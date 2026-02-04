@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Poker Solver",
-  "identifier": "com.pokersolver.app",
+  "identifier": "com.pokersolver.desktop",
   "version": "0.1.0",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": { "script": "npm run dev", "cwd": "../../frontend" },
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": { "script": "npm run build", "cwd": "../../frontend" },
     "frontendDist": "../../frontend/dist"
   },
   "app": {
