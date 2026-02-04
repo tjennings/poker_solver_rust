@@ -257,7 +257,8 @@ impl<G: Game> MccfrSolver<G> {
                 .or_insert_with(|| vec![0.0; num_actions]);
 
             for i in 0..num_actions {
-                let regret_delta = opponent_reach * (action_utils[i] - node_util) * sample_weight * discount;
+                let regret_delta =
+                    opponent_reach * (action_utils[i] - node_util) * sample_weight * discount;
                 regrets[i] += regret_delta;
 
                 // CFR+ : floor regrets at 0

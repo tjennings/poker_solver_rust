@@ -3,7 +3,7 @@
 //! Provides equity (win probability) between two canonical preflop hands.
 //! Equity is calculated via Monte Carlo simulation for accuracy.
 
-use crate::hands::{all_hands, CanonicalHand};
+use crate::hands::{CanonicalHand, all_hands};
 use crate::poker::{Card, Hand, Rank, Rankable, Suit, Value};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -274,9 +274,7 @@ pub fn prewarm_cache() -> usize {
     for &h1 in &hands {
         for &h2 in &hands {
             // Equity function caches both directions, so skip if already cached
-            let already_cached = EQUITY_CACHE
-                .lock()
-                .is_ok_and(|c| c.contains_key(&(h1, h2)));
+            let already_cached = EQUITY_CACHE.lock().is_ok_and(|c| c.contains_key(&(h1, h2)));
 
             if !already_cached {
                 let _ = equity(h1, h2);

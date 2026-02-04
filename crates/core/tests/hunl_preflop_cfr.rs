@@ -28,7 +28,11 @@ fn hunl_preflop_mccfr_trains_efficiently() {
     println!("MCCFR 10 iterations (10 samples each): {:?}", elapsed);
 
     // Should complete quickly (equity calculations are cached)
-    assert!(elapsed.as_secs() < 60, "Training took too long: {:?}", elapsed);
+    assert!(
+        elapsed.as_secs() < 60,
+        "Training took too long: {:?}",
+        elapsed
+    );
 
     // Should have some strategies
     assert!(solver.iterations() == 10);
@@ -89,10 +93,7 @@ fn hunl_preflop_premium_hands_strategies() {
         // AA should rarely fold (if fold is even an option)
         // The first action in preflop for SB is typically call/raise, not fold
         // But if fold is present, it should be very low
-        assert!(
-            !strategy.is_empty(),
-            "AA should have actions"
-        );
+        assert!(!strategy.is_empty(), "AA should have actions");
     }
 
     // 72o should have a strategy too
@@ -101,10 +102,7 @@ fn hunl_preflop_premium_hands_strategies() {
 
         // 72o (worst hand) should have higher fold/check tendency
         // vs premium hands having higher raise tendency
-        assert!(
-            !strategy.is_empty(),
-            "72o should have actions"
-        );
+        assert!(!strategy.is_empty(), "72o should have actions");
     }
 }
 
