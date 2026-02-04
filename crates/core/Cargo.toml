@@ -1,0 +1,14 @@
+[package]
+name = "poker-solver-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CFR poker solver core library"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+proptest = "1.4"
