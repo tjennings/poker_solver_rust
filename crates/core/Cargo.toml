@@ -9,6 +9,19 @@ description = "CFR poker solver core library"
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+rs_poker.workspace = true
+
+# Burn with feature flags for different backends
+burn = { workspace = true, optional = true, features = ["ndarray", "wgpu"] }
 
 [dev-dependencies]
 proptest = "1.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "tensor_ops"
+harness = false
+
+[features]
+default = []
+gpu = ["burn"]
