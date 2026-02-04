@@ -1,5 +1,7 @@
+mod hunl_preflop;
 mod kuhn;
 
+pub use hunl_preflop::HunlPreflop;
 pub use kuhn::KuhnPoker;
 
 /// Player in a two-player game

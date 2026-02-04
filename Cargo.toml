@@ -11,6 +11,7 @@ authors = ["LTJ"]
 [workspace.dependencies]
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
 
 # Poker domain types
 rs_poker = { version = "4.1", default-features = false }

@@ -13,13 +13,18 @@
 //! - `poker` - Re-exported poker domain types from `rs_poker`
 
 pub mod cfr;
+pub mod config;
 #[cfg(feature = "gpu")]
 pub mod device;
+pub mod equity;
 pub mod error;
 pub mod game;
+pub mod hands;
 
+pub use config::Config;
 pub use error::SolverError;
 pub use game::{Action, Game, Player};
+pub use hands::{CanonicalHand, HandType, all_hands};
 
 /// Re-exported poker domain types from the `rs_poker` crate.
 ///

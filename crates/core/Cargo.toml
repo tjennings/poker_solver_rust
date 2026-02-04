@@ -9,6 +9,7 @@ description = "CFR poker solver core library"
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+serde_yaml.workspace = true
 rs_poker.workspace = true
 
 # Burn with feature flags for different backends
