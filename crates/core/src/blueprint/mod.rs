@@ -7,7 +7,10 @@
 //! # Submodules
 //!
 //! - `error` - Error types for blueprint operations
+//! - `strategy` - Strategy storage with save/load functionality
 
 mod error;
+mod strategy;
 
 pub use error::BlueprintError;
+pub use strategy::BlueprintStrategy;

@@ -85,6 +85,7 @@ impl HandStrength {
 ///
 /// Provides methods for computing Expected Hand Strength (EHS) and related
 /// metrics at different streets.
+#[derive(Debug)]
 pub struct HandStrengthCalculator;
 
 impl HandStrengthCalculator {

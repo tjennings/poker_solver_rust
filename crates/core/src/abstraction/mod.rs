@@ -105,6 +105,7 @@ impl Default for AbstractionConfig {
 ///
 /// This struct ties together bucket boundaries and hand strength calculation
 /// to provide a unified API for mapping hands to buckets.
+#[derive(Debug)]
 pub struct CardAbstraction {
     assigner: BucketAssigner,
     calculator: HandStrengthCalculator,
