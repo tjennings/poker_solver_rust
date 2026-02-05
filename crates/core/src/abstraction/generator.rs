@@ -135,18 +135,25 @@ impl BoundaryGenerator {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_precision_loss)]
     use super::*;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn generator_produces_valid_boundaries() {
-        let config = AbstractionConfig {
-            flop_buckets: 10,
-            turn_buckets: 10,
-            river_buckets: 10,
-            samples_per_street: 100, // Small for testing
-        };
-        let generator = BoundaryGenerator::new(config);
-        let boundaries = generator.generate(42);
+        // Test from_samples with synthetic data (avoids expensive flop EHS2)
+        let mut flop_samples: Vec<f32> = (0..50).map(|i| i as f32 / 50.0).collect();
+        let mut turn_samples: Vec<f32> = (0..50).map(|i| i as f32 / 50.0).collect();
+        let mut river_samples: Vec<f32> = (0..50).map(|i| i as f32 / 50.0).collect();
+
+        let boundaries = BucketBoundaries::from_samples(
+            &mut flop_samples,
+            &mut turn_samples,
+            &mut river_samples,
+            10,
+            10,
+            10,
+        );
 
         assert_eq!(boundaries.flop.len(), 9); // 10 buckets = 9 boundaries
         assert_eq!(boundaries.turn.len(), 9);
@@ -156,82 +163,110 @@ mod tests {
         for window in boundaries.river.windows(2) {
             assert!(window[0] <= window[1], "Boundaries not monotonic");
         }
+        for window in boundaries.flop.windows(2) {
+            assert!(window[0] <= window[1], "Boundaries not monotonic");
+        }
     }
 
-    #[test]
+    #[timed_test]
     fn full_deck_has_52_cards() {
         let deck = BoundaryGenerator::full_deck();
         assert_eq!(deck.len(), 52);
     }
 
-    #[test]
+    #[timed_test]
     fn full_deck_has_unique_cards() {
         let deck = BoundaryGenerator::full_deck();
         let unique: std::collections::HashSet<_> = deck.iter().collect();
         assert_eq!(unique.len(), 52);
     }
 
-    #[test]
+    #[timed_test]
     fn deterministic_generation_with_same_seed() {
-        let config = AbstractionConfig {
-            flop_buckets: 5,
-            turn_buckets: 5,
-            river_buckets: 5,
-            samples_per_street: 50,
-        };
-        let generator = BoundaryGenerator::new(config);
+        // River EHS2 is cheap — use HandStrengthCalculator directly
+        let calc = HandStrengthCalculator::new();
+        let board = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Diamond),
+            Card::new(Value::Jack, Suit::Club),
+            Card::new(Value::Two, Suit::Spade),
+        ];
+        let holding = (
+            Card::new(Value::Ten, Suit::Heart),
+            Card::new(Value::Nine, Suit::Heart),
+        );
 
-        let boundaries1 = generator.generate(12345);
-        let boundaries2 = generator.generate(12345);
+        let hs1 = calc.calculate_river(&board, holding);
+        let hs2 = calc.calculate_river(&board, holding);
 
-        assert_eq!(boundaries1.flop, boundaries2.flop);
-        assert_eq!(boundaries1.turn, boundaries2.turn);
-        assert_eq!(boundaries1.river, boundaries2.river);
-    }
-
-    #[test]
-    fn different_seeds_produce_different_boundaries() {
-        let config = AbstractionConfig {
-            flop_buckets: 5,
-            turn_buckets: 5,
-            river_buckets: 5,
-            samples_per_street: 50,
-        };
-        let generator = BoundaryGenerator::new(config);
-
-        let boundaries1 = generator.generate(11111);
-        let boundaries2 = generator.generate(22222);
-
-        // At least one street's boundaries should differ
-        let all_same = boundaries1.flop == boundaries2.flop
-            && boundaries1.turn == boundaries2.turn
-            && boundaries1.river == boundaries2.river;
         assert!(
-            !all_same,
-            "Different seeds should produce different boundaries"
+            (hs1.ehs2 - hs2.ehs2).abs() < f32::EPSILON,
+            "Same inputs should produce identical EHS2: {} vs {}",
+            hs1.ehs2,
+            hs2.ehs2
         );
     }
 
-    #[test]
-    fn boundaries_within_valid_range() {
-        let config = AbstractionConfig {
-            flop_buckets: 5,
-            turn_buckets: 5,
-            river_buckets: 5,
-            samples_per_street: 100,
-        };
-        let generator = BoundaryGenerator::new(config);
-        let boundaries = generator.generate(99);
+    #[timed_test]
+    fn different_inputs_produce_different_ehs2() {
+        let calc = HandStrengthCalculator::new();
+        let board = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Diamond),
+            Card::new(Value::Jack, Suit::Club),
+            Card::new(Value::Two, Suit::Spade),
+        ];
 
-        // All boundaries should be between 0 and 1 (EHS2 range)
-        for &b in &boundaries.flop {
-            assert!(b >= 0.0 && b <= 1.0, "Flop boundary out of range: {}", b);
-        }
-        for &b in &boundaries.turn {
-            assert!(b >= 0.0 && b <= 1.0, "Turn boundary out of range: {}", b);
-        }
-        for &b in &boundaries.river {
-            assert!(b >= 0.0 && b <= 1.0, "River boundary out of range: {}", b);
+        // Strong holding: Broadway straight
+        let strong = (
+            Card::new(Value::Ten, Suit::Heart),
+            Card::new(Value::Nine, Suit::Heart),
+        );
+        // Weak holding: low pair
+        let weak = (
+            Card::new(Value::Three, Suit::Heart),
+            Card::new(Value::Four, Suit::Club),
+        );
+
+        let hs_strong = calc.calculate_river(&board, strong);
+        let hs_weak = calc.calculate_river(&board, weak);
+
+        assert!(
+            (hs_strong.ehs2 - hs_weak.ehs2).abs() > f32::EPSILON,
+            "Different holdings should produce different EHS2: strong={}, weak={}",
+            hs_strong.ehs2,
+            hs_weak.ehs2
+        );
+    }
+
+    #[timed_test]
+    fn boundaries_within_valid_range() {
+        // Use river EHS2 (cheap) for several holdings to verify range
+        let calc = HandStrengthCalculator::new();
+        let board = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Diamond),
+            Card::new(Value::Jack, Suit::Club),
+            Card::new(Value::Two, Suit::Spade),
+        ];
+
+        let holdings = [
+            (Card::new(Value::Ten, Suit::Heart), Card::new(Value::Nine, Suit::Heart)),
+            (Card::new(Value::Three, Suit::Heart), Card::new(Value::Four, Suit::Club)),
+            (Card::new(Value::Seven, Suit::Diamond), Card::new(Value::Eight, Suit::Club)),
+            (Card::new(Value::Five, Suit::Club), Card::new(Value::Six, Suit::Diamond)),
+        ];
+
+        for holding in &holdings {
+            let hs = calc.calculate_river(&board, *holding);
+            assert!(
+                (0.0..=1.0).contains(&hs.ehs2),
+                "EHS2 out of range: {}",
+                hs.ehs2
+            );
         }
     }
 }

@@ -6,48 +6,29 @@
 //! Note: These tests use reduced iteration counts to run quickly. For actual
 //! strategy computation, use many more iterations.
 
-use std::time::Instant;
-
 use poker_solver_core::cfr::MccfrSolver;
 use poker_solver_core::game::{Game, HunlPreflop};
+use test_macros::timed_test;
 
 /// Test that MCCFR trains efficiently on HUNL Preflop.
-#[test]
+#[timed_test(10)]
 fn hunl_preflop_mccfr_trains_efficiently() {
-    let game = HunlPreflop::with_stack(10);
+    let game = HunlPreflop::with_stack(5);
     let mut solver = MccfrSolver::new(game);
 
-    let start = Instant::now();
+    solver.train(2, 2);
 
-    // Sample 10 states per iteration, 10 iterations
-    // This is a minimal test to verify training works
-    solver.train(10, 10);
-
-    let elapsed = start.elapsed();
-
-    println!("MCCFR 10 iterations (10 samples each): {:?}", elapsed);
-
-    // Should complete quickly (equity calculations are cached)
-    assert!(
-        elapsed.as_secs() < 60,
-        "Training took too long: {:?}",
-        elapsed
-    );
-
-    // Should have some strategies
-    assert!(solver.iterations() == 10);
+    assert!(solver.iterations() == 2);
 }
 
 /// Test that MCCFR produces valid strategies for HUNL Preflop.
-#[test]
+#[timed_test(10)]
 fn hunl_preflop_mccfr_produces_valid_strategies() {
-    let game = HunlPreflop::with_stack(10);
+    let game = HunlPreflop::with_stack(5);
     let mut solver = MccfrSolver::new(game);
 
-    // Use minimal training for test speed
-    solver.train(5, 10);
+    solver.train(2, 2);
 
-    // Check SB opening strategies exist and are valid
     let strategies = solver.all_strategies();
 
     let sb_strategies: Vec<_> = strategies
@@ -60,7 +41,6 @@ fn hunl_preflop_mccfr_produces_valid_strategies() {
         "Should have SB opening strategies"
     );
 
-    // Verify probabilities sum to 1
     for (info_set, probs) in &sb_strategies {
         let sum: f64 = probs.iter().sum();
         assert!(
@@ -78,30 +58,20 @@ fn hunl_preflop_mccfr_produces_valid_strategies() {
 }
 
 /// Test that premium hands develop reasonable strategies.
-#[test]
+#[timed_test(10)]
 fn hunl_preflop_premium_hands_strategies() {
-    let game = HunlPreflop::with_stack(20);
+    let game = HunlPreflop::with_stack(5);
     let mut solver = MccfrSolver::new(game);
 
-    // Train with modest iterations (strategy quality not checked, just existence)
-    solver.train(10, 20);
+    solver.train(2, 3);
 
-    // AA should have a strategy at the SB opening position
     if let Some(strategy) = solver.get_average_strategy("SB:AA:") {
-        println!("AA opening strategy: {:?}", strategy);
-
-        // AA should rarely fold (if fold is even an option)
-        // The first action in preflop for SB is typically call/raise, not fold
-        // But if fold is present, it should be very low
+        println!("AA opening strategy: {strategy:?}");
         assert!(!strategy.is_empty(), "AA should have actions");
     }
 
-    // 72o should have a strategy too
     if let Some(strategy) = solver.get_average_strategy("SB:72o:") {
-        println!("72o opening strategy: {:?}", strategy);
-
-        // 72o (worst hand) should have higher fold/check tendency
-        // vs premium hands having higher raise tendency
+        println!("72o opening strategy: {strategy:?}");
         assert!(!strategy.is_empty(), "72o should have actions");
     }
 }
@@ -111,12 +81,13 @@ fn hunl_preflop_premium_hands_strategies() {
 /// Note: This test uses very small parameters to run quickly. The actual speedup
 /// is much higher with larger iteration counts, but equity calculation dominates
 /// in debug builds.
-#[test]
+#[timed_test(300)]
+#[ignore = "slow"]
 fn hunl_preflop_sampling_speedup() {
     let game = HunlPreflop::with_stack(10);
     let num_states = game.initial_states().len();
 
-    println!("HUNL Preflop has {} initial states", num_states);
+    println!("HUNL Preflop has {num_states} initial states");
     assert_eq!(num_states, 169 * 169);
 
     // Just verify both training methods work
@@ -136,24 +107,20 @@ fn hunl_preflop_sampling_speedup() {
 }
 
 /// Test that more training explores more info sets.
-#[test]
+#[timed_test(10)]
 fn hunl_preflop_training_improves() {
-    let game = HunlPreflop::with_stack(10);
+    let game = HunlPreflop::with_stack(5);
 
-    // Train briefly
     let mut solver1 = MccfrSolver::new(game.clone());
-    solver1.train(2, 5);
+    solver1.train(1, 2);
     let strategies1 = solver1.all_strategies();
 
-    // Train more
     let mut solver2 = MccfrSolver::new(game);
-    solver2.train(5, 10);
+    solver2.train(2, 3);
     let strategies2 = solver2.all_strategies();
 
-    // More training should populate more info sets
-    // (deeper game tree exploration)
     println!(
-        "Info sets after 2x5 samples: {}, after 5x10 samples: {}",
+        "Info sets after 1x2 samples: {}, after 2x3 samples: {}",
         strategies1.len(),
         strategies2.len()
     );

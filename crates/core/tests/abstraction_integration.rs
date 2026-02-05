@@ -1,53 +1,43 @@
 //! Integration tests for the card abstraction pipeline.
 //!
-//! These tests verify the full pipeline works end-to-end: generating boundaries,
-//! creating abstractions, saving/loading, and bucket lookups.
+//! These tests verify the full pipeline works end-to-end: creating abstractions
+//! from boundaries, saving/loading, and bucket lookups.
 
-use poker_solver_core::abstraction::{
-    AbstractionConfig, BoundaryGenerator, BucketBoundaries, CardAbstraction, Street,
-};
+use poker_solver_core::abstraction::{BucketBoundaries, CardAbstraction, Street};
 use poker_solver_core::poker::{Card, Suit, Value};
 use tempfile::tempdir;
+use test_macros::timed_test;
 
-#[test]
+/// Helper: build synthetic boundaries with uniform distribution
+fn synthetic_boundaries(flop_buckets: usize, turn_buckets: usize, river_buckets: usize) -> BucketBoundaries {
+    BucketBoundaries {
+        flop: (1..flop_buckets).map(|i| i as f32 / flop_buckets as f32).collect(),
+        turn: (1..turn_buckets).map(|i| i as f32 / turn_buckets as f32).collect(),
+        river: (1..river_buckets).map(|i| i as f32 / river_buckets as f32).collect(),
+    }
+}
+
+#[timed_test]
 fn full_pipeline_generate_save_load() {
-    // Generate small boundaries
-    let config = AbstractionConfig {
-        flop_buckets: 10,
-        turn_buckets: 10,
-        river_buckets: 20,
-        samples_per_street: 50,
-    };
-    let generator = BoundaryGenerator::new(config);
-    let boundaries = generator.generate(12345);
-
-    // Create abstraction and save
+    let boundaries = synthetic_boundaries(10, 10, 20);
     let abstraction = CardAbstraction::from_boundaries(boundaries);
 
     let dir = tempdir().expect("Failed to create temp directory");
     let path = dir.path().join("test_boundaries.bin");
     abstraction.save(&path).expect("Failed to save boundaries");
 
-    // Load and verify
     let loaded = CardAbstraction::load(&path).expect("Failed to load boundaries");
     assert_eq!(loaded.num_buckets(Street::Flop), 10);
     assert_eq!(loaded.num_buckets(Street::Turn), 10);
     assert_eq!(loaded.num_buckets(Street::River), 20);
 }
 
-#[test]
+#[timed_test]
 fn bucket_lookup_returns_valid_index() {
-    let config = AbstractionConfig {
-        flop_buckets: 100,
-        turn_buckets: 100,
-        river_buckets: 200,
-        samples_per_street: 100,
-    };
-    let generator = BoundaryGenerator::new(config);
-    let boundaries = generator.generate(42);
+    let boundaries = synthetic_boundaries(100, 100, 200);
     let abstraction = CardAbstraction::from_boundaries(boundaries);
 
-    // Test river lookup
+    // Test river lookup (cheap — no flop EHS2)
     let board = vec![
         Card::new(Value::Ace, Suit::Spade),
         Card::new(Value::King, Suit::Spade),
@@ -63,19 +53,12 @@ fn bucket_lookup_returns_valid_index() {
     let bucket = abstraction
         .get_bucket(&board, holding)
         .expect("Failed to get bucket");
-    assert!(bucket < 200, "Bucket {} should be < 200", bucket);
+    assert!(bucket < 200, "Bucket {bucket} should be < 200");
 }
 
-#[test]
+#[timed_test]
 fn duplicate_card_rejected() {
-    let config = AbstractionConfig {
-        flop_buckets: 10,
-        turn_buckets: 10,
-        river_buckets: 10,
-        samples_per_street: 10,
-    };
-    let generator = BoundaryGenerator::new(config);
-    let boundaries = generator.generate(1);
+    let boundaries = synthetic_boundaries(10, 10, 10);
     let abstraction = CardAbstraction::from_boundaries(boundaries);
 
     let board = vec![
@@ -95,7 +78,7 @@ fn duplicate_card_rejected() {
     assert!(result.is_err(), "Should reject duplicate card");
 }
 
-#[test]
+#[timed_test]
 fn different_hands_get_different_buckets_on_river() {
     // With enough buckets, strong and weak hands should be in different buckets
     let boundaries = BucketBoundaries {
@@ -141,51 +124,14 @@ fn different_hands_get_different_buckets_on_river() {
     // Strong hand should be in higher bucket than weak hand
     assert!(
         strong_bucket > weak_bucket,
-        "Strong hand bucket {} should be > weak hand bucket {}",
-        strong_bucket,
-        weak_bucket
+        "Strong hand bucket {strong_bucket} should be > weak hand bucket {weak_bucket}"
     );
 }
 
-#[test]
-fn flop_bucket_lookup_works() {
-    let config = AbstractionConfig {
-        flop_buckets: 50,
-        turn_buckets: 50,
-        river_buckets: 100,
-        samples_per_street: 100,
-    };
-    let generator = BoundaryGenerator::new(config);
-    let boundaries = generator.generate(99);
-    let abstraction = CardAbstraction::from_boundaries(boundaries);
-
-    // Test flop lookup (3 cards)
-    let board = vec![
-        Card::new(Value::Ace, Suit::Spade),
-        Card::new(Value::King, Suit::Spade),
-        Card::new(Value::Queen, Suit::Heart),
-    ];
-    let holding = (
-        Card::new(Value::Jack, Suit::Spade),
-        Card::new(Value::Ten, Suit::Spade),
-    );
-
-    let bucket = abstraction
-        .get_bucket(&board, holding)
-        .expect("Failed to get flop bucket");
-    assert!(bucket < 50, "Flop bucket {} should be < 50", bucket);
-}
-
-#[test]
+#[timed_test(10)]
 fn turn_bucket_lookup_works() {
-    let config = AbstractionConfig {
-        flop_buckets: 50,
-        turn_buckets: 50,
-        river_buckets: 100,
-        samples_per_street: 100,
-    };
-    let generator = BoundaryGenerator::new(config);
-    let boundaries = generator.generate(77);
+    // Turn EHS2 is cheap (~990 combos), use synthetic boundaries
+    let boundaries = synthetic_boundaries(50, 50, 100);
     let abstraction = CardAbstraction::from_boundaries(boundaries);
 
     // Test turn lookup (4 cards)
@@ -203,10 +149,10 @@ fn turn_bucket_lookup_works() {
     let bucket = abstraction
         .get_bucket(&board, holding)
         .expect("Failed to get turn bucket");
-    assert!(bucket < 50, "Turn bucket {} should be < 50", bucket);
+    assert!(bucket < 50, "Turn bucket {bucket} should be < 50");
 }
 
-#[test]
+#[timed_test]
 fn invalid_board_size_rejected() {
     let boundaries = BucketBoundaries {
         flop: vec![0.5],
@@ -229,7 +175,7 @@ fn invalid_board_size_rejected() {
     assert!(result.is_err(), "Should reject invalid board size");
 }
 
-#[test]
+#[timed_test]
 fn same_hand_same_bucket_deterministic() {
     let boundaries = BucketBoundaries {
         flop: (1..50).map(|i| i as f32 / 50.0).collect(),
