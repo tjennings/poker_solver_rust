@@ -6,6 +6,7 @@
 
 mod buckets;
 mod error;
+mod generator;
 mod hand_strength;
 mod isomorphism;
 
@@ -15,6 +16,7 @@ use std::path::Path;
 
 pub use buckets::{BucketAssigner, BucketBoundaries};
 pub use error::AbstractionError;
+pub use generator::BoundaryGenerator;
 pub use hand_strength::{HandStrength, HandStrengthCalculator};
 pub use isomorphism::{CanonicalBoard, CanonicalSuit, SuitMapping};
 
