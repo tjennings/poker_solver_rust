@@ -1,6 +1,8 @@
+mod hunl_postflop;
 mod hunl_preflop;
 mod kuhn;
 
+pub use hunl_postflop::{PostflopConfig, PostflopState, TerminalType};
 pub use hunl_preflop::HunlPreflop;
 pub use kuhn::KuhnPoker;
 

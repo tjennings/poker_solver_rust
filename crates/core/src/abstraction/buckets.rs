@@ -58,10 +58,14 @@ impl BucketAssigner {
 
     /// Get bucket index for an EHS2 value on a given street
     /// O(log n) via binary search
+    ///
+    /// Note: Preflop is not supported for EHS2-based bucketing (uses canonical hands instead).
+    /// Calling this with `Street::Preflop` will return bucket 0.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // Bucket counts are always small (<= 65535)
     pub fn get_bucket(&self, street: Street, ehs2: f32) -> u16 {
         let boundaries = match street {
+            Street::Preflop => return 0, // Preflop doesn't use EHS2 bucketing
             Street::Flop => &self.boundaries.flop,
             Street::Turn => &self.boundaries.turn,
             Street::River => &self.boundaries.river,
@@ -73,6 +77,7 @@ impl BucketAssigner {
     #[must_use]
     pub fn num_buckets(&self, street: Street) -> usize {
         match street {
+            Street::Preflop => 169, // 169 canonical preflop hands (no EHS2 bucketing)
             Street::Flop => self.boundaries.flop.len() + 1,
             Street::Turn => self.boundaries.turn.len() + 1,
             Street::River => self.boundaries.river.len() + 1,

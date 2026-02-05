@@ -23,6 +23,8 @@ pub use isomorphism::{CanonicalBoard, CanonicalSuit, SuitMapping};
 /// Street in poker (determines bucket count and calculation method)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Street {
+    /// Preflop: 0 community cards
+    Preflop,
     /// Flop: 3 community cards
     Flop,
     /// Turn: 4 community cards
@@ -38,12 +40,13 @@ impl Street {
     /// * `len` - Number of community cards on the board
     ///
     /// # Errors
-    /// Returns `AbstractionError::InvalidBoardSize` if `len` is not 3, 4, or 5.
+    /// Returns `AbstractionError::InvalidBoardSize` if `len` is not 0, 3, 4, or 5.
     ///
     /// # Examples
     /// ```
     /// use poker_solver_core::abstraction::Street;
     ///
+    /// assert_eq!(Street::from_board_len(0).unwrap(), Street::Preflop);
     /// assert_eq!(Street::from_board_len(3).unwrap(), Street::Flop);
     /// assert_eq!(Street::from_board_len(4).unwrap(), Street::Turn);
     /// assert_eq!(Street::from_board_len(5).unwrap(), Street::River);
@@ -51,11 +54,12 @@ impl Street {
     /// ```
     pub fn from_board_len(len: usize) -> Result<Self, AbstractionError> {
         match len {
+            0 => Ok(Street::Preflop),
             3 => Ok(Street::Flop),
             4 => Ok(Street::Turn),
             5 => Ok(Street::River),
             n => Err(AbstractionError::InvalidBoardSize {
-                expected: 3, // Use 3 as the "expected" since that's the minimum valid
+                expected: 3, // Use 3 as the "expected" since that's the minimum valid postflop
                 got: n,
             }),
         }
@@ -65,6 +69,7 @@ impl Street {
     #[must_use]
     pub const fn board_cards(self) -> usize {
         match self {
+            Street::Preflop => 0,
             Street::Flop => 3,
             Street::Turn => 4,
             Street::River => 5,
@@ -186,8 +191,14 @@ impl CardAbstraction {
         let canonical_board = CanonicalBoard::from_cards(board)?;
         let canonical_holding = canonical_board.canonicalize_holding(holding.0, holding.1);
 
-        // Calculate EHS2
+        // Calculate EHS2 (preflop doesn't use EHS2-based bucketing)
         let hs = match street {
+            Street::Preflop => {
+                return Err(AbstractionError::InvalidBoardSize {
+                    expected: 3,
+                    got: 0,
+                });
+            }
             Street::Flop => self
                 .calculator
                 .calculate_flop(&canonical_board.cards, canonical_holding),
@@ -236,15 +247,10 @@ mod tests {
     }
 
     #[test]
-    fn street_from_board_len_invalid_zero() {
+    fn street_from_board_len_preflop() {
         let result = Street::from_board_len(0);
-        assert!(result.is_err());
-        match result {
-            Err(AbstractionError::InvalidBoardSize { expected: _, got }) => {
-                assert_eq!(got, 0);
-            }
-            _ => panic!("Expected InvalidBoardSize error"),
-        }
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Street::Preflop);
     }
 
     #[test]
@@ -261,6 +267,7 @@ mod tests {
 
     #[test]
     fn street_board_cards_returns_correct_count() {
+        assert_eq!(Street::Preflop.board_cards(), 0);
         assert_eq!(Street::Flop.board_cards(), 3);
         assert_eq!(Street::Turn.board_cards(), 4);
         assert_eq!(Street::River.board_cards(), 5);
