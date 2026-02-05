@@ -4,10 +4,12 @@
 //! This module enables grouping similar hands into buckets to reduce
 //! the game tree size for CFR solving.
 
+mod buckets;
 mod error;
 mod hand_strength;
 mod isomorphism;
 
+pub use buckets::{BucketAssigner, BucketBoundaries};
 pub use error::AbstractionError;
 pub use hand_strength::{HandStrength, HandStrengthCalculator};
 pub use isomorphism::{CanonicalBoard, CanonicalSuit, SuitMapping};
