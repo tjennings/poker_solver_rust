@@ -13,6 +13,7 @@
 //! - `poker` - Re-exported poker domain types from `rs_poker`
 
 pub mod abstraction;
+pub mod blueprint;
 pub mod cfr;
 pub mod config;
 #[cfg(feature = "gpu")]
