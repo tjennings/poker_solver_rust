@@ -9,7 +9,7 @@ mod hand_strength;
 mod isomorphism;
 
 pub use error::AbstractionError;
-pub use hand_strength::HandStrength;
+pub use hand_strength::{HandStrength, HandStrengthCalculator};
 pub use isomorphism::{CanonicalBoard, CanonicalSuit, SuitMapping};
 
 /// Street in poker (determines bucket count and calculation method)
