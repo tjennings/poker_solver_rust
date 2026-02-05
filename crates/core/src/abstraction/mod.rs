@@ -8,7 +8,7 @@ mod error;
 mod isomorphism;
 
 pub use error::AbstractionError;
-pub use isomorphism::{CanonicalSuit, SuitMapping};
+pub use isomorphism::{CanonicalBoard, CanonicalSuit, SuitMapping};
 
 /// Street in poker (determines bucket count and calculation method)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

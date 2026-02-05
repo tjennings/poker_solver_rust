@@ -1,4 +1,5 @@
-use crate::poker::{Card, Suit};
+use crate::abstraction::AbstractionError;
+use crate::poker::{Card, Suit, Value};
 
 /// Canonical suit ordering (used for isomorphism)
 /// Spade=0, Heart=1, Diamond=2, Club=3
@@ -67,6 +68,121 @@ fn suit_to_index(suit: Suit) -> usize {
     }
 }
 
+/// Get numeric rank for value comparison (Ace=14, King=13, ..., Two=2)
+fn value_rank(v: Value) -> u8 {
+    match v {
+        Value::Ace => 14,
+        Value::King => 13,
+        Value::Queen => 12,
+        Value::Jack => 11,
+        Value::Ten => 10,
+        Value::Nine => 9,
+        Value::Eight => 8,
+        Value::Seven => 7,
+        Value::Six => 6,
+        Value::Five => 5,
+        Value::Four => 4,
+        Value::Three => 3,
+        Value::Two => 2,
+    }
+}
+
+/// Compare two slices of values lexicographically by rank
+fn compare_value_slices(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    for (va, vb) in a.iter().zip(b.iter()) {
+        let cmp = value_rank(*va).cmp(&value_rank(*vb));
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// A board in canonical suit form
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalBoard {
+    pub cards: Vec<Card>,
+    pub mapping: SuitMapping,
+}
+
+impl CanonicalBoard {
+    /// Canonicalize a board by reordering suits
+    ///
+    /// Rules:
+    /// 1. Suits ordered by frequency on board (most common first)
+    /// 2. Ties broken by highest card in that suit
+    /// 3. Further ties broken by second-highest, etc.
+    ///
+    /// # Errors
+    /// Returns `AbstractionError::InvalidBoardSize` if board is empty or has more than 5 cards.
+    pub fn from_cards(board: &[Card]) -> Result<Self, AbstractionError> {
+        if board.is_empty() || board.len() > 5 {
+            return Err(AbstractionError::InvalidBoardSize {
+                expected: 3,
+                got: board.len(),
+            });
+        }
+
+        // Collect cards by suit
+        let mut suit_cards: [Vec<Value>; 4] = Default::default();
+        for card in board {
+            let idx = suit_to_index(card.suit);
+            suit_cards[idx].push(card.value);
+        }
+
+        // Sort cards within each suit (descending by value)
+        for cards in &mut suit_cards {
+            cards.sort_by_key(|v| std::cmp::Reverse(value_rank(*v)));
+        }
+
+        // Create suit priority list: (original_suit_idx, count, highest_cards)
+        let mut suit_priority: Vec<(usize, usize, &[Value])> = (0..4)
+            .map(|i| (i, suit_cards[i].len(), suit_cards[i].as_slice()))
+            .collect();
+
+        // Sort by: count desc, then by card ranks desc (lexicographic)
+        suit_priority.sort_by(|a, b| {
+            match b.1.cmp(&a.1) {
+                std::cmp::Ordering::Equal => {
+                    // Compare cards lexicographically (highest first)
+                    compare_value_slices(b.2, a.2)
+                }
+                other => other,
+            }
+        });
+
+        // Build the mapping: suit_priority[0] -> First, [1] -> Second, etc.
+        let mut mapping_arr = [CanonicalSuit::First; 4];
+        for (canonical_idx, (original_idx, _, _)) in suit_priority.iter().enumerate() {
+            let canonical = match canonical_idx {
+                0 => CanonicalSuit::First,
+                1 => CanonicalSuit::Second,
+                2 => CanonicalSuit::Third,
+                _ => CanonicalSuit::Fourth,
+            };
+            mapping_arr[*original_idx] = canonical;
+        }
+
+        let mapping = SuitMapping {
+            mapping: mapping_arr,
+        };
+
+        // Apply mapping to board
+        let canonical_cards: Vec<Card> = board.iter().map(|c| mapping.map_card(*c)).collect();
+
+        Ok(Self {
+            cards: canonical_cards,
+            mapping,
+        })
+    }
+
+    /// Map a holding (two hole cards) using the same suit mapping
+    #[must_use]
+    pub fn canonicalize_holding(&self, card1: Card, card2: Card) -> (Card, Card) {
+        (self.mapping.map_card(card1), self.mapping.map_card(card2))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +204,95 @@ mod tests {
         let mapped = mapping.map_card(card);
         assert_eq!(mapped.value, Value::Ace);
         assert_eq!(mapped.suit, Suit::Heart);
+    }
+
+    #[test]
+    fn canonicalize_rainbow_flop_orders_by_highest_card() {
+        // Ah Kd 7c -> all different suits, order by highest card per suit
+        let board = vec![
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Diamond),
+            Card::new(Value::Seven, Suit::Club),
+        ];
+
+        let canonical = CanonicalBoard::from_cards(&board).unwrap();
+
+        // Canonical board should be As Kh 7d
+        assert_eq!(canonical.cards[0], Card::new(Value::Ace, Suit::Spade));
+        assert_eq!(canonical.cards[1], Card::new(Value::King, Suit::Heart));
+        assert_eq!(canonical.cards[2], Card::new(Value::Seven, Suit::Diamond));
+    }
+
+    #[test]
+    fn canonicalize_monotone_flop() {
+        // All hearts: Ah Kh 7h
+        let board = vec![
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Seven, Suit::Heart),
+        ];
+
+        let canonical = CanonicalBoard::from_cards(&board).unwrap();
+
+        // All should be spades (first canonical suit)
+        assert_eq!(canonical.cards[0].suit, Suit::Spade);
+        assert_eq!(canonical.cards[1].suit, Suit::Spade);
+        assert_eq!(canonical.cards[2].suit, Suit::Spade);
+    }
+
+    #[test]
+    fn canonicalize_two_tone_flop() {
+        // Ah Kh 7c - two hearts, one club
+        let board = vec![
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Seven, Suit::Club),
+        ];
+
+        let canonical = CanonicalBoard::from_cards(&board).unwrap();
+
+        assert_eq!(canonical.cards[0], Card::new(Value::Ace, Suit::Spade));
+        assert_eq!(canonical.cards[1], Card::new(Value::King, Suit::Spade));
+        assert_eq!(canonical.cards[2], Card::new(Value::Seven, Suit::Heart));
+    }
+
+    #[test]
+    fn isomorphic_boards_same_canonical() {
+        // Ah Kd 7c and As Kh 7d should produce same canonical form
+        let board1 = vec![
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Diamond),
+            Card::new(Value::Seven, Suit::Club),
+        ];
+        let board2 = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Seven, Suit::Diamond),
+        ];
+
+        let canonical1 = CanonicalBoard::from_cards(&board1).unwrap();
+        let canonical2 = CanonicalBoard::from_cards(&board2).unwrap();
+
+        assert_eq!(canonical1.cards, canonical2.cards);
+    }
+
+    #[test]
+    fn holding_mapped_consistently_with_board() {
+        let board = vec![
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Diamond),
+            Card::new(Value::Seven, Suit::Club),
+        ];
+
+        let canonical = CanonicalBoard::from_cards(&board).unwrap();
+
+        // Holding with hearts should map to spades (same as Ace)
+        let (c1, c2) = canonical.canonicalize_holding(
+            Card::new(Value::Queen, Suit::Heart),
+            Card::new(Value::Jack, Suit::Heart),
+        );
+
+        assert_eq!(c1.suit, Suit::Spade);
+        assert_eq!(c2.suit, Suit::Spade);
     }
 }
