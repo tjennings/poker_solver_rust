@@ -5,9 +5,11 @@
 //! the game tree size for CFR solving.
 
 mod error;
+mod hand_strength;
 mod isomorphism;
 
 pub use error::AbstractionError;
+pub use hand_strength::HandStrength;
 pub use isomorphism::{CanonicalBoard, CanonicalSuit, SuitMapping};
 
 /// Street in poker (determines bucket count and calculation method)
