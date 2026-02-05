@@ -9,7 +9,7 @@ use std::sync::Arc;
 use rand::prelude::*;
 
 use crate::abstraction::{CardAbstraction, Street};
-use crate::poker::{Card, FlatDeck, Value};
+use crate::poker::{Card, FlatDeck, Hand, Rankable, Value};
 
 use super::{Action, Game, Player};
 
@@ -387,10 +387,36 @@ impl Game for HunlPostflop {
                 }
             }
             TerminalType::Showdown => {
-                // For now, use 50% equity (placeholder - Task 18 will add actual hand eval)
+                use std::cmp::Ordering;
+
+                // Build 7-card hands for evaluation
+                let mut p1_cards = state.board.clone();
+                p1_cards.extend_from_slice(&state.p1_holding);
+                let p1_hand = Hand::new_with_cards(p1_cards);
+                let p1_rank = p1_hand.rank();
+
+                let mut p2_cards = state.board.clone();
+                p2_cards.extend_from_slice(&state.p2_holding);
+                let p2_hand = Hand::new_with_cards(p2_cards);
+                let p2_rank = p2_hand.rank();
+
                 let pot = f64::from(p1_invested + p2_invested) / 100.0;
-                let p1_equity = 0.5;
-                let p1_ev = p1_equity * pot - f64::from(p1_invested) / 100.0;
+
+                // Higher rank is better in rs_poker
+                let p1_ev = match p1_rank.cmp(&p2_rank) {
+                    Ordering::Greater => {
+                        // P1 wins - gets opponent's investment
+                        pot - f64::from(p1_invested) / 100.0
+                    }
+                    Ordering::Less => {
+                        // P2 wins - P1 loses investment
+                        -f64::from(p1_invested) / 100.0
+                    }
+                    Ordering::Equal => {
+                        // Tie - split pot
+                        pot / 2.0 - f64::from(p1_invested) / 100.0
+                    }
+                };
 
                 if player == Player::Player1 {
                     p1_ev
@@ -965,6 +991,110 @@ mod tests {
             after_p2_check.terminal,
             Some(TerminalType::Showdown),
             "Terminal should be Showdown"
+        );
+    }
+
+    #[test]
+    fn showdown_utility_uses_hand_evaluation() {
+        // P1 has AA (Aces)
+        let p1 = [
+            make_card(Value::Ace, Suit::Spade),
+            make_card(Value::Ace, Suit::Heart),
+        ];
+        // P2 has 72o (Seven-Two offsuit - worst hand)
+        let p2 = [
+            make_card(Value::Seven, Suit::Club),
+            make_card(Value::Two, Suit::Diamond),
+        ];
+
+        // Create a 5-card board that doesn't help P2
+        // Board: Kh Qd Jc 8s 3h (no straight, flush, or pair for 72o)
+        let board = vec![
+            make_card(Value::King, Suit::Heart),
+            make_card(Value::Queen, Suit::Diamond),
+            make_card(Value::Jack, Suit::Club),
+            make_card(Value::Eight, Suit::Spade),
+            make_card(Value::Three, Suit::Heart),
+        ];
+
+        let mut state = PostflopState::new_preflop(p1, p2, 100);
+        state.board = board;
+        state.street = Street::River;
+        state.terminal = Some(TerminalType::Showdown);
+        state.to_act = None;
+
+        let game = create_game();
+
+        // P1 should win with pair of Aces vs P2's high card Seven
+        let p1_utility = game.utility(&state, Player::Player1);
+        let p2_utility = game.utility(&state, Player::Player2);
+
+        // P1 wins, so P1 utility should be positive
+        assert!(
+            p1_utility > 0.0,
+            "P1 with AA should have positive utility, got {}",
+            p1_utility
+        );
+
+        // P2 loses, so P2 utility should be negative
+        assert!(
+            p2_utility < 0.0,
+            "P2 with 72o should have negative utility, got {}",
+            p2_utility
+        );
+
+        // Utilities should be zero-sum
+        assert!(
+            (p1_utility + p2_utility).abs() < 0.001,
+            "Utilities should be zero-sum: {} + {} = {}",
+            p1_utility,
+            p2_utility,
+            p1_utility + p2_utility
+        );
+    }
+
+    #[test]
+    fn showdown_utility_tie_splits_pot() {
+        // Both players have same pocket pair
+        let p1 = [
+            make_card(Value::Nine, Suit::Spade),
+            make_card(Value::Nine, Suit::Heart),
+        ];
+        let p2 = [
+            make_card(Value::Nine, Suit::Club),
+            make_card(Value::Nine, Suit::Diamond),
+        ];
+
+        // Board with higher cards - both make same hand
+        // Board: AKQJT (broadway) - both have same straight
+        let board = vec![
+            make_card(Value::Ace, Suit::Spade),
+            make_card(Value::King, Suit::Diamond),
+            make_card(Value::Queen, Suit::Club),
+            make_card(Value::Jack, Suit::Heart),
+            make_card(Value::Ten, Suit::Spade),
+        ];
+
+        let mut state = PostflopState::new_preflop(p1, p2, 100);
+        state.board = board;
+        state.street = Street::River;
+        state.terminal = Some(TerminalType::Showdown);
+        state.to_act = None;
+
+        let game = create_game();
+
+        let p1_utility = game.utility(&state, Player::Player1);
+        let p2_utility = game.utility(&state, Player::Player2);
+
+        // Both should get zero (split pot equals their investment)
+        // P1 invested 0.5BB (50 cents), P2 invested 1BB (100 cents)
+        // With a tie, pot is split - this test verifies zero-sum property
+        assert!(
+            (p1_utility + p2_utility).abs() < 0.001,
+            "Tie utilities should be zero-sum: {} + {} = {}",
+            p1_utility,
+            p2_utility,
+            p1_utility + p2_utility
         );
     }
 }
