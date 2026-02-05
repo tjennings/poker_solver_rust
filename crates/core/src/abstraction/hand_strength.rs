@@ -94,6 +94,148 @@ impl HandStrengthCalculator {
         Self
     }
 
+    /// Calculate EHS2 on the turn (enumerate river cards).
+    ///
+    /// Enumerates all possible opponent holdings and river cards to calculate
+    /// hand strength with positive and negative potential.
+    ///
+    /// # Arguments
+    /// * `board` - The 4 community cards on the turn
+    /// * `holding` - The player's two hole cards
+    ///
+    /// # Returns
+    /// A `HandStrength` with EHS, `PPot`, `NPot`, and EHS2.
+    #[must_use]
+    pub fn calculate_turn(&self, board: &[Card], holding: (Card, Card)) -> HandStrength {
+        let (h1, h2) = holding;
+
+        // Build set of dead cards
+        let mut dead: HashSet<Card> = HashSet::new();
+        dead.insert(h1);
+        dead.insert(h2);
+        for &card in board {
+            dead.insert(card);
+        }
+
+        // Get all non-dead cards for iteration
+        let deck: Vec<Card> = all_cards().filter(|c| !dead.contains(c)).collect();
+
+        // Counters for EHS
+        let mut total_ahead = 0u64;
+        let mut total_tied = 0u64;
+        let mut total_behind = 0u64;
+
+        // Counters for potential
+        let mut ahead_stays_ahead = 0u64;
+        let mut ahead_falls_behind = 0u64;
+        let mut behind_moves_ahead = 0u64;
+        let mut behind_stays_behind = 0u64;
+
+        // Build our turn hand once
+        let mut our_turn: Vec<Card> = board.to_vec();
+        our_turn.push(h1);
+        our_turn.push(h2);
+
+        // Enumerate all opponent holdings
+        for (i, &opp1) in deck.iter().enumerate() {
+            for &opp2 in deck.iter().skip(i + 1) {
+                // Build opponent's turn hand
+                let mut opp_turn: Vec<Card> = board.to_vec();
+                opp_turn.push(opp1);
+                opp_turn.push(opp2);
+
+                // Current hand comparison (on turn - 6 cards each)
+                let our_turn_rank = Hand::new_with_cards(our_turn.clone()).rank();
+                let opp_turn_rank = Hand::new_with_cards(opp_turn.clone()).rank();
+
+                let currently_ahead = our_turn_rank > opp_turn_rank;
+                let currently_behind = our_turn_rank < opp_turn_rank;
+
+                if currently_ahead {
+                    total_ahead += 1;
+                } else if currently_behind {
+                    total_behind += 1;
+                } else {
+                    total_tied += 1;
+                }
+
+                // Pre-allocate space for river card to avoid reallocation
+                our_turn.reserve(1);
+                opp_turn.reserve(1);
+
+                // Enumerate river cards
+                for &river in &deck {
+                    if river == opp1 || river == opp2 {
+                        continue;
+                    }
+
+                    // Add river card, rank hand, then remove - avoids cloning base vectors
+                    our_turn.push(river);
+                    let our_river_rank = Hand::new_with_cards(our_turn.clone()).rank();
+                    our_turn.pop();
+
+                    opp_turn.push(river);
+                    let opp_river_rank = Hand::new_with_cards(opp_turn.clone()).rank();
+                    opp_turn.pop();
+
+                    let finally_ahead = our_river_rank > opp_river_rank;
+
+                    if currently_ahead {
+                        if finally_ahead || our_river_rank == opp_river_rank {
+                            ahead_stays_ahead += 1;
+                        } else {
+                            ahead_falls_behind += 1;
+                        }
+                    } else if currently_behind {
+                        if finally_ahead || our_river_rank == opp_river_rank {
+                            behind_moves_ahead += 1;
+                        } else {
+                            behind_stays_behind += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let total = total_ahead + total_tied + total_behind;
+        #[allow(clippy::cast_precision_loss)]
+        let ehs = if total > 0 {
+            (total_ahead as f32 + total_tied as f32 / 2.0) / total as f32
+        } else {
+            0.5
+        };
+
+        let ppot = if total_behind > 0 {
+            let behind_outcomes = behind_moves_ahead + behind_stays_behind;
+            if behind_outcomes > 0 {
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    behind_moves_ahead as f32 / behind_outcomes as f32
+                }
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let npot = if total_ahead > 0 {
+            let ahead_outcomes = ahead_stays_ahead + ahead_falls_behind;
+            if ahead_outcomes > 0 {
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    ahead_falls_behind as f32 / ahead_outcomes as f32
+                }
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        HandStrength::new(ehs, ppot, npot)
+    }
+
     /// Calculate EHS on the river using exhaustive enumeration.
     ///
     /// Enumerates all possible opponent holdings and calculates the probability
@@ -344,5 +486,53 @@ mod tests {
         let hs = calc.calculate_river(&board, holding);
         // Just check it computed something valid
         assert!(hs.ehs >= 0.0 && hs.ehs <= 1.0);
+    }
+
+    #[test]
+    fn turn_ehs2_flush_draw_higher_than_ehs() {
+        // Flush draw: As 5s on 2s 8s Tc Qd (4 to flush on turn)
+        let board = vec![
+            Card::new(Value::Two, Suit::Spade),
+            Card::new(Value::Eight, Suit::Spade),
+            Card::new(Value::Ten, Suit::Club),
+            Card::new(Value::Queen, Suit::Diamond),
+        ];
+        let holding = (
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::Five, Suit::Spade),
+        );
+
+        let calc = HandStrengthCalculator::new();
+        let hs = calc.calculate_turn(&board, holding);
+
+        // Flush draw should have positive potential
+        assert!(hs.ppot > 0.1, "Expected PPot > 0.1, got {}", hs.ppot);
+        assert!(
+            hs.ehs2 > hs.ehs,
+            "Expected EHS2 > EHS for flush draw, got EHS2={}, EHS={}",
+            hs.ehs2,
+            hs.ehs
+        );
+    }
+
+    #[test]
+    fn turn_ehs2_made_hand_npot() {
+        // Top pair on draw-heavy board: Ah Kc on As 8s 7s 2d
+        let board = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::Eight, Suit::Spade),
+            Card::new(Value::Seven, Suit::Spade),
+            Card::new(Value::Two, Suit::Diamond),
+        ];
+        let holding = (
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Club),
+        );
+
+        let calc = HandStrengthCalculator::new();
+        let hs = calc.calculate_turn(&board, holding);
+
+        // Made hand on flush board should have negative potential
+        assert!(hs.npot > 0.05, "Expected NPot > 0.05, got {}", hs.npot);
     }
 }
