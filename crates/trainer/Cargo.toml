@@ -1,0 +1,13 @@
+[package]
+name = "poker-solver-trainer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI tool for training poker blueprint strategies"
+
+[dependencies]
+poker-solver-core = { path = "../core" }
+clap = { version = "4", features = ["derive"] }
+serde.workspace = true
+serde_yaml.workspace = true

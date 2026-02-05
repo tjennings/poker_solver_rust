@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/tauri-app"]
+members = ["crates/core", "crates/tauri-app", "crates/trainer", "crates/test-macros"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,5 +16,11 @@ serde_yaml = "0.9"
 # Poker domain types
 rs_poker = { version = "4.1", default-features = false }
 
-# GPU/ML backend - use burn with feature flags
-burn = { version = "0.16", default-features = false }
+# Stack-allocated collections
+arrayvec = "0.7"
+
+# Fast hash for short string keys
+rustc-hash = "2.1"
+
+# Data parallelism
+rayon = "1.10"

@@ -28,6 +28,13 @@ pub struct MccfrSolver<G: Game> {
     rng_state: u64,
     /// Total iterations completed
     iterations: u64,
+    /// Number of early iterations to discount (CFR+ optimization).
+    /// Iterations before this threshold use sqrt(t)/(sqrt(t)+1) weighting.
+    discount_iterations: u64,
+    /// Skip strategy accumulation until this iteration count.
+    /// Implements the paper's recommendation to ignore the first ~50% of
+    /// iterations for average strategy computation.
+    skip_strategy_until: u64,
 }
 
 /// Configuration for MCCFR training.
@@ -66,6 +73,8 @@ impl<G: Game> MccfrSolver<G> {
             use_cfr_plus: true,
             rng_state: 0x1234_5678_9ABC_DEF0,
             iterations: 0,
+            discount_iterations: 30,
+            skip_strategy_until: 0,
         }
     }
 
@@ -79,7 +88,14 @@ impl<G: Game> MccfrSolver<G> {
             use_cfr_plus: config.use_cfr_plus,
             rng_state: 0x1234_5678_9ABC_DEF0,
             iterations: 0,
+            discount_iterations: config.discount_iterations.unwrap_or(0),
+            skip_strategy_until: config.skip_first_iterations.unwrap_or(0),
         }
+    }
+
+    /// Set RNG seed for reproducible sampling.
+    pub fn set_seed(&mut self, seed: u64) {
+        self.rng_state = if seed == 0 { 1 } else { seed };
     }
 
     /// Train using chance sampling MCCFR.
@@ -94,9 +110,12 @@ impl<G: Game> MccfrSolver<G> {
             return;
         }
 
-        for iter in 0..iterations {
+        let skip_until = self.skip_strategy_until;
+
+        for _ in 0..iterations {
             // Compute discount factor for CFR+ early iteration discounting
-            let discount = self.compute_discount(iter);
+            let discount = self.compute_discount();
+            let accumulate = self.iterations >= skip_until;
 
             // Sample initial states
             for _ in 0..samples_per_iter {
@@ -114,8 +133,8 @@ impl<G: Game> MccfrSolver<G> {
                 let sample_weight = num_states as f64 / samples_per_iter as f64;
 
                 // Traverse for both players
-                self.cfr_traverse(state, Player::Player1, 1.0, 1.0, sample_weight, discount);
-                self.cfr_traverse(state, Player::Player2, 1.0, 1.0, sample_weight, discount);
+                self.cfr_traverse(state, Player::Player1, 1.0, 1.0, sample_weight, discount, accumulate);
+                self.cfr_traverse(state, Player::Player2, 1.0, 1.0, sample_weight, discount, accumulate);
             }
 
             self.iterations += 1;
@@ -127,13 +146,15 @@ impl<G: Game> MccfrSolver<G> {
     /// This is equivalent to vanilla CFR but can be faster due to CFR+ optimizations.
     pub fn train_full(&mut self, iterations: u64) {
         let initial_states = self.game.initial_states();
+        let skip_until = self.skip_strategy_until;
 
-        for iter in 0..iterations {
-            let discount = self.compute_discount(iter);
+        for _ in 0..iterations {
+            let discount = self.compute_discount();
+            let accumulate = self.iterations >= skip_until;
 
             for state in &initial_states {
-                self.cfr_traverse(state, Player::Player1, 1.0, 1.0, 1.0, discount);
-                self.cfr_traverse(state, Player::Player2, 1.0, 1.0, 1.0, discount);
+                self.cfr_traverse(state, Player::Player1, 1.0, 1.0, 1.0, discount, accumulate);
+                self.cfr_traverse(state, Player::Player2, 1.0, 1.0, 1.0, discount, accumulate);
             }
 
             self.iterations += 1;
@@ -141,11 +162,10 @@ impl<G: Game> MccfrSolver<G> {
     }
 
     /// Compute discount factor for early iterations (CFR+ optimization).
-    #[allow(clippy::unused_self)] // May access config in future
-    fn compute_discount(&self, iter: u64) -> f64 {
-        if iter < 30 {
+    fn compute_discount(&self) -> f64 {
+        if self.iterations < self.discount_iterations {
             #[allow(clippy::cast_precision_loss)]
-            let t = (iter + 1) as f64;
+            let t = (self.iterations + 1) as f64;
             t.sqrt() / (t.sqrt() + 1.0)
         } else {
             1.0
@@ -195,6 +215,7 @@ impl<G: Game> MccfrSolver<G> {
     }
 
     /// Core CFR traversal function.
+    #[allow(clippy::too_many_arguments)]
     fn cfr_traverse(
         &mut self,
         state: &G::State,
@@ -203,6 +224,7 @@ impl<G: Game> MccfrSolver<G> {
         p2_reach: f64,
         sample_weight: f64,
         discount: f64,
+        accumulate_strategy: bool,
     ) -> f64 {
         if self.game.is_terminal(state) {
             return self.game.utility(state, traversing_player);
@@ -234,6 +256,7 @@ impl<G: Game> MccfrSolver<G> {
                 new_p2_reach,
                 sample_weight,
                 discount,
+                accumulate_strategy,
             );
         }
 
@@ -267,18 +290,21 @@ impl<G: Game> MccfrSolver<G> {
                 }
             }
 
-            let my_reach = match current_player {
-                Player::Player1 => p1_reach,
-                Player::Player2 => p2_reach,
-            };
+            // Only accumulate strategy after skip threshold
+            if accumulate_strategy {
+                let my_reach = match current_player {
+                    Player::Player1 => p1_reach,
+                    Player::Player2 => p2_reach,
+                };
 
-            let strat_sums = self
-                .strategy_sum
-                .entry(info_set)
-                .or_insert_with(|| vec![0.0; num_actions]);
+                let strat_sums = self
+                    .strategy_sum
+                    .entry(info_set)
+                    .or_insert_with(|| vec![0.0; num_actions]);
 
-            for i in 0..num_actions {
-                strat_sums[i] += my_reach * strategy[i] * sample_weight * discount;
+                for i in 0..num_actions {
+                    strat_sums[i] += my_reach * strategy[i] * sample_weight * discount;
+                }
             }
         }
 
@@ -290,9 +316,11 @@ impl<G: Game> MccfrSolver<G> {
 mod tests {
     use super::*;
     use crate::game::KuhnPoker;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn mccfr_initializes_empty() {
+
         let game = KuhnPoker::new();
         let solver = MccfrSolver::new(game);
 
@@ -301,8 +329,9 @@ mod tests {
         assert_eq!(solver.iterations(), 0);
     }
 
-    #[test]
+    #[timed_test]
     fn mccfr_training_populates_info_sets() {
+
         let game = KuhnPoker::new();
         let mut solver = MccfrSolver::new(game);
 
@@ -313,14 +342,15 @@ mod tests {
         assert!(solver.iterations() > 0);
     }
 
-    #[test]
+    #[timed_test]
     fn mccfr_strategy_sums_to_one() {
+
         let game = KuhnPoker::new();
         let mut solver = MccfrSolver::new(game);
 
         solver.train(100, 10);
 
-        for (info_set, _) in &solver.strategy_sum {
+        for info_set in solver.strategy_sum.keys() {
             if let Some(strategy) = solver.get_average_strategy(info_set) {
                 let sum: f64 = strategy.iter().sum();
                 assert!(
@@ -331,8 +361,9 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test]
     fn mccfr_converges_on_kuhn() {
+
         let game = KuhnPoker::new();
         let mut solver = MccfrSolver::new(game);
 
@@ -343,8 +374,7 @@ mod tests {
         if let Some(strategy) = solver.get_average_strategy("Kb") {
             assert!(
                 strategy[1] > 0.99,
-                "King should always call a bet, got {:?}",
-                strategy
+                "King should always call a bet, got {strategy:?}"
             );
         }
 
@@ -352,14 +382,14 @@ mod tests {
         if let Some(strategy) = solver.get_average_strategy("Jb") {
             assert!(
                 strategy[0] > 0.99,
-                "Jack should always fold when facing a bet, got {:?}",
-                strategy
+                "Jack should always fold when facing a bet, got {strategy:?}"
             );
         }
     }
 
-    #[test]
+    #[timed_test]
     fn mccfr_sampling_much_faster_than_full() {
+
         use std::time::Instant;
 
         let game = KuhnPoker::new();
@@ -381,11 +411,12 @@ mod tests {
         assert!(solver_full.iterations() == 100);
         assert!(solver_sampled.iterations() == 100);
 
-        println!("Full: {:?}, Sampled: {:?}", time_full, time_sampled);
+        println!("Full: {time_full:?}, Sampled: {time_sampled:?}");
     }
 
-    #[test]
+    #[timed_test]
     fn cfr_plus_floors_negative_regrets() {
+
         let game = KuhnPoker::new();
         let mut solver = MccfrSolver::new(game);
 
@@ -397,5 +428,98 @@ mod tests {
                 assert!(r >= 0.0, "CFR+ should floor regrets at 0, got {r}");
             }
         }
+    }
+
+    #[timed_test]
+    fn set_seed_produces_deterministic_results() {
+        let game = KuhnPoker::new();
+
+        let mut solver1 = MccfrSolver::new(game.clone());
+        solver1.set_seed(42);
+        solver1.train(50, 3);
+        let strats1 = solver1.all_strategies();
+
+        let mut solver2 = MccfrSolver::new(game);
+        solver2.set_seed(42);
+        solver2.train(50, 3);
+        let strats2 = solver2.all_strategies();
+
+        // Same seed → same strategies
+        assert_eq!(strats1.len(), strats2.len());
+        for (key, probs1) in &strats1 {
+            let probs2 = strats2.get(key).expect("same info sets");
+            for (p1, p2) in probs1.iter().zip(probs2.iter()) {
+                assert!(
+                    (p1 - p2).abs() < 1e-10,
+                    "Strategies should be identical with same seed: {p1} vs {p2}"
+                );
+            }
+        }
+    }
+
+    #[timed_test]
+    fn set_seed_zero_becomes_one() {
+        let game = KuhnPoker::new();
+        let mut solver = MccfrSolver::new(game);
+        solver.set_seed(0);
+        assert_eq!(solver.rng_state, 1, "Seed 0 should be mapped to 1");
+    }
+
+    #[timed_test]
+    fn skip_first_iterations_delays_accumulation() {
+        let game = KuhnPoker::new();
+
+        // With skip=50, the first 50 iterations should NOT accumulate strategy
+        let config = MccfrConfig {
+            use_cfr_plus: true,
+            skip_first_iterations: Some(50),
+            ..MccfrConfig::default()
+        };
+        let mut solver = MccfrSolver::with_config(game.clone(), &config);
+        solver.train_full(49);
+
+        // After 49 iterations (all < 50), strategy_sum should be empty
+        assert!(
+            solver.strategy_sum.is_empty(),
+            "Strategy sum should be empty when all iterations are skipped, got {} entries",
+            solver.strategy_sum.len()
+        );
+
+        // Train 1 more iteration (iter 49 is >= 50? No, 0-indexed: iter 49 is the 50th)
+        // After 50 total iterations, the 50th call (iteration index 49) should NOT accumulate
+        // because iterations is checked BEFORE incrementing
+        // Let's train to 51 to be sure we get at least one accumulation
+        solver.train_full(2);
+
+        // Now we should have accumulated for iteration 50
+        assert!(
+            !solver.strategy_sum.is_empty(),
+            "Strategy sum should be non-empty after passing skip threshold"
+        );
+    }
+
+    #[timed_test]
+    fn discount_iterations_from_config() {
+        let config = MccfrConfig {
+            discount_iterations: Some(100),
+            use_cfr_plus: true,
+            ..MccfrConfig::default()
+        };
+        let game = KuhnPoker::new();
+        let solver = MccfrSolver::with_config(game, &config);
+
+        assert_eq!(solver.discount_iterations, 100);
+    }
+
+    #[timed_test]
+    fn discount_iterations_none_means_zero() {
+        let config = MccfrConfig {
+            discount_iterations: None,
+            ..MccfrConfig::default()
+        };
+        let game = KuhnPoker::new();
+        let solver = MccfrSolver::with_config(game, &config);
+
+        assert_eq!(solver.discount_iterations, 0);
     }
 }

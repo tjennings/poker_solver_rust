@@ -7,8 +7,8 @@
 //!
 //! # Modules
 //!
-//! - `game` - Game trait and implementations (Kuhn Poker, HUNL Preflop)
-//! - `cfr` - CFR solver implementations (Vanilla, Batched)
+//! - `game` - Game trait and implementations (Kuhn Poker, HUNL Postflop)
+//! - `cfr` - CFR solver implementations (Vanilla, MCCFR)
 //! - `error` - Error types
 //! - `poker` - Re-exported poker domain types from `rs_poker`
 
@@ -16,8 +16,6 @@ pub mod abstraction;
 pub mod blueprint;
 pub mod cfr;
 pub mod config;
-#[cfg(feature = "gpu")]
-pub mod device;
 pub mod equity;
 pub mod error;
 pub mod game;

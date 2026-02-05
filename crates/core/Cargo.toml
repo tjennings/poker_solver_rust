@@ -9,26 +9,20 @@ description = "CFR poker solver core library"
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+arrayvec.workspace = true
+rustc-hash.workspace = true
+rayon.workspace = true
 serde_yaml.workspace = true
 rs_poker.workspace = true
 
-# Burn with feature flags for different backends
-burn = { workspace = true, optional = true, features = ["ndarray", "wgpu"] }
 rmp-serde = "1.3.1"
 rand = "0.9.2"
 lru = "0.12"
 sled = "0.34"
 bincode = "1.3"
+indicatif = "0.17"
 
 [dev-dependencies]
 proptest = "1.4"
-criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.24.0"
-
-[[bench]]
-name = "tensor_ops"
-harness = false
-
-[features]
-default = []
-gpu = ["burn"]
+test-macros = { path = "../test-macros" }
