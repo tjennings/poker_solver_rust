@@ -1,0 +1,13 @@
+game:
+  stack_depth: 20
+  bet_sizes: [0.5, 1.0]
+  samples_per_iteration: 169
+abstraction:
+  flop_buckets: 50
+  turn_buckets: 50
+  river_buckets: 100
+  samples_per_street: 1000
+training:
+  iterations: 1000
+  seed: 42
+  output_dir: "./test_strategy"

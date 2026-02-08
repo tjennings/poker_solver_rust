@@ -92,9 +92,11 @@ impl BucketAssigner {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_precision_loss)]
     use super::*;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn percentile_boundaries_uniform_distribution() {
         let mut samples: Vec<f32> = (0..100).map(|i| i as f32 / 100.0).collect();
         let boundaries = compute_percentile_boundaries(&mut samples, 10);
@@ -107,15 +109,12 @@ mod tests {
             let expected = (i + 1) as f32 / 10.0;
             assert!(
                 (b - expected).abs() < 0.02,
-                "Boundary {} expected ~{}, got {}",
-                i,
-                expected,
-                b
+                "Boundary {i} expected ~{expected}, got {b}"
             );
         }
     }
 
-    #[test]
+    #[timed_test]
     fn bucket_assignment_correct() {
         let mut samples: Vec<f32> = (0..100).map(|i| i as f32 / 100.0).collect();
         let boundaries = BucketBoundaries {
@@ -135,7 +134,7 @@ mod tests {
         assert_eq!(assigner.get_bucket(Street::Flop, 0.95), 9);
     }
 
-    #[test]
+    #[timed_test]
     fn extreme_values_boundary_buckets() {
         let boundaries = BucketBoundaries {
             flop: vec![0.2, 0.4, 0.6, 0.8],
@@ -151,7 +150,7 @@ mod tests {
         assert_eq!(assigner.get_bucket(Street::River, 1.0), 4);
     }
 
-    #[test]
+    #[timed_test]
     fn num_buckets_correct() {
         let boundaries = BucketBoundaries {
             flop: vec![0.25, 0.5, 0.75], // 4 buckets

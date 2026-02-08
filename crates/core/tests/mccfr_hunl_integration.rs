@@ -14,6 +14,7 @@ fn mccfr_hunl_postflop_full_game() {
         stack_depth: 10,
         bet_sizes: vec![1.0],
         samples_per_iteration: 500,
+        ..PostflopConfig::default()
     };
     let game = HunlPostflop::new(config, None);
 
@@ -62,6 +63,7 @@ fn mccfr_exploitability_decreases_with_training() {
         stack_depth: 10,
         bet_sizes: vec![1.0],
         samples_per_iteration: 100,
+        ..PostflopConfig::default()
     };
     // Create separate game instances for solver and exploitability calculation
     let eval_game = HunlPostflop::new(config.clone(), None);
@@ -79,9 +81,7 @@ fn mccfr_exploitability_decreases_with_training() {
     let late_strategies = solver.all_strategies();
     let late_exploitability = calculate_exploitability(&eval_game, &late_strategies);
 
-    println!(
-        "Exploitability: early={early_exploitability:.4}, late={late_exploitability:.4}"
-    );
+    println!("Exploitability: early={early_exploitability:.4}, late={late_exploitability:.4}");
 
     // Late exploitability should be lower (or at least not drastically worse)
     // We use a generous bound since MCCFR is stochastic
@@ -100,6 +100,7 @@ fn mccfr_blueprint_pipeline() {
         stack_depth: 10,
         bet_sizes: vec![1.0],
         samples_per_iteration: 100,
+        ..PostflopConfig::default()
     };
     let game = HunlPostflop::new(config, None);
     let mut solver = MccfrSolver::new(game);
@@ -109,10 +110,7 @@ fn mccfr_blueprint_pipeline() {
     let strategies = solver.all_strategies();
     let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
 
-    assert!(
-        !blueprint.is_empty(),
-        "Blueprint should contain strategies"
-    );
+    assert!(!blueprint.is_empty(), "Blueprint should contain strategies");
     assert_eq!(blueprint.iterations_trained(), 50);
 
     // Verify save/load roundtrip

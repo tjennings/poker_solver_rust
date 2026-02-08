@@ -256,7 +256,9 @@ fn action_to_char(action: Action) -> char {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::items_after_statements)]
     use super::*;
+    use test_macros::timed_test;
 
     fn create_test_blueprint() -> Arc<BlueprintStrategy> {
         let mut strategy = BlueprintStrategy::new();
@@ -265,7 +267,7 @@ mod tests {
         Arc::new(strategy)
     }
 
-    #[test]
+    #[timed_test]
     fn subgame_config_default() {
         let config = SubgameConfig::default();
 
@@ -280,7 +282,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn subgame_solver_creates() {
         let blueprint = create_test_blueprint();
         let config = SubgameConfig::default();
@@ -297,7 +299,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn subgame_solver_returns_cached() {
         let blueprint = create_test_blueprint();
         let config = SubgameConfig::default();
@@ -334,7 +336,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn subgame_solver_falls_back_to_blueprint() {
         let blueprint = create_test_blueprint();
         let config = SubgameConfig::default();
@@ -360,7 +362,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn subgame_solver_returns_info_set_not_found() {
         let blueprint = create_test_blueprint();
         let config = SubgameConfig::default();
@@ -383,15 +385,14 @@ mod tests {
             Err(BlueprintError::InfoSetNotFound(key)) => {
                 assert!(
                     key.contains("23"),
-                    "error should contain the info set key: {}",
-                    key
+                    "error should contain the info set key: {key}"
                 );
             }
-            other => panic!("expected InfoSetNotFound error, got {:?}", other),
+            other => panic!("expected InfoSetNotFound error, got {other:?}"),
         }
     }
 
-    #[test]
+    #[timed_test]
     fn make_info_set_key_preflop_format() {
         let blueprint = create_test_blueprint();
         let config = SubgameConfig::default();
@@ -413,7 +414,7 @@ mod tests {
         assert_eq!(key, "AK|P|", "preflop key should be AK|P|");
     }
 
-    #[test]
+    #[timed_test]
     fn make_info_set_key_with_history() {
         let blueprint = create_test_blueprint();
         let config = SubgameConfig::default();
@@ -438,7 +439,7 @@ mod tests {
         assert_eq!(key, "AK|P|rc", "key with history should include actions");
     }
 
-    #[test]
+    #[timed_test]
     fn make_cache_key_is_deterministic() {
         let blueprint = create_test_blueprint();
         let config = SubgameConfig::default();

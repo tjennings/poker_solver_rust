@@ -290,8 +290,9 @@ pub fn prewarm_cache() -> usize {
 mod tests {
     use super::*;
     use crate::hands::CanonicalHand;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn aa_beats_kk_most_of_time() {
         let aa = CanonicalHand::parse("AA").unwrap();
         let kk = CanonicalHand::parse("KK").unwrap();
@@ -303,7 +304,7 @@ mod tests {
         assert!(eq < 0.90, "AA equity vs KK: {eq}");
     }
 
-    #[test]
+    #[timed_test]
     fn aks_vs_qjo_is_reasonable() {
         let aks = CanonicalHand::parse("AKs").unwrap();
         let qjo = CanonicalHand::parse("QJo").unwrap();
@@ -315,7 +316,7 @@ mod tests {
         assert!(eq < 0.75, "AKs equity vs QJo: {eq}");
     }
 
-    #[test]
+    #[timed_test]
     fn equity_is_symmetric() {
         let ak = CanonicalHand::parse("AKs").unwrap();
         let qj = CanonicalHand::parse("QJs").unwrap();
@@ -331,7 +332,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn coinflip_hands_are_close() {
         // AKo vs 22 is approximately a coinflip
         let ako = CanonicalHand::parse("AKo").unwrap();
@@ -344,7 +345,7 @@ mod tests {
         assert!(eq < 0.60, "AKo equity vs 22: {eq}");
     }
 
-    #[test]
+    #[timed_test]
     fn cache_stores_values() {
         clear_cache();
 
@@ -358,7 +359,7 @@ mod tests {
         assert!(cache_size() >= 2);
     }
 
-    #[test]
+    #[timed_test]
     fn dominated_hand_loses() {
         // A2o vs AKs - A2 is dominated
         let a2o = CanonicalHand::parse("A2o").unwrap();

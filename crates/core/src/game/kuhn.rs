@@ -1,4 +1,4 @@
-use super::{Action, Game, Player};
+use super::{Action, Actions, Game, Player};
 
 /// Kuhn Poker - a simplified poker game with 3 cards (J, Q, K) and 2 players.
 ///
@@ -110,16 +110,22 @@ impl Game for KuhnPoker {
         }
     }
 
-    fn actions(&self, state: &Self::State) -> Vec<Action> {
+    fn actions(&self, state: &Self::State) -> Actions {
+        let mut actions = Actions::new();
         match state.history.as_slice() {
             // No bet yet: can check or bet
-            [] | [KuhnAction::Check] => vec![Action::Check, Action::Bet(1)],
+            [] | [KuhnAction::Check] => {
+                actions.push(Action::Check);
+                actions.push(Action::Bet(1));
+            }
             // Facing a bet: can fold or call
             [KuhnAction::Bet] | [KuhnAction::Check, KuhnAction::Bet] => {
-                vec![Action::Fold, Action::Call]
+                actions.push(Action::Fold);
+                actions.push(Action::Call);
             }
-            _ => vec![],
+            _ => {}
         }
+        actions
     }
 
     fn next_state(&self, state: &Self::State, action: Action) -> Self::State {
@@ -223,9 +229,11 @@ fn contribution(state: &KuhnState, player: Player) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn initial_states_returns_six_deals() {
         let game = KuhnPoker::new();
         let states = game.initial_states();
@@ -245,7 +253,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test]
     fn initial_pot_is_two() {
         let game = KuhnPoker::new();
         for state in game.initial_states() {
@@ -255,7 +263,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test]
     fn terminal_after_check_check() {
         let game = KuhnPoker::new();
         let mut state = game.initial_states().remove(0);
@@ -269,7 +277,7 @@ mod tests {
         assert!(game.is_terminal(&state));
     }
 
-    #[test]
+    #[timed_test]
     fn terminal_after_bet_fold() {
         let game = KuhnPoker::new();
         let mut state = game.initial_states().remove(0);
@@ -281,7 +289,7 @@ mod tests {
         assert!(game.is_terminal(&state));
     }
 
-    #[test]
+    #[timed_test]
     fn terminal_after_bet_call() {
         let game = KuhnPoker::new();
         let mut state = game.initial_states().remove(0);
@@ -291,7 +299,7 @@ mod tests {
         assert!(game.is_terminal(&state));
     }
 
-    #[test]
+    #[timed_test]
     fn terminal_after_check_bet_fold() {
         let game = KuhnPoker::new();
         let mut state = game.initial_states().remove(0);
@@ -302,7 +310,7 @@ mod tests {
         assert!(game.is_terminal(&state));
     }
 
-    #[test]
+    #[timed_test]
     fn terminal_after_check_bet_call() {
         let game = KuhnPoker::new();
         let mut state = game.initial_states().remove(0);
@@ -313,7 +321,7 @@ mod tests {
         assert!(game.is_terminal(&state));
     }
 
-    #[test]
+    #[timed_test]
     fn bet_fold_gives_pot_to_bettor() {
         let game = KuhnPoker::new();
         // Find a deal where P1 has Jack (weakest)
@@ -332,7 +340,7 @@ mod tests {
         assert_eq!(game.utility(&state, Player::Player2), -1.0);
     }
 
-    #[test]
+    #[timed_test]
     fn check_bet_fold_gives_pot_to_bettor() {
         let game = KuhnPoker::new();
         let mut state = game.initial_states().remove(0);
@@ -347,7 +355,7 @@ mod tests {
         assert_eq!(game.utility(&state, Player::Player1), -1.0);
     }
 
-    #[test]
+    #[timed_test]
     fn showdown_higher_card_wins() {
         let game = KuhnPoker::new();
         // King vs Jack: King wins
@@ -366,7 +374,7 @@ mod tests {
         assert_eq!(game.utility(&state, Player::Player2), -1.0);
     }
 
-    #[test]
+    #[timed_test]
     fn bet_call_showdown_higher_card_wins() {
         let game = KuhnPoker::new();
         // King vs Queen: King wins
@@ -385,7 +393,7 @@ mod tests {
         assert_eq!(game.utility(&state, Player::Player2), -2.0);
     }
 
-    #[test]
+    #[timed_test]
     fn info_set_key_includes_card_and_history() {
         let game = KuhnPoker::new();
         let mut state = game
@@ -406,7 +414,7 @@ mod tests {
         assert_eq!(game.info_set_key(&state), "Kcb");
     }
 
-    #[test]
+    #[timed_test]
     fn player_alternates_correctly() {
         let game = KuhnPoker::new();
         let mut state = game.initial_states().remove(0);
@@ -420,24 +428,33 @@ mod tests {
         assert_eq!(game.player(&state), Player::Player1);
     }
 
-    #[test]
+    #[timed_test]
     fn actions_correct_at_each_decision() {
         let game = KuhnPoker::new();
         let mut state = game.initial_states().remove(0);
 
         // P1 opens
-        assert_eq!(game.actions(&state), vec![Action::Check, Action::Bet(1)]);
+        assert_eq!(
+            game.actions(&state).as_slice(),
+            &[Action::Check, Action::Bet(1)]
+        );
 
         state = game.next_state(&state, Action::Check);
         // P2 after check
-        assert_eq!(game.actions(&state), vec![Action::Check, Action::Bet(1)]);
+        assert_eq!(
+            game.actions(&state).as_slice(),
+            &[Action::Check, Action::Bet(1)]
+        );
 
         state = game.next_state(&state, Action::Bet(1));
         // P1 facing bet
-        assert_eq!(game.actions(&state), vec![Action::Fold, Action::Call]);
+        assert_eq!(
+            game.actions(&state).as_slice(),
+            &[Action::Fold, Action::Call]
+        );
     }
 
-    #[test]
+    #[timed_test]
     fn pot_updates_correctly() {
         let game = KuhnPoker::new();
         let mut state = game.initial_states().remove(0);

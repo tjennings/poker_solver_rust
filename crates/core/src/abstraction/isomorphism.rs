@@ -187,8 +187,9 @@ impl CanonicalBoard {
 mod tests {
     use super::*;
     use crate::poker::Value;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn identity_mapping_preserves_suits() {
         let mapping = SuitMapping::identity();
         assert_eq!(mapping.map_suit(Suit::Spade), Suit::Spade);
@@ -197,7 +198,7 @@ mod tests {
         assert_eq!(mapping.map_suit(Suit::Club), Suit::Club);
     }
 
-    #[test]
+    #[timed_test]
     fn identity_mapping_preserves_cards() {
         let mapping = SuitMapping::identity();
         let card = Card::new(Value::Ace, Suit::Heart);
@@ -206,7 +207,7 @@ mod tests {
         assert_eq!(mapped.suit, Suit::Heart);
     }
 
-    #[test]
+    #[timed_test]
     fn canonicalize_rainbow_flop_orders_by_highest_card() {
         // Ah Kd 7c -> all different suits, order by highest card per suit
         let board = vec![
@@ -223,7 +224,7 @@ mod tests {
         assert_eq!(canonical.cards[2], Card::new(Value::Seven, Suit::Diamond));
     }
 
-    #[test]
+    #[timed_test]
     fn canonicalize_monotone_flop() {
         // All hearts: Ah Kh 7h
         let board = vec![
@@ -240,7 +241,7 @@ mod tests {
         assert_eq!(canonical.cards[2].suit, Suit::Spade);
     }
 
-    #[test]
+    #[timed_test]
     fn canonicalize_two_tone_flop() {
         // Ah Kh 7c - two hearts, one club
         let board = vec![
@@ -256,7 +257,7 @@ mod tests {
         assert_eq!(canonical.cards[2], Card::new(Value::Seven, Suit::Heart));
     }
 
-    #[test]
+    #[timed_test]
     fn isomorphic_boards_same_canonical() {
         // Ah Kd 7c and As Kh 7d should produce same canonical form
         let board1 = vec![
@@ -276,7 +277,7 @@ mod tests {
         assert_eq!(canonical1.cards, canonical2.cards);
     }
 
-    #[test]
+    #[timed_test]
     fn holding_mapped_consistently_with_board() {
         let board = vec![
             Card::new(Value::Ace, Suit::Heart),

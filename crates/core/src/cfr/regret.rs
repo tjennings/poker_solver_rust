@@ -21,8 +21,9 @@ pub fn regret_match(regrets: &[f64]) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn positive_regrets_normalized() {
         let regrets = vec![1.0, 2.0, 3.0];
         let strategy = regret_match(&regrets);
@@ -36,7 +37,7 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-10);
     }
 
-    #[test]
+    #[timed_test]
     fn mixed_regrets_ignore_negative() {
         let regrets = vec![-1.0, 2.0, 4.0];
         let strategy = regret_match(&regrets);
@@ -46,7 +47,7 @@ mod tests {
         assert!((strategy[2] - 4.0 / 6.0).abs() < 1e-10);
     }
 
-    #[test]
+    #[timed_test]
     fn all_non_positive_returns_uniform() {
         let regrets = vec![-1.0, -2.0, 0.0];
         let strategy = regret_match(&regrets);
@@ -57,7 +58,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test]
     fn all_zero_returns_uniform() {
         let regrets = vec![0.0, 0.0];
         let strategy = regret_match(&regrets);
@@ -66,7 +67,7 @@ mod tests {
         assert!((strategy[1] - 0.5).abs() < 1e-10);
     }
 
-    #[test]
+    #[timed_test]
     fn single_action_returns_one() {
         let regrets = vec![5.0];
         let strategy = regret_match(&regrets);

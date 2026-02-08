@@ -221,8 +221,9 @@ impl SubgameCache {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn cache_miss_returns_none() {
         let config = CacheConfig::default();
         let cache = SubgameCache::new(config).expect("cache creation should succeed");
@@ -233,7 +234,7 @@ mod tests {
         assert!(result.is_none(), "cache miss should return None");
     }
 
-    #[test]
+    #[timed_test]
     fn cache_insert_then_get() {
         let config = CacheConfig::default();
         let cache = SubgameCache::new(config).expect("cache creation should succeed");
@@ -249,7 +250,7 @@ mod tests {
         assert_eq!(result, Some(probs), "should retrieve inserted probs");
     }
 
-    #[test]
+    #[timed_test]
     fn cache_with_disk_persists() {
         let dir = tempdir().expect("tempdir creation should succeed");
         let db_path = dir.path().join("cache_db");
@@ -287,7 +288,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test]
     fn memory_len_tracks_entries() {
         let config = CacheConfig {
             max_memory_entries: 1000,
@@ -325,7 +326,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn clear_removes_all_entries() {
         let dir = tempdir().expect("tempdir creation should succeed");
         let db_path = dir.path().join("cache_db");
@@ -361,7 +362,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn subgame_key_to_bytes_is_deterministic() {
         let key1 = SubgameKey::new(100, 50, 200);
         let key2 = SubgameKey::new(100, 50, 200);
@@ -373,7 +374,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn zero_capacity_returns_error() {
         let config = CacheConfig {
             max_memory_entries: 0,
@@ -392,7 +393,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test]
     fn lru_eviction_works() {
         let config = CacheConfig {
             max_memory_entries: 2,
@@ -425,7 +426,7 @@ mod tests {
         assert!(cache.get(&key3).is_some(), "key3 should be present");
     }
 
-    #[test]
+    #[timed_test]
     fn disk_promotion_to_memory() {
         let dir = tempdir().expect("tempdir creation should succeed");
         let db_path = dir.path().join("cache_db");

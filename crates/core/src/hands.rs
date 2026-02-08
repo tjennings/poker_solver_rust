@@ -401,25 +401,28 @@ fn linear_index_to_hand_indices(linear_idx: usize) -> (usize, usize) {
 mod tests {
     use super::*;
     use crate::poker::Suit;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn test_all_hands_count() {
         assert_eq!(all_hands().count(), 169);
     }
 
-    #[test]
+    #[timed_test]
     fn test_pairs_count() {
-        let pairs: Vec<_> = all_hands().filter(|h| h.is_pair()).collect();
+        let pairs: Vec<_> = all_hands().filter(super::CanonicalHand::is_pair).collect();
         assert_eq!(pairs.len(), 13);
     }
 
-    #[test]
+    #[timed_test]
     fn test_suited_count() {
-        let suited: Vec<_> = all_hands().filter(|h| h.is_suited()).collect();
+        let suited: Vec<_> = all_hands()
+            .filter(super::CanonicalHand::is_suited)
+            .collect();
         assert_eq!(suited.len(), 78);
     }
 
-    #[test]
+    #[timed_test]
     fn test_offsuit_count() {
         let offsuit: Vec<_> = all_hands()
             .filter(|h| !h.is_pair() && !h.is_suited())
@@ -427,13 +430,13 @@ mod tests {
         assert_eq!(offsuit.len(), 78);
     }
 
-    #[test]
+    #[timed_test]
     fn test_total_combos() {
         let total: u32 = all_hands().map(|h| u32::from(h.num_combos())).sum();
         assert_eq!(total, 1326); // 52 choose 2
     }
 
-    #[test]
+    #[timed_test]
     fn test_parse_pairs() {
         let aa = CanonicalHand::parse("AA").unwrap();
         assert!(aa.is_pair());
@@ -445,7 +448,7 @@ mod tests {
         assert_eq!(twos.high_value(), Value::Two);
     }
 
-    #[test]
+    #[timed_test]
     fn test_parse_suited() {
         let aks = CanonicalHand::parse("AKs").unwrap();
         assert!(aks.is_suited());
@@ -454,7 +457,7 @@ mod tests {
         assert_eq!(aks.to_string(), "AKs");
     }
 
-    #[test]
+    #[timed_test]
     fn test_parse_offsuit() {
         let ako = CanonicalHand::parse("AKo").unwrap();
         assert!(!ako.is_suited());
@@ -462,23 +465,23 @@ mod tests {
         assert_eq!(ako.to_string(), "AKo");
     }
 
-    #[test]
+    #[timed_test]
     fn test_parse_reversed_order() {
         let ka = CanonicalHand::parse("KAs").unwrap();
         assert_eq!(ka.high_value(), Value::Ace);
         assert_eq!(ka.low_value(), Value::King);
     }
 
-    #[test]
+    #[timed_test]
     fn test_index_roundtrip() {
         for hand in all_hands() {
             let idx = hand.index();
             let recovered = CanonicalHand::from_index(idx).unwrap();
-            assert_eq!(hand, recovered, "Index {} failed roundtrip", idx);
+            assert_eq!(hand, recovered, "Index {idx} failed roundtrip");
         }
     }
 
-    #[test]
+    #[timed_test]
     fn test_matrix_position_roundtrip() {
         for hand in all_hands() {
             let (row, col) = hand.matrix_position();
@@ -487,7 +490,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test]
     fn test_matrix_diagonal_is_pairs() {
         for i in 0..13 {
             let hand = CanonicalHand::from_matrix_position(i, i).unwrap();
@@ -495,32 +498,30 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test]
     fn test_matrix_upper_triangle_is_suited() {
         for row in 0..13 {
             for col in (row + 1)..13 {
                 let hand = CanonicalHand::from_matrix_position(row, col).unwrap();
-                assert!(hand.is_suited(), "({}, {}) should be suited", row, col);
+                assert!(hand.is_suited(), "({row}, {col}) should be suited");
             }
         }
     }
 
-    #[test]
+    #[timed_test]
     fn test_matrix_lower_triangle_is_offsuit() {
         for row in 1..13 {
             for col in 0..row {
                 let hand = CanonicalHand::from_matrix_position(row, col).unwrap();
                 assert!(
                     !hand.is_pair() && !hand.is_suited(),
-                    "({}, {}) should be offsuit",
-                    row,
-                    col
+                    "({row}, {col}) should be offsuit"
                 );
             }
         }
     }
 
-    #[test]
+    #[timed_test]
     fn test_from_cards() {
         let ace_spades = Card::new(Value::Ace, Suit::Spade);
         let king_spades = Card::new(Value::King, Suit::Spade);
@@ -535,7 +536,7 @@ mod tests {
         assert_eq!(ako.to_string(), "AKo");
     }
 
-    #[test]
+    #[timed_test]
     fn test_num_combos() {
         assert_eq!(CanonicalHand::parse("AA").unwrap().num_combos(), 6);
         assert_eq!(CanonicalHand::parse("AKs").unwrap().num_combos(), 4);

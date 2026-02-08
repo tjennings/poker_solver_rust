@@ -127,6 +127,31 @@ Continue navigating through turn and river by entering additional cards.
 
 **History:** The action strip at the top shows the full history. Click any point to rewind.
 
+## Generating Flop Data
+
+Generate a reference dataset of all 1,755 strategically distinct (suit-isomorphic) flops with metadata (suit texture, rank texture, high card class, connectedness, weight):
+
+```bash
+./scripts/generate_flops.sh
+```
+
+This builds the trainer in release mode and writes both formats to `datasets/`:
+
+```
+datasets/
+├── flops.json    # Array of objects with full metadata
+└── flops.csv     # One row per canonical flop
+```
+
+You can also run the underlying command directly for a single format:
+
+```bash
+cargo run -p poker-solver-trainer --release -- flops --format json --output datasets/flops.json
+cargo run -p poker-solver-trainer --release -- flops --format csv --output datasets/flops.csv
+```
+
+Omit `--output` to print to stdout.
+
 ## Running Tests
 
 ```bash
@@ -151,6 +176,7 @@ poker_solver_rust/
 │   ├── trainer/           # CLI for running training
 │   ├── tauri-app/         # Tauri desktop app (strategy explorer backend)
 │   └── test-macros/       # #[timed_test] proc macro
+├── scripts/               # Data generation and utility scripts
 ├── frontend/              # React + TypeScript explorer UI
 └── docs/plans/            # Design documents
 ```

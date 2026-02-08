@@ -502,9 +502,11 @@ fn all_cards() -> impl Iterator<Item = Card> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn river_ehs2_equals_ehs() {
         let hs = HandStrength::river(0.75);
         assert_eq!(hs.ehs2, hs.ehs);
@@ -512,28 +514,28 @@ mod tests {
         assert_eq!(hs.npot, 0.0);
     }
 
-    #[test]
+    #[timed_test]
     fn ehs2_formula_correct() {
         let hs = HandStrength::new(0.5, 0.2, 0.1);
         // EHS2 = 0.5 + (1-0.5)*0.2 - 0.5*0.1 = 0.5 + 0.1 - 0.05 = 0.55
         assert!((hs.ehs2 - 0.55).abs() < 0.001);
     }
 
-    #[test]
+    #[timed_test]
     fn river_with_zero_ehs() {
         let hs = HandStrength::river(0.0);
         assert_eq!(hs.ehs, 0.0);
         assert_eq!(hs.ehs2, 0.0);
     }
 
-    #[test]
+    #[timed_test]
     fn river_with_full_ehs() {
         let hs = HandStrength::river(1.0);
         assert_eq!(hs.ehs, 1.0);
         assert_eq!(hs.ehs2, 1.0);
     }
 
-    #[test]
+    #[timed_test]
     fn ehs2_with_high_positive_potential() {
         // A drawing hand with high positive potential
         let hs = HandStrength::new(0.3, 0.5, 0.0);
@@ -541,7 +543,7 @@ mod tests {
         assert!((hs.ehs2 - 0.65).abs() < 0.001);
     }
 
-    #[test]
+    #[timed_test]
     fn ehs2_with_high_negative_potential() {
         // A vulnerable hand with high negative potential
         let hs = HandStrength::new(0.8, 0.0, 0.3);
@@ -549,29 +551,29 @@ mod tests {
         assert!((hs.ehs2 - 0.56).abs() < 0.001);
     }
 
-    #[test]
+    #[timed_test]
     fn hand_strength_is_copy() {
         let hs1 = HandStrength::new(0.5, 0.2, 0.1);
         let hs2 = hs1;
         assert_eq!(hs1, hs2);
     }
 
-    #[test]
+    #[timed_test]
     fn hand_strength_is_clone() {
         let hs1 = HandStrength::new(0.5, 0.2, 0.1);
-        let hs2 = hs1.clone();
+        let hs2 = hs1;
         assert_eq!(hs1, hs2);
     }
 
-    #[test]
+    #[timed_test]
     fn hand_strength_debug() {
         let hs = HandStrength::river(0.5);
-        let debug_str = format!("{:?}", hs);
+        let debug_str = format!("{hs:?}");
         assert!(debug_str.contains("HandStrength"));
         assert!(debug_str.contains("0.5"));
     }
 
-    #[test]
+    #[timed_test]
     fn river_ehs_nut_flush_near_one() {
         // As Ks on 2s 5s 8s Tc Qd - nut flush
         let board = vec![
@@ -593,7 +595,7 @@ mod tests {
         assert!(hs.ehs > 0.90, "Expected EHS > 0.90, got {}", hs.ehs);
     }
 
-    #[test]
+    #[timed_test]
     fn river_ehs_weak_hand_low() {
         // 7h 2c on As Ks Qs Js 9d - no pair, no flush
         let board = vec![
@@ -615,22 +617,22 @@ mod tests {
         assert!(hs.ehs < 0.30, "Expected EHS < 0.30, got {}", hs.ehs);
     }
 
-    #[test]
+    #[timed_test]
     fn all_cards_generates_52_cards() {
         let cards: Vec<Card> = all_cards().collect();
         assert_eq!(cards.len(), 52);
     }
 
-    #[test]
+    #[timed_test]
     fn all_cards_generates_unique_cards() {
         let cards: Vec<Card> = all_cards().collect();
         let unique: HashSet<Card> = cards.into_iter().collect();
         assert_eq!(unique.len(), 52);
     }
 
-    #[test]
+    #[timed_test]
     fn calculator_default_trait() {
-        let calc = HandStrengthCalculator::default();
+        let calc = HandStrengthCalculator;
         // Just verify we can create via default
         let board = vec![
             Card::new(Value::Two, Suit::Spade),
@@ -648,7 +650,7 @@ mod tests {
         assert!(hs.ehs >= 0.0 && hs.ehs <= 1.0);
     }
 
-    #[test]
+    #[timed_test]
     fn turn_ehs2_flush_draw_higher_than_ehs() {
         // Flush draw: As 5s on 2s 8s Tc Qd (4 to flush on turn)
         let board = vec![
@@ -675,7 +677,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn turn_ehs2_made_hand_npot() {
         // Top pair on draw-heavy board: Ah Kc on As 8s 7s 2d
         let board = vec![
@@ -696,8 +698,8 @@ mod tests {
         assert!(hs.npot > 0.05, "Expected NPot > 0.05, got {}", hs.npot);
     }
 
-    #[test]
-    #[ignore] // Slow: ~30 seconds
+    #[timed_test(60)]
+    #[ignore = "slow"]
     fn flop_ehs2_open_ended_straight_draw() {
         // 9h 8h on 7c 6d 2s - open-ended straight draw
         let board = vec![

@@ -11,6 +11,7 @@ mod hand_strength;
 mod isomorphism;
 
 use crate::poker::Card;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -78,7 +79,7 @@ impl Street {
 }
 
 /// Configuration for abstraction generation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AbstractionConfig {
     /// Number of buckets to use on the flop
     pub flop_buckets: u16,
@@ -223,50 +224,52 @@ impl CardAbstraction {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_precision_loss)]
     use super::*;
     use crate::poker::{Suit, Value};
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn street_from_board_len_flop() {
         let result = Street::from_board_len(3);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Street::Flop);
     }
 
-    #[test]
+    #[timed_test]
     fn street_from_board_len_turn() {
         let result = Street::from_board_len(4);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Street::Turn);
     }
 
-    #[test]
+    #[timed_test]
     fn street_from_board_len_river() {
         let result = Street::from_board_len(5);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Street::River);
     }
 
-    #[test]
+    #[timed_test]
     fn street_from_board_len_preflop() {
         let result = Street::from_board_len(0);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Street::Preflop);
     }
 
-    #[test]
+    #[timed_test]
     fn street_from_board_len_invalid_two() {
         let result = Street::from_board_len(2);
         assert!(result.is_err());
     }
 
-    #[test]
+    #[timed_test]
     fn street_from_board_len_invalid_six() {
         let result = Street::from_board_len(6);
         assert!(result.is_err());
     }
 
-    #[test]
+    #[timed_test]
     fn street_board_cards_returns_correct_count() {
         assert_eq!(Street::Preflop.board_cards(), 0);
         assert_eq!(Street::Flop.board_cards(), 3);
@@ -274,22 +277,22 @@ mod tests {
         assert_eq!(Street::River.board_cards(), 5);
     }
 
-    #[test]
+    #[timed_test]
     fn street_is_copy_and_clone() {
         let flop = Street::Flop;
         let flop_copy = flop;
-        let flop_clone = flop.clone();
+        let flop_clone = flop;
         assert_eq!(flop, flop_copy);
         assert_eq!(flop, flop_clone);
     }
 
-    #[test]
+    #[timed_test]
     fn street_implements_debug() {
         let debug_str = format!("{:?}", Street::Flop);
         assert_eq!(debug_str, "Flop");
     }
 
-    #[test]
+    #[timed_test]
     fn card_abstraction_river_bucket_lookup() {
         // Create simple boundaries for testing
         let boundaries = BucketBoundaries {
@@ -314,10 +317,10 @@ mod tests {
 
         let bucket = abstraction.get_bucket(&board, holding).unwrap();
         // Should return a valid bucket (0-99 for 100 buckets)
-        assert!(bucket < 100, "Bucket {} should be < 100", bucket);
+        assert!(bucket < 100, "Bucket {bucket} should be < 100");
     }
 
-    #[test]
+    #[timed_test]
     fn card_abstraction_rejects_duplicate_card() {
         let boundaries = BucketBoundaries {
             flop: vec![0.5],
@@ -343,7 +346,7 @@ mod tests {
         assert!(result.is_err(), "Should reject duplicate card");
     }
 
-    #[test]
+    #[timed_test]
     fn abstraction_config_default() {
         let config = AbstractionConfig::default();
         assert_eq!(config.flop_buckets, 5_000);
@@ -352,7 +355,7 @@ mod tests {
         assert_eq!(config.samples_per_street, 100_000);
     }
 
-    #[test]
+    #[timed_test]
     fn card_abstraction_num_buckets() {
         let boundaries = BucketBoundaries {
             flop: vec![0.25, 0.5, 0.75], // 4 buckets
@@ -366,7 +369,7 @@ mod tests {
         assert_eq!(abstraction.num_buckets(Street::River), 1);
     }
 
-    #[test]
+    #[timed_test]
     fn card_abstraction_rejects_invalid_board_size() {
         let boundaries = BucketBoundaries {
             flop: vec![0.5],
@@ -389,7 +392,7 @@ mod tests {
         assert!(result.is_err(), "Should reject invalid board size");
     }
 
-    #[test]
+    #[timed_test]
     fn card_abstraction_rejects_duplicate_in_holding() {
         let boundaries = BucketBoundaries {
             flop: vec![0.5],

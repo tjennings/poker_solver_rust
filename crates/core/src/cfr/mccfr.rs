@@ -103,6 +103,25 @@ impl<G: Game> MccfrSolver<G> {
     /// Each iteration samples `samples_per_iter` initial states and runs
     /// CFR on each, rather than iterating over all initial states.
     pub fn train(&mut self, iterations: u64, samples_per_iter: usize) {
+        self.train_with_callback(iterations, samples_per_iter, |_| {});
+    }
+
+    /// Train with a per-iteration callback for progress reporting.
+    ///
+    /// Same as [`train`] but calls `on_iteration` after each iteration
+    /// with the number of iterations completed so far in this call.
+    /// Initial states are generated once and reused across all iterations.
+    #[allow(clippy::missing_panics_doc)]
+    pub fn train_with_callback<F>(
+        &mut self,
+        iterations: u64,
+        samples_per_iter: usize,
+        mut on_iteration: F,
+    ) where
+        F: FnMut(u64),
+    {
+        use indicatif::{ProgressBar, ProgressStyle};
+
         let initial_states = self.game.initial_states();
         let num_states = initial_states.len();
 
@@ -112,10 +131,28 @@ impl<G: Game> MccfrSolver<G> {
 
         let skip_until = self.skip_strategy_until;
 
-        for _ in 0..iterations {
+        let iter_pb = ProgressBar::new(iterations);
+        iter_pb.set_style(
+            ProgressStyle::with_template(
+                "  iters: [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA: {eta})",
+            )
+            .expect("valid template")
+            .progress_chars("=>-"),
+        );
+
+        for i in 0..iterations {
             // Compute discount factor for CFR+ early iteration discounting
             let discount = self.compute_discount();
             let accumulate = self.iterations >= skip_until;
+
+            let sample_pb = ProgressBar::new(samples_per_iter as u64);
+            sample_pb.set_style(
+                ProgressStyle::with_template(
+                    "  samples: [{bar:40.green/black}] {pos}/{len} ({per_sec})",
+                )
+                .expect("valid template")
+                .progress_chars("=>-"),
+            );
 
             // Sample initial states
             for _ in 0..samples_per_iter {
@@ -133,12 +170,35 @@ impl<G: Game> MccfrSolver<G> {
                 let sample_weight = num_states as f64 / samples_per_iter as f64;
 
                 // Traverse for both players
-                self.cfr_traverse(state, Player::Player1, 1.0, 1.0, sample_weight, discount, accumulate);
-                self.cfr_traverse(state, Player::Player2, 1.0, 1.0, sample_weight, discount, accumulate);
+                self.cfr_traverse(
+                    state,
+                    Player::Player1,
+                    1.0,
+                    1.0,
+                    sample_weight,
+                    discount,
+                    accumulate,
+                );
+                self.cfr_traverse(
+                    state,
+                    Player::Player2,
+                    1.0,
+                    1.0,
+                    sample_weight,
+                    discount,
+                    accumulate,
+                );
+
+                sample_pb.inc(1);
             }
 
+            sample_pb.finish_and_clear();
             self.iterations += 1;
+            iter_pb.inc(1);
+            on_iteration(i + 1);
         }
+
+        iter_pb.finish_and_clear();
     }
 
     /// Train for a fixed number of iterations, sampling all states once per iteration.
@@ -214,7 +274,11 @@ impl<G: Game> MccfrSolver<G> {
             .collect()
     }
 
-    /// Core CFR traversal function.
+    /// External sampling MCCFR traversal.
+    ///
+    /// At the traversing player's nodes: explore ALL actions (full width).
+    /// At the opponent's nodes: SAMPLE ONE action according to current strategy.
+    /// This makes traversal linear in the opponent's branching factor.
     #[allow(clippy::too_many_arguments)]
     fn cfr_traverse(
         &mut self,
@@ -238,37 +302,37 @@ impl<G: Game> MccfrSolver<G> {
         // Get current strategy from regrets
         let strategy = self.get_current_strategy(&info_set, num_actions);
 
-        // Compute utility for each action
-        let mut action_utils = vec![0.0; num_actions];
-
-        for (i, action) in actions.iter().enumerate() {
-            let next_state = self.game.next_state(state, *action);
-
-            let (new_p1_reach, new_p2_reach) = match current_player {
-                Player::Player1 => (p1_reach * strategy[i], p2_reach),
-                Player::Player2 => (p1_reach, p2_reach * strategy[i]),
-            };
-
-            action_utils[i] = self.cfr_traverse(
-                &next_state,
-                traversing_player,
-                new_p1_reach,
-                new_p2_reach,
-                sample_weight,
-                discount,
-                accumulate_strategy,
-            );
-        }
-
-        // Expected utility under current strategy
-        let node_util: f64 = action_utils
-            .iter()
-            .zip(strategy.iter())
-            .map(|(u, p)| u * p)
-            .sum();
-
-        // Update regrets and strategy sum only for the current player
         if current_player == traversing_player {
+            // Traversing player: explore all actions
+            let mut action_utils = vec![0.0; num_actions];
+
+            for (i, action) in actions.iter().enumerate() {
+                let next_state = self.game.next_state(state, *action);
+
+                let (new_p1_reach, new_p2_reach) = match current_player {
+                    Player::Player1 => (p1_reach * strategy[i], p2_reach),
+                    Player::Player2 => (p1_reach, p2_reach * strategy[i]),
+                };
+
+                action_utils[i] = self.cfr_traverse(
+                    &next_state,
+                    traversing_player,
+                    new_p1_reach,
+                    new_p2_reach,
+                    sample_weight,
+                    discount,
+                    accumulate_strategy,
+                );
+            }
+
+            // Expected utility under current strategy
+            let node_util: f64 = action_utils
+                .iter()
+                .zip(strategy.iter())
+                .map(|(u, p)| u * p)
+                .sum();
+
+            // Update regrets
             let opponent_reach = match current_player {
                 Player::Player1 => p2_reach,
                 Player::Player2 => p1_reach,
@@ -284,13 +348,12 @@ impl<G: Game> MccfrSolver<G> {
                     opponent_reach * (action_utils[i] - node_util) * sample_weight * discount;
                 regrets[i] += regret_delta;
 
-                // CFR+ : floor regrets at 0
                 if self.use_cfr_plus && regrets[i] < 0.0 {
                     regrets[i] = 0.0;
                 }
             }
 
-            // Only accumulate strategy after skip threshold
+            // Accumulate strategy after skip threshold
             if accumulate_strategy {
                 let my_reach = match current_player {
                     Player::Player1 => p1_reach,
@@ -306,9 +369,69 @@ impl<G: Game> MccfrSolver<G> {
                     strat_sums[i] += my_reach * strategy[i] * sample_weight * discount;
                 }
             }
+
+            node_util
+        } else {
+            // Opponent's node: sample ONE action according to strategy
+            let sampled_action = self.sample_action(&strategy);
+            let action = actions[sampled_action];
+            let next_state = self.game.next_state(state, action);
+
+            let (new_p1_reach, new_p2_reach) = match current_player {
+                Player::Player1 => (p1_reach * strategy[sampled_action], p2_reach),
+                Player::Player2 => (p1_reach, p2_reach * strategy[sampled_action]),
+            };
+
+            // Accumulate opponent's strategy
+            if accumulate_strategy {
+                let opp_reach = match current_player {
+                    Player::Player1 => p1_reach,
+                    Player::Player2 => p2_reach,
+                };
+
+                let strat_sums = self
+                    .strategy_sum
+                    .entry(info_set)
+                    .or_insert_with(|| vec![0.0; num_actions]);
+
+                for i in 0..num_actions {
+                    strat_sums[i] += opp_reach * strategy[i] * sample_weight * discount;
+                }
+            }
+
+            self.cfr_traverse(
+                &next_state,
+                traversing_player,
+                new_p1_reach,
+                new_p2_reach,
+                sample_weight,
+                discount,
+                accumulate_strategy,
+            )
+        }
+    }
+
+    /// Sample an action index according to a probability distribution.
+    fn sample_action(&mut self, strategy: &[f64]) -> usize {
+        // xorshift RNG
+        self.rng_state ^= self.rng_state << 13;
+        self.rng_state ^= self.rng_state >> 7;
+        self.rng_state ^= self.rng_state << 17;
+
+        // Convert to [0, 1)
+        #[allow(clippy::cast_precision_loss)]
+        let r = (self.rng_state as f64) / (u64::MAX as f64);
+
+        let mut cumulative = 0.0;
+        for (i, &prob) in strategy.iter().enumerate() {
+            cumulative += prob;
+            if r < cumulative {
+                return i;
+            }
         }
 
-        node_util
+        // Fallback to last action (rounding)
+        strategy.len() - 1
     }
 }
 
@@ -320,7 +443,6 @@ mod tests {
 
     #[timed_test]
     fn mccfr_initializes_empty() {
-
         let game = KuhnPoker::new();
         let solver = MccfrSolver::new(game);
 
@@ -331,7 +453,6 @@ mod tests {
 
     #[timed_test]
     fn mccfr_training_populates_info_sets() {
-
         let game = KuhnPoker::new();
         let mut solver = MccfrSolver::new(game);
 
@@ -344,7 +465,6 @@ mod tests {
 
     #[timed_test]
     fn mccfr_strategy_sums_to_one() {
-
         let game = KuhnPoker::new();
         let mut solver = MccfrSolver::new(game);
 
@@ -363,7 +483,6 @@ mod tests {
 
     #[timed_test]
     fn mccfr_converges_on_kuhn() {
-
         let game = KuhnPoker::new();
         let mut solver = MccfrSolver::new(game);
 
@@ -389,7 +508,6 @@ mod tests {
 
     #[timed_test]
     fn mccfr_sampling_much_faster_than_full() {
-
         use std::time::Instant;
 
         let game = KuhnPoker::new();
@@ -408,15 +526,13 @@ mod tests {
 
         // Sampled should be faster (for Kuhn it's 6x fewer traversals)
         // But both are fast for Kuhn, so just verify they both work
-        assert!(solver_full.iterations() == 100);
-        assert!(solver_sampled.iterations() == 100);
+        assert!(time_full > time_sampled);
 
         println!("Full: {time_full:?}, Sampled: {time_sampled:?}");
     }
 
     #[timed_test]
     fn cfr_plus_floors_negative_regrets() {
-
         let game = KuhnPoker::new();
         let mut solver = MccfrSolver::new(game);
 

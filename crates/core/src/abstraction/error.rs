@@ -28,8 +28,9 @@ pub enum AbstractionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn invalid_board_size_error_displays_expected_and_got() {
         let err = AbstractionError::InvalidBoardSize {
             expected: 3,
@@ -40,7 +41,7 @@ mod tests {
         assert!(msg.contains("got 2"), "should show actual count");
     }
 
-    #[test]
+    #[timed_test]
     fn invalid_boundaries_error_includes_reason() {
         let err = AbstractionError::InvalidBoundaries {
             reason: "boundaries not sorted".to_string(),
@@ -52,14 +53,14 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn serialization_error_includes_message() {
         let err = AbstractionError::SerializationError("invalid JSON".to_string());
         let msg = err.to_string();
         assert!(msg.contains("invalid JSON"), "should include the message");
     }
 
-    #[test]
+    #[timed_test]
     fn load_error_converts_from_io_error() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err: AbstractionError = io_err.into();

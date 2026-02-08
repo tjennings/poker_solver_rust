@@ -69,6 +69,8 @@ impl BetSize {
 - Separate **data structures** from **behavior** when it aids clarity
 - Group related functionality into coherent modules
 - modules should expose one or more public functions as their API.  These are "orchestration" functions that internally use many small functions to accomplish their work.
+- Functions must be less than 50 lines of code, preferrably less than 10 lines of code.  
+- Functions must have a single responsibility, be pure (no side effects), and be easily composable.
 
 ## Testing Philosophy
 

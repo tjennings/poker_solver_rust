@@ -184,6 +184,7 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_macros::timed_test;
 
     const VALID_YAML: &str = r#"
 name: "Test Config"
@@ -192,7 +193,7 @@ raise_sizes: [2.5, 3.0, 4.0, 5.0, 10.0]
 max_bets_per_round: 3
 "#;
 
-    #[test]
+    #[timed_test]
     fn parse_valid_config() {
         let config = Config::from_yaml(VALID_YAML).unwrap();
         assert_eq!(config.name, "Test Config");
@@ -201,7 +202,7 @@ max_bets_per_round: 3
         assert_eq!(config.max_bets_per_round, 3);
     }
 
-    #[test]
+    #[timed_test]
     fn default_max_bets_is_four() {
         let yaml = r#"
 name: "No Max Bets"
@@ -212,7 +213,7 @@ raise_sizes: [3.0]
         assert_eq!(config.max_bets_per_round, 4);
     }
 
-    #[test]
+    #[timed_test]
     fn empty_stack_depths_fails() {
         let yaml = r#"
 name: "Bad Config"
@@ -223,7 +224,7 @@ raise_sizes: [3.0]
         assert!(matches!(result, Err(ConfigError::EmptyStackDepths)));
     }
 
-    #[test]
+    #[timed_test]
     fn zero_stack_depth_fails() {
         let yaml = r#"
 name: "Bad Config"
@@ -234,7 +235,7 @@ raise_sizes: [3.0]
         assert!(matches!(result, Err(ConfigError::InvalidStackDepth(0))));
     }
 
-    #[test]
+    #[timed_test]
     fn negative_raise_size_fails() {
         let yaml = r#"
 name: "Bad Config"
@@ -245,7 +246,7 @@ raise_sizes: [-1.0, 3.0]
         assert!(matches!(result, Err(ConfigError::InvalidRaiseSize(_))));
     }
 
-    #[test]
+    #[timed_test]
     fn get_legal_raise_sizes_filters_correctly() {
         let config = Config {
             name: "Test".to_string(),
@@ -267,7 +268,7 @@ raise_sizes: [-1.0, 3.0]
         assert!(sizes.contains(&20.0));
     }
 
-    #[test]
+    #[timed_test]
     fn max_bets_stops_raises() {
         let config = Config {
             name: "Test".to_string(),
@@ -281,7 +282,7 @@ raise_sizes: [-1.0, 3.0]
         assert!(sizes.is_empty());
     }
 
-    #[test]
+    #[timed_test]
     fn is_valid_raise_checks_correctly() {
         let config = Config {
             name: "Test".to_string(),
@@ -295,7 +296,7 @@ raise_sizes: [-1.0, 3.0]
         assert!(!config.is_valid_raise(5.0, 2.0, 100.0, 3)); // At max bets
     }
 
-    #[test]
+    #[timed_test]
     fn all_in_always_available() {
         let config = Config {
             name: "Test".to_string(),
@@ -308,7 +309,7 @@ raise_sizes: [-1.0, 3.0]
         assert!(sizes.contains(&25.0)); // All-in
     }
 
-    #[test]
+    #[timed_test]
     fn default_config_is_valid() {
         let config = Config::default();
         assert!(!config.stack_depths.is_empty());

@@ -1,0 +1,17 @@
+game:
+  stack_depth: 100         # Effective stack in big blinds
+  bet_sizes: [0.33, 0.5, 0.75, 1.0]  # Pot-fraction bet sizes (all-in always included)
+  samples_per_iteration: 50000  # Deal pool size (used internally by initial_states)
+
+abstraction:
+  flop_buckets: 200        # EHS2 buckets on flop (production: 5000)
+  turn_buckets: 200        # EHS2 buckets on turn (production: 5000)
+  river_buckets: 500       # EHS2 buckets on river (production: 20000)
+  samples_per_street: 5000 # Monte Carlo samples for computing bucket boundaries
+
+training:
+  iterations: 1000         # Total MCCFR iterations
+  seed: 42                 # RNG seed for reproducibility
+  output_dir: "./mccfr_100bb"
+  mccfr_samples: 500       # Deals sampled per MCCFR iteration (default: 500)
+  deal_count: 50000        # Random deal pool size (default: 50000)

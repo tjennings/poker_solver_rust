@@ -125,10 +125,12 @@ impl Default for BlueprintStrategy {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
     use tempfile::NamedTempFile;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn empty_strategy_returns_none() {
         let strategy = BlueprintStrategy::new();
 
@@ -140,7 +142,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn strategy_lookup_returns_inserted_values() {
         let mut strategy = BlueprintStrategy::new();
         let probs = vec![0.3, 0.5, 0.2];
@@ -156,7 +158,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn strategy_roundtrip_save_load() {
         let mut strategy = BlueprintStrategy::new();
         strategy.insert("AKs:r/c".to_string(), vec![0.3, 0.5, 0.2]);
@@ -191,7 +193,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn from_strategies_converts_f64_to_f32() {
         let mut f64_strategies: HashMap<String, Vec<f64>> = HashMap::new();
         f64_strategies.insert("AKs:r".to_string(), vec![0.25, 0.75]);
@@ -220,7 +222,7 @@ mod tests {
         assert!((qq_probs[2] - 0.6_f32).abs() < f32::EPSILON);
     }
 
-    #[test]
+    #[timed_test]
     fn len_and_is_empty() {
         let mut strategy = BlueprintStrategy::new();
 
@@ -240,7 +242,7 @@ mod tests {
         assert_eq!(strategy.len(), 2, "strategy should have len 2");
     }
 
-    #[test]
+    #[timed_test]
     fn default_creates_empty_strategy() {
         let strategy = BlueprintStrategy::default();
 
@@ -252,7 +254,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn insert_overwrites_existing_key() {
         let mut strategy = BlueprintStrategy::new();
         strategy.insert("AKs:r".to_string(), vec![0.5, 0.5]);
@@ -263,14 +265,14 @@ mod tests {
         assert_eq!(strategy.len(), 1, "should still have one entry");
     }
 
-    #[test]
+    #[timed_test]
     fn load_nonexistent_file_returns_error() {
         let result = BlueprintStrategy::load(Path::new("/nonexistent/path/strategy.bin"));
 
         assert!(result.is_err(), "loading nonexistent file should fail");
         match result.unwrap_err() {
             BlueprintError::IoError(_) => {}
-            other => panic!("expected IoError, got {:?}", other),
+            other => panic!("expected IoError, got {other:?}"),
         }
     }
 }

@@ -9,11 +9,21 @@ use tempfile::tempdir;
 use test_macros::timed_test;
 
 /// Helper: build synthetic boundaries with uniform distribution
-fn synthetic_boundaries(flop_buckets: usize, turn_buckets: usize, river_buckets: usize) -> BucketBoundaries {
+fn synthetic_boundaries(
+    flop_buckets: usize,
+    turn_buckets: usize,
+    river_buckets: usize,
+) -> BucketBoundaries {
     BucketBoundaries {
-        flop: (1..flop_buckets).map(|i| i as f32 / flop_buckets as f32).collect(),
-        turn: (1..turn_buckets).map(|i| i as f32 / turn_buckets as f32).collect(),
-        river: (1..river_buckets).map(|i| i as f32 / river_buckets as f32).collect(),
+        flop: (1..flop_buckets)
+            .map(|i| i as f32 / flop_buckets as f32)
+            .collect(),
+        turn: (1..turn_buckets)
+            .map(|i| i as f32 / turn_buckets as f32)
+            .collect(),
+        river: (1..river_buckets)
+            .map(|i| i as f32 / river_buckets as f32)
+            .collect(),
     }
 }
 

@@ -1,12 +1,15 @@
 use std::error::Error;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use indicatif::{ProgressBar, ProgressStyle};
 use poker_solver_core::Game;
 use poker_solver_core::abstraction::{AbstractionConfig, BoundaryGenerator};
 use poker_solver_core::blueprint::{BlueprintStrategy, BundleConfig, StrategyBundle};
-use poker_solver_core::cfr::{MccfrConfig, MccfrSolver, calculate_exploitability};
+use poker_solver_core::cfr::{MccfrConfig, MccfrSolver};
+use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
 use poker_solver_core::game::{Action, HunlPostflop, PostflopConfig};
 use serde::Deserialize;
 
@@ -26,6 +29,22 @@ enum Commands {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// List all 1,755 canonical (suit-isomorphic) flops
+    Flops {
+        /// Output format
+        #[arg(short, long, default_value = "json")]
+        format: OutputFormat,
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+}
+
+/// Output format for the flops command.
+#[derive(Debug, Clone, ValueEnum)]
+enum OutputFormat {
+    Json,
+    Csv,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +84,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             let yaml = std::fs::read_to_string(&config)?;
             let training_config: TrainingConfig = serde_yaml::from_str(&yaml)?;
             run_mccfr_training(training_config)?;
+        }
+        Commands::Flops { format, output } => {
+            run_flops(format, output)?;
         }
     }
 
@@ -106,6 +128,7 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         stack_depth: config.game.stack_depth,
         bet_sizes: config.game.bet_sizes.clone(),
         samples_per_iteration: config.training.deal_count,
+        ..PostflopConfig::default()
     };
     let game = HunlPostflop::new(game_config, None);
 
@@ -128,17 +151,18 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     solver.set_seed(config.training.seed);
     println!("  Created in {:?}\n", start.elapsed());
 
-    // Create a separate game instance for exploitability + display
-    let eval_config = PostflopConfig {
-        stack_depth: config.game.stack_depth,
-        bet_sizes: config.game.bet_sizes.clone(),
-        samples_per_iteration: config.training.deal_count,
-    };
-    let eval_game = HunlPostflop::new(eval_config, None);
-
-    // Derive action labels from the first initial state (SB preflop)
-    let initial_states = eval_game.initial_states();
-    let actions = eval_game.actions(&initial_states[0]);
+    // Derive action labels from a single deal (all deals share the same preflop actions)
+    let label_game = HunlPostflop::new(
+        PostflopConfig {
+            stack_depth: config.game.stack_depth,
+            bet_sizes: config.game.bet_sizes.clone(),
+            samples_per_iteration: 1,
+            ..PostflopConfig::default()
+        },
+        None,
+    );
+    let initial_states = label_game.initial_states();
+    let actions = label_game.actions(&initial_states[0]);
     let action_labels = format_action_labels(&actions);
     let header = format_table_header(&action_labels);
 
@@ -146,49 +170,58 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     let total = config.training.iterations;
     let checkpoint_interval = total / 10;
     let training_start = Instant::now();
-    let mut prev_exploitability: Option<f64> = None;
-
     // Baseline checkpoint (iteration 0)
     print_checkpoint(
-        &eval_game,
         &solver,
         0,
         10,
         total,
         &training_start,
-        &mut prev_exploitability,
         &header,
         &action_labels,
-        config.training.mccfr_samples,
+    );
+
+    // Progress bar for training iterations
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} iters ({per_sec}, ETA: {eta})",
+        )
+        .expect("valid template")
+        .progress_chars("=>-"),
     );
 
     for checkpoint in 1..=10 {
-        solver.train(checkpoint_interval, config.training.mccfr_samples);
+        solver.train_with_callback(checkpoint_interval, config.training.mccfr_samples, |_| {
+            pb.inc(1);
+        });
 
-        print_checkpoint(
-            &eval_game,
-            &solver,
-            checkpoint,
-            10,
-            total,
-            &training_start,
-            &mut prev_exploitability,
-            &header,
-            &action_labels,
-            config.training.mccfr_samples,
-        );
+        pb.suspend(|| {
+            print_checkpoint(
+                &solver,
+                checkpoint,
+                10,
+                total,
+                &training_start,
+                &header,
+                &action_labels,
+            );
+        });
     }
 
     // Handle remainder iterations
     let trained_so_far = checkpoint_interval * 10;
     if trained_so_far < total {
-        solver.train(total - trained_so_far, config.training.mccfr_samples);
-        println!(
-            "\n  (trained {} extra iterations for total of {})",
+        solver.train_with_callback(
             total - trained_so_far,
-            total
+            config.training.mccfr_samples,
+            |_| {
+                pb.inc(1);
+            },
         );
     }
+
+    pb.finish_with_message("Training complete");
 
     // Save bundle
     println!("\nSaving strategy bundle...");
@@ -211,10 +244,7 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     // Verify loads
     let loaded = StrategyBundle::load(&output_path)?;
-    println!(
-        "  Verified: {} info sets loaded\n",
-        loaded.blueprint.len()
-    );
+    println!("  Verified: {} info sets loaded\n", loaded.blueprint.len());
 
     println!("=== Training Complete ===");
     println!("Total time: {:?}", training_start.elapsed());
@@ -240,18 +270,116 @@ fn format_table_header(labels: &[String]) -> String {
     format!("{:<6}|{action_cols}", "Hand")
 }
 
-#[allow(clippy::too_many_arguments)]
+fn run_flops(format: OutputFormat, output: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+    let flops = flops::all_flops();
+
+    let mut writer: Box<dyn Write> = match &output {
+        Some(path) => Box::new(std::fs::File::create(path)?),
+        None => Box::new(std::io::stdout().lock()),
+    };
+
+    match format {
+        OutputFormat::Json => write_flops_json(&flops, &mut writer)?,
+        OutputFormat::Csv => write_flops_csv(&flops, &mut writer)?,
+    }
+
+    if let Some(path) = &output {
+        eprintln!("Wrote {} flops to {}", flops.len(), path.display());
+    }
+
+    Ok(())
+}
+
+fn flop_to_card_strings(flop: &CanonicalFlop) -> [String; 3] {
+    let cards = flop.cards();
+    [
+        cards[0].to_string(),
+        cards[1].to_string(),
+        cards[2].to_string(),
+    ]
+}
+
+fn suit_texture_str(flop: &CanonicalFlop) -> &'static str {
+    match flop.suit_texture() {
+        SuitTexture::Rainbow => "rainbow",
+        SuitTexture::TwoTone => "two_tone",
+        SuitTexture::Monotone => "monotone",
+    }
+}
+
+fn rank_texture_str(flop: &CanonicalFlop) -> &'static str {
+    match flop.rank_texture() {
+        RankTexture::Unpaired => "unpaired",
+        RankTexture::Paired => "paired",
+        RankTexture::Trips => "trips",
+    }
+}
+
+fn high_card_class_str(flop: &CanonicalFlop) -> &'static str {
+    match flop.high_card_class() {
+        flops::HighCardClass::Broadway => "broadway",
+        flops::HighCardClass::Middle => "middle",
+        flops::HighCardClass::Low => "low",
+    }
+}
+
+fn write_flops_json(flops: &[CanonicalFlop], writer: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    let entries: Vec<serde_json::Value> = flops
+        .iter()
+        .map(|f| {
+            let cards = flop_to_card_strings(f);
+            let conn = f.connectedness();
+            serde_json::json!({
+                "cards": cards,
+                "suit_texture": suit_texture_str(f),
+                "rank_texture": rank_texture_str(f),
+                "high_card_class": high_card_class_str(f),
+                "gap_high_mid": conn.gap_high_mid,
+                "gap_mid_low": conn.gap_mid_low,
+                "has_straight_potential": conn.has_straight_potential,
+                "weight": f.weight(),
+            })
+        })
+        .collect();
+
+    serde_json::to_writer_pretty(writer, &entries)?;
+    Ok(())
+}
+
+fn write_flops_csv(flops: &[CanonicalFlop], writer: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    writeln!(
+        writer,
+        "card1,card2,card3,suit_texture,rank_texture,high_card_class,gap_high_mid,gap_mid_low,has_straight_potential,weight"
+    )?;
+    for f in flops {
+        let cards = flop_to_card_strings(f);
+        let conn = f.connectedness();
+        writeln!(
+            writer,
+            "{},{},{},{},{},{},{},{},{},{}",
+            cards[0],
+            cards[1],
+            cards[2],
+            suit_texture_str(f),
+            rank_texture_str(f),
+            high_card_class_str(f),
+            conn.gap_high_mid,
+            conn.gap_mid_low,
+            conn.has_straight_potential,
+            f.weight(),
+        )?;
+    }
+    Ok(())
+}
+
 fn print_checkpoint(
-    eval_game: &HunlPostflop,
     solver: &MccfrSolver<HunlPostflop>,
     checkpoint: u64,
     total_checkpoints: u64,
     total_iterations: u64,
     training_start: &Instant,
-    prev_exploitability: &mut Option<f64>,
     header: &str,
     action_labels: &[String],
-    _samples_per_iter: usize,
 ) {
     let current_iter = if checkpoint == 0 {
         0
@@ -260,7 +388,6 @@ fn print_checkpoint(
     };
 
     let strategies = solver.all_strategies();
-    let exploitability = calculate_exploitability(eval_game, &strategies);
 
     let elapsed = training_start.elapsed().as_secs_f64();
     let remaining = if checkpoint > 0 {
@@ -272,24 +399,10 @@ fn print_checkpoint(
 
     // Header
     println!(
-        "=== Checkpoint {}/{} ({}/{} iterations) ===",
+        "\n=== Checkpoint {}/{} ({}/{} iterations) ===",
         checkpoint, total_checkpoints, current_iter, total_iterations
     );
-
-    // Exploitability with delta
-    match *prev_exploitability {
-        Some(prev) => {
-            let arrow = if exploitability < prev { "↓" } else { "↑" };
-            println!(
-                "Exploitability: {:.4} ({} was {:.4})",
-                exploitability, arrow, prev
-            );
-        }
-        None => {
-            println!("Exploitability: {:.4}", exploitability);
-        }
-    }
-    *prev_exploitability = Some(exploitability);
+    println!("Info sets: {}", strategies.len());
 
     // Timing
     if checkpoint > 0 {

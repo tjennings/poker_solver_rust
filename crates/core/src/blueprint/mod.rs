@@ -9,12 +9,15 @@
 //! - `error` - Error types for blueprint operations
 //! - `strategy` - Strategy storage with save/load functionality
 //! - `cache` - Two-tier caching for subgame solver results
+//! - `bundle` - Directory-based strategy bundle format
 
+mod bundle;
 mod cache;
 mod error;
 mod strategy;
 mod subgame;
 
+pub use bundle::{BundleConfig, StrategyBundle};
 pub use cache::{CacheConfig, SubgameCache, SubgameKey};
 pub use error::BlueprintError;
 pub use strategy::BlueprintStrategy;

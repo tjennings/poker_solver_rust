@@ -2,9 +2,19 @@ mod hunl_postflop;
 mod hunl_preflop;
 mod kuhn;
 
+use arrayvec::ArrayVec;
+
 pub use hunl_postflop::{HunlPostflop, PostflopConfig, PostflopState, TerminalType};
 pub use hunl_preflop::HunlPreflop;
 pub use kuhn::KuhnPoker;
+
+/// Maximum number of actions at any decision point.
+///
+/// Fold + Check/Call + up to 6 bet/raise sizes (4 pot fractions + all-in + min-raise).
+pub const MAX_ACTIONS: usize = 8;
+
+/// Stack-allocated action list returned by [`Game::actions`].
+pub type Actions = ArrayVec<Action, MAX_ACTIONS>;
 
 /// Player in a two-player game
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,7 +59,7 @@ pub trait Game: Send + Sync {
     fn player(&self, state: &Self::State) -> Player;
 
     /// Returns available actions at this state
-    fn actions(&self, state: &Self::State) -> Vec<Action>;
+    fn actions(&self, state: &Self::State) -> Actions;
 
     /// Returns the next state after taking an action
     fn next_state(&self, state: &Self::State, action: Action) -> Self::State;
@@ -59,4 +69,14 @@ pub trait Game: Send + Sync {
 
     /// Returns the information set key for the current player
     fn info_set_key(&self, state: &Self::State) -> String;
+
+    /// Writes the information set key into an existing buffer, avoiding allocation.
+    ///
+    /// The default implementation clears the buffer and delegates to [`Self::info_set_key`].
+    /// Implementations should override this when the key can be built
+    /// without intermediate `String` allocations.
+    fn info_set_key_into(&self, state: &Self::State, buf: &mut String) {
+        buf.clear();
+        buf.push_str(&self.info_set_key(state));
+    }
 }

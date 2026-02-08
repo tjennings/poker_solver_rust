@@ -5,6 +5,7 @@
 
 use crate::abstraction::{AbstractionConfig, BucketBoundaries, HandStrengthCalculator};
 use crate::poker::{Card, Suit, Value};
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::SeedableRng;
 use rand::prelude::*;
 
@@ -48,13 +49,9 @@ impl BoundaryGenerator {
     pub fn generate(&self, seed: u64) -> BucketBoundaries {
         let mut rng = StdRng::seed_from_u64(seed);
 
-        eprintln!("Generating river samples...");
         let mut river_samples = self.sample_street(&mut rng, 5, self.config.samples_per_street);
-
-        eprintln!("Generating turn samples...");
         let mut turn_samples = self.sample_street(&mut rng, 4, self.config.samples_per_street);
 
-        eprintln!("Generating flop samples (slow)...");
         // Use fewer samples for flop due to computation cost
         let flop_sample_count = (self.config.samples_per_street / 100).max(100);
         let mut flop_samples = self.sample_street(&mut rng, 3, flop_sample_count);
@@ -76,14 +73,22 @@ impl BoundaryGenerator {
     /// * `board_size` - Number of community cards (3=flop, 4=turn, 5=river)
     /// * `num_samples` - Number of samples to generate
     fn sample_street(&self, rng: &mut StdRng, board_size: usize, num_samples: u32) -> Vec<f32> {
+        let street_name = match board_size {
+            3 => "flop",
+            4 => "turn",
+            5 => "river",
+            _ => "unknown",
+        };
+
+        let pb = ProgressBar::new(u64::from(num_samples));
+        pb.set_style(ProgressStyle::with_template(
+            &format!("  sampling {street_name} EHS2 [{{bar:40}}] {{pos}}/{{len}} [{{elapsed}} < {{eta}}, {{per_sec}}]")
+        ).unwrap());
+
         let mut samples = Vec::with_capacity(num_samples as usize);
         let deck = Self::full_deck();
 
-        for i in 0..num_samples {
-            if i % 1000 == 0 && i > 0 {
-                eprintln!("  Sampled {i}/{num_samples}");
-            }
-
+        for _ in 0..num_samples {
             // Shuffle and deal
             let mut cards = deck.clone();
             cards.shuffle(rng);
@@ -99,7 +104,10 @@ impl BoundaryGenerator {
             };
 
             samples.push(hs.ehs2);
+            pb.inc(1);
         }
+
+        pb.finish_and_clear();
 
         samples
     }
@@ -254,10 +262,22 @@ mod tests {
         ];
 
         let holdings = [
-            (Card::new(Value::Ten, Suit::Heart), Card::new(Value::Nine, Suit::Heart)),
-            (Card::new(Value::Three, Suit::Heart), Card::new(Value::Four, Suit::Club)),
-            (Card::new(Value::Seven, Suit::Diamond), Card::new(Value::Eight, Suit::Club)),
-            (Card::new(Value::Five, Suit::Club), Card::new(Value::Six, Suit::Diamond)),
+            (
+                Card::new(Value::Ten, Suit::Heart),
+                Card::new(Value::Nine, Suit::Heart),
+            ),
+            (
+                Card::new(Value::Three, Suit::Heart),
+                Card::new(Value::Four, Suit::Club),
+            ),
+            (
+                Card::new(Value::Seven, Suit::Diamond),
+                Card::new(Value::Eight, Suit::Club),
+            ),
+            (
+                Card::new(Value::Five, Suit::Club),
+                Card::new(Value::Six, Suit::Diamond),
+            ),
         ];
 
         for holding in &holdings {

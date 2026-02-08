@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::equity::equity;
 use crate::hands::CanonicalHand;
 
-use super::{Action, Game, Player};
+use super::{Action, Actions, Game, Player};
 
 /// Heads-Up No-Limit Preflop game.
 ///
@@ -163,12 +163,12 @@ impl Game for HunlPreflop {
         state.to_act.unwrap_or(Player::Player1)
     }
 
-    fn actions(&self, state: &Self::State) -> Vec<Action> {
+    fn actions(&self, state: &Self::State) -> Actions {
+        let mut actions = Actions::new();
         if state.terminal.is_some() {
-            return vec![];
+            return actions;
         }
 
-        let mut actions = Vec::new();
         let stack = state.current_stack();
         let to_call = state.to_call;
 
@@ -194,6 +194,9 @@ impl Game for HunlPreflop {
         );
 
         for size in raise_sizes {
+            if actions.is_full() {
+                break;
+            }
             // Convert to absolute raise amount (total bet size)
             // Size is in BB (0-1000 range typically), so size * 100 fits in u32
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -359,13 +362,15 @@ impl Game for HunlPreflop {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::items_after_statements)]
     use super::*;
+    use test_macros::timed_test;
 
     fn create_game() -> HunlPreflop {
         HunlPreflop::with_stack(100)
     }
 
-    #[test]
+    #[timed_test]
     fn initial_states_not_empty() {
         let game = create_game();
         let states = game.initial_states();
@@ -374,7 +379,7 @@ mod tests {
         assert_eq!(states.len(), 169 * 169);
     }
 
-    #[test]
+    #[timed_test]
     fn initial_state_correct_stacks() {
         let game = create_game();
         let states = game.initial_states();
@@ -386,7 +391,7 @@ mod tests {
         assert!((state.pot - 1.5).abs() < 0.001);
     }
 
-    #[test]
+    #[timed_test]
     fn sb_acts_first() {
         let game = create_game();
         let states = game.initial_states();
@@ -395,7 +400,7 @@ mod tests {
         assert_eq!(game.player(state), Player::Player1);
     }
 
-    #[test]
+    #[timed_test]
     fn sb_can_fold_call_or_raise() {
         let game = create_game();
         let states = game.initial_states();
@@ -408,7 +413,7 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(a, Action::Raise(_))));
     }
 
-    #[test]
+    #[timed_test]
     fn fold_is_terminal() {
         let game = create_game();
         let states = game.initial_states();
@@ -418,7 +423,7 @@ mod tests {
         assert!(game.is_terminal(&folded));
     }
 
-    #[test]
+    #[timed_test]
     fn fold_gives_pot_to_opponent() {
         let game = create_game();
         let states = game.initial_states();
@@ -431,7 +436,7 @@ mod tests {
         assert!(game.utility(&folded, Player::Player1) < 0.0);
     }
 
-    #[test]
+    #[timed_test]
     fn call_then_check_is_showdown() {
         let game = create_game();
         let states = game.initial_states();
@@ -450,7 +455,7 @@ mod tests {
         assert!(game.is_terminal(&after_check));
     }
 
-    #[test]
+    #[timed_test]
     fn raise_switches_action() {
         let game = create_game();
         let states = game.initial_states();
@@ -468,7 +473,7 @@ mod tests {
         assert_eq!(game.player(&after_raise), Player::Player2);
     }
 
-    #[test]
+    #[timed_test]
     fn info_set_includes_hand_and_history() {
         let game = create_game();
         let states = game.initial_states();
@@ -491,7 +496,7 @@ mod tests {
         assert!(info_set2.contains(":r")); // Contains raise history
     }
 
-    #[test]
+    #[timed_test]
     fn call_closes_action() {
         let game = create_game();
         let states = game.initial_states();
@@ -510,7 +515,7 @@ mod tests {
         assert!(game.is_terminal(&after_call));
     }
 
-    #[test]
+    #[timed_test]
     fn utilities_are_zero_sum() {
         let game = create_game();
         let states = game.initial_states();

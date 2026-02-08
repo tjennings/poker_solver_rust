@@ -146,8 +146,9 @@ impl<G: Game> VanillaCfr<G> {
 mod tests {
     use super::*;
     use crate::game::KuhnPoker;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn solver_initializes_empty() {
         let game = KuhnPoker::new();
         let solver = VanillaCfr::new(game);
@@ -156,7 +157,7 @@ mod tests {
         assert!(solver.strategy_sum.is_empty());
     }
 
-    #[test]
+    #[timed_test]
     fn training_populates_info_sets() {
         let game = KuhnPoker::new();
         let mut solver = VanillaCfr::new(game);
@@ -173,14 +174,14 @@ mod tests {
         assert!(solver.strategy_sum.contains_key("Jc"));
     }
 
-    #[test]
+    #[timed_test]
     fn average_strategy_sums_to_one() {
         let game = KuhnPoker::new();
         let mut solver = VanillaCfr::new(game);
 
         solver.train(100);
 
-        for (info_set, _) in &solver.strategy_sum {
+        for info_set in solver.strategy_sum.keys() {
             if let Some(strategy) = solver.get_average_strategy(info_set) {
                 let sum: f64 = strategy.iter().sum();
                 assert!(
@@ -191,7 +192,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test]
     fn king_always_bets_or_calls() {
         let game = KuhnPoker::new();
         let mut solver = VanillaCfr::new(game);
@@ -205,8 +206,7 @@ mod tests {
             // King should bet with high frequency
             assert!(
                 strategy[1] > 0.5,
-                "King should bet frequently, got {:?}",
-                strategy
+                "King should bet frequently, got {strategy:?}"
             );
         }
 
@@ -215,8 +215,7 @@ mod tests {
             // strategy[0] = fold, strategy[1] = call
             assert!(
                 strategy[1] > 0.99,
-                "King should always call a bet, got {:?}",
-                strategy
+                "King should always call a bet, got {strategy:?}"
             );
         }
     }

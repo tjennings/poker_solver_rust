@@ -25,6 +25,11 @@ pub struct PostflopConfig {
     pub bet_sizes: Vec<f32>,
     /// Number of samples per iteration for Monte Carlo methods
     pub samples_per_iteration: usize,
+    /// Maximum bets/raises allowed per street (default: 3).
+    /// After this many bets on a street, only fold/call/check are available.
+    /// This keeps the game tree tractable for CFR traversal.
+    #[serde(default = "default_max_raises")]
+    pub max_raises_per_street: u8,
 }
 
 impl Default for PostflopConfig {
@@ -33,8 +38,13 @@ impl Default for PostflopConfig {
             stack_depth: 100,
             bet_sizes: vec![0.33, 0.5, 0.75, 1.0],
             samples_per_iteration: 1000,
+            max_raises_per_street: 3,
         }
     }
+}
+
+fn default_max_raises() -> u8 {
+    3
 }
 
 /// Type of terminal state in the game.
@@ -228,11 +238,7 @@ impl HunlPostflop {
         ];
 
         let get_opponent = |v1: Value, v2: Value| {
-            if v1 == Value::Two
-                || v1 == Value::Three
-                || v2 == Value::Two
-                || v2 == Value::Three
-            {
+            if v1 == Value::Two || v1 == Value::Three || v2 == Value::Two || v2 == Value::Three {
                 alt_p2
             } else {
                 default_p2
@@ -243,25 +249,28 @@ impl HunlPostflop {
             for &v2 in &values[i..] {
                 if v1 == v2 {
                     // Pair
-                    let p1 = [
-                        Card::new(v1, Suit::Spade),
-                        Card::new(v2, Suit::Heart),
-                    ];
-                    states.push(PostflopState::new_preflop(p1, get_opponent(v1, v2), stack_depth));
+                    let p1 = [Card::new(v1, Suit::Spade), Card::new(v2, Suit::Heart)];
+                    states.push(PostflopState::new_preflop(
+                        p1,
+                        get_opponent(v1, v2),
+                        stack_depth,
+                    ));
                 } else {
                     // Suited
-                    let p1_suited = [
-                        Card::new(v1, Suit::Spade),
-                        Card::new(v2, Suit::Spade),
-                    ];
-                    states.push(PostflopState::new_preflop(p1_suited, get_opponent(v1, v2), stack_depth));
+                    let p1_suited = [Card::new(v1, Suit::Spade), Card::new(v2, Suit::Spade)];
+                    states.push(PostflopState::new_preflop(
+                        p1_suited,
+                        get_opponent(v1, v2),
+                        stack_depth,
+                    ));
 
                     // Offsuit
-                    let p1_offsuit = [
-                        Card::new(v1, Suit::Spade),
-                        Card::new(v2, Suit::Heart),
-                    ];
-                    states.push(PostflopState::new_preflop(p1_offsuit, get_opponent(v1, v2), stack_depth));
+                    let p1_offsuit = [Card::new(v1, Suit::Spade), Card::new(v2, Suit::Heart)];
+                    states.push(PostflopState::new_preflop(
+                        p1_offsuit,
+                        get_opponent(v1, v2),
+                        stack_depth,
+                    ));
                 }
             }
         }
@@ -310,12 +319,20 @@ impl HunlPostflop {
         let deck = Self::full_deck();
         let mut deals = Vec::with_capacity(count);
 
+        print!("Starting random deal generation ...");
         for _ in 0..count {
             let mut shuffled = deck.clone();
             shuffled.shuffle(&mut rng);
+
             let p1 = [shuffled[0], shuffled[1]];
             let p2 = [shuffled[2], shuffled[3]];
-            let board = [shuffled[4], shuffled[5], shuffled[6], shuffled[7], shuffled[8]];
+            let board = [
+                shuffled[4],
+                shuffled[5],
+                shuffled[6],
+                shuffled[7],
+                shuffled[8],
+            ];
             deals.push(PostflopState::new_preflop_with_board(
                 p1,
                 p2,
@@ -323,6 +340,7 @@ impl HunlPostflop {
                 self.config.stack_depth,
             ));
         }
+        println!(" DONE");
         deals
     }
 
@@ -427,9 +445,9 @@ impl Game for HunlPostflop {
             actions.push(Action::Call);
         }
 
-        // Raise/bet sizes
+        // Raise/bet sizes (only if under the per-street raise cap)
         let effective_stack = stack.saturating_sub(to_call);
-        if effective_stack > 0 {
+        if effective_stack > 0 && state.street_bets < self.config.max_raises_per_street {
             let bet_sizes = self.get_bet_sizes(state.pot, effective_stack);
             for size in bet_sizes {
                 if actions.is_full() {
@@ -740,7 +758,6 @@ mod tests {
 
     #[timed_test]
     fn postflop_config_default_values() {
-
         let config = PostflopConfig::default();
         assert_eq!(config.stack_depth, 100);
         assert_eq!(config.bet_sizes, vec![0.33, 0.5, 0.75, 1.0]);
@@ -749,11 +766,11 @@ mod tests {
 
     #[timed_test]
     fn postflop_config_custom_values() {
-
         let config = PostflopConfig {
             stack_depth: 50,
             bet_sizes: vec![0.5, 1.0],
             samples_per_iteration: 500,
+            ..PostflopConfig::default()
         };
         assert_eq!(config.stack_depth, 50);
         assert_eq!(config.bet_sizes.len(), 2);
@@ -762,7 +779,6 @@ mod tests {
 
     #[timed_test]
     fn new_preflop_sets_correct_pot() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -772,7 +788,6 @@ mod tests {
 
     #[timed_test]
     fn new_preflop_sets_correct_stacks() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -784,7 +799,6 @@ mod tests {
 
     #[timed_test]
     fn new_preflop_sb_acts_first() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -793,7 +807,6 @@ mod tests {
 
     #[timed_test]
     fn new_preflop_to_call_is_half_bb() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -803,7 +816,6 @@ mod tests {
 
     #[timed_test]
     fn new_preflop_street_is_preflop() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -812,7 +824,6 @@ mod tests {
 
     #[timed_test]
     fn new_preflop_board_is_empty() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -821,7 +832,6 @@ mod tests {
 
     #[timed_test]
     fn new_preflop_is_not_terminal() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -830,7 +840,6 @@ mod tests {
 
     #[timed_test]
     fn new_preflop_history_is_empty() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -839,7 +848,6 @@ mod tests {
 
     #[timed_test]
     fn new_preflop_street_bets_is_one() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -849,7 +857,6 @@ mod tests {
 
     #[timed_test]
     fn current_stack_returns_sb_stack_when_sb_to_act() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -859,7 +866,6 @@ mod tests {
 
     #[timed_test]
     fn current_stack_returns_bb_stack_when_bb_to_act() {
-
         let (p1, p2) = sample_holdings();
         let mut state = PostflopState::new_preflop(p1, p2, 100);
         state.to_act = Some(Player::Player2);
@@ -869,7 +875,6 @@ mod tests {
 
     #[timed_test]
     fn opponent_stack_returns_bb_stack_when_sb_to_act() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -879,7 +884,6 @@ mod tests {
 
     #[timed_test]
     fn opponent_stack_returns_sb_stack_when_bb_to_act() {
-
         let (p1, p2) = sample_holdings();
         let mut state = PostflopState::new_preflop(p1, p2, 100);
         state.to_act = Some(Player::Player2);
@@ -889,7 +893,6 @@ mod tests {
 
     #[timed_test]
     fn current_holding_returns_p1_holding_when_sb_to_act() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -898,7 +901,6 @@ mod tests {
 
     #[timed_test]
     fn current_holding_returns_p2_holding_when_bb_to_act() {
-
         let (p1, p2) = sample_holdings();
         let mut state = PostflopState::new_preflop(p1, p2, 100);
         state.to_act = Some(Player::Player2);
@@ -908,7 +910,6 @@ mod tests {
 
     #[timed_test]
     fn terminal_type_fold_equality() {
-
         let fold_p1 = TerminalType::Fold(Player::Player1);
         let fold_p1_again = TerminalType::Fold(Player::Player1);
         let fold_p2 = TerminalType::Fold(Player::Player2);
@@ -919,7 +920,6 @@ mod tests {
 
     #[timed_test]
     fn terminal_type_showdown_equality() {
-
         let showdown1 = TerminalType::Showdown;
         let showdown2 = TerminalType::Showdown;
 
@@ -928,7 +928,6 @@ mod tests {
 
     #[timed_test]
     fn postflop_state_stores_holdings() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
@@ -938,7 +937,6 @@ mod tests {
 
     #[timed_test]
     fn different_stack_depths() {
-
         let (p1, p2) = sample_holdings();
 
         let state_50bb = PostflopState::new_preflop(p1, p2, 50);
@@ -958,7 +956,6 @@ mod tests {
 
     #[timed_test]
     fn preflop_actions_include_fold_call_raise() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
         let game = create_game();
@@ -983,7 +980,6 @@ mod tests {
 
     #[timed_test]
     fn fold_ends_game() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
         let game = create_game();
@@ -1000,7 +996,6 @@ mod tests {
 
     #[timed_test]
     fn check_check_advances_street() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
         let game = create_game();
@@ -1046,7 +1041,6 @@ mod tests {
 
     #[timed_test]
     fn call_after_raise_advances_street() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
         let game = create_game();
@@ -1091,7 +1085,10 @@ mod tests {
             assert_eq!(state.street, Street::Preflop);
             assert!(state.terminal.is_none());
             assert_eq!(state.to_act, Some(Player::Player1));
-            assert!(state.full_board.is_some(), "Random deal should have full_board");
+            assert!(
+                state.full_board.is_some(),
+                "Random deal should have full_board"
+            );
         }
     }
 
@@ -1103,7 +1100,6 @@ mod tests {
 
     #[timed_test]
     fn fold_utility_correct() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
         let game = create_game();
@@ -1127,7 +1123,6 @@ mod tests {
 
     #[timed_test]
     fn utilities_are_zero_sum() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
         let game = create_game();
@@ -1145,7 +1140,6 @@ mod tests {
 
     #[timed_test]
     fn info_set_key_includes_hand_and_history() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
         let game = create_game();
@@ -1174,7 +1168,6 @@ mod tests {
 
     #[timed_test]
     fn get_bet_sizes_includes_all_in() {
-
         let game = create_game();
         let pot = 150; // 1.5 BB
         let stack = 500; // 5 BB remaining
@@ -1190,7 +1183,6 @@ mod tests {
 
     #[timed_test]
     fn raise_switches_action() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
         let game = create_game();
@@ -1209,7 +1201,6 @@ mod tests {
 
     #[timed_test]
     fn bet_after_check_allowed() {
-
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
         let game = create_game();
@@ -1228,7 +1219,6 @@ mod tests {
 
     #[timed_test]
     fn river_check_check_is_showdown() {
-
         let (p1, p2) = sample_holdings();
         let mut state = PostflopState::new_preflop(p1, p2, 100);
         state.street = Street::River;
@@ -1256,7 +1246,6 @@ mod tests {
 
     #[timed_test]
     fn showdown_utility_uses_hand_evaluation() {
-
         // P1 has AA (Aces)
         let p1 = [
             make_card(Value::Ace, Suit::Spade),
@@ -1312,7 +1301,6 @@ mod tests {
 
     #[timed_test]
     fn showdown_utility_tie_splits_pot() {
-
         // Both players have same pocket pair
         let p1 = [
             make_card(Value::Nine, Suit::Spade),
@@ -1441,18 +1429,25 @@ mod tests {
         let game = create_game();
 
         // Play through all 4 streets with limp + check-through
-        let s = game.next_state(&state, Action::Call);    // SB limps
-        let s = game.next_state(&s, Action::Check);        // BB checks → flop
-        let s = game.next_state(&s, Action::Check);        // SB checks
-        let s = game.next_state(&s, Action::Check);        // BB checks → turn
-        let s = game.next_state(&s, Action::Check);        // SB checks
-        let s = game.next_state(&s, Action::Check);        // BB checks → river
-        let s = game.next_state(&s, Action::Check);        // SB checks
-        let s = game.next_state(&s, Action::Check);        // BB checks → showdown
+        let s = game.next_state(&state, Action::Call); // SB limps
+        let s = game.next_state(&s, Action::Check); // BB checks → flop
+        let s = game.next_state(&s, Action::Check); // SB checks
+        let s = game.next_state(&s, Action::Check); // BB checks → turn
+        let s = game.next_state(&s, Action::Check); // SB checks
+        let s = game.next_state(&s, Action::Check); // BB checks → river
+        let s = game.next_state(&s, Action::Check); // SB checks
+        let s = game.next_state(&s, Action::Check); // BB checks → showdown
 
-        assert!(game.is_terminal(&s), "Should reach terminal after all streets");
+        assert!(
+            game.is_terminal(&s),
+            "Should reach terminal after all streets"
+        );
         assert_eq!(s.terminal, Some(TerminalType::Showdown));
-        assert_eq!(s.board.len(), 5, "Board should have all 5 cards at showdown");
+        assert_eq!(
+            s.board.len(),
+            5,
+            "Board should have all 5 cards at showdown"
+        );
     }
 
     #[timed_test]
@@ -1506,17 +1501,20 @@ mod tests {
         for (i, deal) in deals.iter().enumerate() {
             let board = deal.full_board.expect("should have board");
             let mut all_cards = vec![
-                deal.p1_holding[0], deal.p1_holding[1],
-                deal.p2_holding[0], deal.p2_holding[1],
-                board[0], board[1], board[2], board[3], board[4],
+                deal.p1_holding[0],
+                deal.p1_holding[1],
+                deal.p2_holding[0],
+                deal.p2_holding[1],
+                board[0],
+                board[1],
+                board[2],
+                board[3],
+                board[4],
             ];
             let orig_len = all_cards.len();
             all_cards.sort_by_key(|c| (c.value as u8, c.suit as u8));
             all_cards.dedup();
-            assert_eq!(
-                all_cards.len(), orig_len,
-                "Deal {i} has duplicate cards"
-            );
+            assert_eq!(all_cards.len(), orig_len, "Deal {i} has duplicate cards");
         }
     }
 
@@ -1542,7 +1540,10 @@ mod tests {
     fn new_preflop_has_none_full_board() {
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
-        assert!(state.full_board.is_none(), "Plain new_preflop should have no full_board");
+        assert!(
+            state.full_board.is_none(),
+            "Plain new_preflop should have no full_board"
+        );
     }
 
     #[timed_test]
@@ -1556,6 +1557,9 @@ mod tests {
         let s = game.next_state(&s, Action::Check);
 
         assert_eq!(s.street, Street::Flop);
-        assert!(s.board.is_empty(), "Board should stay empty without full_board");
+        assert!(
+            s.board.is_empty(),
+            "Board should stay empty without full_board"
+        );
     }
 }

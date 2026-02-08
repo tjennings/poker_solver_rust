@@ -33,8 +33,9 @@ impl From<std::io::Error> for BlueprintError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test]
     fn io_error_displays_message() {
         let err = BlueprintError::IoError("file not found".to_string());
         let msg = err.to_string();
@@ -42,7 +43,7 @@ mod tests {
         assert!(msg.contains("file not found"), "should contain message");
     }
 
-    #[test]
+    #[timed_test]
     fn serialization_error_displays_message() {
         let err = BlueprintError::SerializationError("invalid JSON".to_string());
         let msg = err.to_string();
@@ -53,7 +54,7 @@ mod tests {
         assert!(msg.contains("invalid JSON"), "should contain message");
     }
 
-    #[test]
+    #[timed_test]
     fn invalid_strategy_error_displays_message() {
         let err = BlueprintError::InvalidStrategy("probabilities don't sum to 1".to_string());
         let msg = err.to_string();
@@ -67,7 +68,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test]
     fn cache_error_displays_message() {
         let err = BlueprintError::CacheError("cache full".to_string());
         let msg = err.to_string();
@@ -75,7 +76,7 @@ mod tests {
         assert!(msg.contains("cache full"), "should contain message");
     }
 
-    #[test]
+    #[timed_test]
     fn info_set_not_found_error_displays_message() {
         let err = BlueprintError::InfoSetNotFound("AKs:r/c/r".to_string());
         let msg = err.to_string();
@@ -86,7 +87,7 @@ mod tests {
         assert!(msg.contains("AKs:r/c/r"), "should contain info set key");
     }
 
-    #[test]
+    #[timed_test]
     fn from_io_error_converts_correctly() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
         let blueprint_err: BlueprintError = io_err.into();
@@ -102,10 +103,10 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test]
     fn error_is_debug() {
         let err = BlueprintError::IoError("test".to_string());
-        let debug_str = format!("{:?}", err);
+        let debug_str = format!("{err:?}");
         assert!(debug_str.contains("IoError"), "should be debuggable");
     }
 }

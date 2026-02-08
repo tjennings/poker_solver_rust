@@ -102,9 +102,7 @@ fn exploitability_decreases_over_training() {
         let strategy = extract_strategy(&solver);
         let exploitability = calculate_exploitability(&game, &strategy);
 
-        println!(
-            "After {iterations} iterations: exploitability = {exploitability:.6}"
-        );
+        println!("After {iterations} iterations: exploitability = {exploitability:.6}");
 
         if iterations >= 500 {
             assert!(
@@ -132,4 +130,3 @@ fn extract_strategy(solver: &VanillaCfr<KuhnPoker>) -> HashMap<String, Vec<f64>>
         .filter_map(|&is| solver.get_average_strategy(is).map(|s| (is.to_string(), s)))
         .collect()
 }
-
