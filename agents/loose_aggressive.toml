@@ -1,0 +1,123 @@
+[game]
+stack_depth = 100
+bet_sizes = [0.5, 1.0]
+
+# Very wide opening ranges — plays almost everything in position
+[ranges]
+utg = "22+,A2s+,K9s+,Q9s+,J9s+,T8s+,97s+,87s,76s,65s,A8o+,KTo+,QTo+,JTo"
+mp  = "22+,A2s+,K5s+,Q8s+,J8s+,T8s+,97s+,86s+,76s,65s,54s,A5o+,K9o+,Q9o+,J9o+,T9o"
+co  = "22+,A2s+,K2s+,Q2s+,J5s+,T6s+,96s+,85s+,75s+,64s+,54s,A2o+,K5o+,Q8o+,J8o+,T8o+,98o,87o"
+btn = "22+,A2s+,K2s+,Q2s+,J2s+,T4s+,95s+,85s+,74s+,64s+,53s+,43s,A2o+,K2o+,Q4o+,J7o+,T7o+,97o+,86o+,76o,65o"
+sb  = "22+,A2s+,K2s+,Q2s+,J2s+,T2s+,94s+,84s+,74s+,63s+,53s+,43s,A2o+,K2o+,Q3o+,J6o+,T7o+,96o+,86o+,76o,65o,54o"
+bb  = "22+,A2s+,K2s+,Q2s+,J2s+,T2s+,92s+,82s+,72s+,62s+,52s+,42s+,32s,A2o+,K2o+,Q2o+,J2o+,T3o+,95o+,85o+,74o+,64o+,54o,43o"
+
+# Preflop and unclassified: rarely fold, raise a lot
+[default]
+fold = 0.2
+call = 0.3
+raise = 0.5
+
+# --- Monsters: always raising ---
+[classes.StraightFlush]
+fold = 0.0
+call = 0.1
+raise = 0.9
+
+[classes.FourOfAKind]
+fold = 0.0
+call = 0.1
+raise = 0.9
+
+[classes.FullHouse]
+fold = 0.0
+call = 0.15
+raise = 0.85
+
+[classes.Flush]
+fold = 0.0
+call = 0.2
+raise = 0.8
+
+[classes.Straight]
+fold = 0.0
+call = 0.2
+raise = 0.8
+
+# --- Strong hands: bet/raise almost always ---
+[classes.Set]
+fold = 0.0
+call = 0.15
+raise = 0.85
+
+[classes.Trips]
+fold = 0.0
+call = 0.2
+raise = 0.8
+
+[classes.TwoPair]
+fold = 0.0
+call = 0.25
+raise = 0.75
+
+[classes.TopPair]
+fold = 0.0
+call = 0.3
+raise = 0.7
+
+# --- Medium pairs: still aggressive ---
+[classes.SecondPair]
+fold = 0.1
+call = 0.35
+raise = 0.55
+
+[classes.ThirdPair]
+fold = 0.2
+call = 0.35
+raise = 0.45
+
+[classes.LowPair]
+fold = 0.25
+call = 0.35
+raise = 0.4
+
+[classes.Underpair]
+fold = 0.25
+call = 0.35
+raise = 0.4
+
+# --- No pair: heavy bluffing ---
+[classes.AceHigh]
+fold = 0.15
+call = 0.25
+raise = 0.6
+
+[classes.KingHigh]
+fold = 0.25
+call = 0.25
+raise = 0.5
+
+# --- Draws: very aggressive semi-bluffs ---
+[classes.FlushDrawNuts]
+fold = 0.0
+call = 0.2
+raise = 0.8
+
+[classes.FlushDraw]
+fold = 0.0
+call = 0.25
+raise = 0.75
+
+[classes.BackdoorFlushDraw]
+fold = 0.15
+call = 0.3
+raise = 0.55
+
+[classes.Oesd]
+fold = 0.0
+call = 0.2
+raise = 0.8
+
+[classes.Gutshot]
+fold = 0.1
+call = 0.3
+raise = 0.6

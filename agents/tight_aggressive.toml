@@ -1,0 +1,123 @@
+[game]
+stack_depth = 100
+bet_sizes = [0.5, 1.0]
+
+# Standard TAG opening ranges
+[ranges]
+utg = "77+,ATs+,KQs,AJo+"
+mp  = "55+,A9s+,KJs+,QJs,ATo+,KQo"
+co  = "22+,A2s+,K9s+,Q9s+,J9s+,T8s+,97s+,87s,76s,65s,A8o+,KTo+,QTo+,JTo"
+btn = "22+,A2s+,K2s+,Q5s+,J7s+,T7s+,96s+,86s+,75s+,64s+,54s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o"
+sb  = "22+,A2s+,K2s+,Q2s+,J5s+,T6s+,96s+,85s+,75s+,64s+,54s,A2o+,K4o+,Q7o+,J8o+,T8o+,98o,87o"
+bb  = "22+,A2s+,K2s+,Q2s+,J2s+,T2s+,92s+,82s+,72s+,62s+,52s+,42s+,32s,A2o+,K2o+,Q2o+,J3o+,T5o+,96o+,86o+,75o+,65o,54o"
+
+# Preflop and unclassified: selective, fold most junk
+[default]
+fold = 0.55
+call = 0.2
+raise = 0.25
+
+# --- Monsters: fast-play for value ---
+[classes.StraightFlush]
+fold = 0.0
+call = 0.15
+raise = 0.85
+
+[classes.FourOfAKind]
+fold = 0.0
+call = 0.2
+raise = 0.8
+
+[classes.FullHouse]
+fold = 0.0
+call = 0.25
+raise = 0.75
+
+[classes.Flush]
+fold = 0.0
+call = 0.3
+raise = 0.7
+
+[classes.Straight]
+fold = 0.0
+call = 0.35
+raise = 0.65
+
+# --- Strong hands: raise-heavy ---
+[classes.Set]
+fold = 0.0
+call = 0.25
+raise = 0.75
+
+[classes.Trips]
+fold = 0.0
+call = 0.35
+raise = 0.65
+
+[classes.TwoPair]
+fold = 0.0
+call = 0.4
+raise = 0.6
+
+[classes.TopPair]
+fold = 0.05
+call = 0.4
+raise = 0.55
+
+# --- Medium pairs: mix of actions, still aggressive ---
+[classes.SecondPair]
+fold = 0.2
+call = 0.45
+raise = 0.35
+
+[classes.ThirdPair]
+fold = 0.45
+call = 0.35
+raise = 0.2
+
+[classes.LowPair]
+fold = 0.55
+call = 0.3
+raise = 0.15
+
+[classes.Underpair]
+fold = 0.6
+call = 0.25
+raise = 0.15
+
+# --- No pair: fold or bluff, rarely flat ---
+[classes.AceHigh]
+fold = 0.45
+call = 0.25
+raise = 0.3
+
+[classes.KingHigh]
+fold = 0.6
+call = 0.15
+raise = 0.25
+
+# --- Draws: aggressive semi-bluffs ---
+[classes.FlushDrawNuts]
+fold = 0.0
+call = 0.35
+raise = 0.65
+
+[classes.FlushDraw]
+fold = 0.05
+call = 0.4
+raise = 0.55
+
+[classes.BackdoorFlushDraw]
+fold = 0.4
+call = 0.3
+raise = 0.3
+
+[classes.Oesd]
+fold = 0.05
+call = 0.35
+raise = 0.6
+
+[classes.Gutshot]
+fold = 0.35
+call = 0.3
+raise = 0.35

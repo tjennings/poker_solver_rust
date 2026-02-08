@@ -1,10 +1,10 @@
 //! Exploration commands for navigating trained HUNL strategies.
 //!
-//! Allows users to load a strategy bundle and explore the game tree,
-//! viewing optimal strategies at each decision point.
+//! Allows users to load a strategy bundle or a rule-based agent config
+//! and explore the game tree, viewing strategies at each decision point.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use poker_solver_core::abstraction::{CardAbstraction, Street};
+use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint::{BundleConfig, StrategyBundle};
+use poker_solver_core::hand_class::classify;
+use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{Card, Suit, Value};
 
 /// Event payload for bucket computation progress.
@@ -26,8 +29,8 @@ pub struct BucketProgressEvent {
 
 /// State for the exploration view.
 pub struct ExplorationState {
-    /// Currently loaded bundle
-    bundle: RwLock<Option<LoadedBundle>>,
+    /// Currently loaded strategy source (bundle or agent)
+    source: RwLock<Option<StrategySource>>,
     /// Cached bucket computations: board_key -> (rank1, rank2, suited) -> bucket
     #[allow(clippy::type_complexity)]
     bucket_cache: Arc<RwLock<HashMap<String, HashMap<(char, char, bool), u16>>>>,
@@ -43,16 +46,19 @@ pub struct ExplorationState {
     abstraction_boundaries: Arc<RwLock<Option<poker_solver_core::abstraction::BucketBoundaries>>>,
 }
 
-/// A loaded strategy bundle with derived components.
-struct LoadedBundle {
-    config: BundleConfig,
-    blueprint: poker_solver_core::blueprint::BlueprintStrategy,
+/// A loaded strategy source — either a trained bundle or a rule-based agent.
+enum StrategySource {
+    Bundle {
+        config: BundleConfig,
+        blueprint: poker_solver_core::blueprint::BlueprintStrategy,
+    },
+    Agent(AgentConfig),
 }
 
 impl Default for ExplorationState {
     fn default() -> Self {
         Self {
-            bundle: RwLock::new(None),
+            source: RwLock::new(None),
             bucket_cache: Arc::new(RwLock::new(HashMap::new())),
             computation_progress: Arc::new(AtomicUsize::new(0)),
             computation_total: Arc::new(AtomicUsize::new(0)),
@@ -142,24 +148,49 @@ impl Default for ExplorationPosition {
         Self {
             board: vec![],
             history: vec![],
-            pot: 3, // SB + BB posted
+            pot: 3,       // SB + BB posted
             stack_p1: 99, // SB posted 1
             stack_p2: 98, // BB posted 2
-            to_act: 0, // SB acts first preflop
+            to_act: 0,    // SB acts first preflop
         }
     }
 }
 
-/// Load a strategy bundle from a directory.
+/// Load a strategy bundle from a directory, or an agent from a `.toml` file.
 #[tauri::command]
-pub fn load_bundle(
-    state: State<'_, ExplorationState>,
-    path: String,
-) -> Result<BundleInfo, String> {
+pub fn load_bundle(state: State<'_, ExplorationState>, path: String) -> Result<BundleInfo, String> {
     let bundle_path = PathBuf::from(&path);
 
-    let bundle = StrategyBundle::load(&bundle_path)
-        .map_err(|e| format!("Failed to load bundle: {e}"))?;
+    let (info, source) = if path.ends_with(".toml") {
+        load_agent(&bundle_path)?
+    } else {
+        load_trained_bundle(&bundle_path, &state)?
+    };
+
+    *state.source.write() = Some(source);
+    state.bucket_cache.write().clear();
+
+    Ok(info)
+}
+
+fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
+    let agent = AgentConfig::load(path).map_err(|e| format!("Failed to load agent: {e}"))?;
+
+    let info = BundleInfo {
+        stack_depth: agent.game.stack_depth,
+        bet_sizes: agent.game.bet_sizes.clone(),
+        info_sets: 0,
+        iterations: 0,
+    };
+
+    Ok((info, StrategySource::Agent(agent)))
+}
+
+fn load_trained_bundle(
+    path: &Path,
+    state: &State<'_, ExplorationState>,
+) -> Result<(BundleInfo, StrategySource), String> {
+    let bundle = StrategyBundle::load(path).map_err(|e| format!("Failed to load bundle: {e}"))?;
 
     let info = BundleInfo {
         stack_depth: bundle.config.game.stack_depth,
@@ -168,20 +199,14 @@ pub fn load_bundle(
         iterations: bundle.blueprint.iterations_trained(),
     };
 
-    // Store boundaries for thread-safe bucket computation
     *state.abstraction_boundaries.write() = Some(bundle.boundaries.clone());
 
-    let loaded = LoadedBundle {
+    let source = StrategySource::Bundle {
         config: bundle.config,
         blueprint: bundle.blueprint,
     };
 
-    *state.bundle.write() = Some(loaded);
-
-    // Clear bucket cache when loading new bundle
-    state.bucket_cache.write().clear();
-
-    Ok(info)
+    Ok((info, source))
 }
 
 /// Get the strategy matrix for a given position.
@@ -191,23 +216,35 @@ pub fn get_strategy_matrix(
     state: State<'_, ExplorationState>,
     position: ExplorationPosition,
 ) -> Result<StrategyMatrix, String> {
-    let bundle_guard = state.bundle.read();
-    let bundle = bundle_guard
+    let source_guard = state.source.read();
+    let source = source_guard
         .as_ref()
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
+    match source {
+        StrategySource::Bundle { config, blueprint } => {
+            get_strategy_matrix_bundle(config, blueprint, &state, &position)
+        }
+        StrategySource::Agent(agent) => get_strategy_matrix_agent(agent, &position),
+    }
+}
+
+fn get_strategy_matrix_bundle(
+    config: &BundleConfig,
+    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
+    state: &State<'_, ExplorationState>,
+    position: &ExplorationPosition,
+) -> Result<StrategyMatrix, String> {
     let board = parse_board(&position.board)?;
     let street = street_from_board_len(board.len())?;
     let history_str = build_history_string(&position.history);
 
-    // Build the 13x13 matrix
-    let ranks = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+    let ranks = RANKS;
     let mut cells = Vec::with_capacity(13);
 
-    // Get available actions for this position
-    let actions = get_actions_for_position(bundle, &position);
+    let actions =
+        get_actions_for_position(config.game.stack_depth, &config.game.bet_sizes, position);
 
-    // For postflop, try to use cached buckets (non-blocking)
     let bucket_cache: Option<HashMap<(char, char, bool), u16>> =
         if street != Street::Preflop && !board.is_empty() {
             let board_key = position.board.join("");
@@ -220,20 +257,10 @@ pub fn get_strategy_matrix(
     for (row, &rank1) in ranks.iter().enumerate() {
         let mut row_cells = Vec::with_capacity(13);
         for (col, &rank2) in ranks.iter().enumerate() {
-            let (hand_label, suited, pair) = if row == col {
-                // Pocket pair
-                (format!("{rank1}{rank1}"), false, true)
-            } else if row < col {
-                // Suited (above diagonal)
-                (format!("{rank1}{rank2}s"), true, false)
-            } else {
-                // Offsuit (below diagonal)
-                (format!("{rank2}{rank1}o"), false, false)
-            };
+            let (hand_label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
 
-            // Get strategy for this hand
             let probabilities = get_hand_strategy(
-                bundle,
+                blueprint,
                 &board,
                 street,
                 &history_str,
@@ -259,8 +286,65 @@ pub fn get_strategy_matrix(
         actions,
         street: format!("{street:?}"),
         pot: position.pot,
-        stack: if position.to_act == 0 { position.stack_p1 } else { position.stack_p2 },
-        to_call: calculate_to_call(&position),
+        stack: if position.to_act == 0 {
+            position.stack_p1
+        } else {
+            position.stack_p2
+        },
+        to_call: calculate_to_call(position),
+    })
+}
+
+fn get_strategy_matrix_agent(
+    agent: &AgentConfig,
+    position: &ExplorationPosition,
+) -> Result<StrategyMatrix, String> {
+    let board = parse_board(&position.board)?;
+    let street = street_from_board_len(board.len())?;
+    let is_preflop = street == Street::Preflop;
+
+    let actions = get_actions_for_position(agent.game.stack_depth, &agent.game.bet_sizes, position);
+
+    // For heads-up: to_act 0 (SB) = btn, to_act 1 (BB) = bb
+    let position_name = if position.to_act == 0 { "btn" } else { "bb" };
+
+    let ranks = RANKS;
+    let mut cells = Vec::with_capacity(13);
+
+    for (row, &rank1) in ranks.iter().enumerate() {
+        let mut row_cells = Vec::with_capacity(13);
+        for (col, &rank2) in ranks.iter().enumerate() {
+            let (hand_label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
+
+            let freq = if is_preflop {
+                resolve_preflop_frequency(agent, position_name, rank1, rank2, suited)
+            } else {
+                resolve_postflop_frequency(agent, rank1, rank2, suited, &board)
+            };
+
+            let probabilities = map_frequencies_to_actions(freq, &actions);
+
+            row_cells.push(MatrixCell {
+                hand: hand_label,
+                suited,
+                pair,
+                probabilities,
+            });
+        }
+        cells.push(row_cells);
+    }
+
+    Ok(StrategyMatrix {
+        cells,
+        actions,
+        street: format!("{street:?}"),
+        pot: position.pot,
+        stack: if position.to_act == 0 {
+            position.stack_p1
+        } else {
+            position.stack_p2
+        },
+        to_call: calculate_to_call(position),
     })
 }
 
@@ -270,33 +354,48 @@ pub fn get_available_actions(
     state: State<'_, ExplorationState>,
     position: ExplorationPosition,
 ) -> Result<Vec<ActionInfo>, String> {
-    let bundle_guard = state.bundle.read();
-    let bundle = bundle_guard
+    let source_guard = state.source.read();
+    let source = source_guard
         .as_ref()
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
-    Ok(get_actions_for_position(bundle, &position))
+    let (stack_depth, bet_sizes) = match source {
+        StrategySource::Bundle { config, .. } => {
+            (config.game.stack_depth, config.game.bet_sizes.as_slice())
+        }
+        StrategySource::Agent(agent) => (agent.game.stack_depth, agent.game.bet_sizes.as_slice()),
+    };
+
+    Ok(get_actions_for_position(stack_depth, bet_sizes, &position))
 }
 
-/// Check if a bundle is loaded.
+/// Check if a bundle or agent is loaded.
 #[tauri::command]
 pub fn is_bundle_loaded(state: State<'_, ExplorationState>) -> bool {
-    state.bundle.read().is_some()
+    state.source.read().is_some()
 }
 
-/// Get info about currently loaded bundle.
+/// Get info about currently loaded bundle or agent.
 #[tauri::command]
 pub fn get_bundle_info(state: State<'_, ExplorationState>) -> Result<BundleInfo, String> {
-    let bundle_guard = state.bundle.read();
-    let bundle = bundle_guard
+    let source_guard = state.source.read();
+    let source = source_guard
         .as_ref()
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
-    Ok(BundleInfo {
-        stack_depth: bundle.config.game.stack_depth,
-        bet_sizes: bundle.config.game.bet_sizes.clone(),
-        info_sets: bundle.blueprint.len(),
-        iterations: bundle.blueprint.iterations_trained(),
+    Ok(match source {
+        StrategySource::Bundle { config, blueprint } => BundleInfo {
+            stack_depth: config.game.stack_depth,
+            bet_sizes: config.game.bet_sizes.clone(),
+            info_sets: blueprint.len(),
+            iterations: blueprint.iterations_trained(),
+        },
+        StrategySource::Agent(agent) => BundleInfo {
+            stack_depth: agent.game.stack_depth,
+            bet_sizes: agent.game.bet_sizes.clone(),
+            info_sets: 0,
+            iterations: 0,
+        },
     })
 }
 
@@ -321,16 +420,26 @@ pub fn get_computation_status(state: State<'_, ExplorationState>) -> Computation
 }
 
 /// Start async bucket computation for a board.
-/// Returns immediately, computation happens in background.
+/// Returns immediately for agents (no computation needed).
+/// For bundles, computation happens in background.
 #[tauri::command]
 pub fn start_bucket_computation(
     app: AppHandle,
     state: State<'_, ExplorationState>,
     board: Vec<String>,
 ) -> Result<String, String> {
+    let board_key = board.join("");
+
+    // Agents don't need bucket computation
+    {
+        let source_guard = state.source.read();
+        if let Some(StrategySource::Agent(_)) = source_guard.as_ref() {
+            return Ok(board_key);
+        }
+    }
+
     // Parse board
     let board_cards = parse_board(&board)?;
-    let board_key = board.join("");
 
     // Check if already cached
     {
@@ -376,7 +485,9 @@ pub fn start_bucket_computation(
 
     // Spawn background thread
     std::thread::spawn(move || {
-        let ranks = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+        let ranks = [
+            'A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2',
+        ];
         let mut completed = 0;
         let mut local_cache: HashMap<(char, char, bool), u16> = HashMap::new();
 
@@ -394,7 +505,8 @@ pub fn start_bucket_computation(
                     }
 
                     // Compute bucket
-                    let (card1, card2) = make_representative_hand(rank1, rank2, suited, &board_cards);
+                    let (card1, card2) =
+                        make_representative_hand(rank1, rank2, suited, &board_cards);
                     if let Ok(bucket) = abstraction.get_bucket(&board_cards, (card1, card2)) {
                         local_cache.insert((rank1, rank2, suited), bucket);
                     }
@@ -418,7 +530,9 @@ pub fn start_bucket_computation(
         }
 
         // Store in global cache
-        bucket_cache.write().insert(board_key_clone.clone(), local_cache);
+        bucket_cache
+            .write()
+            .insert(board_key_clone.clone(), local_cache);
 
         // Computation complete - emit final event
         let _ = app.emit(
@@ -439,10 +553,7 @@ pub fn start_bucket_computation(
 
 /// Check if bucket computation for a board is complete.
 #[tauri::command]
-pub fn is_board_cached(
-    state: State<'_, ExplorationState>,
-    board: Vec<String>,
-) -> bool {
+pub fn is_board_cached(state: State<'_, ExplorationState>, board: Vec<String>) -> bool {
     let board_key = board.join("");
     let cache = state.bucket_cache.read();
     cache.contains_key(&board_key)
@@ -520,10 +631,18 @@ fn action_to_key_char(action: &str) -> String {
     }
 }
 
-fn get_actions_for_position(bundle: &LoadedBundle, position: &ExplorationPosition) -> Vec<ActionInfo> {
+fn get_actions_for_position(
+    _stack_depth: u32,
+    bet_sizes: &[f32],
+    position: &ExplorationPosition,
+) -> Vec<ActionInfo> {
     let mut actions = Vec::new();
     let to_call = calculate_to_call(position);
-    let stack = if position.to_act == 0 { position.stack_p1 } else { position.stack_p2 };
+    let stack = if position.to_act == 0 {
+        position.stack_p1
+    } else {
+        position.stack_p2
+    };
 
     // Fold if facing a bet
     if to_call > 0 {
@@ -552,7 +671,7 @@ fn get_actions_for_position(bundle: &LoadedBundle, position: &ExplorationPositio
     // Bet/raise sizes from config
     let effective_stack = stack.saturating_sub(to_call);
     if effective_stack > 0 {
-        for &fraction in &bundle.config.game.bet_sizes {
+        for &fraction in bet_sizes {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let size = (f64::from(position.pot) * f64::from(fraction)).round() as u32;
             if size > 0 && size <= effective_stack {
@@ -568,7 +687,10 @@ fn get_actions_for_position(bundle: &LoadedBundle, position: &ExplorationPositio
 
         // All-in
         let all_in = if to_call == 0 { effective_stack } else { stack };
-        if !actions.iter().any(|a| a.id.ends_with(&format!(":{all_in}"))) {
+        if !actions
+            .iter()
+            .any(|a| a.id.ends_with(&format!(":{all_in}")))
+        {
             let action_type = if to_call == 0 { "bet" } else { "raise" };
             actions.push(ActionInfo {
                 id: format!("{action_type}:{all_in}"),
@@ -595,7 +717,10 @@ fn calculate_to_call(position: &ExplorationPosition) -> u32 {
             } else {
                 p2_invested = p1_invested;
             }
-        } else if let Some(amt) = action.strip_prefix("r:").or_else(|| action.strip_prefix("b:")) {
+        } else if let Some(amt) = action
+            .strip_prefix("r:")
+            .or_else(|| action.strip_prefix("b:"))
+        {
             if let Ok(amount) = amt.parse::<u32>() {
                 if is_p1 {
                     p1_invested = amount;
@@ -615,7 +740,7 @@ fn calculate_to_call(position: &ExplorationPosition) -> u32 {
 
 #[allow(clippy::too_many_arguments)]
 fn get_hand_strategy(
-    bundle: &LoadedBundle,
+    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
     _board: &[Card],
     street: Street,
     history_str: &str,
@@ -625,10 +750,7 @@ fn get_hand_strategy(
     actions: &[ActionInfo],
     bucket_cache: Option<&std::collections::HashMap<(char, char, bool), u16>>,
 ) -> Result<Vec<ActionProb>, String> {
-    // For preflop, use hand string directly
-    // For postflop, need to pick a representative hand and get bucket
     let bucket_or_hand = if street == Street::Preflop {
-        // Canonical format: AA (pairs), AKs (suited), AKo (offsuit)
         if rank1 == rank2 {
             format!("{rank1}{rank2}")
         } else if suited {
@@ -637,7 +759,6 @@ fn get_hand_strategy(
             format!("{rank1}{rank2}o")
         }
     } else {
-        // Postflop requires bucket cache to have been computed
         let cache = bucket_cache.ok_or_else(|| {
             format!(
                 "Bucket cache not available for postflop street {street:?}. \
@@ -659,11 +780,11 @@ fn get_hand_strategy(
 
     let info_set_key = format!("{bucket_or_hand}|{street_char}|{history_str}");
 
-    let probs = bundle.blueprint.lookup(&info_set_key).ok_or_else(|| {
+    let probs = blueprint.lookup(&info_set_key).ok_or_else(|| {
         format!(
             "Blueprint lookup failed for key '{info_set_key}' \
              (blueprint has {} info sets)",
-            bundle.blueprint.len()
+            blueprint.len()
         )
     })?;
 
@@ -677,7 +798,126 @@ fn get_hand_strategy(
         .collect())
 }
 
-fn make_representative_hand(rank1: char, rank2: char, suited: bool, board: &[Card]) -> (Card, Card) {
+const RANKS: [char; 13] = [
+    'A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2',
+];
+
+fn hand_label_from_matrix(
+    row: usize,
+    col: usize,
+    rank1: char,
+    rank2: char,
+) -> (String, bool, bool) {
+    if row == col {
+        (format!("{rank1}{rank1}"), false, true)
+    } else if row < col {
+        (format!("{rank1}{rank2}s"), true, false)
+    } else {
+        (format!("{rank2}{rank1}o"), false, false)
+    }
+}
+
+fn resolve_preflop_frequency<'a>(
+    agent: &'a AgentConfig,
+    position_name: &str,
+    rank1: char,
+    rank2: char,
+    suited: bool,
+) -> &'a FrequencyMap {
+    let v1 = char_to_value(rank1);
+    let v2 = char_to_value(rank2);
+    let canonical = CanonicalHand::new(v1, v2, suited);
+
+    if agent.ranges.is_empty() || agent.in_range(position_name, &canonical) {
+        &agent.default
+    } else {
+        &FrequencyMap::FOLD
+    }
+}
+
+fn resolve_postflop_frequency<'a>(
+    agent: &'a AgentConfig,
+    rank1: char,
+    rank2: char,
+    suited: bool,
+    board: &[Card],
+) -> &'a FrequencyMap {
+    let (card1, card2) = make_representative_hand(rank1, rank2, suited, board);
+    match classify([card1, card2], board) {
+        Ok(classification) => agent.resolve(&classification),
+        Err(_) => &agent.default,
+    }
+}
+
+fn map_frequencies_to_actions(freq: &FrequencyMap, actions: &[ActionInfo]) -> Vec<ActionProb> {
+    let has_fold = actions.iter().any(|a| a.action_type == "fold");
+    let raise_count = actions
+        .iter()
+        .filter(|a| matches!(a.action_type.as_str(), "bet" | "raise" | "allin"))
+        .count();
+
+    // Redistribute fold if not available (check scenario)
+    let (fold_freq, call_freq, raise_freq) = if !has_fold && freq.fold > 0.0 {
+        let redistributable = freq.fold;
+        let non_fold_sum = freq.call + freq.raise;
+        if non_fold_sum > 0.0 {
+            (
+                0.0,
+                freq.call + redistributable * (freq.call / non_fold_sum),
+                freq.raise + redistributable * (freq.raise / non_fold_sum),
+            )
+        } else {
+            (0.0, 1.0, 0.0)
+        }
+    } else {
+        (freq.fold, freq.call, freq.raise)
+    };
+
+    // Redistribute raise if no raise actions available
+    let (fold_freq, call_freq, raise_freq) = if raise_count == 0 && raise_freq > 0.0 {
+        let non_raise_sum = fold_freq + call_freq;
+        if non_raise_sum > 0.0 {
+            (
+                fold_freq + raise_freq * (fold_freq / non_raise_sum),
+                call_freq + raise_freq * (call_freq / non_raise_sum),
+                0.0,
+            )
+        } else {
+            (0.0, 1.0, 0.0)
+        }
+    } else {
+        (fold_freq, call_freq, raise_freq)
+    };
+
+    let per_raise = if raise_count > 0 {
+        raise_freq / raise_count as f32
+    } else {
+        0.0
+    };
+
+    actions
+        .iter()
+        .map(|a| {
+            let probability = match a.action_type.as_str() {
+                "fold" => fold_freq,
+                "check" | "call" => call_freq,
+                "bet" | "raise" | "allin" => per_raise,
+                _ => 0.0,
+            };
+            ActionProb {
+                action: a.label.clone(),
+                probability,
+            }
+        })
+        .collect()
+}
+
+fn make_representative_hand(
+    rank1: char,
+    rank2: char,
+    suited: bool,
+    board: &[Card],
+) -> (Card, Card) {
     let v1 = char_to_value(rank1);
     let v2 = char_to_value(rank2);
 
@@ -733,4 +973,3 @@ fn char_to_value(c: char) -> Value {
         _ => Value::Two,
     }
 }
-

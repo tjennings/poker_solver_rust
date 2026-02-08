@@ -1,0 +1,123 @@
+[game]
+stack_depth = 100
+bet_sizes = [0.5, 1.0]
+
+# Narrow preflop ranges — only premiums and strong hands
+[ranges]
+utg = "TT+,AQs+,AKo"
+mp  = "88+,AJs+,KQs,AQo+"
+co  = "66+,ATs+,KJs+,QJs,AJo+,KQo"
+btn = "44+,A8s+,KTs+,QTs+,JTs,T9s,98s,A9o+,KJo+,QJo"
+sb  = "33+,A5s+,K9s+,Q9s+,J9s+,T9s,98s,87s,A8o+,KTo+,QTo+,JTo"
+bb  = "22+,A2s+,K5s+,Q8s+,J8s+,T8s+,97s+,87s,76s,65s,A2o+,K9o+,Q9o+,J9o+,T9o"
+
+# Preflop and unclassified hands: mostly fold
+[default]
+fold = 0.6
+call = 0.3
+raise = 0.1
+
+# --- Monsters: still mostly call (slow-play tendency) ---
+[classes.StraightFlush]
+fold = 0.0
+call = 0.7
+raise = 0.3
+
+[classes.FourOfAKind]
+fold = 0.0
+call = 0.7
+raise = 0.3
+
+[classes.FullHouse]
+fold = 0.0
+call = 0.7
+raise = 0.3
+
+[classes.Flush]
+fold = 0.0
+call = 0.75
+raise = 0.25
+
+[classes.Straight]
+fold = 0.0
+call = 0.75
+raise = 0.25
+
+# --- Strong made hands: call-heavy, rarely raise ---
+[classes.Set]
+fold = 0.0
+call = 0.7
+raise = 0.3
+
+[classes.Trips]
+fold = 0.05
+call = 0.7
+raise = 0.25
+
+[classes.TwoPair]
+fold = 0.05
+call = 0.75
+raise = 0.2
+
+[classes.TopPair]
+fold = 0.1
+call = 0.75
+raise = 0.15
+
+# --- Medium pairs: call or fold, almost never raise ---
+[classes.SecondPair]
+fold = 0.3
+call = 0.65
+raise = 0.05
+
+[classes.ThirdPair]
+fold = 0.5
+call = 0.45
+raise = 0.05
+
+[classes.LowPair]
+fold = 0.6
+call = 0.35
+raise = 0.05
+
+[classes.Underpair]
+fold = 0.7
+call = 0.25
+raise = 0.05
+
+# --- No pair: mostly fold ---
+[classes.AceHigh]
+fold = 0.6
+call = 0.35
+raise = 0.05
+
+[classes.KingHigh]
+fold = 0.75
+call = 0.2
+raise = 0.05
+
+# --- Draws: call sometimes, rarely semi-bluff ---
+[classes.FlushDrawNuts]
+fold = 0.15
+call = 0.7
+raise = 0.15
+
+[classes.FlushDraw]
+fold = 0.3
+call = 0.6
+raise = 0.1
+
+[classes.BackdoorFlushDraw]
+fold = 0.6
+call = 0.35
+raise = 0.05
+
+[classes.Oesd]
+fold = 0.25
+call = 0.65
+raise = 0.1
+
+[classes.Gutshot]
+fold = 0.5
+call = 0.45
+raise = 0.05

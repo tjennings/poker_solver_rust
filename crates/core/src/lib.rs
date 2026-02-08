@@ -13,6 +13,7 @@
 //! - `poker` - Re-exported poker domain types from `rs_poker`
 
 pub mod abstraction;
+pub mod agent;
 pub mod blueprint;
 pub mod cfr;
 pub mod config;
@@ -23,6 +24,7 @@ pub mod game;
 pub mod hand_class;
 pub mod hands;
 
+pub use agent::AgentConfig;
 pub use config::Config;
 pub use error::SolverError;
 pub use flops::{CanonicalFlop, HighCardClass, RankTexture, SuitTexture, all_flops};

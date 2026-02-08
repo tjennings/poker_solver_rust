@@ -2568,6 +2568,7 @@ dependencies = [
  "tempfile",
  "test-macros",
  "thiserror 1.0.69",
+ "toml 0.8.2",
 ]
 
 [[package]]
@@ -2590,8 +2591,10 @@ name = "poker-solver-trainer"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "indicatif",
  "poker-solver-core",
  "serde",
+ "serde_json",
  "serde_yaml",
 ]
 
