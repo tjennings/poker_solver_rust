@@ -399,58 +399,11 @@ button:disabled {
   border-left: 3px solid #a855f7;
 }
 
-/* Game info */
-.game-info {
-  display: flex;
-  gap: 2rem;
-  padding: 0.5rem 1rem;
-  background: #16213e;
-  border-radius: 4px;
-  margin-bottom: 1rem;
-  font-size: 0.85rem;
-}
-
 /* Matrix */
 .matrix-container {
   background: #16213e;
   border-radius: 8px;
   padding: 1rem;
-}
-
-.matrix-legend {
-  display: flex;
-  gap: 1rem;
-  margin-bottom: 1rem;
-  font-size: 0.85rem;
-}
-
-.legend-item {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.legend-item::before {
-  content: '';
-  width: 16px;
-  height: 16px;
-  border-radius: 2px;
-}
-
-.legend-item.fold::before {
-  background: #3b82f6;
-}
-
-.legend-item.call::before {
-  background: #22c55e;
-}
-
-.legend-item.raise::before {
-  background: #ef4444;
-}
-
-.legend-item.allin::before {
-  background: #a855f7;
 }
 
 .hand-matrix {

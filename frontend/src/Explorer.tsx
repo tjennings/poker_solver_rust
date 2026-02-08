@@ -749,20 +749,8 @@ export default function Explorer() {
             )}
           </div>
 
-          <div className="game-info">
-            <span>Pot: {matrix?.pot ?? position.pot}</span>
-            <span>To call: {matrix?.to_call ?? 0}</span>
-            <span>Street: {matrix?.street ?? (pendingStreet?.street || 'Preflop')}</span>
-          </div>
-
           {matrix && (
             <div className="matrix-container">
-              <div className="matrix-legend">
-                <span className="legend-item fold">Fold</span>
-                <span className="legend-item call">Check/Call</span>
-                <span className="legend-item raise">Bet/Raise</span>
-                <span className="legend-item allin">All-in</span>
-              </div>
               {computingBuckets && (
                 <div className="computation-progress">
                   <div className="progress-bar">
