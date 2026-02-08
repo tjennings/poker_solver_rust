@@ -405,8 +405,8 @@ export default function Explorer() {
           board: [],
           history: [],
           pot: 3,
-          stack_p1: info.stack_depth * 100 - 1,
-          stack_p2: info.stack_depth * 100 - 2,
+          stack_p1: info.stack_depth - 1,
+          stack_p2: info.stack_depth - 2,
           to_act: 0,
         };
         setPosition(initialPosition);
@@ -655,8 +655,8 @@ export default function Explorer() {
           board: newBoard,
           history: newHistory,
           pot: 3, // Would need full replay for accurate pot
-          stack_p1: bundleInfo ? bundleInfo.stack_depth * 100 - 1 : 99,
-          stack_p2: bundleInfo ? bundleInfo.stack_depth * 100 - 2 : 98,
+          stack_p1: bundleInfo ? bundleInfo.stack_depth - 1 : 99,
+          stack_p2: bundleInfo ? bundleInfo.stack_depth - 2 : 98,
           to_act: (actionCount % 2) as 0 | 1,
         };
         setPosition(newPosition);
