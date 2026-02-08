@@ -18,12 +18,16 @@ pub mod cfr;
 pub mod config;
 pub mod equity;
 pub mod error;
+pub mod flops;
 pub mod game;
+pub mod hand_class;
 pub mod hands;
 
 pub use config::Config;
 pub use error::SolverError;
+pub use flops::{CanonicalFlop, HighCardClass, RankTexture, SuitTexture, all_flops};
 pub use game::{Action, Game, Player};
+pub use hand_class::{ClassifyError, HandClass, HandClassification, classify};
 pub use hands::{CanonicalHand, HandType, all_hands};
 
 /// Re-exported poker domain types from the `rs_poker` crate.
