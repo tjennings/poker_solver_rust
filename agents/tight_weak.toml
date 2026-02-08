@@ -3,14 +3,15 @@ name = "Tight Weak"
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
 
-# Narrow preflop ranges — only premiums and strong hands
-[ranges]
-utg = "TT+,AQs+,AKo"
-mp  = "88+,AJs+,KQs,AQo+"
-co  = "66+,ATs+,KJs+,QJs,AJo+,KQo"
-btn = "44+,A8s+,KTs+,QTs+,JTs,T9s,98s,A9o+,KJo+,QJo"
-sb  = "33+,A5s+,K9s+,Q9s+,J9s+,T9s,98s,87s,A8o+,KTo+,QTo+,JTo"
-bb  = "22+,A2s+,K5s+,Q8s+,J8s+,T8s+,97s+,87s,76s,65s,A2o+,K9o+,Q9o+,J9o+,T9o"
+# Narrow preflop ranges — only premiums and strong hands.
+# Raise takes priority over call for overlapping hands.
+[ranges.btn]
+raise = "TT+,AQs+,AKo"
+call = "44+,A8s+,KTs+,QTs+,JTs,T9s,98s,A9o+,KJo+,QJo"
+
+[ranges.bb]
+raise = "QQ+,AKs"
+call = "22+,A2s+,K5s+,Q8s+,J8s+,T8s+,97s+,87s,76s,65s,A2o+,K9o+,Q9o+,J9o+,T9o"
 
 # Preflop and unclassified hands: mostly fold
 [default]

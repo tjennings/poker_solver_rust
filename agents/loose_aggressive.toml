@@ -3,14 +3,15 @@ name = "Loose Aggressive"
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
 
-# Very wide opening ranges — plays almost everything in position
-[ranges]
-utg = "22+,A2s+,K9s+,Q9s+,J9s+,T8s+,97s+,87s,76s,65s,A8o+,KTo+,QTo+,JTo"
-mp  = "22+,A2s+,K5s+,Q8s+,J8s+,T8s+,97s+,86s+,76s,65s,54s,A5o+,K9o+,Q9o+,J9o+,T9o"
-co  = "22+,A2s+,K2s+,Q2s+,J5s+,T6s+,96s+,85s+,75s+,64s+,54s,A2o+,K5o+,Q8o+,J8o+,T8o+,98o,87o"
-btn = "22+,A2s+,K2s+,Q2s+,J2s+,T4s+,95s+,85s+,74s+,64s+,53s+,43s,A2o+,K2o+,Q4o+,J7o+,T7o+,97o+,86o+,76o,65o"
-sb  = "22+,A2s+,K2s+,Q2s+,J2s+,T2s+,94s+,84s+,74s+,63s+,53s+,43s,A2o+,K2o+,Q3o+,J6o+,T7o+,96o+,86o+,76o,65o,54o"
-bb  = "22+,A2s+,K2s+,Q2s+,J2s+,T2s+,92s+,82s+,72s+,62s+,52s+,42s+,32s,A2o+,K2o+,Q2o+,J2o+,T3o+,95o+,85o+,74o+,64o+,54o,43o"
+# Very wide opening ranges — plays almost everything in position.
+# Raise takes priority over call for overlapping hands.
+[ranges.btn]
+raise = "22+,A2s+,K2s+,Q5s+,J7s+,T7s+,96s+,86s+,75s+,64s+,54s,A2o+,K5o+,Q8o+,J8o+,T8o+,98o,87o"
+call = "22+,A2s+,K2s+,Q2s+,J2s+,T4s+,95s+,85s+,74s+,64s+,53s+,43s,A2o+,K2o+,Q4o+,J7o+,T7o+,97o+,86o+,76o,65o"
+
+[ranges.bb]
+raise = "22+,A2s+,K5s+,Q8s+,J8s+,T8s+,97s+,86s+,76s,65s,54s,A5o+,K9o+,Q9o+,J9o+,T9o"
+call = "22+,A2s+,K2s+,Q2s+,J2s+,T2s+,92s+,82s+,72s+,62s+,52s+,42s+,32s,A2o+,K2o+,Q2o+,J2o+,T3o+,95o+,85o+,74o+,64o+,54o,43o"
 
 # Preflop and unclassified: rarely fold, raise a lot
 [default]

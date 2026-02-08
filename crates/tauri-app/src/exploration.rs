@@ -768,6 +768,8 @@ fn get_actions_for_position(
         }
     }
 
+    // Display order: all-in, raises (large→small), check/call, fold
+    actions.reverse();
     actions
 }
 
@@ -896,10 +898,10 @@ fn resolve_preflop_frequency<'a>(
     let v2 = char_to_value(rank2);
     let canonical = CanonicalHand::new(v1, v2, suited);
 
-    if agent.ranges.is_empty() || agent.in_range(position_name, &canonical) {
+    if agent.ranges.is_empty() {
         &agent.default
     } else {
-        &FrequencyMap::FOLD
+        agent.preflop_frequency(position_name, &canonical)
     }
 }
 

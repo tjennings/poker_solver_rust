@@ -439,11 +439,81 @@ button:disabled {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
+.matrix-cell.selected {
+  outline: 2px solid #00d9ff;
+  outline-offset: -2px;
+  z-index: 2;
+}
+
 .cell-label {
   font-size: 0.65rem;
   font-weight: bold;
   color: #fff;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+/* Matrix + detail layout */
+.matrix-with-detail {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+/* Cell detail panel */
+.cell-detail {
+  min-width: 180px;
+  background: #1a1a2e;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 0.75rem;
+  flex-shrink: 0;
+}
+
+.cell-detail-header {
+  font-size: 1.1rem;
+  font-weight: bold;
+  color: #eee;
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #333;
+}
+
+.cell-detail-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.cell-detail-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: auto auto;
+  gap: 2px 0.5rem;
+}
+
+.cell-detail-bar-bg {
+  grid-column: 1 / -1;
+  height: 6px;
+  background: #333;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.cell-detail-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.15s ease;
+}
+
+.cell-detail-label {
+  font-size: 0.8rem;
+  color: #ccc;
+}
+
+.cell-detail-pct {
+  font-size: 0.8rem;
+  color: #888;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Empty state */

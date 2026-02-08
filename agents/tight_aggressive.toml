@@ -3,14 +3,15 @@ name = "Tight Aggressive"
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
 
-# Standard TAG opening ranges
-[ranges]
-utg = "77+,ATs+,KQs,AJo+"
-mp  = "55+,A9s+,KJs+,QJs,ATo+,KQo"
-co  = "22+,A2s+,K9s+,Q9s+,J9s+,T8s+,97s+,87s,76s,65s,A8o+,KTo+,QTo+,JTo"
-btn = "22+,A2s+,K2s+,Q5s+,J7s+,T7s+,96s+,86s+,75s+,64s+,54s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o"
-sb  = "22+,A2s+,K2s+,Q2s+,J5s+,T6s+,96s+,85s+,75s+,64s+,54s,A2o+,K4o+,Q7o+,J8o+,T8o+,98o,87o"
-bb  = "22+,A2s+,K2s+,Q2s+,J2s+,T2s+,92s+,82s+,72s+,62s+,52s+,42s+,32s,A2o+,K2o+,Q2o+,J3o+,T5o+,96o+,86o+,75o+,65o,54o"
+# Standard TAG opening ranges.
+# Raise takes priority over call for overlapping hands.
+[ranges.btn]
+raise = "66+,ATs+,KJs+,QJs,AJo+,KQo"
+call = "22+,A2s+,K2s+,Q5s+,J7s+,T7s+,96s+,86s+,75s+,64s+,54s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o"
+
+[ranges.bb]
+raise = "77+,ATs+,KQs,AJo+"
+call = "22+,A2s+,K2s+,Q2s+,J2s+,T2s+,92s+,82s+,72s+,62s+,52s+,42s+,32s,A2o+,K2o+,Q2o+,J3o+,T5o+,96o+,86o+,75o+,65o,54o"
 
 # Preflop and unclassified: selective, fold most junk
 [default]

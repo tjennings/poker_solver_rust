@@ -118,9 +118,13 @@ function getActionColor(actionType: string): string {
 function HandCell({
   cell,
   actions,
+  isSelected,
+  onClick,
 }: {
   cell: MatrixCell;
   actions: ActionInfo[];
+  isSelected: boolean;
+  onClick: () => void;
 }) {
   const gradientStops = useMemo(() => {
     if (cell.probabilities.length === 0) {
@@ -150,13 +154,48 @@ function HandCell({
 
   return (
     <div
-      className="matrix-cell"
+      className={`matrix-cell ${isSelected ? 'selected' : ''}`}
       style={{ background: gradientStops }}
-      title={cell.probabilities
-        .map((p, i) => `${actions[i]?.label || 'Unknown'}: ${(p.probability * 100).toFixed(1)}%`)
-        .join('\n')}
+      onClick={onClick}
     >
       <span className="cell-label">{cell.hand}</span>
+    </div>
+  );
+}
+
+// Detail panel showing action frequencies for a selected cell
+function CellDetail({
+  cell,
+  actions,
+}: {
+  cell: MatrixCell;
+  actions: ActionInfo[];
+}) {
+  return (
+    <div className="cell-detail">
+      <div className="cell-detail-header">{cell.hand}</div>
+      <div className="cell-detail-actions">
+        {cell.probabilities.map((prob, idx) => {
+          const action = actions[idx];
+          if (!action) return null;
+          const pct = prob.probability * 100;
+          return (
+            <div key={action.id} className="cell-detail-row">
+              <div className="cell-detail-bar-bg">
+                <div
+                  className="cell-detail-bar-fill"
+                  style={{
+                    width: `${pct}%`,
+                    backgroundColor: getActionColor(action.action_type),
+                  }}
+                />
+              </div>
+              <span className="cell-detail-label">{action.label}</span>
+              <span className="cell-detail-pct">{pct.toFixed(1)}%</span>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -348,6 +387,7 @@ export default function Explorer() {
   const [loading, setLoading] = useState(false);
   const [computingBuckets, setComputingBuckets] = useState(false);
   const [computationProgress, setComputationProgress] = useState({ completed: 0, total: 169 });
+  const [selectedCell, setSelectedCell] = useState<{ row: number; col: number } | null>(null);
 
   // Ref to track current position for use in event callbacks
   const positionRef = useRef(position);
@@ -413,6 +453,7 @@ export default function Explorer() {
         setHistoryItems([]);
         setPendingStreet(null);
 
+        setSelectedCell(null);
         const initialMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
           position: initialPosition,
         });
@@ -766,14 +807,28 @@ export default function Explorer() {
                   </span>
                 </div>
               )}
-              <div className="hand-matrix">
-                {matrix.cells.map((row, rowIdx) => (
-                  <div key={rowIdx} className="matrix-row">
-                    {row.map((cell, colIdx) => (
-                      <HandCell key={colIdx} cell={cell} actions={matrix.actions} />
-                    ))}
-                  </div>
-                ))}
+              <div className="matrix-with-detail">
+                <div className="hand-matrix">
+                  {matrix.cells.map((row, rowIdx) => (
+                    <div key={rowIdx} className="matrix-row">
+                      {row.map((cell, colIdx) => (
+                        <HandCell
+                          key={colIdx}
+                          cell={cell}
+                          actions={matrix.actions}
+                          isSelected={selectedCell?.row === rowIdx && selectedCell?.col === colIdx}
+                          onClick={() => setSelectedCell({ row: rowIdx, col: colIdx })}
+                        />
+                      ))}
+                    </div>
+                  ))}
+                </div>
+                {selectedCell && matrix.cells[selectedCell.row]?.[selectedCell.col] && (
+                  <CellDetail
+                    cell={matrix.cells[selectedCell.row][selectedCell.col]}
+                    actions={matrix.actions}
+                  />
+                )}
               </div>
             </div>
           )}

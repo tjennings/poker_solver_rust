@@ -72,21 +72,41 @@ pub struct FrequencyMap {
 }
 
 impl FrequencyMap {
-    /// The all-fold frequency map.
     pub const FOLD: Self = Self {
         fold: 1.0,
         call: 0.0,
         raise: 0.0,
     };
+    pub const CALL: Self = Self {
+        fold: 0.0,
+        call: 1.0,
+        raise: 0.0,
+    };
+    pub const RAISE: Self = Self {
+        fold: 0.0,
+        call: 0.0,
+        raise: 1.0,
+    };
+}
+
+/// Preflop action ranges for a single position.
+///
+/// Hands in `raise` get raise action, hands in `call` get call action,
+/// everything else folds. Raise takes priority over call if a hand
+/// appears in both.
+#[derive(Debug, Clone)]
+pub struct PositionRanges {
+    pub raise: HashSet<CanonicalHand>,
+    pub call: HashSet<CanonicalHand>,
 }
 
 /// A fully loaded and validated agent configuration.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub game: GameSettings,
-    /// Position name -> set of playable canonical hands.
-    pub ranges: HashMap<String, HashSet<CanonicalHand>>,
-    /// Default frequencies for unclassified / preflop in-range hands.
+    /// Position name -> preflop action ranges (raise / call / fold).
+    pub ranges: HashMap<String, PositionRanges>,
+    /// Default frequencies for unclassified postflop hands.
     pub default: FrequencyMap,
     /// Per-HandClass frequency overrides.
     pub classes: HashMap<HandClass, FrequencyMap>,
@@ -115,12 +135,17 @@ impl AgentConfig {
         validate_and_build(raw)
     }
 
-    /// Check if a hand is in the opening range for a position.
+    /// Resolve preflop frequency for a hand at a position.
+    ///
+    /// Returns `RAISE` if the hand is in the raise range, `CALL` if in the
+    /// call range, `FOLD` otherwise. Raise takes priority over call.
     #[must_use]
-    pub fn in_range(&self, position: &str, hand: &CanonicalHand) -> bool {
-        self.ranges
-            .get(position)
-            .is_some_and(|set| set.contains(hand))
+    pub fn preflop_frequency(&self, position: &str, hand: &CanonicalHand) -> &FrequencyMap {
+        match self.ranges.get(position) {
+            Some(pos) if pos.raise.contains(hand) => &FrequencyMap::RAISE,
+            Some(pos) if pos.call.contains(hand) => &FrequencyMap::CALL,
+            _ => &FrequencyMap::FOLD,
+        }
     }
 
     /// Resolve frequencies for a classified hand.
@@ -146,10 +171,16 @@ impl AgentConfig {
 struct RawConfig {
     game: RawGameSettings,
     #[serde(default)]
-    ranges: HashMap<String, String>,
+    ranges: HashMap<String, RawPositionRanges>,
     default: RawFrequency,
     #[serde(default)]
     classes: HashMap<String, RawFrequency>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RawPositionRanges {
+    raise: Option<String>,
+    call: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -223,12 +254,19 @@ fn parse_class_overrides(
 }
 
 fn parse_all_ranges(
-    raw_ranges: &HashMap<String, String>,
-) -> Result<HashMap<String, HashSet<CanonicalHand>>, AgentError> {
+    raw_ranges: &HashMap<String, RawPositionRanges>,
+) -> Result<HashMap<String, PositionRanges>, AgentError> {
     let mut result = HashMap::new();
-    for (position, range_str) in raw_ranges {
-        let hands = parse_range(range_str)?;
-        result.insert(position.clone(), hands);
+    for (position, raw_pos) in raw_ranges {
+        let raise = match &raw_pos.raise {
+            Some(s) if !s.is_empty() => parse_range(s)?,
+            _ => HashSet::new(),
+        };
+        let call = match &raw_pos.call {
+            Some(s) if !s.is_empty() => parse_range(s)?,
+            _ => HashSet::new(),
+        };
+        result.insert(position.clone(), PositionRanges { raise, call });
     }
     Ok(result)
 }
@@ -274,9 +312,13 @@ raise = 0.4
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
 
-[ranges]
-btn = "AA,KK,QQ,AKs"
-bb  = "22+,A2s+,K2s+"
+[ranges.btn]
+raise = "AA,KK,QQ,AKs"
+call = "JJ,TT,AQs,AJs"
+
+[ranges.bb]
+raise = "QQ+,AKs"
+call = "22+,A2s+,K2s+"
 
 [default]
 fold = 0.33
@@ -385,52 +427,74 @@ raise = 2.0
     }
 
     #[timed_test]
-    fn range_parsing_basic() {
+    fn range_parsing_raise_and_call() {
         let config = AgentConfig::from_toml(TOML_WITH_RANGES).unwrap();
-        let btn_range = config.ranges.get("btn").unwrap();
+        let btn = config.ranges.get("btn").unwrap();
 
-        // AA, KK, QQ, AKs should be in the range
-        assert!(btn_range.contains(&CanonicalHand::parse("AA").unwrap()));
-        assert!(btn_range.contains(&CanonicalHand::parse("KK").unwrap()));
-        assert!(btn_range.contains(&CanonicalHand::parse("QQ").unwrap()));
-        assert!(btn_range.contains(&CanonicalHand::parse("AKs").unwrap()));
+        // AA, KK, QQ, AKs in raise range
+        assert!(btn.raise.contains(&CanonicalHand::parse("AA").unwrap()));
+        assert!(btn.raise.contains(&CanonicalHand::parse("KK").unwrap()));
+        assert!(btn.raise.contains(&CanonicalHand::parse("AKs").unwrap()));
 
-        // AKo, JJ should not
-        assert!(!btn_range.contains(&CanonicalHand::parse("AKo").unwrap()));
-        assert!(!btn_range.contains(&CanonicalHand::parse("JJ").unwrap()));
+        // JJ, TT, AQs in call range
+        assert!(btn.call.contains(&CanonicalHand::parse("JJ").unwrap()));
+        assert!(btn.call.contains(&CanonicalHand::parse("TT").unwrap()));
+        assert!(btn.call.contains(&CanonicalHand::parse("AQs").unwrap()));
+
+        // AKo, 99 not in either
+        assert!(!btn.raise.contains(&CanonicalHand::parse("AKo").unwrap()));
+        assert!(!btn.call.contains(&CanonicalHand::parse("AKo").unwrap()));
     }
 
     #[timed_test]
     fn range_plus_notation() {
         let config = AgentConfig::from_toml(TOML_WITH_RANGES).unwrap();
-        let bb_range = config.ranges.get("bb").unwrap();
+        let bb = config.ranges.get("bb").unwrap();
 
-        // 22+ means all pairs
-        assert!(bb_range.contains(&CanonicalHand::parse("AA").unwrap()));
-        assert!(bb_range.contains(&CanonicalHand::parse("22").unwrap()));
+        // QQ+, AKs in raise range
+        assert!(bb.raise.contains(&CanonicalHand::parse("AA").unwrap()));
+        assert!(bb.raise.contains(&CanonicalHand::parse("QQ").unwrap()));
+        assert!(bb.raise.contains(&CanonicalHand::parse("AKs").unwrap()));
 
-        // A2s+ means all Axs
-        assert!(bb_range.contains(&CanonicalHand::parse("AKs").unwrap()));
-        assert!(bb_range.contains(&CanonicalHand::parse("A2s").unwrap()));
+        // 22+ in call range (overlaps with raise for QQ+)
+        assert!(bb.call.contains(&CanonicalHand::parse("22").unwrap()));
+        assert!(bb.call.contains(&CanonicalHand::parse("TT").unwrap()));
 
-        // K2s+ means all Kxs
-        assert!(bb_range.contains(&CanonicalHand::parse("KQs").unwrap()));
-        assert!(bb_range.contains(&CanonicalHand::parse("K2s").unwrap()));
-
-        // Offsuit hands not in range
-        assert!(!bb_range.contains(&CanonicalHand::parse("A2o").unwrap()));
+        // Offsuit hands not in call range
+        assert!(!bb.call.contains(&CanonicalHand::parse("A2o").unwrap()));
     }
 
     #[timed_test]
-    fn in_range_helper() {
+    fn preflop_frequency_raise_priority() {
         let config = AgentConfig::from_toml(TOML_WITH_RANGES).unwrap();
         let aa = CanonicalHand::parse("AA").unwrap();
+        let jj = CanonicalHand::parse("JJ").unwrap();
         let seven_two = CanonicalHand::parse("72o").unwrap();
 
-        assert!(config.in_range("btn", &aa));
-        assert!(!config.in_range("btn", &seven_two));
-        // Non-existent position returns false
-        assert!(!config.in_range("utg", &aa));
+        // AA in raise range → raise
+        let freq = config.preflop_frequency("btn", &aa);
+        assert!((freq.raise - 1.0).abs() < 1e-5);
+
+        // JJ in call range → call
+        let freq = config.preflop_frequency("btn", &jj);
+        assert!((freq.call - 1.0).abs() < 1e-5);
+
+        // 72o in neither → fold
+        let freq = config.preflop_frequency("btn", &seven_two);
+        assert!((freq.fold - 1.0).abs() < 1e-5);
+
+        // Non-existent position → fold
+        let freq = config.preflop_frequency("utg", &aa);
+        assert!((freq.fold - 1.0).abs() < 1e-5);
+    }
+
+    #[timed_test]
+    fn preflop_frequency_raise_beats_call_overlap() {
+        let config = AgentConfig::from_toml(TOML_WITH_RANGES).unwrap();
+        // BB: AA is in both raise (QQ+) and call (22+) ranges. Raise wins.
+        let aa = CanonicalHand::parse("AA").unwrap();
+        let freq = config.preflop_frequency("bb", &aa);
+        assert!((freq.raise - 1.0).abs() < 1e-5);
     }
 
     #[timed_test]
@@ -512,8 +576,8 @@ raise = 0.3
 stack_depth = 100
 bet_sizes = [0.5]
 
-[ranges]
-btn = "ZZZ_INVALID"
+[ranges.btn]
+raise = "ZZZ_INVALID"
 
 [default]
 fold = 0.5
@@ -612,9 +676,10 @@ raise = 0.35
         let config = AgentConfig::load(&path).unwrap();
         assert_eq!(config.game.stack_depth, 100);
         assert_eq!(config.classes.len(), 20);
-        // TAG should have wider ranges than tight-weak
-        let tag_btn = config.ranges.get("btn").unwrap().len();
-        assert!(tag_btn > 50, "TAG btn range should be wide, got {tag_btn}");
+        // TAG should have wide playable range and non-empty raise range
+        let btn = config.ranges.get("btn").unwrap();
+        assert!(btn.call.len() > 50, "TAG btn call range should be wide, got {}", btn.call.len());
+        assert!(!btn.raise.is_empty(), "TAG btn should have a raise range");
     }
 
     #[timed_test]
