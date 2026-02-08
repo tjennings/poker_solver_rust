@@ -762,7 +762,7 @@ fn get_actions_for_position(
             let action_type = if to_call == 0 { "bet" } else { "raise" };
             actions.push(ActionInfo {
                 id: format!("{action_type}:{all_in}"),
-                label: format!("All-in {all_in}"),
+                label: "All-in".to_string(),
                 action_type: "allin".to_string(),
             });
         }
