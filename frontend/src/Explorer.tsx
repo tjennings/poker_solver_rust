@@ -181,7 +181,7 @@ function ActionBlock({
     <div className={`action-block ${isCurrent ? 'current' : ''}`}>
       <div className="action-block-header">
         <span className="position">{position}</span>
-        <span className="stack">{stack}</span>
+        <span className="stack">{stack}BB</span>
       </div>
       <div className="action-list">
         {actions.map((action) => (
