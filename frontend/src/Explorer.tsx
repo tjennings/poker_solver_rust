@@ -11,6 +11,69 @@ import {
   MatrixCell,
 } from './types';
 
+function HamburgerMenu({
+  agents,
+  activeAgentName,
+  loading,
+  onSelectAgent,
+  onLoadBundle,
+}: {
+  agents: AgentInfo[];
+  activeAgentName: string | null;
+  loading: boolean;
+  onSelectAgent: (path: string) => void;
+  onLoadBundle: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  return (
+    <div className="hamburger-menu" ref={menuRef}>
+      <button className="hamburger-button" onClick={() => setOpen(!open)}>
+        <span className="hamburger-icon" />
+      </button>
+      {open && (
+        <div className="hamburger-dropdown">
+          {agents.length > 0 && (
+            <div className="menu-section">
+              <div className="menu-section-label">Agents</div>
+              {agents.map((agent) => (
+                <button
+                  key={agent.path}
+                  className={`menu-item ${activeAgentName === agent.name ? 'active' : ''}`}
+                  disabled={loading}
+                  onClick={() => { onSelectAgent(agent.path); setOpen(false); }}
+                >
+                  {agent.name}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="menu-section">
+            <button
+              className="menu-item"
+              disabled={loading}
+              onClick={() => { onLoadBundle(); setOpen(false); }}
+            >
+              Load Bundle...
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Progress event from backend
 interface BucketProgressEvent {
   completed: number;
@@ -613,28 +676,13 @@ export default function Explorer() {
 
   return (
     <div className="explorer">
-      <div className="explorer-header">
-        <h2>Strategy Explorer</h2>
-        <div className="explorer-header-actions">
-          {agents.length > 0 && (
-            <div className="agent-selector">
-              {agents.map((agent) => (
-                <button
-                  key={agent.path}
-                  className={`agent-button ${bundleInfo?.name === agent.name ? 'active' : ''}`}
-                  onClick={() => handleLoadAgent(agent.path)}
-                  disabled={loading}
-                >
-                  {agent.name}
-                </button>
-              ))}
-            </div>
-          )}
-          <button onClick={handleLoadBundle} disabled={loading}>
-            Load Bundle
-          </button>
-        </div>
-      </div>
+      <HamburgerMenu
+        agents={agents}
+        activeAgentName={bundleInfo?.name ?? null}
+        loading={loading}
+        onSelectAgent={handleLoadAgent}
+        onLoadBundle={handleLoadBundle}
+      />
 
       {error && <div className="error">{error}</div>}
 
