@@ -1,4 +1,5 @@
 [game]
+name = "Tight Aggressive"
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
 

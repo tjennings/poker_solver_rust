@@ -58,6 +58,7 @@ impl From<toml::de::Error> for AgentError {
 /// Game settings from the agent config.
 #[derive(Debug, Clone)]
 pub struct GameSettings {
+    pub name: Option<String>,
     pub stack_depth: u32,
     pub bet_sizes: Vec<f32>,
 }
@@ -153,6 +154,7 @@ struct RawConfig {
 
 #[derive(serde::Deserialize)]
 struct RawGameSettings {
+    name: Option<String>,
     stack_depth: u32,
     bet_sizes: Vec<f32>,
 }
@@ -170,6 +172,7 @@ struct RawFrequency {
 
 fn validate_and_build(raw: RawConfig) -> Result<AgentConfig, AgentError> {
     let game = GameSettings {
+        name: raw.game.name,
         stack_depth: raw.game.stack_depth,
         bet_sizes: raw.game.bet_sizes,
     };

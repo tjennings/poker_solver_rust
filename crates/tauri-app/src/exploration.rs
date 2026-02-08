@@ -69,13 +69,21 @@ impl Default for ExplorationState {
     }
 }
 
-/// Information about a loaded bundle.
+/// Information about a loaded bundle or agent.
 #[derive(Debug, Clone, Serialize)]
 pub struct BundleInfo {
+    pub name: Option<String>,
     pub stack_depth: u32,
     pub bet_sizes: Vec<f32>,
     pub info_sets: usize,
     pub iterations: u64,
+}
+
+/// Information about an available agent config.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentInfo {
+    pub name: String,
+    pub path: String,
 }
 
 /// A single cell in the hand matrix.
@@ -177,6 +185,7 @@ fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
     let agent = AgentConfig::load(path).map_err(|e| format!("Failed to load agent: {e}"))?;
 
     let info = BundleInfo {
+        name: agent.game.name.clone(),
         stack_depth: agent.game.stack_depth,
         bet_sizes: agent.game.bet_sizes.clone(),
         info_sets: 0,
@@ -193,6 +202,7 @@ fn load_trained_bundle(
     let bundle = StrategyBundle::load(path).map_err(|e| format!("Failed to load bundle: {e}"))?;
 
     let info = BundleInfo {
+        name: Some("Trained Bundle".to_string()),
         stack_depth: bundle.config.game.stack_depth,
         bet_sizes: bundle.config.game.bet_sizes.clone(),
         info_sets: bundle.blueprint.len(),
@@ -385,12 +395,14 @@ pub fn get_bundle_info(state: State<'_, ExplorationState>) -> Result<BundleInfo,
 
     Ok(match source {
         StrategySource::Bundle { config, blueprint } => BundleInfo {
+            name: Some("Trained Bundle".to_string()),
             stack_depth: config.game.stack_depth,
             bet_sizes: config.game.bet_sizes.clone(),
             info_sets: blueprint.len(),
             iterations: blueprint.iterations_trained(),
         },
         StrategySource::Agent(agent) => BundleInfo {
+            name: agent.game.name.clone(),
             stack_depth: agent.game.stack_depth,
             bet_sizes: agent.game.bet_sizes.clone(),
             info_sets: 0,
@@ -557,6 +569,62 @@ pub fn is_board_cached(state: State<'_, ExplorationState>, board: Vec<String>) -
     let board_key = board.join("");
     let cache = state.bucket_cache.read();
     cache.contains_key(&board_key)
+}
+
+/// List available agent configs from the agents/ directory.
+///
+/// Searches for `agents/` in the current directory and up to 4 parent
+/// directories, so it works regardless of which subdirectory the process
+/// was started from (e.g. `crates/tauri-app/` during `cargo tauri dev`).
+#[tauri::command]
+pub fn list_agents() -> Result<Vec<AgentInfo>, String> {
+    let agents_dir = match find_agents_dir() {
+        Some(dir) => dir,
+        None => return Ok(vec![]),
+    };
+
+    let entries = std::fs::read_dir(&agents_dir)
+        .map_err(|e| format!("Failed to read agents directory: {e}"))?;
+
+    let mut agents = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {e}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = match AgentConfig::load(&path) {
+            Ok(config) => config.game.name.unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Unknown")
+                    .to_string()
+            }),
+            Err(_) => continue,
+        };
+        agents.push(AgentInfo {
+            name,
+            path: path.to_string_lossy().to_string(),
+        });
+    }
+
+    agents.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(agents)
+}
+
+/// Walk up from CWD looking for an `agents/` directory (max 4 levels).
+fn find_agents_dir() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    for _ in 0..5 {
+        let candidate = dir.join("agents");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
 }
 
 // ============================================================================
