@@ -13,10 +13,9 @@ fn mccfr_hunl_postflop_full_game() {
     let config = PostflopConfig {
         stack_depth: 10,
         bet_sizes: vec![1.0],
-        samples_per_iteration: 500,
         ..PostflopConfig::default()
     };
-    let game = HunlPostflop::new(config, None);
+    let game = HunlPostflop::new(config, None, 500);
 
     let mccfr_config = MccfrConfig {
         samples_per_iteration: 100,
@@ -62,12 +61,11 @@ fn mccfr_exploitability_decreases_with_training() {
     let config = PostflopConfig {
         stack_depth: 10,
         bet_sizes: vec![1.0],
-        samples_per_iteration: 100,
         ..PostflopConfig::default()
     };
     // Create separate game instances for solver and exploitability calculation
-    let eval_game = HunlPostflop::new(config.clone(), None);
-    let solver_game = HunlPostflop::new(config, None);
+    let eval_game = HunlPostflop::new(config.clone(), None, 100);
+    let solver_game = HunlPostflop::new(config, None, 100);
     let mut solver = MccfrSolver::new(solver_game);
     solver.set_seed(42);
 
@@ -99,10 +97,9 @@ fn mccfr_blueprint_pipeline() {
     let config = PostflopConfig {
         stack_depth: 10,
         bet_sizes: vec![1.0],
-        samples_per_iteration: 100,
         ..PostflopConfig::default()
     };
-    let game = HunlPostflop::new(config, None);
+    let game = HunlPostflop::new(config, None, 100);
     let mut solver = MccfrSolver::new(game);
     solver.set_seed(42);
     solver.train(50, 20);

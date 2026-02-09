@@ -115,12 +115,16 @@ pub struct StrategyMatrix {
     pub actions: Vec<ActionInfo>,
     /// Current street
     pub street: String,
-    /// Current pot size
+    /// Current pot size (after replaying history)
     pub pot: u32,
     /// Current player's stack
     pub stack: u32,
     /// Amount to call (0 if check is available)
     pub to_call: u32,
+    /// Player 1 (SB) remaining stack
+    pub stack_p1: u32,
+    /// Player 2 (BB) remaining stack
+    pub stack_p2: u32,
 }
 
 /// Information about an available action.
@@ -159,25 +163,53 @@ impl Default for ExplorationPosition {
         Self {
             board: vec![],
             history: vec![],
-            pot: 3,       // SB + BB posted
-            stack_p1: 99, // SB posted 1
-            stack_p2: 98, // BB posted 2
+            pot: 3,        // SB + BB posted (internal units)
+            stack_p1: 199, // 100BB default: 100*2 - 1 (SB posted 1)
+            stack_p2: 198, // 100BB default: 100*2 - 2 (BB posted 2)
             to_act: 0,    // SB acts first preflop
         }
     }
 }
 
 /// Load a strategy bundle from a directory, or an agent from a `.toml` file.
+///
+/// Bundle loading (which can deserialize ~1 GB of blueprint data) runs on a
+/// blocking thread so the Tauri main thread stays responsive.
 #[tauri::command]
-pub fn load_bundle(state: State<'_, ExplorationState>, path: String) -> Result<BundleInfo, String> {
+pub async fn load_bundle(
+    state: State<'_, ExplorationState>,
+    path: String,
+) -> Result<BundleInfo, String> {
     let bundle_path = PathBuf::from(&path);
 
-    let (info, source) = if path.ends_with(".toml") {
-        load_agent(&bundle_path)?
+    let (info, source, boundaries) = if path.ends_with(".toml") {
+        let (info, source) = load_agent(&bundle_path)?;
+        (info, source, None)
     } else {
-        load_trained_bundle(&bundle_path, &state)?
+        // Heavy I/O on a blocking thread to avoid freezing the UI
+        let bundle = tauri::async_runtime::spawn_blocking(move || {
+            StrategyBundle::load(&bundle_path)
+                .map_err(|e| format!("Failed to load bundle: {e}"))
+        })
+        .await
+        .map_err(|e| format!("Load task panicked: {e}"))??;
+
+        let info = BundleInfo {
+            name: Some("Trained Bundle".to_string()),
+            stack_depth: bundle.config.game.stack_depth,
+            bet_sizes: bundle.config.game.bet_sizes.clone(),
+            info_sets: bundle.blueprint.len(),
+            iterations: bundle.blueprint.iterations_trained(),
+        };
+        let boundaries = bundle.boundaries;
+        let source = StrategySource::Bundle {
+            config: bundle.config,
+            blueprint: bundle.blueprint,
+        };
+        (info, source, boundaries)
     };
 
+    *state.abstraction_boundaries.write() = boundaries;
     *state.source.write() = Some(source);
     state.bucket_cache.write().clear();
 
@@ -196,30 +228,6 @@ fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
     };
 
     Ok((info, StrategySource::Agent(agent)))
-}
-
-fn load_trained_bundle(
-    path: &Path,
-    state: &State<'_, ExplorationState>,
-) -> Result<(BundleInfo, StrategySource), String> {
-    let bundle = StrategyBundle::load(path).map_err(|e| format!("Failed to load bundle: {e}"))?;
-
-    let info = BundleInfo {
-        name: Some("Trained Bundle".to_string()),
-        stack_depth: bundle.config.game.stack_depth,
-        bet_sizes: bundle.config.game.bet_sizes.clone(),
-        info_sets: bundle.blueprint.len(),
-        iterations: bundle.blueprint.iterations_trained(),
-    };
-
-    *state.abstraction_boundaries.write() = Some(bundle.boundaries.clone());
-
-    let source = StrategySource::Bundle {
-        config: bundle.config,
-        blueprint: bundle.blueprint,
-    };
-
-    Ok((info, source))
 }
 
 /// Get the strategy matrix for a given position.
@@ -251,15 +259,18 @@ fn get_strategy_matrix_bundle(
     let board = parse_board(&position.board)?;
     let street = street_from_board_len(board.len())?;
     let history_str = build_history_string(&position.history);
+    let use_hand_class = config.abstraction_mode == "hand_class";
 
     let ranks = RANKS;
     let mut cells = Vec::with_capacity(13);
 
+    let pos_state = compute_position_state(&config.game.bet_sizes, position);
     let actions =
         get_actions_for_position(config.game.stack_depth, &config.game.bet_sizes, position);
 
+    // For EHS2 mode, use bucket cache; for hand_class mode, use classify() directly
     let bucket_cache: Option<HashMap<(char, char, bool), u16>> =
-        if street != Street::Preflop && !board.is_empty() {
+        if !use_hand_class && street != Street::Preflop && !board.is_empty() {
             let board_key = position.board.join("");
             let cache = state.bucket_cache.read();
             cache.get(&board_key).cloned()
@@ -272,17 +283,34 @@ fn get_strategy_matrix_bundle(
         for (col, &rank2) in ranks.iter().enumerate() {
             let (hand_label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
 
-            let probabilities = get_hand_strategy(
-                blueprint,
-                &board,
-                street,
-                &history_str,
-                rank1,
-                rank2,
-                suited,
-                &actions,
-                bucket_cache.as_ref(),
-            )?;
+            let probabilities = if use_hand_class {
+                get_hand_strategy_hand_class(
+                    blueprint,
+                    &board,
+                    street,
+                    &history_str,
+                    pos_state.pot,
+                    pos_state.eff_stack,
+                    rank1,
+                    rank2,
+                    suited,
+                    &actions,
+                )?
+            } else {
+                get_hand_strategy(
+                    blueprint,
+                    &board,
+                    street,
+                    &history_str,
+                    pos_state.pot,
+                    pos_state.eff_stack,
+                    rank1,
+                    rank2,
+                    suited,
+                    &actions,
+                    bucket_cache.as_ref(),
+                )?
+            };
 
             row_cells.push(MatrixCell {
                 hand: hand_label,
@@ -298,13 +326,15 @@ fn get_strategy_matrix_bundle(
         cells,
         actions,
         street: format!("{street:?}"),
-        pot: position.pot,
+        pot: pos_state.pot,
         stack: if position.to_act == 0 {
-            position.stack_p1
+            pos_state.stack_p1
         } else {
-            position.stack_p2
+            pos_state.stack_p2
         },
-        to_call: calculate_to_call(position),
+        to_call: pos_state.to_call,
+        stack_p1: pos_state.stack_p1,
+        stack_p2: pos_state.stack_p2,
     })
 }
 
@@ -347,17 +377,21 @@ fn get_strategy_matrix_agent(
         cells.push(row_cells);
     }
 
+    let pos_state = compute_position_state(&agent.game.bet_sizes, position);
+
     Ok(StrategyMatrix {
         cells,
         actions,
         street: format!("{street:?}"),
-        pot: position.pot,
+        pot: pos_state.pot,
         stack: if position.to_act == 0 {
-            position.stack_p1
+            pos_state.stack_p1
         } else {
-            position.stack_p2
+            pos_state.stack_p2
         },
-        to_call: calculate_to_call(position),
+        to_call: pos_state.to_call,
+        stack_p1: pos_state.stack_p1,
+        stack_p2: pos_state.stack_p2,
     })
 }
 
@@ -445,11 +479,17 @@ pub fn start_bucket_computation(
 ) -> Result<String, String> {
     let board_key = board.join("");
 
-    // Agents don't need bucket computation
+    // Agents and hand_class bundles don't need bucket computation
     {
         let source_guard = state.source.read();
-        if let Some(StrategySource::Agent(_)) = source_guard.as_ref() {
-            return Ok(board_key);
+        match source_guard.as_ref() {
+            Some(StrategySource::Agent(_)) => return Ok(board_key),
+            Some(StrategySource::Bundle { config, .. })
+                if config.abstraction_mode == "hand_class" =>
+            {
+                return Ok(board_key);
+            }
+            _ => {}
         }
     }
 
@@ -686,6 +726,10 @@ fn build_history_string(history: &[String]) -> String {
     history.iter().map(|a| action_to_key_char(a)).collect()
 }
 
+/// Convert a history action string to its info-set key representation.
+///
+/// History entries like `"bet:0"`, `"raise:A"`, `"call"` are mapped to
+/// the same format used by `write_action_to_buf`: `b0`, `rA`, `c`, etc.
 fn action_to_key_char(action: &str) -> String {
     if action == "f" || action == "fold" {
         "f".to_string()
@@ -693,10 +737,14 @@ fn action_to_key_char(action: &str) -> String {
         "x".to_string()
     } else if action == "c" || action == "call" {
         "c".to_string()
-    } else if let Some(amt) = action.strip_prefix("b:") {
-        format!("b{amt}")
-    } else if let Some(amt) = action.strip_prefix("r:") {
-        format!("r{amt}")
+    } else if let Some(idx) = action.strip_prefix("bet:") {
+        format!("b{idx}")
+    } else if let Some(idx) = action.strip_prefix("raise:") {
+        format!("r{idx}")
+    } else if let Some(idx) = action.strip_prefix("b:") {
+        format!("b{idx}")
+    } else if let Some(idx) = action.strip_prefix("r:") {
+        format!("r{idx}")
     } else {
         action.to_string()
     }
@@ -708,7 +756,8 @@ fn get_actions_for_position(
     position: &ExplorationPosition,
 ) -> Vec<ActionInfo> {
     let mut actions = Vec::new();
-    let to_call = calculate_to_call(position);
+    let pos_state = compute_position_state(bet_sizes, position);
+    let to_call = pos_state.to_call;
     let stack = if position.to_act == 0 {
         position.stack_p1
     } else {
@@ -742,42 +791,40 @@ fn get_actions_for_position(
         });
     }
 
-    // Bet/raise sizes from config
+    // Bet/raise sizes from config — always include ALL indices + ALL_IN,
+    // matching HunlPostflop::actions() order exactly so blueprint
+    // probability indices align.
     let effective_stack = stack.saturating_sub(to_call);
     if effective_stack > 0 {
-        for &fraction in bet_sizes {
+        for (idx, &fraction) in bet_sizes.iter().enumerate() {
+            let action_type = if to_call == 0 { "bet" } else { "raise" };
+
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let size = (f64::from(position.pot) * f64::from(fraction)).round() as u32;
-            if size > 0 && size <= effective_stack {
-                let action_type = if to_call == 0 { "bet" } else { "raise" };
-                let total = if to_call == 0 { size } else { to_call + size };
-                actions.push(ActionInfo {
-                    id: format!("{action_type}:{total}"),
-                    label: format!("{} {total}", if to_call == 0 { "Bet" } else { "Raise to" }),
-                    action_type: action_type.to_string(),
-                    size_key: Some(bet_size_key(fraction)),
-                });
-            }
-        }
+            let capped = size.min(effective_stack);
+            let display_total = if to_call == 0 { capped } else { to_call + capped };
 
-        // All-in
-        let all_in = if to_call == 0 { effective_stack } else { stack };
-        if !actions
-            .iter()
-            .any(|a| a.id.ends_with(&format!(":{all_in}")))
-        {
-            let action_type = if to_call == 0 { "bet" } else { "raise" };
             actions.push(ActionInfo {
-                id: format!("{action_type}:{all_in}"),
-                label: "All-in".to_string(),
-                action_type: "allin".to_string(),
-                size_key: Some("allin".to_string()),
+                id: format!("{action_type}:{idx}"),
+                label: format!(
+                    "{} {display_total}",
+                    if to_call == 0 { "Bet" } else { "Raise to" }
+                ),
+                action_type: action_type.to_string(),
+                size_key: Some(bet_size_key(fraction)),
             });
         }
+
+        // All-in (uses "A" as the index sentinel)
+        let action_type = if to_call == 0 { "bet" } else { "raise" };
+        actions.push(ActionInfo {
+            id: format!("{action_type}:A"),
+            label: format!("All-in {}", stack),
+            action_type: "allin".to_string(),
+            size_key: Some("allin".to_string()),
+        });
     }
 
-    // Display order: all-in, raises (large→small), check/call, fold
-    actions.reverse();
     actions
 }
 
@@ -788,42 +835,83 @@ fn bet_size_key(fraction: f32) -> String {
     if s.contains('.') { s } else { format!("{fraction:.1}") }
 }
 
-fn calculate_to_call(position: &ExplorationPosition) -> u32 {
-    // Postflop: history is reset per street, so both start at 0.
-    // Preflop: SB posted 1, BB posted 2.
-    let (mut p1_invested, mut p2_invested) = if position.board.len() >= 3 {
-        (0u32, 0u32)
+/// Replayed position state — pot, stacks, and to-call at the current node.
+struct PositionState {
+    to_call: u32,
+    pot: u32,
+    eff_stack: u32,
+    stack_p1: u32,
+    stack_p2: u32,
+}
+
+/// Replay the action history to determine pot, stacks, and to-call.
+///
+/// Tracks remaining stacks directly, matching `HunlPostflop::next_state`.
+/// Position stacks already have blinds deducted (stack_p1 = depth-1,
+/// stack_p2 = depth-2), so we replay from there without re-subtracting.
+fn compute_position_state(bet_sizes: &[f32], position: &ExplorationPosition) -> PositionState {
+    let mut stacks = [position.stack_p1, position.stack_p2];
+    let mut pot = position.pot;
+
+    // Preflop: SB owes 1 more to match BB's blind.
+    // Postflop: no outstanding bet.
+    let mut to_call = if position.board.is_empty() {
+        position.stack_p1.saturating_sub(position.stack_p2)
     } else {
-        (1u32, 2u32)
+        0u32
     };
 
     for (i, action) in position.history.iter().enumerate() {
-        let is_p1 = (i % 2) == 0;
+        let player = i % 2;
+
         if action == "c" || action == "call" {
-            if is_p1 {
-                p1_invested = p2_invested;
-            } else {
-                p2_invested = p1_invested;
-            }
-        } else if let Some(amt) = action
-            .strip_prefix("r:")
+            let amt = to_call.min(stacks[player]);
+            stacks[player] -= amt;
+            pot += amt;
+            to_call = 0;
+        } else if let Some(idx_str) = action
+            .strip_prefix("bet:")
+            .or_else(|| action.strip_prefix("raise:"))
             .or_else(|| action.strip_prefix("b:"))
+            .or_else(|| action.strip_prefix("r:"))
         {
-            if let Ok(amount) = amt.parse::<u32>() {
-                if is_p1 {
-                    p1_invested = amount;
-                } else {
-                    p2_invested = amount;
-                }
-            }
+            let effective = stacks[player].saturating_sub(to_call);
+            let bet_portion = resolve_bet_index(idx_str, bet_sizes, pot, effective);
+            let total = to_call + bet_portion;
+            let actual = total.min(stacks[player]);
+            stacks[player] -= actual;
+            pot += actual;
+            to_call = actual.saturating_sub(to_call);
         }
+        // "f"/"fold", "x"/"check" don't change stacks
     }
 
-    if position.to_act == 0 {
-        p2_invested.saturating_sub(p1_invested)
-    } else {
-        p1_invested.saturating_sub(p2_invested)
+    PositionState {
+        to_call,
+        pot,
+        eff_stack: stacks[0].min(stacks[1]),
+        stack_p1: stacks[0],
+        stack_p2: stacks[1],
     }
+}
+
+/// Resolve a bet-size index string to a cent amount.
+///
+/// `"A"` maps to all-in (effective stack). Numeric indices look up the
+/// fraction in `bet_sizes` and compute the pot-relative amount.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn resolve_bet_index(idx_str: &str, bet_sizes: &[f32], pot: u32, effective_stack: u32) -> u32 {
+    if idx_str == "A" {
+        return effective_stack;
+    }
+    if let Ok(idx) = idx_str.parse::<usize>() {
+        if let Some(&fraction) = bet_sizes.get(idx) {
+            let size = (f64::from(pot) * f64::from(fraction)).round() as u32;
+            return size.min(effective_stack);
+        }
+    }
+    // Fallback: try parsing as raw cent amount (backwards compat)
+    idx_str.parse::<u32>().unwrap_or(0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -832,6 +920,8 @@ fn get_hand_strategy(
     _board: &[Card],
     street: Street,
     history_str: &str,
+    pot: u32,
+    eff_stack: u32,
     rank1: char,
     rank2: char,
     suited: bool,
@@ -839,13 +929,7 @@ fn get_hand_strategy(
     bucket_cache: Option<&std::collections::HashMap<(char, char, bool), u16>>,
 ) -> Result<Vec<ActionProb>, String> {
     let bucket_or_hand = if street == Street::Preflop {
-        if rank1 == rank2 {
-            format!("{rank1}{rank2}")
-        } else if suited {
-            format!("{rank1}{rank2}s")
-        } else {
-            format!("{rank1}{rank2}o")
-        }
+        canonical_hand_string(rank1, rank2, suited)
     } else {
         let cache = bucket_cache.ok_or_else(|| {
             format!(
@@ -866,7 +950,14 @@ fn get_hand_strategy(
         Street::River => 'R',
     };
 
-    let info_set_key = format!("{bucket_or_hand}|{street_char}|{history_str}");
+    // Pot/stack buckets (10 BB intervals, matching game model).
+    // 1 BB = 2 pot-units, 10 BB = 20 pot-units.
+    // Stacks ≈ BB, so 10 BB = 10 stack-units.
+    let pot_bucket = pot / 20;
+    let stack_bucket = eff_stack / 10;
+
+    let info_set_key =
+        format!("{bucket_or_hand}|{street_char}|p{pot_bucket}s{stack_bucket}|{history_str}");
 
     let probs = blueprint.lookup(&info_set_key).ok_or_else(|| {
         format!(
@@ -884,6 +975,90 @@ fn get_hand_strategy(
             probability: probs.get(i).copied().unwrap_or(0.0),
         })
         .collect())
+}
+
+/// Lookup strategy for a hand using classify()-based bucket keys (hand_class mode).
+///
+/// No bucket cache needed — `classify()` is O(1) and deterministic.
+#[allow(clippy::too_many_arguments)]
+fn get_hand_strategy_hand_class(
+    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
+    board: &[Card],
+    street: Street,
+    history_str: &str,
+    pot: u32,
+    eff_stack: u32,
+    rank1: char,
+    rank2: char,
+    suited: bool,
+    actions: &[ActionInfo],
+) -> Result<Vec<ActionProb>, String> {
+    let bucket_or_hand = if street == Street::Preflop {
+        canonical_hand_string(rank1, rank2, suited)
+    } else {
+        let (card1, card2) = make_representative_hand(rank1, rank2, suited, board);
+        match classify([card1, card2], board) {
+            Ok(classification) => classification.bits().to_string(),
+            Err(_) => "?".to_string(),
+        }
+    };
+
+    let street_char = match street {
+        Street::Preflop => 'P',
+        Street::Flop => 'F',
+        Street::Turn => 'T',
+        Street::River => 'R',
+    };
+
+    let pot_bucket = pot / 20;
+    let stack_bucket = eff_stack / 10;
+
+    let info_set_key =
+        format!("{bucket_or_hand}|{street_char}|p{pot_bucket}s{stack_bucket}|{history_str}");
+
+    let probs = blueprint.lookup(&info_set_key).ok_or_else(|| {
+        format!(
+            "Blueprint lookup failed for key '{info_set_key}' \
+             (blueprint has {} info sets)",
+            blueprint.len()
+        )
+    })?;
+
+    Ok(actions
+        .iter()
+        .enumerate()
+        .map(|(i, a)| ActionProb {
+            action: a.label.clone(),
+            probability: probs.get(i).copied().unwrap_or(0.0),
+        })
+        .collect())
+}
+
+/// Build canonical hand notation from rank chars and suited flag.
+///
+/// Ranks are ordered high-to-low to match the blueprint key format
+/// produced by `write_canonical_hand` in the game module.
+fn canonical_hand_string(rank1: char, rank2: char, suited: bool) -> String {
+    let rank_order = |c: char| match c {
+        'A' => 14,
+        'K' => 13,
+        'Q' => 12,
+        'J' => 11,
+        'T' => 10,
+        _ => c.to_digit(10).unwrap_or(0),
+    };
+    let (high, low) = if rank_order(rank1) >= rank_order(rank2) {
+        (rank1, rank2)
+    } else {
+        (rank2, rank1)
+    };
+    if high == low {
+        format!("{high}{low}")
+    } else if suited {
+        format!("{high}{low}s")
+    } else {
+        format!("{high}{low}o")
+    }
 }
 
 const RANKS: [char; 13] = [

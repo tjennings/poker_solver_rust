@@ -216,7 +216,7 @@ impl SubgameSolver {
         // Build history string
         let history_str: String = history
             .iter()
-            .map(|(_, action)| action_to_char(*action))
+            .map(|(_, action)| action_to_key_str(*action))
             .collect();
 
         Ok(format!("{bucket}|{street_char}|{history_str}"))
@@ -243,14 +243,20 @@ fn card_to_char(card: Card) -> char {
     }
 }
 
-/// Convert an action to a single character
-fn action_to_char(action: Action) -> char {
+/// Convert an action to its info-set key representation.
+///
+/// Matches the format used by `write_action_to_buf` in [`HunlPostflop`]:
+/// `f`, `x`, `c`, `b{idx}`, `r{idx}`, `bA`/`rA` for all-in.
+fn action_to_key_str(action: Action) -> String {
+    use crate::game::ALL_IN;
     match action {
-        Action::Fold => 'f',
-        Action::Check => 'x',
-        Action::Call => 'c',
-        Action::Bet(_) => 'b',
-        Action::Raise(_) => 'r',
+        Action::Fold => "f".to_string(),
+        Action::Check => "x".to_string(),
+        Action::Call => "c".to_string(),
+        Action::Bet(idx) if idx == ALL_IN => "bA".to_string(),
+        Action::Bet(idx) => format!("b{idx}"),
+        Action::Raise(idx) if idx == ALL_IN => "rA".to_string(),
+        Action::Raise(idx) => format!("r{idx}"),
     }
 }
 
@@ -429,14 +435,14 @@ mod tests {
         ];
         let board: &[Card] = &[];
         let history = &[
-            (Street::Preflop, Action::Raise(300)),
+            (Street::Preflop, Action::Raise(1)),
             (Street::Preflop, Action::Call),
         ];
 
         let key = solver
             .make_info_set_key(board, holding, history)
             .expect("should create key");
-        assert_eq!(key, "AK|P|rc", "key with history should include actions");
+        assert_eq!(key, "AK|P|r1c", "key with history should include actions");
     }
 
     #[timed_test]

@@ -166,6 +166,15 @@ impl HandClassification {
         self.bits |= 1 << class as u8;
     }
 
+    /// Raw bits for use as a compact bucket key.
+    ///
+    /// Each bit corresponds to a `HandClass` discriminant, so the value
+    /// uniquely identifies the combination of made-hand and draw classes.
+    #[must_use]
+    pub fn bits(self) -> u32 {
+        self.bits
+    }
+
     /// Check whether the set is empty.
     #[must_use]
     pub fn is_empty(self) -> bool {

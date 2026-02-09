@@ -12,6 +12,18 @@ use crate::game::{Game, Player};
 
 use super::regret::regret_match;
 
+/// Normalize a strategy sum vector to probabilities.
+///
+/// Returns `None` if the total is zero (no data accumulated).
+fn normalize_strategy(sums: &[f64]) -> Option<Vec<f64>> {
+    let total: f64 = sums.iter().sum();
+    if total > 0.0 {
+        Some(sums.iter().map(|&s| s / total).collect())
+    } else {
+        None
+    }
+}
+
 /// Monte Carlo CFR solver with chance sampling.
 ///
 /// Much faster than vanilla CFR for games with many initial states because
@@ -120,8 +132,6 @@ impl<G: Game> MccfrSolver<G> {
     ) where
         F: FnMut(u64),
     {
-        use indicatif::{ProgressBar, ProgressStyle};
-
         let initial_states = self.game.initial_states();
         let num_states = initial_states.len();
 
@@ -131,28 +141,10 @@ impl<G: Game> MccfrSolver<G> {
 
         let skip_until = self.skip_strategy_until;
 
-        let iter_pb = ProgressBar::new(iterations);
-        iter_pb.set_style(
-            ProgressStyle::with_template(
-                "  iters: [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA: {eta})",
-            )
-            .expect("valid template")
-            .progress_chars("=>-"),
-        );
-
         for i in 0..iterations {
             // Compute discount factor for CFR+ early iteration discounting
             let discount = self.compute_discount();
             let accumulate = self.iterations >= skip_until;
-
-            let sample_pb = ProgressBar::new(samples_per_iter as u64);
-            sample_pb.set_style(
-                ProgressStyle::with_template(
-                    "  samples: [{bar:40.green/black}] {pos}/{len} ({per_sec})",
-                )
-                .expect("valid template")
-                .progress_chars("=>-"),
-            );
 
             // Sample initial states
             for _ in 0..samples_per_iter {
@@ -188,17 +180,10 @@ impl<G: Game> MccfrSolver<G> {
                     discount,
                     accumulate,
                 );
-
-                sample_pb.inc(1);
             }
-
-            sample_pb.finish_and_clear();
             self.iterations += 1;
-            iter_pb.inc(1);
             on_iteration(i + 1);
         }
-
-        iter_pb.finish_and_clear();
     }
 
     /// Train for a fixed number of iterations, sampling all states once per iteration.
@@ -272,6 +257,32 @@ impl<G: Game> MccfrSolver<G> {
             .keys()
             .filter_map(|k| self.get_average_strategy(k).map(|s| (k.clone(), s)))
             .collect()
+    }
+
+    /// Returns all info sets with best-available strategies.
+    ///
+    /// Uses the average strategy when available (post-skip-threshold),
+    /// otherwise falls back to the current regret-matched strategy.
+    /// This ensures checkpoints during the skip phase still show data.
+    #[must_use]
+    pub fn all_strategies_best_effort(&self) -> HashMap<String, Vec<f64>> {
+        let mut result = HashMap::new();
+
+        // Average strategies (highest quality, only available after skip threshold)
+        for (k, s) in &self.strategy_sum {
+            if let Some(avg) = normalize_strategy(s) {
+                result.insert(k.clone(), avg);
+            }
+        }
+
+        // Fill gaps with regret-matched strategies
+        for (k, regrets) in &self.regret_sum {
+            result
+                .entry(k.clone())
+                .or_insert_with(|| regret_match(regrets));
+        }
+
+        result
     }
 
     /// External sampling MCCFR traversal.

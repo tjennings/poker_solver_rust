@@ -1,0 +1,11 @@
+game:
+  stack_depth: 100
+  bet_sizes: [0.3, 0.5, 1.0, 1.5]
+
+training:
+  iterations: 5
+  seed: 42
+  output_dir: "./handclass_100bb"
+  mccfr_samples: 500
+  deal_count: 20000
+  abstraction_mode: hand_class

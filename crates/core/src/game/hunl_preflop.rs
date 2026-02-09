@@ -259,6 +259,8 @@ impl Game for HunlPreflop {
                 }
             }
 
+            // Note: HunlPreflop stores absolute cent amounts in Bet/Raise,
+            // unlike HunlPostflop which uses bet-size indices.
             Action::Bet(amount) | Action::Raise(amount) => {
                 let raise_amount = f64::from(amount) / 100.0; // Convert from cents
                 let actual_raise = raise_amount.min(state.current_stack());

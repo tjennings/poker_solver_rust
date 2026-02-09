@@ -4,7 +4,7 @@ mod kuhn;
 
 use arrayvec::ArrayVec;
 
-pub use hunl_postflop::{HunlPostflop, PostflopConfig, PostflopState, TerminalType};
+pub use hunl_postflop::{AbstractionMode, HunlPostflop, PostflopConfig, PostflopState, TerminalType};
 pub use hunl_preflop::HunlPreflop;
 pub use kuhn::KuhnPoker;
 
@@ -12,6 +12,12 @@ pub use kuhn::KuhnPoker;
 ///
 /// Fold + Check/Call + up to 6 bet/raise sizes (4 pot fractions + all-in + min-raise).
 pub const MAX_ACTIONS: usize = 8;
+
+/// Sentinel value for all-in bets/raises.
+///
+/// Used as the index in `Bet(ALL_IN)` / `Raise(ALL_IN)` to represent
+/// going all-in, as distinct from any config bet-size index.
+pub const ALL_IN: u32 = u32::MAX;
 
 /// Stack-allocated action list returned by [`Game::actions`].
 pub type Actions = ArrayVec<Action, MAX_ACTIONS>;
@@ -34,7 +40,12 @@ impl Player {
     }
 }
 
-/// Actions available in poker games
+/// Actions available in poker games.
+///
+/// The `u32` payload in `Bet` and `Raise` is **game-specific**:
+/// - **`HunlPostflop`**: index into `config.bet_sizes`, or [`ALL_IN`] for all-in.
+/// - **`HunlPreflop`**: absolute amount in cents.
+/// - **`KuhnPoker`**: unused (always 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     Fold,

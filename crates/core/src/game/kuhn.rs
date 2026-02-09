@@ -116,7 +116,7 @@ impl Game for KuhnPoker {
             // No bet yet: can check or bet
             [] | [KuhnAction::Check] => {
                 actions.push(Action::Check);
-                actions.push(Action::Bet(1));
+                actions.push(Action::Bet(0));
             }
             // Facing a bet: can fold or call
             [KuhnAction::Bet] | [KuhnAction::Check, KuhnAction::Bet] => {
@@ -282,7 +282,7 @@ mod tests {
         let game = KuhnPoker::new();
         let mut state = game.initial_states().remove(0);
 
-        state = game.next_state(&state, Action::Bet(1));
+        state = game.next_state(&state, Action::Bet(0));
         assert!(!game.is_terminal(&state));
 
         state = game.next_state(&state, Action::Fold);
@@ -294,7 +294,7 @@ mod tests {
         let game = KuhnPoker::new();
         let mut state = game.initial_states().remove(0);
 
-        state = game.next_state(&state, Action::Bet(1));
+        state = game.next_state(&state, Action::Bet(0));
         state = game.next_state(&state, Action::Call);
         assert!(game.is_terminal(&state));
     }
@@ -305,7 +305,7 @@ mod tests {
         let mut state = game.initial_states().remove(0);
 
         state = game.next_state(&state, Action::Check);
-        state = game.next_state(&state, Action::Bet(1));
+        state = game.next_state(&state, Action::Bet(0));
         state = game.next_state(&state, Action::Fold);
         assert!(game.is_terminal(&state));
     }
@@ -316,7 +316,7 @@ mod tests {
         let mut state = game.initial_states().remove(0);
 
         state = game.next_state(&state, Action::Check);
-        state = game.next_state(&state, Action::Bet(1));
+        state = game.next_state(&state, Action::Bet(0));
         state = game.next_state(&state, Action::Call);
         assert!(game.is_terminal(&state));
     }
@@ -331,7 +331,7 @@ mod tests {
             .find(|s| s.p1_card == Card::Jack)
             .unwrap();
 
-        state = game.next_state(&state, Action::Bet(1));
+        state = game.next_state(&state, Action::Bet(0));
         state = game.next_state(&state, Action::Fold);
 
         // P1 bet 1 (total contrib 2), P2 folded (contrib 1)
@@ -346,7 +346,7 @@ mod tests {
         let mut state = game.initial_states().remove(0);
 
         state = game.next_state(&state, Action::Check);
-        state = game.next_state(&state, Action::Bet(1));
+        state = game.next_state(&state, Action::Bet(0));
         state = game.next_state(&state, Action::Fold);
 
         // P2 bet 1 (total contrib 2), P1 folded (contrib 1)
@@ -384,7 +384,7 @@ mod tests {
             .find(|s| s.p1_card == Card::King && s.p2_card == Card::Queen)
             .unwrap();
 
-        state = game.next_state(&state, Action::Bet(1));
+        state = game.next_state(&state, Action::Bet(0));
         state = game.next_state(&state, Action::Call);
 
         // Bet-call showdown, pot is 4, each contributed 2
@@ -409,7 +409,7 @@ mod tests {
         // P2's info set: their card + history
         assert_eq!(game.info_set_key(&state), "Jc");
 
-        state = game.next_state(&state, Action::Bet(1));
+        state = game.next_state(&state, Action::Bet(0));
         // P1's info set: their card + history
         assert_eq!(game.info_set_key(&state), "Kcb");
     }
@@ -424,7 +424,7 @@ mod tests {
         state = game.next_state(&state, Action::Check);
         assert_eq!(game.player(&state), Player::Player2);
 
-        state = game.next_state(&state, Action::Bet(1));
+        state = game.next_state(&state, Action::Bet(0));
         assert_eq!(game.player(&state), Player::Player1);
     }
 
@@ -436,17 +436,17 @@ mod tests {
         // P1 opens
         assert_eq!(
             game.actions(&state).as_slice(),
-            &[Action::Check, Action::Bet(1)]
+            &[Action::Check, Action::Bet(0)]
         );
 
         state = game.next_state(&state, Action::Check);
         // P2 after check
         assert_eq!(
             game.actions(&state).as_slice(),
-            &[Action::Check, Action::Bet(1)]
+            &[Action::Check, Action::Bet(0)]
         );
 
-        state = game.next_state(&state, Action::Bet(1));
+        state = game.next_state(&state, Action::Bet(0));
         // P1 facing bet
         assert_eq!(
             game.actions(&state).as_slice(),
@@ -461,7 +461,7 @@ mod tests {
 
         assert_eq!(state.pot, 2);
 
-        state = game.next_state(&state, Action::Bet(1));
+        state = game.next_state(&state, Action::Bet(0));
         assert_eq!(state.pot, 3);
         assert_eq!(state.p1_contrib, 2);
 

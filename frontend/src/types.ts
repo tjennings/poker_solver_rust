@@ -81,6 +81,8 @@ export interface StrategyMatrix {
   pot: number;
   stack: number;
   to_call: number;
+  stack_p1: number;
+  stack_p2: number;
 }
 
 export interface ExplorationPosition {
@@ -90,4 +92,26 @@ export interface ExplorationPosition {
   stack_p1: number;
   stack_p2: number;
   to_act: number;
+}
+
+// Simulation types
+export interface StrategySourceInfo {
+  name: string;
+  source_type: 'agent' | 'bundle';
+  path: string;
+}
+
+export interface SimulationProgress {
+  hands_played: number;
+  total_hands: number;
+  p1_profit_bb: number;
+  current_mbbh: number;
+}
+
+export interface SimulationResult {
+  hands_played: number;
+  p1_profit_bb: number;
+  mbbh: number;
+  equity_curve: number[];
+  elapsed_ms: number;
 }

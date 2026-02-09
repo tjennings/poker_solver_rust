@@ -10,7 +10,7 @@ use poker_solver_core::abstraction::{AbstractionConfig, BoundaryGenerator};
 use poker_solver_core::blueprint::{BlueprintStrategy, BundleConfig, StrategyBundle};
 use poker_solver_core::cfr::{MccfrConfig, MccfrSolver};
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
-use poker_solver_core::game::{Action, HunlPostflop, PostflopConfig};
+use poker_solver_core::game::{AbstractionMode, Action, HunlPostflop, PostflopConfig};
 use serde::Deserialize;
 
 #[derive(Parser)]
@@ -50,7 +50,8 @@ enum OutputFormat {
 #[derive(Debug, Deserialize)]
 struct TrainingConfig {
     game: PostflopConfig,
-    abstraction: AbstractionConfig,
+    /// EHS2 abstraction config. Omit entirely for hand_class mode.
+    abstraction: Option<AbstractionConfig>,
     training: TrainingParams,
 }
 
@@ -63,6 +64,13 @@ struct TrainingParams {
     mccfr_samples: usize,
     #[serde(default = "default_deal_count")]
     deal_count: usize,
+    /// `"hand_class"` or `"ehs2"` (default). Determines bucketing strategy.
+    #[serde(default = "default_abstraction_mode")]
+    abstraction_mode: String,
+}
+
+fn default_abstraction_mode() -> String {
+    "ehs2".to_string()
 }
 
 fn default_mccfr_samples() -> usize {
@@ -94,20 +102,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
+    let use_hand_class = config.training.abstraction_mode == "hand_class";
+
     println!("=== Poker Blueprint Trainer (MCCFR) ===\n");
     println!("Game config:");
     println!("  Stack depth: {} BB", config.game.stack_depth);
     println!("  Bet sizes: {:?} pot", config.game.bet_sizes);
     println!("  Deal pool size: {}", config.training.deal_count);
     println!();
-    println!("Abstraction config:");
-    println!("  Flop buckets: {}", config.abstraction.flop_buckets);
-    println!("  Turn buckets: {}", config.abstraction.turn_buckets);
-    println!("  River buckets: {}", config.abstraction.river_buckets);
-    println!(
-        "  Samples/street: {}",
-        config.abstraction.samples_per_street
-    );
+
+    if use_hand_class {
+        println!("Abstraction: hand_class (classify()-based, no EHS2)");
+    } else if let Some(ref abs) = config.abstraction {
+        println!("Abstraction config:");
+        println!("  Flop buckets: {}", abs.flop_buckets);
+        println!("  Turn buckets: {}", abs.turn_buckets);
+        println!("  River buckets: {}", abs.river_buckets);
+        println!("  Samples/street: {}", abs.samples_per_street);
+    }
     println!();
     println!(
         "Training: {} iterations, {} samples/iter, seed {}",
@@ -116,21 +128,30 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     println!("Output: {}", config.training.output_dir);
     println!();
 
-    // Generate bucket boundaries
-    println!("Generating bucket boundaries...");
-    let start = Instant::now();
-    let generator = BoundaryGenerator::new(config.abstraction.clone());
-    let boundaries = generator.generate(config.training.seed);
-    println!("  Done in {:?}\n", start.elapsed());
+    // Generate bucket boundaries (only for EHS2 mode)
+    let boundaries = if use_hand_class {
+        println!("Skipping boundary generation (hand_class mode)\n");
+        None
+    } else if let Some(ref abs_config) = config.abstraction {
+        println!("Generating bucket boundaries...");
+        let start = Instant::now();
+        let generator = BoundaryGenerator::new(abs_config.clone());
+        let b = generator.generate(config.training.seed);
+        println!("  Done in {:?}\n", start.elapsed());
+        Some(b)
+    } else {
+        None
+    };
+
+    // Select abstraction mode for the game
+    let abstraction_mode = if use_hand_class {
+        Some(AbstractionMode::HandClass)
+    } else {
+        None
+    };
 
     // Create game with deal pool
-    let game_config = PostflopConfig {
-        stack_depth: config.game.stack_depth,
-        bet_sizes: config.game.bet_sizes.clone(),
-        samples_per_iteration: config.training.deal_count,
-        ..PostflopConfig::default()
-    };
-    let game = HunlPostflop::new(game_config, None);
+    let game = HunlPostflop::new(config.game.clone(), abstraction_mode, config.training.deal_count);
 
     // Create MCCFR solver
     let skip_first = config.training.iterations / 2;
@@ -152,15 +173,7 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     println!("  Created in {:?}\n", start.elapsed());
 
     // Derive action labels from a single deal (all deals share the same preflop actions)
-    let label_game = HunlPostflop::new(
-        PostflopConfig {
-            stack_depth: config.game.stack_depth,
-            bet_sizes: config.game.bet_sizes.clone(),
-            samples_per_iteration: 1,
-            ..PostflopConfig::default()
-        },
-        None,
-    );
+    let label_game = HunlPostflop::new(config.game.clone(), None, 1);
     let initial_states = label_game.initial_states();
     let actions = label_game.actions(&initial_states[0]);
     let action_labels = format_action_labels(&actions);
@@ -168,18 +181,18 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     // Training loop with 10 checkpoints
     let total = config.training.iterations;
-    let checkpoint_interval = total / 10;
+    let checkpoint_interval = (total / 10).max(1);
     let training_start = Instant::now();
     // Baseline checkpoint (iteration 0)
-    print_checkpoint(
-        &solver,
-        0,
-        10,
-        total,
-        &training_start,
-        &header,
-        &action_labels,
-    );
+    let ckpt_ctx = CheckpointCtx {
+        total_checkpoints: 10,
+        total_iterations: total,
+        training_start: &training_start,
+        header: &header,
+        action_labels: &action_labels,
+        stack_depth: config.game.stack_depth,
+    };
+    print_checkpoint(&solver, 0, &ckpt_ctx);
 
     // Progress bar for training iterations
     let pb = ProgressBar::new(total);
@@ -197,15 +210,7 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         });
 
         pb.suspend(|| {
-            print_checkpoint(
-                &solver,
-                checkpoint,
-                10,
-                total,
-                &training_start,
-                &header,
-                &action_labels,
-            );
+            print_checkpoint(&solver, checkpoint, &ckpt_ctx);
         });
     }
 
@@ -236,6 +241,7 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     let bundle_config = BundleConfig {
         game: config.game,
         abstraction: config.abstraction,
+        abstraction_mode: config.training.abstraction_mode.clone(),
     };
     let bundle = StrategyBundle::new(bundle_config, blueprint, boundaries);
     let output_path = PathBuf::from(&config.training.output_dir);
@@ -253,14 +259,17 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 }
 
 fn format_action_labels(actions: &[Action]) -> Vec<String> {
+    use poker_solver_core::game::ALL_IN;
     actions
         .iter()
         .map(|a| match a {
             Action::Fold => "Fold".to_string(),
             Action::Check => "Check".to_string(),
             Action::Call => "Call".to_string(),
-            Action::Bet(n) => format!("B{n}"),
-            Action::Raise(n) => format!("R{n}"),
+            Action::Bet(idx) if *idx == ALL_IN => "B-AI".to_string(),
+            Action::Bet(idx) => format!("B{idx}"),
+            Action::Raise(idx) if *idx == ALL_IN => "R-AI".to_string(),
+            Action::Raise(idx) => format!("R{idx}"),
         })
         .collect()
 }
@@ -372,39 +381,42 @@ fn write_flops_csv(flops: &[CanonicalFlop], writer: &mut dyn Write) -> Result<()
     Ok(())
 }
 
+struct CheckpointCtx<'a> {
+    total_checkpoints: u64,
+    total_iterations: u64,
+    training_start: &'a Instant,
+    header: &'a str,
+    action_labels: &'a [String],
+    stack_depth: u32,
+}
+
 fn print_checkpoint(
     solver: &MccfrSolver<HunlPostflop>,
     checkpoint: u64,
-    total_checkpoints: u64,
-    total_iterations: u64,
-    training_start: &Instant,
-    header: &str,
-    action_labels: &[String],
+    ctx: &CheckpointCtx,
 ) {
     let current_iter = if checkpoint == 0 {
         0
     } else {
-        (total_iterations / total_checkpoints) * checkpoint
+        (ctx.total_iterations / ctx.total_checkpoints) * checkpoint
     };
 
-    let strategies = solver.all_strategies();
+    let strategies = solver.all_strategies_best_effort();
 
-    let elapsed = training_start.elapsed().as_secs_f64();
+    let elapsed = ctx.training_start.elapsed().as_secs_f64();
     let remaining = if checkpoint > 0 {
         let rate = elapsed / checkpoint as f64;
-        rate * (total_checkpoints - checkpoint) as f64
+        rate * (ctx.total_checkpoints - checkpoint) as f64
     } else {
         0.0
     };
 
-    // Header
     println!(
         "\n=== Checkpoint {}/{} ({}/{} iterations) ===",
-        checkpoint, total_checkpoints, current_iter, total_iterations
+        checkpoint, ctx.total_checkpoints, current_iter, ctx.total_iterations
     );
     println!("Info sets: {}", strategies.len());
 
-    // Timing
     if checkpoint > 0 {
         println!(
             "Time: {:.1}s elapsed, ~{:.1}s remaining",
@@ -414,15 +426,19 @@ fn print_checkpoint(
 
     // SB preflop strategy table
     println!("\nSB Opening Strategy (preflop, facing BB):");
-    println!("{header}");
-    println!("{}", "-".repeat(header.len()));
+    println!("{}", ctx.header);
+    println!("{}", "-".repeat(ctx.header.len()));
+
+    // Preflop initial state: pot=3 (SB+BB), stacks=stack_depth*2-1, stack_depth*2-2
+    let pot_bucket = 3u32 / 20;
+    let stack_bucket = (ctx.stack_depth * 2 - 2) / 20;
 
     for &hand in DISPLAY_HANDS {
-        let info_key = format!("{hand}|P|");
+        let info_key = format!("{hand}|P|p{pot_bucket}s{stack_bucket}|");
         if let Some(probs) = strategies.get(&info_key) {
             let prob_cols: String = probs
                 .iter()
-                .take(action_labels.len())
+                .take(ctx.action_labels.len())
                 .map(|p| format!("{:>6.2}", p))
                 .collect();
             println!("{:<6}|{prob_cols}", hand);

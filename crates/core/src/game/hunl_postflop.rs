@@ -10,21 +10,29 @@ use arrayvec::ArrayVec;
 use serde::{Deserialize, Serialize};
 
 use crate::abstraction::{CardAbstraction, Street};
+use crate::hand_class::classify;
 use crate::poker::{Card, Hand, Rankable, Suit, Value};
 
-use super::{Action, Actions, Game, Player};
+use super::{Action, Actions, Game, Player, ALL_IN};
+
+/// Selects which card abstraction to use for postflop info-set keys.
+#[derive(Debug, Clone)]
+pub enum AbstractionMode {
+    /// EHS2-based bucketing (expensive Monte Carlo, fine-grained).
+    Ehs2(Arc<CardAbstraction>),
+    /// Hand-class bucketing via `classify()` (O(1), interpretable).
+    HandClass,
+}
 
 /// Configuration for the postflop game.
 ///
-/// Controls stack depth, bet sizing options, and sampling parameters.
+/// Controls stack depth and bet sizing options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostflopConfig {
     /// Stack depth in big blinds
     pub stack_depth: u32,
     /// Available bet sizes as fractions of pot (e.g., 0.5 = half pot)
     pub bet_sizes: Vec<f32>,
-    /// Number of samples per iteration for Monte Carlo methods
-    pub samples_per_iteration: usize,
     /// Maximum bets/raises allowed per street (default: 3).
     /// After this many bets on a street, only fold/call/check are available.
     /// This keeps the game tree tractable for CFR traversal.
@@ -37,7 +45,6 @@ impl Default for PostflopConfig {
         Self {
             stack_depth: 100,
             bet_sizes: vec![0.33, 0.5, 0.75, 1.0],
-            samples_per_iteration: 1000,
             max_raises_per_street: 3,
         }
     }
@@ -59,7 +66,8 @@ pub enum TerminalType {
 /// State of a HUNL Postflop hand.
 ///
 /// Tracks the board, holdings, pot, stacks, and action history.
-/// Chips are tracked in cents for precision (1 BB = 100 cents).
+/// Internal units: SB=1, BB=2 (one unit = 0.5 BB).
+/// `stack_depth` is in BB; stacks start at `stack_depth * 2` internal units.
 ///
 /// Uses stack-allocated `ArrayVec` for `board` and `history` to avoid
 /// heap allocations on clone (the hot path during tree building).
@@ -76,11 +84,11 @@ pub struct PostflopState {
     pub full_board: Option<[Card; 5]>,
     /// Current street
     pub street: Street,
-    /// Pot size in cents (1 BB = 100 cents)
+    /// Pot size (SB=1, BB=2, initial pot=3)
     pub pot: u32,
-    /// Remaining stacks in cents [SB stack, BB stack]
+    /// Remaining stacks [SB stack, BB stack]
     pub stacks: [u32; 2],
-    /// Amount to call in cents
+    /// Amount to call
     pub to_call: u32,
     /// Player to act (None if terminal)
     pub to_act: Option<Player>,
@@ -95,34 +103,33 @@ pub struct PostflopState {
 impl PostflopState {
     /// Create a new preflop state with blinds posted.
     ///
-    /// SB posts 50 cents (0.5 BB), BB posts 100 cents (1 BB).
-    /// SB acts first preflop.
+    /// SB posts 1, BB posts 2.  SB acts first preflop.
     ///
     /// # Arguments
     /// * `p1_holding` - Player 1 (SB) hole cards
     /// * `p2_holding` - Player 2 (BB) hole cards
-    /// * `stack_depth_bb` - Stack depth in big blinds
+    /// * `stack_depth` - Stack depth in big blinds
     #[must_use]
-    pub fn new_preflop(p1_holding: [Card; 2], p2_holding: [Card; 2], stack_depth_bb: u32) -> Self {
-        let stack_cents = stack_depth_bb * 100;
-
+    pub fn new_preflop(p1_holding: [Card; 2], p2_holding: [Card; 2], stack_depth: u32) -> Self {
+        // Internal units: SB=1, BB=2.  1 BB = 2 internal units.
+        let stack = stack_depth * 2;
         Self {
             board: ArrayVec::new(),
             p1_holding,
             p2_holding,
             full_board: None,
             street: Street::Preflop,
-            pot: 150,                                      // SB (50) + BB (100) = 150 cents
-            stacks: [stack_cents - 50, stack_cents - 100], // SB posted 50, BB posted 100
-            to_call: 50,                                   // SB needs to call 50 more to match BB
-            to_act: Some(Player::Player1),                 // SB acts first preflop
+            pot: 3,                                    // SB (1) + BB (2) in internal units
+            stacks: [stack - 1, stack - 2],            // SB posted 1, BB posted 2
+            to_call: 1,                                        // SB needs 1 more to match BB
+            to_act: Some(Player::Player1),                     // SB acts first preflop
             history: ArrayVec::new(),
             terminal: None,
             street_bets: 1, // BB's post counts as first bet
         }
     }
 
-    /// Get the current player's stack in cents.
+    /// Get the current player's remaining stack.
     #[must_use]
     pub fn current_stack(&self) -> u32 {
         match self.to_act {
@@ -132,7 +139,7 @@ impl PostflopState {
         }
     }
 
-    /// Get the opponent's stack in cents.
+    /// Get the opponent's remaining stack.
     #[must_use]
     pub fn opponent_stack(&self) -> u32 {
         match self.to_act {
@@ -174,7 +181,9 @@ impl PostflopState {
 #[derive(Debug)]
 pub struct HunlPostflop {
     config: PostflopConfig,
-    abstraction: Option<Arc<CardAbstraction>>,
+    abstraction: Option<AbstractionMode>,
+    /// Number of random deals to generate for the deal pool.
+    deal_count: usize,
     rng_seed: u64,
 }
 
@@ -183,12 +192,18 @@ impl HunlPostflop {
     ///
     /// # Arguments
     /// * `config` - Game configuration (stack depth, bet sizes, etc.)
-    /// * `abstraction` - Optional card abstraction for bucketing
+    /// * `abstraction` - Optional abstraction mode for bucketing
+    /// * `deal_count` - Number of random deals to generate for the deal pool
     #[must_use]
-    pub fn new(config: PostflopConfig, abstraction: Option<Arc<CardAbstraction>>) -> Self {
+    pub fn new(
+        config: PostflopConfig,
+        abstraction: Option<AbstractionMode>,
+        deal_count: usize,
+    ) -> Self {
         Self {
             config,
             abstraction,
+            deal_count,
             rng_seed: 42,
         }
     }
@@ -344,23 +359,72 @@ impl HunlPostflop {
         deals
     }
 
-    /// Get bet sizes based on pot and remaining stack.
+    /// Generate deals from the 1,755 canonical flops, weighted by frequency.
     ///
-    /// Returns bet sizes as fractions of the pot, capped at the effective stack.
-    fn get_bet_sizes(&self, pot: u32, stack: u32) -> Vec<u32> {
-        let mut sizes = Vec::new();
-        for &fraction in &self.config.bet_sizes {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    /// For each deal: pick a canonical flop (weighted), then deal random
+    /// turn + river + 2+2 hole cards from the remaining 49 cards.
+    fn generate_flop_deals(&self, seed: u64, count: usize) -> Vec<PostflopState> {
+        use crate::flops;
+        use rand::SeedableRng;
+        use rand::distr::weighted::WeightedIndex;
+        use rand::prelude::Distribution;
+        use rand::prelude::SliceRandom;
+        use rand::rngs::StdRng;
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        let canonical_flops = flops::all_flops();
+
+        let weights: Vec<u16> = canonical_flops.iter().map(crate::flops::CanonicalFlop::weight).collect();
+        // WeightedIndex is safe here: all weights > 0 and total fits in u32.
+        let dist = WeightedIndex::new(&weights).expect("non-empty positive weights");
+
+        let deck = Self::full_deck();
+        let mut deals = Vec::with_capacity(count);
+        
+        for _ in 0..count {
+            let flop = &canonical_flops[dist.sample(&mut rng)];
+            let flop_cards = *flop.cards();
+
+            // Remaining deck excludes the 3 flop cards
+            let remaining: Vec<Card> = deck
+                .iter()
+                .filter(|c| !flop_cards.contains(c))
+                .copied()
+                .collect();
+
+            let mut shuffled = remaining;
+            shuffled.shuffle(&mut rng);
+
+            let turn = shuffled[0];
+            let river = shuffled[1];
+            let p1 = [shuffled[2], shuffled[3]];
+            let p2 = [shuffled[4], shuffled[5]];
+            let board = [flop_cards[0], flop_cards[1], flop_cards[2], turn, river];
+
+            deals.push(PostflopState::new_preflop_with_board(
+                p1,
+                p2,
+                board,
+                self.config.stack_depth,
+            ));
+        }
+        deals
+    }
+
+    /// Resolve a bet-size index to an absolute cent amount.
+    ///
+    /// [`ALL_IN`] maps to the full effective stack. Any other index looks up
+    /// the corresponding pot fraction in `config.bet_sizes` and rounds to
+    /// the nearest cent, capped at the effective stack.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn resolve_bet_amount(&self, idx: u32, pot: u32, effective_stack: u32) -> u32 {
+        if idx == ALL_IN {
+            effective_stack
+        } else {
+            let fraction = self.config.bet_sizes[idx as usize];
             let size = (f64::from(pot) * f64::from(fraction)).round() as u32;
-            if size > 0 && size <= stack {
-                sizes.push(size);
-            }
+            size.min(effective_stack)
         }
-        // Always include all-in if not already present
-        if !sizes.contains(&stack) && stack > 0 {
-            sizes.push(stack);
-        }
-        sizes
     }
 
     /// Advance the game to the next street or showdown.
@@ -413,7 +477,12 @@ impl Game for HunlPostflop {
     type State = PostflopState;
 
     fn initial_states(&self) -> Vec<Self::State> {
-        self.generate_random_deals(self.rng_seed, self.config.samples_per_iteration)
+        match &self.abstraction {
+            Some(AbstractionMode::HandClass) => {
+                self.generate_flop_deals(self.rng_seed, self.deal_count)
+            }
+            _ => self.generate_random_deals(self.rng_seed, self.deal_count),
+        }
     }
 
     fn is_terminal(&self, state: &Self::State) -> bool {
@@ -445,18 +514,29 @@ impl Game for HunlPostflop {
             actions.push(Action::Call);
         }
 
-        // Raise/bet sizes (only if under the per-street raise cap)
-        let effective_stack = stack.saturating_sub(to_call);
-        if effective_stack > 0 && state.street_bets < self.config.max_raises_per_street {
-            let bet_sizes = self.get_bet_sizes(state.pot, effective_stack);
-            for size in bet_sizes {
+        // Bet/raise sizes (only if under the per-street raise cap).
+        // Always include ALL bet-size indices + ALL_IN so that every visit
+        // to the same info set sees the same action count.  Bets that exceed
+        // the effective stack are capped to all-in in `next_state()`.
+        if state.street_bets < self.config.max_raises_per_street {
+            #[allow(clippy::cast_possible_truncation)]
+            for idx in 0..self.config.bet_sizes.len() {
                 if actions.is_full() {
                     break;
                 }
+                let idx_u32 = idx as u32;
                 if to_call == 0 {
-                    actions.push(Action::Bet(size));
+                    actions.push(Action::Bet(idx_u32));
                 } else {
-                    actions.push(Action::Raise(to_call + size));
+                    actions.push(Action::Raise(idx_u32));
+                }
+            }
+
+            if !actions.is_full() {
+                if to_call == 0 {
+                    actions.push(Action::Bet(ALL_IN));
+                } else {
+                    actions.push(Action::Raise(ALL_IN));
                 }
             }
         }
@@ -518,11 +598,14 @@ impl Game for HunlPostflop {
                 }
             }
 
-            Action::Bet(amount) | Action::Raise(amount) => {
-                let actual_amount = amount.min(state.current_stack());
-                new_state.stacks[player_idx] -= actual_amount;
-                new_state.pot += actual_amount;
-                new_state.to_call = actual_amount - state.to_call;
+            Action::Bet(idx) | Action::Raise(idx) => {
+                let effective_stack = state.current_stack().saturating_sub(state.to_call);
+                let bet_portion = self.resolve_bet_amount(idx, state.pot, effective_stack);
+                let total = state.to_call + bet_portion;
+                let actual = total.min(state.current_stack());
+                new_state.stacks[player_idx] -= actual;
+                new_state.pot += actual;
+                new_state.to_call = actual.saturating_sub(state.to_call);
                 new_state.street_bets += 1;
                 new_state.to_act = Some(state.to_act.unwrap_or(Player::Player1).opponent());
 
@@ -542,22 +625,25 @@ impl Game for HunlPostflop {
             return 0.0;
         };
 
-        let stack_cents = self.config.stack_depth * 100;
-        let p1_invested = stack_cents - state.stacks[0];
-        let p2_invested = stack_cents - state.stacks[1];
+        let starting_stack = self.config.stack_depth * 2;
+        let p1_invested = starting_stack - state.stacks[0];
+        let p2_invested = starting_stack - state.stacks[1];
+
+        // Convert internal units to BB (1 BB = 2 internal units)
+        let to_bb = |chips: u32| f64::from(chips) / 2.0;
 
         match terminal {
             TerminalType::Fold(folder) => {
                 if folder == Player::Player1 {
                     if player == Player::Player1 {
-                        -f64::from(p1_invested) / 100.0
+                        -to_bb(p1_invested)
                     } else {
-                        f64::from(p1_invested) / 100.0
+                        to_bb(p1_invested)
                     }
                 } else if player == Player::Player2 {
-                    -f64::from(p2_invested) / 100.0
+                    -to_bb(p2_invested)
                 } else {
-                    f64::from(p2_invested) / 100.0
+                    to_bb(p2_invested)
                 }
             }
             TerminalType::Showdown => {
@@ -582,21 +668,21 @@ impl Game for HunlPostflop {
                 }
                 let p2_rank = p2_hand.rank();
 
-                let pot = f64::from(p1_invested + p2_invested) / 100.0;
+                let pot_bb = to_bb(p1_invested + p2_invested);
 
                 // Higher rank is better in rs_poker
                 let p1_ev = match p1_rank.cmp(&p2_rank) {
                     Ordering::Greater => {
                         // P1 wins - gets opponent's investment
-                        pot - f64::from(p1_invested) / 100.0
+                        pot_bb - to_bb(p1_invested)
                     }
                     Ordering::Less => {
                         // P2 wins - P1 loses investment
-                        -f64::from(p1_invested) / 100.0
+                        -to_bb(p1_invested)
                     }
                     Ordering::Equal => {
                         // Tie - split pot
-                        pot / 2.0 - f64::from(p1_invested) / 100.0
+                        pot_bb / 2.0 - to_bb(p1_invested)
                     }
                 };
 
@@ -622,10 +708,8 @@ impl Game for HunlPostflop {
         let holding = state.current_holding();
 
         // Get bucket if abstraction available, otherwise use card chars
-        if let Some(ref abstraction) = self.abstraction {
-            if state.board.is_empty() {
-                write_canonical_hand(holding, buf);
-            } else {
+        match &self.abstraction {
+            Some(AbstractionMode::Ehs2(abstraction)) if !state.board.is_empty() => {
                 match abstraction.get_bucket(&state.board, (holding[0], holding[1])) {
                     Ok(b) => {
                         let _ = write!(buf, "{b}");
@@ -633,8 +717,17 @@ impl Game for HunlPostflop {
                     Err(_) => buf.push('?'),
                 }
             }
-        } else {
-            write_canonical_hand(holding, buf);
+            Some(AbstractionMode::HandClass) if !state.board.is_empty() => {
+                match classify(holding, &state.board) {
+                    Ok(classification) => {
+                        let _ = write!(buf, "{}", classification.bits());
+                    }
+                    Err(_) => buf.push('?'),
+                }
+            }
+            _ => {
+                write_canonical_hand(holding, buf);
+            }
         }
 
         let street_char = match state.street {
@@ -648,8 +741,19 @@ impl Game for HunlPostflop {
         buf.push(street_char);
         buf.push('|');
 
-        for (_, a) in &state.history {
-            write_action_to_buf(*a, buf);
+        // Pot and stack are both in internal units (1 BB = 2 units).
+        // Divide by 20 for 10-BB-interval buckets.
+        let pot_bucket = state.pot / 20;
+        let eff_stack = state.stacks[0].min(state.stacks[1]);
+        let stack_bucket = eff_stack / 20;
+        let _ = write!(buf, "p{pot_bucket}s{stack_bucket}|");
+
+        // Only include current-street actions in the info set key.
+        // Prior-street actions are reflected in the pot/stack buckets above.
+        for (street, a) in &state.history {
+            if *street == state.street {
+                write_action_to_buf(*a, buf);
+            }
         }
     }
 }
@@ -674,17 +778,22 @@ fn card_to_char(card: Card) -> char {
 }
 
 /// Write an action to the info set key buffer (no allocation).
+///
+/// Bet/Raise indices are written as `b0`, `r1`, etc.
+/// All-in is written as `bA`, `rA`.
 fn write_action_to_buf(action: Action, buf: &mut String) {
     use std::fmt::Write;
     match action {
         Action::Fold => buf.push('f'),
         Action::Check => buf.push('x'),
         Action::Call => buf.push('c'),
-        Action::Bet(amt) => {
-            let _ = write!(buf, "b{amt}");
+        Action::Bet(idx) if idx == ALL_IN => buf.push_str("bA"),
+        Action::Bet(idx) => {
+            let _ = write!(buf, "b{idx}");
         }
-        Action::Raise(amt) => {
-            let _ = write!(buf, "r{amt}");
+        Action::Raise(idx) if idx == ALL_IN => buf.push_str("rA"),
+        Action::Raise(idx) => {
+            let _ = write!(buf, "r{idx}");
         }
     }
 }
@@ -761,7 +870,6 @@ mod tests {
         let config = PostflopConfig::default();
         assert_eq!(config.stack_depth, 100);
         assert_eq!(config.bet_sizes, vec![0.33, 0.5, 0.75, 1.0]);
-        assert_eq!(config.samples_per_iteration, 1000);
     }
 
     #[timed_test]
@@ -769,12 +877,10 @@ mod tests {
         let config = PostflopConfig {
             stack_depth: 50,
             bet_sizes: vec![0.5, 1.0],
-            samples_per_iteration: 500,
             ..PostflopConfig::default()
         };
         assert_eq!(config.stack_depth, 50);
         assert_eq!(config.bet_sizes.len(), 2);
-        assert_eq!(config.samples_per_iteration, 500);
     }
 
     #[timed_test]
@@ -782,8 +888,8 @@ mod tests {
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
-        // Pot should be SB (50) + BB (100) = 150 cents
-        assert_eq!(state.pot, 150);
+        // Pot should be SB (1) + BB (2) = 3
+        assert_eq!(state.pot, 3);
     }
 
     #[timed_test]
@@ -791,10 +897,9 @@ mod tests {
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
-        // SB posted 50 cents: 10000 - 50 = 9950
-        // BB posted 100 cents: 10000 - 100 = 9900
-        assert_eq!(state.stacks[0], 9950);
-        assert_eq!(state.stacks[1], 9900);
+        // 100 BB = 200 internal units.  SB posted 1, BB posted 2.
+        assert_eq!(state.stacks[0], 199);
+        assert_eq!(state.stacks[1], 198);
     }
 
     #[timed_test]
@@ -810,8 +915,8 @@ mod tests {
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
-        // SB needs to call 50 more cents to match BB's 100
-        assert_eq!(state.to_call, 50);
+        // SB needs 1 more to match BB's 2
+        assert_eq!(state.to_call, 1);
     }
 
     #[timed_test]
@@ -860,8 +965,8 @@ mod tests {
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
-        // SB acts first, should return SB's stack
-        assert_eq!(state.current_stack(), 9950);
+        // SB acts first, should return SB's stack (200 - 1)
+        assert_eq!(state.current_stack(), 199);
     }
 
     #[timed_test]
@@ -870,7 +975,7 @@ mod tests {
         let mut state = PostflopState::new_preflop(p1, p2, 100);
         state.to_act = Some(Player::Player2);
 
-        assert_eq!(state.current_stack(), 9900);
+        assert_eq!(state.current_stack(), 198);
     }
 
     #[timed_test]
@@ -878,8 +983,8 @@ mod tests {
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
 
-        // SB acts first, opponent is BB
-        assert_eq!(state.opponent_stack(), 9900);
+        // SB acts first, opponent is BB (200 - 2)
+        assert_eq!(state.opponent_stack(), 198);
     }
 
     #[timed_test]
@@ -888,7 +993,7 @@ mod tests {
         let mut state = PostflopState::new_preflop(p1, p2, 100);
         state.to_act = Some(Player::Player2);
 
-        assert_eq!(state.opponent_stack(), 9950);
+        assert_eq!(state.opponent_stack(), 199);
     }
 
     #[timed_test]
@@ -940,18 +1045,18 @@ mod tests {
         let (p1, p2) = sample_holdings();
 
         let state_50bb = PostflopState::new_preflop(p1, p2, 50);
-        assert_eq!(state_50bb.stacks[0], 4950); // 50 * 100 - 50
-        assert_eq!(state_50bb.stacks[1], 4900); // 50 * 100 - 100
+        assert_eq!(state_50bb.stacks[0], 99);  // 50*2 - 1
+        assert_eq!(state_50bb.stacks[1], 98);  // 50*2 - 2
 
         let state_200bb = PostflopState::new_preflop(p1, p2, 200);
-        assert_eq!(state_200bb.stacks[0], 19950); // 200 * 100 - 50
-        assert_eq!(state_200bb.stacks[1], 19900); // 200 * 100 - 100
+        assert_eq!(state_200bb.stacks[0], 399); // 200*2 - 1
+        assert_eq!(state_200bb.stacks[1], 398); // 200*2 - 2
     }
 
     // ==================== HunlPostflop Game trait tests ====================
 
     fn create_game() -> HunlPostflop {
-        HunlPostflop::new(PostflopConfig::default(), None)
+        HunlPostflop::new(PostflopConfig::default(), None, 1)
     }
 
     #[timed_test]
@@ -1072,11 +1177,7 @@ mod tests {
 
     #[timed_test]
     fn initial_states_returns_random_deals() {
-        let config = PostflopConfig {
-            samples_per_iteration: 50,
-            ..PostflopConfig::default()
-        };
-        let game = HunlPostflop::new(config, None);
+        let game = HunlPostflop::new(PostflopConfig::default(), None, 50);
         let states = game.initial_states();
 
         assert_eq!(states.len(), 50, "Should have 50 random deals");
@@ -1110,7 +1211,7 @@ mod tests {
         let p1_utility = game.utility(&folded, Player::Player1);
         let p2_utility = game.utility(&folded, Player::Player2);
 
-        // SB posted 0.5 BB (50 cents), loses it
+        // SB posted 1 unit (0.5 BB), loses it
         assert!(
             (p1_utility - (-0.5)).abs() < 0.01,
             "P1 should lose 0.5 BB, got {p1_utility}"
@@ -1167,17 +1268,89 @@ mod tests {
     }
 
     #[timed_test]
-    fn get_bet_sizes_includes_all_in() {
+    fn actions_include_all_in() {
+        let (p1, p2) = sample_holdings();
+        let board = sample_board();
+        let state = PostflopState::new_preflop_with_board(p1, p2, board, 100);
         let game = create_game();
-        let pot = 150; // 1.5 BB
-        let stack = 500; // 5 BB remaining
 
-        let sizes = game.get_bet_sizes(pot, stack);
+        // Limp → BB check → flop
+        let s = game.next_state(&state, Action::Call);
+        let s = game.next_state(&s, Action::Check);
 
-        // Should include all-in (500)
+        let actions = game.actions(&s);
+        // Should have an ALL_IN action since effective stack >> pot-fraction bets
         assert!(
-            sizes.contains(&stack),
-            "Sizes should include all-in: {sizes:?}"
+            actions.iter().any(|a| matches!(a, Action::Bet(ALL_IN))),
+            "Actions should include all-in bet: {actions:?}"
+        );
+    }
+
+    #[timed_test]
+    fn resolve_bet_amount_all_in_returns_effective_stack() {
+        let game = create_game();
+        let amount = game.resolve_bet_amount(ALL_IN, 200, 500);
+        assert_eq!(amount, 500, "ALL_IN should return effective stack");
+    }
+
+    #[timed_test]
+    fn resolve_bet_amount_index_returns_pot_fraction() {
+        let config = PostflopConfig {
+            bet_sizes: vec![0.5, 1.0],
+            ..PostflopConfig::default()
+        };
+        let game = HunlPostflop::new(config, None, 1);
+
+        // Index 0 = 0.5 pot, pot=200, effective=1000
+        let amount = game.resolve_bet_amount(0, 200, 1000);
+        assert_eq!(amount, 100, "0.5 * 200 = 100");
+
+        // Index 1 = 1.0 pot, pot=200, effective=1000
+        let amount = game.resolve_bet_amount(1, 200, 1000);
+        assert_eq!(amount, 200, "1.0 * 200 = 200");
+    }
+
+    #[timed_test]
+    fn resolve_bet_amount_capped_at_effective_stack() {
+        let config = PostflopConfig {
+            bet_sizes: vec![1.0],
+            ..PostflopConfig::default()
+        };
+        let game = HunlPostflop::new(config, None, 1);
+
+        // 1.0 * 1000 = 1000, but effective stack is 50
+        let amount = game.resolve_bet_amount(0, 1000, 50);
+        assert_eq!(amount, 50, "Should cap at effective stack");
+    }
+
+    #[timed_test]
+    fn info_set_keys_pot_independent() {
+        // Same hand + action at different pot sizes should produce same info set key
+        let config = PostflopConfig {
+            stack_depth: 100,
+            bet_sizes: vec![0.5, 1.0],
+            ..PostflopConfig::default()
+        };
+        let game = HunlPostflop::new(config, None, 1);
+
+        let (p1, p2) = sample_holdings();
+        let board = sample_board();
+        let state = PostflopState::new_preflop_with_board(p1, p2, board, 100);
+
+        // Path 1: limp → check → bet index 0
+        let s = game.next_state(&state, Action::Call);
+        let s = game.next_state(&s, Action::Check);
+        let s = game.next_state(&s, Action::Bet(0));
+        let key1 = game.info_set_key(&s);
+
+        // The key should contain "b0" (index), not a cent amount
+        assert!(
+            key1.contains("b0"),
+            "Key should contain 'b0' (index), got: {key1}"
+        );
+        assert!(
+            !key1.contains("b75") && !key1.contains("b100") && !key1.contains("b150"),
+            "Key should not contain cent amounts, got: {key1}"
         );
     }
 
@@ -1333,7 +1506,7 @@ mod tests {
         let p2_utility = game.utility(&state, Player::Player2);
 
         // Both should get zero (split pot equals their investment)
-        // P1 invested 0.5BB (50 cents), P2 invested 1BB (100 cents)
+        // P1 invested 1 (0.5BB), P2 invested 2 (1BB)
         // With a tie, pot is split - this test verifies zero-sum property
         assert!(
             (p1_utility + p2_utility).abs() < 0.001,
@@ -1491,11 +1664,7 @@ mod tests {
 
     #[timed_test]
     fn random_deals_no_card_conflicts() {
-        let config = PostflopConfig {
-            samples_per_iteration: 100,
-            ..PostflopConfig::default()
-        };
-        let game = HunlPostflop::new(config, None);
+        let game = HunlPostflop::new(PostflopConfig::default(), None, 100);
         let deals = game.initial_states();
 
         for (i, deal) in deals.iter().enumerate() {
@@ -1520,11 +1689,7 @@ mod tests {
 
     #[timed_test]
     fn random_deals_deterministic() {
-        let config = PostflopConfig {
-            samples_per_iteration: 10,
-            ..PostflopConfig::default()
-        };
-        let game = HunlPostflop::new(config, None);
+        let game = HunlPostflop::new(PostflopConfig::default(), None, 10);
 
         let deals1 = game.initial_states();
         let deals2 = game.initial_states();

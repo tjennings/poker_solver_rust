@@ -96,9 +96,11 @@ const SUIT_SYMBOLS: Record<string, string> = {
   c: '♣',
 };
 
-// Color utilities for action probabilities
-function getActionColor(actionType: string): string {
-  switch (actionType) {
+// Color utilities for action probabilities.
+// Bet/raise actions use a graduated red scale: lightest for the smallest
+// bet size, darkest for all-in.
+function getActionColor(action: ActionInfo, actions: ActionInfo[]): string {
+  switch (action.action_type) {
     case 'fold':
       return 'rgba(59, 130, 246, 1)'; // Blue
     case 'check':
@@ -106,9 +108,20 @@ function getActionColor(actionType: string): string {
       return 'rgba(34, 197, 94, 1)'; // Green
     case 'bet':
     case 'raise':
-      return 'rgba(239, 68, 68, 1)'; // Red
-    case 'allin':
-      return 'rgba(168, 85, 247, 1)'; // Purple
+    case 'allin': {
+      const betActions = actions.filter((a) =>
+        a.action_type === 'bet' || a.action_type === 'raise' || a.action_type === 'allin',
+      );
+      const idx = betActions.findIndex((a) => a.id === action.id);
+      const count = betActions.length;
+      // Lightest (t=0) → darkest (t=1)
+      const t = count > 1 ? idx / (count - 1) : 1;
+      // Interpolate from light red (255, 180, 180) to dark red (153, 27, 27)
+      const r = Math.round(255 - t * (255 - 153));
+      const g = Math.round(180 - t * (180 - 27));
+      const b = Math.round(180 - t * (180 - 27));
+      return `rgba(${r}, ${g}, ${b}, 1)`;
+    }
     default:
       return 'rgba(156, 163, 175, 1)'; // Gray
   }
@@ -138,7 +151,7 @@ function HandCell({
       const action = actions[idx];
       if (!action || prob.probability <= 0) return;
 
-      const color = getActionColor(action.action_type);
+      const color = getActionColor(action, actions);
       const width = prob.probability * 100;
       stops.push(`${color} ${position}%`);
       stops.push(`${color} ${position + width}%`);
@@ -186,7 +199,7 @@ function CellDetail({
                   className="cell-detail-bar-fill"
                   style={{
                     width: `${pct}%`,
-                    backgroundColor: getActionColor(action.action_type),
+                    backgroundColor: getActionColor(action, actions),
                   }}
                 />
               </div>
@@ -228,17 +241,21 @@ function ActionBlock({
         <span className="stack">{stack}BB</span>
       </div>
       <div className="action-list">
-        {actions.map((action) => (
-          <button
-            key={action.id}
-            className={`action-button ${action.action_type} ${
-              selectedAction === action.id ? 'selected' : ''
-            }`}
-            onClick={() => onSelect(action.id)}
-          >
-            {action.label}
-          </button>
-        ))}
+        {actions.map((action) => {
+          const color = getActionColor(action, actions);
+          return (
+            <button
+              key={action.id}
+              className={`action-button ${action.action_type} ${
+                selectedAction === action.id ? 'selected' : ''
+              }`}
+              style={{ borderLeft: `3px solid ${color}` }}
+              onClick={() => onSelect(action.id)}
+            >
+              {action.label}
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -394,7 +411,7 @@ function StreetBlock({
 // History item type
 type HistoryItem =
   | { type: 'action'; position: string; stack: number; actions: ActionInfo[]; selected: string }
-  | { type: 'street'; street: string; pot: number; cards: string[] };
+  | { type: 'street'; street: string; pot: number; stack_p1: number; stack_p2: number; cards: string[] };
 
 export default function Explorer() {
   const [bundleInfo, setBundleInfo] = useState<BundleInfo | null>(null);
@@ -403,14 +420,16 @@ export default function Explorer() {
     board: [],
     history: [],
     pot: 3,
-    stack_p1: 99,
-    stack_p2: 98,
+    stack_p1: 199,
+    stack_p2: 198,
     to_act: 0,
   });
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
   const [pendingStreet, setPendingStreet] = useState<{
     street: string;
     pot: number;
+    stack_p1: number;
+    stack_p2: number;
     expectedCards: number;
   } | null>(null);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
@@ -477,8 +496,8 @@ export default function Explorer() {
           board: [],
           history: [],
           pot: 3,
-          stack_p1: info.stack_depth - 1,
-          stack_p2: info.stack_depth - 2,
+          stack_p1: info.stack_depth * 2 - 1,
+          stack_p2: info.stack_depth * 2 - 2,
           to_act: 0,
         };
         setPosition(initialPosition);
@@ -558,36 +577,21 @@ export default function Explorer() {
         setLoading(true);
 
         let newHistory = [...position.history];
-        let newPot = position.pot;
-        let newStackP1 = position.stack_p1;
-        let newStackP2 = position.stack_p2;
         let newToAct = position.to_act === 0 ? 1 : 0;
 
         let historyEntry: string;
 
         if (actionId === 'call') {
-          const callAmount = matrix.to_call;
-          if (position.to_act === 0) {
-            newStackP1 -= callAmount;
-          } else {
-            newStackP2 -= callAmount;
-          }
-          newPot += callAmount;
           historyEntry = 'c';
         } else if (actionId === 'check') {
           historyEntry = 'x';
         } else if (actionId === 'fold') {
           historyEntry = 'f';
         } else if (actionId.startsWith('bet:') || actionId.startsWith('raise:')) {
-          const amount = parseInt(actionId.split(':')[1], 10);
+          // actionId is e.g. "bet:0", "raise:3", "bet:A" — store index in history
+          const idx = actionId.split(':')[1];
           const prefix = actionId.startsWith('bet:') ? 'b' : 'r';
-          historyEntry = `${prefix}:${amount}`;
-          if (position.to_act === 0) {
-            newStackP1 -= amount;
-          } else {
-            newStackP2 -= amount;
-          }
-          newPot = amount * 2 + (position.pot - matrix.to_call);
+          historyEntry = `${prefix}:${idx}`;
         } else {
           historyEntry = actionId;
         }
@@ -598,7 +602,7 @@ export default function Explorer() {
         const actionItem: HistoryItem = {
           type: 'action',
           position: position.to_act === 0 ? 'SB' : 'BB',
-          stack: position.to_act === 0 ? position.stack_p1 : position.stack_p2,
+          stack: matrix.stack,
           actions: matrix.actions,
           selected: actionId,
         };
@@ -609,9 +613,6 @@ export default function Explorer() {
           setPosition((prev) => ({
             ...prev,
             history: newHistory,
-            pot: newPot,
-            stack_p1: newStackP1,
-            stack_p2: newStackP2,
           }));
           setMatrix(null);
           setHandResult('fold');
@@ -622,14 +623,21 @@ export default function Explorer() {
         const { needsTransition, nextStreet } = checkStreetTransition(newHistory, matrix.street);
 
         if (needsTransition && nextStreet) {
+          // Compute pot/stacks entering the new street.
+          // A call adds to_call to pot and subtracts from the caller's stack.
+          const transitionPot =
+            actionId === 'call' ? matrix.pot + matrix.to_call : matrix.pot;
+          let sp1 = matrix.stack_p1;
+          let sp2 = matrix.stack_p2;
+          if (actionId === 'call') {
+            if (position.to_act === 0) { sp1 -= matrix.to_call; }
+            else { sp2 -= matrix.to_call; }
+          }
           const expectedCards = nextStreet === 'FLOP' ? 3 : 1;
-          setPendingStreet({ street: nextStreet, pot: newPot, expectedCards });
+          setPendingStreet({ street: nextStreet, pot: transitionPot, stack_p1: sp1, stack_p2: sp2, expectedCards });
           setPosition((prev) => ({
             ...prev,
             history: newHistory,
-            pot: newPot,
-            stack_p1: newStackP1,
-            stack_p2: newStackP2,
           }));
           setMatrix(null);
         } else if (needsTransition && !nextStreet) {
@@ -637,9 +645,6 @@ export default function Explorer() {
           setPosition((prev) => ({
             ...prev,
             history: newHistory,
-            pot: newPot,
-            stack_p1: newStackP1,
-            stack_p2: newStackP2,
           }));
           setMatrix(null);
           setHandResult('showdown');
@@ -647,9 +652,6 @@ export default function Explorer() {
           const newPosition: ExplorationPosition = {
             ...position,
             history: newHistory,
-            pot: newPot,
-            stack_p1: newStackP1,
-            stack_p2: newStackP2,
             to_act: newToAct as 0 | 1,
           };
           setPosition(newPosition);
@@ -680,16 +682,21 @@ export default function Explorer() {
           type: 'street',
           street: pendingStreet.street,
           pot: pendingStreet.pot,
+          stack_p1: pendingStreet.stack_p1,
+          stack_p2: pendingStreet.stack_p2,
           cards,
         };
         setHistoryItems((prev) => [...prev, streetItem]);
 
-        // Update board, reset history for new street
+        // Update board, reset history for new street.
+        // Use pot/stacks from pendingStreet (computed at transition time).
         const newBoard = [...position.board, ...cards];
         const newPosition: ExplorationPosition = {
-          ...position,
           board: newBoard,
           history: [],
+          pot: pendingStreet.pot,
+          stack_p1: pendingStreet.stack_p1,
+          stack_p2: pendingStreet.stack_p2,
           to_act: 0, // OOP acts first postflop
         };
         setPosition(newPosition);
@@ -723,6 +730,10 @@ export default function Explorer() {
       let board: string[] = [];
       let history: string[] = [];
       let streetActionCount = 0;
+      // Start with preflop initial values
+      let pot = 3;
+      let sp1 = bundleInfo ? bundleInfo.stack_depth * 2 - 1 : 199;
+      let sp2 = bundleInfo ? bundleInfo.stack_depth * 2 - 2 : 198;
 
       for (const item of items) {
         if (item.type === 'action') {
@@ -739,6 +750,9 @@ export default function Explorer() {
           streetActionCount++;
         } else if (item.type === 'street') {
           board = [...board, ...item.cards];
+          pot = item.pot;
+          sp1 = item.stack_p1;
+          sp2 = item.stack_p2;
           history = [];
           streetActionCount = 0;
         }
@@ -747,9 +761,9 @@ export default function Explorer() {
       const pos: ExplorationPosition = {
         board,
         history,
-        pot: 3, // Would need full replay for accurate pot
-        stack_p1: bundleInfo ? bundleInfo.stack_depth - 1 : 99,
-        stack_p2: bundleInfo ? bundleInfo.stack_depth - 2 : 98,
+        pot,
+        stack_p1: sp1,
+        stack_p2: sp2,
         to_act: (streetActionCount % 2) as 0 | 1,
       };
 
@@ -795,6 +809,8 @@ export default function Explorer() {
       setPendingStreet({
         street: streetItem.street,
         pot: streetItem.pot,
+        stack_p1: streetItem.stack_p1,
+        stack_p2: streetItem.stack_p2,
         expectedCards: streetItem.cards.length,
       });
     },
@@ -809,8 +825,8 @@ export default function Explorer() {
         board: [],
         history: [],
         pot: 3,
-        stack_p1: bundleInfo.stack_depth - 1,
-        stack_p2: bundleInfo.stack_depth - 2,
+        stack_p1: bundleInfo.stack_depth * 2 - 1,
+        stack_p2: bundleInfo.stack_depth * 2 - 2,
         to_act: 0,
       };
       setPosition(initialPosition);
@@ -894,7 +910,7 @@ export default function Explorer() {
             {matrix && !pendingStreet && (
               <ActionBlock
                 position={position.to_act === 0 ? 'SB' : 'BB'}
-                stack={position.to_act === 0 ? position.stack_p1 : position.stack_p2}
+                stack={matrix.stack}
                 actions={matrix.actions}
                 onSelect={handleActionSelect}
                 isCurrent={true}

@@ -23,8 +23,15 @@ use super::{BlueprintError, BlueprintStrategy};
 pub struct BundleConfig {
     /// Game configuration (stack depth, bet sizes)
     pub game: PostflopConfig,
-    /// Abstraction configuration (bucket counts)
-    pub abstraction: AbstractionConfig,
+    /// Abstraction configuration (bucket counts). None for `hand_class` mode.
+    pub abstraction: Option<AbstractionConfig>,
+    /// Which abstraction mode was used: `"ehs2"` or `"hand_class"`.
+    #[serde(default = "default_abstraction_mode")]
+    pub abstraction_mode: String,
+}
+
+fn default_abstraction_mode() -> String {
+    "ehs2".to_string()
 }
 
 /// A complete strategy bundle containing all data needed for exploration.
@@ -34,8 +41,8 @@ pub struct StrategyBundle {
     pub config: BundleConfig,
     /// Trained strategies
     pub blueprint: BlueprintStrategy,
-    /// Bucket boundaries for card abstraction
-    pub boundaries: BucketBoundaries,
+    /// Bucket boundaries for card abstraction (None for `hand_class` mode)
+    pub boundaries: Option<BucketBoundaries>,
 }
 
 impl StrategyBundle {
@@ -44,7 +51,7 @@ impl StrategyBundle {
     pub fn new(
         config: BundleConfig,
         blueprint: BlueprintStrategy,
-        boundaries: BucketBoundaries,
+        boundaries: Option<BucketBoundaries>,
     ) -> Self {
         Self {
             config,
@@ -58,7 +65,7 @@ impl StrategyBundle {
     /// Creates the directory if it doesn't exist. Writes:
     /// - `config.yaml` - Human-readable configuration
     /// - `blueprint.bin` - Binary strategy data
-    /// - `boundaries.bin` - Binary bucket boundaries
+    /// - `boundaries.bin` - Binary bucket boundaries (only for EHS2 mode)
     ///
     /// # Errors
     ///
@@ -80,11 +87,13 @@ impl StrategyBundle {
         let blueprint_path = dir.join("blueprint.bin");
         self.blueprint.save(&blueprint_path)?;
 
-        // Save boundaries as bincode
-        let boundaries_path = dir.join("boundaries.bin");
-        let boundaries_data = bincode::serialize(&self.boundaries)
-            .map_err(|e| BlueprintError::SerializationError(e.to_string()))?;
-        fs::write(&boundaries_path, boundaries_data)?;
+        // Save boundaries as bincode (only if present)
+        if let Some(ref boundaries) = self.boundaries {
+            let boundaries_path = dir.join("boundaries.bin");
+            let boundaries_data = bincode::serialize(boundaries)
+                .map_err(|e| BlueprintError::SerializationError(e.to_string()))?;
+            fs::write(&boundaries_path, boundaries_data)?;
+        }
 
         Ok(())
     }
@@ -94,13 +103,13 @@ impl StrategyBundle {
     /// Expects the directory to contain:
     /// - `config.yaml`
     /// - `blueprint.bin`
-    /// - `boundaries.bin`
+    /// - `boundaries.bin` (optional — absent for `hand_class` bundles)
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - Directory doesn't exist
-    /// - Any required file is missing
+    /// - `config.yaml` or `blueprint.bin` is missing
     /// - Deserialization fails
     pub fn load(dir: &Path) -> Result<Self, BlueprintError> {
         // Load config from YAML
@@ -113,11 +122,16 @@ impl StrategyBundle {
         let blueprint_path = dir.join("blueprint.bin");
         let blueprint = BlueprintStrategy::load(&blueprint_path)?;
 
-        // Load boundaries
+        // Load boundaries (optional)
         let boundaries_path = dir.join("boundaries.bin");
-        let boundaries_data = fs::read(&boundaries_path)?;
-        let boundaries: BucketBoundaries = bincode::deserialize(&boundaries_data)
-            .map_err(|e| BlueprintError::SerializationError(e.to_string()))?;
+        let boundaries = if boundaries_path.exists() {
+            let boundaries_data = fs::read(&boundaries_path)?;
+            let b: BucketBoundaries = bincode::deserialize(&boundaries_data)
+                .map_err(|e| BlueprintError::SerializationError(e.to_string()))?;
+            Some(b)
+        } else {
+            None
+        };
 
         Ok(Self {
             config,
@@ -127,11 +141,12 @@ impl StrategyBundle {
     }
 
     /// Check if a directory contains a valid bundle.
+    ///
+    /// A bundle requires `config.yaml` and `blueprint.bin`.
+    /// `boundaries.bin` is optional (absent for `hand_class` bundles).
     #[must_use]
     pub fn exists(dir: &Path) -> bool {
-        dir.join("config.yaml").exists()
-            && dir.join("blueprint.bin").exists()
-            && dir.join("boundaries.bin").exists()
+        dir.join("config.yaml").exists() && dir.join("blueprint.bin").exists()
     }
 }
 
@@ -146,15 +161,15 @@ mod tests {
             game: PostflopConfig {
                 stack_depth: 20,
                 bet_sizes: vec![0.5, 1.0],
-                samples_per_iteration: 10,
                 ..PostflopConfig::default()
             },
-            abstraction: AbstractionConfig {
+            abstraction: Some(AbstractionConfig {
                 flop_buckets: 100,
                 turn_buckets: 100,
                 river_buckets: 100,
                 samples_per_street: 1000,
-            },
+            }),
+            abstraction_mode: "ehs2".to_string(),
         }
     }
 
@@ -175,7 +190,7 @@ mod tests {
         blueprint.set_iterations(1000);
         let boundaries = create_test_boundaries();
 
-        let bundle = StrategyBundle::new(config, blueprint, boundaries);
+        let bundle = StrategyBundle::new(config, blueprint, Some(boundaries));
 
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let bundle_path = temp_dir.path().join("test_strategy");
@@ -187,10 +202,13 @@ mod tests {
 
         assert_eq!(loaded.config.game.stack_depth, 20);
         assert_eq!(loaded.config.game.bet_sizes, vec![0.5, 1.0]);
-        assert_eq!(loaded.config.abstraction.flop_buckets, 100);
+        assert_eq!(
+            loaded.config.abstraction.as_ref().unwrap().flop_buckets,
+            100
+        );
         assert_eq!(loaded.blueprint.len(), 2);
         assert_eq!(loaded.blueprint.iterations_trained(), 1000);
-        assert_eq!(loaded.boundaries.flop.len(), 3);
+        assert_eq!(loaded.boundaries.as_ref().unwrap().flop.len(), 3);
     }
 
     #[timed_test]
@@ -198,7 +216,7 @@ mod tests {
         let config = create_test_config();
         let blueprint = BlueprintStrategy::new();
         let boundaries = create_test_boundaries();
-        let bundle = StrategyBundle::new(config, blueprint, boundaries);
+        let bundle = StrategyBundle::new(config, blueprint, Some(boundaries));
 
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let bundle_path = temp_dir.path().join("nested").join("strategy");
@@ -210,6 +228,37 @@ mod tests {
         assert!(bundle_path.join("config.yaml").exists());
         assert!(bundle_path.join("blueprint.bin").exists());
         assert!(bundle_path.join("boundaries.bin").exists());
+    }
+
+    #[timed_test]
+    fn bundle_hand_class_no_boundaries_file() {
+        let config = BundleConfig {
+            game: PostflopConfig {
+                stack_depth: 20,
+                bet_sizes: vec![0.5, 1.0],
+                ..PostflopConfig::default()
+            },
+            abstraction: None,
+            abstraction_mode: "hand_class".to_string(),
+        };
+        let blueprint = BlueprintStrategy::new();
+        let bundle = StrategyBundle::new(config, blueprint, None);
+
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let bundle_path = temp_dir.path().join("hand_class_bundle");
+
+        bundle.save(&bundle_path).expect("save should succeed");
+        assert!(StrategyBundle::exists(&bundle_path));
+        assert!(bundle_path.join("config.yaml").exists());
+        assert!(bundle_path.join("blueprint.bin").exists());
+        assert!(
+            !bundle_path.join("boundaries.bin").exists(),
+            "hand_class bundle should not have boundaries.bin"
+        );
+
+        let loaded = StrategyBundle::load(&bundle_path).expect("load should succeed");
+        assert!(loaded.boundaries.is_none());
+        assert_eq!(loaded.config.abstraction_mode, "hand_class");
     }
 
     #[timed_test]
@@ -226,7 +275,7 @@ mod tests {
         let partial_path = temp_dir.path().join("partial");
         fs::create_dir_all(&partial_path).expect("create dir");
         fs::write(partial_path.join("config.yaml"), "test").expect("write config");
-        // Missing blueprint.bin and boundaries.bin
+        // Missing blueprint.bin
 
         assert!(!StrategyBundle::exists(&partial_path));
     }
@@ -236,7 +285,7 @@ mod tests {
         let config = create_test_config();
         let blueprint = BlueprintStrategy::new();
         let boundaries = create_test_boundaries();
-        let bundle = StrategyBundle::new(config, blueprint, boundaries);
+        let bundle = StrategyBundle::new(config, blueprint, Some(boundaries));
 
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let bundle_path = temp_dir.path().join("readable_test");
