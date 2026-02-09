@@ -71,6 +71,7 @@ export interface ActionInfo {
   id: string;
   label: string;
   action_type: string;
+  size_key?: string | null;
 }
 
 export interface StrategyMatrix {

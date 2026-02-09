@@ -207,6 +207,7 @@ function ActionBlock({
   actions,
   selectedAction,
   onSelect,
+  onHeaderClick,
   isCurrent,
 }: {
   position: string;
@@ -214,11 +215,15 @@ function ActionBlock({
   actions: ActionInfo[];
   selectedAction?: string;
   onSelect: (actionId: string) => void;
+  onHeaderClick?: () => void;
   isCurrent: boolean;
 }) {
   return (
     <div className={`action-block ${isCurrent ? 'current' : ''}`}>
-      <div className="action-block-header">
+      <div
+        className={`action-block-header ${onHeaderClick ? 'clickable' : ''}`}
+        onClick={onHeaderClick}
+      >
         <span className="position">{position}</span>
         <span className="stack">{stack}BB</span>
       </div>
@@ -265,97 +270,123 @@ function StreetCard({ card, onClick }: { card: string | null; onClick?: () => vo
   );
 }
 
+const PICKER_RANKS = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+const PICKER_SUITS = ['s', 'h', 'd', 'c'];
+
+// Text colors for the card picker (spades white instead of dark background color)
+const PICKER_COLORS: Record<string, string> = {
+  s: '#fff',
+  h: '#dc2626',
+  d: '#2563eb',
+  c: '#16a34a',
+};
+
+function CardPicker({
+  expectedCards,
+  deadCards,
+  onConfirm,
+}: {
+  expectedCards: number;
+  deadCards: string[];
+  onConfirm: (cards: string[]) => void;
+}) {
+  const [selected, setSelected] = useState<string[]>([]);
+
+  const deadSet = useMemo(() => new Set(deadCards.map((c) => c.toLowerCase())), [deadCards]);
+
+  const handleCardClick = (card: string) => {
+    if (deadSet.has(card)) return;
+
+    setSelected((prev) => {
+      if (prev.includes(card)) {
+        return prev.filter((c) => c !== card);
+      }
+      if (prev.length >= expectedCards) return prev;
+      const next = [...prev, card];
+      // Auto-confirm for single card (turn/river)
+      if (expectedCards === 1 && next.length === 1) {
+        // Use setTimeout to avoid state update during render
+        setTimeout(() => onConfirm(next), 0);
+      }
+      return next;
+    });
+  };
+
+  return (
+    <div className="card-picker">
+      {PICKER_SUITS.map((suit) => (
+        <div key={suit} className="card-picker-row">
+          {PICKER_RANKS.map((rank) => {
+            const card = `${rank}${suit}`;
+            const isDead = deadSet.has(card.toLowerCase());
+            const isSelected = selected.includes(card);
+            return (
+              <button
+                key={card}
+                className={`card-picker-card ${isDead ? 'dead' : ''} ${isSelected ? 'selected' : ''}`}
+                style={{
+                  color: PICKER_COLORS[suit] || '#eee',
+                  borderColor: isSelected ? '#00d9ff' : 'transparent',
+                }}
+                disabled={isDead}
+                onClick={() => handleCardClick(card)}
+              >
+                <span className="picker-rank">{rank}</span>
+                <span className="picker-suit">{SUIT_SYMBOLS[suit]}</span>
+              </button>
+            );
+          })}
+        </div>
+      ))}
+      {expectedCards > 1 && (
+        <button
+          className="card-picker-confirm"
+          disabled={selected.length !== expectedCards}
+          onClick={() => onConfirm(selected)}
+        >
+          Deal {selected.length}/{expectedCards}
+        </button>
+      )}
+    </div>
+  );
+}
+
 // Street transition block (FLOP, TURN, RIVER)
 function StreetBlock({
   street,
   pot,
   cards,
   expectedCards,
-  onCardsChange,
-  isEditable,
+  onHeaderClick,
 }: {
   street: string;
   pot: number;
   cards: string[];
   expectedCards: number;
-  onCardsChange: (cards: string[]) => void;
-  isEditable: boolean;
+  onHeaderClick?: () => void;
 }) {
-  const [inputValue, setInputValue] = useState('');
-  const [showInput, setShowInput] = useState(false);
-
-  const handleSubmit = () => {
-    // Parse cards - accept both "AcTh4d" and "Ac Th 4d" formats
-    let parsed: string[];
-    const trimmed = inputValue.trim();
-
-    if (trimmed.includes(' ')) {
-      // Space-separated format
-      parsed = trimmed.split(/\s+/).filter((c) => c.length === 2);
-    } else {
-      // Continuous format - split every 2 characters
-      parsed = [];
-      for (let i = 0; i + 1 < trimmed.length; i += 2) {
-        parsed.push(trimmed.slice(i, i + 2));
-      }
-    }
-
-    parsed = parsed.slice(0, expectedCards);
-
-    if (parsed.length === expectedCards) {
-      onCardsChange(parsed);
-      setShowInput(false);
-      setInputValue('');
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') {
-      handleSubmit();
-    } else if (e.key === 'Escape') {
-      setShowInput(false);
-      setInputValue('');
-    }
-  };
-
   const cardSlots = [];
   for (let i = 0; i < expectedCards; i++) {
     cardSlots.push(
       <StreetCard
         key={i}
         card={cards[i] || null}
-        onClick={isEditable ? () => setShowInput(true) : undefined}
       />
     );
   }
 
   return (
     <div className={`street-block ${cards.length === expectedCards ? '' : 'pending'}`}>
-      <div className="street-block-header">
+      <div
+        className={`street-block-header ${onHeaderClick ? 'clickable' : ''}`}
+        onClick={onHeaderClick}
+      >
         <span className="street-name">{street}</span>
         <span className="street-pot">{pot}</span>
       </div>
       <div className="street-cards">
         {cardSlots}
       </div>
-      {showInput && isEditable && (
-        <div className="street-input">
-          <input
-            type="text"
-            value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder={expectedCards === 3 ? 'Js Th 8c' : expectedCards === 1 ? '2d' : ''}
-            autoFocus
-          />
-          <button onClick={handleSubmit}>Set</button>
-        </div>
-      )}
-      {cards.length < expectedCards && !showInput && isEditable && (
-        <button className="set-cards-btn" onClick={() => setShowInput(true)}>
-          Set Cards
-        </button>
-      )}
     </div>
   );
 }
@@ -388,6 +419,7 @@ export default function Explorer() {
   const [computingBuckets, setComputingBuckets] = useState(false);
   const [computationProgress, setComputationProgress] = useState({ completed: 0, total: 169 });
   const [selectedCell, setSelectedCell] = useState<{ row: number; col: number } | null>(null);
+  const [handResult, setHandResult] = useState<'fold' | 'showdown' | null>(null);
 
   // Ref to track current position for use in event callbacks
   const positionRef = useRef(position);
@@ -452,7 +484,7 @@ export default function Explorer() {
         setPosition(initialPosition);
         setHistoryItems([]);
         setPendingStreet(null);
-
+        setHandResult(null);
         setSelectedCell(null);
         const initialMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
           position: initialPosition,
@@ -510,6 +542,7 @@ export default function Explorer() {
         if (currentStreet === 'Preflop') return { needsTransition: true, nextStreet: 'FLOP' };
         if (currentStreet === 'Flop') return { needsTransition: true, nextStreet: 'TURN' };
         if (currentStreet === 'Turn') return { needsTransition: true, nextStreet: 'RIVER' };
+        if (currentStreet === 'River') return { needsTransition: true, nextStreet: '' };
       }
 
       return { needsTransition: false, nextStreet: '' };
@@ -571,13 +604,8 @@ export default function Explorer() {
         };
         setHistoryItems((prev) => [...prev, actionItem]);
 
-        // Check for street transition
-        const { needsTransition, nextStreet } = checkStreetTransition(newHistory, matrix.street);
-
-        if (needsTransition) {
-          const expectedCards = nextStreet === 'FLOP' ? 3 : 1;
-          setPendingStreet({ street: nextStreet, pot: newPot, expectedCards });
-          // Don't update matrix yet - wait for cards
+        // Check for terminal states
+        if (actionId === 'fold') {
           setPosition((prev) => ({
             ...prev,
             history: newHistory,
@@ -586,6 +614,35 @@ export default function Explorer() {
             stack_p2: newStackP2,
           }));
           setMatrix(null);
+          setHandResult('fold');
+          return;
+        }
+
+        // Check for street transition
+        const { needsTransition, nextStreet } = checkStreetTransition(newHistory, matrix.street);
+
+        if (needsTransition && nextStreet) {
+          const expectedCards = nextStreet === 'FLOP' ? 3 : 1;
+          setPendingStreet({ street: nextStreet, pot: newPot, expectedCards });
+          setPosition((prev) => ({
+            ...prev,
+            history: newHistory,
+            pot: newPot,
+            stack_p1: newStackP1,
+            stack_p2: newStackP2,
+          }));
+          setMatrix(null);
+        } else if (needsTransition && !nextStreet) {
+          // River betting complete — showdown
+          setPosition((prev) => ({
+            ...prev,
+            history: newHistory,
+            pot: newPot,
+            stack_p1: newStackP1,
+            stack_p2: newStackP2,
+          }));
+          setMatrix(null);
+          setHandResult('showdown');
         } else {
           const newPosition: ExplorationPosition = {
             ...position,
@@ -627,11 +684,12 @@ export default function Explorer() {
         };
         setHistoryItems((prev) => [...prev, streetItem]);
 
-        // Update board
+        // Update board, reset history for new street
         const newBoard = [...position.board, ...cards];
         const newPosition: ExplorationPosition = {
           ...position,
           board: newBoard,
+          history: [],
           to_act: 0, // OOP acts first postflop
         };
         setPosition(newPosition);
@@ -658,52 +716,60 @@ export default function Explorer() {
     [pendingStreet, position]
   );
 
+  // Rebuild position from history items up to (but not including) the given index.
+  const rebuildState = useCallback(
+    (index: number) => {
+      const items = historyItems.slice(0, index);
+      let board: string[] = [];
+      let history: string[] = [];
+      let streetActionCount = 0;
+
+      for (const item of items) {
+        if (item.type === 'action') {
+          let entry: string;
+          if (item.selected === 'call') entry = 'c';
+          else if (item.selected === 'check') entry = 'x';
+          else if (item.selected === 'fold') entry = 'f';
+          else if (item.selected.startsWith('bet:'))
+            entry = `b:${item.selected.split(':')[1]}`;
+          else if (item.selected.startsWith('raise:'))
+            entry = `r:${item.selected.split(':')[1]}`;
+          else entry = item.selected;
+          history.push(entry);
+          streetActionCount++;
+        } else if (item.type === 'street') {
+          board = [...board, ...item.cards];
+          history = [];
+          streetActionCount = 0;
+        }
+      }
+
+      const pos: ExplorationPosition = {
+        board,
+        history,
+        pot: 3, // Would need full replay for accurate pot
+        stack_p1: bundleInfo ? bundleInfo.stack_depth - 1 : 99,
+        stack_p2: bundleInfo ? bundleInfo.stack_depth - 2 : 98,
+        to_act: (streetActionCount % 2) as 0 | 1,
+      };
+
+      return { items, pos };
+    },
+    [historyItems, bundleInfo]
+  );
+
   const handleHistoryRewind = useCallback(
     async (index: number) => {
       try {
         setLoading(true);
-
-        // Rebuild state up to this point
-        const newHistoryItems = historyItems.slice(0, index);
-        let newBoard: string[] = [];
-        let newHistory: string[] = [];
-        let actionCount = 0;
-
-        for (const item of newHistoryItems) {
-          if (item.type === 'action') {
-            // Convert selected action back to history string
-            let historyEntry: string;
-            if (item.selected === 'call') historyEntry = 'c';
-            else if (item.selected === 'check') historyEntry = 'x';
-            else if (item.selected === 'fold') historyEntry = 'f';
-            else if (item.selected.startsWith('bet:'))
-              historyEntry = `b:${item.selected.split(':')[1]}`;
-            else if (item.selected.startsWith('raise:'))
-              historyEntry = `r:${item.selected.split(':')[1]}`;
-            else historyEntry = item.selected;
-            newHistory.push(historyEntry);
-            actionCount++;
-          } else if (item.type === 'street') {
-            newBoard = [...newBoard, ...item.cards];
-          }
-        }
-
-        setHistoryItems(newHistoryItems);
+        const { items, pos } = rebuildState(index);
+        setHistoryItems(items);
         setPendingStreet(null);
-
-        // Recalculate position (simplified)
-        const newPosition: ExplorationPosition = {
-          board: newBoard,
-          history: newHistory,
-          pot: 3, // Would need full replay for accurate pot
-          stack_p1: bundleInfo ? bundleInfo.stack_depth - 1 : 99,
-          stack_p2: bundleInfo ? bundleInfo.stack_depth - 2 : 98,
-          to_act: (actionCount % 2) as 0 | 1,
-        };
-        setPosition(newPosition);
+        setHandResult(null);
+        setPosition(pos);
 
         const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
-          position: newPosition,
+          position: pos,
         });
         setMatrix(newMatrix);
       } catch (e) {
@@ -712,8 +778,56 @@ export default function Explorer() {
         setLoading(false);
       }
     },
-    [historyItems, bundleInfo]
+    [rebuildState]
   );
+
+  // Rewind to a street transition, re-showing the card picker for that street.
+  const handleStreetRewind = useCallback(
+    (index: number) => {
+      const streetItem = historyItems[index];
+      if (!streetItem || streetItem.type !== 'street') return;
+
+      const { items, pos } = rebuildState(index);
+      setHistoryItems(items);
+      setHandResult(null);
+      setMatrix(null);
+      setPosition(pos);
+      setPendingStreet({
+        street: streetItem.street,
+        pot: streetItem.pot,
+        expectedCards: streetItem.cards.length,
+      });
+    },
+    [historyItems, rebuildState]
+  );
+
+  const handleNewHand = useCallback(async () => {
+    if (!bundleInfo) return;
+    try {
+      setLoading(true);
+      const initialPosition: ExplorationPosition = {
+        board: [],
+        history: [],
+        pot: 3,
+        stack_p1: bundleInfo.stack_depth - 1,
+        stack_p2: bundleInfo.stack_depth - 2,
+        to_act: 0,
+      };
+      setPosition(initialPosition);
+      setHistoryItems([]);
+      setPendingStreet(null);
+      setHandResult(null);
+      setSelectedCell(null);
+      const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
+        position: initialPosition,
+      });
+      setMatrix(newMatrix);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [bundleInfo]);
 
   return (
     <div className="explorer">
@@ -753,6 +867,7 @@ export default function Explorer() {
                   actions={item.actions}
                   selectedAction={item.selected}
                   onSelect={() => handleHistoryRewind(idx)}
+                  onHeaderClick={() => handleHistoryRewind(idx)}
                   isCurrent={false}
                 />
               ) : (
@@ -762,8 +877,7 @@ export default function Explorer() {
                   pot={item.pot}
                   cards={item.cards}
                   expectedCards={item.cards.length}
-                  onCardsChange={() => {}}
-                  isEditable={false}
+                  onHeaderClick={() => handleStreetRewind(idx)}
                 />
               )
             )}
@@ -774,8 +888,6 @@ export default function Explorer() {
                 pot={pendingStreet.pot}
                 cards={[]}
                 expectedCards={pendingStreet.expectedCards}
-                onCardsChange={handleStreetCardsSet}
-                isEditable={true}
               />
             )}
 
@@ -834,8 +946,26 @@ export default function Explorer() {
           )}
 
           {!matrix && pendingStreet && (
-            <div className="waiting-for-cards">
-              <p>Set the {pendingStreet.street.toLowerCase()} cards to continue</p>
+            <div className="card-picker-container">
+              <p className="card-picker-prompt">
+                Select {pendingStreet.street.toLowerCase()} card{pendingStreet.expectedCards > 1 ? 's' : ''}
+              </p>
+              <CardPicker
+                expectedCards={pendingStreet.expectedCards}
+                deadCards={position.board}
+                onConfirm={handleStreetCardsSet}
+              />
+            </div>
+          )}
+
+          {handResult && (
+            <div className="hand-complete">
+              <p className="hand-complete-result">
+                {handResult === 'fold' ? 'Player folded' : 'Showdown'} — Pot: {position.pot}
+              </p>
+              <button className="new-hand-btn" onClick={handleNewHand}>
+                New Hand
+              </button>
             </div>
           )}
         </>

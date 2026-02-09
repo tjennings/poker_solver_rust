@@ -132,6 +132,9 @@ pub struct ActionInfo {
     pub label: String,
     /// Action type for styling
     pub action_type: String,
+    /// Key for matching against `raise_sizes` config (e.g. `"0.5"`, `"1.0"`, `"allin"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_key: Option<String>,
 }
 
 /// Current game state for exploration.
@@ -718,6 +721,7 @@ fn get_actions_for_position(
             id: "fold".to_string(),
             label: "Fold".to_string(),
             action_type: "fold".to_string(),
+            size_key: None,
         });
     }
 
@@ -727,12 +731,14 @@ fn get_actions_for_position(
             id: "check".to_string(),
             label: "Check".to_string(),
             action_type: "check".to_string(),
+            size_key: None,
         });
     } else if stack >= to_call {
         actions.push(ActionInfo {
             id: "call".to_string(),
             label: format!("Call {to_call}"),
             action_type: "call".to_string(),
+            size_key: None,
         });
     }
 
@@ -749,6 +755,7 @@ fn get_actions_for_position(
                     id: format!("{action_type}:{total}"),
                     label: format!("{} {total}", if to_call == 0 { "Bet" } else { "Raise to" }),
                     action_type: action_type.to_string(),
+                    size_key: Some(bet_size_key(fraction)),
                 });
             }
         }
@@ -764,6 +771,7 @@ fn get_actions_for_position(
                 id: format!("{action_type}:{all_in}"),
                 label: "All-in".to_string(),
                 action_type: "allin".to_string(),
+                size_key: Some("allin".to_string()),
             });
         }
     }
@@ -773,11 +781,21 @@ fn get_actions_for_position(
     actions
 }
 
+/// Format a bet size fraction as a string key matching TOML config keys.
+/// Ensures `1.0` → `"1.0"` (not `"1"`).
+fn bet_size_key(fraction: f32) -> String {
+    let s = format!("{fraction}");
+    if s.contains('.') { s } else { format!("{fraction:.1}") }
+}
+
 fn calculate_to_call(position: &ExplorationPosition) -> u32 {
-    // Simple heuristic based on history
-    // In a full implementation, we'd track bets properly
-    let mut p1_invested = 1u32; // SB
-    let mut p2_invested = 2u32; // BB
+    // Postflop: history is reset per street, so both start at 0.
+    // Preflop: SB posted 1, BB posted 2.
+    let (mut p1_invested, mut p2_invested) = if position.board.len() >= 3 {
+        (0u32, 0u32)
+    } else {
+        (1u32, 2u32)
+    };
 
     for (i, action) in position.history.iter().enumerate() {
         let is_p1 = (i % 2) == 0;
@@ -926,60 +944,95 @@ fn map_frequencies_to_actions(freq: &FrequencyMap, actions: &[ActionInfo]) -> Ve
         .filter(|a| matches!(a.action_type.as_str(), "bet" | "raise" | "allin"))
         .count();
 
-    // Redistribute fold if not available (check scenario)
-    let (fold_freq, call_freq, raise_freq) = if !has_fold && freq.fold > 0.0 {
-        let redistributable = freq.fold;
-        let non_fold_sum = freq.call + freq.raise;
-        if non_fold_sum > 0.0 {
-            (
-                0.0,
-                freq.call + redistributable * (freq.call / non_fold_sum),
-                freq.raise + redistributable * (freq.raise / non_fold_sum),
-            )
-        } else {
-            (0.0, 1.0, 0.0)
-        }
-    } else {
-        (freq.fold, freq.call, freq.raise)
-    };
+    // Assign raw probability per action
+    let mut probs: Vec<f32> = actions
+        .iter()
+        .map(|a| raw_action_freq(freq, a, raise_count))
+        .collect();
 
-    // Redistribute raise if no raise actions available
-    let (fold_freq, call_freq, raise_freq) = if raise_count == 0 && raise_freq > 0.0 {
-        let non_raise_sum = fold_freq + call_freq;
-        if non_raise_sum > 0.0 {
-            (
-                fold_freq + raise_freq * (fold_freq / non_raise_sum),
-                call_freq + raise_freq * (call_freq / non_raise_sum),
-                0.0,
-            )
-        } else {
-            (0.0, 1.0, 0.0)
-        }
-    } else {
-        (fold_freq, call_freq, raise_freq)
-    };
+    // Redistribute fold frequency when fold is not available (check scenario)
+    if !has_fold {
+        redistribute(&mut probs, actions, |a| a.action_type == "fold");
+    }
 
-    let per_raise = if raise_count > 0 {
-        raise_freq / raise_count as f32
-    } else {
-        0.0
-    };
+    // Redistribute raise frequencies when no raise actions exist
+    if raise_count == 0 {
+        redistribute(&mut probs, actions, |a| {
+            matches!(a.action_type.as_str(), "bet" | "raise" | "allin")
+        });
+    }
 
     actions
         .iter()
-        .map(|a| {
-            let probability = match a.action_type.as_str() {
-                "fold" => fold_freq,
-                "check" | "call" => call_freq,
-                "bet" | "raise" | "allin" => per_raise,
-                _ => 0.0,
-            };
-            ActionProb {
-                action: a.label.clone(),
-                probability,
-            }
+        .zip(probs.iter())
+        .map(|(a, &p)| ActionProb {
+            action: a.label.clone(),
+            probability: p,
         })
         .collect()
+}
+
+fn raw_action_freq(freq: &FrequencyMap, action: &ActionInfo, raise_count: usize) -> f32 {
+    match action.action_type.as_str() {
+        "fold" => freq.fold,
+        "check" | "call" => freq.call,
+        "bet" | "raise" | "allin" => {
+            if let Some(ref sizes) = freq.raise_sizes {
+                action
+                    .size_key
+                    .as_ref()
+                    .and_then(|key| sizes.get(key))
+                    .copied()
+                    .unwrap_or(0.0)
+            } else if raise_count > 0 {
+                freq.raise / raise_count as f32
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+/// Redistribute frequency from removed actions to remaining actions proportionally.
+fn redistribute(probs: &mut [f32], actions: &[ActionInfo], is_removed: impl Fn(&ActionInfo) -> bool) {
+    let removed_sum: f32 = probs
+        .iter()
+        .zip(actions.iter())
+        .filter(|(_, a)| is_removed(a))
+        .map(|(p, _)| *p)
+        .sum();
+
+    if removed_sum <= 0.0 {
+        return;
+    }
+
+    let kept_sum: f32 = probs
+        .iter()
+        .zip(actions.iter())
+        .filter(|(_, a)| !is_removed(a))
+        .map(|(p, _)| *p)
+        .sum();
+
+    if kept_sum > 0.0 {
+        let scale = (kept_sum + removed_sum) / kept_sum;
+        for (p, a) in probs.iter_mut().zip(actions.iter()) {
+            if is_removed(a) {
+                *p = 0.0;
+            } else {
+                *p *= scale;
+            }
+        }
+    } else {
+        // Fallback: assign everything to check/call
+        for (p, a) in probs.iter_mut().zip(actions.iter()) {
+            *p = if a.action_type == "check" || a.action_type == "call" {
+                1.0
+            } else {
+                0.0
+            };
+        }
+    }
 }
 
 fn make_representative_hand(

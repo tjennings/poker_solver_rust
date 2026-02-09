@@ -64,11 +64,17 @@ pub struct GameSettings {
 }
 
 /// Abstract action frequencies (fold/call/raise), normalized to sum to 1.0.
+///
+/// When `raise_sizes` is `Some`, it maps bet-size keys (e.g. `"0.5"`, `"1.0"`,
+/// `"allin"`) to individual frequencies that sum to `raise`.
+/// When `None`, `raise` is split evenly across available raise actions.
 #[derive(Debug, Clone)]
 pub struct FrequencyMap {
     pub fold: f32,
     pub call: f32,
     pub raise: f32,
+    /// Per-size raise distribution. Keys are pot-fraction strings or `"allin"`.
+    pub raise_sizes: Option<HashMap<String, f32>>,
 }
 
 impl FrequencyMap {
@@ -76,16 +82,19 @@ impl FrequencyMap {
         fold: 1.0,
         call: 0.0,
         raise: 0.0,
+        raise_sizes: None,
     };
     pub const CALL: Self = Self {
         fold: 0.0,
         call: 1.0,
         raise: 0.0,
+        raise_sizes: None,
     };
     pub const RAISE: Self = Self {
         fold: 0.0,
         call: 0.0,
         raise: 1.0,
+        raise_sizes: None,
     };
 }
 
@@ -98,6 +107,10 @@ impl FrequencyMap {
 pub struct PositionRanges {
     pub raise: HashSet<CanonicalHand>,
     pub call: HashSet<CanonicalHand>,
+    /// Frequency distribution for hands in the raise range.
+    /// Defaults to `FrequencyMap::RAISE` (100% raise, split evenly) when
+    /// no `raise_sizes` are configured.
+    pub raise_freq: FrequencyMap,
 }
 
 /// A fully loaded and validated agent configuration.
@@ -142,7 +155,7 @@ impl AgentConfig {
     #[must_use]
     pub fn preflop_frequency(&self, position: &str, hand: &CanonicalHand) -> &FrequencyMap {
         match self.ranges.get(position) {
-            Some(pos) if pos.raise.contains(hand) => &FrequencyMap::RAISE,
+            Some(pos) if pos.raise.contains(hand) => &pos.raise_freq,
             Some(pos) if pos.call.contains(hand) => &FrequencyMap::CALL,
             _ => &FrequencyMap::FOLD,
         }
@@ -181,6 +194,9 @@ struct RawConfig {
 struct RawPositionRanges {
     raise: Option<String>,
     call: Option<String>,
+    /// Per-size raise distribution for the raise range (e.g. `{"0.5" = 0.3, "1.0" = 0.6, allin = 0.1}`).
+    #[serde(default)]
+    raise_sizes: Option<HashMap<String, f32>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -190,11 +206,19 @@ struct RawGameSettings {
     bet_sizes: Vec<f32>,
 }
 
+/// Raw frequency from TOML. Supports two formats:
+/// - Legacy: `raise = 0.55` (split evenly across sizes)
+/// - Per-size: `[raises]` table with `"0.5" = 0.3, "1.0" = 0.2, allin = 0.05`
 #[derive(serde::Deserialize)]
 struct RawFrequency {
     fold: f32,
     call: f32,
-    raise: f32,
+    /// Legacy single-value raise (split evenly). Ignored when `raises` is present.
+    #[serde(default)]
+    raise: Option<f32>,
+    /// Per-size raise frequencies. Keys are pot fraction strings or `"allin"`.
+    #[serde(default)]
+    raises: Option<HashMap<String, f32>>,
 }
 
 // ============================================================================
@@ -222,22 +246,53 @@ fn validate_and_build(raw: RawConfig) -> Result<AgentConfig, AgentError> {
 }
 
 fn validate_frequency(raw: &RawFrequency, context: &str) -> Result<FrequencyMap, AgentError> {
-    if raw.fold < 0.0 || raw.call < 0.0 || raw.raise < 0.0 {
+    if raw.fold < 0.0 || raw.call < 0.0 {
         return Err(AgentError::InvalidFrequency(format!(
             "{context}: frequencies must be non-negative"
         )));
     }
-    let sum = raw.fold + raw.call + raw.raise;
+
+    let (raise_total, raise_sizes) = if let Some(ref sizes) = raw.raises {
+        validate_raise_sizes(sizes, context)?
+    } else {
+        let r = raw.raise.unwrap_or(0.0);
+        if r < 0.0 {
+            return Err(AgentError::InvalidFrequency(format!(
+                "{context}: raise frequency must be non-negative"
+            )));
+        }
+        (r, None)
+    };
+
+    let sum = raw.fold + raw.call + raise_total;
     if sum <= 0.0 {
         return Err(AgentError::InvalidFrequency(format!(
             "{context}: frequencies must sum to a positive value"
         )));
     }
+
     Ok(FrequencyMap {
         fold: raw.fold / sum,
         call: raw.call / sum,
-        raise: raw.raise / sum,
+        raise: raise_total / sum,
+        raise_sizes: raise_sizes
+            .map(|sizes| sizes.into_iter().map(|(k, v)| (k, v / sum)).collect()),
     })
+}
+
+fn validate_raise_sizes(
+    sizes: &HashMap<String, f32>,
+    context: &str,
+) -> Result<(f32, Option<HashMap<String, f32>>), AgentError> {
+    for (key, &val) in sizes {
+        if val < 0.0 {
+            return Err(AgentError::InvalidFrequency(format!(
+                "{context}: raise size '{key}' must be non-negative"
+            )));
+        }
+    }
+    let total: f32 = sizes.values().sum();
+    Ok((total, Some(sizes.clone())))
 }
 
 fn parse_class_overrides(
@@ -266,9 +321,39 @@ fn parse_all_ranges(
             Some(s) if !s.is_empty() => parse_range(s)?,
             _ => HashSet::new(),
         };
-        result.insert(position.clone(), PositionRanges { raise, call });
+        let raise_freq = build_raise_freq(raw_pos.raise_sizes.as_ref(), position)?;
+        result.insert(position.clone(), PositionRanges { raise, call, raise_freq });
     }
     Ok(result)
+}
+
+fn build_raise_freq(
+    raise_sizes: Option<&HashMap<String, f32>>,
+    context: &str,
+) -> Result<FrequencyMap, AgentError> {
+    let Some(sizes) = raise_sizes else {
+        return Ok(FrequencyMap {
+            fold: 0.0,
+            call: 0.0,
+            raise: 1.0,
+            raise_sizes: None,
+        });
+    };
+
+    let (total, validated) = validate_raise_sizes(sizes, context)?;
+    if total <= 0.0 {
+        return Err(AgentError::InvalidFrequency(format!(
+            "{context}: raise sizes must sum to a positive value"
+        )));
+    }
+
+    Ok(FrequencyMap {
+        fold: 0.0,
+        call: 0.0,
+        raise: 1.0,
+        raise_sizes: validated
+            .map(|s| s.into_iter().map(|(k, v)| (k, v / total)).collect()),
+    })
 }
 
 fn parse_range(range_str: &str) -> Result<HashSet<CanonicalHand>, AgentError> {
@@ -316,6 +401,11 @@ bet_sizes = [0.5, 1.0]
 raise = "AA,KK,QQ,AKs"
 call = "JJ,TT,AQs,AJs"
 
+[ranges.btn.raise_sizes]
+"0.5" = 0.3
+"1.0" = 0.6
+allin = 0.1
+
 [ranges.bb]
 raise = "QQ+,AKs"
 call = "22+,A2s+,K2s+"
@@ -328,7 +418,11 @@ raise = 0.33
 [classes.TopPair]
 fold = 0.1
 call = 0.5
-raise = 0.4
+
+[classes.TopPair.raises]
+"0.5" = 0.3
+"1.0" = 0.08
+allin = 0.02
 "#;
 
     #[timed_test]
@@ -353,6 +447,7 @@ raise = 0.4
         assert!((tp.fold - 0.1).abs() < 1e-5);
         assert!((tp.call - 0.5).abs() < 1e-5);
         assert!((tp.raise - 0.4).abs() < 1e-5);
+        assert!(tp.raise_sizes.is_none()); // legacy single-value raise
     }
 
     #[timed_test]
@@ -471,9 +566,13 @@ raise = 2.0
         let jj = CanonicalHand::parse("JJ").unwrap();
         let seven_two = CanonicalHand::parse("72o").unwrap();
 
-        // AA in raise range → raise
+        // AA in btn raise range → raise with per-size distribution
         let freq = config.preflop_frequency("btn", &aa);
         assert!((freq.raise - 1.0).abs() < 1e-5);
+        let sizes = freq.raise_sizes.as_ref().unwrap();
+        assert!((sizes["0.5"] - 0.3).abs() < 1e-5);
+        assert!((sizes["1.0"] - 0.6).abs() < 1e-5);
+        assert!((sizes["allin"] - 0.1).abs() < 1e-5);
 
         // JJ in call range → call
         let freq = config.preflop_frequency("btn", &jj);
@@ -491,10 +590,42 @@ raise = 2.0
     #[timed_test]
     fn preflop_frequency_raise_beats_call_overlap() {
         let config = AgentConfig::from_toml(TOML_WITH_RANGES).unwrap();
-        // BB: AA is in both raise (QQ+) and call (22+) ranges. Raise wins.
+        // BB: AA is in both raise (QQ+) and call (22+). Raise wins.
+        // BB has no raise_sizes → raise_sizes is None (split evenly).
         let aa = CanonicalHand::parse("AA").unwrap();
         let freq = config.preflop_frequency("bb", &aa);
         assert!((freq.raise - 1.0).abs() < 1e-5);
+        assert!(freq.raise_sizes.is_none());
+    }
+
+    #[timed_test]
+    fn class_override_with_per_size_raises() {
+        let config = AgentConfig::from_toml(TOML_WITH_RANGES).unwrap();
+        let tp = &config.classes[&HandClass::TopPair];
+        assert!((tp.fold - 0.1).abs() < 1e-5);
+        assert!((tp.call - 0.5).abs() < 1e-5);
+        assert!((tp.raise - 0.4).abs() < 1e-5);
+        let sizes = tp.raise_sizes.as_ref().unwrap();
+        assert!((sizes["0.5"] - 0.3).abs() < 1e-5);
+        assert!((sizes["1.0"] - 0.08).abs() < 1e-5);
+        assert!((sizes["allin"] - 0.02).abs() < 1e-5);
+    }
+
+    #[timed_test]
+    fn legacy_single_raise_still_works() {
+        let toml = r#"
+[game]
+stack_depth = 100
+bet_sizes = [0.5, 1.0]
+
+[default]
+fold = 0.3
+call = 0.3
+raise = 0.4
+"#;
+        let config = AgentConfig::from_toml(toml).unwrap();
+        assert!((config.default.raise - 0.4).abs() < 1e-5);
+        assert!(config.default.raise_sizes.is_none());
     }
 
     #[timed_test]

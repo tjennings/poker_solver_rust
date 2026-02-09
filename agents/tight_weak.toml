@@ -9,11 +9,21 @@ bet_sizes = [0.5, 1.0]
 raise = "TT+,AQs+,AKo"
 call = "44+,A8s+,KTs+,QTs+,JTs,T9s,98s,A9o+,KJo+,QJo"
 
+[ranges.btn.raise_sizes]
+"0.5" = 0.7
+"1.0" = 0.25
+allin = 0.05
+
 [ranges.bb]
 raise = "QQ+,AKs"
 call = "22+,A2s+,K5s+,Q8s+,J8s+,T8s+,97s+,87s,76s,65s,A2o+,K9o+,Q9o+,J9o+,T9o"
 
-# Preflop and unclassified hands: mostly fold
+[ranges.bb.raise_sizes]
+"0.5" = 0.7
+"1.0" = 0.25
+allin = 0.05
+
+# Postflop default for unclassified hands
 [default]
 fold = 0.6
 call = 0.3
@@ -23,103 +33,183 @@ raise = 0.1
 [classes.StraightFlush]
 fold = 0.0
 call = 0.7
-raise = 0.3
+
+[classes.StraightFlush.raises]
+"0.5" = 0.15
+"1.0" = 0.1
+allin = 0.05
 
 [classes.FourOfAKind]
 fold = 0.0
 call = 0.7
-raise = 0.3
+
+[classes.FourOfAKind.raises]
+"0.5" = 0.15
+"1.0" = 0.1
+allin = 0.05
 
 [classes.FullHouse]
 fold = 0.0
 call = 0.7
-raise = 0.3
+
+[classes.FullHouse.raises]
+"0.5" = 0.2
+"1.0" = 0.08
+allin = 0.02
 
 [classes.Flush]
 fold = 0.0
 call = 0.75
-raise = 0.25
+
+[classes.Flush.raises]
+"0.5" = 0.2
+"1.0" = 0.05
+allin = 0.0
 
 [classes.Straight]
 fold = 0.0
 call = 0.75
-raise = 0.25
+
+[classes.Straight.raises]
+"0.5" = 0.2
+"1.0" = 0.05
+allin = 0.0
 
 # --- Strong made hands: call-heavy, rarely raise ---
 [classes.Set]
 fold = 0.0
 call = 0.7
-raise = 0.3
+
+[classes.Set.raises]
+"0.5" = 0.2
+"1.0" = 0.08
+allin = 0.02
 
 [classes.Trips]
 fold = 0.05
 call = 0.7
-raise = 0.25
+
+[classes.Trips.raises]
+"0.5" = 0.2
+"1.0" = 0.05
+allin = 0.0
 
 [classes.TwoPair]
 fold = 0.05
 call = 0.75
-raise = 0.2
+
+[classes.TwoPair.raises]
+"0.5" = 0.15
+"1.0" = 0.05
+allin = 0.0
 
 [classes.TopPair]
 fold = 0.1
 call = 0.75
-raise = 0.15
+
+[classes.TopPair.raises]
+"0.5" = 0.12
+"1.0" = 0.03
+allin = 0.0
 
 # --- Medium pairs: call or fold, almost never raise ---
 [classes.SecondPair]
 fold = 0.3
 call = 0.65
-raise = 0.05
+
+[classes.SecondPair.raises]
+"0.5" = 0.05
+"1.0" = 0.0
+allin = 0.0
 
 [classes.ThirdPair]
 fold = 0.5
 call = 0.45
-raise = 0.05
+
+[classes.ThirdPair.raises]
+"0.5" = 0.05
+"1.0" = 0.0
+allin = 0.0
 
 [classes.LowPair]
 fold = 0.6
 call = 0.35
-raise = 0.05
+
+[classes.LowPair.raises]
+"0.5" = 0.05
+"1.0" = 0.0
+allin = 0.0
 
 [classes.Underpair]
 fold = 0.7
 call = 0.25
-raise = 0.05
+
+[classes.Underpair.raises]
+"0.5" = 0.05
+"1.0" = 0.0
+allin = 0.0
 
 # --- No pair: mostly fold ---
 [classes.AceHigh]
 fold = 0.6
 call = 0.35
-raise = 0.05
+
+[classes.AceHigh.raises]
+"0.5" = 0.05
+"1.0" = 0.0
+allin = 0.0
 
 [classes.KingHigh]
 fold = 0.75
 call = 0.2
-raise = 0.05
+
+[classes.KingHigh.raises]
+"0.5" = 0.05
+"1.0" = 0.0
+allin = 0.0
 
 # --- Draws: call sometimes, rarely semi-bluff ---
 [classes.FlushDrawNuts]
 fold = 0.15
 call = 0.7
-raise = 0.15
+
+[classes.FlushDrawNuts.raises]
+"0.5" = 0.1
+"1.0" = 0.05
+allin = 0.0
 
 [classes.FlushDraw]
 fold = 0.3
 call = 0.6
-raise = 0.1
+
+[classes.FlushDraw.raises]
+"0.5" = 0.08
+"1.0" = 0.02
+allin = 0.0
 
 [classes.BackdoorFlushDraw]
 fold = 0.6
 call = 0.35
-raise = 0.05
+
+[classes.BackdoorFlushDraw.raises]
+"0.5" = 0.05
+"1.0" = 0.0
+allin = 0.0
 
 [classes.Oesd]
 fold = 0.25
 call = 0.65
-raise = 0.1
+
+[classes.Oesd.raises]
+"0.5" = 0.08
+"1.0" = 0.02
+allin = 0.0
 
 [classes.Gutshot]
 fold = 0.5
 call = 0.45
-raise = 0.05
+
+[classes.Gutshot.raises]
+"0.5" = 0.05
+"1.0" = 0.0
+allin = 0.0
