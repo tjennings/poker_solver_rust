@@ -8,9 +8,9 @@ pub use commands::{
 };
 
 pub use exploration::{
-    get_available_actions, get_bundle_info, get_computation_status, get_strategy_matrix,
-    is_board_cached, is_bundle_loaded, list_agents, load_bundle, start_bucket_computation,
-    ExplorationState,
+    get_available_actions, get_bundle_info, get_combo_classes, get_computation_status,
+    get_strategy_matrix, is_board_cached, is_bundle_loaded, list_agents, load_bundle,
+    start_bucket_computation, ExplorationState,
 };
 
 pub use simulation::{

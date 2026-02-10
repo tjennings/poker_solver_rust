@@ -15,7 +15,7 @@ use tauri::{AppHandle, Emitter, State};
 use poker_solver_core::abstraction::{CardAbstraction, Street};
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint::{BundleConfig, StrategyBundle};
-use poker_solver_core::hand_class::classify;
+use poker_solver_core::hand_class::{classify, HandClassification};
 use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::info_key::{canonical_hand_index, cards_from_rank_chars, InfoKey};
 use poker_solver_core::poker::{Card, Suit, Value};
@@ -98,6 +98,8 @@ pub struct MatrixCell {
     pub pair: bool,
     /// Action probabilities (fold, check/call, bets/raises...)
     pub probabilities: Vec<ActionProb>,
+    /// Whether this hand was filtered out by the range threshold.
+    pub filtered: bool,
 }
 
 /// An action with its probability.
@@ -232,20 +234,28 @@ fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
 }
 
 /// Get the strategy matrix for a given position.
-/// Non-blocking: uses cached buckets for postflop, returns default probabilities if not cached.
+///
+/// `threshold` filters out hands whose prior action probabilities fell below
+/// this value (range narrowing).  `street_histories` supplies the action
+/// sequences of all completed streets so the filter can replay the game.
 #[tauri::command]
 pub fn get_strategy_matrix(
     state: State<'_, ExplorationState>,
     position: ExplorationPosition,
+    threshold: Option<f32>,
+    street_histories: Option<Vec<Vec<String>>>,
 ) -> Result<StrategyMatrix, String> {
     let source_guard = state.source.read();
     let source = source_guard
         .as_ref()
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
+    let sh = street_histories.unwrap_or_default();
+    let thresh = threshold.unwrap_or(0.0);
+
     match source {
         StrategySource::Bundle { config, blueprint } => {
-            get_strategy_matrix_bundle(config, blueprint, &state, &position)
+            get_strategy_matrix_bundle(config, blueprint, &state, &position, thresh, &sh)
         }
         StrategySource::Agent(agent) => get_strategy_matrix_agent(agent, &position),
     }
@@ -256,6 +266,8 @@ fn get_strategy_matrix_bundle(
     blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
     state: &State<'_, ExplorationState>,
     position: &ExplorationPosition,
+    threshold: f32,
+    street_histories: &[Vec<String>],
 ) -> Result<StrategyMatrix, String> {
     let board = parse_board(&position.board)?;
     let street = street_from_board_len(board.len())?;
@@ -279,12 +291,31 @@ fn get_strategy_matrix_bundle(
             None
         };
 
+    // Range filtering: only for hand_class bundles with a positive threshold
+    let apply_filter = use_hand_class && threshold > 0.0;
+
     for (row, &rank1) in ranks.iter().enumerate() {
         let mut row_cells = Vec::with_capacity(13);
         for (col, &rank2) in ranks.iter().enumerate() {
             let (hand_label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
 
-            let probabilities = if use_hand_class {
+            let filtered = apply_filter
+                && !is_hand_in_range(
+                    config,
+                    blueprint,
+                    &board,
+                    street_histories,
+                    &position.history,
+                    position.to_act,
+                    threshold,
+                    rank1,
+                    rank2,
+                    suited,
+                );
+
+            let probabilities = if filtered {
+                vec![]
+            } else if use_hand_class {
                 get_hand_strategy_hand_class(
                     blueprint,
                     &board,
@@ -318,6 +349,7 @@ fn get_strategy_matrix_bundle(
                 suited,
                 pair,
                 probabilities,
+                filtered,
             });
         }
         cells.push(row_cells);
@@ -373,6 +405,7 @@ fn get_strategy_matrix_agent(
                 suited,
                 pair,
                 probabilities,
+                filtered: false,
             });
         }
         cells.push(row_cells);
@@ -669,6 +702,456 @@ fn find_agents_dir() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// A group of combos sharing the same hand classification.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComboGroup {
+    /// Raw `HandClassification` bits.
+    pub bits: u32,
+    /// Human-readable class names (e.g. `["TopPair", "FlushDraw"]`).
+    pub class_names: Vec<String>,
+    /// Formatted combo strings (e.g. `["A♠K♠", "A♣K♣"]`).
+    pub combos: Vec<String>,
+    /// Action probabilities from the blueprint.
+    pub strategy: Vec<f32>,
+}
+
+/// Per-cell combo classification breakdown.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComboGroupInfo {
+    /// Hand label (e.g. "AKs").
+    pub hand: String,
+    /// Combo groups, each with a distinct classification.
+    pub groups: Vec<ComboGroup>,
+    /// Number of valid (non-blocked) combos.
+    pub total_combos: usize,
+    /// Number of board-blocked combos.
+    pub blocked_combos: usize,
+    /// Current street name.
+    pub street: String,
+    /// Pot bucket used for key construction.
+    pub pot_bucket: u32,
+    /// Stack bucket used for key construction.
+    pub stack_bucket: u32,
+}
+
+/// Get combo-level classification breakdown for a selected cell.
+///
+/// Enumerates all specific combos of a canonical hand (e.g. "AKs"),
+/// classifies each on the current board, groups by classification,
+/// and looks up the blueprint strategy for each group.
+///
+/// Only meaningful for hand_class bundles on postflop streets.
+#[tauri::command]
+pub fn get_combo_classes(
+    state: State<'_, ExplorationState>,
+    position: ExplorationPosition,
+    hand: String,
+) -> Result<ComboGroupInfo, String> {
+    let source_guard = state.source.read();
+    let source = source_guard
+        .as_ref()
+        .ok_or_else(|| "No bundle loaded".to_string())?;
+
+    let (config, blueprint) = match source {
+        StrategySource::Bundle { config, blueprint } => (config, blueprint),
+        StrategySource::Agent(_) => {
+            return Ok(empty_combo_info(&hand));
+        }
+    };
+
+    if config.abstraction_mode != "hand_class" {
+        return Ok(empty_combo_info(&hand));
+    }
+
+    let board = parse_board(&position.board)?;
+    let street = street_from_board_len(board.len())?;
+
+    if street == Street::Preflop {
+        return Ok(empty_combo_info(&hand));
+    }
+
+    let (rank1, rank2, suited) = parse_hand_label(&hand)?;
+    let max_combos = max_combo_count(rank1, rank2, suited);
+    let combos = enumerate_combos(rank1, rank2, suited, &board);
+    let blocked_combos = max_combos - combos.len();
+
+    let action_codes = build_action_codes(&position.history);
+    let pos_state = compute_position_state(&config.game.bet_sizes, &position);
+    let street_num = street_to_num(street);
+    let pot_bucket = pos_state.pot / 20;
+    let stack_bucket = pos_state.eff_stack / 20;
+
+    // Group combos by classification bits
+    let mut groups_map: std::collections::BTreeMap<u32, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for combo in &combos {
+        let bits = classify(*combo, &board)
+            .map(|c| c.bits())
+            .unwrap_or(0);
+        groups_map
+            .entry(bits)
+            .or_default()
+            .push(format_combo(*combo));
+    }
+
+    // Build ComboGroups with blueprint lookup
+    let groups: Vec<ComboGroup> = groups_map
+        .into_iter()
+        .map(|(bits, combo_strs)| {
+            let key = InfoKey::new(
+                bits,
+                street_num,
+                pot_bucket,
+                stack_bucket,
+                &action_codes,
+            )
+            .as_u64();
+            let strategy = blueprint
+                .lookup(key)
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
+            ComboGroup {
+                bits,
+                class_names: HandClassification::from_bits(bits).to_strings(),
+                combos: combo_strs,
+                strategy,
+            }
+        })
+        .collect();
+
+    Ok(ComboGroupInfo {
+        hand,
+        groups,
+        total_combos: combos.len(),
+        blocked_combos,
+        street: format!("{street:?}"),
+        pot_bucket,
+        stack_bucket,
+    })
+}
+
+fn empty_combo_info(hand: &str) -> ComboGroupInfo {
+    ComboGroupInfo {
+        hand: hand.to_string(),
+        groups: vec![],
+        total_combos: 0,
+        blocked_combos: 0,
+        street: String::new(),
+        pot_bucket: 0,
+        stack_bucket: 0,
+    }
+}
+
+/// Parse a hand label like "AKs", "QQ", "T9o" into (rank1, rank2, suited).
+fn parse_hand_label(label: &str) -> Result<(char, char, bool), String> {
+    let chars: Vec<char> = label.chars().collect();
+    if chars.len() < 2 {
+        return Err(format!("Invalid hand label: {label}"));
+    }
+    let rank1 = chars[0];
+    let rank2 = chars[1];
+    let suited = chars.get(2) == Some(&'s');
+    Ok((rank1, rank2, suited))
+}
+
+/// Maximum number of combos for a canonical hand type.
+fn max_combo_count(rank1: char, rank2: char, suited: bool) -> usize {
+    if rank1 == rank2 {
+        6 // pairs: C(4,2)
+    } else if suited {
+        4 // suited: 4 suits
+    } else {
+        12 // offsuit: 4×3
+    }
+}
+
+/// Enumerate all specific combos of a canonical hand, excluding board-blocked cards.
+fn enumerate_combos(rank1: char, rank2: char, suited: bool, board: &[Card]) -> Vec<[Card; 2]> {
+    let v1 = char_to_value(rank1);
+    let v2 = char_to_value(rank2);
+    let suits = [Suit::Spade, Suit::Heart, Suit::Diamond, Suit::Club];
+    let board_set: std::collections::HashSet<Card> = board.iter().copied().collect();
+
+    let mut combos = Vec::new();
+
+    if rank1 == rank2 {
+        // Pairs: all suit pairs where s1 < s2
+        for (i, &s1) in suits.iter().enumerate() {
+            let c1 = Card::new(v1, s1);
+            if board_set.contains(&c1) {
+                continue;
+            }
+            for &s2 in &suits[i + 1..] {
+                let c2 = Card::new(v2, s2);
+                if !board_set.contains(&c2) {
+                    combos.push([c1, c2]);
+                }
+            }
+        }
+    } else if suited {
+        // Suited: same suit for both cards
+        for &s in &suits {
+            let c1 = Card::new(v1, s);
+            let c2 = Card::new(v2, s);
+            if !board_set.contains(&c1) && !board_set.contains(&c2) {
+                combos.push([c1, c2]);
+            }
+        }
+    } else {
+        // Offsuit: different suits
+        for &s1 in &suits {
+            let c1 = Card::new(v1, s1);
+            if board_set.contains(&c1) {
+                continue;
+            }
+            for &s2 in &suits {
+                if s1 == s2 {
+                    continue;
+                }
+                let c2 = Card::new(v2, s2);
+                if !board_set.contains(&c2) {
+                    combos.push([c1, c2]);
+                }
+            }
+        }
+    }
+
+    combos
+}
+
+/// Format a card as a unicode string (e.g. "A♠").
+fn format_card(card: Card) -> String {
+    let rank = value_to_char(card.value);
+    let suit = match card.suit {
+        Suit::Spade => '♠',
+        Suit::Heart => '♥',
+        Suit::Diamond => '♦',
+        Suit::Club => '♣',
+    };
+    format!("{rank}{suit}")
+}
+
+/// Format a two-card combo (e.g. "A♠K♠").
+fn format_combo(cards: [Card; 2]) -> String {
+    format!("{}{}", format_card(cards[0]), format_card(cards[1]))
+}
+
+/// Convert a Value back to its rank character.
+fn value_to_char(v: Value) -> char {
+    match v {
+        Value::Ace => 'A',
+        Value::King => 'K',
+        Value::Queen => 'Q',
+        Value::Jack => 'J',
+        Value::Ten => 'T',
+        Value::Nine => '9',
+        Value::Eight => '8',
+        Value::Seven => '7',
+        Value::Six => '6',
+        Value::Five => '5',
+        Value::Four => '4',
+        Value::Three => '3',
+        Value::Two => '2',
+    }
+}
+
+// ============================================================================
+// Range filtering
+// ============================================================================
+
+/// Check if a hand would be in the viewing player's range at the current position.
+///
+/// Replays the full game history (completed streets + current street) and
+/// checks that at each prior decision point of the viewing player, the action
+/// taken had at least `threshold` probability in the blueprint.
+#[allow(clippy::too_many_arguments)]
+fn is_hand_in_range(
+    config: &BundleConfig,
+    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
+    full_board: &[Card],
+    street_histories: &[Vec<String>],
+    current_history: &[String],
+    viewing_player: u8,
+    threshold: f32,
+    rank1: char,
+    rank2: char,
+    suited: bool,
+) -> bool {
+    let bet_sizes = &config.game.bet_sizes;
+    let mut stacks = [
+        config.game.stack_depth * 2 - 1,
+        config.game.stack_depth * 2 - 2,
+    ];
+    let mut pot = 3u32;
+
+    // Process completed streets, then the current street
+    let all_streets: Vec<&[String]> = street_histories
+        .iter()
+        .map(|v| v.as_slice())
+        .chain(std::iter::once(current_history))
+        .collect();
+
+    for (street_idx, street_actions) in all_streets.iter().enumerate() {
+        let board_for_street = board_at_street(full_board, street_idx);
+        let mut to_call = initial_to_call(street_idx, &stacks);
+        let mut action_codes: Vec<u8> = Vec::new();
+
+        for (i, action) in street_actions.iter().enumerate() {
+            let acting_player = (i % 2) as u8;
+
+            if acting_player == viewing_player
+                && !action_meets_threshold(
+                    blueprint,
+                    config,
+                    board_for_street,
+                    street_idx,
+                    &action_codes,
+                    pot,
+                    &stacks,
+                    to_call,
+                    action,
+                    threshold,
+                    rank1,
+                    rank2,
+                    suited,
+                )
+            {
+                return false;
+            }
+
+            action_codes.push(action_to_code(action));
+            apply_action(action, i % 2, &mut stacks, &mut pot, &mut to_call, bet_sizes);
+        }
+    }
+
+    true
+}
+
+/// Board cards visible during a given street.
+fn board_at_street(full_board: &[Card], street_idx: usize) -> &[Card] {
+    let n = match street_idx {
+        0 => 0,
+        1 => 3,
+        2 => 4,
+        3 => 5,
+        _ => 0,
+    };
+    &full_board[..n.min(full_board.len())]
+}
+
+/// Initial to-call amount at the start of a street.
+fn initial_to_call(street_idx: usize, stacks: &[u32; 2]) -> u32 {
+    if street_idx == 0 {
+        stacks[0].saturating_sub(stacks[1])
+    } else {
+        0
+    }
+}
+
+/// Check whether a single action's blueprint probability meets the threshold.
+#[allow(clippy::too_many_arguments)]
+fn action_meets_threshold(
+    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
+    config: &BundleConfig,
+    board: &[Card],
+    street_idx: usize,
+    action_codes: &[u8],
+    pot: u32,
+    stacks: &[u32; 2],
+    to_call: u32,
+    action: &str,
+    threshold: f32,
+    rank1: char,
+    rank2: char,
+    suited: bool,
+) -> bool {
+    let hand_bits = hand_bits_at_street(rank1, rank2, suited, board, street_idx);
+    let street_num = street_idx.min(3) as u8;
+    let eff_stack = stacks[0].min(stacks[1]);
+    let key = InfoKey::new(hand_bits, street_num, pot / 20, eff_stack / 20, action_codes).as_u64();
+
+    let strategy = match blueprint.lookup(key) {
+        Some(s) => s,
+        None => return true, // no data → assume in range
+    };
+
+    let code = action_to_code(action);
+    let idx = action_code_to_strategy_index(code, to_call, config.game.bet_sizes.len());
+
+    match idx.and_then(|i| strategy.get(i)) {
+        Some(&prob) => prob >= threshold,
+        None => true,
+    }
+}
+
+/// Compute hand bits for a street (preflop uses canonical rank index,
+/// postflop uses hand-class classification).
+fn hand_bits_at_street(
+    rank1: char,
+    rank2: char,
+    suited: bool,
+    board: &[Card],
+    street_idx: usize,
+) -> u32 {
+    if street_idx == 0 {
+        hand_bits_from_ranks(rank1, rank2, suited)
+    } else {
+        let (c1, c2) = make_representative_hand(rank1, rank2, suited, board);
+        classify([c1, c2], board).map(|c| c.bits()).unwrap_or(0)
+    }
+}
+
+/// Map an action code to its index in the strategy probability vector.
+fn action_code_to_strategy_index(code: u8, to_call: u32, num_bet_sizes: usize) -> Option<usize> {
+    match code {
+        1 => {
+            // fold — only valid when facing a bet
+            if to_call > 0 { Some(0) } else { None }
+        }
+        2 => Some(if to_call > 0 { 1 } else { 0 }), // check
+        3 => {
+            // call
+            if to_call > 0 { Some(1) } else { None }
+        }
+        4..=7 => Some(1 + (code - 4) as usize),                // bet:idx (to_call == 0)
+        8..=11 => Some(2 + (code - 8) as usize),               // raise:idx (to_call > 0)
+        12 => Some(1 + num_bet_sizes),                          // bet all-in
+        13 => Some(2 + num_bet_sizes),                          // raise all-in
+        _ => None,
+    }
+}
+
+/// Update game state after one action (shared by replay and range filter).
+fn apply_action(
+    action: &str,
+    player: usize,
+    stacks: &mut [u32; 2],
+    pot: &mut u32,
+    to_call: &mut u32,
+    bet_sizes: &[f32],
+) {
+    if action == "c" || action == "call" {
+        let amt = (*to_call).min(stacks[player]);
+        stacks[player] -= amt;
+        *pot += amt;
+        *to_call = 0;
+    } else if let Some(idx_str) = action
+        .strip_prefix("bet:")
+        .or_else(|| action.strip_prefix("raise:"))
+        .or_else(|| action.strip_prefix("b:"))
+        .or_else(|| action.strip_prefix("r:"))
+    {
+        let effective = stacks[player].saturating_sub(*to_call);
+        let bet_portion = resolve_bet_index(idx_str, bet_sizes, *pot, effective);
+        let total = *to_call + bet_portion;
+        let actual = total.min(stacks[player]);
+        stacks[player] -= actual;
+        *pot += actual;
+        *to_call = actual.saturating_sub(*to_call);
+    }
+    // fold, check: no state change
 }
 
 // ============================================================================

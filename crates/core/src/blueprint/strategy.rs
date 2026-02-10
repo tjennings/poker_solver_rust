@@ -94,6 +94,11 @@ impl BlueprintStrategy {
         self.strategies.is_empty()
     }
 
+    /// Iterate over all (key, strategy) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&u64, &Vec<f32>)> {
+        self.strategies.iter()
+    }
+
     /// Saves the strategy to a file using bincode serialization.
     ///
     /// # Errors

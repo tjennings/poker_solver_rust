@@ -1,6 +1,5 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
   AgentInfo,
@@ -9,6 +8,7 @@ import {
   ExplorationPosition,
   ActionInfo,
   MatrixCell,
+  ComboGroupInfo,
 } from './types';
 
 function HamburgerMenu({
@@ -72,13 +72,6 @@ function HamburgerMenu({
       )}
     </div>
   );
-}
-
-// Progress event from backend
-interface BucketProgressEvent {
-  completed: number;
-  total: number;
-  board_key: string;
 }
 
 // Suit colors matching the reference image
@@ -147,16 +140,18 @@ function HandCell({
     const stops: string[] = [];
     let position = 0;
 
-    cell.probabilities.forEach((prob, idx) => {
+    // Reverse order: all-in / largest raise first (left), fold last (right)
+    for (let idx = cell.probabilities.length - 1; idx >= 0; idx--) {
+      const prob = cell.probabilities[idx];
       const action = actions[idx];
-      if (!action || prob.probability <= 0) return;
+      if (!action || prob.probability <= 0) continue;
 
       const color = getActionColor(action, actions);
       const width = prob.probability * 100;
       stops.push(`${color} ${position}%`);
       stops.push(`${color} ${position + width}%`);
       position += width;
-    });
+    }
 
     if (stops.length === 0) {
       return 'rgba(30, 41, 59, 1)';
@@ -167,8 +162,8 @@ function HandCell({
 
   return (
     <div
-      className={`matrix-cell ${isSelected ? 'selected' : ''}`}
-      style={{ background: gradientStops }}
+      className={`matrix-cell ${isSelected ? 'selected' : ''} ${cell.filtered ? 'filtered' : ''}`}
+      style={{ background: cell.filtered ? undefined : gradientStops }}
       onClick={onClick}
     >
       <span className="cell-label">{cell.hand}</span>
@@ -208,6 +203,69 @@ function CellDetail({
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+// Panel showing per-combo classification breakdown for a selected cell
+function ComboClassPanel({
+  info,
+  actions,
+}: {
+  info: ComboGroupInfo;
+  actions: ActionInfo[];
+}) {
+  return (
+    <div className="combo-panel">
+      <div className="combo-panel-header">
+        {info.hand}
+        <span className="combo-panel-meta">
+          {info.total_combos} combo{info.total_combos !== 1 ? 's' : ''}
+          {info.blocked_combos > 0 && ` (${info.blocked_combos} blocked)`}
+        </span>
+      </div>
+      {info.groups.length === 0 && (
+        <div className="combo-panel-empty">No combos on this board.</div>
+      )}
+      <div className="combo-panel-list">
+        {info.groups.map((group) => (
+          <div key={group.bits} className="combo-group">
+            <div className="combo-group-tags">
+              {group.class_names.length > 0
+                ? group.class_names.map((name) => (
+                    <span key={name} className="combo-group-tag">{name}</span>
+                  ))
+                : <span className="combo-group-tag empty">No class</span>
+              }
+              <span className="combo-group-count">
+                {group.combos.length}
+              </span>
+            </div>
+            <div className="combo-group-combos">
+              {group.combos.join(', ')}
+            </div>
+            <div className="combo-group-bars">
+              {[...group.strategy].map((_, ri) => {
+                const i = group.strategy.length - 1 - ri;
+                const prob = group.strategy[i];
+                const action = actions[i];
+                if (!action || prob <= 0) return null;
+                return (
+                  <div
+                    key={action.id}
+                    className="combo-group-bar"
+                    style={{
+                      width: `${prob * 100}%`,
+                      backgroundColor: getActionColor(action, actions),
+                    }}
+                    title={`${action.label}: ${(prob * 100).toFixed(1)}%`}
+                  />
+                );
+              })}
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -413,6 +471,34 @@ type HistoryItem =
   | { type: 'action'; position: string; stack: number; actions: ActionInfo[]; selected: string }
   | { type: 'street'; street: string; pot: number; stack_p1: number; stack_p2: number; cards: string[] };
 
+// Extract completed-street action sequences from history items.
+function extractStreetHistories(items: HistoryItem[]): string[][] {
+  const histories: string[][] = [];
+  let current: string[] = [];
+
+  for (const item of items) {
+    if (item.type === 'action') {
+      current.push(actionIdToHistoryEntry(item.selected));
+    } else if (item.type === 'street') {
+      if (current.length > 0) {
+        histories.push(current);
+        current = [];
+      }
+    }
+  }
+  // Don't push `current` — those are current-street actions already in position.history
+  return histories;
+}
+
+function actionIdToHistoryEntry(selected: string): string {
+  if (selected === 'call') return 'c';
+  if (selected === 'check') return 'x';
+  if (selected === 'fold') return 'f';
+  if (selected.startsWith('bet:')) return `b:${selected.split(':')[1]}`;
+  if (selected.startsWith('raise:')) return `r:${selected.split(':')[1]}`;
+  return selected;
+}
+
 export default function Explorer() {
   const [bundleInfo, setBundleInfo] = useState<BundleInfo | null>(null);
   const [matrix, setMatrix] = useState<StrategyMatrix | null>(null);
@@ -435,47 +521,10 @@ export default function Explorer() {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [computingBuckets, setComputingBuckets] = useState(false);
-  const [computationProgress, setComputationProgress] = useState({ completed: 0, total: 169 });
   const [selectedCell, setSelectedCell] = useState<{ row: number; col: number } | null>(null);
   const [handResult, setHandResult] = useState<'fold' | 'showdown' | null>(null);
-
-  // Ref to track current position for use in event callbacks
-  const positionRef = useRef(position);
-  positionRef.current = position;
-
-  // Listen for bucket computation progress events
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-
-    const setupListener = async () => {
-      unlisten = await listen<BucketProgressEvent>('bucket-progress', async (event) => {
-        const { completed, total } = event.payload;
-        setComputationProgress({ completed, total });
-
-        if (completed >= total) {
-          // Computation complete - refresh the matrix
-          setComputingBuckets(false);
-          try {
-            const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
-              position: positionRef.current,
-            });
-            setMatrix(newMatrix);
-          } catch (e) {
-            setError(String(e));
-          }
-        }
-      });
-    };
-
-    setupListener();
-
-    return () => {
-      if (unlisten) {
-        unlisten();
-      }
-    };
-  }, []); // No dependencies - listener set up once, uses ref for current position
+  const [comboInfo, setComboInfo] = useState<ComboGroupInfo | null>(null);
+  const [threshold, setThreshold] = useState(2);
 
   // Fetch available agents on mount
   useEffect(() => {
@@ -483,6 +532,39 @@ export default function Explorer() {
       .then(setAgents)
       .catch(() => setAgents([]));
   }, []);
+
+  // Re-fetch matrix when threshold changes (if a matrix is displayed)
+  useEffect(() => {
+    if (!matrix) return;
+    invoke<StrategyMatrix>('get_strategy_matrix', {
+      position,
+      threshold: threshold / 100,
+      street_histories: extractStreetHistories(historyItems),
+    })
+      .then(setMatrix)
+      .catch((e) => setError(String(e)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [threshold]);
+
+  // Fetch combo classification when a cell is selected on postflop
+  useEffect(() => {
+    if (!matrix || !selectedCell || position.board.length === 0) {
+      setComboInfo(null);
+      return;
+    }
+    const cell = matrix.cells[selectedCell.row]?.[selectedCell.col];
+    if (!cell || cell.filtered) {
+      setComboInfo(null);
+      return;
+    }
+
+    invoke<ComboGroupInfo>('get_combo_classes', { position, hand: cell.hand })
+      .then(setComboInfo)
+      .catch((err) => {
+        console.error('get_combo_classes error:', err);
+        setComboInfo(null);
+      });
+  }, [position, matrix, selectedCell]);
 
   const loadSource = useCallback(
     async (path: string) => {
@@ -507,6 +589,7 @@ export default function Explorer() {
         setSelectedCell(null);
         const initialMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
           position: initialPosition,
+          threshold: threshold / 100,
         });
         setMatrix(initialMatrix);
       } catch (e) {
@@ -515,7 +598,7 @@ export default function Explorer() {
         setLoading(false);
       }
     },
-    []
+    [threshold]
   );
 
   const handleLoadAgent = useCallback(
@@ -658,6 +741,8 @@ export default function Explorer() {
 
           const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
             position: newPosition,
+            threshold: threshold / 100,
+            street_histories: extractStreetHistories(historyItems),
           });
           setMatrix(newMatrix);
         }
@@ -667,7 +752,7 @@ export default function Explorer() {
         setLoading(false);
       }
     },
-    [matrix, position, checkStreetTransition]
+    [matrix, position, checkStreetTransition, threshold, historyItems]
   );
 
   const handleStreetCardsSet = useCallback(
@@ -702,25 +787,25 @@ export default function Explorer() {
         setPosition(newPosition);
         setPendingStreet(null);
 
-        // Start async bucket computation
-        setComputingBuckets(true);
-        setComputationProgress({ completed: 0, total: 169 });
-
         await invoke('start_bucket_computation', { board: newBoard });
 
-        // Get initial matrix (will show default probabilities until computation completes)
+        // Compute street histories: existing completed streets + the just-completed street.
+        // position.history is already in short format (e.g. "r:0", "c").
+        const sh = [...extractStreetHistories(historyItems), [...position.history]];
+
         const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
           position: newPosition,
+          threshold: threshold / 100,
+          street_histories: sh,
         });
         setMatrix(newMatrix);
       } catch (e) {
         setError(String(e));
-        setComputingBuckets(false);
       } finally {
         setLoading(false);
       }
     },
-    [pendingStreet, position]
+    [pendingStreet, position, threshold, historyItems]
   );
 
   // Rebuild position from history items up to (but not including) the given index.
@@ -784,6 +869,8 @@ export default function Explorer() {
 
         const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
           position: pos,
+          threshold: threshold / 100,
+          street_histories: extractStreetHistories(items),
         });
         setMatrix(newMatrix);
       } catch (e) {
@@ -792,7 +879,7 @@ export default function Explorer() {
         setLoading(false);
       }
     },
-    [rebuildState]
+    [rebuildState, threshold]
   );
 
   // Rewind to a street transition, re-showing the card picker for that street.
@@ -834,8 +921,10 @@ export default function Explorer() {
       setPendingStreet(null);
       setHandResult(null);
       setSelectedCell(null);
+      setComboInfo(null);
       const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
         position: initialPosition,
+        threshold: threshold / 100,
       });
       setMatrix(newMatrix);
     } catch (e) {
@@ -843,7 +932,7 @@ export default function Explorer() {
     } finally {
       setLoading(false);
     }
-  }, [bundleInfo]);
+  }, [bundleInfo, threshold]);
 
   return (
     <div className="explorer">
@@ -868,6 +957,19 @@ export default function Explorer() {
           {bundleInfo.iterations > 0 && (
             <span>Iterations: {bundleInfo.iterations.toLocaleString()}</span>
           )}
+          <span className="threshold-control">
+            Filter &lt;
+            <input
+              type="number"
+              className="threshold-input"
+              value={threshold}
+              onChange={(e) => setThreshold(Math.max(0, Math.min(50, Number(e.target.value))))}
+              min={0}
+              max={50}
+              step={1}
+            />
+            %
+          </span>
         </div>
       )}
 
@@ -920,21 +1022,6 @@ export default function Explorer() {
 
           {matrix && (
             <div className="matrix-container">
-              {computingBuckets && (
-                <div className="computation-progress">
-                  <div className="progress-bar">
-                    <div
-                      className="progress-fill"
-                      style={{
-                        width: `${(computationProgress.completed / computationProgress.total) * 100}%`,
-                      }}
-                    />
-                  </div>
-                  <span className="progress-text">
-                    Computing hand strengths: {computationProgress.completed}/{computationProgress.total}
-                  </span>
-                </div>
-              )}
               <div className="matrix-with-detail">
                 <div className="hand-matrix">
                   {matrix.cells.map((row, rowIdx) => (
@@ -956,6 +1043,9 @@ export default function Explorer() {
                     cell={matrix.cells[selectedCell.row][selectedCell.col]}
                     actions={matrix.actions}
                   />
+                )}
+                {comboInfo && comboInfo.groups.length > 0 && (
+                  <ComboClassPanel info={comboInfo} actions={matrix.actions} />
                 )}
               </div>
             </div>

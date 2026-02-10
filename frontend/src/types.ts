@@ -65,6 +65,7 @@ export interface MatrixCell {
   suited: boolean;
   pair: boolean;
   probabilities: ActionProb[];
+  filtered: boolean;
 }
 
 export interface ActionInfo {
@@ -92,6 +93,24 @@ export interface ExplorationPosition {
   stack_p1: number;
   stack_p2: number;
   to_act: number;
+}
+
+// Combo classification types
+export interface ComboGroup {
+  bits: number;
+  class_names: string[];
+  combos: string[];
+  strategy: number[];
+}
+
+export interface ComboGroupInfo {
+  hand: string;
+  groups: ComboGroup[];
+  total_combos: number;
+  blocked_combos: number;
+  street: string;
+  pot_bucket: number;
+  stack_bucket: number;
 }
 
 // Simulation types
