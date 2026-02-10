@@ -10,6 +10,7 @@ use poker_solver_core::HandClass;
 use poker_solver_core::hand_class::HandClassification;
 use poker_solver_core::abstraction::{AbstractionConfig, BoundaryGenerator};
 use poker_solver_core::blueprint::{BlueprintStrategy, BundleConfig, StrategyBundle};
+use poker_solver_core::cfr::convergence;
 use poker_solver_core::cfr::{MccfrConfig, MccfrSolver};
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
 use poker_solver_core::game::{AbstractionMode, Action, HunlPostflop, PostflopConfig};
@@ -218,10 +219,19 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     let action_labels = format_action_labels(&actions);
     let header = format_table_header(&action_labels);
 
+    // Build bundle config for intermediate saves
+    let bundle_config = BundleConfig {
+        game: config.game.clone(),
+        abstraction: config.abstraction.clone(),
+        abstraction_mode: config.training.abstraction_mode.clone(),
+    };
+
     // Training loop with 10 checkpoints
     let total = config.training.iterations;
     let checkpoint_interval = (total / 10).max(1);
     let training_start = Instant::now();
+    let mut previous_strategies: Option<FxHashMap<u64, Vec<f64>>> = None;
+
     // Baseline checkpoint (iteration 0)
     let ckpt_ctx = CheckpointCtx {
         total_checkpoints: 10,
@@ -230,6 +240,7 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         header: &header,
         action_labels: &action_labels,
         stack_depth: config.game.stack_depth,
+        previous_strategies: &previous_strategies,
     };
     print_checkpoint(&solver, 0, &ckpt_ctx);
 
@@ -256,7 +267,28 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         );
 
         pb.suspend(|| {
+            let ckpt_ctx = CheckpointCtx {
+                total_checkpoints: 10,
+                total_iterations: total,
+                training_start: &training_start,
+                header: &header,
+                action_labels: &action_labels,
+                stack_depth: config.game.stack_depth,
+                previous_strategies: &previous_strategies,
+            };
             print_checkpoint(&solver, checkpoint, &ckpt_ctx);
+
+            // Snapshot strategies for next delta computation
+            previous_strategies = Some(solver.all_strategies_best_effort());
+
+            // Save intermediate checkpoint bundle
+            save_checkpoint_bundle(
+                &solver,
+                checkpoint,
+                &config.training.output_dir,
+                &bundle_config,
+                &boundaries,
+            );
         });
     }
 
@@ -274,7 +306,7 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     pb.finish_with_message("Training complete");
 
-    // Save bundle
+    // Save final bundle
     println!("\nSaving strategy bundle...");
     let strategies = solver.all_strategies();
     let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
@@ -284,11 +316,6 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         blueprint.iterations_trained()
     );
 
-    let bundle_config = BundleConfig {
-        game: config.game,
-        abstraction: config.abstraction,
-        abstraction_mode: config.training.abstraction_mode.clone(),
-    };
     let bundle = StrategyBundle::new(bundle_config, blueprint, boundaries);
     let output_path = PathBuf::from(&config.training.output_dir);
     bundle.save(&output_path)?;
@@ -302,6 +329,24 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     println!("Total time: {:?}", training_start.elapsed());
 
     Ok(())
+}
+
+fn save_checkpoint_bundle(
+    solver: &MccfrSolver<HunlPostflop>,
+    checkpoint: u64,
+    output_dir: &str,
+    bundle_config: &BundleConfig,
+    boundaries: &Option<poker_solver_core::abstraction::BucketBoundaries>,
+) {
+    let dir = PathBuf::from(output_dir).join(format!("checkpoint_{checkpoint}_of_10"));
+    let strategies = solver.all_strategies();
+    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
+    let bundle = StrategyBundle::new(bundle_config.clone(), blueprint, boundaries.clone());
+
+    match bundle.save(&dir) {
+        Ok(()) => println!("  Saved checkpoint to {}/", dir.display()),
+        Err(e) => eprintln!("  Warning: failed to save checkpoint: {e}"),
+    }
 }
 
 fn format_action_labels(actions: &[Action]) -> Vec<String> {
@@ -434,6 +479,7 @@ struct CheckpointCtx<'a> {
     header: &'a str,
     action_labels: &'a [String],
     stack_depth: u32,
+    previous_strategies: &'a Option<FxHashMap<u64, Vec<f64>>>,
 }
 
 fn print_checkpoint(
@@ -474,6 +520,25 @@ fn print_checkpoint(
     if total > 0 {
         let skip_pct = 100.0 * pruned as f64 / total as f64;
         println!("Pruned: {pruned}/{total} traversals ({skip_pct:.1}% skip rate)");
+    }
+
+    // Convergence metrics
+    if checkpoint > 0 {
+        let regrets = solver.regret_sum();
+        let max_r = convergence::max_regret(regrets);
+        let avg_r = convergence::avg_regret(regrets);
+        let entropy = convergence::strategy_entropy(&strategies);
+
+        let delta_str = match ctx.previous_strategies {
+            Some(prev) => format!("{:.6}", convergence::strategy_delta(prev, &strategies)),
+            None => "(first checkpoint)".to_string(),
+        };
+
+        println!("\nConvergence Metrics:");
+        println!("  Strategy delta:   {delta_str}");
+        println!("  Max regret:       {max_r:.6}");
+        println!("  Avg regret:       {avg_r:.6}");
+        println!("  Strategy entropy: {entropy:.4}");
     }
 
     // SB preflop strategy table

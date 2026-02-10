@@ -356,6 +356,12 @@ impl<G: Game> MccfrSolver<G> {
         self.iterations
     }
 
+    /// Returns a reference to the cumulative regret sums.
+    #[must_use]
+    pub fn regret_sum(&self) -> &FxHashMap<u64, Vec<f64>> {
+        &self.regret_sum
+    }
+
     /// Returns all info sets and their average strategies.
     #[must_use]
     pub fn all_strategies(&self) -> FxHashMap<u64, Vec<f64>> {
