@@ -81,7 +81,9 @@ impl HandClass {
         Self::BackdoorStraightDraw,
     ];
 
-    fn from_discriminant(d: u8) -> Option<Self> {
+    /// Convert a discriminant (0-27) back to a `HandClass`.
+    #[must_use]
+    pub fn from_discriminant(d: u8) -> Option<Self> {
         Self::ALL.get(d as usize).copied()
     }
 }
@@ -412,6 +414,11 @@ fn classify_pair_type(
         Rank::OnePair(_) => classify_one_pair(hole_values, &board_ranks, is_pocket_pair, result),
         Rank::HighCard(_) => classify_high_card(hole_values, board, result),
         _ => {} // Already handled above
+    }
+
+    // Board has pair/trips but hole cards don't contribute — fall through to high card
+    if result.is_empty() {
+        classify_high_card(hole_values, board, result);
     }
 }
 
@@ -1457,12 +1464,11 @@ mod tests {
 
     #[timed_test]
     fn board_pair_no_hole_match() {
-        // Board has a pair (77) but hole cards don't match → no pair for us
-        // rs_poker says OnePair but neither hole card makes it
+        // Board has a pair (77) but hole cards don't match — AK is overcards
         assert_classes(
             [card(Ace, Diamond), card(King, Club)],
             &[card(Seven, Heart), card(Seven, Spade), card(Three, Diamond)],
-            &[],
+            &[HandClass::Overcards],
         );
     }
 
@@ -1550,7 +1556,7 @@ mod tests {
 
     #[timed_test]
     fn two_pair_board_paired_no_hole_contribution() {
-        // Board has pair 7-7, neither hole card pairs anything → no classification
+        // Board has pair 7-7, neither hole card pairs anything — A2 is ace high (river, no draws)
         assert_classes(
             [card(Ace, Diamond), card(Two, Club)],
             &[
@@ -1560,7 +1566,7 @@ mod tests {
                 card(Three, Heart),
                 card(Six, Club),
             ],
-            &[],
+            &[HandClass::AceHigh],
         );
     }
 

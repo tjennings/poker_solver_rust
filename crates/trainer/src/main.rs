@@ -319,6 +319,8 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         header: &header,
         action_labels: &action_labels,
         stack_depth: config.game.stack_depth,
+        output_dir: &config.training.output_dir,
+        abs_mode,
         previous_strategies: &previous_strategies,
     };
     print_checkpoint(&solver, 0, &ckpt_ctx);
@@ -353,6 +355,8 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
                 header: &header,
                 action_labels: &action_labels,
                 stack_depth: config.game.stack_depth,
+                output_dir: &config.training.output_dir,
+                abs_mode,
                 previous_strategies: &previous_strategies,
             };
             print_checkpoint(&solver, checkpoint, &ckpt_ctx);
@@ -558,6 +562,8 @@ struct CheckpointCtx<'a> {
     header: &'a str,
     action_labels: &'a [String],
     stack_depth: u32,
+    output_dir: &'a str,
+    abs_mode: AbstractionModeConfig,
     previous_strategies: &'a Option<FxHashMap<u64, Vec<f64>>>,
 }
 
@@ -619,6 +625,8 @@ fn print_checkpoint(
         println!("  Max regret:       {max_r:.6}");
         println!("  Avg regret:       {avg_r:.6}");
         println!("  Strategy entropy: {entropy:.4}");
+
+        print_extreme_regret_keys(regrets, iters, ctx.output_dir);
     }
 
     // SB preflop strategy table
@@ -651,7 +659,99 @@ fn print_checkpoint(
     }
     println!();
 
-    print_river_strategies(&strategies);
+    print_river_strategies(&strategies, ctx.abs_mode);
+}
+
+/// Print the 2 highest and 2 lowest total-regret info set keys.
+///
+/// Useful for investigating convergence outliers with the `tree --key` command.
+fn print_extreme_regret_keys(
+    regret_sum: &FxHashMap<u64, Vec<f64>>,
+    iterations: u64,
+    output_dir: &str,
+) {
+    if regret_sum.is_empty() || iterations == 0 {
+        return;
+    }
+
+    let iter_f = iterations as f64;
+
+    // Collect (key, total_positive_regret_per_iter)
+    let mut keyed: Vec<(u64, f64)> = regret_sum
+        .iter()
+        .map(|(&k, regrets)| {
+            let total: f64 = regrets.iter().filter(|&&r| r > 0.0).sum();
+            (k, total / iter_f)
+        })
+        .collect();
+
+    keyed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let lowest: Vec<_> = keyed.iter().take(2).collect();
+    let highest: Vec<_> = keyed.iter().rev().take(2).collect();
+
+    println!("\nExtreme Regret Keys (for `tree --key`):");
+    for &(key, regret) in &highest {
+        let info = InfoKey::from_raw(*key);
+        println!(
+            "  highest: {key:#018x}  regret={regret:.6}  street={} spr={} depth={}",
+            info.street(),
+            info.spr_bucket(),
+            info.depth_bucket(),
+        );
+    }
+    for &(key, regret) in &lowest {
+        let info = InfoKey::from_raw(*key);
+        println!(
+            "  lowest:  {key:#018x}  regret={regret:.6}  street={} spr={} depth={}",
+            info.street(),
+            info.spr_bucket(),
+            info.depth_bucket(),
+        );
+    }
+
+    // Negative regret diagnostic (DCFR health check)
+    let (neg_count, most_neg_regret, most_neg_key) = negative_regret_stats(regret_sum);
+    if neg_count > 0 {
+        let info = InfoKey::from_raw(most_neg_key);
+        println!(
+            "  negative regrets: {} actions, min={:.6} at {:#018x} street={} spr={} depth={}",
+            neg_count, most_neg_regret, most_neg_key,
+            info.street(), info.spr_bucket(), info.depth_bucket()
+        );
+    } else {
+        println!("  negative regrets: NONE (possible regret flooring issue)");
+    }
+
+    // Print a ready-to-copy command for the highest regret key
+    if let Some(&(top_key, _)) = keyed.last() {
+        println!(
+            "  run: cargo run -p poker-solver-trainer -- tree -b {output_dir} --key {top_key:#018x}"
+        );
+    }
+}
+
+/// Find the most negative action regret and count of negative-regret actions.
+///
+/// Returns `(count, min_regret, key_of_min)`.
+fn negative_regret_stats(regret_sum: &FxHashMap<u64, Vec<f64>>) -> (u64, f64, u64) {
+    let mut most_neg = 0.0_f64;
+    let mut most_neg_key = 0u64;
+    let mut count = 0u64;
+
+    for (&k, regrets) in regret_sum {
+        for &r in regrets {
+            if r < 0.0 {
+                count += 1;
+                if r < most_neg {
+                    most_neg = r;
+                    most_neg_key = k;
+                }
+            }
+        }
+    }
+
+    (count, most_neg, most_neg_key)
 }
 
 /// Hand classes to display in the river strategy table (strongest → weakest).
@@ -668,8 +768,16 @@ const RIVER_DISPLAY_CLASSES: &[HandClass] = &[
 
 /// Return the strongest (lowest-discriminant) made-hand class for a hand_bits value,
 /// or `None` if no recognized class is set.
-fn strongest_class(hand_bits: u32) -> Option<HandClass> {
-    HandClassification::from_bits(hand_bits).iter().next()
+///
+/// For `HandClass` mode, `hand_bits` is a classification bitset.
+/// For `HandClassV2` mode, `hand_bits` encodes class_id in bits 27-23.
+fn strongest_class(hand_bits: u32, abs_mode: AbstractionModeConfig) -> Option<HandClass> {
+    if abs_mode == AbstractionModeConfig::HandClassV2 {
+        let class_id = ((hand_bits >> 23) & 0x1F) as u8;
+        HandClass::from_discriminant(class_id)
+    } else {
+        HandClassification::from_bits(hand_bits).iter().next()
+    }
 }
 
 /// Return a short display name for a `HandClass`.
@@ -694,7 +802,7 @@ fn class_label(class: HandClass) -> &'static str {
 type RiverScenario = (u32, u32, u32);
 
 /// Print river strategy tables for the most populated first-to-act and facing-bet scenarios.
-fn print_river_strategies(strategies: &FxHashMap<u64, Vec<f64>>) {
+fn print_river_strategies(strategies: &FxHashMap<u64, Vec<f64>>, abs_mode: AbstractionModeConfig) {
     // Collect river keys grouped by scenario
     let mut first_to_act: FxHashMap<RiverScenario, Vec<(u32, Vec<f64>)>> = FxHashMap::default();
     let mut facing_action: FxHashMap<RiverScenario, Vec<(u32, Vec<f64>)>> = FxHashMap::default();
@@ -727,14 +835,14 @@ fn print_river_strategies(strategies: &FxHashMap<u64, Vec<f64>>) {
         let entries = &first_to_act[&scenario];
         let num_actions = entries.first().map_or(0, |(_, p)| p.len());
         let labels = first_to_act_labels(num_actions);
-        print_river_table("first to act", scenario, entries, &labels);
+        print_river_table("first to act", scenario, entries, &labels, abs_mode);
     }
 
     if let Some(scenario) = most_populated_scenario(&facing_action) {
         let entries = &facing_action[&scenario];
         let num_actions = entries.first().map_or(0, |(_, p)| p.len());
         let labels = facing_bet_labels(num_actions);
-        print_river_table("facing bet", scenario, entries, &labels);
+        print_river_table("facing bet", scenario, entries, &labels, abs_mode);
     }
 }
 
@@ -778,11 +886,12 @@ fn print_river_table(
     scenario: RiverScenario,
     entries: &[(u32, Vec<f64>)],
     labels: &[String],
+    abs_mode: AbstractionModeConfig,
 ) {
     // Deduplicate by strongest hand class — keep entry with most data
     let mut by_class: FxHashMap<u8, &Vec<f64>> = FxHashMap::default();
     for (hand_bits, probs) in entries {
-        if let Some(class) = strongest_class(*hand_bits) {
+        if let Some(class) = strongest_class(*hand_bits, abs_mode) {
             let disc = class as u8;
             by_class.entry(disc).or_insert(probs);
         }

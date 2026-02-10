@@ -427,14 +427,15 @@ impl<G: Game> MccfrSolver<G> {
         if current_player == traversing_player {
             // Traversing player: explore all actions
             let mut action_utils = vec![0.0; num_actions];
+            let mut pruned: u32 = 0;
 
             for (i, action) in actions.iter().enumerate() {
                 self.total_traversals += 1;
 
-                // Zero-regret pruning: skip actions with 0 cumulative regret
+                // Regret-based pruning: skip actions with non-positive cumulative regret
                 if self.should_prune(info_set, i) {
                     self.pruned_traversals += 1;
-                    // action_utils[i] already 0.0 from vec initialization
+                    pruned |= 1 << i;
                     continue;
                 }
 
@@ -474,6 +475,9 @@ impl<G: Game> MccfrSolver<G> {
                 .or_insert_with(|| vec![0.0; num_actions]);
 
             for i in 0..num_actions {
+                if pruned >> i & 1 != 0 {
+                    continue;
+                }
                 let regret_delta =
                     opponent_reach * (action_utils[i] - node_util) * sample_weight;
                 regrets[i] += regret_delta;
@@ -819,13 +823,14 @@ fn cfr_traverse_pure<G: Game>(
 
     if current_player == traversing_player {
         let mut action_utils = vec![0.0; num_actions];
+        let mut pruned: u32 = 0;
 
         for (i, action) in actions.iter().enumerate() {
             acc.total_count += 1;
 
             if should_prune_snapshot(regret_snapshot, info_set, i, &pruning) {
                 acc.pruned_count += 1;
-                // action_utils[i] already 0.0 from vec initialization
+                pruned |= 1 << i;
                 continue;
             }
 
@@ -867,6 +872,9 @@ fn cfr_traverse_pure<G: Game>(
             .or_insert_with(|| vec![0.0; num_actions]);
 
         for i in 0..num_actions {
+            if pruned >> i & 1 != 0 {
+                continue;
+            }
             regrets[i] +=
                 opponent_reach * (action_utils[i] - node_util) * sample_weight;
         }
@@ -982,7 +990,7 @@ mod tests {
         let game = KuhnPoker::new();
         let mut solver = MccfrSolver::new(game);
 
-        // Train with full sampling (equivalent to vanilla but with CFR+)
+        // Train with full sampling (DCFR with external sampling)
         solver.train_full(10_000);
 
         // King (2) facing bet (4) → "Kb"
