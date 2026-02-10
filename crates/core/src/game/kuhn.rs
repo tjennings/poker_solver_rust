@@ -193,30 +193,27 @@ impl Game for KuhnPoker {
         }
     }
 
-    fn info_set_key(&self, state: &Self::State) -> String {
+    fn info_set_key(&self, state: &Self::State) -> u64 {
+        use crate::info_key::InfoKey;
+
         let card = match self.player(state) {
             Player::Player1 => state.p1_card,
             Player::Player2 => state.p2_card,
         };
+        let hand_bits = card as u32; // J=0, Q=1, K=2
 
-        let card_char = match card {
-            Card::Jack => 'J',
-            Card::Queen => 'Q',
-            Card::King => 'K',
-        };
-
-        let history_str: String = state
+        let action_codes: Vec<u8> = state
             .history
             .iter()
             .map(|a| match a {
-                KuhnAction::Check => 'c',
-                KuhnAction::Bet => 'b',
-                KuhnAction::Fold => 'f',
-                KuhnAction::Call => 'k',
+                KuhnAction::Check => 2, // check
+                KuhnAction::Bet => 4,   // bet(0)
+                KuhnAction::Fold => 1,  // fold
+                KuhnAction::Call => 3,  // call
             })
             .collect();
 
-        format!("{card_char}{history_str}")
+        InfoKey::new(hand_bits, 0, 0, 0, &action_codes).as_u64()
     }
 }
 
@@ -394,24 +391,38 @@ mod tests {
     }
 
     #[timed_test]
-    fn info_set_key_includes_card_and_history() {
+    fn info_set_key_different_for_different_cards() {
         let game = KuhnPoker::new();
-        let mut state = game
+        let state_kj = game
             .initial_states()
             .into_iter()
             .find(|s| s.p1_card == Card::King && s.p2_card == Card::Jack)
             .unwrap();
+        let state_qj = game
+            .initial_states()
+            .into_iter()
+            .find(|s| s.p1_card == Card::Queen && s.p2_card == Card::Jack)
+            .unwrap();
 
-        // P1's info set at start: just their card
-        assert_eq!(game.info_set_key(&state), "K");
+        // Different cards → different keys
+        assert_ne!(
+            game.info_set_key(&state_kj),
+            game.info_set_key(&state_qj),
+        );
 
-        state = game.next_state(&state, Action::Check);
-        // P2's info set: their card + history
-        assert_eq!(game.info_set_key(&state), "Jc");
+        // After check, P2's key should change
+        let after_check = game.next_state(&state_kj, Action::Check);
+        assert_ne!(
+            game.info_set_key(&state_kj),
+            game.info_set_key(&after_check),
+        );
 
-        state = game.next_state(&state, Action::Bet(0));
-        // P1's info set: their card + history
-        assert_eq!(game.info_set_key(&state), "Kcb");
+        // After check + bet, P1's key should differ from root
+        let after_bet = game.next_state(&after_check, Action::Bet(0));
+        assert_ne!(
+            game.info_set_key(&state_kj),
+            game.info_set_key(&after_bet),
+        );
     }
 
     #[timed_test]

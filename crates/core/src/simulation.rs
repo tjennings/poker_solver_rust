@@ -21,14 +21,16 @@ thread_local! {
     ///
     /// The arena runs agents sequentially on one thread, so thread-local
     /// storage avoids the need for `Arc<Mutex<...>>`. Each entry is a
-    /// `(Round, key_string)` pair. Cleared at the start of each hand.
-    static ACTION_LOG: RefCell<Vec<(Round, String)>> = const { RefCell::new(Vec::new()) };
+    /// `(Round, action_code)` pair where action_code is the 4-bit encoding
+    /// from `encode_action`. Cleared at the start of each hand.
+    static ACTION_LOG: RefCell<Vec<(Round, u8)>> = const { RefCell::new(Vec::new()) };
 }
 
 use crate::agent::{AgentConfig, FrequencyMap};
 use crate::blueprint::{BlueprintStrategy, BundleConfig};
 use crate::hand_class::classify;
 use crate::hands::CanonicalHand;
+use crate::info_key::{canonical_hand_index, InfoKey};
 
 /// Progress update emitted during a simulation run.
 #[derive(Debug, Clone)]
@@ -122,12 +124,12 @@ impl BlueprintAgent {
         }
     }
 
-    /// Build the info set key for the current game state.
+    /// Build the u64 info set key for the current game state.
     ///
     /// Reads the shared `ACTION_LOG` thread-local to include both players'
     /// actions on the current street. This matches the game model's
-    /// `info_set_key_into()` which iterates over the full `state.history`.
-    fn build_info_set_key(&self, game_state: &GameState) -> String {
+    /// `info_set_key()` which iterates over the full `state.history`.
+    fn build_info_set_key(&self, game_state: &GameState) -> u64 {
         let idx = game_state.to_act_idx();
         let hand = &game_state.hands[idx];
         let board = &game_state.board;
@@ -136,23 +138,22 @@ impl BlueprintAgent {
 
         let use_hand_class = self.bundle_config.abstraction_mode == "hand_class";
 
-        // Bucket or hand string
-        let bucket_or_hand = if board.is_empty() {
-            canonical_hand_string(&hole_cards)
+        let hand_bits: u32 = if board.is_empty() {
+            u32::from(canonical_hand_index(hole_cards))
         } else if use_hand_class {
             let board_cards: Vec<crate::poker::Card> =
                 board.iter().map(|c| to_core_card(*c)).collect();
             let hole = [to_core_card(hole_cards[0]), to_core_card(hole_cards[1])];
             match classify(hole, &board_cards) {
-                Ok(classification) => classification.bits().to_string(),
-                Err(_) => "?".to_string(),
+                Ok(classification) => classification.bits(),
+                Err(_) => 0,
             }
         } else {
-            // EHS2 mode - not supported in simulation, fall back to hand string
-            canonical_hand_string(&hole_cards)
+            // EHS2 mode - not supported in simulation, fall back to canonical hand
+            u32::from(canonical_hand_index(hole_cards))
         };
 
-        let street_char = round_to_street_char(round);
+        let street_num: u8 = round_to_street_num(round);
 
         // Both pot and stacks are in internal units (1 BB = 2 units).
         // Round before truncating to u32 to avoid float drift shifting
@@ -164,16 +165,15 @@ impl BlueprintAgent {
         let stack_bucket = eff_stack / 20;
 
         // Read current-street actions from both players via the shared log
-        let action_str = ACTION_LOG.with(|log| {
+        let action_codes: Vec<u8> = ACTION_LOG.with(|log| {
             log.borrow()
                 .iter()
                 .filter(|(r, _)| r == round)
-                .map(|(_, s)| s.as_str())
-                .collect::<Vec<_>>()
-                .join("")
+                .map(|(_, code)| *code)
+                .collect()
         });
 
-        format!("{bucket_or_hand}|{street_char}|p{pot_bucket}s{stack_bucket}|{action_str}")
+        InfoKey::new(hand_bits, street_num, pot_bucket, stack_bucket, &action_codes).as_u64()
     }
 
     /// Look up strategy probabilities, trying nearby pot/stack buckets when
@@ -181,28 +181,31 @@ impl BlueprintAgent {
     ///
     /// Searches outward by Manhattan distance in (pot_bucket, stack_bucket)
     /// space. Falls back to a uniform distribution if no nearby key is found.
-    fn lookup_nearest(&self, key: &str) -> Vec<f32> {
+    fn lookup_nearest(&self, key: u64) -> Vec<f32> {
         // Try exact key first
         if let Some(probs) = self.blueprint.lookup(key) {
             return probs.to_vec();
         }
 
-        // Parse key: "{bucket}|{street}|p{pot}s{stack}|{actions}"
-        if let Some((prefix, pot_bucket, stack_bucket, suffix)) = parse_info_set_key(key) {
-            // Search nearby pot/stack buckets by increasing Manhattan distance
-            for distance in 1..=5i32 {
-                for dp in -distance..=distance {
-                    let ds_abs = distance - dp.abs();
-                    for &ds in &[-ds_abs, ds_abs] {
-                        let p = pot_bucket as i32 + dp;
-                        let s = stack_bucket as i32 + ds;
-                        if p < 0 || s < 0 {
-                            continue;
-                        }
-                        let candidate = format!("{prefix}|p{}s{}|{suffix}", p, s);
-                        if let Some(probs) = self.blueprint.lookup(&candidate) {
-                            return probs.to_vec();
-                        }
+        // Extract pot/stack buckets from the key to search nearby
+        let info = InfoKey::from_raw(key);
+        let pot_bucket = info.pot_bucket();
+        let stack_bucket = info.stack_bucket();
+
+        // Search nearby pot/stack buckets by increasing Manhattan distance
+        for distance in 1..=5i32 {
+            for dp in -distance..=distance {
+                let ds_abs = distance - dp.abs();
+                for &ds in &[-ds_abs, ds_abs] {
+                    let p = pot_bucket as i32 + dp;
+                    let s = stack_bucket as i32 + ds;
+                    if p < 0 || s < 0 {
+                        continue;
+                    }
+                    #[allow(clippy::cast_sign_loss)]
+                    let candidate = info.with_buckets(p as u32, s as u32).as_u64();
+                    if let Some(probs) = self.blueprint.lookup(candidate) {
+                        return probs.to_vec();
                     }
                 }
             }
@@ -218,7 +221,7 @@ impl Agent for BlueprintAgent {
     fn act(&mut self, _id: u128, game_state: &GameState) -> AgentAction {
         let key = self.build_info_set_key(game_state);
 
-        let probs = self.lookup_nearest(&key);
+        let probs = self.lookup_nearest(key);
 
         let r: f32 = self.rng.random();
         // Action recording is handled by LoggingAgentWrapper
@@ -299,8 +302,8 @@ impl Iterator for RotatingDealerGenerator {
 /// Wraps any `Agent` to record its actions in the thread-local `ACTION_LOG`.
 ///
 /// After the inner agent returns an action, the wrapper converts it to its
-/// info-set-key string representation and appends it to the log. This ensures
-/// that *both* players' actions are visible when `BlueprintAgent` builds keys.
+/// 4-bit action code and appends it to the log. This ensures that *both*
+/// players' actions are visible when `BlueprintAgent` builds keys.
 struct LoggingAgentWrapper {
     inner: Box<dyn Agent>,
     bet_sizes: Vec<f32>,
@@ -309,10 +312,10 @@ struct LoggingAgentWrapper {
 impl Agent for LoggingAgentWrapper {
     fn act(&mut self, id: u128, game_state: &GameState) -> AgentAction {
         let action = self.inner.act(id, game_state);
-        let key_str = agent_action_to_key_str(&action, game_state, &self.bet_sizes);
+        let code = agent_action_to_code(&action, game_state, &self.bet_sizes);
         let round = game_state.round;
         ACTION_LOG.with(|log| {
-            log.borrow_mut().push((round, key_str));
+            log.borrow_mut().push((round, code));
         });
         action
     }
@@ -459,87 +462,14 @@ fn to_core_card(card: Card) -> crate::poker::Card {
     card
 }
 
-/// Get the canonical hand string (e.g. "AKs", "QQ", "T9o") for preflop keys.
-fn canonical_hand_string(hole: &[Card; 2]) -> String {
-    let r1 = value_to_char(hole[0].value);
-    let r2 = value_to_char(hole[1].value);
-
-    let rank_order = |c: char| match c {
-        'A' => 14u8,
-        'K' => 13,
-        'Q' => 12,
-        'J' => 11,
-        'T' => 10,
-        _ => c.to_digit(10).unwrap_or(0) as u8,
-    };
-
-    let (high, low) = if rank_order(r1) >= rank_order(r2) {
-        (r1, r2)
-    } else {
-        (r2, r1)
-    };
-
-    if high == low {
-        format!("{high}{low}")
-    } else if hole[0].suit == hole[1].suit {
-        format!("{high}{low}s")
-    } else {
-        format!("{high}{low}o")
-    }
-}
-
-fn value_to_char(v: Value) -> char {
-    match v {
-        Value::Two => '2',
-        Value::Three => '3',
-        Value::Four => '4',
-        Value::Five => '5',
-        Value::Six => '6',
-        Value::Seven => '7',
-        Value::Eight => '8',
-        Value::Nine => '9',
-        Value::Ten => 'T',
-        Value::Jack => 'J',
-        Value::Queen => 'Q',
-        Value::King => 'K',
-        Value::Ace => 'A',
-    }
-}
-
-/// Parse an info set key into (prefix, pot_bucket, stack_bucket, action_suffix).
-///
-/// Key format: `"{bucket}|{street}|p{pot}s{stack}|{actions}"`
-/// Returns `("{bucket}|{street}", pot, stack, "{actions}")`.
-fn parse_info_set_key(key: &str) -> Option<(&str, u32, u32, &str)> {
-    // Split at "|p" to find the pot/stack segment
-    let pipe_positions: Vec<usize> = key.match_indices('|').map(|(i, _)| i).collect();
-    if pipe_positions.len() < 3 {
-        return None;
-    }
-    // prefix = everything before the second pipe (bucket|street)
-    let prefix = &key[..pipe_positions[1]];
-    // pot_stack segment is between pipe_positions[1]+1 and pipe_positions[2]
-    let ps_segment = &key[pipe_positions[1] + 1..pipe_positions[2]];
-    // actions is everything after pipe_positions[2]+1
-    let actions = &key[pipe_positions[2] + 1..];
-
-    // Parse "p{N}s{M}"
-    let ps_segment = ps_segment.strip_prefix('p')?;
-    let s_pos = ps_segment.find('s')?;
-    let pot_bucket: u32 = ps_segment[..s_pos].parse().ok()?;
-    let stack_bucket: u32 = ps_segment[s_pos + 1..].parse().ok()?;
-
-    Some((prefix, pot_bucket, stack_bucket, actions))
-}
-
-/// Convert arena `Round` to street character for info set keys.
-fn round_to_street_char(round: &Round) -> char {
+/// Convert arena `Round` to numeric street for `InfoKey`.
+fn round_to_street_num(round: &Round) -> u8 {
     match round {
-        Round::Preflop => 'P',
-        Round::Flop => 'F',
-        Round::Turn => 'T',
-        Round::River => 'R',
-        _ => 'P', // Starting, Ante, Deal rounds default to preflop
+        Round::Preflop => 0,
+        Round::Flop => 1,
+        Round::Turn => 2,
+        Round::River => 3,
+        _ => 0, // Starting, Ante, Deal rounds default to preflop
     }
 }
 
@@ -707,24 +637,24 @@ fn sample_blueprint_action(
     AgentAction::AllIn
 }
 
-/// Convert an `AgentAction` to its info set key string representation.
+/// Convert an `AgentAction` to a 4-bit action code.
 ///
-/// Uses the same encoding as the game model's `write_action_to_buf`:
-/// `f`old, `x` (check), `c`all, `b{idx}`/`r{idx}` for sized bets, `bA`/`rA`
-/// for all-in. The `bet_sizes` slice maps pot-fraction sizes to indices.
-fn agent_action_to_key_str(
+/// Uses the same encoding as `encode_action` in `info_key`:
+/// 1=fold, 2=check, 3=call, 4-7=bet idx 0-3, 8-11=raise idx 0-3,
+/// 12=bet all-in, 13=raise all-in.
+fn agent_action_to_code(
     action: &AgentAction,
     game_state: &GameState,
     bet_sizes: &[f32],
-) -> String {
+) -> u8 {
     let to_call = game_state.current_round_bet()
         - game_state.round_data.player_bet[game_state.to_act_idx()];
     let is_bet = to_call <= 0.0;
 
     match action {
-        AgentAction::Fold => "f".to_string(),
+        AgentAction::Fold => 1, // fold
         AgentAction::Call => {
-            if is_bet { "x".to_string() } else { "c".to_string() }
+            if is_bet { 2 } else { 3 } // check or call
         }
         AgentAction::Bet(amount) => {
             let pot = game_state.total_pot;
@@ -747,12 +677,12 @@ fn agent_action_to_key_str(
                 .map(|(i, _)| i)
                 .unwrap_or(0);
 
-            let prefix = if is_bet { 'b' } else { 'r' };
-            format!("{prefix}{closest_idx}")
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = closest_idx.min(3) as u8;
+            if is_bet { 4 + idx } else { 8 + idx } // bet(idx) or raise(idx)
         }
         AgentAction::AllIn => {
-            let prefix = if is_bet { 'b' } else { 'r' };
-            format!("{prefix}A")
+            if is_bet { 12 } else { 13 } // bet all-in or raise all-in
         }
     }
 }
@@ -762,42 +692,6 @@ fn agent_action_to_key_str(
 mod tests {
     use super::*;
     use test_macros::timed_test;
-
-    #[timed_test]
-    fn canonical_hand_string_pair() {
-        let hand = [
-            Card::new(Value::Ace, Suit::Spade),
-            Card::new(Value::Ace, Suit::Heart),
-        ];
-        assert_eq!(canonical_hand_string(&hand), "AA");
-    }
-
-    #[timed_test]
-    fn canonical_hand_string_suited() {
-        let hand = [
-            Card::new(Value::Ace, Suit::Spade),
-            Card::new(Value::King, Suit::Spade),
-        ];
-        assert_eq!(canonical_hand_string(&hand), "AKs");
-    }
-
-    #[timed_test]
-    fn canonical_hand_string_offsuit() {
-        let hand = [
-            Card::new(Value::King, Suit::Heart),
-            Card::new(Value::Ace, Suit::Spade),
-        ];
-        assert_eq!(canonical_hand_string(&hand), "AKo");
-    }
-
-    #[timed_test]
-    fn canonical_hand_string_low_first() {
-        let hand = [
-            Card::new(Value::Two, Suit::Club),
-            Card::new(Value::Seven, Suit::Diamond),
-        ];
-        assert_eq!(canonical_hand_string(&hand), "72o");
-    }
 
     #[timed_test]
     fn extract_hole_cards_works() {
@@ -833,26 +727,11 @@ mod tests {
     }
 
     #[timed_test]
-    fn round_to_street_char_preflop() {
-        assert_eq!(round_to_street_char(&Round::Preflop), 'P');
-        assert_eq!(round_to_street_char(&Round::Flop), 'F');
-        assert_eq!(round_to_street_char(&Round::Turn), 'T');
-        assert_eq!(round_to_street_char(&Round::River), 'R');
-    }
-
-    #[timed_test]
-    fn value_to_char_all_values() {
-        // Just verify all values produce valid chars
-        let values = [
-            (Value::Two, '2'),
-            (Value::Three, '3'),
-            (Value::Ace, 'A'),
-            (Value::King, 'K'),
-            (Value::Ten, 'T'),
-        ];
-        for (v, expected) in values {
-            assert_eq!(value_to_char(v), expected);
-        }
+    fn round_to_street_num_maps_correctly() {
+        assert_eq!(round_to_street_num(&Round::Preflop), 0);
+        assert_eq!(round_to_street_num(&Round::Flop), 1);
+        assert_eq!(round_to_street_num(&Round::Turn), 2);
+        assert_eq!(round_to_street_num(&Round::River), 3);
     }
 
     #[timed_test]
@@ -1049,26 +928,6 @@ raise = 0.4
     }
 
     #[timed_test]
-    fn parse_info_set_key_valid() {
-        let key = "128|F|p11s2|b3r2r1";
-        let (prefix, pot, stack, actions) = parse_info_set_key(key).unwrap();
-        assert_eq!(prefix, "128|F");
-        assert_eq!(pot, 11);
-        assert_eq!(stack, 2);
-        assert_eq!(actions, "b3r2r1");
-    }
-
-    #[timed_test]
-    fn parse_info_set_key_preflop() {
-        let key = "AKs|P|p0s9|";
-        let (prefix, pot, stack, actions) = parse_info_set_key(key).unwrap();
-        assert_eq!(prefix, "AKs|P");
-        assert_eq!(pot, 0);
-        assert_eq!(stack, 9);
-        assert_eq!(actions, "");
-    }
-
-    #[timed_test]
     fn lookup_nearest_falls_back_to_uniform() {
         let blueprint = Arc::new(BlueprintStrategy::new());
         let config = BundleConfig {
@@ -1081,7 +940,9 @@ raise = 0.4
             abstraction_mode: "hand_class".to_string(),
         };
         let agent = BlueprintAgent::new(blueprint, config);
-        let probs = agent.lookup_nearest("128|F|p11s2|b3r2r1");
+        // An arbitrary key that won't be in the empty blueprint
+        let key = InfoKey::new(128, 1, 11, 2, &[7, 10, 9]).as_u64();
+        let probs = agent.lookup_nearest(key);
         // 4 bet sizes → fold + call + 4 bets + all-in = 7 actions
         assert_eq!(probs.len(), 7);
         let expected = 1.0 / 7.0;
@@ -1094,7 +955,8 @@ raise = 0.4
     fn lookup_nearest_finds_nearby_bucket() {
         let mut blueprint = BlueprintStrategy::new();
         // Insert a key with pot=10, stack=3
-        blueprint.insert("128|F|p10s3|b0".to_string(), vec![0.1, 0.2, 0.3, 0.15, 0.1, 0.05, 0.1]);
+        let stored_key = InfoKey::new(128, 1, 10, 3, &[4]).as_u64();
+        blueprint.insert(stored_key, vec![0.1, 0.2, 0.3, 0.15, 0.1, 0.05, 0.1]);
         let blueprint = Arc::new(blueprint);
         let config = BundleConfig {
             game: crate::game::PostflopConfig {
@@ -1107,7 +969,8 @@ raise = 0.4
         };
         let agent = BlueprintAgent::new(blueprint, config);
         // Look up with pot=11, stack=2 — should find nearby pot=10, stack=3 (distance 2)
-        let probs = agent.lookup_nearest("128|F|p11s2|b0");
+        let query_key = InfoKey::new(128, 1, 11, 2, &[4]).as_u64();
+        let probs = agent.lookup_nearest(query_key);
         assert_eq!(probs, vec![0.1, 0.2, 0.3, 0.15, 0.1, 0.05, 0.1]);
     }
 }

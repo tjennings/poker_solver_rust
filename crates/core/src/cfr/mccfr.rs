@@ -6,7 +6,7 @@
 //! This implementation uses **Chance Sampling**: we sample the initial card deal,
 //! then do full CFR traversal on the betting tree for that deal.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::game::{Game, Player};
 
@@ -31,9 +31,9 @@ fn normalize_strategy(sums: &[f64]) -> Option<Vec<f64>> {
 pub struct MccfrSolver<G: Game> {
     game: G,
     /// Cumulative regrets per info set
-    regret_sum: HashMap<String, Vec<f64>>,
+    regret_sum: FxHashMap<u64, Vec<f64>>,
     /// Cumulative strategy sums (for averaging)
-    strategy_sum: HashMap<String, Vec<f64>>,
+    strategy_sum: FxHashMap<u64, Vec<f64>>,
     /// Use CFR+ (floor regrets at 0)
     use_cfr_plus: bool,
     /// RNG state for sampling
@@ -80,8 +80,8 @@ impl<G: Game> MccfrSolver<G> {
     pub fn new(game: G) -> Self {
         Self {
             game,
-            regret_sum: HashMap::new(),
-            strategy_sum: HashMap::new(),
+            regret_sum: FxHashMap::default(),
+            strategy_sum: FxHashMap::default(),
             use_cfr_plus: true,
             rng_state: 0x1234_5678_9ABC_DEF0,
             iterations: 0,
@@ -95,8 +95,8 @@ impl<G: Game> MccfrSolver<G> {
     pub fn with_config(game: G, config: &MccfrConfig) -> Self {
         Self {
             game,
-            regret_sum: HashMap::new(),
-            strategy_sum: HashMap::new(),
+            regret_sum: FxHashMap::default(),
+            strategy_sum: FxHashMap::default(),
             use_cfr_plus: config.use_cfr_plus,
             rng_state: 0x1234_5678_9ABC_DEF0,
             iterations: 0,
@@ -219,8 +219,8 @@ impl<G: Game> MccfrSolver<G> {
 
     /// Returns the average strategy for an information set.
     #[must_use]
-    pub fn get_average_strategy(&self, info_set: &str) -> Option<Vec<f64>> {
-        self.strategy_sum.get(info_set).map(|sums| {
+    pub fn get_average_strategy(&self, info_set: u64) -> Option<Vec<f64>> {
+        self.strategy_sum.get(&info_set).map(|sums| {
             let total: f64 = sums.iter().sum();
             if total > 0.0 {
                 sums.iter().map(|&s| s / total).collect()
@@ -234,8 +234,8 @@ impl<G: Game> MccfrSolver<G> {
 
     /// Returns the current regret-matched strategy for an information set.
     #[must_use]
-    pub fn get_current_strategy(&self, info_set: &str, num_actions: usize) -> Vec<f64> {
-        if let Some(regrets) = self.regret_sum.get(info_set) {
+    pub fn get_current_strategy(&self, info_set: u64, num_actions: usize) -> Vec<f64> {
+        if let Some(regrets) = self.regret_sum.get(&info_set) {
             regret_match(regrets)
         } else {
             #[allow(clippy::cast_precision_loss)]
@@ -252,10 +252,10 @@ impl<G: Game> MccfrSolver<G> {
 
     /// Returns all info sets and their average strategies.
     #[must_use]
-    pub fn all_strategies(&self) -> HashMap<String, Vec<f64>> {
+    pub fn all_strategies(&self) -> FxHashMap<u64, Vec<f64>> {
         self.strategy_sum
             .keys()
-            .filter_map(|k| self.get_average_strategy(k).map(|s| (k.clone(), s)))
+            .filter_map(|&k| self.get_average_strategy(k).map(|s| (k, s)))
             .collect()
     }
 
@@ -265,21 +265,19 @@ impl<G: Game> MccfrSolver<G> {
     /// otherwise falls back to the current regret-matched strategy.
     /// This ensures checkpoints during the skip phase still show data.
     #[must_use]
-    pub fn all_strategies_best_effort(&self) -> HashMap<String, Vec<f64>> {
-        let mut result = HashMap::new();
+    pub fn all_strategies_best_effort(&self) -> FxHashMap<u64, Vec<f64>> {
+        let mut result = FxHashMap::default();
 
         // Average strategies (highest quality, only available after skip threshold)
-        for (k, s) in &self.strategy_sum {
+        for (&k, s) in &self.strategy_sum {
             if let Some(avg) = normalize_strategy(s) {
-                result.insert(k.clone(), avg);
+                result.insert(k, avg);
             }
         }
 
         // Fill gaps with regret-matched strategies
-        for (k, regrets) in &self.regret_sum {
-            result
-                .entry(k.clone())
-                .or_insert_with(|| regret_match(regrets));
+        for (&k, regrets) in &self.regret_sum {
+            result.entry(k).or_insert_with(|| regret_match(regrets));
         }
 
         result
@@ -311,7 +309,7 @@ impl<G: Game> MccfrSolver<G> {
         let info_set = self.game.info_set_key(state);
 
         // Get current strategy from regrets
-        let strategy = self.get_current_strategy(&info_set, num_actions);
+        let strategy = self.get_current_strategy(info_set, num_actions);
 
         if current_player == traversing_player {
             // Traversing player: explore all actions
@@ -351,7 +349,7 @@ impl<G: Game> MccfrSolver<G> {
 
             let regrets = self
                 .regret_sum
-                .entry(info_set.clone())
+                .entry(info_set)
                 .or_insert_with(|| vec![0.0; num_actions]);
 
             for i in 0..num_actions {
@@ -481,7 +479,7 @@ mod tests {
 
         solver.train(100, 10);
 
-        for info_set in solver.strategy_sum.keys() {
+        for &info_set in solver.strategy_sum.keys() {
             if let Some(strategy) = solver.get_average_strategy(info_set) {
                 let sum: f64 = strategy.iter().sum();
                 assert!(
@@ -494,22 +492,26 @@ mod tests {
 
     #[timed_test]
     fn mccfr_converges_on_kuhn() {
+        use crate::info_key::InfoKey;
+
         let game = KuhnPoker::new();
         let mut solver = MccfrSolver::new(game);
 
         // Train with full sampling (equivalent to vanilla but with CFR+)
         solver.train_full(10_000);
 
-        // King should always call when facing a bet
-        if let Some(strategy) = solver.get_average_strategy("Kb") {
+        // King (2) facing bet (4) → "Kb"
+        let kb = InfoKey::new(2, 0, 0, 0, &[4]).as_u64();
+        if let Some(strategy) = solver.get_average_strategy(kb) {
             assert!(
                 strategy[1] > 0.99,
                 "King should always call a bet, got {strategy:?}"
             );
         }
 
-        // Jack should always fold when facing a bet
-        if let Some(strategy) = solver.get_average_strategy("Jb") {
+        // Jack (0) facing bet (4) → "Jb"
+        let jb = InfoKey::new(0, 0, 0, 0, &[4]).as_u64();
+        if let Some(strategy) = solver.get_average_strategy(jb) {
             assert!(
                 strategy[0] > 0.99,
                 "Jack should always fold when facing a bet, got {strategy:?}"

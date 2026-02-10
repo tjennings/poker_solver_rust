@@ -10,6 +10,21 @@ use poker_solver_core::cfr::MccfrSolver;
 use poker_solver_core::game::{Game, HunlPreflop};
 use test_macros::timed_test;
 
+/// FNV-1a hash of an empty action history (offset basis masked to 44 bits).
+const EMPTY_HISTORY_HASH: u64 = 0xcbf2_9ce4_8422_2325_u64 & 0xFFF_FFFF_FFFF;
+
+/// Check if a u64 key represents an SB opening state.
+///
+/// HunlPreflop encodes: upper 20 bits = (position_bit << 19) | hand_idx,
+/// lower 44 bits = FNV hash of action history.
+fn is_sb_opening(key: u64) -> bool {
+    let hand_bits = (key >> 44) & 0xF_FFFF;
+    let history_hash = key & 0xFFF_FFFF_FFFF;
+    // SB: position bit (bit 19 of hand_bits) is clear
+    // Opening: action history is empty → hash equals the offset basis
+    hand_bits & (1 << 19) == 0 && history_hash == EMPTY_HISTORY_HASH
+}
+
 /// Test that MCCFR trains efficiently on HUNL Preflop.
 #[timed_test(10)]
 fn hunl_preflop_mccfr_trains_efficiently() {
@@ -33,7 +48,7 @@ fn hunl_preflop_mccfr_produces_valid_strategies() {
 
     let sb_strategies: Vec<_> = strategies
         .iter()
-        .filter(|(k, _)| k.starts_with("SB:") && k.ends_with(':'))
+        .filter(|(k, _)| is_sb_opening(**k))
         .collect();
 
     assert!(
@@ -45,7 +60,7 @@ fn hunl_preflop_mccfr_produces_valid_strategies() {
         let sum: f64 = probs.iter().sum();
         assert!(
             (sum - 1.0).abs() < 1e-6,
-            "Strategy for {info_set} should sum to 1.0, got {sum}"
+            "Strategy for {info_set:#018x} should sum to 1.0, got {sum}"
         );
 
         for &p in probs.iter() {
@@ -61,18 +76,27 @@ fn hunl_preflop_mccfr_produces_valid_strategies() {
 #[timed_test(10)]
 fn hunl_preflop_premium_hands_strategies() {
     let game = HunlPreflop::with_stack(5);
-    let mut solver = MccfrSolver::new(game);
+    let mut solver = MccfrSolver::new(game.clone());
 
     solver.train(2, 3);
 
-    if let Some(strategy) = solver.get_average_strategy("SB:AA:") {
-        println!("AA opening strategy: {strategy:?}");
-        assert!(!strategy.is_empty(), "AA should have actions");
-    }
+    // Build opening key for a hand: (hand_idx << 44) | EMPTY_HISTORY_HASH
+    // Use the game itself to get the correct key for a known state
+    let states = game.initial_states();
 
-    if let Some(strategy) = solver.get_average_strategy("SB:72o:") {
-        println!("72o opening strategy: {strategy:?}");
-        assert!(!strategy.is_empty(), "72o should have actions");
+    // Find a state where SB has AA (hand index 0 = AA in CanonicalHand)
+    let aa_state = states.iter().find(|s| {
+        let key = game.info_set_key(s);
+        let hand_idx = (key >> 44) & 0x7_FFFF; // mask out position bit
+        hand_idx == 0 // AA = index 0
+    });
+
+    if let Some(state) = aa_state {
+        let key = game.info_set_key(state);
+        if let Some(strategy) = solver.get_average_strategy(key) {
+            println!("AA opening strategy: {strategy:?}");
+            assert!(!strategy.is_empty(), "AA should have actions");
+        }
     }
 }
 

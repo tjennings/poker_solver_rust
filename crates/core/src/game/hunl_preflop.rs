@@ -81,7 +81,7 @@ enum ActionRecord {
     Fold,
     Check,
     Call,
-    Raise(u32), // Raise to amount in BB (as integer for consistent keys)
+    Raise(u32), // Raise to amount in cents (used in info set key hashing)
 }
 
 /// Type of terminal state.
@@ -340,25 +340,31 @@ impl Game for HunlPreflop {
         }
     }
 
-    fn info_set_key(&self, state: &Self::State) -> String {
-        let (hand, position) = match state.to_act {
-            Some(Player::Player1) => (state.sb_hand, "SB"),
-            Some(Player::Player2) => (state.bb_hand, "BB"),
-            None => (state.sb_hand, "?"), // Shouldn't happen for info set lookup
+    fn info_set_key(&self, state: &Self::State) -> u64 {
+        let (hand, position_bit) = match state.to_act {
+            Some(Player::Player2) => (state.bb_hand, 1u64),
+            Some(Player::Player1) | None => (state.sb_hand, 0u64),
         };
 
-        let history_str: String = state
-            .history
-            .iter()
-            .map(|a| match a {
-                ActionRecord::Fold => "f".to_string(),
-                ActionRecord::Check => "x".to_string(),
-                ActionRecord::Call => "c".to_string(),
-                ActionRecord::Raise(amt) => format!("r{amt}"),
-            })
-            .collect();
+        // Upper 20 bits: hand index + position
+        #[allow(clippy::cast_possible_truncation)]
+        let hand_idx = hand.index() as u64;
+        let upper = ((position_bit << 19) | hand_idx) << 44;
 
-        format!("{position}:{hand}:{history_str}")
+        // Lower 44 bits: FNV-1a hash of action history (including raise amounts)
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+        for action in &state.history {
+            let val = match action {
+                ActionRecord::Fold => 1u64,
+                ActionRecord::Check => 2,
+                ActionRecord::Call => 3,
+                ActionRecord::Raise(amt) => 0x1000_0000 | u64::from(*amt),
+            };
+            hash ^= val;
+            hash = hash.wrapping_mul(0x0100_0000_01b3); // FNV prime
+        }
+
+        upper | (hash & 0xFFF_FFFF_FFFF) // Mask to 44 bits
     }
 }
 
@@ -476,16 +482,14 @@ mod tests {
     }
 
     #[timed_test]
-    fn info_set_includes_hand_and_history() {
+    fn info_set_key_changes_after_action() {
         let game = create_game();
         let states = game.initial_states();
         let state = &states[0];
 
         let info_set = game.info_set_key(state);
-        assert!(info_set.starts_with("SB:"));
-        assert!(info_set.contains(':')); // Has hand component
 
-        // After an action, history should be included
+        // After an action, key should change (different player, different actions)
         let actions = game.actions(state);
         let raise = actions
             .iter()
@@ -494,8 +498,10 @@ mod tests {
         let after_raise = game.next_state(state, *raise);
 
         let info_set2 = game.info_set_key(&after_raise);
-        assert!(info_set2.starts_with("BB:"));
-        assert!(info_set2.contains(":r")); // Contains raise history
+        assert_ne!(
+            info_set, info_set2,
+            "Key should change after raise"
+        );
     }
 
     #[timed_test]

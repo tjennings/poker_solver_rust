@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::game::{Game, Player};
 
@@ -11,9 +11,9 @@ use super::regret::regret_match;
 pub struct VanillaCfr<G: Game> {
     game: G,
     /// Cumulative regrets per info set: `info_set_key` -> regrets per action
-    regret_sum: HashMap<String, Vec<f64>>,
+    regret_sum: FxHashMap<u64, Vec<f64>>,
     /// Cumulative strategy sums per info set (for averaging)
-    strategy_sum: HashMap<String, Vec<f64>>,
+    strategy_sum: FxHashMap<u64, Vec<f64>>,
 }
 
 impl<G: Game> VanillaCfr<G> {
@@ -22,8 +22,8 @@ impl<G: Game> VanillaCfr<G> {
     pub fn new(game: G) -> Self {
         Self {
             game,
-            regret_sum: HashMap::new(),
-            strategy_sum: HashMap::new(),
+            regret_sum: FxHashMap::default(),
+            strategy_sum: FxHashMap::default(),
         }
     }
 
@@ -40,8 +40,8 @@ impl<G: Game> VanillaCfr<G> {
 
     /// Returns the average strategy for an information set.
     #[must_use]
-    pub fn get_average_strategy(&self, info_set: &str) -> Option<Vec<f64>> {
-        self.strategy_sum.get(info_set).map(|sums| {
+    pub fn get_average_strategy(&self, info_set: u64) -> Option<Vec<f64>> {
+        self.strategy_sum.get(&info_set).map(|sums| {
             let total: f64 = sums.iter().sum();
             if total > 0.0 {
                 sums.iter().map(|&s| s / total).collect()
@@ -73,7 +73,7 @@ impl<G: Game> VanillaCfr<G> {
         let info_set = self.game.info_set_key(state);
 
         // Get current strategy from regrets
-        let strategy = self.get_strategy(&info_set, num_actions);
+        let strategy = self.get_strategy(info_set, num_actions);
 
         // Compute utility for each action
         let mut action_utils = vec![0.0; num_actions];
@@ -105,7 +105,7 @@ impl<G: Game> VanillaCfr<G> {
 
             let regrets = self
                 .regret_sum
-                .entry(info_set.clone())
+                .entry(info_set)
                 .or_insert_with(|| vec![0.0; num_actions]);
 
             for i in 0..num_actions {
@@ -131,8 +131,8 @@ impl<G: Game> VanillaCfr<G> {
     }
 
     /// Gets the current strategy for an information set using regret matching.
-    fn get_strategy(&self, info_set: &str, num_actions: usize) -> Vec<f64> {
-        if let Some(regrets) = self.regret_sum.get(info_set) {
+    fn get_strategy(&self, info_set: u64, num_actions: usize) -> Vec<f64> {
+        if let Some(regrets) = self.regret_sum.get(&info_set) {
             regret_match(regrets)
         } else {
             #[allow(clippy::cast_precision_loss)]
@@ -146,6 +146,7 @@ impl<G: Game> VanillaCfr<G> {
 mod tests {
     use super::*;
     use crate::game::KuhnPoker;
+    use crate::info_key::InfoKey;
     use test_macros::timed_test;
 
     #[timed_test]
@@ -165,13 +166,13 @@ mod tests {
         solver.train(10);
 
         // Should have info sets for each card at each decision point
-        // J, Q, K at root (3)
-        // Jc, Qc, Kc after check (3)
-        // Jb, Qb, Kb after bet (3)
-        // Jcb, Qcb, Kcb after check-bet (3)
         assert!(!solver.strategy_sum.is_empty());
-        assert!(solver.strategy_sum.contains_key("K"));
-        assert!(solver.strategy_sum.contains_key("Jc"));
+        // K at root
+        let k = InfoKey::new(2, 0, 0, 0, &[]).as_u64();
+        assert!(solver.strategy_sum.contains_key(&k));
+        // J after check (Jc)
+        let jc = InfoKey::new(0, 0, 0, 0, &[2]).as_u64();
+        assert!(solver.strategy_sum.contains_key(&jc));
     }
 
     #[timed_test]
@@ -181,7 +182,7 @@ mod tests {
 
         solver.train(100);
 
-        for info_set in solver.strategy_sum.keys() {
+        for &info_set in solver.strategy_sum.keys() {
             if let Some(strategy) = solver.get_average_strategy(info_set) {
                 let sum: f64 = strategy.iter().sum();
                 assert!(
@@ -199,11 +200,9 @@ mod tests {
 
         solver.train(10_000);
 
-        // With King, should never fold when facing a bet
-        // K at root can check or bet - betting is optimal
-        if let Some(strategy) = solver.get_average_strategy("K") {
-            // strategy[0] = check, strategy[1] = bet
-            // King should bet with high frequency
+        // K at root: check or bet — betting is optimal
+        let k = InfoKey::new(2, 0, 0, 0, &[]).as_u64();
+        if let Some(strategy) = solver.get_average_strategy(k) {
             assert!(
                 strategy[1] > 0.5,
                 "King should bet frequently, got {strategy:?}"
@@ -211,8 +210,8 @@ mod tests {
         }
 
         // Kb = King facing bet, should always call
-        if let Some(strategy) = solver.get_average_strategy("Kb") {
-            // strategy[0] = fold, strategy[1] = call
+        let kb = InfoKey::new(2, 0, 0, 0, &[4]).as_u64();
+        if let Some(strategy) = solver.get_average_strategy(kb) {
             assert!(
                 strategy[1] > 0.99,
                 "King should always call a bet, got {strategy:?}"

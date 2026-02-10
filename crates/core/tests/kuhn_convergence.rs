@@ -1,12 +1,25 @@
 //! Integration tests for Kuhn Poker CFR convergence to Nash equilibrium.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use poker_solver_core::{
     cfr::{VanillaCfr, calculate_exploitability},
     game::KuhnPoker,
+    info_key::InfoKey,
 };
 use test_macros::timed_test;
+
+/// Build a u64 key for a Kuhn Poker info set.
+///
+/// `card`: J=0, Q=1, K=2
+/// `actions`: slice of action chars — 'c'=check, 'b'=bet, 'f'=fold, 'l'=call
+fn kuhn_key(card: u32, actions: &[u8]) -> u64 {
+    InfoKey::new(card, 0, 0, 0, actions).as_u64()
+}
+
+// Kuhn action codes matching kuhn.rs encoding
+const CHECK: u8 = 2;
+const BET: u8 = 4;
 
 /// Test that CFR converges to near-Nash equilibrium on Kuhn Poker.
 ///
@@ -41,8 +54,8 @@ fn kuhn_nash_strategy_properties() {
 
     solver.train(10_000);
 
-    // King should always call when facing a bet
-    if let Some(strategy) = solver.get_average_strategy("Kb") {
+    // King should always call when facing a bet (Kb)
+    if let Some(strategy) = solver.get_average_strategy(kuhn_key(2, &[BET])) {
         assert!(
             strategy[1] > 0.95,
             "King should always call a bet, got fold={:.4}, call={:.4}",
@@ -51,8 +64,8 @@ fn kuhn_nash_strategy_properties() {
         );
     }
 
-    // King should always call after check-bet
-    if let Some(strategy) = solver.get_average_strategy("Kcb") {
+    // King should always call after check-bet (Kcb)
+    if let Some(strategy) = solver.get_average_strategy(kuhn_key(2, &[CHECK, BET])) {
         assert!(
             strategy[1] > 0.95,
             "King should always call after check-bet, got fold={:.4}, call={:.4}",
@@ -62,7 +75,7 @@ fn kuhn_nash_strategy_properties() {
     }
 
     // Jack should always fold when facing a bet (Jb)
-    if let Some(strategy) = solver.get_average_strategy("Jb") {
+    if let Some(strategy) = solver.get_average_strategy(kuhn_key(0, &[BET])) {
         assert!(
             strategy[0] > 0.95,
             "Jack should always fold when facing a bet, got fold={:.4}, call={:.4}",
@@ -72,7 +85,7 @@ fn kuhn_nash_strategy_properties() {
     }
 
     // Jack should always fold after check-bet (Jcb)
-    if let Some(strategy) = solver.get_average_strategy("Jcb") {
+    if let Some(strategy) = solver.get_average_strategy(kuhn_key(0, &[CHECK, BET])) {
         assert!(
             strategy[0] > 0.95,
             "Jack should always fold after check-bet, got fold={:.4}, call={:.4}",
@@ -119,14 +132,31 @@ fn exploitability_decreases_over_training() {
     );
 }
 
-/// Helper to extract average strategy from solver
-fn extract_strategy(solver: &VanillaCfr<KuhnPoker>) -> HashMap<String, Vec<f64>> {
-    let info_sets = [
-        "J", "Q", "K", "Jc", "Qc", "Kc", "Jb", "Qb", "Kb", "Jcb", "Qcb", "Kcb",
+/// Helper to extract average strategy from solver.
+///
+/// Returns the 12 Kuhn info sets as a FxHashMap with u64 keys.
+fn extract_strategy(solver: &VanillaCfr<KuhnPoker>) -> FxHashMap<u64, Vec<f64>> {
+    // (card, actions) for all 12 Kuhn info sets
+    let info_sets: [(u32, &[u8]); 12] = [
+        (0, &[]),             // J
+        (1, &[]),             // Q
+        (2, &[]),             // K
+        (0, &[CHECK]),        // Jc
+        (1, &[CHECK]),        // Qc
+        (2, &[CHECK]),        // Kc
+        (0, &[BET]),          // Jb
+        (1, &[BET]),          // Qb
+        (2, &[BET]),          // Kb
+        (0, &[CHECK, BET]),   // Jcb
+        (1, &[CHECK, BET]),   // Qcb
+        (2, &[CHECK, BET]),   // Kcb
     ];
 
     info_sets
         .iter()
-        .filter_map(|&is| solver.get_average_strategy(is).map(|s| (is.to_string(), s)))
+        .filter_map(|(card, actions)| {
+            let key = kuhn_key(*card, actions);
+            solver.get_average_strategy(key).map(|s| (key, s))
+        })
         .collect()
 }

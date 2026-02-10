@@ -185,8 +185,8 @@ mod tests {
     fn bundle_roundtrip_save_load() {
         let config = create_test_config();
         let mut blueprint = BlueprintStrategy::new();
-        blueprint.insert("AK|P|".to_string(), vec![0.3, 0.7]);
-        blueprint.insert("QQ|P|r50".to_string(), vec![0.1, 0.4, 0.5]);
+        blueprint.insert(100, vec![0.3, 0.7]);
+        blueprint.insert(200, vec![0.1, 0.4, 0.5]);
         blueprint.set_iterations(1000);
         let boundaries = create_test_boundaries();
 

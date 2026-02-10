@@ -20,8 +20,8 @@ pub enum BlueprintError {
     CacheError(String),
 
     /// Information set not found in strategy
-    #[error("Information set not found: {0}")]
-    InfoSetNotFound(String),
+    #[error("Information set not found: {0:#018x}")]
+    InfoSetNotFound(u64),
 }
 
 impl From<std::io::Error> for BlueprintError {
@@ -78,13 +78,13 @@ mod tests {
 
     #[timed_test]
     fn info_set_not_found_error_displays_message() {
-        let err = BlueprintError::InfoSetNotFound("AKs:r/c/r".to_string());
+        let err = BlueprintError::InfoSetNotFound(0x0000_DEAD_BEEF_CAFE);
         let msg = err.to_string();
         assert!(
             msg.contains("Information set not found"),
             "should contain error type"
         );
-        assert!(msg.contains("AKs:r/c/r"), "should contain info set key");
+        assert!(msg.contains("deadbeefcafe"), "should contain hex key: {msg}");
     }
 
     #[timed_test]

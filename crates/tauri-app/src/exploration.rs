@@ -17,6 +17,7 @@ use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint::{BundleConfig, StrategyBundle};
 use poker_solver_core::hand_class::classify;
 use poker_solver_core::hands::CanonicalHand;
+use poker_solver_core::info_key::{canonical_hand_index, cards_from_rank_chars, InfoKey};
 use poker_solver_core::poker::{Card, Suit, Value};
 
 /// Event payload for bucket computation progress.
@@ -258,7 +259,7 @@ fn get_strategy_matrix_bundle(
 ) -> Result<StrategyMatrix, String> {
     let board = parse_board(&position.board)?;
     let street = street_from_board_len(board.len())?;
-    let history_str = build_history_string(&position.history);
+    let action_codes = build_action_codes(&position.history);
     let use_hand_class = config.abstraction_mode == "hand_class";
 
     let ranks = RANKS;
@@ -288,7 +289,7 @@ fn get_strategy_matrix_bundle(
                     blueprint,
                     &board,
                     street,
-                    &history_str,
+                    &action_codes,
                     pos_state.pot,
                     pos_state.eff_stack,
                     rank1,
@@ -301,7 +302,7 @@ fn get_strategy_matrix_bundle(
                     blueprint,
                     &board,
                     street,
-                    &history_str,
+                    &action_codes,
                     pos_state.pot,
                     pos_state.eff_stack,
                     rank1,
@@ -722,31 +723,45 @@ fn street_from_board_len(len: usize) -> Result<Street, String> {
     }
 }
 
-fn build_history_string(history: &[String]) -> String {
-    history.iter().map(|a| action_to_key_char(a)).collect()
+/// Convert history action strings to 4-bit action codes for `InfoKey`.
+fn build_action_codes(history: &[String]) -> Vec<u8> {
+    history.iter().map(|a| action_to_code(a)).collect()
 }
 
-/// Convert a history action string to its info-set key representation.
+/// Convert a history action string to a 4-bit action code.
 ///
-/// History entries like `"bet:0"`, `"raise:A"`, `"call"` are mapped to
-/// the same format used by `write_action_to_buf`: `b0`, `rA`, `c`, etc.
-fn action_to_key_char(action: &str) -> String {
+/// Matches `encode_action` from `info_key`:
+/// 1=fold, 2=check, 3=call, 4-7=bet idx 0-3, 8-11=raise idx 0-3,
+/// 12=bet all-in, 13=raise all-in.
+fn action_to_code(action: &str) -> u8 {
     if action == "f" || action == "fold" {
-        "f".to_string()
+        1
     } else if action == "x" || action == "check" {
-        "x".to_string()
+        2
     } else if action == "c" || action == "call" {
-        "c".to_string()
-    } else if let Some(idx) = action.strip_prefix("bet:") {
-        format!("b{idx}")
-    } else if let Some(idx) = action.strip_prefix("raise:") {
-        format!("r{idx}")
-    } else if let Some(idx) = action.strip_prefix("b:") {
-        format!("b{idx}")
-    } else if let Some(idx) = action.strip_prefix("r:") {
-        format!("r{idx}")
+        3
+    } else if let Some(idx_str) = action
+        .strip_prefix("bet:")
+        .or_else(|| action.strip_prefix("b:"))
+    {
+        if idx_str == "A" {
+            12 // bet all-in
+        } else {
+            let idx: u8 = idx_str.parse().unwrap_or(0);
+            4 + idx.min(3) // bet(idx)
+        }
+    } else if let Some(idx_str) = action
+        .strip_prefix("raise:")
+        .or_else(|| action.strip_prefix("r:"))
+    {
+        if idx_str == "A" {
+            13 // raise all-in
+        } else {
+            let idx: u8 = idx_str.parse().unwrap_or(0);
+            8 + idx.min(3) // raise(idx)
+        }
     } else {
-        action.to_string()
+        0 // unknown → empty
     }
 }
 
@@ -919,7 +934,7 @@ fn get_hand_strategy(
     blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
     _board: &[Card],
     street: Street,
-    history_str: &str,
+    action_codes: &[u8],
     pot: u32,
     eff_stack: u32,
     rank1: char,
@@ -928,8 +943,8 @@ fn get_hand_strategy(
     actions: &[ActionInfo],
     bucket_cache: Option<&std::collections::HashMap<(char, char, bool), u16>>,
 ) -> Result<Vec<ActionProb>, String> {
-    let bucket_or_hand = if street == Street::Preflop {
-        canonical_hand_string(rank1, rank2, suited)
+    let hand_bits: u32 = if street == Street::Preflop {
+        hand_bits_from_ranks(rank1, rank2, suited)
     } else {
         let cache = bucket_cache.ok_or_else(|| {
             format!(
@@ -940,28 +955,19 @@ fn get_hand_strategy(
         let &bucket = cache.get(&(rank1, rank2, suited)).ok_or_else(|| {
             format!("No bucket in cache for hand ({rank1}, {rank2}, suited={suited})")
         })?;
-        bucket.to_string()
+        u32::from(bucket)
     };
 
-    let street_char = match street {
-        Street::Preflop => 'P',
-        Street::Flop => 'F',
-        Street::Turn => 'T',
-        Street::River => 'R',
-    };
-
-    // Pot/stack buckets (10 BB intervals, matching game model).
-    // 1 BB = 2 pot-units, 10 BB = 20 pot-units.
-    // Stacks ≈ BB, so 10 BB = 10 stack-units.
+    let street_num = street_to_num(street);
     let pot_bucket = pot / 20;
-    let stack_bucket = eff_stack / 10;
+    let stack_bucket = eff_stack / 20;
 
     let info_set_key =
-        format!("{bucket_or_hand}|{street_char}|p{pot_bucket}s{stack_bucket}|{history_str}");
+        InfoKey::new(hand_bits, street_num, pot_bucket, stack_bucket, action_codes).as_u64();
 
-    let probs = blueprint.lookup(&info_set_key).ok_or_else(|| {
+    let probs = blueprint.lookup(info_set_key).ok_or_else(|| {
         format!(
-            "Blueprint lookup failed for key '{info_set_key}' \
+            "Blueprint lookup failed for key {info_set_key:#018x} \
              (blueprint has {} info sets)",
             blueprint.len()
         )
@@ -985,7 +991,7 @@ fn get_hand_strategy_hand_class(
     blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
     board: &[Card],
     street: Street,
-    history_str: &str,
+    action_codes: &[u8],
     pot: u32,
     eff_stack: u32,
     rank1: char,
@@ -993,32 +999,26 @@ fn get_hand_strategy_hand_class(
     suited: bool,
     actions: &[ActionInfo],
 ) -> Result<Vec<ActionProb>, String> {
-    let bucket_or_hand = if street == Street::Preflop {
-        canonical_hand_string(rank1, rank2, suited)
+    let hand_bits: u32 = if street == Street::Preflop {
+        hand_bits_from_ranks(rank1, rank2, suited)
     } else {
         let (card1, card2) = make_representative_hand(rank1, rank2, suited, board);
         match classify([card1, card2], board) {
-            Ok(classification) => classification.bits().to_string(),
-            Err(_) => "?".to_string(),
+            Ok(classification) => classification.bits(),
+            Err(_) => 0,
         }
     };
 
-    let street_char = match street {
-        Street::Preflop => 'P',
-        Street::Flop => 'F',
-        Street::Turn => 'T',
-        Street::River => 'R',
-    };
-
+    let street_num = street_to_num(street);
     let pot_bucket = pot / 20;
-    let stack_bucket = eff_stack / 10;
+    let stack_bucket = eff_stack / 20;
 
     let info_set_key =
-        format!("{bucket_or_hand}|{street_char}|p{pot_bucket}s{stack_bucket}|{history_str}");
+        InfoKey::new(hand_bits, street_num, pot_bucket, stack_bucket, action_codes).as_u64();
 
-    let probs = blueprint.lookup(&info_set_key).ok_or_else(|| {
+    let probs = blueprint.lookup(info_set_key).ok_or_else(|| {
         format!(
-            "Blueprint lookup failed for key '{info_set_key}' \
+            "Blueprint lookup failed for key {info_set_key:#018x} \
              (blueprint has {} info sets)",
             blueprint.len()
         )
@@ -1034,30 +1034,22 @@ fn get_hand_strategy_hand_class(
         .collect())
 }
 
-/// Build canonical hand notation from rank chars and suited flag.
-///
-/// Ranks are ordered high-to-low to match the blueprint key format
-/// produced by `write_canonical_hand` in the game module.
-fn canonical_hand_string(rank1: char, rank2: char, suited: bool) -> String {
-    let rank_order = |c: char| match c {
-        'A' => 14,
-        'K' => 13,
-        'Q' => 12,
-        'J' => 11,
-        'T' => 10,
-        _ => c.to_digit(10).unwrap_or(0),
-    };
-    let (high, low) = if rank_order(rank1) >= rank_order(rank2) {
-        (rank1, rank2)
+/// Compute hand bits from rank characters and suited flag for `InfoKey`.
+fn hand_bits_from_ranks(rank1: char, rank2: char, suited: bool) -> u32 {
+    if let Some(cards) = cards_from_rank_chars(rank1, rank2, suited) {
+        u32::from(canonical_hand_index(cards))
     } else {
-        (rank2, rank1)
-    };
-    if high == low {
-        format!("{high}{low}")
-    } else if suited {
-        format!("{high}{low}s")
-    } else {
-        format!("{high}{low}o")
+        0
+    }
+}
+
+/// Convert a `Street` to numeric encoding for `InfoKey`.
+fn street_to_num(street: Street) -> u8 {
+    match street {
+        Street::Preflop => 0,
+        Street::Flop => 1,
+        Street::Turn => 2,
+        Street::River => 3,
     }
 }
 

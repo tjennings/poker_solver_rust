@@ -11,6 +11,7 @@ use poker_solver_core::blueprint::{BlueprintStrategy, BundleConfig, StrategyBund
 use poker_solver_core::cfr::{MccfrConfig, MccfrSolver};
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
 use poker_solver_core::game::{AbstractionMode, Action, HunlPostflop, PostflopConfig};
+use poker_solver_core::info_key::{canonical_hand_index_from_str, InfoKey};
 use serde::Deserialize;
 
 #[derive(Parser)]
@@ -434,16 +435,21 @@ fn print_checkpoint(
     let stack_bucket = (ctx.stack_depth * 2 - 2) / 20;
 
     for &hand in DISPLAY_HANDS {
-        let info_key = format!("{hand}|P|p{pot_bucket}s{stack_bucket}|");
-        if let Some(probs) = strategies.get(&info_key) {
-            let prob_cols: String = probs
-                .iter()
-                .take(ctx.action_labels.len())
-                .map(|p| format!("{:>6.2}", p))
-                .collect();
-            println!("{:<6}|{prob_cols}", hand);
+        if let Some(hand_idx) = canonical_hand_index_from_str(hand) {
+            let info_key =
+                InfoKey::new(u32::from(hand_idx), 0, pot_bucket, stack_bucket, &[]).as_u64();
+            if let Some(probs) = strategies.get(&info_key) {
+                let prob_cols: String = probs
+                    .iter()
+                    .take(ctx.action_labels.len())
+                    .map(|p| format!("{:>6.2}", p))
+                    .collect();
+                println!("{:<6}|{prob_cols}", hand);
+            } else {
+                println!("{:<6}|  (no data)", hand);
+            }
         } else {
-            println!("{:<6}|  (no data)", hand);
+            println!("{:<6}|  (invalid hand)", hand);
         }
     }
     println!();

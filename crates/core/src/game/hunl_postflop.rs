@@ -10,8 +10,8 @@ use arrayvec::ArrayVec;
 use serde::{Deserialize, Serialize};
 
 use crate::abstraction::{CardAbstraction, Street};
-use crate::hand_class::classify;
-use crate::poker::{Card, Hand, Rankable, Suit, Value};
+use crate::hand_class::{HandClassification, classify};
+use crate::poker::{Card, Hand, Rank, Rankable, Suit, Value};
 
 use super::{Action, Actions, Game, Player, ALL_IN};
 
@@ -98,6 +98,14 @@ pub struct PostflopState {
     pub terminal: Option<TerminalType>,
     /// Number of bets/raises on the current street
     pub street_bets: u8,
+    /// Cached 7-card hand rank for P1 (pre-computed at deal time when `full_board` is set)
+    pub cached_p1_rank: Option<Rank>,
+    /// Cached 7-card hand rank for P2 (pre-computed at deal time when `full_board` is set)
+    pub cached_p2_rank: Option<Rank>,
+    /// Cached hand classification for P1 (updated on street advance)
+    pub cached_p1_class: Option<HandClassification>,
+    /// Cached hand classification for P2 (updated on street advance)
+    pub cached_p2_class: Option<HandClassification>,
 }
 
 impl PostflopState {
@@ -126,6 +134,10 @@ impl PostflopState {
             history: ArrayVec::new(),
             terminal: None,
             street_bets: 1, // BB's post counts as first bet
+            cached_p1_rank: None,
+            cached_p2_rank: None,
+            cached_p1_class: None,
+            cached_p2_class: None,
         }
     }
 
@@ -171,8 +183,25 @@ impl PostflopState {
     ) -> Self {
         let mut state = Self::new_preflop(p1_holding, p2_holding, stack_depth_bb);
         state.full_board = Some(full_board);
+
+        // Pre-compute final hand ranks (7 cards = 2 hole + 5 board)
+        state.cached_p1_rank = Some(rank_7cards(p1_holding, &full_board));
+        state.cached_p2_rank = Some(rank_7cards(p2_holding, &full_board));
+
         state
     }
+}
+
+/// Build a 7-card hand and rank it.
+fn rank_7cards(holding: [Card; 2], board: &[Card; 5]) -> Rank {
+    let mut hand = Hand::default();
+    for &c in board {
+        hand.insert(c);
+    }
+    for &c in &holding {
+        hand.insert(c);
+    }
+    hand.rank()
 }
 
 /// Full HUNL game including postflop streets.
@@ -470,6 +499,12 @@ impl HunlPostflop {
                 state.to_act = None;
             }
         }
+
+        // Cache hand classifications after board cards change (used in info_set_key)
+        if !state.board.is_empty() && state.terminal.is_none() {
+            state.cached_p1_class = classify(state.p1_holding, &state.board).ok();
+            state.cached_p2_class = classify(state.p2_holding, &state.board).ok();
+        }
     }
 }
 
@@ -649,24 +684,19 @@ impl Game for HunlPostflop {
             TerminalType::Showdown => {
                 use std::cmp::Ordering;
 
-                // Build 7-card hands for evaluation
-                let mut p1_hand = Hand::default();
-                for &card in &state.board {
-                    p1_hand.insert(card);
-                }
-                for &card in &state.p1_holding {
-                    p1_hand.insert(card);
-                }
-                let p1_rank = p1_hand.rank();
-
-                let mut p2_hand = Hand::default();
-                for &card in &state.board {
-                    p2_hand.insert(card);
-                }
-                for &card in &state.p2_holding {
-                    p2_hand.insert(card);
-                }
-                let p2_rank = p2_hand.rank();
+                // Use cached ranks if available, otherwise compute
+                let p1_rank = state.cached_p1_rank.unwrap_or_else(|| {
+                    let mut h = Hand::default();
+                    for &c in &state.board { h.insert(c); }
+                    for &c in &state.p1_holding { h.insert(c); }
+                    h.rank()
+                });
+                let p2_rank = state.cached_p2_rank.unwrap_or_else(|| {
+                    let mut h = Hand::default();
+                    for &c in &state.board { h.insert(c); }
+                    for &c in &state.p2_holding { h.insert(c); }
+                    h.rank()
+                });
 
                 let pot_bb = to_bb(p1_invested + p2_invested);
 
@@ -695,150 +725,53 @@ impl Game for HunlPostflop {
         }
     }
 
-    fn info_set_key(&self, state: &Self::State) -> String {
-        let mut buf = String::with_capacity(32);
-        self.info_set_key_into(state, &mut buf);
-        buf
-    }
-
-    fn info_set_key_into(&self, state: &Self::State, buf: &mut String) {
-        use std::fmt::Write;
-        buf.clear();
+    fn info_set_key(&self, state: &Self::State) -> u64 {
+        use crate::info_key::{InfoKey, canonical_hand_index, encode_action};
 
         let holding = state.current_holding();
 
-        // Get bucket if abstraction available, otherwise use card chars
-        match &self.abstraction {
+        // Get hand/bucket bits
+        let hand_bits = match &self.abstraction {
             Some(AbstractionMode::Ehs2(abstraction)) if !state.board.is_empty() => {
                 match abstraction.get_bucket(&state.board, (holding[0], holding[1])) {
-                    Ok(b) => {
-                        let _ = write!(buf, "{b}");
-                    }
-                    Err(_) => buf.push('?'),
+                    Ok(b) => u32::from(b),
+                    Err(_) => 0,
                 }
             }
             Some(AbstractionMode::HandClass) if !state.board.is_empty() => {
-                match classify(holding, &state.board) {
-                    Ok(classification) => {
-                        let _ = write!(buf, "{}", classification.bits());
-                    }
-                    Err(_) => buf.push('?'),
-                }
+                // Use cached classification if available
+                let cached = match state.to_act {
+                    Some(Player::Player2) => state.cached_p2_class,
+                    _ => state.cached_p1_class,
+                };
+                cached.map_or_else(
+                    || classify(holding, &state.board).map_or(0, HandClassification::bits),
+                    HandClassification::bits,
+                )
             }
-            _ => {
-                write_canonical_hand(holding, buf);
-            }
-        }
-
-        let street_char = match state.street {
-            Street::Preflop => 'P',
-            Street::Flop => 'F',
-            Street::Turn => 'T',
-            Street::River => 'R',
+            _ => u32::from(canonical_hand_index(holding)),
         };
 
-        buf.push('|');
-        buf.push(street_char);
-        buf.push('|');
+        let street_code = match state.street {
+            Street::Preflop => 0u8,
+            Street::Flop => 1,
+            Street::Turn => 2,
+            Street::River => 3,
+        };
 
-        // Pot and stack are both in internal units (1 BB = 2 units).
-        // Divide by 20 for 10-BB-interval buckets.
         let pot_bucket = state.pot / 20;
         let eff_stack = state.stacks[0].min(state.stacks[1]);
         let stack_bucket = eff_stack / 20;
-        let _ = write!(buf, "p{pot_bucket}s{stack_bucket}|");
 
-        // Only include current-street actions in the info set key.
-        // Prior-street actions are reflected in the pot/stack buckets above.
+        // Encode current-street actions only
+        let mut action_codes = arrayvec::ArrayVec::<u8, 8>::new();
         for (street, a) in &state.history {
-            if *street == state.street {
-                write_action_to_buf(*a, buf);
+            if *street == state.street && !action_codes.is_full() {
+                action_codes.push(encode_action(*a));
             }
         }
-    }
-}
 
-/// Convert a card to a single character (rank only).
-fn card_to_char(card: Card) -> char {
-    match card.value {
-        Value::Two => '2',
-        Value::Three => '3',
-        Value::Four => '4',
-        Value::Five => '5',
-        Value::Six => '6',
-        Value::Seven => '7',
-        Value::Eight => '8',
-        Value::Nine => '9',
-        Value::Ten => 'T',
-        Value::Jack => 'J',
-        Value::Queen => 'Q',
-        Value::King => 'K',
-        Value::Ace => 'A',
-    }
-}
-
-/// Write an action to the info set key buffer (no allocation).
-///
-/// Bet/Raise indices are written as `b0`, `r1`, etc.
-/// All-in is written as `bA`, `rA`.
-fn write_action_to_buf(action: Action, buf: &mut String) {
-    use std::fmt::Write;
-    match action {
-        Action::Fold => buf.push('f'),
-        Action::Check => buf.push('x'),
-        Action::Call => buf.push('c'),
-        Action::Bet(idx) if idx == ALL_IN => buf.push_str("bA"),
-        Action::Bet(idx) => {
-            let _ = write!(buf, "b{idx}");
-        }
-        Action::Raise(idx) if idx == ALL_IN => buf.push_str("rA"),
-        Action::Raise(idx) => {
-            let _ = write!(buf, "r{idx}");
-        }
-    }
-}
-
-/// Write a preflop holding in canonical hand notation into the buffer.
-///
-/// Writes strings like "AA", "AKs" (suited), "`AKo`" (offsuit).
-/// Ranks are ordered high to low (AK not KA).
-fn write_canonical_hand(holding: [Card; 2], buf: &mut String) {
-    let (c1, c2) = (holding[0], holding[1]);
-    let (r1, r2) = (card_to_char(c1), card_to_char(c2));
-
-    // Order ranks high to low using poker rank order
-    let rank_order = |c: char| match c {
-        'A' => 14,
-        'K' => 13,
-        'Q' => 12,
-        'J' => 11,
-        'T' => 10,
-        '9' => 9,
-        '8' => 8,
-        '7' => 7,
-        '6' => 6,
-        '5' => 5,
-        '4' => 4,
-        '3' => 3,
-        '2' => 2,
-        _ => 0,
-    };
-
-    let (high, low) = if rank_order(r1) >= rank_order(r2) {
-        (r1, r2)
-    } else {
-        (r2, r1)
-    };
-
-    buf.push(high);
-    buf.push(low);
-
-    if high != low {
-        if c1.suit == c2.suit {
-            buf.push('s');
-        } else {
-            buf.push('o');
-        }
+        InfoKey::new(hand_bits, street_code, pot_bucket, stack_bucket, &action_codes).as_u64()
     }
 }
 
@@ -1240,19 +1173,14 @@ mod tests {
     }
 
     #[timed_test]
-    fn info_set_key_includes_hand_and_history() {
+    fn info_set_key_different_for_different_hands() {
         let (p1, p2) = sample_holdings();
         let state = PostflopState::new_preflop(p1, p2, 100);
         let game = create_game();
 
-        let info_set = game.info_set_key(&state);
-        // Should contain hand chars (AK) and street (P)
-        assert!(
-            info_set.contains("|P|"),
-            "Info set should contain preflop marker: {info_set}"
-        );
+        let info_set1 = game.info_set_key(&state);
 
-        // After a raise, history should be included
+        // After a raise, key should change (different player, different actions)
         let actions = game.actions(&state);
         let raise = actions
             .iter()
@@ -1261,9 +1189,9 @@ mod tests {
         let after_raise = game.next_state(&state, *raise);
 
         let info_set2 = game.info_set_key(&after_raise);
-        assert!(
-            info_set2.contains(":r") || info_set2.contains("|r"),
-            "Info set should contain raise history: {info_set2}"
+        assert_ne!(
+            info_set1, info_set2,
+            "Info set should change after raise action"
         );
     }
 
@@ -1324,8 +1252,8 @@ mod tests {
     }
 
     #[timed_test]
-    fn info_set_keys_pot_independent() {
-        // Same hand + action at different pot sizes should produce same info set key
+    fn info_set_key_uses_bet_index_encoding() {
+        // A bet at index 0 and index 1 should produce different keys
         let config = PostflopConfig {
             stack_depth: 100,
             bet_sizes: vec![0.5, 1.0],
@@ -1340,18 +1268,15 @@ mod tests {
         // Path 1: limp → check → bet index 0
         let s = game.next_state(&state, Action::Call);
         let s = game.next_state(&s, Action::Check);
-        let s = game.next_state(&s, Action::Bet(0));
-        let key1 = game.info_set_key(&s);
+        let s1 = game.next_state(&s, Action::Bet(0));
+        let key1 = game.info_set_key(&s1);
 
-        // The key should contain "b0" (index), not a cent amount
-        assert!(
-            key1.contains("b0"),
-            "Key should contain 'b0' (index), got: {key1}"
-        );
-        assert!(
-            !key1.contains("b75") && !key1.contains("b100") && !key1.contains("b150"),
-            "Key should not contain cent amounts, got: {key1}"
-        );
+        // Path 2: limp → check → bet index 1
+        let s2 = game.next_state(&s, Action::Bet(1));
+        let key2 = game.info_set_key(&s2);
+
+        // Different bet indices → different keys
+        assert_ne!(key1, key2, "Different bet indices should produce different keys");
     }
 
     #[timed_test]

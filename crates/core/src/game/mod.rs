@@ -78,16 +78,9 @@ pub trait Game: Send + Sync {
     /// Returns the utility for the given player at a terminal state
     fn utility(&self, state: &Self::State, player: Player) -> f64;
 
-    /// Returns the information set key for the current player
-    fn info_set_key(&self, state: &Self::State) -> String;
-
-    /// Writes the information set key into an existing buffer, avoiding allocation.
+    /// Returns the numeric information set key for the current player.
     ///
-    /// The default implementation clears the buffer and delegates to [`Self::info_set_key`].
-    /// Implementations should override this when the key can be built
-    /// without intermediate `String` allocations.
-    fn info_set_key_into(&self, state: &Self::State, buf: &mut String) {
-        buf.clear();
-        buf.push_str(&self.info_set_key(state));
-    }
+    /// Encoded as a u64 via [`InfoKey`](crate::info_key::InfoKey) for
+    /// zero-allocation hashing and comparison.
+    fn info_set_key(&self, state: &Self::State) -> u64;
 }

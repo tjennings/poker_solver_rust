@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::abstraction::{CardAbstraction, Street};
 use crate::game::Action;
+use crate::info_key::{canonical_hand_index, encode_action, InfoKey};
 use crate::poker::Card;
 
 use super::{BlueprintError, BlueprintStrategy, CacheConfig, SubgameCache, SubgameKey};
@@ -109,7 +110,7 @@ impl SubgameSolver {
 
         // Fall back to blueprint lookup
         let info_set_key = self.make_info_set_key(board, holding, history)?;
-        if let Some(probs) = self.blueprint.lookup(&info_set_key) {
+        if let Some(probs) = self.blueprint.lookup(info_set_key) {
             // Cache the result for future lookups
             let probs_vec = probs.to_vec();
             // Ignore cache insert errors - strategy lookup succeeded
@@ -172,15 +173,9 @@ impl SubgameSolver {
         Ok(SubgameKey::new(board_hash, holding_bucket, history_hash))
     }
 
-    /// Create an information set key from game state
+    /// Create a u64 information set key from game state.
     ///
-    /// Format: "{bucket}|{street}|{history}"
-    /// Similar to `HunlPostflop::info_set_key()`
-    ///
-    /// # Arguments
-    /// * `board` - Community cards
-    /// * `holding` - Player's hole cards
-    /// * `history` - Action history
+    /// Uses the same `InfoKey` encoding as `HunlPostflop::info_set_key()`.
     ///
     /// # Errors
     /// Returns error if street cannot be determined from board length
@@ -189,74 +184,34 @@ impl SubgameSolver {
         board: &[Card],
         holding: [Card; 2],
         history: &[(Street, Action)],
-    ) -> Result<String, BlueprintError> {
+    ) -> Result<u64, BlueprintError> {
         let street = Street::from_board_len(board.len())
             .map_err(|e| BlueprintError::InvalidStrategy(format!("invalid board length: {e}")))?;
 
-        // Get bucket representation
-        let bucket = if board.is_empty() {
-            // Preflop: use card representation
-            format!("{}{}", card_to_char(holding[0]), card_to_char(holding[1]))
+        let hand_bits: u32 = if board.is_empty() {
+            u32::from(canonical_hand_index(holding))
         } else if let Some(ref abstraction) = self.abstraction {
             abstraction
                 .get_bucket(board, (holding[0], holding[1]))
-                .map_or_else(|_| "?".to_string(), |b| b.to_string())
+                .map_or(0, u32::from)
         } else {
-            // No abstraction: use card representation
-            format!("{}{}", card_to_char(holding[0]), card_to_char(holding[1]))
+            u32::from(canonical_hand_index(holding))
         };
 
-        let street_char = match street {
-            Street::Preflop => 'P',
-            Street::Flop => 'F',
-            Street::Turn => 'T',
-            Street::River => 'R',
+        let street_num: u8 = match street {
+            Street::Preflop => 0,
+            Street::Flop => 1,
+            Street::Turn => 2,
+            Street::River => 3,
         };
 
-        // Build history string
-        let history_str: String = history
+        let action_codes: Vec<u8> = history
             .iter()
-            .map(|(_, action)| action_to_key_str(*action))
+            .map(|(_, action)| encode_action(*action))
             .collect();
 
-        Ok(format!("{bucket}|{street_char}|{history_str}"))
-    }
-}
-
-/// Convert a card to a single character representation
-fn card_to_char(card: Card) -> char {
-    use crate::poker::Value;
-    match card.value {
-        Value::Two => '2',
-        Value::Three => '3',
-        Value::Four => '4',
-        Value::Five => '5',
-        Value::Six => '6',
-        Value::Seven => '7',
-        Value::Eight => '8',
-        Value::Nine => '9',
-        Value::Ten => 'T',
-        Value::Jack => 'J',
-        Value::Queen => 'Q',
-        Value::King => 'K',
-        Value::Ace => 'A',
-    }
-}
-
-/// Convert an action to its info-set key representation.
-///
-/// Matches the format used by `write_action_to_buf` in [`HunlPostflop`]:
-/// `f`, `x`, `c`, `b{idx}`, `r{idx}`, `bA`/`rA` for all-in.
-fn action_to_key_str(action: Action) -> String {
-    use crate::game::ALL_IN;
-    match action {
-        Action::Fold => "f".to_string(),
-        Action::Check => "x".to_string(),
-        Action::Call => "c".to_string(),
-        Action::Bet(idx) if idx == ALL_IN => "bA".to_string(),
-        Action::Bet(idx) => format!("b{idx}"),
-        Action::Raise(idx) if idx == ALL_IN => "rA".to_string(),
-        Action::Raise(idx) => format!("r{idx}"),
+        // pot/stack buckets are 0 here — SubgameSolver doesn't track pot state
+        Ok(InfoKey::new(hand_bits, street_num, 0, 0, &action_codes).as_u64())
     }
 }
 
@@ -267,9 +222,36 @@ mod tests {
     use test_macros::timed_test;
 
     fn create_test_blueprint() -> Arc<BlueprintStrategy> {
+        use crate::poker::{Suit, Value};
         let mut strategy = BlueprintStrategy::new();
-        strategy.insert("AK|P|".to_string(), vec![0.3, 0.5, 0.2]);
-        strategy.insert("42|F|xb".to_string(), vec![0.4, 0.6]);
+        // AK preflop, no history
+        let ak_holding = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+        ];
+        let ak_key = InfoKey::new(
+            u32::from(canonical_hand_index(ak_holding)),
+            0,
+            0,
+            0,
+            &[],
+        )
+        .as_u64();
+        strategy.insert(ak_key, vec![0.3, 0.5, 0.2]);
+        // 42 (Four-Two offsuit) on flop with check-bet history
+        let ft_holding = [
+            Card::new(Value::Four, Suit::Spade),
+            Card::new(Value::Two, Suit::Heart),
+        ];
+        let ft_key = InfoKey::new(
+            u32::from(canonical_hand_index(ft_holding)),
+            1,
+            0,
+            0,
+            &[2, 4], // check, bet(0)
+        )
+        .as_u64();
+        strategy.insert(ft_key, vec![0.4, 0.6]);
         Arc::new(strategy)
     }
 
@@ -388,12 +370,7 @@ mod tests {
         let result = solver.solve(board, holding, history);
         assert!(result.is_err(), "solve should fail for unknown info set");
         match result {
-            Err(BlueprintError::InfoSetNotFound(key)) => {
-                assert!(
-                    key.contains("23"),
-                    "error should contain the info set key: {key}"
-                );
-            }
+            Err(BlueprintError::InfoSetNotFound(_key)) => {}
             other => panic!("expected InfoSetNotFound error, got {other:?}"),
         }
     }
@@ -417,7 +394,15 @@ mod tests {
         let key = solver
             .make_info_set_key(board, holding, history)
             .expect("should create key");
-        assert_eq!(key, "AK|P|", "preflop key should be AK|P|");
+        let expected = InfoKey::new(
+            u32::from(canonical_hand_index(holding)),
+            0,
+            0,
+            0,
+            &[],
+        )
+        .as_u64();
+        assert_eq!(key, expected, "preflop key should match InfoKey encoding");
     }
 
     #[timed_test]
@@ -442,7 +427,15 @@ mod tests {
         let key = solver
             .make_info_set_key(board, holding, history)
             .expect("should create key");
-        assert_eq!(key, "AK|P|r1c", "key with history should include actions");
+        let expected = InfoKey::new(
+            u32::from(canonical_hand_index(holding)),
+            0,
+            0,
+            0,
+            &[9, 3], // raise(1)=9, call=3
+        )
+        .as_u64();
+        assert_eq!(key, expected, "key with history should encode actions");
     }
 
     #[timed_test]

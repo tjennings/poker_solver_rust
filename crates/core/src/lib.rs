@@ -23,6 +23,7 @@ pub mod flops;
 pub mod game;
 pub mod hand_class;
 pub mod hands;
+pub mod info_key;
 pub mod simulation;
 
 pub use agent::AgentConfig;

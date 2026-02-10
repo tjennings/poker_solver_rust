@@ -37,7 +37,7 @@ pub struct TrainedStrategy {
     pub game_type: String,
     pub iterations: u64,
     pub exploitability: f64,
-    pub strategies: HashMap<String, Vec<f64>>,
+    pub strategies: HashMap<u64, Vec<f64>>,
 }
 
 /// Progress checkpoint emitted during training.
@@ -54,7 +54,7 @@ pub struct TrainingProgress {
 #[derive(Debug, Clone, Serialize)]
 pub struct TrainingResult {
     pub iterations: u64,
-    pub strategies: HashMap<String, Vec<f64>>,
+    pub strategies: HashMap<u64, Vec<f64>>,
     pub exploitability: f64,
     pub elapsed_ms: u64,
     pub stopped_early: bool,
@@ -72,7 +72,7 @@ pub struct Checkpoint {
 #[derive(Serialize)]
 pub struct TrainingResultWithCheckpoints {
     pub checkpoints: Vec<Checkpoint>,
-    pub strategies: HashMap<String, Vec<f64>>,
+    pub strategies: HashMap<u64, Vec<f64>>,
     pub total_iterations: u64,
     pub total_elapsed_ms: u64,
 }
@@ -133,6 +133,7 @@ pub async fn start_training(
 
     let final_strategies = solver.all_strategies();
     let final_exploitability = calculate_exploitability(&game, &final_strategies);
+    let final_strategies: HashMap<u64, Vec<f64>> = final_strategies.into_iter().collect();
 
     // Store strategies for potential save
     {
@@ -241,7 +242,7 @@ pub fn run_kuhn_training(iterations: u64) -> Result<TrainingResultWithCheckpoint
             exploitability,
             elapsed_ms: start.elapsed().as_millis() as u64,
         }],
-        strategies,
+        strategies: strategies.into_iter().collect(),
         total_iterations: iterations,
         total_elapsed_ms: start.elapsed().as_millis() as u64,
     })
@@ -277,7 +278,7 @@ pub fn train_with_checkpoints(
 
     Ok(TrainingResultWithCheckpoints {
         checkpoints,
-        strategies: solver.all_strategies(),
+        strategies: solver.all_strategies().into_iter().collect(),
         total_iterations: current_iteration,
         total_elapsed_ms: start.elapsed().as_millis() as u64,
     })
