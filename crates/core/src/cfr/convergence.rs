@@ -2,6 +2,10 @@
 //!
 //! Pure functions that compute quantitative indicators of training progress.
 //! All functions take `&FxHashMap` references and return scalar metrics.
+//!
+//! Regret functions normalize by iteration count because CFR+ cumulative
+//! regret grows with training (O(sqrt(T))). The per-iteration average
+//! regret/T is the meaningful convergence signal that approaches zero.
 
 use rustc_hash::FxHashMap;
 
@@ -39,25 +43,40 @@ pub fn strategy_delta(
     }
 }
 
-/// Maximum absolute regret across all info sets and actions.
+/// Maximum per-iteration regret across all info sets and actions.
 ///
-/// Returns 0.0 if the regret map is empty.
+/// Divides the maximum absolute cumulative regret by `iterations` to produce
+/// the per-iteration average. This value should decrease toward zero as
+/// training converges. Returns 0.0 if the regret map is empty or iterations is 0.
 #[must_use]
 #[allow(clippy::implicit_hasher)]
-pub fn max_regret(regret_sum: &FxHashMap<u64, Vec<f64>>) -> f64 {
-    regret_sum
+pub fn max_regret(regret_sum: &FxHashMap<u64, Vec<f64>>, iterations: u64) -> f64 {
+    if iterations == 0 {
+        return 0.0;
+    }
+
+    let max_cumulative = regret_sum
         .values()
         .flat_map(|v| v.iter())
         .map(|r| r.abs())
-        .fold(0.0_f64, f64::max)
+        .fold(0.0_f64, f64::max);
+
+    #[allow(clippy::cast_precision_loss)]
+    { max_cumulative / iterations as f64 }
 }
 
-/// Mean absolute regret across all info sets and actions.
+/// Mean per-iteration regret across all info sets and actions.
 ///
-/// Returns 0.0 if the regret map is empty.
+/// Divides the mean absolute cumulative regret by `iterations` to produce
+/// the per-iteration average. Smoother signal than max regret.
+/// Returns 0.0 if the regret map is empty or iterations is 0.
 #[must_use]
 #[allow(clippy::implicit_hasher)]
-pub fn avg_regret(regret_sum: &FxHashMap<u64, Vec<f64>>) -> f64 {
+pub fn avg_regret(regret_sum: &FxHashMap<u64, Vec<f64>>, iterations: u64) -> f64 {
+    if iterations == 0 {
+        return 0.0;
+    }
+
     let mut total = 0.0;
     let mut count = 0u64;
 
@@ -72,7 +91,7 @@ pub fn avg_regret(regret_sum: &FxHashMap<u64, Vec<f64>>) -> f64 {
         0.0
     } else {
         #[allow(clippy::cast_precision_loss)]
-        { total / count as f64 }
+        { total / count as f64 / iterations as f64 }
     }
 }
 
@@ -125,7 +144,6 @@ mod tests {
     fn delta_nonzero_for_changes() {
         let prev = make_map(&[(1, vec![0.5, 0.5])]);
         let curr = make_map(&[(1, vec![1.0, 0.0])]);
-        // L1 distance = |0.5-1.0| + |0.5-0.0| = 1.0, one info set → delta = 1.0
         let delta = strategy_delta(&prev, &curr);
         assert!((delta - 1.0).abs() < 1e-10, "expected 1.0, got {delta}");
     }
@@ -144,63 +162,79 @@ mod tests {
             (2, vec![0.5, 0.5]),
         ]);
         let curr = make_map(&[
-            (1, vec![1.0, 0.0]), // L1 = 1.0
-            (2, vec![0.5, 0.5]), // L1 = 0.0
+            (1, vec![1.0, 0.0]),
+            (2, vec![0.5, 0.5]),
         ]);
         let delta = strategy_delta(&prev, &curr);
         assert!((delta - 0.5).abs() < 1e-10, "expected 0.5, got {delta}");
     }
 
     #[test]
-    fn max_regret_finds_maximum() {
-        let regrets = make_map(&[(1, vec![0.5, 1.0, 0.3]), (2, vec![0.2, 0.8])]);
-        assert!((max_regret(&regrets) - 1.0).abs() < 1e-10);
+    fn max_regret_finds_maximum_normalized() {
+        let regrets = make_map(&[(1, vec![10.0, 20.0]), (2, vec![5.0, 15.0])]);
+        // max abs = 20.0, iterations = 10 → 2.0
+        let result = max_regret(&regrets, 10);
+        assert!((result - 2.0).abs() < 1e-10, "expected 2.0, got {result}");
     }
 
     #[test]
     fn max_regret_handles_negatives() {
-        let regrets = make_map(&[(1, vec![-5.0, 2.0])]);
-        // abs(-5.0) = 5.0 > abs(2.0) = 2.0
-        assert!((max_regret(&regrets) - 5.0).abs() < 1e-10);
+        let regrets = make_map(&[(1, vec![-50.0, 20.0])]);
+        // max abs = 50.0, iterations = 10 → 5.0
+        let result = max_regret(&regrets, 10);
+        assert!((result - 5.0).abs() < 1e-10, "expected 5.0, got {result}");
+    }
+
+    #[test]
+    fn max_regret_zero_iterations() {
+        let regrets = make_map(&[(1, vec![5.0])]);
+        assert!((max_regret(&regrets, 0)).abs() < 1e-10);
     }
 
     #[test]
     fn max_regret_empty_map() {
         let regrets: FxHashMap<u64, Vec<f64>> = FxHashMap::default();
-        assert!((max_regret(&regrets)).abs() < 1e-10);
+        assert!((max_regret(&regrets, 100)).abs() < 1e-10);
     }
 
     #[test]
-    fn avg_regret_computation() {
-        let regrets = make_map(&[(1, vec![1.0, 3.0])]);
-        // mean of abs values: (1.0 + 3.0) / 2 = 2.0
-        assert!((avg_regret(&regrets) - 2.0).abs() < 1e-10);
+    fn avg_regret_normalized() {
+        let regrets = make_map(&[(1, vec![10.0, 30.0])]);
+        // mean abs = (10 + 30) / 2 = 20.0, iterations = 10 → 2.0
+        let result = avg_regret(&regrets, 10);
+        assert!((result - 2.0).abs() < 1e-10, "expected 2.0, got {result}");
     }
 
     #[test]
     fn avg_regret_multiple_info_sets() {
-        let regrets = make_map(&[(1, vec![2.0, 4.0]), (2, vec![0.0, 6.0])]);
-        // (2 + 4 + 0 + 6) / 4 = 3.0
-        assert!((avg_regret(&regrets) - 3.0).abs() < 1e-10);
+        let regrets = make_map(&[(1, vec![20.0, 40.0]), (2, vec![0.0, 60.0])]);
+        // mean abs = (20 + 40 + 0 + 60) / 4 = 30.0, iterations = 10 → 3.0
+        let result = avg_regret(&regrets, 10);
+        assert!((result - 3.0).abs() < 1e-10, "expected 3.0, got {result}");
+    }
+
+    #[test]
+    fn avg_regret_zero_iterations() {
+        let regrets = make_map(&[(1, vec![5.0])]);
+        assert!((avg_regret(&regrets, 0)).abs() < 1e-10);
     }
 
     #[test]
     fn avg_regret_empty_map() {
         let regrets: FxHashMap<u64, Vec<f64>> = FxHashMap::default();
-        assert!((avg_regret(&regrets)).abs() < 1e-10);
+        assert!((avg_regret(&regrets, 100)).abs() < 1e-10);
     }
 
     #[test]
     fn entropy_zero_for_pure_strategy() {
         let strategies = make_map(&[(1, vec![1.0, 0.0])]);
-        // Only p=1.0 contributes: -1.0 * ln(1.0) = 0
         assert!((strategy_entropy(&strategies)).abs() < 1e-10);
     }
 
     #[test]
     fn entropy_max_for_uniform() {
         let strategies = make_map(&[(1, vec![0.5, 0.5])]);
-        let expected = -(0.5_f64 * 0.5_f64.ln()) * 2.0; // ln(2) ≈ 0.693
+        let expected = -(0.5_f64 * 0.5_f64.ln()) * 2.0;
         let entropy = strategy_entropy(&strategies);
         assert!(
             (entropy - expected).abs() < 1e-10,

@@ -525,8 +525,9 @@ fn print_checkpoint(
     // Convergence metrics
     if checkpoint > 0 {
         let regrets = solver.regret_sum();
-        let max_r = convergence::max_regret(regrets);
-        let avg_r = convergence::avg_regret(regrets);
+        let iters = solver.iterations();
+        let max_r = convergence::max_regret(regrets, iters);
+        let avg_r = convergence::avg_regret(regrets, iters);
         let entropy = convergence::strategy_entropy(&strategies);
 
         let delta_str = match ctx.previous_strategies {

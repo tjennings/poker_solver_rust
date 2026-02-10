@@ -20,6 +20,8 @@ fn convergence_metrics_decrease_over_training() {
     let num_checkpoints = checkpoint_iters.len();
 
     let mut deltas = Vec::new();
+    let mut max_regrets = Vec::new();
+    let mut avg_regrets = Vec::new();
     let mut entropies = Vec::new();
     let mut exploitabilities = Vec::new();
     let mut prev_strategies = None;
@@ -31,9 +33,10 @@ fn convergence_metrics_decrease_over_training() {
 
         let strategies = solver.all_strategies_best_effort();
         let regrets = solver.regret_sum();
+        let total_iters = solver.iterations();
 
-        let max_r = convergence::max_regret(regrets);
-        let avg_r = convergence::avg_regret(regrets);
+        let max_r = convergence::max_regret(regrets, total_iters);
+        let avg_r = convergence::avg_regret(regrets, total_iters);
         let entropy = convergence::strategy_entropy(&strategies);
         let exploit = calculate_exploitability(&game, &strategies);
 
@@ -42,6 +45,8 @@ fn convergence_metrics_decrease_over_training() {
             deltas.push(delta);
         }
 
+        max_regrets.push(max_r);
+        avg_regrets.push(avg_r);
         entropies.push(entropy);
         exploitabilities.push(exploit);
         prev_strategies = Some(strategies);
@@ -63,6 +68,22 @@ fn convergence_metrics_decrease_over_training() {
         "Strategy delta should decrease: first={:.6}, last={:.6}",
         deltas.first().unwrap(),
         deltas.last().unwrap()
+    );
+
+    // Per-iteration max regret should decrease
+    assert!(
+        max_regrets.last().unwrap() < max_regrets.first().unwrap(),
+        "Max regret/T should decrease: first={:.6}, last={:.6}",
+        max_regrets.first().unwrap(),
+        max_regrets.last().unwrap()
+    );
+
+    // Per-iteration avg regret should decrease
+    assert!(
+        avg_regrets.last().unwrap() < avg_regrets.first().unwrap(),
+        "Avg regret/T should decrease: first={:.6}, last={:.6}",
+        avg_regrets.first().unwrap(),
+        avg_regrets.last().unwrap()
     );
 
     // Exploitability should decrease: first checkpoint vs last
@@ -98,8 +119,9 @@ fn convergence_metrics_on_empty_solver() {
 
     let strategies = solver.all_strategies_best_effort();
     let regrets = solver.regret_sum();
+    let iters = solver.iterations();
 
-    assert!((convergence::max_regret(regrets)).abs() < 1e-10);
-    assert!((convergence::avg_regret(regrets)).abs() < 1e-10);
+    assert!((convergence::max_regret(regrets, iters)).abs() < 1e-10);
+    assert!((convergence::avg_regret(regrets, iters)).abs() < 1e-10);
     assert!((convergence::strategy_entropy(&strategies)).abs() < 1e-10);
 }
