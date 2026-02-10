@@ -10,8 +10,9 @@ use arrayvec::ArrayVec;
 use serde::{Deserialize, Serialize};
 
 use crate::abstraction::{CardAbstraction, Street};
-use crate::hand_class::{HandClassification, classify};
+use crate::hand_class::{HandClass, HandClassification, classify, intra_class_strength};
 use crate::poker::{Card, Hand, Rank, Rankable, Suit, Value};
+use crate::showdown_equity;
 
 use super::{Action, Actions, Game, Player, ALL_IN};
 
@@ -22,6 +23,16 @@ pub enum AbstractionMode {
     Ehs2(Arc<CardAbstraction>),
     /// Hand-class bucketing via `classify()` (O(1), interpretable).
     HandClass,
+    /// Hand-class V2: class ID + intra-class strength + equity bin + draw flags.
+    ///
+    /// `strength_bits` and `equity_bits` control quantization (0-4 each).
+    /// 0 means that dimension is omitted.
+    HandClassV2 {
+        /// Number of bits for intra-class strength (0-4).
+        strength_bits: u8,
+        /// Number of bits for equity bin (0-4).
+        equity_bits: u8,
+    },
 }
 
 /// Configuration for the postflop game.
@@ -63,6 +74,22 @@ pub enum TerminalType {
     Showdown,
 }
 
+/// Cached per-player evaluation data, precomputed at deal time.
+///
+/// Groups rank, classification, equity, and strength caches that were
+/// previously 6 separate fields on `PostflopState`.
+#[derive(Debug, Clone, Default)]
+pub struct PlayerCache {
+    /// 7-card hand rank (pre-computed when `full_board` is set).
+    pub rank: Option<Rank>,
+    /// Hand classification (updated on street advance).
+    pub class: Option<HandClassification>,
+    /// Equity bins: [flop, turn, river]. Precomputed when `full_board` is set.
+    pub equity: [u8; 3],
+    /// Intra-class strength: [flop, turn, river]. Precomputed when `full_board` is set.
+    pub strength: [u8; 3],
+}
+
 /// State of a HUNL Postflop hand.
 ///
 /// Tracks the board, holdings, pot, stacks, and action history.
@@ -98,14 +125,10 @@ pub struct PostflopState {
     pub terminal: Option<TerminalType>,
     /// Number of bets/raises on the current street
     pub street_bets: u8,
-    /// Cached 7-card hand rank for P1 (pre-computed at deal time when `full_board` is set)
-    pub cached_p1_rank: Option<Rank>,
-    /// Cached 7-card hand rank for P2 (pre-computed at deal time when `full_board` is set)
-    pub cached_p2_rank: Option<Rank>,
-    /// Cached hand classification for P1 (updated on street advance)
-    pub cached_p1_class: Option<HandClassification>,
-    /// Cached hand classification for P2 (updated on street advance)
-    pub cached_p2_class: Option<HandClassification>,
+    /// Cached evaluation data for Player 1 (SB).
+    pub p1_cache: PlayerCache,
+    /// Cached evaluation data for Player 2 (BB).
+    pub p2_cache: PlayerCache,
 }
 
 impl PostflopState {
@@ -134,10 +157,8 @@ impl PostflopState {
             history: ArrayVec::new(),
             terminal: None,
             street_bets: 1, // BB's post counts as first bet
-            cached_p1_rank: None,
-            cached_p2_rank: None,
-            cached_p1_class: None,
-            cached_p2_class: None,
+            p1_cache: PlayerCache::default(),
+            p2_cache: PlayerCache::default(),
         }
     }
 
@@ -185,11 +206,65 @@ impl PostflopState {
         state.full_board = Some(full_board);
 
         // Pre-compute final hand ranks (7 cards = 2 hole + 5 board)
-        state.cached_p1_rank = Some(rank_7cards(p1_holding, &full_board));
-        state.cached_p2_rank = Some(rank_7cards(p2_holding, &full_board));
+        state.p1_cache.rank = Some(rank_7cards(p1_holding, &full_board));
+        state.p2_cache.rank = Some(rank_7cards(p2_holding, &full_board));
 
         state
     }
+
+    /// Precompute equity bins and intra-class strength for all 3 postflop streets.
+    ///
+    /// Called once per deal during `initial_states()` when using `HandClassV2`.
+    /// This is O(~3K) rank evaluations per deal (enumeration over opponent combos).
+    pub fn precompute_v2_caches(&mut self) {
+        let Some(full_board) = self.full_board else {
+            return;
+        };
+        let board_slices: [&[Card]; 3] = [
+            &full_board[..3],
+            &full_board[..4],
+            &full_board[..5],
+        ];
+        for (i, board) in board_slices.iter().enumerate() {
+            self.p1_cache.equity[i] = precompute_equity_bin(self.p1_holding, board);
+            self.p2_cache.equity[i] = precompute_equity_bin(self.p2_holding, board);
+            self.p1_cache.strength[i] = precompute_strength(self.p1_holding, board);
+            self.p2_cache.strength[i] = precompute_strength(self.p2_holding, board);
+        }
+    }
+}
+
+/// Map a street to a cache index (flop=0, turn=1, river=2).
+/// Returns 0 for preflop (unused in practice).
+fn street_to_cache_idx(street: Street) -> usize {
+    match street {
+        Street::Preflop | Street::Flop => 0,
+        Street::Turn => 1,
+        Street::River => 2,
+    }
+}
+
+/// Compute the equity bin (0-15) for a holding on a given board slice.
+///
+/// Uses 16 bins as the maximum resolution. The actual number of bits
+/// used is determined by the `AbstractionMode::HandClassV2` config.
+fn precompute_equity_bin(holding: [Card; 2], board: &[Card]) -> u8 {
+    let eq = showdown_equity::compute_equity(holding, board);
+    showdown_equity::equity_bin(eq, 16)
+}
+
+/// Compute the intra-class strength (1-14) for a holding on a given board.
+fn precompute_strength(holding: [Card; 2], board: &[Card]) -> u8 {
+    let Ok(classification) = classify(holding, board) else {
+        return 1;
+    };
+    let made_id = classification.strongest_made_id();
+    if made_id > 20 {
+        return 1; // draw-only — no made-hand differentiation
+    }
+    // Safe: made_id <= 20 always maps to a valid HandClass discriminant
+    let class = HandClass::ALL[made_id as usize];
+    intra_class_strength(holding, board, class)
 }
 
 /// Build a 7-card hand and rank it.
@@ -273,21 +348,9 @@ impl HunlPostflop {
     pub fn all_canonical_hands(stack_depth: u32) -> Vec<PostflopState> {
         let mut states = Vec::with_capacity(169);
 
-        let values = [
-            Value::Ace,
-            Value::King,
-            Value::Queen,
-            Value::Jack,
-            Value::Ten,
-            Value::Nine,
-            Value::Eight,
-            Value::Seven,
-            Value::Six,
-            Value::Five,
-            Value::Four,
-            Value::Three,
-            Value::Two,
-        ];
+        // Descending order (Ace first) for canonical hand display
+        let mut values = crate::poker::ALL_VALUES;
+        values.reverse();
 
         // Default opponent hand (avoids most collisions)
         let default_p2 = [
@@ -342,30 +405,7 @@ impl HunlPostflop {
 
     /// Generate all 52 cards of a standard deck.
     fn full_deck() -> Vec<Card> {
-        let values = [
-            Value::Two,
-            Value::Three,
-            Value::Four,
-            Value::Five,
-            Value::Six,
-            Value::Seven,
-            Value::Eight,
-            Value::Nine,
-            Value::Ten,
-            Value::Jack,
-            Value::Queen,
-            Value::King,
-            Value::Ace,
-        ];
-        let suits = [Suit::Spade, Suit::Heart, Suit::Diamond, Suit::Club];
-
-        let mut deck = Vec::with_capacity(52);
-        for &value in &values {
-            for &suit in &suits {
-                deck.push(Card::new(value, suit));
-            }
-        }
-        deck
+        crate::poker::full_deck()
     }
 
     /// Generate random deals with pre-dealt boards for MCCFR sampling.
@@ -420,8 +460,8 @@ impl HunlPostflop {
         let canonical_flops = flops::all_flops();
 
         let weights: Vec<u16> = canonical_flops.iter().map(crate::flops::CanonicalFlop::weight).collect();
-        // WeightedIndex is safe here: all weights > 0 and total fits in u32.
-        let dist = WeightedIndex::new(&weights).expect("non-empty positive weights");
+        // Infallible: canonical flops is a compile-time-known non-empty set with all-positive weights.
+        let dist = WeightedIndex::new(&weights).expect("canonical flops are non-empty with positive weights");
 
         let deck = Self::full_deck();
         let mut deals = Vec::with_capacity(count);
@@ -480,7 +520,8 @@ impl HunlPostflop {
             .iter()
             .map(crate::flops::CanonicalFlop::weight)
             .collect();
-        let dist = WeightedIndex::new(&weights).expect("non-empty positive weights");
+        // Infallible: same reasoning as generate_flop_deals — always non-empty positive weights.
+        let dist = WeightedIndex::new(&weights).expect("canonical flops are non-empty with positive weights");
         let deck = Self::full_deck();
 
         let base_count = deals.len();
@@ -499,7 +540,10 @@ impl HunlPostflop {
                     self.config.stack_depth,
                 );
 
-                let board = deal.full_board.expect("flop deal has full_board");
+                let Some(board) = deal.full_board else {
+                    consecutive_failures += 1;
+                    continue;
+                };
                 let mut deal_classes = 0u32;
                 if let Ok(c1) = classify(deal.p1_holding, &board) {
                     deal_classes |= c1.bits();
@@ -597,8 +641,8 @@ impl HunlPostflop {
 
         // Cache hand classifications after board cards change (used in info_set_key)
         if !state.board.is_empty() && state.terminal.is_none() {
-            state.cached_p1_class = classify(state.p1_holding, &state.board).ok();
-            state.cached_p2_class = classify(state.p2_holding, &state.board).ok();
+            state.p1_cache.class = classify(state.p1_holding, &state.board).ok();
+            state.p2_cache.class = classify(state.p2_holding, &state.board).ok();
         }
     }
 }
@@ -686,8 +730,8 @@ impl Game for HunlPostflop {
     type State = PostflopState;
 
     fn initial_states(&self) -> Vec<Self::State> {
-        match &self.abstraction {
-            Some(AbstractionMode::HandClass) => {
+        let mut deals = match &self.abstraction {
+            Some(AbstractionMode::HandClass | AbstractionMode::HandClassV2 { .. }) => {
                 if self.min_deals_per_class > 0 {
                     self.generate_stratified_deals(
                         self.rng_seed,
@@ -700,7 +744,18 @@ impl Game for HunlPostflop {
                 }
             }
             _ => self.generate_random_deals(self.rng_seed, self.deal_count),
+        };
+
+        // Precompute equity bins and strength for HandClassV2 mode
+        if matches!(&self.abstraction, Some(AbstractionMode::HandClassV2 { .. })) {
+            println!("Precomputing equity bins and strength for {} deals...", deals.len());
+            for deal in &mut deals {
+                deal.precompute_v2_caches();
+            }
+            println!("  Precomputation complete.");
         }
+
+        deals
     }
 
     fn is_terminal(&self, state: &Self::State) -> bool {
@@ -868,13 +923,13 @@ impl Game for HunlPostflop {
                 use std::cmp::Ordering;
 
                 // Use cached ranks if available, otherwise compute
-                let p1_rank = state.cached_p1_rank.unwrap_or_else(|| {
+                let p1_rank = state.p1_cache.rank.unwrap_or_else(|| {
                     let mut h = Hand::default();
                     for &c in &state.board { h.insert(c); }
                     for &c in &state.p1_holding { h.insert(c); }
                     h.rank()
                 });
-                let p2_rank = state.cached_p2_rank.unwrap_or_else(|| {
+                let p2_rank = state.p2_cache.rank.unwrap_or_else(|| {
                     let mut h = Hand::default();
                     for &c in &state.board { h.insert(c); }
                     for &c in &state.p2_holding { h.insert(c); }
@@ -909,7 +964,7 @@ impl Game for HunlPostflop {
     }
 
     fn info_set_key(&self, state: &Self::State) -> u64 {
-        use crate::info_key::{InfoKey, canonical_hand_index, depth_bucket, encode_action, spr_bucket};
+        use crate::info_key::{InfoKey, canonical_hand_index, depth_bucket, encode_action, encode_hand_v2, spr_bucket};
 
         let holding = state.current_holding();
 
@@ -924,13 +979,39 @@ impl Game for HunlPostflop {
             Some(AbstractionMode::HandClass) if !state.board.is_empty() => {
                 // Use cached classification if available
                 let cached = match state.to_act {
-                    Some(Player::Player2) => state.cached_p2_class,
-                    _ => state.cached_p1_class,
+                    Some(Player::Player2) => state.p2_cache.class,
+                    _ => state.p1_cache.class,
                 };
                 cached.map_or_else(
                     || classify(holding, &state.board).map_or(0, HandClassification::bits),
                     HandClassification::bits,
                 )
+            }
+            Some(AbstractionMode::HandClassV2 { strength_bits, equity_bits })
+                if !state.board.is_empty() =>
+            {
+                let is_p2 = state.to_act == Some(Player::Player2);
+                let street_idx = street_to_cache_idx(state.street);
+
+                // Get cached classification (or compute on the fly)
+                let cached_class = if is_p2 {
+                    state.p2_cache.class
+                } else {
+                    state.p1_cache.class
+                };
+                let classification = cached_class.unwrap_or_else(|| {
+                    classify(holding, &state.board).unwrap_or_default()
+                });
+
+                let class_id = classification.strongest_made_id();
+                let draw_flags = classification.draw_flags();
+
+                // Use precomputed values from deal-time caching
+                let cache = if is_p2 { &state.p2_cache } else { &state.p1_cache };
+                let equity = cache.equity[street_idx];
+                let strength = cache.strength[street_idx];
+
+                encode_hand_v2(class_id, strength, equity, draw_flags, *strength_bits, *equity_bits)
             }
             _ => u32::from(canonical_hand_index(holding)),
         };

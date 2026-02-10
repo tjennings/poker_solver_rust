@@ -3,7 +3,7 @@ mod kuhn;
 
 use arrayvec::ArrayVec;
 
-pub use hunl_postflop::{AbstractionMode, HunlPostflop, PostflopConfig, PostflopState, TerminalType};
+pub use hunl_postflop::{AbstractionMode, HunlPostflop, PlayerCache, PostflopConfig, PostflopState, TerminalType};
 pub use kuhn::KuhnPoker;
 
 /// Maximum number of actions at any decision point.

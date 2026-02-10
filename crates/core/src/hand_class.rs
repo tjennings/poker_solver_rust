@@ -49,7 +49,8 @@ pub enum HandClass {
 }
 
 impl HandClass {
-    const ALL: [Self; 28] = [
+    /// All 28 variants in discriminant order.
+    pub const ALL: [Self; 28] = [
         Self::StraightFlush,
         Self::FourOfAKind,
         Self::FullHouse,
@@ -211,6 +212,32 @@ impl HandClassification {
     #[must_use]
     pub fn bits(self) -> u32 {
         self.bits
+    }
+
+    /// Return the discriminant (0-20) of the strongest made-hand class present,
+    /// or 21 if no made-hand class is set.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn strongest_made_id(self) -> u8 {
+        // Made-hand classes are bits 0..=20 (StraightFlush..KingHigh).
+        // The strongest is the one with the lowest discriminant.
+        // trailing_zeros() on a 21-bit mask is always <= 20, fits in u8.
+        let made_mask = self.bits & 0x001F_FFFF; // bits 0-20
+        if made_mask == 0 {
+            21
+        } else {
+            made_mask.trailing_zeros() as u8
+        }
+    }
+
+    /// Return draw flags as a 7-bit value.
+    ///
+    /// Bit 0 = `ComboDraw` (disc 21), bit 1 = `FlushDrawNuts` (22),
+    /// bit 2 = `FlushDraw` (23), bit 3 = `BackdoorFlushDraw` (24),
+    /// bit 4 = `Oesd` (25), bit 5 = `Gutshot` (26), bit 6 = `BackdoorStraightDraw` (27).
+    #[must_use]
+    pub fn draw_flags(self) -> u8 {
+        ((self.bits >> 21) & 0x7F) as u8
     }
 
     /// Check whether the set is empty.
@@ -793,6 +820,154 @@ fn has_backdoor_straight(hole: [Card; 2], _board: &[Card], present: u16) -> bool
         }
     }
     false
+}
+
+/// Compute intra-class strength for a made hand.
+///
+/// Returns a value 1-14 (higher = stronger within the class). The "key rank"
+/// depends on the class: for sets it's the set rank, for pairs the kicker, etc.
+/// If the class has no meaningful differentiation, returns 1.
+///
+/// Only meaningful for made-hand classes (discriminants 0-20).
+#[must_use]
+pub fn intra_class_strength(hole: [Card; 2], board: &[Card], class: HandClass) -> u8 {
+    let raw = raw_intra_strength(hole, board, class);
+    raw.clamp(1, 14)
+}
+
+/// Core strength computation — may return 0 or >14 for edge cases; caller clamps.
+fn raw_intra_strength(hole: [Card; 2], board: &[Card], class: HandClass) -> u8 {
+    let h0 = value_rank(hole[0].value);
+    let h1 = value_rank(hole[1].value);
+    let board_ranks: Vec<u8> = board.iter().map(|c| value_rank(c.value)).collect();
+
+    match class {
+        HandClass::StraightFlush | HandClass::Straight => {
+            let top = straight_top_rank(hole, board);
+            15u8.saturating_sub(top)
+        }
+        HandClass::FourOfAKind => {
+            let quad = find_quad_rank(hole, board);
+            15u8.saturating_sub(quad)
+        }
+        HandClass::FullHouse => {
+            let trips = find_trips_rank(hole, board);
+            15u8.saturating_sub(trips)
+        }
+        HandClass::Flush => {
+            let max_hole_flush = max_hole_flush_rank(hole, board);
+            15u8.saturating_sub(max_hole_flush)
+        }
+        HandClass::TopSet | HandClass::Set | HandClass::BottomSet => {
+            // Pocket pair matches board → set rank = pocket rank
+            15u8.saturating_sub(h0) // h0 == h1 for pocket pair
+        }
+        HandClass::Trips => {
+            // Board pair + one hole card matches → kicker is the other hole card
+            let kicker = h0.max(h1);
+            15u8.saturating_sub(kicker)
+        }
+        HandClass::TwoPair => {
+            // Higher of the two pairing hole cards
+            let higher = h0.max(h1);
+            15u8.saturating_sub(higher)
+        }
+        HandClass::Overpair | HandClass::Underpair => 15u8.saturating_sub(h0), // pocket pair rank
+        HandClass::TopPairTopKicker => {
+            // Paired board rank (the highest board rank)
+            let paired = board_ranks.iter().copied().max().unwrap_or(0);
+            15u8.saturating_sub(paired)
+        }
+        HandClass::TopPair => {
+            // Kicker rank (non-pairing hole card)
+            let top_board = board_ranks.iter().copied().max().unwrap_or(0);
+            let kicker = if h0 == top_board { h1 } else { h0 };
+            15u8.saturating_sub(kicker)
+        }
+        HandClass::SecondPair | HandClass::ThirdPair | HandClass::LowPair => {
+            // Pair rank of the hole card that pairs the board
+            let pair_rank = if board_ranks.contains(&h0) {
+                h0
+            } else {
+                h1
+            };
+            15u8.saturating_sub(pair_rank)
+        }
+        HandClass::Overcards => 15u8.saturating_sub(h0.max(h1)),
+        HandClass::AceHigh | HandClass::KingHigh => {
+            // Kicker: the lower hole card
+            let kicker = h0.min(h1);
+            15u8.saturating_sub(kicker)
+        }
+        // Draw classes — no intra-class strength
+        _ => 1,
+    }
+}
+
+/// Find the top card rank of the made straight (or straight flush).
+///
+/// Checks each 5-card window from high to low; returns the top rank of
+/// the first window where all 5 ranks are present (using at least one hole card).
+fn straight_top_rank(hole: [Card; 2], board: &[Card]) -> u8 {
+    let mut present: u16 = 0;
+    for &c in hole.iter().chain(board.iter()) {
+        present |= 1 << value_rank(c.value);
+    }
+    // Ace-low: duplicate ace as rank 1
+    if present & (1 << 14) != 0 {
+        present |= 1 << 1;
+    }
+    for top in (5..=14u8).rev() {
+        let low = top - 4;
+        let window: u16 = (low..=top).fold(0u16, |acc, r| acc | (1 << r));
+        if present & window == window {
+            return top;
+        }
+    }
+    5 // fallback (wheel)
+}
+
+/// Find the rank of the four-of-a-kind.
+fn find_quad_rank(hole: [Card; 2], board: &[Card]) -> u8 {
+    let mut counts = [0u8; 15];
+    for &c in hole.iter().chain(board.iter()) {
+        counts[value_rank(c.value) as usize] += 1;
+    }
+    for r in (2..=14u8).rev() {
+        if counts[r as usize] == 4 {
+            return r;
+        }
+    }
+    0
+}
+
+/// Find the trips rank in a full house.
+fn find_trips_rank(hole: [Card; 2], board: &[Card]) -> u8 {
+    let mut counts = [0u8; 15];
+    for &c in hole.iter().chain(board.iter()) {
+        counts[value_rank(c.value) as usize] += 1;
+    }
+    for r in (2..=14u8).rev() {
+        if counts[r as usize] >= 3 {
+            return r;
+        }
+    }
+    0
+}
+
+/// Find the highest hole card rank in the flush suit.
+fn max_hole_flush_rank(hole: [Card; 2], board: &[Card]) -> u8 {
+    let all: Vec<Card> = hole.iter().copied().chain(board.iter().copied()).collect();
+    let flush_suit = [Suit::Spade, Suit::Heart, Suit::Diamond, Suit::Club]
+        .into_iter()
+        .find(|&s| all.iter().filter(|c| c.suit == s).count() >= 5);
+
+    let Some(suit) = flush_suit else { return 0 };
+    hole.iter()
+        .filter(|c| c.suit == suit)
+        .map(|c| value_rank(c.value))
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1594,5 +1769,171 @@ mod tests {
             ],
             &[HandClass::BottomSet],
         );
+    }
+
+    // === strongest_made_id tests ===
+
+    #[timed_test]
+    fn strongest_made_id_straight_flush() {
+        let mut c = HandClassification::new();
+        c.add(HandClass::StraightFlush);
+        c.add(HandClass::FlushDraw); // draw should be ignored
+        assert_eq!(c.strongest_made_id(), 0);
+    }
+
+    #[timed_test]
+    fn strongest_made_id_top_pair_with_draw() {
+        let mut c = HandClassification::new();
+        c.add(HandClass::TopPair);
+        c.add(HandClass::Oesd);
+        assert_eq!(c.strongest_made_id(), HandClass::TopPair as u8);
+    }
+
+    #[timed_test]
+    fn strongest_made_id_no_made_hand() {
+        let mut c = HandClassification::new();
+        c.add(HandClass::FlushDraw);
+        c.add(HandClass::Gutshot);
+        assert_eq!(c.strongest_made_id(), 21);
+    }
+
+    #[timed_test]
+    fn strongest_made_id_empty() {
+        let c = HandClassification::new();
+        assert_eq!(c.strongest_made_id(), 21);
+    }
+
+    // === draw_flags tests ===
+
+    #[timed_test]
+    fn draw_flags_combo() {
+        let mut c = HandClassification::new();
+        c.add(HandClass::ComboDraw);
+        c.add(HandClass::FlushDraw);
+        c.add(HandClass::Oesd);
+        let flags = c.draw_flags();
+        assert_eq!(flags & 1, 1, "ComboDraw bit");
+        assert_eq!((flags >> 2) & 1, 1, "FlushDraw bit");
+        assert_eq!((flags >> 4) & 1, 1, "Oesd bit");
+    }
+
+    #[timed_test]
+    fn draw_flags_none() {
+        let mut c = HandClassification::new();
+        c.add(HandClass::TopPair);
+        assert_eq!(c.draw_flags(), 0);
+    }
+
+    // === intra_class_strength tests ===
+
+    #[timed_test]
+    fn strength_overpair_aces_vs_kings() {
+        let board = &[card(Queen, Heart), card(Seven, Spade), card(Three, Diamond)];
+        let aa = [card(Ace, Diamond), card(Ace, Club)];
+        let kk = [card(King, Diamond), card(King, Club)];
+        let s_aa = intra_class_strength(aa, board, HandClass::Overpair);
+        let s_kk = intra_class_strength(kk, board, HandClass::Overpair);
+        assert!(s_aa < s_kk, "AA ({s_aa}) should be stronger (lower) than KK ({s_kk})");
+    }
+
+    #[timed_test]
+    fn strength_top_pair_ace_kicker_vs_queen() {
+        let board = &[card(King, Heart), card(Seven, Spade), card(Three, Diamond)];
+        // AK on K73 — top pair, kicker is A
+        let ak = [card(Ace, Diamond), card(King, Club)];
+        // QK on K73 — top pair, kicker is Q
+        let qk = [card(Queen, Diamond), card(King, Club)];
+        let s_ak = intra_class_strength(ak, board, HandClass::TopPair);
+        let s_qk = intra_class_strength(qk, board, HandClass::TopPair);
+        assert!(s_ak < s_qk, "AK ({s_ak}) better kicker than QK ({s_qk})");
+    }
+
+    #[timed_test]
+    fn strength_straight_ace_high_vs_nine_high() {
+        // A-high straight: AKQJT
+        let board_a = &[
+            card(Queen, Heart),
+            card(Jack, Spade),
+            card(Ten, Diamond),
+            card(Two, Club),
+            card(Three, Heart),
+        ];
+        let ak = [card(Ace, Diamond), card(King, Club)];
+        let s_a = intra_class_strength(ak, board_a, HandClass::Straight);
+
+        // 9-high straight: 98765
+        let board_9 = &[
+            card(Seven, Heart),
+            card(Six, Spade),
+            card(Five, Diamond),
+            card(Two, Club),
+            card(Three, Heart),
+        ];
+        let n89 = [card(Nine, Diamond), card(Eight, Club)];
+        let s_9 = intra_class_strength(n89, board_9, HandClass::Straight);
+
+        assert!(s_a < s_9, "A-high ({s_a}) stronger than 9-high ({s_9})");
+    }
+
+    #[timed_test]
+    fn strength_set_rank() {
+        let board = &[card(King, Heart), card(Seven, Spade), card(Three, Diamond)];
+        let kk = [card(King, Diamond), card(King, Club)];
+        let s = intra_class_strength(kk, board, HandClass::TopSet);
+        // King = rank 13, so 15 - 13 = 2
+        assert_eq!(s, 2);
+    }
+
+    #[timed_test]
+    fn strength_quads() {
+        let board = &[
+            card(Seven, Heart),
+            card(Seven, Spade),
+            card(Three, Diamond),
+            card(King, Club),
+            card(Two, Heart),
+        ];
+        let s77 = [card(Seven, Diamond), card(Seven, Club)];
+        let s = intra_class_strength(s77, board, HandClass::FourOfAKind);
+        // Seven = rank 7, so 15 - 7 = 8
+        assert_eq!(s, 8);
+    }
+
+    #[timed_test]
+    fn strength_full_house() {
+        let board = &[
+            card(Ace, Heart),
+            card(Ace, Spade),
+            card(King, Diamond),
+            card(King, Club),
+            card(Two, Heart),
+        ];
+        let aa = [card(Ace, Diamond), card(Three, Club)];
+        let s = intra_class_strength(aa, board, HandClass::FullHouse);
+        // Trips rank = Ace(14), so 15 - 14 = 1
+        assert_eq!(s, 1);
+    }
+
+    #[timed_test]
+    fn strength_clamped_to_1_14() {
+        // NutFlush always returns 1
+        let board = &[
+            card(Queen, Heart),
+            card(Jack, Heart),
+            card(Five, Heart),
+            card(Three, Heart),
+            card(Two, Club),
+        ];
+        let ah = [card(Ace, Heart), card(King, Diamond)];
+        let s = intra_class_strength(ah, board, HandClass::NutFlush);
+        assert_eq!(s, 1);
+    }
+
+    #[timed_test]
+    fn strength_draw_class_returns_1() {
+        let board = &[card(Nine, Heart), card(Six, Heart), card(Two, Club)];
+        let h87 = [card(Eight, Heart), card(Seven, Heart)];
+        let s = intra_class_strength(h87, board, HandClass::Oesd);
+        assert_eq!(s, 1);
     }
 }

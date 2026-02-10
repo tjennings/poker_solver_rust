@@ -17,7 +17,7 @@ mod error;
 mod strategy;
 mod subgame;
 
-pub use bundle::{BundleConfig, StrategyBundle};
+pub use bundle::{AbstractionModeConfig, BundleConfig, StrategyBundle};
 pub use cache::{CacheConfig, SubgameCache, SubgameKey};
 pub use error::BlueprintError;
 pub use strategy::BlueprintStrategy;

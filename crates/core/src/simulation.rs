@@ -27,10 +27,11 @@ thread_local! {
 }
 
 use crate::agent::{AgentConfig, FrequencyMap};
-use crate::blueprint::{BlueprintStrategy, BundleConfig};
-use crate::hand_class::classify;
+use crate::blueprint::{AbstractionModeConfig, BlueprintStrategy, BundleConfig};
+use crate::hand_class::{classify, intra_class_strength, HandClass};
 use crate::hands::CanonicalHand;
-use crate::info_key::{canonical_hand_index, depth_bucket, spr_bucket, InfoKey};
+use crate::info_key::{canonical_hand_index, depth_bucket, encode_hand_v2, spr_bucket, InfoKey};
+use crate::showdown_equity;
 
 /// Progress update emitted during a simulation run.
 #[derive(Debug, Clone)]
@@ -73,10 +74,10 @@ impl RuleBasedAgent {
 impl Agent for RuleBasedAgent {
     fn act(&mut self, _id: u128, game_state: &GameState) -> AgentAction {
         let idx = game_state.to_act_idx();
-        let hand = &game_state.hands[idx];
+        let hand = game_state.hands[idx];
         let hole_cards = extract_hole_cards(hand, &game_state.board);
 
-        let freq = resolve_frequency(&self.config, game_state, &hole_cards);
+        let freq = resolve_frequency(&self.config, game_state, hole_cards);
         let r: f32 = self.rng.random();
         sample_frequency(freq, game_state, r)
     }
@@ -88,6 +89,7 @@ pub struct RuleBasedAgentGenerator {
 }
 
 impl RuleBasedAgentGenerator {
+    #[must_use]
     pub fn new(config: Arc<AgentConfig>) -> Self {
         Self { config }
     }
@@ -131,21 +133,45 @@ impl BlueprintAgent {
     /// `info_set_key()` which iterates over the full `state.history`.
     fn build_info_set_key(&self, game_state: &GameState) -> u64 {
         let idx = game_state.to_act_idx();
-        let hand = &game_state.hands[idx];
+        let hand = game_state.hands[idx];
         let board = &game_state.board;
         let hole_cards = extract_hole_cards(hand, board);
-        let round = &game_state.round;
+        let round = game_state.round;
 
-        let use_hand_class = self.bundle_config.abstraction_mode == "hand_class";
+        let mode = self.bundle_config.abstraction_mode;
 
         let hand_bits: u32 = if board.is_empty() {
             u32::from(canonical_hand_index(hole_cards))
-        } else if use_hand_class {
-            let board_cards: Vec<crate::poker::Card> =
-                board.iter().map(|c| to_core_card(*c)).collect();
-            let hole = [to_core_card(hole_cards[0]), to_core_card(hole_cards[1])];
+        } else if mode.is_hand_class() {
+            let board_cards: Vec<crate::poker::Card> = board.clone();
+            let hole = hole_cards;
             match classify(hole, &board_cards) {
-                Ok(classification) => classification.bits(),
+                Ok(classification) => {
+                    if mode == AbstractionModeConfig::HandClassV2 {
+                        let made_id = classification.strongest_made_id();
+                        let strength = if made_id <= 20 {
+                            let class = HandClass::ALL[made_id as usize];
+                            intra_class_strength(hole, &board_cards, class)
+                        } else {
+                            1
+                        };
+                        let equity = showdown_equity::compute_equity(hole, &board_cards);
+                        let eq_bin = showdown_equity::equity_bin(
+                            equity,
+                            1u8 << self.bundle_config.equity_bits,
+                        );
+                        encode_hand_v2(
+                            made_id,
+                            strength,
+                            eq_bin,
+                            classification.draw_flags(),
+                            self.bundle_config.strength_bits,
+                            self.bundle_config.equity_bits,
+                        )
+                    } else {
+                        classification.bits()
+                    }
+                }
                 Err(_) => 0,
             }
         } else {
@@ -168,7 +194,7 @@ impl BlueprintAgent {
         let action_codes: Vec<u8> = ACTION_LOG.with(|log| {
             log.borrow()
                 .iter()
-                .filter(|(r, _)| r == round)
+                .filter(|(r, _)| *r == round)
                 .map(|(_, code)| *code)
                 .collect()
         });
@@ -197,7 +223,9 @@ impl BlueprintAgent {
             for dp in -distance..=distance {
                 let ds_abs = distance - dp.abs();
                 for &ds in &[-ds_abs, ds_abs] {
+                    #[allow(clippy::cast_possible_wrap)]
                     let p = spr as i32 + dp;
+                    #[allow(clippy::cast_possible_wrap)]
                     let s = depth as i32 + ds;
                     if p < 0 || s < 0 {
                         continue;
@@ -213,7 +241,9 @@ impl BlueprintAgent {
 
         // Fallback: uniform over all actions
         let num_actions = 2 + self.bundle_config.game.bet_sizes.len() + 1; // fold/call + bets + all-in
-        vec![1.0 / num_actions as f32; num_actions]
+        #[allow(clippy::cast_precision_loss)]
+        let uniform = 1.0 / num_actions as f32;
+        vec![uniform; num_actions]
     }
 }
 
@@ -236,6 +266,7 @@ pub struct BlueprintAgentGenerator {
 }
 
 impl BlueprintAgentGenerator {
+    #[must_use]
     pub fn new(blueprint: Arc<BlueprintStrategy>, bundle_config: BundleConfig) -> Self {
         Self {
             blueprint,
@@ -259,7 +290,7 @@ impl AgentGenerator for BlueprintAgentGenerator {
 
 /// A game state iterator that rotates the dealer index each hand.
 ///
-/// `CloneGameStateGenerator` from rs_poker always uses the same `dealer_idx`,
+/// `CloneGameStateGenerator` from `rs_poker` always uses the same `dealer_idx`,
 /// creating a positional bias. This generator advances the dealer each hand
 /// so that both seats share the SB/BB positions equally.
 struct RotatingDealerGenerator {
@@ -399,8 +430,10 @@ pub fn run_simulation(
 
     while hands_played < num_hands && !stop.load(Ordering::Relaxed) {
         let batch = batch_size.min(num_hands - hands_played);
+        #[allow(clippy::cast_possible_truncation)]
+        let n = batch as usize;
         competition
-            .run(batch as usize)
+            .run(n)
             .map_err(|e| format!("Simulation error: {e:?}"))?;
         hands_played += batch;
 
@@ -416,6 +449,7 @@ pub fn run_simulation(
         });
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     let elapsed_ms = start.elapsed().as_millis() as u64;
     let p1_profit_bb = f64::from(competition.total_change[0]);
     let mbbh = if hands_played > 0 {
@@ -441,7 +475,7 @@ pub fn run_simulation(
 ///
 /// The arena adds community cards to each player's `Hand`, so we filter
 /// out any card that also appears on the board.
-fn extract_hole_cards(hand: &Hand, board: &[Card]) -> [Card; 2] {
+fn extract_hole_cards(hand: Hand, board: &[Card]) -> [Card; 2] {
     let cards: Vec<Card> = hand
         .iter()
         .filter(|c| !board.contains(c))
@@ -457,19 +491,13 @@ fn extract_hole_cards(hand: &Hand, board: &[Card]) -> [Card; 2] {
     }
 }
 
-/// Convert an rs_poker Card to our core Card type (they're the same type).
-fn to_core_card(card: Card) -> crate::poker::Card {
-    card
-}
-
 /// Convert arena `Round` to numeric street for `InfoKey`.
-fn round_to_street_num(round: &Round) -> u8 {
+fn round_to_street_num(round: Round) -> u8 {
     match round {
-        Round::Preflop => 0,
         Round::Flop => 1,
         Round::Turn => 2,
         Round::River => 3,
-        _ => 0, // Starting, Ante, Deal rounds default to preflop
+        _ => 0, // Preflop, Starting, Ante, Deal rounds default to preflop
     }
 }
 
@@ -488,7 +516,7 @@ fn effective_stack_rounded(game_state: &GameState) -> u32 {
 fn resolve_frequency<'a>(
     config: &'a AgentConfig,
     game_state: &GameState,
-    hole_cards: &[Card; 2],
+    hole_cards: [Card; 2],
 ) -> &'a FrequencyMap {
     let board = &game_state.board;
 
@@ -503,10 +531,8 @@ fn resolve_frequency<'a>(
         config.preflop_frequency(position, &canonical)
     } else {
         // Postflop: classify hand and resolve
-        let board_cards: Vec<crate::poker::Card> =
-            board.iter().map(|c| to_core_card(*c)).collect();
-        let hole = [to_core_card(hole_cards[0]), to_core_card(hole_cards[1])];
-        match classify(hole, &board_cards) {
+        let board_cards: Vec<crate::poker::Card> = board.clone();
+        match classify(hole_cards, &board_cards) {
             Ok(classification) => config.resolve(&classification),
             Err(_) => &config.default,
         }
@@ -518,7 +544,7 @@ fn dealer_idx(game_state: &GameState) -> usize {
     game_state.dealer_idx
 }
 
-/// Sample an action from a FrequencyMap given the current game state.
+/// Sample an action from a `FrequencyMap` given the current game state.
 ///
 /// When fold is not available (nothing to call), fold probability is
 /// redistributed to call (check). When raise probability is zero,
@@ -674,8 +700,7 @@ fn agent_action_to_code(
                         .partial_cmp(&((**b - fraction).abs()))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
-                .map(|(i, _)| i)
-                .unwrap_or(0);
+                .map_or(0, |(i, _)| i);
 
             #[allow(clippy::cast_possible_truncation)]
             let idx = closest_idx.min(4) as u8;
@@ -698,7 +723,7 @@ mod tests {
         let mut hand = Hand::default();
         hand.insert(Card::new(Value::Ace, Suit::Spade));
         hand.insert(Card::new(Value::King, Suit::Heart));
-        let cards = extract_hole_cards(&hand, &[]);
+        let cards = extract_hole_cards(hand, &[]);
         // Hand iterates in a specific order, just verify we get 2 cards
         assert_ne!(cards[0], cards[1]);
     }
@@ -717,7 +742,7 @@ mod tests {
             Card::new(Value::Three, Suit::Club),
             Card::new(Value::Four, Suit::Heart),
         ];
-        let cards = extract_hole_cards(&hand, &board);
+        let cards = extract_hole_cards(hand, &board);
         assert_ne!(cards[0], cards[1]);
         // Should only return hole cards, not board cards
         assert!(
@@ -728,10 +753,10 @@ mod tests {
 
     #[timed_test]
     fn round_to_street_num_maps_correctly() {
-        assert_eq!(round_to_street_num(&Round::Preflop), 0);
-        assert_eq!(round_to_street_num(&Round::Flop), 1);
-        assert_eq!(round_to_street_num(&Round::Turn), 2);
-        assert_eq!(round_to_street_num(&Round::River), 3);
+        assert_eq!(round_to_street_num(Round::Preflop), 0);
+        assert_eq!(round_to_street_num(Round::Flop), 1);
+        assert_eq!(round_to_street_num(Round::Turn), 2);
+        assert_eq!(round_to_street_num(Round::River), 3);
     }
 
     #[timed_test]
@@ -762,7 +787,9 @@ raise = 0.33
                 ..crate::game::PostflopConfig::default()
             },
             abstraction: None,
-            abstraction_mode: "hand_class".to_string(),
+            abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClass,
+            strength_bits: 0,
+            equity_bits: 0,
         };
         let generator = BlueprintAgentGenerator::new(blueprint, config);
         let gs = GameState::new_starting(vec![100.0, 100.0], 2.0, 1.0, 0.0, 0);
@@ -937,7 +964,9 @@ raise = 0.4
                 ..crate::game::PostflopConfig::default()
             },
             abstraction: None,
-            abstraction_mode: "hand_class".to_string(),
+            abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClass,
+            strength_bits: 0,
+            equity_bits: 0,
         };
         let agent = BlueprintAgent::new(blueprint, config);
         // An arbitrary key that won't be in the empty blueprint
@@ -965,7 +994,9 @@ raise = 0.4
                 ..crate::game::PostflopConfig::default()
             },
             abstraction: None,
-            abstraction_mode: "hand_class".to_string(),
+            abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClass,
+            strength_bits: 0,
+            equity_bits: 0,
         };
         let agent = BlueprintAgent::new(blueprint, config);
         // Look up with pot=11, stack=2 — should find nearby pot=10, stack=3 (distance 2)

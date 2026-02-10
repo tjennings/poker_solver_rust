@@ -18,20 +18,45 @@ use crate::game::PostflopConfig;
 
 use super::{BlueprintError, BlueprintStrategy};
 
+/// Which abstraction mode a bundle was trained with.
+///
+/// Determines how postflop hands are bucketed for info-set key construction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AbstractionModeConfig {
+    /// EHS2-based bucketing (expensive Monte Carlo, fine-grained).
+    #[default]
+    Ehs2,
+    /// Hand-class bucketing via `classify()` (O(1), interpretable).
+    HandClass,
+    /// Hand-class V2: class ID + intra-class strength + equity bin + draw flags.
+    HandClassV2,
+}
+
+impl AbstractionModeConfig {
+    /// Returns true if this mode uses hand-class based bucketing (v1 or v2).
+    #[must_use]
+    pub fn is_hand_class(self) -> bool {
+        matches!(self, Self::HandClass | Self::HandClassV2)
+    }
+}
+
 /// Combined configuration stored in config.yaml
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BundleConfig {
     /// Game configuration (stack depth, bet sizes)
     pub game: PostflopConfig,
     /// Abstraction configuration (bucket counts). None for `hand_class` mode.
     pub abstraction: Option<AbstractionConfig>,
-    /// Which abstraction mode was used: `"ehs2"` or `"hand_class"`.
-    #[serde(default = "default_abstraction_mode")]
-    pub abstraction_mode: String,
-}
-
-fn default_abstraction_mode() -> String {
-    "ehs2".to_string()
+    /// Which abstraction mode was used.
+    #[serde(default)]
+    pub abstraction_mode: AbstractionModeConfig,
+    /// Number of bits for intra-class strength (0-4). Only used with `hand_class_v2`.
+    #[serde(default)]
+    pub strength_bits: u8,
+    /// Number of bits for equity bin (0-4). Only used with `hand_class_v2`.
+    #[serde(default)]
+    pub equity_bits: u8,
 }
 
 /// A complete strategy bundle containing all data needed for exploration.
@@ -169,7 +194,9 @@ mod tests {
                 river_buckets: 100,
                 samples_per_street: 1000,
             }),
-            abstraction_mode: "ehs2".to_string(),
+            abstraction_mode: AbstractionModeConfig::Ehs2,
+            strength_bits: 0,
+            equity_bits: 0,
         }
     }
 
@@ -239,7 +266,9 @@ mod tests {
                 ..PostflopConfig::default()
             },
             abstraction: None,
-            abstraction_mode: "hand_class".to_string(),
+            abstraction_mode: AbstractionModeConfig::HandClass,
+            strength_bits: 0,
+            equity_bits: 0,
         };
         let blueprint = BlueprintStrategy::new();
         let bundle = StrategyBundle::new(config, blueprint, None);
@@ -258,7 +287,7 @@ mod tests {
 
         let loaded = StrategyBundle::load(&bundle_path).expect("load should succeed");
         assert!(loaded.boundaries.is_none());
-        assert_eq!(loaded.config.abstraction_mode, "hand_class");
+        assert_eq!(loaded.config.abstraction_mode, AbstractionModeConfig::HandClass);
     }
 
     #[timed_test]

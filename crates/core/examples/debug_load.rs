@@ -56,7 +56,7 @@ fn main() {
     println!("  stack_depth:          {}", config.game.stack_depth);
     println!("  bet_sizes:            {:?}", config.game.bet_sizes);
     println!("  max_raises_per_street:{}", config.game.max_raises_per_street);
-    println!("  abstraction_mode:     {}", config.abstraction_mode);
+    println!("  abstraction_mode:     {:?}", config.abstraction_mode);
     println!("  abstraction:          {:?}", config.abstraction);
     println!();
 
@@ -208,7 +208,7 @@ fn main() {
         Ok(bundle) => {
             println!("OK in {:?}", start.elapsed());
             println!(
-                "  config.abstraction_mode: {}",
+                "  config.abstraction_mode: {:?}",
                 bundle.config.abstraction_mode
             );
             println!("  blueprint info sets:     {}", bundle.blueprint.len());
@@ -220,7 +220,7 @@ fn main() {
     }
 
     // --- Step 8: Scan test (simulates scan_node_classes) ---
-    if config.abstraction_mode == "hand_class" {
+    if config.abstraction_mode.is_hand_class() {
         println!("\n--- Scan test (hand_class node scan) ---");
         // Simulate exploring a flop after preflop limp:
         // pot = 4 (SB 1 + BB 2 + SB call 1), stacks = [198, 198] for 100BB

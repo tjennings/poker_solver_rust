@@ -14,10 +14,11 @@ use tauri::{AppHandle, Emitter, State};
 
 use poker_solver_core::abstraction::{CardAbstraction, Street};
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
-use poker_solver_core::blueprint::{BundleConfig, StrategyBundle};
-use poker_solver_core::hand_class::{classify, HandClassification};
+use poker_solver_core::blueprint::{AbstractionModeConfig, BundleConfig, StrategyBundle};
+use poker_solver_core::hand_class::{classify, intra_class_strength, HandClass, HandClassification};
 use poker_solver_core::hands::CanonicalHand;
-use poker_solver_core::info_key::{canonical_hand_index, cards_from_rank_chars, depth_bucket, spr_bucket, InfoKey};
+use poker_solver_core::info_key::{canonical_hand_index, cards_from_rank_chars, depth_bucket, encode_hand_v2, spr_bucket, InfoKey};
+use poker_solver_core::showdown_equity;
 use poker_solver_core::poker::{Card, Suit, Value};
 
 /// Event payload for bucket computation progress.
@@ -272,7 +273,8 @@ fn get_strategy_matrix_bundle(
     let board = parse_board(&position.board)?;
     let street = street_from_board_len(board.len())?;
     let action_codes = build_action_codes(&position.history);
-    let use_hand_class = config.abstraction_mode == "hand_class";
+    let mode = config.abstraction_mode;
+    let use_hand_class = mode.is_hand_class();
 
     let ranks = RANKS;
     let mut cells = Vec::with_capacity(13);
@@ -315,32 +317,22 @@ fn get_strategy_matrix_bundle(
 
             let probabilities = if filtered {
                 vec![]
-            } else if use_hand_class {
-                get_hand_strategy_hand_class(
-                    blueprint,
-                    &board,
-                    street,
-                    &action_codes,
-                    pos_state.pot,
-                    pos_state.eff_stack,
-                    rank1,
-                    rank2,
-                    suited,
-                    &actions,
-                )?
             } else {
-                get_hand_strategy(
+                let hand_bits = if mode == AbstractionModeConfig::HandClassV2 {
+                    hand_bits_hand_class_v2(config, street, &board, rank1, rank2, suited)
+                } else if mode == AbstractionModeConfig::HandClass {
+                    hand_bits_hand_class(street, &board, rank1, rank2, suited)
+                } else {
+                    hand_bits_ehs2(street, rank1, rank2, suited, bucket_cache.as_ref())?
+                };
+                lookup_blueprint_strategy(
                     blueprint,
-                    &board,
+                    hand_bits,
                     street,
                     &action_codes,
                     pos_state.pot,
                     pos_state.eff_stack,
-                    rank1,
-                    rank2,
-                    suited,
                     &actions,
-                    bucket_cache.as_ref(),
                 )?
             };
 
@@ -519,7 +511,7 @@ pub fn start_bucket_computation(
         match source_guard.as_ref() {
             Some(StrategySource::Agent(_)) => return Ok(board_key),
             Some(StrategySource::Bundle { config, .. })
-                if config.abstraction_mode == "hand_class" =>
+                if config.abstraction_mode.is_hand_class() =>
             {
                 return Ok(board_key);
             }
@@ -761,7 +753,7 @@ pub fn get_combo_classes(
         }
     };
 
-    if config.abstraction_mode != "hand_class" {
+    if !config.abstraction_mode.is_hand_class() {
         return Ok(empty_combo_info(&hand));
     }
 
@@ -783,13 +775,40 @@ pub fn get_combo_classes(
     let spr = spr_bucket(pos_state.pot, pos_state.eff_stack);
     let depth = depth_bucket(pos_state.eff_stack);
 
-    // Group combos by classification bits
+    // Group combos by hand bits (classification for hand_class, v2 encoding for hand_class_v2)
+    let is_v2 = config.abstraction_mode == AbstractionModeConfig::HandClassV2;
     let mut groups_map: std::collections::BTreeMap<u32, Vec<String>> =
         std::collections::BTreeMap::new();
     for combo in &combos {
-        let bits = classify(*combo, &board)
-            .map(|c| c.bits())
-            .unwrap_or(0);
+        let bits = match classify(*combo, &board) {
+            Ok(classification) if is_v2 => {
+                let made_id = classification.strongest_made_id();
+                let strength = if made_id <= 20 {
+                    intra_class_strength(
+                        *combo,
+                        &board,
+                        HandClass::ALL[made_id as usize],
+                    )
+                } else {
+                    1
+                };
+                let equity = showdown_equity::compute_equity(*combo, &board);
+                let eq_bin = showdown_equity::equity_bin(
+                    equity,
+                    1u8 << config.equity_bits,
+                );
+                encode_hand_v2(
+                    made_id,
+                    strength,
+                    eq_bin,
+                    classification.draw_flags(),
+                    config.strength_bits,
+                    config.equity_bits,
+                )
+            }
+            Ok(classification) => classification.bits(),
+            Err(_) => 0,
+        };
         groups_map
             .entry(bits)
             .or_default()
@@ -1067,7 +1086,7 @@ fn action_meets_threshold(
     rank2: char,
     suited: bool,
 ) -> bool {
-    let hand_bits = hand_bits_at_street(rank1, rank2, suited, board, street_idx);
+    let hand_bits = hand_bits_at_street(config, rank1, rank2, suited, board, street_idx);
     let street_num = street_idx.min(3) as u8;
     let eff_stack = stacks[0].min(stacks[1]);
     let key = InfoKey::new(hand_bits, street_num, spr_bucket(pot, eff_stack), depth_bucket(eff_stack), action_codes).as_u64();
@@ -1087,8 +1106,9 @@ fn action_meets_threshold(
 }
 
 /// Compute hand bits for a street (preflop uses canonical rank index,
-/// postflop uses hand-class classification).
+/// postflop uses hand-class or hand-class-v2 classification).
 fn hand_bits_at_street(
+    config: &BundleConfig,
     rank1: char,
     rank2: char,
     suited: bool,
@@ -1096,10 +1116,32 @@ fn hand_bits_at_street(
     street_idx: usize,
 ) -> u32 {
     if street_idx == 0 {
-        hand_bits_from_ranks(rank1, rank2, suited)
+        return hand_bits_from_ranks(rank1, rank2, suited);
+    }
+    let (c1, c2) = make_representative_hand(rank1, rank2, suited, board);
+    let classification = match classify([c1, c2], board) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    if config.abstraction_mode == AbstractionModeConfig::HandClassV2 {
+        let made_id = classification.strongest_made_id();
+        let strength = if made_id <= 20 {
+            intra_class_strength([c1, c2], board, HandClass::ALL[made_id as usize])
+        } else {
+            1
+        };
+        let equity = showdown_equity::compute_equity([c1, c2], board);
+        let eq_bin = showdown_equity::equity_bin(equity, 1u8 << config.equity_bits);
+        encode_hand_v2(
+            made_id,
+            strength,
+            eq_bin,
+            classification.draw_flags(),
+            config.strength_bits,
+            config.equity_bits,
+        )
     } else {
-        let (c1, c2) = make_representative_hand(rank1, rank2, suited, board);
-        classify([c1, c2], board).map(|c| c.bits()).unwrap_or(0)
+        classification.bits()
     }
 }
 
@@ -1412,35 +1454,20 @@ fn resolve_bet_index(idx_str: &str, bet_sizes: &[f32], pot: u32, effective_stack
     idx_str.parse::<u32>().unwrap_or(0)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn get_hand_strategy(
+/// Look up blueprint strategy for a hand, given precomputed hand bits.
+///
+/// Shared implementation for all abstraction modes. Each mode computes
+/// `hand_bits` differently, but the InfoKey construction, blueprint lookup,
+/// and ActionProb mapping are identical.
+fn lookup_blueprint_strategy(
     blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
-    _board: &[Card],
+    hand_bits: u32,
     street: Street,
     action_codes: &[u8],
     pot: u32,
     eff_stack: u32,
-    rank1: char,
-    rank2: char,
-    suited: bool,
     actions: &[ActionInfo],
-    bucket_cache: Option<&std::collections::HashMap<(char, char, bool), u16>>,
 ) -> Result<Vec<ActionProb>, String> {
-    let hand_bits: u32 = if street == Street::Preflop {
-        hand_bits_from_ranks(rank1, rank2, suited)
-    } else {
-        let cache = bucket_cache.ok_or_else(|| {
-            format!(
-                "Bucket cache not available for postflop street {street:?}. \
-                 Start bucket computation before requesting postflop strategy."
-            )
-        })?;
-        let &bucket = cache.get(&(rank1, rank2, suited)).ok_or_else(|| {
-            format!("No bucket in cache for hand ({rank1}, {rank2}, suited={suited})")
-        })?;
-        u32::from(bucket)
-    };
-
     let street_num = street_to_num(street);
     let spr = spr_bucket(pot, eff_stack);
     let depth = depth_bucket(eff_stack);
@@ -1466,55 +1493,84 @@ fn get_hand_strategy(
         .collect())
 }
 
-/// Lookup strategy for a hand using classify()-based bucket keys (hand_class mode).
-///
-/// No bucket cache needed — `classify()` is O(1) and deterministic.
-#[allow(clippy::too_many_arguments)]
-fn get_hand_strategy_hand_class(
-    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
-    board: &[Card],
+/// Compute hand bits for EHS2 mode (requires precomputed bucket cache).
+fn hand_bits_ehs2(
     street: Street,
-    action_codes: &[u8],
-    pot: u32,
-    eff_stack: u32,
     rank1: char,
     rank2: char,
     suited: bool,
-    actions: &[ActionInfo],
-) -> Result<Vec<ActionProb>, String> {
-    let hand_bits: u32 = if street == Street::Preflop {
-        hand_bits_from_ranks(rank1, rank2, suited)
-    } else {
-        let (card1, card2) = make_representative_hand(rank1, rank2, suited, board);
-        match classify([card1, card2], board) {
-            Ok(classification) => classification.bits(),
-            Err(_) => 0,
-        }
-    };
-
-    let street_num = street_to_num(street);
-    let spr = spr_bucket(pot, eff_stack);
-    let depth = depth_bucket(eff_stack);
-
-    let info_set_key =
-        InfoKey::new(hand_bits, street_num, spr, depth, action_codes).as_u64();
-
-    let probs = blueprint.lookup(info_set_key).ok_or_else(|| {
+    bucket_cache: Option<&std::collections::HashMap<(char, char, bool), u16>>,
+) -> Result<u32, String> {
+    if street == Street::Preflop {
+        return Ok(hand_bits_from_ranks(rank1, rank2, suited));
+    }
+    let cache = bucket_cache.ok_or_else(|| {
         format!(
-            "Blueprint lookup failed for key {info_set_key:#018x} \
-             (blueprint has {} info sets)",
-            blueprint.len()
+            "Bucket cache not available for postflop street {street:?}. \
+             Start bucket computation before requesting postflop strategy."
         )
     })?;
+    let &bucket = cache.get(&(rank1, rank2, suited)).ok_or_else(|| {
+        format!("No bucket in cache for hand ({rank1}, {rank2}, suited={suited})")
+    })?;
+    Ok(u32::from(bucket))
+}
 
-    Ok(actions
-        .iter()
-        .enumerate()
-        .map(|(i, a)| ActionProb {
-            action: a.label.clone(),
-            probability: probs.get(i).copied().unwrap_or(0.0),
-        })
-        .collect())
+/// Compute hand bits for hand_class mode (classify() is O(1)).
+fn hand_bits_hand_class(
+    street: Street,
+    board: &[Card],
+    rank1: char,
+    rank2: char,
+    suited: bool,
+) -> u32 {
+    if street == Street::Preflop {
+        return hand_bits_from_ranks(rank1, rank2, suited);
+    }
+    let (card1, card2) = make_representative_hand(rank1, rank2, suited, board);
+    classify([card1, card2], board)
+        .map_or(0, HandClassification::bits)
+}
+
+/// Compute hand bits for hand_class_v2 mode (classify + strength + equity).
+fn hand_bits_hand_class_v2(
+    config: &BundleConfig,
+    street: Street,
+    board: &[Card],
+    rank1: char,
+    rank2: char,
+    suited: bool,
+) -> u32 {
+    if street == Street::Preflop {
+        return hand_bits_from_ranks(rank1, rank2, suited);
+    }
+    let (card1, card2) = make_representative_hand(rank1, rank2, suited, board);
+    match classify([card1, card2], board) {
+        Ok(classification) => {
+            let made_id = classification.strongest_made_id();
+            let strength = if made_id <= 20 {
+                intra_class_strength(
+                    [card1, card2],
+                    board,
+                    HandClass::ALL[made_id as usize],
+                )
+            } else {
+                1
+            };
+            let equity = showdown_equity::compute_equity([card1, card2], board);
+            let eq_bin =
+                showdown_equity::equity_bin(equity, 1u8 << config.equity_bits);
+            encode_hand_v2(
+                made_id,
+                strength,
+                eq_bin,
+                classification.draw_flags(),
+                config.strength_bits,
+                config.equity_bits,
+            )
+        }
+        Err(_) => 0,
+    }
 }
 
 /// Compute hand bits from rank characters and suited flag for `InfoKey`.

@@ -155,6 +155,55 @@ pub fn encode_action(action: Action) -> u8 {
     }
 }
 
+/// Encode the 28-bit hand field for `HandClassV2` mode.
+///
+/// Packs made-hand class ID, quantized strength, quantized equity, and draw
+/// flags into 28 bits:
+///
+/// ```text
+/// Bits 27-23: Made hand class ID     (5 bits, 0-20, or 21 if draw-only)
+/// Bits 22-19: Strength               (4 bits, max — quantized from 1-14)
+/// Bits 18-15: Equity bin             (4 bits, max — quantized from 0-15)
+/// Bits 14-8:  Draw flags             (7 bits, one per draw type)
+/// Bits 7-0:   Spare                  (8 bits, zero)
+/// ```
+///
+/// When `strength_bits` or `equity_bits` is less than 4, the value is
+/// right-shifted to quantize into fewer bins.
+#[must_use]
+pub fn encode_hand_v2(
+    class_id: u8,
+    strength: u8,
+    equity_bin: u8,
+    draw_flags: u8,
+    strength_bits: u8,
+    equity_bits: u8,
+) -> u32 {
+    // Quantize strength (1-14, stored as 0-13) into strength_bits
+    let s = if strength_bits == 0 {
+        0u32
+    } else {
+        let val = strength.saturating_sub(1).min(13); // 0-13
+        let quantized = u32::from(val) >> (4 - strength_bits);
+        quantized & ((1 << strength_bits) - 1)
+    };
+
+    // Quantize equity bin (0-15) into equity_bits
+    let e = if equity_bits == 0 {
+        0u32
+    } else {
+        let quantized = u32::from(equity_bin) >> (4 - equity_bits);
+        quantized & ((1 << equity_bits) - 1)
+    };
+
+    let mut bits: u32 = 0;
+    bits |= (u32::from(class_id) & 0x1F) << 23;        // 5 bits at 27-23
+    bits |= (s & 0xF) << 19;                            // 4 bits at 22-19
+    bits |= (e & 0xF) << 15;                            // 4 bits at 18-15
+    bits |= (u32::from(draw_flags) & 0x7F) << 8;        // 7 bits at 14-8
+    bits
+}
+
 /// Map a canonical hand to a unique index in 0..169.
 ///
 /// Canonical hands: 13 pairs + 78 suited combos + 78 offsuit combos.
@@ -540,5 +589,91 @@ mod tests {
         assert_eq!(canonical_hand_index_from_str(""), None);
         assert_eq!(canonical_hand_index_from_str("X"), None);
         assert_eq!(canonical_hand_index_from_str("AAAA"), None);
+    }
+
+    // === encode_hand_v2 tests ===
+
+    #[timed_test]
+    fn encode_hand_v2_class_id_round_trips() {
+        for id in 0..=21u8 {
+            let bits = encode_hand_v2(id, 1, 0, 0, 4, 4);
+            let extracted = (bits >> 23) & 0x1F;
+            assert_eq!(extracted, u32::from(id), "class_id {id}");
+        }
+    }
+
+    #[timed_test]
+    fn encode_hand_v2_strength_round_trips() {
+        for strength in 1..=14u8 {
+            let bits = encode_hand_v2(0, strength, 0, 0, 4, 4);
+            let extracted = ((bits >> 19) & 0xF) as u8;
+            // strength 1-14 stored as 0-13
+            assert_eq!(extracted, strength - 1, "strength {strength}");
+        }
+    }
+
+    #[timed_test]
+    fn encode_hand_v2_equity_round_trips() {
+        for eq in 0..=15u8 {
+            let bits = encode_hand_v2(0, 1, eq, 0, 4, 4);
+            let extracted = ((bits >> 15) & 0xF) as u8;
+            assert_eq!(extracted, eq, "equity_bin {eq}");
+        }
+    }
+
+    #[timed_test]
+    fn encode_hand_v2_draw_flags_round_trips() {
+        for flags in [0u8, 0x7F, 0b101_0101, 0b010_1010] {
+            let bits = encode_hand_v2(0, 1, 0, flags, 0, 0);
+            let extracted = ((bits >> 8) & 0x7F) as u8;
+            assert_eq!(extracted, flags, "draw_flags {flags:#b}");
+        }
+    }
+
+    #[timed_test]
+    fn encode_hand_v2_quantization_strength_bits_2() {
+        // strength=14 → val=13 → quantized = 13 >> 2 = 3 (2-bit: 0-3)
+        let bits = encode_hand_v2(0, 14, 0, 0, 2, 0);
+        let extracted = ((bits >> 19) & 0xF) as u8;
+        assert_eq!(extracted, 3);
+
+        // strength=1 → val=0 → quantized = 0 >> 2 = 0
+        let bits = encode_hand_v2(0, 1, 0, 0, 2, 0);
+        let extracted = ((bits >> 19) & 0xF) as u8;
+        assert_eq!(extracted, 0);
+    }
+
+    #[timed_test]
+    fn encode_hand_v2_zero_bits_means_omitted() {
+        let bits = encode_hand_v2(5, 14, 15, 0x7F, 0, 0);
+        // strength and equity should be zero
+        let s = ((bits >> 19) & 0xF) as u8;
+        let e = ((bits >> 15) & 0xF) as u8;
+        assert_eq!(s, 0, "strength should be 0 when strength_bits=0");
+        assert_eq!(e, 0, "equity should be 0 when equity_bits=0");
+        // class_id and draw_flags should still be present
+        assert_eq!((bits >> 23) & 0x1F, 5);
+        assert_eq!((bits >> 8) & 0x7F, 0x7F);
+    }
+
+    #[timed_test]
+    fn encode_hand_v2_different_strengths_different_bits() {
+        let b1 = encode_hand_v2(5, 1, 8, 0, 4, 4);
+        let b2 = encode_hand_v2(5, 14, 8, 0, 4, 4);
+        assert_ne!(b1, b2, "Different strengths should produce different encodings");
+    }
+
+    #[timed_test]
+    fn encode_hand_v2_different_equity_different_bits() {
+        let b1 = encode_hand_v2(5, 7, 0, 0, 4, 4);
+        let b2 = encode_hand_v2(5, 7, 15, 0, 4, 4);
+        assert_ne!(b1, b2, "Different equity bins should produce different encodings");
+    }
+
+    #[timed_test]
+    fn encode_hand_v2_fits_in_28_bits() {
+        // Max values for all fields
+        let bits = encode_hand_v2(31, 14, 15, 0x7F, 4, 4);
+        assert!(bits < (1 << 28), "Encoded value {bits:#010x} exceeds 28 bits");
     }
 }

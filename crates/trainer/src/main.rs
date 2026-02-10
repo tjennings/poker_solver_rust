@@ -9,7 +9,7 @@ use poker_solver_core::Game;
 use poker_solver_core::HandClass;
 use poker_solver_core::hand_class::HandClassification;
 use poker_solver_core::abstraction::{AbstractionConfig, BoundaryGenerator};
-use poker_solver_core::blueprint::{BlueprintStrategy, BundleConfig, StrategyBundle};
+use poker_solver_core::blueprint::{AbstractionModeConfig, BlueprintStrategy, BundleConfig, StrategyBundle};
 use poker_solver_core::cfr::convergence;
 use poker_solver_core::cfr::{MccfrConfig, MccfrSolver};
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
@@ -72,15 +72,21 @@ struct TrainingParams {
     mccfr_samples: usize,
     #[serde(default = "default_deal_count")]
     deal_count: usize,
-    /// `"hand_class"` or `"ehs2"` (default). Determines bucketing strategy.
-    #[serde(default = "default_abstraction_mode")]
-    abstraction_mode: String,
+    /// Which abstraction mode to use: `ehs2`, `hand_class`, or `hand_class_v2`.
+    #[serde(default)]
+    abstraction_mode: AbstractionModeConfig,
     /// Minimum deals per hand class for stratified generation (0 = disabled).
     #[serde(default)]
     min_deals_per_class: usize,
     /// Maximum rejection-sample attempts per deficit class.
     #[serde(default = "default_max_rejections")]
     max_rejections_per_class: usize,
+    /// Number of bits for intra-class strength (0-4). Only used with `hand_class_v2`.
+    #[serde(default = "default_strength_bits")]
+    strength_bits: u8,
+    /// Number of bits for equity bin (0-4). Only used with `hand_class_v2`.
+    #[serde(default = "default_equity_bits")]
+    equity_bits: u8,
     /// Enable zero-regret pruning during training.
     #[serde(default)]
     pruning: bool,
@@ -90,10 +96,6 @@ struct TrainingParams {
     /// Run a full un-pruned probe iteration every N iterations.
     #[serde(default = "default_pruning_probe_interval")]
     pruning_probe_interval: u64,
-}
-
-fn default_abstraction_mode() -> String {
-    "ehs2".to_string()
 }
 
 fn default_mccfr_samples() -> usize {
@@ -106,6 +108,14 @@ fn default_deal_count() -> usize {
 
 fn default_max_rejections() -> usize {
     500_000
+}
+
+fn default_strength_bits() -> u8 {
+    4
+}
+
+fn default_equity_bits() -> u8 {
+    4
 }
 
 fn default_pruning_warmup_fraction() -> f64 {
@@ -143,7 +153,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
-    let use_hand_class = config.training.abstraction_mode == "hand_class";
+    let abs_mode = config.training.abstraction_mode;
+    let use_hand_class = abs_mode == AbstractionModeConfig::HandClass;
+    let use_hand_class_v2 = abs_mode == AbstractionModeConfig::HandClassV2;
 
     println!("=== Poker Blueprint Trainer (MCCFR) ===\n");
     println!("Game config:");
@@ -152,7 +164,12 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     println!("  Deal pool size: {}", config.training.deal_count);
     println!();
 
-    if use_hand_class {
+    if use_hand_class_v2 {
+        println!(
+            "Abstraction: hand_class_v2 (strength_bits={}, equity_bits={})",
+            config.training.strength_bits, config.training.equity_bits
+        );
+    } else if use_hand_class {
         println!("Abstraction: hand_class (classify()-based, no EHS2)");
     } else if let Some(ref abs) = config.abstraction {
         println!("Abstraction config:");
@@ -170,8 +187,8 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     println!();
 
     // Generate bucket boundaries (only for EHS2 mode)
-    let boundaries = if use_hand_class {
-        println!("Skipping boundary generation (hand_class mode)\n");
+    let boundaries = if abs_mode.is_hand_class() {
+        println!("Skipping boundary generation ({abs_mode:?} mode)\n");
         None
     } else if let Some(ref abs_config) = config.abstraction {
         println!("Generating bucket boundaries...");
@@ -185,7 +202,12 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     };
 
     // Select abstraction mode for the game
-    let abstraction_mode = if use_hand_class {
+    let abstraction_mode = if use_hand_class_v2 {
+        Some(AbstractionMode::HandClassV2 {
+            strength_bits: config.training.strength_bits,
+            equity_bits: config.training.equity_bits,
+        })
+    } else if use_hand_class {
         Some(AbstractionMode::HandClass)
     } else {
         None
@@ -238,7 +260,9 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     let bundle_config = BundleConfig {
         game: config.game.clone(),
         abstraction: config.abstraction.clone(),
-        abstraction_mode: config.training.abstraction_mode.clone(),
+        abstraction_mode: abs_mode,
+        strength_bits: if use_hand_class_v2 { config.training.strength_bits } else { 0 },
+        equity_bits: if use_hand_class_v2 { config.training.equity_bits } else { 0 },
     };
 
     // Training loop with 10 checkpoints
