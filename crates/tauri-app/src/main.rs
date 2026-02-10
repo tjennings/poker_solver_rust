@@ -3,18 +3,9 @@
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(poker_solver_tauri::TrainingState::default())
         .manage(poker_solver_tauri::ExplorationState::default())
         .manage(poker_solver_tauri::SimulationState::default())
         .invoke_handler(tauri::generate_handler![
-            // Training commands
-            poker_solver_tauri::run_kuhn_training,
-            poker_solver_tauri::train_with_checkpoints,
-            poker_solver_tauri::start_training,
-            poker_solver_tauri::stop_training,
-            poker_solver_tauri::get_training_status,
-            poker_solver_tauri::save_strategy,
-            poker_solver_tauri::load_strategy,
             // Exploration commands
             poker_solver_tauri::load_bundle,
             poker_solver_tauri::get_strategy_matrix,
