@@ -14,7 +14,9 @@
 //! Action encoding (4 bits): 0=empty, 1=fold, 2=check, 3=call,
 //! 4-8=bet idx 0-4, 9-13=raise idx 0-4, 14=bet all-in, 15=raise all-in.
 
+use crate::blueprint::BlueprintStrategy;
 use crate::game::{Action, ALL_IN};
+use crate::hand_class::{HandClass, HandClassification};
 use crate::poker::{Card, Suit, Value};
 
 const HAND_SHIFT: u32 = 36;
@@ -332,6 +334,446 @@ fn value_from_char(c: char) -> Option<Value> {
         '3' => Some(Value::Three),
         '2' => Some(Value::Two),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key translation API
+// ---------------------------------------------------------------------------
+
+const STREET_NAMES: [&str; 4] = ["preflop", "flop", "turn", "river"];
+
+const ACTION_CODE_NAMES: [&str; 16] = [
+    "empty", "fold", "check", "call",
+    "bet0", "bet1", "bet2", "bet3", "bet4",
+    "raise0", "raise1", "raise2", "raise3", "raise4",
+    "bet-allin", "raise-allin",
+];
+
+/// Decoded components of an info set key with both hex and human-readable forms.
+#[derive(Debug, Clone)]
+pub struct KeyDescription {
+    /// Raw u64 key value.
+    pub raw: u64,
+    /// 28-bit hand field.
+    pub hand_bits: u32,
+    /// Human-readable hand label (e.g. "AKs", "`TopPair`", "`TopPair`:5:8").
+    pub hand_label: String,
+    /// Street index (0-3).
+    pub street: u8,
+    /// Street name ("preflop", "flop", "turn", "river").
+    pub street_label: &'static str,
+    /// SPR bucket (0-31).
+    pub spr_bucket: u32,
+    /// Depth bucket (0-15).
+    pub depth_bucket: u32,
+    /// Non-zero action codes extracted from the key.
+    pub action_codes: Vec<u8>,
+    /// Human-readable action labels (e.g. "Check", "Bet 67%").
+    pub action_labels: Vec<String>,
+    /// Strategy probabilities from the blueprint, if found.
+    pub strategy: Option<Vec<f32>>,
+}
+
+impl KeyDescription {
+    /// Produce the human-readable compose string that recreates this key.
+    #[must_use]
+    pub fn compose_string(&self) -> String {
+        let actions_str = self
+            .action_codes
+            .iter()
+            .map(|&c| ACTION_CODE_NAMES[c as usize])
+            .collect::<Vec<_>>()
+            .join(",");
+
+        if actions_str.is_empty() {
+            format!(
+                "hand={} street={} spr={} depth={}",
+                self.hand_label, self.street_label, self.spr_bucket, self.depth_bucket
+            )
+        } else {
+            format!(
+                "hand={} street={} spr={} depth={} actions={}",
+                self.hand_label, self.street_label, self.spr_bucket, self.depth_bucket, actions_str
+            )
+        }
+    }
+}
+
+/// Decode a 4-bit action code to its string label.
+#[must_use]
+pub fn decode_action_code(code: u8) -> &'static str {
+    ACTION_CODE_NAMES.get(code as usize).unwrap_or(&"unknown")
+}
+
+/// Format an action with resolved bet sizes as a human-readable string.
+///
+/// Uses `bet_sizes` to convert `Bet(idx)` / `Raise(idx)` into percentage labels.
+#[must_use]
+pub fn format_action_label(action: Action, bet_sizes: &[f32]) -> String {
+    match action {
+        Action::Fold => "Fold".into(),
+        Action::Check => "Check".into(),
+        Action::Call => "Call".into(),
+        Action::Bet(idx) if idx == ALL_IN => "Bet All-In".into(),
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Action::Bet(idx) => {
+            let pct = (bet_sizes.get(idx as usize).unwrap_or(&0.0) * 100.0) as u32;
+            format!("Bet {pct}%")
+        }
+        Action::Raise(idx) if idx == ALL_IN => "Raise All-In".into(),
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Action::Raise(idx) => {
+            let pct = (bet_sizes.get(idx as usize).unwrap_or(&0.0) * 100.0) as u32;
+            format!("Raise {pct}%")
+        }
+    }
+}
+
+/// Format a 4-bit action code with resolved bet sizes as a human-readable string.
+#[must_use]
+pub fn format_action_code_label(code: u8, bet_sizes: &[f32]) -> String {
+    match code {
+        0 => String::new(),
+        1 => "Fold".into(),
+        2 => "Check".into(),
+        3 => "Call".into(),
+        c @ 4..=8 => {
+            let idx = (c - 4) as usize;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pct = (bet_sizes.get(idx).unwrap_or(&0.0) * 100.0) as u32;
+            format!("Bet {pct}%")
+        }
+        c @ 9..=13 => {
+            let idx = (c - 9) as usize;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pct = (bet_sizes.get(idx).unwrap_or(&0.0) * 100.0) as u32;
+            format!("Raise {pct}%")
+        }
+        14 => "Bet All-In".into(),
+        15 => "Raise All-In".into(),
+        _ => "Unknown".into(),
+    }
+}
+
+/// Map a canonical hand index (0..168) back to its string representation.
+///
+/// Returns labels like `"AA"`, `"AKs"`, `"72o"`.
+#[must_use]
+pub fn reverse_canonical_index(index: u16) -> &'static str {
+    const RANKS: [char; 13] = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+
+    static HANDS: std::sync::LazyLock<[String; 169]> = std::sync::LazyLock::new(|| {
+        let mut table: [String; 169] = std::array::from_fn(|_| String::new());
+        let mut idx = 0usize;
+
+        // Pairs: AA=0, KK=1, ..., 22=12
+        for r in RANKS {
+            table[idx] = format!("{r}{r}");
+            idx += 1;
+        }
+
+        // Suited: triangle_index(high, low) = high*(high-1)/2 + low
+        for (high, &h) in RANKS.iter().enumerate().skip(1) {
+            for &l in &RANKS[..high] {
+                table[idx] = format!("{l}{h}s");
+                idx += 1;
+            }
+        }
+
+        // Offsuit: same triangle order
+        for (high, &h) in RANKS.iter().enumerate().skip(1) {
+            for &l in &RANKS[..high] {
+                table[idx] = format!("{l}{h}o");
+                idx += 1;
+            }
+        }
+
+        table
+    });
+
+    &HANDS[index as usize]
+}
+
+/// Describe a key from either hex or compose format.
+///
+/// Accepts:
+/// - Hex: `"0x002A400000300000"` or raw hex digits
+/// - Compose: `"hand=TopPair street=flop spr=12 depth=7 actions=check,bet1"`
+///
+/// # Errors
+///
+/// Returns an error if the input cannot be parsed.
+pub fn describe_key(
+    input: &str,
+    bet_sizes: &[f32],
+    abstraction_mode: &str,
+    blueprint: Option<&BlueprintStrategy>,
+) -> Result<KeyDescription, String> {
+    let trimmed = input.trim();
+
+    if is_hex_input(trimmed) {
+        describe_from_hex(trimmed, bet_sizes, abstraction_mode, blueprint)
+    } else {
+        describe_from_compose(trimmed, bet_sizes, abstraction_mode, blueprint)
+    }
+}
+
+fn is_hex_input(s: &str) -> bool {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit() || c == '_')
+}
+
+fn describe_from_hex(
+    input: &str,
+    bet_sizes: &[f32],
+    abstraction_mode: &str,
+    blueprint: Option<&BlueprintStrategy>,
+) -> Result<KeyDescription, String> {
+    let hex_str = input
+        .strip_prefix("0x")
+        .or_else(|| input.strip_prefix("0X"))
+        .unwrap_or(input)
+        .replace('_', "");
+
+    let raw = u64::from_str_radix(&hex_str, 16)
+        .map_err(|e| format!("invalid hex: {e}"))?;
+
+    let key = InfoKey::from_raw(raw);
+    let hand_bits = key.hand_bits();
+    let street = key.street();
+    let spr = key.spr_bucket();
+    let depth = key.depth_bucket();
+
+    let action_codes = extract_action_codes(key.actions_bits());
+    let action_labels = action_codes
+        .iter()
+        .map(|&c| format_action_code_label(c, bet_sizes))
+        .collect();
+
+    let hand_label = hand_label_from_bits(hand_bits, street, abstraction_mode);
+    let strategy = blueprint.and_then(|bp| bp.lookup(raw).map(<[f32]>::to_vec));
+
+    Ok(KeyDescription {
+        raw,
+        hand_bits,
+        hand_label,
+        street,
+        street_label: STREET_NAMES[street as usize],
+        spr_bucket: spr,
+        depth_bucket: depth,
+        action_codes,
+        action_labels,
+        strategy,
+    })
+}
+
+fn describe_from_compose(
+    input: &str,
+    bet_sizes: &[f32],
+    abstraction_mode: &str,
+    blueprint: Option<&BlueprintStrategy>,
+) -> Result<KeyDescription, String> {
+    let mut hand_str: Option<&str> = None;
+    let mut street_str: Option<&str> = None;
+    let mut spr_val: Option<u32> = None;
+    let mut depth_val: Option<u32> = None;
+    let mut actions_str: Option<&str> = None;
+
+    for part in input.split_whitespace() {
+        if let Some(val) = part.strip_prefix("hand=") {
+            hand_str = Some(val);
+        } else if let Some(val) = part.strip_prefix("street=") {
+            street_str = Some(val);
+        } else if let Some(val) = part.strip_prefix("spr=") {
+            spr_val = Some(val.parse().map_err(|_| format!("invalid spr: {val}"))?);
+        } else if let Some(val) = part.strip_prefix("depth=") {
+            depth_val = Some(val.parse().map_err(|_| format!("invalid depth: {val}"))?);
+        } else if let Some(val) = part.strip_prefix("actions=") {
+            actions_str = Some(val);
+        } else {
+            return Err(format!("unknown field: {part}"));
+        }
+    }
+
+    let hand_raw = hand_str.ok_or("missing hand= field")?;
+    let street = parse_street(street_str.ok_or("missing street= field")?)?;
+    let spr = spr_val.ok_or("missing spr= field")?;
+    let depth = depth_val.ok_or("missing depth= field")?;
+
+    let hand_bits = parse_hand_bits(hand_raw, abstraction_mode)?;
+
+    let action_codes = match actions_str {
+        Some(s) if !s.is_empty() => parse_action_codes(s)?,
+        _ => Vec::new(),
+    };
+
+    let action_labels = action_codes
+        .iter()
+        .map(|&c| format_action_code_label(c, bet_sizes))
+        .collect();
+
+    let raw = InfoKey::new(hand_bits, street, spr, depth, &action_codes).as_u64();
+    let strategy = blueprint.and_then(|bp| bp.lookup(raw).map(<[f32]>::to_vec));
+
+    let hand_label = hand_raw.to_string();
+
+    Ok(KeyDescription {
+        raw,
+        hand_bits,
+        hand_label,
+        street,
+        street_label: STREET_NAMES[street as usize],
+        spr_bucket: spr,
+        depth_bucket: depth,
+        action_codes,
+        action_labels,
+        strategy,
+    })
+}
+
+/// Extract non-zero action codes from the 24-bit action field.
+fn extract_action_codes(actions_bits: u32) -> Vec<u8> {
+    let mut codes = Vec::new();
+    for i in 0..6 {
+        let code = ((actions_bits >> (20 - i * 4)) & 0xF) as u8;
+        if code == 0 {
+            break;
+        }
+        codes.push(code);
+    }
+    codes
+}
+
+fn parse_street(s: &str) -> Result<u8, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "preflop" | "0" => Ok(0),
+        "flop" | "1" => Ok(1),
+        "turn" | "2" => Ok(2),
+        "river" | "3" => Ok(3),
+        _ => Err(format!("invalid street: {s}")),
+    }
+}
+
+fn parse_hand_bits(hand: &str, mode: &str) -> Result<u32, String> {
+    // Try raw numeric first (decimal or hex)
+    if let Ok(v) = hand.parse::<u32>() {
+        return Ok(v);
+    }
+    if let Some(hex) = hand.strip_prefix("0x") {
+        return u32::from_str_radix(hex, 16).map_err(|e| format!("invalid hex hand: {e}"));
+    }
+
+    match mode {
+        "ehs2" => {
+            // Canonical hand string like "AKs", "QQ"
+            canonical_hand_index_from_str(hand)
+                .map(u32::from)
+                .ok_or_else(|| format!("invalid canonical hand: {hand}"))
+        }
+        "hand_class" => {
+            // HandClassification from class names, e.g. "TopPair" or "TopPair+FlushDraw"
+            let parts: Vec<&str> = hand.split('+').collect();
+            let cls = HandClassification::from_strings(&parts)
+                .map_err(|e| format!("invalid hand class: {e}"))?;
+            Ok(cls.bits())
+        }
+        "hand_class_v2" => {
+            // Packed format: "TopPair:5:8" = class:strength:equity
+            parse_hand_class_v2(hand)
+        }
+        _ => Err(format!("unknown abstraction mode: {mode}")),
+    }
+}
+
+fn parse_hand_class_v2(hand: &str) -> Result<u32, String> {
+    let parts: Vec<&str> = hand.split(':').collect();
+    let class_name = parts.first().ok_or("empty hand class")?;
+
+    let class = HandClass::from_name(class_name)
+        .ok_or_else(|| format!("unknown hand class: {class_name}"))?;
+    let class_id = class as u8;
+
+    let strength: u8 = parts
+        .get(1)
+        .unwrap_or(&"1")
+        .parse()
+        .map_err(|_| "invalid strength")?;
+    let equity: u8 = parts
+        .get(2)
+        .unwrap_or(&"0")
+        .parse()
+        .map_err(|_| "invalid equity")?;
+
+    // Draw flags from additional parts like "+FlushDraw"
+    let draw_flags = 0u8; // Simplified — could extend later
+
+    Ok(encode_hand_v2(class_id, strength, equity, draw_flags, 4, 4))
+}
+
+fn parse_action_codes(s: &str) -> Result<Vec<u8>, String> {
+    s.split(',')
+        .map(|a| {
+            let lower = a.trim().to_ascii_lowercase();
+            match lower.as_str() {
+                "fold" => Ok(1),
+                "check" => Ok(2),
+                "call" => Ok(3),
+                "bet0" => Ok(4),
+                "bet1" => Ok(5),
+                "bet2" => Ok(6),
+                "bet3" => Ok(7),
+                "bet4" => Ok(8),
+                "raise0" => Ok(9),
+                "raise1" => Ok(10),
+                "raise2" => Ok(11),
+                "raise3" => Ok(12),
+                "raise4" => Ok(13),
+                "bet-allin" | "betallin" => Ok(14),
+                "raise-allin" | "raiseallin" => Ok(15),
+                _ => Err(format!("unknown action: {a}")),
+            }
+        })
+        .collect()
+}
+
+/// Generate a human-readable hand label from the raw 28-bit hand field.
+fn hand_label_from_bits(hand_bits: u32, street: u8, mode: &str) -> String {
+    match mode {
+        "ehs2" => {
+            if street == 0 && hand_bits < 169 {
+                #[allow(clippy::cast_possible_truncation)]
+                reverse_canonical_index(hand_bits as u16).to_string()
+            } else {
+                format!("bucket:{hand_bits}")
+            }
+        }
+        "hand_class" => {
+            let cls = HandClassification::from_bits(hand_bits);
+            if cls.is_empty() {
+                format!("bits:{hand_bits:#x}")
+            } else {
+                cls.to_strings().join("+")
+            }
+        }
+        "hand_class_v2" => {
+            let class_id = (hand_bits >> 23) & 0x1F;
+            let strength = ((hand_bits >> 19) & 0xF) as u8;
+            let equity = ((hand_bits >> 15) & 0xF) as u8;
+            let draw_flags = ((hand_bits >> 8) & 0x7F) as u8;
+
+            let class_name = HandClass::ALL
+                .get(class_id as usize)
+                .map_or_else(|| format!("class{class_id}"), std::string::ToString::to_string);
+
+            let mut label = format!("{class_name}:{strength}:{equity}");
+            if draw_flags != 0 {
+                use std::fmt::Write;
+                let _ = write!(label, ":d{draw_flags:#04x}");
+            }
+            label
+        }
+        _ => format!("{hand_bits}"),
     }
 }
 
@@ -675,5 +1117,136 @@ mod tests {
         // Max values for all fields
         let bits = encode_hand_v2(31, 14, 15, 0x7F, 4, 4);
         assert!(bits < (1 << 28), "Encoded value {bits:#010x} exceeds 28 bits");
+    }
+
+    // === Key translation API tests ===
+
+    #[timed_test]
+    fn decode_action_code_all_16() {
+        assert_eq!(decode_action_code(0), "empty");
+        assert_eq!(decode_action_code(1), "fold");
+        assert_eq!(decode_action_code(2), "check");
+        assert_eq!(decode_action_code(3), "call");
+        assert_eq!(decode_action_code(4), "bet0");
+        assert_eq!(decode_action_code(8), "bet4");
+        assert_eq!(decode_action_code(9), "raise0");
+        assert_eq!(decode_action_code(13), "raise4");
+        assert_eq!(decode_action_code(14), "bet-allin");
+        assert_eq!(decode_action_code(15), "raise-allin");
+    }
+
+    #[timed_test]
+    fn format_action_label_all_variants() {
+        let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
+        assert_eq!(format_action_label(Action::Fold, &sizes), "Fold");
+        assert_eq!(format_action_label(Action::Check, &sizes), "Check");
+        assert_eq!(format_action_label(Action::Call, &sizes), "Call");
+        assert_eq!(format_action_label(Action::Bet(0), &sizes), "Bet 33%");
+        assert_eq!(format_action_label(Action::Bet(1), &sizes), "Bet 67%");
+        assert_eq!(format_action_label(Action::Bet(2), &sizes), "Bet 100%");
+        assert_eq!(format_action_label(Action::Bet(ALL_IN), &sizes), "Bet All-In");
+        assert_eq!(format_action_label(Action::Raise(0), &sizes), "Raise 33%");
+        assert_eq!(format_action_label(Action::Raise(ALL_IN), &sizes), "Raise All-In");
+    }
+
+    #[timed_test]
+    fn reverse_canonical_index_roundtrip() {
+        for idx in 0..169u16 {
+            let name = reverse_canonical_index(idx);
+            let back = canonical_hand_index_from_str(name);
+            assert_eq!(back, Some(idx), "roundtrip failed for index {idx} -> {name}");
+        }
+    }
+
+    #[timed_test]
+    fn reverse_canonical_index_known_values() {
+        assert_eq!(reverse_canonical_index(0), "AA");
+        assert_eq!(reverse_canonical_index(1), "KK");
+        assert_eq!(reverse_canonical_index(12), "22");
+        assert_eq!(reverse_canonical_index(13), "AKs");
+        assert_eq!(reverse_canonical_index(91), "AKo");
+    }
+
+    #[timed_test]
+    fn describe_key_hex_roundtrip() {
+        let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
+        let key = InfoKey::new(42, 1, 10, 5, &[2, 5]).as_u64();
+        let hex = format!("0x{key:016X}");
+
+        let desc = describe_key(&hex, &sizes, "ehs2", None).unwrap();
+        assert_eq!(desc.raw, key);
+        assert_eq!(desc.street, 1);
+        assert_eq!(desc.spr_bucket, 10);
+        assert_eq!(desc.depth_bucket, 5);
+        assert_eq!(desc.action_codes, vec![2, 5]);
+    }
+
+    #[timed_test]
+    fn describe_key_compose_format() {
+        let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
+        let input = "hand=AKs street=preflop spr=31 depth=15";
+
+        let desc = describe_key(input, &sizes, "ehs2", None).unwrap();
+        assert_eq!(desc.street, 0);
+        assert_eq!(desc.spr_bucket, 31);
+        assert_eq!(desc.depth_bucket, 15);
+        assert_eq!(desc.hand_bits, 13); // AKs = index 13
+    }
+
+    #[timed_test]
+    fn describe_key_compose_with_actions() {
+        let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
+        let input = "hand=QQ street=flop spr=5 depth=3 actions=check,bet1";
+
+        let desc = describe_key(input, &sizes, "ehs2", None).unwrap();
+        assert_eq!(desc.action_codes, vec![2, 5]); // check=2, bet1=5
+        assert_eq!(desc.action_labels, vec!["Check", "Bet 67%"]);
+    }
+
+    #[timed_test]
+    fn describe_key_hex_then_compose_roundtrip() {
+        let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
+        let input = "hand=AKs street=preflop spr=20 depth=10 actions=call";
+
+        let desc1 = describe_key(input, &sizes, "ehs2", None).unwrap();
+        let hex = format!("0x{:016X}", desc1.raw);
+        let desc2 = describe_key(&hex, &sizes, "ehs2", None).unwrap();
+
+        assert_eq!(desc1.raw, desc2.raw);
+        assert_eq!(desc1.street, desc2.street);
+        assert_eq!(desc1.spr_bucket, desc2.spr_bucket);
+        assert_eq!(desc1.action_codes, desc2.action_codes);
+    }
+
+    #[timed_test]
+    fn compose_string_output() {
+        let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
+        let input = "hand=AKs street=flop spr=10 depth=5 actions=check,bet1";
+
+        let desc = describe_key(input, &sizes, "ehs2", None).unwrap();
+        let compose = desc.compose_string();
+        assert!(compose.contains("hand=AKs"), "compose: {compose}");
+        assert!(compose.contains("street=flop"), "compose: {compose}");
+        assert!(compose.contains("spr=10"), "compose: {compose}");
+        assert!(compose.contains("actions=check,bet1"), "compose: {compose}");
+    }
+
+    #[timed_test]
+    fn extract_action_codes_stops_at_zero() {
+        // Actions [3, 5, 0, 0, 0, 0] → should return [3, 5]
+        let bits = (3u32 << 20) | (5u32 << 16);
+        let codes = extract_action_codes(bits);
+        assert_eq!(codes, vec![3, 5]);
+    }
+
+    #[timed_test]
+    fn describe_key_hand_class_mode() {
+        let sizes = vec![0.33, 0.67, 1.0];
+        let input = "hand=TopPair street=flop spr=5 depth=3";
+
+        let desc = describe_key(input, &sizes, "hand_class", None).unwrap();
+        // TopPair = discriminant 13 → bit 13 set → 0x2000
+        let expected_bits = 1u32 << (HandClass::TopPair as u8);
+        assert_eq!(desc.hand_bits, expected_bits);
     }
 }

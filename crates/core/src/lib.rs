@@ -25,6 +25,7 @@ pub mod hands;
 pub mod info_key;
 pub mod showdown_equity;
 pub mod simulation;
+pub mod tree;
 
 pub use agent::AgentConfig;
 pub use error::SolverError;

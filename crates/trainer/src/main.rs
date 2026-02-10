@@ -1,3 +1,5 @@
+mod tree;
+
 use std::error::Error;
 use std::io::Write;
 use std::path::PathBuf;
@@ -45,6 +47,27 @@ enum Commands {
         /// Output file (defaults to stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+    /// Analyze game tree or translate info set keys
+    Tree {
+        /// Path to trained strategy bundle
+        #[arg(short, long)]
+        bundle: PathBuf,
+        /// Max tree depth to traverse
+        #[arg(short, long, default_value = "4")]
+        depth: usize,
+        /// Prune branches below this probability
+        #[arg(short, long, default_value = "0.01")]
+        min_prob: f32,
+        /// RNG seed for deal selection
+        #[arg(short, long, default_value = "42")]
+        seed: u64,
+        /// Info set key (hex or compose format) for key describe mode
+        #[arg(short, long)]
+        key: Option<String>,
+        /// Filter deals to this canonical hand (e.g. "AKs", "QQ")
+        #[arg(long)]
+        hand: Option<String>,
     },
 }
 
@@ -146,6 +169,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Commands::Flops { format, output } => {
             run_flops(format, output)?;
+        }
+        Commands::Tree {
+            bundle,
+            depth,
+            min_prob,
+            seed,
+            key,
+            hand,
+        } => {
+            tree::run_tree(
+                &bundle,
+                depth,
+                min_prob,
+                seed,
+                key.as_deref(),
+                hand.as_deref(),
+            )?;
         }
     }
 

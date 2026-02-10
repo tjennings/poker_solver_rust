@@ -138,36 +138,52 @@ impl FromStr for HandClass {
     type Err = ParseHandClassError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "StraightFlush" => Ok(Self::StraightFlush),
-            "FourOfAKind" => Ok(Self::FourOfAKind),
-            "FullHouse" => Ok(Self::FullHouse),
-            "NutFlush" => Ok(Self::NutFlush),
-            "Flush" => Ok(Self::Flush),
-            "Straight" => Ok(Self::Straight),
-            "TopSet" => Ok(Self::TopSet),
-            "Set" => Ok(Self::Set),
-            "BottomSet" => Ok(Self::BottomSet),
-            "Trips" => Ok(Self::Trips),
-            "TwoPair" => Ok(Self::TwoPair),
-            "Overpair" => Ok(Self::Overpair),
-            "TopPairTopKicker" => Ok(Self::TopPairTopKicker),
-            "TopPair" => Ok(Self::TopPair),
-            "SecondPair" => Ok(Self::SecondPair),
-            "ThirdPair" => Ok(Self::ThirdPair),
-            "LowPair" => Ok(Self::LowPair),
-            "Underpair" => Ok(Self::Underpair),
-            "Overcards" => Ok(Self::Overcards),
-            "AceHigh" => Ok(Self::AceHigh),
-            "KingHigh" => Ok(Self::KingHigh),
-            "ComboDraw" => Ok(Self::ComboDraw),
-            "FlushDrawNuts" => Ok(Self::FlushDrawNuts),
-            "FlushDraw" => Ok(Self::FlushDraw),
-            "BackdoorFlushDraw" => Ok(Self::BackdoorFlushDraw),
-            "Oesd" => Ok(Self::Oesd),
-            "Gutshot" => Ok(Self::Gutshot),
-            "BackdoorStraightDraw" => Ok(Self::BackdoorStraightDraw),
-            _ => Err(ParseHandClassError(s.to_string())),
+        // Try exact match first, then case-insensitive
+        Self::from_name(s).ok_or_else(|| ParseHandClassError(s.to_string()))
+    }
+}
+
+impl HandClass {
+    /// Parse a hand class name, case-insensitive.
+    ///
+    /// Accepts both `"TopPair"` and `"toppair"` formats.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        let lower = name.to_ascii_lowercase();
+        match lower.as_str() {
+            "straightflush" | "straight_flush" => Some(Self::StraightFlush),
+            "fourofakind" | "four_of_a_kind" | "quads" => Some(Self::FourOfAKind),
+            "fullhouse" | "full_house" => Some(Self::FullHouse),
+            "nutflush" | "nut_flush" => Some(Self::NutFlush),
+            "flush" => Some(Self::Flush),
+            "straight" => Some(Self::Straight),
+            "topset" | "top_set" => Some(Self::TopSet),
+            "set" => Some(Self::Set),
+            "bottomset" | "bottom_set" => Some(Self::BottomSet),
+            "trips" => Some(Self::Trips),
+            "twopair" | "two_pair" => Some(Self::TwoPair),
+            "overpair" | "over_pair" => Some(Self::Overpair),
+            "toppairtopkicker" | "top_pair_top_kicker" | "tptk" => Some(Self::TopPairTopKicker),
+            "toppair" | "top_pair" => Some(Self::TopPair),
+            "secondpair" | "second_pair" => Some(Self::SecondPair),
+            "thirdpair" | "third_pair" => Some(Self::ThirdPair),
+            "lowpair" | "low_pair" => Some(Self::LowPair),
+            "underpair" | "under_pair" => Some(Self::Underpair),
+            "overcards" | "over_cards" => Some(Self::Overcards),
+            "acehigh" | "ace_high" => Some(Self::AceHigh),
+            "kinghigh" | "king_high" => Some(Self::KingHigh),
+            "combodraw" | "combo_draw" => Some(Self::ComboDraw),
+            "flushdraewnuts" | "flushdraw_nuts" | "flush_draw_nuts" | "flushdrawnuts" => {
+                Some(Self::FlushDrawNuts)
+            }
+            "flushdraw" | "flush_draw" => Some(Self::FlushDraw),
+            "backdoorflushdraw" | "backdoor_flush_draw" => Some(Self::BackdoorFlushDraw),
+            "oesd" | "open_ended" => Some(Self::Oesd),
+            "gutshot" | "gut_shot" => Some(Self::Gutshot),
+            "backdoorstraightdraw" | "backdoor_straight_draw" => {
+                Some(Self::BackdoorStraightDraw)
+            }
+            _ => None,
         }
     }
 }
