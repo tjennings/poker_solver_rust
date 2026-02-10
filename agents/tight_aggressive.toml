@@ -57,6 +57,15 @@ call = 0.25
 "1.0" = 0.4
 allin = 0.15
 
+[classes.NutFlush]
+fold = 0.0
+call = 0.2
+
+[classes.NutFlush.raises]
+"0.5" = 0.15
+"1.0" = 0.4
+allin = 0.25
+
 [classes.Flush]
 fold = 0.0
 call = 0.3
@@ -76,6 +85,15 @@ call = 0.35
 allin = 0.05
 
 # --- Strong hands: raise-heavy ---
+[classes.TopSet]
+fold = 0.0
+call = 0.15
+
+[classes.TopSet.raises]
+"0.5" = 0.15
+"1.0" = 0.4
+allin = 0.3
+
 [classes.Set]
 fold = 0.0
 call = 0.25
@@ -83,6 +101,15 @@ call = 0.25
 [classes.Set.raises]
 "0.5" = 0.2
 "1.0" = 0.4
+allin = 0.15
+
+[classes.BottomSet]
+fold = 0.0
+call = 0.3
+
+[classes.BottomSet.raises]
+"0.5" = 0.2
+"1.0" = 0.35
 allin = 0.15
 
 [classes.Trips]
@@ -102,6 +129,24 @@ call = 0.4
 "0.5" = 0.25
 "1.0" = 0.3
 allin = 0.05
+
+[classes.Overpair]
+fold = 0.0
+call = 0.3
+
+[classes.Overpair.raises]
+"0.5" = 0.25
+"1.0" = 0.35
+allin = 0.1
+
+[classes.TopPairTopKicker]
+fold = 0.0
+call = 0.35
+
+[classes.TopPairTopKicker.raises]
+"0.5" = 0.3
+"1.0" = 0.25
+allin = 0.1
 
 [classes.TopPair]
 fold = 0.05
@@ -149,6 +194,15 @@ call = 0.25
 "1.0" = 0.05
 allin = 0.0
 
+[classes.Overcards]
+fold = 0.3
+call = 0.3
+
+[classes.Overcards.raises]
+"0.5" = 0.15
+"1.0" = 0.2
+allin = 0.05
+
 # --- No pair: fold or bluff, rarely flat ---
 [classes.AceHigh]
 fold = 0.45
@@ -169,6 +223,15 @@ call = 0.15
 allin = 0.05
 
 # --- Draws: aggressive semi-bluffs ---
+[classes.ComboDraw]
+fold = 0.0
+call = 0.25
+
+[classes.ComboDraw.raises]
+"0.5" = 0.2
+"1.0" = 0.4
+allin = 0.15
+
 [classes.FlushDrawNuts]
 fold = 0.0
 call = 0.35
@@ -212,4 +275,13 @@ call = 0.3
 [classes.Gutshot.raises]
 "0.5" = 0.15
 "1.0" = 0.15
+allin = 0.05
+
+[classes.BackdoorStraightDraw]
+fold = 0.45
+call = 0.25
+
+[classes.BackdoorStraightDraw.raises]
+"0.5" = 0.15
+"1.0" = 0.1
 allin = 0.05

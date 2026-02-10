@@ -3,12 +3,12 @@
 //! ## Bit Layout
 //!
 //! ```text
-//! Bits 63-44: hand/bucket   (20 bits)
-//! Bits 43-42: street         (2 bits)
-//! Bits 41-37: pot_bucket     (5 bits)
-//! Bits 36-33: stack_bucket   (4 bits)
-//! Bit  32:    (reserved)
-//! Bits 31-0:  action slots  (32 bits) — up to 8 actions × 4 bits
+//! Bits 63-36: hand/bucket   (28 bits)
+//! Bits 35-34: street         (2 bits)
+//! Bits 33-29: pot_bucket     (5 bits)
+//! Bits 28-25: stack_bucket   (4 bits)
+//! Bit  24:    (reserved)
+//! Bits 23-0:  action slots  (24 bits) — up to 6 actions × 4 bits
 //! ```
 //!
 //! Action encoding (4 bits): 0=empty, 1=fold, 2=check, 3=call,
@@ -17,14 +17,14 @@
 use crate::game::{Action, ALL_IN};
 use crate::poker::{Card, Suit, Value};
 
-const HAND_SHIFT: u32 = 44;
-const STREET_SHIFT: u32 = 42;
-const POT_SHIFT: u32 = 37;
-const STACK_SHIFT: u32 = 33;
+const HAND_SHIFT: u32 = 36;
+const STREET_SHIFT: u32 = 34;
+const POT_SHIFT: u32 = 29;
+const STACK_SHIFT: u32 = 25;
 
 /// A packed u64 information set key.
 ///
-/// Encodes hand/bucket, street, pot/stack buckets, and up to 8 actions
+/// Encodes hand/bucket, street, pot/stack buckets, and up to 6 actions
 /// in a single 64-bit integer for allocation-free hashing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InfoKey(u64);
@@ -33,7 +33,7 @@ impl InfoKey {
     /// Build a key from its components.
     ///
     /// # Arguments
-    /// * `hand_or_bucket` - Canonical hand index (0-168) or classification bits (up to 20 bits)
+    /// * `hand_or_bucket` - Canonical hand index (0-168) or classification bits (up to 28 bits)
     /// * `street` - 0=Preflop, 1=Flop, 2=Turn, 3=River
     /// * `pot_bucket` - pot / 20 (5 bits, max 31)
     /// * `stack_bucket` - `eff_stack` / 20 (4 bits, max 15)
@@ -47,16 +47,16 @@ impl InfoKey {
         actions: &[u8],
     ) -> Self {
         let mut key: u64 = 0;
-        key |= (u64::from(hand_or_bucket) & 0xF_FFFF) << HAND_SHIFT;
+        key |= (u64::from(hand_or_bucket) & 0xFFF_FFFF) << HAND_SHIFT;
         key |= (u64::from(street) & 0x3) << STREET_SHIFT;
         key |= (u64::from(pot_bucket) & 0x1F) << POT_SHIFT;
         key |= (u64::from(stack_bucket) & 0xF) << STACK_SHIFT;
 
-        // Pack up to 8 actions into bits 31..0 (4 bits each, MSB-first)
-        // Action 0 → bits 31-28, action 1 → bits 27-24, ..., action 7 → bits 3-0
-        for (i, &code) in actions.iter().take(8).enumerate() {
+        // Pack up to 6 actions into bits 23..0 (4 bits each, MSB-first)
+        // Action 0 → bits 23-20, action 1 → bits 19-16, ..., action 5 → bits 3-0
+        for (i, &code) in actions.iter().take(6).enumerate() {
             #[allow(clippy::cast_possible_truncation)]
-            let shift = 28 - (i as u32) * 4;
+            let shift = 20 - (i as u32) * 4;
             key |= (u64::from(code) & 0xF) << shift;
         }
 
@@ -425,9 +425,8 @@ mod tests {
 
     #[timed_test]
     fn actions_do_not_overlap_with_stack_bucket() {
-        // With the old buggy shift (32 - i*4), action bits overlapped stack_bucket.
         // Verify that setting all action bits to max doesn't corrupt stack_bucket.
-        let key = InfoKey::new(0, 0, 0, 15, &[15, 15, 15, 15, 15, 15, 15, 15]);
+        let key = InfoKey::new(0, 0, 0, 15, &[15, 15, 15, 15, 15, 15]);
         assert_eq!(key.stack_bucket(), 15, "Stack bucket corrupted by action bits");
 
         // Verify that max stack_bucket doesn't corrupt first action

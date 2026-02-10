@@ -791,7 +791,7 @@ raise = 0.35
             .join("agents/tight_weak.toml");
         let config = AgentConfig::load(&path).unwrap();
         assert_eq!(config.game.stack_depth, 100);
-        assert_eq!(config.classes.len(), 20);
+        assert_eq!(config.classes.len(), 28);
         assert!(config.ranges.contains_key("btn"));
         assert!(config.ranges.contains_key("bb"));
     }
@@ -806,7 +806,7 @@ raise = 0.35
             .join("agents/tight_aggressive.toml");
         let config = AgentConfig::load(&path).unwrap();
         assert_eq!(config.game.stack_depth, 100);
-        assert_eq!(config.classes.len(), 20);
+        assert_eq!(config.classes.len(), 28);
         // TAG should have wide playable range and non-empty raise range
         let btn = config.ranges.get("btn").unwrap();
         assert!(btn.call.len() > 50, "TAG btn call range should be wide, got {}", btn.call.len());
@@ -823,7 +823,7 @@ raise = 0.35
             .join("agents/loose_aggressive.toml");
         let config = AgentConfig::load(&path).unwrap();
         assert_eq!(config.game.stack_depth, 100);
-        assert_eq!(config.classes.len(), 20);
+        assert_eq!(config.classes.len(), 28);
         // LAG default should be raise-heavy
         assert!(config.default.raise > config.default.fold);
     }

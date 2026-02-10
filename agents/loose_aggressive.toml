@@ -57,6 +57,15 @@ call = 0.15
 "1.0" = 0.4
 allin = 0.3
 
+[classes.NutFlush]
+fold = 0.0
+call = 0.1
+
+[classes.NutFlush.raises]
+"0.5" = 0.1
+"1.0" = 0.4
+allin = 0.4
+
 [classes.Flush]
 fold = 0.0
 call = 0.2
@@ -76,6 +85,15 @@ call = 0.2
 allin = 0.2
 
 # --- Strong hands: bet/raise almost always ---
+[classes.TopSet]
+fold = 0.0
+call = 0.1
+
+[classes.TopSet.raises]
+"0.5" = 0.1
+"1.0" = 0.35
+allin = 0.45
+
 [classes.Set]
 fold = 0.0
 call = 0.15
@@ -84,6 +102,15 @@ call = 0.15
 "0.5" = 0.15
 "1.0" = 0.4
 allin = 0.3
+
+[classes.BottomSet]
+fold = 0.0
+call = 0.2
+
+[classes.BottomSet.raises]
+"0.5" = 0.15
+"1.0" = 0.4
+allin = 0.25
 
 [classes.Trips]
 fold = 0.0
@@ -100,6 +127,24 @@ call = 0.25
 
 [classes.TwoPair.raises]
 "0.5" = 0.2
+"1.0" = 0.4
+allin = 0.15
+
+[classes.Overpair]
+fold = 0.0
+call = 0.15
+
+[classes.Overpair.raises]
+"0.5" = 0.2
+"1.0" = 0.4
+allin = 0.25
+
+[classes.TopPairTopKicker]
+fold = 0.0
+call = 0.2
+
+[classes.TopPairTopKicker.raises]
+"0.5" = 0.25
 "1.0" = 0.4
 allin = 0.15
 
@@ -149,6 +194,15 @@ call = 0.35
 "1.0" = 0.15
 allin = 0.05
 
+[classes.Overcards]
+fold = 0.1
+call = 0.3
+
+[classes.Overcards.raises]
+"0.5" = 0.15
+"1.0" = 0.3
+allin = 0.15
+
 # --- No pair: heavy bluffing ---
 [classes.AceHigh]
 fold = 0.15
@@ -169,6 +223,15 @@ call = 0.25
 allin = 0.1
 
 # --- Draws: very aggressive semi-bluffs ---
+[classes.ComboDraw]
+fold = 0.0
+call = 0.1
+
+[classes.ComboDraw.raises]
+"0.5" = 0.1
+"1.0" = 0.4
+allin = 0.4
+
 [classes.FlushDrawNuts]
 fold = 0.0
 call = 0.2
@@ -213,3 +276,12 @@ call = 0.3
 "0.5" = 0.15
 "1.0" = 0.3
 allin = 0.15
+
+[classes.BackdoorStraightDraw]
+fold = 0.2
+call = 0.3
+
+[classes.BackdoorStraightDraw.raises]
+"0.5" = 0.2
+"1.0" = 0.2
+allin = 0.1

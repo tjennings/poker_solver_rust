@@ -20,48 +20,64 @@ pub enum HandClass {
     StraightFlush = 0,
     FourOfAKind = 1,
     FullHouse = 2,
-    Flush = 3,
-    Straight = 4,
-    Set = 5,
-    Trips = 6,
-    TwoPair = 7,
-    TopPair = 8,
-    SecondPair = 9,
-    ThirdPair = 10,
-    LowPair = 11,
-    Underpair = 12,
-    AceHigh = 13,
-    KingHigh = 14,
+    NutFlush = 3,
+    Flush = 4,
+    Straight = 5,
+    TopSet = 6,
+    Set = 7, // middle set
+    BottomSet = 8,
+    Trips = 9,
+    TwoPair = 10,
+    Overpair = 11,
+    TopPairTopKicker = 12,
+    TopPair = 13,
+    SecondPair = 14,
+    ThirdPair = 15,
+    LowPair = 16,
+    Underpair = 17,
+    Overcards = 18,
+    AceHigh = 19,
+    KingHigh = 20,
     // Draws
-    FlushDrawNuts = 15,
-    FlushDraw = 16,
-    BackdoorFlushDraw = 17,
-    Oesd = 18,
-    Gutshot = 19,
+    ComboDraw = 21,
+    FlushDrawNuts = 22,
+    FlushDraw = 23,
+    BackdoorFlushDraw = 24,
+    Oesd = 25,
+    Gutshot = 26,
+    BackdoorStraightDraw = 27,
 }
 
 impl HandClass {
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 28] = [
         Self::StraightFlush,
         Self::FourOfAKind,
         Self::FullHouse,
+        Self::NutFlush,
         Self::Flush,
         Self::Straight,
+        Self::TopSet,
         Self::Set,
+        Self::BottomSet,
         Self::Trips,
         Self::TwoPair,
+        Self::Overpair,
+        Self::TopPairTopKicker,
         Self::TopPair,
         Self::SecondPair,
         Self::ThirdPair,
         Self::LowPair,
         Self::Underpair,
+        Self::Overcards,
         Self::AceHigh,
         Self::KingHigh,
+        Self::ComboDraw,
         Self::FlushDrawNuts,
         Self::FlushDraw,
         Self::BackdoorFlushDraw,
         Self::Oesd,
         Self::Gutshot,
+        Self::BackdoorStraightDraw,
     ];
 
     fn from_discriminant(d: u8) -> Option<Self> {
@@ -75,23 +91,31 @@ impl fmt::Display for HandClass {
             Self::StraightFlush => "StraightFlush",
             Self::FourOfAKind => "FourOfAKind",
             Self::FullHouse => "FullHouse",
+            Self::NutFlush => "NutFlush",
             Self::Flush => "Flush",
             Self::Straight => "Straight",
+            Self::TopSet => "TopSet",
             Self::Set => "Set",
+            Self::BottomSet => "BottomSet",
             Self::Trips => "Trips",
             Self::TwoPair => "TwoPair",
+            Self::Overpair => "Overpair",
+            Self::TopPairTopKicker => "TopPairTopKicker",
             Self::TopPair => "TopPair",
             Self::SecondPair => "SecondPair",
             Self::ThirdPair => "ThirdPair",
             Self::LowPair => "LowPair",
             Self::Underpair => "Underpair",
+            Self::Overcards => "Overcards",
             Self::AceHigh => "AceHigh",
             Self::KingHigh => "KingHigh",
+            Self::ComboDraw => "ComboDraw",
             Self::FlushDrawNuts => "FlushDrawNuts",
             Self::FlushDraw => "FlushDraw",
             Self::BackdoorFlushDraw => "BackdoorFlushDraw",
             Self::Oesd => "Oesd",
             Self::Gutshot => "Gutshot",
+            Self::BackdoorStraightDraw => "BackdoorStraightDraw",
         };
         write!(f, "{s}")
     }
@@ -117,23 +141,31 @@ impl FromStr for HandClass {
             "StraightFlush" => Ok(Self::StraightFlush),
             "FourOfAKind" => Ok(Self::FourOfAKind),
             "FullHouse" => Ok(Self::FullHouse),
+            "NutFlush" => Ok(Self::NutFlush),
             "Flush" => Ok(Self::Flush),
             "Straight" => Ok(Self::Straight),
+            "TopSet" => Ok(Self::TopSet),
             "Set" => Ok(Self::Set),
+            "BottomSet" => Ok(Self::BottomSet),
             "Trips" => Ok(Self::Trips),
             "TwoPair" => Ok(Self::TwoPair),
+            "Overpair" => Ok(Self::Overpair),
+            "TopPairTopKicker" => Ok(Self::TopPairTopKicker),
             "TopPair" => Ok(Self::TopPair),
             "SecondPair" => Ok(Self::SecondPair),
             "ThirdPair" => Ok(Self::ThirdPair),
             "LowPair" => Ok(Self::LowPair),
             "Underpair" => Ok(Self::Underpair),
+            "Overcards" => Ok(Self::Overcards),
             "AceHigh" => Ok(Self::AceHigh),
             "KingHigh" => Ok(Self::KingHigh),
+            "ComboDraw" => Ok(Self::ComboDraw),
             "FlushDrawNuts" => Ok(Self::FlushDrawNuts),
             "FlushDraw" => Ok(Self::FlushDraw),
             "BackdoorFlushDraw" => Ok(Self::BackdoorFlushDraw),
             "Oesd" => Ok(Self::Oesd),
             "Gutshot" => Ok(Self::Gutshot),
+            "BackdoorStraightDraw" => Ok(Self::BackdoorStraightDraw),
             _ => Err(ParseHandClassError(s.to_string())),
         }
     }
@@ -166,6 +198,12 @@ impl HandClassification {
         self.bits |= 1 << class as u8;
     }
 
+    /// Create a classification from raw bits.
+    #[must_use]
+    pub fn from_bits(bits: u32) -> Self {
+        Self { bits }
+    }
+
     /// Raw bits for use as a compact bucket key.
     ///
     /// Each bit corresponds to a `HandClass` discriminant, so the value
@@ -184,7 +222,7 @@ impl HandClassification {
     /// Iterate over all active classes in discriminant order.
     pub fn iter(self) -> impl Iterator<Item = HandClass> {
         let bits = self.bits;
-        (0u8..20).filter_map(move |i| {
+        (0u8..28).filter_map(move |i| {
             if bits & (1 << i) != 0 {
                 HandClass::from_discriminant(i)
             } else {
@@ -286,7 +324,11 @@ fn classify_made_hand(hole: [Card; 2], board: &[Card], result: &mut HandClassifi
             return;
         }
         Rank::Flush(_) => {
-            result.add(HandClass::Flush);
+            if is_nut_flush_made(hole, board) {
+                result.add(HandClass::NutFlush);
+            } else {
+                result.add(HandClass::Flush);
+            }
             return;
         }
         Rank::Straight(_) => {
@@ -311,46 +353,77 @@ fn classify_pair_type(
     let hole_values = [hole[0].value, hole[1].value];
     let mut board_ranks: Vec<u8> = board.iter().map(|c| value_rank(c.value)).collect();
     board_ranks.sort_unstable();
+    let board_has_pair = board_ranks.windows(2).any(|w| w[0] == w[1]);
     board_ranks.dedup();
     board_ranks.reverse(); // highest first
 
     let is_pocket_pair = hole_values[0] == hole_values[1];
 
     match rank {
-        Rank::ThreeOfAKind(_) => classify_three_of_a_kind(hole_values, is_pocket_pair, result),
-        Rank::TwoPair(_) => classify_two_pair(hole_values, board, result),
+        Rank::ThreeOfAKind(_) => {
+            classify_three_of_a_kind(hole_values, is_pocket_pair, &board_ranks, result);
+        }
+        Rank::TwoPair(_) => {
+            classify_two_pair(hole_values, &board_ranks, is_pocket_pair, board_has_pair, result);
+        }
         Rank::OnePair(_) => classify_one_pair(hole_values, &board_ranks, is_pocket_pair, result),
-        Rank::HighCard(_) => classify_high_card(hole_values, result),
+        Rank::HighCard(_) => classify_high_card(hole_values, board, result),
         _ => {} // Already handled above
     }
 }
 
-/// Classify three-of-a-kind as either Set (pocket pair + board card) or Trips (one hole + board pair).
+/// Classify three-of-a-kind as TopSet/Set(middle)/BottomSet or Trips.
 fn classify_three_of_a_kind(
-    _hole_values: [Value; 2],
+    hole_values: [Value; 2],
     is_pocket_pair: bool,
+    board_ranks: &[u8],
     result: &mut HandClassification,
 ) {
     if is_pocket_pair {
-        result.add(HandClass::Set);
+        let set_rank = value_rank(hole_values[0]);
+        if set_rank == board_ranks[0] {
+            result.add(HandClass::TopSet);
+        } else if set_rank == *board_ranks.last().unwrap_or(&0) {
+            result.add(HandClass::BottomSet);
+        } else {
+            result.add(HandClass::Set);
+        }
     } else {
         result.add(HandClass::Trips);
     }
-    // If neither hole card matches each other, it's trips from hole + board pair
-    // (handled by the else branch since !is_pocket_pair means one hole card matches a board pair)
 }
 
-/// Classify two-pair hands. Must use at least one hole card.
-fn classify_two_pair(hole_values: [Value; 2], board: &[Card], result: &mut HandClassification) {
-    let board_values: Vec<Value> = board.iter().map(|c| c.value).collect();
-
-    // Check if at least one hole card pairs something
-    let h0_pairs_board = board_values.contains(&hole_values[0]);
-    let h1_pairs_board = board_values.contains(&hole_values[1]);
-    let is_pocket_pair = hole_values[0] == hole_values[1];
-
-    if h0_pairs_board || h1_pairs_board || is_pocket_pair {
-        result.add(HandClass::TwoPair);
+/// Classify two-pair hands.
+///
+/// - Board has a pair → classify the hole-card pair as top/second/third/low pair.
+/// - No board pair → both hole cards pair distinct board cards → `TwoPair`.
+fn classify_two_pair(
+    hole_values: [Value; 2],
+    board_ranks: &[u8],
+    is_pocket_pair: bool,
+    board_has_pair: bool,
+    result: &mut HandClassification,
+) {
+    if board_has_pair {
+        // One pair comes from the board; classify the hole-card pair position
+        if is_pocket_pair {
+            classify_pocket_pair_position(value_rank(hole_values[0]), board_ranks, result);
+        } else {
+            let h0_rank = value_rank(hole_values[0]);
+            let h1_rank = value_rank(hole_values[1]);
+            if board_ranks.contains(&h0_rank) {
+                classify_pair_position(h0_rank, hole_values, board_ranks, result);
+            } else if board_ranks.contains(&h1_rank) {
+                classify_pair_position(h1_rank, hole_values, board_ranks, result);
+            }
+        }
+    } else {
+        // No board pair — both hole cards independently pair board cards
+        let h0_rank = value_rank(hole_values[0]);
+        let h1_rank = value_rank(hole_values[1]);
+        if board_ranks.contains(&h0_rank) && board_ranks.contains(&h1_rank) && !is_pocket_pair {
+            result.add(HandClass::TwoPair);
+        }
     }
 }
 
@@ -381,13 +454,13 @@ fn classify_one_pair(
         return;
     };
 
-    classify_pair_position(pair_rank, board_ranks, result);
+    classify_pair_position(pair_rank, hole_values, board_ranks, result);
 }
 
 /// Classify a pocket pair relative to board ranks.
 ///
 /// Position is determined by how many distinct board ranks are above the pair:
-/// 0 above → `TopPair` (overpair), 1 above → `SecondPair`, etc.
+/// 0 above → `Overpair`, 1 above → `SecondPair`, etc.
 fn classify_pocket_pair_position(
     pair_rank: u8,
     board_ranks: &[u8],
@@ -395,7 +468,7 @@ fn classify_pocket_pair_position(
 ) {
     let ranks_above = board_ranks.iter().filter(|&&r| r > pair_rank).count();
     match ranks_above {
-        0 => result.add(HandClass::TopPair),
+        0 => result.add(HandClass::Overpair),
         1 => result.add(HandClass::SecondPair),
         2 => result.add(HandClass::ThirdPair),
         _ => {
@@ -408,47 +481,82 @@ fn classify_pocket_pair_position(
     }
 }
 
-/// Given a pair rank and the sorted (descending) distinct board ranks,
-/// classify as top/second/third/low pair.
-fn classify_pair_position(pair_rank: u8, board_ranks: &[u8], result: &mut HandClassification) {
+/// Given a pair rank, hole values, and the sorted (descending) distinct board ranks,
+/// classify as top pair (possibly TPTK)/second/third/low pair.
+fn classify_pair_position(
+    pair_rank: u8,
+    hole_values: [Value; 2],
+    board_ranks: &[u8],
+    result: &mut HandClassification,
+) {
     // board_ranks is sorted highest-first, deduplicated
     if let Some(pos) = board_ranks.iter().position(|&r| r == pair_rank) {
         match pos {
-            0 => result.add(HandClass::TopPair),
+            0 => {
+                if is_top_kicker(pair_rank, hole_values) {
+                    result.add(HandClass::TopPairTopKicker);
+                } else {
+                    result.add(HandClass::TopPair);
+                }
+            }
             1 => result.add(HandClass::SecondPair),
             2 => result.add(HandClass::ThirdPair),
             _ => result.add(HandClass::LowPair),
         }
     } else {
-        // Pocket pair above all board cards: treat as overpair = top pair
-        // (pocket pair that's higher than all board ranks)
+        // Pocket pair above all board cards → Overpair
         if pair_rank > board_ranks[0] {
-            result.add(HandClass::TopPair);
+            result.add(HandClass::Overpair);
         } else {
             result.add(HandClass::Underpair);
         }
     }
 }
 
-/// Classify no-pair hands as ace-high or king-high.
-fn classify_high_card(hole_values: [Value; 2], result: &mut HandClassification) {
-    let max_hole = std::cmp::max(value_rank(hole_values[0]), value_rank(hole_values[1]));
+/// Check if the non-pairing hole card is the top kicker for top pair.
+///
+/// If paired rank is not Ace: top kicker is Ace.
+/// If paired rank is Ace: top kicker is King.
+fn is_top_kicker(pair_rank: u8, hole_values: [Value; 2]) -> bool {
+    let h0 = value_rank(hole_values[0]);
+    let h1 = value_rank(hole_values[1]);
+    let kicker = if h0 == pair_rank { h1 } else { h0 };
+    let ace = value_rank(Value::Ace);
+    let king = value_rank(Value::King);
+    if pair_rank == ace {
+        kicker == king
+    } else {
+        kicker == ace
+    }
+}
+
+/// Classify no-pair hands: overcards, ace-high, or king-high.
+fn classify_high_card(hole_values: [Value; 2], board: &[Card], result: &mut HandClassification) {
+    let h0 = value_rank(hole_values[0]);
+    let h1 = value_rank(hole_values[1]);
+    let max_board = board.iter().map(|c| value_rank(c.value)).max().unwrap_or(0);
+
+    if h0 > max_board && h1 > max_board {
+        result.add(HandClass::Overcards);
+        return;
+    }
+
+    let max_hole = std::cmp::max(h0, h1);
     if max_hole == value_rank(Value::Ace) {
         result.add(HandClass::AceHigh);
     } else if max_hole == value_rank(Value::King) {
         result.add(HandClass::KingHigh);
     }
-    // Other high cards get no classification
 }
 
-/// Classify draw potential (flush draws, straight draws).
+/// Classify draw potential (flush draws, straight draws, combo draws).
 ///
 /// Draws are suppressed when a completed hand of that type is already made:
 /// - No flush draws when a flush or straight flush is already made
 /// - No straight draws when a straight, straight flush, or better is made
 fn classify_draws(hole: [Card; 2], board: &[Card], result: &mut HandClassification) {
     let sf = result.has(HandClass::StraightFlush);
-    let has_flush = result.has(HandClass::Flush) || sf;
+    let has_flush = result.has(HandClass::Flush) || result.has(HandClass::NutFlush) || sf;
     let has_straight = result.has(HandClass::Straight) || sf;
 
     if !has_flush {
@@ -456,6 +564,14 @@ fn classify_draws(hole: [Card; 2], board: &[Card], result: &mut HandClassificati
     }
     if !has_straight {
         classify_straight_draws(hole, board, result);
+    }
+
+    // Combo draw: both a flush draw and a straight draw
+    let has_flush_draw =
+        result.has(HandClass::FlushDrawNuts) || result.has(HandClass::FlushDraw);
+    let has_straight_draw = result.has(HandClass::Oesd) || result.has(HandClass::Gutshot);
+    if has_flush_draw && has_straight_draw {
+        result.add(HandClass::ComboDraw);
     }
 }
 
@@ -509,7 +625,7 @@ fn classify_flush_draws(hole: [Card; 2], board: &[Card], result: &mut HandClassi
 
 /// Determine which of two flush draw classes is stronger.
 fn stronger_flush_draw(a: HandClass, b: HandClass) -> HandClass {
-    // FlushDrawNuts (15) < FlushDraw (16) < BackdoorFlushDraw (17) by discriminant,
+    // FlushDrawNuts (22) < FlushDraw (23) < BackdoorFlushDraw (24) by discriminant,
     // but FlushDrawNuts is strongest, so lower discriminant = stronger
     if (a as u8) <= (b as u8) { a } else { b }
 }
@@ -544,6 +660,48 @@ fn is_nut_flush_draw(hole: [Card; 2], board: &[Card], suit: Suit) -> bool {
     for rank in (max_hole_rank + 1)..=value_rank(Value::Ace) {
         if !visible_in_suit.contains(&rank) {
             return false; // A higher card of this suit is out there
+        }
+    }
+
+    true
+}
+
+/// Check if the hole cards make the nut flush (highest possible flush).
+///
+/// Finds the flush suit (5+ cards), then checks whether the highest hole card
+/// in that suit has no higher unseen card of the same suit.
+fn is_nut_flush_made(hole: [Card; 2], board: &[Card]) -> bool {
+    // Find the flush suit
+    let all_cards: Vec<Card> = hole.iter().copied().chain(board.iter().copied()).collect();
+    let flush_suit = [Suit::Spade, Suit::Heart, Suit::Diamond, Suit::Club]
+        .into_iter()
+        .find(|&suit| all_cards.iter().filter(|c| c.suit == suit).count() >= 5);
+
+    let Some(suit) = flush_suit else {
+        return false;
+    };
+
+    // Must have at least one hole card in the flush suit
+    let max_hole_in_suit = hole
+        .iter()
+        .filter(|c| c.suit == suit)
+        .map(|c| value_rank(c.value))
+        .max();
+
+    let Some(max_hole_rank) = max_hole_in_suit else {
+        return false;
+    };
+
+    // Check if any higher card of this suit is unseen (could beat us)
+    let visible_in_suit: Vec<u8> = all_cards
+        .iter()
+        .filter(|c| c.suit == suit)
+        .map(|c| value_rank(c.value))
+        .collect();
+
+    for rank in (max_hole_rank + 1)..=value_rank(Value::Ace) {
+        if !visible_in_suit.contains(&rank) {
+            return false;
         }
     }
 
@@ -603,7 +761,38 @@ fn classify_straight_draws(hole: [Card; 2], board: &[Card], result: &mut HandCla
         result.add(HandClass::Oesd);
     } else if completions >= 1 {
         result.add(HandClass::Gutshot);
+    } else if board.len() == 3 {
+        // Backdoor straight draw: flop only, 3-to-a-straight needing 2 runners
+        if has_backdoor_straight(hole, board, present) {
+            result.add(HandClass::BackdoorStraightDraw);
+        }
     }
+}
+
+/// Detect a backdoor straight draw on the flop.
+///
+/// Looks for any 5-card straight window where exactly 2 cards are missing
+/// and at least one hole card is in the window.
+fn has_backdoor_straight(hole: [Card; 2], _board: &[Card], present: u16) -> bool {
+    let hole_ranks: [u8; 2] = [value_rank(hole[0].value), value_rank(hole[1].value)];
+
+    for low in 1..=10u8 {
+        let window: u16 = (0..5).fold(0u16, |acc, i| acc | (1 << (low + i)));
+        let missing = window & !present;
+        let missing_count = missing.count_ones();
+
+        if missing_count == 2 {
+            let hole_in_window = hole_ranks.iter().any(|&r| {
+                let r_bit = 1u16 << r;
+                window & r_bit != 0
+            }) || (hole_ranks.contains(&value_rank(Value::Ace)) && window & (1 << 1) != 0);
+
+            if hole_in_window {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -702,7 +891,7 @@ mod tests {
         assert_classes(
             [card(Ace, Diamond), card(Two, Club)],
             &[card(Ace, Heart), card(Seven, Spade), card(Three, Diamond)],
-            &[HandClass::TopPair],
+            &[HandClass::TopPair, HandClass::BackdoorStraightDraw],
         );
     }
 
@@ -748,7 +937,7 @@ mod tests {
         assert_classes(
             [card(Jack, Diamond), card(Two, Club)],
             &[card(Ace, Heart), card(King, Spade), card(Jack, Heart)],
-            &[HandClass::ThirdPair],
+            &[HandClass::ThirdPair, HandClass::BackdoorStraightDraw],
         );
     }
 
@@ -810,7 +999,7 @@ mod tests {
 
     #[timed_test]
     fn nut_flush_draw() {
-        // Ad 5d on Kd 7d 3s — ace high + nut flush draw
+        // Ad 5d on Kd 7d 3s — ace high + nut flush draw + backdoor straight
         assert_classes(
             [card(Ace, Diamond), card(Five, Diamond)],
             &[
@@ -818,7 +1007,7 @@ mod tests {
                 card(Seven, Diamond),
                 card(Three, Spade),
             ],
-            &[HandClass::AceHigh, HandClass::FlushDrawNuts],
+            &[HandClass::AceHigh, HandClass::FlushDrawNuts, HandClass::BackdoorStraightDraw],
         );
     }
 
@@ -827,7 +1016,7 @@ mod tests {
         assert_classes(
             [card(Five, Diamond), card(Three, Diamond)],
             &[card(King, Diamond), card(Seven, Diamond), card(Two, Spade)],
-            &[HandClass::FlushDraw],
+            &[HandClass::FlushDraw, HandClass::BackdoorStraightDraw],
         );
     }
 
@@ -836,7 +1025,7 @@ mod tests {
         assert_classes(
             [card(Ace, Diamond), card(Five, Diamond)],
             &[card(King, Diamond), card(Seven, Spade), card(Three, Spade)],
-            &[HandClass::AceHigh, HandClass::BackdoorFlushDraw],
+            &[HandClass::AceHigh, HandClass::BackdoorFlushDraw, HandClass::BackdoorStraightDraw],
         );
     }
 
@@ -850,16 +1039,17 @@ mod tests {
                 card(Seven, Diamond),
                 card(Three, Spade),
             ],
-            &[HandClass::AceHigh, HandClass::FlushDrawNuts],
+            &[HandClass::AceHigh, HandClass::FlushDrawNuts, HandClass::BackdoorStraightDraw],
         );
     }
 
     #[timed_test]
     fn oesd() {
+        // 9h 8c on 7s 6d 2h: 9,8 > all board (7,6,2) → Overcards + OESD
         assert_classes(
             [card(Nine, Heart), card(Eight, Club)],
             &[card(Seven, Spade), card(Six, Diamond), card(Two, Heart)],
-            &[HandClass::Oesd],
+            &[HandClass::Overcards, HandClass::Oesd],
         );
     }
 
@@ -879,12 +1069,13 @@ mod tests {
         assert_classes(
             [card(Ace, Diamond), card(Five, Diamond)],
             &[card(Ace, Heart), card(Seven, Diamond), card(Three, Diamond)],
-            &[HandClass::TopPair, HandClass::FlushDrawNuts],
+            &[HandClass::TopPair, HandClass::FlushDrawNuts, HandClass::BackdoorStraightDraw],
         );
     }
 
     #[timed_test]
-    fn ace_high_plus_nut_flush_draw() {
+    fn overcards_plus_nut_flush_draw() {
+        // AKd on Qd 7d 3s — both hole cards above all board ranks + backdoor straight
         assert_classes(
             [card(Ace, Diamond), card(King, Diamond)],
             &[
@@ -892,7 +1083,7 @@ mod tests {
                 card(Seven, Diamond),
                 card(Three, Spade),
             ],
-            &[HandClass::AceHigh, HandClass::FlushDrawNuts],
+            &[HandClass::Overcards, HandClass::FlushDrawNuts, HandClass::BackdoorStraightDraw],
         );
     }
 
@@ -941,7 +1132,7 @@ mod tests {
 
     #[timed_test]
     fn turn_flush_draw_no_backdoor() {
-        // Ad 5d on Kd 7s 3s 2d — ace high + nut flush draw + gutshot (4 makes A5432 wheel)
+        // Ad 5d on Kd 7s 3s 2d — ace high + combo draw (nut flush + gutshot)
         assert_classes(
             [card(Ace, Diamond), card(Five, Diamond)],
             &[
@@ -952,6 +1143,7 @@ mod tests {
             ],
             &[
                 HandClass::AceHigh,
+                HandClass::ComboDraw,
                 HandClass::FlushDrawNuts,
                 HandClass::Gutshot,
             ],
@@ -1018,7 +1210,7 @@ mod tests {
 
     #[timed_test]
     fn flush_on_board() {
-        // 5 suited cards = flush, no draws emitted
+        // 5 suited cards with Ah = nut flush, no draws on river
         assert_classes(
             [card(Ace, Heart), card(Three, Heart)],
             &[
@@ -1028,17 +1220,17 @@ mod tests {
                 card(Six, Spade),
                 card(Jack, Diamond),
             ],
-            &[HandClass::Flush],
+            &[HandClass::NutFlush],
         );
     }
 
     #[timed_test]
-    fn overpair_is_top_pair() {
+    fn overpair() {
         // AA on K73 — pocket pair above all board cards
         assert_classes(
             [card(Ace, Diamond), card(Ace, Club)],
             &[card(King, Heart), card(Seven, Spade), card(Three, Diamond)],
-            &[HandClass::TopPair],
+            &[HandClass::Overpair],
         );
     }
 
@@ -1064,11 +1256,11 @@ mod tests {
 
     #[timed_test]
     fn no_class_for_low_high_card() {
-        // No ace or king high, no pair → empty (no classification)
+        // No ace or king high, no pair → only backdoor straight draw
         assert_classes(
             [card(Jack, Diamond), card(Nine, Club)],
             &[card(Queen, Heart), card(Seven, Spade), card(Three, Diamond)],
-            &[],
+            &[HandClass::BackdoorStraightDraw],
         );
     }
 
@@ -1090,6 +1282,317 @@ mod tests {
             [card(Ace, Diamond), card(Three, Club)],
             &[card(Two, Heart), card(Five, Spade), card(Nine, Diamond)],
             &[HandClass::AceHigh, HandClass::Gutshot],
+        );
+    }
+
+    // === TwoPair vs board-paired two pair ===
+
+    #[timed_test]
+    fn two_pair_both_hole_cards_pair_board() {
+        // A7 on A-7-3: both hole cards pair distinct board cards → TwoPair
+        assert_classes(
+            [card(Ace, Diamond), card(Seven, Club)],
+            &[card(Ace, Heart), card(Seven, Spade), card(Three, Diamond)],
+            &[HandClass::TwoPair],
+        );
+    }
+
+    #[timed_test]
+    fn two_pair_board_paired_classifies_as_top_pair() {
+        // Kd 5c on Kh 7s 7d 3h: board pair 7-7, K pairs top board rank → TopPair
+        assert_classes(
+            [card(King, Diamond), card(Five, Club)],
+            &[
+                card(King, Heart),
+                card(Seven, Spade),
+                card(Seven, Diamond),
+                card(Three, Heart),
+            ],
+            &[HandClass::TopPair],
+        );
+    }
+
+    #[timed_test]
+    fn two_pair_board_paired_pocket_pair_as_second_pair() {
+        // KK on A-7-7-3: pocket pair below A, board pair 7-7 → SecondPair
+        assert_classes(
+            [card(King, Diamond), card(King, Club)],
+            &[
+                card(Ace, Heart),
+                card(Seven, Spade),
+                card(Seven, Diamond),
+                card(Three, Heart),
+            ],
+            &[HandClass::SecondPair],
+        );
+    }
+
+    #[timed_test]
+    fn two_pair_board_paired_hole_makes_third_pair() {
+        // A3 on K-7-7-3: 3 pairs board 3, board ranks desc [K,7,3] → ThirdPair
+        assert_classes(
+            [card(Ace, Diamond), card(Three, Club)],
+            &[
+                card(King, Heart),
+                card(Seven, Spade),
+                card(Seven, Diamond),
+                card(Three, Heart),
+            ],
+            &[HandClass::ThirdPair],
+        );
+    }
+
+    #[timed_test]
+    fn two_pair_both_hole_cards_on_turn() {
+        // J9 on J-9-K-2: both hole cards pair, no board pair → TwoPair
+        assert_classes(
+            [card(Jack, Diamond), card(Nine, Club)],
+            &[
+                card(Jack, Heart),
+                card(Nine, Spade),
+                card(King, Diamond),
+                card(Two, Heart),
+            ],
+            &[HandClass::TwoPair],
+        );
+    }
+
+    #[timed_test]
+    fn two_pair_board_paired_no_hole_contribution() {
+        // Board has pair 7-7, neither hole card pairs anything → no classification
+        assert_classes(
+            [card(Ace, Diamond), card(Two, Club)],
+            &[
+                card(King, Heart),
+                card(Seven, Spade),
+                card(Seven, Diamond),
+                card(Three, Heart),
+                card(Six, Club),
+            ],
+            &[],
+        );
+    }
+
+    // === New hand class tests ===
+
+    #[timed_test]
+    fn overpair_not_top_pair() {
+        // AK on A-7-3: Ace pairs top board rank → TopPair (not Overpair)
+        assert_classes(
+            [card(Ace, Diamond), card(King, Club)],
+            &[card(Ace, Heart), card(Seven, Spade), card(Three, Diamond)],
+            &[HandClass::TopPairTopKicker],
+        );
+    }
+
+    #[timed_test]
+    fn top_pair_top_kicker_ace() {
+        // AK on K-7-3: K pairs top board rank, other hole card is Ace → TPTK
+        assert_classes(
+            [card(Ace, Diamond), card(King, Club)],
+            &[card(King, Heart), card(Seven, Spade), card(Three, Diamond)],
+            &[HandClass::TopPairTopKicker],
+        );
+    }
+
+    #[timed_test]
+    fn top_pair_top_kicker_king_when_ace_paired() {
+        // AK on A-7-3: Ace pairs board, kicker is King → TPTK
+        assert_classes(
+            [card(Ace, Diamond), card(King, Club)],
+            &[card(Ace, Heart), card(Seven, Spade), card(Three, Diamond)],
+            &[HandClass::TopPairTopKicker],
+        );
+    }
+
+    #[timed_test]
+    fn top_pair_not_tptk() {
+        // KQ on K-7-3: K pairs top rank, but Q is not Ace → plain TopPair
+        assert_classes(
+            [card(King, Diamond), card(Queen, Club)],
+            &[card(King, Heart), card(Seven, Spade), card(Three, Diamond)],
+            &[HandClass::TopPair],
+        );
+    }
+
+    #[timed_test]
+    fn overcards() {
+        // AK on 7-5-3: both hole cards above all board ranks + backdoor straight
+        assert_classes(
+            [card(Ace, Diamond), card(King, Club)],
+            &[card(Seven, Heart), card(Five, Spade), card(Three, Diamond)],
+            &[HandClass::Overcards, HandClass::BackdoorStraightDraw],
+        );
+    }
+
+    #[timed_test]
+    fn overcards_vs_ace_high() {
+        // AQ on K-7-3: Queen(12) < King(13), not overcards → AceHigh + backdoor straight
+        assert_classes(
+            [card(Ace, Diamond), card(Queen, Club)],
+            &[card(King, Heart), card(Seven, Spade), card(Three, Diamond)],
+            &[HandClass::AceHigh, HandClass::BackdoorStraightDraw],
+        );
+    }
+
+    #[timed_test]
+    fn nut_flush_made() {
+        // Ah Kd on Qh Jh 5h 3h 2c → flush with Ah, nut flush
+        assert_classes(
+            [card(Ace, Heart), card(King, Diamond)],
+            &[
+                card(Queen, Heart),
+                card(Jack, Heart),
+                card(Five, Heart),
+                card(Three, Heart),
+                card(Two, Club),
+            ],
+            &[HandClass::NutFlush],
+        );
+    }
+
+    #[timed_test]
+    fn non_nut_flush_made() {
+        // Kh Kd on Qh Jh 5h 3h 2c → flush with Kh, but Ah is unseen
+        assert_classes(
+            [card(King, Heart), card(King, Diamond)],
+            &[
+                card(Queen, Heart),
+                card(Jack, Heart),
+                card(Five, Heart),
+                card(Three, Heart),
+                card(Two, Club),
+            ],
+            &[HandClass::Flush],
+        );
+    }
+
+    #[timed_test]
+    fn top_set() {
+        // KK on K-7-3: set matching highest board rank
+        assert_classes(
+            [card(King, Diamond), card(King, Club)],
+            &[card(King, Heart), card(Seven, Spade), card(Three, Diamond)],
+            &[HandClass::TopSet],
+        );
+    }
+
+    #[timed_test]
+    fn middle_set() {
+        // 77 on K-7-3: set matching middle board rank
+        assert_classes(
+            [card(Seven, Diamond), card(Seven, Club)],
+            &[card(King, Heart), card(Seven, Spade), card(Three, Diamond)],
+            &[HandClass::Set],
+        );
+    }
+
+    #[timed_test]
+    fn bottom_set() {
+        // 33 on K-7-3: set matching lowest board rank
+        assert_classes(
+            [card(Three, Heart), card(Three, Club)],
+            &[card(King, Heart), card(Seven, Spade), card(Three, Diamond)],
+            &[HandClass::BottomSet],
+        );
+    }
+
+    #[timed_test]
+    fn combo_draw() {
+        // 8h7h on 9h6h2c: flush draw + OESD = combo draw
+        assert_classes(
+            [card(Eight, Heart), card(Seven, Heart)],
+            &[card(Nine, Heart), card(Six, Heart), card(Two, Club)],
+            &[HandClass::ComboDraw, HandClass::FlushDraw, HandClass::Oesd],
+        );
+    }
+
+    #[timed_test]
+    fn backdoor_straight_draw() {
+        // JT on A-5-2: no straight draw (1 card), but 3-to-a-straight on flop
+        // Window: T-J-Q-K-A → present T(12),J(11),A(14+low=1). Missing Q(12)...
+        // Actually: J(11),T(10), board A(14),5(5),2(2). present: 1,2,5,10,11,14
+        // Window low=10: T,J,Q,K,A → bits 10,11,12,13,14. present: 10,11,14. Missing: 12,13 → 2 missing.
+        // Hole in window: J(11) yes. → backdoor straight draw
+        assert_classes(
+            [card(Jack, Diamond), card(Ten, Club)],
+            &[card(Ace, Heart), card(Five, Spade), card(Two, Diamond)],
+            &[HandClass::BackdoorStraightDraw],
+        );
+    }
+
+    #[timed_test]
+    fn no_backdoor_straight_draw_on_turn() {
+        // JT on A-5-2-Q (turn): has gutshot (need K) but no backdoor straight
+        assert_classes(
+            [card(Jack, Diamond), card(Ten, Club)],
+            &[
+                card(Ace, Heart),
+                card(Five, Spade),
+                card(Two, Diamond),
+                card(Queen, Club),
+            ],
+            &[HandClass::Gutshot],
+        );
+    }
+
+    #[timed_test]
+    fn overpair_in_two_pair_context() {
+        // AA on A-7-7-3: board pair 7-7, pocket AA above all non-paired ranks → Overpair
+        assert_classes(
+            [card(Ace, Diamond), card(Ace, Club)],
+            &[
+                card(Ace, Heart),
+                card(Seven, Spade),
+                card(Seven, Diamond),
+                card(Three, Heart),
+            ],
+            &[HandClass::FullHouse],
+        );
+    }
+
+    #[timed_test]
+    fn combo_draw_with_nut_flush() {
+        // Ah 7h on 8h 6h 5c: nut flush draw + OESD (4 or 9 make straight) = combo draw
+        assert_classes(
+            [card(Ace, Heart), card(Seven, Heart)],
+            &[card(Eight, Heart), card(Six, Heart), card(Five, Club)],
+            &[
+                HandClass::AceHigh,
+                HandClass::ComboDraw,
+                HandClass::FlushDrawNuts,
+                HandClass::Oesd,
+            ],
+        );
+    }
+
+    #[timed_test]
+    fn top_set_on_turn() {
+        // KK on K-7-3-2: set matching highest board rank
+        assert_classes(
+            [card(King, Diamond), card(King, Club)],
+            &[
+                card(King, Heart),
+                card(Seven, Spade),
+                card(Three, Diamond),
+                card(Two, Club),
+            ],
+            &[HandClass::TopSet],
+        );
+    }
+
+    #[timed_test]
+    fn bottom_set_on_turn() {
+        // 22 on K-7-3-2: set matching lowest board rank
+        assert_classes(
+            [card(Two, Diamond), card(Two, Club)],
+            &[
+                card(King, Heart),
+                card(Seven, Spade),
+                card(Three, Diamond),
+                card(Two, Heart),
+            ],
+            &[HandClass::BottomSet],
         );
     }
 }

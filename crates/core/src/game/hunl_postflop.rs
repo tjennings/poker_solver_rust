@@ -764,7 +764,7 @@ impl Game for HunlPostflop {
         let stack_bucket = eff_stack / 20;
 
         // Encode current-street actions only
-        let mut action_codes = arrayvec::ArrayVec::<u8, 8>::new();
+        let mut action_codes = arrayvec::ArrayVec::<u8, 6>::new();
         for (street, a) in &state.history {
             if *street == state.street && !action_codes.is_full() {
                 action_codes.push(encode_action(*a));
