@@ -1,14 +1,14 @@
 game:
   stack_depth: 100
-  bet_sizes: [0.3, 0.5, 1.0, 1.5]
+  bet_sizes: [0.33, 0.67, 1.0, 2.0, 3.0]
 
 training:
-  iterations: 5000
+  iterations: 10000
   seed: 42
   output_dir: "./handclass_100bb"
   mccfr_samples: 1000
   deal_count: 20000
   abstraction_mode: hand_class
   pruning: true
-  pruning_warmup_fraction: 0.2
-  pruning_probe_interval: 20
+  pruning_warmup_fraction: 0.10
+  pruning_probe_interval: 100

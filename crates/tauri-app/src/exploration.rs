@@ -17,7 +17,7 @@ use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint::{BundleConfig, StrategyBundle};
 use poker_solver_core::hand_class::{classify, HandClassification};
 use poker_solver_core::hands::CanonicalHand;
-use poker_solver_core::info_key::{canonical_hand_index, cards_from_rank_chars, InfoKey};
+use poker_solver_core::info_key::{canonical_hand_index, cards_from_rank_chars, depth_bucket, spr_bucket, InfoKey};
 use poker_solver_core::poker::{Card, Suit, Value};
 
 /// Event payload for bucket computation progress.
@@ -730,10 +730,10 @@ pub struct ComboGroupInfo {
     pub blocked_combos: usize,
     /// Current street name.
     pub street: String,
-    /// Pot bucket used for key construction.
-    pub pot_bucket: u32,
-    /// Stack bucket used for key construction.
-    pub stack_bucket: u32,
+    /// SPR bucket used for key construction.
+    pub spr_bucket: u32,
+    /// Depth bucket used for key construction.
+    pub depth_bucket: u32,
 }
 
 /// Get combo-level classification breakdown for a selected cell.
@@ -780,8 +780,8 @@ pub fn get_combo_classes(
     let action_codes = build_action_codes(&position.history);
     let pos_state = compute_position_state(&config.game.bet_sizes, &position);
     let street_num = street_to_num(street);
-    let pot_bucket = pos_state.pot / 20;
-    let stack_bucket = pos_state.eff_stack / 20;
+    let spr = spr_bucket(pos_state.pot, pos_state.eff_stack);
+    let depth = depth_bucket(pos_state.eff_stack);
 
     // Group combos by classification bits
     let mut groups_map: std::collections::BTreeMap<u32, Vec<String>> =
@@ -803,8 +803,8 @@ pub fn get_combo_classes(
             let key = InfoKey::new(
                 bits,
                 street_num,
-                pot_bucket,
-                stack_bucket,
+                spr,
+                depth,
                 &action_codes,
             )
             .as_u64();
@@ -827,8 +827,8 @@ pub fn get_combo_classes(
         total_combos: combos.len(),
         blocked_combos,
         street: format!("{street:?}"),
-        pot_bucket,
-        stack_bucket,
+        spr_bucket: spr,
+        depth_bucket: depth,
     })
 }
 
@@ -839,8 +839,8 @@ fn empty_combo_info(hand: &str) -> ComboGroupInfo {
         total_combos: 0,
         blocked_combos: 0,
         street: String::new(),
-        pot_bucket: 0,
-        stack_bucket: 0,
+        spr_bucket: 0,
+        depth_bucket: 0,
     }
 }
 
@@ -1070,7 +1070,7 @@ fn action_meets_threshold(
     let hand_bits = hand_bits_at_street(rank1, rank2, suited, board, street_idx);
     let street_num = street_idx.min(3) as u8;
     let eff_stack = stacks[0].min(stacks[1]);
-    let key = InfoKey::new(hand_bits, street_num, pot / 20, eff_stack / 20, action_codes).as_u64();
+    let key = InfoKey::new(hand_bits, street_num, spr_bucket(pot, eff_stack), depth_bucket(eff_stack), action_codes).as_u64();
 
     let strategy = match blueprint.lookup(key) {
         Some(s) => s,
@@ -1115,10 +1115,10 @@ fn action_code_to_strategy_index(code: u8, to_call: u32, num_bet_sizes: usize) -
             // call
             if to_call > 0 { Some(1) } else { None }
         }
-        4..=7 => Some(1 + (code - 4) as usize),                // bet:idx (to_call == 0)
-        8..=11 => Some(2 + (code - 8) as usize),               // raise:idx (to_call > 0)
-        12 => Some(1 + num_bet_sizes),                          // bet all-in
-        13 => Some(2 + num_bet_sizes),                          // raise all-in
+        4..=8 => Some(1 + (code - 4) as usize),                 // bet:idx (to_call == 0)
+        9..=13 => Some(2 + (code - 9) as usize),               // raise:idx (to_call > 0)
+        14 => Some(1 + num_bet_sizes),                          // bet all-in
+        15 => Some(2 + num_bet_sizes),                          // raise all-in
         _ => None,
     }
 }
@@ -1214,8 +1214,8 @@ fn build_action_codes(history: &[String]) -> Vec<u8> {
 /// Convert a history action string to a 4-bit action code.
 ///
 /// Matches `encode_action` from `info_key`:
-/// 1=fold, 2=check, 3=call, 4-7=bet idx 0-3, 8-11=raise idx 0-3,
-/// 12=bet all-in, 13=raise all-in.
+/// 1=fold, 2=check, 3=call, 4-8=bet idx 0-4, 9-13=raise idx 0-4,
+/// 14=bet all-in, 15=raise all-in.
 fn action_to_code(action: &str) -> u8 {
     if action == "f" || action == "fold" {
         1
@@ -1228,20 +1228,20 @@ fn action_to_code(action: &str) -> u8 {
         .or_else(|| action.strip_prefix("b:"))
     {
         if idx_str == "A" {
-            12 // bet all-in
+            14 // bet all-in
         } else {
             let idx: u8 = idx_str.parse().unwrap_or(0);
-            4 + idx.min(3) // bet(idx)
+            4 + idx.min(4) // bet(idx)
         }
     } else if let Some(idx_str) = action
         .strip_prefix("raise:")
         .or_else(|| action.strip_prefix("r:"))
     {
         if idx_str == "A" {
-            13 // raise all-in
+            15 // raise all-in
         } else {
             let idx: u8 = idx_str.parse().unwrap_or(0);
-            8 + idx.min(3) // raise(idx)
+            9 + idx.min(4) // raise(idx)
         }
     } else {
         0 // unknown → empty
@@ -1442,11 +1442,11 @@ fn get_hand_strategy(
     };
 
     let street_num = street_to_num(street);
-    let pot_bucket = pot / 20;
-    let stack_bucket = eff_stack / 20;
+    let spr = spr_bucket(pot, eff_stack);
+    let depth = depth_bucket(eff_stack);
 
     let info_set_key =
-        InfoKey::new(hand_bits, street_num, pot_bucket, stack_bucket, action_codes).as_u64();
+        InfoKey::new(hand_bits, street_num, spr, depth, action_codes).as_u64();
 
     let probs = blueprint.lookup(info_set_key).ok_or_else(|| {
         format!(
@@ -1493,11 +1493,11 @@ fn get_hand_strategy_hand_class(
     };
 
     let street_num = street_to_num(street);
-    let pot_bucket = pot / 20;
-    let stack_bucket = eff_stack / 20;
+    let spr = spr_bucket(pot, eff_stack);
+    let depth = depth_bucket(eff_stack);
 
     let info_set_key =
-        InfoKey::new(hand_bits, street_num, pot_bucket, stack_bucket, action_codes).as_u64();
+        InfoKey::new(hand_bits, street_num, spr, depth, action_codes).as_u64();
 
     let probs = blueprint.lookup(info_set_key).ok_or_else(|| {
         format!(

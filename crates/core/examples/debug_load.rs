@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use poker_solver_core::blueprint::{BlueprintStrategy, BundleConfig, StrategyBundle};
-use poker_solver_core::info_key::{canonical_hand_index_from_str, InfoKey};
+use poker_solver_core::info_key::{canonical_hand_index_from_str, depth_bucket, spr_bucket, InfoKey};
 
 fn main() {
     let path = std::env::args()
@@ -131,13 +131,14 @@ fn main() {
     let probe_hands = [
         "AA", "KK", "AKs", "AKo", "AQs", "JTs", "76s", "72o", "32o",
     ];
-    // Initial SB opening: pot_bucket=3/20=0, stack_bucket varies by config
-    let pot_bucket = 3u32 / 20;
-    let stack_bucket = (config.game.stack_depth * 2 - 2) / 20;
+    // Initial SB opening: SPR and depth buckets vary by config
+    let preflop_eff_stack = config.game.stack_depth * 2 - 2;
+    let spr_b = spr_bucket(3, preflop_eff_stack);
+    let depth_b = depth_bucket(preflop_eff_stack);
 
     for hand in &probe_hands {
         if let Some(idx) = canonical_hand_index_from_str(hand) {
-            let key = InfoKey::new(u32::from(idx), 0, pot_bucket, stack_bucket, &[]).as_u64();
+            let key = InfoKey::new(u32::from(idx), 0, spr_b, depth_b, &[]).as_u64();
             match blueprint.lookup(key) {
                 Some(probs) => {
                     let s: Vec<String> = probs.iter().map(|p| format!("{p:.3}")).collect();
@@ -187,7 +188,7 @@ fn main() {
 
             if let Some(idx) = canonical_hand_index_from_str(&hand) {
                 let key =
-                    InfoKey::new(u32::from(idx), 0, pot_bucket, stack_bucket, &[]).as_u64();
+                    InfoKey::new(u32::from(idx), 0, spr_b, depth_b, &[]).as_u64();
                 if blueprint.lookup(key).is_some() {
                     found += 1;
                 } else {
@@ -227,15 +228,15 @@ fn main() {
         let limp_pot = 4u32; // After limp
         let limp_stacks = stack_depth * 2 - 2; // Both players have same stack after limp
 
-        let pot_bucket = limp_pot / 20;
-        let stack_bucket = limp_stacks / 20;
+        let spr_b = spr_bucket(limp_pot, limp_stacks);
+        let depth_b = depth_bucket(limp_stacks);
         let street_num = 1u8; // Flop
 
-        println!("  pot={limp_pot} pot_bucket={pot_bucket}");
-        println!("  eff_stack={limp_stacks} stack_bucket={stack_bucket}");
+        println!("  pot={limp_pot} spr_bucket={spr_b}");
+        println!("  eff_stack={limp_stacks} depth_bucket={depth_b}");
 
         let position_key =
-            InfoKey::new(0, street_num, pot_bucket, stack_bucket, &[]).as_u64();
+            InfoKey::new(0, street_num, spr_b, depth_b, &[]).as_u64();
         let position_mask: u64 = (1u64 << 44) - 1;
 
         println!("  position_key: {position_key:#018x}");
@@ -261,7 +262,7 @@ fn main() {
                 .filter(|(k, _)| (**k & street_mask) == street_key)
                 .map(|(k, _)| {
                     let decoded = InfoKey::from_raw(*k);
-                    (decoded.pot_bucket(), decoded.stack_bucket())
+                    (decoded.spr_bucket(), decoded.depth_bucket())
                 })
                 .collect();
             bucket_combos.sort();
@@ -269,7 +270,7 @@ fn main() {
 
             println!("  No exact match! Flop pot/stack buckets in blueprint:");
             for (pb, sb) in &bucket_combos {
-                println!("    pot_bucket={pb} stack_bucket={sb}");
+                println!("    spr_bucket={pb} depth_bucket={sb}");
             }
         } else {
             // Show some matched hand classifications

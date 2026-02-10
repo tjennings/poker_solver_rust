@@ -5,26 +5,46 @@
 //! ```text
 //! Bits 63-36: hand/bucket   (28 bits)
 //! Bits 35-34: street         (2 bits)
-//! Bits 33-29: pot_bucket     (5 bits)
-//! Bits 28-25: stack_bucket   (4 bits)
+//! Bits 33-29: spr_bucket     (5 bits) — min(eff_stack*2/pot, 31), half-SPR units
+//! Bits 28-25: depth_bucket   (4 bits) — min(eff_stack/13, 15), ~6.5 BB increments
 //! Bit  24:    (reserved)
 //! Bits 23-0:  action slots  (24 bits) — up to 6 actions × 4 bits
 //! ```
 //!
 //! Action encoding (4 bits): 0=empty, 1=fold, 2=check, 3=call,
-//! 4-7=bet idx 0-3, 8-11=raise idx 0-3, 12=bet all-in, 13=raise all-in.
+//! 4-8=bet idx 0-4, 9-13=raise idx 0-4, 14=bet all-in, 15=raise all-in.
 
 use crate::game::{Action, ALL_IN};
 use crate::poker::{Card, Suit, Value};
 
 const HAND_SHIFT: u32 = 36;
 const STREET_SHIFT: u32 = 34;
-const POT_SHIFT: u32 = 29;
-const STACK_SHIFT: u32 = 25;
+const SPR_SHIFT: u32 = 29;
+const DEPTH_SHIFT: u32 = 25;
+
+/// Compute SPR bucket: `min(eff_stack * 2 / pot, 31)`.
+///
+/// Half-SPR units give fine resolution at low SPR where decisions matter most.
+/// Returns 31 when pot is zero (infinite SPR).
+#[must_use]
+pub fn spr_bucket(pot: u32, eff_stack: u32) -> u32 {
+    if pot == 0 {
+        return 31;
+    }
+    (eff_stack * 2 / pot).min(31)
+}
+
+/// Compute depth bucket: `min(eff_stack / 13, 15)`.
+///
+/// Absolute stack depth in ~6.5 BB increments (internal units).
+#[must_use]
+pub fn depth_bucket(eff_stack: u32) -> u32 {
+    (eff_stack / 13).min(15)
+}
 
 /// A packed u64 information set key.
 ///
-/// Encodes hand/bucket, street, pot/stack buckets, and up to 6 actions
+/// Encodes hand/bucket, street, SPR/depth buckets, and up to 6 actions
 /// in a single 64-bit integer for allocation-free hashing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InfoKey(u64);
@@ -35,22 +55,22 @@ impl InfoKey {
     /// # Arguments
     /// * `hand_or_bucket` - Canonical hand index (0-168) or classification bits (up to 28 bits)
     /// * `street` - 0=Preflop, 1=Flop, 2=Turn, 3=River
-    /// * `pot_bucket` - pot / 20 (5 bits, max 31)
-    /// * `stack_bucket` - `eff_stack` / 20 (4 bits, max 15)
+    /// * `spr_bucket` - `min(eff_stack * 2 / pot, 31)` (5 bits, max 31)
+    /// * `depth_bucket` - `min(eff_stack / 13, 15)` (4 bits, max 15)
     /// * `actions` - Slice of encoded action codes (from `encode_action`)
     #[must_use]
     pub fn new(
         hand_or_bucket: u32,
         street: u8,
-        pot_bucket: u32,
-        stack_bucket: u32,
+        spr_bucket: u32,
+        depth_bucket: u32,
         actions: &[u8],
     ) -> Self {
         let mut key: u64 = 0;
         key |= (u64::from(hand_or_bucket) & 0xFFF_FFFF) << HAND_SHIFT;
         key |= (u64::from(street) & 0x3) << STREET_SHIFT;
-        key |= (u64::from(pot_bucket) & 0x1F) << POT_SHIFT;
-        key |= (u64::from(stack_bucket) & 0xF) << STACK_SHIFT;
+        key |= (u64::from(spr_bucket) & 0x1F) << SPR_SHIFT;
+        key |= (u64::from(depth_bucket) & 0xF) << DEPTH_SHIFT;
 
         // Pack up to 6 actions into bits 23..0 (4 bits each, MSB-first)
         // Action 0 → bits 23-20, action 1 → bits 19-16, ..., action 5 → bits 3-0
@@ -77,16 +97,16 @@ impl InfoKey {
         self.0
     }
 
-    /// Extract pot bucket (5 bits).
+    /// Extract SPR bucket (5 bits).
     #[must_use]
-    pub const fn pot_bucket(self) -> u32 {
-        ((self.0 >> POT_SHIFT) & 0x1F) as u32
+    pub const fn spr_bucket(self) -> u32 {
+        ((self.0 >> SPR_SHIFT) & 0x1F) as u32
     }
 
-    /// Extract stack bucket (4 bits).
+    /// Extract depth bucket (4 bits).
     #[must_use]
-    pub const fn stack_bucket(self) -> u32 {
-        ((self.0 >> STACK_SHIFT) & 0xF) as u32
+    pub const fn depth_bucket(self) -> u32 {
+        ((self.0 >> DEPTH_SHIFT) & 0xF) as u32
     }
 
     /// Extract the street (2 bits): 0=Preflop, 1=Flop, 2=Turn, 3=River.
@@ -107,31 +127,31 @@ impl InfoKey {
         (self.0 & 0xFF_FFFF) as u32
     }
 
-    /// Return a new key with modified pot and stack buckets.
+    /// Return a new key with modified SPR and depth buckets.
     #[must_use]
-    pub const fn with_buckets(self, pot_bucket: u32, stack_bucket: u32) -> Self {
-        let mask = !((0x1F << POT_SHIFT) | (0xF << STACK_SHIFT));
+    pub const fn with_buckets(self, spr_bucket: u32, depth_bucket: u32) -> Self {
+        let mask = !((0x1F << SPR_SHIFT) | (0xF << DEPTH_SHIFT));
         let cleared = self.0 & mask;
-        let new_bits = ((pot_bucket as u64 & 0x1F) << POT_SHIFT)
-            | ((stack_bucket as u64 & 0xF) << STACK_SHIFT);
+        let new_bits = ((spr_bucket as u64 & 0x1F) << SPR_SHIFT)
+            | ((depth_bucket as u64 & 0xF) << DEPTH_SHIFT);
         Self(cleared | new_bits)
     }
 }
 
 /// Encode an [`Action`] into a 4-bit code.
 ///
-/// 0=empty, 1=fold, 2=check, 3=call, 4-7=bet idx 0-3,
-/// 8-11=raise idx 0-3, 12=bet all-in, 13=raise all-in.
+/// 0=empty, 1=fold, 2=check, 3=call, 4-8=bet idx 0-4,
+/// 9-13=raise idx 0-4, 14=bet all-in, 15=raise all-in.
 #[must_use]
 pub fn encode_action(action: Action) -> u8 {
     match action {
         Action::Fold => 1,
         Action::Check => 2,
         Action::Call => 3,
-        Action::Bet(idx) if idx == ALL_IN => 12,
-        Action::Bet(idx) => 4 + idx.min(3) as u8,
-        Action::Raise(idx) if idx == ALL_IN => 13,
-        Action::Raise(idx) => 8 + idx.min(3) as u8,
+        Action::Bet(idx) if idx == ALL_IN => 14,
+        Action::Bet(idx) => 4 + idx.min(4) as u8,
+        Action::Raise(idx) if idx == ALL_IN => 15,
+        Action::Raise(idx) => 9 + idx.min(4) as u8,
     }
 }
 
@@ -274,8 +294,8 @@ mod tests {
     #[timed_test]
     fn round_trip_key_components() {
         let key = InfoKey::new(42, 2, 15, 9, &[1, 3, 5]);
-        assert_eq!(key.pot_bucket(), 15);
-        assert_eq!(key.stack_bucket(), 9);
+        assert_eq!(key.spr_bucket(), 15);
+        assert_eq!(key.depth_bucket(), 9);
         assert_eq!(key.street(), 2);
         assert_eq!(key.hand_bits(), 42);
     }
@@ -312,8 +332,8 @@ mod tests {
     fn with_buckets_replaces_correctly() {
         let key = InfoKey::new(42, 1, 10, 5, &[2, 3]);
         let modified = key.with_buckets(20, 8);
-        assert_eq!(modified.pot_bucket(), 20);
-        assert_eq!(modified.stack_bucket(), 8);
+        assert_eq!(modified.spr_bucket(), 20);
+        assert_eq!(modified.depth_bucket(), 8);
         // Hand and street bits should be unchanged
         assert_eq!(
             key.as_u64() >> HAND_SHIFT,
@@ -442,12 +462,14 @@ mod tests {
         assert_eq!(encode_action(Action::Bet(1)), 5);
         assert_eq!(encode_action(Action::Bet(2)), 6);
         assert_eq!(encode_action(Action::Bet(3)), 7);
-        assert_eq!(encode_action(Action::Raise(0)), 8);
-        assert_eq!(encode_action(Action::Raise(1)), 9);
-        assert_eq!(encode_action(Action::Raise(2)), 10);
-        assert_eq!(encode_action(Action::Raise(3)), 11);
-        assert_eq!(encode_action(Action::Bet(ALL_IN)), 12);
-        assert_eq!(encode_action(Action::Raise(ALL_IN)), 13);
+        assert_eq!(encode_action(Action::Bet(4)), 8);
+        assert_eq!(encode_action(Action::Raise(0)), 9);
+        assert_eq!(encode_action(Action::Raise(1)), 10);
+        assert_eq!(encode_action(Action::Raise(2)), 11);
+        assert_eq!(encode_action(Action::Raise(3)), 12);
+        assert_eq!(encode_action(Action::Raise(4)), 13);
+        assert_eq!(encode_action(Action::Bet(ALL_IN)), 14);
+        assert_eq!(encode_action(Action::Raise(ALL_IN)), 15);
     }
 
     #[timed_test]
@@ -472,15 +494,45 @@ mod tests {
     }
 
     #[timed_test]
-    fn actions_do_not_overlap_with_stack_bucket() {
-        // Verify that setting all action bits to max doesn't corrupt stack_bucket.
+    fn actions_do_not_overlap_with_depth_bucket() {
+        // Verify that setting all action bits to max doesn't corrupt depth_bucket.
         let key = InfoKey::new(0, 0, 0, 15, &[15, 15, 15, 15, 15, 15]);
-        assert_eq!(key.stack_bucket(), 15, "Stack bucket corrupted by action bits");
+        assert_eq!(key.depth_bucket(), 15, "Depth bucket corrupted by action bits");
 
-        // Verify that max stack_bucket doesn't corrupt first action
+        // Verify that max depth_bucket doesn't corrupt first action
         let k1 = InfoKey::new(0, 0, 0, 15, &[1]);
         let k2 = InfoKey::new(0, 0, 0, 15, &[2]);
-        assert_ne!(k1.as_u64(), k2.as_u64(), "Actions indistinguishable with max stack_bucket");
+        assert_ne!(k1.as_u64(), k2.as_u64(), "Actions indistinguishable with max depth_bucket");
+    }
+
+    #[timed_test]
+    fn spr_bucket_edge_cases() {
+        // Zero pot → infinite SPR → capped at 31
+        assert_eq!(spr_bucket(0, 100), 31);
+        // Small pot, large stack → high SPR capped at 31
+        assert_eq!(spr_bucket(1, 200), 31);
+        // Equal pot and stack → SPR = 2 (half-SPR units)
+        assert_eq!(spr_bucket(10, 10), 2);
+        // Pot larger than stack → low SPR
+        assert_eq!(spr_bucket(20, 5), 0);
+        // Typical flop after limp: pot=4, eff_stack=18 → 36/4 = 9
+        assert_eq!(spr_bucket(4, 18), 9);
+        // Typical raised pot: pot=12, eff_stack=14 → 28/12 = 2
+        assert_eq!(spr_bucket(12, 14), 2);
+    }
+
+    #[timed_test]
+    fn depth_bucket_edge_cases() {
+        // Zero stack
+        assert_eq!(depth_bucket(0), 0);
+        // Small stack (< 13)
+        assert_eq!(depth_bucket(12), 0);
+        // Exactly 13
+        assert_eq!(depth_bucket(13), 1);
+        // 100 BB game: eff_stack ~198 internal units → 198/13 = 15
+        assert_eq!(depth_bucket(198), 15);
+        // Large stack: capped at 15
+        assert_eq!(depth_bucket(500), 15);
     }
 
     #[timed_test]

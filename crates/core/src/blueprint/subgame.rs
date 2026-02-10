@@ -432,7 +432,7 @@ mod tests {
             0,
             0,
             0,
-            &[9, 3], // raise(1)=9, call=3
+            &[10, 3], // raise(1)=10, call=3
         )
         .as_u64();
         assert_eq!(key, expected, "key with history should encode actions");

@@ -143,7 +143,7 @@ fn mccfr_parallel_hunl_postflop() {
 #[timed_test(10)]
 fn hand_class_blueprint_scan_finds_entries() {
     use poker_solver_core::blueprint::BlueprintStrategy;
-    use poker_solver_core::info_key::InfoKey;
+    use poker_solver_core::info_key::{depth_bucket, spr_bucket, InfoKey};
 
     let config = PostflopConfig {
         stack_depth: 10,
@@ -172,15 +172,15 @@ fn hand_class_blueprint_scan_finds_entries() {
     println!("Blueprint has {} info sets", blueprint.len());
 
     // After preflop limp (call + check), pot = 4, stacks = [18, 18] (10BB * 2 = 20)
-    // pot_bucket = 4/20 = 0, stack_bucket = 18/20 = 0
+    // spr_bucket = min(18*2/4, 31) = 9, depth_bucket = min(18/13, 15) = 1
     // street = Flop (1), action_codes = [] (first action on flop)
-    let pot_bucket = 0u32;
-    let stack_bucket = 0u32;
+    let spr_b = spr_bucket(4, 18);
+    let depth_b = depth_bucket(18);
     let street_num = 1u8; // Flop
     let action_codes: &[u8] = &[];
 
     let position_key =
-        InfoKey::new(0, street_num, pot_bucket, stack_bucket, action_codes).as_u64();
+        InfoKey::new(0, street_num, spr_b, depth_b, action_codes).as_u64();
     let position_mask: u64 = (1u64 << 44) - 1;
 
     let matches: Vec<(u64, u32)> = blueprint
@@ -205,7 +205,7 @@ fn hand_class_blueprint_scan_finds_entries() {
         .filter(|(k, _)| (*k & street_mask) == street_key)
         .map(|(k, _)| {
             let decoded = InfoKey::from_raw(*k);
-            (decoded.pot_bucket(), decoded.stack_bucket())
+            (decoded.spr_bucket(), decoded.depth_bucket())
         })
         .collect();
 
@@ -229,7 +229,7 @@ fn hand_class_blueprint_scan_finds_entries() {
     // If no exact matches, that's a bucket mismatch - report it
     if matches.is_empty() {
         println!(
-            "WARNING: No exact match for pot_bucket={pot_bucket}, stack_bucket={stack_bucket}. \
+            "WARNING: No exact match for spr_bucket={spr_b}, depth_bucket={depth_b}. \
              Training used different bucket values."
         );
     }

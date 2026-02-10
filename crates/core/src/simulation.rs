@@ -30,7 +30,7 @@ use crate::agent::{AgentConfig, FrequencyMap};
 use crate::blueprint::{BlueprintStrategy, BundleConfig};
 use crate::hand_class::classify;
 use crate::hands::CanonicalHand;
-use crate::info_key::{canonical_hand_index, InfoKey};
+use crate::info_key::{canonical_hand_index, depth_bucket, spr_bucket, InfoKey};
 
 /// Progress update emitted during a simulation run.
 #[derive(Debug, Clone)]
@@ -157,12 +157,12 @@ impl BlueprintAgent {
 
         // Both pot and stacks are in internal units (1 BB = 2 units).
         // Round before truncating to u32 to avoid float drift shifting
-        // values into the wrong bucket (e.g. 119.8 → 119 vs 120).
-        // Divide by 20 for 10-BB-interval buckets, matching the game model.
+        // values into the wrong bucket.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let pot_bucket = game_state.total_pot.round() as u32 / 20;
+        let pot_rounded = game_state.total_pot.round() as u32;
         let eff_stack = effective_stack_rounded(game_state);
-        let stack_bucket = eff_stack / 20;
+        let spr = spr_bucket(pot_rounded, eff_stack);
+        let depth = depth_bucket(eff_stack);
 
         // Read current-street actions from both players via the shared log
         let action_codes: Vec<u8> = ACTION_LOG.with(|log| {
@@ -173,13 +173,13 @@ impl BlueprintAgent {
                 .collect()
         });
 
-        InfoKey::new(hand_bits, street_num, pot_bucket, stack_bucket, &action_codes).as_u64()
+        InfoKey::new(hand_bits, street_num, spr, depth, &action_codes).as_u64()
     }
 
     /// Look up strategy probabilities, trying nearby pot/stack buckets when
     /// the exact key is missing from the blueprint.
     ///
-    /// Searches outward by Manhattan distance in (pot_bucket, stack_bucket)
+    /// Searches outward by Manhattan distance in (`spr_bucket`, `depth_bucket`)
     /// space. Falls back to a uniform distribution if no nearby key is found.
     fn lookup_nearest(&self, key: u64) -> Vec<f32> {
         // Try exact key first
@@ -187,18 +187,18 @@ impl BlueprintAgent {
             return probs.to_vec();
         }
 
-        // Extract pot/stack buckets from the key to search nearby
+        // Extract SPR/depth buckets from the key to search nearby
         let info = InfoKey::from_raw(key);
-        let pot_bucket = info.pot_bucket();
-        let stack_bucket = info.stack_bucket();
+        let spr = info.spr_bucket();
+        let depth = info.depth_bucket();
 
-        // Search nearby pot/stack buckets by increasing Manhattan distance
+        // Search nearby SPR/depth buckets by increasing Manhattan distance
         for distance in 1..=5i32 {
             for dp in -distance..=distance {
                 let ds_abs = distance - dp.abs();
                 for &ds in &[-ds_abs, ds_abs] {
-                    let p = pot_bucket as i32 + dp;
-                    let s = stack_bucket as i32 + ds;
+                    let p = spr as i32 + dp;
+                    let s = depth as i32 + ds;
                     if p < 0 || s < 0 {
                         continue;
                     }
@@ -640,8 +640,8 @@ fn sample_blueprint_action(
 /// Convert an `AgentAction` to a 4-bit action code.
 ///
 /// Uses the same encoding as `encode_action` in `info_key`:
-/// 1=fold, 2=check, 3=call, 4-7=bet idx 0-3, 8-11=raise idx 0-3,
-/// 12=bet all-in, 13=raise all-in.
+/// 1=fold, 2=check, 3=call, 4-8=bet idx 0-4, 9-13=raise idx 0-4,
+/// 14=bet all-in, 15=raise all-in.
 fn agent_action_to_code(
     action: &AgentAction,
     game_state: &GameState,
@@ -678,11 +678,11 @@ fn agent_action_to_code(
                 .unwrap_or(0);
 
             #[allow(clippy::cast_possible_truncation)]
-            let idx = closest_idx.min(3) as u8;
-            if is_bet { 4 + idx } else { 8 + idx } // bet(idx) or raise(idx)
+            let idx = closest_idx.min(4) as u8;
+            if is_bet { 4 + idx } else { 9 + idx } // bet(idx) or raise(idx)
         }
         AgentAction::AllIn => {
-            if is_bet { 12 } else { 13 } // bet all-in or raise all-in
+            if is_bet { 14 } else { 15 } // bet all-in or raise all-in
         }
     }
 }

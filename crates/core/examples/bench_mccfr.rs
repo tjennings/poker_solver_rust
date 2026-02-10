@@ -18,7 +18,7 @@ fn main() {
 
     let config = PostflopConfig {
         stack_depth: 100,
-        bet_sizes: vec![0.3, 0.5, 1.0, 1.5],
+        bet_sizes: vec![0.33, 0.67, 1.0, 2.0, 3.0],
         max_raises_per_street: 3,
     };
 
@@ -87,7 +87,7 @@ fn main() {
 
     let par_config = PostflopConfig {
         stack_depth: 100,
-        bet_sizes: vec![0.3, 0.5, 1.0, 1.5],
+        bet_sizes: vec![0.33, 0.67, 1.0, 2.0, 3.0],
         max_raises_per_street: 3,
     };
     let par_game = HunlPostflop::new(par_config, Some(AbstractionMode::HandClass), deal_count);
@@ -116,7 +116,7 @@ fn main() {
 
     let prune_game_config = PostflopConfig {
         stack_depth: 100,
-        bet_sizes: vec![0.3, 0.5, 1.0, 1.5],
+        bet_sizes: vec![0.33, 0.67, 1.0, 2.0, 3.0],
         max_raises_per_street: 3,
     };
     let prune_game =
