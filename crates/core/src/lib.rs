@@ -16,7 +16,6 @@ pub mod abstraction;
 pub mod agent;
 pub mod blueprint;
 pub mod cfr;
-pub mod config;
 pub mod equity;
 pub mod error;
 pub mod flops;
@@ -27,7 +26,6 @@ pub mod info_key;
 pub mod simulation;
 
 pub use agent::AgentConfig;
-pub use config::Config;
 pub use error::SolverError;
 pub use flops::{CanonicalFlop, HighCardClass, RankTexture, SuitTexture, all_flops};
 pub use game::{Action, Game, Player};

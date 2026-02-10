@@ -1,11 +1,9 @@
 mod hunl_postflop;
-mod hunl_preflop;
 mod kuhn;
 
 use arrayvec::ArrayVec;
 
 pub use hunl_postflop::{AbstractionMode, HunlPostflop, PostflopConfig, PostflopState, TerminalType};
-pub use hunl_preflop::HunlPreflop;
 pub use kuhn::KuhnPoker;
 
 /// Maximum number of actions at any decision point.
@@ -44,7 +42,6 @@ impl Player {
 ///
 /// The `u32` payload in `Bet` and `Raise` is **game-specific**:
 /// - **`HunlPostflop`**: index into `config.bet_sizes`, or [`ALL_IN`] for all-in.
-/// - **`HunlPreflop`**: absolute amount in cents.
 /// - **`KuhnPoker`**: unused (always 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
