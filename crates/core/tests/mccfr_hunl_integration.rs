@@ -4,7 +4,7 @@
 //! (preflop through river with board dealing) and produce valid strategies.
 
 use poker_solver_core::cfr::{MccfrConfig, MccfrSolver, calculate_exploitability};
-use poker_solver_core::game::{HunlPostflop, PostflopConfig};
+use poker_solver_core::game::{AbstractionMode, HunlPostflop, PostflopConfig};
 use test_macros::timed_test;
 
 /// Test that MCCFR produces valid strategies when training on full HUNL.
@@ -21,7 +21,6 @@ fn mccfr_hunl_postflop_full_game() {
         samples_per_iteration: 100,
         use_cfr_plus: true,
         discount_iterations: Some(30),
-        skip_first_iterations: None,
     };
     let mut solver = MccfrSolver::with_config(game, &mccfr_config);
     solver.set_seed(42);
@@ -103,7 +102,6 @@ fn mccfr_parallel_hunl_postflop() {
         samples_per_iteration: 100,
         use_cfr_plus: true,
         discount_iterations: Some(30),
-        skip_first_iterations: None,
     };
     let mut solver = MccfrSolver::with_config(game, &mccfr_config);
     solver.set_seed(42);
@@ -134,6 +132,104 @@ fn mccfr_parallel_hunl_postflop() {
         strategies.len(),
         solver.iterations()
     );
+}
+
+/// Test that hand_class blueprint keys can be scanned by position mask.
+///
+/// Simulates the scan_node_classes logic: build a position key from
+/// street/pot/stack/actions, then filter the blueprint for matching keys.
+#[timed_test(10)]
+fn hand_class_blueprint_scan_finds_entries() {
+    use poker_solver_core::blueprint::BlueprintStrategy;
+    use poker_solver_core::info_key::InfoKey;
+
+    let config = PostflopConfig {
+        stack_depth: 10,
+        bet_sizes: vec![1.0],
+        ..PostflopConfig::default()
+    };
+    let game = HunlPostflop::new(config, Some(AbstractionMode::HandClass), 200);
+
+    let mccfr_config = MccfrConfig {
+        samples_per_iteration: 50,
+        use_cfr_plus: true,
+        discount_iterations: None,
+    };
+    let mut solver = MccfrSolver::with_config(game, &mccfr_config);
+    solver.set_seed(42);
+    solver.train(30, 15);
+
+    let strategies = solver.all_strategies();
+    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
+
+    assert!(
+        !blueprint.is_empty(),
+        "Blueprint should contain strategies"
+    );
+    println!("Blueprint has {} info sets", blueprint.len());
+
+    // After preflop limp (call + check), pot = 4, stacks = [18, 18] (10BB * 2 = 20)
+    // pot_bucket = 4/20 = 0, stack_bucket = 18/20 = 0
+    // street = Flop (1), action_codes = [] (first action on flop)
+    let pot_bucket = 0u32;
+    let stack_bucket = 0u32;
+    let street_num = 1u8; // Flop
+    let action_codes: &[u8] = &[];
+
+    let position_key =
+        InfoKey::new(0, street_num, pot_bucket, stack_bucket, action_codes).as_u64();
+    let position_mask: u64 = (1u64 << 44) - 1;
+
+    let matches: Vec<(u64, u32)> = blueprint
+        .iter()
+        .filter(|(k, _)| (*k & position_mask) == position_key)
+        .map(|(k, _)| {
+            let hand_bits = (*k >> 44) as u32;
+            (*k, hand_bits)
+        })
+        .collect();
+
+    println!(
+        "Position key: {position_key:#018x}, matches: {}",
+        matches.len()
+    );
+
+    // Also try scanning for all flop keys regardless of pot/stack bucket
+    let street_mask: u64 = 0x3u64 << 42; // just the street bits
+    let street_key: u64 = (u64::from(street_num) & 0x3) << 42;
+    let flop_keys: Vec<(u32, u32)> = blueprint
+        .iter()
+        .filter(|(k, _)| (*k & street_mask) == street_key)
+        .map(|(k, _)| {
+            let decoded = InfoKey::from_raw(*k);
+            (decoded.pot_bucket(), decoded.stack_bucket())
+        })
+        .collect();
+
+    println!(
+        "Total flop keys: {}, pot/stack buckets seen: {:?}",
+        flop_keys.len(),
+        {
+            let mut unique: Vec<(u32, u32)> = flop_keys.clone();
+            unique.sort();
+            unique.dedup();
+            unique
+        }
+    );
+
+    // At minimum, some flop keys should exist in the blueprint
+    assert!(
+        !flop_keys.is_empty(),
+        "Blueprint should have flop keys for hand_class mode"
+    );
+
+    // If no exact matches, that's a bucket mismatch - report it
+    if matches.is_empty() {
+        println!(
+            "WARNING: No exact match for pot_bucket={pot_bucket}, stack_bucket={stack_bucket}. \
+             Training used different bucket values."
+        );
+    }
 }
 
 /// Test that blueprint pipeline works with MCCFR (train → extract → create blueprint).

@@ -53,7 +53,6 @@ fn main() {
         samples_per_iteration: samples,
         use_cfr_plus: true,
         discount_iterations: Some(0),
-        skip_first_iterations: Some(0),
     };
 
     let t2 = Instant::now();

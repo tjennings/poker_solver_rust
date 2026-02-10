@@ -164,19 +164,14 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     let game = HunlPostflop::new(config.game.clone(), abstraction_mode, config.training.deal_count);
 
     // Create MCCFR solver
-    let skip_first = config.training.iterations / 2;
     let mccfr_config = MccfrConfig {
         samples_per_iteration: config.training.mccfr_samples,
         use_cfr_plus: true,
         discount_iterations: Some(30),
-        skip_first_iterations: Some(skip_first),
     };
 
     println!("Creating MCCFR solver...");
-    println!(
-        "  Skip first {} iterations for average strategy (50%)",
-        skip_first
-    );
+    println!("  DCFR strategy discounting: (t/(t+1))^2");
     let start = Instant::now();
     let mut solver = MccfrSolver::with_config(game, &mccfr_config);
     solver.set_seed(config.training.seed);
