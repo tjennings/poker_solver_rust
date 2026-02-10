@@ -51,8 +51,6 @@ fn main() {
     // Phase 3: MCCFR solver creation
     let mccfr_config = MccfrConfig {
         samples_per_iteration: samples,
-        use_cfr_plus: true,
-        discount_iterations: Some(0),
         ..MccfrConfig::default()
     };
 
@@ -123,11 +121,10 @@ fn main() {
         HunlPostflop::new(prune_game_config, Some(AbstractionMode::HandClass), deal_count);
     let prune_mccfr_config = MccfrConfig {
         samples_per_iteration: samples,
-        use_cfr_plus: true,
-        discount_iterations: Some(0),
         pruning: true,
         pruning_warmup: 0, // no warmup for benchmark (short run)
         pruning_probe_interval: 20,
+        ..MccfrConfig::default()
     };
     let mut prune_solver = MccfrSolver::with_config(prune_game, &prune_mccfr_config);
     prune_solver.set_seed(42);

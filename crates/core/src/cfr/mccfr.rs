@@ -89,16 +89,17 @@ pub struct MccfrSolver<G: Game> {
     regret_sum: FxHashMap<u64, Vec<f64>>,
     /// Cumulative strategy sums (for averaging)
     strategy_sum: FxHashMap<u64, Vec<f64>>,
-    /// Use CFR+ (floor regrets at 0)
-    use_cfr_plus: bool,
     /// RNG state for sampling
     rng_state: u64,
     /// Total iterations completed
     iterations: u64,
-    /// Number of early iterations to discount (CFR+ optimization).
-    /// Iterations before this threshold use sqrt(t)/(sqrt(t)+1) weighting.
-    discount_iterations: u64,
-    /// Zero-regret pruning: skip subtrees of actions with 0 cumulative regret.
+    /// DCFR positive regret discount exponent
+    dcfr_alpha: f64,
+    /// DCFR negative regret discount exponent
+    dcfr_beta: f64,
+    /// DCFR strategy sum discount exponent
+    dcfr_gamma: f64,
+    /// Non-positive-regret pruning: skip actions with <= 0 cumulative regret.
     pruning: bool,
     /// Absolute iteration count before pruning activates.
     pruning_warmup: u64,
@@ -110,18 +111,23 @@ pub struct MccfrSolver<G: Game> {
     total_traversals: u64,
 }
 
-/// Configuration for MCCFR training.
+/// Configuration for MCCFR training with DCFR discounting.
+///
+/// Implements Discounted CFR (Brown & Sandholm 2019):
+/// - Positive regrets discounted by `t^α / (t^α + 1)` after each iteration
+/// - Negative regrets discounted by `t^β / (t^β + 1)` after each iteration
+/// - Strategy contributions weighted by `(t / (t+1))^γ` per iteration
 #[derive(Debug, Clone)]
 pub struct MccfrConfig {
     /// Number of initial states to sample per iteration
     pub samples_per_iteration: usize,
-    /// Use CFR+ regret flooring
-    pub use_cfr_plus: bool,
-    /// Discount early iterations (CFR+ optimization)
-    /// If Some(n), discount first n iterations by sqrt(t)/(sqrt(t)+1)
-    pub discount_iterations: Option<u64>,
-    /// Enable zero-regret pruning (skip actions with cumulative regret == 0).
-    /// Only applies when `use_cfr_plus` is true.
+    /// DCFR positive regret discount exponent (default 1.5)
+    pub dcfr_alpha: f64,
+    /// DCFR negative regret discount exponent (default 0.5)
+    pub dcfr_beta: f64,
+    /// DCFR strategy sum discount exponent (default 2.0)
+    pub dcfr_gamma: f64,
+    /// Enable non-positive-regret pruning (skip actions with cumulative regret <= 0).
     pub pruning: bool,
     /// Absolute iteration count to complete before enabling pruning.
     /// Caller should compute from a warmup fraction of total iterations.
@@ -134,8 +140,9 @@ impl Default for MccfrConfig {
     fn default() -> Self {
         Self {
             samples_per_iteration: 100,
-            use_cfr_plus: true,
-            discount_iterations: Some(30),
+            dcfr_alpha: 1.5,
+            dcfr_beta: 0.5,
+            dcfr_gamma: 2.0,
             pruning: false,
             pruning_warmup: 0,
             pruning_probe_interval: 20,
@@ -144,23 +151,10 @@ impl Default for MccfrConfig {
 }
 
 impl<G: Game> MccfrSolver<G> {
-    /// Creates a new MCCFR solver for the given game.
+    /// Creates a new MCCFR solver for the given game with default DCFR parameters.
     #[must_use]
     pub fn new(game: G) -> Self {
-        Self {
-            game,
-            regret_sum: FxHashMap::default(),
-            strategy_sum: FxHashMap::default(),
-            use_cfr_plus: true,
-            rng_state: 0x1234_5678_9ABC_DEF0,
-            iterations: 0,
-            discount_iterations: 30,
-            pruning: false,
-            pruning_warmup: 0,
-            pruning_probe_interval: 20,
-            pruned_traversals: 0,
-            total_traversals: 0,
-        }
+        Self::with_config(game, &MccfrConfig::default())
     }
 
     /// Creates a new MCCFR solver with custom configuration.
@@ -170,11 +164,12 @@ impl<G: Game> MccfrSolver<G> {
             game,
             regret_sum: FxHashMap::default(),
             strategy_sum: FxHashMap::default(),
-            use_cfr_plus: config.use_cfr_plus,
             rng_state: 0x1234_5678_9ABC_DEF0,
             iterations: 0,
-            discount_iterations: config.discount_iterations.unwrap_or(0),
-            pruning: config.pruning && config.use_cfr_plus,
+            dcfr_alpha: config.dcfr_alpha,
+            dcfr_beta: config.dcfr_beta,
+            dcfr_gamma: config.dcfr_gamma,
+            pruning: config.pruning,
             pruning_warmup: config.pruning_warmup,
             pruning_probe_interval: config.pruning_probe_interval.max(1),
             pruned_traversals: 0,
@@ -217,7 +212,6 @@ impl<G: Game> MccfrSolver<G> {
         }
 
         for i in 0..iterations {
-            let discount = self.compute_discount();
             let strategy_discount = self.compute_strategy_discount();
             let player = self.traversing_player();
 
@@ -237,30 +231,29 @@ impl<G: Game> MccfrSolver<G> {
                     1.0,
                     1.0,
                     sample_weight,
-                    discount,
                     strategy_discount,
                 );
             }
+            self.discount_regrets();
             self.iterations += 1;
             on_iteration(i + 1);
         }
     }
 
     /// Train for a fixed number of iterations, sampling all states once per iteration.
-    ///
-    /// This is equivalent to vanilla CFR but can be faster due to CFR+ optimizations.
     pub fn train_full(&mut self, iterations: u64) {
         let initial_states = self.game.initial_states();
 
         for _ in 0..iterations {
-            let discount = self.compute_discount();
             let strategy_discount = self.compute_strategy_discount();
             let player = self.traversing_player();
 
             for state in &initial_states {
-                self.cfr_traverse(state, player, 1.0, 1.0, 1.0, discount, strategy_discount);
+                self.cfr_traverse(state, player, 1.0, 1.0, 1.0, strategy_discount);
             }
 
+
+            self.discount_regrets();
             self.iterations += 1;
         }
     }
@@ -274,27 +267,37 @@ impl<G: Game> MccfrSolver<G> {
         }
     }
 
-    /// Compute discount factor for early iterations (CFR+ optimization).
-    fn compute_discount(&self) -> f64 {
-        if self.iterations < self.discount_iterations {
-            #[allow(clippy::cast_precision_loss)]
-            let t = (self.iterations + 1) as f64;
-            t.sqrt() / (t.sqrt() + 1.0)
-        } else {
-            1.0
-        }
-    }
-
-    /// Compute DCFR strategy discount: `(t / (t + 1))^2`.
+    /// Compute DCFR strategy discount: `(t / (t + 1))^γ`.
     ///
     /// Down-weights older strategy contributions so that early, noisy
-    /// iterations contribute less to the average strategy. Replaces the
-    /// hard skip of the first N iterations.
+    /// iterations contribute less to the average strategy.
     fn compute_strategy_discount(&self) -> f64 {
         #[allow(clippy::cast_precision_loss)]
         let t = self.iterations as f64;
         let ratio = t / (t + 1.0);
-        ratio * ratio
+        ratio.powf(self.dcfr_gamma)
+    }
+
+    /// Apply DCFR cumulative regret discounting after each iteration.
+    ///
+    /// Positive regrets multiplied by `t^α / (t^α + 1)`.
+    /// Negative regrets multiplied by `t^β / (t^β + 1)`.
+    /// With α > β, negative regrets decay faster, focusing on promising actions.
+    fn discount_regrets(&mut self) {
+        #[allow(clippy::cast_precision_loss)]
+        let t = (self.iterations + 1) as f64;
+        let pos_factor = t.powf(self.dcfr_alpha) / (t.powf(self.dcfr_alpha) + 1.0);
+        let neg_factor = t.powf(self.dcfr_beta) / (t.powf(self.dcfr_beta) + 1.0);
+
+        for regrets in self.regret_sum.values_mut() {
+            for r in regrets.iter_mut() {
+                if *r > 0.0 {
+                    *r *= pos_factor;
+                } else if *r < 0.0 {
+                    *r *= neg_factor;
+                }
+            }
+        }
     }
 
     /// Returns pruning statistics: `(pruned, total)` traversals.
@@ -306,7 +309,7 @@ impl<G: Game> MccfrSolver<G> {
     /// Check whether action `action_idx` at `info_set` should be pruned.
     ///
     /// Prunes only when: pruning is enabled, past warmup, not a probe iteration,
-    /// the action has zero regret, and at least one sibling has positive regret.
+    /// the action has non-positive regret, and at least one sibling has positive regret.
     fn should_prune(&self, info_set: u64, action_idx: usize) -> bool {
         if !self.pruning {
             return false;
@@ -319,11 +322,11 @@ impl<G: Game> MccfrSolver<G> {
         }
         match self.regret_sum.get(&info_set) {
             Some(regrets) => {
-                // Only prune if this action is zero AND at least one action is positive.
-                // If ALL regrets are zero, regret matching returns uniform — must explore all.
+                // Only prune if this action has non-positive regret AND at least one
+                // sibling has positive regret. If ALL regrets are <= 0, regret matching
+                // returns uniform — must explore all.
                 let has_positive = regrets.iter().any(|&r| r > 0.0);
-                // CFR+ explicitly assigns 0.0 via flooring, so == 0.0 is safe here.
-                has_positive && regrets[action_idx] == 0.0
+                has_positive && regrets[action_idx] <= 0.0
             }
             None => false, // No regret data yet — don't prune
         }
@@ -400,7 +403,6 @@ impl<G: Game> MccfrSolver<G> {
     /// At the traversing player's nodes: explore ALL actions (full width).
     /// At the opponent's nodes: SAMPLE ONE action according to current strategy.
     /// This makes traversal linear in the opponent's branching factor.
-    #[allow(clippy::too_many_arguments)]
     fn cfr_traverse(
         &mut self,
         state: &G::State,
@@ -408,7 +410,6 @@ impl<G: Game> MccfrSolver<G> {
         p1_reach: f64,
         p2_reach: f64,
         sample_weight: f64,
-        discount: f64,
         strategy_discount: f64,
     ) -> f64 {
         if self.game.is_terminal(state) {
@@ -450,7 +451,6 @@ impl<G: Game> MccfrSolver<G> {
                     new_p1_reach,
                     new_p2_reach,
                     sample_weight,
-                    discount,
                     strategy_discount,
                 );
             }
@@ -475,12 +475,8 @@ impl<G: Game> MccfrSolver<G> {
 
             for i in 0..num_actions {
                 let regret_delta =
-                    opponent_reach * (action_utils[i] - node_util) * sample_weight * discount;
+                    opponent_reach * (action_utils[i] - node_util) * sample_weight;
                 regrets[i] += regret_delta;
-
-                if self.use_cfr_plus && regrets[i] < 0.0 {
-                    regrets[i] = 0.0;
-                }
             }
 
             // Accumulate strategy with DCFR discounting
@@ -535,7 +531,6 @@ impl<G: Game> MccfrSolver<G> {
                 new_p1_reach,
                 new_p2_reach,
                 sample_weight,
-                discount,
                 strategy_discount,
             )
         }
@@ -568,7 +563,6 @@ impl<G: Game> MccfrSolver<G> {
         }
 
         for i in 0..iterations {
-            let discount = self.compute_discount();
             let strategy_discount = self.compute_strategy_discount();
             let player = self.traversing_player();
             let base_seed = self.rng_state;
@@ -611,7 +605,6 @@ impl<G: Game> MccfrSolver<G> {
                                 1.0,
                                 1.0,
                                 sample_weight,
-                                discount,
                                 strategy_discount,
                                 pruning_ctx,
                             );
@@ -622,6 +615,7 @@ impl<G: Game> MccfrSolver<G> {
             };
 
             self.merge_accumulator(merged);
+            self.discount_regrets();
 
             // Advance main RNG so seed changes per iteration
             xorshift(&mut self.rng_state);
@@ -635,7 +629,6 @@ impl<G: Game> MccfrSolver<G> {
         let initial_states = self.game.initial_states();
 
         for _ in 0..iterations {
-            let discount = self.compute_discount();
             let strategy_discount = self.compute_strategy_discount();
             let player = self.traversing_player();
 
@@ -669,7 +662,6 @@ impl<G: Game> MccfrSolver<G> {
                                 1.0,
                                 1.0,
                                 1.0,
-                                discount,
                                 strategy_discount,
                                 pruning_ctx,
                             );
@@ -680,13 +672,12 @@ impl<G: Game> MccfrSolver<G> {
             };
 
             self.merge_accumulator(merged);
+            self.discount_regrets();
             self.iterations += 1;
         }
     }
 
     /// Merge a `TraversalAccumulator` into the solver's main tables.
-    ///
-    /// Applies CFR+ flooring (clamp to 0) on regrets during merge.
     fn merge_accumulator(&mut self, acc: TraversalAccumulator) {
         self.pruned_traversals += acc.pruned_count;
         self.total_traversals += acc.total_count;
@@ -698,9 +689,6 @@ impl<G: Game> MccfrSolver<G> {
                 .or_insert_with(|| vec![0.0; deltas.len()]);
             for (i, d) in deltas.iter().enumerate() {
                 regrets[i] += d;
-                if self.use_cfr_plus && regrets[i] < 0.0 {
-                    regrets[i] = 0.0;
-                }
             }
         }
 
@@ -727,7 +715,7 @@ struct PruningCtx {
 
 /// Thread-local accumulator for parallel MCCFR traversals.
 ///
-/// Collects regret and strategy deltas without CFR+ flooring.
+/// Collects regret and strategy deltas during parallel traversal.
 /// Merged via tree reduction after all samples complete.
 struct TraversalAccumulator {
     regret_deltas: FxHashMap<u64, Vec<f64>>,
@@ -795,8 +783,7 @@ fn should_prune_snapshot(
     match regret_snapshot.get(&info_set) {
         Some(regrets) => {
             let has_positive = regrets.iter().any(|&r| r > 0.0);
-            // Snapshot was floored during previous merge — == 0.0 is safe.
-            has_positive && regrets[action_idx] == 0.0
+            has_positive && regrets[action_idx] <= 0.0
         }
         None => false,
     }
@@ -816,7 +803,6 @@ fn cfr_traverse_pure<G: Game>(
     p1_reach: f64,
     p2_reach: f64,
     sample_weight: f64,
-    discount: f64,
     strategy_discount: f64,
     pruning: PruningCtx,
 ) -> f64 {
@@ -859,7 +845,6 @@ fn cfr_traverse_pure<G: Game>(
                 new_p1,
                 new_p2,
                 sample_weight,
-                discount,
                 strategy_discount,
                 pruning,
             );
@@ -883,7 +868,7 @@ fn cfr_traverse_pure<G: Game>(
 
         for i in 0..num_actions {
             regrets[i] +=
-                opponent_reach * (action_utils[i] - node_util) * sample_weight * discount;
+                opponent_reach * (action_utils[i] - node_util) * sample_weight;
         }
 
         if strategy_discount > 0.0 {
@@ -938,7 +923,6 @@ fn cfr_traverse_pure<G: Game>(
             new_p1,
             new_p2,
             sample_weight,
-            discount,
             strategy_discount,
             pruning,
         )
@@ -1046,21 +1030,6 @@ mod tests {
     }
 
     #[timed_test]
-    fn cfr_plus_floors_negative_regrets() {
-        let game = KuhnPoker::new();
-        let mut solver = MccfrSolver::new(game);
-
-        solver.train_full(100);
-
-        // All regrets should be >= 0 with CFR+
-        for regrets in solver.regret_sum.values() {
-            for &r in regrets {
-                assert!(r >= 0.0, "CFR+ should floor regrets at 0, got {r}");
-            }
-        }
-    }
-
-    #[timed_test]
     fn set_seed_produces_deterministic_results() {
         let game = KuhnPoker::new();
 
@@ -1132,28 +1101,107 @@ mod tests {
     }
 
     #[timed_test]
-    fn discount_iterations_from_config() {
+    fn dcfr_config_params_wired_correctly() {
         let config = MccfrConfig {
-            discount_iterations: Some(100),
-            use_cfr_plus: true,
+            dcfr_alpha: 2.0,
+            dcfr_beta: 1.0,
+            dcfr_gamma: 3.0,
             ..MccfrConfig::default()
         };
         let game = KuhnPoker::new();
         let solver = MccfrSolver::with_config(game, &config);
 
-        assert_eq!(solver.discount_iterations, 100);
+        assert!((solver.dcfr_alpha - 2.0).abs() < 1e-10);
+        assert!((solver.dcfr_beta - 1.0).abs() < 1e-10);
+        assert!((solver.dcfr_gamma - 3.0).abs() < 1e-10);
     }
 
     #[timed_test]
-    fn discount_iterations_none_means_zero() {
+    fn dcfr_default_params() {
+        let config = MccfrConfig::default();
+        assert!((config.dcfr_alpha - 1.5).abs() < 1e-10);
+        assert!((config.dcfr_beta - 0.5).abs() < 1e-10);
+        assert!((config.dcfr_gamma - 2.0).abs() < 1e-10);
+    }
+
+    #[timed_test]
+    fn dcfr_discounts_positive_and_negative_regrets() {
+        let game = KuhnPoker::new();
+        let mut solver = MccfrSolver::new(game);
+
+        // Manually inject known regrets
+        solver.regret_sum.insert(1, vec![10.0, -5.0, 0.0]);
+        solver.iterations = 4; // t = 5
+
+        // Expected factors: pos = 5^1.5 / (5^1.5 + 1) ≈ 0.918
+        //                   neg = 5^0.5 / (5^0.5 + 1) ≈ 0.691
+        let t = 5.0_f64;
+        let expected_pos = t.powf(1.5) / (t.powf(1.5) + 1.0);
+        let expected_neg = t.powf(0.5) / (t.powf(0.5) + 1.0);
+
+        solver.discount_regrets();
+
+        let regrets = &solver.regret_sum[&1];
+        assert!(
+            (regrets[0] - 10.0 * expected_pos).abs() < 1e-6,
+            "Positive regret should be discounted by alpha: got {}, expected {}",
+            regrets[0], 10.0 * expected_pos
+        );
+        assert!(
+            (regrets[1] - (-5.0 * expected_neg)).abs() < 1e-6,
+            "Negative regret should be discounted by beta: got {}, expected {}",
+            regrets[1], -5.0 * expected_neg
+        );
+        assert!(
+            regrets[2].abs() < 1e-10,
+            "Zero regret should remain zero"
+        );
+    }
+
+    #[timed_test]
+    fn dcfr_negative_regrets_decay_faster_than_positive() {
+        let game = KuhnPoker::new();
+        let mut solver = MccfrSolver::new(game);
+
+        // With default α=1.5, β=0.5, negative regrets decay faster
+        solver.regret_sum.insert(1, vec![100.0, -100.0]);
+        solver.iterations = 2; // t = 3
+
+        solver.discount_regrets();
+
+        let regrets = &solver.regret_sum[&1];
+        let pos_retained = regrets[0] / 100.0;
+        let neg_retained = regrets[1].abs() / 100.0;
+
+        assert!(
+            neg_retained < pos_retained,
+            "Negative regrets should decay faster (β<α): pos_retained={pos_retained:.4}, neg_retained={neg_retained:.4}"
+        );
+    }
+
+    #[timed_test]
+    fn dcfr_pruning_prunes_negative_regret_actions() {
+        let game = KuhnPoker::new();
         let config = MccfrConfig {
-            discount_iterations: None,
+            pruning: true,
+            pruning_warmup: 0,
+            pruning_probe_interval: 100,
             ..MccfrConfig::default()
         };
-        let game = KuhnPoker::new();
-        let solver = MccfrSolver::with_config(game, &config);
+        let mut solver = MccfrSolver::with_config(game, &config);
 
-        assert_eq!(solver.discount_iterations, 0);
+        // One positive regret, one negative regret
+        solver.regret_sum.insert(999, vec![5.0, -2.0]);
+        solver.iterations = 50; // past warmup, not a probe
+
+        assert!(
+            solver.should_prune(999, 1),
+            "Should prune action with negative regret when a sibling is positive"
+        );
+        assert!(
+            !solver.should_prune(999, 0),
+            "Should not prune the positive-regret action"
+        );
     }
 
     // --- Parallel MCCFR tests ---
@@ -1237,23 +1285,6 @@ mod tests {
                 strategy[0] > 0.99,
                 "Parallel: Jack should always fold facing a bet, got {strategy:?}"
             );
-        }
-    }
-
-    #[timed_test]
-    fn parallel_cfr_plus_floors_negative_regrets() {
-        let game = KuhnPoker::new();
-        let mut solver = MccfrSolver::new(game);
-
-        solver.train_full_parallel(100);
-
-        for regrets in solver.regret_sum.values() {
-            for &r in regrets {
-                assert!(
-                    r >= 0.0,
-                    "Parallel CFR+ should floor regrets at 0, got {r}"
-                );
-            }
         }
     }
 
@@ -1357,7 +1388,7 @@ mod tests {
     }
 
     #[timed_test]
-    fn pruning_does_not_skip_all_zero_info_set() {
+    fn pruning_does_not_skip_all_non_positive_info_set() {
         let game = KuhnPoker::new();
         let config = MccfrConfig {
             pruning: true,
@@ -1365,35 +1396,40 @@ mod tests {
             pruning_probe_interval: 100,
             ..MccfrConfig::default()
         };
-        let solver = MccfrSolver::with_config(game, &config);
+        let mut solver = MccfrSolver::with_config(game, &config);
+        solver.iterations = 101; // past warmup, not a probe (101 % 100 != 0)
 
-        // Manually test should_prune with an all-zero regret entry
-        // (simulates a newly discovered info set where all regrets are floored)
-        // We can't call should_prune directly (it's &self), so test the logic:
         // When all regrets are zero, has_positive is false → no pruning
-        let mut solver_with_zeros = solver;
-        solver_with_zeros.regret_sum.insert(999, vec![0.0, 0.0]);
-        solver_with_zeros.iterations = 101; // past warmup, not a probe (101 % 100 != 0)
-
-        // Action 0 should NOT be pruned (all zeros → uniform fallback)
+        solver.regret_sum.insert(999, vec![0.0, 0.0]);
         assert!(
-            !solver_with_zeros.should_prune(999, 0),
+            !solver.should_prune(999, 0),
             "should not prune when all regrets are zero"
         );
         assert!(
-            !solver_with_zeros.should_prune(999, 1),
+            !solver.should_prune(999, 1),
             "should not prune when all regrets are zero"
         );
 
-        // But if one is positive, the zero one should be pruned
-        solver_with_zeros.regret_sum.insert(999, vec![5.0, 0.0]);
+        // When all regrets are negative, has_positive is false → no pruning
+        solver.regret_sum.insert(999, vec![-3.0, -1.0]);
         assert!(
-            !solver_with_zeros.should_prune(999, 0),
+            !solver.should_prune(999, 0),
+            "should not prune when all regrets are negative"
+        );
+
+        // If one is positive, the zero or negative ones should be pruned
+        solver.regret_sum.insert(999, vec![5.0, 0.0, -2.0]);
+        assert!(
+            !solver.should_prune(999, 0),
             "should not prune the positive-regret action"
         );
         assert!(
-            solver_with_zeros.should_prune(999, 1),
+            solver.should_prune(999, 1),
             "should prune the zero-regret action when a sibling is positive"
+        );
+        assert!(
+            solver.should_prune(999, 2),
+            "should prune the negative-regret action when a sibling is positive"
         );
     }
 

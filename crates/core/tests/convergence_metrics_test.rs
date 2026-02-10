@@ -1,4 +1,4 @@
-//! Integration tests for convergence metrics during MCCFR training.
+//! Integration tests for convergence metrics during DCFR training.
 //!
 //! Trains Kuhn poker with periodic checkpoints and verifies that
 //! convergence indicators improve over training.
@@ -70,7 +70,7 @@ fn convergence_metrics_decrease_over_training() {
         deltas.last().unwrap()
     );
 
-    // Per-iteration max regret should decrease
+    // Max regret/T should decrease (DCFR regret is bounded; dividing by T → 0)
     assert!(
         max_regrets.last().unwrap() < max_regrets.first().unwrap(),
         "Max regret/T should decrease: first={:.6}, last={:.6}",
@@ -78,7 +78,7 @@ fn convergence_metrics_decrease_over_training() {
         max_regrets.last().unwrap()
     );
 
-    // Per-iteration avg regret should decrease
+    // Avg regret/T should decrease
     assert!(
         avg_regrets.last().unwrap() < avg_regrets.first().unwrap(),
         "Avg regret/T should decrease: first={:.6}, last={:.6}",

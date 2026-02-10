@@ -1,11 +1,13 @@
-//! Convergence metrics for MCCFR training.
+//! Convergence metrics for DCFR training.
 //!
 //! Pure functions that compute quantitative indicators of training progress.
 //! All functions take `&FxHashMap` references and return scalar metrics.
 //!
-//! Regret functions normalize by iteration count because CFR+ cumulative
-//! regret grows with training (O(sqrt(T))). The per-iteration average
-//! regret/T is the meaningful convergence signal that approaches zero.
+//! Regret functions normalize by iteration count. With DCFR, cumulative
+//! regrets are bounded by per-iteration discounting (positive by
+//! `t^α/(t^α+1)`, negative by `t^β/(t^β+1)`) and stabilize at a
+//! constant. Dividing by T produces a decreasing signal useful for
+//! monitoring convergence progress.
 
 use rustc_hash::FxHashMap;
 
@@ -43,11 +45,11 @@ pub fn strategy_delta(
     }
 }
 
-/// Maximum per-iteration regret across all info sets and actions.
+/// Maximum regret per iteration across all info sets and actions.
 ///
-/// Divides the maximum absolute cumulative regret by `iterations` to produce
-/// the per-iteration average. This value should decrease toward zero as
-/// training converges. Returns 0.0 if the regret map is empty or iterations is 0.
+/// With DCFR, cumulative regrets stabilize at a bounded constant due to
+/// discounting. Dividing by `iterations` produces a decreasing monitoring
+/// signal. Returns 0.0 if the regret map is empty or iterations is 0.
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 pub fn max_regret(regret_sum: &FxHashMap<u64, Vec<f64>>, iterations: u64) -> f64 {
@@ -65,10 +67,11 @@ pub fn max_regret(regret_sum: &FxHashMap<u64, Vec<f64>>, iterations: u64) -> f64
     { max_cumulative / iterations as f64 }
 }
 
-/// Mean per-iteration regret across all info sets and actions.
+/// Mean regret per iteration across all info sets and actions.
 ///
-/// Divides the mean absolute cumulative regret by `iterations` to produce
-/// the per-iteration average. Smoother signal than max regret.
+/// Smoother signal than max regret. With DCFR, cumulative regrets are
+/// bounded by discounting; dividing by iterations gives a decreasing
+/// convergence indicator.
 /// Returns 0.0 if the regret map is empty or iterations is 0.
 #[must_use]
 #[allow(clippy::implicit_hasher)]

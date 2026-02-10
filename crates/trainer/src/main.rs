@@ -191,15 +191,14 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     let mccfr_config = MccfrConfig {
         samples_per_iteration: config.training.mccfr_samples,
-        use_cfr_plus: true,
-        discount_iterations: Some(30),
         pruning: config.training.pruning,
         pruning_warmup,
         pruning_probe_interval: config.training.pruning_probe_interval,
+        ..MccfrConfig::default()
     };
 
     println!("Creating MCCFR solver...");
-    println!("  DCFR strategy discounting: (t/(t+1))^2");
+    println!("  DCFR: α={}, β={}, γ={}", mccfr_config.dcfr_alpha, mccfr_config.dcfr_beta, mccfr_config.dcfr_gamma);
     if config.training.pruning {
         println!(
             "  Pruning: enabled (warmup {:.0}%, probe every {} iters)",
