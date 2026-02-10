@@ -30,9 +30,9 @@ cd frontend && npm install && cd ..
 
 Training uses the `poker-solver-trainer` CLI to run MCCFR iterations and save a strategy bundle.
 
-MCCFR (Monte Carlo CFR) samples random card deals and performs full CFR traversal on the betting tree for each deal. This avoids materializing the entire game tree, making it practical for full HUNL. The implementation follows Brown et al.'s depth-limited solving paper:
-- CFR+ regret flooring
-- Early iteration discounting: first 30 iterations weighted by `sqrt(T)/(sqrt(T)+1)`
+MCCFR (Monte Carlo CFR) samples random card deals and performs full CFR traversal on the betting tree for each deal. This avoids materializing the entire game tree, making it practical for full HUNL. The implementation uses Discounted CFR (DCFR):
+- DCFR discounting with α=1.5, β=0.5, γ=2.0 (positive regrets retained, negative regrets decay)
+- Regret-based pruning: actions with non-positive cumulative regret are skipped (with probe iterations)
 - Average strategy skips first 50% of iterations
 
 ### 1. Create a training config
@@ -42,7 +42,7 @@ Create a YAML file (e.g. `training_mccfr.yaml`):
 ```yaml
 game:
   stack_depth: 100         # Effective stack in big blinds
-  bet_sizes: [0.33, 0.5, 0.75, 1.0]  # Pot-fraction bet sizes (all-in always included)
+  bet_sizes: [0.33, 0.67, 1.0, 2.0, 3.0]  # Pot-fraction bet sizes (all-in always included)
   samples_per_iteration: 50000  # Deal pool size (used internally by initial_states)
 
 abstraction:
@@ -151,6 +151,70 @@ cargo run -p poker-solver-trainer --release -- flops --format csv --output datas
 ```
 
 Omit `--output` to print to stdout.
+
+## Analyzing the Game Tree
+
+The `tree` subcommand inspects trained strategy bundles. It has two modes: **deal tree** (walk a concrete deal showing strategies at each node) and **key describe** (translate info set keys).
+
+### Deal tree
+
+Walk a random deal from a trained bundle, showing strategy probabilities and path-weighted EV:
+
+```bash
+cargo run -p poker-solver-trainer --release -- tree -b ./my_strategy
+```
+
+Filter to a specific starting hand:
+
+```bash
+cargo run -p poker-solver-trainer --release -- tree -b ./my_strategy --hand AKs
+```
+
+Options:
+- `-d, --depth <N>` — Max tree depth (default: 4)
+- `-m, --min-prob <P>` — Prune branches below this probability (default: 0.01)
+- `-s, --seed <N>` — RNG seed for deal selection (default: 42)
+- `--hand <HAND>` — Filter to a canonical hand (e.g. "AKs", "QQ", "T9o")
+
+Output includes an ASCII tree with action probabilities and an EV summary:
+
+```
+Preflop (P1 to act) — AcKh
+├── Fold (2%)
+├── Call (35%)
+├── Bet 33% (48%) ── ...
+└── Bet All-In (5%) ── ...
+
+─── EV Summary (P1 perspective) ──────────────
+  Path                                            Reach%     EV (BB)
+  ──────────────────────────────────────────────────────────────────
+  P1:Fold                                           2.0%      -0.50
+  P1:Call → P2:Check → ...                         18.2%      +1.23
+```
+
+### Key describe
+
+Translate an info set key (from training diagnostics) to human-readable format:
+
+```bash
+cargo run -p poker-solver-trainer --release -- tree -b ./my_strategy --key 0xa800000c02000000
+```
+
+Output shows the decoded fields and the blueprint strategy for that key:
+
+```
+Key:     0xA800000C02000000
+Compose: river:TopSet:spr0:d1:check,bet33
+
+  Street:  River
+  Hand:    TopSet (bits: 0x00000015)
+  SPR:     0    Depth: 1
+  Actions: [Check, Bet 33%]
+
+  Strategy: Check 0.15 | Bet 33% 0.42 | Bet 67% 0.28 | Bet All-In 0.15
+```
+
+This is useful for investigating convergence outliers — training checkpoints print the highest/lowest regret keys with a ready-to-copy `tree --key` command.
 
 ## Running Tests
 
