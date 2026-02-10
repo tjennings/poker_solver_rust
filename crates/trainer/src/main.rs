@@ -6,12 +6,15 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use poker_solver_core::Game;
+use poker_solver_core::HandClass;
+use poker_solver_core::hand_class::HandClassification;
 use poker_solver_core::abstraction::{AbstractionConfig, BoundaryGenerator};
 use poker_solver_core::blueprint::{BlueprintStrategy, BundleConfig, StrategyBundle};
 use poker_solver_core::cfr::{MccfrConfig, MccfrSolver};
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
 use poker_solver_core::game::{AbstractionMode, Action, HunlPostflop, PostflopConfig};
 use poker_solver_core::info_key::{canonical_hand_index_from_str, InfoKey};
+use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
 #[derive(Parser)]
@@ -461,6 +464,171 @@ fn print_checkpoint(
             }
         } else {
             println!("{:<6}|  (invalid hand)", hand);
+        }
+    }
+    println!();
+
+    print_river_strategies(&strategies);
+}
+
+/// Hand classes to display in the river strategy table (strongest → weakest).
+const RIVER_DISPLAY_CLASSES: &[HandClass] = &[
+    HandClass::NutFlush,
+    HandClass::Straight,
+    HandClass::TopSet,
+    HandClass::TwoPair,
+    HandClass::Overpair,
+    HandClass::TopPair,
+    HandClass::SecondPair,
+    HandClass::AceHigh,
+];
+
+/// Return the strongest (lowest-discriminant) made-hand class for a hand_bits value,
+/// or `None` if no recognized class is set.
+fn strongest_class(hand_bits: u32) -> Option<HandClass> {
+    HandClassification::from_bits(hand_bits).iter().next()
+}
+
+/// Return a short display name for a `HandClass`.
+fn class_label(class: HandClass) -> &'static str {
+    match class {
+        HandClass::NutFlush => "NutFlush",
+        HandClass::Straight => "Straight",
+        HandClass::TopSet => "TopSet",
+        HandClass::TwoPair => "TwoPair",
+        HandClass::Overpair => "Overpair",
+        HandClass::TopPair => "TopPair",
+        HandClass::SecondPair => "SecondPair",
+        HandClass::AceHigh => "AceHigh",
+        other => {
+            // Fallback — use the Display impl (leaks a String, acceptable for rare cases)
+            Box::leak(other.to_string().into_boxed_str())
+        }
+    }
+}
+
+/// Group key for river scenarios: (pot_bucket, stack_bucket, actions_bits).
+type RiverScenario = (u32, u32, u32);
+
+/// Print river strategy tables for the most populated first-to-act and facing-bet scenarios.
+fn print_river_strategies(strategies: &FxHashMap<u64, Vec<f64>>) {
+    // Collect river keys grouped by scenario
+    let mut first_to_act: FxHashMap<RiverScenario, Vec<(u32, Vec<f64>)>> = FxHashMap::default();
+    let mut facing_action: FxHashMap<RiverScenario, Vec<(u32, Vec<f64>)>> = FxHashMap::default();
+
+    for (&raw_key, probs) in strategies {
+        let key = InfoKey::from_raw(raw_key);
+        if key.street() != 3 {
+            continue;
+        }
+        let hand_bits = key.hand_bits();
+        let pot = key.pot_bucket();
+        let stack = key.stack_bucket();
+        let actions = key.actions_bits();
+        let scenario = (pot, stack, actions);
+
+        if actions == 0 {
+            first_to_act
+                .entry(scenario)
+                .or_default()
+                .push((hand_bits, probs.clone()));
+        } else {
+            facing_action
+                .entry(scenario)
+                .or_default()
+                .push((hand_bits, probs.clone()));
+        }
+    }
+
+    if let Some(scenario) = most_populated_scenario(&first_to_act) {
+        let entries = &first_to_act[&scenario];
+        let num_actions = entries.first().map_or(0, |(_, p)| p.len());
+        let labels = first_to_act_labels(num_actions);
+        print_river_table("first to act", scenario, entries, &labels);
+    }
+
+    if let Some(scenario) = most_populated_scenario(&facing_action) {
+        let entries = &facing_action[&scenario];
+        let num_actions = entries.first().map_or(0, |(_, p)| p.len());
+        let labels = facing_bet_labels(num_actions);
+        print_river_table("facing bet", scenario, entries, &labels);
+    }
+}
+
+/// Find the scenario key with the most entries.
+fn most_populated_scenario(
+    groups: &FxHashMap<RiverScenario, Vec<(u32, Vec<f64>)>>,
+) -> Option<RiverScenario> {
+    groups
+        .iter()
+        .max_by_key(|(_, entries)| entries.len())
+        .map(|(&k, _)| k)
+}
+
+/// Build action labels for first-to-act river spots.
+fn first_to_act_labels(num_actions: usize) -> Vec<String> {
+    let mut labels = vec!["Check".to_string()];
+    for i in 0..num_actions.saturating_sub(2) {
+        labels.push(format!("B{i}"));
+    }
+    if num_actions > 1 {
+        labels.push("B-AI".to_string());
+    }
+    labels
+}
+
+/// Build action labels for facing-bet river spots.
+fn facing_bet_labels(num_actions: usize) -> Vec<String> {
+    let mut labels = vec!["Fold".to_string(), "Call".to_string()];
+    for i in 0..num_actions.saturating_sub(3) {
+        labels.push(format!("R{i}"));
+    }
+    if num_actions > 2 {
+        labels.push("R-AI".to_string());
+    }
+    labels
+}
+
+/// Print a single river strategy table.
+fn print_river_table(
+    context: &str,
+    scenario: RiverScenario,
+    entries: &[(u32, Vec<f64>)],
+    labels: &[String],
+) {
+    // Deduplicate by strongest hand class — keep entry with most data
+    let mut by_class: FxHashMap<u8, &Vec<f64>> = FxHashMap::default();
+    for (hand_bits, probs) in entries {
+        if let Some(class) = strongest_class(*hand_bits) {
+            let disc = class as u8;
+            by_class.entry(disc).or_insert(probs);
+        }
+    }
+
+    let (pot_bucket, stack_bucket, _) = scenario;
+    // Convert buckets back to approximate BB values: bucket * 20 / 2 (internal units → BB)
+    let pot_bb = pot_bucket * 10;
+    let stack_bb = stack_bucket * 10;
+
+    let action_cols: String = labels.iter().map(|l| format!("{:>6}", l)).collect();
+    let header = format!("{:<12}|{action_cols}", "Class");
+    let separator = "-".repeat(header.len());
+
+    println!(
+        "River Strategy ({context}, pot ~{pot_bb}BB, stack ~{stack_bb}BB):"
+    );
+    println!("{header}");
+    println!("{separator}");
+
+    for &class in RIVER_DISPLAY_CLASSES {
+        let disc = class as u8;
+        if let Some(probs) = by_class.get(&disc) {
+            let prob_cols: String = probs
+                .iter()
+                .take(labels.len())
+                .map(|p| format!("{:>6.2}", p))
+                .collect();
+            println!("{:<12}|{prob_cols}", class_label(class));
         }
     }
     println!();

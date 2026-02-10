@@ -89,6 +89,24 @@ impl InfoKey {
         ((self.0 >> STACK_SHIFT) & 0xF) as u32
     }
 
+    /// Extract the street (2 bits): 0=Preflop, 1=Flop, 2=Turn, 3=River.
+    #[must_use]
+    pub const fn street(self) -> u8 {
+        ((self.0 >> STREET_SHIFT) & 0x3) as u8
+    }
+
+    /// Extract the hand/bucket bits (28 bits).
+    #[must_use]
+    pub const fn hand_bits(self) -> u32 {
+        ((self.0 >> HAND_SHIFT) & 0xFFF_FFFF) as u32
+    }
+
+    /// Extract the action slots (lower 24 bits).
+    #[must_use]
+    pub const fn actions_bits(self) -> u32 {
+        (self.0 & 0xFF_FFFF) as u32
+    }
+
     /// Return a new key with modified pot and stack buckets.
     #[must_use]
     pub const fn with_buckets(self, pot_bucket: u32, stack_bucket: u32) -> Self {
@@ -258,6 +276,36 @@ mod tests {
         let key = InfoKey::new(42, 2, 15, 9, &[1, 3, 5]);
         assert_eq!(key.pot_bucket(), 15);
         assert_eq!(key.stack_bucket(), 9);
+        assert_eq!(key.street(), 2);
+        assert_eq!(key.hand_bits(), 42);
+    }
+
+    #[timed_test]
+    fn street_extractor() {
+        for street in 0..=3u8 {
+            let key = InfoKey::new(0, street, 0, 0, &[]);
+            assert_eq!(key.street(), street);
+        }
+    }
+
+    #[timed_test]
+    fn hand_bits_extractor() {
+        let key = InfoKey::new(0xABC_DEF, 1, 5, 3, &[2]);
+        assert_eq!(key.hand_bits(), 0xABC_DEF);
+    }
+
+    #[timed_test]
+    fn actions_bits_extractor() {
+        // Actions packed: [4, 7] → action 0 at bits 23-20 = 4, action 1 at bits 19-16 = 7
+        let key = InfoKey::new(0, 0, 0, 0, &[4, 7]);
+        let expected = (4u32 << 20) | (7u32 << 16);
+        assert_eq!(key.actions_bits(), expected);
+    }
+
+    #[timed_test]
+    fn actions_bits_empty() {
+        let key = InfoKey::new(100, 3, 10, 5, &[]);
+        assert_eq!(key.actions_bits(), 0);
     }
 
     #[timed_test]
