@@ -549,10 +549,9 @@ impl Game for HunlPostflop {
             actions.push(Action::Call);
         }
 
-        // Bet/raise sizes (only if under the per-street raise cap).
-        // Always include ALL bet-size indices + ALL_IN so that every visit
-        // to the same info set sees the same action count.  Bets that exceed
-        // the effective stack are capped to all-in in `next_state()`.
+        // Sized bet/raise options (only if under the per-street raise cap).
+        // Bets that exceed the effective stack are capped to all-in in
+        // `next_state()`.
         if state.street_bets < self.config.max_raises_per_street {
             #[allow(clippy::cast_possible_truncation)]
             for idx in 0..self.config.bet_sizes.len() {
@@ -566,13 +565,14 @@ impl Game for HunlPostflop {
                     actions.push(Action::Raise(idx_u32));
                 }
             }
+        }
 
-            if !actions.is_full() {
-                if to_call == 0 {
-                    actions.push(Action::Bet(ALL_IN));
-                } else {
-                    actions.push(Action::Raise(ALL_IN));
-                }
+        // All-in is always available regardless of raise cap
+        if !actions.is_full() {
+            if to_call == 0 {
+                actions.push(Action::Bet(ALL_IN));
+            } else {
+                actions.push(Action::Raise(ALL_IN));
             }
         }
 
@@ -1211,6 +1211,32 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(a, Action::Bet(ALL_IN))),
             "Actions should include all-in bet: {actions:?}"
+        );
+    }
+
+    #[timed_test]
+    fn all_in_available_at_raise_cap() {
+        let (p1, p2) = sample_holdings();
+        let board = sample_board();
+        let state = PostflopState::new_preflop_with_board(p1, p2, board, 100);
+        let game = create_game(); // max_raises_per_street = 3
+
+        // Limp → BB check → flop, then exhaust raise cap: bet → raise → raise
+        let s = game.next_state(&state, Action::Call);
+        let s = game.next_state(&s, Action::Check);
+        let s = game.next_state(&s, Action::Bet(0));
+        let s = game.next_state(&s, Action::Raise(0));
+        let s = game.next_state(&s, Action::Raise(0));
+
+        // At raise cap: sized raises should be gone, but all-in must remain
+        let actions = game.actions(&s);
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Raise(idx) if *idx != ALL_IN)),
+            "Sized raises should not be available at raise cap: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Raise(ALL_IN))),
+            "All-in raise should be available at raise cap: {actions:?}"
         );
     }
 
