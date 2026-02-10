@@ -89,6 +89,53 @@ fn mccfr_exploitability_decreases_with_training() {
     );
 }
 
+/// Test that parallel MCCFR produces valid strategies on full HUNL.
+#[timed_test(10)]
+fn mccfr_parallel_hunl_postflop() {
+    let config = PostflopConfig {
+        stack_depth: 10,
+        bet_sizes: vec![1.0],
+        ..PostflopConfig::default()
+    };
+    let game = HunlPostflop::new(config, None, 500);
+
+    let mccfr_config = MccfrConfig {
+        samples_per_iteration: 100,
+        use_cfr_plus: true,
+        discount_iterations: Some(30),
+        skip_first_iterations: None,
+    };
+    let mut solver = MccfrSolver::with_config(game, &mccfr_config);
+    solver.set_seed(42);
+    solver.train_parallel(100, 50);
+
+    let strategies = solver.all_strategies();
+    assert!(
+        !strategies.is_empty(),
+        "Parallel should produce strategies, got empty map"
+    );
+
+    for (info_set, probs) in &strategies {
+        let sum: f64 = probs.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 0.01,
+            "Parallel strategy for '{info_set}' should sum to ~1.0, got {sum:.6}"
+        );
+        for (i, &p) in probs.iter().enumerate() {
+            assert!(
+                (0.0..=1.0).contains(&p),
+                "Probability at index {i} for '{info_set}' should be in [0,1], got {p}"
+            );
+        }
+    }
+
+    println!(
+        "Parallel MCCFR HUNL: {} info sets after {} iterations",
+        strategies.len(),
+        solver.iterations()
+    );
+}
+
 /// Test that blueprint pipeline works with MCCFR (train → extract → create blueprint).
 #[timed_test(10)]
 fn mccfr_blueprint_pipeline() {

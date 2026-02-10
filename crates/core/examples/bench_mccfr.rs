@@ -70,10 +70,8 @@ fn main() {
 
     // Summary
     let strategies = solver.all_strategies();
-    let total = t0.elapsed();
     println!();
     println!("Info sets:  {}", strategies.len());
-    println!("Total time: {:?}", total);
     println!(
         "Per iter:   {:?}",
         train_time / iterations as u32,
@@ -82,4 +80,41 @@ fn main() {
         "Per sample: {:?}",
         train_time / (iterations as u32 * samples as u32),
     );
+
+    // Phase 5: Parallel training comparison
+    println!();
+    println!("=== Parallel MCCFR ===");
+
+    let par_config = PostflopConfig {
+        stack_depth: 100,
+        bet_sizes: vec![0.3, 0.5, 1.0, 1.5],
+        max_raises_per_street: 3,
+    };
+    let par_game = HunlPostflop::new(par_config, Some(AbstractionMode::HandClass), deal_count);
+    let mut par_solver = MccfrSolver::with_config(par_game, &mccfr_config);
+    par_solver.set_seed(42);
+
+    let t4 = Instant::now();
+    par_solver.train_parallel(iterations, samples);
+    let par_time = t4.elapsed();
+    println!("[parallel training] {:?}", par_time);
+
+    let par_strategies = par_solver.all_strategies();
+    println!("Info sets:  {}", par_strategies.len());
+    println!(
+        "Per iter:   {:?}",
+        par_time / iterations as u32,
+    );
+    println!(
+        "Per sample: {:?}",
+        par_time / (iterations as u32 * samples as u32),
+    );
+
+    println!();
+    println!("=== Comparison ===");
+    println!("Sequential: {:?}", train_time);
+    println!("Parallel:   {:?}", par_time);
+    let speedup = train_time.as_secs_f64() / par_time.as_secs_f64();
+    println!("Speedup:    {:.2}x", speedup);
+    println!("Total time: {:?}", t0.elapsed());
 }

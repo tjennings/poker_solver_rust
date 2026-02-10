@@ -58,7 +58,7 @@ pub enum Action {
 /// Trait defining a two-player zero-sum game
 pub trait Game: Send + Sync {
     /// The state type for this game
-    type State: Clone + Send;
+    type State: Clone + Send + Sync;
 
     /// Returns all possible initial states (e.g., all card deals)
     fn initial_states(&self) -> Vec<Self::State>;

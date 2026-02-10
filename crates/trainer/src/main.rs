@@ -29,6 +29,9 @@ enum Commands {
         /// Path to YAML config file
         #[arg(short, long)]
         config: PathBuf,
+        /// Number of threads for parallel training (default: all cores)
+        #[arg(short, long)]
+        threads: Option<usize>,
     },
     /// List all 1,755 canonical (suit-isomorphic) flops
     Flops {
@@ -89,7 +92,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Train { config } => {
+        Commands::Train { config, threads } => {
+            if let Some(n) = threads {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build_global()
+                    .expect("failed to configure rayon thread pool");
+            }
             let yaml = std::fs::read_to_string(&config)?;
             let training_config: TrainingConfig = serde_yaml::from_str(&yaml)?;
             run_mccfr_training(training_config)?;
@@ -205,10 +214,17 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         .progress_chars("=>-"),
     );
 
+    let num_threads = rayon::current_num_threads();
+    println!("  Parallel training with {} threads\n", num_threads);
+
     for checkpoint in 1..=10 {
-        solver.train_with_callback(checkpoint_interval, config.training.mccfr_samples, |_| {
-            pb.inc(1);
-        });
+        solver.train_parallel_with_callback(
+            checkpoint_interval,
+            config.training.mccfr_samples,
+            |_| {
+                pb.inc(1);
+            },
+        );
 
         pb.suspend(|| {
             print_checkpoint(&solver, checkpoint, &ckpt_ctx);
@@ -218,7 +234,7 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     // Handle remainder iterations
     let trained_so_far = checkpoint_interval * 10;
     if trained_so_far < total {
-        solver.train_with_callback(
+        solver.train_parallel_with_callback(
             total - trained_so_far,
             config.training.mccfr_samples,
             |_| {
