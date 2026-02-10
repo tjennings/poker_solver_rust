@@ -75,6 +75,12 @@ struct TrainingParams {
     /// `"hand_class"` or `"ehs2"` (default). Determines bucketing strategy.
     #[serde(default = "default_abstraction_mode")]
     abstraction_mode: String,
+    /// Minimum deals per hand class for stratified generation (0 = disabled).
+    #[serde(default)]
+    min_deals_per_class: usize,
+    /// Maximum rejection-sample attempts per deficit class.
+    #[serde(default = "default_max_rejections")]
+    max_rejections_per_class: usize,
     /// Enable zero-regret pruning during training.
     #[serde(default)]
     pruning: bool,
@@ -96,6 +102,10 @@ fn default_mccfr_samples() -> usize {
 
 fn default_deal_count() -> usize {
     50_000
+}
+
+fn default_max_rejections() -> usize {
+    500_000
 }
 
 fn default_pruning_warmup_fraction() -> f64 {
@@ -182,7 +192,13 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     };
 
     // Create game with deal pool
-    let game = HunlPostflop::new(config.game.clone(), abstraction_mode, config.training.deal_count);
+    let mut game = HunlPostflop::new(config.game.clone(), abstraction_mode, config.training.deal_count);
+    if config.training.min_deals_per_class > 0 {
+        game = game.with_stratification(
+            config.training.min_deals_per_class,
+            config.training.max_rejections_per_class,
+        );
+    }
 
     // Create MCCFR solver
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

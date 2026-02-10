@@ -1,14 +1,16 @@
 game:
-  stack_depth: 100
-  bet_sizes: [0.33, 0.67, 1.0, 2.0, 3.0]
+  stack_depth: 25
+  bet_sizes: [0.33, 0.5, 1.0, 1.5]
 
 training:
   iterations: 10000
   seed: 42
   output_dir: "./handclass_100bb"
-  mccfr_samples: 1000
-  deal_count: 20000
+  mccfr_samples: 2000
+  deal_count: 200000
   abstraction_mode: hand_class
+  min_deals_per_class: 50
+  max_rejections_per_class: 500000
   pruning: true
   pruning_warmup_fraction: 0.10
   pruning_probe_interval: 100

@@ -214,6 +214,10 @@ pub struct HunlPostflop {
     /// Number of random deals to generate for the deal pool.
     deal_count: usize,
     rng_seed: u64,
+    /// Minimum deals per hand class for stratified generation (0 = disabled).
+    min_deals_per_class: usize,
+    /// Maximum rejection-sample attempts per deficit class.
+    max_rejections_per_class: usize,
 }
 
 impl HunlPostflop {
@@ -234,12 +238,26 @@ impl HunlPostflop {
             abstraction,
             deal_count,
             rng_seed: 42,
+            min_deals_per_class: 0,
+            max_rejections_per_class: 500_000,
         }
     }
 
     /// Set RNG seed for reproducible sampling.
     pub fn set_seed(&mut self, seed: u64) {
         self.rng_seed = seed;
+    }
+
+    /// Enable stratified deal generation to ensure rare hand classes are represented.
+    ///
+    /// After generating the base deal pool, rejection sampling tops up any class
+    /// with fewer than `min_per_class` observations. At most `max_rejections`
+    /// consecutive failures are attempted per deficit class before giving up.
+    #[must_use]
+    pub fn with_stratification(mut self, min_per_class: usize, max_rejections: usize) -> Self {
+        self.min_deals_per_class = min_per_class;
+        self.max_rejections_per_class = max_rejections;
+        self
     }
 
     /// Get the configuration.
@@ -396,8 +414,6 @@ impl HunlPostflop {
         use crate::flops;
         use rand::SeedableRng;
         use rand::distr::weighted::WeightedIndex;
-        use rand::prelude::Distribution;
-        use rand::prelude::SliceRandom;
         use rand::rngs::StdRng;
 
         let mut rng = StdRng::seed_from_u64(seed);
@@ -409,34 +425,113 @@ impl HunlPostflop {
 
         let deck = Self::full_deck();
         let mut deals = Vec::with_capacity(count);
-        
+
         for _ in 0..count {
-            let flop = &canonical_flops[dist.sample(&mut rng)];
-            let flop_cards = *flop.cards();
-
-            // Remaining deck excludes the 3 flop cards
-            let remaining: Vec<Card> = deck
-                .iter()
-                .filter(|c| !flop_cards.contains(c))
-                .copied()
-                .collect();
-
-            let mut shuffled = remaining;
-            shuffled.shuffle(&mut rng);
-
-            let turn = shuffled[0];
-            let river = shuffled[1];
-            let p1 = [shuffled[2], shuffled[3]];
-            let p2 = [shuffled[4], shuffled[5]];
-            let board = [flop_cards[0], flop_cards[1], flop_cards[2], turn, river];
-
-            deals.push(PostflopState::new_preflop_with_board(
-                p1,
-                p2,
-                board,
+            deals.push(generate_one_flop_deal(
+                &mut rng,
+                &canonical_flops,
+                &dist,
+                &deck,
                 self.config.stack_depth,
             ));
         }
+        deals
+    }
+
+    /// Generate a stratified deal pool that ensures minimum representation per class.
+    ///
+    /// Phase 1: generate the base pool via `generate_flop_deals`.
+    /// Phase 2: count per-class coverage on the river.
+    /// Phase 3: rejection-sample new deals to top up deficit classes.
+    fn generate_stratified_deals(
+        &self,
+        seed: u64,
+        count: usize,
+        min_per_class: usize,
+        max_rejections: usize,
+    ) -> Vec<PostflopState> {
+        use crate::flops;
+        use rand::SeedableRng;
+        use rand::distr::weighted::WeightedIndex;
+        use rand::rngs::StdRng;
+
+        // Phase 1: base pool
+        let mut deals = self.generate_flop_deals(seed, count);
+
+        // Phase 2: count coverage
+        let mut coverage = count_class_coverage(&deals);
+
+        // Phase 3: top up deficit classes (only made hands appear on river)
+        let mut deficit_classes: Vec<(usize, u8)> = (0u8..28)
+            .filter(|&i| coverage[i as usize] < min_per_class)
+            .map(|i| (min_per_class - coverage[i as usize], i))
+            .collect();
+        // Sort by deficit descending (rarest first)
+        deficit_classes.sort_by_key(|&(deficit, _)| std::cmp::Reverse(deficit));
+
+        if deficit_classes.is_empty() {
+            return deals;
+        }
+
+        // Continue RNG from a derived seed so base pool is unchanged
+        let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0x5742_4154));
+        let canonical_flops = flops::all_flops();
+        let weights: Vec<u16> = canonical_flops
+            .iter()
+            .map(crate::flops::CanonicalFlop::weight)
+            .collect();
+        let dist = WeightedIndex::new(&weights).expect("non-empty positive weights");
+        let deck = Self::full_deck();
+
+        let base_count = deals.len();
+        let mut total_added = 0usize;
+
+        for &(_, class_idx) in &deficit_classes {
+            let ci = class_idx as usize;
+            let mut consecutive_failures = 0usize;
+
+            while coverage[ci] < min_per_class && consecutive_failures < max_rejections {
+                let deal = generate_one_flop_deal(
+                    &mut rng,
+                    &canonical_flops,
+                    &dist,
+                    &deck,
+                    self.config.stack_depth,
+                );
+
+                let board = deal.full_board.expect("flop deal has full_board");
+                let mut deal_classes = 0u32;
+                if let Ok(c1) = classify(deal.p1_holding, &board) {
+                    deal_classes |= c1.bits();
+                }
+                if let Ok(c2) = classify(deal.p2_holding, &board) {
+                    deal_classes |= c2.bits();
+                }
+
+                if deal_classes & (1 << class_idx) != 0 {
+                    // Accept: update coverage for ALL classes this deal covers
+                    for (i, count) in coverage.iter_mut().enumerate() {
+                        if deal_classes & (1 << i) != 0 {
+                            *count += 1;
+                        }
+                    }
+                    deals.push(deal);
+                    total_added += 1;
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                }
+            }
+        }
+
+        println!(
+            "Stratified pool: {} deals (base {} + {} top-up)",
+            deals.len(),
+            base_count,
+            total_added
+        );
+        print_coverage_summary(&coverage);
+
         deals
     }
 
@@ -508,13 +603,101 @@ impl HunlPostflop {
     }
 }
 
+/// Generate a single random deal from the canonical flop distribution.
+///
+/// Picks a weighted-random canonical flop, then deals turn + river + 2+2
+/// hole cards from the remaining 49 cards.
+fn generate_one_flop_deal(
+    rng: &mut rand::rngs::StdRng,
+    canonical_flops: &[crate::flops::CanonicalFlop],
+    flop_dist: &rand::distr::weighted::WeightedIndex<u16>,
+    deck: &[Card],
+    stack_depth: u32,
+) -> PostflopState {
+    use rand::prelude::Distribution;
+    use rand::prelude::SliceRandom;
+
+    let flop = &canonical_flops[flop_dist.sample(rng)];
+    let flop_cards = *flop.cards();
+
+    let remaining: Vec<Card> = deck
+        .iter()
+        .filter(|c| !flop_cards.contains(c))
+        .copied()
+        .collect();
+
+    let mut shuffled = remaining;
+    shuffled.shuffle(rng);
+
+    let turn = shuffled[0];
+    let river = shuffled[1];
+    let p1 = [shuffled[2], shuffled[3]];
+    let p2 = [shuffled[4], shuffled[5]];
+    let board = [flop_cards[0], flop_cards[1], flop_cards[2], turn, river];
+
+    PostflopState::new_preflop_with_board(p1, p2, board, stack_depth)
+}
+
+/// Print a compact summary of per-class deal coverage.
+fn print_coverage_summary(coverage: &[usize; 28]) {
+    use crate::hand_class::HandClass;
+    let labels = [
+        "SF", "4K", "FH", "NF", "Fl", "St", "TS", "Se", "BS", "Tr",
+        "2P", "OP", "TK", "TP", "2n", "3r", "LP", "UP", "OC", "AH",
+        "KH", "CD", "FN", "FD", "BF", "OS", "GS", "BD",
+    ];
+    let parts: Vec<String> = (0..28)
+        .filter(|&i| {
+            // Only show made-hand classes (discriminants 0..=20)
+            i <= HandClass::KingHigh as usize
+        })
+        .map(|i| format!("{}={}", labels[i], coverage[i]))
+        .collect();
+    println!("  Coverage: {}", parts.join(", "));
+}
+
+/// Count how many deals cover each of the 28 hand classes on the river.
+///
+/// For each deal, classifies both players' hands against the full 5-card board.
+/// A deal counts toward a class if *either* player has that class.
+fn count_class_coverage(deals: &[PostflopState]) -> [usize; 28] {
+    let mut counts = [0usize; 28];
+    for deal in deals {
+        let Some(board) = deal.full_board else {
+            continue;
+        };
+        let mut deal_classes = 0u32;
+        if let Ok(c1) = classify(deal.p1_holding, &board) {
+            deal_classes |= c1.bits();
+        }
+        if let Ok(c2) = classify(deal.p2_holding, &board) {
+            deal_classes |= c2.bits();
+        }
+        for (i, count) in counts.iter_mut().enumerate() {
+            if deal_classes & (1 << i) != 0 {
+                *count += 1;
+            }
+        }
+    }
+    counts
+}
+
 impl Game for HunlPostflop {
     type State = PostflopState;
 
     fn initial_states(&self) -> Vec<Self::State> {
         match &self.abstraction {
             Some(AbstractionMode::HandClass) => {
-                self.generate_flop_deals(self.rng_seed, self.deal_count)
+                if self.min_deals_per_class > 0 {
+                    self.generate_stratified_deals(
+                        self.rng_seed,
+                        self.deal_count,
+                        self.min_deals_per_class,
+                        self.max_rejections_per_class,
+                    )
+                } else {
+                    self.generate_flop_deals(self.rng_seed, self.deal_count)
+                }
             }
             _ => self.generate_random_deals(self.rng_seed, self.deal_count),
         }
@@ -779,6 +962,7 @@ impl Game for HunlPostflop {
 mod tests {
     #![allow(clippy::float_cmp, clippy::items_after_statements)]
     use super::*;
+    use crate::hand_class::HandClass;
     use crate::poker::{Suit, Value};
     use test_macros::timed_test;
 
@@ -1677,5 +1861,212 @@ mod tests {
             s.board.is_empty(),
             "Board should stay empty without full_board"
         );
+    }
+
+    // ==================== Stratification tests ====================
+
+    #[timed_test]
+    fn count_class_coverage_empty() {
+        let coverage = super::count_class_coverage(&[]);
+        assert_eq!(coverage, [0usize; 28]);
+    }
+
+    #[timed_test]
+    fn count_class_coverage_counts_both_players() {
+        // P1: Ah Kh (nut flush on heart board)
+        // P2: 7c 2d (no class on this board)
+        // Board: Qh Jh 5h 3h 2c → P1 has NutFlush, P2 has LowPair (2 pairs 2c)
+        let p1 = [
+            make_card(Value::Ace, Suit::Heart),
+            make_card(Value::King, Suit::Heart),
+        ];
+        let p2 = [
+            make_card(Value::Seven, Suit::Club),
+            make_card(Value::Two, Suit::Diamond),
+        ];
+        let board = [
+            make_card(Value::Queen, Suit::Heart),
+            make_card(Value::Jack, Suit::Heart),
+            make_card(Value::Five, Suit::Heart),
+            make_card(Value::Three, Suit::Heart),
+            make_card(Value::Two, Suit::Club),
+        ];
+        let deal = PostflopState::new_preflop_with_board(p1, p2, board, 100);
+        let coverage = super::count_class_coverage(&[deal]);
+
+        // P1 should have NutFlush
+        assert!(
+            coverage[HandClass::NutFlush as usize] > 0,
+            "NutFlush should be counted"
+        );
+        // P2 pairs the 2 on board → LowPair
+        assert!(
+            coverage[HandClass::LowPair as usize] > 0,
+            "LowPair should be counted"
+        );
+    }
+
+    #[timed_test]
+    fn stratified_zero_min_equals_base() {
+        let config = PostflopConfig {
+            stack_depth: 100,
+            bet_sizes: vec![1.0],
+            ..PostflopConfig::default()
+        };
+        // min=0 means stratification is disabled in initial_states
+        let base_game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClass), 50);
+        let strat_game =
+            HunlPostflop::new(config, Some(AbstractionMode::HandClass), 50)
+                .with_stratification(0, 500_000);
+
+        let base = base_game.initial_states();
+        let strat = strat_game.initial_states();
+
+        // Same length and same deals (stratification disabled when min=0)
+        assert_eq!(base.len(), strat.len());
+        for (b, s) in base.iter().zip(strat.iter()) {
+            assert_eq!(b.p1_holding, s.p1_holding);
+            assert_eq!(b.full_board, s.full_board);
+        }
+    }
+
+    #[timed_test]
+    fn stratified_deals_deterministic() {
+        let config = PostflopConfig {
+            stack_depth: 100,
+            bet_sizes: vec![1.0],
+            ..PostflopConfig::default()
+        };
+        let game1 =
+            HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClass), 100)
+                .with_stratification(2, 10_000);
+        let game2 =
+            HunlPostflop::new(config, Some(AbstractionMode::HandClass), 100)
+                .with_stratification(2, 10_000);
+
+        let deals1 = game1.initial_states();
+        let deals2 = game2.initial_states();
+
+        assert_eq!(deals1.len(), deals2.len());
+        for (d1, d2) in deals1.iter().zip(deals2.iter()) {
+            assert_eq!(d1.p1_holding, d2.p1_holding);
+            assert_eq!(d1.p2_holding, d2.p2_holding);
+            assert_eq!(d1.full_board, d2.full_board);
+        }
+    }
+
+    #[timed_test]
+    fn stratified_deals_no_card_conflicts() {
+        let config = PostflopConfig {
+            stack_depth: 100,
+            bet_sizes: vec![1.0],
+            ..PostflopConfig::default()
+        };
+        let game =
+            HunlPostflop::new(config, Some(AbstractionMode::HandClass), 100)
+                .with_stratification(2, 10_000);
+        let deals = game.initial_states();
+
+        for (i, deal) in deals.iter().enumerate() {
+            let board = deal.full_board.expect("should have board");
+            let mut all_cards = vec![
+                deal.p1_holding[0],
+                deal.p1_holding[1],
+                deal.p2_holding[0],
+                deal.p2_holding[1],
+                board[0],
+                board[1],
+                board[2],
+                board[3],
+                board[4],
+            ];
+            let orig_len = all_cards.len();
+            all_cards.sort_by_key(|c| (c.value as u8, c.suit as u8));
+            all_cards.dedup();
+            assert_eq!(all_cards.len(), orig_len, "Deal {i} has duplicate cards");
+        }
+    }
+
+    #[timed_test]
+    fn stratified_deals_improve_rare_coverage() {
+        // Use generate_stratified_deals directly with smaller parameters
+        let config = PostflopConfig {
+            stack_depth: 100,
+            bet_sizes: vec![1.0],
+            ..PostflopConfig::default()
+        };
+        let game = HunlPostflop::new(
+            config,
+            Some(AbstractionMode::HandClass),
+            200,
+        );
+
+        let base = game.generate_flop_deals(42, 200);
+        let base_coverage = super::count_class_coverage(&base);
+
+        let strat = game.generate_stratified_deals(42, 200, 2, 50_000);
+        let strat_coverage = super::count_class_coverage(&strat);
+
+        // Stratified pool should be at least as large
+        assert!(
+            strat.len() >= base.len(),
+            "Stratified pool ({}) should be >= base ({})",
+            strat.len(),
+            base.len()
+        );
+
+        // Every made-hand class should have coverage >= base
+        for i in 0..=20 {
+            assert!(
+                strat_coverage[i] >= base_coverage[i],
+                "Class {} coverage dropped: strat {} < base {}",
+                i,
+                strat_coverage[i],
+                base_coverage[i]
+            );
+        }
+    }
+
+    #[timed_test]
+    fn stratified_deals_meet_minimum() {
+        let config = PostflopConfig {
+            stack_depth: 100,
+            bet_sizes: vec![1.0],
+            ..PostflopConfig::default()
+        };
+        let min_per_class = 2;
+        let game = HunlPostflop::new(
+            config,
+            Some(AbstractionMode::HandClass),
+            200,
+        );
+        let deals = game.generate_stratified_deals(42, 200, min_per_class, 50_000);
+        let coverage = super::count_class_coverage(&deals);
+
+        // Common classes should easily meet the minimum
+        let common = [
+            HandClass::TopPair as usize,
+            HandClass::SecondPair as usize,
+            HandClass::TwoPair as usize,
+            HandClass::AceHigh as usize,
+        ];
+        for &ci in &common {
+            assert!(
+                coverage[ci] >= min_per_class,
+                "Common class {} has {} < {} minimum",
+                ci,
+                coverage[ci],
+                min_per_class
+            );
+        }
+    }
+
+    #[timed_test]
+    fn with_stratification_builder() {
+        let config = PostflopConfig::default();
+        let game = HunlPostflop::new(config, None, 100)
+            .with_stratification(50, 100_000);
+        assert_eq!(game.min_deals_per_class, 50);
+        assert_eq!(game.max_rejections_per_class, 100_000);
     }
 }
