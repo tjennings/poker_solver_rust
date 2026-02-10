@@ -14,3 +14,6 @@ training:
   output_dir: "./mccfr_100bb"
   mccfr_samples: 500
   deal_count: 50000
+  pruning: true
+  pruning_warmup_fraction: 0.2
+  pruning_probe_interval: 20

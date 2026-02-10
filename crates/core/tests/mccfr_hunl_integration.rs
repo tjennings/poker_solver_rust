@@ -21,6 +21,7 @@ fn mccfr_hunl_postflop_full_game() {
         samples_per_iteration: 100,
         use_cfr_plus: true,
         discount_iterations: Some(30),
+        ..MccfrConfig::default()
     };
     let mut solver = MccfrSolver::with_config(game, &mccfr_config);
     solver.set_seed(42);
@@ -102,6 +103,7 @@ fn mccfr_parallel_hunl_postflop() {
         samples_per_iteration: 100,
         use_cfr_plus: true,
         discount_iterations: Some(30),
+        ..MccfrConfig::default()
     };
     let mut solver = MccfrSolver::with_config(game, &mccfr_config);
     solver.set_seed(42);
@@ -154,6 +156,7 @@ fn hand_class_blueprint_scan_finds_entries() {
         samples_per_iteration: 50,
         use_cfr_plus: true,
         discount_iterations: None,
+        ..MccfrConfig::default()
     };
     let mut solver = MccfrSolver::with_config(game, &mccfr_config);
     solver.set_seed(42);

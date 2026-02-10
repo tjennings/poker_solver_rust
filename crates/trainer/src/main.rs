@@ -74,6 +74,15 @@ struct TrainingParams {
     /// `"hand_class"` or `"ehs2"` (default). Determines bucketing strategy.
     #[serde(default = "default_abstraction_mode")]
     abstraction_mode: String,
+    /// Enable zero-regret pruning during training.
+    #[serde(default)]
+    pruning: bool,
+    /// Fraction of total iterations to complete before enabling pruning.
+    #[serde(default = "default_pruning_warmup_fraction")]
+    pruning_warmup_fraction: f64,
+    /// Run a full un-pruned probe iteration every N iterations.
+    #[serde(default = "default_pruning_probe_interval")]
+    pruning_probe_interval: u64,
 }
 
 fn default_abstraction_mode() -> String {
@@ -86,6 +95,14 @@ fn default_mccfr_samples() -> usize {
 
 fn default_deal_count() -> usize {
     50_000
+}
+
+fn default_pruning_warmup_fraction() -> f64 {
+    0.2
+}
+
+fn default_pruning_probe_interval() -> u64 {
+    20
 }
 
 /// Hands to display in the SB preflop strategy table.
@@ -167,14 +184,28 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     let game = HunlPostflop::new(config.game.clone(), abstraction_mode, config.training.deal_count);
 
     // Create MCCFR solver
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pruning_warmup = (config.training.pruning_warmup_fraction
+        * config.training.iterations as f64) as u64;
+
     let mccfr_config = MccfrConfig {
         samples_per_iteration: config.training.mccfr_samples,
         use_cfr_plus: true,
         discount_iterations: Some(30),
+        pruning: config.training.pruning,
+        pruning_warmup,
+        pruning_probe_interval: config.training.pruning_probe_interval,
     };
 
     println!("Creating MCCFR solver...");
     println!("  DCFR strategy discounting: (t/(t+1))^2");
+    if config.training.pruning {
+        println!(
+            "  Pruning: enabled (warmup {:.0}%, probe every {} iters)",
+            config.training.pruning_warmup_fraction * 100.0,
+            config.training.pruning_probe_interval
+        );
+    }
     let start = Instant::now();
     let mut solver = MccfrSolver::with_config(game, &mccfr_config);
     solver.set_seed(config.training.seed);
@@ -437,6 +468,12 @@ fn print_checkpoint(
             "Time: {:.1}s elapsed, ~{:.1}s remaining",
             elapsed, remaining
         );
+    }
+
+    let (pruned, total) = solver.pruning_stats();
+    if total > 0 {
+        let skip_pct = 100.0 * pruned as f64 / total as f64;
+        println!("Pruned: {pruned}/{total} traversals ({skip_pct:.1}% skip rate)");
     }
 
     // SB preflop strategy table

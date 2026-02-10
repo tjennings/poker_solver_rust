@@ -98,6 +98,16 @@ pub struct MccfrSolver<G: Game> {
     /// Number of early iterations to discount (CFR+ optimization).
     /// Iterations before this threshold use sqrt(t)/(sqrt(t)+1) weighting.
     discount_iterations: u64,
+    /// Zero-regret pruning: skip subtrees of actions with 0 cumulative regret.
+    pruning: bool,
+    /// Absolute iteration count before pruning activates.
+    pruning_warmup: u64,
+    /// Run a full un-pruned probe iteration every N iterations.
+    pruning_probe_interval: u64,
+    /// Number of subtree traversals skipped by pruning.
+    pruned_traversals: u64,
+    /// Total action traversals attempted (pruned + executed).
+    total_traversals: u64,
 }
 
 /// Configuration for MCCFR training.
@@ -110,6 +120,14 @@ pub struct MccfrConfig {
     /// Discount early iterations (CFR+ optimization)
     /// If Some(n), discount first n iterations by sqrt(t)/(sqrt(t)+1)
     pub discount_iterations: Option<u64>,
+    /// Enable zero-regret pruning (skip actions with cumulative regret == 0).
+    /// Only applies when `use_cfr_plus` is true.
+    pub pruning: bool,
+    /// Absolute iteration count to complete before enabling pruning.
+    /// Caller should compute from a warmup fraction of total iterations.
+    pub pruning_warmup: u64,
+    /// Run a full un-pruned probe iteration every N iterations.
+    pub pruning_probe_interval: u64,
 }
 
 impl Default for MccfrConfig {
@@ -118,6 +136,9 @@ impl Default for MccfrConfig {
             samples_per_iteration: 100,
             use_cfr_plus: true,
             discount_iterations: Some(30),
+            pruning: false,
+            pruning_warmup: 0,
+            pruning_probe_interval: 20,
         }
     }
 }
@@ -134,6 +155,11 @@ impl<G: Game> MccfrSolver<G> {
             rng_state: 0x1234_5678_9ABC_DEF0,
             iterations: 0,
             discount_iterations: 30,
+            pruning: false,
+            pruning_warmup: 0,
+            pruning_probe_interval: 20,
+            pruned_traversals: 0,
+            total_traversals: 0,
         }
     }
 
@@ -148,6 +174,11 @@ impl<G: Game> MccfrSolver<G> {
             rng_state: 0x1234_5678_9ABC_DEF0,
             iterations: 0,
             discount_iterations: config.discount_iterations.unwrap_or(0),
+            pruning: config.pruning && config.use_cfr_plus,
+            pruning_warmup: config.pruning_warmup,
+            pruning_probe_interval: config.pruning_probe_interval.max(1),
+            pruned_traversals: 0,
+            total_traversals: 0,
         }
     }
 
@@ -266,6 +297,38 @@ impl<G: Game> MccfrSolver<G> {
         ratio * ratio
     }
 
+    /// Returns pruning statistics: `(pruned, total)` traversals.
+    #[must_use]
+    pub fn pruning_stats(&self) -> (u64, u64) {
+        (self.pruned_traversals, self.total_traversals)
+    }
+
+    /// Check whether action `action_idx` at `info_set` should be pruned.
+    ///
+    /// Prunes only when: pruning is enabled, past warmup, not a probe iteration,
+    /// the action has zero regret, and at least one sibling has positive regret.
+    fn should_prune(&self, info_set: u64, action_idx: usize) -> bool {
+        if !self.pruning {
+            return false;
+        }
+        if self.iterations < self.pruning_warmup {
+            return false;
+        }
+        if self.iterations.is_multiple_of(self.pruning_probe_interval) {
+            return false; // probe iteration — explore everything
+        }
+        match self.regret_sum.get(&info_set) {
+            Some(regrets) => {
+                // Only prune if this action is zero AND at least one action is positive.
+                // If ALL regrets are zero, regret matching returns uniform — must explore all.
+                let has_positive = regrets.iter().any(|&r| r > 0.0);
+                // CFR+ explicitly assigns 0.0 via flooring, so == 0.0 is safe here.
+                has_positive && regrets[action_idx] == 0.0
+            }
+            None => false, // No regret data yet — don't prune
+        }
+    }
+
     /// Returns the average strategy for an information set.
     #[must_use]
     pub fn get_average_strategy(&self, info_set: u64) -> Option<Vec<f64>> {
@@ -359,6 +422,15 @@ impl<G: Game> MccfrSolver<G> {
             let mut action_utils = vec![0.0; num_actions];
 
             for (i, action) in actions.iter().enumerate() {
+                self.total_traversals += 1;
+
+                // Zero-regret pruning: skip actions with 0 cumulative regret
+                if self.should_prune(info_set, i) {
+                    self.pruned_traversals += 1;
+                    // action_utils[i] already 0.0 from vec initialization
+                    continue;
+                }
+
                 let next_state = self.game.next_state(state, *action);
 
                 let (new_p1_reach, new_p2_reach) = match current_player {
@@ -495,6 +567,13 @@ impl<G: Game> MccfrSolver<G> {
             let player = self.traversing_player();
             let base_seed = self.rng_state;
 
+            let pruning_ctx = PruningCtx {
+                enabled: self.pruning,
+                warmup: self.pruning_warmup,
+                probe_interval: self.pruning_probe_interval,
+                iteration: self.iterations,
+            };
+
             #[allow(clippy::cast_precision_loss)]
             let sample_weight = num_states as f64 / samples_per_iter as f64;
 
@@ -528,6 +607,7 @@ impl<G: Game> MccfrSolver<G> {
                                 sample_weight,
                                 discount,
                                 strategy_discount,
+                                pruning_ctx,
                             );
                             acc
                         },
@@ -552,6 +632,13 @@ impl<G: Game> MccfrSolver<G> {
             let discount = self.compute_discount();
             let strategy_discount = self.compute_strategy_discount();
             let player = self.traversing_player();
+
+            let pruning_ctx = PruningCtx {
+                enabled: self.pruning,
+                warmup: self.pruning_warmup,
+                probe_interval: self.pruning_probe_interval,
+                iteration: self.iterations,
+            };
 
             let merged = {
                 let regret_snapshot = &self.regret_sum;
@@ -578,6 +665,7 @@ impl<G: Game> MccfrSolver<G> {
                                 1.0,
                                 discount,
                                 strategy_discount,
+                                pruning_ctx,
                             );
                             acc
                         },
@@ -594,6 +682,9 @@ impl<G: Game> MccfrSolver<G> {
     ///
     /// Applies CFR+ flooring (clamp to 0) on regrets during merge.
     fn merge_accumulator(&mut self, acc: TraversalAccumulator) {
+        self.pruned_traversals += acc.pruned_count;
+        self.total_traversals += acc.total_count;
+
         for (key, deltas) in acc.regret_deltas {
             let regrets = self
                 .regret_sum
@@ -619,6 +710,15 @@ impl<G: Game> MccfrSolver<G> {
     }
 }
 
+/// Immutable pruning configuration passed through parallel traversal.
+#[derive(Clone, Copy)]
+struct PruningCtx {
+    enabled: bool,
+    warmup: u64,
+    probe_interval: u64,
+    iteration: u64,
+}
+
 /// Thread-local accumulator for parallel MCCFR traversals.
 ///
 /// Collects regret and strategy deltas without CFR+ flooring.
@@ -627,6 +727,8 @@ struct TraversalAccumulator {
     regret_deltas: FxHashMap<u64, Vec<f64>>,
     strategy_deltas: FxHashMap<u64, Vec<f64>>,
     rng_state: u64,
+    pruned_count: u64,
+    total_count: u64,
 }
 
 impl TraversalAccumulator {
@@ -635,6 +737,8 @@ impl TraversalAccumulator {
             regret_deltas: FxHashMap::default(),
             strategy_deltas: FxHashMap::default(),
             rng_state: 0x1234_5678_9ABC_DEF0,
+            pruned_count: 0,
+            total_count: 0,
         }
     }
 
@@ -660,7 +764,35 @@ impl TraversalAccumulator {
             }
         }
 
+        self.pruned_count += other.pruned_count;
+        self.total_count += other.total_count;
+
         self
+    }
+}
+
+/// Check whether an action should be pruned using the frozen regret snapshot.
+///
+/// Same logic as `MccfrSolver::should_prune` but reads from immutable snapshot.
+fn should_prune_snapshot(
+    regret_snapshot: &FxHashMap<u64, Vec<f64>>,
+    info_set: u64,
+    action_idx: usize,
+    pruning: &PruningCtx,
+) -> bool {
+    if !pruning.enabled || pruning.iteration < pruning.warmup {
+        return false;
+    }
+    if pruning.iteration.is_multiple_of(pruning.probe_interval) {
+        return false;
+    }
+    match regret_snapshot.get(&info_set) {
+        Some(regrets) => {
+            let has_positive = regrets.iter().any(|&r| r > 0.0);
+            // Snapshot was floored during previous merge — == 0.0 is safe.
+            has_positive && regrets[action_idx] == 0.0
+        }
+        None => false,
     }
 }
 
@@ -668,7 +800,7 @@ impl TraversalAccumulator {
 ///
 /// Same logic as `cfr_traverse` but operates on immutable regret snapshot
 /// and accumulates deltas without applying CFR+ flooring.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn cfr_traverse_pure<G: Game>(
     game: &G,
     regret_snapshot: &FxHashMap<u64, Vec<f64>>,
@@ -680,6 +812,7 @@ fn cfr_traverse_pure<G: Game>(
     sample_weight: f64,
     discount: f64,
     strategy_discount: f64,
+    pruning: PruningCtx,
 ) -> f64 {
     if game.is_terminal(state) {
         return game.utility(state, traversing_player);
@@ -696,6 +829,14 @@ fn cfr_traverse_pure<G: Game>(
         let mut action_utils = vec![0.0; num_actions];
 
         for (i, action) in actions.iter().enumerate() {
+            acc.total_count += 1;
+
+            if should_prune_snapshot(regret_snapshot, info_set, i, &pruning) {
+                acc.pruned_count += 1;
+                // action_utils[i] already 0.0 from vec initialization
+                continue;
+            }
+
             let next_state = game.next_state(state, *action);
 
             let (new_p1, new_p2) = match current_player {
@@ -714,6 +855,7 @@ fn cfr_traverse_pure<G: Game>(
                 sample_weight,
                 discount,
                 strategy_discount,
+                pruning,
             );
         }
 
@@ -792,6 +934,7 @@ fn cfr_traverse_pure<G: Game>(
             sample_weight,
             discount,
             strategy_discount,
+            pruning,
         )
     }
 }
@@ -1141,5 +1284,188 @@ mod tests {
             seq_jb[0],
             par_jb[0]
         );
+    }
+
+    // --- Pruning tests ---
+
+    #[timed_test]
+    fn pruning_disabled_by_default() {
+        let config = MccfrConfig::default();
+        assert!(!config.pruning, "pruning should be disabled by default");
+    }
+
+    #[timed_test]
+    fn pruning_skips_zero_regret_actions() {
+        let game = KuhnPoker::new();
+        let config = MccfrConfig {
+            pruning: true,
+            pruning_warmup: 0,
+            pruning_probe_interval: 100, // large so no probes during test
+            ..MccfrConfig::default()
+        };
+        let mut solver = MccfrSolver::with_config(game, &config);
+
+        // Train enough to build regret table with some zeros
+        solver.train_full(200);
+
+        let (pruned, total) = solver.pruning_stats();
+        assert!(total > 0, "should have traversals");
+        assert!(pruned > 0, "should prune some zero-regret actions after warmup");
+    }
+
+    #[timed_test]
+    fn pruning_does_not_skip_during_warmup() {
+        let game = KuhnPoker::new();
+        let config = MccfrConfig {
+            pruning: true,
+            pruning_warmup: 1000, // warmup exceeds iterations
+            pruning_probe_interval: 100,
+            ..MccfrConfig::default()
+        };
+        let mut solver = MccfrSolver::with_config(game, &config);
+
+        solver.train_full(100);
+
+        let (pruned, _total) = solver.pruning_stats();
+        assert_eq!(pruned, 0, "no pruning should occur during warmup");
+    }
+
+    #[timed_test]
+    fn probe_iterations_are_full_width() {
+        let game = KuhnPoker::new();
+        let config = MccfrConfig {
+            pruning: true,
+            pruning_warmup: 0,
+            pruning_probe_interval: 1, // every iteration is a probe
+            ..MccfrConfig::default()
+        };
+        let mut solver = MccfrSolver::with_config(game, &config);
+
+        solver.train_full(200);
+
+        let (pruned, _total) = solver.pruning_stats();
+        assert_eq!(
+            pruned, 0,
+            "no pruning should occur when every iteration is a probe"
+        );
+    }
+
+    #[timed_test]
+    fn pruning_does_not_skip_all_zero_info_set() {
+        let game = KuhnPoker::new();
+        let config = MccfrConfig {
+            pruning: true,
+            pruning_warmup: 0,
+            pruning_probe_interval: 100,
+            ..MccfrConfig::default()
+        };
+        let solver = MccfrSolver::with_config(game, &config);
+
+        // Manually test should_prune with an all-zero regret entry
+        // (simulates a newly discovered info set where all regrets are floored)
+        // We can't call should_prune directly (it's &self), so test the logic:
+        // When all regrets are zero, has_positive is false → no pruning
+        let mut solver_with_zeros = solver;
+        solver_with_zeros.regret_sum.insert(999, vec![0.0, 0.0]);
+        solver_with_zeros.iterations = 101; // past warmup, not a probe (101 % 100 != 0)
+
+        // Action 0 should NOT be pruned (all zeros → uniform fallback)
+        assert!(
+            !solver_with_zeros.should_prune(999, 0),
+            "should not prune when all regrets are zero"
+        );
+        assert!(
+            !solver_with_zeros.should_prune(999, 1),
+            "should not prune when all regrets are zero"
+        );
+
+        // But if one is positive, the zero one should be pruned
+        solver_with_zeros.regret_sum.insert(999, vec![5.0, 0.0]);
+        assert!(
+            !solver_with_zeros.should_prune(999, 0),
+            "should not prune the positive-regret action"
+        );
+        assert!(
+            solver_with_zeros.should_prune(999, 1),
+            "should prune the zero-regret action when a sibling is positive"
+        );
+    }
+
+    #[timed_test]
+    fn pruning_converges_on_kuhn() {
+        use crate::info_key::InfoKey;
+
+        let game = KuhnPoker::new();
+        let config = MccfrConfig {
+            pruning: true,
+            pruning_warmup: 100,
+            pruning_probe_interval: 20,
+            ..MccfrConfig::default()
+        };
+        let mut solver = MccfrSolver::with_config(game, &config);
+
+        solver.train_full(10_000);
+
+        // King facing bet → always call (relaxed threshold; pruning adds slight noise)
+        let kb = InfoKey::new(2, 0, 0, 0, &[4]).as_u64();
+        if let Some(strategy) = solver.get_average_strategy(kb) {
+            assert!(
+                strategy[1] > 0.95,
+                "Pruning: King should always call a bet, got {strategy:?}"
+            );
+        }
+
+        // Jack facing bet → always fold
+        let jb = InfoKey::new(0, 0, 0, 0, &[4]).as_u64();
+        if let Some(strategy) = solver.get_average_strategy(jb) {
+            assert!(
+                strategy[0] > 0.95,
+                "Pruning: Jack should always fold facing a bet, got {strategy:?}"
+            );
+        }
+
+        // Verify some pruning actually happened
+        let (pruned, total) = solver.pruning_stats();
+        assert!(pruned > 0, "pruning should have skipped some traversals");
+        assert!(total > pruned, "not everything should be pruned");
+    }
+
+    #[timed_test]
+    fn parallel_pruning_converges_on_kuhn() {
+        use crate::info_key::InfoKey;
+
+        let game = KuhnPoker::new();
+        let config = MccfrConfig {
+            pruning: true,
+            pruning_warmup: 100,
+            pruning_probe_interval: 20,
+            ..MccfrConfig::default()
+        };
+        let mut solver = MccfrSolver::with_config(game, &config);
+
+        solver.train_full_parallel(10_000);
+
+        // King facing bet → always call (relaxed threshold; pruning adds slight noise)
+        let kb = InfoKey::new(2, 0, 0, 0, &[4]).as_u64();
+        if let Some(strategy) = solver.get_average_strategy(kb) {
+            assert!(
+                strategy[1] > 0.95,
+                "Parallel pruning: King should always call a bet, got {strategy:?}"
+            );
+        }
+
+        // Jack facing bet → always fold
+        let jb = InfoKey::new(0, 0, 0, 0, &[4]).as_u64();
+        if let Some(strategy) = solver.get_average_strategy(jb) {
+            assert!(
+                strategy[0] > 0.95,
+                "Parallel pruning: Jack should always fold facing a bet, got {strategy:?}"
+            );
+        }
+
+        // Verify some pruning actually happened
+        let (pruned, total) = solver.pruning_stats();
+        assert!(pruned > 0, "parallel pruning should have skipped some traversals");
+        assert!(total > pruned, "not everything should be pruned");
     }
 }

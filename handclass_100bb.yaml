@@ -9,3 +9,6 @@ training:
   mccfr_samples: 1000
   deal_count: 20000
   abstraction_mode: hand_class
+  pruning: true
+  pruning_warmup_fraction: 0.2
+  pruning_probe_interval: 20

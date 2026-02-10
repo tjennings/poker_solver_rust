@@ -53,6 +53,7 @@ fn main() {
         samples_per_iteration: samples,
         use_cfr_plus: true,
         discount_iterations: Some(0),
+        ..MccfrConfig::default()
     };
 
     let t2 = Instant::now();
@@ -109,11 +110,49 @@ fn main() {
         par_time / (iterations as u32 * samples as u32),
     );
 
+    // Phase 6: Parallel + Pruning comparison
+    println!();
+    println!("=== Parallel + Pruning MCCFR ===");
+
+    let prune_game_config = PostflopConfig {
+        stack_depth: 100,
+        bet_sizes: vec![0.3, 0.5, 1.0, 1.5],
+        max_raises_per_street: 3,
+    };
+    let prune_game =
+        HunlPostflop::new(prune_game_config, Some(AbstractionMode::HandClass), deal_count);
+    let prune_mccfr_config = MccfrConfig {
+        samples_per_iteration: samples,
+        use_cfr_plus: true,
+        discount_iterations: Some(0),
+        pruning: true,
+        pruning_warmup: 0, // no warmup for benchmark (short run)
+        pruning_probe_interval: 20,
+    };
+    let mut prune_solver = MccfrSolver::with_config(prune_game, &prune_mccfr_config);
+    prune_solver.set_seed(42);
+
+    let t5 = Instant::now();
+    prune_solver.train_parallel(iterations, samples);
+    let prune_time = t5.elapsed();
+    println!("[parallel+pruning]  {:?}", prune_time);
+
+    let prune_strategies = prune_solver.all_strategies();
+    println!("Info sets:  {}", prune_strategies.len());
+    let (pruned, total) = prune_solver.pruning_stats();
+    if total > 0 {
+        let skip_pct = 100.0 * pruned as f64 / total as f64;
+        println!("Pruned:     {pruned}/{total} ({skip_pct:.1}% skip rate)");
+    }
+
     println!();
     println!("=== Comparison ===");
-    println!("Sequential: {:?}", train_time);
-    println!("Parallel:   {:?}", par_time);
-    let speedup = train_time.as_secs_f64() / par_time.as_secs_f64();
-    println!("Speedup:    {:.2}x", speedup);
+    println!("Sequential:       {:?}", train_time);
+    println!("Parallel:         {:?}", par_time);
+    println!("Parallel+Pruning: {:?}", prune_time);
+    let par_speedup = train_time.as_secs_f64() / par_time.as_secs_f64();
+    let prune_speedup = train_time.as_secs_f64() / prune_time.as_secs_f64();
+    println!("Parallel speedup:         {:.2}x", par_speedup);
+    println!("Parallel+Pruning speedup: {:.2}x", prune_speedup);
     println!("Total time: {:?}", t0.elapsed());
 }
