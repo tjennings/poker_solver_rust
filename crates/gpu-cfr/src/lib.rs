@@ -152,8 +152,10 @@ pub struct GpuCfrSolver {
     deal_p1_wins_buffer: wgpu::Buffer,
     info_id_lookup_buffer: wgpu::Buffer,
 
-    // Uniform buffer
+    // Uniform buffer (array of Uniforms, indexed by dynamic offset)
     uniform_buffer: wgpu::Buffer,
+    /// Aligned stride for each Uniforms entry in the dynamic uniform buffer.
+    uniform_stride: u32,
 
     // Bind group layouts
     group0_layout: wgpu::BindGroupLayout,
@@ -211,7 +213,12 @@ impl GpuCfrSolver {
             tree, &deals, &position_indices, &key_to_dense, num_hand_classes,
         );
 
-        let batch_size = config.batch_size.min(deals.len());
+        // Auto-size batch to fit within GPU buffer binding limits.
+        // The largest per-batch buffer is info_id_lookup: batch_size × num_nodes × 4 bytes.
+        let max_binding = device.limits().max_storage_buffer_binding_size as u64;
+        let max_batch_for_gpu = (max_binding / (num_nodes as u64 * 4)) as usize;
+        let batch_size = config.batch_size.min(deals.len()).min(max_batch_for_gpu);
+
         let state_size = (num_info_sets as u64) * (max_actions as u64) * 4;
         let batch_node_size = (batch_size as u64) * (num_nodes as u64) * 4;
 
@@ -254,8 +261,16 @@ impl GpuCfrSolver {
         let info_id_lookup_buffer = create_buffer_zeroed(&device, "info_id_lookup",
             batch_lookup_size, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
 
+        // Uniform buffer: array of Uniforms with dynamic offsets.
+        // Each dispatch indexes a different slot. We need enough slots for:
+        //   1 (regret_match) + L (forward) + L (backward) + 1 (merge/discount)
+        // where L = number of tree levels.
+        let num_levels = level_counts.len();
+        let max_uniform_slots = (1 + num_levels + num_levels + 1) as u64;
+        let min_align = device.limits().min_uniform_buffer_offset_alignment;
+        let uniform_stride = align_up(std::mem::size_of::<Uniforms>() as u32, min_align);
         let uniform_buffer = create_buffer_zeroed(&device, "uniforms",
-            std::mem::size_of::<Uniforms>() as u64,
+            max_uniform_slots * u64::from(uniform_stride),
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
 
         // Create bind group layouts
@@ -311,6 +326,7 @@ impl GpuCfrSolver {
             deal_p1_wins_buffer,
             info_id_lookup_buffer,
             uniform_buffer,
+            uniform_stride,
             group0_layout,
             group1_layout,
             group2_layout,
@@ -351,6 +367,12 @@ impl GpuCfrSolver {
     #[must_use]
     pub fn num_info_sets(&self) -> u32 {
         self.num_info_sets
+    }
+
+    /// Deals per GPU batch (may be smaller than requested if GPU limits require it).
+    #[must_use]
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
     }
 
     /// Return average strategies for all info sets.
@@ -452,72 +474,95 @@ impl GpuCfrSolver {
     }
 
     fn dispatch_batch(&self, num_deals: u32, strategy_discount: f32) {
-        let bind_group0 = self.create_bind_group0();
-        let bind_group1 = self.create_bind_group1();
-        let bind_group2 = self.create_bind_group2();
+        let bg0 = self.create_bind_group0();
+        let bg1 = self.create_bind_group1();
+        let bg2 = self.create_bind_group2();
+        let num_levels = self.level_counts.len();
+        let stride = self.uniform_stride;
 
-        // Step 1: Regret matching (compute strategy from regrets)
-        self.dispatch_single(&self.regret_match_pipeline, &bind_group0, &bind_group1, &bind_group2,
-            0, 0, num_deals, strategy_discount, self.num_info_sets);
+        // Pre-upload ALL uniforms for this batch into the uniform buffer array.
+        // Slot layout: [regret_match, fwd_0..fwd_L-1, bwd_L-1..bwd_0]
+        let mut slot = 0u32;
 
-        // Step 2: Forward pass (level by level, root to leaves)
-        for level in 0..self.level_counts.len() {
+        // Slot 0: regret_match
+        self.write_uniform_slot(slot, 0, 0, num_deals, strategy_discount);
+        let regret_match_offset = slot * stride;
+        slot += 1;
+
+        // Slots 1..L: forward pass levels
+        let mut fwd_offsets = Vec::with_capacity(num_levels);
+        let mut fwd_threads = Vec::with_capacity(num_levels);
+        for level in 0..num_levels {
             let level_start = self.level_offsets[level];
             let level_count = self.level_counts[level];
-            let total_threads = num_deals * level_count;
-            self.dispatch_single(&self.forward_pass_pipeline, &bind_group0, &bind_group1, &bind_group2,
-                level_start, level_count, num_deals, strategy_discount, total_threads);
+            self.write_uniform_slot(slot, level_start, level_count, num_deals, strategy_discount);
+            fwd_offsets.push(slot * stride);
+            fwd_threads.push(num_deals * level_count);
+            slot += 1;
         }
 
-        // Step 3: Backward pass (level by level, leaves to root)
-        for level in (0..self.level_counts.len()).rev() {
+        // Slots L+1..2L: backward pass levels (reversed)
+        let mut bwd_offsets = Vec::with_capacity(num_levels);
+        let mut bwd_threads = Vec::with_capacity(num_levels);
+        for level in (0..num_levels).rev() {
             let level_start = self.level_offsets[level];
             let level_count = self.level_counts[level];
-            let total_threads = num_deals * level_count;
-            self.dispatch_single(&self.backward_pass_pipeline, &bind_group0, &bind_group1, &bind_group2,
-                level_start, level_count, num_deals, strategy_discount, total_threads);
+            self.write_uniform_slot(slot, level_start, level_count, num_deals, strategy_discount);
+            bwd_offsets.push(slot * stride);
+            bwd_threads.push(num_deals * level_count);
+            slot += 1;
         }
-    }
 
-    /// Submit a single compute dispatch with its own encoder.
-    ///
-    /// This ensures `write_uniforms` data is visible to the GPU
-    /// by the time the dispatch reads it.
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_single(
-        &self,
-        pipeline: &wgpu::ComputePipeline,
-        bg0: &wgpu::BindGroup,
-        bg1: &wgpu::BindGroup,
-        bg2: &wgpu::BindGroup,
-        level_start: u32,
-        level_count: u32,
-        num_deals: u32,
-        strategy_discount: f32,
-        total_threads: u32,
-    ) {
-        self.write_uniforms(level_start, level_count, num_deals, strategy_discount);
-
+        // Single encoder for the entire batch
         let mut encoder = self.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: None });
+            &wgpu::CommandEncoderDescriptor { label: Some("cfr_batch") });
+
+        // Step 1: Regret matching
         {
-            let mut pass = encoder.begin_compute_pass(
-                &wgpu::ComputePassDescriptor::default());
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bg0, &[]);
-            pass.set_bind_group(1, bg1, &[]);
-            pass.set_bind_group(2, bg2, &[]);
-            pass.dispatch_workgroups(div_ceil(total_threads, WORKGROUP_SIZE), 1, 1);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.regret_match_pipeline);
+            pass.set_bind_group(0, &bg0, &[regret_match_offset]);
+            pass.set_bind_group(1, &bg1, &[]);
+            pass.set_bind_group(2, &bg2, &[]);
+            pass.dispatch_workgroups(div_ceil(self.num_info_sets, WORKGROUP_SIZE), 1, 1);
         }
+
+        // Step 2: Forward pass (root to leaves)
+        for (i, (&offset, &threads)) in fwd_offsets.iter().zip(fwd_threads.iter()).enumerate() {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(if i == 0 { "fwd_0" } else { "fwd" }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.forward_pass_pipeline);
+            pass.set_bind_group(0, &bg0, &[offset]);
+            pass.set_bind_group(1, &bg1, &[]);
+            pass.set_bind_group(2, &bg2, &[]);
+            pass.dispatch_workgroups(div_ceil(threads, WORKGROUP_SIZE), 1, 1);
+        }
+
+        // Step 3: Backward pass (leaves to root)
+        for (i, (&offset, &threads)) in bwd_offsets.iter().zip(bwd_threads.iter()).enumerate() {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(if i == 0 { "bwd_0" } else { "bwd" }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.backward_pass_pipeline);
+            pass.set_bind_group(0, &bg0, &[offset]);
+            pass.set_bind_group(1, &bg1, &[]);
+            pass.set_bind_group(2, &bg2, &[]);
+            pass.dispatch_workgroups(div_ceil(threads, WORKGROUP_SIZE), 1, 1);
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
     fn dispatch_merge_and_discount(&self) {
-        let bind_group0 = self.create_bind_group0();
-        let bind_group1 = self.create_bind_group1();
-        let bind_group2 = self.create_bind_group2();
+        let bg0 = self.create_bind_group0();
+        let bg1 = self.create_bind_group1();
+        let bg2 = self.create_bind_group2();
 
-        self.write_uniforms(0, 0, 0, 0.0);
+        // Write uniforms at slot 0
+        self.write_uniform_slot(0, 0, 0, 0, 0.0);
 
         let total_entries = self.num_info_sets * self.max_actions;
         let mut encoder = self.device.create_command_encoder(
@@ -528,9 +573,9 @@ impl GpuCfrSolver {
             let mut pass = encoder.begin_compute_pass(
                 &wgpu::ComputePassDescriptor { label: Some("merge_deltas"), ..Default::default() });
             pass.set_pipeline(&self.merge_deltas_pipeline);
-            pass.set_bind_group(0, &bind_group0, &[]);
-            pass.set_bind_group(1, &bind_group1, &[]);
-            pass.set_bind_group(2, &bind_group2, &[]);
+            pass.set_bind_group(0, &bg0, &[0]);
+            pass.set_bind_group(1, &bg1, &[]);
+            pass.set_bind_group(2, &bg2, &[]);
             pass.dispatch_workgroups(div_ceil(total_entries, WORKGROUP_SIZE), 1, 1);
         }
 
@@ -539,9 +584,9 @@ impl GpuCfrSolver {
             let mut pass = encoder.begin_compute_pass(
                 &wgpu::ComputePassDescriptor { label: Some("dcfr_discount"), ..Default::default() });
             pass.set_pipeline(&self.dcfr_discount_pipeline);
-            pass.set_bind_group(0, &bind_group0, &[]);
-            pass.set_bind_group(1, &bind_group1, &[]);
-            pass.set_bind_group(2, &bind_group2, &[]);
+            pass.set_bind_group(0, &bg0, &[0]);
+            pass.set_bind_group(1, &bg1, &[]);
+            pass.set_bind_group(2, &bg2, &[]);
             pass.dispatch_workgroups(div_ceil(total_entries, WORKGROUP_SIZE), 1, 1);
         }
 
@@ -549,7 +594,8 @@ impl GpuCfrSolver {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
     }
 
-    fn write_uniforms(&self, level_start: u32, level_count: u32, num_deals: u32, strategy_discount: f32) {
+    /// Write a Uniforms struct at the given slot index in the dynamic uniform buffer.
+    fn write_uniform_slot(&self, slot: u32, level_start: u32, level_count: u32, num_deals: u32, strategy_discount: f32) {
         let uniforms = Uniforms {
             level_start,
             level_count,
@@ -564,7 +610,8 @@ impl GpuCfrSolver {
             dcfr_gamma: self.config.dcfr_gamma as f32,
             strategy_discount,
         };
-        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        let offset = u64::from(slot * self.uniform_stride);
+        self.queue.write_buffer(&self.uniform_buffer, offset, bytemuck::bytes_of(&uniforms));
     }
 
     fn compute_strategy_discount(&self) -> f32 {
@@ -578,7 +625,17 @@ impl GpuCfrSolver {
             label: Some("group0"),
             layout: &self.group0_layout,
             entries: &[
-                entry(0, &self.uniform_buffer),
+                // Dynamic uniform: bind the whole buffer but specify the
+                // size of one Uniforms struct. The dynamic offset selects
+                // which slot to read.
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.uniform_buffer,
+                        offset: 0,
+                        size: std::num::NonZero::new(std::mem::size_of::<Uniforms>() as u64),
+                    }),
+                },
                 entry(1, &self.node_buffer),
                 entry(2, &self.children_buffer),
                 entry(3, &self.level_nodes_buffer),
@@ -855,7 +912,17 @@ fn create_group0_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("group0_layout"),
         entries: &[
-            layout_entry(0, wgpu::BufferBindingType::Uniform),
+            // Uniform binding with dynamic offset
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
             layout_entry(1, storage_rw()),
             layout_entry(2, storage_rw()),
             layout_entry(3, storage_rw()),
@@ -931,6 +998,11 @@ fn create_pipeline(
 
 fn div_ceil(a: u32, b: u32) -> u32 {
     a.div_ceil(b)
+}
+
+/// Round `value` up to the next multiple of `alignment`.
+fn align_up(value: u32, alignment: u32) -> u32 {
+    value.div_ceil(alignment) * alignment
 }
 
 #[cfg(test)]
