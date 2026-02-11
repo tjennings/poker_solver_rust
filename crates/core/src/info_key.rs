@@ -6,8 +6,7 @@
 //! Bits 63-36: hand/bucket   (28 bits)
 //! Bits 35-34: street         (2 bits)
 //! Bits 33-29: spr_bucket     (5 bits) — min(eff_stack*2/pot, 31), half-SPR units
-//! Bits 28-25: depth_bucket   (4 bits) — min(eff_stack/13, 15), ~6.5 BB increments
-//! Bit  24:    (reserved)
+//! Bits 28-24: (reserved)     (5 bits)
 //! Bits 23-0:  action slots  (24 bits) — up to 6 actions × 4 bits
 //! ```
 //!
@@ -22,7 +21,6 @@ use crate::poker::{Card, Suit, Value};
 const HAND_SHIFT: u32 = 36;
 const STREET_SHIFT: u32 = 34;
 const SPR_SHIFT: u32 = 29;
-const DEPTH_SHIFT: u32 = 25;
 
 /// Compute SPR bucket: `min(eff_stack * 2 / pot, 31)`.
 ///
@@ -34,14 +32,6 @@ pub fn spr_bucket(pot: u32, eff_stack: u32) -> u32 {
         return 31;
     }
     (eff_stack * 2 / pot).min(31)
-}
-
-/// Compute depth bucket: `min(eff_stack / 13, 15)`.
-///
-/// Absolute stack depth in ~6.5 BB increments (internal units).
-#[must_use]
-pub fn depth_bucket(eff_stack: u32) -> u32 {
-    (eff_stack / 13).min(15)
 }
 
 /// A packed u64 information set key.
@@ -58,21 +48,18 @@ impl InfoKey {
     /// * `hand_or_bucket` - Canonical hand index (0-168) or classification bits (up to 28 bits)
     /// * `street` - 0=Preflop, 1=Flop, 2=Turn, 3=River
     /// * `spr_bucket` - `min(eff_stack * 2 / pot, 31)` (5 bits, max 31)
-    /// * `depth_bucket` - `min(eff_stack / 13, 15)` (4 bits, max 15)
     /// * `actions` - Slice of encoded action codes (from `encode_action`)
     #[must_use]
     pub fn new(
         hand_or_bucket: u32,
         street: u8,
         spr_bucket: u32,
-        depth_bucket: u32,
         actions: &[u8],
     ) -> Self {
         let mut key: u64 = 0;
         key |= (u64::from(hand_or_bucket) & 0xFFF_FFFF) << HAND_SHIFT;
         key |= (u64::from(street) & 0x3) << STREET_SHIFT;
         key |= (u64::from(spr_bucket) & 0x1F) << SPR_SHIFT;
-        key |= (u64::from(depth_bucket) & 0xF) << DEPTH_SHIFT;
 
         // Pack up to 6 actions into bits 23..0 (4 bits each, MSB-first)
         // Action 0 → bits 23-20, action 1 → bits 19-16, ..., action 5 → bits 3-0
@@ -105,12 +92,6 @@ impl InfoKey {
         ((self.0 >> SPR_SHIFT) & 0x1F) as u32
     }
 
-    /// Extract depth bucket (4 bits).
-    #[must_use]
-    pub const fn depth_bucket(self) -> u32 {
-        ((self.0 >> DEPTH_SHIFT) & 0xF) as u32
-    }
-
     /// Extract the street (2 bits): 0=Preflop, 1=Flop, 2=Turn, 3=River.
     #[must_use]
     pub const fn street(self) -> u8 {
@@ -129,13 +110,12 @@ impl InfoKey {
         (self.0 & 0xFF_FFFF) as u32
     }
 
-    /// Return a new key with modified SPR and depth buckets.
+    /// Return a new key with a modified SPR bucket.
     #[must_use]
-    pub const fn with_buckets(self, spr_bucket: u32, depth_bucket: u32) -> Self {
-        let mask = !((0x1F << SPR_SHIFT) | (0xF << DEPTH_SHIFT));
+    pub const fn with_spr(self, spr_bucket: u32) -> Self {
+        let mask = !(0x1F << SPR_SHIFT);
         let cleared = self.0 & mask;
-        let new_bits = ((spr_bucket as u64 & 0x1F) << SPR_SHIFT)
-            | ((depth_bucket as u64 & 0xF) << DEPTH_SHIFT);
+        let new_bits = (spr_bucket as u64 & 0x1F) << SPR_SHIFT;
         Self(cleared | new_bits)
     }
 }
@@ -365,8 +345,6 @@ pub struct KeyDescription {
     pub street_label: &'static str,
     /// SPR bucket (0-31).
     pub spr_bucket: u32,
-    /// Depth bucket (0-15).
-    pub depth_bucket: u32,
     /// Non-zero action codes extracted from the key.
     pub action_codes: Vec<u8>,
     /// Human-readable action labels (e.g. "Check", "Bet 67%").
@@ -388,13 +366,13 @@ impl KeyDescription {
 
         if actions_str.is_empty() {
             format!(
-                "hand={} street={} spr={} depth={}",
-                self.hand_label, self.street_label, self.spr_bucket, self.depth_bucket
+                "hand={} street={} spr={}",
+                self.hand_label, self.street_label, self.spr_bucket
             )
         } else {
             format!(
-                "hand={} street={} spr={} depth={} actions={}",
-                self.hand_label, self.street_label, self.spr_bucket, self.depth_bucket, actions_str
+                "hand={} street={} spr={} actions={}",
+                self.hand_label, self.street_label, self.spr_bucket, actions_str
             )
         }
     }
@@ -543,7 +521,6 @@ fn describe_from_hex(
     let hand_bits = key.hand_bits();
     let street = key.street();
     let spr = key.spr_bucket();
-    let depth = key.depth_bucket();
 
     let action_codes = extract_action_codes(key.actions_bits());
     let action_labels = action_codes
@@ -561,7 +538,6 @@ fn describe_from_hex(
         street,
         street_label: STREET_NAMES[street as usize],
         spr_bucket: spr,
-        depth_bucket: depth,
         action_codes,
         action_labels,
         strategy,
@@ -577,7 +553,6 @@ fn describe_from_compose(
     let mut hand_str: Option<&str> = None;
     let mut street_str: Option<&str> = None;
     let mut spr_val: Option<u32> = None;
-    let mut depth_val: Option<u32> = None;
     let mut actions_str: Option<&str> = None;
 
     for part in input.split_whitespace() {
@@ -587,10 +562,10 @@ fn describe_from_compose(
             street_str = Some(val);
         } else if let Some(val) = part.strip_prefix("spr=") {
             spr_val = Some(val.parse().map_err(|_| format!("invalid spr: {val}"))?);
-        } else if let Some(val) = part.strip_prefix("depth=") {
-            depth_val = Some(val.parse().map_err(|_| format!("invalid depth: {val}"))?);
         } else if let Some(val) = part.strip_prefix("actions=") {
             actions_str = Some(val);
+        } else if part.starts_with("depth=") {
+            // Silently ignore legacy depth= field for backwards compatibility
         } else {
             return Err(format!("unknown field: {part}"));
         }
@@ -599,7 +574,6 @@ fn describe_from_compose(
     let hand_raw = hand_str.ok_or("missing hand= field")?;
     let street = parse_street(street_str.ok_or("missing street= field")?)?;
     let spr = spr_val.ok_or("missing spr= field")?;
-    let depth = depth_val.ok_or("missing depth= field")?;
 
     let hand_bits = parse_hand_bits(hand_raw, abstraction_mode)?;
 
@@ -613,7 +587,7 @@ fn describe_from_compose(
         .map(|&c| format_action_code_label(c, bet_sizes))
         .collect();
 
-    let raw = InfoKey::new(hand_bits, street, spr, depth, &action_codes).as_u64();
+    let raw = InfoKey::new(hand_bits, street, spr, &action_codes).as_u64();
     let strategy = blueprint.and_then(|bp| bp.lookup(raw).map(<[f32]>::to_vec));
 
     let hand_label = hand_raw.to_string();
@@ -625,7 +599,6 @@ fn describe_from_compose(
         street,
         street_label: STREET_NAMES[street as usize],
         spr_bucket: spr,
-        depth_bucket: depth,
         action_codes,
         action_labels,
         strategy,
@@ -784,9 +757,8 @@ mod tests {
 
     #[timed_test]
     fn round_trip_key_components() {
-        let key = InfoKey::new(42, 2, 15, 9, &[1, 3, 5]);
+        let key = InfoKey::new(42, 2, 15, &[1, 3, 5]);
         assert_eq!(key.spr_bucket(), 15);
-        assert_eq!(key.depth_bucket(), 9);
         assert_eq!(key.street(), 2);
         assert_eq!(key.hand_bits(), 42);
     }
@@ -794,37 +766,36 @@ mod tests {
     #[timed_test]
     fn street_extractor() {
         for street in 0..=3u8 {
-            let key = InfoKey::new(0, street, 0, 0, &[]);
+            let key = InfoKey::new(0, street, 0, &[]);
             assert_eq!(key.street(), street);
         }
     }
 
     #[timed_test]
     fn hand_bits_extractor() {
-        let key = InfoKey::new(0xABC_DEF, 1, 5, 3, &[2]);
+        let key = InfoKey::new(0xABC_DEF, 1, 5, &[2]);
         assert_eq!(key.hand_bits(), 0xABC_DEF);
     }
 
     #[timed_test]
     fn actions_bits_extractor() {
         // Actions packed: [4, 7] → action 0 at bits 23-20 = 4, action 1 at bits 19-16 = 7
-        let key = InfoKey::new(0, 0, 0, 0, &[4, 7]);
+        let key = InfoKey::new(0, 0, 0, &[4, 7]);
         let expected = (4u32 << 20) | (7u32 << 16);
         assert_eq!(key.actions_bits(), expected);
     }
 
     #[timed_test]
     fn actions_bits_empty() {
-        let key = InfoKey::new(100, 3, 10, 5, &[]);
+        let key = InfoKey::new(100, 3, 10, &[]);
         assert_eq!(key.actions_bits(), 0);
     }
 
     #[timed_test]
-    fn with_buckets_replaces_correctly() {
-        let key = InfoKey::new(42, 1, 10, 5, &[2, 3]);
-        let modified = key.with_buckets(20, 8);
+    fn with_spr_replaces_correctly() {
+        let key = InfoKey::new(42, 1, 10, &[2, 3]);
+        let modified = key.with_spr(20);
         assert_eq!(modified.spr_bucket(), 20);
-        assert_eq!(modified.depth_bucket(), 8);
         // Hand and street bits should be unchanged
         assert_eq!(
             key.as_u64() >> HAND_SHIFT,
@@ -965,35 +936,35 @@ mod tests {
 
     #[timed_test]
     fn different_streets_produce_different_keys() {
-        let k1 = InfoKey::new(0, 0, 0, 0, &[]);
-        let k2 = InfoKey::new(0, 1, 0, 0, &[]);
+        let k1 = InfoKey::new(0, 0, 0, &[]);
+        let k2 = InfoKey::new(0, 1, 0, &[]);
         assert_ne!(k1.as_u64(), k2.as_u64());
     }
 
     #[timed_test]
     fn different_actions_produce_different_keys() {
-        let k1 = InfoKey::new(0, 0, 0, 0, &[1]);
-        let k2 = InfoKey::new(0, 0, 0, 0, &[2]);
+        let k1 = InfoKey::new(0, 0, 0, &[1]);
+        let k2 = InfoKey::new(0, 0, 0, &[2]);
         assert_ne!(k1.as_u64(), k2.as_u64());
     }
 
     #[timed_test]
     fn action_packing_order_matters() {
-        let k1 = InfoKey::new(0, 0, 0, 0, &[1, 2]);
-        let k2 = InfoKey::new(0, 0, 0, 0, &[2, 1]);
+        let k1 = InfoKey::new(0, 0, 0, &[1, 2]);
+        let k2 = InfoKey::new(0, 0, 0, &[2, 1]);
         assert_ne!(k1.as_u64(), k2.as_u64());
     }
 
     #[timed_test]
-    fn actions_do_not_overlap_with_depth_bucket() {
-        // Verify that setting all action bits to max doesn't corrupt depth_bucket.
-        let key = InfoKey::new(0, 0, 0, 15, &[15, 15, 15, 15, 15, 15]);
-        assert_eq!(key.depth_bucket(), 15, "Depth bucket corrupted by action bits");
+    fn actions_do_not_overlap_with_spr_bucket() {
+        // Verify that setting all action bits to max doesn't corrupt spr_bucket.
+        let key = InfoKey::new(0, 0, 31, &[15, 15, 15, 15, 15, 15]);
+        assert_eq!(key.spr_bucket(), 31, "SPR bucket corrupted by action bits");
 
-        // Verify that max depth_bucket doesn't corrupt first action
-        let k1 = InfoKey::new(0, 0, 0, 15, &[1]);
-        let k2 = InfoKey::new(0, 0, 0, 15, &[2]);
-        assert_ne!(k1.as_u64(), k2.as_u64(), "Actions indistinguishable with max depth_bucket");
+        // Verify that max spr_bucket doesn't corrupt first action
+        let k1 = InfoKey::new(0, 0, 31, &[1]);
+        let k2 = InfoKey::new(0, 0, 31, &[2]);
+        assert_ne!(k1.as_u64(), k2.as_u64(), "Actions indistinguishable with max spr_bucket");
     }
 
     #[timed_test]
@@ -1010,20 +981,6 @@ mod tests {
         assert_eq!(spr_bucket(4, 18), 9);
         // Typical raised pot: pot=12, eff_stack=14 → 28/12 = 2
         assert_eq!(spr_bucket(12, 14), 2);
-    }
-
-    #[timed_test]
-    fn depth_bucket_edge_cases() {
-        // Zero stack
-        assert_eq!(depth_bucket(0), 0);
-        // Small stack (< 13)
-        assert_eq!(depth_bucket(12), 0);
-        // Exactly 13
-        assert_eq!(depth_bucket(13), 1);
-        // 100 BB game: eff_stack ~198 internal units → 198/13 = 15
-        assert_eq!(depth_bucket(198), 15);
-        // Large stack: capped at 15
-        assert_eq!(depth_bucket(500), 15);
     }
 
     #[timed_test]
@@ -1170,33 +1127,31 @@ mod tests {
     #[timed_test]
     fn describe_key_hex_roundtrip() {
         let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
-        let key = InfoKey::new(42, 1, 10, 5, &[2, 5]).as_u64();
+        let key = InfoKey::new(42, 1, 10, &[2, 5]).as_u64();
         let hex = format!("0x{key:016X}");
 
         let desc = describe_key(&hex, &sizes, "ehs2", None).unwrap();
         assert_eq!(desc.raw, key);
         assert_eq!(desc.street, 1);
         assert_eq!(desc.spr_bucket, 10);
-        assert_eq!(desc.depth_bucket, 5);
         assert_eq!(desc.action_codes, vec![2, 5]);
     }
 
     #[timed_test]
     fn describe_key_compose_format() {
         let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
-        let input = "hand=AKs street=preflop spr=31 depth=15";
+        let input = "hand=AKs street=preflop spr=31";
 
         let desc = describe_key(input, &sizes, "ehs2", None).unwrap();
         assert_eq!(desc.street, 0);
         assert_eq!(desc.spr_bucket, 31);
-        assert_eq!(desc.depth_bucket, 15);
         assert_eq!(desc.hand_bits, 13); // AKs = index 13
     }
 
     #[timed_test]
     fn describe_key_compose_with_actions() {
         let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
-        let input = "hand=QQ street=flop spr=5 depth=3 actions=check,bet1";
+        let input = "hand=QQ street=flop spr=5 actions=check,bet1";
 
         let desc = describe_key(input, &sizes, "ehs2", None).unwrap();
         assert_eq!(desc.action_codes, vec![2, 5]); // check=2, bet1=5
@@ -1206,7 +1161,7 @@ mod tests {
     #[timed_test]
     fn describe_key_hex_then_compose_roundtrip() {
         let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
-        let input = "hand=AKs street=preflop spr=20 depth=10 actions=call";
+        let input = "hand=AKs street=preflop spr=20 actions=call";
 
         let desc1 = describe_key(input, &sizes, "ehs2", None).unwrap();
         let hex = format!("0x{:016X}", desc1.raw);
@@ -1221,7 +1176,7 @@ mod tests {
     #[timed_test]
     fn compose_string_output() {
         let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
-        let input = "hand=AKs street=flop spr=10 depth=5 actions=check,bet1";
+        let input = "hand=AKs street=flop spr=10 actions=check,bet1";
 
         let desc = describe_key(input, &sizes, "ehs2", None).unwrap();
         let compose = desc.compose_string();
@@ -1242,7 +1197,7 @@ mod tests {
     #[timed_test]
     fn describe_key_hand_class_mode() {
         let sizes = vec![0.33, 0.67, 1.0];
-        let input = "hand=TopPair street=flop spr=5 depth=3";
+        let input = "hand=TopPair street=flop spr=5";
 
         let desc = describe_key(input, &sizes, "hand_class", None).unwrap();
         // TopPair = discriminant 13 → bit 13 set → 0x2000

@@ -168,10 +168,10 @@ mod tests {
         // Should have info sets for each card at each decision point
         assert!(!solver.strategy_sum.is_empty());
         // K at root
-        let k = InfoKey::new(2, 0, 0, 0, &[]).as_u64();
+        let k = InfoKey::new(2, 0, 0, &[]).as_u64();
         assert!(solver.strategy_sum.contains_key(&k));
         // J after check (Jc)
-        let jc = InfoKey::new(0, 0, 0, 0, &[2]).as_u64();
+        let jc = InfoKey::new(0, 0, 0, &[2]).as_u64();
         assert!(solver.strategy_sum.contains_key(&jc));
     }
 
@@ -201,7 +201,7 @@ mod tests {
         solver.train(10_000);
 
         // K at root: check or bet — betting is optimal
-        let k = InfoKey::new(2, 0, 0, 0, &[]).as_u64();
+        let k = InfoKey::new(2, 0, 0, &[]).as_u64();
         if let Some(strategy) = solver.get_average_strategy(k) {
             assert!(
                 strategy[1] > 0.5,
@@ -210,7 +210,7 @@ mod tests {
         }
 
         // Kb = King facing bet, should always call
-        let kb = InfoKey::new(2, 0, 0, 0, &[4]).as_u64();
+        let kb = InfoKey::new(2, 0, 0, &[4]).as_u64();
         if let Some(strategy) = solver.get_average_strategy(kb) {
             assert!(
                 strategy[1] > 0.99,

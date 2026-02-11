@@ -477,7 +477,7 @@ mod tests {
 
         // In Kuhn Nash equilibrium:
         // P1 with Jack at root: bet with probability alpha = ~1/3
-        let jack_root_key = crate::info_key::InfoKey::new(0, 0, 0, 0, &[]).as_u64();
+        let jack_root_key = crate::info_key::InfoKey::new(0, 0, 0, &[]).as_u64();
         if let Some(probs) = strategies.get(&jack_root_key) {
             let bet_prob = probs[1];
             assert!(
@@ -487,7 +487,7 @@ mod tests {
         }
 
         // P1 with King at root: should bet frequently (3*alpha in Nash)
-        let king_root_key = crate::info_key::InfoKey::new(2, 0, 0, 0, &[]).as_u64();
+        let king_root_key = crate::info_key::InfoKey::new(2, 0, 0, &[]).as_u64();
         if let Some(probs) = strategies.get(&king_root_key) {
             let bet_prob = probs[1];
             assert!(

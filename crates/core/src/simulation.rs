@@ -30,7 +30,7 @@ use crate::agent::{AgentConfig, FrequencyMap};
 use crate::blueprint::{AbstractionModeConfig, BlueprintStrategy, BundleConfig};
 use crate::hand_class::{classify, intra_class_strength, HandClass};
 use crate::hands::CanonicalHand;
-use crate::info_key::{canonical_hand_index, depth_bucket, encode_hand_v2, spr_bucket, InfoKey};
+use crate::info_key::{canonical_hand_index, encode_hand_v2, spr_bucket, InfoKey};
 use crate::showdown_equity;
 
 /// Progress update emitted during a simulation run.
@@ -188,7 +188,6 @@ impl BlueprintAgent {
         let pot_rounded = game_state.total_pot.round() as u32;
         let eff_stack = effective_stack_rounded(game_state);
         let spr = spr_bucket(pot_rounded, eff_stack);
-        let depth = depth_bucket(eff_stack);
 
         // Read current-street actions from both players via the shared log
         let action_codes: Vec<u8> = ACTION_LOG.with(|log| {
@@ -199,42 +198,36 @@ impl BlueprintAgent {
                 .collect()
         });
 
-        InfoKey::new(hand_bits, street_num, spr, depth, &action_codes).as_u64()
+        InfoKey::new(hand_bits, street_num, spr, &action_codes).as_u64()
     }
 
-    /// Look up strategy probabilities, trying nearby pot/stack buckets when
+    /// Look up strategy probabilities, trying nearby SPR buckets when
     /// the exact key is missing from the blueprint.
     ///
-    /// Searches outward by Manhattan distance in (`spr_bucket`, `depth_bucket`)
-    /// space. Falls back to a uniform distribution if no nearby key is found.
+    /// Searches outward by distance in `spr_bucket` space.
+    /// Falls back to a uniform distribution if no nearby key is found.
     fn lookup_nearest(&self, key: u64) -> Vec<f32> {
         // Try exact key first
         if let Some(probs) = self.blueprint.lookup(key) {
             return probs.to_vec();
         }
 
-        // Extract SPR/depth buckets from the key to search nearby
+        // Extract SPR bucket from the key to search nearby
         let info = InfoKey::from_raw(key);
         let spr = info.spr_bucket();
-        let depth = info.depth_bucket();
 
-        // Search nearby SPR/depth buckets by increasing Manhattan distance
+        // Search nearby SPR buckets by increasing distance
         for distance in 1..=5i32 {
-            for dp in -distance..=distance {
-                let ds_abs = distance - dp.abs();
-                for &ds in &[-ds_abs, ds_abs] {
-                    #[allow(clippy::cast_possible_wrap)]
-                    let p = spr as i32 + dp;
-                    #[allow(clippy::cast_possible_wrap)]
-                    let s = depth as i32 + ds;
-                    if p < 0 || s < 0 {
-                        continue;
-                    }
-                    #[allow(clippy::cast_sign_loss)]
-                    let candidate = info.with_buckets(p as u32, s as u32).as_u64();
-                    if let Some(probs) = self.blueprint.lookup(candidate) {
-                        return probs.to_vec();
-                    }
+            for &delta in &[-distance, distance] {
+                #[allow(clippy::cast_possible_wrap)]
+                let candidate_spr = spr as i32 + delta;
+                if candidate_spr < 0 {
+                    continue;
+                }
+                #[allow(clippy::cast_sign_loss)]
+                let candidate = info.with_spr(candidate_spr as u32).as_u64();
+                if let Some(probs) = self.blueprint.lookup(candidate) {
+                    return probs.to_vec();
                 }
             }
         }
@@ -970,7 +963,7 @@ raise = 0.4
         };
         let agent = BlueprintAgent::new(blueprint, config);
         // An arbitrary key that won't be in the empty blueprint
-        let key = InfoKey::new(128, 1, 11, 2, &[7, 10, 9]).as_u64();
+        let key = InfoKey::new(128, 1, 11, &[7, 10, 9]).as_u64();
         let probs = agent.lookup_nearest(key);
         // 4 bet sizes → fold + call + 4 bets + all-in = 7 actions
         assert_eq!(probs.len(), 7);
@@ -984,7 +977,7 @@ raise = 0.4
     fn lookup_nearest_finds_nearby_bucket() {
         let mut blueprint = BlueprintStrategy::new();
         // Insert a key with pot=10, stack=3
-        let stored_key = InfoKey::new(128, 1, 10, 3, &[4]).as_u64();
+        let stored_key = InfoKey::new(128, 1, 10, &[4]).as_u64();
         blueprint.insert(stored_key, vec![0.1, 0.2, 0.3, 0.15, 0.1, 0.05, 0.1]);
         let blueprint = Arc::new(blueprint);
         let config = BundleConfig {
@@ -1000,7 +993,7 @@ raise = 0.4
         };
         let agent = BlueprintAgent::new(blueprint, config);
         // Look up with pot=11, stack=2 — should find nearby pot=10, stack=3 (distance 2)
-        let query_key = InfoKey::new(128, 1, 11, 2, &[4]).as_u64();
+        let query_key = InfoKey::new(128, 1, 11, &[4]).as_u64();
         let probs = agent.lookup_nearest(query_key);
         assert_eq!(probs, vec![0.1, 0.2, 0.3, 0.15, 0.1, 0.05, 0.1]);
     }

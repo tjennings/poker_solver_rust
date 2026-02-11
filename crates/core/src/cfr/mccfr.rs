@@ -1011,7 +1011,7 @@ mod tests {
         solver.train_full(10_000);
 
         // King (2) facing bet (4) → "Kb"
-        let kb = InfoKey::new(2, 0, 0, 0, &[4]).as_u64();
+        let kb = InfoKey::new(2, 0, 0, &[4]).as_u64();
         if let Some(strategy) = solver.get_average_strategy(kb) {
             assert!(
                 strategy[1] > 0.99,
@@ -1020,7 +1020,7 @@ mod tests {
         }
 
         // Jack (0) facing bet (4) → "Jb"
-        let jb = InfoKey::new(0, 0, 0, 0, &[4]).as_u64();
+        let jb = InfoKey::new(0, 0, 0, &[4]).as_u64();
         if let Some(strategy) = solver.get_average_strategy(jb) {
             assert!(
                 strategy[0] > 0.99,
@@ -1295,7 +1295,7 @@ mod tests {
         solver.train_full_parallel(10_000);
 
         // King facing bet → always call
-        let kb = InfoKey::new(2, 0, 0, 0, &[4]).as_u64();
+        let kb = InfoKey::new(2, 0, 0, &[4]).as_u64();
         if let Some(strategy) = solver.get_average_strategy(kb) {
             assert!(
                 strategy[1] > 0.99,
@@ -1304,7 +1304,7 @@ mod tests {
         }
 
         // Jack facing bet → always fold
-        let jb = InfoKey::new(0, 0, 0, 0, &[4]).as_u64();
+        let jb = InfoKey::new(0, 0, 0, &[4]).as_u64();
         if let Some(strategy) = solver.get_average_strategy(jb) {
             assert!(
                 strategy[0] > 0.99,
@@ -1326,8 +1326,8 @@ mod tests {
         par.train_full_parallel(5_000);
 
         // Both should converge to same Nash equilibrium points
-        let kb = InfoKey::new(2, 0, 0, 0, &[4]).as_u64();
-        let jb = InfoKey::new(0, 0, 0, 0, &[4]).as_u64();
+        let kb = InfoKey::new(2, 0, 0, &[4]).as_u64();
+        let jb = InfoKey::new(0, 0, 0, &[4]).as_u64();
 
         let seq_kb = seq.get_average_strategy(kb).expect("seq kb");
         let par_kb = par.get_average_strategy(kb).expect("par kb");
@@ -1474,7 +1474,7 @@ mod tests {
         solver.train_full(10_000);
 
         // King facing bet → always call (relaxed threshold; pruning adds slight noise)
-        let kb = InfoKey::new(2, 0, 0, 0, &[4]).as_u64();
+        let kb = InfoKey::new(2, 0, 0, &[4]).as_u64();
         if let Some(strategy) = solver.get_average_strategy(kb) {
             assert!(
                 strategy[1] > 0.95,
@@ -1483,7 +1483,7 @@ mod tests {
         }
 
         // Jack facing bet → always fold
-        let jb = InfoKey::new(0, 0, 0, 0, &[4]).as_u64();
+        let jb = InfoKey::new(0, 0, 0, &[4]).as_u64();
         if let Some(strategy) = solver.get_average_strategy(jb) {
             assert!(
                 strategy[0] > 0.95,
@@ -1513,7 +1513,7 @@ mod tests {
         solver.train_full_parallel(10_000);
 
         // King facing bet → always call (relaxed threshold; pruning adds slight noise)
-        let kb = InfoKey::new(2, 0, 0, 0, &[4]).as_u64();
+        let kb = InfoKey::new(2, 0, 0, &[4]).as_u64();
         if let Some(strategy) = solver.get_average_strategy(kb) {
             assert!(
                 strategy[1] > 0.95,
@@ -1522,7 +1522,7 @@ mod tests {
         }
 
         // Jack facing bet → always fold
-        let jb = InfoKey::new(0, 0, 0, 0, &[4]).as_u64();
+        let jb = InfoKey::new(0, 0, 0, &[4]).as_u64();
         if let Some(strategy) = solver.get_average_strategy(jb) {
             assert!(
                 strategy[0] > 0.95,

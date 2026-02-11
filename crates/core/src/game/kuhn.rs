@@ -213,7 +213,7 @@ impl Game for KuhnPoker {
             })
             .collect();
 
-        InfoKey::new(hand_bits, 0, 0, 0, &action_codes).as_u64()
+        InfoKey::new(hand_bits, 0, 0, &action_codes).as_u64()
     }
 }
 

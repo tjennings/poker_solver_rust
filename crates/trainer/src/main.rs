@@ -19,7 +19,7 @@ use poker_solver_core::cfr::{
 };
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
 use poker_solver_core::game::{AbstractionMode, Action, HunlPostflop, PostflopConfig, PostflopState};
-use poker_solver_core::info_key::{canonical_hand_index_from_str, depth_bucket, spr_bucket, InfoKey};
+use poker_solver_core::info_key::{canonical_hand_index_from_str, spr_bucket, InfoKey};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
@@ -1366,12 +1366,11 @@ fn print_checkpoint(
     // Preflop initial state: pot=3 (SB+BB), stacks=stack_depth*2-1, stack_depth*2-2
     let preflop_eff_stack = ctx.stack_depth * 2 - 2;
     let spr_b = spr_bucket(3, preflop_eff_stack);
-    let depth_b = depth_bucket(preflop_eff_stack);
 
     for &hand in DISPLAY_HANDS {
         if let Some(hand_idx) = canonical_hand_index_from_str(hand) {
             let info_key =
-                InfoKey::new(u32::from(hand_idx), 0, spr_b, depth_b, &[]).as_u64();
+                InfoKey::new(u32::from(hand_idx), 0, spr_b, &[]).as_u64();
             if let Some(probs) = strategies.get(&info_key) {
                 let prob_cols: String = probs
                     .iter()
@@ -1425,19 +1424,17 @@ fn print_extreme_regret_keys(
     for &(key, regret) in &highest {
         let info = InfoKey::from_raw(*key);
         println!(
-            "  highest: {key:#018x}  regret={regret:.6}  street={} spr={} depth={}",
+            "  highest: {key:#018x}  regret={regret:.6}  street={} spr={}",
             info.street(),
             info.spr_bucket(),
-            info.depth_bucket(),
         );
     }
     for &(key, regret) in &lowest {
         let info = InfoKey::from_raw(*key);
         println!(
-            "  lowest:  {key:#018x}  regret={regret:.6}  street={} spr={} depth={}",
+            "  lowest:  {key:#018x}  regret={regret:.6}  street={} spr={}",
             info.street(),
             info.spr_bucket(),
-            info.depth_bucket(),
         );
     }
 
@@ -1446,9 +1443,9 @@ fn print_extreme_regret_keys(
     if neg_count > 0 {
         let info = InfoKey::from_raw(most_neg_key);
         println!(
-            "  negative regrets: {} actions, min={:.6} at {:#018x} street={} spr={} depth={}",
+            "  negative regrets: {} actions, min={:.6} at {:#018x} street={} spr={}",
             neg_count, most_neg_regret, most_neg_key,
-            info.street(), info.spr_bucket(), info.depth_bucket()
+            info.street(), info.spr_bucket()
         );
     } else {
         println!("  negative regrets: NONE (possible regret flooring issue)");
@@ -1529,8 +1526,8 @@ fn class_label(class: HandClass) -> &'static str {
     }
 }
 
-/// Group key for river scenarios: (spr_bucket, depth_bucket, actions_bits).
-type RiverScenario = (u32, u32, u32);
+/// Group key for river scenarios: (spr_bucket, actions_bits).
+type RiverScenario = (u32, u32);
 
 /// Print river strategy tables for the most populated first-to-act and facing-bet scenarios.
 fn print_river_strategies(strategies: &FxHashMap<u64, Vec<f64>>, abs_mode: AbstractionModeConfig) {
@@ -1545,9 +1542,8 @@ fn print_river_strategies(strategies: &FxHashMap<u64, Vec<f64>>, abs_mode: Abstr
         }
         let hand_bits = key.hand_bits();
         let spr = key.spr_bucket();
-        let depth = key.depth_bucket();
         let actions = key.actions_bits();
-        let scenario = (spr, depth, actions);
+        let scenario = (spr, actions);
 
         if actions == 0 {
             first_to_act
@@ -1628,17 +1624,16 @@ fn print_river_table(
         }
     }
 
-    let (spr_b, depth_b, _) = scenario;
-    // Convert buckets back to approximate values
+    let (spr_b, _) = scenario;
+    // Convert bucket back to approximate value
     let approx_spr = spr_b as f64 / 2.0;
-    let approx_stack_bb = depth_b * 13 / 2;
 
     let action_cols: String = labels.iter().map(|l| format!("{:>6}", l)).collect();
     let header = format!("{:<12}|{action_cols}", "Class");
     let separator = "-".repeat(header.len());
 
     println!(
-        "River Strategy ({context}, SPR ~{approx_spr:.1}, stack ~{approx_stack_bb}BB):"
+        "River Strategy ({context}, SPR ~{approx_spr:.1}):"
     );
     println!("{header}");
     println!("{separator}");

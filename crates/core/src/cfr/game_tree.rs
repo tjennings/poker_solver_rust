@@ -45,7 +45,6 @@ pub enum NodeType {
         pot: u32,
         stacks: [u32; 2],
         spr_bucket: u32,
-        depth_bucket: u32,
         /// Encoded action codes for actions on the current street
         /// leading to this node (used for info set key computation).
         street_action_codes: ArrayVec<u8, 6>,
@@ -248,7 +247,6 @@ fn make_decision_node_generic<G: Game>(
             pot: 0,
             stacks: [0; 2],
             spr_bucket: key.spr_bucket(),
-            depth_bucket: key.depth_bucket(),
             street_action_codes,
         },
     }
@@ -403,7 +401,6 @@ fn make_postflop_decision(
 
     let eff_stack = state.stacks[0].min(state.stacks[1]);
     let spr = info_key::spr_bucket(state.pot, eff_stack);
-    let depth_bucket = info_key::depth_bucket(eff_stack);
 
     // Encode current-street actions
     let mut street_action_codes = ArrayVec::<u8, 6>::new();
@@ -424,7 +421,6 @@ fn make_postflop_decision(
             pot: state.pot,
             stacks: state.stacks,
             spr_bucket: spr,
-            depth_bucket,
             street_action_codes,
         },
     }
@@ -439,8 +435,8 @@ impl GameTree {
     pub fn info_set_key(&self, node_idx: u32, hand_bits: u32) -> u64 {
         let node = &self.nodes[node_idx as usize];
         match &node.node_type {
-            NodeType::Decision { street, spr_bucket, depth_bucket, street_action_codes, .. } => {
-                InfoKey::new(hand_bits, *street, *spr_bucket, *depth_bucket, street_action_codes)
+            NodeType::Decision { street, spr_bucket, street_action_codes, .. } => {
+                InfoKey::new(hand_bits, *street, *spr_bucket, street_action_codes)
                     .as_u64()
             }
             NodeType::Terminal { .. } => 0,
@@ -511,8 +507,8 @@ impl GameTree {
 
         let mut seen = HashSet::new();
         for node in &self.nodes {
-            if let NodeType::Decision { street, spr_bucket, depth_bucket, street_action_codes, .. } = &node.node_type {
-                let key = InfoKey::new(0, *street, *spr_bucket, *depth_bucket, street_action_codes)
+            if let NodeType::Decision { street, spr_bucket, street_action_codes, .. } = &node.node_type {
+                let key = InfoKey::new(0, *street, *spr_bucket, street_action_codes)
                     .as_u64();
                 seen.insert(key);
             }

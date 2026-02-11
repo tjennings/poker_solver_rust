@@ -211,7 +211,7 @@ impl SubgameSolver {
             .collect();
 
         // pot/stack buckets are 0 here — SubgameSolver doesn't track pot state
-        Ok(InfoKey::new(hand_bits, street_num, 0, 0, &action_codes).as_u64())
+        Ok(InfoKey::new(hand_bits, street_num, 0, &action_codes).as_u64())
     }
 }
 
@@ -233,7 +233,6 @@ mod tests {
             u32::from(canonical_hand_index(ak_holding)),
             0,
             0,
-            0,
             &[],
         )
         .as_u64();
@@ -246,7 +245,6 @@ mod tests {
         let ft_key = InfoKey::new(
             u32::from(canonical_hand_index(ft_holding)),
             1,
-            0,
             0,
             &[2, 4], // check, bet(0)
         )
@@ -398,7 +396,6 @@ mod tests {
             u32::from(canonical_hand_index(holding)),
             0,
             0,
-            0,
             &[],
         )
         .as_u64();
@@ -429,7 +426,6 @@ mod tests {
             .expect("should create key");
         let expected = InfoKey::new(
             u32::from(canonical_hand_index(holding)),
-            0,
             0,
             0,
             &[10, 3], // raise(1)=10, call=3

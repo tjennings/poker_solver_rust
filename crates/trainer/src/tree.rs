@@ -58,7 +58,7 @@ fn run_key_describe(
     println!();
     println!("  Street:  {}", capitalize(desc.street_label));
     println!("  Hand:    {} (bits: {:#010x})", desc.hand_label, desc.hand_bits);
-    println!("  SPR:     {}    Depth: {}", desc.spr_bucket, desc.depth_bucket);
+    println!("  SPR:     {}", desc.spr_bucket);
 
     if desc.action_labels.is_empty() {
         println!("  Actions: (none)");

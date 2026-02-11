@@ -139,7 +139,7 @@ fn mccfr_parallel_hunl_postflop() {
 #[timed_test(10)]
 fn hand_class_blueprint_scan_finds_entries() {
     use poker_solver_core::blueprint::BlueprintStrategy;
-    use poker_solver_core::info_key::{depth_bucket, spr_bucket, InfoKey};
+    use poker_solver_core::info_key::{spr_bucket, InfoKey};
 
     let config = PostflopConfig {
         stack_depth: 10,
@@ -166,15 +166,14 @@ fn hand_class_blueprint_scan_finds_entries() {
     println!("Blueprint has {} info sets", blueprint.len());
 
     // After preflop limp (call + check), pot = 4, stacks = [18, 18] (10BB * 2 = 20)
-    // spr_bucket = min(18*2/4, 31) = 9, depth_bucket = min(18/13, 15) = 1
+    // spr_bucket = min(18*2/4, 31) = 9
     // street = Flop (1), action_codes = [] (first action on flop)
     let spr_b = spr_bucket(4, 18);
-    let depth_b = depth_bucket(18);
     let street_num = 1u8; // Flop
     let action_codes: &[u8] = &[];
 
     let position_key =
-        InfoKey::new(0, street_num, spr_b, depth_b, action_codes).as_u64();
+        InfoKey::new(0, street_num, spr_b, action_codes).as_u64();
     let position_mask: u64 = (1u64 << 44) - 1;
 
     let matches: Vec<(u64, u32)> = blueprint
@@ -191,23 +190,23 @@ fn hand_class_blueprint_scan_finds_entries() {
         matches.len()
     );
 
-    // Also try scanning for all flop keys regardless of pot/stack bucket
+    // Also try scanning for all flop keys regardless of SPR bucket
     let street_mask: u64 = 0x3u64 << 42; // just the street bits
     let street_key: u64 = (u64::from(street_num) & 0x3) << 42;
-    let flop_keys: Vec<(u32, u32)> = blueprint
+    let flop_keys: Vec<u32> = blueprint
         .iter()
         .filter(|(k, _)| (*k & street_mask) == street_key)
         .map(|(k, _)| {
             let decoded = InfoKey::from_raw(*k);
-            (decoded.spr_bucket(), decoded.depth_bucket())
+            decoded.spr_bucket()
         })
         .collect();
 
     println!(
-        "Total flop keys: {}, pot/stack buckets seen: {:?}",
+        "Total flop keys: {}, SPR buckets seen: {:?}",
         flop_keys.len(),
         {
-            let mut unique: Vec<(u32, u32)> = flop_keys.clone();
+            let mut unique: Vec<u32> = flop_keys.clone();
             unique.sort();
             unique.dedup();
             unique
@@ -223,7 +222,7 @@ fn hand_class_blueprint_scan_finds_entries() {
     // If no exact matches, that's a bucket mismatch - report it
     if matches.is_empty() {
         println!(
-            "WARNING: No exact match for spr_bucket={spr_b}, depth_bucket={depth_b}. \
+            "WARNING: No exact match for spr_bucket={spr_b}. \
              Training used different bucket values."
         );
     }

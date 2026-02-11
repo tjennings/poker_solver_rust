@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use poker_solver_core::blueprint::{BlueprintStrategy, BundleConfig, StrategyBundle};
-use poker_solver_core::info_key::{canonical_hand_index_from_str, depth_bucket, spr_bucket, InfoKey};
+use poker_solver_core::info_key::{canonical_hand_index_from_str, spr_bucket, InfoKey};
 
 fn main() {
     let path = std::env::args()
@@ -134,11 +134,10 @@ fn main() {
     // Initial SB opening: SPR and depth buckets vary by config
     let preflop_eff_stack = config.game.stack_depth * 2 - 2;
     let spr_b = spr_bucket(3, preflop_eff_stack);
-    let depth_b = depth_bucket(preflop_eff_stack);
 
     for hand in &probe_hands {
         if let Some(idx) = canonical_hand_index_from_str(hand) {
-            let key = InfoKey::new(u32::from(idx), 0, spr_b, depth_b, &[]).as_u64();
+            let key = InfoKey::new(u32::from(idx), 0, spr_b, &[]).as_u64();
             match blueprint.lookup(key) {
                 Some(probs) => {
                     let s: Vec<String> = probs.iter().map(|p| format!("{p:.3}")).collect();
@@ -188,7 +187,7 @@ fn main() {
 
             if let Some(idx) = canonical_hand_index_from_str(&hand) {
                 let key =
-                    InfoKey::new(u32::from(idx), 0, spr_b, depth_b, &[]).as_u64();
+                    InfoKey::new(u32::from(idx), 0, spr_b, &[]).as_u64();
                 if blueprint.lookup(key).is_some() {
                     found += 1;
                 } else {
@@ -229,14 +228,12 @@ fn main() {
         let limp_stacks = stack_depth * 2 - 2; // Both players have same stack after limp
 
         let spr_b = spr_bucket(limp_pot, limp_stacks);
-        let depth_b = depth_bucket(limp_stacks);
         let street_num = 1u8; // Flop
 
         println!("  pot={limp_pot} spr_bucket={spr_b}");
-        println!("  eff_stack={limp_stacks} depth_bucket={depth_b}");
 
         let position_key =
-            InfoKey::new(0, street_num, spr_b, depth_b, &[]).as_u64();
+            InfoKey::new(0, street_num, spr_b, &[]).as_u64();
         let position_mask: u64 = (1u64 << 44) - 1;
 
         println!("  position_key: {position_key:#018x}");
@@ -257,20 +254,20 @@ fn main() {
             // Try all pot/stack combos for flop street
             let street_mask: u64 = 0x3u64 << 42;
             let street_key: u64 = (u64::from(street_num) & 0x3) << 42;
-            let mut bucket_combos: Vec<(u32, u32)> = blueprint
+            let mut bucket_combos: Vec<u32> = blueprint
                 .iter()
                 .filter(|(k, _)| (**k & street_mask) == street_key)
                 .map(|(k, _)| {
                     let decoded = InfoKey::from_raw(*k);
-                    (decoded.spr_bucket(), decoded.depth_bucket())
+                    decoded.spr_bucket()
                 })
                 .collect();
             bucket_combos.sort();
             bucket_combos.dedup();
 
-            println!("  No exact match! Flop pot/stack buckets in blueprint:");
-            for (pb, sb) in &bucket_combos {
-                println!("    spr_bucket={pb} depth_bucket={sb}");
+            println!("  No exact match! Flop SPR buckets in blueprint:");
+            for pb in &bucket_combos {
+                println!("    spr_bucket={pb}");
             }
         } else {
             // Show some matched hand classifications

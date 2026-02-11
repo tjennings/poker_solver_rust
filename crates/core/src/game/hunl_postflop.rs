@@ -1115,7 +1115,7 @@ impl Game for HunlPostflop {
     }
 
     fn info_set_key(&self, state: &Self::State) -> u64 {
-        use crate::info_key::{InfoKey, canonical_hand_index, depth_bucket, encode_action, encode_hand_v2, spr_bucket};
+        use crate::info_key::{InfoKey, canonical_hand_index, encode_action, encode_hand_v2, spr_bucket};
 
         let holding = state.current_holding();
 
@@ -1176,7 +1176,6 @@ impl Game for HunlPostflop {
 
         let eff_stack = state.stacks[0].min(state.stacks[1]);
         let spr = spr_bucket(state.pot, eff_stack);
-        let depth = depth_bucket(eff_stack);
 
         // Encode current-street actions only
         let mut action_codes = arrayvec::ArrayVec::<u8, 6>::new();
@@ -1186,7 +1185,7 @@ impl Game for HunlPostflop {
             }
         }
 
-        InfoKey::new(hand_bits, street_code, spr, depth, &action_codes).as_u64()
+        InfoKey::new(hand_bits, street_code, spr, &action_codes).as_u64()
     }
 }
 

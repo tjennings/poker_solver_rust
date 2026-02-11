@@ -18,7 +18,7 @@ use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint::{AbstractionModeConfig, BundleConfig, StrategyBundle};
 use poker_solver_core::hand_class::{classify, intra_class_strength, HandClass, HandClassification};
 use poker_solver_core::hands::CanonicalHand;
-use poker_solver_core::info_key::{canonical_hand_index, cards_from_rank_chars, depth_bucket, encode_hand_v2, spr_bucket, InfoKey};
+use poker_solver_core::info_key::{canonical_hand_index, cards_from_rank_chars, encode_hand_v2, spr_bucket, InfoKey};
 use poker_solver_core::showdown_equity;
 use poker_solver_core::poker::{Card, Suit, Value};
 
@@ -828,8 +828,6 @@ pub struct ComboGroupInfo {
     pub street: String,
     /// SPR bucket used for key construction.
     pub spr_bucket: u32,
-    /// Depth bucket used for key construction.
-    pub depth_bucket: u32,
 }
 
 /// Get combo-level classification breakdown for a selected cell.
@@ -877,7 +875,6 @@ pub fn get_combo_classes(
     let pos_state = compute_position_state(&config.game.bet_sizes, &position);
     let street_num = street_to_num(street);
     let spr = spr_bucket(pos_state.pot, pos_state.eff_stack);
-    let depth = depth_bucket(pos_state.eff_stack);
 
     // Group combos by hand bits (classification for hand_class, v2 encoding for hand_class_v2)
     let is_v2 = config.abstraction_mode == AbstractionModeConfig::HandClassV2;
@@ -927,7 +924,6 @@ pub fn get_combo_classes(
                 bits,
                 street_num,
                 spr,
-                depth,
                 &action_codes,
             )
             .as_u64();
@@ -956,7 +952,6 @@ pub fn get_combo_classes(
         blocked_combos,
         street: format!("{street:?}"),
         spr_bucket: spr,
-        depth_bucket: depth,
     })
 }
 
@@ -968,7 +963,6 @@ fn empty_combo_info(hand: &str) -> ComboGroupInfo {
         blocked_combos: 0,
         street: String::new(),
         spr_bucket: 0,
-        depth_bucket: 0,
     }
 }
 
@@ -1226,7 +1220,7 @@ fn action_meets_threshold(
     let hand_bits = hand_bits_at_street(config, rank1, rank2, suited, board, street_idx);
     let street_num = street_idx.min(3) as u8;
     let eff_stack = stacks[0].min(stacks[1]);
-    let key = InfoKey::new(hand_bits, street_num, spr_bucket(pot, eff_stack), depth_bucket(eff_stack), action_codes).as_u64();
+    let key = InfoKey::new(hand_bits, street_num, spr_bucket(pot, eff_stack), action_codes).as_u64();
 
     let strategy = match blueprint.lookup(key) {
         Some(s) => s,
@@ -1607,10 +1601,9 @@ fn lookup_blueprint_strategy(
 ) -> Result<Vec<ActionProb>, String> {
     let street_num = street_to_num(street);
     let spr = spr_bucket(pot, eff_stack);
-    let depth = depth_bucket(eff_stack);
 
     let info_set_key =
-        InfoKey::new(hand_bits, street_num, spr, depth, action_codes).as_u64();
+        InfoKey::new(hand_bits, street_num, spr, action_codes).as_u64();
 
     let probs = blueprint.lookup(info_set_key).ok_or_else(|| {
         format!(

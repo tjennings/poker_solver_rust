@@ -14,7 +14,7 @@ use test_macros::timed_test;
 /// `card`: J=0, Q=1, K=2
 /// `actions`: slice of action chars — 'c'=check, 'b'=bet, 'f'=fold, 'l'=call
 fn kuhn_key(card: u32, actions: &[u8]) -> u64 {
-    InfoKey::new(card, 0, 0, 0, actions).as_u64()
+    InfoKey::new(card, 0, 0, actions).as_u64()
 }
 
 // Kuhn action codes matching kuhn.rs encoding
