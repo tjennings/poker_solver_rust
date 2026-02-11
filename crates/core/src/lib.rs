@@ -12,6 +12,7 @@
 //! - `error` - Error types
 //! - `poker` - Re-exported poker domain types from `rs_poker`
 
+pub mod abstract_game;
 pub mod abstraction;
 pub mod agent;
 pub mod blueprint;

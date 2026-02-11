@@ -38,7 +38,7 @@ fn main() {
 
     // Phase 1: Deal generation
     let t0 = Instant::now();
-    let game = HunlPostflop::new(config, Some(AbstractionMode::HandClass), deal_count);
+    let game = HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
     let deal_time = t0.elapsed();
     println!("[deal generation]  {:?}", deal_time);
 
@@ -88,7 +88,7 @@ fn main() {
         bet_sizes: vec![0.33, 0.67, 1.0, 2.0, 3.0],
         max_raises_per_street: 3,
     };
-    let par_game = HunlPostflop::new(par_config, Some(AbstractionMode::HandClass), deal_count);
+    let par_game = HunlPostflop::new(par_config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
     let mut par_solver = MccfrSolver::with_config(par_game, &mccfr_config);
     par_solver.set_seed(42);
 
@@ -118,7 +118,7 @@ fn main() {
         max_raises_per_street: 3,
     };
     let prune_game =
-        HunlPostflop::new(prune_game_config, Some(AbstractionMode::HandClass), deal_count);
+        HunlPostflop::new(prune_game_config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
     let prune_mccfr_config = MccfrConfig {
         samples_per_iteration: samples,
         pruning: true,

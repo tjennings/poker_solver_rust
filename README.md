@@ -145,6 +145,31 @@ The strategy delta is the average per-info-set sum of absolute differences in ac
 
 If both `convergence_threshold` and `iterations` are set, a warning is printed and `convergence_threshold` takes precedence. At least one of the two must be specified.
 
+#### Exhaustive abstract deals
+
+For `hand_class_v2` mode, you can enumerate **all** abstract deal trajectories instead of sampling randomly. This eliminates Monte Carlo variance entirely — every iteration is a complete traversal of the finite abstract game.
+
+The enumerator walks all hole card pairs × 1,755 canonical flops × all turn/river completions, encodes per-street hand bits, determines showdown winners, and deduplicates into weighted abstract deals. With `strength_bits=0, equity_bits=0`, billions of concrete deals compress to ~1M abstract deals (~100x compression).
+
+```yaml
+training:
+  abstraction_mode: hand_class_v2
+  strength_bits: 0
+  equity_bits: 0
+  exhaustive: true            # generate abstract deals in-memory
+```
+
+Or pre-generate deals to disk and reference them:
+
+```yaml
+training:
+  abstract_deals_dir: ./my_deals/   # load pre-generated deals
+```
+
+Pre-generate with the `generate-deals` command (see below). Use `exhaustive` with the `sequence` or `gpu` solver — MCCFR ignores it.
+
+Higher bit configs produce more unique trajectories and less compression. At 4/4 bits there is essentially no compression, so `exhaustive` is only practical for low-bit configs (0/0 or 1/1).
+
 #### Complete example
 
 ```yaml
@@ -168,6 +193,7 @@ training:
   pruning_warmup_fraction: 0.30
   # convergence_threshold: 0.001     # uncomment to train until converged
   # convergence_check_interval: 100
+  # exhaustive: true                 # uncomment for exhaustive abstract deals (low-bit configs)
 ```
 
 ### 2. Run training
@@ -219,8 +245,10 @@ cargo run -p poker-solver-trainer --features gpu --release -- train -c config.ya
 | Solver | Best for | Deal handling |
 |--------|----------|---------------|
 | `mccfr` | Large games, `ehs2`/`hand_class_v2`, production training | Samples per iteration |
-| `sequence` | Small-medium `hand_class` games, debugging, correctness validation | Full traversal |
+| `sequence` | Small-medium games, exact convergence, `exhaustive` mode | Full traversal (all deals every iteration) |
 | `gpu` | Same as `sequence` but faster, when GPU is available | Full traversal on GPU |
+
+With `exhaustive: true` in the config, `sequence` and `gpu` solvers use weighted abstract deals instead of random concrete deals. This gives exact convergence (no sampling variance) for hand-class abstractions.
 
 Release mode is essential for performance. Training prints progress at 10 checkpoints with exploitability, sample hand strategies, and ETA:
 
@@ -301,6 +329,38 @@ cargo run -p poker-solver-trainer --release -- flops --format csv --output datas
 ```
 
 Omit `--output` to print to stdout.
+
+## Generating Abstract Deals
+
+Pre-generate exhaustive abstract deals for use with the `sequence` or `gpu` solver. This is useful when the generation step is expensive and you want to reuse the same deal set across multiple training runs.
+
+```bash
+# Estimate size without generating
+cargo run -p poker-solver-trainer --release -- generate-deals -c config.yaml -o ./my_deals/ --dry-run
+
+# Generate and save to disk
+cargo run -p poker-solver-trainer --release -- generate-deals -c config.yaml -o ./my_deals/
+```
+
+Options:
+- `-c, --config <FILE>` — Training config YAML (must use `hand_class_v2` abstraction)
+- `-o, --output <DIR>` — Output directory for deal files
+- `--dry-run` — Estimate deal count and memory without generating
+- `-t, --threads <N>` — Thread count for parallel generation (default: all cores)
+
+Output:
+```
+my_deals/
+├── abstract_deals.bin   # Bincode-serialized deal data
+└── manifest.yaml        # Config snapshot and statistics
+```
+
+Then reference the directory in your training config:
+
+```yaml
+training:
+  abstract_deals_dir: ./my_deals/
+```
 
 ## Analyzing the Game Tree
 

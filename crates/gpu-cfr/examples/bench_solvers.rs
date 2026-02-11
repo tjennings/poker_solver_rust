@@ -23,30 +23,29 @@ fn build_deal_infos(game: &HunlPostflop) -> Vec<DealInfo> {
     states
         .iter()
         .map(|state| {
-            let key_p1 = game.info_set_key(state);
-            let hand_bits_p1 = InfoKey::from_raw(key_p1).hand_bits();
+            let hand_bits_p1 = InfoKey::from_raw(game.info_set_key(state)).hand_bits();
 
             let first_action = game.actions(state)[0];
             let next_state = game.next_state(state, first_action);
-            let key_p2 = game.info_set_key(&next_state);
-            let hand_bits_p2 = InfoKey::from_raw(key_p2).hand_bits();
+            let hand_bits_p2 = InfoKey::from_raw(game.info_set_key(&next_state)).hand_bits();
 
-            let p1_wins = match (&state.p1_cache.rank, &state.p2_cache.rank) {
+            let p1_equity = match (&state.p1_cache.rank, &state.p2_cache.rank) {
                 (Some(r1), Some(r2)) => {
                     use std::cmp::Ordering;
                     match r1.cmp(r2) {
-                        Ordering::Greater => Some(true),
-                        Ordering::Less => Some(false),
-                        Ordering::Equal => None,
+                        Ordering::Greater => 1.0,
+                        Ordering::Less => 0.0,
+                        Ordering::Equal => 0.5,
                     }
                 }
-                _ => None,
+                _ => 0.5,
             };
 
             DealInfo {
-                hand_bits_p1,
-                hand_bits_p2,
-                p1_wins,
+                hand_bits_p1: [hand_bits_p1; 4],
+                hand_bits_p2: [hand_bits_p2; 4],
+                p1_equity,
+                weight: 1.0,
             }
         })
         .collect()
@@ -68,7 +67,7 @@ fn bench_mccfr_sequential(
     deal_count: usize,
 ) -> BenchResult {
     let t0 = Instant::now();
-    let game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClass), deal_count);
+    let game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
     let mccfr_config = MccfrConfig {
         samples_per_iteration: samples,
         ..MccfrConfig::default()
@@ -99,7 +98,7 @@ fn bench_mccfr_parallel(
     deal_count: usize,
 ) -> BenchResult {
     let t0 = Instant::now();
-    let game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClass), deal_count);
+    let game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
     let mccfr_config = MccfrConfig {
         samples_per_iteration: samples,
         ..MccfrConfig::default()
@@ -129,7 +128,7 @@ fn bench_sequence(
     deal_count: usize,
 ) -> BenchResult {
     let t0 = Instant::now();
-    let game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClass), deal_count);
+    let game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
     let states = game.initial_states();
     let tree = materialize_postflop(&game, &states[0]);
     let deals = build_deal_infos(&game);
@@ -162,7 +161,7 @@ fn bench_gpu(
     deal_count: usize,
 ) -> Option<BenchResult> {
     let t0 = Instant::now();
-    let game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClass), deal_count);
+    let game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
     let states = game.initial_states();
     let tree = materialize_postflop(&game, &states[0]);
     let deals = build_deal_infos(&game);

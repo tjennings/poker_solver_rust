@@ -146,7 +146,7 @@ fn hand_class_blueprint_scan_finds_entries() {
         bet_sizes: vec![1.0],
         ..PostflopConfig::default()
     };
-    let game = HunlPostflop::new(config, Some(AbstractionMode::HandClass), 200);
+    let game = HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 200);
 
     let mccfr_config = MccfrConfig {
         samples_per_iteration: 50,

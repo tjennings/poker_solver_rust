@@ -446,13 +446,15 @@ impl GameTree {
     /// Compute the P1 utility at a terminal node.
     ///
     /// For fold terminals, utility is determined by who folded and their investment.
-    /// For showdown terminals, `p1_wins` determines who takes the pot.
+    /// For showdown terminals, `p1_equity` determines the expected payoff:
+    /// - 1.0 = P1 wins, 0.0 = P2 wins, 0.5 = tie/split.
+    /// - Fractional values interpolate between win and lose utilities.
     ///
     /// For postflop trees (with `starting_stack > 0`), utility is computed from
     /// pot/stacks in BB (internal units / 2).
     /// For generic trees (with `starting_stack == 0`), pre-computed utilities are used.
     #[must_use]
-    pub fn terminal_utility_p1(&self, node_idx: u32, p1_wins: Option<bool>) -> f64 {
+    pub fn terminal_utility_p1(&self, node_idx: u32, p1_equity: f64) -> f64 {
         let node = &self.nodes[node_idx as usize];
         match &node.node_type {
             NodeType::Terminal {
@@ -461,11 +463,8 @@ impl GameTree {
             } => {
                 // Generic tree: use pre-computed utilities
                 if *starting_stack == 0 {
-                    return match p1_wins {
-                        Some(true) => *utility_p1_wins,
-                        Some(false) => *utility_p1_loses,
-                        None => f64::midpoint(*utility_p1_wins, *utility_p1_loses),
-                    };
+                    return p1_equity * utility_p1_wins
+                        + (1.0 - p1_equity) * utility_p1_loses;
                 }
 
                 // Postflop tree: compute from pot/stacks
@@ -480,17 +479,9 @@ impl GameTree {
                         to_bb(p2_invested)
                     }
                 } else {
-                    match p1_wins {
-                        Some(true) => {
-                            let pot_bb = to_bb(p1_invested + p2_invested);
-                            pot_bb - to_bb(p1_invested)
-                        }
-                        Some(false) => -to_bb(p1_invested),
-                        None => {
-                            let pot_bb = to_bb(p1_invested + p2_invested);
-                            pot_bb / 2.0 - to_bb(p1_invested)
-                        }
-                    }
+                    let win_util = to_bb(p1_invested + p2_invested) - to_bb(p1_invested);
+                    let lose_util = -to_bb(p1_invested);
+                    p1_equity * win_util + (1.0 - p1_equity) * lose_util
                 }
             }
             NodeType::Decision { .. } => 0.0,
@@ -762,7 +753,7 @@ mod tests {
             .find(|&&idx| tree.nodes[idx as usize].action_from_parent == Action::Fold);
 
         if let Some(&fold_idx) = fold_child_idx {
-            let utility = tree.terminal_utility_p1(fold_idx, None);
+            let utility = tree.terminal_utility_p1(fold_idx, 0.5);
             // SB folds preflop: loses 0.5 BB (invested 1 internal unit = 0.5 BB)
             assert!(
                 (utility - (-0.5)).abs() < 0.01,
@@ -780,7 +771,7 @@ mod tests {
             bet_sizes: vec![1.0],
             max_raises_per_street: 2,
         };
-        let game = HunlPostflop::new(config, Some(AbstractionMode::HandClass), 1);
+        let game = HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 1);
         let deals = game.initial_states();
         let tree = materialize_postflop(&game, &deals[0]);
 

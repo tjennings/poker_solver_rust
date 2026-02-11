@@ -48,15 +48,24 @@ impl Default for SequenceCfrConfig {
     }
 }
 
-/// Maps each deal to its hand bits per player and showdown outcome.
+/// Maps each deal to its per-street hand bits, equity, and weight.
+///
+/// Hand bits can differ per street when using hand-class abstractions:
+/// preflop uses canonical hand index, while flop/turn/river use
+/// class-based encodings that depend on the board.
 #[derive(Debug, Clone)]
 pub struct DealInfo {
-    /// Hand bits for P1 (used in info set key computation).
-    pub hand_bits_p1: u32,
-    /// Hand bits for P2.
-    pub hand_bits_p2: u32,
-    /// Showdown result: `Some(true)` if P1 wins, `Some(false)` if P2 wins, `None` for tie.
-    pub p1_wins: Option<bool>,
+    /// Per-street hand bits for P1: `[preflop, flop, turn, river]`.
+    pub hand_bits_p1: [u32; 4],
+    /// Per-street hand bits for P2: `[preflop, flop, turn, river]`.
+    pub hand_bits_p2: [u32; 4],
+    /// P1's showdown equity (0.0 = P2 wins, 0.5 = tie, 1.0 = P1 wins).
+    ///
+    /// For concrete deals this is 0.0, 0.5, or 1.0.
+    /// For abstract deals this can be any value in `[0.0, 1.0]`.
+    pub p1_equity: f64,
+    /// Weight of this deal (1.0 for concrete deals, >1.0 for grouped abstract deals).
+    pub weight: f64,
 }
 
 /// CPU sequence-form CFR solver operating on materialized game trees.
@@ -143,6 +152,35 @@ impl SequenceCfrSolver {
         }
     }
 
+    /// Run `num_iterations` of CFR, streaming deals from a source each iteration.
+    ///
+    /// Use this for large abstract deal sets that don't fit in memory.
+    /// The `deal_source` is called each iteration to produce deal batches.
+    /// The solver's `deals` field is unused in this mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the solver was not created with a single shared tree.
+    pub fn train_streaming<F>(&mut self, num_iterations: u64, deal_source: F)
+    where
+        F: Fn() -> Box<dyn Iterator<Item = Vec<DealInfo>>>,
+    {
+        assert_eq!(self.trees.len(), 1, "Streaming requires single shared tree");
+
+        for _ in 0..num_iterations {
+            let strategy_discount = self.compute_strategy_discount();
+
+            for batch in deal_source() {
+                for deal in &batch {
+                    self.process_single_deal(0, deal, strategy_discount);
+                }
+            }
+
+            self.iterations += 1;
+            self.discount_regrets();
+        }
+    }
+
     /// Number of completed iterations.
     #[must_use]
     pub fn iterations(&self) -> u64 {
@@ -190,37 +228,38 @@ impl SequenceCfrSolver {
 
         for deal_idx in 0..num_deals {
             let tree_idx = if single_tree { 0 } else { deal_idx };
-            let num_nodes = self.trees[tree_idx].nodes.len();
-
-            // Per-node arrays for this deal
-            let mut reach_p1 = vec![0.0_f64; num_nodes];
-            let mut reach_p2 = vec![0.0_f64; num_nodes];
-            let mut utility_p1 = vec![0.0_f64; num_nodes];
-
-            // Root has reach probability 1 for both players
-            reach_p1[0] = 1.0;
-            reach_p2[0] = 1.0;
-
-            // Forward pass: propagate reach probabilities (root → leaves)
-            forward_pass(
-                &self.trees[tree_idx], &self.deals[deal_idx], &self.regret_sum,
-                &mut reach_p1, &mut reach_p2,
-            );
-
-            // Backward pass: propagate utilities (leaves → root) and update regrets
-            backward_pass(
-                &self.trees[tree_idx], &self.deals[deal_idx],
-                &reach_p1, &reach_p2,
-                &mut utility_p1,
-                strategy_discount,
-                &mut self.regret_sum,
-                &mut self.strategy_sum,
-                &mut self.num_actions,
-            );
+            self.process_single_deal(tree_idx, &self.deals[deal_idx].clone(), strategy_discount);
         }
 
         self.iterations += 1;
         self.discount_regrets();
+    }
+
+    /// Process one deal: forward pass, backward pass, regret/strategy update.
+    fn process_single_deal(&mut self, tree_idx: usize, deal: &DealInfo, strategy_discount: f64) {
+        let num_nodes = self.trees[tree_idx].nodes.len();
+
+        let mut reach_p1 = vec![0.0_f64; num_nodes];
+        let mut reach_p2 = vec![0.0_f64; num_nodes];
+        let mut utility_p1 = vec![0.0_f64; num_nodes];
+
+        reach_p1[0] = 1.0;
+        reach_p2[0] = 1.0;
+
+        forward_pass(
+            &self.trees[tree_idx], deal, &self.regret_sum,
+            &mut reach_p1, &mut reach_p2,
+        );
+
+        backward_pass(
+            &self.trees[tree_idx], deal,
+            &reach_p1, &reach_p2,
+            &mut utility_p1,
+            strategy_discount,
+            &mut self.regret_sum,
+            &mut self.strategy_sum,
+            &mut self.num_actions,
+        );
     }
 
     /// Compute DCFR strategy discount: `(t / (t + 1))^γ`.
@@ -251,12 +290,14 @@ impl SequenceCfrSolver {
 }
 
 /// Compute info set key for a node given a deal.
+///
+/// Selects the correct per-street hand bits based on the node's street.
 fn deal_info_key(tree: &GameTree, node_idx: u32, deal: &DealInfo) -> u64 {
     let node = &tree.nodes[node_idx as usize];
-    if let NodeType::Decision { player, .. } = &node.node_type {
+    if let NodeType::Decision { player, street, .. } = &node.node_type {
         let hand_bits = match player {
-            Player::Player1 => deal.hand_bits_p1,
-            Player::Player2 => deal.hand_bits_p2,
+            Player::Player1 => deal.hand_bits_p1[*street as usize],
+            Player::Player2 => deal.hand_bits_p2[*street as usize],
         };
         tree.info_set_key(node_idx, hand_bits)
     } else {
@@ -337,7 +378,7 @@ fn backward_pass(
 
             match &node.node_type {
                 NodeType::Terminal { .. } => {
-                    utility_p1[ni] = tree.terminal_utility_p1(node_idx, deal.p1_wins);
+                    utility_p1[ni] = tree.terminal_utility_p1(node_idx, deal.p1_equity);
                 }
                 NodeType::Decision { player, .. } => {
                     let info_key = deal_info_key(tree, node_idx, deal);
@@ -351,7 +392,7 @@ fn backward_pass(
                     }
                     utility_p1[ni] = node_util;
 
-                    // Compute counterfactual regrets
+                    // Compute counterfactual regrets, scaled by deal weight
                     let (my_reach, opp_reach) = match player {
                         Player::Player1 => (reach_p1[ni], reach_p2[ni]),
                         Player::Player2 => (reach_p2[ni], reach_p1[ni]),
@@ -363,21 +404,19 @@ fn backward_pass(
 
                     for (action_idx, &child_idx) in node.children.iter().enumerate() {
                         let child_util = utility_p1[child_idx as usize];
-                        // For P1: regret = opp_reach * (child_util - node_util)
-                        // For P2: negate because utility is from P1's perspective
                         let cf_regret = match player {
                             Player::Player1 => opp_reach * (child_util - node_util),
                             Player::Player2 => opp_reach * (node_util - child_util),
                         };
-                        regrets[action_idx] += cf_regret;
+                        regrets[action_idx] += cf_regret * deal.weight;
                     }
 
-                    // Accumulate strategy sum (for average strategy)
+                    // Accumulate strategy sum (for average strategy), scaled by weight
                     if strategy_discount > 0.0 {
                         let strat_sums = strategy_sum.entry(info_key)
                             .or_insert_with(|| vec![0.0; num_actions]);
                         for (i, &prob) in strategy.iter().enumerate() {
-                            strat_sums[i] += my_reach * prob * strategy_discount;
+                            strat_sums[i] += my_reach * prob * strategy_discount * deal.weight;
                         }
                     }
                 }
@@ -420,13 +459,15 @@ mod tests {
             let key_p2 = game.info_set_key(&next);
             let hand_bits_p2 = crate::info_key::InfoKey::from_raw(key_p2).hand_bits();
 
-            let p1_wins = Some(hand_bits_p1 > hand_bits_p2);
+            let p1_equity = if hand_bits_p1 > hand_bits_p2 { 1.0 } else { 0.0 };
 
             trees.push(tree);
+            // Kuhn has no per-street variation — same hand bits on all streets.
             deals.push(DealInfo {
-                hand_bits_p1,
-                hand_bits_p2,
-                p1_wins,
+                hand_bits_p1: [hand_bits_p1; 4],
+                hand_bits_p2: [hand_bits_p2; 4],
+                p1_equity,
+                weight: 1.0,
             });
         }
 
@@ -551,6 +592,62 @@ mod tests {
             "Should have at least 4 info sets, got {}",
             strategies.len()
         );
+    }
+
+    #[timed_test]
+    fn streaming_matches_in_memory() {
+        let (trees, deals) = kuhn_trees_and_deals();
+        let config = SequenceCfrConfig::default();
+
+        // In-memory solver
+        let mut mem_solver = SequenceCfrSolver::from_per_deal_trees(
+            trees.clone(), deals.clone(), config.clone(),
+        );
+        mem_solver.train(100);
+
+        // Streaming solver: per-deal trees need one tree per batch entry
+        // For Kuhn, each deal has its own tree, so we need to stream one deal at a time
+        // with the correct tree. Since streaming requires a single shared tree,
+        // we test with a single-tree setup instead.
+        //
+        // For the streaming test, simulate by wrapping deals as single-item batches
+        // using the first Kuhn tree (which won't give correct Kuhn results, but tests
+        // the streaming mechanics work the same as in-memory).
+
+        // Simpler approach: create two identical solvers with same deals/tree
+        // and verify streaming produces same results as in-memory.
+        let game_tree = trees[0].clone();
+        let single_deal = vec![deals[0].clone()];
+
+        let mut mem2 = SequenceCfrSolver::new(
+            game_tree.clone(), single_deal.clone(), config.clone(),
+        );
+        mem2.train(100);
+
+        let deals_for_stream = single_deal.clone();
+        let mut stream_solver = SequenceCfrSolver::new(
+            game_tree, vec![], config,
+        );
+        stream_solver.train_streaming(100, || {
+            Box::new(std::iter::once(deals_for_stream.clone()))
+        });
+
+        // Both should produce identical strategies
+        let mem_strats = mem2.all_strategies();
+        let stream_strats = stream_solver.all_strategies();
+
+        assert_eq!(mem_strats.len(), stream_strats.len(),
+            "Same number of info sets");
+        for (key, mem_probs) in &mem_strats {
+            let stream_probs = stream_strats.get(key)
+                .unwrap_or_else(|| panic!("Missing key {key:#x} in streaming"));
+            for (mp, sp) in mem_probs.iter().zip(stream_probs.iter()) {
+                assert!(
+                    (mp - sp).abs() < 1e-10,
+                    "Strategy mismatch at key {key:#x}: mem={mp}, stream={sp}"
+                );
+            }
+        }
     }
 
     fn strategy_delta(a: &FxHashMap<u64, Vec<f64>>, b: &FxHashMap<u64, Vec<f64>>) -> f64 {

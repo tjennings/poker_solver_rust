@@ -43,11 +43,12 @@ struct GpuNode {
 @group(1) @binding(3) var<storage, read_write> regret_delta: array<atomic<u32>>;
 @group(1) @binding(4) var<storage, read_write> strat_sum_delta: array<atomic<u32>>;
 
-@group(2) @binding(2) var<storage, read_write> deal_p1_wins: array<i32>;
+@group(2) @binding(2) var<storage, read_write> deal_p1_equity: array<f32>;
 @group(2) @binding(3) var<storage, read_write> info_id_lookup: array<u32>;
 @group(2) @binding(4) var<storage, read_write> reach_p1: array<f32>;
 @group(2) @binding(5) var<storage, read_write> reach_p2: array<f32>;
 @group(2) @binding(6) var<storage, read_write> utility_p1: array<f32>;
+@group(2) @binding(7) var<storage, read_write> deal_weight: array<f32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -73,15 +74,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // P2 folded: P1 gains P2's investment
             util = node.p2_invested_bb;
         } else {
-            // Showdown
-            let p1_wins = deal_p1_wins[deal_idx];
-            if p1_wins > 0 {
-                util = node.p2_invested_bb;
-            } else if p1_wins < 0 {
-                util = -node.p1_invested_bb;
-            } else {
-                util = (node.p2_invested_bb - node.p1_invested_bb) * 0.5;
-            }
+            // Showdown: interpolate between win/lose utility using equity
+            let equity = deal_p1_equity[deal_idx];
+            let win_util = node.p2_invested_bb;     // P1 wins: gains P2's investment
+            let lose_util = -node.p1_invested_bb;   // P1 loses: loses own investment
+            util = equity * win_util + (1.0 - equity) * lose_util;
         }
         utility_p1[deal_base + node_idx] = util;
         return;
@@ -111,15 +108,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         my_reach = reach_p2[deal_base + node_idx];
     }
 
+    // Deal weight for scaling regrets and strategy sums
+    let w = deal_weight[deal_idx];
+
     // Accumulate counterfactual regrets via CAS-based atomic f32 add
     for (var a = 0u; a < node.num_children; a++) {
         let child_idx = children_arr[node.first_child + a];
         let child_util = utility_p1[deal_base + child_idx];
         var cf_regret: f32;
         if player == 0u {
-            cf_regret = opp_reach * (child_util - node_util);
+            cf_regret = opp_reach * (child_util - node_util) * w;
         } else {
-            cf_regret = opp_reach * (node_util - child_util);
+            cf_regret = opp_reach * (node_util - child_util) * w;
         }
 
         // Inline atomic f32 add for regret_delta
@@ -138,7 +138,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Accumulate strategy sum (for average strategy)
     if uniforms.strategy_discount > 0.0 {
         for (var a = 0u; a < node.num_children; a++) {
-            let contribution = my_reach * strategy[strat_base + a] * uniforms.strategy_discount;
+            let contribution = my_reach * strategy[strat_base + a] * uniforms.strategy_discount * w;
 
             // Inline atomic f32 add for strat_sum_delta
             let ss_idx = strat_base + a;

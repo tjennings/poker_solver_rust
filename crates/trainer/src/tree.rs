@@ -40,7 +40,6 @@ pub fn run_tree(
 fn abstraction_mode_str(mode: AbstractionModeConfig) -> &'static str {
     match mode {
         AbstractionModeConfig::Ehs2 => "ehs2",
-        AbstractionModeConfig::HandClass => "hand_class",
         AbstractionModeConfig::HandClassV2 => "hand_class_v2",
     }
 }
@@ -146,7 +145,6 @@ fn run_deal_tree(
 
 fn build_abstraction_mode(config: &poker_solver_core::blueprint::BundleConfig) -> Option<AbstractionMode> {
     match config.abstraction_mode {
-        AbstractionModeConfig::HandClass => Some(AbstractionMode::HandClass),
         AbstractionModeConfig::HandClassV2 => Some(AbstractionMode::HandClassV2 {
             strength_bits: config.strength_bits,
             equity_bits: config.equity_bits,

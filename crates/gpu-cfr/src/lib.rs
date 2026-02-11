@@ -151,6 +151,7 @@ pub struct GpuCfrSolver {
     deal_hand_p1_buffer: wgpu::Buffer,
     deal_hand_p2_buffer: wgpu::Buffer,
     deal_p1_wins_buffer: wgpu::Buffer,
+    deal_weight_buffer: wgpu::Buffer,
     info_id_lookup_buffer: wgpu::Buffer,
 
     // Uniform buffer (array of Uniforms, indexed by dynamic offset)
@@ -260,7 +261,9 @@ impl GpuCfrSolver {
             batch_deal_size, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
         let deal_hand_p2_buffer = create_buffer_zeroed(&device, "deal_hand_p2",
             batch_deal_size, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
-        let deal_p1_wins_buffer = create_buffer_zeroed(&device, "deal_p1_wins",
+        let deal_p1_wins_buffer = create_buffer_zeroed(&device, "deal_p1_equity",
+            batch_deal_size, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        let deal_weight_buffer = create_buffer_zeroed(&device, "deal_weight",
             batch_deal_size, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
         let info_id_lookup_buffer = create_buffer_zeroed(&device, "info_id_lookup",
             batch_lookup_size, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
@@ -328,6 +331,7 @@ impl GpuCfrSolver {
             deal_hand_p1_buffer,
             deal_hand_p2_buffer,
             deal_p1_wins_buffer,
+            deal_weight_buffer,
             info_id_lookup_buffer,
             uniform_buffer,
             uniform_stride,
@@ -432,24 +436,16 @@ impl GpuCfrSolver {
     fn upload_batch(&self, deal_offset: usize, batch_count: usize) {
         let n = self.num_nodes as usize;
 
-        // Upload deal data
-        let hand_p1: Vec<u32> = (deal_offset..deal_offset + batch_count)
-            .map(|i| self.deals[i].hand_bits_p1)
+        // Upload deal data (hand_bits not used on GPU — info IDs are pre-computed)
+        let p1_equity: Vec<f32> = (deal_offset..deal_offset + batch_count)
+            .map(|i| self.deals[i].p1_equity as f32)
             .collect();
-        let hand_p2: Vec<u32> = (deal_offset..deal_offset + batch_count)
-            .map(|i| self.deals[i].hand_bits_p2)
-            .collect();
-        let p1_wins: Vec<i32> = (deal_offset..deal_offset + batch_count)
-            .map(|i| match self.deals[i].p1_wins {
-                Some(true) => 1i32,
-                Some(false) => -1i32,
-                None => 0i32,
-            })
+        let deal_weight: Vec<f32> = (deal_offset..deal_offset + batch_count)
+            .map(|i| self.deals[i].weight as f32)
             .collect();
 
-        self.queue.write_buffer(&self.deal_hand_p1_buffer, 0, bytemuck::cast_slice(&hand_p1));
-        self.queue.write_buffer(&self.deal_hand_p2_buffer, 0, bytemuck::cast_slice(&hand_p2));
-        self.queue.write_buffer(&self.deal_p1_wins_buffer, 0, bytemuck::cast_slice(&p1_wins));
+        self.queue.write_buffer(&self.deal_p1_wins_buffer, 0, bytemuck::cast_slice(&p1_equity));
+        self.queue.write_buffer(&self.deal_weight_buffer, 0, bytemuck::cast_slice(&deal_weight));
 
         // Upload info_id_lookup for this batch
         let mut lookup = vec![u32::MAX; batch_count * n];
@@ -674,6 +670,7 @@ impl GpuCfrSolver {
                 entry(4, &self.reach_p1_buffer),
                 entry(5, &self.reach_p2_buffer),
                 entry(6, &self.utility_buffer),
+                entry(7, &self.deal_weight_buffer),
             ],
         })
     }
@@ -838,10 +835,10 @@ fn build_info_set_mapping(
 
     for deal in deals {
         for (node_idx, node) in tree.nodes.iter().enumerate() {
-            if let NodeType::Decision { player, .. } = &node.node_type {
+            if let NodeType::Decision { player, street, .. } = &node.node_type {
                 let hand_bits = match player {
-                    Player::Player1 => deal.hand_bits_p1,
-                    Player::Player2 => deal.hand_bits_p2,
+                    Player::Player1 => deal.hand_bits_p1[*street as usize],
+                    Player::Player2 => deal.hand_bits_p2[*street as usize],
                 };
                 hand_classes_seen.insert(hand_bits);
 
@@ -871,10 +868,10 @@ fn precompute_deal_info_ids(
     deals.iter().map(|deal| {
         let mut ids = vec![u32::MAX; num_nodes];
         for (node_idx, node) in tree.nodes.iter().enumerate() {
-            if let NodeType::Decision { player, .. } = &node.node_type {
+            if let NodeType::Decision { player, street, .. } = &node.node_type {
                 let hand_bits = match player {
-                    Player::Player1 => deal.hand_bits_p1,
-                    Player::Player2 => deal.hand_bits_p2,
+                    Player::Player1 => deal.hand_bits_p1[*street as usize],
+                    Player::Player2 => deal.hand_bits_p2[*street as usize],
                 };
                 let key = tree.info_set_key(node_idx as u32, hand_bits);
                 if let Some(&dense_id) = key_to_dense.get(&key) {
@@ -954,11 +951,12 @@ fn create_group2_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         entries: &[
             layout_entry(0, storage_rw()), // deal_hand_p1
             layout_entry(1, storage_rw()), // deal_hand_p2
-            layout_entry(2, storage_rw()), // deal_p1_wins
+            layout_entry(2, storage_rw()), // deal_p1_equity
             layout_entry(3, storage_rw()), // info_id_lookup
             layout_entry(4, storage_rw()), // reach_p1
             layout_entry(5, storage_rw()), // reach_p2
             layout_entry(6, storage_rw()), // utility
+            layout_entry(7, storage_rw()), // deal_weight
         ],
     })
 }
@@ -1047,31 +1045,37 @@ mod tests {
             bet_sizes: vec![1.0],
             max_raises_per_street: 2,
         };
-        let game = HunlPostflop::new(config, Some(AbstractionMode::HandClass), 42);
+        let game = HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 {
+            strength_bits: 0,
+            equity_bits: 0,
+        }), 42);
         let states = game.initial_states();
 
         let deals: Vec<DealInfo> = states.iter().take(100).map(|state| {
-            let key_p1 = game.info_set_key(state);
-            let hand_bits_p1 = InfoKey::from_raw(key_p1).hand_bits();
+            let hand_bits_p1 = InfoKey::from_raw(game.info_set_key(state)).hand_bits();
 
             let first_action = game.actions(state)[0];
             let next_state = game.next_state(state, first_action);
-            let key_p2 = game.info_set_key(&next_state);
-            let hand_bits_p2 = InfoKey::from_raw(key_p2).hand_bits();
+            let hand_bits_p2 = InfoKey::from_raw(game.info_set_key(&next_state)).hand_bits();
 
-            let p1_wins = match (&state.p1_cache.rank, &state.p2_cache.rank) {
+            let p1_equity = match (&state.p1_cache.rank, &state.p2_cache.rank) {
                 (Some(r1), Some(r2)) => {
                     use std::cmp::Ordering;
-                    match r1.cmp(&r2) {
-                        Ordering::Greater => Some(true),
-                        Ordering::Less => Some(false),
-                        Ordering::Equal => None,
+                    match r1.cmp(r2) {
+                        Ordering::Greater => 1.0,
+                        Ordering::Less => 0.0,
+                        Ordering::Equal => 0.5,
                     }
                 }
-                _ => None,
+                _ => 0.5,
             };
 
-            DealInfo { hand_bits_p1, hand_bits_p2, p1_wins }
+            DealInfo {
+                hand_bits_p1: [hand_bits_p1; 4],
+                hand_bits_p2: [hand_bits_p2; 4],
+                p1_equity,
+                weight: 1.0,
+            }
         }).collect();
 
         (game, deals)

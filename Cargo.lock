@@ -2927,6 +2927,7 @@ dependencies = [
 name = "poker-solver-trainer"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "clap",
  "indicatif",
  "poker-solver-core",

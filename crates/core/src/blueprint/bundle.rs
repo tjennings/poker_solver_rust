@@ -27,17 +27,19 @@ pub enum AbstractionModeConfig {
     /// EHS2-based bucketing (expensive Monte Carlo, fine-grained).
     #[default]
     Ehs2,
-    /// Hand-class bucketing via `classify()` (O(1), interpretable).
-    HandClass,
     /// Hand-class V2: class ID + intra-class strength + equity bin + draw flags.
+    ///
+    /// With `strength_bits=0, equity_bits=0`, equivalent to the old `hand_class` mode.
+    /// Legacy configs with `hand_class` are deserialized as `HandClassV2`.
+    #[serde(alias = "hand_class")]
     HandClassV2,
 }
 
 impl AbstractionModeConfig {
-    /// Returns true if this mode uses hand-class based bucketing (v1 or v2).
+    /// Returns true if this mode uses hand-class based bucketing.
     #[must_use]
     pub fn is_hand_class(self) -> bool {
-        matches!(self, Self::HandClass | Self::HandClassV2)
+        matches!(self, Self::HandClassV2)
     }
 }
 
@@ -266,7 +268,7 @@ mod tests {
                 ..PostflopConfig::default()
             },
             abstraction: None,
-            abstraction_mode: AbstractionModeConfig::HandClass,
+            abstraction_mode: AbstractionModeConfig::HandClassV2,
             strength_bits: 0,
             equity_bits: 0,
         };
@@ -287,7 +289,7 @@ mod tests {
 
         let loaded = StrategyBundle::load(&bundle_path).expect("load should succeed");
         assert!(loaded.boundaries.is_none());
-        assert_eq!(loaded.config.abstraction_mode, AbstractionModeConfig::HandClass);
+        assert_eq!(loaded.config.abstraction_mode, AbstractionModeConfig::HandClassV2);
     }
 
     #[timed_test]
