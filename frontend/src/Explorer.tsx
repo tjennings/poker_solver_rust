@@ -428,8 +428,6 @@ function CardPicker({
 }
 
 // Street transition block (FLOP, TURN, RIVER)
-const SUIT_DISPLAY: Record<string, string> = { s: '♠', h: '♥', d: '♦', c: '♣' };
-
 function StreetBlock({
   street,
   pot,
@@ -445,8 +443,6 @@ function StreetBlock({
   onHeaderClick?: () => void;
   remapInfo?: { original: string[]; canonical: string[]; suitMap: Record<string, string> } | null;
 }) {
-  const [showRemap, setShowRemap] = useState(false);
-
   const cardSlots = [];
   for (let i = 0; i < expectedCards; i++) {
     cardSlots.push(
@@ -459,6 +455,17 @@ function StreetBlock({
 
   const hasRemap = remapInfo && Object.keys(remapInfo.suitMap).length > 0;
 
+  // Extract original cards for this street from the accumulated remap info
+  const originalCards = hasRemap
+    ? remapInfo!.original.slice(
+        street === 'FLOP' ? 0 : street === 'TURN' ? 3 : 4,
+        street === 'FLOP' ? 3 : street === 'TURN' ? 4 : 5,
+      )
+    : [];
+  // Only show if any card actually differs
+  const showOriginal = originalCards.length > 0 &&
+    originalCards.some((orig, i) => orig !== cards[i]);
+
   return (
     <div className={`street-block ${cards.length === expectedCards ? '' : 'pending'}`}>
       <div
@@ -467,33 +474,16 @@ function StreetBlock({
       >
         <span className="street-name">{street}</span>
         <span className="street-pot">{pot}</span>
-        {hasRemap && (
-          <span
-            className="remap-indicator"
-            onMouseEnter={() => setShowRemap(true)}
-            onMouseLeave={() => setShowRemap(false)}
-            title="Suits remapped to canonical form"
-          >
-            ↔
-          </span>
-        )}
+        {hasRemap && <span className="remap-indicator">↔</span>}
       </div>
       <div className="street-cards">
         {cardSlots}
       </div>
-      {hasRemap && showRemap && (
-        <div className="remap-tooltip">
-          {remapInfo!.original.map((orig, i) => (
-            <span key={i} className="remap-pair">
-              {orig} → {remapInfo!.canonical[i]}
-              {i < remapInfo!.original.length - 1 ? '  ' : ''}
-            </span>
+      {showOriginal && (
+        <div className="street-cards original">
+          {originalCards.map((card, i) => (
+            <StreetCard key={i} card={card} />
           ))}
-          <div className="remap-suits">
-            {Object.entries(remapInfo!.suitMap).map(([from, to]) => (
-              <span key={from}>{SUIT_DISPLAY[from] || from}→{SUIT_DISPLAY[to] || to} </span>
-            ))}
-          </div>
         </div>
       )}
     </div>
