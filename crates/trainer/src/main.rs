@@ -93,6 +93,9 @@ enum SolverMode {
     Mccfr,
     /// Full-traversal sequence-form CFR on materialized game tree.
     Sequence,
+    /// GPU-accelerated sequence-form CFR via wgpu compute shaders.
+    /// Requires `--features gpu` at build time.
+    Gpu,
 }
 
 /// Output format for the flops command.
@@ -210,6 +213,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             match solver {
                 SolverMode::Mccfr => run_mccfr_training(training_config)?,
                 SolverMode::Sequence => run_sequence_training(training_config)?,
+                SolverMode::Gpu => {
+                    #[cfg(feature = "gpu")]
+                    {
+                        run_gpu_training(training_config)?;
+                    }
+                    #[cfg(not(feature = "gpu"))]
+                    {
+                        eprintln!("Error: GPU solver requires `--features gpu` at build time.");
+                        eprintln!("Build with: cargo run -p poker-solver-trainer --features gpu --release -- train ...");
+                        std::process::exit(1);
+                    }
+                }
             }
         }
         Commands::TreeStats { config, sample_deals } => {
@@ -783,6 +798,228 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     println!("Total time: {:?}", training_start.elapsed());
 
     Ok(())
+}
+
+#[cfg(feature = "gpu")]
+fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
+    use poker_solver_gpu_cfr::{GpuCfrConfig, GpuCfrSolver};
+
+    let abs_mode = config.training.abstraction_mode;
+    let abstraction_mode = build_abstraction_mode(&config);
+
+    println!("=== Poker Blueprint Trainer (GPU CFR) ===\n");
+    println!("Game config:");
+    println!("  Stack depth: {} BB", config.game.stack_depth);
+    println!("  Bet sizes: {:?} pot", config.game.bet_sizes);
+    println!("  Deal pool size: {}", config.training.deal_count);
+    println!();
+
+    let iterations = if let Some(threshold) = config.training.convergence_threshold {
+        println!("Convergence mode: delta < {threshold:.6}");
+        u64::MAX
+    } else if config.training.iterations > 0 {
+        config.training.iterations
+    } else {
+        return Err("Either iterations or convergence_threshold must be set".into());
+    };
+
+    // Create game with deal pool
+    let mut game = HunlPostflop::new(config.game.clone(), abstraction_mode, config.training.deal_count);
+    if config.training.min_deals_per_class > 0 {
+        game = game.with_stratification(
+            config.training.min_deals_per_class,
+            config.training.max_rejections_per_class,
+        );
+    }
+
+    // Materialize tree from first deal
+    println!("Materializing game tree...");
+    let start = Instant::now();
+    let states = game.initial_states();
+    let tree = materialize_postflop(&game, &states[0]);
+    println!("  {} nodes, done in {:?}", tree.stats.total_nodes, start.elapsed());
+
+    // Build DealInfo for each deal
+    println!("Building deal info for {} deals...", states.len());
+    let start = Instant::now();
+    let deals = build_deal_infos(&game, &states);
+    println!("  Done in {:?}", start.elapsed());
+
+    // Build GPU solver
+    println!("Initializing GPU solver...");
+    let start = Instant::now();
+    let gpu_config = GpuCfrConfig {
+        dcfr_alpha: 1.5,
+        dcfr_beta: 0.5,
+        dcfr_gamma: 2.0,
+        batch_size: 1024,
+    };
+    let mut solver = GpuCfrSolver::new(&tree, deals, gpu_config)?;
+    println!(
+        "  {} info sets, initialized in {:?}\n",
+        solver.num_info_sets(),
+        start.elapsed()
+    );
+
+    // Build bundle config for saves
+    let bundle_config = BundleConfig {
+        game: config.game.clone(),
+        abstraction: config.abstraction.clone(),
+        abstraction_mode: abs_mode,
+        strength_bits: if abs_mode == AbstractionModeConfig::HandClassV2 {
+            config.training.strength_bits
+        } else {
+            0
+        },
+        equity_bits: if abs_mode == AbstractionModeConfig::HandClassV2 {
+            config.training.equity_bits
+        } else {
+            0
+        },
+    };
+
+    let boundaries = None; // GPU solver doesn't use EHS2
+
+    let training_start = Instant::now();
+
+    if let Some(threshold) = config.training.convergence_threshold {
+        let check_interval = config.training.convergence_check_interval;
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] {pos} iters ({per_sec})",
+            )
+            .expect("valid template"),
+        );
+
+        let mut previous: Option<FxHashMap<u64, Vec<f64>>> = None;
+        let mut checkpoint_num = 0u64;
+
+        loop {
+            solver.train_with_callback(check_interval, |_| {
+                pb.inc(1);
+            });
+            checkpoint_num += 1;
+
+            let converged = pb.suspend(|| {
+                let strategies = solver.all_strategies();
+                let delta = previous
+                    .as_ref()
+                    .map(|prev| convergence::strategy_delta(prev, &strategies));
+
+                println!(
+                    "\n=== GPU Check {} ({} iters) info_sets={} delta={} ===",
+                    checkpoint_num,
+                    solver.iterations(),
+                    strategies.len(),
+                    delta.map_or("(first)".to_string(), |d| format!("{d:.6}"))
+                );
+
+                save_gpu_checkpoint(
+                    &solver,
+                    &format!("gpu_checkpoint_{checkpoint_num}"),
+                    &config.training.output_dir,
+                    &bundle_config,
+                    &boundaries,
+                );
+
+                previous = Some(strategies);
+                matches!(delta, Some(d) if d < threshold)
+            });
+
+            if converged {
+                pb.finish_with_message(format!(
+                    "Converged after {} iterations",
+                    solver.iterations()
+                ));
+                break;
+            }
+        }
+    } else {
+        let total = iterations;
+        let checkpoint_interval = (total / 10).max(1);
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} iters ({per_sec}, ETA: {eta})",
+            )
+            .expect("valid template")
+            .progress_chars("=>-"),
+        );
+
+        for checkpoint in 1..=10 {
+            solver.train_with_callback(checkpoint_interval, |_| {
+                pb.inc(1);
+            });
+
+            pb.suspend(|| {
+                let strategies = solver.all_strategies();
+                println!(
+                    "\n=== GPU Checkpoint {}/10 ({}/{} iters) info_sets={} ===",
+                    checkpoint,
+                    checkpoint_interval * checkpoint,
+                    total,
+                    strategies.len()
+                );
+
+                save_gpu_checkpoint(
+                    &solver,
+                    &format!("gpu_checkpoint_{checkpoint}_of_10"),
+                    &config.training.output_dir,
+                    &bundle_config,
+                    &boundaries,
+                );
+            });
+        }
+
+        let trained_so_far = checkpoint_interval * 10;
+        if trained_so_far < total {
+            solver.train_with_callback(total - trained_so_far, |_| {
+                pb.inc(1);
+            });
+        }
+
+        pb.finish_with_message("Training complete");
+    }
+
+    // Save final bundle
+    println!("\nSaving strategy bundle...");
+    let strategies = solver.all_strategies();
+    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
+    println!(
+        "  {} info sets, {} iterations",
+        blueprint.len(),
+        blueprint.iterations_trained()
+    );
+
+    let bundle = StrategyBundle::new(bundle_config, blueprint, boundaries);
+    let output_path = PathBuf::from(&config.training.output_dir);
+    bundle.save(&output_path)?;
+    println!("  Saved to {}/", config.training.output_dir);
+
+    println!("\n=== Training Complete ===");
+    println!("Total time: {:?}", training_start.elapsed());
+
+    Ok(())
+}
+
+#[cfg(feature = "gpu")]
+fn save_gpu_checkpoint(
+    solver: &poker_solver_gpu_cfr::GpuCfrSolver,
+    dir_name: &str,
+    output_dir: &str,
+    bundle_config: &BundleConfig,
+    boundaries: &Option<poker_solver_core::abstraction::BucketBoundaries>,
+) {
+    let dir = PathBuf::from(output_dir).join(dir_name);
+    let strategies = solver.all_strategies();
+    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
+    let bundle = StrategyBundle::new(bundle_config.clone(), blueprint, boundaries.clone());
+
+    match bundle.save(&dir) {
+        Ok(()) => println!("  Saved checkpoint to {}/", dir.display()),
+        Err(e) => eprintln!("  Warning: failed to save checkpoint: {e}"),
+    }
 }
 
 fn build_deal_infos(game: &HunlPostflop, states: &[PostflopState]) -> Vec<DealInfo> {
