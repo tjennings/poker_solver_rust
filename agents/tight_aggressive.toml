@@ -57,23 +57,14 @@ call = 0.25
 "1.0" = 0.4
 allin = 0.15
 
-[classes.NutFlush]
-fold = 0.0
-call = 0.2
-
-[classes.NutFlush.raises]
-"0.5" = 0.15
-"1.0" = 0.4
-allin = 0.25
-
 [classes.Flush]
 fold = 0.0
-call = 0.3
+call = 0.25
 
 [classes.Flush.raises]
-"0.5" = 0.2
+"0.5" = 0.18
 "1.0" = 0.4
-allin = 0.1
+allin = 0.17
 
 [classes.Straight]
 fold = 0.0
@@ -85,32 +76,14 @@ call = 0.35
 allin = 0.05
 
 # --- Strong hands: raise-heavy ---
-[classes.TopSet]
-fold = 0.0
-call = 0.15
-
-[classes.TopSet.raises]
-"0.5" = 0.15
-"1.0" = 0.4
-allin = 0.3
-
 [classes.Set]
 fold = 0.0
-call = 0.25
+call = 0.23
 
 [classes.Set.raises]
-"0.5" = 0.2
-"1.0" = 0.4
-allin = 0.15
-
-[classes.BottomSet]
-fold = 0.0
-call = 0.3
-
-[classes.BottomSet.raises]
-"0.5" = 0.2
-"1.0" = 0.35
-allin = 0.15
+"0.5" = 0.18
+"1.0" = 0.38
+allin = 0.21
 
 [classes.Trips]
 fold = 0.0
@@ -139,51 +112,14 @@ call = 0.3
 "1.0" = 0.35
 allin = 0.1
 
-[classes.TopPairTopKicker]
-fold = 0.0
-call = 0.35
-
-[classes.TopPairTopKicker.raises]
-"0.5" = 0.3
-"1.0" = 0.25
-allin = 0.1
-
-[classes.TopPair]
-fold = 0.05
-call = 0.4
-
-[classes.TopPair.raises]
-"0.5" = 0.3
-"1.0" = 0.2
-allin = 0.05
-
-# --- Medium pairs: mix of actions, still aggressive ---
-[classes.SecondPair]
+[classes.Pair]
 fold = 0.2
-call = 0.45
+call = 0.42
 
-[classes.SecondPair.raises]
-"0.5" = 0.25
-"1.0" = 0.1
-allin = 0.0
-
-[classes.ThirdPair]
-fold = 0.45
-call = 0.35
-
-[classes.ThirdPair.raises]
-"0.5" = 0.15
-"1.0" = 0.05
-allin = 0.0
-
-[classes.LowPair]
-fold = 0.55
-call = 0.3
-
-[classes.LowPair.raises]
-"0.5" = 0.12
-"1.0" = 0.03
-allin = 0.0
+[classes.Pair.raises]
+"0.5" = 0.23
+"1.0" = 0.12
+allin = 0.03
 
 [classes.Underpair]
 fold = 0.6
@@ -204,22 +140,13 @@ call = 0.3
 allin = 0.05
 
 # --- No pair: fold or bluff, rarely flat ---
-[classes.AceHigh]
-fold = 0.45
-call = 0.25
+[classes.HighCard]
+fold = 0.52
+call = 0.2
 
-[classes.AceHigh.raises]
+[classes.HighCard.raises]
 "0.5" = 0.1
-"1.0" = 0.15
-allin = 0.05
-
-[classes.KingHigh]
-fold = 0.6
-call = 0.15
-
-[classes.KingHigh.raises]
-"0.5" = 0.1
-"1.0" = 0.1
+"1.0" = 0.13
 allin = 0.05
 
 # --- Draws: aggressive semi-bluffs ---
@@ -232,23 +159,14 @@ call = 0.25
 "1.0" = 0.4
 allin = 0.15
 
-[classes.FlushDrawNuts]
-fold = 0.0
-call = 0.35
-
-[classes.FlushDrawNuts.raises]
-"0.5" = 0.2
-"1.0" = 0.35
-allin = 0.1
-
 [classes.FlushDraw]
-fold = 0.05
-call = 0.4
+fold = 0.03
+call = 0.38
 
 [classes.FlushDraw.raises]
 "0.5" = 0.2
-"1.0" = 0.3
-allin = 0.05
+"1.0" = 0.32
+allin = 0.07
 
 [classes.BackdoorFlushDraw]
 fold = 0.4

@@ -2,7 +2,7 @@
 //!
 //! Classifies both players' hands on flop, turn, and river for N random
 //! deals and prints per-street frequency tables. Useful for evaluating
-//! whether rare but strategically important classes (NutFlush, StraightFlush,
+//! whether rare but strategically important classes (Flush, StraightFlush,
 //! etc.) appear often enough in the training deal pool.
 //!
 //! When run with `--stratified`, also generates a stratified pool for comparison.
@@ -19,31 +19,22 @@ use poker_solver_core::game::{AbstractionMode, HunlPostflop, PostflopConfig};
 use poker_solver_core::hand_class::{HandClass, classify};
 use poker_solver_core::Game;
 
-/// All 28 hand classes in display order (made hands strongest-first, then draws).
-const ALL_CLASSES: [HandClass; 28] = [
+/// All hand classes in display order (made hands strongest-first, then draws).
+const ALL_CLASSES: [HandClass; HandClass::COUNT] = [
     HandClass::StraightFlush,
     HandClass::FourOfAKind,
     HandClass::FullHouse,
-    HandClass::NutFlush,
     HandClass::Flush,
     HandClass::Straight,
-    HandClass::TopSet,
     HandClass::Set,
-    HandClass::BottomSet,
     HandClass::Trips,
     HandClass::TwoPair,
     HandClass::Overpair,
-    HandClass::TopPairTopKicker,
-    HandClass::TopPair,
-    HandClass::SecondPair,
-    HandClass::ThirdPair,
-    HandClass::LowPair,
+    HandClass::Pair,
     HandClass::Underpair,
     HandClass::Overcards,
-    HandClass::AceHigh,
-    HandClass::KingHigh,
+    HandClass::HighCard,
     HandClass::ComboDraw,
-    HandClass::FlushDrawNuts,
     HandClass::FlushDraw,
     HandClass::BackdoorFlushDraw,
     HandClass::Oesd,
@@ -68,7 +59,7 @@ fn main() {
     };
 
     let start = Instant::now();
-    let game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClass), deal_count);
+    let game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
     let deals = game.initial_states();
     println!("Generated {} base deals in {:?}\n", deals.len(), start.elapsed());
 
@@ -90,7 +81,7 @@ fn main() {
         println!("\n\n--- Stratified Pool (min 50 per class) ---\n");
 
         let start = Instant::now();
-        let strat_game = HunlPostflop::new(config, Some(AbstractionMode::HandClass), deal_count)
+        let strat_game = HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count)
             .with_stratification(50, 500_000);
         let strat_deals = strat_game.initial_states();
         println!("Generated {} stratified deals in {:?}\n", strat_deals.len(), start.elapsed());
@@ -108,8 +99,8 @@ fn main() {
 
 fn count_all_streets(
     deals: &[poker_solver_core::game::PostflopState],
-) -> ([[u64; 28]; 3], [u64; 3]) {
-    let mut counts = [[0u64; 28]; 3];
+) -> ([[u64; HandClass::COUNT]; 3], [u64; 3]) {
+    let mut counts = [[0u64; HandClass::COUNT]; 3];
     let mut no_class = [0u64; 3];
 
     for deal in deals {
@@ -134,7 +125,7 @@ fn count_all_streets(
 fn classify_and_count(
     hole: [poker_solver_core::poker::Card; 2],
     board: &[poker_solver_core::poker::Card],
-    counts: &mut [u64; 28],
+    counts: &mut [u64; HandClass::COUNT],
 ) -> bool {
     if let Ok(classification) = classify(hole, board) {
         for class in classification.iter() {
@@ -146,7 +137,7 @@ fn classify_and_count(
     }
 }
 
-fn print_rare_analysis(counts: &[[u64; 28]; 3], total_per_street: u64) {
+fn print_rare_analysis(counts: &[[u64; HandClass::COUNT]; 3], total_per_street: u64) {
     println!("\nRare class analysis (classes appearing < 1% on river):");
     print_separator();
     println!(
@@ -181,9 +172,9 @@ fn print_comparison_header() {
 
 fn print_comparison_row(
     class: HandClass,
-    base_counts: &[[u64; 28]; 3],
+    base_counts: &[[u64; HandClass::COUNT]; 3],
     base_total: u64,
-    strat_counts: &[[u64; 28]; 3],
+    strat_counts: &[[u64; HandClass::COUNT]; 3],
     strat_total: u64,
 ) {
     let d = class as usize;
@@ -232,7 +223,7 @@ fn print_separator() {
     println!("{}", "-".repeat(56));
 }
 
-fn print_class_row(class: HandClass, counts: &[[u64; 28]; 3], total: u64) {
+fn print_class_row(class: HandClass, counts: &[[u64; HandClass::COUNT]; 3], total: u64) {
     let d = class as usize;
     let pcts: Vec<String> = (0..3)
         .map(|s| {

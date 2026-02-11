@@ -27,7 +27,7 @@ thread_local! {
 }
 
 use crate::agent::{AgentConfig, FrequencyMap};
-use crate::blueprint::{AbstractionModeConfig, BlueprintStrategy, BundleConfig};
+use crate::blueprint::{BlueprintStrategy, BundleConfig};
 use crate::hand_class::{classify, intra_class_strength, HandClass};
 use crate::hands::CanonicalHand;
 use crate::info_key::{canonical_hand_index, encode_hand_v2, spr_bucket, InfoKey};
@@ -147,30 +147,26 @@ impl BlueprintAgent {
             let hole = hole_cards;
             match classify(hole, &board_cards) {
                 Ok(classification) => {
-                    if mode == AbstractionModeConfig::HandClassV2 {
-                        let made_id = classification.strongest_made_id();
-                        let strength = if made_id <= 20 {
-                            let class = HandClass::ALL[made_id as usize];
-                            intra_class_strength(hole, &board_cards, class)
-                        } else {
-                            1
-                        };
-                        let equity = showdown_equity::compute_equity(hole, &board_cards);
-                        let eq_bin = showdown_equity::equity_bin(
-                            equity,
-                            1u8 << self.bundle_config.equity_bits,
-                        );
-                        encode_hand_v2(
-                            made_id,
-                            strength,
-                            eq_bin,
-                            classification.draw_flags(),
-                            self.bundle_config.strength_bits,
-                            self.bundle_config.equity_bits,
-                        )
+                    let made_id = classification.strongest_made_id();
+                    let strength = if HandClass::is_made_hand_id(made_id) {
+                        let class = HandClass::ALL[made_id as usize];
+                        intra_class_strength(hole, &board_cards, class)
                     } else {
-                        classification.bits()
-                    }
+                        1
+                    };
+                    let equity = showdown_equity::compute_equity(hole, &board_cards);
+                    let eq_bin = showdown_equity::equity_bin(
+                        equity,
+                        1u8 << self.bundle_config.equity_bits,
+                    );
+                    encode_hand_v2(
+                        made_id,
+                        strength,
+                        eq_bin,
+                        classification.draw_flags(),
+                        self.bundle_config.strength_bits,
+                        self.bundle_config.equity_bits,
+                    )
                 }
                 Err(_) => 0,
             }
@@ -780,7 +776,7 @@ raise = 0.33
                 ..crate::game::PostflopConfig::default()
             },
             abstraction: None,
-            abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClass,
+            abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClassV2,
             strength_bits: 0,
             equity_bits: 0,
         };
@@ -957,7 +953,7 @@ raise = 0.4
                 ..crate::game::PostflopConfig::default()
             },
             abstraction: None,
-            abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClass,
+            abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClassV2,
             strength_bits: 0,
             equity_bits: 0,
         };
@@ -987,7 +983,7 @@ raise = 0.4
                 ..crate::game::PostflopConfig::default()
             },
             abstraction: None,
-            abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClass,
+            abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClassV2,
             strength_bits: 0,
             equity_bits: 0,
         };

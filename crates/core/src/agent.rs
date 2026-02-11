@@ -386,7 +386,7 @@ fold = 0.33
 call = 0.34
 raise = 0.33
 
-[classes.TopPair]
+[classes.Pair]
 fold = 0.1
 call = 0.5
 raise = 0.4
@@ -415,11 +415,11 @@ fold = 0.33
 call = 0.34
 raise = 0.33
 
-[classes.TopPair]
+[classes.Pair]
 fold = 0.1
 call = 0.5
 
-[classes.TopPair.raises]
+[classes.Pair.raises]
 "0.5" = 0.3
 "1.0" = 0.08
 allin = 0.02
@@ -442,8 +442,8 @@ allin = 0.02
     #[timed_test]
     fn class_override_parsed() {
         let config = AgentConfig::from_toml(MINIMAL_TOML).unwrap();
-        assert!(config.classes.contains_key(&HandClass::TopPair));
-        let tp = &config.classes[&HandClass::TopPair];
+        assert!(config.classes.contains_key(&HandClass::Pair));
+        let tp = &config.classes[&HandClass::Pair];
         assert!((tp.fold - 0.1).abs() < 1e-5);
         assert!((tp.call - 0.5).abs() < 1e-5);
         assert!((tp.raise - 0.4).abs() < 1e-5);
@@ -601,7 +601,7 @@ raise = 2.0
     #[timed_test]
     fn class_override_with_per_size_raises() {
         let config = AgentConfig::from_toml(TOML_WITH_RANGES).unwrap();
-        let tp = &config.classes[&HandClass::TopPair];
+        let tp = &config.classes[&HandClass::Pair];
         assert!((tp.fold - 0.1).abs() < 1e-5);
         assert!((tp.call - 0.5).abs() < 1e-5);
         assert!((tp.raise - 0.4).abs() < 1e-5);
@@ -632,9 +632,9 @@ raise = 0.4
     fn resolve_first_matching_class_wins() {
         let config = AgentConfig::from_toml(MINIMAL_TOML).unwrap();
 
-        // Classification with TopPair should resolve to the TopPair override
+        // Classification with Pair should resolve to the Pair override
         let mut classification = HandClassification::new();
-        classification.add(HandClass::TopPair);
+        classification.add(HandClass::Pair);
         classification.add(HandClass::FlushDraw);
 
         let freq = config.resolve(&classification);
@@ -741,7 +741,7 @@ fold = 0.0
 call = 0.15
 raise = 0.85
 
-[classes.TopPair]
+[classes.Pair]
 fold = 0.05
 call = 0.4
 raise = 0.55
@@ -755,7 +755,7 @@ raise = 0.35
         assert_eq!(config.classes.len(), 4);
         assert!(config.classes.contains_key(&HandClass::StraightFlush));
         assert!(config.classes.contains_key(&HandClass::FourOfAKind));
-        assert!(config.classes.contains_key(&HandClass::TopPair));
+        assert!(config.classes.contains_key(&HandClass::Pair));
         assert!(config.classes.contains_key(&HandClass::Gutshot));
     }
 
@@ -791,7 +791,7 @@ raise = 0.35
             .join("agents/tight_weak.toml");
         let config = AgentConfig::load(&path).unwrap();
         assert_eq!(config.game.stack_depth, 100);
-        assert_eq!(config.classes.len(), 28);
+        assert_eq!(config.classes.len(), 19);
         assert!(config.ranges.contains_key("btn"));
         assert!(config.ranges.contains_key("bb"));
     }
@@ -806,7 +806,7 @@ raise = 0.35
             .join("agents/tight_aggressive.toml");
         let config = AgentConfig::load(&path).unwrap();
         assert_eq!(config.game.stack_depth, 100);
-        assert_eq!(config.classes.len(), 28);
+        assert_eq!(config.classes.len(), 19);
         // TAG should have wide playable range and non-empty raise range
         let btn = config.ranges.get("btn").unwrap();
         assert!(btn.call.len() > 50, "TAG btn call range should be wide, got {}", btn.call.len());
@@ -823,7 +823,7 @@ raise = 0.35
             .join("agents/loose_aggressive.toml");
         let config = AgentConfig::load(&path).unwrap();
         assert_eq!(config.game.stack_depth, 100);
-        assert_eq!(config.classes.len(), 28);
+        assert_eq!(config.classes.len(), 19);
         // LAG default should be raise-heavy
         assert!(config.default.raise > config.default.fold);
     }

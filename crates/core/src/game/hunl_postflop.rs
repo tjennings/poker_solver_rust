@@ -22,12 +22,11 @@ use super::{Action, Actions, Game, Player, ALL_IN};
 pub enum AbstractionMode {
     /// EHS2-based bucketing (expensive Monte Carlo, fine-grained).
     Ehs2(Arc<CardAbstraction>),
-    /// Hand-class bucketing via `classify()` (O(1), interpretable).
-    HandClass,
     /// Hand-class V2: class ID + intra-class strength + equity bin + draw flags.
     ///
     /// `strength_bits` and `equity_bits` control quantization (0-4 each).
-    /// 0 means that dimension is omitted.
+    /// 0 means that dimension is omitted. With both set to 0, this is equivalent
+    /// to the old `HandClass` mode (class ID only).
     HandClassV2 {
         /// Number of bits for intra-class strength (0-4).
         strength_bits: u8,
@@ -260,10 +259,10 @@ fn precompute_strength(holding: [Card; 2], board: &[Card]) -> u8 {
         return 1;
     };
     let made_id = classification.strongest_made_id();
-    if made_id > 20 {
+    if !HandClass::is_made_hand_id(made_id) {
         return 1; // draw-only — no made-hand differentiation
     }
-    // Safe: made_id <= 20 always maps to a valid HandClass discriminant
+    // Safe: made_id < NUM_MADE always maps to a valid HandClass discriminant
     let class = HandClass::ALL[made_id as usize];
     intra_class_strength(holding, board, class)
 }
@@ -563,7 +562,8 @@ impl HunlPostflop {
 
         let mut coverage = count_class_coverage(&deals);
 
-        let mut deficit_classes: Vec<(usize, u8)> = (0u8..28)
+        #[allow(clippy::cast_possible_truncation)]
+        let mut deficit_classes: Vec<(usize, u8)> = (0u8..(HandClass::COUNT as u8))
             .filter(|&i| coverage[i as usize] < min_per_class)
             .map(|i| (min_per_class - coverage[i as usize], i))
             .collect();
@@ -742,18 +742,15 @@ fn generate_one_flop_deal(
 }
 
 /// Print a compact summary of per-class deal coverage.
-fn print_coverage_summary(coverage: &[usize; 28]) {
+fn print_coverage_summary(coverage: &[usize; HandClass::COUNT]) {
     use crate::hand_class::HandClass;
     let labels = [
-        "SF", "4K", "FH", "NF", "Fl", "St", "TS", "Se", "BS", "Tr",
-        "2P", "OP", "TK", "TP", "2n", "3r", "LP", "UP", "OC", "AH",
-        "KH", "CD", "FN", "FD", "BF", "OS", "GS", "BD",
+        "SF", "4K", "FH", "Fl", "St", "Se", "Tr",
+        "2P", "OP", "Pr", "UP", "OC", "HC",
+        "CD", "FD", "BF", "OS", "GS", "BD",
     ];
-    let parts: Vec<String> = (0..28)
-        .filter(|&i| {
-            // Only show made-hand classes (discriminants 0..=20)
-            i <= HandClass::KingHigh as usize
-        })
+    let parts: Vec<String> = (0..HandClass::COUNT)
+        .filter(|&i| i < HandClass::NUM_MADE)
         .map(|i| format!("{}={}", labels[i], coverage[i]))
         .collect();
     println!("  Coverage: {}", parts.join(", "));
@@ -787,12 +784,12 @@ fn decode_hole_pair(idx: usize, n: usize) -> (usize, usize) {
     (a, b)
 }
 
-/// Count how many deals cover each of the 28 hand classes on the river.
+/// Count how many deals cover each hand class on the river.
 ///
 /// For each deal, classifies both players' hands against the full 5-card board.
 /// A deal counts toward a class if *either* player has that class.
-fn count_class_coverage(deals: &[PostflopState]) -> [usize; 28] {
-    let mut counts = [0usize; 28];
+fn count_class_coverage(deals: &[PostflopState]) -> [usize; HandClass::COUNT] {
+    let mut counts = [0usize; HandClass::COUNT];
     for deal in deals {
         let Some(board) = deal.full_board else {
             continue;
@@ -879,7 +876,7 @@ impl Game for HunlPostflop {
 
     fn initial_states(&self) -> Vec<Self::State> {
         let mut deals = match &self.abstraction {
-            Some(AbstractionMode::HandClass | AbstractionMode::HandClassV2 { .. }) => {
+            Some(AbstractionMode::HandClassV2 { .. }) => {
                 let base = if self.uniform_deals {
                     self.generate_uniform_deals(self.rng_seed)
                 } else {
@@ -1126,17 +1123,6 @@ impl Game for HunlPostflop {
                     Ok(b) => u32::from(b),
                     Err(_) => 0,
                 }
-            }
-            Some(AbstractionMode::HandClass) if !state.board.is_empty() => {
-                // Use cached classification if available
-                let cached = match state.to_act {
-                    Some(Player::Player2) => state.p2_cache.class,
-                    _ => state.p1_cache.class,
-                };
-                cached.map_or_else(
-                    || classify(holding, &state.board).map_or(0, HandClassification::bits),
-                    HandClassification::bits,
-                )
             }
             Some(AbstractionMode::HandClassV2 { strength_bits, equity_bits })
                 if !state.board.is_empty() =>
@@ -2099,14 +2085,14 @@ mod tests {
     #[timed_test]
     fn count_class_coverage_empty() {
         let coverage = super::count_class_coverage(&[]);
-        assert_eq!(coverage, [0usize; 28]);
+        assert_eq!(coverage, [0usize; HandClass::COUNT]);
     }
 
     #[timed_test]
     fn count_class_coverage_counts_both_players() {
-        // P1: Ah Kh (nut flush on heart board)
-        // P2: 7c 2d (no class on this board)
-        // Board: Qh Jh 5h 3h 2c → P1 has NutFlush, P2 has LowPair (2 pairs 2c)
+        // P1: Ah Kh (flush on heart board)
+        // P2: 7c 2d (low pair on this board)
+        // Board: Qh Jh 5h 3h 2c → P1 has Flush, P2 has Pair (pairs the 2c)
         let p1 = [
             make_card(Value::Ace, Suit::Heart),
             make_card(Value::King, Suit::Heart),
@@ -2125,15 +2111,15 @@ mod tests {
         let deal = PostflopState::new_preflop_with_board(p1, p2, board, 100);
         let coverage = super::count_class_coverage(&[deal]);
 
-        // P1 should have NutFlush
+        // P1 should have Flush
         assert!(
-            coverage[HandClass::NutFlush as usize] > 0,
-            "NutFlush should be counted"
+            coverage[HandClass::Flush as usize] > 0,
+            "Flush should be counted"
         );
-        // P2 pairs the 2 on board → LowPair
+        // P2 pairs the 2 on board → Pair
         assert!(
-            coverage[HandClass::LowPair as usize] > 0,
-            "LowPair should be counted"
+            coverage[HandClass::Pair as usize] > 0,
+            "Pair should be counted"
         );
     }
 
@@ -2145,9 +2131,9 @@ mod tests {
             ..PostflopConfig::default()
         };
         // min=0 means stratification is disabled in initial_states
-        let base_game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClass), 50);
+        let base_game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 50);
         let strat_game =
-            HunlPostflop::new(config, Some(AbstractionMode::HandClass), 50)
+            HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 50)
                 .with_stratification(0, 500_000);
 
         let base = base_game.initial_states();
@@ -2169,10 +2155,10 @@ mod tests {
             ..PostflopConfig::default()
         };
         let game1 =
-            HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClass), 100)
+            HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 100)
                 .with_stratification(2, 10_000);
         let game2 =
-            HunlPostflop::new(config, Some(AbstractionMode::HandClass), 100)
+            HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 100)
                 .with_stratification(2, 10_000);
 
         let deals1 = game1.initial_states();
@@ -2194,7 +2180,7 @@ mod tests {
             ..PostflopConfig::default()
         };
         let game =
-            HunlPostflop::new(config, Some(AbstractionMode::HandClass), 100)
+            HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 100)
                 .with_stratification(2, 10_000);
         let deals = game.initial_states();
 
@@ -2228,7 +2214,7 @@ mod tests {
         };
         let game = HunlPostflop::new(
             config,
-            Some(AbstractionMode::HandClass),
+            Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }),
             200,
         );
 
@@ -2247,7 +2233,7 @@ mod tests {
         );
 
         // Every made-hand class should have coverage >= base
-        for i in 0..=20 {
+        for i in 0..HandClass::NUM_MADE {
             assert!(
                 strat_coverage[i] >= base_coverage[i],
                 "Class {} coverage dropped: strat {} < base {}",
@@ -2268,7 +2254,7 @@ mod tests {
         let min_per_class = 2;
         let game = HunlPostflop::new(
             config,
-            Some(AbstractionMode::HandClass),
+            Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }),
             200,
         );
         let deals = game.generate_stratified_deals(42, 200, min_per_class, 50_000);
@@ -2276,10 +2262,9 @@ mod tests {
 
         // Common classes should easily meet the minimum
         let common = [
-            HandClass::TopPair as usize,
-            HandClass::SecondPair as usize,
+            HandClass::Pair as usize,
             HandClass::TwoPair as usize,
-            HandClass::AceHigh as usize,
+            HandClass::HighCard as usize,
         ];
         for &ci in &common {
             assert!(
@@ -2488,7 +2473,7 @@ mod tests {
     #[timed_test]
     fn with_uniform_deals_builder() {
         let config = PostflopConfig::default();
-        let game = HunlPostflop::new(config, Some(AbstractionMode::HandClass), 1)
+        let game = HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 1)
             .with_uniform_deals();
         assert!(game.uniform_deals);
     }

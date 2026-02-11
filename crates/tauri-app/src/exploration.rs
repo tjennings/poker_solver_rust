@@ -16,7 +16,7 @@ use poker_solver_core::abstraction::{CardAbstraction, Street};
 use poker_solver_core::abstraction::isomorphism::{CanonicalBoard, SuitMapping};
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint::{AbstractionModeConfig, BundleConfig, StrategyBundle};
-use poker_solver_core::hand_class::{classify, intra_class_strength, HandClass, HandClassification};
+use poker_solver_core::hand_class::{classify, intra_class_strength, HandClass};
 use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::info_key::{canonical_hand_index, cards_from_rank_chars, encode_hand_v2, spr_bucket, InfoKey};
 use poker_solver_core::showdown_equity;
@@ -325,8 +325,6 @@ fn get_strategy_matrix_bundle(
             } else {
                 let hand_bits = if mode == AbstractionModeConfig::HandClassV2 {
                     hand_bits_hand_class_v2(config, street, &board, rank1, rank2, suited)
-                } else if mode == AbstractionModeConfig::HandClass {
-                    hand_bits_hand_class(street, &board, rank1, rank2, suited)
                 } else {
                     hand_bits_ehs2(street, rank1, rank2, suited, bucket_cache.as_ref())?
                 };
@@ -805,7 +803,7 @@ fn find_agents_dir() -> Option<PathBuf> {
 pub struct ComboGroup {
     /// Raw `HandClassification` bits.
     pub bits: u32,
-    /// Human-readable class names (e.g. `["TopPair", "FlushDraw"]`).
+    /// Human-readable class names (e.g. `["Pair", "FlushDraw"]`).
     pub class_names: Vec<String>,
     /// Formatted combo strings (e.g. `["A♠K♠", "A♣K♣"]`).
     pub combos: Vec<String>,
@@ -876,15 +874,14 @@ pub fn get_combo_classes(
     let street_num = street_to_num(street);
     let spr = spr_bucket(pos_state.pot, pos_state.eff_stack);
 
-    // Group combos by hand bits (classification for hand_class, v2 encoding for hand_class_v2)
-    let is_v2 = config.abstraction_mode == AbstractionModeConfig::HandClassV2;
+    // Group combos by hand bits (v2 encoding: class_id + strength + equity + draw flags)
     let mut groups_map: std::collections::BTreeMap<u32, Vec<String>> =
         std::collections::BTreeMap::new();
     for combo in &combos {
         let bits = match classify(*combo, &board) {
-            Ok(classification) if is_v2 => {
+            Ok(classification) => {
                 let made_id = classification.strongest_made_id();
-                let strength = if made_id <= 20 {
+                let strength = if HandClass::is_made_hand_id(made_id) {
                     intra_class_strength(
                         *combo,
                         &board,
@@ -907,7 +904,6 @@ pub fn get_combo_classes(
                     config.equity_bits,
                 )
             }
-            Ok(classification) => classification.bits(),
             Err(_) => 0,
         };
         groups_map
@@ -931,11 +927,7 @@ pub fn get_combo_classes(
                 .lookup(key)
                 .map(|s| s.to_vec())
                 .unwrap_or_default();
-            let class_names = if is_v2 {
-                decode_v2_class_names(bits)
-            } else {
-                HandClassification::from_bits(bits).to_strings()
-            };
+            let class_names = decode_v2_class_names(bits);
             ComboGroup {
                 bits,
                 class_names,
@@ -1045,24 +1037,25 @@ fn enumerate_combos(rank1: char, rank2: char, suited: bool, board: &[Card]) -> V
 
 /// Decode v2 packed bits into human-readable class names.
 ///
-/// v2 layout: class_id(5) | strength(4) | equity(4) | draw_flags(7) | spare(8)
+/// v2 layout: class_id(5) | strength(4) | equity(4) | draw_flags(NUM_DRAWS) | spare
 fn decode_v2_class_names(bits: u32) -> Vec<String> {
     let class_id = (bits >> 23) & 0x1F;
-    let draw_flags = (bits >> 8) & 0x7F;
+    let draw_mask = (1u32 << HandClass::NUM_DRAWS) - 1;
+    let draw_flags = (bits >> 8) & draw_mask;
 
     let mut names = Vec::new();
 
-    // Made hand class (discriminants 0-20)
-    if class_id <= 20 {
+    // Made hand class
+    if HandClass::is_made_hand_id(class_id as u8) {
         if let Some(class) = HandClass::from_discriminant(class_id as u8) {
             names.push(class.to_string());
         }
     }
 
-    // Draw classes (discriminants 21-27, mapped from draw_flags bits 0-6)
-    for i in 0u8..7 {
+    // Draw classes (mapped from draw_flags)
+    for i in 0u8..(HandClass::NUM_DRAWS as u8) {
         if draw_flags & (1 << i) != 0 {
-            if let Some(class) = HandClass::from_discriminant(21 + i) {
+            if let Some(class) = HandClass::from_discriminant(HandClass::DRAW_ONLY_ID + i) {
                 names.push(class.to_string());
             }
         }
@@ -1256,7 +1249,7 @@ fn hand_bits_at_street(
     };
     if config.abstraction_mode == AbstractionModeConfig::HandClassV2 {
         let made_id = classification.strongest_made_id();
-        let strength = if made_id <= 20 {
+        let strength = if HandClass::is_made_hand_id(made_id) {
             intra_class_strength([c1, c2], board, HandClass::ALL[made_id as usize])
         } else {
             1
@@ -1646,22 +1639,6 @@ fn hand_bits_ehs2(
     Ok(u32::from(bucket))
 }
 
-/// Compute hand bits for hand_class mode (classify() is O(1)).
-fn hand_bits_hand_class(
-    street: Street,
-    board: &[Card],
-    rank1: char,
-    rank2: char,
-    suited: bool,
-) -> u32 {
-    if street == Street::Preflop {
-        return hand_bits_from_ranks(rank1, rank2, suited);
-    }
-    let (card1, card2) = make_representative_hand(rank1, rank2, suited, board);
-    classify([card1, card2], board)
-        .map_or(0, HandClassification::bits)
-}
-
 /// Compute hand bits for hand_class_v2 mode (classify + strength + equity).
 fn hand_bits_hand_class_v2(
     config: &BundleConfig,
@@ -1678,7 +1655,7 @@ fn hand_bits_hand_class_v2(
     match classify([card1, card2], board) {
         Ok(classification) => {
             let made_id = classification.strongest_made_id();
-            let strength = if made_id <= 20 {
+            let strength = if HandClass::is_made_hand_id(made_id) {
                 intra_class_strength(
                     [card1, card2],
                     board,

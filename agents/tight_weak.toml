@@ -57,23 +57,14 @@ call = 0.7
 "1.0" = 0.08
 allin = 0.02
 
-[classes.NutFlush]
-fold = 0.0
-call = 0.7
-
-[classes.NutFlush.raises]
-"0.5" = 0.2
-"1.0" = 0.08
-allin = 0.02
-
 [classes.Flush]
 fold = 0.0
-call = 0.75
+call = 0.72
 
 [classes.Flush.raises]
 "0.5" = 0.2
-"1.0" = 0.05
-allin = 0.0
+"1.0" = 0.06
+allin = 0.02
 
 [classes.Straight]
 fold = 0.0
@@ -85,32 +76,14 @@ call = 0.75
 allin = 0.0
 
 # --- Strong made hands: call-heavy, rarely raise ---
-[classes.TopSet]
-fold = 0.0
-call = 0.65
-
-[classes.TopSet.raises]
-"0.5" = 0.2
-"1.0" = 0.1
-allin = 0.05
-
 [classes.Set]
 fold = 0.0
-call = 0.7
+call = 0.68
 
 [classes.Set.raises]
 "0.5" = 0.2
-"1.0" = 0.08
-allin = 0.02
-
-[classes.BottomSet]
-fold = 0.0
-call = 0.7
-
-[classes.BottomSet.raises]
-"0.5" = 0.2
-"1.0" = 0.08
-allin = 0.02
+"1.0" = 0.09
+allin = 0.03
 
 [classes.Trips]
 fold = 0.05
@@ -139,51 +112,14 @@ call = 0.75
 "1.0" = 0.05
 allin = 0.0
 
-[classes.TopPairTopKicker]
-fold = 0.05
-call = 0.75
-
-[classes.TopPairTopKicker.raises]
-"0.5" = 0.15
-"1.0" = 0.05
-allin = 0.0
-
-[classes.TopPair]
-fold = 0.1
-call = 0.75
-
-[classes.TopPair.raises]
-"0.5" = 0.12
-"1.0" = 0.03
-allin = 0.0
-
-# --- Medium pairs: call or fold, almost never raise ---
-[classes.SecondPair]
+[classes.Pair]
 fold = 0.3
-call = 0.65
+call = 0.58
 
-[classes.SecondPair.raises]
-"0.5" = 0.05
-"1.0" = 0.0
-allin = 0.0
-
-[classes.ThirdPair]
-fold = 0.5
-call = 0.45
-
-[classes.ThirdPair.raises]
-"0.5" = 0.05
-"1.0" = 0.0
-allin = 0.0
-
-[classes.LowPair]
-fold = 0.6
-call = 0.35
-
-[classes.LowPair.raises]
-"0.5" = 0.05
-"1.0" = 0.0
-allin = 0.0
+[classes.Pair.raises]
+"0.5" = 0.08
+"1.0" = 0.03
+allin = 0.01
 
 [classes.Underpair]
 fold = 0.7
@@ -204,20 +140,11 @@ call = 0.4
 allin = 0.0
 
 # --- No pair: mostly fold ---
-[classes.AceHigh]
-fold = 0.6
-call = 0.35
+[classes.HighCard]
+fold = 0.67
+call = 0.28
 
-[classes.AceHigh.raises]
-"0.5" = 0.05
-"1.0" = 0.0
-allin = 0.0
-
-[classes.KingHigh]
-fold = 0.75
-call = 0.2
-
-[classes.KingHigh.raises]
+[classes.HighCard.raises]
 "0.5" = 0.05
 "1.0" = 0.0
 allin = 0.0
@@ -232,22 +159,13 @@ call = 0.7
 "1.0" = 0.05
 allin = 0.0
 
-[classes.FlushDrawNuts]
-fold = 0.15
-call = 0.7
-
-[classes.FlushDrawNuts.raises]
-"0.5" = 0.1
-"1.0" = 0.05
-allin = 0.0
-
 [classes.FlushDraw]
-fold = 0.3
-call = 0.6
+fold = 0.22
+call = 0.65
 
 [classes.FlushDraw.raises]
-"0.5" = 0.08
-"1.0" = 0.02
+"0.5" = 0.09
+"1.0" = 0.04
 allin = 0.0
 
 [classes.BackdoorFlushDraw]

@@ -9,6 +9,7 @@ use clap::{Parser, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use poker_solver_core::Game;
 use poker_solver_core::HandClass;
+use poker_solver_core::abstract_game::{self, AbstractDealConfig};
 use poker_solver_core::hand_class::HandClassification;
 use poker_solver_core::abstraction::{AbstractionConfig, BoundaryGenerator};
 use poker_solver_core::blueprint::{AbstractionModeConfig, BlueprintStrategy, BundleConfig, StrategyBundle};
@@ -62,6 +63,21 @@ enum Commands {
         /// Number of deals to sample for info set count estimation
         #[arg(long, default_value = "100")]
         sample_deals: usize,
+    },
+    /// Generate exhaustive abstract deals for tabular CFR
+    GenerateDeals {
+        /// Path to YAML config file
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Output directory for abstract deals
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Dry run: estimate deal count without generating
+        #[arg(long)]
+        dry_run: bool,
+        /// Number of threads for parallel generation (default: all cores)
+        #[arg(short, long)]
+        threads: Option<usize>,
     },
     /// Analyze game tree or translate info set keys
     Tree {
@@ -160,6 +176,14 @@ struct TrainingParams {
     /// regrets back above the line between probes.
     #[serde(default)]
     pruning_threshold: f64,
+    /// Use exhaustive abstract deal enumeration instead of random sampling.
+    /// Only valid with `hand_class_v2` abstraction mode.
+    #[serde(default)]
+    exhaustive: bool,
+    /// Pre-generated abstract deals directory. If set, loads deals from disk.
+    /// If absent with `exhaustive: true`, generates in-memory.
+    #[serde(default)]
+    abstract_deals_dir: Option<String>,
 }
 
 fn default_convergence_check_interval() -> u64 {
@@ -227,6 +251,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+        Commands::GenerateDeals { config, output, dry_run, threads } => {
+            if let Some(n) = threads {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build_global()
+                    .expect("failed to configure rayon thread pool");
+            }
+            let yaml = std::fs::read_to_string(&config)?;
+            let training_config: TrainingConfig = serde_yaml::from_str(&yaml)?;
+            run_generate_deals(training_config, &output, dry_run)?;
+        }
         Commands::TreeStats { config, sample_deals } => {
             let yaml = std::fs::read_to_string(&config)?;
             let training_config: TrainingConfig = serde_yaml::from_str(&yaml)?;
@@ -259,7 +294,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     let abs_mode = config.training.abstraction_mode;
-    let use_hand_class = abs_mode == AbstractionModeConfig::HandClass;
     let use_hand_class_v2 = abs_mode == AbstractionModeConfig::HandClassV2;
 
     println!("=== Poker Blueprint Trainer (MCCFR) ===\n");
@@ -274,8 +308,6 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
             "Abstraction: hand_class_v2 (strength_bits={}, equity_bits={})",
             config.training.strength_bits, config.training.equity_bits
         );
-    } else if use_hand_class {
-        println!("Abstraction: hand_class (classify()-based, no EHS2)");
     } else if let Some(ref abs) = config.abstraction {
         println!("Abstraction config:");
         println!("  Flop buckets: {}", abs.flop_buckets);
@@ -337,8 +369,6 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
             strength_bits: config.training.strength_bits,
             equity_bits: config.training.equity_bits,
         })
-    } else if use_hand_class {
-        Some(AbstractionMode::HandClass)
     } else {
         None
     };
@@ -573,6 +603,83 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_generate_deals(
+    config: TrainingConfig,
+    output: &PathBuf,
+    dry_run: bool,
+) -> Result<(), Box<dyn Error>> {
+    let abs_mode = config.training.abstraction_mode;
+    if abs_mode != AbstractionModeConfig::HandClassV2 {
+        return Err("generate-deals requires hand_class_v2 abstraction mode".into());
+    }
+
+    let deal_config = AbstractDealConfig {
+        stack_depth: config.game.stack_depth,
+        strength_bits: config.training.strength_bits,
+        equity_bits: config.training.equity_bits,
+        max_hole_pairs: 0, // all pairs
+    };
+
+    println!("=== Abstract Deal Generator ===\n");
+    println!("Config:");
+    println!("  Stack depth: {} BB", deal_config.stack_depth);
+    println!("  Strength bits: {}", deal_config.strength_bits);
+    println!("  Equity bits: {}", deal_config.equity_bits);
+    println!();
+
+    if dry_run {
+        let (est_abstract, concrete) = abstract_game::estimate_deal_count(&deal_config);
+        println!("Estimated deal counts:");
+        println!("  Concrete: {concrete}");
+        println!("  Abstract: ~{est_abstract}");
+        println!(
+            "  Estimated memory: ~{:.0} MB (at 48 bytes/deal)",
+            est_abstract as f64 * 48.0 / 1_048_576.0
+        );
+        return Ok(());
+    }
+
+    let start = Instant::now();
+    let (deals, stats) = abstract_game::generate_abstract_deals(&deal_config);
+    let elapsed = start.elapsed();
+
+    println!("\nGeneration complete in {elapsed:?}");
+    println!("  Concrete deals: {}", stats.concrete_deals);
+    println!("  Abstract deals: {}", stats.abstract_deals);
+    println!("  Compression: {:.1}x", stats.compression_ratio);
+
+    // Save deals
+    std::fs::create_dir_all(output)?;
+    let deals_path = output.join("abstract_deals.bin");
+    let data = bincode::serialize(&deals.iter().map(|d| {
+        (d.hand_bits_p1, d.hand_bits_p2, d.p1_equity, d.weight)
+    }).collect::<Vec<_>>())?;
+    std::fs::write(&deals_path, &data)?;
+
+    // Save manifest
+    let manifest = serde_yaml::to_string(&serde_yaml::Value::Mapping({
+        let mut m = serde_yaml::Mapping::new();
+        m.insert("stack_depth".into(), config.game.stack_depth.into());
+        m.insert("strength_bits".into(), config.training.strength_bits.into());
+        m.insert("equity_bits".into(), config.training.equity_bits.into());
+        m.insert("concrete_deals".into(), (stats.concrete_deals as i64).into());
+        m.insert("abstract_deals".into(), (stats.abstract_deals as i64).into());
+        m.insert("compression_ratio".into(), serde_yaml::Value::Number(
+            serde_yaml::Number::from(stats.compression_ratio),
+        ));
+        m
+    }))?;
+    std::fs::write(output.join("manifest.yaml"), manifest)?;
+
+    println!("  Saved to {}/", output.display());
+    println!(
+        "  File size: {:.2} MB",
+        data.len() as f64 / 1_048_576.0
+    );
+
+    Ok(())
+}
+
 fn run_tree_stats(config: TrainingConfig, sample_deals: usize) -> Result<(), Box<dyn Error>> {
     println!("=== Game Tree Statistics ===\n");
     println!("Game config:");
@@ -646,12 +753,17 @@ fn run_tree_stats(config: TrainingConfig, sample_deals: usize) -> Result<(), Box
 fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     let abs_mode = config.training.abstraction_mode;
     let abstraction_mode = build_abstraction_mode(&config);
+    let abstraction_for_deals = build_abstraction_mode(&config);
 
     println!("=== Poker Blueprint Trainer (Sequence-Form CFR) ===\n");
     println!("Game config:");
     println!("  Stack depth: {} BB", config.game.stack_depth);
     println!("  Bet sizes: {:?} pot", config.game.bet_sizes);
-    println!("  Deal pool size: {}", config.training.deal_count);
+    if config.training.exhaustive {
+        println!("  Mode: exhaustive abstract deals");
+    } else {
+        println!("  Deal pool size: {}", config.training.deal_count);
+    }
     println!();
 
     let iterations = if let Some(threshold) = config.training.convergence_threshold {
@@ -663,27 +775,37 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         return Err("Either iterations or convergence_threshold must be set".into());
     };
 
-    // Create game with deal pool
-    let mut game = HunlPostflop::new(config.game.clone(), abstraction_mode, config.training.deal_count);
-    if config.training.min_deals_per_class > 0 {
-        game = game.with_stratification(
-            config.training.min_deals_per_class,
-            config.training.max_rejections_per_class,
-        );
-    }
+    // Build deals: either exhaustive abstract or random concrete
+    let deals = if config.training.exhaustive {
+        build_exhaustive_deals(&config)?
+    } else if let Some(ref dir) = config.training.abstract_deals_dir {
+        load_abstract_deals(dir)?
+    } else {
+        let mut game = HunlPostflop::new(config.game.clone(), abstraction_mode.clone(), config.training.deal_count);
+        if config.training.min_deals_per_class > 0 {
+            game = game.with_stratification(
+                config.training.min_deals_per_class,
+                config.training.max_rejections_per_class,
+            );
+        }
+        let states = game.initial_states();
+        println!("Building deal info for {} deals...", states.len());
+        let start = Instant::now();
+        let deals = build_deal_infos(&game, &states, &abstraction_for_deals);
+        println!("  Done in {:?}", start.elapsed());
+        deals
+    };
 
-    // Materialize tree from first deal
+    println!("  {} deals loaded\n", deals.len());
+
+    // Materialize tree (need a game for tree structure)
+    let game = HunlPostflop::new(config.game.clone(), abstraction_mode, 1);
+    let states = game.initial_states();
+
     println!("Materializing game tree...");
     let start = Instant::now();
-    let states = game.initial_states();
     let tree = materialize_postflop(&game, &states[0]);
     println!("  {} nodes, done in {:?}", tree.stats.total_nodes, start.elapsed());
-
-    // Build DealInfo for each deal
-    println!("Building deal info for {} deals...", states.len());
-    let start = Instant::now();
-    let deals = build_deal_infos(&game, &states);
-    println!("  Done in {:?}\n", start.elapsed());
 
     // Build solver
     let seq_config = SequenceCfrConfig {
@@ -806,12 +928,17 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     let abs_mode = config.training.abstraction_mode;
     let abstraction_mode = build_abstraction_mode(&config);
+    let abstraction_for_deals = build_abstraction_mode(&config);
 
     println!("=== Poker Blueprint Trainer (GPU CFR) ===\n");
     println!("Game config:");
     println!("  Stack depth: {} BB", config.game.stack_depth);
     println!("  Bet sizes: {:?} pot", config.game.bet_sizes);
-    println!("  Deal pool size: {}", config.training.deal_count);
+    if config.training.exhaustive {
+        println!("  Mode: exhaustive abstract deals");
+    } else {
+        println!("  Deal pool size: {}", config.training.deal_count);
+    }
     println!();
 
     let iterations = if let Some(threshold) = config.training.convergence_threshold {
@@ -823,27 +950,37 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         return Err("Either iterations or convergence_threshold must be set".into());
     };
 
-    // Create game with deal pool
-    let mut game = HunlPostflop::new(config.game.clone(), abstraction_mode, config.training.deal_count);
-    if config.training.min_deals_per_class > 0 {
-        game = game.with_stratification(
-            config.training.min_deals_per_class,
-            config.training.max_rejections_per_class,
-        );
-    }
+    // Build deals: either exhaustive abstract or random concrete
+    let deals = if config.training.exhaustive {
+        build_exhaustive_deals(&config)?
+    } else if let Some(ref dir) = config.training.abstract_deals_dir {
+        load_abstract_deals(dir)?
+    } else {
+        let mut game = HunlPostflop::new(config.game.clone(), abstraction_mode.clone(), config.training.deal_count);
+        if config.training.min_deals_per_class > 0 {
+            game = game.with_stratification(
+                config.training.min_deals_per_class,
+                config.training.max_rejections_per_class,
+            );
+        }
+        let states = game.initial_states();
+        println!("Building deal info for {} deals...", states.len());
+        let start = Instant::now();
+        let deals = build_deal_infos(&game, &states, &abstraction_for_deals);
+        println!("  Done in {:?}", start.elapsed());
+        deals
+    };
 
-    // Materialize tree from first deal
+    println!("  {} deals loaded\n", deals.len());
+
+    // Materialize tree
+    let game = HunlPostflop::new(config.game.clone(), abstraction_mode, 1);
+    let states = game.initial_states();
+
     println!("Materializing game tree...");
     let start = Instant::now();
-    let states = game.initial_states();
     let tree = materialize_postflop(&game, &states[0]);
     println!("  {} nodes, done in {:?}", tree.stats.total_nodes, start.elapsed());
-
-    // Build DealInfo for each deal
-    println!("Building deal info for {} deals...", states.len());
-    let start = Instant::now();
-    let deals = build_deal_infos(&game, &states);
-    println!("  Done in {:?}", start.elapsed());
 
     // Build GPU solver
     println!("Initializing GPU solver...");
@@ -1023,35 +1160,92 @@ fn save_gpu_checkpoint(
     }
 }
 
-fn build_deal_infos(game: &HunlPostflop, states: &[PostflopState]) -> Vec<DealInfo> {
-    use poker_solver_core::info_key::InfoKey;
-
+fn build_deal_infos(
+    _game: &HunlPostflop,
+    states: &[PostflopState],
+    abstraction: &Option<AbstractionMode>,
+) -> Vec<DealInfo> {
     states.iter().map(|state| {
-        // Get P1 hand bits from info set key (P1 acts first preflop)
-        let key_p1 = game.info_set_key(state);
-        let hand_bits_p1 = InfoKey::from_raw(key_p1).hand_bits();
+        let hand_bits_p1 = compute_per_street_hand_bits(state, true, abstraction);
+        let hand_bits_p2 = compute_per_street_hand_bits(state, false, abstraction);
 
-        // Get P2 hand bits by advancing to P2's first decision
-        let first_action = game.actions(state)[0];
-        let next_state = game.next_state(state, first_action);
-        let key_p2 = game.info_set_key(&next_state);
-        let hand_bits_p2 = InfoKey::from_raw(key_p2).hand_bits();
-
-        // Determine showdown winner using cached ranks
-        let p1_wins = match (&state.p1_cache.rank, &state.p2_cache.rank) {
+        let p1_equity = match (&state.p1_cache.rank, &state.p2_cache.rank) {
             (Some(r1), Some(r2)) => {
                 use std::cmp::Ordering;
                 match r1.cmp(r2) {
-                    Ordering::Greater => Some(true),
-                    Ordering::Less => Some(false),
-                    Ordering::Equal => None, // tie
+                    Ordering::Greater => 1.0,
+                    Ordering::Less => 0.0,
+                    Ordering::Equal => 0.5,
                 }
             }
-            _ => None, // no cached rank, will be computed at terminals
+            _ => 0.5,
         };
 
-        DealInfo { hand_bits_p1, hand_bits_p2, p1_wins }
+        DealInfo {
+            hand_bits_p1,
+            hand_bits_p2,
+            p1_equity,
+            weight: 1.0,
+        }
     }).collect()
+}
+
+/// Compute hand bits for all 4 streets (preflop, flop, turn, river).
+///
+/// Preflop always uses canonical_hand_index. Postflop streets use the
+/// abstraction mode to encode the hand classification.
+fn compute_per_street_hand_bits(
+    state: &PostflopState,
+    is_p1: bool,
+    abstraction: &Option<AbstractionMode>,
+) -> [u32; 4] {
+    use poker_solver_core::hand_class::{classify, intra_class_strength, HandClass};
+    use poker_solver_core::info_key::{canonical_hand_index, encode_hand_v2};
+    use poker_solver_core::showdown_equity;
+
+    let holding = if is_p1 { state.p1_holding } else { state.p2_holding };
+    let preflop_bits = u32::from(canonical_hand_index(holding));
+
+    let Some(full_board) = state.full_board else {
+        return [preflop_bits; 4];
+    };
+
+    let board_slices: [&[poker_solver_core::poker::Card]; 3] = [
+        &full_board[..3],
+        &full_board[..4],
+        &full_board[..5],
+    ];
+
+    let postflop_bits = |board: &[poker_solver_core::poker::Card]| -> u32 {
+        match abstraction {
+            Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }) => {
+                classify(holding, board).map_or(0, |c| c.bits())
+            }
+            Some(AbstractionMode::HandClassV2 { strength_bits, equity_bits }) => {
+                let classification = classify(holding, board).unwrap_or_default();
+                let class_id = classification.strongest_made_id();
+                let draw_flags = classification.draw_flags();
+                let made_id = class_id;
+                let strength = if HandClass::is_made_hand_id(made_id) {
+                    let class = HandClass::ALL[made_id as usize];
+                    intra_class_strength(holding, board, class)
+                } else {
+                    1
+                };
+                let eq = showdown_equity::compute_equity(holding, board);
+                let eq_bin = showdown_equity::equity_bin(eq, 16);
+                encode_hand_v2(class_id, strength, eq_bin, draw_flags, *strength_bits, *equity_bits)
+            }
+            _ => preflop_bits,
+        }
+    };
+
+    [
+        preflop_bits,
+        postflop_bits(board_slices[0]),
+        postflop_bits(board_slices[1]),
+        postflop_bits(board_slices[2]),
+    ]
 }
 
 fn save_sequence_checkpoint(
@@ -1072,6 +1266,47 @@ fn save_sequence_checkpoint(
     }
 }
 
+/// Build abstract deals via exhaustive enumeration.
+fn build_exhaustive_deals(config: &TrainingConfig) -> Result<Vec<DealInfo>, Box<dyn Error>> {
+    if config.training.abstraction_mode != AbstractionModeConfig::HandClassV2 {
+        return Err("Exhaustive deals require hand_class_v2 abstraction mode".into());
+    }
+
+    let deal_config = AbstractDealConfig {
+        stack_depth: config.game.stack_depth,
+        strength_bits: config.training.strength_bits,
+        equity_bits: config.training.equity_bits,
+        max_hole_pairs: 0,
+    };
+
+    println!("Generating exhaustive abstract deals...");
+    let start = Instant::now();
+    let (deals, stats) = abstract_game::generate_abstract_deals(&deal_config);
+    println!(
+        "  {} concrete → {} abstract ({:.1}x compression) in {:?}",
+        stats.concrete_deals, stats.abstract_deals, stats.compression_ratio, start.elapsed()
+    );
+
+    Ok(abstract_game::to_deal_infos(&deals))
+}
+
+/// Load pre-generated abstract deals from a directory.
+fn load_abstract_deals(dir: &str) -> Result<Vec<DealInfo>, Box<dyn Error>> {
+    let deals_path = PathBuf::from(dir).join("abstract_deals.bin");
+    println!("Loading abstract deals from {}...", deals_path.display());
+    let start = Instant::now();
+    let data = std::fs::read(&deals_path)?;
+    let tuples: Vec<([u32; 4], [u32; 4], f64, f64)> = bincode::deserialize(&data)?;
+    let deals: Vec<DealInfo> = tuples.into_iter().map(|(p1, p2, eq, w)| DealInfo {
+        hand_bits_p1: p1,
+        hand_bits_p2: p2,
+        p1_equity: eq,
+        weight: w,
+    }).collect();
+    println!("  {} deals loaded in {:?}", deals.len(), start.elapsed());
+    Ok(deals)
+}
+
 fn build_abstraction_mode(config: &TrainingConfig) -> Option<AbstractionMode> {
     let abs_mode = config.training.abstraction_mode;
     if abs_mode == AbstractionModeConfig::HandClassV2 {
@@ -1079,8 +1314,6 @@ fn build_abstraction_mode(config: &TrainingConfig) -> Option<AbstractionMode> {
             strength_bits: config.training.strength_bits,
             equity_bits: config.training.equity_bits,
         })
-    } else if abs_mode == AbstractionModeConfig::HandClass {
-        Some(AbstractionMode::HandClass)
     } else {
         None
     }
@@ -1484,14 +1717,13 @@ fn negative_regret_stats(regret_sum: &FxHashMap<u64, Vec<f64>>) -> (u64, f64, u6
 
 /// Hand classes to display in the river strategy table (strongest → weakest).
 const RIVER_DISPLAY_CLASSES: &[HandClass] = &[
-    HandClass::NutFlush,
+    HandClass::Flush,
     HandClass::Straight,
-    HandClass::TopSet,
+    HandClass::Set,
     HandClass::TwoPair,
     HandClass::Overpair,
-    HandClass::TopPair,
-    HandClass::SecondPair,
-    HandClass::AceHigh,
+    HandClass::Pair,
+    HandClass::HighCard,
 ];
 
 /// Return the strongest (lowest-discriminant) made-hand class for a hand_bits value,
@@ -1511,14 +1743,13 @@ fn strongest_class(hand_bits: u32, abs_mode: AbstractionModeConfig) -> Option<Ha
 /// Return a short display name for a `HandClass`.
 fn class_label(class: HandClass) -> &'static str {
     match class {
-        HandClass::NutFlush => "NutFlush",
+        HandClass::Flush => "Flush",
         HandClass::Straight => "Straight",
-        HandClass::TopSet => "TopSet",
+        HandClass::Set => "Set",
         HandClass::TwoPair => "TwoPair",
         HandClass::Overpair => "Overpair",
-        HandClass::TopPair => "TopPair",
-        HandClass::SecondPair => "SecondPair",
-        HandClass::AceHigh => "AceHigh",
+        HandClass::Pair => "Pair",
+        HandClass::HighCard => "HighCard",
         other => {
             // Fallback — use the Display impl (leaks a String, acceptable for rare cases)
             Box::leak(other.to_string().into_boxed_str())

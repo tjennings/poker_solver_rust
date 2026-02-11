@@ -15,7 +15,7 @@
 
 use crate::blueprint::BlueprintStrategy;
 use crate::game::{Action, ALL_IN};
-use crate::hand_class::{HandClass, HandClassification};
+use crate::hand_class::HandClass;
 use crate::poker::{Card, Suit, Value};
 
 const HAND_SHIFT: u32 = 36;
@@ -143,10 +143,10 @@ pub fn encode_action(action: Action) -> u8 {
 /// flags into 28 bits:
 ///
 /// ```text
-/// Bits 27-23: Made hand class ID     (5 bits, 0-20, or 21 if draw-only)
+/// Bits 27-23: Made hand class ID     (5 bits, 0-12, or 13 if draw-only)
 /// Bits 22-19: Strength               (4 bits, max — quantized from 1-14)
 /// Bits 18-15: Equity bin             (4 bits, max — quantized from 0-15)
-/// Bits 14-8:  Draw flags             (7 bits, one per draw type)
+/// Bits 14-8:  Draw flags             (6 bits used, 1 spare)
 /// Bits 7-0:   Spare                  (8 bits, zero)
 /// ```
 ///
@@ -182,7 +182,8 @@ pub fn encode_hand_v2(
     bits |= (u32::from(class_id) & 0x1F) << 23;        // 5 bits at 27-23
     bits |= (s & 0xF) << 19;                            // 4 bits at 22-19
     bits |= (e & 0xF) << 15;                            // 4 bits at 18-15
-    bits |= (u32::from(draw_flags) & 0x7F) << 8;        // 7 bits at 14-8
+    let draw_mask = (1u32 << HandClass::NUM_DRAWS) - 1;
+    bits |= (u32::from(draw_flags) & draw_mask) << 8;   // draw bits at 13-8
     bits
 }
 
@@ -337,7 +338,7 @@ pub struct KeyDescription {
     pub raw: u64,
     /// 28-bit hand field.
     pub hand_bits: u32,
-    /// Human-readable hand label (e.g. "AKs", "`TopPair`", "`TopPair`:5:8").
+    /// Human-readable hand label (e.g. "AKs", "`Pair`", "`Pair`:5:8").
     pub hand_label: String,
     /// Street index (0-3).
     pub street: u8,
@@ -477,7 +478,7 @@ pub fn reverse_canonical_index(index: u16) -> &'static str {
 ///
 /// Accepts:
 /// - Hex: `"0x002A400000300000"` or raw hex digits
-/// - Compose: `"hand=TopPair street=flop spr=12 depth=7 actions=check,bet1"`
+/// - Compose: `"hand=Pair street=flop spr=12 spr=7 actions=check,bet1"`
 ///
 /// # Errors
 ///
@@ -644,15 +645,8 @@ fn parse_hand_bits(hand: &str, mode: &str) -> Result<u32, String> {
                 .map(u32::from)
                 .ok_or_else(|| format!("invalid canonical hand: {hand}"))
         }
-        "hand_class" => {
-            // HandClassification from class names, e.g. "TopPair" or "TopPair+FlushDraw"
-            let parts: Vec<&str> = hand.split('+').collect();
-            let cls = HandClassification::from_strings(&parts)
-                .map_err(|e| format!("invalid hand class: {e}"))?;
-            Ok(cls.bits())
-        }
-        "hand_class_v2" => {
-            // Packed format: "TopPair:5:8" = class:strength:equity
+        "hand_class" | "hand_class_v2" => {
+            // Packed format: "Pair:5:8" = class:strength:equity
             parse_hand_class_v2(hand)
         }
         _ => Err(format!("unknown abstraction mode: {mode}")),
@@ -721,19 +715,13 @@ fn hand_label_from_bits(hand_bits: u32, street: u8, mode: &str) -> String {
                 format!("bucket:{hand_bits}")
             }
         }
-        "hand_class" => {
-            let cls = HandClassification::from_bits(hand_bits);
-            if cls.is_empty() {
-                format!("bits:{hand_bits:#x}")
-            } else {
-                cls.to_strings().join("+")
-            }
-        }
-        "hand_class_v2" => {
+        "hand_class" | "hand_class_v2" => {
             let class_id = (hand_bits >> 23) & 0x1F;
             let strength = ((hand_bits >> 19) & 0xF) as u8;
             let equity = ((hand_bits >> 15) & 0xF) as u8;
-            let draw_flags = ((hand_bits >> 8) & 0x7F) as u8;
+            let draw_mask = (1u32 << HandClass::NUM_DRAWS) - 1;
+            #[allow(clippy::cast_possible_truncation)]
+            let draw_flags = ((hand_bits >> 8) & draw_mask) as u8;
 
             let class_name = HandClass::ALL
                 .get(class_id as usize)
@@ -1022,9 +1010,9 @@ mod tests {
 
     #[timed_test]
     fn encode_hand_v2_draw_flags_round_trips() {
-        for flags in [0u8, 0x7F, 0b101_0101, 0b010_1010] {
+        for flags in [0u8, 0x3F, 0b10_1010, 0b01_0101] {
             let bits = encode_hand_v2(0, 1, 0, flags, 0, 0);
-            let extracted = ((bits >> 8) & 0x7F) as u8;
+            let extracted = ((bits >> 8) & 0x3F) as u8;
             assert_eq!(extracted, flags, "draw_flags {flags:#b}");
         }
     }
@@ -1044,7 +1032,7 @@ mod tests {
 
     #[timed_test]
     fn encode_hand_v2_zero_bits_means_omitted() {
-        let bits = encode_hand_v2(5, 14, 15, 0x7F, 0, 0);
+        let bits = encode_hand_v2(5, 14, 15, 0x3F, 0, 0);
         // strength and equity should be zero
         let s = ((bits >> 19) & 0xF) as u8;
         let e = ((bits >> 15) & 0xF) as u8;
@@ -1052,7 +1040,7 @@ mod tests {
         assert_eq!(e, 0, "equity should be 0 when equity_bits=0");
         // class_id and draw_flags should still be present
         assert_eq!((bits >> 23) & 0x1F, 5);
-        assert_eq!((bits >> 8) & 0x7F, 0x7F);
+        assert_eq!((bits >> 8) & 0x3F, 0x3F);
     }
 
     #[timed_test]
@@ -1072,7 +1060,7 @@ mod tests {
     #[timed_test]
     fn encode_hand_v2_fits_in_28_bits() {
         // Max values for all fields
-        let bits = encode_hand_v2(31, 14, 15, 0x7F, 4, 4);
+        let bits = encode_hand_v2(31, 14, 15, 0x3F, 4, 4);
         assert!(bits < (1 << 28), "Encoded value {bits:#010x} exceeds 28 bits");
     }
 
@@ -1195,13 +1183,16 @@ mod tests {
     }
 
     #[timed_test]
-    fn describe_key_hand_class_mode() {
+    fn describe_key_hand_class_v2_mode() {
         let sizes = vec![0.33, 0.67, 1.0];
-        let input = "hand=TopPair street=flop spr=5";
+        let input = "hand=Pair:1:0 street=flop spr=5";
 
-        let desc = describe_key(input, &sizes, "hand_class", None).unwrap();
-        // TopPair = discriminant 13 → bit 13 set → 0x2000
-        let expected_bits = 1u32 << (HandClass::TopPair as u8);
+        let desc = describe_key(input, &sizes, "hand_class_v2", None).unwrap();
+        // Pair = discriminant 9.
+        // parse_hand_class_v2 passes raw strength=1, equity=0 to encode_hand_v2(bits=4,4).
+        // encode_hand_v2 quantizes strength: (1-1).min(13) = 0, so encoded strength = 0.
+        // class_id(5 bits) at bits 23..28 = 9 << 23
+        let expected_bits = 9u32 << 23;
         assert_eq!(desc.hand_bits, expected_bits);
     }
 }
