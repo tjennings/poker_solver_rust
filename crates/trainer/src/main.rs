@@ -110,7 +110,7 @@ struct TrainingParams {
     /// Number of bits for equity bin (0-4). Only used with `hand_class_v2`.
     #[serde(default = "default_equity_bits")]
     equity_bits: u8,
-    /// Enable zero-regret pruning during training.
+    /// Enable regret-based pruning during training.
     #[serde(default)]
     pruning: bool,
     /// Fraction of total iterations to complete before enabling pruning.
@@ -119,6 +119,11 @@ struct TrainingParams {
     /// Run a full un-pruned probe iteration every N iterations.
     #[serde(default = "default_pruning_probe_interval")]
     pruning_probe_interval: u64,
+    /// Regret threshold below which actions are pruned (default 0.0).
+    /// With DCFR, a negative value (e.g. -5.0) lets DCFR decay bring
+    /// regrets back above the line between probes.
+    #[serde(default)]
+    pruning_threshold: f64,
 }
 
 fn default_mccfr_samples() -> usize {
@@ -272,6 +277,7 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         pruning: config.training.pruning,
         pruning_warmup,
         pruning_probe_interval: config.training.pruning_probe_interval,
+        pruning_threshold: config.training.pruning_threshold,
         ..MccfrConfig::default()
     };
 
@@ -279,9 +285,10 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     println!("  DCFR: α={}, β={}, γ={}", mccfr_config.dcfr_alpha, mccfr_config.dcfr_beta, mccfr_config.dcfr_gamma);
     if config.training.pruning {
         println!(
-            "  Pruning: enabled (warmup {:.0}%, probe every {} iters)",
+            "  Pruning: enabled (warmup {:.0}%, probe every {} iters, threshold {:.1})",
             config.training.pruning_warmup_fraction * 100.0,
-            config.training.pruning_probe_interval
+            config.training.pruning_probe_interval,
+            config.training.pruning_threshold,
         );
     }
     let start = Instant::now();

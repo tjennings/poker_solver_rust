@@ -99,12 +99,16 @@ pub struct MccfrSolver<G: Game> {
     dcfr_beta: f64,
     /// DCFR strategy sum discount exponent
     dcfr_gamma: f64,
-    /// Non-positive-regret pruning: skip actions with <= 0 cumulative regret.
+    /// Regret-based pruning: skip actions below the pruning threshold.
     pruning: bool,
     /// Absolute iteration count before pruning activates.
     pruning_warmup: u64,
     /// Run a full un-pruned probe iteration every N iterations.
     pruning_probe_interval: u64,
+    /// Regret threshold below which actions are pruned.
+    /// With DCFR, use a negative value (e.g. -5.0) so that DCFR's
+    /// decay can bring regrets back above the threshold between probes.
+    pruning_threshold: f64,
     /// Number of subtree traversals skipped by pruning.
     pruned_traversals: u64,
     /// Total action traversals attempted (pruned + executed).
@@ -127,13 +131,17 @@ pub struct MccfrConfig {
     pub dcfr_beta: f64,
     /// DCFR strategy sum discount exponent (default 2.0)
     pub dcfr_gamma: f64,
-    /// Enable non-positive-regret pruning (skip actions with cumulative regret <= 0).
+    /// Enable regret-based pruning (skip actions below the threshold).
     pub pruning: bool,
     /// Absolute iteration count to complete before enabling pruning.
     /// Caller should compute from a warmup fraction of total iterations.
     pub pruning_warmup: u64,
     /// Run a full un-pruned probe iteration every N iterations.
     pub pruning_probe_interval: u64,
+    /// Regret threshold below which actions are pruned (default 0.0).
+    /// With DCFR, use a negative value so that decay can bring regrets
+    /// back above this line between probes. Recommended: -5.0 to -20.0.
+    pub pruning_threshold: f64,
 }
 
 impl Default for MccfrConfig {
@@ -146,6 +154,7 @@ impl Default for MccfrConfig {
             pruning: false,
             pruning_warmup: 0,
             pruning_probe_interval: 20,
+            pruning_threshold: 0.0,
         }
     }
 }
@@ -172,6 +181,7 @@ impl<G: Game> MccfrSolver<G> {
             pruning: config.pruning,
             pruning_warmup: config.pruning_warmup,
             pruning_probe_interval: config.pruning_probe_interval.max(1),
+            pruning_threshold: config.pruning_threshold,
             pruned_traversals: 0,
             total_traversals: 0,
         }
@@ -309,7 +319,9 @@ impl<G: Game> MccfrSolver<G> {
     /// Check whether action `action_idx` at `info_set` should be pruned.
     ///
     /// Prunes only when: pruning is enabled, past warmup, not a probe iteration,
-    /// the action has non-positive regret, and at least one sibling has positive regret.
+    /// the action's regret is below the threshold, and at least one sibling has
+    /// positive regret. With DCFR, a negative threshold allows decayed regrets
+    /// to cross back above the line between probes.
     fn should_prune(&self, info_set: u64, action_idx: usize) -> bool {
         if !self.pruning {
             return false;
@@ -322,11 +334,11 @@ impl<G: Game> MccfrSolver<G> {
         }
         match self.regret_sum.get(&info_set) {
             Some(regrets) => {
-                // Only prune if this action has non-positive regret AND at least one
-                // sibling has positive regret. If ALL regrets are <= 0, regret matching
-                // returns uniform — must explore all.
+                // Only prune if this action is below threshold AND at least one
+                // sibling has positive regret. If ALL regrets are below threshold,
+                // regret matching returns uniform — must explore all.
                 let has_positive = regrets.iter().any(|&r| r > 0.0);
-                has_positive && regrets[action_idx] <= 0.0
+                has_positive && regrets[action_idx] <= self.pruning_threshold
             }
             None => false, // No regret data yet — don't prune
         }
@@ -512,22 +524,9 @@ impl<G: Game> MccfrSolver<G> {
                 Player::Player2 => (p1_reach, p2_reach * strategy[sampled_action]),
             };
 
-            // Accumulate opponent's strategy with DCFR discounting
-            if strategy_discount > 0.0 {
-                let opp_reach = match current_player {
-                    Player::Player1 => p1_reach,
-                    Player::Player2 => p2_reach,
-                };
-
-                let strat_sums = self
-                    .strategy_sum
-                    .entry(info_set)
-                    .or_insert_with(|| vec![0.0; num_actions]);
-
-                for i in 0..num_actions {
-                    strat_sums[i] += opp_reach * strategy[i] * sample_weight * strategy_discount;
-                }
-            }
+            // Opponent strategy is NOT accumulated here — it's accumulated
+            // when the opponent is the traversing player on alternating iterations.
+            // Accumulating here would double-count with biased reach weights.
 
             self.cfr_traverse(
                 &next_state,
@@ -575,6 +574,7 @@ impl<G: Game> MccfrSolver<G> {
                 enabled: self.pruning,
                 warmup: self.pruning_warmup,
                 probe_interval: self.pruning_probe_interval,
+                threshold: self.pruning_threshold,
                 iteration: self.iterations,
             };
 
@@ -640,6 +640,7 @@ impl<G: Game> MccfrSolver<G> {
                 enabled: self.pruning,
                 warmup: self.pruning_warmup,
                 probe_interval: self.pruning_probe_interval,
+                threshold: self.pruning_threshold,
                 iteration: self.iterations,
             };
 
@@ -714,6 +715,7 @@ struct PruningCtx {
     enabled: bool,
     warmup: u64,
     probe_interval: u64,
+    threshold: f64,
     iteration: u64,
 }
 
@@ -787,7 +789,7 @@ fn should_prune_snapshot(
     match regret_snapshot.get(&info_set) {
         Some(regrets) => {
             let has_positive = regrets.iter().any(|&r| r > 0.0);
-            has_positive && regrets[action_idx] <= 0.0
+            has_positive && regrets[action_idx] <= pruning.threshold
         }
         None => false,
     }
@@ -906,21 +908,8 @@ fn cfr_traverse_pure<G: Game>(
             Player::Player2 => (p1_reach, p2_reach * strategy[sampled_action]),
         };
 
-        if strategy_discount > 0.0 {
-            let opp_reach = match current_player {
-                Player::Player1 => p1_reach,
-                Player::Player2 => p2_reach,
-            };
-
-            let strat_sums = acc
-                .strategy_deltas
-                .entry(info_set)
-                .or_insert_with(|| vec![0.0; num_actions]);
-
-            for i in 0..num_actions {
-                strat_sums[i] += opp_reach * strategy[i] * sample_weight * strategy_discount;
-            }
-        }
+        // Opponent strategy is NOT accumulated here — it's accumulated
+        // when the opponent is the traversing player on alternating iterations.
 
         cfr_traverse_pure(
             game,
