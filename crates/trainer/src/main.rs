@@ -13,9 +13,12 @@ use poker_solver_core::hand_class::HandClassification;
 use poker_solver_core::abstraction::{AbstractionConfig, BoundaryGenerator};
 use poker_solver_core::blueprint::{AbstractionModeConfig, BlueprintStrategy, BundleConfig, StrategyBundle};
 use poker_solver_core::cfr::convergence;
-use poker_solver_core::cfr::{MccfrConfig, MccfrSolver};
+use poker_solver_core::cfr::{
+    DealInfo, MccfrConfig, MccfrSolver, SequenceCfrConfig, SequenceCfrSolver,
+    materialize_postflop,
+};
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
-use poker_solver_core::game::{AbstractionMode, Action, HunlPostflop, PostflopConfig};
+use poker_solver_core::game::{AbstractionMode, Action, HunlPostflop, PostflopConfig, PostflopState};
 use poker_solver_core::info_key::{canonical_hand_index_from_str, depth_bucket, spr_bucket, InfoKey};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
@@ -38,6 +41,9 @@ enum Commands {
         /// Number of threads for parallel training (default: all cores)
         #[arg(short, long)]
         threads: Option<usize>,
+        /// Solver backend: mccfr (default) or sequence (full-traversal)
+        #[arg(long, default_value = "mccfr")]
+        solver: SolverMode,
     },
     /// List all 1,755 canonical (suit-isomorphic) flops
     Flops {
@@ -47,6 +53,15 @@ enum Commands {
         /// Output file (defaults to stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+    /// Print materialized game tree statistics for a training config
+    TreeStats {
+        /// Path to YAML config file
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Number of deals to sample for info set count estimation
+        #[arg(long, default_value = "100")]
+        sample_deals: usize,
     },
     /// Analyze game tree or translate info set keys
     Tree {
@@ -69,6 +84,15 @@ enum Commands {
         #[arg(long)]
         hand: Option<String>,
     },
+}
+
+/// Solver backend selection.
+#[derive(Debug, Clone, ValueEnum)]
+enum SolverMode {
+    /// External sampling MCCFR with parallel Rayon training (default).
+    Mccfr,
+    /// Full-traversal sequence-form CFR on materialized game tree.
+    Sequence,
 }
 
 /// Output format for the flops command.
@@ -174,7 +198,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Train { config, threads } => {
+        Commands::Train { config, threads, solver } => {
             if let Some(n) = threads {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(n)
@@ -183,7 +207,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let yaml = std::fs::read_to_string(&config)?;
             let training_config: TrainingConfig = serde_yaml::from_str(&yaml)?;
-            run_mccfr_training(training_config)?;
+            match solver {
+                SolverMode::Mccfr => run_mccfr_training(training_config)?,
+                SolverMode::Sequence => run_sequence_training(training_config)?,
+            }
+        }
+        Commands::TreeStats { config, sample_deals } => {
+            let yaml = std::fs::read_to_string(&config)?;
+            let training_config: TrainingConfig = serde_yaml::from_str(&yaml)?;
+            run_tree_stats(training_config, sample_deals)?;
         }
         Commands::Flops { format, output } => {
             run_flops(format, output)?;
@@ -524,6 +556,331 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     println!("Total time: {:?}", training_start.elapsed());
 
     Ok(())
+}
+
+fn run_tree_stats(config: TrainingConfig, sample_deals: usize) -> Result<(), Box<dyn Error>> {
+    println!("=== Game Tree Statistics ===\n");
+    println!("Game config:");
+    println!("  Stack depth: {} BB", config.game.stack_depth);
+    println!("  Bet sizes: {:?} pot", config.game.bet_sizes);
+    println!();
+
+    // Build game with a small deal pool (just need the tree structure)
+    let abs_mode = config.training.abstraction_mode;
+    let abstraction_mode = build_abstraction_mode(&config);
+
+    let game = HunlPostflop::new(config.game.clone(), abstraction_mode, sample_deals);
+    let states = game.initial_states();
+
+    println!("Materializing tree from first deal...");
+    let start = Instant::now();
+    let tree = materialize_postflop(&game, &states[0]);
+    let elapsed = start.elapsed();
+    println!("  Done in {elapsed:?}\n");
+
+    println!("{}", tree.stats);
+
+    let position_keys = tree.unique_position_keys();
+    println!("Unique position keys: {position_keys}");
+    println!("  (action-history positions ignoring hand bits)\n");
+
+    // Estimate info sets for different abstraction sizes
+    let hand_class_count = 28u32;
+    println!("Estimated info sets (upper bound):");
+    println!(
+        "  hand_class ({hand_class_count} classes): {}",
+        tree.estimated_info_sets(hand_class_count)
+    );
+
+    // For hand_class_v2, estimate based on configured bits
+    if abs_mode == AbstractionModeConfig::HandClassV2 {
+        let class_bits = 5u32;
+        let strength_bins = 1u32 << config.training.strength_bits;
+        let equity_bins = 1u32 << config.training.equity_bits;
+        let draw_combos = 128u32; // 7 draw flag bits
+        let v2_combos = (1 << class_bits) * strength_bins * equity_bins * draw_combos;
+        println!(
+            "  hand_class_v2 (s={}, e={}, 7 draw bits): {} (theoretical max)",
+            config.training.strength_bits, config.training.equity_bits,
+            tree.estimated_info_sets(v2_combos)
+        );
+    }
+    println!();
+
+    // Count actual unique info set keys across sampled deals
+    println!("Sampling {sample_deals} deals to count actual info sets...");
+    let start = Instant::now();
+    let actual_info_sets = count_actual_info_sets(&game, &tree, &states, sample_deals);
+    let elapsed = start.elapsed();
+    println!("  Unique info set keys found: {actual_info_sets}");
+    println!("  Done in {elapsed:?}\n");
+
+    // Memory estimates
+    let node_bytes = tree.nodes.len() * std::mem::size_of::<poker_solver_core::cfr::game_tree::TreeNode>();
+    let strategy_bytes_est = actual_info_sets as usize * tree.nodes[0].children.len() * 8;
+    println!("Memory estimates:");
+    println!("  Tree nodes: {:.2} MB", node_bytes as f64 / 1_048_576.0);
+    println!(
+        "  Strategy arrays (f64): {:.2} MB",
+        strategy_bytes_est as f64 / 1_048_576.0
+    );
+
+    Ok(())
+}
+
+fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
+    let abs_mode = config.training.abstraction_mode;
+    let abstraction_mode = build_abstraction_mode(&config);
+
+    println!("=== Poker Blueprint Trainer (Sequence-Form CFR) ===\n");
+    println!("Game config:");
+    println!("  Stack depth: {} BB", config.game.stack_depth);
+    println!("  Bet sizes: {:?} pot", config.game.bet_sizes);
+    println!("  Deal pool size: {}", config.training.deal_count);
+    println!();
+
+    let iterations = if let Some(threshold) = config.training.convergence_threshold {
+        println!("Convergence mode: delta < {threshold:.6}");
+        u64::MAX // will stop when converged
+    } else if config.training.iterations > 0 {
+        config.training.iterations
+    } else {
+        return Err("Either iterations or convergence_threshold must be set".into());
+    };
+
+    // Create game with deal pool
+    let mut game = HunlPostflop::new(config.game.clone(), abstraction_mode, config.training.deal_count);
+    if config.training.min_deals_per_class > 0 {
+        game = game.with_stratification(
+            config.training.min_deals_per_class,
+            config.training.max_rejections_per_class,
+        );
+    }
+
+    // Materialize tree from first deal
+    println!("Materializing game tree...");
+    let start = Instant::now();
+    let states = game.initial_states();
+    let tree = materialize_postflop(&game, &states[0]);
+    println!("  {} nodes, done in {:?}", tree.stats.total_nodes, start.elapsed());
+
+    // Build DealInfo for each deal
+    println!("Building deal info for {} deals...", states.len());
+    let start = Instant::now();
+    let deals = build_deal_infos(&game, &states);
+    println!("  Done in {:?}\n", start.elapsed());
+
+    // Build solver
+    let seq_config = SequenceCfrConfig {
+        dcfr_alpha: 1.5,
+        dcfr_beta: 0.5,
+        dcfr_gamma: 2.0,
+    };
+    let mut solver = SequenceCfrSolver::new(tree, deals, seq_config);
+
+    // Build bundle config for saves
+    let bundle_config = BundleConfig {
+        game: config.game.clone(),
+        abstraction: config.abstraction.clone(),
+        abstraction_mode: abs_mode,
+        strength_bits: if abs_mode == AbstractionModeConfig::HandClassV2 { config.training.strength_bits } else { 0 },
+        equity_bits: if abs_mode == AbstractionModeConfig::HandClassV2 { config.training.equity_bits } else { 0 },
+    };
+
+    let boundaries = None; // sequence solver doesn't use EHS2
+
+    let training_start = Instant::now();
+
+    if let Some(threshold) = config.training.convergence_threshold {
+        let check_interval = config.training.convergence_check_interval;
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] {pos} iters ({per_sec})",
+            )
+            .expect("valid template"),
+        );
+
+        let mut previous: Option<FxHashMap<u64, Vec<f64>>> = None;
+        let mut checkpoint_num = 0u64;
+
+        loop {
+            solver.train_with_callback(check_interval, |_| { pb.inc(1); });
+            checkpoint_num += 1;
+
+            let converged = pb.suspend(|| {
+                let strategies = solver.all_strategies_best_effort();
+                let delta = previous.as_ref()
+                    .map(|prev| convergence::strategy_delta(prev, &strategies));
+
+                println!("\n=== Check {} ({} iters) info_sets={} delta={} ===",
+                    checkpoint_num, solver.iterations(), strategies.len(),
+                    delta.map_or("(first)".to_string(), |d| format!("{d:.6}"))
+                );
+
+                save_sequence_checkpoint(
+                    &solver, &format!("seq_checkpoint_{checkpoint_num}"),
+                    &config.training.output_dir, &bundle_config, &boundaries,
+                );
+
+                previous = Some(strategies);
+                matches!(delta, Some(d) if d < threshold)
+            });
+
+            if converged {
+                pb.finish_with_message(format!("Converged after {} iterations", solver.iterations()));
+                break;
+            }
+        }
+    } else {
+        let total = iterations;
+        let checkpoint_interval = (total / 10).max(1);
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} iters ({per_sec}, ETA: {eta})",
+            )
+            .expect("valid template")
+            .progress_chars("=>-"),
+        );
+
+        for checkpoint in 1..=10 {
+            solver.train_with_callback(checkpoint_interval, |_| { pb.inc(1); });
+
+            pb.suspend(|| {
+                let strategies = solver.all_strategies_best_effort();
+                println!("\n=== Checkpoint {}/10 ({}/{} iters) info_sets={} ===",
+                    checkpoint, checkpoint_interval * checkpoint, total, strategies.len()
+                );
+
+                save_sequence_checkpoint(
+                    &solver, &format!("seq_checkpoint_{checkpoint}_of_10"),
+                    &config.training.output_dir, &bundle_config, &boundaries,
+                );
+            });
+        }
+
+        let trained_so_far = checkpoint_interval * 10;
+        if trained_so_far < total {
+            solver.train_with_callback(total - trained_so_far, |_| { pb.inc(1); });
+        }
+
+        pb.finish_with_message("Training complete");
+    }
+
+    // Save final bundle
+    println!("\nSaving strategy bundle...");
+    let strategies = solver.all_strategies();
+    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
+    println!("  {} info sets, {} iterations", blueprint.len(), blueprint.iterations_trained());
+
+    let bundle = StrategyBundle::new(bundle_config, blueprint, boundaries);
+    let output_path = PathBuf::from(&config.training.output_dir);
+    bundle.save(&output_path)?;
+    println!("  Saved to {}/", config.training.output_dir);
+
+    println!("\n=== Training Complete ===");
+    println!("Total time: {:?}", training_start.elapsed());
+
+    Ok(())
+}
+
+fn build_deal_infos(game: &HunlPostflop, states: &[PostflopState]) -> Vec<DealInfo> {
+    use poker_solver_core::info_key::InfoKey;
+
+    states.iter().map(|state| {
+        // Get P1 hand bits from info set key (P1 acts first preflop)
+        let key_p1 = game.info_set_key(state);
+        let hand_bits_p1 = InfoKey::from_raw(key_p1).hand_bits();
+
+        // Get P2 hand bits by advancing to P2's first decision
+        let first_action = game.actions(state)[0];
+        let next_state = game.next_state(state, first_action);
+        let key_p2 = game.info_set_key(&next_state);
+        let hand_bits_p2 = InfoKey::from_raw(key_p2).hand_bits();
+
+        // Determine showdown winner using cached ranks
+        let p1_wins = match (&state.p1_cache.rank, &state.p2_cache.rank) {
+            (Some(r1), Some(r2)) => {
+                use std::cmp::Ordering;
+                match r1.cmp(r2) {
+                    Ordering::Greater => Some(true),
+                    Ordering::Less => Some(false),
+                    Ordering::Equal => None, // tie
+                }
+            }
+            _ => None, // no cached rank, will be computed at terminals
+        };
+
+        DealInfo { hand_bits_p1, hand_bits_p2, p1_wins }
+    }).collect()
+}
+
+fn save_sequence_checkpoint(
+    solver: &SequenceCfrSolver,
+    dir_name: &str,
+    output_dir: &str,
+    bundle_config: &BundleConfig,
+    boundaries: &Option<poker_solver_core::abstraction::BucketBoundaries>,
+) {
+    let dir = PathBuf::from(output_dir).join(dir_name);
+    let strategies = solver.all_strategies();
+    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
+    let bundle = StrategyBundle::new(bundle_config.clone(), blueprint, boundaries.clone());
+
+    match bundle.save(&dir) {
+        Ok(()) => println!("  Saved checkpoint to {}/", dir.display()),
+        Err(e) => eprintln!("  Warning: failed to save checkpoint: {e}"),
+    }
+}
+
+fn build_abstraction_mode(config: &TrainingConfig) -> Option<AbstractionMode> {
+    let abs_mode = config.training.abstraction_mode;
+    if abs_mode == AbstractionModeConfig::HandClassV2 {
+        Some(AbstractionMode::HandClassV2 {
+            strength_bits: config.training.strength_bits,
+            equity_bits: config.training.equity_bits,
+        })
+    } else if abs_mode == AbstractionModeConfig::HandClass {
+        Some(AbstractionMode::HandClass)
+    } else {
+        None
+    }
+}
+
+fn count_actual_info_sets(
+    game: &HunlPostflop,
+    _tree: &poker_solver_core::cfr::GameTree,
+    states: &[PostflopState],
+    sample_count: usize,
+) -> u64 {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+
+    for state in states.iter().take(sample_count) {
+        collect_info_keys_dfs(game, state, &mut seen);
+    }
+
+    seen.len() as u64
+}
+
+fn collect_info_keys_dfs(
+    game: &HunlPostflop,
+    state: &PostflopState,
+    seen: &mut std::collections::HashSet<u64>,
+) {
+    if game.is_terminal(state) {
+        return;
+    }
+
+    let key = game.info_set_key(state);
+    seen.insert(key);
+
+    for &action in &game.actions(state) {
+        let next = game.next_state(state, action);
+        collect_info_keys_dfs(game, &next, seen);
+    }
 }
 
 fn save_checkpoint_bundle(
