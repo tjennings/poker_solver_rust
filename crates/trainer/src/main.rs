@@ -88,6 +88,7 @@ struct TrainingConfig {
 
 #[derive(Debug, Deserialize)]
 struct TrainingParams {
+    #[serde(default)]
     iterations: u64,
     seed: u64,
     output_dir: String,
@@ -110,6 +111,14 @@ struct TrainingParams {
     /// Number of bits for equity bin (0-4). Only used with `hand_class_v2`.
     #[serde(default = "default_equity_bits")]
     equity_bits: u8,
+    /// Strategy delta threshold for convergence-based stopping.
+    /// When set, training continues until the mean L1 strategy delta between
+    /// consecutive checkpoints drops below this value, overriding `iterations`.
+    #[serde(default)]
+    convergence_threshold: Option<f64>,
+    /// How often (in iterations) to check convergence (default: 100).
+    #[serde(default = "default_convergence_check_interval")]
+    convergence_check_interval: u64,
     /// Enable regret-based pruning during training.
     #[serde(default)]
     pruning: bool,
@@ -124,6 +133,10 @@ struct TrainingParams {
     /// regrets back above the line between probes.
     #[serde(default)]
     pruning_threshold: f64,
+}
+
+fn default_convergence_check_interval() -> u64 {
+    100
 }
 
 fn default_mccfr_samples() -> usize {
@@ -224,10 +237,35 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         println!("  Samples/street: {}", abs.samples_per_street);
     }
     println!();
-    println!(
-        "Training: {} iterations, {} samples/iter, seed {}",
-        config.training.iterations, config.training.mccfr_samples, config.training.seed
-    );
+
+    // Validate stopping criteria
+    let convergence_mode = config.training.convergence_threshold.is_some();
+    if convergence_mode && config.training.iterations > 0 {
+        eprintln!(
+            "WARNING: both convergence_threshold ({:.6}) and iterations ({}) are set; \
+             convergence_threshold will be used for stopping (iterations value ignored)",
+            config.training.convergence_threshold.unwrap(),
+            config.training.iterations,
+        );
+    }
+    if !convergence_mode && config.training.iterations == 0 {
+        return Err("Either iterations or convergence_threshold must be set".into());
+    }
+
+    if let Some(threshold) = config.training.convergence_threshold {
+        println!(
+            "Training: converge to delta < {:.6}, check every {} iters, {} samples/iter, seed {}",
+            threshold,
+            config.training.convergence_check_interval,
+            config.training.mccfr_samples,
+            config.training.seed,
+        );
+    } else {
+        println!(
+            "Training: {} iterations, {} samples/iter, seed {}",
+            config.training.iterations, config.training.mccfr_samples, config.training.seed
+        );
+    }
     println!("Output: {}", config.training.output_dir);
     println!();
 
@@ -312,16 +350,14 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         equity_bits: if use_hand_class_v2 { config.training.equity_bits } else { 0 },
     };
 
-    // Training loop with 10 checkpoints
-    let total = config.training.iterations;
-    let checkpoint_interval = (total / 10).max(1);
     let training_start = Instant::now();
     let mut previous_strategies: Option<FxHashMap<u64, Vec<f64>>> = None;
+    let num_threads = rayon::current_num_threads();
 
     // Baseline checkpoint (iteration 0)
     let ckpt_ctx = CheckpointCtx {
         total_checkpoints: 10,
-        total_iterations: total,
+        total_iterations: config.training.iterations,
         training_start: &training_start,
         header: &header,
         action_labels: &action_labels,
@@ -329,72 +365,141 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         output_dir: &config.training.output_dir,
         abs_mode,
         previous_strategies: &previous_strategies,
+        convergence_threshold: config.training.convergence_threshold,
     };
     print_checkpoint(&solver, 0, &ckpt_ctx);
 
-    // Progress bar for training iterations
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} iters ({per_sec}, ETA: {eta})",
-        )
-        .expect("valid template")
-        .progress_chars("=>-"),
-    );
+    if let Some(threshold) = config.training.convergence_threshold {
+        // --- Convergence-based training ---
+        let check_interval = config.training.convergence_check_interval;
 
-    let num_threads = rayon::current_num_threads();
-    println!("  Parallel training with {} threads\n", num_threads);
-
-    for checkpoint in 1..=10 {
-        solver.train_parallel_with_callback(
-            checkpoint_interval,
-            config.training.mccfr_samples,
-            |_| {
-                pb.inc(1);
-            },
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] {pos} iters ({per_sec})",
+            )
+            .expect("valid template"),
         );
 
-        pb.suspend(|| {
-            let ckpt_ctx = CheckpointCtx {
-                total_checkpoints: 10,
-                total_iterations: total,
-                training_start: &training_start,
-                header: &header,
-                action_labels: &action_labels,
-                stack_depth: config.game.stack_depth,
-                output_dir: &config.training.output_dir,
-                abs_mode,
-                previous_strategies: &previous_strategies,
-            };
-            print_checkpoint(&solver, checkpoint, &ckpt_ctx);
+        println!(
+            "  Parallel training with {} threads (target delta < {:.6})\n",
+            num_threads, threshold
+        );
 
-            // Snapshot strategies for next delta computation
-            previous_strategies = Some(solver.all_strategies_best_effort());
+        let mut checkpoint_num = 0u64;
 
-            // Save intermediate checkpoint bundle
-            save_checkpoint_bundle(
-                &solver,
-                checkpoint,
-                &config.training.output_dir,
-                &bundle_config,
-                &boundaries,
+        loop {
+            solver.train_parallel_with_callback(
+                check_interval,
+                config.training.mccfr_samples,
+                |_| {
+                    pb.inc(1);
+                },
             );
-        });
-    }
+            checkpoint_num += 1;
 
-    // Handle remainder iterations
-    let trained_so_far = checkpoint_interval * 10;
-    if trained_so_far < total {
-        solver.train_parallel_with_callback(
-            total - trained_so_far,
-            config.training.mccfr_samples,
-            |_| {
-                pb.inc(1);
-            },
+            let converged = pb.suspend(|| {
+                let ckpt_ctx = CheckpointCtx {
+                    total_checkpoints: 0,
+                    total_iterations: 0,
+                    training_start: &training_start,
+                    header: &header,
+                    action_labels: &action_labels,
+                    stack_depth: config.game.stack_depth,
+                    output_dir: &config.training.output_dir,
+                    abs_mode,
+                    previous_strategies: &previous_strategies,
+                    convergence_threshold: Some(threshold),
+                };
+                let delta = print_checkpoint(&solver, checkpoint_num, &ckpt_ctx);
+
+                previous_strategies = Some(solver.all_strategies_best_effort());
+
+                save_checkpoint_bundle(
+                    &solver,
+                    &format!("checkpoint_{checkpoint_num}"),
+                    &config.training.output_dir,
+                    &bundle_config,
+                    &boundaries,
+                );
+
+                matches!(delta, Some(d) if d < threshold)
+            });
+
+            if converged {
+                pb.finish_with_message(format!(
+                    "Converged after {} iterations",
+                    solver.iterations()
+                ));
+                break;
+            }
+        }
+    } else {
+        // --- Fixed-iteration training ---
+        let total = config.training.iterations;
+        let checkpoint_interval = (total / 10).max(1);
+
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} iters ({per_sec}, ETA: {eta})",
+            )
+            .expect("valid template")
+            .progress_chars("=>-"),
         );
-    }
 
-    pb.finish_with_message("Training complete");
+        println!("  Parallel training with {} threads\n", num_threads);
+
+        for checkpoint in 1..=10 {
+            solver.train_parallel_with_callback(
+                checkpoint_interval,
+                config.training.mccfr_samples,
+                |_| {
+                    pb.inc(1);
+                },
+            );
+
+            pb.suspend(|| {
+                let ckpt_ctx = CheckpointCtx {
+                    total_checkpoints: 10,
+                    total_iterations: total,
+                    training_start: &training_start,
+                    header: &header,
+                    action_labels: &action_labels,
+                    stack_depth: config.game.stack_depth,
+                    output_dir: &config.training.output_dir,
+                    abs_mode,
+                    previous_strategies: &previous_strategies,
+                    convergence_threshold: None,
+                };
+                print_checkpoint(&solver, checkpoint, &ckpt_ctx);
+
+                previous_strategies = Some(solver.all_strategies_best_effort());
+
+                save_checkpoint_bundle(
+                    &solver,
+                    &format!("checkpoint_{checkpoint}_of_10"),
+                    &config.training.output_dir,
+                    &bundle_config,
+                    &boundaries,
+                );
+            });
+        }
+
+        // Handle remainder iterations
+        let trained_so_far = checkpoint_interval * 10;
+        if trained_so_far < total {
+            solver.train_parallel_with_callback(
+                total - trained_so_far,
+                config.training.mccfr_samples,
+                |_| {
+                    pb.inc(1);
+                },
+            );
+        }
+
+        pb.finish_with_message("Training complete");
+    }
 
     // Save final bundle
     println!("\nSaving strategy bundle...");
@@ -423,12 +528,12 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
 fn save_checkpoint_bundle(
     solver: &MccfrSolver<HunlPostflop>,
-    checkpoint: u64,
+    dir_name: &str,
     output_dir: &str,
     bundle_config: &BundleConfig,
     boundaries: &Option<poker_solver_core::abstraction::BucketBoundaries>,
 ) {
-    let dir = PathBuf::from(output_dir).join(format!("checkpoint_{checkpoint}_of_10"));
+    let dir = PathBuf::from(output_dir).join(dir_name);
     let strategies = solver.all_strategies();
     let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
     let bundle = StrategyBundle::new(bundle_config.clone(), blueprint, boundaries.clone());
@@ -572,40 +677,48 @@ struct CheckpointCtx<'a> {
     output_dir: &'a str,
     abs_mode: AbstractionModeConfig,
     previous_strategies: &'a Option<FxHashMap<u64, Vec<f64>>>,
+    convergence_threshold: Option<f64>,
 }
 
 fn print_checkpoint(
     solver: &MccfrSolver<HunlPostflop>,
     checkpoint: u64,
     ctx: &CheckpointCtx,
-) {
-    let current_iter = if checkpoint == 0 {
-        0
-    } else {
-        (ctx.total_iterations / ctx.total_checkpoints) * checkpoint
-    };
-
+) -> Option<f64> {
     let strategies = solver.all_strategies_best_effort();
-
     let elapsed = ctx.training_start.elapsed().as_secs_f64();
-    let remaining = if checkpoint > 0 {
-        let rate = elapsed / checkpoint as f64;
-        rate * (ctx.total_checkpoints - checkpoint) as f64
-    } else {
-        0.0
-    };
 
-    println!(
-        "\n=== Checkpoint {}/{} ({}/{} iterations) ===",
-        checkpoint, ctx.total_checkpoints, current_iter, ctx.total_iterations
-    );
+    if ctx.convergence_threshold.is_some() {
+        println!(
+            "\n=== Convergence Check {} ({} iterations) ===",
+            checkpoint,
+            solver.iterations()
+        );
+    } else {
+        let current_iter = if checkpoint == 0 {
+            0
+        } else {
+            (ctx.total_iterations / ctx.total_checkpoints) * checkpoint
+        };
+        println!(
+            "\n=== Checkpoint {}/{} ({}/{} iterations) ===",
+            checkpoint, ctx.total_checkpoints, current_iter, ctx.total_iterations
+        );
+    }
+
     println!("Info sets: {}", strategies.len());
 
-    if checkpoint > 0 {
+    if checkpoint > 0 && ctx.convergence_threshold.is_none() {
+        let remaining = {
+            let rate = elapsed / checkpoint as f64;
+            rate * (ctx.total_checkpoints - checkpoint) as f64
+        };
         println!(
             "Time: {:.1}s elapsed, ~{:.1}s remaining",
             elapsed, remaining
         );
+    } else if checkpoint > 0 {
+        println!("Time: {:.1}s elapsed", elapsed);
     }
 
     let (pruned, total) = solver.pruning_stats();
@@ -615,26 +728,40 @@ fn print_checkpoint(
     }
 
     // Convergence metrics
-    if checkpoint > 0 {
+    let delta = if checkpoint > 0 {
         let regrets = solver.regret_sum();
         let iters = solver.iterations();
         let max_r = convergence::max_regret(regrets, iters);
         let avg_r = convergence::avg_regret(regrets, iters);
         let entropy = convergence::strategy_entropy(&strategies);
 
-        let delta_str = match ctx.previous_strategies {
-            Some(prev) => format!("{:.6}", convergence::strategy_delta(prev, &strategies)),
+        let delta = ctx
+            .previous_strategies
+            .as_ref()
+            .map(|prev| convergence::strategy_delta(prev, &strategies));
+        let delta_str = match delta {
+            Some(d) => format!("{d:.6}"),
             None => "(first checkpoint)".to_string(),
         };
 
         println!("\nConvergence Metrics:");
         println!("  Strategy delta:   {delta_str}");
+        if let Some(threshold) = ctx.convergence_threshold {
+            let status = match delta {
+                Some(d) if d < threshold => "CONVERGED",
+                _ => "not converged",
+            };
+            println!("  Target delta:     {threshold:.6} ({status})");
+        }
         println!("  Max regret:       {max_r:.6}");
         println!("  Avg regret:       {avg_r:.6}");
         println!("  Strategy entropy: {entropy:.4}");
 
         print_extreme_regret_keys(regrets, iters, ctx.output_dir);
-    }
+        delta
+    } else {
+        None
+    };
 
     // SB preflop strategy table
     println!("\nSB Opening Strategy (preflop, facing BB):");
@@ -667,6 +794,8 @@ fn print_checkpoint(
     println!();
 
     print_river_strategies(&strategies, ctx.abs_mode);
+
+    delta
 }
 
 /// Print the 2 highest and 2 lowest total-regret info set keys.
