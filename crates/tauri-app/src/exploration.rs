@@ -935,9 +935,14 @@ pub fn get_combo_classes(
                 .lookup(key)
                 .map(|s| s.to_vec())
                 .unwrap_or_default();
+            let class_names = if is_v2 {
+                decode_v2_class_names(bits)
+            } else {
+                HandClassification::from_bits(bits).to_strings()
+            };
             ComboGroup {
                 bits,
-                class_names: HandClassification::from_bits(bits).to_strings(),
+                class_names,
                 combos: combo_strs,
                 strategy,
             }
@@ -1042,6 +1047,34 @@ fn enumerate_combos(rank1: char, rank2: char, suited: bool, board: &[Card]) -> V
     }
 
     combos
+}
+
+/// Decode v2 packed bits into human-readable class names.
+///
+/// v2 layout: class_id(5) | strength(4) | equity(4) | draw_flags(7) | spare(8)
+fn decode_v2_class_names(bits: u32) -> Vec<String> {
+    let class_id = (bits >> 23) & 0x1F;
+    let draw_flags = (bits >> 8) & 0x7F;
+
+    let mut names = Vec::new();
+
+    // Made hand class (discriminants 0-20)
+    if class_id <= 20 {
+        if let Some(class) = HandClass::from_discriminant(class_id as u8) {
+            names.push(class.to_string());
+        }
+    }
+
+    // Draw classes (discriminants 21-27, mapped from draw_flags bits 0-6)
+    for i in 0u8..7 {
+        if draw_flags & (1 << i) != 0 {
+            if let Some(class) = HandClass::from_discriminant(21 + i) {
+                names.push(class.to_string());
+            }
+        }
+    }
+
+    names
 }
 
 /// Format a card as a unicode string (e.g. "A♠").

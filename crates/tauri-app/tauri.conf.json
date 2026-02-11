@@ -14,8 +14,8 @@
     "windows": [
       {
         "title": "Poker Solver",
-        "width": 900,
-        "height": 700
+        "width": 1300,
+        "height": 1280
       }
     ],
     "security": {

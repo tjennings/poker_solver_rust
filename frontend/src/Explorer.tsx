@@ -1087,15 +1087,17 @@ export default function Explorer() {
                     </div>
                   ))}
                 </div>
-                {selectedCell && matrix.cells[selectedCell.row]?.[selectedCell.col] && (
-                  <CellDetail
-                    cell={matrix.cells[selectedCell.row][selectedCell.col]}
-                    actions={matrix.actions}
-                  />
-                )}
-                {comboInfo && comboInfo.groups.length > 0 && (
-                  <ComboClassPanel info={comboInfo} actions={matrix.actions} />
-                )}
+                <div className="detail-column">
+                  {selectedCell && matrix.cells[selectedCell.row]?.[selectedCell.col] && (
+                    <CellDetail
+                      cell={matrix.cells[selectedCell.row][selectedCell.col]}
+                      actions={matrix.actions}
+                    />
+                  )}
+                  {comboInfo && comboInfo.groups.length > 0 && (
+                    <ComboClassPanel info={comboInfo} actions={matrix.actions} />
+                  )}
+                </div>
               </div>
             </div>
           )}

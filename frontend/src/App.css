@@ -601,6 +601,13 @@ button:disabled {
   align-items: flex-start;
 }
 
+.detail-column {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  flex-shrink: 0;
+}
+
 /* Cell detail panel */
 .cell-detail {
   min-width: 180px;
