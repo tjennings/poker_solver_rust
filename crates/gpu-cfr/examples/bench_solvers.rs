@@ -166,10 +166,7 @@ fn bench_gpu(
     let states = game.initial_states();
     let tree = materialize_postflop(&game, &states[0]);
     let deals = build_deal_infos(&game);
-    let gpu_config = GpuCfrConfig {
-        batch_size: deal_count.min(1024),
-        ..Default::default()
-    };
+    let gpu_config = GpuCfrConfig::default();
 
     let solver = match GpuCfrSolver::new(&tree, deals, gpu_config) {
         Ok(s) => s,

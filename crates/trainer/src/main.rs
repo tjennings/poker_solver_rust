@@ -852,7 +852,7 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         dcfr_alpha: 1.5,
         dcfr_beta: 0.5,
         dcfr_gamma: 2.0,
-        batch_size: 1024,
+        ..Default::default()
     };
     let mut solver = GpuCfrSolver::new(&tree, deals, gpu_config)?;
     println!(

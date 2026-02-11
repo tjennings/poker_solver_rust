@@ -77,8 +77,9 @@ pub struct GpuCfrConfig {
     pub dcfr_beta: f64,
     /// DCFR strategy sum exponent (default 2.0).
     pub dcfr_gamma: f64,
-    /// Number of deals per GPU batch (default 1024).
-    pub batch_size: usize,
+    /// Maximum deals per GPU batch. `None` (default) auto-sizes to the
+    /// largest batch that fits within GPU buffer binding limits.
+    pub max_batch_size: Option<usize>,
 }
 
 impl Default for GpuCfrConfig {
@@ -87,7 +88,7 @@ impl Default for GpuCfrConfig {
             dcfr_alpha: 1.5,
             dcfr_beta: 0.5,
             dcfr_gamma: 2.0,
-            batch_size: 1024,
+            max_batch_size: None,
         }
     }
 }
@@ -217,7 +218,10 @@ impl GpuCfrSolver {
         // The largest per-batch buffer is info_id_lookup: batch_size × num_nodes × 4 bytes.
         let max_binding = device.limits().max_storage_buffer_binding_size as u64;
         let max_batch_for_gpu = (max_binding / (num_nodes as u64 * 4)) as usize;
-        let batch_size = config.batch_size.min(deals.len()).min(max_batch_for_gpu);
+        let batch_size = config.max_batch_size
+            .unwrap_or(max_batch_for_gpu)
+            .min(deals.len())
+            .min(max_batch_for_gpu);
 
         let state_size = (num_info_sets as u64) * (max_actions as u64) * 4;
         let batch_node_size = (batch_size as u64) * (num_nodes as u64) * 4;
@@ -1095,7 +1099,7 @@ mod tests {
         let (game, deals) = build_test_game();
         let tree = materialize_postflop(&game, &game.initial_states()[0]);
 
-        match GpuCfrSolver::new(&tree, deals, GpuCfrConfig { batch_size: 50, ..Default::default() }) {
+        match GpuCfrSolver::new(&tree, deals, GpuCfrConfig { max_batch_size: Some(50), ..Default::default() }) {
             Ok(mut solver) => {
                 // First iteration has strategy_discount=0, so strategy_sum stays empty.
                 // Train 5 iterations so strategies accumulate.
@@ -1127,7 +1131,7 @@ mod tests {
         let (game, deals) = build_test_game();
         let tree = materialize_postflop(&game, &game.initial_states()[0]);
 
-        match GpuCfrSolver::new(&tree, deals, GpuCfrConfig { batch_size: 50, ..Default::default() }) {
+        match GpuCfrSolver::new(&tree, deals, GpuCfrConfig { max_batch_size: Some(50), ..Default::default() }) {
             Ok(mut solver) => {
                 solver.train(10);
                 assert_eq!(solver.iterations(), 10);
