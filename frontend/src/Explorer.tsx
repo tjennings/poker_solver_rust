@@ -4,6 +4,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import {
   AgentInfo,
   BundleInfo,
+  CanonicalizeResult,
   StrategyMatrix,
   ExplorationPosition,
   ActionInfo,
@@ -427,19 +428,25 @@ function CardPicker({
 }
 
 // Street transition block (FLOP, TURN, RIVER)
+const SUIT_DISPLAY: Record<string, string> = { s: '♠', h: '♥', d: '♦', c: '♣' };
+
 function StreetBlock({
   street,
   pot,
   cards,
   expectedCards,
   onHeaderClick,
+  remapInfo,
 }: {
   street: string;
   pot: number;
   cards: string[];
   expectedCards: number;
   onHeaderClick?: () => void;
+  remapInfo?: { original: string[]; canonical: string[]; suitMap: Record<string, string> } | null;
 }) {
+  const [showRemap, setShowRemap] = useState(false);
+
   const cardSlots = [];
   for (let i = 0; i < expectedCards; i++) {
     cardSlots.push(
@@ -450,6 +457,8 @@ function StreetBlock({
     );
   }
 
+  const hasRemap = remapInfo && Object.keys(remapInfo.suitMap).length > 0;
+
   return (
     <div className={`street-block ${cards.length === expectedCards ? '' : 'pending'}`}>
       <div
@@ -458,10 +467,35 @@ function StreetBlock({
       >
         <span className="street-name">{street}</span>
         <span className="street-pot">{pot}</span>
+        {hasRemap && (
+          <span
+            className="remap-indicator"
+            onMouseEnter={() => setShowRemap(true)}
+            onMouseLeave={() => setShowRemap(false)}
+            title="Suits remapped to canonical form"
+          >
+            ↔
+          </span>
+        )}
       </div>
       <div className="street-cards">
         {cardSlots}
       </div>
+      {hasRemap && showRemap && (
+        <div className="remap-tooltip">
+          {remapInfo!.original.map((orig, i) => (
+            <span key={i} className="remap-pair">
+              {orig} → {remapInfo!.canonical[i]}
+              {i < remapInfo!.original.length - 1 ? '  ' : ''}
+            </span>
+          ))}
+          <div className="remap-suits">
+            {Object.entries(remapInfo!.suitMap).map(([from, to]) => (
+              <span key={from}>{SUIT_DISPLAY[from] || from}→{SUIT_DISPLAY[to] || to} </span>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -525,6 +559,11 @@ export default function Explorer() {
   const [handResult, setHandResult] = useState<'fold' | 'showdown' | null>(null);
   const [comboInfo, setComboInfo] = useState<ComboGroupInfo | null>(null);
   const [threshold, setThreshold] = useState(2);
+  const [remapInfo, setRemapInfo] = useState<{
+    original: string[];
+    canonical: string[];
+    suitMap: Record<string, string>;
+  } | null>(null);
 
   // Fetch available agents on mount
   useEffect(() => {
@@ -762,20 +801,33 @@ export default function Explorer() {
       try {
         setLoading(true);
 
-        // Add street to history
+        // Canonicalize the board cards via backend
+        const result = await invoke<CanonicalizeResult>('canonicalize_board', { cards });
+        const canonicalCards = result.canonical_cards;
+
+        // Track remap info for the indicator (flop establishes it, turn/river extends it)
+        if (result.remapped && result.suit_map) {
+          setRemapInfo((prev) => ({
+            original: [...(prev?.original ?? []), ...cards],
+            canonical: [...(prev?.canonical ?? []), ...canonicalCards],
+            suitMap: { ...(prev?.suitMap ?? {}), ...result.suit_map },
+          }));
+        }
+
+        // Add street to history (use canonical cards)
         const streetItem: HistoryItem = {
           type: 'street',
           street: pendingStreet.street,
           pot: pendingStreet.pot,
           stack_p1: pendingStreet.stack_p1,
           stack_p2: pendingStreet.stack_p2,
-          cards,
+          cards: canonicalCards,
         };
         setHistoryItems((prev) => [...prev, streetItem]);
 
         // Update board, reset history for new street.
         // Use pot/stacks from pendingStreet (computed at transition time).
-        const newBoard = [...position.board, ...cards];
+        const newBoard = [...position.board, ...canonicalCards];
         const newPosition: ExplorationPosition = {
           board: newBoard,
           history: [],
@@ -888,6 +940,11 @@ export default function Explorer() {
       const streetItem = historyItems[index];
       if (!streetItem || streetItem.type !== 'street') return;
 
+      // Clear remap info when rewinding to the flop (will be re-established on card pick)
+      if (streetItem.street === 'FLOP') {
+        setRemapInfo(null);
+      }
+
       const { items, pos } = rebuildState(index);
       setHistoryItems(items);
       setHandResult(null);
@@ -922,6 +979,7 @@ export default function Explorer() {
       setHandResult(null);
       setSelectedCell(null);
       setComboInfo(null);
+      setRemapInfo(null);
       const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
         position: initialPosition,
         threshold: threshold / 100,
@@ -996,6 +1054,7 @@ export default function Explorer() {
                   cards={item.cards}
                   expectedCards={item.cards.length}
                   onHeaderClick={() => handleStreetRewind(idx)}
+                  remapInfo={remapInfo}
                 />
               )
             )}

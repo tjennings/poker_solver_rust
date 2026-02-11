@@ -69,6 +69,13 @@ export interface ComboGroupInfo {
   stack_bucket: number;
 }
 
+// Board canonicalization result
+export interface CanonicalizeResult {
+  canonical_cards: string[];
+  remapped: boolean;
+  suit_map: Record<string, string> | null;
+}
+
 // Simulation types
 export interface StrategySourceInfo {
   name: string;

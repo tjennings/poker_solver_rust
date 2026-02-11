@@ -8,7 +8,7 @@ mod buckets;
 mod error;
 mod generator;
 mod hand_strength;
-mod isomorphism;
+pub mod isomorphism;
 
 use crate::poker::Card;
 use serde::{Deserialize, Serialize};

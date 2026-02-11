@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use poker_solver_core::abstraction::{CardAbstraction, Street};
+use poker_solver_core::abstraction::isomorphism::{CanonicalBoard, SuitMapping};
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint::{AbstractionModeConfig, BundleConfig, StrategyBundle};
 use poker_solver_core::hand_class::{classify, intra_class_strength, HandClass, HandClassification};
@@ -46,6 +47,8 @@ pub struct ExplorationState {
     computing_board_key: Arc<RwLock<Option<String>>>,
     /// Abstraction for bucket computation (cloned for thread use)
     abstraction_boundaries: Arc<RwLock<Option<poker_solver_core::abstraction::BucketBoundaries>>>,
+    /// Suit mapping established by flop canonicalization, applied to turn/river cards
+    suit_mapping: RwLock<Option<SuitMapping>>,
 }
 
 /// A loaded strategy source — either a trained bundle or a rule-based agent.
@@ -67,6 +70,7 @@ impl Default for ExplorationState {
             computing: Arc::new(AtomicBool::new(false)),
             computing_board_key: Arc::new(RwLock::new(None)),
             abstraction_boundaries: Arc::new(RwLock::new(None)),
+            suit_mapping: RwLock::new(None),
         }
     }
 }
@@ -216,6 +220,7 @@ pub async fn load_bundle(
     *state.abstraction_boundaries.write() = boundaries;
     *state.source.write() = Some(source);
     state.bucket_cache.write().clear();
+    *state.suit_mapping.write() = None;
 
     Ok(info)
 }
@@ -638,6 +643,105 @@ pub fn is_board_cached(state: State<'_, ExplorationState>, board: Vec<String>) -
     let board_key = board.join("");
     let cache = state.bucket_cache.read();
     cache.contains_key(&board_key)
+}
+
+/// Result of board canonicalization.
+#[derive(Debug, Clone, Serialize)]
+pub struct CanonicalizeResult {
+    /// Canonical card strings (e.g., ["As", "Kh", "7d"])
+    pub canonical_cards: Vec<String>,
+    /// Whether the cards were remapped (false if already canonical)
+    pub remapped: bool,
+    /// Suit substitution map (original → canonical), only present when remapped
+    pub suit_map: Option<HashMap<String, String>>,
+}
+
+/// Canonicalize board cards to their suit-isomorphic equivalent.
+///
+/// On flop (3 cards): establishes a `SuitMapping` stored in state for reuse.
+/// On turn/river (1 card): applies the stored flop mapping to the new card.
+/// Returns canonical card strings and substitution info.
+#[tauri::command]
+pub fn canonicalize_board(
+    state: State<'_, ExplorationState>,
+    cards: Vec<String>,
+) -> Result<CanonicalizeResult, String> {
+    let parsed: Vec<Card> = cards.iter().map(|s| parse_card(s)).collect::<Result<_, _>>()?;
+
+    if parsed.len() == 3 {
+        // Flop: establish canonical mapping
+        let canonical = CanonicalBoard::from_cards(&parsed)
+            .map_err(|e| format!("Canonicalization failed: {e}"))?;
+
+        let remapped = canonical.cards != parsed;
+        let suit_map = if remapped {
+            Some(build_suit_map(&parsed, &canonical.cards))
+        } else {
+            None
+        };
+
+        let canonical_strs: Vec<String> = canonical.cards.iter().map(format_card_short).collect();
+        *state.suit_mapping.write() = Some(canonical.mapping);
+
+        Ok(CanonicalizeResult {
+            canonical_cards: canonical_strs,
+            remapped,
+            suit_map,
+        })
+    } else {
+        // Turn/river: apply stored mapping
+        let mapping_guard = state.suit_mapping.read();
+        let mapping = mapping_guard
+            .as_ref()
+            .ok_or_else(|| "No flop mapping established".to_string())?;
+
+        let canonical_strs: Vec<String> = parsed
+            .iter()
+            .map(|c| format_card_short(&mapping.map_card(*c)))
+            .collect();
+
+        let remapped = canonical_strs.iter().zip(cards.iter()).any(|(c, o)| c != o);
+        let suit_map = if remapped {
+            let mapped: Vec<Card> = parsed.iter().map(|c| mapping.map_card(*c)).collect();
+            Some(build_suit_map(&parsed, &mapped))
+        } else {
+            None
+        };
+
+        Ok(CanonicalizeResult {
+            canonical_cards: canonical_strs,
+            remapped,
+            suit_map,
+        })
+    }
+}
+
+/// Build a suit substitution map from original cards to canonical cards.
+fn build_suit_map(original: &[Card], canonical: &[Card]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for (orig, canon) in original.iter().zip(canonical.iter()) {
+        if orig.suit != canon.suit {
+            map.insert(suit_char(orig.suit), suit_char(canon.suit));
+        }
+    }
+    map
+}
+
+/// Format a suit as its single-character abbreviation.
+fn suit_char(suit: Suit) -> String {
+    match suit {
+        Suit::Spade => "s".to_string(),
+        Suit::Heart => "h".to_string(),
+        Suit::Diamond => "d".to_string(),
+        Suit::Club => "c".to_string(),
+    }
+}
+
+/// Format a card as a short string (e.g., "As", "Kh").
+fn format_card_short(card: &Card) -> String {
+    let rank = value_to_char(card.value);
+    let suit = suit_char(card.suit);
+    format!("{rank}{suit}")
 }
 
 /// List available agent configs from the agents/ directory.

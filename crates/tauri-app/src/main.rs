@@ -12,6 +12,7 @@ fn main() {
             poker_solver_tauri::get_available_actions,
             poker_solver_tauri::is_bundle_loaded,
             poker_solver_tauri::get_bundle_info,
+            poker_solver_tauri::canonicalize_board,
             poker_solver_tauri::start_bucket_computation,
             poker_solver_tauri::get_computation_status,
             poker_solver_tauri::is_board_cached,
