@@ -89,6 +89,8 @@ pub struct MccfrSolver<G: Game> {
     regret_sum: FxHashMap<u64, Vec<f64>>,
     /// Cumulative strategy sums (for averaging)
     strategy_sum: FxHashMap<u64, Vec<f64>>,
+    /// Cached deal pool (generated once, reused across train calls)
+    cached_initial_states: Option<Vec<G::State>>,
     /// RNG state for sampling
     rng_state: u64,
     /// Total iterations completed
@@ -173,6 +175,7 @@ impl<G: Game> MccfrSolver<G> {
             game,
             regret_sum: FxHashMap::default(),
             strategy_sum: FxHashMap::default(),
+            cached_initial_states: None,
             rng_state: 0x1234_5678_9ABC_DEF0,
             iterations: 0,
             dcfr_alpha: config.dcfr_alpha,
@@ -185,6 +188,22 @@ impl<G: Game> MccfrSolver<G> {
             pruned_traversals: 0,
             total_traversals: 0,
         }
+    }
+
+    /// Ensures the deal pool is generated and cached. No-op after the first call.
+    fn ensure_deals_cached(&mut self) {
+        if self.cached_initial_states.is_none() {
+            self.cached_initial_states = Some(self.game.initial_states());
+        }
+    }
+
+    /// Takes the cached deal pool out of `self`, avoiding borrow conflicts
+    /// with `&mut self` methods like `cfr_traverse`. Caller must put it back
+    /// via `self.cached_initial_states = Some(states)` when done.
+    fn take_deals(&mut self) -> Vec<G::State> {
+        self.cached_initial_states
+            .take()
+            .expect("ensure_deals_cached must be called first")
     }
 
     /// Set RNG seed for reproducible sampling.
@@ -214,10 +233,12 @@ impl<G: Game> MccfrSolver<G> {
     ) where
         F: FnMut(u64),
     {
-        let initial_states = self.game.initial_states();
+        self.ensure_deals_cached();
+        let initial_states = self.take_deals();
         let num_states = initial_states.len();
 
         if num_states == 0 {
+            self.cached_initial_states = Some(initial_states);
             return;
         }
 
@@ -248,11 +269,13 @@ impl<G: Game> MccfrSolver<G> {
             self.iterations += 1;
             on_iteration(i + 1);
         }
+        self.cached_initial_states = Some(initial_states);
     }
 
     /// Train for a fixed number of iterations, sampling all states once per iteration.
     pub fn train_full(&mut self, iterations: u64) {
-        let initial_states = self.game.initial_states();
+        self.ensure_deals_cached();
+        let initial_states = self.take_deals();
 
         for _ in 0..iterations {
             let strategy_discount = self.compute_strategy_discount();
@@ -262,10 +285,10 @@ impl<G: Game> MccfrSolver<G> {
                 self.cfr_traverse(state, player, 1.0, 1.0, 1.0, strategy_discount);
             }
 
-
             self.discount_regrets();
             self.iterations += 1;
         }
+        self.cached_initial_states = Some(initial_states);
     }
 
     /// Returns the traversing player for this iteration (alternating P1/P2).
@@ -558,10 +581,12 @@ impl<G: Game> MccfrSolver<G> {
     ) where
         F: FnMut(u64),
     {
-        let initial_states = self.game.initial_states();
+        self.ensure_deals_cached();
+        let initial_states = self.take_deals();
         let num_states = initial_states.len();
 
         if num_states == 0 {
+            self.cached_initial_states = Some(initial_states);
             return;
         }
 
@@ -626,11 +651,13 @@ impl<G: Game> MccfrSolver<G> {
             self.iterations += 1;
             on_iteration(i + 1);
         }
+        self.cached_initial_states = Some(initial_states);
     }
 
     /// Parallel train for a fixed number of iterations, visiting all states.
     pub fn train_full_parallel(&mut self, iterations: u64) {
-        let initial_states = self.game.initial_states();
+        self.ensure_deals_cached();
+        let initial_states = self.take_deals();
 
         for _ in 0..iterations {
             let strategy_discount = self.compute_strategy_discount();
@@ -680,6 +707,7 @@ impl<G: Game> MccfrSolver<G> {
             self.discount_regrets();
             self.iterations += 1;
         }
+        self.cached_initial_states = Some(initial_states);
     }
 
     /// Merge a `TraversalAccumulator` into the solver's main tables.

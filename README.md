@@ -6,8 +6,11 @@ A Rust-based poker solver using Counterfactual Regret Minimization (CFR) for Hea
 
 - **HUNL Postflop solver** - Full preflop-through-river training with card abstraction
 - **MCCFR training** - Monte Carlo CFR with chance sampling for scalable blueprint computation
-- **EHS2 card abstraction** - Equity and potential-aware hand bucketing for tractable game trees
+- **Three abstraction modes** - EHS2 bucketing, hand-class, or hand-class v2 (class + strength + equity + draws)
+- **DCFR** - Discounted CFR with configurable regret-based pruning
+- **Parallel training** - Rayon-based parallel MCCFR with frozen-snapshot accumulation
 - **Strategy explorer** - Interactive 13x13 hand matrix for browsing trained strategies
+- **Agent simulation** - Pit trained blueprints and rule-based agents against each other
 - **Kuhn Poker** - 3-card toy game for algorithm testing and validation
 
 ## Prerequisites
@@ -31,45 +34,132 @@ cd frontend && npm install && cd ..
 Training uses the `poker-solver-trainer` CLI to run MCCFR iterations and save a strategy bundle.
 
 MCCFR (Monte Carlo CFR) samples random card deals and performs full CFR traversal on the betting tree for each deal. This avoids materializing the entire game tree, making it practical for full HUNL. The implementation uses Discounted CFR (DCFR):
-- DCFR discounting with α=1.5, β=0.5, γ=2.0 (positive regrets retained, negative regrets decay)
-- Regret-based pruning: actions with non-positive cumulative regret are skipped (with probe iterations)
+- DCFR discounting with α=1.5, β=0.5, γ=2.0 (positive regrets weighted up, negative regrets decay)
+- Configurable regret-based pruning with negative threshold support
+- Parallel training via Rayon (frozen-snapshot accumulation pattern)
 - Average strategy skips first 50% of iterations
 
 ### 1. Create a training config
 
-Create a YAML file (e.g. `training_mccfr.yaml`):
+Create a YAML file. The config has two top-level sections: `game` and `training`.
+
+#### Game settings
 
 ```yaml
 game:
-  stack_depth: 100         # Effective stack in big blinds
-  bet_sizes: [0.33, 0.67, 1.0, 2.0, 3.0]  # Pot-fraction bet sizes (all-in always included)
-  samples_per_iteration: 50000  # Deal pool size (used internally by initial_states)
-
-abstraction:
-  flop_buckets: 200        # EHS2 buckets on flop (production: 5000)
-  turn_buckets: 200        # EHS2 buckets on turn (production: 5000)
-  river_buckets: 500       # EHS2 buckets on river (production: 20000)
-  samples_per_street: 5000 # Monte Carlo samples for computing bucket boundaries
-
-training:
-  iterations: 1000         # Total MCCFR iterations
-  seed: 42                 # RNG seed for reproducibility
-  output_dir: "./mccfr_100bb"
-  mccfr_samples: 500       # Deals sampled per MCCFR iteration (default: 500)
-  deal_count: 50000        # Random deal pool size (default: 50000)
+  stack_depth: 100                        # Effective stack in big blinds
+  bet_sizes: [0.33, 0.67, 1.0, 2.0, 3.0] # Pot-fraction bet sizes (all-in always included)
+  max_raises_per_street: 3                # Cap on bets/raises per street (default: 3)
 ```
 
-**Tuning notes:**
-- `deal_count` controls how many random deals (hole cards + 5-card board) are pre-generated. Larger pools give better coverage of the card space.
-- `mccfr_samples` controls how many deals are sampled per iteration. Higher = more node visits per iteration but slower.
-- More buckets = finer hand distinction but larger strategy table.
-- More `samples_per_street` = more accurate EHS2 bucket boundaries.
-- More iterations = better convergence (watch exploitability trend).
+- `bet_sizes` are pot fractions. `[0.5, 1.0, 1.5]` means half-pot, pot, and 1.5x pot. All-in is always available as an additional action regardless of this list.
+- `max_raises_per_street` keeps the game tree tractable. After this many bets on a street, only fold/call/check remain.
+
+#### Training settings
+
+```yaml
+training:
+  iterations: 5000          # Total MCCFR iterations
+  seed: 42                  # RNG seed for reproducibility
+  output_dir: "./my_strategy"
+  mccfr_samples: 5000       # Deals sampled per iteration (default: 500)
+  deal_count: 50000          # Pre-generated deal pool size (default: 50000)
+```
+
+#### Abstraction mode
+
+Choose one of three abstraction modes via `abstraction_mode`:
+
+**`ehs2`** (default) — EHS2 bucketing with Monte Carlo equity estimation. Fine-grained but expensive to compute. Requires an `abstraction` section:
+
+```yaml
+training:
+  abstraction_mode: ehs2
+
+abstraction:
+  flop_buckets: 200          # EHS2 buckets on flop (production: 5000)
+  turn_buckets: 200          # EHS2 buckets on turn (production: 5000)
+  river_buckets: 500         # EHS2 buckets on river (production: 20000)
+  samples_per_street: 5000   # Monte Carlo samples for bucket boundaries
+```
+
+**`hand_class`** — Categorical hand classification (28 classes: NutFlush, TopSet, Overpair, etc.). O(1) per hand, interpretable, no `abstraction` section needed:
+
+```yaml
+training:
+  abstraction_mode: hand_class
+```
+
+**`hand_class_v2`** — Hand class + intra-class strength + showdown equity + draw flags. Finer resolution than `hand_class` while remaining interpretable:
+
+```yaml
+training:
+  abstraction_mode: hand_class_v2
+  strength_bits: 4           # Intra-class strength resolution, 0-4 bits (default: 4)
+  equity_bits: 4             # Showdown equity bin resolution, 0-4 bits (default: 4)
+```
+
+The `strength_bits` and `equity_bits` control how finely hands within the same class are distinguished. 4 bits = 16 levels, 0 = dimension omitted. Higher values produce more info sets (larger strategy tables) but capture more nuance.
+
+#### Stratified deal generation
+
+For `hand_class` and `hand_class_v2` modes, you can ensure rare hand classes (e.g., quads, straight flushes) appear in the deal pool:
+
+```yaml
+training:
+  min_deals_per_class: 50       # Minimum deals per hand class (default: 0 = disabled)
+  max_rejections_per_class: 500000  # Max rejection-sample attempts per deficit class
+```
+
+#### Regret-based pruning
+
+Pruning skips actions with low cumulative regret, speeding up training by avoiding clearly bad lines. Probe iterations periodically explore all actions to prevent permanent pruning.
+
+```yaml
+training:
+  pruning: true                  # Enable pruning (default: false)
+  pruning_threshold: -5.0        # Regret threshold for pruning (default: 0.0)
+  pruning_warmup_fraction: 0.30  # Fraction of iterations before pruning starts (default: 0.2)
+  pruning_probe_interval: 20     # Full exploration every N iterations (default: 20)
+```
+
+- `pruning_threshold` controls how negative a regret must be before the action is pruned. With DCFR, negative regrets decay asymptotically but never reach zero — a threshold of 0 would prune actions permanently. A negative threshold (e.g., -5.0) allows DCFR's decay to bring regrets back above the threshold between probes, so actions can recover if the strategy shifts.
+- `pruning_warmup_fraction` delays pruning until the strategy has partially converged. At 0.30, the first 30% of iterations explore everything.
+- `pruning_probe_interval` runs a full un-pruned iteration every N iterations to discover if pruned actions have become viable.
+
+#### Complete example
+
+```yaml
+game:
+  stack_depth: 25
+  bet_sizes: [0.5, 1.0, 1.5]
+
+training:
+  iterations: 5000
+  seed: 42
+  output_dir: "./handclass_25bb_v2"
+  mccfr_samples: 5000
+  deal_count: 50000
+  abstraction_mode: hand_class_v2
+  strength_bits: 4
+  equity_bits: 4
+  min_deals_per_class: 50
+  max_rejections_per_class: 500000
+  pruning: true
+  pruning_threshold: -5.0
+  pruning_warmup_fraction: 0.30
+```
 
 ### 2. Run training
 
 ```bash
 cargo run -p poker-solver-trainer --release -- train -c training_mccfr.yaml
+```
+
+Use `-t` to control thread count (defaults to all cores):
+
+```bash
+cargo run -p poker-solver-trainer --release -- train -c training_mccfr.yaml -t 4
 ```
 
 Release mode is essential for performance. Training prints progress at 10 checkpoints with exploitability, sample hand strategies, and ETA:
@@ -89,13 +179,13 @@ AKs   |  0.02  0.35  0.58  0.05
 
 ### 3. Strategy bundle output
 
-Training saves three files to the output directory:
+Training saves to the output directory:
 
 ```
-mccfr_100bb/
+my_strategy/
 ├── config.yaml       # Game and abstraction settings (human-readable)
-├── blueprint.bin     # Trained strategy (bincode)
-└── boundaries.bin    # EHS2 bucket boundaries (bincode)
+├── blueprint.bin     # Trained strategy (bincode, FxHashMap<u64, Vec<f32>>)
+└── boundaries.bin    # EHS2 bucket boundaries (only for ehs2 mode)
 ```
 
 ## Exploring a Strategy

@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use arrayvec::ArrayVec;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::abstraction::{CardAbstraction, Street};
@@ -749,9 +750,7 @@ impl Game for HunlPostflop {
         // Precompute equity bins and strength for HandClassV2 mode
         if matches!(&self.abstraction, Some(AbstractionMode::HandClassV2 { .. })) {
             println!("Precomputing equity bins and strength for {} deals...", deals.len());
-            for deal in &mut deals {
-                deal.precompute_v2_caches();
-            }
+            deals.par_iter_mut().for_each(PostflopState::precompute_v2_caches);
             println!("  Precomputation complete.");
         }
 
