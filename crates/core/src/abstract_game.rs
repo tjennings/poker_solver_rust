@@ -21,6 +21,11 @@
 //! Each unique trajectory key maps to one [`AbstractDeal`] with averaged
 //! equity and summed weight, ready for use as a [`DealInfo`].
 
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
@@ -120,6 +125,48 @@ fn estimate_hand_encodings(strength_bits: u8, equity_bits: u8) -> u64 {
     classes * strength_levels * equity_levels * draw_combos
 }
 
+fn format_duration(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("{secs:.0}s")
+    } else if secs < 3600.0 {
+        format!("{}m {}s", secs as u64 / 60, secs as u64 % 60)
+    } else {
+        format!("{}h {}m", secs as u64 / 3600, (secs as u64 % 3600) / 60)
+    }
+}
+
+fn spawn_progress_thread(
+    done: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    total_work: u64,
+    total_flops: usize,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        let ppf = total_work / total_flops.max(1) as u64;
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(2));
+            let completed = done.load(Ordering::Relaxed);
+            let elapsed = start.elapsed().as_secs_f64();
+            let flop_idx = completed / ppf.max(1);
+            let flop_pairs = completed % ppf.max(1);
+            let pct = completed as f64 / total_work as f64 * 100.0;
+            let rate = completed as f64 / elapsed;
+            let eta = if rate > 0.0 {
+                format_duration((total_work.saturating_sub(completed)) as f64 / rate)
+            } else {
+                "--".to_string()
+            };
+            print!(
+                "\r  flop {flop_idx}/{total_flops} | {flop_pairs}/{ppf} pairs ({pct:.1}%) [{}, ETA ~{eta}]     ",
+                format_duration(elapsed),
+            );
+            let _ = std::io::stdout().flush();
+        }
+        println!();
+    })
+}
+
 /// Generate all abstract deals by exhaustive enumeration.
 ///
 /// Iterates over all hand pairs and canonical flops in parallel,
@@ -146,8 +193,8 @@ pub fn generate_abstract_deals(config: &AbstractDealConfig) -> (Vec<AbstractDeal
     };
 
     // For each ordered (P1, P2) hand pair, enumerate all boards
-    let total_pairs = hole_pairs.len() * (hole_pairs.len() - 1);
-    println!("  {} P1×P2 hand pairs × {} canonical flops", total_pairs, canonical_flops.len());
+    let max_pairs = hole_pairs.len() * (hole_pairs.len() - 1);
+    println!("  {} P1×P2 hand pairs × {} canonical flops", max_pairs, canonical_flops.len());
 
     // Generate all valid (P1, P2) pairs
     let hand_pairs: Vec<([Card; 2], [Card; 2])> = hole_pairs
@@ -163,34 +210,50 @@ pub fn generate_abstract_deals(config: &AbstractDealConfig) -> (Vec<AbstractDeal
 
     println!("  {} valid non-overlapping hand pairs", hand_pairs.len());
 
-    let results: Vec<(FxHashMap<TrajectoryKey, TrajectoryAccum>, u64)> = hand_pairs
-        .par_iter()
-        .fold(
-            || (FxHashMap::<TrajectoryKey, TrajectoryAccum>::default(), 0u64),
-            |(mut map, mut count), &(p1, p2)| {
-                count += enumerate_boards_for_pair(
-                    p1, p2, &canonical_flops, &deck, config, &mut map,
-                );
-                (map, count)
-            },
-        )
-        .collect();
+    let total_flops = canonical_flops.len();
+    let pairs_done = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let total_work = total_flops as u64 * hand_pairs.len() as u64;
+    let progress_handle = spawn_progress_thread(
+        pairs_done.clone(),
+        stop.clone(),
+        total_work,
+        total_flops,
+    );
 
-    // Merge all thread-local maps
     let mut global_map = FxHashMap::<TrajectoryKey, TrajectoryAccum>::default();
     let mut concrete_deals = 0u64;
 
-    for (local_map, local_count) in results {
-        concrete_deals += local_count;
-        for (key, accum) in local_map {
-            let entry = global_map.entry(key).or_insert(TrajectoryAccum {
-                weight: 0.0,
-                equity_sum: 0.0,
-            });
-            entry.weight += accum.weight;
-            entry.equity_sum += accum.equity_sum;
+    for flop in &canonical_flops {
+        let flop_results: Vec<(FxHashMap<TrajectoryKey, TrajectoryAccum>, u64)> = hand_pairs
+            .par_iter()
+            .fold(
+                || (FxHashMap::<TrajectoryKey, TrajectoryAccum>::default(), 0u64),
+                |(mut map, mut count), &(p1, p2)| {
+                    count += enumerate_flop_for_pair(
+                        p1, p2, flop, &deck, config, &mut map,
+                    );
+                    pairs_done.fetch_add(1, Ordering::Relaxed);
+                    (map, count)
+                },
+            )
+            .collect();
+
+        for (local_map, local_count) in flop_results {
+            concrete_deals += local_count;
+            for (key, accum) in local_map {
+                let entry = global_map.entry(key).or_insert(TrajectoryAccum {
+                    weight: 0.0,
+                    equity_sum: 0.0,
+                });
+                entry.weight += accum.weight;
+                entry.equity_sum += accum.equity_sum;
+            }
         }
     }
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = progress_handle.join();
 
     // Convert to AbstractDeal vec
     let deals: Vec<AbstractDeal> = global_map
@@ -241,76 +304,67 @@ fn cards_overlap(a: [Card; 2], b: [Card; 2]) -> bool {
     a[0] == b[0] || a[0] == b[1] || a[1] == b[0] || a[1] == b[1]
 }
 
-/// Enumerate all board completions for a given (P1, P2) hand pair.
+/// Enumerate all turn+river completions for one (P1, P2, flop) triple.
 ///
-/// For each canonical flop compatible with both hands, iterates over all
-/// turn and river cards, computing per-street hand-class encodings and
-/// showdown outcomes.
-///
-/// Returns the number of concrete deals enumerated.
-fn enumerate_boards_for_pair(
+/// Returns the number of concrete deals enumerated (0 if flop conflicts
+/// with hole cards).
+fn enumerate_flop_for_pair(
     p1: [Card; 2],
     p2: [Card; 2],
-    canonical_flops: &[CanonicalFlop],
+    flop: &CanonicalFlop,
     deck: &[Card],
     config: &AbstractDealConfig,
     map: &mut FxHashMap<TrajectoryKey, TrajectoryAccum>,
 ) -> u64 {
     let dead_cards = [p1[0], p1[1], p2[0], p2[1]];
+    let flop_cards = *flop.cards();
+
+    if flop_cards.iter().any(|c| dead_cards.contains(c)) {
+        return 0;
+    }
+
     let preflop_p1 = u32::from(canonical_hand_index(p1));
     let preflop_p2 = u32::from(canonical_hand_index(p2));
+    let flop_weight = f64::from(flop.weight());
+    let flop_p1 = encode_postflop(p1, &flop_cards, config);
+    let flop_p2 = encode_postflop(p2, &flop_cards, config);
+
+    let remaining: Vec<Card> = deck.iter()
+        .filter(|c| !dead_cards.contains(c) && !flop_cards.contains(c))
+        .copied()
+        .collect();
+
     let mut count = 0u64;
+    for (ti, &turn) in remaining.iter().enumerate() {
+        let turn_board = [flop_cards[0], flop_cards[1], flop_cards[2], turn];
+        let turn_p1 = encode_postflop(p1, &turn_board, config);
+        let turn_p2 = encode_postflop(p2, &turn_board, config);
 
-    for flop in canonical_flops {
-        let flop_cards = *flop.cards();
+        for &river in &remaining[(ti + 1)..] {
+            let river_board = [flop_cards[0], flop_cards[1], flop_cards[2], turn, river];
+            let river_p1 = encode_postflop(p1, &river_board, config);
+            let river_p2 = encode_postflop(p2, &river_board, config);
 
-        // Skip flops that conflict with hole cards
-        if flop_cards.iter().any(|c| dead_cards.contains(c)) {
-            continue;
-        }
+            let p1_rank = rank_7cards(p1, &river_board);
+            let p2_rank = rank_7cards(p2, &river_board);
+            let equity = match p1_rank.cmp(&p2_rank) {
+                std::cmp::Ordering::Greater => 1.0,
+                std::cmp::Ordering::Less => 0.0,
+                std::cmp::Ordering::Equal => 0.5,
+            };
 
-        let flop_weight = f64::from(flop.weight());
-        let flop_p1 = encode_postflop(p1, &flop_cards, config);
-        let flop_p2 = encode_postflop(p2, &flop_cards, config);
+            let key = TrajectoryKey {
+                p1_bits: [preflop_p1, flop_p1, turn_p1, river_p1],
+                p2_bits: [preflop_p2, flop_p2, turn_p2, river_p2],
+            };
 
-        // Remaining cards for turn/river
-        let remaining: Vec<Card> = deck.iter()
-            .filter(|c| !dead_cards.contains(c) && !flop_cards.contains(c))
-            .copied()
-            .collect();
-
-        for (ti, &turn) in remaining.iter().enumerate() {
-            let turn_board = [flop_cards[0], flop_cards[1], flop_cards[2], turn];
-            let turn_p1 = encode_postflop(p1, &turn_board, config);
-            let turn_p2 = encode_postflop(p2, &turn_board, config);
-
-            for &river in &remaining[(ti + 1)..] {
-                let river_board = [flop_cards[0], flop_cards[1], flop_cards[2], turn, river];
-                let river_p1 = encode_postflop(p1, &river_board, config);
-                let river_p2 = encode_postflop(p2, &river_board, config);
-
-                // Determine showdown winner
-                let p1_rank = rank_7cards(p1, &river_board);
-                let p2_rank = rank_7cards(p2, &river_board);
-                let equity = match p1_rank.cmp(&p2_rank) {
-                    std::cmp::Ordering::Greater => 1.0,
-                    std::cmp::Ordering::Less => 0.0,
-                    std::cmp::Ordering::Equal => 0.5,
-                };
-
-                let key = TrajectoryKey {
-                    p1_bits: [preflop_p1, flop_p1, turn_p1, river_p1],
-                    p2_bits: [preflop_p2, flop_p2, turn_p2, river_p2],
-                };
-
-                let entry = map.entry(key).or_insert(TrajectoryAccum {
-                    weight: 0.0,
-                    equity_sum: 0.0,
-                });
-                entry.weight += flop_weight;
-                entry.equity_sum += equity * flop_weight;
-                count += 1;
-            }
+            let entry = map.entry(key).or_insert(TrajectoryAccum {
+                weight: 0.0,
+                equity_sum: 0.0,
+            });
+            entry.weight += flop_weight;
+            entry.equity_sum += equity * flop_weight;
+            count += 1;
         }
     }
     count
@@ -389,8 +443,12 @@ mod tests {
             .find(|p| !super::cards_overlap(p1, **p))
             .expect("should find a non-overlapping pair");
         let mut map = FxHashMap::default();
-        let count = super::enumerate_boards_for_pair(p1, *p2, &canonical_flops, &deck, &config, &mut map);
-        assert!(count > 0, "Single pair should produce concrete deals");
+        let dead = [p1[0], p1[1], p2[0], p2[1]];
+        let flop = canonical_flops.iter()
+            .find(|f| !f.cards().iter().any(|c| dead.contains(c)))
+            .expect("should find a compatible flop");
+        let count = super::enumerate_flop_for_pair(p1, *p2, flop, &deck, &config, &mut map);
+        assert!(count > 0, "Single pair+flop should produce concrete deals");
 
         // Full generation
         let (deals, stats) = generate_abstract_deals(&config);
