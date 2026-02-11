@@ -2903,6 +2903,7 @@ dependencies = [
  "bytemuck",
  "poker-solver-core",
  "pollster",
+ "rayon",
  "rustc-hash 2.1.1",
  "thiserror 1.0.69",
  "wgpu",

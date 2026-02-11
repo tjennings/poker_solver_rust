@@ -6,6 +6,8 @@ A Rust-based poker solver using Counterfactual Regret Minimization (CFR) for Hea
 
 - **HUNL Postflop solver** - Full preflop-through-river training with card abstraction
 - **MCCFR training** - Monte Carlo CFR with chance sampling for scalable blueprint computation
+- **Sequence-form CFR** - Full-traversal CFR on materialized game tree (no sampling variance)
+- **GPU-accelerated CFR** - wgpu compute shaders for sequence-form CFR on Metal/Vulkan/DX12
 - **Three abstraction modes** - EHS2 bucketing, hand-class, or hand-class v2 (class + strength + equity + draws)
 - **DCFR** - Discounted CFR with configurable regret-based pruning
 - **Parallel training** - Rayon-based parallel MCCFR with frozen-snapshot accumulation
@@ -170,15 +172,55 @@ training:
 
 ### 2. Run training
 
+The trainer supports three solver backends, selected with the `--solver` flag:
+
+#### MCCFR (default)
+
+Samples random deals per iteration. Best for large games with many info sets. Low memory, handles any abstraction mode.
+
 ```bash
-cargo run -p poker-solver-trainer --release -- train -c training_mccfr.yaml
+cargo run -p poker-solver-trainer --release -- train -c config.yaml
 ```
 
 Use `-t` to control thread count (defaults to all cores):
 
 ```bash
-cargo run -p poker-solver-trainer --release -- train -c training_mccfr.yaml -t 4
+cargo run -p poker-solver-trainer --release -- train -c config.yaml -t 4
 ```
+
+#### Sequence-form CFR (full traversal, CPU)
+
+Materializes the game tree as a flat graph and runs level-by-level CFR over all deals every iteration. No sampling variance — each iteration is a complete traversal. Best for `hand_class` mode where the tree is small enough to materialize (~200-300K info sets).
+
+```bash
+cargo run -p poker-solver-trainer --release -- train -c config.yaml --solver sequence
+```
+
+**Trade-offs vs MCCFR:**
+- Each iteration is more expensive (traverses all deals, not a sample)
+- But each iteration makes more progress (no sampling noise)
+- No `mccfr_samples` parameter needed — all deals are processed every iteration
+- Memory scales with tree size × deal count
+
+#### GPU-accelerated CFR (wgpu)
+
+Same algorithm as sequence-form, but the inner loop (regret matching, reach propagation, utility computation) runs on GPU compute shaders via [wgpu](https://wgpu.rs/). Cross-platform: Metal (macOS), Vulkan (Linux/Windows), DX12 (Windows).
+
+Requires building with the `gpu` feature flag:
+
+```bash
+cargo run -p poker-solver-trainer --features gpu --release -- train -c config.yaml --solver gpu
+```
+
+**Performance:** ~7.7x faster than CPU sequence-form on Apple Silicon (M-series) for 25BB hand_class configs. The speedup increases with larger deal counts.
+
+**When to use each solver:**
+
+| Solver | Best for | Deal handling |
+|--------|----------|---------------|
+| `mccfr` | Large games, `ehs2`/`hand_class_v2`, production training | Samples per iteration |
+| `sequence` | Small-medium `hand_class` games, debugging, correctness validation | Full traversal |
+| `gpu` | Same as `sequence` but faster, when GPU is available | Full traversal on GPU |
 
 Release mode is essential for performance. Training prints progress at 10 checkpoints with exploitability, sample hand strategies, and ETA:
 
@@ -324,6 +366,34 @@ Compose: river:TopSet:spr0:d1:check,bet33
 
 This is useful for investigating convergence outliers — training checkpoints print the highest/lowest regret keys with a ready-to-copy `tree --key` command.
 
+## Benchmarking Solvers
+
+Compare all three solver backends on the same config:
+
+```bash
+# Quick benchmark (20 iterations, 1000 deals)
+cargo run --release -p poker-solver-gpu-cfr --example bench_solvers
+
+# Longer benchmark (100 iterations, 5000 deals)
+cargo run --release -p poker-solver-gpu-cfr --example bench_solvers -- long
+```
+
+MCCFR-only benchmark (no GPU dependency):
+
+```bash
+cargo run --release -p poker-solver-core --example bench_mccfr
+```
+
+### Game tree statistics
+
+Inspect the materialized tree size for a training config without actually training:
+
+```bash
+cargo run -p poker-solver-trainer --release -- tree-stats -c config.yaml --sample-deals 100
+```
+
+This prints node counts, info set estimates, and memory usage for planning larger training runs.
+
 ## Running Tests
 
 ```bash
@@ -345,6 +415,7 @@ All tests use the `#[timed_test]` proc macro which prints elapsed time and enfor
 poker_solver_rust/
 ├── crates/
 │   ├── core/              # CFR solver, game trees, card abstraction, blueprint storage
+│   ├── gpu-cfr/           # GPU-accelerated CFR via wgpu compute shaders (optional)
 │   ├── trainer/           # CLI for running training
 │   ├── tauri-app/         # Tauri desktop app (strategy explorer backend)
 │   └── test-macros/       # #[timed_test] proc macro
