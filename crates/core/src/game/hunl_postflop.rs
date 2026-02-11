@@ -294,6 +294,11 @@ pub struct HunlPostflop {
     min_deals_per_class: usize,
     /// Maximum rejection-sample attempts per deficit class.
     max_rejections_per_class: usize,
+    /// Use exhaustive uniform deal enumeration for hand-class modes.
+    ///
+    /// When true, enumerates all (flop, P1 hole) combos instead of
+    /// weighted random sampling. Produces ~2M base deals (1,755 × C(49,2)).
+    uniform_deals: bool,
 }
 
 impl HunlPostflop {
@@ -316,6 +321,7 @@ impl HunlPostflop {
             rng_seed: 42,
             min_deals_per_class: 0,
             max_rejections_per_class: 500_000,
+            uniform_deals: false,
         }
     }
 
@@ -333,6 +339,16 @@ impl HunlPostflop {
     pub fn with_stratification(mut self, min_per_class: usize, max_rejections: usize) -> Self {
         self.min_deals_per_class = min_per_class;
         self.max_rejections_per_class = max_rejections;
+        self
+    }
+
+    /// Enable exhaustive uniform deal enumeration.
+    ///
+    /// Enumerates all (flop, P1 hole) combos instead of weighted
+    /// random sampling. Produces ~2M base deals.
+    #[must_use]
+    pub fn with_uniform_deals(mut self) -> Self {
+        self.uniform_deals = true;
         self
     }
 
@@ -479,15 +495,64 @@ impl HunlPostflop {
         deals
     }
 
+    /// Generate exhaustive uniform deals: every (flop, P1 hole) combination.
+    ///
+    /// For each of the 1,755 canonical flops and each of the C(49,2)=1,176 P1 hole
+    /// card pairs, generates one random completion (P2 hole + turn + river).
+    /// Total output: 1,755 × 1,176 = 2,064,480 deals.
+    fn generate_uniform_deals(&self, seed: u64) -> Vec<PostflopState> {
+        use crate::flops;
+
+        let canonical_flops = flops::all_flops();
+        let deck = Self::full_deck();
+        let total = canonical_flops.len() * C49_2;
+
+        println!(
+            "Generating uniform deals: {} flops × {} P1 pairs = {} deals...",
+            canonical_flops.len(),
+            C49_2,
+            total,
+        );
+
+        let stack_depth = self.config.stack_depth;
+
+        let deals: Vec<PostflopState> = canonical_flops
+            .par_iter()
+            .enumerate()
+            .flat_map_iter(|(flop_idx, flop)| {
+                generate_deals_for_flop(flop, &deck, seed, flop_idx, stack_depth)
+            })
+            .collect();
+
+        println!("  Generated {} deals.", deals.len());
+        deals
+    }
+
     /// Generate a stratified deal pool that ensures minimum representation per class.
     ///
     /// Phase 1: generate the base pool via `generate_flop_deals`.
-    /// Phase 2: count per-class coverage on the river.
-    /// Phase 3: rejection-sample new deals to top up deficit classes.
+    /// Phase 2+3: top up deficit classes via `stratify_pool`.
+    #[cfg(test)]
     fn generate_stratified_deals(
         &self,
         seed: u64,
         count: usize,
+        min_per_class: usize,
+        max_rejections: usize,
+    ) -> Vec<PostflopState> {
+        let deals = self.generate_flop_deals(seed, count);
+        self.stratify_pool(deals, seed, min_per_class, max_rejections)
+    }
+
+    /// Top up a deal pool with rejection-sampled deals for rare hand classes.
+    ///
+    /// Counts per-class coverage, identifies classes below `min_per_class`,
+    /// and rejection-samples new deals until each deficit class is covered
+    /// or `max_rejections` consecutive failures are hit.
+    fn stratify_pool(
+        &self,
+        mut deals: Vec<PostflopState>,
+        seed: u64,
         min_per_class: usize,
         max_rejections: usize,
     ) -> Vec<PostflopState> {
@@ -496,33 +561,27 @@ impl HunlPostflop {
         use rand::distr::weighted::WeightedIndex;
         use rand::rngs::StdRng;
 
-        // Phase 1: base pool
-        let mut deals = self.generate_flop_deals(seed, count);
-
-        // Phase 2: count coverage
         let mut coverage = count_class_coverage(&deals);
 
-        // Phase 3: top up deficit classes (only made hands appear on river)
         let mut deficit_classes: Vec<(usize, u8)> = (0u8..28)
             .filter(|&i| coverage[i as usize] < min_per_class)
             .map(|i| (min_per_class - coverage[i as usize], i))
             .collect();
-        // Sort by deficit descending (rarest first)
         deficit_classes.sort_by_key(|&(deficit, _)| std::cmp::Reverse(deficit));
 
         if deficit_classes.is_empty() {
             return deals;
         }
 
-        // Continue RNG from a derived seed so base pool is unchanged
         let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0x5742_4154));
         let canonical_flops = flops::all_flops();
         let weights: Vec<u16> = canonical_flops
             .iter()
             .map(crate::flops::CanonicalFlop::weight)
             .collect();
-        // Infallible: same reasoning as generate_flop_deals — always non-empty positive weights.
-        let dist = WeightedIndex::new(&weights).expect("canonical flops are non-empty with positive weights");
+        // Infallible: canonical flops are non-empty with positive weights.
+        let dist = WeightedIndex::new(&weights)
+            .expect("canonical flops are non-empty with positive weights");
         let deck = Self::full_deck();
 
         let base_count = deals.len();
@@ -554,7 +613,6 @@ impl HunlPostflop {
                 }
 
                 if deal_classes & (1 << class_idx) != 0 {
-                    // Accept: update coverage for ALL classes this deal covers
                     for (i, count) in coverage.iter_mut().enumerate() {
                         if deal_classes & (1 << i) != 0 {
                             *count += 1;
@@ -701,6 +759,34 @@ fn print_coverage_summary(coverage: &[usize; 28]) {
     println!("  Coverage: {}", parts.join(", "));
 }
 
+/// Number of 2-element subsets of 49 remaining cards: C(49, 2).
+const C49_2: usize = 49 * 48 / 2;
+
+/// Decode a combinatorial index to a pair `(a, b)` with `0 <= a < b < n`.
+///
+/// Uses the combinatorial number system for 2-element subsets.
+/// Index space: `0..n*(n-1)/2`.
+#[must_use]
+fn decode_hole_pair(idx: usize, n: usize) -> (usize, usize) {
+    debug_assert!(idx < n * (n - 1) / 2, "idx {idx} out of range for n={n}");
+    // b is the largest integer such that C(b,2) = b*(b-1)/2 <= idx.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let mut b = f64::midpoint(1.0, ((8 * idx + 1) as f64).sqrt()) as usize;
+    // Correct for floating-point rounding at exact squares
+    if b > 0 && b * (b - 1) / 2 > idx {
+        b -= 1;
+    }
+    if (b + 1) * b / 2 <= idx {
+        b += 1;
+    }
+    let a = idx - b * (b - 1) / 2;
+    (a, b)
+}
+
 /// Count how many deals cover each of the 28 hand classes on the river.
 ///
 /// For each deal, classifies both players' hands against the full 5-card board.
@@ -727,21 +813,87 @@ fn count_class_coverage(deals: &[PostflopState]) -> [usize; 28] {
     counts
 }
 
+/// Generate all (`P1_hole`, `random_completion`) deals for a single canonical flop.
+///
+/// Enumerates every 2-card P1 holding from the 49 non-flop cards, and for each
+/// randomly selects P2 hole cards, turn, and river from the remaining 47.
+fn generate_deals_for_flop(
+    flop: &crate::flops::CanonicalFlop,
+    deck: &[Card],
+    base_seed: u64,
+    flop_idx: usize,
+    stack_depth: u32,
+) -> Vec<PostflopState> {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    let flop_cards = *flop.cards();
+    let remaining: Vec<Card> = deck
+        .iter()
+        .filter(|c| !flop_cards.contains(c))
+        .copied()
+        .collect();
+    debug_assert_eq!(remaining.len(), 49);
+
+    let flop_seed = base_seed
+        .wrapping_add((flop_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mut rng = StdRng::seed_from_u64(flop_seed);
+    let mut deals = Vec::with_capacity(C49_2);
+
+    for pair_idx in 0..C49_2 {
+        let (a, b) = decode_hole_pair(pair_idx, 49);
+        let p1 = [remaining[a], remaining[b]];
+
+        // Build 47-card pool excluding P1's hole cards (stack-allocated)
+        let mut pool = [remaining[0]; 47];
+        let mut k = 0;
+        for (i, &c) in remaining.iter().enumerate() {
+            if i != a && i != b {
+                pool[k] = c;
+                k += 1;
+            }
+        }
+        debug_assert_eq!(k, 47);
+
+        // Fisher-Yates partial shuffle: pick 4 random cards
+        for i in 0..4 {
+            let j = rng.random_range(i..47);
+            pool.swap(i, j);
+        }
+
+        let p2 = [pool[0], pool[1]];
+        let board = [flop_cards[0], flop_cards[1], flop_cards[2], pool[2], pool[3]];
+        deals.push(PostflopState::new_preflop_with_board(
+            p1,
+            p2,
+            board,
+            stack_depth,
+        ));
+    }
+
+    deals
+}
+
 impl Game for HunlPostflop {
     type State = PostflopState;
 
     fn initial_states(&self) -> Vec<Self::State> {
         let mut deals = match &self.abstraction {
             Some(AbstractionMode::HandClass | AbstractionMode::HandClassV2 { .. }) => {
+                let base = if self.uniform_deals {
+                    self.generate_uniform_deals(self.rng_seed)
+                } else {
+                    self.generate_flop_deals(self.rng_seed, self.deal_count)
+                };
                 if self.min_deals_per_class > 0 {
-                    self.generate_stratified_deals(
+                    self.stratify_pool(
+                        base,
                         self.rng_seed,
-                        self.deal_count,
                         self.min_deals_per_class,
                         self.max_rejections_per_class,
                     )
                 } else {
-                    self.generate_flop_deals(self.rng_seed, self.deal_count)
+                    base
                 }
             }
             _ => self.generate_random_deals(self.rng_seed, self.deal_count),
@@ -2148,5 +2300,197 @@ mod tests {
             .with_stratification(50, 100_000);
         assert_eq!(game.min_deals_per_class, 50);
         assert_eq!(game.max_rejections_per_class, 100_000);
+    }
+
+    // ==================== decode_hole_pair tests ====================
+
+    #[timed_test]
+    fn decode_hole_pair_first_index() {
+        let (a, b) = super::decode_hole_pair(0, 49);
+        assert_eq!((a, b), (0, 1), "Index 0 should give pair (0, 1)");
+    }
+
+    #[timed_test]
+    fn decode_hole_pair_last_index() {
+        let (a, b) = super::decode_hole_pair(C49_2 - 1, 49);
+        assert_eq!((a, b), (47, 48), "Last index should give pair (47, 48)");
+    }
+
+    #[timed_test]
+    fn decode_hole_pair_round_trip_all_indices() {
+        use std::collections::HashSet;
+        let n = 49;
+        let total = n * (n - 1) / 2;
+        assert_eq!(total, C49_2);
+
+        let mut seen = HashSet::new();
+        for idx in 0..total {
+            let (a, b) = super::decode_hole_pair(idx, n);
+            assert!(a < b, "Expected a < b, got a={a}, b={b} at idx={idx}");
+            assert!(b < n, "Expected b < {n}, got b={b} at idx={idx}");
+            assert!(seen.insert((a, b)), "Duplicate pair ({a}, {b}) at idx={idx}");
+        }
+
+        assert_eq!(seen.len(), total, "Should have exactly {total} unique pairs");
+    }
+
+    #[timed_test]
+    fn decode_hole_pair_small_n() {
+        // C(4, 2) = 6 pairs: (0,1) (0,2) (1,2) (0,3) (1,3) (2,3)
+        let expected = [(0, 1), (0, 2), (1, 2), (0, 3), (1, 3), (2, 3)];
+        for (idx, &exp) in expected.iter().enumerate() {
+            let result = super::decode_hole_pair(idx, 4);
+            assert_eq!(result, exp, "idx={idx}: expected {exp:?}, got {result:?}");
+        }
+    }
+
+    // ==================== uniform deal generation tests ====================
+
+    #[timed_test]
+    fn generate_deals_for_single_flop_count() {
+        let flops = crate::flops::all_flops();
+        let deck = HunlPostflop::full_deck();
+
+        let deals = super::generate_deals_for_flop(&flops[0], &deck, 42, 0, 25);
+
+        assert_eq!(
+            deals.len(),
+            C49_2,
+            "Should produce C(49,2)={} deals per flop, got {}",
+            C49_2,
+            deals.len()
+        );
+    }
+
+    #[timed_test]
+    fn generate_deals_for_flop_no_card_conflicts() {
+        let flops = crate::flops::all_flops();
+        let deck = HunlPostflop::full_deck();
+
+        let deals = super::generate_deals_for_flop(&flops[0], &deck, 42, 0, 25);
+
+        for (i, deal) in deals.iter().enumerate() {
+            let board = deal.full_board.expect("should have board");
+            let mut all_cards = vec![
+                deal.p1_holding[0],
+                deal.p1_holding[1],
+                deal.p2_holding[0],
+                deal.p2_holding[1],
+                board[0],
+                board[1],
+                board[2],
+                board[3],
+                board[4],
+            ];
+            let orig_len = all_cards.len();
+            all_cards.sort_by_key(|c| (c.value as u8, c.suit as u8));
+            all_cards.dedup();
+            assert_eq!(all_cards.len(), orig_len, "Deal {i} has duplicate cards");
+        }
+    }
+
+    #[timed_test]
+    fn generate_deals_for_flop_all_p1_pairs_unique() {
+        use std::collections::HashSet;
+
+        let flops = crate::flops::all_flops();
+        let deck = HunlPostflop::full_deck();
+
+        let deals = super::generate_deals_for_flop(&flops[0], &deck, 42, 0, 25);
+
+        let mut seen = HashSet::new();
+        for deal in &deals {
+            let mut pair = [deal.p1_holding[0], deal.p1_holding[1]];
+            pair.sort_by_key(|c| (c.value as u8, c.suit as u8));
+            assert!(
+                seen.insert((pair[0].value as u8, pair[0].suit as u8,
+                             pair[1].value as u8, pair[1].suit as u8)),
+                "Duplicate P1 pair"
+            );
+        }
+        assert_eq!(seen.len(), C49_2);
+    }
+
+    #[timed_test]
+    fn generate_deals_for_flop_p1_uses_only_remaining_cards() {
+        let flops = crate::flops::all_flops();
+        let deck = HunlPostflop::full_deck();
+
+        let deals = super::generate_deals_for_flop(&flops[0], &deck, 42, 0, 25);
+        let flop_cards = *flops[0].cards();
+
+        for deal in &deals {
+            for &hole_card in &deal.p1_holding {
+                assert!(
+                    !flop_cards.contains(&hole_card),
+                    "P1 hole card {:?} collides with flop {:?}",
+                    hole_card,
+                    flop_cards
+                );
+            }
+        }
+    }
+
+    #[timed_test]
+    fn generate_deals_for_flop_preserves_flop() {
+        let flops = crate::flops::all_flops();
+        let deck = HunlPostflop::full_deck();
+
+        let deals = super::generate_deals_for_flop(&flops[42], &deck, 77, 42, 25);
+        let flop_cards = *flops[42].cards();
+
+        for deal in &deals {
+            let board = deal.full_board.expect("should have board");
+            assert_eq!(board[0], flop_cards[0]);
+            assert_eq!(board[1], flop_cards[1]);
+            assert_eq!(board[2], flop_cards[2]);
+        }
+    }
+
+    #[timed_test]
+    fn generate_deals_for_flop_p2_diversity() {
+        use std::collections::HashSet;
+
+        let flops = crate::flops::all_flops();
+        let deck = HunlPostflop::full_deck();
+
+        let deals = super::generate_deals_for_flop(&flops[0], &deck, 42, 0, 25);
+
+        // For a given P1 combo, P2 should vary across different P1 combos
+        // Check that not all deals have the same P2
+        let p2_set: HashSet<_> = deals
+            .iter()
+            .map(|d| (d.p2_holding[0].value as u8, d.p2_holding[0].suit as u8,
+                       d.p2_holding[1].value as u8, d.p2_holding[1].suit as u8))
+            .collect();
+
+        assert!(
+            p2_set.len() > 1,
+            "P2 holdings should vary across deals, but all {} deals have same P2",
+            deals.len()
+        );
+    }
+
+    #[timed_test]
+    fn generate_deals_for_flop_deterministic() {
+        let flops = crate::flops::all_flops();
+        let deck = HunlPostflop::full_deck();
+
+        let deals1 = super::generate_deals_for_flop(&flops[0], &deck, 42, 0, 25);
+        let deals2 = super::generate_deals_for_flop(&flops[0], &deck, 42, 0, 25);
+
+        for (d1, d2) in deals1.iter().zip(deals2.iter()) {
+            assert_eq!(d1.p1_holding, d2.p1_holding);
+            assert_eq!(d1.p2_holding, d2.p2_holding);
+            assert_eq!(d1.full_board, d2.full_board);
+        }
+    }
+
+    #[timed_test]
+    fn with_uniform_deals_builder() {
+        let config = PostflopConfig::default();
+        let game = HunlPostflop::new(config, Some(AbstractionMode::HandClass), 1)
+            .with_uniform_deals();
+        assert!(game.uniform_deals);
     }
 }
