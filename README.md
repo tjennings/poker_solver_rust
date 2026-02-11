@@ -59,7 +59,7 @@ game:
 
 ```yaml
 training:
-  iterations: 5000          # Total MCCFR iterations
+  iterations: 5000          # Total MCCFR iterations (or use convergence_threshold)
   seed: 42                  # RNG seed for reproducibility
   output_dir: "./my_strategy"
   mccfr_samples: 5000       # Deals sampled per iteration (default: 500)
@@ -127,6 +127,22 @@ training:
 - `pruning_warmup_fraction` delays pruning until the strategy has partially converged. At 0.30, the first 30% of iterations explore everything.
 - `pruning_probe_interval` runs a full un-pruned iteration every N iterations to discover if pruned actions have become viable.
 
+#### Convergence-based stopping
+
+Instead of a fixed iteration count, you can train until the strategy stabilizes. Set `convergence_threshold` to stop when the mean L1 strategy delta between consecutive checkpoints drops below the threshold:
+
+```yaml
+training:
+  convergence_threshold: 0.001   # Stop when mean L1 delta < this value
+  convergence_check_interval: 100  # Check every N iterations (default: 100)
+```
+
+When `convergence_threshold` is set, `iterations` is ignored. The trainer runs in a loop: train for `convergence_check_interval` iterations, snapshot the strategy, compute the mean L1 distance from the previous snapshot, and stop if it falls below the threshold. Each check also saves a numbered checkpoint bundle.
+
+The strategy delta is the average per-info-set sum of absolute differences in action probabilities between consecutive snapshots. A value of 0.001 means action probabilities are changing by less than 0.1% on average per info set.
+
+If both `convergence_threshold` and `iterations` are set, a warning is printed and `convergence_threshold` takes precedence. At least one of the two must be specified.
+
 #### Complete example
 
 ```yaml
@@ -135,7 +151,7 @@ game:
   bet_sizes: [0.5, 1.0, 1.5]
 
 training:
-  iterations: 5000
+  iterations: 5000                    # or use convergence_threshold instead
   seed: 42
   output_dir: "./handclass_25bb_v2"
   mccfr_samples: 5000
@@ -148,6 +164,8 @@ training:
   pruning: true
   pruning_threshold: -5.0
   pruning_warmup_fraction: 0.30
+  # convergence_threshold: 0.001     # uncomment to train until converged
+  # convergence_check_interval: 100
 ```
 
 ### 2. Run training
