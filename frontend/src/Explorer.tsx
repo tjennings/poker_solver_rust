@@ -795,14 +795,27 @@ export default function Explorer() {
         const result = await invoke<CanonicalizeResult>('canonicalize_board', { cards });
         const canonicalCards = result.canonical_cards;
 
-        // Track remap info for the indicator (flop establishes it, turn/river extends it)
-        if (result.remapped && result.suit_map) {
-          setRemapInfo((prev) => ({
-            original: [...(prev?.original ?? []), ...cards],
-            canonical: [...(prev?.canonical ?? []), ...canonicalCards],
-            suitMap: { ...(prev?.suitMap ?? {}), ...result.suit_map },
-          }));
-        }
+        // Track remap info for the indicator.
+        // On flop: establish if remapped. On turn/river: always accumulate if a mapping exists.
+        setRemapInfo((prev) => {
+          if (result.remapped && result.suit_map) {
+            // This street introduced new suit substitutions
+            return {
+              original: [...(prev?.original ?? []), ...cards],
+              canonical: [...(prev?.canonical ?? []), ...canonicalCards],
+              suitMap: { ...(prev?.suitMap ?? {}), ...result.suit_map },
+            };
+          }
+          if (prev) {
+            // Mapping exists from a prior street — accumulate even if this card didn't change
+            return {
+              ...prev,
+              original: [...prev.original, ...cards],
+              canonical: [...prev.canonical, ...canonicalCards],
+            };
+          }
+          return prev;
+        });
 
         // Add street to history (use canonical cards)
         const streetItem: HistoryItem = {
