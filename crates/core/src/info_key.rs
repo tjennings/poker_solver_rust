@@ -705,7 +705,7 @@ fn parse_action_codes(s: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Generate a human-readable hand label from the raw 28-bit hand field.
-fn hand_label_from_bits(hand_bits: u32, street: u8, mode: &str) -> String {
+pub fn hand_label_from_bits(hand_bits: u32, street: u8, mode: &str) -> String {
     match mode {
         "ehs2" => {
             if street == 0 && hand_bits < 169 {

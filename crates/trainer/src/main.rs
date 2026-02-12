@@ -20,7 +20,7 @@ use poker_solver_core::cfr::{
 };
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
 use poker_solver_core::game::{AbstractionMode, Action, HunlPostflop, PostflopConfig, PostflopState};
-use poker_solver_core::info_key::{canonical_hand_index_from_str, spr_bucket, InfoKey};
+use poker_solver_core::info_key::{canonical_hand_index_from_str, hand_label_from_bits, reverse_canonical_index, spr_bucket, InfoKey};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
@@ -79,6 +79,21 @@ enum Commands {
         #[arg(short, long)]
         threads: Option<usize>,
     },
+    /// Inspect pre-generated abstract deal files
+    InspectDeals {
+        /// Directory containing abstract_deals.bin and manifest.yaml
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Number of sample deals to display (0 = summary only)
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+        /// Sort deals by: weight, equity, or none
+        #[arg(long, default_value = "weight")]
+        sort: DealSortOrder,
+        /// Export deals to CSV file
+        #[arg(long)]
+        csv: Option<PathBuf>,
+    },
     /// Analyze game tree or translate info set keys
     Tree {
         /// Path to trained strategy bundle
@@ -119,6 +134,14 @@ enum SolverMode {
 enum OutputFormat {
     Json,
     Csv,
+}
+
+/// Sort order for inspect-deals sample output.
+#[derive(Debug, Clone, ValueEnum)]
+enum DealSortOrder {
+    Weight,
+    Equity,
+    None,
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,6 +284,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             let yaml = std::fs::read_to_string(&config)?;
             let training_config: TrainingConfig = serde_yaml::from_str(&yaml)?;
             run_generate_deals(training_config, &output, dry_run)?;
+        }
+        Commands::InspectDeals { input, limit, sort, csv } => {
+            run_inspect_deals(&input, limit, sort, csv.as_deref())?;
         }
         Commands::TreeStats { config, sample_deals } => {
             let yaml = std::fs::read_to_string(&config)?;
@@ -1305,6 +1331,184 @@ fn load_abstract_deals(dir: &str) -> Result<Vec<DealInfo>, Box<dyn Error>> {
     }).collect();
     println!("  {} deals loaded in {:?}", deals.len(), start.elapsed());
     Ok(deals)
+}
+
+fn run_inspect_deals(
+    input: &std::path::Path,
+    limit: usize,
+    sort: DealSortOrder,
+    csv: Option<&std::path::Path>,
+) -> Result<(), Box<dyn Error>> {
+    // Load manifest
+    let manifest_path = input.join("manifest.yaml");
+    let manifest_str = std::fs::read_to_string(&manifest_path)?;
+    let manifest: serde_yaml::Value = serde_yaml::from_str(&manifest_str)?;
+
+    println!("=== Abstract Deal Inspector ===\n");
+    println!("Source: {}/", input.display());
+    print_manifest(&manifest);
+
+    // Load deals
+    let deals = load_abstract_deals(&input.to_string_lossy())?;
+
+    // Compute and print statistics
+    let equities: Vec<f64> = deals.iter().map(|d| d.p1_equity).collect();
+    let weights: Vec<f64> = deals.iter().map(|d| d.weight).collect();
+
+    println!("\n--- Summary Statistics ---");
+    println!("Total deals: {}", deals.len());
+    println!("Total weight: {:.1}", weights.iter().sum::<f64>());
+    println!();
+
+    print_equity_stats(&equities);
+    print_weight_stats(&weights);
+    print_class_histogram(&deals);
+
+    // Print sample deals
+    if limit > 0 {
+        print_sample_deals(&deals, limit, &sort);
+    }
+
+    // Optional CSV export
+    if let Some(csv_path) = csv {
+        export_csv(&deals, csv_path)?;
+    }
+
+    Ok(())
+}
+
+fn print_manifest(manifest: &serde_yaml::Value) {
+    println!("Manifest:");
+    if let Some(map) = manifest.as_mapping() {
+        for (k, v) in map {
+            if let Some(key) = k.as_str() {
+                match v {
+                    serde_yaml::Value::Number(n) => println!("  {key}: {n}"),
+                    serde_yaml::Value::String(s) => println!("  {key}: {s}"),
+                    serde_yaml::Value::Bool(b) => println!("  {key}: {b}"),
+                    other => println!("  {key}: {other:?}"),
+                }
+            }
+        }
+    }
+}
+
+fn print_equity_stats(equities: &[f64]) {
+    if equities.is_empty() {
+        return;
+    }
+    let min = equities.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = equities.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mean = equities.iter().sum::<f64>() / equities.len() as f64;
+    let median = {
+        let mut sorted = equities.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted[sorted.len() / 2]
+    };
+    let variance = equities.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / equities.len() as f64;
+    let stddev = variance.sqrt();
+
+    println!("Equity distribution:");
+    println!("  min={min:.4}  max={max:.4}  mean={mean:.4}  median={median:.4}  stddev={stddev:.4}");
+}
+
+fn print_weight_stats(weights: &[f64]) {
+    if weights.is_empty() {
+        return;
+    }
+    let min = weights.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = weights.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mean = weights.iter().sum::<f64>() / weights.len() as f64;
+
+    println!("Weight distribution:");
+    println!("  min={min:.4}  max={max:.4}  mean={mean:.4}");
+}
+
+fn print_class_histogram(deals: &[DealInfo]) {
+    let mut counts: FxHashMap<u8, usize> = FxHashMap::default();
+    for deal in deals {
+        let river_bits = deal.hand_bits_p1[3];
+        let class_id = ((river_bits >> 23) & 0x1F) as u8;
+        *counts.entry(class_id).or_default() += 1;
+    }
+
+    let mut entries: Vec<(u8, usize)> = counts.into_iter().collect();
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
+
+    println!("\nP1 river hand class frequency:");
+    println!("  {:<20} {:>8} {:>7}", "Class", "Count", "%");
+    println!("  {}", "-".repeat(37));
+    let total = deals.len() as f64;
+    for (class_id, count) in &entries {
+        let name = HandClass::ALL
+            .get(*class_id as usize)
+            .map_or_else(|| format!("class{class_id}"), |c| c.to_string());
+        let pct = *count as f64 / total * 100.0;
+        println!("  {name:<20} {count:>8} {pct:>6.1}%");
+    }
+}
+
+fn decode_trajectory(bits: [u32; 4]) -> [String; 4] {
+    let preflop = reverse_canonical_index(bits[0] as u16).to_string();
+    let flop = hand_label_from_bits(bits[1], 1, "hand_class_v2");
+    let turn = hand_label_from_bits(bits[2], 2, "hand_class_v2");
+    let river = hand_label_from_bits(bits[3], 3, "hand_class_v2");
+    [preflop, flop, turn, river]
+}
+
+fn print_sample_deals(deals: &[DealInfo], limit: usize, sort: &DealSortOrder) {
+    let mut indices: Vec<usize> = (0..deals.len()).collect();
+    match sort {
+        DealSortOrder::Weight => {
+            indices.sort_by(|&a, &b| {
+                deals[b].weight.partial_cmp(&deals[a].weight)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        DealSortOrder::Equity => {
+            indices.sort_by(|&a, &b| {
+                deals[b].p1_equity.partial_cmp(&deals[a].p1_equity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        DealSortOrder::None => {}
+    }
+
+    let n = limit.min(indices.len());
+    println!("\n--- Sample Deals (top {n} by {sort:?}) ---");
+    for (rank, &idx) in indices.iter().take(n).enumerate() {
+        let deal = &deals[idx];
+        let p1 = decode_trajectory(deal.hand_bits_p1);
+        let p2 = decode_trajectory(deal.hand_bits_p2);
+        println!(
+            "\nDeal #{} (weight={:.1}, equity={:.4}):",
+            rank + 1, deal.weight, deal.p1_equity,
+        );
+        println!("  P1: {} -> {} -> {} -> {}", p1[0], p1[1], p1[2], p1[3]);
+        println!("  P2: {} -> {} -> {} -> {}", p2[0], p2[1], p2[2], p2[3]);
+    }
+    println!();
+}
+
+fn export_csv(deals: &[DealInfo], path: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    let mut file = std::fs::File::create(path)?;
+    writeln!(
+        file,
+        "p1_preflop,p1_flop,p1_turn,p1_river,p2_preflop,p2_flop,p2_turn,p2_river,equity,weight"
+    )?;
+    for deal in deals {
+        let p1 = decode_trajectory(deal.hand_bits_p1);
+        let p2 = decode_trajectory(deal.hand_bits_p2);
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{:.6},{:.6}",
+            p1[0], p1[1], p1[2], p1[3],
+            p2[0], p2[1], p2[2], p2[3],
+            deal.p1_equity, deal.weight,
+        )?;
+    }
+    println!("Exported {} deals to {}", deals.len(), path.display());
+    Ok(())
 }
 
 fn build_abstraction_mode(config: &TrainingConfig) -> Option<AbstractionMode> {

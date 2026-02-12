@@ -362,6 +362,37 @@ training:
   abstract_deals_dir: ./my_deals/
 ```
 
+## Inspecting Abstract Deals
+
+The `inspect-deals` subcommand loads pre-generated abstract deal files and displays summary statistics, sample deals, and optionally exports to CSV. Useful for debugging deal generation and verifying abstraction quality.
+
+```bash
+# Summary statistics + 10 sample deals (sorted by weight)
+cargo run -p poker-solver-trainer --release -- inspect-deals -i ./my_deals/
+
+# Show 20 deals sorted by equity
+cargo run -p poker-solver-trainer --release -- inspect-deals -i ./my_deals/ --limit 20 --sort equity
+
+# Summary only (no sample deals)
+cargo run -p poker-solver-trainer --release -- inspect-deals -i ./my_deals/ --limit 0
+
+# Export all deals to CSV
+cargo run -p poker-solver-trainer --release -- inspect-deals -i ./my_deals/ --csv deals.csv
+```
+
+Options:
+- `-i, --input <DIR>` — Directory containing `abstract_deals.bin` and `manifest.yaml`
+- `-l, --limit <N>` — Number of sample deals to display (default: 10, 0 = summary only)
+- `--sort <ORDER>` — Sort sample deals by `weight`, `equity`, or `none` (default: weight)
+- `--csv <FILE>` — Export all deals to a CSV file
+
+Output includes:
+- **Manifest** — Config snapshot (stack depth, strength/equity bits, compression ratio)
+- **Equity distribution** — min, max, mean, median, stddev
+- **Weight distribution** — min, max, mean
+- **Hand class histogram** — P1 river hand class frequency table sorted by count
+- **Sample deals** — Per-street hand classification trajectories for both players
+
 ## Analyzing the Game Tree
 
 The `tree` subcommand inspects trained strategy bundles. It has two modes: **deal tree** (walk a concrete deal showing strategies at each node) and **key describe** (translate info set keys).
