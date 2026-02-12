@@ -22,14 +22,17 @@
 //! equity and summed weight, ready for use as a [`DealInfo`].
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 
 use crate::cfr::DealInfo;
+use crate::error::SolverError;
 use crate::flops::{self, CanonicalFlop};
 use crate::hand_class::{classify, intra_class_strength, HandClass};
 use crate::info_key::{canonical_hand_index, encode_hand_v2};
@@ -96,6 +99,44 @@ pub struct GenerationStats {
     pub abstract_deals: usize,
     /// Compression ratio (concrete / abstract).
     pub compression_ratio: f64,
+}
+
+/// On-disk format for a single batch of accumulated trajectories.
+#[derive(Serialize, Deserialize)]
+struct BatchFile {
+    version: u32,
+    batch_index: u32,
+    flops_in_batch: u32,
+    concrete_deals: u64,
+    /// Each entry: `(p1_bits, p2_bits, weight, equity_sum)`.
+    entries: Vec<([u32; 4], [u32; 4], f64, f64)>,
+}
+
+const BATCH_VERSION: u32 = 1;
+
+/// Precomputed invariants shared across batches.
+///
+/// Expensive to build once, cheap to reuse for every batch of flops.
+pub struct DealGenContext {
+    hole_pairs: Vec<[Card; 2]>,
+    preflop_encs: Vec<u32>,
+    hole_masks: Vec<u64>,
+    deck: Vec<Card>,
+}
+
+impl DealGenContext {
+    /// Build context from a deal config. Call once before processing batches.
+    #[must_use]
+    pub fn new(config: &AbstractDealConfig) -> Self {
+        let deck = crate::poker::full_deck();
+        let hole_pairs = select_hole_pairs(&deck, config.max_hole_pairs);
+        let preflop_encs: Vec<u32> = hole_pairs
+            .iter()
+            .map(|h| u32::from(canonical_hand_index(*h)))
+            .collect();
+        let hole_masks: Vec<u64> = hole_pairs.iter().map(|h| card_mask_pair(*h)).collect();
+        Self { hole_pairs, preflop_encs, hole_masks, deck }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +560,121 @@ pub fn generate_abstract_deals(config: &AbstractDealConfig) -> (Vec<AbstractDeal
     );
 
     (deals, stats)
+}
+
+/// Process a batch of canonical flops, accumulate trajectories, and write to disk.
+///
+/// Returns `(entries_written, concrete_deals)`.
+///
+/// # Errors
+///
+/// Returns `SolverError::BatchSerialize` if serialization fails, or
+/// `SolverError::Io` if writing the batch file fails.
+#[allow(clippy::cast_possible_truncation)]
+pub fn generate_deals_batch(
+    ctx: &DealGenContext,
+    config: &AbstractDealConfig,
+    flops: &[CanonicalFlop],
+    batch_index: u32,
+    batch_path: &Path,
+) -> Result<(usize, u64), SolverError> {
+    let flop_results: Vec<_> = flops
+        .par_iter()
+        .map(|flop| {
+            process_flop_board_centric(
+                flop,
+                &ctx.hole_pairs,
+                &ctx.preflop_encs,
+                &ctx.hole_masks,
+                &ctx.deck,
+                config,
+            )
+        })
+        .collect();
+
+    let (merged, concrete) = merge_flop_results(flop_results);
+    let entries: Vec<([u32; 4], [u32; 4], f64, f64)> = merged
+        .into_iter()
+        .map(|(k, v)| (k.p1_bits, k.p2_bits, v.weight, v.equity_sum))
+        .collect();
+
+    let count = entries.len();
+    let batch = BatchFile {
+        version: BATCH_VERSION,
+        batch_index,
+        flops_in_batch: flops.len() as u32,
+        concrete_deals: concrete,
+        entries,
+    };
+
+    let data = bincode::serialize(&batch)
+        .map_err(|e| SolverError::BatchSerialize(e.to_string()))?;
+    std::fs::write(batch_path, data)?;
+
+    Ok((count, concrete))
+}
+
+/// Load batch files one at a time, merge into a global trajectory map,
+/// finalize into `AbstractDeal` vec, and write to `output_path`.
+///
+/// Returns the final deals and generation stats.
+///
+/// # Errors
+///
+/// Returns `SolverError::NoBatchFiles` if `batch_paths` is empty,
+/// `SolverError::BatchVersionMismatch` on version mismatch,
+/// `SolverError::BatchSerialize` on (de)serialization failure,
+/// or `SolverError::Io` on I/O failure.
+pub fn merge_deal_batches(
+    batch_paths: &[PathBuf],
+    output_path: &Path,
+) -> Result<(Vec<AbstractDeal>, GenerationStats), SolverError> {
+    if batch_paths.is_empty() {
+        return Err(SolverError::NoBatchFiles(
+            output_path.display().to_string(),
+        ));
+    }
+
+    let mut global = FxHashMap::<TrajectoryKey, TrajectoryAccum>::default();
+    let mut total_concrete = 0u64;
+
+    for path in batch_paths {
+        let data = std::fs::read(path)?;
+        let batch: BatchFile = bincode::deserialize(&data)
+            .map_err(|e| SolverError::BatchSerialize(e.to_string()))?;
+
+        if batch.version != BATCH_VERSION {
+            return Err(SolverError::BatchVersionMismatch {
+                expected: BATCH_VERSION,
+                actual: batch.version,
+            });
+        }
+
+        total_concrete += batch.concrete_deals;
+        for (p1, p2, weight, equity_sum) in batch.entries {
+            let key = TrajectoryKey { p1_bits: p1, p2_bits: p2 };
+            let e = global.entry(key).or_insert(TrajectoryAccum {
+                weight: 0.0,
+                equity_sum: 0.0,
+            });
+            e.weight += weight;
+            e.equity_sum += equity_sum;
+        }
+        // batch is dropped here, freeing memory before loading next
+    }
+
+    let (deals, stats) = finalize_deals(global, total_concrete);
+
+    // Serialize final deals in the same format as run_generate_deals
+    let tuples: Vec<([u32; 4], [u32; 4], f64, f64)> = deals
+        .iter()
+        .map(|d| (d.hand_bits_p1, d.hand_bits_p2, d.p1_equity, d.weight))
+        .collect();
+    let data = bincode::serialize(&tuples)
+        .map_err(|e| SolverError::BatchSerialize(e.to_string()))?;
+    std::fs::write(output_path, data)?;
+
+    Ok((deals, stats))
 }
 
 /// Select and optionally subsample hole card pairs.

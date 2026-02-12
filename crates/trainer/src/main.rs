@@ -2,7 +2,7 @@ mod tree;
 
 use std::error::Error;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
@@ -78,6 +78,9 @@ enum Commands {
         /// Number of threads for parallel generation (default: all cores)
         #[arg(short, long)]
         threads: Option<usize>,
+        /// Number of canonical flops per batch (0 = in-memory, no batching)
+        #[arg(long, default_value = "20")]
+        batch_size: usize,
     },
     /// Inspect pre-generated abstract deal files
     InspectDeals {
@@ -93,6 +96,15 @@ enum Commands {
         /// Export deals to CSV file
         #[arg(long)]
         csv: Option<PathBuf>,
+    },
+    /// Merge batch files from a batched generate-deals run
+    MergeDeals {
+        /// Directory containing batch_*.bin files
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Output directory for abstract_deals.bin + manifest.yaml
+        #[arg(short, long)]
+        output: PathBuf,
     },
     /// Analyze game tree or translate info set keys
     Tree {
@@ -274,7 +286,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        Commands::GenerateDeals { config, output, dry_run, threads } => {
+        Commands::GenerateDeals { config, output, dry_run, threads, batch_size } => {
             if let Some(n) = threads {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(n)
@@ -283,7 +295,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let yaml = std::fs::read_to_string(&config)?;
             let training_config: TrainingConfig = serde_yaml::from_str(&yaml)?;
-            run_generate_deals(training_config, &output, dry_run)?;
+            run_generate_deals(training_config, &output, dry_run, batch_size)?;
+        }
+        Commands::MergeDeals { input, output } => {
+            run_merge_deals(&input, &output)?;
         }
         Commands::InspectDeals { input, limit, sort, csv } => {
             run_inspect_deals(&input, limit, sort, csv.as_deref())?;
@@ -631,8 +646,9 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
 fn run_generate_deals(
     config: TrainingConfig,
-    output: &PathBuf,
+    output: &Path,
     dry_run: bool,
+    batch_size: usize,
 ) -> Result<(), Box<dyn Error>> {
     let abs_mode = config.training.abstraction_mode;
     if abs_mode != AbstractionModeConfig::HandClassV2 {
@@ -651,6 +667,9 @@ fn run_generate_deals(
     println!("  Stack depth: {} BB", deal_config.stack_depth);
     println!("  Strength bits: {}", deal_config.strength_bits);
     println!("  Equity bits: {}", deal_config.equity_bits);
+    if batch_size > 0 {
+        println!("  Batch size: {} flops", batch_size);
+    }
     println!();
 
     if dry_run {
@@ -666,41 +685,210 @@ fn run_generate_deals(
     }
 
     let start = Instant::now();
-    let (deals, stats) = abstract_game::generate_abstract_deals(&deal_config);
-    let elapsed = start.elapsed();
 
-    println!("\nGeneration complete in {elapsed:?}");
+    if batch_size > 0 {
+        run_generate_deals_batched(&config, &deal_config, output, batch_size)?;
+    } else {
+        run_generate_deals_in_memory(&config, &deal_config, output)?;
+    }
+
+    println!("\nTotal time: {:?}", start.elapsed());
+    Ok(())
+}
+
+fn run_generate_deals_in_memory(
+    config: &TrainingConfig,
+    deal_config: &AbstractDealConfig,
+    output: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let (deals, stats) = abstract_game::generate_abstract_deals(deal_config);
+
+    println!("\nGeneration complete");
     println!("  Concrete deals: {}", stats.concrete_deals);
     println!("  Abstract deals: {}", stats.abstract_deals);
     println!("  Compression: {:.1}x", stats.compression_ratio);
 
-    // Save deals
+    save_deals_and_manifest(config, &deals, &stats, output)
+}
+
+fn run_generate_deals_batched(
+    config: &TrainingConfig,
+    deal_config: &AbstractDealConfig,
+    output: &Path,
+    batch_size: usize,
+) -> Result<(), Box<dyn Error>> {
+    use abstract_game::DealGenContext;
+
+    let canonical_flops = flops::all_flops();
+    let total_flops = canonical_flops.len();
+    let num_batches = total_flops.div_ceil(batch_size);
+
+    println!("Building deal generation context...");
+    let ctx = DealGenContext::new(deal_config);
+
+    let batches_dir = output.join("batches");
+    std::fs::create_dir_all(&batches_dir)?;
+
+    println!(
+        "Processing {} flops in {} batches of up to {}...\n",
+        total_flops, num_batches, batch_size
+    );
+
+    let mut batch_paths = Vec::with_capacity(num_batches);
+    let mut total_entries = 0usize;
+    let mut total_concrete = 0u64;
+
+    for (i, chunk) in canonical_flops.chunks(batch_size).enumerate() {
+        let batch_path = batches_dir.join(format!("batch_{i:04}.bin"));
+        let batch_start = Instant::now();
+
+        let (entries, concrete) = abstract_game::generate_deals_batch(
+            &ctx,
+            deal_config,
+            chunk,
+            i as u32,
+            &batch_path,
+        )?;
+
+        total_entries += entries;
+        total_concrete += concrete;
+        batch_paths.push(batch_path);
+
+        println!(
+            "  batch {}/{}: {} flops, {} entries, {} concrete deals ({:?})",
+            i + 1,
+            num_batches,
+            chunk.len(),
+            entries,
+            concrete,
+            batch_start.elapsed(),
+        );
+    }
+
+    println!(
+        "\nAll batches written ({} total entries, {} concrete deals)",
+        total_entries, total_concrete
+    );
+    println!("Merging batches...");
+
+    let deals_path = output.join("abstract_deals.bin");
+    let (deals, stats) =
+        abstract_game::merge_deal_batches(&batch_paths, &deals_path)?;
+
+    println!(
+        "  {} concrete -> {} abstract deals ({:.1}x compression)",
+        stats.concrete_deals, stats.abstract_deals, stats.compression_ratio
+    );
+
+    save_manifest(config, &stats, output)?;
+    let file_size = std::fs::metadata(&deals_path)?.len();
+    println!(
+        "  Saved to {}/  ({:.2} MB)",
+        output.display(),
+        file_size as f64 / 1_048_576.0
+    );
+
+    // Verify round-trip
+    println!("  {} abstract deals finalized", deals.len());
+
+    Ok(())
+}
+
+fn save_deals_and_manifest(
+    config: &TrainingConfig,
+    deals: &[abstract_game::AbstractDeal],
+    stats: &abstract_game::GenerationStats,
+    output: &Path,
+) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(output)?;
     let deals_path = output.join("abstract_deals.bin");
-    let data = bincode::serialize(&deals.iter().map(|d| {
-        (d.hand_bits_p1, d.hand_bits_p2, d.p1_equity, d.weight)
-    }).collect::<Vec<_>>())?;
+    let data = bincode::serialize(
+        &deals
+            .iter()
+            .map(|d| (d.hand_bits_p1, d.hand_bits_p2, d.p1_equity, d.weight))
+            .collect::<Vec<_>>(),
+    )?;
     std::fs::write(&deals_path, &data)?;
 
-    // Save manifest
+    save_manifest(config, stats, output)?;
+
+    println!("  Saved to {}/", output.display());
+    println!("  File size: {:.2} MB", data.len() as f64 / 1_048_576.0);
+    Ok(())
+}
+
+fn save_manifest(
+    config: &TrainingConfig,
+    stats: &abstract_game::GenerationStats,
+    output: &Path,
+) -> Result<(), Box<dyn Error>> {
     let manifest = serde_yaml::to_string(&serde_yaml::Value::Mapping({
         let mut m = serde_yaml::Mapping::new();
         m.insert("stack_depth".into(), config.game.stack_depth.into());
-        m.insert("strength_bits".into(), config.training.strength_bits.into());
+        m.insert(
+            "strength_bits".into(),
+            config.training.strength_bits.into(),
+        );
         m.insert("equity_bits".into(), config.training.equity_bits.into());
-        m.insert("concrete_deals".into(), (stats.concrete_deals as i64).into());
-        m.insert("abstract_deals".into(), (stats.abstract_deals as i64).into());
-        m.insert("compression_ratio".into(), serde_yaml::Value::Number(
-            serde_yaml::Number::from(stats.compression_ratio),
-        ));
+        m.insert(
+            "concrete_deals".into(),
+            (stats.concrete_deals as i64).into(),
+        );
+        m.insert(
+            "abstract_deals".into(),
+            (stats.abstract_deals as i64).into(),
+        );
+        m.insert(
+            "compression_ratio".into(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(stats.compression_ratio)),
+        );
         m
     }))?;
     std::fs::write(output.join("manifest.yaml"), manifest)?;
+    Ok(())
+}
 
-    println!("  Saved to {}/", output.display());
+fn run_merge_deals(input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+    println!("=== Merge Deal Batches ===\n");
+    println!("Input:  {}/", input.display());
+    println!("Output: {}/\n", output.display());
+
+    let mut batch_paths: Vec<PathBuf> = std::fs::read_dir(input)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|ext| ext == "bin")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("batch_"))
+        })
+        .collect();
+    batch_paths.sort();
+
+    if batch_paths.is_empty() {
+        return Err(format!("no batch_*.bin files found in {}", input.display()).into());
+    }
+
+    println!("Found {} batch files", batch_paths.len());
+
+    std::fs::create_dir_all(output)?;
+    let deals_path = output.join("abstract_deals.bin");
+
+    let start = Instant::now();
+    let (deals, stats) =
+        abstract_game::merge_deal_batches(&batch_paths, &deals_path)?;
+    let elapsed = start.elapsed();
+
+    println!("\nMerge complete in {elapsed:?}");
+    println!("  Concrete deals: {}", stats.concrete_deals);
+    println!("  Abstract deals: {} ({})", stats.abstract_deals, deals.len());
+    println!("  Compression: {:.1}x", stats.compression_ratio);
+
+    let file_size = std::fs::metadata(&deals_path)?.len();
     println!(
-        "  File size: {:.2} MB",
-        data.len() as f64 / 1_048_576.0
+        "  Saved to {}/abstract_deals.bin ({:.2} MB)",
+        output.display(),
+        file_size as f64 / 1_048_576.0
     );
 
     Ok(())
