@@ -978,8 +978,7 @@ fn run_generate_deals_batched(
     println!("Merging batches...");
 
     let deals_path = output.join("abstract_deals.bin");
-    let (deals, stats) =
-        abstract_game::merge_deal_batches(&batch_paths, &deals_path)?;
+    let stats = abstract_game::merge_deal_batches(&batch_paths, &deals_path)?;
 
     println!(
         "  {} concrete -> {} abstract deals ({:.1}x compression)",
@@ -993,9 +992,6 @@ fn run_generate_deals_batched(
         output.display(),
         file_size as f64 / 1_048_576.0
     );
-
-    // Verify round-trip
-    println!("  {} abstract deals finalized", deals.len());
 
     Ok(())
 }
@@ -1081,13 +1077,12 @@ fn run_merge_deals(input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     let deals_path = output.join("abstract_deals.bin");
 
     let start = Instant::now();
-    let (deals, stats) =
-        abstract_game::merge_deal_batches(&batch_paths, &deals_path)?;
+    let stats = abstract_game::merge_deal_batches(&batch_paths, &deals_path)?;
     let elapsed = start.elapsed();
 
     println!("\nMerge complete in {elapsed:?}");
     println!("  Concrete deals: {}", stats.concrete_deals);
-    println!("  Abstract deals: {} ({})", stats.abstract_deals, deals.len());
+    println!("  Abstract deals: {}", stats.abstract_deals);
     println!("  Compression: {:.1}x", stats.compression_ratio);
 
     let file_size = std::fs::metadata(&deals_path)?.len();
@@ -1510,18 +1505,37 @@ fn build_exhaustive_deals(config: &TrainingConfig) -> Result<Vec<DealInfo>, Box<
 }
 
 /// Load pre-generated abstract deals from a directory.
+///
+/// Auto-detects format by reading the first 4 bytes:
+/// - `b"DEAL"` → new raw binary format from streaming merge
+/// - Otherwise → legacy bincode `Vec<(p1, p2, eq, w)>` format
 fn load_abstract_deals(dir: &str) -> Result<Vec<DealInfo>, Box<dyn Error>> {
     let deals_path = PathBuf::from(dir).join("abstract_deals.bin");
     println!("Loading abstract deals from {}...", deals_path.display());
     let start = Instant::now();
-    let data = std::fs::read(&deals_path)?;
-    let tuples: Vec<([u32; 4], [u32; 4], f64, f64)> = bincode::deserialize(&data)?;
-    let deals: Vec<DealInfo> = tuples.into_iter().map(|(p1, p2, eq, w)| DealInfo {
-        hand_bits_p1: p1,
-        hand_bits_p2: p2,
-        p1_equity: eq,
-        weight: w,
-    }).collect();
+
+    // Peek at first 4 bytes to detect format
+    let mut file = std::fs::File::open(&deals_path)?;
+    let mut magic = [0u8; 4];
+    use std::io::Read;
+    file.read_exact(&mut magic)?;
+    drop(file);
+
+    let deals = if &magic == b"DEAL" {
+        println!("  detected raw binary (DEAL) format");
+        abstract_game::load_raw_deal_file(&deals_path)?
+    } else {
+        println!("  detected legacy bincode format");
+        let data = std::fs::read(&deals_path)?;
+        let tuples: Vec<([u32; 4], [u32; 4], f64, f64)> = bincode::deserialize(&data)?;
+        tuples.into_iter().map(|(p1, p2, eq, w)| DealInfo {
+            hand_bits_p1: p1,
+            hand_bits_p2: p2,
+            p1_equity: eq,
+            weight: w,
+        }).collect()
+    };
+
     println!("  {} deals loaded in {:?}", deals.len(), start.elapsed());
     Ok(deals)
 }

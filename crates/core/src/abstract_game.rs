@@ -21,7 +21,8 @@
 //! Each unique trajectory key maps to one [`AbstractDeal`] with averaged
 //! equity and summed weight, ready for use as a [`DealInfo`].
 
-use std::io::Write;
+use std::collections::BinaryHeap;
+use std::io::{self, BufReader, BufWriter, Read as _, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -78,7 +79,7 @@ pub struct AbstractDealConfig {
 }
 
 /// Key for deduplicating abstract deal trajectories.
-#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+#[derive(Hash, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
 struct TrajectoryKey {
     p1_bits: [u32; 4],
     p2_bits: [u32; 4],
@@ -614,10 +615,13 @@ pub fn generate_deals_batch(
     Ok((count, concrete))
 }
 
-/// Load batch files one at a time, merge into a global trajectory map,
-/// finalize into `AbstractDeal` vec, and write to `output_path`.
+/// Sort each batch file, then stream a k-way merge to the output file.
 ///
-/// Returns the final deals and generation stats.
+/// This replaces the old in-memory merge that OOM'd on large datasets.
+/// Peak memory: ~one batch during the sort phase, then O(k) during merge.
+///
+/// The output uses a raw binary format (magic `DEAL`) that can be read by
+/// [`load_raw_deal_file`].
 ///
 /// # Errors
 ///
@@ -628,53 +632,390 @@ pub fn generate_deals_batch(
 pub fn merge_deal_batches(
     batch_paths: &[PathBuf],
     output_path: &Path,
-) -> Result<(Vec<AbstractDeal>, GenerationStats), SolverError> {
+) -> Result<GenerationStats, SolverError> {
     if batch_paths.is_empty() {
         return Err(SolverError::NoBatchFiles(
             output_path.display().to_string(),
         ));
     }
 
-    let mut global = FxHashMap::<TrajectoryKey, TrajectoryAccum>::default();
+    // Phase 1: Sort each batch (one at a time to limit memory)
+    let mut sorted_paths = Vec::with_capacity(batch_paths.len());
     let mut total_concrete = 0u64;
 
-    for path in batch_paths {
-        let data = std::fs::read(path)?;
-        let batch: BatchFile = bincode::deserialize(&data)
-            .map_err(|e| SolverError::BatchSerialize(e.to_string()))?;
+    for (i, batch_path) in batch_paths.iter().enumerate() {
+        let sorted_path = batch_path.with_extension("sorted");
+        println!(
+            "  sorting batch {}/{} ({})...",
+            i + 1,
+            batch_paths.len(),
+            batch_path.file_name().unwrap_or_default().to_string_lossy(),
+        );
+        let concrete = sort_batch_to_file(batch_path, &sorted_path)?;
+        total_concrete += concrete;
+        sorted_paths.push(sorted_path);
+    }
+    println!("  all batches sorted ({total_concrete} concrete deals)");
 
-        if batch.version != BATCH_VERSION {
-            return Err(SolverError::BatchVersionMismatch {
-                expected: BATCH_VERSION,
-                actual: batch.version,
-            });
-        }
+    // Phase 2: Streaming k-way merge
+    println!("  starting k-way merge of {} sorted files...", sorted_paths.len());
+    let stats = streaming_kway_merge(&sorted_paths, output_path, total_concrete)?;
 
-        total_concrete += batch.concrete_deals;
-        for (p1, p2, weight, equity_sum) in batch.entries {
-            let key = TrajectoryKey { p1_bits: p1, p2_bits: p2 };
-            let e = global.entry(key).or_insert(TrajectoryAccum {
-                weight: 0.0,
-                equity_sum: 0.0,
-            });
-            e.weight += weight;
-            e.equity_sum += equity_sum;
-        }
-        // batch is dropped here, freeing memory before loading next
+    // Phase 3: Clean up sorted temp files
+    for path in &sorted_paths {
+        let _ = std::fs::remove_file(path);
     }
 
-    let (deals, stats) = finalize_deals(global, total_concrete);
+    Ok(stats)
+}
 
-    // Serialize final deals in the same format as run_generate_deals
-    let tuples: Vec<([u32; 4], [u32; 4], f64, f64)> = deals
-        .iter()
-        .map(|d| (d.hand_bits_p1, d.hand_bits_p2, d.p1_equity, d.weight))
-        .collect();
-    let data = bincode::serialize(&tuples)
+/// Read a raw binary deal file (`DEAL` magic) into a `Vec<DealInfo>`.
+///
+/// This is the counterpart to the output produced by [`merge_deal_batches`].
+///
+/// # Errors
+///
+/// Returns `SolverError::BatchSerialize` on format errors,
+/// `SolverError::BatchVersionMismatch` on version mismatch,
+/// or `SolverError::Io` on I/O failure.
+#[allow(clippy::cast_possible_truncation, clippy::missing_panics_doc)]
+pub fn load_raw_deal_file(path: &Path) -> Result<Vec<DealInfo>, SolverError> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hdr = [0u8; HEADER_SIZE];
+    reader.read_exact(&mut hdr).map_err(|e| {
+        SolverError::BatchSerialize(format!("failed to read deal file header: {e}"))
+    })?;
+
+    let magic = &hdr[0..4];
+    if magic != DEAL_MAGIC {
+        return Err(SolverError::BatchSerialize(format!(
+            "expected DEAL magic, got {magic:?}",
+        )));
+    }
+    let version = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+    if version != RAW_FORMAT_VERSION {
+        return Err(SolverError::BatchVersionMismatch {
+            expected: RAW_FORMAT_VERSION,
+            actual: version,
+        });
+    }
+    let entry_count = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+
+    let mut deals = Vec::with_capacity(entry_count as usize);
+    let mut buf = [0u8; ENTRY_SIZE];
+    for _ in 0..entry_count {
+        reader.read_exact(&mut buf).map_err(|e| {
+            SolverError::BatchSerialize(format!("failed to read deal entry: {e}"))
+        })?;
+        let (key, p1_equity, weight) = parse_raw_entry(&buf);
+        deals.push(DealInfo {
+            hand_bits_p1: key.p1_bits,
+            hand_bits_p2: key.p2_bits,
+            p1_equity,
+            weight,
+        });
+    }
+    Ok(deals)
+}
+
+// ---------------------------------------------------------------------------
+// Sorted binary file I/O (streaming merge infrastructure)
+// ---------------------------------------------------------------------------
+
+/// Magic bytes for sorted intermediate files.
+const SORTED_MAGIC: &[u8; 4] = b"DSRT";
+/// Magic bytes for the final merged output.
+const DEAL_MAGIC: &[u8; 4] = b"DEAL";
+/// Current version for the raw binary format.
+const RAW_FORMAT_VERSION: u32 = 1;
+/// Size of the file header in bytes.
+const HEADER_SIZE: usize = 24;
+/// Size of a single entry in bytes.
+const ENTRY_SIZE: usize = 48;
+
+/// Write a sorted file with the DSRT header and 48-byte entries.
+fn write_sorted_file(
+    path: &Path,
+    entries: &[(TrajectoryKey, f64, f64)],
+    concrete_deals: u64,
+) -> Result<(), SolverError> {
+    let file = std::fs::File::create(path)?;
+    let mut w = BufWriter::new(file);
+    write_raw_header(&mut w, *SORTED_MAGIC, entries.len() as u64, concrete_deals)?;
+    for &(ref key, weight, equity_sum) in entries {
+        write_raw_entry(&mut w, key, weight, equity_sum)?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// Write the 24-byte raw binary header.
+fn write_raw_header(
+    w: &mut impl Write,
+    magic: [u8; 4],
+    entry_count: u64,
+    concrete_deals: u64,
+) -> Result<(), io::Error> {
+    w.write_all(&magic)?;
+    w.write_all(&RAW_FORMAT_VERSION.to_le_bytes())?;
+    w.write_all(&entry_count.to_le_bytes())?;
+    w.write_all(&concrete_deals.to_le_bytes())?;
+    Ok(())
+}
+
+/// Write a single 48-byte entry to the raw binary stream.
+fn write_raw_entry(
+    w: &mut impl Write,
+    key: &TrajectoryKey,
+    field_a: f64,
+    field_b: f64,
+) -> Result<(), io::Error> {
+    for &v in &key.p1_bits {
+        w.write_all(&v.to_le_bytes())?;
+    }
+    for &v in &key.p2_bits {
+        w.write_all(&v.to_le_bytes())?;
+    }
+    w.write_all(&field_a.to_le_bytes())?;
+    w.write_all(&field_b.to_le_bytes())?;
+    Ok(())
+}
+
+/// Buffered reader that yields sorted entries one at a time.
+struct SortedEntryReader {
+    reader: BufReader<std::fs::File>,
+    remaining: u64,
+}
+
+impl SortedEntryReader {
+    /// Open a sorted file for streaming reads.
+    fn open(path: &Path) -> Result<(Self, u64), SolverError> {
+        let file = std::fs::File::open(path)?;
+        let mut reader = BufReader::new(file);
+        let mut hdr = [0u8; HEADER_SIZE];
+        reader.read_exact(&mut hdr).map_err(|e| {
+            SolverError::BatchSerialize(format!("failed to read sorted header: {e}"))
+        })?;
+        // Skip magic validation (caller controls file provenance)
+        let version = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+        if version != RAW_FORMAT_VERSION {
+            return Err(SolverError::BatchVersionMismatch {
+                expected: RAW_FORMAT_VERSION,
+                actual: version,
+            });
+        }
+        let entry_count = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        let concrete_deals = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+        Ok((Self { reader, remaining: entry_count }, concrete_deals))
+    }
+
+    /// Read the next entry, or `None` if exhausted.
+    fn next_entry(&mut self) -> Result<Option<(TrajectoryKey, f64, f64)>, SolverError> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let mut buf = [0u8; ENTRY_SIZE];
+        self.reader.read_exact(&mut buf).map_err(|e| {
+            SolverError::BatchSerialize(format!("failed to read sorted entry: {e}"))
+        })?;
+        self.remaining -= 1;
+        Ok(Some(parse_raw_entry(&buf)))
+    }
+}
+
+/// Parse a 48-byte buffer into `(TrajectoryKey, f64, f64)`.
+fn parse_raw_entry(buf: &[u8; ENTRY_SIZE]) -> (TrajectoryKey, f64, f64) {
+    let p1 = [
+        u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+        u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+    ];
+    let p2 = [
+        u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+        u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+        u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+        u32::from_le_bytes(buf[28..32].try_into().unwrap()),
+    ];
+    let a = f64::from_le_bytes(buf[32..40].try_into().unwrap());
+    let b = f64::from_le_bytes(buf[40..48].try_into().unwrap());
+    (TrajectoryKey { p1_bits: p1, p2_bits: p2 }, a, b)
+}
+
+// ---------------------------------------------------------------------------
+// Sort phase: convert one bincode batch to a sorted binary file
+// ---------------------------------------------------------------------------
+
+/// Load a bincode `BatchFile`, sort by key, write as sorted binary file.
+///
+/// Returns the `concrete_deals` count from the batch header.
+fn sort_batch_to_file(batch_path: &Path, sorted_path: &Path) -> Result<u64, SolverError> {
+    let data = std::fs::read(batch_path)?;
+    let batch: BatchFile = bincode::deserialize(&data)
         .map_err(|e| SolverError::BatchSerialize(e.to_string()))?;
-    std::fs::write(output_path, data)?;
+    if batch.version != BATCH_VERSION {
+        return Err(SolverError::BatchVersionMismatch {
+            expected: BATCH_VERSION,
+            actual: batch.version,
+        });
+    }
+    let concrete = batch.concrete_deals;
 
-    Ok((deals, stats))
+    let mut entries: Vec<(TrajectoryKey, f64, f64)> = batch
+        .entries
+        .into_iter()
+        .map(|(p1, p2, w, eq)| (TrajectoryKey { p1_bits: p1, p2_bits: p2 }, w, eq))
+        .collect();
+    // Drop batch data before sorting to reduce peak memory
+    drop(data);
+
+    entries.sort_unstable_by_key(|(k, _, _)| *k);
+    write_sorted_file(sorted_path, &entries, concrete)?;
+    Ok(concrete)
+}
+
+// ---------------------------------------------------------------------------
+// K-way merge phase: stream sorted files into final output
+// ---------------------------------------------------------------------------
+
+/// Heap entry for the k-way merge.
+///
+/// Ordering is reversed so `BinaryHeap` becomes a min-heap by key.
+#[derive(PartialEq)]
+struct MergeEntry {
+    key: TrajectoryKey,
+    weight: f64,
+    equity_sum: f64,
+    reader_idx: usize,
+}
+
+impl Eq for MergeEntry {}
+
+impl Ord for MergeEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse so BinaryHeap pops the smallest key first
+        other.key.cmp(&self.key)
+            .then_with(|| other.reader_idx.cmp(&self.reader_idx))
+    }
+}
+
+impl PartialOrd for MergeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Stream-merge sorted files into a single output file.
+///
+/// The output uses the `DEAL` magic and stores `(p1_equity, weight)` per entry
+/// (equity sum divided by weight = p1 equity).
+fn streaming_kway_merge(
+    sorted_paths: &[PathBuf],
+    output_path: &Path,
+    total_concrete: u64,
+) -> Result<GenerationStats, SolverError> {
+    let mut readers: Vec<SortedEntryReader> = Vec::with_capacity(sorted_paths.len());
+    let mut heap = BinaryHeap::with_capacity(sorted_paths.len());
+
+    // Open all readers and seed the heap
+    for (i, path) in sorted_paths.iter().enumerate() {
+        let (mut reader, _concrete) = SortedEntryReader::open(path)?;
+        if let Some((key, weight, equity_sum)) = reader.next_entry()? {
+            heap.push(MergeEntry { key, weight, equity_sum, reader_idx: i });
+        }
+        readers.push(reader);
+    }
+
+    // Open output file, write placeholder header
+    let file = std::fs::File::create(output_path)?;
+    let mut out = BufWriter::new(file);
+    write_raw_header(&mut out, *DEAL_MAGIC, 0, total_concrete)?;
+
+    let mut entry_count = 0u64;
+    let mut progress_entries = 0u64;
+    let start = Instant::now();
+
+    while let Some(current) = heap.pop() {
+        let mut merged_weight = current.weight;
+        let mut merged_equity_sum = current.equity_sum;
+        let current_key = current.key;
+
+        // Refill the reader that provided this entry
+        refill_reader(&mut readers[current.reader_idx], current.reader_idx, &mut heap)?;
+
+        // Merge all entries with the same key
+        while heap.peek().is_some_and(|e| e.key == current_key) {
+            let same = heap.pop().unwrap(); // safe: just peeked
+            merged_weight += same.weight;
+            merged_equity_sum += same.equity_sum;
+            refill_reader(&mut readers[same.reader_idx], same.reader_idx, &mut heap)?;
+        }
+
+        // Finalize: equity = equity_sum / weight
+        let p1_equity = if merged_weight > 0.0 {
+            merged_equity_sum / merged_weight
+        } else {
+            0.5
+        };
+
+        // Output format stores (p1_equity, weight) — matches DealInfo field order
+        write_raw_entry(&mut out, &current_key, p1_equity, merged_weight)?;
+        entry_count += 1;
+
+        // Progress reporting every 10M entries
+        progress_entries += 1;
+        if progress_entries.is_multiple_of(10_000_000) {
+            let elapsed = start.elapsed().as_secs_f64();
+            #[allow(clippy::cast_precision_loss)]
+            let rate = progress_entries as f64 / elapsed;
+            print!(
+                "\r  merge: {}M entries written ({:.0} entries/sec)     ",
+                progress_entries / 1_000_000,
+                rate,
+            );
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    if progress_entries >= 10_000_000 {
+        println!();
+    }
+
+    out.flush()?;
+
+    // Seek back and write the actual entry count in the header
+    let mut file = out.into_inner().map_err(|e| {
+        SolverError::BatchSerialize(format!("failed to flush output: {e}"))
+    })?;
+    file.seek(SeekFrom::Start(8))?;
+    file.write_all(&entry_count.to_le_bytes())?;
+
+    #[allow(clippy::cast_precision_loss)]
+    let compression = if entry_count > 0 {
+        total_concrete as f64 / entry_count as f64
+    } else {
+        0.0
+    };
+
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(GenerationStats {
+        concrete_deals: total_concrete,
+        abstract_deals: entry_count as usize,
+        compression_ratio: compression,
+    })
+}
+
+/// Read the next entry from a reader and push it onto the heap.
+fn refill_reader(
+    reader: &mut SortedEntryReader,
+    idx: usize,
+    heap: &mut BinaryHeap<MergeEntry>,
+) -> Result<(), SolverError> {
+    if let Some((key, weight, equity_sum)) = reader.next_entry()? {
+        heap.push(MergeEntry { key, weight, equity_sum, reader_idx: idx });
+    }
+    Ok(())
 }
 
 /// Select and optionally subsample hole card pairs.
@@ -1012,6 +1353,102 @@ mod tests {
                 (deal.p1_equity - le).abs() < 1e-6,
                 "Equity mismatch for {key:?}: new={}, legacy={le}", deal.p1_equity,
             );
+        }
+    }
+
+    #[timed_test]
+    fn sorted_file_roundtrip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("test.sorted");
+
+        let entries = vec![
+            (TrajectoryKey { p1_bits: [1,2,3,4], p2_bits: [5,6,7,8] }, 10.0, 7.5),
+            (TrajectoryKey { p1_bits: [9,10,11,12], p2_bits: [13,14,15,16] }, 20.0, 15.0),
+        ];
+
+        write_sorted_file(&path, &entries, 42).expect("write");
+
+        let (mut reader, concrete) = SortedEntryReader::open(&path).expect("open");
+        assert_eq!(concrete, 42);
+
+        let e1 = reader.next_entry().expect("read").expect("entry");
+        assert_eq!(e1.0.p1_bits, [1,2,3,4]);
+        assert!((e1.1 - 10.0).abs() < f64::EPSILON);
+        assert!((e1.2 - 7.5).abs() < f64::EPSILON);
+
+        let e2 = reader.next_entry().expect("read").expect("entry");
+        assert_eq!(e2.0.p1_bits, [9,10,11,12]);
+
+        assert!(reader.next_entry().expect("read").is_none());
+    }
+
+    #[timed_test]
+    fn raw_deal_file_roundtrip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("test.deal");
+
+        // Write a DEAL-format file manually
+        let file = std::fs::File::create(&path).expect("create");
+        let mut w = BufWriter::new(file);
+        write_raw_header(&mut w, *DEAL_MAGIC, 2, 100).expect("header");
+        let k1 = TrajectoryKey { p1_bits: [1,2,3,4], p2_bits: [5,6,7,8] };
+        let k2 = TrajectoryKey { p1_bits: [10,20,30,40], p2_bits: [50,60,70,80] };
+        write_raw_entry(&mut w, &k1, 0.75, 10.0).expect("entry");
+        write_raw_entry(&mut w, &k2, 0.25, 5.0).expect("entry");
+        w.flush().expect("flush");
+        drop(w);
+
+        let deals = load_raw_deal_file(&path).expect("load");
+        assert_eq!(deals.len(), 2);
+        assert_eq!(deals[0].hand_bits_p1, [1,2,3,4]);
+        assert!((deals[0].p1_equity - 0.75).abs() < f64::EPSILON);
+        assert!((deals[0].weight - 10.0).abs() < f64::EPSILON);
+        assert_eq!(deals[1].hand_bits_p1, [10,20,30,40]);
+    }
+
+    #[timed_test(30)]
+    fn merge_deal_batches_small_roundtrip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // Use very small config to keep test fast
+        let config = AbstractDealConfig {
+            stack_depth: 10,
+            strength_bits: 0,
+            equity_bits: 0,
+            max_hole_pairs: 5,
+        };
+        let ctx = DealGenContext::new(&config);
+        let canonical_flops = crate::flops::all_flops();
+
+        let batch1_path = dir.path().join("batch_0000.bin");
+        let batch2_path = dir.path().join("batch_0001.bin");
+
+        generate_deals_batch(&ctx, &config, &canonical_flops[..1], 0, &batch1_path)
+            .expect("batch1");
+        generate_deals_batch(&ctx, &config, &canonical_flops[1..2], 1, &batch2_path)
+            .expect("batch2");
+
+        // Merge
+        let output = dir.path().join("merged.bin");
+        let stats = merge_deal_batches(
+            &[batch1_path, batch2_path],
+            &output,
+        ).expect("merge");
+
+        assert!(stats.abstract_deals > 0);
+        assert!(stats.concrete_deals > 0);
+        assert!(stats.compression_ratio >= 1.0);
+
+        // Load and verify
+        let deals = load_raw_deal_file(&output).expect("load");
+        assert_eq!(deals.len(), stats.abstract_deals);
+        for d in &deals {
+            assert!(
+                (0.0..=1.0).contains(&d.p1_equity),
+                "equity out of range: {}",
+                d.p1_equity,
+            );
+            assert!(d.weight > 0.0);
         }
     }
 }
