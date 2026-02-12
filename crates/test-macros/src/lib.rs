@@ -3,7 +3,7 @@ use quote::quote;
 use syn::{ItemFn, LitInt, parse_macro_input};
 
 /// A drop-in replacement for `#[test]` that prints elapsed time and fails
-/// any test exceeding a timeout (default: 10 seconds).
+/// any test exceeding a timeout (default: 1 second).
 ///
 /// # Usage
 /// ```ignore
@@ -22,7 +22,7 @@ use syn::{ItemFn, LitInt, parse_macro_input};
 #[proc_macro_attribute]
 pub fn timed_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let timeout_secs: u64 = if attr.is_empty() {
-        10
+        1
     } else {
         let lit = parse_macro_input!(attr as LitInt);
         lit.base10_parse::<u64>()

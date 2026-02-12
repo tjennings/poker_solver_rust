@@ -1198,7 +1198,7 @@ mod tests {
         assert!((s1[1] - 1.2).abs() < 1e-10);
     }
 
-    #[timed_test]
+    #[timed_test(15)]
     fn parallel_training_populates_info_sets() {
         let game = KuhnPoker::new();
         let mut solver = MccfrSolver::new(game);
@@ -1209,7 +1209,7 @@ mod tests {
         assert!(solver.iterations() > 0);
     }
 
-    #[timed_test]
+    #[timed_test(15)]
     fn parallel_strategy_sums_to_one() {
         let game = KuhnPoker::new();
         let mut solver = MccfrSolver::new(game);
@@ -1227,7 +1227,7 @@ mod tests {
         }
     }
 
-    #[timed_test]
+    #[timed_test(15)]
     fn parallel_converges_on_kuhn() {
         use crate::info_key::InfoKey;
 
@@ -1255,7 +1255,7 @@ mod tests {
         }
     }
 
-    #[timed_test]
+    #[timed_test(15)]
     fn parallel_and_sequential_converge_similarly() {
         use crate::info_key::InfoKey;
 
@@ -1439,7 +1439,7 @@ mod tests {
         assert!(total > pruned, "not everything should be pruned");
     }
 
-    #[timed_test]
+    #[timed_test(15)]
     fn parallel_pruning_converges_on_kuhn() {
         use crate::info_key::InfoKey;
 

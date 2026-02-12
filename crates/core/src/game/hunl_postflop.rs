@@ -2147,7 +2147,7 @@ mod tests {
         );
     }
 
-    #[timed_test]
+    #[timed_test(5)]
     fn stratified_zero_min_equals_base() {
         let config = PostflopConfig {
             stack_depth: 100,
@@ -2171,7 +2171,7 @@ mod tests {
         }
     }
 
-    #[timed_test]
+    #[timed_test(15)]
     fn stratified_deals_deterministic() {
         let config = PostflopConfig {
             stack_depth: 100,
@@ -2196,7 +2196,7 @@ mod tests {
         }
     }
 
-    #[timed_test]
+    #[timed_test(10)]
     fn stratified_deals_no_card_conflicts() {
         let config = PostflopConfig {
             stack_depth: 100,
@@ -2228,7 +2228,7 @@ mod tests {
         }
     }
 
-    #[timed_test]
+    #[timed_test(10)]
     fn stratified_deals_improve_rare_coverage() {
         // Use generate_stratified_deals directly with smaller parameters
         let config = PostflopConfig {
@@ -2268,7 +2268,7 @@ mod tests {
         }
     }
 
-    #[timed_test]
+    #[timed_test(10)]
     fn stratified_deals_meet_minimum() {
         let config = PostflopConfig {
             stack_depth: 100,
