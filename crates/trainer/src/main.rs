@@ -1430,9 +1430,7 @@ fn compute_per_street_hand_bits(
     is_p1: bool,
     abstraction: &Option<AbstractionMode>,
 ) -> [u32; 4] {
-    use poker_solver_core::hand_class::{classify, intra_class_strength, HandClass};
-    use poker_solver_core::info_key::{canonical_hand_index, encode_hand_v2};
-    use poker_solver_core::showdown_equity;
+    use poker_solver_core::info_key::{canonical_hand_index, compute_hand_bits_v2};
 
     let holding = if is_p1 { state.p1_holding } else { state.p2_holding };
     let preflop_bits = u32::from(canonical_hand_index(holding));
@@ -1441,31 +1439,10 @@ fn compute_per_street_hand_bits(
         return [preflop_bits; 4];
     };
 
-    let board_slices: [&[poker_solver_core::poker::Card]; 3] = [
-        &full_board[..3],
-        &full_board[..4],
-        &full_board[..5],
-    ];
-
     let postflop_bits = |board: &[poker_solver_core::poker::Card]| -> u32 {
         match abstraction {
-            Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }) => {
-                classify(holding, board).map_or(0, |c| c.bits())
-            }
             Some(AbstractionMode::HandClassV2 { strength_bits, equity_bits }) => {
-                let classification = classify(holding, board).unwrap_or_default();
-                let class_id = classification.strongest_made_id();
-                let draw_flags = classification.draw_flags();
-                let made_id = class_id;
-                let strength = if HandClass::is_made_hand_id(made_id) {
-                    let class = HandClass::ALL[made_id as usize];
-                    intra_class_strength(holding, board, class)
-                } else {
-                    1
-                };
-                let eq = showdown_equity::compute_equity(holding, board);
-                let eq_bin = showdown_equity::equity_bin(eq, 16);
-                encode_hand_v2(class_id, strength, eq_bin, draw_flags, *strength_bits, *equity_bits)
+                compute_hand_bits_v2(holding, board, *strength_bits, *equity_bits)
             }
             _ => preflop_bits,
         }
@@ -1473,9 +1450,9 @@ fn compute_per_street_hand_bits(
 
     [
         preflop_bits,
-        postflop_bits(board_slices[0]),
-        postflop_bits(board_slices[1]),
-        postflop_bits(board_slices[2]),
+        postflop_bits(&full_board[..3]),
+        postflop_bits(&full_board[..4]),
+        postflop_bits(&full_board[..5]),
     ]
 }
 
@@ -1657,9 +1634,9 @@ fn print_class_histogram(deals: &[DealInfo]) {
 
 fn decode_trajectory(bits: [u32; 4]) -> [String; 4] {
     let preflop = reverse_canonical_index(bits[0] as u16).to_string();
-    let flop = hand_label_from_bits(bits[1], 1, "hand_class_v2");
-    let turn = hand_label_from_bits(bits[2], 2, "hand_class_v2");
-    let river = hand_label_from_bits(bits[3], 3, "hand_class_v2");
+    let flop = hand_label_from_bits(bits[1], 1, AbstractionModeConfig::HandClassV2);
+    let turn = hand_label_from_bits(bits[2], 2, AbstractionModeConfig::HandClassV2);
+    let river = hand_label_from_bits(bits[3], 3, AbstractionModeConfig::HandClassV2);
     [preflop, flop, turn, river]
 }
 
@@ -2134,22 +2111,6 @@ fn strongest_class(hand_bits: u32, abs_mode: AbstractionModeConfig) -> Option<Ha
     }
 }
 
-/// Return a short display name for a `HandClass`.
-fn class_label(class: HandClass) -> &'static str {
-    match class {
-        HandClass::Flush => "Flush",
-        HandClass::Straight => "Straight",
-        HandClass::Set => "Set",
-        HandClass::TwoPair => "TwoPair",
-        HandClass::Overpair => "Overpair",
-        HandClass::Pair => "Pair",
-        HandClass::HighCard => "HighCard",
-        other => {
-            // Fallback — use the Display impl (leaks a String, acceptable for rare cases)
-            Box::leak(other.to_string().into_boxed_str())
-        }
-    }
-}
 
 /// Group key for river scenarios: (spr_bucket, actions_bits).
 type RiverScenario = (u32, u32);
@@ -2271,7 +2232,7 @@ fn print_river_table(
                 .take(labels.len())
                 .map(|p| format!("{:>6.2}", p))
                 .collect();
-            println!("{:<12}|{prob_cols}", class_label(class));
+            println!("{:<12}|{prob_cols}", class);
         }
     }
     println!();

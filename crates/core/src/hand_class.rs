@@ -328,10 +328,7 @@ pub fn classify(hole: [Card; 2], board: &[Card]) -> Result<HandClassification, C
     Ok(result)
 }
 
-/// Convert a `Value` to a numeric rank (Two=2, ..., Ace=14).
-fn value_rank(v: Value) -> u8 {
-    u8::from(v) + 2
-}
+use crate::card_utils::value_rank;
 
 /// Classify the strongest made hand and add it to the result.
 fn classify_made_hand(hole: [Card; 2], board: &[Card], result: &mut HandClassification) {

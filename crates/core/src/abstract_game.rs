@@ -32,12 +32,13 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
+use crate::card_utils::hand_rank;
 use crate::cfr::DealInfo;
 use crate::error::SolverError;
 use crate::flops::{self, CanonicalFlop};
 use crate::hand_class::{classify, intra_class_strength, HandClass};
 use crate::info_key::{canonical_hand_index, encode_hand_v2};
-use crate::poker::{Card, Hand, Rank, Rankable};
+use crate::poker::{Card, Rank};
 use crate::showdown_equity;
 
 /// A fully-enumerated abstract deal with averaged showdown equity.
@@ -418,7 +419,7 @@ impl<'a> FlopContext<'a> {
             );
             out.push(EncodedHand {
                 enc: [self.preflop_encs[th.gi], self.flop_encs[th.ci], th.turn_enc, re],
-                rank: rank_7cards(self.hole_pairs[th.gi], &rb),
+                rank: hand_rank(self.hole_pairs[th.gi], &rb),
                 hole_mask: self.hole_masks[th.gi],
             });
         }
@@ -1113,18 +1114,6 @@ fn generate_hole_pairs(deck: &[Card]) -> Vec<[Card; 2]> {
     pairs
 }
 
-/// Rank a 7-card hand (2 hole + 5 board).
-fn rank_7cards(holding: [Card; 2], board: &[Card; 5]) -> Rank {
-    let mut hand = Hand::default();
-    for &c in board {
-        hand.insert(c);
-    }
-    for &c in &holding {
-        hand.insert(c);
-    }
-    hand.rank()
-}
-
 /// Convert abstract deals to `DealInfo` for use with the sequence-form solver.
 #[must_use]
 pub fn to_deal_infos(deals: &[AbstractDeal]) -> Vec<DealInfo> {
@@ -1210,8 +1199,8 @@ mod tests {
                 let rb = [fc[0], fc[1], fc[2], turn, river];
                 let rp1 = encode_postflop_legacy(p1, &rb, config);
                 let rp2 = encode_postflop_legacy(p2, &rb, config);
-                let r1 = rank_7cards(p1, &rb);
-                let r2 = rank_7cards(p2, &rb);
+                let r1 = hand_rank(p1, &rb);
+                let r2 = hand_rank(p2, &rb);
                 let eq = rank_equity(r1, r2);
                 let key = TrajectoryKey {
                     p1_bits: [pp1, fp1, tp1, rp1],

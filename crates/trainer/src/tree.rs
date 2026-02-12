@@ -28,26 +28,17 @@ pub fn run_tree(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bundle = StrategyBundle::load(bundle_path)?;
     let bet_sizes = &bundle.config.game.bet_sizes;
-    let mode_str = abstraction_mode_str(bundle.config.abstraction_mode);
-
     if let Some(key_str) = key_input {
-        return run_key_describe(key_str, bet_sizes, mode_str, &bundle.blueprint);
+        return run_key_describe(key_str, bet_sizes, bundle.config.abstraction_mode, &bundle.blueprint);
     }
 
     run_deal_tree(&bundle, depth, min_prob, seed, hand_filter)
 }
 
-fn abstraction_mode_str(mode: AbstractionModeConfig) -> &'static str {
-    match mode {
-        AbstractionModeConfig::Ehs2 => "ehs2",
-        AbstractionModeConfig::HandClassV2 => "hand_class_v2",
-    }
-}
-
 fn run_key_describe(
     input: &str,
     bet_sizes: &[f32],
-    mode: &str,
+    mode: AbstractionModeConfig,
     blueprint: &BlueprintStrategy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let desc = describe_key(input, bet_sizes, mode, Some(blueprint))?;

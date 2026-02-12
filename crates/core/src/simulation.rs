@@ -439,20 +439,26 @@ pub fn run_simulation(
 ///
 /// The arena adds community cards to each player's `Hand`, so we filter
 /// out any card that also appears on the board.
+///
+/// # Panics
+///
+/// Panics in debug builds if fewer than 2 hole cards remain after filtering.
+/// In release builds, defaults to the first available cards (should never happen
+/// in a properly configured game).
 fn extract_hole_cards(hand: Hand, board: &[Card]) -> [Card; 2] {
     let cards: Vec<Card> = hand
         .iter()
         .filter(|c| !board.contains(c))
         .collect();
-    if cards.len() >= 2 {
-        [cards[0], cards[1]]
-    } else {
-        // Fallback (should not happen in a properly configured game)
-        [
-            Card::new(Value::Two, Suit::Spade),
-            Card::new(Value::Three, Suit::Spade),
-        ]
-    }
+    debug_assert!(
+        cards.len() >= 2,
+        "extract_hole_cards: expected >= 2 cards after board filter, got {}",
+        cards.len()
+    );
+    [
+        cards.first().copied().unwrap_or(Card::new(Value::Two, Suit::Spade)),
+        cards.get(1).copied().unwrap_or(Card::new(Value::Three, Suit::Spade)),
+    ]
 }
 
 /// Convert arena `Round` to numeric street for `InfoKey`.

@@ -391,7 +391,7 @@ fn make_postflop_decision(
 ) -> TreeNode {
     use crate::abstraction::Street;
 
-    let player = state.to_act.unwrap_or(Player::Player1);
+    let player = state.active_player();
     let street_code = match state.street {
         Street::Preflop => 0u8,
         Street::Flop => 1,

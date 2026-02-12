@@ -119,10 +119,7 @@ fn full_deck() -> Vec<Card> {
     deck
 }
 
-/// Convert a `Value` to a numeric rank (Two=2, ..., Ace=14).
-fn value_rank(v: Value) -> u8 {
-    u8::from(v) + 2
-}
+use crate::card_utils::value_rank;
 
 /// Classify the suit texture of three cards.
 fn classify_suit_texture(cards: [Card; 3]) -> SuitTexture {

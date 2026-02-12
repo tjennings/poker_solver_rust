@@ -1,4 +1,5 @@
 use crate::abstraction::AbstractionError;
+use crate::card_utils::value_rank;
 use crate::poker::{Card, Suit, Value};
 
 /// Canonical suit ordering (used for isomorphism)
@@ -68,24 +69,6 @@ fn suit_to_index(suit: Suit) -> usize {
     }
 }
 
-/// Get numeric rank for value comparison (Ace=14, King=13, ..., Two=2)
-fn value_rank(v: Value) -> u8 {
-    match v {
-        Value::Ace => 14,
-        Value::King => 13,
-        Value::Queen => 12,
-        Value::Jack => 11,
-        Value::Ten => 10,
-        Value::Nine => 9,
-        Value::Eight => 8,
-        Value::Seven => 7,
-        Value::Six => 6,
-        Value::Five => 5,
-        Value::Four => 4,
-        Value::Three => 3,
-        Value::Two => 2,
-    }
-}
 
 /// Compare two slices of values lexicographically by rank
 fn compare_value_slices(a: &[Value], b: &[Value]) -> std::cmp::Ordering {

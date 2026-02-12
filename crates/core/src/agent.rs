@@ -5,54 +5,33 @@
 //! output as trained blueprint strategies, enabling UI development without training.
 
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
 use rs_poker::holdem::RangeParser;
+use thiserror::Error;
 
 use crate::hand_class::{HandClass, HandClassification};
 use crate::hands::CanonicalHand;
 
 /// Error type for agent configuration loading and validation.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum AgentError {
     /// I/O error reading the TOML file.
-    Io(std::io::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     /// TOML parse error.
-    Parse(toml::de::Error),
+    #[error("TOML parse error: {0}")]
+    Parse(#[from] toml::de::Error),
     /// Invalid hand class name in `[classes.*]`.
+    #[error("invalid hand class: '{0}'")]
     InvalidClass(String),
     /// Frequency value is negative.
+    #[error("invalid frequency: {0}")]
     InvalidFrequency(String),
     /// Range string failed to parse.
+    #[error("invalid range: {0}")]
     InvalidRange(String),
-}
-
-impl fmt::Display for AgentError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "I/O error: {e}"),
-            Self::Parse(e) => write!(f, "TOML parse error: {e}"),
-            Self::InvalidClass(s) => write!(f, "invalid hand class: '{s}'"),
-            Self::InvalidFrequency(s) => write!(f, "invalid frequency: {s}"),
-            Self::InvalidRange(s) => write!(f, "invalid range: {s}"),
-        }
-    }
-}
-
-impl std::error::Error for AgentError {}
-
-impl From<std::io::Error> for AgentError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-impl From<toml::de::Error> for AgentError {
-    fn from(e: toml::de::Error) -> Self {
-        Self::Parse(e)
-    }
 }
 
 /// Game settings from the agent config.

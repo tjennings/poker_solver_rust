@@ -16,6 +16,7 @@ pub mod abstract_game;
 pub mod abstraction;
 pub mod agent;
 pub mod blueprint;
+pub mod card_utils;
 pub mod cfr;
 pub mod equity;
 pub mod error;

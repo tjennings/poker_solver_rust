@@ -11,8 +11,9 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::abstraction::{CardAbstraction, Street};
+use crate::card_utils::hand_rank;
 use crate::hand_class::{HandClass, HandClassification, classify, intra_class_strength};
-use crate::poker::{Card, Hand, Rank, Rankable, Suit, Value};
+use crate::poker::{Card, Rank, Suit, Value};
 use crate::showdown_equity;
 
 use super::{Action, Actions, Game, Player, ALL_IN};
@@ -162,6 +163,18 @@ impl PostflopState {
         }
     }
 
+    /// The player to act, assuming the state is non-terminal.
+    ///
+    /// Panics in debug builds if `to_act` is `None` (terminal state).
+    /// In release builds, defaults to `Player1` to avoid UB.
+    #[must_use]
+    pub fn active_player(&self) -> Player {
+        debug_assert!(self.to_act.is_some(), "active_player called on terminal state");
+        // Infallible on non-terminal states; to_act is always Some when
+        // terminal is None (invariant maintained by apply_fold/advance_street).
+        self.to_act.unwrap_or(Player::Player1)
+    }
+
     /// Get the current player's remaining stack.
     #[must_use]
     pub fn current_stack(&self) -> u32 {
@@ -206,8 +219,8 @@ impl PostflopState {
         state.full_board = Some(full_board);
 
         // Pre-compute final hand ranks (7 cards = 2 hole + 5 board)
-        state.p1_cache.rank = Some(rank_7cards(p1_holding, &full_board));
-        state.p2_cache.rank = Some(rank_7cards(p2_holding, &full_board));
+        state.p1_cache.rank = Some(hand_rank(p1_holding, &full_board));
+        state.p2_cache.rank = Some(hand_rank(p2_holding, &full_board));
 
         state
     }
@@ -263,7 +276,7 @@ fn encode_current_street_actions(
 
 /// Apply a fold action to the game state.
 fn apply_fold(state: &PostflopState, new_state: &mut PostflopState) {
-    let folder = state.to_act.unwrap_or(Player::Player1);
+    let folder = state.active_player();
     new_state.terminal = Some(TerminalType::Fold(folder));
     new_state.to_act = None;
 }
@@ -289,11 +302,11 @@ fn compute_showdown_payoff(state: &PostflopState, p1_invested: u32, p2_invested:
     let p1_rank = state
         .p1_cache
         .rank
-        .unwrap_or_else(|| compute_hand_rank(&state.board, state.p1_holding));
+        .unwrap_or_else(|| hand_rank(state.p1_holding, &state.board));
     let p2_rank = state
         .p2_cache
         .rank
-        .unwrap_or_else(|| compute_hand_rank(&state.board, state.p2_holding));
+        .unwrap_or_else(|| hand_rank(state.p2_holding, &state.board));
 
     let pot_bb = to_bb(p1_invested + p2_invested);
 
@@ -305,17 +318,6 @@ fn compute_showdown_payoff(state: &PostflopState, p1_invested: u32, p2_invested:
 }
 
 /// Compute the 7-card hand rank from board + hole cards.
-fn compute_hand_rank(board: &[Card], holding: [Card; 2]) -> Rank {
-    let mut h = Hand::default();
-    for &c in board {
-        h.insert(c);
-    }
-    for c in holding {
-        h.insert(c);
-    }
-    h.rank()
-}
-
 fn street_to_cache_idx(street: Street) -> usize {
     match street {
         Street::Preflop | Street::Flop => 0,
@@ -348,17 +350,6 @@ fn precompute_strength(holding: [Card; 2], board: &[Card]) -> u8 {
 }
 
 /// Build a 7-card hand and rank it.
-fn rank_7cards(holding: [Card; 2], board: &[Card; 5]) -> Rank {
-    let mut hand = Hand::default();
-    for &c in board {
-        hand.insert(c);
-    }
-    for &c in &holding {
-        hand.insert(c);
-    }
-    hand.rank()
-}
-
 /// Full HUNL game including postflop streets.
 ///
 /// Implements the [`Game`] trait for use with CFR solvers.
@@ -742,7 +733,7 @@ impl HunlPostflop {
         if matches!(last_action_on_street, Some(Action::Check)) {
             self.advance_street(new_state);
         } else {
-            new_state.to_act = Some(state.to_act.unwrap_or(Player::Player1).opponent());
+            new_state.to_act = Some(state.active_player().opponent());
         }
     }
 
@@ -772,7 +763,7 @@ impl HunlPostflop {
         new_state.pot += actual;
         new_state.to_call = actual.saturating_sub(state.to_call);
         new_state.street_bets += 1;
-        new_state.to_act = Some(state.to_act.unwrap_or(Player::Player1).opponent());
+        new_state.to_act = Some(state.active_player().opponent());
 
         if new_state.opponent_stack() == 0 {
             new_state.terminal = Some(TerminalType::Showdown);
@@ -1066,7 +1057,7 @@ impl Game for HunlPostflop {
     }
 
     fn player(&self, state: &Self::State) -> Player {
-        state.to_act.unwrap_or(Player::Player1)
+        state.active_player()
     }
 
     fn actions(&self, state: &Self::State) -> Actions {
