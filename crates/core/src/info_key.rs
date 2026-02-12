@@ -15,8 +15,9 @@
 
 use crate::blueprint::BlueprintStrategy;
 use crate::game::{Action, ALL_IN};
-use crate::hand_class::HandClass;
+use crate::hand_class::{classify, intra_class_strength, HandClass};
 use crate::poker::{Card, Suit, Value};
+use crate::showdown_equity;
 
 const HAND_SHIFT: u32 = 36;
 const STREET_SHIFT: u32 = 34;
@@ -185,6 +186,32 @@ pub fn encode_hand_v2(
     let draw_mask = (1u32 << HandClass::NUM_DRAWS) - 1;
     bits |= (u32::from(draw_flags) & draw_mask) << 8;   // draw bits at 13-8
     bits
+}
+
+/// Compute the 28-bit hand field for `HandClassV2` mode from scratch.
+///
+/// Classifies the hand, computes intra-class strength and equity, then
+/// packs everything via [`encode_hand_v2`]. Returns 0 if classification fails.
+#[must_use]
+pub fn compute_hand_bits_v2(
+    hole: [Card; 2],
+    board: &[Card],
+    strength_bits: u8,
+    equity_bits: u8,
+) -> u32 {
+    let Ok(classification) = classify(hole, board) else {
+        return 0;
+    };
+    let made_id = classification.strongest_made_id();
+    let draw_flags = classification.draw_flags();
+    let strength = if HandClass::is_made_hand_id(made_id) {
+        intra_class_strength(hole, board, HandClass::ALL[made_id as usize])
+    } else {
+        1
+    };
+    let equity = showdown_equity::compute_equity(hole, board);
+    let eq_bin = showdown_equity::equity_bin(equity, 1u8 << equity_bits);
+    encode_hand_v2(made_id, strength, eq_bin, draw_flags, strength_bits, equity_bits)
 }
 
 /// Map a canonical hand to a unique index in 0..169.

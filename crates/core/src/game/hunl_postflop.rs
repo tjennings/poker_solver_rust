@@ -236,6 +236,86 @@ impl PostflopState {
 
 /// Map a street to a cache index (flop=0, turn=1, river=2).
 /// Returns 0 for preflop (unused in practice).
+/// Convert a `Street` to the 2-bit info set key code.
+fn street_to_info_code(street: Street) -> u8 {
+    match street {
+        Street::Preflop => 0,
+        Street::Flop => 1,
+        Street::Turn => 2,
+        Street::River => 3,
+    }
+}
+
+/// Encode the actions on the current street from the game history.
+fn encode_current_street_actions(
+    history: &[(Street, Action)],
+    current_street: Street,
+) -> arrayvec::ArrayVec<u8, 6> {
+    use crate::info_key::encode_action;
+    let mut codes = arrayvec::ArrayVec::<u8, 6>::new();
+    for (street, a) in history {
+        if *street == current_street && !codes.is_full() {
+            codes.push(encode_action(*a));
+        }
+    }
+    codes
+}
+
+/// Apply a fold action to the game state.
+fn apply_fold(state: &PostflopState, new_state: &mut PostflopState) {
+    let folder = state.to_act.unwrap_or(Player::Player1);
+    new_state.terminal = Some(TerminalType::Fold(folder));
+    new_state.to_act = None;
+}
+
+/// Convert internal chip units to BB (1 BB = 2 internal units).
+fn to_bb(chips: u32) -> f64 {
+    f64::from(chips) / 2.0
+}
+
+/// Compute P1's payoff when a player folds.
+fn compute_fold_payoff(folder: Player, p1_invested: u32, p2_invested: u32) -> f64 {
+    if folder == Player::Player1 {
+        -to_bb(p1_invested)
+    } else {
+        to_bb(p2_invested)
+    }
+}
+
+/// Compute P1's payoff at showdown.
+fn compute_showdown_payoff(state: &PostflopState, p1_invested: u32, p2_invested: u32) -> f64 {
+    use std::cmp::Ordering;
+
+    let p1_rank = state
+        .p1_cache
+        .rank
+        .unwrap_or_else(|| compute_hand_rank(&state.board, state.p1_holding));
+    let p2_rank = state
+        .p2_cache
+        .rank
+        .unwrap_or_else(|| compute_hand_rank(&state.board, state.p2_holding));
+
+    let pot_bb = to_bb(p1_invested + p2_invested);
+
+    match p1_rank.cmp(&p2_rank) {
+        Ordering::Greater => pot_bb - to_bb(p1_invested),
+        Ordering::Less => -to_bb(p1_invested),
+        Ordering::Equal => pot_bb / 2.0 - to_bb(p1_invested),
+    }
+}
+
+/// Compute the 7-card hand rank from board + hole cards.
+fn compute_hand_rank(board: &[Card], holding: [Card; 2]) -> Rank {
+    let mut h = Hand::default();
+    for &c in board {
+        h.insert(c);
+    }
+    for c in holding {
+        h.insert(c);
+    }
+    h.rank()
+}
+
 fn street_to_cache_idx(street: Street) -> usize {
     match street {
         Street::Preflop | Street::Flop => 0,
@@ -467,31 +547,15 @@ impl HunlPostflop {
     /// For each deal: pick a canonical flop (weighted), then deal random
     /// turn + river + 2+2 hole cards from the remaining 49 cards.
     fn generate_flop_deals(&self, seed: u64, count: usize) -> Vec<PostflopState> {
-        use crate::flops;
         use rand::SeedableRng;
-        use rand::distr::weighted::WeightedIndex;
         use rand::rngs::StdRng;
 
         let mut rng = StdRng::seed_from_u64(seed);
-        let canonical_flops = flops::all_flops();
+        let sampler = FlopSampler::new();
 
-        let weights: Vec<u16> = canonical_flops.iter().map(crate::flops::CanonicalFlop::weight).collect();
-        // Infallible: canonical flops is a compile-time-known non-empty set with all-positive weights.
-        let dist = WeightedIndex::new(&weights).expect("canonical flops are non-empty with positive weights");
-
-        let deck = Self::full_deck();
-        let mut deals = Vec::with_capacity(count);
-
-        for _ in 0..count {
-            deals.push(generate_one_flop_deal(
-                &mut rng,
-                &canonical_flops,
-                &dist,
-                &deck,
-                self.config.stack_depth,
-            ));
-        }
-        deals
+        (0..count)
+            .map(|_| sampler.sample_deal(&mut rng, self.config.stack_depth))
+            .collect()
     }
 
     /// Generate exhaustive uniform deals: every (flop, P1 hole) combination.
@@ -555,76 +619,33 @@ impl HunlPostflop {
         min_per_class: usize,
         max_rejections: usize,
     ) -> Vec<PostflopState> {
-        use crate::flops;
         use rand::SeedableRng;
-        use rand::distr::weighted::WeightedIndex;
         use rand::rngs::StdRng;
 
         let mut coverage = count_class_coverage(&deals);
-
-        #[allow(clippy::cast_possible_truncation)]
-        let mut deficit_classes: Vec<(usize, u8)> = (0u8..(HandClass::COUNT as u8))
-            .filter(|&i| coverage[i as usize] < min_per_class)
-            .map(|i| (min_per_class - coverage[i as usize], i))
-            .collect();
-        deficit_classes.sort_by_key(|&(deficit, _)| std::cmp::Reverse(deficit));
+        let deficit_classes = find_deficit_classes(&coverage, min_per_class);
 
         if deficit_classes.is_empty() {
             return deals;
         }
 
         let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0x5742_4154));
-        let canonical_flops = flops::all_flops();
-        let weights: Vec<u16> = canonical_flops
-            .iter()
-            .map(crate::flops::CanonicalFlop::weight)
-            .collect();
-        // Infallible: canonical flops are non-empty with positive weights.
-        let dist = WeightedIndex::new(&weights)
-            .expect("canonical flops are non-empty with positive weights");
-        let deck = Self::full_deck();
-
+        let sampler = FlopSampler::new();
         let base_count = deals.len();
         let mut total_added = 0usize;
 
         for &(_, class_idx) in &deficit_classes {
-            let ci = class_idx as usize;
-            let mut consecutive_failures = 0usize;
-
-            while coverage[ci] < min_per_class && consecutive_failures < max_rejections {
-                let deal = generate_one_flop_deal(
-                    &mut rng,
-                    &canonical_flops,
-                    &dist,
-                    &deck,
-                    self.config.stack_depth,
-                );
-
-                let Some(board) = deal.full_board else {
-                    consecutive_failures += 1;
-                    continue;
-                };
-                let mut deal_classes = 0u32;
-                if let Ok(c1) = classify(deal.p1_holding, &board) {
-                    deal_classes |= c1.bits();
-                }
-                if let Ok(c2) = classify(deal.p2_holding, &board) {
-                    deal_classes |= c2.bits();
-                }
-
-                if deal_classes & (1 << class_idx) != 0 {
-                    for (i, count) in coverage.iter_mut().enumerate() {
-                        if deal_classes & (1 << i) != 0 {
-                            *count += 1;
-                        }
-                    }
-                    deals.push(deal);
-                    total_added += 1;
-                    consecutive_failures = 0;
-                } else {
-                    consecutive_failures += 1;
-                }
-            }
+            let added = fill_deficit_class(
+                &sampler,
+                &mut rng,
+                &mut coverage,
+                &mut deals,
+                class_idx,
+                min_per_class,
+                max_rejections,
+                self.config.stack_depth,
+            );
+            total_added += added;
         }
 
         println!(
@@ -704,44 +725,188 @@ impl HunlPostflop {
             state.p2_cache.class = classify(state.p2_holding, &state.board).ok();
         }
     }
+
+    fn apply_check(&self, state: &PostflopState, new_state: &mut PostflopState) {
+        let is_p1 = state.to_act == Some(Player::Player1);
+        if !is_p1 && state.street == Street::Preflop && state.to_call == 0 {
+            self.advance_street(new_state);
+            return;
+        }
+        let last_action_on_street = state
+            .history
+            .iter()
+            .rev()
+            .find(|(s, _)| *s == state.street)
+            .map(|(_, a)| a);
+
+        if matches!(last_action_on_street, Some(Action::Check)) {
+            self.advance_street(new_state);
+        } else {
+            new_state.to_act = Some(state.to_act.unwrap_or(Player::Player1).opponent());
+        }
+    }
+
+    fn apply_call(&self, state: &PostflopState, new_state: &mut PostflopState) {
+        let is_p1 = state.to_act == Some(Player::Player1);
+        let player_idx = usize::from(!is_p1);
+        let call_amount = state.to_call.min(state.current_stack());
+        new_state.stacks[player_idx] -= call_amount;
+        new_state.pot += call_amount;
+        new_state.to_call = 0;
+
+        if is_p1 && state.street == Street::Preflop && state.street_bets == 1 {
+            new_state.to_act = Some(Player::Player2);
+        } else {
+            self.advance_street(new_state);
+        }
+    }
+
+    fn apply_bet_or_raise(&self, state: &PostflopState, new_state: &mut PostflopState, idx: u32) {
+        let is_p1 = state.to_act == Some(Player::Player1);
+        let player_idx = usize::from(!is_p1);
+        let effective_stack = state.current_stack().saturating_sub(state.to_call);
+        let bet_portion = self.resolve_bet_amount(idx, state.pot, effective_stack);
+        let total = state.to_call + bet_portion;
+        let actual = total.min(state.current_stack());
+        new_state.stacks[player_idx] -= actual;
+        new_state.pot += actual;
+        new_state.to_call = actual.saturating_sub(state.to_call);
+        new_state.street_bets += 1;
+        new_state.to_act = Some(state.to_act.unwrap_or(Player::Player1).opponent());
+
+        if new_state.opponent_stack() == 0 {
+            new_state.terminal = Some(TerminalType::Showdown);
+            new_state.to_act = None;
+        }
+    }
 }
 
-/// Generate a single random deal from the canonical flop distribution.
+/// Pre-built sampler for generating deals from the canonical flop distribution.
 ///
-/// Picks a weighted-random canonical flop, then deals turn + river + 2+2
-/// hole cards from the remaining 49 cards.
-fn generate_one_flop_deal(
-    rng: &mut rand::rngs::StdRng,
-    canonical_flops: &[crate::flops::CanonicalFlop],
-    flop_dist: &rand::distr::weighted::WeightedIndex<u16>,
-    deck: &[Card],
-    stack_depth: u32,
-) -> PostflopState {
-    use rand::prelude::Distribution;
-    use rand::prelude::SliceRandom;
+/// Caches the canonical flops, their weighted distribution, and the full deck
+/// so callers can generate deals without redundant setup.
+struct FlopSampler {
+    canonical_flops: Vec<crate::flops::CanonicalFlop>,
+    dist: rand::distr::weighted::WeightedIndex<u16>,
+    deck: Vec<Card>,
+}
 
-    let flop = &canonical_flops[flop_dist.sample(rng)];
-    let flop_cards = *flop.cards();
+impl FlopSampler {
+    fn new() -> Self {
+        use crate::flops;
+        use rand::distr::weighted::WeightedIndex;
 
-    let remaining: Vec<Card> = deck
-        .iter()
-        .filter(|c| !flop_cards.contains(c))
-        .copied()
-        .collect();
+        let canonical_flops = flops::all_flops();
+        let weights: Vec<u16> = canonical_flops
+            .iter()
+            .map(flops::CanonicalFlop::weight)
+            .collect();
+        // Infallible: canonical flops are non-empty with positive weights.
+        let dist = WeightedIndex::new(&weights)
+            .expect("canonical flops are non-empty with positive weights");
+        let deck = crate::poker::full_deck();
+        Self { canonical_flops, dist, deck }
+    }
 
-    let mut shuffled = remaining;
-    shuffled.shuffle(rng);
+    fn sample_deal(&self, rng: &mut rand::rngs::StdRng, stack_depth: u32) -> PostflopState {
+        use rand::prelude::Distribution;
+        use rand::prelude::SliceRandom;
 
-    let turn = shuffled[0];
-    let river = shuffled[1];
-    let p1 = [shuffled[2], shuffled[3]];
-    let p2 = [shuffled[4], shuffled[5]];
-    let board = [flop_cards[0], flop_cards[1], flop_cards[2], turn, river];
+        let flop = &self.canonical_flops[self.dist.sample(rng)];
+        let flop_cards = *flop.cards();
 
-    PostflopState::new_preflop_with_board(p1, p2, board, stack_depth)
+        let mut remaining: Vec<Card> = self.deck
+            .iter()
+            .filter(|c| !flop_cards.contains(c))
+            .copied()
+            .collect();
+        remaining.shuffle(rng);
+
+        let p1 = [remaining[0], remaining[1]];
+        let p2 = [remaining[2], remaining[3]];
+        let board = [flop_cards[0], flop_cards[1], flop_cards[2], remaining[4], remaining[5]];
+
+        PostflopState::new_preflop_with_board(p1, p2, board, stack_depth)
+    }
 }
 
 /// Print a compact summary of per-class deal coverage.
+/// Identify hand classes that fall below the minimum coverage threshold.
+///
+/// Returns `(deficit, class_index)` pairs sorted by largest deficit first.
+#[allow(clippy::cast_possible_truncation)]
+fn find_deficit_classes(
+    coverage: &[usize; HandClass::COUNT],
+    min_per_class: usize,
+) -> Vec<(usize, u8)> {
+    let mut deficit_classes: Vec<(usize, u8)> = (0u8..(HandClass::COUNT as u8))
+        .filter(|&i| coverage[i as usize] < min_per_class)
+        .map(|i| (min_per_class - coverage[i as usize], i))
+        .collect();
+    deficit_classes.sort_by_key(|&(deficit, _)| std::cmp::Reverse(deficit));
+    deficit_classes
+}
+
+/// Rejection-sample deals until a deficit class meets its minimum coverage.
+///
+/// Returns the number of deals added.
+#[allow(clippy::too_many_arguments)]
+fn fill_deficit_class(
+    sampler: &FlopSampler,
+    rng: &mut rand::rngs::StdRng,
+    coverage: &mut [usize; HandClass::COUNT],
+    deals: &mut Vec<PostflopState>,
+    class_idx: u8,
+    min_per_class: usize,
+    max_rejections: usize,
+    stack_depth: u32,
+) -> usize {
+    let ci = class_idx as usize;
+    let mut added = 0usize;
+    let mut consecutive_failures = 0usize;
+
+    while coverage[ci] < min_per_class && consecutive_failures < max_rejections {
+        let deal = sampler.sample_deal(rng, stack_depth);
+
+        let Some(board) = deal.full_board else {
+            consecutive_failures += 1;
+            continue;
+        };
+        let deal_classes = classify_deal_bits(&deal, &board);
+
+        if deal_classes & (1 << class_idx) != 0 {
+            update_coverage(coverage, deal_classes);
+            deals.push(deal);
+            added += 1;
+            consecutive_failures = 0;
+        } else {
+            consecutive_failures += 1;
+        }
+    }
+    added
+}
+
+/// Compute the combined hand-class bitmask for both players in a deal.
+fn classify_deal_bits(deal: &PostflopState, board: &[Card; 5]) -> u32 {
+    let mut bits = 0u32;
+    if let Ok(c1) = classify(deal.p1_holding, board) {
+        bits |= c1.bits();
+    }
+    if let Ok(c2) = classify(deal.p2_holding, board) {
+        bits |= c2.bits();
+    }
+    bits
+}
+
+/// Increment coverage counters for all classes present in the bitmask.
+fn update_coverage(coverage: &mut [usize; HandClass::COUNT], deal_classes: u32) {
+    for (i, count) in coverage.iter_mut().enumerate() {
+        if deal_classes & (1 << i) != 0 {
+            *count += 1;
+        }
+    }
+}
+
 fn print_coverage_summary(coverage: &[usize; HandClass::COUNT]) {
     use crate::hand_class::HandClass;
     let labels = [
@@ -794,18 +959,8 @@ fn count_class_coverage(deals: &[PostflopState]) -> [usize; HandClass::COUNT] {
         let Some(board) = deal.full_board else {
             continue;
         };
-        let mut deal_classes = 0u32;
-        if let Ok(c1) = classify(deal.p1_holding, &board) {
-            deal_classes |= c1.bits();
-        }
-        if let Ok(c2) = classify(deal.p2_holding, &board) {
-            deal_classes |= c2.bits();
-        }
-        for (i, count) in counts.iter_mut().enumerate() {
-            if deal_classes & (1 << i) != 0 {
-                *count += 1;
-            }
-        }
+        let deal_classes = classify_deal_bits(deal, &board);
+        update_coverage(&mut counts, deal_classes);
     }
     counts
 }
@@ -967,74 +1122,14 @@ impl Game for HunlPostflop {
 
     fn next_state(&self, state: &Self::State, action: Action) -> Self::State {
         let mut new_state = state.clone();
-        let is_p1 = state.to_act == Some(Player::Player1);
-        let player_idx = usize::from(!is_p1);
-
         new_state.history.push((state.street, action));
 
         match action {
-            Action::Fold => {
-                let folder = state.to_act.unwrap_or(Player::Player1);
-                new_state.terminal = Some(TerminalType::Fold(folder));
-                new_state.to_act = None;
-            }
-
-            Action::Check => {
-                // Special case: BB checking option preflop after SB limp
-                if !is_p1 && state.street == Street::Preflop && state.to_call == 0 {
-                    // BB checked option, advance to flop
-                    self.advance_street(&mut new_state);
-                } else {
-                    // Check if opponent just checked on the SAME STREET (both players checked)
-                    let last_action_on_street = state
-                        .history
-                        .iter()
-                        .rev()
-                        .find(|(s, _)| *s == state.street)
-                        .map(|(_, a)| a);
-
-                    if matches!(last_action_on_street, Some(Action::Check)) {
-                        // Both checked on this street - advance street
-                        self.advance_street(&mut new_state);
-                    } else {
-                        // First check on this street, switch to opponent
-                        new_state.to_act = Some(state.to_act.unwrap_or(Player::Player1).opponent());
-                    }
-                }
-            }
-
-            Action::Call => {
-                let call_amount = state.to_call.min(state.current_stack());
-                new_state.stacks[player_idx] -= call_amount;
-                new_state.pot += call_amount;
-                new_state.to_call = 0;
-
-                // Check if this is SB limping preflop (BB gets option to raise)
-                if is_p1 && state.street == Street::Preflop && state.street_bets == 1 {
-                    // SB limped, BB gets option
-                    new_state.to_act = Some(Player::Player2);
-                } else {
-                    // Call closes action - advance street or showdown
-                    self.advance_street(&mut new_state);
-                }
-            }
-
+            Action::Fold => apply_fold(state, &mut new_state),
+            Action::Check => self.apply_check(state, &mut new_state),
+            Action::Call => self.apply_call(state, &mut new_state),
             Action::Bet(idx) | Action::Raise(idx) => {
-                let effective_stack = state.current_stack().saturating_sub(state.to_call);
-                let bet_portion = self.resolve_bet_amount(idx, state.pot, effective_stack);
-                let total = state.to_call + bet_portion;
-                let actual = total.min(state.current_stack());
-                new_state.stacks[player_idx] -= actual;
-                new_state.pot += actual;
-                new_state.to_call = actual.saturating_sub(state.to_call);
-                new_state.street_bets += 1;
-                new_state.to_act = Some(state.to_act.unwrap_or(Player::Player1).opponent());
-
-                // Check if opponent is all-in
-                if new_state.opponent_stack() == 0 {
-                    new_state.terminal = Some(TerminalType::Showdown);
-                    new_state.to_act = None;
-                }
+                self.apply_bet_or_raise(state, &mut new_state, idx);
             }
         }
 
@@ -1050,69 +1145,16 @@ impl Game for HunlPostflop {
         let p1_invested = starting_stack - state.stacks[0];
         let p2_invested = starting_stack - state.stacks[1];
 
-        // Convert internal units to BB (1 BB = 2 internal units)
-        let to_bb = |chips: u32| f64::from(chips) / 2.0;
+        let p1_ev = match terminal {
+            TerminalType::Fold(folder) => compute_fold_payoff(folder, p1_invested, p2_invested),
+            TerminalType::Showdown => compute_showdown_payoff(state, p1_invested, p2_invested),
+        };
 
-        match terminal {
-            TerminalType::Fold(folder) => {
-                if folder == Player::Player1 {
-                    if player == Player::Player1 {
-                        -to_bb(p1_invested)
-                    } else {
-                        to_bb(p1_invested)
-                    }
-                } else if player == Player::Player2 {
-                    -to_bb(p2_invested)
-                } else {
-                    to_bb(p2_invested)
-                }
-            }
-            TerminalType::Showdown => {
-                use std::cmp::Ordering;
-
-                // Use cached ranks if available, otherwise compute
-                let p1_rank = state.p1_cache.rank.unwrap_or_else(|| {
-                    let mut h = Hand::default();
-                    for &c in &state.board { h.insert(c); }
-                    for &c in &state.p1_holding { h.insert(c); }
-                    h.rank()
-                });
-                let p2_rank = state.p2_cache.rank.unwrap_or_else(|| {
-                    let mut h = Hand::default();
-                    for &c in &state.board { h.insert(c); }
-                    for &c in &state.p2_holding { h.insert(c); }
-                    h.rank()
-                });
-
-                let pot_bb = to_bb(p1_invested + p2_invested);
-
-                // Higher rank is better in rs_poker
-                let p1_ev = match p1_rank.cmp(&p2_rank) {
-                    Ordering::Greater => {
-                        // P1 wins - gets opponent's investment
-                        pot_bb - to_bb(p1_invested)
-                    }
-                    Ordering::Less => {
-                        // P2 wins - P1 loses investment
-                        -to_bb(p1_invested)
-                    }
-                    Ordering::Equal => {
-                        // Tie - split pot
-                        pot_bb / 2.0 - to_bb(p1_invested)
-                    }
-                };
-
-                if player == Player::Player1 {
-                    p1_ev
-                } else {
-                    -p1_ev
-                }
-            }
-        }
+        if player == Player::Player1 { p1_ev } else { -p1_ev }
     }
 
     fn info_set_key(&self, state: &Self::State) -> u64 {
-        use crate::info_key::{InfoKey, canonical_hand_index, encode_action, encode_hand_v2, spr_bucket};
+        use crate::info_key::{InfoKey, canonical_hand_index, compute_hand_bits_v2, encode_hand_v2, spr_bucket};
 
         let holding = state.current_holding();
 
@@ -1128,48 +1170,30 @@ impl Game for HunlPostflop {
                 if !state.board.is_empty() =>
             {
                 let is_p2 = state.to_act == Some(Player::Player2);
-                let street_idx = street_to_cache_idx(state.street);
-
-                // Get cached classification (or compute on the fly)
-                let cached_class = if is_p2 {
-                    state.p2_cache.class
-                } else {
-                    state.p1_cache.class
-                };
-                let classification = cached_class.unwrap_or_else(|| {
-                    classify(holding, &state.board).unwrap_or_default()
-                });
-
-                let class_id = classification.strongest_made_id();
-                let draw_flags = classification.draw_flags();
-
-                // Use precomputed values from deal-time caching
                 let cache = if is_p2 { &state.p2_cache } else { &state.p1_cache };
-                let equity = cache.equity[street_idx];
-                let strength = cache.strength[street_idx];
 
-                encode_hand_v2(class_id, strength, equity, draw_flags, *strength_bits, *equity_bits)
+                if let Some(classification) = cache.class {
+                    // Fast path: use precomputed values from deal-time caching
+                    let street_idx = street_to_cache_idx(state.street);
+                    encode_hand_v2(
+                        classification.strongest_made_id(),
+                        cache.strength[street_idx],
+                        cache.equity[street_idx],
+                        classification.draw_flags(),
+                        *strength_bits,
+                        *equity_bits,
+                    )
+                } else {
+                    // Slow path: compute from scratch
+                    compute_hand_bits_v2(holding, &state.board, *strength_bits, *equity_bits)
+                }
             }
             _ => u32::from(canonical_hand_index(holding)),
         };
 
-        let street_code = match state.street {
-            Street::Preflop => 0u8,
-            Street::Flop => 1,
-            Street::Turn => 2,
-            Street::River => 3,
-        };
-
-        let eff_stack = state.stacks[0].min(state.stacks[1]);
-        let spr = spr_bucket(state.pot, eff_stack);
-
-        // Encode current-street actions only
-        let mut action_codes = arrayvec::ArrayVec::<u8, 6>::new();
-        for (street, a) in &state.history {
-            if *street == state.street && !action_codes.is_full() {
-                action_codes.push(encode_action(*a));
-            }
-        }
+        let street_code = street_to_info_code(state.street);
+        let spr = spr_bucket(state.pot, state.stacks[0].min(state.stacks[1]));
+        let action_codes = encode_current_street_actions(&state.history, state.street);
 
         InfoKey::new(hand_bits, street_code, spr, &action_codes).as_u64()
     }

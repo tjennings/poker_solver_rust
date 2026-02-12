@@ -28,10 +28,9 @@ thread_local! {
 
 use crate::agent::{AgentConfig, FrequencyMap};
 use crate::blueprint::{BlueprintStrategy, BundleConfig};
-use crate::hand_class::{classify, intra_class_strength, HandClass};
+use crate::hand_class::classify;
 use crate::hands::CanonicalHand;
-use crate::info_key::{canonical_hand_index, encode_hand_v2, spr_bucket, InfoKey};
-use crate::showdown_equity;
+use crate::info_key::{canonical_hand_index, compute_hand_bits_v2, spr_bucket, InfoKey};
 
 /// Progress update emitted during a simulation run.
 #[derive(Debug, Clone)]
@@ -140,39 +139,15 @@ impl BlueprintAgent {
 
         let mode = self.bundle_config.abstraction_mode;
 
-        let hand_bits: u32 = if board.is_empty() {
+        let hand_bits: u32 = if board.is_empty() || !mode.is_hand_class() {
             u32::from(canonical_hand_index(hole_cards))
-        } else if mode.is_hand_class() {
-            let board_cards: Vec<crate::poker::Card> = board.clone();
-            let hole = hole_cards;
-            match classify(hole, &board_cards) {
-                Ok(classification) => {
-                    let made_id = classification.strongest_made_id();
-                    let strength = if HandClass::is_made_hand_id(made_id) {
-                        let class = HandClass::ALL[made_id as usize];
-                        intra_class_strength(hole, &board_cards, class)
-                    } else {
-                        1
-                    };
-                    let equity = showdown_equity::compute_equity(hole, &board_cards);
-                    let eq_bin = showdown_equity::equity_bin(
-                        equity,
-                        1u8 << self.bundle_config.equity_bits,
-                    );
-                    encode_hand_v2(
-                        made_id,
-                        strength,
-                        eq_bin,
-                        classification.draw_flags(),
-                        self.bundle_config.strength_bits,
-                        self.bundle_config.equity_bits,
-                    )
-                }
-                Err(_) => 0,
-            }
         } else {
-            // EHS2 mode - not supported in simulation, fall back to canonical hand
-            u32::from(canonical_hand_index(hole_cards))
+            compute_hand_bits_v2(
+                hole_cards,
+                board,
+                self.bundle_config.strength_bits,
+                self.bundle_config.equity_bits,
+            )
         };
 
         let street_num: u8 = round_to_street_num(round);

@@ -333,6 +333,350 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Shared training loop infrastructure
+// ---------------------------------------------------------------------------
+
+/// Trait abstracting over solver backends for the generic training loop.
+trait TrainingSolver {
+    /// Train for `iterations` iterations, calling `callback` after each.
+    fn train_batch(&mut self, iterations: u64, callback: &dyn Fn(u64));
+
+    /// Extract the full average strategy map.
+    fn all_strategies(&self) -> FxHashMap<u64, Vec<f64>>;
+
+    /// Return the total number of iterations completed.
+    fn iterations(&self) -> u64;
+
+    /// Naming prefix for checkpoint directories (e.g. "checkpoint_", "seq_checkpoint_").
+    fn checkpoint_prefix(&self) -> &str;
+
+    /// Called at each checkpoint. Should print progress/metrics and return the
+    /// strategy delta (if computable from a previous checkpoint).
+    fn checkpoint_report(
+        &mut self,
+        checkpoint_num: u64,
+        is_convergence: bool,
+        total_checkpoints: u64,
+        total_iterations: u64,
+    ) -> Option<f64>;
+}
+
+/// Configuration for [`run_training_loop`].
+struct TrainingLoopConfig<'a> {
+    convergence_threshold: Option<f64>,
+    check_interval: u64,
+    iterations: u64,
+    output_dir: &'a str,
+    bundle_config: &'a BundleConfig,
+    boundaries: &'a Option<poker_solver_core::abstraction::BucketBoundaries>,
+}
+
+/// Run the convergence or fixed-iteration training loop, then save the final bundle.
+fn run_training_loop<S: TrainingSolver>(
+    solver: &mut S,
+    loop_config: &TrainingLoopConfig<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let training_start = Instant::now();
+
+    if let Some(threshold) = loop_config.convergence_threshold {
+        run_convergence_loop(solver, threshold, loop_config);
+    } else {
+        run_fixed_iteration_loop(solver, loop_config);
+    }
+
+    save_final_bundle(solver, loop_config)?;
+
+    println!("\n=== Training Complete ===");
+    println!("Total time: {:?}", training_start.elapsed());
+
+    Ok(())
+}
+
+fn run_convergence_loop<S: TrainingSolver>(
+    solver: &mut S,
+    threshold: f64,
+    config: &TrainingLoopConfig<'_>,
+) {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] {pos} iters ({per_sec})",
+        )
+        .expect("valid template"),
+    );
+
+    let mut checkpoint_num = 0u64;
+
+    loop {
+        solver.train_batch(config.check_interval, &|_| pb.inc(1));
+        checkpoint_num += 1;
+
+        let converged = pb.suspend(|| {
+            let delta = solver.checkpoint_report(checkpoint_num, true, 0, 0);
+
+            save_checkpoint(
+                solver.all_strategies(),
+                solver.iterations(),
+                &format!("{}{checkpoint_num}", solver.checkpoint_prefix()),
+                config.output_dir,
+                config.bundle_config,
+                config.boundaries,
+            );
+
+            delta.is_some_and(|d| d < threshold)
+        });
+
+        if converged {
+            pb.finish_with_message(format!(
+                "Converged after {} iterations",
+                solver.iterations()
+            ));
+            break;
+        }
+    }
+}
+
+fn run_fixed_iteration_loop<S: TrainingSolver>(
+    solver: &mut S,
+    config: &TrainingLoopConfig<'_>,
+) {
+    let total = config.iterations;
+    let checkpoint_interval = (total / 10).max(1);
+
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} iters ({per_sec}, ETA: {eta})",
+        )
+        .expect("valid template")
+        .progress_chars("=>-"),
+    );
+
+    for checkpoint in 1..=10 {
+        solver.train_batch(checkpoint_interval, &|_| pb.inc(1));
+
+        pb.suspend(|| {
+            solver.checkpoint_report(checkpoint, false, 10, total);
+
+            save_checkpoint(
+                solver.all_strategies(),
+                solver.iterations(),
+                &format!("{}{checkpoint}_of_10", solver.checkpoint_prefix()),
+                config.output_dir,
+                config.bundle_config,
+                config.boundaries,
+            );
+        });
+    }
+
+    let trained_so_far = checkpoint_interval * 10;
+    if trained_so_far < total {
+        solver.train_batch(total - trained_so_far, &|_| pb.inc(1));
+    }
+
+    pb.finish_with_message("Training complete");
+}
+
+fn save_final_bundle<S: TrainingSolver>(
+    solver: &S,
+    config: &TrainingLoopConfig<'_>,
+) -> Result<(), Box<dyn Error>> {
+    println!("\nSaving strategy bundle...");
+    let strategies = solver.all_strategies();
+    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
+    println!(
+        "  {} info sets, {} iterations",
+        blueprint.len(),
+        blueprint.iterations_trained()
+    );
+
+    let bundle = StrategyBundle::new(
+        config.bundle_config.clone(),
+        blueprint,
+        config.boundaries.clone(),
+    );
+    let output_path = PathBuf::from(config.output_dir);
+    bundle.save(&output_path)?;
+    println!("  Saved to {}/", config.output_dir);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MCCFR solver wrapper
+// ---------------------------------------------------------------------------
+
+struct MccfrTrainingSolver<'a> {
+    solver: MccfrSolver<HunlPostflop>,
+    mccfr_samples: usize,
+    previous_strategies: Option<FxHashMap<u64, Vec<f64>>>,
+    training_start: Instant,
+    header: String,
+    action_labels: Vec<String>,
+    stack_depth: u32,
+    output_dir: &'a str,
+    abs_mode: AbstractionModeConfig,
+    convergence_threshold: Option<f64>,
+}
+
+impl TrainingSolver for MccfrTrainingSolver<'_> {
+    fn train_batch(&mut self, iterations: u64, callback: &dyn Fn(u64)) {
+        self.solver
+            .train_parallel_with_callback(iterations, self.mccfr_samples, callback);
+    }
+
+    fn all_strategies(&self) -> FxHashMap<u64, Vec<f64>> {
+        self.solver.all_strategies()
+    }
+
+    fn iterations(&self) -> u64 {
+        self.solver.iterations()
+    }
+
+    fn checkpoint_prefix(&self) -> &str {
+        "checkpoint_"
+    }
+
+    fn checkpoint_report(
+        &mut self,
+        checkpoint_num: u64,
+        is_convergence: bool,
+        total_checkpoints: u64,
+        total_iterations: u64,
+    ) -> Option<f64> {
+        let ctx = CheckpointCtx {
+            total_checkpoints,
+            total_iterations,
+            training_start: &self.training_start,
+            header: &self.header,
+            action_labels: &self.action_labels,
+            stack_depth: self.stack_depth,
+            output_dir: self.output_dir,
+            abs_mode: self.abs_mode,
+            previous_strategies: &self.previous_strategies,
+            convergence_threshold: if is_convergence {
+                self.convergence_threshold
+            } else {
+                None
+            },
+        };
+        let delta = print_checkpoint(&self.solver, checkpoint_num, &ctx);
+        self.previous_strategies = Some(self.solver.all_strategies_best_effort());
+        delta
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sequence/GPU solver wrappers
+// ---------------------------------------------------------------------------
+
+struct SimpleTrainingSolver<'a, S> {
+    solver: S,
+    prefix: &'a str,
+    previous: Option<FxHashMap<u64, Vec<f64>>>,
+}
+
+impl<S> TrainingSolver for SimpleTrainingSolver<'_, S>
+where
+    S: SimpleTrainingSolverBackend,
+{
+    fn train_batch(&mut self, iterations: u64, callback: &dyn Fn(u64)) {
+        self.solver.train_with_cb(iterations, callback);
+    }
+
+    fn all_strategies(&self) -> FxHashMap<u64, Vec<f64>> {
+        self.solver.strategies()
+    }
+
+    fn iterations(&self) -> u64 {
+        self.solver.iters()
+    }
+
+    fn checkpoint_prefix(&self) -> &str {
+        self.prefix
+    }
+
+    fn checkpoint_report(
+        &mut self,
+        checkpoint_num: u64,
+        is_convergence: bool,
+        total_checkpoints: u64,
+        total_iterations: u64,
+    ) -> Option<f64> {
+        let strategies = self.solver.strategies_best_effort();
+        let delta = self
+            .previous
+            .as_ref()
+            .map(|prev| convergence::strategy_delta(prev, &strategies));
+
+        if is_convergence {
+            println!(
+                "\n=== Check {} ({} iters) info_sets={} delta={} ===",
+                checkpoint_num,
+                self.solver.iters(),
+                strategies.len(),
+                delta.map_or("(first)".to_string(), |d| format!("{d:.6}"))
+            );
+        } else {
+            let current_iter = total_iterations
+                .checked_div(total_checkpoints)
+                .unwrap_or(0) * checkpoint_num;
+            println!(
+                "\n=== Checkpoint {}/{} ({}/{} iters) info_sets={} ===",
+                checkpoint_num,
+                total_checkpoints,
+                current_iter,
+                total_iterations,
+                strategies.len()
+            );
+        }
+
+        self.previous = Some(strategies);
+        delta
+    }
+}
+
+/// Minimal interface that both `SequenceCfrSolver` and `GpuCfrSolver` satisfy.
+trait SimpleTrainingSolverBackend {
+    fn train_with_cb(&mut self, iterations: u64, callback: &dyn Fn(u64));
+    fn strategies(&self) -> FxHashMap<u64, Vec<f64>>;
+    fn strategies_best_effort(&self) -> FxHashMap<u64, Vec<f64>>;
+    fn iters(&self) -> u64;
+}
+
+impl SimpleTrainingSolverBackend for SequenceCfrSolver {
+    fn train_with_cb(&mut self, iterations: u64, callback: &dyn Fn(u64)) {
+        self.train_with_callback(iterations, callback);
+    }
+    fn strategies(&self) -> FxHashMap<u64, Vec<f64>> {
+        self.all_strategies()
+    }
+    fn strategies_best_effort(&self) -> FxHashMap<u64, Vec<f64>> {
+        self.all_strategies_best_effort()
+    }
+    fn iters(&self) -> u64 {
+        self.iterations()
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl SimpleTrainingSolverBackend for poker_solver_gpu_cfr::GpuCfrSolver {
+    fn train_with_cb(&mut self, iterations: u64, callback: &dyn Fn(u64)) {
+        self.train_with_callback(iterations, callback);
+    }
+    fn strategies(&self) -> FxHashMap<u64, Vec<f64>> {
+        self.all_strategies()
+    }
+    fn strategies_best_effort(&self) -> FxHashMap<u64, Vec<f64>> {
+        // GPU solver doesn't have best_effort; use full strategies
+        self.all_strategies()
+    }
+    fn iters(&self) -> u64 {
+        self.iterations()
+    }
+}
+
 fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     let abs_mode = config.training.abstraction_mode;
     let use_hand_class_v2 = abs_mode == AbstractionModeConfig::HandClassV2;
@@ -468,180 +812,42 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         equity_bits: if use_hand_class_v2 { config.training.equity_bits } else { 0 },
     };
 
-    let training_start = Instant::now();
-    let mut previous_strategies: Option<FxHashMap<u64, Vec<f64>>> = None;
     let num_threads = rayon::current_num_threads();
-
-    // Baseline checkpoint (iteration 0)
-    let ckpt_ctx = CheckpointCtx {
-        total_checkpoints: 10,
-        total_iterations: config.training.iterations,
-        training_start: &training_start,
-        header: &header,
-        action_labels: &action_labels,
-        stack_depth: config.game.stack_depth,
-        output_dir: &config.training.output_dir,
-        abs_mode,
-        previous_strategies: &previous_strategies,
-        convergence_threshold: config.training.convergence_threshold,
-    };
-    print_checkpoint(&solver, 0, &ckpt_ctx);
-
     if let Some(threshold) = config.training.convergence_threshold {
-        // --- Convergence-based training ---
-        let check_interval = config.training.convergence_check_interval;
-
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] {pos} iters ({per_sec})",
-            )
-            .expect("valid template"),
-        );
-
         println!(
             "  Parallel training with {} threads (target delta < {:.6})\n",
             num_threads, threshold
         );
-
-        let mut checkpoint_num = 0u64;
-
-        loop {
-            solver.train_parallel_with_callback(
-                check_interval,
-                config.training.mccfr_samples,
-                |_| {
-                    pb.inc(1);
-                },
-            );
-            checkpoint_num += 1;
-
-            let converged = pb.suspend(|| {
-                let ckpt_ctx = CheckpointCtx {
-                    total_checkpoints: 0,
-                    total_iterations: 0,
-                    training_start: &training_start,
-                    header: &header,
-                    action_labels: &action_labels,
-                    stack_depth: config.game.stack_depth,
-                    output_dir: &config.training.output_dir,
-                    abs_mode,
-                    previous_strategies: &previous_strategies,
-                    convergence_threshold: Some(threshold),
-                };
-                let delta = print_checkpoint(&solver, checkpoint_num, &ckpt_ctx);
-
-                previous_strategies = Some(solver.all_strategies_best_effort());
-
-                save_checkpoint_bundle(
-                    &solver,
-                    &format!("checkpoint_{checkpoint_num}"),
-                    &config.training.output_dir,
-                    &bundle_config,
-                    &boundaries,
-                );
-
-                matches!(delta, Some(d) if d < threshold)
-            });
-
-            if converged {
-                pb.finish_with_message(format!(
-                    "Converged after {} iterations",
-                    solver.iterations()
-                ));
-                break;
-            }
-        }
     } else {
-        // --- Fixed-iteration training ---
-        let total = config.training.iterations;
-        let checkpoint_interval = (total / 10).max(1);
-
-        let pb = ProgressBar::new(total);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} iters ({per_sec}, ETA: {eta})",
-            )
-            .expect("valid template")
-            .progress_chars("=>-"),
-        );
-
         println!("  Parallel training with {} threads\n", num_threads);
-
-        for checkpoint in 1..=10 {
-            solver.train_parallel_with_callback(
-                checkpoint_interval,
-                config.training.mccfr_samples,
-                |_| {
-                    pb.inc(1);
-                },
-            );
-
-            pb.suspend(|| {
-                let ckpt_ctx = CheckpointCtx {
-                    total_checkpoints: 10,
-                    total_iterations: total,
-                    training_start: &training_start,
-                    header: &header,
-                    action_labels: &action_labels,
-                    stack_depth: config.game.stack_depth,
-                    output_dir: &config.training.output_dir,
-                    abs_mode,
-                    previous_strategies: &previous_strategies,
-                    convergence_threshold: None,
-                };
-                print_checkpoint(&solver, checkpoint, &ckpt_ctx);
-
-                previous_strategies = Some(solver.all_strategies_best_effort());
-
-                save_checkpoint_bundle(
-                    &solver,
-                    &format!("checkpoint_{checkpoint}_of_10"),
-                    &config.training.output_dir,
-                    &bundle_config,
-                    &boundaries,
-                );
-            });
-        }
-
-        // Handle remainder iterations
-        let trained_so_far = checkpoint_interval * 10;
-        if trained_so_far < total {
-            solver.train_parallel_with_callback(
-                total - trained_so_far,
-                config.training.mccfr_samples,
-                |_| {
-                    pb.inc(1);
-                },
-            );
-        }
-
-        pb.finish_with_message("Training complete");
     }
 
-    // Save final bundle
-    println!("\nSaving strategy bundle...");
-    let strategies = solver.all_strategies();
-    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
-    println!(
-        "  {} info sets, {} iterations",
-        blueprint.len(),
-        blueprint.iterations_trained()
-    );
+    let mut wrapper = MccfrTrainingSolver {
+        solver,
+        mccfr_samples: config.training.mccfr_samples,
+        previous_strategies: None,
+        training_start: Instant::now(),
+        header,
+        action_labels,
+        stack_depth: config.game.stack_depth,
+        output_dir: &config.training.output_dir,
+        abs_mode,
+        convergence_threshold: config.training.convergence_threshold,
+    };
 
-    let bundle = StrategyBundle::new(bundle_config, blueprint, boundaries);
-    let output_path = PathBuf::from(&config.training.output_dir);
-    bundle.save(&output_path)?;
-    println!("  Saved to {}/", config.training.output_dir);
+    // Baseline checkpoint (iteration 0)
+    wrapper.checkpoint_report(0, false, 10, config.training.iterations);
 
-    // Verify loads
-    let loaded = StrategyBundle::load(&output_path)?;
-    println!("  Verified: {} info sets loaded\n", loaded.blueprint.len());
+    let loop_config = TrainingLoopConfig {
+        convergence_threshold: config.training.convergence_threshold,
+        check_interval: config.training.convergence_check_interval,
+        iterations: config.training.iterations,
+        output_dir: &config.training.output_dir,
+        bundle_config: &bundle_config,
+        boundaries: &boundaries,
+    };
 
-    println!("=== Training Complete ===");
-    println!("Total time: {:?}", training_start.elapsed());
-
-    Ok(())
+    run_training_loop(&mut wrapper, &loop_config)
 }
 
 fn run_generate_deals(
@@ -1027,7 +1233,7 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         dcfr_beta: 0.5,
         dcfr_gamma: 2.0,
     };
-    let mut solver = SequenceCfrSolver::new(tree, deals, seq_config);
+    let solver = SequenceCfrSolver::new(tree, deals, seq_config);
 
     // Build bundle config for saves
     let bundle_config = BundleConfig {
@@ -1040,100 +1246,22 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     let boundaries = None; // sequence solver doesn't use EHS2
 
-    let training_start = Instant::now();
+    let mut wrapper = SimpleTrainingSolver {
+        solver,
+        prefix: "seq_checkpoint_",
+        previous: None,
+    };
 
-    if let Some(threshold) = config.training.convergence_threshold {
-        let check_interval = config.training.convergence_check_interval;
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] {pos} iters ({per_sec})",
-            )
-            .expect("valid template"),
-        );
+    let loop_config = TrainingLoopConfig {
+        convergence_threshold: config.training.convergence_threshold,
+        check_interval: config.training.convergence_check_interval,
+        iterations,
+        output_dir: &config.training.output_dir,
+        bundle_config: &bundle_config,
+        boundaries: &boundaries,
+    };
 
-        let mut previous: Option<FxHashMap<u64, Vec<f64>>> = None;
-        let mut checkpoint_num = 0u64;
-
-        loop {
-            solver.train_with_callback(check_interval, |_| { pb.inc(1); });
-            checkpoint_num += 1;
-
-            let converged = pb.suspend(|| {
-                let strategies = solver.all_strategies_best_effort();
-                let delta = previous.as_ref()
-                    .map(|prev| convergence::strategy_delta(prev, &strategies));
-
-                println!("\n=== Check {} ({} iters) info_sets={} delta={} ===",
-                    checkpoint_num, solver.iterations(), strategies.len(),
-                    delta.map_or("(first)".to_string(), |d| format!("{d:.6}"))
-                );
-
-                save_sequence_checkpoint(
-                    &solver, &format!("seq_checkpoint_{checkpoint_num}"),
-                    &config.training.output_dir, &bundle_config, &boundaries,
-                );
-
-                previous = Some(strategies);
-                matches!(delta, Some(d) if d < threshold)
-            });
-
-            if converged {
-                pb.finish_with_message(format!("Converged after {} iterations", solver.iterations()));
-                break;
-            }
-        }
-    } else {
-        let total = iterations;
-        let checkpoint_interval = (total / 10).max(1);
-        let pb = ProgressBar::new(total);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} iters ({per_sec}, ETA: {eta})",
-            )
-            .expect("valid template")
-            .progress_chars("=>-"),
-        );
-
-        for checkpoint in 1..=10 {
-            solver.train_with_callback(checkpoint_interval, |_| { pb.inc(1); });
-
-            pb.suspend(|| {
-                let strategies = solver.all_strategies_best_effort();
-                println!("\n=== Checkpoint {}/10 ({}/{} iters) info_sets={} ===",
-                    checkpoint, checkpoint_interval * checkpoint, total, strategies.len()
-                );
-
-                save_sequence_checkpoint(
-                    &solver, &format!("seq_checkpoint_{checkpoint}_of_10"),
-                    &config.training.output_dir, &bundle_config, &boundaries,
-                );
-            });
-        }
-
-        let trained_so_far = checkpoint_interval * 10;
-        if trained_so_far < total {
-            solver.train_with_callback(total - trained_so_far, |_| { pb.inc(1); });
-        }
-
-        pb.finish_with_message("Training complete");
-    }
-
-    // Save final bundle
-    println!("\nSaving strategy bundle...");
-    let strategies = solver.all_strategies();
-    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
-    println!("  {} info sets, {} iterations", blueprint.len(), blueprint.iterations_trained());
-
-    let bundle = StrategyBundle::new(bundle_config, blueprint, boundaries);
-    let output_path = PathBuf::from(&config.training.output_dir);
-    bundle.save(&output_path)?;
-    println!("  Saved to {}/", config.training.output_dir);
-
-    println!("\n=== Training Complete ===");
-    println!("Total time: {:?}", training_start.elapsed());
-
-    Ok(())
+    run_training_loop(&mut wrapper, &loop_config)
 }
 
 #[cfg(feature = "gpu")]
@@ -1232,140 +1360,34 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     let boundaries = None; // GPU solver doesn't use EHS2
 
-    let training_start = Instant::now();
+    let mut wrapper = SimpleTrainingSolver {
+        solver,
+        prefix: "gpu_checkpoint_",
+        previous: None,
+    };
 
-    if let Some(threshold) = config.training.convergence_threshold {
-        let check_interval = config.training.convergence_check_interval;
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] {pos} iters ({per_sec})",
-            )
-            .expect("valid template"),
-        );
+    let loop_config = TrainingLoopConfig {
+        convergence_threshold: config.training.convergence_threshold,
+        check_interval: config.training.convergence_check_interval,
+        iterations,
+        output_dir: &config.training.output_dir,
+        bundle_config: &bundle_config,
+        boundaries: &boundaries,
+    };
 
-        let mut previous: Option<FxHashMap<u64, Vec<f64>>> = None;
-        let mut checkpoint_num = 0u64;
-
-        loop {
-            solver.train_with_callback(check_interval, |_| {
-                pb.inc(1);
-            });
-            checkpoint_num += 1;
-
-            let converged = pb.suspend(|| {
-                let strategies = solver.all_strategies();
-                let delta = previous
-                    .as_ref()
-                    .map(|prev| convergence::strategy_delta(prev, &strategies));
-
-                println!(
-                    "\n=== GPU Check {} ({} iters) info_sets={} delta={} ===",
-                    checkpoint_num,
-                    solver.iterations(),
-                    strategies.len(),
-                    delta.map_or("(first)".to_string(), |d| format!("{d:.6}"))
-                );
-
-                save_gpu_checkpoint(
-                    &solver,
-                    &format!("gpu_checkpoint_{checkpoint_num}"),
-                    &config.training.output_dir,
-                    &bundle_config,
-                    &boundaries,
-                );
-
-                previous = Some(strategies);
-                matches!(delta, Some(d) if d < threshold)
-            });
-
-            if converged {
-                pb.finish_with_message(format!(
-                    "Converged after {} iterations",
-                    solver.iterations()
-                ));
-                break;
-            }
-        }
-    } else {
-        let total = iterations;
-        let checkpoint_interval = (total / 10).max(1);
-        let pb = ProgressBar::new(total);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} iters ({per_sec}, ETA: {eta})",
-            )
-            .expect("valid template")
-            .progress_chars("=>-"),
-        );
-
-        for checkpoint in 1..=10 {
-            solver.train_with_callback(checkpoint_interval, |_| {
-                pb.inc(1);
-            });
-
-            pb.suspend(|| {
-                let strategies = solver.all_strategies();
-                println!(
-                    "\n=== GPU Checkpoint {}/10 ({}/{} iters) info_sets={} ===",
-                    checkpoint,
-                    checkpoint_interval * checkpoint,
-                    total,
-                    strategies.len()
-                );
-
-                save_gpu_checkpoint(
-                    &solver,
-                    &format!("gpu_checkpoint_{checkpoint}_of_10"),
-                    &config.training.output_dir,
-                    &bundle_config,
-                    &boundaries,
-                );
-            });
-        }
-
-        let trained_so_far = checkpoint_interval * 10;
-        if trained_so_far < total {
-            solver.train_with_callback(total - trained_so_far, |_| {
-                pb.inc(1);
-            });
-        }
-
-        pb.finish_with_message("Training complete");
-    }
-
-    // Save final bundle
-    println!("\nSaving strategy bundle...");
-    let strategies = solver.all_strategies();
-    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
-    println!(
-        "  {} info sets, {} iterations",
-        blueprint.len(),
-        blueprint.iterations_trained()
-    );
-
-    let bundle = StrategyBundle::new(bundle_config, blueprint, boundaries);
-    let output_path = PathBuf::from(&config.training.output_dir);
-    bundle.save(&output_path)?;
-    println!("  Saved to {}/", config.training.output_dir);
-
-    println!("\n=== Training Complete ===");
-    println!("Total time: {:?}", training_start.elapsed());
-
-    Ok(())
+    run_training_loop(&mut wrapper, &loop_config)
 }
 
-#[cfg(feature = "gpu")]
-fn save_gpu_checkpoint(
-    solver: &poker_solver_gpu_cfr::GpuCfrSolver,
+fn save_checkpoint(
+    strategies: FxHashMap<u64, Vec<f64>>,
+    iterations: u64,
     dir_name: &str,
     output_dir: &str,
     bundle_config: &BundleConfig,
     boundaries: &Option<poker_solver_core::abstraction::BucketBoundaries>,
 ) {
     let dir = PathBuf::from(output_dir).join(dir_name);
-    let strategies = solver.all_strategies();
-    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
+    let blueprint = BlueprintStrategy::from_strategies(strategies, iterations);
     let bundle = StrategyBundle::new(bundle_config.clone(), blueprint, boundaries.clone());
 
     match bundle.save(&dir) {
@@ -1462,23 +1484,6 @@ fn compute_per_street_hand_bits(
     ]
 }
 
-fn save_sequence_checkpoint(
-    solver: &SequenceCfrSolver,
-    dir_name: &str,
-    output_dir: &str,
-    bundle_config: &BundleConfig,
-    boundaries: &Option<poker_solver_core::abstraction::BucketBoundaries>,
-) {
-    let dir = PathBuf::from(output_dir).join(dir_name);
-    let strategies = solver.all_strategies();
-    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
-    let bundle = StrategyBundle::new(bundle_config.clone(), blueprint, boundaries.clone());
-
-    match bundle.save(&dir) {
-        Ok(()) => println!("  Saved checkpoint to {}/", dir.display()),
-        Err(e) => eprintln!("  Warning: failed to save checkpoint: {e}"),
-    }
-}
 
 /// Build abstract deals via exhaustive enumeration.
 fn build_exhaustive_deals(config: &TrainingConfig) -> Result<Vec<DealInfo>, Box<dyn Error>> {
@@ -1746,23 +1751,6 @@ fn collect_info_keys_dfs(
     }
 }
 
-fn save_checkpoint_bundle(
-    solver: &MccfrSolver<HunlPostflop>,
-    dir_name: &str,
-    output_dir: &str,
-    bundle_config: &BundleConfig,
-    boundaries: &Option<poker_solver_core::abstraction::BucketBoundaries>,
-) {
-    let dir = PathBuf::from(output_dir).join(dir_name);
-    let strategies = solver.all_strategies();
-    let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
-    let bundle = StrategyBundle::new(bundle_config.clone(), blueprint, boundaries.clone());
-
-    match bundle.save(&dir) {
-        Ok(()) => println!("  Saved checkpoint to {}/", dir.display()),
-        Err(e) => eprintln!("  Warning: failed to save checkpoint: {e}"),
-    }
-}
 
 fn format_action_labels(actions: &[Action]) -> Vec<String> {
     use poker_solver_core::game::ALL_IN;

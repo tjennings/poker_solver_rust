@@ -79,6 +79,69 @@ fn per_sample_seed(base_seed: u64, iteration: u64, sample_idx: usize) -> u64 {
     if z == 0 { 1 } else { z }
 }
 
+/// Compute updated reach probabilities after a player acts with probability `action_prob`.
+fn update_reaches(player: Player, p1_reach: f64, p2_reach: f64, action_prob: f64) -> (f64, f64) {
+    match player {
+        Player::Player1 => (p1_reach * action_prob, p2_reach),
+        Player::Player2 => (p1_reach, p2_reach * action_prob),
+    }
+}
+
+/// Get the opponent's reach probability for the given player.
+fn opponent_reach(player: Player, p1_reach: f64, p2_reach: f64) -> f64 {
+    match player {
+        Player::Player1 => p2_reach,
+        Player::Player2 => p1_reach,
+    }
+}
+
+/// Get the acting player's own reach probability.
+fn player_reach(player: Player, p1_reach: f64, p2_reach: f64) -> f64 {
+    match player {
+        Player::Player1 => p1_reach,
+        Player::Player2 => p2_reach,
+    }
+}
+
+/// Compute expected node utility under the current strategy.
+fn compute_node_utility(action_utils: &[f64], strategy: &[f64]) -> f64 {
+    action_utils
+        .iter()
+        .zip(strategy.iter())
+        .map(|(u, p)| u * p)
+        .sum()
+}
+
+/// Add regret increments for each unpruned action.
+fn add_regret_deltas(
+    regrets: &mut [f64],
+    action_utils: &[f64],
+    node_util: f64,
+    opp_reach: f64,
+    sample_weight: f64,
+    pruned: u32,
+) {
+    for (i, regret) in regrets.iter_mut().enumerate() {
+        if pruned >> i & 1 != 0 {
+            continue;
+        }
+        *regret += opp_reach * (action_utils[i] - node_util) * sample_weight;
+    }
+}
+
+/// Accumulate DCFR-weighted strategy contributions.
+fn accumulate_strategy_sums(
+    strat_sums: &mut [f64],
+    strategy: &[f64],
+    my_reach: f64,
+    sample_weight: f64,
+    strategy_discount: f64,
+) {
+    for (i, sum) in strat_sums.iter_mut().enumerate() {
+        *sum += my_reach * strategy[i] * sample_weight * strategy_discount;
+    }
+}
+
 /// Monte Carlo CFR solver with chance sampling.
 ///
 /// Much faster than vanilla CFR for games with many initial states because
@@ -455,109 +518,47 @@ impl<G: Game> MccfrSolver<G> {
         let actions = self.game.actions(state);
         let num_actions = actions.len();
         let info_set = self.game.info_set_key(state);
-
-        // Get current strategy from regrets
         let strategy = current_strategy_from(&self.regret_sum, info_set, num_actions);
 
         if current_player == traversing_player {
-            // Traversing player: explore all actions
             let mut action_utils = vec![0.0; num_actions];
             let mut pruned: u32 = 0;
 
             for (i, action) in actions.iter().enumerate() {
                 self.total_traversals += 1;
-
-                // Regret-based pruning: skip actions with non-positive cumulative regret
                 if self.should_prune(info_set, i) {
                     self.pruned_traversals += 1;
                     pruned |= 1 << i;
                     continue;
                 }
-
                 let next_state = self.game.next_state(state, *action);
-
-                let (new_p1_reach, new_p2_reach) = match current_player {
-                    Player::Player1 => (p1_reach * strategy[i], p2_reach),
-                    Player::Player2 => (p1_reach, p2_reach * strategy[i]),
-                };
-
+                let (np1, np2) = update_reaches(current_player, p1_reach, p2_reach, strategy[i]);
                 action_utils[i] = self.cfr_traverse(
-                    &next_state,
-                    traversing_player,
-                    new_p1_reach,
-                    new_p2_reach,
-                    sample_weight,
-                    strategy_discount,
+                    &next_state, traversing_player, np1, np2, sample_weight, strategy_discount,
                 );
             }
 
-            // Expected utility under current strategy
-            let node_util: f64 = action_utils
-                .iter()
-                .zip(strategy.iter())
-                .map(|(u, p)| u * p)
-                .sum();
-
-            // Update regrets
-            let opponent_reach = match current_player {
-                Player::Player1 => p2_reach,
-                Player::Player2 => p1_reach,
-            };
-
-            let regrets = self
-                .regret_sum
-                .entry(info_set)
+            let node_util = compute_node_utility(&action_utils, &strategy);
+            let opp_reach = opponent_reach(current_player, p1_reach, p2_reach);
+            let regrets = self.regret_sum.entry(info_set)
                 .or_insert_with(|| vec![0.0; num_actions]);
+            add_regret_deltas(regrets, &action_utils, node_util, opp_reach, sample_weight, pruned);
 
-            for i in 0..num_actions {
-                if pruned >> i & 1 != 0 {
-                    continue;
-                }
-                let regret_delta =
-                    opponent_reach * (action_utils[i] - node_util) * sample_weight;
-                regrets[i] += regret_delta;
-            }
-
-            // Accumulate strategy with DCFR discounting
             if strategy_discount > 0.0 {
-                let my_reach = match current_player {
-                    Player::Player1 => p1_reach,
-                    Player::Player2 => p2_reach,
-                };
-
-                let strat_sums = self
-                    .strategy_sum
-                    .entry(info_set)
+                let my_reach = player_reach(current_player, p1_reach, p2_reach);
+                let strat_sums = self.strategy_sum.entry(info_set)
                     .or_insert_with(|| vec![0.0; num_actions]);
-
-                for i in 0..num_actions {
-                    strat_sums[i] += my_reach * strategy[i] * sample_weight * strategy_discount;
-                }
+                accumulate_strategy_sums(strat_sums, &strategy, my_reach, sample_weight, strategy_discount);
             }
 
             node_util
         } else {
-            // Opponent's node: sample ONE action according to strategy
-            let sampled_action = sample_action_rng(&mut self.rng_state, &strategy);
-            let action = actions[sampled_action];
-            let next_state = self.game.next_state(state, action);
-
-            let (new_p1_reach, new_p2_reach) = match current_player {
-                Player::Player1 => (p1_reach * strategy[sampled_action], p2_reach),
-                Player::Player2 => (p1_reach, p2_reach * strategy[sampled_action]),
-            };
-
-            // Opponent strategy is NOT accumulated here — it's accumulated
-            // when the opponent is the traversing player on alternating iterations.
-            // Accumulating here would double-count with biased reach weights.
-
+            // Opponent: sample one action, don't accumulate strategy here
+            let sampled = sample_action_rng(&mut self.rng_state, &strategy);
+            let next_state = self.game.next_state(state, actions[sampled]);
+            let (np1, np2) = update_reaches(current_player, p1_reach, p2_reach, strategy[sampled]);
             self.cfr_traverse(
-                &next_state,
-                traversing_player,
-                new_p1_reach,
-                new_p2_reach,
-                sample_weight,
-                strategy_discount,
+                &next_state, traversing_player, np1, np2, sample_weight, strategy_discount,
             )
         }
     }
@@ -827,7 +828,7 @@ fn should_prune_snapshot(
 ///
 /// Same logic as `cfr_traverse` but operates on immutable regret snapshot
 /// and accumulates deltas without applying CFR+ flooring.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn cfr_traverse_pure<G: Game>(
     game: &G,
     regret_snapshot: &FxHashMap<u64, Vec<f64>>,
@@ -848,7 +849,6 @@ fn cfr_traverse_pure<G: Game>(
     let actions = game.actions(state);
     let num_actions = actions.len();
     let info_set = game.info_set_key(state);
-
     let strategy = current_strategy_from(regret_snapshot, info_set, num_actions);
 
     if current_player == traversing_player {
@@ -857,99 +857,41 @@ fn cfr_traverse_pure<G: Game>(
 
         for (i, action) in actions.iter().enumerate() {
             acc.total_count += 1;
-
             if should_prune_snapshot(regret_snapshot, info_set, i, &pruning) {
                 acc.pruned_count += 1;
                 pruned |= 1 << i;
                 continue;
             }
-
             let next_state = game.next_state(state, *action);
-
-            let (new_p1, new_p2) = match current_player {
-                Player::Player1 => (p1_reach * strategy[i], p2_reach),
-                Player::Player2 => (p1_reach, p2_reach * strategy[i]),
-            };
-
+            let (np1, np2) = update_reaches(current_player, p1_reach, p2_reach, strategy[i]);
             action_utils[i] = cfr_traverse_pure(
-                game,
-                regret_snapshot,
-                acc,
-                &next_state,
-                traversing_player,
-                new_p1,
-                new_p2,
-                sample_weight,
-                strategy_discount,
-                pruning,
+                game, regret_snapshot, acc, &next_state, traversing_player,
+                np1, np2, sample_weight, strategy_discount, pruning,
             );
         }
 
-        let node_util: f64 = action_utils
-            .iter()
-            .zip(strategy.iter())
-            .map(|(u, p)| u * p)
-            .sum();
-
-        let opponent_reach = match current_player {
-            Player::Player1 => p2_reach,
-            Player::Player2 => p1_reach,
-        };
-
-        let regrets = acc
-            .regret_deltas
-            .entry(info_set)
+        let node_util = compute_node_utility(&action_utils, &strategy);
+        let opp_reach = opponent_reach(current_player, p1_reach, p2_reach);
+        let regrets = acc.regret_deltas.entry(info_set)
             .or_insert_with(|| vec![0.0; num_actions]);
-
-        for i in 0..num_actions {
-            if pruned >> i & 1 != 0 {
-                continue;
-            }
-            regrets[i] +=
-                opponent_reach * (action_utils[i] - node_util) * sample_weight;
-        }
+        add_regret_deltas(regrets, &action_utils, node_util, opp_reach, sample_weight, pruned);
 
         if strategy_discount > 0.0 {
-            let my_reach = match current_player {
-                Player::Player1 => p1_reach,
-                Player::Player2 => p2_reach,
-            };
-
-            let strat_sums = acc
-                .strategy_deltas
-                .entry(info_set)
+            let my_reach = player_reach(current_player, p1_reach, p2_reach);
+            let strat_sums = acc.strategy_deltas.entry(info_set)
                 .or_insert_with(|| vec![0.0; num_actions]);
-
-            for i in 0..num_actions {
-                strat_sums[i] += my_reach * strategy[i] * sample_weight * strategy_discount;
-            }
+            accumulate_strategy_sums(strat_sums, &strategy, my_reach, sample_weight, strategy_discount);
         }
 
         node_util
     } else {
-        let sampled_action = sample_action_rng(&mut acc.rng_state, &strategy);
-        let action = actions[sampled_action];
-        let next_state = game.next_state(state, action);
-
-        let (new_p1, new_p2) = match current_player {
-            Player::Player1 => (p1_reach * strategy[sampled_action], p2_reach),
-            Player::Player2 => (p1_reach, p2_reach * strategy[sampled_action]),
-        };
-
-        // Opponent strategy is NOT accumulated here — it's accumulated
-        // when the opponent is the traversing player on alternating iterations.
-
+        // Opponent: sample one action, don't accumulate strategy here
+        let sampled = sample_action_rng(&mut acc.rng_state, &strategy);
+        let next_state = game.next_state(state, actions[sampled]);
+        let (np1, np2) = update_reaches(current_player, p1_reach, p2_reach, strategy[sampled]);
         cfr_traverse_pure(
-            game,
-            regret_snapshot,
-            acc,
-            &next_state,
-            traversing_player,
-            new_p1,
-            new_p2,
-            sample_weight,
-            strategy_discount,
-            pruning,
+            game, regret_snapshot, acc, &next_state, traversing_player,
+            np1, np2, sample_weight, strategy_discount, pruning,
         )
     }
 }

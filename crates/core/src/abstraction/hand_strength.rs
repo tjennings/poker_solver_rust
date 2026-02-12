@@ -4,7 +4,7 @@
 //! potential metrics, and the EHS2 formula that combines current strength with
 //! hand potential.
 
-use crate::poker::{Card, Hand, Rankable, Suit, Value};
+use crate::poker::{Card, Hand, Rank, Rankable, Suit, Value};
 use std::collections::HashSet;
 
 /// Hand strength metrics for poker hand evaluation.
@@ -81,6 +81,159 @@ impl HandStrength {
     }
 }
 
+/// Counters accumulated during opponent enumeration for EHS and potential.
+#[derive(Default)]
+struct EhsCounters {
+    total_ahead: u64,
+    total_tied: u64,
+    total_behind: u64,
+    ahead_stays_ahead: u64,
+    ahead_falls_behind: u64,
+    behind_moves_ahead: u64,
+    behind_stays_behind: u64,
+}
+
+impl EhsCounters {
+    /// Record the current-street comparison result.
+    fn record_current(&mut self, our_rank: Rank, opp_rank: Rank) {
+        match our_rank.cmp(&opp_rank) {
+            std::cmp::Ordering::Greater => self.total_ahead += 1,
+            std::cmp::Ordering::Less => self.total_behind += 1,
+            std::cmp::Ordering::Equal => self.total_tied += 1,
+        }
+    }
+
+    /// Record a runout comparison result given the current-street comparison.
+    fn record_runout(&mut self, currently_ahead: bool, currently_behind: bool, our_rank: Rank, opp_rank: Rank) {
+        let finally_ahead = our_rank > opp_rank;
+        let tied_or_ahead = finally_ahead || our_rank == opp_rank;
+
+        if currently_ahead {
+            if tied_or_ahead { self.ahead_stays_ahead += 1; }
+            else { self.ahead_falls_behind += 1; }
+        } else if currently_behind {
+            if tied_or_ahead { self.behind_moves_ahead += 1; }
+            else { self.behind_stays_behind += 1; }
+        }
+    }
+
+    /// Compute final EHS, `PPot`, `NPot` from accumulated counters.
+    fn to_hand_strength(&self) -> HandStrength {
+        let total = self.total_ahead + self.total_tied + self.total_behind;
+        #[allow(clippy::cast_precision_loss)]
+        let ehs = if total > 0 {
+            (self.total_ahead as f32 + self.total_tied as f32 / 2.0) / total as f32
+        } else {
+            0.5
+        };
+
+        let ppot = compute_potential(self.behind_moves_ahead, self.behind_stays_behind, self.total_behind);
+        let npot = compute_potential(self.ahead_falls_behind, self.ahead_stays_ahead, self.total_ahead);
+
+        HandStrength::new(ehs, ppot, npot)
+    }
+}
+
+/// Compute a potential metric: P(outcome changed) given a category total.
+///
+/// `changed` = count where outcome flipped, `stayed` = count where it didn't,
+/// `category_total` = total current-street matchups in this category.
+#[allow(clippy::cast_precision_loss)]
+fn compute_potential(changed: u64, stayed: u64, category_total: u64) -> f32 {
+    if category_total == 0 {
+        return 0.0;
+    }
+    let outcomes = changed + stayed;
+    if outcomes > 0 { changed as f32 / outcomes as f32 } else { 0.0 }
+}
+
+/// Build the live deck (all cards not in the dead set).
+fn build_deck(holding: (Card, Card), board: &[Card]) -> Vec<Card> {
+    let mut dead: HashSet<Card> = HashSet::new();
+    dead.insert(holding.0);
+    dead.insert(holding.1);
+    for &card in board {
+        dead.insert(card);
+    }
+    all_cards().filter(|c| !dead.contains(c)).collect()
+}
+
+/// Build a hand from board + hole cards.
+fn build_hand(board: &[Card], h1: Card, h2: Card) -> Vec<Card> {
+    let mut hand: Vec<Card> = board.to_vec();
+    hand.push(h1);
+    hand.push(h2);
+    hand
+}
+
+/// Enumerate flop runouts (turn + river) and record potential transitions.
+#[allow(clippy::too_many_arguments)]
+fn enumerate_flop_runouts(
+    our_hand: &mut Vec<Card>,
+    opp_hand: &mut Vec<Card>,
+    deck: &[Card],
+    opp1: Card,
+    opp2: Card,
+    currently_ahead: bool,
+    currently_behind: bool,
+    counters: &mut EhsCounters,
+) {
+    our_hand.reserve(2);
+    opp_hand.reserve(2);
+
+    for (ti, &turn) in deck.iter().enumerate() {
+        if turn == opp1 || turn == opp2 { continue; }
+        for &river in deck.iter().skip(ti + 1) {
+            if river == opp1 || river == opp2 { continue; }
+
+            our_hand.push(turn);
+            our_hand.push(river);
+            let our_rank = Hand::new_with_cards(our_hand.clone()).rank();
+            our_hand.pop();
+            our_hand.pop();
+
+            opp_hand.push(turn);
+            opp_hand.push(river);
+            let opp_rank = Hand::new_with_cards(opp_hand.clone()).rank();
+            opp_hand.pop();
+            opp_hand.pop();
+
+            counters.record_runout(currently_ahead, currently_behind, our_rank, opp_rank);
+        }
+    }
+
+}
+
+/// Enumerate turn runouts (river only) and record potential transitions.
+#[allow(clippy::too_many_arguments)]
+fn enumerate_turn_runouts(
+    our_hand: &mut Vec<Card>,
+    opp_hand: &mut Vec<Card>,
+    deck: &[Card],
+    opp1: Card,
+    opp2: Card,
+    currently_ahead: bool,
+    currently_behind: bool,
+    counters: &mut EhsCounters,
+) {
+    our_hand.reserve(1);
+    opp_hand.reserve(1);
+
+    for &river in deck {
+        if river == opp1 || river == opp2 { continue; }
+
+        our_hand.push(river);
+        let our_rank = Hand::new_with_cards(our_hand.clone()).rank();
+        our_hand.pop();
+
+        opp_hand.push(river);
+        let opp_rank = Hand::new_with_cards(opp_hand.clone()).rank();
+        opp_hand.pop();
+
+        counters.record_runout(currently_ahead, currently_behind, our_rank, opp_rank);
+    }
+}
+
 /// Calculator for hand strength metrics.
 ///
 /// Provides methods for computing Expected Hand Strength (EHS) and related
@@ -100,300 +253,62 @@ impl HandStrengthCalculator {
     /// This is the most expensive calculation (~1M evaluations per holding).
     /// Enumerates all possible opponent holdings and turn+river cards to calculate
     /// hand strength with positive and negative potential.
-    ///
-    /// # Arguments
-    /// * `board` - The 3 community cards on the flop
-    /// * `holding` - The player's two hole cards
-    ///
-    /// # Returns
-    /// A `HandStrength` with EHS, `PPot`, `NPot`, and EHS2.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn calculate_flop(&self, board: &[Card], holding: (Card, Card)) -> HandStrength {
-        let (h1, h2) = holding;
+        let deck = build_deck(holding, board);
+        let mut our_hand = build_hand(board, holding.0, holding.1);
+        let mut counters = EhsCounters::default();
 
-        // Build set of dead cards
-        let mut dead: HashSet<Card> = HashSet::new();
-        dead.insert(h1);
-        dead.insert(h2);
-        for &card in board {
-            dead.insert(card);
-        }
-
-        // Get all non-dead cards for iteration
-        let deck: Vec<Card> = all_cards().filter(|c| !dead.contains(c)).collect();
-
-        // Counters for EHS
-        let mut total_ahead = 0u64;
-        let mut total_tied = 0u64;
-        let mut total_behind = 0u64;
-
-        // Counters for potential
-        let mut ahead_stays_ahead = 0u64;
-        let mut ahead_falls_behind = 0u64;
-        let mut behind_moves_ahead = 0u64;
-        let mut behind_stays_behind = 0u64;
-
-        // Build our flop hand once
-        let mut our_flop: Vec<Card> = board.to_vec();
-        our_flop.push(h1);
-        our_flop.push(h2);
-
-        // Enumerate all opponent holdings
         for (i, &opp1) in deck.iter().enumerate() {
             for &opp2 in deck.iter().skip(i + 1) {
-                // Build opponent's flop hand
-                let mut opp_flop: Vec<Card> = board.to_vec();
-                opp_flop.push(opp1);
-                opp_flop.push(opp2);
+                let mut opp_hand = build_hand(board, opp1, opp2);
+                let our_rank = Hand::new_with_cards(our_hand.clone()).rank();
+                let opp_rank = Hand::new_with_cards(opp_hand.clone()).rank();
 
-                // Current hand comparison (on flop - 5 cards each, best 5 from 5)
-                let our_flop_rank = Hand::new_with_cards(our_flop.clone()).rank();
-                let opp_flop_rank = Hand::new_with_cards(opp_flop.clone()).rank();
+                counters.record_current(our_rank, opp_rank);
+                let currently_ahead = our_rank > opp_rank;
+                let currently_behind = our_rank < opp_rank;
 
-                let currently_ahead = our_flop_rank > opp_flop_rank;
-                let currently_behind = our_flop_rank < opp_flop_rank;
+                enumerate_flop_runouts(
+                    &mut our_hand, &mut opp_hand, &deck, opp1, opp2,
+                    currently_ahead, currently_behind, &mut counters,
+                );
 
-                if currently_ahead {
-                    total_ahead += 1;
-                } else if currently_behind {
-                    total_behind += 1;
-                } else {
-                    total_tied += 1;
-                }
-
-                // Pre-allocate space
-                our_flop.reserve(2);
-                opp_flop.reserve(2);
-
-                // Enumerate turn cards
-                for (ti, &turn) in deck.iter().enumerate() {
-                    if turn == opp1 || turn == opp2 {
-                        continue;
-                    }
-
-                    // Enumerate river cards (only cards after turn to avoid duplicates)
-                    for &river in deck.iter().skip(ti + 1) {
-                        if river == opp1 || river == opp2 {
-                            continue;
-                        }
-
-                        // Add turn+river, rank, then remove
-                        our_flop.push(turn);
-                        our_flop.push(river);
-                        let our_river_rank = Hand::new_with_cards(our_flop.clone()).rank();
-                        our_flop.pop();
-                        our_flop.pop();
-
-                        opp_flop.push(turn);
-                        opp_flop.push(river);
-                        let opp_river_rank = Hand::new_with_cards(opp_flop.clone()).rank();
-                        opp_flop.pop();
-                        opp_flop.pop();
-
-                        let finally_ahead = our_river_rank > opp_river_rank;
-
-                        if currently_ahead {
-                            if finally_ahead || our_river_rank == opp_river_rank {
-                                ahead_stays_ahead += 1;
-                            } else {
-                                ahead_falls_behind += 1;
-                            }
-                        } else if currently_behind {
-                            if finally_ahead || our_river_rank == opp_river_rank {
-                                behind_moves_ahead += 1;
-                            } else {
-                                behind_stays_behind += 1;
-                            }
-                        }
-                    }
-                }
-
-                // Reset capacity to avoid memory buildup
-                our_flop.truncate(5);
-                opp_flop.truncate(5);
+                our_hand.truncate(board.len() + 2);
             }
         }
 
-        let total = total_ahead + total_tied + total_behind;
-        #[allow(clippy::cast_precision_loss)]
-        let ehs = if total > 0 {
-            (total_ahead as f32 + total_tied as f32 / 2.0) / total as f32
-        } else {
-            0.5
-        };
-
-        let ppot = if total_behind > 0 {
-            let behind_outcomes = behind_moves_ahead + behind_stays_behind;
-            if behind_outcomes > 0 {
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    behind_moves_ahead as f32 / behind_outcomes as f32
-                }
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
-        let npot = if total_ahead > 0 {
-            let ahead_outcomes = ahead_stays_ahead + ahead_falls_behind;
-            if ahead_outcomes > 0 {
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    ahead_falls_behind as f32 / ahead_outcomes as f32
-                }
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
-        HandStrength::new(ehs, ppot, npot)
+        counters.to_hand_strength()
     }
 
     /// Calculate EHS2 on the turn (enumerate river cards).
     ///
     /// Enumerates all possible opponent holdings and river cards to calculate
     /// hand strength with positive and negative potential.
-    ///
-    /// # Arguments
-    /// * `board` - The 4 community cards on the turn
-    /// * `holding` - The player's two hole cards
-    ///
-    /// # Returns
-    /// A `HandStrength` with EHS, `PPot`, `NPot`, and EHS2.
     #[must_use]
     pub fn calculate_turn(&self, board: &[Card], holding: (Card, Card)) -> HandStrength {
-        let (h1, h2) = holding;
+        let deck = build_deck(holding, board);
+        let mut our_hand = build_hand(board, holding.0, holding.1);
+        let mut counters = EhsCounters::default();
 
-        // Build set of dead cards
-        let mut dead: HashSet<Card> = HashSet::new();
-        dead.insert(h1);
-        dead.insert(h2);
-        for &card in board {
-            dead.insert(card);
-        }
-
-        // Get all non-dead cards for iteration
-        let deck: Vec<Card> = all_cards().filter(|c| !dead.contains(c)).collect();
-
-        // Counters for EHS
-        let mut total_ahead = 0u64;
-        let mut total_tied = 0u64;
-        let mut total_behind = 0u64;
-
-        // Counters for potential
-        let mut ahead_stays_ahead = 0u64;
-        let mut ahead_falls_behind = 0u64;
-        let mut behind_moves_ahead = 0u64;
-        let mut behind_stays_behind = 0u64;
-
-        // Build our turn hand once
-        let mut our_turn: Vec<Card> = board.to_vec();
-        our_turn.push(h1);
-        our_turn.push(h2);
-
-        // Enumerate all opponent holdings
         for (i, &opp1) in deck.iter().enumerate() {
             for &opp2 in deck.iter().skip(i + 1) {
-                // Build opponent's turn hand
-                let mut opp_turn: Vec<Card> = board.to_vec();
-                opp_turn.push(opp1);
-                opp_turn.push(opp2);
+                let mut opp_hand = build_hand(board, opp1, opp2);
+                let our_rank = Hand::new_with_cards(our_hand.clone()).rank();
+                let opp_rank = Hand::new_with_cards(opp_hand.clone()).rank();
 
-                // Current hand comparison (on turn - 6 cards each)
-                let our_turn_rank = Hand::new_with_cards(our_turn.clone()).rank();
-                let opp_turn_rank = Hand::new_with_cards(opp_turn.clone()).rank();
+                counters.record_current(our_rank, opp_rank);
+                let currently_ahead = our_rank > opp_rank;
+                let currently_behind = our_rank < opp_rank;
 
-                let currently_ahead = our_turn_rank > opp_turn_rank;
-                let currently_behind = our_turn_rank < opp_turn_rank;
-
-                if currently_ahead {
-                    total_ahead += 1;
-                } else if currently_behind {
-                    total_behind += 1;
-                } else {
-                    total_tied += 1;
-                }
-
-                // Pre-allocate space for river card to avoid reallocation
-                our_turn.reserve(1);
-                opp_turn.reserve(1);
-
-                // Enumerate river cards
-                for &river in &deck {
-                    if river == opp1 || river == opp2 {
-                        continue;
-                    }
-
-                    // Add river card, rank hand, then remove - avoids cloning base vectors
-                    our_turn.push(river);
-                    let our_river_rank = Hand::new_with_cards(our_turn.clone()).rank();
-                    our_turn.pop();
-
-                    opp_turn.push(river);
-                    let opp_river_rank = Hand::new_with_cards(opp_turn.clone()).rank();
-                    opp_turn.pop();
-
-                    let finally_ahead = our_river_rank > opp_river_rank;
-
-                    if currently_ahead {
-                        if finally_ahead || our_river_rank == opp_river_rank {
-                            ahead_stays_ahead += 1;
-                        } else {
-                            ahead_falls_behind += 1;
-                        }
-                    } else if currently_behind {
-                        if finally_ahead || our_river_rank == opp_river_rank {
-                            behind_moves_ahead += 1;
-                        } else {
-                            behind_stays_behind += 1;
-                        }
-                    }
-                }
+                enumerate_turn_runouts(
+                    &mut our_hand, &mut opp_hand, &deck, opp1, opp2,
+                    currently_ahead, currently_behind, &mut counters,
+                );
             }
         }
 
-        let total = total_ahead + total_tied + total_behind;
-        #[allow(clippy::cast_precision_loss)]
-        let ehs = if total > 0 {
-            (total_ahead as f32 + total_tied as f32 / 2.0) / total as f32
-        } else {
-            0.5
-        };
-
-        let ppot = if total_behind > 0 {
-            let behind_outcomes = behind_moves_ahead + behind_stays_behind;
-            if behind_outcomes > 0 {
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    behind_moves_ahead as f32 / behind_outcomes as f32
-                }
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
-        let npot = if total_ahead > 0 {
-            let ahead_outcomes = ahead_stays_ahead + ahead_falls_behind;
-            if ahead_outcomes > 0 {
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    ahead_falls_behind as f32 / ahead_outcomes as f32
-                }
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
-        HandStrength::new(ehs, ppot, npot)
+        counters.to_hand_strength()
     }
 
     /// Calculate EHS on the river using exhaustive enumeration.
