@@ -446,6 +446,7 @@ impl GpuCfrSolver {
         // Process deals in batches
         let mut deal_offset = 0;
         while deal_offset < num_deals {
+            println!("Starting batch, deal_offset: {}", deal_offset);
             let batch_end = (deal_offset + self.batch_size).min(num_deals);
             let batch_count = batch_end - deal_offset;
 
