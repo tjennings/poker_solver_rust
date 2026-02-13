@@ -434,6 +434,8 @@ impl GpuCfrSolver {
     fn run_iteration(&mut self) {
         let num_deals = self.deals.len();
         let strategy_discount = self.compute_strategy_discount();
+        let iter_start = Instant::now();
+        let mut last_log = Instant::now();
 
         // Process deals in batches
         let mut deal_offset = 0;
@@ -445,12 +447,32 @@ impl GpuCfrSolver {
             self.dispatch_batch(batch_count as u32, strategy_discount);
 
             deal_offset = batch_end;
+
+            // Log progress every 10 minutes
+            if last_log.elapsed().as_secs() >= 600 {
+                let pct = (deal_offset as f64 / num_deals as f64) * 100.0;
+                println!(
+                    "  iter {}: {:.1}% ({}/{} deals, {:.1}s elapsed)",
+                    self.iterations + 1,
+                    pct,
+                    deal_offset,
+                    num_deals,
+                    iter_start.elapsed().as_secs_f64(),
+                );
+                last_log = Instant::now();
+            }
         }
 
         // After all batches: merge deltas and apply DCFR discount
         self.dispatch_merge_and_discount();
 
         self.iterations += 1;
+        println!(
+            "  iter {} complete: {} deals in {:.1}s",
+            self.iterations,
+            num_deals,
+            iter_start.elapsed().as_secs_f64(),
+        );
     }
 
     fn upload_batch(&self, deal_offset: usize, batch_count: usize) {
