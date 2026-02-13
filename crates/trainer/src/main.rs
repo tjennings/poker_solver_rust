@@ -545,24 +545,36 @@ impl TrainingSolver for MccfrTrainingSolver<'_> {
         total_checkpoints: u64,
         total_iterations: u64,
     ) -> Option<f64> {
-        let ctx = CheckpointCtx {
+        let strategies = self.solver.all_strategies_best_effort();
+
+        let report_ctx = StrategyReportCtx {
+            strategies: &strategies,
+            previous: &self.previous_strategies,
+            checkpoint_num,
+            is_convergence,
             total_checkpoints,
             total_iterations,
+            current_iterations: self.solver.iterations(),
             training_start: &self.training_start,
             header: &self.header,
             action_labels: &self.action_labels,
             stack_depth: self.stack_depth,
-            output_dir: self.output_dir,
             abs_mode: self.abs_mode,
-            previous_strategies: &self.previous_strategies,
             convergence_threshold: if is_convergence {
                 self.convergence_threshold
             } else {
                 None
             },
         };
-        let delta = print_checkpoint(&self.solver, checkpoint_num, &ctx);
-        self.previous_strategies = Some(self.solver.all_strategies_best_effort());
+        let delta = print_strategy_report(&report_ctx);
+
+        // MCCFR-specific extras: pruning stats, regret metrics, extreme regret keys
+        let mccfr_ctx = MccfrCheckpointCtx {
+            output_dir: self.output_dir,
+        };
+        print_mccfr_extras(&self.solver, checkpoint_num, &mccfr_ctx);
+
+        self.previous_strategies = Some(strategies);
         delta
     }
 }
@@ -575,6 +587,12 @@ struct SimpleTrainingSolver<'a, S> {
     solver: S,
     prefix: &'a str,
     previous: Option<FxHashMap<u64, Vec<f64>>>,
+    training_start: Instant,
+    header: String,
+    action_labels: Vec<String>,
+    stack_depth: u32,
+    abs_mode: AbstractionModeConfig,
+    convergence_threshold: Option<f64>,
 }
 
 impl<S> TrainingSolver for SimpleTrainingSolver<'_, S>
@@ -605,32 +623,27 @@ where
         total_iterations: u64,
     ) -> Option<f64> {
         let strategies = self.solver.strategies_best_effort();
-        let delta = self
-            .previous
-            .as_ref()
-            .map(|prev| convergence::strategy_delta(prev, &strategies));
 
-        if is_convergence {
-            println!(
-                "\n=== Check {} ({} iters) info_sets={} delta={} ===",
-                checkpoint_num,
-                self.solver.iters(),
-                strategies.len(),
-                delta.map_or("(first)".to_string(), |d| format!("{d:.6}"))
-            );
-        } else {
-            let current_iter = total_iterations
-                .checked_div(total_checkpoints)
-                .unwrap_or(0) * checkpoint_num;
-            println!(
-                "\n=== Checkpoint {}/{} ({}/{} iters) info_sets={} ===",
-                checkpoint_num,
-                total_checkpoints,
-                current_iter,
-                total_iterations,
-                strategies.len()
-            );
-        }
+        let report_ctx = StrategyReportCtx {
+            strategies: &strategies,
+            previous: &self.previous,
+            checkpoint_num,
+            is_convergence,
+            total_checkpoints,
+            total_iterations,
+            current_iterations: self.solver.iters(),
+            training_start: &self.training_start,
+            header: &self.header,
+            action_labels: &self.action_labels,
+            stack_depth: self.stack_depth,
+            abs_mode: self.abs_mode,
+            convergence_threshold: if is_convergence {
+                self.convergence_threshold
+            } else {
+                None
+            },
+        };
+        let delta = print_strategy_report(&report_ctx);
 
         self.previous = Some(strategies);
         delta
@@ -1241,10 +1254,23 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     let boundaries = None; // sequence solver doesn't use EHS2
 
+    // Derive action labels from a single deal (all deals share the same preflop actions)
+    let label_game = HunlPostflop::new(config.game.clone(), None, 1);
+    let label_states = label_game.initial_states();
+    let actions = label_game.actions(&label_states[0]);
+    let action_labels = format_action_labels(&actions);
+    let header = format_table_header(&action_labels);
+
     let mut wrapper = SimpleTrainingSolver {
         solver,
         prefix: "seq_checkpoint_",
         previous: None,
+        training_start: Instant::now(),
+        header,
+        action_labels,
+        stack_depth: config.game.stack_depth,
+        abs_mode,
+        convergence_threshold: config.training.convergence_threshold,
     };
 
     let loop_config = TrainingLoopConfig {
@@ -1355,10 +1381,23 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     let boundaries = None; // GPU solver doesn't use EHS2
 
+    // Derive action labels from a single deal (all deals share the same preflop actions)
+    let label_game = HunlPostflop::new(config.game.clone(), None, 1);
+    let label_states = label_game.initial_states();
+    let actions = label_game.actions(&label_states[0]);
+    let action_labels = format_action_labels(&actions);
+    let header = format_table_header(&action_labels);
+
     let mut wrapper = SimpleTrainingSolver {
         solver,
         prefix: "gpu_checkpoint_",
         previous: None,
+        training_start: Instant::now(),
+        header,
+        action_labels,
+        stack_depth: config.game.stack_depth,
+        abs_mode,
+        convergence_threshold: config.training.convergence_threshold,
     };
 
     let loop_config = TrainingLoopConfig {
@@ -1866,116 +1905,121 @@ fn write_flops_csv(flops: &[CanonicalFlop], writer: &mut dyn Write) -> Result<()
     Ok(())
 }
 
-struct CheckpointCtx<'a> {
+/// Context for MCCFR-specific checkpoint extras (regret data, pruning stats).
+struct MccfrCheckpointCtx<'a> {
+    output_dir: &'a str,
+}
+
+/// Context for strategy-based checkpoint output shared by all solvers.
+struct StrategyReportCtx<'a> {
+    strategies: &'a FxHashMap<u64, Vec<f64>>,
+    previous: &'a Option<FxHashMap<u64, Vec<f64>>>,
+    checkpoint_num: u64,
+    is_convergence: bool,
     total_checkpoints: u64,
     total_iterations: u64,
+    current_iterations: u64,
     training_start: &'a Instant,
     header: &'a str,
     action_labels: &'a [String],
     stack_depth: u32,
-    output_dir: &'a str,
     abs_mode: AbstractionModeConfig,
-    previous_strategies: &'a Option<FxHashMap<u64, Vec<f64>>>,
     convergence_threshold: Option<f64>,
 }
 
-fn print_checkpoint(
-    solver: &MccfrSolver<HunlPostflop>,
-    checkpoint: u64,
-    ctx: &CheckpointCtx,
-) -> Option<f64> {
-    let strategies = solver.all_strategies_best_effort();
+/// Print strategy-based checkpoint output shared by all solvers.
+///
+/// Prints: header, info set count, time/ETA, strategy delta, entropy,
+/// preflop strategy table, and river strategy tables.
+/// Returns the strategy delta (if a previous checkpoint exists).
+fn print_strategy_report(ctx: &StrategyReportCtx) -> Option<f64> {
     let elapsed = ctx.training_start.elapsed().as_secs_f64();
 
-    if ctx.convergence_threshold.is_some() {
-        println!(
-            "\n=== Convergence Check {} ({} iterations) ===",
-            checkpoint,
-            solver.iterations()
-        );
-    } else {
-        let current_iter = if checkpoint == 0 {
-            0
-        } else {
-            (ctx.total_iterations / ctx.total_checkpoints) * checkpoint
-        };
-        println!(
-            "\n=== Checkpoint {}/{} ({}/{} iterations) ===",
-            checkpoint, ctx.total_checkpoints, current_iter, ctx.total_iterations
-        );
-    }
+    print_checkpoint_header(ctx);
+    println!("Info sets: {}", ctx.strategies.len());
+    print_time_estimate(ctx.checkpoint_num, elapsed, ctx);
 
-    println!("Info sets: {}", strategies.len());
-
-    if checkpoint > 0 && ctx.convergence_threshold.is_none() {
-        let remaining = {
-            let rate = elapsed / checkpoint as f64;
-            rate * (ctx.total_checkpoints - checkpoint) as f64
-        };
-        println!(
-            "Time: {:.1}s elapsed, ~{:.1}s remaining",
-            elapsed, remaining
-        );
-    } else if checkpoint > 0 {
-        println!("Time: {:.1}s elapsed", elapsed);
-    }
-
-    let (pruned, total) = solver.pruning_stats();
-    if total > 0 {
-        let skip_pct = 100.0 * pruned as f64 / total as f64;
-        println!("Pruned: {pruned}/{total} traversals ({skip_pct:.1}% skip rate)");
-    }
-
-    // Convergence metrics
-    let delta = if checkpoint > 0 {
-        let regrets = solver.regret_sum();
-        let iters = solver.iterations();
-        let max_r = convergence::max_regret(regrets, iters);
-        let avg_r = convergence::avg_regret(regrets, iters);
-        let entropy = convergence::strategy_entropy(&strategies);
-
-        let delta = ctx
-            .previous_strategies
-            .as_ref()
-            .map(|prev| convergence::strategy_delta(prev, &strategies));
-        let delta_str = match delta {
-            Some(d) => format!("{d:.6}"),
-            None => "(first checkpoint)".to_string(),
-        };
-
-        println!("\nConvergence Metrics:");
-        println!("  Strategy delta:   {delta_str}");
-        if let Some(threshold) = ctx.convergence_threshold {
-            let status = match delta {
-                Some(d) if d < threshold => "CONVERGED",
-                _ => "not converged",
-            };
-            println!("  Target delta:     {threshold:.6} ({status})");
-        }
-        println!("  Max regret:       {max_r:.6}");
-        println!("  Avg regret:       {avg_r:.6}");
-        println!("  Strategy entropy: {entropy:.4}");
-
-        print_extreme_regret_keys(regrets, iters, ctx.output_dir);
-        delta
+    let delta = if ctx.checkpoint_num > 0 {
+        compute_and_print_convergence(ctx)
     } else {
         None
     };
 
-    // SB preflop strategy table
+    print_preflop_table(ctx);
+    print_river_strategies(ctx.strategies, ctx.abs_mode);
+
+    delta
+}
+
+fn print_checkpoint_header(ctx: &StrategyReportCtx) {
+    if ctx.is_convergence {
+        println!(
+            "\n=== Convergence Check {} ({} iterations) ===",
+            ctx.checkpoint_num, ctx.current_iterations
+        );
+    } else {
+        let current_iter = if ctx.checkpoint_num == 0 {
+            0
+        } else {
+            (ctx.total_iterations / ctx.total_checkpoints) * ctx.checkpoint_num
+        };
+        println!(
+            "\n=== Checkpoint {}/{} ({}/{} iterations) ===",
+            ctx.checkpoint_num, ctx.total_checkpoints, current_iter, ctx.total_iterations
+        );
+    }
+}
+
+fn print_time_estimate(checkpoint: u64, elapsed: f64, ctx: &StrategyReportCtx) {
+    if checkpoint == 0 {
+        return;
+    }
+    if !ctx.is_convergence && ctx.total_checkpoints > 0 {
+        let rate = elapsed / checkpoint as f64;
+        let remaining = rate * (ctx.total_checkpoints - checkpoint) as f64;
+        println!("Time: {elapsed:.1}s elapsed, ~{remaining:.1}s remaining");
+    } else {
+        println!("Time: {elapsed:.1}s elapsed");
+    }
+}
+
+fn compute_and_print_convergence(ctx: &StrategyReportCtx) -> Option<f64> {
+    let entropy = convergence::strategy_entropy(ctx.strategies);
+    let delta = ctx
+        .previous
+        .as_ref()
+        .map(|prev| convergence::strategy_delta(prev, ctx.strategies));
+    let delta_str = match delta {
+        Some(d) => format!("{d:.6}"),
+        None => "(first checkpoint)".to_string(),
+    };
+
+    println!("\nConvergence Metrics:");
+    println!("  Strategy delta:   {delta_str}");
+    if let Some(threshold) = ctx.convergence_threshold {
+        let status = match delta {
+            Some(d) if d < threshold => "CONVERGED",
+            _ => "not converged",
+        };
+        println!("  Target delta:     {threshold:.6} ({status})");
+    }
+    println!("  Strategy entropy: {entropy:.4}");
+
+    delta
+}
+
+fn print_preflop_table(ctx: &StrategyReportCtx) {
     println!("\nSB Opening Strategy (preflop, facing BB):");
     println!("{}", ctx.header);
     println!("{}", "-".repeat(ctx.header.len()));
 
-    // Preflop initial state: pot=3 (SB+BB), stacks=stack_depth*2-1, stack_depth*2-2
     let preflop_eff_stack = ctx.stack_depth * 2 - 2;
     let spr_b = spr_bucket(3, preflop_eff_stack);
 
     for &hand in DISPLAY_HANDS {
         if let Some(hand_idx) = canonical_hand_index_from_str(hand) {
-            let info_key =
-                InfoKey::new(u32::from(hand_idx), 0, spr_b, &[]).as_u64();
-            if let Some(probs) = strategies.get(&info_key) {
+            let info_key = InfoKey::new(u32::from(hand_idx), 0, spr_b, &[]).as_u64();
+            if let Some(probs) = ctx.strategies.get(&info_key) {
                 let prob_cols: String = probs
                     .iter()
                     .take(ctx.action_labels.len())
@@ -1990,10 +2034,29 @@ fn print_checkpoint(
         }
     }
     println!();
+}
 
-    print_river_strategies(&strategies, ctx.abs_mode);
+/// Print MCCFR-specific checkpoint extras: pruning stats, regret metrics, extreme regret keys.
+fn print_mccfr_extras(
+    solver: &MccfrSolver<HunlPostflop>,
+    checkpoint_num: u64,
+    mccfr_ctx: &MccfrCheckpointCtx,
+) {
+    let (pruned, total) = solver.pruning_stats();
+    if total > 0 {
+        let skip_pct = 100.0 * pruned as f64 / total as f64;
+        println!("Pruned: {pruned}/{total} traversals ({skip_pct:.1}% skip rate)");
+    }
 
-    delta
+    if checkpoint_num > 0 {
+        let regrets = solver.regret_sum();
+        let iters = solver.iterations();
+        let max_r = convergence::max_regret(regrets, iters);
+        let avg_r = convergence::avg_regret(regrets, iters);
+        println!("  Max regret:       {max_r:.6}");
+        println!("  Avg regret:       {avg_r:.6}");
+        print_extreme_regret_keys(regrets, iters, mccfr_ctx.output_dir);
+    }
 }
 
 /// Print the 2 highest and 2 lowest total-regret info set keys.
