@@ -385,6 +385,7 @@ struct TabularUniforms {
 /// vectors indexed by trajectory IDs. Terminal computations are matrix-vector
 /// multiplies over coupling matrices. No batching needed — all state fits in
 /// GPU memory at once.
+#[allow(dead_code)] // GPU buffers must be kept alive for bind group references
 pub struct TabularGpuCfrSolver {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -847,6 +848,17 @@ impl TabularGpuCfrSolver {
             config,
             iterations: 0,
         })
+    }
+
+    /// Run `num_iterations` with a per-iteration callback (e.g. progress bar).
+    ///
+    /// Trains one iteration at a time so the callback fires after each.
+    /// This loses double-buffer pipelining but is only used for progress ticks.
+    pub fn train_with_callback<F: FnMut(u64)>(&mut self, num_iterations: u64, mut cb: F) {
+        for _ in 0..num_iterations {
+            self.train(1);
+            cb(self.iterations);
+        }
     }
 
     /// Run `num_iterations` of tabular CFR training on GPU.

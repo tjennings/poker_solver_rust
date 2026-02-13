@@ -565,6 +565,7 @@ impl TrainingSolver for MccfrTrainingSolver<'_> {
             } else {
                 None
             },
+            max_regret: None,
         };
         let delta = print_strategy_report(&report_ctx);
 
@@ -642,6 +643,7 @@ where
             } else {
                 None
             },
+            max_regret: self.solver.max_regret(),
         };
         let delta = print_strategy_report(&report_ctx);
 
@@ -650,12 +652,14 @@ where
     }
 }
 
-/// Minimal interface that both `SequenceCfrSolver` and `GpuCfrSolver` satisfy.
+/// Minimal interface that both `SequenceCfrSolver` and `TabularGpuCfrSolver` satisfy.
 trait SimpleTrainingSolverBackend {
     fn train_with_cb(&mut self, iterations: u64, callback: &dyn Fn(u64));
     fn strategies(&self) -> FxHashMap<u64, Vec<f64>>;
     fn strategies_best_effort(&self) -> FxHashMap<u64, Vec<f64>>;
     fn iters(&self) -> u64;
+    /// GPU max regret (upper bound on exploitability). `None` for CPU solvers.
+    fn max_regret(&self) -> Option<f32> { None }
 }
 
 impl SimpleTrainingSolverBackend for SequenceCfrSolver {
@@ -674,7 +678,7 @@ impl SimpleTrainingSolverBackend for SequenceCfrSolver {
 }
 
 #[cfg(feature = "gpu")]
-impl SimpleTrainingSolverBackend for poker_solver_gpu_cfr::GpuCfrSolver {
+impl SimpleTrainingSolverBackend for poker_solver_gpu_cfr::tabular::TabularGpuCfrSolver {
     fn train_with_cb(&mut self, iterations: u64, callback: &dyn Fn(u64)) {
         self.train_with_callback(iterations, callback);
     }
@@ -682,11 +686,13 @@ impl SimpleTrainingSolverBackend for poker_solver_gpu_cfr::GpuCfrSolver {
         self.all_strategies()
     }
     fn strategies_best_effort(&self) -> FxHashMap<u64, Vec<f64>> {
-        // GPU solver doesn't have best_effort; use full strategies
         self.all_strategies()
     }
     fn iters(&self) -> u64 {
         self.iterations()
+    }
+    fn max_regret(&self) -> Option<f32> {
+        Some(self.max_regret())
     }
 }
 
@@ -1287,13 +1293,14 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
 #[cfg(feature = "gpu")]
 fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
-    use poker_solver_gpu_cfr::{GpuCfrConfig, GpuCfrSolver};
+    use poker_solver_gpu_cfr::GpuCfrConfig;
+    use poker_solver_gpu_cfr::tabular::TabularGpuCfrSolver;
 
     let abs_mode = config.training.abstraction_mode;
     let abstraction_mode = build_abstraction_mode(&config);
     let abstraction_for_deals = build_abstraction_mode(&config);
 
-    println!("=== Poker Blueprint Trainer (GPU CFR) ===\n");
+    println!("=== Poker Blueprint Trainer (Tabular GPU CFR) ===\n");
     println!("Game config:");
     println!("  Stack depth: {} BB", config.game.stack_depth);
     println!("  Bet sizes: {:?} pot", config.game.bet_sizes);
@@ -1344,7 +1351,7 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     let tree = materialize_postflop(&tree_game, &tree_states[0]);
     println!("  {} nodes, done in {:?}\n", tree.stats.total_nodes, start.elapsed());
 
-    println!("Step 3/4: Initializing GPU solver...");
+    println!("Step 3/4: Initializing tabular GPU solver...");
     let start = Instant::now();
     let gpu_config = GpuCfrConfig {
         dcfr_alpha: 1.5,
@@ -1352,11 +1359,10 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         dcfr_gamma: 2.0,
         ..Default::default()
     };
-    let solver = GpuCfrSolver::new(&tree, deals, gpu_config)?;
+    let solver = TabularGpuCfrSolver::new(&tree, deals, gpu_config)?;
     println!(
-        "  {} info sets, batch_size={}, initialized in {:?}\n",
+        "  {} info sets, initialized in {:?}\n",
         solver.num_info_sets(),
-        solver.batch_size(),
         start.elapsed()
     );
 
@@ -1377,7 +1383,7 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         },
     };
 
-    let boundaries = None; // GPU solver doesn't use EHS2
+    let boundaries = None;
 
     // Derive action labels from the tree-building deal (reuse, no extra deal generation)
     let actions = tree_game.actions(&tree_states[0]);
@@ -1922,6 +1928,8 @@ struct StrategyReportCtx<'a> {
     stack_depth: u32,
     abs_mode: AbstractionModeConfig,
     convergence_threshold: Option<f64>,
+    /// GPU-computed max regret (upper bound on exploitability). `None` for CPU solvers.
+    max_regret: Option<f32>,
 }
 
 /// Print strategy-based checkpoint output shared by all solvers.
@@ -1992,6 +2000,9 @@ fn compute_and_print_convergence(ctx: &StrategyReportCtx) -> Option<f64> {
     };
 
     println!("\nConvergence Metrics:");
+    if let Some(mr) = ctx.max_regret {
+        println!("  Max regret:       {mr:.6}");
+    }
     println!("  Strategy delta:   {delta_str}");
     if let Some(threshold) = ctx.convergence_threshold {
         let status = match delta {
