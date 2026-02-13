@@ -169,17 +169,12 @@ pub struct GpuCfrSolver {
     group2_layout: wgpu::BindGroupLayout,
 
     // Compute pipelines
+    init_batch_pipeline: wgpu::ComputePipeline,
     regret_match_pipeline: wgpu::ComputePipeline,
     forward_pass_pipeline: wgpu::ComputePipeline,
     backward_pass_pipeline: wgpu::ComputePipeline,
     merge_deltas_pipeline: wgpu::ComputePipeline,
     dcfr_discount_pipeline: wgpu::ComputePipeline,
-
-    // Pre-allocated CPU buffers for batch upload (avoid per-batch allocation)
-    /// Reach init pattern: 1.0 at root (offset 0) of each deal, 0.0 elsewhere.
-    initial_reach: Vec<u8>,
-    /// Zero buffer for utility init.
-    batch_zeros: Vec<u8>,
 
     // Training state
     config: GpuCfrConfig,
@@ -317,6 +312,8 @@ impl GpuCfrSolver {
             immediate_size: 0,
         });
 
+        let init_batch_pipeline = create_pipeline(&device, &pipeline_layout,
+            "init_batch", include_str!("shaders/init_batch.wgsl"));
         let regret_match_pipeline = create_pipeline(&device, &pipeline_layout,
             "regret_match", include_str!("shaders/regret_match.wgsl"));
         let forward_pass_pipeline = create_pipeline(&device, &pipeline_layout,
@@ -328,23 +325,6 @@ impl GpuCfrSolver {
         let dcfr_discount_pipeline = create_pipeline(&device, &pipeline_layout,
             "dcfr_discount", include_str!("shaders/dcfr_discount.wgsl"));
         println!("  Shader pipelines compiled in {:?}", step.elapsed());
-
-        // Pre-allocate CPU buffers for batch upload (avoids per-batch 128MB allocation)
-        let batch_node_bytes = batch_size * num_nodes as usize * 4;
-        let batch_zeros = vec![0u8; batch_node_bytes];
-        let initial_reach = {
-            let mut buf = vec![0u8; batch_node_bytes];
-            let one = 1.0_f32.to_ne_bytes();
-            for d in 0..batch_size {
-                let offset = d * num_nodes as usize * 4;
-                buf[offset..offset + 4].copy_from_slice(&one);
-            }
-            buf
-        };
-        println!(
-            "  Pre-allocated batch buffers: {:.1} MB",
-            (batch_node_bytes * 2) as f64 / 1_048_576.0,
-        );
 
         Ok(Self {
             device,
@@ -381,13 +361,12 @@ impl GpuCfrSolver {
             group0_layout,
             group1_layout,
             group2_layout,
+            init_batch_pipeline,
             regret_match_pipeline,
             forward_pass_pipeline,
             backward_pass_pipeline,
             merge_deltas_pipeline,
             dcfr_discount_pipeline,
-            initial_reach,
-            batch_zeros,
             config,
             deals,
             batch_size,
@@ -470,6 +449,7 @@ impl GpuCfrSolver {
 
         // Process deals in batches
         let mut deal_offset = 0;
+        let mut batch_num = 0u64;
         while deal_offset < num_deals {
             let batch_end = (deal_offset + self.batch_size).min(num_deals);
             let batch_count = batch_end - deal_offset;
@@ -479,17 +459,26 @@ impl GpuCfrSolver {
             self.dispatch_batch(batch_count as u32, strategy_discount, log);
 
             deal_offset = batch_end;
+            batch_num += 1;
 
-            // Log progress every 10 minutes
-            if last_log.elapsed().as_secs() >= 600 {
+            // Poll GPU every 256 batches to prevent wgpu resource buildup
+            if batch_num.is_multiple_of(256) {
+                let _ = self.device.poll(wgpu::PollType::Poll);
+            }
+
+            // Log progress every 60 seconds
+            if last_log.elapsed().as_secs() >= 60 {
                 let pct = (deal_offset as f64 / num_deals as f64) * 100.0;
+                let elapsed = iter_start.elapsed().as_secs_f64();
+                let eta = elapsed / pct * (100.0 - pct);
                 println!(
-                    "  iter {}: {:.1}% ({}/{} deals, {:.1}s elapsed)",
+                    "  iter {}: {:.1}% ({}/{} deals, {:.0}s elapsed, ~{:.0}s remaining)",
                     self.iterations + 1,
                     pct,
                     deal_offset,
                     num_deals,
-                    iter_start.elapsed().as_secs_f64(),
+                    elapsed,
+                    eta,
                 );
                 last_log = Instant::now();
             }
@@ -535,14 +524,8 @@ impl GpuCfrSolver {
         self.queue.write_buffer(&self.info_id_lookup_buffer, 0, bytemuck::cast_slice(&lookup));
         if log { println!("    upload info_id_lookup: {:?}", step.elapsed()); }
 
-        // Init reach (1.0 at root, 0.0 elsewhere) and zero utility.
-        // Uses pre-allocated buffers to avoid per-batch 128MB allocation.
-        let step = Instant::now();
-        let batch_bytes = batch_count * n * 4;
-        self.queue.write_buffer(&self.reach_p1_buffer, 0, &self.initial_reach[..batch_bytes]);
-        self.queue.write_buffer(&self.reach_p2_buffer, 0, &self.initial_reach[..batch_bytes]);
-        self.queue.write_buffer(&self.utility_buffer, 0, &self.batch_zeros[..batch_bytes]);
-        if log { println!("    init reach + zero utility: {:?}", step.elapsed()); }
+        // Reach and utility buffers are initialized GPU-side in dispatch_batch
+        // via clear_buffer + init_batch shader (avoids 384MB CPU→GPU transfer).
     }
 
     fn dispatch_batch(&self, num_deals: u32, strategy_discount: f32, log: bool) {
@@ -590,6 +573,24 @@ impl GpuCfrSolver {
         // Single encoder for the entire batch
         let mut encoder = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("cfr_batch") });
+
+        // Step 0: GPU-side buffer init — zero reach/utility, then set root reach = 1.0.
+        // This replaces a 384MB CPU→GPU transfer with fast GPU-side operations.
+        let batch_bytes = (num_deals as u64) * (self.num_nodes as u64) * 4;
+        encoder.clear_buffer(&self.reach_p1_buffer, 0, Some(batch_bytes));
+        encoder.clear_buffer(&self.reach_p2_buffer, 0, Some(batch_bytes));
+        encoder.clear_buffer(&self.utility_buffer, 0, Some(batch_bytes));
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("init_batch"),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.init_batch_pipeline);
+            pass.set_bind_group(0, &bg0, &[regret_match_offset]);
+            pass.set_bind_group(1, &bg1, &[]);
+            pass.set_bind_group(2, &bg2, &[]);
+            pass.dispatch_workgroups(div_ceil(num_deals, WORKGROUP_SIZE), 1, 1);
+        }
 
         // Step 1: Regret matching
         {
