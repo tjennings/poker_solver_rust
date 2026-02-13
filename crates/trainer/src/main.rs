@@ -1314,6 +1314,8 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     };
 
     // Build deals: either exhaustive abstract or random concrete
+    println!("Step 1/4: Loading deals...");
+    let step_start = Instant::now();
     let deals = if config.training.exhaustive {
         build_exhaustive_deals(&config)?
     } else if let Some(ref dir) = config.training.abstract_deals_dir {
@@ -1327,26 +1329,22 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
             );
         }
         let states = game.initial_states();
-        println!("Building deal info for {} deals...", states.len());
+        println!("  Building deal info for {} deals...", states.len());
         let start = Instant::now();
         let deals = build_deal_infos(&game, &states, &abstraction_for_deals);
-        println!("  Done in {:?}", start.elapsed());
+        println!("  Deal info built in {:?}", start.elapsed());
         deals
     };
+    println!("  {} deals loaded in {:?}\n", deals.len(), step_start.elapsed());
 
-    println!("  {} deals loaded\n", deals.len());
-
-    // Materialize tree (abstraction mode not needed — tree shape depends only on bet sizes/stacks)
+    println!("Step 2/4: Materializing game tree...");
+    let start = Instant::now();
     let tree_game = HunlPostflop::new(config.game.clone(), None, 1);
     let tree_states = tree_game.initial_states();
-
-    println!("Materializing game tree...");
-    let start = Instant::now();
     let tree = materialize_postflop(&tree_game, &tree_states[0]);
-    println!("  {} nodes, done in {:?}", tree.stats.total_nodes, start.elapsed());
+    println!("  {} nodes, done in {:?}\n", tree.stats.total_nodes, start.elapsed());
 
-    // Build GPU solver
-    println!("Initializing GPU solver...");
+    println!("Step 3/4: Initializing GPU solver...");
     let start = Instant::now();
     let gpu_config = GpuCfrConfig {
         dcfr_alpha: 1.5,
@@ -1381,10 +1379,8 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     let boundaries = None; // GPU solver doesn't use EHS2
 
-    // Derive action labels from a single deal (all deals share the same preflop actions)
-    let label_game = HunlPostflop::new(config.game.clone(), None, 1);
-    let label_states = label_game.initial_states();
-    let actions = label_game.actions(&label_states[0]);
+    // Derive action labels from the tree-building deal (reuse, no extra deal generation)
+    let actions = tree_game.actions(&tree_states[0]);
     let action_labels = format_action_labels(&actions);
     let header = format_table_header(&action_labels);
 
@@ -1409,6 +1405,7 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         boundaries: &boundaries,
     };
 
+    println!("Step 4/4: Training ({iterations} iterations)...\n");
     run_training_loop(&mut wrapper, &loop_config)
 }
 

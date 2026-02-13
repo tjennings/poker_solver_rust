@@ -433,9 +433,15 @@ impl GpuCfrSolver {
 
     fn run_iteration(&mut self) {
         let num_deals = self.deals.len();
+        let total_batches = num_deals.div_ceil(self.batch_size);
         let strategy_discount = self.compute_strategy_discount();
         let iter_start = Instant::now();
         let mut last_log = Instant::now();
+
+        println!(
+            "  iter {} starting: {} deals in {} batches...",
+            self.iterations + 1, num_deals, total_batches,
+        );
 
         // Process deals in batches
         let mut deal_offset = 0;
