@@ -15,6 +15,8 @@
 //!       -->  merge_deltas  -->  dcfr_discount
 //! ```
 
+pub mod tabular;
+
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
@@ -26,7 +28,7 @@ use poker_solver_core::cfr::game_tree::{GameTree, NodeType};
 use poker_solver_core::cfr::DealInfo;
 use poker_solver_core::game::Player;
 
-const WORKGROUP_SIZE: u32 = 256;
+pub(crate) const WORKGROUP_SIZE: u32 = 256;
 /// Must match `HAND_SHIFT` in `poker_solver_core::info_key`.
 const HAND_SHIFT: u64 = 36;
 
@@ -35,22 +37,24 @@ const HAND_SHIFT: u64 = 36;
 /// GPU-friendly node representation. 32 bytes, aligned to 4.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct GpuNode {
+pub struct GpuNode {
     /// 0 = P1 decision, 1 = P2 decision,
     /// 2 = fold (P1 folded), 3 = fold (P2 folded), 4 = showdown.
-    node_type: u32,
+    pub node_type: u32,
     /// Dense position index for info set id. `u32::MAX` for terminals.
-    position_index: u32,
+    pub position_index: u32,
     /// Index of first child in `children_flat`.
-    first_child: u32,
+    pub first_child: u32,
     /// Number of children (actions).
-    num_children: u32,
+    pub num_children: u32,
     /// P1 investment in BB at this terminal. 0 for decisions.
-    p1_invested_bb: f32,
+    pub p1_invested_bb: f32,
     /// P2 investment in BB at this terminal. 0 for decisions.
-    p2_invested_bb: f32,
-    _pad0: u32,
-    _pad1: u32,
+    pub p2_invested_bb: f32,
+    /// Street (0-3) for decision nodes. 0 for terminals.
+    pub street: u32,
+    /// Dense decision-node index. `u32::MAX` for terminals.
+    pub decision_idx: u32,
 }
 
 /// Uniform parameters passed to every shader dispatch.
@@ -806,7 +810,7 @@ fn flush_stdout() {
     let _ = std::io::stdout().flush();
 }
 
-fn init_gpu() -> Result<(wgpu::Device, wgpu::Queue), GpuError> {
+pub(crate) fn init_gpu() -> Result<(wgpu::Device, wgpu::Queue), GpuError> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
@@ -829,12 +833,13 @@ fn init_gpu() -> Result<(wgpu::Device, wgpu::Queue), GpuError> {
 }
 
 /// Encoded tree: (gpu_nodes, children_flat, level_nodes, level_offsets, level_counts).
-type EncodedTree = (Vec<GpuNode>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>);
+pub(crate) type EncodedTree = (Vec<GpuNode>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>);
 
-fn encode_tree(tree: &GameTree) -> EncodedTree {
+pub(crate) fn encode_tree(tree: &GameTree) -> EncodedTree {
     let num_nodes = tree.nodes.len();
     let mut gpu_nodes = Vec::with_capacity(num_nodes);
     let mut children_flat: Vec<u32> = Vec::new();
+    let mut decision_counter = 0u32;
 
     for node in &tree.nodes {
         let first_child = children_flat.len() as u32;
@@ -842,30 +847,39 @@ fn encode_tree(tree: &GameTree) -> EncodedTree {
             children_flat.push(child);
         }
 
-        let (node_type, p1_invested_bb, p2_invested_bb) = match &node.node_type {
-            NodeType::Decision { player, .. } => {
-                let nt = match player {
-                    Player::Player1 => 0u32,
-                    Player::Player2 => 1u32,
-                };
-                (nt, 0.0, 0.0)
-            }
-            NodeType::Terminal {
-                is_fold, fold_player, stacks, starting_stack, ..
-            } => {
-                let nt = if *is_fold {
-                    match fold_player {
-                        Player::Player1 => 2u32,
-                        Player::Player2 => 3u32,
-                    }
-                } else {
-                    4u32
-                };
-                let p1_inv = f64::from(*starting_stack - stacks[0]) / 2.0;
-                let p2_inv = f64::from(*starting_stack - stacks[1]) / 2.0;
-                (nt, p1_inv as f32, p2_inv as f32)
-            }
-        };
+        let (node_type, p1_invested_bb, p2_invested_bb, street, decision_idx) =
+            match &node.node_type {
+                NodeType::Decision {
+                    player, street, ..
+                } => {
+                    let nt = match player {
+                        Player::Player1 => 0u32,
+                        Player::Player2 => 1u32,
+                    };
+                    let d_idx = decision_counter;
+                    decision_counter += 1;
+                    (nt, 0.0, 0.0, u32::from(*street), d_idx)
+                }
+                NodeType::Terminal {
+                    is_fold,
+                    fold_player,
+                    stacks,
+                    starting_stack,
+                    ..
+                } => {
+                    let nt = if *is_fold {
+                        match fold_player {
+                            Player::Player1 => 2u32,
+                            Player::Player2 => 3u32,
+                        }
+                    } else {
+                        4u32
+                    };
+                    let p1_inv = f64::from(*starting_stack - stacks[0]) / 2.0;
+                    let p2_inv = f64::from(*starting_stack - stacks[1]) / 2.0;
+                    (nt, p1_inv as f32, p2_inv as f32, 0, u32::MAX)
+                }
+            };
 
         gpu_nodes.push(GpuNode {
             node_type,
@@ -874,8 +888,8 @@ fn encode_tree(tree: &GameTree) -> EncodedTree {
             num_children: node.children.len() as u32,
             p1_invested_bb,
             p2_invested_bb,
-            _pad0: 0,
-            _pad1: 0,
+            street,
+            decision_idx,
         });
     }
 
@@ -932,15 +946,15 @@ fn build_position_indices(tree: &GameTree) -> (Vec<u32>, u32, Vec<u32>) {
 /// can be reconstructed as `position_key | ((hand_bits as u64) << HAND_SHIFT)`
 /// without needing the `GameTree` at batch time.
 #[derive(Clone, Copy)]
-struct DecisionNodeInfo {
-    node_idx: usize,
-    player: Player,
-    street: u8,
-    position_key: u64,
+pub struct DecisionNodeInfo {
+    pub node_idx: usize,
+    pub player: Player,
+    pub street: u8,
+    pub position_key: u64,
 }
 
 /// Scan the tree once and extract decision node metadata including position keys.
-fn collect_decision_nodes(tree: &GameTree) -> Vec<DecisionNodeInfo> {
+pub fn collect_decision_nodes(tree: &GameTree) -> Vec<DecisionNodeInfo> {
     tree.nodes
         .iter()
         .enumerate()
@@ -1045,7 +1059,7 @@ fn compute_batch_info_ids(
     lookup
 }
 
-fn create_buffer_init(device: &wgpu::Device, label: &str, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+pub(crate) fn create_buffer_init(device: &wgpu::Device, label: &str, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
@@ -1054,7 +1068,7 @@ fn create_buffer_init(device: &wgpu::Device, label: &str, data: &[u8], usage: wg
     })
 }
 
-fn create_buffer_zeroed(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+pub(crate) fn create_buffer_zeroed(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
     let size = size.max(4); // wgpu requires non-zero buffer size
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
@@ -1064,7 +1078,7 @@ fn create_buffer_zeroed(device: &wgpu::Device, label: &str, size: u64, usage: wg
     })
 }
 
-fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+pub(crate) fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
@@ -1123,7 +1137,7 @@ fn create_group2_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-fn layout_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn layout_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -1136,11 +1150,11 @@ fn layout_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLay
     }
 }
 
-fn storage_rw() -> wgpu::BufferBindingType {
+pub(crate) fn storage_rw() -> wgpu::BufferBindingType {
     wgpu::BufferBindingType::Storage { read_only: false }
 }
 
-fn create_pipeline(
+pub(crate) fn create_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     label: &str,
@@ -1165,7 +1179,7 @@ fn div_ceil(a: u32, b: u32) -> u32 {
 }
 
 /// Round `value` up to the next multiple of `alignment`.
-fn align_up(value: u32, alignment: u32) -> u32 {
+pub(crate) fn align_up(value: u32, alignment: u32) -> u32 {
     value.div_ceil(alignment) * alignment
 }
 

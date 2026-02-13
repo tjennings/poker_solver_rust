@@ -16,6 +16,7 @@ use poker_solver_core::game::{AbstractionMode, HunlPostflop, PostflopConfig};
 use poker_solver_core::info_key::InfoKey;
 use poker_solver_core::Game;
 use poker_solver_gpu_cfr::{GpuCfrConfig, GpuCfrSolver};
+use poker_solver_gpu_cfr::tabular::TabularGpuCfrSolver;
 use rustc_hash::FxHashMap;
 
 fn build_deal_infos(game: &HunlPostflop) -> Vec<DealInfo> {
@@ -192,6 +193,43 @@ fn bench_gpu(
     })
 }
 
+fn bench_tabular_gpu(
+    config: &PostflopConfig,
+    iterations: u64,
+    deal_count: usize,
+) -> Option<BenchResult> {
+    let t0 = Instant::now();
+    let game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
+    let states = game.initial_states();
+    let tree = materialize_postflop(&game, &states[0]);
+    let deals = build_deal_infos(&game);
+    let gpu_config = GpuCfrConfig::default();
+
+    let solver = match TabularGpuCfrSolver::new(&tree, deals, gpu_config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Tabular GPU solver init failed: {e}");
+            return None;
+        }
+    };
+    let setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let mut solver = solver;
+    let t1 = Instant::now();
+    solver.train(iterations);
+    let train_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+    let strategies = solver.all_strategies();
+    Some(BenchResult {
+        name: "Tabular GPU (wgpu)".to_string(),
+        setup_ms,
+        train_ms,
+        info_sets: strategies.len(),
+        per_iter_ms: train_ms / iterations as f64,
+        strategies,
+    })
+}
+
 fn print_result(result: &BenchResult) {
     println!(
         "  {:<30} setup={:>8.1}ms  train={:>8.1}ms  per_iter={:>8.2}ms  info_sets={}",
@@ -271,10 +309,18 @@ fn main() {
     let seq = bench_sequence(&config, iterations, deal_count);
     print_result(&seq);
 
-    println!("\n--- GPU ---");
+    println!("\n--- GPU (deal-centric) ---");
     let gpu = bench_gpu(&config, iterations, deal_count);
     if let Some(ref gpu_result) = gpu {
         print_result(gpu_result);
+    } else {
+        println!("  (skipped, no GPU available)");
+    }
+
+    println!("\n--- Tabular GPU ---");
+    let tab_gpu = bench_tabular_gpu(&config, iterations, deal_count);
+    if let Some(ref tab_result) = tab_gpu {
+        print_result(tab_result);
     } else {
         println!("  (skipped, no GPU available)");
     }
@@ -285,6 +331,9 @@ fn main() {
     if let Some(ref g) = gpu {
         all_results.push(g);
     }
+    if let Some(ref t) = tab_gpu {
+        all_results.push(t);
+    }
     for r in &all_results {
         print_result(r);
     }
@@ -294,6 +343,14 @@ fn main() {
     println!("\n=== Strategy Agreement ===");
     if let Some(ref g) = gpu {
         print_strategy_agreement(&seq, g);
+    }
+    if let Some(ref t) = tab_gpu {
+        print_strategy_agreement(&seq, t);
+    }
+    if let Some(ref g) = gpu
+        && let Some(ref t) = tab_gpu
+    {
+        print_strategy_agreement(g, t);
     }
     // MCCFR vs sequence (expect higher delta due to sampling)
     print_strategy_agreement(&mccfr_par, &seq);
