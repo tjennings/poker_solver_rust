@@ -446,40 +446,55 @@ impl GpuCfrSolver {
             "  iter {} starting: {} deals in {} batches...",
             self.iterations + 1, num_deals, total_batches,
         );
+        flush_stdout();
 
         // Process deals in batches
         let mut deal_offset = 0;
         let mut batch_num = 0u64;
         while deal_offset < num_deals {
+            let batch_start = Instant::now();
             let batch_end = (deal_offset + self.batch_size).min(num_deals);
             let batch_count = batch_end - deal_offset;
 
-            let log = deal_offset == 0; // log timing for first batch only
+            let log = batch_num == 0; // log timing for first batch only
             self.upload_batch(deal_offset, batch_count, log);
             self.dispatch_batch(batch_count as u32, strategy_discount, log);
 
             deal_offset = batch_end;
             batch_num += 1;
 
-            // Poll GPU every 256 batches to prevent wgpu resource buildup
-            if batch_num.is_multiple_of(256) {
-                let _ = self.device.poll(wgpu::PollType::Poll);
+            // Log first 5 batch timings to diagnose per-batch cost
+            if batch_num <= 5 {
+                println!(
+                    "    batch {}: {:.1}ms",
+                    batch_num,
+                    batch_start.elapsed().as_secs_f64() * 1000.0,
+                );
+                flush_stdout();
             }
 
-            // Log progress every 60 seconds
-            if last_log.elapsed().as_secs() >= 60 {
+            // Blocking GPU sync every 64 batches.
+            // Metal has limited in-flight command buffers; without draining
+            // the GPU queue, wgpu submissions can block indefinitely.
+            if batch_num.is_multiple_of(64) {
+                let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            }
+
+            // Log progress every 60 seconds or every 5000 batches
+            if last_log.elapsed().as_secs() >= 60 || batch_num.is_multiple_of(5000) {
                 let pct = (deal_offset as f64 / num_deals as f64) * 100.0;
                 let elapsed = iter_start.elapsed().as_secs_f64();
-                let eta = elapsed / pct * (100.0 - pct);
+                let eta = if pct > 0.0 { elapsed / pct * (100.0 - pct) } else { f64::INFINITY };
                 println!(
-                    "  iter {}: {:.1}% ({}/{} deals, {:.0}s elapsed, ~{:.0}s remaining)",
+                    "  iter {}: batch {}/{} ({:.2}%), {:.0}s elapsed, ~{:.0}s remaining",
                     self.iterations + 1,
+                    batch_num,
+                    total_batches,
                     pct,
-                    deal_offset,
-                    num_deals,
                     elapsed,
                     eta,
                 );
+                flush_stdout();
                 last_log = Instant::now();
             }
         }
@@ -494,6 +509,7 @@ impl GpuCfrSolver {
             num_deals,
             iter_start.elapsed().as_secs_f64(),
         );
+        flush_stdout();
     }
 
     fn upload_batch(&self, deal_offset: usize, batch_count: usize, log: bool) {
@@ -784,6 +800,11 @@ impl GpuCfrSolver {
 }
 
 // --- Free functions ---
+
+fn flush_stdout() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
 
 fn init_gpu() -> Result<(wgpu::Device, wgpu::Queue), GpuError> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
