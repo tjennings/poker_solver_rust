@@ -15,6 +15,8 @@
 //!       -->  merge_deltas  -->  dcfr_discount
 //! ```
 
+use std::time::Instant;
+
 use bytemuck::{Pod, Zeroable};
 use pollster::FutureExt as _;
 use rayon::prelude::*;
@@ -194,7 +196,9 @@ impl GpuCfrSolver {
             return Err(GpuError::NoDeals);
         }
 
+        let step = Instant::now();
         let (device, queue) = init_gpu()?;
+        println!("  GPU device acquired in {:?}", step.elapsed());
 
         // Encode tree for GPU
         let (gpu_nodes, children_flat, level_nodes_flat, level_offsets, level_counts) =
@@ -207,11 +211,17 @@ impl GpuCfrSolver {
 
         // Pre-collect decision node indices with position keys
         let decision_nodes = collect_decision_nodes(tree);
+        println!("  {} decision nodes out of {} total", decision_nodes.len(), num_nodes);
 
         // Determine hand classes and build info set mapping
+        let step = Instant::now();
         let (key_to_dense, dense_to_key, num_hand_classes) =
             build_info_set_mapping(tree, &deals, &decision_nodes);
         let num_info_sets = dense_to_key.len() as u32;
+        println!(
+            "  Info set mapping: {} info sets, {} hand classes in {:?}",
+            num_info_sets, num_hand_classes, step.elapsed()
+        );
 
         let max_actions = position_num_actions.iter().copied().max().unwrap_or(1);
 
@@ -226,8 +236,14 @@ impl GpuCfrSolver {
 
         let state_size = (num_info_sets as u64) * (max_actions as u64) * 4;
         let batch_node_size = (batch_size as u64) * (num_nodes as u64) * 4;
+        println!(
+            "  Batch size: {batch_size}, state buffer: {:.1} MB, batch buffer: {:.1} MB",
+            state_size as f64 / 1_048_576.0,
+            batch_node_size as f64 / 1_048_576.0,
+        );
 
         // Create GPU buffers
+        let step = Instant::now();
         let node_buffer = create_buffer_init(&device, "nodes", bytemuck::cast_slice(&gpu_nodes),
             wgpu::BufferUsages::STORAGE);
         let children_buffer = create_buffer_init(&device, "children",
@@ -280,7 +296,10 @@ impl GpuCfrSolver {
             max_uniform_slots * u64::from(uniform_stride),
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
 
-        // Create bind group layouts
+        println!("  GPU buffers allocated in {:?}", step.elapsed());
+
+        // Create bind group layouts and compute pipelines
+        let step = Instant::now();
         let group0_layout = create_group0_layout(&device);
         let group1_layout = create_group1_layout(&device);
         let group2_layout = create_group2_layout(&device);
@@ -302,6 +321,7 @@ impl GpuCfrSolver {
             "merge_deltas", include_str!("shaders/merge_deltas.wgsl"));
         let dcfr_discount_pipeline = create_pipeline(&device, &pipeline_layout,
             "dcfr_discount", include_str!("shaders/dcfr_discount.wgsl"));
+        println!("  Shader pipelines compiled in {:?}", step.elapsed());
 
         Ok(Self {
             device,
@@ -869,12 +889,18 @@ fn build_info_set_mapping(
     ];
 
     // Pass 1: collect unique hand_bits per (player, street) — O(deals)
+    let step = Instant::now();
     for deal in deals {
         for street in 0..4usize {
             unique_per_bucket[street].insert(deal.hand_bits_p1[street]);
             unique_per_bucket[4 + street].insert(deal.hand_bits_p2[street]);
         }
     }
+    let total_unique: usize = unique_per_bucket.iter().map(|s| s.len()).sum();
+    println!(
+        "    Pass 1: {total_unique} unique hand_bits across {} deals in {:?}",
+        deals.len(), step.elapsed()
+    );
 
     // Pass 2: iterate decision_nodes × unique_hands — O(D_nodes × U_hands)
     let mut key_to_dense: FxHashMap<u64, u32> = FxHashMap::default();

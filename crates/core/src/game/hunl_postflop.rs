@@ -508,7 +508,8 @@ impl HunlPostflop {
         let deck = Self::full_deck();
         let mut deals = Vec::with_capacity(count);
 
-        print!("Starting random deal generation ...");
+        println!("Generating {count} random deals...");
+        let gen_start = std::time::Instant::now();
         for _ in 0..count {
             let mut shuffled = deck.clone();
             shuffled.shuffle(&mut rng);
@@ -529,7 +530,7 @@ impl HunlPostflop {
                 self.config.stack_depth,
             ));
         }
-        println!(" DONE");
+        println!("  {count} deals generated in {:?}", gen_start.elapsed());
         deals
     }
 
@@ -541,12 +542,17 @@ impl HunlPostflop {
         use rand::SeedableRng;
         use rand::rngs::StdRng;
 
+        println!("Generating {count} flop-weighted deals...");
+        let gen_start = std::time::Instant::now();
+
         let mut rng = StdRng::seed_from_u64(seed);
         let sampler = FlopSampler::new();
 
-        (0..count)
+        let deals: Vec<_> = (0..count)
             .map(|_| sampler.sample_deal(&mut rng, self.config.stack_depth))
-            .collect()
+            .collect();
+        println!("  {count} deals generated in {:?}", gen_start.elapsed());
+        deals
     }
 
     /// Generate exhaustive uniform deals: every (flop, P1 hole) combination.
@@ -1045,8 +1051,9 @@ impl Game for HunlPostflop {
         // Precompute equity bins and strength for HandClassV2 mode
         if matches!(&self.abstraction, Some(AbstractionMode::HandClassV2 { .. })) {
             println!("Precomputing equity bins and strength for {} deals...", deals.len());
+            let precomp_start = std::time::Instant::now();
             deals.par_iter_mut().for_each(PostflopState::precompute_v2_caches);
-            println!("  Precomputation complete.");
+            println!("  Precomputation complete in {:?}", precomp_start.elapsed());
         }
 
         deals
