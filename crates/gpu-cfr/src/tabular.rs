@@ -87,6 +87,24 @@ pub fn precompute_tabular(
     let n1 = traj_p1.len();
     let n2 = traj_p2.len();
 
+    let mat_elems = n1 as u64 * n2 as u64;
+    let mat_bytes = mat_elems * 4;
+    let reach_bytes = tree.nodes.len() as u64 * n1.max(n2) as u64 * 4;
+    println!("  Trajectory counts: n1={n1}, n2={n2}");
+    println!(
+        "  Coupling matrix: {n1}x{n2} = {} elems, {:.1} GB per matrix, {:.1} GB total (6 matrices)",
+        mat_elems,
+        mat_bytes as f64 / 1e9,
+        mat_bytes as f64 * 6.0 / 1e9,
+    );
+    println!(
+        "  Reach/util buffers: {}nodes x {} traj x 4 bytes = {:.1} GB each, {:.1} GB total (4 buffers)",
+        tree.nodes.len(),
+        n1.max(n2),
+        reach_bytes as f64 / 1e9,
+        reach_bytes as f64 * 4.0 / 1e9,
+    );
+
     let (w_mat, we_mat, w_neg_mat) =
         build_coupling_matrices(deals, &traj_p1_map, &traj_p2_map, n1, n2);
 
@@ -136,7 +154,7 @@ pub fn precompute_tabular(
 // Trajectory extraction
 // ---------------------------------------------------------------------------
 
-fn extract_unique_trajectories_p1(
+pub fn extract_unique_trajectories_p1(
     deals: &[DealInfo],
 ) -> (Vec<[u32; 4]>, FxHashMap<[u32; 4], u32>) {
     let mut map = FxHashMap::default();
@@ -151,7 +169,7 @@ fn extract_unique_trajectories_p1(
     (trajs, map)
 }
 
-fn extract_unique_trajectories_p2(
+pub fn extract_unique_trajectories_p2(
     deals: &[DealInfo],
 ) -> (Vec<[u32; 4]>, FxHashMap<[u32; 4], u32>) {
     let mut map = FxHashMap::default();
@@ -175,7 +193,7 @@ fn extract_unique_trajectories_p2(
 /// - `W[t1][t2]`    = `Σ deal.weight` for all deals with `(traj_p1=t1, traj_p2=t2)`
 /// - `WE[t1][t2]`   = `Σ deal.weight × deal.p1_equity`
 /// - `W_neg[t1][t2]` = `Σ deal.weight × (1 - deal.p1_equity)`
-fn build_coupling_matrices(
+pub fn build_coupling_matrices(
     deals: &[DealInfo],
     traj_p1_map: &FxHashMap<[u32; 4], u32>,
     traj_p2_map: &FxHashMap<[u32; 4], u32>,
@@ -239,7 +257,7 @@ fn col_sums(mat: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 /// For each decision node `d` and trajectory `t`, computes the full info set
 /// key and assigns a dense ID. The table maps
 /// `(decision_idx, traj_id) → dense_info_id`.
-fn build_info_id_table(
+pub fn build_info_id_table(
     tree: &GameTree,
     decision_nodes: &[DecisionNodeInfo],
     traj_p1: &[[u32; 4]],

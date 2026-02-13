@@ -219,6 +219,10 @@ struct TrainingParams {
     /// If absent with `exhaustive: true`, generates in-memory.
     #[serde(default)]
     abstract_deals_dir: Option<String>,
+    /// GPU tile size for tiled solver. `None` or absent = auto-detect,
+    /// `Some(0)` = force untiled solver.
+    #[serde(default)]
+    tile_size: Option<u32>,
 }
 
 fn default_convergence_check_interval() -> u64 {
@@ -679,6 +683,25 @@ impl SimpleTrainingSolverBackend for SequenceCfrSolver {
 
 #[cfg(feature = "gpu")]
 impl SimpleTrainingSolverBackend for poker_solver_gpu_cfr::tabular::TabularGpuCfrSolver {
+    fn train_with_cb(&mut self, iterations: u64, callback: &dyn Fn(u64)) {
+        self.train_with_callback(iterations, callback);
+    }
+    fn strategies(&self) -> FxHashMap<u64, Vec<f64>> {
+        self.all_strategies()
+    }
+    fn strategies_best_effort(&self) -> FxHashMap<u64, Vec<f64>> {
+        self.all_strategies()
+    }
+    fn iters(&self) -> u64 {
+        self.iterations()
+    }
+    fn max_regret(&self) -> Option<f32> {
+        Some(self.max_regret())
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl SimpleTrainingSolverBackend for poker_solver_gpu_cfr::tiled::TiledTabularGpuCfrSolver {
     fn train_with_cb(&mut self, iterations: u64, callback: &dyn Fn(u64)) {
         self.train_with_callback(iterations, callback);
     }
@@ -1295,6 +1318,7 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     use poker_solver_gpu_cfr::GpuCfrConfig;
     use poker_solver_gpu_cfr::tabular::TabularGpuCfrSolver;
+    use poker_solver_gpu_cfr::tiled::TiledTabularGpuCfrSolver;
 
     let abs_mode = config.training.abstraction_mode;
     let abstraction_mode = build_abstraction_mode(&config);
@@ -1357,16 +1381,27 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         dcfr_alpha: 1.5,
         dcfr_beta: 0.5,
         dcfr_gamma: 2.0,
+        tile_size: config.training.tile_size,
         ..Default::default()
     };
-    let solver = TabularGpuCfrSolver::new(&tree, deals, gpu_config)?;
-    println!(
-        "  {} info sets, initialized in {:?}\n",
-        solver.num_info_sets(),
-        start.elapsed()
-    );
 
-    // Build bundle config for saves
+    // Choose tiled vs untiled solver based on tile_size config.
+    // tile_size: None => auto-detect (use tiled if coupling matrices too large)
+    // tile_size: Some(0) => force untiled
+    // tile_size: Some(n) => force tiled with given tile size
+    let use_tiled = match config.training.tile_size {
+        Some(0) => false,
+        Some(_) => true,
+        None => {
+            // Auto-detect: use tiled if coupling matrices would exceed ~8 GB
+            let n1 = deals.iter().map(|d| d.hand_bits_p1).collect::<std::collections::HashSet<_>>().len() as u64;
+            let n2 = deals.iter().map(|d| d.hand_bits_p2).collect::<std::collections::HashSet<_>>().len() as u64;
+            let coupling_bytes = 6 * n1 * n2 * 4; // 6 matrices (3 + 3 transposed) x f32
+            coupling_bytes > 8 * 1024 * 1024 * 1024
+        }
+    };
+
+    // Build bundle config for saves (shared by both paths)
     let bundle_config = BundleConfig {
         game: config.game.clone(),
         abstraction: config.abstraction.clone(),
@@ -1382,37 +1417,71 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
             0
         },
     };
-
     let boundaries = None;
-
-    // Derive action labels from the tree-building deal (reuse, no extra deal generation)
     let actions = tree_game.actions(&tree_states[0]);
     let action_labels = format_action_labels(&actions);
     let header = format_table_header(&action_labels);
 
-    let mut wrapper = SimpleTrainingSolver {
-        solver,
-        prefix: "gpu_checkpoint_",
-        previous: None,
-        training_start: Instant::now(),
-        header,
-        action_labels,
-        stack_depth: config.game.stack_depth,
-        abs_mode,
-        convergence_threshold: config.training.convergence_threshold,
-    };
-
-    let loop_config = TrainingLoopConfig {
-        convergence_threshold: config.training.convergence_threshold,
-        check_interval: config.training.convergence_check_interval,
-        iterations,
-        output_dir: &config.training.output_dir,
-        bundle_config: &bundle_config,
-        boundaries: &boundaries,
-    };
-
-    println!("Step 4/4: Training ({iterations} iterations)...\n");
-    run_training_loop(&mut wrapper, &loop_config)
+    if use_tiled {
+        let tile_sz = config.training.tile_size.unwrap_or(32_768);
+        println!("  Using tiled solver (tile_size={tile_sz})");
+        let solver = TiledTabularGpuCfrSolver::new(&tree, deals, gpu_config)?;
+        println!(
+            "  {} info sets, initialized in {:?}\n",
+            solver.num_info_sets(),
+            start.elapsed()
+        );
+        let mut wrapper = SimpleTrainingSolver {
+            solver,
+            prefix: "gpu_checkpoint_",
+            previous: None,
+            training_start: Instant::now(),
+            header,
+            action_labels,
+            stack_depth: config.game.stack_depth,
+            abs_mode,
+            convergence_threshold: config.training.convergence_threshold,
+        };
+        let loop_config = TrainingLoopConfig {
+            convergence_threshold: config.training.convergence_threshold,
+            check_interval: config.training.convergence_check_interval,
+            iterations,
+            output_dir: &config.training.output_dir,
+            bundle_config: &bundle_config,
+            boundaries: &boundaries,
+        };
+        println!("Step 4/4: Training ({iterations} iterations)...\n");
+        run_training_loop(&mut wrapper, &loop_config)
+    } else {
+        println!("  Using untiled solver");
+        let solver = TabularGpuCfrSolver::new(&tree, deals, gpu_config)?;
+        println!(
+            "  {} info sets, initialized in {:?}\n",
+            solver.num_info_sets(),
+            start.elapsed()
+        );
+        let mut wrapper = SimpleTrainingSolver {
+            solver,
+            prefix: "gpu_checkpoint_",
+            previous: None,
+            training_start: Instant::now(),
+            header,
+            action_labels,
+            stack_depth: config.game.stack_depth,
+            abs_mode,
+            convergence_threshold: config.training.convergence_threshold,
+        };
+        let loop_config = TrainingLoopConfig {
+            convergence_threshold: config.training.convergence_threshold,
+            check_interval: config.training.convergence_check_interval,
+            iterations,
+            output_dir: &config.training.output_dir,
+            bundle_config: &bundle_config,
+            boundaries: &boundaries,
+        };
+        println!("Step 4/4: Training ({iterations} iterations)...\n");
+        run_training_loop(&mut wrapper, &loop_config)
+    }
 }
 
 fn save_checkpoint(

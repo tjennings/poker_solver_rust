@@ -16,6 +16,7 @@
 //! ```
 
 pub mod tabular;
+pub mod tiled;
 
 use std::time::Instant;
 
@@ -89,6 +90,9 @@ pub struct GpuCfrConfig {
     /// Maximum deals per GPU batch. `None` (default) auto-sizes to the
     /// largest batch that fits within GPU buffer binding limits.
     pub max_batch_size: Option<usize>,
+    /// Tile size for the tiled tabular solver. `None` = auto-detect,
+    /// `Some(0)` = disable tiling (use untiled solver).
+    pub tile_size: Option<u32>,
 }
 
 impl Default for GpuCfrConfig {
@@ -98,6 +102,7 @@ impl Default for GpuCfrConfig {
             dcfr_beta: 0.5,
             dcfr_gamma: 2.0,
             max_batch_size: None,
+            tile_size: None,
         }
     }
 }
@@ -824,6 +829,44 @@ pub(crate) fn init_gpu() -> Result<(wgpu::Device, wgpu::Queue), GpuError> {
             label: Some("cfr_device"),
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        },
+    )
+    .block_on()?;
+
+    Ok((device, queue))
+}
+
+/// Initialize GPU with maximum buffer size limits from the adapter.
+///
+/// The tiled solver needs large storage buffers (e.g. 14+ GB info_id_table).
+/// Default wgpu limits cap storage buffers at 128 MB, so we request the
+/// adapter's actual maximums.
+pub(crate) fn init_gpu_large_buffers() -> Result<(wgpu::Device, wgpu::Queue), GpuError> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    })
+    .block_on()
+    .map_err(|_| GpuError::NoAdapter)?;
+
+    let adapter_limits = adapter.limits();
+    let mut limits = wgpu::Limits::default();
+    limits.max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size;
+    limits.max_buffer_size = adapter_limits.max_buffer_size;
+
+    println!(
+        "  Adapter limits: max_storage_buffer={:.1} GB, max_buffer={:.1} GB",
+        adapter_limits.max_storage_buffer_binding_size as f64 / 1e9,
+        adapter_limits.max_buffer_size as f64 / 1e9,
+    );
+
+    let (device, queue) = adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("cfr_device_large"),
+            required_features: wgpu::Features::empty(),
+            required_limits: limits,
             ..Default::default()
         },
     )
