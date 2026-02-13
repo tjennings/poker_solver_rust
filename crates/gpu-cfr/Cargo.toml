@@ -13,6 +13,4 @@ pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 rustc-hash.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 rayon.workspace = true

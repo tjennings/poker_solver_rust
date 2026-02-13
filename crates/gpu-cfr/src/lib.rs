@@ -17,7 +17,8 @@
 
 use bytemuck::{Pod, Zeroable};
 use pollster::FutureExt as _;
-use rustc_hash::FxHashMap;
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use poker_solver_core::cfr::game_tree::{GameTree, NodeType};
 use poker_solver_core::cfr::DealInfo;
@@ -128,8 +129,8 @@ pub struct GpuCfrSolver {
     key_to_dense: FxHashMap<u64, u32>,
     dense_to_key: Vec<u64>,
 
-    // Pre-computed per-(deal, node) info set ids
-    deal_info_ids: Vec<Vec<u32>>,
+    // Pre-computed per-(deal, node) info set ids — flat layout, stride = num_nodes
+    deal_info_ids: Vec<u32>,
 
     // GPU buffers — static tree
     node_buffer: wgpu::Buffer,
@@ -200,19 +201,22 @@ impl GpuCfrSolver {
         let num_nodes = tree.nodes.len() as u32;
 
         // Build position index mapping and find max_actions
-        let (position_indices, num_positions, position_num_actions) =
+        let (_position_indices, num_positions, position_num_actions) =
             build_position_indices(tree);
+
+        // Pre-collect decision node indices (avoids repeated NodeType matching)
+        let decision_nodes = collect_decision_nodes(tree);
 
         // Determine hand classes and build info set mapping
         let (key_to_dense, dense_to_key, num_hand_classes) =
-            build_info_set_mapping(tree, &deals, &position_indices, num_positions);
+            build_info_set_mapping(tree, &deals, &decision_nodes);
         let num_info_sets = dense_to_key.len() as u32;
 
         let max_actions = position_num_actions.iter().copied().max().unwrap_or(1);
 
-        // Pre-compute per-deal info set id lookups
+        // Pre-compute per-deal info set id lookups (parallelized, flat layout)
         let deal_info_ids = precompute_deal_info_ids(
-            tree, &deals, &position_indices, &key_to_dense, num_hand_classes,
+            tree, &deals, &decision_nodes, &key_to_dense,
         );
 
         // Auto-size batch to fit within GPU buffer binding limits.
@@ -447,13 +451,12 @@ impl GpuCfrSolver {
         self.queue.write_buffer(&self.deal_p1_wins_buffer, 0, bytemuck::cast_slice(&p1_equity));
         self.queue.write_buffer(&self.deal_weight_buffer, 0, bytemuck::cast_slice(&deal_weight));
 
-        // Upload info_id_lookup for this batch
+        // Upload info_id_lookup for this batch (flat copy)
         let mut lookup = vec![u32::MAX; batch_count * n];
         for (batch_idx, deal_idx) in (deal_offset..deal_offset + batch_count).enumerate() {
-            let ids = &self.deal_info_ids[deal_idx];
-            for (node_idx, &info_id) in ids.iter().enumerate() {
-                lookup[batch_idx * n + node_idx] = info_id;
-            }
+            let src = deal_idx * n;
+            let dst = batch_idx * n;
+            lookup[dst..dst + n].copy_from_slice(&self.deal_info_ids[src..src + n]);
         }
         self.queue.write_buffer(&self.info_id_lookup_buffer, 0, bytemuck::cast_slice(&lookup));
 
@@ -823,32 +826,74 @@ fn build_position_indices(tree: &GameTree) -> (Vec<u32>, u32, Vec<u32>) {
     (indices, next_index, position_num_actions)
 }
 
+/// Pre-collected decision node metadata to avoid repeated `NodeType` matching.
+#[derive(Clone, Copy)]
+struct DecisionNodeInfo {
+    node_idx: usize,
+    player: Player,
+    street: u8,
+}
+
+/// Scan the tree once and extract decision node indices with their metadata.
+fn collect_decision_nodes(tree: &GameTree) -> Vec<DecisionNodeInfo> {
+    tree.nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, node)| match &node.node_type {
+            NodeType::Decision { player, street, .. } => Some(DecisionNodeInfo {
+                node_idx: i,
+                player: *player,
+                street: *street,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Build the info set mapping from unique (position, hand_bits) combos.
+///
+/// Instead of iterating `deals × nodes` (O(D×N)), this:
+/// 1. Collects unique `hand_bits` per `(player, street)` in O(D) time.
+/// 2. Iterates `decision_nodes × unique_hands` which is much smaller.
 fn build_info_set_mapping(
     tree: &GameTree,
     deals: &[DealInfo],
-    _position_indices: &[u32],
-    _num_positions: u32,
+    decision_nodes: &[DecisionNodeInfo],
 ) -> (FxHashMap<u64, u32>, Vec<u64>, u32) {
+    // 8 buckets: player(0..2) × street(0..4)
+    let mut unique_per_bucket: [FxHashSet<u32>; 8] = [
+        FxHashSet::default(), FxHashSet::default(),
+        FxHashSet::default(), FxHashSet::default(),
+        FxHashSet::default(), FxHashSet::default(),
+        FxHashSet::default(), FxHashSet::default(),
+    ];
+
+    // Pass 1: collect unique hand_bits per (player, street) — O(deals)
+    for deal in deals {
+        for street in 0..4usize {
+            unique_per_bucket[street].insert(deal.hand_bits_p1[street]);
+            unique_per_bucket[4 + street].insert(deal.hand_bits_p2[street]);
+        }
+    }
+
+    // Pass 2: iterate decision_nodes × unique_hands — O(D_nodes × U_hands)
     let mut key_to_dense: FxHashMap<u64, u32> = FxHashMap::default();
     let mut dense_to_key: Vec<u64> = Vec::new();
-    let mut hand_classes_seen = std::collections::HashSet::new();
+    let mut hand_classes_seen = FxHashSet::default();
 
-    for deal in deals {
-        for (node_idx, node) in tree.nodes.iter().enumerate() {
-            if let NodeType::Decision { player, street, .. } = &node.node_type {
-                let hand_bits = match player {
-                    Player::Player1 => deal.hand_bits_p1[*street as usize],
-                    Player::Player2 => deal.hand_bits_p2[*street as usize],
-                };
-                hand_classes_seen.insert(hand_bits);
-
-                let key = tree.info_set_key(node_idx as u32, hand_bits);
-                key_to_dense.entry(key).or_insert_with(|| {
-                    let id = dense_to_key.len() as u32;
-                    dense_to_key.push(key);
-                    id
-                });
-            }
+    for dn in decision_nodes {
+        let bucket = match dn.player {
+            Player::Player1 => dn.street as usize,
+            Player::Player2 => 4 + dn.street as usize,
+        };
+        for &hand_bits in &unique_per_bucket[bucket] {
+            hand_classes_seen.insert(hand_bits);
+            let key = tree.info_set_key(dn.node_idx as u32, hand_bits);
+            key_to_dense.entry(key).or_insert_with(|| {
+                let id = dense_to_key.len() as u32;
+                dense_to_key.push(key);
+                id
+            });
         }
     }
 
@@ -856,31 +901,35 @@ fn build_info_set_mapping(
     (key_to_dense, dense_to_key, num_hand_classes)
 }
 
+/// Pre-compute per-(deal, node) info set dense IDs.
+///
+/// Returns a flat `Vec<u32>` with stride `num_nodes`. Each deal's slice is
+/// independent, so computation is parallelized with rayon.
 fn precompute_deal_info_ids(
     tree: &GameTree,
     deals: &[DealInfo],
-    _position_indices: &[u32],
+    decision_nodes: &[DecisionNodeInfo],
     key_to_dense: &FxHashMap<u64, u32>,
-    _num_hand_classes: u32,
-) -> Vec<Vec<u32>> {
+) -> Vec<u32> {
     let num_nodes = tree.nodes.len();
+    let mut flat = vec![u32::MAX; deals.len() * num_nodes];
 
-    deals.iter().map(|deal| {
-        let mut ids = vec![u32::MAX; num_nodes];
-        for (node_idx, node) in tree.nodes.iter().enumerate() {
-            if let NodeType::Decision { player, street, .. } = &node.node_type {
-                let hand_bits = match player {
-                    Player::Player1 => deal.hand_bits_p1[*street as usize],
-                    Player::Player2 => deal.hand_bits_p2[*street as usize],
+    flat.par_chunks_mut(num_nodes)
+        .zip(deals.par_iter())
+        .for_each(|(ids, deal)| {
+            for dn in decision_nodes {
+                let hand_bits = match dn.player {
+                    Player::Player1 => deal.hand_bits_p1[dn.street as usize],
+                    Player::Player2 => deal.hand_bits_p2[dn.street as usize],
                 };
-                let key = tree.info_set_key(node_idx as u32, hand_bits);
+                let key = tree.info_set_key(dn.node_idx as u32, hand_bits);
                 if let Some(&dense_id) = key_to_dense.get(&key) {
-                    ids[node_idx] = dense_id;
+                    ids[dn.node_idx] = dense_id;
                 }
             }
-        }
-        ids
-    }).collect()
+        });
+
+    flat
 }
 
 fn create_buffer_init(device: &wgpu::Device, label: &str, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
