@@ -1226,13 +1226,13 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     println!("  {} deals loaded\n", deals.len());
 
-    // Materialize tree (need a game for tree structure)
-    let game = HunlPostflop::new(config.game.clone(), abstraction_mode, 1);
-    let states = game.initial_states();
+    // Materialize tree (abstraction mode not needed — tree shape depends only on bet sizes/stacks)
+    let tree_game = HunlPostflop::new(config.game.clone(), None, 1);
+    let tree_states = tree_game.initial_states();
 
     println!("Materializing game tree...");
     let start = Instant::now();
-    let tree = materialize_postflop(&game, &states[0]);
+    let tree = materialize_postflop(&tree_game, &tree_states[0]);
     println!("  {} nodes, done in {:?}", tree.stats.total_nodes, start.elapsed());
 
     // Build solver
@@ -1336,13 +1336,13 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     println!("  {} deals loaded\n", deals.len());
 
-    // Materialize tree
-    let game = HunlPostflop::new(config.game.clone(), abstraction_mode, 1);
-    let states = game.initial_states();
+    // Materialize tree (abstraction mode not needed — tree shape depends only on bet sizes/stacks)
+    let tree_game = HunlPostflop::new(config.game.clone(), None, 1);
+    let tree_states = tree_game.initial_states();
 
     println!("Materializing game tree...");
     let start = Instant::now();
-    let tree = materialize_postflop(&game, &states[0]);
+    let tree = materialize_postflop(&tree_game, &tree_states[0]);
     println!("  {} nodes, done in {:?}", tree.stats.total_nodes, start.elapsed());
 
     // Build GPU solver
