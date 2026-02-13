@@ -449,8 +449,9 @@ impl GpuCfrSolver {
             let batch_end = (deal_offset + self.batch_size).min(num_deals);
             let batch_count = batch_end - deal_offset;
 
-            self.upload_batch(deal_offset, batch_count);
-            self.dispatch_batch(batch_count as u32, strategy_discount);
+            let log = deal_offset == 0; // log timing for first batch only
+            self.upload_batch(deal_offset, batch_count, log);
+            self.dispatch_batch(batch_count as u32, strategy_discount, log);
 
             deal_offset = batch_end;
 
@@ -481,10 +482,11 @@ impl GpuCfrSolver {
         );
     }
 
-    fn upload_batch(&self, deal_offset: usize, batch_count: usize) {
+    fn upload_batch(&self, deal_offset: usize, batch_count: usize, log: bool) {
         let n = self.num_nodes as usize;
 
         // Upload deal data (hand_bits not used on GPU — info IDs are pre-computed)
+        let step = Instant::now();
         let p1_equity: Vec<f32> = (deal_offset..deal_offset + batch_count)
             .map(|i| self.deals[i].p1_equity as f32)
             .collect();
@@ -494,15 +496,22 @@ impl GpuCfrSolver {
 
         self.queue.write_buffer(&self.deal_p1_wins_buffer, 0, bytemuck::cast_slice(&p1_equity));
         self.queue.write_buffer(&self.deal_weight_buffer, 0, bytemuck::cast_slice(&deal_weight));
+        if log { println!("    upload deal data: {:?}", step.elapsed()); }
 
         // Compute info_id_lookup on-the-fly for this batch
+        let step = Instant::now();
         let batch_deals = &self.deals[deal_offset..deal_offset + batch_count];
         let lookup = compute_batch_info_ids(
             batch_deals, n, &self.decision_nodes, &self.key_to_dense,
         );
+        if log { println!("    compute_batch_info_ids: {:?}", step.elapsed()); }
+
+        let step = Instant::now();
         self.queue.write_buffer(&self.info_id_lookup_buffer, 0, bytemuck::cast_slice(&lookup));
+        if log { println!("    upload info_id_lookup: {:?}", step.elapsed()); }
 
         // Zero reach and utility arrays
+        let step = Instant::now();
         let batch_node_bytes = (batch_count * n * 4) as u64;
         let zeros = vec![0u8; batch_node_bytes as usize];
         self.queue.write_buffer(&self.reach_p1_buffer, 0, &zeros);
@@ -516,9 +525,11 @@ impl GpuCfrSolver {
             self.queue.write_buffer(&self.reach_p1_buffer, offset, &one_bytes);
             self.queue.write_buffer(&self.reach_p2_buffer, offset, &one_bytes);
         }
+        if log { println!("    zero + root reach: {:?}", step.elapsed()); }
     }
 
-    fn dispatch_batch(&self, num_deals: u32, strategy_discount: f32) {
+    fn dispatch_batch(&self, num_deals: u32, strategy_discount: f32, log: bool) {
+        let step = Instant::now();
         let bg0 = self.create_bind_group0();
         let bg1 = self.create_bind_group1();
         let bg2 = self.create_bind_group2();
@@ -557,6 +568,7 @@ impl GpuCfrSolver {
             bwd_threads.push(num_deals * level_count);
             slot += 1;
         }
+        if log { println!("    bind groups + uniforms: {:?}", step.elapsed()); }
 
         // Single encoder for the entire batch
         let mut encoder = self.device.create_command_encoder(
@@ -598,7 +610,14 @@ impl GpuCfrSolver {
             pass.dispatch_workgroups(div_ceil(threads, WORKGROUP_SIZE), 1, 1);
         }
 
+        let step = Instant::now();
         self.queue.submit(std::iter::once(encoder.finish()));
+        if log {
+            println!(
+                "    GPU dispatch: regret_match + {} fwd + {} bwd levels, submit: {:?}",
+                num_levels, num_levels, step.elapsed()
+            );
+        }
     }
 
     fn dispatch_merge_and_discount(&self) {
