@@ -871,7 +871,7 @@ fn sort_batch_to_file(batch_path: &Path, sorted_path: &Path) -> Result<u64, Solv
     // Drop batch data before sorting to reduce peak memory
     drop(data);
 
-    entries.sort_unstable_by_key(|(k, _, _)| *k);
+    entries.par_sort_unstable_by_key(|(k, _, _)| *k);
     write_sorted_file(sorted_path, &entries, concrete)?;
     Ok(concrete)
 }
