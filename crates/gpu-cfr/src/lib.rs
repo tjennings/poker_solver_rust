@@ -25,6 +25,8 @@ use poker_solver_core::cfr::DealInfo;
 use poker_solver_core::game::Player;
 
 const WORKGROUP_SIZE: u32 = 256;
+/// Must match `HAND_SHIFT` in `poker_solver_core::info_key`.
+const HAND_SHIFT: u64 = 36;
 
 // --- GPU data structures ---
 
@@ -125,12 +127,11 @@ pub struct GpuCfrSolver {
     level_counts: Vec<u32>,
 
     // Info set mapping
-    #[allow(dead_code)]
     key_to_dense: FxHashMap<u64, u32>,
     dense_to_key: Vec<u64>,
 
-    // Pre-computed per-(deal, node) info set ids — flat layout, stride = num_nodes
-    deal_info_ids: Vec<u32>,
+    // Decision node metadata for on-the-fly info ID computation
+    decision_nodes: Vec<DecisionNodeInfo>,
 
     // GPU buffers — static tree
     node_buffer: wgpu::Buffer,
@@ -204,7 +205,7 @@ impl GpuCfrSolver {
         let (_position_indices, num_positions, position_num_actions) =
             build_position_indices(tree);
 
-        // Pre-collect decision node indices (avoids repeated NodeType matching)
+        // Pre-collect decision node indices with position keys
         let decision_nodes = collect_decision_nodes(tree);
 
         // Determine hand classes and build info set mapping
@@ -213,11 +214,6 @@ impl GpuCfrSolver {
         let num_info_sets = dense_to_key.len() as u32;
 
         let max_actions = position_num_actions.iter().copied().max().unwrap_or(1);
-
-        // Pre-compute per-deal info set id lookups (parallelized, flat layout)
-        let deal_info_ids = precompute_deal_info_ids(
-            tree, &deals, &decision_nodes, &key_to_dense,
-        );
 
         // Auto-size batch to fit within GPU buffer binding limits.
         // The largest per-batch buffer is info_id_lookup: batch_size × num_nodes × 4 bytes.
@@ -319,7 +315,7 @@ impl GpuCfrSolver {
             level_counts,
             key_to_dense,
             dense_to_key,
-            deal_info_ids,
+            decision_nodes,
             node_buffer,
             children_buffer,
             level_nodes_buffer,
@@ -451,13 +447,11 @@ impl GpuCfrSolver {
         self.queue.write_buffer(&self.deal_p1_wins_buffer, 0, bytemuck::cast_slice(&p1_equity));
         self.queue.write_buffer(&self.deal_weight_buffer, 0, bytemuck::cast_slice(&deal_weight));
 
-        // Upload info_id_lookup for this batch (flat copy)
-        let mut lookup = vec![u32::MAX; batch_count * n];
-        for (batch_idx, deal_idx) in (deal_offset..deal_offset + batch_count).enumerate() {
-            let src = deal_idx * n;
-            let dst = batch_idx * n;
-            lookup[dst..dst + n].copy_from_slice(&self.deal_info_ids[src..src + n]);
-        }
+        // Compute info_id_lookup on-the-fly for this batch
+        let batch_deals = &self.deals[deal_offset..deal_offset + batch_count];
+        let lookup = compute_batch_info_ids(
+            batch_deals, n, &self.decision_nodes, &self.key_to_dense,
+        );
         self.queue.write_buffer(&self.info_id_lookup_buffer, 0, bytemuck::cast_slice(&lookup));
 
         // Zero reach and utility arrays
@@ -826,15 +820,20 @@ fn build_position_indices(tree: &GameTree) -> (Vec<u32>, u32, Vec<u32>) {
     (indices, next_index, position_num_actions)
 }
 
-/// Pre-collected decision node metadata to avoid repeated `NodeType` matching.
+/// Pre-collected decision node metadata for on-the-fly info ID computation.
+///
+/// `position_key` is the info set key with `hand_bits=0`, so the full key
+/// can be reconstructed as `position_key | ((hand_bits as u64) << HAND_SHIFT)`
+/// without needing the `GameTree` at batch time.
 #[derive(Clone, Copy)]
 struct DecisionNodeInfo {
     node_idx: usize,
     player: Player,
     street: u8,
+    position_key: u64,
 }
 
-/// Scan the tree once and extract decision node indices with their metadata.
+/// Scan the tree once and extract decision node metadata including position keys.
 fn collect_decision_nodes(tree: &GameTree) -> Vec<DecisionNodeInfo> {
     tree.nodes
         .iter()
@@ -844,6 +843,7 @@ fn collect_decision_nodes(tree: &GameTree) -> Vec<DecisionNodeInfo> {
                 node_idx: i,
                 player: *player,
                 street: *street,
+                position_key: tree.info_set_key(i as u32, 0),
             }),
             _ => None,
         })
@@ -901,35 +901,36 @@ fn build_info_set_mapping(
     (key_to_dense, dense_to_key, num_hand_classes)
 }
 
-/// Pre-compute per-(deal, node) info set dense IDs.
+/// Compute info set dense IDs on-the-fly for a single batch of deals.
 ///
-/// Returns a flat `Vec<u32>` with stride `num_nodes`. Each deal's slice is
-/// independent, so computation is parallelized with rayon.
-fn precompute_deal_info_ids(
-    tree: &GameTree,
-    deals: &[DealInfo],
+/// Returns a flat `Vec<u32>` of length `batch_count × num_nodes`.
+/// Uses pre-computed `position_key` to reconstruct full info set keys
+/// without needing the `GameTree`.
+fn compute_batch_info_ids(
+    batch_deals: &[DealInfo],
+    num_nodes: usize,
     decision_nodes: &[DecisionNodeInfo],
     key_to_dense: &FxHashMap<u64, u32>,
 ) -> Vec<u32> {
-    let num_nodes = tree.nodes.len();
-    let mut flat = vec![u32::MAX; deals.len() * num_nodes];
+    let mut lookup = vec![u32::MAX; batch_deals.len() * num_nodes];
 
-    flat.par_chunks_mut(num_nodes)
-        .zip(deals.par_iter())
+    lookup
+        .par_chunks_mut(num_nodes)
+        .zip(batch_deals.par_iter())
         .for_each(|(ids, deal)| {
             for dn in decision_nodes {
                 let hand_bits = match dn.player {
                     Player::Player1 => deal.hand_bits_p1[dn.street as usize],
                     Player::Player2 => deal.hand_bits_p2[dn.street as usize],
                 };
-                let key = tree.info_set_key(dn.node_idx as u32, hand_bits);
+                let key = dn.position_key | ((hand_bits as u64) << HAND_SHIFT);
                 if let Some(&dense_id) = key_to_dense.get(&key) {
                     ids[dn.node_idx] = dense_id;
                 }
             }
         });
 
-    flat
+    lookup
 }
 
 fn create_buffer_init(device: &wgpu::Device, label: &str, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {

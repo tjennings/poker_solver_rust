@@ -1354,7 +1354,7 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         dcfr_gamma: 2.0,
         ..Default::default()
     };
-    let mut solver = GpuCfrSolver::new(&tree, deals, gpu_config)?;
+    let solver = GpuCfrSolver::new(&tree, deals, gpu_config)?;
     println!(
         "  {} info sets, batch_size={}, initialized in {:?}\n",
         solver.num_info_sets(),
