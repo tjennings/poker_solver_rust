@@ -175,6 +175,12 @@ pub struct GpuCfrSolver {
     merge_deltas_pipeline: wgpu::ComputePipeline,
     dcfr_discount_pipeline: wgpu::ComputePipeline,
 
+    // Pre-allocated CPU buffers for batch upload (avoid per-batch allocation)
+    /// Reach init pattern: 1.0 at root (offset 0) of each deal, 0.0 elsewhere.
+    initial_reach: Vec<u8>,
+    /// Zero buffer for utility init.
+    batch_zeros: Vec<u8>,
+
     // Training state
     config: GpuCfrConfig,
     deals: Vec<DealInfo>,
@@ -323,6 +329,23 @@ impl GpuCfrSolver {
             "dcfr_discount", include_str!("shaders/dcfr_discount.wgsl"));
         println!("  Shader pipelines compiled in {:?}", step.elapsed());
 
+        // Pre-allocate CPU buffers for batch upload (avoids per-batch 128MB allocation)
+        let batch_node_bytes = batch_size * num_nodes as usize * 4;
+        let batch_zeros = vec![0u8; batch_node_bytes];
+        let initial_reach = {
+            let mut buf = vec![0u8; batch_node_bytes];
+            let one = 1.0_f32.to_ne_bytes();
+            for d in 0..batch_size {
+                let offset = d * num_nodes as usize * 4;
+                buf[offset..offset + 4].copy_from_slice(&one);
+            }
+            buf
+        };
+        println!(
+            "  Pre-allocated batch buffers: {:.1} MB",
+            (batch_node_bytes * 2) as f64 / 1_048_576.0,
+        );
+
         Ok(Self {
             device,
             queue,
@@ -363,6 +386,8 @@ impl GpuCfrSolver {
             backward_pass_pipeline,
             merge_deltas_pipeline,
             dcfr_discount_pipeline,
+            initial_reach,
+            batch_zeros,
             config,
             deals,
             batch_size,
@@ -446,7 +471,6 @@ impl GpuCfrSolver {
         // Process deals in batches
         let mut deal_offset = 0;
         while deal_offset < num_deals {
-            println!("Starting batch, deal_offset: {}", deal_offset);
             let batch_end = (deal_offset + self.batch_size).min(num_deals);
             let batch_count = batch_end - deal_offset;
 
@@ -511,22 +535,14 @@ impl GpuCfrSolver {
         self.queue.write_buffer(&self.info_id_lookup_buffer, 0, bytemuck::cast_slice(&lookup));
         if log { println!("    upload info_id_lookup: {:?}", step.elapsed()); }
 
-        // Zero reach and utility arrays
+        // Init reach (1.0 at root, 0.0 elsewhere) and zero utility.
+        // Uses pre-allocated buffers to avoid per-batch 128MB allocation.
         let step = Instant::now();
-        let batch_node_bytes = (batch_count * n * 4) as u64;
-        let zeros = vec![0u8; batch_node_bytes as usize];
-        self.queue.write_buffer(&self.reach_p1_buffer, 0, &zeros);
-        self.queue.write_buffer(&self.reach_p2_buffer, 0, &zeros);
-        self.queue.write_buffer(&self.utility_buffer, 0, &zeros);
-
-        // Set root reach = 1.0 for each deal
-        let one_bytes = 1.0_f32.to_ne_bytes();
-        for d in 0..batch_count {
-            let offset = (d * n * 4) as u64;
-            self.queue.write_buffer(&self.reach_p1_buffer, offset, &one_bytes);
-            self.queue.write_buffer(&self.reach_p2_buffer, offset, &one_bytes);
-        }
-        if log { println!("    zero + root reach: {:?}", step.elapsed()); }
+        let batch_bytes = batch_count * n * 4;
+        self.queue.write_buffer(&self.reach_p1_buffer, 0, &self.initial_reach[..batch_bytes]);
+        self.queue.write_buffer(&self.reach_p2_buffer, 0, &self.initial_reach[..batch_bytes]);
+        self.queue.write_buffer(&self.utility_buffer, 0, &self.batch_zeros[..batch_bytes]);
+        if log { println!("    init reach + zero utility: {:?}", step.elapsed()); }
     }
 
     fn dispatch_batch(&self, num_deals: u32, strategy_discount: f32, log: bool) {
