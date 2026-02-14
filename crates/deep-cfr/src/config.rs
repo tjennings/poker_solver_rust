@@ -21,6 +21,8 @@ pub struct SdCfrConfig {
     pub grad_clip_norm: f64,
     /// Random seed for reproducibility
     pub seed: u64,
+    /// Save a checkpoint every N iterations (0 = disabled)
+    pub checkpoint_interval: u32,
 }
 
 impl Default for SdCfrConfig {
@@ -36,6 +38,7 @@ impl Default for SdCfrConfig {
             learning_rate: 0.001,
             grad_clip_norm: 1.0,
             seed: 42,
+            checkpoint_interval: 0,
         }
     }
 }
@@ -76,6 +79,12 @@ mod tests {
             ..SdCfrConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn default_config_has_zero_checkpoint_interval() {
+        let config = SdCfrConfig::default();
+        assert_eq!(config.checkpoint_interval, 0);
     }
 
     #[test]

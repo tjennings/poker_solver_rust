@@ -8,6 +8,7 @@ description = "CLI tool for training poker blueprint strategies"
 
 [dependencies]
 poker-solver-core = { path = "../core" }
+poker-solver-deep-cfr = { path = "../deep-cfr" }
 poker-solver-gpu-cfr = { path = "../gpu-cfr", optional = true }
 clap = { version = "4", features = ["derive"] }
 rayon.workspace = true
@@ -17,6 +18,7 @@ serde_json = "1"
 serde_yaml.workspace = true
 rustc-hash.workspace = true
 bincode = "1.3"
+candle-core = "0.9"
 
 [features]
 gpu = ["dep:poker-solver-gpu-cfr"]

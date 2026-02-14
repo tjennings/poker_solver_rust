@@ -85,6 +85,7 @@ fn convergence_config(seed: u64) -> SdCfrConfig {
         learning_rate: 0.003,
         grad_clip_norm: 10.0,
         seed,
+        checkpoint_interval: 0,
     }
 }
 
@@ -234,6 +235,7 @@ fn sd_cfr_kuhn_consistent_structure() {
         learning_rate: 0.001,
         grad_clip_norm: 1.0,
         seed: 123,
+        checkpoint_interval: 0,
     };
 
     let run = || {

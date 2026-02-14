@@ -1,6 +1,7 @@
 pub mod card_features;
 pub mod config;
 pub mod eval;
+pub mod hunl_encoder;
 pub mod memory;
 pub mod model_buffer;
 pub mod network;

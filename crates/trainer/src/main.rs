@@ -19,7 +19,7 @@ use poker_solver_core::cfr::{
     materialize_postflop,
 };
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
-use poker_solver_core::game::{AbstractionMode, Action, HunlPostflop, PostflopConfig, PostflopState};
+use poker_solver_core::game::{AbstractionMode, Action, HunlPostflop, Player, PostflopConfig, PostflopState};
 use poker_solver_core::info_key::{canonical_hand_index_from_str, hand_label_from_bits, reverse_canonical_index, spr_bucket, InfoKey};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
@@ -139,6 +139,8 @@ enum SolverMode {
     /// GPU-accelerated sequence-form CFR via wgpu compute shaders.
     /// Requires `--features gpu` at build time.
     Gpu,
+    /// Single Deep CFR with neural network advantage estimation.
+    SdCfr,
 }
 
 /// Output format for the flops command.
@@ -257,6 +259,69 @@ fn default_pruning_probe_interval() -> u64 {
     20
 }
 
+// ---------------------------------------------------------------------------
+// SD-CFR YAML config structs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct SdCfrTrainingConfig {
+    game: PostflopConfig,
+    deals: SdCfrDealConfig,
+    training: SdCfrTrainingParams,
+    network: SdCfrNetworkConfig,
+    sgd: SdCfrSgdConfig,
+    memory: SdCfrMemoryConfig,
+    checkpoint: SdCfrCheckpointConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Fields parsed from YAML; some reserved for future checkpoint/stratification tasks
+struct SdCfrDealConfig {
+    count: usize,
+    #[serde(default)]
+    min_per_class: usize,
+    #[serde(default = "default_max_rejections")]
+    max_rejections: usize,
+    seed: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SdCfrTrainingParams {
+    iterations: u32,
+    traversals_per_iter: u32,
+    seed: u64,
+    output_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SdCfrNetworkConfig {
+    hidden_dim: usize,
+    num_actions: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SdCfrSgdConfig {
+    steps: usize,
+    batch_size: usize,
+    learning_rate: f64,
+    #[serde(default = "default_grad_clip")]
+    grad_clip_norm: f64,
+}
+
+fn default_grad_clip() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Deserialize)]
+struct SdCfrMemoryConfig {
+    advantage_cap: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SdCfrCheckpointConfig {
+    interval: u32,
+}
+
 /// Hands to display in the SB preflop strategy table.
 const DISPLAY_HANDS: &[&str] = &["AA", "KK", "QQ", "AKs", "AKo", "JTs", "76s", "72o"];
 
@@ -271,21 +336,29 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .build_global()
                     .expect("failed to configure rayon thread pool");
             }
-            let yaml = std::fs::read_to_string(&config)?;
-            let training_config: TrainingConfig = serde_yaml::from_str(&yaml)?;
             match solver {
-                SolverMode::Mccfr => run_mccfr_training(training_config)?,
-                SolverMode::Sequence => run_sequence_training(training_config)?,
-                SolverMode::Gpu => {
-                    #[cfg(feature = "gpu")]
-                    {
-                        run_gpu_training(training_config)?;
-                    }
-                    #[cfg(not(feature = "gpu"))]
-                    {
-                        eprintln!("Error: GPU solver requires `--features gpu` at build time.");
-                        eprintln!("Build with: cargo run -p poker-solver-trainer --features gpu --release -- train ...");
-                        std::process::exit(1);
+                SolverMode::SdCfr => {
+                    run_sdcfr_training(&config)?;
+                }
+                SolverMode::Mccfr | SolverMode::Sequence | SolverMode::Gpu => {
+                    let yaml = std::fs::read_to_string(&config)?;
+                    let training_config: TrainingConfig = serde_yaml::from_str(&yaml)?;
+                    match solver {
+                        SolverMode::Mccfr => run_mccfr_training(training_config)?,
+                        SolverMode::Sequence => run_sequence_training(training_config)?,
+                        SolverMode::Gpu => {
+                            #[cfg(feature = "gpu")]
+                            {
+                                run_gpu_training(training_config)?;
+                            }
+                            #[cfg(not(feature = "gpu"))]
+                            {
+                                eprintln!("Error: GPU solver requires `--features gpu` at build time.");
+                                eprintln!("Build with: cargo run -p poker-solver-trainer --features gpu --release -- train ...");
+                                std::process::exit(1);
+                            }
+                        }
+                        SolverMode::SdCfr => unreachable!("SdCfr handled in outer match"),
                     }
                 }
             }
@@ -890,6 +963,234 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     };
 
     run_training_loop(&mut wrapper, &loop_config)
+}
+
+fn run_sdcfr_training(config_path: &Path) -> Result<(), Box<dyn Error>> {
+    let yaml = std::fs::read_to_string(config_path)?;
+    let config: SdCfrTrainingConfig = serde_yaml::from_str(&yaml)?;
+    print_sdcfr_config(&config);
+
+    let game = HunlPostflop::new(config.game.clone(), None, config.deals.count);
+    let deal_pool = game.initial_states();
+    println!("  Generated {} deals", deal_pool.len());
+
+    let encoder = poker_solver_deep_cfr::hunl_encoder::HunlStateEncoder::new(
+        config.game.bet_sizes.clone(),
+    );
+    let sdcfr_config = build_sdcfr_config(&config);
+    let mut solver = poker_solver_deep_cfr::solver::SdCfrSolver::new(
+        game, encoder, sdcfr_config,
+    )?;
+
+    let output_dir = config.training.output_dir.clone();
+    let game_config = config.game.clone();
+    let num_actions = config.network.num_actions;
+    let hidden_dim = config.network.hidden_dim;
+
+    let mut checkpoint_cb = |iteration: u32,
+                             trained: &poker_solver_deep_cfr::solver::TrainedSdCfr|
+     -> Result<(), poker_solver_deep_cfr::SdCfrError> {
+        save_sdcfr_checkpoint(
+            trained,
+            iteration,
+            &output_dir,
+            &game_config,
+            num_actions,
+            hidden_dim,
+        )
+    };
+
+    println!("\nStarting SD-CFR training...");
+    let start = Instant::now();
+    let trained = solver.train_with_deals(
+        Some(&deal_pool),
+        Some(&mut checkpoint_cb),
+    )?;
+    let elapsed = start.elapsed();
+
+    print_sdcfr_summary(&trained, elapsed);
+    Ok(())
+}
+
+fn print_sdcfr_config(config: &SdCfrTrainingConfig) {
+    println!("=== Poker Blueprint Trainer (Single Deep CFR) ===");
+    println!("  Stack depth: {} BB", config.game.stack_depth);
+    println!("  Bet sizes: {:?}", config.game.bet_sizes);
+    println!("  Iterations: {}", config.training.iterations);
+    println!("  Traversals/iter: {}", config.training.traversals_per_iter);
+    println!("  Deal pool: {} deals", config.deals.count);
+    println!("  Network: hidden_dim={}, num_actions={}", config.network.hidden_dim, config.network.num_actions);
+    println!("  SGD: steps={}, batch={}, lr={}", config.sgd.steps, config.sgd.batch_size, config.sgd.learning_rate);
+    println!("  Memory cap: {}", config.memory.advantage_cap);
+    println!("  Checkpoint every {} iters", config.checkpoint.interval);
+}
+
+fn build_sdcfr_config(config: &SdCfrTrainingConfig) -> poker_solver_deep_cfr::SdCfrConfig {
+    poker_solver_deep_cfr::SdCfrConfig {
+        cfr_iterations: config.training.iterations,
+        traversals_per_iter: config.training.traversals_per_iter,
+        advantage_memory_cap: config.memory.advantage_cap,
+        hidden_dim: config.network.hidden_dim,
+        num_actions: config.network.num_actions,
+        sgd_steps: config.sgd.steps,
+        batch_size: config.sgd.batch_size,
+        learning_rate: config.sgd.learning_rate,
+        grad_clip_norm: config.sgd.grad_clip_norm,
+        seed: config.training.seed,
+        checkpoint_interval: config.checkpoint.interval,
+    }
+}
+
+fn print_sdcfr_summary(
+    trained: &poker_solver_deep_cfr::solver::TrainedSdCfr,
+    elapsed: std::time::Duration,
+) {
+    println!("\n=== SD-CFR Training Complete ===");
+    println!("  Total time: {:.1}s", elapsed.as_secs_f64());
+    println!(
+        "  P1 model snapshots: {}",
+        trained.model_buffers[0].len(),
+    );
+    println!(
+        "  P2 model snapshots: {}",
+        trained.model_buffers[1].len(),
+    );
+    println!(
+        "  Time/iteration: {:.2}s",
+        elapsed.as_secs_f64() / f64::from(trained.config.cfr_iterations),
+    );
+}
+
+fn save_sdcfr_checkpoint(
+    trained: &poker_solver_deep_cfr::solver::TrainedSdCfr,
+    iteration: u32,
+    output_dir: &str,
+    game_config: &PostflopConfig,
+    num_actions: usize,
+    hidden_dim: usize,
+) -> Result<(), poker_solver_deep_cfr::SdCfrError> {
+    let device = candle_core::Device::Cpu;
+    println!("\n  Checkpoint at iteration {iteration}...");
+
+    let policies = build_explicit_policies(trained, num_actions, hidden_dim, &device)?;
+    let strategy_map = walk_deals_for_strategies(game_config, &policies)?;
+    println!("    {} info sets extracted", strategy_map.len());
+
+    save_strategy_bundle(game_config, strategy_map, iteration, output_dir)
+}
+
+/// Build `ExplicitPolicy` for both players from the trained model buffers.
+fn build_explicit_policies(
+    trained: &poker_solver_deep_cfr::solver::TrainedSdCfr,
+    num_actions: usize,
+    hidden_dim: usize,
+    device: &candle_core::Device,
+) -> Result<[poker_solver_deep_cfr::eval::ExplicitPolicy; 2], poker_solver_deep_cfr::SdCfrError> {
+    let p1 = poker_solver_deep_cfr::eval::ExplicitPolicy::from_buffer(
+        &trained.model_buffers[0],
+        num_actions,
+        hidden_dim,
+        device,
+    )?;
+    let p2 = poker_solver_deep_cfr::eval::ExplicitPolicy::from_buffer(
+        &trained.model_buffers[1],
+        num_actions,
+        hidden_dim,
+        device,
+    )?;
+    Ok([p1, p2])
+}
+
+/// Sample deals and walk the game tree to extract strategies at every info set.
+fn walk_deals_for_strategies(
+    game_config: &PostflopConfig,
+    policies: &[poker_solver_deep_cfr::eval::ExplicitPolicy; 2],
+) -> Result<FxHashMap<u64, Vec<f64>>, poker_solver_deep_cfr::SdCfrError> {
+    let encoder = poker_solver_deep_cfr::hunl_encoder::HunlStateEncoder::new(
+        game_config.bet_sizes.clone(),
+    );
+    let tree_game = HunlPostflop::new(game_config.clone(), None, 200);
+    let sample_deals = tree_game.initial_states();
+
+    let mut strategy_map: FxHashMap<u64, Vec<f64>> = FxHashMap::default();
+    for deal in &sample_deals {
+        extract_strategies_dfs(&tree_game, deal, policies, &encoder, &mut strategy_map)?;
+    }
+    Ok(strategy_map)
+}
+
+/// Save the extracted strategy map as a `StrategyBundle` to disk.
+fn save_strategy_bundle(
+    game_config: &PostflopConfig,
+    strategy_map: FxHashMap<u64, Vec<f64>>,
+    iteration: u32,
+    output_dir: &str,
+) -> Result<(), poker_solver_deep_cfr::SdCfrError> {
+    let bundle_config = BundleConfig {
+        game: game_config.clone(),
+        abstraction: None,
+        abstraction_mode: AbstractionModeConfig::default(),
+        strength_bits: 0,
+        equity_bits: 0,
+    };
+    let blueprint = BlueprintStrategy::from_strategies(strategy_map, u64::from(iteration));
+    let bundle = StrategyBundle::new(bundle_config, blueprint, None);
+
+    let dir = PathBuf::from(output_dir).join(format!("checkpoint_{iteration}"));
+    bundle.save(&dir).map_err(|e| {
+        poker_solver_deep_cfr::SdCfrError::Io(std::io::Error::other(e.to_string()))
+    })?;
+    println!("    Saved to {}", dir.display());
+    Ok(())
+}
+
+/// Recursive DFS through the game tree, collecting info_set_key -> action
+/// probabilities from the neural network policies.
+fn extract_strategies_dfs(
+    game: &HunlPostflop,
+    state: &PostflopState,
+    policies: &[poker_solver_deep_cfr::eval::ExplicitPolicy; 2],
+    encoder: &poker_solver_deep_cfr::hunl_encoder::HunlStateEncoder,
+    strategy_map: &mut FxHashMap<u64, Vec<f64>>,
+) -> Result<(), poker_solver_deep_cfr::SdCfrError> {
+    if game.is_terminal(state) {
+        return Ok(());
+    }
+
+    let key = game.info_set_key(state);
+    if let std::collections::hash_map::Entry::Vacant(entry) = strategy_map.entry(key) {
+        let strat = query_policy(game, state, policies, encoder)?;
+        entry.insert(strat);
+    }
+
+    let actions = game.actions(state);
+    for action in actions {
+        let next = game.next_state(state, action);
+        extract_strategies_dfs(game, &next, policies, encoder, strategy_map)?;
+    }
+    Ok(())
+}
+
+/// Query the neural network policy for the current player at the given state.
+fn query_policy(
+    game: &HunlPostflop,
+    state: &PostflopState,
+    policies: &[poker_solver_deep_cfr::eval::ExplicitPolicy; 2],
+    encoder: &poker_solver_deep_cfr::hunl_encoder::HunlStateEncoder,
+) -> Result<Vec<f64>, poker_solver_deep_cfr::SdCfrError> {
+    use poker_solver_deep_cfr::traverse::StateEncoder;
+
+    let player = game.player(state);
+    let pi = match player {
+        Player::Player1 => 0,
+        Player::Player2 => 1,
+    };
+    let features = encoder.encode(state, player);
+    let probs = policies[pi].strategy(&features)?;
+
+    let actions = game.actions(state);
+    let n = actions.len().min(probs.len());
+    Ok(probs[..n].iter().map(|&p| f64::from(p)).collect())
 }
 
 fn run_generate_deals(

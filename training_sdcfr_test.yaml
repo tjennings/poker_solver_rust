@@ -1,0 +1,32 @@
+game:
+  stack_depth: 10
+  bet_sizes: [0.5, 1.0]
+  max_raises_per_street: 2
+
+deals:
+  count: 100
+  min_per_class: 0
+  max_rejections: 0
+  seed: 42
+
+training:
+  iterations: 3
+  traversals_per_iter: 50
+  seed: 42
+  output_dir: "./test_sdcfr_output"
+
+network:
+  hidden_dim: 32
+  num_actions: 5
+
+sgd:
+  steps: 20
+  batch_size: 64
+  learning_rate: 0.001
+  grad_clip_norm: 1.0
+
+memory:
+  advantage_cap: 10000
+
+checkpoint:
+  interval: 1

@@ -12,6 +12,7 @@ use candle_nn::{VarBuilder, VarMap};
 use rand::Rng;
 
 /// A single stored network snapshot.
+#[derive(Clone)]
 pub struct ModelEntry {
     /// Serialized VarMap in safetensors binary format.
     weights: Vec<u8>,
@@ -25,6 +26,7 @@ pub struct ModelEntry {
 ///
 /// Grows by one entry per player per iteration. No eviction policy --
 /// all networks are retained for weighted averaging.
+#[derive(Clone)]
 pub struct ModelBuffer {
     entries: Vec<ModelEntry>,
 }

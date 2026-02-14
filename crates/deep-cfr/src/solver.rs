@@ -23,6 +23,11 @@ use crate::traverse::{AdvantageSample, StateEncoder, traverse};
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Callback type for checkpoint notifications during training.
+///
+/// Called with `(iteration, snapshot)` every `checkpoint_interval` iterations.
+pub type CheckpointFn<'a> = &'a mut dyn FnMut(u32, &TrainedSdCfr) -> Result<(), SdCfrError>;
+
 /// The fully-trained output of an SD-CFR run: model buffers for both players.
 pub struct TrainedSdCfr {
     pub model_buffers: [ModelBuffer; 2],
@@ -65,28 +70,72 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
     }
 
     /// Run one full CFR iteration: update both players sequentially.
+    ///
+    /// Delegates to [`step_with_deals`](Self::step_with_deals) with no deal pool.
     pub fn step(&mut self) -> Result<(), SdCfrError> {
+        self.step_with_deals(None)
+    }
+
+    /// Run one full CFR iteration using an optional external deal pool.
+    ///
+    /// If `deal_pool` is `Some`, samples from it instead of calling
+    /// `game.initial_states()` each iteration.
+    pub fn step_with_deals(&mut self, deal_pool: Option<&[G::State]>) -> Result<(), SdCfrError> {
         self.current_iteration += 1;
         let t = self.current_iteration;
-
-        self.update_player(Player::Player1, t)?;
-        self.update_player(Player::Player2, t)?;
+        self.update_player_with_deals(Player::Player1, t, deal_pool)?;
+        self.update_player_with_deals(Player::Player2, t, deal_pool)?;
         Ok(())
     }
 
     /// Run all T iterations and return the trained model.
+    ///
+    /// Delegates to [`train_with_deals`](Self::train_with_deals) with no deal pool
+    /// and no checkpoint callback.
     pub fn train(&mut self) -> Result<TrainedSdCfr, SdCfrError> {
+        self.train_with_deals(None, None)
+    }
+
+    /// Run all T iterations with optional pre-generated deal pool and checkpoint callback.
+    ///
+    /// - `deal_pool`: If `Some`, samples from this pool instead of calling
+    ///   `game.initial_states()` each iteration.
+    /// - `checkpoint_cb`: If `Some`, called every `config.checkpoint_interval` iterations
+    ///   with the current iteration number and a snapshot of the model buffers.
+    pub fn train_with_deals(
+        &mut self,
+        deal_pool: Option<&[G::State]>,
+        mut checkpoint_cb: Option<CheckpointFn<'_>>,
+    ) -> Result<TrainedSdCfr, SdCfrError> {
         let total = self.config.cfr_iterations;
+        let interval = self.config.checkpoint_interval;
+
         for _ in 0..total {
-            self.step()?;
+            self.step_with_deals(deal_pool)?;
+            self.maybe_checkpoint(interval, &mut checkpoint_cb)?;
         }
-        Ok(TrainedSdCfr {
+        Ok(self.take_result())
+    }
+
+    /// Clone the current model buffers and config into a `TrainedSdCfr` snapshot.
+    ///
+    /// Does not consume or modify the solver state.
+    pub fn snapshot(&self) -> TrainedSdCfr {
+        TrainedSdCfr {
+            model_buffers: [self.model_buffers[0].clone(), self.model_buffers[1].clone()],
+            config: self.config.clone(),
+        }
+    }
+
+    /// Take the model buffers out of the solver, leaving empty defaults behind.
+    pub fn take_result(&mut self) -> TrainedSdCfr {
+        TrainedSdCfr {
             model_buffers: [
                 std::mem::take(&mut self.model_buffers[0]),
                 std::mem::take(&mut self.model_buffers[1]),
             ],
             config: self.config.clone(),
-        })
+        }
     }
 
     /// Current iteration number (0 before any step).
@@ -101,12 +150,35 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
 
 impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
     /// Run K traversals for one player, then train and store the value net.
-    fn update_player(&mut self, player: Player, iteration: u32) -> Result<(), SdCfrError> {
+    ///
+    /// If `deal_pool` is `Some`, samples initial states from it; otherwise
+    /// calls `game.initial_states()`.
+    fn update_player_with_deals(
+        &mut self,
+        player: Player,
+        iteration: u32,
+        deal_pool: Option<&[G::State]>,
+    ) -> Result<(), SdCfrError> {
         let pi = player_index(player);
         let value_net = self.get_or_init_value_net(pi)?;
-
-        self.run_traversals(player, iteration, &value_net)?;
+        self.run_traversals_with_deals(player, iteration, &value_net, deal_pool)?;
         self.train_and_store(pi, iteration)
+    }
+
+    /// Invoke the checkpoint callback if the interval is reached.
+    fn maybe_checkpoint(
+        &self,
+        interval: u32,
+        cb: &mut Option<CheckpointFn<'_>>,
+    ) -> Result<(), SdCfrError> {
+        if interval == 0 || !self.current_iteration.is_multiple_of(interval) {
+            return Ok(());
+        }
+        if let Some(f) = cb {
+            let snap = self.snapshot();
+            f(self.current_iteration, &snap)?;
+        }
+        Ok(())
     }
 
     /// Obtain the current value net for player `pi`, creating a read-only copy.
@@ -127,18 +199,29 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
     }
 
     /// Run K traversals for `player`, accumulating samples in the advantage buffer.
-    fn run_traversals(
+    ///
+    /// If `deal_pool` is `Some`, samples initial states from the provided slice;
+    /// otherwise falls back to calling `game.initial_states()`.
+    fn run_traversals_with_deals(
         &mut self,
         player: Player,
         iteration: u32,
         value_net: &AdvantageNet,
+        deal_pool: Option<&[G::State]>,
     ) -> Result<(), SdCfrError> {
-        let initial_states = self.game.initial_states();
+        let fallback;
+        let states: &[G::State] = match deal_pool {
+            Some(pool) => pool,
+            None => {
+                fallback = self.game.initial_states();
+                &fallback
+            }
+        };
         let pi = player_index(player);
 
         for _ in 0..self.config.traversals_per_iter {
-            let idx = self.rng.random_range(0..initial_states.len());
-            let state = &initial_states[idx];
+            let idx = self.rng.random_range(0..states.len());
+            let state = &states[idx];
             traverse(
                 &self.game,
                 state,
@@ -442,6 +525,7 @@ mod tests {
             learning_rate: 0.001,
             grad_clip_norm: 1.0,
             seed: 42,
+            checkpoint_interval: 0,
         }
     }
 
@@ -602,6 +686,7 @@ mod tests {
             learning_rate: 0.001,
             grad_clip_norm: 1.0,
             seed: 123,
+            checkpoint_interval: 0,
         };
         let mut solver = SdCfrSolver::new(game, encoder, config).unwrap();
 
@@ -665,5 +750,176 @@ mod tests {
 
         let result = train_value_net(&buffer, &config, 1, &device, &mut rng);
         assert!(result.is_err(), "should error on empty buffer");
+    }
+
+    // -----------------------------------------------------------------------
+    // Deal pool + checkpoint callback tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn train_with_deal_pool_uses_provided_states() {
+        let game = KuhnPoker::new();
+        let encoder = KuhnEncoder::new();
+        let deals = game.initial_states();
+        let config = test_config();
+        let mut solver = SdCfrSolver::new(game, encoder, config).unwrap();
+
+        let result = solver.train_with_deals(Some(&deals), None);
+        assert!(
+            result.is_ok(),
+            "train_with_deals(Some, None) should succeed"
+        );
+
+        let trained = result.unwrap();
+        assert_eq!(
+            trained.model_buffers[0].len(),
+            3,
+            "P1 model buffer should have 3 entries (cfr_iterations=3)"
+        );
+        assert_eq!(
+            trained.model_buffers[1].len(),
+            3,
+            "P2 model buffer should have 3 entries (cfr_iterations=3)"
+        );
+    }
+
+    #[test]
+    fn train_with_checkpoint_callback_is_called() {
+        let game = KuhnPoker::new();
+        let encoder = KuhnEncoder::new();
+        let config = SdCfrConfig {
+            cfr_iterations: 4,
+            checkpoint_interval: 2,
+            ..test_config()
+        };
+        let mut solver = SdCfrSolver::new(game, encoder, config).unwrap();
+
+        let mut call_count = 0u32;
+        let mut seen_iterations = Vec::new();
+        let result = solver.train_with_deals(
+            None,
+            Some(&mut |iter, trained: &TrainedSdCfr| {
+                call_count += 1;
+                seen_iterations.push(iter);
+                // Verify snapshot has correct number of entries at checkpoint time
+                assert_eq!(
+                    trained.model_buffers[0].len(),
+                    iter as usize,
+                    "snapshot at iter {iter} should have {iter} P1 entries"
+                );
+                Ok(())
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "train_with_deals with callback should succeed"
+        );
+        assert_eq!(
+            call_count, 2,
+            "callback should fire exactly twice (iters 2 and 4)"
+        );
+        assert_eq!(seen_iterations, vec![2, 4]);
+    }
+
+    #[test]
+    fn train_with_deals_none_falls_back_to_game() {
+        let game = KuhnPoker::new();
+        let encoder = KuhnEncoder::new();
+        let config = test_config();
+        let mut solver = SdCfrSolver::new(game, encoder, config).unwrap();
+
+        let result = solver.train_with_deals(None, None);
+        assert!(
+            result.is_ok(),
+            "train_with_deals(None, None) should behave like train()"
+        );
+
+        let trained = result.unwrap();
+        assert_eq!(trained.model_buffers[0].len(), 3);
+        assert_eq!(trained.model_buffers[1].len(), 3);
+    }
+
+    #[test]
+    fn existing_train_still_works() {
+        let game = KuhnPoker::new();
+        let encoder = KuhnEncoder::new();
+        let config = SdCfrConfig {
+            cfr_iterations: 5,
+            traversals_per_iter: 50,
+            advantage_memory_cap: 5_000,
+            hidden_dim: 16,
+            num_actions: 2,
+            sgd_steps: 10,
+            batch_size: 32,
+            learning_rate: 0.001,
+            grad_clip_norm: 1.0,
+            seed: 123,
+            checkpoint_interval: 0,
+        };
+        let mut solver = SdCfrSolver::new(game, encoder, config).unwrap();
+
+        let result = solver.train();
+        assert!(result.is_ok(), "delegating train() should still work");
+
+        let trained = result.unwrap();
+        assert_eq!(trained.model_buffers[0].len(), 5);
+        assert_eq!(trained.model_buffers[1].len(), 5);
+    }
+
+    #[test]
+    fn step_with_deals_uses_provided_pool() {
+        let game = KuhnPoker::new();
+        let encoder = KuhnEncoder::new();
+        let deals = game.initial_states();
+        let config = test_config();
+        let mut solver = SdCfrSolver::new(game, encoder, config).unwrap();
+
+        solver.step_with_deals(Some(&deals)).unwrap();
+
+        assert_eq!(solver.iteration(), 1);
+        assert_eq!(solver.model_buffers[0].len(), 1);
+        assert_eq!(solver.model_buffers[1].len(), 1);
+    }
+
+    #[test]
+    fn snapshot_clones_current_state() {
+        let game = KuhnPoker::new();
+        let encoder = KuhnEncoder::new();
+        let config = test_config();
+        let mut solver = SdCfrSolver::new(game, encoder, config).unwrap();
+
+        solver.step().unwrap();
+        let snap = solver.snapshot();
+
+        assert_eq!(snap.model_buffers[0].len(), 1);
+        assert_eq!(snap.model_buffers[1].len(), 1);
+
+        // Original solver still has its buffers (snapshot is independent)
+        solver.step().unwrap();
+        assert_eq!(solver.model_buffers[0].len(), 2);
+        assert_eq!(
+            snap.model_buffers[0].len(),
+            1,
+            "snapshot should be independent"
+        );
+    }
+
+    #[test]
+    fn take_result_empties_solver_buffers() {
+        let game = KuhnPoker::new();
+        let encoder = KuhnEncoder::new();
+        let config = test_config();
+        let mut solver = SdCfrSolver::new(game, encoder, config).unwrap();
+
+        solver.step().unwrap();
+        solver.step().unwrap();
+
+        let result = solver.take_result();
+        assert_eq!(result.model_buffers[0].len(), 2);
+        assert_eq!(result.model_buffers[1].len(), 2);
+
+        // Solver buffers should be empty after take
+        assert_eq!(solver.model_buffers[0].len(), 0);
+        assert_eq!(solver.model_buffers[1].len(), 0);
     }
 }
