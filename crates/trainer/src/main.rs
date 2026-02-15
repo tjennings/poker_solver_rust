@@ -987,9 +987,36 @@ fn run_sdcfr_training(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let num_actions = config.network.num_actions;
     let hidden_dim = config.network.hidden_dim;
 
+    // Derive action labels from a single deal (same pattern as MCCFR setup)
+    let label_game = HunlPostflop::new(config.game.clone(), None, 1);
+    let initial_states = label_game.initial_states();
+    let actions = label_game.actions(&initial_states[0]);
+    let action_labels = format_action_labels(&actions);
+    let header = format_table_header(&action_labels);
+
+    let total_iterations = config.training.iterations;
+    let checkpoint_interval = config.checkpoint.interval;
+    let total_checkpoints = total_iterations / checkpoint_interval;
+    let training_start = Instant::now();
+    let mut previous_strategies: Option<FxHashMap<u64, Vec<f64>>> = None;
+    let mut checkpoint_count = 0u64;
+
+    let mut report_state = SdCfrReportState {
+        training_start: &training_start,
+        header: &header,
+        action_labels: &action_labels,
+        previous_strategies: &mut previous_strategies,
+        checkpoint_count: 0,
+        total_checkpoints: u64::from(total_checkpoints),
+        total_iterations: u64::from(total_iterations),
+        stack_depth: config.game.stack_depth,
+    };
+
     let mut checkpoint_cb = |iteration: u32,
                              trained: &poker_solver_deep_cfr::solver::TrainedSdCfr|
      -> Result<(), poker_solver_deep_cfr::SdCfrError> {
+        checkpoint_count += 1;
+        report_state.checkpoint_count = checkpoint_count;
         save_sdcfr_checkpoint(
             trained,
             iteration,
@@ -997,6 +1024,7 @@ fn run_sdcfr_training(config_path: &Path) -> Result<(), Box<dyn Error>> {
             &game_config,
             num_actions,
             hidden_dim,
+            &mut report_state,
         )
     };
 
@@ -1061,6 +1089,18 @@ fn print_sdcfr_summary(
     );
 }
 
+/// Mutable state carried across SD-CFR checkpoints for reporting.
+struct SdCfrReportState<'a> {
+    training_start: &'a Instant,
+    header: &'a str,
+    action_labels: &'a [String],
+    previous_strategies: &'a mut Option<FxHashMap<u64, Vec<f64>>>,
+    checkpoint_count: u64,
+    total_checkpoints: u64,
+    total_iterations: u64,
+    stack_depth: u32,
+}
+
 fn save_sdcfr_checkpoint(
     trained: &poker_solver_deep_cfr::solver::TrainedSdCfr,
     iteration: u32,
@@ -1068,13 +1108,32 @@ fn save_sdcfr_checkpoint(
     game_config: &PostflopConfig,
     num_actions: usize,
     hidden_dim: usize,
+    report: &mut SdCfrReportState<'_>,
 ) -> Result<(), poker_solver_deep_cfr::SdCfrError> {
     let device = candle_core::Device::Cpu;
-    println!("\n  Checkpoint at iteration {iteration}...");
 
     let policies = build_explicit_policies(trained, num_actions, hidden_dim, &device)?;
     let strategy_map = walk_deals_for_strategies(game_config, &policies)?;
-    println!("    {} info sets extracted", strategy_map.len());
+
+    let report_ctx = StrategyReportCtx {
+        strategies: &strategy_map,
+        previous: report.previous_strategies,
+        checkpoint_num: report.checkpoint_count,
+        is_convergence: false,
+        total_checkpoints: report.total_checkpoints,
+        total_iterations: report.total_iterations,
+        current_iterations: u64::from(iteration),
+        training_start: report.training_start,
+        header: report.header,
+        action_labels: report.action_labels,
+        stack_depth: report.stack_depth,
+        abs_mode: AbstractionModeConfig::default(),
+        convergence_threshold: None,
+        max_regret: None,
+    };
+    print_strategy_report(&report_ctx);
+
+    *report.previous_strategies = Some(strategy_map.clone());
 
     save_strategy_bundle(game_config, strategy_map, iteration, output_dir)
 }
@@ -2321,6 +2380,7 @@ fn print_strategy_report(ctx: &StrategyReportCtx) -> Option<f64> {
     };
 
     print_preflop_table(ctx);
+    print_flop_strategies(ctx.strategies, ctx.abs_mode);
     print_river_strategies(ctx.strategies, ctx.abs_mode);
 
     delta
@@ -2538,6 +2598,21 @@ const RIVER_DISPLAY_CLASSES: &[HandClass] = &[
     HandClass::HighCard,
 ];
 
+/// Hand classes to display in the flop strategy table (made hands + draws).
+const FLOP_DISPLAY_CLASSES: &[HandClass] = &[
+    HandClass::Flush,
+    HandClass::Straight,
+    HandClass::Set,
+    HandClass::TwoPair,
+    HandClass::Overpair,
+    HandClass::Pair,
+    HandClass::HighCard,
+    HandClass::ComboDraw,
+    HandClass::FlushDraw,
+    HandClass::Oesd,
+    HandClass::Gutshot,
+];
+
 /// Return the strongest (lowest-discriminant) made-hand class for a hand_bits value,
 /// or `None` if no recognized class is set.
 ///
@@ -2553,18 +2628,28 @@ fn strongest_class(hand_bits: u32, abs_mode: AbstractionModeConfig) -> Option<Ha
 }
 
 
-/// Group key for river scenarios: (spr_bucket, actions_bits).
-type RiverScenario = (u32, u32);
+/// Group key for postflop scenarios: (spr_bucket, actions_bits).
+type PostflopScenario = (u32, u32);
 
-/// Print river strategy tables for the most populated first-to-act and facing-bet scenarios.
-fn print_river_strategies(strategies: &FxHashMap<u64, Vec<f64>>, abs_mode: AbstractionModeConfig) {
-    // Collect river keys grouped by scenario
-    let mut first_to_act: FxHashMap<RiverScenario, Vec<(u32, Vec<f64>)>> = FxHashMap::default();
-    let mut facing_action: FxHashMap<RiverScenario, Vec<(u32, Vec<f64>)>> = FxHashMap::default();
+/// Print postflop strategy tables for a given street.
+fn print_postflop_strategies(
+    strategies: &FxHashMap<u64, Vec<f64>>,
+    abs_mode: AbstractionModeConfig,
+    street_code: u8,
+    street_name: &str,
+    display_classes: &[HandClass],
+) {
+    if !abs_mode.is_hand_class() {
+        return;
+    }
+
+    // Collect keys for the target street, grouped by scenario
+    let mut first_to_act: FxHashMap<PostflopScenario, Vec<(u32, Vec<f64>)>> = FxHashMap::default();
+    let mut facing_action: FxHashMap<PostflopScenario, Vec<(u32, Vec<f64>)>> = FxHashMap::default();
 
     for (&raw_key, probs) in strategies {
         let key = InfoKey::from_raw(raw_key);
-        if key.street() != 3 {
+        if key.street() != street_code {
             continue;
         }
         let hand_bits = key.hand_bits();
@@ -2589,21 +2674,31 @@ fn print_river_strategies(strategies: &FxHashMap<u64, Vec<f64>>, abs_mode: Abstr
         let entries = &first_to_act[&scenario];
         let num_actions = entries.first().map_or(0, |(_, p)| p.len());
         let labels = first_to_act_labels(num_actions);
-        print_river_table("first to act", scenario, entries, &labels, abs_mode);
+        print_postflop_table(street_name, "first to act", scenario, entries, &labels, abs_mode, display_classes);
     }
 
     if let Some(scenario) = most_populated_scenario(&facing_action) {
         let entries = &facing_action[&scenario];
         let num_actions = entries.first().map_or(0, |(_, p)| p.len());
         let labels = facing_bet_labels(num_actions);
-        print_river_table("facing bet", scenario, entries, &labels, abs_mode);
+        print_postflop_table(street_name, "facing bet", scenario, entries, &labels, abs_mode, display_classes);
     }
+}
+
+/// Print flop strategy tables for the most populated scenarios.
+fn print_flop_strategies(strategies: &FxHashMap<u64, Vec<f64>>, abs_mode: AbstractionModeConfig) {
+    print_postflop_strategies(strategies, abs_mode, 1, "Flop", FLOP_DISPLAY_CLASSES);
+}
+
+/// Print river strategy tables for the most populated first-to-act and facing-bet scenarios.
+fn print_river_strategies(strategies: &FxHashMap<u64, Vec<f64>>, abs_mode: AbstractionModeConfig) {
+    print_postflop_strategies(strategies, abs_mode, 3, "River", RIVER_DISPLAY_CLASSES);
 }
 
 /// Find the scenario key with the most entries.
 fn most_populated_scenario(
-    groups: &FxHashMap<RiverScenario, Vec<(u32, Vec<f64>)>>,
-) -> Option<RiverScenario> {
+    groups: &FxHashMap<PostflopScenario, Vec<(u32, Vec<f64>)>>,
+) -> Option<PostflopScenario> {
     groups
         .iter()
         .max_by_key(|(_, entries)| entries.len())
@@ -2634,13 +2729,15 @@ fn facing_bet_labels(num_actions: usize) -> Vec<String> {
     labels
 }
 
-/// Print a single river strategy table.
-fn print_river_table(
+/// Print a single postflop strategy table (used for both flop and river).
+fn print_postflop_table(
+    street_name: &str,
     context: &str,
-    scenario: RiverScenario,
+    scenario: PostflopScenario,
     entries: &[(u32, Vec<f64>)],
     labels: &[String],
     abs_mode: AbstractionModeConfig,
+    display_classes: &[HandClass],
 ) {
     // Deduplicate by strongest hand class — keep entry with most data
     let mut by_class: FxHashMap<u8, &Vec<f64>> = FxHashMap::default();
@@ -2660,12 +2757,12 @@ fn print_river_table(
     let separator = "-".repeat(header.len());
 
     println!(
-        "River Strategy ({context}, SPR ~{approx_spr:.1}):"
+        "{street_name} Strategy ({context}, SPR ~{approx_spr:.1}):"
     );
     println!("{header}");
     println!("{separator}");
 
-    for &class in RIVER_DISPLAY_CLASSES {
+    for &class in display_classes {
         let disc = class as u8;
         if let Some(probs) = by_class.get(&disc) {
             let prob_cols: String = probs
