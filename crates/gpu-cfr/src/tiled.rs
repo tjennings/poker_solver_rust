@@ -303,7 +303,7 @@ struct TiledTabularUniforms {
     tile_offset: u32,
     tile_size: u32,
     opp_tile_size: u32,
-    _pad0: u32,
+    n_decision: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -342,6 +342,7 @@ pub struct TiledTabularGpuCfrSolver {
     n1: u32,
     n2: u32,
     max_traj: u32,
+    n_decision: u32,
     tile_size: u32,
     num_p1_tiles: u32,
     num_p2_tiles: u32,
@@ -375,14 +376,16 @@ pub struct TiledTabularGpuCfrSolver {
     regret_delta_buffer: wgpu::Buffer,
     strat_sum_delta_buffer: wgpu::Buffer,
 
-    // GPU buffers -- Group 2: tile-sized reach/util + full info
+    // GPU buffers -- Group 2: tile-sized reach/util + tiled info
     /// Tile-sized buffer: used for reach_own or reach_opp depending on phase.
     reach_buffer: wgpu::Buffer,
     /// Tile-sized buffer: used for util_own.
     util_buffer: wgpu::Buffer,
     /// Small dummy buffer for unused bind group slots.
     dummy_buffer: wgpu::Buffer,
-    /// Full-sized info ID table.
+    /// Full transposed info ID table (trajectory-major, COPY_SRC only).
+    info_id_full_buffer: wgpu::Buffer,
+    /// Tile-sized info ID buffer for bind group binding.
     info_id_table_buffer: wgpu::Buffer,
     /// Combined weight sums [p1..., p2...].
     weight_sum_buffer: wgpu::Buffer,
@@ -426,7 +429,7 @@ impl TiledTabularGpuCfrSolver {
             return Err(GpuError::NoDeals);
         }
 
-        let tile_size = config.tile_size.unwrap_or(32768);
+        let requested_tile_size = config.tile_size.unwrap_or(32768);
 
         let step = Instant::now();
         let (device, queue) = crate::init_gpu_large_buffers()?;
@@ -436,12 +439,32 @@ impl TiledTabularGpuCfrSolver {
         let (gpu_nodes, children_flat, _lnf, _lo, _lc) = encode_tree(tree);
         let num_nodes = tree.nodes.len() as u32;
 
+        // Auto-cap tile_size to fit within GPU buffer binding limits.
+        // Largest per-tile buffers: reach/util = num_nodes × tile_size × 4,
+        // coupling matrices = tile_size² × 4.
+        let max_binding = device.limits().max_storage_buffer_binding_size as u64;
+        let max_tile_for_reach = max_binding / (u64::from(num_nodes) * 4);
+        let max_tile_for_coupling = ((max_binding / 4) as f64).sqrt() as u64;
+        let max_tile = max_tile_for_reach.min(max_tile_for_coupling) as u32;
+        let tile_size = if requested_tile_size > max_tile {
+            let capped = (max_tile / 256) * 256;
+            let capped = capped.max(256);
+            println!(
+                "  WARNING: tile_size {} exceeds GPU buffer limits (max_binding={}), capped to {}",
+                requested_tile_size, max_binding, capped
+            );
+            capped
+        } else {
+            requested_tile_size
+        };
+
         // Partition levels
         let partition = partition_levels(tree);
         let num_levels = partition.decision_counts.len();
 
         // Precompute tiled data
         let decision_nodes = collect_decision_nodes(tree);
+        let n_decision = decision_nodes.len() as u32;
         let step = Instant::now();
         let tab = precompute_tiled(tree, &deals, &decision_nodes, tile_size);
         println!(
@@ -457,18 +480,32 @@ impl TiledTabularGpuCfrSolver {
         let num_p1_tiles = n1.div_ceil(tile_size);
         let num_p2_tiles = n2.div_ceil(tile_size);
 
+        // Transpose info_id_table from decision-major to trajectory-major layout
+        // so each tile's data is a contiguous slice for GPU→GPU copy.
+        let nd = n_decision as usize;
+        let mt = max_traj as usize;
+        let mut info_id_transposed = vec![u32::MAX; mt * nd];
+        for d in 0..nd {
+            for t in 0..mt {
+                info_id_transposed[t * nd + d] = tab.info_id_table[d * mt + t];
+            }
+        }
+        drop(tab.info_id_table);
+
         // Buffer sizes
         let state_size = u64::from(num_info_sets) * u64::from(max_actions) * 4;
         let tile_reach_size = u64::from(num_nodes) * u64::from(tile_size) * 4;
         let coupling_tile_size = u64::from(tile_size) * u64::from(tile_size) * 4;
-        let info_id_size = tab.info_id_table.len() as u64 * 4;
+        let info_id_full_size = (mt * nd) as u64 * 4;
+        let info_id_tile_size = u64::from(tile_size) * u64::from(n_decision) * 4;
 
         println!(
-            "  Buffers: state={:.1}MB, tile_reach={:.1}GB, coupling_tile={:.1}GB (x3), info_id={:.1}GB",
+            "  Buffers: state={:.1}MB, tile_reach={:.1}GB, coupling_tile={:.1}GB (x3), info_id_full={:.1}GB, info_id_tile={:.1}MB",
             state_size as f64 / 1_048_576.0,
             tile_reach_size as f64 / 1e9,
             coupling_tile_size as f64 / 1e9,
-            info_id_size as f64 / 1e9,
+            info_id_full_size as f64 / 1e9,
+            info_id_tile_size as f64 / 1_048_576.0,
         );
 
         // Create GPU buffers
@@ -532,9 +569,14 @@ impl TiledTabularGpuCfrSolver {
             &device, "tiled_dummy", 4,
             wgpu::BufferUsages::STORAGE,
         );
-        let info_id_table_buffer = create_buffer_init(
-            &device, "tiled_info_id", bytemuck::cast_slice(&tab.info_id_table),
-            wgpu::BufferUsages::STORAGE,
+        let info_id_full_buffer = create_buffer_init(
+            &device, "tiled_info_id_full", bytemuck::cast_slice(&info_id_transposed),
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        drop(info_id_transposed);
+        let info_id_table_buffer = create_buffer_zeroed(
+            &device, "tiled_info_id_tile", info_id_tile_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
         let mut weight_sum_combined = tab.weight_sum_p1;
         weight_sum_combined.extend_from_slice(&tab.weight_sum_p2);
@@ -665,6 +707,7 @@ impl TiledTabularGpuCfrSolver {
             n1,
             n2,
             max_traj,
+            n_decision,
             tile_size,
             num_p1_tiles,
             num_p2_tiles,
@@ -690,6 +733,7 @@ impl TiledTabularGpuCfrSolver {
             reach_buffer,
             util_buffer,
             dummy_buffer,
+            info_id_full_buffer,
             info_id_table_buffer,
             weight_sum_buffer,
             w_tile_buffer,
@@ -881,6 +925,7 @@ impl TiledTabularGpuCfrSolver {
         let mut cpu_util = vec![0.0f32; cpu_util_size];
 
         // Phase 2: Backward terminal (doubly tiled)
+        let phase2_start = Instant::now();
         for own_tile in 0..num_own_tiles {
             let own_offset = own_tile * self.tile_size;
             let own_actual = (n_own - own_offset).min(self.tile_size);
@@ -896,6 +941,7 @@ impl TiledTabularGpuCfrSolver {
             for opp_tile in 0..num_opp_tiles {
                 let opp_offset = opp_tile * self.tile_size;
                 let opp_actual = (n_opp - opp_offset).min(self.tile_size);
+                let tile_pair_start = Instant::now();
 
                 // Recompute opponent reach via forward pass
                 self.run_forward_pass(1 - player, opp_offset, opp_actual, n_opp, n_own);
@@ -922,6 +968,19 @@ impl TiledTabularGpuCfrSolver {
                 self.dispatch_backward_terminal(
                     player, own_actual, opp_actual, n_own, n_opp, strategy_discount,
                 );
+
+                if self.iterations == 0 {
+                    let pair_idx = own_tile * num_opp_tiles + opp_tile + 1;
+                    let total_pairs = num_own_tiles * num_opp_tiles;
+                    println!(
+                        "    P{} bwd_term {}/{} [{},{}] {:.1}s (elapsed {:.0}s)",
+                        player + 1, pair_idx, total_pairs,
+                        own_tile, opp_tile,
+                        tile_pair_start.elapsed().as_secs_f64(),
+                        phase2_start.elapsed().as_secs_f64(),
+                    );
+                    flush_stdout();
+                }
             }
 
             // Download util_own from GPU to cpu_util
@@ -930,6 +989,20 @@ impl TiledTabularGpuCfrSolver {
                 own_offset as usize,
                 own_actual as usize,
                 n_own as usize,
+            );
+            if self.iterations == 0 {
+                print!(
+                    "    P{} bwd_term own_tile {}/{} ({:.0}s)\r",
+                    player + 1, own_tile + 1, num_own_tiles,
+                    phase2_start.elapsed().as_secs_f64(),
+                );
+                flush_stdout();
+            }
+        }
+        if self.iterations == 0 {
+            println!(
+                "    P{} bwd_term done in {:.1}s              ",
+                player + 1, phase2_start.elapsed().as_secs_f64(),
             );
         }
 
@@ -984,6 +1057,16 @@ impl TiledTabularGpuCfrSolver {
         // Clear reach buffer
         enc.clear_buffer(&self.reach_buffer, 0, Some(reach_bytes));
 
+        // Copy info_id tile slice (transposed layout: contiguous per tile)
+        let nd = u64::from(self.n_decision);
+        let info_src_offset = u64::from(tile_offset) * nd * 4;
+        let info_copy_size = u64::from(tile_actual) * nd * 4;
+        enc.copy_buffer_to_buffer(
+            &self.info_id_full_buffer, info_src_offset,
+            &self.info_id_table_buffer, 0,
+            info_copy_size,
+        );
+
         // Create bind groups
         let bg0 = self.create_bg0_decision(0);
         let bg1 = self.create_bg1();
@@ -1026,7 +1109,6 @@ impl TiledTabularGpuCfrSolver {
                 u64::from(slot * stride),
                 bytemuck::bytes_of(&fwd_uniforms),
             );
-            let threads = count * tile_actual;
             let offset = slot * stride;
             let mut pass = enc.begin_compute_pass(
                 &wgpu::ComputePassDescriptor { label: Some("tiled_fwd_l"), ..Default::default() },
@@ -1036,7 +1118,7 @@ impl TiledTabularGpuCfrSolver {
             pass.set_bind_group(1, &bg1, &[]);
             pass.set_bind_group(2, &bg2, &[]);
             pass.set_bind_group(3, &bg3, &[]);
-            pass.dispatch_workgroups(threads.div_ceil(WORKGROUP_SIZE), 1, 1);
+            pass.dispatch_workgroups(tile_actual.div_ceil(WORKGROUP_SIZE), count, 1);
         }
 
         self.queue.submit(std::iter::once(enc.finish()));
@@ -1138,7 +1220,6 @@ impl TiledTabularGpuCfrSolver {
                 bytemuck::bytes_of(&uniforms),
             );
 
-            let threads = dec_count * tile_actual;
             let mut pass = enc.begin_compute_pass(
                 &wgpu::ComputePassDescriptor { label: Some("tiled_bd"), ..Default::default() },
             );
@@ -1147,7 +1228,7 @@ impl TiledTabularGpuCfrSolver {
             pass.set_bind_group(1, &bg1, &[]);
             pass.set_bind_group(2, &bg2, &[]);
             pass.set_bind_group(3, &bg3, &[]);
-            pass.dispatch_workgroups(threads.div_ceil(WORKGROUP_SIZE), 1, 1);
+            pass.dispatch_workgroups(tile_actual.div_ceil(WORKGROUP_SIZE), dec_count, 1);
         }
 
         self.queue.submit(std::iter::once(enc.finish()));
@@ -1270,7 +1351,7 @@ impl TiledTabularGpuCfrSolver {
             tile_offset,
             tile_size,
             opp_tile_size,
-            _pad0: 0,
+            n_decision: self.n_decision,
             _pad1: 0,
             _pad2: 0,
         }

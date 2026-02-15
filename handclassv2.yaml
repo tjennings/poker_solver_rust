@@ -3,7 +3,7 @@ game:
   bet_sizes: [0.5, 1.0, 1.5]
 
 training:
-  iterations: 5000                    # or use convergence_threshold instead
+  iterations: 2                    # or use convergence_threshold instead
   seed: 42
   output_dir: "./handclass_25bb_v2"
   abstraction_mode: hand_class_v2
@@ -15,3 +15,4 @@ training:
   # convergence_threshold: 0.001     # uncomment to train until converged
   # convergence_check_interval: 100
   abstract_deals_dir: ./deals
+  #tile_size: 16384

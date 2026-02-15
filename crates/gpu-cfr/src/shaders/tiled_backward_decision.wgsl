@@ -29,7 +29,7 @@ struct Uniforms {
     tile_offset: u32,
     tile_size: u32,
     opp_tile_size: u32,
-    _pad0: u32,
+    n_decision: u32,
     _pad1: u32,
     _pad2: u32,
 };
@@ -61,14 +61,11 @@ struct GpuNode {
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let thread_id = gid.x;
-    let total_threads = uniforms.level_count * uniforms.tile_size;
-    if thread_id >= total_threads {
+    let local_traj = gid.x;
+    let node_local = gid.y;
+    if local_traj >= uniforms.tile_size || node_local >= uniforms.level_count {
         return;
     }
-
-    let node_local = thread_id / uniforms.tile_size;
-    let local_traj = thread_id % uniforms.tile_size;
     let global_traj = uniforms.tile_offset + local_traj;
     let node_idx = level_nodes[uniforms.level_start + node_local];
     let node = nodes[node_idx];
@@ -83,7 +80,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if node.node_type == uniforms.player {
         // ---- Own player's decision node ----
 
-        let info_id = info_id_table[node.decision_idx * uniforms.max_traj + global_traj];
+        let info_id = info_id_table[local_traj * uniforms.n_decision + node.decision_idx];
         let strat_base = info_id * uniforms.max_actions;
 
         // Compute node utility (weighted average by strategy)

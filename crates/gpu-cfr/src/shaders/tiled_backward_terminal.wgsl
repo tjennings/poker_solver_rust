@@ -32,7 +32,7 @@ struct Uniforms {
     tile_offset: u32,
     tile_size: u32,
     opp_tile_size: u32,
-    _pad0: u32,
+    n_decision: u32,
     _pad1: u32,
     _pad2: u32,
 };
