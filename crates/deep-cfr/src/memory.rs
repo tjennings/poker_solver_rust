@@ -83,6 +83,11 @@ impl<T: Clone + Send> ReservoirBuffer<T> {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+
+    /// Borrow the stored samples as a slice.
+    pub fn data(&self) -> &[T] {
+        &self.data
+    }
 }
 
 #[cfg(test)]

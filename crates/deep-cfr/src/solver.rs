@@ -344,7 +344,8 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
 
 /// Train a fresh advantage network from scratch on the reservoir buffer.
 ///
-/// Uses weighted MSE loss with linear CFR weighting (weight = sample.iteration / max_iteration).
+/// Pre-uploads the entire buffer to GPU once, then samples mini-batches via
+/// `index_select` to avoid per-step CPU allocation and CPU→GPU transfers.
 fn train_value_net(
     buffer: &ReservoirBuffer<AdvantageSample>,
     config: &SdCfrConfig,
@@ -361,12 +362,12 @@ fn train_value_net(
     let mut opt = candle_nn::AdamW::new_lr(vars.clone(), config.learning_rate)?;
     let log_interval = sgd_log_interval(config.sgd_steps);
 
+    let gpu = buffer_to_gpu_tensors(buffer, max_iteration, config.num_actions, device)?;
+    let n = gpu.len;
+
     for step in 0..config.sgd_steps {
-        let batch = buffer.sample_batch(config.batch_size, rng);
-        if batch.is_empty() {
-            continue;
-        }
-        let loss = compute_batch_loss(&net, &batch, max_iteration, config.num_actions, device)?;
+        let indices = random_index_tensor(config.batch_size.min(n), n, rng, device)?;
+        let loss = compute_batch_loss_gpu(&net, &gpu, &indices)?;
         if log_interval > 0 && step > 0 && step % log_interval == 0 {
             let loss_val = loss.to_scalar::<f32>()?;
             eprintln!(
@@ -382,6 +383,99 @@ fn train_value_net(
     Ok((net, varmap))
 }
 
+// ---------------------------------------------------------------------------
+// GPU-resident training data
+// ---------------------------------------------------------------------------
+
+/// All training data pre-uploaded to the compute device.
+struct GpuTrainingData {
+    cards: Tensor,   // [N, 7] i64
+    bets: Tensor,    // [N, 48] f32
+    targets: Tensor, // [N, num_actions] f32
+    weights: Tensor, // [N, 1] f32
+    len: usize,
+}
+
+/// Convert the entire reservoir buffer into GPU-resident tensors.
+fn buffer_to_gpu_tensors(
+    buffer: &ReservoirBuffer<AdvantageSample>,
+    max_iteration: u32,
+    num_actions: usize,
+    device: &Device,
+) -> Result<GpuTrainingData, SdCfrError> {
+    let data = buffer.data();
+    let n = data.len();
+    let max_iter_f = f64::from(max_iteration).max(1.0);
+
+    let card_data = collect_card_data_slice(data);
+    let bet_data = collect_bet_data_slice(data);
+    let (target_data, weight_data) = collect_targets_and_weights_slice(data, num_actions, max_iter_f);
+
+    let cards = Tensor::from_vec(card_data, &[n, 7], device)?;
+    let bets = Tensor::from_vec(bet_data, &[n, 48], device)?;
+    let targets = Tensor::from_vec(target_data, &[n, num_actions], device)?;
+    let weights = Tensor::from_vec(weight_data, &[n, 1], device)?;
+
+    Ok(GpuTrainingData { cards, bets, targets, weights, len: n })
+}
+
+/// Generate a tensor of `batch_size` random indices in `[0, n)`.
+fn random_index_tensor(
+    batch_size: usize,
+    n: usize,
+    rng: &mut impl Rng,
+    device: &Device,
+) -> Result<Tensor, SdCfrError> {
+    let indices: Vec<u32> = (0..batch_size)
+        .map(|_| rng.random_range(0..n as u32))
+        .collect();
+    Ok(Tensor::from_vec(indices, &[batch_size], device)?)
+}
+
+/// Compute weighted MSE loss from pre-uploaded GPU tensors using index_select.
+fn compute_batch_loss_gpu(
+    net: &AdvantageNet,
+    gpu: &GpuTrainingData,
+    indices: &Tensor,
+) -> Result<Tensor, SdCfrError> {
+    let cards = gpu.cards.index_select(indices, 0)?;
+    let bets = gpu.bets.index_select(indices, 0)?;
+    let targets = gpu.targets.index_select(indices, 0)?;
+    let weights = gpu.weights.index_select(indices, 0)?;
+    let predictions = net.forward(&cards, &bets)?;
+    weighted_mse(&predictions, &targets, &weights)
+}
+
+/// Flatten card features from a slice of samples.
+fn collect_card_data_slice(data: &[AdvantageSample]) -> Vec<i64> {
+    data.iter()
+        .flat_map(|s| s.features.cards.iter().map(|&c| i64::from(c)))
+        .collect()
+}
+
+/// Flatten bet features from a slice of samples.
+fn collect_bet_data_slice(data: &[AdvantageSample]) -> Vec<f32> {
+    data.iter()
+        .flat_map(|s| s.features.bets.iter().copied())
+        .collect()
+}
+
+/// Build padded targets and weights from a slice of samples.
+fn collect_targets_and_weights_slice(
+    data: &[AdvantageSample],
+    num_actions: usize,
+    max_iter_f: f64,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut targets = Vec::with_capacity(data.len() * num_actions);
+    let mut weights = Vec::with_capacity(data.len());
+    for sample in data {
+        let w = f64::from(sample.iteration) / max_iter_f;
+        weights.push(w as f32);
+        targets.extend(pad_advantages(&sample.advantages, num_actions));
+    }
+    (targets, weights)
+}
+
 /// Create a fresh AdvantageNet with random weights.
 fn create_fresh_net(
     config: &SdCfrConfig,
@@ -391,83 +485,6 @@ fn create_fresh_net(
     let vs = VarBuilder::from_varmap(&varmap, DType::F32, device);
     let net = AdvantageNet::new(config.num_actions, config.hidden_dim, &vs)?;
     Ok((varmap, net))
-}
-
-// ---------------------------------------------------------------------------
-// Loss computation
-// ---------------------------------------------------------------------------
-
-/// Compute weighted MSE loss for a mini-batch of advantage samples.
-///
-/// Loss = sum(w_i * ||pred_i - target_i||^2) / sum(w_i)
-fn compute_batch_loss(
-    net: &AdvantageNet,
-    batch: &[&AdvantageSample],
-    max_iteration: u32,
-    num_actions: usize,
-    device: &Device,
-) -> Result<Tensor, SdCfrError> {
-    let (cards, bets, targets, weights) =
-        samples_to_tensors(batch, max_iteration, num_actions, device)?;
-    let predictions = net.forward(&cards, &bets)?;
-    weighted_mse(&predictions, &targets, &weights)
-}
-
-/// Convert advantage samples into batched tensors for training.
-///
-/// Returns (card_indices, bet_features, target_advantages, weights).
-fn samples_to_tensors(
-    batch: &[&AdvantageSample],
-    max_iteration: u32,
-    num_actions: usize,
-    device: &Device,
-) -> Result<(Tensor, Tensor, Tensor, Tensor), SdCfrError> {
-    let b = batch.len();
-    let max_iter_f = f64::from(max_iteration).max(1.0);
-
-    let card_data = collect_card_data(batch);
-    let bet_data = collect_bet_data(batch);
-    let (target_data, weight_data) = collect_targets_and_weights(batch, num_actions, max_iter_f);
-
-    let cards = Tensor::from_vec(card_data, &[b, 7], device)?;
-    let bets = Tensor::from_vec(bet_data, &[b, 48], device)?;
-    let targets = Tensor::from_vec(target_data, &[b, num_actions], device)?;
-    let weights = Tensor::from_vec(weight_data, &[b, 1], device)?;
-
-    Ok((cards, bets, targets, weights))
-}
-
-/// Flatten card features from all samples into a contiguous i64 vector.
-fn collect_card_data(batch: &[&AdvantageSample]) -> Vec<i64> {
-    batch
-        .iter()
-        .flat_map(|s| s.features.cards.iter().map(|&c| i64::from(c)))
-        .collect()
-}
-
-/// Flatten bet features from all samples into a contiguous f32 vector.
-fn collect_bet_data(batch: &[&AdvantageSample]) -> Vec<f32> {
-    batch
-        .iter()
-        .flat_map(|s| s.features.bets.iter().copied())
-        .collect()
-}
-
-/// Build padded target advantages and linear CFR weights for each sample.
-fn collect_targets_and_weights(
-    batch: &[&AdvantageSample],
-    num_actions: usize,
-    max_iter_f: f64,
-) -> (Vec<f32>, Vec<f32>) {
-    let mut targets = Vec::with_capacity(batch.len() * num_actions);
-    let mut weights = Vec::with_capacity(batch.len());
-
-    for sample in batch {
-        let w = f64::from(sample.iteration) / max_iter_f;
-        weights.push(w as f32);
-        targets.extend(pad_advantages(&sample.advantages, num_actions));
-    }
-    (targets, weights)
 }
 
 /// Pad advantage values to `num_actions` width, filling extra slots with 0.
@@ -724,11 +741,13 @@ mod tests {
             buffer.push(sample, &mut rng);
         }
 
-        // Compute loss before training (random net)
         let device = Device::Cpu;
+        let gpu = buffer_to_gpu_tensors(&buffer, 1, config.num_actions, &device).unwrap();
+        let all_indices = random_index_tensor(config.batch_size, gpu.len, &mut rng, &device).unwrap();
+
+        // Compute loss before training (random net)
         let (_, initial_net) = create_fresh_net(&config, &device).unwrap();
-        let batch = buffer.sample_batch(config.batch_size, &mut rng);
-        let initial_loss = compute_batch_loss(&initial_net, &batch, 1, config.num_actions, &device)
+        let initial_loss = compute_batch_loss_gpu(&initial_net, &gpu, &all_indices)
             .unwrap()
             .to_scalar::<f32>()
             .unwrap();
@@ -738,9 +757,7 @@ mod tests {
         let (trained_net, _) = train_value_net(&buffer, &config, 1, &device, &mut rng2).unwrap();
 
         // Compute loss after training
-        let mut rng3 = StdRng::seed_from_u64(42);
-        let batch = buffer.sample_batch(config.batch_size, &mut rng3);
-        let final_loss = compute_batch_loss(&trained_net, &batch, 1, config.num_actions, &device)
+        let final_loss = compute_batch_loss_gpu(&trained_net, &gpu, &all_indices)
             .unwrap()
             .to_scalar::<f32>()
             .unwrap();
