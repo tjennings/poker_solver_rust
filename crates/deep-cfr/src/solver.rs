@@ -18,6 +18,7 @@ use crate::config::SdCfrConfig;
 use crate::memory::ReservoirBuffer;
 use crate::model_buffer::ModelBuffer;
 use crate::network::AdvantageNet;
+use crate::batched_traverse::traverse_batched;
 use crate::traverse::{AdvantageSample, StateEncoder, traverse};
 
 // ---------------------------------------------------------------------------
@@ -218,6 +219,9 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
     ///
     /// If `deal_pool` is `Some`, samples initial states from the provided slice;
     /// otherwise falls back to calling `game.initial_states()`.
+    ///
+    /// When `parallel_traversals > 1`, uses the batched traversal engine for
+    /// GPU-efficient NN inference. Otherwise falls back to sequential traversal.
     fn run_traversals_with_deals(
         &mut self,
         player: Player,
@@ -233,6 +237,22 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
                 &fallback
             }
         };
+
+        if self.config.parallel_traversals > 1 {
+            self.run_traversals_batched(player, iteration, value_net, states)
+        } else {
+            self.run_traversals_sequential(player, iteration, value_net, states)
+        }
+    }
+
+    /// Sequential traversal path: one traversal at a time (original behavior).
+    fn run_traversals_sequential(
+        &mut self,
+        player: Player,
+        iteration: u32,
+        value_net: &AdvantageNet,
+        states: &[G::State],
+    ) -> Result<(), SdCfrError> {
         let pi = player_index(player);
         let total = self.config.traversals_per_iter;
         let log_interval = traversal_log_interval(total);
@@ -260,6 +280,46 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
                 &self.device,
             )?;
         }
+        Ok(())
+    }
+
+    /// Batched traversal path: run B traversals concurrently with batched NN inference.
+    fn run_traversals_batched(
+        &mut self,
+        player: Player,
+        iteration: u32,
+        value_net: &AdvantageNet,
+        states: &[G::State],
+    ) -> Result<(), SdCfrError> {
+        let pi = player_index(player);
+        let total = self.config.traversals_per_iter;
+        let batch_size = self.config.parallel_traversals;
+
+        let samples = traverse_batched(
+            &self.game,
+            states,
+            player,
+            iteration,
+            value_net,
+            &self.encoder,
+            &self.device,
+            &mut self.rng,
+            total,
+            batch_size,
+        )?;
+
+        for sample in samples {
+            self.advantage_buffers[pi].push(sample, &mut self.rng);
+        }
+
+        eprintln!(
+            "    [iter {iteration}] P{} batched {} traversals (batch_size={batch_size}, buf: {} stored, {} seen)",
+            pi + 1,
+            total,
+            self.advantage_buffers[pi].len(),
+            self.advantage_buffers[pi].total_seen(),
+        );
+
         Ok(())
     }
 
@@ -578,6 +638,7 @@ mod tests {
             grad_clip_norm: 1.0,
             seed: 42,
             checkpoint_interval: 0,
+            parallel_traversals: 1,
         }
     }
 
@@ -739,6 +800,7 @@ mod tests {
             grad_clip_norm: 1.0,
             seed: 123,
             checkpoint_interval: 0,
+            parallel_traversals: 1,
         };
         let mut solver = SdCfrSolver::new(game, encoder, config).unwrap();
 
@@ -907,6 +969,7 @@ mod tests {
             grad_clip_norm: 1.0,
             seed: 123,
             checkpoint_interval: 0,
+            parallel_traversals: 1,
         };
         let mut solver = SdCfrSolver::new(game, encoder, config).unwrap();
 

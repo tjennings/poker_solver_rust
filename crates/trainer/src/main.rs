@@ -286,12 +286,18 @@ struct SdCfrDealConfig {
     seed: u64,
 }
 
+fn default_parallel_traversals() -> usize {
+    256
+}
+
 #[derive(Debug, Deserialize)]
 struct SdCfrTrainingParams {
     iterations: u32,
     traversals_per_iter: u32,
     seed: u64,
     output_dir: String,
+    #[serde(default = "default_parallel_traversals")]
+    parallel_traversals: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1082,6 +1088,7 @@ fn print_sdcfr_config(config: &SdCfrTrainingConfig) {
     println!("  Network: hidden_dim={}, num_actions={}", config.network.hidden_dim, config.network.num_actions);
     println!("  SGD: steps={}, batch={}, lr={}", config.sgd.steps, config.sgd.batch_size, config.sgd.learning_rate);
     println!("  Memory cap: {}", config.memory.advantage_cap);
+    println!("  Parallel traversals: {}", config.training.parallel_traversals);
     println!("  Checkpoint every {} iters", config.checkpoint.interval);
 }
 
@@ -1098,6 +1105,7 @@ fn build_sdcfr_config(config: &SdCfrTrainingConfig) -> poker_solver_deep_cfr::Sd
         grad_clip_norm: config.sgd.grad_clip_norm,
         seed: config.training.seed,
         checkpoint_interval: config.checkpoint.interval,
+        parallel_traversals: config.training.parallel_traversals,
     }
 }
 

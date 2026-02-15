@@ -249,7 +249,7 @@ fn compute_cf_values<G: Game, E: StateEncoder<G::State>>(
 }
 
 /// Dot product of values and probabilities.
-fn weighted_sum(values: &[f64], weights: &[f32]) -> f64 {
+pub(crate) fn weighted_sum(values: &[f64], weights: &[f32]) -> f64 {
     values
         .iter()
         .zip(weights.iter())
@@ -258,7 +258,7 @@ fn weighted_sum(values: &[f64], weights: &[f32]) -> f64 {
 }
 
 /// Instantaneous advantages: `adv[a] = cf_value[a] - node_value`.
-fn compute_advantages(cf_values: &[f64], node_value: f64) -> Vec<f32> {
+pub(crate) fn compute_advantages(cf_values: &[f64], node_value: f64) -> Vec<f32> {
     cf_values.iter().map(|&v| (v - node_value) as f32).collect()
 }
 
@@ -266,7 +266,7 @@ fn compute_advantages(cf_values: &[f64], node_value: f64) -> Vec<f32> {
 ///
 /// Falls back to index 0 if all probabilities are zero (shouldn't happen
 /// with a well-formed strategy, but avoids panicking).
-fn sample_action(strategy: &[f32], rng: &mut impl Rng) -> usize {
+pub(crate) fn sample_action(strategy: &[f32], rng: &mut impl Rng) -> usize {
     let r: f32 = rng.random();
     let mut cumulative = 0.0;
     for (i, &p) in strategy.iter().enumerate() {

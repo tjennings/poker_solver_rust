@@ -1,3 +1,4 @@
+pub mod batched_traverse;
 pub mod card_features;
 pub mod config;
 pub mod eval;

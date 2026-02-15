@@ -41,6 +41,7 @@ fn small_sdcfr_config(cfr_iterations: u32, checkpoint_interval: u32) -> SdCfrCon
         grad_clip_norm: 1.0,
         seed: 42,
         checkpoint_interval,
+        parallel_traversals: 1,
     }
 }
 

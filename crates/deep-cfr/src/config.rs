@@ -23,6 +23,8 @@ pub struct SdCfrConfig {
     pub seed: u64,
     /// Save a checkpoint every N iterations (0 = disabled)
     pub checkpoint_interval: u32,
+    /// Number of traversals to run concurrently for batched NN inference (1 = sequential)
+    pub parallel_traversals: usize,
 }
 
 impl Default for SdCfrConfig {
@@ -39,6 +41,7 @@ impl Default for SdCfrConfig {
             grad_clip_norm: 1.0,
             seed: 42,
             checkpoint_interval: 0,
+            parallel_traversals: 256,
         }
     }
 }
@@ -58,6 +61,11 @@ impl SdCfrConfig {
         }
         if self.batch_size == 0 {
             return Err(crate::SdCfrError::Config("batch_size must be > 0".into()));
+        }
+        if self.parallel_traversals == 0 {
+            return Err(crate::SdCfrError::Config(
+                "parallel_traversals must be >= 1".into(),
+            ));
         }
         Ok(())
     }

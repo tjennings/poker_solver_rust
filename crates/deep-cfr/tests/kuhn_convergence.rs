@@ -86,6 +86,7 @@ fn convergence_config(seed: u64) -> SdCfrConfig {
         grad_clip_norm: 10.0,
         seed,
         checkpoint_interval: 0,
+        parallel_traversals: 1,
     }
 }
 

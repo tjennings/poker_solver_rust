@@ -12,6 +12,7 @@ deals:
 training:
   iterations: 1500
   traversals_per_iter: 1000
+  parallel_traversals: 256
   seed: 42
   output_dir: "./sdcfr_25bb"
 
@@ -20,7 +21,7 @@ network:
   num_actions: 8
 
 sgd:
-  steps: 500
+  steps: 4000
   batch_size: 4096
   learning_rate: 0.001
   grad_clip_norm: 1.0
