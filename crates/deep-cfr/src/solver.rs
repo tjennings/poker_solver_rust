@@ -143,6 +143,14 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
     pub fn iteration(&self) -> u32 {
         self.current_iteration
     }
+
+    /// Return buffer statistics: `[(stored, total_seen); 2]` for each player.
+    pub fn buffer_stats(&self) -> [(usize, u64); 2] {
+        [
+            (self.advantage_buffers[0].len(), self.advantage_buffers[0].total_seen()),
+            (self.advantage_buffers[1].len(), self.advantage_buffers[1].total_seen()),
+        ]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,8 +169,15 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
         deal_pool: Option<&[G::State]>,
     ) -> Result<(), SdCfrError> {
         let pi = player_index(player);
+        eprintln!("    P{}: traversing {} deals...", pi + 1, self.config.traversals_per_iter);
         let value_net = self.get_or_init_value_net(pi)?;
         self.run_traversals_with_deals(player, iteration, &value_net, deal_pool)?;
+        eprintln!(
+            "    P{}: training value net ({} SGD steps, {} samples)...",
+            pi + 1,
+            self.config.sgd_steps,
+            self.advantage_buffers[pi].len(),
+        );
         self.train_and_store(pi, iteration)
     }
 
@@ -219,8 +234,18 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
             }
         };
         let pi = player_index(player);
+        let total = self.config.traversals_per_iter;
+        let log_interval = traversal_log_interval(total);
 
-        for _ in 0..self.config.traversals_per_iter {
+        for k in 0..total {
+            if log_interval > 0 && k > 0 && k % log_interval == 0 {
+                eprintln!(
+                    "    [iter {iteration}] P{} traversal {k}/{total} (buf: {} stored, {} seen)",
+                    pi + 1,
+                    self.advantage_buffers[pi].len(),
+                    self.advantage_buffers[pi].total_seen(),
+                );
+            }
             let idx = self.rng.random_range(0..states.len());
             let state = &states[idx];
             traverse(
@@ -274,13 +299,21 @@ fn train_value_net(
     let (varmap, net) = create_fresh_net(config, device)?;
     let vars = varmap.all_vars();
     let mut opt = candle_nn::AdamW::new_lr(vars.clone(), config.learning_rate)?;
+    let log_interval = sgd_log_interval(config.sgd_steps);
 
-    for _ in 0..config.sgd_steps {
+    for step in 0..config.sgd_steps {
         let batch = buffer.sample_batch(config.batch_size, rng);
         if batch.is_empty() {
             continue;
         }
         let loss = compute_batch_loss(&net, &batch, max_iteration, config.num_actions, device)?;
+        if log_interval > 0 && step > 0 && step % log_interval == 0 {
+            let loss_val = loss.to_scalar::<f32>()?;
+            eprintln!(
+                "      SGD step {step}/{} loss={loss_val:.6}",
+                config.sgd_steps,
+            );
+        }
         let mut grads = loss.backward()?;
         clip_grad_store(&mut grads, &vars, config.grad_clip_norm)?;
         opt.step(&grads)?;
@@ -465,6 +498,24 @@ const fn player_index(player: Player) -> usize {
         Player::Player1 => 0,
         Player::Player2 => 1,
     }
+}
+
+/// Compute a log interval that yields ~4 log lines for a traversal loop of `total` steps.
+/// Returns 0 if total is too small to warrant logging.
+fn traversal_log_interval(total: u32) -> u32 {
+    if total < 100 {
+        return 0;
+    }
+    (total / 4).max(1)
+}
+
+/// Compute a log interval that yields ~4 log lines for an SGD loop of `total` steps.
+/// Returns 0 if total is too small to warrant logging.
+fn sgd_log_interval(total: usize) -> usize {
+    if total < 20 {
+        return 0;
+    }
+    (total / 4).max(1)
 }
 
 // ---------------------------------------------------------------------------

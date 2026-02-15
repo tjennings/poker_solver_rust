@@ -1000,7 +1000,11 @@ fn run_sdcfr_training(config_path: &Path) -> Result<(), Box<dyn Error>> {
 
     let total_iterations = config.training.iterations;
     let checkpoint_interval = config.checkpoint.interval;
-    let total_checkpoints = total_iterations / checkpoint_interval;
+    let total_checkpoints = if checkpoint_interval > 0 {
+        total_iterations / checkpoint_interval
+    } else {
+        0
+    };
     let training_start = Instant::now();
     let mut previous_strategies: Option<FxHashMap<u64, Vec<f64>>> = None;
     let mut checkpoint_count = 0u64;
@@ -1016,30 +1020,54 @@ fn run_sdcfr_training(config_path: &Path) -> Result<(), Box<dyn Error>> {
         stack_depth: config.game.stack_depth,
     };
 
-    let mut checkpoint_cb = |iteration: u32,
-                             trained: &poker_solver_deep_cfr::solver::TrainedSdCfr|
-     -> Result<(), poker_solver_deep_cfr::SdCfrError> {
-        checkpoint_count += 1;
-        report_state.checkpoint_count = checkpoint_count;
-        save_sdcfr_checkpoint(
-            trained,
-            iteration,
-            &output_dir,
-            &game_config,
-            num_actions,
-            hidden_dim,
-            &mut report_state,
-        )
-    };
-
-    println!("\nStarting SD-CFR training...");
+    println!("\nStarting SD-CFR training ({total_iterations} iterations)...");
     let start = Instant::now();
-    let trained = solver.train_with_deals(
-        Some(&deal_pool),
-        Some(&mut checkpoint_cb),
-    )?;
-    let elapsed = start.elapsed();
 
+    for i in 1..=total_iterations {
+        let iter_start = Instant::now();
+        eprintln!(
+            "  [iter {i}/{total_iterations}] starting (elapsed: {:.1}s)...",
+            start.elapsed().as_secs_f64(),
+        );
+
+        solver.step_with_deals(Some(&deal_pool))?;
+
+        let iter_elapsed = iter_start.elapsed();
+        let total_elapsed = start.elapsed().as_secs_f64();
+        let rate = f64::from(i) / total_elapsed;
+        let remaining = f64::from(total_iterations - i) / rate;
+        let stats = solver.buffer_stats();
+
+        eprintln!(
+            "  [iter {i}/{total_iterations}] done in {:.1}s | rate: {rate:.2} iter/s | \
+             buf P1: {}/{} P2: {}/{} | ETA: {:.0}s",
+            iter_elapsed.as_secs_f64(),
+            stats[0].0,
+            stats[0].1,
+            stats[1].0,
+            stats[1].1,
+            remaining,
+        );
+
+        // Run checkpoint callback at the specified interval
+        if checkpoint_interval > 0 && i % checkpoint_interval == 0 {
+            checkpoint_count += 1;
+            report_state.checkpoint_count = checkpoint_count;
+            let snap = solver.snapshot();
+            save_sdcfr_checkpoint(
+                &snap,
+                i,
+                &output_dir,
+                &game_config,
+                num_actions,
+                hidden_dim,
+                &mut report_state,
+            )?;
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let trained = solver.take_result();
     print_sdcfr_summary(&trained, elapsed);
     Ok(())
 }
