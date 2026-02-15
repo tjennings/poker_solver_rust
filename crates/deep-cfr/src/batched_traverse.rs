@@ -10,6 +10,8 @@
 //! 4. Distribute strategy results back to each traversal
 //! 5. Repeat until all traversals complete
 
+use std::collections::HashMap;
+
 use candle_core::{Device, Tensor};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -23,6 +25,53 @@ use crate::network::AdvantageNet;
 use crate::traverse::{
     AdvantageSample, StateEncoder, compute_advantages, sample_action, weighted_sum,
 };
+
+// ---------------------------------------------------------------------------
+// Strategy cache types
+// ---------------------------------------------------------------------------
+
+type StrategyCache = HashMap<CacheKey, Vec<f32>>;
+
+/// Cache key for info set features. Converts f32 bets to bit-exact u32
+/// so we can derive Hash + Eq.
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+struct CacheKey {
+    cards: [i8; 7],
+    bet_bits: [u32; BET_FEATURES],
+}
+
+impl CacheKey {
+    fn from_features(f: &InfoSetFeatures) -> Self {
+        let mut bet_bits = [0u32; BET_FEATURES];
+        for (i, &v) in f.bets.iter().enumerate() {
+            bet_bits[i] = v.to_bits();
+        }
+        Self {
+            cards: f.cards,
+            bet_bits,
+        }
+    }
+}
+
+/// Tracks cache hit/miss statistics.
+struct CacheStats {
+    hits: u64,
+    misses: u64,
+}
+
+impl CacheStats {
+    fn new() -> Self {
+        Self { hits: 0, misses: 0 }
+    }
+
+    fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            return 0.0;
+        }
+        self.hits as f64 / total as f64
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Frame & phase types
@@ -107,6 +156,8 @@ pub fn traverse_batched<G: Game, E: StateEncoder<G::State>>(
 ) -> Result<Vec<AdvantageSample>, SdCfrError> {
     let mut all_samples = Vec::new();
     let mut remaining = count;
+    let mut cache: StrategyCache = HashMap::new();
+    let mut stats = CacheStats::new();
 
     while remaining > 0 {
         let b = (remaining as usize).min(batch_size);
@@ -120,9 +171,20 @@ pub fn traverse_batched<G: Game, E: StateEncoder<G::State>>(
             device,
             main_rng,
             b,
+            &mut cache,
+            &mut stats,
         )?;
         all_samples.extend(batch_samples);
         remaining -= b as u32;
+    }
+
+    let total = stats.hits + stats.misses;
+    if total > 0 {
+        log::debug!(
+            "Strategy cache: {total} lookups, {:.1}% hit rate ({} entries)",
+            stats.hit_rate() * 100.0,
+            cache.len(),
+        );
     }
 
     Ok(all_samples)
@@ -143,6 +205,8 @@ fn run_batch<G: Game, E: StateEncoder<G::State>>(
     device: &Device,
     main_rng: &mut impl Rng,
     b: usize,
+    cache: &mut StrategyCache,
+    stats: &mut CacheStats,
 ) -> Result<Vec<AdvantageSample>, SdCfrError> {
     let mut traversals = init_traversals(game, initial_states, traverser, iteration, main_rng, b);
 
@@ -154,8 +218,8 @@ fn run_batch<G: Game, E: StateEncoder<G::State>>(
             break;
         }
 
-        // Batched NN inference
-        let strategies = batched_inference(value_net, &pending, device)?;
+        // Cached batched NN inference
+        let strategies = resolve_strategies(value_net, &pending, device, cache, stats)?;
 
         // Distribute results — opponent nodes need the game for next_state
         apply_strategies(game, &mut traversals, &pending, &strategies);
@@ -417,19 +481,57 @@ fn apply_single_strategy<G: Game>(
 }
 
 // ---------------------------------------------------------------------------
-// Batched NN inference
+// Cached batched NN inference
 // ---------------------------------------------------------------------------
 
-/// Run a single batched NN forward pass for all pending inference requests.
+/// Resolve strategies for all pending requests, using the cache when possible.
 ///
-/// Returns one strategy (action probabilities) per request, each sliced
-/// to the actual number of legal actions at that node.
-fn batched_inference(
+/// Cache hits return immediately; misses are batched into a single GPU forward
+/// pass. New results are inserted into the cache for future lookups.
+fn resolve_strategies(
     value_net: &AdvantageNet,
     pending: &[PendingInference],
     device: &Device,
+    cache: &mut StrategyCache,
+    stats: &mut CacheStats,
 ) -> Result<Vec<Vec<f32>>, SdCfrError> {
-    // Build tensors directly from pending — no intermediate Vec<InfoSetFeatures>
+    let mut strategies: Vec<Option<Vec<f32>>> = vec![None; pending.len()];
+    let mut miss_indices: Vec<usize> = Vec::new();
+
+    // Check cache for each request
+    for (i, p) in pending.iter().enumerate() {
+        let key = CacheKey::from_features(&p.features);
+        if let Some(cached) = cache.get(&key) {
+            strategies[i] = Some(cached[..p.num_actions].to_vec());
+            stats.hits += 1;
+        } else {
+            miss_indices.push(i);
+            stats.misses += 1;
+        }
+    }
+
+    // Run batched inference on misses only
+    if !miss_indices.is_empty() {
+        let miss_pending: Vec<&PendingInference> =
+            miss_indices.iter().map(|&i| &pending[i]).collect();
+        let miss_strategies = batched_inference_subset(value_net, &miss_pending, device)?;
+
+        for (&idx, strategy) in miss_indices.iter().zip(miss_strategies) {
+            let key = CacheKey::from_features(&pending[idx].features);
+            cache.insert(key, strategy.clone());
+            strategies[idx] = Some(strategy[..pending[idx].num_actions].to_vec());
+        }
+    }
+
+    Ok(strategies.into_iter().map(|s| s.expect("all resolved")).collect())
+}
+
+/// Run a single batched NN forward pass for a subset of pending requests.
+fn batched_inference_subset(
+    value_net: &AdvantageNet,
+    pending: &[&PendingInference],
+    device: &Device,
+) -> Result<Vec<Vec<f32>>, SdCfrError> {
     let b = pending.len();
     let card_data: Vec<i64> = pending
         .iter()
@@ -443,12 +545,9 @@ fn batched_inference(
     let bets = Tensor::from_vec(bet_data, &[b, BET_FEATURES], device)?;
 
     let raw_advantages = value_net.forward(&cards, &bets)?;
-
-    // Single batched advantages_to_strategy on full [B, num_actions] tensor
     let strategy_tensor = AdvantageNet::advantages_to_strategy(&raw_advantages)?;
     let all_probs = strategy_tensor.to_vec2::<f32>()?;
 
-    // Slice each row to actual num_actions on CPU (trivial)
     let strategies = pending
         .iter()
         .zip(all_probs)
@@ -736,5 +835,106 @@ mod tests {
                 "All samples should carry the iteration number"
             );
         }
+    }
+
+    #[test]
+    fn cache_key_equal_for_identical_features() {
+        let f1 = InfoSetFeatures {
+            cards: [0, 1, 2, 3, 4, -1, -1],
+            bets: [0.5f32; BET_FEATURES],
+        };
+        let f2 = InfoSetFeatures {
+            cards: [0, 1, 2, 3, 4, -1, -1],
+            bets: [0.5f32; BET_FEATURES],
+        };
+        assert_eq!(CacheKey::from_features(&f1), CacheKey::from_features(&f2));
+    }
+
+    #[test]
+    fn cache_key_differs_for_different_bets() {
+        let f1 = InfoSetFeatures {
+            cards: [0, 1, 2, 3, 4, -1, -1],
+            bets: [0.5f32; BET_FEATURES],
+        };
+        let mut bets2 = [0.5f32; BET_FEATURES];
+        bets2[0] = 0.75;
+        let f2 = InfoSetFeatures {
+            cards: [0, 1, 2, 3, 4, -1, -1],
+            bets: bets2,
+        };
+        assert_ne!(CacheKey::from_features(&f1), CacheKey::from_features(&f2));
+    }
+
+    #[test]
+    fn cached_traversal_is_deterministic() {
+        let game = KuhnPoker::new();
+        let encoder = KuhnEncoder::new();
+        let (net, _varmap) = make_kuhn_net(16);
+        let device = Device::Cpu;
+        let states = game.initial_states();
+
+        let run = |seed| {
+            let mut rng = StdRng::seed_from_u64(seed);
+            traverse_batched(
+                &game,
+                &states,
+                Player::Player1,
+                1,
+                &net,
+                &encoder,
+                &device,
+                &mut rng,
+                30,
+                8,
+            )
+            .unwrap()
+        };
+
+        let s1 = run(123);
+        let s2 = run(123);
+        assert_eq!(s1.len(), s2.len(), "same seed should produce same count");
+        for (a, b) in s1.iter().zip(s2.iter()) {
+            assert_eq!(a.advantages, b.advantages, "advantages should match");
+        }
+    }
+
+    #[test]
+    fn cache_gets_hits_on_kuhn() {
+        let game = KuhnPoker::new();
+        let encoder = KuhnEncoder::new();
+        let (net, _varmap) = make_kuhn_net(16);
+        let device = Device::Cpu;
+        let states = game.initial_states();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut cache: StrategyCache = HashMap::new();
+        let mut stats = CacheStats::new();
+
+        // Run enough traversals that info sets must repeat (only 12 in Kuhn)
+        for _ in 0..5 {
+            let b = 10;
+            run_batch(
+                &game,
+                &states,
+                Player::Player1,
+                1,
+                &net,
+                &encoder,
+                &device,
+                &mut rng,
+                b,
+                &mut cache,
+                &mut stats,
+            )
+            .unwrap();
+        }
+
+        assert!(
+            stats.hits > 0,
+            "With 50 Kuhn traversals and only 12 info sets, \
+             cache should have hits (got {hits} hits, {misses} misses)",
+            hits = stats.hits,
+            misses = stats.misses,
+        );
     }
 }
