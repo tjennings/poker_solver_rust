@@ -62,11 +62,19 @@ impl InfoSetFeatures {
 /// Returns a 4-element map where `map[original_suit] = canonical_suit`.
 /// Suits that never appear get the next available canonical id.
 fn build_suit_map(hole: [Card; 2], board: &[Card]) -> [u8; 4] {
-    let scan_order = board_then_hole_then_extra(hole, board);
     let mut map = [u8::MAX; 4];
     let mut next_id = 0u8;
 
-    for card in scan_order {
+    // Scan order: flop cards, then hole cards, then turn, then river.
+    // Inlined to avoid Vec allocation.
+    let flop = &board[..board.len().min(3)];
+    let scan = flop
+        .iter()
+        .chain(hole.iter())
+        .chain(board.get(3))
+        .chain(board.get(4));
+
+    for card in scan {
         let s = card.suit as u8;
         if map[s as usize] == u8::MAX {
             map[s as usize] = next_id;
@@ -81,24 +89,6 @@ fn build_suit_map(hole: [Card; 2], board: &[Card]) -> [u8; 4] {
         }
     }
     map
-}
-
-/// Produce the scan order: flop cards, then hole cards, then turn, then river.
-fn board_then_hole_then_extra(hole: [Card; 2], board: &[Card]) -> Vec<Card> {
-    let flop = &board[..board.len().min(3)];
-    let turn = board.get(3);
-    let river = board.get(4);
-
-    let mut out = Vec::with_capacity(7);
-    out.extend_from_slice(flop);
-    out.extend_from_slice(&hole);
-    if let Some(&t) = turn {
-        out.push(t);
-    }
-    if let Some(&r) = river {
-        out.push(r);
-    }
-    out
 }
 
 /// Encode a single card as `rank * 4 + canonical_suit` (0..51).

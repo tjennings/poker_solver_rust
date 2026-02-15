@@ -10,7 +10,7 @@
 //! 4. Distribute strategy results back to each traversal
 //! 5. Repeat until all traversals complete
 
-use candle_core::Device;
+use candle_core::{Device, Tensor};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -18,7 +18,7 @@ use poker_solver_core::game::{Game, Player};
 use poker_solver_core::Action;
 
 use crate::SdCfrError;
-use crate::card_features::InfoSetFeatures;
+use crate::card_features::{BET_FEATURES, InfoSetFeatures};
 use crate::network::AdvantageNet;
 use crate::traverse::{
     AdvantageSample, StateEncoder, compute_advantages, sample_action, weighted_sum,
@@ -429,19 +429,31 @@ fn batched_inference(
     pending: &[PendingInference],
     device: &Device,
 ) -> Result<Vec<Vec<f32>>, SdCfrError> {
-    let features_batch: Vec<InfoSetFeatures> = pending.iter().map(|p| p.features.clone()).collect();
-    let (cards, bets) = InfoSetFeatures::to_tensors(&features_batch, device)?;
+    // Build tensors directly from pending — no intermediate Vec<InfoSetFeatures>
+    let b = pending.len();
+    let card_data: Vec<i64> = pending
+        .iter()
+        .flat_map(|p| p.features.cards.iter().map(|&c| i64::from(c)))
+        .collect();
+    let bet_data: Vec<f32> = pending
+        .iter()
+        .flat_map(|p| p.features.bets.iter().copied())
+        .collect();
+    let cards = Tensor::from_vec(card_data, &[b, 7], device)?;
+    let bets = Tensor::from_vec(bet_data, &[b, BET_FEATURES], device)?;
+
     let raw_advantages = value_net.forward(&cards, &bets)?;
 
-    let mut strategies = Vec::with_capacity(pending.len());
-    for (i, p) in pending.iter().enumerate() {
-        let row = raw_advantages.get(i)?;
-        let sliced = row.narrow(0, 0, p.num_actions)?;
-        let sliced_2d = sliced.unsqueeze(0)?;
-        let strategy_tensor = AdvantageNet::advantages_to_strategy(&sliced_2d)?;
-        let probs = strategy_tensor.squeeze(0)?.to_vec1::<f32>()?;
-        strategies.push(probs);
-    }
+    // Single batched advantages_to_strategy on full [B, num_actions] tensor
+    let strategy_tensor = AdvantageNet::advantages_to_strategy(&raw_advantages)?;
+    let all_probs = strategy_tensor.to_vec2::<f32>()?;
+
+    // Slice each row to actual num_actions on CPU (trivial)
+    let strategies = pending
+        .iter()
+        .zip(all_probs)
+        .map(|(p, row)| row[..p.num_actions].to_vec())
+        .collect();
 
     Ok(strategies)
 }
