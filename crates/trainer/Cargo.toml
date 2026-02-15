@@ -22,3 +22,5 @@ candle-core = "0.9"
 
 [features]
 gpu = ["dep:poker-solver-gpu-cfr"]
+cuda = ["poker-solver-deep-cfr/cuda"]
+metal = ["poker-solver-deep-cfr/metal"]

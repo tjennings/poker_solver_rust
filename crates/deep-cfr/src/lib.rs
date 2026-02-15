@@ -10,6 +10,23 @@ pub mod traverse;
 
 pub use config::SdCfrConfig;
 
+/// Select the best available compute device.
+///
+/// Tries CUDA first (Linux), then Metal (macOS), falls back to CPU.
+pub fn best_available_device() -> candle_core::Device {
+    #[cfg(feature = "cuda")]
+    if let Ok(device) = candle_core::Device::cuda_if_available(0) {
+        if device.is_cuda() {
+            return device;
+        }
+    }
+    #[cfg(feature = "metal")]
+    if let Ok(device) = candle_core::Device::new_metal(0) {
+        return device;
+    }
+    candle_core::Device::Cpu
+}
+
 /// Errors that can occur during SD-CFR training or evaluation.
 #[derive(thiserror::Error, Debug)]
 pub enum SdCfrError {

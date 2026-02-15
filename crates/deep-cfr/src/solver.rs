@@ -13,6 +13,7 @@ use rand::{Rng, SeedableRng};
 use poker_solver_core::game::{Game, Player};
 
 use crate::SdCfrError;
+use crate::best_available_device;
 use crate::config::SdCfrConfig;
 use crate::memory::ReservoirBuffer;
 use crate::model_buffer::ModelBuffer;
@@ -64,7 +65,7 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
             model_buffers: [ModelBuffer::new(), ModelBuffer::new()],
             value_nets: [None, None],
             current_iteration: 0,
-            device: Device::Cpu,
+            device: best_available_device(),
             rng,
         })
     }

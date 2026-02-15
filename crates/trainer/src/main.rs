@@ -224,6 +224,7 @@ struct TrainingParams {
     /// GPU tile size for tiled solver. `None` or absent = auto-detect,
     /// `Some(0)` = force untiled solver.
     #[serde(default)]
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     tile_size: Option<u32>,
 }
 
@@ -969,6 +970,9 @@ fn run_sdcfr_training(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let yaml = std::fs::read_to_string(config_path)?;
     let config: SdCfrTrainingConfig = serde_yaml::from_str(&yaml)?;
     print_sdcfr_config(&config);
+
+    let device = poker_solver_deep_cfr::best_available_device();
+    println!("  Compute device: {:?}", device);
 
     let game = HunlPostflop::new(config.game.clone(), None, config.deals.count);
     let deal_pool = game.initial_states();

@@ -17,6 +17,11 @@ candle-core = "0.9"
 candle-nn = "0.9"
 safetensors = "0.7"
 
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+
 [dev-dependencies]
 proptest = "1.4"
 rustc-hash = "2"
