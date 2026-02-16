@@ -27,7 +27,7 @@ fn small_game_config() -> PostflopConfig {
     }
 }
 
-/// SD-CFR config with small parameters for speed.
+/// SD-CFR config with small parameters for speed (sequential traversal).
 fn small_sdcfr_config(cfr_iterations: u32, checkpoint_interval: u32) -> SdCfrConfig {
     SdCfrConfig {
         cfr_iterations,
@@ -42,6 +42,24 @@ fn small_sdcfr_config(cfr_iterations: u32, checkpoint_interval: u32) -> SdCfrCon
         seed: 42,
         checkpoint_interval,
         parallel_traversals: 1,
+    }
+}
+
+/// Minimal SD-CFR config that exercises the batched traversal + strategy cache path.
+fn smoke_sdcfr_config() -> SdCfrConfig {
+    SdCfrConfig {
+        cfr_iterations: 2,
+        traversals_per_iter: 50,
+        advantage_memory_cap: 1_000,
+        hidden_dim: 16,
+        num_actions: 4, // fold, check/call, bet/raise(0), all-in
+        sgd_steps: 2,
+        batch_size: 16,
+        learning_rate: 0.001,
+        grad_clip_norm: 1.0,
+        seed: 42,
+        checkpoint_interval: 0,
+        parallel_traversals: 4,
     }
 }
 
@@ -245,4 +263,58 @@ fn sdcfr_hunl_both_players_have_strategies() {
         .expect("P2 strategy query should succeed");
     assert_eq!(p2_probs.len(), 5);
     assert_valid_distribution(&p2_probs, "P2 strategy");
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: Full pipeline smoke test (batched traversal + strategy cache)
+// ---------------------------------------------------------------------------
+
+/// Minimal end-to-end test exercising the batched traversal path with the
+/// strategy cache. Uses the smallest practical game tree (1 bet size,
+/// 1 raise cap) to verify the entire pipeline is exception-free:
+/// deal generation → batched traversal → value net training → policy extraction.
+#[test]
+fn sdcfr_hunl_batched_smoke() {
+    let game_config = PostflopConfig {
+        stack_depth: 10,
+        bet_sizes: vec![1.0],
+        max_raises_per_street: 1,
+    };
+    let game = HunlPostflop::new(game_config.clone(), None, 20);
+    let deal_pool = game.initial_states();
+    let encoder = HunlStateEncoder::new(game_config.bet_sizes.clone());
+    let config = smoke_sdcfr_config();
+
+    let mut solver = SdCfrSolver::new(game, encoder, config)
+        .expect("SdCfrSolver::new should succeed");
+    let trained = solver
+        .train_with_deals(Some(&deal_pool), None)
+        .expect("batched training should complete without error");
+
+    // Both players should have model entries (one per iteration)
+    assert_eq!(trained.model_buffers[0].len(), 2, "P1 should have 2 model snapshots");
+    assert_eq!(trained.model_buffers[1].len(), 2, "P2 should have 2 model snapshots");
+
+    // Extract and query strategies for both players
+    let device = Device::Cpu;
+    let game2 = HunlPostflop::new(game_config.clone(), None, 1);
+    let states = game2.initial_states();
+    let encoder2 = HunlStateEncoder::new(game_config.bet_sizes.clone());
+
+    for (pi, &player) in [Player::Player1, Player::Player2].iter().enumerate() {
+        let policy = ExplicitPolicy::from_buffer(
+            &trained.model_buffers[pi],
+            4,  // num_actions
+            16, // hidden_dim
+            &device,
+        )
+        .expect("ExplicitPolicy should load");
+
+        let features = encoder2.encode(&states[0], player);
+        let probs = policy
+            .strategy(&features)
+            .expect("strategy query should succeed");
+        assert_eq!(probs.len(), 4, "P{} strategy should have 4 entries", pi + 1);
+        assert_valid_distribution(&probs, &format!("P{} batched smoke", pi + 1));
+    }
 }
