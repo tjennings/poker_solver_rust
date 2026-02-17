@@ -10,17 +10,23 @@ use indicatif::{ProgressBar, ProgressStyle};
 use poker_solver_core::Game;
 use poker_solver_core::HandClass;
 use poker_solver_core::abstract_game::{self, AbstractDealConfig};
-use poker_solver_core::hand_class::HandClassification;
 use poker_solver_core::abstraction::{AbstractionConfig, BoundaryGenerator};
-use poker_solver_core::blueprint::{AbstractionModeConfig, BlueprintStrategy, BundleConfig, StrategyBundle};
+use poker_solver_core::blueprint::{
+    AbstractionModeConfig, BlueprintStrategy, BundleConfig, StrategyBundle,
+};
 use poker_solver_core::cfr::convergence;
 use poker_solver_core::cfr::{
-    DealInfo, MccfrConfig, MccfrSolver, SequenceCfrConfig, SequenceCfrSolver,
-    materialize_postflop,
+    DealInfo, MccfrConfig, MccfrSolver, SequenceCfrConfig, SequenceCfrSolver, materialize_postflop,
 };
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
-use poker_solver_core::game::{AbstractionMode, Action, HunlPostflop, Player, PostflopConfig, PostflopState};
-use poker_solver_core::info_key::{canonical_hand_index_from_str, hand_label_from_bits, reverse_canonical_index, spr_bucket, InfoKey};
+use poker_solver_core::game::{
+    AbstractionMode, Action, HunlPostflop, LimitHoldem, Player, PostflopConfig, PostflopState,
+};
+use poker_solver_core::hand_class::HandClassification;
+use poker_solver_core::info_key::{
+    InfoKey, canonical_hand_index_from_str, hand_label_from_bits, reverse_canonical_index,
+    spr_bucket,
+};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
@@ -264,9 +270,25 @@ fn default_pruning_probe_interval() -> u64 {
 // SD-CFR YAML config structs
 // ---------------------------------------------------------------------------
 
+/// Game type selection for SD-CFR training.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SdCfrGameType {
+    HunlPostflop,
+    LimitHoldem,
+}
+
+fn default_sdcfr_game_type() -> SdCfrGameType {
+    SdCfrGameType::HunlPostflop
+}
+
 #[derive(Debug, Deserialize)]
 struct SdCfrTrainingConfig {
+    #[serde(default = "default_sdcfr_game_type")]
+    game_type: SdCfrGameType,
     game: PostflopConfig,
+    #[serde(default)]
+    lhe_game: Option<poker_solver_core::game::LimitHoldemConfig>,
     deals: SdCfrDealConfig,
     training: SdCfrTrainingParams,
     network: SdCfrNetworkConfig,
@@ -336,7 +358,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Train { config, threads, solver } => {
+        Commands::Train {
+            config,
+            threads,
+            solver,
+        } => {
             if let Some(n) = threads {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(n)
@@ -360,8 +386,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }
                             #[cfg(not(feature = "gpu"))]
                             {
-                                eprintln!("Error: GPU solver requires `--features gpu` at build time.");
-                                eprintln!("Build with: cargo run -p poker-solver-trainer --features gpu --release -- train ...");
+                                eprintln!(
+                                    "Error: GPU solver requires `--features gpu` at build time."
+                                );
+                                eprintln!(
+                                    "Build with: cargo run -p poker-solver-trainer --features gpu --release -- train ..."
+                                );
                                 std::process::exit(1);
                             }
                         }
@@ -370,7 +400,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        Commands::GenerateDeals { config, output, dry_run, threads, batch_size } => {
+        Commands::GenerateDeals {
+            config,
+            output,
+            dry_run,
+            threads,
+            batch_size,
+        } => {
             if let Some(n) = threads {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(n)
@@ -384,10 +420,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::MergeDeals { input, output } => {
             run_merge_deals(&input, &output)?;
         }
-        Commands::InspectDeals { input, limit, sort, csv } => {
+        Commands::InspectDeals {
+            input,
+            limit,
+            sort,
+            csv,
+        } => {
             run_inspect_deals(&input, limit, sort, csv.as_deref())?;
         }
-        Commands::TreeStats { config, sample_deals } => {
+        Commands::TreeStats {
+            config,
+            sample_deals,
+        } => {
             let yaml = std::fs::read_to_string(&config)?;
             let training_config: TrainingConfig = serde_yaml::from_str(&yaml)?;
             run_tree_stats(training_config, sample_deals)?;
@@ -521,10 +565,7 @@ fn run_convergence_loop<S: TrainingSolver>(
     }
 }
 
-fn run_fixed_iteration_loop<S: TrainingSolver>(
-    solver: &mut S,
-    config: &TrainingLoopConfig<'_>,
-) {
+fn run_fixed_iteration_loop<S: TrainingSolver>(solver: &mut S, config: &TrainingLoopConfig<'_>) {
     let total = config.iterations;
     let checkpoint_interval = (total / 10).max(1);
 
@@ -743,7 +784,9 @@ trait SimpleTrainingSolverBackend {
     fn strategies_best_effort(&self) -> FxHashMap<u64, Vec<f64>>;
     fn iters(&self) -> u64;
     /// GPU max regret (upper bound on exploitability). `None` for CPU solvers.
-    fn max_regret(&self) -> Option<f32> { None }
+    fn max_regret(&self) -> Option<f32> {
+        None
+    }
 }
 
 impl SimpleTrainingSolverBackend for SequenceCfrSolver {
@@ -881,7 +924,11 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     };
 
     // Create game with deal pool
-    let mut game = HunlPostflop::new(config.game.clone(), abstraction_mode, config.training.deal_count);
+    let mut game = HunlPostflop::new(
+        config.game.clone(),
+        abstraction_mode,
+        config.training.deal_count,
+    );
     if config.training.min_deals_per_class > 0 {
         game = game.with_stratification(
             config.training.min_deals_per_class,
@@ -891,8 +938,8 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     // Create MCCFR solver
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let pruning_warmup = (config.training.pruning_warmup_fraction
-        * config.training.iterations as f64) as u64;
+    let pruning_warmup =
+        (config.training.pruning_warmup_fraction * config.training.iterations as f64) as u64;
 
     let mccfr_config = MccfrConfig {
         samples_per_iteration: config.training.mccfr_samples,
@@ -904,7 +951,10 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     };
 
     println!("Creating MCCFR solver...");
-    println!("  DCFR: α={}, β={}, γ={}", mccfr_config.dcfr_alpha, mccfr_config.dcfr_beta, mccfr_config.dcfr_gamma);
+    println!(
+        "  DCFR: α={}, β={}, γ={}",
+        mccfr_config.dcfr_alpha, mccfr_config.dcfr_beta, mccfr_config.dcfr_gamma
+    );
     if config.training.pruning {
         println!(
             "  Pruning: enabled (warmup {:.0}%, probe every {} iters, threshold {:.1})",
@@ -930,8 +980,16 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         game: config.game.clone(),
         abstraction: config.abstraction.clone(),
         abstraction_mode: abs_mode,
-        strength_bits: if use_hand_class_v2 { config.training.strength_bits } else { 0 },
-        equity_bits: if use_hand_class_v2 { config.training.equity_bits } else { 0 },
+        strength_bits: if use_hand_class_v2 {
+            config.training.strength_bits
+        } else {
+            0
+        },
+        equity_bits: if use_hand_class_v2 {
+            config.training.equity_bits
+        } else {
+            0
+        },
     };
 
     let num_threads = rayon::current_num_threads();
@@ -975,6 +1033,14 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 fn run_sdcfr_training(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let yaml = std::fs::read_to_string(config_path)?;
     let config: SdCfrTrainingConfig = serde_yaml::from_str(&yaml)?;
+
+    match config.game_type {
+        SdCfrGameType::HunlPostflop => run_sdcfr_hunl(config),
+        SdCfrGameType::LimitHoldem => run_sdcfr_lhe(config),
+    }
+}
+
+fn run_sdcfr_hunl(config: SdCfrTrainingConfig) -> Result<(), Box<dyn Error>> {
     print_sdcfr_config(&config);
 
     let device = poker_solver_deep_cfr::best_available_device();
@@ -984,13 +1050,10 @@ fn run_sdcfr_training(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let deal_pool = game.initial_states();
     println!("  Generated {} deals", deal_pool.len());
 
-    let encoder = poker_solver_deep_cfr::hunl_encoder::HunlStateEncoder::new(
-        config.game.bet_sizes.clone(),
-    );
+    let encoder =
+        poker_solver_deep_cfr::hunl_encoder::HunlStateEncoder::new(config.game.bet_sizes.clone());
     let sdcfr_config = build_sdcfr_config(&config);
-    let mut solver = poker_solver_deep_cfr::solver::SdCfrSolver::new(
-        game, encoder, sdcfr_config,
-    )?;
+    let mut solver = poker_solver_deep_cfr::solver::SdCfrSolver::new(game, encoder, sdcfr_config)?;
 
     let output_dir = config.training.output_dir.clone();
     let game_config = config.game.clone();
@@ -1078,18 +1141,110 @@ fn run_sdcfr_training(config_path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_sdcfr_lhe(config: SdCfrTrainingConfig) -> Result<(), Box<dyn Error>> {
+    print_sdcfr_lhe_config(&config);
+
+    let device = poker_solver_deep_cfr::best_available_device();
+    println!("  Compute device: {:?}", device);
+
+    let lhe_config = config.lhe_game.clone().unwrap_or_default();
+    let game = LimitHoldem::new(lhe_config, config.deals.count, config.deals.seed);
+    let deal_pool = game.initial_states();
+    println!("  Generated {} deals", deal_pool.len());
+
+    let encoder = poker_solver_deep_cfr::lhe_encoder::LheEncoder::new();
+    let sdcfr_config = build_sdcfr_config(&config);
+    let mut solver = poker_solver_deep_cfr::solver::SdCfrSolver::new(game, encoder, sdcfr_config)?;
+
+    let total_iterations = config.training.iterations;
+    println!("\nStarting SD-CFR LHE training ({total_iterations} iterations)...");
+    let start = Instant::now();
+
+    for i in 1..=total_iterations {
+        let iter_start = Instant::now();
+        eprintln!(
+            "  [iter {i}/{total_iterations}] starting (elapsed: {:.1}s)...",
+            start.elapsed().as_secs_f64(),
+        );
+
+        solver.step_with_deals(Some(&deal_pool))?;
+
+        let iter_elapsed = iter_start.elapsed();
+        let total_elapsed = start.elapsed().as_secs_f64();
+        let rate = f64::from(i) / total_elapsed;
+        let remaining = f64::from(total_iterations - i) / rate;
+        let stats = solver.buffer_stats();
+
+        eprintln!(
+            "  [iter {i}/{total_iterations}] done in {:.1}s | rate: {rate:.2} iter/s | \
+             buf P1: {}/{} P2: {}/{} | ETA: {:.0}s",
+            iter_elapsed.as_secs_f64(),
+            stats[0].0,
+            stats[0].1,
+            stats[1].0,
+            stats[1].1,
+            remaining,
+        );
+    }
+
+    let elapsed = start.elapsed();
+    let trained = solver.take_result();
+    print_sdcfr_summary(&trained, elapsed);
+    Ok(())
+}
+
 fn print_sdcfr_config(config: &SdCfrTrainingConfig) {
     println!("=== Poker Blueprint Trainer (Single Deep CFR) ===");
+    println!("  Game type: {:?}", config.game_type);
     println!("  Stack depth: {} BB", config.game.stack_depth);
     println!("  Bet sizes: {:?}", config.game.bet_sizes);
     println!("  Iterations: {}", config.training.iterations);
     println!("  Traversals/iter: {}", config.training.traversals_per_iter);
     println!("  Deal pool: {} deals", config.deals.count);
-    println!("  Network: hidden_dim={}, num_actions={}", config.network.hidden_dim, config.network.num_actions);
-    println!("  SGD: steps={}, batch={}, lr={}", config.sgd.steps, config.sgd.batch_size, config.sgd.learning_rate);
+    println!(
+        "  Network: hidden_dim={}, num_actions={}",
+        config.network.hidden_dim, config.network.num_actions
+    );
+    println!(
+        "  SGD: steps={}, batch={}, lr={}",
+        config.sgd.steps, config.sgd.batch_size, config.sgd.learning_rate
+    );
     println!("  Memory cap: {}", config.memory.advantage_cap);
-    println!("  Parallel traversals: {}", config.training.parallel_traversals);
+    println!(
+        "  Parallel traversals: {}",
+        config.training.parallel_traversals
+    );
     println!("  Checkpoint every {} iters", config.checkpoint.interval);
+}
+
+fn print_sdcfr_lhe_config(config: &SdCfrTrainingConfig) {
+    let lhe = config.lhe_game.as_ref().cloned().unwrap_or_default();
+    println!("=== Poker Blueprint Trainer (SD-CFR Limit Hold'em) ===");
+    println!("  Stack depth: {} BB", lhe.stack_depth);
+    println!("  Streets: {}", lhe.num_streets);
+    println!("  Max raises (early): {}", lhe.max_raises_early);
+    println!("  Max raises (late): {}", lhe.max_raises_late);
+    println!("  Small bet: {} SB units", lhe.small_bet);
+    println!("  Big bet: {} SB units", lhe.big_bet);
+    println!("  Iterations: {}", config.training.iterations);
+    println!("  Traversals/iter: {}", config.training.traversals_per_iter);
+    println!(
+        "  Deal pool: {} deals (seed: {})",
+        config.deals.count, config.deals.seed
+    );
+    println!(
+        "  Network: hidden_dim={}, num_actions={}",
+        config.network.hidden_dim, config.network.num_actions
+    );
+    println!(
+        "  SGD: steps={}, batch={}, lr={}",
+        config.sgd.steps, config.sgd.batch_size, config.sgd.learning_rate
+    );
+    println!("  Memory cap: {}", config.memory.advantage_cap);
+    println!(
+        "  Parallel traversals: {}",
+        config.training.parallel_traversals
+    );
 }
 
 fn build_sdcfr_config(config: &SdCfrTrainingConfig) -> poker_solver_deep_cfr::SdCfrConfig {
@@ -1115,14 +1270,8 @@ fn print_sdcfr_summary(
 ) {
     println!("\n=== SD-CFR Training Complete ===");
     println!("  Total time: {:.1}s", elapsed.as_secs_f64());
-    println!(
-        "  P1 model snapshots: {}",
-        trained.model_buffers[0].len(),
-    );
-    println!(
-        "  P2 model snapshots: {}",
-        trained.model_buffers[1].len(),
-    );
+    println!("  P1 model snapshots: {}", trained.model_buffers[0].len(),);
+    println!("  P2 model snapshots: {}", trained.model_buffers[1].len(),);
     println!(
         "  Time/iteration: {:.2}s",
         elapsed.as_secs_f64() / f64::from(trained.config.cfr_iterations),
@@ -1205,9 +1354,8 @@ fn walk_deals_for_strategies(
     game_config: &PostflopConfig,
     policies: &[poker_solver_deep_cfr::eval::ExplicitPolicy; 2],
 ) -> Result<FxHashMap<u64, Vec<f64>>, poker_solver_deep_cfr::SdCfrError> {
-    let encoder = poker_solver_deep_cfr::hunl_encoder::HunlStateEncoder::new(
-        game_config.bet_sizes.clone(),
-    );
+    let encoder =
+        poker_solver_deep_cfr::hunl_encoder::HunlStateEncoder::new(game_config.bet_sizes.clone());
     let tree_game = HunlPostflop::new(game_config.clone(), None, 200);
     let sample_deals = tree_game.initial_states();
 
@@ -1236,9 +1384,9 @@ fn save_strategy_bundle(
     let bundle = StrategyBundle::new(bundle_config, blueprint, None);
 
     let dir = PathBuf::from(output_dir).join(format!("checkpoint_{iteration}"));
-    bundle.save(&dir).map_err(|e| {
-        poker_solver_deep_cfr::SdCfrError::Io(std::io::Error::other(e.to_string()))
-    })?;
+    bundle
+        .save(&dir)
+        .map_err(|e| poker_solver_deep_cfr::SdCfrError::Io(std::io::Error::other(e.to_string())))?;
     println!("    Saved to {}", dir.display());
     Ok(())
 }
@@ -1390,13 +1538,8 @@ fn run_generate_deals_batched(
         let batch_path = batches_dir.join(format!("batch_{i:04}.bin"));
         let batch_start = Instant::now();
 
-        let (entries, concrete) = abstract_game::generate_deals_batch(
-            &ctx,
-            deal_config,
-            chunk,
-            i as u32,
-            &batch_path,
-        )?;
+        let (entries, concrete) =
+            abstract_game::generate_deals_batch(&ctx, deal_config, chunk, i as u32, &batch_path)?;
 
         total_entries += entries;
         total_concrete += concrete;
@@ -1469,10 +1612,7 @@ fn save_manifest(
     let manifest = serde_yaml::to_string(&serde_yaml::Value::Mapping({
         let mut m = serde_yaml::Mapping::new();
         m.insert("stack_depth".into(), config.game.stack_depth.into());
-        m.insert(
-            "strength_bits".into(),
-            config.training.strength_bits.into(),
-        );
+        m.insert("strength_bits".into(), config.training.strength_bits.into());
         m.insert("equity_bits".into(), config.training.equity_bits.into());
         m.insert(
             "concrete_deals".into(),
@@ -1580,7 +1720,8 @@ fn run_tree_stats(config: TrainingConfig, sample_deals: usize) -> Result<(), Box
         let v2_combos = (1 << class_bits) * strength_bins * equity_bins * draw_combos;
         println!(
             "  hand_class_v2 (s={}, e={}, 7 draw bits): {} (theoretical max)",
-            config.training.strength_bits, config.training.equity_bits,
+            config.training.strength_bits,
+            config.training.equity_bits,
             tree.estimated_info_sets(v2_combos)
         );
     }
@@ -1595,7 +1736,8 @@ fn run_tree_stats(config: TrainingConfig, sample_deals: usize) -> Result<(), Box
     println!("  Done in {elapsed:?}\n");
 
     // Memory estimates
-    let node_bytes = tree.nodes.len() * std::mem::size_of::<poker_solver_core::cfr::game_tree::TreeNode>();
+    let node_bytes =
+        tree.nodes.len() * std::mem::size_of::<poker_solver_core::cfr::game_tree::TreeNode>();
     let strategy_bytes_est = actual_info_sets as usize * tree.nodes[0].children.len() * 8;
     println!("Memory estimates:");
     println!("  Tree nodes: {:.2} MB", node_bytes as f64 / 1_048_576.0);
@@ -1638,7 +1780,11 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     } else if let Some(ref dir) = config.training.abstract_deals_dir {
         load_abstract_deals(dir)?
     } else {
-        let mut game = HunlPostflop::new(config.game.clone(), abstraction_mode.clone(), config.training.deal_count);
+        let mut game = HunlPostflop::new(
+            config.game.clone(),
+            abstraction_mode.clone(),
+            config.training.deal_count,
+        );
         if config.training.min_deals_per_class > 0 {
             game = game.with_stratification(
                 config.training.min_deals_per_class,
@@ -1662,7 +1808,11 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     println!("Materializing game tree...");
     let start = Instant::now();
     let tree = materialize_postflop(&tree_game, &tree_states[0]);
-    println!("  {} nodes, done in {:?}", tree.stats.total_nodes, start.elapsed());
+    println!(
+        "  {} nodes, done in {:?}",
+        tree.stats.total_nodes,
+        start.elapsed()
+    );
 
     // Build solver
     let seq_config = SequenceCfrConfig {
@@ -1677,8 +1827,16 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         game: config.game.clone(),
         abstraction: config.abstraction.clone(),
         abstraction_mode: abs_mode,
-        strength_bits: if abs_mode == AbstractionModeConfig::HandClassV2 { config.training.strength_bits } else { 0 },
-        equity_bits: if abs_mode == AbstractionModeConfig::HandClassV2 { config.training.equity_bits } else { 0 },
+        strength_bits: if abs_mode == AbstractionModeConfig::HandClassV2 {
+            config.training.strength_bits
+        } else {
+            0
+        },
+        equity_bits: if abs_mode == AbstractionModeConfig::HandClassV2 {
+            config.training.equity_bits
+        } else {
+            0
+        },
     };
 
     let boundaries = None; // sequence solver doesn't use EHS2
@@ -1752,7 +1910,11 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     } else if let Some(ref dir) = config.training.abstract_deals_dir {
         load_abstract_deals(dir)?
     } else {
-        let mut game = HunlPostflop::new(config.game.clone(), abstraction_mode.clone(), config.training.deal_count);
+        let mut game = HunlPostflop::new(
+            config.game.clone(),
+            abstraction_mode.clone(),
+            config.training.deal_count,
+        );
         if config.training.min_deals_per_class > 0 {
             game = game.with_stratification(
                 config.training.min_deals_per_class,
@@ -1766,14 +1928,22 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         println!("  Deal info built in {:?}", start.elapsed());
         deals
     };
-    println!("  {} deals loaded in {:?}\n", deals.len(), step_start.elapsed());
+    println!(
+        "  {} deals loaded in {:?}\n",
+        deals.len(),
+        step_start.elapsed()
+    );
 
     println!("Step 2/4: Materializing game tree...");
     let start = Instant::now();
     let tree_game = HunlPostflop::new(config.game.clone(), None, 1);
     let tree_states = tree_game.initial_states();
     let tree = materialize_postflop(&tree_game, &tree_states[0]);
-    println!("  {} nodes, done in {:?}\n", tree.stats.total_nodes, start.elapsed());
+    println!(
+        "  {} nodes, done in {:?}\n",
+        tree.stats.total_nodes,
+        start.elapsed()
+    );
 
     println!("Step 3/4: Initializing tabular GPU solver...");
     let start = Instant::now();
@@ -1794,8 +1964,16 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         Some(_) => true,
         None => {
             // Auto-detect: use tiled if coupling matrices would exceed ~8 GB
-            let n1 = deals.iter().map(|d| d.hand_bits_p1).collect::<std::collections::HashSet<_>>().len() as u64;
-            let n2 = deals.iter().map(|d| d.hand_bits_p2).collect::<std::collections::HashSet<_>>().len() as u64;
+            let n1 = deals
+                .iter()
+                .map(|d| d.hand_bits_p1)
+                .collect::<std::collections::HashSet<_>>()
+                .len() as u64;
+            let n2 = deals
+                .iter()
+                .map(|d| d.hand_bits_p2)
+                .collect::<std::collections::HashSet<_>>()
+                .len() as u64;
             let coupling_bytes = 6 * n1 * n2 * 4; // 6 matrices (3 + 3 transposed) x f32
             coupling_bytes > 8 * 1024 * 1024 * 1024
         }
@@ -1907,29 +2085,32 @@ fn build_deal_infos(
     states: &[PostflopState],
     abstraction: &Option<AbstractionMode>,
 ) -> Vec<DealInfo> {
-    states.iter().map(|state| {
-        let hand_bits_p1 = compute_per_street_hand_bits(state, true, abstraction);
-        let hand_bits_p2 = compute_per_street_hand_bits(state, false, abstraction);
+    states
+        .iter()
+        .map(|state| {
+            let hand_bits_p1 = compute_per_street_hand_bits(state, true, abstraction);
+            let hand_bits_p2 = compute_per_street_hand_bits(state, false, abstraction);
 
-        let p1_equity = match (&state.p1_cache.rank, &state.p2_cache.rank) {
-            (Some(r1), Some(r2)) => {
-                use std::cmp::Ordering;
-                match r1.cmp(r2) {
-                    Ordering::Greater => 1.0,
-                    Ordering::Less => 0.0,
-                    Ordering::Equal => 0.5,
+            let p1_equity = match (&state.p1_cache.rank, &state.p2_cache.rank) {
+                (Some(r1), Some(r2)) => {
+                    use std::cmp::Ordering;
+                    match r1.cmp(r2) {
+                        Ordering::Greater => 1.0,
+                        Ordering::Less => 0.0,
+                        Ordering::Equal => 0.5,
+                    }
                 }
-            }
-            _ => 0.5,
-        };
+                _ => 0.5,
+            };
 
-        DealInfo {
-            hand_bits_p1,
-            hand_bits_p2,
-            p1_equity,
-            weight: 1.0,
-        }
-    }).collect()
+            DealInfo {
+                hand_bits_p1,
+                hand_bits_p2,
+                p1_equity,
+                weight: 1.0,
+            }
+        })
+        .collect()
 }
 
 /// Compute hand bits for all 4 streets (preflop, flop, turn, river).
@@ -1943,7 +2124,11 @@ fn compute_per_street_hand_bits(
 ) -> [u32; 4] {
     use poker_solver_core::info_key::{canonical_hand_index, compute_hand_bits_v2};
 
-    let holding = if is_p1 { state.p1_holding } else { state.p2_holding };
+    let holding = if is_p1 {
+        state.p1_holding
+    } else {
+        state.p2_holding
+    };
     let preflop_bits = u32::from(canonical_hand_index(holding));
 
     let Some(full_board) = state.full_board else {
@@ -1952,9 +2137,10 @@ fn compute_per_street_hand_bits(
 
     let postflop_bits = |board: &[poker_solver_core::poker::Card]| -> u32 {
         match abstraction {
-            Some(AbstractionMode::HandClassV2 { strength_bits, equity_bits }) => {
-                compute_hand_bits_v2(holding, board, *strength_bits, *equity_bits)
-            }
+            Some(AbstractionMode::HandClassV2 {
+                strength_bits,
+                equity_bits,
+            }) => compute_hand_bits_v2(holding, board, *strength_bits, *equity_bits),
             _ => preflop_bits,
         }
     };
@@ -1966,7 +2152,6 @@ fn compute_per_street_hand_bits(
         postflop_bits(&full_board[..5]),
     ]
 }
-
 
 /// Build abstract deals via exhaustive enumeration.
 fn build_exhaustive_deals(config: &TrainingConfig) -> Result<Vec<DealInfo>, Box<dyn Error>> {
@@ -1986,7 +2171,10 @@ fn build_exhaustive_deals(config: &TrainingConfig) -> Result<Vec<DealInfo>, Box<
     let (deals, stats) = abstract_game::generate_abstract_deals(&deal_config);
     println!(
         "  {} concrete → {} abstract ({:.1}x compression) in {:?}",
-        stats.concrete_deals, stats.abstract_deals, stats.compression_ratio, start.elapsed()
+        stats.concrete_deals,
+        stats.abstract_deals,
+        stats.compression_ratio,
+        start.elapsed()
     );
 
     Ok(abstract_game::to_deal_infos(&deals))
@@ -2016,12 +2204,15 @@ fn load_abstract_deals(dir: &str) -> Result<Vec<DealInfo>, Box<dyn Error>> {
         println!("  detected legacy bincode format");
         let data = std::fs::read(&deals_path)?;
         let tuples: Vec<([u32; 4], [u32; 4], f64, f64)> = bincode::deserialize(&data)?;
-        tuples.into_iter().map(|(p1, p2, eq, w)| DealInfo {
-            hand_bits_p1: p1,
-            hand_bits_p2: p2,
-            p1_equity: eq,
-            weight: w,
-        }).collect()
+        tuples
+            .into_iter()
+            .map(|(p1, p2, eq, w)| DealInfo {
+                hand_bits_p1: p1,
+                hand_bits_p2: p2,
+                p1_equity: eq,
+                weight: w,
+            })
+            .collect()
     };
 
     println!("  {} deals loaded in {:?}", deals.len(), start.elapsed());
@@ -2104,7 +2295,9 @@ fn print_equity_stats(equities: &[f64]) {
     let stddev = variance.sqrt();
 
     println!("Equity distribution:");
-    println!("  min={min:.4}  max={max:.4}  mean={mean:.4}  median={median:.4}  stddev={stddev:.4}");
+    println!(
+        "  min={min:.4}  max={max:.4}  mean={mean:.4}  median={median:.4}  stddev={stddev:.4}"
+    );
 }
 
 fn print_weight_stats(weights: &[f64]) {
@@ -2156,13 +2349,17 @@ fn print_sample_deals(deals: &[DealInfo], limit: usize, sort: &DealSortOrder) {
     match sort {
         DealSortOrder::Weight => {
             indices.sort_by(|&a, &b| {
-                deals[b].weight.partial_cmp(&deals[a].weight)
+                deals[b]
+                    .weight
+                    .partial_cmp(&deals[a].weight)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
         DealSortOrder::Equity => {
             indices.sort_by(|&a, &b| {
-                deals[b].p1_equity.partial_cmp(&deals[a].p1_equity)
+                deals[b]
+                    .p1_equity
+                    .partial_cmp(&deals[a].p1_equity)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
@@ -2177,7 +2374,9 @@ fn print_sample_deals(deals: &[DealInfo], limit: usize, sort: &DealSortOrder) {
         let p2 = decode_trajectory(deal.hand_bits_p2);
         println!(
             "\nDeal #{} (weight={:.1}, equity={:.4}):",
-            rank + 1, deal.weight, deal.p1_equity,
+            rank + 1,
+            deal.weight,
+            deal.p1_equity,
         );
         println!("  P1: {} -> {} -> {} -> {}", p1[0], p1[1], p1[2], p1[3]);
         println!("  P2: {} -> {} -> {} -> {}", p2[0], p2[1], p2[2], p2[3]);
@@ -2197,9 +2396,7 @@ fn export_csv(deals: &[DealInfo], path: &std::path::Path) -> Result<(), Box<dyn 
         writeln!(
             file,
             "{},{},{},{},{},{},{},{},{:.6},{:.6}",
-            p1[0], p1[1], p1[2], p1[3],
-            p2[0], p2[1], p2[2], p2[3],
-            deal.p1_equity, deal.weight,
+            p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], deal.p1_equity, deal.weight,
         )?;
     }
     println!("Exported {} deals to {}", deals.len(), path.display());
@@ -2252,7 +2449,6 @@ fn collect_info_keys_dfs(
         collect_info_keys_dfs(game, &next, seen);
     }
 }
-
 
 fn format_action_labels(actions: &[Action]) -> Vec<String> {
     use poker_solver_core::game::ALL_IN;
@@ -2589,8 +2785,11 @@ fn print_extreme_regret_keys(
         let info = InfoKey::from_raw(most_neg_key);
         println!(
             "  negative regrets: {} actions, min={:.6} at {:#018x} street={} spr={}",
-            neg_count, most_neg_regret, most_neg_key,
-            info.street(), info.spr_bucket()
+            neg_count,
+            most_neg_regret,
+            most_neg_key,
+            info.street(),
+            info.spr_bucket()
         );
     } else {
         println!("  negative regrets: NONE (possible regret flooring issue)");
@@ -2667,7 +2866,6 @@ fn strongest_class(hand_bits: u32, abs_mode: AbstractionModeConfig) -> Option<Ha
     }
 }
 
-
 /// Group key for postflop scenarios: (spr_bucket, actions_bits).
 type PostflopScenario = (u32, u32);
 
@@ -2714,14 +2912,30 @@ fn print_postflop_strategies(
         let entries = &first_to_act[&scenario];
         let num_actions = entries.first().map_or(0, |(_, p)| p.len());
         let labels = first_to_act_labels(num_actions);
-        print_postflop_table(street_name, "first to act", scenario, entries, &labels, abs_mode, display_classes);
+        print_postflop_table(
+            street_name,
+            "first to act",
+            scenario,
+            entries,
+            &labels,
+            abs_mode,
+            display_classes,
+        );
     }
 
     if let Some(scenario) = most_populated_scenario(&facing_action) {
         let entries = &facing_action[&scenario];
         let num_actions = entries.first().map_or(0, |(_, p)| p.len());
         let labels = facing_bet_labels(num_actions);
-        print_postflop_table(street_name, "facing bet", scenario, entries, &labels, abs_mode, display_classes);
+        print_postflop_table(
+            street_name,
+            "facing bet",
+            scenario,
+            entries,
+            &labels,
+            abs_mode,
+            display_classes,
+        );
     }
 }
 
@@ -2796,9 +3010,7 @@ fn print_postflop_table(
     let header = format!("{:<12}|{action_cols}", "Class");
     let separator = "-".repeat(header.len());
 
-    println!(
-        "{street_name} Strategy ({context}, SPR ~{approx_spr:.1}):"
-    );
+    println!("{street_name} Strategy ({context}, SPR ~{approx_spr:.1}):");
     println!("{header}");
     println!("{separator}");
 
