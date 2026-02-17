@@ -356,7 +356,7 @@ fn apply_action(
         Action::Call => apply_call(state, &mut new, config),
         Action::Bet(0) => apply_bet(state, &mut new, config),
         Action::Raise(0) => apply_raise(state, &mut new, config),
-        _ => debug_assert!(false, "invalid action for limit holdem: {action:?}"),
+        _ => unreachable!("invalid action for limit holdem: {action:?}"),
     }
 
     new

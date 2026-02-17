@@ -239,16 +239,15 @@ fn make_hole_cards(row: usize, col: usize) -> [Card; 2] {
 }
 
 /// Build a state with specific hole cards for the target player.
+///
+/// Picks dummy opponent cards that don't collide with hole or board.
 fn build_state(
     hole: [Card; 2],
     board: [Card; 5],
     target_player: Player,
     config: &LimitHoldemConfig,
 ) -> LimitHoldemState {
-    let dummy_opp = [
-        Card::new(Value::Two, Suit::Club),
-        Card::new(Value::Three, Suit::Club),
-    ];
+    let dummy_opp = pick_dummy_opponent(&hole, &board);
 
     match target_player {
         Player::Player1 => {
@@ -258,6 +257,22 @@ fn build_state(
             LimitHoldemState::new_preflop(dummy_opp, hole, board, config.stack_depth)
         }
     }
+}
+
+/// Pick two cards that don't collide with hole cards or board.
+fn pick_dummy_opponent(hole: &[Card; 2], board: &[Card; 5]) -> [Card; 2] {
+    let used: std::collections::HashSet<Card> =
+        hole.iter().chain(board.iter()).copied().collect();
+    let mut dummy = Vec::with_capacity(2);
+    for card in poker_solver_core::poker::full_deck() {
+        if !used.contains(&card) {
+            dummy.push(card);
+            if dummy.len() == 2 {
+                break;
+            }
+        }
+    }
+    [dummy[0], dummy[1]]
 }
 
 /// Classify action probabilities into fold/call/raise buckets.
