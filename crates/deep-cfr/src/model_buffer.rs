@@ -110,6 +110,46 @@ impl ModelBuffer {
     pub fn iter_weights(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
         self.entries.iter().enumerate().map(|(i, e)| (i, e.weight))
     }
+
+    /// Save the model buffer to a file using a simple binary format.
+    ///
+    /// Format: [num_entries: u32] then for each entry:
+    ///   [iteration: u32] [weight_bytes: f64] [data_len: u64] [data: [u8]]
+    pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), SdCfrError> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)?;
+        let num_entries = self.entries.len() as u32;
+        file.write_all(&num_entries.to_le_bytes())?;
+        for entry in &self.entries {
+            file.write_all(&entry.iteration.to_le_bytes())?;
+            file.write_all(&entry.weight.to_le_bytes())?;
+            let data_len = entry.weights.len() as u64;
+            file.write_all(&data_len.to_le_bytes())?;
+            file.write_all(&entry.weights)?;
+        }
+        Ok(())
+    }
+
+    /// Load a model buffer from a file written by [`save_to_file`].
+    pub fn load_from_file(path: &std::path::Path) -> Result<Self, SdCfrError> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let num_entries = read_u32(&mut file)?;
+        let mut entries = Vec::with_capacity(num_entries as usize);
+        for _ in 0..num_entries {
+            let iteration = read_u32(&mut file)?;
+            let weight = read_f64(&mut file)?;
+            let data_len = read_u64(&mut file)?;
+            let mut weights = vec![0u8; data_len as usize];
+            file.read_exact(&mut weights)?;
+            entries.push(ModelEntry {
+                weights,
+                iteration,
+                weight,
+            });
+        }
+        Ok(Self { entries })
+    }
 }
 
 impl Default for ModelBuffer {
@@ -133,6 +173,27 @@ impl ModelEntry {
 // ---------------------------------------------------------------------------
 // Serialization helpers
 // ---------------------------------------------------------------------------
+
+/// Read a `u32` from a reader in little-endian format.
+fn read_u32(r: &mut impl std::io::Read) -> Result<u32, SdCfrError> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+/// Read a `u64` from a reader in little-endian format.
+fn read_u64(r: &mut impl std::io::Read) -> Result<u64, SdCfrError> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// Read an `f64` from a reader in little-endian format.
+fn read_f64(r: &mut impl std::io::Read) -> Result<f64, SdCfrError> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(f64::from_le_bytes(buf))
+}
 
 /// Serialize a `VarMap` to safetensors binary format in memory.
 ///

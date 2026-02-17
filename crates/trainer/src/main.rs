@@ -1,3 +1,4 @@
+mod lhe_viz;
 mod tree;
 
 use std::error::Error;
@@ -132,6 +133,33 @@ enum Commands {
         /// Filter deals to this canonical hand (e.g. "AKs", "QQ")
         #[arg(long)]
         hand: Option<String>,
+    },
+    /// Evaluate a trained LHE SD-CFR model (exploitability + strategy visualization)
+    EvalLhe {
+        /// Directory containing model checkpoint (p1.bin + p2.bin)
+        #[arg(short, long)]
+        model: PathBuf,
+        /// Number of deals for exploitability sampling
+        #[arg(long, default_value = "10000")]
+        eval_deals: usize,
+        /// Number of actions in the trained network
+        #[arg(long, default_value = "3")]
+        num_actions: usize,
+        /// Hidden dimension of the trained network
+        #[arg(long, default_value = "64")]
+        hidden_dim: usize,
+        /// Random seed
+        #[arg(long, default_value = "42")]
+        seed: u64,
+        /// LHE stack depth in BB
+        #[arg(long, default_value = "20")]
+        stack_depth: u32,
+        /// Number of streets (2=flop HE, 4=full)
+        #[arg(long, default_value = "4")]
+        num_streets: u8,
+        /// Board samples for strategy visualization
+        #[arg(long, default_value = "100")]
+        board_samples: usize,
     },
 }
 
@@ -454,6 +482,27 @@ fn main() -> Result<(), Box<dyn Error>> {
                 seed,
                 key.as_deref(),
                 hand.as_deref(),
+            )?;
+        }
+        Commands::EvalLhe {
+            model,
+            eval_deals,
+            num_actions,
+            hidden_dim,
+            seed,
+            stack_depth,
+            num_streets,
+            board_samples,
+        } => {
+            run_eval_lhe(
+                &model,
+                eval_deals,
+                num_actions,
+                hidden_dim,
+                seed,
+                stack_depth,
+                num_streets,
+                board_samples,
             )?;
         }
     }
@@ -1185,11 +1234,132 @@ fn run_sdcfr_lhe(config: SdCfrTrainingConfig) -> Result<(), Box<dyn Error>> {
             stats[1].1,
             remaining,
         );
+
+        // Save LHE checkpoint at the configured interval
+        let checkpoint_interval = config.checkpoint.interval;
+        if checkpoint_interval > 0 && i % checkpoint_interval == 0 {
+            let snap = solver.snapshot();
+            save_lhe_checkpoint(&snap, i, &config.training.output_dir)?;
+        }
     }
 
+    // Final checkpoint
     let elapsed = start.elapsed();
     let trained = solver.take_result();
+    save_lhe_checkpoint(&trained, total_iterations, &config.training.output_dir)?;
     print_sdcfr_summary(&trained, elapsed);
+    Ok(())
+}
+
+/// Save LHE model buffers (p1.bin, p2.bin) to a checkpoint directory.
+fn save_lhe_checkpoint(
+    trained: &poker_solver_deep_cfr::solver::TrainedSdCfr,
+    iteration: u32,
+    output_dir: &str,
+) -> Result<(), Box<dyn Error>> {
+    let dir = PathBuf::from(output_dir).join(format!("lhe_checkpoint_{iteration}"));
+    std::fs::create_dir_all(&dir)?;
+    trained.model_buffers[0].save_to_file(&dir.join("p1.bin"))?;
+    trained.model_buffers[1].save_to_file(&dir.join("p2.bin"))?;
+    println!("  Saved LHE checkpoint to {}", dir.display());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// eval-lhe command
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn run_eval_lhe(
+    model_dir: &Path,
+    eval_deals: usize,
+    num_actions: usize,
+    hidden_dim: usize,
+    seed: u64,
+    stack_depth: u32,
+    num_streets: u8,
+    board_samples: usize,
+) -> Result<(), Box<dyn Error>> {
+    println!("=== LHE Model Evaluation ===");
+    println!("  Model: {}", model_dir.display());
+    println!("  Eval deals: {eval_deals}");
+    println!("  Network: num_actions={num_actions}, hidden_dim={hidden_dim}");
+    println!("  LHE: stack_depth={stack_depth} BB, streets={num_streets}");
+    println!("  Seed: {seed}");
+    println!();
+
+    // 1. Load model checkpoint
+    let p1_path = model_dir.join("p1.bin");
+    let p2_path = model_dir.join("p2.bin");
+    let p1_buf = poker_solver_deep_cfr::model_buffer::ModelBuffer::load_from_file(&p1_path)?;
+    let p2_buf = poker_solver_deep_cfr::model_buffer::ModelBuffer::load_from_file(&p2_path)?;
+    println!(
+        "  Loaded model buffers: P1={} nets, P2={} nets",
+        p1_buf.len(),
+        p2_buf.len(),
+    );
+
+    // 2. Build explicit policies
+    let device = candle_core::Device::Cpu;
+    let policies = [
+        poker_solver_deep_cfr::eval::ExplicitPolicy::from_buffer(
+            &p1_buf,
+            num_actions,
+            hidden_dim,
+            &device,
+        )?,
+        poker_solver_deep_cfr::eval::ExplicitPolicy::from_buffer(
+            &p2_buf,
+            num_actions,
+            hidden_dim,
+            &device,
+        )?,
+    ];
+
+    // 3. Create LHE game + encoder
+    let lhe_config = poker_solver_core::game::LimitHoldemConfig {
+        stack_depth,
+        num_streets,
+        ..Default::default()
+    };
+    let game = LimitHoldem::new(lhe_config.clone(), eval_deals, seed);
+    let encoder = poker_solver_deep_cfr::lhe_encoder::LheEncoder::new();
+
+    // 4. Generate eval deals and compute exploitability
+    println!("\nComputing sampled exploitability ({eval_deals} deals)...");
+    let deals = game.initial_states();
+    let start = Instant::now();
+    let mbb = poker_solver_deep_cfr::lhe_exploitability::sampled_exploitability(
+        &game,
+        &encoder,
+        &policies,
+        &deals,
+        num_actions,
+    )?;
+    let elapsed = start.elapsed();
+
+    println!("  Exploitability: {mbb:.1} mbb/h");
+    println!("  Computed in {:.1}s", elapsed.as_secs_f64());
+
+    // 5. Preflop strategy visualization
+    println!("\nComputing preflop strategies ({board_samples} board samples per hand)...");
+    let viz_start = Instant::now();
+
+    let rfi_matrix =
+        lhe_viz::preflop_rfi_matrix(&policies, &lhe_config, num_actions, board_samples, seed);
+    lhe_viz::print_hand_matrix(&rfi_matrix, "SB Preflop RFI (Fold/Call/Raise)");
+    lhe_viz::print_hand_matrix_numeric(&rfi_matrix, "SB Preflop RFI (Numeric)");
+
+    let response_matrix =
+        lhe_viz::preflop_response_matrix(&policies, &lhe_config, num_actions, board_samples, seed);
+    lhe_viz::print_hand_matrix(&response_matrix, "BB vs SB Raise (Fold/Call/3-bet)");
+    lhe_viz::print_hand_matrix_numeric(&response_matrix, "BB vs SB Raise (Numeric)");
+
+    println!(
+        "\nVisualization computed in {:.1}s",
+        viz_start.elapsed().as_secs_f64()
+    );
+
     Ok(())
 }
 

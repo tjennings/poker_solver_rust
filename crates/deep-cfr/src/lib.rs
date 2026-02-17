@@ -4,6 +4,7 @@ pub mod config;
 pub mod eval;
 pub mod hunl_encoder;
 pub mod lhe_encoder;
+pub mod lhe_exploitability;
 pub mod memory;
 pub mod model_buffer;
 pub mod network;
