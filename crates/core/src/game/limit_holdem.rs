@@ -153,8 +153,8 @@ impl LimitHoldemState {
             street_raises: 0,
             history: ArrayVec::new(),
             terminal: None,
-            p1_rank: Some(hand_rank(p1_holding, &full_board)),
-            p2_rank: Some(hand_rank(p2_holding, &full_board)),
+            p1_rank: None,
+            p2_rank: None,
         }
     }
 
@@ -356,7 +356,7 @@ fn apply_action(
         Action::Call => apply_call(state, &mut new, config),
         Action::Bet(0) => apply_bet(state, &mut new, config),
         Action::Raise(0) => apply_raise(state, &mut new, config),
-        _ => {} // Other action indices are not valid for limit holdem
+        _ => debug_assert!(false, "invalid action for limit holdem: {action:?}"),
     }
 
     new
