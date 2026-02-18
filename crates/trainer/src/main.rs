@@ -4,6 +4,7 @@ mod tree;
 use std::error::Error;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
@@ -136,27 +137,30 @@ enum Commands {
     },
     /// Evaluate a trained LHE SD-CFR model (exploitability + strategy visualization)
     EvalLhe {
-        /// Directory containing model checkpoint (p1.bin + p2.bin)
+        /// Training output directory (reads training_config.yaml for defaults)
         #[arg(short, long)]
-        model: PathBuf,
+        dir: PathBuf,
+        /// Specific checkpoint subdir (default: latest_checkpoint)
+        #[arg(long)]
+        checkpoint: Option<String>,
         /// Number of deals for exploitability sampling
         #[arg(long, default_value = "10000")]
         eval_deals: usize,
-        /// Number of actions in the trained network
-        #[arg(long, default_value = "3")]
-        num_actions: usize,
-        /// Hidden dimension of the trained network
-        #[arg(long, default_value = "64")]
-        hidden_dim: usize,
-        /// Random seed
-        #[arg(long, default_value = "42")]
-        seed: u64,
-        /// LHE stack depth in BB
-        #[arg(long, default_value = "20")]
-        stack_depth: u32,
-        /// Number of streets (2=flop HE, 4=full)
-        #[arg(long, default_value = "4")]
-        num_streets: u8,
+        /// Override: number of actions in the trained network
+        #[arg(long)]
+        num_actions: Option<usize>,
+        /// Override: hidden dimension of the trained network
+        #[arg(long)]
+        hidden_dim: Option<usize>,
+        /// Override: random seed
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Override: LHE stack depth in BB
+        #[arg(long)]
+        stack_depth: Option<u32>,
+        /// Override: number of streets (2=flop HE, 4=full)
+        #[arg(long)]
+        num_streets: Option<u8>,
         /// Board samples for strategy visualization
         #[arg(long, default_value = "100")]
         board_samples: usize,
@@ -485,7 +489,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             )?;
         }
         Commands::EvalLhe {
-            model,
+            dir,
+            checkpoint,
             eval_deals,
             num_actions,
             hidden_dim,
@@ -495,7 +500,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             board_samples,
         } => {
             run_eval_lhe(
-                &model,
+                &dir,
+                checkpoint.as_deref(),
                 eval_deals,
                 num_actions,
                 hidden_dim,
@@ -1085,7 +1091,7 @@ fn run_sdcfr_training(config_path: &Path) -> Result<(), Box<dyn Error>> {
 
     match config.game_type {
         SdCfrGameType::HunlPostflop => run_sdcfr_hunl(config),
-        SdCfrGameType::LimitHoldem => run_sdcfr_lhe(config),
+        SdCfrGameType::LimitHoldem => run_sdcfr_lhe(config, config_path),
     }
 }
 
@@ -1190,14 +1196,19 @@ fn run_sdcfr_hunl(config: SdCfrTrainingConfig) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_sdcfr_lhe(config: SdCfrTrainingConfig) -> Result<(), Box<dyn Error>> {
+fn run_sdcfr_lhe(config: SdCfrTrainingConfig, config_path: &Path) -> Result<(), Box<dyn Error>> {
     print_sdcfr_lhe_config(&config);
 
     let device = poker_solver_deep_cfr::best_available_device();
     println!("  Compute device: {:?}", device);
 
+    // Persist training config in output directory
+    let output_dir = PathBuf::from(&config.training.output_dir);
+    std::fs::create_dir_all(&output_dir)?;
+    std::fs::copy(config_path, output_dir.join("training_config.yaml"))?;
+
     let lhe_config = config.lhe_game.clone().unwrap_or_default();
-    let game = LimitHoldem::new(lhe_config, config.deals.count, config.deals.seed);
+    let game = LimitHoldem::new(lhe_config.clone(), config.deals.count, config.deals.seed);
     let deal_pool = game.initial_states();
     println!("  Generated {} deals", deal_pool.len());
 
@@ -1239,29 +1250,91 @@ fn run_sdcfr_lhe(config: SdCfrTrainingConfig) -> Result<(), Box<dyn Error>> {
         let checkpoint_interval = config.checkpoint.interval;
         if checkpoint_interval > 0 && i % checkpoint_interval == 0 {
             let snap = solver.snapshot();
-            save_lhe_checkpoint(&snap, i, &config.training.output_dir)?;
+            save_lhe_checkpoint(
+                &snap,
+                i,
+                &config.training.output_dir,
+                config.network.num_actions,
+                config.network.hidden_dim,
+                &lhe_config,
+                config.deals.seed,
+                50,
+            )?;
         }
     }
 
     // Final checkpoint
     let elapsed = start.elapsed();
     let trained = solver.take_result();
-    save_lhe_checkpoint(&trained, total_iterations, &config.training.output_dir)?;
+    save_lhe_checkpoint(
+        &trained,
+        total_iterations,
+        &config.training.output_dir,
+        config.network.num_actions,
+        config.network.hidden_dim,
+        &lhe_config,
+        config.deals.seed,
+        50,
+    )?;
     print_sdcfr_summary(&trained, elapsed);
     Ok(())
 }
 
-/// Save LHE model buffers (p1.bin, p2.bin) to a checkpoint directory.
+/// Save LHE model buffers (p1.bin, p2.bin) to a checkpoint directory,
+/// update the `latest_checkpoint` symlink, and print preflop strategy matrices.
+#[allow(clippy::too_many_arguments)]
 fn save_lhe_checkpoint(
     trained: &poker_solver_deep_cfr::solver::TrainedSdCfr,
     iteration: u32,
     output_dir: &str,
+    num_actions: usize,
+    hidden_dim: usize,
+    lhe_config: &poker_solver_core::game::LimitHoldemConfig,
+    seed: u64,
+    board_samples: usize,
 ) -> Result<(), Box<dyn Error>> {
-    let dir = PathBuf::from(output_dir).join(format!("lhe_checkpoint_{iteration}"));
+    let base = PathBuf::from(output_dir);
+    let checkpoint_name = format!("lhe_checkpoint_{iteration}");
+    let dir = base.join(&checkpoint_name);
     std::fs::create_dir_all(&dir)?;
     trained.model_buffers[0].save_to_file(&dir.join("p1.bin"))?;
     trained.model_buffers[1].save_to_file(&dir.join("p2.bin"))?;
+
+    // Update latest_checkpoint symlink (relative target for portability)
+    let link = base.join("latest_checkpoint");
+    let _ = std::fs::remove_file(&link);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&checkpoint_name, &link)?;
+
     println!("  Saved LHE checkpoint to {}", dir.display());
+
+    // Print preflop strategy matrices
+    let device = candle_core::Device::Cpu;
+    let policies = [
+        poker_solver_deep_cfr::eval::ExplicitPolicy::from_buffer(
+            &trained.model_buffers[0],
+            num_actions,
+            hidden_dim,
+            &device,
+        )?,
+        poker_solver_deep_cfr::eval::ExplicitPolicy::from_buffer(
+            &trained.model_buffers[1],
+            num_actions,
+            hidden_dim,
+            &device,
+        )?,
+    ];
+
+    let rfi_matrix =
+        lhe_viz::preflop_rfi_matrix(&policies, lhe_config, num_actions, board_samples, seed);
+    lhe_viz::print_hand_matrix(&rfi_matrix, "SB Preflop RFI (Fold/Call/Raise)");
+    lhe_viz::print_hand_matrix_numeric(&rfi_matrix, "SB Preflop RFI (Numeric)");
+
+    let response_matrix =
+        lhe_viz::preflop_response_matrix(&policies, lhe_config, num_actions, board_samples, seed);
+    lhe_viz::print_hand_matrix(&response_matrix, "BB vs SB Raise (Fold/Call/3-bet)");
+    lhe_viz::print_hand_matrix_numeric(&response_matrix, "BB vs SB Raise (Numeric)");
+
     Ok(())
 }
 
@@ -1271,17 +1344,54 @@ fn save_lhe_checkpoint(
 
 #[allow(clippy::too_many_arguments)]
 fn run_eval_lhe(
-    model_dir: &Path,
+    dir: &Path,
+    checkpoint: Option<&str>,
     eval_deals: usize,
-    num_actions: usize,
-    hidden_dim: usize,
-    seed: u64,
-    stack_depth: u32,
-    num_streets: u8,
+    num_actions_override: Option<usize>,
+    hidden_dim_override: Option<usize>,
+    seed_override: Option<u64>,
+    stack_depth_override: Option<u32>,
+    num_streets_override: Option<u8>,
     board_samples: usize,
 ) -> Result<(), Box<dyn Error>> {
+    // Try to load training config from output directory
+    let config_path = dir.join("training_config.yaml");
+    let saved_config = if config_path.exists() {
+        let yaml = std::fs::read_to_string(&config_path)?;
+        Some(serde_yaml::from_str::<SdCfrTrainingConfig>(&yaml)?)
+    } else {
+        None
+    };
+
+    // Resolve parameters: CLI override > saved config > hardcoded default
+    let num_actions = num_actions_override
+        .or(saved_config.as_ref().map(|c| c.network.num_actions))
+        .unwrap_or(3);
+    let hidden_dim = hidden_dim_override
+        .or(saved_config.as_ref().map(|c| c.network.hidden_dim))
+        .unwrap_or(64);
+    let seed = seed_override
+        .or(saved_config.as_ref().map(|c| c.deals.seed))
+        .unwrap_or(42);
+    let stack_depth = stack_depth_override
+        .or(saved_config.as_ref().and_then(|c| c.lhe_game.as_ref().map(|g| g.stack_depth)))
+        .unwrap_or(20);
+    let num_streets = num_streets_override
+        .or(saved_config.as_ref().and_then(|c| c.lhe_game.as_ref().map(|g| g.num_streets)))
+        .unwrap_or(4);
+
+    // Resolve checkpoint directory
+    let checkpoint_dir = match checkpoint {
+        Some(name) => dir.join(name),
+        None => dir.join("latest_checkpoint"),
+    };
+
     println!("=== LHE Model Evaluation ===");
-    println!("  Model: {}", model_dir.display());
+    println!("  Directory: {}", dir.display());
+    println!("  Checkpoint: {}", checkpoint_dir.display());
+    if saved_config.is_some() {
+        println!("  Config: loaded from training_config.yaml");
+    }
     println!("  Eval deals: {eval_deals}");
     println!("  Network: num_actions={num_actions}, hidden_dim={hidden_dim}");
     println!("  LHE: stack_depth={stack_depth} BB, streets={num_streets}");
@@ -1289,8 +1399,8 @@ fn run_eval_lhe(
     println!();
 
     // 1. Load model checkpoint
-    let p1_path = model_dir.join("p1.bin");
-    let p2_path = model_dir.join("p2.bin");
+    let p1_path = checkpoint_dir.join("p1.bin");
+    let p2_path = checkpoint_dir.join("p2.bin");
     let p1_buf = poker_solver_deep_cfr::model_buffer::ModelBuffer::load_from_file(&p1_path)?;
     let p2_buf = poker_solver_deep_cfr::model_buffer::ModelBuffer::load_from_file(&p2_path)?;
     println!(
@@ -1325,17 +1435,58 @@ fn run_eval_lhe(
     let game = LimitHoldem::new(lhe_config.clone(), eval_deals, seed);
     let encoder = poker_solver_deep_cfr::lhe_encoder::LheEncoder::new();
 
-    // 4. Generate eval deals and compute exploitability
-    println!("\nComputing sampled exploitability ({eval_deals} deals)...");
+    // 4. Generate eval deals and compute exploitability with progress bar
     let deals = game.initial_states();
+    println!("\nComputing sampled exploitability ({} deals)...", deals.len());
     let start = Instant::now();
-    let mbb = poker_solver_deep_cfr::lhe_exploitability::sampled_exploitability(
-        &game,
-        &encoder,
-        &policies,
-        &deals,
-        num_actions,
-    )?;
+
+    let pb = ProgressBar::new((2 * deals.len()) as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner} [{elapsed_precise}] [{bar:40}] {pos}/{len} ({per_sec}, ETA: {eta})")
+            .expect("valid progress bar template")
+            .progress_chars("=> "),
+    );
+
+    use rayon::prelude::*;
+
+    let progress = AtomicU64::new(0);
+    let br_p1_sum: f64 = deals
+        .par_iter()
+        .map(|deal| {
+            let ev = poker_solver_deep_cfr::lhe_exploitability::br_ev_for_deal(
+                &game, &encoder, &policies, deal, Player::Player1, num_actions,
+            );
+            let prev = progress.fetch_add(1, Ordering::Relaxed);
+            if prev % 64 == 0 {
+                pb.set_position(prev + 1);
+            }
+            ev
+        })
+        .collect::<Result<Vec<f64>, _>>()?
+        .iter()
+        .sum();
+
+    let br_p2_sum: f64 = deals
+        .par_iter()
+        .map(|deal| {
+            let ev = poker_solver_deep_cfr::lhe_exploitability::br_ev_for_deal(
+                &game, &encoder, &policies, deal, Player::Player2, num_actions,
+            );
+            let prev = progress.fetch_add(1, Ordering::Relaxed);
+            if prev % 64 == 0 {
+                pb.set_position(prev + 1);
+            }
+            ev
+        })
+        .collect::<Result<Vec<f64>, _>>()?
+        .iter()
+        .sum();
+
+    pb.finish_and_clear();
+
+    let n = deals.len() as f64;
+    let mbb = ((br_p1_sum / n) + (br_p2_sum / n)) / 2.0 * 1000.0;
     let elapsed = start.elapsed();
 
     println!("  Exploitability: {mbb:.1} mbb/h");
