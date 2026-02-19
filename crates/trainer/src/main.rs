@@ -651,11 +651,7 @@ fn run_solve_preflop(
             .progress_chars("#>-"),
     );
 
-    let chunk = if print_every > 0 {
-        print_every
-    } else {
-        std::cmp::max(iterations / 100, 1)
-    };
+    let chunk = std::cmp::max(iterations / 100, 1);
     let mut done = 0u64;
     while done < iterations {
         let batch = std::cmp::min(chunk, iterations - done);
