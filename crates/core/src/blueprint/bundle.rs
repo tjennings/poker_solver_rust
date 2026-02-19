@@ -43,8 +43,13 @@ impl AbstractionModeConfig {
     }
 }
 
+/// Default number of players for a blueprint.
+fn default_num_players() -> u8 {
+    2
+}
+
 /// Combined configuration stored in config.yaml
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleConfig {
     /// Game configuration (stack depth, bet sizes)
     pub game: PostflopConfig,
@@ -59,6 +64,26 @@ pub struct BundleConfig {
     /// Number of bits for equity bin (0-4). Only used with `hand_class_v2`.
     #[serde(default)]
     pub equity_bits: u8,
+    /// Number of players this blueprint was trained for (default: 2).
+    #[serde(default = "default_num_players")]
+    pub num_players: u8,
+    /// Whether this blueprint is intended as a subgame-solving base.
+    #[serde(default)]
+    pub is_subgame_base: bool,
+}
+
+impl Default for BundleConfig {
+    fn default() -> Self {
+        Self {
+            game: PostflopConfig::default(),
+            abstraction: None,
+            abstraction_mode: AbstractionModeConfig::default(),
+            strength_bits: 0,
+            equity_bits: 0,
+            num_players: default_num_players(),
+            is_subgame_base: false,
+        }
+    }
 }
 
 /// A complete strategy bundle containing all data needed for exploration.
@@ -197,8 +222,7 @@ mod tests {
                 samples_per_street: 1000,
             }),
             abstraction_mode: AbstractionModeConfig::Ehs2,
-            strength_bits: 0,
-            equity_bits: 0,
+            ..BundleConfig::default()
         }
     }
 
@@ -269,8 +293,7 @@ mod tests {
             },
             abstraction: None,
             abstraction_mode: AbstractionModeConfig::HandClassV2,
-            strength_bits: 0,
-            equity_bits: 0,
+            ..BundleConfig::default()
         };
         let blueprint = BlueprintStrategy::new();
         let bundle = StrategyBundle::new(config, blueprint, None);
@@ -344,5 +367,27 @@ mod tests {
     fn load_nonexistent_returns_error() {
         let result = StrategyBundle::load(Path::new("/nonexistent/path"));
         assert!(result.is_err());
+    }
+
+    #[timed_test]
+    fn bundle_config_defaults_to_2_players() {
+        let yaml = "game:\n  stack_depth: 20\n  bet_sizes: [0.5]\n";
+        let config: BundleConfig = serde_yaml::from_str(yaml)
+            .expect("minimal YAML should parse");
+        assert_eq!(config.num_players, 2);
+        assert!(!config.is_subgame_base);
+    }
+
+    #[timed_test]
+    fn bundle_config_roundtrips_new_fields() {
+        let config = BundleConfig {
+            num_players: 6,
+            is_subgame_base: true,
+            ..create_test_config()
+        };
+        let yaml = serde_yaml::to_string(&config).expect("serialize");
+        let loaded: BundleConfig = serde_yaml::from_str(&yaml).expect("deserialize");
+        assert_eq!(loaded.num_players, 6);
+        assert!(loaded.is_subgame_base);
     }
 }

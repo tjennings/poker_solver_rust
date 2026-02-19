@@ -1104,6 +1104,7 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         } else {
             0
         },
+        ..BundleConfig::default()
     };
 
     let num_threads = rayon::current_num_threads();
@@ -1753,8 +1754,7 @@ fn save_strategy_bundle(
         game: game_config.clone(),
         abstraction: None,
         abstraction_mode: AbstractionModeConfig::default(),
-        strength_bits: 0,
-        equity_bits: 0,
+        ..BundleConfig::default()
     };
     let blueprint = BlueprintStrategy::from_strategies(strategy_map, u64::from(iteration));
     let bundle = StrategyBundle::new(bundle_config, blueprint, None);
@@ -2213,6 +2213,7 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         } else {
             0
         },
+        ..BundleConfig::default()
     };
 
     let boundaries = None; // sequence solver doesn't use EHS2
@@ -2370,6 +2371,7 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         } else {
             0
         },
+        ..BundleConfig::default()
     };
     let boundaries = None;
     let actions = tree_game.actions(&tree_states[0]);

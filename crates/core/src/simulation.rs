@@ -758,8 +758,7 @@ raise = 0.33
             },
             abstraction: None,
             abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClassV2,
-            strength_bits: 0,
-            equity_bits: 0,
+            ..BundleConfig::default()
         };
         let generator = BlueprintAgentGenerator::new(blueprint, config);
         let gs = GameState::new_starting(vec![100.0, 100.0], 2.0, 1.0, 0.0, 0);
@@ -935,8 +934,7 @@ raise = 0.4
             },
             abstraction: None,
             abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClassV2,
-            strength_bits: 0,
-            equity_bits: 0,
+            ..BundleConfig::default()
         };
         let agent = BlueprintAgent::new(blueprint, config);
         // An arbitrary key that won't be in the empty blueprint
@@ -965,8 +963,7 @@ raise = 0.4
             },
             abstraction: None,
             abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClassV2,
-            strength_bits: 0,
-            equity_bits: 0,
+            ..BundleConfig::default()
         };
         let agent = BlueprintAgent::new(blueprint, config);
         // Look up with pot=11, stack=2 — should find nearby pot=10, stack=3 (distance 2)
