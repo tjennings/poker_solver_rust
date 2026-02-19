@@ -48,6 +48,19 @@ impl Default for SequenceCfrConfig {
     }
 }
 
+impl SequenceCfrConfig {
+    /// Linear CFR weighting (Pluribus). All discount exponents = 1.0.
+    /// This weights iteration t's contributions by t/(t+1).
+    #[must_use]
+    pub fn linear_cfr() -> Self {
+        Self {
+            dcfr_alpha: 1.0,
+            dcfr_beta: 1.0,
+            dcfr_gamma: 1.0,
+        }
+    }
+}
+
 /// Maps each deal to its per-street hand bits, equity, and weight.
 ///
 /// Hand bits can differ per street when using hand-class abstractions:
@@ -648,6 +661,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[timed_test]
+    fn linear_cfr_config_has_all_ones() {
+        let config = SequenceCfrConfig::linear_cfr();
+        assert!((config.dcfr_alpha - 1.0).abs() < f64::EPSILON);
+        assert!((config.dcfr_beta - 1.0).abs() < f64::EPSILON);
+        assert!((config.dcfr_gamma - 1.0).abs() < f64::EPSILON);
     }
 
     fn strategy_delta(a: &FxHashMap<u64, Vec<f64>>, b: &FxHashMap<u64, Vec<f64>>) -> f64 {
