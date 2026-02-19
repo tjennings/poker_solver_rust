@@ -7,6 +7,7 @@
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Optimizer, VarBuilder, VarMap};
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -360,25 +361,36 @@ fn train_value_net(
     let (varmap, net) = create_fresh_net(config, device)?;
     let vars = varmap.all_vars();
     let mut opt = candle_nn::AdamW::new_lr(vars.clone(), config.learning_rate)?;
-    let log_interval = sgd_log_interval(config.sgd_steps);
 
     let gpu = buffer_to_gpu_tensors(buffer, max_iteration, config.num_actions, device)?;
     let n = gpu.len;
 
+    let pb = ProgressBar::new(config.sgd_steps as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "      {spinner:.green} [{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} steps ({per_sec}, ETA: {eta}) loss={msg}",
+        )
+        .expect("valid template")
+        .progress_chars("=> "),
+    );
+    pb.set_message("...");
+
+    let log_interval = sgd_log_interval(config.sgd_steps);
+    let mut last_loss = 0.0_f32;
+
     for step in 0..config.sgd_steps {
         let indices = random_index_tensor(config.batch_size.min(n), n, rng, device)?;
         let loss = compute_batch_loss_gpu(&net, &gpu, &indices)?;
-        if log_interval > 0 && step > 0 && step % log_interval == 0 {
-            let loss_val = loss.to_scalar::<f32>()?;
-            eprintln!(
-                "      SGD step {step}/{} loss={loss_val:.6}",
-                config.sgd_steps,
-            );
+        if log_interval > 0 && step % log_interval == 0 {
+            last_loss = loss.to_scalar::<f32>()?;
+            pb.set_message(format!("{last_loss:.6}"));
         }
         let mut grads = loss.backward()?;
         clip_grad_store(&mut grads, &vars, config.grad_clip_norm)?;
         opt.step(&grads)?;
+        pb.inc(1);
     }
+    pb.finish_with_message(format!("{last_loss:.6}"));
 
     Ok((net, varmap))
 }

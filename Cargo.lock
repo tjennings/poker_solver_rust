@@ -3442,6 +3442,7 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "indicatif",
  "log",
  "poker-solver-core",
  "proptest",
