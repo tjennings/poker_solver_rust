@@ -428,7 +428,18 @@ pub fn preflop_strategy_matrix(
 }
 
 /// Classify preflop action probabilities into fold/raise.
+///
+/// When `probs` is empty (no training yet), falls back to uniform over actions.
+#[allow(clippy::cast_precision_loss)]
 fn classify_preflop_probs(actions: &[PreflopAction], probs: &[f64]) -> HandStrategy {
+    let probs: &[f64] = if probs.is_empty() {
+        // No strategy yet — use uniform placeholder
+        // Leaked only once per call, but we use a static-sized buffer instead
+        return uniform_strategy(actions);
+    } else {
+        probs
+    };
+
     let mut fold = 0.0f64;
     let mut raise = 0.0f64;
 
@@ -441,6 +452,28 @@ fn classify_preflop_probs(actions: &[PreflopAction], probs: &[f64]) -> HandStrat
         }
     }
 
+    HandStrategy {
+        fold: fold as f32,
+        raise: raise as f32,
+    }
+}
+
+/// Uniform strategy over the given actions.
+#[allow(clippy::cast_precision_loss)]
+fn uniform_strategy(actions: &[PreflopAction]) -> HandStrategy {
+    if actions.is_empty() {
+        return HandStrategy { fold: 0.0, raise: 0.0 };
+    }
+    let p = 1.0 / actions.len() as f64;
+    let mut fold = 0.0f64;
+    let mut raise = 0.0f64;
+    for action in actions {
+        match action {
+            PreflopAction::Fold => fold += p,
+            PreflopAction::Call => {}
+            PreflopAction::Raise(_) | PreflopAction::AllIn => raise += p,
+        }
+    }
     HandStrategy {
         fold: fold as f32,
         raise: raise as f32,
