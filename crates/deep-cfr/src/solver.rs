@@ -389,7 +389,7 @@ fn train_value_net(
 
 /// All training data pre-uploaded to the compute device.
 struct GpuTrainingData {
-    cards: Tensor,   // [N, 7] i64
+    cards: Tensor,   // [N, 7] f32 (cast to i64 before forward pass; f32 for Metal compat)
     bets: Tensor,    // [N, 48] f32
     targets: Tensor, // [N, num_actions] f32
     weights: Tensor, // [N, 1] f32
@@ -438,7 +438,8 @@ fn compute_batch_loss_gpu(
     gpu: &GpuTrainingData,
     indices: &Tensor,
 ) -> Result<Tensor, SdCfrError> {
-    let cards = gpu.cards.index_select(indices, 0)?;
+    let cards_f32 = gpu.cards.index_select(indices, 0)?;
+    let cards = cards_f32.to_dtype(DType::I64)?; // -1.0 → -1, 0-51 exact
     let bets = gpu.bets.index_select(indices, 0)?;
     let targets = gpu.targets.index_select(indices, 0)?;
     let weights = gpu.weights.index_select(indices, 0)?;
@@ -446,10 +447,12 @@ fn compute_batch_loss_gpu(
     weighted_mse(&predictions, &targets, &weights)
 }
 
-/// Flatten card features from a slice of samples.
-fn collect_card_data_slice(data: &[AdvantageSample]) -> Vec<i64> {
+/// Flatten card features from a slice of samples as f32.
+/// Metal lacks i64 `index_select`, so cards are stored as f32 on GPU
+/// and cast to i64 before the forward pass. Values -1..51 are exact in f32.
+fn collect_card_data_slice(data: &[AdvantageSample]) -> Vec<f32> {
     data.iter()
-        .flat_map(|s| s.features.cards.iter().map(|&c| i64::from(c)))
+        .flat_map(|s| s.features.cards.iter().map(|&c| f32::from(c)))
         .collect()
 }
 
