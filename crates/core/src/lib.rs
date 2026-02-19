@@ -25,6 +25,7 @@ pub mod game;
 pub mod hand_class;
 pub mod hands;
 pub mod info_key;
+pub mod preflop;
 pub mod showdown_equity;
 pub mod simulation;
 pub mod tree;
