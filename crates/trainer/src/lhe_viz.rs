@@ -79,6 +79,7 @@ fn rank_label(v: Value) -> &'static str {
 }
 
 /// Hand label for a matrix cell (e.g., "AKs", "QQ", "72o").
+#[cfg(test)]
 fn hand_label(row: usize, col: usize) -> String {
     let r1 = rank_label(RANK_ORDER[row]);
     let r2 = rank_label(RANK_ORDER[col]);
@@ -335,10 +336,10 @@ pub fn print_hand_matrix(matrix: &HandMatrix, title: &str) {
     println!("\n{BOLD}{title}{RESET}");
     println!();
 
-    // Header row
+    // Header row — "s" suffix marks the suited (upper-triangle) dimension
     print!("     ");
     for &rank in &RANK_ORDER {
-        print!("{:>5} ", rank_label(rank));
+        print!("{:>4}s ", rank_label(rank));
     }
     println!();
 
@@ -355,43 +356,9 @@ pub fn print_hand_matrix(matrix: &HandMatrix, title: &str) {
 
     // Legend
     println!();
-    println!("  Legend: {RED}F{RESET}=fold {GREEN}C{RESET}=call/check {YELLOW}R{RESET}=raise/bet");
-}
-
-/// Print a hand matrix as a numerical table (no colors).
-pub fn print_hand_matrix_numeric(matrix: &HandMatrix, title: &str) {
-    println!("\n{title}");
-    println!();
-
-    // Header
-    print!("       ");
-    for &rank in &RANK_ORDER {
-        print!("{:>12} ", rank_label(rank));
-    }
-    println!();
-
-    for (row, matrix_row) in matrix.iter().enumerate() {
-        print!("  {}  ", rank_label(RANK_ORDER[row]));
-        for (col, cell) in matrix_row.iter().enumerate() {
-            match cell {
-                Some(s) => {
-                    let label = hand_label(row, col);
-                    print!(
-                        " {:>3} {:.0}/{:.0}/{:.0}",
-                        label,
-                        s.fold * 100.0,
-                        s.call * 100.0,
-                        s.raise * 100.0,
-                    );
-                }
-                None => print!("         --- "),
-            }
-        }
-        println!();
-    }
-
-    println!();
-    println!("  Format: HAND F%/C%/R%  (Fold/Call-Check/Raise-Bet)");
+    println!(
+        "  Legend: {RED}F{RESET}=fold {GREEN}C{RESET}=call/check {YELLOW}R{RESET}=raise/bet  |  Upper-right=suited  Lower-left=offsuit  Diagonal=pairs"
+    );
 }
 
 /// Render a single cell as a stacked color bar of `BAR_WIDTH` characters.

@@ -1328,12 +1328,10 @@ fn save_lhe_checkpoint(
     let rfi_matrix =
         lhe_viz::preflop_rfi_matrix(&policies, lhe_config, num_actions, board_samples, seed);
     lhe_viz::print_hand_matrix(&rfi_matrix, "SB Preflop RFI (Fold/Call/Raise)");
-    lhe_viz::print_hand_matrix_numeric(&rfi_matrix, "SB Preflop RFI (Numeric)");
 
     let response_matrix =
         lhe_viz::preflop_response_matrix(&policies, lhe_config, num_actions, board_samples, seed);
     lhe_viz::print_hand_matrix(&response_matrix, "BB vs SB Raise (Fold/Call/3-bet)");
-    lhe_viz::print_hand_matrix_numeric(&response_matrix, "BB vs SB Raise (Numeric)");
 
     Ok(())
 }
@@ -1499,12 +1497,10 @@ fn run_eval_lhe(
     let rfi_matrix =
         lhe_viz::preflop_rfi_matrix(&policies, &lhe_config, num_actions, board_samples, seed);
     lhe_viz::print_hand_matrix(&rfi_matrix, "SB Preflop RFI (Fold/Call/Raise)");
-    lhe_viz::print_hand_matrix_numeric(&rfi_matrix, "SB Preflop RFI (Numeric)");
 
     let response_matrix =
         lhe_viz::preflop_response_matrix(&policies, &lhe_config, num_actions, board_samples, seed);
     lhe_viz::print_hand_matrix(&response_matrix, "BB vs SB Raise (Fold/Call/3-bet)");
-    lhe_viz::print_hand_matrix_numeric(&response_matrix, "BB vs SB Raise (Numeric)");
 
     println!(
         "\nVisualization computed in {:.1}s",
