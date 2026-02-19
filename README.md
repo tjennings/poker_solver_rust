@@ -276,6 +276,64 @@ my_strategy/
 └── boundaries.bin    # EHS2 bucket boundaries (only for ehs2 mode)
 ```
 
+### 4. Diagnosing training convergence (LHE)
+
+The `trace-lhe` subcommand traces strategy evolution across SD-CFR checkpoints for specific spots. This is useful for verifying that training is converging rather than stuck with uniform strategies.
+
+```bash
+# Trace specific spots across all checkpoints
+cargo run -p poker-solver-trainer --release -- trace-lhe -d ./lhe_sdcfr \
+  --spot "SB AA" --spot "SB 72o" --spot "BB.R AKs"
+
+# Sample every 5th checkpoint with 200 board samples per hand
+cargo run -p poker-solver-trainer --release -- trace-lhe -d ./lhe_sdcfr \
+  --spot "SB AA" --every 5 --board-samples 200
+
+# Load spots from a YAML file
+cargo run -p poker-solver-trainer --release -- trace-lhe -d ./lhe_sdcfr \
+  --spots-file spots.yaml
+```
+
+**Spot notation:**
+
+| Notation | Meaning |
+|-|-|
+| `SB AA` | SB at preflop root with AA |
+| `SB AKs` | SB at preflop root with AKs |
+| `BB.R AKs` | BB facing SB raise with AKs |
+| `BB.C JTs` | BB after SB limp with JTs |
+
+**Spots file format** (`spots.yaml`):
+
+```yaml
+- player: SB
+  hand: AA
+- player: BB.R
+  hand: AKs
+```
+
+Output shows a table per spot with fold/call/raise probabilities, number of nets in the model buffer, and raw advantage predictions from the latest net:
+
+```
+=== SB AA (Fold/Call/Raise) ===
+ Iter |   Fold |   Call |  Raise | Nets | Raw Adv (latest net)
+------|--------|--------|--------|------|---------------------
+    1 |  0.330 |  0.340 |  0.330 |    1 | [ -0.01,   0.02,   0.01]
+    5 |  0.250 |  0.300 |  0.450 |    5 | [ -0.34,  -0.12,   0.89]
+   10 |  0.100 |  0.150 |  0.750 |   10 | [ -1.20,  -0.45,   2.10]
+   37 |  0.020 |  0.080 |  0.900 |   37 | [ -2.50,  -0.90,   3.80]
+```
+
+If strategies remain near-uniform (0.33/0.33/0.33) across many checkpoints and raw advantages stay near zero, the network is not learning meaningful signals.
+
+Options:
+- `-d, --dir <DIR>` — Training output directory containing `lhe_checkpoint_N` subdirectories
+- `--spot <SPOT>` — Spot to trace (repeatable)
+- `--spots-file <FILE>` — YAML file with spot definitions
+- `--every <N>` — Sample every Nth checkpoint (default: 1)
+- `--board-samples <N>` — Board samples per hand per checkpoint (default: 50)
+- `--num-actions`, `--hidden-dim`, `--seed`, `--stack-depth`, `--num-streets` — Override network/game parameters (auto-detected from `training_config.yaml`)
+
 ## Exploring a Strategy
 
 The desktop app lets you browse trained strategies interactively.

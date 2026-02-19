@@ -1,3 +1,4 @@
+mod lhe_diagnose;
 mod lhe_viz;
 mod tree;
 
@@ -165,6 +166,39 @@ enum Commands {
         #[arg(long, default_value = "100")]
         board_samples: usize,
     },
+    /// Trace LHE strategy evolution across SD-CFR checkpoints
+    TraceLhe {
+        /// Training output directory containing lhe_checkpoint_N subdirs
+        #[arg(short, long)]
+        dir: PathBuf,
+        /// Spot to trace (repeatable, e.g. "SB AA", "BB.R AKs")
+        #[arg(long)]
+        spot: Vec<String>,
+        /// YAML file with spot definitions
+        #[arg(long)]
+        spots_file: Option<PathBuf>,
+        /// Sample every Nth checkpoint
+        #[arg(long, default_value = "1")]
+        every: u32,
+        /// Board samples per hand per checkpoint
+        #[arg(long, default_value = "50")]
+        board_samples: usize,
+        /// Override: number of actions in the trained network
+        #[arg(long)]
+        num_actions: Option<usize>,
+        /// Override: hidden dimension of the trained network
+        #[arg(long)]
+        hidden_dim: Option<usize>,
+        /// Override: random seed
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Override: LHE stack depth in BB
+        #[arg(long)]
+        stack_depth: Option<u32>,
+        /// Override: number of streets (2=flop HE, 4=full)
+        #[arg(long)]
+        num_streets: Option<u8>,
+    },
 }
 
 /// Solver backend selection.
@@ -305,7 +339,7 @@ fn default_pruning_probe_interval() -> u64 {
 /// Game type selection for SD-CFR training.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum SdCfrGameType {
+pub(crate) enum SdCfrGameType {
     HunlPostflop,
     LimitHoldem,
 }
@@ -315,29 +349,29 @@ fn default_sdcfr_game_type() -> SdCfrGameType {
 }
 
 #[derive(Debug, Deserialize)]
-struct SdCfrTrainingConfig {
+pub(crate) struct SdCfrTrainingConfig {
     #[serde(default = "default_sdcfr_game_type")]
-    game_type: SdCfrGameType,
-    game: PostflopConfig,
+    pub(crate) game_type: SdCfrGameType,
+    pub(crate) game: PostflopConfig,
     #[serde(default)]
-    lhe_game: Option<poker_solver_core::game::LimitHoldemConfig>,
-    deals: SdCfrDealConfig,
-    training: SdCfrTrainingParams,
-    network: SdCfrNetworkConfig,
-    sgd: SdCfrSgdConfig,
-    memory: SdCfrMemoryConfig,
-    checkpoint: SdCfrCheckpointConfig,
+    pub(crate) lhe_game: Option<poker_solver_core::game::LimitHoldemConfig>,
+    pub(crate) deals: SdCfrDealConfig,
+    pub(crate) training: SdCfrTrainingParams,
+    pub(crate) network: SdCfrNetworkConfig,
+    pub(crate) sgd: SdCfrSgdConfig,
+    pub(crate) memory: SdCfrMemoryConfig,
+    pub(crate) checkpoint: SdCfrCheckpointConfig,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // Fields parsed from YAML; some reserved for future checkpoint/stratification tasks
-struct SdCfrDealConfig {
-    count: usize,
+pub(crate) struct SdCfrDealConfig {
+    pub(crate) count: usize,
     #[serde(default)]
-    min_per_class: usize,
+    pub(crate) min_per_class: usize,
     #[serde(default = "default_max_rejections")]
-    max_rejections: usize,
-    seed: u64,
+    pub(crate) max_rejections: usize,
+    pub(crate) seed: u64,
 }
 
 fn default_parallel_traversals() -> usize {
@@ -345,28 +379,28 @@ fn default_parallel_traversals() -> usize {
 }
 
 #[derive(Debug, Deserialize)]
-struct SdCfrTrainingParams {
-    iterations: u32,
-    traversals_per_iter: u32,
-    seed: u64,
-    output_dir: String,
+pub(crate) struct SdCfrTrainingParams {
+    pub(crate) iterations: u32,
+    pub(crate) traversals_per_iter: u32,
+    pub(crate) seed: u64,
+    pub(crate) output_dir: String,
     #[serde(default = "default_parallel_traversals")]
-    parallel_traversals: usize,
+    pub(crate) parallel_traversals: usize,
 }
 
 #[derive(Debug, Deserialize)]
-struct SdCfrNetworkConfig {
-    hidden_dim: usize,
-    num_actions: usize,
+pub(crate) struct SdCfrNetworkConfig {
+    pub(crate) hidden_dim: usize,
+    pub(crate) num_actions: usize,
 }
 
 #[derive(Debug, Deserialize)]
-struct SdCfrSgdConfig {
-    steps: usize,
-    batch_size: usize,
-    learning_rate: f64,
+pub(crate) struct SdCfrSgdConfig {
+    pub(crate) steps: usize,
+    pub(crate) batch_size: usize,
+    pub(crate) learning_rate: f64,
     #[serde(default = "default_grad_clip")]
-    grad_clip_norm: f64,
+    pub(crate) grad_clip_norm: f64,
 }
 
 fn default_grad_clip() -> f64 {
@@ -374,13 +408,13 @@ fn default_grad_clip() -> f64 {
 }
 
 #[derive(Debug, Deserialize)]
-struct SdCfrMemoryConfig {
-    advantage_cap: usize,
+pub(crate) struct SdCfrMemoryConfig {
+    pub(crate) advantage_cap: usize,
 }
 
 #[derive(Debug, Deserialize)]
-struct SdCfrCheckpointConfig {
-    interval: u32,
+pub(crate) struct SdCfrCheckpointConfig {
+    pub(crate) interval: u32,
 }
 
 /// Hands to display in the SB preflop strategy table.
@@ -509,6 +543,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                 stack_depth,
                 num_streets,
                 board_samples,
+            )?;
+        }
+        Commands::TraceLhe {
+            dir,
+            spot,
+            spots_file,
+            every,
+            board_samples,
+            num_actions,
+            hidden_dim,
+            seed,
+            stack_depth,
+            num_streets,
+        } => {
+            lhe_diagnose::run_trace_lhe(
+                &dir,
+                &spot,
+                spots_file.as_deref(),
+                every,
+                board_samples,
+                num_actions,
+                hidden_dim,
+                seed,
+                stack_depth,
+                num_streets,
             )?;
         }
     }

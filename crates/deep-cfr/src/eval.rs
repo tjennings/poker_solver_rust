@@ -142,6 +142,29 @@ impl ExplicitPolicy {
         Ok(normalized)
     }
 
+    /// Return the raw advantage predictions from the highest-weight net.
+    ///
+    /// This reveals the network's advantage estimates before ReLU and
+    /// normalization, useful for diagnosing whether training is producing
+    /// meaningful signals or near-zero noise.
+    pub fn latest_raw_advantages(
+        &self,
+        features: &InfoSetFeatures,
+    ) -> Result<Vec<f32>, SdCfrError> {
+        let (best_net, _) = self
+            .nets
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .ok_or(SdCfrError::EmptyModelBuffer)?;
+
+        let (cards, bets) =
+            InfoSetFeatures::to_tensors(std::slice::from_ref(features), &self.device)?;
+        let advantages = best_net.forward(&cards, &bets)?;
+        let flat = advantages.squeeze(0)?;
+        let raw = flat.to_vec1::<f32>()?;
+        Ok(raw)
+    }
+
     /// Compute the weighted sum of per-net strategies (before normalization).
     fn weighted_strategy_sum(&self, cards: &Tensor, bets: &Tensor) -> Result<Vec<f32>, SdCfrError> {
         let num_actions = self.nets[0].0.num_actions();
