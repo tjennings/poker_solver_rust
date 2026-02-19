@@ -24,6 +24,12 @@ pub struct PreflopConfig {
     pub raise_sizes: Vec<Vec<f64>>,
     /// Maximum number of raises allowed per round.
     pub raise_cap: u8,
+    /// DCFR positive regret discount exponent.
+    pub dcfr_alpha: f64,
+    /// DCFR negative regret discount exponent.
+    pub dcfr_beta: f64,
+    /// DCFR strategy sum discount exponent.
+    pub dcfr_gamma: f64,
 }
 
 impl PreflopConfig {
@@ -39,8 +45,11 @@ impl PreflopConfig {
             blinds: vec![(0, 1), (1, 2)],
             antes: vec![],
             stacks: vec![stacks_internal, stacks_internal],
-            raise_sizes: vec![vec![2.5], vec![3.0], vec![2.5]],
+            raise_sizes: vec![vec![2.0, 3.0], vec![2.5, 3.5], vec![2.5]],
             raise_cap: 4,
+            dcfr_alpha: 1.5,
+            dcfr_beta: 0.5,
+            dcfr_gamma: 2.0,
         }
     }
 
@@ -60,8 +69,11 @@ impl PreflopConfig {
             blinds: vec![(4, 1), (5, 2)],
             antes: vec![],
             stacks: vec![stacks_internal; 6],
-            raise_sizes: vec![vec![2.5], vec![3.0], vec![2.5]],
+            raise_sizes: vec![vec![2.0, 3.0], vec![2.5, 3.5], vec![2.5]],
             raise_cap: 4,
+            dcfr_alpha: 1.5,
+            dcfr_beta: 0.5,
+            dcfr_gamma: 2.0,
         }
     }
 
@@ -120,6 +132,22 @@ mod tests {
     fn six_max_initial_pot_is_three() {
         let config = PreflopConfig::six_max(100);
         assert_eq!(config.initial_pot(), 3);
+    }
+
+    #[timed_test]
+    fn hu_config_has_dcfr_defaults() {
+        let config = PreflopConfig::heads_up(100);
+        assert!((config.dcfr_alpha - 1.5).abs() < f64::EPSILON);
+        assert!((config.dcfr_beta - 0.5).abs() < f64::EPSILON);
+        assert!((config.dcfr_gamma - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[timed_test]
+    fn hu_config_has_multiple_raise_sizes() {
+        let config = PreflopConfig::heads_up(100);
+        assert_eq!(config.raise_sizes[0].len(), 2, "open should have 2 sizes");
+        assert_eq!(config.raise_sizes[1].len(), 2, "3bet should have 2 sizes");
+        assert_eq!(config.raise_sizes[2].len(), 1, "4bet+ should have 1 size");
     }
 
     #[timed_test]

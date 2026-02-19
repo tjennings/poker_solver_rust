@@ -1,7 +1,7 @@
-//! Linear CFR solver for preflop game trees.
+//! DCFR solver for preflop game trees with alternating updates.
 //!
-//! Performs full-game CFR over 169 canonical hand matchups, using linear
-//! weighting (regrets and strategy sums scaled by iteration number `t`).
+//! Performs full-game CFR over 169 canonical hand matchups using DCFR
+//! discounting (α/β/γ scheme) and alternating player traversals.
 //! Each iteration is parallelized via rayon: a frozen regret snapshot is
 //! shared across threads, with flat buffer deltas merged via parallel reduce.
 //!
@@ -110,10 +110,10 @@ struct Ctx<'a> {
     snapshot: &'a [f64],
 }
 
-/// Preflop Linear CFR solver.
+/// Preflop DCFR solver with alternating updates.
 ///
 /// Traverses the preflop tree for every 169x169 canonical hand matchup,
-/// accumulating regrets and strategy sums with linear weighting.
+/// using DCFR discounting and alternating player traversals.
 pub struct PreflopSolver {
     tree: PreflopTree,
     equity: EquityTable,
@@ -126,6 +126,12 @@ pub struct PreflopSolver {
     /// Cumulative weighted strategy, flat buffer indexed by `layout.slot()`.
     strategy_sum: Vec<f64>,
     iteration: u64,
+    /// DCFR positive regret discount exponent.
+    dcfr_alpha: f64,
+    /// DCFR negative regret discount exponent.
+    dcfr_beta: f64,
+    /// DCFR strategy sum discount exponent.
+    dcfr_gamma: f64,
 }
 
 impl PreflopSolver {
@@ -158,15 +164,17 @@ impl PreflopSolver {
             regret_sum: vec![0.0; buf_size],
             strategy_sum: vec![0.0; buf_size],
             iteration: 0,
+            dcfr_alpha: config.dcfr_alpha,
+            dcfr_beta: config.dcfr_beta,
+            dcfr_gamma: config.dcfr_gamma,
         }
     }
 
-    /// Run `iterations` of Linear CFR training.
+    /// Run `iterations` of DCFR training with alternating updates.
     pub fn train(&mut self, iterations: u64) {
         for _ in 0..iterations {
             self.iteration += 1;
-            let t = self.iteration;
-            self.train_one_iteration(t);
+            self.train_one_iteration();
         }
     }
 
@@ -197,11 +205,38 @@ impl PreflopSolver {
         PreflopStrategy { strategies }
     }
 
-    /// Single training iteration: snapshot regrets, parallel traverse, merge.
-    fn train_one_iteration(&mut self, t: u64) {
-        // Clone is a fast memcpy of a flat buffer (no HashMap allocation)
+    /// Compute DCFR strategy discount: `(t / (t + 1))^γ`.
+    #[allow(clippy::cast_precision_loss)]
+    fn strategy_discount(&self) -> f64 {
+        let t = self.iteration as f64;
+        (t / (t + 1.0)).powf(self.dcfr_gamma)
+    }
+
+    /// Apply DCFR cumulative regret discounting after each iteration.
+    ///
+    /// Positive regrets multiplied by `t^α / (t^α + 1)`.
+    /// Negative regrets multiplied by `t^β / (t^β + 1)`.
+    #[allow(clippy::cast_precision_loss)]
+    fn discount_regrets(&mut self) {
+        let t = (self.iteration + 1) as f64;
+        let pos_factor = t.powf(self.dcfr_alpha) / (t.powf(self.dcfr_alpha) + 1.0);
+        let neg_factor = t.powf(self.dcfr_beta) / (t.powf(self.dcfr_beta) + 1.0);
+        for r in &mut self.regret_sum {
+            if *r > 0.0 {
+                *r *= pos_factor;
+            } else if *r < 0.0 {
+                *r *= neg_factor;
+            }
+        }
+    }
+
+    /// Single training iteration: snapshot regrets, parallel traverse, merge, discount.
+    #[allow(clippy::cast_precision_loss)]
+    fn train_one_iteration(&mut self) {
         let snapshot = self.regret_sum.clone();
         let buf_size = self.layout.total_size;
+        let sd = self.strategy_discount();
+        let hero_pos = (self.iteration % 2) as u8;
 
         let ctx = Ctx {
             tree: &self.tree,
@@ -213,6 +248,7 @@ impl PreflopSolver {
 
         // Parallel fold+reduce: each rayon task accumulates into its own
         // flat buffer, then buffers are merged in a parallel reduction tree.
+        // Alternating updates: only traverse for one hero per iteration.
         let pairs = &self.pairs;
         let (merged_regret, merged_strategy) = pairs
             .par_iter()
@@ -220,8 +256,7 @@ impl PreflopSolver {
                 || (vec![0.0f64; buf_size], vec![0.0f64; buf_size]),
                 |(mut dr, mut ds), &(h1, h2)| {
                     let w = ctx.equity.weight(h1 as usize, h2 as usize);
-                    cfr_traverse(&ctx, &mut dr, &mut ds, 0, h1, h2, 0, 1.0, w, t);
-                    cfr_traverse(&ctx, &mut dr, &mut ds, 0, h2, h1, 1, 1.0, w, t);
+                    cfr_traverse(&ctx, &mut dr, &mut ds, 0, h1, h2, hero_pos, 1.0, w, sd);
                     (dr, ds)
                 },
             )
@@ -236,6 +271,7 @@ impl PreflopSolver {
 
         add_into(&mut self.regret_sum, &merged_regret);
         add_into(&mut self.strategy_sum, &merged_strategy);
+        self.discount_regrets();
     }
 }
 
@@ -251,6 +287,7 @@ fn add_into(dst: &mut [f64], src: &[f64]) {
 ///
 /// Reads strategy from `ctx.snapshot` (frozen for the iteration),
 /// writes regret and strategy deltas to flat `dr` / `ds` buffers.
+/// `sd` is the DCFR strategy discount factor for the current iteration.
 #[allow(clippy::too_many_arguments)]
 fn cfr_traverse(
     ctx: &Ctx<'_>,
@@ -262,7 +299,7 @@ fn cfr_traverse(
     hero_pos: u8,
     reach_hero: f64,
     reach_opp: f64,
-    t: u64,
+    sd: f64,
 ) -> f64 {
     let inv = ctx.investments[node_idx as usize];
     let hero_inv = f64::from(inv[hero_pos as usize]);
@@ -283,13 +320,13 @@ fn cfr_traverse(
                 traverse_hero(
                     ctx, dr, ds,
                     start, hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                    t, children, &strategy[..num_actions],
+                    sd, children, &strategy[..num_actions],
                 )
             } else {
                 traverse_opponent(
                     ctx, dr, ds,
                     hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                    t, children, &strategy[..num_actions],
+                    sd, children, &strategy[..num_actions],
                 )
             }
         }
@@ -297,7 +334,10 @@ fn cfr_traverse(
 }
 
 /// Hero's decision: compute regrets and update strategy/regret deltas.
-#[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
+///
+/// DCFR: regrets are unweighted (discounting applied after iteration).
+/// Strategy sums are weighted by the DCFR strategy discount `sd`.
+#[allow(clippy::too_many_arguments)]
 fn traverse_hero(
     ctx: &Ctx<'_>,
     dr: &mut [f64],
@@ -308,7 +348,7 @@ fn traverse_hero(
     hero_pos: u8,
     reach_hero: f64,
     reach_opp: f64,
-    t: u64,
+    sd: f64,
     children: &[u32],
     strategy: &[f64],
 ) -> f64 {
@@ -318,7 +358,7 @@ fn traverse_hero(
         action_values[i] = cfr_traverse(
             ctx, dr, ds,
             child_idx, hero_hand, opp_hand, hero_pos,
-            reach_hero * strategy[i], reach_opp, t,
+            reach_hero * strategy[i], reach_opp, sd,
         );
     }
 
@@ -326,16 +366,15 @@ fn traverse_hero(
         .zip(&action_values[..num_actions])
         .map(|(s, v)| s * v)
         .sum();
-    let t_f64 = t as f64;
 
-    // Accumulate regret deltas (weighted by t for linear CFR)
+    // Accumulate regret deltas (unweighted; DCFR discounts after iteration)
     for (i, val) in action_values[..num_actions].iter().enumerate() {
-        dr[slot_start + i] += t_f64 * reach_opp * (val - node_value);
+        dr[slot_start + i] += reach_opp * (val - node_value);
     }
 
-    // Accumulate strategy deltas (weighted by t * reach_hero)
+    // Accumulate strategy deltas (weighted by DCFR strategy discount)
     for (i, &s) in strategy.iter().enumerate() {
-        ds[slot_start + i] += t_f64 * reach_hero * s;
+        ds[slot_start + i] += sd * reach_hero * s;
     }
 
     node_value
@@ -352,7 +391,7 @@ fn traverse_opponent(
     hero_pos: u8,
     reach_hero: f64,
     reach_opp: f64,
-    t: u64,
+    sd: f64,
     children: &[u32],
     strategy: &[f64],
 ) -> f64 {
@@ -361,7 +400,7 @@ fn traverse_opponent(
         let child_value = cfr_traverse(
             ctx, dr, ds,
             child_idx, hero_hand, opp_hand, hero_pos,
-            reach_hero, reach_opp * strategy[i], t,
+            reach_hero, reach_opp * strategy[i], sd,
         );
         node_value += strategy[i] * child_value;
     }
@@ -602,6 +641,69 @@ mod tests {
                 "hand {hand_idx} should have strategy at root"
             );
         }
+    }
+
+    #[timed_test]
+    fn solver_stores_dcfr_params_from_config() {
+        let config = tiny_config();
+        let solver = PreflopSolver::new(&config);
+        assert!((solver.dcfr_alpha - 1.5).abs() < f64::EPSILON);
+        assert!((solver.dcfr_beta - 0.5).abs() < f64::EPSILON);
+        assert!((solver.dcfr_gamma - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[timed_test]
+    fn discount_regrets_scales_positive_and_negative() {
+        let config = tiny_config();
+        let mut solver = PreflopSolver::new(&config);
+        // Set up known regret values
+        if solver.regret_sum.len() >= 3 {
+            solver.regret_sum[0] = 10.0;  // positive
+            solver.regret_sum[1] = -5.0;  // negative
+            solver.regret_sum[2] = 0.0;   // zero
+            solver.iteration = 5;
+            solver.discount_regrets();
+
+            let t = 6.0_f64; // iteration + 1
+            let pf = t.powf(1.5) / (t.powf(1.5) + 1.0);
+            let nf = t.powf(0.5) / (t.powf(0.5) + 1.0);
+            assert!((solver.regret_sum[0] - 10.0 * pf).abs() < 1e-10);
+            assert!((solver.regret_sum[1] - (-5.0 * nf)).abs() < 1e-10);
+            assert!((solver.regret_sum[2]).abs() < 1e-10);
+        }
+    }
+
+    #[timed_test]
+    fn strategy_discount_formula() {
+        let config = tiny_config();
+        let mut solver = PreflopSolver::new(&config);
+        solver.iteration = 10;
+        let sd = solver.strategy_discount();
+        let expected = (10.0_f64 / 11.0).powf(2.0);
+        assert!((sd - expected).abs() < 1e-10, "sd={sd}, expected={expected}");
+    }
+
+    #[timed_test]
+    fn alternating_updates_traverse_different_players() {
+        let config = tiny_config();
+        let mut solver = PreflopSolver::new(&config);
+
+        // Run iteration 1 (hero_pos = 1 since iteration=1, 1%2=1)
+        solver.train(1);
+        let regrets_after_1 = solver.regret_sum.clone();
+
+        // Run iteration 2 (hero_pos = 0 since iteration=2, 2%2=0)
+        solver.train(1);
+        let regrets_after_2 = solver.regret_sum.clone();
+
+        // Both iterations should produce non-trivial changes
+        let changed_1: usize = regrets_after_1.iter().filter(|&&r| r.abs() > 1e-15).count();
+        let changed_2: usize = regrets_after_2.iter()
+            .zip(&regrets_after_1)
+            .filter(|&(a, b)| (a - b).abs() > 1e-15)
+            .count();
+        assert!(changed_1 > 0, "iteration 1 should change some regrets");
+        assert!(changed_2 > 0, "iteration 2 should change some regrets");
     }
 
     #[timed_test]
