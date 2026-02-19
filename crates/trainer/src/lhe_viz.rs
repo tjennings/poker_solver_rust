@@ -325,18 +325,18 @@ const fn player_index(player: Player) -> usize {
 const BAR_WIDTH: usize = 10;
 
 /// ANSI color codes.
-const RED: &str = "\x1b[31m";
-const GREEN: &str = "\x1b[32m";
+const GREEN: &str = "\x1b[38;5;34m";
+const GRAY: &str = "\x1b[38;5;245m";
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 
-/// Raise color gradient (bright yellow → dark orange), 256-color ANSI.
+/// Raise color gradient (light red → dark red), 256-color ANSI.
 const RAISE_COLORS: &[&str] = &[
-    "\x1b[38;5;226m", // bright yellow — smallest raise
-    "\x1b[38;5;220m", // yellow
-    "\x1b[38;5;214m", // orange-yellow
-    "\x1b[38;5;208m", // orange
-    "\x1b[38;5;202m", // dark orange — all-in
+    "\x1b[38;5;210m", // light salmon — smallest raise
+    "\x1b[38;5;203m", // coral
+    "\x1b[38;5;196m", // bright red
+    "\x1b[38;5;160m", // dark red
+    "\x1b[38;5;124m", // deep red — all-in
 ];
 
 /// Print a hand matrix with color-coded bars.
@@ -345,9 +345,10 @@ pub fn print_hand_matrix(matrix: &HandMatrix, title: &str) {
     println!();
 
     // Header row — "s" suffix marks the suited (upper-triangle) dimension
-    print!("          ");
+    // Row label = 4 chars ("  A "), each cell = 11 chars (" " + 10 bar)
+    print!("    ");
     for &rank in &RANK_ORDER {
-        print!("{:>9}s ", rank_label(rank));
+        print!("{:^11}", format!("{}s", rank_label(rank)));
     }
     println!();
 
@@ -368,7 +369,7 @@ pub fn print_hand_matrix(matrix: &HandMatrix, title: &str) {
     let r2 = RAISE_COLORS[2];
     let r4 = RAISE_COLORS[4];
     println!(
-        "  Legend: {RED}.{RESET}=fold  {GREEN}|{RESET}=call  {r0}#{RESET}=small raise  {r2}#{RESET}=mid raise  {r4}#{RESET}=all-in  |  Upper-right=suited  Lower-left=offsuit  Diagonal=pairs"
+        "  Legend: {GRAY}#{RESET}=fold  {GREEN}#{RESET}=call  {r0}#{RESET}=small raise  {r2}#{RESET}=mid raise  {r4}#{RESET}=all-in  |  Upper-right=suited  Lower-left=offsuit  Diagonal=pairs"
     );
 }
 
@@ -396,11 +397,11 @@ fn render_bar(s: &HandStrategy) -> String {
     }
     for _ in 0..call_chars {
         bar.push_str(GREEN);
-        bar.push('|');
+        bar.push('#');
     }
     for _ in 0..fold_chars {
-        bar.push_str(RED);
-        bar.push('.');
+        bar.push_str(GRAY);
+        bar.push('#');
     }
     bar.push_str(RESET);
 
@@ -627,8 +628,11 @@ mod tests {
             raises: vec![1.0],
         };
         let bar = render_bar(&s);
+        // All raise chars, colored with RAISE_COLORS
         assert!(bar.contains('#'));
-        assert!(!bar.contains('.'));
+        assert!(bar.contains(RAISE_COLORS[0]));
+        assert!(!bar.contains(GRAY));
+        assert!(!bar.contains(GREEN));
     }
 
     #[test]
@@ -638,7 +642,8 @@ mod tests {
             raises: vec![],
         };
         let bar = render_bar(&s);
-        assert!(bar.contains('.'));
+        assert!(bar.contains('#'));
+        assert!(bar.contains(GRAY));
     }
 
     #[test]
@@ -648,10 +653,12 @@ mod tests {
             raises: vec![0.5, 0.5],
         };
         let bar = render_bar(&s);
-        // Should have all '#' chars (raises) and no call or fold
         assert!(bar.contains('#'));
-        assert!(!bar.contains('|'));
-        assert!(!bar.contains('.'));
+        // Two different raise colors should appear
+        assert!(bar.contains(RAISE_COLORS[0]));
+        assert!(bar.contains(RAISE_COLORS[1]));
+        assert!(!bar.contains(GRAY));
+        assert!(!bar.contains(GREEN));
     }
 
     // -----------------------------------------------------------------------
