@@ -4,7 +4,8 @@ mod simulation;
 pub use exploration::{
     canonicalize_board, get_available_actions, get_bundle_info, get_combo_classes,
     get_computation_status, get_strategy_matrix, is_board_cached, is_bundle_loaded, list_agents,
-    load_bundle, start_bucket_computation, ExplorationState,
+    load_bundle, load_preflop_solve, load_subgame_source, solve_preflop_live,
+    start_bucket_computation, ExplorationState, SubgameProgressEvent,
 };
 
 pub use simulation::{

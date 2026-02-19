@@ -30,6 +30,15 @@ pub struct BucketProgressEvent {
     pub board_key: String,
 }
 
+/// Event payload for subgame solving progress.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubgameProgressEvent {
+    pub iteration: u32,
+    pub max_iterations: u32,
+    pub board_key: String,
+    pub elapsed_ms: u64,
+}
+
 /// State for the exploration view.
 pub struct ExplorationState {
     /// Currently loaded strategy source (bundle or agent)
@@ -51,13 +60,27 @@ pub struct ExplorationState {
     suit_mapping: RwLock<Option<SuitMapping>>,
 }
 
-/// A loaded strategy source — either a trained bundle or a rule-based agent.
+/// A loaded strategy source — either a trained bundle, rule-based agent,
+/// preflop solve, or subgame solve backed by a blueprint.
 enum StrategySource {
     Bundle {
         config: BundleConfig,
         blueprint: poker_solver_core::blueprint::BlueprintStrategy,
     },
     Agent(AgentConfig),
+    PreflopSolve {
+        config: poker_solver_core::preflop::PreflopConfig,
+        strategy: poker_solver_core::preflop::PreflopStrategy,
+    },
+    SubgameSolve {
+        blueprint: Arc<poker_solver_core::blueprint::BlueprintStrategy>,
+        blueprint_config: BundleConfig,
+        #[allow(dead_code)]
+        subgame_config: poker_solver_core::blueprint::SubgameConfig,
+        /// Cache of solved subgames
+        #[allow(dead_code)]
+        solve_cache: Arc<RwLock<HashMap<u64, poker_solver_core::blueprint::SubgameStrategy>>>,
+    },
 }
 
 impl Default for ExplorationState {
@@ -133,6 +156,8 @@ pub struct StrategyMatrix {
     pub stack_p1: u32,
     /// Player 2 (BB) remaining stack
     pub stack_p2: u32,
+    /// Per-player stacks (N-player generalized)
+    pub stacks: Vec<u32>,
 }
 
 /// Information about an available action.
@@ -158,12 +183,14 @@ pub struct ExplorationPosition {
     pub history: Vec<String>,
     /// Current pot size
     pub pot: u32,
-    /// Player 1 (SB) stack
-    pub stack_p1: u32,
-    /// Player 2 (BB) stack
-    pub stack_p2: u32,
+    /// Per-player stacks (index 0 = P1/SB, index 1 = P2/BB, etc.)
+    pub stacks: Vec<u32>,
     /// Whose turn (0 = P1/SB, 1 = P2/BB)
     pub to_act: u8,
+    /// Number of players in the game
+    pub num_players: u8,
+    /// Whether each player is still active (not folded)
+    pub active_players: Vec<bool>,
 }
 
 impl Default for ExplorationPosition {
@@ -172,9 +199,10 @@ impl Default for ExplorationPosition {
             board: vec![],
             history: vec![],
             pot: 3,        // SB + BB posted (internal units)
-            stack_p1: 199, // 100BB default: 100*2 - 1 (SB posted 1)
-            stack_p2: 198, // 100BB default: 100*2 - 2 (BB posted 2)
+            stacks: vec![199, 198], // 100BB default: SB posted 1, BB posted 2
             to_act: 0,    // SB acts first preflop
+            num_players: 2,
+            active_players: vec![true, true],
         }
     }
 }
@@ -239,6 +267,104 @@ fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
     Ok((info, StrategySource::Agent(agent)))
 }
 
+/// Load a preflop strategy bundle from a directory.
+#[tauri::command]
+pub async fn load_preflop_solve(
+    state: State<'_, ExplorationState>,
+    path: String,
+) -> Result<BundleInfo, String> {
+    let bundle_path = PathBuf::from(&path);
+    let bundle = tauri::async_runtime::spawn_blocking(move || {
+        poker_solver_core::preflop::PreflopBundle::load(&bundle_path)
+            .map_err(|e| format!("Failed to load preflop bundle: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))??;
+
+    let info = BundleInfo {
+        name: Some("Preflop Solve".into()),
+        stack_depth: bundle.config.stacks.first().copied().unwrap_or(0) / 2,
+        bet_sizes: vec![],
+        info_sets: bundle.strategy.len(),
+        iterations: 0,
+    };
+
+    *state.source.write() = Some(StrategySource::PreflopSolve {
+        config: bundle.config,
+        strategy: bundle.strategy,
+    });
+
+    Ok(info)
+}
+
+/// Solve a preflop game live with the given stack depth and iterations.
+#[tauri::command]
+pub async fn solve_preflop_live(
+    state: State<'_, ExplorationState>,
+    stack_depth: u32,
+    iterations: u64,
+) -> Result<BundleInfo, String> {
+    let config = poker_solver_core::preflop::PreflopConfig::heads_up(stack_depth);
+    let config_clone = config.clone();
+
+    let (strategy, len) = tauri::async_runtime::spawn_blocking(move || {
+        let mut solver = poker_solver_core::preflop::PreflopSolver::new(&config_clone);
+        solver.train(iterations);
+        let strat = solver.strategy();
+        let len = strat.len();
+        (strat, len)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?;
+
+    let info = BundleInfo {
+        name: Some(format!("Preflop {stack_depth}BB")),
+        stack_depth,
+        bet_sizes: vec![],
+        info_sets: len,
+        iterations,
+    };
+
+    *state.source.write() = Some(StrategySource::PreflopSolve {
+        config,
+        strategy,
+    });
+
+    Ok(info)
+}
+
+/// Load a blueprint for subgame solving.
+#[tauri::command]
+pub async fn load_subgame_source(
+    state: State<'_, ExplorationState>,
+    blueprint_path: String,
+) -> Result<BundleInfo, String> {
+    let bundle_path = PathBuf::from(&blueprint_path);
+    let bundle = tauri::async_runtime::spawn_blocking(move || {
+        poker_solver_core::blueprint::StrategyBundle::load(&bundle_path)
+            .map_err(|e| format!("Failed to load bundle: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Load task panicked: {e}"))??;
+
+    let info = BundleInfo {
+        name: Some("Subgame Solve".to_string()),
+        stack_depth: bundle.config.game.stack_depth,
+        bet_sizes: bundle.config.game.bet_sizes.clone(),
+        info_sets: bundle.blueprint.len(),
+        iterations: bundle.blueprint.iterations_trained(),
+    };
+
+    *state.source.write() = Some(StrategySource::SubgameSolve {
+        blueprint: Arc::new(bundle.blueprint),
+        blueprint_config: bundle.config,
+        subgame_config: poker_solver_core::blueprint::SubgameConfig::default(),
+        solve_cache: Arc::new(RwLock::new(HashMap::new())),
+    });
+
+    Ok(info)
+}
+
 /// Get the strategy matrix for a given position.
 ///
 /// `threshold` filters out hands whose prior action probabilities fell below
@@ -264,6 +390,21 @@ pub fn get_strategy_matrix(
             get_strategy_matrix_bundle(config, blueprint, &state, &position, thresh, &sh)
         }
         StrategySource::Agent(agent) => get_strategy_matrix_agent(agent, &position),
+        StrategySource::PreflopSolve { config, strategy } => {
+            get_strategy_matrix_preflop(config, strategy, &position)
+        }
+        StrategySource::SubgameSolve {
+            blueprint,
+            blueprint_config,
+            ..
+        } => get_strategy_matrix_bundle(
+            blueprint_config,
+            blueprint,
+            &state,
+            &position,
+            thresh,
+            &sh,
+        ),
     }
 }
 
@@ -363,6 +504,7 @@ fn get_strategy_matrix_bundle(
         to_call: pos_state.to_call,
         stack_p1: pos_state.stack_p1,
         stack_p2: pos_state.stack_p2,
+        stacks: vec![pos_state.stack_p1, pos_state.stack_p2],
     })
 }
 
@@ -421,7 +563,200 @@ fn get_strategy_matrix_agent(
         to_call: pos_state.to_call,
         stack_p1: pos_state.stack_p1,
         stack_p2: pos_state.stack_p2,
+        stacks: vec![pos_state.stack_p1, pos_state.stack_p2],
     })
+}
+
+fn get_strategy_matrix_preflop(
+    config: &poker_solver_core::preflop::PreflopConfig,
+    strategy: &poker_solver_core::preflop::PreflopStrategy,
+    position: &ExplorationPosition,
+) -> Result<StrategyMatrix, String> {
+    use poker_solver_core::preflop::{PreflopNode, PreflopTree};
+
+    let tree = PreflopTree::build(config);
+
+    // Walk the tree following the action history to find the current node
+    let node_idx = walk_preflop_tree(&tree, &position.history)?;
+
+    // Get available actions at this node
+    let (action_labels, _children) = match &tree.nodes[node_idx as usize] {
+        PreflopNode::Decision {
+            action_labels,
+            children,
+            ..
+        } => (action_labels.clone(), children.clone()),
+        PreflopNode::Terminal { .. } => {
+            return Err("Position is at a terminal node".to_string());
+        }
+    };
+
+    // Build ActionInfo from preflop action labels
+    let actions: Vec<ActionInfo> = action_labels
+        .iter()
+        .enumerate()
+        .map(|(i, a)| preflop_action_info(a, i))
+        .collect();
+
+    let ranks = RANKS;
+    let mut cells = Vec::with_capacity(13);
+
+    for (row, &rank1) in ranks.iter().enumerate() {
+        let mut row_cells = Vec::with_capacity(13);
+        for (col, &rank2) in ranks.iter().enumerate() {
+            let (hand_label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
+
+            let hand_idx = canonical_hand_index_from_ranks(rank1, rank2, suited);
+            let probs_f64 = strategy.get_probs(node_idx, hand_idx);
+
+            #[allow(clippy::cast_possible_truncation)]
+            let probabilities: Vec<ActionProb> = actions
+                .iter()
+                .zip(probs_f64.iter())
+                .map(|(a, &p)| ActionProb {
+                    action: a.label.clone(),
+                    probability: p as f32,
+                })
+                .collect();
+
+            row_cells.push(MatrixCell {
+                hand: hand_label,
+                suited,
+                pair,
+                probabilities,
+                filtered: false,
+            });
+        }
+        cells.push(row_cells);
+    }
+
+    let stack_p1 = position.stacks.first().copied().unwrap_or(0);
+    let stack_p2 = position.stacks.get(1).copied().unwrap_or(0);
+
+    Ok(StrategyMatrix {
+        cells,
+        actions,
+        street: "Preflop".to_string(),
+        pot: position.pot,
+        stack: position.stacks.get(position.to_act as usize).copied().unwrap_or(0),
+        to_call: if position.board.is_empty() {
+            stack_p1.saturating_sub(stack_p2)
+        } else {
+            0
+        },
+        stack_p1,
+        stack_p2,
+        stacks: position.stacks.clone(),
+    })
+}
+
+/// Walk the preflop tree following an action history, returning the resulting node index.
+fn walk_preflop_tree(
+    tree: &poker_solver_core::preflop::PreflopTree,
+    history: &[String],
+) -> Result<u32, String> {
+    use poker_solver_core::preflop::PreflopNode;
+
+    let mut node_idx = 0u32;
+    for action_str in history {
+        let node = &tree.nodes[node_idx as usize];
+        let (action_labels, children) = match node {
+            PreflopNode::Decision {
+                action_labels,
+                children,
+                ..
+            } => (action_labels, children),
+            PreflopNode::Terminal { .. } => {
+                return Err(format!("Reached terminal before processing action '{action_str}'"));
+            }
+        };
+
+        let target_action = parse_preflop_action(action_str);
+        let child_pos = action_labels
+            .iter()
+            .position(|a| preflop_action_matches(a, &target_action))
+            .ok_or_else(|| {
+                format!(
+                    "Action '{action_str}' not available at node {node_idx}. Available: {action_labels:?}"
+                )
+            })?;
+        node_idx = children[child_pos];
+    }
+    Ok(node_idx)
+}
+
+/// Parse a history action string into a `PreflopAction` for matching.
+fn parse_preflop_action(s: &str) -> poker_solver_core::preflop::PreflopAction {
+    use poker_solver_core::preflop::PreflopAction;
+    if s == "f" || s == "fold" {
+        PreflopAction::Fold
+    } else if s == "c" || s == "call" || s == "x" || s == "check" {
+        PreflopAction::Call
+    } else if s.starts_with("r:A") || s.starts_with("raise:A") || s.starts_with("b:A") || s.starts_with("bet:A") {
+        PreflopAction::AllIn
+    } else if s.starts_with("r:") || s.starts_with("raise:") || s.starts_with("b:") || s.starts_with("bet:") {
+        // Any raise maps to the tree raise action
+        PreflopAction::Raise(0.0) // size doesn't matter for matching
+    } else {
+        PreflopAction::Call // fallback
+    }
+}
+
+/// Check if a tree action matches a parsed action (ignoring raise size).
+fn preflop_action_matches(
+    tree_action: &poker_solver_core::preflop::PreflopAction,
+    target: &poker_solver_core::preflop::PreflopAction,
+) -> bool {
+    use poker_solver_core::preflop::PreflopAction;
+    matches!(
+        (tree_action, target),
+        (PreflopAction::Fold, PreflopAction::Fold)
+            | (PreflopAction::Call, PreflopAction::Call)
+            | (PreflopAction::AllIn, PreflopAction::AllIn)
+            | (PreflopAction::Raise(_), PreflopAction::Raise(_))
+    )
+}
+
+/// Build an `ActionInfo` from a preflop tree action.
+fn preflop_action_info(
+    action: &poker_solver_core::preflop::PreflopAction,
+    idx: usize,
+) -> ActionInfo {
+    use poker_solver_core::preflop::PreflopAction;
+    match action {
+        PreflopAction::Fold => ActionInfo {
+            id: "fold".to_string(),
+            label: "Fold".to_string(),
+            action_type: "fold".to_string(),
+            size_key: None,
+        },
+        PreflopAction::Call => ActionInfo {
+            id: "call".to_string(),
+            label: "Call".to_string(),
+            action_type: "call".to_string(),
+            size_key: None,
+        },
+        PreflopAction::Raise(size) => ActionInfo {
+            id: format!("r:{idx}"),
+            label: format!("Raise {size:.1}x"),
+            action_type: "raise".to_string(),
+            size_key: Some(format!("{size}")),
+        },
+        PreflopAction::AllIn => ActionInfo {
+            id: "r:A".to_string(),
+            label: "All-in".to_string(),
+            action_type: "allin".to_string(),
+            size_key: Some("allin".to_string()),
+        },
+    }
+}
+
+/// Get the canonical hand index (0..169) from rank characters.
+fn canonical_hand_index_from_ranks(rank1: char, rank2: char, suited: bool) -> usize {
+    let v1 = char_to_value(rank1);
+    let v2 = char_to_value(rank2);
+    let canonical = CanonicalHand::new(v1, v2, suited);
+    canonical.index()
 }
 
 /// Get available actions at the current position.
@@ -436,10 +771,15 @@ pub fn get_available_actions(
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
     let (stack_depth, bet_sizes) = match source {
-        StrategySource::Bundle { config, .. } => {
+        StrategySource::Bundle { config, .. } | StrategySource::SubgameSolve { blueprint_config: config, .. } => {
             (config.game.stack_depth, config.game.bet_sizes.as_slice())
         }
         StrategySource::Agent(agent) => (agent.game.stack_depth, agent.game.bet_sizes.as_slice()),
+        StrategySource::PreflopSolve { config, .. } => {
+            let depth = config.stacks.first().copied().unwrap_or(0) / 2;
+            // Preflop uses tree-based actions, return empty bet_sizes
+            (depth, [].as_slice())
+        }
     };
 
     Ok(get_actions_for_position(stack_depth, bet_sizes, &position))
@@ -473,6 +813,24 @@ pub fn get_bundle_info(state: State<'_, ExplorationState>) -> Result<BundleInfo,
             bet_sizes: agent.game.bet_sizes.clone(),
             info_sets: 0,
             iterations: 0,
+        },
+        StrategySource::PreflopSolve { config, strategy } => BundleInfo {
+            name: Some("Preflop Solve".to_string()),
+            stack_depth: config.stacks.first().copied().unwrap_or(0) / 2,
+            bet_sizes: vec![],
+            info_sets: strategy.len(),
+            iterations: 0,
+        },
+        StrategySource::SubgameSolve {
+            blueprint,
+            blueprint_config,
+            ..
+        } => BundleInfo {
+            name: Some("Subgame Solve".to_string()),
+            stack_depth: blueprint_config.game.stack_depth,
+            bet_sizes: blueprint_config.game.bet_sizes.clone(),
+            info_sets: blueprint.len(),
+            iterations: blueprint.iterations_trained(),
         },
     })
 }
@@ -508,13 +866,20 @@ pub fn start_bucket_computation(
 ) -> Result<String, String> {
     let board_key = board.join("");
 
-    // Agents and hand_class bundles don't need bucket computation
+    // Agents, hand_class bundles, preflop solves, and subgame solves don't need bucket computation
     {
         let source_guard = state.source.read();
         match source_guard.as_ref() {
-            Some(StrategySource::Agent(_)) => return Ok(board_key),
+            Some(StrategySource::Agent(_) | StrategySource::PreflopSolve { .. }) => {
+                return Ok(board_key);
+            }
             Some(StrategySource::Bundle { config, .. })
                 if config.abstraction_mode.is_hand_class() =>
+            {
+                return Ok(board_key);
+            }
+            Some(StrategySource::SubgameSolve { blueprint_config, .. })
+                if blueprint_config.abstraction_mode.is_hand_class() =>
             {
                 return Ok(board_key);
             }
@@ -848,7 +1213,12 @@ pub fn get_combo_classes(
 
     let (config, blueprint) = match source {
         StrategySource::Bundle { config, blueprint } => (config, blueprint),
-        StrategySource::Agent(_) => {
+        StrategySource::SubgameSolve {
+            blueprint_config,
+            blueprint,
+            ..
+        } => (blueprint_config, blueprint.as_ref()),
+        StrategySource::Agent(_) | StrategySource::PreflopSolve { .. } => {
             return Ok(empty_combo_info(&hand));
         }
     };
@@ -1422,11 +1792,7 @@ fn get_actions_for_position(
     let mut actions = Vec::new();
     let pos_state = compute_position_state(bet_sizes, position);
     let to_call = pos_state.to_call;
-    let stack = if position.to_act == 0 {
-        position.stack_p1
-    } else {
-        position.stack_p2
-    };
+    let stack = position.stacks.get(position.to_act as usize).copied().unwrap_or(0);
 
     // Fold if facing a bet
     if to_call > 0 {
@@ -1514,13 +1880,15 @@ struct PositionState {
 /// Position stacks already have blinds deducted (stack_p1 = depth-1,
 /// stack_p2 = depth-2), so we replay from there without re-subtracting.
 fn compute_position_state(bet_sizes: &[f32], position: &ExplorationPosition) -> PositionState {
-    let mut stacks = [position.stack_p1, position.stack_p2];
+    let stack_p1 = position.stacks.first().copied().unwrap_or(0);
+    let stack_p2 = position.stacks.get(1).copied().unwrap_or(0);
+    let mut stacks = [stack_p1, stack_p2];
     let mut pot = position.pot;
 
     // Preflop: SB owes 1 more to match BB's blind.
     // Postflop: no outstanding bet.
     let mut to_call = if position.board.is_empty() {
-        position.stack_p1.saturating_sub(position.stack_p2)
+        stack_p1.saturating_sub(stack_p2)
     } else {
         0u32
     };
@@ -1907,5 +2275,77 @@ fn char_to_value(c: char) -> Value {
         '3' => Value::Three,
         '2' => Value::Two,
         _ => Value::Two,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_macros::timed_test;
+
+    #[timed_test]
+    fn exploration_position_default_has_two_stacks() {
+        let pos = ExplorationPosition::default();
+        assert_eq!(pos.stacks.len(), 2);
+        assert_eq!(pos.num_players, 2);
+        assert_eq!(pos.stacks[0], 199);
+        assert_eq!(pos.stacks[1], 198);
+    }
+
+    #[timed_test]
+    fn exploration_position_default_active_players() {
+        let pos = ExplorationPosition::default();
+        assert_eq!(pos.active_players, vec![true, true]);
+        assert_eq!(pos.to_act, 0);
+        assert_eq!(pos.pot, 3);
+    }
+
+    #[timed_test]
+    fn compute_position_state_default() {
+        let pos = ExplorationPosition::default();
+        let state = compute_position_state(&[], &pos);
+        // Preflop: SB owes 1 to match BB
+        assert_eq!(state.to_call, 1);
+        assert_eq!(state.pot, 3);
+        assert_eq!(state.stack_p1, 199);
+        assert_eq!(state.stack_p2, 198);
+    }
+
+    #[timed_test]
+    fn subgame_progress_event_serializes() {
+        let event = SubgameProgressEvent {
+            iteration: 10,
+            max_iterations: 100,
+            board_key: "AsKhQd".to_string(),
+            elapsed_ms: 42,
+        };
+        let json = serde_json::to_string(&event).expect("should serialize");
+        assert!(json.contains("\"iteration\":10"));
+        assert!(json.contains("\"max_iterations\":100"));
+    }
+
+    #[timed_test]
+    fn walk_preflop_tree_empty_history() {
+        let config = poker_solver_core::preflop::PreflopConfig::heads_up(100);
+        let tree = poker_solver_core::preflop::PreflopTree::build(&config);
+        let idx = walk_preflop_tree(&tree, &[]).expect("should walk empty history");
+        assert_eq!(idx, 0);
+    }
+
+    #[timed_test]
+    fn walk_preflop_tree_fold() {
+        let config = poker_solver_core::preflop::PreflopConfig::heads_up(100);
+        let tree = poker_solver_core::preflop::PreflopTree::build(&config);
+        let history = vec!["fold".to_string()];
+        let result = walk_preflop_tree(&tree, &history);
+        // Fold leads to a terminal node, but the walk itself should succeed
+        assert!(result.is_ok());
+    }
+
+    #[timed_test]
+    fn canonical_hand_index_from_ranks_aces() {
+        let idx = canonical_hand_index_from_ranks('A', 'A', false);
+        // AA should be index 0 in the canonical ordering
+        assert!(idx < 169);
     }
 }

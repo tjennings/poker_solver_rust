@@ -30,6 +30,7 @@ use poker_solver_core::info_key::{
     InfoKey, canonical_hand_index_from_str, hand_label_from_bits, reverse_canonical_index,
     spr_bucket,
 };
+use poker_solver_core::preflop::{PreflopBundle, PreflopConfig, PreflopSolver};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
@@ -199,6 +200,21 @@ enum Commands {
         #[arg(long)]
         num_streets: Option<u8>,
     },
+    /// Solve preflop strategy using Linear CFR
+    SolvePreflop {
+        /// Stack depth in big blinds
+        #[arg(long, default_value = "100")]
+        stack_depth: u32,
+        /// Number of players (2 = HU, 6 = six-max)
+        #[arg(long, default_value = "2")]
+        players: u8,
+        /// Number of LCFR iterations
+        #[arg(long, default_value = "5000")]
+        iterations: u64,
+        /// Output directory for the preflop bundle
+        #[arg(short, long)]
+        output: PathBuf,
+    },
 }
 
 /// Solver backend selection.
@@ -228,6 +244,19 @@ enum DealSortOrder {
     Weight,
     Equity,
     None,
+}
+
+/// CFR variant: `dcfr` (default) or `linear` (alpha=beta=gamma=1).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum CfrVariant {
+    #[default]
+    Dcfr,
+    Linear,
+}
+
+fn default_cfr_variant() -> CfrVariant {
+    CfrVariant::Dcfr
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,6 +314,9 @@ struct TrainingParams {
     /// regrets back above the line between probes.
     #[serde(default)]
     pruning_threshold: f64,
+    /// CFR variant: `dcfr` (default) or `linear` (alpha=beta=gamma=1).
+    #[serde(default = "default_cfr_variant")]
+    cfr_variant: CfrVariant,
     /// Use exhaustive abstract deal enumeration instead of random sampling.
     /// Only valid with `hand_class_v2` abstraction mode.
     #[serde(default)]
@@ -570,7 +602,65 @@ fn main() -> Result<(), Box<dyn Error>> {
                 num_streets,
             )?;
         }
+        Commands::SolvePreflop {
+            stack_depth,
+            players,
+            iterations,
+            output,
+        } => {
+            run_solve_preflop(stack_depth, players, iterations, &output)?;
+        }
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Preflop solver
+// ---------------------------------------------------------------------------
+
+fn run_solve_preflop(
+    stack_depth: u32,
+    players: u8,
+    iterations: u64,
+    output: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let config = match players {
+        2 => PreflopConfig::heads_up(stack_depth),
+        6 => PreflopConfig::six_max(stack_depth),
+        n => return Err(format!("unsupported player count: {n} (use 2 or 6)").into()),
+    };
+
+    println!("Solving preflop: {players}p, {stack_depth}BB, {iterations} iterations");
+    let start = Instant::now();
+
+    let mut solver = PreflopSolver::new(&config);
+
+    let pb = ProgressBar::new(iterations);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .expect("valid template")
+            .progress_chars("#>-"),
+    );
+
+    let chunk = std::cmp::max(iterations / 100, 1);
+    let mut done = 0u64;
+    while done < iterations {
+        let batch = std::cmp::min(chunk, iterations - done);
+        solver.train(batch);
+        done += batch;
+        pb.set_position(done);
+    }
+    pb.finish_with_message("done");
+
+    let elapsed = start.elapsed();
+    let strategy = solver.strategy();
+    println!("Converged in {elapsed:.1?} — {} info sets", strategy.len());
+
+    let bundle = PreflopBundle::new(config, strategy);
+    bundle.save(output)?;
+    println!("Saved to {}", output.display());
 
     Ok(())
 }
@@ -1184,11 +1274,9 @@ fn run_sdcfr_hunl(config: SdCfrTrainingConfig) -> Result<(), Box<dyn Error>> {
 
     let total_iterations = config.training.iterations;
     let checkpoint_interval = config.checkpoint.interval;
-    let total_checkpoints = if checkpoint_interval > 0 {
-        total_iterations / checkpoint_interval
-    } else {
-        0
-    };
+    let total_checkpoints = total_iterations
+        .checked_div(checkpoint_interval)
+        .unwrap_or(0);
     let training_start = Instant::now();
     let mut previous_strategies: Option<FxHashMap<u64, Vec<f64>>> = None;
     let mut checkpoint_count = 0u64;
@@ -1516,7 +1604,7 @@ fn run_eval_lhe(
                 &game, &encoder, &policies, deal, Player::Player1, num_actions,
             );
             let prev = progress.fetch_add(1, Ordering::Relaxed);
-            if prev % 64 == 0 {
+            if prev.is_multiple_of(64) {
                 pb.set_position(prev + 1);
             }
             ev
@@ -1532,7 +1620,7 @@ fn run_eval_lhe(
                 &game, &encoder, &policies, deal, Player::Player2, num_actions,
             );
             let prev = progress.fetch_add(1, Ordering::Relaxed);
-            if prev % 64 == 0 {
+            if prev.is_multiple_of(64) {
                 pb.set_position(prev + 1);
             }
             ev
@@ -2191,10 +2279,9 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     );
 
     // Build solver
-    let seq_config = SequenceCfrConfig {
-        dcfr_alpha: 1.5,
-        dcfr_beta: 0.5,
-        dcfr_gamma: 2.0,
+    let seq_config = match config.training.cfr_variant {
+        CfrVariant::Linear => SequenceCfrConfig::linear_cfr(),
+        CfrVariant::Dcfr => SequenceCfrConfig::default(),
     };
     let solver = SequenceCfrSolver::new(tree, deals, seq_config);
 

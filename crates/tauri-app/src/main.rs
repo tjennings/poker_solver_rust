@@ -8,6 +8,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             // Exploration commands
             poker_solver_tauri::load_bundle,
+            poker_solver_tauri::load_preflop_solve,
+            poker_solver_tauri::solve_preflop_live,
+            poker_solver_tauri::load_subgame_source,
             poker_solver_tauri::get_strategy_matrix,
             poker_solver_tauri::get_available_actions,
             poker_solver_tauri::is_bundle_loaded,
