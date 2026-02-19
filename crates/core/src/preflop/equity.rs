@@ -4,6 +4,9 @@
 //! all canonical preflop hand pairings. The full computation is expensive;
 //! use `new_uniform()` for testing with equal equities.
 
+use crate::equity::calculate_equity;
+use crate::hands::CanonicalHand;
+
 const NUM_CANONICAL_HANDS: usize = 169;
 
 /// A precomputed equity table for 169 canonical preflop hands.
@@ -43,12 +46,77 @@ impl EquityTable {
     pub fn num_hands(&self) -> usize {
         self.equities.len()
     }
+
+    /// Compute real equities for all 169x169 canonical hand matchups.
+    ///
+    /// Uses Monte Carlo simulation with `samples` per matchup.
+    /// Calls `on_progress(pairs_done)` after each unique pair is computed.
+    #[must_use]
+    pub fn new_computed(samples: u32, on_progress: impl Fn(usize)) -> Self {
+        let mut equities = vec![vec![0.5; NUM_CANONICAL_HANDS]; NUM_CANONICAL_HANDS];
+        let weights = vec![vec![1.0; NUM_CANONICAL_HANDS]; NUM_CANONICAL_HANDS];
+        let mut done = 0usize;
+
+        for i in 0..NUM_CANONICAL_HANDS {
+            // SAFETY: indices 0..168 are always valid for CanonicalHand
+            let h1 = CanonicalHand::from_index(i).expect("valid canonical index");
+            for j in (i + 1)..NUM_CANONICAL_HANDS {
+                let h2 = CanonicalHand::from_index(j).expect("valid canonical index");
+                let eq = calculate_equity(h1, h2, samples);
+                equities[i][j] = eq;
+                equities[j][i] = 1.0 - eq;
+                done += 1;
+                on_progress(done);
+            }
+        }
+
+        Self { equities, weights }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hands::CanonicalHand as CH;
     use test_macros::timed_test;
+
+    #[test]
+    #[ignore] // ~60s in debug mode (14,196 MC equity computations)
+    fn computed_table_has_real_equities() {
+        let table = EquityTable::new_computed(500, |_| {});
+        let aa = CH::parse("AA").unwrap().index();
+        let seven_two = CH::parse("72o").unwrap().index();
+        let eq = table.equity(aa, seven_two);
+        assert!(eq > 0.80, "AA vs 72o equity should be > 0.80, got {eq}");
+    }
+
+    #[test]
+    #[ignore] // ~25s in debug mode
+    fn computed_equities_are_symmetric() {
+        let table = EquityTable::new_computed(200, |_| {});
+        for i in 0..NUM_CANONICAL_HANDS {
+            for j in (i + 1)..NUM_CANONICAL_HANDS {
+                let sum = table.equity(i, j) + table.equity(j, i);
+                assert!(
+                    (sum - 1.0).abs() < 1e-10,
+                    "equity({i},{j}) + equity({j},{i}) = {sum}, expected 1.0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // ~25s in debug mode
+    fn computed_table_self_matchup_is_half() {
+        let table = EquityTable::new_computed(200, |_| {});
+        for i in 0..NUM_CANONICAL_HANDS {
+            let eq = table.equity(i, i);
+            assert!(
+                (eq - 0.5).abs() < f64::EPSILON,
+                "self-matchup equity({i},{i}) = {eq}, expected 0.5"
+            );
+        }
+    }
 
     #[timed_test]
     fn uniform_table_is_169x169() {

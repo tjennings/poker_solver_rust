@@ -30,7 +30,9 @@ use poker_solver_core::info_key::{
     InfoKey, canonical_hand_index_from_str, hand_label_from_bits, reverse_canonical_index,
     spr_bucket,
 };
-use poker_solver_core::preflop::{PreflopBundle, PreflopConfig, PreflopSolver, PreflopTree};
+use poker_solver_core::preflop::{
+    EquityTable, PreflopBundle, PreflopConfig, PreflopSolver, PreflopTree,
+};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
@@ -217,6 +219,9 @@ enum Commands {
         /// Print strategy matrices every N iterations (0 = only at end)
         #[arg(long, default_value = "1000")]
         print_every: u64,
+        /// Monte Carlo samples per hand matchup for equity table (0 = uniform)
+        #[arg(long, default_value = "2000")]
+        equity_samples: u32,
     },
 }
 
@@ -611,8 +616,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             iterations,
             output,
             print_every,
+            equity_samples,
         } => {
-            run_solve_preflop(stack_depth, players, iterations, &output, print_every)?;
+            run_solve_preflop(
+                stack_depth,
+                players,
+                iterations,
+                &output,
+                print_every,
+                equity_samples,
+            )?;
         }
     }
 
@@ -629,6 +642,7 @@ fn run_solve_preflop(
     iterations: u64,
     output: &Path,
     print_every: u64,
+    equity_samples: u32,
 ) -> Result<(), Box<dyn Error>> {
     let config = match players {
         2 => PreflopConfig::heads_up(stack_depth),
@@ -636,12 +650,33 @@ fn run_solve_preflop(
         n => return Err(format!("unsupported player count: {n} (use 2 or 6)").into()),
     };
 
+    let equity = if equity_samples > 0 {
+        let total_pairs = 169 * 168 / 2;
+        let eq_pb = ProgressBar::new(total_pairs as u64);
+        eq_pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} Computing equities [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                .expect("valid template")
+                .progress_chars("#>-"),
+        );
+        let eq_start = Instant::now();
+        let table = EquityTable::new_computed(equity_samples, |done| {
+            eq_pb.set_position(done as u64);
+        });
+        eq_pb.finish_with_message("done");
+        println!("Equity table built in {:.1?}", eq_start.elapsed());
+        table
+    } else {
+        println!("Using uniform equities (--equity-samples 0)");
+        EquityTable::new_uniform()
+    };
+
     println!("Solving preflop: {players}p, {stack_depth}BB, {iterations} iterations");
     let start = Instant::now();
 
     let tree = PreflopTree::build(&config);
     let bb_node = lhe_viz::find_raise_child(&tree, 0);
-    let mut solver = PreflopSolver::new(&config);
+    let mut solver = PreflopSolver::new_with_equity(&config, equity);
 
     print_preflop_matrices(&solver.strategy(), &tree, bb_node, 0);
 
