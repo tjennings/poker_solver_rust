@@ -11,23 +11,31 @@ A Rust-based poker solver using Counterfactual Regret Minimization (CFR) for Hea
 - **Strategy explorer** — Interactive 13x13 hand matrix desktop app for browsing trained strategies
 - **Agent simulation** — Pit blueprints and rule-based agents against each other
 
-## Prerequisites
+## Getting Started
 
-- [Rust](https://rustup.rs/) (edition 2024)
-- [Node.js](https://nodejs.org/) (v18+)
-- [Tauri CLI](https://tauri.app/start/prerequisites/)
+### 1. Install dependencies
 
-## Quick Start
+```bash
+# Rust (https://rustup.rs)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-### 1. Clone and install
+# Node.js v18+ (https://nodejs.org)
+brew install node        # macOS — or download from nodejs.org
+
+# Tauri system dependencies (macOS)
+xcode-select --install
+```
+
+### 2. Clone and build
 
 ```bash
 git clone <repo-url>
 cd poker_solver_rust
 cd frontend && npm install && cd ..
+cargo test -p poker-solver-core    # builds and runs ~500 tests
 ```
 
-### 2. Create a training config
+### 3. Create a training config
 
 Save as `quickstart.yaml`:
 
@@ -47,15 +55,15 @@ training:
   equity_bits: 4
 ```
 
-### 3. Train
+### 4. Train
 
 ```bash
 cargo run -p poker-solver-trainer --release -- train -c quickstart.yaml
 ```
 
-Training prints progress with exploitability and sample strategies at each checkpoint. A 25BB / 1000-iteration run completes in under a minute.
+Training prints progress with exploitability and sample strategies at each checkpoint. This config trains ~90 seconds on a 10-core machine (first build adds a few minutes for compilation).
 
-### 4. Explore the strategy
+### 5. Explore the strategy
 
 ```bash
 cd crates/tauri-app && cargo tauri dev
@@ -83,13 +91,6 @@ poker_solver_rust/
 - **[Training Reference](docs/training.md)** — Config options, abstraction modes, solver backends, pruning, convergence
 - **[Strategy Explorer](docs/explorer.md)** — Desktop app usage guide
 - **[CLI Reference](docs/cli.md)** — All trainer subcommands: `tree`, `inspect-deals`, `generate-deals`, `flops`, `trace-lhe`, benchmarks
-
-## Running Tests
-
-```bash
-cargo test -p poker-solver-core                    # fast tests (~3s)
-cargo test -p poker-solver-core -- --include-ignored  # include slow tests
-```
 
 ## License
 
