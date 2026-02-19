@@ -26,10 +26,14 @@ use rand::rngs::StdRng;
 // ---------------------------------------------------------------------------
 
 /// Strategy frequencies for a single hand.
-#[derive(Debug, Clone, Copy)]
+///
+/// `raises` holds one probability per raise/bet action, ordered from
+/// smallest to largest (all-in last). Call probability is implied:
+/// `1.0 - fold - raises.sum()`.
+#[derive(Debug, Clone)]
 pub struct HandStrategy {
     pub fold: f32,
-    pub raise: f32,
+    pub raises: Vec<f32>,
 }
 
 /// A 13x13 matrix of hand strategies.
@@ -155,7 +159,7 @@ pub fn preflop_response_matrix(
 fn compute_preflop_matrix(cfg: &MatrixConfig<'_>) -> HandMatrix {
     let encoder = LheEncoder::new();
     let game = LimitHoldem::new(cfg.lhe_config.clone(), 1, cfg.seed);
-    let mut matrix = [[None; 13]; 13];
+    let mut matrix = std::array::from_fn(|_| std::array::from_fn(|_| None));
 
     for (row, matrix_row) in matrix.iter_mut().enumerate() {
         for (col, cell) in matrix_row.iter_mut().enumerate() {
@@ -208,14 +212,14 @@ fn average_strategy_for_hand(
     if count == 0 {
         return HandStrategy {
             fold: 1.0,
-            raise: 0.0,
+            raises: vec![],
         };
     }
 
     let n = count as f64;
     HandStrategy {
         fold: (fold_sum / n) as f32,
-        raise: (raise_sum / n) as f32,
+        raises: vec![(raise_sum / n) as f32],
     }
 }
 
@@ -317,15 +321,23 @@ const fn player_index(player: Player) -> usize {
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// Bar width for the color-coded display.
-const BAR_WIDTH: usize = 5;
+/// Bar width for the color-coded display (10 = 10% precision per char).
+const BAR_WIDTH: usize = 10;
 
 /// ANSI color codes.
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
+
+/// Raise color gradient (bright yellow → dark orange), 256-color ANSI.
+const RAISE_COLORS: &[&str] = &[
+    "\x1b[38;5;226m", // bright yellow — smallest raise
+    "\x1b[38;5;220m", // yellow
+    "\x1b[38;5;214m", // orange-yellow
+    "\x1b[38;5;208m", // orange
+    "\x1b[38;5;202m", // dark orange — all-in
+];
 
 /// Print a hand matrix with color-coded bars.
 pub fn print_hand_matrix(matrix: &HandMatrix, title: &str) {
@@ -333,9 +345,9 @@ pub fn print_hand_matrix(matrix: &HandMatrix, title: &str) {
     println!();
 
     // Header row — "s" suffix marks the suited (upper-triangle) dimension
-    print!("     ");
+    print!("          ");
     for &rank in &RANK_ORDER {
-        print!("{:>4}s ", rank_label(rank));
+        print!("{:>9}s ", rank_label(rank));
     }
     println!();
 
@@ -343,8 +355,8 @@ pub fn print_hand_matrix(matrix: &HandMatrix, title: &str) {
         print!("  {} ", rank_label(RANK_ORDER[row]));
         for cell in matrix_row {
             match cell {
-                Some(s) => print!(" {}", render_bar(*s)),
-                None => print!("  --- "),
+                Some(s) => print!(" {}", render_bar(s)),
+                None => print!("  --------  "),
             }
         }
         println!();
@@ -352,27 +364,39 @@ pub fn print_hand_matrix(matrix: &HandMatrix, title: &str) {
 
     // Legend
     println!();
+    let r0 = RAISE_COLORS[0];
+    let r2 = RAISE_COLORS[2];
+    let r4 = RAISE_COLORS[4];
     println!(
-        "  Legend: {RED}F{RESET}=fold {GREEN}C{RESET}=call/check {YELLOW}R{RESET}=raise/bet  |  Upper-right=suited  Lower-left=offsuit  Diagonal=pairs"
+        "  Legend: {RED}.{RESET}=fold  {GREEN}|{RESET}=call  {r0}#{RESET}=small raise  {r2}#{RESET}=mid raise  {r4}#{RESET}=all-in  |  Upper-right=suited  Lower-left=offsuit  Diagonal=pairs"
     );
 }
 
 /// Render a single cell as a stacked color bar of `BAR_WIDTH` characters.
-fn render_bar(s: HandStrategy) -> String {
+///
+/// Raises are drawn left-to-right from smallest (bright yellow `#`) to largest
+/// (dark orange `#`), then call (green `|`), then fold (red `.`).
+fn render_bar(s: &HandStrategy) -> String {
+    let raise_total: f32 = s.raises.iter().sum();
     let fold_chars = (s.fold * BAR_WIDTH as f32).round() as usize;
-    let raise_chars = (s.raise * BAR_WIDTH as f32).round() as usize;
+    let total_raise_chars = (raise_total * BAR_WIDTH as f32).round() as usize;
     let call_chars = BAR_WIDTH
         .saturating_sub(fold_chars)
-        .saturating_sub(raise_chars);
+        .saturating_sub(total_raise_chars);
 
-    let mut bar = String::with_capacity(BAR_WIDTH + 20);
-    for _ in 0..raise_chars {
-        bar.push_str(YELLOW);
-        bar.push('#');
+    let per_raise = distribute_raise_chars(&s.raises, total_raise_chars);
+
+    let mut bar = String::with_capacity(BAR_WIDTH + 120);
+    for (i, &count) in per_raise.iter().enumerate() {
+        let color = RAISE_COLORS[i.min(RAISE_COLORS.len() - 1)];
+        for _ in 0..count {
+            bar.push_str(color);
+            bar.push('#');
+        }
     }
     for _ in 0..call_chars {
         bar.push_str(GREEN);
-        bar.push('#');
+        bar.push('|');
     }
     for _ in 0..fold_chars {
         bar.push_str(RED);
@@ -381,6 +405,37 @@ fn render_bar(s: HandStrategy) -> String {
     bar.push_str(RESET);
 
     bar
+}
+
+/// Distribute `total` bar characters across raises proportionally.
+fn distribute_raise_chars(raises: &[f32], total: usize) -> Vec<usize> {
+    if raises.is_empty() || total == 0 {
+        return vec![];
+    }
+    let sum: f32 = raises.iter().sum();
+    if sum <= 0.0 {
+        return vec![0; raises.len()];
+    }
+    // Floor each, then distribute remainder to largest fractional parts
+    let mut chars: Vec<usize> = raises.iter().map(|r| (r / sum * total as f32) as usize).collect();
+    let assigned: usize = chars.iter().sum();
+    let mut remainder = total.saturating_sub(assigned);
+    if remainder > 0 {
+        let mut fracs: Vec<(usize, f32)> = raises
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i, (r / sum * total as f32) - chars[i] as f32))
+            .collect();
+        fracs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (i, _) in fracs {
+            if remainder == 0 {
+                break;
+            }
+            chars[i] += 1;
+            remainder -= 1;
+        }
+    }
+    chars
 }
 
 // ---------------------------------------------------------------------------
@@ -413,10 +468,10 @@ pub fn preflop_strategy_matrix(
 ) -> HandMatrix {
     let action_labels = match &tree.nodes[node_idx as usize] {
         PreflopNode::Decision { action_labels, .. } => action_labels,
-        PreflopNode::Terminal { .. } => return [[None; 13]; 13],
+        PreflopNode::Terminal { .. } => return std::array::from_fn(|_| std::array::from_fn(|_| None)),
     };
 
-    let mut matrix = [[None; 13]; 13];
+    let mut matrix = std::array::from_fn(|_| std::array::from_fn(|_| None));
     for (row, matrix_row) in matrix.iter_mut().enumerate() {
         for (col, cell) in matrix_row.iter_mut().enumerate() {
             let hand_idx = canonical_hand_index(row, col);
@@ -427,34 +482,30 @@ pub fn preflop_strategy_matrix(
     matrix
 }
 
-/// Classify preflop action probabilities into fold/raise.
+/// Classify preflop action probabilities into fold + per-raise.
 ///
 /// When `probs` is empty (no training yet), falls back to uniform over actions.
 #[allow(clippy::cast_precision_loss)]
 fn classify_preflop_probs(actions: &[PreflopAction], probs: &[f64]) -> HandStrategy {
-    let probs: &[f64] = if probs.is_empty() {
-        // No strategy yet — use uniform placeholder
-        // Leaked only once per call, but we use a static-sized buffer instead
+    if probs.is_empty() {
         return uniform_strategy(actions);
-    } else {
-        probs
-    };
+    }
 
     let mut fold = 0.0f64;
-    let mut raise = 0.0f64;
+    let mut raises = Vec::new();
 
     for (i, action) in actions.iter().enumerate() {
         let p = if i < probs.len() { probs[i] } else { 0.0 };
         match action {
             PreflopAction::Fold => fold += p,
             PreflopAction::Call => {}
-            PreflopAction::Raise(_) | PreflopAction::AllIn => raise += p,
+            PreflopAction::Raise(_) | PreflopAction::AllIn => raises.push(p as f32),
         }
     }
 
     HandStrategy {
         fold: fold as f32,
-        raise: raise as f32,
+        raises,
     }
 }
 
@@ -462,22 +513,19 @@ fn classify_preflop_probs(actions: &[PreflopAction], probs: &[f64]) -> HandStrat
 #[allow(clippy::cast_precision_loss)]
 fn uniform_strategy(actions: &[PreflopAction]) -> HandStrategy {
     if actions.is_empty() {
-        return HandStrategy { fold: 0.0, raise: 0.0 };
+        return HandStrategy { fold: 0.0, raises: vec![] };
     }
-    let p = 1.0 / actions.len() as f64;
-    let mut fold = 0.0f64;
-    let mut raise = 0.0f64;
+    let p = (1.0 / actions.len() as f64) as f32;
+    let mut fold = 0.0f32;
+    let mut raises = Vec::new();
     for action in actions {
         match action {
             PreflopAction::Fold => fold += p,
             PreflopAction::Call => {}
-            PreflopAction::Raise(_) | PreflopAction::AllIn => raise += p,
+            PreflopAction::Raise(_) | PreflopAction::AllIn => raises.push(p),
         }
     }
-    HandStrategy {
-        fold: fold as f32,
-        raise: raise as f32,
-    }
+    HandStrategy { fold, raises }
 }
 
 /// Find the first Raise child of a decision node.
@@ -576,9 +624,9 @@ mod tests {
     fn render_bar_all_raise() {
         let s = HandStrategy {
             fold: 0.0,
-            raise: 1.0,
+            raises: vec![1.0],
         };
-        let bar = render_bar(s);
+        let bar = render_bar(&s);
         assert!(bar.contains('#'));
         assert!(!bar.contains('.'));
     }
@@ -587,10 +635,23 @@ mod tests {
     fn render_bar_all_fold() {
         let s = HandStrategy {
             fold: 1.0,
-            raise: 0.0,
+            raises: vec![],
         };
-        let bar = render_bar(s);
+        let bar = render_bar(&s);
         assert!(bar.contains('.'));
+    }
+
+    #[test]
+    fn render_bar_multiple_raises() {
+        let s = HandStrategy {
+            fold: 0.0,
+            raises: vec![0.5, 0.5],
+        };
+        let bar = render_bar(&s);
+        // Should have all '#' chars (raises) and no call or fold
+        assert!(bar.contains('#'));
+        assert!(!bar.contains('|'));
+        assert!(!bar.contains('.'));
     }
 
     // -----------------------------------------------------------------------
@@ -711,7 +772,8 @@ mod tests {
         let probs = [0.2, 0.3, 0.5];
         let s = classify_preflop_probs(&actions, &probs);
         assert!((s.fold - 0.2).abs() < 1e-6);
-        assert!((s.raise - 0.5).abs() < 1e-6);
+        assert_eq!(s.raises.len(), 1);
+        assert!((s.raises[0] - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -719,7 +781,26 @@ mod tests {
         let actions = [PreflopAction::Fold, PreflopAction::Call, PreflopAction::AllIn];
         let probs = [0.1, 0.2, 0.7];
         let s = classify_preflop_probs(&actions, &probs);
-        assert!((s.raise - 0.7).abs() < 1e-6);
+        assert_eq!(s.raises.len(), 1);
+        assert!((s.raises[0] - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn classify_preflop_multiple_raises() {
+        let actions = [
+            PreflopAction::Fold,
+            PreflopAction::Call,
+            PreflopAction::Raise(2.0),
+            PreflopAction::Raise(3.0),
+            PreflopAction::AllIn,
+        ];
+        let probs = [0.1, 0.2, 0.3, 0.25, 0.15];
+        let s = classify_preflop_probs(&actions, &probs);
+        assert!((s.fold - 0.1).abs() < 1e-6);
+        assert_eq!(s.raises.len(), 3);
+        assert!((s.raises[0] - 0.3).abs() < 1e-6);
+        assert!((s.raises[1] - 0.25).abs() < 1e-6);
+        assert!((s.raises[2] - 0.15).abs() < 1e-6);
     }
 
     // -----------------------------------------------------------------------
