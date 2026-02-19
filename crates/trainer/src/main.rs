@@ -643,6 +643,8 @@ fn run_solve_preflop(
     let bb_node = lhe_viz::find_raise_child(&tree, 0);
     let mut solver = PreflopSolver::new(&config);
 
+    print_preflop_matrices(&solver.strategy(), &tree, bb_node, 0);
+
     let pb = ProgressBar::new(iterations);
     pb.set_style(
         ProgressStyle::default_bar()
