@@ -12,6 +12,7 @@ use poker_solver_core::game::{
     Action, Game, LimitHoldem, LimitHoldemConfig, LimitHoldemState, Player,
 };
 use poker_solver_core::poker::{Card, Suit, Value};
+use poker_solver_core::preflop::{PreflopAction, PreflopNode, PreflopStrategy, PreflopTree};
 use poker_solver_deep_cfr::eval::ExplicitPolicy;
 use poker_solver_deep_cfr::lhe_encoder::LheEncoder;
 use poker_solver_deep_cfr::traverse::StateEncoder;
@@ -383,6 +384,91 @@ fn render_bar(s: HandStrategy) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Preflop LCFR strategy matrix
+// ---------------------------------------------------------------------------
+
+/// Map a 13x13 matrix cell to a canonical hand index (0..169).
+///
+/// - Pairs (row == col): indices 0..12
+/// - Suited (row < col): indices 13..90
+/// - Offsuit (row > col): indices 91..168
+fn canonical_hand_index(row: usize, col: usize) -> usize {
+    if row == col {
+        row
+    } else if row < col {
+        13 + col * (col - 1) / 2 + row
+    } else {
+        91 + row * (row - 1) / 2 + col
+    }
+}
+
+/// Build a 13x13 strategy matrix from a `PreflopStrategy` at a given node.
+///
+/// For each cell, looks up the strategy probabilities and classifies actions
+/// from the node's `action_labels` into fold/raise buckets.
+pub fn preflop_strategy_matrix(
+    strategy: &PreflopStrategy,
+    tree: &PreflopTree,
+    node_idx: u32,
+) -> HandMatrix {
+    let action_labels = match &tree.nodes[node_idx as usize] {
+        PreflopNode::Decision { action_labels, .. } => action_labels,
+        PreflopNode::Terminal { .. } => return [[None; 13]; 13],
+    };
+
+    let mut matrix = [[None; 13]; 13];
+    for (row, matrix_row) in matrix.iter_mut().enumerate() {
+        for (col, cell) in matrix_row.iter_mut().enumerate() {
+            let hand_idx = canonical_hand_index(row, col);
+            let probs = strategy.get_probs(node_idx, hand_idx);
+            *cell = Some(classify_preflop_probs(action_labels, &probs));
+        }
+    }
+    matrix
+}
+
+/// Classify preflop action probabilities into fold/raise.
+fn classify_preflop_probs(actions: &[PreflopAction], probs: &[f64]) -> HandStrategy {
+    let mut fold = 0.0f64;
+    let mut raise = 0.0f64;
+
+    for (i, action) in actions.iter().enumerate() {
+        let p = if i < probs.len() { probs[i] } else { 0.0 };
+        match action {
+            PreflopAction::Fold => fold += p,
+            PreflopAction::Call => {}
+            PreflopAction::Raise(_) | PreflopAction::AllIn => raise += p,
+        }
+    }
+
+    HandStrategy {
+        fold: fold as f32,
+        raise: raise as f32,
+    }
+}
+
+/// Find the first Raise child of a decision node.
+///
+/// Used to locate the BB response node after SB raises at the root.
+pub fn find_raise_child(tree: &PreflopTree, node_idx: u32) -> Option<u32> {
+    match &tree.nodes[node_idx as usize] {
+        PreflopNode::Decision {
+            action_labels,
+            children,
+            ..
+        } => {
+            for (i, action) in action_labels.iter().enumerate() {
+                if matches!(action, PreflopAction::Raise(_)) {
+                    return Some(children[i]);
+                }
+            }
+            None
+        }
+        PreflopNode::Terminal { .. } => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -541,5 +627,107 @@ mod tests {
         let cards = make_hole_cards(0, 0); // AA
         assert_ne!(cards[0].suit, cards[1].suit);
         assert_eq!(cards[0].value, cards[1].value);
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. Canonical hand index
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn canonical_index_pairs() {
+        assert_eq!(canonical_hand_index(0, 0), 0); // AA
+        assert_eq!(canonical_hand_index(12, 12), 12); // 22
+    }
+
+    #[test]
+    fn canonical_index_suited() {
+        assert_eq!(canonical_hand_index(0, 1), 13); // AKs
+        assert_eq!(canonical_hand_index(11, 12), 90); // 32s
+    }
+
+    #[test]
+    fn canonical_index_offsuit() {
+        assert_eq!(canonical_hand_index(1, 0), 91); // KAo
+        assert_eq!(canonical_hand_index(12, 11), 168); // 23o
+    }
+
+    #[test]
+    fn canonical_index_covers_169() {
+        let mut seen = std::collections::HashSet::new();
+        for row in 0..13 {
+            for col in 0..13 {
+                let idx = canonical_hand_index(row, col);
+                assert!(idx < 169, "index {idx} out of range for ({row},{col})");
+                assert!(seen.insert(idx), "duplicate index {idx}");
+            }
+        }
+        assert_eq!(seen.len(), 169);
+    }
+
+    // -----------------------------------------------------------------------
+    // 9. Classify preflop action probs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_preflop_fold_call_raise() {
+        let actions = [
+            PreflopAction::Fold,
+            PreflopAction::Call,
+            PreflopAction::Raise(2.0),
+        ];
+        let probs = [0.2, 0.3, 0.5];
+        let s = classify_preflop_probs(&actions, &probs);
+        assert!((s.fold - 0.2).abs() < 1e-6);
+        assert!((s.raise - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn classify_preflop_all_in_counts_as_raise() {
+        let actions = [PreflopAction::Fold, PreflopAction::Call, PreflopAction::AllIn];
+        let probs = [0.1, 0.2, 0.7];
+        let s = classify_preflop_probs(&actions, &probs);
+        assert!((s.raise - 0.7).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // 10. find_raise_child
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_raise_child_in_hu_tree() {
+        use poker_solver_core::preflop::PreflopConfig;
+        let config = PreflopConfig::heads_up(25);
+        let tree = PreflopTree::build(&config);
+        let child = find_raise_child(&tree, 0);
+        assert!(child.is_some(), "HU root should have a raise child");
+        // The child should be a BB decision node
+        match &tree.nodes[child.unwrap() as usize] {
+            PreflopNode::Decision { position, .. } => {
+                assert_eq!(*position, 1, "raise child should be BB's decision");
+            }
+            other => panic!("expected decision node, got: {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 11. preflop_strategy_matrix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn preflop_strategy_matrix_returns_169_cells() {
+        use poker_solver_core::preflop::{PreflopConfig, PreflopSolver};
+        let mut config = PreflopConfig::heads_up(10);
+        config.raise_sizes = vec![vec![3.0]];
+        config.raise_cap = 1;
+        let mut solver = PreflopSolver::new(&config);
+        solver.train(5);
+        let strategy = solver.strategy();
+        let tree = PreflopTree::build(&config);
+        let matrix = preflop_strategy_matrix(&strategy, &tree, 0);
+        for row in &matrix {
+            for cell in row {
+                assert!(cell.is_some());
+            }
+        }
     }
 }

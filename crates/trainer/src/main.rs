@@ -30,7 +30,7 @@ use poker_solver_core::info_key::{
     InfoKey, canonical_hand_index_from_str, hand_label_from_bits, reverse_canonical_index,
     spr_bucket,
 };
-use poker_solver_core::preflop::{PreflopBundle, PreflopConfig, PreflopSolver};
+use poker_solver_core::preflop::{PreflopBundle, PreflopConfig, PreflopSolver, PreflopTree};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
@@ -214,6 +214,9 @@ enum Commands {
         /// Output directory for the preflop bundle
         #[arg(short, long)]
         output: PathBuf,
+        /// Print strategy matrices every N iterations (0 = only at end)
+        #[arg(long, default_value = "1000")]
+        print_every: u64,
     },
 }
 
@@ -607,8 +610,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             players,
             iterations,
             output,
+            print_every,
         } => {
-            run_solve_preflop(stack_depth, players, iterations, &output)?;
+            run_solve_preflop(stack_depth, players, iterations, &output, print_every)?;
         }
     }
 
@@ -624,6 +628,7 @@ fn run_solve_preflop(
     players: u8,
     iterations: u64,
     output: &Path,
+    print_every: u64,
 ) -> Result<(), Box<dyn Error>> {
     let config = match players {
         2 => PreflopConfig::heads_up(stack_depth),
@@ -634,6 +639,8 @@ fn run_solve_preflop(
     println!("Solving preflop: {players}p, {stack_depth}BB, {iterations} iterations");
     let start = Instant::now();
 
+    let tree = PreflopTree::build(&config);
+    let bb_node = lhe_viz::find_raise_child(&tree, 0);
     let mut solver = PreflopSolver::new(&config);
 
     let pb = ProgressBar::new(iterations);
@@ -644,13 +651,23 @@ fn run_solve_preflop(
             .progress_chars("#>-"),
     );
 
-    let chunk = std::cmp::max(iterations / 100, 1);
+    let chunk = if print_every > 0 {
+        print_every
+    } else {
+        std::cmp::max(iterations / 100, 1)
+    };
     let mut done = 0u64;
     while done < iterations {
         let batch = std::cmp::min(chunk, iterations - done);
         solver.train(batch);
         done += batch;
         pb.set_position(done);
+
+        if print_every > 0 && done < iterations && done.is_multiple_of(print_every) {
+            pb.suspend(|| {
+                print_preflop_matrices(&solver.strategy(), &tree, bb_node, done);
+            });
+        }
     }
     pb.finish_with_message("done");
 
@@ -658,11 +675,27 @@ fn run_solve_preflop(
     let strategy = solver.strategy();
     println!("Converged in {elapsed:.1?} — {} info sets", strategy.len());
 
+    print_preflop_matrices(&strategy, &tree, bb_node, iterations);
+
     let bundle = PreflopBundle::new(config, strategy);
     bundle.save(output)?;
     println!("Saved to {}", output.display());
 
     Ok(())
+}
+
+fn print_preflop_matrices(
+    strategy: &poker_solver_core::preflop::PreflopStrategy,
+    tree: &PreflopTree,
+    bb_node: Option<u32>,
+    iteration: u64,
+) {
+    let sb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, 0);
+    lhe_viz::print_hand_matrix(&sb_matrix, &format!("SB RFI — iteration {iteration}"));
+    if let Some(bb_idx) = bb_node {
+        let bb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, bb_idx);
+        lhe_viz::print_hand_matrix(&bb_matrix, &format!("BB vs Raise — iteration {iteration}"));
+    }
 }
 
 // ---------------------------------------------------------------------------
