@@ -3,7 +3,10 @@
 //! Performs full-game CFR over 169 canonical hand matchups, using linear
 //! weighting (regrets and strategy sums scaled by iteration number `t`).
 //! Each iteration is parallelized via rayon: a frozen regret snapshot is
-//! shared across threads, with thread-local delta maps merged afterward.
+//! shared across threads, with flat buffer deltas merged via parallel reduce.
+//!
+//! Storage uses flat `Vec<f64>` buffers indexed by `(node, hand, action)`
+//! for cache-friendly access and fast clone/merge operations.
 
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -14,6 +17,7 @@ use super::equity::EquityTable;
 use super::tree::{PreflopAction, PreflopNode, PreflopTree, TerminalType};
 
 const NUM_HANDS: usize = 169;
+const MAX_ACTIONS: usize = 8;
 
 /// Extracted average strategy from Linear CFR training.
 ///
@@ -62,19 +66,48 @@ impl PreflopStrategy {
 /// Per-node investment amounts for each player (HU only: [p0, p1]).
 type NodeInvestments = Vec<[u32; 2]>;
 
-/// Thread-local delta accumulators for regret and strategy updates.
-struct Deltas {
-    regret: FxHashMap<u64, Vec<f64>>,
-    strategy: FxHashMap<u64, Vec<f64>>,
+/// Pre-computed layout mapping `(node, hand)` pairs to flat buffer offsets.
+///
+/// Each decision node reserves `NUM_HANDS * num_actions` contiguous slots.
+/// Terminal nodes have zero-width regions.
+struct NodeLayout {
+    /// `(offset, num_actions)` per tree node. Terminals have `num_actions = 0`.
+    entries: Vec<(usize, usize)>,
+    /// Total buffer size in `f64` elements.
+    total_size: usize,
 }
 
-impl Deltas {
-    fn new() -> Self {
-        Self {
-            regret: FxHashMap::default(),
-            strategy: FxHashMap::default(),
+impl NodeLayout {
+    fn from_tree(tree: &PreflopTree) -> Self {
+        let mut entries = Vec::with_capacity(tree.nodes.len());
+        let mut offset = 0;
+        for node in &tree.nodes {
+            let num_actions = match node {
+                PreflopNode::Decision { children, .. } => children.len(),
+                PreflopNode::Terminal { .. } => 0,
+            };
+            entries.push((offset, num_actions));
+            offset += NUM_HANDS * num_actions;
         }
+        Self { entries, total_size: offset }
     }
+
+    /// Start index and action count for a `(node, hand)` pair.
+    #[inline]
+    fn slot(&self, node_idx: u32, hand_idx: u16) -> (usize, usize) {
+        let (base, n) = self.entries[node_idx as usize];
+        (base + (hand_idx as usize) * n, n)
+    }
+
+}
+
+/// Immutable context shared across all traversals in one iteration.
+struct Ctx<'a> {
+    tree: &'a PreflopTree,
+    investments: &'a NodeInvestments,
+    equity: &'a EquityTable,
+    layout: &'a NodeLayout,
+    snapshot: &'a [f64],
 }
 
 /// Preflop Linear CFR solver.
@@ -84,12 +117,14 @@ impl Deltas {
 pub struct PreflopSolver {
     tree: PreflopTree,
     equity: EquityTable,
-    /// Per-node per-player investments, precomputed from the tree.
     investments: NodeInvestments,
-    /// Cumulative regrets per action, keyed by `(node_idx, hand_idx)`.
-    regret_sum: FxHashMap<u64, Vec<f64>>,
-    /// Cumulative weighted strategy per action, keyed by `(node_idx, hand_idx)`.
-    strategy_sum: FxHashMap<u64, Vec<f64>>,
+    layout: NodeLayout,
+    /// Pre-computed valid `(hand_i, hand_j)` pairs with non-zero weight.
+    pairs: Vec<(u16, u16)>,
+    /// Cumulative regrets, flat buffer indexed by `layout.slot()`.
+    regret_sum: Vec<f64>,
+    /// Cumulative weighted strategy, flat buffer indexed by `layout.slot()`.
+    strategy_sum: Vec<f64>,
     iteration: u64,
 }
 
@@ -102,15 +137,26 @@ impl PreflopSolver {
 
     /// Create a solver with a custom precomputed equity table.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn new_with_equity(config: &PreflopConfig, equity: EquityTable) -> Self {
         let tree = PreflopTree::build(config);
         let investments = precompute_investments(&tree, config);
+        let layout = NodeLayout::from_tree(&tree);
+        // Safe: h1, h2 always < 169, well within u16
+        let pairs: Vec<(u16, u16)> = (0..NUM_HANDS)
+            .flat_map(|h1| (0..NUM_HANDS).map(move |h2| (h1, h2)))
+            .filter(|&(h1, h2)| equity.weight(h1, h2) > 0.0)
+            .map(|(h1, h2)| (h1 as u16, h2 as u16))
+            .collect();
+        let buf_size = layout.total_size;
         Self {
             tree,
             equity,
             investments,
-            regret_sum: FxHashMap::default(),
-            strategy_sum: FxHashMap::default(),
+            layout,
+            pairs,
+            regret_sum: vec![0.0; buf_size],
+            strategy_sum: vec![0.0; buf_size],
             iteration: 0,
         }
     }
@@ -132,76 +178,84 @@ impl PreflopSolver {
 
     /// Extract the average strategy (normalized `strategy_sum`).
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn strategy(&self) -> PreflopStrategy {
         let mut strategies = FxHashMap::default();
-        for (&key, sums) in &self.strategy_sum {
-            strategies.insert(key, normalize(sums));
+        for (node_idx, node) in self.tree.nodes.iter().enumerate() {
+            let num_actions = match node {
+                PreflopNode::Decision { children, .. } => children.len(),
+                PreflopNode::Terminal { .. } => continue,
+            };
+            // Safe: hand_idx < 169, node_idx fits u32 for any reasonable tree
+            for hand_idx in 0..NUM_HANDS {
+                let (start, _) = self.layout.slot(node_idx as u32, hand_idx as u16);
+                let sums = &self.strategy_sum[start..start + num_actions];
+                let key = PreflopStrategy::key(node_idx as u32, hand_idx as u16);
+                strategies.insert(key, normalize(sums));
+            }
         }
         PreflopStrategy { strategies }
     }
 
     /// Single training iteration: snapshot regrets, parallel traverse, merge.
-    #[allow(clippy::cast_possible_truncation)]
     fn train_one_iteration(&mut self, t: u64) {
-        let regret_snapshot = self.regret_sum.clone();
+        // Clone is a fast memcpy of a flat buffer (no HashMap allocation)
+        let snapshot = self.regret_sum.clone();
+        let buf_size = self.layout.total_size;
 
-        let pairs: Vec<(u16, u16)> = (0..NUM_HANDS)
-            .flat_map(|h1| (0..NUM_HANDS).map(move |h2| (h1, h2)))
-            .filter(|&(h1, h2)| self.equity.weight(h1, h2) > 0.0)
-            // Safe: h1, h2 always < 169, well within u16
-            .map(|(h1, h2)| (h1 as u16, h2 as u16))
-            .collect();
+        let ctx = Ctx {
+            tree: &self.tree,
+            investments: &self.investments,
+            equity: &self.equity,
+            layout: &self.layout,
+            snapshot: &snapshot,
+        };
 
-        let all_deltas: Vec<Deltas> = pairs
+        // Parallel fold+reduce: each rayon task accumulates into its own
+        // flat buffer, then buffers are merged in a parallel reduction tree.
+        let pairs = &self.pairs;
+        let (merged_regret, merged_strategy) = pairs
             .par_iter()
             .fold(
-                Deltas::new,
-                |mut deltas, &(h1, h2)| {
-                    cfr_traverse(
-                        &self.tree, &self.investments, &self.equity,
-                        &regret_snapshot, &mut deltas,
-                        0, h1, h2, 0, 1.0, 1.0, t,
-                    );
-                    cfr_traverse(
-                        &self.tree, &self.investments, &self.equity,
-                        &regret_snapshot, &mut deltas,
-                        0, h2, h1, 1, 1.0, 1.0, t,
-                    );
-                    deltas
+                || (vec![0.0f64; buf_size], vec![0.0f64; buf_size]),
+                |(mut dr, mut ds), &(h1, h2)| {
+                    let w = ctx.equity.weight(h1 as usize, h2 as usize);
+                    cfr_traverse(&ctx, &mut dr, &mut ds, 0, h1, h2, 0, 1.0, w, t);
+                    cfr_traverse(&ctx, &mut dr, &mut ds, 0, h2, h1, 1, 1.0, w, t);
+                    (dr, ds)
                 },
             )
-            .collect();
+            .reduce(
+                || (vec![0.0; buf_size], vec![0.0; buf_size]),
+                |(mut ar, mut a_s), (br, bs)| {
+                    add_into(&mut ar, &br);
+                    add_into(&mut a_s, &bs);
+                    (ar, a_s)
+                },
+            );
 
-        for deltas in all_deltas {
-            merge_deltas(&mut self.regret_sum, deltas.regret);
-            merge_deltas(&mut self.strategy_sum, deltas.strategy);
-        }
+        add_into(&mut self.regret_sum, &merged_regret);
+        add_into(&mut self.strategy_sum, &merged_strategy);
     }
 }
 
-/// Merge source deltas into target by adding element-wise.
-fn merge_deltas(target: &mut FxHashMap<u64, Vec<f64>>, source: FxHashMap<u64, Vec<f64>>) {
-    for (key, src_vals) in source {
-        let dst = target
-            .entry(key)
-            .or_insert_with(|| vec![0.0; src_vals.len()]);
-        for (d, s) in dst.iter_mut().zip(&src_vals) {
-            *d += s;
-        }
+/// Element-wise `dst[i] += src[i]`.
+#[inline]
+fn add_into(dst: &mut [f64], src: &[f64]) {
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d += s;
     }
 }
 
 /// Recursive CFR traversal. Returns expected value for the hero player.
 ///
-/// Reads strategy from `regret_snapshot` (frozen for the iteration),
-/// writes regret and strategy deltas to thread-local `deltas`.
+/// Reads strategy from `ctx.snapshot` (frozen for the iteration),
+/// writes regret and strategy deltas to flat `dr` / `ds` buffers.
 #[allow(clippy::too_many_arguments)]
 fn cfr_traverse(
-    tree: &PreflopTree,
-    investments: &NodeInvestments,
-    equity: &EquityTable,
-    regret_snapshot: &FxHashMap<u64, Vec<f64>>,
-    deltas: &mut Deltas,
+    ctx: &Ctx<'_>,
+    dr: &mut [f64],
+    ds: &mut [f64],
     node_idx: u32,
     hero_hand: u16,
     opp_hand: u16,
@@ -210,31 +264,32 @@ fn cfr_traverse(
     reach_opp: f64,
     t: u64,
 ) -> f64 {
-    let inv = investments[node_idx as usize];
+    let inv = ctx.investments[node_idx as usize];
     let hero_inv = f64::from(inv[hero_pos as usize]);
 
-    match &tree.nodes[node_idx as usize] {
+    match &ctx.tree.nodes[node_idx as usize] {
         PreflopNode::Terminal { terminal_type, pot } => {
-            terminal_value(*terminal_type, *pot, hero_inv, hero_hand, opp_hand, hero_pos, equity)
+            terminal_value(*terminal_type, *pot, hero_inv, hero_hand, opp_hand, hero_pos, ctx.equity)
         }
         PreflopNode::Decision { position, children, .. } => {
             let num_actions = children.len();
             let is_hero = *position == hero_pos;
             let hand_for_key = if is_hero { hero_hand } else { opp_hand };
-            let key = PreflopStrategy::key(node_idx, hand_for_key);
-            let strategy = regret_matching(regret_snapshot, key, num_actions);
+            let (start, _) = ctx.layout.slot(node_idx, hand_for_key);
+            let mut strategy = [0.0f64; MAX_ACTIONS];
+            regret_matching_into(ctx.snapshot, start, &mut strategy[..num_actions]);
 
             if is_hero {
                 traverse_hero(
-                    tree, investments, equity, regret_snapshot, deltas,
-                    key, hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                    t, children, &strategy, num_actions,
+                    ctx, dr, ds,
+                    start, hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
+                    t, children, &strategy[..num_actions],
                 )
             } else {
                 traverse_opponent(
-                    tree, investments, equity, regret_snapshot, deltas,
+                    ctx, dr, ds,
                     hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                    t, children, &strategy,
+                    t, children, &strategy[..num_actions],
                 )
             }
         }
@@ -244,12 +299,10 @@ fn cfr_traverse(
 /// Hero's decision: compute regrets and update strategy/regret deltas.
 #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
 fn traverse_hero(
-    tree: &PreflopTree,
-    investments: &NodeInvestments,
-    equity: &EquityTable,
-    regret_snapshot: &FxHashMap<u64, Vec<f64>>,
-    deltas: &mut Deltas,
-    key: u64,
+    ctx: &Ctx<'_>,
+    dr: &mut [f64],
+    ds: &mut [f64],
+    slot_start: usize,
     hero_hand: u16,
     opp_hand: u16,
     hero_pos: u8,
@@ -258,30 +311,31 @@ fn traverse_hero(
     t: u64,
     children: &[u32],
     strategy: &[f64],
-    num_actions: usize,
 ) -> f64 {
-    let mut action_values = vec![0.0f64; num_actions];
+    let num_actions = children.len();
+    let mut action_values = [0.0f64; MAX_ACTIONS];
     for (i, &child_idx) in children.iter().enumerate() {
         action_values[i] = cfr_traverse(
-            tree, investments, equity, regret_snapshot, deltas,
+            ctx, dr, ds,
             child_idx, hero_hand, opp_hand, hero_pos,
             reach_hero * strategy[i], reach_opp, t,
         );
     }
 
-    let node_value: f64 = strategy.iter().zip(&action_values).map(|(s, v)| s * v).sum();
+    let node_value: f64 = strategy.iter()
+        .zip(&action_values[..num_actions])
+        .map(|(s, v)| s * v)
+        .sum();
     let t_f64 = t as f64;
 
     // Accumulate regret deltas (weighted by t for linear CFR)
-    let regrets = deltas.regret.entry(key).or_insert_with(|| vec![0.0; num_actions]);
-    for (i, val) in action_values.iter().enumerate() {
-        regrets[i] += t_f64 * reach_opp * (val - node_value);
+    for (i, val) in action_values[..num_actions].iter().enumerate() {
+        dr[slot_start + i] += t_f64 * reach_opp * (val - node_value);
     }
 
     // Accumulate strategy deltas (weighted by t * reach_hero)
-    let strat = deltas.strategy.entry(key).or_insert_with(|| vec![0.0; num_actions]);
     for (i, &s) in strategy.iter().enumerate() {
-        strat[i] += t_f64 * reach_hero * s;
+        ds[slot_start + i] += t_f64 * reach_hero * s;
     }
 
     node_value
@@ -290,11 +344,9 @@ fn traverse_hero(
 /// Opponent's decision: traverse using opponent's strategy.
 #[allow(clippy::too_many_arguments)]
 fn traverse_opponent(
-    tree: &PreflopTree,
-    investments: &NodeInvestments,
-    equity: &EquityTable,
-    regret_snapshot: &FxHashMap<u64, Vec<f64>>,
-    deltas: &mut Deltas,
+    ctx: &Ctx<'_>,
+    dr: &mut [f64],
+    ds: &mut [f64],
     hero_hand: u16,
     opp_hand: u16,
     hero_pos: u8,
@@ -307,7 +359,7 @@ fn traverse_opponent(
     let mut node_value = 0.0f64;
     for (i, &child_idx) in children.iter().enumerate() {
         let child_value = cfr_traverse(
-            tree, investments, equity, regret_snapshot, deltas,
+            ctx, dr, ds,
             child_idx, hero_hand, opp_hand, hero_pos,
             reach_hero, reach_opp * strategy[i], t,
         );
@@ -341,32 +393,31 @@ fn terminal_value(
     }
 }
 
-/// Regret matching: normalize positive regrets into a probability distribution.
+/// Regret matching: write positive-regret-normalized strategy into `out`.
 #[allow(clippy::cast_precision_loss)]
-fn regret_matching(regret_sum: &FxHashMap<u64, Vec<f64>>, key: u64, num_actions: usize) -> Vec<f64> {
-    let mut strategy = vec![0.0f64; num_actions];
+fn regret_matching_into(regret_buf: &[f64], start: usize, out: &mut [f64]) {
+    let num_actions = out.len();
     let mut positive_sum = 0.0f64;
 
-    if let Some(r) = regret_sum.get(&key) {
-        for (i, &val) in r.iter().enumerate() {
-            if val > 0.0 {
-                strategy[i] = val;
-                positive_sum += val;
-            }
+    for (i, s) in out.iter_mut().enumerate() {
+        let val = regret_buf[start + i];
+        if val > 0.0 {
+            *s = val;
+            positive_sum += val;
+        } else {
+            *s = 0.0;
         }
     }
 
     if positive_sum > 0.0 {
-        for s in &mut strategy {
+        for s in out.iter_mut() {
             *s /= positive_sum;
         }
     } else {
-        // Safe: num_actions is small (< 10)
+        // Safe: num_actions is small (< MAX_ACTIONS)
         let uniform = 1.0 / num_actions as f64;
-        strategy.fill(uniform);
+        out.fill(uniform);
     }
-
-    strategy
 }
 
 /// Normalize a cumulative strategy sum into a probability distribution.

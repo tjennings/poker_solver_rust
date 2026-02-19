@@ -10,6 +10,7 @@ use rayon::prelude::*;
 
 use crate::equity::calculate_equity;
 use crate::hands::CanonicalHand;
+use crate::poker::Card;
 
 const NUM_CANONICAL_HANDS: usize = 169;
 
@@ -51,6 +52,28 @@ impl EquityTable {
         self.equities.len()
     }
 
+    /// Returns the equity of hand `hand_i` vs a random opponent hand,
+    /// weighted by card-removal weights.
+    #[must_use]
+    pub fn equity_vs_random(&self, hand_i: usize) -> f64 {
+        let n = self.equities.len();
+        let mut total_eq = 0.0;
+        let mut total_weight = 0.0;
+        for j in 0..n {
+            if j == hand_i {
+                continue;
+            }
+            let w = self.weights[hand_i][j];
+            total_eq += self.equities[hand_i][j] * w;
+            total_weight += w;
+        }
+        if total_weight > 0.0 {
+            total_eq / total_weight
+        } else {
+            0.5
+        }
+    }
+
     /// Compute real equities for all 169x169 canonical hand matchups.
     ///
     /// Uses Monte Carlo simulation with `samples` per matchup.
@@ -85,10 +108,43 @@ impl EquityTable {
             equities[i][j] = eq;
             equities[j][i] = 1.0 - eq;
         }
-        let weights = vec![vec![1.0; NUM_CANONICAL_HANDS]; NUM_CANONICAL_HANDS];
+        let weights = compute_card_removal_weights();
 
         Self { equities, weights }
     }
+}
+
+/// Count non-overlapping combo pairs for two canonical hands.
+fn count_non_overlapping(c1: &[(Card, Card)], c2: &[(Card, Card)]) -> usize {
+    c1.iter()
+        .flat_map(|a| c2.iter().map(move |b| (a, b)))
+        .filter(|((a1, a2), (b1, b2))| *a1 != *b1 && *a1 != *b2 && *a2 != *b1 && *a2 != *b2)
+        .count()
+}
+
+/// Compute the 169x169 card-removal weight matrix.
+///
+/// `weights[i][j]` = number of non-overlapping (`combo_a`, `combo_b`) pairs
+/// for canonical hands i and j. Symmetric: `weights[i][j] == weights[j][i]`.
+#[allow(clippy::cast_precision_loss)] // max value is 144 (12×12), fits in f64 exactly
+fn compute_card_removal_weights() -> Vec<Vec<f64>> {
+    let combos: Vec<Vec<(Card, Card)>> = (0..NUM_CANONICAL_HANDS)
+        .map(|i| {
+            CanonicalHand::from_index(i)
+                .expect("valid canonical index")
+                .combos()
+        })
+        .collect();
+
+    let mut weights = vec![vec![0.0; NUM_CANONICAL_HANDS]; NUM_CANONICAL_HANDS];
+    for i in 0..NUM_CANONICAL_HANDS {
+        for j in i..NUM_CANONICAL_HANDS {
+            let w = count_non_overlapping(&combos[i], &combos[j]) as f64;
+            weights[i][j] = w;
+            weights[j][i] = w;
+        }
+    }
+    weights
 }
 
 #[cfg(test)]
@@ -172,5 +228,72 @@ mod tests {
         assert!((table.equity(168, 168) - 0.5).abs() < f64::EPSILON);
         assert!((table.weight(0, 0) - 1.0).abs() < f64::EPSILON);
         assert!((table.weight(84, 42) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[timed_test]
+    fn weight_aa_vs_kk_is_36() {
+        let weights = compute_card_removal_weights();
+        let aa = CH::parse("AA").unwrap().index();
+        let kk = CH::parse("KK").unwrap().index();
+        assert_eq!(weights[aa][kk], 36.0, "AA vs KK: 6x6, no shared ranks");
+    }
+
+    #[timed_test]
+    fn weight_aa_vs_aks_is_12() {
+        let weights = compute_card_removal_weights();
+        let aa = CH::parse("AA").unwrap().index();
+        let aks = CH::parse("AKs").unwrap().index();
+        assert_eq!(weights[aa][aks], 12.0, "AA vs AKs: shared ace reduces combos");
+    }
+
+    #[timed_test]
+    fn weight_aks_vs_ako_is_24() {
+        let weights = compute_card_removal_weights();
+        let aks = CH::parse("AKs").unwrap().index();
+        let ako = CH::parse("AKo").unwrap().index();
+        assert_eq!(weights[aks][ako], 24.0, "AKs vs AKo: shared A and K");
+    }
+
+    #[timed_test]
+    fn weight_aa_vs_aa_is_6() {
+        let weights = compute_card_removal_weights();
+        let aa = CH::parse("AA").unwrap().index();
+        // C(4,2) ways to split 4 aces into two non-overlapping pairs = 3
+        // But we count ordered pairs: (combo_a, combo_b) where a != b
+        // 6 combos x 6 combos = 36, minus 6 self-overlaps, minus 24 card-overlaps = 6
+        assert_eq!(weights[aa][aa], 6.0);
+    }
+
+    #[timed_test]
+    fn weight_symmetry() {
+        let weights = compute_card_removal_weights();
+        for i in 0..NUM_CANONICAL_HANDS {
+            for j in (i + 1)..NUM_CANONICAL_HANDS {
+                assert_eq!(
+                    weights[i][j], weights[j][i],
+                    "weight[{i}][{j}] != weight[{j}][{i}]"
+                );
+            }
+        }
+    }
+
+    #[timed_test]
+    fn weight_no_shared_ranks_is_product() {
+        let weights = compute_card_removal_weights();
+        // 72o vs 83o: no shared ranks → 12 * 12 = 144
+        let seven_two = CH::parse("72o").unwrap();
+        let eight_three = CH::parse("83o").unwrap();
+        let w = weights[seven_two.index()][eight_three.index()];
+        let expected = f64::from(seven_two.num_combos()) * f64::from(eight_three.num_combos());
+        assert_eq!(w, expected, "no shared ranks should give full product");
+    }
+
+    #[timed_test]
+    fn self_weight_suited_is_12() {
+        let weights = compute_card_removal_weights();
+        let aks = CH::parse("AKs").unwrap().index();
+        // 4 suited combos: AsKs, AhKh, AdKd, AcKc
+        // Ordered pairs (a, b) with different suits: 4 * 3 = 12
+        assert_eq!(weights[aks][aks], 12.0);
     }
 }

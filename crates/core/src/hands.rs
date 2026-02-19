@@ -8,7 +8,10 @@
 
 use std::fmt;
 
-use crate::poker::{Card, Value};
+use crate::poker::{Card, Suit, Value};
+
+/// The four suits in a fixed order for combo enumeration.
+const ALL_SUITS: [Suit; 4] = [Suit::Spade, Suit::Heart, Suit::Diamond, Suit::Club];
 
 /// A canonical preflop hand category.
 ///
@@ -109,6 +112,41 @@ impl CanonicalHand {
             HandType::Pair => 6,
             HandType::Suited => 4,
             HandType::Offsuit => 12,
+        }
+    }
+
+    /// Enumerate all specific 2-card combos for this canonical hand.
+    ///
+    /// - Pairs: 6 combos (all C(4,2) suit pairs)
+    /// - Suited: 4 combos (one per suit)
+    /// - Offsuit: 12 combos (all suit1 != suit2)
+    #[must_use]
+    pub fn combos(&self) -> Vec<(Card, Card)> {
+        match self.hand_type {
+            HandType::Pair => {
+                let mut out = Vec::with_capacity(6);
+                for (i, &s1) in ALL_SUITS.iter().enumerate() {
+                    for &s2 in &ALL_SUITS[i + 1..] {
+                        out.push((Card::new(self.high, s1), Card::new(self.high, s2)));
+                    }
+                }
+                out
+            }
+            HandType::Suited => ALL_SUITS
+                .iter()
+                .map(|&s| (Card::new(self.high, s), Card::new(self.low, s)))
+                .collect(),
+            HandType::Offsuit => {
+                let mut out = Vec::with_capacity(12);
+                for &s1 in &ALL_SUITS {
+                    for &s2 in &ALL_SUITS {
+                        if s1 != s2 {
+                            out.push((Card::new(self.high, s1), Card::new(self.low, s2)));
+                        }
+                    }
+                }
+                out
+            }
         }
     }
 
@@ -541,5 +579,54 @@ mod tests {
         assert_eq!(CanonicalHand::parse("AA").unwrap().num_combos(), 6);
         assert_eq!(CanonicalHand::parse("AKs").unwrap().num_combos(), 4);
         assert_eq!(CanonicalHand::parse("AKo").unwrap().num_combos(), 12);
+    }
+
+    #[timed_test]
+    fn combos_pair_returns_six() {
+        let aa = CanonicalHand::parse("AA").unwrap();
+        let combos = aa.combos();
+        assert_eq!(combos.len(), 6);
+        // All combos should have Ace value
+        for (c1, c2) in &combos {
+            assert_eq!(c1.value, Value::Ace);
+            assert_eq!(c2.value, Value::Ace);
+            assert_ne!(c1.suit, c2.suit);
+        }
+    }
+
+    #[timed_test]
+    fn combos_suited_returns_four() {
+        let aks = CanonicalHand::parse("AKs").unwrap();
+        let combos = aks.combos();
+        assert_eq!(combos.len(), 4);
+        for (c1, c2) in &combos {
+            assert_eq!(c1.value, Value::Ace);
+            assert_eq!(c2.value, Value::King);
+            assert_eq!(c1.suit, c2.suit);
+        }
+    }
+
+    #[timed_test]
+    fn combos_offsuit_returns_twelve() {
+        let ako = CanonicalHand::parse("AKo").unwrap();
+        let combos = ako.combos();
+        assert_eq!(combos.len(), 12);
+        for (c1, c2) in &combos {
+            assert_eq!(c1.value, Value::Ace);
+            assert_eq!(c2.value, Value::King);
+            assert_ne!(c1.suit, c2.suit);
+        }
+    }
+
+    #[timed_test]
+    fn combos_no_duplicates() {
+        for hand in all_hands() {
+            let combos = hand.combos();
+            for (i, a) in combos.iter().enumerate() {
+                for b in &combos[i + 1..] {
+                    assert_ne!(a, b, "duplicate combo in {hand}");
+                }
+            }
+        }
     }
 }
