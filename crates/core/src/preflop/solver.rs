@@ -256,7 +256,10 @@ impl PreflopSolver {
                 || (vec![0.0f64; buf_size], vec![0.0f64; buf_size]),
                 |(mut dr, mut ds), &(h1, h2)| {
                     let w = ctx.equity.weight(h1 as usize, h2 as usize);
-                    cfr_traverse(&ctx, &mut dr, &mut ds, 0, h1, h2, hero_pos, 1.0, w, sd);
+                    // h1=SB's hand, h2=BB's hand. Swap so hero_hand
+                    // always corresponds to the traversing player.
+                    let (hh, oh) = if hero_pos == 0 { (h1, h2) } else { (h2, h1) };
+                    cfr_traverse(&ctx, &mut dr, &mut ds, 0, hh, oh, hero_pos, 1.0, w, sd);
                     (dr, ds)
                 },
             )
