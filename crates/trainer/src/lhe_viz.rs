@@ -28,7 +28,6 @@ use rand::rngs::StdRng;
 #[derive(Debug, Clone, Copy)]
 pub struct HandStrategy {
     pub fold: f32,
-    pub call: f32,
     pub raise: f32,
 }
 
@@ -179,7 +178,6 @@ fn average_strategy_for_hand(
     let deck = build_remaining_deck(&hole);
 
     let mut fold_sum = 0.0f64;
-    let mut call_sum = 0.0f64;
     let mut raise_sum = 0.0f64;
     let mut count = 0;
 
@@ -200,9 +198,8 @@ fn average_strategy_for_hand(
         };
 
         let actions = game.actions(&state);
-        let (f, c, r) = classify_action_probs(&actions, &probs);
+        let (f, _c, r) = classify_action_probs(&actions, &probs);
         fold_sum += f64::from(f);
-        call_sum += f64::from(c);
         raise_sum += f64::from(r);
         count += 1;
     }
@@ -210,7 +207,6 @@ fn average_strategy_for_hand(
     if count == 0 {
         return HandStrategy {
             fold: 1.0,
-            call: 0.0,
             raise: 0.0,
         };
     }
@@ -218,7 +214,6 @@ fn average_strategy_for_hand(
     let n = count as f64;
     HandStrategy {
         fold: (fold_sum / n) as f32,
-        call: (call_sum / n) as f32,
         raise: (raise_sum / n) as f32,
     }
 }
@@ -462,7 +457,6 @@ mod tests {
     fn render_bar_all_raise() {
         let s = HandStrategy {
             fold: 0.0,
-            call: 0.0,
             raise: 1.0,
         };
         let bar = render_bar(s);
@@ -474,7 +468,6 @@ mod tests {
     fn render_bar_all_fold() {
         let s = HandStrategy {
             fold: 1.0,
-            call: 0.0,
             raise: 0.0,
         };
         let bar = render_bar(s);
