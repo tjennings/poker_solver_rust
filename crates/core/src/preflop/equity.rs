@@ -4,6 +4,10 @@
 //! all canonical preflop hand pairings. The full computation is expensive;
 //! use `new_uniform()` for testing with equal equities.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use rayon::prelude::*;
+
 use crate::equity::calculate_equity;
 use crate::hands::CanonicalHand;
 
@@ -51,24 +55,37 @@ impl EquityTable {
     ///
     /// Uses Monte Carlo simulation with `samples` per matchup.
     /// Calls `on_progress(pairs_done)` after each unique pair is computed.
+    /// Computation is parallelized across all available cores via rayon.
+    ///
+    /// # Panics
+    /// Panics if a canonical hand index (0..168) is invalid (should never happen).
     #[must_use]
-    pub fn new_computed(samples: u32, on_progress: impl Fn(usize)) -> Self {
-        let mut equities = vec![vec![0.5; NUM_CANONICAL_HANDS]; NUM_CANONICAL_HANDS];
-        let weights = vec![vec![1.0; NUM_CANONICAL_HANDS]; NUM_CANONICAL_HANDS];
-        let mut done = 0usize;
+    pub fn new_computed(samples: u32, on_progress: impl Fn(usize) + Sync + Send) -> Self {
+        let pairs: Vec<(usize, usize)> = (0..NUM_CANONICAL_HANDS)
+            .flat_map(|i| ((i + 1)..NUM_CANONICAL_HANDS).map(move |j| (i, j)))
+            .collect();
 
-        for i in 0..NUM_CANONICAL_HANDS {
-            // SAFETY: indices 0..168 are always valid for CanonicalHand
-            let h1 = CanonicalHand::from_index(i).expect("valid canonical index");
-            for j in (i + 1)..NUM_CANONICAL_HANDS {
+        let done = AtomicUsize::new(0);
+
+        let results: Vec<(usize, usize, f64)> = pairs
+            .par_iter()
+            .map(|&(i, j)| {
+                // indices 0..168 are always valid for CanonicalHand
+                let h1 = CanonicalHand::from_index(i).expect("valid canonical index");
                 let h2 = CanonicalHand::from_index(j).expect("valid canonical index");
                 let eq = calculate_equity(h1, h2, samples);
-                equities[i][j] = eq;
-                equities[j][i] = 1.0 - eq;
-                done += 1;
-                on_progress(done);
-            }
+                let count = done.fetch_add(1, Ordering::Relaxed) + 1;
+                on_progress(count);
+                (i, j, eq)
+            })
+            .collect();
+
+        let mut equities = vec![vec![0.5; NUM_CANONICAL_HANDS]; NUM_CANONICAL_HANDS];
+        for (i, j, eq) in results {
+            equities[i][j] = eq;
+            equities[j][i] = 1.0 - eq;
         }
+        let weights = vec![vec![1.0; NUM_CANONICAL_HANDS]; NUM_CANONICAL_HANDS];
 
         Self { equities, weights }
     }

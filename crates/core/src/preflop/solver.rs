@@ -2,7 +2,10 @@
 //!
 //! Performs full-game CFR over 169 canonical hand matchups, using linear
 //! weighting (regrets and strategy sums scaled by iteration number `t`).
+//! Each iteration is parallelized via rayon: a frozen regret snapshot is
+//! shared across threads, with thread-local delta maps merged afterward.
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +61,21 @@ impl PreflopStrategy {
 
 /// Per-node investment amounts for each player (HU only: [p0, p1]).
 type NodeInvestments = Vec<[u32; 2]>;
+
+/// Thread-local delta accumulators for regret and strategy updates.
+struct Deltas {
+    regret: FxHashMap<u64, Vec<f64>>,
+    strategy: FxHashMap<u64, Vec<f64>>,
+}
+
+impl Deltas {
+    fn new() -> Self {
+        Self {
+            regret: FxHashMap::default(),
+            strategy: FxHashMap::default(),
+        }
+    }
+}
 
 /// Preflop Linear CFR solver.
 ///
@@ -122,126 +140,180 @@ impl PreflopSolver {
         PreflopStrategy { strategies }
     }
 
-    /// Single training iteration: traverse all hand matchups for both players.
+    /// Single training iteration: snapshot regrets, parallel traverse, merge.
     #[allow(clippy::cast_possible_truncation)]
     fn train_one_iteration(&mut self, t: u64) {
-        for h1 in 0..NUM_HANDS {
-            for h2 in 0..NUM_HANDS {
-                if self.equity.weight(h1, h2) <= 0.0 {
-                    continue;
-                }
-                // Safe: h1, h2 always < 169, well within u16
-                self.cfr_traverse(0, h1 as u16, h2 as u16, 0, 1.0, 1.0, t);
-                self.cfr_traverse(0, h2 as u16, h1 as u16, 1, 1.0, 1.0, t);
+        let regret_snapshot = self.regret_sum.clone();
+
+        let pairs: Vec<(u16, u16)> = (0..NUM_HANDS)
+            .flat_map(|h1| (0..NUM_HANDS).map(move |h2| (h1, h2)))
+            .filter(|&(h1, h2)| self.equity.weight(h1, h2) > 0.0)
+            // Safe: h1, h2 always < 169, well within u16
+            .map(|(h1, h2)| (h1 as u16, h2 as u16))
+            .collect();
+
+        let all_deltas: Vec<Deltas> = pairs
+            .par_iter()
+            .fold(
+                Deltas::new,
+                |mut deltas, &(h1, h2)| {
+                    cfr_traverse(
+                        &self.tree, &self.investments, &self.equity,
+                        &regret_snapshot, &mut deltas,
+                        0, h1, h2, 0, 1.0, 1.0, t,
+                    );
+                    cfr_traverse(
+                        &self.tree, &self.investments, &self.equity,
+                        &regret_snapshot, &mut deltas,
+                        0, h2, h1, 1, 1.0, 1.0, t,
+                    );
+                    deltas
+                },
+            )
+            .collect();
+
+        for deltas in all_deltas {
+            merge_deltas(&mut self.regret_sum, deltas.regret);
+            merge_deltas(&mut self.strategy_sum, deltas.strategy);
+        }
+    }
+}
+
+/// Merge source deltas into target by adding element-wise.
+fn merge_deltas(target: &mut FxHashMap<u64, Vec<f64>>, source: FxHashMap<u64, Vec<f64>>) {
+    for (key, src_vals) in source {
+        let dst = target
+            .entry(key)
+            .or_insert_with(|| vec![0.0; src_vals.len()]);
+        for (d, s) in dst.iter_mut().zip(&src_vals) {
+            *d += s;
+        }
+    }
+}
+
+/// Recursive CFR traversal. Returns expected value for the hero player.
+///
+/// Reads strategy from `regret_snapshot` (frozen for the iteration),
+/// writes regret and strategy deltas to thread-local `deltas`.
+#[allow(clippy::too_many_arguments)]
+fn cfr_traverse(
+    tree: &PreflopTree,
+    investments: &NodeInvestments,
+    equity: &EquityTable,
+    regret_snapshot: &FxHashMap<u64, Vec<f64>>,
+    deltas: &mut Deltas,
+    node_idx: u32,
+    hero_hand: u16,
+    opp_hand: u16,
+    hero_pos: u8,
+    reach_hero: f64,
+    reach_opp: f64,
+    t: u64,
+) -> f64 {
+    let inv = investments[node_idx as usize];
+    let hero_inv = f64::from(inv[hero_pos as usize]);
+
+    match &tree.nodes[node_idx as usize] {
+        PreflopNode::Terminal { terminal_type, pot } => {
+            terminal_value(*terminal_type, *pot, hero_inv, hero_hand, opp_hand, hero_pos, equity)
+        }
+        PreflopNode::Decision { position, children, .. } => {
+            let num_actions = children.len();
+            let is_hero = *position == hero_pos;
+            let hand_for_key = if is_hero { hero_hand } else { opp_hand };
+            let key = PreflopStrategy::key(node_idx, hand_for_key);
+            let strategy = regret_matching(regret_snapshot, key, num_actions);
+
+            if is_hero {
+                traverse_hero(
+                    tree, investments, equity, regret_snapshot, deltas,
+                    key, hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
+                    t, children, &strategy, num_actions,
+                )
+            } else {
+                traverse_opponent(
+                    tree, investments, equity, regret_snapshot, deltas,
+                    hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
+                    t, children, &strategy,
+                )
             }
         }
     }
+}
 
-    /// Recursive CFR traversal. Returns expected value for the hero player.
-    #[allow(clippy::too_many_arguments)]
-    fn cfr_traverse(
-        &mut self,
-        node_idx: u32,
-        hero_hand: u16,
-        opp_hand: u16,
-        hero_pos: u8,
-        reach_hero: f64,
-        reach_opp: f64,
-        t: u64,
-    ) -> f64 {
-        let inv = self.investments[node_idx as usize];
-        let hero_inv = f64::from(inv[hero_pos as usize]);
-
-        match self.tree.nodes[node_idx as usize].clone() {
-            PreflopNode::Terminal { terminal_type, pot } => {
-                terminal_value(terminal_type, pot, hero_inv, hero_hand, opp_hand, hero_pos, &self.equity)
-            }
-            PreflopNode::Decision { position, children, .. } => {
-                let num_actions = children.len();
-                let is_hero = position == hero_pos;
-                let hand_for_key = if is_hero { hero_hand } else { opp_hand };
-                let key = PreflopStrategy::key(node_idx, hand_for_key);
-                let strategy = regret_matching(&self.regret_sum, key, num_actions);
-
-                if is_hero {
-                    self.traverse_hero(
-                        key, hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                        t, &children, &strategy, num_actions,
-                    )
-                } else {
-                    self.traverse_opponent(
-                        hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                        t, &children, &strategy,
-                    )
-                }
-            }
-        }
+/// Hero's decision: compute regrets and update strategy/regret deltas.
+#[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
+fn traverse_hero(
+    tree: &PreflopTree,
+    investments: &NodeInvestments,
+    equity: &EquityTable,
+    regret_snapshot: &FxHashMap<u64, Vec<f64>>,
+    deltas: &mut Deltas,
+    key: u64,
+    hero_hand: u16,
+    opp_hand: u16,
+    hero_pos: u8,
+    reach_hero: f64,
+    reach_opp: f64,
+    t: u64,
+    children: &[u32],
+    strategy: &[f64],
+    num_actions: usize,
+) -> f64 {
+    let mut action_values = vec![0.0f64; num_actions];
+    for (i, &child_idx) in children.iter().enumerate() {
+        action_values[i] = cfr_traverse(
+            tree, investments, equity, regret_snapshot, deltas,
+            child_idx, hero_hand, opp_hand, hero_pos,
+            reach_hero * strategy[i], reach_opp, t,
+        );
     }
 
-    /// Hero's decision: compute regrets and update strategy/regret sums.
-    #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
-    fn traverse_hero(
-        &mut self,
-        key: u64,
-        hero_hand: u16,
-        opp_hand: u16,
-        hero_pos: u8,
-        reach_hero: f64,
-        reach_opp: f64,
-        t: u64,
-        children: &[u32],
-        strategy: &[f64],
-        num_actions: usize,
-    ) -> f64 {
-        let mut action_values = vec![0.0f64; num_actions];
-        for (i, &child_idx) in children.iter().enumerate() {
-            action_values[i] = self.cfr_traverse(
-                child_idx, hero_hand, opp_hand, hero_pos,
-                reach_hero * strategy[i], reach_opp, t,
-            );
-        }
+    let node_value: f64 = strategy.iter().zip(&action_values).map(|(s, v)| s * v).sum();
+    let t_f64 = t as f64;
 
-        let node_value: f64 = strategy.iter().zip(&action_values).map(|(s, v)| s * v).sum();
-        let t_f64 = t as f64;
-
-        // Update regrets (weighted by t for linear CFR)
-        let regrets = self.regret_sum.entry(key).or_insert_with(|| vec![0.0; num_actions]);
-        for (i, val) in action_values.iter().enumerate() {
-            regrets[i] += t_f64 * reach_opp * (val - node_value);
-        }
-
-        // Update strategy sum (weighted by t * reach_hero)
-        let strat_sum = self.strategy_sum.entry(key).or_insert_with(|| vec![0.0; num_actions]);
-        for (i, &s) in strategy.iter().enumerate() {
-            strat_sum[i] += t_f64 * reach_hero * s;
-        }
-
-        node_value
+    // Accumulate regret deltas (weighted by t for linear CFR)
+    let regrets = deltas.regret.entry(key).or_insert_with(|| vec![0.0; num_actions]);
+    for (i, val) in action_values.iter().enumerate() {
+        regrets[i] += t_f64 * reach_opp * (val - node_value);
     }
 
-    /// Opponent's decision: traverse using opponent's strategy.
-    #[allow(clippy::too_many_arguments)]
-    fn traverse_opponent(
-        &mut self,
-        hero_hand: u16,
-        opp_hand: u16,
-        hero_pos: u8,
-        reach_hero: f64,
-        reach_opp: f64,
-        t: u64,
-        children: &[u32],
-        strategy: &[f64],
-    ) -> f64 {
-        let mut node_value = 0.0f64;
-        for (i, &child_idx) in children.iter().enumerate() {
-            let child_value = self.cfr_traverse(
-                child_idx, hero_hand, opp_hand, hero_pos,
-                reach_hero, reach_opp * strategy[i], t,
-            );
-            node_value += strategy[i] * child_value;
-        }
-        node_value
+    // Accumulate strategy deltas (weighted by t * reach_hero)
+    let strat = deltas.strategy.entry(key).or_insert_with(|| vec![0.0; num_actions]);
+    for (i, &s) in strategy.iter().enumerate() {
+        strat[i] += t_f64 * reach_hero * s;
     }
+
+    node_value
+}
+
+/// Opponent's decision: traverse using opponent's strategy.
+#[allow(clippy::too_many_arguments)]
+fn traverse_opponent(
+    tree: &PreflopTree,
+    investments: &NodeInvestments,
+    equity: &EquityTable,
+    regret_snapshot: &FxHashMap<u64, Vec<f64>>,
+    deltas: &mut Deltas,
+    hero_hand: u16,
+    opp_hand: u16,
+    hero_pos: u8,
+    reach_hero: f64,
+    reach_opp: f64,
+    t: u64,
+    children: &[u32],
+    strategy: &[f64],
+) -> f64 {
+    let mut node_value = 0.0f64;
+    for (i, &child_idx) in children.iter().enumerate() {
+        let child_value = cfr_traverse(
+            tree, investments, equity, regret_snapshot, deltas,
+            child_idx, hero_hand, opp_hand, hero_pos,
+            reach_hero, reach_opp * strategy[i], t,
+        );
+        node_value += strategy[i] * child_value;
+    }
+    node_value
 }
 
 /// Compute hero's utility at a terminal node.
