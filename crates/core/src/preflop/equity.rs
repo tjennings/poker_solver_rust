@@ -52,10 +52,10 @@ impl EquityTable {
         self.equities.len()
     }
 
-    /// Returns the equity of hand `hand_i` vs a random opponent hand,
-    /// weighted by card-removal weights.
+    /// Returns the average equity of `hand_i` vs all other hands,
+    /// weighted by card-removal counts.
     #[must_use]
-    pub fn equity_vs_random(&self, hand_i: usize) -> f64 {
+    pub fn avg_equity(&self, hand_i: usize) -> f64 {
         let n = self.equities.len();
         let mut total_eq = 0.0;
         let mut total_weight = 0.0;

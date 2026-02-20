@@ -220,7 +220,7 @@ enum Commands {
         #[arg(long, default_value = "1000")]
         print_every: u64,
         /// Monte Carlo samples per hand matchup for equity table (0 = uniform)
-        #[arg(long, default_value = "2000")]
+        #[arg(long, default_value = "20000")]
         equity_samples: u32,
     },
 }
@@ -665,6 +665,7 @@ fn run_solve_preflop(
         });
         eq_pb.finish_with_message("done");
         println!("Equity table built in {:.1?}", eq_start.elapsed());
+        lhe_viz::print_equity_matrix(&table);
         table
     } else {
         println!("Using uniform equities (--equity-samples 0)");
@@ -678,7 +679,7 @@ fn run_solve_preflop(
     let bb_node = lhe_viz::find_raise_child(&tree, 0);
     let mut solver = PreflopSolver::new_with_equity(&config, equity);
 
-    print_preflop_matrices(&solver.strategy(), &tree, bb_node, 0);
+    let mut prev_matrices = print_preflop_matrices(&solver.strategy(), &tree, bb_node, 0, None);
 
     let pb = ProgressBar::new(iterations);
     pb.set_style(
@@ -698,7 +699,9 @@ fn run_solve_preflop(
 
         if print_every > 0 && done < iterations && done.is_multiple_of(print_every) {
             pb.suspend(|| {
-                print_preflop_matrices(&solver.strategy(), &tree, bb_node, done);
+                prev_matrices = print_preflop_matrices(
+                    &solver.strategy(), &tree, bb_node, done, Some(&prev_matrices),
+                );
             });
         }
     }
@@ -708,7 +711,7 @@ fn run_solve_preflop(
     let strategy = solver.strategy();
     println!("Converged in {elapsed:.1?} — {} info sets", strategy.len());
 
-    print_preflop_matrices(&strategy, &tree, bb_node, iterations);
+    print_preflop_matrices(&strategy, &tree, bb_node, iterations, Some(&prev_matrices));
 
     let bundle = PreflopBundle::new(config, strategy);
     bundle.save(output)?;
@@ -717,18 +720,38 @@ fn run_solve_preflop(
     Ok(())
 }
 
+/// Previous SB and BB matrices for delta computation.
+type PrevMatrices = (lhe_viz::HandMatrix, Option<lhe_viz::HandMatrix>);
+
 fn print_preflop_matrices(
     strategy: &poker_solver_core::preflop::PreflopStrategy,
     tree: &PreflopTree,
     bb_node: Option<u32>,
     iteration: u64,
-) {
+    prev: Option<&PrevMatrices>,
+) -> PrevMatrices {
     let sb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, 0);
-    lhe_viz::print_hand_matrix(&sb_matrix, &format!("SB RFI — iteration {iteration}"));
-    if let Some(bb_idx) = bb_node {
-        let bb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, bb_idx);
-        lhe_viz::print_hand_matrix(&bb_matrix, &format!("BB vs Raise — iteration {iteration}"));
-    }
+    let sb_delta = prev.and_then(|(p, _)| lhe_viz::matrix_delta(p, &sb_matrix));
+    let sb_title = match sb_delta {
+        Some(d) => format!("SB RFI — iteration {iteration}  (Δ={d:.4})"),
+        None => format!("SB RFI — iteration {iteration}"),
+    };
+    lhe_viz::print_hand_matrix(&sb_matrix, &sb_title);
+
+    let bb_matrix = bb_node.map(|bb_idx| {
+        let m = lhe_viz::preflop_strategy_matrix(strategy, tree, bb_idx);
+        let bb_delta = prev
+            .and_then(|(_, prev_bb)| prev_bb.as_ref())
+            .and_then(|p| lhe_viz::matrix_delta(p, &m));
+        let bb_title = match bb_delta {
+            Some(d) => format!("BB vs Raise — iteration {iteration}  (Δ={d:.4})"),
+            None => format!("BB vs Raise — iteration {iteration}"),
+        };
+        lhe_viz::print_hand_matrix(&m, &bb_title);
+        m
+    });
+
+    (sb_matrix, bb_matrix)
 }
 
 // ---------------------------------------------------------------------------

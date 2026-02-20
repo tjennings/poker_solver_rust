@@ -174,17 +174,21 @@ fn build_recursive(
 
     // Raises (if under raise cap)
     if state.raise_count < config.raise_cap {
-        let depth = (state.raise_count as usize).min(config.raise_sizes.len().saturating_sub(1));
         let player_stack = state.stacks[position as usize];
+        let last_raise_depth = state.raise_count + 1 == config.raise_cap;
 
-        for &size in &config.raise_sizes[depth] {
-            let raise_amount = compute_raise_amount(state, size);
-            // Only add if player can afford it and it's less than all-in
-            if raise_amount < player_stack {
-                let child_state = apply_raise(state, position, raise_amount);
-                let child_idx = build_recursive(config, &child_state, nodes);
-                actions.push(PreflopAction::Raise(size));
-                child_indices.push(child_idx);
+        // At the last raise depth, only offer all-in (no sized raises)
+        if !last_raise_depth {
+            let depth =
+                (state.raise_count as usize).min(config.raise_sizes.len().saturating_sub(1));
+            for &size in &config.raise_sizes[depth] {
+                let raise_amount = compute_raise_amount(state, size);
+                if raise_amount < player_stack {
+                    let child_state = apply_raise(state, position, raise_amount);
+                    let child_idx = build_recursive(config, &child_state, nodes);
+                    actions.push(PreflopAction::Raise(size));
+                    child_indices.push(child_idx);
+                }
             }
         }
 
@@ -482,6 +486,39 @@ mod tests {
                 (children[pos] as usize, pos)
             }
             other => panic!("Expected decision node at {}, got: {:?}", node_idx, other),
+        }
+    }
+
+    #[timed_test]
+    fn last_raise_depth_only_offers_all_in() {
+        // With raise_cap=2, the second raise depth should only have all-in (no sized raises)
+        let mut config = PreflopConfig::heads_up(25);
+        config.raise_sizes = vec![vec![3.0]];
+        config.raise_cap = 2;
+        let tree = PreflopTree::build(&config);
+
+        // SB opens with Raise(3.0) → BB's decision
+        let (bb_node, _) = find_action_child(&tree, 0, PreflopAction::Raise(3.0));
+
+        // BB at depth 1 (last depth with cap=2): should have Fold, Call, AllIn but NO Raise
+        match &tree.nodes[bb_node] {
+            PreflopNode::Decision { action_labels, .. } => {
+                let has_raise = action_labels
+                    .iter()
+                    .any(|a| matches!(a, PreflopAction::Raise(_)));
+                assert!(
+                    !has_raise,
+                    "Last raise depth should not have sized raises, got: {:?}",
+                    action_labels
+                );
+                let has_all_in = action_labels.iter().any(|a| *a == PreflopAction::AllIn);
+                assert!(
+                    has_all_in,
+                    "Last raise depth should offer all-in, got: {:?}",
+                    action_labels
+                );
+            }
+            other => panic!("Expected decision node, got: {:?}", other),
         }
     }
 

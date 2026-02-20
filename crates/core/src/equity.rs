@@ -1,15 +1,15 @@
 //! Preflop equity calculations for canonical hand matchups.
 //!
 //! Provides equity (win probability) between two canonical preflop hands.
-//! Equity is calculated via Monte Carlo simulation for accuracy.
+//! Equity is calculated by enumerating all non-overlapping combo pairs and
+//! running Monte Carlo board sampling for each.
 
-use crate::hands::{CanonicalHand, all_hands};
+use crate::hands::{all_hands, CanonicalHand};
 use crate::poker::{Card, Hand, Rank, Rankable, Suit, Value};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 /// Default number of Monte Carlo samples for equity calculations.
-/// Lower values are faster but less accurate.
 pub const DEFAULT_EQUITY_SAMPLES: u32 = 1_000;
 
 /// Cache for equity calculations to avoid recomputation.
@@ -51,200 +51,128 @@ pub fn equity(hand1: CanonicalHand, hand2: CanonicalHand) -> f64 {
     eq
 }
 
-/// Calculate equity with a specific number of Monte Carlo samples.
+/// Calculate equity with a specific number of Monte Carlo board samples.
 ///
-/// # Arguments
-///
-/// * `hand1` - First canonical hand
-/// * `hand2` - Second canonical hand
-/// * `samples` - Number of Monte Carlo samples
-///
-/// # Returns
-///
-/// Equity of hand1 vs hand2 (probability hand1 wins).
+/// Enumerates all non-overlapping combo pairs for the two canonical hands,
+/// then distributes board samples evenly across them. This ensures unbiased
+/// equity calculation regardless of hand type (pair, suited, offsuit).
 #[must_use]
 pub fn calculate_equity(hand1: CanonicalHand, hand2: CanonicalHand, samples: u32) -> f64 {
-    let mut wins1 = 0u32;
-    let mut wins2 = 0u32;
-    let mut ties = 0u32;
+    let valid_pairs = non_overlapping_combos(hand1, hand2);
+    if valid_pairs.is_empty() {
+        return 0.5;
+    }
 
-    // We need a deterministic RNG for reproducibility
-    let mut rng_state: u64 = 0x1234_5678_9ABC_DEF0;
+    #[allow(clippy::cast_possible_truncation)]
+    let samples_per_pair = (samples as usize / valid_pairs.len()).max(1);
 
-    for i in 0..samples {
-        // Mix in the iteration counter for variety
-        let seed = rng_state.wrapping_add(u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mut total_wins = 0.0_f64;
+    let mut total_count = 0u64;
 
-        // Simple xorshift RNG
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
+    for (pair_idx, &(hole1, hole2)) in valid_pairs.iter().enumerate() {
+        // Unique seed per combo pair for reproducibility
+        let base_seed = splitmix64(pair_idx as u64 ^ 0xBEEF_CAFE_1234_5678);
+        let mut rng = base_seed;
 
-        // Deal specific cards for each canonical hand
-        let (cards1, cards2) = deal_hands(hand1, hand2, seed);
+        for s in 0..samples_per_pair {
+            rng = splitmix64(rng ^ s as u64);
+            let board = deal_board(hole1, hole2, rng);
+            let rank1 = evaluate_hand(hole1, board);
+            let rank2 = evaluate_hand(hole2, board);
 
-        // Deal community cards (5 cards)
-        let board = deal_board(cards1, cards2, seed.wrapping_add(0xDEAD_BEEF));
-
-        // Evaluate hands
-        let rank1 = evaluate_hand(cards1, board);
-        let rank2 = evaluate_hand(cards2, board);
-
-        match rank1.cmp(&rank2) {
-            std::cmp::Ordering::Greater => wins1 += 1,
-            std::cmp::Ordering::Less => wins2 += 1,
-            std::cmp::Ordering::Equal => ties += 1,
+            match rank1.cmp(&rank2) {
+                std::cmp::Ordering::Greater => total_wins += 1.0,
+                std::cmp::Ordering::Equal => total_wins += 0.5,
+                std::cmp::Ordering::Less => {}
+            }
+            total_count += 1;
         }
     }
 
-    // Equity = wins + (ties / 2)
-    let total = f64::from(wins1 + wins2 + ties);
-    (f64::from(wins1) + f64::from(ties) / 2.0) / total
+    total_wins / total_count as f64
+}
+
+/// Enumerate all non-overlapping `([Card;2], [Card;2])` pairs for two canonical hands.
+fn non_overlapping_combos(
+    hand1: CanonicalHand,
+    hand2: CanonicalHand,
+) -> Vec<([Card; 2], [Card; 2])> {
+    let combos1 = hand1.combos();
+    let combos2 = hand2.combos();
+
+    combos1
+        .iter()
+        .flat_map(|&(a, b)| {
+            combos2
+                .iter()
+                .filter(move |&&(c, d)| a != c && a != d && b != c && b != d)
+                .map(move |&(c, d)| ([a, b], [c, d]))
+        })
+        .collect()
+}
+
+/// `splitmix64` — high-quality 64-bit hash/RNG step.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
 }
 
 const SUITS: [Suit; 4] = [Suit::Spade, Suit::Heart, Suit::Diamond, Suit::Club];
+const VALUES: [Value; 13] = [
+    Value::Two,
+    Value::Three,
+    Value::Four,
+    Value::Five,
+    Value::Six,
+    Value::Seven,
+    Value::Eight,
+    Value::Nine,
+    Value::Ten,
+    Value::Jack,
+    Value::Queen,
+    Value::King,
+    Value::Ace,
+];
 
-/// Deal specific cards for two canonical hands.
-fn deal_hands(hand1: CanonicalHand, hand2: CanonicalHand, seed: u64) -> ([Card; 2], [Card; 2]) {
-    // Select suits for hand1 based on seed
-    #[allow(clippy::cast_possible_truncation)]
-    let suit_idx1 = (seed % 4) as usize;
-    let suit_idx2 = if hand1.is_suited() {
-        suit_idx1 // Same suit for suited hands
-    } else {
-        // For pairs or offsuit - ensure different suit
-        #[allow(clippy::cast_possible_truncation)]
-        let offset = ((seed >> 8) % 3) as usize;
-        (suit_idx1 + 1 + offset) % 4
-    };
-
-    let card1_1 = Card::new(hand1.high_value(), SUITS[suit_idx1]);
-    let card1_2 = Card::new(hand1.low_value(), SUITS[suit_idx2]);
-
-    // Select suits for hand2, avoiding conflicts with hand1
-    let mut used_cards = vec![card1_1, card1_2];
-
-    let card2_1 = find_available_card(hand2.high_value(), &used_cards, seed >> 16);
-    used_cards.push(card2_1);
-
-    let card2_2 = if hand2.is_suited() {
-        // Same suit as card2_1
-        let target_suit = card2_1.suit;
-        let card = Card::new(hand2.low_value(), target_suit);
-        if used_cards.contains(&card) {
-            // If blocked, try other suits (shouldn't happen for valid canonical hands)
-            find_available_card(hand2.low_value(), &used_cards, seed >> 24)
-        } else {
-            card
-        }
-    } else {
-        // For pairs or offsuit - different suit from card2_1
-        find_available_card_offsuit(hand2.low_value(), card2_1.suit, &used_cards, seed >> 24)
-    };
-
-    ([card1_1, card1_2], [card2_1, card2_2])
-}
-
-/// Find an available card with the given value.
-fn find_available_card(value: Value, used: &[Card], seed: u64) -> Card {
-    #[allow(clippy::cast_possible_truncation)]
-    let start = (seed % 4) as usize;
-    for i in 0..4 {
-        let suit = SUITS[(start + i) % 4];
-        let card = Card::new(value, suit);
-        if !used.contains(&card) {
-            return card;
-        }
-    }
-    // Fallback (shouldn't happen in valid scenarios)
-    Card::new(value, SUITS[0])
-}
-
-/// Find an available card with a different suit.
-fn find_available_card_offsuit(value: Value, avoid_suit: Suit, used: &[Card], seed: u64) -> Card {
-    #[allow(clippy::cast_possible_truncation)]
-    let start = (seed % 4) as usize;
-    for i in 0..4 {
-        let suit = SUITS[(start + i) % 4];
-        if suit == avoid_suit {
-            continue;
-        }
-        let card = Card::new(value, suit);
-        if !used.contains(&card) {
-            return card;
-        }
-    }
-    // Fallback to any available
-    find_available_card(value, used, seed)
-}
-
-/// Deal 5 community cards avoiding the hole cards.
+/// Deal 5 community cards avoiding the 4 hole cards.
+///
+/// Uses Fisher-Yates partial shuffle on the remaining 48 cards.
 fn deal_board(hand1: [Card; 2], hand2: [Card; 2], seed: u64) -> [Card; 5] {
-    let mut used: Vec<Card> = vec![hand1[0], hand1[1], hand2[0], hand2[1]];
-    let mut board = [Card::new(Value::Two, Suit::Spade); 5];
+    // Build remaining deck (48 cards)
+    let mut deck = [Card::new(Value::Two, Suit::Spade); 48];
+    let mut n = 0;
+    for &value in &VALUES {
+        for &suit in &SUITS {
+            let card = Card::new(value, suit);
+            if card != hand1[0] && card != hand1[1] && card != hand2[0] && card != hand2[1] {
+                deck[n] = card;
+                n += 1;
+            }
+        }
+    }
+
+    // Fisher-Yates for first 5 positions
     let mut rng = seed;
-
-    for card in &mut board {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-
-        // Pick a card from remaining deck
-        let remaining = 52 - used.len();
+    let mut board = [Card::new(Value::Two, Suit::Spade); 5];
+    for i in 0..5 {
+        rng = splitmix64(rng);
         #[allow(clippy::cast_possible_truncation)]
-        let idx = (rng % remaining as u64) as usize;
-
-        *card = nth_available_card(idx, &used);
-        used.push(*card);
+        let j = i + (rng as usize % (n - i));
+        deck.swap(i, j);
+        board[i] = deck[i];
     }
 
     board
 }
 
-/// Get the nth available card (not in used list).
-fn nth_available_card(n: usize, used: &[Card]) -> Card {
-    let values = [
-        Value::Two,
-        Value::Three,
-        Value::Four,
-        Value::Five,
-        Value::Six,
-        Value::Seven,
-        Value::Eight,
-        Value::Nine,
-        Value::Ten,
-        Value::Jack,
-        Value::Queen,
-        Value::King,
-        Value::Ace,
-    ];
-
-    let mut count = 0;
-    for &value in &values {
-        for &suit in &SUITS {
-            let card = Card::new(value, suit);
-            if !used.contains(&card) {
-                if count == n {
-                    return card;
-                }
-                count += 1;
-            }
-        }
-    }
-
-    // Fallback
-    Card::new(Value::Two, Suit::Spade)
-}
-
 /// Evaluate a 7-card hand (2 hole + 5 board) and return its rank.
 fn evaluate_hand(hole: [Card; 2], board: [Card; 5]) -> Rank {
-    // Build all 7 cards
     let cards = vec![
         hole[0], hole[1], board[0], board[1], board[2], board[3], board[4],
     ];
     let hand = Hand::new_with_cards(cards);
-
-    // rs_poker evaluates the best 5-card hand from 7 cards
     hand.rank()
 }
 
@@ -334,13 +262,11 @@ mod tests {
 
     #[timed_test]
     fn coinflip_hands_are_close() {
-        // AKo vs 22 is approximately a coinflip
         let ako = CanonicalHand::parse("AKo").unwrap();
         let twos = CanonicalHand::parse("22").unwrap();
 
         let eq = calculate_equity(ako, twos, 5000);
 
-        // Should be roughly 50/50
         assert!(eq > 0.40, "AKo equity vs 22: {eq}");
         assert!(eq < 0.60, "AKo equity vs 22: {eq}");
     }
@@ -352,22 +278,70 @@ mod tests {
         let aa = CanonicalHand::parse("AA").unwrap();
         let kk = CanonicalHand::parse("KK").unwrap();
 
-        // First call calculates
         let _ = equity(aa, kk);
 
-        // Should have cached both directions
         assert!(cache_size() >= 2);
     }
 
     #[timed_test]
     fn dominated_hand_loses() {
-        // A2o vs AKs - A2 is dominated
         let a2o = CanonicalHand::parse("A2o").unwrap();
         let aks = CanonicalHand::parse("AKs").unwrap();
 
         let eq = calculate_equity(a2o, aks, 5000);
 
-        // A2o should lose most of the time
         assert!(eq < 0.35, "A2o equity vs AKs: {eq}");
+    }
+
+    #[timed_test]
+    fn a2o_has_higher_avg_equity_than_82o() {
+        // A2o should clearly beat 82o in avg equity vs the field
+        let a2o = CanonicalHand::parse("A2o").unwrap();
+        let eight_two = CanonicalHand::parse("82o").unwrap();
+
+        let eq_a2o = calculate_equity(a2o, eight_two, 10_000);
+        assert!(
+            eq_a2o > 0.55,
+            "A2o should beat 82o, got equity {eq_a2o}"
+        );
+    }
+
+    #[timed_test]
+    fn a2o_beats_72o_head_to_head() {
+        let a2o = CanonicalHand::parse("A2o").unwrap();
+        let seven_two = CanonicalHand::parse("72o").unwrap();
+        let eq = calculate_equity(a2o, seven_two, 50_000);
+        // A2o dominates 72o — should win about 63-65%
+        assert!(
+            eq > 0.60,
+            "A2o vs 72o equity {eq:.3} should be > 0.60"
+        );
+    }
+
+    #[timed_test]
+    fn a5s_equity_above_fifty() {
+        // A5s vs a random mediocre hand should be favored
+        let a5s = CanonicalHand::parse("A5s").unwrap();
+        let t8o = CanonicalHand::parse("T8o").unwrap();
+        let eq = calculate_equity(a5s, t8o, 50_000);
+        // A5s vs T8o is close to 50/50 but A5s has slight edge
+        assert!(
+            eq > 0.40 && eq < 0.60,
+            "A5s vs T8o equity {eq:.3} should be near 0.50"
+        );
+    }
+
+    #[timed_test]
+    fn non_overlapping_combo_counts() {
+        let aa = CanonicalHand::parse("AA").unwrap();
+        let kk = CanonicalHand::parse("KK").unwrap();
+        assert_eq!(non_overlapping_combos(aa, kk).len(), 36); // 6 * 6
+
+        let aks = CanonicalHand::parse("AKs").unwrap();
+        assert_eq!(non_overlapping_combos(aa, aks).len(), 12); // shared ace
+
+        let seven_two = CanonicalHand::parse("72o").unwrap();
+        let eight_three = CanonicalHand::parse("83o").unwrap();
+        assert_eq!(non_overlapping_combos(seven_two, eight_three).len(), 144); // 12 * 12
     }
 }

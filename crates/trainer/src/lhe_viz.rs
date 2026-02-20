@@ -11,8 +11,9 @@
 use poker_solver_core::game::{
     Action, Game, LimitHoldem, LimitHoldemConfig, LimitHoldemState, Player,
 };
+use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{Card, Suit, Value};
-use poker_solver_core::preflop::{PreflopAction, PreflopNode, PreflopStrategy, PreflopTree};
+use poker_solver_core::preflop::{EquityTable, PreflopAction, PreflopNode, PreflopStrategy, PreflopTree};
 use poker_solver_deep_cfr::eval::ExplicitPolicy;
 use poker_solver_deep_cfr::lhe_encoder::LheEncoder;
 use poker_solver_deep_cfr::traverse::StateEncoder;
@@ -373,6 +374,93 @@ pub fn print_hand_matrix(matrix: &HandMatrix, title: &str) {
     );
 }
 
+/// Compute the mean L1 strategy distance between two hand matrices.
+///
+/// For each hand, sums the absolute differences across all action
+/// probabilities (fold + raises + implied call). Returns the average
+/// across all 169 hands, or `None` if `prev` is empty.
+pub fn matrix_delta(prev: &HandMatrix, curr: &HandMatrix) -> Option<f64> {
+    let mut total = 0.0f64;
+    let mut count = 0u32;
+    for row in 0..13 {
+        for col in 0..13 {
+            if let (Some(p), Some(c)) = (&prev[row][col], &curr[row][col]) {
+                let max_len = p.raises.len().max(c.raises.len());
+                let mut dist = (f64::from(p.fold) - f64::from(c.fold)).abs();
+                for i in 0..max_len {
+                    let pv = p.raises.get(i).copied().unwrap_or(0.0);
+                    let cv = c.raises.get(i).copied().unwrap_or(0.0);
+                    dist += (f64::from(pv) - f64::from(cv)).abs();
+                }
+                // implied call = 1 - fold - sum(raises)
+                let p_call = 1.0 - f64::from(p.fold) - p.raises.iter().map(|&r| f64::from(r)).sum::<f64>();
+                let c_call = 1.0 - f64::from(c.fold) - c.raises.iter().map(|&r| f64::from(r)).sum::<f64>();
+                dist += (p_call - c_call).abs();
+                total += dist;
+                count += 1;
+            }
+        }
+    }
+    if count > 0 { Some(total / f64::from(count)) } else { None }
+}
+
+/// Print a 13x13 average equity matrix with color-coded values.
+///
+/// Each cell shows the weighted-average equity (0–100%) of the canonical
+/// hand against all other hands. Colors range from red (low) through
+/// yellow (50%) to green (high).
+pub fn print_equity_matrix(equity: &EquityTable) {
+    println!("\n{BOLD}Avg Equity vs All Hands{RESET}");
+    println!();
+
+    // Header
+    print!("    ");
+    for &rank in &RANK_ORDER {
+        print!("{:>6}", format!("{}s", rank_label(rank)));
+    }
+    println!();
+
+    for row in 0..13 {
+        print!("  {} ", rank_label(RANK_ORDER[row]));
+        for col in 0..13 {
+            let hand_idx = canonical_hand_index(row, col);
+            let eq = equity.avg_equity(hand_idx);
+            let pct = eq * 100.0;
+            let color = equity_color(eq);
+            print!(" {color}{pct:5.1}{RESET}");
+        }
+        println!();
+    }
+
+    println!();
+    println!(
+        "  Legend: {EQ_RED}low{RESET}  {EQ_YELLOW}50%{RESET}  {EQ_GREEN}high{RESET}  |  Upper-right=suited  Lower-left=offsuit  Diagonal=pairs"
+    );
+}
+
+/// ANSI color for an equity value (0.0–1.0).
+///
+/// Red (<0.40) → yellow (0.50) → green (>0.60).
+fn equity_color(eq: f64) -> &'static str {
+    if eq >= 0.65 {
+        EQ_GREEN
+    } else if eq >= 0.58 {
+        EQ_LIGHT_GREEN
+    } else if eq >= 0.52 {
+        EQ_YELLOW
+    } else if eq >= 0.46 {
+        EQ_ORANGE
+    } else {
+        EQ_RED
+    }
+}
+
+const EQ_GREEN: &str = "\x1b[38;5;34m";
+const EQ_LIGHT_GREEN: &str = "\x1b[38;5;76m";
+const EQ_YELLOW: &str = "\x1b[38;5;220m";
+const EQ_ORANGE: &str = "\x1b[38;5;208m";
+const EQ_RED: &str = "\x1b[38;5;196m";
+
 /// Render a single cell as a stacked color bar of `BAR_WIDTH` characters.
 ///
 /// Raises are drawn left-to-right from smallest (bright yellow `#`) to largest
@@ -445,17 +533,11 @@ fn distribute_raise_chars(raises: &[f32], total: usize) -> Vec<usize> {
 
 /// Map a 13x13 matrix cell to a canonical hand index (0..169).
 ///
-/// - Pairs (row == col): indices 0..12
-/// - Suited (row < col): indices 13..90
-/// - Offsuit (row > col): indices 91..168
+/// Delegates to `CanonicalHand::from_matrix_position` for correct mapping.
 fn canonical_hand_index(row: usize, col: usize) -> usize {
-    if row == col {
-        row
-    } else if row < col {
-        13 + col * (col - 1) / 2 + row
-    } else {
-        91 + row * (row - 1) / 2 + col
-    }
+    CanonicalHand::from_matrix_position(row, col)
+        .expect("row/col always < 13")
+        .index()
 }
 
 /// Build a 13x13 strategy matrix from a `PreflopStrategy` at a given node.
@@ -557,6 +639,7 @@ pub fn find_raise_child(tree: &PreflopTree, node_idx: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use poker_solver_core::hands::CanonicalHand as CH;
 
     // -----------------------------------------------------------------------
     // 1. Hand label correctness
@@ -736,20 +819,20 @@ mod tests {
 
     #[test]
     fn canonical_index_pairs() {
-        assert_eq!(canonical_hand_index(0, 0), 0); // AA
-        assert_eq!(canonical_hand_index(12, 12), 12); // 22
+        assert_eq!(canonical_hand_index(0, 0), CH::parse("AA").unwrap().index());
+        assert_eq!(canonical_hand_index(12, 12), CH::parse("22").unwrap().index());
     }
 
     #[test]
     fn canonical_index_suited() {
-        assert_eq!(canonical_hand_index(0, 1), 13); // AKs
-        assert_eq!(canonical_hand_index(11, 12), 90); // 32s
+        assert_eq!(canonical_hand_index(0, 1), CH::parse("AKs").unwrap().index());
+        assert_eq!(canonical_hand_index(11, 12), CH::parse("32s").unwrap().index());
     }
 
     #[test]
     fn canonical_index_offsuit() {
-        assert_eq!(canonical_hand_index(1, 0), 91); // KAo
-        assert_eq!(canonical_hand_index(12, 11), 168); // 23o
+        assert_eq!(canonical_hand_index(1, 0), CH::parse("AKo").unwrap().index());
+        assert_eq!(canonical_hand_index(12, 11), CH::parse("32o").unwrap().index());
     }
 
     #[test]

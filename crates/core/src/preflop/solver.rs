@@ -212,20 +212,58 @@ impl PreflopSolver {
         (t / (t + 1.0)).powf(self.dcfr_gamma)
     }
 
-    /// Apply DCFR cumulative regret discounting after each iteration.
+    /// Apply DCFR cumulative regret discounting to the hero's nodes only.
+    ///
+    /// With alternating updates, only the traversing player's regrets are
+    /// updated each iteration. Discounting must match: only discount the
+    /// hero's regrets so each player's regrets are discounted once per
+    /// their update, matching standard simultaneous-update DCFR behavior.
     ///
     /// Positive regrets multiplied by `t^α / (t^α + 1)`.
     /// Negative regrets multiplied by `t^β / (t^β + 1)`.
-    #[allow(clippy::cast_precision_loss)]
-    fn discount_regrets(&mut self) {
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn discount_regrets(&mut self, hero_pos: u8) {
         let t = (self.iteration + 1) as f64;
         let pos_factor = t.powf(self.dcfr_alpha) / (t.powf(self.dcfr_alpha) + 1.0);
         let neg_factor = t.powf(self.dcfr_beta) / (t.powf(self.dcfr_beta) + 1.0);
-        for r in &mut self.regret_sum {
-            if *r > 0.0 {
-                *r *= pos_factor;
-            } else if *r < 0.0 {
-                *r *= neg_factor;
+        for (node_idx, node) in self.tree.nodes.iter().enumerate() {
+            let (position, num_actions) = match node {
+                PreflopNode::Decision { position, children, .. } => (*position, children.len()),
+                PreflopNode::Terminal { .. } => continue,
+            };
+            if position != hero_pos {
+                continue;
+            }
+            let (base, _) = self.layout.slot(node_idx as u32, 0);
+            let end = base + NUM_HANDS * num_actions;
+            for r in &mut self.regret_sum[base..end] {
+                if *r > 0.0 {
+                    *r *= pos_factor;
+                } else if *r < 0.0 {
+                    *r *= neg_factor;
+                }
+            }
+        }
+    }
+
+    /// Multiplicatively discount existing strategy sums for the hero's nodes.
+    ///
+    /// Standard DCFR: `S^{T+1} = sd * S^T + new_contribution`.
+    /// This ensures early (poor) strategies get exponentially washed out.
+    #[allow(clippy::cast_possible_truncation)]
+    fn discount_strategy_sums(&mut self, hero_pos: u8, sd: f64) {
+        for (node_idx, node) in self.tree.nodes.iter().enumerate() {
+            let (position, num_actions) = match node {
+                PreflopNode::Decision { position, children, .. } => (*position, children.len()),
+                PreflopNode::Terminal { .. } => continue,
+            };
+            if position != hero_pos {
+                continue;
+            }
+            let (base, _) = self.layout.slot(node_idx as u32, 0);
+            let end = base + NUM_HANDS * num_actions;
+            for s in &mut self.strategy_sum[base..end] {
+                *s *= sd;
             }
         }
     }
@@ -259,7 +297,7 @@ impl PreflopSolver {
                     // h1=SB's hand, h2=BB's hand. Swap so hero_hand
                     // always corresponds to the traversing player.
                     let (hh, oh) = if hero_pos == 0 { (h1, h2) } else { (h2, h1) };
-                    cfr_traverse(&ctx, &mut dr, &mut ds, 0, hh, oh, hero_pos, 1.0, w, sd);
+                    cfr_traverse(&ctx, &mut dr, &mut ds, 0, hh, oh, hero_pos, 1.0, w);
                     (dr, ds)
                 },
             )
@@ -272,9 +310,12 @@ impl PreflopSolver {
                 },
             );
 
+        // DCFR: discount existing cumulative values BEFORE adding new deltas.
+        // S^{T+1} = sd * S^T + new, R^{T+1} = d * R^T + new
+        self.discount_regrets(hero_pos);
+        self.discount_strategy_sums(hero_pos, sd);
         add_into(&mut self.regret_sum, &merged_regret);
         add_into(&mut self.strategy_sum, &merged_strategy);
-        self.discount_regrets();
     }
 }
 
@@ -290,7 +331,6 @@ fn add_into(dst: &mut [f64], src: &[f64]) {
 ///
 /// Reads strategy from `ctx.snapshot` (frozen for the iteration),
 /// writes regret and strategy deltas to flat `dr` / `ds` buffers.
-/// `sd` is the DCFR strategy discount factor for the current iteration.
 #[allow(clippy::too_many_arguments)]
 fn cfr_traverse(
     ctx: &Ctx<'_>,
@@ -302,7 +342,6 @@ fn cfr_traverse(
     hero_pos: u8,
     reach_hero: f64,
     reach_opp: f64,
-    sd: f64,
 ) -> f64 {
     let inv = ctx.investments[node_idx as usize];
     let hero_inv = f64::from(inv[hero_pos as usize]);
@@ -323,13 +362,13 @@ fn cfr_traverse(
                 traverse_hero(
                     ctx, dr, ds,
                     start, hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                    sd, children, &strategy[..num_actions],
+                    children, &strategy[..num_actions],
                 )
             } else {
                 traverse_opponent(
                     ctx, dr, ds,
                     hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                    sd, children, &strategy[..num_actions],
+                    children, &strategy[..num_actions],
                 )
             }
         }
@@ -338,8 +377,8 @@ fn cfr_traverse(
 
 /// Hero's decision: compute regrets and update strategy/regret deltas.
 ///
-/// DCFR: regrets are unweighted (discounting applied after iteration).
-/// Strategy sums are weighted by the DCFR strategy discount `sd`.
+/// DCFR discounting is applied externally (multiplicative on existing sums
+/// before merge), so deltas here are unweighted.
 #[allow(clippy::too_many_arguments)]
 fn traverse_hero(
     ctx: &Ctx<'_>,
@@ -351,7 +390,6 @@ fn traverse_hero(
     hero_pos: u8,
     reach_hero: f64,
     reach_opp: f64,
-    sd: f64,
     children: &[u32],
     strategy: &[f64],
 ) -> f64 {
@@ -361,7 +399,7 @@ fn traverse_hero(
         action_values[i] = cfr_traverse(
             ctx, dr, ds,
             child_idx, hero_hand, opp_hand, hero_pos,
-            reach_hero * strategy[i], reach_opp, sd,
+            reach_hero * strategy[i], reach_opp,
         );
     }
 
@@ -375,9 +413,10 @@ fn traverse_hero(
         dr[slot_start + i] += reach_opp * (val - node_value);
     }
 
-    // Accumulate strategy deltas (weighted by DCFR strategy discount)
+    // Accumulate strategy deltas (unweighted; DCFR discounts existing sums
+    // multiplicatively before merge, so early iterations get washed out)
     for (i, &s) in strategy.iter().enumerate() {
-        ds[slot_start + i] += sd * reach_hero * s;
+        ds[slot_start + i] += reach_hero * s;
     }
 
     node_value
@@ -394,7 +433,6 @@ fn traverse_opponent(
     hero_pos: u8,
     reach_hero: f64,
     reach_opp: f64,
-    sd: f64,
     children: &[u32],
     strategy: &[f64],
 ) -> f64 {
@@ -403,7 +441,7 @@ fn traverse_opponent(
         let child_value = cfr_traverse(
             ctx, dr, ds,
             child_idx, hero_hand, opp_hand, hero_pos,
-            reach_hero, reach_opp * strategy[i], sd,
+            reach_hero, reach_opp * strategy[i],
         );
         node_value += strategy[i] * child_value;
     }
@@ -659,20 +697,22 @@ mod tests {
     fn discount_regrets_scales_positive_and_negative() {
         let config = tiny_config();
         let mut solver = PreflopSolver::new(&config);
-        // Set up known regret values
-        if solver.regret_sum.len() >= 3 {
-            solver.regret_sum[0] = 10.0;  // positive
-            solver.regret_sum[1] = -5.0;  // negative
-            solver.regret_sum[2] = 0.0;   // zero
+        // Find the root node's layout slot (position=0)
+        let (base, _) = solver.layout.slot(0, 0);
+        if solver.regret_sum.len() > base + 2 {
+            solver.regret_sum[base] = 10.0;      // positive
+            solver.regret_sum[base + 1] = -5.0;  // negative
+            solver.regret_sum[base + 2] = 0.0;   // zero
             solver.iteration = 5;
-            solver.discount_regrets();
+            // Discount hero_pos=0 (root node position is 0)
+            solver.discount_regrets(0);
 
             let t = 6.0_f64; // iteration + 1
             let pf = t.powf(1.5) / (t.powf(1.5) + 1.0);
             let nf = t.powf(0.5) / (t.powf(0.5) + 1.0);
-            assert!((solver.regret_sum[0] - 10.0 * pf).abs() < 1e-10);
-            assert!((solver.regret_sum[1] - (-5.0 * nf)).abs() < 1e-10);
-            assert!((solver.regret_sum[2]).abs() < 1e-10);
+            assert!((solver.regret_sum[base] - 10.0 * pf).abs() < 1e-10);
+            assert!((solver.regret_sum[base + 1] - (-5.0 * nf)).abs() < 1e-10);
+            assert!((solver.regret_sum[base + 2]).abs() < 1e-10);
         }
     }
 
