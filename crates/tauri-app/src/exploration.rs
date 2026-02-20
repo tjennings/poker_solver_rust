@@ -106,6 +106,7 @@ pub struct BundleInfo {
     pub bet_sizes: Vec<f32>,
     pub info_sets: usize,
     pub iterations: u64,
+    pub preflop_only: bool,
 }
 
 /// Information about an available agent config.
@@ -236,6 +237,7 @@ pub async fn load_bundle(
             bet_sizes: bundle.config.game.bet_sizes.clone(),
             info_sets: bundle.blueprint.len(),
             iterations: bundle.blueprint.iterations_trained(),
+            preflop_only: false,
         };
         let boundaries = bundle.boundaries;
         let source = StrategySource::Bundle {
@@ -262,6 +264,7 @@ fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
         bet_sizes: agent.game.bet_sizes.clone(),
         info_sets: 0,
         iterations: 0,
+        preflop_only: false,
     };
 
     Ok((info, StrategySource::Agent(agent)))
@@ -287,6 +290,7 @@ pub async fn load_preflop_solve(
         bet_sizes: vec![],
         info_sets: bundle.strategy.len(),
         iterations: 0,
+        preflop_only: true,
     };
 
     *state.source.write() = Some(StrategySource::PreflopSolve {
@@ -323,6 +327,7 @@ pub async fn solve_preflop_live(
         bet_sizes: vec![],
         info_sets: len,
         iterations,
+        preflop_only: true,
     };
 
     *state.source.write() = Some(StrategySource::PreflopSolve {
@@ -353,6 +358,7 @@ pub async fn load_subgame_source(
         bet_sizes: bundle.config.game.bet_sizes.clone(),
         info_sets: bundle.blueprint.len(),
         iterations: bundle.blueprint.iterations_trained(),
+        preflop_only: false,
     };
 
     *state.source.write() = Some(StrategySource::SubgameSolve {
@@ -806,6 +812,7 @@ pub fn get_bundle_info(state: State<'_, ExplorationState>) -> Result<BundleInfo,
             bet_sizes: config.game.bet_sizes.clone(),
             info_sets: blueprint.len(),
             iterations: blueprint.iterations_trained(),
+            preflop_only: false,
         },
         StrategySource::Agent(agent) => BundleInfo {
             name: agent.game.name.clone(),
@@ -813,6 +820,7 @@ pub fn get_bundle_info(state: State<'_, ExplorationState>) -> Result<BundleInfo,
             bet_sizes: agent.game.bet_sizes.clone(),
             info_sets: 0,
             iterations: 0,
+            preflop_only: false,
         },
         StrategySource::PreflopSolve { config, strategy } => BundleInfo {
             name: Some("Preflop Solve".to_string()),
@@ -820,6 +828,7 @@ pub fn get_bundle_info(state: State<'_, ExplorationState>) -> Result<BundleInfo,
             bet_sizes: vec![],
             info_sets: strategy.len(),
             iterations: 0,
+            preflop_only: true,
         },
         StrategySource::SubgameSolve {
             blueprint,
@@ -831,6 +840,7 @@ pub fn get_bundle_info(state: State<'_, ExplorationState>) -> Result<BundleInfo,
             bet_sizes: blueprint_config.game.bet_sizes.clone(),
             info_sets: blueprint.len(),
             iterations: blueprint.iterations_trained(),
+            preflop_only: false,
         },
     })
 }
