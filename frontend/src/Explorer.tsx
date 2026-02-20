@@ -653,24 +653,25 @@ export default function Explorer() {
 
   // Check if current betting round is complete (needs street transition)
   const checkStreetTransition = useCallback(
-    (history: string[], currentStreet: string): { needsTransition: boolean; nextStreet: string } => {
+    (history: string[], currentStreet: string, preflopOnly: boolean): { needsTransition: boolean; nextStreet: string } => {
       if (history.length < 2) return { needsTransition: false, nextStreet: '' };
 
       const lastTwo = history.slice(-2);
 
-      // Round ends when:
-      // 1. Call after bet/raise: ['b:X', 'c'] or ['r:X', 'c']
       const isCallAfterBetOrRaise =
         lastTwo[1] === 'c' && (lastTwo[0].startsWith('r:') || lastTwo[0].startsWith('b:'));
 
-      // 2. Both players check (postflop): ['x', 'x']
       const isBothCheck = lastTwo[0] === 'x' && lastTwo[1] === 'x';
 
-      // 3. Preflop limp: SB calls, BB checks: ['c', 'x']
       const isPreflopLimp = currentStreet === 'Preflop' && lastTwo[0] === 'c' && lastTwo[1] === 'x';
 
       if (isCallAfterBetOrRaise || isBothCheck || isPreflopLimp) {
-        if (currentStreet === 'Preflop') return { needsTransition: true, nextStreet: 'FLOP' };
+        if (currentStreet === 'Preflop') {
+          if (preflopOnly) {
+            return { needsTransition: true, nextStreet: '' };
+          }
+          return { needsTransition: true, nextStreet: 'FLOP' };
+        }
         if (currentStreet === 'Flop') return { needsTransition: true, nextStreet: 'TURN' };
         if (currentStreet === 'Turn') return { needsTransition: true, nextStreet: 'RIVER' };
         if (currentStreet === 'River') return { needsTransition: true, nextStreet: '' };
@@ -732,7 +733,11 @@ export default function Explorer() {
         }
 
         // Check for street transition
-        const { needsTransition, nextStreet } = checkStreetTransition(newHistory, matrix.street);
+        const { needsTransition, nextStreet } = checkStreetTransition(
+          newHistory,
+          matrix.street,
+          bundleInfo?.preflop_only ?? false
+        );
 
         if (needsTransition && nextStreet) {
           // Compute pot/stacks entering the new street.
@@ -781,7 +786,7 @@ export default function Explorer() {
         setLoading(false);
       }
     },
-    [matrix, position, checkStreetTransition, threshold, historyItems]
+    [matrix, position, checkStreetTransition, threshold, historyItems, bundleInfo]
   );
 
   const handleStreetCardsSet = useCallback(
