@@ -4,6 +4,7 @@ export interface BundleInfo {
   bet_sizes: number[];
   info_sets: number;
   iterations: number;
+  preflop_only: boolean;
 }
 
 export interface AgentInfo {

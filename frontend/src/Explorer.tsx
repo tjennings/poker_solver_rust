@@ -66,7 +66,7 @@ function HamburgerMenu({
               disabled={loading}
               onClick={() => { onLoadBundle(); setOpen(false); }}
             >
-              Load Bundle...
+              Load Dataset...
             </button>
           </div>
         </div>
@@ -637,11 +637,11 @@ export default function Explorer() {
     [loadSource]
   );
 
-  const handleLoadBundle = useCallback(async () => {
+  const handleLoadDataset = useCallback(async () => {
     try {
       const path = await open({
         directory: true,
-        title: 'Select Strategy Bundle Directory',
+        title: 'Select Dataset Directory',
       });
       if (path) {
         loadSource(path);
@@ -1002,7 +1002,7 @@ export default function Explorer() {
         activeAgentName={bundleInfo?.name ?? null}
         loading={loading}
         onSelectAgent={handleLoadAgent}
-        onLoadBundle={handleLoadBundle}
+        onLoadBundle={handleLoadDataset}
       />
 
       {error && <div className="error">{error}</div>}
