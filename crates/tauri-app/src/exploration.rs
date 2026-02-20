@@ -653,11 +653,11 @@ fn get_strategy_matrix_preflop(
 
     let tree = PreflopTree::build(config);
 
-    // Walk the tree following the action history to find the current node
-    let node_idx = walk_preflop_tree(&tree, &position.history)?;
+    // Walk the tree following the action history, tracking pot/stacks
+    let walk = walk_preflop_tree_with_state(config, &tree, &position.history)?;
 
     // Get available actions at this node
-    let (action_labels, _children) = match &tree.nodes[node_idx as usize] {
+    let (action_labels, _children) = match &tree.nodes[walk.node_idx as usize] {
         PreflopNode::Decision {
             action_labels,
             children,
@@ -668,11 +668,11 @@ fn get_strategy_matrix_preflop(
         }
     };
 
-    // Build ActionInfo from preflop action labels
+    // Build ActionInfo from preflop action labels (check vs call aware)
     let actions: Vec<ActionInfo> = action_labels
         .iter()
         .enumerate()
-        .map(|(i, a)| preflop_action_info(a, i))
+        .map(|(i, a)| preflop_action_info(a, i, walk.to_call))
         .collect();
 
     let ranks = RANKS;
@@ -684,7 +684,7 @@ fn get_strategy_matrix_preflop(
             let (hand_label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
 
             let hand_idx = canonical_hand_index_from_ranks(rank1, rank2, suited);
-            let probs_f64 = strategy.get_probs(node_idx, hand_idx);
+            let probs_f64 = strategy.get_probs(walk.node_idx, hand_idx);
 
             #[allow(clippy::cast_possible_truncation)]
             let probabilities: Vec<ActionProb> = actions
@@ -707,44 +707,71 @@ fn get_strategy_matrix_preflop(
         cells.push(row_cells);
     }
 
-    let stack_p1 = position.stacks.first().copied().unwrap_or(0);
-    let stack_p2 = position.stacks.get(1).copied().unwrap_or(0);
-
     Ok(StrategyMatrix {
         cells,
         actions,
         street: "Preflop".to_string(),
-        pot: position.pot,
-        stack: position.stacks.get(position.to_act as usize).copied().unwrap_or(0),
-        to_call: if position.board.is_empty() {
-            stack_p1.saturating_sub(stack_p2)
-        } else {
-            0
-        },
-        stack_p1,
-        stack_p2,
-        stacks: position.stacks.clone(),
+        pot: walk.pot,
+        stack: walk.stacks.get(walk.to_act as usize).copied().unwrap_or(0),
+        to_call: walk.to_call,
+        stack_p1: walk.stacks.first().copied().unwrap_or(0),
+        stack_p2: walk.stacks.get(1).copied().unwrap_or(0),
+        stacks: walk.stacks,
     })
 }
 
-/// Walk the preflop tree following an action history, returning the resulting node index.
-fn walk_preflop_tree(
+/// Result of walking the preflop tree with full state tracking.
+struct PreflopWalkState {
+    node_idx: u32,
+    pot: u32,
+    stacks: Vec<u32>,
+    to_call: u32,
+    to_act: u8,
+}
+
+/// Walk the preflop tree following an action history, tracking pot/stacks/to_call.
+///
+/// Mirrors the `BuildState` transitions from tree construction so that
+/// pot, stacks, and to_call are accurate at each decision point.
+fn walk_preflop_tree_with_state(
+    config: &poker_solver_core::preflop::PreflopConfig,
     tree: &poker_solver_core::preflop::PreflopTree,
     history: &[String],
-) -> Result<u32, String> {
-    use poker_solver_core::preflop::PreflopNode;
+) -> Result<PreflopWalkState, String> {
+    use poker_solver_core::preflop::{PreflopAction, PreflopNode};
 
+    let num_players = config.num_players() as usize;
+    let mut invested = vec![0u32; num_players];
+    let mut stacks = config.stacks.clone();
+
+    // Post blinds
+    for &(pos, amount) in &config.blinds {
+        let actual = amount.min(stacks[pos]);
+        invested[pos] = actual;
+        stacks[pos] -= actual;
+    }
+    // Post antes
+    for &(pos, amount) in &config.antes {
+        let actual = amount.min(stacks[pos]);
+        invested[pos] += actual;
+        stacks[pos] -= actual;
+    }
+
+    let mut current_bet = invested.iter().copied().max().unwrap_or(0);
     let mut node_idx = 0u32;
+
     for action_str in history {
         let node = &tree.nodes[node_idx as usize];
-        let (action_labels, children) = match node {
+        let (action_labels, children, position) = match node {
             PreflopNode::Decision {
                 action_labels,
                 children,
-                ..
-            } => (action_labels, children),
+                position,
+            } => (action_labels, children, *position),
             PreflopNode::Terminal { .. } => {
-                return Err(format!("Reached terminal before processing action '{action_str}'"));
+                return Err(format!(
+                    "Reached terminal before processing action '{action_str}'"
+                ));
             }
         };
 
@@ -754,12 +781,62 @@ fn walk_preflop_tree(
             .position(|a| preflop_action_matches(a, &target_action))
             .ok_or_else(|| {
                 format!(
-                    "Action '{action_str}' not available at node {node_idx}. Available: {action_labels:?}"
+                    "Action '{action_str}' not available at node {node_idx}. \
+                     Available: {action_labels:?}"
                 )
             })?;
+
+        let tree_action = &action_labels[child_pos];
+        let p = position as usize;
+        let to_call = current_bet.saturating_sub(invested[p]);
+
+        match tree_action {
+            PreflopAction::Fold => {}
+            PreflopAction::Call => {
+                let actual = to_call.min(stacks[p]);
+                invested[p] += actual;
+                stacks[p] -= actual;
+            }
+            PreflopAction::Raise(multiplier) => {
+                let new_bet = (f64::from(current_bet) * multiplier) as u32;
+                let new_bet = new_bet.max(current_bet + 1);
+                let total = new_bet.saturating_sub(invested[p]);
+                let actual = total.min(stacks[p]);
+                invested[p] += actual;
+                stacks[p] -= actual;
+                current_bet = invested[p];
+            }
+            PreflopAction::AllIn => {
+                let all_chips = stacks[p];
+                invested[p] += all_chips;
+                stacks[p] = 0;
+                if invested[p] > current_bet {
+                    current_bet = invested[p];
+                }
+            }
+        }
+
         node_idx = children[child_pos];
     }
-    Ok(node_idx)
+
+    // Determine to_act and to_call at the current node
+    let (to_act, to_call) = match &tree.nodes[node_idx as usize] {
+        PreflopNode::Decision { position, .. } => {
+            let tc = current_bet.saturating_sub(invested[*position as usize]);
+            (*position, tc)
+        }
+        PreflopNode::Terminal { .. } => (0, 0),
+    };
+
+    let pot: u32 = invested.iter().sum();
+
+    Ok(PreflopWalkState {
+        node_idx,
+        pot,
+        stacks,
+        to_call,
+        to_act,
+    })
 }
 
 /// Parse a history action string into a `PreflopAction` for matching.
@@ -795,9 +872,12 @@ fn preflop_action_matches(
 }
 
 /// Build an `ActionInfo` from a preflop tree action.
+///
+/// `to_call` distinguishes check (0) from call (>0) for `PreflopAction::Call`.
 fn preflop_action_info(
     action: &poker_solver_core::preflop::PreflopAction,
     idx: usize,
+    to_call: u32,
 ) -> ActionInfo {
     use poker_solver_core::preflop::PreflopAction;
     match action {
@@ -807,9 +887,15 @@ fn preflop_action_info(
             action_type: "fold".to_string(),
             size_key: None,
         },
+        PreflopAction::Call if to_call == 0 => ActionInfo {
+            id: "check".to_string(),
+            label: "Check".to_string(),
+            action_type: "check".to_string(),
+            size_key: None,
+        },
         PreflopAction::Call => ActionInfo {
             id: "call".to_string(),
-            label: "Call".to_string(),
+            label: format!("Call {to_call}"),
             action_type: "call".to_string(),
             size_key: None,
         },
@@ -2465,8 +2551,12 @@ mod tests {
     fn walk_preflop_tree_empty_history() {
         let config = poker_solver_core::preflop::PreflopConfig::heads_up(100);
         let tree = poker_solver_core::preflop::PreflopTree::build(&config);
-        let idx = walk_preflop_tree(&tree, &[]).expect("should walk empty history");
-        assert_eq!(idx, 0);
+        let walk = walk_preflop_tree_with_state(&config, &tree, &[])
+            .expect("should walk empty history");
+        assert_eq!(walk.node_idx, 0);
+        // Initial pot = SB(1) + BB(2) = 3
+        assert_eq!(walk.pot, 3);
+        assert_eq!(walk.to_call, 1);
     }
 
     #[timed_test]
@@ -2474,9 +2564,24 @@ mod tests {
         let config = poker_solver_core::preflop::PreflopConfig::heads_up(100);
         let tree = poker_solver_core::preflop::PreflopTree::build(&config);
         let history = vec!["fold".to_string()];
-        let result = walk_preflop_tree(&tree, &history);
+        let result = walk_preflop_tree_with_state(&config, &tree, &history);
         // Fold leads to a terminal node, but the walk itself should succeed
         assert!(result.is_ok());
+        let walk = result.unwrap();
+        assert_eq!(walk.pot, 3); // pot unchanged by fold
+    }
+
+    #[timed_test]
+    fn walk_preflop_tree_raise_tracks_state() {
+        let config = poker_solver_core::preflop::PreflopConfig::heads_up(50);
+        let tree = poker_solver_core::preflop::PreflopTree::build(&config);
+        // SB raises (action index varies by config, use "r:0" format)
+        let history = vec!["r:0".to_string()];
+        let walk = walk_preflop_tree_with_state(&config, &tree, &history)
+            .expect("should walk raise history");
+        // After SB raise: pot should be > 3, SB stack should decrease
+        assert!(walk.pot > 3, "pot should increase after raise");
+        assert!(walk.stacks[0] < 99, "SB stack should decrease (was 99 after blind)");
     }
 
     #[timed_test]

@@ -548,7 +548,7 @@ export default function Explorer() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [selectedCell, setSelectedCell] = useState<{ row: number; col: number } | null>(null);
-  const [handResult, setHandResult] = useState<'fold' | 'showdown' | null>(null);
+  const [handResult, setHandResult] = useState<{ type: 'fold' | 'showdown'; pot: number } | null>(null);
   const [comboInfo, setComboInfo] = useState<ComboGroupInfo | null>(null);
   const [threshold, setThreshold] = useState(2);
   const [remapInfo, setRemapInfo] = useState<{
@@ -738,7 +738,7 @@ export default function Explorer() {
             history: newHistory,
           }));
           setMatrix(null);
-          setHandResult('fold');
+          setHandResult({ type: 'fold', pot: matrix.pot });
           return;
         }
 
@@ -768,13 +768,16 @@ export default function Explorer() {
           }));
           setMatrix(null);
         } else if (needsTransition && !nextStreet) {
-          // River betting complete — showdown
+          // Betting complete — showdown (or preflop-only terminal)
+          const finalPot = actionId === 'call'
+            ? matrix.pot + matrix.to_call
+            : matrix.pot;
           setPosition((prev) => ({
             ...prev,
             history: newHistory,
           }));
           setMatrix(null);
-          setHandResult('showdown');
+          setHandResult({ type: 'showdown', pot: finalPot });
         } else {
           const newPosition: ExplorationPosition = {
             ...position,
@@ -1157,7 +1160,7 @@ export default function Explorer() {
           {handResult && (
             <div className="hand-complete">
               <p className="hand-complete-result">
-                {handResult === 'fold' ? 'Player folded' : 'Showdown'} — Pot: {position.pot}
+                {handResult.type === 'fold' ? 'Player folded' : 'Showdown'} — Pot: {handResult.pot}
               </p>
               <button className="new-hand-btn" onClick={handleNewHand}>
                 New Hand

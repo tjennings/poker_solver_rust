@@ -250,11 +250,11 @@ async fn main() {
         .layer(cors)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001")
         .await
-        .expect("failed to bind to port 3000");
+        .expect("failed to bind to port 3001");
 
-    println!("devserver listening on http://0.0.0.0:3000");
+    println!("devserver listening on http://0.0.0.0:3001");
 
     axum::serve(listener, app)
         .await
