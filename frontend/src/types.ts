@@ -47,9 +47,12 @@ export interface ExplorationPosition {
   board: string[];
   history: string[];
   pot: number;
+  stacks: number[];
   stack_p1: number;
   stack_p2: number;
   to_act: number;
+  num_players: number;
+  active_players: boolean[];
 }
 
 // Combo classification types

@@ -530,9 +530,12 @@ export default function Explorer() {
     board: [],
     history: [],
     pot: 3,
+    stacks: [199, 198],
     stack_p1: 199,
     stack_p2: 198,
     to_act: 0,
+    num_players: 2,
+    active_players: [true, true],
   });
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
   const [pendingStreet, setPendingStreet] = useState<{
@@ -603,13 +606,18 @@ export default function Explorer() {
         const info = await invoke<BundleInfo>('load_bundle', { path });
         setBundleInfo(info);
 
+        const sp1 = info.stack_depth * 2 - 1;
+        const sp2 = info.stack_depth * 2 - 2;
         const initialPosition: ExplorationPosition = {
           board: [],
           history: [],
           pot: 3,
-          stack_p1: info.stack_depth * 2 - 1,
-          stack_p2: info.stack_depth * 2 - 2,
+          stacks: [sp1, sp2],
+          stack_p1: sp1,
+          stack_p2: sp2,
           to_act: 0,
+          num_players: 2,
+          active_players: [true, true],
         };
         setPosition(initialPosition);
         setHistoryItems([]);
@@ -840,9 +848,12 @@ export default function Explorer() {
           board: newBoard,
           history: [],
           pot: pendingStreet.pot,
+          stacks: [pendingStreet.stack_p1, pendingStreet.stack_p2],
           stack_p1: pendingStreet.stack_p1,
           stack_p2: pendingStreet.stack_p2,
           to_act: 0, // OOP acts first postflop
+          num_players: 2,
+          active_players: [true, true],
         };
         setPosition(newPosition);
         setPendingStreet(null);
@@ -907,9 +918,12 @@ export default function Explorer() {
         board,
         history,
         pot,
+        stacks: [sp1, sp2],
         stack_p1: sp1,
         stack_p2: sp2,
         to_act: (streetActionCount % 2) as 0 | 1,
+        num_players: 2,
+        active_players: [true, true],
       };
 
       return { items, pos };
@@ -973,13 +987,18 @@ export default function Explorer() {
     if (!bundleInfo) return;
     try {
       setLoading(true);
+      const sp1 = bundleInfo.stack_depth * 2 - 1;
+      const sp2 = bundleInfo.stack_depth * 2 - 2;
       const initialPosition: ExplorationPosition = {
         board: [],
         history: [],
         pot: 3,
-        stack_p1: bundleInfo.stack_depth * 2 - 1,
-        stack_p2: bundleInfo.stack_depth * 2 - 2,
+        stacks: [sp1, sp2],
+        stack_p1: sp1,
+        stack_p2: sp2,
         to_act: 0,
+        num_players: 2,
+        active_players: [true, true],
       };
       setPosition(initialPosition);
       setHistoryItems([]);
