@@ -1,6 +1,5 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-dialog';
+import { invoke } from './invoke';
 import {
   AgentInfo,
   BundleInfo,
@@ -647,10 +646,13 @@ export default function Explorer() {
 
   const handleLoadDataset = useCallback(async () => {
     try {
-      const path = await open({
-        directory: true,
-        title: 'Select Dataset Directory',
-      });
+      let path: string | null = null;
+      if ('__TAURI__' in window) {
+        const { open } = await import('@tauri-apps/plugin-dialog');
+        path = await open({ directory: true, title: 'Select Dataset Directory' });
+      } else {
+        path = window.prompt('Enter dataset directory path:');
+      }
       if (path) {
         loadSource(path);
       }
