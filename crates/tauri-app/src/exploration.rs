@@ -222,8 +222,8 @@ pub async fn load_bundle(
     let (info, source, boundaries) = if path.ends_with(".toml") {
         let (info, source) = load_agent(&bundle_path)?;
         (info, source, None)
-    } else {
-        // Heavy I/O on a blocking thread to avoid freezing the UI
+    } else if bundle_path.join("blueprint.bin").exists() {
+        // Postflop strategy bundle
         let bundle = tauri::async_runtime::spawn_blocking(move || {
             StrategyBundle::load(&bundle_path)
                 .map_err(|e| format!("Failed to load bundle: {e}"))
@@ -245,6 +245,32 @@ pub async fn load_bundle(
             blueprint: bundle.blueprint,
         };
         (info, source, boundaries)
+    } else if bundle_path.join("strategy.bin").exists() {
+        // Preflop strategy bundle
+        let bundle = tauri::async_runtime::spawn_blocking(move || {
+            poker_solver_core::preflop::PreflopBundle::load(&bundle_path)
+                .map_err(|e| format!("Failed to load preflop bundle: {e}"))
+        })
+        .await
+        .map_err(|e| format!("Load task panicked: {e}"))??;
+
+        let info = BundleInfo {
+            name: Some("Preflop Solve".into()),
+            stack_depth: bundle.config.stacks.first().copied().unwrap_or(0) / 2,
+            bet_sizes: vec![],
+            info_sets: bundle.strategy.len(),
+            iterations: 0,
+            preflop_only: true,
+        };
+        let source = StrategySource::PreflopSolve {
+            config: bundle.config,
+            strategy: bundle.strategy,
+        };
+        (info, source, None)
+    } else {
+        return Err(
+            "Directory contains neither blueprint.bin nor strategy.bin".to_string(),
+        );
     };
 
     *state.abstraction_boundaries.write() = boundaries;
