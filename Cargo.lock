@@ -3480,6 +3480,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "test-macros",
+ "tokio",
 ]
 
 [[package]]

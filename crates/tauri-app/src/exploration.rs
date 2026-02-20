@@ -208,13 +208,13 @@ impl Default for ExplorationPosition {
     }
 }
 
-/// Load a strategy bundle from a directory, or an agent from a `.toml` file.
+/// Load a strategy bundle from a directory, or an agent from a `.toml` file
+/// (core logic, no Tauri dependency).
 ///
 /// Bundle loading (which can deserialize ~1 GB of blueprint data) runs on a
-/// blocking thread so the Tauri main thread stays responsive.
-#[tauri::command]
-pub async fn load_bundle(
-    state: State<'_, ExplorationState>,
+/// blocking thread so the async runtime stays responsive.
+pub async fn load_bundle_core(
+    state: &ExplorationState,
     path: String,
 ) -> Result<BundleInfo, String> {
     let bundle_path = PathBuf::from(&path);
@@ -224,7 +224,7 @@ pub async fn load_bundle(
         (info, source, None)
     } else if bundle_path.join("blueprint.bin").exists() {
         // Postflop strategy bundle
-        let bundle = tauri::async_runtime::spawn_blocking(move || {
+        let bundle = tokio::task::spawn_blocking(move || {
             StrategyBundle::load(&bundle_path)
                 .map_err(|e| format!("Failed to load bundle: {e}"))
         })
@@ -247,7 +247,7 @@ pub async fn load_bundle(
         (info, source, boundaries)
     } else if bundle_path.join("strategy.bin").exists() {
         // Preflop strategy bundle
-        let bundle = tauri::async_runtime::spawn_blocking(move || {
+        let bundle = tokio::task::spawn_blocking(move || {
             poker_solver_core::preflop::PreflopBundle::load(&bundle_path)
                 .map_err(|e| format!("Failed to load preflop bundle: {e}"))
         })
@@ -281,6 +281,15 @@ pub async fn load_bundle(
     Ok(info)
 }
 
+/// Load a strategy bundle (Tauri wrapper).
+#[tauri::command]
+pub async fn load_bundle(
+    state: State<'_, ExplorationState>,
+    path: String,
+) -> Result<BundleInfo, String> {
+    load_bundle_core(&state, path).await
+}
+
 fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
     let agent = AgentConfig::load(path).map_err(|e| format!("Failed to load agent: {e}"))?;
 
@@ -296,14 +305,13 @@ fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
     Ok((info, StrategySource::Agent(agent)))
 }
 
-/// Load a preflop strategy bundle from a directory.
-#[tauri::command]
-pub async fn load_preflop_solve(
-    state: State<'_, ExplorationState>,
+/// Load a preflop strategy bundle from a directory (core logic, no Tauri dependency).
+pub async fn load_preflop_solve_core(
+    state: &ExplorationState,
     path: String,
 ) -> Result<BundleInfo, String> {
     let bundle_path = PathBuf::from(&path);
-    let bundle = tauri::async_runtime::spawn_blocking(move || {
+    let bundle = tokio::task::spawn_blocking(move || {
         poker_solver_core::preflop::PreflopBundle::load(&bundle_path)
             .map_err(|e| format!("Failed to load preflop bundle: {e}"))
     })
@@ -327,17 +335,26 @@ pub async fn load_preflop_solve(
     Ok(info)
 }
 
-/// Solve a preflop game live with the given stack depth and iterations.
+/// Load a preflop strategy bundle (Tauri wrapper).
 #[tauri::command]
-pub async fn solve_preflop_live(
+pub async fn load_preflop_solve(
     state: State<'_, ExplorationState>,
+    path: String,
+) -> Result<BundleInfo, String> {
+    load_preflop_solve_core(&state, path).await
+}
+
+/// Solve a preflop game live with the given stack depth and iterations
+/// (core logic, no Tauri dependency).
+pub async fn solve_preflop_live_core(
+    state: &ExplorationState,
     stack_depth: u32,
     iterations: u64,
 ) -> Result<BundleInfo, String> {
     let config = poker_solver_core::preflop::PreflopConfig::heads_up(stack_depth);
     let config_clone = config.clone();
 
-    let (strategy, len) = tauri::async_runtime::spawn_blocking(move || {
+    let (strategy, len) = tokio::task::spawn_blocking(move || {
         let mut solver = poker_solver_core::preflop::PreflopSolver::new(&config_clone);
         solver.train(iterations);
         let strat = solver.strategy();
@@ -364,14 +381,23 @@ pub async fn solve_preflop_live(
     Ok(info)
 }
 
-/// Load a blueprint for subgame solving.
+/// Solve a preflop game live (Tauri wrapper).
 #[tauri::command]
-pub async fn load_subgame_source(
+pub async fn solve_preflop_live(
     state: State<'_, ExplorationState>,
+    stack_depth: u32,
+    iterations: u64,
+) -> Result<BundleInfo, String> {
+    solve_preflop_live_core(&state, stack_depth, iterations).await
+}
+
+/// Load a blueprint for subgame solving (core logic, no Tauri dependency).
+pub async fn load_subgame_source_core(
+    state: &ExplorationState,
     blueprint_path: String,
 ) -> Result<BundleInfo, String> {
     let bundle_path = PathBuf::from(&blueprint_path);
-    let bundle = tauri::async_runtime::spawn_blocking(move || {
+    let bundle = tokio::task::spawn_blocking(move || {
         poker_solver_core::blueprint::StrategyBundle::load(&bundle_path)
             .map_err(|e| format!("Failed to load bundle: {e}"))
     })
@@ -397,14 +423,22 @@ pub async fn load_subgame_source(
     Ok(info)
 }
 
-/// Get the strategy matrix for a given position.
+/// Load a blueprint for subgame solving (Tauri wrapper).
+#[tauri::command]
+pub async fn load_subgame_source(
+    state: State<'_, ExplorationState>,
+    blueprint_path: String,
+) -> Result<BundleInfo, String> {
+    load_subgame_source_core(&state, blueprint_path).await
+}
+
+/// Get the strategy matrix for a given position (core logic, no Tauri dependency).
 ///
 /// `threshold` filters out hands whose prior action probabilities fell below
 /// this value (range narrowing).  `street_histories` supplies the action
 /// sequences of all completed streets so the filter can replay the game.
-#[tauri::command]
-pub fn get_strategy_matrix(
-    state: State<'_, ExplorationState>,
+pub fn get_strategy_matrix_core(
+    state: &ExplorationState,
     position: ExplorationPosition,
     threshold: Option<f32>,
     street_histories: Option<Vec<Vec<String>>>,
@@ -419,7 +453,7 @@ pub fn get_strategy_matrix(
 
     match source {
         StrategySource::Bundle { config, blueprint } => {
-            get_strategy_matrix_bundle(config, blueprint, &state, &position, thresh, &sh)
+            get_strategy_matrix_bundle(config, blueprint, state, &position, thresh, &sh)
         }
         StrategySource::Agent(agent) => get_strategy_matrix_agent(agent, &position),
         StrategySource::PreflopSolve { config, strategy } => {
@@ -432,7 +466,7 @@ pub fn get_strategy_matrix(
         } => get_strategy_matrix_bundle(
             blueprint_config,
             blueprint,
-            &state,
+            state,
             &position,
             thresh,
             &sh,
@@ -440,10 +474,21 @@ pub fn get_strategy_matrix(
     }
 }
 
+/// Get the strategy matrix for a given position (Tauri wrapper).
+#[tauri::command]
+pub fn get_strategy_matrix(
+    state: State<'_, ExplorationState>,
+    position: ExplorationPosition,
+    threshold: Option<f32>,
+    street_histories: Option<Vec<Vec<String>>>,
+) -> Result<StrategyMatrix, String> {
+    get_strategy_matrix_core(&state, position, threshold, street_histories)
+}
+
 fn get_strategy_matrix_bundle(
     config: &BundleConfig,
     blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
-    state: &State<'_, ExplorationState>,
+    state: &ExplorationState,
     position: &ExplorationPosition,
     threshold: f32,
     street_histories: &[Vec<String>],
@@ -791,10 +836,9 @@ fn canonical_hand_index_from_ranks(rank1: char, rank2: char, suited: bool) -> us
     canonical.index()
 }
 
-/// Get available actions at the current position.
-#[tauri::command]
-pub fn get_available_actions(
-    state: State<'_, ExplorationState>,
+/// Get available actions at the current position (core logic, no Tauri dependency).
+pub fn get_available_actions_core(
+    state: &ExplorationState,
     position: ExplorationPosition,
 ) -> Result<Vec<ActionInfo>, String> {
     let source_guard = state.source.read();
@@ -817,15 +861,28 @@ pub fn get_available_actions(
     Ok(get_actions_for_position(stack_depth, bet_sizes, &position))
 }
 
-/// Check if a bundle or agent is loaded.
+/// Get available actions at the current position (Tauri wrapper).
 #[tauri::command]
-pub fn is_bundle_loaded(state: State<'_, ExplorationState>) -> bool {
+pub fn get_available_actions(
+    state: State<'_, ExplorationState>,
+    position: ExplorationPosition,
+) -> Result<Vec<ActionInfo>, String> {
+    get_available_actions_core(&state, position)
+}
+
+/// Check if a bundle or agent is loaded (core logic, no Tauri dependency).
+pub fn is_bundle_loaded_core(state: &ExplorationState) -> bool {
     state.source.read().is_some()
 }
 
-/// Get info about currently loaded bundle or agent.
+/// Check if a bundle or agent is loaded (Tauri wrapper).
 #[tauri::command]
-pub fn get_bundle_info(state: State<'_, ExplorationState>) -> Result<BundleInfo, String> {
+pub fn is_bundle_loaded(state: State<'_, ExplorationState>) -> bool {
+    is_bundle_loaded_core(&state)
+}
+
+/// Get info about currently loaded bundle or agent (core logic, no Tauri dependency).
+pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, String> {
     let source_guard = state.source.read();
     let source = source_guard
         .as_ref()
@@ -871,6 +928,12 @@ pub fn get_bundle_info(state: State<'_, ExplorationState>) -> Result<BundleInfo,
     })
 }
 
+/// Get info about currently loaded bundle or agent (Tauri wrapper).
+#[tauri::command]
+pub fn get_bundle_info(state: State<'_, ExplorationState>) -> Result<BundleInfo, String> {
+    get_bundle_info_core(&state)
+}
+
 /// Computation progress status.
 #[derive(Debug, Clone, Serialize)]
 pub struct ComputationStatus {
@@ -880,9 +943,8 @@ pub struct ComputationStatus {
     pub board_key: Option<String>,
 }
 
-/// Get the current bucket computation status.
-#[tauri::command]
-pub fn get_computation_status(state: State<'_, ExplorationState>) -> ComputationStatus {
+/// Get the current bucket computation status (core logic, no Tauri dependency).
+pub fn get_computation_status_core(state: &ExplorationState) -> ComputationStatus {
     ComputationStatus {
         computing: state.computing.load(Ordering::SeqCst),
         progress: state.computation_progress.load(Ordering::SeqCst),
@@ -891,14 +953,21 @@ pub fn get_computation_status(state: State<'_, ExplorationState>) -> Computation
     }
 }
 
-/// Start async bucket computation for a board.
+/// Get the current bucket computation status (Tauri wrapper).
+#[tauri::command]
+pub fn get_computation_status(state: State<'_, ExplorationState>) -> ComputationStatus {
+    get_computation_status_core(&state)
+}
+
+/// Start async bucket computation for a board (core logic, no Tauri dependency).
+///
 /// Returns immediately for agents (no computation needed).
 /// For bundles, computation happens in background.
-#[tauri::command]
-pub fn start_bucket_computation(
-    app: AppHandle,
-    state: State<'_, ExplorationState>,
+/// An optional `on_progress` callback receives `(completed, total, board_key)`.
+pub fn start_bucket_computation_core(
+    state: &ExplorationState,
     board: Vec<String>,
+    on_progress: Option<Box<dyn Fn(usize, usize, &str) + Send + 'static>>,
 ) -> Result<String, String> {
     let board_key = board.join("");
 
@@ -1001,14 +1070,9 @@ pub fn start_bucket_computation(
 
                     // Emit progress event every 10 hands
                     if completed % 10 == 0 {
-                        let _ = app.emit(
-                            "bucket-progress",
-                            BucketProgressEvent {
-                                completed,
-                                total: 169,
-                                board_key: board_key_clone.clone(),
-                            },
-                        );
+                        if let Some(ref cb) = on_progress {
+                            cb(completed, 169, &board_key_clone);
+                        }
                     }
                 }
             }
@@ -1020,14 +1084,9 @@ pub fn start_bucket_computation(
             .insert(board_key_clone.clone(), local_cache);
 
         // Computation complete - emit final event
-        let _ = app.emit(
-            "bucket-progress",
-            BucketProgressEvent {
-                completed: 169,
-                total: 169,
-                board_key: board_key_clone,
-            },
-        );
+        if let Some(ref cb) = on_progress {
+            cb(169, 169, &board_key_clone);
+        }
 
         computing.store(false, Ordering::SeqCst);
         *computing_board_key.write() = None;
@@ -1036,12 +1095,37 @@ pub fn start_bucket_computation(
     Ok(board_key)
 }
 
-/// Check if bucket computation for a board is complete.
+/// Start async bucket computation for a board (Tauri wrapper).
 #[tauri::command]
-pub fn is_board_cached(state: State<'_, ExplorationState>, board: Vec<String>) -> bool {
+pub fn start_bucket_computation(
+    app: AppHandle,
+    state: State<'_, ExplorationState>,
+    board: Vec<String>,
+) -> Result<String, String> {
+    let on_progress = Box::new(move |completed: usize, total: usize, board_key: &str| {
+        let _ = app.emit(
+            "bucket-progress",
+            BucketProgressEvent {
+                completed,
+                total,
+                board_key: board_key.to_string(),
+            },
+        );
+    });
+    start_bucket_computation_core(&state, board, Some(on_progress))
+}
+
+/// Check if bucket computation for a board is complete (core logic, no Tauri dependency).
+pub fn is_board_cached_core(state: &ExplorationState, board: Vec<String>) -> bool {
     let board_key = board.join("");
     let cache = state.bucket_cache.read();
     cache.contains_key(&board_key)
+}
+
+/// Check if bucket computation for a board is complete (Tauri wrapper).
+#[tauri::command]
+pub fn is_board_cached(state: State<'_, ExplorationState>, board: Vec<String>) -> bool {
+    is_board_cached_core(&state, board)
 }
 
 /// Result of board canonicalization.
@@ -1055,14 +1139,13 @@ pub struct CanonicalizeResult {
     pub suit_map: Option<HashMap<String, String>>,
 }
 
-/// Canonicalize board cards to their suit-isomorphic equivalent.
+/// Canonicalize board cards to their suit-isomorphic equivalent (core logic, no Tauri dependency).
 ///
 /// On flop (3 cards): establishes a `SuitMapping` stored in state for reuse.
 /// On turn/river (1 card): applies the stored flop mapping to the new card.
 /// Returns canonical card strings and substitution info.
-#[tauri::command]
-pub fn canonicalize_board(
-    state: State<'_, ExplorationState>,
+pub fn canonicalize_board_core(
+    state: &ExplorationState,
     cards: Vec<String>,
 ) -> Result<CanonicalizeResult, String> {
     let parsed: Vec<Card> = cards.iter().map(|s| parse_card(s)).collect::<Result<_, _>>()?;
@@ -1113,6 +1196,15 @@ pub fn canonicalize_board(
             suit_map,
         })
     }
+}
+
+/// Canonicalize board cards (Tauri wrapper).
+#[tauri::command]
+pub fn canonicalize_board(
+    state: State<'_, ExplorationState>,
+    cards: Vec<String>,
+) -> Result<CanonicalizeResult, String> {
+    canonicalize_board_core(&state, cards)
 }
 
 /// Build a suit substitution map from original cards to canonical cards.
@@ -1229,16 +1321,15 @@ pub struct ComboGroupInfo {
     pub spr_bucket: u32,
 }
 
-/// Get combo-level classification breakdown for a selected cell.
+/// Get combo-level classification breakdown for a selected cell (core logic, no Tauri dependency).
 ///
 /// Enumerates all specific combos of a canonical hand (e.g. "AKs"),
 /// classifies each on the current board, groups by classification,
 /// and looks up the blueprint strategy for each group.
 ///
 /// Only meaningful for hand_class bundles on postflop streets.
-#[tauri::command]
-pub fn get_combo_classes(
-    state: State<'_, ExplorationState>,
+pub fn get_combo_classes_core(
+    state: &ExplorationState,
     position: ExplorationPosition,
     hand: String,
 ) -> Result<ComboGroupInfo, String> {
@@ -1351,6 +1442,16 @@ pub fn get_combo_classes(
         street: format!("{street:?}"),
         spr_bucket: spr,
     })
+}
+
+/// Get combo-level classification breakdown (Tauri wrapper).
+#[tauri::command]
+pub fn get_combo_classes(
+    state: State<'_, ExplorationState>,
+    position: ExplorationPosition,
+    hand: String,
+) -> Result<ComboGroupInfo, String> {
+    get_combo_classes_core(&state, position, hand)
 }
 
 fn empty_combo_info(hand: &str) -> ComboGroupInfo {
