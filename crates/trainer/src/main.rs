@@ -679,7 +679,7 @@ fn run_solve_preflop(
     let bb_node = lhe_viz::find_raise_child(&tree, 0);
     let mut solver = PreflopSolver::new_with_equity(&config, equity);
 
-    let mut prev_matrices = print_preflop_matrices(&solver.strategy(), &tree, bb_node, 0, None);
+    let (mut prev_matrices, _) = print_preflop_matrices(&solver.strategy(), &tree, bb_node, 0, None);
 
     let pb = ProgressBar::new(iterations);
     pb.set_style(
@@ -689,8 +689,10 @@ fn run_solve_preflop(
             .progress_chars("#>-"),
     );
 
+    const DELTA_THRESHOLD: f64 = 0.0001;
     let chunk = std::cmp::max(iterations / 100, 1);
     let mut done = 0u64;
+    let mut converged_early = false;
     while done < iterations {
         let batch = std::cmp::min(chunk, iterations - done);
         solver.train(batch);
@@ -698,20 +700,33 @@ fn run_solve_preflop(
         pb.set_position(done);
 
         if print_every > 0 && done < iterations && done.is_multiple_of(print_every) {
+            let mut early_stop = false;
             pb.suspend(|| {
-                prev_matrices = print_preflop_matrices(
+                let (matrices, max_delta) = print_preflop_matrices(
                     &solver.strategy(), &tree, bb_node, done, Some(&prev_matrices),
                 );
+                prev_matrices = matrices;
+                if let Some(d) = max_delta {
+                    if d < DELTA_THRESHOLD {
+                        println!("Delta {d:.6} < {DELTA_THRESHOLD} — stopping early at iteration {done}");
+                        early_stop = true;
+                    }
+                }
             });
+            if early_stop {
+                converged_early = true;
+                break;
+            }
         }
     }
     pb.finish_with_message("done");
 
     let elapsed = start.elapsed();
     let strategy = solver.strategy();
-    println!("Converged in {elapsed:.1?} — {} info sets", strategy.len());
+    let label = if converged_early { "Converged" } else { "Finished" };
+    println!("{label} in {elapsed:.1?} — {done} iterations, {} info sets", strategy.len());
 
-    print_preflop_matrices(&strategy, &tree, bb_node, iterations, Some(&prev_matrices));
+    print_preflop_matrices(&strategy, &tree, bb_node, done, Some(&prev_matrices));
 
     let bundle = PreflopBundle::new(config, strategy);
     bundle.save(output)?;
@@ -723,13 +738,14 @@ fn run_solve_preflop(
 /// Previous SB and BB matrices for delta computation.
 type PrevMatrices = (lhe_viz::HandMatrix, Option<lhe_viz::HandMatrix>);
 
+/// Returns `(updated_matrices, max_delta)`.
 fn print_preflop_matrices(
     strategy: &poker_solver_core::preflop::PreflopStrategy,
     tree: &PreflopTree,
     bb_node: Option<u32>,
     iteration: u64,
     prev: Option<&PrevMatrices>,
-) -> PrevMatrices {
+) -> (PrevMatrices, Option<f64>) {
     let sb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, 0);
     let sb_delta = prev.and_then(|(p, _)| lhe_viz::matrix_delta(p, &sb_matrix));
     let sb_title = match sb_delta {
@@ -737,6 +753,8 @@ fn print_preflop_matrices(
         None => format!("SB RFI — iteration {iteration}"),
     };
     lhe_viz::print_hand_matrix(&sb_matrix, &sb_title);
+
+    let mut max_delta = sb_delta;
 
     let bb_matrix = bb_node.map(|bb_idx| {
         let m = lhe_viz::preflop_strategy_matrix(strategy, tree, bb_idx);
@@ -748,10 +766,13 @@ fn print_preflop_matrices(
             None => format!("BB vs Raise — iteration {iteration}"),
         };
         lhe_viz::print_hand_matrix(&m, &bb_title);
+        if let Some(bd) = bb_delta {
+            max_delta = Some(max_delta.map_or(bd, |sd: f64| sd.max(bd)));
+        }
         m
     });
 
-    (sb_matrix, bb_matrix)
+    ((sb_matrix, bb_matrix), max_delta)
 }
 
 // ---------------------------------------------------------------------------
