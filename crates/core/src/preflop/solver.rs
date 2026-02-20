@@ -108,6 +108,11 @@ struct Ctx<'a> {
     equity: &'a EquityTable,
     layout: &'a NodeLayout,
     snapshot: &'a [f64],
+    /// ε-greedy exploration factor (0.0 = pure regret matching).
+    exploration: f64,
+    /// Current iteration number (1-based). Used for LCFR linear weighting
+    /// of strategy contributions: `ds += iteration * reach * strategy`.
+    iteration: u64,
 }
 
 /// Preflop DCFR solver with alternating updates.
@@ -132,6 +137,10 @@ pub struct PreflopSolver {
     dcfr_beta: f64,
     /// DCFR strategy sum discount exponent.
     dcfr_gamma: f64,
+    /// Number of initial iterations without DCFR discounting.
+    dcfr_warmup: u64,
+    /// ε-greedy exploration factor.
+    exploration: f64,
 }
 
 impl PreflopSolver {
@@ -167,6 +176,8 @@ impl PreflopSolver {
             dcfr_alpha: config.dcfr_alpha,
             dcfr_beta: config.dcfr_beta,
             dcfr_gamma: config.dcfr_gamma,
+            dcfr_warmup: config.dcfr_warmup,
+            exploration: config.exploration,
         }
     }
 
@@ -182,6 +193,12 @@ impl PreflopSolver {
     #[must_use]
     pub fn iteration(&self) -> u64 {
         self.iteration
+    }
+
+    /// The game tree used by this solver.
+    #[must_use]
+    pub fn tree(&self) -> &PreflopTree {
+        &self.tree
     }
 
     /// Extract the average strategy (normalized `strategy_sum`).
@@ -203,6 +220,30 @@ impl PreflopSolver {
             }
         }
         PreflopStrategy { strategies }
+    }
+
+    /// Raw regret sums for a hand at a specific node (for diagnostics).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn regret_at(&self, node_idx: u32, hand_idx: usize) -> Vec<f64> {
+        let num_actions = match &self.tree.nodes[node_idx as usize] {
+            PreflopNode::Decision { children, .. } => children.len(),
+            PreflopNode::Terminal { .. } => return vec![],
+        };
+        let (start, _) = self.layout.slot(node_idx, hand_idx as u16);
+        self.regret_sum[start..start + num_actions].to_vec()
+    }
+
+    /// Raw strategy sums for a hand at a specific node (for diagnostics).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn strategy_sum_at(&self, node_idx: u32, hand_idx: usize) -> Vec<f64> {
+        let num_actions = match &self.tree.nodes[node_idx as usize] {
+            PreflopNode::Decision { children, .. } => children.len(),
+            PreflopNode::Terminal { .. } => return vec![],
+        };
+        let (start, _) = self.layout.slot(node_idx, hand_idx as u16);
+        self.strategy_sum[start..start + num_actions].to_vec()
     }
 
     /// Compute DCFR strategy discount: `(t / (t + 1))^γ`.
@@ -269,12 +310,16 @@ impl PreflopSolver {
     }
 
     /// Single training iteration: snapshot regrets, parallel traverse, merge, discount.
+    ///
+    /// Uses **simultaneous updates**: both players traverse every iteration
+    /// using the same frozen regret snapshot.  This ensures all subtrees
+    /// receive regret signal regardless of the opponent's current strategy,
+    /// fixing off-path learning issues that plague alternating updates.
     #[allow(clippy::cast_precision_loss)]
     fn train_one_iteration(&mut self) {
         let snapshot = self.regret_sum.clone();
         let buf_size = self.layout.total_size;
         let sd = self.strategy_discount();
-        let hero_pos = (self.iteration % 2) as u8;
 
         let ctx = Ctx {
             tree: &self.tree,
@@ -282,11 +327,13 @@ impl PreflopSolver {
             equity: &self.equity,
             layout: &self.layout,
             snapshot: &snapshot,
+            exploration: self.exploration,
+            iteration: self.iteration,
         };
 
         // Parallel fold+reduce: each rayon task accumulates into its own
         // flat buffer, then buffers are merged in a parallel reduction tree.
-        // Alternating updates: only traverse for one hero per iteration.
+        // Simultaneous updates: traverse for BOTH heroes each iteration.
         let pairs = &self.pairs;
         let (merged_regret, merged_strategy) = pairs
             .par_iter()
@@ -294,10 +341,11 @@ impl PreflopSolver {
                 || (vec![0.0f64; buf_size], vec![0.0f64; buf_size]),
                 |(mut dr, mut ds), &(h1, h2)| {
                     let w = ctx.equity.weight(h1 as usize, h2 as usize);
-                    // h1=SB's hand, h2=BB's hand. Swap so hero_hand
-                    // always corresponds to the traversing player.
-                    let (hh, oh) = if hero_pos == 0 { (h1, h2) } else { (h2, h1) };
-                    cfr_traverse(&ctx, &mut dr, &mut ds, 0, hh, oh, hero_pos, 1.0, w);
+                    // Traverse for both players using the same snapshot.
+                    for hero_pos in 0..2u8 {
+                        let (hh, oh) = if hero_pos == 0 { (h1, h2) } else { (h2, h1) };
+                        cfr_traverse(&ctx, &mut dr, &mut ds, 0, hh, oh, hero_pos, 1.0, w);
+                    }
                     (dr, ds)
                 },
             )
@@ -311,9 +359,13 @@ impl PreflopSolver {
             );
 
         // DCFR: discount existing cumulative values BEFORE adding new deltas.
-        // S^{T+1} = sd * S^T + new, R^{T+1} = d * R^T + new
-        self.discount_regrets(hero_pos);
-        self.discount_strategy_sums(hero_pos, sd);
+        // With simultaneous updates, discount BOTH players each iteration.
+        if self.iteration > self.dcfr_warmup {
+            for pos in 0..2u8 {
+                self.discount_regrets(pos);
+                self.discount_strategy_sums(pos, sd);
+            }
+        }
         add_into(&mut self.regret_sum, &merged_regret);
         add_into(&mut self.strategy_sum, &merged_strategy);
     }
@@ -355,20 +407,33 @@ fn cfr_traverse(
             let is_hero = *position == hero_pos;
             let hand_for_key = if is_hero { hero_hand } else { opp_hand };
             let (start, _) = ctx.layout.slot(node_idx, hand_for_key);
-            let mut strategy = [0.0f64; MAX_ACTIONS];
-            regret_matching_into(ctx.snapshot, start, &mut strategy[..num_actions]);
+
+            // Intended strategy from regret matching (used for strategy_sum output).
+            let mut intended = [0.0f64; MAX_ACTIONS];
+            regret_matching_into(ctx.snapshot, start, &mut intended[..num_actions]);
+
+            // Traversal strategy: blend with uniform for exploration.
+            let mut traversal = intended;
+            if ctx.exploration > 0.0 {
+                let eps = ctx.exploration;
+                #[allow(clippy::cast_precision_loss)]
+                let n_inv = 1.0 / num_actions as f64;
+                for s in &mut traversal[..num_actions] {
+                    *s = (1.0 - eps).mul_add(*s, eps * n_inv);
+                }
+            }
 
             if is_hero {
                 traverse_hero(
                     ctx, dr, ds,
                     start, hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                    children, &strategy[..num_actions],
+                    children, &intended[..num_actions], &traversal[..num_actions],
                 )
             } else {
                 traverse_opponent(
                     ctx, dr, ds,
                     hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                    children, &strategy[..num_actions],
+                    children, &traversal[..num_actions],
                 )
             }
         }
@@ -377,6 +442,8 @@ fn cfr_traverse(
 
 /// Hero's decision: compute regrets and update strategy/regret deltas.
 ///
+/// `intended` is the regret-matching strategy (accumulated into `strategy_sums`).
+/// `traversal` is the ε-explored strategy (used for subtree values and regrets).
 /// DCFR discounting is applied externally (multiplicative on existing sums
 /// before merge), so deltas here are unweighted.
 #[allow(clippy::too_many_arguments)]
@@ -391,7 +458,8 @@ fn traverse_hero(
     reach_hero: f64,
     reach_opp: f64,
     children: &[u32],
-    strategy: &[f64],
+    intended: &[f64],
+    traversal: &[f64],
 ) -> f64 {
     let num_actions = children.len();
     let mut action_values = [0.0f64; MAX_ACTIONS];
@@ -399,24 +467,30 @@ fn traverse_hero(
         action_values[i] = cfr_traverse(
             ctx, dr, ds,
             child_idx, hero_hand, opp_hand, hero_pos,
-            reach_hero * strategy[i], reach_opp,
+            reach_hero * traversal[i], reach_opp,
         );
     }
 
-    let node_value: f64 = strategy.iter()
+    // Node value under the traversal (explored) strategy.
+    let node_value: f64 = traversal.iter()
         .zip(&action_values[..num_actions])
         .map(|(s, v)| s * v)
         .sum();
 
-    // Accumulate regret deltas (unweighted; DCFR discounts after iteration)
+    // LCFR: weight both regret and strategy contributions by iteration number.
+    // Later iterations contribute more, so later (better) strategies dominate.
+    #[allow(clippy::cast_precision_loss)]
+    let weight = ctx.iteration as f64;
+
+    // Accumulate regret deltas (under explored strategy profile).
     for (i, val) in action_values[..num_actions].iter().enumerate() {
-        dr[slot_start + i] += reach_opp * (val - node_value);
+        dr[slot_start + i] += weight * reach_opp * (val - node_value);
     }
 
-    // Accumulate strategy deltas (unweighted; DCFR discounts existing sums
-    // multiplicatively before merge, so early iterations get washed out)
-    for (i, &s) in strategy.iter().enumerate() {
-        ds[slot_start + i] += reach_hero * s;
+    // Accumulate strategy deltas using the *intended* (non-explored) strategy.
+    // This keeps exploration noise out of the average strategy output.
+    for (i, &s) in intended.iter().enumerate() {
+        ds[slot_start + i] += weight * reach_hero * s;
     }
 
     node_value
