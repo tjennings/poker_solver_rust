@@ -1,5 +1,40 @@
 # Rust Project Guidelines
 
+## Build & Test
+
+```bash
+cargo test                                          # all tests
+cargo test -p poker-solver-core                     # core only
+cargo test -p poker-solver-trainer                  # trainer only
+cargo clippy                                        # lint (pedantic enabled in core)
+cargo run -p poker-solver-trainer --release -- <subcommand>  # always --release for training/diag
+```
+
+**Known timer failures** (pre-existing, not bugs): `cfr/vanilla`, `cfr/exploitability`, `blueprint/subgame_cfr`, `preflop/bundle`
+
+## Crate Map
+
+| Crate | Purpose |
+|-|-|
+| `core` | Game logic, CFR solvers, preflop, hand eval, abstractions |
+| `trainer` | CLI: training, diagnostics, deal generation |
+| `deep-cfr` | Neural network SD-CFR (candle) |
+| `gpu-cfr` | GPU sequence-form CFR (wgpu) |
+| `tauri-app` | Desktop GUI exploration app |
+| `devserver` | HTTP mirror of Tauri API for browser debugging |
+| `test-macros` | `#[timed_test]` proc macro |
+
+## Key Config Files
+
+- Training configs: `sample_configurations/*.yaml`
+- Agent configs: `agents/*.toml`
+
+## Internal Units & Conventions
+
+- SB=1, BB=2. `stack_depth` is in BB; stacks = `stack_depth * 2`
+- `Action::Bet(u32)` / `Action::Raise(u32)` store index into bet_sizes, not chip amounts
+- `ALL_IN = u32::MAX` sentinel for all-in actions
+
 ## Domain-Driven Design
 
 - Model the **domain** with types that reflect domain concepts
