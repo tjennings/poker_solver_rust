@@ -181,12 +181,12 @@ fn build_recursive(
 
         // At the last raise depth, only offer all-in (no sized raises)
         if !last_raise_depth {
-            let depth =
-                (state.raise_count as usize).min(config.raise_sizes.len().saturating_sub(1));
-            for &size in &config.raise_sizes[depth] {
-                let raise_amount = compute_raise_amount(state, size);
-                if raise_amount < player_stack {
-                    let child_state = apply_raise(state, position, raise_amount);
+            let depth = state.raise_count as usize;
+            for &size in config.raise_sizes_for(position, depth) {
+                let new_bet = compute_raise_amount(state, size);
+                let additional = new_bet.saturating_sub(state.invested[position as usize]);
+                if additional > 0 && additional < player_stack {
+                    let child_state = apply_raise(state, position, new_bet);
                     let child_idx = build_recursive(config, &child_state, nodes);
                     actions.push(PreflopAction::Raise(size));
                     child_indices.push(child_idx);
@@ -292,13 +292,11 @@ fn apply_call(state: &BuildState, position: u8, to_call: u32) -> BuildState {
     new_state
 }
 
-fn apply_raise(state: &BuildState, position: u8, raise_total: u32) -> BuildState {
+fn apply_raise(state: &BuildState, position: u8, new_bet_level: u32) -> BuildState {
     let mut new_state = state.clone();
-    let to_call = state
-        .current_bet
-        .saturating_sub(state.invested[position as usize]);
-    // Total new investment = call + raise above current bet
-    let additional = raise_total;
+    // new_bet_level is the target total investment (e.g. current_bet * multiplier).
+    // additional = chips player must add beyond current investment.
+    let additional = new_bet_level.saturating_sub(state.invested[position as usize]);
     let actual = additional.min(state.stacks[position as usize]);
     new_state.invested[position as usize] += actual;
     new_state.stacks[position as usize] -= actual;
@@ -306,7 +304,6 @@ fn apply_raise(state: &BuildState, position: u8, raise_total: u32) -> BuildState
     new_state.raise_count += 1;
     new_state.actions_since_last_raise = 1; // reset: raiser has acted
     new_state.to_act = next_player(position, state.num_players);
-    let _ = to_call;
     new_state
 }
 
@@ -494,6 +491,25 @@ mod tests {
                 (children[pos] as usize, pos)
             }
             other => panic!("Expected decision node at {}, got: {:?}", node_idx, other),
+        }
+    }
+
+    #[timed_test]
+    fn raise_amount_produces_correct_pot_sizes() {
+        // SB opens 2.5x BB: investment should be 5 (= 2 * 2.5), pot after BB fold = 7
+        let config = PreflopConfig::heads_up(100);
+        let tree = PreflopTree::build(&config);
+
+        // Find raise(2.5) child from root
+        let (raise_node, _) = find_action_child(&tree, 0, PreflopAction::Raise(2.5));
+
+        // BB folds after SB open → terminal pot should be SB(5) + BB(2) = 7
+        let (fold_node, _) = find_action_child(&tree, raise_node, PreflopAction::Fold);
+        match &tree.nodes[fold_node] {
+            PreflopNode::Terminal { pot, .. } => {
+                assert_eq!(*pot, 7, "After SB open 2.5x (to 5) + BB fold: pot should be 7");
+            }
+            other => panic!("Expected terminal, got: {:?}", other),
         }
     }
 
