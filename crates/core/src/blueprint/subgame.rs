@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::abstraction::{CardAbstraction, Street};
 use crate::game::Action;
-use crate::info_key::{canonical_hand_index, encode_action, InfoKey};
+use crate::info_key::{InfoKey, canonical_hand_index, encode_action};
 use crate::poker::Card;
 
 use super::{BlueprintError, BlueprintStrategy, CacheConfig, SubgameCache, SubgameKey};
@@ -229,13 +229,7 @@ mod tests {
             Card::new(Value::Ace, Suit::Spade),
             Card::new(Value::King, Suit::Heart),
         ];
-        let ak_key = InfoKey::new(
-            u32::from(canonical_hand_index(ak_holding)),
-            0,
-            0,
-            &[],
-        )
-        .as_u64();
+        let ak_key = InfoKey::new(u32::from(canonical_hand_index(ak_holding)), 0, 0, &[]).as_u64();
         strategy.insert(ak_key, vec![0.3, 0.5, 0.2]);
         // 42 (Four-Two offsuit) on flop with check-bet history
         let ft_holding = [
@@ -392,13 +386,7 @@ mod tests {
         let key = solver
             .make_info_set_key(board, holding, history)
             .expect("should create key");
-        let expected = InfoKey::new(
-            u32::from(canonical_hand_index(holding)),
-            0,
-            0,
-            &[],
-        )
-        .as_u64();
+        let expected = InfoKey::new(u32::from(canonical_hand_index(holding)), 0, 0, &[]).as_u64();
         assert_eq!(key, expected, "preflop key should match InfoKey encoding");
     }
 

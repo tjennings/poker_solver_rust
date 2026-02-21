@@ -69,7 +69,6 @@ fn suit_to_index(suit: Suit) -> usize {
     }
 }
 
-
 /// Compare two slices of values lexicographically by rank
 fn compare_value_slices(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
     for (va, vb) in a.iter().zip(b.iter()) {

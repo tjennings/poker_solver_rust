@@ -312,7 +312,10 @@ mod tests {
 
         let loaded = StrategyBundle::load(&bundle_path).expect("load should succeed");
         assert!(loaded.boundaries.is_none());
-        assert_eq!(loaded.config.abstraction_mode, AbstractionModeConfig::HandClassV2);
+        assert_eq!(
+            loaded.config.abstraction_mode,
+            AbstractionModeConfig::HandClassV2
+        );
     }
 
     #[timed_test]
@@ -372,8 +375,7 @@ mod tests {
     #[timed_test]
     fn bundle_config_defaults_to_2_players() {
         let yaml = "game:\n  stack_depth: 20\n  bet_sizes: [0.5]\n";
-        let config: BundleConfig = serde_yaml::from_str(yaml)
-            .expect("minimal YAML should parse");
+        let config: BundleConfig = serde_yaml::from_str(yaml).expect("minimal YAML should parse");
         assert_eq!(config.num_players, 2);
         assert!(!config.is_subgame_base);
     }

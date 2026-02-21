@@ -405,10 +405,7 @@ mod tests {
             .unwrap();
 
         // Different cards → different keys
-        assert_ne!(
-            game.info_set_key(&state_kj),
-            game.info_set_key(&state_qj),
-        );
+        assert_ne!(game.info_set_key(&state_kj), game.info_set_key(&state_qj),);
 
         // After check, P2's key should change
         let after_check = game.next_state(&state_kj, Action::Check);
@@ -419,10 +416,7 @@ mod tests {
 
         // After check + bet, P1's key should differ from root
         let after_bet = game.next_state(&after_check, Action::Bet(0));
-        assert_ne!(
-            game.info_set_key(&state_kj),
-            game.info_set_key(&after_bet),
-        );
+        assert_ne!(game.info_set_key(&state_kj), game.info_set_key(&after_bet),);
     }
 
     #[timed_test]

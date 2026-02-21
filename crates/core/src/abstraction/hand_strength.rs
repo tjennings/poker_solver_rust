@@ -104,16 +104,28 @@ impl EhsCounters {
     }
 
     /// Record a runout comparison result given the current-street comparison.
-    fn record_runout(&mut self, currently_ahead: bool, currently_behind: bool, our_rank: Rank, opp_rank: Rank) {
+    fn record_runout(
+        &mut self,
+        currently_ahead: bool,
+        currently_behind: bool,
+        our_rank: Rank,
+        opp_rank: Rank,
+    ) {
         let finally_ahead = our_rank > opp_rank;
         let tied_or_ahead = finally_ahead || our_rank == opp_rank;
 
         if currently_ahead {
-            if tied_or_ahead { self.ahead_stays_ahead += 1; }
-            else { self.ahead_falls_behind += 1; }
+            if tied_or_ahead {
+                self.ahead_stays_ahead += 1;
+            } else {
+                self.ahead_falls_behind += 1;
+            }
         } else if currently_behind {
-            if tied_or_ahead { self.behind_moves_ahead += 1; }
-            else { self.behind_stays_behind += 1; }
+            if tied_or_ahead {
+                self.behind_moves_ahead += 1;
+            } else {
+                self.behind_stays_behind += 1;
+            }
         }
     }
 
@@ -127,8 +139,16 @@ impl EhsCounters {
             0.5
         };
 
-        let ppot = compute_potential(self.behind_moves_ahead, self.behind_stays_behind, self.total_behind);
-        let npot = compute_potential(self.ahead_falls_behind, self.ahead_stays_ahead, self.total_ahead);
+        let ppot = compute_potential(
+            self.behind_moves_ahead,
+            self.behind_stays_behind,
+            self.total_behind,
+        );
+        let npot = compute_potential(
+            self.ahead_falls_behind,
+            self.ahead_stays_ahead,
+            self.total_ahead,
+        );
 
         HandStrength::new(ehs, ppot, npot)
     }
@@ -144,7 +164,11 @@ fn compute_potential(changed: u64, stayed: u64, category_total: u64) -> f32 {
         return 0.0;
     }
     let outcomes = changed + stayed;
-    if outcomes > 0 { changed as f32 / outcomes as f32 } else { 0.0 }
+    if outcomes > 0 {
+        changed as f32 / outcomes as f32
+    } else {
+        0.0
+    }
 }
 
 /// Build the live deck (all cards not in the dead set).
@@ -182,9 +206,13 @@ fn enumerate_flop_runouts(
     opp_hand.reserve(2);
 
     for (ti, &turn) in deck.iter().enumerate() {
-        if turn == opp1 || turn == opp2 { continue; }
+        if turn == opp1 || turn == opp2 {
+            continue;
+        }
         for &river in deck.iter().skip(ti + 1) {
-            if river == opp1 || river == opp2 { continue; }
+            if river == opp1 || river == opp2 {
+                continue;
+            }
 
             our_hand.push(turn);
             our_hand.push(river);
@@ -201,7 +229,6 @@ fn enumerate_flop_runouts(
             counters.record_runout(currently_ahead, currently_behind, our_rank, opp_rank);
         }
     }
-
 }
 
 /// Enumerate turn runouts (river only) and record potential transitions.
@@ -220,7 +247,9 @@ fn enumerate_turn_runouts(
     opp_hand.reserve(1);
 
     for &river in deck {
-        if river == opp1 || river == opp2 { continue; }
+        if river == opp1 || river == opp2 {
+            continue;
+        }
 
         our_hand.push(river);
         let our_rank = Hand::new_with_cards(our_hand.clone()).rank();
@@ -270,8 +299,14 @@ impl HandStrengthCalculator {
                 let currently_behind = our_rank < opp_rank;
 
                 enumerate_flop_runouts(
-                    &mut our_hand, &mut opp_hand, &deck, opp1, opp2,
-                    currently_ahead, currently_behind, &mut counters,
+                    &mut our_hand,
+                    &mut opp_hand,
+                    &deck,
+                    opp1,
+                    opp2,
+                    currently_ahead,
+                    currently_behind,
+                    &mut counters,
                 );
 
                 our_hand.truncate(board.len() + 2);
@@ -302,8 +337,14 @@ impl HandStrengthCalculator {
                 let currently_behind = our_rank < opp_rank;
 
                 enumerate_turn_runouts(
-                    &mut our_hand, &mut opp_hand, &deck, opp1, opp2,
-                    currently_ahead, currently_behind, &mut counters,
+                    &mut our_hand,
+                    &mut opp_hand,
+                    &deck,
+                    opp1,
+                    opp2,
+                    currently_ahead,
+                    currently_behind,
+                    &mut counters,
                 );
             }
         }

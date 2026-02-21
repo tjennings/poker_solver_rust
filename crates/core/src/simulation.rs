@@ -5,8 +5,8 @@
 //! in mbb/h (milli-big-blinds per hand).
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -30,7 +30,7 @@ use crate::agent::{AgentConfig, FrequencyMap};
 use crate::blueprint::{BlueprintStrategy, BundleConfig};
 use crate::hand_class::classify;
 use crate::hands::CanonicalHand;
-use crate::info_key::{canonical_hand_index, compute_hand_bits_v2, spr_bucket, InfoKey};
+use crate::info_key::{InfoKey, canonical_hand_index, compute_hand_bits_v2, spr_bucket};
 
 /// Progress update emitted during a simulation run.
 #[derive(Debug, Clone)]
@@ -446,18 +446,21 @@ pub fn run_simulation(
 /// In release builds, defaults to the first available cards (should never happen
 /// in a properly configured game).
 fn extract_hole_cards(hand: Hand, board: &[Card]) -> [Card; 2] {
-    let cards: Vec<Card> = hand
-        .iter()
-        .filter(|c| !board.contains(c))
-        .collect();
+    let cards: Vec<Card> = hand.iter().filter(|c| !board.contains(c)).collect();
     debug_assert!(
         cards.len() >= 2,
         "extract_hole_cards: expected >= 2 cards after board filter, got {}",
         cards.len()
     );
     [
-        cards.first().copied().unwrap_or(Card::new(Value::Two, Suit::Spade)),
-        cards.get(1).copied().unwrap_or(Card::new(Value::Three, Suit::Spade)),
+        cards
+            .first()
+            .copied()
+            .unwrap_or(Card::new(Value::Two, Suit::Spade)),
+        cards
+            .get(1)
+            .copied()
+            .unwrap_or(Card::new(Value::Three, Suit::Spade)),
     ]
 }
 
@@ -521,9 +524,8 @@ fn dealer_idx(game_state: &GameState) -> usize {
 /// the agent checks/calls instead of accidentally raising.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn sample_frequency(freq: &FrequencyMap, game_state: &GameState, r: f32) -> AgentAction {
-
-    let to_call = game_state.current_round_bet()
-        - game_state.round_data.player_bet[game_state.to_act_idx()];
+    let to_call =
+        game_state.current_round_bet() - game_state.round_data.player_bet[game_state.to_act_idx()];
     let can_fold = to_call > 0.0;
 
     // Compute effective probabilities (redistribute fold when unavailable)
@@ -583,9 +585,8 @@ fn sample_blueprint_action(
     bundle_config: &BundleConfig,
     r: f32,
 ) -> AgentAction {
-
-    let to_call = game_state.current_round_bet()
-        - game_state.round_data.player_bet[game_state.to_act_idx()];
+    let to_call =
+        game_state.current_round_bet() - game_state.round_data.player_bet[game_state.to_act_idx()];
     let can_fold = to_call > 0.0;
 
     // Action order matches HunlPostflop::actions():
@@ -638,13 +639,9 @@ fn sample_blueprint_action(
 /// Uses the same encoding as `encode_action` in `info_key`:
 /// 1=fold, 2=check, 3=call, 4-8=bet idx 0-4, 9-13=raise idx 0-4,
 /// 14=bet all-in, 15=raise all-in.
-fn agent_action_to_code(
-    action: &AgentAction,
-    game_state: &GameState,
-    bet_sizes: &[f32],
-) -> u8 {
-    let to_call = game_state.current_round_bet()
-        - game_state.round_data.player_bet[game_state.to_act_idx()];
+fn agent_action_to_code(action: &AgentAction, game_state: &GameState, bet_sizes: &[f32]) -> u8 {
+    let to_call =
+        game_state.current_round_bet() - game_state.round_data.player_bet[game_state.to_act_idx()];
     let is_bet = to_call <= 0.0;
 
     match action {
@@ -656,11 +653,7 @@ fn agent_action_to_code(
             let pot = game_state.total_pot;
             let current_bet = game_state.current_round_bet();
             let bet_portion = amount - current_bet;
-            let fraction = if pot > 0.0 {
-                bet_portion / pot
-            } else {
-                1.0
-            };
+            let fraction = if pot > 0.0 { bet_portion / pot } else { 1.0 };
 
             let closest_idx = bet_sizes
                 .iter()
@@ -681,7 +674,6 @@ fn agent_action_to_code(
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -815,8 +807,7 @@ raise = 0.1
         let agg_config = Arc::new(AgentConfig::from_toml(aggressive_toml).unwrap());
         let passive_config = Arc::new(AgentConfig::from_toml(passive_toml).unwrap());
 
-        let p1_gen: Box<dyn AgentGenerator> =
-            Box::new(RuleBasedAgentGenerator::new(agg_config));
+        let p1_gen: Box<dyn AgentGenerator> = Box::new(RuleBasedAgentGenerator::new(agg_config));
         let p2_gen: Box<dyn AgentGenerator> =
             Box::new(RuleBasedAgentGenerator::new(passive_config));
 
@@ -844,11 +835,11 @@ raise = 0.33
 
         let p1_gen: Box<dyn AgentGenerator> =
             Box::new(RuleBasedAgentGenerator::new(config.clone()));
-        let p2_gen: Box<dyn AgentGenerator> =
-            Box::new(RuleBasedAgentGenerator::new(config));
+        let p2_gen: Box<dyn AgentGenerator> = Box::new(RuleBasedAgentGenerator::new(config));
 
         let stop = AtomicBool::new(true); // Start already stopped
-        let result = run_simulation(p1_gen, p2_gen, 10000, 100, &stop, &[0.5, 1.0], |_| {}).unwrap();
+        let result =
+            run_simulation(p1_gen, p2_gen, 10000, 100, &stop, &[0.5, 1.0], |_| {}).unwrap();
 
         assert_eq!(result.hands_played, 0, "Should stop immediately");
     }
@@ -869,8 +860,7 @@ raise = 0.4
 
         let p1_gen: Box<dyn AgentGenerator> =
             Box::new(RuleBasedAgentGenerator::new(config.clone()));
-        let p2_gen: Box<dyn AgentGenerator> =
-            Box::new(RuleBasedAgentGenerator::new(config));
+        let p2_gen: Box<dyn AgentGenerator> = Box::new(RuleBasedAgentGenerator::new(config));
 
         let stop = AtomicBool::new(false);
         let mut progress_count = 0u32;
@@ -880,7 +870,10 @@ raise = 0.4
         .unwrap();
 
         assert_eq!(result.hands_played, 200);
-        assert!(!result.equity_curve.is_empty(), "Equity curve should have data");
+        assert!(
+            !result.equity_curve.is_empty(),
+            "Equity curve should have data"
+        );
         assert!(progress_count > 0, "Should have received progress updates");
     }
 

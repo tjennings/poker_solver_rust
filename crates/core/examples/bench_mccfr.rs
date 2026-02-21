@@ -28,7 +28,10 @@ fn main() {
         (3, 100, 1000)
     };
 
-    println!("=== MCCFR Micro-Benchmark{} ===", if long_mode { " (long)" } else { "" });
+    println!(
+        "=== MCCFR Micro-Benchmark{} ===",
+        if long_mode { " (long)" } else { "" }
+    );
     println!(
         "  Config: {} iters x {} samples, {} deals, stack_depth={}",
         iterations, samples, deal_count, config.stack_depth
@@ -38,7 +41,14 @@ fn main() {
 
     // Phase 1: Deal generation
     let t0 = Instant::now();
-    let game = HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
+    let game = HunlPostflop::new(
+        config,
+        Some(AbstractionMode::HandClassV2 {
+            strength_bits: 0,
+            equity_bits: 0,
+        }),
+        deal_count,
+    );
     let deal_time = t0.elapsed();
     println!("[deal generation]  {:?}", deal_time);
 
@@ -46,7 +56,11 @@ fn main() {
     let t1 = Instant::now();
     let _states = game.initial_states();
     let init_time = t1.elapsed();
-    println!("[initial_states]   {:?}  ({} deals)", init_time, _states.len());
+    println!(
+        "[initial_states]   {:?}  ({} deals)",
+        init_time,
+        _states.len()
+    );
 
     // Phase 3: MCCFR solver creation
     let mccfr_config = MccfrConfig {
@@ -70,10 +84,7 @@ fn main() {
     let strategies = solver.all_strategies();
     println!();
     println!("Info sets:  {}", strategies.len());
-    println!(
-        "Per iter:   {:?}",
-        train_time / iterations as u32,
-    );
+    println!("Per iter:   {:?}", train_time / iterations as u32,);
     println!(
         "Per sample: {:?}",
         train_time / (iterations as u32 * samples as u32),
@@ -88,7 +99,14 @@ fn main() {
         bet_sizes: vec![0.33, 0.67, 1.0, 2.0, 3.0],
         max_raises_per_street: 3,
     };
-    let par_game = HunlPostflop::new(par_config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
+    let par_game = HunlPostflop::new(
+        par_config,
+        Some(AbstractionMode::HandClassV2 {
+            strength_bits: 0,
+            equity_bits: 0,
+        }),
+        deal_count,
+    );
     let mut par_solver = MccfrSolver::with_config(par_game, &mccfr_config);
     par_solver.set_seed(42);
 
@@ -99,10 +117,7 @@ fn main() {
 
     let par_strategies = par_solver.all_strategies();
     println!("Info sets:  {}", par_strategies.len());
-    println!(
-        "Per iter:   {:?}",
-        par_time / iterations as u32,
-    );
+    println!("Per iter:   {:?}", par_time / iterations as u32,);
     println!(
         "Per sample: {:?}",
         par_time / (iterations as u32 * samples as u32),
@@ -117,8 +132,14 @@ fn main() {
         bet_sizes: vec![0.33, 0.67, 1.0, 2.0, 3.0],
         max_raises_per_street: 3,
     };
-    let prune_game =
-        HunlPostflop::new(prune_game_config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
+    let prune_game = HunlPostflop::new(
+        prune_game_config,
+        Some(AbstractionMode::HandClassV2 {
+            strength_bits: 0,
+            equity_bits: 0,
+        }),
+        deal_count,
+    );
     let prune_mccfr_config = MccfrConfig {
         samples_per_iteration: samples,
         pruning: true,

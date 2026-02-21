@@ -94,10 +94,7 @@ fn step1_preflop_solver_produces_valid_strategy() {
         for hand_idx in [0_usize, 84, 168] {
             let probs = strategy.get_probs(node_idx, hand_idx);
             if !probs.is_empty() {
-                assert_valid_distribution(
-                    &probs,
-                    &format!("node {node_idx} hand {hand_idx}"),
-                );
+                assert_valid_distribution(&probs, &format!("node {node_idx} hand {hand_idx}"));
             }
         }
     }
@@ -167,7 +164,11 @@ fn step3_subgame_full_enumeration_creates_correct_combo_count() {
     let board = river_board();
     let hands = SubgameHands::enumerate(&board);
     // C(47, 2) = 1081 combos for a 5-card board.
-    assert_eq!(hands.combos.len(), 1081, "river should have C(47,2) = 1081 combos");
+    assert_eq!(
+        hands.combos.len(),
+        1081,
+        "river should have C(47,2) = 1081 combos"
+    );
 }
 
 // -----------------------------------------------------------------------

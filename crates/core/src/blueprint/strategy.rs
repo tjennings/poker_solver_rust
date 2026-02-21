@@ -162,7 +162,9 @@ impl BlueprintStrategy {
                     0.0
                 } else {
                     #[allow(clippy::cast_precision_loss)]
-                    { 1.0 / num_actions as f64 }
+                    {
+                        1.0 / num_actions as f64
+                    }
                 }
             }
         }
@@ -177,7 +179,15 @@ impl BlueprintStrategy {
     #[must_use]
     pub fn opponent_reach_for_hand(&self, queries: &[ReachQuery]) -> f64 {
         queries.iter().fold(1.0, |reach, q| {
-            reach * self.action_probability(q.hand_bits, q.street, q.spr, &q.action_codes, q.action_index, q.num_actions)
+            reach
+                * self.action_probability(
+                    q.hand_bits,
+                    q.street,
+                    q.spr,
+                    &q.action_codes,
+                    q.action_index,
+                    q.num_actions,
+                )
         })
     }
 
@@ -236,7 +246,11 @@ impl BlueprintStrategy {
         let file = File::create(path)?;
         let writer = BufWriter::new(file);
         let wire = WireStrategy {
-            strategies: self.strategies.iter().map(|(&k, v)| (k, v.clone())).collect(),
+            strategies: self
+                .strategies
+                .iter()
+                .map(|(&k, v)| (k, v.clone()))
+                .collect(),
             iterations_trained: self.iterations_trained,
         };
         bincode::serialize_into(writer, &wire)
@@ -440,10 +454,7 @@ mod tests {
 
         let prob = bp.action_probability(42, 0, 15, &[], 1, 3);
 
-        assert!(
-            (prob - 0.5).abs() < 0.001,
-            "expected 0.5, got {prob}"
-        );
+        assert!((prob - 0.5).abs() < 0.001, "expected 0.5, got {prob}");
     }
 
     #[timed_test]
@@ -487,10 +498,7 @@ mod tests {
 
         let reach = bp.opponent_reach_for_hand(&queries);
 
-        assert!(
-            (reach - 0.5).abs() < 0.001,
-            "expected 0.5, got {reach}"
-        );
+        assert!((reach - 0.5).abs() < 0.001, "expected 0.5, got {reach}");
     }
 
     #[timed_test]

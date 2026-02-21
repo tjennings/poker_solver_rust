@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use super::config::PreflopConfig;
 use super::equity::EquityTable;
+use super::postflop_abstraction::PostflopAbstraction;
+use super::postflop_tree::PotType;
 use super::tree::{PreflopAction, PreflopNode, PreflopTree, TerminalType};
 
 const NUM_HANDS: usize = 169;
@@ -89,7 +91,10 @@ impl NodeLayout {
             entries.push((offset, num_actions));
             offset += NUM_HANDS * num_actions;
         }
-        Self { entries, total_size: offset }
+        Self {
+            entries,
+            total_size: offset,
+        }
     }
 
     /// Start index and action count for a `(node, hand)` pair.
@@ -98,7 +103,6 @@ impl NodeLayout {
         let (base, n) = self.entries[node_idx as usize];
         (base + (hand_idx as usize) * n, n)
     }
-
 }
 
 /// Immutable context shared across all traversals in one iteration.
@@ -113,6 +117,15 @@ struct Ctx<'a> {
     /// Current iteration number (1-based). Used for LCFR linear weighting
     /// of strategy contributions: `ds += iteration * reach * strategy`.
     iteration: u64,
+    /// Optional postflop abstraction for modeling postflop play at showdown terminals.
+    postflop: Option<&'a PostflopState>,
+}
+
+/// Postflop state: pre-solved value table + raise counts for pot-type classification.
+struct PostflopState {
+    abstraction: PostflopAbstraction,
+    /// Per-node raise counts for the preflop tree (to determine PotType).
+    raise_counts: Vec<u8>,
 }
 
 /// Preflop DCFR solver with alternating updates.
@@ -141,6 +154,8 @@ pub struct PreflopSolver {
     dcfr_warmup: u64,
     /// ε-greedy exploration factor.
     exploration: f64,
+    /// Optional postflop model state.
+    postflop: Option<PostflopState>,
 }
 
 impl PreflopSolver {
@@ -178,7 +193,20 @@ impl PreflopSolver {
             dcfr_gamma: config.dcfr_gamma,
             dcfr_warmup: config.dcfr_warmup,
             exploration: config.exploration,
+            postflop: None,
         }
+    }
+
+    /// Attach a precomputed postflop abstraction to improve showdown values.
+    ///
+    /// When attached, showdown terminals in the preflop tree will use postflop
+    /// CFR traversal instead of raw equity lookup.
+    pub fn attach_postflop(&mut self, abstraction: PostflopAbstraction) {
+        let raise_counts = precompute_raise_counts(&self.tree);
+        self.postflop = Some(PostflopState {
+            abstraction,
+            raise_counts,
+        });
     }
 
     /// Run `iterations` of DCFR training with alternating updates.
@@ -269,7 +297,9 @@ impl PreflopSolver {
         let neg_factor = t.powf(self.dcfr_beta) / (t.powf(self.dcfr_beta) + 1.0);
         for (node_idx, node) in self.tree.nodes.iter().enumerate() {
             let (position, num_actions) = match node {
-                PreflopNode::Decision { position, children, .. } => (*position, children.len()),
+                PreflopNode::Decision {
+                    position, children, ..
+                } => (*position, children.len()),
                 PreflopNode::Terminal { .. } => continue,
             };
             if position != hero_pos {
@@ -295,7 +325,9 @@ impl PreflopSolver {
     fn discount_strategy_sums(&mut self, hero_pos: u8, sd: f64) {
         for (node_idx, node) in self.tree.nodes.iter().enumerate() {
             let (position, num_actions) = match node {
-                PreflopNode::Decision { position, children, .. } => (*position, children.len()),
+                PreflopNode::Decision {
+                    position, children, ..
+                } => (*position, children.len()),
                 PreflopNode::Terminal { .. } => continue,
             };
             if position != hero_pos {
@@ -312,14 +344,10 @@ impl PreflopSolver {
     /// Single training iteration: snapshot regrets, parallel traverse, merge, discount.
     ///
     /// Uses **simultaneous updates**: both players traverse every iteration
-    /// using the same frozen regret snapshot.  This ensures all subtrees
-    /// receive regret signal regardless of the opponent's current strategy,
-    /// fixing off-path learning issues that plague alternating updates.
+    /// using the same frozen regret snapshot.
     #[allow(clippy::cast_precision_loss)]
     fn train_one_iteration(&mut self) {
         let snapshot = self.regret_sum.clone();
-        let buf_size = self.layout.total_size;
-        let sd = self.strategy_discount();
 
         let ctx = Ctx {
             tree: &self.tree,
@@ -329,46 +357,56 @@ impl PreflopSolver {
             snapshot: &snapshot,
             exploration: self.exploration,
             iteration: self.iteration,
+            postflop: self.postflop.as_ref(),
         };
 
-        // Parallel fold+reduce: each rayon task accumulates into its own
-        // flat buffer, then buffers are merged in a parallel reduction tree.
-        // Simultaneous updates: traverse for BOTH heroes each iteration.
-        let pairs = &self.pairs;
-        let (merged_regret, merged_strategy) = pairs
-            .par_iter()
-            .fold(
-                || (vec![0.0f64; buf_size], vec![0.0f64; buf_size]),
-                |(mut dr, mut ds), &(h1, h2)| {
-                    let w = ctx.equity.weight(h1 as usize, h2 as usize);
-                    // Traverse for both players using the same snapshot.
-                    for hero_pos in 0..2u8 {
-                        let (hh, oh) = if hero_pos == 0 { (h1, h2) } else { (h2, h1) };
-                        cfr_traverse(&ctx, &mut dr, &mut ds, 0, hh, oh, hero_pos, 1.0, w);
-                    }
-                    (dr, ds)
-                },
-            )
-            .reduce(
-                || (vec![0.0; buf_size], vec![0.0; buf_size]),
-                |(mut ar, mut a_s), (br, bs)| {
-                    add_into(&mut ar, &br);
-                    add_into(&mut a_s, &bs);
-                    (ar, a_s)
-                },
-            );
+        let (mr, ms) = parallel_traverse(&ctx, &self.pairs);
 
-        // DCFR: discount existing cumulative values BEFORE adding new deltas.
-        // With simultaneous updates, discount BOTH players each iteration.
+        self.apply_discounting();
+        add_into(&mut self.regret_sum, &mr);
+        add_into(&mut self.strategy_sum, &ms);
+    }
+
+    /// Apply DCFR discounting to both players' cumulative values.
+    fn apply_discounting(&mut self) {
         if self.iteration > self.dcfr_warmup {
+            let sd = self.strategy_discount();
             for pos in 0..2u8 {
                 self.discount_regrets(pos);
                 self.discount_strategy_sums(pos, sd);
             }
         }
-        add_into(&mut self.regret_sum, &merged_regret);
-        add_into(&mut self.strategy_sum, &merged_strategy);
     }
+}
+
+/// Parallel fold+reduce over all hand pairs, returning merged deltas.
+fn parallel_traverse(
+    ctx: &Ctx<'_>,
+    pairs: &[(u16, u16)],
+) -> (Vec<f64>, Vec<f64>) {
+    let buf_size = ctx.layout.total_size;
+
+    pairs
+        .par_iter()
+        .fold(
+            || (vec![0.0f64; buf_size], vec![0.0f64; buf_size]),
+            |(mut dr, mut ds), &(h1, h2)| {
+                let w = ctx.equity.weight(h1 as usize, h2 as usize);
+                for hero_pos in 0..2u8 {
+                    let (hh, oh) = if hero_pos == 0 { (h1, h2) } else { (h2, h1) };
+                    cfr_traverse(ctx, &mut dr, &mut ds, 0, hh, oh, hero_pos, 1.0, w);
+                }
+                (dr, ds)
+            },
+        )
+        .reduce(
+            || (vec![0.0; buf_size], vec![0.0; buf_size]),
+            |(mut ar, mut a_s), (br, bs)| {
+                add_into(&mut ar, &br);
+                add_into(&mut a_s, &bs);
+                (ar, a_s)
+            },
+        )
 }
 
 /// Element-wise `dst[i] += src[i]`.
@@ -383,7 +421,7 @@ fn add_into(dst: &mut [f64], src: &[f64]) {
 ///
 /// Reads strategy from `ctx.snapshot` (frozen for the iteration),
 /// writes regret and strategy deltas to flat `dr` / `ds` buffers.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
 fn cfr_traverse(
     ctx: &Ctx<'_>,
     dr: &mut [f64],
@@ -399,20 +437,36 @@ fn cfr_traverse(
     let hero_inv = f64::from(inv[hero_pos as usize]);
 
     match &ctx.tree.nodes[node_idx as usize] {
-        PreflopNode::Terminal { terminal_type, pot } => {
-            terminal_value(*terminal_type, *pot, hero_inv, hero_hand, opp_hand, hero_pos, ctx.equity)
-        }
-        PreflopNode::Decision { position, children, .. } => {
+        PreflopNode::Terminal { terminal_type, pot } => match terminal_type {
+            TerminalType::Showdown => {
+                if let Some(pf_state) = ctx.postflop {
+                    postflop_showdown_value(
+                        pf_state, node_idx, *pot, hero_inv,
+                        hero_hand, opp_hand, hero_pos,
+                    )
+                } else {
+                    terminal_value(
+                        *terminal_type, *pot, hero_inv,
+                        hero_hand, opp_hand, hero_pos, ctx.equity,
+                    )
+                }
+            }
+            TerminalType::Fold { .. } => terminal_value(
+                *terminal_type, *pot, hero_inv,
+                hero_hand, opp_hand, hero_pos, ctx.equity,
+            ),
+        },
+        PreflopNode::Decision {
+            position, children, ..
+        } => {
             let num_actions = children.len();
             let is_hero = *position == hero_pos;
             let hand_for_key = if is_hero { hero_hand } else { opp_hand };
             let (start, _) = ctx.layout.slot(node_idx, hand_for_key);
 
-            // Intended strategy from regret matching (used for strategy_sum output).
             let mut intended = [0.0f64; MAX_ACTIONS];
             regret_matching_into(ctx.snapshot, start, &mut intended[..num_actions]);
 
-            // Traversal strategy: blend with uniform for exploration.
             let mut traversal = intended;
             if ctx.exploration > 0.0 {
                 let eps = ctx.exploration;
@@ -425,15 +479,14 @@ fn cfr_traverse(
 
             if is_hero {
                 traverse_hero(
-                    ctx, dr, ds,
-                    start, hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                    children, &intended[..num_actions], &traversal[..num_actions],
+                    ctx, dr, ds, start, hero_hand, opp_hand, hero_pos,
+                    reach_hero, reach_opp, children,
+                    &intended[..num_actions], &traversal[..num_actions],
                 )
             } else {
                 traverse_opponent(
-                    ctx, dr, ds,
-                    hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                    children, &traversal[..num_actions],
+                    ctx, dr, ds, hero_hand, opp_hand, hero_pos,
+                    reach_hero, reach_opp, children, &traversal[..num_actions],
                 )
             }
         }
@@ -441,12 +494,7 @@ fn cfr_traverse(
 }
 
 /// Hero's decision: compute regrets and update strategy/regret deltas.
-///
-/// `intended` is the regret-matching strategy (accumulated into `strategy_sums`).
-/// `traversal` is the ε-explored strategy (used for subtree values and regrets).
-/// DCFR discounting is applied externally (multiplicative on existing sums
-/// before merge), so deltas here are unweighted.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
 fn traverse_hero(
     ctx: &Ctx<'_>,
     dr: &mut [f64],
@@ -465,30 +513,23 @@ fn traverse_hero(
     let mut action_values = [0.0f64; MAX_ACTIONS];
     for (i, &child_idx) in children.iter().enumerate() {
         action_values[i] = cfr_traverse(
-            ctx, dr, ds,
-            child_idx, hero_hand, opp_hand, hero_pos,
+            ctx, dr, ds, child_idx, hero_hand, opp_hand, hero_pos,
             reach_hero * traversal[i], reach_opp,
         );
     }
 
-    // Node value under the traversal (explored) strategy.
-    let node_value: f64 = traversal.iter()
+    let node_value: f64 = traversal
+        .iter()
         .zip(&action_values[..num_actions])
         .map(|(s, v)| s * v)
         .sum();
 
-    // LCFR: weight both regret and strategy contributions by iteration number.
-    // Later iterations contribute more, so later (better) strategies dominate.
     #[allow(clippy::cast_precision_loss)]
     let weight = ctx.iteration as f64;
 
-    // Accumulate regret deltas (under explored strategy profile).
     for (i, val) in action_values[..num_actions].iter().enumerate() {
         dr[slot_start + i] += weight * reach_opp * (val - node_value);
     }
-
-    // Accumulate strategy deltas using the *intended* (non-explored) strategy.
-    // This keeps exploration noise out of the average strategy output.
     for (i, &s) in intended.iter().enumerate() {
         ds[slot_start + i] += weight * reach_hero * s;
     }
@@ -497,7 +538,7 @@ fn traverse_hero(
 }
 
 /// Opponent's decision: traverse using opponent's strategy.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
 fn traverse_opponent(
     ctx: &Ctx<'_>,
     dr: &mut [f64],
@@ -513,8 +554,7 @@ fn traverse_opponent(
     let mut node_value = 0.0f64;
     for (i, &child_idx) in children.iter().enumerate() {
         let child_value = cfr_traverse(
-            ctx, dr, ds,
-            child_idx, hero_hand, opp_hand, hero_pos,
+            ctx, dr, ds, child_idx, hero_hand, opp_hand, hero_pos,
             reach_hero, reach_opp * strategy[i],
         );
         node_value += strategy[i] * child_value;
@@ -588,6 +628,68 @@ fn normalize(sums: &[f64]) -> Vec<f64> {
     }
 }
 
+/// Compute hero's EV at a preflop showdown terminal using the postflop model.
+///
+/// Determines the pot type from the precomputed raise count, maps hands to
+/// flop buckets for the first texture, then runs postflop CFR traversal.
+/// Returns EV in the same units as `terminal_value` (chips relative to start).
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
+/// Look up pre-solved postflop EV from the value table.
+fn postflop_showdown_value(
+    pf_state: &PostflopState,
+    preflop_node_idx: u32,
+    pot: u32,
+    hero_inv: f64,
+    hero_hand: u16,
+    opp_hand: u16,
+    hero_pos: u8,
+) -> f64 {
+    let raise_count = pf_state.raise_counts[preflop_node_idx as usize];
+    let pot_type = PotType::from_raise_count(raise_count);
+
+    // Map preflop hand indices to flop buckets (texture 0 as representative).
+    let hero_bucket = pf_state.abstraction.buckets.flop_buckets
+        .get(hero_hand as usize)
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0);
+    let opp_bucket = pf_state.abstraction.buckets.flop_buckets
+        .get(opp_hand as usize)
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0);
+
+    let pf_ev_frac = pf_state.abstraction.values.get(pot_type, hero_pos, hero_bucket, opp_bucket);
+
+    // Scale: postflop EV fraction × actual pot size, offset by hero's investment.
+    pf_ev_frac * f64::from(pot) + (f64::from(pot) / 2.0 - hero_inv)
+}
+
+/// Precompute the raise count at every node in the preflop tree.
+///
+/// Walks from root, counting `Raise`/`AllIn` actions along each path.
+fn precompute_raise_counts(tree: &PreflopTree) -> Vec<u8> {
+    let mut counts = vec![0u8; tree.nodes.len()];
+    fill_raise_counts(tree, 0, 0, &mut counts);
+    counts
+}
+
+fn fill_raise_counts(tree: &PreflopTree, node_idx: u32, count: u8, out: &mut [u8]) {
+    out[node_idx as usize] = count;
+    if let PreflopNode::Decision {
+        children,
+        action_labels,
+        ..
+    } = &tree.nodes[node_idx as usize]
+    {
+        for (&child, action) in children.iter().zip(action_labels) {
+            let child_count = match action {
+                PreflopAction::Raise(_) | PreflopAction::AllIn => count + 1,
+                _ => count,
+            };
+            fill_raise_counts(tree, child, child_count, out);
+        }
+    }
+}
+
 /// Precompute per-player investments at every node in the tree.
 ///
 /// Walks the tree from the root, tracking how much each player has committed.
@@ -611,17 +713,14 @@ fn precompute_investments(tree: &PreflopTree, config: &PreflopConfig) -> NodeInv
 }
 
 /// Recursively fill investment data for all children of a decision node.
-fn fill_investments(
-    tree: &PreflopTree,
-    node_idx: u32,
-    inv: [u32; 2],
-    out: &mut NodeInvestments,
-) {
+fn fill_investments(tree: &PreflopTree, node_idx: u32, inv: [u32; 2], out: &mut NodeInvestments) {
     let node = &tree.nodes[node_idx as usize];
     let (position, children, action_labels) = match node {
-        PreflopNode::Decision { position, children, action_labels } => {
-            (*position, children.as_slice(), action_labels.as_slice())
-        }
+        PreflopNode::Decision {
+            position,
+            children,
+            action_labels,
+        } => (*position, children.as_slice(), action_labels.as_slice()),
         PreflopNode::Terminal { .. } => return,
     };
 
@@ -675,7 +774,11 @@ fn compute_child_investment(
 fn first_terminal_pot(tree: &PreflopTree, node_idx: u32) -> u32 {
     match &tree.nodes[node_idx as usize] {
         PreflopNode::Terminal { pot, .. } => *pot,
-        PreflopNode::Decision { children, action_labels, .. } => {
+        PreflopNode::Decision {
+            children,
+            action_labels,
+            ..
+        } => {
             // A fold terminal gives us the pot with no further investment changes
             for (i, action) in action_labels.iter().enumerate() {
                 if matches!(action, PreflopAction::Fold)
@@ -736,10 +839,7 @@ mod tests {
                 continue;
             }
             let sum: f64 = probs.iter().sum();
-            assert!(
-                (sum - 1.0).abs() < 0.01,
-                "hand {hand_idx}: sum = {sum}"
-            );
+            assert!((sum - 1.0).abs() < 0.01, "hand {hand_idx}: sum = {sum}");
         }
     }
 
@@ -774,9 +874,9 @@ mod tests {
         // Find the root node's layout slot (position=0)
         let (base, _) = solver.layout.slot(0, 0);
         if solver.regret_sum.len() > base + 2 {
-            solver.regret_sum[base] = 10.0;      // positive
-            solver.regret_sum[base + 1] = -5.0;  // negative
-            solver.regret_sum[base + 2] = 0.0;   // zero
+            solver.regret_sum[base] = 10.0; // positive
+            solver.regret_sum[base + 1] = -5.0; // negative
+            solver.regret_sum[base + 2] = 0.0; // zero
             solver.iteration = 5;
             // Discount hero_pos=0 (root node position is 0)
             solver.discount_regrets(0);
@@ -797,7 +897,10 @@ mod tests {
         solver.iteration = 10;
         let sd = solver.strategy_discount();
         let expected = (10.0_f64 / 11.0).powf(2.0);
-        assert!((sd - expected).abs() < 1e-10, "sd={sd}, expected={expected}");
+        assert!(
+            (sd - expected).abs() < 1e-10,
+            "sd={sd}, expected={expected}"
+        );
     }
 
     #[timed_test]
@@ -815,7 +918,8 @@ mod tests {
 
         // Both iterations should produce non-trivial changes
         let changed_1: usize = regrets_after_1.iter().filter(|&&r| r.abs() > 1e-15).count();
-        let changed_2: usize = regrets_after_2.iter()
+        let changed_2: usize = regrets_after_2
+            .iter()
             .zip(&regrets_after_1)
             .filter(|&(a, b)| (a - b).abs() > 1e-15)
             .count();
@@ -838,8 +942,15 @@ mod tests {
         let tree = PreflopTree::build(&config);
         let inv = precompute_investments(&tree, &config);
         // SB folds: investments unchanged from root
-        if let PreflopNode::Decision { children, action_labels, .. } = &tree.nodes[0] {
-            let fold_idx = action_labels.iter().position(|a| matches!(a, PreflopAction::Fold));
+        if let PreflopNode::Decision {
+            children,
+            action_labels,
+            ..
+        } = &tree.nodes[0]
+        {
+            let fold_idx = action_labels
+                .iter()
+                .position(|a| matches!(a, PreflopAction::Fold));
             if let Some(fi) = fold_idx {
                 let child = children[fi] as usize;
                 assert_eq!(inv[child], [1, 2], "fold should not change investments");
@@ -853,8 +964,15 @@ mod tests {
         let tree = PreflopTree::build(&config);
         let inv = precompute_investments(&tree, &config);
         // SB calls (limps): SB inv goes from 1 to 2
-        if let PreflopNode::Decision { children, action_labels, .. } = &tree.nodes[0] {
-            let call_idx = action_labels.iter().position(|a| matches!(a, PreflopAction::Call));
+        if let PreflopNode::Decision {
+            children,
+            action_labels,
+            ..
+        } = &tree.nodes[0]
+        {
+            let call_idx = action_labels
+                .iter()
+                .position(|a| matches!(a, PreflopAction::Call));
             if let Some(ci) = call_idx {
                 let child = children[ci] as usize;
                 assert_eq!(inv[child], [2, 2], "after SB limps, both invested 2");

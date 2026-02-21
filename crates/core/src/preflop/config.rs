@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::postflop_model::PostflopModelConfig;
+
 fn default_exploration() -> f64 {
     0.05
 }
@@ -50,6 +52,14 @@ pub struct PreflopConfig {
     /// Set to 0.0 for pure regret matching.  Typical value: 0.05.
     #[serde(default = "default_exploration")]
     pub exploration: f64,
+    /// Optional postflop model for equity realization.
+    ///
+    /// When `None`, showdown terminals use raw hand equity (current behaviour).
+    /// When `Some`, each preflop showdown terminal is replaced by a sampled
+    /// abstracted postflop subtree, allowing the solver to discover equity
+    /// realization endogenously.
+    #[serde(default)]
+    pub postflop_model: Option<PostflopModelConfig>,
 }
 
 impl PreflopConfig {
@@ -59,8 +69,14 @@ impl PreflopConfig {
         let stacks_internal = stack_depth_bb * 2;
         Self {
             positions: vec![
-                PositionInfo { name: "Small Blind".into(), short_name: "SB".into() },
-                PositionInfo { name: "Big Blind".into(), short_name: "BB".into() },
+                PositionInfo {
+                    name: "Small Blind".into(),
+                    short_name: "SB".into(),
+                },
+                PositionInfo {
+                    name: "Big Blind".into(),
+                    short_name: "BB".into(),
+                },
             ],
             blinds: vec![(0, 1), (1, 2)],
             antes: vec![],
@@ -73,6 +89,7 @@ impl PreflopConfig {
             dcfr_gamma: 2.0,
             dcfr_warmup: 0,
             exploration: 0.05,
+            postflop_model: None,
         }
     }
 
@@ -82,12 +99,30 @@ impl PreflopConfig {
         let stacks_internal = stack_depth_bb * 2;
         Self {
             positions: vec![
-                PositionInfo { name: "Under the Gun".into(), short_name: "UTG".into() },
-                PositionInfo { name: "Hijack".into(), short_name: "HJ".into() },
-                PositionInfo { name: "Cutoff".into(), short_name: "CO".into() },
-                PositionInfo { name: "Button".into(), short_name: "BTN".into() },
-                PositionInfo { name: "Small Blind".into(), short_name: "SB".into() },
-                PositionInfo { name: "Big Blind".into(), short_name: "BB".into() },
+                PositionInfo {
+                    name: "Under the Gun".into(),
+                    short_name: "UTG".into(),
+                },
+                PositionInfo {
+                    name: "Hijack".into(),
+                    short_name: "HJ".into(),
+                },
+                PositionInfo {
+                    name: "Cutoff".into(),
+                    short_name: "CO".into(),
+                },
+                PositionInfo {
+                    name: "Button".into(),
+                    short_name: "BTN".into(),
+                },
+                PositionInfo {
+                    name: "Small Blind".into(),
+                    short_name: "SB".into(),
+                },
+                PositionInfo {
+                    name: "Big Blind".into(),
+                    short_name: "BB".into(),
+                },
             ],
             blinds: vec![(4, 1), (5, 2)],
             antes: vec![],
@@ -100,6 +135,7 @@ impl PreflopConfig {
             dcfr_gamma: 2.0,
             dcfr_warmup: 0,
             exploration: 0.05,
+            postflop_model: None,
         }
     }
 

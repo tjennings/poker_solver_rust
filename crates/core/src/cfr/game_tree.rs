@@ -17,7 +17,7 @@
 
 use arrayvec::ArrayVec;
 
-use crate::game::{Game, Player, Action, MAX_ACTIONS};
+use crate::game::{Action, Game, MAX_ACTIONS, Player};
 use crate::info_key::{self, InfoKey};
 
 /// A node in the materialized game tree.
@@ -97,10 +97,16 @@ impl std::fmt::Display for TreeStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Tree Statistics:")?;
         writeln!(f, "  Total nodes:      {}", self.total_nodes)?;
-        writeln!(f, "  Decision nodes:   {} (P1: {}, P2: {})",
-            self.decision_nodes, self.p1_decision_nodes, self.p2_decision_nodes)?;
-        writeln!(f, "  Terminal nodes:   {} (fold: {}, showdown: {})",
-            self.terminal_nodes, self.fold_terminals, self.showdown_terminals)?;
+        writeln!(
+            f,
+            "  Decision nodes:   {} (P1: {}, P2: {})",
+            self.decision_nodes, self.p1_decision_nodes, self.p2_decision_nodes
+        )?;
+        writeln!(
+            f,
+            "  Terminal nodes:   {} (fold: {}, showdown: {})",
+            self.terminal_nodes, self.fold_terminals, self.showdown_terminals
+        )?;
         writeln!(f, "  Max depth:        {}", self.max_depth)?;
         let bytes = self.total_nodes as usize * std::mem::size_of::<TreeNode>();
         #[allow(clippy::cast_precision_loss)]
@@ -121,13 +127,27 @@ pub fn materialize<G: Game>(game: &G, root_state: &G::State) -> GameTree {
 
     // DFS stack: (state, node_index, depth)
     // We first create a placeholder node, then fill in children during DFS
-    build_recursive(game, root_state, u32::MAX, Action::Check, 0,
-        &mut nodes, &mut levels, &mut stats);
+    build_recursive(
+        game,
+        root_state,
+        u32::MAX,
+        Action::Check,
+        0,
+        &mut nodes,
+        &mut levels,
+        &mut stats,
+    );
 
     #[allow(clippy::cast_possible_truncation)]
-    { stats.total_nodes = nodes.len() as u32; }
+    {
+        stats.total_nodes = nodes.len() as u32;
+    }
 
-    GameTree { nodes, levels, stats }
+    GameTree {
+        nodes,
+        levels,
+        stats,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -156,10 +176,19 @@ fn build_recursive<G: Game>(
 
     if game.is_terminal(state) {
         let is_fold = action_from_parent == Action::Fold;
-        let fold_player = if is_fold { game.player(state) } else { Player::Player1 };
+        let fold_player = if is_fold {
+            game.player(state)
+        } else {
+            Player::Player1
+        };
         let utility_p1 = game.utility(state, Player::Player1);
         let node = make_terminal_node_generic(
-            is_fold, fold_player, parent, action_from_parent, depth, utility_p1,
+            is_fold,
+            fold_player,
+            parent,
+            action_from_parent,
+            depth,
+            utility_p1,
         );
         update_terminal_stats(tree_stats, &node.node_type);
         nodes.push(node);
@@ -177,8 +206,14 @@ fn build_recursive<G: Game>(
     for &action in &actions {
         let child_state = game.next_state(state, action);
         let child_idx = build_recursive(
-            game, &child_state, node_idx, action, depth + 1,
-            nodes, levels, tree_stats,
+            game,
+            &child_state,
+            node_idx,
+            action,
+            depth + 1,
+            nodes,
+            levels,
+            tree_stats,
         );
         child_indices.push(child_idx);
     }
@@ -288,14 +323,26 @@ pub fn materialize_postflop(
     let mut stats = TreeStats::default();
 
     build_postflop_recursive(
-        game, root_state, u32::MAX, Action::Check, 0,
-        &mut nodes, &mut levels, &mut stats,
+        game,
+        root_state,
+        u32::MAX,
+        Action::Check,
+        0,
+        &mut nodes,
+        &mut levels,
+        &mut stats,
     );
 
     #[allow(clippy::cast_possible_truncation)]
-    { stats.total_nodes = nodes.len() as u32; }
+    {
+        stats.total_nodes = nodes.len() as u32;
+    }
 
-    GameTree { nodes, levels, stats }
+    GameTree {
+        nodes,
+        levels,
+        stats,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,8 +386,14 @@ fn build_postflop_recursive(
     for &action in &actions {
         let child_state = game.next_state(state, action);
         let child_idx = build_postflop_recursive(
-            game, &child_state, node_idx, action, depth + 1,
-            nodes, levels, tree_stats,
+            game,
+            &child_state,
+            node_idx,
+            action,
+            depth + 1,
+            nodes,
+            levels,
+            tree_stats,
         );
         child_indices.push(child_idx);
     }
@@ -435,10 +488,12 @@ impl GameTree {
     pub fn info_set_key(&self, node_idx: u32, hand_bits: u32) -> u64 {
         let node = &self.nodes[node_idx as usize];
         match &node.node_type {
-            NodeType::Decision { street, spr_bucket, street_action_codes, .. } => {
-                InfoKey::new(hand_bits, *street, *spr_bucket, street_action_codes)
-                    .as_u64()
-            }
+            NodeType::Decision {
+                street,
+                spr_bucket,
+                street_action_codes,
+                ..
+            } => InfoKey::new(hand_bits, *street, *spr_bucket, street_action_codes).as_u64(),
             NodeType::Terminal { .. } => 0,
         }
     }
@@ -458,13 +513,17 @@ impl GameTree {
         let node = &self.nodes[node_idx as usize];
         match &node.node_type {
             NodeType::Terminal {
-                is_fold, fold_player, stacks, starting_stack,
-                utility_p1_wins, utility_p1_loses, ..
+                is_fold,
+                fold_player,
+                stacks,
+                starting_stack,
+                utility_p1_wins,
+                utility_p1_loses,
+                ..
             } => {
                 // Generic tree: use pre-computed utilities
                 if *starting_stack == 0 {
-                    return p1_equity * utility_p1_wins
-                        + (1.0 - p1_equity) * utility_p1_loses;
+                    return p1_equity * utility_p1_wins + (1.0 - p1_equity) * utility_p1_loses;
                 }
 
                 // Postflop tree: compute from pot/stacks
@@ -498,9 +557,14 @@ impl GameTree {
 
         let mut seen = HashSet::new();
         for node in &self.nodes {
-            if let NodeType::Decision { street, spr_bucket, street_action_codes, .. } = &node.node_type {
-                let key = InfoKey::new(0, *street, *spr_bucket, street_action_codes)
-                    .as_u64();
+            if let NodeType::Decision {
+                street,
+                spr_bucket,
+                street_action_codes,
+                ..
+            } = &node.node_type
+            {
+                let key = InfoKey::new(0, *street, *spr_bucket, street_action_codes).as_u64();
                 seen.insert(key);
             }
         }
@@ -567,8 +631,14 @@ mod tests {
         // So yes, 4 decision nodes.
 
         assert_eq!(tree.stats.total_nodes, 9, "Kuhn tree should have 9 nodes");
-        assert_eq!(tree.stats.decision_nodes, 4, "Kuhn tree should have 4 decision nodes");
-        assert_eq!(tree.stats.terminal_nodes, 5, "Kuhn tree should have 5 terminal nodes");
+        assert_eq!(
+            tree.stats.decision_nodes, 4,
+            "Kuhn tree should have 4 decision nodes"
+        );
+        assert_eq!(
+            tree.stats.terminal_nodes, 5,
+            "Kuhn tree should have 5 terminal nodes"
+        );
     }
 
     #[timed_test]
@@ -599,7 +669,11 @@ mod tests {
         let states = game.initial_states();
         let tree = materialize(&game, &states[0]);
 
-        assert_eq!(tree.nodes[0].children.len(), 2, "Root should have 2 children (Check, Bet)");
+        assert_eq!(
+            tree.nodes[0].children.len(),
+            2,
+            "Root should have 2 children (Check, Bet)"
+        );
     }
 
     #[timed_test]
@@ -723,10 +797,15 @@ mod tests {
         // Root should be P1 decision at preflop
         let root = &tree.nodes[0];
         match &root.node_type {
-            NodeType::Decision { player, street, pot, .. } => {
+            NodeType::Decision {
+                player,
+                street,
+                pot,
+                ..
+            } => {
                 assert_eq!(*player, Player::Player1);
                 assert_eq!(*street, 0); // preflop
-                assert_eq!(*pot, 3);    // SB(1) + BB(2)
+                assert_eq!(*pot, 3); // SB(1) + BB(2)
             }
             _ => panic!("Root should be a decision node"),
         }
@@ -749,7 +828,8 @@ mod tests {
         // First child of root should be Fold if to_call > 0
         let root_children = &tree.nodes[0].children;
         // Find the fold child
-        let fold_child_idx = root_children.iter()
+        let fold_child_idx = root_children
+            .iter()
             .find(|&&idx| tree.nodes[idx as usize].action_from_parent == Action::Fold);
 
         if let Some(&fold_idx) = fold_child_idx {
@@ -764,14 +844,21 @@ mod tests {
 
     #[timed_test]
     fn info_set_key_from_tree_matches_game() {
-        use crate::game::{HunlPostflop, PostflopConfig, AbstractionMode};
+        use crate::game::{AbstractionMode, HunlPostflop, PostflopConfig};
 
         let config = PostflopConfig {
             stack_depth: 25,
             bet_sizes: vec![1.0],
             max_raises_per_street: 2,
         };
-        let game = HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 1);
+        let game = HunlPostflop::new(
+            config,
+            Some(AbstractionMode::HandClassV2 {
+                strength_bits: 0,
+                equity_bits: 0,
+            }),
+            1,
+        );
         let deals = game.initial_states();
         let tree = materialize_postflop(&game, &deals[0]);
 

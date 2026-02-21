@@ -84,7 +84,10 @@ mod tests {
             msg.contains("Information set not found"),
             "should contain error type"
         );
-        assert!(msg.contains("deadbeefcafe"), "should contain hex key: {msg}");
+        assert!(
+            msg.contains("deadbeefcafe"),
+            "should contain hex key: {msg}"
+        );
     }
 
     #[timed_test]

@@ -243,7 +243,10 @@ mod tests {
         let weights = compute_card_removal_weights();
         let aa = CH::parse("AA").unwrap().index();
         let aks = CH::parse("AKs").unwrap().index();
-        assert_eq!(weights[aa][aks], 12.0, "AA vs AKs: shared ace reduces combos");
+        assert_eq!(
+            weights[aa][aks], 12.0,
+            "AA vs AKs: shared ace reduces combos"
+        );
     }
 
     #[timed_test]

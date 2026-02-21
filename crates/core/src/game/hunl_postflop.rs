@@ -16,7 +16,7 @@ use crate::hand_class::{HandClass, HandClassification, classify, intra_class_str
 use crate::poker::{Card, Rank, Suit, Value};
 use crate::showdown_equity;
 
-use super::{Action, Actions, Game, Player, ALL_IN};
+use super::{ALL_IN, Action, Actions, Game, Player};
 
 /// Selects which card abstraction to use for postflop info-set keys.
 #[derive(Debug, Clone)]
@@ -151,10 +151,10 @@ impl PostflopState {
             p2_holding,
             full_board: None,
             street: Street::Preflop,
-            pot: 3,                                    // SB (1) + BB (2) in internal units
-            stacks: [stack - 1, stack - 2],            // SB posted 1, BB posted 2
-            to_call: 1,                                        // SB needs 1 more to match BB
-            to_act: Some(Player::Player1),                     // SB acts first preflop
+            pot: 3,                         // SB (1) + BB (2) in internal units
+            stacks: [stack - 1, stack - 2], // SB posted 1, BB posted 2
+            to_call: 1,                     // SB needs 1 more to match BB
+            to_act: Some(Player::Player1),  // SB acts first preflop
             history: ArrayVec::new(),
             terminal: None,
             street_bets: 1, // BB's post counts as first bet
@@ -169,7 +169,10 @@ impl PostflopState {
     /// In release builds, defaults to `Player1` to avoid UB.
     #[must_use]
     pub fn active_player(&self) -> Player {
-        debug_assert!(self.to_act.is_some(), "active_player called on terminal state");
+        debug_assert!(
+            self.to_act.is_some(),
+            "active_player called on terminal state"
+        );
         // Infallible on non-terminal states; to_act is always Some when
         // terminal is None (invariant maintained by apply_fold/advance_street).
         self.to_act.unwrap_or(Player::Player1)
@@ -233,11 +236,7 @@ impl PostflopState {
         let Some(full_board) = self.full_board else {
             return;
         };
-        let board_slices: [&[Card]; 3] = [
-            &full_board[..3],
-            &full_board[..4],
-            &full_board[..5],
-        ];
+        let board_slices: [&[Card]; 3] = [&full_board[..3], &full_board[..4], &full_board[..5]];
         for (i, board) in board_slices.iter().enumerate() {
             self.p1_cache.equity[i] = precompute_equity_bin(self.p1_holding, board);
             self.p2_cache.equity[i] = precompute_equity_bin(self.p2_holding, board);
@@ -802,7 +801,11 @@ impl FlopSampler {
         let dist = WeightedIndex::new(&weights)
             .expect("canonical flops are non-empty with positive weights");
         let deck = crate::poker::full_deck();
-        Self { canonical_flops, dist, deck }
+        Self {
+            canonical_flops,
+            dist,
+            deck,
+        }
     }
 
     fn sample_deal(&self, rng: &mut rand::rngs::StdRng, stack_depth: u32) -> PostflopState {
@@ -812,7 +815,8 @@ impl FlopSampler {
         let flop = &self.canonical_flops[self.dist.sample(rng)];
         let flop_cards = *flop.cards();
 
-        let mut remaining: Vec<Card> = self.deck
+        let mut remaining: Vec<Card> = self
+            .deck
             .iter()
             .filter(|c| !flop_cards.contains(c))
             .copied()
@@ -821,7 +825,13 @@ impl FlopSampler {
 
         let p1 = [remaining[0], remaining[1]];
         let p2 = [remaining[2], remaining[3]];
-        let board = [flop_cards[0], flop_cards[1], flop_cards[2], remaining[4], remaining[5]];
+        let board = [
+            flop_cards[0],
+            flop_cards[1],
+            flop_cards[2],
+            remaining[4],
+            remaining[5],
+        ];
 
         PostflopState::new_preflop_with_board(p1, p2, board, stack_depth)
     }
@@ -907,9 +917,8 @@ fn update_coverage(coverage: &mut [usize; HandClass::COUNT], deal_classes: u32) 
 fn print_coverage_summary(coverage: &[usize; HandClass::COUNT]) {
     use crate::hand_class::HandClass;
     let labels = [
-        "SF", "4K", "FH", "Fl", "St", "Se", "Tr",
-        "2P", "OP", "Pr", "UP", "OC", "HC",
-        "CD", "FD", "BF", "OS", "GS", "BD",
+        "SF", "4K", "FH", "Fl", "St", "Se", "Tr", "2P", "OP", "Pr", "UP", "OC", "HC", "CD", "FD",
+        "BF", "OS", "GS", "BD",
     ];
     let parts: Vec<String> = (0..HandClass::COUNT)
         .filter(|&i| i < HandClass::NUM_MADE)
@@ -984,8 +993,7 @@ fn generate_deals_for_flop(
         .collect();
     debug_assert_eq!(remaining.len(), 49);
 
-    let flop_seed = base_seed
-        .wrapping_add((flop_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let flop_seed = base_seed.wrapping_add((flop_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let mut rng = StdRng::seed_from_u64(flop_seed);
     let mut deals = Vec::with_capacity(C49_2);
 
@@ -1011,7 +1019,13 @@ fn generate_deals_for_flop(
         }
 
         let p2 = [pool[0], pool[1]];
-        let board = [flop_cards[0], flop_cards[1], flop_cards[2], pool[2], pool[3]];
+        let board = [
+            flop_cards[0],
+            flop_cards[1],
+            flop_cards[2],
+            pool[2],
+            pool[3],
+        ];
         deals.push(PostflopState::new_preflop_with_board(
             p1,
             p2,
@@ -1050,9 +1064,14 @@ impl Game for HunlPostflop {
 
         // Precompute equity bins and strength for HandClassV2 mode
         if matches!(&self.abstraction, Some(AbstractionMode::HandClassV2 { .. })) {
-            println!("Precomputing equity bins and strength for {} deals...", deals.len());
+            println!(
+                "Precomputing equity bins and strength for {} deals...",
+                deals.len()
+            );
             let precomp_start = std::time::Instant::now();
-            deals.par_iter_mut().for_each(PostflopState::precompute_v2_caches);
+            deals
+                .par_iter_mut()
+                .for_each(PostflopState::precompute_v2_caches);
             println!("  Precomputation complete in {:?}", precomp_start.elapsed());
         }
 
@@ -1148,11 +1167,17 @@ impl Game for HunlPostflop {
             TerminalType::Showdown => compute_showdown_payoff(state, p1_invested, p2_invested),
         };
 
-        if player == Player::Player1 { p1_ev } else { -p1_ev }
+        if player == Player::Player1 {
+            p1_ev
+        } else {
+            -p1_ev
+        }
     }
 
     fn info_set_key(&self, state: &Self::State) -> u64 {
-        use crate::info_key::{InfoKey, canonical_hand_index, compute_hand_bits_v2, encode_hand_v2, spr_bucket};
+        use crate::info_key::{
+            InfoKey, canonical_hand_index, compute_hand_bits_v2, encode_hand_v2, spr_bucket,
+        };
 
         let holding = state.current_holding();
 
@@ -1164,11 +1189,16 @@ impl Game for HunlPostflop {
                     Err(_) => 0,
                 }
             }
-            Some(AbstractionMode::HandClassV2 { strength_bits, equity_bits })
-                if !state.board.is_empty() =>
-            {
+            Some(AbstractionMode::HandClassV2 {
+                strength_bits,
+                equity_bits,
+            }) if !state.board.is_empty() => {
                 let is_p2 = state.to_act == Some(Player::Player2);
-                let cache = if is_p2 { &state.p2_cache } else { &state.p1_cache };
+                let cache = if is_p2 {
+                    &state.p2_cache
+                } else {
+                    &state.p1_cache
+                };
 
                 if let Some(classification) = cache.class {
                     // Fast path: use precomputed values from deal-time caching
@@ -1401,8 +1431,8 @@ mod tests {
         let (p1, p2) = sample_holdings();
 
         let state_50bb = PostflopState::new_preflop(p1, p2, 50);
-        assert_eq!(state_50bb.stacks[0], 99);  // 50*2 - 1
-        assert_eq!(state_50bb.stacks[1], 98);  // 50*2 - 2
+        assert_eq!(state_50bb.stacks[0], 99); // 50*2 - 1
+        assert_eq!(state_50bb.stacks[1], 98); // 50*2 - 2
 
         let state_200bb = PostflopState::new_preflop(p1, p2, 200);
         assert_eq!(state_200bb.stacks[0], 399); // 200*2 - 1
@@ -1654,7 +1684,9 @@ mod tests {
         // At raise cap: sized raises should be gone, but all-in must remain
         let actions = game.actions(&s);
         assert!(
-            !actions.iter().any(|a| matches!(a, Action::Raise(idx) if *idx != ALL_IN)),
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Raise(idx) if *idx != ALL_IN)),
             "Sized raises should not be available at raise cap: {actions:?}"
         );
         assert!(
@@ -1725,7 +1757,10 @@ mod tests {
         let key2 = game.info_set_key(&s2);
 
         // Different bet indices → different keys
-        assert_ne!(key1, key2, "Different bet indices should produce different keys");
+        assert_ne!(
+            key1, key2,
+            "Different bet indices should produce different keys"
+        );
     }
 
     #[timed_test]
@@ -2153,10 +2188,23 @@ mod tests {
             ..PostflopConfig::default()
         };
         // min=0 means stratification is disabled in initial_states
-        let base_game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 50);
-        let strat_game =
-            HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 50)
-                .with_stratification(0, 500_000);
+        let base_game = HunlPostflop::new(
+            config.clone(),
+            Some(AbstractionMode::HandClassV2 {
+                strength_bits: 0,
+                equity_bits: 0,
+            }),
+            50,
+        );
+        let strat_game = HunlPostflop::new(
+            config,
+            Some(AbstractionMode::HandClassV2 {
+                strength_bits: 0,
+                equity_bits: 0,
+            }),
+            50,
+        )
+        .with_stratification(0, 500_000);
 
         let base = base_game.initial_states();
         let strat = strat_game.initial_states();
@@ -2176,12 +2224,24 @@ mod tests {
             bet_sizes: vec![1.0],
             ..PostflopConfig::default()
         };
-        let game1 =
-            HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 100)
-                .with_stratification(2, 10_000);
-        let game2 =
-            HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 100)
-                .with_stratification(2, 10_000);
+        let game1 = HunlPostflop::new(
+            config.clone(),
+            Some(AbstractionMode::HandClassV2 {
+                strength_bits: 0,
+                equity_bits: 0,
+            }),
+            100,
+        )
+        .with_stratification(2, 10_000);
+        let game2 = HunlPostflop::new(
+            config,
+            Some(AbstractionMode::HandClassV2 {
+                strength_bits: 0,
+                equity_bits: 0,
+            }),
+            100,
+        )
+        .with_stratification(2, 10_000);
 
         let deals1 = game1.initial_states();
         let deals2 = game2.initial_states();
@@ -2201,9 +2261,15 @@ mod tests {
             bet_sizes: vec![1.0],
             ..PostflopConfig::default()
         };
-        let game =
-            HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 100)
-                .with_stratification(2, 10_000);
+        let game = HunlPostflop::new(
+            config,
+            Some(AbstractionMode::HandClassV2 {
+                strength_bits: 0,
+                equity_bits: 0,
+            }),
+            100,
+        )
+        .with_stratification(2, 10_000);
         let deals = game.initial_states();
 
         for (i, deal) in deals.iter().enumerate() {
@@ -2236,7 +2302,10 @@ mod tests {
         };
         let game = HunlPostflop::new(
             config,
-            Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }),
+            Some(AbstractionMode::HandClassV2 {
+                strength_bits: 0,
+                equity_bits: 0,
+            }),
             200,
         );
 
@@ -2276,7 +2345,10 @@ mod tests {
         let min_per_class = 2;
         let game = HunlPostflop::new(
             config,
-            Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }),
+            Some(AbstractionMode::HandClassV2 {
+                strength_bits: 0,
+                equity_bits: 0,
+            }),
             200,
         );
         let deals = game.generate_stratified_deals(42, 200, min_per_class, 50_000);
@@ -2302,8 +2374,7 @@ mod tests {
     #[timed_test]
     fn with_stratification_builder() {
         let config = PostflopConfig::default();
-        let game = HunlPostflop::new(config, None, 100)
-            .with_stratification(50, 100_000);
+        let game = HunlPostflop::new(config, None, 100).with_stratification(50, 100_000);
         assert_eq!(game.min_deals_per_class, 50);
         assert_eq!(game.max_rejections_per_class, 100_000);
     }
@@ -2334,10 +2405,17 @@ mod tests {
             let (a, b) = super::decode_hole_pair(idx, n);
             assert!(a < b, "Expected a < b, got a={a}, b={b} at idx={idx}");
             assert!(b < n, "Expected b < {n}, got b={b} at idx={idx}");
-            assert!(seen.insert((a, b)), "Duplicate pair ({a}, {b}) at idx={idx}");
+            assert!(
+                seen.insert((a, b)),
+                "Duplicate pair ({a}, {b}) at idx={idx}"
+            );
         }
 
-        assert_eq!(seen.len(), total, "Should have exactly {total} unique pairs");
+        assert_eq!(
+            seen.len(),
+            total,
+            "Should have exactly {total} unique pairs"
+        );
     }
 
     #[timed_test]
@@ -2409,8 +2487,12 @@ mod tests {
             let mut pair = [deal.p1_holding[0], deal.p1_holding[1]];
             pair.sort_by_key(|c| (c.value as u8, c.suit as u8));
             assert!(
-                seen.insert((pair[0].value as u8, pair[0].suit as u8,
-                             pair[1].value as u8, pair[1].suit as u8)),
+                seen.insert((
+                    pair[0].value as u8,
+                    pair[0].suit as u8,
+                    pair[1].value as u8,
+                    pair[1].suit as u8
+                )),
                 "Duplicate P1 pair"
             );
         }
@@ -2466,8 +2548,14 @@ mod tests {
         // Check that not all deals have the same P2
         let p2_set: HashSet<_> = deals
             .iter()
-            .map(|d| (d.p2_holding[0].value as u8, d.p2_holding[0].suit as u8,
-                       d.p2_holding[1].value as u8, d.p2_holding[1].suit as u8))
+            .map(|d| {
+                (
+                    d.p2_holding[0].value as u8,
+                    d.p2_holding[0].suit as u8,
+                    d.p2_holding[1].value as u8,
+                    d.p2_holding[1].suit as u8,
+                )
+            })
             .collect();
 
         assert!(
@@ -2495,8 +2583,15 @@ mod tests {
     #[timed_test]
     fn with_uniform_deals_builder() {
         let config = PostflopConfig::default();
-        let game = HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 1)
-            .with_uniform_deals();
+        let game = HunlPostflop::new(
+            config,
+            Some(AbstractionMode::HandClassV2 {
+                strength_bits: 0,
+                equity_bits: 0,
+            }),
+            1,
+        )
+        .with_uniform_deals();
         assert!(game.uniform_deals);
     }
 }

@@ -319,14 +319,7 @@ impl<G: Game> MccfrSolver<G> {
                 #[allow(clippy::cast_precision_loss)]
                 let sample_weight = num_states as f64 / samples_per_iter as f64;
 
-                self.cfr_traverse(
-                    state,
-                    player,
-                    1.0,
-                    1.0,
-                    sample_weight,
-                    strategy_discount,
-                );
+                self.cfr_traverse(state, player, 1.0, 1.0, sample_weight, strategy_discount);
             }
             self.discount_regrets();
             self.iterations += 1;
@@ -534,21 +527,43 @@ impl<G: Game> MccfrSolver<G> {
                 let next_state = self.game.next_state(state, *action);
                 let (np1, np2) = update_reaches(current_player, p1_reach, p2_reach, strategy[i]);
                 action_utils[i] = self.cfr_traverse(
-                    &next_state, traversing_player, np1, np2, sample_weight, strategy_discount,
+                    &next_state,
+                    traversing_player,
+                    np1,
+                    np2,
+                    sample_weight,
+                    strategy_discount,
                 );
             }
 
             let node_util = compute_node_utility(&action_utils, &strategy);
             let opp_reach = opponent_reach(current_player, p1_reach, p2_reach);
-            let regrets = self.regret_sum.entry(info_set)
+            let regrets = self
+                .regret_sum
+                .entry(info_set)
                 .or_insert_with(|| vec![0.0; num_actions]);
-            add_regret_deltas(regrets, &action_utils, node_util, opp_reach, sample_weight, pruned);
+            add_regret_deltas(
+                regrets,
+                &action_utils,
+                node_util,
+                opp_reach,
+                sample_weight,
+                pruned,
+            );
 
             if strategy_discount > 0.0 {
                 let my_reach = player_reach(current_player, p1_reach, p2_reach);
-                let strat_sums = self.strategy_sum.entry(info_set)
+                let strat_sums = self
+                    .strategy_sum
+                    .entry(info_set)
                     .or_insert_with(|| vec![0.0; num_actions]);
-                accumulate_strategy_sums(strat_sums, &strategy, my_reach, sample_weight, strategy_discount);
+                accumulate_strategy_sums(
+                    strat_sums,
+                    &strategy,
+                    my_reach,
+                    sample_weight,
+                    strategy_discount,
+                );
             }
 
             node_util
@@ -558,7 +573,12 @@ impl<G: Game> MccfrSolver<G> {
             let next_state = self.game.next_state(state, actions[sampled]);
             let (np1, np2) = update_reaches(current_player, p1_reach, p2_reach, strategy[sampled]);
             self.cfr_traverse(
-                &next_state, traversing_player, np1, np2, sample_weight, strategy_discount,
+                &next_state,
+                traversing_player,
+                np1,
+                np2,
+                sample_weight,
+                strategy_discount,
             )
         }
     }
@@ -615,32 +635,28 @@ impl<G: Game> MccfrSolver<G> {
 
                 (0..samples_per_iter)
                     .into_par_iter()
-                    .fold(
-                        TraversalAccumulator::new,
-                        |mut acc, idx| {
-                            acc.rng_state = per_sample_seed(base_seed, iter_num, idx);
+                    .fold(TraversalAccumulator::new, |mut acc, idx| {
+                        acc.rng_state = per_sample_seed(base_seed, iter_num, idx);
 
-                            #[allow(clippy::cast_possible_truncation)]
-                            let state_idx =
-                                (per_sample_seed(base_seed, iter_num, idx) % num_states as u64)
-                                    as usize;
-                            let state = &states[state_idx];
+                        #[allow(clippy::cast_possible_truncation)]
+                        let state_idx = (per_sample_seed(base_seed, iter_num, idx)
+                            % num_states as u64) as usize;
+                        let state = &states[state_idx];
 
-                            cfr_traverse_pure(
-                                game,
-                                regret_snapshot,
-                                &mut acc,
-                                state,
-                                player,
-                                1.0,
-                                1.0,
-                                sample_weight,
-                                strategy_discount,
-                                pruning_ctx,
-                            );
-                            acc
-                        },
-                    )
+                        cfr_traverse_pure(
+                            game,
+                            regret_snapshot,
+                            &mut acc,
+                            state,
+                            player,
+                            1.0,
+                            1.0,
+                            sample_weight,
+                            strategy_discount,
+                            pruning_ctx,
+                        );
+                        acc
+                    })
                     .reduce(TraversalAccumulator::new, TraversalAccumulator::merge)
             };
 
@@ -681,26 +697,23 @@ impl<G: Game> MccfrSolver<G> {
                 states
                     .par_iter()
                     .enumerate()
-                    .fold(
-                        TraversalAccumulator::new,
-                        |mut acc, (idx, state)| {
-                            acc.rng_state = per_sample_seed(0xCAFE, iter_num, idx);
+                    .fold(TraversalAccumulator::new, |mut acc, (idx, state)| {
+                        acc.rng_state = per_sample_seed(0xCAFE, iter_num, idx);
 
-                            cfr_traverse_pure(
-                                game,
-                                regret_snapshot,
-                                &mut acc,
-                                state,
-                                player,
-                                1.0,
-                                1.0,
-                                1.0,
-                                strategy_discount,
-                                pruning_ctx,
-                            );
-                            acc
-                        },
-                    )
+                        cfr_traverse_pure(
+                            game,
+                            regret_snapshot,
+                            &mut acc,
+                            state,
+                            player,
+                            1.0,
+                            1.0,
+                            1.0,
+                            strategy_discount,
+                            pruning_ctx,
+                        );
+                        acc
+                    })
                     .reduce(TraversalAccumulator::new, TraversalAccumulator::merge)
             };
 
@@ -865,22 +878,47 @@ fn cfr_traverse_pure<G: Game>(
             let next_state = game.next_state(state, *action);
             let (np1, np2) = update_reaches(current_player, p1_reach, p2_reach, strategy[i]);
             action_utils[i] = cfr_traverse_pure(
-                game, regret_snapshot, acc, &next_state, traversing_player,
-                np1, np2, sample_weight, strategy_discount, pruning,
+                game,
+                regret_snapshot,
+                acc,
+                &next_state,
+                traversing_player,
+                np1,
+                np2,
+                sample_weight,
+                strategy_discount,
+                pruning,
             );
         }
 
         let node_util = compute_node_utility(&action_utils, &strategy);
         let opp_reach = opponent_reach(current_player, p1_reach, p2_reach);
-        let regrets = acc.regret_deltas.entry(info_set)
+        let regrets = acc
+            .regret_deltas
+            .entry(info_set)
             .or_insert_with(|| vec![0.0; num_actions]);
-        add_regret_deltas(regrets, &action_utils, node_util, opp_reach, sample_weight, pruned);
+        add_regret_deltas(
+            regrets,
+            &action_utils,
+            node_util,
+            opp_reach,
+            sample_weight,
+            pruned,
+        );
 
         if strategy_discount > 0.0 {
             let my_reach = player_reach(current_player, p1_reach, p2_reach);
-            let strat_sums = acc.strategy_deltas.entry(info_set)
+            let strat_sums = acc
+                .strategy_deltas
+                .entry(info_set)
                 .or_insert_with(|| vec![0.0; num_actions]);
-            accumulate_strategy_sums(strat_sums, &strategy, my_reach, sample_weight, strategy_discount);
+            accumulate_strategy_sums(
+                strat_sums,
+                &strategy,
+                my_reach,
+                sample_weight,
+                strategy_discount,
+            );
         }
 
         node_util
@@ -890,8 +928,16 @@ fn cfr_traverse_pure<G: Game>(
         let next_state = game.next_state(state, actions[sampled]);
         let (np1, np2) = update_reaches(current_player, p1_reach, p2_reach, strategy[sampled]);
         cfr_traverse_pure(
-            game, regret_snapshot, acc, &next_state, traversing_player,
-            np1, np2, sample_weight, strategy_discount, pruning,
+            game,
+            regret_snapshot,
+            acc,
+            &next_state,
+            traversing_player,
+            np1,
+            np2,
+            sample_weight,
+            strategy_discount,
+            pruning,
         )
     }
 }
@@ -1064,7 +1110,10 @@ mod tests {
             .strategy_sum
             .values()
             .any(|v| v.iter().any(|&x| x > 0.0));
-        assert!(has_nonzero, "Later iterations should contribute to strategy sum");
+        assert!(
+            has_nonzero,
+            "Later iterations should contribute to strategy sum"
+        );
     }
 
     #[timed_test]
@@ -1112,17 +1161,16 @@ mod tests {
         assert!(
             (regrets[0] - 10.0 * expected_pos).abs() < 1e-6,
             "Positive regret should be discounted by alpha: got {}, expected {}",
-            regrets[0], 10.0 * expected_pos
+            regrets[0],
+            10.0 * expected_pos
         );
         assert!(
             (regrets[1] - (-5.0 * expected_neg)).abs() < 1e-6,
             "Negative regret should be discounted by beta: got {}, expected {}",
-            regrets[1], -5.0 * expected_neg
+            regrets[1],
+            -5.0 * expected_neg
         );
-        assert!(
-            regrets[2].abs() < 1e-10,
-            "Zero regret should remain zero"
-        );
+        assert!(regrets[2].abs() < 1e-10, "Zero regret should remain zero");
     }
 
     #[timed_test]
@@ -1314,7 +1362,10 @@ mod tests {
 
         let (pruned, total) = solver.pruning_stats();
         assert!(total > 0, "should have traversals");
-        assert!(pruned > 0, "should prune some zero-regret actions after warmup");
+        assert!(
+            pruned > 0,
+            "should prune some zero-regret actions after warmup"
+        );
     }
 
     #[timed_test]
@@ -1474,7 +1525,10 @@ mod tests {
 
         // Verify some pruning actually happened
         let (pruned, total) = solver.pruning_stats();
-        assert!(pruned > 0, "parallel pruning should have skipped some traversals");
+        assert!(
+            pruned > 0,
+            "parallel pruning should have skipped some traversals"
+        );
         assert!(total > pruned, "not everything should be pruned");
     }
 }

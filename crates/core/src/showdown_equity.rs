@@ -199,7 +199,9 @@ mod tests {
 
     #[timed_test]
     fn card_bit_unique_for_all_52() {
-        let values = [Two, Three, Four, Five, Six, Seven, Eight, Nine, Ten, Jack, Queen, King, Ace];
+        let values = [
+            Two, Three, Four, Five, Six, Seven, Eight, Nine, Ten, Jack, Queen, King, Ace,
+        ];
         let suits = [Spade, Heart, Diamond, Club];
         let mut seen = 0u64;
         for &v in &values {

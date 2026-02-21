@@ -260,13 +260,18 @@ impl SequenceCfrSolver {
         reach_p2[0] = 1.0;
 
         forward_pass(
-            &self.trees[tree_idx], deal, &self.regret_sum,
-            &mut reach_p1, &mut reach_p2,
+            &self.trees[tree_idx],
+            deal,
+            &self.regret_sum,
+            &mut reach_p1,
+            &mut reach_p2,
         );
 
         backward_pass(
-            &self.trees[tree_idx], deal,
-            &reach_p1, &reach_p2,
+            &self.trees[tree_idx],
+            deal,
+            &reach_p1,
+            &reach_p2,
             &mut utility_p1,
             strategy_discount,
             &mut self.regret_sum,
@@ -411,7 +416,8 @@ fn backward_pass(
                         Player::Player2 => (reach_p2[ni], reach_p1[ni]),
                     };
 
-                    let regrets = regret_sum.entry(info_key)
+                    let regrets = regret_sum
+                        .entry(info_key)
                         .or_insert_with(|| vec![0.0; num_actions]);
                     num_actions_map.entry(info_key).or_insert(num_actions);
 
@@ -426,7 +432,8 @@ fn backward_pass(
 
                     // Accumulate strategy sum (for average strategy), scaled by weight
                     if strategy_discount > 0.0 {
-                        let strat_sums = strategy_sum.entry(info_key)
+                        let strat_sums = strategy_sum
+                            .entry(info_key)
                             .or_insert_with(|| vec![0.0; num_actions]);
                         for (i, &prob) in strategy.iter().enumerate() {
                             strat_sums[i] += my_reach * prob * strategy_discount * deal.weight;
@@ -472,7 +479,11 @@ mod tests {
             let key_p2 = game.info_set_key(&next);
             let hand_bits_p2 = crate::info_key::InfoKey::from_raw(key_p2).hand_bits();
 
-            let p1_equity = if hand_bits_p1 > hand_bits_p2 { 1.0 } else { 0.0 };
+            let p1_equity = if hand_bits_p1 > hand_bits_p2 {
+                1.0
+            } else {
+                0.0
+            };
 
             trees.push(tree);
             // Kuhn has no per-street variation — same hand bits on all streets.
@@ -490,9 +501,8 @@ mod tests {
     #[timed_test]
     fn sequence_cfr_runs_without_panic() {
         let (trees, deals) = kuhn_trees_and_deals();
-        let mut solver = SequenceCfrSolver::from_per_deal_trees(
-            trees, deals, SequenceCfrConfig::default(),
-        );
+        let mut solver =
+            SequenceCfrSolver::from_per_deal_trees(trees, deals, SequenceCfrConfig::default());
         solver.train(10);
 
         assert_eq!(solver.iterations(), 10);
@@ -502,9 +512,8 @@ mod tests {
     #[timed_test]
     fn sequence_cfr_strategies_sum_to_one() {
         let (trees, deals) = kuhn_trees_and_deals();
-        let mut solver = SequenceCfrSolver::from_per_deal_trees(
-            trees, deals, SequenceCfrConfig::default(),
-        );
+        let mut solver =
+            SequenceCfrSolver::from_per_deal_trees(trees, deals, SequenceCfrConfig::default());
         solver.train(100);
 
         for (key, probs) in solver.all_strategies() {
@@ -554,9 +563,8 @@ mod tests {
     #[timed_test]
     fn sequence_cfr_strategy_delta_decreases() {
         let (trees, deals) = kuhn_trees_and_deals();
-        let mut solver = SequenceCfrSolver::from_per_deal_trees(
-            trees, deals, SequenceCfrConfig::default(),
-        );
+        let mut solver =
+            SequenceCfrSolver::from_per_deal_trees(trees, deals, SequenceCfrConfig::default());
 
         solver.train(100);
         let strat1 = solver.all_strategies();
@@ -579,9 +587,8 @@ mod tests {
     #[timed_test]
     fn sequence_cfr_regrets_populated() {
         let (trees, deals) = kuhn_trees_and_deals();
-        let mut solver = SequenceCfrSolver::from_per_deal_trees(
-            trees, deals, SequenceCfrConfig::default(),
-        );
+        let mut solver =
+            SequenceCfrSolver::from_per_deal_trees(trees, deals, SequenceCfrConfig::default());
         solver.train(10);
 
         assert!(!solver.regret_sum().is_empty());
@@ -594,9 +601,8 @@ mod tests {
     #[timed_test]
     fn sequence_cfr_zero_sum_property() {
         let (trees, deals) = kuhn_trees_and_deals();
-        let mut solver = SequenceCfrSolver::from_per_deal_trees(
-            trees, deals, SequenceCfrConfig::default(),
-        );
+        let mut solver =
+            SequenceCfrSolver::from_per_deal_trees(trees, deals, SequenceCfrConfig::default());
         solver.train(1000);
 
         let strategies = solver.all_strategies();
@@ -613,9 +619,8 @@ mod tests {
         let config = SequenceCfrConfig::default();
 
         // In-memory solver
-        let mut mem_solver = SequenceCfrSolver::from_per_deal_trees(
-            trees.clone(), deals.clone(), config.clone(),
-        );
+        let mut mem_solver =
+            SequenceCfrSolver::from_per_deal_trees(trees.clone(), deals.clone(), config.clone());
         mem_solver.train(100);
 
         // Streaming solver: per-deal trees need one tree per batch entry
@@ -632,27 +637,26 @@ mod tests {
         let game_tree = trees[0].clone();
         let single_deal = vec![deals[0].clone()];
 
-        let mut mem2 = SequenceCfrSolver::new(
-            game_tree.clone(), single_deal.clone(), config.clone(),
-        );
+        let mut mem2 =
+            SequenceCfrSolver::new(game_tree.clone(), single_deal.clone(), config.clone());
         mem2.train(100);
 
         let deals_for_stream = single_deal.clone();
-        let mut stream_solver = SequenceCfrSolver::new(
-            game_tree, vec![], config,
-        );
-        stream_solver.train_streaming(100, || {
-            Box::new(std::iter::once(deals_for_stream.clone()))
-        });
+        let mut stream_solver = SequenceCfrSolver::new(game_tree, vec![], config);
+        stream_solver.train_streaming(100, || Box::new(std::iter::once(deals_for_stream.clone())));
 
         // Both should produce identical strategies
         let mem_strats = mem2.all_strategies();
         let stream_strats = stream_solver.all_strategies();
 
-        assert_eq!(mem_strats.len(), stream_strats.len(),
-            "Same number of info sets");
+        assert_eq!(
+            mem_strats.len(),
+            stream_strats.len(),
+            "Same number of info sets"
+        );
         for (key, mem_probs) in &mem_strats {
-            let stream_probs = stream_strats.get(key)
+            let stream_probs = stream_strats
+                .get(key)
                 .unwrap_or_else(|| panic!("Missing key {key:#x} in streaming"));
             for (mp, sp) in mem_probs.iter().zip(stream_probs.iter()) {
                 assert!(
@@ -677,7 +681,9 @@ mod tests {
 
         for (key, probs_a) in a {
             if let Some(probs_b) = b.get(key) {
-                let diff: f64 = probs_a.iter().zip(probs_b.iter())
+                let diff: f64 = probs_a
+                    .iter()
+                    .zip(probs_b.iter())
                     .map(|(pa, pb)| (pa - pb).abs())
                     .sum();
                 total_diff += diff;
