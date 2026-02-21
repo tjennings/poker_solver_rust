@@ -1,3 +1,4 @@
+mod bucket_diagnostics;
 mod lhe_diagnose;
 mod lhe_viz;
 mod tree;
@@ -231,6 +232,18 @@ enum Commands {
         /// Overrides any postflop_model in the config file.
         #[arg(long)]
         postflop_model: Option<String>,
+    },
+    /// Run EHS bucket diagnostics on a postflop abstraction config
+    DiagBuckets {
+        /// YAML config file (same format as solve-preflop)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Directory for abstraction cache
+        #[arg(long, default_value = "cache/postflop")]
+        cache_dir: PathBuf,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -639,6 +652,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 equity_samples,
                 postflop_model.as_deref(),
             )?;
+        }
+        Commands::DiagBuckets { config, cache_dir, json } => {
+            let yaml = std::fs::read_to_string(&config)?;
+            let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
+            let pf_config = training.game.postflop_model
+                .ok_or("config file has no postflop_model section")?;
+            let all_passed = bucket_diagnostics::run(&pf_config, &cache_dir, json);
+            if !all_passed {
+                std::process::exit(1);
+            }
         }
     }
 
