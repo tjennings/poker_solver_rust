@@ -15,9 +15,9 @@
 
 use std::time::Instant;
 
+use poker_solver_core::Game;
 use poker_solver_core::game::{AbstractionMode, HunlPostflop, PostflopConfig};
 use poker_solver_core::hand_class::{HandClass, classify};
-use poker_solver_core::Game;
 
 /// All hand classes in display order (made hands strongest-first, then draws).
 const ALL_CLASSES: [HandClass; HandClass::COUNT] = [
@@ -59,9 +59,20 @@ fn main() {
     };
 
     let start = Instant::now();
-    let game = HunlPostflop::new(config.clone(), Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count);
+    let game = HunlPostflop::new(
+        config.clone(),
+        Some(AbstractionMode::HandClassV2 {
+            strength_bits: 0,
+            equity_bits: 0,
+        }),
+        deal_count,
+    );
     let deals = game.initial_states();
-    println!("Generated {} base deals in {:?}\n", deals.len(), start.elapsed());
+    println!(
+        "Generated {} base deals in {:?}\n",
+        deals.len(),
+        start.elapsed()
+    );
 
     let (counts, no_class) = count_all_streets(&deals);
     let total_per_street = (deals.len() as u64) * 2;
@@ -81,17 +92,34 @@ fn main() {
         println!("\n\n--- Stratified Pool (min 50 per class) ---\n");
 
         let start = Instant::now();
-        let strat_game = HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), deal_count)
-            .with_stratification(50, 500_000);
+        let strat_game = HunlPostflop::new(
+            config,
+            Some(AbstractionMode::HandClassV2 {
+                strength_bits: 0,
+                equity_bits: 0,
+            }),
+            deal_count,
+        )
+        .with_stratification(50, 500_000);
         let strat_deals = strat_game.initial_states();
-        println!("Generated {} stratified deals in {:?}\n", strat_deals.len(), start.elapsed());
+        println!(
+            "Generated {} stratified deals in {:?}\n",
+            strat_deals.len(),
+            start.elapsed()
+        );
 
         let (strat_counts, strat_no_class) = count_all_streets(&strat_deals);
         let strat_total = (strat_deals.len() as u64) * 2;
 
         print_comparison_header();
         for class in &ALL_CLASSES {
-            print_comparison_row(*class, &counts, total_per_street, &strat_counts, strat_total);
+            print_comparison_row(
+                *class,
+                &counts,
+                total_per_street,
+                &strat_counts,
+                strat_total,
+            );
         }
         print_separator();
     }

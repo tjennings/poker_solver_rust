@@ -301,7 +301,14 @@ fn parse_all_ranges(
             _ => HashSet::new(),
         };
         let raise_freq = build_raise_freq(raw_pos.raise_sizes.as_ref(), position)?;
-        result.insert(position.clone(), PositionRanges { raise, call, raise_freq });
+        result.insert(
+            position.clone(),
+            PositionRanges {
+                raise,
+                call,
+                raise_freq,
+            },
+        );
     }
     Ok(result)
 }
@@ -330,8 +337,7 @@ fn build_raise_freq(
         fold: 0.0,
         call: 0.0,
         raise: 1.0,
-        raise_sizes: validated
-            .map(|s| s.into_iter().map(|(k, v)| (k, v / total)).collect()),
+        raise_sizes: validated.map(|s| s.into_iter().map(|(k, v)| (k, v / total)).collect()),
     })
 }
 
@@ -788,7 +794,11 @@ raise = 0.35
         assert_eq!(config.classes.len(), 19);
         // TAG should have wide playable range and non-empty raise range
         let btn = config.ranges.get("btn").unwrap();
-        assert!(btn.call.len() > 50, "TAG btn call range should be wide, got {}", btn.call.len());
+        assert!(
+            btn.call.len() > 50,
+            "TAG btn call range should be wide, got {}",
+            btn.call.len()
+        );
         assert!(!btn.raise.is_empty(), "TAG btn should have a raise range");
     }
 

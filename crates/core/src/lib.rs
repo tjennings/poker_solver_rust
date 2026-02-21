@@ -34,7 +34,9 @@ pub use agent::AgentConfig;
 pub use error::SolverError;
 pub use flops::{CanonicalFlop, HighCardClass, RankTexture, SuitTexture, all_flops};
 pub use game::{Action, Game, Player};
-pub use hand_class::{ClassifyError, HandClass, HandClassification, classify, intra_class_strength};
+pub use hand_class::{
+    ClassifyError, HandClass, HandClassification, classify, intra_class_strength,
+};
 pub use hands::{CanonicalHand, HandType, all_hands};
 
 /// Re-exported poker domain types from the `rs_poker` crate.
@@ -45,9 +47,19 @@ pub mod poker {
 
     /// All 13 card values in ascending order (Two through Ace).
     pub const ALL_VALUES: [Value; 13] = [
-        Value::Two, Value::Three, Value::Four, Value::Five,
-        Value::Six, Value::Seven, Value::Eight, Value::Nine,
-        Value::Ten, Value::Jack, Value::Queen, Value::King, Value::Ace,
+        Value::Two,
+        Value::Three,
+        Value::Four,
+        Value::Five,
+        Value::Six,
+        Value::Seven,
+        Value::Eight,
+        Value::Nine,
+        Value::Ten,
+        Value::Jack,
+        Value::Queen,
+        Value::King,
+        Value::Ace,
     ];
 
     /// All 4 suits.

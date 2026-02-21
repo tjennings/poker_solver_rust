@@ -166,7 +166,11 @@ pub fn build_tree(
     }
 
     // Sort by probability descending
-    children.sort_by(|a, b| b.probability.partial_cmp(&a.probability).unwrap_or(std::cmp::Ordering::Equal));
+    children.sort_by(|a, b| {
+        b.probability
+            .partial_cmp(&a.probability)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     TreeNode {
         action_label,
@@ -203,11 +207,7 @@ pub fn compute_deal_ev(root: &TreeNode) -> EvSummary {
     }
 }
 
-fn collect_terminals(
-    node: &TreeNode,
-    path: &[String],
-    out: &mut Vec<(String, f64, f64)>,
-) {
+fn collect_terminals(node: &TreeNode, path: &[String], out: &mut Vec<(String, f64, f64)>) {
     if let Some(ref terminal) = node.terminal {
         let path_str = if path.is_empty() {
             node.action_label.clone()
@@ -240,12 +240,23 @@ fn build_terminal_info(
 
     match terminal {
         TerminalType::Fold(folder) => {
-            let winner = if folder == Player::Player1 { "P2" } else { "P1" };
-            let folder_name = if folder == Player::Player1 { "P1" } else { "P2" };
+            let winner = if folder == Player::Player1 {
+                "P2"
+            } else {
+                "P1"
+            };
+            let folder_name = if folder == Player::Player1 {
+                "P1"
+            } else {
+                "P2"
+            };
             TerminalInfo {
                 kind: TerminalKind::Fold,
                 ev_bb,
-                description: format!("{folder_name} folds \u{2192} {winner} wins {:.1} BB", f64::from(state.pot) / 2.0),
+                description: format!(
+                    "{folder_name} folds \u{2192} {winner} wins {:.1} BB",
+                    f64::from(state.pot) / 2.0
+                ),
             }
         }
         TerminalType::Showdown => {
@@ -449,7 +460,11 @@ mod tests {
         let summary = compute_deal_ev(&root);
         assert_eq!(summary.terminals.len(), 2);
         // EV = 0.6 * 2.0 + 0.4 * 1.0 = 1.6
-        assert!((summary.total_ev_bb - 1.6).abs() < 0.001, "EV: {}", summary.total_ev_bb);
+        assert!(
+            (summary.total_ev_bb - 1.6).abs() < 0.001,
+            "EV: {}",
+            summary.total_ev_bb
+        );
         assert!((summary.total_reach - 1.0).abs() < 0.001);
     }
 

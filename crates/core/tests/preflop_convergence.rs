@@ -179,15 +179,16 @@ fn solver_matches_gto_reference_25bb() {
             break;
         }
         if solver.iteration() >= max_iterations {
-            eprintln!(
-                "Hit max iterations ({max_iterations}) with delta={mean_delta:.4}pp"
-            );
+            eprintln!("Hit max iterations ({max_iterations}) with delta={mean_delta:.4}pp");
             break;
         }
         prev_raise_pcts = cur_raise_pcts;
     }
 
-    assert!(converged, "solver should converge within {max_iterations} iterations");
+    assert!(
+        converged,
+        "solver should converge within {max_iterations} iterations"
+    );
 
     let strategy = solver.strategy();
 
@@ -228,7 +229,10 @@ fn solver_matches_gto_reference_25bb() {
     let mut total_error = 0.0f64;
     let mut count = 0usize;
 
-    println!("\n{:<6} ref_r%  sol_r%  ref_l%  sol_l%  ref_f%  sol_f%  err", "Hand");
+    println!(
+        "\n{:<6} ref_r%  sol_r%  ref_l%  sol_l%  ref_f%  sol_f%  err",
+        "Hand"
+    );
     println!("{}", "-".repeat(75));
 
     for hand_idx in 0..169 {
@@ -263,17 +267,15 @@ fn solver_matches_gto_reference_25bb() {
     }
 
     let mean_error = total_error / count as f64;
-    errors.sort_by(|a, b| {
-        (b.1 - b.2)
-            .abs()
-            .partial_cmp(&(a.1 - a.2).abs())
-            .unwrap()
-    });
+    errors.sort_by(|a, b| (b.1 - b.2).abs().partial_cmp(&(a.1 - a.2).abs()).unwrap());
 
     println!("\nMean raise% error: {mean_error:.1}pp");
     println!("Top 10 worst errors:");
     for (name, ref_r, sol_r) in errors.iter().take(10) {
-        println!("  {name:<6} ref={ref_r:.1}% sol={sol_r:.1}% err={:.1}pp", (ref_r - sol_r).abs());
+        println!(
+            "  {name:<6} ref={ref_r:.1}% sol={sol_r:.1}% err={:.1}pp",
+            (ref_r - sol_r).abs()
+        );
     }
 
     // === Structural assertions ===

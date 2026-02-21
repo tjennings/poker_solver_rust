@@ -139,14 +139,21 @@ fn mccfr_parallel_hunl_postflop() {
 #[timed_test(10)]
 fn hand_class_blueprint_scan_finds_entries() {
     use poker_solver_core::blueprint::BlueprintStrategy;
-    use poker_solver_core::info_key::{spr_bucket, InfoKey};
+    use poker_solver_core::info_key::{InfoKey, spr_bucket};
 
     let config = PostflopConfig {
         stack_depth: 10,
         bet_sizes: vec![1.0],
         ..PostflopConfig::default()
     };
-    let game = HunlPostflop::new(config, Some(AbstractionMode::HandClassV2 { strength_bits: 0, equity_bits: 0 }), 200);
+    let game = HunlPostflop::new(
+        config,
+        Some(AbstractionMode::HandClassV2 {
+            strength_bits: 0,
+            equity_bits: 0,
+        }),
+        200,
+    );
 
     let mccfr_config = MccfrConfig {
         samples_per_iteration: 50,
@@ -159,10 +166,7 @@ fn hand_class_blueprint_scan_finds_entries() {
     let strategies = solver.all_strategies();
     let blueprint = BlueprintStrategy::from_strategies(strategies, solver.iterations());
 
-    assert!(
-        !blueprint.is_empty(),
-        "Blueprint should contain strategies"
-    );
+    assert!(!blueprint.is_empty(), "Blueprint should contain strategies");
     println!("Blueprint has {} info sets", blueprint.len());
 
     // After preflop limp (call + check), pot = 4, stacks = [18, 18] (10BB * 2 = 20)
@@ -172,8 +176,7 @@ fn hand_class_blueprint_scan_finds_entries() {
     let street_num = 1u8; // Flop
     let action_codes: &[u8] = &[];
 
-    let position_key =
-        InfoKey::new(0, street_num, spr_b, action_codes).as_u64();
+    let position_key = InfoKey::new(0, street_num, spr_b, action_codes).as_u64();
     let position_mask: u64 = (1u64 << 44) - 1;
 
     let matches: Vec<(u64, u32)> = blueprint

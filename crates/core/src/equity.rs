@@ -4,7 +4,7 @@
 //! Equity is calculated by enumerating all non-overlapping combo pairs and
 //! running Monte Carlo board sampling for each.
 
-use crate::hands::{all_hands, CanonicalHand};
+use crate::hands::{CanonicalHand, all_hands};
 use crate::poker::{Card, Hand, Rank, Rankable, Suit, Value};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -300,10 +300,7 @@ mod tests {
         let eight_two = CanonicalHand::parse("82o").unwrap();
 
         let eq_a2o = calculate_equity(a2o, eight_two, 10_000);
-        assert!(
-            eq_a2o > 0.55,
-            "A2o should beat 82o, got equity {eq_a2o}"
-        );
+        assert!(eq_a2o > 0.55, "A2o should beat 82o, got equity {eq_a2o}");
     }
 
     #[timed_test]
@@ -312,10 +309,7 @@ mod tests {
         let seven_two = CanonicalHand::parse("72o").unwrap();
         let eq = calculate_equity(a2o, seven_two, 50_000);
         // A2o dominates 72o — should win about 63-65%
-        assert!(
-            eq > 0.60,
-            "A2o vs 72o equity {eq:.3} should be > 0.60"
-        );
+        assert!(eq > 0.60, "A2o vs 72o equity {eq:.3} should be > 0.60");
     }
 
     #[timed_test]

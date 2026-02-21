@@ -157,9 +157,18 @@ impl HandClass {
             "trips" => Some(Self::Trips),
             "twopair" | "two_pair" => Some(Self::TwoPair),
             "overpair" | "over_pair" => Some(Self::Overpair),
-            "pair" | "toppairtopkicker" | "top_pair_top_kicker" | "tptk" | "toppair"
-            | "top_pair" | "secondpair" | "second_pair" | "thirdpair" | "third_pair"
-            | "lowpair" | "low_pair" => Some(Self::Pair),
+            "pair"
+            | "toppairtopkicker"
+            | "top_pair_top_kicker"
+            | "tptk"
+            | "toppair"
+            | "top_pair"
+            | "secondpair"
+            | "second_pair"
+            | "thirdpair"
+            | "third_pair"
+            | "lowpair"
+            | "low_pair" => Some(Self::Pair),
             "underpair" | "under_pair" => Some(Self::Underpair),
             "overcards" | "over_cards" => Some(Self::Overcards),
             "highcard" | "high_card" | "acehigh" | "ace_high" | "kinghigh" | "king_high" => {
@@ -171,9 +180,7 @@ impl HandClass {
             "backdoorflushdraw" | "backdoor_flush_draw" => Some(Self::BackdoorFlushDraw),
             "oesd" | "open_ended" => Some(Self::Oesd),
             "gutshot" | "gut_shot" => Some(Self::Gutshot),
-            "backdoorstraightdraw" | "backdoor_straight_draw" => {
-                Some(Self::BackdoorStraightDraw)
-            }
+            "backdoorstraightdraw" | "backdoor_straight_draw" => Some(Self::BackdoorStraightDraw),
             _ => None,
         }
     }
@@ -390,7 +397,13 @@ fn classify_pair_type(
             classify_three_of_a_kind(hole_values, is_pocket_pair, &board_ranks, result);
         }
         Rank::TwoPair(_) => {
-            classify_two_pair(hole_values, &board_ranks, is_pocket_pair, board_has_pair, result);
+            classify_two_pair(
+                hole_values,
+                &board_ranks,
+                is_pocket_pair,
+                board_has_pair,
+                result,
+            );
         }
         Rank::OnePair(_) => classify_one_pair(hole_values, &board_ranks, is_pocket_pair, result),
         Rank::HighCard(_) => classify_high_card(hole_values, board, result),
@@ -683,7 +696,8 @@ fn has_backdoor_straight(hole: [Card; 2], _board: &[Card], present: u16) -> bool
             let hole_in_window = hole_ranks.iter().any(|&r| {
                 let r_bit = 1u16 << r;
                 window & r_bit != 0
-            }) || (hole_ranks.contains(&value_rank(Value::Ace)) && window & (1 << 1) != 0);
+            }) || (hole_ranks.contains(&value_rank(Value::Ace))
+                && window & (1 << 1) != 0);
 
             if hole_in_window {
                 return true;
@@ -746,11 +760,7 @@ fn raw_intra_strength(hole: [Card; 2], board: &[Card], class: HandClass) -> u8 {
         HandClass::Overpair | HandClass::Underpair => 15u8.saturating_sub(h0), // pocket pair rank
         HandClass::Pair => {
             // Pair rank of the hole card that pairs the board
-            let pair_rank = if board_ranks.contains(&h0) {
-                h0
-            } else {
-                h1
-            };
+            let pair_rank = if board_ranks.contains(&h0) { h0 } else { h1 };
             15u8.saturating_sub(pair_rank)
         }
         HandClass::Overcards => 15u8.saturating_sub(h0.max(h1)),
@@ -866,14 +876,20 @@ mod tests {
         assert_eq!(HandClass::from_name("TopSet"), Some(HandClass::Set));
         assert_eq!(HandClass::from_name("BottomSet"), Some(HandClass::Set));
         assert_eq!(HandClass::from_name("TopPair"), Some(HandClass::Pair));
-        assert_eq!(HandClass::from_name("TopPairTopKicker"), Some(HandClass::Pair));
+        assert_eq!(
+            HandClass::from_name("TopPairTopKicker"),
+            Some(HandClass::Pair)
+        );
         assert_eq!(HandClass::from_name("TPTK"), Some(HandClass::Pair));
         assert_eq!(HandClass::from_name("SecondPair"), Some(HandClass::Pair));
         assert_eq!(HandClass::from_name("ThirdPair"), Some(HandClass::Pair));
         assert_eq!(HandClass::from_name("LowPair"), Some(HandClass::Pair));
         assert_eq!(HandClass::from_name("AceHigh"), Some(HandClass::HighCard));
         assert_eq!(HandClass::from_name("KingHigh"), Some(HandClass::HighCard));
-        assert_eq!(HandClass::from_name("FlushDrawNuts"), Some(HandClass::FlushDraw));
+        assert_eq!(
+            HandClass::from_name("FlushDrawNuts"),
+            Some(HandClass::FlushDraw)
+        );
     }
 
     #[timed_test]
@@ -1062,7 +1078,11 @@ mod tests {
                 card(Seven, Diamond),
                 card(Three, Spade),
             ],
-            &[HandClass::HighCard, HandClass::FlushDraw, HandClass::BackdoorStraightDraw],
+            &[
+                HandClass::HighCard,
+                HandClass::FlushDraw,
+                HandClass::BackdoorStraightDraw,
+            ],
         );
     }
 
@@ -1080,7 +1100,11 @@ mod tests {
         assert_classes(
             [card(Ace, Diamond), card(Five, Diamond)],
             &[card(King, Diamond), card(Seven, Spade), card(Three, Spade)],
-            &[HandClass::HighCard, HandClass::BackdoorFlushDraw, HandClass::BackdoorStraightDraw],
+            &[
+                HandClass::HighCard,
+                HandClass::BackdoorFlushDraw,
+                HandClass::BackdoorStraightDraw,
+            ],
         );
     }
 
@@ -1094,7 +1118,11 @@ mod tests {
                 card(Seven, Diamond),
                 card(Three, Spade),
             ],
-            &[HandClass::HighCard, HandClass::FlushDraw, HandClass::BackdoorStraightDraw],
+            &[
+                HandClass::HighCard,
+                HandClass::FlushDraw,
+                HandClass::BackdoorStraightDraw,
+            ],
         );
     }
 
@@ -1125,7 +1153,11 @@ mod tests {
         assert_classes(
             [card(Ace, Diamond), card(Five, Diamond)],
             &[card(Ace, Heart), card(Seven, Diamond), card(Three, Diamond)],
-            &[HandClass::Pair, HandClass::FlushDraw, HandClass::BackdoorStraightDraw],
+            &[
+                HandClass::Pair,
+                HandClass::FlushDraw,
+                HandClass::BackdoorStraightDraw,
+            ],
         );
     }
 
@@ -1139,7 +1171,11 @@ mod tests {
                 card(Seven, Diamond),
                 card(Three, Spade),
             ],
-            &[HandClass::Overcards, HandClass::FlushDraw, HandClass::BackdoorStraightDraw],
+            &[
+                HandClass::Overcards,
+                HandClass::FlushDraw,
+                HandClass::BackdoorStraightDraw,
+            ],
         );
     }
 
@@ -1676,9 +1712,9 @@ mod tests {
         c.add(HandClass::FlushDraw);
         c.add(HandClass::Oesd);
         let flags = c.draw_flags();
-        assert_eq!(flags & 1, 1, "ComboDraw bit");      // bit 0
+        assert_eq!(flags & 1, 1, "ComboDraw bit"); // bit 0
         assert_eq!((flags >> 1) & 1, 1, "FlushDraw bit"); // bit 1
-        assert_eq!((flags >> 3) & 1, 1, "Oesd bit");      // bit 3
+        assert_eq!((flags >> 3) & 1, 1, "Oesd bit"); // bit 3
     }
 
     #[timed_test]
@@ -1697,7 +1733,10 @@ mod tests {
         let kk = [card(King, Diamond), card(King, Club)];
         let s_aa = intra_class_strength(aa, board, HandClass::Overpair);
         let s_kk = intra_class_strength(kk, board, HandClass::Overpair);
-        assert!(s_aa < s_kk, "AA ({s_aa}) should be stronger (lower) than KK ({s_kk})");
+        assert!(
+            s_aa < s_kk,
+            "AA ({s_aa}) should be stronger (lower) than KK ({s_kk})"
+        );
     }
 
     #[timed_test]

@@ -138,18 +138,18 @@ fn exploitability_decreases_over_training() {
 fn extract_strategy(solver: &VanillaCfr<KuhnPoker>) -> FxHashMap<u64, Vec<f64>> {
     // (card, actions) for all 12 Kuhn info sets
     let info_sets: [(u32, &[u8]); 12] = [
-        (0, &[]),             // J
-        (1, &[]),             // Q
-        (2, &[]),             // K
-        (0, &[CHECK]),        // Jc
-        (1, &[CHECK]),        // Qc
-        (2, &[CHECK]),        // Kc
-        (0, &[BET]),          // Jb
-        (1, &[BET]),          // Qb
-        (2, &[BET]),          // Kb
-        (0, &[CHECK, BET]),   // Jcb
-        (1, &[CHECK, BET]),   // Qcb
-        (2, &[CHECK, BET]),   // Kcb
+        (0, &[]),           // J
+        (1, &[]),           // Q
+        (2, &[]),           // K
+        (0, &[CHECK]),      // Jc
+        (1, &[CHECK]),      // Qc
+        (2, &[CHECK]),      // Kc
+        (0, &[BET]),        // Jb
+        (1, &[BET]),        // Qb
+        (2, &[BET]),        // Kb
+        (0, &[CHECK, BET]), // Jcb
+        (1, &[CHECK, BET]), // Qcb
+        (2, &[CHECK, BET]), // Kcb
     ];
 
     info_sets

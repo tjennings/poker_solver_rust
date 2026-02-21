@@ -1,0 +1,73 @@
+# Preflop solver config — HU 25BB with medium postflop model
+#
+# Usage:
+#   cargo run -p poker-solver-trainer --release -- solve-preflop \
+#     -c preflop_medium.yaml -o preflop_hu_25bb
+
+# ── Training parameters ──────────────────────────────────────────────────────
+
+iterations: 10000
+equity_samples: 10000
+print_every: 1000
+
+# ── Game structure ───────────────────────────────────────────────────────────
+# Internal units: SB=1, BB=2. Stacks = stack_depth_bb × 2.
+
+positions:
+  - name: Small Blind
+    short_name: SB
+  - name: Big Blind
+    short_name: BB
+
+blinds:
+  - [0, 1]   # SB posts 1
+  - [1, 2]   # BB posts 2
+
+antes: []
+
+stacks: [50, 50]  # 25 BB × 2
+
+# raise_sizes[depth] — multiplier of current pot/bet at each raise depth.
+# depth 0 = first open raise, depth 1 = 3-bet, etc.
+raise_sizes:
+  - [2.5]    # open raise: 2.5×
+  - [3.0]    # 3-bet: 3.0×
+
+raise_cap: 4
+
+# ── DCFR discounting ─────────────────────────────────────────────────────────
+
+dcfr_alpha: 1.5     # positive regret discount exponent
+dcfr_beta: 0.5      # negative regret discount exponent
+dcfr_gamma: 2.0     # strategy sum discount exponent
+dcfr_warmup: 0      # iterations before discounting starts
+
+# ε-greedy exploration: each action gets at least ε/N probability during
+# traversal. Average strategy accumulates the intended (non-explored) strategy.
+exploration: 0.05
+
+# ── Postflop model ───────────────────────────────────────────────────────────
+# Replaces raw equity at showdown with an abstracted postflop game.
+# Remove this section entirely to use raw equity (original behaviour).
+
+postflop_model:
+  # Board abstraction: k-means clustering of canonical flops into textures.
+  num_flop_textures: 20
+  num_turn_transitions: 2
+  num_river_transitions: 2
+
+  # Hand abstraction: EHS k-means clustering per texture.
+  num_hand_buckets_flop: 100
+  num_hand_buckets_turn: 100
+  num_hand_buckets_river: 100 
+  ehs_samples: 200
+
+  # Postflop tree structure (per pot type: limped/raised/3bet/4bet+).
+  bet_sizes: [0.5, 1.0, 2]    # fraction of pot
+  raises_per_street: 1
+
+  # Pre-solve: chance-sampled MCCFR to converge postflop before preflop training.
+  postflop_solve_iterations: 1000   # MCCFR iterations per pot type
+  postflop_solve_samples: 100000        # bucket pairs sampled per iteration (0 = num_hand_buckets_flop)
+
+  flop_samples_per_iter: 1

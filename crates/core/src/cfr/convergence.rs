@@ -18,10 +18,7 @@ use rustc_hash::FxHashMap;
 /// across all shared info sets. Returns 0.0 if no info sets are shared.
 #[must_use]
 #[allow(clippy::implicit_hasher)]
-pub fn strategy_delta(
-    prev: &FxHashMap<u64, Vec<f64>>,
-    curr: &FxHashMap<u64, Vec<f64>>,
-) -> f64 {
+pub fn strategy_delta(prev: &FxHashMap<u64, Vec<f64>>, curr: &FxHashMap<u64, Vec<f64>>) -> f64 {
     let mut total_delta = 0.0;
     let mut count = 0u64;
 
@@ -41,7 +38,9 @@ pub fn strategy_delta(
         0.0
     } else {
         #[allow(clippy::cast_precision_loss)]
-        { total_delta / count as f64 }
+        {
+            total_delta / count as f64
+        }
     }
 }
 
@@ -64,7 +63,9 @@ pub fn max_regret(regret_sum: &FxHashMap<u64, Vec<f64>>, iterations: u64) -> f64
         .fold(0.0_f64, f64::max);
 
     #[allow(clippy::cast_precision_loss)]
-    { max_cumulative / iterations as f64 }
+    {
+        max_cumulative / iterations as f64
+    }
 }
 
 /// Mean regret per iteration across all info sets and actions.
@@ -94,7 +95,9 @@ pub fn avg_regret(regret_sum: &FxHashMap<u64, Vec<f64>>, iterations: u64) -> f64
         0.0
     } else {
         #[allow(clippy::cast_precision_loss)]
-        { total / count as f64 / iterations as f64 }
+        {
+            total / count as f64 / iterations as f64
+        }
     }
 }
 
@@ -125,7 +128,9 @@ pub fn strategy_entropy(strategies: &FxHashMap<u64, Vec<f64>>) -> f64 {
         0.0
     } else {
         #[allow(clippy::cast_precision_loss)]
-        { total_entropy / count as f64 }
+        {
+            total_entropy / count as f64
+        }
     }
 }
 
@@ -160,14 +165,8 @@ mod tests {
 
     #[test]
     fn delta_averages_across_info_sets() {
-        let prev = make_map(&[
-            (1, vec![0.5, 0.5]),
-            (2, vec![0.5, 0.5]),
-        ]);
-        let curr = make_map(&[
-            (1, vec![1.0, 0.0]),
-            (2, vec![0.5, 0.5]),
-        ]);
+        let prev = make_map(&[(1, vec![0.5, 0.5]), (2, vec![0.5, 0.5])]);
+        let curr = make_map(&[(1, vec![1.0, 0.0]), (2, vec![0.5, 0.5])]);
         let delta = strategy_delta(&prev, &curr);
         assert!((delta - 0.5).abs() < 1e-10, "expected 0.5, got {delta}");
     }

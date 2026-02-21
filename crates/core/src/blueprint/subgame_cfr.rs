@@ -8,8 +8,8 @@ use rustc_hash::FxHashMap;
 use crate::cfr::regret::regret_match;
 use crate::poker::{Card, Hand, Rank, Rankable};
 
-use super::subgame_tree::{SubgameHands, SubgameNode, SubgameTree, SubgameTreeBuilder};
 use super::SubgameConfig;
+use super::subgame_tree::{SubgameHands, SubgameNode, SubgameTree, SubgameTreeBuilder};
 
 // ---------------------------------------------------------------------------
 // SubgameStrategy -- the output of a subgame solve
@@ -228,8 +228,13 @@ impl SubgameCfrSolver {
 
         for (a, &child_idx) in children.iter().enumerate() {
             let new_reach = reach_hero * strategy[a];
-            action_values[a] =
-                self.cfr_traverse(child_idx as usize, hero_combo, new_reach, reach_opp, traverser);
+            action_values[a] = self.cfr_traverse(
+                child_idx as usize,
+                hero_combo,
+                new_reach,
+                reach_opp,
+                traverser,
+            );
             node_value += strategy[a] * action_values[a];
         }
 
@@ -537,8 +542,7 @@ mod tests {
             .pot(100)
             .stacks(&[200, 200])
             .build();
-        let mut solver =
-            SubgameCfrSolver::new(tree, hands, vec![1.0; n], vec![0.0; n]);
+        let mut solver = SubgameCfrSolver::new(tree, hands, vec![1.0; n], vec![0.0; n]);
         solver.train(config.max_iterations);
         let strategy = solver.strategy();
         assert!(strategy.num_combos() > 0);

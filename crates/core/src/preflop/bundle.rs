@@ -35,12 +35,10 @@ impl PreflopBundle {
     pub fn save(&self, dir: &Path) -> Result<(), std::io::Error> {
         fs::create_dir_all(dir)?;
 
-        let config_yaml = serde_yaml::to_string(&self.config)
-            .map_err(std::io::Error::other)?;
+        let config_yaml = serde_yaml::to_string(&self.config).map_err(std::io::Error::other)?;
         fs::write(dir.join("config.yaml"), config_yaml)?;
 
-        let strategy_bytes = bincode::serialize(&self.strategy)
-            .map_err(std::io::Error::other)?;
+        let strategy_bytes = bincode::serialize(&self.strategy).map_err(std::io::Error::other)?;
         fs::write(dir.join("strategy.bin"), strategy_bytes)?;
 
         Ok(())
@@ -53,12 +51,12 @@ impl PreflopBundle {
     /// Returns an error if files are missing, unreadable, or deserialization fails.
     pub fn load(dir: &Path) -> Result<Self, std::io::Error> {
         let config_yaml = fs::read_to_string(dir.join("config.yaml"))?;
-        let config: PreflopConfig = serde_yaml::from_str(&config_yaml)
-            .map_err(std::io::Error::other)?;
+        let config: PreflopConfig =
+            serde_yaml::from_str(&config_yaml).map_err(std::io::Error::other)?;
 
         let strategy_bytes = fs::read(dir.join("strategy.bin"))?;
-        let strategy: PreflopStrategy = bincode::deserialize(&strategy_bytes)
-            .map_err(std::io::Error::other)?;
+        let strategy: PreflopStrategy =
+            bincode::deserialize(&strategy_bytes).map_err(std::io::Error::other)?;
 
         Ok(Self { config, strategy })
     }

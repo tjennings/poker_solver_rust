@@ -5,7 +5,7 @@
 //! tracks concrete pot/stack values and the tree can be depth-limited
 //! to solve only the current street.
 
-use crate::game::{Action, ALL_IN};
+use crate::game::{ALL_IN, Action};
 use crate::poker::Card;
 
 /// A node in a concrete subgame tree (specific board, no hand abstraction).
@@ -27,10 +27,7 @@ pub enum SubgameNode {
         stacks: Vec<u32>,
     },
     /// Depth boundary -- stop solving here, use blueprint continuation values.
-    DepthBoundary {
-        pot: u32,
-        stacks: Vec<u32>,
-    },
+    DepthBoundary { pot: u32, stacks: Vec<u32> },
 }
 
 /// A concrete subgame tree for a specific board.
@@ -212,7 +209,11 @@ fn build_recursive(ctx: &BuildContext, state: &NodeState, nodes: &mut Vec<Subgam
         children.push(child_idx);
     }
 
-    if let SubgameNode::Decision { children: ref mut c, .. } = nodes[node_idx as usize] {
+    if let SubgameNode::Decision {
+        children: ref mut c,
+        ..
+    } = nodes[node_idx as usize]
+    {
         *c = children;
     }
 
@@ -542,21 +543,13 @@ mod tests {
     fn subgame_hands_excludes_board() {
         let board = make_river_board();
         let hands = SubgameHands::enumerate(&board);
-        assert_eq!(
-            hands.combos.len(),
-            1081,
-            "C(47,2) = 1081 for 5-card board"
-        );
+        assert_eq!(hands.combos.len(), 1081, "C(47,2) = 1081 for 5-card board");
     }
 
     #[timed_test]
     fn subgame_hands_flop_count() {
         let board = make_flop_board();
         let hands = SubgameHands::enumerate(&board);
-        assert_eq!(
-            hands.combos.len(),
-            1176,
-            "C(49,2) = 1176 for 3-card board"
-        );
+        assert_eq!(hands.combos.len(), 1176, "C(49,2) = 1176 for 3-card board");
     }
 }

@@ -14,8 +14,8 @@
 //! 4-8=bet idx 0-4, 9-13=raise idx 0-4, 14=bet all-in, 15=raise all-in.
 
 use crate::blueprint::{AbstractionModeConfig, BlueprintStrategy};
-use crate::game::{Action, ALL_IN};
-use crate::hand_class::{classify, intra_class_strength, HandClass};
+use crate::game::{ALL_IN, Action};
+use crate::hand_class::{HandClass, classify, intra_class_strength};
 use crate::poker::{Card, Suit, Value};
 use crate::showdown_equity;
 
@@ -51,12 +51,7 @@ impl InfoKey {
     /// * `spr_bucket` - `min(eff_stack * 2 / pot, 31)` (5 bits, max 31)
     /// * `actions` - Slice of encoded action codes (from `encode_action`)
     #[must_use]
-    pub fn new(
-        hand_or_bucket: u32,
-        street: u8,
-        spr_bucket: u32,
-        actions: &[u8],
-    ) -> Self {
+    pub fn new(hand_or_bucket: u32, street: u8, spr_bucket: u32, actions: &[u8]) -> Self {
         let mut key: u64 = 0;
         key |= (u64::from(hand_or_bucket) & 0xFFF_FFFF) << HAND_SHIFT;
         key |= (u64::from(street) & 0x3) << STREET_SHIFT;
@@ -180,11 +175,11 @@ pub fn encode_hand_v2(
     };
 
     let mut bits: u32 = 0;
-    bits |= (u32::from(class_id) & 0x1F) << 23;        // 5 bits at 27-23
-    bits |= (s & 0xF) << 19;                            // 4 bits at 22-19
-    bits |= (e & 0xF) << 15;                            // 4 bits at 18-15
+    bits |= (u32::from(class_id) & 0x1F) << 23; // 5 bits at 27-23
+    bits |= (s & 0xF) << 19; // 4 bits at 22-19
+    bits |= (e & 0xF) << 15; // 4 bits at 18-15
     let draw_mask = (1u32 << HandClass::NUM_DRAWS) - 1;
-    bits |= (u32::from(draw_flags) & draw_mask) << 8;   // draw bits at 13-8
+    bits |= (u32::from(draw_flags) & draw_mask) << 8; // draw bits at 13-8
     bits
 }
 
@@ -211,7 +206,14 @@ pub fn compute_hand_bits_v2(
     };
     let equity = showdown_equity::compute_equity(hole, board);
     let eq_bin = showdown_equity::equity_bin(equity, 1u8 << equity_bits);
-    encode_hand_v2(made_id, strength, eq_bin, draw_flags, strength_bits, equity_bits)
+    encode_hand_v2(
+        made_id,
+        strength,
+        eq_bin,
+        draw_flags,
+        strength_bits,
+        equity_bits,
+    )
 }
 
 /// Map a canonical hand to a unique index in 0..169.
@@ -352,10 +354,22 @@ fn value_from_char(c: char) -> Option<Value> {
 const STREET_NAMES: [&str; 4] = ["preflop", "flop", "turn", "river"];
 
 const ACTION_CODE_NAMES: [&str; 16] = [
-    "empty", "fold", "check", "call",
-    "bet0", "bet1", "bet2", "bet3", "bet4",
-    "raise0", "raise1", "raise2", "raise3", "raise4",
-    "bet-allin", "raise-allin",
+    "empty",
+    "fold",
+    "check",
+    "call",
+    "bet0",
+    "bet1",
+    "bet2",
+    "bet3",
+    "bet4",
+    "raise0",
+    "raise1",
+    "raise2",
+    "raise3",
+    "raise4",
+    "bet-allin",
+    "raise-allin",
 ];
 
 /// Decoded components of an info set key with both hex and human-readable forms.
@@ -467,7 +481,9 @@ pub fn format_action_code_label(code: u8, bet_sizes: &[f32]) -> String {
 /// Returns labels like `"AA"`, `"AKs"`, `"72o"`.
 #[must_use]
 pub fn reverse_canonical_index(index: u16) -> &'static str {
-    const RANKS: [char; 13] = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+    const RANKS: [char; 13] = [
+        'A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2',
+    ];
 
     static HANDS: std::sync::LazyLock<[String; 169]> = std::sync::LazyLock::new(|| {
         let mut table: [String; 169] = std::array::from_fn(|_| String::new());
@@ -526,7 +542,10 @@ pub fn describe_key(
 }
 
 fn is_hex_input(s: &str) -> bool {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit() || c == '_')
 }
 
@@ -542,8 +561,7 @@ fn describe_from_hex(
         .unwrap_or(input)
         .replace('_', "");
 
-    let raw = u64::from_str_radix(&hex_str, 16)
-        .map_err(|e| format!("invalid hex: {e}"))?;
+    let raw = u64::from_str_radix(&hex_str, 16).map_err(|e| format!("invalid hex: {e}"))?;
 
     let key = InfoKey::from_raw(raw);
     let hand_bits = key.hand_bits();
@@ -666,14 +684,10 @@ fn parse_hand_bits(hand: &str, mode: AbstractionModeConfig) -> Result<u32, Strin
     }
 
     match mode {
-        AbstractionModeConfig::Ehs2 => {
-            canonical_hand_index_from_str(hand)
-                .map(u32::from)
-                .ok_or_else(|| format!("invalid canonical hand: {hand}"))
-        }
-        AbstractionModeConfig::HandClassV2 => {
-            parse_hand_class_v2(hand)
-        }
+        AbstractionModeConfig::Ehs2 => canonical_hand_index_from_str(hand)
+            .map(u32::from)
+            .ok_or_else(|| format!("invalid canonical hand: {hand}")),
+        AbstractionModeConfig::HandClassV2 => parse_hand_class_v2(hand),
     }
 }
 
@@ -747,9 +761,10 @@ pub fn hand_label_from_bits(hand_bits: u32, street: u8, mode: AbstractionModeCon
             #[allow(clippy::cast_possible_truncation)]
             let draw_flags = ((hand_bits >> 8) & draw_mask) as u8;
 
-            let class_name = HandClass::ALL
-                .get(class_id as usize)
-                .map_or_else(|| format!("class{class_id}"), std::string::ToString::to_string);
+            let class_name = HandClass::ALL.get(class_id as usize).map_or_else(
+                || format!("class{class_id}"),
+                std::string::ToString::to_string,
+            );
 
             let mut label = format!("{class_name}:{strength}:{equity}");
             if draw_flags != 0 {
@@ -808,10 +823,7 @@ mod tests {
         let modified = key.with_spr(20);
         assert_eq!(modified.spr_bucket(), 20);
         // Hand and street bits should be unchanged
-        assert_eq!(
-            key.as_u64() >> HAND_SHIFT,
-            modified.as_u64() >> HAND_SHIFT,
-        );
+        assert_eq!(key.as_u64() >> HAND_SHIFT, modified.as_u64() >> HAND_SHIFT,);
     }
 
     #[timed_test]
@@ -897,14 +909,8 @@ mod tests {
         assert_eq!(canonical_hand_index_from_str("AA"), Some(0));
         assert_eq!(canonical_hand_index_from_str("KK"), Some(1));
         assert_eq!(canonical_hand_index_from_str("22"), Some(12));
-        assert_eq!(
-            canonical_hand_index_from_str("AKs"),
-            Some(13)
-        );
-        assert_eq!(
-            canonical_hand_index_from_str("AKo"),
-            Some(91)
-        );
+        assert_eq!(canonical_hand_index_from_str("AKs"), Some(13));
+        assert_eq!(canonical_hand_index_from_str("AKo"), Some(91));
     }
 
     #[timed_test]
@@ -975,7 +981,11 @@ mod tests {
         // Verify that max spr_bucket doesn't corrupt first action
         let k1 = InfoKey::new(0, 0, 31, &[1]);
         let k2 = InfoKey::new(0, 0, 31, &[2]);
-        assert_ne!(k1.as_u64(), k2.as_u64(), "Actions indistinguishable with max spr_bucket");
+        assert_ne!(
+            k1.as_u64(),
+            k2.as_u64(),
+            "Actions indistinguishable with max spr_bucket"
+        );
     }
 
     #[timed_test]
@@ -1070,21 +1080,30 @@ mod tests {
     fn encode_hand_v2_different_strengths_different_bits() {
         let b1 = encode_hand_v2(5, 1, 8, 0, 4, 4);
         let b2 = encode_hand_v2(5, 14, 8, 0, 4, 4);
-        assert_ne!(b1, b2, "Different strengths should produce different encodings");
+        assert_ne!(
+            b1, b2,
+            "Different strengths should produce different encodings"
+        );
     }
 
     #[timed_test]
     fn encode_hand_v2_different_equity_different_bits() {
         let b1 = encode_hand_v2(5, 7, 0, 0, 4, 4);
         let b2 = encode_hand_v2(5, 7, 15, 0, 4, 4);
-        assert_ne!(b1, b2, "Different equity bins should produce different encodings");
+        assert_ne!(
+            b1, b2,
+            "Different equity bins should produce different encodings"
+        );
     }
 
     #[timed_test]
     fn encode_hand_v2_fits_in_28_bits() {
         // Max values for all fields
         let bits = encode_hand_v2(31, 14, 15, 0x3F, 4, 4);
-        assert!(bits < (1 << 28), "Encoded value {bits:#010x} exceeds 28 bits");
+        assert!(
+            bits < (1 << 28),
+            "Encoded value {bits:#010x} exceeds 28 bits"
+        );
     }
 
     // === Key translation API tests ===
@@ -1112,9 +1131,15 @@ mod tests {
         assert_eq!(format_action_label(Action::Bet(0), &sizes), "Bet 33%");
         assert_eq!(format_action_label(Action::Bet(1), &sizes), "Bet 67%");
         assert_eq!(format_action_label(Action::Bet(2), &sizes), "Bet 100%");
-        assert_eq!(format_action_label(Action::Bet(ALL_IN), &sizes), "Bet All-In");
+        assert_eq!(
+            format_action_label(Action::Bet(ALL_IN), &sizes),
+            "Bet All-In"
+        );
         assert_eq!(format_action_label(Action::Raise(0), &sizes), "Raise 33%");
-        assert_eq!(format_action_label(Action::Raise(ALL_IN), &sizes), "Raise All-In");
+        assert_eq!(
+            format_action_label(Action::Raise(ALL_IN), &sizes),
+            "Raise All-In"
+        );
     }
 
     #[timed_test]
@@ -1122,7 +1147,11 @@ mod tests {
         for idx in 0..169u16 {
             let name = reverse_canonical_index(idx);
             let back = canonical_hand_index_from_str(name);
-            assert_eq!(back, Some(idx), "roundtrip failed for index {idx} -> {name}");
+            assert_eq!(
+                back,
+                Some(idx),
+                "roundtrip failed for index {idx} -> {name}"
+            );
         }
     }
 

@@ -31,10 +31,11 @@ use poker_solver_core::info_key::{
     spr_bucket,
 };
 use poker_solver_core::preflop::{
-    EquityTable, PreflopBundle, PreflopConfig, PreflopSolver, PreflopTree,
+    EquityTable, PostflopModelConfig, PreflopBundle, PreflopConfig, PreflopSolver, PreflopTree,
 };
+use poker_solver_core::preflop::postflop_abstraction::{BuildPhase, PostflopAbstraction};
 use rustc_hash::FxHashMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
 #[command(name = "poker-solver-trainer")]
@@ -204,24 +205,32 @@ enum Commands {
     },
     /// Solve preflop strategy using Linear CFR
     SolvePreflop {
+        /// YAML config file (contains PreflopConfig + training params).
+        /// CLI flags override values from the config file.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
         /// Stack depth in big blinds
-        #[arg(long, default_value = "100")]
-        stack_depth: u32,
+        #[arg(long)]
+        stack_depth: Option<u32>,
         /// Number of players (2 = HU, 6 = six-max)
-        #[arg(long, default_value = "2")]
-        players: u8,
+        #[arg(long)]
+        players: Option<u8>,
         /// Number of LCFR iterations
-        #[arg(long, default_value = "5000")]
-        iterations: u64,
+        #[arg(long)]
+        iterations: Option<u64>,
         /// Output directory for the preflop bundle
         #[arg(short, long)]
         output: PathBuf,
         /// Print strategy matrices every N iterations (0 = only at end)
-        #[arg(long, default_value = "1000")]
-        print_every: u64,
+        #[arg(long)]
+        print_every: Option<u64>,
         /// Monte Carlo samples per hand matchup for equity table (0 = uniform)
-        #[arg(long, default_value = "20000")]
-        equity_samples: u32,
+        #[arg(long)]
+        equity_samples: Option<u32>,
+        /// Postflop model preset: fast, medium, standard, or accurate.
+        /// Overrides any postflop_model in the config file.
+        #[arg(long)]
+        postflop_model: Option<String>,
     },
 }
 
@@ -611,20 +620,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             )?;
         }
         Commands::SolvePreflop {
+            config,
             stack_depth,
             players,
             iterations,
             output,
             print_every,
             equity_samples,
+            postflop_model,
         } => {
             run_solve_preflop(
+                config.as_deref(),
                 stack_depth,
                 players,
                 iterations,
                 &output,
                 print_every,
                 equity_samples,
+                postflop_model.as_deref(),
             )?;
         }
     }
@@ -636,19 +649,68 @@ fn main() -> Result<(), Box<dyn Error>> {
 // Preflop solver
 // ---------------------------------------------------------------------------
 
+/// YAML config file for preflop training. Contains both game config and training params.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PreflopTrainingConfig {
+    #[serde(flatten)]
+    pub game: PreflopConfig,
+    #[serde(default = "default_iterations")]
+    pub iterations: u64,
+    #[serde(default = "default_equity_samples")]
+    pub equity_samples: u32,
+    #[serde(default = "default_print_every")]
+    pub print_every: u64,
+}
+
+fn default_iterations() -> u64 { 5000 }
+fn default_equity_samples() -> u32 { 20000 }
+fn default_print_every() -> u64 { 1000 }
+
+#[allow(clippy::too_many_arguments)]
 fn run_solve_preflop(
-    stack_depth: u32,
-    players: u8,
-    iterations: u64,
+    config_path: Option<&Path>,
+    cli_stack_depth: Option<u32>,
+    cli_players: Option<u8>,
+    cli_iterations: Option<u64>,
     output: &Path,
-    print_every: u64,
-    equity_samples: u32,
+    cli_print_every: Option<u64>,
+    cli_equity_samples: Option<u32>,
+    cli_postflop_model: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
-    let config = match players {
-        2 => PreflopConfig::heads_up(stack_depth),
-        6 => PreflopConfig::six_max(stack_depth),
-        n => return Err(format!("unsupported player count: {n} (use 2 or 6)").into()),
+    // Load config: from YAML file or defaults based on CLI args.
+    let mut training = if let Some(path) = config_path {
+        let yaml = std::fs::read_to_string(path)?;
+        serde_yaml::from_str::<PreflopTrainingConfig>(&yaml)?
+    } else {
+        let stack_depth = cli_stack_depth.unwrap_or(100);
+        let players = cli_players.unwrap_or(2);
+        let game = match players {
+            2 => PreflopConfig::heads_up(stack_depth),
+            6 => PreflopConfig::six_max(stack_depth),
+            n => return Err(format!("unsupported player count: {n} (use 2 or 6)").into()),
+        };
+        PreflopTrainingConfig {
+            game,
+            iterations: 5000,
+            equity_samples: 20000,
+            print_every: 1000,
+        }
     };
+
+    // CLI overrides
+    if let Some(v) = cli_iterations { training.iterations = v; }
+    if let Some(v) = cli_equity_samples { training.equity_samples = v; }
+    if let Some(v) = cli_print_every { training.print_every = v; }
+    if let Some(preset) = cli_postflop_model {
+        training.game.postflop_model = Some(PostflopModelConfig::from_preset(preset)
+            .ok_or_else(|| format!("unknown postflop preset: {preset} (use fast/medium/standard/accurate)"))?);
+    }
+
+    let config = training.game;
+    let iterations = training.iterations;
+    let equity_samples = training.equity_samples;
+    let print_every = training.print_every;
+    let players = config.positions.len();
 
     let equity = if equity_samples > 0 {
         let total_pairs = 169 * 168 / 2;
@@ -672,12 +734,56 @@ fn run_solve_preflop(
         EquityTable::new_uniform()
     };
 
-    println!("Solving preflop: {players}p, {stack_depth}BB, {iterations} iterations");
+    println!("Solving preflop: {players}p, {iterations} iterations");
     let start = Instant::now();
 
     let tree = PreflopTree::build(&config);
     let bb_node = lhe_viz::find_raise_child(&tree, 0);
+
+    // Build postflop abstraction before the solver takes equity ownership.
+    let postflop = if let Some(pf_config) = &config.postflop_model {
+        let pf_pb = ProgressBar::new(0);
+        pf_pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len}")
+                .expect("valid template")
+                .progress_chars("#>-"),
+        );
+        pf_pb.set_message("Building postflop abstraction");
+        let pf_start = Instant::now();
+        let cache_base = std::path::Path::new("cache/postflop");
+        let abstraction = PostflopAbstraction::build(pf_config, Some(&equity), Some(cache_base), |phase| {
+            match &phase {
+                BuildPhase::HandBuckets(done, total) => {
+                    pf_pb.set_length(*total as u64);
+                    pf_pb.set_position(*done as u64);
+                    pf_pb.set_message("Hand buckets");
+                }
+                BuildPhase::SolvingPostflop(iter, total) => {
+                    pf_pb.set_length(*total as u64);
+                    pf_pb.set_position(*iter as u64);
+                    pf_pb.set_message("Solving postflop");
+                }
+                _ => {
+                    pf_pb.set_message(format!("{phase}..."));
+                }
+            }
+        })
+        .map_err(|e| format!("postflop abstraction: {e}"))?;
+        pf_pb.finish_with_message(format!(
+            "done in {:.1?} (values: {} entries)",
+            pf_start.elapsed(),
+            abstraction.values.len(),
+        ));
+        Some(abstraction)
+    } else {
+        None
+    };
+
     let mut solver = PreflopSolver::new_with_equity(&config, equity);
+    if let Some(abstraction) = postflop {
+        solver.attach_postflop(abstraction);
+    }
 
     let (mut prev_matrices, _) = print_preflop_matrices(&solver.strategy(), &tree, bb_node, 0, None);
 

@@ -144,7 +144,9 @@ fn build_recursive(
 
     // Skip folded players
     let position = find_next_active(state);
-    let to_call = state.current_bet.saturating_sub(state.invested[position as usize]);
+    let to_call = state
+        .current_bet
+        .saturating_sub(state.invested[position as usize]);
 
     let mut actions = Vec::new();
     let mut child_indices = Vec::new();
@@ -292,7 +294,9 @@ fn apply_call(state: &BuildState, position: u8, to_call: u32) -> BuildState {
 
 fn apply_raise(state: &BuildState, position: u8, raise_total: u32) -> BuildState {
     let mut new_state = state.clone();
-    let to_call = state.current_bet.saturating_sub(state.invested[position as usize]);
+    let to_call = state
+        .current_bet
+        .saturating_sub(state.invested[position as usize]);
     // Total new investment = call + raise above current bet
     let additional = raise_total;
     let actual = additional.min(state.stacks[position as usize]);
@@ -467,7 +471,11 @@ mod tests {
     }
 
     /// Helper: find the child index for a given action at a decision node.
-    fn find_action_child(tree: &PreflopTree, node_idx: usize, action: PreflopAction) -> (usize, usize) {
+    fn find_action_child(
+        tree: &PreflopTree,
+        node_idx: usize,
+        action: PreflopAction,
+    ) -> (usize, usize) {
         match &tree.nodes[node_idx] {
             PreflopNode::Decision {
                 action_labels,

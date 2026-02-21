@@ -7,7 +7,10 @@ use poker_solver_core::{
 };
 
 /// Build per-deal trees and DealInfo for all 6 Kuhn deals.
-fn kuhn_trees_and_deals() -> (Vec<poker_solver_core::cfr::GameTree>, Vec<poker_solver_core::cfr::DealInfo>) {
+fn kuhn_trees_and_deals() -> (
+    Vec<poker_solver_core::cfr::GameTree>,
+    Vec<poker_solver_core::cfr::DealInfo>,
+) {
     let game = KuhnPoker::new();
     let states = game.initial_states();
     let mut trees = Vec::new();
@@ -22,7 +25,11 @@ fn kuhn_trees_and_deals() -> (Vec<poker_solver_core::cfr::GameTree>, Vec<poker_s
         let key_p2 = game.info_set_key(&next);
         let hand_bits_p2 = InfoKey::from_raw(key_p2).hand_bits();
 
-        let p1_equity = if hand_bits_p1 > hand_bits_p2 { 1.0 } else { 0.0 };
+        let p1_equity = if hand_bits_p1 > hand_bits_p2 {
+            1.0
+        } else {
+            0.0
+        };
 
         trees.push(tree);
         deals.push(poker_solver_core::cfr::DealInfo {
@@ -73,7 +80,8 @@ fn lcfr_converges_on_kuhn_poker() {
         assert!(
             probs[1] > 0.90,
             "King should always call a bet, got fold={:.4}, call={:.4}",
-            probs[0], probs[1]
+            probs[0],
+            probs[1]
         );
     }
 
@@ -83,7 +91,8 @@ fn lcfr_converges_on_kuhn_poker() {
         assert!(
             probs[0] > 0.90,
             "Jack should always fold facing a bet, got fold={:.4}, call={:.4}",
-            probs[0], probs[1]
+            probs[0],
+            probs[1]
         );
     }
 }

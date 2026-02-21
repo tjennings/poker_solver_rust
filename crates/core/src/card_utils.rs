@@ -43,9 +43,19 @@ mod tests {
     #[timed_test]
     fn value_rank_all_values_ascending() {
         let values = [
-            Value::Two, Value::Three, Value::Four, Value::Five,
-            Value::Six, Value::Seven, Value::Eight, Value::Nine,
-            Value::Ten, Value::Jack, Value::Queen, Value::King, Value::Ace,
+            Value::Two,
+            Value::Three,
+            Value::Four,
+            Value::Five,
+            Value::Six,
+            Value::Seven,
+            Value::Eight,
+            Value::Nine,
+            Value::Ten,
+            Value::Jack,
+            Value::Queen,
+            Value::King,
+            Value::Ace,
         ];
         for (i, &v) in values.iter().enumerate() {
             assert_eq!(value_rank(v), (i + 2) as u8);

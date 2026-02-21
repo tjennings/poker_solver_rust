@@ -4,7 +4,7 @@
 //! convergence indicators improve over training.
 
 use poker_solver_core::cfr::convergence;
-use poker_solver_core::cfr::{calculate_exploitability, MccfrSolver};
+use poker_solver_core::cfr::{MccfrSolver, calculate_exploitability};
 use poker_solver_core::game::KuhnPoker;
 
 /// Train Kuhn poker with 5 checkpoints and verify convergence metrics improve.
@@ -27,7 +27,11 @@ fn convergence_metrics_decrease_over_training() {
     let mut prev_strategies = None;
 
     for (ckpt, &iters) in checkpoint_iters.iter().enumerate() {
-        let already_trained = if ckpt == 0 { 0 } else { checkpoint_iters[ckpt - 1] };
+        let already_trained = if ckpt == 0 {
+            0
+        } else {
+            checkpoint_iters[ckpt - 1]
+        };
         let to_train = iters - already_trained;
         solver.train_full(to_train);
 

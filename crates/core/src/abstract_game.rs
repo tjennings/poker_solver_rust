@@ -24,8 +24,8 @@
 use std::collections::BinaryHeap;
 use std::io::{self, BufReader, BufWriter, Read as _, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -36,7 +36,7 @@ use crate::card_utils::hand_rank;
 use crate::cfr::DealInfo;
 use crate::error::SolverError;
 use crate::flops::{self, CanonicalFlop};
-use crate::hand_class::{classify, intra_class_strength, HandClass};
+use crate::hand_class::{HandClass, classify, intra_class_strength};
 use crate::info_key::{canonical_hand_index, encode_hand_v2};
 use crate::poker::{Card, Rank};
 use crate::showdown_equity;
@@ -137,7 +137,12 @@ impl DealGenContext {
             .map(|h| u32::from(canonical_hand_index(*h)))
             .collect();
         let hole_masks: Vec<u64> = hole_pairs.iter().map(|h| card_mask_pair(*h)).collect();
-        Self { hole_pairs, preflop_encs, hole_masks, deck }
+        Self {
+            hole_pairs,
+            preflop_encs,
+            hole_masks,
+            deck,
+        }
     }
 }
 
@@ -187,8 +192,12 @@ fn encode_postflop_fast(
         0
     };
     encode_hand_v2(
-        class_id, strength, eq_bin, draw_flags,
-        config.strength_bits, config.equity_bits,
+        class_id,
+        strength,
+        eq_bin,
+        draw_flags,
+        config.strength_bits,
+        config.equity_bits,
     )
 }
 
@@ -294,8 +303,14 @@ fn accumulate_group_pair(
             }
         }
         if w_ab > 0.0 {
-            let key = TrajectoryKey { p1_bits: enc_a, p2_bits: enc_b };
-            let e = map.entry(key).or_insert(TrajectoryAccum { weight: 0.0, equity_sum: 0.0 });
+            let key = TrajectoryKey {
+                p1_bits: enc_a,
+                p2_bits: enc_b,
+            };
+            let e = map.entry(key).or_insert(TrajectoryAccum {
+                weight: 0.0,
+                equity_sum: 0.0,
+            });
             e.weight += w_ab;
             e.equity_sum += eq_ab;
         }
@@ -316,14 +331,26 @@ fn accumulate_group_pair(
             }
         }
         if w_ab > 0.0 {
-            let k = TrajectoryKey { p1_bits: enc_a, p2_bits: enc_b };
-            let e = map.entry(k).or_insert(TrajectoryAccum { weight: 0.0, equity_sum: 0.0 });
+            let k = TrajectoryKey {
+                p1_bits: enc_a,
+                p2_bits: enc_b,
+            };
+            let e = map.entry(k).or_insert(TrajectoryAccum {
+                weight: 0.0,
+                equity_sum: 0.0,
+            });
             e.weight += w_ab;
             e.equity_sum += eq_ab;
         }
         if w_ba > 0.0 {
-            let k = TrajectoryKey { p1_bits: enc_b, p2_bits: enc_a };
-            let e = map.entry(k).or_insert(TrajectoryAccum { weight: 0.0, equity_sum: 0.0 });
+            let k = TrajectoryKey {
+                p1_bits: enc_b,
+                p2_bits: enc_a,
+            };
+            let e = map.entry(k).or_insert(TrajectoryAccum {
+                weight: 0.0,
+                equity_sum: 0.0,
+            });
             e.weight += w_ba;
             e.equity_sum += eq_ba;
         }
@@ -348,9 +375,7 @@ fn cross_join_and_accumulate(
     let mut concrete = 0u64;
     for (gi, &ga) in groups.iter().enumerate() {
         for &gb in &groups[gi..] {
-            concrete += accumulate_group_pair(
-                hands, ga, gb, ga.0 == gb.0, flop_weight, map,
-            );
+            concrete += accumulate_group_pair(hands, ga, gb, ga.0 == gb.0, flop_weight, map);
         }
     }
     concrete
@@ -374,30 +399,55 @@ impl<'a> FlopContext<'a> {
             .filter(|&i| !masks_overlap(hole_masks[i], flop_mask))
             .collect();
         let eq_bins: Vec<u8> = if config.equity_bits > 0 {
-            compat.iter().map(|&i| {
-                let eq = showdown_equity::compute_equity(hole_pairs[i], &flop_cards);
-                showdown_equity::equity_bin(eq, 16)
-            }).collect()
+            compat
+                .iter()
+                .map(|&i| {
+                    let eq = showdown_equity::compute_equity(hole_pairs[i], &flop_cards);
+                    showdown_equity::equity_bin(eq, 16)
+                })
+                .collect()
         } else {
             vec![0u8; compat.len()]
         };
-        let flop_encs: Vec<u32> = compat.iter().enumerate().map(|(ci, &i)| {
-            encode_postflop_fast(hole_pairs[i], &flop_cards, config, eq_bins[ci])
-        }).collect();
-        Self { flop_cards, hole_pairs, preflop_encs, hole_masks, config, compat, eq_bins, flop_encs }
+        let flop_encs: Vec<u32> = compat
+            .iter()
+            .enumerate()
+            .map(|(ci, &i)| encode_postflop_fast(hole_pairs[i], &flop_cards, config, eq_bins[ci]))
+            .collect();
+        Self {
+            flop_cards,
+            hole_pairs,
+            preflop_encs,
+            hole_masks,
+            config,
+            compat,
+            eq_bins,
+            flop_encs,
+        }
     }
 
     /// Build `TurnInfo` for all hands compatible with flop + turn.
     fn build_turn_info(&self, turn: Card) -> Vec<TurnInfo> {
         let turn_mask = 1u64 << card_bit(turn);
-        let tb = [self.flop_cards[0], self.flop_cards[1], self.flop_cards[2], turn];
-        self.compat.iter().copied().enumerate()
+        let tb = [
+            self.flop_cards[0],
+            self.flop_cards[1],
+            self.flop_cards[2],
+            turn,
+        ];
+        self.compat
+            .iter()
+            .copied()
+            .enumerate()
             .filter(|(_, i)| !masks_overlap(self.hole_masks[*i], turn_mask))
             .map(|(ci, i)| TurnInfo {
                 ci,
                 gi: i,
                 turn_enc: encode_postflop_fast(
-                    self.hole_pairs[i], &tb, self.config, self.eq_bins[ci],
+                    self.hole_pairs[i],
+                    &tb,
+                    self.config,
+                    self.eq_bins[ci],
                 ),
             })
             .collect()
@@ -405,20 +455,38 @@ impl<'a> FlopContext<'a> {
 
     /// Encode hands for a full 5-card board, writing into `out`.
     fn encode_river_hands(
-        &self, out: &mut Vec<EncodedHand>, turn_hands: &[TurnInfo], turn: Card, river: Card,
+        &self,
+        out: &mut Vec<EncodedHand>,
+        turn_hands: &[TurnInfo],
+        turn: Card,
+        river: Card,
     ) {
         let rm = 1u64 << card_bit(river);
-        let rb = [self.flop_cards[0], self.flop_cards[1], self.flop_cards[2], turn, river];
+        let rb = [
+            self.flop_cards[0],
+            self.flop_cards[1],
+            self.flop_cards[2],
+            turn,
+            river,
+        ];
         out.clear();
         for th in turn_hands {
             if masks_overlap(self.hole_masks[th.gi], rm) {
                 continue;
             }
             let re = encode_postflop_fast(
-                self.hole_pairs[th.gi], &rb, self.config, self.eq_bins[th.ci],
+                self.hole_pairs[th.gi],
+                &rb,
+                self.config,
+                self.eq_bins[th.ci],
             );
             out.push(EncodedHand {
-                enc: [self.preflop_encs[th.gi], self.flop_encs[th.ci], th.turn_enc, re],
+                enc: [
+                    self.preflop_encs[th.gi],
+                    self.flop_encs[th.ci],
+                    th.turn_enc,
+                    re,
+                ],
                 rank: hand_rank(self.hole_pairs[th.gi], &rb),
                 hole_mask: self.hole_masks[th.gi],
             });
@@ -443,7 +511,9 @@ fn process_flop_board_centric(
     let flop_weight = f64::from(flop.weight());
     let ctx = FlopContext::new(flop_cards, hole_pairs, preflop_encs, hole_masks, config);
 
-    let remaining: Vec<Card> = deck.iter().copied()
+    let remaining: Vec<Card> = deck
+        .iter()
+        .copied()
         .filter(|&c| !masks_overlap(1u64 << card_bit(c), flop_mask))
         .collect();
 
@@ -471,7 +541,8 @@ pub fn estimate_deal_count(config: &AbstractDealConfig) -> (u64, u64) {
     // C(49,2) P1 pairs × C(47,2) P2 pairs per flop × 46 turns × 45 rivers
     // But this overcounts — abstract dedup reduces it significantly.
     // Rough estimate: concrete = sum of flop_weight * C(49,2) * 46 * 45
-    let concrete: u64 = canonical_flops.iter()
+    let concrete: u64 = canonical_flops
+        .iter()
         .map(|f| u64::from(f.weight()) * 1176 * 46 * 45)
         .sum();
 
@@ -483,8 +554,16 @@ pub fn estimate_deal_count(config: &AbstractDealConfig) -> (u64, u64) {
 
 fn estimate_hand_encodings(strength_bits: u8, equity_bits: u8) -> u64 {
     let classes = HandClass::COUNT as u64;
-    let strength_levels = if strength_bits == 0 { 1 } else { 1u64 << strength_bits };
-    let equity_levels = if equity_bits == 0 { 1 } else { 1u64 << equity_bits };
+    let strength_levels = if strength_bits == 0 {
+        1
+    } else {
+        1u64 << strength_bits
+    };
+    let equity_levels = if equity_bits == 0 {
+        1
+    } else {
+        1u64 << equity_bits
+    };
     let draw_combos = 16u64; // rough estimate of common draw flag combinations
     classes * strength_levels * equity_levels * draw_combos
 }
@@ -501,14 +580,15 @@ fn format_duration(secs: f64) -> String {
     }
 }
 
-
 /// Generate all abstract deals by board-centric exhaustive enumeration.
 ///
 /// For each canonical flop (in parallel), iterates all turn+river boards,
 /// encodes every compatible hand, groups by encoding, and cross-joins to
 /// produce trajectory-keyed equity/weight accumulators.
 #[must_use]
-pub fn generate_abstract_deals(config: &AbstractDealConfig) -> (Vec<AbstractDeal>, GenerationStats) {
+pub fn generate_abstract_deals(
+    config: &AbstractDealConfig,
+) -> (Vec<AbstractDeal>, GenerationStats) {
     let canonical_flops = flops::all_flops();
     let deck = crate::poker::full_deck();
 
@@ -521,28 +601,35 @@ pub fn generate_abstract_deals(config: &AbstractDealConfig) -> (Vec<AbstractDeal
     let hole_pairs = select_hole_pairs(&deck, config.max_hole_pairs);
 
     // Precompute per-hand invariants
-    let preflop_encs: Vec<u32> = hole_pairs.iter()
+    let preflop_encs: Vec<u32> = hole_pairs
+        .iter()
         .map(|h| u32::from(canonical_hand_index(*h)))
         .collect();
-    let hole_masks: Vec<u64> = hole_pairs.iter()
-        .map(|h| card_mask_pair(*h))
-        .collect();
+    let hole_masks: Vec<u64> = hole_pairs.iter().map(|h| card_mask_pair(*h)).collect();
 
     let total_flops = canonical_flops.len();
-    println!("  {} hole pairs × {} canonical flops (board-centric)", hole_pairs.len(), total_flops);
+    println!(
+        "  {} hole pairs × {} canonical flops (board-centric)",
+        hole_pairs.len(),
+        total_flops
+    );
 
     let flops_done = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let progress_handle = spawn_flop_progress_thread(
-        flops_done.clone(), stop.clone(), total_flops as u64,
-    );
+    let progress_handle =
+        spawn_flop_progress_thread(flops_done.clone(), stop.clone(), total_flops as u64);
 
     // Parallel over canonical flops
     let flop_results: Vec<(FxHashMap<TrajectoryKey, TrajectoryAccum>, u64)> = canonical_flops
         .par_iter()
         .map(|flop| {
             let result = process_flop_board_centric(
-                flop, &hole_pairs, &preflop_encs, &hole_masks, &deck, config,
+                flop,
+                &hole_pairs,
+                &preflop_encs,
+                &hole_masks,
+                &deck,
+                config,
             );
             flops_done.fetch_add(1, Ordering::Relaxed);
             result
@@ -609,8 +696,8 @@ pub fn generate_deals_batch(
         entries,
     };
 
-    let data = bincode::serialize(&batch)
-        .map_err(|e| SolverError::BatchSerialize(e.to_string()))?;
+    let data =
+        bincode::serialize(&batch).map_err(|e| SolverError::BatchSerialize(e.to_string()))?;
     std::fs::write(batch_path, data)?;
 
     Ok((count, concrete))
@@ -635,9 +722,7 @@ pub fn merge_deal_batches(
     output_path: &Path,
 ) -> Result<GenerationStats, SolverError> {
     if batch_paths.is_empty() {
-        return Err(SolverError::NoBatchFiles(
-            output_path.display().to_string(),
-        ));
+        return Err(SolverError::NoBatchFiles(output_path.display().to_string()));
     }
 
     // Phase 1: Sort each batch (one at a time to limit memory)
@@ -659,7 +744,10 @@ pub fn merge_deal_batches(
     println!("  all batches sorted ({total_concrete} concrete deals)");
 
     // Phase 2: Streaming k-way merge
-    println!("  starting k-way merge of {} sorted files...", sorted_paths.len());
+    println!(
+        "  starting k-way merge of {} sorted files...",
+        sorted_paths.len()
+    );
     let stats = streaming_kway_merge(&sorted_paths, output_path, total_concrete)?;
 
     // Phase 3: Clean up sorted temp files
@@ -706,9 +794,9 @@ pub fn load_raw_deal_file(path: &Path) -> Result<Vec<DealInfo>, SolverError> {
     let mut deals = Vec::with_capacity(entry_count as usize);
     let mut buf = [0u8; ENTRY_SIZE];
     for _ in 0..entry_count {
-        reader.read_exact(&mut buf).map_err(|e| {
-            SolverError::BatchSerialize(format!("failed to read deal entry: {e}"))
-        })?;
+        reader
+            .read_exact(&mut buf)
+            .map_err(|e| SolverError::BatchSerialize(format!("failed to read deal entry: {e}")))?;
         let (key, p1_equity, weight) = parse_raw_entry(&buf);
         deals.push(DealInfo {
             hand_bits_p1: key.p1_bits,
@@ -808,7 +896,13 @@ impl SortedEntryReader {
         }
         let entry_count = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
         let concrete_deals = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
-        Ok((Self { reader, remaining: entry_count }, concrete_deals))
+        Ok((
+            Self {
+                reader,
+                remaining: entry_count,
+            },
+            concrete_deals,
+        ))
     }
 
     /// Read the next entry, or `None` if exhausted.
@@ -841,7 +935,14 @@ fn parse_raw_entry(buf: &[u8; ENTRY_SIZE]) -> (TrajectoryKey, f64, f64) {
     ];
     let a = f64::from_le_bytes(buf[32..40].try_into().unwrap());
     let b = f64::from_le_bytes(buf[40..48].try_into().unwrap());
-    (TrajectoryKey { p1_bits: p1, p2_bits: p2 }, a, b)
+    (
+        TrajectoryKey {
+            p1_bits: p1,
+            p2_bits: p2,
+        },
+        a,
+        b,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -853,8 +954,8 @@ fn parse_raw_entry(buf: &[u8; ENTRY_SIZE]) -> (TrajectoryKey, f64, f64) {
 /// Returns the `concrete_deals` count from the batch header.
 fn sort_batch_to_file(batch_path: &Path, sorted_path: &Path) -> Result<u64, SolverError> {
     let data = std::fs::read(batch_path)?;
-    let batch: BatchFile = bincode::deserialize(&data)
-        .map_err(|e| SolverError::BatchSerialize(e.to_string()))?;
+    let batch: BatchFile =
+        bincode::deserialize(&data).map_err(|e| SolverError::BatchSerialize(e.to_string()))?;
     if batch.version != BATCH_VERSION {
         return Err(SolverError::BatchVersionMismatch {
             expected: BATCH_VERSION,
@@ -866,7 +967,16 @@ fn sort_batch_to_file(batch_path: &Path, sorted_path: &Path) -> Result<u64, Solv
     let mut entries: Vec<(TrajectoryKey, f64, f64)> = batch
         .entries
         .into_iter()
-        .map(|(p1, p2, w, eq)| (TrajectoryKey { p1_bits: p1, p2_bits: p2 }, w, eq))
+        .map(|(p1, p2, w, eq)| {
+            (
+                TrajectoryKey {
+                    p1_bits: p1,
+                    p2_bits: p2,
+                },
+                w,
+                eq,
+            )
+        })
         .collect();
     // Drop batch data before sorting to reduce peak memory
     drop(data);
@@ -896,7 +1006,9 @@ impl Eq for MergeEntry {}
 impl Ord for MergeEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Reverse so BinaryHeap pops the smallest key first
-        other.key.cmp(&self.key)
+        other
+            .key
+            .cmp(&self.key)
             .then_with(|| other.reader_idx.cmp(&self.reader_idx))
     }
 }
@@ -923,7 +1035,12 @@ fn streaming_kway_merge(
     for (i, path) in sorted_paths.iter().enumerate() {
         let (mut reader, _concrete) = SortedEntryReader::open(path)?;
         if let Some((key, weight, equity_sum)) = reader.next_entry()? {
-            heap.push(MergeEntry { key, weight, equity_sum, reader_idx: i });
+            heap.push(MergeEntry {
+                key,
+                weight,
+                equity_sum,
+                reader_idx: i,
+            });
         }
         readers.push(reader);
     }
@@ -943,7 +1060,11 @@ fn streaming_kway_merge(
         let current_key = current.key;
 
         // Refill the reader that provided this entry
-        refill_reader(&mut readers[current.reader_idx], current.reader_idx, &mut heap)?;
+        refill_reader(
+            &mut readers[current.reader_idx],
+            current.reader_idx,
+            &mut heap,
+        )?;
 
         // Merge all entries with the same key
         while heap.peek().is_some_and(|e| e.key == current_key) {
@@ -986,9 +1107,9 @@ fn streaming_kway_merge(
     out.flush()?;
 
     // Seek back and write the actual entry count in the header
-    let mut file = out.into_inner().map_err(|e| {
-        SolverError::BatchSerialize(format!("failed to flush output: {e}"))
-    })?;
+    let mut file = out
+        .into_inner()
+        .map_err(|e| SolverError::BatchSerialize(format!("failed to flush output: {e}")))?;
     file.seek(SeekFrom::Start(8))?;
     file.write_all(&entry_count.to_le_bytes())?;
 
@@ -1014,7 +1135,12 @@ fn refill_reader(
     heap: &mut BinaryHeap<MergeEntry>,
 ) -> Result<(), SolverError> {
     if let Some((key, weight, equity_sum)) = reader.next_entry()? {
-        heap.push(MergeEntry { key, weight, equity_sum, reader_idx: idx });
+        heap.push(MergeEntry {
+            key,
+            weight,
+            equity_sum,
+            reader_idx: idx,
+        });
     }
     Ok(())
 }
@@ -1070,7 +1196,8 @@ fn merge_flop_results(
         concrete += local_count;
         for (key, accum) in local_map {
             let e = global.entry(key).or_insert(TrajectoryAccum {
-                weight: 0.0, equity_sum: 0.0,
+                weight: 0.0,
+                equity_sum: 0.0,
             });
             e.weight += accum.weight;
             e.equity_sum += accum.equity_sum;
@@ -1084,7 +1211,8 @@ fn finalize_deals(
     map: FxHashMap<TrajectoryKey, TrajectoryAccum>,
     concrete_deals: u64,
 ) -> (Vec<AbstractDeal>, GenerationStats) {
-    let deals: Vec<AbstractDeal> = map.into_iter()
+    let deals: Vec<AbstractDeal> = map
+        .into_iter()
         .map(|(key, accum)| AbstractDeal {
             hand_bits_p1: key.p1_bits,
             hand_bits_p2: key.p2_bits,
@@ -1094,7 +1222,11 @@ fn finalize_deals(
         .collect();
     let n = deals.len();
     #[allow(clippy::cast_precision_loss)]
-    let compression = if n > 0 { concrete_deals as f64 / n as f64 } else { 0.0 };
+    let compression = if n > 0 {
+        concrete_deals as f64 / n as f64
+    } else {
+        0.0
+    };
     let stats = GenerationStats {
         concrete_deals,
         abstract_deals: n,
@@ -1117,12 +1249,15 @@ fn generate_hole_pairs(deck: &[Card]) -> Vec<[Card; 2]> {
 /// Convert abstract deals to `DealInfo` for use with the sequence-form solver.
 #[must_use]
 pub fn to_deal_infos(deals: &[AbstractDeal]) -> Vec<DealInfo> {
-    deals.iter().map(|ad| DealInfo {
-        hand_bits_p1: ad.hand_bits_p1,
-        hand_bits_p2: ad.hand_bits_p2,
-        p1_equity: ad.p1_equity,
-        weight: ad.weight,
-    }).collect()
+    deals
+        .iter()
+        .map(|ad| DealInfo {
+            hand_bits_p1: ad.hand_bits_p1,
+            hand_bits_p2: ad.hand_bits_p2,
+            p1_equity: ad.p1_equity,
+            weight: ad.weight,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1148,7 +1283,9 @@ mod tests {
     }
 
     fn encode_postflop_legacy(
-        holding: [Card; 2], board: &[Card], config: &AbstractDealConfig,
+        holding: [Card; 2],
+        board: &[Card],
+        config: &AbstractDealConfig,
     ) -> u32 {
         let classification = classify(holding, board).unwrap_or_default();
         let class_id = classification.strongest_made_id();
@@ -1165,20 +1302,28 @@ mod tests {
             0
         };
         encode_hand_v2(
-            class_id, strength, eq_bin, draw_flags,
-            config.strength_bits, config.equity_bits,
+            class_id,
+            strength,
+            eq_bin,
+            draw_flags,
+            config.strength_bits,
+            config.equity_bits,
         )
     }
 
     fn enumerate_flop_for_pair_legacy(
-        p1: [Card; 2], p2: [Card; 2],
+        p1: [Card; 2],
+        p2: [Card; 2],
         flop: &crate::flops::CanonicalFlop,
-        deck: &[Card], config: &AbstractDealConfig,
+        deck: &[Card],
+        config: &AbstractDealConfig,
         map: &mut FxHashMap<TrajectoryKey, TrajectoryAccum>,
     ) -> u64 {
         let dead = [p1[0], p1[1], p2[0], p2[1]];
         let fc = *flop.cards();
-        if fc.iter().any(|c| dead.contains(c)) { return 0; }
+        if fc.iter().any(|c| dead.contains(c)) {
+            return 0;
+        }
 
         let pp1 = u32::from(canonical_hand_index(p1));
         let pp2 = u32::from(canonical_hand_index(p2));
@@ -1186,9 +1331,11 @@ mod tests {
         let fp1 = encode_postflop_legacy(p1, &fc, config);
         let fp2 = encode_postflop_legacy(p2, &fc, config);
 
-        let remaining: Vec<Card> = deck.iter()
+        let remaining: Vec<Card> = deck
+            .iter()
             .filter(|c| !dead.contains(c) && !fc.contains(c))
-            .copied().collect();
+            .copied()
+            .collect();
 
         let mut count = 0u64;
         for (ti, &turn) in remaining.iter().enumerate() {
@@ -1207,7 +1354,8 @@ mod tests {
                     p2_bits: [pp2, fp2, tp2, rp2],
                 };
                 let e = map.entry(key).or_insert(TrajectoryAccum {
-                    weight: 0.0, equity_sum: 0.0,
+                    weight: 0.0,
+                    equity_sum: 0.0,
                 });
                 e.weight += fw;
                 e.equity_sum += eq * fw;
@@ -1224,9 +1372,13 @@ mod tests {
         let deck = crate::poker::full_deck();
         let hole_pairs = select_hole_pairs(&deck, config.max_hole_pairs);
 
-        let hand_pairs: Vec<([Card; 2], [Card; 2])> = hole_pairs.iter().enumerate()
+        let hand_pairs: Vec<([Card; 2], [Card; 2])> = hole_pairs
+            .iter()
+            .enumerate()
             .flat_map(|(i, &p1)| {
-                hole_pairs.iter().enumerate()
+                hole_pairs
+                    .iter()
+                    .enumerate()
                     .filter(move |(j, _)| *j != i)
                     .filter(move |(_, p2)| !cards_overlap(p1, **p2))
                     .map(move |(_, p2)| (p1, *p2))
@@ -1237,9 +1389,8 @@ mod tests {
         let mut concrete = 0u64;
         for flop in &canonical_flops {
             for &(p1, p2) in &hand_pairs {
-                concrete += enumerate_flop_for_pair_legacy(
-                    p1, p2, flop, &deck, config, &mut global_map,
-                );
+                concrete +=
+                    enumerate_flop_for_pair_legacy(p1, p2, flop, &deck, config, &mut global_map);
             }
         }
         finalize_deals(global_map, concrete)
@@ -1254,7 +1405,10 @@ mod tests {
         let config = small_config();
         let (deals, stats) = generate_abstract_deals(&config);
 
-        assert!(!deals.is_empty(), "Should generate at least one abstract deal");
+        assert!(
+            !deals.is_empty(),
+            "Should generate at least one abstract deal"
+        );
         assert!(stats.concrete_deals > 0);
         assert!(stats.compression_ratio >= 1.0);
 
@@ -1265,7 +1419,8 @@ mod tests {
             assert!(
                 (0.0..=1.0).contains(&deal.p1_equity),
                 "Equity {:.4} out of range for deal {:?}",
-                deal.p1_equity, deal.hand_bits_p1
+                deal.p1_equity,
+                deal.hand_bits_p1
             );
         }
 
@@ -1320,27 +1475,33 @@ mod tests {
             legacy_stats.concrete_deals, new_stats.concrete_deals,
         );
         assert_eq!(
-            legacy_deals.len(), new_deals.len(),
+            legacy_deals.len(),
+            new_deals.len(),
             "abstract deal count mismatch: legacy={}, new={}",
-            legacy_deals.len(), new_deals.len(),
+            legacy_deals.len(),
+            new_deals.len(),
         );
 
         // Build legacy lookup for comparison
-        let legacy_map: FxHashMap<([u32; 4], [u32; 4]), (f64, f64)> = legacy_deals.iter()
+        let legacy_map: FxHashMap<([u32; 4], [u32; 4]), (f64, f64)> = legacy_deals
+            .iter()
             .map(|d| ((d.hand_bits_p1, d.hand_bits_p2), (d.weight, d.p1_equity)))
             .collect();
 
         for deal in &new_deals {
             let key = (deal.hand_bits_p1, deal.hand_bits_p2);
-            let &(lw, le) = legacy_map.get(&key)
+            let &(lw, le) = legacy_map
+                .get(&key)
                 .unwrap_or_else(|| panic!("Missing trajectory in legacy: {key:?}"));
             assert!(
                 (deal.weight - lw).abs() < 1e-6,
-                "Weight mismatch for {key:?}: new={}, legacy={lw}", deal.weight,
+                "Weight mismatch for {key:?}: new={}, legacy={lw}",
+                deal.weight,
             );
             assert!(
                 (deal.p1_equity - le).abs() < 1e-6,
-                "Equity mismatch for {key:?}: new={}, legacy={le}", deal.p1_equity,
+                "Equity mismatch for {key:?}: new={}, legacy={le}",
+                deal.p1_equity,
             );
         }
     }
@@ -1351,8 +1512,22 @@ mod tests {
         let path = dir.path().join("test.sorted");
 
         let entries = vec![
-            (TrajectoryKey { p1_bits: [1,2,3,4], p2_bits: [5,6,7,8] }, 10.0, 7.5),
-            (TrajectoryKey { p1_bits: [9,10,11,12], p2_bits: [13,14,15,16] }, 20.0, 15.0),
+            (
+                TrajectoryKey {
+                    p1_bits: [1, 2, 3, 4],
+                    p2_bits: [5, 6, 7, 8],
+                },
+                10.0,
+                7.5,
+            ),
+            (
+                TrajectoryKey {
+                    p1_bits: [9, 10, 11, 12],
+                    p2_bits: [13, 14, 15, 16],
+                },
+                20.0,
+                15.0,
+            ),
         ];
 
         write_sorted_file(&path, &entries, 42).expect("write");
@@ -1361,12 +1536,12 @@ mod tests {
         assert_eq!(concrete, 42);
 
         let e1 = reader.next_entry().expect("read").expect("entry");
-        assert_eq!(e1.0.p1_bits, [1,2,3,4]);
+        assert_eq!(e1.0.p1_bits, [1, 2, 3, 4]);
         assert!((e1.1 - 10.0).abs() < f64::EPSILON);
         assert!((e1.2 - 7.5).abs() < f64::EPSILON);
 
         let e2 = reader.next_entry().expect("read").expect("entry");
-        assert_eq!(e2.0.p1_bits, [9,10,11,12]);
+        assert_eq!(e2.0.p1_bits, [9, 10, 11, 12]);
 
         assert!(reader.next_entry().expect("read").is_none());
     }
@@ -1380,8 +1555,14 @@ mod tests {
         let file = std::fs::File::create(&path).expect("create");
         let mut w = BufWriter::new(file);
         write_raw_header(&mut w, *DEAL_MAGIC, 2, 100).expect("header");
-        let k1 = TrajectoryKey { p1_bits: [1,2,3,4], p2_bits: [5,6,7,8] };
-        let k2 = TrajectoryKey { p1_bits: [10,20,30,40], p2_bits: [50,60,70,80] };
+        let k1 = TrajectoryKey {
+            p1_bits: [1, 2, 3, 4],
+            p2_bits: [5, 6, 7, 8],
+        };
+        let k2 = TrajectoryKey {
+            p1_bits: [10, 20, 30, 40],
+            p2_bits: [50, 60, 70, 80],
+        };
         write_raw_entry(&mut w, &k1, 0.75, 10.0).expect("entry");
         write_raw_entry(&mut w, &k2, 0.25, 5.0).expect("entry");
         w.flush().expect("flush");
@@ -1389,10 +1570,10 @@ mod tests {
 
         let deals = load_raw_deal_file(&path).expect("load");
         assert_eq!(deals.len(), 2);
-        assert_eq!(deals[0].hand_bits_p1, [1,2,3,4]);
+        assert_eq!(deals[0].hand_bits_p1, [1, 2, 3, 4]);
         assert!((deals[0].p1_equity - 0.75).abs() < f64::EPSILON);
         assert!((deals[0].weight - 10.0).abs() < f64::EPSILON);
-        assert_eq!(deals[1].hand_bits_p1, [10,20,30,40]);
+        assert_eq!(deals[1].hand_bits_p1, [10, 20, 30, 40]);
     }
 
     #[timed_test(30)]
@@ -1419,10 +1600,7 @@ mod tests {
 
         // Merge
         let output = dir.path().join("merged.bin");
-        let stats = merge_deal_batches(
-            &[batch1_path, batch2_path],
-            &output,
-        ).expect("merge");
+        let stats = merge_deal_batches(&[batch1_path, batch2_path], &output).expect("merge");
 
         assert!(stats.abstract_deals > 0);
         assert!(stats.concrete_deals > 0);

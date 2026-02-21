@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use poker_solver_core::blueprint::{BlueprintStrategy, BundleConfig, StrategyBundle};
-use poker_solver_core::info_key::{canonical_hand_index_from_str, spr_bucket, InfoKey};
+use poker_solver_core::info_key::{InfoKey, canonical_hand_index_from_str, spr_bucket};
 
 fn main() {
     let path = std::env::args()
@@ -55,7 +55,10 @@ fn main() {
     println!("Parsed OK:");
     println!("  stack_depth:          {}", config.game.stack_depth);
     println!("  bet_sizes:            {:?}", config.game.bet_sizes);
-    println!("  max_raises_per_street:{}", config.game.max_raises_per_street);
+    println!(
+        "  max_raises_per_street:{}",
+        config.game.max_raises_per_street
+    );
     println!("  abstraction_mode:     {:?}", config.abstraction_mode);
     println!("  abstraction:          {:?}", config.abstraction);
     println!();
@@ -128,9 +131,7 @@ fn main() {
 
     // --- Step 5: Probe specific preflop keys ---
     println!("--- Preflop key probes ---");
-    let probe_hands = [
-        "AA", "KK", "AKs", "AKo", "AQs", "JTs", "76s", "72o", "32o",
-    ];
+    let probe_hands = ["AA", "KK", "AKs", "AKo", "AQs", "JTs", "76s", "72o", "32o"];
     // Initial SB opening: SPR and depth buckets vary by config
     let preflop_eff_stack = config.game.stack_depth * 2 - 2;
     let spr_b = spr_bucket(3, preflop_eff_stack);
@@ -155,7 +156,9 @@ fn main() {
 
     // --- Step 6: Simulated 13x13 matrix lookup ---
     println!("--- Simulated matrix lookup (preflop) ---");
-    let ranks = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+    let ranks = [
+        'A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2',
+    ];
     let mut found = 0u32;
     let mut missing = 0u32;
 
@@ -186,8 +189,7 @@ fn main() {
             };
 
             if let Some(idx) = canonical_hand_index_from_str(&hand) {
-                let key =
-                    InfoKey::new(u32::from(idx), 0, spr_b, &[]).as_u64();
+                let key = InfoKey::new(u32::from(idx), 0, spr_b, &[]).as_u64();
                 if blueprint.lookup(key).is_some() {
                     found += 1;
                 } else {
@@ -232,8 +234,7 @@ fn main() {
 
         println!("  pot={limp_pot} spr_bucket={spr_b}");
 
-        let position_key =
-            InfoKey::new(0, street_num, spr_b, &[]).as_u64();
+        let position_key = InfoKey::new(0, street_num, spr_b, &[]).as_u64();
         let position_mask: u64 = (1u64 << 44) - 1;
 
         println!("  position_key: {position_key:#018x}");
