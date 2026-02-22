@@ -483,6 +483,81 @@ pub fn cluster_per_texture(
     assignments
 }
 
+/// Cluster features globally: pool all `(hand, texture)` feature vectors into one
+/// k-means run so bucket IDs are consistent across textures.
+///
+/// Returns `assignments[hand_idx][texture_id]` → bucket ID.
+///
+/// Unlike `cluster_per_texture` which runs independent k-means per texture,
+/// this pools all non-NaN feature vectors, runs k-means once, and maps
+/// assignments back. Blocked (NaN) hands are assigned to the nearest global
+/// centroid using their cross-texture average.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn cluster_global(
+    features: &[Vec<EhsFeatures>],
+    k: u16,
+    num_textures: usize,
+) -> Vec<Vec<u16>> {
+    let num_hands = features.len();
+
+    // Precompute each hand's average feature vector across non-blocked textures
+    let hand_averages: Vec<EhsFeatures> = (0..num_hands)
+        .map(|h| {
+            let valid: Vec<&EhsFeatures> = features[h]
+                .iter()
+                .filter(|f| !f[0].is_nan())
+                .collect();
+            if valid.is_empty() {
+                return [0.5, 0.0, 0.0];
+            }
+            let n = valid.len() as f64;
+            [
+                valid.iter().map(|f| f[0]).sum::<f64>() / n,
+                valid.iter().map(|f| f[1]).sum::<f64>() / n,
+                valid.iter().map(|f| f[2]).sum::<f64>() / n,
+            ]
+        })
+        .collect();
+
+    // Pool all non-NaN (hand, texture) feature vectors into one flat list.
+    // Track the original (hand, texture) index for each pooled point.
+    let mut pooled_points: Vec<EhsFeatures> = Vec::new();
+    let mut pooled_origins: Vec<(usize, usize)> = Vec::new();
+    let mut blocked: Vec<(usize, usize)> = Vec::new();
+
+    for (h, hand_feats) in features.iter().enumerate() {
+        for (t, feat) in hand_feats.iter().enumerate() {
+            if feat[0].is_nan() {
+                blocked.push((h, t));
+            } else {
+                pooled_points.push(*feat);
+                pooled_origins.push((h, t));
+            }
+        }
+    }
+
+    // Run k-means once on all pooled points
+    let pooled_assignments = kmeans(&pooled_points, k as usize, 100);
+
+    // Compute global centroids for assigning blocked hands
+    let centroids = recompute_centroids(&pooled_points, &pooled_assignments, k as usize);
+
+    // Map assignments back to [hand][texture] shape
+    let mut assignments = vec![vec![0u16; num_textures]; num_hands];
+    for (i, &(h, t)) in pooled_origins.iter().enumerate() {
+        assignments[h][t] = pooled_assignments[i];
+    }
+    for &(h, t) in &blocked {
+        assignments[h][t] = nearest_centroid(&hand_averages[h], &centroids);
+    }
+
+    // Relabel so bucket 0 = highest average EHS
+    relabel_by_centroid_ehs(&mut assignments, features, k as usize);
+
+    assignments
+}
+
 /// Relabel bucket IDs so bucket 0 has the highest average EHS, bucket 1 next, etc.
 ///
 /// Per-texture k-means produces arbitrary cluster IDs. This sorts them by average
@@ -1319,6 +1394,71 @@ mod tests {
             (centroids[0] - 0.8).abs() < 1e-9,
             "NaN should be excluded from centroid: got {}",
             centroids[0]
+        );
+    }
+
+    #[timed_test]
+    fn cluster_global_assigns_high_ehs_to_strong_buckets_across_textures() {
+        // 6 hands across 3 textures, 3 buckets.
+        // Hand 0-1: strong EHS ~0.9 on all textures
+        // Hand 2-3: medium EHS ~0.5 on all textures
+        // Hand 4-5: weak EHS ~0.1 on all textures
+        // With per-texture k-means, bucket IDs could differ per texture.
+        // With global k-means, same-strength hands must get same bucket everywhere.
+        let features = vec![
+            // Strong
+            vec![[0.90, 0.0, 0.0], [0.91, 0.0, 0.0], [0.89, 0.0, 0.0]],
+            vec![[0.88, 0.0, 0.0], [0.92, 0.0, 0.0], [0.87, 0.0, 0.0]],
+            // Medium
+            vec![[0.50, 0.0, 0.0], [0.52, 0.0, 0.0], [0.48, 0.0, 0.0]],
+            vec![[0.48, 0.0, 0.0], [0.51, 0.0, 0.0], [0.49, 0.0, 0.0]],
+            // Weak
+            vec![[0.10, 0.0, 0.0], [0.12, 0.0, 0.0], [0.11, 0.0, 0.0]],
+            vec![[0.08, 0.0, 0.0], [0.09, 0.0, 0.0], [0.13, 0.0, 0.0]],
+        ];
+        let assignments = cluster_global(&features, 3, 3);
+
+        assert_eq!(assignments.len(), 6, "one row per hand");
+        assert_eq!(assignments[0].len(), 3, "one column per texture");
+
+        // After relabeling: bucket 0 = strong, bucket 2 = weak.
+        // Strong hands should have bucket 0 on ALL textures.
+        assert_eq!(assignments[0][0], 0);
+        assert_eq!(assignments[0][1], 0);
+        assert_eq!(assignments[0][2], 0);
+        assert_eq!(assignments[1][0], 0);
+
+        // Medium hands: bucket 1 on all textures.
+        assert_eq!(assignments[2][0], 1);
+        assert_eq!(assignments[2][1], 1);
+        assert_eq!(assignments[3][0], 1);
+
+        // Weak hands: bucket 2 on all textures.
+        assert_eq!(assignments[4][0], 2);
+        assert_eq!(assignments[4][1], 2);
+        assert_eq!(assignments[5][0], 2);
+    }
+
+    #[timed_test]
+    fn cluster_global_assigns_blocked_hands_to_nearest_centroid() {
+        // 5 hands, 2 textures, 2 buckets.
+        // Hand 2 is blocked (NaN) on texture 0 but strong on texture 1.
+        // Should be assigned to strong bucket on texture 0 via cross-texture average.
+        let features = vec![
+            vec![[0.90, 0.0, 0.0], [0.92, 0.0, 0.0]],
+            vec![[0.88, 0.0, 0.0], [0.91, 0.0, 0.0]],
+            vec![[f64::NAN, f64::NAN, f64::NAN], [0.95, 0.0, 0.0]],
+            vec![[0.20, 0.0, 0.0], [0.18, 0.0, 0.0]],
+            vec![[0.22, 0.0, 0.0], [0.19, 0.0, 0.0]],
+        ];
+        let assignments = cluster_global(&features, 2, 2);
+
+        let strong_bucket = assignments[0][0];
+        let weak_bucket = assignments[3][0];
+        assert_ne!(strong_bucket, weak_bucket, "should have 2 distinct clusters");
+        assert_eq!(
+            assignments[2][0], strong_bucket,
+            "blocked strong hand should be assigned to strong bucket"
         );
     }
 }
