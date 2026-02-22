@@ -686,7 +686,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let ak = abstraction_cache::cache_key(&pf_config, has_eq);
 
             let abstraction = if let Some(values) = solve_cache::load(&cache_dir, &sk)
-                && let Some((board, buckets, bucket_equity)) =
+                && let Some((board, buckets, street_equity)) =
                     abstraction_cache::load(&cache_dir, &ak)
             {
                 eprintln!(
@@ -694,7 +694,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     solve_cache::cache_dir(&cache_dir, &sk).display()
                 );
                 PostflopAbstraction::build_from_cached(
-                    &pf_config, board, buckets, bucket_equity, values,
+                    &pf_config, board, buckets, street_equity, values,
                 )
                 .map_err(|e| format!("postflop from cache: {e}"))?
             } else {
@@ -850,7 +850,7 @@ fn run_solve_preflop(
 
         // Try full solve cache (phases 2-7 all cached).
         if let Some(values) = solve_cache::load(cache_base, &sk)
-            && let Some((board, buckets, bucket_equity)) =
+            && let Some((board, buckets, street_equity)) =
                 abstraction_cache::load(cache_base, &ak)
         {
             eprintln!(
@@ -862,7 +862,7 @@ fn run_solve_preflop(
                     pf_config,
                     board,
                     buckets,
-                    bucket_equity,
+                    street_equity,
                     values,
                 )
                 .map_err(|e| format!("postflop from cache: {e}"))?,

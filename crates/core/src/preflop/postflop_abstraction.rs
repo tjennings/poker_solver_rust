@@ -381,14 +381,14 @@ impl PostflopAbstraction {
         config: &PostflopModelConfig,
         board: BoardAbstraction,
         buckets: HandBucketMapping,
-        bucket_equity: BucketEquity,
+        street_equity: StreetEquity,
         values: PostflopValues,
     ) -> Result<Self, PostflopAbstractionError> {
         let trees = build_all_spr_trees(config)?;
         Ok(Self {
             board,
             buckets,
-            bucket_equity,
+            street_equity,
             trees,
             values,
             canonical_sprs: config.canonical_sprs.clone(),
