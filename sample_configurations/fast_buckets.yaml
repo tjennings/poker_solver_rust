@@ -62,12 +62,16 @@ postflop_model:
   num_hand_buckets_river: 60 
   ehs_samples: 200
 
-  # Postflop tree structure (per pot type: limped/raised/3bet/4bet+).
+  # Postflop tree structure (one tree per canonical SPR value).
   bet_sizes: [0.5, 1.0, 2]    # fraction of pot
   raises_per_street: 1
 
+  # Canonical SPR values: one postflop tree is built and solved per value.
+  # At runtime, each preflop pot type maps to the nearest canonical SPR.
+  canonical_sprs: [0.5, 1.0, 1.5, 3.0, 5.0, 10.0, 20.0, 50.0]
+
   # Pre-solve: chance-sampled MCCFR to converge postflop before preflop training.
-  postflop_solve_iterations: 1000   # MCCFR iterations per pot type
+  postflop_solve_iterations: 1000   # MCCFR iterations per SPR
   postflop_solve_samples: 100000        # bucket pairs sampled per iteration (0 = num_hand_buckets_flop)
 
   flop_samples_per_iter: 1
