@@ -66,6 +66,16 @@ pub struct StreetEquity {
     pub river: BucketEquity,
 }
 
+/// Progress phases for `build_street_buckets_independent`.
+pub enum BuildProgress {
+    FlopFeatures,
+    FlopClustering,
+    TurnFeatures,
+    TurnClustering,
+    RiverFeatures,
+    RiverClustering,
+}
+
 /// Per-street bucket assignments with imperfect recall.
 ///
 /// Each street is clustered independently. The player "forgets" which bucket
@@ -388,6 +398,190 @@ pub fn build_street_equity(
     let river = build_bucket_equity_from_centroids(&river_centroids);
 
     StreetEquity { flop, turn, river }
+}
+
+// ---------------------------------------------------------------------------
+// Independent per-street clustering pipeline (imperfect recall)
+// ---------------------------------------------------------------------------
+
+/// Build independent per-street bucket assignments from canonical boards.
+///
+/// Each street runs k-means independently on equity histogram CDFs (flop/turn)
+/// or raw equity (river). No cross-street dependencies. Implements standard
+/// imperfect-recall abstraction as used by Pluribus.
+#[must_use]
+pub fn build_street_buckets_independent(
+    hands: &[CanonicalHand],
+    flops: &[[Card; 3]],
+    num_flop_buckets: u16,
+    num_turn_buckets: u16,
+    num_river_buckets: u16,
+    on_progress: &(impl Fn(BuildProgress) + Sync + Send),
+) -> StreetBuckets {
+    // --- Flop ---
+    on_progress(BuildProgress::FlopFeatures);
+    let flop_features = compute_flop_histograms(hands, flops, &|_| {});
+
+    on_progress(BuildProgress::FlopClustering);
+    let flop_assignments = cluster_histograms(&flop_features, num_flop_buckets);
+
+    // --- Turn ---
+    // Sample a subset of flops to keep turn enumeration feasible.
+    let max_flop_sample = 50;
+    let flop_sample: Vec<&[Card; 3]> = flops.iter().take(max_flop_sample).collect();
+
+    // For each sampled flop, enumerate all 47 live turn cards.
+    // Use a dummy hole [Card(0), Card(1)] that won't conflict — we just need
+    // the 47 cards not on the flop. Since we only care about board cards,
+    // use two cards that are definitely not on any flop.
+    let turn_boards: Vec<[Card; 4]> = flop_sample
+        .iter()
+        .flat_map(|flop| {
+            let flop_set: Vec<Card> = flop.to_vec();
+            let live: Vec<Card> = all_cards_vec()
+                .into_iter()
+                .filter(|c| !flop_set.contains(c))
+                .collect();
+            live.into_iter().map(move |tc| [flop[0], flop[1], flop[2], tc])
+        })
+        .collect();
+
+    on_progress(BuildProgress::TurnFeatures);
+    let turn_features = compute_turn_histograms(hands, &turn_boards);
+
+    on_progress(BuildProgress::TurnClustering);
+    let turn_assignments = cluster_histograms(&turn_features, num_turn_buckets);
+
+    // --- River ---
+    // Sample a subset of turn boards, enumerate all 46 live river cards each.
+    let max_turn_sample = 100;
+    let turn_sample: Vec<&[Card; 4]> = turn_boards.iter().take(max_turn_sample).collect();
+
+    let river_boards: Vec<[Card; 5]> = turn_sample
+        .iter()
+        .flat_map(|tb| {
+            let board_set: Vec<Card> = tb.to_vec();
+            let live: Vec<Card> = all_cards_vec()
+                .into_iter()
+                .filter(|c| !board_set.contains(c))
+                .collect();
+            live.into_iter()
+                .map(move |rc| [tb[0], tb[1], tb[2], tb[3], rc])
+        })
+        .collect();
+
+    on_progress(BuildProgress::RiverFeatures);
+    let river_equities = compute_river_equities(hands, &river_boards);
+
+    on_progress(BuildProgress::RiverClustering);
+    let river_assignments = cluster_river_equities(&river_equities, num_river_buckets);
+
+    StreetBuckets {
+        flop: flop_assignments,
+        num_flop_buckets,
+        turn: turn_assignments,
+        num_turn_buckets,
+        river: river_assignments,
+        num_river_buckets,
+    }
+}
+
+/// All 52 cards as a Vec (for board enumeration without a hole-card reference).
+fn all_cards_vec() -> Vec<Card> {
+    use crate::poker::{Suit, Value};
+    const VALUES: [Value; 13] = [
+        Value::Two, Value::Three, Value::Four, Value::Five, Value::Six,
+        Value::Seven, Value::Eight, Value::Nine, Value::Ten,
+        Value::Jack, Value::Queen, Value::King, Value::Ace,
+    ];
+    const SUITS: [Suit; 4] = [Suit::Spade, Suit::Heart, Suit::Diamond, Suit::Club];
+    VALUES
+        .into_iter()
+        .flat_map(|v| SUITS.into_iter().map(move |s| Card::new(v, s)))
+        .collect()
+}
+
+/// Cluster histogram features into k buckets using k-means with L2 on CDFs.
+#[allow(clippy::cast_precision_loss)]
+fn cluster_histograms(features: &[HistogramFeatures], k: u16) -> Vec<u16> {
+    let valid_indices: Vec<usize> = features
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f[0].is_nan())
+        .map(|(i, _)| i)
+        .collect();
+    let valid_points: Vec<HistogramFeatures> =
+        valid_indices.iter().map(|&i| features[i]).collect();
+
+    if valid_points.is_empty() {
+        return vec![0; features.len()];
+    }
+
+    let valid_assignments = kmeans_generic(&valid_points, k as usize, 100);
+    let centroids = recompute_centroids_generic(&valid_points, &valid_assignments, k as usize);
+
+    let mut full = vec![0u16; features.len()];
+    for (vi, &orig_idx) in valid_indices.iter().enumerate() {
+        full[orig_idx] = valid_assignments[vi];
+    }
+
+    // Assign blocked (NaN) to nearest centroid using uniform CDF fallback
+    let uniform_cdf: HistogramFeatures = {
+        let mut cdf = [0.0f64; HISTOGRAM_BINS];
+        for (i, v) in cdf.iter_mut().enumerate() {
+            *v = (i + 1) as f64 / HISTOGRAM_BINS as f64;
+        }
+        cdf
+    };
+    for (i, feat) in features.iter().enumerate() {
+        if feat[0].is_nan() {
+            full[i] = nearest_centroid_generic(&uniform_cdf, &centroids);
+        }
+    }
+    full
+}
+
+/// Cluster scalar river equities into buckets.
+///
+/// Wraps equity values as 1D k-means (using `[f64; 3]` with padding for compat).
+fn cluster_river_equities(equities: &[f64], k: u16) -> Vec<u16> {
+    let points: Vec<EhsFeatures> = equities
+        .iter()
+        .map(|&eq| {
+            if eq.is_nan() {
+                [f64::NAN, 0.0, 0.0]
+            } else {
+                [eq, 0.0, 0.0]
+            }
+        })
+        .collect();
+
+    let valid_indices: Vec<usize> = points
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f[0].is_nan())
+        .map(|(i, _)| i)
+        .collect();
+    let valid_points: Vec<EhsFeatures> =
+        valid_indices.iter().map(|&i| points[i]).collect();
+
+    if valid_points.is_empty() {
+        return vec![0; equities.len()];
+    }
+
+    let valid_assignments = kmeans(&valid_points, k as usize, 100);
+    let centroids = recompute_centroids_generic(&valid_points, &valid_assignments, k as usize);
+
+    let mut full = vec![0u16; equities.len()];
+    for (vi, &orig_idx) in valid_indices.iter().enumerate() {
+        full[orig_idx] = valid_assignments[vi];
+    }
+    for (i, &eq) in equities.iter().enumerate() {
+        if eq.is_nan() {
+            full[i] = nearest_centroid_generic(&[0.5, 0.0, 0.0], &centroids);
+        }
+    }
+    full
 }
 
 // ---------------------------------------------------------------------------
@@ -1981,5 +2175,34 @@ mod tests {
             assert!(eq >= 0.0 && eq <= 1.0, "equity out of range: {eq}");
         }
         assert!(valid_count > 100, "too few valid equities: {valid_count}");
+    }
+
+    #[timed_test(300)]
+    #[ignore = "slow"]
+    fn build_street_buckets_independent_produces_valid_assignments() {
+        use crate::preflop::ehs::canonical_flops;
+        let hands: Vec<CanonicalHand> = all_hands().collect();
+        let flops = canonical_flops();
+        let small_flops: Vec<[Card; 3]> = flops.into_iter().take(3).collect();
+
+        let buckets = build_street_buckets_independent(
+            &hands, &small_flops, 5, 5, 5, &|_| {},
+        );
+
+        // All flop bucket IDs should be in range
+        for &b in &buckets.flop {
+            assert!(b < buckets.num_flop_buckets, "flop bucket {b} >= {}", buckets.num_flop_buckets);
+        }
+        // Flop situation count = hands x flops
+        assert_eq!(buckets.flop.len(), hands.len() * small_flops.len());
+        // Turn and river should also have valid assignments
+        assert!(!buckets.turn.is_empty(), "turn buckets should not be empty");
+        assert!(!buckets.river.is_empty(), "river buckets should not be empty");
+        for &b in &buckets.turn {
+            assert!(b < buckets.num_turn_buckets);
+        }
+        for &b in &buckets.river {
+            assert!(b < buckets.num_river_buckets);
+        }
     }
 }
