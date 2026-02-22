@@ -320,49 +320,15 @@ impl PostflopAbstraction {
         on_progress(BuildPhase::Trees);
         let trees = build_all_trees(config)?;
 
-        on_progress(BuildPhase::Layout);
-        let node_streets: FxHashMap<PotType, Vec<Street>> = trees
-            .iter()
-            .map(|(&pt, tree)| (pt, annotate_streets(tree)))
-            .collect();
-
         let num_b = buckets.num_flop_buckets as usize;
-
-        // Build per-pot-type layouts so each solve uses isolated, smaller buffers.
-        let pt_layouts = build_per_pot_type_layouts(
+        let values = Self::solve_values(
+            config,
             &trees,
-            &node_streets,
+            &bucket_equity,
             num_b,
             buckets.num_turn_buckets as usize,
             buckets.num_river_buckets as usize,
-        );
-
-        let total_iters = config.postflop_solve_iterations as usize;
-        let samples = if config.postflop_solve_samples > 0 {
-            config.postflop_solve_samples as usize
-        } else {
-            num_b
-        };
-        let total_steps = total_iters * NUM_POT_TYPES;
-        on_progress(BuildPhase::SolvingPostflop(0, total_steps));
-
-        let pt_strategy_sums = solve_postflop_per_pot_type(
-            &trees,
-            &pt_layouts,
-            &bucket_equity,
-            num_b,
-            total_iters,
-            samples,
-            |step, total| on_progress(BuildPhase::SolvingPostflop(step, total)),
-        );
-
-        on_progress(BuildPhase::ComputingValues);
-        let values = compute_postflop_values(
-            &trees,
-            &pt_layouts,
-            &bucket_equity,
-            &pt_strategy_sums,
-            num_b,
+            &on_progress,
         );
 
         Ok(Self {
@@ -372,6 +338,85 @@ impl PostflopAbstraction {
             trees,
             values,
         })
+    }
+
+    /// Build PostflopAbstraction using pre-cached values, skipping the solve phase.
+    ///
+    /// Loads abstraction from cache, rebuilds trees (instant), and uses the
+    /// provided `PostflopValues` directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tree building fails.
+    pub fn build_from_cached(
+        config: &PostflopModelConfig,
+        board: BoardAbstraction,
+        buckets: HandBucketMapping,
+        bucket_equity: BucketEquity,
+        values: PostflopValues,
+    ) -> Result<Self, PostflopAbstractionError> {
+        let trees = build_all_trees(config)?;
+        Ok(Self {
+            board,
+            buckets,
+            bucket_equity,
+            trees,
+            values,
+        })
+    }
+
+    /// Run the postflop CFR solve and compute the value table.
+    ///
+    /// This is the expensive phase (minutes). The result can be cached via `solve_cache`.
+    pub fn solve_values(
+        config: &PostflopModelConfig,
+        trees: &FxHashMap<PotType, PostflopTree>,
+        bucket_equity: &BucketEquity,
+        num_flop_buckets: usize,
+        num_turn_buckets: usize,
+        num_river_buckets: usize,
+        on_progress: impl Fn(BuildPhase) + Sync,
+    ) -> PostflopValues {
+        let node_streets: FxHashMap<PotType, Vec<Street>> = trees
+            .iter()
+            .map(|(&pt, tree)| (pt, annotate_streets(tree)))
+            .collect();
+
+        let pt_layouts = build_per_pot_type_layouts(
+            trees,
+            &node_streets,
+            num_flop_buckets,
+            num_turn_buckets,
+            num_river_buckets,
+        );
+
+        let total_iters = config.postflop_solve_iterations as usize;
+        let samples = if config.postflop_solve_samples > 0 {
+            config.postflop_solve_samples as usize
+        } else {
+            num_flop_buckets
+        };
+        let total_steps = total_iters * NUM_POT_TYPES;
+        on_progress(BuildPhase::SolvingPostflop(0, total_steps));
+
+        let pt_strategy_sums = solve_postflop_per_pot_type(
+            trees,
+            &pt_layouts,
+            bucket_equity,
+            num_flop_buckets,
+            total_iters,
+            samples,
+            |step, total| on_progress(BuildPhase::SolvingPostflop(step, total)),
+        );
+
+        on_progress(BuildPhase::ComputingValues);
+        compute_postflop_values(
+            trees,
+            &pt_layouts,
+            bucket_equity,
+            &pt_strategy_sums,
+            num_flop_buckets,
+        )
     }
 }
 
