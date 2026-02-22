@@ -41,6 +41,9 @@ fn default_postflop_solve_iterations() -> u32 {
 fn default_postflop_solve_samples() -> u32 {
     0
 }
+fn default_canonical_sprs() -> Vec<f64> {
+    vec![0.5, 1.0, 1.5, 3.0, 5.0, 10.0, 20.0, 50.0]
+}
 
 /// Configuration for the postflop model integrated into the preflop solver.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -79,6 +82,11 @@ pub struct PostflopModelConfig {
     /// Bucket pairs sampled per MCCFR iteration. 0 = use num_hand_buckets_flop.
     #[serde(default = "default_postflop_solve_samples")]
     pub postflop_solve_samples: u32,
+
+    /// Canonical SPR values for postflop solving. One tree is built and solved
+    /// per SPR value. At runtime, each pot type maps to the nearest canonical SPR.
+    #[serde(default = "default_canonical_sprs")]
+    pub canonical_sprs: Vec<f64>,
 }
 
 impl PostflopModelConfig {
@@ -126,6 +134,7 @@ impl PostflopModelConfig {
             flop_samples_per_iter: 1,
             postflop_solve_iterations: 200,
             postflop_solve_samples: 0,
+            canonical_sprs: default_canonical_sprs(),
         }
     }
 
@@ -234,5 +243,22 @@ mod tests {
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let restored: PostflopModelConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(cfg, restored);
+    }
+
+    #[timed_test]
+    fn default_canonical_sprs_has_eight_values() {
+        let cfg = PostflopModelConfig::standard();
+        assert_eq!(cfg.canonical_sprs.len(), 8);
+        assert!((cfg.canonical_sprs[0] - 0.5).abs() < 1e-9);
+        assert!((cfg.canonical_sprs[7] - 50.0).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn serde_round_trip_with_canonical_sprs() {
+        let mut cfg = PostflopModelConfig::fast();
+        cfg.canonical_sprs = vec![1.0, 5.0, 20.0];
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let restored: PostflopModelConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(cfg.canonical_sprs, restored.canonical_sprs);
     }
 }
