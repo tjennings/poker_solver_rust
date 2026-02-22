@@ -659,15 +659,9 @@ fn postflop_showdown_value(
     let ip_player = pot_type.default_ip_player();
     let hero_tree_pos = u8::from(hero_pos == ip_player);
 
-    // Map preflop hand indices to flop buckets (texture 0 as representative).
-    let hero_bucket = pf_state.abstraction.buckets.flop_buckets
-        .get(hero_hand as usize)
-        .and_then(|v| v.first().copied())
-        .unwrap_or(0);
-    let opp_bucket = pf_state.abstraction.buckets.flop_buckets
-        .get(opp_hand as usize)
-        .and_then(|v| v.first().copied())
-        .unwrap_or(0);
+    // Map preflop hand indices to flop buckets (flop 0 as representative).
+    let hero_bucket = pf_state.abstraction.buckets.flop_bucket_for_hand(hero_hand as usize, 0);
+    let opp_bucket = pf_state.abstraction.buckets.flop_bucket_for_hand(opp_hand as usize, 0);
 
     let pf_ev_frac = pf_state.abstraction.values.get_by_spr(
         spr_idx, hero_tree_pos, hero_bucket, opp_bucket,

@@ -6,10 +6,9 @@
 use std::path::Path;
 
 use poker_solver_core::hands::{CanonicalHand, all_hands};
-use poker_solver_core::preflop::board_abstraction::{BoardAbstraction, BoardAbstractionConfig};
 use poker_solver_core::preflop::hand_buckets::{
-    BucketEquity, HandBucketMapping, StreetEquity, compute_all_flop_features, cluster_per_texture,
-    bucket_ehs_centroids, build_bucket_equity_from_centroids,
+    BucketEquity, StreetBuckets, StreetEquity, build_street_buckets_independent,
+    compute_all_flop_features, bucket_ehs_centroids,
 };
 use poker_solver_core::preflop::postflop_model::PostflopModelConfig;
 use poker_solver_core::preflop::{abstraction_cache, ehs::EhsFeatures};
@@ -36,37 +35,49 @@ pub struct CheckResult {
 /// Run all bucket diagnostics, returning true if all non-info checks pass.
 pub fn run(config: &PostflopModelConfig, cache_dir: &Path, json: bool) -> bool {
     let num_buckets = config.num_hand_buckets_flop;
-    let num_textures = config.num_flop_textures;
 
     eprintln!("Loading or building abstraction...");
-    let (board, buckets, street_equity) = load_or_build(config, cache_dir);
+    let (buckets, street_equity) = load_or_build(config, cache_dir);
     let equity = &street_equity.flop;
+    let num_flop_boards = buckets.num_flop_boards;
 
     let hands: Vec<CanonicalHand> = all_hands().collect();
-    let flop_samples: Vec<Vec<_>> = board.prototype_flops.iter().map(|f| vec![*f]).collect();
 
-    eprintln!("Computing EHS features ({} hands x {} textures)...", hands.len(), flop_samples.len());
+    // Convert flat StreetBuckets.flop to 2D assignments for compatibility with diagnostic checks.
+    let assignments: Vec<Vec<u16>> = (0..hands.len())
+        .map(|h| {
+            (0..num_flop_boards)
+                .map(|f| buckets.flop_bucket_for_hand(h, f))
+                .collect()
+        })
+        .collect();
+
+    // We need EHS features for the diagnostic checks. Compute from canonical flops.
+    let flops = poker_solver_core::preflop::ehs::canonical_flops();
+    let flop_samples: Vec<Vec<_>> = flops.iter().take(num_flop_boards).map(|f| vec![*f]).collect();
+    let num_textures = flop_samples.len();
+
+    eprintln!("Computing EHS features ({} hands x {} textures)...", hands.len(), num_textures);
     let features = compute_all_flop_features(&hands, &flop_samples, &|_| {});
-    let assignments = &buckets.flop_buckets;
-    let centroids = bucket_ehs_centroids(&features, assignments, num_buckets as usize);
+    let centroids = bucket_ehs_centroids(&features, &assignments, num_buckets as usize);
 
     let nb = num_buckets as usize;
-    let nt = num_textures as usize;
+    let nt = num_textures;
     let results = vec![
-        check_bucket_sizes(assignments, num_buckets, nt),
-        check_silhouette(&features, assignments, &centroids, nb),
-        check_ehs_overlap(&features, assignments, &centroids, nb),
-        check_monotonicity(&centroids, &equity),
-        check_known_hands(&hands, assignments, &centroids, nb),
-        check_cross_texture(&hands, assignments, &centroids, nb, nt),
-        check_equity_coherence(&equity),
-        check_draw_buckets(&features, assignments, nb),
+        check_bucket_sizes(&assignments, num_buckets, nt),
+        check_silhouette(&features, &assignments, &centroids, nb),
+        check_ehs_overlap(&features, &assignments, &centroids, nb),
+        check_monotonicity(&centroids, equity),
+        check_known_hands(&hands, &assignments, &centroids, nb),
+        check_cross_texture(&hands, &assignments, &centroids, nb, nt),
+        check_equity_coherence(equity),
+        check_draw_buckets(&features, &assignments, nb),
     ];
 
     if json {
         print_json(&results);
     } else {
-        print_text(&results, num_buckets, num_textures);
+        print_text(&results, num_buckets, num_textures as u16);
     }
 
     results.iter().all(|r| r.status != CheckStatus::Fail)
@@ -79,55 +90,42 @@ pub fn run(config: &PostflopModelConfig, cache_dir: &Path, json: bool) -> bool {
 fn load_or_build(
     config: &PostflopModelConfig,
     cache_base: &Path,
-) -> (BoardAbstraction, HandBucketMapping, StreetEquity) {
+) -> (StreetBuckets, StreetEquity) {
     let key = abstraction_cache::cache_key(config, false);
     if let Some(cached) = abstraction_cache::load(cache_base, &key) {
         eprintln!("Cache hit: {}", abstraction_cache::cache_dir(cache_base, &key).display());
         return cached;
     }
 
-    eprintln!("Cache miss — building board abstraction...");
-    let ba_config = BoardAbstractionConfig {
-        num_flop_textures: config.num_flop_textures,
-        num_turn_transitions: config.num_turn_transitions,
-        num_river_transitions: config.num_river_transitions,
-        kmeans_max_iter: 50,
-    };
-    let board = BoardAbstraction::build(&ba_config).expect("board abstraction build failed");
-
+    eprintln!("Cache miss — building independent per-street buckets...");
     let hands: Vec<CanonicalHand> = all_hands().collect();
-    let flop_samples: Vec<Vec<_>> = board.prototype_flops.iter().map(|f| vec![*f]).collect();
+    let flops = poker_solver_core::preflop::ehs::canonical_flops();
 
-    eprintln!("Computing EHS features...");
-    let features = compute_all_flop_features(&hands, &flop_samples, &|_| {});
-    let num_buckets = config.num_hand_buckets_flop;
-    let num_textures = flop_samples.len();
+    let buckets = build_street_buckets_independent(
+        &hands,
+        &flops,
+        config.num_hand_buckets_flop,
+        config.num_hand_buckets_turn,
+        config.num_hand_buckets_river,
+        &|_| {},
+    );
 
-    eprintln!("Clustering into {} buckets x {} textures...", num_buckets, num_textures);
-    let flop_assignments = cluster_per_texture(&features, num_buckets, num_textures);
-
-    let centroids = bucket_ehs_centroids(&features, &flop_assignments, num_buckets as usize);
-    let flop_equity = build_bucket_equity_from_centroids(&centroids);
+    // Build placeholder equity (0.5 uniform) — matches postflop_abstraction behavior.
+    let make_eq = |n: u16| BucketEquity {
+        equity: vec![vec![0.5f32; n as usize]; n as usize],
+        num_buckets: n as usize,
+    };
     let street_equity = StreetEquity {
-        flop: flop_equity,
-        turn: build_bucket_equity_from_centroids(&centroids),
-        river: build_bucket_equity_from_centroids(&centroids),
+        flop: make_eq(buckets.num_flop_buckets),
+        turn: make_eq(buckets.num_turn_buckets),
+        river: make_eq(buckets.num_river_buckets),
     };
 
-    let buckets = HandBucketMapping {
-        num_flop_buckets: num_buckets,
-        num_turn_buckets: num_buckets,
-        num_river_buckets: num_buckets,
-        flop_buckets: flop_assignments,
-        turn_buckets: vec![],
-        river_buckets: vec![],
-    };
-
-    if let Err(e) = abstraction_cache::save(cache_base, &key, &board, &buckets, &street_equity) {
+    if let Err(e) = abstraction_cache::save(cache_base, &key, &buckets, &street_equity) {
         eprintln!("Warning: failed to save cache: {e}");
     }
 
-    (board, buckets, street_equity)
+    (buckets, street_equity)
 }
 
 // ---------------------------------------------------------------------------

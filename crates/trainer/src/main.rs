@@ -679,42 +679,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             let pf_config = training.game.postflop_model
                 .ok_or("config file has no postflop_model section")?;
 
-            // Try loading from solve + abstraction caches (same as solve-preflop).
-            use poker_solver_core::preflop::{abstraction_cache, solve_cache};
-            let has_eq = true; // match solve-preflop's cache key (equity was used when solving)
-            let sk = solve_cache::cache_key(&pf_config, has_eq);
-            let ak = abstraction_cache::cache_key(&pf_config, has_eq);
-
-            let abstraction = if let Some(values) = solve_cache::load(&cache_dir, &sk)
-                && let Some((board, buckets, street_equity)) =
-                    abstraction_cache::load(&cache_dir, &ak)
-            {
-                eprintln!(
-                    "Solve cache hit: {}",
-                    solve_cache::cache_dir(&cache_dir, &sk).display()
-                );
-                PostflopAbstraction::build_from_cached(
-                    &pf_config, board, buckets, street_equity, values,
-                )
-                .map_err(|e| format!("postflop from cache: {e}"))?
-            } else {
-                eprintln!("Cache miss — building postflop abstraction from scratch...");
-                let abstraction = PostflopAbstraction::build(
-                    &pf_config, None, Some(&cache_dir), |phase| {
-                        eprintln!("  {phase:?}");
-                    },
-                )?;
-                // Save solve cache for next time.
-                if let Err(e) = solve_cache::save(&cache_dir, &sk, &abstraction.values) {
-                    eprintln!("Warning: failed to save solve cache: {e}");
-                } else {
-                    eprintln!(
-                        "Solve cache saved: {}",
-                        solve_cache::cache_dir(&cache_dir, &sk).display()
-                    );
-                }
-                abstraction
-            };
+            // Abstraction cache is disabled during StreetBuckets migration.
+            // Always build from scratch. Solve cache still works for PostflopValues.
+            eprintln!("Building postflop abstraction from scratch...");
+            let abstraction = PostflopAbstraction::build(
+                &pf_config, None, Some(&cache_dir), |phase| {
+                    eprintln!("  {phase:?}");
+                },
+            )?;
 
             hand_trace::run_with_abstraction(&pf_config, &abstraction)?;
         }
@@ -842,32 +814,14 @@ fn run_solve_preflop(
 
     // Build postflop abstraction before the solver takes equity ownership.
     let postflop = if let Some(pf_config) = &config.postflop_model {
-        use poker_solver_core::preflop::{abstraction_cache, solve_cache};
+        use poker_solver_core::preflop::solve_cache;
 
         let has_eq = equity_samples > 0;
         let sk = solve_cache::cache_key(pf_config, has_eq);
-        let ak = abstraction_cache::cache_key(pf_config, has_eq);
 
-        // Try full solve cache (phases 2-7 all cached).
-        if let Some(values) = solve_cache::load(cache_base, &sk)
-            && let Some((board, buckets, street_equity)) =
-                abstraction_cache::load(cache_base, &ak)
+        // Abstraction cache is disabled during StreetBuckets migration.
+        // Always build the abstraction, but try solve cache for PostflopValues.
         {
-            eprintln!(
-                "Solve cache hit: {}",
-                solve_cache::cache_dir(cache_base, &sk).display()
-            );
-            Some(
-                PostflopAbstraction::build_from_cached(
-                    pf_config,
-                    board,
-                    buckets,
-                    street_equity,
-                    values,
-                )
-                .map_err(|e| format!("postflop from cache: {e}"))?,
-            )
-        } else {
             // Build with progress, then cache the values.
             let pf_pb = ProgressBar::new(0);
             pf_pb.set_style(

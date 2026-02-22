@@ -82,13 +82,15 @@ pub enum BuildProgress {
 /// they were in on the previous street, spending the full bucket budget on
 /// present-state resolution.
 ///
-/// Situation indexing is caller-defined — typically `(hand_idx, board_idx)` mapped
-/// to a flat index.
+/// Flop situations are indexed as `hand_idx * num_flop_boards + flop_idx`.
+/// Turn and river have their own board-count-dependent indexing.
 #[derive(Serialize, Deserialize)]
 pub struct StreetBuckets {
-    /// `flop[situation_idx]` → flop bucket ID
+    /// `flop[hand_idx * num_flop_boards + flop_idx]` → flop bucket ID
     pub flop: Vec<u16>,
     pub num_flop_buckets: u16,
+    /// Number of flop boards used (for 2D indexing into the flat flop vec).
+    pub num_flop_boards: usize,
     /// `turn[situation_idx]` → turn bucket ID
     pub turn: Vec<u16>,
     pub num_turn_buckets: u16,
@@ -102,6 +104,12 @@ impl StreetBuckets {
     #[must_use]
     pub fn flop_bucket(&self, idx: usize) -> u16 {
         self.flop[idx]
+    }
+
+    /// Look up the flop bucket for a given `(hand_idx, flop_idx)` pair.
+    #[must_use]
+    pub fn flop_bucket_for_hand(&self, hand_idx: usize, flop_idx: usize) -> u16 {
+        self.flop[hand_idx * self.num_flop_boards + flop_idx]
     }
 
     /// Look up the turn bucket for a given situation index.
@@ -479,6 +487,7 @@ pub fn build_street_buckets_independent(
     StreetBuckets {
         flop: flop_assignments,
         num_flop_buckets,
+        num_flop_boards: flops.len(),
         turn: turn_assignments,
         num_turn_buckets,
         river: river_assignments,
@@ -2053,6 +2062,7 @@ mod tests {
         let sb = StreetBuckets {
             flop: vec![0, 1, 2, 0, 1],
             num_flop_buckets: 3,
+            num_flop_boards: 5,
             turn: vec![1, 0, 2, 1],
             num_turn_buckets: 3,
             river: vec![0, 0, 1, 1, 2, 2],

@@ -18,8 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::board_abstraction::BoardAbstraction;
-use super::hand_buckets::{HandBucketMapping, StreetEquity};
+use super::hand_buckets::{StreetBuckets, StreetEquity};
 use super::postflop_model::PostflopModelConfig;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -66,8 +65,7 @@ pub fn cache_dir(base: &Path, key: &AbstractionCacheKey) -> PathBuf {
 
 #[derive(Serialize, Deserialize)]
 struct AbstractionCacheData {
-    board: BoardAbstraction,
-    buckets: HandBucketMapping,
+    buckets: StreetBuckets,
     equity: StreetEquity,
 }
 
@@ -94,8 +92,7 @@ pub enum CacheError {
 pub fn save(
     base: &Path,
     key: &AbstractionCacheKey,
-    board: &BoardAbstraction,
-    buckets: &HandBucketMapping,
+    buckets: &StreetBuckets,
     equity: &StreetEquity,
 ) -> Result<(), CacheError> {
     let dir = cache_dir(base, key);
@@ -105,8 +102,7 @@ pub fn save(
     fs::write(dir.join("key.yaml"), key_yaml)?;
 
     let data = AbstractionCacheData {
-        board: board.clone(),
-        buckets: bincode_clone_buckets(buckets),
+        buckets: clone_street_buckets(buckets),
         equity: clone_street_equity(equity),
     };
     let bytes = bincode::serialize(&data).map_err(|e| CacheError::Serialize(e.to_string()))?;
@@ -120,11 +116,11 @@ pub fn save(
 pub fn load(
     base: &Path,
     key: &AbstractionCacheKey,
-) -> Option<(BoardAbstraction, HandBucketMapping, StreetEquity)> {
+) -> Option<(StreetBuckets, StreetEquity)> {
     let dir = cache_dir(base, key);
     let bytes = fs::read(dir.join("abstraction.bin")).ok()?;
     let data: AbstractionCacheData = bincode::deserialize(&bytes).ok()?;
-    Some((data.board, data.buckets, data.equity))
+    Some((data.buckets, data.equity))
 }
 
 /// Check whether a cache entry exists for the given key.
@@ -145,15 +141,15 @@ fn hex_hash(key: &AbstractionCacheKey) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Clone `HandBucketMapping` via bincode round-trip (avoids needing Clone derive).
-fn bincode_clone_buckets(b: &HandBucketMapping) -> HandBucketMapping {
-    // Fields are all Vec/u16 — just clone directly.
-    HandBucketMapping {
-        flop_buckets: b.flop_buckets.clone(),
-        turn_buckets: b.turn_buckets.clone(),
-        river_buckets: b.river_buckets.clone(),
+/// Clone `StreetBuckets` by copying fields.
+fn clone_street_buckets(b: &StreetBuckets) -> StreetBuckets {
+    StreetBuckets {
+        flop: b.flop.clone(),
         num_flop_buckets: b.num_flop_buckets,
+        num_flop_boards: b.num_flop_boards,
+        turn: b.turn.clone(),
         num_turn_buckets: b.num_turn_buckets,
+        river: b.river.clone(),
         num_river_buckets: b.num_river_buckets,
     }
 }
@@ -179,7 +175,6 @@ fn clone_street_equity(e: &StreetEquity) -> StreetEquity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::poker::{Card, Suit, Value};
     use tempfile::TempDir;
     use test_macros::timed_test;
 
@@ -196,34 +191,14 @@ mod tests {
         }
     }
 
-    fn minimal_board() -> BoardAbstraction {
-        let card = |v, s| Card::new(v, s);
-        BoardAbstraction {
-            flop_textures: vec![super::super::board_abstraction::FlopTexture {
-                id: 0,
-                weight: 1.0,
-                flush_type: 0,
-                connectivity: 0,
-                high_card: 14,
-                pairing: 0,
-            }],
-            turn_transitions: vec![vec![]],
-            river_transitions: vec![vec![]],
-            prototype_flops: vec![[
-                card(Value::Ace, Suit::Spade),
-                card(Value::King, Suit::Heart),
-                card(Value::Seven, Suit::Diamond),
-            ]],
-        }
-    }
-
-    fn minimal_buckets() -> HandBucketMapping {
-        HandBucketMapping {
-            flop_buckets: vec![vec![0u16]],
-            turn_buckets: vec![vec![0u16]],
-            river_buckets: vec![vec![0u16]],
+    fn minimal_buckets() -> StreetBuckets {
+        StreetBuckets {
+            flop: vec![0u16],
             num_flop_buckets: 1,
+            num_flop_boards: 1,
+            turn: vec![0u16],
             num_turn_buckets: 1,
+            river: vec![0u16],
             num_river_buckets: 1,
         }
     }
@@ -245,18 +220,16 @@ mod tests {
     fn cache_roundtrip() {
         let dir = TempDir::new().unwrap();
         let key = minimal_key();
-        let board = minimal_board();
         let buckets = minimal_buckets();
         let equity = minimal_equity();
 
-        save(dir.path(), &key, &board, &buckets, &equity).unwrap();
-        let (loaded_board, loaded_buckets, loaded_equity) =
+        save(dir.path(), &key, &buckets, &equity).unwrap();
+        let (loaded_buckets, loaded_equity) =
             load(dir.path(), &key).expect("cache load should succeed");
 
-        assert_eq!(loaded_board.flop_textures.len(), board.flop_textures.len());
-        assert_eq!(loaded_board.prototype_flops.len(), board.prototype_flops.len());
         assert_eq!(loaded_buckets.num_flop_buckets, buckets.num_flop_buckets);
-        assert_eq!(loaded_buckets.flop_buckets, buckets.flop_buckets);
+        assert_eq!(loaded_buckets.flop, buckets.flop);
+        assert_eq!(loaded_buckets.num_flop_boards, buckets.num_flop_boards);
         assert_eq!(loaded_equity.river.num_buckets, equity.river.num_buckets);
         assert!((loaded_equity.river.get(0, 0) - 0.5).abs() < 1e-6);
     }
@@ -299,7 +272,7 @@ mod tests {
     fn exists_true_after_save() {
         let dir = TempDir::new().unwrap();
         let key = minimal_key();
-        save(dir.path(), &key, &minimal_board(), &minimal_buckets(), &minimal_equity()).unwrap();
+        save(dir.path(), &key, &minimal_buckets(), &minimal_equity()).unwrap();
         assert!(exists(dir.path(), &key));
     }
 
@@ -307,7 +280,7 @@ mod tests {
     fn key_yaml_written_on_save() {
         let dir = TempDir::new().unwrap();
         let key = minimal_key();
-        save(dir.path(), &key, &minimal_board(), &minimal_buckets(), &minimal_equity()).unwrap();
+        save(dir.path(), &key, &minimal_buckets(), &minimal_equity()).unwrap();
         let yaml_path = cache_dir(dir.path(), &key).join("key.yaml");
         assert!(yaml_path.exists());
         let contents = fs::read_to_string(yaml_path).unwrap();
