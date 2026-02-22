@@ -249,6 +249,26 @@ pub fn canonical_flops() -> Vec<[Card; 3]> {
     result
 }
 
+/// Return a deterministic uniform sample of `n` canonical flops.
+///
+/// Uses stride-based sampling to pick evenly spaced flops from the full
+/// canonical list, ensuring coverage across the board-texture spectrum
+/// (low cards, high cards, rainbow, suited, monotone).
+/// If `n >= total`, returns all canonical flops.
+#[must_use]
+pub fn sample_canonical_flops(n: usize) -> Vec<[Card; 3]> {
+    let all = canonical_flops();
+    if n == 0 || n >= all.len() {
+        return all;
+    }
+    let total = all.len();
+    // Stride-based: pick indices 0, stride, 2*stride, ... to get n evenly spaced samples.
+    // Use fixed-point arithmetic to avoid floating-point drift.
+    (0..n)
+        .map(|i| all[i * total / n])
+        .collect()
+}
+
 /// All cards not in hole or board — thin wrapper around `live_deck`.
 #[must_use]
 pub fn live_turn_cards(hole: &[Card; 2], board: &[Card]) -> Vec<Card> {

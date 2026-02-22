@@ -384,10 +384,7 @@ fn load_or_build_abstraction(
     on_progress(BuildPhase::HandBuckets(0, hand_buckets::NUM_HANDS));
 
     let hands: Vec<_> = crate::hands::all_hands().collect();
-    let mut flops = crate::preflop::ehs::canonical_flops();
-    if config.max_flop_boards > 0 && config.max_flop_boards < flops.len() {
-        flops.truncate(config.max_flop_boards);
-    }
+    let flops = crate::preflop::ehs::sample_canonical_flops(config.max_flop_boards);
 
     let buckets = hand_buckets::build_street_buckets_independent(
         &hands,
