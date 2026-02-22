@@ -1,4 +1,5 @@
 pub mod abstraction_cache;
+pub mod equity_cache;
 pub mod board_abstraction;
 pub mod bundle;
 pub mod config;
