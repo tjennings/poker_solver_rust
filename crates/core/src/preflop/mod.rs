@@ -9,6 +9,7 @@ pub mod hand_buckets;
 pub mod postflop_abstraction;
 pub mod postflop_model;
 pub mod postflop_tree;
+pub mod solve_cache;
 pub mod solver;
 pub mod tree;
 
