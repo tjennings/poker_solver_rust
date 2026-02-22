@@ -441,7 +441,7 @@ fn build_hand_buckets_and_equity(
         &|done| on_progress(BuildPhase::HandBuckets(done, total)),
     );
 
-    let flop_buckets = hand_buckets::cluster_per_texture(&features, num_buckets, num_textures);
+    let flop_buckets = hand_buckets::cluster_global(&features, num_buckets, num_textures);
 
     hand_buckets::log_bucket_diagnostics(
         &hands, &features, &flop_buckets, num_buckets, &board.prototype_flops,

@@ -88,7 +88,7 @@ pub fn build_flop_buckets(
     validate_buckets(num_buckets, board_samples.len() as u16)?;
     let hands: Vec<CanonicalHand> = all_hands().collect();
     let features = compute_all_flop_features(&hands, board_samples, &on_hand_done);
-    Ok(cluster_per_texture(&features, num_buckets, board_samples.len()))
+    Ok(cluster_global(&features, num_buckets, board_samples.len()))
 }
 
 /// Build turn bucket assignments from flop bucket IDs and turn transition boards.
@@ -108,7 +108,7 @@ pub fn build_turn_buckets(
     validate_buckets(num_buckets, turn_board_samples.len() as u16)?;
     let hands: Vec<CanonicalHand> = all_hands().collect();
     let features = compute_all_turn_features(&hands, flop_bucket_count, turn_board_samples);
-    Ok(cluster_per_texture(&features, num_buckets, turn_board_samples.len()))
+    Ok(cluster_global(&features, num_buckets, turn_board_samples.len()))
 }
 
 /// Build river bucket assignments from turn bucket IDs and river transition boards.
@@ -126,7 +126,7 @@ pub fn build_river_buckets(
     validate_buckets(num_buckets, river_board_samples.len() as u16)?;
     let hands: Vec<CanonicalHand> = all_hands().collect();
     let features = compute_all_river_features(&hands, turn_bucket_count, river_board_samples);
-    Ok(cluster_per_texture(&features, num_buckets, river_board_samples.len()))
+    Ok(cluster_global(&features, num_buckets, river_board_samples.len()))
 }
 
 /// Build river equity table from a set of representative river boards per bucket pair.
