@@ -80,7 +80,7 @@ Each tree has three streets of Decision nodes (OOP=0, IP=1), Chance nodes at str
 
 MCCFR per-SPR tree with bucket-level abstraction:
 - Parallel iterations over all (or sampled) bucket pairs
-- Imperfect recall: at Chance nodes, bucket IDs pass through unchanged — flop bucket used for all streets
+- Imperfect recall: each street's decision nodes use that street's independent bucket ID (player "forgets" prior-street identity)
 - Output: `PostflopValues` — flat 4D array `[spr_idx][hero_pos][hero_bucket][opp_bucket] → EV`
 
 **File:** `crates/core/src/preflop/postflop_abstraction.rs`
