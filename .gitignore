@@ -25,3 +25,9 @@ local_data
 # Worktrees
 .worktrees/
 worktrees/
+
+# Dolt
+.dolt/
+
+# Cache
+cache/
