@@ -9,7 +9,6 @@ use poker_solver_core::preflop::ehs::EhsFeatures;
 use poker_solver_core::preflop::hand_buckets::{bucket_ehs_centroids, compute_all_flop_features};
 use poker_solver_core::preflop::postflop_abstraction::PostflopAbstraction;
 use poker_solver_core::preflop::postflop_model::PostflopModelConfig;
-use poker_solver_core::preflop::postflop_tree::PotType;
 use poker_solver_core::poker::{Card, Suit, Value};
 
 // ---------------------------------------------------------------------------
@@ -42,10 +41,14 @@ struct TextureTrace {
 
 #[derive(Serialize)]
 struct PostflopEvTrace {
-    limped: PositionEv,
-    raised: PositionEv,
-    three_bet: PositionEv,
-    four_bet_plus: PositionEv,
+    by_spr: Vec<SprEv>,
+}
+
+#[derive(Serialize)]
+struct SprEv {
+    spr: f64,
+    sb: f64,
+    bb: f64,
 }
 
 #[derive(Serialize)]
@@ -59,7 +62,7 @@ struct HandSummary {
     avg_ehs: f64,
     bucket_range: [u16; 2],
     blocked_texture_count: usize,
-    avg_postflop_ev_raised: PositionEv,
+    avg_postflop_ev_mid_spr: PositionEv,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,8 +129,9 @@ fn build_trace_output(
             let mut blocked_count = 0_usize;
             let mut min_bucket = u16::MAX;
             let mut max_bucket = 0_u16;
-            let mut ev_raised_sb_sum = 0.0_f64;
-            let mut ev_raised_bb_sum = 0.0_f64;
+            let mid_spr_idx = abstraction.canonical_sprs.len() / 2;
+            let mut ev_mid_sb_sum = 0.0_f64;
+            let mut ev_mid_bb_sum = 0.0_f64;
             let mut ev_count = 0_usize;
 
             #[allow(clippy::needless_range_loop)]
@@ -147,8 +151,8 @@ fn build_trace_output(
                 }
                 min_bucket = min_bucket.min(bucket);
                 max_bucket = max_bucket.max(bucket);
-                ev_raised_sb_sum += postflop_ev.raised.sb;
-                ev_raised_bb_sum += postflop_ev.raised.bb;
+                ev_mid_sb_sum += postflop_ev.by_spr[mid_spr_idx].sb;
+                ev_mid_bb_sum += postflop_ev.by_spr[mid_spr_idx].bb;
                 ev_count += 1;
 
                 let flop_str = format_flop(&abstraction.board.prototype_flops[tex_id]);
@@ -173,10 +177,10 @@ fn build_trace_output(
             } else {
                 f64::NAN
             };
-            let avg_ev_raised = if ev_count > 0 {
+            let avg_ev_mid_spr = if ev_count > 0 {
                 PositionEv {
-                    sb: ev_raised_sb_sum / ev_count as f64,
-                    bb: ev_raised_bb_sum / ev_count as f64,
+                    sb: ev_mid_sb_sum / ev_count as f64,
+                    bb: ev_mid_bb_sum / ev_count as f64,
                 }
             } else {
                 PositionEv { sb: 0.0, bb: 0.0 }
@@ -190,7 +194,7 @@ fn build_trace_output(
                     avg_ehs,
                     bucket_range: [min_bucket, max_bucket],
                     blocked_texture_count: blocked_count,
-                    avg_postflop_ev_raised: avg_ev_raised,
+                    avg_postflop_ev_mid_spr: avg_ev_mid_spr,
                 },
             }
         })
@@ -210,41 +214,26 @@ fn compute_postflop_ev(
     hero_bucket: u16,
     num_buckets: usize,
 ) -> PostflopEvTrace {
-    let pot_types = [
-        PotType::Limped,
-        PotType::Raised,
-        PotType::ThreeBet,
-        PotType::FourBetPlus,
-    ];
-
-    let mut evs = [[0.0_f64; 2]; 4];
-    for (pt_idx, &pot_type) in pot_types.iter().enumerate() {
-        for pos in 0..2_u8 {
-            let sum: f64 = (0..num_buckets as u16)
-                .map(|opp| abstraction.values.get(pot_type, pos, hero_bucket, opp))
-                .sum();
-            evs[pt_idx][pos as usize] = sum / num_buckets as f64;
-        }
-    }
-
-    PostflopEvTrace {
-        limped: PositionEv {
-            sb: evs[0][0],
-            bb: evs[0][1],
-        },
-        raised: PositionEv {
-            sb: evs[1][0],
-            bb: evs[1][1],
-        },
-        three_bet: PositionEv {
-            sb: evs[2][0],
-            bb: evs[2][1],
-        },
-        four_bet_plus: PositionEv {
-            sb: evs[3][0],
-            bb: evs[3][1],
-        },
-    }
+    let by_spr: Vec<SprEv> = abstraction
+        .canonical_sprs
+        .iter()
+        .enumerate()
+        .map(|(spr_idx, &spr)| {
+            let mut evs = [0.0_f64; 2];
+            for pos in 0..2_u8 {
+                let sum: f64 = (0..num_buckets as u16)
+                    .map(|opp| abstraction.values.get_by_spr(spr_idx, pos, hero_bucket, opp))
+                    .sum();
+                evs[pos as usize] = sum / num_buckets as f64;
+            }
+            SprEv {
+                spr,
+                sb: evs[0],
+                bb: evs[1],
+            }
+        })
+        .collect();
+    PostflopEvTrace { by_spr }
 }
 
 fn format_card(card: Card) -> String {

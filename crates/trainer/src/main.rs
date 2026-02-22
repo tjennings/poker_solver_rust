@@ -887,7 +887,7 @@ fn run_solve_preflop(
 
     let mut solver = PreflopSolver::new_with_equity(&config, equity);
     if let Some(abstraction) = postflop {
-        solver.attach_postflop(abstraction);
+        solver.attach_postflop(abstraction, &config);
     }
 
     let (mut prev_matrices, _) = print_preflop_matrices(&solver.strategy(), &tree, bb_node, 0, None);

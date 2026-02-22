@@ -83,6 +83,9 @@ pub enum PostflopTreeError {
 pub struct PostflopTree {
     pub nodes: Vec<PostflopNode>,
     pub pot_type: PotType,
+    /// Stack-to-pot ratio (each player's remaining stack / initial pot).
+    /// `f64::INFINITY` means unconstrained (legacy behavior).
+    pub spr: f64,
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -132,7 +135,32 @@ impl PostflopTree {
         let ip = pot_type.default_ip_player();
         let oop = 1 - ip;
         build_flop_subtree(&mut nodes, oop, ip, config, 1.0);
-        Ok(Self { nodes, pot_type })
+        Ok(Self { nodes, pot_type, spr: f64::INFINITY })
+    }
+
+    /// Build a three-street postflop tree with stack-depth constraints.
+    ///
+    /// `spr` is each player's remaining stack divided by the initial pot entering
+    /// postflop. Bet sizes that would exceed the remaining stack are replaced with
+    /// an all-in at the remaining fraction, and calling an all-in goes directly to
+    /// showdown (skipping remaining streets).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `config` has empty `bet_sizes` or zero transition counts.
+    pub fn build_with_spr(
+        config: &PostflopModelConfig,
+        spr: f64,
+    ) -> Result<Self, PostflopTreeError> {
+        validate_config(config)?;
+        let max_pot = 1.0 + 2.0 * spr;
+        let mut nodes: Vec<PostflopNode> = Vec::new();
+        build_flop_subtree_spr(&mut nodes, 0, 1, config, 1.0, max_pot);
+        Ok(Self {
+            nodes,
+            pot_type: PotType::Raised,
+            spr,
+        })
     }
 
     /// Returns the root node index (always 0).
@@ -486,6 +514,340 @@ fn build_flop_subtree(
     build_opening_decision(nodes, oop, ip, config, pot_fraction, Street::Flop);
 }
 
+// ─── SPR-constrained tree building ──────────────────────────────────────────
+
+/// Filter bet sizes: keep sizes below remaining stack, replace overflow with all-in.
+#[allow(clippy::cast_possible_truncation)]
+fn constrained_bet_actions(bet_sizes: &[f32], pot_fraction: f64, max_pot: f64) -> Vec<PostflopAction> {
+    let mut actions = vec![PostflopAction::Check];
+    let available = max_pot / pot_fraction - 1.0;
+    if available <= 1e-9 {
+        return actions;
+    }
+    let mut added_allin = false;
+    let mut any_capped = false;
+    for &s in bet_sizes {
+        if f64::from(s) < available - 1e-6 {
+            actions.push(PostflopAction::Bet(s));
+        } else {
+            any_capped = true;
+            if !added_allin {
+                actions.push(PostflopAction::Bet(available as f32));
+                added_allin = true;
+            }
+        }
+    }
+    // Only add an implicit all-in if at least one bet was capped but none replaced yet
+    if !added_allin && any_capped && available > 0.01 {
+        actions.push(PostflopAction::Bet(available as f32));
+    }
+    actions
+}
+
+/// Filter raise sizes against remaining stack.
+#[allow(clippy::cast_possible_truncation)]
+fn constrained_raise_actions(
+    bet_sizes: &[f32],
+    new_pot: f64,
+    max_pot: f64,
+    raises_remaining: u8,
+) -> Vec<PostflopAction> {
+    let mut actions = vec![PostflopAction::Fold, PostflopAction::Call];
+    if raises_remaining == 0 {
+        return actions;
+    }
+    let available = max_pot / new_pot - 1.0;
+    if available <= 1e-9 {
+        return actions;
+    }
+    let mut added_allin = false;
+    let mut any_capped = false;
+    for &s in bet_sizes {
+        if f64::from(s) < available - 1e-6 {
+            actions.push(PostflopAction::Raise(s));
+        } else {
+            any_capped = true;
+            if !added_allin {
+                actions.push(PostflopAction::Raise(available as f32));
+                added_allin = true;
+            }
+        }
+    }
+    // Only add an implicit all-in if at least one raise was capped but none replaced yet
+    if !added_allin && any_capped && available > 0.01 {
+        actions.push(PostflopAction::Raise(available as f32));
+    }
+    actions
+}
+
+/// Builds the flop subtree with SPR constraints (OOP=0, IP=1).
+fn build_flop_subtree_spr(
+    nodes: &mut Vec<PostflopNode>,
+    oop: u8,
+    ip: u8,
+    config: &PostflopModelConfig,
+    pot_fraction: f64,
+    max_pot: f64,
+) {
+    build_opening_decision_spr(nodes, oop, ip, config, pot_fraction, Street::Flop, max_pot);
+}
+
+/// Builds the opening decision node with SPR-constrained bet actions.
+#[allow(clippy::too_many_arguments)]
+fn build_opening_decision_spr(
+    nodes: &mut Vec<PostflopNode>,
+    actor: u8,
+    opponent: u8,
+    config: &PostflopModelConfig,
+    pot_fraction: f64,
+    street: Street,
+    max_pot: f64,
+) -> u32 {
+    let actions = constrained_bet_actions(&config.bet_sizes, pot_fraction, max_pot);
+    let idx = alloc_node(nodes);
+    let children: Vec<u32> = actions
+        .iter()
+        .map(|action| {
+            build_after_opening_action_spr(
+                nodes, actor, opponent, config, pot_fraction, street, *action, max_pot,
+            )
+        })
+        .collect();
+    set_node(
+        nodes,
+        idx,
+        PostflopNode::Decision {
+            position: actor,
+            children,
+            action_labels: actions,
+        },
+    );
+    idx
+}
+
+/// Builds the subtree after the opening player acts (SPR-aware).
+#[allow(clippy::too_many_arguments)]
+fn build_after_opening_action_spr(
+    nodes: &mut Vec<PostflopNode>,
+    actor: u8,
+    opponent: u8,
+    config: &PostflopModelConfig,
+    pot_fraction: f64,
+    street: Street,
+    action: PostflopAction,
+    max_pot: f64,
+) -> u32 {
+    match action {
+        PostflopAction::Check => {
+            build_check_response_spr(nodes, opponent, actor, config, pot_fraction, street, max_pot)
+        }
+        PostflopAction::Bet(frac) => {
+            let new_pot = (pot_fraction * (1.0 + f64::from(frac))).min(max_pot);
+            build_facing_bet_decision_spr(
+                nodes,
+                opponent,
+                actor,
+                config,
+                pot_fraction,
+                new_pot,
+                street,
+                config.raises_per_street,
+                max_pot,
+            )
+        }
+        _ => unreachable!("opener can only check or bet"),
+    }
+}
+
+/// Builds the opponent's response node after opener checks (SPR-aware).
+#[allow(clippy::too_many_arguments)]
+fn build_check_response_spr(
+    nodes: &mut Vec<PostflopNode>,
+    actor: u8,
+    opponent: u8,
+    config: &PostflopModelConfig,
+    pot_fraction: f64,
+    street: Street,
+    max_pot: f64,
+) -> u32 {
+    let actions = constrained_bet_actions(&config.bet_sizes, pot_fraction, max_pot);
+    let idx = alloc_node(nodes);
+    let children: Vec<u32> = actions
+        .iter()
+        .map(|action| match action {
+            PostflopAction::Check => {
+                build_street_end_spr(nodes, config, pot_fraction, street, max_pot)
+            }
+            PostflopAction::Bet(frac) => {
+                let new_pot = (pot_fraction * (1.0 + f64::from(*frac))).min(max_pot);
+                build_facing_bet_decision_spr(
+                    nodes,
+                    opponent,
+                    actor,
+                    config,
+                    pot_fraction,
+                    new_pot,
+                    street,
+                    config.raises_per_street,
+                    max_pot,
+                )
+            }
+            _ => unreachable!(),
+        })
+        .collect();
+    set_node(
+        nodes,
+        idx,
+        PostflopNode::Decision {
+            position: actor,
+            children,
+            action_labels: actions,
+        },
+    );
+    idx
+}
+
+/// Builds a decision node for a player facing a bet (SPR-aware).
+#[allow(clippy::too_many_arguments)]
+fn build_facing_bet_decision_spr(
+    nodes: &mut Vec<PostflopNode>,
+    actor: u8,
+    bettor: u8,
+    config: &PostflopModelConfig,
+    prev_pot: f64,
+    new_pot: f64,
+    street: Street,
+    raises_remaining: u8,
+    max_pot: f64,
+) -> u32 {
+    let actions = constrained_raise_actions(&config.bet_sizes, new_pot, max_pot, raises_remaining);
+    let idx = alloc_node(nodes);
+    let children: Vec<u32> = actions
+        .iter()
+        .map(|action| {
+            build_after_facing_bet_spr(
+                nodes,
+                actor,
+                bettor,
+                config,
+                prev_pot,
+                new_pot,
+                street,
+                raises_remaining,
+                *action,
+                max_pot,
+            )
+        })
+        .collect();
+    set_node(
+        nodes,
+        idx,
+        PostflopNode::Decision {
+            position: actor,
+            children,
+            action_labels: actions,
+        },
+    );
+    idx
+}
+
+/// Builds the child after a player responds to a bet (SPR-aware).
+#[allow(clippy::too_many_arguments)]
+fn build_after_facing_bet_spr(
+    nodes: &mut Vec<PostflopNode>,
+    actor: u8,
+    bettor: u8,
+    config: &PostflopModelConfig,
+    _prev_pot: f64,
+    new_pot: f64,
+    street: Street,
+    raises_remaining: u8,
+    action: PostflopAction,
+    max_pot: f64,
+) -> u32 {
+    match action {
+        PostflopAction::Fold => {
+            build_terminal(nodes, PostflopTerminalType::Fold { folder: actor }, new_pot)
+        }
+        PostflopAction::Call => {
+            if (new_pot - max_pot).abs() < 1e-9 || new_pot >= max_pot - 1e-9 {
+                // All-in call → go directly to showdown
+                build_terminal(nodes, PostflopTerminalType::Showdown, new_pot)
+            } else {
+                build_street_end_spr(nodes, config, new_pot, street, max_pot)
+            }
+        }
+        PostflopAction::Raise(frac) => {
+            let raised_pot = (new_pot * (1.0 + f64::from(frac))).min(max_pot);
+            build_facing_bet_decision_spr(
+                nodes,
+                bettor,
+                actor,
+                config,
+                new_pot,
+                raised_pot,
+                street,
+                raises_remaining - 1,
+                max_pot,
+            )
+        }
+        _ => unreachable!("facing-bet actor can only fold, call, or raise"),
+    }
+}
+
+/// Builds the end-of-street node with SPR constraints.
+fn build_street_end_spr(
+    nodes: &mut Vec<PostflopNode>,
+    config: &PostflopModelConfig,
+    pot_fraction: f64,
+    street: Street,
+    max_pot: f64,
+) -> u32 {
+    match street {
+        Street::Flop => build_chance_node_spr(nodes, config, pot_fraction, Street::Turn, max_pot),
+        Street::Turn => build_chance_node_spr(nodes, config, pot_fraction, Street::River, max_pot),
+        Street::River => build_terminal(nodes, PostflopTerminalType::Showdown, pot_fraction),
+        Street::Preflop => unreachable!("postflop tree starts at flop"),
+    }
+}
+
+/// Builds a chance node transitioning to `next_street` (SPR-aware).
+#[allow(clippy::cast_possible_truncation)]
+fn build_chance_node_spr(
+    nodes: &mut Vec<PostflopNode>,
+    config: &PostflopModelConfig,
+    pot_fraction: f64,
+    next_street: Street,
+    max_pot: f64,
+) -> u32 {
+    let num_transitions = transition_count(config, next_street);
+    // Safe: game trees never exceed u32::MAX nodes
+    let idx = nodes.len() as u32;
+    #[allow(clippy::cast_precision_loss)]
+    let uniform_weight = 1.0_f64 / num_transitions as f64;
+    // Push placeholder; children are built next
+    nodes.push(PostflopNode::Chance {
+        street: next_street,
+        children: vec![],
+        weights: vec![uniform_weight; num_transitions],
+    });
+    let oop = 0u8;
+    let ip = 1u8;
+    let children: Vec<u32> = (0..num_transitions)
+        .map(|_| {
+            build_opening_decision_spr(nodes, oop, ip, config, pot_fraction, next_street, max_pot)
+        })
+        .collect();
+    if let PostflopNode::Chance {
+        children: ref mut slot,
+        ..
+    } = nodes[idx as usize]
+    {
+        *slot = children;
+    }
+    idx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,5 +1037,75 @@ mod tests {
             many.node_count(),
             few.node_count()
         );
+    }
+
+    // ── SPR-constrained tree construction ───────────────────────────────────
+
+    #[timed_test]
+    fn spr_tree_shallow_has_fewer_nodes_than_deep() {
+        let cfg = fast_config();
+        let shallow = PostflopTree::build_with_spr(&cfg, 0.5).unwrap();
+        let deep = PostflopTree::build_with_spr(&cfg, 20.0).unwrap();
+        assert!(
+            shallow.node_count() < deep.node_count(),
+            "shallow SPR ({}) should have fewer nodes than deep ({})",
+            shallow.node_count(),
+            deep.node_count(),
+        );
+    }
+
+    #[timed_test]
+    fn spr_tree_very_shallow_only_check_or_allin() {
+        // SPR=0.1: max_pot=1.2, available from 1.0 = 0.2
+        // bet_sizes [0.5, 1.0] both exceed 0.2 → replaced with single all-in
+        let cfg = fast_config();
+        let tree = PostflopTree::build_with_spr(&cfg, 0.1).unwrap();
+        match &tree.nodes[0] {
+            PostflopNode::Decision { action_labels, .. } => {
+                assert_eq!(
+                    action_labels.len(),
+                    2,
+                    "expected Check + all-in, got {action_labels:?}"
+                );
+                assert_eq!(action_labels[0], PostflopAction::Check);
+                assert!(matches!(action_labels[1], PostflopAction::Bet(_)));
+                if let PostflopAction::Bet(f) = action_labels[1] {
+                    assert!(
+                        (f64::from(f) - 0.2).abs() < 0.02,
+                        "all-in fraction should be ~0.2, got {f}"
+                    );
+                }
+            }
+            _ => panic!("root should be Decision"),
+        }
+    }
+
+    #[timed_test]
+    fn spr_tree_terminals_never_exceed_max_pot() {
+        let cfg = fast_config();
+        for &spr in &[0.5, 1.5, 5.0, 20.0] {
+            let tree = PostflopTree::build_with_spr(&cfg, spr).unwrap();
+            let max_pot = 1.0 + 2.0 * spr;
+            for node in &tree.nodes {
+                if let PostflopNode::Terminal { pot_fraction, .. } = node {
+                    assert!(
+                        *pot_fraction <= max_pot + 1e-6,
+                        "SPR={spr}: terminal pot_fraction {pot_fraction} exceeds max_pot {max_pot}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[timed_test]
+    fn spr_tree_deep_matches_unconstrained() {
+        // SPR=1000 → max_pot=2001 → no bet is capped → same tree as old build.
+        // Use Limped because build_with_spr always uses OOP=0, IP=1 which matches
+        // PotType::Limped's default_ip_player()=1. (PotType::Raised uses ip=0 at
+        // the flop but chance nodes hardcode ip=1, creating an inconsistency.)
+        let cfg = fast_config();
+        let spr_tree = PostflopTree::build_with_spr(&cfg, 1000.0).unwrap();
+        let old_tree = PostflopTree::build(PotType::Limped, &cfg).unwrap();
+        assert_eq!(spr_tree.node_count(), old_tree.node_count());
     }
 }

@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! PreflopSolver hits Showdown terminal
-//!   → PostflopAbstraction::evaluate(pot_type, hero_hand, opp_hand, pot)
+//!   → PostflopAbstraction::evaluate(spr_idx, hero_hand, opp_hand, pot)
 //!     → look up hand buckets per street/texture
 //!     → traverse postflop tree with bucket-level regret matching
 //!     → return expected value
@@ -19,14 +19,13 @@ use rand::rngs::SmallRng;
 use serde::{Deserialize, Serialize};
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
 
 use super::abstraction_cache;
 use super::board_abstraction::{BoardAbstraction, BoardAbstractionConfig};
 use super::equity::EquityTable;
 use super::hand_buckets::{self, BucketEquity, HandBucketMapping};
 use super::postflop_model::PostflopModelConfig;
-use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree, PotType};
+use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree};
 use crate::abstraction::Street;
 
 /// All precomputed postflop data needed by the preflop solver.
@@ -34,22 +33,31 @@ pub struct PostflopAbstraction {
     pub board: BoardAbstraction,
     pub buckets: HandBucketMapping,
     pub bucket_equity: BucketEquity,
-    pub trees: FxHashMap<PotType, PostflopTree>,
+    pub trees: Vec<PostflopTree>,
     /// Precomputed EV table from solved postflop game.
     pub values: PostflopValues,
+    /// Canonical SPR values for runtime SPR mapping.
+    pub canonical_sprs: Vec<f64>,
 }
 
-/// Precomputed EV table: `values[pot_type][hero_pos][hero_bucket][opp_bucket]` → EV fraction.
+/// Precomputed EV table: `values[spr_idx][hero_pos][hero_bucket][opp_bucket]` → EV fraction.
 ///
 /// Stored as a flat `Vec<f64>` indexed by
-/// `pot_type_idx * 2 * n * n + hero_pos * n * n + hero_bucket * n + opp_bucket`.
+/// `spr_idx * 2 * n * n + hero_pos * n * n + hero_bucket * n + opp_bucket`.
 #[derive(Serialize, Deserialize)]
 pub struct PostflopValues {
     values: Vec<f64>,
     num_buckets: usize,
+    num_sprs: usize,
 }
 
 impl PostflopValues {
+    /// Number of SPR slots in the value table.
+    #[must_use]
+    pub fn num_sprs(&self) -> usize {
+        self.num_sprs
+    }
+
     /// Number of entries in the value table.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -68,46 +76,28 @@ impl PostflopValues {
         Self {
             values: Vec::new(),
             num_buckets: 0,
+            num_sprs: 0,
         }
     }
 
-    /// Look up the postflop EV (as fraction of pot) for a given configuration.
+    /// Look up postflop EV by SPR index.
     #[inline]
     #[must_use]
-    pub fn get(&self, pot_type: PotType, hero_pos: u8, hero_bucket: u16, opp_bucket: u16) -> f64 {
+    pub fn get_by_spr(&self, spr_idx: usize, hero_pos: u8, hero_bucket: u16, opp_bucket: u16) -> f64 {
         let n = self.num_buckets;
-        let pt_idx = pot_type_index(pot_type);
-        let idx = pt_idx * 2 * n * n + (hero_pos as usize) * n * n + (hero_bucket as usize) * n + opp_bucket as usize;
+        let idx = spr_idx * 2 * n * n + (hero_pos as usize) * n * n + (hero_bucket as usize) * n + opp_bucket as usize;
         self.values.get(idx).copied().unwrap_or(0.0)
     }
+
 }
 
-const NUM_POT_TYPES: usize = 4;
-
-fn pot_type_index(pt: PotType) -> usize {
-    match pt {
-        PotType::Limped => 0,
-        PotType::Raised => 1,
-        PotType::ThreeBet => 2,
-        PotType::FourBetPlus => 3,
-    }
-}
-
-const ALL_POT_TYPES: [PotType; NUM_POT_TYPES] = [
-    PotType::Limped,
-    PotType::Raised,
-    PotType::ThreeBet,
-    PotType::FourBetPlus,
-];
-
-/// Maps `(pot_type, node_idx, bucket)` → flat buffer offset.
+/// Maps `(node_idx, bucket)` → flat buffer offset for ONE tree.
 ///
-/// Each decision node in each pot type's tree reserves `num_buckets × num_actions`
-/// slots. The bucket count varies by the street of the node.
+/// Each decision node reserves `num_buckets × num_actions` slots.
+/// The bucket count varies by the street of the node.
 pub struct PostflopLayout {
-    /// Per pot-type: `(pot_type, [(offset, num_actions, street)])` for each tree node.
-    entries: FxHashMap<PotType, Vec<NodeEntry>>,
-    /// Total buffer size across all pot types.
+    entries: Vec<NodeEntry>,
+    /// Total buffer size for this tree.
     pub total_size: usize,
 }
 
@@ -119,46 +109,41 @@ struct NodeEntry {
 }
 
 impl PostflopLayout {
-    /// Build the layout from the postflop trees and bucket counts.
+    /// Build the layout from a single postflop tree and bucket counts.
     fn build(
-        trees: &FxHashMap<PotType, PostflopTree>,
-        node_streets: &FxHashMap<PotType, Vec<Street>>,
+        tree: &PostflopTree,
+        node_streets: &[Street],
         num_flop_buckets: usize,
         num_turn_buckets: usize,
         num_river_buckets: usize,
     ) -> Self {
-        let mut entries = FxHashMap::default();
         let mut offset = 0;
 
-        for (&pot_type, tree) in trees {
-            let streets = &node_streets[&pot_type];
-            let node_entries: Vec<NodeEntry> = tree
-                .nodes
-                .iter()
-                .enumerate()
-                .map(|(i, node)| {
-                    let num_actions = match node {
-                        PostflopNode::Decision { children, .. } => children.len(),
-                        _ => 0,
-                    };
-                    let street = streets[i];
-                    let num_buckets = buckets_for_street(
-                        street,
-                        num_flop_buckets,
-                        num_turn_buckets,
-                        num_river_buckets,
-                    );
-                    let entry = NodeEntry {
-                        offset,
-                        num_actions,
-                        street,
-                    };
-                    offset += num_buckets * num_actions;
-                    entry
-                })
-                .collect();
-            entries.insert(pot_type, node_entries);
-        }
+        let entries: Vec<NodeEntry> = tree
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                let num_actions = match node {
+                    PostflopNode::Decision { children, .. } => children.len(),
+                    _ => 0,
+                };
+                let street = node_streets[i];
+                let num_buckets = buckets_for_street(
+                    street,
+                    num_flop_buckets,
+                    num_turn_buckets,
+                    num_river_buckets,
+                );
+                let entry = NodeEntry {
+                    offset,
+                    num_actions,
+                    street,
+                };
+                offset += num_buckets * num_actions;
+                entry
+            })
+            .collect();
 
         Self {
             entries,
@@ -166,13 +151,13 @@ impl PostflopLayout {
         }
     }
 
-    /// Returns `(base_offset, num_actions)` for a given `(pot_type, node_idx, bucket)`.
+    /// Returns `(base_offset, num_actions)` for a given `(node_idx, bucket)`.
     ///
-    /// The caller indexes into the flat buffer as `base + bucket * num_actions + action_idx`.
+    /// The caller indexes into the flat buffer as `base + action_idx`.
     #[inline]
     #[must_use]
-    pub fn slot(&self, pot_type: PotType, node_idx: u32, bucket: u16) -> (usize, usize) {
-        let entry = &self.entries[&pot_type][node_idx as usize];
+    pub fn slot(&self, node_idx: u32, bucket: u16) -> (usize, usize) {
+        let entry = &self.entries[node_idx as usize];
         let base = entry.offset + (bucket as usize) * entry.num_actions;
         (base, entry.num_actions)
     }
@@ -180,8 +165,8 @@ impl PostflopLayout {
     /// Street for a given node.
     #[inline]
     #[must_use]
-    pub fn street(&self, pot_type: PotType, node_idx: u32) -> Street {
-        self.entries[&pot_type][node_idx as usize].street
+    pub fn street(&self, node_idx: u32) -> Street {
+        self.entries[node_idx as usize].street
     }
 }
 
@@ -248,6 +233,8 @@ pub enum PostflopAbstractionError {
     Tree(#[from] super::postflop_tree::PostflopTreeError),
     #[error("abstraction cache: {0}")]
     Cache(#[from] abstraction_cache::CacheError),
+    #[error("canonical_sprs must be non-empty")]
+    EmptyCanonicalSprs,
 }
 
 /// Progress report during postflop abstraction construction.
@@ -260,7 +247,7 @@ pub enum BuildPhase {
     HandBuckets(usize, usize),
     /// Computing bucket-vs-bucket equity table.
     EquityTable,
-    /// Building postflop game trees for each pot type.
+    /// Building postflop game trees for each SPR.
     Trees,
     /// Computing flat buffer layout.
     Layout,
@@ -310,6 +297,9 @@ impl PostflopAbstraction {
         cache_base: Option<&std::path::Path>,
         on_progress: impl Fn(BuildPhase) + Sync,
     ) -> Result<Self, PostflopAbstractionError> {
+        if config.canonical_sprs.is_empty() {
+            return Err(PostflopAbstractionError::EmptyCanonicalSprs);
+        }
         let (board, buckets, bucket_equity) = load_or_build_abstraction(
             config,
             equity_table,
@@ -318,17 +308,51 @@ impl PostflopAbstraction {
         )?;
 
         on_progress(BuildPhase::Trees);
-        let trees = build_all_trees(config)?;
+        let trees = build_all_spr_trees(config)?;
+
+        on_progress(BuildPhase::Layout);
+        let node_streets: Vec<Vec<Street>> = trees
+            .iter()
+            .map(annotate_streets)
+            .collect();
 
         let num_b = buckets.num_flop_buckets as usize;
-        let values = Self::solve_values(
-            config,
+
+        let spr_layouts = build_per_spr_layouts(
             &trees,
-            &bucket_equity,
+            &node_streets,
             num_b,
             buckets.num_turn_buckets as usize,
             buckets.num_river_buckets as usize,
-            &on_progress,
+        );
+
+        let total_iters = config.postflop_solve_iterations as usize;
+        let samples = if config.postflop_solve_samples > 0 {
+            config.postflop_solve_samples as usize
+        } else {
+            num_b
+        };
+        let num_sprs = trees.len();
+        let total_steps = total_iters * num_sprs;
+        on_progress(BuildPhase::SolvingPostflop(0, total_steps));
+
+        let spr_strategy_sums = solve_postflop_per_spr(
+            &trees,
+            &spr_layouts,
+            &bucket_equity,
+            num_b,
+            total_iters,
+            samples,
+            |step, total| on_progress(BuildPhase::SolvingPostflop(step, total)),
+        );
+
+        on_progress(BuildPhase::ComputingValues);
+        let values = compute_postflop_values(
+            &trees,
+            &spr_layouts,
+            &bucket_equity,
+            &spr_strategy_sums,
+            num_b,
         );
 
         Ok(Self {
@@ -337,6 +361,7 @@ impl PostflopAbstraction {
             bucket_equity,
             trees,
             values,
+            canonical_sprs: config.canonical_sprs.clone(),
         })
     }
 
@@ -355,68 +380,15 @@ impl PostflopAbstraction {
         bucket_equity: BucketEquity,
         values: PostflopValues,
     ) -> Result<Self, PostflopAbstractionError> {
-        let trees = build_all_trees(config)?;
+        let trees = build_all_spr_trees(config)?;
         Ok(Self {
             board,
             buckets,
             bucket_equity,
             trees,
             values,
+            canonical_sprs: config.canonical_sprs.clone(),
         })
-    }
-
-    /// Run the postflop CFR solve and compute the value table.
-    ///
-    /// This is the expensive phase (minutes). The result can be cached via `solve_cache`.
-    pub fn solve_values(
-        config: &PostflopModelConfig,
-        trees: &FxHashMap<PotType, PostflopTree>,
-        bucket_equity: &BucketEquity,
-        num_flop_buckets: usize,
-        num_turn_buckets: usize,
-        num_river_buckets: usize,
-        on_progress: impl Fn(BuildPhase) + Sync,
-    ) -> PostflopValues {
-        let node_streets: FxHashMap<PotType, Vec<Street>> = trees
-            .iter()
-            .map(|(&pt, tree)| (pt, annotate_streets(tree)))
-            .collect();
-
-        let pt_layouts = build_per_pot_type_layouts(
-            trees,
-            &node_streets,
-            num_flop_buckets,
-            num_turn_buckets,
-            num_river_buckets,
-        );
-
-        let total_iters = config.postflop_solve_iterations as usize;
-        let samples = if config.postflop_solve_samples > 0 {
-            config.postflop_solve_samples as usize
-        } else {
-            num_flop_buckets
-        };
-        let total_steps = total_iters * NUM_POT_TYPES;
-        on_progress(BuildPhase::SolvingPostflop(0, total_steps));
-
-        let pt_strategy_sums = solve_postflop_per_pot_type(
-            trees,
-            &pt_layouts,
-            bucket_equity,
-            num_flop_buckets,
-            total_iters,
-            samples,
-            |step, total| on_progress(BuildPhase::SolvingPostflop(step, total)),
-        );
-
-        on_progress(BuildPhase::ComputingValues);
-        compute_postflop_values(
-            trees,
-            &pt_layouts,
-            bucket_equity,
-            &pt_strategy_sums,
-            num_flop_buckets,
-        )
     }
 }
 
@@ -529,67 +501,54 @@ fn build_hand_buckets_and_equity(
     Ok((mapping, bucket_equity))
 }
 
-fn build_all_trees(
+fn build_all_spr_trees(
     config: &PostflopModelConfig,
-) -> Result<FxHashMap<PotType, PostflopTree>, super::postflop_tree::PostflopTreeError> {
-    let pot_types = [
-        PotType::Limped,
-        PotType::Raised,
-        PotType::ThreeBet,
-        PotType::FourBetPlus,
-    ];
-    let mut trees = FxHashMap::default();
-    for pt in pot_types {
-        trees.insert(pt, PostflopTree::build(pt, config)?);
-    }
-    Ok(trees)
+) -> Result<Vec<PostflopTree>, super::postflop_tree::PostflopTreeError> {
+    config.canonical_sprs
+        .iter()
+        .map(|&spr| PostflopTree::build_with_spr(config, spr))
+        .collect()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Postflop pre-solve: run CFR to convergence, then extract value table
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Build a separate `PostflopLayout` for each pot type so each solve uses a small
-/// isolated buffer instead of one monolithic buffer for all pot types.
-fn build_per_pot_type_layouts(
-    trees: &FxHashMap<PotType, PostflopTree>,
-    node_streets: &FxHashMap<PotType, Vec<Street>>,
+/// Build a separate `PostflopLayout` for each SPR so each solve uses a small
+/// isolated buffer instead of one monolithic buffer for all SPRs.
+fn build_per_spr_layouts(
+    trees: &[PostflopTree],
+    node_streets: &[Vec<Street>],
     num_flop_buckets: usize,
     num_turn_buckets: usize,
     num_river_buckets: usize,
-) -> FxHashMap<PotType, PostflopLayout> {
-    let mut layouts = FxHashMap::default();
-    for &pt in &ALL_POT_TYPES {
-        let mut single_tree = FxHashMap::default();
-        single_tree.insert(pt, trees[&pt].clone());
-        let mut single_streets = FxHashMap::default();
-        single_streets.insert(pt, node_streets[&pt].clone());
-        let layout = PostflopLayout::build(
-            &single_tree,
-            &single_streets,
+) -> Vec<PostflopLayout> {
+    trees.iter().enumerate().map(|(i, tree)| {
+        PostflopLayout::build(
+            tree,
+            &node_streets[i],
             num_flop_buckets,
             num_turn_buckets,
             num_river_buckets,
-        );
-        layouts.insert(pt, layout);
-    }
-    layouts
+        )
+    }).collect()
 }
 
-/// Solve all pot types in parallel, each with its own small buffer.
+/// Solve all SPRs in parallel, each with its own small buffer.
 ///
-/// Returns per-pot-type strategy sums.
+/// Returns per-SPR strategy sums.
 #[allow(clippy::cast_possible_truncation)]
-fn solve_postflop_per_pot_type(
-    trees: &FxHashMap<PotType, PostflopTree>,
-    pt_layouts: &FxHashMap<PotType, PostflopLayout>,
+fn solve_postflop_per_spr(
+    trees: &[PostflopTree],
+    spr_layouts: &[PostflopLayout],
     bucket_equity: &BucketEquity,
     num_buckets: usize,
     num_iterations: usize,
     samples_per_iter: usize,
     on_progress: impl Fn(usize, usize) + Sync,
-) -> FxHashMap<PotType, Vec<f64>> {
-    let total_steps = num_iterations * NUM_POT_TYPES;
+) -> Vec<Vec<f64>> {
+    let num_sprs = trees.len();
+    let total_steps = num_iterations * num_sprs;
     let use_exhaustive = num_buckets * num_buckets <= samples_per_iter;
     let actual_pairs = if use_exhaustive {
         num_buckets * num_buckets
@@ -597,28 +556,29 @@ fn solve_postflop_per_pot_type(
         samples_per_iter
     };
 
-    for &pot_type in &ALL_POT_TYPES {
-        let buf_size = pt_layouts[&pot_type].total_size;
+    for (spr_idx, tree) in trees.iter().enumerate() {
+        let buf_size = spr_layouts[spr_idx].total_size;
         #[allow(clippy::cast_precision_loss)]
         let mb = buf_size as f64 * 8.0 / 1_000_000.0;
         let mode = if use_exhaustive { "exhaustive" } else { "sampled" };
         eprintln!(
-            "  {pot_type:?}: {} nodes, {buf_size} slots ({mb:.1} MB), {mode} {actual_pairs} pairs/iter",
-            trees[&pot_type].node_count(),
+            "  SPR {:.1}: {} nodes, {buf_size} slots ({mb:.1} MB), {mode} {actual_pairs} pairs/iter",
+            tree.spr,
+            tree.node_count(),
         );
     }
 
     let progress = AtomicUsize::new(0);
 
-    ALL_POT_TYPES
-        .par_iter()
-        .map(|&pot_type| {
-            let layout = &pt_layouts[&pot_type];
-            let strategy_sum = solve_one_pot_type(
+    (0..num_sprs)
+        .into_par_iter()
+        .map(|spr_idx| {
+            let layout = &spr_layouts[spr_idx];
+            solve_one_spr(
                 trees,
                 layout,
                 bucket_equity,
-                pot_type,
+                spr_idx,
                 num_buckets,
                 layout.total_size,
                 num_iterations,
@@ -626,24 +586,23 @@ fn solve_postflop_per_pot_type(
                 &progress,
                 total_steps,
                 &on_progress,
-            );
-            (pot_type, strategy_sum)
+            )
         })
         .collect()
 }
 
-/// Run CFR for a single pot type with parallel inner loop.
+/// Run CFR for a single SPR with parallel inner loop.
 ///
 /// Uses exhaustive bucket-pair enumeration when N² ≤ `samples_per_iter`
 /// (eliminates sampling variance), otherwise falls back to random sampling.
 /// Reads `regret_sum` directly each iteration (no per-iteration clone needed
 /// since it is immutable within the inner loop).
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
-fn solve_one_pot_type(
-    trees: &FxHashMap<PotType, PostflopTree>,
+fn solve_one_spr(
+    trees: &[PostflopTree],
     layout: &PostflopLayout,
     bucket_equity: &BucketEquity,
-    pot_type: PotType,
+    spr_idx: usize,
     num_buckets: usize,
     buf_size: usize,
     num_iterations: usize,
@@ -667,12 +626,12 @@ fn solve_one_pot_type(
         let (dr, ds) = if use_exhaustive {
             exhaustive_cfr_iteration(
                 trees, layout, bucket_equity, &regret_sum,
-                pot_type, num_buckets, buf_size, iteration,
+                spr_idx, num_buckets, buf_size, iteration,
             )
         } else {
             sampled_cfr_iteration(
                 trees, layout, bucket_equity, &regret_sum,
-                pot_type, num_buckets, buf_size, samples_per_iter, iteration, iter,
+                spr_idx, num_buckets, buf_size, samples_per_iter, iteration, iter,
             )
         };
 
@@ -684,13 +643,13 @@ fn solve_one_pot_type(
 }
 
 /// One CFR iteration over all N² bucket pairs, parallelised across hero buckets.
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn exhaustive_cfr_iteration(
-    trees: &FxHashMap<PotType, PostflopTree>,
+    trees: &[PostflopTree],
     layout: &PostflopLayout,
     bucket_equity: &BucketEquity,
     regret_sum: &[f64],
-    pot_type: PotType,
+    spr_idx: usize,
     num_buckets: usize,
     buf_size: usize,
     iteration: u64,
@@ -706,7 +665,7 @@ fn exhaustive_cfr_iteration(
                         solve_cfr_traverse(
                             trees, layout, bucket_equity, regret_sum,
                             &mut dr, &mut ds,
-                            pot_type, 0, hb, ob, hero_pos, 1.0, 1.0, iteration,
+                            spr_idx, 0, hb, ob, hero_pos, 1.0, 1.0, iteration,
                         );
                     }
                 }
@@ -724,13 +683,13 @@ fn exhaustive_cfr_iteration(
 }
 
 /// One CFR iteration with random bucket-pair sampling, parallelised across chunks.
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn sampled_cfr_iteration(
-    trees: &FxHashMap<PotType, PostflopTree>,
+    trees: &[PostflopTree],
     layout: &PostflopLayout,
     bucket_equity: &BucketEquity,
     regret_sum: &[f64],
-    pot_type: PotType,
+    spr_idx: usize,
     num_buckets: usize,
     buf_size: usize,
     samples_per_iter: usize,
@@ -738,7 +697,7 @@ fn sampled_cfr_iteration(
     iter_idx: usize,
 ) -> (Vec<f64>, Vec<f64>) {
     // Generate pairs sequentially (RNG is sequential), then process in parallel.
-    let seed = iter_idx as u64 * 1_000_003 + pot_type_index(pot_type) as u64;
+    let seed = iter_idx as u64 * 1_000_003 + spr_idx as u64;
     let mut rng = SmallRng::seed_from_u64(seed);
     let pairs: Vec<(u16, u16)> = (0..samples_per_iter)
         .map(|_| {
@@ -761,7 +720,7 @@ fn sampled_cfr_iteration(
                         solve_cfr_traverse(
                             trees, layout, bucket_equity, regret_sum,
                             &mut dr, &mut ds,
-                            pot_type, 0, hb, ob, hero_pos, 1.0, 1.0, iteration,
+                            spr_idx, 0, hb, ob, hero_pos, 1.0, 1.0, iteration,
                         );
                     }
                 }
@@ -781,13 +740,13 @@ fn sampled_cfr_iteration(
 /// Single CFR traversal for the postflop solve phase. Returns hero EV fraction.
 #[allow(clippy::too_many_arguments)]
 fn solve_cfr_traverse(
-    trees: &FxHashMap<PotType, PostflopTree>,
+    trees: &[PostflopTree],
     layout: &PostflopLayout,
     bucket_equity: &BucketEquity,
     snapshot: &[f64],
     dr: &mut [f64],
     ds: &mut [f64],
-    pot_type: PotType,
+    spr_idx: usize,
     node_idx: u32,
     hero_bucket: u16,
     opp_bucket: u16,
@@ -796,7 +755,7 @@ fn solve_cfr_traverse(
     reach_opp: f64,
     iteration: u64,
 ) -> f64 {
-    let tree = &trees[&pot_type];
+    let tree = &trees[spr_idx];
 
     match &tree.nodes[node_idx as usize] {
         PostflopNode::Terminal { terminal_type, pot_fraction } => {
@@ -807,7 +766,7 @@ fn solve_cfr_traverse(
                 .map(|(&child, &w)| {
                     w * solve_cfr_traverse(
                         trees, layout, bucket_equity, snapshot, dr, ds,
-                        pot_type, child, hero_bucket, opp_bucket, hero_pos,
+                        spr_idx, child, hero_bucket, opp_bucket, hero_pos,
                         reach_hero, reach_opp, iteration,
                     )
                 })
@@ -816,7 +775,7 @@ fn solve_cfr_traverse(
         PostflopNode::Decision { position, children, .. } => {
             let is_hero = *position == hero_pos;
             let bucket = if is_hero { hero_bucket } else { opp_bucket };
-            let (start, _) = layout.slot(pot_type, node_idx, bucket);
+            let (start, _) = layout.slot(node_idx, bucket);
             let num_actions = children.len();
 
             let mut strategy = [0.0f64; MAX_POSTFLOP_ACTIONS];
@@ -825,13 +784,13 @@ fn solve_cfr_traverse(
             if is_hero {
                 solve_traverse_hero(
                     trees, layout, bucket_equity, snapshot, dr, ds,
-                    start, pot_type, hero_bucket, opp_bucket, hero_pos,
+                    start, spr_idx, hero_bucket, opp_bucket, hero_pos,
                     reach_hero, reach_opp, children, &strategy[..num_actions], iteration,
                 )
             } else {
                 solve_traverse_opponent(
                     trees, layout, bucket_equity, snapshot, dr, ds,
-                    pot_type, hero_bucket, opp_bucket, hero_pos,
+                    spr_idx, hero_bucket, opp_bucket, hero_pos,
                     reach_hero, reach_opp, children, &strategy[..num_actions], iteration,
                 )
             }
@@ -841,14 +800,14 @@ fn solve_cfr_traverse(
 
 #[allow(clippy::too_many_arguments)]
 fn solve_traverse_hero(
-    trees: &FxHashMap<PotType, PostflopTree>,
+    trees: &[PostflopTree],
     layout: &PostflopLayout,
     bucket_equity: &BucketEquity,
     snapshot: &[f64],
     dr: &mut [f64],
     ds: &mut [f64],
     slot_start: usize,
-    pot_type: PotType,
+    spr_idx: usize,
     hero_bucket: u16,
     opp_bucket: u16,
     hero_pos: u8,
@@ -864,7 +823,7 @@ fn solve_traverse_hero(
     for (i, &child) in children.iter().enumerate() {
         action_values[i] = solve_cfr_traverse(
             trees, layout, bucket_equity, snapshot, dr, ds,
-            pot_type, child, hero_bucket, opp_bucket, hero_pos,
+            spr_idx, child, hero_bucket, opp_bucket, hero_pos,
             reach_hero * strategy[i], reach_opp, iteration,
         );
     }
@@ -888,13 +847,13 @@ fn solve_traverse_hero(
 
 #[allow(clippy::too_many_arguments)]
 fn solve_traverse_opponent(
-    trees: &FxHashMap<PotType, PostflopTree>,
+    trees: &[PostflopTree],
     layout: &PostflopLayout,
     bucket_equity: &BucketEquity,
     snapshot: &[f64],
     dr: &mut [f64],
     ds: &mut [f64],
-    pot_type: PotType,
+    spr_idx: usize,
     hero_bucket: u16,
     opp_bucket: u16,
     hero_pos: u8,
@@ -908,7 +867,7 @@ fn solve_traverse_opponent(
         .map(|(i, &child)| {
             strategy[i] * solve_cfr_traverse(
                 trees, layout, bucket_equity, snapshot, dr, ds,
-                pot_type, child, hero_bucket, opp_bucket, hero_pos,
+                spr_idx, child, hero_bucket, opp_bucket, hero_pos,
                 reach_hero, reach_opp * strategy[i], iteration,
             )
         })
@@ -926,29 +885,30 @@ fn add_buffers(dst: &mut [f64], src: &[f64]) {
 // Value table computation from converged strategy
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Compute EV table from per-pot-type converged strategy sums.
+/// Compute EV table from per-SPR converged strategy sums.
 #[allow(clippy::cast_possible_truncation)]
 fn compute_postflop_values(
-    trees: &FxHashMap<PotType, PostflopTree>,
-    pt_layouts: &FxHashMap<PotType, PostflopLayout>,
+    trees: &[PostflopTree],
+    spr_layouts: &[PostflopLayout],
     bucket_equity: &BucketEquity,
-    pt_strategy_sums: &FxHashMap<PotType, Vec<f64>>,
+    spr_strategy_sums: &[Vec<f64>],
     num_buckets: usize,
 ) -> PostflopValues {
-    let total = NUM_POT_TYPES * 2 * num_buckets * num_buckets;
+    let num_sprs = trees.len();
+    let total = num_sprs * 2 * num_buckets * num_buckets;
     let mut values = vec![0.0f64; total];
 
-    for &pot_type in &ALL_POT_TYPES {
-        let layout = &pt_layouts[&pot_type];
-        let strategy_sum = &pt_strategy_sums[&pot_type];
+    for spr_idx in 0..num_sprs {
+        let layout = &spr_layouts[spr_idx];
+        let strategy_sum = &spr_strategy_sums[spr_idx];
         for hero_pos in 0..2u8 {
             for hero_bucket in 0..num_buckets as u16 {
                 for opp_bucket in 0..num_buckets as u16 {
                     let ev = eval_with_avg_strategy(
                         trees, layout, bucket_equity, strategy_sum,
-                        pot_type, 0, hero_bucket, opp_bucket, hero_pos,
+                        spr_idx, 0, hero_bucket, opp_bucket, hero_pos,
                     );
-                    let idx = pot_type_index(pot_type) * 2 * num_buckets * num_buckets
+                    let idx = spr_idx * 2 * num_buckets * num_buckets
                         + (hero_pos as usize) * num_buckets * num_buckets
                         + (hero_bucket as usize) * num_buckets
                         + opp_bucket as usize;
@@ -958,23 +918,23 @@ fn compute_postflop_values(
         }
     }
 
-    PostflopValues { values, num_buckets }
+    PostflopValues { values, num_buckets, num_sprs }
 }
 
 /// Walk tree using averaged (converged) strategy, returning hero EV fraction.
 #[allow(clippy::too_many_arguments)]
 fn eval_with_avg_strategy(
-    trees: &FxHashMap<PotType, PostflopTree>,
+    trees: &[PostflopTree],
     layout: &PostflopLayout,
     bucket_equity: &BucketEquity,
     strategy_sum: &[f64],
-    pot_type: PotType,
+    spr_idx: usize,
     node_idx: u32,
     hero_bucket: u16,
     opp_bucket: u16,
     hero_pos: u8,
 ) -> f64 {
-    let tree = &trees[&pot_type];
+    let tree = &trees[spr_idx];
 
     match &tree.nodes[node_idx as usize] {
         PostflopNode::Terminal { terminal_type, pot_fraction } => {
@@ -985,14 +945,14 @@ fn eval_with_avg_strategy(
                 .map(|(&child, &w)| {
                     w * eval_with_avg_strategy(
                         trees, layout, bucket_equity, strategy_sum,
-                        pot_type, child, hero_bucket, opp_bucket, hero_pos,
+                        spr_idx, child, hero_bucket, opp_bucket, hero_pos,
                     )
                 })
                 .sum()
         }
         PostflopNode::Decision { position, children, .. } => {
             let bucket = if *position == hero_pos { hero_bucket } else { opp_bucket };
-            let (start, _) = layout.slot(pot_type, node_idx, bucket);
+            let (start, _) = layout.slot(node_idx, bucket);
             let num_actions = children.len();
 
             let strategy = normalize_strategy_sum(strategy_sum, start, num_actions);
@@ -1001,7 +961,7 @@ fn eval_with_avg_strategy(
                 .map(|(i, &child)| {
                     strategy[i] * eval_with_avg_strategy(
                         trees, layout, bucket_equity, strategy_sum,
-                        pot_type, child, hero_bucket, opp_bucket, hero_pos,
+                        spr_idx, child, hero_bucket, opp_bucket, hero_pos,
                     )
                 })
                 .sum()
@@ -1102,7 +1062,7 @@ mod tests {
     #[timed_test]
     fn annotate_streets_marks_root_as_flop() {
         let config = PostflopModelConfig::fast();
-        let tree = PostflopTree::build(PotType::Raised, &config).unwrap();
+        let tree = PostflopTree::build_with_spr(&config, 5.0).unwrap();
         let streets = annotate_streets(&tree);
         assert_eq!(streets[0], Street::Flop);
     }
@@ -1116,7 +1076,7 @@ mod tests {
             raises_per_street: 0,
             ..PostflopModelConfig::fast()
         };
-        let tree = PostflopTree::build(PotType::Raised, &config).unwrap();
+        let tree = PostflopTree::build_with_spr(&config, 5.0).unwrap();
         let streets = annotate_streets(&tree);
 
         // Find a chance node and verify its children are on the next street.
@@ -1227,28 +1187,55 @@ mod tests {
             raises_per_street: 0,
             ..PostflopModelConfig::fast()
         };
-        let trees = build_all_trees(&config).unwrap();
-        let node_streets: FxHashMap<PotType, Vec<Street>> = trees
+        let trees = build_all_spr_trees(&config).unwrap();
+        let node_streets: Vec<Vec<Street>> = trees
             .iter()
-            .map(|(&pt, tree)| (pt, annotate_streets(tree)))
+            .map(annotate_streets)
             .collect();
-        let layout = PostflopLayout::build(&trees, &node_streets, 10, 10, 10);
+        let layouts = build_per_spr_layouts(&trees, &node_streets, 10, 10, 10);
 
-        assert!(layout.total_size > 0, "layout should have nonzero size");
+        // Check each layout has nonzero size
+        for layout in &layouts {
+            assert!(layout.total_size > 0, "layout should have nonzero size");
+        }
 
-        // Slot for root node, bucket 0 should be valid
-        let (base, num_actions) = layout.slot(PotType::Raised, 0, 0);
+        // Slot for root node, bucket 0 in first tree should be valid
+        let (base, num_actions) = layouts[0].slot(0, 0);
         assert!(num_actions > 0);
-        assert!(base + num_actions <= layout.total_size);
+        assert!(base + num_actions <= layouts[0].total_size);
     }
 
     #[timed_test]
-    fn build_all_trees_creates_four_pot_types() {
-        let config = PostflopModelConfig::fast();
-        let trees = build_all_trees(&config).unwrap();
-        assert!(trees.contains_key(&PotType::Limped));
-        assert!(trees.contains_key(&PotType::Raised));
-        assert!(trees.contains_key(&PotType::ThreeBet));
-        assert!(trees.contains_key(&PotType::FourBetPlus));
+    fn build_with_canonical_sprs_produces_different_trees() {
+        let config = PostflopModelConfig {
+            canonical_sprs: vec![1.0, 10.0],
+            ..PostflopModelConfig::fast()
+        };
+        let trees = build_all_spr_trees(&config).unwrap();
+        assert_eq!(trees.len(), 2);
+        assert_ne!(trees[0].node_count(), trees[1].node_count(),
+            "SPR 1.0 and 10.0 should produce different tree sizes");
+    }
+
+    #[timed_test]
+    fn postflop_values_get_by_spr_index() {
+        let num_sprs = 2;
+        let num_buckets = 2;
+        let total = num_sprs * 2 * num_buckets * num_buckets;
+        let mut values = vec![0.0; total];
+        let idx = 1 * 2 * 4 + 0 * 4 + 1 * 2 + 0;
+        values[idx] = 0.42;
+        let pv = PostflopValues { values, num_buckets, num_sprs };
+        assert!((pv.get_by_spr(1, 0, 1, 0) - 0.42).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn build_all_spr_trees_creates_one_per_canonical_spr() {
+        let config = PostflopModelConfig {
+            canonical_sprs: vec![0.5, 1.0, 5.0],
+            ..PostflopModelConfig::fast()
+        };
+        let trees = build_all_spr_trees(&config).unwrap();
+        assert_eq!(trees.len(), 3);
     }
 }
