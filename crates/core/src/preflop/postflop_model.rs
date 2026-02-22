@@ -1,8 +1,11 @@
 /// Configuration for the abstracted postflop model used by the preflop solver.
 ///
-/// Controls board abstraction granularity (flop textures, transition clusters),
-/// hand abstraction granularity (EHS k-means buckets), postflop betting structure,
+/// Controls hand abstraction granularity (EHS k-means buckets), postflop betting structure,
 /// and per-iteration sampling counts.
+///
+/// The texture fields (`num_flop_textures`, `num_turn_transitions`, `num_river_transitions`,
+/// `ehs_samples`) are deprecated — kept for backward-compatible deserialization of old YAML
+/// configs but no longer used by new code paths.
 use serde::{Deserialize, Serialize};
 
 fn default_num_flop_textures() -> u16 {
@@ -15,13 +18,13 @@ fn default_num_river_transitions() -> u16 {
     10
 }
 fn default_num_hand_buckets_flop() -> u16 {
-    2000
+    500
 }
 fn default_num_hand_buckets_turn() -> u16 {
-    2000
+    500
 }
 fn default_num_hand_buckets_river() -> u16 {
-    2000
+    500
 }
 fn default_ehs_samples() -> u32 {
     200
@@ -48,7 +51,7 @@ fn default_canonical_sprs() -> Vec<f64> {
 /// Configuration for the postflop model integrated into the preflop solver.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PostflopModelConfig {
-    // Board abstraction
+    // Board abstraction — deprecated, kept for backward-compatible deserialization
     #[serde(default = "default_num_flop_textures")]
     pub num_flop_textures: u16,
     #[serde(default = "default_num_turn_transitions")]
@@ -63,6 +66,7 @@ pub struct PostflopModelConfig {
     pub num_hand_buckets_turn: u16,
     #[serde(default = "default_num_hand_buckets_river")]
     pub num_hand_buckets_river: u16,
+    /// Deprecated — kept for backward-compatible deserialization.
     #[serde(default = "default_ehs_samples")]
     pub ehs_samples: u32,
 
@@ -79,7 +83,7 @@ pub struct PostflopModelConfig {
     // Postflop solve (chance-sampled MCCFR)
     #[serde(default = "default_postflop_solve_iterations")]
     pub postflop_solve_iterations: u32,
-    /// Bucket pairs sampled per MCCFR iteration. 0 = use num_hand_buckets_flop.
+    /// Bucket pairs sampled per MCCFR iteration. 0 = use `num_hand_buckets_flop`.
     #[serde(default = "default_postflop_solve_samples")]
     pub postflop_solve_samples: u32,
 
@@ -90,13 +94,10 @@ pub struct PostflopModelConfig {
 }
 
 impl PostflopModelConfig {
-    /// Fast preset: minimal textures for quick testing (~30s build).
+    /// Fast preset: minimal buckets for quick testing (~30s build).
     #[must_use]
     pub fn fast() -> Self {
         Self {
-            num_flop_textures: 5,
-            num_turn_transitions: 3,
-            num_river_transitions: 3,
             num_hand_buckets_flop: 50,
             num_hand_buckets_turn: 50,
             num_hand_buckets_river: 50,
@@ -108,9 +109,6 @@ impl PostflopModelConfig {
     #[must_use]
     pub fn medium() -> Self {
         Self {
-            num_flop_textures: 20,
-            num_turn_transitions: 2,
-            num_river_transitions: 2,
             num_hand_buckets_flop: 200,
             num_hand_buckets_turn: 200,
             num_hand_buckets_river: 200,
@@ -125,9 +123,9 @@ impl PostflopModelConfig {
             num_flop_textures: 200,
             num_turn_transitions: 10,
             num_river_transitions: 10,
-            num_hand_buckets_flop: 2000,
-            num_hand_buckets_turn: 2000,
-            num_hand_buckets_river: 2000,
+            num_hand_buckets_flop: 500,
+            num_hand_buckets_turn: 500,
+            num_hand_buckets_river: 500,
             ehs_samples: 200,
             bet_sizes: vec![0.5, 1.0],
             raises_per_street: 1,
@@ -142,12 +140,9 @@ impl PostflopModelConfig {
     #[must_use]
     pub fn accurate() -> Self {
         Self {
-            num_flop_textures: 500,
-            num_turn_transitions: 20,
-            num_river_transitions: 20,
-            num_hand_buckets_flop: 5000,
-            num_hand_buckets_turn: 5000,
-            num_hand_buckets_river: 5000,
+            num_hand_buckets_flop: 1000,
+            num_hand_buckets_turn: 1000,
+            num_hand_buckets_river: 1000,
             ..Self::standard()
         }
     }
@@ -187,33 +182,35 @@ mod tests {
     #[timed_test]
     fn standard_preset_has_expected_defaults() {
         let cfg = PostflopModelConfig::standard();
-        assert_eq!(cfg.num_flop_textures, 200);
-        assert_eq!(cfg.num_hand_buckets_flop, 2000);
+        assert_eq!(cfg.num_hand_buckets_flop, 500);
+        assert_eq!(cfg.num_hand_buckets_turn, 500);
+        assert_eq!(cfg.num_hand_buckets_river, 500);
         assert_eq!(cfg.bet_sizes, vec![0.5, 1.0]);
         assert_eq!(cfg.raises_per_street, 1);
-        assert_eq!(cfg.ehs_samples, 200);
     }
 
     #[timed_test]
-    fn fast_preset_has_fewer_textures_and_buckets() {
+    fn fast_preset_has_fewer_buckets() {
         let fast = PostflopModelConfig::fast();
         let std = PostflopModelConfig::standard();
-        assert!(fast.num_flop_textures < std.num_flop_textures);
         assert!(fast.num_hand_buckets_flop < std.num_hand_buckets_flop);
+        assert!(fast.num_hand_buckets_turn < std.num_hand_buckets_turn);
+        assert!(fast.num_hand_buckets_river < std.num_hand_buckets_river);
     }
 
     #[timed_test]
-    fn accurate_preset_has_more_textures_and_buckets() {
+    fn accurate_preset_has_more_buckets() {
         let acc = PostflopModelConfig::accurate();
         let std = PostflopModelConfig::standard();
-        assert!(acc.num_flop_textures > std.num_flop_textures);
         assert!(acc.num_hand_buckets_flop > std.num_hand_buckets_flop);
+        assert!(acc.num_hand_buckets_turn > std.num_hand_buckets_turn);
+        assert!(acc.num_hand_buckets_river > std.num_hand_buckets_river);
     }
 
     #[timed_test]
     fn total_hand_buckets_sums_all_streets() {
         let cfg = PostflopModelConfig::standard();
-        assert_eq!(cfg.total_hand_buckets(), 2000 + 2000 + 2000);
+        assert_eq!(cfg.total_hand_buckets(), 500 + 500 + 500);
     }
 
     #[timed_test]
@@ -260,5 +257,42 @@ mod tests {
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let restored: PostflopModelConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(cfg.canonical_sprs, restored.canonical_sprs);
+    }
+
+    #[timed_test]
+    fn deprecated_texture_fields_still_deserialize() {
+        let yaml = r"
+num_flop_textures: 100
+num_turn_transitions: 5
+num_river_transitions: 5
+ehs_samples: 500
+num_hand_buckets_flop: 300
+num_hand_buckets_turn: 300
+num_hand_buckets_river: 300
+";
+        let cfg: PostflopModelConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.num_flop_textures, 100);
+        assert_eq!(cfg.num_turn_transitions, 5);
+        assert_eq!(cfg.num_river_transitions, 5);
+        assert_eq!(cfg.ehs_samples, 500);
+        assert_eq!(cfg.num_hand_buckets_flop, 300);
+    }
+
+    #[timed_test]
+    fn medium_preset_has_expected_buckets() {
+        let cfg = PostflopModelConfig::medium();
+        assert_eq!(cfg.num_hand_buckets_flop, 200);
+        assert_eq!(cfg.num_hand_buckets_turn, 200);
+        assert_eq!(cfg.num_hand_buckets_river, 200);
+        assert_eq!(cfg.total_hand_buckets(), 600);
+    }
+
+    #[timed_test]
+    fn accurate_preset_has_expected_buckets() {
+        let cfg = PostflopModelConfig::accurate();
+        assert_eq!(cfg.num_hand_buckets_flop, 1000);
+        assert_eq!(cfg.num_hand_buckets_turn, 1000);
+        assert_eq!(cfg.num_hand_buckets_river, 1000);
+        assert_eq!(cfg.total_hand_buckets(), 3000);
     }
 }
