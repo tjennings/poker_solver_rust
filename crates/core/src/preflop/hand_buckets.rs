@@ -11,8 +11,11 @@ use thiserror::Error;
 
 use crate::hands::{CanonicalHand, all_hands};
 use crate::poker::{Card, Suit, Value};
-use crate::preflop::ehs::{EhsFeatures, ehs_features};
+use crate::preflop::ehs::{EhsFeatures, ehs_features, equity_histogram, HISTOGRAM_BINS};
 use crate::preflop::equity::EquityTable;
+
+/// Feature type for histogram-based k-means clustering.
+pub type HistogramFeatures = [f64; HISTOGRAM_BINS];
 
 /// Number of canonical preflop hands.
 pub const NUM_HANDS: usize = 169;
@@ -525,6 +528,116 @@ pub fn compute_all_river_features(
                 .collect()
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Histogram-based feature computation (for imperfect-recall clustering)
+// ---------------------------------------------------------------------------
+
+/// Compute equity histogram CDF features for all (hand, flop) situations.
+///
+/// Returns flat `Vec<HistogramFeatures>` indexed by `hand_idx * num_flops + flop_idx`.
+/// Blocked hands (hole cards conflict with board) get NaN sentinel.
+pub fn compute_flop_histograms(
+    hands: &[CanonicalHand],
+    flops: &[[Card; 3]],
+    on_hand_done: &(impl Fn(usize) + Sync + Send),
+) -> Vec<HistogramFeatures> {
+    let done = AtomicUsize::new(0);
+    let per_hand: Vec<Vec<HistogramFeatures>> = hands
+        .par_iter()
+        .map(|hand| {
+            let combos = hand.combos();
+            let feats: Vec<HistogramFeatures> = flops
+                .iter()
+                .map(|flop| {
+                    // Find first non-conflicting combo
+                    if let Some(&(c1, c2)) = combos.iter().find(|&&(c1, c2)| !board_conflicts([c1, c2], flop)) {
+                        equity_histogram(&[c1, c2], flop.as_slice())
+                    } else {
+                        [f64::NAN; HISTOGRAM_BINS]
+                    }
+                })
+                .collect();
+            let count = done.fetch_add(1, Ordering::Relaxed) + 1;
+            on_hand_done(count);
+            feats
+        })
+        .collect();
+
+    // Flatten to hand_idx * num_flops + flop_idx
+    let num_flops = flops.len();
+    let mut flat = Vec::with_capacity(hands.len() * num_flops);
+    for hand_feats in &per_hand {
+        flat.extend_from_slice(hand_feats);
+    }
+    flat
+}
+
+/// Compute equity histogram CDF features for all (hand, turn_board) situations.
+///
+/// Returns flat `Vec<HistogramFeatures>` indexed by `hand_idx * num_turns + turn_idx`.
+/// Blocked hands (hole cards conflict with board) get NaN sentinel.
+pub fn compute_turn_histograms(
+    hands: &[CanonicalHand],
+    turn_boards: &[[Card; 4]],
+) -> Vec<HistogramFeatures> {
+    let per_hand: Vec<Vec<HistogramFeatures>> = hands
+        .par_iter()
+        .map(|hand| {
+            let combos = hand.combos();
+            turn_boards
+                .iter()
+                .map(|board| {
+                    if let Some(&(c1, c2)) = combos.iter().find(|&&(c1, c2)| !board_conflicts([c1, c2], board)) {
+                        equity_histogram(&[c1, c2], board.as_slice())
+                    } else {
+                        [f64::NAN; HISTOGRAM_BINS]
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    let num_turns = turn_boards.len();
+    let mut flat = Vec::with_capacity(hands.len() * num_turns);
+    for hand_feats in &per_hand {
+        flat.extend_from_slice(hand_feats);
+    }
+    flat
+}
+
+/// Compute scalar equity for all (hand, river_board) situations.
+///
+/// Returns flat `Vec<f64>` indexed by `hand_idx * num_rivers + river_idx`.
+/// Blocked hands get NaN sentinel.
+pub fn compute_river_equities(
+    hands: &[CanonicalHand],
+    river_boards: &[[Card; 5]],
+) -> Vec<f64> {
+    let per_hand: Vec<Vec<f64>> = hands
+        .par_iter()
+        .map(|hand| {
+            let combos = hand.combos();
+            river_boards
+                .iter()
+                .map(|board| {
+                    if let Some(&(c1, c2)) = combos.iter().find(|&&(c1, c2)| !board_conflicts([c1, c2], board)) {
+                        ehs_features([c1, c2], board.as_slice())[0]
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    let num_rivers = river_boards.len();
+    let mut flat = Vec::with_capacity(hands.len() * num_rivers);
+    for hand_equities in &per_hand {
+        flat.extend_from_slice(hand_equities);
+    }
+    flat
 }
 
 /// EHS features for a hand over representative boards using one combo per hand.
@@ -1818,5 +1931,55 @@ mod tests {
         let b: [f64; 10] = [0.0; 10];
         let d = sq_dist_generic(&a, &b);
         assert!((d - 10.0).abs() < 1e-12);
+    }
+
+    #[timed_test(300)]
+    #[ignore = "slow"]
+    fn compute_flop_histograms_produces_valid_cdfs() {
+        use crate::preflop::ehs::{canonical_flops, HISTOGRAM_BINS};
+        let hands: Vec<CanonicalHand> = all_hands().collect();
+        let flops = canonical_flops();
+        let small_flops: Vec<[Card; 3]> = flops.into_iter().take(2).collect();
+        let histograms = compute_flop_histograms(&hands, &small_flops, &|_| {});
+
+        assert_eq!(histograms.len(), hands.len() * small_flops.len());
+
+        // Every non-NaN histogram should be a valid CDF
+        for hist in &histograms {
+            if hist[0].is_nan() {
+                continue;
+            }
+            for i in 1..HISTOGRAM_BINS {
+                assert!(
+                    hist[i] >= hist[i - 1] - 1e-9,
+                    "CDF not monotonic: {:?}",
+                    hist
+                );
+            }
+            assert!(
+                (hist[HISTOGRAM_BINS - 1] - 1.0).abs() < 1e-6,
+                "CDF must end at 1.0: {:?}",
+                hist
+            );
+        }
+    }
+
+    #[timed_test]
+    fn compute_river_equities_basic() {
+        let hands: Vec<CanonicalHand> = all_hands().collect();
+        let river = [sample_river()];
+        let equities = compute_river_equities(&hands, &river);
+
+        assert_eq!(equities.len(), hands.len());
+
+        let mut valid_count = 0;
+        for &eq in &equities {
+            if eq.is_nan() {
+                continue;
+            }
+            valid_count += 1;
+            assert!(eq >= 0.0 && eq <= 1.0, "equity out of range: {eq}");
+        }
+        assert!(valid_count > 100, "too few valid equities: {valid_count}");
     }
 }
