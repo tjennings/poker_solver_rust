@@ -18,6 +18,12 @@ See [`docs/explorer.md`](docs/explorer.md) for the strategy explorer desktop app
 
 **Keep it current:** When adding/changing explorer commands, UI features, or API endpoints, update `docs/explorer.md` to reflect the new state.
 
+## Cloud Compute
+
+See [`docs/cloud.md`](docs/cloud.md) for the AWS compute CLI: setup, launching training jobs, monitoring, downloading models, and configuration.
+
+**Keep it current:** When adding/changing cloud commands, AWS resources, configuration variables, or the job lifecycle, update `docs/cloud.md` to reflect the new state.
+
 ## Build & Test
 
 ```bash
