@@ -681,7 +681,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             // Try loading from solve + abstraction caches (same as solve-preflop).
             use poker_solver_core::preflop::{abstraction_cache, solve_cache};
-            let has_eq = false; // trace-hand doesn't use an equity table
+            let has_eq = true; // match solve-preflop's cache key (equity was used when solving)
             let sk = solve_cache::cache_key(&pf_config, has_eq);
             let ak = abstraction_cache::cache_key(&pf_config, has_eq);
 
