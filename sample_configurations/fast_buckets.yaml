@@ -51,16 +51,10 @@ exploration: 0.05
 # Remove this section entirely to use raw equity (original behaviour).
 
 postflop_model:
-  # Board abstraction: k-means clustering of canonical flops into textures.
-  num_flop_textures: 50
-  num_turn_transitions: 2
-  num_river_transitions: 2
-
-  # Hand abstraction: EHS k-means clustering per texture.
-  num_hand_buckets_flop: 20
-  num_hand_buckets_turn: 15
-  num_hand_buckets_river: 60 
-  ehs_samples: 200
+  # Hand abstraction: EHS k-means clustering per street.
+  num_hand_buckets_flop: 50
+  num_hand_buckets_turn: 50
+  num_hand_buckets_river: 50
 
   # Postflop tree structure (one tree per canonical SPR value).
   bet_sizes: [0.5, 1.0, 2]    # fraction of pot

@@ -51,23 +51,21 @@ exploration: 0.05
 # Remove this section entirely to use raw equity (original behaviour).
 
 postflop_model:
-  # Board abstraction: k-means clustering of canonical flops into textures.
-  num_flop_textures: 20
-  num_turn_transitions: 2
-  num_river_transitions: 2
+  # Hand abstraction: EHS k-means clustering per street.
+  num_hand_buckets_flop: 200
+  num_hand_buckets_turn: 200
+  num_hand_buckets_river: 200
 
-  # Hand abstraction: EHS k-means clustering per texture.
-  num_hand_buckets_flop: 100
-  num_hand_buckets_turn: 100
-  num_hand_buckets_river: 100 
-  ehs_samples: 200
-
-  # Postflop tree structure (per pot type: limped/raised/3bet/4bet+).
+  # Postflop tree structure (one tree per canonical SPR value).
   bet_sizes: [0.5, 1.0, 2]    # fraction of pot
   raises_per_street: 1
 
+  # Canonical SPR values: one postflop tree is built and solved per value.
+  # At runtime, each preflop pot type maps to the nearest canonical SPR.
+  canonical_sprs: [0.5, 1.0, 1.5, 3.0, 5.0, 10.0, 20.0, 50.0]
+
   # Pre-solve: chance-sampled MCCFR to converge postflop before preflop training.
-  postflop_solve_iterations: 1000   # MCCFR iterations per pot type
+  postflop_solve_iterations: 1000   # MCCFR iterations per SPR
   postflop_solve_samples: 100000        # bucket pairs sampled per iteration (0 = num_hand_buckets_flop)
 
   flop_samples_per_iter: 1
