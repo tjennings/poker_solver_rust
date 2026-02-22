@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
+use serde::{Deserialize, Serialize};
+
 use crate::equity::calculate_equity;
 use crate::hands::CanonicalHand;
 use crate::poker::Card;
@@ -15,7 +17,7 @@ use crate::poker::Card;
 const NUM_CANONICAL_HANDS: usize = 169;
 
 /// A precomputed equity table for 169 canonical preflop hands.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquityTable {
     /// Equity of hand i vs hand j: `equities[i][j]`.
     equities: Vec<Vec<f64>>,
