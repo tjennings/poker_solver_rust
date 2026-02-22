@@ -63,6 +63,47 @@ pub struct StreetEquity {
     pub river: BucketEquity,
 }
 
+/// Per-street bucket assignments with imperfect recall.
+///
+/// Each street is clustered independently. The player "forgets" which bucket
+/// they were in on the previous street, spending the full bucket budget on
+/// present-state resolution.
+///
+/// Situation indexing is caller-defined — typically `(hand_idx, board_idx)` mapped
+/// to a flat index.
+#[derive(Serialize, Deserialize)]
+pub struct StreetBuckets {
+    /// `flop[situation_idx]` → flop bucket ID
+    pub flop: Vec<u16>,
+    pub num_flop_buckets: u16,
+    /// `turn[situation_idx]` → turn bucket ID
+    pub turn: Vec<u16>,
+    pub num_turn_buckets: u16,
+    /// `river[situation_idx]` → river bucket ID
+    pub river: Vec<u16>,
+    pub num_river_buckets: u16,
+}
+
+impl StreetBuckets {
+    /// Look up the flop bucket for a given situation index.
+    #[must_use]
+    pub fn flop_bucket(&self, idx: usize) -> u16 {
+        self.flop[idx]
+    }
+
+    /// Look up the turn bucket for a given situation index.
+    #[must_use]
+    pub fn turn_bucket(&self, idx: usize) -> u16 {
+        self.turn[idx]
+    }
+
+    /// Look up the river bucket for a given situation index.
+    #[must_use]
+    pub fn river_bucket(&self, idx: usize) -> u16 {
+        self.river[idx]
+    }
+}
+
 impl BucketEquity {
     /// Look up equity of `bucket_a` vs `bucket_b`.
     #[must_use]
@@ -1624,6 +1665,22 @@ mod tests {
         // Flop bucket 1 → turn bucket 1
         assert_eq!(table[1][0], 1);
         assert_eq!(table[1][1], 1);
+    }
+
+    #[timed_test]
+    fn street_buckets_lookup_returns_correct_bucket() {
+        let sb = StreetBuckets {
+            flop: vec![0, 1, 2, 0, 1],
+            num_flop_buckets: 3,
+            turn: vec![1, 0, 2, 1],
+            num_turn_buckets: 3,
+            river: vec![0, 0, 1, 1, 2, 2],
+            num_river_buckets: 3,
+        };
+        assert_eq!(sb.flop_bucket(0), 0);
+        assert_eq!(sb.flop_bucket(2), 2);
+        assert_eq!(sb.turn_bucket(1), 0);
+        assert_eq!(sb.river_bucket(5), 2);
     }
 
     #[timed_test]
