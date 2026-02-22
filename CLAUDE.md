@@ -1,5 +1,40 @@
 # Rust Project Guidelines
 
+# Task/Issue/Bug Tracking
+
+Use `bd` (beads) — a CLI issue tracker with first-class dependency chains. Data lives in `.beads/`.
+
+### Essential Commands
+
+```bash
+bd ready                        # show unblocked work (open, no active blockers)
+bd list                         # all open issues
+bd blocked                      # issues waiting on dependencies
+bd show <ID>                    # full issue details
+bd create -t "title" -b "body"  # create issue
+bd q "quick note"               # quick capture, outputs only ID
+bd close <ID>                   # close issue (unblocks dependents)
+bd update <ID> -s "field=value" # update issue fields
+bd comments <ID>                # view/add comments
+bd children <ID>                # list child issues
+bd search "text"                # full-text search
+```
+
+### Workflow: Planning → Execution
+
+**Planning:**
+1. `bd ready` / `bd list` — survey existing work
+2. Create issues with dependencies so work flows in order (A blocks B blocks C)
+3. Use `bd create` with a markdown file for bulk creation from plans
+
+**Execution:**
+1. `bd ready` — pick next unblocked issue
+2. Work the issue; use `bd q` to capture discoveries without losing focus
+3. `bd close <ID>` when done — downstream issues auto-unblock
+4. `bd ready` again for next task
+
+**With agent teams:** architect creates dependency graph, developers pick from `bd ready` in parallel, reviewer checks before `bd close`.
+
 ## Build & Test
 
 ```bash
