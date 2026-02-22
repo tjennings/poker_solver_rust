@@ -76,7 +76,7 @@ fn live_deck(hole: [Card; 2], board: &[Card]) -> Vec<Card> {
 #[allow(clippy::cast_precision_loss)]
 fn average_features(features: &[EhsFeatures]) -> EhsFeatures {
     if features.is_empty() {
-        return [0.5, 0.0, 0.0];
+        return [f64::NAN, f64::NAN, f64::NAN]; // sentinel: hand blocked on this board
     }
     // features.len() ≤ millions in typical use; precision loss is acceptable
     let n = features.len() as f64;
@@ -227,9 +227,11 @@ mod tests {
     }
 
     #[timed_test]
-    fn average_features_empty_returns_default() {
+    fn average_features_empty_returns_nan() {
         let result = average_features(&[]);
-        assert_eq!(result, [0.5, 0.0, 0.0]);
+        assert!(result[0].is_nan(), "empty features should return NaN sentinel");
+        assert!(result[1].is_nan());
+        assert!(result[2].is_nan());
     }
 
     #[timed_test]

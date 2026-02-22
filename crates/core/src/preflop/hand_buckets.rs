@@ -163,6 +163,9 @@ pub fn bucket_ehs_centroids(
 
     for (hand_idx, hand_feats) in features.iter().enumerate() {
         for (tex_id, feat) in hand_feats.iter().enumerate() {
+            if feat[0].is_nan() {
+                continue; // skip blocked hands
+            }
             let bucket = assignments[hand_idx][tex_id] as usize;
             sums[bucket] += feat[0]; // EHS component
             counts[bucket] += 1;
@@ -383,7 +386,7 @@ fn board_conflicts<const N: usize>(hole: [Card; 2], board: &[Card; N]) -> bool {
 #[allow(clippy::cast_precision_loss)]
 fn average_features(feats: &[EhsFeatures]) -> EhsFeatures {
     if feats.is_empty() {
-        return [0.5, 0.0, 0.0];
+        return [f64::NAN, f64::NAN, f64::NAN]; // sentinel: hand blocked on this board
     }
     // feats.len() is bounded by combo × texture count; precision acceptable
     let n = feats.len() as f64;
@@ -401,22 +404,77 @@ fn average_features(feats: &[EhsFeatures]) -> EhsFeatures {
 ///
 /// Returns `assignments[hand_idx][texture_id]` → bucket ID.
 /// Callers must validate inputs before calling (num_textures > 0, k > 0).
+///
+/// Hands with NaN features (board-conflict sentinel) are excluded from k-means,
+/// then assigned to the nearest bucket centroid using their cross-texture average.
+#[allow(clippy::cast_precision_loss)]
 pub fn cluster_per_texture(
     features: &[Vec<EhsFeatures>],
     k: u16,
     num_textures: usize,
 ) -> Vec<Vec<u16>> {
-    let all_hands_count = features.len();
+    let num_hands = features.len();
+
+    // Precompute each hand's average feature vector across non-blocked textures
+    let hand_averages: Vec<EhsFeatures> = (0..num_hands)
+        .map(|h| {
+            let valid: Vec<&EhsFeatures> = features[h]
+                .iter()
+                .filter(|f| !f[0].is_nan())
+                .collect();
+            if valid.is_empty() {
+                return [0.5, 0.0, 0.0]; // truly all-blocked (shouldn't happen in practice)
+            }
+            let n = valid.len() as f64;
+            [
+                valid.iter().map(|f| f[0]).sum::<f64>() / n,
+                valid.iter().map(|f| f[1]).sum::<f64>() / n,
+                valid.iter().map(|f| f[2]).sum::<f64>() / n,
+            ]
+        })
+        .collect();
+
     let by_texture: Vec<Vec<u16>> = (0..num_textures)
         .into_par_iter()
         .map(|tex_id| {
-            let points: Vec<EhsFeatures> =
-                (0..all_hands_count).map(|h| features[h][tex_id]).collect();
-            kmeans(&points, k as usize, 100)
+            // Separate valid vs blocked hands
+            let mut valid_indices = Vec::new();
+            let mut blocked_indices = Vec::new();
+            let mut valid_points = Vec::new();
+            for (h, hand_feats) in features.iter().enumerate() {
+                if hand_feats[tex_id][0].is_nan() {
+                    blocked_indices.push(h);
+                } else {
+                    valid_indices.push(h);
+                    valid_points.push(hand_feats[tex_id]);
+                }
+            }
+
+            let valid_assignments = kmeans(&valid_points, k as usize, 100);
+
+            // Build full assignment vector
+            let mut full = vec![0u16; num_hands];
+            if blocked_indices.is_empty() {
+                // Fast path: no blocked hands, just map valid assignments back
+                for (i, &h) in valid_indices.iter().enumerate() {
+                    full[h] = valid_assignments[i];
+                }
+            } else {
+                // Compute per-bucket centroids for assigning blocked hands
+                let centroids = recompute_centroids(&valid_points, &valid_assignments, k as usize);
+                for (i, &h) in valid_indices.iter().enumerate() {
+                    full[h] = valid_assignments[i];
+                }
+                // Assign blocked hands to nearest centroid by their cross-texture average
+                for &h in &blocked_indices {
+                    full[h] = nearest_centroid(&hand_averages[h], &centroids);
+                }
+            }
+            full
         })
         .collect();
     // Transpose: assignments[texture_id][hand_idx] → assignments[hand_idx][texture_id]
-    transpose(&by_texture, all_hands_count, num_textures)
+    transpose(&by_texture, num_hands, num_textures)
 }
 
 /// Transpose a 2D vec from `[texture][hand]` to `[hand][texture]`.
@@ -802,6 +860,7 @@ fn ehs_spread_for_texture(
         if let (Some(feat), Some(tex_assignments)) =
             (hand_feats.get(texture_id), assignments.get(hand_idx))
             && let Some(&bucket) = tex_assignments.get(texture_id)
+            && !feat[0].is_nan()
         {
             sums[bucket as usize] += feat[0];
             counts[bucket as usize] += 1;
@@ -1124,5 +1183,49 @@ mod tests {
         // hand1 appears twice in bucket 0
         let hand1_count = counts[0].iter().find(|&&(h, _)| h == 1).unwrap().1;
         assert_eq!(hand1_count, 2);
+    }
+
+    #[timed_test]
+    fn cluster_per_texture_assigns_blocked_hands_by_cross_texture_average() {
+        // 5 hands, 2 textures, 2 buckets.
+        // Hand 2 is blocked (NaN) on texture 0 but has strong EHS on texture 1.
+        // It should be assigned to the strong bucket on texture 0 (not weak).
+        let features = vec![
+            // Strong hands (EHS ~0.9)
+            vec![[0.90, 0.0, 0.0], [0.92, 0.0, 0.0]],
+            vec![[0.88, 0.0, 0.0], [0.91, 0.0, 0.0]],
+            // Blocked on texture 0, strong on texture 1
+            vec![[f64::NAN, f64::NAN, f64::NAN], [0.95, 0.0, 0.0]],
+            // Weak hands (EHS ~0.2)
+            vec![[0.20, 0.0, 0.0], [0.18, 0.0, 0.0]],
+            vec![[0.22, 0.0, 0.0], [0.19, 0.0, 0.0]],
+        ];
+        let assignments = cluster_per_texture(&features, 2, 2);
+
+        // Hand 2 should be in the same bucket as hands 0,1 on texture 0
+        // (the strong cluster), not with hands 3,4 (the weak cluster).
+        let strong_bucket_tex0 = assignments[0][0];
+        let weak_bucket_tex0 = assignments[3][0];
+        assert_ne!(strong_bucket_tex0, weak_bucket_tex0, "should have 2 distinct clusters");
+        assert_eq!(
+            assignments[2][0], strong_bucket_tex0,
+            "blocked strong hand should be assigned to strong bucket, not weak"
+        );
+    }
+
+    #[timed_test]
+    fn bucket_ehs_centroids_skips_nan_features() {
+        // 2 hands, 1 texture, 1 bucket. Hand 1 is NaN.
+        let features = vec![
+            vec![[0.8, 0.0, 0.0]],
+            vec![[f64::NAN, f64::NAN, f64::NAN]],
+        ];
+        let assignments = vec![vec![0u16], vec![0u16]];
+        let centroids = bucket_ehs_centroids(&features, &assignments, 1);
+        assert!(
+            (centroids[0] - 0.8).abs() < 1e-9,
+            "NaN should be excluded from centroid: got {}",
+            centroids[0]
+        );
     }
 }
