@@ -752,23 +752,45 @@ fn run_solve_preflop(
     let print_every = training.print_every;
     let players = config.positions.len();
 
+    let cache_base = std::path::Path::new("cache/postflop");
+
     let equity = if equity_samples > 0 {
-        let total_pairs = 169 * 168 / 2;
-        let eq_pb = ProgressBar::new(total_pairs as u64);
-        eq_pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} Computing equities [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-                .expect("valid template")
-                .progress_chars("#>-"),
-        );
-        let eq_start = Instant::now();
-        let table = EquityTable::new_computed(equity_samples, |done| {
-            eq_pb.set_position(done as u64);
-        });
-        eq_pb.finish_with_message("done");
-        println!("Equity table built in {:.1?}", eq_start.elapsed());
-        lhe_viz::print_equity_matrix(&table);
-        table
+        use poker_solver_core::preflop::equity_cache;
+
+        if let Some(cached) = equity_cache::load(cache_base, equity_samples) {
+            eprintln!(
+                "Equity cache hit: {}",
+                equity_cache::cache_dir(cache_base, equity_samples).display()
+            );
+            cached
+        } else {
+            let total_pairs = 169 * 168 / 2;
+            let eq_pb = ProgressBar::new(total_pairs as u64);
+            eq_pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} Computing equities [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                    .expect("valid template")
+                    .progress_chars("#>-"),
+            );
+            let eq_start = Instant::now();
+            let table = EquityTable::new_computed(equity_samples, |done| {
+                eq_pb.set_position(done as u64);
+            });
+            eq_pb.finish_with_message("done");
+            println!("Equity table built in {:.1?}", eq_start.elapsed());
+
+            if let Err(e) = equity_cache::save(cache_base, equity_samples, &table) {
+                eprintln!("Warning: failed to save equity cache: {e}");
+            } else {
+                eprintln!(
+                    "Equity cache saved: {}",
+                    equity_cache::cache_dir(cache_base, equity_samples).display()
+                );
+            }
+
+            lhe_viz::print_equity_matrix(&table);
+            table
+        }
     } else {
         println!("Using uniform equities (--equity-samples 0)");
         EquityTable::new_uniform()
@@ -782,40 +804,83 @@ fn run_solve_preflop(
 
     // Build postflop abstraction before the solver takes equity ownership.
     let postflop = if let Some(pf_config) = &config.postflop_model {
-        let pf_pb = ProgressBar::new(0);
-        pf_pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len}")
-                .expect("valid template")
-                .progress_chars("#>-"),
-        );
-        pf_pb.set_message("Building postflop abstraction");
-        let pf_start = Instant::now();
-        let cache_base = std::path::Path::new("cache/postflop");
-        let abstraction = PostflopAbstraction::build(pf_config, Some(&equity), Some(cache_base), |phase| {
-            match &phase {
-                BuildPhase::HandBuckets(done, total) => {
-                    pf_pb.set_length(*total as u64);
-                    pf_pb.set_position(*done as u64);
-                    pf_pb.set_message("Hand buckets");
-                }
-                BuildPhase::SolvingPostflop(iter, total) => {
-                    pf_pb.set_length(*total as u64);
-                    pf_pb.set_position(*iter as u64);
-                    pf_pb.set_message("Solving postflop");
-                }
-                _ => {
-                    pf_pb.set_message(format!("{phase}..."));
-                }
+        use poker_solver_core::preflop::{abstraction_cache, solve_cache};
+
+        let has_eq = equity_samples > 0;
+        let sk = solve_cache::cache_key(pf_config, has_eq);
+        let ak = abstraction_cache::cache_key(pf_config, has_eq);
+
+        // Try full solve cache (phases 2-7 all cached).
+        if let Some(values) = solve_cache::load(cache_base, &sk)
+            && let Some((board, buckets, bucket_equity)) =
+                abstraction_cache::load(cache_base, &ak)
+        {
+            eprintln!(
+                "Solve cache hit: {}",
+                solve_cache::cache_dir(cache_base, &sk).display()
+            );
+            Some(
+                PostflopAbstraction::build_from_cached(
+                    pf_config,
+                    board,
+                    buckets,
+                    bucket_equity,
+                    values,
+                )
+                .map_err(|e| format!("postflop from cache: {e}"))?,
+            )
+        } else {
+            // Build with progress, then cache the values.
+            let pf_pb = ProgressBar::new(0);
+            pf_pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len}")
+                    .expect("valid template")
+                    .progress_chars("#>-"),
+            );
+            pf_pb.set_message("Building postflop abstraction");
+            let pf_start = Instant::now();
+            let abstraction = PostflopAbstraction::build(
+                pf_config,
+                Some(&equity),
+                Some(cache_base),
+                |phase| {
+                    match &phase {
+                        BuildPhase::HandBuckets(done, total) => {
+                            pf_pb.set_length(*total as u64);
+                            pf_pb.set_position(*done as u64);
+                            pf_pb.set_message("Hand buckets");
+                        }
+                        BuildPhase::SolvingPostflop(iter, total) => {
+                            pf_pb.set_length(*total as u64);
+                            pf_pb.set_position(*iter as u64);
+                            pf_pb.set_message("Solving postflop");
+                        }
+                        _ => {
+                            pf_pb.set_message(format!("{phase}..."));
+                        }
+                    }
+                },
+            )
+            .map_err(|e| format!("postflop abstraction: {e}"))?;
+            pf_pb.finish_with_message(format!(
+                "done in {:.1?} (values: {} entries)",
+                pf_start.elapsed(),
+                abstraction.values.len(),
+            ));
+
+            // Cache the solve values for next time.
+            if let Err(e) = solve_cache::save(cache_base, &sk, &abstraction.values) {
+                eprintln!("Warning: failed to save solve cache: {e}");
+            } else {
+                eprintln!(
+                    "Solve cache saved: {}",
+                    solve_cache::cache_dir(cache_base, &sk).display()
+                );
             }
-        })
-        .map_err(|e| format!("postflop abstraction: {e}"))?;
-        pf_pb.finish_with_message(format!(
-            "done in {:.1?} (values: {} entries)",
-            pf_start.elapsed(),
-            abstraction.values.len(),
-        ));
-        Some(abstraction)
+
+            Some(abstraction)
+        }
     } else {
         None
     };
