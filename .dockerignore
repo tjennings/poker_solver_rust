@@ -1,0 +1,13 @@
+target/
+.git/
+node_modules/
+dist/
+local_data/
+.idea/
+.vscode/
+frontend/
+cloud/
+.beads/
+.claude/
+.dolt/
+*.md
