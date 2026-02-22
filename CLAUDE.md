@@ -12,6 +12,12 @@ See [`docs/training.md`](docs/training.md) for all CLI commands, config options,
 
 **Keep it current:** When adding/changing CLI commands, config parameters, or training workflows, update `docs/training.md` to reflect the new state.
 
+## Explorer
+
+See [`docs/explorer.md`](docs/explorer.md) for the strategy explorer desktop app and dev server: loading strategies, browsing the game tree, API commands.
+
+**Keep it current:** When adding/changing explorer commands, UI features, or API endpoints, update `docs/explorer.md` to reflect the new state.
+
 ## Build & Test
 
 ```bash
