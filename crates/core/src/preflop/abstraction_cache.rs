@@ -28,13 +28,9 @@ use super::postflop_model::PostflopModelConfig;
 /// The subset of config fields that determine the abstraction output.
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct AbstractionCacheKey {
-    pub num_flop_textures: u16,
-    pub num_turn_transitions: u16,
-    pub num_river_transitions: u16,
     pub num_hand_buckets_flop: u16,
     pub num_hand_buckets_turn: u16,
     pub num_hand_buckets_river: u16,
-    pub ehs_samples: u32,
     pub has_equity_table: bool,
 }
 
@@ -42,13 +38,9 @@ pub struct AbstractionCacheKey {
 #[must_use]
 pub fn cache_key(config: &PostflopModelConfig, has_equity_table: bool) -> AbstractionCacheKey {
     AbstractionCacheKey {
-        num_flop_textures: config.num_flop_textures,
-        num_turn_transitions: config.num_turn_transitions,
-        num_river_transitions: config.num_river_transitions,
         num_hand_buckets_flop: config.num_hand_buckets_flop,
         num_hand_buckets_turn: config.num_hand_buckets_turn,
         num_hand_buckets_river: config.num_hand_buckets_river,
-        ehs_samples: config.ehs_samples,
         has_equity_table,
     }
 }
@@ -180,13 +172,9 @@ mod tests {
 
     fn minimal_key() -> AbstractionCacheKey {
         AbstractionCacheKey {
-            num_flop_textures: 5,
-            num_turn_transitions: 3,
-            num_river_transitions: 3,
             num_hand_buckets_flop: 50,
             num_hand_buckets_turn: 50,
             num_hand_buckets_river: 50,
-            ehs_samples: 200,
             has_equity_table: false,
         }
     }
@@ -284,6 +272,6 @@ mod tests {
         let yaml_path = cache_dir(dir.path(), &key).join("key.yaml");
         assert!(yaml_path.exists());
         let contents = fs::read_to_string(yaml_path).unwrap();
-        assert!(contents.contains("num_flop_textures"));
+        assert!(contents.contains("num_hand_buckets_flop"));
     }
 }

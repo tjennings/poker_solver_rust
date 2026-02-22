@@ -2,21 +2,8 @@
 ///
 /// Controls hand abstraction granularity (EHS k-means buckets), postflop betting structure,
 /// and per-iteration sampling counts.
-///
-/// The texture fields (`num_flop_textures`, `num_turn_transitions`, `num_river_transitions`,
-/// `ehs_samples`) are deprecated — kept for backward-compatible deserialization of old YAML
-/// configs but no longer used by new code paths.
 use serde::{Deserialize, Serialize};
 
-fn default_num_flop_textures() -> u16 {
-    200
-}
-fn default_num_turn_transitions() -> u16 {
-    10
-}
-fn default_num_river_transitions() -> u16 {
-    10
-}
 fn default_num_hand_buckets_flop() -> u16 {
     500
 }
@@ -25,9 +12,6 @@ fn default_num_hand_buckets_turn() -> u16 {
 }
 fn default_num_hand_buckets_river() -> u16 {
     500
-}
-fn default_ehs_samples() -> u32 {
-    200
 }
 fn default_bet_sizes() -> Vec<f32> {
     vec![0.5, 1.0]
@@ -51,14 +35,6 @@ fn default_canonical_sprs() -> Vec<f64> {
 /// Configuration for the postflop model integrated into the preflop solver.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PostflopModelConfig {
-    // Board abstraction — deprecated, kept for backward-compatible deserialization
-    #[serde(default = "default_num_flop_textures")]
-    pub num_flop_textures: u16,
-    #[serde(default = "default_num_turn_transitions")]
-    pub num_turn_transitions: u16,
-    #[serde(default = "default_num_river_transitions")]
-    pub num_river_transitions: u16,
-
     // Hand abstraction (EHS k-means)
     #[serde(default = "default_num_hand_buckets_flop")]
     pub num_hand_buckets_flop: u16,
@@ -66,9 +42,6 @@ pub struct PostflopModelConfig {
     pub num_hand_buckets_turn: u16,
     #[serde(default = "default_num_hand_buckets_river")]
     pub num_hand_buckets_river: u16,
-    /// Deprecated — kept for backward-compatible deserialization.
-    #[serde(default = "default_ehs_samples")]
-    pub ehs_samples: u32,
 
     // Postflop tree structure
     #[serde(default = "default_bet_sizes")]
@@ -120,13 +93,9 @@ impl PostflopModelConfig {
     #[must_use]
     pub fn standard() -> Self {
         Self {
-            num_flop_textures: 200,
-            num_turn_transitions: 10,
-            num_river_transitions: 10,
             num_hand_buckets_flop: 500,
             num_hand_buckets_turn: 500,
             num_hand_buckets_river: 500,
-            ehs_samples: 200,
             bet_sizes: vec![0.5, 1.0],
             raises_per_street: 1,
             flop_samples_per_iter: 1,
@@ -260,7 +229,8 @@ mod tests {
     }
 
     #[timed_test]
-    fn deprecated_texture_fields_still_deserialize() {
+    fn old_yaml_with_removed_fields_still_deserializes() {
+        // Old configs may contain removed texture fields; serde should ignore them.
         let yaml = r"
 num_flop_textures: 100
 num_turn_transitions: 5
@@ -271,10 +241,6 @@ num_hand_buckets_turn: 300
 num_hand_buckets_river: 300
 ";
         let cfg: PostflopModelConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.num_flop_textures, 100);
-        assert_eq!(cfg.num_turn_transitions, 5);
-        assert_eq!(cfg.num_river_transitions, 5);
-        assert_eq!(cfg.ehs_samples, 500);
         assert_eq!(cfg.num_hand_buckets_flop, 300);
     }
 

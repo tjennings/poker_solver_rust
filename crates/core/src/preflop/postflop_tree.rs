@@ -72,10 +72,6 @@ pub enum PostflopNode {
 pub enum PostflopTreeError {
     #[error("bet_sizes must be non-empty")]
     EmptyBetSizes,
-    #[error("num_turn_transitions must be > 0")]
-    ZeroTurnTransitions,
-    #[error("num_river_transitions must be > 0")]
-    ZeroRiverTransitions,
 }
 
 /// A complete postflop game tree template for one pot type.
@@ -197,12 +193,6 @@ impl PostflopTree {
 fn validate_config(config: &PostflopModelConfig) -> Result<(), PostflopTreeError> {
     if config.bet_sizes.is_empty() {
         return Err(PostflopTreeError::EmptyBetSizes);
-    }
-    if config.num_turn_transitions == 0 {
-        return Err(PostflopTreeError::ZeroTurnTransitions);
-    }
-    if config.num_river_transitions == 0 {
-        return Err(PostflopTreeError::ZeroRiverTransitions);
     }
     Ok(())
 }
@@ -494,12 +484,11 @@ fn build_chance_node(
     idx
 }
 
-fn transition_count(config: &PostflopModelConfig, street: Street) -> usize {
-    match street {
-        Street::Turn => config.num_turn_transitions as usize,
-        Street::River => config.num_river_transitions as usize,
-        _ => 1,
-    }
+/// With imperfect-recall per-street bucketing, board transitions are captured
+/// by the hand bucket assignments themselves, so each chance node has exactly
+/// one branch.
+fn transition_count(_config: &PostflopModelConfig, _street: Street) -> usize {
+    1
 }
 
 /// Builds the flop subtree (OOP acts first postflop).
@@ -857,8 +846,6 @@ mod tests {
         PostflopModelConfig {
             bet_sizes: vec![0.5, 1.0],
             raises_per_street: 1,
-            num_turn_transitions: 2,
-            num_river_transitions: 2,
             ..PostflopModelConfig::fast()
         }
     }
@@ -1000,28 +987,6 @@ mod tests {
     }
 
     #[timed_test]
-    fn error_on_zero_turn_transitions() {
-        let mut cfg = fast_config();
-        cfg.num_turn_transitions = 0;
-        let result = PostflopTree::build(PotType::Raised, &cfg);
-        assert!(matches!(
-            result,
-            Err(PostflopTreeError::ZeroTurnTransitions)
-        ));
-    }
-
-    #[timed_test]
-    fn error_on_zero_river_transitions() {
-        let mut cfg = fast_config();
-        cfg.num_river_transitions = 0;
-        let result = PostflopTree::build(PotType::Raised, &cfg);
-        assert!(matches!(
-            result,
-            Err(PostflopTreeError::ZeroRiverTransitions)
-        ));
-    }
-
-    #[timed_test]
     fn all_pot_types_build_successfully() {
         let cfg = fast_config();
         for pot_type in [
@@ -1036,23 +1001,19 @@ mod tests {
     }
 
     #[timed_test]
-    fn more_transitions_means_more_nodes() {
-        let mut cfg_few = fast_config();
-        cfg_few.num_turn_transitions = 1;
-        cfg_few.num_river_transitions = 1;
-
-        let mut cfg_many = fast_config();
-        cfg_many.num_turn_transitions = 4;
-        cfg_many.num_river_transitions = 4;
-
-        let few = PostflopTree::build(PotType::Raised, &cfg_few).unwrap();
-        let many = PostflopTree::build(PotType::Raised, &cfg_many).unwrap();
-        assert!(
-            many.node_count() > few.node_count(),
-            "more transitions ({}) should yield more nodes than fewer ({})",
-            many.node_count(),
-            few.node_count()
-        );
+    fn single_transition_per_chance_node() {
+        let cfg = fast_config();
+        let tree = PostflopTree::build(PotType::Raised, &cfg).unwrap();
+        // With imperfect recall, every chance node should have exactly 1 child.
+        for node in &tree.nodes {
+            if let PostflopNode::Chance { children, .. } = node {
+                assert_eq!(
+                    children.len(),
+                    1,
+                    "chance nodes should have exactly 1 transition with imperfect recall"
+                );
+            }
+        }
     }
 
     // ── SPR-constrained tree construction ───────────────────────────────────
