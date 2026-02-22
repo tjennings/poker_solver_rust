@@ -24,7 +24,7 @@ use super::board_abstraction::{BoardAbstraction, BoardAbstractionConfig};
 use super::equity::EquityTable;
 use super::hand_buckets::{self, BucketEquity, HandBucketMapping};
 use super::postflop_model::PostflopModelConfig;
-use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree, PotType};
+use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree};
 use crate::abstraction::Street;
 
 /// All precomputed postflop data needed by the preflop solver.
@@ -77,27 +77,6 @@ impl PostflopValues {
         self.values.get(idx).copied().unwrap_or(0.0)
     }
 
-    /// Look up the postflop EV (as fraction of pot) for a given configuration.
-    ///
-    /// Deprecated: use `get_by_spr` instead. Kept temporarily for backward compatibility.
-    #[inline]
-    #[must_use]
-    pub fn get(&self, pot_type: PotType, hero_pos: u8, hero_bucket: u16, opp_bucket: u16) -> f64 {
-        let n = self.num_buckets;
-        let pt_idx = pot_type_index(pot_type);
-        let idx = pt_idx * 2 * n * n + (hero_pos as usize) * n * n + (hero_bucket as usize) * n + opp_bucket as usize;
-        self.values.get(idx).copied().unwrap_or(0.0)
-    }
-}
-
-/// Map legacy `PotType` to SPR index for backward compatibility.
-fn pot_type_index(pt: PotType) -> usize {
-    match pt {
-        PotType::Limped => 0,
-        PotType::Raised => 1,
-        PotType::ThreeBet => 2,
-        PotType::FourBetPlus => 3,
-    }
 }
 
 /// Maps `(node_idx, bucket)` → flat buffer offset for ONE tree.
@@ -242,6 +221,8 @@ pub enum PostflopAbstractionError {
     Tree(#[from] super::postflop_tree::PostflopTreeError),
     #[error("abstraction cache: {0}")]
     Cache(#[from] abstraction_cache::CacheError),
+    #[error("canonical_sprs must be non-empty")]
+    EmptyCanonicalSprs,
 }
 
 /// Progress report during postflop abstraction construction.
@@ -304,6 +285,9 @@ impl PostflopAbstraction {
         cache_base: Option<&std::path::Path>,
         on_progress: impl Fn(BuildPhase) + Sync,
     ) -> Result<Self, PostflopAbstractionError> {
+        if config.canonical_sprs.is_empty() {
+            return Err(PostflopAbstractionError::EmptyCanonicalSprs);
+        }
         let (board, buckets, bucket_equity) = load_or_build_abstraction(
             config,
             equity_table,
