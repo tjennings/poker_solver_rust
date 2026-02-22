@@ -101,6 +101,94 @@ impl PotType {
         }
     }
 
+    /// Compute the default stack-to-pot ratio for this pot type given game structure.
+    ///
+    /// Uses the preflop raise sizes to derive typical pot size and remaining stack
+    /// for each pot-type category. The SPR is `remaining_stack / pot`.
+    ///
+    /// # Arguments
+    /// * `stacks` - Per-player starting stacks in internal units (SB=1)
+    /// * `blinds` - `(position_idx, amount)` pairs for blind posts
+    /// * `raise_sizes` - Raise multipliers indexed by depth (depth 0 = open, 1 = 3bet, etc.)
+    #[must_use]
+    pub fn default_spr(self, stacks: &[u32], blinds: &[(usize, u32)], raise_sizes: &[Vec<f64>]) -> f64 {
+        let stack = *stacks.iter().min().unwrap_or(&0);
+        let bb = blinds.iter().map(|(_, amt)| *amt).max().unwrap_or(2);
+        let sb = blinds.iter().map(|(_, amt)| *amt).min().unwrap_or(1);
+
+        let (pot, invested) = match self {
+            Self::Limped => {
+                // Both post blinds, no raises
+                let pot = sb + bb;
+                (pot, bb) // max investment = BB
+            }
+            Self::Raised => {
+                // Open raise: depth 0 multiplier × BB
+                let open_mult = raise_sizes
+                    .first()
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or(2.5);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let open_size = (open_mult * f64::from(bb)).round() as u32;
+                let open_size = open_size.min(stack);
+                // Caller puts in open_size to match
+                let pot = open_size + open_size;
+                (pot, open_size)
+            }
+            Self::ThreeBet => {
+                let open_mult = raise_sizes
+                    .first()
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or(2.5);
+                let three_bet_mult = raise_sizes
+                    .get(1)
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or(3.0);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let open_size = (open_mult * f64::from(bb)).round() as u32;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let three_bet_size = (three_bet_mult * f64::from(open_size)).round() as u32;
+                let three_bet_size = three_bet_size.min(stack);
+                // Caller puts in three_bet_size to match
+                let pot = three_bet_size + three_bet_size;
+                (pot, three_bet_size)
+            }
+            Self::FourBetPlus => {
+                let open_mult = raise_sizes
+                    .first()
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or(2.5);
+                let three_bet_mult = raise_sizes
+                    .get(1)
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or(3.0);
+                // 4bet multiplier: use depth 2 if available, else depth 1
+                let four_bet_mult = raise_sizes
+                    .get(2)
+                    .or_else(|| raise_sizes.get(1))
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or(3.0);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let open_size = (open_mult * f64::from(bb)).round() as u32;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let three_bet_size = (three_bet_mult * f64::from(open_size)).round() as u32;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let four_bet_size = (four_bet_mult * f64::from(three_bet_size)).round() as u32;
+                let four_bet_size = four_bet_size.min(stack);
+                let pot = four_bet_size + four_bet_size;
+                (pot, four_bet_size)
+            }
+        };
+
+        if pot == 0 {
+            return 0.0;
+        }
+        let remaining = stack.saturating_sub(invested);
+        #[allow(clippy::cast_precision_loss)]
+        let spr = remaining as f64 / pot as f64;
+        spr
+    }
+
     /// Returns the IP player index (0 = OOP / first to act, 1 = IP / last to act).
     ///
     /// For HU: in a limped pot the BB (index 1 in our scheme, acts last preflop)
@@ -655,6 +743,75 @@ mod tests {
             let result = PostflopTree::build(pot_type, &cfg);
             assert!(result.is_ok(), "failed to build tree for {pot_type:?}");
         }
+    }
+
+    // ── default_spr ──────────────────────────────────────────────────────────
+
+    fn hu_game_structure() -> (Vec<u32>, Vec<(usize, u32)>, Vec<Vec<f64>>) {
+        let stacks = vec![50, 50]; // 25BB in internal units
+        let blinds = vec![(0, 1), (1, 2)]; // SB=1, BB=2
+        let raise_sizes = vec![vec![2.5], vec![3.0]]; // open=2.5×BB, 3bet=3×open
+        (stacks, blinds, raise_sizes)
+    }
+
+    #[timed_test]
+    fn spr_limped_pot_is_highest() {
+        let (stacks, blinds, raise_sizes) = hu_game_structure();
+        let spr = PotType::Limped.default_spr(&stacks, &blinds, &raise_sizes);
+        // pot=3, remaining=50-2=48, SPR=48/3=16.0
+        assert!((spr - 16.0).abs() < 0.01, "limped SPR should be ~16.0, got {spr}");
+    }
+
+    #[timed_test]
+    fn spr_raised_pot_is_moderate() {
+        let (stacks, blinds, raise_sizes) = hu_game_structure();
+        let spr = PotType::Raised.default_spr(&stacks, &blinds, &raise_sizes);
+        // open=round(2.5*2)=5, pot=10, remaining=50-5=45, SPR=45/10=4.5
+        assert!(spr > 3.0 && spr < 7.0, "raised SPR should be ~4.5, got {spr}");
+    }
+
+    #[timed_test]
+    fn spr_three_bet_pot_is_small() {
+        let (stacks, blinds, raise_sizes) = hu_game_structure();
+        let spr = PotType::ThreeBet.default_spr(&stacks, &blinds, &raise_sizes);
+        // open=5, 3bet=round(3*5)=15, pot=30, remaining=50-15=35, SPR=35/30≈1.17
+        assert!(spr > 0.5 && spr < 2.5, "3bet SPR should be ~1.17, got {spr}");
+    }
+
+    #[timed_test]
+    fn spr_four_bet_pot_is_tiny() {
+        let (stacks, blinds, raise_sizes) = hu_game_structure();
+        let spr = PotType::FourBetPlus.default_spr(&stacks, &blinds, &raise_sizes);
+        // open=5, 3bet=15, 4bet=round(3*15)=45, pot=90 but 45 capped by stack,
+        // remaining=50-45=5, pot=90, SPR=5/90≈0.06
+        assert!(spr < 1.0, "4bet+ SPR should be <1.0, got {spr}");
+    }
+
+    #[timed_test]
+    fn spr_decreases_with_pot_type_aggression() {
+        let (stacks, blinds, raise_sizes) = hu_game_structure();
+        let limped = PotType::Limped.default_spr(&stacks, &blinds, &raise_sizes);
+        let raised = PotType::Raised.default_spr(&stacks, &blinds, &raise_sizes);
+        let three_bet = PotType::ThreeBet.default_spr(&stacks, &blinds, &raise_sizes);
+        let four_bet = PotType::FourBetPlus.default_spr(&stacks, &blinds, &raise_sizes);
+        assert!(limped > raised, "limped ({limped}) > raised ({raised})");
+        assert!(raised > three_bet, "raised ({raised}) > 3bet ({three_bet})");
+        assert!(three_bet > four_bet, "3bet ({three_bet}) > 4bet ({four_bet})");
+    }
+
+    #[timed_test]
+    fn spr_deeper_stacks_produce_higher_spr() {
+        let blinds = vec![(0, 1), (1, 2)];
+        let raise_sizes = vec![vec![2.5], vec![3.0]];
+        let shallow = PotType::Raised.default_spr(&[50, 50], &blinds, &raise_sizes);
+        let deep = PotType::Raised.default_spr(&[200, 200], &blinds, &raise_sizes);
+        assert!(deep > shallow, "deeper stacks ({deep}) should give higher SPR than shallow ({shallow})");
+    }
+
+    #[timed_test]
+    fn spr_zero_stacks_returns_zero() {
+        let spr = PotType::Limped.default_spr(&[0, 0], &[(0, 1), (1, 2)], &[vec![2.5]]);
+        assert!((spr - 0.0).abs() < f64::EPSILON);
     }
 
     #[timed_test]

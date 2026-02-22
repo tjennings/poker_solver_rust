@@ -42,6 +42,20 @@ fn default_postflop_solve_samples() -> u32 {
     0
 }
 
+/// Game structure info needed to compute SPR for postflop trees.
+///
+/// Extracted from `PreflopConfig` so the postflop build doesn't need
+/// to depend on the full preflop config.
+#[derive(Debug, Clone)]
+pub struct GameStructure {
+    /// Per-player starting stacks in internal units (SB=1).
+    pub stacks: Vec<u32>,
+    /// `(position_idx, amount)` pairs for blind posts.
+    pub blinds: Vec<(usize, u32)>,
+    /// Raise size multipliers indexed by depth.
+    pub raise_sizes: Vec<Vec<f64>>,
+}
+
 /// Configuration for the postflop model integrated into the preflop solver.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PostflopModelConfig {

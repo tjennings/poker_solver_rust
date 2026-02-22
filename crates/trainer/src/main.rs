@@ -36,6 +36,7 @@ use poker_solver_core::preflop::{
     EquityTable, PostflopModelConfig, PreflopBundle, PreflopConfig, PreflopSolver, PreflopTree,
 };
 use poker_solver_core::preflop::postflop_abstraction::{BuildPhase, PostflopAbstraction};
+use poker_solver_core::preflop::postflop_model::GameStructure;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -678,7 +679,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
             let pf_config = training.game.postflop_model
                 .ok_or("config file has no postflop_model section")?;
-            hand_trace::run(&pf_config, &cache_dir)?;
+            let game_structure = GameStructure {
+                stacks: training.game.stacks.clone(),
+                blinds: training.game.blinds.clone(),
+                raise_sizes: training.game.raise_sizes.clone(),
+            };
+            hand_trace::run(&pf_config, &cache_dir, Some(&game_structure))?;
         }
     }
 
@@ -792,7 +798,12 @@ fn run_solve_preflop(
         pf_pb.set_message("Building postflop abstraction");
         let pf_start = Instant::now();
         let cache_base = std::path::Path::new("cache/postflop");
-        let abstraction = PostflopAbstraction::build(pf_config, Some(&equity), Some(cache_base), |phase| {
+        let game_structure = GameStructure {
+            stacks: config.stacks.clone(),
+            blinds: config.blinds.clone(),
+            raise_sizes: config.raise_sizes.clone(),
+        };
+        let abstraction = PostflopAbstraction::build_with_game_structure(pf_config, Some(&equity), Some(cache_base), Some(&game_structure), |phase| {
             match &phase {
                 BuildPhase::HandBuckets(done, total) => {
                     pf_pb.set_length(*total as u64);

@@ -8,7 +8,7 @@ use poker_solver_core::hands::{all_hands, CanonicalHand};
 use poker_solver_core::preflop::ehs::EhsFeatures;
 use poker_solver_core::preflop::hand_buckets::{bucket_ehs_centroids, compute_all_flop_features};
 use poker_solver_core::preflop::postflop_abstraction::PostflopAbstraction;
-use poker_solver_core::preflop::postflop_model::PostflopModelConfig;
+use poker_solver_core::preflop::postflop_model::{GameStructure, PostflopModelConfig};
 use poker_solver_core::preflop::postflop_tree::PotType;
 use poker_solver_core::poker::{Card, Suit, Value};
 
@@ -18,7 +18,16 @@ use poker_solver_core::poker::{Card, Suit, Value};
 
 #[derive(Serialize)]
 struct TraceOutput {
+    spr: SprTrace,
     hands: Vec<HandTrace>,
+}
+
+#[derive(Serialize)]
+struct SprTrace {
+    limped: Option<f64>,
+    raised: Option<f64>,
+    three_bet: Option<f64>,
+    four_bet_plus: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -70,6 +79,7 @@ struct HandSummary {
 pub fn run(
     config: &PostflopModelConfig,
     cache_dir: &Path,
+    game_structure: Option<&GameStructure>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let all_hands_vec: Vec<CanonicalHand> = all_hands().collect();
 
@@ -78,9 +88,11 @@ pub fn run(
     // Build the full postflop abstraction (loads board/buckets/equity from cache,
     // rebuilds trees + solves postflop)
     eprintln!("Building postflop abstraction...");
-    let abstraction = PostflopAbstraction::build(config, None, Some(cache_dir), |phase| {
-        eprintln!("  {phase:?}");
-    })?;
+    let abstraction = PostflopAbstraction::build_with_game_structure(
+        config, None, Some(cache_dir), game_structure, |phase| {
+            eprintln!("  {phase:?}");
+        },
+    )?;
 
     // Compute EHS features for all hands
     eprintln!("Computing EHS features...");
@@ -95,8 +107,25 @@ pub fn run(
     let centroids =
         bucket_ehs_centroids(&features, &abstraction.buckets.flop_buckets, num_buckets);
 
+    // Build SPR trace from abstraction
+    let spr = if let Some(ref sprs) = abstraction.spr_values {
+        SprTrace {
+            limped: sprs.get(&PotType::Limped).copied(),
+            raised: sprs.get(&PotType::Raised).copied(),
+            three_bet: sprs.get(&PotType::ThreeBet).copied(),
+            four_bet_plus: sprs.get(&PotType::FourBetPlus).copied(),
+        }
+    } else {
+        SprTrace {
+            limped: None,
+            raised: None,
+            three_bet: None,
+            four_bet_plus: None,
+        }
+    };
+
     // Build and print JSON output
-    let output = build_trace_output(&all_hands_vec, &features, &abstraction, &centroids);
+    let output = build_trace_output(&all_hands_vec, &features, &abstraction, &centroids, spr);
     println!("{}", serde_json::to_string_pretty(&output)?);
 
     Ok(())
@@ -112,6 +141,7 @@ fn build_trace_output(
     features: &[Vec<EhsFeatures>],
     abstraction: &PostflopAbstraction,
     centroids: &[f64],
+    spr: SprTrace,
 ) -> TraceOutput {
     let num_textures = abstraction.board.prototype_flops.len();
     let num_buckets = centroids.len();
@@ -196,7 +226,7 @@ fn build_trace_output(
         })
         .collect();
 
-    TraceOutput { hands }
+    TraceOutput { spr, hands }
 }
 
 // ---------------------------------------------------------------------------

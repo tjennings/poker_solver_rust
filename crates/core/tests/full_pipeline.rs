@@ -10,6 +10,8 @@ use poker_solver_core::blueprint::{
     BlueprintStrategy, SubgameCfrSolver, SubgameHands, SubgameStrategy, SubgameTreeBuilder,
 };
 use poker_solver_core::poker::{Card, Suit, Value};
+use poker_solver_core::preflop::postflop_model::GameStructure;
+use poker_solver_core::preflop::postflop_tree::PotType;
 use poker_solver_core::preflop::{PreflopConfig, PreflopSolver, PreflopStrategy};
 
 // -----------------------------------------------------------------------
@@ -259,4 +261,48 @@ fn full_pipeline_preflop_then_subgame() {
     blueprint.insert(42, vec![0.25, 0.50, 0.25]);
     assert_eq!(blueprint.len(), 1);
     assert!(blueprint.lookup(42).is_some());
+}
+
+// -----------------------------------------------------------------------
+// SPR computation from game structure
+// -----------------------------------------------------------------------
+
+#[test]
+fn spr_values_from_game_structure_are_monotone() {
+    let config = PreflopConfig::heads_up(25);
+    let gs = GameStructure {
+        stacks: config.stacks.clone(),
+        blinds: config.blinds.clone(),
+        raise_sizes: config.raise_sizes.clone(),
+    };
+
+    let limped = PotType::Limped.default_spr(&gs.stacks, &gs.blinds, &gs.raise_sizes);
+    let raised = PotType::Raised.default_spr(&gs.stacks, &gs.blinds, &gs.raise_sizes);
+    let three_bet = PotType::ThreeBet.default_spr(&gs.stacks, &gs.blinds, &gs.raise_sizes);
+    let four_bet = PotType::FourBetPlus.default_spr(&gs.stacks, &gs.blinds, &gs.raise_sizes);
+
+    assert!(limped > raised, "limped SPR ({limped}) should > raised ({raised})");
+    assert!(raised > three_bet, "raised SPR ({raised}) should > 3bet ({three_bet})");
+    assert!(three_bet > four_bet, "3bet SPR ({three_bet}) should > 4bet ({four_bet})");
+
+    // All SPRs should be positive for non-trivial stacks
+    assert!(limped > 0.0);
+    assert!(raised > 0.0);
+    assert!(three_bet > 0.0);
+    assert!(four_bet >= 0.0);
+}
+
+#[test]
+fn spr_values_differ_across_stack_depths() {
+    let shallow = PreflopConfig::heads_up(15);
+    let deep = PreflopConfig::heads_up(100);
+
+    for &pt in &[PotType::Limped, PotType::Raised, PotType::ThreeBet] {
+        let shallow_spr = pt.default_spr(&shallow.stacks, &shallow.blinds, &shallow.raise_sizes);
+        let deep_spr = pt.default_spr(&deep.stacks, &deep.blinds, &deep.raise_sizes);
+        assert!(
+            deep_spr > shallow_spr,
+            "{pt:?}: deeper stacks ({deep_spr}) should give higher SPR than shallow ({shallow_spr})"
+        );
+    }
 }

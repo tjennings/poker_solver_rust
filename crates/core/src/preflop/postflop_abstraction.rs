@@ -24,7 +24,7 @@ use super::abstraction_cache;
 use super::board_abstraction::{BoardAbstraction, BoardAbstractionConfig};
 use super::equity::EquityTable;
 use super::hand_buckets::{self, BucketEquity, HandBucketMapping};
-use super::postflop_model::PostflopModelConfig;
+use super::postflop_model::{GameStructure, PostflopModelConfig};
 use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree, PotType};
 use crate::abstraction::Street;
 
@@ -36,6 +36,9 @@ pub struct PostflopAbstraction {
     pub trees: FxHashMap<PotType, PostflopTree>,
     /// Precomputed EV table from solved postflop game.
     pub values: PostflopValues,
+    /// Per-pot-type SPR values computed from game structure.
+    /// `None` when no game structure was provided (legacy path).
+    pub spr_values: Option<FxHashMap<PotType, f64>>,
 }
 
 /// Precomputed EV table: `values[pot_type][hero_pos][hero_bucket][opp_bucket]` → EV fraction.
@@ -290,6 +293,9 @@ impl PostflopAbstraction {
     /// hand buckets, equity) are cached to disk. On subsequent runs with the
     /// same abstraction config, these are loaded from cache instead of recomputed.
     ///
+    /// When `game_structure` is provided, per-pot-type SPR values are computed
+    /// from the preflop game structure and stored for tree building and diagnostics.
+    ///
     /// # Errors
     ///
     /// Returns an error if board abstraction, hand bucketing, or tree building fails.
@@ -299,6 +305,23 @@ impl PostflopAbstraction {
         cache_base: Option<&std::path::Path>,
         on_progress: impl Fn(BuildPhase) + Sync,
     ) -> Result<Self, PostflopAbstractionError> {
+        Self::build_with_game_structure(config, equity_table, cache_base, None, on_progress)
+    }
+
+    /// Build with explicit game structure for SPR-aware trees.
+    ///
+    /// See [`build`](Self::build) for general documentation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if board abstraction, hand bucketing, or tree building fails.
+    pub fn build_with_game_structure(
+        config: &PostflopModelConfig,
+        equity_table: Option<&EquityTable>,
+        cache_base: Option<&std::path::Path>,
+        game_structure: Option<&GameStructure>,
+        on_progress: impl Fn(BuildPhase) + Sync,
+    ) -> Result<Self, PostflopAbstractionError> {
         let (board, buckets, bucket_equity) = load_or_build_abstraction(
             config,
             equity_table,
@@ -306,7 +329,16 @@ impl PostflopAbstraction {
             &on_progress,
         )?;
 
+        // Compute per-pot-type SPR from game structure when available.
+        let spr_values = game_structure.map(compute_spr_map);
+        if let Some(ref sprs) = spr_values {
+            for &pt in &ALL_POT_TYPES {
+                eprintln!("  {pt:?}: SPR = {:.2}", sprs[&pt]);
+            }
+        }
+
         on_progress(BuildPhase::Trees);
+        // TODO(psr-d45): pass per-pot-type SPR to PostflopTree::build() once it accepts spr param
         let trees = build_all_trees(config)?;
 
         on_progress(BuildPhase::Layout);
@@ -360,8 +392,17 @@ impl PostflopAbstraction {
             bucket_equity,
             trees,
             values,
+            spr_values,
         })
     }
+}
+
+/// Compute per-pot-type SPR from game structure.
+fn compute_spr_map(gs: &GameStructure) -> FxHashMap<PotType, f64> {
+    ALL_POT_TYPES
+        .iter()
+        .map(|&pt| (pt, pt.default_spr(&gs.stacks, &gs.blinds, &gs.raise_sizes)))
+        .collect()
 }
 
 /// Try loading abstraction data from cache; build and save on miss.
