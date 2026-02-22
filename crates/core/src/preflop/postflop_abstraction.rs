@@ -248,6 +248,8 @@ pub enum PostflopAbstractionError {
     Tree(#[from] super::postflop_tree::PostflopTreeError),
     #[error("abstraction cache: {0}")]
     Cache(#[from] abstraction_cache::CacheError),
+    #[error("solve cache: {0}")]
+    SolveCache(#[from] super::solve_cache::SolveCacheError),
 }
 
 /// Progress report during postflop abstraction construction.
