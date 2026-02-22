@@ -140,34 +140,9 @@ pub fn exists(base: &Path, key: &AbstractionCacheKey) -> bool {
 
 /// FNV-1a hash of the key, formatted as a 16-char hex string.
 fn hex_hash(key: &AbstractionCacheKey) -> String {
-    let mut hasher = FnvHasher::new();
+    let mut hasher = super::fnv::FnvHasher::new();
     key.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
-}
-
-/// FNV-1a 64-bit hasher (no external dependency needed).
-struct FnvHasher(u64);
-
-impl FnvHasher {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01B3;
-
-    fn new() -> Self {
-        Self(Self::OFFSET_BASIS)
-    }
-}
-
-impl Hasher for FnvHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 ^= u64::from(byte);
-            self.0 = self.0.wrapping_mul(Self::PRIME);
-        }
-    }
 }
 
 /// Clone `HandBucketMapping` via bincode round-trip (avoids needing Clone derive).

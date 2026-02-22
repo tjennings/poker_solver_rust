@@ -1,5 +1,6 @@
 pub mod abstraction_cache;
 pub mod equity_cache;
+mod fnv;
 pub mod board_abstraction;
 pub mod bundle;
 pub mod config;

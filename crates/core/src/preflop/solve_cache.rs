@@ -1,6 +1,6 @@
-//! Disk cache for postflop solve results (PostflopValues).
+//! Disk cache for postflop solve results (`PostflopValues`).
 //!
-//! Caches the expensive postflop CFR solve keyed by the full PostflopModelConfig
+//! Caches the expensive postflop CFR solve keyed by the full `PostflopModelConfig`
 //! plus whether a real equity table was used. On cache hit, the preflop solver
 //! skips phases 5-7 entirely.
 //!
@@ -13,7 +13,6 @@
 //! ```
 
 use std::fs;
-use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -89,35 +88,11 @@ pub fn load(base: &Path, key: &SolveCacheKey) -> Option<PostflopValues> {
 /// Uses YAML rather than `Hash` trait because `PostflopModelConfig` contains
 /// `Vec<f32>` which doesn't implement `Hash`.
 fn hex_hash(key: &SolveCacheKey) -> String {
-    let yaml = serde_yaml::to_string(key).unwrap_or_default();
-    let mut hasher = FnvHasher::new();
+    use std::hash::Hasher;
+    let yaml = serde_yaml::to_string(key).expect("SolveCacheKey should always serialize");
+    let mut hasher = super::fnv::FnvHasher::new();
     hasher.write(yaml.as_bytes());
     format!("{:016x}", hasher.finish())
-}
-
-/// FNV-1a 64-bit hasher.
-struct FnvHasher(u64);
-
-impl FnvHasher {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01B3;
-
-    fn new() -> Self {
-        Self(Self::OFFSET_BASIS)
-    }
-}
-
-impl Hasher for FnvHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 ^= u64::from(byte);
-            self.0 = self.0.wrapping_mul(Self::PRIME);
-        }
-    }
 }
 
 #[cfg(test)]
