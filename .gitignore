@@ -31,3 +31,6 @@ worktrees/
 
 # Cache
 cache/
+
+# Cloud local config
+cloud/config.local.sh
