@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::board_abstraction::BoardAbstraction;
-use super::hand_buckets::{BucketEquity, HandBucketMapping};
+use super::hand_buckets::{HandBucketMapping, StreetEquity};
 use super::postflop_model::PostflopModelConfig;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -68,7 +68,7 @@ pub fn cache_dir(base: &Path, key: &AbstractionCacheKey) -> PathBuf {
 struct AbstractionCacheData {
     board: BoardAbstraction,
     buckets: HandBucketMapping,
-    equity: BucketEquity,
+    equity: StreetEquity,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -96,7 +96,7 @@ pub fn save(
     key: &AbstractionCacheKey,
     board: &BoardAbstraction,
     buckets: &HandBucketMapping,
-    equity: &BucketEquity,
+    equity: &StreetEquity,
 ) -> Result<(), CacheError> {
     let dir = cache_dir(base, key);
     fs::create_dir_all(&dir)?;
@@ -107,7 +107,7 @@ pub fn save(
     let data = AbstractionCacheData {
         board: board.clone(),
         buckets: bincode_clone_buckets(buckets),
-        equity: bincode_clone_equity(equity),
+        equity: clone_street_equity(equity),
     };
     let bytes = bincode::serialize(&data).map_err(|e| CacheError::Serialize(e.to_string()))?;
     fs::write(dir.join("abstraction.bin"), bytes)?;
@@ -120,7 +120,7 @@ pub fn save(
 pub fn load(
     base: &Path,
     key: &AbstractionCacheKey,
-) -> Option<(BoardAbstraction, HandBucketMapping, BucketEquity)> {
+) -> Option<(BoardAbstraction, HandBucketMapping, StreetEquity)> {
     let dir = cache_dir(base, key);
     let bytes = fs::read(dir.join("abstraction.bin")).ok()?;
     let data: AbstractionCacheData = bincode::deserialize(&bytes).ok()?;
@@ -158,11 +158,17 @@ fn bincode_clone_buckets(b: &HandBucketMapping) -> HandBucketMapping {
     }
 }
 
-/// Clone `BucketEquity` by copying fields.
-fn bincode_clone_equity(e: &BucketEquity) -> BucketEquity {
-    BucketEquity {
-        equity: e.equity.clone(),
-        num_buckets: e.num_buckets,
+/// Clone `StreetEquity` by copying fields.
+fn clone_street_equity(e: &StreetEquity) -> StreetEquity {
+    use super::hand_buckets::BucketEquity;
+    let clone_eq = |eq: &BucketEquity| BucketEquity {
+        equity: eq.equity.clone(),
+        num_buckets: eq.num_buckets,
+    };
+    StreetEquity {
+        flop: clone_eq(&e.flop),
+        turn: clone_eq(&e.turn),
+        river: clone_eq(&e.river),
     }
 }
 
@@ -222,10 +228,16 @@ mod tests {
         }
     }
 
-    fn minimal_equity() -> BucketEquity {
-        BucketEquity {
+    fn minimal_equity() -> StreetEquity {
+        use super::super::hand_buckets::BucketEquity;
+        let eq = BucketEquity {
             equity: vec![vec![0.5f32]],
             num_buckets: 1,
+        };
+        StreetEquity {
+            flop: BucketEquity { equity: eq.equity.clone(), num_buckets: eq.num_buckets },
+            turn: BucketEquity { equity: eq.equity.clone(), num_buckets: eq.num_buckets },
+            river: eq,
         }
     }
 
@@ -245,8 +257,8 @@ mod tests {
         assert_eq!(loaded_board.prototype_flops.len(), board.prototype_flops.len());
         assert_eq!(loaded_buckets.num_flop_buckets, buckets.num_flop_buckets);
         assert_eq!(loaded_buckets.flop_buckets, buckets.flop_buckets);
-        assert_eq!(loaded_equity.num_buckets, equity.num_buckets);
-        assert!((loaded_equity.get(0, 0) - 0.5).abs() < 1e-6);
+        assert_eq!(loaded_equity.river.num_buckets, equity.river.num_buckets);
+        assert!((loaded_equity.river.get(0, 0) - 0.5).abs() < 1e-6);
     }
 
     #[timed_test]

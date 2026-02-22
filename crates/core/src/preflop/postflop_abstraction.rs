@@ -23,7 +23,7 @@ use rayon::prelude::*;
 use super::abstraction_cache;
 use super::board_abstraction::{BoardAbstraction, BoardAbstractionConfig};
 use super::equity::EquityTable;
-use super::hand_buckets::{self, BucketEquity, HandBucketMapping};
+use super::hand_buckets::{self, BucketEquity, HandBucketMapping, StreetEquity};
 use super::postflop_model::PostflopModelConfig;
 use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree};
 use crate::abstraction::Street;
@@ -32,7 +32,7 @@ use crate::abstraction::Street;
 pub struct PostflopAbstraction {
     pub board: BoardAbstraction,
     pub buckets: HandBucketMapping,
-    pub bucket_equity: BucketEquity,
+    pub street_equity: StreetEquity,
     pub trees: Vec<PostflopTree>,
     /// Precomputed EV table from solved postflop game.
     pub values: PostflopValues,
@@ -300,7 +300,7 @@ impl PostflopAbstraction {
         if config.canonical_sprs.is_empty() {
             return Err(PostflopAbstractionError::EmptyCanonicalSprs);
         }
-        let (board, buckets, bucket_equity) = load_or_build_abstraction(
+        let (board, buckets, street_equity) = load_or_build_abstraction(
             config,
             equity_table,
             cache_base,
@@ -316,21 +316,23 @@ impl PostflopAbstraction {
             .map(annotate_streets)
             .collect();
 
-        let num_b = buckets.num_flop_buckets as usize;
+        let num_flop_b = buckets.num_flop_buckets as usize;
+        let num_turn_b = buckets.num_turn_buckets as usize;
+        let num_river_b = buckets.num_river_buckets as usize;
 
         let spr_layouts = build_per_spr_layouts(
             &trees,
             &node_streets,
-            num_b,
-            buckets.num_turn_buckets as usize,
-            buckets.num_river_buckets as usize,
+            num_flop_b,
+            num_turn_b,
+            num_river_b,
         );
 
         let total_iters = config.postflop_solve_iterations as usize;
         let samples = if config.postflop_solve_samples > 0 {
             config.postflop_solve_samples as usize
         } else {
-            num_b
+            num_flop_b
         };
         let num_sprs = trees.len();
         let total_steps = total_iters * num_sprs;
@@ -339,8 +341,9 @@ impl PostflopAbstraction {
         let spr_strategy_sums = solve_postflop_per_spr(
             &trees,
             &spr_layouts,
-            &bucket_equity,
-            num_b,
+            &street_equity,
+            &buckets,
+            num_flop_b,
             total_iters,
             samples,
             |step, total| on_progress(BuildPhase::SolvingPostflop(step, total)),
@@ -350,15 +353,16 @@ impl PostflopAbstraction {
         let values = compute_postflop_values(
             &trees,
             &spr_layouts,
-            &bucket_equity,
+            &street_equity,
+            &buckets,
             &spr_strategy_sums,
-            num_b,
+            num_flop_b,
         );
 
         Ok(Self {
             board,
             buckets,
-            bucket_equity,
+            street_equity,
             trees,
             values,
             canonical_sprs: config.canonical_sprs.clone(),
@@ -398,7 +402,7 @@ fn load_or_build_abstraction(
     equity_table: Option<&EquityTable>,
     cache_base: Option<&std::path::Path>,
     on_progress: &(impl Fn(BuildPhase) + Sync),
-) -> Result<(BoardAbstraction, HandBucketMapping, BucketEquity), PostflopAbstractionError> {
+) -> Result<(BoardAbstraction, HandBucketMapping, StreetEquity), PostflopAbstractionError> {
     let key = abstraction_cache::cache_key(config, equity_table.is_some());
 
     if let Some(base) = cache_base
@@ -413,18 +417,18 @@ fn load_or_build_abstraction(
     let board = build_board_abstraction(config)?;
 
     on_progress(BuildPhase::HandBuckets(0, hand_buckets::NUM_HANDS));
-    let (buckets, bucket_equity) =
+    let (buckets, street_equity) =
         build_hand_buckets_and_equity(config, &board, equity_table, on_progress)?;
 
     on_progress(BuildPhase::EquityTable);
 
     if let Some(base) = cache_base {
-        abstraction_cache::save(base, &key, &board, &buckets, &bucket_equity)?;
+        abstraction_cache::save(base, &key, &board, &buckets, &street_equity)?;
         let dir = abstraction_cache::cache_dir(base, &key);
         eprintln!("Abstraction cache saved: {}", dir.display());
     }
 
-    Ok((board, buckets, bucket_equity))
+    Ok((board, buckets, street_equity))
 }
 
 fn build_board_abstraction(
@@ -448,57 +452,138 @@ fn build_hand_buckets_and_equity(
     board: &BoardAbstraction,
     equity_table: Option<&EquityTable>,
     on_progress: &(impl Fn(BuildPhase) + Sync),
-) -> Result<(HandBucketMapping, BucketEquity), hand_buckets::BucketError> {
+) -> Result<(HandBucketMapping, StreetEquity), hand_buckets::BucketError> {
     use crate::hands::all_hands;
+    use crate::poker::Card;
+    use super::board_abstraction::{representative_turn_cards, representative_river_cards};
 
-    let flop_samples: Vec<Vec<[crate::poker::Card; 3]>> = board
+    let flop_samples: Vec<Vec<[Card; 3]>> = board
         .prototype_flops
         .iter()
         .map(|f| vec![*f])
         .collect();
 
-    let num_buckets = config.num_hand_buckets_flop;
+    let num_flop_buckets = config.num_hand_buckets_flop;
     let num_textures = flop_samples.len();
-    hand_buckets::validate_buckets(num_buckets, num_textures as u16)?;
+    hand_buckets::validate_buckets(num_flop_buckets, num_textures as u16)?;
 
     let hands: Vec<_> = all_hands().collect();
     let total = hand_buckets::NUM_HANDS;
-    let features = hand_buckets::compute_all_flop_features(
+    let flop_features = hand_buckets::compute_all_flop_features(
         &hands,
         &flop_samples,
         &|done| on_progress(BuildPhase::HandBuckets(done, total)),
     );
 
-    let flop_buckets = hand_buckets::cluster_global(&features, num_buckets, num_textures);
+    let flop_buckets = hand_buckets::cluster_global(&flop_features, num_flop_buckets, num_textures);
 
     hand_buckets::log_bucket_diagnostics(
-        &hands, &features, &flop_buckets, num_buckets, &board.prototype_flops,
+        &hands, &flop_features, &flop_buckets, num_flop_buckets, &board.prototype_flops,
     );
 
-    let bucket_equity = if let Some(eq_table) = equity_table {
-        // Use real pairwise equities — much more accurate.
-        hand_buckets::build_bucket_equity_from_equity_table(
-            &flop_buckets,
-            eq_table,
-            num_buckets as usize,
-        )
-    } else {
-        // Fallback: derive from EHS centroids.
-        let centroids =
-            hand_buckets::bucket_ehs_centroids(&features, &flop_buckets, num_buckets as usize);
-        hand_buckets::build_bucket_equity_from_centroids(&centroids)
-    };
+    // ── Turn bucket assignments ──────────────────────────────────────────────
+    let num_turn_trans = config.num_turn_transitions as usize;
+
+    let turn_board_samples: Vec<Vec<[Card; 4]>> = (0..num_turn_trans)
+        .map(|trans_i| {
+            board.prototype_flops.iter().enumerate().filter_map(|(t, flop)| {
+                let turn_txs = &board.turn_transitions[t];
+                let tx_idx = trans_i.min(turn_txs.len().saturating_sub(1));
+                if turn_txs.is_empty() { return None; }
+                let rep_cards = representative_turn_cards(flop, turn_txs);
+                let turn_card = rep_cards[tx_idx];
+                if flop.contains(&turn_card) { return None; }
+                Some([flop[0], flop[1], flop[2], turn_card])
+            }).collect()
+        })
+        .collect();
+
+    eprintln!("  Building turn buckets ({} buckets, {} textures)...",
+        config.num_hand_buckets_turn, num_turn_trans);
+
+    // Compute turn features and cluster (instead of calling build_turn_buckets)
+    let turn_features = hand_buckets::compute_all_turn_features(
+        &hands, num_flop_buckets as usize, &turn_board_samples,
+    );
+    hand_buckets::validate_buckets(config.num_hand_buckets_turn, num_turn_trans as u16)?;
+    let turn_assignments = hand_buckets::cluster_global(
+        &turn_features, config.num_hand_buckets_turn, num_turn_trans,
+    );
+
+    let turn_transitions = hand_buckets::build_transition_table(
+        &flop_buckets,
+        &turn_assignments,
+        num_flop_buckets,
+        num_turn_trans,
+        config.num_hand_buckets_turn,
+    );
+
+    // ── River bucket assignments ─────────────────────────────────────────────
+    let num_river_trans = config.num_river_transitions as usize;
+
+    let river_board_samples: Vec<Vec<[Card; 5]>> = (0..num_river_trans)
+        .map(|river_i| {
+            board.prototype_flops.iter().enumerate().flat_map(|(t, flop)| {
+                let turn_txs = &board.turn_transitions[t];
+                if turn_txs.is_empty() { return Vec::new(); }
+                let turn_rep_cards = representative_turn_cards(flop, turn_txs);
+
+                turn_rep_cards.iter().enumerate().filter_map(|(ti, &turn_card)| {
+                    if flop.contains(&turn_card) { return None; }
+                    let four_board = [flop[0], flop[1], flop[2], turn_card];
+                    let river_txs = board.river_transitions.get(t)
+                        .and_then(|v| v.get(ti))?;
+                    if river_txs.is_empty() { return None; }
+                    let river_rep_cards = representative_river_cards(&four_board, river_txs);
+                    let rx_idx = river_i.min(river_rep_cards.len().saturating_sub(1));
+                    let river_card = river_rep_cards[rx_idx];
+                    if four_board.contains(&river_card) { return None; }
+                    Some([flop[0], flop[1], flop[2], turn_card, river_card])
+                }).collect::<Vec<_>>()
+            }).collect()
+        })
+        .collect();
+
+    eprintln!("  Building river buckets ({} buckets, {} textures)...",
+        config.num_hand_buckets_river, num_river_trans);
+
+    let river_features = hand_buckets::compute_all_river_features(
+        &hands, config.num_hand_buckets_turn as usize, &river_board_samples,
+    );
+    hand_buckets::validate_buckets(config.num_hand_buckets_river, num_river_trans as u16)?;
+    let river_assignments = hand_buckets::cluster_global(
+        &river_features, config.num_hand_buckets_river, num_river_trans,
+    );
+
+    let river_transitions = hand_buckets::build_transition_table(
+        &turn_assignments,
+        &river_assignments,
+        config.num_hand_buckets_turn,
+        num_river_trans,
+        config.num_hand_buckets_river,
+    );
+
+    // ── Per-street equity tables ─────────────────────────────────────────────
+    let street_equity = hand_buckets::build_street_equity(
+        &flop_buckets, &flop_features, num_flop_buckets as usize,
+        &turn_features, &turn_assignments, config.num_hand_buckets_turn as usize,
+        &river_features, &river_assignments, config.num_hand_buckets_river as usize,
+        equity_table,
+    );
+
+    eprintln!("  Bucket counts: flop={}, turn={}, river={}",
+        num_flop_buckets, config.num_hand_buckets_turn, config.num_hand_buckets_river);
 
     let mapping = HandBucketMapping {
-        num_flop_buckets: num_buckets,
-        num_turn_buckets: num_buckets,
-        num_river_buckets: num_buckets,
-        turn_buckets: flop_buckets.clone(),
-        river_buckets: flop_buckets.clone(),
+        num_flop_buckets,
+        num_turn_buckets: config.num_hand_buckets_turn,
+        num_river_buckets: config.num_hand_buckets_river,
         flop_buckets,
+        turn_buckets: turn_transitions,
+        river_buckets: river_transitions,
     };
 
-    Ok((mapping, bucket_equity))
+    Ok((mapping, street_equity))
 }
 
 fn build_all_spr_trees(
@@ -541,17 +626,18 @@ fn build_per_spr_layouts(
 fn solve_postflop_per_spr(
     trees: &[PostflopTree],
     spr_layouts: &[PostflopLayout],
-    bucket_equity: &BucketEquity,
-    num_buckets: usize,
+    street_equity: &StreetEquity,
+    buckets: &HandBucketMapping,
+    num_flop_buckets: usize,
     num_iterations: usize,
     samples_per_iter: usize,
     on_progress: impl Fn(usize, usize) + Sync,
 ) -> Vec<Vec<f64>> {
     let num_sprs = trees.len();
     let total_steps = num_iterations * num_sprs;
-    let use_exhaustive = num_buckets * num_buckets <= samples_per_iter;
+    let use_exhaustive = num_flop_buckets * num_flop_buckets <= samples_per_iter;
     let actual_pairs = if use_exhaustive {
-        num_buckets * num_buckets
+        num_flop_buckets * num_flop_buckets
     } else {
         samples_per_iter
     };
@@ -577,9 +663,10 @@ fn solve_postflop_per_spr(
             solve_one_spr(
                 trees,
                 layout,
-                bucket_equity,
+                street_equity,
+                buckets,
                 spr_idx,
-                num_buckets,
+                num_flop_buckets,
                 layout.total_size,
                 num_iterations,
                 samples_per_iter,
@@ -592,18 +679,14 @@ fn solve_postflop_per_spr(
 }
 
 /// Run CFR for a single SPR with parallel inner loop.
-///
-/// Uses exhaustive bucket-pair enumeration when N² ≤ `samples_per_iter`
-/// (eliminates sampling variance), otherwise falls back to random sampling.
-/// Reads `regret_sum` directly each iteration (no per-iteration clone needed
-/// since it is immutable within the inner loop).
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn solve_one_spr(
     trees: &[PostflopTree],
     layout: &PostflopLayout,
-    bucket_equity: &BucketEquity,
+    street_equity: &StreetEquity,
+    buckets: &HandBucketMapping,
     spr_idx: usize,
-    num_buckets: usize,
+    num_flop_buckets: usize,
     buf_size: usize,
     num_iterations: usize,
     samples_per_iter: usize,
@@ -613,7 +696,7 @@ fn solve_one_spr(
 ) -> Vec<f64> {
     let mut regret_sum = vec![0.0f64; buf_size];
     let mut strategy_sum = vec![0.0f64; buf_size];
-    let use_exhaustive = num_buckets * num_buckets <= samples_per_iter;
+    let use_exhaustive = num_flop_buckets * num_flop_buckets <= samples_per_iter;
 
     for iter in 0..num_iterations {
         let step = progress.fetch_add(1, Ordering::Relaxed) + 1;
@@ -621,17 +704,15 @@ fn solve_one_spr(
 
         let iteration = iter as u64 + 1;
 
-        // Parallel fold: each rayon task accumulates its own (dr, ds) deltas,
-        // reading regret_sum immutably (no clone needed).
         let (dr, ds) = if use_exhaustive {
             exhaustive_cfr_iteration(
-                trees, layout, bucket_equity, &regret_sum,
-                spr_idx, num_buckets, buf_size, iteration,
+                trees, layout, street_equity, buckets, &regret_sum,
+                spr_idx, num_flop_buckets, buf_size, iteration,
             )
         } else {
             sampled_cfr_iteration(
-                trees, layout, bucket_equity, &regret_sum,
-                spr_idx, num_buckets, buf_size, samples_per_iter, iteration, iter,
+                trees, layout, street_equity, buckets, &regret_sum,
+                spr_idx, num_flop_buckets, buf_size, samples_per_iter, iteration, iter,
             )
         };
 
@@ -642,28 +723,29 @@ fn solve_one_spr(
     strategy_sum
 }
 
-/// One CFR iteration over all N² bucket pairs, parallelised across hero buckets.
+/// One CFR iteration over all N² flop bucket pairs, parallelised across hero buckets.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn exhaustive_cfr_iteration(
     trees: &[PostflopTree],
     layout: &PostflopLayout,
-    bucket_equity: &BucketEquity,
+    street_equity: &StreetEquity,
+    buckets: &HandBucketMapping,
     regret_sum: &[f64],
     spr_idx: usize,
-    num_buckets: usize,
+    num_flop_buckets: usize,
     buf_size: usize,
     iteration: u64,
 ) -> (Vec<f64>, Vec<f64>) {
-    (0..num_buckets)
+    (0..num_flop_buckets)
         .into_par_iter()
         .fold(
             || (vec![0.0f64; buf_size], vec![0.0f64; buf_size]),
             |(mut dr, mut ds), hb| {
                 let hb = hb as u16;
-                for ob in 0..num_buckets as u16 {
+                for ob in 0..num_flop_buckets as u16 {
                     for hero_pos in 0..2u8 {
                         solve_cfr_traverse(
-                            trees, layout, bucket_equity, regret_sum,
+                            trees, layout, street_equity, buckets, regret_sum,
                             &mut dr, &mut ds,
                             spr_idx, 0, hb, ob, hero_pos, 1.0, 1.0, iteration,
                         );
@@ -687,22 +769,22 @@ fn exhaustive_cfr_iteration(
 fn sampled_cfr_iteration(
     trees: &[PostflopTree],
     layout: &PostflopLayout,
-    bucket_equity: &BucketEquity,
+    street_equity: &StreetEquity,
+    buckets: &HandBucketMapping,
     regret_sum: &[f64],
     spr_idx: usize,
-    num_buckets: usize,
+    num_flop_buckets: usize,
     buf_size: usize,
     samples_per_iter: usize,
     iteration: u64,
     iter_idx: usize,
 ) -> (Vec<f64>, Vec<f64>) {
-    // Generate pairs sequentially (RNG is sequential), then process in parallel.
     let seed = iter_idx as u64 * 1_000_003 + spr_idx as u64;
     let mut rng = SmallRng::seed_from_u64(seed);
     let pairs: Vec<(u16, u16)> = (0..samples_per_iter)
         .map(|_| {
-            let hb = rng.random_range(0..num_buckets as u16);
-            let ob = rng.random_range(0..num_buckets as u16);
+            let hb = rng.random_range(0..num_flop_buckets as u16);
+            let ob = rng.random_range(0..num_flop_buckets as u16);
             (hb, ob)
         })
         .collect();
@@ -718,7 +800,7 @@ fn sampled_cfr_iteration(
                 for &(hb, ob) in chunk {
                     for hero_pos in 0..2u8 {
                         solve_cfr_traverse(
-                            trees, layout, bucket_equity, regret_sum,
+                            trees, layout, street_equity, buckets, regret_sum,
                             &mut dr, &mut ds,
                             spr_idx, 0, hb, ob, hero_pos, 1.0, 1.0, iteration,
                         );
@@ -738,11 +820,15 @@ fn sampled_cfr_iteration(
 }
 
 /// Single CFR traversal for the postflop solve phase. Returns hero EV fraction.
+///
+/// Bucket IDs are transitioned at Chance nodes using the `buckets` mapping.
+/// Per-street equity is used at showdown terminals.
 #[allow(clippy::too_many_arguments)]
 fn solve_cfr_traverse(
     trees: &[PostflopTree],
     layout: &PostflopLayout,
-    bucket_equity: &BucketEquity,
+    street_equity: &StreetEquity,
+    buckets: &HandBucketMapping,
     snapshot: &[f64],
     dr: &mut [f64],
     ds: &mut [f64],
@@ -759,14 +845,19 @@ fn solve_cfr_traverse(
 
     match &tree.nodes[node_idx as usize] {
         PostflopNode::Terminal { terminal_type, pot_fraction } => {
-            postflop_terminal_value(*terminal_type, *pot_fraction, hero_bucket, opp_bucket, hero_pos, bucket_equity)
+            let current_street = layout.street(node_idx);
+            let eq_table = equity_for_street(street_equity, current_street);
+            postflop_terminal_value(*terminal_type, *pot_fraction, hero_bucket, opp_bucket, hero_pos, eq_table)
         }
-        PostflopNode::Chance { children, weights, .. } => {
-            children.iter().zip(weights.iter())
-                .map(|(&child, &w)| {
+        PostflopNode::Chance { street, children, weights } => {
+            children.iter().zip(weights.iter()).enumerate()
+                .map(|(tex_id, (&child, &w))| {
+                    let (new_hero, new_opp) = transition_buckets(
+                        buckets, *street, hero_bucket, opp_bucket, tex_id,
+                    );
                     w * solve_cfr_traverse(
-                        trees, layout, bucket_equity, snapshot, dr, ds,
-                        spr_idx, child, hero_bucket, opp_bucket, hero_pos,
+                        trees, layout, street_equity, buckets, snapshot, dr, ds,
+                        spr_idx, child, new_hero, new_opp, hero_pos,
                         reach_hero, reach_opp, iteration,
                     )
                 })
@@ -783,13 +874,13 @@ fn solve_cfr_traverse(
 
             if is_hero {
                 solve_traverse_hero(
-                    trees, layout, bucket_equity, snapshot, dr, ds,
+                    trees, layout, street_equity, buckets, snapshot, dr, ds,
                     start, spr_idx, hero_bucket, opp_bucket, hero_pos,
                     reach_hero, reach_opp, children, &strategy[..num_actions], iteration,
                 )
             } else {
                 solve_traverse_opponent(
-                    trees, layout, bucket_equity, snapshot, dr, ds,
+                    trees, layout, street_equity, buckets, snapshot, dr, ds,
                     spr_idx, hero_bucket, opp_bucket, hero_pos,
                     reach_hero, reach_opp, children, &strategy[..num_actions], iteration,
                 )
@@ -802,7 +893,8 @@ fn solve_cfr_traverse(
 fn solve_traverse_hero(
     trees: &[PostflopTree],
     layout: &PostflopLayout,
-    bucket_equity: &BucketEquity,
+    street_equity: &StreetEquity,
+    buckets: &HandBucketMapping,
     snapshot: &[f64],
     dr: &mut [f64],
     ds: &mut [f64],
@@ -822,7 +914,7 @@ fn solve_traverse_hero(
 
     for (i, &child) in children.iter().enumerate() {
         action_values[i] = solve_cfr_traverse(
-            trees, layout, bucket_equity, snapshot, dr, ds,
+            trees, layout, street_equity, buckets, snapshot, dr, ds,
             spr_idx, child, hero_bucket, opp_bucket, hero_pos,
             reach_hero * strategy[i], reach_opp, iteration,
         );
@@ -849,7 +941,8 @@ fn solve_traverse_hero(
 fn solve_traverse_opponent(
     trees: &[PostflopTree],
     layout: &PostflopLayout,
-    bucket_equity: &BucketEquity,
+    street_equity: &StreetEquity,
+    buckets: &HandBucketMapping,
     snapshot: &[f64],
     dr: &mut [f64],
     ds: &mut [f64],
@@ -866,7 +959,7 @@ fn solve_traverse_opponent(
     children.iter().enumerate()
         .map(|(i, &child)| {
             strategy[i] * solve_cfr_traverse(
-                trees, layout, bucket_equity, snapshot, dr, ds,
+                trees, layout, street_equity, buckets, snapshot, dr, ds,
                 spr_idx, child, hero_bucket, opp_bucket, hero_pos,
                 reach_hero, reach_opp * strategy[i], iteration,
             )
@@ -890,27 +983,28 @@ fn add_buffers(dst: &mut [f64], src: &[f64]) {
 fn compute_postflop_values(
     trees: &[PostflopTree],
     spr_layouts: &[PostflopLayout],
-    bucket_equity: &BucketEquity,
+    street_equity: &StreetEquity,
+    buckets: &HandBucketMapping,
     spr_strategy_sums: &[Vec<f64>],
-    num_buckets: usize,
+    num_flop_buckets: usize,
 ) -> PostflopValues {
     let num_sprs = trees.len();
-    let total = num_sprs * 2 * num_buckets * num_buckets;
+    let total = num_sprs * 2 * num_flop_buckets * num_flop_buckets;
     let mut values = vec![0.0f64; total];
 
     for spr_idx in 0..num_sprs {
         let layout = &spr_layouts[spr_idx];
         let strategy_sum = &spr_strategy_sums[spr_idx];
         for hero_pos in 0..2u8 {
-            for hero_bucket in 0..num_buckets as u16 {
-                for opp_bucket in 0..num_buckets as u16 {
+            for hero_bucket in 0..num_flop_buckets as u16 {
+                for opp_bucket in 0..num_flop_buckets as u16 {
                     let ev = eval_with_avg_strategy(
-                        trees, layout, bucket_equity, strategy_sum,
+                        trees, layout, street_equity, buckets, strategy_sum,
                         spr_idx, 0, hero_bucket, opp_bucket, hero_pos,
                     );
-                    let idx = spr_idx * 2 * num_buckets * num_buckets
-                        + (hero_pos as usize) * num_buckets * num_buckets
-                        + (hero_bucket as usize) * num_buckets
+                    let idx = spr_idx * 2 * num_flop_buckets * num_flop_buckets
+                        + (hero_pos as usize) * num_flop_buckets * num_flop_buckets
+                        + (hero_bucket as usize) * num_flop_buckets
                         + opp_bucket as usize;
                     values[idx] = ev;
                 }
@@ -918,7 +1012,7 @@ fn compute_postflop_values(
         }
     }
 
-    PostflopValues { values, num_buckets, num_sprs }
+    PostflopValues { values, num_buckets: num_flop_buckets, num_sprs }
 }
 
 /// Walk tree using averaged (converged) strategy, returning hero EV fraction.
@@ -926,7 +1020,8 @@ fn compute_postflop_values(
 fn eval_with_avg_strategy(
     trees: &[PostflopTree],
     layout: &PostflopLayout,
-    bucket_equity: &BucketEquity,
+    street_equity: &StreetEquity,
+    buckets: &HandBucketMapping,
     strategy_sum: &[f64],
     spr_idx: usize,
     node_idx: u32,
@@ -938,14 +1033,19 @@ fn eval_with_avg_strategy(
 
     match &tree.nodes[node_idx as usize] {
         PostflopNode::Terminal { terminal_type, pot_fraction } => {
-            postflop_terminal_value(*terminal_type, *pot_fraction, hero_bucket, opp_bucket, hero_pos, bucket_equity)
+            let current_street = layout.street(node_idx);
+            let eq_table = equity_for_street(street_equity, current_street);
+            postflop_terminal_value(*terminal_type, *pot_fraction, hero_bucket, opp_bucket, hero_pos, eq_table)
         }
-        PostflopNode::Chance { children, weights, .. } => {
-            children.iter().zip(weights.iter())
-                .map(|(&child, &w)| {
+        PostflopNode::Chance { street, children, weights } => {
+            children.iter().zip(weights.iter()).enumerate()
+                .map(|(tex_id, (&child, &w))| {
+                    let (new_hero, new_opp) = transition_buckets(
+                        buckets, *street, hero_bucket, opp_bucket, tex_id,
+                    );
                     w * eval_with_avg_strategy(
-                        trees, layout, bucket_equity, strategy_sum,
-                        spr_idx, child, hero_bucket, opp_bucket, hero_pos,
+                        trees, layout, street_equity, buckets, strategy_sum,
+                        spr_idx, child, new_hero, new_opp, hero_pos,
                     )
                 })
                 .sum()
@@ -960,7 +1060,7 @@ fn eval_with_avg_strategy(
             children.iter().enumerate()
                 .map(|(i, &child)| {
                     strategy[i] * eval_with_avg_strategy(
-                        trees, layout, bucket_equity, strategy_sum,
+                        trees, layout, street_equity, buckets, strategy_sum,
                         spr_idx, child, hero_bucket, opp_bucket, hero_pos,
                     )
                 })
@@ -991,6 +1091,57 @@ fn normalize_strategy_sum(strategy_sum: &[f64], start: usize, num_actions: usize
 
 const MAX_POSTFLOP_ACTIONS: usize = 8;
 
+/// Select the equity table for the given street.
+fn equity_for_street(street_equity: &StreetEquity, street: Street) -> &BucketEquity {
+    match street {
+        Street::Preflop | Street::Flop => &street_equity.flop,
+        Street::Turn => &street_equity.turn,
+        Street::River => &street_equity.river,
+    }
+}
+
+/// Transition bucket IDs at a Chance node (street transition).
+///
+/// Uses the bucket mapping to convert flop→turn or turn→river bucket IDs
+/// based on the texture index (child index in the chance node).
+fn transition_buckets(
+    buckets: &HandBucketMapping,
+    street: Street,
+    hero_bucket: u16,
+    opp_bucket: u16,
+    tex_id: usize,
+) -> (u16, u16) {
+    match street {
+        Street::Turn => {
+            let new_hero = buckets.turn_buckets
+                .get(hero_bucket as usize)
+                .and_then(|v| v.get(tex_id))
+                .copied()
+                .unwrap_or(hero_bucket);
+            let new_opp = buckets.turn_buckets
+                .get(opp_bucket as usize)
+                .and_then(|v| v.get(tex_id))
+                .copied()
+                .unwrap_or(opp_bucket);
+            (new_hero, new_opp)
+        }
+        Street::River => {
+            let new_hero = buckets.river_buckets
+                .get(hero_bucket as usize)
+                .and_then(|v| v.get(tex_id))
+                .copied()
+                .unwrap_or(hero_bucket);
+            let new_opp = buckets.river_buckets
+                .get(opp_bucket as usize)
+                .and_then(|v| v.get(tex_id))
+                .copied()
+                .unwrap_or(opp_bucket);
+            (new_hero, new_opp)
+        }
+        _ => (hero_bucket, opp_bucket),
+    }
+}
+
 fn postflop_terminal_value(
     terminal_type: PostflopTerminalType,
     pot_fraction: f64,
@@ -1002,10 +1153,8 @@ fn postflop_terminal_value(
     match terminal_type {
         PostflopTerminalType::Fold { folder } => {
             if folder == hero_pos {
-                // Hero folded: loses half the pot_fraction
                 -pot_fraction / 2.0
             } else {
-                // Opponent folded: hero wins half the pot_fraction
                 pot_fraction / 2.0
             }
         }

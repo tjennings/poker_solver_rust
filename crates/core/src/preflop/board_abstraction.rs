@@ -781,7 +781,7 @@ fn prototype_boards_for_textures(flop_textures: &[FlopTexture]) -> Vec<[Card; 3]
 /// We choose the actual remaining card whose features best match the cluster
 /// centroid (majority vote on boolean features).
 #[allow(clippy::trivially_copy_pass_by_ref)]
-fn representative_turn_cards(flop_board: &[Card; 3], turn_txs: &[TurnTransition]) -> Vec<Card> {
+pub fn representative_turn_cards(flop_board: &[Card; 3], turn_txs: &[TurnTransition]) -> Vec<Card> {
     let remaining = remaining_cards(flop_board);
     turn_txs
         .iter()
@@ -791,6 +791,33 @@ fn representative_turn_cards(flop_board: &[Card; 3], turn_txs: &[TurnTransition]
                 .copied()
                 .find(|&c| {
                     let f = street_features(c, flop_board);
+                    f.completes_flush == tx.completes_flush
+                        && f.pairs_board == tx.pairs_board
+                        && f.overcard == tx.overcard
+                })
+                .unwrap_or(remaining[0])
+        })
+        .collect()
+}
+
+/// For each river transition cluster, pick a representative river card.
+///
+/// Analogous to `representative_turn_cards` — chooses the actual remaining card
+/// whose boolean features best match the cluster.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub fn representative_river_cards(
+    four_card_board: &[Card; 4],
+    river_txs: &[RiverTransition],
+) -> Vec<Card> {
+    let remaining = remaining_cards(four_card_board);
+    river_txs
+        .iter()
+        .map(|tx| {
+            remaining
+                .iter()
+                .copied()
+                .find(|&c| {
+                    let f = street_features(c, four_card_board);
                     f.completes_flush == tx.completes_flush
                         && f.pairs_board == tx.pairs_board
                         && f.overcard == tx.overcard
