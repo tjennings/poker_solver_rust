@@ -8,7 +8,7 @@ use std::path::Path;
 use poker_solver_core::hands::{CanonicalHand, all_hands};
 use poker_solver_core::preflop::board_abstraction::{BoardAbstraction, BoardAbstractionConfig};
 use poker_solver_core::preflop::hand_buckets::{
-    BucketEquity, HandBucketMapping, compute_all_flop_features, cluster_per_texture,
+    BucketEquity, HandBucketMapping, StreetEquity, compute_all_flop_features, cluster_per_texture,
     bucket_ehs_centroids, build_bucket_equity_from_centroids,
 };
 use poker_solver_core::preflop::postflop_model::PostflopModelConfig;
@@ -39,7 +39,8 @@ pub fn run(config: &PostflopModelConfig, cache_dir: &Path, json: bool) -> bool {
     let num_textures = config.num_flop_textures;
 
     eprintln!("Loading or building abstraction...");
-    let (board, buckets, equity) = load_or_build(config, cache_dir);
+    let (board, buckets, street_equity) = load_or_build(config, cache_dir);
+    let equity = &street_equity.flop;
 
     let hands: Vec<CanonicalHand> = all_hands().collect();
     let flop_samples: Vec<Vec<_>> = board.prototype_flops.iter().map(|f| vec![*f]).collect();
@@ -78,7 +79,7 @@ pub fn run(config: &PostflopModelConfig, cache_dir: &Path, json: bool) -> bool {
 fn load_or_build(
     config: &PostflopModelConfig,
     cache_base: &Path,
-) -> (BoardAbstraction, HandBucketMapping, BucketEquity) {
+) -> (BoardAbstraction, HandBucketMapping, StreetEquity) {
     let key = abstraction_cache::cache_key(config, false);
     if let Some(cached) = abstraction_cache::load(cache_base, &key) {
         eprintln!("Cache hit: {}", abstraction_cache::cache_dir(cache_base, &key).display());
@@ -106,7 +107,12 @@ fn load_or_build(
     let flop_assignments = cluster_per_texture(&features, num_buckets, num_textures);
 
     let centroids = bucket_ehs_centroids(&features, &flop_assignments, num_buckets as usize);
-    let bucket_equity = build_bucket_equity_from_centroids(&centroids);
+    let flop_equity = build_bucket_equity_from_centroids(&centroids);
+    let street_equity = StreetEquity {
+        flop: flop_equity,
+        turn: build_bucket_equity_from_centroids(&centroids),
+        river: build_bucket_equity_from_centroids(&centroids),
+    };
 
     let buckets = HandBucketMapping {
         num_flop_buckets: num_buckets,
@@ -117,11 +123,11 @@ fn load_or_build(
         river_buckets: vec![],
     };
 
-    if let Err(e) = abstraction_cache::save(cache_base, &key, &board, &buckets, &bucket_equity) {
+    if let Err(e) = abstraction_cache::save(cache_base, &key, &board, &buckets, &street_equity) {
         eprintln!("Warning: failed to save cache: {e}");
     }
 
-    (board, buckets, bucket_equity)
+    (board, buckets, street_equity)
 }
 
 // ---------------------------------------------------------------------------
