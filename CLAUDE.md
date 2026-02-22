@@ -6,6 +6,12 @@ See [`docs/architecture.md`](docs/architecture.md) for the full solver architect
 
 **Keep it current:** When making changes to the solver pipeline, abstraction system, config parameters, or caching, update `docs/architecture.md` to reflect the new state.
 
+## Training & CLI
+
+See [`docs/training.md`](docs/training.md) for all CLI commands, config options, abstraction modes, solver backends, and postflop model presets.
+
+**Keep it current:** When adding/changing CLI commands, config parameters, or training workflows, update `docs/training.md` to reflect the new state.
+
 ## Build & Test
 
 ```bash

@@ -1,243 +1,342 @@
 # Training Reference
 
-The `poker-solver-trainer` CLI runs MCCFR iterations and saves a strategy bundle. This document covers all configuration options.
+All commands are run via the `poker-solver-trainer` crate:
 
-## Config Structure
-
-Training configs are YAML files with two top-level sections: `game` and `training`, plus an optional `abstraction` section for EHS2 mode.
-
-## Game Settings
-
-```yaml
-game:
-  stack_depth: 100                        # Effective stack in big blinds
-  bet_sizes: [0.33, 0.67, 1.0, 2.0, 3.0] # Pot-fraction bet sizes (all-in always included)
-  max_raises_per_street: 3                # Cap on bets/raises per street (default: 3)
+```bash
+cargo run -p poker-solver-trainer --release -- <subcommand> [options]
 ```
 
-- `bet_sizes` are pot fractions. `[0.5, 1.0, 1.5]` means half-pot, pot, and 1.5x pot. All-in is always available regardless of this list.
-- `max_raises_per_street` keeps the game tree tractable. After this many bets on a street, only fold/call/check remain.
+Always use `--release` for training and diagnostics.
 
-## Training Settings
+## Commands
 
-```yaml
-training:
-  iterations: 5000          # Total MCCFR iterations (or use convergence_threshold)
-  seed: 42                  # RNG seed for reproducibility
-  output_dir: "./my_strategy"
-  mccfr_samples: 5000       # Deals sampled per iteration (default: 500)
-  deal_count: 50000          # Pre-generated deal pool size (default: 50000)
+### solve-preflop
+
+Solve preflop strategy using Linear CFR with optional postflop model.
+
+```bash
+# From a config file
+cargo run -p poker-solver-trainer --release -- solve-preflop \
+  -c sample_configurations/preflop_medium.yaml -o preflop_hu_25bb
+
+# With postflop model preset override
+cargo run -p poker-solver-trainer --release -- solve-preflop \
+  -c config.yaml -o output/ --postflop-model medium
+
+# CLI overrides (supplement or replace config file)
+cargo run -p poker-solver-trainer --release -- solve-preflop \
+  -o output/ --stack-depth 25 --iterations 5000 --equity-samples 10000
 ```
 
-## Abstraction Modes
+Options:
+- `-c, --config <FILE>` -- YAML config file (optional; CLI flags override config values)
+- `-o, --output <DIR>` -- Output directory for preflop bundle
+- `--stack-depth <N>` -- Stack depth in BB
+- `--players <N>` -- Number of players (2=HU, 6=six-max)
+- `--iterations <N>` -- LCFR iterations
+- `--equity-samples <N>` -- Monte Carlo samples per hand matchup for equity table (0=uniform)
+- `--postflop-model <PRESET>` -- Postflop model preset: fast, medium, standard, accurate
+- `--print-every <N>` -- Print strategy matrices every N iterations (0=only at end)
 
-Choose one via `abstraction_mode`:
+### train
 
-### `ehs2` (default)
-
-EHS2 bucketing with Monte Carlo equity estimation. Fine-grained but expensive to compute. Requires an `abstraction` section:
-
-```yaml
-training:
-  abstraction_mode: ehs2
-
-abstraction:
-  flop_buckets: 200          # EHS2 buckets on flop (production: 5000)
-  turn_buckets: 200          # EHS2 buckets on turn (production: 5000)
-  river_buckets: 500         # EHS2 buckets on river (production: 20000)
-  samples_per_street: 5000   # Monte Carlo samples for bucket boundaries
-```
-
-### `hand_class`
-
-Categorical hand classification (19 classes: Flush, Set, Overpair, etc.). O(1) per hand, interpretable, no `abstraction` section needed:
-
-```yaml
-training:
-  abstraction_mode: hand_class
-```
-
-### `hand_class_v2`
-
-Hand class + intra-class strength + showdown equity + draw flags. Finer resolution than `hand_class` while remaining interpretable:
-
-```yaml
-training:
-  abstraction_mode: hand_class_v2
-  strength_bits: 4           # Intra-class strength resolution, 0-4 bits (default: 4)
-  equity_bits: 4             # Showdown equity bin resolution, 0-4 bits (default: 4)
-```
-
-The `strength_bits` and `equity_bits` control how finely hands within the same class are distinguished. 4 bits = 16 levels, 0 = dimension omitted. Higher values produce more info sets (larger strategy tables) but capture more nuance.
-
-## Stratified Deal Generation
-
-For `hand_class` and `hand_class_v2` modes, you can ensure rare hand classes (e.g., quads, straight flushes) appear in the deal pool:
-
-```yaml
-training:
-  min_deals_per_class: 50       # Minimum deals per hand class (default: 0 = disabled)
-  max_rejections_per_class: 500000  # Max rejection-sample attempts per deficit class
-```
-
-## Regret-Based Pruning
-
-Pruning skips actions with low cumulative regret, speeding up training by avoiding clearly bad lines. Probe iterations periodically explore all actions to prevent permanent pruning.
-
-```yaml
-training:
-  pruning: true                  # Enable pruning (default: false)
-  pruning_threshold: -5.0        # Regret threshold for pruning (default: 0.0)
-  pruning_warmup_fraction: 0.30  # Fraction of iterations before pruning starts (default: 0.2)
-  pruning_probe_interval: 20     # Full exploration every N iterations (default: 20)
-```
-
-- `pruning_threshold` controls how negative a regret must be before the action is pruned. With DCFR, negative regrets decay asymptotically but never reach zero — a threshold of 0 would prune actions permanently. A negative threshold (e.g., -5.0) allows DCFR's decay to bring regrets back above the threshold between probes, so actions can recover if the strategy shifts.
-- `pruning_warmup_fraction` delays pruning until the strategy has partially converged. At 0.30, the first 30% of iterations explore everything.
-- `pruning_probe_interval` runs a full un-pruned iteration every N iterations to discover if pruned actions have become viable.
-
-## Convergence-Based Stopping
-
-Instead of a fixed iteration count, train until the strategy stabilizes:
-
-```yaml
-training:
-  convergence_threshold: 0.001   # Stop when mean L1 delta < this value
-  convergence_check_interval: 100  # Check every N iterations (default: 100)
-```
-
-When `convergence_threshold` is set, `iterations` is ignored. The trainer runs in a loop: train for `convergence_check_interval` iterations, snapshot the strategy, compute the mean L1 distance from the previous snapshot, and stop if it falls below the threshold. Each check also saves a numbered checkpoint bundle.
-
-The strategy delta is the average per-info-set sum of absolute differences in action probabilities between consecutive snapshots. A value of 0.001 means action probabilities are changing by less than 0.1% on average per info set.
-
-## Exhaustive Abstract Deals
-
-For `hand_class_v2` mode, you can enumerate **all** abstract deal trajectories instead of sampling randomly. This eliminates Monte Carlo variance entirely — every iteration is a complete traversal of the finite abstract game.
-
-The enumerator walks all hole card pairs x 1,755 canonical flops x all turn/river completions, encodes per-street hand bits, determines showdown winners, and deduplicates into weighted abstract deals. With `strength_bits=0, equity_bits=0`, billions of concrete deals compress to ~1M abstract deals (~100x compression).
-
-```yaml
-training:
-  abstraction_mode: hand_class_v2
-  strength_bits: 0
-  equity_bits: 0
-  exhaustive: true            # generate abstract deals in-memory
-```
-
-Or pre-generate deals to disk and reference them:
-
-```yaml
-training:
-  abstract_deals_dir: ./my_deals/   # load pre-generated deals
-```
-
-Pre-generate with the `generate-deals` command (see [CLI Reference](cli.md#generating-abstract-deals)). Use `exhaustive` with the `sequence` or `gpu` solver — MCCFR ignores it.
-
-Higher bit configs produce more unique trajectories and less compression. At 4/4 bits there is essentially no compression, so `exhaustive` is only practical for low-bit configs (0/0 or 1/1).
-
-## Solver Backends
-
-Select with `--solver`:
-
-### MCCFR (default)
-
-Samples random deals per iteration. Best for large games with many info sets. Low memory, handles any abstraction mode.
+Run MCCFR/sequence/GPU training for the postflop HUNL game.
 
 ```bash
 cargo run -p poker-solver-trainer --release -- train -c config.yaml
+cargo run -p poker-solver-trainer --release -- train -c config.yaml --solver sequence
+cargo run -p poker-solver-trainer --features gpu --release -- train -c config.yaml --solver gpu
 cargo run -p poker-solver-trainer --release -- train -c config.yaml -t 4  # limit threads
 ```
 
-MCCFR uses Discounted CFR (DCFR):
-- DCFR discounting with alpha=1.5, beta=0.5, gamma=2.0
-- Configurable regret-based pruning with negative threshold support
-- Parallel training via Rayon (frozen-snapshot accumulation pattern)
-- Average strategy skips first 50% of iterations
+Options:
+- `-c, --config <FILE>` -- Training config YAML
+- `-t, --threads <N>` -- Thread count (default: all cores)
+- `--solver <MODE>` -- Backend: `mccfr` (default), `sequence`, `gpu`, `sd-cfr`
 
-### Sequence-form CFR
+### tree
 
-Materializes the game tree as a flat graph and runs level-by-level CFR over all deals every iteration. No sampling variance — each iteration is a complete traversal. Best for `hand_class` mode where the tree is small enough to materialize (~200-300K info sets).
+Inspect trained strategy bundles. Two modes: deal tree and key describe.
 
-```bash
-cargo run -p poker-solver-trainer --release -- train -c config.yaml --solver sequence
-```
-
-Trade-offs vs MCCFR:
-- Each iteration is more expensive (traverses all deals, not a sample)
-- But each iteration makes more progress (no sampling noise)
-- No `mccfr_samples` parameter needed
-- Memory scales with tree size x deal count
-
-### GPU-accelerated CFR
-
-Same algorithm as sequence-form, but the inner loop runs on GPU compute shaders via wgpu. Cross-platform: Metal (macOS), Vulkan (Linux/Windows), DX12 (Windows).
+**Deal tree** -- walk a random deal showing strategy probabilities:
 
 ```bash
-cargo run -p poker-solver-trainer --features gpu --release -- train -c config.yaml --solver gpu
+cargo run -p poker-solver-trainer --release -- tree -b ./my_strategy
+cargo run -p poker-solver-trainer --release -- tree -b ./my_strategy --hand AKs
 ```
 
-~7.7x faster than CPU sequence-form on Apple Silicon for 25BB hand_class configs.
+**Key describe** -- translate an info set key to human-readable format:
 
-### When to use each solver
-
-| Solver | Best for | Deal handling |
-|-|-|
-| `mccfr` | Large games, `ehs2`/`hand_class_v2`, production training | Samples per iteration |
-| `sequence` | Small-medium games, exact convergence, `exhaustive` mode | Full traversal |
-| `gpu` | Same as `sequence` but faster, when GPU is available | Full traversal on GPU |
-
-With `exhaustive: true`, `sequence` and `gpu` solvers use weighted abstract deals instead of random concrete deals.
-
-## Training Output
-
-Training saves to the output directory:
-
-```
-my_strategy/
-├── config.yaml       # Game and abstraction settings (human-readable)
-├── blueprint.bin     # Trained strategy (bincode, FxHashMap<u64, Vec<f32>>)
-└── boundaries.bin    # EHS2 bucket boundaries (only for ehs2 mode)
+```bash
+cargo run -p poker-solver-trainer --release -- tree -b ./my_strategy --key 0xa800000c02000000
 ```
 
-## Progress Output
+Options:
+- `-b, --bundle <DIR>` -- Strategy bundle directory
+- `-d, --depth <N>` -- Max tree depth (default: 4)
+- `-m, --min-prob <P>` -- Prune branches below this probability (default: 0.01)
+- `-s, --seed <N>` -- RNG seed (default: 42)
+- `--hand <HAND>` -- Filter to canonical hand (e.g. "AKs", "QQ", "T9o")
+- `--key <HEX>` -- Info set key for key describe mode
 
-Training prints progress at 10 checkpoints with exploitability, sample strategies, and ETA:
+### tree-stats
 
+Estimate game tree size without training:
+
+```bash
+cargo run -p poker-solver-trainer --release -- tree-stats -c config.yaml --sample-deals 100
 ```
-=== Checkpoint 3/10 (300/1000 iterations) ===
-Exploitability: 2.4531 (down from 3.1204)
-Time: 12.3s elapsed, ~28.7s remaining
 
-SB Opening Strategy (preflop, facing BB):
-Hand  |  Fold  Call   R50  R9950
-------|------------------------
-AA    |  0.00  0.12  0.72  0.16
-AKs   |  0.02  0.35  0.58  0.05
-72o   |  0.85  0.10  0.05  0.00
+### diag-buckets
+
+Run EHS bucket diagnostics on a postflop abstraction:
+
+```bash
+cargo run -p poker-solver-trainer --release -- diag-buckets -c config.yaml
+cargo run -p poker-solver-trainer --release -- diag-buckets -c config.yaml --json
 ```
 
-## Complete Example
+Options:
+- `-c, --config <FILE>` -- YAML config (same format as solve-preflop)
+- `--cache-dir <DIR>` -- Abstraction cache directory (default: `cache/postflop`)
+- `--json` -- Output as JSON
+
+### trace-hand
+
+Trace all 169 hands through the full postflop pipeline (EHS -> buckets -> EV):
+
+```bash
+cargo run -p poker-solver-trainer --release -- trace-hand -c config.yaml
+```
+
+### generate-deals
+
+Pre-generate exhaustive abstract deals for sequence/GPU solvers:
+
+```bash
+# Estimate size
+cargo run -p poker-solver-trainer --release -- generate-deals -c config.yaml -o ./deals/ --dry-run
+
+# Generate
+cargo run -p poker-solver-trainer --release -- generate-deals -c config.yaml -o ./deals/
+```
+
+Options:
+- `-o, --output <DIR>` -- Output directory
+- `--dry-run` -- Estimate only
+- `-t, --threads <N>` -- Thread count
+- `--batch-size <N>` -- Canonical flops per batch (default: 20, 0=in-memory)
+
+### merge-deals
+
+Merge batch files from a batched generate-deals run:
+
+```bash
+cargo run -p poker-solver-trainer --release -- merge-deals -i ./batches/ -o ./deals/
+```
+
+### inspect-deals
+
+Display summary statistics for pre-generated deals:
+
+```bash
+cargo run -p poker-solver-trainer --release -- inspect-deals -i ./deals/
+cargo run -p poker-solver-trainer --release -- inspect-deals -i ./deals/ --limit 20 --sort equity
+cargo run -p poker-solver-trainer --release -- inspect-deals -i ./deals/ --csv deals.csv
+```
+
+### flops
+
+List all 1,755 canonical (suit-isomorphic) flops:
+
+```bash
+cargo run -p poker-solver-trainer --release -- flops --format json --output flops.json
+cargo run -p poker-solver-trainer --release -- flops --format csv
+```
+
+### eval-lhe
+
+Evaluate a trained LHE SD-CFR model (exploitability + strategy visualization):
+
+```bash
+cargo run -p poker-solver-trainer --release -- eval-lhe -d ./lhe_sdcfr
+cargo run -p poker-solver-trainer --release -- eval-lhe -d ./lhe_sdcfr --checkpoint lhe_checkpoint_100
+```
+
+### trace-lhe
+
+Trace strategy evolution across SD-CFR checkpoints:
+
+```bash
+cargo run -p poker-solver-trainer --release -- trace-lhe -d ./lhe_sdcfr \
+  --spot "SB AA" --spot "BB.R AKs"
+```
+
+Spot notation: `SB AA` (SB root), `BB.R AKs` (BB facing raise), `BB.C JTs` (BB after limp).
+
+---
+
+## Preflop Config (solve-preflop)
+
+The preflop solver uses a YAML config with game structure and DCFR parameters. See `sample_configurations/preflop_medium.yaml` for a complete example.
+
+```yaml
+# Training
+iterations: 10000
+equity_samples: 10000
+print_every: 1000
+
+# Game structure (internal units: SB=1, BB=2)
+positions:
+  - { name: Small Blind, short_name: SB }
+  - { name: Big Blind, short_name: BB }
+blinds:
+  - [0, 1]   # SB posts 1
+  - [1, 2]   # BB posts 2
+stacks: [50, 50]  # 25BB x 2
+
+raise_sizes:
+  - [2.5]    # open raise
+  - [3.0]    # 3-bet
+raise_cap: 4
+
+# DCFR discounting
+dcfr_alpha: 1.5
+dcfr_beta: 0.5
+dcfr_gamma: 2.0
+exploration: 0.05
+
+# Postflop model (optional; omit for raw equity)
+postflop_model:
+  num_hand_buckets_flop: 200
+  num_hand_buckets_turn: 200
+  num_hand_buckets_river: 200
+  bet_sizes: [0.5, 1.0, 2.0]
+  raises_per_street: 1
+  canonical_sprs: [0.5, 1.0, 1.5, 3.0, 5.0, 10.0, 20.0, 50.0]
+  postflop_solve_iterations: 1000
+  postflop_solve_samples: 100000
+```
+
+### Postflop Model Presets
+
+| Preset | Buckets (flop/turn/river) | Use case |
+|-|-|-|
+| `fast` | 50/50/50 | Quick testing (~30s build) |
+| `medium` | 200/200/200 | Development iteration |
+| `standard` | 500/500/500 | Production training (Pluribus-like) |
+| `accurate` | 1000/1000/1000 | High-fidelity analysis |
+
+---
+
+## HUNL Training Config (train)
+
+Training configs have `game` and `training` sections.
+
+### Game Settings
 
 ```yaml
 game:
-  stack_depth: 25
-  bet_sizes: [0.5, 1.0, 1.5]
+  stack_depth: 100
+  bet_sizes: [0.33, 0.67, 1.0, 2.0, 3.0]
+  max_raises_per_street: 3
+```
 
+### Training Settings
+
+```yaml
 training:
   iterations: 5000
   seed: 42
-  output_dir: "./handclass_25bb_v2"
+  output_dir: "./my_strategy"
   mccfr_samples: 5000
   deal_count: 50000
   abstraction_mode: hand_class_v2
   strength_bits: 4
   equity_bits: 4
+```
+
+### Abstraction Modes
+
+**`ehs2`** -- EHS2 bucketing with Monte Carlo equity estimation:
+
+```yaml
+training:
+  abstraction_mode: ehs2
+abstraction:
+  flop_buckets: 200
+  turn_buckets: 200
+  river_buckets: 500
+  samples_per_street: 5000
+```
+
+**`hand_class`** -- Categorical 19-class hand classification (O(1), no extra config).
+
+**`hand_class_v2`** -- Hand class + intra-class strength + equity + draw flags:
+
+```yaml
+training:
+  abstraction_mode: hand_class_v2
+  strength_bits: 4   # 0-4 bits (16 levels at 4)
+  equity_bits: 4     # 0-4 bits
+```
+
+### Solver Backends
+
+| Solver | Best for | Deal handling |
+|-|-|-|
+| `mccfr` | Large games, production training | Samples per iteration |
+| `sequence` | Small-medium games, exact convergence | Full traversal |
+| `gpu` | Same as sequence, faster on GPU | Full traversal on GPU |
+| `sd-cfr` | Neural network advantage estimation | SD-CFR checkpoints |
+
+### Advanced Options
+
+**Stratified deals** (hand_class modes):
+```yaml
+training:
   min_deals_per_class: 50
   max_rejections_per_class: 500000
+```
+
+**Regret-based pruning:**
+```yaml
+training:
   pruning: true
   pruning_threshold: -5.0
   pruning_warmup_fraction: 0.30
-  # convergence_threshold: 0.001     # uncomment to train until converged
-  # convergence_check_interval: 100
-  # exhaustive: true                 # uncomment for exhaustive abstract deals (low-bit only)
+  pruning_probe_interval: 20
 ```
+
+**Convergence-based stopping:**
+```yaml
+training:
+  convergence_threshold: 0.001
+  convergence_check_interval: 100
+```
+
+**Exhaustive abstract deals** (low-bit hand_class_v2 only):
+```yaml
+training:
+  exhaustive: true
+  # or pre-generated:
+  abstract_deals_dir: ./my_deals/
+```
+
+### Training Output
+
+```
+my_strategy/
+├── config.yaml       # Game and abstraction settings
+├── blueprint.bin     # Trained strategy (bincode, FxHashMap<u64, Vec<f32>>)
+└── boundaries.bin    # EHS2 bucket boundaries (ehs2 mode only)
+```
+
+---
+
+## Sample Configs
+
+| Config | Purpose |
+|-|-|
+| `sample_configurations/preflop_medium.yaml` | HU 25BB preflop solve with medium postflop model |
+| `sample_configurations/fast_buckets.yaml` | Quick postflop bucketing test |
