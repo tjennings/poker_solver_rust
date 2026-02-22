@@ -1,5 +1,11 @@
 # Rust Project Guidelines
 
+## Architecture
+
+See [`docs/architecture.md`](docs/architecture.md) for the full solver architecture: preflop LCFR solver, postflop imperfect-recall abstraction pipeline, key control parameters, and caching.
+
+**Keep it current:** When making changes to the solver pipeline, abstraction system, config parameters, or caching, update `docs/architecture.md` to reflect the new state.
+
 ## Build & Test
 
 ```bash
