@@ -16,6 +16,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rand::rngs::SmallRng;
+use serde::{Deserialize, Serialize};
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -42,6 +43,7 @@ pub struct PostflopAbstraction {
 ///
 /// Stored as a flat `Vec<f64>` indexed by
 /// `pot_type_idx * 2 * n * n + hero_pos * n * n + hero_bucket * n + opp_bucket`.
+#[derive(Serialize, Deserialize)]
 pub struct PostflopValues {
     values: Vec<f64>,
     num_buckets: usize,
@@ -58,6 +60,15 @@ impl PostflopValues {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+
+    /// Create an empty value table (for testing).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            values: Vec::new(),
+            num_buckets: 0,
+        }
     }
 
     /// Look up the postflop EV (as fraction of pot) for a given configuration.
