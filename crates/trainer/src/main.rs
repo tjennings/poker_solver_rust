@@ -678,7 +678,45 @@ fn main() -> Result<(), Box<dyn Error>> {
             let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
             let pf_config = training.game.postflop_model
                 .ok_or("config file has no postflop_model section")?;
-            hand_trace::run(&pf_config, &cache_dir)?;
+
+            // Try loading from solve + abstraction caches (same as solve-preflop).
+            use poker_solver_core::preflop::{abstraction_cache, solve_cache};
+            let has_eq = false; // trace-hand doesn't use an equity table
+            let sk = solve_cache::cache_key(&pf_config, has_eq);
+            let ak = abstraction_cache::cache_key(&pf_config, has_eq);
+
+            let abstraction = if let Some(values) = solve_cache::load(&cache_dir, &sk)
+                && let Some((board, buckets, bucket_equity)) =
+                    abstraction_cache::load(&cache_dir, &ak)
+            {
+                eprintln!(
+                    "Solve cache hit: {}",
+                    solve_cache::cache_dir(&cache_dir, &sk).display()
+                );
+                PostflopAbstraction::build_from_cached(
+                    &pf_config, board, buckets, bucket_equity, values,
+                )
+                .map_err(|e| format!("postflop from cache: {e}"))?
+            } else {
+                eprintln!("Cache miss — building postflop abstraction from scratch...");
+                let abstraction = PostflopAbstraction::build(
+                    &pf_config, None, Some(&cache_dir), |phase| {
+                        eprintln!("  {phase:?}");
+                    },
+                )?;
+                // Save solve cache for next time.
+                if let Err(e) = solve_cache::save(&cache_dir, &sk, &abstraction.values) {
+                    eprintln!("Warning: failed to save solve cache: {e}");
+                } else {
+                    eprintln!(
+                        "Solve cache saved: {}",
+                        solve_cache::cache_dir(&cache_dir, &sk).display()
+                    );
+                }
+                abstraction
+            };
+
+            hand_trace::run_with_abstraction(&pf_config, &abstraction)?;
         }
     }
 

@@ -1,7 +1,5 @@
 //! Hand trace diagnostic: traces hands through EHS → buckets → postflop EV.
 
-use std::path::Path;
-
 use serde::Serialize;
 
 use poker_solver_core::hands::{all_hands, CanonicalHand};
@@ -69,21 +67,14 @@ struct HandSummary {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Run the hand trace diagnostic for all 169 canonical hands.
-pub fn run(
+/// Run the hand trace diagnostic with a pre-built postflop abstraction.
+pub fn run_with_abstraction(
     config: &PostflopModelConfig,
-    cache_dir: &Path,
+    abstraction: &PostflopAbstraction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let all_hands_vec: Vec<CanonicalHand> = all_hands().collect();
 
     eprintln!("Tracing all {} canonical hands...", all_hands_vec.len());
-
-    // Build the full postflop abstraction (loads board/buckets/equity from cache,
-    // rebuilds trees + solves postflop)
-    eprintln!("Building postflop abstraction...");
-    let abstraction = PostflopAbstraction::build(config, None, Some(cache_dir), |phase| {
-        eprintln!("  {phase:?}");
-    })?;
 
     // Compute EHS features for all hands
     eprintln!("Computing EHS features...");
@@ -99,7 +90,7 @@ pub fn run(
         bucket_ehs_centroids(&features, &abstraction.buckets.flop_buckets, num_buckets);
 
     // Build and print JSON output
-    let output = build_trace_output(&all_hands_vec, &features, &abstraction, &centroids);
+    let output = build_trace_output(&all_hands_vec, &features, abstraction, &centroids);
     println!("{}", serde_json::to_string_pretty(&output)?);
 
     Ok(())
