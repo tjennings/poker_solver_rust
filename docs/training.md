@@ -342,3 +342,38 @@ my_strategy/
 |-|-|
 | `sample_configurations/preflop_medium.yaml` | HU 25BB preflop solve with medium postflop model |
 | `sample_configurations/fast_buckets.yaml` | Quick postflop bucketing test |
+
+---
+
+## Cloud Training (AWS)
+
+Run training jobs on AWS EC2 instances using the `solver-cloud` CLI. See [`cloud/README.md`](../cloud/README.md) for full documentation.
+
+### Prerequisites
+
+- AWS CLI v2 configured with a profile (`~/.aws/credentials`)
+- Docker installed locally
+- One-time setup: `./cloud/solver-cloud setup`
+
+### Workflow
+
+```bash
+# Launch a training job on a spot instance
+./cloud/solver-cloud launch \
+  --instance c5.4xlarge \
+  --config sample_configurations/preflop_medium.yaml \
+  --output ~/models/run-001
+
+# Attach to watch progress (SSH + tmux)
+./cloud/solver-cloud attach <job-id>
+
+# Check status of all jobs
+./cloud/solver-cloud status
+
+# Download finished model when complete
+./cloud/solver-cloud download <job-id>
+```
+
+The instance auto-terminates after uploading the model to S3. Use `--on-demand` for long-running critical jobs, or `--profile <name>` to select an AWS profile.
+
+Override defaults by creating `cloud/config.local.sh` (gitignored) — see `cloud/lib/config.sh` for available settings.
