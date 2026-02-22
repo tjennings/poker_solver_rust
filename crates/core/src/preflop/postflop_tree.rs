@@ -106,16 +106,13 @@ impl PotType {
 
     /// Returns the IP player index (0 = OOP / first to act, 1 = IP / last to act).
     ///
-    /// For HU: in a limped pot the BB (index 1 in our scheme, acts last preflop)
-    /// has position postflop. For a raised pot the raiser has position.
-    /// This method returns the default; solver integration overrides as needed.
+    /// In HU, SB/Button is always IP postflop regardless of preflop action.
+    /// Player 0 is SB/Button, player 1 is BB.
     #[must_use]
     pub const fn default_ip_player(&self) -> u8 {
         match self {
-            // BB acts last preflop when limped → IP postflop
-            Self::Limped => 1,
-            // Raiser (SB in HU) is IP postflop in most configurations
-            Self::Raised | Self::ThreeBet | Self::FourBetPlus => 0,
+            // SB/Button is always IP postflop in HU
+            Self::Limped | Self::Raised | Self::ThreeBet | Self::FourBetPlus => 0,
         }
     }
 }
@@ -155,7 +152,8 @@ impl PostflopTree {
         validate_config(config)?;
         let max_pot = 1.0 + 2.0 * spr;
         let mut nodes: Vec<PostflopNode> = Vec::new();
-        build_flop_subtree_spr(&mut nodes, 0, 1, config, 1.0, max_pot);
+        // OOP=1 (BB), IP=0 (SB/Button) — SB is always IP postflop in HU
+        build_flop_subtree_spr(&mut nodes, 1, 0, config, 1.0, max_pot);
         Ok(Self {
             nodes,
             pot_type: PotType::Raised,
@@ -480,8 +478,9 @@ fn build_chance_node(
         children: vec![],
         weights: vec![uniform_weight; num_transitions],
     });
-    let ip = 1u8; // default; solver overrides per pot type
-    let oop = 0u8;
+    // OOP=1 (BB), IP=0 (SB/Button) — consistent with default_ip_player()
+    let oop = 1u8;
+    let ip = 0u8;
     let children: Vec<u32> = (0..num_transitions)
         .map(|_| build_opening_decision(nodes, oop, ip, config, pot_fraction, next_street))
         .collect();
@@ -831,8 +830,9 @@ fn build_chance_node_spr(
         children: vec![],
         weights: vec![uniform_weight; num_transitions],
     });
-    let oop = 0u8;
-    let ip = 1u8;
+    // OOP=1 (BB), IP=0 (SB/Button) — consistent with build_with_spr
+    let oop = 1u8;
+    let ip = 0u8;
     let children: Vec<u32> = (0..num_transitions)
         .map(|_| {
             build_opening_decision_spr(nodes, oop, ip, config, pot_fraction, next_street, max_pot)
@@ -888,6 +888,22 @@ mod tests {
     #[timed_test]
     fn pot_type_from_many_raises_is_four_bet_plus() {
         assert_eq!(PotType::from_raise_count(10), PotType::FourBetPlus);
+    }
+
+    #[timed_test]
+    fn all_pot_types_have_sb_as_ip() {
+        for pot_type in [
+            PotType::Limped,
+            PotType::Raised,
+            PotType::ThreeBet,
+            PotType::FourBetPlus,
+        ] {
+            assert_eq!(
+                pot_type.default_ip_player(), 0,
+                "SB (player 0) should always be IP postflop in HU, but {pot_type:?} returned {}",
+                pot_type.default_ip_player()
+            );
+        }
     }
 
     // ── Tree construction ────────────────────────────────────────────────────
@@ -1100,12 +1116,10 @@ mod tests {
     #[timed_test]
     fn spr_tree_deep_matches_unconstrained() {
         // SPR=1000 → max_pot=2001 → no bet is capped → same tree as old build.
-        // Use Limped because build_with_spr always uses OOP=0, IP=1 which matches
-        // PotType::Limped's default_ip_player()=1. (PotType::Raised uses ip=0 at
-        // the flop but chance nodes hardcode ip=1, creating an inconsistency.)
+        // Both builders now use consistent OOP=1(BB), IP=0(SB) positions.
         let cfg = fast_config();
         let spr_tree = PostflopTree::build_with_spr(&cfg, 1000.0).unwrap();
-        let old_tree = PostflopTree::build(PotType::Limped, &cfg).unwrap();
+        let old_tree = PostflopTree::build(PotType::Raised, &cfg).unwrap();
         assert_eq!(spr_tree.node_count(), old_tree.node_count());
     }
 }
