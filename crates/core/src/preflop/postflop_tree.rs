@@ -139,6 +139,85 @@ impl PotType {
             Self::FourBetPlus => 0.75,
         }
     }
+
+    /// Compute SPR from game structure parameters.
+    ///
+    /// Models typical HU preflop action sequences to derive the pot size
+    /// and remaining stack for each pot type. Uses `raise_sizes[depth]` as
+    /// multipliers of the current bet to go.
+    ///
+    /// # Arguments
+    /// * `stacks` - Starting stacks in internal units (SB=1, BB=2)
+    /// * `blinds` - `(position, amount)` pairs
+    /// * `raise_sizes` - Raise multipliers indexed by depth (depth 0 = open, depth 1 = 3bet, ...)
+    ///
+    /// Returns SPR as `remaining_stack / pot`.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn compute_spr(
+        &self,
+        stacks: &[u32],
+        blinds: &[(usize, u32)],
+        raise_sizes: &[Vec<f64>],
+    ) -> f64 {
+        // Use the smaller stack (HU: both should be equal, but be safe)
+        let stack = stacks.iter().copied().min().unwrap_or(0) as f64;
+        let sb = blinds.iter().map(|&(_, amt)| amt).min().unwrap_or(1) as f64;
+        let bb = blinds.iter().map(|&(_, amt)| amt).max().unwrap_or(2) as f64;
+
+        // Helper: get raise multiplier at a given depth
+        let raise_mult = |depth: usize| -> f64 {
+            raise_sizes
+                .get(depth.min(raise_sizes.len().saturating_sub(1)))
+                .and_then(|sizes| sizes.first().copied())
+                .unwrap_or(3.0)
+        };
+
+        let (pot, invested) = match self {
+            Self::Limped => {
+                // Both players post blinds, no raise.
+                // pot = SB + BB, max invested = BB
+                (sb + bb, bb)
+            }
+            Self::Raised => {
+                // SB opens: raise to BB × open_mult
+                let open_size = bb * raise_mult(0);
+                // BB calls the open
+                let pot = open_size * 2.0;
+                (pot, open_size)
+            }
+            Self::ThreeBet => {
+                // SB opens, BB 3-bets: raise to open_size × 3bet_mult
+                let open_size = bb * raise_mult(0);
+                let three_bet_size = open_size * raise_mult(1);
+                // SB calls the 3-bet
+                let pot = three_bet_size * 2.0;
+                (pot, three_bet_size)
+            }
+            Self::FourBetPlus => {
+                // SB opens, BB 3-bets, SB 4-bets
+                let open_size = bb * raise_mult(0);
+                let three_bet_size = open_size * raise_mult(1);
+                // 4-bet: use depth 1 mult again (or depth 2 if available)
+                let four_bet_mult = raise_sizes
+                    .get(2)
+                    .or(raise_sizes.last())
+                    .and_then(|sizes| sizes.first().copied())
+                    .unwrap_or(raise_mult(1));
+                let four_bet_size = three_bet_size * four_bet_mult;
+                // BB calls the 4-bet
+                let pot = four_bet_size * 2.0;
+                (pot, four_bet_size)
+            }
+        };
+
+        let remaining = (stack - invested).max(0.0);
+        if pot > 0.0 {
+            remaining / pot
+        } else {
+            self.default_spr()
+        }
+    }
 }
 
 impl PostflopTree {
@@ -1119,5 +1198,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── compute_spr tests ───────────────────────────────────────────────────
+
+    /// HU 25BB: stacks=[50,50], blinds=[(0,1),(1,2)], raise_sizes=[[2.5],[3.0]]
+    fn hu_25bb_params() -> (Vec<u32>, Vec<(usize, u32)>, Vec<Vec<f64>>) {
+        (
+            vec![50, 50],
+            vec![(0, 1), (1, 2)],
+            vec![vec![2.5], vec![3.0]],
+        )
+    }
+
+    #[timed_test]
+    fn compute_spr_limped_hu_25bb() {
+        let (stacks, blinds, sizes) = hu_25bb_params();
+        let spr = PotType::Limped.compute_spr(&stacks, &blinds, &sizes);
+        // pot = 3, remaining = 50 - 2 = 48, SPR = 48/3 = 16.0
+        assert!((spr - 16.0).abs() < 0.01, "limped SPR: expected 16.0, got {spr}");
+    }
+
+    #[timed_test]
+    fn compute_spr_raised_hu_25bb() {
+        let (stacks, blinds, sizes) = hu_25bb_params();
+        let spr = PotType::Raised.compute_spr(&stacks, &blinds, &sizes);
+        // open = 2 * 2.5 = 5, pot = 10, remaining = 50 - 5 = 45, SPR = 45/10 = 4.5
+        assert!((spr - 4.5).abs() < 0.01, "raised SPR: expected 4.5, got {spr}");
+    }
+
+    #[timed_test]
+    fn compute_spr_three_bet_hu_25bb() {
+        let (stacks, blinds, sizes) = hu_25bb_params();
+        let spr = PotType::ThreeBet.compute_spr(&stacks, &blinds, &sizes);
+        // open = 5, 3bet = 5 * 3.0 = 15, pot = 30, remaining = 50 - 15 = 35, SPR = 35/30 ≈ 1.167
+        assert!(spr > 1.0 && spr < 2.0, "3bet SPR: expected ~1.17, got {spr}");
+    }
+
+    #[timed_test]
+    fn compute_spr_four_bet_hu_25bb() {
+        let (stacks, blinds, sizes) = hu_25bb_params();
+        let spr = PotType::FourBetPlus.compute_spr(&stacks, &blinds, &sizes);
+        // open = 5, 3bet = 15, 4bet = 15 * 3.0 = 45, pot = 90, remaining = 50 - 45 = 5, SPR = 5/90 ≈ 0.056
+        assert!(spr < 1.0, "4bet SPR: expected < 1.0, got {spr}");
+    }
+
+    #[timed_test]
+    fn compute_spr_decreases_with_pot_type() {
+        let (stacks, blinds, sizes) = hu_25bb_params();
+        let limped = PotType::Limped.compute_spr(&stacks, &blinds, &sizes);
+        let raised = PotType::Raised.compute_spr(&stacks, &blinds, &sizes);
+        let three_bet = PotType::ThreeBet.compute_spr(&stacks, &blinds, &sizes);
+        let four_bet = PotType::FourBetPlus.compute_spr(&stacks, &blinds, &sizes);
+        assert!(limped > raised, "limped ({limped}) > raised ({raised})");
+        assert!(raised > three_bet, "raised ({raised}) > 3bet ({three_bet})");
+        assert!(three_bet > four_bet, "3bet ({three_bet}) > 4bet ({four_bet})");
+    }
+
+    #[timed_test]
+    fn compute_spr_deep_stacks_gives_high_spr() {
+        // 100BB deep
+        let stacks = vec![200, 200];
+        let blinds = vec![(0, 1), (1, 2)];
+        let sizes = vec![vec![2.5], vec![3.0]];
+        let spr = PotType::Limped.compute_spr(&stacks, &blinds, &sizes);
+        // pot = 3, remaining = 200 - 2 = 198, SPR = 66.0
+        assert!(spr > 60.0, "deep limped SPR should be > 60, got {spr}");
     }
 }

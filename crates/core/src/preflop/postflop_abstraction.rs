@@ -22,6 +22,7 @@ use rustc_hash::FxHashMap;
 
 use super::abstraction_cache;
 use super::board_abstraction::{BoardAbstraction, BoardAbstractionConfig};
+use super::config::PreflopConfig;
 use super::equity::EquityTable;
 use super::hand_buckets::{self, BucketEquity, HandBucketMapping};
 use super::postflop_model::PostflopModelConfig;
@@ -290,6 +291,10 @@ impl PostflopAbstraction {
     /// hand buckets, equity) are cached to disk. On subsequent runs with the
     /// same abstraction config, these are loaded from cache instead of recomputed.
     ///
+    /// When `preflop_config` is provided, SPR values are computed from the game
+    /// structure (stacks, blinds, raise sizes). Without it, uses hardcoded
+    /// defaults from `PotType::default_spr()`.
+    ///
     /// # Errors
     ///
     /// Returns an error if board abstraction, hand bucketing, or tree building fails.
@@ -297,6 +302,7 @@ impl PostflopAbstraction {
         config: &PostflopModelConfig,
         equity_table: Option<&EquityTable>,
         cache_base: Option<&std::path::Path>,
+        preflop_config: Option<&PreflopConfig>,
         on_progress: impl Fn(BuildPhase) + Sync,
     ) -> Result<Self, PostflopAbstractionError> {
         let (board, buckets, bucket_equity) = load_or_build_abstraction(
@@ -307,7 +313,8 @@ impl PostflopAbstraction {
         )?;
 
         on_progress(BuildPhase::Trees);
-        let trees = build_all_trees(config)?;
+        let sprs = compute_pot_type_sprs(preflop_config);
+        let trees = build_all_trees(config, &sprs)?;
 
         on_progress(BuildPhase::Layout);
         let node_streets: FxHashMap<PotType, Vec<Street>> = trees
@@ -473,18 +480,30 @@ fn build_hand_buckets_and_equity(
     Ok((mapping, bucket_equity))
 }
 
+/// Compute per-pot-type SPR values from preflop config, or use defaults.
+fn compute_pot_type_sprs(
+    preflop_config: Option<&PreflopConfig>,
+) -> FxHashMap<PotType, f64> {
+    let mut sprs = FxHashMap::default();
+    for &pt in &ALL_POT_TYPES {
+        let spr = if let Some(pf) = preflop_config {
+            pt.compute_spr(&pf.stacks, &pf.blinds, &pf.raise_sizes)
+        } else {
+            pt.default_spr()
+        };
+        sprs.insert(pt, spr);
+    }
+    sprs
+}
+
 fn build_all_trees(
     config: &PostflopModelConfig,
+    sprs: &FxHashMap<PotType, f64>,
 ) -> Result<FxHashMap<PotType, PostflopTree>, super::postflop_tree::PostflopTreeError> {
-    let pot_types = [
-        PotType::Limped,
-        PotType::Raised,
-        PotType::ThreeBet,
-        PotType::FourBetPlus,
-    ];
     let mut trees = FxHashMap::default();
-    for pt in pot_types {
-        trees.insert(pt, PostflopTree::build(pt, config, pt.default_spr())?);
+    for &pt in &ALL_POT_TYPES {
+        let spr = sprs.get(&pt).copied().unwrap_or_else(|| pt.default_spr());
+        trees.insert(pt, PostflopTree::build(pt, config, spr)?);
     }
     Ok(trees)
 }
@@ -1171,7 +1190,8 @@ mod tests {
             raises_per_street: 0,
             ..PostflopModelConfig::fast()
         };
-        let trees = build_all_trees(&config).unwrap();
+        let sprs = compute_pot_type_sprs(None);
+        let trees = build_all_trees(&config, &sprs).unwrap();
         let node_streets: FxHashMap<PotType, Vec<Street>> = trees
             .iter()
             .map(|(&pt, tree)| (pt, annotate_streets(tree)))
@@ -1189,10 +1209,63 @@ mod tests {
     #[timed_test]
     fn build_all_trees_creates_four_pot_types() {
         let config = PostflopModelConfig::fast();
-        let trees = build_all_trees(&config).unwrap();
+        let sprs = compute_pot_type_sprs(None);
+        let trees = build_all_trees(&config, &sprs).unwrap();
         assert!(trees.contains_key(&PotType::Limped));
         assert!(trees.contains_key(&PotType::Raised));
         assert!(trees.contains_key(&PotType::ThreeBet));
         assert!(trees.contains_key(&PotType::FourBetPlus));
+    }
+
+    #[timed_test]
+    fn build_trees_with_preflop_config_uses_computed_sprs() {
+        let config = PostflopModelConfig::fast();
+        let pf_config = PreflopConfig::heads_up(25);
+        let sprs = compute_pot_type_sprs(Some(&pf_config));
+        let trees = build_all_trees(&config, &sprs).unwrap();
+
+        // With computed SPRs, trees should have genuinely different shapes
+        let limped = &trees[&PotType::Limped];
+        let four_bet = &trees[&PotType::FourBetPlus];
+        assert_ne!(
+            limped.node_count(),
+            four_bet.node_count(),
+            "limped and 4bet trees should differ with computed SPRs"
+        );
+        // Limped has higher SPR → more nodes
+        assert!(
+            limped.node_count() > four_bet.node_count(),
+            "limped ({}) should have more nodes than 4bet ({})",
+            limped.node_count(),
+            four_bet.node_count()
+        );
+    }
+
+    #[timed_test]
+    fn compute_pot_type_sprs_without_config_uses_defaults() {
+        let sprs = compute_pot_type_sprs(None);
+        assert!((sprs[&PotType::Limped] - 12.0).abs() < f64::EPSILON);
+        assert!((sprs[&PotType::Raised] - 4.5).abs() < f64::EPSILON);
+        assert!((sprs[&PotType::ThreeBet] - 1.75).abs() < f64::EPSILON);
+        assert!((sprs[&PotType::FourBetPlus] - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[timed_test]
+    fn compute_pot_type_sprs_with_config_differs_from_defaults() {
+        let pf_config = PreflopConfig::heads_up(25);
+        let computed = compute_pot_type_sprs(Some(&pf_config));
+        let defaults = compute_pot_type_sprs(None);
+
+        // Computed SPR should monotonically decrease
+        assert!(computed[&PotType::Limped] > computed[&PotType::Raised]);
+        assert!(computed[&PotType::Raised] > computed[&PotType::ThreeBet]);
+        assert!(computed[&PotType::ThreeBet] > computed[&PotType::FourBetPlus]);
+
+        // At least one should differ from defaults (raised should match since
+        // default_spr uses same 25BB HU assumption, but limped will differ)
+        let any_differ = ALL_POT_TYPES.iter().any(|pt| {
+            (computed[pt] - defaults[pt]).abs() > 0.01
+        });
+        assert!(any_differ, "computed SPRs should differ from hardcoded defaults");
     }
 }

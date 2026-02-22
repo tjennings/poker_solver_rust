@@ -5,6 +5,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use poker_solver_core::hands::{all_hands, CanonicalHand};
+use poker_solver_core::preflop::config::PreflopConfig;
 use poker_solver_core::preflop::ehs::EhsFeatures;
 use poker_solver_core::preflop::hand_buckets::{bucket_ehs_centroids, compute_all_flop_features};
 use poker_solver_core::preflop::postflop_abstraction::PostflopAbstraction;
@@ -18,7 +19,16 @@ use poker_solver_core::poker::{Card, Suit, Value};
 
 #[derive(Serialize)]
 struct TraceOutput {
+    spr_values: SprValues,
     hands: Vec<HandTrace>,
+}
+
+#[derive(Serialize)]
+struct SprValues {
+    limped: f64,
+    raised: f64,
+    three_bet: f64,
+    four_bet_plus: f64,
 }
 
 #[derive(Serialize)]
@@ -69,6 +79,7 @@ struct HandSummary {
 /// Run the hand trace diagnostic for all 169 canonical hands.
 pub fn run(
     config: &PostflopModelConfig,
+    preflop_config: Option<&PreflopConfig>,
     cache_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let all_hands_vec: Vec<CanonicalHand> = all_hands().collect();
@@ -78,7 +89,7 @@ pub fn run(
     // Build the full postflop abstraction (loads board/buckets/equity from cache,
     // rebuilds trees + solves postflop)
     eprintln!("Building postflop abstraction...");
-    let abstraction = PostflopAbstraction::build(config, None, Some(cache_dir), |phase| {
+    let abstraction = PostflopAbstraction::build(config, None, Some(cache_dir), preflop_config, |phase| {
         eprintln!("  {phase:?}");
     })?;
 
@@ -196,7 +207,14 @@ fn build_trace_output(
         })
         .collect();
 
-    TraceOutput { hands }
+    let spr_values = SprValues {
+        limped: abstraction.trees.get(&PotType::Limped).map_or(PotType::Limped.default_spr(), |t| t.spr),
+        raised: abstraction.trees.get(&PotType::Raised).map_or(PotType::Raised.default_spr(), |t| t.spr),
+        three_bet: abstraction.trees.get(&PotType::ThreeBet).map_or(PotType::ThreeBet.default_spr(), |t| t.spr),
+        four_bet_plus: abstraction.trees.get(&PotType::FourBetPlus).map_or(PotType::FourBetPlus.default_spr(), |t| t.spr),
+    };
+
+    TraceOutput { spr_values, hands }
 }
 
 // ---------------------------------------------------------------------------

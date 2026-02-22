@@ -676,9 +676,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::TraceHand { config, cache_dir } => {
             let yaml = std::fs::read_to_string(&config)?;
             let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
-            let pf_config = training.game.postflop_model
+            let pf_config = training.game.postflop_model.as_ref()
                 .ok_or("config file has no postflop_model section")?;
-            hand_trace::run(&pf_config, &cache_dir)?;
+            hand_trace::run(pf_config, Some(&training.game), &cache_dir)?;
         }
     }
 
@@ -792,7 +792,7 @@ fn run_solve_preflop(
         pf_pb.set_message("Building postflop abstraction");
         let pf_start = Instant::now();
         let cache_base = std::path::Path::new("cache/postflop");
-        let abstraction = PostflopAbstraction::build(pf_config, Some(&equity), Some(cache_base), |phase| {
+        let abstraction = PostflopAbstraction::build(pf_config, Some(&equity), Some(cache_base), Some(&config), |phase| {
             match &phase {
                 BuildPhase::HandBuckets(done, total) => {
                     pf_pb.set_length(*total as u64);
