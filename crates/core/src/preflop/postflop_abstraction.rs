@@ -384,7 +384,10 @@ fn load_or_build_abstraction(
     on_progress(BuildPhase::HandBuckets(0, hand_buckets::NUM_HANDS));
 
     let hands: Vec<_> = crate::hands::all_hands().collect();
-    let flops = crate::preflop::ehs::canonical_flops();
+    let mut flops = crate::preflop::ehs::canonical_flops();
+    if config.max_flop_boards > 0 && config.max_flop_boards < flops.len() {
+        flops.truncate(config.max_flop_boards);
+    }
 
     let buckets = hand_buckets::build_street_buckets_independent(
         &hands,
@@ -392,7 +395,15 @@ fn load_or_build_abstraction(
         config.num_hand_buckets_flop,
         config.num_hand_buckets_turn,
         config.num_hand_buckets_river,
-        &|_| {},
+        &|progress| {
+            use hand_buckets::BuildProgress;
+            match progress {
+                BuildProgress::FlopFeatures(done, total) => {
+                    on_progress(BuildPhase::HandBuckets(done, total));
+                }
+                _ => {}
+            }
+        },
     );
 
     // Build equity from bucket centroids (placeholder: 0.5 uniform equity).

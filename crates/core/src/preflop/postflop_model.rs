@@ -31,6 +31,9 @@ fn default_postflop_solve_samples() -> u32 {
 fn default_canonical_sprs() -> Vec<f64> {
     vec![0.5, 1.0, 1.5, 3.0, 5.0, 10.0, 20.0, 50.0]
 }
+fn default_max_flop_boards() -> usize {
+    0
+}
 
 /// Configuration for the postflop model integrated into the preflop solver.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +67,12 @@ pub struct PostflopModelConfig {
     /// per SPR value. At runtime, each pot type maps to the nearest canonical SPR.
     #[serde(default = "default_canonical_sprs")]
     pub canonical_sprs: Vec<f64>,
+
+    /// Maximum number of canonical flop boards to use for EHS feature computation.
+    /// 0 means use all canonical flops (~1,755). Lower values dramatically speed up
+    /// the hand bucketing phase at the cost of clustering quality.
+    #[serde(default = "default_max_flop_boards")]
+    pub max_flop_boards: usize,
 }
 
 impl PostflopModelConfig {
@@ -74,6 +83,7 @@ impl PostflopModelConfig {
             num_hand_buckets_flop: 50,
             num_hand_buckets_turn: 50,
             num_hand_buckets_river: 50,
+            max_flop_boards: 200,
             ..Self::standard()
         }
     }
@@ -85,6 +95,7 @@ impl PostflopModelConfig {
             num_hand_buckets_flop: 200,
             num_hand_buckets_turn: 200,
             num_hand_buckets_river: 200,
+            max_flop_boards: 500,
             ..Self::standard()
         }
     }
@@ -102,6 +113,7 @@ impl PostflopModelConfig {
             postflop_solve_iterations: 200,
             postflop_solve_samples: 0,
             canonical_sprs: default_canonical_sprs(),
+            max_flop_boards: 0,
         }
     }
 

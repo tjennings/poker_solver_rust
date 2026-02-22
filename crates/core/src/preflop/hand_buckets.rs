@@ -39,11 +39,14 @@ pub struct StreetEquity {
 
 /// Progress phases for `build_street_buckets_independent`.
 pub enum BuildProgress {
-    FlopFeatures,
+    /// Flop feature computation progress: `(hands_done, total_hands)`.
+    FlopFeatures(usize, usize),
     FlopClustering,
-    TurnFeatures,
+    /// Turn feature computation progress: `(hands_done, total_hands)`.
+    TurnFeatures(usize, usize),
     TurnClustering,
-    RiverFeatures,
+    /// River feature computation progress: `(hands_done, total_hands)`.
+    RiverFeatures(usize, usize),
     RiverClustering,
 }
 
@@ -164,8 +167,11 @@ pub fn build_street_buckets_independent(
     on_progress: &(impl Fn(BuildProgress) + Sync + Send),
 ) -> StreetBuckets {
     // --- Flop ---
-    on_progress(BuildProgress::FlopFeatures);
-    let flop_features = compute_flop_histograms(hands, flops, &|_| {});
+    let num_hands = hands.len();
+    on_progress(BuildProgress::FlopFeatures(0, num_hands));
+    let flop_features = compute_flop_histograms(hands, flops, &|done| {
+        on_progress(BuildProgress::FlopFeatures(done, num_hands));
+    });
 
     on_progress(BuildProgress::FlopClustering);
     let flop_assignments = cluster_histograms(&flop_features, num_flop_buckets);
@@ -191,8 +197,10 @@ pub fn build_street_buckets_independent(
         })
         .collect();
 
-    on_progress(BuildProgress::TurnFeatures);
-    let turn_features = compute_turn_histograms(hands, &turn_boards);
+    on_progress(BuildProgress::TurnFeatures(0, num_hands));
+    let turn_features = compute_turn_histograms(hands, &turn_boards, &|done| {
+        on_progress(BuildProgress::TurnFeatures(done, num_hands));
+    });
 
     on_progress(BuildProgress::TurnClustering);
     let turn_assignments = cluster_histograms(&turn_features, num_turn_buckets);
@@ -215,8 +223,10 @@ pub fn build_street_buckets_independent(
         })
         .collect();
 
-    on_progress(BuildProgress::RiverFeatures);
-    let river_equities = compute_river_equities(hands, &river_boards);
+    on_progress(BuildProgress::RiverFeatures(0, num_hands));
+    let river_equities = compute_river_equities(hands, &river_boards, &|done| {
+        on_progress(BuildProgress::RiverFeatures(done, num_hands));
+    });
 
     on_progress(BuildProgress::RiverClustering);
     let river_assignments = cluster_river_equities(&river_equities, num_river_buckets);
@@ -409,12 +419,14 @@ pub fn compute_flop_histograms(
 pub fn compute_turn_histograms(
     hands: &[CanonicalHand],
     turn_boards: &[[Card; 4]],
+    on_hand_done: &(impl Fn(usize) + Sync + Send),
 ) -> Vec<HistogramFeatures> {
+    let done = AtomicUsize::new(0);
     let per_hand: Vec<Vec<HistogramFeatures>> = hands
         .par_iter()
         .map(|hand| {
             let combos = hand.combos();
-            turn_boards
+            let feats: Vec<HistogramFeatures> = turn_boards
                 .iter()
                 .map(|board| {
                     if let Some(&(c1, c2)) = combos.iter().find(|&&(c1, c2)| !board_conflicts([c1, c2], board)) {
@@ -423,7 +435,10 @@ pub fn compute_turn_histograms(
                         [f64::NAN; HISTOGRAM_BINS]
                     }
                 })
-                .collect()
+                .collect();
+            let count = done.fetch_add(1, Ordering::Relaxed) + 1;
+            on_hand_done(count);
+            feats
         })
         .collect();
 
@@ -443,12 +458,14 @@ pub fn compute_turn_histograms(
 pub fn compute_river_equities(
     hands: &[CanonicalHand],
     river_boards: &[[Card; 5]],
+    on_hand_done: &(impl Fn(usize) + Sync + Send),
 ) -> Vec<f64> {
+    let done = AtomicUsize::new(0);
     let per_hand: Vec<Vec<f64>> = hands
         .par_iter()
         .map(|hand| {
             let combos = hand.combos();
-            river_boards
+            let equities: Vec<f64> = river_boards
                 .iter()
                 .map(|board| {
                     if let Some(&(c1, c2)) = combos.iter().find(|&&(c1, c2)| !board_conflicts([c1, c2], board)) {
@@ -457,7 +474,10 @@ pub fn compute_river_equities(
                         f64::NAN
                     }
                 })
-                .collect()
+                .collect();
+            let count = done.fetch_add(1, Ordering::Relaxed) + 1;
+            on_hand_done(count);
+            equities
         })
         .collect();
 
@@ -974,7 +994,7 @@ mod tests {
     fn compute_river_equities_basic() {
         let hands: Vec<CanonicalHand> = all_hands().collect();
         let river = [sample_river()];
-        let equities = compute_river_equities(&hands, &river);
+        let equities = compute_river_equities(&hands, &river, &|_| {});
 
         assert_eq!(equities.len(), hands.len());
 
