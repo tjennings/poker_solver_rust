@@ -794,21 +794,55 @@ fn transpose(by_texture: &[Vec<u16>], num_hands: usize, num_textures: usize) -> 
         .collect()
 }
 
-/// K-means clustering returning per-point cluster assignments.
+// ---------------------------------------------------------------------------
+// Generic k-means trait and implementations
+// ---------------------------------------------------------------------------
+
+/// Trait for types that can be used as k-means feature vectors.
+pub trait KmeansPoint: Copy + Send + Sync + PartialEq {
+    /// Number of dimensions in this feature vector.
+    fn dims(&self) -> usize;
+    /// Get the value at dimension `i`.
+    fn get(&self, i: usize) -> f64;
+    /// Return the zero/origin point.
+    fn zero() -> Self;
+    /// Set the value at dimension `i`.
+    fn set(&mut self, i: usize, val: f64);
+}
+
+impl KmeansPoint for [f64; 3] {
+    fn dims(&self) -> usize { 3 }
+    fn get(&self, i: usize) -> f64 { self[i] }
+    fn zero() -> Self { [0.0; 3] }
+    fn set(&mut self, i: usize, val: f64) { self[i] = val; }
+}
+
+impl KmeansPoint for [f64; 10] {
+    fn dims(&self) -> usize { 10 }
+    fn get(&self, i: usize) -> f64 { self[i] }
+    fn zero() -> Self { [0.0; 10] }
+    fn set(&mut self, i: usize, val: f64) { self[i] = val; }
+}
+
+// ---------------------------------------------------------------------------
+// Generic k-means functions
+// ---------------------------------------------------------------------------
+
+/// Generic k-means clustering returning per-point cluster assignments.
 ///
 /// Initialises centroids via k-means++ seeding then iterates until stable or `max_iter`.
 #[must_use]
-pub fn kmeans(points: &[EhsFeatures], k: usize, max_iter: usize) -> Vec<u16> {
+pub fn kmeans_generic<P: KmeansPoint>(points: &[P], k: usize, max_iter: usize) -> Vec<u16> {
     if points.is_empty() || k == 0 {
         return vec![];
     }
     let k = k.min(points.len());
-    let mut centroids = kmeans_pp_init(points, k);
-    let mut assignments = assign_clusters(points, &centroids);
+    let mut centroids = kmeans_pp_init_generic(points, k);
+    let mut assignments = assign_clusters_generic(points, &centroids);
 
     for _ in 0..max_iter {
-        let new_centroids = recompute_centroids(points, &assignments, k);
-        let new_assignments = assign_clusters(points, &new_centroids);
+        let new_centroids = recompute_centroids_generic(points, &assignments, k);
+        let new_assignments = assign_clusters_generic(points, &new_centroids);
         if new_assignments == assignments {
             break;
         }
@@ -819,17 +853,16 @@ pub fn kmeans(points: &[EhsFeatures], k: usize, max_iter: usize) -> Vec<u16> {
     assignments
 }
 
-/// K-means++ initialisation: picks first centroid uniformly, then
+/// Generic k-means++ initialisation: picks first centroid uniformly, then
 /// subsequent centroids proportional to squared distance from nearest centroid.
-fn kmeans_pp_init(points: &[EhsFeatures], k: usize) -> Vec<EhsFeatures> {
+fn kmeans_pp_init_generic<P: KmeansPoint>(points: &[P], k: usize) -> Vec<P> {
     let mut centroids = vec![points[0]];
     let mut seed: u64 = 0xDEAD_BEEF_CAFE_1234;
 
     for _ in 1..k {
-        let weights = compute_sq_distances(points, &centroids);
+        let weights = compute_sq_distances_generic(points, &centroids);
         let total: f64 = weights.iter().sum();
         seed = splitmix64(seed);
-        // Normalise seed to [0,1]: both casts lose precision but that's fine for sampling
         #[allow(clippy::cast_precision_loss)]
         let threshold = (seed as f64 / u64::MAX as f64) * total;
         let idx = pick_weighted_index(&weights, threshold);
@@ -838,14 +871,14 @@ fn kmeans_pp_init(points: &[EhsFeatures], k: usize) -> Vec<EhsFeatures> {
     centroids
 }
 
-/// For each point, compute its squared distance to the nearest centroid.
-fn compute_sq_distances(points: &[EhsFeatures], centroids: &[EhsFeatures]) -> Vec<f64> {
+/// For each point, compute its squared distance to the nearest centroid (generic).
+fn compute_sq_distances_generic<P: KmeansPoint>(points: &[P], centroids: &[P]) -> Vec<f64> {
     points
         .iter()
         .map(|p| {
             centroids
                 .iter()
-                .map(|c| sq_dist(p, c))
+                .map(|c| sq_dist_generic(p, c))
                 .fold(f64::MAX, f64::min)
         })
         .collect()
@@ -863,65 +896,106 @@ fn pick_weighted_index(weights: &[f64], threshold: f64) -> usize {
     weights.len() - 1
 }
 
-/// Assign each point to its nearest centroid.
-fn assign_clusters(points: &[EhsFeatures], centroids: &[EhsFeatures]) -> Vec<u16> {
+/// Assign each point to its nearest centroid (generic).
+pub fn assign_clusters_generic<P: KmeansPoint>(points: &[P], centroids: &[P]) -> Vec<u16> {
     points
         .iter()
-        .map(|p| nearest_centroid(p, centroids))
+        .map(|p| nearest_centroid_generic(p, centroids))
         .collect()
+}
+
+/// Return index of nearest centroid to point `p` (generic).
+#[allow(clippy::cast_possible_truncation)]
+pub fn nearest_centroid_generic<P: KmeansPoint>(p: &P, centroids: &[P]) -> u16 {
+    centroids
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            sq_dist_generic(p, a)
+                .partial_cmp(&sq_dist_generic(p, b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map_or(0, |(i, _)| i as u16)
+}
+
+/// Recompute centroids as the mean of assigned points (generic).
+pub fn recompute_centroids_generic<P: KmeansPoint>(
+    points: &[P],
+    assignments: &[u16],
+    k: usize,
+) -> Vec<P> {
+    let dims = if points.is_empty() {
+        // Fall back: create a zero point to query dims
+        P::zero().dims()
+    } else {
+        points[0].dims()
+    };
+
+    let mut sums: Vec<P> = vec![P::zero(); k];
+    let mut counts = vec![0usize; k];
+
+    for (p, &a) in points.iter().zip(assignments.iter()) {
+        let ci = a as usize;
+        for d in 0..dims {
+            let cur = sums[ci].get(d);
+            sums[ci].set(d, cur + p.get(d));
+        }
+        counts[ci] += 1;
+    }
+
+    (0..k)
+        .map(|i| {
+            if counts[i] == 0 {
+                // Empty cluster: place centroid at midpoint of first dimension
+                let mut mid = P::zero();
+                mid.set(0, 0.5);
+                mid
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let n = counts[i] as f64;
+                let mut centroid = P::zero();
+                for d in 0..dims {
+                    centroid.set(d, sums[i].get(d) / n);
+                }
+                centroid
+            }
+        })
+        .collect()
+}
+
+/// Squared Euclidean distance for generic feature vectors.
+pub fn sq_dist_generic<P: KmeansPoint>(a: &P, b: &P) -> f64 {
+    let dims = a.dims();
+    (0..dims).map(|i| (a.get(i) - b.get(i)).powi(2)).sum()
+}
+
+// ---------------------------------------------------------------------------
+// Concrete k-means functions (delegate to generics for backward compat)
+// ---------------------------------------------------------------------------
+
+/// K-means clustering returning per-point cluster assignments.
+///
+/// Initialises centroids via k-means++ seeding then iterates until stable or `max_iter`.
+#[must_use]
+pub fn kmeans(points: &[EhsFeatures], k: usize, max_iter: usize) -> Vec<u16> {
+    kmeans_generic(points, k, max_iter)
 }
 
 /// Return index of nearest centroid to point `p`.
 #[allow(clippy::cast_possible_truncation)]
 fn nearest_centroid(p: &EhsFeatures, centroids: &[EhsFeatures]) -> u16 {
-    // k ≤ 65535 by type constraint on num_buckets, so cast is safe
-    centroids
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| sq_dist(p, a).partial_cmp(&sq_dist(p, b)).unwrap_or(std::cmp::Ordering::Equal))
-        .map_or(0, |(i, _)| i as u16)
+    nearest_centroid_generic(p, centroids)
 }
 
 /// Recompute centroids as the mean of assigned points.
 fn recompute_centroids(points: &[EhsFeatures], assignments: &[u16], k: usize) -> Vec<EhsFeatures> {
-    let (sums, counts) = accumulate_cluster_sums(points, assignments, k);
-    (0..k)
-        .map(|i| centroid_from_sum(&sums[i], counts[i]))
-        .collect()
-}
-
-/// Accumulate per-cluster sums and counts.
-fn accumulate_cluster_sums(
-    points: &[EhsFeatures],
-    assignments: &[u16],
-    k: usize,
-) -> (Vec<[f64; 3]>, Vec<usize>) {
-    let mut sums = vec![[0.0f64; 3]; k];
-    let mut counts = vec![0usize; k];
-    for (p, &a) in points.iter().zip(assignments.iter()) {
-        let i = a as usize;
-        sums[i][0] += p[0];
-        sums[i][1] += p[1];
-        sums[i][2] += p[2];
-        counts[i] += 1;
-    }
-    (sums, counts)
-}
-
-/// Compute centroid from accumulated sum.
-#[allow(clippy::cast_precision_loss)]
-fn centroid_from_sum(sum: &[f64; 3], count: usize) -> EhsFeatures {
-    if count == 0 {
-        return [0.5, 0.0, 0.0];
-    }
-    // count ≤ num_hands (169); precision loss negligible
-    let n = count as f64;
-    [sum[0] / n, sum[1] / n, sum[2] / n]
+    recompute_centroids_generic(points, assignments, k)
 }
 
 /// Squared Euclidean distance in 3D feature space.
+#[cfg(test)]
 fn sq_dist(a: &EhsFeatures, b: &EhsFeatures) -> f64 {
-    (0..3).map(|i| (a[i] - b[i]).powi(2)).sum()
+    sq_dist_generic(a, b)
 }
 
 // ---------------------------------------------------------------------------
@@ -1698,5 +1772,51 @@ mod tests {
             1, 1, 2,
         );
         assert_eq!(table[0][0], 0, "majority vote should pick bucket 0");
+    }
+
+    #[timed_test]
+    fn kmeans_generic_works_with_10d_vectors() {
+        let low: [f64; 10] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+        let high: [f64; 10] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.3, 0.4, 1.0];
+        let points = vec![low, low, low, high, high, high];
+        let assignments = kmeans_generic(&points, 2, 100);
+        assert_eq!(assignments.len(), 6);
+        assert_eq!(assignments[0], assignments[1]);
+        assert_eq!(assignments[1], assignments[2]);
+        assert_eq!(assignments[3], assignments[4]);
+        assert_eq!(assignments[4], assignments[5]);
+        assert_ne!(assignments[0], assignments[3]);
+    }
+
+    #[timed_test]
+    fn kmeans_existing_still_works_after_generics() {
+        // Existing 3D test still works through the wrapper
+        let points = vec![
+            [0.1, 0.0, 0.0],
+            [0.9, 0.0, 0.0],
+            [0.15, 0.0, 0.0],
+            [0.85, 0.0, 0.0],
+        ];
+        let assignments = kmeans(&points, 2, 100);
+        assert_eq!(assignments[0], assignments[2]); // low cluster
+        assert_eq!(assignments[1], assignments[3]); // high cluster
+        assert_ne!(assignments[0], assignments[1]);
+    }
+
+    #[timed_test]
+    fn sq_dist_generic_matches_concrete() {
+        let a = [1.0, 0.5, 0.2];
+        let b = [0.3, 0.1, 0.9];
+        let concrete = sq_dist(&a, &b);
+        let generic = sq_dist_generic(&a, &b);
+        assert!((concrete - generic).abs() < 1e-12);
+    }
+
+    #[timed_test]
+    fn sq_dist_generic_10d() {
+        let a: [f64; 10] = [1.0; 10];
+        let b: [f64; 10] = [0.0; 10];
+        let d = sq_dist_generic(&a, &b);
+        assert!((d - 10.0).abs() < 1e-12);
     }
 }
