@@ -3,6 +3,8 @@
 //! Wraps the existing `HandStrengthCalculator` to provide the EHS feature vectors
 //! used in k-means clustering of hands into buckets.
 
+use std::collections::HashSet;
+
 use crate::abstraction::HandStrengthCalculator;
 use crate::poker::{Card, Suit, Value};
 
@@ -194,6 +196,63 @@ fn splitmix64(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
+}
+
+/// Compute a canonical key for a board by remapping suits to first-seen order.
+///
+/// Sort the board cards by (value, suit), then walk through assigning canonical
+/// suit indices (0, 1, 2, 3) in the order suits are first encountered.
+/// Returns a vector of `(Value, canonical_suit_index)` pairs.
+#[must_use]
+pub fn canonical_board_key(board: &[Card]) -> Vec<(Value, u8)> {
+    let mut sorted: Vec<Card> = board.to_vec();
+    sorted.sort();
+
+    let mut suit_map = [u8::MAX; 4]; // indexed by Suit as u8
+    let mut next_suit: u8 = 0;
+
+    sorted
+        .iter()
+        .map(|card| {
+            let suit_idx = u8::from(card.suit) as usize;
+            if suit_map[suit_idx] == u8::MAX {
+                suit_map[suit_idx] = next_suit;
+                next_suit += 1;
+            }
+            (card.value, suit_map[suit_idx])
+        })
+        .collect()
+}
+
+/// Enumerate all suit-isomorphic canonical flops.
+///
+/// Iterates all C(52,3) = 22,100 three-card combinations, computes a canonical
+/// key for each via suit remapping, and deduplicates. Produces ~1,755 canonical flops.
+#[must_use]
+pub fn canonical_flops() -> Vec<[Card; 3]> {
+    let cards: Vec<Card> = all_cards().collect();
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+
+    for i in 0..cards.len() {
+        for j in (i + 1)..cards.len() {
+            for k in (j + 1)..cards.len() {
+                let flop = [cards[i], cards[j], cards[k]];
+                let key = canonical_board_key(&flop);
+                if seen.insert(key) {
+                    result.push(flop);
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// All cards not in hole or board — thin wrapper around `live_deck`.
+#[must_use]
+pub fn live_turn_cards(hole: &[Card; 2], board: &[Card]) -> Vec<Card> {
+    live_deck(*hole, board)
 }
 
 #[cfg(test)]
@@ -501,6 +560,73 @@ mod tests {
             cdf[4] < 0.3,
             "AA on low board: CDF at bin 4 should be < 0.3, got {}",
             cdf[4]
+        );
+    }
+
+    #[timed_test]
+    fn canonical_flops_count_is_correct() {
+        let flops = canonical_flops();
+        assert!(flops.len() > 1000, "too few: {}", flops.len());
+        assert!(flops.len() < 3000, "too many: {}", flops.len());
+        for f in &flops {
+            assert_ne!(f[0], f[1]);
+            assert_ne!(f[1], f[2]);
+            assert_ne!(f[0], f[2]);
+        }
+    }
+
+    #[timed_test]
+    fn live_turn_cards_excludes_board_and_hole() {
+        let hole = [
+            make_card(Value::Ace, Suit::Spade),
+            make_card(Value::King, Suit::Heart),
+        ];
+        let flop = [
+            make_card(Value::Two, Suit::Diamond),
+            make_card(Value::Five, Suit::Club),
+            make_card(Value::Eight, Suit::Spade),
+        ];
+        let turns = live_turn_cards(&hole, &flop);
+        assert_eq!(turns.len(), 47);
+        assert!(!turns.contains(&hole[0]));
+        assert!(!turns.contains(&hole[1]));
+        for c in &flop {
+            assert!(!turns.contains(c));
+        }
+    }
+
+    #[timed_test]
+    fn canonical_board_key_remaps_suits() {
+        // Two isomorphic flops should produce the same key
+        let flop_a = [
+            make_card(Value::Ace, Suit::Spade),
+            make_card(Value::King, Suit::Heart),
+            make_card(Value::Queen, Suit::Diamond),
+        ];
+        let flop_b = [
+            make_card(Value::Ace, Suit::Heart),
+            make_card(Value::King, Suit::Diamond),
+            make_card(Value::Queen, Suit::Club),
+        ];
+        assert_eq!(canonical_board_key(&flop_a), canonical_board_key(&flop_b));
+    }
+
+    #[timed_test]
+    fn canonical_board_key_distinguishes_flush_boards() {
+        // Monotone flop (all same suit) vs rainbow flop (all different suits)
+        let monotone = [
+            make_card(Value::Ace, Suit::Spade),
+            make_card(Value::King, Suit::Spade),
+            make_card(Value::Queen, Suit::Spade),
+        ];
+        let rainbow = [
+            make_card(Value::Ace, Suit::Spade),
+            make_card(Value::King, Suit::Heart),
+            make_card(Value::Queen, Suit::Diamond),
+        ];
+        assert_ne!(
+            canonical_board_key(&monotone),
+            canonical_board_key(&rainbow)
         );
     }
 }
