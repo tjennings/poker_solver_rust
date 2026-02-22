@@ -17,6 +17,59 @@ PreflopConfig ─► PreflopTree ─► PreflopSolver
                               └───────────────────────┘
 ```
 
+## Project Structure
+
+```
+poker_solver_rust/
+├── crates/
+│   ├── core/                  # Core solver library
+│   │   └── src/
+│   │       ├── game/          # Game implementations (HUNL, Kuhn, LHE)
+│   │       ├── cfr/           # CFR variants (vanilla, MCCFR, sequence-form)
+│   │       ├── blueprint/     # Blueprint strategy, subgame solving, bundling
+│   │       ├── preflop/       # Preflop LCFR solver & postflop abstraction pipeline
+│   │       ├── abstraction/   # Card abstraction (EHS buckets, isomorphism)
+│   │       ├── hand_class.rs  # 19-variant hand classification system
+│   │       ├── info_key.rs    # Info set key encoding (64-bit packed)
+│   │       ├── agent.rs       # Agent system (TOML-configured play styles)
+│   │       ├── simulation.rs  # Arena-based agent simulation
+│   │       └── abstract_game.rs  # Exhaustive deal enumeration
+│   ├── trainer/               # CLI for training, diagnostics, deal generation
+│   ├── deep-cfr/              # Neural network SD-CFR (candle backend)
+│   ├── gpu-cfr/               # GPU sequence-form CFR (wgpu)
+│   │   └── src/shaders/       # WGSL compute shaders
+│   ├── tauri-app/             # Desktop strategy explorer (Tauri)
+│   ├── devserver/             # HTTP mirror of Tauri API for browser debugging
+│   └── test-macros/           # #[timed_test] proc macro
+├── frontend/                  # React/TypeScript explorer UI
+│   └── src/
+│       ├── Explorer.tsx       # Strategy browsing interface
+│       ├── Simulator.tsx      # Agent simulation interface
+│       └── invoke.ts          # Tauri/fetch abstraction layer
+├── agents/                    # Agent personality configs (TOML)
+├── sample_configurations/     # Training config presets (YAML)
+├── docs/                      # Architecture, training, explorer, cloud docs
+└── *.yaml                     # Training configs (root-level)
+```
+
+### Component Summary
+
+**`core`** — The heart of the solver. Contains the `Game` trait and its implementations (heads-up no-limit, Kuhn poker, limit hold'em), multiple CFR solver backends (vanilla, MCCFR, sequence-form), the preflop LCFR solver with its full postflop abstraction pipeline (hand bucketing, equity tables, tree building, solving), the blueprint strategy system with subgame refinement, card abstractions, hand classification, and the agent simulation framework.
+
+**`trainer`** — CLI entry point that orchestrates training runs, bucket diagnostics, hand tracing, and deal generation. Parses YAML configs and drives the core library.
+
+**`deep-cfr`** — Neural network approach to CFR using the candle ML framework. Encodes game states as card features, trains advantage networks via reservoir sampling, and supports both HUNL and limit hold'em.
+
+**`gpu-cfr`** — GPU-accelerated sequence-form CFR using wgpu. Includes tabular and tiled solver variants with WGSL compute shaders for forward pass, backward pass, regret matching, and DCFR discounting.
+
+**`tauri-app`** — Desktop application for exploring solved strategies. Loads blueprint bundles, navigates the game tree, queries strategy/EV at any node, and runs agent simulations.
+
+**`devserver`** — Lightweight HTTP server that mirrors all Tauri exploration commands as POST endpoints, enabling browser-based UI development without the full Tauri build cycle.
+
+**`frontend`** — React/TypeScript UI shared between the Tauri app and dev server. Provides the strategy explorer (tree browsing, action frequencies, EV display) and agent simulator. Auto-detects Tauri vs browser environment.
+
+**`agents/`** — TOML files defining agent play styles (tight-aggressive, loose-aggressive, etc.) that map hand classes to action frequency distributions for simulation.
+
 ## Preflop Solver
 
 **Algorithm:** Linear CFR (LCFR) with DCFR discounting. Both regret and strategy sums are weighted by iteration number. Simultaneous updates — both players traverse every iteration.
