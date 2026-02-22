@@ -484,7 +484,7 @@ fn build_all_trees(
     ];
     let mut trees = FxHashMap::default();
     for pt in pot_types {
-        trees.insert(pt, PostflopTree::build(pt, config)?);
+        trees.insert(pt, PostflopTree::build(pt, config, pt.default_spr())?);
     }
     Ok(trees)
 }
@@ -993,7 +993,7 @@ fn postflop_terminal_value(
                 pot_fraction / 2.0
             }
         }
-        PostflopTerminalType::Showdown => {
+        PostflopTerminalType::Showdown | PostflopTerminalType::AllIn => {
             let eq = f64::from(bucket_equity.get(hero_bucket as usize, opp_bucket as usize));
             eq * pot_fraction - pot_fraction / 2.0
         }
@@ -1046,7 +1046,7 @@ mod tests {
     #[timed_test]
     fn annotate_streets_marks_root_as_flop() {
         let config = PostflopModelConfig::fast();
-        let tree = PostflopTree::build(PotType::Raised, &config).unwrap();
+        let tree = PostflopTree::build(PotType::Raised, &config, 100.0).unwrap();
         let streets = annotate_streets(&tree);
         assert_eq!(streets[0], Street::Flop);
     }
@@ -1060,7 +1060,7 @@ mod tests {
             raises_per_street: 0,
             ..PostflopModelConfig::fast()
         };
-        let tree = PostflopTree::build(PotType::Raised, &config).unwrap();
+        let tree = PostflopTree::build(PotType::Raised, &config, 100.0).unwrap();
         let streets = annotate_streets(&tree);
 
         // Find a chance node and verify its children are on the next street.
