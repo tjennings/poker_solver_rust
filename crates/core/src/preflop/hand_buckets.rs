@@ -51,6 +51,18 @@ pub struct BucketEquity {
     pub num_buckets: usize,
 }
 
+/// Per-street equity tables for postflop showdown evaluation.
+///
+/// Each street has its own bucket equity table dimensioned by that street's
+/// bucket count. River showdowns use river equity, flop/turn all-in showdowns
+/// use the corresponding street's equity.
+#[derive(Serialize, Deserialize)]
+pub struct StreetEquity {
+    pub flop: BucketEquity,
+    pub turn: BucketEquity,
+    pub river: BucketEquity,
+}
+
 impl BucketEquity {
     /// Look up equity of `bucket_a` vs `bucket_b`.
     #[must_use]
@@ -297,6 +309,125 @@ fn bucket_pair_equity(
 }
 
 // ---------------------------------------------------------------------------
+// Per-street equity construction
+// ---------------------------------------------------------------------------
+
+/// Build per-street equity tables from bucket assignments and features.
+///
+/// - Flop equity: uses `equity_table` if provided (accurate pairwise), else EHS centroids.
+/// - Turn equity: EHS centroids from turn features/assignments.
+/// - River equity: EHS centroids from river features/assignments.
+#[must_use]
+pub fn build_street_equity(
+    flop_assignments: &[Vec<u16>],
+    flop_features: &[Vec<EhsFeatures>],
+    num_flop_buckets: usize,
+    turn_features: &[Vec<EhsFeatures>],
+    turn_assignments: &[Vec<u16>],
+    num_turn_buckets: usize,
+    river_features: &[Vec<EhsFeatures>],
+    river_assignments: &[Vec<u16>],
+    num_river_buckets: usize,
+    equity_table: Option<&EquityTable>,
+) -> StreetEquity {
+    let flop = if let Some(eq_table) = equity_table {
+        build_bucket_equity_from_equity_table(flop_assignments, eq_table, num_flop_buckets)
+    } else {
+        let centroids = bucket_ehs_centroids(flop_features, flop_assignments, num_flop_buckets);
+        build_bucket_equity_from_centroids(&centroids)
+    };
+
+    let turn_centroids = bucket_ehs_centroids(turn_features, turn_assignments, num_turn_buckets);
+    let turn = build_bucket_equity_from_centroids(&turn_centroids);
+
+    let river_centroids = bucket_ehs_centroids(river_features, river_assignments, num_river_buckets);
+    let river = build_bucket_equity_from_centroids(&river_centroids);
+
+    StreetEquity { flop, turn, river }
+}
+
+// ---------------------------------------------------------------------------
+// Bucket transition tables
+// ---------------------------------------------------------------------------
+
+/// Convert hand-indexed bucket assignments to bucket-indexed transitions.
+///
+/// For each `(prev_bucket, next_texture)`, collects all hands that map to
+/// `prev_bucket` on any texture, then takes majority vote of their
+/// `next_texture` assignment to determine the transition bucket.
+///
+/// Returns `transitions[prev_bucket][next_texture]` → next bucket ID.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn build_transition_table(
+    prev_assignments: &[Vec<u16>],
+    next_assignments: &[Vec<u16>],
+    num_prev_buckets: u16,
+    num_next_textures: usize,
+    num_next_buckets: u16,
+) -> Vec<Vec<u16>> {
+    // For each prev_bucket, collect which hands belong to it (on any texture).
+    let mut bucket_hands: Vec<Vec<usize>> = vec![Vec::new(); num_prev_buckets as usize];
+    for (hand_idx, prev_textures) in prev_assignments.iter().enumerate() {
+        for &bucket in prev_textures {
+            let bh = &mut bucket_hands[bucket as usize];
+            if bh.last() != Some(&hand_idx) {
+                bh.push(hand_idx);
+            }
+        }
+    }
+
+    // Dedup hand lists (a hand may appear for multiple textures mapping to same bucket)
+    for hands in &mut bucket_hands {
+        hands.sort_unstable();
+        hands.dedup();
+    }
+
+    // For each (prev_bucket, next_texture), majority vote
+    (0..num_prev_buckets as usize)
+        .map(|prev_b| {
+            (0..num_next_textures)
+                .map(|next_tex| {
+                    majority_vote_bucket(
+                        &bucket_hands[prev_b],
+                        next_assignments,
+                        next_tex,
+                        num_next_buckets,
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Among all hands in `hand_indices`, find the most common bucket assignment
+/// at `texture_id` in `assignments`. Returns the majority bucket.
+#[allow(clippy::cast_possible_truncation)]
+fn majority_vote_bucket(
+    hand_indices: &[usize],
+    assignments: &[Vec<u16>],
+    texture_id: usize,
+    num_buckets: u16,
+) -> u16 {
+    if hand_indices.is_empty() {
+        return 0;
+    }
+    let mut counts = vec![0u32; num_buckets as usize];
+    for &h in hand_indices {
+        if let Some(textures) = assignments.get(h) {
+            if let Some(&bucket) = textures.get(texture_id) {
+                counts[bucket as usize] += 1;
+            }
+        }
+    }
+    counts
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &c)| c)
+        .map_or(0, |(i, _)| i as u16)
+}
+
+// ---------------------------------------------------------------------------
 // Feature computation helpers
 // ---------------------------------------------------------------------------
 
@@ -323,7 +454,7 @@ pub fn compute_all_flop_features(
         .collect()
 }
 
-fn compute_all_turn_features(
+pub fn compute_all_turn_features(
     hands: &[CanonicalHand],
     _flop_bucket_count: usize,
     turn_samples: &[Vec<[Card; 4]>],
@@ -339,7 +470,7 @@ fn compute_all_turn_features(
         .collect()
 }
 
-fn compute_all_river_features(
+pub fn compute_all_river_features(
     hands: &[CanonicalHand],
     _turn_bucket_count: usize,
     river_samples: &[Vec<[Card; 5]>],
@@ -1460,5 +1591,55 @@ mod tests {
             assignments[2][0], strong_bucket,
             "blocked strong hand should be assigned to strong bucket"
         );
+    }
+
+    #[timed_test]
+    fn build_transition_table_correct_shape() {
+        // 4 hands, 2 flop textures, 2 flop buckets
+        // Hands 0,1 → flop bucket 0; Hands 2,3 → flop bucket 1
+        let flop_assignments = vec![
+            vec![0u16, 0], // hand 0
+            vec![0, 0],    // hand 1
+            vec![1, 1],    // hand 2
+            vec![1, 1],    // hand 3
+        ];
+        // 4 hands, 3 turn textures, 2 turn buckets
+        // Hands 0,1 (flop b0) → turn bucket 0 on all textures
+        // Hands 2,3 (flop b1) → turn bucket 1 on all textures
+        let turn_assignments = vec![
+            vec![0u16, 0, 0],
+            vec![0, 0, 0],
+            vec![1, 1, 1],
+            vec![1, 1, 1],
+        ];
+        let table = build_transition_table(
+            &flop_assignments, &turn_assignments,
+            2, 3, 2,
+        );
+        assert_eq!(table.len(), 2, "one row per flop bucket");
+        assert_eq!(table[0].len(), 3, "one col per turn texture");
+        // Flop bucket 0 → turn bucket 0
+        assert_eq!(table[0][0], 0);
+        assert_eq!(table[0][1], 0);
+        // Flop bucket 1 → turn bucket 1
+        assert_eq!(table[1][0], 1);
+        assert_eq!(table[1][1], 1);
+    }
+
+    #[timed_test]
+    fn build_transition_table_majority_vote() {
+        // 3 hands in flop bucket 0. Two map to turn bucket 0, one to turn bucket 1.
+        // Majority vote should give turn bucket 0.
+        let flop_assignments = vec![
+            vec![0u16], vec![0], vec![0],
+        ];
+        let turn_assignments = vec![
+            vec![0u16], vec![0], vec![1],
+        ];
+        let table = build_transition_table(
+            &flop_assignments, &turn_assignments,
+            1, 1, 2,
+        );
+        assert_eq!(table[0][0], 0, "majority vote should pick bucket 0");
     }
 }
