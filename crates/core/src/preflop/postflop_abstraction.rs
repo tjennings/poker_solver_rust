@@ -1002,8 +1002,6 @@ mod tests {
     #[timed_test]
     fn annotate_streets_chance_children_get_next_street() {
         let config = PostflopModelConfig {
-            num_turn_transitions: 1,
-            num_river_transitions: 1,
             bet_sizes: vec![1.0],
             raises_per_street: 0,
             ..PostflopModelConfig::fast()
@@ -1113,8 +1111,6 @@ mod tests {
     #[timed_test]
     fn layout_slot_returns_valid_offset() {
         let config = PostflopModelConfig {
-            num_turn_transitions: 1,
-            num_river_transitions: 1,
             bet_sizes: vec![1.0],
             raises_per_street: 0,
             ..PostflopModelConfig::fast()
