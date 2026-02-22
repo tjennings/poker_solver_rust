@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # cloud/lib/docker.sh — build Docker image and push to ECR
 
+set -euo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 
@@ -8,7 +10,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Compute a content hash for cache-busting: hash of Cargo.lock + all Rust source
 content_hash() {
-  (cd "$REPO_ROOT" && find crates/ Cargo.toml Cargo.lock -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' | sort | xargs sha256sum | sha256sum | cut -c1-12)
+  (cd "$REPO_ROOT" && find crates/ Cargo.toml Cargo.lock \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) | sort | xargs sha256sum | sha256sum | cut -c1-12)
 }
 
 # Get the ECR registry URI

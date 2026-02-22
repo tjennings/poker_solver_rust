@@ -4,15 +4,6 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 
-# Upload a local config file to S3 for the job
-upload_config() {
-  local config_path="$1" instance_id="$2"
-  local s3_path="s3://${SOLVER_S3_BUCKET}/jobs/${instance_id}/config/$(basename "$config_path")"
-  info "Uploading config to $s3_path"
-  aws_cmd s3 cp "$config_path" "$s3_path"
-  echo "$s3_path"
-}
-
 # Download the finished model bundle from S3
 download_bundle() {
   local instance_id="$1" local_dir="$2"

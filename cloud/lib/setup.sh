@@ -54,10 +54,14 @@ run_setup() {
       --description "solver-cloud SSH access" \
       --query 'GroupId' --output text)"
 
+    # Restrict SSH to caller's current IP
+    local my_ip
+    my_ip="$(curl -s https://checkip.amazonaws.com)"
     aws_cmd ec2 authorize-security-group-ingress \
       --group-id "$sg_id" \
-      --protocol tcp --port 22 --cidr 0.0.0.0/0
-    info "Security group created: $sg_id (SSH open)"
+      --protocol tcp --port 22 --cidr "${my_ip}/32"
+    info "Security group created: $sg_id (SSH from ${my_ip}/32)"
+    info "To update allowed IP later: aws ec2 authorize-security-group-ingress --group-id $sg_id --protocol tcp --port 22 --cidr <your-ip>/32"
   fi
 
   # ── IAM instance profile ───────────────────────────────────────────────
@@ -95,9 +99,8 @@ run_setup() {
           },
           {
             "Effect": "Allow",
-            "Action": ["ec2:TerminateInstances", "ec2:CreateTags"],
-            "Resource": "*",
-            "Condition": {"StringEquals": {"ec2:ResourceTag/Name": "solver-training"}}
+            "Action": ["ec2:TerminateInstances", "ec2:CreateTags", "ec2:DescribeTags"],
+            "Resource": "*"
           }
         ]
       }'
