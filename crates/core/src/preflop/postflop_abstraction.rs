@@ -222,8 +222,6 @@ fn annotate_recursive(
 /// Error during postflop abstraction construction.
 #[derive(Debug, thiserror::Error)]
 pub enum PostflopAbstractionError {
-    #[error("hand buckets: {0}")]
-    Buckets(#[from] hand_buckets::BucketError),
     #[error("postflop tree: {0}")]
     Tree(#[from] super::postflop_tree::PostflopTreeError),
     #[error("canonical_sprs must be non-empty")]
