@@ -1,4 +1,5 @@
 mod bucket_diagnostics;
+mod hand_trace;
 mod lhe_diagnose;
 mod lhe_viz;
 mod tree;
@@ -244,6 +245,15 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Trace all 169 hands through the full postflop pipeline (EHS → buckets → EV)
+    TraceHand {
+        /// YAML config file (same format as solve-preflop)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Directory for abstraction cache
+        #[arg(long, default_value = "cache/postflop")]
+        cache_dir: PathBuf,
     },
 }
 
@@ -662,6 +672,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             if !all_passed {
                 std::process::exit(1);
             }
+        }
+        Commands::TraceHand { config, cache_dir } => {
+            let yaml = std::fs::read_to_string(&config)?;
+            let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
+            let pf_config = training.game.postflop_model
+                .ok_or("config file has no postflop_model section")?;
+            hand_trace::run(&pf_config, &cache_dir)?;
         }
     }
 
