@@ -474,7 +474,70 @@ pub fn cluster_per_texture(
         })
         .collect();
     // Transpose: assignments[texture_id][hand_idx] → assignments[hand_idx][texture_id]
-    transpose(&by_texture, num_hands, num_textures)
+    let mut assignments = transpose(&by_texture, num_hands, num_textures);
+
+    // Relabel bucket IDs so bucket 0 = highest average EHS across all textures.
+    // Per-texture k-means produces arbitrary IDs; this makes them globally consistent.
+    relabel_by_centroid_ehs(&mut assignments, features, k as usize);
+
+    assignments
+}
+
+/// Relabel bucket IDs so bucket 0 has the highest average EHS, bucket 1 next, etc.
+///
+/// Per-texture k-means produces arbitrary cluster IDs. This sorts them by average
+/// EHS (descending) so that bucket IDs are globally consistent across textures.
+#[allow(clippy::cast_precision_loss)]
+fn relabel_by_centroid_ehs(
+    assignments: &mut [Vec<u16>],
+    features: &[Vec<EhsFeatures>],
+    k: usize,
+) {
+    // Compute per-bucket average EHS across all (hand, texture) pairs
+    let mut sums = vec![0.0f64; k];
+    let mut counts = vec![0u32; k];
+    for (hand_idx, hand_feats) in features.iter().enumerate() {
+        for (tex_id, feat) in hand_feats.iter().enumerate() {
+            if feat[0].is_nan() {
+                continue;
+            }
+            let bucket = assignments[hand_idx][tex_id] as usize;
+            sums[bucket] += feat[0];
+            counts[bucket] += 1;
+        }
+    }
+
+    let mut avg_ehs: Vec<(usize, f64)> = sums
+        .iter()
+        .zip(&counts)
+        .enumerate()
+        .map(|(i, (&s, &c))| {
+            let avg = if c > 0 { s / f64::from(c) } else { 0.0 };
+            (i, avg)
+        })
+        .collect();
+
+    // Sort descending by EHS so rank 0 = strongest
+    avg_ehs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Build remap: remap[old_id] = new_id
+    let mut remap = vec![0u16; k];
+    #[allow(clippy::cast_possible_truncation)]
+    for (new_id, &(old_id, _)) in avg_ehs.iter().enumerate() {
+        remap[old_id] = new_id as u16;
+    }
+
+    // Check if already in order (common after convergence)
+    if remap.iter().enumerate().all(|(i, &r)| r as usize == i) {
+        return;
+    }
+
+    // Apply remap in-place
+    for hand_assignments in assignments.iter_mut() {
+        for bucket in hand_assignments.iter_mut() {
+            *bucket = remap[*bucket as usize];
+        }
+    }
 }
 
 /// Transpose a 2D vec from `[texture][hand]` to `[hand][texture]`.
@@ -1211,6 +1274,36 @@ mod tests {
             assignments[2][0], strong_bucket_tex0,
             "blocked strong hand should be assigned to strong bucket, not weak"
         );
+    }
+
+    #[timed_test]
+    fn cluster_per_texture_relabels_bucket_0_as_strongest() {
+        // 6 hands across 2 textures, 3 buckets.
+        // Strong group (EHS ~0.9), medium (~0.5), weak (~0.1).
+        let features = vec![
+            // Strong
+            vec![[0.90, 0.0, 0.0], [0.92, 0.0, 0.0]],
+            vec![[0.88, 0.0, 0.0], [0.91, 0.0, 0.0]],
+            // Medium
+            vec![[0.50, 0.0, 0.0], [0.52, 0.0, 0.0]],
+            vec![[0.48, 0.0, 0.0], [0.51, 0.0, 0.0]],
+            // Weak
+            vec![[0.10, 0.0, 0.0], [0.12, 0.0, 0.0]],
+            vec![[0.08, 0.0, 0.0], [0.11, 0.0, 0.0]],
+        ];
+        let assignments = cluster_per_texture(&features, 3, 2);
+
+        // After relabeling: bucket 0 = strong, bucket 1 = medium, bucket 2 = weak
+        assert_eq!(assignments[0][0], 0, "strong hand should be bucket 0");
+        assert_eq!(assignments[1][0], 0, "strong hand should be bucket 0");
+        assert_eq!(assignments[2][0], 1, "medium hand should be bucket 1");
+        assert_eq!(assignments[3][0], 1, "medium hand should be bucket 1");
+        assert_eq!(assignments[4][0], 2, "weak hand should be bucket 2");
+        assert_eq!(assignments[5][0], 2, "weak hand should be bucket 2");
+
+        // Same on texture 1
+        assert_eq!(assignments[0][1], 0);
+        assert_eq!(assignments[4][1], 2);
     }
 
     #[timed_test]
