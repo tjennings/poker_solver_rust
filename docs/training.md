@@ -222,8 +222,8 @@ postflop_model:
 
 | Preset | Buckets (flop/turn/river) | Max flop boards | Use case |
 |-|-|-|-|
-| `fast` | 50/50/50 | 200 | Quick testing (~30s build) |
-| `medium` | 200/200/200 | 500 | Development iteration |
+| `fast` | 50/50/50 | 10 | Quick testing (~3 min) |
+| `medium` | 200/200/200 | 200 | Development iteration (~10 min) |
 | `standard` | 500/500/500 | all (~1,755) | Production training |
 | `accurate` | 1000/1000/1000 | all (~1,755) | High-fidelity analysis |
 

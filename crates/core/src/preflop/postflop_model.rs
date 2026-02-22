@@ -76,14 +76,14 @@ pub struct PostflopModelConfig {
 }
 
 impl PostflopModelConfig {
-    /// Fast preset: minimal buckets for quick testing (~30s build).
+    /// Fast preset: minimal buckets for quick testing (~2 min build).
     #[must_use]
     pub fn fast() -> Self {
         Self {
             num_hand_buckets_flop: 50,
             num_hand_buckets_turn: 50,
             num_hand_buckets_river: 50,
-            max_flop_boards: 200,
+            max_flop_boards: 10,
             ..Self::standard()
         }
     }
@@ -95,7 +95,7 @@ impl PostflopModelConfig {
             num_hand_buckets_flop: 200,
             num_hand_buckets_turn: 200,
             num_hand_buckets_river: 200,
-            max_flop_boards: 500,
+            max_flop_boards: 200,
             ..Self::standard()
         }
     }
