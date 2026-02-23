@@ -46,16 +46,17 @@ exploration: 0.05
 # ── Postflop model (minimal for fast validation) ─────────────────────────────
 
 postflop_model:
-  num_hand_buckets_flop: 1
-  num_hand_buckets_turn: 1
-  num_hand_buckets_river: 1
-  $max_flop_boards: 3
+  num_hand_buckets_flop: 5
+  num_hand_buckets_turn: 5
+  num_hand_buckets_river: 10
+  #max_flop_boards: 3
   #fixed_flops: ['KhKdTs', 'Kh8s7s', '9s8s5h', 'AsQs9h', 'KsTsTh', 'Js5h4d', '9s6s2s', 'AsQhQd', '6s4h2d', '8s6h2d', 'Ts8h3s', 'As6s5s', 'AsAhKs', '7s5h2s', 'QhJs8s', 'Ks9h3d', 'As7h3d', 'Ah5s4s', 'Js9h6s', 'QsTs2h', '9s7h4d', '8h4s3s', 'Qs7h5d', 'JhTs6s', 'Js4h3s']
-  # fixed_flops: [ '9s8s5h', 'AsQs9h', 'Js5h4d', 'Ks9h3d']
-  fixed_flops: [ '9s8s5h']
+  #fixed_flops: [ 'Kh8s7s', 'AsQs2h', 'Js5h4d', '2s3s4c']
+  fixed_flops: [ 'AhKcQs']
+  # fixed_flops: [ '9s8s5h']
   bet_sizes: [0.5, 1.0, 1.5]
-  max_raises_per_street: 1
+  max_raises_per_street: 3
   postflop_solve_iterations: 10
   postflop_solve_samples: 0
-  canonical_sprs: [1.0]
+  canonical_sprs: [0.5, 1, 2]
   flop_samples_per_iter: 1
