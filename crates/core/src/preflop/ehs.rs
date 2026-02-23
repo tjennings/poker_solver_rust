@@ -306,20 +306,13 @@ pub fn parse_flop(s: &str) -> Option<[Card; 3]> {
 ///
 /// # Errors
 ///
-/// Returns an error if any string is malformed or if duplicate cards appear
-/// across different flops.
+/// Returns an error if any string is malformed or contains duplicate cards
+/// within a single flop.
 pub fn parse_flops(names: &[String]) -> Result<Vec<[Card; 3]>, String> {
-    use std::collections::HashSet;
-    let mut seen = HashSet::new();
     let mut result = Vec::with_capacity(names.len());
     for (i, name) in names.iter().enumerate() {
         let flop = parse_flop(name)
             .ok_or_else(|| format!("invalid flop at index {i}: {name:?}"))?;
-        for &card in &flop {
-            if !seen.insert(card) {
-                return Err(format!("duplicate card {card} in flop at index {i}: {name:?}"));
-            }
-        }
         result.push(flop);
     }
     Ok(result)
