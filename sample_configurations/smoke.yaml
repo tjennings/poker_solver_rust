@@ -1,0 +1,58 @@
+# Smoke test: exercises the full postflop bucketed pipeline in ~1-2 minutes.
+# Tweak these values to debug specific phases.
+#
+# Usage:
+#   cargo run -p poker-solver-trainer --release -- solve-preflop \
+#     -c sample_configurations/smoke.yaml -o smoke_test
+#
+# Validation: AA (hand 0) should raise more than 72o (hand 168).
+
+# ── Training parameters ──────────────────────────────────────────────────────
+
+iterations: 2000
+equity_samples: 10000
+print_every: 500
+
+# ── Game structure ───────────────────────────────────────────────────────────
+
+positions:
+  - name: Small Blind
+    short_name: SB
+  - name: Big Blind
+    short_name: BB
+
+blinds:
+  - [0, 1]
+  - [1, 2]
+
+antes: []
+
+stacks: [50, 50]  # 25 BB
+
+raise_sizes:
+  - [2.5]
+  - [3.0]
+
+raise_cap: 3
+
+# ── DCFR discounting ─────────────────────────────────────────────────────────
+
+dcfr_alpha: 1.5
+dcfr_beta: 0.5
+dcfr_gamma: 2.0
+dcfr_warmup: 0
+exploration: 0.05
+
+# ── Postflop model (minimal for fast validation) ─────────────────────────────
+
+postflop_model:
+  num_hand_buckets_flop: 10
+  num_hand_buckets_turn: 10
+  num_hand_buckets_river: 10
+  max_flop_boards: 3
+  bet_sizes: [0.5, 1.0]
+  max_raises_per_street: 1
+  postflop_solve_iterations: 50
+  postflop_solve_samples: 0
+  canonical_sprs: [1.0, 5.0]
+  flop_samples_per_iter: 1
