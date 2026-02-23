@@ -208,25 +208,25 @@ exploration: 0.05
 
 # Postflop model (optional; omit for raw equity)
 postflop_model:
-  num_hand_buckets_flop: 200
+  num_hand_buckets_flop: 20       # per-flop buckets (169 hands clustered per flop)
   num_hand_buckets_turn: 200
   num_hand_buckets_river: 200
   bet_sizes: [0.5, 1.0, 2.0]
   max_raises_per_street: 1
-  canonical_sprs: [0.5, 1.0, 1.5, 3.0, 5.0, 10.0, 20.0, 50.0]
+  postflop_spr: 5.0               # fixed SPR for shared postflop tree
   postflop_solve_iterations: 1000
   postflop_solve_samples: 100000
-  equity_rollout_fraction: 1.0  # 1.0=exhaustive, 0.1=sample 10% of runouts per hand pair on flop
+  equity_rollout_fraction: 1.0    # 1.0=exhaustive, 0.1=sample 10% of runouts per hand pair on flop
 ```
 
 ### Postflop Model Presets
 
-| Preset | Buckets (flop/turn/river) | Max flop boards | Use case |
-|-|-|-|-|
-| `fast` | 50/50/50 | 10 | Quick testing (~3 min) |
-| `medium` | 200/200/200 | 200 | Development iteration (~10 min) |
-| `standard` | 500/500/500 | all (~1,755) | Production training |
-| `accurate` | 1000/1000/1000 | all (~1,755) | High-fidelity analysis |
+| Preset | Flop buckets (per-flop) | Turn/River buckets (global) | Max flop boards | Use case |
+|-|-|-|-|-|
+| `fast` | 10 | 50/50 | 10 | Quick testing (~3 min) |
+| `medium` | 15 | 200/200 | 200 | Development iteration (~10 min) |
+| `standard` | 20 | 500/500 | all (~1,755) | Production training |
+| `accurate` | 30 | 1000/1000 | all (~1,755) | High-fidelity analysis |
 
 The `max_flop_boards` parameter controls how many canonical flop textures are used for EHS feature computation during hand bucketing. Lower values dramatically speed up the bucketing phase. Set to `0` (or omit) to use all ~1,755 canonical flops. Configurable in YAML via `max_flop_boards: 200`.
 

@@ -32,7 +32,7 @@ pub struct BucketEquity {
 /// use the corresponding street's equity.
 #[derive(Serialize, Deserialize)]
 pub struct StreetEquity {
-    pub flop: BucketEquity,
+    pub flop: Vec<BucketEquity>,
     pub turn: BucketEquity,
     pub river: BucketEquity,
 }
@@ -60,15 +60,11 @@ pub enum BuildProgress {
 /// Turn and river have their own board-count-dependent indexing.
 #[derive(Serialize, Deserialize)]
 pub struct StreetBuckets {
-    /// `flop[hand_idx * num_flop_boards + flop_idx]` → flop bucket ID
-    pub flop: Vec<u16>,
+    /// `flop[flop_idx][hand_idx]` → flop bucket ID (per-flop independent buckets)
+    pub flop: Vec<Vec<u16>>,
     pub num_flop_buckets: u16,
-    /// Number of flop boards used (for 2D indexing into the flat flop vec).
-    pub num_flop_boards: usize,
-    /// `turn[situation_idx]` → turn bucket ID
     pub turn: Vec<u16>,
     pub num_turn_buckets: u16,
-    /// `river[situation_idx]` → river bucket ID
     pub river: Vec<u16>,
     pub num_river_buckets: u16,
 }
@@ -101,16 +97,26 @@ impl BucketingResult {
     /// For river, uses raw scalar equities directly.
     #[must_use]
     pub fn compute_street_equity(&self) -> StreetEquity {
-        let flop_avg: Vec<f64> = self
-            .flop_histograms
-            .iter()
-            .map(|cdf| cdf_to_avg_equity(cdf))
+        let num_flops = self.buckets.flop.len();
+
+        // Per-flop bucket equity
+        let flop: Vec<BucketEquity> = (0..num_flops)
+            .map(|flop_idx| {
+                let assignments = &self.buckets.flop[flop_idx];
+                let num_hands = assignments.len();
+                let avg: Vec<f64> = (0..num_hands)
+                    .map(|h| {
+                        let flat_idx = h * num_flops + flop_idx;
+                        cdf_to_avg_equity(&self.flop_histograms[flat_idx])
+                    })
+                    .collect();
+                compute_bucket_pair_equity(
+                    assignments,
+                    self.buckets.num_flop_buckets as usize,
+                    &avg,
+                )
+            })
             .collect();
-        let flop = compute_bucket_pair_equity(
-            &self.buckets.flop,
-            self.buckets.num_flop_buckets as usize,
-            &flop_avg,
-        );
 
         let turn_avg: Vec<f64> = self
             .turn_histograms
@@ -149,15 +155,24 @@ impl BucketingResult {
         river_boards: &[[Card; 5]],
         rollout_fraction: f64,
     ) -> StreetEquity {
-        let flop_board_refs: Vec<&[Card]> = flops.iter().map(AsRef::as_ref).collect();
-        let flop = compute_pairwise_bucket_equity(
-            hands,
-            &flop_board_refs,
-            &self.buckets.flop,
-            self.buckets.num_flop_buckets as usize,
-            flops.len(),
-            rollout_fraction,
-        );
+        let num_flops = self.buckets.flop.len();
+
+        // Per-flop bucket equity
+        let flop: Vec<BucketEquity> = (0..num_flops)
+            .map(|flop_idx| {
+                let assignments = &self.buckets.flop[flop_idx];
+                let board_refs: Vec<&[Card]> = vec![flops[flop_idx].as_ref()];
+                // Build a flat assignment vec: just hand_idx -> bucket for this one board
+                compute_pairwise_bucket_equity(
+                    hands,
+                    &board_refs,
+                    assignments,
+                    self.buckets.num_flop_buckets as usize,
+                    1, // one board per flop solve
+                    rollout_fraction,
+                )
+            })
+            .collect();
 
         let turn_board_refs: Vec<&[Card]> = turn_boards.iter().map(AsRef::as_ref).collect();
         let turn = compute_pairwise_bucket_equity(
@@ -166,7 +181,7 @@ impl BucketingResult {
             &self.buckets.turn,
             self.buckets.num_turn_buckets as usize,
             turn_boards.len(),
-            1.0, // Turn: always exhaustive (44 river cards, cheap)
+            1.0,
         );
 
         let river_board_refs: Vec<&[Card]> = river_boards.iter().map(AsRef::as_ref).collect();
@@ -176,7 +191,7 @@ impl BucketingResult {
             &self.buckets.river,
             self.buckets.num_river_buckets as usize,
             river_boards.len(),
-            1.0, // River: always exhaustive (single comparison)
+            1.0,
         );
 
         StreetEquity { flop, turn, river }
@@ -184,16 +199,16 @@ impl BucketingResult {
 }
 
 impl StreetBuckets {
-    /// Look up the flop bucket for a given situation index.
-    #[must_use]
-    pub fn flop_bucket(&self, idx: usize) -> u16 {
-        self.flop[idx]
-    }
-
     /// Look up the flop bucket for a given `(hand_idx, flop_idx)` pair.
     #[must_use]
     pub fn flop_bucket_for_hand(&self, hand_idx: usize, flop_idx: usize) -> u16 {
-        self.flop[hand_idx * self.num_flop_boards + flop_idx]
+        self.flop[flop_idx][hand_idx]
+    }
+
+    /// Number of flop boards in this bucketing.
+    #[must_use]
+    pub fn num_flop_boards(&self) -> usize {
+        self.flop.len()
     }
 
     /// Look up the turn bucket for a given situation index.
@@ -653,7 +668,16 @@ pub fn build_street_buckets_independent(
     });
 
     on_progress(BuildProgress::FlopClustering);
-    let flop_assignments = cluster_histograms(&flop_features, num_flop_buckets);
+    // Per-flop clustering: each flop gets its own k-means over 169 hands
+    let num_flops = flops.len();
+    let flop_assignments: Vec<Vec<u16>> = (0..num_flops)
+        .map(|flop_idx| {
+            let per_flop_features: Vec<HistogramFeatures> = (0..num_hands)
+                .map(|h| flop_features[h * num_flops + flop_idx])
+                .collect();
+            cluster_histograms(&per_flop_features, num_flop_buckets)
+        })
+        .collect();
 
     // --- Turn ---
     // Sample a subset of flops to keep turn enumeration feasible.
@@ -714,7 +738,6 @@ pub fn build_street_buckets_independent(
         buckets: StreetBuckets {
             flop: flop_assignments,
             num_flop_buckets,
-            num_flop_boards: flops.len(),
             turn: turn_assignments,
             num_turn_buckets,
             river: river_assignments,
@@ -1385,16 +1408,17 @@ mod tests {
     #[timed_test]
     fn street_buckets_lookup_returns_correct_bucket() {
         let sb = StreetBuckets {
-            flop: vec![0, 1, 2, 0, 1],
+            flop: vec![vec![0, 1, 2], vec![1, 0, 2]],
             num_flop_buckets: 3,
-            num_flop_boards: 5,
             turn: vec![1, 0, 2, 1],
             num_turn_buckets: 3,
             river: vec![0, 0, 1, 1, 2, 2],
             num_river_buckets: 3,
         };
-        assert_eq!(sb.flop_bucket(0), 0);
-        assert_eq!(sb.flop_bucket(2), 2);
+        assert_eq!(sb.flop_bucket_for_hand(0, 0), 0);
+        assert_eq!(sb.flop_bucket_for_hand(2, 0), 2);
+        assert_eq!(sb.flop_bucket_for_hand(0, 1), 1);
+        assert_eq!(sb.num_flop_boards(), 2);
         assert_eq!(sb.turn_bucket(1), 0);
         assert_eq!(sb.river_bucket(5), 2);
     }
@@ -1655,12 +1679,13 @@ mod tests {
         );
         let buckets = &result.buckets;
 
-        // All flop bucket IDs should be in range
-        for &b in &buckets.flop {
-            assert!(b < buckets.num_flop_buckets, "flop bucket {b} >= {}", buckets.num_flop_buckets);
+        assert_eq!(buckets.flop.len(), small_flops.len(), "should have one vec per flop");
+        for (flop_idx, flop_buckets) in buckets.flop.iter().enumerate() {
+            assert_eq!(flop_buckets.len(), hands.len(), "flop {flop_idx} should have 169 hand assignments");
+            for &b in flop_buckets {
+                assert!(b < buckets.num_flop_buckets, "flop bucket {b} >= {}", buckets.num_flop_buckets);
+            }
         }
-        // Flop situation count = hands x flops
-        assert_eq!(buckets.flop.len(), hands.len() * small_flops.len());
         // Turn and river should also have valid assignments
         assert!(!buckets.turn.is_empty(), "turn buckets should not be empty");
         assert!(!buckets.river.is_empty(), "river buckets should not be empty");

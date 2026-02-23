@@ -126,8 +126,6 @@ struct PostflopState {
     abstraction: PostflopAbstraction,
     /// Per-node raise counts for the preflop tree (to determine `PotType`).
     raise_counts: Vec<u8>,
-    /// Maps `raise_count` (0..=3) to canonical SPR index. Precomputed at attach time.
-    spr_indices: Vec<usize>,
 }
 
 /// Preflop DCFR solver with alternating updates.
@@ -203,17 +201,11 @@ impl PreflopSolver {
     ///
     /// When attached, showdown terminals in the preflop tree will use postflop
     /// CFR traversal instead of raw equity lookup.
-    pub fn attach_postflop(&mut self, abstraction: PostflopAbstraction, config: &PreflopConfig) {
+    pub fn attach_postflop(&mut self, abstraction: PostflopAbstraction, _config: &PreflopConfig) {
         let raise_counts = precompute_raise_counts(&self.tree);
-        let actual_sprs = compute_raise_count_sprs(config);
-        let spr_indices: Vec<usize> = actual_sprs
-            .iter()
-            .map(|&s| nearest_spr_index(&abstraction.canonical_sprs, s))
-            .collect();
         self.postflop = Some(PostflopState {
             abstraction,
             raise_counts,
-            spr_indices,
         });
     }
 
@@ -653,86 +645,24 @@ fn postflop_showdown_value(
 ) -> f64 {
     let raise_count = pf_state.raise_counts[preflop_node_idx as usize];
     let pot_type = PotType::from_raise_count(raise_count);
-    let spr_idx = pf_state.spr_indices[raise_count.min(3) as usize];
 
     // Map physical player to tree position (0=OOP, 1=IP)
     let ip_player = pot_type.default_ip_player();
     let hero_tree_pos = u8::from(hero_pos == ip_player);
 
-    // Average postflop EV across all flop textures.
-    let num_tex = pf_state.abstraction.buckets.num_flop_boards;
+    // Average postflop EV across all flop boards with per-flop bucket lookup.
+    let num_flops = pf_state.abstraction.buckets.num_flop_boards();
     let mut ev_sum = 0.0;
-    for tex in 0..num_tex {
-        let hb = pf_state.abstraction.buckets.flop_bucket_for_hand(hero_hand as usize, tex);
-        let ob = pf_state.abstraction.buckets.flop_bucket_for_hand(opp_hand as usize, tex);
-        ev_sum += pf_state.abstraction.values.get_by_spr(spr_idx, hero_tree_pos, hb, ob);
+    for flop_idx in 0..num_flops {
+        let hb = pf_state.abstraction.buckets.flop_bucket_for_hand(hero_hand as usize, flop_idx);
+        let ob = pf_state.abstraction.buckets.flop_bucket_for_hand(opp_hand as usize, flop_idx);
+        ev_sum += pf_state.abstraction.values.get_by_flop(flop_idx, hero_tree_pos, hb, ob);
     }
     #[allow(clippy::cast_precision_loss)]
-    let pf_ev_frac = ev_sum / num_tex as f64;
+    let pf_ev_frac = ev_sum / num_flops as f64;
 
     // Scale: postflop EV fraction × actual pot size, offset by hero's investment.
     pf_ev_frac * f64::from(pot) + (f64::from(pot) / 2.0 - hero_inv)
-}
-
-/// Find the index of the nearest canonical SPR by log-distance.
-fn nearest_spr_index(canonical_sprs: &[f64], actual_spr: f64) -> usize {
-    let ln_actual = actual_spr.max(0.01).ln();
-    canonical_sprs
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            let da = (a.ln() - ln_actual).abs();
-            let db = (b.ln() - ln_actual).abs();
-            da.partial_cmp(&db).unwrap()
-        })
-        .map_or(0, |(i, _)| i)
-}
-
-/// Compute the actual SPR for each raise count from the preflop config.
-///
-/// Returns a Vec where index = `raise_count` (0=limped, 1=raised, 2=3bet, 3=4bet+).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn compute_raise_count_sprs(config: &PreflopConfig) -> Vec<f64> {
-    let stack = config.stacks[0];
-    let bb = config.blinds.iter().map(|(_, amt)| *amt).max().unwrap_or(2);
-
-    let mut sprs = Vec::with_capacity(4);
-
-    // raise_count=0 (Limped): SB completes to BB
-    let limped_invest = bb;
-    let limped_pot = 2 * limped_invest;
-    let limped_remaining = stack.saturating_sub(limped_invest);
-    sprs.push(f64::from(limped_remaining) / f64::from(limped_pot).max(1.0));
-
-    // raise_count=1 (Raised): first raise size * BB
-    let raise_mult = config
-        .raise_sizes
-        .first()
-        .and_then(|v| v.first().copied())
-        .unwrap_or(2.5);
-    let raised_invest = (f64::from(bb) * raise_mult) as u32;
-    let raised_pot = 2 * raised_invest;
-    let raised_remaining = stack.saturating_sub(raised_invest);
-    sprs.push(f64::from(raised_remaining) / f64::from(raised_pot).max(1.0));
-
-    // raise_count=2 (3-bet): second raise size * raised amount
-    let threebet_mult = config
-        .raise_sizes
-        .get(1)
-        .and_then(|v| v.first().copied())
-        .unwrap_or(3.0);
-    let threebet_invest = (f64::from(raised_invest) * threebet_mult) as u32;
-    let threebet_pot = 2 * threebet_invest;
-    let threebet_remaining = stack.saturating_sub(threebet_invest);
-    sprs.push(f64::from(threebet_remaining) / f64::from(threebet_pot).max(1.0));
-
-    // raise_count=3+ (4-bet+): 3x the 3bet size, cap at stack
-    let fourbet_invest = (threebet_invest * 3).min(stack);
-    let fourbet_pot = 2 * fourbet_invest;
-    let fourbet_remaining = stack.saturating_sub(fourbet_invest);
-    sprs.push(f64::from(fourbet_remaining) / f64::from(fourbet_pot).max(1.0));
-
-    sprs
 }
 
 /// Precompute the raise count at every node in the preflop tree.
@@ -1052,30 +982,4 @@ mod tests {
         }
     }
 
-    #[timed_test]
-    fn nearest_spr_index_finds_closest_by_log_distance() {
-        let sprs = vec![0.5, 1.0, 1.5, 3.0, 5.0, 10.0, 20.0, 50.0];
-        assert_eq!(nearest_spr_index(&sprs, 0.3), 0); // closest to 0.5
-        assert_eq!(nearest_spr_index(&sprs, 0.7), 0); // ln(0.7) closer to ln(0.5) than ln(1.0)
-        assert_eq!(nearest_spr_index(&sprs, 100.0), 7); // closest to 50.0
-    }
-
-    #[timed_test]
-    fn compute_raise_count_sprs_25bb() {
-        let config = PreflopConfig::heads_up(25); // stacks = 50
-        let sprs = compute_raise_count_sprs(&config);
-        assert_eq!(sprs.len(), 4);
-        // Limped: pot=4, remaining=48, SPR=12
-        assert!(
-            (sprs[0] - 12.0).abs() < 0.1,
-            "limped SPR={}",
-            sprs[0]
-        );
-        // Raised (2.5x): invest=5, pot=10, remaining=45, SPR=4.5
-        assert!(
-            (sprs[1] - 4.5).abs() < 0.1,
-            "raised SPR={}",
-            sprs[1]
-        );
-    }
 }

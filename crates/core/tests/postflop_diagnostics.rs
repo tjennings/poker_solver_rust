@@ -26,11 +26,13 @@ fn diag_bucket_monotonicity() {
         &hands, &flops, 10, 10, 10, &|_| {},
     );
 
+    // Use first flop's bucket assignments as representative
+    let first_flop_buckets = &result.buckets.flop[0];
     let flop_ehs: Vec<f64> = result.flop_histograms.iter()
         .map(|cdf| cdf_to_avg_equity(cdf))
         .collect();
     let equity = compute_bucket_pair_equity(
-        &result.buckets.flop, result.buckets.num_flop_buckets as usize, &flop_ehs,
+        first_flop_buckets, result.buckets.num_flop_buckets as usize, &flop_ehs,
     );
 
     let n = result.buckets.num_flop_buckets as usize;
@@ -63,11 +65,13 @@ fn diag_street_equity_sanity() {
         &hands, &flops, 10, 10, 10, &|_| {},
     );
 
+    // Use first flop's bucket assignments as representative
+    let first_flop_buckets = &result.buckets.flop[0];
     let flop_ehs: Vec<f64> = result.flop_histograms.iter()
         .map(|cdf| cdf_to_avg_equity(cdf))
         .collect();
     let flop_equity = compute_bucket_pair_equity(
-        &result.buckets.flop, result.buckets.num_flop_buckets as usize, &flop_ehs,
+        first_flop_buckets, result.buckets.num_flop_buckets as usize, &flop_ehs,
     );
 
     let n = result.buckets.num_flop_buckets as usize;
@@ -114,7 +118,7 @@ fn diag_value_table_strong_beats_weak() {
         num_hand_buckets_flop: 5,
         num_hand_buckets_turn: 5,
         num_hand_buckets_river: 5,
-        canonical_sprs: vec![5.0],
+        postflop_spr: 5.0,
         postflop_solve_iterations: 100,
         postflop_solve_samples: 0,
         bet_sizes: vec![1.0],
@@ -129,13 +133,15 @@ fn diag_value_table_strong_beats_weak() {
     ).expect("build should succeed");
 
     let n = config.num_hand_buckets_flop as usize;
+    // Use first flop's equity table as representative
+    let flop_eq = &abstraction.street_equity.flop[0];
     let mut best_bucket = 0;
     let mut worst_bucket = 0;
     let mut best_eq = 0.0f32;
     let mut worst_eq = 1.0f32;
     for b in 0..n {
         let avg: f32 = (0..n)
-            .map(|o| abstraction.street_equity.flop.get(b, o))
+            .map(|o| flop_eq.get(b, o))
             .sum::<f32>() / n as f32;
         if avg > best_eq { best_eq = avg; best_bucket = b; }
         if avg < worst_eq { worst_eq = avg; worst_bucket = b; }
@@ -144,10 +150,10 @@ fn diag_value_table_strong_beats_weak() {
     eprintln!("strongest bucket: {best_bucket} (avg eq {best_eq:.3})");
     eprintln!("weakest bucket: {worst_bucket} (avg eq {worst_eq:.3})");
 
-    let strong_ev = abstraction.values.get_by_spr(
+    let strong_ev = abstraction.values.get_by_flop(
         0, 0, best_bucket as u16, worst_bucket as u16,
     );
-    let weak_ev = abstraction.values.get_by_spr(
+    let weak_ev = abstraction.values.get_by_flop(
         0, 0, worst_bucket as u16, best_bucket as u16,
     );
 
@@ -166,7 +172,7 @@ fn diag_end_to_end_aa_beats_72o() {
         num_hand_buckets_flop: 10,
         num_hand_buckets_turn: 10,
         num_hand_buckets_river: 10,
-        canonical_sprs: vec![1.0, 5.0],
+        postflop_spr: 5.0,
         postflop_solve_iterations: 50,
         postflop_solve_samples: 0,
         bet_sizes: vec![0.5, 1.0],

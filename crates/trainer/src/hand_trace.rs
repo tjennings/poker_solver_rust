@@ -34,14 +34,8 @@ struct TextureTrace {
 
 #[derive(Serialize)]
 struct PostflopEvTrace {
-    by_spr: Vec<SprEv>,
-}
-
-#[derive(Serialize)]
-struct SprEv {
-    spr: f64,
-    sb: f64,
-    bb: f64,
+    avg_sb: f64,
+    avg_bb: f64,
 }
 
 #[derive(Serialize)]
@@ -67,7 +61,7 @@ pub fn run_with_abstraction(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let all_hands_vec: Vec<CanonicalHand> = all_hands().collect();
     let flops = &abstraction.flops;
-    let num_flop_boards = abstraction.buckets.num_flop_boards;
+    let num_flop_boards = abstraction.buckets.num_flop_boards();
     let num_buckets = abstraction.buckets.num_flop_buckets as usize;
 
     eprintln!("Tracing all {} canonical hands...", all_hands_vec.len());
@@ -99,9 +93,8 @@ fn build_trace_output(
             let mut textures = Vec::with_capacity(num_textures);
             let mut min_bucket = u16::MAX;
             let mut max_bucket = 0_u16;
-            let mid_spr_idx = abstraction.canonical_sprs.len() / 2;
-            let mut ev_mid_sb_sum = 0.0_f64;
-            let mut ev_mid_bb_sum = 0.0_f64;
+            let mut ev_sb_sum = 0.0_f64;
+            let mut ev_bb_sum = 0.0_f64;
             let mut ev_count = 0_usize;
 
             #[allow(clippy::needless_range_loop)]
@@ -111,8 +104,8 @@ fn build_trace_output(
 
                 min_bucket = min_bucket.min(bucket);
                 max_bucket = max_bucket.max(bucket);
-                ev_mid_sb_sum += postflop_ev.by_spr[mid_spr_idx].sb;
-                ev_mid_bb_sum += postflop_ev.by_spr[mid_spr_idx].bb;
+                ev_sb_sum += postflop_ev.avg_sb;
+                ev_bb_sum += postflop_ev.avg_bb;
                 ev_count += 1;
 
                 let flop_str = format_flop(&flops[tex_id]);
@@ -127,8 +120,8 @@ fn build_trace_output(
 
             let avg_ev_mid_spr = if ev_count > 0 {
                 PositionEv {
-                    sb: ev_mid_sb_sum / ev_count as f64,
-                    bb: ev_mid_bb_sum / ev_count as f64,
+                    sb: ev_sb_sum / ev_count as f64,
+                    bb: ev_bb_sum / ev_count as f64,
                 }
             } else {
                 PositionEv { sb: 0.0, bb: 0.0 }
@@ -160,26 +153,23 @@ fn compute_postflop_ev(
     hero_bucket: u16,
     num_buckets: usize,
 ) -> PostflopEvTrace {
-    let by_spr: Vec<SprEv> = abstraction
-        .canonical_sprs
-        .iter()
-        .enumerate()
-        .map(|(spr_idx, &spr)| {
-            let mut evs = [0.0_f64; 2];
-            for pos in 0..2_u8 {
-                let sum: f64 = (0..num_buckets as u16)
-                    .map(|opp| abstraction.values.get_by_spr(spr_idx, pos, hero_bucket, opp))
-                    .sum();
-                evs[pos as usize] = sum / num_buckets as f64;
-            }
-            SprEv {
-                spr,
-                sb: evs[0],
-                bb: evs[1],
-            }
-        })
-        .collect();
-    PostflopEvTrace { by_spr }
+    let num_flops = abstraction.values.num_flops();
+    let mut evs = [0.0_f64; 2];
+    for pos in 0..2_u8 {
+        let sum: f64 = (0..num_flops)
+            .flat_map(|flop_idx| {
+                (0..num_buckets as u16)
+                    .map(move |opp| abstraction.values.get_by_flop(flop_idx, pos, hero_bucket, opp))
+            })
+            .sum();
+        #[allow(clippy::cast_precision_loss)]
+        let denom = (num_flops * num_buckets) as f64;
+        evs[pos as usize] = sum / denom;
+    }
+    PostflopEvTrace {
+        avg_sb: evs[0],
+        avg_bb: evs[1],
+    }
 }
 
 fn format_card(card: Card) -> String {

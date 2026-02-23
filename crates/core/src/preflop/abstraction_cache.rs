@@ -138,7 +138,6 @@ fn clone_street_buckets(b: &StreetBuckets) -> StreetBuckets {
     StreetBuckets {
         flop: b.flop.clone(),
         num_flop_buckets: b.num_flop_buckets,
-        num_flop_boards: b.num_flop_boards,
         turn: b.turn.clone(),
         num_turn_buckets: b.num_turn_buckets,
         river: b.river.clone(),
@@ -154,7 +153,7 @@ fn clone_street_equity(e: &StreetEquity) -> StreetEquity {
         num_buckets: eq.num_buckets,
     };
     StreetEquity {
-        flop: clone_eq(&e.flop),
+        flop: e.flop.iter().map(|eq| clone_eq(eq)).collect(),
         turn: clone_eq(&e.turn),
         river: clone_eq(&e.river),
     }
@@ -181,9 +180,8 @@ mod tests {
 
     fn minimal_buckets() -> StreetBuckets {
         StreetBuckets {
-            flop: vec![0u16],
+            flop: vec![vec![0u16]],
             num_flop_buckets: 1,
-            num_flop_boards: 1,
             turn: vec![0u16],
             num_turn_buckets: 1,
             river: vec![0u16],
@@ -198,7 +196,7 @@ mod tests {
             num_buckets: 1,
         };
         StreetEquity {
-            flop: BucketEquity { equity: eq.equity.clone(), num_buckets: eq.num_buckets },
+            flop: vec![BucketEquity { equity: eq.equity.clone(), num_buckets: eq.num_buckets }],
             turn: BucketEquity { equity: eq.equity.clone(), num_buckets: eq.num_buckets },
             river: eq,
         }
@@ -217,7 +215,7 @@ mod tests {
 
         assert_eq!(loaded_buckets.num_flop_buckets, buckets.num_flop_buckets);
         assert_eq!(loaded_buckets.flop, buckets.flop);
-        assert_eq!(loaded_buckets.num_flop_boards, buckets.num_flop_boards);
+        assert_eq!(loaded_buckets.flop.len(), buckets.flop.len());
         assert_eq!(loaded_equity.river.num_buckets, equity.river.num_buckets);
         assert!((loaded_equity.river.get(0, 0) - 0.5).abs() < 1e-6);
     }

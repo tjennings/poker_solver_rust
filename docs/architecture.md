@@ -2,19 +2,19 @@
 
 ## Overview
 
-The solver finds a Nash equilibrium for heads-up no-limit Texas Hold'em by splitting the game into two phases: a **preflop solver** that uses Linear CFR (LCFR) over 169 canonical hand matchups, and an **abstracted postflop model** that provides expected values at preflop showdown boundaries. The postflop model uses imperfect-recall card abstraction (Pluribus-style) with independent per-street k-means clustering on equity histogram CDFs.
+The solver finds a Nash equilibrium for heads-up no-limit Texas Hold'em by splitting the game into two phases: a **preflop solver** that uses Linear CFR (LCFR) over 169 canonical hand matchups, and an **abstracted postflop model** that provides expected values at preflop showdown boundaries. The postflop model uses imperfect-recall card abstraction (Pluribus-style) with per-flop hand bucketing and a shared tree template at a fixed SPR.
 
 ```
 PreflopConfig ─► PreflopTree ─► PreflopSolver
                                       │
                                       ▼
                               PostflopAbstraction
-                              ┌───────────────────────┐
-                              │ StreetBuckets          │  ◄── independent k-means
-                              │ StreetEquity           │  ◄── bucket-pair equity tables
-                              │ PostflopTrees (per SPR)│  ◄── one tree per canonical SPR
-                              │ PostflopValues         │  ◄── solved EV table
-                              └───────────────────────┘
+                              ┌───────────────────────────┐
+                              │ StreetBuckets (per-flop)   │  ◄── independent k-means per flop
+                              │ StreetEquity (per-flop)    │  ◄── bucket-pair equity per flop
+                              │ PostflopTree (shared)      │  ◄── single tree at fixed SPR
+                              │ PostflopValues (per-flop)  │  ◄── solved EV table per flop
+                              └───────────────────────────┘
 ```
 
 ## Project Structure
@@ -100,15 +100,15 @@ The postflop model replaces raw equity evaluation at preflop showdown terminals 
 
 Independent per-street k-means clustering on equity histogram CDF features:
 
-**Flop:** For each (hand, canonical_flop) pair, enumerate 47 turn cards, compute equity vs uniform opponent for each, bin into 10 equal-width bins over [0,1], convert to CDF. K-means on the 10-dim CDF vectors.
+**Flop (per-flop):** For each canonical flop, cluster the 169 hands independently into N buckets. Each (hand, flop) pair's feature vector is the 10-bin equity CDF computed by enumerating 47 turn cards and computing equity vs uniform opponent. This gives each flop its own bucket assignments — "top pair on K72r" and "top pair on 987ss" get separate bucket IDs.
 
-**Turn:** For each (hand, flop, turn_card), enumerate 46 river cards, same histogram → CDF → k-means process.
+**Turn:** For each (hand, flop, turn_card), enumerate 46 river cards, same histogram → CDF → k-means process. Global clustering across all turns.
 
-**River:** Raw equity scalar. K-means on 1D values.
+**River:** Raw equity scalar. K-means on 1D values. Global clustering.
 
 The CDF representation means L2 distance equals Earth Mover's Distance for 1D distributions.
 
-**Output:** `StreetBuckets` — flat `Vec<u16>` per street mapping situation index → bucket ID.
+**Output:** `StreetBuckets` — `flop: Vec<Vec<u16>>` where `flop[flop_idx][hand_idx] → bucket`. Turn/river remain flat global `Vec<u16>`.
 
 **Files:**
 - Histogram CDFs & canonical boards: `crates/core/src/preflop/ehs.rs`
@@ -116,21 +116,20 @@ The CDF representation means L2 distance equals Earth Mover's Distance for 1D di
 
 ### Stage 2: Equity Tables
 
-`StreetEquity` holds per-street `BucketEquity` tables — 2D arrays `[bucket_a][bucket_b] → f32` storing average equity when bucket A faces bucket B. Used as leaf-node estimates during postflop CFR.
+`StreetEquity` holds per-street `BucketEquity` tables. Flop equity is per-flop: `flop: Vec<BucketEquity>` — one N×N table per canonical flop. Turn and river equity tables are global. Each `BucketEquity` is a 2D array `[bucket_a][bucket_b] → f32` storing average equity when bucket A faces bucket B. Used as leaf-node estimates during postflop CFR.
 
-**Computation:** Bucket-pair equity is derived from the histogram CDFs already computed during Stage 1 (no second EHS pass needed):
+**Computation:** Bucket-pair equity uses true pairwise hand-vs-hand evaluation:
 
-1. **Per-situation average equity:** Extract from each CDF: `avg_eq = (1/BINS) * Σ(1 - cdf[i])`. For river, use raw scalar equity directly.
-2. **Per-bucket centroid:** Group situations by bucket assignment, average their equities.
-3. **Pair equity:** `equity(a, b) = centroid[a] / (centroid[a] + centroid[b])`. This approximation correctly orders buckets by strength and guarantees zero-sum symmetry.
+1. **Per-flop:** For each flop, enumerate all hand pairs assigned to each bucket pair, evaluate equity via exhaustive runout enumeration, and average to get `equity(a, b)`.
+2. **Turn/River:** Same pairwise evaluation using global bucket assignments.
 
 The intermediate features are returned from `build_street_buckets_independent` in a `BucketingResult` struct to avoid recomputation.
 
 **File:** `crates/core/src/preflop/hand_buckets.rs`
 
-### Stage 3: Postflop Trees
+### Stage 3: Postflop Tree
 
-One tree per canonical SPR value. Preflop pot types (Limped/Raised/3Bet/4Bet+) map to the nearest canonical SPR by log-distance.
+A single shared tree template at a fixed SPR (`postflop_spr`, default 5.0). All per-flop solves share this tree structure.
 
 Each tree has three streets of Decision nodes (OOP=0, IP=1), Chance nodes at street transitions, and Terminals (Fold/Showdown). Bet sizes are pot fractions.
 
@@ -138,20 +137,22 @@ Each tree has three streets of Decision nodes (OOP=0, IP=1), Chance nodes at str
 
 ### Stage 4: Postflop Solve
 
-MCCFR per-SPR tree with bucket-level abstraction:
-- Parallel iterations over all (or sampled) bucket pairs
+MCCFR per-flop with bucket-level abstraction:
+- Embarrassingly parallel: one independent solve per canonical flop
+- Each solve uses the shared tree template but its own per-flop equity table
 - Imperfect recall: each street's decision nodes use that street's independent bucket ID (player "forgets" prior-street identity)
-- Output: `PostflopValues` — flat 4D array `[spr_idx][hero_pos][hero_bucket][opp_bucket] → EV`
+- At flop terminals: use per-flop `BucketEquity`; at turn/river: use global equity tables
+- Output: `PostflopValues` — flat 4D array `[flop_idx][hero_pos][hero_bucket][opp_bucket] → EV`
 
 **File:** `crates/core/src/preflop/postflop_abstraction.rs`
 
 ### Runtime Integration
 
 At each preflop showdown terminal:
-1. Raise count → `PotType` → nearest canonical SPR index
-2. Preflop hands → flop bucket IDs (via `StreetBuckets`)
-3. Lookup: `PostflopValues::get_by_spr(spr_idx, hero_pos, hero_bucket, opp_bucket) → EV fraction`
-4. Scale: `EV_fraction * actual_pot + (pot/2 - hero_investment)`
+1. Loop over all canonical flops
+2. Per flop: look up hero and opponent bucket IDs via `StreetBuckets::flop_bucket_for_hand(hand_idx, flop_idx)`
+3. Lookup: `PostflopValues::get_by_flop(flop_idx, hero_pos, hero_bucket, opp_bucket) → EV fraction`
+4. Average across flops, then scale: `EV_fraction * actual_pot + (pot/2 - hero_investment)`
 
 ## Key Control Parameters
 
@@ -173,13 +174,13 @@ At each preflop showdown terminal:
 
 | Parameter | Default | Presets (fast/med/std/acc) | Description |
 |-|-|-|-|
-| `num_hand_buckets_flop` | 500 | 50/200/500/1000 | Flop k-means clusters |
-| `num_hand_buckets_turn` | 500 | 50/200/500/1000 | Turn k-means clusters |
-| `num_hand_buckets_river` | 500 | 50/200/500/1000 | River k-means clusters |
+| `num_hand_buckets_flop` | 20 | 10/15/20/30 | Per-flop k-means clusters (169 hands per flop) |
+| `num_hand_buckets_turn` | 500 | 50/200/500/1000 | Turn k-means clusters (global) |
+| `num_hand_buckets_river` | 500 | 50/200/500/1000 | River k-means clusters (global) |
 | `bet_sizes` | [0.5, 1.0] | — | Pot-fraction bet sizes |
 | `max_raises_per_street` | 1 | — | Raise cap per postflop street |
-| `canonical_sprs` | [0.5..50.0] | — | SPR values for tree building |
-| `postflop_solve_iterations` | 200 | — | MCCFR iterations per SPR tree |
+| `postflop_spr` | 5.0 | — | Fixed SPR for shared postflop tree |
+| `postflop_solve_iterations` | 200 | — | MCCFR iterations per flop |
 | `postflop_solve_samples` | 0 | — | Bucket pairs per iteration (0 = all) |
 
 ## Caching
@@ -196,5 +197,4 @@ At each preflop showdown terminal:
 ## Known Limitations
 
 - **Preflop-only model limitation:** The preflop solver with postflop equity reference finds a limp-trap equilibrium (AA ~30% raise) rather than full-game GTO (AA 100% raise). This is inherent to the preflop-only model, not a bug.
-- **Placeholder equity tables:** `build_street_equity_from_buckets()` currently returns 0.5 for all bucket pairs. Will be replaced with real computed equity when abstraction caching is re-enabled.
 - **No real-time subgame solving yet:** The postflop model is a static blueprint. Pluribus-style real-time search is planned but not implemented.

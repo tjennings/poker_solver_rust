@@ -38,8 +38,7 @@ pub fn run(config: &PostflopModelConfig, cache_dir: &Path, json: bool) -> bool {
 
     eprintln!("Loading or building abstraction...");
     let (buckets, street_equity) = load_or_build(config, cache_dir);
-    let equity = &street_equity.flop;
-    let num_flop_boards = buckets.num_flop_boards;
+    let num_flop_boards = buckets.num_flop_boards();
 
     let hands: Vec<CanonicalHand> = all_hands().collect();
 
@@ -63,6 +62,8 @@ pub fn run(config: &PostflopModelConfig, cache_dir: &Path, json: bool) -> bool {
 
     let nb = num_buckets as usize;
     let nt = num_textures;
+    // Use first flop's equity table as representative for diagnostics.
+    let equity = &street_equity.flop[0];
     let results = vec![
         check_bucket_sizes(&assignments, num_buckets, nt),
         check_silhouette(&features, &assignments, &centroids, nb),

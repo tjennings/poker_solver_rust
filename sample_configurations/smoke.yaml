@@ -58,5 +58,5 @@ postflop_model:
   max_raises_per_street: 3
   postflop_solve_iterations: 10
   postflop_solve_samples: 0
-  canonical_sprs: [0.5, 1, 2]
+  postflop_spr: 5.0
   flop_samples_per_iter: 1
