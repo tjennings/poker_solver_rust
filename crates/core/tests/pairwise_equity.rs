@@ -49,7 +49,7 @@ fn pairwise_river_aa_dominates_72o() {
     assignments[trash_idx] = 1;
 
     let boards: Vec<&[Card]> = vec![river_board];
-    let eq = compute_pairwise_bucket_equity(&hands, &boards, &assignments, 3, num_boards, 0);
+    let eq = compute_pairwise_bucket_equity(&hands, &boards, &assignments, 3, num_boards, 1.0);
 
     let aa_vs_72o = eq.get(0, 1);
     assert!(
@@ -74,7 +74,7 @@ fn pairwise_self_equity_approximately_half() {
     let num_boards = 1;
     let assignments = vec![0u16; hands.len() * num_boards];
     let boards: Vec<&[Card]> = vec![river_board];
-    let eq = compute_pairwise_bucket_equity(&hands, &boards, &assignments, 1, num_boards, 0);
+    let eq = compute_pairwise_bucket_equity(&hands, &boards, &assignments, 1, num_boards, 1.0);
 
     let self_eq = eq.get(0, 0);
     assert!(
@@ -103,7 +103,7 @@ fn pairwise_flop_nut_straight_dominates() {
     assignments[weak_idx] = 1;
 
     let boards: Vec<&[Card]> = vec![flop];
-    let eq = compute_pairwise_bucket_equity(&hands, &boards, &assignments, 3, num_boards, 0);
+    let eq = compute_pairwise_bucket_equity(&hands, &boards, &assignments, 3, num_boards, 1.0);
 
     let straight_vs_weak = eq.get(0, 1);
     assert!(
@@ -131,9 +131,9 @@ fn pairwise_sampled_close_to_exhaustive() {
     assignments[weak_idx] = 1;
 
     let boards: Vec<&[Card]> = vec![flop];
-    let exact = compute_pairwise_bucket_equity(&hands, &boards, &assignments, 3, num_boards, 0);
+    let exact = compute_pairwise_bucket_equity(&hands, &boards, &assignments, 3, num_boards, 1.0);
     let sampled =
-        compute_pairwise_bucket_equity(&hands, &boards, &assignments, 3, num_boards, 200);
+        compute_pairwise_bucket_equity(&hands, &boards, &assignments, 3, num_boards, 0.2);
 
     let diff = (exact.get(0, 1) - sampled.get(0, 1)).abs();
     assert!(
@@ -166,7 +166,7 @@ fn pairwise_more_extreme_than_centroid_ratio() {
 
     // Pairwise equity.
     let boards: Vec<&[Card]> = vec![river_board];
-    let pairwise = compute_pairwise_bucket_equity(&hands, &boards, &assignments, 3, num_boards, 0);
+    let pairwise = compute_pairwise_bucket_equity(&hands, &boards, &assignments, 3, num_boards, 1.0);
 
     // Old centroid-ratio equity (for comparison).
     // Fake avg equities: AA ~0.85, 72o ~0.10, others 0.5.

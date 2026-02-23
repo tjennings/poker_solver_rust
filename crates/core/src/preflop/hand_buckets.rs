@@ -138,8 +138,8 @@ impl BucketingResult {
     /// For each street, enumerates all valid combo pairs per bucket pair and evaluates
     /// who wins on each board.
     ///
-    /// Turn/river are always exhaustive (cheap). Flop uses `rollout_samples` for
-    /// optional sampling (0 = exhaustive).
+    /// Turn/river are always exhaustive (cheap). Flop uses `rollout_fraction` for
+    /// optional sampling (1.0 = exhaustive, 0.1 = 10% of runouts).
     #[must_use]
     pub fn compute_pairwise_street_equity(
         &self,
@@ -147,7 +147,7 @@ impl BucketingResult {
         flops: &[[Card; 3]],
         turn_boards: &[[Card; 4]],
         river_boards: &[[Card; 5]],
-        rollout_samples: u32,
+        rollout_fraction: f64,
     ) -> StreetEquity {
         let flop_board_refs: Vec<&[Card]> = flops.iter().map(AsRef::as_ref).collect();
         let flop = compute_pairwise_bucket_equity(
@@ -156,7 +156,7 @@ impl BucketingResult {
             &self.buckets.flop,
             self.buckets.num_flop_buckets as usize,
             flops.len(),
-            rollout_samples,
+            rollout_fraction,
         );
 
         let turn_board_refs: Vec<&[Card]> = turn_boards.iter().map(AsRef::as_ref).collect();
@@ -166,7 +166,7 @@ impl BucketingResult {
             &self.buckets.turn,
             self.buckets.num_turn_buckets as usize,
             turn_boards.len(),
-            0, // Turn: always exhaustive (44 river cards, cheap)
+            1.0, // Turn: always exhaustive (44 river cards, cheap)
         );
 
         let river_board_refs: Vec<&[Card]> = river_boards.iter().map(AsRef::as_ref).collect();
@@ -176,7 +176,7 @@ impl BucketingResult {
             &self.buckets.river,
             self.buckets.num_river_buckets as usize,
             river_boards.len(),
-            0, // River: always exhaustive (single comparison)
+            1.0, // River: always exhaustive (single comparison)
         );
 
         StreetEquity { flop, turn, river }
@@ -348,7 +348,7 @@ pub fn compute_bucket_pair_equity(
 /// * `assignments` - flat: `hand_idx * num_boards + board_idx` → bucket
 /// * `num_buckets` - number of buckets
 /// * `num_boards` - number of boards
-/// * `rollout_samples` - 0 = exhaustive enumeration, >0 = sample this many runouts per pair (flop only)
+/// * `rollout_fraction` - 1.0 = exhaustive enumeration, <1.0 = sample that fraction of runouts per pair (flop only)
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines, clippy::missing_panics_doc, clippy::many_single_char_names)]
 pub fn compute_pairwise_bucket_equity(
@@ -357,7 +357,7 @@ pub fn compute_pairwise_bucket_equity(
     assignments: &[u16],
     num_buckets: usize,
     num_boards: usize,
-    rollout_samples: u32,
+    rollout_fraction: f64,
 ) -> BucketEquity {
     assert_eq!(assignments.len(), hands.len() * num_boards);
 
@@ -408,7 +408,7 @@ pub fn compute_pairwise_bucket_equity(
                                 combo_b,
                                 board,
                                 board_len,
-                                rollout_samples,
+                                rollout_fraction,
                             );
                             wins_a += w;
                             ties += t;
@@ -460,13 +460,13 @@ pub fn compute_pairwise_bucket_equity(
 ///
 /// - River (5-card board): single rank comparison.
 /// - Turn (4-card board): enumerate all live river cards.
-/// - Flop (3-card board): exhaustive or sampled runouts depending on `rollout_samples`.
+/// - Flop (3-card board): exhaustive or sampled runouts depending on `rollout_fraction`.
 fn evaluate_combo_pair(
     combo_a: [Card; 2],
     combo_b: [Card; 2],
     board: &[Card],
     board_len: usize,
-    rollout_samples: u32,
+    rollout_fraction: f64,
 ) -> (u64, u64, u64) {
     match board_len {
         5 => {
@@ -499,11 +499,14 @@ fn evaluate_combo_pair(
         3 => {
             // Flop: enumerate or sample (turn, river) runouts.
             let live = live_cards(&[combo_a[0], combo_a[1], combo_b[0], combo_b[1]], board);
-            if rollout_samples == 0 || (live.len() * (live.len() - 1) / 2) <= rollout_samples as usize {
+            let total_runouts = live.len() * (live.len() - 1) / 2;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let actual_samples = (rollout_fraction * total_runouts as f64).round() as u32;
+            if actual_samples >= total_runouts as u32 {
                 // Exhaustive: all C(live, 2) runouts.
                 flop_exhaustive(combo_a, combo_b, board, &live)
             } else {
-                flop_sampled(combo_a, combo_b, board, &live, rollout_samples)
+                flop_sampled(combo_a, combo_b, board, &live, actual_samples)
             }
         }
         _ => (0, 0, 0),

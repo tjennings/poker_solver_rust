@@ -428,7 +428,7 @@ fn load_or_build_abstraction(
         &flops,
         &result.turn_boards,
         &result.river_boards,
-        config.equity_rollout_samples,
+        config.equity_rollout_fraction,
     );
 
     Ok((result.buckets, street_equity, flops))
