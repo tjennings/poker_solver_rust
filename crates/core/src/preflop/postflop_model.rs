@@ -16,7 +16,7 @@ fn default_num_hand_buckets_river() -> u16 {
 fn default_bet_sizes() -> Vec<f32> {
     vec![0.5, 1.0]
 }
-fn default_raises_per_street() -> u8 {
+fn default_max_raises_per_street() -> u8 {
     1
 }
 fn default_flop_samples_per_iter() -> u16 {
@@ -49,8 +49,8 @@ pub struct PostflopModelConfig {
     // Postflop tree structure
     #[serde(default = "default_bet_sizes")]
     pub bet_sizes: Vec<f32>,
-    #[serde(default = "default_raises_per_street")]
-    pub raises_per_street: u8,
+    #[serde(default = "default_max_raises_per_street", alias = "raises_per_street")]
+    pub max_raises_per_street: u8,
 
     // Sampling
     #[serde(default = "default_flop_samples_per_iter")]
@@ -108,7 +108,7 @@ impl PostflopModelConfig {
             num_hand_buckets_turn: 500,
             num_hand_buckets_river: 500,
             bet_sizes: vec![0.5, 1.0],
-            raises_per_street: 1,
+            max_raises_per_street: 1,
             flop_samples_per_iter: 1,
             postflop_solve_iterations: 200,
             postflop_solve_samples: 0,
@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(cfg.num_hand_buckets_turn, 500);
         assert_eq!(cfg.num_hand_buckets_river, 500);
         assert_eq!(cfg.bet_sizes, vec![0.5, 1.0]);
-        assert_eq!(cfg.raises_per_street, 1);
+        assert_eq!(cfg.max_raises_per_street, 1);
     }
 
     #[timed_test]

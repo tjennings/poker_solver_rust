@@ -307,7 +307,7 @@ fn build_after_opening_action(
                 pot_fraction,
                 new_pot,
                 street,
-                config.raises_per_street,
+                config.max_raises_per_street,
             )
         }
         _ => unreachable!("opener can only check or bet"),
@@ -339,7 +339,7 @@ fn build_check_response(
                     pot_fraction,
                     new_pot,
                     street,
-                    config.raises_per_street,
+                    config.max_raises_per_street,
                 )
             }
             _ => unreachable!(),
@@ -639,7 +639,7 @@ fn build_after_opening_action_spr(
                 pot_fraction,
                 new_pot,
                 street,
-                config.raises_per_street,
+                config.max_raises_per_street,
                 max_pot,
             )
         }
@@ -676,7 +676,7 @@ fn build_check_response_spr(
                     pot_fraction,
                     new_pot,
                     street,
-                    config.raises_per_street,
+                    config.max_raises_per_street,
                     max_pot,
                 )
             }
@@ -845,7 +845,7 @@ mod tests {
     fn fast_config() -> PostflopModelConfig {
         PostflopModelConfig {
             bet_sizes: vec![0.5, 1.0],
-            raises_per_street: 1,
+            max_raises_per_street: 1,
             ..PostflopModelConfig::fast()
         }
     }

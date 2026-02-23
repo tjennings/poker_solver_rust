@@ -1013,7 +1013,7 @@ mod tests {
     fn annotate_streets_chance_children_get_next_street() {
         let config = PostflopModelConfig {
             bet_sizes: vec![1.0],
-            raises_per_street: 0,
+            max_raises_per_street: 0,
             ..PostflopModelConfig::fast()
         };
         let tree = PostflopTree::build_with_spr(&config, 5.0).unwrap();
@@ -1122,7 +1122,7 @@ mod tests {
     fn layout_slot_returns_valid_offset() {
         let config = PostflopModelConfig {
             bet_sizes: vec![1.0],
-            raises_per_street: 0,
+            max_raises_per_street: 0,
             ..PostflopModelConfig::fast()
         };
         let trees = build_all_spr_trees(&config).unwrap();

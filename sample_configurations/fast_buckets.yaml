@@ -58,7 +58,7 @@ postflop_model:
 
   # Postflop tree structure (one tree per canonical SPR value).
   bet_sizes: [0.5, 1.0, 2]    # fraction of pot
-  raises_per_street: 1
+  max_raises_per_street: 1
 
   # Canonical SPR values: one postflop tree is built and solved per value.
   # At runtime, each preflop pot type maps to the nearest canonical SPR.

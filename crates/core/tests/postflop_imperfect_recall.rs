@@ -28,7 +28,7 @@ fn postflop_abstraction_with_imperfect_recall_builds_and_solves() {
         canonical_sprs: vec![1.0, 5.0],
         postflop_solve_iterations: 50,
         bet_sizes: vec![1.0],
-        raises_per_street: 0,
+        max_raises_per_street: 0,
         ..PostflopModelConfig::fast()
     };
 

@@ -32,8 +32,9 @@ stacks: [50, 50]  # 25 BB × 2
 raise_sizes:
   - [2.5]    # open raise: 2.5×
   - [3.0]    # 3-bet: 3.0×
+  - [5.0]    # 4-bet
 
-raise_cap: 4
+raise_cap: 3
 
 # ── DCFR discounting ─────────────────────────────────────────────────────────
 
@@ -52,20 +53,20 @@ exploration: 0.05
 
 postflop_model:
   # Hand abstraction: EHS k-means clustering per street.
-  num_hand_buckets_flop: 200
-  num_hand_buckets_turn: 200
-  num_hand_buckets_river: 200
+  num_hand_buckets_flop: 50
+  num_hand_buckets_turn: 50
+  num_hand_buckets_river: 50
 
   # Postflop tree structure (one tree per canonical SPR value).
-  bet_sizes: [0.5, 1.0, 2]    # fraction of pot
-  max_raises_per_street: 1
+  bet_sizes: [0.5, 1.0,2]    # fraction of pot
+  max_raises_per_street: 3
 
   # Canonical SPR values: one postflop tree is built and solved per value.
   # At runtime, each preflop pot type maps to the nearest canonical SPR.
-  canonical_sprs: [0.5, 1.0, 1.5, 3.0, 5.0, 10.0, 20.0, 50.0]
+  canonical_sprs: [0.5, 1.0, 1.5, 3.0, 5.0, 10.0]
 
   # Pre-solve: chance-sampled MCCFR to converge postflop before preflop training.
-  postflop_solve_iterations: 1000   # MCCFR iterations per SPR
-  postflop_solve_samples: 100000        # bucket pairs sampled per iteration (0 = num_hand_buckets_flop)
+  postflop_solve_iterations: 500   # MCCFR iterations per SPR
+  postflop_solve_samples: 10000        # bucket pairs sampled per iteration (0 = num_hand_buckets_flop)
 
   flop_samples_per_iter: 1

@@ -212,7 +212,7 @@ postflop_model:
   num_hand_buckets_turn: 200
   num_hand_buckets_river: 200
   bet_sizes: [0.5, 1.0, 2.0]
-  raises_per_street: 1
+  max_raises_per_street: 1
   canonical_sprs: [0.5, 1.0, 1.5, 3.0, 5.0, 10.0, 20.0, 50.0]
   postflop_solve_iterations: 1000
   postflop_solve_samples: 100000

@@ -169,7 +169,7 @@ At each preflop showdown terminal:
 | `num_hand_buckets_turn` | 500 | 50/200/500/1000 | Turn k-means clusters |
 | `num_hand_buckets_river` | 500 | 50/200/500/1000 | River k-means clusters |
 | `bet_sizes` | [0.5, 1.0] | — | Pot-fraction bet sizes |
-| `raises_per_street` | 1 | — | Raise cap per postflop street |
+| `max_raises_per_street` | 1 | — | Raise cap per postflop street |
 | `canonical_sprs` | [0.5..50.0] | — | SPR values for tree building |
 | `postflop_solve_iterations` | 200 | — | MCCFR iterations per SPR tree |
 | `postflop_solve_samples` | 0 | — | Bucket pairs per iteration (0 = all) |
