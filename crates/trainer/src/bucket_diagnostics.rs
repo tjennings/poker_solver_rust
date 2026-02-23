@@ -101,7 +101,7 @@ fn load_or_build(
     let hands: Vec<CanonicalHand> = all_hands().collect();
     let flops = poker_solver_core::preflop::ehs::sample_canonical_flops(config.max_flop_boards);
 
-    let buckets = build_street_buckets_independent(
+    let result = build_street_buckets_independent(
         &hands,
         &flops,
         config.num_hand_buckets_flop,
@@ -110,16 +110,8 @@ fn load_or_build(
         &|_| {},
     );
 
-    // Build placeholder equity (0.5 uniform) — matches postflop_abstraction behavior.
-    let make_eq = |n: u16| BucketEquity {
-        equity: vec![vec![0.5f32; n as usize]; n as usize],
-        num_buckets: n as usize,
-    };
-    let street_equity = StreetEquity {
-        flop: make_eq(buckets.num_flop_buckets),
-        turn: make_eq(buckets.num_turn_buckets),
-        river: make_eq(buckets.num_river_buckets),
-    };
+    let street_equity = result.compute_street_equity();
+    let buckets = result.buckets;
 
     if let Err(e) = abstraction_cache::save(cache_base, &key, &buckets, &street_equity) {
         eprintln!("Warning: failed to save cache: {e}");

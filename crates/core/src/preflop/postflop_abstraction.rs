@@ -371,6 +371,13 @@ impl PostflopAbstraction {
 }
 
 /// Build abstraction data: independent per-street buckets + equity tables.
+///
+/// Computes real bucket-pair equity from the histogram CDFs and river equities
+/// produced during bucketing. For each street:
+/// - Flop/turn: extract average equity from each CDF via `cdf_to_avg_equity`,
+///   then group by bucket to get centroid equity.
+/// - River: use raw scalar equities directly.
+/// - Pair equity: `equity(a, b) = centroid_a / (centroid_a + centroid_b)`.
 #[allow(clippy::unnecessary_wraps)]
 fn load_or_build_abstraction(
     config: &PostflopModelConfig,
@@ -384,7 +391,7 @@ fn load_or_build_abstraction(
     let hands: Vec<_> = crate::hands::all_hands().collect();
     let flops = crate::preflop::ehs::sample_canonical_flops(config.max_flop_boards);
 
-    let buckets = hand_buckets::build_street_buckets_independent(
+    let result = hand_buckets::build_street_buckets_independent(
         &hands,
         &flops,
         config.num_hand_buckets_flop,
@@ -401,32 +408,11 @@ fn load_or_build_abstraction(
         },
     );
 
-    // Build equity from bucket centroids (placeholder: 0.5 uniform equity).
-    // Proper bucket-pair equity will be added when real-time subgame solving lands.
-    let street_equity = build_street_equity_from_buckets(&buckets);
-
     on_progress(BuildPhase::EquityTable);
 
-    Ok((buckets, street_equity))
-}
+    let street_equity = result.compute_street_equity();
 
-/// Build per-street equity tables from `StreetBuckets`.
-///
-/// For now, uses a placeholder where `equity[a][b] = 0.5` for all bucket pairs.
-/// The CFR traversal still works — it just gets uniform equity for showdown nodes.
-fn build_street_equity_from_buckets(buckets: &StreetBuckets) -> StreetEquity {
-    let make_eq = |num_buckets: u16| -> BucketEquity {
-        let n = num_buckets as usize;
-        BucketEquity {
-            equity: vec![vec![0.5f32; n]; n],
-            num_buckets: n,
-        }
-    };
-    StreetEquity {
-        flop: make_eq(buckets.num_flop_buckets),
-        turn: make_eq(buckets.num_turn_buckets),
-        river: make_eq(buckets.num_river_buckets),
-    }
+    Ok((result.buckets, street_equity))
 }
 
 fn build_all_spr_trees(
