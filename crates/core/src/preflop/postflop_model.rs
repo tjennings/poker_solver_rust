@@ -2,6 +2,7 @@
 ///
 /// Controls hand abstraction granularity (EHS k-means buckets), postflop betting structure,
 /// and per-iteration sampling counts.
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 fn default_num_hand_buckets_flop() -> u16 {
@@ -28,14 +29,44 @@ fn default_postflop_solve_iterations() -> u32 {
 fn default_postflop_solve_samples() -> u32 {
     0
 }
-fn default_postflop_spr() -> f64 {
-    5.0
+fn default_postflop_sprs() -> Vec<f64> {
+    vec![3.5]
 }
 fn default_max_flop_boards() -> usize {
     0
 }
 fn default_equity_rollout_fraction() -> f64 {
     1.0
+}
+fn default_rebucket_rounds() -> u16 {
+    1
+}
+fn default_rebucket_delta_threshold() -> f64 {
+    0.001
+}
+
+/// Deserialize either a scalar `f64` or a `Vec<f64>` into `Vec<f64>`.
+/// Supports backward-compatible YAML: `postflop_spr: 4.0` → `vec![4.0]`.
+fn deserialize_sprs<'de, D>(deserializer: D) -> Result<Vec<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ScalarOrVec {
+        Scalar(f64),
+        Vec(Vec<f64>),
+    }
+    match ScalarOrVec::deserialize(deserializer)? {
+        ScalarOrVec::Scalar(v) => Ok(vec![v]),
+        ScalarOrVec::Vec(v) => {
+            if v.is_empty() {
+                Err(de::Error::custom("postflop_sprs must not be empty"))
+            } else {
+                Ok(v)
+            }
+        }
+    }
 }
 
 /// Configuration for the postflop model integrated into the preflop solver.
@@ -66,10 +97,23 @@ pub struct PostflopModelConfig {
     #[serde(default = "default_postflop_solve_samples")]
     pub postflop_solve_samples: u32,
 
-    /// Fixed SPR for all postflop solves. A single tree template is built at this SPR
-    /// and shared across all per-flop solves.
-    #[serde(default = "default_postflop_spr")]
-    pub postflop_spr: f64,
+    /// SPR values for postflop solves. A tree template is built per SPR.
+    /// Accepts both `postflop_sprs: [3.5, 6.0]` and the legacy scalar
+    /// `postflop_spr: 3.5` (deserialized as a single-element vec).
+    #[serde(
+        default = "default_postflop_sprs",
+        alias = "postflop_spr",
+        deserialize_with = "deserialize_sprs"
+    )]
+    pub postflop_sprs: Vec<f64>,
+
+    /// Number of EV-based rebucketing rounds. 1 = no rebucketing (backward compat).
+    #[serde(default = "default_rebucket_rounds")]
+    pub rebucket_rounds: u16,
+
+    /// Max-regret-delta threshold for early CFR stopping during rebucketing.
+    #[serde(default = "default_rebucket_delta_threshold")]
+    pub rebucket_delta_threshold: f64,
 
     /// Maximum number of canonical flop boards to use for EHS feature computation.
     /// 0 means use all canonical flops (~1,755). Lower values dramatically speed up
@@ -126,7 +170,9 @@ impl PostflopModelConfig {
             flop_samples_per_iter: 1,
             postflop_solve_iterations: 200,
             postflop_solve_samples: 0,
-            postflop_spr: 5.0,
+            postflop_sprs: vec![3.5],
+            rebucket_rounds: 1,
+            rebucket_delta_threshold: 0.001,
             max_flop_boards: 0,
             fixed_flops: None,
             equity_rollout_fraction: 1.0,
@@ -154,6 +200,12 @@ impl PostflopModelConfig {
             "accurate" => Some(Self::accurate()),
             _ => None,
         }
+    }
+
+    /// The primary (first) SPR value, used as the default for single-SPR solves.
+    #[must_use]
+    pub fn primary_spr(&self) -> f64 {
+        self.postflop_sprs.first().copied().unwrap_or(3.5)
     }
 
     /// Total number of hand buckets across all streets.
@@ -184,7 +236,7 @@ mod tests {
         assert_eq!(cfg.num_hand_buckets_river, 500);
         assert_eq!(cfg.bet_sizes, vec![0.5, 1.0]);
         assert_eq!(cfg.max_raises_per_street, 1);
-        assert!((cfg.postflop_spr - 5.0).abs() < 1e-9);
+        assert_eq!(cfg.postflop_sprs, vec![3.5]);
     }
 
     #[timed_test]
@@ -241,18 +293,55 @@ mod tests {
     }
 
     #[timed_test]
-    fn postflop_spr_default_is_five() {
+    fn rebucket_rounds_defaults_to_one() {
         let cfg = PostflopModelConfig::standard();
-        assert!((cfg.postflop_spr - 5.0).abs() < 1e-9);
+        assert_eq!(cfg.rebucket_rounds, 1);
     }
 
     #[timed_test]
-    fn postflop_spr_round_trip() {
+    fn rebucket_delta_threshold_defaults() {
+        let cfg = PostflopModelConfig::standard();
+        assert!((cfg.rebucket_delta_threshold - 0.001).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn postflop_sprs_defaults_to_single_value() {
+        let cfg = PostflopModelConfig::standard();
+        assert_eq!(cfg.postflop_sprs.len(), 1);
+        assert!((cfg.postflop_sprs[0] - 3.5).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn postflop_spr_scalar_yaml_deserializes_as_vec() {
+        let yaml = "postflop_spr: 4.0";
+        let cfg: PostflopModelConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.postflop_sprs.len(), 1);
+        assert!((cfg.postflop_sprs[0] - 4.0).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn postflop_sprs_vec_yaml_deserializes() {
+        let yaml = "postflop_sprs: [3.5, 6.0]";
+        let cfg: PostflopModelConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.postflop_sprs.len(), 2);
+        assert!((cfg.postflop_sprs[0] - 3.5).abs() < 1e-9);
+        assert!((cfg.postflop_sprs[1] - 6.0).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn rebucket_rounds_round_trip() {
         let mut cfg = PostflopModelConfig::fast();
-        cfg.postflop_spr = 3.5;
+        cfg.rebucket_rounds = 3;
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let restored: PostflopModelConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert!((restored.postflop_spr - 3.5).abs() < 1e-9);
+        assert_eq!(restored.rebucket_rounds, 3);
+    }
+
+    #[timed_test]
+    fn primary_spr_returns_first_element() {
+        let mut cfg = PostflopModelConfig::standard();
+        cfg.postflop_sprs = vec![6.0, 3.5];
+        assert!((cfg.primary_spr() - 6.0).abs() < 1e-9);
     }
 
     #[timed_test]

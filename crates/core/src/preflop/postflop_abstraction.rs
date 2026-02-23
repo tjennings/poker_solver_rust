@@ -31,7 +31,7 @@ use crate::poker::Card;
 pub struct PostflopAbstraction {
     pub buckets: StreetBuckets,
     pub street_equity: StreetEquity,
-    /// Single shared tree template at `config.postflop_spr`.
+    /// Single shared tree template at `config.primary_spr()`.
     pub tree: PostflopTree,
     /// Precomputed EV table from solved postflop game.
     pub values: PostflopValues,
@@ -288,7 +288,7 @@ impl PostflopAbstraction {
         )?;
 
         on_progress(BuildPhase::Trees);
-        let tree = PostflopTree::build_with_spr(config, config.postflop_spr)?;
+        let tree = PostflopTree::build_with_spr(config, config.primary_spr())?;
 
         on_progress(BuildPhase::Layout);
         let node_streets = annotate_streets(&tree);
@@ -339,7 +339,7 @@ impl PostflopAbstraction {
             street_equity,
             tree,
             values,
-            spr: config.postflop_spr,
+            spr: config.primary_spr(),
             flops,
         })
     }
@@ -358,13 +358,13 @@ impl PostflopAbstraction {
         values: PostflopValues,
         flops: Vec<[Card; 3]>,
     ) -> Result<Self, PostflopAbstractionError> {
-        let tree = PostflopTree::build_with_spr(config, config.postflop_spr)?;
+        let tree = PostflopTree::build_with_spr(config, config.primary_spr())?;
         Ok(Self {
             buckets,
             street_equity,
             tree,
             values,
-            spr: config.postflop_spr,
+            spr: config.primary_spr(),
             flops,
         })
     }
