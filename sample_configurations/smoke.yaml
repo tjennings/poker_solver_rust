@@ -1,0 +1,48 @@
+# Smoke-test config — minimal postflop for CI / quick iteration
+#
+# Usage:
+#   cargo run -p poker-solver-trainer --release -- solve-preflop \
+#     -c sample_configurations/smoke.yaml -o smoke_test
+
+iterations: 100
+equity_samples: 1000
+print_every: 50
+
+positions:
+  - name: Small Blind
+    short_name: SB
+  - name: Big Blind
+    short_name: BB
+
+blinds:
+  - [0, 1]
+  - [1, 2]
+
+antes: []
+
+stacks: [50, 50]
+
+raise_sizes:
+  - [2.5]
+  - [3.0]
+
+raise_cap: 4
+
+dcfr_alpha: 1.5
+dcfr_beta: 0.5
+dcfr_gamma: 2.0
+dcfr_warmup: 0
+exploration: 0.05
+
+postflop_model:
+  num_hand_buckets_flop: 10
+  num_hand_buckets_turn: 10
+  num_hand_buckets_river: 10
+  bet_sizes: [0.5, 1.0]
+  max_raises_per_street: 1
+  canonical_sprs: [1.0, 5.0]
+  postflop_solve_iterations: 50
+  postflop_solve_samples: 0
+  max_flop_boards: 5
+  # fixed_flops: ["AhKd2s", "7c8c9c", "QhJhTh"]  # override max_flop_boards
+  flop_samples_per_iter: 1

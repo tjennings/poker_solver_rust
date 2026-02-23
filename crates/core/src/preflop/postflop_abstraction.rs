@@ -226,6 +226,8 @@ pub enum PostflopAbstractionError {
     Tree(#[from] super::postflop_tree::PostflopTreeError),
     #[error("canonical_sprs must be non-empty")]
     EmptyCanonicalSprs,
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
 }
 
 /// Progress report during postflop abstraction construction.
@@ -382,7 +384,12 @@ fn load_or_build_abstraction(
     on_progress(BuildPhase::HandBuckets(0, hand_buckets::NUM_HANDS));
 
     let hands: Vec<_> = crate::hands::all_hands().collect();
-    let flops = crate::preflop::ehs::sample_canonical_flops(config.max_flop_boards);
+    let flops = if let Some(ref names) = config.fixed_flops {
+        crate::preflop::ehs::parse_flops(names)
+            .map_err(PostflopAbstractionError::InvalidConfig)?
+    } else {
+        crate::preflop::ehs::sample_canonical_flops(config.max_flop_boards)
+    };
 
     let buckets = hand_buckets::build_street_buckets_independent(
         &hands,

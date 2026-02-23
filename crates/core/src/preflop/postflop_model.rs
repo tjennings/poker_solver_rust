@@ -73,6 +73,11 @@ pub struct PostflopModelConfig {
     /// the hand bucketing phase at the cost of clustering quality.
     #[serde(default = "default_max_flop_boards")]
     pub max_flop_boards: usize,
+
+    /// Optional list of explicit flop boards (e.g. `["AhKd2s", "7c8c9c"]`).
+    /// When set, overrides `max_flop_boards` entirely.
+    #[serde(default)]
+    pub fixed_flops: Option<Vec<String>>,
 }
 
 impl PostflopModelConfig {
@@ -114,6 +119,7 @@ impl PostflopModelConfig {
             postflop_solve_samples: 0,
             canonical_sprs: default_canonical_sprs(),
             max_flop_boards: 0,
+            fixed_flops: None,
         }
     }
 
@@ -272,5 +278,26 @@ num_hand_buckets_river: 300
         assert_eq!(cfg.num_hand_buckets_turn, 1000);
         assert_eq!(cfg.num_hand_buckets_river, 1000);
         assert_eq!(cfg.total_hand_buckets(), 3000);
+    }
+
+    #[timed_test]
+    fn fixed_flops_deserializes_from_yaml() {
+        let yaml = r#"
+fixed_flops:
+  - "AhKd2s"
+  - "7c8c9c"
+"#;
+        let cfg: PostflopModelConfig = serde_yaml::from_str(yaml).unwrap();
+        let flops = cfg.fixed_flops.unwrap();
+        assert_eq!(flops.len(), 2);
+        assert_eq!(flops[0], "AhKd2s");
+        assert_eq!(flops[1], "7c8c9c");
+    }
+
+    #[timed_test]
+    fn fixed_flops_defaults_to_none() {
+        let yaml = "num_hand_buckets_flop: 100";
+        let cfg: PostflopModelConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.fixed_flops.is_none());
     }
 }
