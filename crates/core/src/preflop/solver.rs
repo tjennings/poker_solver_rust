@@ -659,13 +659,16 @@ fn postflop_showdown_value(
     let ip_player = pot_type.default_ip_player();
     let hero_tree_pos = u8::from(hero_pos == ip_player);
 
-    // Map preflop hand indices to flop buckets (flop 0 as representative).
-    let hero_bucket = pf_state.abstraction.buckets.flop_bucket_for_hand(hero_hand as usize, 0);
-    let opp_bucket = pf_state.abstraction.buckets.flop_bucket_for_hand(opp_hand as usize, 0);
-
-    let pf_ev_frac = pf_state.abstraction.values.get_by_spr(
-        spr_idx, hero_tree_pos, hero_bucket, opp_bucket,
-    );
+    // Average postflop EV across all flop textures.
+    let num_tex = pf_state.abstraction.buckets.num_flop_boards;
+    let mut ev_sum = 0.0;
+    for tex in 0..num_tex {
+        let hb = pf_state.abstraction.buckets.flop_bucket_for_hand(hero_hand as usize, tex);
+        let ob = pf_state.abstraction.buckets.flop_bucket_for_hand(opp_hand as usize, tex);
+        ev_sum += pf_state.abstraction.values.get_by_spr(spr_idx, hero_tree_pos, hb, ob);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let pf_ev_frac = ev_sum / num_tex as f64;
 
     // Scale: postflop EV fraction × actual pot size, offset by hero's investment.
     pf_ev_frac * f64::from(pot) + (f64::from(pot) / 2.0 - hero_inv)

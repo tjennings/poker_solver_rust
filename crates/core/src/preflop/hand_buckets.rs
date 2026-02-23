@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::hands::CanonicalHand;
-use crate::poker::Card;
+use crate::poker::{Card, Hand, Rank, Rankable};
 use crate::preflop::ehs::{EhsFeatures, ehs_features, equity_histogram, HISTOGRAM_BINS};
 
 /// Feature type for histogram-based k-means clustering.
@@ -87,6 +87,10 @@ pub struct BucketingResult {
     /// Flat scalar equities from river computation, indexed by
     /// `hand_idx * num_river_boards + river_idx`.
     pub river_equities: Vec<f64>,
+    /// Turn boards used during bucketing (for pairwise equity computation).
+    pub turn_boards: Vec<[Card; 4]>,
+    /// River boards used during bucketing (for pairwise equity computation).
+    pub river_boards: Vec<[Card; 5]>,
 }
 
 impl BucketingResult {
@@ -123,6 +127,56 @@ impl BucketingResult {
             &self.buckets.river,
             self.buckets.num_river_buckets as usize,
             &self.river_equities,
+        );
+
+        StreetEquity { flop, turn, river }
+    }
+
+    /// Compute per-street bucket-pair equity using true pairwise hand-vs-hand evaluation.
+    ///
+    /// This replaces the centroid-ratio approximation with actual showdown evaluation.
+    /// For each street, enumerates all valid combo pairs per bucket pair and evaluates
+    /// who wins on each board.
+    ///
+    /// Turn/river are always exhaustive (cheap). Flop uses `rollout_samples` for
+    /// optional sampling (0 = exhaustive).
+    #[must_use]
+    pub fn compute_pairwise_street_equity(
+        &self,
+        hands: &[CanonicalHand],
+        flops: &[[Card; 3]],
+        turn_boards: &[[Card; 4]],
+        river_boards: &[[Card; 5]],
+        rollout_samples: u32,
+    ) -> StreetEquity {
+        let flop_board_refs: Vec<&[Card]> = flops.iter().map(AsRef::as_ref).collect();
+        let flop = compute_pairwise_bucket_equity(
+            hands,
+            &flop_board_refs,
+            &self.buckets.flop,
+            self.buckets.num_flop_buckets as usize,
+            flops.len(),
+            rollout_samples,
+        );
+
+        let turn_board_refs: Vec<&[Card]> = turn_boards.iter().map(AsRef::as_ref).collect();
+        let turn = compute_pairwise_bucket_equity(
+            hands,
+            &turn_board_refs,
+            &self.buckets.turn,
+            self.buckets.num_turn_buckets as usize,
+            turn_boards.len(),
+            0, // Turn: always exhaustive (44 river cards, cheap)
+        );
+
+        let river_board_refs: Vec<&[Card]> = river_boards.iter().map(AsRef::as_ref).collect();
+        let river = compute_pairwise_bucket_equity(
+            hands,
+            &river_board_refs,
+            &self.buckets.river,
+            self.buckets.num_river_buckets as usize,
+            river_boards.len(),
+            0, // River: always exhaustive (single comparison)
         );
 
         StreetEquity { flop, turn, river }
@@ -279,6 +333,295 @@ pub fn compute_bucket_pair_equity(
 }
 
 // ---------------------------------------------------------------------------
+// Pairwise bucket equity via hand-vs-hand evaluation
+// ---------------------------------------------------------------------------
+
+/// Compute true pairwise bucket equity via hand-vs-hand evaluation on actual boards.
+///
+/// For each board, enumerates all valid combo pairs from different buckets and
+/// evaluates who wins by ranking 7-card hands. This replaces the centroid-ratio
+/// approximation (`c_a / (c_a + c_b)`) with exact hand-vs-hand equity.
+///
+/// # Arguments
+/// * `hands` - canonical hands (169)
+/// * `boards` - boards to evaluate on (3, 4, or 5 cards)
+/// * `assignments` - flat: `hand_idx * num_boards + board_idx` → bucket
+/// * `num_buckets` - number of buckets
+/// * `num_boards` - number of boards
+/// * `rollout_samples` - 0 = exhaustive enumeration, >0 = sample this many runouts per pair (flop only)
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines, clippy::missing_panics_doc, clippy::many_single_char_names)]
+pub fn compute_pairwise_bucket_equity(
+    hands: &[CanonicalHand],
+    boards: &[&[Card]],
+    assignments: &[u16],
+    num_buckets: usize,
+    num_boards: usize,
+    rollout_samples: u32,
+) -> BucketEquity {
+    assert_eq!(assignments.len(), hands.len() * num_boards);
+
+    if num_buckets == 0 || boards.is_empty() {
+        return BucketEquity {
+            equity: vec![vec![0.5f32; num_buckets]; num_buckets],
+            num_buckets,
+        };
+    }
+
+    // Per-board results accumulated in parallel.
+    // Each board produces (wins, ties, total) per bucket pair.
+    let per_board: Vec<Vec<Vec<(u64, u64, u64)>>> = boards
+        .par_iter()
+        .enumerate()
+        .map(|(board_idx, board)| {
+            let board_len = board.len();
+
+            // Build per-bucket combo lists for this board.
+            let mut bucket_combos: Vec<Vec<[Card; 2]>> = vec![Vec::new(); num_buckets];
+            for (hand_idx, hand) in hands.iter().enumerate() {
+                let bucket = assignments[hand_idx * num_boards + board_idx] as usize;
+                for &(c1, c2) in &hand.combos() {
+                    if !cards_overlap(&[c1, c2], board) {
+                        bucket_combos[bucket].push([c1, c2]);
+                    }
+                }
+            }
+
+            // Accumulate (wins, ties, total) for each (bucket_a, bucket_b) pair.
+            let mut pair_stats = vec![vec![(0u64, 0u64, 0u64); num_buckets]; num_buckets];
+
+            for a in 0..num_buckets {
+                for b in a..num_buckets {
+                    let (mut wins_a, mut ties, mut total) = (0u64, 0u64, 0u64);
+                    for &combo_a in &bucket_combos[a] {
+                        for &combo_b in &bucket_combos[b] {
+                            // Skip pairs that share cards.
+                            if combo_a[0] == combo_b[0]
+                                || combo_a[0] == combo_b[1]
+                                || combo_a[1] == combo_b[0]
+                                || combo_a[1] == combo_b[1]
+                            {
+                                continue;
+                            }
+                            let (w, t, n) = evaluate_combo_pair(
+                                combo_a,
+                                combo_b,
+                                board,
+                                board_len,
+                                rollout_samples,
+                            );
+                            wins_a += w;
+                            ties += t;
+                            total += n;
+                        }
+                    }
+                    pair_stats[a][b] = (wins_a, ties, total);
+                    if a != b {
+                        // Symmetric: B vs A — B's wins = total - wins_a - ties
+                        let wins_b = total.saturating_sub(wins_a).saturating_sub(ties);
+                        pair_stats[b][a] = (wins_b, ties, total);
+                    }
+                }
+            }
+            pair_stats
+        })
+        .collect();
+
+    // Aggregate across all boards.
+    let mut global_stats = vec![vec![(0u64, 0u64, 0u64); num_buckets]; num_buckets];
+    for board_stats in &per_board {
+        for a in 0..num_buckets {
+            for b in 0..num_buckets {
+                global_stats[a][b].0 += board_stats[a][b].0;
+                global_stats[a][b].1 += board_stats[a][b].1;
+                global_stats[a][b].2 += board_stats[a][b].2;
+            }
+        }
+    }
+
+    // Convert to equity.
+    let mut equity = vec![vec![0.5f32; num_buckets]; num_buckets];
+    for a in 0..num_buckets {
+        for b in 0..num_buckets {
+            let (w, t, n) = global_stats[a][b];
+            if n > 0 {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    equity[a][b] = ((w as f64 + 0.5 * t as f64) / n as f64) as f32;
+                }
+            }
+        }
+    }
+
+    BucketEquity { equity, num_buckets }
+}
+
+/// Evaluate a single combo pair on a board, returning `(wins_a, ties, total_evals)`.
+///
+/// - River (5-card board): single rank comparison.
+/// - Turn (4-card board): enumerate all live river cards.
+/// - Flop (3-card board): exhaustive or sampled runouts depending on `rollout_samples`.
+fn evaluate_combo_pair(
+    combo_a: [Card; 2],
+    combo_b: [Card; 2],
+    board: &[Card],
+    board_len: usize,
+    rollout_samples: u32,
+) -> (u64, u64, u64) {
+    match board_len {
+        5 => {
+            // River: direct comparison.
+            let rank_a = rank_7cards(combo_a, board);
+            let rank_b = rank_7cards(combo_b, board);
+            match rank_a.cmp(&rank_b) {
+                std::cmp::Ordering::Greater => (1, 0, 1),
+                std::cmp::Ordering::Equal => (0, 1, 1),
+                std::cmp::Ordering::Less => (0, 0, 1),
+            }
+        }
+        4 => {
+            // Turn: enumerate all 44 live river cards.
+            let live = live_cards(&[combo_a[0], combo_a[1], combo_b[0], combo_b[1]], board);
+            let (mut w, mut t, mut n) = (0u64, 0u64, 0u64);
+            for &rc in &live {
+                let full_board = [board[0], board[1], board[2], board[3], rc];
+                let rank_a = rank_7cards(combo_a, &full_board);
+                let rank_b = rank_7cards(combo_b, &full_board);
+                match rank_a.cmp(&rank_b) {
+                    std::cmp::Ordering::Greater => w += 1,
+                    std::cmp::Ordering::Equal => t += 1,
+                    std::cmp::Ordering::Less => {}
+                }
+                n += 1;
+            }
+            (w, t, n)
+        }
+        3 => {
+            // Flop: enumerate or sample (turn, river) runouts.
+            let live = live_cards(&[combo_a[0], combo_a[1], combo_b[0], combo_b[1]], board);
+            if rollout_samples == 0 || (live.len() * (live.len() - 1) / 2) <= rollout_samples as usize {
+                // Exhaustive: all C(live, 2) runouts.
+                flop_exhaustive(combo_a, combo_b, board, &live)
+            } else {
+                flop_sampled(combo_a, combo_b, board, &live, rollout_samples)
+            }
+        }
+        _ => (0, 0, 0),
+    }
+}
+
+/// Exhaustive flop runout enumeration.
+fn flop_exhaustive(
+    combo_a: [Card; 2],
+    combo_b: [Card; 2],
+    flop: &[Card],
+    live: &[Card],
+) -> (u64, u64, u64) {
+    let (mut w, mut t, mut n) = (0u64, 0u64, 0u64);
+    for (i, &tc) in live.iter().enumerate() {
+        for &rc in &live[i + 1..] {
+            let full = [flop[0], flop[1], flop[2], tc, rc];
+            let rank_a = rank_7cards(combo_a, &full);
+            let rank_b = rank_7cards(combo_b, &full);
+            match rank_a.cmp(&rank_b) {
+                std::cmp::Ordering::Greater => w += 1,
+                std::cmp::Ordering::Equal => t += 1,
+                std::cmp::Ordering::Less => {}
+            }
+            n += 1;
+        }
+    }
+    (w, t, n)
+}
+
+/// Sampled flop runout: pick `num_samples` random (turn, river) pairs.
+#[allow(clippy::cast_possible_truncation, clippy::many_single_char_names)]
+fn flop_sampled(
+    combo_a: [Card; 2],
+    combo_b: [Card; 2],
+    flop: &[Card],
+    live: &[Card],
+    num_samples: u32,
+) -> (u64, u64, u64) {
+    use std::hash::{Hash, Hasher};
+    // Deterministic seed from the combo + board for reproducibility.
+    let mut hasher = std::hash::DefaultHasher::new();
+    combo_a[0].hash(&mut hasher);
+    combo_a[1].hash(&mut hasher);
+    combo_b[0].hash(&mut hasher);
+    combo_b[1].hash(&mut hasher);
+    for &c in flop {
+        c.hash(&mut hasher);
+    }
+    let mut seed = hasher.finish();
+
+    let live_len = live.len();
+    let (mut w, mut t, mut n) = (0u64, 0u64, 0u64);
+    for _ in 0..num_samples {
+        seed = splitmix64(seed);
+        let i = (seed % live_len as u64) as usize;
+        seed = splitmix64(seed);
+        let mut j = (seed % (live_len as u64 - 1)) as usize;
+        if j >= i {
+            j += 1;
+        }
+        let full = [flop[0], flop[1], flop[2], live[i], live[j]];
+        let rank_a = rank_7cards(combo_a, &full);
+        let rank_b = rank_7cards(combo_b, &full);
+        match rank_a.cmp(&rank_b) {
+            std::cmp::Ordering::Greater => w += 1,
+            std::cmp::Ordering::Equal => t += 1,
+            std::cmp::Ordering::Less => {}
+        }
+        n += 1;
+    }
+    (w, t, n)
+}
+
+/// Rank a 7-card hand (2 hole + 5 board) using `rs_poker`.
+fn rank_7cards(hole: [Card; 2], board: &[Card]) -> Rank {
+    let mut hand = Hand::default();
+    hand.insert(hole[0]);
+    hand.insert(hole[1]);
+    for &c in board {
+        hand.insert(c);
+    }
+    hand.rank()
+}
+
+/// Check if any card in `hole` overlaps with `board`.
+fn cards_overlap(hole: &[Card], board: &[Card]) -> bool {
+    hole.iter().any(|c| board.contains(c))
+}
+
+/// Collect live cards not in hole cards or board.
+fn live_cards(hole_cards: &[Card], board: &[Card]) -> Vec<Card> {
+    use crate::poker::{ALL_SUITS, ALL_VALUES};
+    let mut used = 0u64;
+    for &c in hole_cards {
+        used |= 1u64 << card_bit_idx(c);
+    }
+    for &c in board {
+        used |= 1u64 << card_bit_idx(c);
+    }
+    let mut live = Vec::with_capacity(48);
+    for &v in &ALL_VALUES {
+        for &s in &ALL_SUITS {
+            let c = Card::new(v, s);
+            if used & (1u64 << card_bit_idx(c)) == 0 {
+                live.push(c);
+            }
+        }
+    }
+    live
+}
+
+/// Map a card to a bit index (0..51).
+fn card_bit_idx(card: Card) -> u32 {
+    card.value as u32 * 4 + card.suit as u32
+}
+
+// ---------------------------------------------------------------------------
 // Independent per-street clustering pipeline (imperfect recall)
 // ---------------------------------------------------------------------------
 
@@ -377,6 +720,8 @@ pub fn build_street_buckets_independent(
         flop_histograms: flop_features,
         turn_histograms: turn_features,
         river_equities,
+        turn_boards,
+        river_boards,
     }
 }
 

@@ -121,6 +121,7 @@ fn diag_value_table_strong_beats_weak() {
         max_raises_per_street: 0,
         max_flop_boards: 3,
         flop_samples_per_iter: 1,
+        ..PostflopModelConfig::default()
     };
 
     let abstraction = PostflopAbstraction::build(
@@ -172,6 +173,7 @@ fn diag_end_to_end_aa_beats_72o() {
         max_raises_per_street: 1,
         max_flop_boards: 3,
         flop_samples_per_iter: 1,
+        ..PostflopModelConfig::default()
     };
 
     let mut config = PreflopConfig::heads_up(25);

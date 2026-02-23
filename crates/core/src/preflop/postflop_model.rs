@@ -34,6 +34,9 @@ fn default_canonical_sprs() -> Vec<f64> {
 fn default_max_flop_boards() -> usize {
     0
 }
+fn default_equity_rollout_samples() -> u32 {
+    0
+}
 
 /// Configuration for the postflop model integrated into the preflop solver.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -78,6 +81,12 @@ pub struct PostflopModelConfig {
     /// When set, overrides `max_flop_boards` entirely.
     #[serde(default)]
     pub fixed_flops: Option<Vec<String>>,
+
+    /// Number of random runout samples per hand pair for pairwise equity computation.
+    /// 0 = exhaustive enumeration (exact but slower). Values > 0 sample that many
+    /// random (turn, river) runouts per pair on flop boards. River is always exact.
+    #[serde(default = "default_equity_rollout_samples")]
+    pub equity_rollout_samples: u32,
 }
 
 impl PostflopModelConfig {
@@ -120,6 +129,7 @@ impl PostflopModelConfig {
             canonical_sprs: default_canonical_sprs(),
             max_flop_boards: 0,
             fixed_flops: None,
+            equity_rollout_samples: 0,
         }
     }
 

@@ -423,7 +423,13 @@ fn load_or_build_abstraction(
 
     on_progress(BuildPhase::EquityTable);
 
-    let street_equity = result.compute_street_equity();
+    let street_equity = result.compute_pairwise_street_equity(
+        &hands,
+        &flops,
+        &result.turn_boards,
+        &result.river_boards,
+        config.equity_rollout_samples,
+    );
 
     Ok((result.buckets, street_equity, flops))
 }
