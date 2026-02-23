@@ -10,6 +10,8 @@ use poker_solver_core::preflop::ehs::sample_canonical_flops;
 use poker_solver_core::preflop::hand_buckets::{
     build_street_buckets_independent, cdf_to_avg_equity, compute_bucket_pair_equity,
 };
+use poker_solver_core::preflop::postflop_abstraction::PostflopAbstraction;
+use poker_solver_core::preflop::postflop_model::PostflopModelConfig;
 
 /// Bucket assignments should correlate with hand strength.
 /// Buckets should have meaningful equity spread (strong != weak).
@@ -99,4 +101,55 @@ fn diag_street_equity_sanity() {
             );
         }
     }
+}
+
+/// After building the full postflop abstraction (buckets + CFR + values),
+/// the value table should show strong buckets winning against weak buckets.
+#[test]
+fn diag_value_table_strong_beats_weak() {
+    let config = PostflopModelConfig {
+        num_hand_buckets_flop: 5,
+        num_hand_buckets_turn: 5,
+        num_hand_buckets_river: 5,
+        canonical_sprs: vec![5.0],
+        postflop_solve_iterations: 100,
+        postflop_solve_samples: 0,
+        bet_sizes: vec![1.0],
+        max_raises_per_street: 0,
+        max_flop_boards: 3,
+        flop_samples_per_iter: 1,
+    };
+
+    let abstraction = PostflopAbstraction::build(
+        &config, None, None, &|phase| eprintln!("  [build] {phase}"),
+    ).expect("build should succeed");
+
+    let n = config.num_hand_buckets_flop as usize;
+    let mut best_bucket = 0;
+    let mut worst_bucket = 0;
+    let mut best_eq = 0.0f32;
+    let mut worst_eq = 1.0f32;
+    for b in 0..n {
+        let avg: f32 = (0..n)
+            .map(|o| abstraction.street_equity.flop.get(b, o))
+            .sum::<f32>() / n as f32;
+        if avg > best_eq { best_eq = avg; best_bucket = b; }
+        if avg < worst_eq { worst_eq = avg; worst_bucket = b; }
+    }
+
+    eprintln!("strongest bucket: {best_bucket} (avg eq {best_eq:.3})");
+    eprintln!("weakest bucket: {worst_bucket} (avg eq {worst_eq:.3})");
+
+    let strong_ev = abstraction.values.get_by_spr(
+        0, 0, best_bucket as u16, worst_bucket as u16,
+    );
+    let weak_ev = abstraction.values.get_by_spr(
+        0, 0, worst_bucket as u16, best_bucket as u16,
+    );
+
+    eprintln!("strong_hero EV={strong_ev:.4}, weak_hero EV={weak_ev:.4}");
+    assert!(
+        strong_ev > weak_ev,
+        "strong bucket should have higher EV: {strong_ev} vs {weak_ev}"
+    );
 }
