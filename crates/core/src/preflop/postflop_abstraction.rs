@@ -92,7 +92,7 @@ impl PostflopValues {
 ///
 /// Each decision node reserves `num_buckets × num_actions` slots.
 /// The bucket count varies by the street of the node.
-pub struct PostflopLayout {
+pub(crate) struct PostflopLayout {
     entries: Vec<NodeEntry>,
     /// Total buffer size for this tree.
     pub total_size: usize,
@@ -260,7 +260,7 @@ impl std::fmt::Display for BuildPhase {
 }
 
 /// Total number of canonical preflop hands (for fine-grained progress).
-pub const NUM_CANONICAL_HANDS: usize = hand_buckets::NUM_HANDS;
+pub(crate) const NUM_CANONICAL_HANDS: usize = hand_buckets::NUM_HANDS;
 
 impl PostflopAbstraction {
     /// Build all precomputed postflop data from configuration.

@@ -13,7 +13,7 @@ use crate::poker::Card;
 use crate::preflop::ehs::{EhsFeatures, ehs_features, equity_histogram, HISTOGRAM_BINS};
 
 /// Feature type for histogram-based k-means clustering.
-pub type HistogramFeatures = [f64; HISTOGRAM_BINS];
+pub(crate) type HistogramFeatures = [f64; HISTOGRAM_BINS];
 
 /// Number of canonical preflop hands.
 pub const NUM_HANDS: usize = 169;
@@ -539,7 +539,7 @@ fn average_features(feats: &[EhsFeatures]) -> EhsFeatures {
 // ---------------------------------------------------------------------------
 
 /// Trait for types that can be used as k-means feature vectors.
-pub trait KmeansPoint: Copy + Send + Sync + PartialEq {
+pub(crate) trait KmeansPoint: Copy + Send + Sync + PartialEq {
     /// Number of dimensions in this feature vector.
     fn dims(&self) -> usize;
     /// Get the value at dimension `i`.
@@ -572,7 +572,7 @@ impl KmeansPoint for [f64; 10] {
 ///
 /// Initialises centroids via k-means++ seeding then iterates until stable or `max_iter`.
 #[must_use]
-pub fn kmeans_generic<P: KmeansPoint>(points: &[P], k: usize, max_iter: usize) -> Vec<u16> {
+pub(crate) fn kmeans_generic<P: KmeansPoint>(points: &[P], k: usize, max_iter: usize) -> Vec<u16> {
     if points.is_empty() || k == 0 {
         return vec![];
     }
@@ -637,7 +637,7 @@ fn pick_weighted_index(weights: &[f64], threshold: f64) -> usize {
 }
 
 /// Assign each point to its nearest centroid (generic).
-pub fn assign_clusters_generic<P: KmeansPoint>(points: &[P], centroids: &[P]) -> Vec<u16> {
+pub(crate) fn assign_clusters_generic<P: KmeansPoint>(points: &[P], centroids: &[P]) -> Vec<u16> {
     points
         .iter()
         .map(|p| nearest_centroid_generic(p, centroids))
@@ -646,7 +646,7 @@ pub fn assign_clusters_generic<P: KmeansPoint>(points: &[P], centroids: &[P]) ->
 
 /// Return index of nearest centroid to point `p` (generic).
 #[allow(clippy::cast_possible_truncation)]
-pub fn nearest_centroid_generic<P: KmeansPoint>(p: &P, centroids: &[P]) -> u16 {
+pub(crate) fn nearest_centroid_generic<P: KmeansPoint>(p: &P, centroids: &[P]) -> u16 {
     centroids
         .iter()
         .enumerate()
@@ -659,7 +659,7 @@ pub fn nearest_centroid_generic<P: KmeansPoint>(p: &P, centroids: &[P]) -> u16 {
 }
 
 /// Recompute centroids as the mean of assigned points (generic).
-pub fn recompute_centroids_generic<P: KmeansPoint>(
+pub(crate) fn recompute_centroids_generic<P: KmeansPoint>(
     points: &[P],
     assignments: &[u16],
     k: usize,
@@ -704,7 +704,7 @@ pub fn recompute_centroids_generic<P: KmeansPoint>(
 }
 
 /// Squared Euclidean distance for generic feature vectors.
-pub fn sq_dist_generic<P: KmeansPoint>(a: &P, b: &P) -> f64 {
+pub(crate) fn sq_dist_generic<P: KmeansPoint>(a: &P, b: &P) -> f64 {
     let dims = a.dims();
     (0..dims).map(|i| (a.get(i) - b.get(i)).powi(2)).sum()
 }
@@ -717,7 +717,7 @@ pub fn sq_dist_generic<P: KmeansPoint>(a: &P, b: &P) -> f64 {
 ///
 /// Initialises centroids via k-means++ seeding then iterates until stable or `max_iter`.
 #[must_use]
-pub fn kmeans(points: &[EhsFeatures], k: usize, max_iter: usize) -> Vec<u16> {
+pub(crate) fn kmeans(points: &[EhsFeatures], k: usize, max_iter: usize) -> Vec<u16> {
     kmeans_generic(points, k, max_iter)
 }
 

@@ -38,7 +38,7 @@ const HAND_SHIFT: u64 = 36;
 /// GPU-friendly node representation. 32 bytes, aligned to 4.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-pub struct GpuNode {
+pub(crate) struct GpuNode {
     /// 0 = P1 decision, 1 = P2 decision,
     /// 2 = fold (P1 folded), 3 = fold (P2 folded), 4 = showdown.
     pub node_type: u32,
@@ -989,7 +989,7 @@ fn build_position_indices(tree: &GameTree) -> (Vec<u32>, u32, Vec<u32>) {
 /// can be reconstructed as `position_key | ((hand_bits as u64) << HAND_SHIFT)`
 /// without needing the `GameTree` at batch time.
 #[derive(Clone, Copy)]
-pub struct DecisionNodeInfo {
+pub(crate) struct DecisionNodeInfo {
     pub node_idx: usize,
     pub player: Player,
     pub street: u8,
@@ -997,7 +997,7 @@ pub struct DecisionNodeInfo {
 }
 
 /// Scan the tree once and extract decision node metadata including position keys.
-pub fn collect_decision_nodes(tree: &GameTree) -> Vec<DecisionNodeInfo> {
+pub(crate) fn collect_decision_nodes(tree: &GameTree) -> Vec<DecisionNodeInfo> {
     tree.nodes
         .iter()
         .enumerate()
