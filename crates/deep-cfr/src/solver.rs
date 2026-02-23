@@ -171,10 +171,10 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
         deal_pool: Option<&[G::State]>,
     ) -> Result<(), SdCfrError> {
         let pi = player_index(player);
-        eprintln!("    P{}: traversing {} deals...", pi + 1, self.config.traversals_per_iter);
+        tracing::info!("    P{}: traversing {} deals...", pi + 1, self.config.traversals_per_iter);
         let value_net = self.get_or_init_value_net(pi)?;
         self.run_traversals_with_deals(player, iteration, &value_net, deal_pool)?;
-        eprintln!(
+        tracing::info!(
             "    P{}: training value net ({} SGD steps, {} samples)...",
             pi + 1,
             self.config.sgd_steps,
@@ -260,7 +260,7 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
 
         for k in 0..total {
             if log_interval > 0 && k > 0 && k % log_interval == 0 {
-                eprintln!(
+                tracing::info!(
                     "    [iter {iteration}] P{} traversal {k}/{total} (buf: {} stored, {} seen)",
                     pi + 1,
                     self.advantage_buffers[pi].len(),
@@ -313,7 +313,7 @@ impl<G: Game, E: StateEncoder<G::State>> SdCfrSolver<G, E> {
             self.advantage_buffers[pi].push(sample, &mut self.rng);
         }
 
-        eprintln!(
+        tracing::info!(
             "    [iter {iteration}] P{} batched {} traversals (batch_size={batch_size}, buf: {} stored, {} seen)",
             pi + 1,
             total,

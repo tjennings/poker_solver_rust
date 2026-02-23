@@ -491,10 +491,14 @@ fn solve_postflop_per_spr(
         #[allow(clippy::cast_precision_loss)]
         let mb = buf_size as f64 * 8.0 / 1_000_000.0;
         let mode = if use_exhaustive { "exhaustive" } else { "sampled" };
-        eprintln!(
-            "  SPR {:.1}: {} nodes, {buf_size} slots ({mb:.1} MB), {mode} {actual_pairs} pairs/iter",
-            tree.spr,
-            tree.node_count(),
+        tracing::debug!(
+            spr = format_args!("{:.1}", tree.spr),
+            nodes = tree.node_count(),
+            buf_size,
+            mb = format_args!("{mb:.1}"),
+            mode,
+            actual_pairs,
+            "SPR tree allocated"
         );
     }
 

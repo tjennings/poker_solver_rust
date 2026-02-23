@@ -180,7 +180,7 @@ pub fn traverse_batched<G: Game, E: StateEncoder<G::State>>(
 
     let total = stats.hits + stats.misses;
     if total > 0 {
-        log::debug!(
+        tracing::debug!(
             "Strategy cache: {total} lookups, {:.1}% hit rate ({} entries)",
             stats.hit_rate() * 100.0,
             cache.len(),

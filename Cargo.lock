@@ -3499,6 +3499,7 @@ dependencies = [
  "test-macros",
  "thiserror 1.0.69",
  "toml 0.8.2",
+ "tracing",
 ]
 
 [[package]]
@@ -3508,7 +3509,6 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "indicatif",
- "log",
  "poker-solver-core",
  "proptest",
  "rand 0.9.2",
@@ -3517,6 +3517,7 @@ dependencies = [
  "safetensors 0.7.0",
  "serde",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -3541,6 +3542,7 @@ dependencies = [
  "rayon",
  "rustc-hash 2.1.1",
  "thiserror 1.0.69",
+ "tracing",
  "wgpu",
 ]
 
