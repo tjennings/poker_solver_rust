@@ -118,6 +118,14 @@ The CDF representation means L2 distance equals Earth Mover's Distance for 1D di
 
 `StreetEquity` holds per-street `BucketEquity` tables — 2D arrays `[bucket_a][bucket_b] → f32` storing average equity when bucket A faces bucket B. Used as leaf-node estimates during postflop CFR.
 
+**Computation:** Bucket-pair equity is derived from the histogram CDFs already computed during Stage 1 (no second EHS pass needed):
+
+1. **Per-situation average equity:** Extract from each CDF: `avg_eq = (1/BINS) * Σ(1 - cdf[i])`. For river, use raw scalar equity directly.
+2. **Per-bucket centroid:** Group situations by bucket assignment, average their equities.
+3. **Pair equity:** `equity(a, b) = centroid[a] / (centroid[a] + centroid[b])`. This approximation correctly orders buckets by strength and guarantees zero-sum symmetry.
+
+The intermediate features are returned from `build_street_buckets_independent` in a `BucketingResult` struct to avoid recomputation.
+
 **File:** `crates/core/src/preflop/hand_buckets.rs`
 
 ### Stage 3: Postflop Trees

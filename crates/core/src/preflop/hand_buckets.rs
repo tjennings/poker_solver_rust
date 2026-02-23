@@ -13,7 +13,7 @@ use crate::poker::Card;
 use crate::preflop::ehs::{EhsFeatures, ehs_features, equity_histogram, HISTOGRAM_BINS};
 
 /// Feature type for histogram-based k-means clustering.
-pub(crate) type HistogramFeatures = [f64; HISTOGRAM_BINS];
+pub type HistogramFeatures = [f64; HISTOGRAM_BINS];
 
 /// Number of canonical preflop hands.
 pub const NUM_HANDS: usize = 169;
@@ -71,6 +71,62 @@ pub struct StreetBuckets {
     /// `river[situation_idx]` → river bucket ID
     pub river: Vec<u16>,
     pub num_river_buckets: u16,
+}
+
+/// Result of `build_street_buckets_independent`, containing both the bucket
+/// assignments and the intermediate features needed to compute bucket-pair equity.
+pub struct BucketingResult {
+    /// Per-street bucket assignments.
+    pub buckets: StreetBuckets,
+    /// Flat histogram CDF features from flop clustering, indexed by
+    /// `hand_idx * num_flop_boards + flop_idx`.
+    pub flop_histograms: Vec<HistogramFeatures>,
+    /// Flat histogram CDF features from turn clustering, indexed by
+    /// `hand_idx * num_turn_boards + turn_idx`.
+    pub turn_histograms: Vec<HistogramFeatures>,
+    /// Flat scalar equities from river computation, indexed by
+    /// `hand_idx * num_river_boards + river_idx`.
+    pub river_equities: Vec<f64>,
+}
+
+impl BucketingResult {
+    /// Compute per-street bucket-pair equity tables from the intermediate features.
+    ///
+    /// For flop/turn, extracts average equity from each histogram CDF via
+    /// `cdf_to_avg_equity` (NaN-safe), then groups by bucket to derive pair equity.
+    /// For river, uses raw scalar equities directly.
+    #[must_use]
+    pub fn compute_street_equity(&self) -> StreetEquity {
+        let flop_avg: Vec<f64> = self
+            .flop_histograms
+            .iter()
+            .map(|cdf| cdf_to_avg_equity(cdf))
+            .collect();
+        let flop = compute_bucket_pair_equity(
+            &self.buckets.flop,
+            self.buckets.num_flop_buckets as usize,
+            &flop_avg,
+        );
+
+        let turn_avg: Vec<f64> = self
+            .turn_histograms
+            .iter()
+            .map(|cdf| cdf_to_avg_equity(cdf))
+            .collect();
+        let turn = compute_bucket_pair_equity(
+            &self.buckets.turn,
+            self.buckets.num_turn_buckets as usize,
+            &turn_avg,
+        );
+
+        let river = compute_bucket_pair_equity(
+            &self.buckets.river,
+            self.buckets.num_river_buckets as usize,
+            &self.river_equities,
+        );
+
+        StreetEquity { flop, turn, river }
+    }
 }
 
 impl StreetBuckets {
@@ -149,6 +205,80 @@ pub fn bucket_ehs_centroids(
 }
 
 // ---------------------------------------------------------------------------
+// Bucket-pair equity from histogram CDFs
+// ---------------------------------------------------------------------------
+
+/// Extract average equity from a histogram CDF.
+///
+/// A CDF `cdf[i]` = P(equity <= (i+1)/N). The average equity is:
+///   `avg = (1/N) * sum_{i=0}^{N-1} (1 - cdf[i])`
+///
+/// This works because `1 - cdf[i]` = P(equity > (i+1)/N), and summing these
+/// survival probabilities over equal-width bins gives the mean.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn cdf_to_avg_equity(cdf: &HistogramFeatures) -> f64 {
+    if cdf.iter().any(|c| c.is_nan()) {
+        return f64::NAN;
+    }
+    let n = HISTOGRAM_BINS as f64;
+    let sum: f64 = cdf.iter().map(|&c| 1.0 - c).sum();
+    sum / n
+}
+
+/// Compute bucket-pair equity from per-situation average equities and bucket assignments.
+///
+/// Groups situations by bucket to get per-bucket centroid equity (average of
+/// member equities), then derives pair equity as `c_a / (c_a + c_b)`.
+///
+/// Situations with NaN equity are skipped.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn compute_bucket_pair_equity(
+    assignments: &[u16],
+    num_buckets: usize,
+    avg_equities: &[f64],
+) -> BucketEquity {
+    debug_assert_eq!(assignments.len(), avg_equities.len());
+
+    // Accumulate per-bucket centroid equity.
+    let mut sums = vec![0.0f64; num_buckets];
+    let mut counts = vec![0u32; num_buckets];
+
+    for (&bucket, &eq) in assignments.iter().zip(avg_equities.iter()) {
+        if eq.is_nan() {
+            continue;
+        }
+        let b = bucket as usize;
+        sums[b] += eq;
+        counts[b] += 1;
+    }
+
+    let centroids: Vec<f64> = sums
+        .iter()
+        .zip(&counts)
+        .map(|(&s, &c)| if c > 0 { s / f64::from(c) } else { 0.5 })
+        .collect();
+
+    // Derive pair equity: equity(a, b) = c_a / (c_a + c_b).
+    let mut equity = vec![vec![0.5f32; num_buckets]; num_buckets];
+    for a in 0..num_buckets {
+        for b in 0..num_buckets {
+            let ca = centroids[a];
+            let cb = centroids[b];
+            let denom = ca + cb;
+            #[allow(clippy::cast_possible_truncation)]
+            if denom > 0.0 {
+                equity[a][b] = (ca / denom) as f32;
+            }
+            // If both centroids are 0.0, keep default 0.5.
+        }
+    }
+
+    BucketEquity { equity, num_buckets }
+}
+
+// ---------------------------------------------------------------------------
 // Independent per-street clustering pipeline (imperfect recall)
 // ---------------------------------------------------------------------------
 
@@ -157,6 +287,9 @@ pub fn bucket_ehs_centroids(
 /// Each street runs k-means independently on equity histogram CDFs (flop/turn)
 /// or raw equity (river). No cross-street dependencies. Implements standard
 /// imperfect-recall abstraction as used by Pluribus.
+///
+/// Returns a `BucketingResult` containing both the bucket assignments and the
+/// intermediate features (histograms, equities) needed for computing bucket-pair equity.
 #[must_use]
 pub fn build_street_buckets_independent(
     hands: &[CanonicalHand],
@@ -165,7 +298,7 @@ pub fn build_street_buckets_independent(
     num_turn_buckets: u16,
     num_river_buckets: u16,
     on_progress: &(impl Fn(BuildProgress) + Sync + Send),
-) -> StreetBuckets {
+) -> BucketingResult {
     // --- Flop ---
     let num_hands = hands.len();
     on_progress(BuildProgress::FlopFeatures(0, num_hands));
@@ -231,14 +364,19 @@ pub fn build_street_buckets_independent(
     on_progress(BuildProgress::RiverClustering);
     let river_assignments = cluster_river_equities(&river_equities, num_river_buckets);
 
-    StreetBuckets {
-        flop: flop_assignments,
-        num_flop_buckets,
-        num_flop_boards: flops.len(),
-        turn: turn_assignments,
-        num_turn_buckets,
-        river: river_assignments,
-        num_river_buckets,
+    BucketingResult {
+        buckets: StreetBuckets {
+            flop: flop_assignments,
+            num_flop_buckets,
+            num_flop_boards: flops.len(),
+            turn: turn_assignments,
+            num_turn_buckets,
+            river: river_assignments,
+            num_river_buckets,
+        },
+        flop_histograms: flop_features,
+        turn_histograms: turn_features,
+        river_equities,
     }
 }
 
@@ -1009,6 +1147,153 @@ mod tests {
         assert!(valid_count > 100, "too few valid equities: {valid_count}");
     }
 
+    // -----------------------------------------------------------------------
+    // cdf_to_avg_equity tests
+    // -----------------------------------------------------------------------
+
+    #[timed_test]
+    fn cdf_to_avg_equity_nan_guard() {
+        let cdf = [f64::NAN; HISTOGRAM_BINS];
+        assert!(cdf_to_avg_equity(&cdf).is_nan(), "all-NaN CDF should return NaN");
+
+        let mut partial = [0.0f64; HISTOGRAM_BINS];
+        partial[3] = f64::NAN;
+        assert!(cdf_to_avg_equity(&partial).is_nan(), "any NaN element should return NaN");
+    }
+
+    #[timed_test]
+    fn cdf_to_avg_equity_uniform_returns_half() {
+        // Uniform CDF: cdf[i] = (i+1) / N
+        let mut cdf = [0.0f64; HISTOGRAM_BINS];
+        for (i, v) in cdf.iter_mut().enumerate() {
+            *v = (i + 1) as f64 / HISTOGRAM_BINS as f64;
+        }
+        let avg = cdf_to_avg_equity(&cdf);
+        assert!(
+            (avg - 0.45).abs() < 1e-9,
+            "uniform CDF avg equity should be 0.45 (midpoint of discrete bins), got {avg}"
+        );
+    }
+
+    #[timed_test]
+    fn cdf_to_avg_equity_all_ones_returns_zero() {
+        // CDF is all 1.0 — all mass at equity = 0. avg = 0.
+        let cdf = [1.0f64; HISTOGRAM_BINS];
+        let avg = cdf_to_avg_equity(&cdf);
+        assert!(
+            avg.abs() < 1e-9,
+            "all-ones CDF should give avg equity 0, got {avg}"
+        );
+    }
+
+    #[timed_test]
+    fn cdf_to_avg_equity_step_at_last_bin_returns_high() {
+        // CDF is 0.0 for all bins except last which is 1.0.
+        // This means all mass is in the highest bin.
+        let mut cdf = [0.0f64; HISTOGRAM_BINS];
+        cdf[HISTOGRAM_BINS - 1] = 1.0;
+        let avg = cdf_to_avg_equity(&cdf);
+        // sum of (1 - cdf[i]) = (N-1)*1.0 + 0.0 = N-1
+        // avg = (N-1)/N = 0.9
+        let expected = (HISTOGRAM_BINS - 1) as f64 / HISTOGRAM_BINS as f64;
+        assert!(
+            (avg - expected).abs() < 1e-9,
+            "step-at-last CDF should give avg {expected}, got {avg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_bucket_pair_equity tests
+    // -----------------------------------------------------------------------
+
+    #[timed_test]
+    fn compute_bucket_pair_equity_basic_ordering() {
+        // 4 situations, 2 buckets. Bucket 0 has high equity, bucket 1 has low equity.
+        let assignments = vec![0u16, 0, 1, 1];
+        let avg_equities = vec![0.8, 0.9, 0.2, 0.3];
+        let eq = compute_bucket_pair_equity(&assignments, 2, &avg_equities);
+
+        // Centroid 0 = 0.85, centroid 1 = 0.25
+        // equity(0,1) = 0.85 / (0.85 + 0.25) = 0.85/1.1 ≈ 0.7727
+        // equity(1,0) = 0.25 / (0.25 + 0.85) = 0.25/1.1 ≈ 0.2273
+        assert!(
+            eq.get(0, 1) > 0.7,
+            "strong bucket vs weak should have high equity, got {}",
+            eq.get(0, 1)
+        );
+        assert!(
+            eq.get(1, 0) < 0.3,
+            "weak bucket vs strong should have low equity, got {}",
+            eq.get(1, 0)
+        );
+    }
+
+    #[timed_test]
+    fn compute_bucket_pair_equity_symmetric() {
+        // equity(a, b) + equity(b, a) should equal 1.0
+        let assignments = vec![0u16, 0, 1, 1, 2, 2];
+        let avg_equities = vec![0.9, 0.8, 0.5, 0.5, 0.2, 0.1];
+        let eq = compute_bucket_pair_equity(&assignments, 3, &avg_equities);
+
+        for a in 0..3 {
+            for b in 0..3 {
+                let sum = eq.get(a, b) + eq.get(b, a);
+                assert!(
+                    (sum - 1.0).abs() < 1e-5,
+                    "equity({a},{b}) + equity({b},{a}) should = 1.0, got {sum}"
+                );
+            }
+        }
+    }
+
+    #[timed_test]
+    fn compute_bucket_pair_equity_self_is_half() {
+        let assignments = vec![0u16, 1, 2];
+        let avg_equities = vec![0.8, 0.5, 0.2];
+        let eq = compute_bucket_pair_equity(&assignments, 3, &avg_equities);
+
+        for b in 0..3 {
+            assert!(
+                (eq.get(b, b) - 0.5).abs() < 1e-6,
+                "self-equity should be 0.5, got {} for bucket {b}",
+                eq.get(b, b)
+            );
+        }
+    }
+
+    #[timed_test]
+    fn compute_bucket_pair_equity_skips_nan() {
+        // One NaN situation should be excluded from centroid calculation.
+        let assignments = vec![0u16, 0, 1];
+        let avg_equities = vec![0.8, f64::NAN, 0.3];
+        let eq = compute_bucket_pair_equity(&assignments, 2, &avg_equities);
+
+        // Centroid 0 = 0.8 (NaN skipped), centroid 1 = 0.3
+        // equity(0,1) = 0.8 / 1.1 ≈ 0.7273
+        let expected = (0.8 / 1.1) as f32;
+        assert!(
+            (eq.get(0, 1) - expected).abs() < 1e-5,
+            "NaN should be skipped, expected {expected}, got {}",
+            eq.get(0, 1)
+        );
+    }
+
+    #[timed_test]
+    fn compute_bucket_pair_equity_empty_bucket_defaults_half() {
+        // Bucket 1 has no assignments.
+        let assignments = vec![0u16, 0];
+        let avg_equities = vec![0.7, 0.8];
+        let eq = compute_bucket_pair_equity(&assignments, 2, &avg_equities);
+
+        // Centroid 0 = 0.75, centroid 1 = 0.5 (default)
+        // equity(0,1) = 0.75 / 1.25 = 0.6
+        assert!(
+            (eq.get(0, 1) - 0.6).abs() < 1e-5,
+            "empty bucket should default to 0.5 centroid, got equity {}",
+            eq.get(0, 1)
+        );
+    }
+
     #[timed_test(300)]
     #[ignore = "slow"]
     fn build_street_buckets_independent_produces_valid_assignments() {
@@ -1017,9 +1302,10 @@ mod tests {
         let flops = canonical_flops();
         let small_flops: Vec<[Card; 3]> = flops.into_iter().take(3).collect();
 
-        let buckets = build_street_buckets_independent(
+        let result = build_street_buckets_independent(
             &hands, &small_flops, 5, 5, 5, &|_| {},
         );
+        let buckets = &result.buckets;
 
         // All flop bucket IDs should be in range
         for &b in &buckets.flop {
