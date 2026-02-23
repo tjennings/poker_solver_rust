@@ -216,6 +216,7 @@ postflop_model:
   canonical_sprs: [0.5, 1.0, 1.5, 3.0, 5.0, 10.0, 20.0, 50.0]
   postflop_solve_iterations: 1000
   postflop_solve_samples: 100000
+  equity_rollout_samples: 0  # 0=exhaustive, >0=sample N runouts per hand pair on flop
 ```
 
 ### Postflop Model Presets
@@ -228,6 +229,8 @@ postflop_model:
 | `accurate` | 1000/1000/1000 | all (~1,755) | High-fidelity analysis |
 
 The `max_flop_boards` parameter controls how many canonical flop textures are used for EHS feature computation during hand bucketing. Lower values dramatically speed up the bucketing phase. Set to `0` (or omit) to use all ~1,755 canonical flops. Configurable in YAML via `max_flop_boards: 200`.
+
+The `equity_rollout_samples` parameter controls how bucket-pair equity is computed on flop boards. With `0` (default), all C(remaining,2) runouts are enumerated exactly (~990 per hand pair). With a positive value like `100` or `200`, that many random (turn, river) runouts are sampled per pair — roughly 10x faster with good accuracy. Turn and river equity is always exact regardless of this setting.
 
 ---
 
