@@ -847,14 +847,14 @@ fn run_solve_preflop(
                             pf_pb.set_position(*done as u64);
                             pf_pb.set_message("Hand buckets");
                         }
-                        BuildPhase::SolvingPostflop(iter, total) => {
-                            if *iter == 0 {
+                        BuildPhase::SolvingPostflop { iteration, max_iterations, flop_name, .. } => {
+                            if *iteration <= 1 {
                                 pf_pb.reset_eta();
                             }
                             pf_pb.set_style(bar_style.clone());
-                            pf_pb.set_length(*total as u64);
-                            pf_pb.set_position(*iter as u64);
-                            pf_pb.set_message("Solving postflop");
+                            pf_pb.set_length(*max_iterations as u64);
+                            pf_pb.set_position(*iteration as u64);
+                            pf_pb.set_message(format!("Solving {flop_name}"));
                         }
                         _ => {
                             pf_pb.set_style(spinner_style.clone());

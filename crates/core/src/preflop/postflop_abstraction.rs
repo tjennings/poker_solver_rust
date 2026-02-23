@@ -13,8 +13,6 @@
 //!     → return expected value
 //! ```
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use rand::rngs::SmallRng;
 use serde::{Deserialize, Serialize};
 use rand::{Rng, SeedableRng};
@@ -250,12 +248,23 @@ pub enum BuildPhase {
     HandBuckets(usize, usize),
     /// Computing bucket-vs-bucket equity table.
     EquityTable,
-    /// Building postflop game trees for each SPR.
+    /// Building postflop game trees.
     Trees,
     /// Computing flat buffer layout.
     Layout,
-    /// Solving postflop game to convergence. Contains `(iteration, total)`.
-    SolvingPostflop(usize, usize),
+    /// Per-flop CFR solve with convergence tracking.
+    SolvingPostflop {
+        round: u16,
+        total_rounds: u16,
+        flop_name: String,
+        iteration: usize,
+        max_iterations: usize,
+        delta: f64,
+    },
+    /// Extracting EV histograms from converged strategy.
+    ExtractingEv(usize, usize),
+    /// Re-clustering with EV features.
+    Rebucketing(u16, u16),
     /// Computing value table from converged strategy.
     ComputingValues,
 }
@@ -267,8 +276,12 @@ impl std::fmt::Display for BuildPhase {
             Self::EquityTable => write!(f, "Equity table"),
             Self::Trees => write!(f, "Postflop trees"),
             Self::Layout => write!(f, "Buffer layout"),
-            Self::SolvingPostflop(iter, total) => write!(f, "Solving postflop ({iter}/{total})"),
-            Self::ComputingValues => write!(f, "Computing value table"),
+            Self::SolvingPostflop { round, total_rounds, flop_name, iteration, max_iterations, delta } => {
+                write!(f, "[{round}/{total_rounds}] Flop '{flop_name}' iter {iteration}/{max_iterations} \u{03b4}={delta:.4}")
+            }
+            Self::ExtractingEv(done, total) => write!(f, "EV histograms ({done}/{total})"),
+            Self::Rebucketing(round, total) => write!(f, "Rebucketing ({round}/{total})"),
+            Self::ComputingValues => write!(f, "Computing values"),
         }
     }
 }
@@ -322,9 +335,10 @@ impl PostflopAbstraction {
         } else {
             num_flop_b
         };
-        let num_flops = buckets.flop.len();
-        let total_steps = total_iters * num_flops;
-        on_progress(BuildPhase::SolvingPostflop(0, total_steps));
+
+        let flop_names: Vec<String> = flops.iter()
+            .map(|f| format!("{}{}{}", f[0], f[1], f[2]))
+            .collect();
 
         let flop_results = solve_postflop_per_flop(
             &tree,
@@ -334,7 +348,10 @@ impl PostflopAbstraction {
             total_iters,
             samples,
             config.rebucket_delta_threshold,
-            |step, total| on_progress(BuildPhase::SolvingPostflop(step, total)),
+            &flop_names,
+            1,
+            config.rebucket_rounds,
+            &on_progress,
         );
 
         let per_flop_strategy_sums: Vec<Vec<f64>> = flop_results
@@ -464,7 +481,7 @@ struct SolveEquity<'a> {
 /// Solve all flops in parallel, each with the shared tree template.
 ///
 /// Returns per-flop solve results (strategy sums + convergence info).
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
 fn solve_postflop_per_flop(
     tree: &PostflopTree,
     layout: &PostflopLayout,
@@ -473,10 +490,12 @@ fn solve_postflop_per_flop(
     num_iterations: usize,
     samples_per_iter: usize,
     delta_threshold: f64,
-    on_progress: impl Fn(usize, usize) + Sync,
+    flop_names: &[String],
+    round: u16,
+    total_rounds: u16,
+    on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> Vec<FlopSolveResult> {
     let num_flops = street_equity.flop.len();
-    let total_steps = num_iterations * num_flops;
     let use_exhaustive = num_flop_buckets * num_flop_buckets <= samples_per_iter;
     let actual_pairs = if use_exhaustive {
         num_flop_buckets * num_flop_buckets
@@ -500,8 +519,6 @@ fn solve_postflop_per_flop(
         "Per-flop solve allocated"
     );
 
-    let progress = AtomicUsize::new(0);
-
     (0..num_flops)
         .into_par_iter()
         .map(|flop_idx| {
@@ -510,6 +527,7 @@ fn solve_postflop_per_flop(
                 turn: &street_equity.turn,
                 river: &street_equity.river,
             };
+            let flop_name = flop_names.get(flop_idx).map_or("?", |s| s.as_str());
             solve_one_flop(
                 tree,
                 layout,
@@ -520,9 +538,10 @@ fn solve_postflop_per_flop(
                 samples_per_iter,
                 delta_threshold,
                 flop_idx,
-                &progress,
-                total_steps,
-                &on_progress,
+                flop_name,
+                round,
+                total_rounds,
+                on_progress,
             )
         })
         .collect()
@@ -544,9 +563,10 @@ fn solve_one_flop(
     samples_per_iter: usize,
     delta_threshold: f64,
     flop_idx: usize,
-    progress: &AtomicUsize,
-    total_steps: usize,
-    on_progress: &(impl Fn(usize, usize) + Sync),
+    flop_name: &str,
+    round: u16,
+    total_rounds: u16,
+    on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> FlopSolveResult {
     let mut regret_sum = vec![0.0f64; buf_size];
     let mut strategy_sum = vec![0.0f64; buf_size];
@@ -555,9 +575,6 @@ fn solve_one_flop(
     let mut iterations_used = 0;
 
     for iter in 0..num_iterations {
-        let step = progress.fetch_add(1, Ordering::Relaxed) + 1;
-        on_progress(step, total_steps);
-
         let iteration = iter as u64 + 1;
 
         // Snapshot regrets before this iteration for delta computation.
@@ -584,14 +601,18 @@ fn solve_one_flop(
         if iter >= 1 {
             final_delta = max_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
             if final_delta < delta_threshold {
-                // Advance the shared progress counter for the skipped iterations.
-                let skipped = num_iterations - iterations_used;
-                if skipped > 0 {
-                    progress.fetch_add(skipped, Ordering::Relaxed);
-                }
                 break;
             }
         }
+
+        on_progress(BuildPhase::SolvingPostflop {
+            round,
+            total_rounds,
+            flop_name: flop_name.to_string(),
+            iteration: iter + 1,
+            max_iterations: num_iterations,
+            delta: final_delta,
+        });
     }
 
     FlopSolveResult { strategy_sum, final_delta, iterations_used }
@@ -1246,11 +1267,10 @@ mod tests {
             turn: &eq,
             river: &eq,
         };
-        let progress = AtomicUsize::new(0);
         let result = solve_one_flop(
             &tree, &layout, &solve_eq,
             5, buf_size, 4, 25, 0.0001,
-            0, &progress, 4, &|_, _| {},
+            0, "AhKd7s", 1, 1, &|_| {},
         );
         assert_eq!(result.strategy_sum.len(), buf_size);
         assert!(result.iterations_used >= 2);
@@ -1277,11 +1297,10 @@ mod tests {
             turn: &eq,
             river: &eq,
         };
-        let progress = AtomicUsize::new(0);
         let result = solve_one_flop(
             &tree, &layout, &solve_eq,
             5, buf_size, 3, 25, 0.0,
-            0, &progress, 3, &|_, _| {},
+            0, "AhKd7s", 1, 1, &|_| {},
         );
         assert_eq!(result.iterations_used, 3, "zero threshold should run all iterations");
     }
@@ -1304,11 +1323,10 @@ mod tests {
             turn: &eq,
             river: &eq,
         };
-        let progress = AtomicUsize::new(0);
         let result = solve_one_flop(
             &tree, &layout, &solve_eq,
             5, buf_size, 100, 25, f64::INFINITY,
-            0, &progress, 100, &|_, _| {},
+            0, "AhKd7s", 1, 1, &|_| {},
         );
         assert_eq!(result.iterations_used, 2, "huge threshold should stop at minimum 2 iterations");
     }
@@ -1326,5 +1344,34 @@ mod tests {
         let (slot_base, slot_actions) = layout.slot(0, 0);
         assert_eq!(entry_offset, slot_base);
         assert_eq!(entry_actions, slot_actions);
+    }
+
+    #[timed_test]
+    fn build_phase_display_solving_postflop() {
+        let phase = BuildPhase::SolvingPostflop {
+            round: 1,
+            total_rounds: 2,
+            flop_name: "AhKd7s".to_string(),
+            iteration: 45,
+            max_iterations: 200,
+            delta: 0.0032,
+        };
+        let s = format!("{phase}");
+        assert!(s.contains("1/2"), "should show round: {s}");
+        assert!(s.contains("AhKd7s"), "should show flop name: {s}");
+        assert!(s.contains("45/200"), "should show iteration: {s}");
+        assert!(s.contains("0.0032"), "should show delta: {s}");
+    }
+
+    #[timed_test]
+    fn build_phase_display_extracting_ev() {
+        let phase = BuildPhase::ExtractingEv(50, 169);
+        assert_eq!(format!("{phase}"), "EV histograms (50/169)");
+    }
+
+    #[timed_test]
+    fn build_phase_display_rebucketing() {
+        let phase = BuildPhase::Rebucketing(2, 3);
+        assert_eq!(format!("{phase}"), "Rebucketing (2/3)");
     }
 }
