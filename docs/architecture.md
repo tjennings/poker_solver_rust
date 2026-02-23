@@ -49,7 +49,6 @@ poker_solver_rust/
 ├── agents/                    # Agent personality configs (TOML)
 ├── sample_configurations/     # Training config presets (YAML)
 ├── docs/                      # Architecture, training, explorer, cloud docs
-└── *.yaml                     # Training configs (root-level)
 ```
 
 ### Component Summary
