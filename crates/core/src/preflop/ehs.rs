@@ -27,6 +27,7 @@ pub fn ehs_features(hole: [Card; 2], board: &[Card]) -> EhsFeatures {
     [f64::from(hs.ehs), f64::from(hs.ppot), f64::from(hs.npot)]
 }
 
+#[cfg(test)]
 /// Compute average EHS feature vector over sampled boards, given a set of blocked cards.
 ///
 /// Samples `num_samples` runouts from the remaining deck, computes EHS features for each,
@@ -47,6 +48,7 @@ pub(crate) fn avg_ehs_features(
     )
 }
 
+#[cfg(test)]
 /// Sample `n` random runouts completing `known_board` to the next street.
 ///
 /// Returns boards of length `known_board.len() + 1` (adds one card per sample).
@@ -74,6 +76,7 @@ fn live_deck(hole: [Card; 2], board: &[Card]) -> Vec<Card> {
         .collect()
 }
 
+#[cfg(test)]
 /// Average a slice of `EhsFeatures` vectors.
 #[allow(clippy::cast_precision_loss)]
 fn average_features(features: &[EhsFeatures]) -> EhsFeatures {
@@ -190,6 +193,7 @@ pub fn single_value_cdf(eq: f64) -> [f64; HISTOGRAM_BINS] {
     cdf
 }
 
+#[cfg(test)]
 /// `splitmix64` — high-quality 64-bit hash/RNG step (same as used in `equity.rs`).
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -269,6 +273,7 @@ pub fn sample_canonical_flops(n: usize) -> Vec<[Card; 3]> {
         .collect()
 }
 
+#[cfg(test)]
 /// All cards not in hole or board — thin wrapper around `live_deck`.
 #[must_use]
 pub(crate) fn live_turn_cards(hole: &[Card; 2], board: &[Card]) -> Vec<Card> {

@@ -4,7 +4,9 @@
 //! Equity is calculated by enumerating all non-overlapping combo pairs and
 //! running Monte Carlo board sampling for each.
 
-use crate::hands::{CanonicalHand, all_hands};
+use crate::hands::CanonicalHand;
+#[cfg(test)]
+use crate::hands::all_hands;
 use crate::poker::{Card, Hand, Rank, Rankable, Suit, Value};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -177,6 +179,7 @@ fn evaluate_hand(hole: [Card; 2], board: [Card; 5]) -> Rank {
     hand.rank()
 }
 
+#[cfg(test)]
 /// Clear the equity cache.
 pub(crate) fn clear_cache() {
     if let Ok(mut cache) = EQUITY_CACHE.lock() {
@@ -184,12 +187,14 @@ pub(crate) fn clear_cache() {
     }
 }
 
+#[cfg(test)]
 /// Get the number of cached equity values.
 #[must_use]
 pub(crate) fn cache_size() -> usize {
     EQUITY_CACHE.lock().map_or(0, |c| c.len())
 }
 
+#[cfg(test)]
 /// Pre-compute all equity values between canonical hands.
 ///
 /// This can be called once before training to avoid equity calculation

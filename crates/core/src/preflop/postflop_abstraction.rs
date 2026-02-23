@@ -259,8 +259,6 @@ impl std::fmt::Display for BuildPhase {
     }
 }
 
-/// Total number of canonical preflop hands (for fine-grained progress).
-pub(crate) const NUM_CANONICAL_HANDS: usize = hand_buckets::NUM_HANDS;
 
 impl PostflopAbstraction {
     /// Build all precomputed postflop data from configuration.

@@ -420,6 +420,7 @@ impl KeyDescription {
     }
 }
 
+#[cfg(test)]
 /// Decode a 4-bit action code to its string label.
 #[must_use]
 pub(crate) fn decode_action_code(code: u8) -> &'static str {

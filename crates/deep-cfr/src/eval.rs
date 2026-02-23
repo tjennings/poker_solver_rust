@@ -11,6 +11,7 @@
 //!   decision) but exact. Used for exploitability measurement.
 
 use candle_core::{Device, Tensor};
+#[cfg(test)]
 use rand::Rng;
 
 use crate::SdCfrError;
@@ -22,6 +23,7 @@ use crate::network::AdvantageNet;
 // Shared helper: compute strategy from a single network + features
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 /// Compute a strategy (probability distribution over actions) from a single
 /// advantage network and info set features.
 ///
@@ -48,6 +50,7 @@ fn extract_probs(strategy: &Tensor) -> Result<Vec<f32>, SdCfrError> {
 // TrajectoryPolicy
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 /// Policy that uses a single sampled value net for an entire episode.
 ///
 /// At episode start, one network is sampled from the model buffer with
@@ -59,6 +62,7 @@ pub(crate) struct TrajectoryPolicy {
     device: Device,
 }
 
+#[cfg(test)]
 impl TrajectoryPolicy {
     /// Sample a trajectory policy from the model buffer.
     ///
