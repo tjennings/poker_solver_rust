@@ -168,6 +168,17 @@ impl PostflopLayout {
     pub fn street(&self, node_idx: u32) -> Street {
         self.entries[node_idx as usize].street
     }
+
+    /// Number of nodes in the layout.
+    pub(crate) fn num_nodes(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Get entry offset and `num_actions` for a node.
+    pub(crate) fn entry(&self, node_idx: usize) -> (usize, usize) {
+        let e = &self.entries[node_idx];
+        (e.offset, e.num_actions)
+    }
 }
 
 /// Number of hand buckets for a given street.
@@ -315,15 +326,21 @@ impl PostflopAbstraction {
         let total_steps = total_iters * num_flops;
         on_progress(BuildPhase::SolvingPostflop(0, total_steps));
 
-        let per_flop_strategy_sums = solve_postflop_per_flop(
+        let flop_results = solve_postflop_per_flop(
             &tree,
             &layout,
             &street_equity,
             num_flop_b,
             total_iters,
             samples,
+            config.rebucket_delta_threshold,
             |step, total| on_progress(BuildPhase::SolvingPostflop(step, total)),
         );
+
+        let per_flop_strategy_sums: Vec<Vec<f64>> = flop_results
+            .into_iter()
+            .map(|r| r.strategy_sum)
+            .collect();
 
         on_progress(BuildPhase::ComputingValues);
         let values = compute_postflop_values(
@@ -430,6 +447,13 @@ fn load_or_build_abstraction(
 // Postflop pre-solve: run CFR to convergence, then extract value table
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Result of a single flop CFR solve.
+pub(crate) struct FlopSolveResult {
+    pub strategy_sum: Vec<f64>,
+    pub final_delta: f64,
+    pub iterations_used: usize,
+}
+
 /// Equity references for a single flop solve.
 struct SolveEquity<'a> {
     flop: &'a BucketEquity,
@@ -439,7 +463,7 @@ struct SolveEquity<'a> {
 
 /// Solve all flops in parallel, each with the shared tree template.
 ///
-/// Returns per-flop strategy sums.
+/// Returns per-flop solve results (strategy sums + convergence info).
 #[allow(clippy::cast_possible_truncation)]
 fn solve_postflop_per_flop(
     tree: &PostflopTree,
@@ -448,8 +472,9 @@ fn solve_postflop_per_flop(
     num_flop_buckets: usize,
     num_iterations: usize,
     samples_per_iter: usize,
+    delta_threshold: f64,
     on_progress: impl Fn(usize, usize) + Sync,
-) -> Vec<Vec<f64>> {
+) -> Vec<FlopSolveResult> {
     let num_flops = street_equity.flop.len();
     let total_steps = num_iterations * num_flops;
     let use_exhaustive = num_flop_buckets * num_flop_buckets <= samples_per_iter;
@@ -471,6 +496,7 @@ fn solve_postflop_per_flop(
         mode,
         actual_pairs,
         num_flops,
+        delta_threshold,
         "Per-flop solve allocated"
     );
 
@@ -492,6 +518,7 @@ fn solve_postflop_per_flop(
                 buf_size,
                 num_iterations,
                 samples_per_iter,
+                delta_threshold,
                 flop_idx,
                 &progress,
                 total_steps,
@@ -502,6 +529,10 @@ fn solve_postflop_per_flop(
 }
 
 /// Run CFR for a single flop with the shared tree template.
+///
+/// Runs up to `num_iterations` CFR iterations, stopping early when the max
+/// strategy change between consecutive iterations drops below `delta_threshold`.
+/// Early stopping requires at least 2 completed iterations.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn solve_one_flop(
     tree: &PostflopTree,
@@ -511,20 +542,26 @@ fn solve_one_flop(
     buf_size: usize,
     num_iterations: usize,
     samples_per_iter: usize,
+    delta_threshold: f64,
     flop_idx: usize,
     progress: &AtomicUsize,
     total_steps: usize,
     on_progress: &(impl Fn(usize, usize) + Sync),
-) -> Vec<f64> {
+) -> FlopSolveResult {
     let mut regret_sum = vec![0.0f64; buf_size];
     let mut strategy_sum = vec![0.0f64; buf_size];
     let use_exhaustive = num_flop_buckets * num_flop_buckets <= samples_per_iter;
+    let mut final_delta = f64::INFINITY;
+    let mut iterations_used = 0;
 
     for iter in 0..num_iterations {
         let step = progress.fetch_add(1, Ordering::Relaxed) + 1;
         on_progress(step, total_steps);
 
         let iteration = iter as u64 + 1;
+
+        // Snapshot regrets before this iteration for delta computation.
+        let prev_regrets = regret_sum.clone();
 
         let (dr, ds) = if use_exhaustive {
             exhaustive_cfr_iteration(
@@ -541,9 +578,23 @@ fn solve_one_flop(
 
         add_buffers(&mut regret_sum, &dr);
         add_buffers(&mut strategy_sum, &ds);
+        iterations_used = iter + 1;
+
+        // Check for early stopping after at least 2 iterations.
+        if iter >= 1 {
+            final_delta = max_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
+            if final_delta < delta_threshold {
+                // Advance the shared progress counter for the skipped iterations.
+                let skipped = num_iterations - iterations_used;
+                if skipped > 0 {
+                    progress.fetch_add(skipped, Ordering::Relaxed);
+                }
+                break;
+            }
+        }
     }
 
-    strategy_sum
+    FlopSolveResult { strategy_sum, final_delta, iterations_used }
 }
 
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
@@ -781,6 +832,51 @@ fn add_buffers(dst: &mut [f64], src: &[f64]) {
     for (d, s) in dst.iter_mut().zip(src) {
         *d += *s;
     }
+}
+
+/// Compute max strategy change between two regret buffers across all decision nodes.
+///
+/// For each decision node in the tree, iterates through every bucket's action slice,
+/// applies regret matching to both the old and new regret buffers, and returns the
+/// maximum absolute difference in any action probability.
+fn max_strategy_delta(
+    old_regrets: &[f64],
+    new_regrets: &[f64],
+    layout: &PostflopLayout,
+    tree: &PostflopTree,
+) -> f64 {
+    let mut max_delta = 0.0f64;
+
+    for (node_idx, node) in tree.nodes.iter().enumerate() {
+        if let PostflopNode::Decision { children, .. } = node {
+            let num_actions = children.len();
+            if num_actions == 0 {
+                continue;
+            }
+
+            let (node_offset, _) = layout.entry(node_idx);
+            let node_end = if node_idx + 1 < layout.num_nodes() {
+                layout.entry(node_idx + 1).0
+            } else {
+                old_regrets.len()
+            };
+
+            // Process each bucket's action slice.
+            let mut pos = node_offset;
+            let mut old_strat = vec![0.0f64; num_actions];
+            let mut new_strat = vec![0.0f64; num_actions];
+            while pos + num_actions <= node_end {
+                regret_matching_into(old_regrets, pos, &mut old_strat);
+                regret_matching_into(new_regrets, pos, &mut new_strat);
+                for i in 0..num_actions {
+                    let diff = (old_strat[i] - new_strat[i]).abs();
+                    max_delta = max_delta.max(diff);
+                }
+                pos += num_actions;
+            }
+        }
+    }
+    max_delta
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1098,5 +1194,137 @@ mod tests {
         values[idx] = 0.42;
         let pv = PostflopValues { values, num_buckets, num_flops };
         assert!((pv.get_by_flop(1, 0, 1, 0) - 0.42).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn max_strategy_delta_identical_buffers_is_zero() {
+        let config = PostflopModelConfig::fast();
+        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
+        let streets = annotate_streets(&tree);
+        let layout = PostflopLayout::build(&tree, &streets, 10, 10, 10);
+        let buf = vec![1.0f64; layout.total_size];
+        let delta = max_strategy_delta(&buf, &buf, &layout, &tree);
+        assert!(
+            delta.abs() < 1e-12,
+            "identical buffers should have zero delta, got {delta}"
+        );
+    }
+
+    #[timed_test]
+    fn max_strategy_delta_detects_change() {
+        let config = PostflopModelConfig::fast();
+        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
+        let streets = annotate_streets(&tree);
+        let layout = PostflopLayout::build(&tree, &streets, 10, 10, 10);
+        let old = vec![1.0f64; layout.total_size];
+        let mut new = old.clone();
+        // Flip first slot to create a strategy change.
+        if layout.total_size >= 2 {
+            new[0] = 100.0;
+            new[1] = 0.0;
+        }
+        let delta = max_strategy_delta(&old, &new, &layout, &tree);
+        assert!(delta > 0.0, "different buffers should have nonzero delta");
+    }
+
+    #[timed_test]
+    fn solve_one_flop_returns_result_struct() {
+        // Verify that solve_one_flop returns FlopSolveResult with correct fields.
+        let config = PostflopModelConfig::fast();
+        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
+        let streets = annotate_streets(&tree);
+        let layout = PostflopLayout::build(&tree, &streets, 5, 5, 5);
+        let buf_size = layout.total_size;
+
+        // Create minimal equity tables (5 buckets).
+        let eq = BucketEquity {
+            equity: vec![vec![0.5; 5]; 5],
+            num_buckets: 5,
+        };
+        let solve_eq = SolveEquity {
+            flop: &eq,
+            turn: &eq,
+            river: &eq,
+        };
+        let progress = AtomicUsize::new(0);
+        let result = solve_one_flop(
+            &tree, &layout, &solve_eq,
+            5, buf_size, 4, 25, 0.0001,
+            0, &progress, 4, &|_, _| {},
+        );
+        assert_eq!(result.strategy_sum.len(), buf_size);
+        assert!(result.iterations_used >= 2);
+        assert!(result.iterations_used <= 4);
+        assert!(result.final_delta.is_finite());
+    }
+
+    #[timed_test]
+    fn solve_one_flop_early_stop_with_zero_threshold() {
+        // With threshold=0.0, should run all iterations (never stops early
+        // because delta is never exactly 0 after real CFR iterations).
+        let config = PostflopModelConfig::fast();
+        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
+        let streets = annotate_streets(&tree);
+        let layout = PostflopLayout::build(&tree, &streets, 5, 5, 5);
+        let buf_size = layout.total_size;
+
+        let eq = BucketEquity {
+            equity: vec![vec![0.5; 5]; 5],
+            num_buckets: 5,
+        };
+        let solve_eq = SolveEquity {
+            flop: &eq,
+            turn: &eq,
+            river: &eq,
+        };
+        let progress = AtomicUsize::new(0);
+        let result = solve_one_flop(
+            &tree, &layout, &solve_eq,
+            5, buf_size, 3, 25, 0.0,
+            0, &progress, 3, &|_, _| {},
+        );
+        assert_eq!(result.iterations_used, 3, "zero threshold should run all iterations");
+    }
+
+    #[timed_test]
+    fn solve_one_flop_early_stop_with_large_threshold() {
+        // With a very large threshold, should stop at iteration 2 (minimum).
+        let config = PostflopModelConfig::fast();
+        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
+        let streets = annotate_streets(&tree);
+        let layout = PostflopLayout::build(&tree, &streets, 5, 5, 5);
+        let buf_size = layout.total_size;
+
+        let eq = BucketEquity {
+            equity: vec![vec![0.5; 5]; 5],
+            num_buckets: 5,
+        };
+        let solve_eq = SolveEquity {
+            flop: &eq,
+            turn: &eq,
+            river: &eq,
+        };
+        let progress = AtomicUsize::new(0);
+        let result = solve_one_flop(
+            &tree, &layout, &solve_eq,
+            5, buf_size, 100, 25, f64::INFINITY,
+            0, &progress, 100, &|_, _| {},
+        );
+        assert_eq!(result.iterations_used, 2, "huge threshold should stop at minimum 2 iterations");
+    }
+
+    #[timed_test]
+    fn layout_entry_accessor_matches_slot() {
+        let config = PostflopModelConfig::fast();
+        let tree = PostflopTree::build_with_spr(&config, 5.0).unwrap();
+        let streets = annotate_streets(&tree);
+        let layout = PostflopLayout::build(&tree, &streets, 10, 10, 10);
+
+        assert!(layout.num_nodes() > 0);
+        // First decision node's entry should match slot(0, 0).
+        let (entry_offset, entry_actions) = layout.entry(0);
+        let (slot_base, slot_actions) = layout.slot(0, 0);
+        assert_eq!(entry_offset, slot_base);
+        assert_eq!(entry_actions, slot_actions);
     }
 }
