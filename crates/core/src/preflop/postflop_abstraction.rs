@@ -25,6 +25,7 @@ use super::hand_buckets::{self, BucketEquity, StreetBuckets, StreetEquity};
 use super::postflop_model::PostflopModelConfig;
 use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree};
 use crate::abstraction::Street;
+use crate::poker::Card;
 
 /// All precomputed postflop data needed by the preflop solver.
 pub struct PostflopAbstraction {
@@ -35,6 +36,8 @@ pub struct PostflopAbstraction {
     pub values: PostflopValues,
     /// Canonical SPR values for runtime SPR mapping.
     pub canonical_sprs: Vec<f64>,
+    /// The flop boards used to build this abstraction (for diagnostics/display).
+    pub flops: Vec<[Card; 3]>,
 }
 
 /// Precomputed EV table: `values[spr_idx][hero_pos][hero_bucket][opp_bucket]` → EV fraction.
@@ -284,7 +287,7 @@ impl PostflopAbstraction {
         if config.canonical_sprs.is_empty() {
             return Err(PostflopAbstractionError::EmptyCanonicalSprs);
         }
-        let (buckets, street_equity) = load_or_build_abstraction(
+        let (buckets, street_equity, flops) = load_or_build_abstraction(
             config,
             &on_progress,
         )?;
@@ -345,6 +348,7 @@ impl PostflopAbstraction {
             trees,
             values,
             canonical_sprs: config.canonical_sprs.clone(),
+            flops,
         })
     }
 
@@ -360,6 +364,7 @@ impl PostflopAbstraction {
         buckets: StreetBuckets,
         street_equity: StreetEquity,
         values: PostflopValues,
+        flops: Vec<[Card; 3]>,
     ) -> Result<Self, PostflopAbstractionError> {
         let trees = build_all_spr_trees(config)?;
         Ok(Self {
@@ -368,6 +373,7 @@ impl PostflopAbstraction {
             trees,
             values,
             canonical_sprs: config.canonical_sprs.clone(),
+            flops,
         })
     }
 }
@@ -384,7 +390,7 @@ impl PostflopAbstraction {
 fn load_or_build_abstraction(
     config: &PostflopModelConfig,
     on_progress: &(impl Fn(BuildPhase) + Sync),
-) -> Result<(StreetBuckets, StreetEquity), PostflopAbstractionError> {
+) -> Result<(StreetBuckets, StreetEquity, Vec<[Card; 3]>), PostflopAbstractionError> {
     // Cache is disabled during the StreetBuckets migration (format changed).
     // Task 9 will re-enable caching with the new format.
 
@@ -419,7 +425,7 @@ fn load_or_build_abstraction(
 
     let street_equity = result.compute_street_equity();
 
-    Ok((result.buckets, street_equity))
+    Ok((result.buckets, street_equity, flops))
 }
 
 fn build_all_spr_trees(

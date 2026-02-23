@@ -3,7 +3,6 @@
 use serde::Serialize;
 
 use poker_solver_core::hands::{all_hands, CanonicalHand};
-use poker_solver_core::preflop::ehs::canonical_flops;
 use poker_solver_core::preflop::postflop_abstraction::PostflopAbstraction;
 use poker_solver_core::preflop::postflop_model::PostflopModelConfig;
 use poker_solver_core::poker::{Card, Suit, Value};
@@ -67,13 +66,13 @@ pub fn run_with_abstraction(
     abstraction: &PostflopAbstraction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let all_hands_vec: Vec<CanonicalHand> = all_hands().collect();
-    let flops = canonical_flops();
+    let flops = &abstraction.flops;
     let num_flop_boards = abstraction.buckets.num_flop_boards;
     let num_buckets = abstraction.buckets.num_flop_buckets as usize;
 
     eprintln!("Tracing all {} canonical hands...", all_hands_vec.len());
 
-    let output = build_trace_output(&all_hands_vec, &flops, abstraction, num_flop_boards, num_buckets);
+    let output = build_trace_output(&all_hands_vec, flops, abstraction, num_flop_boards, num_buckets);
     println!("{}", serde_json::to_string_pretty(&output)?);
 
     Ok(())
