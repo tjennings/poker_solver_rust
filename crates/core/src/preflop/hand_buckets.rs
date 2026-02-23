@@ -640,6 +640,79 @@ fn card_bit_idx(card: Card) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// EV-based histogram features (for rebucketing)
+// ---------------------------------------------------------------------------
+
+/// Convert EV values into a histogram CDF (same 10-bin format as equity histograms).
+///
+/// EV values are normalized to [0, 1] range using min/max of the input,
+/// then binned into `HISTOGRAM_BINS` equal-width bins. Returns NaN sentinel
+/// if input is empty or all values are identical (zero range).
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn ev_values_to_histogram(ev_values: &[f64]) -> HistogramFeatures {
+    use crate::preflop::ehs::{counts_to_cdf, single_value_cdf};
+
+    if ev_values.is_empty() {
+        return [f64::NAN; HISTOGRAM_BINS];
+    }
+
+    let min_ev = ev_values.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_ev = ev_values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let range = max_ev - min_ev;
+
+    if range < 1e-12 {
+        // All values identical — produce a single-value CDF at midpoint
+        return single_value_cdf(0.5);
+    }
+
+    let mut counts = [0u32; HISTOGRAM_BINS];
+    for &ev in ev_values {
+        let normalized = (ev - min_ev) / range;
+        let bin = (normalized * HISTOGRAM_BINS as f64) as usize;
+        counts[bin.min(HISTOGRAM_BINS - 1)] += 1;
+    }
+    counts_to_cdf(&counts, ev_values.len())
+}
+
+/// Extract per-hand EV histograms from converged per-flop value tables.
+///
+/// For each (hand, flop), looks up the hand's bucket, collects EVs against
+/// all opponent buckets (averaged over both positions), and bins into a
+/// histogram CDF for clustering.
+///
+/// Returns flat `Vec<HistogramFeatures>` indexed by `hand_idx * num_flops + flop_idx`.
+#[must_use]
+pub fn build_ev_histograms(
+    buckets: &StreetBuckets,
+    values: &super::postflop_abstraction::PostflopValues,
+    num_hands: usize,
+    num_flop_buckets: usize,
+) -> Vec<HistogramFeatures> {
+    let num_flops = buckets.num_flop_boards();
+    let mut result = Vec::with_capacity(num_hands * num_flops);
+
+    for hand_idx in 0..num_hands {
+        for flop_idx in 0..num_flops {
+            let hero_bucket = buckets.flop_bucket_for_hand(hand_idx, flop_idx);
+
+            // Collect EV vs each opponent bucket, averaged over both positions
+            let evs: Vec<f64> = (0..num_flop_buckets)
+                .map(|opp_b| {
+                    let ev_pos0 = values.get_by_flop(flop_idx, 0, hero_bucket, opp_b as u16);
+                    let ev_pos1 = values.get_by_flop(flop_idx, 1, hero_bucket, opp_b as u16);
+                    (ev_pos0 + ev_pos1) / 2.0
+                })
+                .collect();
+
+            result.push(ev_values_to_histogram(&evs));
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Independent per-street clustering pipeline (imperfect recall)
 // ---------------------------------------------------------------------------
 
@@ -1695,5 +1768,68 @@ mod tests {
         for &b in &buckets.river {
             assert!(b < buckets.num_river_buckets);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // EV histogram tests
+    // -----------------------------------------------------------------------
+
+    #[timed_test]
+    fn ev_histogram_produces_valid_cdf() {
+        let ev_per_opp = vec![0.3, 0.7, 0.1, 0.9, 0.5];
+        let hist = ev_values_to_histogram(&ev_per_opp);
+        for i in 1..HISTOGRAM_BINS {
+            assert!(hist[i] >= hist[i - 1] - 1e-9, "CDF not monotonic at bin {i}");
+        }
+        assert!((hist[HISTOGRAM_BINS - 1] - 1.0).abs() < 1e-6, "CDF must end at 1.0");
+    }
+
+    #[timed_test]
+    fn ev_histogram_all_same_value() {
+        let ev_per_opp = vec![0.5, 0.5, 0.5];
+        let hist = ev_values_to_histogram(&ev_per_opp);
+        // When all values are the same, should still produce a valid CDF
+        assert!((hist[HISTOGRAM_BINS - 1] - 1.0).abs() < 1e-6);
+        assert!(!hist[0].is_nan(), "same-value input should not be NaN");
+    }
+
+    #[timed_test]
+    fn ev_histogram_empty_returns_nan() {
+        let ev_per_opp: Vec<f64> = vec![];
+        let hist = ev_values_to_histogram(&ev_per_opp);
+        assert!(hist[0].is_nan(), "empty input should produce NaN sentinel");
+    }
+
+    #[timed_test]
+    fn ev_histogram_two_extreme_values() {
+        let ev_per_opp = vec![0.0, 1.0];
+        let hist = ev_values_to_histogram(&ev_per_opp);
+        for i in 1..HISTOGRAM_BINS {
+            assert!(hist[i] >= hist[i - 1] - 1e-9, "CDF not monotonic at bin {i}");
+        }
+        assert!((hist[HISTOGRAM_BINS - 1] - 1.0).abs() < 1e-6);
+    }
+
+    #[timed_test]
+    fn build_ev_histograms_correct_length() {
+        // Create minimal buckets and values for 3 hands, 2 flops, 2 buckets
+        let buckets = StreetBuckets {
+            flop: vec![vec![0, 1, 0], vec![1, 0, 1]],
+            num_flop_buckets: 2,
+            turn: vec![],
+            num_turn_buckets: 2,
+            river: vec![],
+            num_river_buckets: 2,
+        };
+        // Create a PostflopValues with 2 flops, 2 buckets
+        // values[flop_idx * 2 * n * n + pos * n * n + hero * n + opp]
+        let n = 2;
+        let num_flops = 2;
+        let total = num_flops * 2 * n * n;
+        let values_data = vec![0.5f64; total];
+        let values = crate::preflop::postflop_abstraction::PostflopValues::from_raw(values_data, n, num_flops);
+
+        let histograms = build_ev_histograms(&buckets, &values, 3, 2);
+        assert_eq!(histograms.len(), 3 * 2, "should have num_hands * num_flops histograms");
     }
 }

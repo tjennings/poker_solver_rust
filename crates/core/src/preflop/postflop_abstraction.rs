@@ -87,6 +87,12 @@ impl PostflopValues {
         let idx = flop_idx * 2 * n * n + (hero_pos as usize) * n * n + (hero_bucket as usize) * n + opp_bucket as usize;
         self.values.get(idx).copied().unwrap_or(0.0)
     }
+
+    /// Create from raw data (for testing).
+    #[cfg(test)]
+    pub(crate) fn from_raw(values: Vec<f64>, num_buckets: usize, num_flops: usize) -> Self {
+        Self { values, num_buckets, num_flops }
+    }
 }
 
 /// Maps `(node_idx, bucket)` → flat buffer offset for ONE tree.
