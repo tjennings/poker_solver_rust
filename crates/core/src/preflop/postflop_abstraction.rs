@@ -92,7 +92,7 @@ impl PostflopValues {
 ///
 /// Each decision node reserves `num_buckets × num_actions` slots.
 /// The bucket count varies by the street of the node.
-pub struct PostflopLayout {
+pub(crate) struct PostflopLayout {
     entries: Vec<NodeEntry>,
     /// Total buffer size for this tree.
     pub total_size: usize,
@@ -260,7 +260,7 @@ impl std::fmt::Display for BuildPhase {
 }
 
 /// Total number of canonical preflop hands (for fine-grained progress).
-pub const NUM_CANONICAL_HANDS: usize = hand_buckets::NUM_HANDS;
+pub(crate) const NUM_CANONICAL_HANDS: usize = hand_buckets::NUM_HANDS;
 
 impl PostflopAbstraction {
     /// Build all precomputed postflop data from configuration.
@@ -491,10 +491,14 @@ fn solve_postflop_per_spr(
         #[allow(clippy::cast_precision_loss)]
         let mb = buf_size as f64 * 8.0 / 1_000_000.0;
         let mode = if use_exhaustive { "exhaustive" } else { "sampled" };
-        eprintln!(
-            "  SPR {:.1}: {} nodes, {buf_size} slots ({mb:.1} MB), {mode} {actual_pairs} pairs/iter",
-            tree.spr,
-            tree.node_count(),
+        tracing::debug!(
+            spr = format_args!("{:.1}", tree.spr),
+            nodes = tree.node_count(),
+            buf_size,
+            mb = format_args!("{mb:.1}"),
+            mode,
+            actual_pairs,
+            "SPR tree allocated"
         );
     }
 

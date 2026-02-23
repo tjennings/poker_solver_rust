@@ -507,7 +507,7 @@ impl HunlPostflop {
         let deck = Self::full_deck();
         let mut deals = Vec::with_capacity(count);
 
-        println!("Generating {count} random deals...");
+        tracing::info!(count, "generating random deals");
         let gen_start = std::time::Instant::now();
         for _ in 0..count {
             let mut shuffled = deck.clone();
@@ -529,7 +529,7 @@ impl HunlPostflop {
                 self.config.stack_depth,
             ));
         }
-        println!("  {count} deals generated in {:?}", gen_start.elapsed());
+        tracing::info!(count, elapsed = ?gen_start.elapsed(), "deals generated");
         deals
     }
 
@@ -541,7 +541,7 @@ impl HunlPostflop {
         use rand::SeedableRng;
         use rand::rngs::StdRng;
 
-        println!("Generating {count} flop-weighted deals...");
+        tracing::info!(count, "generating flop-weighted deals");
         let gen_start = std::time::Instant::now();
 
         let mut rng = StdRng::seed_from_u64(seed);
@@ -550,7 +550,7 @@ impl HunlPostflop {
         let deals: Vec<_> = (0..count)
             .map(|_| sampler.sample_deal(&mut rng, self.config.stack_depth))
             .collect();
-        println!("  {count} deals generated in {:?}", gen_start.elapsed());
+        tracing::info!(count, elapsed = ?gen_start.elapsed(), "deals generated");
         deals
     }
 
@@ -566,12 +566,7 @@ impl HunlPostflop {
         let deck = Self::full_deck();
         let total = canonical_flops.len() * C49_2;
 
-        println!(
-            "Generating uniform deals: {} flops × {} P1 pairs = {} deals...",
-            canonical_flops.len(),
-            C49_2,
-            total,
-        );
+        tracing::info!(flops = canonical_flops.len(), pairs = C49_2, total, "generating uniform deals");
 
         let stack_depth = self.config.stack_depth;
 
@@ -583,7 +578,7 @@ impl HunlPostflop {
             })
             .collect();
 
-        println!("  Generated {} deals.", deals.len());
+        tracing::info!(deals = deals.len(), "deals generated");
         deals
     }
 
@@ -644,12 +639,7 @@ impl HunlPostflop {
             total_added += added;
         }
 
-        println!(
-            "Stratified pool: {} deals (base {} + {} top-up)",
-            deals.len(),
-            base_count,
-            total_added
-        );
+        tracing::info!(deals = deals.len(), base_count, total_added, "stratified pool generated");
         print_coverage_summary(&coverage);
 
         deals
@@ -924,7 +914,7 @@ fn print_coverage_summary(coverage: &[usize; HandClass::COUNT]) {
         .filter(|&i| i < HandClass::NUM_MADE)
         .map(|i| format!("{}={}", labels[i], coverage[i]))
         .collect();
-    println!("  Coverage: {}", parts.join(", "));
+    tracing::info!(coverage = %parts.join(", "), "class coverage");
 }
 
 /// Number of 2-element subsets of 49 remaining cards: C(49, 2).
@@ -1064,15 +1054,12 @@ impl Game for HunlPostflop {
 
         // Precompute equity bins and strength for HandClassV2 mode
         if matches!(&self.abstraction, Some(AbstractionMode::HandClassV2 { .. })) {
-            println!(
-                "Precomputing equity bins and strength for {} deals...",
-                deals.len()
-            );
+            tracing::info!(deals = deals.len(), "precomputing equity bins and strength");
             let precomp_start = std::time::Instant::now();
             deals
                 .par_iter_mut()
                 .for_each(PostflopState::precompute_v2_caches);
-            println!("  Precomputation complete in {:?}", precomp_start.elapsed());
+            tracing::info!(elapsed = ?precomp_start.elapsed(), "precomputation complete");
         }
 
         deals

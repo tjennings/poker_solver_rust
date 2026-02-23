@@ -24,6 +24,7 @@ use bytemuck::{Pod, Zeroable};
 use pollster::FutureExt as _;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
+use tracing;
 
 use poker_solver_core::cfr::game_tree::{GameTree, NodeType};
 use poker_solver_core::cfr::DealInfo;
@@ -38,7 +39,7 @@ const HAND_SHIFT: u64 = 36;
 /// GPU-friendly node representation. 32 bytes, aligned to 4.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-pub struct GpuNode {
+pub(crate) struct GpuNode {
     /// 0 = P1 decision, 1 = P2 decision,
     /// 2 = fold (P1 folded), 3 = fold (P2 folded), 4 = showdown.
     pub node_type: u32,
@@ -208,7 +209,7 @@ impl GpuCfrSolver {
 
         let step = Instant::now();
         let (device, queue) = init_gpu()?;
-        println!("  GPU device acquired in {:?}", step.elapsed());
+        tracing::info!("  GPU device acquired in {:?}", step.elapsed());
 
         // Encode tree for GPU
         let (gpu_nodes, children_flat, level_nodes_flat, level_offsets, level_counts) =
@@ -221,14 +222,14 @@ impl GpuCfrSolver {
 
         // Pre-collect decision node indices with position keys
         let decision_nodes = collect_decision_nodes(tree);
-        println!("  {} decision nodes out of {} total", decision_nodes.len(), num_nodes);
+        tracing::info!("  {} decision nodes out of {} total", decision_nodes.len(), num_nodes);
 
         // Determine hand classes and build info set mapping
         let step = Instant::now();
         let (key_to_dense, dense_to_key, num_hand_classes) =
             build_info_set_mapping(tree, &deals, &decision_nodes);
         let num_info_sets = dense_to_key.len() as u32;
-        println!(
+        tracing::info!(
             "  Info set mapping: {} info sets, {} hand classes in {:?}",
             num_info_sets, num_hand_classes, step.elapsed()
         );
@@ -246,7 +247,7 @@ impl GpuCfrSolver {
 
         let state_size = (num_info_sets as u64) * (max_actions as u64) * 4;
         let batch_node_size = (batch_size as u64) * (num_nodes as u64) * 4;
-        println!(
+        tracing::debug!(
             "  Batch size: {batch_size}, state buffer: {:.1} MB, batch buffer: {:.1} MB",
             state_size as f64 / 1_048_576.0,
             batch_node_size as f64 / 1_048_576.0,
@@ -306,7 +307,7 @@ impl GpuCfrSolver {
             max_uniform_slots * u64::from(uniform_stride),
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
 
-        println!("  GPU buffers allocated in {:?}", step.elapsed());
+        tracing::debug!("  GPU buffers allocated in {:?}", step.elapsed());
 
         // Create bind group layouts and compute pipelines
         let step = Instant::now();
@@ -333,7 +334,7 @@ impl GpuCfrSolver {
             "merge_deltas", include_str!("shaders/merge_deltas.wgsl"));
         let dcfr_discount_pipeline = create_pipeline(&device, &pipeline_layout,
             "dcfr_discount", include_str!("shaders/dcfr_discount.wgsl"));
-        println!("  Shader pipelines compiled in {:?}", step.elapsed());
+        tracing::info!("  Shader pipelines compiled in {:?}", step.elapsed());
 
         Ok(Self {
             device,
@@ -451,11 +452,10 @@ impl GpuCfrSolver {
         let iter_start = Instant::now();
         let mut last_log = Instant::now();
 
-        println!(
+        tracing::info!(
             "  iter {} starting: {} deals in {} batches...",
             self.iterations + 1, num_deals, total_batches,
         );
-        flush_stdout();
 
         // Process deals in batches
         let mut deal_offset = 0;
@@ -474,12 +474,11 @@ impl GpuCfrSolver {
 
             // Log first 5 batch timings to diagnose per-batch cost
             if batch_num <= 5 {
-                println!(
+                tracing::debug!(
                     "    batch {}: {:.1}ms",
                     batch_num,
                     batch_start.elapsed().as_secs_f64() * 1000.0,
                 );
-                flush_stdout();
             }
 
             // Blocking GPU sync every 64 batches.
@@ -494,7 +493,7 @@ impl GpuCfrSolver {
                 let pct = (deal_offset as f64 / num_deals as f64) * 100.0;
                 let elapsed = iter_start.elapsed().as_secs_f64();
                 let eta = if pct > 0.0 { elapsed / pct * (100.0 - pct) } else { f64::INFINITY };
-                println!(
+                tracing::info!(
                     "  iter {}: batch {}/{} ({:.2}%), {:.0}s elapsed, ~{:.0}s remaining",
                     self.iterations + 1,
                     batch_num,
@@ -503,7 +502,6 @@ impl GpuCfrSolver {
                     elapsed,
                     eta,
                 );
-                flush_stdout();
                 last_log = Instant::now();
             }
         }
@@ -512,13 +510,12 @@ impl GpuCfrSolver {
         self.dispatch_merge_and_discount();
 
         self.iterations += 1;
-        println!(
+        tracing::info!(
             "  iter {} complete: {} deals in {:.1}s",
             self.iterations,
             num_deals,
             iter_start.elapsed().as_secs_f64(),
         );
-        flush_stdout();
     }
 
     fn upload_batch(&self, deal_offset: usize, batch_count: usize, log: bool) {
@@ -535,7 +532,7 @@ impl GpuCfrSolver {
 
         self.queue.write_buffer(&self.deal_p1_wins_buffer, 0, bytemuck::cast_slice(&p1_equity));
         self.queue.write_buffer(&self.deal_weight_buffer, 0, bytemuck::cast_slice(&deal_weight));
-        if log { println!("    upload deal data: {:?}", step.elapsed()); }
+        if log { tracing::debug!("    upload deal data: {:?}", step.elapsed()); }
 
         // Compute info_id_lookup on-the-fly for this batch
         let step = Instant::now();
@@ -543,11 +540,11 @@ impl GpuCfrSolver {
         let lookup = compute_batch_info_ids(
             batch_deals, n, &self.decision_nodes, &self.key_to_dense,
         );
-        if log { println!("    compute_batch_info_ids: {:?}", step.elapsed()); }
+        if log { tracing::debug!("    compute_batch_info_ids: {:?}", step.elapsed()); }
 
         let step = Instant::now();
         self.queue.write_buffer(&self.info_id_lookup_buffer, 0, bytemuck::cast_slice(&lookup));
-        if log { println!("    upload info_id_lookup: {:?}", step.elapsed()); }
+        if log { tracing::debug!("    upload info_id_lookup: {:?}", step.elapsed()); }
 
         // Reach and utility buffers are initialized GPU-side in dispatch_batch
         // via clear_buffer + init_batch shader (avoids 384MB CPU→GPU transfer).
@@ -593,7 +590,7 @@ impl GpuCfrSolver {
             bwd_threads.push(num_deals * level_count);
             slot += 1;
         }
-        if log { println!("    bind groups + uniforms: {:?}", step.elapsed()); }
+        if log { tracing::debug!("    bind groups + uniforms: {:?}", step.elapsed()); }
 
         // Single encoder for the entire batch
         let mut encoder = self.device.create_command_encoder(
@@ -656,7 +653,7 @@ impl GpuCfrSolver {
         let step = Instant::now();
         self.queue.submit(std::iter::once(encoder.finish()));
         if log {
-            println!(
+            tracing::debug!(
                 "    GPU dispatch: regret_match + {} fwd + {} bwd levels, submit: {:?}",
                 num_levels, num_levels, step.elapsed()
             );
@@ -810,10 +807,6 @@ impl GpuCfrSolver {
 
 // --- Free functions ---
 
-fn flush_stdout() {
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-}
 
 pub(crate) fn init_gpu() -> Result<(wgpu::Device, wgpu::Queue), GpuError> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
@@ -856,7 +849,7 @@ pub(crate) fn init_gpu_large_buffers() -> Result<(wgpu::Device, wgpu::Queue), Gp
     limits.max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size;
     limits.max_buffer_size = adapter_limits.max_buffer_size;
 
-    println!(
+    tracing::info!(
         "  Adapter limits: max_storage_buffer={:.1} GB, max_buffer={:.1} GB",
         adapter_limits.max_storage_buffer_binding_size as f64 / 1e9,
         adapter_limits.max_buffer_size as f64 / 1e9,
@@ -989,7 +982,7 @@ fn build_position_indices(tree: &GameTree) -> (Vec<u32>, u32, Vec<u32>) {
 /// can be reconstructed as `position_key | ((hand_bits as u64) << HAND_SHIFT)`
 /// without needing the `GameTree` at batch time.
 #[derive(Clone, Copy)]
-pub struct DecisionNodeInfo {
+pub(crate) struct DecisionNodeInfo {
     pub node_idx: usize,
     pub player: Player,
     pub street: u8,
@@ -997,7 +990,7 @@ pub struct DecisionNodeInfo {
 }
 
 /// Scan the tree once and extract decision node metadata including position keys.
-pub fn collect_decision_nodes(tree: &GameTree) -> Vec<DecisionNodeInfo> {
+pub(crate) fn collect_decision_nodes(tree: &GameTree) -> Vec<DecisionNodeInfo> {
     tree.nodes
         .iter()
         .enumerate()
@@ -1040,7 +1033,7 @@ fn build_info_set_mapping(
         }
     }
     let total_unique: usize = unique_per_bucket.iter().map(|s| s.len()).sum();
-    println!(
+    tracing::info!(
         "    Pass 1: {total_unique} unique hand_bits across {} deals in {:?}",
         deals.len(), step.elapsed()
     );

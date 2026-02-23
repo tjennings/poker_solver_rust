@@ -592,10 +592,7 @@ pub fn generate_abstract_deals(
     let canonical_flops = flops::all_flops();
     let deck = crate::poker::full_deck();
 
-    println!(
-        "Generating abstract deals (strength_bits={}, equity_bits={}, board-centric)...",
-        config.strength_bits, config.equity_bits
-    );
+    tracing::info!(strength_bits = config.strength_bits, equity_bits = config.equity_bits, "generating abstract deals (board-centric)");
 
     // Generate hole card pairs (optionally limited for testing)
     let hole_pairs = select_hole_pairs(&deck, config.max_hole_pairs);
@@ -608,11 +605,7 @@ pub fn generate_abstract_deals(
     let hole_masks: Vec<u64> = hole_pairs.iter().map(|h| card_mask_pair(*h)).collect();
 
     let total_flops = canonical_flops.len();
-    println!(
-        "  {} hole pairs × {} canonical flops (board-centric)",
-        hole_pairs.len(),
-        total_flops
-    );
+    tracing::info!(hole_pairs = hole_pairs.len(), total_flops, "board-centric enumeration");
 
     let flops_done = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -643,9 +636,11 @@ pub fn generate_abstract_deals(
     let (global_map, concrete_deals) = merge_flop_results(flop_results);
     let (deals, stats) = finalize_deals(global_map, concrete_deals);
 
-    println!(
-        "  {} concrete → {} abstract deals ({:.1}x compression)",
-        stats.concrete_deals, stats.abstract_deals, stats.compression_ratio
+    tracing::info!(
+        concrete = stats.concrete_deals,
+        abstract_deals = stats.abstract_deals,
+        compression = format_args!("{:.1}x", stats.compression_ratio),
+        "deal compression"
     );
 
     (deals, stats)
@@ -731,23 +726,20 @@ pub fn merge_deal_batches(
 
     for (i, batch_path) in batch_paths.iter().enumerate() {
         let sorted_path = batch_path.with_extension("sorted");
-        println!(
-            "  sorting batch {}/{} ({})...",
-            i + 1,
-            batch_paths.len(),
-            batch_path.file_name().unwrap_or_default().to_string_lossy(),
+        tracing::info!(
+            batch = i + 1,
+            total = batch_paths.len(),
+            file = %batch_path.file_name().unwrap_or_default().to_string_lossy(),
+            "sorting batch"
         );
         let concrete = sort_batch_to_file(batch_path, &sorted_path)?;
         total_concrete += concrete;
         sorted_paths.push(sorted_path);
     }
-    println!("  all batches sorted ({total_concrete} concrete deals)");
+    tracing::info!(total_concrete, "all batches sorted");
 
     // Phase 2: Streaming k-way merge
-    println!(
-        "  starting k-way merge of {} sorted files...",
-        sorted_paths.len()
-    );
+    tracing::info!(files = sorted_paths.len(), "starting k-way merge");
     let stats = streaming_kway_merge(&sorted_paths, output_path, total_concrete)?;
 
     // Phase 3: Clean up sorted temp files

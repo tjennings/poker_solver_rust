@@ -14,3 +14,4 @@ bytemuck = { version = "1", features = ["derive"] }
 rustc-hash.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
+tracing = "0.1"

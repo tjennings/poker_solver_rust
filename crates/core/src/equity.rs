@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 /// Default number of Monte Carlo samples for equity calculations.
-pub const DEFAULT_EQUITY_SAMPLES: u32 = 1_000;
+pub(crate) const DEFAULT_EQUITY_SAMPLES: u32 = 1_000;
 
 /// Cache for equity calculations to avoid recomputation.
 static EQUITY_CACHE: LazyLock<Mutex<HashMap<(CanonicalHand, CanonicalHand), f64>>> =
@@ -178,7 +178,7 @@ fn evaluate_hand(hole: [Card; 2], board: [Card; 5]) -> Rank {
 }
 
 /// Clear the equity cache.
-pub fn clear_cache() {
+pub(crate) fn clear_cache() {
     if let Ok(mut cache) = EQUITY_CACHE.lock() {
         cache.clear();
     }
@@ -186,7 +186,7 @@ pub fn clear_cache() {
 
 /// Get the number of cached equity values.
 #[must_use]
-pub fn cache_size() -> usize {
+pub(crate) fn cache_size() -> usize {
     EQUITY_CACHE.lock().map_or(0, |c| c.len())
 }
 
@@ -196,7 +196,7 @@ pub fn cache_size() -> usize {
 /// overhead during CFR traversal. Computes all 169×169 = 28,561 equity pairs.
 ///
 /// Returns the number of equity pairs computed.
-pub fn prewarm_cache() -> usize {
+pub(crate) fn prewarm_cache() -> usize {
     let hands: Vec<_> = all_hands().collect();
     let mut computed = 0;
 

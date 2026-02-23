@@ -54,7 +54,7 @@ fn extract_probs(strategy: &Tensor) -> Result<Vec<f32>, SdCfrError> {
 /// probability proportional to its iteration number (linear weighting).
 /// That network is used for all decisions in the trajectory, yielding
 /// one forward pass per decision point.
-pub struct TrajectoryPolicy {
+pub(crate) struct TrajectoryPolicy {
     net: AdvantageNet,
     device: Device,
 }

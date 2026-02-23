@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use rustc_hash::FxHashMap;
+use tracing;
 
 use poker_solver_core::cfr::game_tree::{GameTree, NodeType};
 use poker_solver_core::cfr::DealInfo;
@@ -90,14 +91,14 @@ pub fn precompute_tabular(
     let mat_elems = n1 as u64 * n2 as u64;
     let mat_bytes = mat_elems * 4;
     let reach_bytes = tree.nodes.len() as u64 * n1.max(n2) as u64 * 4;
-    println!("  Trajectory counts: n1={n1}, n2={n2}");
-    println!(
+    tracing::info!("  Trajectory counts: n1={n1}, n2={n2}");
+    tracing::debug!(
         "  Coupling matrix: {n1}x{n2} = {} elems, {:.1} GB per matrix, {:.1} GB total (6 matrices)",
         mat_elems,
         mat_bytes as f64 / 1e9,
         mat_bytes as f64 * 6.0 / 1e9,
     );
-    println!(
+    tracing::debug!(
         "  Reach/util buffers: {}nodes x {} traj x 4 bytes = {:.1} GB each, {:.1} GB total (4 buffers)",
         tree.nodes.len(),
         n1.max(n2),
@@ -498,7 +499,7 @@ impl TabularGpuCfrSolver {
 
         let step = Instant::now();
         let (device, queue) = crate::init_gpu()?;
-        println!("  GPU device acquired in {:?}", step.elapsed());
+        tracing::info!("  GPU device acquired in {:?}", step.elapsed());
 
         // Encode tree
         let (gpu_nodes, children_flat, _level_nodes_flat, _level_offsets, _level_counts) =
@@ -513,7 +514,7 @@ impl TabularGpuCfrSolver {
         let decision_nodes = collect_decision_nodes(tree);
         let step = Instant::now();
         let tab = precompute_tabular(tree, &deals, &decision_nodes);
-        println!(
+        tracing::info!(
             "  Tabular precomputation: {} P1 traj, {} P2 traj, {} info sets in {:?}",
             tab.n_traj_p1, tab.n_traj_p2, tab.num_info_sets, step.elapsed()
         );
@@ -530,7 +531,7 @@ impl TabularGpuCfrSolver {
         let reach_p1_size = u64::from(num_nodes) * u64::from(n1) * 4;
         let reach_p2_size = u64::from(num_nodes) * u64::from(n2) * 4;
         let mat_size = u64::from(n1) * u64::from(n2) * 4;
-        println!(
+        tracing::debug!(
             "  Buffers: state={:.1}MB, reach_p1={:.1}MB, reach_p2={:.1}MB, matrices={:.1}MB",
             state_size as f64 / 1_048_576.0,
             reach_p1_size as f64 / 1_048_576.0,
@@ -657,7 +658,7 @@ impl TabularGpuCfrSolver {
             ),
         ];
 
-        println!("  GPU buffers allocated in {:?}", step.elapsed());
+        tracing::debug!("  GPU buffers allocated in {:?}", step.elapsed());
 
         // Create bind group layouts and pipelines
         let step = Instant::now();
@@ -741,7 +742,7 @@ impl TabularGpuCfrSolver {
                 entry(2, &convergence_buffer),
             ],
         });
-        println!("  Shader pipelines compiled in {:?}", step.elapsed());
+        tracing::info!("  Shader pipelines compiled in {:?}", step.elapsed());
 
         // Create double-buffered bind groups for uniform pipelining
         let uniform_binding_size =

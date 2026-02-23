@@ -422,7 +422,7 @@ impl KeyDescription {
 
 /// Decode a 4-bit action code to its string label.
 #[must_use]
-pub fn decode_action_code(code: u8) -> &'static str {
+pub(crate) fn decode_action_code(code: u8) -> &'static str {
     ACTION_CODE_NAMES.get(code as usize).unwrap_or(&"unknown")
 }
 

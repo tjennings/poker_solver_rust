@@ -32,7 +32,7 @@ pub fn ehs_features(hole: [Card; 2], board: &[Card]) -> EhsFeatures {
 /// Samples `num_samples` runouts from the remaining deck, computes EHS features for each,
 /// and returns the average. Used for clustering (`canonical_hand`, `flop_texture`) pairs.
 #[must_use]
-pub fn avg_ehs_features(
+pub(crate) fn avg_ehs_features(
     hole: [Card; 2],
     known_board: &[Card],
     num_samples: u32,
@@ -271,7 +271,7 @@ pub fn sample_canonical_flops(n: usize) -> Vec<[Card; 3]> {
 
 /// All cards not in hole or board — thin wrapper around `live_deck`.
 #[must_use]
-pub fn live_turn_cards(hole: &[Card; 2], board: &[Card]) -> Vec<Card> {
+pub(crate) fn live_turn_cards(hole: &[Card; 2], board: &[Card]) -> Vec<Card> {
     live_deck(*hole, board)
 }
 

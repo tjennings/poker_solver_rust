@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use rustc_hash::FxHashMap;
+use tracing;
 
 use poker_solver_core::cfr::game_tree::GameTree;
 use poker_solver_core::cfr::DealInfo;
@@ -221,14 +222,14 @@ pub fn precompute_tiled(
     let n1 = traj_p1.len() as u32;
     let n2 = traj_p2.len() as u32;
     let max_traj = n1.max(n2);
-    println!(
+    tracing::info!(
         "  Trajectories: n1={n1}, n2={n2}, extracted in {:?}",
         step.elapsed()
     );
 
     let num_p1_tiles = n1.div_ceil(tile_size);
     let num_p2_tiles = n2.div_ceil(tile_size);
-    println!(
+    tracing::info!(
         "  Tiling: tile_size={tile_size}, p1_tiles={num_p1_tiles}, p2_tiles={num_p2_tiles}"
     );
 
@@ -236,7 +237,7 @@ pub fn precompute_tiled(
     let step = Instant::now();
     let tile_builder =
         CouplingTileBuilder::new(deals, &traj_p1_map, &traj_p2_map, n1, n2, tile_size);
-    println!(
+    tracing::debug!(
         "  CouplingTileBuilder: {} entries, {:.1} MB, built in {:?}",
         tile_builder.num_entries(),
         tile_builder.num_entries() as f64 * 16.0 / 1_048_576.0,
@@ -251,13 +252,13 @@ pub fn precompute_tiled(
         ws_p1[e.t1 as usize] += e.weight;
         ws_p2[e.t2 as usize] += e.weight;
     }
-    println!("  Weight sums computed in {:?}", step.elapsed());
+    tracing::info!("  Weight sums computed in {:?}", step.elapsed());
 
     // Build info ID table
     let step = Instant::now();
     let (info_id_table, info_set_num_actions, dense_to_key, num_info_sets) =
         build_info_id_table(tree, decision_nodes, &traj_p1, &traj_p2, max_traj);
-    println!(
+    tracing::info!(
         "  Info ID table: {} info sets, {:.1} GB, built in {:?}",
         num_info_sets,
         info_id_table.len() as f64 * 4.0 / 1e9,
@@ -433,7 +434,7 @@ impl TiledTabularGpuCfrSolver {
 
         let step = Instant::now();
         let (device, queue) = crate::init_gpu_large_buffers()?;
-        println!("  GPU device acquired in {:?}", step.elapsed());
+        tracing::info!("  GPU device acquired in {:?}", step.elapsed());
 
         // Encode tree
         let (gpu_nodes, children_flat, _lnf, _lo, _lc) = encode_tree(tree);
@@ -449,7 +450,7 @@ impl TiledTabularGpuCfrSolver {
         let tile_size = if requested_tile_size > max_tile {
             let capped = (max_tile / 256) * 256;
             let capped = capped.max(256);
-            println!(
+            tracing::info!(
                 "  WARNING: tile_size {} exceeds GPU buffer limits (max_binding={}), capped to {}",
                 requested_tile_size, max_binding, capped
             );
@@ -467,7 +468,7 @@ impl TiledTabularGpuCfrSolver {
         let n_decision = decision_nodes.len() as u32;
         let step = Instant::now();
         let tab = precompute_tiled(tree, &deals, &decision_nodes, tile_size);
-        println!(
+        tracing::info!(
             "  Tiled precomputation complete in {:?}",
             step.elapsed()
         );
@@ -499,7 +500,7 @@ impl TiledTabularGpuCfrSolver {
         let info_id_full_size = (mt * nd) as u64 * 4;
         let info_id_tile_size = u64::from(tile_size) * u64::from(n_decision) * 4;
 
-        println!(
+        tracing::debug!(
             "  Buffers: state={:.1}MB, tile_reach={:.1}GB, coupling_tile={:.1}GB (x3), info_id_full={:.1}GB, info_id_tile={:.1}MB",
             state_size as f64 / 1_048_576.0,
             tile_reach_size as f64 / 1e9,
@@ -612,7 +613,7 @@ impl TiledTabularGpuCfrSolver {
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         );
 
-        println!("  GPU buffers allocated in {:?}", step.elapsed());
+        tracing::debug!("  GPU buffers allocated in {:?}", step.elapsed());
 
         // Create bind group layouts and pipelines
         let step = Instant::now();
@@ -696,7 +697,7 @@ impl TiledTabularGpuCfrSolver {
             ],
         });
 
-        println!("  Shader pipelines compiled in {:?}", step.elapsed());
+        tracing::info!("  Shader pipelines compiled in {:?}", step.elapsed());
 
         Ok(Self {
             device,
@@ -900,12 +901,11 @@ impl TiledTabularGpuCfrSolver {
 
         self.iterations += 1;
         if self.iterations <= 3 || self.iterations % 10 == 0 {
-            println!(
+            tracing::info!(
                 "  tiled iter {} complete in {:.1}s",
                 self.iterations,
                 iter_start.elapsed().as_secs_f64(),
             );
-            flush_stdout();
         }
     }
 
@@ -972,14 +972,13 @@ impl TiledTabularGpuCfrSolver {
                 if self.iterations == 0 {
                     let pair_idx = own_tile * num_opp_tiles + opp_tile + 1;
                     let total_pairs = num_own_tiles * num_opp_tiles;
-                    println!(
+                    tracing::debug!(
                         "    P{} bwd_term {}/{} [{},{}] {:.1}s (elapsed {:.0}s)",
                         player + 1, pair_idx, total_pairs,
                         own_tile, opp_tile,
                         tile_pair_start.elapsed().as_secs_f64(),
                         phase2_start.elapsed().as_secs_f64(),
                     );
-                    flush_stdout();
                 }
             }
 
@@ -996,11 +995,10 @@ impl TiledTabularGpuCfrSolver {
                     player + 1, own_tile + 1, num_own_tiles,
                     phase2_start.elapsed().as_secs_f64(),
                 );
-                flush_stdout();
             }
         }
         if self.iterations == 0 {
-            println!(
+            tracing::info!(
                 "    P{} bwd_term done in {:.1}s              ",
                 player + 1, phase2_start.elapsed().as_secs_f64(),
             );
@@ -1474,10 +1472,6 @@ impl TiledTabularGpuCfrSolver {
     }
 }
 
-fn flush_stdout() {
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-}
 
 // ---------------------------------------------------------------------------
 // Bind group layouts for tiled solver
