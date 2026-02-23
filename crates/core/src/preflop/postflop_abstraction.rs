@@ -299,9 +299,12 @@ impl PostflopAbstraction {
     /// This is expensive (minutes) — called once before training begins.
     /// Calls `on_progress(phase)` at the start of each build phase.
     ///
-    /// When `equity_table` is provided, bucket equity is derived from the
-    /// precomputed 169x169 pairwise equities (much more accurate). Without it,
-    /// falls back to the EHS centroid approximation.
+    /// When `rebucket_rounds > 1`, runs an outer loop:
+    /// 1. Solve all flops with current bucket assignments
+    /// 2. Extract EV histograms from the converged strategy
+    /// 3. Re-cluster flop buckets using EV features
+    /// 4. Recompute pairwise equity for the new flop assignments
+    /// 5. Repeat from (1) until final round, then compute final values
     ///
     /// # Errors
     ///
@@ -312,11 +315,13 @@ impl PostflopAbstraction {
         _cache_base: Option<&std::path::Path>,
         on_progress: impl Fn(BuildPhase) + Sync,
     ) -> Result<Self, PostflopAbstractionError> {
-        let (buckets, street_equity, flops) = load_or_build_abstraction(
+        // Phase 1: Build initial EHS abstraction
+        let (mut buckets, mut street_equity, flops) = load_or_build_abstraction(
             config,
             &on_progress,
         )?;
 
+        // Build tree (once, shared across all rounds)
         on_progress(BuildPhase::Trees);
         let tree = PostflopTree::build_with_spr(config, config.primary_spr())?;
 
@@ -346,26 +351,78 @@ impl PostflopAbstraction {
             .map(|f| format!("{}{}{}", f[0], f[1], f[2]))
             .collect();
 
-        let flop_results = solve_postflop_per_flop(
-            &tree,
-            &layout,
-            &street_equity,
-            num_flop_b,
-            total_iters,
-            samples,
-            config.rebucket_delta_threshold,
-            &flop_names,
-            1,
-            config.rebucket_rounds,
-            &on_progress,
-        );
+        let total_rounds = config.rebucket_rounds;
+        let num_hands = hand_buckets::NUM_HANDS;
+        let num_flops = buckets.flop.len();
+        let hands: Vec<_> = crate::hands::all_hands().collect();
+        let mut last_solve_results = Vec::new();
 
-        let per_flop_strategy_sums: Vec<Vec<f64>> = flop_results
+        for round in 1..=total_rounds {
+            // Solve all flops with current bucket assignments
+            last_solve_results = solve_postflop_per_flop(
+                &tree,
+                &layout,
+                &street_equity,
+                num_flop_b,
+                total_iters,
+                samples,
+                config.rebucket_delta_threshold,
+                &flop_names,
+                round,
+                total_rounds,
+                &on_progress,
+            );
+
+            // If not the last round, extract EV and rebucket
+            if round < total_rounds {
+                // Compute intermediate values from converged strategy
+                let strat_refs: Vec<Vec<f64>> = last_solve_results.iter()
+                    .map(|r| r.strategy_sum.clone())
+                    .collect();
+                let values = compute_postflop_values(
+                    &tree, &layout, &street_equity, &strat_refs, num_flop_b,
+                );
+
+                // Extract EV histograms
+                on_progress(BuildPhase::ExtractingEv(0, num_hands));
+                let ev_histograms = hand_buckets::build_ev_histograms(
+                    &buckets, &values, num_hands, num_flop_b,
+                );
+                on_progress(BuildPhase::ExtractingEv(num_hands, num_hands));
+
+                // Recluster flop buckets using EV features
+                on_progress(BuildPhase::Rebucketing(round, total_rounds));
+                buckets.flop = hand_buckets::recluster_flop_buckets(
+                    &ev_histograms, buckets.num_flop_buckets, num_flops, num_hands,
+                );
+
+                // Recompute flop pairwise equity with new assignments
+                on_progress(BuildPhase::EquityTable);
+                let new_flop_equity: Vec<BucketEquity> = (0..num_flops)
+                    .map(|flop_idx| {
+                        let assignments = &buckets.flop[flop_idx];
+                        let board_refs: Vec<&[Card]> = vec![flops[flop_idx].as_ref()];
+                        hand_buckets::compute_pairwise_bucket_equity(
+                            &hands,
+                            &board_refs,
+                            assignments,
+                            buckets.num_flop_buckets as usize,
+                            1,
+                            config.equity_rollout_fraction,
+                        )
+                    })
+                    .collect();
+                street_equity.flop = new_flop_equity;
+                // Turn and river equity unchanged
+            }
+        }
+
+        // Final values from last round
+        on_progress(BuildPhase::ComputingValues);
+        let per_flop_strategy_sums: Vec<Vec<f64>> = last_solve_results
             .into_iter()
             .map(|r| r.strategy_sum)
             .collect();
-
-        on_progress(BuildPhase::ComputingValues);
         let values = compute_postflop_values(
             &tree,
             &layout,
@@ -1379,5 +1436,31 @@ mod tests {
     fn build_phase_display_rebucketing() {
         let phase = BuildPhase::Rebucketing(2, 3);
         assert_eq!(format!("{phase}"), "Rebucketing (2/3)");
+    }
+
+    #[test]
+    #[ignore = "slow: full postflop abstraction pipeline with rebucketing"]
+    fn build_with_rebucket_rounds_1_succeeds() {
+        let mut config = PostflopModelConfig::fast();
+        config.rebucket_rounds = 1;
+        config.postflop_solve_iterations = 10;
+        config.max_flop_boards = 3;
+        let result = PostflopAbstraction::build(&config, None, None, |_| {});
+        assert!(result.is_ok());
+        let abs = result.unwrap();
+        assert!(!abs.values.is_empty());
+    }
+
+    #[test]
+    #[ignore = "slow: full postflop abstraction pipeline with 2-round rebucketing"]
+    fn build_with_rebucket_rounds_2_succeeds() {
+        let mut config = PostflopModelConfig::fast();
+        config.rebucket_rounds = 2;
+        config.postflop_solve_iterations = 10;
+        config.max_flop_boards = 3;
+        let result = PostflopAbstraction::build(&config, None, None, |_| {});
+        assert!(result.is_ok());
+        let abs = result.unwrap();
+        assert!(!abs.values.is_empty());
     }
 }

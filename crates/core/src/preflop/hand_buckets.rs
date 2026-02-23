@@ -712,6 +712,29 @@ pub fn build_ev_histograms(
     result
 }
 
+/// Re-cluster flop buckets using EV histograms instead of equity histograms.
+///
+/// Runs k-means per flop on the EV histogram features (same infra as initial
+/// clustering). Returns per-flop bucket assignments.
+///
+/// `ev_histograms` is flat, indexed by `hand_idx * num_flops + flop_idx`.
+#[must_use]
+pub fn recluster_flop_buckets(
+    ev_histograms: &[HistogramFeatures],
+    num_flop_buckets: u16,
+    num_flops: usize,
+    num_hands: usize,
+) -> Vec<Vec<u16>> {
+    (0..num_flops)
+        .map(|flop_idx| {
+            let per_flop_features: Vec<HistogramFeatures> = (0..num_hands)
+                .map(|h| ev_histograms[h * num_flops + flop_idx])
+                .collect();
+            cluster_histograms(&per_flop_features, num_flop_buckets)
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Independent per-street clustering pipeline (imperfect recall)
 // ---------------------------------------------------------------------------
@@ -1831,5 +1854,40 @@ mod tests {
 
         let histograms = build_ev_histograms(&buckets, &values, 3, 2);
         assert_eq!(histograms.len(), 3 * 2, "should have num_hands * num_flops histograms");
+    }
+
+    #[timed_test]
+    fn recluster_flop_buckets_returns_correct_shape() {
+        // 3 hands, 2 flops, 2 buckets
+        // ev_histograms indexed by hand_idx * num_flops + flop_idx
+        let num_hands = 3;
+        let num_flops = 2;
+        let num_buckets = 2u16;
+
+        // Create distinct histogram features so clustering can produce assignments
+        let mut ev_histograms = Vec::with_capacity(num_hands * num_flops);
+        for h in 0..num_hands {
+            for _f in 0..num_flops {
+                let mut hist = [0.0f64; HISTOGRAM_BINS];
+                // Spread values so k-means sees distinct points
+                #[allow(clippy::cast_precision_loss)]
+                for (i, val) in hist.iter_mut().enumerate() {
+                    *val = (h * HISTOGRAM_BINS + i) as f64 / (num_hands * HISTOGRAM_BINS) as f64;
+                }
+                ev_histograms.push(hist);
+            }
+        }
+
+        let result = recluster_flop_buckets(&ev_histograms, num_buckets, num_flops, num_hands);
+        assert_eq!(result.len(), num_flops, "one assignment vec per flop");
+        for (flop_idx, assignments) in result.iter().enumerate() {
+            assert_eq!(
+                assignments.len(), num_hands,
+                "flop {flop_idx} should have one assignment per hand"
+            );
+            for &b in assignments {
+                assert!(b < num_buckets, "bucket ID should be < num_buckets");
+            }
+        }
     }
 }
