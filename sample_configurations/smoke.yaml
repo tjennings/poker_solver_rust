@@ -50,6 +50,7 @@ postflop_model:
   num_hand_buckets_turn: 10
   num_hand_buckets_river: 10
   max_flop_boards: 3
+  # fixed_flops: ["AhKd2s", "7c8c9c", "QhJhTh"]  # override max_flop_boards
   bet_sizes: [0.5, 1.0]
   max_raises_per_street: 1
   postflop_solve_iterations: 50

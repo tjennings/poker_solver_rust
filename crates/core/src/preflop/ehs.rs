@@ -253,24 +253,76 @@ pub fn canonical_flops() -> Vec<[Card; 3]> {
     result
 }
 
-/// Return a deterministic uniform sample of `n` canonical flops.
+/// Return a random sample of `n` canonical flops.
 ///
-/// Uses stride-based sampling to pick evenly spaced flops from the full
-/// canonical list, ensuring coverage across the board-texture spectrum
-/// (low cards, high cards, rainbow, suited, monotone).
-/// If `n >= total`, returns all canonical flops.
+/// Uses random shuffling to pick flops uniformly at random from the full
+/// canonical list, ensuring unbiased coverage of board textures.
+/// If `n == 0` or `n >= total`, returns all canonical flops.
 #[must_use]
 pub fn sample_canonical_flops(n: usize) -> Vec<[Card; 3]> {
-    let all = canonical_flops();
+    use rand::seq::SliceRandom;
+
+    let mut all = canonical_flops();
     if n == 0 || n >= all.len() {
         return all;
     }
-    let total = all.len();
-    // Stride-based: pick indices 0, stride, 2*stride, ... to get n evenly spaced samples.
-    // Use fixed-point arithmetic to avoid floating-point drift.
-    (0..n)
-        .map(|i| all[i * total / n])
-        .collect()
+    let mut rng = rand::rng();
+    all.shuffle(&mut rng);
+    all.truncate(n);
+    all
+}
+
+/// Parse a two-character card string like `"Ah"` into a `Card`.
+///
+/// Format: value char (`2`-`9`, `T`, `J`, `Q`, `K`, `A`) followed by suit char
+/// (`s`, `h`, `d`, `c`).
+#[must_use]
+pub fn parse_card(s: &str) -> Option<Card> {
+    let mut chars = s.chars();
+    let value = Value::from_char(chars.next()?)?;
+    let suit = Suit::from_char(chars.next()?)?;
+    if chars.next().is_some() {
+        return None; // trailing chars
+    }
+    Some(Card::new(value, suit))
+}
+
+/// Parse a six-character flop string like `"AhKd2s"` into three cards.
+#[must_use]
+pub fn parse_flop(s: &str) -> Option<[Card; 3]> {
+    if s.len() != 6 {
+        return None;
+    }
+    let c1 = parse_card(&s[0..2])?;
+    let c2 = parse_card(&s[2..4])?;
+    let c3 = parse_card(&s[4..6])?;
+    if c1 == c2 || c2 == c3 || c1 == c3 {
+        return None;
+    }
+    Some([c1, c2, c3])
+}
+
+/// Parse a slice of flop name strings into validated flop arrays.
+///
+/// # Errors
+///
+/// Returns an error if any string is malformed or if duplicate cards appear
+/// across different flops.
+pub fn parse_flops(names: &[String]) -> Result<Vec<[Card; 3]>, String> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut result = Vec::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        let flop = parse_flop(name)
+            .ok_or_else(|| format!("invalid flop at index {i}: {name:?}"))?;
+        for &card in &flop {
+            if !seen.insert(card) {
+                return Err(format!("duplicate card {card} in flop at index {i}: {name:?}"));
+            }
+        }
+        result.push(flop);
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -653,5 +705,67 @@ mod tests {
             canonical_board_key(&monotone),
             canonical_board_key(&rainbow)
         );
+    }
+
+    #[timed_test]
+    fn parse_card_valid() {
+        let card = parse_card("Ah").unwrap();
+        assert_eq!(card.value, Value::Ace);
+        assert_eq!(card.suit, Suit::Heart);
+
+        let card2 = parse_card("2s").unwrap();
+        assert_eq!(card2.value, Value::Two);
+        assert_eq!(card2.suit, Suit::Spade);
+
+        let card3 = parse_card("Td").unwrap();
+        assert_eq!(card3.value, Value::Ten);
+        assert_eq!(card3.suit, Suit::Diamond);
+    }
+
+    #[timed_test]
+    fn parse_card_invalid() {
+        assert!(parse_card("").is_none());
+        assert!(parse_card("A").is_none());
+        assert!(parse_card("Ahx").is_none());
+        assert!(parse_card("Xh").is_none());
+        assert!(parse_card("Ax").is_none());
+    }
+
+    #[timed_test]
+    fn parse_flop_valid() {
+        let flop = parse_flop("AhKd2s").unwrap();
+        assert_eq!(flop[0].value, Value::Ace);
+        assert_eq!(flop[1].value, Value::King);
+        assert_eq!(flop[2].value, Value::Two);
+    }
+
+    #[timed_test]
+    fn parse_flop_invalid_length() {
+        assert!(parse_flop("AhKd").is_none()); // too short
+        assert!(parse_flop("AhKd2s3c").is_none()); // too long
+        assert!(parse_flop("AhAhKd").is_none()); // duplicate card
+    }
+
+    #[timed_test]
+    fn sample_canonical_flops_random_differs() {
+        // Two calls should (with overwhelming probability) produce different orderings
+        let a = sample_canonical_flops(100);
+        let b = sample_canonical_flops(100);
+        assert_eq!(a.len(), 100);
+        assert_eq!(b.len(), 100);
+        // At least one position should differ
+        assert!(
+            a != b,
+            "two random samples of 100 flops should differ (astronomically unlikely if equal)"
+        );
+    }
+
+    #[timed_test]
+    fn sample_canonical_flops_all_returns_full_set() {
+        let total = canonical_flops().len();
+        let all = sample_canonical_flops(0);
+        assert_eq!(all.len(), total);
+        let all2 = sample_canonical_flops(total + 100);
+        assert_eq!(all2.len(), total);
     }
 }

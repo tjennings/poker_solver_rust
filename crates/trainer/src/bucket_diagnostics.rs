@@ -99,7 +99,12 @@ fn load_or_build(
 
     eprintln!("Cache miss — building independent per-street buckets...");
     let hands: Vec<CanonicalHand> = all_hands().collect();
-    let flops = poker_solver_core::preflop::ehs::sample_canonical_flops(config.max_flop_boards);
+    let flops = if let Some(ref names) = config.fixed_flops {
+        poker_solver_core::preflop::ehs::parse_flops(names)
+            .expect("invalid fixed_flops in config")
+    } else {
+        poker_solver_core::preflop::ehs::sample_canonical_flops(config.max_flop_boards)
+    };
 
     let result = build_street_buckets_independent(
         &hands,
