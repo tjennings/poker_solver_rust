@@ -837,7 +837,7 @@ fn run_solve_preflop(
             let phase_bar = multi.add(ProgressBar::new(169));
             phase_bar.set_style(bar_style.clone());
             phase_bar.set_message("Hand buckets");
-            phase_bar.enable_steady_tick(std::time::Duration::from_millis(100));
+            phase_bar.enable_steady_tick(std::time::Duration::from_millis(500));
             let flop_bars: Arc<Mutex<HashMap<String, ProgressBar>>> =
                 Arc::new(Mutex::new(HashMap::new()));
 
@@ -871,7 +871,7 @@ fn run_solve_preflop(
                                     let b = multi
                                         .add(ProgressBar::new(*max_iterations as u64));
                                     b.set_style(bar_style.clone());
-                                    b.enable_steady_tick(std::time::Duration::from_millis(100));
+                                    b.enable_steady_tick(std::time::Duration::from_millis(500));
                                     b
                                 });
                             bar.set_length(*max_iterations as u64);
