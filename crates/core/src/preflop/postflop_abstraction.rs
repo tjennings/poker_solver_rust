@@ -637,6 +637,15 @@ fn solve_one_flop(
     let mut final_delta = 0.0;
     let mut iterations_used = 0;
 
+    on_progress(BuildPhase::FlopProgress {
+        flop_name: flop_name.to_string(),
+        stage: FlopStage::Solving {
+            iteration: 0,
+            max_iterations: num_iterations,
+            delta: 0.0,
+        },
+    });
+
     for iter in 0..num_iterations {
         let iteration = iter as u64 + 1;
 
