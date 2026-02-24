@@ -3,8 +3,6 @@
 //! Wraps the existing `HandStrengthCalculator` to provide the EHS feature vectors
 //! used in k-means clustering of hands into buckets.
 
-use std::collections::HashSet;
-
 use crate::abstraction::HandStrengthCalculator;
 use crate::poker::{Card, Suit, Value};
 
@@ -204,11 +202,11 @@ fn splitmix64(mut x: u64) -> u64 {
 
 /// Compute a canonical key for a board by remapping suits to first-seen order.
 ///
-/// Sort the board cards by (value, suit), then walk through assigning canonical
-/// suit indices (0, 1, 2, 3) in the order suits are first encountered.
-/// Returns a vector of `(Value, canonical_suit_index)` pairs.
-#[must_use]
-pub fn canonical_board_key(board: &[Card]) -> Vec<(Value, u8)> {
+/// NOTE: This uses a naive left-to-right suit assignment that produces 1,911
+/// classes instead of the correct 1,755. Kept for test coverage only;
+/// production code should use `CanonicalBoard::from_cards()`.
+#[cfg(test)]
+fn canonical_board_key(board: &[Card]) -> Vec<(Value, u8)> {
     let mut sorted: Vec<Card> = board.to_vec();
     sorted.sort();
 
@@ -228,29 +226,16 @@ pub fn canonical_board_key(board: &[Card]) -> Vec<(Value, u8)> {
         .collect()
 }
 
-/// Enumerate all suit-isomorphic canonical flops.
+/// Enumerate all 1,755 suit-isomorphic canonical flops.
 ///
-/// Iterates all C(52,3) = 22,100 three-card combinations, computes a canonical
-/// key for each via suit remapping, and deduplicates. Produces ~1,755 canonical flops.
+/// Delegates to `flops::all_flops()` which uses proper suit-frequency-based
+/// canonicalization via `CanonicalBoard::from_cards()`.
 #[must_use]
 pub fn canonical_flops() -> Vec<[Card; 3]> {
-    let cards: Vec<Card> = all_cards().collect();
-    let mut seen = HashSet::new();
-    let mut result = Vec::new();
-
-    for i in 0..cards.len() {
-        for j in (i + 1)..cards.len() {
-            for k in (j + 1)..cards.len() {
-                let flop = [cards[i], cards[j], cards[k]];
-                let key = canonical_board_key(&flop);
-                if seen.insert(key) {
-                    result.push(flop);
-                }
-            }
-        }
-    }
-
-    result
+    crate::flops::all_flops()
+        .into_iter()
+        .map(|f| *f.cards())
+        .collect()
 }
 
 /// Return a random sample of `n` canonical flops.
@@ -636,8 +621,7 @@ mod tests {
     #[timed_test]
     fn canonical_flops_count_is_correct() {
         let flops = canonical_flops();
-        assert!(flops.len() > 1000, "too few: {}", flops.len());
-        assert!(flops.len() < 3000, "too many: {}", flops.len());
+        assert_eq!(flops.len(), 1755);
         for f in &flops {
             assert_ne!(f[0], f[1]);
             assert_ne!(f[1], f[2]);
