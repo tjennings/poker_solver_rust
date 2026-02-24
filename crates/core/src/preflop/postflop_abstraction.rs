@@ -253,7 +253,8 @@ pub enum BuildPhase {
     /// Contains `(hands_done, total_hands)`.
     HandBuckets(usize, usize),
     /// Computing bucket-vs-bucket equity table.
-    EquityTable,
+    /// Contains `(steps_done, total_steps)`.
+    EquityTable(usize, usize),
     /// Building postflop game trees.
     Trees,
     /// Computing flat buffer layout.
@@ -279,7 +280,7 @@ impl std::fmt::Display for BuildPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::HandBuckets(done, total) => write!(f, "Hand buckets ({done}/{total})"),
-            Self::EquityTable => write!(f, "Equity table"),
+            Self::EquityTable(done, total) => write!(f, "Equity table ({done}/{total})"),
             Self::Trees => write!(f, "Postflop trees"),
             Self::Layout => write!(f, "Buffer layout"),
             Self::SolvingPostflop { round, total_rounds, flop_name, iteration, max_iterations, delta } => {
@@ -397,19 +398,19 @@ impl PostflopAbstraction {
                 );
 
                 // Recompute flop pairwise equity with new assignments
-                on_progress(BuildPhase::EquityTable);
+                on_progress(BuildPhase::EquityTable(0, num_flops));
                 let new_flop_equity: Vec<BucketEquity> = (0..num_flops)
                     .map(|flop_idx| {
-                        let assignments = &buckets.flop[flop_idx];
-                        let board_refs: Vec<&[Card]> = vec![flops[flop_idx].as_ref()];
-                        hand_buckets::compute_pairwise_bucket_equity(
+                        let eq = hand_buckets::compute_pairwise_bucket_equity(
                             &hands,
-                            &board_refs,
-                            assignments,
+                            &[flops[flop_idx].as_ref()],
+                            &buckets.flop[flop_idx],
                             buckets.num_flop_buckets as usize,
                             1,
                             config.equity_rollout_fraction,
-                        )
+                        );
+                        on_progress(BuildPhase::EquityTable(flop_idx + 1, num_flops));
+                        eq
                     })
                     .collect();
                 street_equity.flop = new_flop_equity;
@@ -510,7 +511,7 @@ fn load_or_build_abstraction(
         },
     );
 
-    on_progress(BuildPhase::EquityTable);
+    on_progress(BuildPhase::EquityTable(0, 0));
 
     let street_equity = result.compute_pairwise_street_equity(
         &hands,
@@ -518,6 +519,7 @@ fn load_or_build_abstraction(
         &result.turn_boards,
         &result.river_boards,
         config.equity_rollout_fraction,
+        |done, total| on_progress(BuildPhase::EquityTable(done, total)),
     );
 
     Ok((result.buckets, street_equity, flops))

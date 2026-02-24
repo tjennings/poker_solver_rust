@@ -154,23 +154,24 @@ impl BucketingResult {
         turn_boards: &[[Card; 4]],
         river_boards: &[[Card; 5]],
         rollout_fraction: f64,
+        on_progress: impl Fn(usize, usize),
     ) -> StreetEquity {
         let num_flops = self.buckets.flop.len();
+        let total_steps = num_flops + 2; // flops + turn + river
 
         // Per-flop bucket equity
         let flop: Vec<BucketEquity> = (0..num_flops)
             .map(|flop_idx| {
-                let assignments = &self.buckets.flop[flop_idx];
-                let board_refs: Vec<&[Card]> = vec![flops[flop_idx].as_ref()];
-                // Build a flat assignment vec: just hand_idx -> bucket for this one board
-                compute_pairwise_bucket_equity(
+                let eq = compute_pairwise_bucket_equity(
                     hands,
-                    &board_refs,
-                    assignments,
+                    &[flops[flop_idx].as_ref()],
+                    &self.buckets.flop[flop_idx],
                     self.buckets.num_flop_buckets as usize,
                     1, // one board per flop solve
                     rollout_fraction,
-                )
+                );
+                on_progress(flop_idx + 1, total_steps);
+                eq
             })
             .collect();
 
@@ -183,6 +184,7 @@ impl BucketingResult {
             turn_boards.len(),
             1.0,
         );
+        on_progress(num_flops + 1, total_steps);
 
         let river_board_refs: Vec<&[Card]> = river_boards.iter().map(AsRef::as_ref).collect();
         let river = compute_pairwise_bucket_equity(
@@ -193,6 +195,7 @@ impl BucketingResult {
             river_boards.len(),
             1.0,
         );
+        on_progress(num_flops + 2, total_steps);
 
         StreetEquity { flop, turn, river }
     }

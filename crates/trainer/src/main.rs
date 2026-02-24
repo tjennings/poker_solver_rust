@@ -837,6 +837,7 @@ fn run_solve_preflop(
             let phase_bar = multi.add(ProgressBar::new(169));
             phase_bar.set_style(bar_style.clone());
             phase_bar.set_message("Hand buckets");
+            phase_bar.enable_steady_tick(std::time::Duration::from_millis(100));
             let flop_bars: Arc<Mutex<HashMap<String, ProgressBar>>> =
                 Arc::new(Mutex::new(HashMap::new()));
 
@@ -867,6 +868,7 @@ fn run_solve_preflop(
                                     let b = multi
                                         .add(ProgressBar::new(*max_iterations as u64));
                                     b.set_style(bar_style.clone());
+                                    b.enable_steady_tick(std::time::Duration::from_millis(100));
                                     b
                                 });
                             bar.set_length(*max_iterations as u64);
@@ -874,6 +876,12 @@ fn run_solve_preflop(
                             bar.set_message(format!(
                                 "[{round}/{total_rounds}] Flop '{flop_name}' \u{03b4}={delta:.4}"
                             ));
+                        }
+                        BuildPhase::EquityTable(done, total) => {
+                            phase_bar.set_style(bar_style.clone());
+                            phase_bar.set_length(*total as u64);
+                            phase_bar.set_position(*done as u64);
+                            phase_bar.set_message("Equity table");
                         }
                         BuildPhase::ExtractingEv(done, total) => {
                             // Clear flop bars, show extraction progress.
