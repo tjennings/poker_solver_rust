@@ -1,5 +1,48 @@
-# MCCFR smoke test configuration
-# Uses concrete hand evaluation instead of bucket transitions
+# MCCFR smoke test: exercises the MCCFR postflop backend in ~1-2 minutes.
+# Uses concrete hand evaluation instead of bucket transitions.
+#
+# Usage:
+#   cargo run -p poker-solver-trainer --release -- solve-preflop \
+#     -c sample_configurations/mccfr_smoke.yaml -o mccfr_smoke_test
+
+# ── Training parameters ──────────────────────────────────────────────────────
+
+iterations: 2000
+equity_samples: 10000
+print_every: 500
+
+# ── Game structure ───────────────────────────────────────────────────────────
+
+positions:
+  - name: Small Blind
+    short_name: SB
+  - name: Big Blind
+    short_name: BB
+
+blinds:
+  - [0, 1]
+  - [1, 2]
+
+antes: []
+
+stacks: [50, 50]  # 25 BB
+
+raise_sizes:
+  - [2.5]
+  - [3.0]
+
+raise_cap: 3
+
+# ── DCFR discounting ─────────────────────────────────────────────────────────
+
+dcfr_alpha: 1.5
+dcfr_beta: 0.5
+dcfr_gamma: 2.0
+dcfr_warmup: 0
+exploration: 0.05
+
+# ── Postflop model (MCCFR backend) ──────────────────────────────────────────
+
 postflop_model:
   solve_type: mccfr
   num_hand_buckets_flop: 5
