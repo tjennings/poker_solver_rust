@@ -19,7 +19,7 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
 use super::equity::EquityTable;
-use super::hand_buckets::{self, BucketEquity, StreetBuckets, StreetEquity};
+use super::hand_buckets::{self, BucketEquity, StreetBuckets, StreetEquity, TransitionMatrices};
 use super::postflop_model::PostflopModelConfig;
 use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree};
 use crate::abstraction::Street;
@@ -29,6 +29,7 @@ use crate::poker::Card;
 pub struct PostflopAbstraction {
     pub buckets: StreetBuckets,
     pub street_equity: StreetEquity,
+    pub transitions: TransitionMatrices,
     /// Single shared tree template at `config.primary_spr()`.
     pub tree: PostflopTree,
     /// Precomputed EV table from solved postflop game.
@@ -316,8 +317,8 @@ impl PostflopAbstraction {
         _cache_base: Option<&std::path::Path>,
         on_progress: impl Fn(BuildPhase) + Sync,
     ) -> Result<Self, PostflopAbstractionError> {
-        // Phase 1: Build initial EHS abstraction
-        let (mut buckets, mut street_equity, flops) = load_or_build_abstraction(
+        // Phase 1: Build initial EHS abstraction + transitions
+        let (mut buckets, mut street_equity, mut transitions, flops) = load_or_build_abstraction(
             config,
             &on_progress,
         )?;
@@ -364,6 +365,7 @@ impl PostflopAbstraction {
                 &tree,
                 &layout,
                 &street_equity,
+                &transitions,
                 num_flop_b,
                 total_iters,
                 samples,
@@ -381,7 +383,7 @@ impl PostflopAbstraction {
                     .map(|r| r.strategy_sum.clone())
                     .collect();
                 let values = compute_postflop_values(
-                    &tree, &layout, &street_equity, &strat_refs, num_flop_b,
+                    &tree, &layout, &street_equity, &transitions, &strat_refs, num_flop_b,
                 );
 
                 // Extract EV histograms
@@ -414,7 +416,14 @@ impl PostflopAbstraction {
                     })
                     .collect();
                 street_equity.flop = new_flop_equity;
-                // Turn and river equity unchanged
+
+                // Recompute transition matrices for the new flop buckets
+                transitions = hand_buckets::compute_transition_matrices(
+                    &buckets,
+                    num_flop_b as u16,
+                    buckets.num_turn_buckets,
+                    buckets.num_river_buckets,
+                );
             }
         }
 
@@ -428,6 +437,7 @@ impl PostflopAbstraction {
             &tree,
             &layout,
             &street_equity,
+            &transitions,
             &per_flop_strategy_sums,
             num_flop_b,
         );
@@ -435,6 +445,7 @@ impl PostflopAbstraction {
         Ok(Self {
             buckets,
             street_equity,
+            transitions,
             tree,
             values,
             spr: config.primary_spr(),
@@ -453,6 +464,7 @@ impl PostflopAbstraction {
         config: &PostflopModelConfig,
         buckets: StreetBuckets,
         street_equity: StreetEquity,
+        transitions: TransitionMatrices,
         values: PostflopValues,
         flops: Vec<[Card; 3]>,
     ) -> Result<Self, PostflopAbstractionError> {
@@ -460,6 +472,7 @@ impl PostflopAbstraction {
         Ok(Self {
             buckets,
             street_equity,
+            transitions,
             tree,
             values,
             spr: config.primary_spr(),
@@ -480,9 +493,8 @@ impl PostflopAbstraction {
 fn load_or_build_abstraction(
     config: &PostflopModelConfig,
     on_progress: &(impl Fn(BuildPhase) + Sync),
-) -> Result<(StreetBuckets, StreetEquity, Vec<[Card; 3]>), PostflopAbstractionError> {
+) -> Result<(StreetBuckets, StreetEquity, TransitionMatrices, Vec<[Card; 3]>), PostflopAbstractionError> {
     // Cache is disabled during the StreetBuckets migration (format changed).
-    // Task 9 will re-enable caching with the new format.
 
     on_progress(BuildPhase::HandBuckets(0, hand_buckets::NUM_HANDS));
 
@@ -516,18 +528,24 @@ fn load_or_build_abstraction(
     );
 
     let num_flops = flops.len();
-    on_progress(BuildPhase::EquityTable(0, num_flops + 2));
+    on_progress(BuildPhase::EquityTable(0, num_flops * 3));
 
     let street_equity = result.compute_pairwise_street_equity(
         &hands,
         &flops,
-        &result.turn_boards,
-        &result.river_boards,
         config.equity_rollout_fraction,
         |done, total| on_progress(BuildPhase::EquityTable(done, total)),
     );
 
-    Ok((result.buckets, street_equity, flops))
+    // Compute transition matrices
+    let transitions = hand_buckets::compute_transition_matrices(
+        &result.buckets,
+        config.num_hand_buckets_flop,
+        config.num_hand_buckets_turn,
+        config.num_hand_buckets_river,
+    );
+
+    Ok((result.buckets, street_equity, transitions, flops))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -542,11 +560,15 @@ pub(crate) struct FlopSolveResult {
     pub iterations_used: usize,
 }
 
-/// Equity references for a single flop solve.
+/// Equity and transition references for a single flop solve.
 struct SolveEquity<'a> {
     flop: &'a BucketEquity,
     turn: &'a BucketEquity,
     river: &'a BucketEquity,
+    /// `flop_to_turn[flop_bucket][turn_bucket]` → transition probability
+    flop_to_turn: &'a [Vec<f64>],
+    /// `turn_to_river[turn_bucket][river_bucket]` → transition probability
+    turn_to_river: &'a [Vec<f64>],
 }
 
 /// Solve all flops in parallel, each with the shared tree template.
@@ -557,6 +579,7 @@ fn solve_postflop_per_flop(
     tree: &PostflopTree,
     layout: &PostflopLayout,
     street_equity: &StreetEquity,
+    transitions: &TransitionMatrices,
     num_flop_buckets: usize,
     num_iterations: usize,
     samples_per_iter: usize,
@@ -595,8 +618,10 @@ fn solve_postflop_per_flop(
         .map(|flop_idx| {
             let solve_eq = SolveEquity {
                 flop: &street_equity.flop[flop_idx],
-                turn: &street_equity.turn,
-                river: &street_equity.river,
+                turn: &street_equity.turn[flop_idx],
+                river: &street_equity.river[flop_idx],
+                flop_to_turn: &transitions.flop_to_turn[flop_idx],
+                turn_to_river: &transitions.turn_to_river[flop_idx],
             };
             let flop_name = flop_names.get(flop_idx).map_or("?", |s| s.as_str());
             solve_one_flop(
@@ -784,10 +809,9 @@ fn sampled_cfr_iteration(
 
 /// Single CFR traversal for the postflop solve phase. Returns hero EV fraction.
 ///
-/// With imperfect recall, bucket IDs pass through unchanged at Chance nodes
-/// (street transitions). The player does not track bucket transitions — the
-/// strategy at a turn/river node is the same regardless of which flop bucket
-/// led there.
+/// At Chance nodes (street transitions), iterates over all new-street bucket
+/// pairs weighted by transition probabilities. This properly models how hands
+/// transition between per-flop buckets at street boundaries.
 #[allow(clippy::too_many_arguments)]
 fn solve_cfr_traverse(
     tree: &PostflopTree,
@@ -810,16 +834,42 @@ fn solve_cfr_traverse(
             let eq_table = solve_equity_for_street(solve_eq, current_street);
             postflop_terminal_value(*terminal_type, *pot_fraction, hero_bucket, opp_bucket, hero_pos, eq_table)
         }
-        PostflopNode::Chance { children, weights, .. } => {
-            children.iter().zip(weights.iter())
-                .map(|(&child, &w)| {
-                    w * solve_cfr_traverse(
+        PostflopNode::Chance { children, street, .. } => {
+            // Transition to new street buckets using transition matrices
+            let transition = match street {
+                Street::Turn => solve_eq.flop_to_turn,
+                Street::River => solve_eq.turn_to_river,
+                _ => {
+                    // Shouldn't happen in practice, fall through to children
+                    return children.iter()
+                        .map(|&child| {
+                            solve_cfr_traverse(
+                                tree, layout, solve_eq, snapshot, dr, ds,
+                                child, hero_bucket, opp_bucket, hero_pos,
+                                reach_hero, reach_opp, iteration,
+                            )
+                        })
+                        .sum::<f64>() / children.len().max(1) as f64;
+                }
+            };
+            debug_assert_eq!(children.len(), 1, "chance node should have exactly 1 structural child");
+            let child = children[0];
+            let num_new = transition[0].len();
+            let mut value = 0.0;
+            for new_hero in 0..num_new {
+                let hw = transition[hero_bucket as usize][new_hero];
+                if hw < 1e-12 { continue; }
+                for new_opp in 0..num_new {
+                    let ow = transition[opp_bucket as usize][new_opp];
+                    if ow < 1e-12 { continue; }
+                    value += hw * ow * solve_cfr_traverse(
                         tree, layout, solve_eq, snapshot, dr, ds,
-                        child, hero_bucket, opp_bucket, hero_pos,
-                        reach_hero, reach_opp, iteration,
-                    )
-                })
-                .sum()
+                        child, new_hero as u16, new_opp as u16, hero_pos,
+                        reach_hero * hw, reach_opp * ow, iteration,
+                    );
+                }
+            }
+            value
         }
         PostflopNode::Decision { position, children, .. } => {
             let is_hero = *position == hero_pos;
@@ -1002,6 +1052,7 @@ fn compute_postflop_values(
     tree: &PostflopTree,
     layout: &PostflopLayout,
     street_equity: &StreetEquity,
+    transitions: &TransitionMatrices,
     per_flop_strategy_sums: &[Vec<f64>],
     num_flop_buckets: usize,
 ) -> PostflopValues {
@@ -1013,8 +1064,10 @@ fn compute_postflop_values(
         let strategy_sum = &per_flop_strategy_sums[flop_idx];
         let solve_eq = SolveEquity {
             flop: &street_equity.flop[flop_idx],
-            turn: &street_equity.turn,
-            river: &street_equity.river,
+            turn: &street_equity.turn[flop_idx],
+            river: &street_equity.river[flop_idx],
+            flop_to_turn: &transitions.flop_to_turn[flop_idx],
+            turn_to_river: &transitions.turn_to_river[flop_idx],
         };
         for hero_pos in 0..2u8 {
             for hero_bucket in 0..num_flop_buckets as u16 {
@@ -1054,15 +1107,38 @@ fn eval_with_avg_strategy(
             let eq_table = solve_equity_for_street(solve_eq, current_street);
             postflop_terminal_value(*terminal_type, *pot_fraction, hero_bucket, opp_bucket, hero_pos, eq_table)
         }
-        PostflopNode::Chance { children, weights, .. } => {
-            children.iter().zip(weights.iter())
-                .map(|(&child, &w)| {
-                    w * eval_with_avg_strategy(
+        PostflopNode::Chance { children, street, .. } => {
+            let transition = match street {
+                Street::Turn => solve_eq.flop_to_turn,
+                Street::River => solve_eq.turn_to_river,
+                _ => {
+                    return children.iter()
+                        .map(|&child| {
+                            eval_with_avg_strategy(
+                                tree, layout, solve_eq, strategy_sum,
+                                child, hero_bucket, opp_bucket, hero_pos,
+                            )
+                        })
+                        .sum::<f64>() / children.len().max(1) as f64;
+                }
+            };
+            debug_assert_eq!(children.len(), 1, "chance node should have exactly 1 structural child");
+            let child = children[0];
+            let num_new = transition[0].len();
+            let mut value = 0.0;
+            for new_hero in 0..num_new {
+                let hw = transition[hero_bucket as usize][new_hero];
+                if hw < 1e-12 { continue; }
+                for new_opp in 0..num_new {
+                    let ow = transition[opp_bucket as usize][new_opp];
+                    if ow < 1e-12 { continue; }
+                    value += hw * ow * eval_with_avg_strategy(
                         tree, layout, solve_eq, strategy_sum,
-                        child, hero_bucket, opp_bucket, hero_pos,
-                    )
-                })
-                .sum()
+                        child, new_hero as u16, new_opp as u16, hero_pos,
+                    );
+                }
+            }
+            value
         }
         PostflopNode::Decision { position, children, .. } => {
             let bucket = if *position == hero_pos { hero_bucket } else { opp_bucket };
@@ -1341,6 +1417,16 @@ mod tests {
         assert!(delta > 0.0, "different buffers should have nonzero delta");
     }
 
+    /// Build identity transition matrix: each bucket maps to the same-index bucket.
+    /// This makes tests equivalent to the old pass-through behavior.
+    fn identity_transition(k: usize) -> Vec<Vec<f64>> {
+        let mut matrix = vec![vec![0.0; k]; k];
+        for i in 0..k {
+            matrix[i][i] = 1.0;
+        }
+        matrix
+    }
+
     #[timed_test]
     fn solve_one_flop_returns_result_struct() {
         // Verify that solve_one_flop returns FlopSolveResult with correct fields.
@@ -1355,10 +1441,14 @@ mod tests {
             equity: vec![vec![0.5; 5]; 5],
             num_buckets: 5,
         };
+        let f2t = identity_transition(5);
+        let t2r = identity_transition(5);
         let solve_eq = SolveEquity {
             flop: &eq,
             turn: &eq,
             river: &eq,
+            flop_to_turn: &f2t,
+            turn_to_river: &t2r,
         };
         let result = solve_one_flop(
             &tree, &layout, &solve_eq,
@@ -1373,8 +1463,6 @@ mod tests {
 
     #[timed_test]
     fn solve_one_flop_early_stop_with_zero_threshold() {
-        // With threshold=0.0, should run all iterations (never stops early
-        // because delta is never exactly 0 after real CFR iterations).
         let config = PostflopModelConfig::fast();
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
         let streets = annotate_streets(&tree);
@@ -1385,10 +1473,14 @@ mod tests {
             equity: vec![vec![0.5; 5]; 5],
             num_buckets: 5,
         };
+        let f2t = identity_transition(5);
+        let t2r = identity_transition(5);
         let solve_eq = SolveEquity {
             flop: &eq,
             turn: &eq,
             river: &eq,
+            flop_to_turn: &f2t,
+            turn_to_river: &t2r,
         };
         let result = solve_one_flop(
             &tree, &layout, &solve_eq,
@@ -1400,7 +1492,6 @@ mod tests {
 
     #[timed_test]
     fn solve_one_flop_early_stop_with_large_threshold() {
-        // With a very large threshold, should stop at iteration 2 (minimum).
         let config = PostflopModelConfig::fast();
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
         let streets = annotate_streets(&tree);
@@ -1411,10 +1502,14 @@ mod tests {
             equity: vec![vec![0.5; 5]; 5],
             num_buckets: 5,
         };
+        let f2t = identity_transition(5);
+        let t2r = identity_transition(5);
         let solve_eq = SolveEquity {
             flop: &eq,
             turn: &eq,
             river: &eq,
+            flop_to_turn: &f2t,
+            turn_to_river: &t2r,
         };
         let result = solve_one_flop(
             &tree, &layout, &solve_eq,

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::hand_buckets::{StreetBuckets, StreetEquity};
+use super::hand_buckets::{StreetBuckets, StreetEquity, TransitionMatrices};
 use super::postflop_model::PostflopModelConfig;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -59,6 +59,7 @@ pub fn cache_dir(base: &Path, key: &AbstractionCacheKey) -> PathBuf {
 struct AbstractionCacheData {
     buckets: StreetBuckets,
     equity: StreetEquity,
+    transitions: TransitionMatrices,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -86,6 +87,7 @@ pub fn save(
     key: &AbstractionCacheKey,
     buckets: &StreetBuckets,
     equity: &StreetEquity,
+    transitions: &TransitionMatrices,
 ) -> Result<(), CacheError> {
     let dir = cache_dir(base, key);
     fs::create_dir_all(&dir)?;
@@ -96,6 +98,10 @@ pub fn save(
     let data = AbstractionCacheData {
         buckets: clone_street_buckets(buckets),
         equity: clone_street_equity(equity),
+        transitions: TransitionMatrices {
+            flop_to_turn: transitions.flop_to_turn.clone(),
+            turn_to_river: transitions.turn_to_river.clone(),
+        },
     };
     let bytes = bincode::serialize(&data).map_err(|e| CacheError::Serialize(e.to_string()))?;
     fs::write(dir.join("abstraction.bin"), bytes)?;
@@ -108,11 +114,11 @@ pub fn save(
 pub fn load(
     base: &Path,
     key: &AbstractionCacheKey,
-) -> Option<(StreetBuckets, StreetEquity)> {
+) -> Option<(StreetBuckets, StreetEquity, TransitionMatrices)> {
     let dir = cache_dir(base, key);
     let bytes = fs::read(dir.join("abstraction.bin")).ok()?;
     let data: AbstractionCacheData = bincode::deserialize(&bytes).ok()?;
-    Some((data.buckets, data.equity))
+    Some((data.buckets, data.equity, data.transitions))
 }
 
 /// Check whether a cache entry exists for the given key.
@@ -153,9 +159,9 @@ fn clone_street_equity(e: &StreetEquity) -> StreetEquity {
         num_buckets: eq.num_buckets,
     };
     StreetEquity {
-        flop: e.flop.iter().map(|eq| clone_eq(eq)).collect(),
-        turn: clone_eq(&e.turn),
-        river: clone_eq(&e.river),
+        flop: e.flop.iter().map(clone_eq).collect(),
+        turn: e.turn.iter().map(clone_eq).collect(),
+        river: e.river.iter().map(clone_eq).collect(),
     }
 }
 
@@ -182,9 +188,9 @@ mod tests {
         StreetBuckets {
             flop: vec![vec![0u16]],
             num_flop_buckets: 1,
-            turn: vec![0u16],
+            turn: vec![vec![0u16]],
             num_turn_buckets: 1,
-            river: vec![0u16],
+            river: vec![vec![0u16]],
             num_river_buckets: 1,
         }
     }
@@ -197,8 +203,15 @@ mod tests {
         };
         StreetEquity {
             flop: vec![BucketEquity { equity: eq.equity.clone(), num_buckets: eq.num_buckets }],
-            turn: BucketEquity { equity: eq.equity.clone(), num_buckets: eq.num_buckets },
-            river: eq,
+            turn: vec![BucketEquity { equity: eq.equity.clone(), num_buckets: eq.num_buckets }],
+            river: vec![eq],
+        }
+    }
+
+    fn minimal_transitions() -> TransitionMatrices {
+        TransitionMatrices {
+            flop_to_turn: vec![vec![vec![1.0]]],
+            turn_to_river: vec![vec![vec![1.0]]],
         }
     }
 
@@ -208,16 +221,19 @@ mod tests {
         let key = minimal_key();
         let buckets = minimal_buckets();
         let equity = minimal_equity();
+        let transitions = minimal_transitions();
 
-        save(dir.path(), &key, &buckets, &equity).unwrap();
-        let (loaded_buckets, loaded_equity) =
+        save(dir.path(), &key, &buckets, &equity, &transitions).unwrap();
+        let (loaded_buckets, loaded_equity, loaded_transitions) =
             load(dir.path(), &key).expect("cache load should succeed");
 
         assert_eq!(loaded_buckets.num_flop_buckets, buckets.num_flop_buckets);
         assert_eq!(loaded_buckets.flop, buckets.flop);
         assert_eq!(loaded_buckets.flop.len(), buckets.flop.len());
-        assert_eq!(loaded_equity.river.num_buckets, equity.river.num_buckets);
-        assert!((loaded_equity.river.get(0, 0) - 0.5).abs() < 1e-6);
+        assert_eq!(loaded_equity.river[0].num_buckets, equity.river[0].num_buckets);
+        assert!((loaded_equity.river[0].get(0, 0) - 0.5).abs() < 1e-6);
+        assert_eq!(loaded_transitions.flop_to_turn.len(), 1);
+        assert!((loaded_transitions.flop_to_turn[0][0][0] - 1.0).abs() < 1e-9);
     }
 
     #[timed_test]
@@ -258,7 +274,7 @@ mod tests {
     fn exists_true_after_save() {
         let dir = TempDir::new().unwrap();
         let key = minimal_key();
-        save(dir.path(), &key, &minimal_buckets(), &minimal_equity()).unwrap();
+        save(dir.path(), &key, &minimal_buckets(), &minimal_equity(), &minimal_transitions()).unwrap();
         assert!(exists(dir.path(), &key));
     }
 
@@ -266,7 +282,7 @@ mod tests {
     fn key_yaml_written_on_save() {
         let dir = TempDir::new().unwrap();
         let key = minimal_key();
-        save(dir.path(), &key, &minimal_buckets(), &minimal_equity()).unwrap();
+        save(dir.path(), &key, &minimal_buckets(), &minimal_equity(), &minimal_transitions()).unwrap();
         let yaml_path = cache_dir(dir.path(), &key).join("key.yaml");
         assert!(yaml_path.exists());
         let contents = fs::read_to_string(yaml_path).unwrap();

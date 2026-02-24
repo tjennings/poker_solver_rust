@@ -107,8 +107,12 @@ fn postflop_abstraction_with_imperfect_recall_builds_and_solves() {
     for flop_eq in &abstraction.street_equity.flop {
         assert_eq!(flop_eq.num_buckets, n);
     }
-    assert_eq!(abstraction.street_equity.turn.num_buckets, n);
-    assert_eq!(abstraction.street_equity.river.num_buckets, n);
+    for turn_eq in &abstraction.street_equity.turn {
+        assert_eq!(turn_eq.num_buckets, n);
+    }
+    for river_eq in &abstraction.street_equity.river {
+        assert_eq!(river_eq.num_buckets, n);
+    }
 
     eprintln!(
         "  [done] value table has {} entries across {} flops",
