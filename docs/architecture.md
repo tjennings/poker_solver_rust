@@ -146,6 +146,22 @@ MCCFR per-flop with bucket-level abstraction:
 
 **File:** `crates/core/src/preflop/postflop_abstraction.rs`
 
+### Stage 5: EV Rebucketing (Optional)
+
+When `rebucket_rounds > 1`, an outer loop refines flop bucket assignments using strategy-dependent EV features instead of raw equity:
+
+1. **Round 1 (EHS):** Standard pipeline — cluster on equity histograms, solve all flops
+2. **Rounds 2+:** Extract per-hand EV histograms from the converged strategy (distribution of EVs across opponent buckets), re-cluster flop hands on EV features, recompute per-flop equity tables, re-solve
+3. **Final round:** Compute `PostflopValues` from the last converged strategy
+
+This captures hand value nuances that equity alone misses. Nut hands and second-nut hands have similar equity (~95%+) but divergent EV profiles — nuts extract value from strong-but-second-best hands, while second-best pays off in those spots. EV rebucketing separates them.
+
+Each per-flop CFR solve uses **early stopping**: when the max absolute strategy delta between consecutive iterations drops below `rebucket_delta_threshold` (default 0.001), the solve stops early. Otherwise it runs to `postflop_solve_iterations`.
+
+With `rebucket_rounds: 1` (default), behavior is identical to the standard EHS-only pipeline.
+
+**File:** `crates/core/src/preflop/postflop_abstraction.rs`, `crates/core/src/preflop/hand_buckets.rs`
+
 ### Runtime Integration
 
 At each preflop showdown terminal:
@@ -179,9 +195,11 @@ At each preflop showdown terminal:
 | `num_hand_buckets_river` | 500 | 50/200/500/1000 | River k-means clusters (global) |
 | `bet_sizes` | [0.5, 1.0] | — | Pot-fraction bet sizes |
 | `max_raises_per_street` | 1 | — | Raise cap per postflop street |
-| `postflop_spr` | 5.0 | — | Fixed SPR for shared postflop tree |
+| `postflop_sprs` | [3.5] | — | SPR(s) for shared postflop tree (scalar or list) |
 | `postflop_solve_iterations` | 200 | — | MCCFR iterations per flop |
 | `postflop_solve_samples` | 0 | — | Bucket pairs per iteration (0 = all) |
+| `rebucket_rounds` | 1 | — | EV rebucketing rounds (1 = EHS only, 2+ = EV rebucketing) |
+| `rebucket_delta_threshold` | 0.001 | — | Max strategy delta for early CFR stopping |
 
 ## Caching
 

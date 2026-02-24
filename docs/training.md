@@ -213,10 +213,13 @@ postflop_model:
   num_hand_buckets_river: 200
   bet_sizes: [0.5, 1.0, 2.0]
   max_raises_per_street: 1
-  postflop_spr: 5.0               # fixed SPR for shared postflop tree
+  postflop_sprs: [3.5]            # SPR(s) for shared postflop tree (scalar also accepted)
   postflop_solve_iterations: 1000
   postflop_solve_samples: 100000
   equity_rollout_fraction: 1.0    # 1.0=exhaustive, 0.1=sample 10% of runouts per hand pair on flop
+  # EV rebucketing (default: 1 = EHS only)
+  # rebucket_rounds: 2
+  # rebucket_delta_threshold: 0.001
 ```
 
 ### Postflop Model Presets
@@ -231,6 +234,8 @@ postflop_model:
 The `max_flop_boards` parameter controls how many canonical flop textures are used for EHS feature computation during hand bucketing. Lower values dramatically speed up the bucketing phase. Set to `0` (or omit) to use all ~1,755 canonical flops. Configurable in YAML via `max_flop_boards: 200`.
 
 The `equity_rollout_fraction` parameter controls how bucket-pair equity is computed on flop boards. With `1.0` (default), all C(remaining,2) runouts are enumerated exactly (~990 per hand pair). With a fractional value like `0.1` or `0.2`, that fraction of runouts is sampled per pair — roughly 5-10x faster with good accuracy. Turn and river equity is always exact regardless of this setting.
+
+The `rebucket_rounds` parameter controls EV-based postflop rebucketing. With the default value of `1`, only EHS equity histograms are used (standard behavior). With `2` or more, the solver runs an additional loop: solve all flops, extract per-hand EV histograms from the converged strategy, re-cluster flop buckets on EV features, and re-solve. Each CFR solve uses early stopping when max strategy delta drops below `rebucket_delta_threshold` (default 0.001). The `postflop_sprs` field accepts a scalar or list of SPR values for the shared postflop tree (replaces `postflop_spr`; scalar values are auto-wrapped for backward compatibility).
 
 ---
 
