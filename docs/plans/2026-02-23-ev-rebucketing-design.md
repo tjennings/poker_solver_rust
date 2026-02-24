@@ -49,7 +49,7 @@ New fields in `PostflopModelConfig`:
 ```yaml
 postflop_model:
   rebucket_rounds: 1              # 1 = EHS only (backward compat), 2+ = EV rebucketing
-  rebucket_delta_threshold: 0.001 # max-regret-delta for early CFR stopping
+  cfr_delta_threshold: 0.001 # max-regret-delta for early CFR stopping
   postflop_sprs: [3.5]            # list of SPRs, starting with one (100bb 3bet/call)
 ```
 
@@ -102,7 +102,7 @@ enum BuildPhase {
 
 | Component | Change |
 |-|-|
-| `PostflopModelConfig` | Add `rebucket_rounds`, `rebucket_delta_threshold`; replace `postflop_spr` with `postflop_sprs: Vec<f64>` |
+| `PostflopModelConfig` | Add `rebucket_rounds`, `cfr_delta_threshold`; replace `postflop_spr` with `postflop_sprs: Vec<f64>` |
 | `PostflopAbstraction::build()` | Outer loop over rebucket rounds; extract EV histograms after each solve |
 | `solve_one_flop()` | Add early-stopping via max-regret-delta check per iteration; return delta alongside strategy_sum |
 | `hand_buckets.rs` | New `build_ev_histograms()` to extract EV distribution per (hand, flop) from converged strategy; new `cluster_ev_histograms()` reusing existing k-means infra |

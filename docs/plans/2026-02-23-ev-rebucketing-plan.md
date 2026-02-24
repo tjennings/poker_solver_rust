@@ -29,9 +29,9 @@ fn rebucket_rounds_defaults_to_one() {
 }
 
 #[timed_test]
-fn rebucket_delta_threshold_defaults() {
+fn cfr_delta_threshold_defaults() {
     let cfg = PostflopModelConfig::standard();
-    assert!((cfg.rebucket_delta_threshold - 0.001).abs() < 1e-9);
+    assert!((cfg.cfr_delta_threshold - 0.001).abs() < 1e-9);
 }
 
 #[timed_test]
@@ -79,7 +79,7 @@ Add default functions:
 
 ```rust
 fn default_rebucket_rounds() -> u16 { 1 }
-fn default_rebucket_delta_threshold() -> f64 { 0.001 }
+fn default_cfr_delta_threshold() -> f64 { 0.001 }
 fn default_postflop_sprs() -> Vec<f64> { vec![3.5] }
 ```
 
@@ -89,8 +89,8 @@ Add fields to `PostflopModelConfig`:
 #[serde(default = "default_rebucket_rounds")]
 pub rebucket_rounds: u16,
 
-#[serde(default = "default_rebucket_delta_threshold")]
-pub rebucket_delta_threshold: f64,
+#[serde(default = "default_cfr_delta_threshold")]
+pub cfr_delta_threshold: f64,
 
 /// SPR(s) for postflop solves. Supports scalar `postflop_spr: 3.5`
 /// (backward compat) or list `postflop_sprs: [3.5, 6.0]`.
@@ -126,7 +126,7 @@ feat: add rebucket_rounds, delta_threshold, postflop_sprs config
 
 Replaces scalar postflop_spr with Vec<f64> postflop_sprs (backward
 compatible via serde alias). Adds rebucket_rounds (default 1, no
-rebucketing) and rebucket_delta_threshold (default 0.001) for
+rebucketing) and cfr_delta_threshold (default 0.001) for
 EV-based postflop rebucketing.
 ```
 
@@ -479,7 +479,7 @@ pub fn build(config, equity_table, cache_base, on_progress) -> Result<Self, _> {
         let solve_results = solve_postflop_per_flop(
             &tree, &layout, &street_equity,
             num_flop_b, config.postflop_solve_iterations,
-            samples, config.rebucket_delta_threshold,
+            samples, config.cfr_delta_threshold,
             round, total_rounds, &flop_names,
             &on_progress,
         );
@@ -694,14 +694,14 @@ Add a section under postflop abstraction describing the rebucketing loop, EV his
 
 **Step 2: Update training.md**
 
-Document new config fields: `rebucket_rounds`, `rebucket_delta_threshold`, `postflop_sprs`. Include example YAML.
+Document new config fields: `rebucket_rounds`, `cfr_delta_threshold`, `postflop_sprs`. Include example YAML.
 
 **Step 3: Add commented example to smoke.yaml**
 
 ```yaml
 # EV rebucketing (default: 1 round = EHS only)
 # rebucket_rounds: 2
-# rebucket_delta_threshold: 0.001
+# cfr_delta_threshold: 0.001
 # postflop_sprs: [3.5]
 ```
 

@@ -41,7 +41,7 @@ fn default_equity_rollout_fraction() -> f64 {
 fn default_rebucket_rounds() -> u16 {
     1
 }
-fn default_rebucket_delta_threshold() -> f64 {
+fn default_cfr_delta_threshold() -> f64 {
     0.001
 }
 
@@ -112,8 +112,8 @@ pub struct PostflopModelConfig {
     pub rebucket_rounds: u16,
 
     /// Max-regret-delta threshold for early CFR stopping during rebucketing.
-    #[serde(default = "default_rebucket_delta_threshold")]
-    pub rebucket_delta_threshold: f64,
+    #[serde(default = "default_cfr_delta_threshold")]
+    pub cfr_delta_threshold: f64,
 
     /// Maximum number of canonical flop boards to use for EHS feature computation.
     /// 0 means use all canonical flops (~1,755). Lower values dramatically speed up
@@ -172,7 +172,7 @@ impl PostflopModelConfig {
             postflop_solve_samples: 0,
             postflop_sprs: vec![3.5],
             rebucket_rounds: 1,
-            rebucket_delta_threshold: 0.001,
+            cfr_delta_threshold: 0.001,
             max_flop_boards: 0,
             fixed_flops: None,
             equity_rollout_fraction: 1.0,
@@ -299,9 +299,9 @@ mod tests {
     }
 
     #[timed_test]
-    fn rebucket_delta_threshold_defaults() {
+    fn cfr_delta_threshold_defaults() {
         let cfg = PostflopModelConfig::standard();
-        assert!((cfg.rebucket_delta_threshold - 0.001).abs() < 1e-9);
+        assert!((cfg.cfr_delta_threshold - 0.001).abs() < 1e-9);
     }
 
     #[timed_test]
