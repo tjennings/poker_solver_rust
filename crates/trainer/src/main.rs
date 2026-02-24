@@ -712,11 +712,14 @@ struct PreflopTrainingConfig {
     pub equity_samples: u32,
     #[serde(default = "default_print_every")]
     pub print_every: u64,
+    #[serde(default = "default_convergence_threshold")]
+    pub convergence_threshold: f64,
 }
 
 fn default_iterations() -> u64 { 5000 }
 fn default_equity_samples() -> u32 { 20000 }
 fn default_print_every() -> u64 { 1000 }
+fn default_convergence_threshold() -> f64 { 0.0001 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_solve_preflop(
@@ -746,6 +749,7 @@ fn run_solve_preflop(
             iterations: 5000,
             equity_samples: 20000,
             print_every: 1000,
+            convergence_threshold: default_convergence_threshold(),
         }
     };
 
@@ -762,6 +766,7 @@ fn run_solve_preflop(
     let iterations = training.iterations;
     let equity_samples = training.equity_samples;
     let print_every = training.print_every;
+    let convergence_threshold = training.convergence_threshold;
     let players = config.positions.len();
 
     let cache_base = std::path::Path::new("cache/postflop");
@@ -966,7 +971,7 @@ fn run_solve_preflop(
             .progress_chars("#>-"),
     );
 
-    const DELTA_THRESHOLD: f64 = 0.0001;
+    let delta_threshold = convergence_threshold;
     let chunk = std::cmp::max(iterations / 100, 1);
     let mut done = 0u64;
     let mut converged_early = false;
@@ -984,8 +989,8 @@ fn run_solve_preflop(
                 );
                 prev_matrices = matrices;
                 if let Some(d) = max_delta {
-                    if d < DELTA_THRESHOLD {
-                        println!("Delta {d:.6} < {DELTA_THRESHOLD} — stopping early at iteration {done}");
+                    if d < delta_threshold {
+                        println!("Delta {d:.6} < {delta_threshold} — stopping early at iteration {done}");
                         early_stop = true;
                     }
                 }
