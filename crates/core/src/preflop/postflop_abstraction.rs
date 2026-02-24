@@ -13,6 +13,8 @@
 //!     → return expected value
 //! ```
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use rand::rngs::SmallRng;
 use serde::{Deserialize, Serialize};
 use rand::{Rng, SeedableRng};
@@ -351,6 +353,7 @@ impl PostflopAbstraction {
         let num_hands = hand_buckets::NUM_HANDS;
 
         // First round: streaming per-flop pipeline (bucket + equity + transitions + solve + extract)
+        let flop_done = AtomicUsize::new(0);
         on_progress(BuildPhase::HandBuckets(0, num_flops));
         let results: Vec<(Vec<u16>, Vec<f64>)> = (0..num_flops)
             .into_par_iter()
@@ -380,6 +383,8 @@ impl PostflopAbstraction {
                     total_rounds,
                     &on_progress,
                 );
+                let done = flop_done.fetch_add(1, Ordering::Relaxed) + 1;
+                on_progress(BuildPhase::HandBuckets(done, num_flops));
                 (flop_buckets, values)
             })
             .collect();
@@ -426,6 +431,7 @@ impl PostflopAbstraction {
             // Stream-solve again with reclustered flop buckets
             // process_single_flop with override_flop_buckets ensures consistent
             // flop_to_turn transitions (computed from the reclustered flop buckets)
+            let flop_done = AtomicUsize::new(0);
             on_progress(BuildPhase::HandBuckets(0, num_flops));
             let results: Vec<(Vec<u16>, Vec<f64>)> = (0..num_flops)
                 .into_par_iter()
@@ -455,6 +461,8 @@ impl PostflopAbstraction {
                         total_rounds,
                         &on_progress,
                     );
+                    let done = flop_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    on_progress(BuildPhase::HandBuckets(done, num_flops));
                     (fb, vals)
                 })
                 .collect();
