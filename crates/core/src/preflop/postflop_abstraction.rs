@@ -268,10 +268,6 @@ pub enum FlopStage {
 /// Progress report during postflop abstraction construction.
 #[derive(Debug, Clone)]
 pub enum BuildPhase {
-    /// Building postflop game trees.
-    Trees,
-    /// Computing flat buffer layout.
-    Layout,
     /// Per-flop streaming progress.
     FlopProgress {
         flop_name: String,
@@ -288,8 +284,6 @@ pub enum BuildPhase {
 impl std::fmt::Display for BuildPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Trees => write!(f, "Postflop trees"),
-            Self::Layout => write!(f, "Buffer layout"),
             Self::FlopProgress { flop_name, stage } => match stage {
                 FlopStage::Bucketing => write!(f, "Flop '{flop_name}' Bucketing"),
                 FlopStage::Solving { iteration, max_iterations, delta } =>
@@ -336,10 +330,7 @@ impl PostflopAbstraction {
         let num_flops = flops.len();
 
         // Build tree + layout (global, shared across all flops/rounds)
-        on_progress(BuildPhase::Trees);
         let tree = PostflopTree::build_with_spr(config, config.primary_spr())?;
-
-        on_progress(BuildPhase::Layout);
         let node_streets = annotate_streets(&tree);
         let nfb = config.num_hand_buckets_flop as usize;
         let ntb = config.num_hand_buckets_turn as usize;
