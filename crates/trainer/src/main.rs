@@ -843,8 +843,50 @@ fn run_solve_preflop(
             phase_bar.set_style(spinner_style.clone());
             phase_bar.set_message("Postflop abstraction");
             phase_bar.enable_steady_tick(std::time::Duration::from_millis(500));
-            let flop_bars: Arc<Mutex<HashMap<String, ProgressBar>>> =
-                Arc::new(Mutex::new(HashMap::new()));
+            // Per-flop display state for sorted progress bars.
+            // Bars are reassigned on each update so most-progressed flops
+            // stay at the top of the terminal output.
+            struct FlopSlotData {
+                sort_key: f64,
+                position: u64,
+                length: u64,
+                message: String,
+            }
+
+            #[allow(clippy::cast_precision_loss)]
+            fn refresh_flop_slots(
+                states: &HashMap<String, FlopSlotData>,
+                slots: &mut Vec<ProgressBar>,
+                multi: &MultiProgress,
+                style: &ProgressStyle,
+            ) {
+                let mut sorted: Vec<_> = states.iter().collect();
+                sorted.sort_by(|a, b| {
+                    b.1.sort_key
+                        .partial_cmp(&a.1.sort_key)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                while slots.len() < sorted.len() {
+                    let b = multi.add(ProgressBar::new(0));
+                    b.set_style(style.clone());
+                    b.enable_steady_tick(std::time::Duration::from_millis(500));
+                    slots.push(b);
+                }
+                while slots.len() > sorted.len() {
+                    if let Some(bar) = slots.pop() {
+                        bar.finish_and_clear();
+                        multi.remove(&bar);
+                    }
+                }
+                for (i, (_, data)) in sorted.iter().enumerate() {
+                    slots[i].set_length(data.length);
+                    slots[i].set_position(data.position);
+                    slots[i].set_message(data.message.clone());
+                }
+            }
+
+            let flop_state: Arc<Mutex<(HashMap<String, FlopSlotData>, Vec<ProgressBar>)>> =
+                Arc::new(Mutex::new((HashMap::new(), Vec::new())));
 
             let pf_start = Instant::now();
             let abstraction = PostflopAbstraction::build(
@@ -854,45 +896,41 @@ fn run_solve_preflop(
                 |phase| {
                     match &phase {
                         BuildPhase::FlopProgress { flop_name, stage } => {
-                            let mut bars = flop_bars.lock().unwrap();
+                            let mut guard = flop_state.lock().unwrap();
+                            let (states, slots) = &mut *guard;
                             match stage {
                                 FlopStage::Bucketing { step, total_steps } => {
-                                    let bar = bars.entry(flop_name.clone()).or_insert_with(|| {
-                                        let b = multi.add(ProgressBar::new(u64::from(*total_steps)));
-                                        b.set_style(bar_style.clone());
-                                        b.enable_steady_tick(std::time::Duration::from_millis(500));
-                                        b
+                                    states.insert(flop_name.clone(), FlopSlotData {
+                                        sort_key: f64::from(*step) / f64::from((*total_steps).max(1)),
+                                        position: u64::from(*step),
+                                        length: u64::from(*total_steps),
+                                        message: format!("Flop '{flop_name}' Bucketing"),
                                     });
-                                    bar.set_length(u64::from(*total_steps));
-                                    bar.set_position(u64::from(*step));
-                                    bar.set_message(format!("Flop '{flop_name}' Bucketing"));
                                 }
                                 FlopStage::Solving { iteration, max_iterations, delta } => {
-                                    let bar = bars.entry(flop_name.clone()).or_insert_with(|| {
-                                        let b = multi.add(ProgressBar::new(*max_iterations as u64));
-                                        b.set_style(bar_style.clone());
-                                        b.enable_steady_tick(std::time::Duration::from_millis(500));
-                                        b
+                                    #[allow(clippy::cast_precision_loss)]
+                                    let key = 1.0 + *iteration as f64 / (*max_iterations).max(1) as f64;
+                                    states.insert(flop_name.clone(), FlopSlotData {
+                                        sort_key: key,
+                                        position: *iteration as u64,
+                                        length: *max_iterations as u64,
+                                        message: format!("Flop '{flop_name}' CFR \u{03b4}={delta:.4}"),
                                     });
-                                    // Switch from spinner to bar on first solve tick
-                                    bar.set_style(bar_style.clone());
-                                    bar.set_length(*max_iterations as u64);
-                                    bar.set_position(*iteration as u64);
-                                    bar.set_message(format!("Flop '{flop_name}' CFR \u{03b4}={delta:.4}"));
                                 }
                                 FlopStage::Done => {
-                                    if let Some(bar) = bars.remove(flop_name) {
-                                        bar.finish_and_clear();
-                                        multi.remove(&bar);
-                                    }
+                                    states.remove(flop_name);
                                 }
                             }
+                            refresh_flop_slots(states, slots, &multi, &bar_style);
                         }
                         BuildPhase::ExtractingEv(done, total) => {
                             // Clear flop bars, show extraction progress.
-                            let mut bars = flop_bars.lock().unwrap();
-                            for (_, bar) in bars.drain() {
+                            let mut guard = flop_state.lock().unwrap();
+                            let (states, slots) = &mut *guard;
+                            states.clear();
+                            for bar in slots.drain(..) {
                                 bar.finish_and_clear();
+                                multi.remove(&bar);
                             }
                             phase_bar.set_style(bar_style.clone());
                             phase_bar.set_length(*total as u64);
@@ -907,8 +945,10 @@ fn run_solve_preflop(
                         }
                         BuildPhase::MccfrFlopsCompleted { completed, total } => {
                             // Clear any remaining flop bucketing bars
-                            let mut bars = flop_bars.lock().unwrap();
-                            for (_, bar) in bars.drain() {
+                            let mut guard = flop_state.lock().unwrap();
+                            let (states, slots) = &mut *guard;
+                            states.clear();
+                            for bar in slots.drain(..) {
                                 bar.finish_and_clear();
                                 multi.remove(&bar);
                             }
@@ -928,9 +968,12 @@ fn run_solve_preflop(
 
             // Clean up any remaining flop bars.
             {
-                let mut bars = flop_bars.lock().unwrap();
-                for (_, bar) in bars.drain() {
+                let mut guard = flop_state.lock().unwrap();
+                let (states, slots) = &mut *guard;
+                states.clear();
+                for bar in slots.drain(..) {
                     bar.finish_and_clear();
+                    multi.remove(&bar);
                 }
             }
             phase_bar.set_style(bar_style);
