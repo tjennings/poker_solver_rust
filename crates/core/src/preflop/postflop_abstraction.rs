@@ -535,6 +535,7 @@ fn load_or_build_abstraction(
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Result of a single flop CFR solve.
+#[allow(dead_code)] // final_delta and iterations_used read in tests
 pub(crate) struct FlopSolveResult {
     pub strategy_sum: Vec<f64>,
     pub final_delta: f64,
