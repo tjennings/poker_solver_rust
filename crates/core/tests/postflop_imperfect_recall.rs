@@ -102,16 +102,19 @@ fn postflop_abstraction_with_imperfect_recall_builds_and_solves() {
     assert!(v_pos0.is_finite());
     assert!(v_pos1.is_finite());
 
-    // Street equity tables should have correct dimensions.
-    assert!(!abstraction.street_equity.flop.is_empty());
-    for flop_eq in &abstraction.street_equity.flop {
-        assert_eq!(flop_eq.num_buckets, n);
-    }
-    for turn_eq in &abstraction.street_equity.turn {
-        assert_eq!(turn_eq.num_buckets, n);
-    }
-    for river_eq in &abstraction.street_equity.river {
-        assert_eq!(river_eq.num_buckets, n);
+    // Street equity tables are None in streaming mode (only populated for diagnostics/cache).
+    // The streaming pipeline drops equity tables after solving each flop.
+    if let Some(ref eq) = abstraction.street_equity {
+        assert!(!eq.flop.is_empty());
+        for flop_eq in &eq.flop {
+            assert_eq!(flop_eq.num_buckets, n);
+        }
+        for turn_eq in &eq.turn {
+            assert_eq!(turn_eq.num_buckets, n);
+        }
+        for river_eq in &eq.river {
+            assert_eq!(river_eq.num_buckets, n);
+        }
     }
 
     eprintln!(

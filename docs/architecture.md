@@ -10,11 +10,15 @@ PreflopConfig ─► PreflopTree ─► PreflopSolver
                                       ▼
                               PostflopAbstraction
                               ┌───────────────────────────┐
-                              │ StreetBuckets (per-flop)   │  ◄── independent k-means per flop
-                              │ StreetEquity (per-flop)    │  ◄── bucket-pair equity per flop
+                              │ StreetBuckets.flop         │  ◄── flop bucket assignments (retained)
                               │ PostflopTree (shared)      │  ◄── single tree at fixed SPR
                               │ PostflopValues (per-flop)  │  ◄── solved EV table per flop
                               └───────────────────────────┘
+
+Streaming pipeline (per canonical flop, in parallel):
+  flop histograms → flop buckets → turn histograms → turn buckets
+  → river equities → river buckets → equity tables → transitions
+  → CFR solve → extract values → DROP intermediate data
 ```
 
 ## Project Structure
@@ -96,39 +100,54 @@ poker_solver_rust/
 
 The postflop model replaces raw equity evaluation at preflop showdown terminals with solved postflop EVs. It uses imperfect recall — each street clusters independently, and the player "forgets" prior-street bucket identity.
 
-### Stage 1: Hand Bucketing
+### Streaming Architecture
+
+The pipeline streams per-flop: for each canonical flop in parallel, it computes all data (buckets, equity tables, transition matrices), runs CFR to convergence, extracts the value row, then drops all intermediate data. Only flop bucket assignments and the per-flop value row persist. This reduces peak memory from ~6 GB (materializing all flops simultaneously) to ~30 MB.
+
+```
+For each canonical flop (parallel):
+  1. Compute flop histograms → k-means → flop_buckets
+  2. Compute flop pairwise equity
+  3. Enumerate 47 turn cards → turn histograms → k-means → turn_buckets
+  4. Compute turn pairwise equity
+  5. Sample 10 turns → enumerate river cards → river equities → k-means → river_buckets
+  6. Compute river pairwise equity
+  7. Compute flop→turn and turn→river transition matrices
+  8. CFR solve using shared tree template + per-flop equity/transitions
+  9. Extract value row: values[hero_pos][hero_bucket][opp_bucket] → EV
+  10. DROP: turn/river buckets, equity tables, transitions, regret/strategy buffers
+```
+
+**Entry point:** `process_single_flop()` (steps 1-7) + `stream_solve_and_extract_one_flop()` (steps 8-10)
+
+**Output retained at runtime:** `PostflopAbstraction` contains only flop bucket assignments (`StreetBuckets.flop`), the shared tree, and `PostflopValues`.
+
+### Per-Flop Bucketing
 
 Independent per-street k-means clustering on equity histogram CDF features:
 
-**Flop (per-flop):** For each canonical flop, cluster the 169 hands independently into N buckets. Each (hand, flop) pair's feature vector is the 10-bin equity CDF computed by enumerating 47 turn cards and computing equity vs uniform opponent. This gives each flop its own bucket assignments — "top pair on K72r" and "top pair on 987ss" get separate bucket IDs.
+**Flop:** For each canonical flop, cluster the 169 hands independently into N buckets. Each (hand, flop) pair's feature vector is the 10-bin equity CDF computed by enumerating 47 turn cards and computing equity vs uniform opponent. This gives each flop its own bucket assignments — "top pair on K72r" and "top pair on 987ss" get separate bucket IDs.
 
-**Turn (per-flop):** For each canonical flop, enumerate 47 live turn cards. For each of 169 hands × 47 turns, compute equity histogram CDF over 46 river cards → k-means. Independent clustering per flop, giving each flop its own turn bucket assignments.
+**Turn:** Enumerate 47 live turn cards. For each of 169 hands × 47 turns, compute equity histogram CDF over 46 river cards → k-means. Independent clustering per flop.
 
-**River (per-flop):** For each canonical flop, sample 10 evenly-spaced turn cards, enumerate ~46 river cards each → ~460 five-card boards. Compute scalar equity per hand × board → k-means. Independent clustering per flop.
+**River:** Sample 10 evenly-spaced turn cards, enumerate ~46 river cards each → ~460 five-card boards. Compute scalar equity per hand × board → k-means. Independent clustering per flop.
 
 The CDF representation means L2 distance equals Earth Mover's Distance for 1D distributions.
-
-**Output:** `StreetBuckets` — all streets per-flop: `flop[flop_idx][hand_idx] → bucket`, `turn[flop_idx][hand_idx * 47 + turn_local_idx] → bucket`, `river[flop_idx][hand_idx * num_river_boards + board_local_idx] → bucket`.
 
 **Files:**
 - Histogram CDFs & canonical boards: `crates/core/src/preflop/ehs.rs`
 - K-means & clustering pipeline: `crates/core/src/preflop/hand_buckets.rs`
+- Single-flop streaming: `process_single_flop()` in `hand_buckets.rs`
 
-### Stage 2: Equity Tables
+### Equity Tables & Transition Matrices
 
-`StreetEquity` holds per-street `BucketEquity` tables — all per-flop: `flop: Vec<BucketEquity>`, `turn: Vec<BucketEquity>`, `river: Vec<BucketEquity>`. Each `BucketEquity` is a 2D array `[bucket_a][bucket_b] → f32` storing average equity when bucket A faces bucket B. Used as leaf-node estimates during postflop CFR.
+Per-street `BucketEquity` tables: 2D array `[bucket_a][bucket_b] → f32` storing average equity when bucket A faces bucket B. Computed via true pairwise hand-vs-hand evaluation. Used as leaf-node estimates during postflop CFR.
 
-**Computation:** Bucket-pair equity uses true pairwise hand-vs-hand evaluation, computed independently per flop for all three streets.
+Transition matrices connect streets: `flop_to_turn[flop_bucket][turn_bucket] → P(turn_bucket | flop_bucket)` and `turn_to_river[turn_bucket][river_bucket] → P(river_bucket | turn_bucket)`. Computed by counting (hand, board) assignments across adjacent streets and normalizing rows.
 
-### Stage 2.5: Transition Matrices
+In streaming mode, equity tables and transition matrices are computed per-flop, used for the solve, then dropped. They are not retained in the final `PostflopAbstraction` struct.
 
-`TransitionMatrices` connects streets via probability matrices: `flop_to_turn[flop_idx][flop_bucket][turn_bucket] → P(turn_bucket | flop_bucket)` and `turn_to_river[flop_idx][turn_bucket][river_bucket] → P(river_bucket | turn_bucket)`. Computed by counting (hand, board) assignments across adjacent streets and normalizing rows.
-
-The intermediate features are returned from `build_street_buckets_independent` in a `BucketingResult` struct to avoid recomputation.
-
-**File:** `crates/core/src/preflop/hand_buckets.rs`
-
-### Stage 3: Postflop Tree
+### Postflop Tree
 
 A single shared tree template at a fixed SPR (`postflop_spr`, default 5.0). All per-flop solves share this tree structure.
 
@@ -136,25 +155,24 @@ Each tree has three streets of Decision nodes (OOP=0, IP=1), Chance nodes at str
 
 `PostflopLayout` maps `(node_idx, bucket)` to flat buffer offsets for regret/strategy storage.
 
-### Stage 4: Postflop Solve
+### Postflop Solve
 
 MCCFR per-flop with bucket-level abstraction:
 - Embarrassingly parallel: one independent solve per canonical flop
 - Each solve uses the shared tree template but its own per-flop equity and transition matrices
 - Imperfect recall: each street's decision nodes use that street's independent per-flop bucket ID
 - At chance nodes (street transitions): iterate over all new-street bucket pairs, weighted by transition probabilities `P(new_bucket | old_bucket)`. Reach probabilities are multiplied by transition weights for correct regret weighting
-- All equity lookups are per-flop: flop, turn, and river `BucketEquity` tables
 - Output: `PostflopValues` — flat 4D array `[flop_idx][hero_pos][hero_bucket][opp_bucket] → EV`
 
 **File:** `crates/core/src/preflop/postflop_abstraction.rs`
 
-### Stage 5: EV Rebucketing (Optional)
+### EV Rebucketing (Optional)
 
 When `rebucket_rounds > 1`, an outer loop refines flop bucket assignments using strategy-dependent EV features instead of raw equity:
 
-1. **Round 1 (EHS):** Standard pipeline — cluster on equity histograms, solve all flops
-2. **Rounds 2+:** Extract per-hand EV histograms from the converged strategy (distribution of EVs across opponent buckets), re-cluster flop hands on EV features, recompute per-flop equity tables, re-solve
-3. **Final round:** Compute `PostflopValues` from the last converged strategy
+1. **Round 1 (EHS):** Standard streaming pipeline — cluster on equity histograms, solve all flops
+2. **Rounds 2+:** Extract per-hand EV histograms from the converged strategy (distribution of EVs across opponent buckets), re-cluster flop hands on EV features, then stream-solve again (turn/river recomputed fresh per flop)
+3. **Final round:** Use values from the last converged strategy
 
 This captures hand value nuances that equity alone misses. Nut hands and second-nut hands have similar equity (~95%+) but divergent EV profiles — nuts extract value from strong-but-second-best hands, while second-best pays off in those spots. EV rebucketing separates them.
 

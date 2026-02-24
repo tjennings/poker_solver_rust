@@ -133,22 +133,21 @@ fn diag_value_table_strong_beats_weak() {
     ).expect("build should succeed");
 
     let n = config.num_hand_buckets_flop as usize;
-    // Use first flop's equity table as representative
-    let flop_eq = &abstraction.street_equity.flop[0];
+    // Determine strongest/weakest buckets by average EV as hero (pos 0) across opponents
     let mut best_bucket = 0;
     let mut worst_bucket = 0;
-    let mut best_eq = 0.0f32;
-    let mut worst_eq = 1.0f32;
+    let mut best_ev = f64::NEG_INFINITY;
+    let mut worst_ev = f64::INFINITY;
     for b in 0..n {
-        let avg: f32 = (0..n)
-            .map(|o| flop_eq.get(b, o))
-            .sum::<f32>() / n as f32;
-        if avg > best_eq { best_eq = avg; best_bucket = b; }
-        if avg < worst_eq { worst_eq = avg; worst_bucket = b; }
+        let avg_ev: f64 = (0..n)
+            .map(|o| abstraction.values.get_by_flop(0, 0, b as u16, o as u16))
+            .sum::<f64>() / n as f64;
+        if avg_ev > best_ev { best_ev = avg_ev; best_bucket = b; }
+        if avg_ev < worst_ev { worst_ev = avg_ev; worst_bucket = b; }
     }
 
-    eprintln!("strongest bucket: {best_bucket} (avg eq {best_eq:.3})");
-    eprintln!("weakest bucket: {worst_bucket} (avg eq {worst_eq:.3})");
+    eprintln!("strongest bucket: {best_bucket} (avg EV {best_ev:.4})");
+    eprintln!("weakest bucket: {worst_bucket} (avg EV {worst_ev:.4})");
 
     let strong_ev = abstraction.values.get_by_flop(
         0, 0, best_bucket as u16, worst_bucket as u16,

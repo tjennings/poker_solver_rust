@@ -1031,6 +1031,183 @@ fn normalize_transition_rows(matrix: &mut [Vec<f64>]) {
     }
 }
 
+
+/// Complete per-flop abstraction data: buckets, equity, transitions.
+/// Created and consumed within one flop's streaming pipeline.
+pub struct SingleFlopAbstraction {
+    /// Flop bucket assignments (169 entries, one per canonical hand).
+    pub flop_buckets: Vec<u16>,
+    /// Flop-level bucket-pair equity table.
+    pub flop_equity: BucketEquity,
+    /// Turn-level bucket-pair equity table for this flop.
+    pub turn_equity: BucketEquity,
+    /// River-level bucket-pair equity table for this flop.
+    pub river_equity: BucketEquity,
+    /// `flop_to_turn[flop_bucket][turn_bucket]` → transition probability.
+    pub flop_to_turn: Vec<Vec<f64>>,
+    /// `turn_to_river[turn_bucket][river_bucket]` → transition probability.
+    pub turn_to_river: Vec<Vec<f64>>,
+}
+
+/// Complete per-flop pipeline: compute flop/turn/river buckets, equity tables,
+/// and transition matrices for a single canonical flop.
+///
+/// When `override_flop_buckets` is `Some`, skips flop clustering and uses the
+/// provided bucket assignments. This is used during EV rebucketing rounds where
+/// flop buckets have been reclustered but turn/river need fresh computation.
+///
+/// All intermediate data (turn/river bucket assignments, board lists, histograms)
+/// is dropped when this function returns. Only the equity tables, transition
+/// matrices, and flop bucket assignments survive.
+#[allow(clippy::cast_precision_loss)]
+pub fn process_single_flop(
+    hands: &[CanonicalHand],
+    flop: &[Card; 3],
+    num_flop_buckets: u16,
+    num_turn_buckets: u16,
+    num_river_buckets: u16,
+    rollout_fraction: f64,
+    override_flop_buckets: Option<&[u16]>,
+) -> SingleFlopAbstraction {
+    let num_hands = hands.len();
+    let nfb = num_flop_buckets as usize;
+    let ntb = num_turn_buckets as usize;
+    let nrb = num_river_buckets as usize;
+
+    // --- Flop buckets ---
+    let flop_buckets = if let Some(overrides) = override_flop_buckets {
+        overrides.to_vec()
+    } else {
+        // Compute histogram features for 169 hands on this single flop
+        let flop_features: Vec<HistogramFeatures> = hands
+            .iter()
+            .map(|hand| {
+                let combos = hand.combos();
+                if let Some(&(c1, c2)) = combos.iter().find(|&&(c1, c2)| !board_conflicts([c1, c2], flop)) {
+                    equity_histogram(&[c1, c2], flop.as_slice())
+                } else {
+                    [f64::NAN; HISTOGRAM_BINS]
+                }
+            })
+            .collect();
+        cluster_histograms(&flop_features, num_flop_buckets)
+    };
+
+    // Flop pairwise equity
+    let flop_equity = compute_pairwise_bucket_equity(
+        hands,
+        &[flop.as_ref()],
+        &flop_buckets,
+        nfb,
+        1,
+        rollout_fraction,
+    );
+
+    // --- Turn buckets ---
+    let flop_set: Vec<Card> = flop.to_vec();
+    let live_turn: Vec<Card> = all_cards_vec()
+        .into_iter()
+        .filter(|c| !flop_set.contains(c))
+        .collect();
+    let turn_boards: Vec<[Card; 4]> = live_turn
+        .iter()
+        .map(|&tc| [flop[0], flop[1], flop[2], tc])
+        .collect();
+    let num_turn_boards = turn_boards.len();
+
+    let turn_features = compute_turn_histograms(hands, &turn_boards, &|_| {});
+    let turn_assignments = cluster_histograms(&turn_features, num_turn_buckets);
+
+    // Turn pairwise equity
+    let turn_board_refs: Vec<&[Card]> = turn_boards.iter().map(AsRef::as_ref).collect();
+    let turn_equity = compute_pairwise_bucket_equity(
+        hands,
+        &turn_board_refs,
+        &turn_assignments,
+        ntb,
+        turn_boards.len(),
+        1.0,
+    );
+
+    // --- River buckets ---
+    let river_turn_samples = 10usize;
+    let sample_count = river_turn_samples.min(turn_boards.len());
+    let step = turn_boards.len().max(1) / sample_count.max(1);
+    let sampled_turns: Vec<&[Card; 4]> = (0..sample_count)
+        .map(|i| &turn_boards[i * step])
+        .collect();
+
+    let river_boards: Vec<[Card; 5]> = sampled_turns
+        .iter()
+        .flat_map(|tb| {
+            let board_set: Vec<Card> = tb.to_vec();
+            let live: Vec<Card> = all_cards_vec()
+                .into_iter()
+                .filter(|c| !board_set.contains(c))
+                .collect();
+            live.into_iter()
+                .map(move |rc| [tb[0], tb[1], tb[2], tb[3], rc])
+        })
+        .collect();
+    let num_river_boards = river_boards.len();
+
+    let river_equities_raw = compute_river_equities(hands, &river_boards, &|_| {});
+    let river_assignments = cluster_river_equities(&river_equities_raw, num_river_buckets);
+
+    // River pairwise equity
+    let river_board_refs: Vec<&[Card]> = river_boards.iter().map(AsRef::as_ref).collect();
+    let river_equity = compute_pairwise_bucket_equity(
+        hands,
+        &river_board_refs,
+        &river_assignments,
+        nrb,
+        river_boards.len(),
+        1.0,
+    );
+
+    // --- Transition matrices ---
+    // Flop → Turn
+    let mut f2t = vec![vec![0.0f64; ntb]; nfb];
+    for hand_idx in 0..num_hands {
+        let fb = flop_buckets[hand_idx] as usize;
+        for turn_local in 0..num_turn_boards {
+            let tb = turn_assignments[hand_idx * num_turn_boards + turn_local] as usize;
+            f2t[fb][tb] += 1.0;
+        }
+    }
+    normalize_transition_rows(&mut f2t);
+
+    // Turn → River
+    let mut t2r = vec![vec![0.0f64; nrb]; ntb];
+    if num_river_boards > 0 && num_turn_boards > 0 {
+        let river_per_turn = num_river_boards / num_turn_boards.max(1);
+        for hand_idx in 0..num_hands {
+            for turn_local in 0..num_turn_boards {
+                let tb = turn_assignments[hand_idx * num_turn_boards + turn_local] as usize;
+                let river_start = turn_local * river_per_turn;
+                for river_offset in 0..river_per_turn {
+                    let river_local = river_start + river_offset;
+                    let river_idx = hand_idx * num_river_boards + river_local;
+                    if river_idx < river_assignments.len() {
+                        let rb = river_assignments[river_idx] as usize;
+                        t2r[tb][rb] += 1.0;
+                    }
+                }
+            }
+        }
+    }
+    normalize_transition_rows(&mut t2r);
+
+    SingleFlopAbstraction {
+        flop_buckets,
+        flop_equity,
+        turn_equity,
+        river_equity,
+        flop_to_turn: f2t,
+        turn_to_river: t2r,
+    }
+}
+
 /// All 52 cards as a Vec (for board enumeration without a hole-card reference).
 fn all_cards_vec() -> Vec<Card> {
     use crate::poker::{Suit, Value};

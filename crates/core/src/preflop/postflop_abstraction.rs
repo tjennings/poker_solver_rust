@@ -19,7 +19,7 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
 use super::equity::EquityTable;
-use super::hand_buckets::{self, BucketEquity, StreetBuckets, StreetEquity, TransitionMatrices};
+use super::hand_buckets::{self, BucketEquity, SingleFlopAbstraction, StreetBuckets, StreetEquity, TransitionMatrices};
 use super::postflop_model::PostflopModelConfig;
 use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree};
 use crate::abstraction::Street;
@@ -27,9 +27,12 @@ use crate::poker::Card;
 
 /// All precomputed postflop data needed by the preflop solver.
 pub struct PostflopAbstraction {
+    /// Flop bucket assignments (per-flop, needed at runtime).
     pub buckets: StreetBuckets,
-    pub street_equity: StreetEquity,
-    pub transitions: TransitionMatrices,
+    /// Per-flop equity tables (only populated for diagnostics/cached builds).
+    pub street_equity: Option<StreetEquity>,
+    /// Per-flop transition matrices (only populated for diagnostics/cached builds).
+    pub transitions: Option<TransitionMatrices>,
     /// Single shared tree template at `config.primary_spr()`.
     pub tree: PostflopTree,
     /// Precomputed EV table from solved postflop game.
@@ -317,135 +320,165 @@ impl PostflopAbstraction {
         _cache_base: Option<&std::path::Path>,
         on_progress: impl Fn(BuildPhase) + Sync,
     ) -> Result<Self, PostflopAbstractionError> {
-        // Phase 1: Build initial EHS abstraction + transitions
-        let (mut buckets, mut street_equity, mut transitions, flops) = load_or_build_abstraction(
-            config,
-            &on_progress,
-        )?;
+        let hands: Vec<_> = crate::hands::all_hands().collect();
+        let flops = if let Some(ref names) = config.fixed_flops {
+            crate::preflop::ehs::parse_flops(names)
+                .map_err(PostflopAbstractionError::InvalidConfig)?
+        } else {
+            crate::preflop::ehs::sample_canonical_flops(config.max_flop_boards)
+        };
+        let num_flops = flops.len();
 
-        // Build tree (once, shared across all rounds)
+        // Build tree + layout (global, shared across all flops/rounds)
         on_progress(BuildPhase::Trees);
         let tree = PostflopTree::build_with_spr(config, config.primary_spr())?;
 
         on_progress(BuildPhase::Layout);
         let node_streets = annotate_streets(&tree);
+        let nfb = config.num_hand_buckets_flop as usize;
+        let ntb = config.num_hand_buckets_turn as usize;
+        let nrb = config.num_hand_buckets_river as usize;
+        let layout = PostflopLayout::build(&tree, &node_streets, nfb, ntb, nrb);
 
-        let num_flop_b = buckets.num_flop_buckets as usize;
-        let num_turn_b = buckets.num_turn_buckets as usize;
-        let num_river_b = buckets.num_river_buckets as usize;
-
-        let layout = PostflopLayout::build(
-            &tree,
-            &node_streets,
-            num_flop_b,
-            num_turn_b,
-            num_river_b,
-        );
-
-        let total_iters = config.postflop_solve_iterations as usize;
+        let solve_iters = config.postflop_solve_iterations as usize;
         let samples = if config.postflop_solve_samples > 0 {
             config.postflop_solve_samples as usize
         } else {
-            num_flop_b * num_flop_b // 0 = exhaustive (all bucket pairs)
+            nfb * nfb // 0 = exhaustive (all bucket pairs)
         };
-
-        let flop_names: Vec<String> = flops.iter()
-            .map(|f| format!("{}{}{}", f[0], f[1], f[2]))
-            .collect();
 
         let total_rounds = config.rebucket_rounds;
         let num_hands = hand_buckets::NUM_HANDS;
-        let num_flops = buckets.flop.len();
-        let hands: Vec<_> = crate::hands::all_hands().collect();
-        let mut last_solve_results = Vec::new();
 
-        for round in 1..=total_rounds {
-            // Solve all flops with current bucket assignments
-            last_solve_results = solve_postflop_per_flop(
-                &tree,
-                &layout,
-                &street_equity,
-                &transitions,
-                num_flop_b,
-                total_iters,
-                samples,
-                config.rebucket_delta_threshold,
-                &flop_names,
-                round,
-                total_rounds,
-                &on_progress,
-            );
-
-            // If not the last round, extract EV and rebucket
-            if round < total_rounds {
-                // Compute intermediate values from converged strategy
-                let strat_refs: Vec<Vec<f64>> = last_solve_results.iter()
-                    .map(|r| r.strategy_sum.clone())
-                    .collect();
-                let values = compute_postflop_values(
-                    &tree, &layout, &street_equity, &transitions, &strat_refs, num_flop_b,
+        // First round: streaming per-flop pipeline (bucket + equity + transitions + solve + extract)
+        on_progress(BuildPhase::HandBuckets(0, num_flops));
+        let results: Vec<(Vec<u16>, Vec<f64>)> = (0..num_flops)
+            .into_par_iter()
+            .map(|flop_idx| {
+                let flop_data = hand_buckets::process_single_flop(
+                    &hands,
+                    &flops[flop_idx],
+                    config.num_hand_buckets_flop,
+                    config.num_hand_buckets_turn,
+                    config.num_hand_buckets_river,
+                    config.equity_rollout_fraction,
+                    None, // first round: cluster from scratch
                 );
-
-                // Extract EV histograms
-                on_progress(BuildPhase::ExtractingEv(0, num_hands));
-                let ev_histograms = hand_buckets::build_ev_histograms(
-                    &buckets, &values, num_hands, num_flop_b,
+                let flop_buckets = flop_data.flop_buckets.clone();
+                let flop_name = format!("{}{}{}", flops[flop_idx][0], flops[flop_idx][1], flops[flop_idx][2]);
+                let values = stream_solve_and_extract_one_flop(
+                    flop_data,
+                    &tree,
+                    &layout,
+                    nfb,
+                    solve_iters,
+                    samples,
+                    config.rebucket_delta_threshold,
+                    flop_idx,
+                    &flop_name,
+                    1,
+                    total_rounds,
+                    &on_progress,
                 );
-                on_progress(BuildPhase::ExtractingEv(num_hands, num_hands));
+                (flop_buckets, values)
+            })
+            .collect();
 
-                // Recluster flop buckets using EV features
-                on_progress(BuildPhase::Rebucketing(round, total_rounds));
-                buckets.flop = hand_buckets::recluster_flop_buckets(
-                    &ev_histograms, buckets.num_flop_buckets, num_flops, num_hands,
-                );
-
-                // Recompute flop pairwise equity with new assignments
-                on_progress(BuildPhase::EquityTable(0, num_flops));
-                let new_flop_equity: Vec<BucketEquity> = (0..num_flops)
-                    .map(|flop_idx| {
-                        let eq = hand_buckets::compute_pairwise_bucket_equity(
-                            &hands,
-                            &[flops[flop_idx].as_ref()],
-                            &buckets.flop[flop_idx],
-                            buckets.num_flop_buckets as usize,
-                            1,
-                            config.equity_rollout_fraction,
-                        );
-                        on_progress(BuildPhase::EquityTable(flop_idx + 1, num_flops));
-                        eq
-                    })
-                    .collect();
-                street_equity.flop = new_flop_equity;
-
-                // Recompute transition matrices for the new flop buckets
-                transitions = hand_buckets::compute_transition_matrices(
-                    &buckets,
-                    num_flop_b as u16,
-                    buckets.num_turn_buckets,
-                    buckets.num_river_buckets,
-                );
-            }
+        // Assemble first-round outputs
+        let mut flop_assignments: Vec<Vec<u16>> = Vec::with_capacity(num_flops);
+        let mut all_values = vec![0.0f64; num_flops * 2 * nfb * nfb];
+        for (flop_idx, (fb, vals)) in results.into_iter().enumerate() {
+            flop_assignments.push(fb);
+            let offset = flop_idx * 2 * nfb * nfb;
+            all_values[offset..offset + vals.len()].copy_from_slice(&vals);
         }
 
-        // Final values from last round
+        let mut buckets = StreetBuckets {
+            flop: flop_assignments,
+            num_flop_buckets: config.num_hand_buckets_flop,
+            turn: Vec::new(),
+            num_turn_buckets: config.num_hand_buckets_turn,
+            river: Vec::new(),
+            num_river_buckets: config.num_hand_buckets_river,
+        };
+
+        let mut values = PostflopValues {
+            values: all_values,
+            num_buckets: nfb,
+            num_flops,
+        };
+
+        // Rebucketing rounds (2..=total_rounds): extract EV, recluster, re-stream
+        for round in 2..=total_rounds {
+            // Extract EV histograms from current values
+            on_progress(BuildPhase::ExtractingEv(0, num_hands));
+            let ev_histograms = hand_buckets::build_ev_histograms(
+                &buckets, &values, num_hands, nfb,
+            );
+            on_progress(BuildPhase::ExtractingEv(num_hands, num_hands));
+
+            // Recluster flop buckets using EV features
+            on_progress(BuildPhase::Rebucketing(round, total_rounds));
+            buckets.flop = hand_buckets::recluster_flop_buckets(
+                &ev_histograms, buckets.num_flop_buckets, num_flops, num_hands,
+            );
+
+            // Stream-solve again with reclustered flop buckets
+            // process_single_flop with override_flop_buckets ensures consistent
+            // flop_to_turn transitions (computed from the reclustered flop buckets)
+            on_progress(BuildPhase::HandBuckets(0, num_flops));
+            let results: Vec<(Vec<u16>, Vec<f64>)> = (0..num_flops)
+                .into_par_iter()
+                .map(|flop_idx| {
+                    let flop_data = hand_buckets::process_single_flop(
+                        &hands,
+                        &flops[flop_idx],
+                        config.num_hand_buckets_flop,
+                        config.num_hand_buckets_turn,
+                        config.num_hand_buckets_river,
+                        config.equity_rollout_fraction,
+                        Some(&buckets.flop[flop_idx]), // use reclustered assignments
+                    );
+                    let fb = flop_data.flop_buckets.clone();
+                    let flop_name = format!("{}{}{}", flops[flop_idx][0], flops[flop_idx][1], flops[flop_idx][2]);
+                    let vals = stream_solve_and_extract_one_flop(
+                        flop_data,
+                        &tree,
+                        &layout,
+                        nfb,
+                        solve_iters,
+                        samples,
+                        config.rebucket_delta_threshold,
+                        flop_idx,
+                        &flop_name,
+                        round,
+                        total_rounds,
+                        &on_progress,
+                    );
+                    (fb, vals)
+                })
+                .collect();
+
+            // Reassemble
+            let mut new_all_values = vec![0.0f64; num_flops * 2 * nfb * nfb];
+            for (flop_idx, (fb, vals)) in results.into_iter().enumerate() {
+                buckets.flop[flop_idx] = fb;
+                let offset = flop_idx * 2 * nfb * nfb;
+                new_all_values[offset..offset + vals.len()].copy_from_slice(&vals);
+            }
+            values = PostflopValues {
+                values: new_all_values,
+                num_buckets: nfb,
+                num_flops,
+            };
+        }
+
         on_progress(BuildPhase::ComputingValues);
-        let per_flop_strategy_sums: Vec<Vec<f64>> = last_solve_results
-            .into_iter()
-            .map(|r| r.strategy_sum)
-            .collect();
-        let values = compute_postflop_values(
-            &tree,
-            &layout,
-            &street_equity,
-            &transitions,
-            &per_flop_strategy_sums,
-            num_flop_b,
-        );
 
         Ok(Self {
             buckets,
-            street_equity,
-            transitions,
+            street_equity: None,
+            transitions: None,
             tree,
             values,
             spr: config.primary_spr(),
@@ -463,8 +496,8 @@ impl PostflopAbstraction {
     pub fn build_from_cached(
         config: &PostflopModelConfig,
         buckets: StreetBuckets,
-        street_equity: StreetEquity,
-        transitions: TransitionMatrices,
+        street_equity: Option<StreetEquity>,
+        transitions: Option<TransitionMatrices>,
         values: PostflopValues,
         flops: Vec<[Card; 3]>,
     ) -> Result<Self, PostflopAbstractionError> {
@@ -479,73 +512,6 @@ impl PostflopAbstraction {
             flops,
         })
     }
-}
-
-/// Build abstraction data: independent per-street buckets + equity tables.
-///
-/// Computes real bucket-pair equity from the histogram CDFs and river equities
-/// produced during bucketing. For each street:
-/// - Flop/turn: extract average equity from each CDF via `cdf_to_avg_equity`,
-///   then group by bucket to get centroid equity.
-/// - River: use raw scalar equities directly.
-/// - Pair equity: `equity(a, b) = centroid_a / (centroid_a + centroid_b)`.
-#[allow(clippy::unnecessary_wraps)]
-fn load_or_build_abstraction(
-    config: &PostflopModelConfig,
-    on_progress: &(impl Fn(BuildPhase) + Sync),
-) -> Result<(StreetBuckets, StreetEquity, TransitionMatrices, Vec<[Card; 3]>), PostflopAbstractionError> {
-    // Cache is disabled during the StreetBuckets migration (format changed).
-
-    on_progress(BuildPhase::HandBuckets(0, hand_buckets::NUM_HANDS));
-
-    let hands: Vec<_> = crate::hands::all_hands().collect();
-    let flops = if let Some(ref names) = config.fixed_flops {
-        crate::preflop::ehs::parse_flops(names)
-            .map_err(PostflopAbstractionError::InvalidConfig)?
-    } else {
-        crate::preflop::ehs::sample_canonical_flops(config.max_flop_boards)
-    };
-
-    let result = hand_buckets::build_street_buckets_independent(
-        &hands,
-        &flops,
-        config.num_hand_buckets_flop,
-        config.num_hand_buckets_turn,
-        config.num_hand_buckets_river,
-        &|progress| {
-            use hand_buckets::BuildProgress;
-            match progress {
-                BuildProgress::FlopFeatures(done, total)
-                | BuildProgress::TurnFeatures(done, total)
-                | BuildProgress::RiverFeatures(done, total) => {
-                    on_progress(BuildPhase::HandBuckets(done, total));
-                }
-                BuildProgress::FlopClustering
-                | BuildProgress::TurnClustering
-                | BuildProgress::RiverClustering => {}
-            }
-        },
-    );
-
-    let num_flops = flops.len();
-    on_progress(BuildPhase::EquityTable(0, num_flops * 3));
-
-    let street_equity = result.compute_pairwise_street_equity(
-        &hands,
-        &flops,
-        config.equity_rollout_fraction,
-        |done, total| on_progress(BuildPhase::EquityTable(done, total)),
-    );
-
-    // Compute transition matrices
-    let transitions = hand_buckets::compute_transition_matrices(
-        &result.buckets,
-        config.num_hand_buckets_flop,
-        config.num_hand_buckets_turn,
-        config.num_hand_buckets_river,
-    );
-
-    Ok((result.buckets, street_equity, transitions, flops))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -571,76 +537,60 @@ struct SolveEquity<'a> {
     turn_to_river: &'a [Vec<f64>],
 }
 
-/// Solve all flops in parallel, each with the shared tree template.
+/// Solve one flop and extract the value row.
 ///
-/// Returns per-flop solve results (strategy sums + convergence info).
-#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
-fn solve_postflop_per_flop(
+/// Takes ownership of the per-flop abstraction data. After solving and
+/// extracting values, all intermediate data (equity tables, transitions,
+/// regret/strategy buffers) is dropped.
+///
+/// Returns `Vec<f64>` of size `2 * num_flop_buckets * num_flop_buckets`:
+/// indexed by `hero_pos * n * n + hero_bucket * n + opp_bucket`.
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+fn stream_solve_and_extract_one_flop(
+    flop_data: SingleFlopAbstraction,
     tree: &PostflopTree,
     layout: &PostflopLayout,
-    street_equity: &StreetEquity,
-    transitions: &TransitionMatrices,
     num_flop_buckets: usize,
     num_iterations: usize,
     samples_per_iter: usize,
     delta_threshold: f64,
-    flop_names: &[String],
+    flop_idx: usize,
+    flop_name: &str,
     round: u16,
     total_rounds: u16,
     on_progress: &(impl Fn(BuildPhase) + Sync),
-) -> Vec<FlopSolveResult> {
-    let num_flops = street_equity.flop.len();
-    let use_exhaustive = num_flop_buckets * num_flop_buckets <= samples_per_iter;
-    let actual_pairs = if use_exhaustive {
-        num_flop_buckets * num_flop_buckets
-    } else {
-        samples_per_iter
+) -> Vec<f64> {
+    let solve_eq = SolveEquity {
+        flop: &flop_data.flop_equity,
+        turn: &flop_data.turn_equity,
+        river: &flop_data.river_equity,
+        flop_to_turn: &flop_data.flop_to_turn,
+        turn_to_river: &flop_data.turn_to_river,
     };
 
     let buf_size = layout.total_size;
-    #[allow(clippy::cast_precision_loss)]
-    let mb = buf_size as f64 * 8.0 / 1_000_000.0;
-    let mode = if use_exhaustive { "exhaustive" } else { "sampled" };
-    tracing::debug!(
-        spr = format_args!("{:.1}", tree.spr),
-        nodes = tree.node_count(),
-        buf_size,
-        mb = format_args!("{mb:.1}"),
-        mode,
-        actual_pairs,
-        num_flops,
-        delta_threshold,
-        "Per-flop solve allocated"
+    let result = solve_one_flop(
+        tree, layout, &solve_eq,
+        num_flop_buckets, buf_size,
+        num_iterations, samples_per_iter, delta_threshold,
+        flop_idx, flop_name, round, total_rounds, on_progress,
     );
 
-    (0..num_flops)
-        .into_par_iter()
-        .map(|flop_idx| {
-            let solve_eq = SolveEquity {
-                flop: &street_equity.flop[flop_idx],
-                turn: &street_equity.turn[flop_idx],
-                river: &street_equity.river[flop_idx],
-                flop_to_turn: &transitions.flop_to_turn[flop_idx],
-                turn_to_river: &transitions.turn_to_river[flop_idx],
-            };
-            let flop_name = flop_names.get(flop_idx).map_or("?", |s| s.as_str());
-            solve_one_flop(
-                tree,
-                layout,
-                &solve_eq,
-                num_flop_buckets,
-                buf_size,
-                num_iterations,
-                samples_per_iter,
-                delta_threshold,
-                flop_idx,
-                flop_name,
-                round,
-                total_rounds,
-                on_progress,
-            )
-        })
-        .collect()
+    // Extract values from converged strategy
+    let n = num_flop_buckets;
+    let mut values = vec![0.0f64; 2 * n * n];
+    for hero_pos in 0..2u8 {
+        for hb in 0..n as u16 {
+            for ob in 0..n as u16 {
+                let ev = eval_with_avg_strategy(
+                    tree, layout, &solve_eq, &result.strategy_sum,
+                    0, hb, ob, hero_pos,
+                );
+                values[hero_pos as usize * n * n + hb as usize * n + ob as usize] = ev;
+            }
+        }
+    }
+    values
 }
 
 /// Run CFR for a single flop with the shared tree template.
@@ -1042,52 +992,6 @@ fn weighted_avg_strategy_delta(
     } else {
         0.0
     }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Value table computation from converged strategy
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[allow(clippy::cast_possible_truncation)]
-fn compute_postflop_values(
-    tree: &PostflopTree,
-    layout: &PostflopLayout,
-    street_equity: &StreetEquity,
-    transitions: &TransitionMatrices,
-    per_flop_strategy_sums: &[Vec<f64>],
-    num_flop_buckets: usize,
-) -> PostflopValues {
-    let num_flops = per_flop_strategy_sums.len();
-    let total = num_flops * 2 * num_flop_buckets * num_flop_buckets;
-    let mut values = vec![0.0f64; total];
-
-    for flop_idx in 0..num_flops {
-        let strategy_sum = &per_flop_strategy_sums[flop_idx];
-        let solve_eq = SolveEquity {
-            flop: &street_equity.flop[flop_idx],
-            turn: &street_equity.turn[flop_idx],
-            river: &street_equity.river[flop_idx],
-            flop_to_turn: &transitions.flop_to_turn[flop_idx],
-            turn_to_river: &transitions.turn_to_river[flop_idx],
-        };
-        for hero_pos in 0..2u8 {
-            for hero_bucket in 0..num_flop_buckets as u16 {
-                for opp_bucket in 0..num_flop_buckets as u16 {
-                    let ev = eval_with_avg_strategy(
-                        tree, layout, &solve_eq, strategy_sum,
-                        0, hero_bucket, opp_bucket, hero_pos,
-                    );
-                    let idx = flop_idx * 2 * num_flop_buckets * num_flop_buckets
-                        + (hero_pos as usize) * num_flop_buckets * num_flop_buckets
-                        + (hero_bucket as usize) * num_flop_buckets
-                        + opp_bucket as usize;
-                    values[idx] = ev;
-                }
-            }
-        }
-    }
-
-    PostflopValues { values, num_buckets: num_flop_buckets, num_flops }
 }
 
 /// Walk tree using averaged (converged) strategy, returning hero EV fraction.
