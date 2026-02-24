@@ -124,7 +124,6 @@ fn diag_value_table_strong_beats_weak() {
         bet_sizes: vec![1.0],
         max_raises_per_street: 0,
         max_flop_boards: 3,
-        flop_samples_per_iter: 1,
         ..PostflopModelConfig::default()
     };
 
@@ -177,7 +176,6 @@ fn diag_end_to_end_aa_beats_72o() {
         bet_sizes: vec![0.5, 1.0],
         max_raises_per_street: 1,
         max_flop_boards: 3,
-        flop_samples_per_iter: 1,
         ..PostflopModelConfig::default()
     };
 

@@ -688,7 +688,6 @@ mod tests {
             cfr_delta_threshold: 0.001,
             max_flop_boards: 1,
             fixed_flops: None,
-            flop_samples_per_iter: 1,
             equity_rollout_fraction: 1.0,
             solve_type: super::super::postflop_model::PostflopSolveType::Mccfr,
             mccfr_sample_pct: 0.01,

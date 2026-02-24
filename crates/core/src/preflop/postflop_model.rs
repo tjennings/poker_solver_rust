@@ -20,9 +20,6 @@ fn default_bet_sizes() -> Vec<f32> {
 fn default_max_raises_per_street() -> u8 {
     1
 }
-fn default_flop_samples_per_iter() -> u16 {
-    1
-}
 fn default_postflop_solve_iterations() -> u32 {
     200
 }
@@ -99,10 +96,6 @@ pub struct PostflopModelConfig {
     pub bet_sizes: Vec<f32>,
     #[serde(default = "default_max_raises_per_street", alias = "raises_per_street")]
     pub max_raises_per_street: u8,
-
-    // Sampling
-    #[serde(default = "default_flop_samples_per_iter")]
-    pub flop_samples_per_iter: u16,
 
     // Postflop solve (chance-sampled MCCFR)
     #[serde(default = "default_postflop_solve_iterations")]
@@ -195,7 +188,6 @@ impl PostflopModelConfig {
             num_hand_buckets_river: 500,
             bet_sizes: vec![0.5, 1.0],
             max_raises_per_street: 1,
-            flop_samples_per_iter: 1,
             postflop_solve_iterations: 200,
             postflop_solve_samples: 0,
             postflop_sprs: vec![3.5],

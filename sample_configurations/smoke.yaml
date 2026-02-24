@@ -59,7 +59,6 @@ postflop_model:
   postflop_solve_iterations: 10
   postflop_solve_samples: 0
   postflop_spr: 5.0
-  flop_samples_per_iter: 1
   # EV rebucketing (default: 1 round = EHS only)
   # rebucket_rounds: 2
   # cfr_delta_threshold: 0.001

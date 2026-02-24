@@ -67,5 +67,3 @@ postflop_model:
   # Pre-solve: chance-sampled MCCFR to converge postflop before preflop training.
   postflop_solve_iterations: 500   # MCCFR iterations per flop
   postflop_solve_samples: 10000        # bucket pairs sampled per iteration (0 = num_hand_buckets_flop)
-
-  flop_samples_per_iter: 1
