@@ -7,6 +7,8 @@ pub mod ehs;
 pub mod equity;
 pub mod hand_buckets;
 pub mod postflop_abstraction;
+pub(crate) mod postflop_bucketed;
+pub(crate) mod postflop_mccfr;
 pub mod postflop_model;
 pub mod postflop_tree;
 pub mod solve_cache;
