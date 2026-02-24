@@ -642,7 +642,7 @@ fn solve_one_flop(
     let mut regret_sum = vec![0.0f64; buf_size];
     let mut strategy_sum = vec![0.0f64; buf_size];
     let use_exhaustive = num_flop_buckets * num_flop_buckets <= samples_per_iter;
-    let mut final_delta = f64::INFINITY;
+    let mut final_delta = 0.0;
     let mut iterations_used = 0;
 
     for iter in 0..num_iterations {
@@ -668,12 +668,9 @@ fn solve_one_flop(
         add_buffers(&mut strategy_sum, &ds);
         iterations_used = iter + 1;
 
-        // Check for early stopping after at least 2 iterations.
+        // Compute strategy delta (meaningful after iteration 1).
         if iter >= 1 {
             final_delta = max_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
-            if final_delta < delta_threshold {
-                break;
-            }
         }
 
         on_progress(BuildPhase::SolvingPostflop {
@@ -684,6 +681,11 @@ fn solve_one_flop(
             max_iterations: num_iterations,
             delta: final_delta,
         });
+
+        // Early stopping after at least 2 iterations.
+        if iter >= 1 && final_delta < delta_threshold {
+            break;
+        }
     }
 
     FlopSolveResult { strategy_sum, final_delta, iterations_used }
