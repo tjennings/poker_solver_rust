@@ -220,6 +220,9 @@ At each preflop showdown terminal:
 | `postflop_solve_samples` | 0 | — | Bucket pairs per iteration (0 = all) |
 | `rebucket_rounds` | 1 | — | EV rebucketing rounds (1 = EHS only, 2+ = EV rebucketing) |
 | `cfr_delta_threshold` | 0.001 | — | Max strategy delta for early CFR stopping |
+| `solve_type` | bucketed | — | Postflop backend: `bucketed` or `mccfr` |
+| `mccfr_sample_pct` | 0.01 | — | Fraction of deal space sampled per MCCFR iteration |
+| `value_extraction_samples` | 10,000 | — | Monte Carlo samples for post-convergence EV extraction |
 
 ## Caching
 
@@ -231,6 +234,21 @@ At each preflop showdown terminal:
 **Files:**
 - `crates/core/src/preflop/abstraction_cache.rs`
 - `crates/core/src/preflop/solve_cache.rs`
+
+
+### MCCFR Postflop Backend
+
+An alternative postflop solve backend selectable via `solve_type: mccfr` in config. Instead of abstract bucket transitions between streets, the MCCFR backend:
+
+- Uses concrete card pairs (expanded from canonical hands) assigned to flop buckets
+- Samples random (hero_hand, opp_hand, turn, river) deals per iteration
+- Evaluates showdowns using `rank_hand()` on the actual 5-card board
+- Uses only flop buckets (no turn/river bucket abstraction needed)
+
+Key config fields:
+- `solve_type`: `bucketed` (default) or `mccfr`
+- `mccfr_sample_pct`: fraction of deal space sampled per iteration (default 0.01)
+- `value_extraction_samples`: Monte Carlo samples for post-convergence EV extraction (default 10,000)
 
 ## Known Limitations
 

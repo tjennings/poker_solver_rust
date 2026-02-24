@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use super::equity::EquityTable;
 use super::hand_buckets::{BucketEquity, StreetBuckets, StreetEquity, TransitionMatrices};
-use super::postflop_model::PostflopModelConfig;
+use super::postflop_bucketed::build_bucketed;
+use super::postflop_mccfr::build_mccfr;
+use super::postflop_model::{PostflopModelConfig, PostflopSolveType};
 use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree};
 use crate::abstraction::Street;
 use crate::poker::Card;
@@ -331,11 +333,21 @@ impl PostflopAbstraction {
         let nfb = config.num_hand_buckets_flop as usize;
         let ntb = config.num_hand_buckets_turn as usize;
         let nrb = config.num_hand_buckets_river as usize;
-        let layout = PostflopLayout::build(&tree, &node_streets, nfb, ntb, nrb);
+        let layout = match config.solve_type {
+            PostflopSolveType::Bucketed => PostflopLayout::build(&tree, &node_streets, nfb, ntb, nrb),
+            PostflopSolveType::Mccfr => PostflopLayout::build(&tree, &node_streets, nfb, nfb, nfb),
+        };
 
-        let (buckets, values) = super::postflop_bucketed::build_bucketed(
-            config, &tree, &layout, &node_streets, &flops, &on_progress,
-        );
+        let (buckets, values) = match config.solve_type {
+            PostflopSolveType::Bucketed => {
+                build_bucketed(
+                    config, &tree, &layout, &node_streets, &flops, &on_progress,
+                )
+            }
+            PostflopSolveType::Mccfr => {
+                build_mccfr(config, &tree, &layout, &node_streets, &flops, &on_progress)
+            }
+        };
 
         on_progress(BuildPhase::ComputingValues);
 
@@ -817,5 +829,32 @@ mod tests {
         // Turn and river should be unchanged (only flop is rebucketed)
         assert_eq!(r1.buckets.turn, r2.buckets.turn, "turn buckets should be unchanged");
         assert_eq!(r1.buckets.river, r2.buckets.river, "river buckets should be unchanged");
+    }
+
+    #[test]
+    #[ignore = "slow: full MCCFR postflop pipeline via config dispatch"]
+    fn build_mccfr_via_config_produces_values() {
+        let config = PostflopModelConfig {
+            solve_type: PostflopSolveType::Mccfr,
+            num_hand_buckets_flop: 5,
+            num_hand_buckets_turn: 5,
+            num_hand_buckets_river: 5,
+            fixed_flops: Some(vec!["AhKsQd".into()]),
+            postflop_solve_iterations: 20,
+            mccfr_sample_pct: 0.1,
+            value_extraction_samples: 100,
+            ..PostflopModelConfig::fast()
+        };
+        let result = PostflopAbstraction::build(&config, None, None, |_| {}).unwrap();
+        assert!(!result.values.is_empty());
+        // Check approximate zero-sum
+        let n = config.num_hand_buckets_flop as usize;
+        for hb in 0..n as u16 {
+            for ob in 0..n as u16 {
+                let v0 = result.values.get_by_flop(0, 0, hb, ob);
+                let v1 = result.values.get_by_flop(0, 1, ob, hb);
+                assert!((v0 + v1).abs() < 0.5, "should be approximately zero-sum: v0={v0}, v1={v1}");
+            }
+        }
     }
 }

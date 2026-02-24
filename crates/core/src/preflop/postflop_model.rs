@@ -221,6 +221,33 @@ impl PostflopModelConfig {
         }
     }
 
+    /// MCCFR fast preset: quick testing with concrete hand evaluation.
+    #[must_use]
+    pub fn mccfr_fast() -> Self {
+        Self {
+            solve_type: PostflopSolveType::Mccfr,
+            num_hand_buckets_flop: 10,
+            mccfr_sample_pct: 0.05,
+            value_extraction_samples: 1_000,
+            postflop_solve_iterations: 100,
+            max_flop_boards: 10,
+            ..Self::standard()
+        }
+    }
+
+    /// MCCFR standard preset: balanced accuracy with concrete hand evaluation.
+    #[must_use]
+    pub fn mccfr_standard() -> Self {
+        Self {
+            solve_type: PostflopSolveType::Mccfr,
+            num_hand_buckets_flop: 30,
+            mccfr_sample_pct: 0.01,
+            value_extraction_samples: 10_000,
+            postflop_solve_iterations: 500,
+            ..Self::standard()
+        }
+    }
+
     /// Parse a preset name into a config, or `None` for unknown names.
     #[must_use]
     pub fn from_preset(name: &str) -> Option<Self> {
@@ -229,6 +256,8 @@ impl PostflopModelConfig {
             "medium" => Some(Self::medium()),
             "standard" => Some(Self::standard()),
             "accurate" => Some(Self::accurate()),
+            "mccfr_fast" => Some(Self::mccfr_fast()),
+            "mccfr_standard" => Some(Self::mccfr_standard()),
             _ => None,
         }
     }
@@ -447,5 +476,32 @@ fixed_flops:
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let restored: PostflopModelConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(cfg, restored);
+    }
+
+    #[timed_test]
+    fn mccfr_fast_preset_uses_mccfr_solve_type() {
+        let cfg = PostflopModelConfig::mccfr_fast();
+        assert_eq!(cfg.solve_type, PostflopSolveType::Mccfr);
+        assert_eq!(cfg.num_hand_buckets_flop, 10);
+        assert!((cfg.mccfr_sample_pct - 0.05).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn mccfr_standard_preset_uses_mccfr_solve_type() {
+        let cfg = PostflopModelConfig::mccfr_standard();
+        assert_eq!(cfg.solve_type, PostflopSolveType::Mccfr);
+        assert_eq!(cfg.num_hand_buckets_flop, 30);
+    }
+
+    #[timed_test]
+    fn from_preset_mccfr_fast() {
+        let cfg = PostflopModelConfig::from_preset("mccfr_fast").unwrap();
+        assert_eq!(cfg.solve_type, PostflopSolveType::Mccfr);
+    }
+
+    #[timed_test]
+    fn from_preset_mccfr_standard() {
+        let cfg = PostflopModelConfig::from_preset("mccfr_standard").unwrap();
+        assert_eq!(cfg.solve_type, PostflopSolveType::Mccfr);
     }
 }

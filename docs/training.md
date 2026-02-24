@@ -35,7 +35,7 @@ Options:
 - `--players <N>` -- Number of players (2=HU, 6=six-max)
 - `--iterations <N>` -- LCFR iterations
 - `--equity-samples <N>` -- Monte Carlo samples per hand matchup for equity table (0=uniform)
-- `--postflop-model <PRESET>` -- Postflop model preset: fast, medium, standard, accurate
+- `--postflop-model <PRESET>` -- Postflop model preset: fast, medium, standard, accurate, mccfr_fast, mccfr_standard
 - `--print-every <N>` -- Print strategy matrices every N iterations (0=only at end)
 
 ### train
@@ -230,12 +230,29 @@ postflop_model:
 | `medium` | 15 | 200/200 | 200 | Development iteration (~10 min) |
 | `standard` | 20 | 500/500 | all (~1,755) | Production training |
 | `accurate` | 30 | 1000/1000 | all (~1,755) | High-fidelity analysis |
+| `mccfr_fast` | 10 | — (concrete eval) | 10 | Quick MCCFR testing |
+| `mccfr_standard` | 30 | — (concrete eval) | all (~1,755) | Balanced MCCFR |
 
 The `max_flop_boards` parameter controls how many canonical flop textures are used for EHS feature computation during hand bucketing. Lower values dramatically speed up the bucketing phase. Set to `0` (or omit) to use all ~1,755 canonical flops. Configurable in YAML via `max_flop_boards: 200`.
 
 The `equity_rollout_fraction` parameter controls how bucket-pair equity is computed on flop boards. With `1.0` (default), all C(remaining,2) runouts are enumerated exactly (~990 per hand pair). With a fractional value like `0.1` or `0.2`, that fraction of runouts is sampled per pair — roughly 5-10x faster with good accuracy. Turn and river equity is always exact regardless of this setting.
 
 The `rebucket_rounds` parameter controls EV-based postflop rebucketing. With the default value of `1`, only EHS equity histograms are used (standard behavior). With `2` or more, the solver runs an additional loop: solve all flops, extract per-hand EV histograms from the converged strategy, re-cluster flop buckets on EV features, and re-solve. Each CFR solve uses early stopping when max strategy delta drops below `cfr_delta_threshold` (default 0.001). The `postflop_sprs` field accepts a scalar or list of SPR values for the shared postflop tree (replaces `postflop_spr`; scalar values are auto-wrapped for backward compatibility).
+
+### MCCFR Backend
+
+The MCCFR backend uses concrete hand evaluation instead of bucket transitions:
+
+```yaml
+postflop_model:
+  solve_type: mccfr
+  num_hand_buckets_flop: 30
+  mccfr_sample_pct: 0.01
+  value_extraction_samples: 10000
+  postflop_solve_iterations: 500
+```
+
+Presets: `mccfr_fast` (10 buckets, quick testing) and `mccfr_standard` (30 buckets, balanced).
 
 ---
 
@@ -350,6 +367,7 @@ my_strategy/
 |-|-|
 | `sample_configurations/preflop_medium.yaml` | HU 25BB preflop solve with medium postflop model |
 | `sample_configurations/fast_buckets.yaml` | Quick postflop bucketing test |
+| `sample_configurations/mccfr_smoke.yaml` | MCCFR smoke test (single flop, fast) |
 
 ---
 

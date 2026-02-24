@@ -1,0 +1,11 @@
+# MCCFR smoke test configuration
+# Uses concrete hand evaluation instead of bucket transitions
+postflop_model:
+  solve_type: mccfr
+  num_hand_buckets_flop: 5
+  fixed_flops: ['AhKsQd']
+  mccfr_sample_pct: 0.05
+  value_extraction_samples: 500
+  postflop_solve_iterations: 50
+  postflop_spr: 3.5
+  bet_sizes: [0.5, 1.0]
