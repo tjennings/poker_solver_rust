@@ -224,7 +224,7 @@ postflop_model:
 
 ### Postflop Model Presets
 
-| Preset | Flop buckets (per-flop) | Turn/River buckets (global) | Max flop boards | Use case |
+| Preset | Flop buckets (per-flop) | Turn/River buckets (per-flop) | Max flop boards | Use case |
 |-|-|-|-|-|
 | `fast` | 10 | 50/50 | 10 | Quick testing (~3 min) |
 | `medium` | 15 | 200/200 | 200 | Development iteration (~10 min) |

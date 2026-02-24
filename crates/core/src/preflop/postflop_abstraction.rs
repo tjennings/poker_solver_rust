@@ -856,6 +856,7 @@ fn solve_cfr_traverse(
             let child = children[0];
             let num_new = transition[0].len();
             let mut value = 0.0;
+            #[allow(clippy::cast_possible_truncation)] // num_new ≤ u16::MAX (bucket count)
             for new_hero in 0..num_new {
                 let hw = transition[hero_bucket as usize][new_hero];
                 if hw < 1e-12 { continue; }
@@ -1126,6 +1127,7 @@ fn eval_with_avg_strategy(
             let child = children[0];
             let num_new = transition[0].len();
             let mut value = 0.0;
+            #[allow(clippy::cast_possible_truncation)] // num_new ≤ u16::MAX (bucket count)
             for new_hero in 0..num_new {
                 let hw = transition[hero_bucket as usize][new_hero];
                 if hw < 1e-12 { continue; }

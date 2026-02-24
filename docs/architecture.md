@@ -102,13 +102,13 @@ Independent per-street k-means clustering on equity histogram CDF features:
 
 **Flop (per-flop):** For each canonical flop, cluster the 169 hands independently into N buckets. Each (hand, flop) pair's feature vector is the 10-bin equity CDF computed by enumerating 47 turn cards and computing equity vs uniform opponent. This gives each flop its own bucket assignments — "top pair on K72r" and "top pair on 987ss" get separate bucket IDs.
 
-**Turn:** For each (hand, flop, turn_card), enumerate 46 river cards, same histogram → CDF → k-means process. Global clustering across all turns.
+**Turn (per-flop):** For each canonical flop, enumerate 47 live turn cards. For each of 169 hands × 47 turns, compute equity histogram CDF over 46 river cards → k-means. Independent clustering per flop, giving each flop its own turn bucket assignments.
 
-**River:** Raw equity scalar. K-means on 1D values. Global clustering.
+**River (per-flop):** For each canonical flop, sample 10 evenly-spaced turn cards, enumerate ~46 river cards each → ~460 five-card boards. Compute scalar equity per hand × board → k-means. Independent clustering per flop.
 
 The CDF representation means L2 distance equals Earth Mover's Distance for 1D distributions.
 
-**Output:** `StreetBuckets` — `flop: Vec<Vec<u16>>` where `flop[flop_idx][hand_idx] → bucket`. Turn/river remain flat global `Vec<u16>`.
+**Output:** `StreetBuckets` — all streets per-flop: `flop[flop_idx][hand_idx] → bucket`, `turn[flop_idx][hand_idx * 47 + turn_local_idx] → bucket`, `river[flop_idx][hand_idx * num_river_boards + board_local_idx] → bucket`.
 
 **Files:**
 - Histogram CDFs & canonical boards: `crates/core/src/preflop/ehs.rs`
@@ -116,12 +116,13 @@ The CDF representation means L2 distance equals Earth Mover's Distance for 1D di
 
 ### Stage 2: Equity Tables
 
-`StreetEquity` holds per-street `BucketEquity` tables. Flop equity is per-flop: `flop: Vec<BucketEquity>` — one N×N table per canonical flop. Turn and river equity tables are global. Each `BucketEquity` is a 2D array `[bucket_a][bucket_b] → f32` storing average equity when bucket A faces bucket B. Used as leaf-node estimates during postflop CFR.
+`StreetEquity` holds per-street `BucketEquity` tables — all per-flop: `flop: Vec<BucketEquity>`, `turn: Vec<BucketEquity>`, `river: Vec<BucketEquity>`. Each `BucketEquity` is a 2D array `[bucket_a][bucket_b] → f32` storing average equity when bucket A faces bucket B. Used as leaf-node estimates during postflop CFR.
 
-**Computation:** Bucket-pair equity uses true pairwise hand-vs-hand evaluation:
+**Computation:** Bucket-pair equity uses true pairwise hand-vs-hand evaluation, computed independently per flop for all three streets.
 
-1. **Per-flop:** For each flop, enumerate all hand pairs assigned to each bucket pair, evaluate equity via exhaustive runout enumeration, and average to get `equity(a, b)`.
-2. **Turn/River:** Same pairwise evaluation using global bucket assignments.
+### Stage 2.5: Transition Matrices
+
+`TransitionMatrices` connects streets via probability matrices: `flop_to_turn[flop_idx][flop_bucket][turn_bucket] → P(turn_bucket | flop_bucket)` and `turn_to_river[flop_idx][turn_bucket][river_bucket] → P(river_bucket | turn_bucket)`. Computed by counting (hand, board) assignments across adjacent streets and normalizing rows.
 
 The intermediate features are returned from `build_street_buckets_independent` in a `BucketingResult` struct to avoid recomputation.
 
@@ -139,9 +140,10 @@ Each tree has three streets of Decision nodes (OOP=0, IP=1), Chance nodes at str
 
 MCCFR per-flop with bucket-level abstraction:
 - Embarrassingly parallel: one independent solve per canonical flop
-- Each solve uses the shared tree template but its own per-flop equity table
-- Imperfect recall: each street's decision nodes use that street's independent bucket ID (player "forgets" prior-street identity)
-- At flop terminals: use per-flop `BucketEquity`; at turn/river: use global equity tables
+- Each solve uses the shared tree template but its own per-flop equity and transition matrices
+- Imperfect recall: each street's decision nodes use that street's independent per-flop bucket ID
+- At chance nodes (street transitions): iterate over all new-street bucket pairs, weighted by transition probabilities `P(new_bucket | old_bucket)`. Reach probabilities are multiplied by transition weights for correct regret weighting
+- All equity lookups are per-flop: flop, turn, and river `BucketEquity` tables
 - Output: `PostflopValues` — flat 4D array `[flop_idx][hero_pos][hero_bucket][opp_bucket] → EV`
 
 **File:** `crates/core/src/preflop/postflop_abstraction.rs`
@@ -191,8 +193,8 @@ At each preflop showdown terminal:
 | Parameter | Default | Presets (fast/med/std/acc) | Description |
 |-|-|-|-|
 | `num_hand_buckets_flop` | 20 | 10/15/20/30 | Per-flop k-means clusters (169 hands per flop) |
-| `num_hand_buckets_turn` | 500 | 50/200/500/1000 | Turn k-means clusters (global) |
-| `num_hand_buckets_river` | 500 | 50/200/500/1000 | River k-means clusters (global) |
+| `num_hand_buckets_turn` | 500 | 50/200/500/1000 | Per-flop turn k-means clusters |
+| `num_hand_buckets_river` | 500 | 50/200/500/1000 | Per-flop river k-means clusters |
 | `bet_sizes` | [0.5, 1.0] | — | Pot-fraction bet sizes |
 | `max_raises_per_street` | 1 | — | Raise cap per postflop street |
 | `postflop_sprs` | [3.5] | — | SPR(s) for shared postflop tree (scalar or list) |
@@ -206,7 +208,7 @@ At each preflop showdown terminal:
 | Cache | Key | Stores | Status |
 |-|-|-|-|
 | `solve_cache` | config hash + equity flag | `PostflopValues` | Active |
-| `abstraction_cache` | config hash + equity flag | `StreetBuckets` + `StreetEquity` | Disabled (pending StreetBuckets format migration) |
+| `abstraction_cache` | config hash + equity flag | `StreetBuckets` + `StreetEquity` + `TransitionMatrices` | Disabled (pending StreetBuckets format migration) |
 
 **Files:**
 - `crates/core/src/preflop/abstraction_cache.rs`
