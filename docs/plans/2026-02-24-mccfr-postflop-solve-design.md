@@ -234,24 +234,63 @@ value_extraction_samples: 10000   # samples for post-convergence evaluation
 
 No existing config files break — `solve_type` defaults to `Bucketed`.
 
-## Dispatch in `PostflopAbstraction::build()`
+## Code Organization
 
-The top-level `build()` dispatches based on `config.solve_type`:
+### Single dispatch point
+
+There is exactly **one** `match config.solve_type` in the entire codebase, at the top of `PostflopAbstraction::build()`:
 
 ```rust
 match config.solve_type {
-    PostflopSolveType::Bucketed => {
-        // Existing pipeline: process_single_flop + bucket CFR
-        // (current code, unchanged)
-    }
-    PostflopSolveType::Mccfr => {
-        // New pipeline: cluster flop buckets + MCCFR solve + extract values
-        // Layout uses num_flop_buckets for all streets
-    }
+    PostflopSolveType::Bucketed => build_bucketed(config, on_progress),
+    PostflopSolveType::Mccfr => build_mccfr(config, on_progress),
 }
 ```
 
-Both paths produce the same `PostflopAbstraction` struct with `PostflopValues`.
+Both return the same `PostflopAbstraction` struct. No `if solve_type` checks anywhere else.
+
+### Module structure
+
+Each backend lives in its own module with a clean boundary:
+
+```
+preflop/
+  postflop_abstraction.rs    — PostflopAbstraction, PostflopValues, shared types
+  postflop_bucketed.rs       — build_bucketed(), bucket CFR solve (existing code, moved)
+  postflop_mccfr.rs          — build_mccfr(), MCCFR solve (new code)
+  postflop_tree.rs           — PostflopTree (shared)
+  postflop_model.rs          — PostflopModelConfig, PostflopSolveType (shared)
+```
+
+### Shared code (not duplicated)
+
+Extract into `postflop_abstraction.rs` or a shared helper:
+
+- `PostflopLayout` — buffer layout mapping. MCCFR uses it with `num_flop_buckets` for all streets; Bucketed uses per-street counts. Same struct, different construction args.
+- `PostflopTree` and tree building — identical for both backends.
+- `regret_matching_into()` — used by both solvers for strategy computation.
+- `normalize_strategy_sum()` — used by both for value extraction.
+- `weighted_avg_strategy_delta()` — used by both for convergence tracking.
+- `add_buffers()` — element-wise buffer addition.
+- Flop bucket clustering (`cluster_histograms`, `equity_histogram`) — both backends cluster flop hands identically. Bucketed additionally clusters turn/river.
+- `PostflopValues` and value table construction.
+- Progress reporting (`BuildPhase`, `FlopStage`).
+
+### Backend-specific code (separate modules, no overlap)
+
+**`postflop_bucketed.rs`:**
+- `process_single_flop()` (turn/river bucketing, equity tables, transition matrices)
+- `SingleFlopAbstraction`, `SolveEquity`, `BucketEquity` usage
+- `solve_one_flop()`, `exhaustive_cfr_iteration()`, `sampled_cfr_iteration()`
+- `solve_cfr_traverse()` and bucket-CFR-specific traversal
+- `eval_with_avg_strategy()` (bucket equity at terminals, transition matrices at chance nodes)
+
+**`postflop_mccfr.rs`:**
+- `FlopBucketMap`
+- `mccfr_solve_one_flop()`, `mccfr_traverse()`
+- `mccfr_extract_values()`, `mccfr_eval_with_avg_strategy()`
+- Real hand evaluation at showdown terminals
+- Board sampling logic
 
 ## Performance
 
