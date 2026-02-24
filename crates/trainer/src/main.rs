@@ -843,14 +843,21 @@ fn run_solve_preflop(
             phase_bar.set_style(spinner_style.clone());
             phase_bar.set_message("Postflop abstraction");
             phase_bar.enable_steady_tick(std::time::Duration::from_millis(500));
-            // Per-flop display state for sorted progress bars.
-            // Bars are reassigned on each update so most-progressed flops
-            // stay at the top of the terminal output.
+            // Per-flop display state. Shows top 10 most-progressed flops,
+            // refreshed every 10 seconds to keep the display stable.
+            const MAX_FLOP_BARS: usize = 10;
+
             struct FlopSlotData {
                 sort_key: f64,
                 position: u64,
                 length: u64,
                 message: String,
+            }
+
+            struct FlopBarState {
+                states: HashMap<String, FlopSlotData>,
+                slots: Vec<ProgressBar>,
+                last_refresh: Instant,
             }
 
             #[allow(clippy::cast_precision_loss)]
@@ -866,39 +873,31 @@ fn run_solve_preflop(
                         .partial_cmp(&a.1.sort_key)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                while slots.len() < sorted.len() {
+                let visible = sorted.len().min(MAX_FLOP_BARS);
+                while slots.len() < visible {
                     let b = multi.add(ProgressBar::new(0));
                     b.set_style(style.clone());
                     b.enable_steady_tick(std::time::Duration::from_millis(500));
                     slots.push(b);
                 }
-                while slots.len() > sorted.len() {
+                while slots.len() > visible {
                     if let Some(bar) = slots.pop() {
                         bar.finish_and_clear();
                         multi.remove(&bar);
                     }
                 }
-                for (i, (_, data)) in sorted.iter().enumerate() {
+                for (i, (_, data)) in sorted.iter().take(visible).enumerate() {
                     slots[i].set_length(data.length);
                     slots[i].set_position(data.position);
                     slots[i].set_message(data.message.clone());
                 }
             }
 
-            // Tracks the last sort_key at which each flop triggered a reorder.
-            // Reorder only on phase changes (bucketing→solving, Done) or when
-            // sort_key crosses a 10% threshold, to avoid jumpy bar positions.
-            struct FlopBarState {
-                states: HashMap<String, FlopSlotData>,
-                slots: Vec<ProgressBar>,
-                last_reorder_key: HashMap<String, f64>,
-            }
-
             let flop_state: Arc<Mutex<FlopBarState>> =
                 Arc::new(Mutex::new(FlopBarState {
                     states: HashMap::new(),
                     slots: Vec::new(),
-                    last_reorder_key: HashMap::new(),
+                    last_refresh: Instant::now(),
                 }));
 
             let pf_start = Instant::now();
@@ -911,15 +910,10 @@ fn run_solve_preflop(
                         BuildPhase::FlopProgress { flop_name, stage } => {
                             let mut guard = flop_state.lock().unwrap();
                             let fbs = &mut *guard;
-                            let mut needs_reorder = false;
                             match stage {
                                 FlopStage::Bucketing { step, total_steps } => {
-                                    let key = f64::from(*step) / f64::from((*total_steps).max(1));
-                                    // Bucketing steps are coarse — always reorder.
-                                    needs_reorder = true;
-                                    fbs.last_reorder_key.insert(flop_name.clone(), key);
                                     fbs.states.insert(flop_name.clone(), FlopSlotData {
-                                        sort_key: key,
+                                        sort_key: f64::from(*step) / f64::from((*total_steps).max(1)),
                                         position: u64::from(*step),
                                         length: u64::from(*total_steps),
                                         message: format!("Flop '{flop_name}' Bucketing"),
@@ -928,12 +922,6 @@ fn run_solve_preflop(
                                 FlopStage::Solving { iteration, max_iterations, delta } => {
                                     #[allow(clippy::cast_precision_loss)]
                                     let key = 1.0 + *iteration as f64 / (*max_iterations).max(1) as f64;
-                                    let prev = fbs.last_reorder_key.get(flop_name).copied().unwrap_or(0.0);
-                                    // Phase change (bucketing→solving) or every 4th iteration.
-                                    if prev < 1.0 || (*iteration % 4 == 0) {
-                                        needs_reorder = true;
-                                        fbs.last_reorder_key.insert(flop_name.clone(), key);
-                                    }
                                     fbs.states.insert(flop_name.clone(), FlopSlotData {
                                         sort_key: key,
                                         position: *iteration as u64,
@@ -943,28 +931,11 @@ fn run_solve_preflop(
                                 }
                                 FlopStage::Done => {
                                     fbs.states.remove(flop_name);
-                                    fbs.last_reorder_key.remove(flop_name);
-                                    needs_reorder = true;
                                 }
                             }
-                            if needs_reorder {
+                            if fbs.last_refresh.elapsed() >= std::time::Duration::from_secs(10) {
+                                fbs.last_refresh = Instant::now();
                                 refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
-                            } else if let Some(data) = fbs.states.get(flop_name) {
-                                // Update bar content in-place without reordering.
-                                // Find which sorted slot this flop currently occupies.
-                                let mut sorted: Vec<_> = fbs.states.keys().collect();
-                                sorted.sort_by(|a, b| {
-                                    let ka = fbs.states[*a].sort_key;
-                                    let kb = fbs.states[*b].sort_key;
-                                    kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                                if let Some(slot_idx) = sorted.iter().position(|n| *n == flop_name) {
-                                    if slot_idx < fbs.slots.len() {
-                                        fbs.slots[slot_idx].set_position(data.position);
-                                        fbs.slots[slot_idx].set_length(data.length);
-                                        fbs.slots[slot_idx].set_message(data.message.clone());
-                                    }
-                                }
                             }
                         }
                         BuildPhase::ExtractingEv(done, total) => {
@@ -972,7 +943,6 @@ fn run_solve_preflop(
                             let mut guard = flop_state.lock().unwrap();
                             let fbs = &mut *guard;
                             fbs.states.clear();
-                            fbs.last_reorder_key.clear();
                             for bar in fbs.slots.drain(..) {
                                 bar.finish_and_clear();
                                 multi.remove(&bar);
@@ -993,7 +963,6 @@ fn run_solve_preflop(
                             let mut guard = flop_state.lock().unwrap();
                             let fbs = &mut *guard;
                             fbs.states.clear();
-                            fbs.last_reorder_key.clear();
                             for bar in fbs.slots.drain(..) {
                                 bar.finish_and_clear();
                                 multi.remove(&bar);
@@ -1017,7 +986,6 @@ fn run_solve_preflop(
                 let mut guard = flop_state.lock().unwrap();
                 let fbs = &mut *guard;
                 fbs.states.clear();
-                fbs.last_reorder_key.clear();
                 for bar in fbs.slots.drain(..) {
                     bar.finish_and_clear();
                     multi.remove(&bar);
