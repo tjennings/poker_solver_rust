@@ -9,19 +9,19 @@ The current postflop solve uses exhaustive bucket CFR with per-street buckets an
 
 ## Solution
 
-Replace exhaustive bucket CFR with external-sampling MCCFR using flop-only imperfect recall:
+Add external-sampling MCCFR as a new postflop solve backend alongside the existing bucket CFR. Selected via a `type` field in the postflop model config:
 
-- Strategy tables indexed by **flop bucket only** at all streets
-- Sample actual hands and board runouts per traversal
-- Evaluate real 7-card hands at showdown
-- Cost per sample: `O(tree_nodes)` with no quadratic blowup
-- Replaces the current bucket CFR entirely (not kept as an option)
+- `Bucketed` — existing per-street bucket CFR with transition matrices (default, backward compatible)
+- `MCCFR` — flop-only imperfect recall with sampled hands and real showdown evaluation
+
+Both backends produce the same `PostflopValues` output consumed by the preflop solver.
 
 ## Key Design Decisions
 
 | Decision | Choice | Rationale |
 |-|-|-|
-| Strategy key at turn/river | Flop bucket only | Imperfect recall — simpler, smaller tables, no transition matrices |
+| Backend selection | Config `type` field | Allows comparison and gradual migration |
+| Strategy key at turn/river (MCCFR) | Flop bucket only | Imperfect recall — simpler, smaller tables, no transition matrices |
 | Chance node sampling | External sampling | Sample one turn + one river card per traversal. Both players see same board. |
 | Showdown evaluation | Real 7-card hand eval | MCCFR samples actual hands, no bucket equity needed |
 | Sample count | Percentage of total space | `mccfr_sample_pct` as fraction of all valid (hand, hand, turn, river) combos per flop |
@@ -29,46 +29,60 @@ Replace exhaustive bucket CFR with external-sampling MCCFR using flop-only imper
 
 ## Architecture
 
-```
-Per-flop pipeline (unchanged interface):
+Both backends share the same pipeline entry/exit:
 
+```
+PostflopAbstraction::build()
+    ↓
+  match config.solve_type:
+    Bucketed → existing per-flop pipeline (process_single_flop + bucket CFR)
+    MCCFR    → new per-flop pipeline (cluster_flop_buckets + mccfr solve)
+    ↓
+  PostflopValues → preflop solver (unchanged consumer)
+```
+
+### MCCFR pipeline per flop
+
+```
   cluster_flop_buckets()         →  Vec<u16> (169 flop bucket assignments)
        ↓
   mccfr_solve_one_flop()         →  converged strategy_sum buffer
        ↓
   mccfr_extract_values()         →  Vec<f64> (2 × n × n values)
-       ↓
-  PostflopValues                 →  preflop solver (unchanged consumer)
 ```
 
-## What Gets Removed
+### Bucketed pipeline per flop (unchanged)
 
-- Turn/river bucketing (clustering, equity computation)
-- Flop/turn/river pairwise bucket equity tables (`BucketEquity`)
-- Transition matrices (`flop_to_turn`, `turn_to_river`)
-- `SingleFlopAbstraction` struct (replaced by `Vec<u16>`)
-- `SolveEquity` struct
-- `PostflopLayout` per-street bucket counts (all nodes use `num_flop_buckets`)
-- `exhaustive_cfr_iteration`, `sampled_cfr_iteration`
-- `solve_one_flop`, `solve_cfr_traverse` and related functions
+```
+  process_single_flop()          →  SingleFlopAbstraction (buckets + equity + transitions)
+       ↓
+  stream_solve_and_extract()     →  Vec<f64> (2 × n × n values)
+```
 
 ## What Stays Unchanged
 
+- All existing bucket CFR code (retained for `Bucketed` type)
 - `PostflopValues` format and interface
 - `postflop_showdown_value` in the preflop solver
 - `PostflopTree` and tree building
 - EV rebucketing loop (extract EV histograms → recluster → re-solve)
 - Solve caching (`solve_cache.rs`)
-- Overall `PostflopAbstraction::build()` flow
 - Progress reporting interface (`FlopStage::Bucketing` → `Solving` → `Done`)
 
-## What's Simplified
+## New Components (MCCFR backend)
 
-- `process_single_flop` → returns just `Vec<u16>` (flop bucket assignments)
-- `PostflopLayout::build` takes one bucket count (used at all streets)
-- Bucketing progress: 1 step instead of 6
+### `PostflopSolveType` enum
 
-## New Components
+```rust
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostflopSolveType {
+    Bucketed,
+    Mccfr,
+}
+```
+
+Added to `PostflopModelConfig` as `solve_type` field, defaulting to `Bucketed`.
 
 ### `FlopBucketMap`
 
@@ -190,33 +204,87 @@ fn mccfr_extract_values(tree, layout, strategy_sum, bucket_map, flop, M):
 
 ## Config Changes
 
-**Removed:**
-- `num_hand_buckets_turn`
-- `num_hand_buckets_river`
-- `equity_rollout_fraction`
-- `postflop_solve_samples`
+### `PostflopModelConfig` additions
 
-**Renamed:**
-- `num_hand_buckets_flop` → `num_hand_buckets` (only one bucket count now)
+```yaml
+# New field — selects solve backend
+solve_type: mccfr        # or "bucketed" (default)
 
-**Retained:**
-- `postflop_solve_iterations`
-- `cfr_delta_threshold`
-- `postflop_sprs`
-- `max_flop_boards` / `fixed_flops`
-- `rebucket_rounds`
+# MCCFR-specific (ignored when solve_type: bucketed)
+mccfr_sample_pct: 0.01            # fraction of total sample space per flop (default: 1%)
+value_extraction_samples: 10000   # samples for post-convergence evaluation
+```
 
-**New:**
-- `mccfr_sample_pct: f64` — fraction of total (hand_pair × turn × river) space to sample per flop (default: 0.01 = 1%)
-- `value_extraction_samples: usize` — samples for post-convergence evaluation (default: 10,000)
+### Existing fields by backend
+
+| Field | Bucketed | MCCFR |
+|-|-|-|
+| `num_hand_buckets_flop` | Used | Used (only bucket count) |
+| `num_hand_buckets_turn` | Used | Ignored |
+| `num_hand_buckets_river` | Used | Ignored |
+| `equity_rollout_fraction` | Used | Ignored |
+| `postflop_solve_iterations` | Used | Used |
+| `postflop_solve_samples` | Used | Ignored (uses `mccfr_sample_pct`) |
+| `cfr_delta_threshold` | Used | Used |
+| `postflop_sprs` | Used | Used |
+| `max_flop_boards` / `fixed_flops` | Used | Used |
+| `rebucket_rounds` | Used | Used |
+| `mccfr_sample_pct` | Ignored | Used |
+| `value_extraction_samples` | Ignored | Used |
+
+No existing config files break — `solve_type` defaults to `Bucketed`.
+
+## Dispatch in `PostflopAbstraction::build()`
+
+The top-level `build()` dispatches based on `config.solve_type`:
+
+```rust
+match config.solve_type {
+    PostflopSolveType::Bucketed => {
+        // Existing pipeline: process_single_flop + bucket CFR
+        // (current code, unchanged)
+    }
+    PostflopSolveType::Mccfr => {
+        // New pipeline: cluster flop buckets + MCCFR solve + extract values
+        // Layout uses num_flop_buckets for all streets
+    }
+}
+```
+
+Both paths produce the same `PostflopAbstraction` struct with `PostflopValues`.
 
 ## Performance
 
-| Metric | Current (20/20/50) | MCCFR (20 buckets) |
+| Metric | Bucketed (20/20/50) | MCCFR (20 buckets) |
 |-|-|-|
 | Bucketing per flop | 6 steps (3 streets × bucket + equity) | 1 step (flop clustering) |
 | Per-iteration cost | O(flop² × turn² × river² × tree) | O(samples × tree) |
 | Chance node cost | O(turn² × river²) per traversal | O(1) per traversal |
 | Memory (strategy buffers) | flop_b + turn_b + river_b per node | flop_b per node |
 
-With 20 flop buckets: current exhaustive iteration = ~400M traversals. MCCFR with 1% sampling ≈ thousands of traversals per iteration. Orders of magnitude faster.
+With 20 flop buckets: current exhaustive iteration ≈ 400M traversals. MCCFR with 1% sampling ≈ thousands of traversals per iteration. Orders of magnitude faster.
+
+## Example Configs
+
+### Bucketed (existing behavior, unchanged)
+
+```yaml
+postflop_model:
+  solve_type: bucketed
+  num_hand_buckets_flop: 10
+  num_hand_buckets_turn: 10
+  num_hand_buckets_river: 10
+  postflop_solve_iterations: 200
+```
+
+### MCCFR
+
+```yaml
+postflop_model:
+  solve_type: mccfr
+  num_hand_buckets_flop: 30
+  mccfr_sample_pct: 0.01
+  value_extraction_samples: 10000
+  postflop_solve_iterations: 500
+  cfr_delta_threshold: 0.001
+```
