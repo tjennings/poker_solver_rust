@@ -345,7 +345,7 @@ impl PostflopAbstraction {
         let samples = if config.postflop_solve_samples > 0 {
             config.postflop_solve_samples as usize
         } else {
-            num_flop_b
+            num_flop_b * num_flop_b // 0 = exhaustive (all bucket pairs)
         };
 
         let flop_names: Vec<String> = flops.iter()
