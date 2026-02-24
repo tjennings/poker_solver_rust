@@ -670,7 +670,7 @@ fn solve_one_flop(
 
         // Compute strategy delta (meaningful after iteration 1).
         if iter >= 1 {
-            final_delta = max_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
+            final_delta = weighted_avg_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
         }
 
         on_progress(BuildPhase::SolvingPostflop {
@@ -932,14 +932,19 @@ fn add_buffers(dst: &mut [f64], src: &[f64]) {
 ///
 /// For each decision node in the tree, iterates through every bucket's action slice,
 /// applies regret matching to both the old and new regret buffers, and returns the
-/// maximum absolute difference in any action probability.
-fn max_strategy_delta(
+/// weighted average strategy delta.
+///
+/// Each (node, bucket) position is weighted by its total absolute regret mass,
+/// so frequently-reached positions with large regrets dominate the metric while
+/// rarely-reached positions with near-zero regrets are ignored.
+fn weighted_avg_strategy_delta(
     old_regrets: &[f64],
     new_regrets: &[f64],
     layout: &PostflopLayout,
     tree: &PostflopTree,
 ) -> f64 {
-    let mut max_delta = 0.0f64;
+    let mut weighted_sum = 0.0f64;
+    let mut total_weight = 0.0f64;
 
     for (node_idx, node) in tree.nodes.iter().enumerate() {
         if let PostflopNode::Decision { children, .. } = node {
@@ -960,17 +965,32 @@ fn max_strategy_delta(
             let mut old_strat = vec![0.0f64; num_actions];
             let mut new_strat = vec![0.0f64; num_actions];
             while pos + num_actions <= node_end {
-                regret_matching_into(old_regrets, pos, &mut old_strat);
-                regret_matching_into(new_regrets, pos, &mut new_strat);
-                for i in 0..num_actions {
-                    let diff = (old_strat[i] - new_strat[i]).abs();
-                    max_delta = max_delta.max(diff);
+                // Weight = sum of absolute regrets at this position (using new regrets).
+                let weight: f64 = new_regrets[pos..pos + num_actions]
+                    .iter()
+                    .map(|r| r.abs())
+                    .sum();
+
+                if weight > 0.0 {
+                    regret_matching_into(old_regrets, pos, &mut old_strat);
+                    regret_matching_into(new_regrets, pos, &mut new_strat);
+                    let mut pos_delta = 0.0f64;
+                    for i in 0..num_actions {
+                        pos_delta = pos_delta.max((old_strat[i] - new_strat[i]).abs());
+                    }
+                    weighted_sum += pos_delta * weight;
+                    total_weight += weight;
                 }
                 pos += num_actions;
             }
         }
     }
-    max_delta
+
+    if total_weight > 0.0 {
+        weighted_sum / total_weight
+    } else {
+        0.0
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1291,13 +1311,13 @@ mod tests {
     }
 
     #[timed_test]
-    fn max_strategy_delta_identical_buffers_is_zero() {
+    fn weighted_avg_strategy_delta_identical_buffers_is_zero() {
         let config = PostflopModelConfig::fast();
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
         let streets = annotate_streets(&tree);
         let layout = PostflopLayout::build(&tree, &streets, 10, 10, 10);
         let buf = vec![1.0f64; layout.total_size];
-        let delta = max_strategy_delta(&buf, &buf, &layout, &tree);
+        let delta = weighted_avg_strategy_delta(&buf, &buf, &layout, &tree);
         assert!(
             delta.abs() < 1e-12,
             "identical buffers should have zero delta, got {delta}"
@@ -1305,7 +1325,7 @@ mod tests {
     }
 
     #[timed_test]
-    fn max_strategy_delta_detects_change() {
+    fn weighted_avg_strategy_delta_detects_change() {
         let config = PostflopModelConfig::fast();
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
         let streets = annotate_streets(&tree);
@@ -1317,7 +1337,7 @@ mod tests {
             new[0] = 100.0;
             new[1] = 0.0;
         }
-        let delta = max_strategy_delta(&old, &new, &layout, &tree);
+        let delta = weighted_avg_strategy_delta(&old, &new, &layout, &tree);
         assert!(delta > 0.0, "different buffers should have nonzero delta");
     }
 
