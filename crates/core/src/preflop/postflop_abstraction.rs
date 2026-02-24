@@ -503,15 +503,20 @@ fn load_or_build_abstraction(
         &|progress| {
             use hand_buckets::BuildProgress;
             match progress {
-                BuildProgress::FlopFeatures(done, total) => {
+                BuildProgress::FlopFeatures(done, total)
+                | BuildProgress::TurnFeatures(done, total)
+                | BuildProgress::RiverFeatures(done, total) => {
                     on_progress(BuildPhase::HandBuckets(done, total));
                 }
-                _ => {}
+                BuildProgress::FlopClustering
+                | BuildProgress::TurnClustering
+                | BuildProgress::RiverClustering => {}
             }
         },
     );
 
-    on_progress(BuildPhase::EquityTable(0, 0));
+    let num_flops = flops.len();
+    on_progress(BuildPhase::EquityTable(0, num_flops + 2));
 
     let street_equity = result.compute_pairwise_street_equity(
         &hands,

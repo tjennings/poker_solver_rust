@@ -849,8 +849,11 @@ fn run_solve_preflop(
                 |phase| {
                     match &phase {
                         BuildPhase::HandBuckets(done, total) => {
-                            phase_bar.set_style(bar_style.clone());
-                            phase_bar.set_length(*total as u64);
+                            if *done == 0 {
+                                phase_bar.set_style(bar_style.clone());
+                                phase_bar.set_length(*total as u64);
+                                phase_bar.reset_eta();
+                            }
                             phase_bar.set_position(*done as u64);
                             phase_bar.set_message("Hand buckets");
                         }
@@ -878,8 +881,11 @@ fn run_solve_preflop(
                             ));
                         }
                         BuildPhase::EquityTable(done, total) => {
-                            phase_bar.set_style(bar_style.clone());
-                            phase_bar.set_length(*total as u64);
+                            if *done == 0 {
+                                phase_bar.set_style(bar_style.clone());
+                                phase_bar.set_length(*total as u64);
+                                phase_bar.reset_eta();
+                            }
                             phase_bar.set_position(*done as u64);
                             phase_bar.set_message("Equity table");
                         }
