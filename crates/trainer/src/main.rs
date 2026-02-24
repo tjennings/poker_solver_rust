@@ -929,8 +929,8 @@ fn run_solve_preflop(
                                     #[allow(clippy::cast_precision_loss)]
                                     let key = 1.0 + *iteration as f64 / (*max_iterations).max(1) as f64;
                                     let prev = fbs.last_reorder_key.get(flop_name).copied().unwrap_or(0.0);
-                                    // Phase change (bucketing→solving) or 10% threshold.
-                                    if prev < 1.0 || (key - prev) >= 0.1 {
+                                    // Phase change (bucketing→solving) or every 4th iteration.
+                                    if prev < 1.0 || (*iteration % 4 == 0) {
                                         needs_reorder = true;
                                         fbs.last_reorder_key.insert(flop_name.clone(), key);
                                     }
