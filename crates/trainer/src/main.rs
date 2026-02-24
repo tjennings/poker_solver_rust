@@ -37,7 +37,7 @@ use poker_solver_core::info_key::{
 use poker_solver_core::preflop::{
     EquityTable, PostflopModelConfig, PreflopBundle, PreflopConfig, PreflopSolver, PreflopTree,
 };
-use poker_solver_core::preflop::postflop_abstraction::{BuildPhase, PostflopAbstraction};
+use poker_solver_core::preflop::postflop_abstraction::{BuildPhase, FlopStage, PostflopAbstraction};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -834,9 +834,9 @@ fn run_solve_preflop(
                 .expect("valid template");
 
             let multi = MultiProgress::new();
-            let phase_bar = multi.add(ProgressBar::new(169));
-            phase_bar.set_style(bar_style.clone());
-            phase_bar.set_message("Hand buckets");
+            let phase_bar = multi.add(ProgressBar::new_spinner());
+            phase_bar.set_style(spinner_style.clone());
+            phase_bar.set_message("Postflop abstraction");
             phase_bar.enable_steady_tick(std::time::Duration::from_millis(500));
             let flop_bars: Arc<Mutex<HashMap<String, ProgressBar>>> =
                 Arc::new(Mutex::new(HashMap::new()));
@@ -848,46 +848,38 @@ fn run_solve_preflop(
                 Some(cache_base),
                 |phase| {
                     match &phase {
-                        BuildPhase::HandBuckets(done, total) => {
-                            if *done == 0 {
-                                phase_bar.set_style(bar_style.clone());
-                                phase_bar.set_length(*total as u64);
-                                phase_bar.reset_eta();
-                            }
-                            phase_bar.set_position(*done as u64);
-                            phase_bar.set_message("Hand buckets");
-                        }
-                        BuildPhase::SolvingPostflop {
-                            round,
-                            total_rounds,
-                            flop_name,
-                            iteration,
-                            max_iterations,
-                            delta,
-                        } => {
+                        BuildPhase::FlopProgress { flop_name, stage } => {
                             let mut bars = flop_bars.lock().unwrap();
-                            let bar =
-                                bars.entry(flop_name.clone()).or_insert_with(|| {
-                                    let b = multi
-                                        .add(ProgressBar::new(*max_iterations as u64));
-                                    b.set_style(bar_style.clone());
-                                    b.enable_steady_tick(std::time::Duration::from_millis(500));
-                                    b
-                                });
-                            bar.set_length(*max_iterations as u64);
-                            bar.set_position(*iteration as u64);
-                            bar.set_message(format!(
-                                "[{round}/{total_rounds}] Flop '{flop_name}' \u{03b4}={delta:.4}"
-                            ));
-                        }
-                        BuildPhase::EquityTable(done, total) => {
-                            if *done == 0 {
-                                phase_bar.set_style(bar_style.clone());
-                                phase_bar.set_length(*total as u64);
-                                phase_bar.reset_eta();
+                            match stage {
+                                FlopStage::Bucketing => {
+                                    let bar = bars.entry(flop_name.clone()).or_insert_with(|| {
+                                        let b = multi.add(ProgressBar::new_spinner());
+                                        b.set_style(spinner_style.clone());
+                                        b.enable_steady_tick(std::time::Duration::from_millis(500));
+                                        b
+                                    });
+                                    bar.set_message(format!("Flop '{flop_name}' Bucketing"));
+                                }
+                                FlopStage::Solving { iteration, max_iterations, delta } => {
+                                    let bar = bars.entry(flop_name.clone()).or_insert_with(|| {
+                                        let b = multi.add(ProgressBar::new(*max_iterations as u64));
+                                        b.set_style(bar_style.clone());
+                                        b.enable_steady_tick(std::time::Duration::from_millis(500));
+                                        b
+                                    });
+                                    // Switch from spinner to bar on first solve tick
+                                    bar.set_style(bar_style.clone());
+                                    bar.set_length(*max_iterations as u64);
+                                    bar.set_position(*iteration as u64);
+                                    bar.set_message(format!("Flop '{flop_name}' CFR \u{03b4}={delta:.4}"));
+                                }
+                                FlopStage::Done => {
+                                    if let Some(bar) = bars.remove(flop_name) {
+                                        bar.finish_and_clear();
+                                        multi.remove(&bar);
+                                    }
+                                }
                             }
-                            phase_bar.set_position(*done as u64);
-                            phase_bar.set_message("Equity table");
                         }
                         BuildPhase::ExtractingEv(done, total) => {
                             // Clear flop bars, show extraction progress.

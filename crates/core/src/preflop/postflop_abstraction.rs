@@ -13,8 +13,6 @@
 //!     → return expected value
 //! ```
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use rand::rngs::SmallRng;
 use serde::{Deserialize, Serialize};
 use rand::{Rng, SeedableRng};
@@ -252,27 +250,32 @@ pub enum PostflopAbstractionError {
     InvalidConfig(String),
 }
 
+/// Stage within a single flop's streaming pipeline.
+#[derive(Debug, Clone)]
+pub enum FlopStage {
+    /// Computing buckets, equity tables, transition matrices.
+    Bucketing,
+    /// CFR solve in progress.
+    Solving {
+        iteration: usize,
+        max_iterations: usize,
+        delta: f64,
+    },
+    /// Flop complete — signal to clear the bar.
+    Done,
+}
+
 /// Progress report during postflop abstraction construction.
 #[derive(Debug, Clone)]
 pub enum BuildPhase {
-    /// Computing EHS features and clustering hands into buckets.
-    /// Contains `(hands_done, total_hands)`.
-    HandBuckets(usize, usize),
-    /// Computing bucket-vs-bucket equity table.
-    /// Contains `(steps_done, total_steps)`.
-    EquityTable(usize, usize),
     /// Building postflop game trees.
     Trees,
     /// Computing flat buffer layout.
     Layout,
-    /// Per-flop CFR solve with convergence tracking.
-    SolvingPostflop {
-        round: u16,
-        total_rounds: u16,
+    /// Per-flop streaming progress.
+    FlopProgress {
         flop_name: String,
-        iteration: usize,
-        max_iterations: usize,
-        delta: f64,
+        stage: FlopStage,
     },
     /// Extracting EV histograms from converged strategy.
     ExtractingEv(usize, usize),
@@ -285,13 +288,14 @@ pub enum BuildPhase {
 impl std::fmt::Display for BuildPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::HandBuckets(done, total) => write!(f, "Hand buckets ({done}/{total})"),
-            Self::EquityTable(done, total) => write!(f, "Equity table ({done}/{total})"),
             Self::Trees => write!(f, "Postflop trees"),
             Self::Layout => write!(f, "Buffer layout"),
-            Self::SolvingPostflop { round, total_rounds, flop_name, iteration, max_iterations, delta } => {
-                write!(f, "[{round}/{total_rounds}] Flop '{flop_name}' iter {iteration}/{max_iterations} \u{03b4}={delta:.4}")
-            }
+            Self::FlopProgress { flop_name, stage } => match stage {
+                FlopStage::Bucketing => write!(f, "Flop '{flop_name}' Bucketing"),
+                FlopStage::Solving { iteration, max_iterations, delta } =>
+                    write!(f, "Flop '{flop_name}' CFR \u{03b4}={delta:.4} ({iteration}/{max_iterations})"),
+                FlopStage::Done => write!(f, "Flop '{flop_name}' Done"),
+            },
             Self::ExtractingEv(done, total) => write!(f, "EV histograms ({done}/{total})"),
             Self::Rebucketing(round, total) => write!(f, "Rebucketing ({round}/{total})"),
             Self::ComputingValues => write!(f, "Computing values"),
@@ -353,11 +357,14 @@ impl PostflopAbstraction {
         let num_hands = hand_buckets::NUM_HANDS;
 
         // First round: streaming per-flop pipeline (bucket + equity + transitions + solve + extract)
-        let flop_done = AtomicUsize::new(0);
-        on_progress(BuildPhase::HandBuckets(0, num_flops));
         let results: Vec<(Vec<u16>, Vec<f64>)> = (0..num_flops)
             .into_par_iter()
             .map(|flop_idx| {
+                let flop_name = format!("{}{}{}", flops[flop_idx][0], flops[flop_idx][1], flops[flop_idx][2]);
+                on_progress(BuildPhase::FlopProgress {
+                    flop_name: flop_name.clone(),
+                    stage: FlopStage::Bucketing,
+                });
                 let flop_data = hand_buckets::process_single_flop(
                     &hands,
                     &flops[flop_idx],
@@ -368,7 +375,6 @@ impl PostflopAbstraction {
                     None, // first round: cluster from scratch
                 );
                 let flop_buckets = flop_data.flop_buckets.clone();
-                let flop_name = format!("{}{}{}", flops[flop_idx][0], flops[flop_idx][1], flops[flop_idx][2]);
                 let values = stream_solve_and_extract_one_flop(
                     flop_data,
                     &tree,
@@ -379,12 +385,12 @@ impl PostflopAbstraction {
                     config.rebucket_delta_threshold,
                     flop_idx,
                     &flop_name,
-                    1,
-                    total_rounds,
                     &on_progress,
                 );
-                let done = flop_done.fetch_add(1, Ordering::Relaxed) + 1;
-                on_progress(BuildPhase::HandBuckets(done, num_flops));
+                on_progress(BuildPhase::FlopProgress {
+                    flop_name,
+                    stage: FlopStage::Done,
+                });
                 (flop_buckets, values)
             })
             .collect();
@@ -431,11 +437,14 @@ impl PostflopAbstraction {
             // Stream-solve again with reclustered flop buckets
             // process_single_flop with override_flop_buckets ensures consistent
             // flop_to_turn transitions (computed from the reclustered flop buckets)
-            let flop_done = AtomicUsize::new(0);
-            on_progress(BuildPhase::HandBuckets(0, num_flops));
             let results: Vec<(Vec<u16>, Vec<f64>)> = (0..num_flops)
                 .into_par_iter()
                 .map(|flop_idx| {
+                    let flop_name = format!("{}{}{}", flops[flop_idx][0], flops[flop_idx][1], flops[flop_idx][2]);
+                    on_progress(BuildPhase::FlopProgress {
+                        flop_name: flop_name.clone(),
+                        stage: FlopStage::Bucketing,
+                    });
                     let flop_data = hand_buckets::process_single_flop(
                         &hands,
                         &flops[flop_idx],
@@ -446,7 +455,6 @@ impl PostflopAbstraction {
                         Some(&buckets.flop[flop_idx]), // use reclustered assignments
                     );
                     let fb = flop_data.flop_buckets.clone();
-                    let flop_name = format!("{}{}{}", flops[flop_idx][0], flops[flop_idx][1], flops[flop_idx][2]);
                     let vals = stream_solve_and_extract_one_flop(
                         flop_data,
                         &tree,
@@ -457,12 +465,12 @@ impl PostflopAbstraction {
                         config.rebucket_delta_threshold,
                         flop_idx,
                         &flop_name,
-                        round,
-                        total_rounds,
                         &on_progress,
                     );
-                    let done = flop_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    on_progress(BuildPhase::HandBuckets(done, num_flops));
+                    on_progress(BuildPhase::FlopProgress {
+                        flop_name,
+                        stage: FlopStage::Done,
+                    });
                     (fb, vals)
                 })
                 .collect();
@@ -564,8 +572,6 @@ fn stream_solve_and_extract_one_flop(
     delta_threshold: f64,
     flop_idx: usize,
     flop_name: &str,
-    round: u16,
-    total_rounds: u16,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> Vec<f64> {
     let solve_eq = SolveEquity {
@@ -581,7 +587,7 @@ fn stream_solve_and_extract_one_flop(
         tree, layout, &solve_eq,
         num_flop_buckets, buf_size,
         num_iterations, samples_per_iter, delta_threshold,
-        flop_idx, flop_name, round, total_rounds, on_progress,
+        flop_idx, flop_name, on_progress,
     );
 
     // Extract values from converged strategy
@@ -618,8 +624,6 @@ fn solve_one_flop(
     delta_threshold: f64,
     flop_idx: usize,
     flop_name: &str,
-    round: u16,
-    total_rounds: u16,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> FlopSolveResult {
     let mut regret_sum = vec![0.0f64; buf_size];
@@ -656,13 +660,13 @@ fn solve_one_flop(
             final_delta = weighted_avg_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
         }
 
-        on_progress(BuildPhase::SolvingPostflop {
-            round,
-            total_rounds,
+        on_progress(BuildPhase::FlopProgress {
             flop_name: flop_name.to_string(),
-            iteration: iter + 1,
-            max_iterations: num_iterations,
-            delta: final_delta,
+            stage: FlopStage::Solving {
+                iteration: iter + 1,
+                max_iterations: num_iterations,
+                delta: final_delta,
+            },
         });
 
         // Early stopping after at least 2 iterations.
@@ -1367,7 +1371,7 @@ mod tests {
         let result = solve_one_flop(
             &tree, &layout, &solve_eq,
             5, buf_size, 4, 25, 0.0001,
-            0, "AhKd7s", 1, 1, &|_| {},
+            0, "AhKd7s", &|_| {},
         );
         assert_eq!(result.strategy_sum.len(), buf_size);
         assert!(result.iterations_used >= 2);
@@ -1399,7 +1403,7 @@ mod tests {
         let result = solve_one_flop(
             &tree, &layout, &solve_eq,
             5, buf_size, 3, 25, 0.0,
-            0, "AhKd7s", 1, 1, &|_| {},
+            0, "AhKd7s", &|_| {},
         );
         assert_eq!(result.iterations_used, 3, "zero threshold should run all iterations");
     }
@@ -1428,7 +1432,7 @@ mod tests {
         let result = solve_one_flop(
             &tree, &layout, &solve_eq,
             5, buf_size, 100, 25, f64::INFINITY,
-            0, "AhKd7s", 1, 1, &|_| {},
+            0, "AhKd7s", &|_| {},
         );
         assert_eq!(result.iterations_used, 2, "huge threshold should stop at minimum 2 iterations");
     }
@@ -1449,20 +1453,31 @@ mod tests {
     }
 
     #[timed_test]
-    fn build_phase_display_solving_postflop() {
-        let phase = BuildPhase::SolvingPostflop {
-            round: 1,
-            total_rounds: 2,
+    fn build_phase_display_flop_progress() {
+        let phase = BuildPhase::FlopProgress {
             flop_name: "AhKd7s".to_string(),
-            iteration: 45,
-            max_iterations: 200,
-            delta: 0.0032,
+            stage: FlopStage::Solving {
+                iteration: 45,
+                max_iterations: 200,
+                delta: 0.0032,
+            },
         };
         let s = format!("{phase}");
-        assert!(s.contains("1/2"), "should show round: {s}");
         assert!(s.contains("AhKd7s"), "should show flop name: {s}");
         assert!(s.contains("45/200"), "should show iteration: {s}");
         assert!(s.contains("0.0032"), "should show delta: {s}");
+
+        let bucketing = BuildPhase::FlopProgress {
+            flop_name: "AhKd7s".to_string(),
+            stage: FlopStage::Bucketing,
+        };
+        assert!(format!("{bucketing}").contains("Bucketing"));
+
+        let done = BuildPhase::FlopProgress {
+            flop_name: "AhKd7s".to_string(),
+            stage: FlopStage::Done,
+        };
+        assert!(format!("{done}").contains("Done"));
     }
 
     #[timed_test]
