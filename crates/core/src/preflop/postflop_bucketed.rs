@@ -69,7 +69,7 @@ pub(crate) fn build_bucketed(
             let flop_name = format!("{}{}{}", flops[flop_idx][0], flops[flop_idx][1], flops[flop_idx][2]);
             on_progress(BuildPhase::FlopProgress {
                 flop_name: flop_name.clone(),
-                stage: FlopStage::Bucketing { step: 0 },
+                stage: FlopStage::Bucketing { step: 0, total_steps: 6 },
             });
             let flop_data = hand_buckets::process_single_flop(
                 &hands,
@@ -82,7 +82,7 @@ pub(crate) fn build_bucketed(
                 &|step| {
                     on_progress(BuildPhase::FlopProgress {
                         flop_name: flop_name.clone(),
-                        stage: FlopStage::Bucketing { step },
+                        stage: FlopStage::Bucketing { step, total_steps: 6 },
                     });
                 },
             );
@@ -153,7 +153,7 @@ pub(crate) fn build_bucketed(
                 let flop_name = format!("{}{}{}", flops[flop_idx][0], flops[flop_idx][1], flops[flop_idx][2]);
                 on_progress(BuildPhase::FlopProgress {
                     flop_name: flop_name.clone(),
-                    stage: FlopStage::Bucketing { step: 0 },
+                    stage: FlopStage::Bucketing { step: 0, total_steps: 6 },
                 });
                 let flop_data = hand_buckets::process_single_flop(
                     &hands,
@@ -166,7 +166,7 @@ pub(crate) fn build_bucketed(
                     &|step| {
                         on_progress(BuildPhase::FlopProgress {
                             flop_name: flop_name.clone(),
-                            stage: FlopStage::Bucketing { step },
+                            stage: FlopStage::Bucketing { step, total_steps: 6 },
                         });
                     },
                 );

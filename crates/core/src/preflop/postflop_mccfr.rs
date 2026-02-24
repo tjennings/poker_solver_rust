@@ -7,6 +7,8 @@
 //! the full 5-card board. Strategies and regrets are still indexed by **flop
 //! bucket** (not by concrete hand).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -87,6 +89,7 @@ pub(crate) fn build_mccfr(
     let nfb = config.num_hand_buckets_flop as usize;
     let num_iterations = config.postflop_solve_iterations as usize;
     let _ = node_streets; // Streets are embedded in the layout already.
+    let completed = AtomicUsize::new(0);
 
     // Phase 1: per-flop solve
     let results: Vec<(Vec<u16>, Vec<f64>)> = (0..num_flops)
@@ -98,7 +101,7 @@ pub(crate) fn build_mccfr(
             // Step 1: Compute flop histogram features and cluster
             on_progress(BuildPhase::FlopProgress {
                 flop_name: flop_name.clone(),
-                stage: FlopStage::Bucketing { step: 0 },
+                stage: FlopStage::Bucketing { step: 0, total_steps: 3 },
             });
             let flop_features = hand_buckets::compute_flop_histograms(
                 &hands,
@@ -107,14 +110,14 @@ pub(crate) fn build_mccfr(
             );
             on_progress(BuildPhase::FlopProgress {
                 flop_name: flop_name.clone(),
-                stage: FlopStage::Bucketing { step: 1 },
+                stage: FlopStage::Bucketing { step: 1, total_steps: 3 },
             });
 
             let assignments =
                 hand_buckets::cluster_histograms(&flop_features, config.num_hand_buckets_flop);
             on_progress(BuildPhase::FlopProgress {
                 flop_name: flop_name.clone(),
-                stage: FlopStage::Bucketing { step: 2 },
+                stage: FlopStage::Bucketing { step: 2, total_steps: 3 },
             });
 
             // Step 2: Build bucket map
@@ -147,7 +150,6 @@ pub(crate) fn build_mccfr(
                 samples_per_iter,
                 config.cfr_delta_threshold,
                 &flop_name,
-                on_progress,
             );
 
             // Step 5: Extract values
@@ -161,10 +163,8 @@ pub(crate) fn build_mccfr(
                 nfb,
             );
 
-            on_progress(BuildPhase::FlopProgress {
-                flop_name,
-                stage: FlopStage::Done,
-            });
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            on_progress(BuildPhase::MccfrFlopsCompleted { completed: done, total: num_flops });
 
             (assignments, values)
         })
@@ -209,22 +209,12 @@ fn mccfr_solve_one_flop(
     samples_per_iter: usize,
     delta_threshold: f64,
     flop_name: &str,
-    on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> FlopSolveResult {
     let buf_size = layout.total_size;
     let mut regret_sum = vec![0.0f64; buf_size];
     let mut strategy_sum = vec![0.0f64; buf_size];
     let mut final_delta = 0.0;
     let mut iterations_used = 0;
-
-    on_progress(BuildPhase::FlopProgress {
-        flop_name: flop_name.to_string(),
-        stage: FlopStage::Solving {
-            iteration: 0,
-            max_iterations: num_iterations,
-            delta: 0.0,
-        },
-    });
 
     for iter in 0..num_iterations {
         let iteration = iter as u64 + 1;
@@ -273,15 +263,6 @@ fn mccfr_solve_one_flop(
             final_delta =
                 weighted_avg_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
         }
-
-        on_progress(BuildPhase::FlopProgress {
-            flop_name: flop_name.to_string(),
-            stage: FlopStage::Solving {
-                iteration: iter + 1,
-                max_iterations: num_iterations,
-                delta: final_delta,
-            },
-        });
 
         if iter >= 1 && final_delta < delta_threshold {
             break;
@@ -912,7 +893,6 @@ mod tests {
             20,
             0.0001,
             "test",
-            &|_| {},
         );
 
         assert!(result.iterations_used > 0, "should complete at least 1 iteration");
@@ -943,7 +923,6 @@ mod tests {
             10,
             0.001,
             "test",
-            &|_| {},
         );
 
         let values =

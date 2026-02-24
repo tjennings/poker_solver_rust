@@ -851,14 +851,14 @@ fn run_solve_preflop(
                         BuildPhase::FlopProgress { flop_name, stage } => {
                             let mut bars = flop_bars.lock().unwrap();
                             match stage {
-                                FlopStage::Bucketing { step } => {
+                                FlopStage::Bucketing { step, total_steps } => {
                                     let bar = bars.entry(flop_name.clone()).or_insert_with(|| {
-                                        let b = multi.add(ProgressBar::new(6));
+                                        let b = multi.add(ProgressBar::new(u64::from(*total_steps)));
                                         b.set_style(bar_style.clone());
                                         b.enable_steady_tick(std::time::Duration::from_millis(500));
                                         b
                                     });
-                                    bar.set_length(6);
+                                    bar.set_length(u64::from(*total_steps));
                                     bar.set_position(u64::from(*step));
                                     bar.set_message(format!("Flop '{flop_name}' Bucketing"));
                                 }
@@ -899,6 +899,18 @@ fn run_solve_preflop(
                             phase_bar.set_message(format!(
                                 "Rebucketing ({round}/{total})..."
                             ));
+                        }
+                        BuildPhase::MccfrFlopsCompleted { completed, total } => {
+                            // Clear any remaining flop bucketing bars
+                            let mut bars = flop_bars.lock().unwrap();
+                            for (_, bar) in bars.drain() {
+                                bar.finish_and_clear();
+                                multi.remove(&bar);
+                            }
+                            phase_bar.set_style(bar_style.clone());
+                            phase_bar.set_length(*total as u64);
+                            phase_bar.set_position(*completed as u64);
+                            phase_bar.set_message("MCCFR Solving");
                         }
                         _ => {
                             phase_bar.set_style(spinner_style.clone());

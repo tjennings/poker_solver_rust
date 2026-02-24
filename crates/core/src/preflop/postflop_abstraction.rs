@@ -254,7 +254,7 @@ pub enum FlopStage {
     /// Computing buckets, equity tables, transition matrices.
     /// `step` counts completed sub-steps (0..6): flop buckets, flop equity,
     /// turn buckets, turn equity, river buckets, river equity.
-    Bucketing { step: u8 },
+    Bucketing { step: u8, total_steps: u8 },
     /// CFR solve in progress.
     Solving {
         iteration: usize,
@@ -279,13 +279,15 @@ pub enum BuildPhase {
     Rebucketing(u16, u16),
     /// Computing value table from converged strategy.
     ComputingValues,
+    /// Aggregate progress for MCCFR: how many flops have completed solve + extraction.
+    MccfrFlopsCompleted { completed: usize, total: usize },
 }
 
 impl std::fmt::Display for BuildPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FlopProgress { flop_name, stage } => match stage {
-                FlopStage::Bucketing { step } => write!(f, "Flop '{flop_name}' Bucketing ({step}/6)"),
+                FlopStage::Bucketing { step, total_steps } => write!(f, "Flop '{flop_name}' Bucketing ({step}/{total_steps})"),
                 FlopStage::Solving { iteration, max_iterations, delta } =>
                     write!(f, "Flop '{flop_name}' CFR \u{03b4}={delta:.4} ({iteration}/{max_iterations})"),
                 FlopStage::Done => write!(f, "Flop '{flop_name}' Done"),
@@ -293,6 +295,7 @@ impl std::fmt::Display for BuildPhase {
             Self::ExtractingEv(done, total) => write!(f, "EV histograms ({done}/{total})"),
             Self::Rebucketing(round, total) => write!(f, "Rebucketing ({round}/{total})"),
             Self::ComputingValues => write!(f, "Computing values"),
+            Self::MccfrFlopsCompleted { completed, total } => write!(f, "MCCFR Solving ({completed}/{total} flops)"),
         }
     }
 }
@@ -755,7 +758,7 @@ mod tests {
 
         let bucketing = BuildPhase::FlopProgress {
             flop_name: "AhKd7s".to_string(),
-            stage: FlopStage::Bucketing { step: 0 },
+            stage: FlopStage::Bucketing { step: 0, total_steps: 6 },
         };
         assert!(format!("{bucketing}").contains("Bucketing"));
 
