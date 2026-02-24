@@ -154,13 +154,15 @@ impl BucketingResult {
         turn_boards: &[[Card; 4]],
         river_boards: &[[Card; 5]],
         rollout_fraction: f64,
-        on_progress: impl Fn(usize, usize),
+        on_progress: impl Fn(usize, usize) + Sync,
     ) -> StreetEquity {
         let num_flops = self.buckets.flop.len();
         let total_steps = num_flops + 2; // flops + turn + river
 
-        // Per-flop bucket equity
+        // Per-flop bucket equity (parallel)
+        let flop_done = AtomicUsize::new(0);
         let flop: Vec<BucketEquity> = (0..num_flops)
+            .into_par_iter()
             .map(|flop_idx| {
                 let eq = compute_pairwise_bucket_equity(
                     hands,
@@ -170,7 +172,8 @@ impl BucketingResult {
                     1, // one board per flop solve
                     rollout_fraction,
                 );
-                on_progress(flop_idx + 1, total_steps);
+                let done = flop_done.fetch_add(1, Ordering::Relaxed) + 1;
+                on_progress(done, total_steps);
                 eq
             })
             .collect();
