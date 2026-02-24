@@ -254,7 +254,9 @@ pub enum PostflopAbstractionError {
 #[derive(Debug, Clone)]
 pub enum FlopStage {
     /// Computing buckets, equity tables, transition matrices.
-    Bucketing,
+    /// `step` counts completed sub-steps (0..6): flop buckets, flop equity,
+    /// turn buckets, turn equity, river buckets, river equity.
+    Bucketing { step: u8 },
     /// CFR solve in progress.
     Solving {
         iteration: usize,
@@ -285,7 +287,7 @@ impl std::fmt::Display for BuildPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FlopProgress { flop_name, stage } => match stage {
-                FlopStage::Bucketing => write!(f, "Flop '{flop_name}' Bucketing"),
+                FlopStage::Bucketing { step } => write!(f, "Flop '{flop_name}' Bucketing ({step}/6)"),
                 FlopStage::Solving { iteration, max_iterations, delta } =>
                     write!(f, "Flop '{flop_name}' CFR \u{03b4}={delta:.4} ({iteration}/{max_iterations})"),
                 FlopStage::Done => write!(f, "Flop '{flop_name}' Done"),
@@ -354,7 +356,7 @@ impl PostflopAbstraction {
                 let flop_name = format!("{}{}{}", flops[flop_idx][0], flops[flop_idx][1], flops[flop_idx][2]);
                 on_progress(BuildPhase::FlopProgress {
                     flop_name: flop_name.clone(),
-                    stage: FlopStage::Bucketing,
+                    stage: FlopStage::Bucketing { step: 0 },
                 });
                 let flop_data = hand_buckets::process_single_flop(
                     &hands,
@@ -364,6 +366,12 @@ impl PostflopAbstraction {
                     config.num_hand_buckets_river,
                     config.equity_rollout_fraction,
                     None, // first round: cluster from scratch
+                    &|step| {
+                        on_progress(BuildPhase::FlopProgress {
+                            flop_name: flop_name.clone(),
+                            stage: FlopStage::Bucketing { step },
+                        });
+                    },
                 );
                 let flop_buckets = flop_data.flop_buckets.clone();
                 let values = stream_solve_and_extract_one_flop(
@@ -434,7 +442,7 @@ impl PostflopAbstraction {
                     let flop_name = format!("{}{}{}", flops[flop_idx][0], flops[flop_idx][1], flops[flop_idx][2]);
                     on_progress(BuildPhase::FlopProgress {
                         flop_name: flop_name.clone(),
-                        stage: FlopStage::Bucketing,
+                        stage: FlopStage::Bucketing { step: 0 },
                     });
                     let flop_data = hand_buckets::process_single_flop(
                         &hands,
@@ -444,6 +452,12 @@ impl PostflopAbstraction {
                         config.num_hand_buckets_river,
                         config.equity_rollout_fraction,
                         Some(&buckets.flop[flop_idx]), // use reclustered assignments
+                        &|step| {
+                            on_progress(BuildPhase::FlopProgress {
+                                flop_name: flop_name.clone(),
+                                stage: FlopStage::Bucketing { step },
+                            });
+                        },
                     );
                     let fb = flop_data.flop_buckets.clone();
                     let vals = stream_solve_and_extract_one_flop(
@@ -1460,7 +1474,7 @@ mod tests {
 
         let bucketing = BuildPhase::FlopProgress {
             flop_name: "AhKd7s".to_string(),
-            stage: FlopStage::Bucketing,
+            stage: FlopStage::Bucketing { step: 0 },
         };
         assert!(format!("{bucketing}").contains("Bucketing"));
 

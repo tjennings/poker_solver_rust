@@ -1068,6 +1068,7 @@ pub fn process_single_flop(
     num_river_buckets: u16,
     rollout_fraction: f64,
     override_flop_buckets: Option<&[u16]>,
+    on_step: &dyn Fn(u8),
 ) -> SingleFlopAbstraction {
     let num_hands = hands.len();
     let nfb = num_flop_buckets as usize;
@@ -1093,6 +1094,8 @@ pub fn process_single_flop(
         cluster_histograms(&flop_features, num_flop_buckets)
     };
 
+    on_step(1); // flop buckets done
+
     // Flop pairwise equity
     let flop_equity = compute_pairwise_bucket_equity(
         hands,
@@ -1102,6 +1105,7 @@ pub fn process_single_flop(
         1,
         rollout_fraction,
     );
+    on_step(2); // flop equity done
 
     // --- Turn buckets ---
     let flop_set: Vec<Card> = flop.to_vec();
@@ -1117,6 +1121,7 @@ pub fn process_single_flop(
 
     let turn_features = compute_turn_histograms(hands, &turn_boards, &|_| {});
     let turn_assignments = cluster_histograms(&turn_features, num_turn_buckets);
+    on_step(3); // turn buckets done
 
     // Turn pairwise equity
     let turn_board_refs: Vec<&[Card]> = turn_boards.iter().map(AsRef::as_ref).collect();
@@ -1128,6 +1133,7 @@ pub fn process_single_flop(
         turn_boards.len(),
         1.0,
     );
+    on_step(4); // turn equity done
 
     // --- River buckets ---
     let river_turn_samples = 10usize;
@@ -1153,6 +1159,7 @@ pub fn process_single_flop(
 
     let river_equities_raw = compute_river_equities(hands, &river_boards, &|_| {});
     let river_assignments = cluster_river_equities(&river_equities_raw, num_river_buckets);
+    on_step(5); // river buckets done
 
     // River pairwise equity
     let river_board_refs: Vec<&[Card]> = river_boards.iter().map(AsRef::as_ref).collect();
@@ -1164,6 +1171,7 @@ pub fn process_single_flop(
         river_boards.len(),
         1.0,
     );
+    on_step(6); // river equity done
 
     // --- Transition matrices ---
     // Flop → Turn

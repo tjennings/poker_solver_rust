@@ -851,13 +851,15 @@ fn run_solve_preflop(
                         BuildPhase::FlopProgress { flop_name, stage } => {
                             let mut bars = flop_bars.lock().unwrap();
                             match stage {
-                                FlopStage::Bucketing => {
+                                FlopStage::Bucketing { step } => {
                                     let bar = bars.entry(flop_name.clone()).or_insert_with(|| {
-                                        let b = multi.add(ProgressBar::new_spinner());
-                                        b.set_style(spinner_style.clone());
+                                        let b = multi.add(ProgressBar::new(6));
+                                        b.set_style(bar_style.clone());
                                         b.enable_steady_tick(std::time::Duration::from_millis(500));
                                         b
                                     });
+                                    bar.set_length(6);
+                                    bar.set_position(u64::from(*step));
                                     bar.set_message(format!("Flop '{flop_name}' Bucketing"));
                                 }
                                 FlopStage::Solving { iteration, max_iterations, delta } => {
