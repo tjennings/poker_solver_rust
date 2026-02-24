@@ -7,11 +7,13 @@ mod tree;
 use std::error::Error;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use poker_solver_core::Game;
 use poker_solver_core::HandClass;
 use poker_solver_core::abstract_game::{self, AbstractDealConfig};
@@ -831,9 +833,13 @@ fn run_solve_preflop(
                 .template("{spinner:.green} {msg}")
                 .expect("valid template");
 
-            let pf_pb = ProgressBar::new(169);
-            pf_pb.set_style(bar_style.clone());
-            pf_pb.set_message("Hand buckets");
+            let multi = MultiProgress::new();
+            let phase_bar = multi.add(ProgressBar::new(169));
+            phase_bar.set_style(bar_style.clone());
+            phase_bar.set_message("Hand buckets");
+            let flop_bars: Arc<Mutex<HashMap<String, ProgressBar>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+
             let pf_start = Instant::now();
             let abstraction = PostflopAbstraction::build(
                 pf_config,
@@ -842,30 +848,68 @@ fn run_solve_preflop(
                 |phase| {
                     match &phase {
                         BuildPhase::HandBuckets(done, total) => {
-                            pf_pb.set_style(bar_style.clone());
-                            pf_pb.set_length(*total as u64);
-                            pf_pb.set_position(*done as u64);
-                            pf_pb.set_message("Hand buckets");
+                            phase_bar.set_style(bar_style.clone());
+                            phase_bar.set_length(*total as u64);
+                            phase_bar.set_position(*done as u64);
+                            phase_bar.set_message("Hand buckets");
                         }
-                        BuildPhase::SolvingPostflop { iteration, max_iterations, flop_name, .. } => {
-                            if *iteration <= 1 {
-                                pf_pb.reset_eta();
+                        BuildPhase::SolvingPostflop {
+                            round,
+                            total_rounds,
+                            flop_name,
+                            iteration,
+                            max_iterations,
+                            delta,
+                        } => {
+                            let mut bars = flop_bars.lock().unwrap();
+                            let bar =
+                                bars.entry(flop_name.clone()).or_insert_with(|| {
+                                    let b = multi
+                                        .add(ProgressBar::new(*max_iterations as u64));
+                                    b.set_style(bar_style.clone());
+                                    b
+                                });
+                            bar.set_length(*max_iterations as u64);
+                            bar.set_position(*iteration as u64);
+                            bar.set_message(format!(
+                                "[{round}/{total_rounds}] Flop '{flop_name}' \u{03b4}={delta:.4}"
+                            ));
+                        }
+                        BuildPhase::ExtractingEv(done, total) => {
+                            // Clear flop bars, show extraction progress.
+                            let mut bars = flop_bars.lock().unwrap();
+                            for (_, bar) in bars.drain() {
+                                bar.finish_and_clear();
                             }
-                            pf_pb.set_style(bar_style.clone());
-                            pf_pb.set_length(*max_iterations as u64);
-                            pf_pb.set_position(*iteration as u64);
-                            pf_pb.set_message(format!("Solving {flop_name}"));
+                            phase_bar.set_style(bar_style.clone());
+                            phase_bar.set_length(*total as u64);
+                            phase_bar.set_position(*done as u64);
+                            phase_bar.set_message("EV histograms");
+                        }
+                        BuildPhase::Rebucketing(round, total) => {
+                            phase_bar.set_style(spinner_style.clone());
+                            phase_bar.set_message(format!(
+                                "Rebucketing ({round}/{total})..."
+                            ));
                         }
                         _ => {
-                            pf_pb.set_style(spinner_style.clone());
-                            pf_pb.set_message(format!("{phase}..."));
+                            phase_bar.set_style(spinner_style.clone());
+                            phase_bar.set_message(format!("{phase}..."));
                         }
                     }
                 },
             )
             .map_err(|e| format!("postflop abstraction: {e}"))?;
-            pf_pb.set_style(bar_style);
-            pf_pb.finish_with_message(format!(
+
+            // Clean up any remaining flop bars.
+            {
+                let mut bars = flop_bars.lock().unwrap();
+                for (_, bar) in bars.drain() {
+                    bar.finish_and_clear();
+                }
+            }
+            phase_bar.set_style(bar_style);
+            phase_bar.finish_with_message(format!(
                 "done in {:.1?} (values: {} entries)",
                 pf_start.elapsed(),
                 abstraction.values.len(),
