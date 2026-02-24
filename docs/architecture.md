@@ -210,19 +210,22 @@ At each preflop showdown terminal:
 
 | Parameter | Default | Presets (fast/med/std/acc) | Description |
 |-|-|-|-|
+| `solve_type` | bucketed | — | Postflop backend: `bucketed` or `mccfr` |
 | `num_hand_buckets_flop` | 20 | 10/15/20/30 | Per-flop k-means clusters (169 hands per flop) |
-| `num_hand_buckets_turn` | 500 | 50/200/500/1000 | Per-flop turn k-means clusters |
-| `num_hand_buckets_river` | 500 | 50/200/500/1000 | Per-flop river k-means clusters |
+| `num_hand_buckets_turn` | 500 | 50/200/500/1000 | Per-flop turn k-means clusters (bucketed only) |
+| `num_hand_buckets_river` | 500 | 50/200/500/1000 | Per-flop river k-means clusters (bucketed only) |
 | `bet_sizes` | [0.5, 1.0] | — | Pot-fraction bet sizes |
 | `max_raises_per_street` | 1 | — | Raise cap per postflop street |
 | `postflop_sprs` | [3.5] | — | SPR(s) for shared postflop tree (scalar or list) |
-| `postflop_solve_iterations` | 200 | — | MCCFR iterations per flop |
-| `postflop_solve_samples` | 0 | — | Bucket pairs per iteration (0 = all) |
+| `postflop_solve_iterations` | 200 | — | CFR/MCCFR iterations per flop |
+| `postflop_solve_samples` | 0 | — | Bucket pairs per iteration; 0 = all (bucketed only) |
+| `max_flop_boards` | 0 | 10/200/0/0 | Max canonical flops for EHS features; 0 = all ~1,755 |
+| `fixed_flops` | none | — | Explicit flop boards (overrides `max_flop_boards`) |
+| `equity_rollout_fraction` | 1.0 | — | Fraction of runouts per hand pair; 1.0 = exact (bucketed only) |
 | `rebucket_rounds` | 1 | — | EV rebucketing rounds (1 = EHS only, 2+ = EV rebucketing) |
 | `cfr_delta_threshold` | 0.001 | — | Max strategy delta for early CFR stopping |
-| `solve_type` | bucketed | — | Postflop backend: `bucketed` or `mccfr` |
-| `mccfr_sample_pct` | 0.01 | — | Fraction of deal space sampled per MCCFR iteration |
-| `value_extraction_samples` | 10,000 | — | Monte Carlo samples for post-convergence EV extraction |
+| `mccfr_sample_pct` | 0.01 | — | Fraction of deal space per MCCFR iteration (MCCFR only) |
+| `value_extraction_samples` | 10,000 | — | Monte Carlo samples for EV extraction (MCCFR only) |
 
 ## Caching
 

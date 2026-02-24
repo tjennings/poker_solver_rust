@@ -208,30 +208,47 @@ exploration: 0.05
 
 # Postflop model (optional; omit for raw equity)
 postflop_model:
+  # Backend selection: "bucketed" (default) or "mccfr"
+  solve_type: bucketed
+
+  # Hand abstraction (EHS k-means)
   num_hand_buckets_flop: 20       # per-flop buckets (169 hands clustered per flop)
   num_hand_buckets_turn: 200
   num_hand_buckets_river: 200
+
+  # Flop board selection
+  max_flop_boards: 0              # 0 = all ~1,755 canonical flops; lower = faster bucketing
+  # fixed_flops: ['AhKsQd']      # explicit flops (overrides max_flop_boards)
+
+  # Tree structure
   bet_sizes: [0.5, 1.0, 2.0]
   max_raises_per_street: 1
   postflop_sprs: [3.5]            # SPR(s) for shared postflop tree (scalar also accepted)
+
+  # Bucketed CFR solve parameters
   postflop_solve_iterations: 1000
-  postflop_solve_samples: 100000
+  postflop_solve_samples: 100000  # bucket pairs per iteration (0 = all)
   equity_rollout_fraction: 1.0    # 1.0=exhaustive, 0.1=sample 10% of runouts per hand pair on flop
+
   # EV rebucketing (default: 1 = EHS only)
   # rebucket_rounds: 2
   # cfr_delta_threshold: 0.001
+
+  # MCCFR-specific (only when solve_type: mccfr)
+  # mccfr_sample_pct: 0.01         # fraction of deal space sampled per iteration
+  # value_extraction_samples: 10000 # Monte Carlo samples for post-convergence EV extraction
 ```
 
 ### Postflop Model Presets
 
-| Preset | Flop buckets (per-flop) | Turn/River buckets (per-flop) | Max flop boards | Use case |
-|-|-|-|-|-|
-| `fast` | 10 | 50/50 | 10 | Quick testing (~3 min) |
-| `medium` | 15 | 200/200 | 200 | Development iteration (~10 min) |
-| `standard` | 20 | 500/500 | all (~1,755) | Production training |
-| `accurate` | 30 | 1000/1000 | all (~1,755) | High-fidelity analysis |
-| `mccfr_fast` | 10 | — (concrete eval) | 10 | Quick MCCFR testing |
-| `mccfr_standard` | 30 | — (concrete eval) | all (~1,755) | Balanced MCCFR |
+| Preset | Backend | Flop buckets | Turn/River | Max boards | Sample % | Use case |
+|-|-|-|-|-|-|-|
+| `fast` | bucketed | 10 | 50/50 | 10 | — | Quick testing (~3 min) |
+| `medium` | bucketed | 15 | 200/200 | 200 | — | Development (~10 min) |
+| `standard` | bucketed | 20 | 500/500 | all | — | Production training |
+| `accurate` | bucketed | 30 | 1000/1000 | all | — | High-fidelity analysis |
+| `mccfr_fast` | mccfr | 10 | — | 10 | 5% | Quick MCCFR testing |
+| `mccfr_standard` | mccfr | 30 | — | all | 1% | Balanced MCCFR |
 
 The `max_flop_boards` parameter controls how many canonical flop textures are used for EHS feature computation during hand bucketing. Lower values dramatically speed up the bucketing phase. Set to `0` (or omit) to use all ~1,755 canonical flops. Configurable in YAML via `max_flop_boards: 200`.
 
@@ -239,20 +256,50 @@ The `equity_rollout_fraction` parameter controls how bucket-pair equity is compu
 
 The `rebucket_rounds` parameter controls EV-based postflop rebucketing. With the default value of `1`, only EHS equity histograms are used (standard behavior). With `2` or more, the solver runs an additional loop: solve all flops, extract per-hand EV histograms from the converged strategy, re-cluster flop buckets on EV features, and re-solve. Each CFR solve uses early stopping when max strategy delta drops below `cfr_delta_threshold` (default 0.001). The `postflop_sprs` field accepts a scalar or list of SPR values for the shared postflop tree (replaces `postflop_spr`; scalar values are auto-wrapped for backward compatibility).
 
+### Postflop Model Parameters
+
+| Parameter | Default | Type | Description |
+|-|-|-|-|
+| `solve_type` | `bucketed` | string | Postflop backend: `bucketed` (per-street bucket CFR) or `mccfr` (concrete hand eval) |
+| `num_hand_buckets_flop` | 20 | u16 | Per-flop k-means clusters (169 hands clustered per flop) |
+| `num_hand_buckets_turn` | 500 | u16 | Per-flop turn k-means clusters (bucketed only) |
+| `num_hand_buckets_river` | 500 | u16 | Per-flop river k-means clusters (bucketed only) |
+| `bet_sizes` | [0.5, 1.0] | [f32] | Pot-fraction bet sizes for postflop tree |
+| `max_raises_per_street` | 1 | u8 | Raise cap per postflop street |
+| `postflop_sprs` | [3.5] | [f64] | SPR(s) for shared postflop tree (scalar or list) |
+| `postflop_solve_iterations` | 200 | u32 | CFR/MCCFR iterations per flop |
+| `postflop_solve_samples` | 0 | u32 | Bucket pairs per iteration; 0 = all (bucketed only) |
+| `max_flop_boards` | 0 | usize | Max canonical flops for EHS features; 0 = all ~1,755 |
+| `fixed_flops` | none | [string] | Explicit flop boards (overrides `max_flop_boards`) |
+| `equity_rollout_fraction` | 1.0 | f64 | Fraction of runouts per hand pair; 1.0 = exact (bucketed only) |
+| `rebucket_rounds` | 1 | u16 | EV rebucketing rounds; 1 = EHS only, 2+ = EV rebucketing |
+| `cfr_delta_threshold` | 0.001 | f64 | Max strategy delta for early CFR stopping |
+| `mccfr_sample_pct` | 0.01 | f64 | Fraction of deal space sampled per iteration (MCCFR only) |
+| `value_extraction_samples` | 10,000 | u32 | Monte Carlo samples for post-convergence EV extraction (MCCFR only) |
+
 ### MCCFR Backend
 
-The MCCFR backend uses concrete hand evaluation instead of bucket transitions:
+The MCCFR backend (`solve_type: mccfr`) uses concrete hand evaluation instead of abstract bucket transitions between streets. It expands canonical hands to actual card pairs, samples random deals (hero_hand, opp_hand, turn, river), and evaluates showdowns using `rank_hand()` on the actual 5-card board. Only flop buckets are needed — no turn/river bucket abstraction.
 
 ```yaml
 postflop_model:
   solve_type: mccfr
-  num_hand_buckets_flop: 30
-  mccfr_sample_pct: 0.01
-  value_extraction_samples: 10000
+  num_hand_buckets_flop: 30        # flop buckets (turn/river buckets ignored)
+  mccfr_sample_pct: 0.01          # 1% of deal space per iteration
+  value_extraction_samples: 10000  # Monte Carlo samples for EV extraction
   postflop_solve_iterations: 500
+  postflop_spr: 3.5
+  bet_sizes: [0.5, 1.0]
 ```
 
-Presets: `mccfr_fast` (10 buckets, quick testing) and `mccfr_standard` (30 buckets, balanced).
+Key differences from bucketed:
+- **No turn/river buckets**: `num_hand_buckets_turn` and `num_hand_buckets_river` are ignored
+- **No transition matrices**: deals are sampled directly with concrete cards
+- **Real showdown eval**: uses 7-card hand ranking instead of bucket equity tables
+- **`mccfr_sample_pct`**: controls sampling density per iteration (higher = slower but more accurate)
+- **`value_extraction_samples`**: Monte Carlo samples for post-convergence EV extraction
+
+Presets: `mccfr_fast` (10 buckets, 5% sampling, quick testing) and `mccfr_standard` (30 buckets, 1% sampling, balanced).
 
 ---
 
