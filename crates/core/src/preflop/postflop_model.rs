@@ -45,6 +45,10 @@ fn default_cfr_delta_threshold() -> f64 {
     0.001
 }
 
+fn default_solve_type() -> PostflopSolveType { PostflopSolveType::Bucketed }
+fn default_mccfr_sample_pct() -> f64 { 0.01 }
+fn default_value_extraction_samples() -> u32 { 10_000 }
+
 /// Deserialize either a scalar `f64` or a `Vec<f64>` into `Vec<f64>`.
 /// Supports backward-compatible YAML: `postflop_spr: 4.0` → `vec![4.0]`.
 fn deserialize_sprs<'de, D>(deserializer: D) -> Result<Vec<f64>, D::Error>
@@ -67,6 +71,16 @@ where
             }
         }
     }
+}
+
+/// Selects the postflop solve backend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PostflopSolveType {
+    /// Per-street bucket CFR with transition matrices (default).
+    Bucketed,
+    /// Flop-only imperfect recall with sampled hands and real showdown eval.
+    Mccfr,
 }
 
 /// Configuration for the postflop model integrated into the preflop solver.
@@ -131,6 +145,20 @@ pub struct PostflopModelConfig {
     /// Turn and river equity is always exact regardless of this setting.
     #[serde(default = "default_equity_rollout_fraction", alias = "equity_rollout_samples")]
     pub equity_rollout_fraction: f64,
+
+    /// Selects the postflop solve backend.
+    #[serde(default = "default_solve_type")]
+    pub solve_type: PostflopSolveType,
+
+    /// Fraction of total (hand_pair × turn × river) sample space per flop.
+    /// Only used when solve_type is Mccfr. Default: 0.01 (1%).
+    #[serde(default = "default_mccfr_sample_pct")]
+    pub mccfr_sample_pct: f64,
+
+    /// Number of Monte Carlo samples for post-convergence value extraction.
+    /// Only used when solve_type is Mccfr. Default: 10,000.
+    #[serde(default = "default_value_extraction_samples")]
+    pub value_extraction_samples: u32,
 }
 
 impl PostflopModelConfig {
@@ -176,6 +204,9 @@ impl PostflopModelConfig {
             max_flop_boards: 0,
             fixed_flops: None,
             equity_rollout_fraction: 1.0,
+            solve_type: PostflopSolveType::Bucketed,
+            mccfr_sample_pct: 0.01,
+            value_extraction_samples: 10_000,
         }
     }
 
@@ -394,5 +425,27 @@ fixed_flops:
         let yaml = "num_hand_buckets_flop: 100";
         let cfg: PostflopModelConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.fixed_flops.is_none());
+    }
+
+    #[timed_test]
+    fn solve_type_defaults_to_bucketed() {
+        let cfg = PostflopModelConfig::standard();
+        assert_eq!(cfg.solve_type, PostflopSolveType::Bucketed);
+    }
+
+    #[timed_test]
+    fn solve_type_mccfr_deserializes() {
+        let yaml = "solve_type: mccfr\nmccfr_sample_pct: 0.05";
+        let cfg: PostflopModelConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.solve_type, PostflopSolveType::Mccfr);
+        assert!((cfg.mccfr_sample_pct - 0.05).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn solve_type_bucketed_round_trip() {
+        let cfg = PostflopModelConfig::standard();
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let restored: PostflopModelConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(cfg, restored);
     }
 }

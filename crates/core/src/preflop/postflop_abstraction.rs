@@ -110,15 +110,15 @@ pub(crate) struct PostflopLayout {
 }
 
 #[derive(Clone, Copy)]
-struct NodeEntry {
-    offset: usize,
-    num_actions: usize,
-    street: Street,
+pub(crate) struct NodeEntry {
+    pub(crate) offset: usize,
+    pub(crate) num_actions: usize,
+    pub(crate) street: Street,
 }
 
 impl PostflopLayout {
     /// Build the layout from a single postflop tree and bucket counts.
-    fn build(
+    pub(crate) fn build(
         tree: &PostflopTree,
         node_streets: &[Street],
         num_flop_buckets: usize,
@@ -190,7 +190,7 @@ impl PostflopLayout {
 }
 
 /// Number of hand buckets for a given street.
-fn buckets_for_street(
+pub(crate) fn buckets_for_street(
     street: Street,
     flop: usize,
     turn: usize,
@@ -207,13 +207,13 @@ fn buckets_for_street(
 ///
 /// Walks the tree from root, tracking the current street.
 /// Chance nodes transition to their `next_street` for their children.
-fn annotate_streets(tree: &PostflopTree) -> Vec<Street> {
+pub(crate) fn annotate_streets(tree: &PostflopTree) -> Vec<Street> {
     let mut streets = vec![Street::Flop; tree.nodes.len()];
     annotate_recursive(&tree.nodes, 0, Street::Flop, &mut streets);
     streets
 }
 
-fn annotate_recursive(
+pub(crate) fn annotate_recursive(
     nodes: &[PostflopNode],
     idx: u32,
     current_street: Street,
@@ -949,7 +949,7 @@ fn solve_traverse_opponent(
 }
 
 /// Element-wise `dst[i] += src[i]`.
-fn add_buffers(dst: &mut [f64], src: &[f64]) {
+pub(crate) fn add_buffers(dst: &mut [f64], src: &[f64]) {
     for (d, s) in dst.iter_mut().zip(src) {
         *d += *s;
     }
@@ -964,7 +964,7 @@ fn add_buffers(dst: &mut [f64], src: &[f64]) {
 /// Each (node, bucket) position is weighted by its total absolute regret mass,
 /// so frequently-reached positions with large regrets dominate the metric while
 /// rarely-reached positions with near-zero regrets are ignored.
-fn weighted_avg_strategy_delta(
+pub(crate) fn weighted_avg_strategy_delta(
     old_regrets: &[f64],
     new_regrets: &[f64],
     layout: &PostflopLayout,
@@ -1092,7 +1092,7 @@ fn eval_with_avg_strategy(
 }
 
 /// Normalize strategy sum into a probability distribution.
-fn normalize_strategy_sum(strategy_sum: &[f64], start: usize, num_actions: usize) -> Vec<f64> {
+pub(crate) fn normalize_strategy_sum(strategy_sum: &[f64], start: usize, num_actions: usize) -> Vec<f64> {
     let total: f64 = (0..num_actions)
         .map(|i| strategy_sum.get(start + i).copied().unwrap_or(0.0).max(0.0))
         .sum();
@@ -1111,7 +1111,7 @@ fn normalize_strategy_sum(strategy_sum: &[f64], start: usize, num_actions: usize
 // Shared helpers for CFR traversal and value evaluation
 // ──────────────────────────────────────────────────────────────────────────────
 
-const MAX_POSTFLOP_ACTIONS: usize = 8;
+pub(crate) const MAX_POSTFLOP_ACTIONS: usize = 8;
 
 /// Select the equity table for the given street.
 fn solve_equity_for_street<'a>(solve_eq: &'a SolveEquity<'a>, street: Street) -> &'a BucketEquity {
@@ -1122,7 +1122,7 @@ fn solve_equity_for_street<'a>(solve_eq: &'a SolveEquity<'a>, street: Street) ->
     }
 }
 
-fn postflop_terminal_value(
+pub(crate) fn postflop_terminal_value(
     terminal_type: PostflopTerminalType,
     pot_fraction: f64,
     hero_bucket: u16,
@@ -1147,7 +1147,7 @@ fn postflop_terminal_value(
 
 /// Regret matching: normalize positive regrets into a strategy.
 #[allow(clippy::cast_precision_loss)]
-fn regret_matching_into(regret_buf: &[f64], start: usize, out: &mut [f64]) {
+pub(crate) fn regret_matching_into(regret_buf: &[f64], start: usize, out: &mut [f64]) {
     let num_actions = out.len();
     let mut positive_sum = 0.0f64;
 

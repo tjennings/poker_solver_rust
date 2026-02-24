@@ -49,7 +49,7 @@ pub fn equity_bin(equity: f64, num_bins: u8) -> u8 {
 }
 
 /// Rank a hand (hole + board) using `rs_poker`.
-fn rank_hand(hole: [Card; 2], board: &[Card]) -> Rank {
+pub(crate) fn rank_hand(hole: [Card; 2], board: &[Card]) -> Rank {
     let mut hand = Hand::default();
     for &c in &hole {
         hand.insert(c);

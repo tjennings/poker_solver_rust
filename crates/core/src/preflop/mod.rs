@@ -16,7 +16,7 @@ pub mod tree;
 pub use bundle::PreflopBundle;
 pub use config::{PositionInfo, PreflopConfig};
 pub use equity::EquityTable;
-pub use postflop_model::PostflopModelConfig;
+pub use postflop_model::{PostflopModelConfig, PostflopSolveType};
 pub use postflop_tree::{
     PostflopAction, PostflopNode, PostflopTerminalType, PostflopTree, PostflopTreeError, PotType,
 };

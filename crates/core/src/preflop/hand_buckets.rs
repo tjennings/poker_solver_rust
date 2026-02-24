@@ -1217,7 +1217,7 @@ pub fn process_single_flop(
 }
 
 /// All 52 cards as a Vec (for board enumeration without a hole-card reference).
-fn all_cards_vec() -> Vec<Card> {
+pub(crate) fn all_cards_vec() -> Vec<Card> {
     use crate::poker::{Suit, Value};
     const VALUES: [Value; 13] = [
         Value::Two, Value::Three, Value::Four, Value::Five, Value::Six,
@@ -1233,7 +1233,7 @@ fn all_cards_vec() -> Vec<Card> {
 
 /// Cluster histogram features into k buckets using k-means with L2 on CDFs.
 #[allow(clippy::cast_precision_loss)]
-fn cluster_histograms(features: &[HistogramFeatures], k: u16) -> Vec<u16> {
+pub(crate) fn cluster_histograms(features: &[HistogramFeatures], k: u16) -> Vec<u16> {
     let valid_indices: Vec<usize> = features
         .iter()
         .enumerate()
@@ -1487,7 +1487,7 @@ fn avg_features_for_hand<const N: usize>(
 }
 
 /// Check whether any board card conflicts with the hole cards.
-fn board_conflicts<const N: usize>(hole: [Card; 2], board: &[Card; N]) -> bool {
+pub(crate) fn board_conflicts<const N: usize>(hole: [Card; 2], board: &[Card; N]) -> bool {
     board.iter().any(|c| *c == hole[0] || *c == hole[1])
 }
 
