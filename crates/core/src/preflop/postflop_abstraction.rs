@@ -1463,4 +1463,31 @@ mod tests {
         let abs = result.unwrap();
         assert!(!abs.values.is_empty());
     }
+
+    #[test]
+    #[ignore = "slow: builds full pipeline twice to verify rebucketing changes assignments"]
+    fn rebucketing_round_2_changes_flop_assignments() {
+        let mut config = PostflopModelConfig::fast();
+        config.rebucket_rounds = 1;
+        config.postflop_solve_iterations = 20;
+        config.max_flop_boards = 3;
+        let r1 = PostflopAbstraction::build(&config, None, None, |_| {}).unwrap();
+
+        config.rebucket_rounds = 2;
+        let r2 = PostflopAbstraction::build(&config, None, None, |_| {}).unwrap();
+
+        // Bucket assignments should differ after EV rebucketing
+        let mut any_different = false;
+        for flop_idx in 0..r1.buckets.flop.len() {
+            if r1.buckets.flop[flop_idx] != r2.buckets.flop[flop_idx] {
+                any_different = true;
+                break;
+            }
+        }
+        assert!(any_different, "rebucketing should produce different flop assignments");
+
+        // Turn and river should be unchanged (only flop is rebucketed)
+        assert_eq!(r1.buckets.turn, r2.buckets.turn, "turn buckets should be unchanged");
+        assert_eq!(r1.buckets.river, r2.buckets.river, "river buckets should be unchanged");
+    }
 }
