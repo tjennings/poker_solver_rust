@@ -1030,6 +1030,16 @@ fn run_solve_preflop(
                                         message: format!("Flop '{flop_name}' CFR \u{03b4}={delta:.4}"),
                                     });
                                 }
+                                FlopStage::EstimatingEv { sample, total_samples } => {
+                                    #[allow(clippy::cast_precision_loss)]
+                                    let key = 2.0 + *sample as f64 / (*total_samples).max(1) as f64;
+                                    fbs.states.insert(flop_name.clone(), FlopSlotData {
+                                        sort_key: key,
+                                        position: *sample as u64,
+                                        length: *total_samples as u64,
+                                        message: format!("Flop '{flop_name}' EV Estimation"),
+                                    });
+                                }
                                 FlopStage::Done => {
                                     fbs.states.remove(flop_name);
                                     // Refresh immediately so the finished flop disappears.

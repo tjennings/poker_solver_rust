@@ -173,6 +173,8 @@ pub(crate) fn build_mccfr(
                 flop,
                 config.value_extraction_samples as usize,
                 nfb,
+                &flop_name,
+                on_progress,
             );
 
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -536,6 +538,8 @@ fn mccfr_extract_values(
     flop: &[Card; 3],
     num_samples: usize,
     num_flop_buckets: usize,
+    flop_name: &str,
+    on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> Vec<f64> {
     let n = num_flop_buckets;
     let mut values = vec![0.0f64; 2 * n * n];
@@ -543,7 +547,17 @@ fn mccfr_extract_values(
 
     let mut rng = SmallRng::seed_from_u64(42);
 
-    for _ in 0..num_samples {
+    for sample_idx in 0..num_samples {
+        // Report progress every 1000 samples to avoid callback overhead.
+        if sample_idx % 1000 == 0 {
+            on_progress(BuildPhase::FlopProgress {
+                flop_name: flop_name.to_string(),
+                stage: FlopStage::EstimatingEv {
+                    sample: sample_idx,
+                    total_samples: num_samples,
+                },
+            });
+        }
         let Some((hb, ob, hero_hand, opp_hand, turn, river)) =
             sample_deal(bucket_map, flop, &mut rng)
         else {
@@ -954,7 +968,7 @@ mod tests {
         );
 
         let values =
-            mccfr_extract_values(&tree, &layout, &result.strategy_sum, &bucket_map, &flop, 500, nfb);
+            mccfr_extract_values(&tree, &layout, &result.strategy_sum, &bucket_map, &flop, 500, nfb, "test", &|_| {});
 
         assert_eq!(values.len(), 2 * nfb * nfb, "values should be 2*n*n");
         // All values should be finite
