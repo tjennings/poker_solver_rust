@@ -552,16 +552,9 @@ fn mccfr_extract_values(
     let convergence_threshold = 0.001;
 
     let mut final_sample = num_samples;
+    let mut current_max_delta = f64::INFINITY;
     for sample_idx in 0..num_samples {
         if sample_idx % 1000 == 0 {
-            on_progress(BuildPhase::FlopProgress {
-                flop_name: flop_name.to_string(),
-                stage: FlopStage::EstimatingEv {
-                    sample: sample_idx,
-                    total_samples: num_samples,
-                },
-            });
-
             // Check convergence: max change in any bucket pair's mean.
             if sample_idx >= min_samples {
                 let mut max_delta = 0.0f64;
@@ -572,11 +565,20 @@ fn mccfr_extract_values(
                         prev_means[i] = mean;
                     }
                 }
+                current_max_delta = max_delta;
                 if max_delta < convergence_threshold {
                     final_sample = sample_idx;
+                    on_progress(BuildPhase::FlopProgress {
+                        flop_name: flop_name.to_string(),
+                        stage: FlopStage::EstimatingEv {
+                            sample: sample_idx,
+                            total_samples: num_samples,
+                            max_delta: current_max_delta,
+                        },
+                    });
                     break;
                 }
-            } else {
+            } else if sample_idx > 0 {
                 // Snapshot current means for next comparison.
                 for (i, &sum) in values.iter().enumerate() {
                     if counts[i] > 0 {
@@ -584,6 +586,15 @@ fn mccfr_extract_values(
                     }
                 }
             }
+
+            on_progress(BuildPhase::FlopProgress {
+                flop_name: flop_name.to_string(),
+                stage: FlopStage::EstimatingEv {
+                    sample: sample_idx,
+                    total_samples: num_samples,
+                    max_delta: current_max_delta,
+                },
+            });
         }
 
         let Some((hb, ob, hero_hand, opp_hand, turn, river)) =
@@ -617,16 +628,6 @@ fn mccfr_extract_values(
         if counts[i] > 0 {
             *val /= f64::from(counts[i]);
         }
-    }
-
-    if final_sample < num_samples {
-        on_progress(BuildPhase::FlopProgress {
-            flop_name: flop_name.to_string(),
-            stage: FlopStage::EstimatingEv {
-                sample: final_sample,
-                total_samples: num_samples,
-            },
-        });
     }
 
     values
