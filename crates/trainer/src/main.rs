@@ -1201,18 +1201,19 @@ fn print_regret_sparkline(history: &[f64], height: usize) {
     if history.len() < 2 {
         return;
     }
-    let width = 60usize.min(history.len());
-    // Resample history to `width * 2` points (braille has 2 columns per cell).
+    let window = if history.len() > 100 { &history[history.len() - 100..] } else { history };
+    let width = 60usize.min(window.len());
+    // Resample window to `width * 2` points (braille has 2 columns per cell).
     let cols = width * 2;
     let rows = height * 4; // braille has 4 rows per cell
-    let n = history.len();
+    let n = window.len();
     let mut samples = Vec::with_capacity(cols);
     for i in 0..cols {
         let idx_f = i as f64 * (n - 1) as f64 / (cols - 1) as f64;
         let lo = idx_f as usize;
         let hi = (lo + 1).min(n - 1);
         let frac = idx_f - lo as f64;
-        samples.push(history[lo] * (1.0 - frac) + history[hi] * frac);
+        samples.push(window[lo] * (1.0 - frac) + window[hi] * frac);
     }
 
     let y_max = samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
