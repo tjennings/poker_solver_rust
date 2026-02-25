@@ -456,6 +456,39 @@ impl<G: Game> MccfrSolver<G> {
         &self.regret_sum
     }
 
+    /// Average positive regret per info-set-action per iteration.
+    ///
+    /// Sums `max(R[I][a], 0)` across all info sets and actions, then divides
+    /// by `iterations * total_entries`. Directly bounds exploitability:
+    /// as this metric -> 0, the average strategy -> Nash equilibrium.
+    #[must_use]
+    pub fn avg_positive_regret(&self) -> f64 {
+        if self.iterations == 0 {
+            return 0.0;
+        }
+
+        let mut total = 0.0;
+        let mut count = 0u64;
+
+        for regrets in self.regret_sum.values() {
+            for &r in regrets {
+                if r > 0.0 {
+                    total += r;
+                }
+                count += 1;
+            }
+        }
+
+        if count == 0 {
+            return 0.0;
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        {
+            total / count as f64 / self.iterations as f64
+        }
+    }
+
     /// Returns all info sets and their average strategies.
     #[must_use]
     pub fn all_strategies(&self) -> FxHashMap<u64, Vec<f64>> {

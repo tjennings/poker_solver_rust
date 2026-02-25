@@ -115,6 +115,32 @@ fn convergence_metrics_decrease_over_training() {
     );
 }
 
+#[test]
+fn avg_positive_regret_decreases_over_training() {
+    let game = KuhnPoker::new();
+    let mut solver = MccfrSolver::new(game);
+    solver.set_seed(42);
+
+    solver.train_full(200);
+    let early = solver.avg_positive_regret();
+
+    solver.train_full(19800);
+    let late = solver.avg_positive_regret();
+
+    assert!(early > 0.0, "early regret should be positive, got {early}");
+    assert!(
+        late < early,
+        "avg positive regret should decrease: early={early:.6}, late={late:.6}"
+    );
+}
+
+#[test]
+fn avg_positive_regret_zero_on_empty_solver() {
+    let game = KuhnPoker::new();
+    let solver = MccfrSolver::new(game);
+    assert!((solver.avg_positive_regret()).abs() < 1e-10);
+}
+
 /// Verify metrics return sensible values on an untrained solver.
 #[test]
 fn convergence_metrics_on_empty_solver() {
