@@ -285,7 +285,7 @@ impl PreflopSolver {
     /// inflation from DCFR's asymmetric positive/negative discounting.
     #[must_use]
     pub fn avg_positive_regret(&self) -> f64 {
-        if self.last_instantaneous_regret.is_empty() {
+        if self.iteration == 0 || self.last_instantaneous_regret.is_empty() {
             return 0.0;
         }
 
@@ -296,9 +296,11 @@ impl PreflopSolver {
             }
         }
 
+        // The traversal weights regret deltas by `iteration` (LCFR linear
+        // weighting), so divide it back out to get the unweighted regret.
         #[allow(clippy::cast_precision_loss)]
         {
-            total / self.last_instantaneous_regret.len() as f64
+            total / self.last_instantaneous_regret.len() as f64 / self.iteration as f64
         }
     }
 
