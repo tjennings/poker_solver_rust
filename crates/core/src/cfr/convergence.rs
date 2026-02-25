@@ -68,11 +68,12 @@ pub fn max_regret(regret_sum: &FxHashMap<u64, Vec<f64>>, iterations: u64) -> f64
     }
 }
 
-/// Mean regret per iteration across all info sets and actions.
+/// Mean positive regret per iteration across all info sets and actions.
 ///
-/// Smoother signal than max regret. With DCFR, cumulative regrets are
-/// bounded by discounting; dividing by iterations gives a decreasing
-/// convergence indicator.
+/// Sums only positive regrets (actions the player regrets not playing more),
+/// then divides by the total number of regret entries and the iteration count.
+/// This bounds exploitability: as avg positive regret → 0, strategy → Nash.
+///
 /// Returns 0.0 if the regret map is empty or iterations is 0.
 #[must_use]
 #[allow(clippy::implicit_hasher)]
@@ -86,7 +87,9 @@ pub fn avg_regret(regret_sum: &FxHashMap<u64, Vec<f64>>, iterations: u64) -> f64
 
     for regrets in regret_sum.values() {
         for &r in regrets {
-            total += r.abs();
+            if r > 0.0 {
+                total += r;
+            }
             count += 1;
         }
     }
@@ -202,7 +205,7 @@ mod tests {
     #[test]
     fn avg_regret_normalized() {
         let regrets = make_map(&[(1, vec![10.0, 30.0])]);
-        // mean abs = (10 + 30) / 2 = 20.0, iterations = 10 → 2.0
+        // positive sum = 10 + 30 = 40, count = 2 → 40/2 = 20.0, iterations = 10 → 2.0
         let result = avg_regret(&regrets, 10);
         assert!((result - 2.0).abs() < 1e-10, "expected 2.0, got {result}");
     }
@@ -210,7 +213,7 @@ mod tests {
     #[test]
     fn avg_regret_multiple_info_sets() {
         let regrets = make_map(&[(1, vec![20.0, 40.0]), (2, vec![0.0, 60.0])]);
-        // mean abs = (20 + 40 + 0 + 60) / 4 = 30.0, iterations = 10 → 3.0
+        // positive sum = 20 + 40 + 0 + 60 = 120, count = 4 → 120/4 = 30.0, iterations = 10 → 3.0
         let result = avg_regret(&regrets, 10);
         assert!((result - 3.0).abs() < 1e-10, "expected 3.0, got {result}");
     }
@@ -225,6 +228,19 @@ mod tests {
     fn avg_regret_empty_map() {
         let regrets: FxHashMap<u64, Vec<f64>> = FxHashMap::default();
         assert!((avg_regret(&regrets, 100)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn avg_regret_ignores_negative_regrets() {
+        let regrets = make_map(&[(1, vec![10.0, -50.0, 30.0])]);
+        // positive sum = 10 + 30 = 40, count = 3, iterations = 10
+        // result = 40 / 3 / 10 = 1.333...
+        let result = avg_regret(&regrets, 10);
+        let expected = 40.0 / 3.0 / 10.0;
+        assert!(
+            (result - expected).abs() < 1e-10,
+            "expected {expected}, got {result}"
+        );
     }
 
     #[test]
