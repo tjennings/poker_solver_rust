@@ -551,29 +551,36 @@ fn mccfr_extract_values(
     let min_samples = 2000usize.min(num_samples);
     let convergence_threshold = 0.001;
 
-    let mut final_sample = num_samples;
-    let mut current_max_delta = f64::INFINITY;
+    let mut current_avg_delta = f64::INFINITY;
     for sample_idx in 0..num_samples {
         if sample_idx % 1000 == 0 {
-            // Check convergence: max change in any bucket pair's mean.
+            // Check convergence: weighted-average change in bucket pair means.
+            // Weight by sample count so sparse cells don't dominate.
             if sample_idx >= min_samples {
-                let mut max_delta = 0.0f64;
+                let mut weighted_delta_sum = 0.0f64;
+                let mut weight_sum = 0u64;
                 for (i, &sum) in values.iter().enumerate() {
                     if counts[i] > 0 {
                         let mean = sum / f64::from(counts[i]);
-                        max_delta = max_delta.max((mean - prev_means[i]).abs());
+                        let delta = (mean - prev_means[i]).abs();
+                        weighted_delta_sum += delta * f64::from(counts[i]);
+                        weight_sum += u64::from(counts[i]);
                         prev_means[i] = mean;
                     }
                 }
-                current_max_delta = max_delta;
-                if max_delta < convergence_threshold {
-                    final_sample = sample_idx;
+                let avg_delta = if weight_sum > 0 {
+                    weighted_delta_sum / weight_sum as f64
+                } else {
+                    f64::INFINITY
+                };
+                current_avg_delta = avg_delta;
+                if avg_delta < convergence_threshold {
                     on_progress(BuildPhase::FlopProgress {
                         flop_name: flop_name.to_string(),
                         stage: FlopStage::EstimatingEv {
                             sample: sample_idx,
                             total_samples: num_samples,
-                            max_delta: current_max_delta,
+                            avg_delta: current_avg_delta,
                         },
                     });
                     break;
@@ -592,7 +599,7 @@ fn mccfr_extract_values(
                 stage: FlopStage::EstimatingEv {
                     sample: sample_idx,
                     total_samples: num_samples,
-                    max_delta: current_max_delta,
+                    avg_delta: current_avg_delta,
                 },
             });
         }
