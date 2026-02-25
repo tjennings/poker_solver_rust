@@ -1148,7 +1148,7 @@ fn run_solve_preflop(
             .progress_chars("#>-"),
     );
 
-    let chunk = std::cmp::max(iterations / 100, 1);
+    let chunk = if print_every > 0 { print_every } else { std::cmp::max(iterations / 100, 1) };
     let mut done = 0u64;
     let mut converged_early = false;
     while done < iterations {
