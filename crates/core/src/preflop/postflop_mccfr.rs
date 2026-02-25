@@ -173,6 +173,7 @@ pub(crate) fn build_mccfr(
                 flop,
                 config.value_extraction_samples as usize,
                 nfb,
+                config.ev_convergence_threshold,
                 &flop_name,
                 on_progress,
             );
@@ -538,6 +539,7 @@ fn mccfr_extract_values(
     flop: &[Card; 3],
     num_samples: usize,
     num_flop_buckets: usize,
+    convergence_threshold: f64,
     flop_name: &str,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> Vec<f64> {
@@ -549,7 +551,6 @@ fn mccfr_extract_values(
     let mut rng = SmallRng::seed_from_u64(42);
     // Need at least 2 checkpoints to measure convergence.
     let min_samples = 2000usize.min(num_samples);
-    let convergence_threshold = 0.001;
 
     let mut current_avg_delta = f64::INFINITY;
     for sample_idx in 0..num_samples {
@@ -779,6 +780,7 @@ mod tests {
             solve_type: super::super::postflop_model::PostflopSolveType::Mccfr,
             mccfr_sample_pct: 0.01,
             value_extraction_samples: 1000,
+            ev_convergence_threshold: 0.001,
         }
     }
 
@@ -1014,7 +1016,7 @@ mod tests {
         );
 
         let values =
-            mccfr_extract_values(&tree, &layout, &result.strategy_sum, &bucket_map, &flop, 500, nfb, "test", &|_| {});
+            mccfr_extract_values(&tree, &layout, &result.strategy_sum, &bucket_map, &flop, 500, nfb, 0.001, "test", &|_| {});
 
         assert_eq!(values.len(), 2 * nfb * nfb, "values should be 2*n*n");
         // All values should be finite
