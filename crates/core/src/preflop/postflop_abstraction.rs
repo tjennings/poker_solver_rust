@@ -184,16 +184,6 @@ impl PostflopLayout {
         self.entries[node_idx as usize].street
     }
 
-    /// Number of nodes in the layout.
-    pub(crate) fn num_nodes(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Get entry offset and `num_actions` for a node.
-    pub(crate) fn entry(&self, node_idx: usize) -> (usize, usize) {
-        let e = &self.entries[node_idx];
-        (e.offset, e.num_actions)
-    }
 }
 
 /// Number of hand buckets for a given street.
@@ -741,21 +731,6 @@ mod tests {
     fn avg_positive_regret_flat_empty() {
         assert!(avg_positive_regret_flat(&[], 10).abs() < 1e-10);
         assert!(avg_positive_regret_flat(&[5.0], 0).abs() < 1e-10);
-    }
-
-    #[timed_test]
-    fn layout_entry_accessor_matches_slot() {
-        let config = PostflopModelConfig::fast();
-        let tree = PostflopTree::build_with_spr(&config, 5.0).unwrap();
-        let streets = annotate_streets(&tree);
-        let layout = PostflopLayout::build(&tree, &streets, 10, 10, 10);
-
-        assert!(layout.num_nodes() > 0);
-        // First decision node's entry should match slot(0, 0).
-        let (entry_offset, entry_actions) = layout.entry(0);
-        let (slot_base, slot_actions) = layout.slot(0, 0);
-        assert_eq!(entry_offset, slot_base);
-        assert_eq!(entry_actions, slot_actions);
     }
 
     #[timed_test]
