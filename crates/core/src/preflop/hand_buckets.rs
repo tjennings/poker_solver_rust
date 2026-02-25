@@ -75,7 +75,7 @@ pub enum BuildProgress {
 /// - `flop[flop_idx][hand_idx]` → flop bucket ID
 /// - `turn[flop_idx][hand_idx * num_turn_boards_for_flop + turn_local_idx]` → turn bucket ID
 /// - `river[flop_idx][hand_idx * num_river_boards_for_flop + river_local_idx]` → river bucket ID
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StreetBuckets {
     /// `flop[flop_idx][hand_idx]` → flop bucket ID (per-flop independent buckets)
     pub flop: Vec<Vec<u16>>,

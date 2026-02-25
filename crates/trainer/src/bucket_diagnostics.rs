@@ -1,6 +1,6 @@
 //! Standalone EHS bucket diagnostic tool.
 //!
-//! Computes (or loads from cache) hand buckets for a postflop abstraction config,
+//! Computes hand buckets for a postflop abstraction config,
 //! runs 8 quality checks, and prints a pass/fail report.
 
 use std::path::Path;
@@ -8,10 +8,10 @@ use std::path::Path;
 use poker_solver_core::hands::{CanonicalHand, all_hands};
 use poker_solver_core::preflop::hand_buckets::{
     BucketEquity, StreetBuckets, StreetEquity, build_street_buckets_independent,
-    compute_all_flop_features, bucket_ehs_centroids, compute_transition_matrices,
+    compute_all_flop_features, bucket_ehs_centroids,
 };
 use poker_solver_core::preflop::postflop_model::PostflopModelConfig;
-use poker_solver_core::preflop::{abstraction_cache, ehs::EhsFeatures};
+use poker_solver_core::preflop::ehs::EhsFeatures;
 
 /// Status of a single diagnostic check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,15 +90,9 @@ pub fn run(config: &PostflopModelConfig, cache_dir: &Path, json: bool) -> bool {
 
 fn load_or_build(
     config: &PostflopModelConfig,
-    cache_base: &Path,
+    _cache_base: &Path,
 ) -> (StreetBuckets, StreetEquity) {
-    let key = abstraction_cache::cache_key(config, false);
-    if let Some((buckets, equity, _transitions)) = abstraction_cache::load(cache_base, &key) {
-        eprintln!("Cache hit: {}", abstraction_cache::cache_dir(cache_base, &key).display());
-        return (buckets, equity);
-    }
-
-    eprintln!("Cache miss — building independent per-street buckets...");
+    eprintln!("Building independent per-street buckets...");
     let hands: Vec<CanonicalHand> = all_hands().collect();
     let flops = if let Some(ref names) = config.fixed_flops {
         poker_solver_core::preflop::ehs::parse_flops(names)
@@ -117,17 +111,7 @@ fn load_or_build(
     );
 
     let street_equity = result.compute_street_equity();
-    let transitions = compute_transition_matrices(
-        &result.buckets,
-        config.num_hand_buckets_flop,
-        config.num_hand_buckets_turn,
-        config.num_hand_buckets_river,
-    );
     let buckets = result.buckets;
-
-    if let Err(e) = abstraction_cache::save(cache_base, &key, &buckets, &street_equity, &transitions) {
-        eprintln!("Warning: failed to save cache: {e}");
-    }
 
     (buckets, street_equity)
 }

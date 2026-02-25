@@ -38,6 +38,27 @@ Options:
 - `--postflop-model <PRESET>` -- Postflop model preset: fast, medium, standard, accurate, mccfr_fast, mccfr_standard
 - `--print-every <N>` -- Print strategy matrices every N iterations (0=only at end)
 
+### solve-postflop
+
+Build a postflop abstraction and save it as a reusable bundle. Use `postflop_model_path` in preflop training configs to load a pre-built bundle instead of rebuilding each time.
+
+```bash
+# Build a postflop bundle from a training config
+cargo run -p poker-solver-trainer --release -- solve-postflop \
+  -c sample_configurations/preflop_medium.yaml -o postflop_models/medium
+
+# Then reference it in preflop training:
+# postflop_model_path: postflop_models/medium
+```
+
+Options:
+- `-c, --config <FILE>` -- YAML config file (reads the `postflop_model` section)
+- `-o, --output <DIR>` -- Output directory for the postflop bundle
+
+The bundle directory contains:
+- `config.yaml` -- Human-readable `PostflopModelConfig`
+- `solve.bin` -- Bincode-serialized buckets, values, flops, and SPR
+
 ### train
 
 Run MCCFR/sequence/GPU training for the postflop HUNL game.
@@ -206,7 +227,10 @@ dcfr_beta: 0.5
 dcfr_gamma: 2.0
 exploration: 0.05
 
-# Postflop model (optional; omit for raw equity)
+# Postflop model: either inline config or pre-built bundle path
+# Option A: reference a pre-built bundle (skips postflop build)
+# postflop_model_path: postflop_models/medium
+# Option B: build inline (existing behavior)
 postflop_model:
   # Backend selection: "bucketed" (default) or "mccfr"
   solve_type: bucketed

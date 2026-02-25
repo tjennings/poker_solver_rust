@@ -24,6 +24,9 @@ use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree};
 use crate::abstraction::Street;
 use crate::poker::Card;
 
+/// Number of canonical hole-card pairs (169).
+pub const NUM_CANONICAL_HANDS: usize = 169;
+
 /// All precomputed postflop data needed by the preflop solver.
 pub struct PostflopAbstraction {
     /// Flop bucket assignments (per-flop, needed at runtime).
@@ -36,6 +39,12 @@ pub struct PostflopAbstraction {
     pub tree: PostflopTree,
     /// Precomputed EV table from solved postflop game.
     pub values: PostflopValues,
+    /// Hand-averaged EV: `hand_avg_values[hero_pos * 169 * 169 + hero_hand * 169 + opp_hand]`.
+    ///
+    /// Precomputed average of `values.get_by_flop` across all flops for each
+    /// `(hero_pos, hero_hand, opp_hand)` triple. This turns O(num_flops) showdown
+    /// lookups into O(1) during preflop solving.
+    pub hand_avg_values: Vec<f64>,
     /// The fixed SPR used for all postflop solves.
     pub spr: f64,
     /// The flop boards used to build this abstraction (for diagnostics/display).
@@ -354,12 +363,15 @@ impl PostflopAbstraction {
 
         on_progress(BuildPhase::ComputingValues);
 
+        let hand_avg_values = compute_hand_avg_values(&buckets, &values);
+
         Ok(Self {
             buckets,
             street_equity: None,
             transitions: None,
             tree,
             values,
+            hand_avg_values,
             spr: config.primary_spr(),
             flops,
         })
@@ -378,6 +390,7 @@ impl PostflopAbstraction {
         street_equity: Option<StreetEquity>,
         transitions: Option<TransitionMatrices>,
         values: PostflopValues,
+        hand_avg_values: Vec<f64>,
         flops: Vec<[Card; 3]>,
     ) -> Result<Self, PostflopAbstractionError> {
         let tree = PostflopTree::build_with_spr(config, config.primary_spr())?;
@@ -387,10 +400,79 @@ impl PostflopAbstraction {
             transitions,
             tree,
             values,
+            hand_avg_values,
             spr: config.primary_spr(),
             flops,
         })
     }
+
+    /// Look up precomputed hand-averaged postflop EV.
+    ///
+    /// Returns the average EV fraction across all flops for the given
+    /// `(hero_pos, hero_hand, opp_hand)` triple. O(1).
+    #[inline]
+    #[must_use]
+    pub fn avg_ev(&self, hero_pos: u8, hero_hand: usize, opp_hand: usize) -> f64 {
+        let n = self.num_avg_hands();
+        let idx = (hero_pos as usize) * n * n + hero_hand * n + opp_hand;
+        self.hand_avg_values.get(idx).copied().unwrap_or(0.0)
+    }
+
+    /// Number of hands in the hand-averaged value table (169 in production).
+    #[inline]
+    fn num_avg_hands(&self) -> usize {
+        // Table is 2 * n * n, so n = isqrt(len / 2)
+        let half = self.hand_avg_values.len() / 2;
+        if half == 0 { return 0; }
+        let n = (half as f64).sqrt() as usize;
+        debug_assert_eq!(n * n, half, "hand_avg_values has unexpected size");
+        n
+    }
+}
+
+/// Precompute hand-averaged postflop EV for all `(hero_pos, hero_hand, opp_hand)` triples.
+///
+/// Averages `values.get_by_flop(flop_idx, pos, hb, ob)` across all flops for each
+/// canonical hand pair. Returns a flat `Vec<f64>` of size `2 × N × N` where
+/// N = number of hands in the bucket table (169 in production).
+/// Parallelized across hero hands with rayon.
+#[allow(clippy::cast_precision_loss)]
+pub fn compute_hand_avg_values(buckets: &StreetBuckets, values: &PostflopValues) -> Vec<f64> {
+    use rayon::prelude::*;
+
+    let num_flops = buckets.num_flop_boards();
+    let num_hands = if num_flops > 0 { buckets.flop[0].len() } else { 0 };
+    let inv_flops = if num_flops > 0 { 1.0 / num_flops as f64 } else { 0.0 };
+
+    // Allocate output: [pos0: N×N, pos1: N×N]
+    let mut out = vec![0.0f64; 2 * num_hands * num_hands];
+
+    // Parallel over hero_hand — each writes to a disjoint slice per position.
+    let chunks: Vec<(usize, Vec<f64>)> = (0..num_hands)
+        .into_par_iter()
+        .map(|hero_hand| {
+            let mut local = vec![0.0f64; 2 * num_hands];
+            for flop_idx in 0..num_flops {
+                let hb = buckets.flop_bucket_for_hand(hero_hand, flop_idx);
+                for opp_hand in 0..num_hands {
+                    let ob = buckets.flop_bucket_for_hand(opp_hand, flop_idx);
+                    local[opp_hand] += values.get_by_flop(flop_idx, 0, hb, ob);
+                    local[num_hands + opp_hand] += values.get_by_flop(flop_idx, 1, hb, ob);
+                }
+            }
+            (hero_hand, local)
+        })
+        .collect();
+
+    let n = num_hands;
+    for (hero_hand, local) in chunks {
+        for opp_hand in 0..n {
+            out[hero_hand * n + opp_hand] = local[opp_hand] * inv_flops;
+            out[n * n + hero_hand * n + opp_hand] = local[n + opp_hand] * inv_flops;
+        }
+    }
+
+    out
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

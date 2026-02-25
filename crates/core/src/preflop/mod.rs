@@ -1,4 +1,3 @@
-pub mod abstraction_cache;
 pub mod equity_cache;
 mod fnv;
 pub mod bundle;
@@ -7,6 +6,7 @@ pub mod ehs;
 pub mod equity;
 pub mod hand_buckets;
 pub mod postflop_abstraction;
+pub mod postflop_bundle;
 pub(crate) mod postflop_bucketed;
 pub(crate) mod postflop_mccfr;
 pub mod postflop_model;
@@ -18,6 +18,7 @@ pub mod tree;
 pub use bundle::PreflopBundle;
 pub use config::{PositionInfo, PreflopConfig};
 pub use equity::EquityTable;
+pub use postflop_bundle::PostflopBundle;
 pub use postflop_model::{PostflopModelConfig, PostflopSolveType};
 pub use postflop_tree::{
     PostflopAction, PostflopNode, PostflopTerminalType, PostflopTree, PostflopTreeError, PotType,

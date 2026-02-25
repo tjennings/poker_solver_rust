@@ -227,16 +227,18 @@ At each preflop showdown terminal:
 | `mccfr_sample_pct` | 0.01 | — | Fraction of deal space per MCCFR iteration (MCCFR only) |
 | `value_extraction_samples` | 10,000 | — | Monte Carlo samples for EV extraction (MCCFR only) |
 
-## Caching
+## Caching & Bundles
 
 | Cache | Key | Stores | Status |
 |-|-|-|-|
 | `solve_cache` | config hash + equity flag | `PostflopValues` | Active |
-| `abstraction_cache` | config hash + equity flag | `StreetBuckets` + `StreetEquity` + `TransitionMatrices` | Disabled (pending StreetBuckets format migration) |
+| `PostflopBundle` | directory path | `PostflopModelConfig` + `StreetBuckets` + `PostflopValues` + flops + SPR | Active |
 
 **Files:**
-- `crates/core/src/preflop/abstraction_cache.rs`
 - `crates/core/src/preflop/solve_cache.rs`
+- `crates/core/src/preflop/postflop_bundle.rs`
+
+**Postflop bundles:** Build a postflop abstraction once with `solve-postflop`, then reference the bundle directory via `postflop_model_path` in training configs to skip the expensive rebuild.
 
 
 ### MCCFR Postflop Backend

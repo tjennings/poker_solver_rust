@@ -650,16 +650,8 @@ fn postflop_showdown_value(
     let ip_player = pot_type.default_ip_player();
     let hero_tree_pos = u8::from(hero_pos == ip_player);
 
-    // Average postflop EV across all flop boards with per-flop bucket lookup.
-    let num_flops = pf_state.abstraction.buckets.num_flop_boards();
-    let mut ev_sum = 0.0;
-    for flop_idx in 0..num_flops {
-        let hb = pf_state.abstraction.buckets.flop_bucket_for_hand(hero_hand as usize, flop_idx);
-        let ob = pf_state.abstraction.buckets.flop_bucket_for_hand(opp_hand as usize, flop_idx);
-        ev_sum += pf_state.abstraction.values.get_by_flop(flop_idx, hero_tree_pos, hb, ob);
-    }
-    #[allow(clippy::cast_precision_loss)]
-    let pf_ev_frac = ev_sum / num_flops as f64;
+    // O(1) lookup into precomputed hand-averaged EV table.
+    let pf_ev_frac = pf_state.abstraction.avg_ev(hero_tree_pos, hero_hand as usize, opp_hand as usize);
 
     // Scale: postflop EV fraction × actual pot size, offset by hero's investment.
     pf_ev_frac * f64::from(pot) + (f64::from(pot) / 2.0 - hero_inv)

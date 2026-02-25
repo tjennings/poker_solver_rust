@@ -35,7 +35,8 @@ use poker_solver_core::info_key::{
     spr_bucket,
 };
 use poker_solver_core::preflop::{
-    EquityTable, PostflopModelConfig, PreflopBundle, PreflopConfig, PreflopSolver, PreflopTree,
+    EquityTable, PostflopBundle, PostflopModelConfig, PreflopBundle, PreflopConfig, PreflopSolver,
+    PreflopTree,
 };
 use poker_solver_core::preflop::postflop_abstraction::{BuildPhase, FlopStage, PostflopAbstraction};
 use rustc_hash::FxHashMap;
@@ -235,6 +236,15 @@ enum Commands {
         /// Overrides any postflop_model in the config file.
         #[arg(long)]
         postflop_model: Option<String>,
+    },
+    /// Build a postflop abstraction and save it as a reusable bundle
+    SolvePostflop {
+        /// YAML config file (same format as solve-preflop, reads postflop_model section)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Output directory for the postflop bundle
+        #[arg(short, long)]
+        output: PathBuf,
     },
     /// Run EHS bucket diagnostics on a postflop abstraction config
     DiagBuckets {
@@ -665,6 +675,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 postflop_model.as_deref(),
             )?;
         }
+        Commands::SolvePostflop { config, output } => {
+            run_solve_postflop(&config, &output)?;
+        }
         Commands::DiagBuckets { config, cache_dir, json } => {
             let yaml = std::fs::read_to_string(&config)?;
             let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
@@ -714,12 +727,82 @@ struct PreflopTrainingConfig {
     pub print_every: u64,
     #[serde(default = "default_convergence_threshold")]
     pub convergence_threshold: f64,
+    /// Path to a pre-built postflop bundle directory. When set, loads the bundle
+    /// instead of building the postflop abstraction from `postflop_model`.
+    #[serde(default)]
+    pub postflop_model_path: Option<PathBuf>,
 }
 
 fn default_iterations() -> u64 { 5000 }
 fn default_equity_samples() -> u32 { 20000 }
 fn default_print_every() -> u64 { 1000 }
 fn default_convergence_threshold() -> f64 { 0.0001 }
+
+// ---------------------------------------------------------------------------
+// Postflop bundle builder
+// ---------------------------------------------------------------------------
+
+fn run_solve_postflop(config_path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+    let yaml = std::fs::read_to_string(config_path)?;
+    let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
+    let pf_config = training
+        .game
+        .postflop_model
+        .ok_or("config file has no postflop_model section")?;
+
+    eprintln!("Building postflop abstraction...");
+
+    let bar_style = ProgressStyle::default_bar()
+        .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+        .expect("valid template")
+        .progress_chars("#>-");
+    let spinner_style = ProgressStyle::default_spinner()
+        .template("{spinner:.green} {msg}")
+        .expect("valid template");
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(spinner_style.clone());
+    pb.set_message("Postflop abstraction");
+    pb.enable_steady_tick(std::time::Duration::from_millis(500));
+
+    let pf_start = Instant::now();
+    let abstraction = PostflopAbstraction::build(&pf_config, None, None, |phase| {
+        match &phase {
+            BuildPhase::MccfrFlopsCompleted { completed, total } => {
+                pb.set_style(bar_style.clone());
+                pb.set_length(*total as u64);
+                pb.set_position(*completed as u64);
+                pb.set_message("MCCFR Solving");
+            }
+            BuildPhase::ExtractingEv(done, total) => {
+                pb.set_style(bar_style.clone());
+                pb.set_length(*total as u64);
+                pb.set_position(*done as u64);
+                pb.set_message("EV histograms");
+            }
+            _ => {
+                pb.set_style(spinner_style.clone());
+                pb.set_message(format!("{phase}..."));
+            }
+        }
+    })
+    .map_err(|e| format!("postflop abstraction: {e}"))?;
+
+    pb.finish_with_message(format!(
+        "done in {:.1?} (values: {} entries)",
+        pf_start.elapsed(),
+        abstraction.values.len(),
+    ));
+
+    let bundle = PostflopBundle::from_abstraction(&pf_config, &abstraction);
+    bundle.save(output)?;
+    eprintln!(
+        "Postflop bundle saved to {} (config.yaml + solve.bin)",
+        output.display()
+    );
+
+    Ok(())
+}
 
 #[allow(clippy::too_many_arguments)]
 fn run_solve_preflop(
@@ -750,6 +833,7 @@ fn run_solve_preflop(
             equity_samples: 20000,
             print_every: 1000,
             convergence_threshold: default_convergence_threshold(),
+            postflop_model_path: None,
         }
     };
 
@@ -762,6 +846,7 @@ fn run_solve_preflop(
             .ok_or_else(|| format!("unknown postflop preset: {preset} (use fast/medium/standard/accurate)"))?);
     }
 
+    let postflop_model_path = training.postflop_model_path.take();
     let config = training.game;
     let iterations = training.iterations;
     let equity_samples = training.equity_samples;
@@ -819,8 +904,24 @@ fn run_solve_preflop(
     let tree = PreflopTree::build(&config);
     let bb_node = lhe_viz::find_raise_child(&tree, 0);
 
-    // Build postflop abstraction before the solver takes equity ownership.
-    let postflop = if let Some(pf_config) = &config.postflop_model {
+    // Build or load postflop abstraction before the solver takes equity ownership.
+    let postflop = if let Some(bundle_path) = &postflop_model_path {
+        if config.postflop_model.is_some() {
+            eprintln!("Warning: both postflop_model_path and postflop_model are set; using postflop_model_path");
+        }
+        eprintln!("Loading postflop bundle from {}", bundle_path.display());
+        let pf_start = Instant::now();
+        let bundle = PostflopBundle::load(bundle_path)
+            .map_err(|e| format!("failed to load postflop bundle: {e}"))?;
+        let abstraction = bundle.into_abstraction()
+            .map_err(|e| format!("failed to reconstruct postflop abstraction: {e}"))?;
+        eprintln!(
+            "Postflop bundle loaded in {:.1?} (values: {} entries)",
+            pf_start.elapsed(),
+            abstraction.values.len(),
+        );
+        Some(abstraction)
+    } else if let Some(pf_config) = &config.postflop_model {
         use poker_solver_core::preflop::solve_cache;
 
         let has_eq = equity_samples > 0;
