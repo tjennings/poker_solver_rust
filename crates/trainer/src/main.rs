@@ -903,6 +903,7 @@ fn run_solve_preflop(
 
     let tree = PreflopTree::build(&config);
     let bb_node = lhe_viz::find_raise_child(&tree, 0);
+    let bb_call_node = lhe_viz::find_call_child(&tree, 0);
 
     // Build or load postflop abstraction before the solver takes equity ownership.
     let postflop = if let Some(bundle_path) = &postflop_model_path {
@@ -1138,7 +1139,7 @@ fn run_solve_preflop(
         solver.attach_postflop(abstraction, &config);
     }
 
-    print_preflop_matrices(&solver.strategy(), &tree, bb_node, 0);
+    print_preflop_matrices(&solver.strategy(), &tree, bb_node, bb_call_node, 0);
 
     let pb = ProgressBar::new(iterations);
     pb.set_style(
@@ -1161,7 +1162,7 @@ fn run_solve_preflop(
         if print_every > 0 && done < iterations && done.is_multiple_of(print_every) {
             let mut early_stop = false;
             pb.suspend(|| {
-                print_preflop_matrices(&solver.strategy(), &tree, bb_node, done);
+                print_preflop_matrices(&solver.strategy(), &tree, bb_node, bb_call_node, done);
                 let apr = solver.avg_positive_regret();
                 regret_history.push(apr);
                 println!("  Avg +regret: {apr:.6}");
@@ -1184,7 +1185,7 @@ fn run_solve_preflop(
     let label = if converged_early { "Converged" } else { "Finished" };
     println!("{label} in {elapsed:.1?} — {done} iterations, {} info sets", strategy.len());
 
-    print_preflop_matrices(&strategy, &tree, bb_node, done);
+    print_preflop_matrices(&strategy, &tree, bb_node, bb_call_node, done);
 
     let bundle = PreflopBundle::new(config, strategy);
     bundle.save(output)?;
@@ -1267,13 +1268,19 @@ fn print_regret_sparkline(history: &[f64], height: usize) {
 fn print_preflop_matrices(
     strategy: &poker_solver_core::preflop::PreflopStrategy,
     tree: &PreflopTree,
-    bb_node: Option<u32>,
+    bb_raise_node: Option<u32>,
+    bb_call_node: Option<u32>,
     iteration: u64,
 ) {
     let sb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, 0);
     lhe_viz::print_hand_matrix(&sb_matrix, &format!("SB RFI — iteration {iteration}"));
 
-    if let Some(bb_idx) = bb_node {
+    if let Some(bb_idx) = bb_call_node {
+        let bb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, bb_idx);
+        lhe_viz::print_hand_matrix(&bb_matrix, &format!("BB vs SB Call — iteration {iteration}"));
+    }
+
+    if let Some(bb_idx) = bb_raise_node {
         let bb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, bb_idx);
         lhe_viz::print_hand_matrix(&bb_matrix, &format!("BB vs Raise — iteration {iteration}"));
     }

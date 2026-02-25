@@ -582,6 +582,27 @@ fn uniform_strategy(actions: &[PreflopAction]) -> HandStrategy {
     HandStrategy { fold, raises }
 }
 
+/// Find the first Call child of a decision node.
+///
+/// Used to locate the BB response node after SB limps (calls) at the root.
+pub fn find_call_child(tree: &PreflopTree, node_idx: u32) -> Option<u32> {
+    match &tree.nodes[node_idx as usize] {
+        PreflopNode::Decision {
+            action_labels,
+            children,
+            ..
+        } => {
+            for (i, action) in action_labels.iter().enumerate() {
+                if matches!(action, PreflopAction::Call) {
+                    return Some(children[i]);
+                }
+            }
+            None
+        }
+        PreflopNode::Terminal { .. } => None,
+    }
+}
+
 /// Find the first Raise child of a decision node.
 ///
 /// Used to locate the BB response node after SB raises at the root.
