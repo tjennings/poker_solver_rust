@@ -161,6 +161,7 @@ pub(crate) fn build_mccfr(
                 samples_per_iter,
                 config.cfr_delta_threshold,
                 &flop_name,
+                on_progress,
             );
 
             // Step 5: Extract values
@@ -220,6 +221,7 @@ fn mccfr_solve_one_flop(
     samples_per_iter: usize,
     delta_threshold: f64,
     flop_name: &str,
+    on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> FlopSolveResult {
     let buf_size = layout.total_size;
     let mut regret_sum = vec![0.0f64; buf_size];
@@ -275,10 +277,24 @@ fn mccfr_solve_one_flop(
                 weighted_avg_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
         }
 
+        on_progress(BuildPhase::FlopProgress {
+            flop_name: flop_name.to_string(),
+            stage: FlopStage::Solving {
+                iteration: iterations_used,
+                max_iterations: num_iterations,
+                delta: final_delta,
+            },
+        });
+
         if iter >= 1 && final_delta < delta_threshold {
             break;
         }
     }
+
+    on_progress(BuildPhase::FlopProgress {
+        flop_name: flop_name.to_string(),
+        stage: FlopStage::Done,
+    });
 
     FlopSolveResult {
         strategy_sum,
@@ -903,6 +919,7 @@ mod tests {
             20,
             0.0001,
             "test",
+            &|_| {},
         );
 
         assert!(result.iterations_used > 0, "should complete at least 1 iteration");
@@ -933,6 +950,7 @@ mod tests {
             10,
             0.001,
             "test",
+            &|_| {},
         );
 
         let values =
