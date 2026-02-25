@@ -274,6 +274,29 @@ impl PreflopSolver {
         self.strategy_sum[start..start + num_actions].to_vec()
     }
 
+    /// Average positive regret per slot per iteration.
+    ///
+    /// Iterates the flat regret buffer, sums all positive values, divides by
+    /// `iteration * buffer_length`. Same metric as `MccfrSolver::avg_positive_regret`.
+    #[must_use]
+    pub fn avg_positive_regret(&self) -> f64 {
+        if self.iteration == 0 || self.regret_sum.is_empty() {
+            return 0.0;
+        }
+
+        let mut total = 0.0;
+        for &r in &self.regret_sum {
+            if r > 0.0 {
+                total += r;
+            }
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        {
+            total / self.regret_sum.len() as f64 / self.iteration as f64
+        }
+    }
+
     /// Compute DCFR strategy discount: `(t / (t + 1))^γ`.
     #[allow(clippy::cast_precision_loss)]
     fn strategy_discount(&self) -> f64 {
