@@ -19,12 +19,10 @@ fn convergence_metrics_decrease_over_training() {
     let checkpoint_iters = [200, 1000, 5000, 10000, 20000];
     let num_checkpoints = checkpoint_iters.len();
 
-    let mut deltas = Vec::new();
     let mut max_regrets = Vec::new();
     let mut avg_regrets = Vec::new();
     let mut entropies = Vec::new();
     let mut exploitabilities = Vec::new();
-    let mut prev_strategies = None;
 
     for (ckpt, &iters) in checkpoint_iters.iter().enumerate() {
         let already_trained = if ckpt == 0 {
@@ -44,35 +42,16 @@ fn convergence_metrics_decrease_over_training() {
         let entropy = convergence::strategy_entropy(&strategies);
         let exploit = calculate_exploitability(&game, &strategies);
 
-        if let Some(ref prev) = prev_strategies {
-            let delta = convergence::strategy_delta(prev, &strategies);
-            deltas.push(delta);
-        }
-
         max_regrets.push(max_r);
         avg_regrets.push(avg_r);
         entropies.push(entropy);
         exploitabilities.push(exploit);
-        prev_strategies = Some(strategies);
 
         eprintln!(
             "Checkpoint {} ({iters} iters): max_r={max_r:.4}, avg_r={avg_r:.4}, entropy={entropy:.4}, exploit={exploit:.6}",
             ckpt + 1
         );
     }
-
-    // Strategy delta should generally decrease (later checkpoints change less)
-    assert!(
-        deltas.len() >= 2,
-        "Need at least 2 deltas, got {}",
-        deltas.len()
-    );
-    assert!(
-        deltas.last().unwrap() < deltas.first().unwrap(),
-        "Strategy delta should decrease: first={:.6}, last={:.6}",
-        deltas.first().unwrap(),
-        deltas.last().unwrap()
-    );
 
     // Max regret/T should decrease (DCFR regret is bounded; dividing by T → 0)
     assert!(
@@ -113,6 +92,32 @@ fn convergence_metrics_decrease_over_training() {
         entropies[0],
         entropies[num_checkpoints - 1]
     );
+}
+
+#[test]
+fn avg_positive_regret_decreases_over_training() {
+    let game = KuhnPoker::new();
+    let mut solver = MccfrSolver::new(game);
+    solver.set_seed(42);
+
+    solver.train_full(200);
+    let early = solver.avg_positive_regret();
+
+    solver.train_full(19800);
+    let late = solver.avg_positive_regret();
+
+    assert!(early > 0.0, "early regret should be positive, got {early}");
+    assert!(
+        late < early,
+        "avg positive regret should decrease: early={early:.6}, late={late:.6}"
+    );
+}
+
+#[test]
+fn avg_positive_regret_zero_on_empty_solver() {
+    let game = KuhnPoker::new();
+    let solver = MccfrSolver::new(game);
+    assert!((solver.avg_positive_regret()).abs() < 1e-10);
 }
 
 /// Verify metrics return sensible values on an untrained solver.
