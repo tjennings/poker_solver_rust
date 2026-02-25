@@ -119,6 +119,15 @@ impl PostflopBundle {
         )
     }
 
+    /// Return a reference to the hand-averaged EV table.
+    ///
+    /// Layout: `[pos0: N×N, pos1: N×N]` where N = number of canonical hands (169).
+    /// Index: `pos * N * N + hero_hand * N + opp_hand`.
+    #[must_use]
+    pub fn hand_avg_values(&self) -> &[f64] {
+        &self.data.hand_avg_values
+    }
+
     /// Check whether a directory contains a complete bundle.
     #[must_use]
     pub fn exists(dir: &Path) -> bool {
@@ -199,6 +208,14 @@ mod tests {
         let abs = loaded.into_abstraction().unwrap();
         assert!((abs.spr - 3.5).abs() < 1e-9);
         assert!(!abs.hand_avg_values.is_empty());
+    }
+
+    #[timed_test]
+    fn hand_avg_values_getter() {
+        let bundle = minimal_bundle();
+        let vals = bundle.hand_avg_values();
+        assert!(!vals.is_empty());
+        assert_eq!(vals.len(), bundle.data.hand_avg_values.len());
     }
 
     #[timed_test]

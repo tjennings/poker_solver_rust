@@ -18,7 +18,7 @@ use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint::{AbstractionModeConfig, BundleConfig, StrategyBundle};
 use poker_solver_core::hand_class::{classify, intra_class_strength, HandClass};
 use poker_solver_core::hands::CanonicalHand;
-use poker_solver_core::info_key::{canonical_hand_index, cards_from_rank_chars, encode_hand_v2, spr_bucket, InfoKey};
+use poker_solver_core::info_key::{canonical_hand_index, canonical_hand_index_from_str, cards_from_rank_chars, encode_hand_v2, spr_bucket, InfoKey};
 use poker_solver_core::showdown_equity;
 use poker_solver_core::poker::{Card, Suit, Value};
 
@@ -71,6 +71,9 @@ enum StrategySource {
     PreflopSolve {
         config: poker_solver_core::preflop::PreflopConfig,
         strategy: poker_solver_core::preflop::PreflopStrategy,
+        /// Hand-averaged postflop EV table from the companion PostflopBundle, if present.
+        /// Layout: `[pos0: 169×169, pos1: 169×169]`.
+        hand_avg_values: Option<Vec<f64>>,
     },
     SubgameSolve {
         blueprint: Arc<poker_solver_core::blueprint::BlueprintStrategy>,
@@ -248,23 +251,39 @@ pub async fn load_bundle_core(
     } else if bundle_path.join("strategy.bin").exists() {
         // Preflop strategy bundle
         let bundle = tokio::task::spawn_blocking(move || {
-            poker_solver_core::preflop::PreflopBundle::load(&bundle_path)
-                .map_err(|e| format!("Failed to load preflop bundle: {e}"))
+            let bp = bundle_path.clone();
+            let preflop = poker_solver_core::preflop::PreflopBundle::load(&bp)
+                .map_err(|e| format!("Failed to load preflop bundle: {e}"))?;
+
+            // Try loading companion postflop bundle for hand equity data.
+            let postflop_dir = bp.join("postflop");
+            let hand_avg_values =
+                if poker_solver_core::preflop::PostflopBundle::exists(&postflop_dir) {
+                    poker_solver_core::preflop::PostflopBundle::load(&postflop_dir)
+                        .ok()
+                        .map(|b| b.hand_avg_values().to_vec())
+                } else {
+                    None
+                };
+
+            Ok::<_, String>((preflop, hand_avg_values))
         })
         .await
         .map_err(|e| format!("Load task panicked: {e}"))??;
 
+        let (preflop_bundle, hand_avg_values) = bundle;
         let info = BundleInfo {
             name: Some("Preflop Solve".into()),
-            stack_depth: bundle.config.stacks.first().copied().unwrap_or(0) / 2,
+            stack_depth: preflop_bundle.config.stacks.first().copied().unwrap_or(0) / 2,
             bet_sizes: vec![],
-            info_sets: bundle.strategy.len(),
+            info_sets: preflop_bundle.strategy.len(),
             iterations: 0,
             preflop_only: true,
         };
         let source = StrategySource::PreflopSolve {
-            config: bundle.config,
-            strategy: bundle.strategy,
+            config: preflop_bundle.config,
+            strategy: preflop_bundle.strategy,
+            hand_avg_values,
         };
         (info, source, None)
     } else {
@@ -311,25 +330,38 @@ pub async fn load_preflop_solve_core(
     path: String,
 ) -> Result<BundleInfo, String> {
     let bundle_path = PathBuf::from(&path);
-    let bundle = tokio::task::spawn_blocking(move || {
-        poker_solver_core::preflop::PreflopBundle::load(&bundle_path)
-            .map_err(|e| format!("Failed to load preflop bundle: {e}"))
+    let (preflop_bundle, hand_avg_values) = tokio::task::spawn_blocking(move || {
+        let preflop = poker_solver_core::preflop::PreflopBundle::load(&bundle_path)
+            .map_err(|e| format!("Failed to load preflop bundle: {e}"))?;
+
+        let postflop_dir = bundle_path.join("postflop");
+        let hand_avg_values =
+            if poker_solver_core::preflop::PostflopBundle::exists(&postflop_dir) {
+                poker_solver_core::preflop::PostflopBundle::load(&postflop_dir)
+                    .ok()
+                    .map(|b| b.hand_avg_values().to_vec())
+            } else {
+                None
+            };
+
+        Ok::<_, String>((preflop, hand_avg_values))
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))??;
 
     let info = BundleInfo {
         name: Some("Preflop Solve".into()),
-        stack_depth: bundle.config.stacks.first().copied().unwrap_or(0) / 2,
+        stack_depth: preflop_bundle.config.stacks.first().copied().unwrap_or(0) / 2,
         bet_sizes: vec![],
-        info_sets: bundle.strategy.len(),
+        info_sets: preflop_bundle.strategy.len(),
         iterations: 0,
         preflop_only: true,
     };
 
     *state.source.write() = Some(StrategySource::PreflopSolve {
-        config: bundle.config,
-        strategy: bundle.strategy,
+        config: preflop_bundle.config,
+        strategy: preflop_bundle.strategy,
+        hand_avg_values,
     });
 
     Ok(info)
@@ -376,6 +408,7 @@ pub async fn solve_preflop_live_core(
     *state.source.write() = Some(StrategySource::PreflopSolve {
         config,
         strategy,
+        hand_avg_values: None,
     });
 
     Ok(info)
@@ -456,7 +489,7 @@ pub fn get_strategy_matrix_core(
             get_strategy_matrix_bundle(config, blueprint, state, &position, thresh, &sh)
         }
         StrategySource::Agent(agent) => get_strategy_matrix_agent(agent, &position),
-        StrategySource::PreflopSolve { config, strategy } => {
+        StrategySource::PreflopSolve { config, strategy, .. } => {
             get_strategy_matrix_preflop(config, strategy, &position)
         }
         StrategySource::SubgameSolve {
@@ -991,7 +1024,7 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
             iterations: 0,
             preflop_only: false,
         },
-        StrategySource::PreflopSolve { config, strategy } => BundleInfo {
+        StrategySource::PreflopSolve { config, strategy, .. } => BundleInfo {
             name: Some("Preflop Solve".to_string()),
             stack_depth: config.stacks.first().copied().unwrap_or(0) / 2,
             bet_sizes: vec![],
@@ -1018,6 +1051,73 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
 #[tauri::command]
 pub fn get_bundle_info(state: State<'_, ExplorationState>) -> Result<BundleInfo, String> {
     get_bundle_info_core(&state)
+}
+
+/// Per-hand postflop equity data returned by `get_hand_equity`.
+#[derive(Debug, Clone, Serialize)]
+pub struct HandEquity {
+    /// Average postflop EV fraction when hero is position 0 (SB).
+    pub ev_pos0: f64,
+    /// Average postflop EV fraction when hero is position 1 (BB).
+    pub ev_pos1: f64,
+    /// Overall average across both positions.
+    pub ev_avg: f64,
+}
+
+/// Return the average postflop equity for a canonical hand (e.g. "AKs", "QQ", "72o").
+///
+/// Averages the hand-averaged EV across all opponents. Returns `None` if no
+/// postflop data is loaded or the hand string is unrecognised.
+pub fn get_hand_equity_core(
+    state: &ExplorationState,
+    hand: &str,
+) -> Result<Option<HandEquity>, String> {
+    let hand_index = match canonical_hand_index_from_str(hand) {
+        Some(idx) => idx as usize,
+        None => return Ok(None),
+    };
+
+    let source_guard = state.source.read();
+    let source = source_guard
+        .as_ref()
+        .ok_or_else(|| "No bundle loaded".to_string())?;
+
+    let hand_avg = match source {
+        StrategySource::PreflopSolve { hand_avg_values: Some(v), .. } => v,
+        _ => return Ok(None),
+    };
+
+    // Table layout: [pos0: N×N, pos1: N×N]
+    let half = hand_avg.len() / 2;
+    if half == 0 {
+        return Ok(None);
+    }
+    let n = (half as f64).sqrt() as usize;
+    if n == 0 || n * n != half || hand_index >= n {
+        return Ok(None);
+    }
+
+    // Average EV across all opponent hands for each position.
+    let avg_for_pos = |pos: usize| -> f64 {
+        let base = pos * n * n + hand_index * n;
+        let sum: f64 = hand_avg[base..base + n].iter().sum();
+        sum / n as f64
+    };
+
+    let ev_pos0 = avg_for_pos(0);
+    let ev_pos1 = avg_for_pos(1);
+    let ev_avg = (ev_pos0 + ev_pos1) / 2.0;
+
+    Ok(Some(HandEquity { ev_pos0, ev_pos1, ev_avg }))
+}
+
+/// Get postflop equity for a canonical hand (Tauri wrapper).
+#[tauri::command]
+pub fn get_hand_equity(
+    state: State<'_, ExplorationState>,
+    hand: String,
+) -> Result<Option<HandEquity>, String> {
+    get_hand_equity_core(&state, &hand)
 }
 
 /// Computation progress status.

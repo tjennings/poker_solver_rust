@@ -73,6 +73,13 @@ export interface ComboGroupInfo {
   stack_bucket: number;
 }
 
+// Hand equity from postflop bundle
+export interface HandEquity {
+  ev_pos0: number;
+  ev_pos1: number;
+  ev_avg: number;
+}
+
 // Board canonicalization result
 export interface CanonicalizeResult {
   canonical_cards: string[];

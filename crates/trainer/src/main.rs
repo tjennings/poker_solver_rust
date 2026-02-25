@@ -1123,6 +1123,16 @@ fn run_solve_preflop(
         None
     };
 
+    // Save postflop bundle into output/postflop/ before the abstraction is consumed.
+    if let Some(ref abstraction) = postflop {
+        if let Some(pf_config) = &config.postflop_model {
+            let pf_bundle = PostflopBundle::from_abstraction(pf_config, abstraction);
+            let pf_dir = output.join("postflop");
+            pf_bundle.save(&pf_dir)?;
+            eprintln!("Postflop bundle saved to {}", pf_dir.display());
+        }
+    }
+
     let mut solver = PreflopSolver::new_with_equity(&config, equity);
     if let Some(abstraction) = postflop {
         solver.attach_postflop(abstraction, &config);

@@ -105,3 +105,4 @@ The explorer uses these backend commands (available as Tauri commands or HTTP `P
 | `canonicalize_board` | Canonicalize board cards via suit isomorphism |
 | `list_agents` | List available agent TOML configs |
 | `get_combo_classes` | Get combo-level hand class breakdown for a cell |
+| `get_hand_equity` | Get avg postflop EV for a canonical hand (preflop bundles with postflop data) |
