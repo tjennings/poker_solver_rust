@@ -1,5 +1,10 @@
 # Rust Project Guidelines
 
+## Issue Tracking and Task management 
+
+**IMPORTANT**: before you do anything else, run the `beans prime` command and heed its output.
+
+
 ## Architecture
 
 See [`docs/architecture.md`](docs/architecture.md) for the full solver architecture: preflop LCFR solver, postflop imperfect-recall abstraction pipeline, key control parameters, and caching.
@@ -87,29 +92,6 @@ cd frontend && npm run dev              # Vite on :5173
 - Dev server: `crates/devserver/src/main.rs`
 - Invoke wrapper: `frontend/src/invoke.ts`
 - Core functions: `crates/tauri-app/src/exploration.rs` (`_core` suffix variants)
-
-## Issue Tracking (beads)
-
-Use `bd` for all task tracking. Do NOT use TodoWrite, TaskCreate, or markdown files.
-
-```bash
-bd ready                          # find unblocked work
-bd show <id>                      # review issue details
-bd update <id> --status=in_progress  # claim work
-bd close <id>                     # mark complete
-bd close <id1> <id2> ...          # close multiple at once
-bd sync                           # sync with git (run at session end)
-```
-
-**Creating issues:**
-```bash
-bd create --title="Summary" --description="Why and what" --type=task|bug|feature --priority=2
-bd dep add <issue> <depends-on>   # add dependency
-```
-
-Priority: 0-4 (0=critical, 4=backlog). Use `bd ready` to find available work, `bd blocked` to see blocked issues.
-
-**Session close checklist:** Always run `bd sync` before finishing, then commit and push.
 
 ## Git Workflow
 - Always use worktrees for implementing plans

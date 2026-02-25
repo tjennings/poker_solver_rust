@@ -12,7 +12,7 @@
 iterations: 1000000
 equity_samples: 10000
 print_every: 500
-regret_threshold: 0.0001
+regret_threshold: 0.1
 
 # ── Game structure ───────────────────────────────────────────────────────────
 
