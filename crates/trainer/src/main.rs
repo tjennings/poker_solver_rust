@@ -1151,6 +1151,7 @@ fn run_solve_preflop(
     let chunk = if print_every > 0 { print_every } else { std::cmp::max(iterations / 100, 1) };
     let mut done = 0u64;
     let mut converged_early = false;
+    let mut regret_history: Vec<f64> = Vec::new();
     while done < iterations {
         let batch = std::cmp::min(chunk, iterations - done);
         solver.train(batch);
@@ -1162,7 +1163,9 @@ fn run_solve_preflop(
             pb.suspend(|| {
                 print_preflop_matrices(&solver.strategy(), &tree, bb_node, done);
                 let apr = solver.avg_positive_regret();
+                regret_history.push(apr);
                 println!("  Avg +regret: {apr:.6}");
+                print_regret_sparkline(&regret_history, 10);
                 if apr < regret_threshold {
                     println!("Avg +regret {apr:.6} < {regret_threshold} — stopping early at iteration {done}");
                     early_stop = true;
@@ -1188,6 +1191,76 @@ fn run_solve_preflop(
     println!("Saved to {}", output.display());
 
     Ok(())
+}
+
+/// Print a small terminal chart of regret history (y=regret, x=iteration).
+///
+/// Uses Unicode braille characters for sub-cell resolution (2×4 dots per cell),
+/// giving effective resolution of `width*2 × height*4` pixels.
+fn print_regret_sparkline(history: &[f64], height: usize) {
+    if history.len() < 2 {
+        return;
+    }
+    let width = 60usize.min(history.len());
+    // Resample history to `width * 2` points (braille has 2 columns per cell).
+    let cols = width * 2;
+    let rows = height * 4; // braille has 4 rows per cell
+    let n = history.len();
+    let mut samples = Vec::with_capacity(cols);
+    for i in 0..cols {
+        let idx_f = i as f64 * (n - 1) as f64 / (cols - 1) as f64;
+        let lo = idx_f as usize;
+        let hi = (lo + 1).min(n - 1);
+        let frac = idx_f - lo as f64;
+        samples.push(history[lo] * (1.0 - frac) + history[hi] * frac);
+    }
+
+    let y_max = samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let y_min = samples.iter().cloned().fold(f64::INFINITY, f64::min);
+    let y_range = if (y_max - y_min).abs() < 1e-12 { 1.0 } else { y_max - y_min };
+
+    // Map each sample to a row (0 = bottom, rows-1 = top).
+    let mapped: Vec<usize> = samples
+        .iter()
+        .map(|&v| {
+            let norm = (v - y_min) / y_range;
+            ((norm * (rows - 1) as f64).round() as usize).min(rows - 1)
+        })
+        .collect();
+
+    // Braille base: U+2800. Dot positions in a 2×4 cell:
+    //   col0: rows 0-3 → bits 0,1,2,6
+    //   col1: rows 0-3 → bits 3,4,5,7
+    const DOT_MAP: [[u32; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+
+    // Build grid of braille cells.
+    let mut grid = vec![vec![0u32; width]; height];
+    for (col_idx, &row_val) in mapped.iter().enumerate() {
+        let cell_x = col_idx / 2;
+        let dot_x = col_idx % 2;
+        // row_val is from bottom; convert to cell coords.
+        let cell_y = height - 1 - row_val / 4;
+        let dot_y = 3 - (row_val % 4);
+        grid[cell_y][cell_x] |= DOT_MAP[dot_x][dot_y];
+    }
+
+    // Print with y-axis labels.
+    for row in 0..height {
+        let label = if row == 0 {
+            format!("{y_max:.1}")
+        } else if row == height - 1 {
+            format!("{y_min:.1}")
+        } else {
+            String::new()
+        };
+        let braille: String = grid[row]
+            .iter()
+            .map(|&bits| char::from_u32(0x2800 + bits).unwrap_or(' '))
+            .collect();
+        println!("  {label:>10} │{braille}");
+    }
+    // x-axis line
+    println!("  {:>10} └{}", "", "─".repeat(width));
 }
 
 fn print_preflop_matrices(
