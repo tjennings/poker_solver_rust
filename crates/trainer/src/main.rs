@@ -1032,6 +1032,9 @@ fn run_solve_preflop(
                                 }
                                 FlopStage::Done => {
                                     fbs.states.remove(flop_name);
+                                    // Refresh immediately so the finished flop disappears.
+                                    refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
+                                    fbs.last_refresh = Instant::now();
                                 }
                             }
                             if fbs.last_refresh.elapsed() >= std::time::Duration::from_secs(10) {
@@ -1060,14 +1063,9 @@ fn run_solve_preflop(
                             ));
                         }
                         BuildPhase::MccfrFlopsCompleted { completed, total } => {
-                            // Clear any remaining flop bucketing bars
-                            let mut guard = flop_state.lock().unwrap();
-                            let fbs = &mut *guard;
-                            fbs.states.clear();
-                            for bar in fbs.slots.drain(..) {
-                                bar.finish_and_clear();
-                                multi.remove(&bar);
-                            }
+                            // Update the main progress bar without clearing per-flop sub-bars.
+                            // Active flop bars are managed by FlopProgress events and the
+                            // periodic refresh_flop_slots timer.
                             phase_bar.set_style(bar_style.clone());
                             phase_bar.set_length(*total as u64);
                             phase_bar.set_position(*completed as u64);
