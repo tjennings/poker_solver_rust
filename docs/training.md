@@ -260,7 +260,8 @@ postflop_model:
 
   # MCCFR-specific (only when solve_type: mccfr)
   # mccfr_sample_pct: 0.01         # fraction of deal space sampled per iteration
-  # value_extraction_samples: 10000 # Monte Carlo samples for post-convergence EV extraction
+  # value_extraction_samples: 10000   # Monte Carlo samples for post-convergence EV extraction
+  # ev_convergence_threshold: 0.001   # weighted-avg delta threshold for early-stop EV estimation
 ```
 
 ### Postflop Model Presets
@@ -300,6 +301,7 @@ The `rebucket_rounds` parameter controls EV-based postflop rebucketing. With the
 | `cfr_delta_threshold` | 0.001 | f64 | Max strategy delta for early CFR stopping |
 | `mccfr_sample_pct` | 0.01 | f64 | Fraction of deal space sampled per iteration (MCCFR only) |
 | `value_extraction_samples` | 10,000 | u32 | Monte Carlo samples for post-convergence EV extraction (MCCFR only) |
+| `ev_convergence_threshold` | 0.001 | f64 | Weighted-avg delta threshold for early-stop EV estimation (MCCFR only) |
 
 ### MCCFR Backend
 
@@ -311,6 +313,7 @@ postflop_model:
   num_hand_buckets_flop: 30        # flop buckets (turn/river buckets ignored)
   mccfr_sample_pct: 0.01          # 1% of deal space per iteration
   value_extraction_samples: 10000  # Monte Carlo samples for EV extraction
+  ev_convergence_threshold: 0.001 # early-stop when weighted-avg delta drops below this
   postflop_solve_iterations: 500
   postflop_spr: 3.5
   bet_sizes: [0.5, 1.0]
@@ -322,6 +325,7 @@ Key differences from bucketed:
 - **Real showdown eval**: uses 7-card hand ranking instead of bucket equity tables
 - **`mccfr_sample_pct`**: controls sampling density per iteration (higher = slower but more accurate)
 - **`value_extraction_samples`**: Monte Carlo samples for post-convergence EV extraction
+- **`ev_convergence_threshold`**: weighted-average delta threshold for early-stopping EV estimation (default 0.001)
 
 Presets: `mccfr_fast` (10 buckets, 5% sampling, quick testing) and `mccfr_standard` (30 buckets, 1% sampling, balanced).
 
