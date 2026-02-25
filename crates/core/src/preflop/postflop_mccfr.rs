@@ -544,11 +544,15 @@ fn mccfr_extract_values(
     let n = num_flop_buckets;
     let mut values = vec![0.0f64; 2 * n * n];
     let mut counts = vec![0u32; 2 * n * n];
+    let mut prev_means = vec![0.0f64; 2 * n * n];
 
     let mut rng = SmallRng::seed_from_u64(42);
+    // Need at least 2 checkpoints to measure convergence.
+    let min_samples = 2000usize.min(num_samples);
+    let convergence_threshold = 0.001;
 
+    let mut final_sample = num_samples;
     for sample_idx in 0..num_samples {
-        // Report progress every 1000 samples to avoid callback overhead.
         if sample_idx % 1000 == 0 {
             on_progress(BuildPhase::FlopProgress {
                 flop_name: flop_name.to_string(),
@@ -557,7 +561,31 @@ fn mccfr_extract_values(
                     total_samples: num_samples,
                 },
             });
+
+            // Check convergence: max change in any bucket pair's mean.
+            if sample_idx >= min_samples {
+                let mut max_delta = 0.0f64;
+                for (i, &sum) in values.iter().enumerate() {
+                    if counts[i] > 0 {
+                        let mean = sum / f64::from(counts[i]);
+                        max_delta = max_delta.max((mean - prev_means[i]).abs());
+                        prev_means[i] = mean;
+                    }
+                }
+                if max_delta < convergence_threshold {
+                    final_sample = sample_idx;
+                    break;
+                }
+            } else {
+                // Snapshot current means for next comparison.
+                for (i, &sum) in values.iter().enumerate() {
+                    if counts[i] > 0 {
+                        prev_means[i] = sum / f64::from(counts[i]);
+                    }
+                }
+            }
         }
+
         let Some((hb, ob, hero_hand, opp_hand, turn, river)) =
             sample_deal(bucket_map, flop, &mut rng)
         else {
@@ -589,6 +617,16 @@ fn mccfr_extract_values(
         if counts[i] > 0 {
             *val /= f64::from(counts[i]);
         }
+    }
+
+    if final_sample < num_samples {
+        on_progress(BuildPhase::FlopProgress {
+            flop_name: flop_name.to_string(),
+            stage: FlopStage::EstimatingEv {
+                sample: final_sample,
+                total_samples: num_samples,
+            },
+        });
     }
 
     values
