@@ -144,10 +144,10 @@ pub struct PreflopSolver {
     /// Cumulative weighted strategy, flat buffer indexed by `layout.slot()`.
     strategy_sum: Vec<f64>,
     iteration: u64,
-    /// Effective iteration weight accounting for DCFR positive-regret discounting.
-    /// Each iteration: `weight = pos_factor * weight + 1.0`.
-    /// For vanilla CFR (no discounting), this equals `iteration`.
-    regret_discount_weight: f64,
+    /// Instantaneous regret from the most recent iteration's traversal.
+    /// Used for convergence metrics instead of cumulative regret sums,
+    /// which are unsuitable under DCFR's asymmetric discounting.
+    last_instantaneous_regret: Vec<f64>,
     /// DCFR positive regret discount exponent.
     dcfr_alpha: f64,
     /// DCFR negative regret discount exponent.
@@ -192,7 +192,7 @@ impl PreflopSolver {
             regret_sum: vec![0.0; buf_size],
             strategy_sum: vec![0.0; buf_size],
             iteration: 0,
-            regret_discount_weight: 0.0,
+            last_instantaneous_regret: Vec::new(),
             dcfr_alpha: config.dcfr_alpha,
             dcfr_beta: config.dcfr_beta,
             dcfr_gamma: config.dcfr_gamma,
@@ -279,18 +279,18 @@ impl PreflopSolver {
         self.strategy_sum[start..start + num_actions].to_vec()
     }
 
-    /// Average positive regret per slot per iteration.
+    /// Average positive instantaneous regret per slot.
     ///
-    /// Iterates the flat regret buffer, sums all positive values, divides by
-    /// `iteration * buffer_length`. Same metric as `MccfrSolver::avg_positive_regret`.
+    /// Uses the most recent iteration's regret (not cumulative sums) to avoid
+    /// inflation from DCFR's asymmetric positive/negative discounting.
     #[must_use]
     pub fn avg_positive_regret(&self) -> f64 {
-        if self.regret_discount_weight == 0.0 || self.regret_sum.is_empty() {
+        if self.last_instantaneous_regret.is_empty() {
             return 0.0;
         }
 
         let mut total = 0.0;
-        for &r in &self.regret_sum {
+        for &r in &self.last_instantaneous_regret {
             if r > 0.0 {
                 total += r;
             }
@@ -298,7 +298,7 @@ impl PreflopSolver {
 
         #[allow(clippy::cast_precision_loss)]
         {
-            total / self.regret_sum.len() as f64 / self.regret_discount_weight
+            total / self.last_instantaneous_regret.len() as f64
         }
     }
 
@@ -393,22 +393,17 @@ impl PreflopSolver {
         self.apply_discounting();
         add_into(&mut self.regret_sum, &mr);
         add_into(&mut self.strategy_sum, &ms);
+        self.last_instantaneous_regret = mr;
     }
 
     /// Apply DCFR discounting to both players' cumulative values.
-    #[allow(clippy::cast_precision_loss)]
     fn apply_discounting(&mut self) {
         if self.iteration > self.dcfr_warmup {
-            let t = (self.iteration + 1) as f64;
-            let pos_factor = t.powf(self.dcfr_alpha) / (t.powf(self.dcfr_alpha) + 1.0);
-            self.regret_discount_weight = pos_factor * self.regret_discount_weight + 1.0;
             let sd = self.strategy_discount();
             for pos in 0..2u8 {
                 self.discount_regrets(pos);
                 self.discount_strategy_sums(pos, sd);
             }
-        } else {
-            self.regret_discount_weight += 1.0;
         }
     }
 }
