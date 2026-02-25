@@ -39,9 +39,10 @@ raise_cap: 4
 # ── CFR variant ──────────────────────────────────────────────────────────────
 # "dcfr" (default): Discounted CFR with α/β/γ discounting + LCFR weighting.
 # "vanilla": Standard CFR — no discounting, uniform iteration weighting.
+# "cfrplus": CFR+ — regrets floored to zero, linear strategy weighting.
 cfr_variant: dcfr
 
-# ── DCFR discounting (ignored when cfr_variant is vanilla) ──────────────────
+# ── DCFR discounting (ignored when cfr_variant is vanilla or cfrplus) ───────
 
 dcfr_alpha: 1.5     # positive regret discount exponent
 dcfr_beta: 0.5      # negative regret discount exponent

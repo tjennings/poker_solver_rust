@@ -11,6 +11,8 @@ pub enum CfrVariant {
     /// Discounted CFR with α/β/γ discounting and linear (LCFR) iteration weighting.
     #[default]
     Dcfr,
+    /// CFR+ (Tammelin 2014): regrets floored to zero, linear strategy weighting.
+    CfrPlus,
 }
 
 fn default_exploration() -> f64 {
@@ -44,7 +46,7 @@ pub struct PreflopConfig {
     pub position_raise_sizes: Option<Vec<Vec<Vec<f64>>>>,
     /// Maximum number of raises allowed per round.
     pub raise_cap: u8,
-    /// CFR variant: `vanilla` (no discounting) or `dcfr` (default).
+    /// CFR variant: `vanilla`, `dcfr` (default), or `cfrplus`.
     #[serde(default)]
     pub cfr_variant: CfrVariant,
     /// DCFR positive regret discount exponent.
@@ -294,6 +296,29 @@ mod tests {
         "#;
         let config: PreflopConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.cfr_variant, CfrVariant::Dcfr);
+    }
+
+    #[timed_test]
+    fn cfr_variant_cfrplus_deserializes() {
+        let yaml = r#"
+            positions:
+              - name: SB
+                short_name: SB
+              - name: BB
+                short_name: BB
+            blinds: [[0, 1], [1, 2]]
+            antes: []
+            stacks: [200, 200]
+            raise_sizes: [[2.5]]
+            raise_cap: 4
+            cfr_variant: cfrplus
+            dcfr_alpha: 1.5
+            dcfr_beta: 0.5
+            dcfr_gamma: 2.0
+            dcfr_warmup: 0
+        "#;
+        let config: PreflopConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.cfr_variant, CfrVariant::CfrPlus);
     }
 
     #[timed_test]

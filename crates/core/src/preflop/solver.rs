@@ -1,8 +1,9 @@
 //! CFR solver for preflop game trees with alternating updates.
 //!
-//! Supports two variants via [`CfrVariant`]:
+//! Supports three variants via [`CfrVariant`]:
 //! - **Vanilla**: standard CFR with uniform iteration weighting and no discounting.
 //! - **DCFR**: discounted CFR with α/β/γ discounting and linear (LCFR) iteration weighting.
+//! - **CFR+**: regrets floored to zero each iteration, linear strategy weighting.
 //!
 //! Both variants perform full-game CFR over 169 canonical hand matchups with
 //! alternating player traversals. Each iteration is parallelized via rayon:
@@ -137,8 +138,9 @@ struct PostflopState {
 /// Preflop CFR solver with alternating updates.
 ///
 /// Traverses the preflop tree for every 169x169 canonical hand matchup
-/// using alternating player traversals. Supports vanilla CFR (no discounting)
-/// and DCFR (α/β/γ discounting with linear iteration weighting).
+/// using alternating player traversals. Supports vanilla CFR (no discounting),
+/// DCFR (α/β/γ discounting with linear iteration weighting), and CFR+
+/// (regrets floored to zero, linear strategy weighting).
 pub struct PreflopSolver {
     tree: PreflopTree,
     equity: EquityTable,
@@ -155,7 +157,7 @@ pub struct PreflopSolver {
     /// Used for convergence metrics instead of cumulative regret sums,
     /// which are unsuitable under DCFR's asymmetric discounting.
     last_instantaneous_regret: Vec<f64>,
-    /// CFR variant (Vanilla or DCFR).
+    /// CFR variant (Vanilla, DCFR, or CFR+).
     cfr_variant: CfrVariant,
     /// DCFR positive regret discount exponent.
     dcfr_alpha: f64,
@@ -294,8 +296,8 @@ impl PreflopSolver {
     /// - **DCFR**: Uses the most recent iteration's instantaneous regret to avoid
     ///   inflation from asymmetric positive/negative discounting. Divides out the
     ///   LCFR iteration weight.
-    /// - **Vanilla**: Uses cumulative `regret_sum` divided by iteration count,
-    ///   since there is no discounting bias.
+    /// - **Vanilla / CFR+**: Uses cumulative `regret_sum` divided by iteration count,
+    ///   since there is no discounting bias. (CFR+ regrets are always ≥ 0.)
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn avg_positive_regret(&self) -> f64 {
@@ -304,7 +306,7 @@ impl PreflopSolver {
         }
 
         match self.cfr_variant {
-            CfrVariant::Vanilla => {
+            CfrVariant::Vanilla | CfrVariant::CfrPlus => {
                 if self.regret_sum.is_empty() {
                     return 0.0;
                 }
@@ -425,13 +427,16 @@ impl PreflopSolver {
         self.apply_discounting();
         add_into(&mut self.regret_sum, &mr);
         add_into(&mut self.strategy_sum, &ms);
+        if self.cfr_variant == CfrVariant::CfrPlus {
+            self.floor_regrets();
+        }
         self.last_instantaneous_regret = mr;
     }
 
     /// Apply DCFR discounting to both players' cumulative values.
-    /// Skipped entirely for Vanilla CFR.
+    /// Skipped entirely for Vanilla CFR and CFR+.
     fn apply_discounting(&mut self) {
-        if self.cfr_variant == CfrVariant::Vanilla {
+        if self.cfr_variant != CfrVariant::Dcfr {
             return;
         }
         if self.iteration > self.dcfr_warmup {
@@ -439,6 +444,15 @@ impl PreflopSolver {
             for pos in 0..2u8 {
                 self.discount_regrets(pos);
                 self.discount_strategy_sums(pos, sd);
+            }
+        }
+    }
+
+    /// Floor all cumulative regrets to zero (CFR+ update rule).
+    fn floor_regrets(&mut self) {
+        for r in &mut self.regret_sum {
+            if *r < 0.0 {
+                *r = 0.0;
             }
         }
     }
@@ -589,19 +603,23 @@ fn traverse_hero(
         .map(|(s, v)| s * v)
         .sum();
 
-    // DCFR uses LCFR linear weighting (weight = iteration number).
-    // Vanilla CFR uses uniform weighting (weight = 1).
+    // Regret weighting: DCFR uses linear (LCFR), Vanilla and CFR+ use uniform.
+    // Strategy weighting: DCFR and CFR+ use linear, Vanilla uses uniform.
     #[allow(clippy::cast_precision_loss)]
-    let weight = match ctx.cfr_variant {
-        CfrVariant::Vanilla => 1.0,
-        CfrVariant::Dcfr => ctx.iteration as f64,
+    let (regret_weight, strategy_weight) = match ctx.cfr_variant {
+        CfrVariant::Vanilla => (1.0, 1.0),
+        CfrVariant::Dcfr => {
+            let w = ctx.iteration as f64;
+            (w, w)
+        }
+        CfrVariant::CfrPlus => (1.0, ctx.iteration as f64),
     };
 
     for (i, val) in action_values[..num_actions].iter().enumerate() {
-        dr[slot_start + i] += weight * reach_opp * (val - node_value);
+        dr[slot_start + i] += regret_weight * reach_opp * (val - node_value);
     }
     for (i, &s) in intended.iter().enumerate() {
-        ds[slot_start + i] += weight * reach_hero * s;
+        ds[slot_start + i] += strategy_weight * reach_hero * s;
     }
 
     node_value
@@ -1124,6 +1142,79 @@ mod tests {
                 let child = children[ci] as usize;
                 assert_eq!(inv[child], [2, 2], "after SB limps, both invested 2");
             }
+        }
+    }
+
+    /// CFR+: negative regrets are floored to zero after each iteration.
+    #[timed_test]
+    fn cfrplus_floors_negative_regrets() {
+        use super::super::config::CfrVariant;
+        let mut config = tiny_config();
+        config.cfr_variant = CfrVariant::CfrPlus;
+        let mut solver = PreflopSolver::new(&config);
+
+        // Seed negative regrets
+        let (base, _) = solver.layout.slot(0, 0);
+        if solver.regret_sum.len() > base + 2 {
+            solver.regret_sum[base] = 10.0;
+            solver.regret_sum[base + 1] = -5.0;
+            solver.regret_sum[base + 2] = -100.0;
+        }
+
+        // Train one iteration — flooring happens at end
+        solver.train(1);
+
+        // All regrets must be >= 0
+        for (i, &r) in solver.regret_sum.iter().enumerate() {
+            assert!(r >= 0.0, "regret[{i}] = {r} should be >= 0 under CFR+");
+        }
+    }
+
+    /// CFR+: produces valid probability distributions after training.
+    #[timed_test]
+    fn cfrplus_produces_valid_strategy() {
+        use super::super::config::CfrVariant;
+        let mut config = tiny_config();
+        config.cfr_variant = CfrVariant::CfrPlus;
+        let mut solver = PreflopSolver::new(&config);
+        solver.train(10);
+        let strategy = solver.strategy();
+        for hand_idx in 0..169 {
+            let probs = strategy.get_root_probs(hand_idx);
+            if probs.is_empty() {
+                continue;
+            }
+            let sum: f64 = probs.iter().sum();
+            assert!((sum - 1.0).abs() < 0.01, "hand {hand_idx}: sum = {sum}");
+        }
+    }
+
+    /// CFR+: DCFR discounting is not applied.
+    #[timed_test]
+    fn cfrplus_no_dcfr_discounting() {
+        use super::super::config::CfrVariant;
+        let mut config = tiny_config();
+        config.cfr_variant = CfrVariant::CfrPlus;
+        let mut solver = PreflopSolver::new(&config);
+
+        let (base, _) = solver.layout.slot(0, 0);
+        if solver.regret_sum.len() > base + 1 {
+            solver.regret_sum[base] = 10.0;
+            solver.regret_sum[base + 1] = 3.0;
+            solver.iteration = 5;
+
+            let before_0 = solver.regret_sum[base];
+            let before_1 = solver.regret_sum[base + 1];
+            solver.apply_discounting();
+
+            assert!(
+                (solver.regret_sum[base] - before_0).abs() < 1e-10,
+                "CFR+ should not apply DCFR discounting to regrets"
+            );
+            assert!(
+                (solver.regret_sum[base + 1] - before_1).abs() < 1e-10,
+                "CFR+ should not apply DCFR discounting to regrets"
+            );
         }
     }
 

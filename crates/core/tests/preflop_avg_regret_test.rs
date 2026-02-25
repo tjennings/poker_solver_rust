@@ -69,6 +69,43 @@ fn vanilla_avg_positive_regret_decreases_over_training() {
     );
 }
 
+/// CFR+: avg_positive_regret decreases over training. Since regrets are always ≥ 0,
+/// the cumulative metric converges smoothly like Vanilla CFR.
+#[test]
+fn cfrplus_avg_positive_regret_decreases_over_training() {
+    let mut config = PreflopConfig::heads_up(10);
+    config.raise_sizes = vec![vec![3.0]];
+    config.raise_cap = 1;
+    config.cfr_variant = CfrVariant::CfrPlus;
+
+    let mut solver = PreflopSolver::new(&config);
+
+    let mut history: Vec<f64> = Vec::new();
+    let chunk = 50;
+    let total = 500;
+
+    for _ in 0..(total / chunk) {
+        solver.train(chunk);
+        let apr = solver.avg_positive_regret();
+        assert!(apr.is_finite(), "regret must be finite at iter {}, got {apr}", solver.iteration());
+        assert!(apr >= 0.0, "regret must be non-negative at iter {}, got {apr}", solver.iteration());
+        history.push(apr);
+    }
+
+    assert!(
+        *history.last().unwrap() > 0.0,
+        "final avg positive regret should be positive, got {}",
+        history.last().unwrap()
+    );
+
+    assert!(
+        history.last().unwrap() < history.first().unwrap(),
+        "avg positive regret should decrease: first={:.6}, last={:.6}",
+        history.first().unwrap(),
+        history.last().unwrap()
+    );
+}
+
 /// DCFR: avg_positive_regret also decreases (regression guard for existing behavior).
 /// DCFR's instantaneous regret metric needs many iterations to show convergence
 /// on this small tree — the metric is inherently noisy under asymmetric discounting.
