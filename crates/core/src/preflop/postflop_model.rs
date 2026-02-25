@@ -45,6 +45,7 @@ fn default_cfr_delta_threshold() -> f64 {
 fn default_solve_type() -> PostflopSolveType { PostflopSolveType::Bucketed }
 fn default_mccfr_sample_pct() -> f64 { 0.01 }
 fn default_value_extraction_samples() -> u32 { 10_000 }
+fn default_ev_convergence_threshold() -> f64 { 0.001 }
 
 /// Deserialize either a scalar `f64` or a `Vec<f64>` into `Vec<f64>`.
 /// Supports backward-compatible YAML: `postflop_spr: 4.0` → `vec![4.0]`.
@@ -152,6 +153,11 @@ pub struct PostflopModelConfig {
     /// Only used when solve_type is Mccfr. Default: 10,000.
     #[serde(default = "default_value_extraction_samples")]
     pub value_extraction_samples: u32,
+
+    /// Early-stop threshold for EV estimation (weighted-average delta).
+    /// Only used when solve_type is Mccfr. Default: 0.001.
+    #[serde(default = "default_ev_convergence_threshold")]
+    pub ev_convergence_threshold: f64,
 }
 
 impl PostflopModelConfig {
@@ -199,6 +205,7 @@ impl PostflopModelConfig {
             solve_type: PostflopSolveType::Bucketed,
             mccfr_sample_pct: 0.01,
             value_extraction_samples: 10_000,
+            ev_convergence_threshold: 0.001,
         }
     }
 
