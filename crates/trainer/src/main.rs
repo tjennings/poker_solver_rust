@@ -344,11 +344,11 @@ struct TrainingParams {
     /// Number of bits for equity bin (0-4). Only used with `hand_class_v2`.
     #[serde(default = "default_equity_bits")]
     equity_bits: u8,
-    /// Strategy delta threshold for convergence-based stopping.
-    /// When set, training continues until the mean L1 strategy delta between
-    /// consecutive checkpoints drops below this value, overriding `iterations`.
-    #[serde(default)]
-    convergence_threshold: Option<f64>,
+    /// Average positive regret threshold for convergence-based stopping.
+    /// When set, training continues until avg positive regret drops below
+    /// this value, overriding `iterations`.
+    #[serde(default, alias = "convergence_threshold")]
+    regret_threshold: Option<f64>,
     /// How often (in iterations) to check convergence (default: 100).
     #[serde(default = "default_convergence_check_interval")]
     convergence_check_interval: u64,
@@ -725,8 +725,8 @@ struct PreflopTrainingConfig {
     pub equity_samples: u32,
     #[serde(default = "default_print_every")]
     pub print_every: u64,
-    #[serde(default = "default_convergence_threshold")]
-    pub convergence_threshold: f64,
+    #[serde(default = "default_regret_threshold", alias = "convergence_threshold")]
+    pub regret_threshold: f64,
     /// Path to a pre-built postflop bundle directory. When set, loads the bundle
     /// instead of building the postflop abstraction from `postflop_model`.
     #[serde(default)]
@@ -736,7 +736,7 @@ struct PreflopTrainingConfig {
 fn default_iterations() -> u64 { 5000 }
 fn default_equity_samples() -> u32 { 20000 }
 fn default_print_every() -> u64 { 1000 }
-fn default_convergence_threshold() -> f64 { 0.0001 }
+fn default_regret_threshold() -> f64 { 0.0001 }
 
 // ---------------------------------------------------------------------------
 // Postflop bundle builder
@@ -832,7 +832,7 @@ fn run_solve_preflop(
             iterations: 5000,
             equity_samples: 20000,
             print_every: 1000,
-            convergence_threshold: default_convergence_threshold(),
+            regret_threshold: default_regret_threshold(),
             postflop_model_path: None,
         }
     };
@@ -851,7 +851,7 @@ fn run_solve_preflop(
     let iterations = training.iterations;
     let equity_samples = training.equity_samples;
     let print_every = training.print_every;
-    let convergence_threshold = training.convergence_threshold;
+    let regret_threshold = training.regret_threshold;
     let players = config.positions.len();
 
     let cache_base = std::path::Path::new("cache/postflop");
@@ -1148,7 +1148,7 @@ fn run_solve_preflop(
             .progress_chars("#>-"),
     );
 
-    let delta_threshold = convergence_threshold;
+    let delta_threshold = regret_threshold;
     let chunk = std::cmp::max(iterations / 100, 1);
     let mut done = 0u64;
     let mut converged_early = false;
@@ -1265,7 +1265,7 @@ trait TrainingSolver {
 
 /// Configuration for [`run_training_loop`].
 struct TrainingLoopConfig<'a> {
-    convergence_threshold: Option<f64>,
+    regret_threshold: Option<f64>,
     check_interval: u64,
     iterations: u64,
     output_dir: &'a str,
@@ -1280,7 +1280,7 @@ fn run_training_loop<S: TrainingSolver>(
 ) -> Result<(), Box<dyn Error>> {
     let training_start = Instant::now();
 
-    if let Some(threshold) = loop_config.convergence_threshold {
+    if let Some(threshold) = loop_config.regret_threshold {
         run_convergence_loop(solver, threshold, loop_config);
     } else {
         run_fixed_iteration_loop(solver, loop_config);
@@ -1415,7 +1415,7 @@ struct MccfrTrainingSolver<'a> {
     stack_depth: u32,
     output_dir: &'a str,
     abs_mode: AbstractionModeConfig,
-    convergence_threshold: Option<f64>,
+    regret_threshold: Option<f64>,
 }
 
 impl TrainingSolver for MccfrTrainingSolver<'_> {
@@ -1458,8 +1458,8 @@ impl TrainingSolver for MccfrTrainingSolver<'_> {
             action_labels: &self.action_labels,
             stack_depth: self.stack_depth,
             abs_mode: self.abs_mode,
-            convergence_threshold: if is_convergence {
-                self.convergence_threshold
+            regret_threshold: if is_convergence {
+                self.regret_threshold
             } else {
                 None
             },
@@ -1491,7 +1491,7 @@ struct SimpleTrainingSolver<'a, S> {
     action_labels: Vec<String>,
     stack_depth: u32,
     abs_mode: AbstractionModeConfig,
-    convergence_threshold: Option<f64>,
+    regret_threshold: Option<f64>,
 }
 
 impl<S> TrainingSolver for SimpleTrainingSolver<'_, S>
@@ -1536,8 +1536,8 @@ where
             action_labels: &self.action_labels,
             stack_depth: self.stack_depth,
             abs_mode: self.abs_mode,
-            convergence_threshold: if is_convergence {
-                self.convergence_threshold
+            regret_threshold: if is_convergence {
+                self.regret_threshold
             } else {
                 None
             },
@@ -1641,22 +1641,22 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     println!();
 
     // Validate stopping criteria
-    let convergence_mode = config.training.convergence_threshold.is_some();
+    let convergence_mode = config.training.regret_threshold.is_some();
     if convergence_mode && config.training.iterations > 0 {
         eprintln!(
-            "WARNING: both convergence_threshold ({:.6}) and iterations ({}) are set; \
-             convergence_threshold will be used for stopping (iterations value ignored)",
-            config.training.convergence_threshold.unwrap(),
+            "WARNING: both regret_threshold ({:.6}) and iterations ({}) are set; \
+             regret_threshold will be used for stopping (iterations value ignored)",
+            config.training.regret_threshold.unwrap(),
             config.training.iterations,
         );
     }
     if !convergence_mode && config.training.iterations == 0 {
-        return Err("Either iterations or convergence_threshold must be set".into());
+        return Err("Either iterations or regret_threshold must be set".into());
     }
 
-    if let Some(threshold) = config.training.convergence_threshold {
+    if let Some(threshold) = config.training.regret_threshold {
         println!(
-            "Training: converge to delta < {:.6}, check every {} iters, {} samples/iter, seed {}",
+            "Training: converge to avg +regret < {:.6}, check every {} iters, {} samples/iter, seed {}",
             threshold,
             config.training.convergence_check_interval,
             config.training.mccfr_samples,
@@ -1767,9 +1767,9 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     };
 
     let num_threads = rayon::current_num_threads();
-    if let Some(threshold) = config.training.convergence_threshold {
+    if let Some(threshold) = config.training.regret_threshold {
         println!(
-            "  Parallel training with {} threads (target delta < {:.6})\n",
+            "  Parallel training with {} threads (target avg +regret < {:.6})\n",
             num_threads, threshold
         );
     } else {
@@ -1786,14 +1786,14 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         stack_depth: config.game.stack_depth,
         output_dir: &config.training.output_dir,
         abs_mode,
-        convergence_threshold: config.training.convergence_threshold,
+        regret_threshold: config.training.regret_threshold,
     };
 
     // Baseline checkpoint (iteration 0)
     wrapper.checkpoint_report(0, false, 10, config.training.iterations);
 
     let loop_config = TrainingLoopConfig {
-        convergence_threshold: config.training.convergence_threshold,
+        regret_threshold: config.training.regret_threshold,
         check_interval: config.training.convergence_check_interval,
         iterations: config.training.iterations,
         output_dir: &config.training.output_dir,
@@ -2351,7 +2351,7 @@ fn save_sdcfr_checkpoint(
         action_labels: report.action_labels,
         stack_depth: report.stack_depth,
         abs_mode: AbstractionModeConfig::default(),
-        convergence_threshold: None,
+        regret_threshold: None,
         max_regret: None,
     };
     print_strategy_report(&report_ctx);
@@ -2798,13 +2798,13 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     }
     println!();
 
-    let iterations = if let Some(threshold) = config.training.convergence_threshold {
+    let iterations = if let Some(threshold) = config.training.regret_threshold {
         println!("Convergence mode: delta < {threshold:.6}");
         u64::MAX // will stop when converged
     } else if config.training.iterations > 0 {
         config.training.iterations
     } else {
-        return Err("Either iterations or convergence_threshold must be set".into());
+        return Err("Either iterations or regret_threshold must be set".into());
     };
 
     // Build deals: either exhaustive abstract or random concrete
@@ -2890,11 +2890,11 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         action_labels,
         stack_depth: config.game.stack_depth,
         abs_mode,
-        convergence_threshold: config.training.convergence_threshold,
+        regret_threshold: config.training.regret_threshold,
     };
 
     let loop_config = TrainingLoopConfig {
-        convergence_threshold: config.training.convergence_threshold,
+        regret_threshold: config.training.regret_threshold,
         check_interval: config.training.convergence_check_interval,
         iterations,
         output_dir: &config.training.output_dir,
@@ -2926,13 +2926,13 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     }
     println!();
 
-    let iterations = if let Some(threshold) = config.training.convergence_threshold {
+    let iterations = if let Some(threshold) = config.training.regret_threshold {
         println!("Convergence mode: delta < {threshold:.6}");
         u64::MAX
     } else if config.training.iterations > 0 {
         config.training.iterations
     } else {
-        return Err("Either iterations or convergence_threshold must be set".into());
+        return Err("Either iterations or regret_threshold must be set".into());
     };
 
     // Build deals: either exhaustive abstract or random concrete
@@ -3052,10 +3052,10 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
             action_labels,
             stack_depth: config.game.stack_depth,
             abs_mode,
-            convergence_threshold: config.training.convergence_threshold,
+            regret_threshold: config.training.regret_threshold,
         };
         let loop_config = TrainingLoopConfig {
-            convergence_threshold: config.training.convergence_threshold,
+            regret_threshold: config.training.regret_threshold,
             check_interval: config.training.convergence_check_interval,
             iterations,
             output_dir: &config.training.output_dir,
@@ -3081,10 +3081,10 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
             action_labels,
             stack_depth: config.game.stack_depth,
             abs_mode,
-            convergence_threshold: config.training.convergence_threshold,
+            regret_threshold: config.training.regret_threshold,
         };
         let loop_config = TrainingLoopConfig {
-            convergence_threshold: config.training.convergence_threshold,
+            regret_threshold: config.training.regret_threshold,
             check_interval: config.training.convergence_check_interval,
             iterations,
             output_dir: &config.training.output_dir,
@@ -3626,7 +3626,7 @@ struct StrategyReportCtx<'a> {
     action_labels: &'a [String],
     stack_depth: u32,
     abs_mode: AbstractionModeConfig,
-    convergence_threshold: Option<f64>,
+    regret_threshold: Option<f64>,
     /// GPU-computed max regret (upper bound on exploitability). `None` for CPU solvers.
     max_regret: Option<f32>,
 }
@@ -3704,7 +3704,7 @@ fn compute_and_print_convergence(ctx: &StrategyReportCtx) -> Option<f64> {
         println!("  Max regret:       {mr:.6}");
     }
     println!("  Strategy delta:   {delta_str}");
-    if let Some(threshold) = ctx.convergence_threshold {
+    if let Some(threshold) = ctx.regret_threshold {
         let status = match delta {
             Some(d) if d < threshold => "CONVERGED",
             _ => "not converged",
