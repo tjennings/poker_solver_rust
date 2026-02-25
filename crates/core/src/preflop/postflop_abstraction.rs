@@ -270,6 +270,8 @@ pub enum FlopStage {
         max_iterations: usize,
         delta: f64,
     },
+    /// Extracting EV estimates from converged strategy.
+    EstimatingEv { sample: usize, total_samples: usize },
     /// Flop complete — signal to clear the bar.
     Done,
 }
@@ -299,6 +301,8 @@ impl std::fmt::Display for BuildPhase {
                 FlopStage::Bucketing { step, total_steps } => write!(f, "Flop '{flop_name}' Bucketing ({step}/{total_steps})"),
                 FlopStage::Solving { iteration, max_iterations, delta } =>
                     write!(f, "Flop '{flop_name}' CFR \u{03b4}={delta:.4} ({iteration}/{max_iterations})"),
+                FlopStage::EstimatingEv { sample, total_samples } =>
+                    write!(f, "Flop '{flop_name}' EV Estimation ({sample}/{total_samples})"),
                 FlopStage::Done => write!(f, "Flop '{flop_name}' Done"),
             },
             Self::ExtractingEv(done, total) => write!(f, "EV histograms ({done}/{total})"),
