@@ -375,35 +375,6 @@ pub fn print_hand_matrix(matrix: &HandMatrix, title: &str) {
 }
 
 /// Compute the mean L1 strategy distance between two hand matrices.
-///
-/// For each hand, sums the absolute differences across all action
-/// probabilities (fold + raises + implied call). Returns the average
-/// across all 169 hands, or `None` if `prev` is empty.
-pub fn matrix_delta(prev: &HandMatrix, curr: &HandMatrix) -> Option<f64> {
-    let mut total = 0.0f64;
-    let mut count = 0u32;
-    for row in 0..13 {
-        for col in 0..13 {
-            if let (Some(p), Some(c)) = (&prev[row][col], &curr[row][col]) {
-                let max_len = p.raises.len().max(c.raises.len());
-                let mut dist = (f64::from(p.fold) - f64::from(c.fold)).abs();
-                for i in 0..max_len {
-                    let pv = p.raises.get(i).copied().unwrap_or(0.0);
-                    let cv = c.raises.get(i).copied().unwrap_or(0.0);
-                    dist += (f64::from(pv) - f64::from(cv)).abs();
-                }
-                // implied call = 1 - fold - sum(raises)
-                let p_call = 1.0 - f64::from(p.fold) - p.raises.iter().map(|&r| f64::from(r)).sum::<f64>();
-                let c_call = 1.0 - f64::from(c.fold) - c.raises.iter().map(|&r| f64::from(r)).sum::<f64>();
-                dist += (p_call - c_call).abs();
-                total += dist;
-                count += 1;
-            }
-        }
-    }
-    if count > 0 { Some(total / f64::from(count)) } else { None }
-}
-
 /// Print a 13x13 average equity matrix with color-coded values.
 ///
 /// Each cell shows the weighted-average equity (0–100%) of the canonical
