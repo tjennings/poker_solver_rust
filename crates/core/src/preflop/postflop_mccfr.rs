@@ -98,27 +98,38 @@ pub(crate) fn build_mccfr(
             let flop = &flops[flop_idx];
             let flop_name = format!("{}{}{}", flop[0], flop[1], flop[2]);
 
-            // Step 1: Compute flop histogram features and cluster
-            on_progress(BuildPhase::FlopProgress {
-                flop_name: flop_name.clone(),
-                stage: FlopStage::Bucketing { step: 0, total_steps: 3 },
-            });
-            let flop_features = hand_buckets::compute_flop_histograms(
-                &hands,
-                std::slice::from_ref(flop),
-                &|_| {},
-            );
-            on_progress(BuildPhase::FlopProgress {
-                flop_name: flop_name.clone(),
-                stage: FlopStage::Bucketing { step: 1, total_steps: 3 },
-            });
+            // Step 1: Assign hands to buckets.
+            // When num_buckets >= num_hands (e.g. 169 buckets for 169 hands),
+            // each hand gets its own bucket — skip expensive histogram + k-means.
+            let assignments = if nfb >= hands.len() {
+                #[allow(clippy::cast_possible_truncation)]
+                let id: Vec<u16> = (0..hands.len() as u16).collect();
+                id
+            } else {
+                on_progress(BuildPhase::FlopProgress {
+                    flop_name: flop_name.clone(),
+                    stage: FlopStage::Bucketing { step: 0, total_steps: 3 },
+                });
+                let flop_features = hand_buckets::compute_flop_histograms(
+                    &hands,
+                    std::slice::from_ref(flop),
+                    &|_| {},
+                );
+                on_progress(BuildPhase::FlopProgress {
+                    flop_name: flop_name.clone(),
+                    stage: FlopStage::Bucketing { step: 1, total_steps: 3 },
+                });
 
-            let assignments =
-                hand_buckets::cluster_histograms(&flop_features, config.num_hand_buckets_flop);
-            on_progress(BuildPhase::FlopProgress {
-                flop_name: flop_name.clone(),
-                stage: FlopStage::Bucketing { step: 2, total_steps: 3 },
-            });
+                let a = hand_buckets::cluster_histograms(
+                    &flop_features,
+                    config.num_hand_buckets_flop,
+                );
+                on_progress(BuildPhase::FlopProgress {
+                    flop_name: flop_name.clone(),
+                    stage: FlopStage::Bucketing { step: 2, total_steps: 3 },
+                });
+                a
+            };
 
             // Step 2: Build bucket map
             let bucket_map = FlopBucketMap::build(&assignments, nfb, flop);
