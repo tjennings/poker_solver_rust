@@ -2,6 +2,17 @@ use serde::{Deserialize, Serialize};
 
 use super::postflop_model::PostflopModelConfig;
 
+/// Which CFR variant the preflop solver should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CfrVariant {
+    /// Standard CFR: no discounting, uniform iteration weighting.
+    Vanilla,
+    /// Discounted CFR with α/β/γ discounting and linear (LCFR) iteration weighting.
+    #[default]
+    Dcfr,
+}
+
 fn default_exploration() -> f64 {
     0.05
 }
@@ -33,6 +44,9 @@ pub struct PreflopConfig {
     pub position_raise_sizes: Option<Vec<Vec<Vec<f64>>>>,
     /// Maximum number of raises allowed per round.
     pub raise_cap: u8,
+    /// CFR variant: `vanilla` (no discounting) or `dcfr` (default).
+    #[serde(default)]
+    pub cfr_variant: CfrVariant,
     /// DCFR positive regret discount exponent.
     pub dcfr_alpha: f64,
     /// DCFR negative regret discount exponent.
@@ -84,6 +98,7 @@ impl PreflopConfig {
             raise_sizes: vec![vec![2.5], vec![3.0]],
             position_raise_sizes: None,
             raise_cap: 4,
+            cfr_variant: CfrVariant::Dcfr,
             dcfr_alpha: 1.5,
             dcfr_beta: 0.5,
             dcfr_gamma: 2.0,
@@ -130,6 +145,7 @@ impl PreflopConfig {
             raise_sizes: vec![vec![2.5], vec![3.0]],
             position_raise_sizes: None,
             raise_cap: 4,
+            cfr_variant: CfrVariant::Dcfr,
             dcfr_alpha: 1.5,
             dcfr_beta: 0.5,
             dcfr_gamma: 2.0,
@@ -227,6 +243,57 @@ mod tests {
         assert_eq!(config.raise_sizes.len(), 2, "should have 2 raise depths");
         assert_eq!(config.raise_sizes[0].len(), 1, "open should have 1 size");
         assert_eq!(config.raise_sizes[1].len(), 1, "3bet should have 1 size");
+    }
+
+    #[timed_test]
+    fn hu_config_defaults_to_dcfr() {
+        let config = PreflopConfig::heads_up(100);
+        assert_eq!(config.cfr_variant, CfrVariant::Dcfr);
+    }
+
+    #[timed_test]
+    fn cfr_variant_deserializes_from_yaml() {
+        let yaml = r#"
+            positions:
+              - name: SB
+                short_name: SB
+              - name: BB
+                short_name: BB
+            blinds: [[0, 1], [1, 2]]
+            antes: []
+            stacks: [200, 200]
+            raise_sizes: [[2.5]]
+            raise_cap: 4
+            cfr_variant: vanilla
+            dcfr_alpha: 1.5
+            dcfr_beta: 0.5
+            dcfr_gamma: 2.0
+            dcfr_warmup: 0
+        "#;
+        let config: PreflopConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.cfr_variant, CfrVariant::Vanilla);
+    }
+
+    #[timed_test]
+    fn cfr_variant_defaults_to_dcfr_when_omitted() {
+        let yaml = r#"
+            positions:
+              - name: SB
+                short_name: SB
+              - name: BB
+                short_name: BB
+            blinds: [[0, 1], [1, 2]]
+            antes: []
+            stacks: [200, 200]
+            raise_sizes: [[2.5]]
+            raise_cap: 4
+            dcfr_alpha: 1.5
+            dcfr_beta: 0.5
+            dcfr_gamma: 2.0
+            dcfr_warmup: 0
+        "#;
+        let config: PreflopConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.cfr_variant, CfrVariant::Dcfr);
     }
 
     #[timed_test]
