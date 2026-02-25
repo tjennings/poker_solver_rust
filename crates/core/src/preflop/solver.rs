@@ -144,6 +144,10 @@ pub struct PreflopSolver {
     /// Cumulative weighted strategy, flat buffer indexed by `layout.slot()`.
     strategy_sum: Vec<f64>,
     iteration: u64,
+    /// Effective iteration weight accounting for DCFR positive-regret discounting.
+    /// Each iteration: `weight = pos_factor * weight + 1.0`.
+    /// For vanilla CFR (no discounting), this equals `iteration`.
+    regret_discount_weight: f64,
     /// DCFR positive regret discount exponent.
     dcfr_alpha: f64,
     /// DCFR negative regret discount exponent.
@@ -188,6 +192,7 @@ impl PreflopSolver {
             regret_sum: vec![0.0; buf_size],
             strategy_sum: vec![0.0; buf_size],
             iteration: 0,
+            regret_discount_weight: 0.0,
             dcfr_alpha: config.dcfr_alpha,
             dcfr_beta: config.dcfr_beta,
             dcfr_gamma: config.dcfr_gamma,
@@ -280,7 +285,7 @@ impl PreflopSolver {
     /// `iteration * buffer_length`. Same metric as `MccfrSolver::avg_positive_regret`.
     #[must_use]
     pub fn avg_positive_regret(&self) -> f64 {
-        if self.iteration == 0 || self.regret_sum.is_empty() {
+        if self.regret_discount_weight == 0.0 || self.regret_sum.is_empty() {
             return 0.0;
         }
 
@@ -293,7 +298,7 @@ impl PreflopSolver {
 
         #[allow(clippy::cast_precision_loss)]
         {
-            total / self.regret_sum.len() as f64 / self.iteration as f64
+            total / self.regret_sum.len() as f64 / self.regret_discount_weight
         }
     }
 
@@ -391,13 +396,19 @@ impl PreflopSolver {
     }
 
     /// Apply DCFR discounting to both players' cumulative values.
+    #[allow(clippy::cast_precision_loss)]
     fn apply_discounting(&mut self) {
         if self.iteration > self.dcfr_warmup {
+            let t = (self.iteration + 1) as f64;
+            let pos_factor = t.powf(self.dcfr_alpha) / (t.powf(self.dcfr_alpha) + 1.0);
+            self.regret_discount_weight = pos_factor * self.regret_discount_weight + 1.0;
             let sd = self.strategy_discount();
             for pos in 0..2u8 {
                 self.discount_regrets(pos);
                 self.discount_strategy_sums(pos, sd);
             }
+        } else {
+            self.regret_discount_weight += 1.0;
         }
     }
 }
