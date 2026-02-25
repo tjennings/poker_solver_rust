@@ -16,8 +16,8 @@ use rayon::prelude::*;
 use super::hand_buckets::{self, StreetBuckets};
 use super::postflop_abstraction::{
     BuildPhase, FlopSolveResult, FlopStage, PostflopLayout, PostflopValues,
-    add_buffers, regret_matching_into, normalize_strategy_sum,
-    weighted_avg_strategy_delta, MAX_POSTFLOP_ACTIONS,
+    add_buffers, avg_positive_regret_flat, regret_matching_into, normalize_strategy_sum,
+    MAX_POSTFLOP_ACTIONS,
 };
 use super::postflop_model::PostflopModelConfig;
 use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree};
@@ -159,7 +159,7 @@ pub(crate) fn build_mccfr(
                 flop,
                 num_iterations,
                 samples_per_iter,
-                config.cfr_delta_threshold,
+                config.cfr_regret_threshold,
                 &flop_name,
                 on_progress,
             );
@@ -227,19 +227,18 @@ fn mccfr_solve_one_flop(
     flop: &[Card; 3],
     num_iterations: usize,
     samples_per_iter: usize,
-    delta_threshold: f64,
+    regret_threshold: f64,
     flop_name: &str,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> FlopSolveResult {
     let buf_size = layout.total_size;
     let mut regret_sum = vec![0.0f64; buf_size];
     let mut strategy_sum = vec![0.0f64; buf_size];
-    let mut final_delta = 0.0;
+    let mut current_regret = 0.0;
     let mut iterations_used = 0;
 
     for iter in 0..num_iterations {
         let iteration = iter as u64 + 1;
-        let prev_regrets = regret_sum.clone();
 
         // Sample deals and traverse
         let seed = iteration * 1_000_003 + flop_name.len() as u64;
@@ -280,28 +279,25 @@ fn mccfr_solve_one_flop(
         add_buffers(&mut strategy_sum, &ds);
         iterations_used = iter + 1;
 
-        if iter >= 1 {
-            final_delta =
-                weighted_avg_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
-        }
+        current_regret = avg_positive_regret_flat(&regret_sum, iteration);
 
         on_progress(BuildPhase::FlopProgress {
             flop_name: flop_name.to_string(),
             stage: FlopStage::Solving {
                 iteration: iterations_used,
                 max_iterations: num_iterations,
-                delta: final_delta,
+                avg_regret: current_regret,
             },
         });
 
-        if iter >= 1 && final_delta < delta_threshold {
+        if iter >= 1 && current_regret < regret_threshold {
             break;
         }
     }
 
     FlopSolveResult {
         strategy_sum,
-        final_delta,
+        avg_regret: current_regret,
         iterations_used,
     }
 }
@@ -773,7 +769,7 @@ mod tests {
             postflop_solve_samples: 0,
             postflop_sprs: vec![3.5],
             rebucket_rounds: 1,
-            cfr_delta_threshold: 0.001,
+            cfr_regret_threshold: 0.001,
             max_flop_boards: 1,
             fixed_flops: None,
             equity_rollout_fraction: 1.0,

@@ -268,7 +268,7 @@ pub enum FlopStage {
     Solving {
         iteration: usize,
         max_iterations: usize,
-        delta: f64,
+        avg_regret: f64,
     },
     /// Extracting EV estimates from converged strategy.
     EstimatingEv { sample: usize, total_samples: usize, avg_delta: f64 },
@@ -299,8 +299,8 @@ impl std::fmt::Display for BuildPhase {
         match self {
             Self::FlopProgress { flop_name, stage } => match stage {
                 FlopStage::Bucketing { step, total_steps } => write!(f, "Flop '{flop_name}' Bucketing ({step}/{total_steps})"),
-                FlopStage::Solving { iteration, max_iterations, delta } =>
-                    write!(f, "Flop '{flop_name}' CFR \u{03b4}={delta:.4} ({iteration}/{max_iterations})"),
+                FlopStage::Solving { iteration, max_iterations, avg_regret } =>
+                    write!(f, "Flop '{flop_name}' CFR +R={avg_regret:.4} ({iteration}/{max_iterations})"),
                 FlopStage::EstimatingEv { sample, total_samples, avg_delta } =>
                     write!(f, "Flop '{flop_name}' EV Estimation ({sample}/{total_samples}) \u{0394}={avg_delta:.4}"),
                 FlopStage::Done => write!(f, "Flop '{flop_name}' Done"),
@@ -484,10 +484,10 @@ pub fn compute_hand_avg_values(buckets: &StreetBuckets, values: &PostflopValues)
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Result of a single flop CFR solve.
-#[allow(dead_code)] // final_delta and iterations_used read in tests
+#[allow(dead_code)] // avg_regret and iterations_used read in tests
 pub(crate) struct FlopSolveResult {
     pub strategy_sum: Vec<f64>,
-    pub final_delta: f64,
+    pub avg_regret: f64,
     pub iterations_used: usize,
 }
 
@@ -498,69 +498,16 @@ pub(crate) fn add_buffers(dst: &mut [f64], src: &[f64]) {
     }
 }
 
-/// Compute max strategy change between two regret buffers across all decision nodes.
+/// Average positive regret per entry per iteration for a flat regret buffer.
 ///
-/// For each decision node in the tree, iterates through every bucket's action slice,
-/// applies regret matching to both the old and new regret buffers, and returns the
-/// weighted average strategy delta.
-///
-/// Each (node, bucket) position is weighted by its total absolute regret mass,
-/// so frequently-reached positions with large regrets dominate the metric while
-/// rarely-reached positions with near-zero regrets are ignored.
-pub(crate) fn weighted_avg_strategy_delta(
-    old_regrets: &[f64],
-    new_regrets: &[f64],
-    layout: &PostflopLayout,
-    tree: &PostflopTree,
-) -> f64 {
-    let mut weighted_sum = 0.0f64;
-    let mut total_weight = 0.0f64;
-
-    for (node_idx, node) in tree.nodes.iter().enumerate() {
-        if let PostflopNode::Decision { children, .. } = node {
-            let num_actions = children.len();
-            if num_actions == 0 {
-                continue;
-            }
-
-            let (node_offset, _) = layout.entry(node_idx);
-            let node_end = if node_idx + 1 < layout.num_nodes() {
-                layout.entry(node_idx + 1).0
-            } else {
-                old_regrets.len()
-            };
-
-            // Process each bucket's action slice.
-            let mut pos = node_offset;
-            let mut old_strat = vec![0.0f64; num_actions];
-            let mut new_strat = vec![0.0f64; num_actions];
-            while pos + num_actions <= node_end {
-                // Weight = sum of absolute regrets at this position (using new regrets).
-                let weight: f64 = new_regrets[pos..pos + num_actions]
-                    .iter()
-                    .map(|r| r.abs())
-                    .sum();
-
-                if weight > 0.0 {
-                    regret_matching_into(old_regrets, pos, &mut old_strat);
-                    regret_matching_into(new_regrets, pos, &mut new_strat);
-                    let mut pos_delta = 0.0f64;
-                    for i in 0..num_actions {
-                        pos_delta = pos_delta.max((old_strat[i] - new_strat[i]).abs());
-                    }
-                    weighted_sum += pos_delta * weight;
-                    total_weight += weight;
-                }
-                pos += num_actions;
-            }
-        }
+/// Sums only positive values in `regret_sum`, divides by total entry count
+/// and `iterations`. Returns 0.0 if the buffer is empty or iterations is 0.
+pub(crate) fn avg_positive_regret_flat(regret_sum: &[f64], iterations: u64) -> f64 {
+    if iterations == 0 || regret_sum.is_empty() {
+        return 0.0;
     }
-
-    if total_weight > 0.0 {
-        weighted_sum / total_weight
-    } else {
-        0.0
-    }
+    let total: f64 = regret_sum.iter().filter(|&&r| r > 0.0).sum();
+    total / regret_sum.len() as f64 / iterations as f64
 }
 
 /// Normalize strategy sum into a probability distribution.
@@ -782,34 +729,18 @@ mod tests {
     }
 
     #[timed_test]
-    fn weighted_avg_strategy_delta_identical_buffers_is_zero() {
-        let config = PostflopModelConfig::fast();
-        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
-        let streets = annotate_streets(&tree);
-        let layout = PostflopLayout::build(&tree, &streets, 10, 10, 10);
-        let buf = vec![1.0f64; layout.total_size];
-        let delta = weighted_avg_strategy_delta(&buf, &buf, &layout, &tree);
-        assert!(
-            delta.abs() < 1e-12,
-            "identical buffers should have zero delta, got {delta}"
-        );
+    fn avg_positive_regret_flat_basic() {
+        // 3 positive, 1 negative, 1 zero → sum positives = 6.0, count = 5, iters = 2
+        let buf = vec![1.0, 2.0, 3.0, -10.0, 0.0];
+        let result = avg_positive_regret_flat(&buf, 2);
+        let expected = 6.0 / 5.0 / 2.0;
+        assert!((result - expected).abs() < 1e-10, "expected {expected}, got {result}");
     }
 
     #[timed_test]
-    fn weighted_avg_strategy_delta_detects_change() {
-        let config = PostflopModelConfig::fast();
-        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
-        let streets = annotate_streets(&tree);
-        let layout = PostflopLayout::build(&tree, &streets, 10, 10, 10);
-        let old = vec![1.0f64; layout.total_size];
-        let mut new = old.clone();
-        // Flip first slot to create a strategy change.
-        if layout.total_size >= 2 {
-            new[0] = 100.0;
-            new[1] = 0.0;
-        }
-        let delta = weighted_avg_strategy_delta(&old, &new, &layout, &tree);
-        assert!(delta > 0.0, "different buffers should have nonzero delta");
+    fn avg_positive_regret_flat_empty() {
+        assert!(avg_positive_regret_flat(&[], 10).abs() < 1e-10);
+        assert!(avg_positive_regret_flat(&[5.0], 0).abs() < 1e-10);
     }
 
     #[timed_test]
@@ -834,13 +765,13 @@ mod tests {
             stage: FlopStage::Solving {
                 iteration: 45,
                 max_iterations: 200,
-                delta: 0.0032,
+                avg_regret: 0.0032,
             },
         };
         let s = format!("{phase}");
         assert!(s.contains("AhKd7s"), "should show flop name: {s}");
         assert!(s.contains("45/200"), "should show iteration: {s}");
-        assert!(s.contains("0.0032"), "should show delta: {s}");
+        assert!(s.contains("0.0032"), "should show avg regret: {s}");
 
         let bucketing = BuildPhase::FlopProgress {
             flop_name: "AhKd7s".to_string(),

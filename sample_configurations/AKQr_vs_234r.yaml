@@ -56,7 +56,7 @@ postflop_model:
   max_raises_per_street: 3
   postflop_solve_iterations: 1000
   postflop_solve_samples: 0
-  cfr_delta_threshold: 0.5
+  cfr_regret_threshold: 0.5
   equity_rollout_fraction: 1
   value_extraction_samples: 20000
 

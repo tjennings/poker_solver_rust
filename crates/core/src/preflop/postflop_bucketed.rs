@@ -13,8 +13,8 @@ use super::postflop_model::PostflopModelConfig;
 use super::postflop_tree::{PostflopNode, PostflopTree};
 use super::postflop_abstraction::{
     BuildPhase, FlopSolveResult, FlopStage, PostflopLayout, PostflopValues,
-    add_buffers, regret_matching_into, normalize_strategy_sum,
-    weighted_avg_strategy_delta, postflop_terminal_value, MAX_POSTFLOP_ACTIONS,
+    add_buffers, avg_positive_regret_flat, regret_matching_into, normalize_strategy_sum,
+    postflop_terminal_value, MAX_POSTFLOP_ACTIONS,
 };
 use crate::abstraction::Street;
 use crate::poker::Card;
@@ -94,7 +94,7 @@ pub(crate) fn build_bucketed(
                 nfb,
                 solve_iters,
                 samples,
-                config.cfr_delta_threshold,
+                config.cfr_regret_threshold,
                 flop_idx,
                 &flop_name,
                 on_progress,
@@ -178,7 +178,7 @@ pub(crate) fn build_bucketed(
                     nfb,
                     solve_iters,
                     samples,
-                    config.cfr_delta_threshold,
+                    config.cfr_regret_threshold,
                     flop_idx,
                     &flop_name,
                     on_progress,
@@ -264,8 +264,8 @@ fn stream_solve_and_extract_one_flop(
 
 /// Run CFR for a single flop with the shared tree template.
 ///
-/// Runs up to `num_iterations` CFR iterations, stopping early when the max
-/// strategy change between consecutive iterations drops below `delta_threshold`.
+/// Runs up to `num_iterations` CFR iterations, stopping early when
+/// avg positive regret drops below `regret_threshold`.
 /// Early stopping requires at least 2 completed iterations.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn solve_one_flop(
@@ -276,7 +276,7 @@ fn solve_one_flop(
     buf_size: usize,
     num_iterations: usize,
     samples_per_iter: usize,
-    delta_threshold: f64,
+    regret_threshold: f64,
     flop_idx: usize,
     flop_name: &str,
     on_progress: &(impl Fn(BuildPhase) + Sync),
@@ -284,7 +284,7 @@ fn solve_one_flop(
     let mut regret_sum = vec![0.0f64; buf_size];
     let mut strategy_sum = vec![0.0f64; buf_size];
     let use_exhaustive = num_flop_buckets * num_flop_buckets <= samples_per_iter;
-    let mut final_delta = 0.0;
+    let mut current_regret = 0.0;
     let mut iterations_used = 0;
 
     on_progress(BuildPhase::FlopProgress {
@@ -292,15 +292,12 @@ fn solve_one_flop(
         stage: FlopStage::Solving {
             iteration: 0,
             max_iterations: num_iterations,
-            delta: 0.0,
+            avg_regret: 0.0,
         },
     });
 
     for iter in 0..num_iterations {
         let iteration = iter as u64 + 1;
-
-        // Snapshot regrets before this iteration for delta computation.
-        let prev_regrets = regret_sum.clone();
 
         let (dr, ds) = if use_exhaustive {
             exhaustive_cfr_iteration(
@@ -319,27 +316,24 @@ fn solve_one_flop(
         add_buffers(&mut strategy_sum, &ds);
         iterations_used = iter + 1;
 
-        // Compute strategy delta (meaningful after iteration 1).
-        if iter >= 1 {
-            final_delta = weighted_avg_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
-        }
+        current_regret = avg_positive_regret_flat(&regret_sum, iteration);
 
         on_progress(BuildPhase::FlopProgress {
             flop_name: flop_name.to_string(),
             stage: FlopStage::Solving {
                 iteration: iter + 1,
                 max_iterations: num_iterations,
-                delta: final_delta,
+                avg_regret: current_regret,
             },
         });
 
         // Early stopping after at least 2 iterations.
-        if iter >= 1 && final_delta < delta_threshold {
+        if iter >= 1 && current_regret < regret_threshold {
             break;
         }
     }
 
-    FlopSolveResult { strategy_sum, final_delta, iterations_used }
+    FlopSolveResult { strategy_sum, avg_regret: current_regret, iterations_used }
 }
 
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
@@ -717,7 +711,7 @@ mod tests {
         assert_eq!(result.strategy_sum.len(), buf_size);
         assert!(result.iterations_used >= 2);
         assert!(result.iterations_used <= 4);
-        assert!(result.final_delta.is_finite());
+        assert!(result.avg_regret.is_finite());
     }
 
     #[timed_test]
