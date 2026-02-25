@@ -4,6 +4,7 @@ import {
   AgentInfo,
   BundleInfo,
   CanonicalizeResult,
+  HandEquity,
   StrategyMatrix,
   ExplorationPosition,
   ActionInfo,
@@ -550,6 +551,7 @@ export default function Explorer() {
   const [selectedCell, setSelectedCell] = useState<{ row: number; col: number } | null>(null);
   const [handResult, setHandResult] = useState<{ type: 'fold' | 'showdown'; pot: number } | null>(null);
   const [comboInfo, setComboInfo] = useState<ComboGroupInfo | null>(null);
+  const [handEquity, setHandEquity] = useState<HandEquity | null>(null);
   const [threshold, setThreshold] = useState(2);
   const [remapInfo, setRemapInfo] = useState<{
     original: string[];
@@ -596,6 +598,23 @@ export default function Explorer() {
         setComboInfo(null);
       });
   }, [position, matrix, selectedCell]);
+
+  // Fetch postflop equity when a cell is selected on preflop view
+  useEffect(() => {
+    if (!matrix || !selectedCell || !bundleInfo?.preflop_only) {
+      setHandEquity(null);
+      return;
+    }
+    const cell = matrix.cells[selectedCell.row]?.[selectedCell.col];
+    if (!cell || cell.filtered) {
+      setHandEquity(null);
+      return;
+    }
+
+    invoke<HandEquity | null>('get_hand_equity', { hand: cell.hand })
+      .then(setHandEquity)
+      .catch(() => setHandEquity(null));
+  }, [matrix, selectedCell, bundleInfo]);
 
   const loadSource = useCallback(
     async (path: string) => {
@@ -1135,6 +1154,25 @@ export default function Explorer() {
                       cell={matrix.cells[selectedCell.row][selectedCell.col]}
                       actions={matrix.actions}
                     />
+                  )}
+                  {handEquity && (
+                    <div className="hand-equity-panel">
+                      <div className="cell-detail-header">Avg Postflop EV</div>
+                      <div className="hand-equity-rows">
+                        <div className="hand-equity-row">
+                          <span className="hand-equity-label">As SB</span>
+                          <span className="hand-equity-value">{(handEquity.ev_pos0 * 100).toFixed(1)}%</span>
+                        </div>
+                        <div className="hand-equity-row">
+                          <span className="hand-equity-label">As BB</span>
+                          <span className="hand-equity-value">{(handEquity.ev_pos1 * 100).toFixed(1)}%</span>
+                        </div>
+                        <div className="hand-equity-row hand-equity-avg">
+                          <span className="hand-equity-label">Average</span>
+                          <span className="hand-equity-value">{(handEquity.ev_avg * 100).toFixed(1)}%</span>
+                        </div>
+                      </div>
+                    </div>
                   )}
                   {comboInfo && comboInfo.groups.length > 0 && (
                     <ComboClassPanel info={comboInfo} actions={matrix.actions} />

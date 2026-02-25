@@ -61,6 +61,11 @@ struct ComboClassesParams {
     hand: String,
 }
 
+#[derive(Deserialize)]
+struct HandEquityParams {
+    hand: String,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -178,6 +183,16 @@ async fn handle_get_combo_classes(
     ))
 }
 
+async fn handle_get_hand_equity(
+    AxumState(state): AxumState<AppState>,
+    Json(params): Json<HandEquityParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::get_hand_equity_core(
+        &state,
+        &params.hand,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Handlers — sync core functions (no params)
 // ---------------------------------------------------------------------------
@@ -247,6 +262,7 @@ async fn main() {
         .route("/api/is_board_cached", post(handle_is_board_cached))
         .route("/api/list_agents", post(handle_list_agents))
         .route("/api/get_combo_classes", post(handle_get_combo_classes))
+        .route("/api/get_hand_equity", post(handle_get_hand_equity))
         .layer(cors)
         .with_state(state);
 

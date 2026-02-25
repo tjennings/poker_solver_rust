@@ -38,6 +38,19 @@ Options:
 - `--postflop-model <PRESET>` -- Postflop model preset: fast, medium, standard, accurate, mccfr_fast, mccfr_standard
 - `--print-every <N>` -- Print strategy matrices every N iterations (0=only at end)
 
+When a postflop model is used, the postflop solve data is automatically saved into a `postflop/` subdirectory of the output:
+
+```
+output/
+├── config.yaml       # PreflopConfig
+├── strategy.bin      # PreflopStrategy
+└── postflop/         # PostflopBundle (auto-saved when postflop model is used)
+    ├── config.yaml   # PostflopModelConfig
+    └── solve.bin     # Buckets, values, hand-averaged EVs, flops, SPR
+```
+
+The Explorer loads this postflop data automatically and displays per-hand average postflop equity when a cell is selected. Old bundles without a `postflop/` subdirectory continue to work — the equity panel simply doesn't appear.
+
 ### solve-postflop
 
 Build a postflop abstraction and save it as a reusable bundle. Use `postflop_model_path` in preflop training configs to load a pre-built bundle instead of rebuilding each time.

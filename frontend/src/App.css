@@ -877,6 +877,44 @@ button:disabled {
   font-size: 0.9rem;
 }
 
+/* Hand equity panel */
+.hand-equity-panel {
+  min-width: 200px;
+  padding: 0.75rem;
+  background: #1a1a2e;
+  border-radius: 8px;
+  margin-bottom: 0.5rem;
+}
+
+.hand-equity-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.hand-equity-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.85rem;
+  color: #bbb;
+}
+
+.hand-equity-row.hand-equity-avg {
+  font-weight: bold;
+  color: #eee;
+  padding-top: 0.25rem;
+  border-top: 1px solid #333;
+  margin-top: 0.1rem;
+}
+
+.hand-equity-label {
+  color: inherit;
+}
+
+.hand-equity-value {
+  font-variant-numeric: tabular-nums;
+}
+
 /* Combo classification panel */
 .combo-panel {
   min-width: 200px;
