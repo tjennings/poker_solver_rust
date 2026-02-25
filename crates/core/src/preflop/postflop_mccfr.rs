@@ -177,6 +177,11 @@ pub(crate) fn build_mccfr(
                 on_progress,
             );
 
+            on_progress(BuildPhase::FlopProgress {
+                flop_name: flop_name.clone(),
+                stage: FlopStage::Done,
+            });
+
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             on_progress(BuildPhase::MccfrFlopsCompleted { completed: done, total: num_flops });
 
@@ -292,11 +297,6 @@ fn mccfr_solve_one_flop(
             break;
         }
     }
-
-    on_progress(BuildPhase::FlopProgress {
-        flop_name: flop_name.to_string(),
-        stage: FlopStage::Done,
-    });
 
     FlopSolveResult {
         strategy_sum,
