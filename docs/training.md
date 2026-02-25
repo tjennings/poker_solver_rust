@@ -423,10 +423,10 @@ training:
   pruning_probe_interval: 20
 ```
 
-**Convergence-based stopping:**
+**Convergence-based stopping (avg positive regret):**
 ```yaml
 training:
-  convergence_threshold: 0.001
+  regret_threshold: 0.001
   convergence_check_interval: 100
 ```
 
