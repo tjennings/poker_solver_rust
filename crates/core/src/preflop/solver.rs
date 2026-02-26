@@ -568,17 +568,18 @@ fn cfr_traverse(
             let mut intended = [0.0f64; MAX_ACTIONS];
             regret_matching_into(ctx.snapshot, start, &mut intended[..num_actions]);
 
-            let mut traversal = intended;
-            if ctx.exploration > 0.0 {
-                let eps = ctx.exploration;
-                #[allow(clippy::cast_precision_loss)]
-                let n_inv = 1.0 / num_actions as f64;
-                for s in &mut traversal[..num_actions] {
-                    *s = (1.0 - eps).mul_add(*s, eps * n_inv);
-                }
-            }
-
             if is_hero {
+                // Epsilon-greedy exploration: only applied to the traversing
+                // player's strategy. The opponent plays pure regret-matched.
+                let mut traversal = intended;
+                if ctx.exploration > 0.0 {
+                    let eps = ctx.exploration;
+                    #[allow(clippy::cast_precision_loss)]
+                    let n_inv = 1.0 / num_actions as f64;
+                    for s in &mut traversal[..num_actions] {
+                        *s = (1.0 - eps).mul_add(*s, eps * n_inv);
+                    }
+                }
                 traverse_hero(
                     ctx, dr, ds, start, hero_hand, opp_hand, hero_pos,
                     reach_hero, reach_opp, children,
@@ -587,7 +588,7 @@ fn cfr_traverse(
             } else {
                 traverse_opponent(
                     ctx, dr, ds, hero_hand, opp_hand, hero_pos,
-                    reach_hero, reach_opp, children, &traversal[..num_actions],
+                    reach_hero, reach_opp, children, &intended[..num_actions],
                 )
             }
         }
