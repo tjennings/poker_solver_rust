@@ -727,6 +727,10 @@ struct PreflopTrainingConfig {
     pub print_every: u64,
     #[serde(default = "default_regret_threshold", alias = "convergence_threshold")]
     pub regret_threshold: f64,
+    /// Save a checkpoint bundle every N iterations during training.
+    /// When `None`, no intermediate checkpoints are saved.
+    #[serde(default)]
+    pub checkpoint_every: Option<u64>,
     /// Path to a pre-built postflop bundle directory. When set, loads the bundle
     /// instead of building the postflop abstraction from `postflop_model`.
     #[serde(default)]
@@ -833,6 +837,7 @@ fn run_solve_preflop(
             equity_samples: 20000,
             print_every: 1000,
             regret_threshold: default_regret_threshold(),
+            checkpoint_every: None,
             postflop_model_path: None,
         }
     };
@@ -852,6 +857,7 @@ fn run_solve_preflop(
     let equity_samples = training.equity_samples;
     let print_every = training.print_every;
     let regret_threshold = training.regret_threshold;
+    let checkpoint_every = training.checkpoint_every;
     let players = config.positions.len();
 
     let cache_base = std::path::Path::new("cache/postflop");
@@ -1177,6 +1183,20 @@ fn run_solve_preflop(
             if early_stop {
                 converged_early = true;
                 break;
+            }
+        }
+
+        // Periodic checkpoint save
+        if let Some(interval) = checkpoint_every {
+            if interval > 0 && done.is_multiple_of(interval) {
+                pb.suspend(|| {
+                    let cp_dir = output.join(format!("checkpoint_{done}"));
+                    let bundle = PreflopBundle::new(config.clone(), solver.strategy());
+                    match bundle.save(&cp_dir) {
+                        Ok(()) => println!("  Saved checkpoint to {}/", cp_dir.display()),
+                        Err(e) => eprintln!("  Warning: failed to save checkpoint: {e}"),
+                    }
+                });
             }
         }
     }

@@ -220,6 +220,7 @@ iterations: 10000
 equity_samples: 10000
 print_every: 1000
 regret_threshold: 0.0001           # early-stop when avg +regret drops below this
+# checkpoint_every: 5000           # save intermediate bundles every N iterations
 
 # Game structure (internal units: SB=1, BB=2)
 positions:
@@ -295,6 +296,8 @@ Both metrics are printed every `print_every` iterations:
 
 - **Avg positive regret** (`regret_threshold`): proxy convergence metric. When it drops below the threshold, training stops early.
 - **Exploitability**: gold-standard metric. Computes the best-response value for both players — how much an optimal opponent could exploit the current strategy. Reported in both raw SB/hand and mBB/hand. At Nash equilibrium, exploitability is 0.
+
+Set `checkpoint_every` to save intermediate strategy bundles at regular intervals (e.g. every 5000 iterations). Each checkpoint is saved to `{output}/checkpoint_{iteration}/` in the same format as the final bundle.
 
 The `max_flop_boards` parameter controls how many canonical flop textures are used for EHS feature computation during hand bucketing. Lower values dramatically speed up the bucketing phase. Set to `0` (or omit) to use all ~1,755 canonical flops. Configurable in YAML via `max_flop_boards: 200`.
 
