@@ -1,4 +1,4 @@
-//! Hand trace diagnostic: traces hands through EHS → buckets → postflop EV.
+//! Hand trace diagnostic: traces hands through canonical index → postflop EV.
 
 use serde::Serialize;
 
@@ -28,7 +28,7 @@ struct HandTrace {
 struct TextureTrace {
     texture_id: usize,
     prototype_flop: String,
-    flop_bucket: u16,
+    hand_index: u16,
     postflop_ev: PostflopEvTrace,
 }
 
@@ -46,7 +46,7 @@ struct PositionEv {
 
 #[derive(Serialize)]
 struct HandSummary {
-    bucket_range: [u16; 2],
+    canonical_index: usize,
     avg_postflop_ev_mid_spr: PositionEv,
 }
 
@@ -61,12 +61,11 @@ pub fn run_with_abstraction(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let all_hands_vec: Vec<CanonicalHand> = all_hands().collect();
     let flops = &abstraction.flops;
-    let num_flop_boards = abstraction.buckets.num_flop_boards();
-    let num_buckets = abstraction.buckets.num_flop_buckets as usize;
+    let num_hands = 169;
 
     eprintln!("Tracing all {} canonical hands...", all_hands_vec.len());
 
-    let output = build_trace_output(&all_hands_vec, flops, abstraction, num_flop_boards, num_buckets);
+    let output = build_trace_output(&all_hands_vec, flops, abstraction, num_hands);
     println!("{}", serde_json::to_string_pretty(&output)?);
 
     Ok(())
@@ -81,29 +80,22 @@ fn build_trace_output(
     all_hands: &[CanonicalHand],
     flops: &[[Card; 3]],
     abstraction: &PostflopAbstraction,
-    num_flop_boards: usize,
-    num_buckets: usize,
+    num_hands: usize,
 ) -> TraceOutput {
-    let num_textures = num_flop_boards.min(flops.len());
+    let num_textures = flops.len();
 
     let hands: Vec<HandTrace> = all_hands
         .iter()
         .enumerate()
         .map(|(hand_idx, hand)| {
             let mut textures = Vec::with_capacity(num_textures);
-            let mut min_bucket = u16::MAX;
-            let mut max_bucket = 0_u16;
             let mut ev_sb_sum = 0.0_f64;
             let mut ev_bb_sum = 0.0_f64;
             let mut ev_count = 0_usize;
 
-            #[allow(clippy::needless_range_loop)]
             for tex_id in 0..num_textures {
-                let bucket = abstraction.buckets.flop_bucket_for_hand(hand_idx, tex_id);
-                let postflop_ev = compute_postflop_ev(abstraction, bucket, num_buckets);
+                let postflop_ev = compute_postflop_ev(abstraction, hand_idx as u16, num_hands);
 
-                min_bucket = min_bucket.min(bucket);
-                max_bucket = max_bucket.max(bucket);
                 ev_sb_sum += postflop_ev.avg_sb;
                 ev_bb_sum += postflop_ev.avg_bb;
                 ev_count += 1;
@@ -113,7 +105,7 @@ fn build_trace_output(
                 textures.push(TextureTrace {
                     texture_id: tex_id,
                     prototype_flop: flop_str,
-                    flop_bucket: bucket,
+                    hand_index: hand_idx as u16,
                     postflop_ev,
                 });
             }
@@ -132,7 +124,7 @@ fn build_trace_output(
                 canonical_index: hand_idx,
                 textures,
                 summary: HandSummary {
-                    bucket_range: [min_bucket, max_bucket],
+                    canonical_index: hand_idx,
                     avg_postflop_ev_mid_spr: avg_ev_mid_spr,
                 },
             }
@@ -146,24 +138,24 @@ fn build_trace_output(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Average postflop EV for a hero bucket across all opponent buckets (uniform weighting).
+/// Average postflop EV for a hero hand across all opponent hands (uniform weighting).
 #[allow(clippy::cast_precision_loss)]
 fn compute_postflop_ev(
     abstraction: &PostflopAbstraction,
-    hero_bucket: u16,
-    num_buckets: usize,
+    hero_hand: u16,
+    num_hands: usize,
 ) -> PostflopEvTrace {
     let num_flops = abstraction.values.num_flops();
     let mut evs = [0.0_f64; 2];
     for pos in 0..2_u8 {
         let sum: f64 = (0..num_flops)
             .flat_map(|flop_idx| {
-                (0..num_buckets as u16)
-                    .map(move |opp| abstraction.values.get_by_flop(flop_idx, pos, hero_bucket, opp))
+                (0..num_hands as u16)
+                    .map(move |opp| abstraction.values.get_by_flop(flop_idx, pos, hero_hand, opp))
             })
             .sum();
         #[allow(clippy::cast_precision_loss)]
-        let denom = (num_flops * num_buckets) as f64;
+        let denom = (num_flops * num_hands) as f64;
         evs[pos as usize] = sum / denom;
     }
     PostflopEvTrace {

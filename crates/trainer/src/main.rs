@@ -780,12 +780,6 @@ fn run_solve_postflop(config_path: &Path, output: &Path) -> Result<(), Box<dyn E
                 pb.set_position(*completed as u64);
                 pb.set_message("MCCFR Solving");
             }
-            BuildPhase::ExtractingEv(done, total) => {
-                pb.set_style(bar_style.clone());
-                pb.set_length(*total as u64);
-                pb.set_position(*done as u64);
-                pb.set_message("EV histograms");
-            }
             _ => {
                 pb.set_style(spinner_style.clone());
                 pb.set_message(format!("{phase}..."));
@@ -1021,14 +1015,6 @@ fn run_solve_preflop(
                             let mut guard = flop_state.lock().unwrap();
                             let fbs = &mut *guard;
                             match stage {
-                                FlopStage::Bucketing { step, total_steps } => {
-                                    fbs.states.insert(flop_name.clone(), FlopSlotData {
-                                        sort_key: f64::from(*step) / f64::from((*total_steps).max(1)),
-                                        position: u64::from(*step),
-                                        length: u64::from(*total_steps),
-                                        message: format!("Flop '{flop_name}' Bucketing"),
-                                    });
-                                }
                                 FlopStage::Solving { iteration, max_iterations, delta } => {
                                     #[allow(clippy::cast_precision_loss)]
                                     let key = 1.0 + *iteration as f64 / (*max_iterations).max(1) as f64;
@@ -1060,26 +1046,6 @@ fn run_solve_preflop(
                                 fbs.last_refresh = Instant::now();
                                 refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
                             }
-                        }
-                        BuildPhase::ExtractingEv(done, total) => {
-                            // Clear flop bars, show extraction progress.
-                            let mut guard = flop_state.lock().unwrap();
-                            let fbs = &mut *guard;
-                            fbs.states.clear();
-                            for bar in fbs.slots.drain(..) {
-                                bar.finish_and_clear();
-                                multi.remove(&bar);
-                            }
-                            phase_bar.set_style(bar_style.clone());
-                            phase_bar.set_length(*total as u64);
-                            phase_bar.set_position(*done as u64);
-                            phase_bar.set_message("EV histograms");
-                        }
-                        BuildPhase::Rebucketing(round, total) => {
-                            phase_bar.set_style(spinner_style.clone());
-                            phase_bar.set_message(format!(
-                                "Rebucketing ({round}/{total})..."
-                            ));
                         }
                         BuildPhase::MccfrFlopsCompleted { completed, total } => {
                             // Update the main progress bar without clearing per-flop sub-bars.

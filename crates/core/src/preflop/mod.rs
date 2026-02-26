@@ -8,7 +8,7 @@ pub mod equity;
 pub mod hand_buckets;
 pub mod postflop_abstraction;
 pub mod postflop_bundle;
-pub(crate) mod postflop_bucketed;
+// postflop_bucketed removed: Bucketed solve type no longer exists.
 pub mod postflop_hands;
 pub(crate) mod postflop_mccfr;
 pub mod postflop_model;

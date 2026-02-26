@@ -1,30 +1,23 @@
-//! End-to-end integration test for the imperfect-recall postflop abstraction pipeline.
+//! End-to-end integration test for the postflop abstraction pipeline.
 //!
 //! Verifies the full pipeline works:
-//! canonical board enumeration -> histogram CDF features -> independent per-street clustering ->
-//! per-flop equity tables -> postflop CFR solve -> value table extraction.
+//! canonical board enumeration -> 169-hand combo map -> per-flop MCCFR solve ->
+//! value table extraction.
 //!
-//! The bottleneck is EHS feature computation (169 hands x ~1755 canonical flops), which
-//! takes several minutes even in release mode. All tests here are `#[ignore]`.
+//! All tests here are `#[ignore]`.
 
 use poker_solver_core::preflop::postflop_abstraction::PostflopAbstraction;
 use poker_solver_core::preflop::postflop_model::PostflopModelConfig;
 
-/// Verify the full imperfect-recall abstraction pipeline:
-/// canonical boards -> histogram CDFs -> independent per-street clustering ->
-/// per-flop equity tables -> postflop CFR -> value table extraction.
+/// Verify the full 169-hand MCCFR abstraction pipeline:
+/// canonical boards -> combo maps -> per-flop MCCFR solve -> value table extraction.
 ///
 /// Run with: `cargo test -p poker-solver-core --test postflop_imperfect_recall --release -- --ignored --nocapture`
 #[test]
 #[ignore = "slow (~5 min in release): full postflop abstraction pipeline"]
-fn postflop_abstraction_with_imperfect_recall_builds_and_solves() {
-    let num_buckets: u16 = 10;
-
-    // Minimal config: 10 buckets per street, single SPR, 50 CFR iterations.
+fn postflop_abstraction_with_169_hands_builds_and_solves() {
+    // Minimal config: single SPR, 50 CFR iterations.
     let config = PostflopModelConfig {
-        num_hand_buckets_flop: num_buckets,
-        num_hand_buckets_turn: num_buckets,
-        num_hand_buckets_river: num_buckets,
         postflop_sprs: vec![5.0],
         postflop_solve_iterations: 50,
         bet_sizes: vec![1.0],
@@ -60,11 +53,6 @@ fn postflop_abstraction_with_imperfect_recall_builds_and_solves() {
         "spr should be 5.0"
     );
 
-    // Buckets should be populated.
-    assert_eq!(abstraction.buckets.num_flop_buckets, num_buckets);
-    assert_eq!(abstraction.buckets.num_turn_buckets, num_buckets);
-    assert_eq!(abstraction.buckets.num_river_buckets, num_buckets);
-
     // Value table should be non-empty.
     assert!(
         !abstraction.values.is_empty(),
@@ -79,12 +67,11 @@ fn postflop_abstraction_with_imperfect_recall_builds_and_solves() {
     // --- Value table spot checks ---
 
     // Query a few entries and verify they are finite.
-    let n = num_buckets as usize;
     for flop_idx in 0..num_flops.min(3) {
         for hero_pos in 0..2u8 {
-            for hb in 0..n.min(3) {
-                for ob in 0..n.min(3) {
-                    let val = abstraction.values.get_by_flop(flop_idx, hero_pos, hb as u16, ob as u16);
+            for hb in 0..5u16 {
+                for ob in 0..5u16 {
+                    let val = abstraction.values.get_by_flop(flop_idx, hero_pos, hb, ob);
                     assert!(
                         val.is_finite(),
                         "EV should be finite for flop={flop_idx} pos={hero_pos} hb={hb} ob={ob}, got {val}"
@@ -94,28 +81,13 @@ fn postflop_abstraction_with_imperfect_recall_builds_and_solves() {
         }
     }
 
-    // Zero-sum check: for the same bucket pair, hero EV as position 0 and position 1
+    // Zero-sum check: for the same hand pair, hero EV as position 0 and position 1
     // should sum close to zero (exact zero for converged symmetric game).
     let v_pos0 = abstraction.values.get_by_flop(0, 0, 0, 1);
     let v_pos1 = abstraction.values.get_by_flop(0, 1, 0, 1);
     eprintln!("  [check] v(pos0, 0v1) = {v_pos0:.4}, v(pos1, 0v1) = {v_pos1:.4}");
     assert!(v_pos0.is_finite());
     assert!(v_pos1.is_finite());
-
-    // Street equity tables are None in streaming mode (only populated for diagnostics/cache).
-    // The streaming pipeline drops equity tables after solving each flop.
-    if let Some(ref eq) = abstraction.street_equity {
-        assert!(!eq.flop.is_empty());
-        for flop_eq in &eq.flop {
-            assert_eq!(flop_eq.num_buckets, n);
-        }
-        for turn_eq in &eq.turn {
-            assert_eq!(turn_eq.num_buckets, n);
-        }
-        for river_eq in &eq.river {
-            assert_eq!(river_eq.num_buckets, n);
-        }
-    }
 
     eprintln!(
         "  [done] value table has {} entries across {} flops",

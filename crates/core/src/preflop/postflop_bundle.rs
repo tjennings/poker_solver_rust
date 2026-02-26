@@ -1,6 +1,6 @@
 //! Postflop solve bundle persistence.
 //!
-//! Saves and loads a `PostflopModelConfig` + solved data (buckets, values, flops, spr):
+//! Saves and loads a `PostflopModelConfig` + solved data (values, flops, spr):
 //! ```text
 //! postflop_bundle/
 //! ├── config.yaml      # Human-readable PostflopModelConfig
@@ -14,7 +14,6 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::hand_buckets::StreetBuckets;
 use super::postflop_abstraction::{
     PostflopAbstraction, PostflopAbstractionError, PostflopValues, compute_hand_avg_values,
 };
@@ -24,7 +23,6 @@ use crate::poker::Card;
 /// Serializable payload for a postflop solve bundle.
 #[derive(Serialize, Deserialize)]
 struct PostflopBundleData {
-    buckets: StreetBuckets,
     values: PostflopValues,
     /// Hand-averaged EV: `[pos0: 169×169, pos1: 169×169]`.
     hand_avg_values: Vec<f64>,
@@ -45,7 +43,6 @@ impl PostflopBundle {
         Self {
             config: config.clone(),
             data: PostflopBundleData {
-                buckets: abs.buckets.clone(),
                 values: PostflopValues::from_raw(
                     abs.values.values.clone(),
                     abs.values.num_buckets,
@@ -96,7 +93,7 @@ impl PostflopBundle {
     ///
     /// Rebuilds the `PostflopTree` from the stored config (cheap).
     /// Uses the precomputed `hand_avg_values` from the bundle if present,
-    /// otherwise recomputes from buckets + values.
+    /// otherwise recomputes from values.
     ///
     /// # Errors
     ///
@@ -104,15 +101,12 @@ impl PostflopBundle {
     pub fn into_abstraction(self) -> Result<PostflopAbstraction, PostflopAbstractionError> {
         let hand_avg = if self.data.hand_avg_values.is_empty() {
             // Backward compat: recompute if bundle was saved without avg values.
-            compute_hand_avg_values(&self.data.buckets, &self.data.values)
+            compute_hand_avg_values(&self.data.values)
         } else {
             self.data.hand_avg_values
         };
         PostflopAbstraction::build_from_cached(
             &self.config,
-            self.data.buckets,
-            None,
-            None,
             self.data.values,
             hand_avg,
             self.data.flops,
@@ -143,21 +137,12 @@ mod tests {
 
     fn minimal_bundle() -> PostflopBundle {
         let config = PostflopModelConfig::fast();
-        let buckets = StreetBuckets {
-            flop: vec![vec![0u16]],
-            num_flop_buckets: 1,
-            turn: vec![vec![0u16]],
-            num_turn_buckets: 1,
-            river: vec![vec![0u16]],
-            num_river_buckets: 1,
-        };
         let values = PostflopValues::from_raw(vec![0.5; 8], 1, 1);
-        let hand_avg_values = compute_hand_avg_values(&buckets, &values);
+        let hand_avg_values = compute_hand_avg_values(&values);
         let flops = vec![];
         PostflopBundle {
             config,
             data: PostflopBundleData {
-                buckets,
                 values,
                 hand_avg_values,
                 flops,

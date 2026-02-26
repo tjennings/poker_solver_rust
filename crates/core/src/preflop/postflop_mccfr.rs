@@ -2,10 +2,10 @@
 //!
 //! Instead of abstract bucket-to-bucket transitions at street changes, this
 //! backend uses **concrete hands** (actual `Card` pairs). For each sample it
-//! picks two non-conflicting hands from flop buckets and a random turn + river.
-//! At showdown terminals it uses `rank_hand()` to evaluate actual hands against
-//! the full 5-card board. Strategies and regrets are still indexed by **flop
-//! bucket** (not by concrete hand).
+//! picks two non-conflicting hands from canonical hand combos and a random turn
+//! + river. At showdown terminals it uses `rank_hand()` to evaluate actual hands
+//! against the full 5-card board. Strategies and regrets are indexed by canonical
+//! hand index (0..168).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -13,53 +13,17 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
-use super::hand_buckets::{self, StreetBuckets};
 use super::postflop_abstraction::{
     BuildPhase, FlopSolveResult, FlopStage, PostflopLayout, PostflopValues,
     add_buffers, regret_matching_into, normalize_strategy_sum, weighted_avg_strategy_delta,
     MAX_POSTFLOP_ACTIONS,
 };
+use super::postflop_hands::{build_combo_map, all_cards_vec, NUM_CANONICAL_HANDS};
 use super::postflop_model::PostflopModelConfig;
 use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree};
 use crate::abstraction::Street;
-use crate::hands::CanonicalHand;
 use crate::poker::Card;
 use crate::showdown_equity::rank_hand;
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Types
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Maps flop_bucket → list of concrete (Card, Card) hand combos in that bucket.
-struct FlopBucketMap {
-    /// `bucket_hands[bucket]` = list of hands assigned to that bucket.
-    bucket_hands: Vec<Vec<(Card, Card)>>,
-    num_buckets: usize,
-}
-
-impl FlopBucketMap {
-    /// Build from flop bucket assignments and the canonical 169 hands.
-    ///
-    /// `assignments[hand_idx]` → bucket index for each of the 169 canonical
-    /// hands. Each canonical hand is expanded into its concrete combos and
-    /// only non-conflicting combos (with the flop) are kept.
-    fn build(assignments: &[u16], num_buckets: usize, flop: &[Card; 3]) -> Self {
-        let hands: Vec<CanonicalHand> = crate::hands::all_hands().collect();
-        let mut bucket_hands = vec![Vec::new(); num_buckets];
-        for (i, &bucket) in assignments.iter().enumerate() {
-            for &(c1, c2) in &hands[i].combos() {
-                if hand_buckets::board_conflicts([c1, c2], flop) {
-                    continue;
-                }
-                bucket_hands[bucket as usize].push((c1, c2));
-            }
-        }
-        Self {
-            bucket_hands,
-            num_buckets,
-        }
-    }
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Entry point
@@ -68,13 +32,11 @@ impl FlopBucketMap {
 /// Build postflop abstraction using MCCFR with sampled concrete hands.
 ///
 /// Pipeline per flop (parallelised via rayon):
-/// 1. Compute flop histogram features and cluster into `num_hand_buckets_flop` buckets.
-/// 2. Build `FlopBucketMap` mapping bucket → concrete card combos.
-/// 3. Run MCCFR training loop (`mccfr_solve_one_flop`).
-/// 4. Extract EV table from converged strategy (`mccfr_extract_values`).
+/// 1. Build combo map — each canonical hand (0..168) maps to its concrete combos.
+/// 2. Run MCCFR training loop (`mccfr_solve_one_flop`).
+/// 3. Extract EV table from converged strategy (`mccfr_extract_values`).
 ///
-/// Returns `(StreetBuckets, PostflopValues)`. Turn/river bucket fields are
-/// empty since MCCFR uses only flop buckets with concrete runouts.
+/// Returns `PostflopValues` indexed by canonical hand indices (169).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_mccfr(
     config: &PostflopModelConfig,
@@ -83,135 +45,62 @@ pub(crate) fn build_mccfr(
     node_streets: &[Street],
     flops: &[[Card; 3]],
     on_progress: &(impl Fn(BuildPhase) + Sync),
-) -> (StreetBuckets, PostflopValues) {
-    let hands: Vec<CanonicalHand> = crate::hands::all_hands().collect();
+) -> PostflopValues {
     let num_flops = flops.len();
-    let nfb = config.num_hand_buckets_flop as usize;
+    let n = NUM_CANONICAL_HANDS;
     let num_iterations = config.postflop_solve_iterations as usize;
     let _ = node_streets; // Streets are embedded in the layout already.
     let completed = AtomicUsize::new(0);
 
-    // Phase 1: per-flop solve
-    let results: Vec<(Vec<u16>, Vec<f64>)> = (0..num_flops)
+    let results: Vec<Vec<f64>> = (0..num_flops)
         .into_par_iter()
         .map(|flop_idx| {
             let flop = &flops[flop_idx];
             let flop_name = format!("{}{}{}", flop[0], flop[1], flop[2]);
 
-            // Step 1: Assign hands to buckets.
-            // When num_buckets >= num_hands (e.g. 169 buckets for 169 hands),
-            // each hand gets its own bucket — skip expensive histogram + k-means.
-            let assignments = if nfb >= hands.len() {
-                #[allow(clippy::cast_possible_truncation)]
-                let id: Vec<u16> = (0..hands.len() as u16).collect();
-                id
-            } else {
-                on_progress(BuildPhase::FlopProgress {
-                    flop_name: flop_name.clone(),
-                    stage: FlopStage::Bucketing { step: 0, total_steps: 3 },
-                });
-                let flop_features = hand_buckets::compute_flop_histograms(
-                    &hands,
-                    std::slice::from_ref(flop),
-                    &|_| {},
-                );
-                on_progress(BuildPhase::FlopProgress {
-                    flop_name: flop_name.clone(),
-                    stage: FlopStage::Bucketing { step: 1, total_steps: 3 },
-                });
+            // Build combo map — no clustering needed
+            let combo_map = build_combo_map(flop);
 
-                let a = hand_buckets::cluster_histograms(
-                    &flop_features,
-                    config.num_hand_buckets_flop,
-                );
-                on_progress(BuildPhase::FlopProgress {
-                    flop_name: flop_name.clone(),
-                    stage: FlopStage::Bucketing { step: 2, total_steps: 3 },
-                });
-                a
-            };
-
-            // Step 2: Build bucket map
-            let bucket_map = FlopBucketMap::build(&assignments, nfb, flop);
-
-            // Step 3: Compute sample count
-            let total_non_conflicting: usize =
-                bucket_map.bucket_hands.iter().map(Vec::len).sum();
-            // Remaining deck after flop (3 cards) and one hand (2 cards) = 47 cards
-            // for turn, then 46 for river. But we're choosing turn+river from deck
-            // minus flop minus both hands (7 used), so 45 cards for turn, 44 for river.
+            // Compute sample count
+            let total_non_conflicting: usize = combo_map.iter().map(Vec::len).sum();
             let live_runouts = 45usize * 44;
             let total_space = total_non_conflicting.saturating_mul(live_runouts);
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_precision_loss,
-                clippy::cast_sign_loss
-            )]
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
             let samples_per_iter = ((total_space as f64 * config.mccfr_sample_pct) as usize
-                / num_iterations.max(1))
-            .max(1);
+                / num_iterations.max(1)).max(1);
 
-            // Step 4: Solve
+            // Solve
             let result = mccfr_solve_one_flop(
-                tree,
-                layout,
-                &bucket_map,
-                flop,
-                num_iterations,
-                samples_per_iter,
+                tree, layout, &combo_map, flop,
+                num_iterations, samples_per_iter,
                 config.cfr_convergence_threshold,
-                &flop_name,
-                on_progress,
+                &flop_name, on_progress,
             );
 
-            // Step 5: Extract values
+            // Extract values
             let values = mccfr_extract_values(
-                tree,
-                layout,
-                &result.strategy_sum,
-                &bucket_map,
-                flop,
-                config.value_extraction_samples as usize,
-                nfb,
-                config.ev_convergence_threshold,
-                &flop_name,
-                on_progress,
+                tree, layout, &result.strategy_sum, &combo_map, flop,
+                config.value_extraction_samples as usize, n,
+                config.ev_convergence_threshold, &flop_name, on_progress,
             );
 
-            on_progress(BuildPhase::FlopProgress {
-                flop_name: flop_name.clone(),
-                stage: FlopStage::Done,
-            });
-
+            on_progress(BuildPhase::FlopProgress { flop_name: flop_name.clone(), stage: FlopStage::Done });
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             on_progress(BuildPhase::MccfrFlopsCompleted { completed: done, total: num_flops });
 
-            (assignments, values)
+            values
         })
         .collect();
 
-    // Assemble results
-    let mut flop_assignments: Vec<Vec<u16>> = Vec::with_capacity(num_flops);
-    let mut all_values = vec![0.0f64; num_flops * 2 * nfb * nfb];
-    for (flop_idx, (fb, vals)) in results.into_iter().enumerate() {
-        flop_assignments.push(fb);
-        let offset = flop_idx * 2 * nfb * nfb;
-        let copy_len = vals.len().min(2 * nfb * nfb);
+    // Assemble
+    let mut all_values = vec![0.0f64; num_flops * 2 * n * n];
+    for (flop_idx, vals) in results.into_iter().enumerate() {
+        let offset = flop_idx * 2 * n * n;
+        let copy_len = vals.len().min(2 * n * n);
         all_values[offset..offset + copy_len].copy_from_slice(&vals[..copy_len]);
     }
 
-    let buckets = StreetBuckets {
-        flop: flop_assignments,
-        num_flop_buckets: config.num_hand_buckets_flop,
-        turn: Vec::new(),
-        num_turn_buckets: 0,
-        river: Vec::new(),
-        num_river_buckets: 0,
-    };
-
-    let values = PostflopValues::from_raw(all_values, nfb, num_flops);
-
-    (buckets, values)
+    PostflopValues::from_raw(all_values, n, num_flops)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -228,7 +117,7 @@ pub(crate) fn build_mccfr(
 fn mccfr_solve_one_flop(
     tree: &PostflopTree,
     layout: &PostflopLayout,
-    bucket_map: &FlopBucketMap,
+    combo_map: &[Vec<(Card, Card)>],
     flop: &[Card; 3],
     num_iterations: usize,
     samples_per_iter: usize,
@@ -255,7 +144,7 @@ fn mccfr_solve_one_flop(
         let mut ds = vec![0.0f64; buf_size];
 
         for _ in 0..samples_per_iter {
-            let deal = sample_deal(bucket_map, flop, &mut rng);
+            let deal = sample_deal(combo_map, flop, &mut rng);
             let Some((hb, ob, hero_hand, opp_hand, turn, river)) = deal else {
                 continue;
             };
@@ -315,33 +204,33 @@ fn mccfr_solve_one_flop(
 // Deal sampling
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Sample a concrete deal: two non-conflicting hands from random buckets plus
-/// random turn + river cards.
+/// Sample a concrete deal: two non-conflicting hands from random canonical hand
+/// indices plus random turn + river cards.
 ///
-/// Returns `(hero_bucket, opp_bucket, hero_hand, opp_hand, turn_card, river_card)`.
+/// Returns `(hero_hand_idx, opp_hand_idx, hero_hand, opp_hand, turn_card, river_card)`.
 #[allow(clippy::cast_possible_truncation)]
 fn sample_deal(
-    bucket_map: &FlopBucketMap,
+    combo_map: &[Vec<(Card, Card)>],
     flop: &[Card; 3],
     rng: &mut SmallRng,
 ) -> Option<(u16, u16, [Card; 2], [Card; 2], Card, Card)> {
-    let hb = rng.random_range(0..bucket_map.num_buckets as u16);
-    let ob = rng.random_range(0..bucket_map.num_buckets as u16);
+    let n = combo_map.len();
+    let hero_hand_idx = rng.random_range(0..n) as u16;
+    let opp_hand_idx = rng.random_range(0..n) as u16;
 
-    let hero_hands = &bucket_map.bucket_hands[hb as usize];
-    let opp_hands = &bucket_map.bucket_hands[ob as usize];
-    if hero_hands.is_empty() || opp_hands.is_empty() {
+    let hero_combos = &combo_map[hero_hand_idx as usize];
+    let opp_combos = &combo_map[opp_hand_idx as usize];
+    if hero_combos.is_empty() || opp_combos.is_empty() {
         return None;
     }
 
-    let hero_idx = rng.random_range(0..hero_hands.len());
-    let (h1, h2) = hero_hands[hero_idx];
+    let hero_idx = rng.random_range(0..hero_combos.len());
+    let (h1, h2) = hero_combos[hero_idx];
 
-    // Find a non-conflicting opponent hand (try up to 10 times)
     let mut opp_hand = None;
     for _ in 0..10 {
-        let idx = rng.random_range(0..opp_hands.len());
-        let (o1, o2) = opp_hands[idx];
+        let idx = rng.random_range(0..opp_combos.len());
+        let (o1, o2) = opp_combos[idx];
         if o1 != h1 && o1 != h2 && o2 != h1 && o2 != h2 {
             opp_hand = Some((o1, o2));
             break;
@@ -349,23 +238,18 @@ fn sample_deal(
     }
     let (o1, o2) = opp_hand?;
 
-    // Build remaining deck and pick turn + river
     let used = [flop[0], flop[1], flop[2], h1, h2, o1, o2];
-    let deck: Vec<Card> = hand_buckets::all_cards_vec()
+    let deck: Vec<Card> = all_cards_vec()
         .into_iter()
         .filter(|c| !used.contains(c))
         .collect();
-    if deck.len() < 2 {
-        return None;
-    }
+    if deck.len() < 2 { return None; }
 
     let t_idx = rng.random_range(0..deck.len());
     let mut r_idx = rng.random_range(0..deck.len() - 1);
-    if r_idx >= t_idx {
-        r_idx += 1;
-    }
+    if r_idx >= t_idx { r_idx += 1; }
 
-    Some((hb, ob, [h1, h2], [o1, o2], deck[t_idx], deck[r_idx]))
+    Some((hero_hand_idx, opp_hand_idx, [h1, h2], [o1, o2], deck[t_idx], deck[r_idx]))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -529,7 +413,7 @@ fn mccfr_traverse(
 /// Monte Carlo value extraction after convergence.
 ///
 /// Samples random deals, evaluates using the averaged strategy, and
-/// accumulates per `(hero_pos, hero_bucket, opp_bucket)`. Returns a flat
+/// accumulates per `(hero_pos, hero_hand_idx, opp_hand_idx)`. Returns a flat
 /// `Vec<f64>` of size `2 * n * n`.
 #[allow(
     clippy::too_many_arguments,
@@ -540,7 +424,7 @@ fn mccfr_extract_values(
     tree: &PostflopTree,
     layout: &PostflopLayout,
     strategy_sum: &[f64],
-    bucket_map: &FlopBucketMap,
+    combo_map: &[Vec<(Card, Card)>],
     flop: &[Card; 3],
     num_samples: usize,
     num_flop_buckets: usize,
@@ -611,7 +495,7 @@ fn mccfr_extract_values(
         }
 
         let Some((hb, ob, hero_hand, opp_hand, turn, river)) =
-            sample_deal(bucket_map, flop, &mut rng)
+            sample_deal(combo_map, flop, &mut rng)
         else {
             continue;
         };
@@ -751,6 +635,7 @@ mod tests {
     use super::*;
     use crate::poker::{Suit, Value};
     use crate::preflop::postflop_abstraction::annotate_streets;
+    use crate::preflop::postflop_model::PostflopSolveType;
     use test_macros::timed_test;
 
     fn card(v: Value, s: Suit) -> Card {
@@ -766,23 +651,17 @@ mod tests {
         ]
     }
 
-    /// Build a minimal config and tree for testing.
-    fn test_config(num_buckets: u16) -> PostflopModelConfig {
+    /// Build a minimal config for testing.
+    fn test_config() -> PostflopModelConfig {
         PostflopModelConfig {
-            num_hand_buckets_flop: num_buckets,
-            num_hand_buckets_turn: num_buckets,
-            num_hand_buckets_river: num_buckets,
             bet_sizes: vec![1.0],
             max_raises_per_street: 1,
             postflop_solve_iterations: 50,
-            postflop_solve_samples: 0,
             postflop_sprs: vec![3.5],
-            rebucket_rounds: 1,
             cfr_convergence_threshold: 0.01,
             max_flop_boards: 1,
             fixed_flops: None,
-            equity_rollout_fraction: 1.0,
-            solve_type: super::super::postflop_model::PostflopSolveType::Mccfr,
+            solve_type: PostflopSolveType::Mccfr,
             mccfr_sample_pct: 0.01,
             value_extraction_samples: 1000,
             ev_convergence_threshold: 0.001,
@@ -790,25 +669,19 @@ mod tests {
     }
 
     #[timed_test]
-    fn flop_bucket_map_construction() {
+    fn combo_map_construction() {
         let flop = test_flop();
-        // Build simple assignments: all hands → bucket 0 or 1
-        let assignments: Vec<u16> = (0..169).map(|i| (i % 3) as u16).collect();
-        let map = FlopBucketMap::build(&assignments, 3, &flop);
+        let combo_map = build_combo_map(&flop);
 
-        assert_eq!(map.num_buckets, 3);
-        // Every bucket should have some hands (169 hands across 3 buckets)
-        for b in 0..3 {
-            assert!(
-                !map.bucket_hands[b].is_empty(),
-                "bucket {b} should not be empty"
-            );
-        }
+        assert_eq!(combo_map.len(), NUM_CANONICAL_HANDS);
+        // Every hand should have some combos (except maybe those conflicting with flop)
+        let non_empty = combo_map.iter().filter(|c| !c.is_empty()).count();
+        assert!(non_empty > 100, "most hands should have non-empty combos, got {non_empty}");
         // Verify no card conflicts with flop
-        for bucket_hands in &map.bucket_hands {
-            for &(c1, c2) in bucket_hands {
+        for combos in &combo_map {
+            for &(c1, c2) in combos {
                 assert!(
-                    !hand_buckets::board_conflicts([c1, c2], &flop),
+                    !super::super::postflop_hands::board_conflicts([c1, c2], &flop),
                     "hand ({c1}, {c2}) conflicts with flop"
                 );
             }
@@ -817,11 +690,11 @@ mod tests {
 
     #[timed_test]
     fn mccfr_traverse_fold_terminal() {
-        let config = test_config(3);
+        let config = test_config();
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
         let node_streets = annotate_streets(&tree);
-        let nfb = 3;
-        let layout = PostflopLayout::build(&tree, &node_streets, nfb, nfb, nfb);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
 
         let buf_size = layout.total_size;
         let snapshot = vec![0.0f64; buf_size];
@@ -896,11 +769,11 @@ mod tests {
 
     #[timed_test]
     fn mccfr_traverse_showdown_terminal() {
-        let config = test_config(3);
+        let config = test_config();
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
         let node_streets = annotate_streets(&tree);
-        let nfb = 3;
-        let layout = PostflopLayout::build(&tree, &node_streets, nfb, nfb, nfb);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
 
         let buf_size = layout.total_size;
         let snapshot = vec![0.0f64; buf_size];
@@ -967,20 +840,19 @@ mod tests {
 
     #[timed_test]
     fn mccfr_solve_tiny_tree_converges() {
-        let config = test_config(3);
+        let config = test_config();
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
         let node_streets = annotate_streets(&tree);
-        let nfb = 3;
-        let layout = PostflopLayout::build(&tree, &node_streets, nfb, nfb, nfb);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
 
         let flop = test_flop();
-        let assignments: Vec<u16> = (0..169).map(|i| (i % 3) as u16).collect();
-        let bucket_map = FlopBucketMap::build(&assignments, nfb, &flop);
+        let combo_map = build_combo_map(&flop);
 
         let result = mccfr_solve_one_flop(
             &tree,
             &layout,
-            &bucket_map,
+            &combo_map,
             &flop,
             50,
             20,
@@ -997,21 +869,20 @@ mod tests {
 
     #[timed_test]
     fn mccfr_extract_values_correct_dimensions() {
-        let config = test_config(3);
+        let config = test_config();
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
         let node_streets = annotate_streets(&tree);
-        let nfb = 3;
-        let layout = PostflopLayout::build(&tree, &node_streets, nfb, nfb, nfb);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
 
         let flop = test_flop();
-        let assignments: Vec<u16> = (0..169).map(|i| (i % 3) as u16).collect();
-        let bucket_map = FlopBucketMap::build(&assignments, nfb, &flop);
+        let combo_map = build_combo_map(&flop);
 
         // Solve first
         let result = mccfr_solve_one_flop(
             &tree,
             &layout,
-            &bucket_map,
+            &combo_map,
             &flop,
             20,
             10,
@@ -1021,9 +892,9 @@ mod tests {
         );
 
         let values =
-            mccfr_extract_values(&tree, &layout, &result.strategy_sum, &bucket_map, &flop, 500, nfb, 0.001, "test", &|_| {});
+            mccfr_extract_values(&tree, &layout, &result.strategy_sum, &combo_map, &flop, 500, n, 0.001, "test", &|_| {});
 
-        assert_eq!(values.len(), 2 * nfb * nfb, "values should be 2*n*n");
+        assert_eq!(values.len(), 2 * n * n, "values should be 2*n*n");
         // All values should be finite
         assert!(
             values.iter().all(|v| v.is_finite()),
@@ -1034,40 +905,27 @@ mod tests {
     #[test]
     #[ignore = "slow: full MCCFR pipeline for single flop"]
     fn build_mccfr_single_flop() {
-        let config = test_config(5);
+        let config = test_config();
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
         let node_streets = annotate_streets(&tree);
-        let nfb = 5;
-        let layout = PostflopLayout::build(&tree, &node_streets, nfb, nfb, nfb);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
 
         let flop = [test_flop()];
 
-        let (buckets, values) =
+        let values =
             build_mccfr(&config, &tree, &layout, &node_streets, &flop, &|_| {});
 
-        // Verify bucket structure
-        assert_eq!(buckets.flop.len(), 1, "one flop");
-        assert_eq!(
-            buckets.flop[0].len(),
-            169,
-            "169 canonical hands bucketed"
-        );
-        assert!(buckets.turn.is_empty(), "MCCFR has no turn buckets");
-        assert!(buckets.river.is_empty(), "MCCFR has no river buckets");
-
         // Verify values dimensions
-        assert_eq!(values.len(), 2 * nfb * nfb, "values = 2*n*n");
+        assert_eq!(values.len(), 2 * n * n, "values = 2*n*n");
 
         // Check approximately zero-sum: sum of pos0 + pos1 should be near 0
-        let n = nfb;
         let mut total_ev = 0.0f64;
         let mut count = 0;
         for hb in 0..n as u16 {
             for ob in 0..n as u16 {
                 let ev0 = values.get_by_flop(0, 0, hb, ob);
                 let ev1 = values.get_by_flop(0, 1, hb, ob);
-                // These are from the same bucket matchup; in a fair game
-                // the sum over all matchups should tend toward zero.
                 total_ev += ev0 + ev1;
                 count += 1;
             }

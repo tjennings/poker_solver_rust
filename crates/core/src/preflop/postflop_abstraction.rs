@@ -1,40 +1,19 @@
 //! Postflop abstraction: precomputed data + CFR traversal for the abstracted postflop model.
 //!
-//! Combines board abstraction, hand buckets, and postflop trees into a single
-//! structure that the preflop solver queries at showdown terminals.
-//!
-//! # Architecture
-//!
-//! ```text
-//! PreflopSolver hits Showdown terminal
-//!   → PostflopAbstraction::evaluate(spr_idx, hero_hand, opp_hand, pot)
-//!     → look up hand buckets per street/texture
-//!     → traverse postflop tree with bucket-level regret matching
-//!     → return expected value
-//! ```
+//! Combines board abstraction, canonical 169-hand indexing, and postflop trees
+//! into a single structure that the preflop solver queries at showdown terminals.
 
 use serde::{Deserialize, Serialize};
 
-use super::equity::EquityTable;
-use super::hand_buckets::{BucketEquity, StreetBuckets, StreetEquity, TransitionMatrices};
-use super::postflop_bucketed::build_bucketed;
+use super::postflop_hands::{parse_flops, sample_canonical_flops, NUM_CANONICAL_HANDS};
 use super::postflop_mccfr::build_mccfr;
 use super::postflop_model::{PostflopModelConfig, PostflopSolveType};
-use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree};
+use super::postflop_tree::{PostflopNode, PostflopTree};
 use crate::abstraction::Street;
 use crate::poker::Card;
 
-/// Number of canonical hole-card pairs (169).
-pub const NUM_CANONICAL_HANDS: usize = 169;
-
 /// All precomputed postflop data needed by the preflop solver.
 pub struct PostflopAbstraction {
-    /// Flop bucket assignments (per-flop, needed at runtime).
-    pub buckets: StreetBuckets,
-    /// Per-flop equity tables (only populated for diagnostics/cached builds).
-    pub street_equity: Option<StreetEquity>,
-    /// Per-flop transition matrices (only populated for diagnostics/cached builds).
-    pub transitions: Option<TransitionMatrices>,
     /// Single shared tree template at `config.primary_spr()`.
     pub tree: PostflopTree,
     /// Precomputed EV table from solved postflop game.
@@ -51,10 +30,10 @@ pub struct PostflopAbstraction {
     pub flops: Vec<[Card; 3]>,
 }
 
-/// Precomputed EV table: `values[flop_idx][hero_pos][hero_bucket][opp_bucket]` → EV fraction.
+/// Precomputed EV table: `values[flop_idx][hero_pos][hero_hand][opp_hand]` → EV fraction.
 ///
 /// Stored as a flat `Vec<f64>` indexed by
-/// `flop_idx * 2 * n * n + hero_pos * n * n + hero_bucket * n + opp_bucket`.
+/// `flop_idx * 2 * n * n + hero_pos * n * n + hero_hand * n + opp_hand`.
 #[derive(Serialize, Deserialize)]
 pub struct PostflopValues {
     pub(crate) values: Vec<f64>,
@@ -120,6 +99,7 @@ pub(crate) struct PostflopLayout {
 pub(crate) struct NodeEntry {
     pub(crate) offset: usize,
     pub(crate) num_actions: usize,
+    #[allow(dead_code)] // Used by exhaustive backend (not yet implemented)
     pub(crate) street: Street,
 }
 
@@ -180,6 +160,7 @@ impl PostflopLayout {
     /// Street for a given node.
     #[inline]
     #[must_use]
+    #[allow(dead_code)] // Used by exhaustive backend (not yet implemented)
     pub fn street(&self, node_idx: u32) -> Street {
         self.entries[node_idx as usize].street
     }
@@ -260,10 +241,6 @@ pub enum PostflopAbstractionError {
 /// Stage within a single flop's streaming pipeline.
 #[derive(Debug, Clone)]
 pub enum FlopStage {
-    /// Computing buckets, equity tables, transition matrices.
-    /// `step` counts completed sub-steps (0..6): flop buckets, flop equity,
-    /// turn buckets, turn equity, river buckets, river equity.
-    Bucketing { step: u8, total_steps: u8 },
     /// CFR solve in progress.
     Solving {
         iteration: usize,
@@ -284,10 +261,6 @@ pub enum BuildPhase {
         flop_name: String,
         stage: FlopStage,
     },
-    /// Extracting EV histograms from converged strategy.
-    ExtractingEv(usize, usize),
-    /// Re-clustering with EV features.
-    Rebucketing(u16, u16),
     /// Computing value table from converged strategy.
     ComputingValues,
     /// Aggregate progress for MCCFR: how many flops have completed solve + extraction.
@@ -298,15 +271,12 @@ impl std::fmt::Display for BuildPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FlopProgress { flop_name, stage } => match stage {
-                FlopStage::Bucketing { step, total_steps } => write!(f, "Flop '{flop_name}' Bucketing ({step}/{total_steps})"),
                 FlopStage::Solving { iteration, max_iterations, delta } =>
                     write!(f, "Flop '{flop_name}' CFR \u{03b4}={delta:.4} ({iteration}/{max_iterations})"),
                 FlopStage::EstimatingEv { sample, total_samples, avg_delta } =>
                     write!(f, "Flop '{flop_name}' EV Estimation ({sample}/{total_samples}) \u{0394}={avg_delta:.4}"),
                 FlopStage::Done => write!(f, "Flop '{flop_name}' Done"),
             },
-            Self::ExtractingEv(done, total) => write!(f, "EV histograms ({done}/{total})"),
-            Self::Rebucketing(round, total) => write!(f, "Rebucketing ({round}/{total})"),
             Self::ComputingValues => write!(f, "Computing values"),
             Self::MccfrFlopsCompleted { completed, total } => write!(f, "MCCFR Solving ({completed}/{total} flops)"),
         }
@@ -320,65 +290,31 @@ impl PostflopAbstraction {
     /// This is expensive (minutes) — called once before training begins.
     /// Calls `on_progress(phase)` at the start of each build phase.
     ///
-    /// When `rebucket_rounds > 1`, runs an outer loop:
-    /// 1. Solve all flops with current bucket assignments
-    /// 2. Extract EV histograms from the converged strategy
-    /// 3. Re-cluster flop buckets using EV features
-    /// 4. Recompute pairwise equity for the new flop assignments
-    /// 5. Repeat from (1) until final round, then compute final values
-    ///
     /// # Errors
     ///
-    /// Returns an error if hand bucketing or tree building fails.
+    /// Returns an error if tree building fails.
     pub fn build(
         config: &PostflopModelConfig,
-        _equity_table: Option<&EquityTable>,
+        _equity_table: Option<&super::equity::EquityTable>,
         _cache_base: Option<&std::path::Path>,
         on_progress: impl Fn(BuildPhase) + Sync,
     ) -> Result<Self, PostflopAbstractionError> {
         let flops = if let Some(ref names) = config.fixed_flops {
-            crate::preflop::ehs::parse_flops(names)
-                .map_err(PostflopAbstractionError::InvalidConfig)?
+            parse_flops(names).map_err(PostflopAbstractionError::InvalidConfig)?
         } else {
-            crate::preflop::ehs::sample_canonical_flops(config.max_flop_boards)
+            sample_canonical_flops(config.max_flop_boards)
         };
-
-        // Build tree + layout (global, shared across all flops/rounds)
         let tree = PostflopTree::build_with_spr(config, config.primary_spr())?;
         let node_streets = annotate_streets(&tree);
-        let nfb = config.num_hand_buckets_flop as usize;
-        let ntb = config.num_hand_buckets_turn as usize;
-        let nrb = config.num_hand_buckets_river as usize;
-        let layout = match config.solve_type {
-            PostflopSolveType::Bucketed => PostflopLayout::build(&tree, &node_streets, nfb, ntb, nrb),
-            PostflopSolveType::Mccfr => PostflopLayout::build(&tree, &node_streets, nfb, nfb, nfb),
-        };
+        let layout = PostflopLayout::build(&tree, &node_streets, NUM_CANONICAL_HANDS, NUM_CANONICAL_HANDS, NUM_CANONICAL_HANDS);
 
-        let (buckets, values) = match config.solve_type {
-            PostflopSolveType::Bucketed => {
-                build_bucketed(
-                    config, &tree, &layout, &node_streets, &flops, &on_progress,
-                )
-            }
-            PostflopSolveType::Mccfr => {
-                build_mccfr(config, &tree, &layout, &node_streets, &flops, &on_progress)
-            }
+        let values = match config.solve_type {
+            PostflopSolveType::Mccfr => build_mccfr(config, &tree, &layout, &node_streets, &flops, &on_progress),
+            PostflopSolveType::Exhaustive => todo!("Exhaustive backend not yet implemented"),
         };
-
         on_progress(BuildPhase::ComputingValues);
-
-        let hand_avg_values = compute_hand_avg_values(&buckets, &values);
-
-        Ok(Self {
-            buckets,
-            street_equity: None,
-            transitions: None,
-            tree,
-            values,
-            hand_avg_values,
-            spr: config.primary_spr(),
-            flops,
-        })
+        let hand_avg_values = compute_hand_avg_values(&values);
+        Ok(Self { tree, values, hand_avg_values, spr: config.primary_spr(), flops })
     }
 
     /// Build `PostflopAbstraction` using pre-cached values, skipping the solve phase.
@@ -390,24 +326,12 @@ impl PostflopAbstraction {
     /// Returns an error if tree building fails.
     pub fn build_from_cached(
         config: &PostflopModelConfig,
-        buckets: StreetBuckets,
-        street_equity: Option<StreetEquity>,
-        transitions: Option<TransitionMatrices>,
         values: PostflopValues,
         hand_avg_values: Vec<f64>,
         flops: Vec<[Card; 3]>,
     ) -> Result<Self, PostflopAbstractionError> {
         let tree = PostflopTree::build_with_spr(config, config.primary_spr())?;
-        Ok(Self {
-            buckets,
-            street_equity,
-            transitions,
-            tree,
-            values,
-            hand_avg_values,
-            spr: config.primary_spr(),
-            flops,
-        })
+        Ok(Self { tree, values, hand_avg_values, spr: config.primary_spr(), flops })
     }
 
     /// Look up precomputed hand-averaged postflop EV.
@@ -436,38 +360,30 @@ impl PostflopAbstraction {
 
 /// Precompute hand-averaged postflop EV for all `(hero_pos, hero_hand, opp_hand)` triples.
 ///
-/// Averages `values.get_by_flop(flop_idx, pos, hb, ob)` across all flops for each
-/// canonical hand pair. Returns a flat `Vec<f64>` of size `2 × N × N` where
-/// N = number of hands in the bucket table (169 in production).
-/// Parallelized across hero hands with rayon.
+/// Averages `values.get_by_flop(flop_idx, pos, hand, opp)` across all flops for each
+/// canonical hand pair. Returns a flat `Vec<f64>` of size `2 * N * N` where
+/// N = 169 (canonical hands). Parallelized across hero hands with rayon.
 #[allow(clippy::cast_precision_loss)]
-pub fn compute_hand_avg_values(buckets: &StreetBuckets, values: &PostflopValues) -> Vec<f64> {
+pub fn compute_hand_avg_values(values: &PostflopValues) -> Vec<f64> {
     use rayon::prelude::*;
-
-    let num_flops = buckets.num_flop_boards();
-    let num_hands = if num_flops > 0 { buckets.flop[0].len() } else { 0 };
-    let inv_flops = if num_flops > 0 { 1.0 / num_flops as f64 } else { 0.0 };
-
-    // Allocate output: [pos0: N×N, pos1: N×N]
+    let num_flops = values.num_flops;
+    let num_hands = NUM_CANONICAL_HANDS;
+    if num_flops == 0 { return vec![0.0; 2 * num_hands * num_hands]; }
+    let inv_flops = 1.0 / num_flops as f64;
     let mut out = vec![0.0f64; 2 * num_hands * num_hands];
-
-    // Parallel over hero_hand — each writes to a disjoint slice per position.
     let chunks: Vec<(usize, Vec<f64>)> = (0..num_hands)
         .into_par_iter()
         .map(|hero_hand| {
             let mut local = vec![0.0f64; 2 * num_hands];
             for flop_idx in 0..num_flops {
-                let hb = buckets.flop_bucket_for_hand(hero_hand, flop_idx);
                 for opp_hand in 0..num_hands {
-                    let ob = buckets.flop_bucket_for_hand(opp_hand, flop_idx);
-                    local[opp_hand] += values.get_by_flop(flop_idx, 0, hb, ob);
-                    local[num_hands + opp_hand] += values.get_by_flop(flop_idx, 1, hb, ob);
+                    local[opp_hand] += values.get_by_flop(flop_idx, 0, hero_hand as u16, opp_hand as u16);
+                    local[num_hands + opp_hand] += values.get_by_flop(flop_idx, 1, hero_hand as u16, opp_hand as u16);
                 }
             }
             (hero_hand, local)
         })
         .collect();
-
     let n = num_hands;
     for (hero_hand, local) in chunks {
         for opp_hand in 0..n {
@@ -475,7 +391,6 @@ pub fn compute_hand_avg_values(buckets: &StreetBuckets, values: &PostflopValues)
             out[n * n + hero_hand * n + opp_hand] = local[n + opp_hand] * inv_flops;
         }
     }
-
     out
 }
 
@@ -601,29 +516,6 @@ pub(crate) fn normalize_strategy_sum(strategy_sum: &[f64], start: usize, num_act
 
 pub(crate) const MAX_POSTFLOP_ACTIONS: usize = 8;
 
-pub(crate) fn postflop_terminal_value(
-    terminal_type: PostflopTerminalType,
-    pot_fraction: f64,
-    hero_bucket: u16,
-    opp_bucket: u16,
-    hero_pos: u8,
-    bucket_equity: &BucketEquity,
-) -> f64 {
-    match terminal_type {
-        PostflopTerminalType::Fold { folder } => {
-            if folder == hero_pos {
-                -pot_fraction / 2.0
-            } else {
-                pot_fraction / 2.0
-            }
-        }
-        PostflopTerminalType::Showdown => {
-            let eq = f64::from(bucket_equity.get(hero_bucket as usize, opp_bucket as usize));
-            eq * pot_fraction - pot_fraction / 2.0
-        }
-    }
-}
-
 /// Regret matching: normalize positive regrets into a strategy.
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn regret_matching_into(regret_buf: &[f64], start: usize, out: &mut [f64]) {
@@ -710,45 +602,6 @@ mod tests {
     }
 
     #[timed_test]
-    fn postflop_terminal_fold_hero_loses() {
-        let eq = BucketEquity {
-            equity: vec![],
-            num_buckets: 0,
-        };
-        let val = postflop_terminal_value(
-            PostflopTerminalType::Fold { folder: 0 },
-            2.0, 0, 0, 0, &eq,
-        );
-        assert!((val - (-1.0)).abs() < 1e-9, "hero fold: loses pot/2");
-    }
-
-    #[timed_test]
-    fn postflop_terminal_fold_opponent_wins() {
-        let eq = BucketEquity {
-            equity: vec![],
-            num_buckets: 0,
-        };
-        let val = postflop_terminal_value(
-            PostflopTerminalType::Fold { folder: 1 },
-            2.0, 0, 0, 0, &eq,
-        );
-        assert!((val - 1.0).abs() < 1e-9, "opp fold: hero wins pot/2");
-    }
-
-    #[timed_test]
-    fn postflop_terminal_showdown_uses_bucket_equity() {
-        let eq = BucketEquity {
-            equity: vec![vec![0.7]],
-            num_buckets: 1,
-        };
-        let val = postflop_terminal_value(
-            PostflopTerminalType::Showdown,
-            2.0, 0, 0, 0, &eq,
-        );
-        assert!((val - 0.4).abs() < 1e-6, "showdown: eq*pot - pot/2, got {val}");
-    }
-
-    #[timed_test]
     fn regret_matching_uniform_when_no_positive() {
         let buf = vec![-1.0, -2.0, -3.0];
         let mut out = [0.0; 3];
@@ -777,7 +630,7 @@ mod tests {
         };
         let tree = PostflopTree::build_with_spr(&config, 5.0).unwrap();
         let streets = annotate_streets(&tree);
-        let layout = PostflopLayout::build(&tree, &streets, 10, 10, 10);
+        let layout = PostflopLayout::build(&tree, &streets, 169, 169, 169);
 
         assert!(layout.total_size > 0, "layout should have nonzero size");
         let (base, num_actions) = layout.slot(0, 0);
@@ -817,7 +670,7 @@ mod tests {
         let config = PostflopModelConfig::fast();
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
         let streets = annotate_streets(&tree);
-        let layout = PostflopLayout::build(&tree, &streets, 10, 10, 10);
+        let layout = PostflopLayout::build(&tree, &streets, 169, 169, 169);
         let buf = vec![1.0f64; layout.total_size];
         let delta = weighted_avg_strategy_delta(&buf, &buf, &layout, &tree);
         assert!(
@@ -831,7 +684,7 @@ mod tests {
         let config = PostflopModelConfig::fast();
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
         let streets = annotate_streets(&tree);
-        let layout = PostflopLayout::build(&tree, &streets, 10, 10, 10);
+        let layout = PostflopLayout::build(&tree, &streets, 169, 169, 169);
         let old = vec![1.0f64; layout.total_size];
         let mut new = old.clone();
         // Flip first slot to create a strategy change.
@@ -859,12 +712,6 @@ mod tests {
         assert!(s.contains("δ="), "should show delta label: {s}");
         assert!(s.contains("0.0032"), "should show delta value: {s}");
 
-        let bucketing = BuildPhase::FlopProgress {
-            flop_name: "AhKd7s".to_string(),
-            stage: FlopStage::Bucketing { step: 0, total_steps: 6 },
-        };
-        assert!(format!("{bucketing}").contains("Bucketing"));
-
         let done = BuildPhase::FlopProgress {
             flop_name: "AhKd7s".to_string(),
             stage: FlopStage::Done,
@@ -872,79 +719,11 @@ mod tests {
         assert!(format!("{done}").contains("Done"));
     }
 
-    #[timed_test]
-    fn build_phase_display_extracting_ev() {
-        let phase = BuildPhase::ExtractingEv(50, 169);
-        assert_eq!(format!("{phase}"), "EV histograms (50/169)");
-    }
-
-    #[timed_test]
-    fn build_phase_display_rebucketing() {
-        let phase = BuildPhase::Rebucketing(2, 3);
-        assert_eq!(format!("{phase}"), "Rebucketing (2/3)");
-    }
-
-    #[test]
-    #[ignore = "slow: full postflop abstraction pipeline with rebucketing"]
-    fn build_with_rebucket_rounds_1_succeeds() {
-        let mut config = PostflopModelConfig::fast();
-        config.rebucket_rounds = 1;
-        config.postflop_solve_iterations = 10;
-        config.max_flop_boards = 3;
-        let result = PostflopAbstraction::build(&config, None, None, |_| {});
-        assert!(result.is_ok());
-        let abs = result.unwrap();
-        assert!(!abs.values.is_empty());
-    }
-
-    #[test]
-    #[ignore = "slow: full postflop abstraction pipeline with 2-round rebucketing"]
-    fn build_with_rebucket_rounds_2_succeeds() {
-        let mut config = PostflopModelConfig::fast();
-        config.rebucket_rounds = 2;
-        config.postflop_solve_iterations = 10;
-        config.max_flop_boards = 3;
-        let result = PostflopAbstraction::build(&config, None, None, |_| {});
-        assert!(result.is_ok());
-        let abs = result.unwrap();
-        assert!(!abs.values.is_empty());
-    }
-
-    #[test]
-    #[ignore = "slow: builds full pipeline twice to verify rebucketing changes assignments"]
-    fn rebucketing_round_2_changes_flop_assignments() {
-        let mut config = PostflopModelConfig::fast();
-        config.rebucket_rounds = 1;
-        config.postflop_solve_iterations = 20;
-        config.max_flop_boards = 3;
-        let r1 = PostflopAbstraction::build(&config, None, None, |_| {}).unwrap();
-
-        config.rebucket_rounds = 2;
-        let r2 = PostflopAbstraction::build(&config, None, None, |_| {}).unwrap();
-
-        // Bucket assignments should differ after EV rebucketing
-        let mut any_different = false;
-        for flop_idx in 0..r1.buckets.flop.len() {
-            if r1.buckets.flop[flop_idx] != r2.buckets.flop[flop_idx] {
-                any_different = true;
-                break;
-            }
-        }
-        assert!(any_different, "rebucketing should produce different flop assignments");
-
-        // Turn and river should be unchanged (only flop is rebucketed)
-        assert_eq!(r1.buckets.turn, r2.buckets.turn, "turn buckets should be unchanged");
-        assert_eq!(r1.buckets.river, r2.buckets.river, "river buckets should be unchanged");
-    }
-
     #[test]
     #[ignore = "slow: full MCCFR postflop pipeline via config dispatch"]
     fn build_mccfr_via_config_produces_values() {
         let config = PostflopModelConfig {
             solve_type: PostflopSolveType::Mccfr,
-            num_hand_buckets_flop: 5,
-            num_hand_buckets_turn: 5,
-            num_hand_buckets_river: 5,
             fixed_flops: Some(vec!["AhKsQd".into()]),
             postflop_solve_iterations: 20,
             mccfr_sample_pct: 0.1,
@@ -953,13 +732,11 @@ mod tests {
         };
         let result = PostflopAbstraction::build(&config, None, None, |_| {}).unwrap();
         assert!(!result.values.is_empty());
-        // Check approximate zero-sum
-        let n = config.num_hand_buckets_flop as usize;
-        for hb in 0..n as u16 {
-            for ob in 0..n as u16 {
-                let v0 = result.values.get_by_flop(0, 0, hb, ob);
-                let v1 = result.values.get_by_flop(0, 1, ob, hb);
-                assert!((v0 + v1).abs() < 0.5, "should be approximately zero-sum: v0={v0}, v1={v1}");
+        for h in 0..5u16 {
+            for o in 0..5u16 {
+                let v0 = result.values.get_by_flop(0, 0, h, o);
+                let v1 = result.values.get_by_flop(0, 1, o, h);
+                assert!((v0 + v1).abs() < 0.5, "approximately zero-sum: v0={v0}, v1={v1}");
             }
         }
     }
