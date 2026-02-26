@@ -247,6 +247,8 @@ pub enum FlopStage {
         iteration: usize,
         max_iterations: usize,
         delta: f64,
+        /// Label for the convergence metric (e.g. "δ" for strategy delta, "expl" for exploitability).
+        metric_label: String,
     },
     /// Extracting EV estimates from converged strategy.
     EstimatingEv { sample: usize, total_samples: usize, avg_delta: f64 },
@@ -272,8 +274,8 @@ impl std::fmt::Display for BuildPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FlopProgress { flop_name, stage } => match stage {
-                FlopStage::Solving { iteration, max_iterations, delta } =>
-                    write!(f, "Flop '{flop_name}' CFR \u{03b4}={delta:.4} ({iteration}/{max_iterations})"),
+                FlopStage::Solving { iteration, max_iterations, delta, metric_label } =>
+                    write!(f, "Flop '{flop_name}' CFR {metric_label}={delta:.4} ({iteration}/{max_iterations})"),
                 FlopStage::EstimatingEv { sample, total_samples, avg_delta } =>
                     write!(f, "Flop '{flop_name}' EV Estimation ({sample}/{total_samples}) \u{0394}={avg_delta:.4}"),
                 FlopStage::Done => write!(f, "Flop '{flop_name}' Done"),
@@ -705,6 +707,7 @@ mod tests {
                 iteration: 45,
                 max_iterations: 200,
                 delta: 0.0032,
+                metric_label: "\u{03b4}".to_string(),
             },
         };
         let s = format!("{phase}");

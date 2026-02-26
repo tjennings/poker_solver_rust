@@ -6,7 +6,7 @@
 use rayon::prelude::*;
 
 use super::postflop_abstraction::{
-    regret_matching_into, normalize_strategy_sum, weighted_avg_strategy_delta, BuildPhase,
+    regret_matching_into, normalize_strategy_sum, BuildPhase,
     FlopSolveResult, FlopStage, PostflopLayout, PostflopValues, MAX_POSTFLOP_ACTIONS,
 };
 use super::postflop_hands::{all_cards_vec, build_combo_map, NUM_CANONICAL_HANDS};
@@ -219,6 +219,129 @@ fn terminal_payoff(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Exploitability
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Compute best-response EV for one player against the opponent's average strategy.
+///
+/// At `br_player`'s decision nodes: pick the action with highest EV (best response).
+/// At opponent's decision nodes: play the average strategy from `strategy_sum`.
+/// At terminals: use equity table for showdown, `pot_fraction` for folds.
+#[allow(clippy::too_many_arguments)]
+fn best_response_ev(
+    tree: &PostflopTree,
+    layout: &PostflopLayout,
+    strategy_sum: &[f64],
+    equity_table: &[f64],
+    node_idx: u32,
+    hero_hand: u16,
+    opp_hand: u16,
+    br_player: u8,
+) -> f64 {
+    let n = NUM_CANONICAL_HANDS;
+    match &tree.nodes[node_idx as usize] {
+        PostflopNode::Terminal {
+            terminal_type,
+            pot_fraction,
+        } => terminal_payoff(*terminal_type, *pot_fraction, equity_table, hero_hand, opp_hand, br_player, n),
+
+        PostflopNode::Chance { children, .. } => best_response_ev(
+            tree, layout, strategy_sum, equity_table,
+            children[0], hero_hand, opp_hand, br_player,
+        ),
+
+        PostflopNode::Decision {
+            position, children, ..
+        } => {
+            let is_br = *position == br_player;
+            let bucket = if is_br { hero_hand } else { opp_hand };
+            let (start, _) = layout.slot(node_idx, bucket);
+            let num_actions = children.len();
+
+            if is_br {
+                // Best response: pick the action with highest EV
+                children
+                    .iter()
+                    .map(|&child| {
+                        best_response_ev(
+                            tree, layout, strategy_sum, equity_table,
+                            child, hero_hand, opp_hand, br_player,
+                        )
+                    })
+                    .fold(f64::NEG_INFINITY, f64::max)
+            } else {
+                // Opponent plays average strategy
+                let strategy = normalize_strategy_sum(strategy_sum, start, num_actions);
+                children
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &child)| {
+                        strategy[i]
+                            * best_response_ev(
+                                tree, layout, strategy_sum, equity_table,
+                                child, hero_hand, opp_hand, br_player,
+                            )
+                    })
+                    .sum()
+            }
+        }
+    }
+}
+
+/// Assumed initial pot size in BB for mBB/h conversion.
+///
+/// Standard HU open (~3× pot entering flop). This matches the preflop
+/// solver's convention of reporting exploitability in mBB.
+const INITIAL_POT_BB: f64 = 3.0;
+
+/// Compute exploitability of the current average strategy, in mBB/h.
+///
+/// For each player, computes the best-response value over all hand matchups,
+/// then returns the average of both players' BR values converted to mBB/h
+/// (assumes ~3 BB initial pot: 1 pot-fraction = 3 BB = 3000 mBB).
+///
+/// A Nash equilibrium has exploitability of 0.
+#[allow(clippy::cast_precision_loss)]
+fn compute_exploitability(
+    tree: &PostflopTree,
+    layout: &PostflopLayout,
+    strategy_sum: &[f64],
+    equity_table: &[f64],
+) -> f64 {
+    let n = NUM_CANONICAL_HANDS;
+    let mut br_values = [0.0f64; 2];
+
+    for br_player in 0..2u8 {
+        let mut total = 0.0f64;
+        let mut count = 0u64;
+
+        for hero_hand in 0..n as u16 {
+            for opp_hand in 0..n as u16 {
+                let eq = equity_table[hero_hand as usize * n + opp_hand as usize];
+                if eq.is_nan() {
+                    continue;
+                }
+
+                total += best_response_ev(
+                    tree, layout, strategy_sum, equity_table,
+                    0, hero_hand, opp_hand, br_player,
+                );
+                count += 1;
+            }
+        }
+
+        br_values[br_player as usize] = if count > 0 {
+            total / count as f64
+        } else {
+            0.0
+        };
+    }
+
+    let pot_fraction = (br_values[0] + br_values[1]) / 2.0;
+    pot_fraction * INITIAL_POT_BB * 1000.0
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Solve one flop
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -236,13 +359,11 @@ fn exhaustive_solve_one_flop(
     let buf_size = layout.total_size;
     let mut regret_sum = vec![0.0f64; buf_size];
     let mut strategy_sum = vec![0.0f64; buf_size];
-    let mut current_delta = 0.0;
+    let mut current_exploitability = f64::INFINITY;
     let mut iterations_used = 0;
     let n = NUM_CANONICAL_HANDS;
 
     for iter in 0..num_iterations {
-        let prev_regrets = regret_sum.clone();
-
         // Traverse all hand pairs
         for hero_hand in 0..n as u16 {
             for opp_hand in 0..n as u16 {
@@ -271,8 +392,8 @@ fn exhaustive_solve_one_flop(
 
         iterations_used = iter + 1;
         if iter >= 1 {
-            current_delta =
-                weighted_avg_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
+            current_exploitability =
+                compute_exploitability(tree, layout, &strategy_sum, equity_table);
         }
 
         on_progress(BuildPhase::FlopProgress {
@@ -280,18 +401,19 @@ fn exhaustive_solve_one_flop(
             stage: FlopStage::Solving {
                 iteration: iterations_used,
                 max_iterations: num_iterations,
-                delta: current_delta,
+                delta: current_exploitability,
+                metric_label: "mBB/h".to_string(),
             },
         });
 
-        if iter >= 1 && current_delta < convergence_threshold {
+        if iter >= 1 && current_exploitability < convergence_threshold {
             break;
         }
     }
 
     FlopSolveResult {
         strategy_sum,
-        delta: current_delta,
+        delta: current_exploitability,
         iterations_used,
     }
 }
@@ -775,5 +897,67 @@ mod tests {
                 "showdown EV: expected {expected}, got {ev}"
             );
         }
+    }
+
+    /// Helper: build a minimal tree + layout + synthetic equity for exploitability tests.
+    fn expl_test_fixtures() -> (PostflopTree, PostflopLayout, Vec<f64>) {
+        let config = PostflopModelConfig {
+            bet_sizes: vec![1.0],
+            max_raises_per_street: 0,
+            postflop_solve_iterations: 1,
+            ..PostflopModelConfig::exhaustive_fast()
+        };
+        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
+        let node_streets = annotate_streets(&tree);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
+        let equity_table = synthetic_equity_table();
+        (tree, layout, equity_table)
+    }
+
+    #[timed_test(2)]
+    fn exploitability_is_positive_for_uniform_strategy() {
+        let (tree, layout, equity_table) = expl_test_fixtures();
+        // All-zero strategy_sum → normalize_strategy_sum returns uniform
+        let strategy_sum = vec![0.0f64; layout.total_size];
+        let expl = compute_exploitability(&tree, &layout, &strategy_sum, &equity_table);
+        assert!(expl > 0.0, "uniform strategy should be exploitable, got {expl}");
+    }
+
+    #[timed_test(10)]
+    fn exploitability_decreases_with_training() {
+        let (tree, layout, equity_table) = expl_test_fixtures();
+        // Uniform strategy exploitability (baseline).
+        let uniform_sum = vec![0.0f64; layout.total_size];
+        let expl_uniform = compute_exploitability(&tree, &layout, &uniform_sum, &equity_table);
+        // 2 CFR iterations with no early stop → result.delta is exploitability after iter 1.
+        let result = exhaustive_solve_one_flop(
+            &tree, &layout, &equity_table, 2, 0.0, "test", &|_| {},
+        );
+        assert!(
+            result.delta < expl_uniform,
+            "trained exploitability ({:.6}) should be less than uniform ({:.6})",
+            result.delta, expl_uniform
+        );
+    }
+
+    #[timed_test(5)]
+    fn exploitability_early_stopping_triggers() {
+        let (tree, layout, equity_table) = expl_test_fixtures();
+        // Very generous threshold (30 BB/h) — stops at first exploitability check.
+        let threshold_mbb = 30_000.0;
+        let result = exhaustive_solve_one_flop(
+            &tree, &layout, &equity_table, 30, threshold_mbb, "test", &|_| {},
+        );
+        assert_eq!(
+            result.iterations_used, 2,
+            "should stop at first exploitability check (iter 1), used {}",
+            result.iterations_used
+        );
+        assert!(
+            result.delta < threshold_mbb,
+            "final exploitability should be below threshold, got {} mBB/h",
+            result.delta
+        );
     }
 }

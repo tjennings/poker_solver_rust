@@ -93,7 +93,7 @@ pub struct PostflopModelConfig {
 
     /// Convergence threshold for early per-flop CFR stopping.
     /// MCCFR solver: strategy delta (max probability change).
-    /// Exhaustive solver: exploitability (pot fraction).
+    /// Exhaustive solver: exploitability in mBB/h (assumes ~3 BB initial pot).
     #[serde(
         default = "default_cfr_convergence_threshold",
         alias = "cfr_convergence_threshold",

@@ -1012,14 +1012,14 @@ fn run_solve_preflop(
                             let mut guard = flop_state.lock().unwrap();
                             let fbs = &mut *guard;
                             match stage {
-                                FlopStage::Solving { iteration, max_iterations, delta } => {
+                                FlopStage::Solving { iteration, max_iterations, delta, metric_label } => {
                                     #[allow(clippy::cast_precision_loss)]
                                     let key = 1.0 + *iteration as f64 / (*max_iterations).max(1) as f64;
                                     fbs.states.insert(flop_name.clone(), FlopSlotData {
                                         sort_key: key,
                                         position: *iteration as u64,
                                         length: *max_iterations as u64,
-                                        message: format!("Flop '{flop_name}' CFR \u{03b4}={delta:.4}"),
+                                        message: format!("Flop '{flop_name}' CFR {metric_label}={delta:.4}"),
                                     });
                                 }
                                 FlopStage::EstimatingEv { sample, total_samples, avg_delta } => {
