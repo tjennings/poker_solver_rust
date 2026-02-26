@@ -292,7 +292,7 @@ fn solve_one_flop(
         stage: FlopStage::Solving {
             iteration: 0,
             max_iterations: num_iterations,
-            exploitability: 0.0,
+            delta: 0.0,
         },
     });
 
@@ -323,7 +323,7 @@ fn solve_one_flop(
             stage: FlopStage::Solving {
                 iteration: iter + 1,
                 max_iterations: num_iterations,
-                exploitability: current_expl,
+                delta: current_expl,
             },
         });
 
@@ -333,7 +333,7 @@ fn solve_one_flop(
         }
     }
 
-    FlopSolveResult { strategy_sum, exploitability: current_expl, iterations_used }
+    FlopSolveResult { strategy_sum, delta: current_expl, iterations_used }
 }
 
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
@@ -838,7 +838,7 @@ mod tests {
         assert_eq!(result.strategy_sum.len(), buf_size);
         assert!(result.iterations_used >= 2);
         assert!(result.iterations_used <= 4);
-        assert!(result.exploitability.is_finite());
+        assert!(result.delta.is_finite());
     }
 
     #[timed_test]
@@ -931,10 +931,10 @@ mod tests {
             0, "test", &|_| {},
         );
 
-        assert!(early.exploitability > late.exploitability,
-            "exploitability should decrease: early={:.6}, late={:.6}",
-            early.exploitability, late.exploitability);
-        assert!(late.exploitability >= 0.0);
+        assert!(early.delta > late.delta,
+            "delta should decrease: early={:.6}, late={:.6}",
+            early.delta, late.delta);
+        assert!(late.delta >= 0.0);
     }
 
     #[timed_test]

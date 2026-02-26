@@ -344,8 +344,8 @@ struct TrainingParams {
     /// Number of bits for equity bin (0-4). Only used with `hand_class_v2`.
     #[serde(default = "default_equity_bits")]
     equity_bits: u8,
-    /// Average positive regret threshold for convergence-based stopping.
-    /// When set, training continues until avg positive regret drops below
+    /// Strategy delta threshold for convergence-based stopping.
+    /// When set, training continues until mean L1 strategy delta drops below
     /// this value, overriding `iterations`.
     #[serde(default, alias = "convergence_threshold")]
     regret_threshold: Option<f64>,
@@ -1027,14 +1027,14 @@ fn run_solve_preflop(
                                         message: format!("Flop '{flop_name}' Bucketing"),
                                     });
                                 }
-                                FlopStage::Solving { iteration, max_iterations, exploitability } => {
+                                FlopStage::Solving { iteration, max_iterations, delta } => {
                                     #[allow(clippy::cast_precision_loss)]
                                     let key = 1.0 + *iteration as f64 / (*max_iterations).max(1) as f64;
                                     fbs.states.insert(flop_name.clone(), FlopSlotData {
                                         sort_key: key,
                                         position: *iteration as u64,
                                         length: *max_iterations as u64,
-                                        message: format!("Flop '{flop_name}' CFR expl={exploitability:.4}"),
+                                        message: format!("Flop '{flop_name}' CFR \u{03b4}={delta:.4}"),
                                     });
                                 }
                                 FlopStage::EstimatingEv { sample, total_samples, avg_delta } => {
@@ -1159,6 +1159,7 @@ fn run_solve_preflop(
     let mut done = 0u64;
     let mut converged_early = false;
     let mut expl_history: Vec<f64> = Vec::new();
+    let mut prev_strategy: Option<FxHashMap<u64, Vec<f64>>> = None;
     while done < iterations {
         let batch = std::cmp::min(chunk, iterations - done);
         solver.train(batch);
@@ -1168,12 +1169,16 @@ fn run_solve_preflop(
         if print_every > 0 && done < iterations && done.is_multiple_of(print_every) {
             let mut early_stop = false;
             pb.suspend(|| {
-                print_preflop_matrices(&solver.strategy(), &tree, bb_node, bb_call_node, done);
-                let apr = solver.avg_positive_regret();
+                let strat = solver.strategy();
+                print_preflop_matrices(&strat, &tree, bb_node, bb_call_node, done);
+                let strat_map = strat.into_inner();
+                let delta = prev_strategy.as_ref()
+                    .map_or(0.0, |prev| convergence::strategy_delta(prev, &strat_map));
                 let expl = solver.exploitability();
                 let mbb = expl * 500.0;
                 expl_history.push(mbb);
-                println!("  Avg +regret: {apr:.6}  Exploitability: {expl:.6} (mBB/hand: {mbb:.2})");
+                println!("  Strategy \u{03b4}: {delta:.6}  Exploitability: {expl:.6} (mBB/hand: {mbb:.2})");
+                prev_strategy = Some(strat_map);
                 print_regret_sparkline(&expl_history, 10);
                 if expl < exploitability_threshold {
                     println!("Exploitability {expl:.6} < {exploitability_threshold} — stopping early at iteration {done}");
@@ -1330,8 +1335,8 @@ trait TrainingSolver {
     /// Naming prefix for checkpoint directories (e.g. "checkpoint_", "seq_checkpoint_").
     fn checkpoint_prefix(&self) -> &str;
 
-    /// Average positive regret per info-set-action per iteration.
-    fn avg_positive_regret(&self) -> f64;
+    /// Mean L1 strategy delta since the last checkpoint (0.0 before first comparison).
+    fn strategy_delta(&self) -> f64;
 
     /// Called at each checkpoint. Prints progress/metrics.
     fn checkpoint_report(
@@ -1405,14 +1410,14 @@ fn run_convergence_loop<S: TrainingSolver>(
                 config.boundaries,
             );
 
-            solver.avg_positive_regret() < threshold
+            solver.strategy_delta() < threshold
         });
 
         if converged {
             pb.finish_with_message(format!(
-                "Converged after {} iterations (avg +regret {:.6})",
+                "Converged after {} iterations (strategy \u{03b4} {:.6})",
                 solver.iterations(),
-                solver.avg_positive_regret(),
+                solver.strategy_delta(),
             ));
             break;
         }
@@ -1496,6 +1501,8 @@ struct MccfrTrainingSolver<'a> {
     output_dir: &'a str,
     abs_mode: AbstractionModeConfig,
     regret_threshold: Option<f64>,
+    prev_strategies: Option<FxHashMap<u64, Vec<f64>>>,
+    last_delta: f64,
 }
 
 impl TrainingSolver for MccfrTrainingSolver<'_> {
@@ -1516,8 +1523,8 @@ impl TrainingSolver for MccfrTrainingSolver<'_> {
         "checkpoint_"
     }
 
-    fn avg_positive_regret(&self) -> f64 {
-        self.solver.avg_positive_regret()
+    fn strategy_delta(&self) -> f64 {
+        self.last_delta
     }
 
     fn checkpoint_report(
@@ -1529,9 +1536,13 @@ impl TrainingSolver for MccfrTrainingSolver<'_> {
     ) {
         let strategies = self.solver.all_strategies_best_effort();
 
+        if let Some(ref prev) = self.prev_strategies {
+            self.last_delta = convergence::strategy_delta(prev, &strategies);
+        }
+
         let report_ctx = StrategyReportCtx {
             strategies: &strategies,
-            avg_positive_regret: self.solver.avg_positive_regret(),
+            strategy_delta: self.last_delta,
             checkpoint_num,
             is_convergence,
             total_checkpoints,
@@ -1550,6 +1561,8 @@ impl TrainingSolver for MccfrTrainingSolver<'_> {
             max_regret: None,
         };
         print_strategy_report(&report_ctx);
+
+        self.prev_strategies = Some(strategies);
 
         // MCCFR-specific extras: pruning stats, regret metrics, extreme regret keys
         let mccfr_ctx = MccfrCheckpointCtx {
@@ -1572,6 +1585,8 @@ struct SimpleTrainingSolver<'a, S> {
     stack_depth: u32,
     abs_mode: AbstractionModeConfig,
     regret_threshold: Option<f64>,
+    prev_strategies: Option<FxHashMap<u64, Vec<f64>>>,
+    last_delta: f64,
 }
 
 impl<S> TrainingSolver for SimpleTrainingSolver<'_, S>
@@ -1594,8 +1609,8 @@ where
         self.prefix
     }
 
-    fn avg_positive_regret(&self) -> f64 {
-        self.solver.avg_positive_regret()
+    fn strategy_delta(&self) -> f64 {
+        self.last_delta
     }
 
     fn checkpoint_report(
@@ -1607,9 +1622,13 @@ where
     ) {
         let strategies = self.solver.strategies_best_effort();
 
+        if let Some(ref prev) = self.prev_strategies {
+            self.last_delta = convergence::strategy_delta(prev, &strategies);
+        }
+
         let report_ctx = StrategyReportCtx {
             strategies: &strategies,
-            avg_positive_regret: self.solver.avg_positive_regret(),
+            strategy_delta: self.last_delta,
             checkpoint_num,
             is_convergence,
             total_checkpoints,
@@ -1628,6 +1647,8 @@ where
             max_regret: self.solver.max_regret(),
         };
         print_strategy_report(&report_ctx);
+
+        self.prev_strategies = Some(strategies);
     }
 }
 
@@ -1640,10 +1661,6 @@ trait SimpleTrainingSolverBackend {
     /// GPU max regret (upper bound on exploitability). `None` for CPU solvers.
     fn max_regret(&self) -> Option<f32> {
         None
-    }
-    /// Average positive regret. Default 0.0 for backends that don't track regrets.
-    fn avg_positive_regret(&self) -> f64 {
-        0.0
     }
 }
 
@@ -1659,9 +1676,6 @@ impl SimpleTrainingSolverBackend for SequenceCfrSolver {
     }
     fn iters(&self) -> u64 {
         self.iterations()
-    }
-    fn avg_positive_regret(&self) -> f64 {
-        convergence::avg_regret(self.regret_sum(), self.iterations())
     }
 }
 
@@ -1744,7 +1758,7 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
 
     if let Some(threshold) = config.training.regret_threshold {
         println!(
-            "Training: converge to avg +regret < {:.6}, check every {} iters, {} samples/iter, seed {}",
+            "Training: converge to strategy \u{03b4} < {:.6}, check every {} iters, {} samples/iter, seed {}",
             threshold,
             config.training.convergence_check_interval,
             config.training.mccfr_samples,
@@ -1857,7 +1871,7 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     let num_threads = rayon::current_num_threads();
     if let Some(threshold) = config.training.regret_threshold {
         println!(
-            "  Parallel training with {} threads (target avg +regret < {:.6})\n",
+            "  Parallel training with {} threads (target strategy \u{03b4} < {:.6})\n",
             num_threads, threshold
         );
     } else {
@@ -1874,6 +1888,8 @@ fn run_mccfr_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         output_dir: &config.training.output_dir,
         abs_mode,
         regret_threshold: config.training.regret_threshold,
+        prev_strategies: None,
+        last_delta: 0.0,
     };
 
     // Baseline checkpoint (iteration 0)
@@ -2424,7 +2440,7 @@ fn save_sdcfr_checkpoint(
 
     let report_ctx = StrategyReportCtx {
         strategies: &strategy_map,
-        avg_positive_regret: 0.0, // SD-CFR doesn't track regrets in the same way
+        strategy_delta: 0.0, // SD-CFR doesn't track strategy delta
         checkpoint_num: report.checkpoint_count,
         is_convergence: false,
         total_checkpoints: report.total_checkpoints,
@@ -2972,6 +2988,8 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         stack_depth: config.game.stack_depth,
         abs_mode,
         regret_threshold: config.training.regret_threshold,
+        prev_strategies: None,
+        last_delta: 0.0,
     };
 
     let loop_config = TrainingLoopConfig {
@@ -3127,7 +3145,8 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         let mut wrapper = SimpleTrainingSolver {
             solver,
             prefix: "gpu_checkpoint_",
-            previous: None,
+            prev_strategies: None,
+            last_delta: 0.0,
             training_start: Instant::now(),
             header,
             action_labels,
@@ -3156,7 +3175,8 @@ fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
         let mut wrapper = SimpleTrainingSolver {
             solver,
             prefix: "gpu_checkpoint_",
-            previous: None,
+            prev_strategies: None,
+            last_delta: 0.0,
             training_start: Instant::now(),
             header,
             action_labels,
@@ -3696,7 +3716,7 @@ struct MccfrCheckpointCtx<'a> {
 /// Context for strategy-based checkpoint output shared by all solvers.
 struct StrategyReportCtx<'a> {
     strategies: &'a FxHashMap<u64, Vec<f64>>,
-    avg_positive_regret: f64,
+    strategy_delta: f64,
     checkpoint_num: u64,
     is_convergence: bool,
     total_checkpoints: u64,
@@ -3766,20 +3786,20 @@ fn print_time_estimate(checkpoint: u64, elapsed: f64, ctx: &StrategyReportCtx) {
 
 fn compute_and_print_convergence(ctx: &StrategyReportCtx) {
     let entropy = convergence::strategy_entropy(ctx.strategies);
-    let apr = ctx.avg_positive_regret;
+    let delta = ctx.strategy_delta;
 
     println!("\nConvergence Metrics:");
     if let Some(mr) = ctx.max_regret {
         println!("  Max regret:       {mr:.6}");
     }
-    println!("  Avg +regret:      {apr:.6}");
+    println!("  Strategy \u{03b4}:      {delta:.6}");
     if let Some(threshold) = ctx.regret_threshold {
-        let status = if apr < threshold {
+        let status = if delta < threshold {
             "CONVERGED"
         } else {
             "not converged"
         };
-        println!("  Target regret:    {threshold:.6} ({status})");
+        println!("  Target \u{03b4}:        {threshold:.6} ({status})");
     }
     println!("  Strategy entropy: {entropy:.4}");
 }

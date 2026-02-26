@@ -268,7 +268,7 @@ pub enum FlopStage {
     Solving {
         iteration: usize,
         max_iterations: usize,
-        exploitability: f64,
+        delta: f64,
     },
     /// Extracting EV estimates from converged strategy.
     EstimatingEv { sample: usize, total_samples: usize, avg_delta: f64 },
@@ -299,8 +299,8 @@ impl std::fmt::Display for BuildPhase {
         match self {
             Self::FlopProgress { flop_name, stage } => match stage {
                 FlopStage::Bucketing { step, total_steps } => write!(f, "Flop '{flop_name}' Bucketing ({step}/{total_steps})"),
-                FlopStage::Solving { iteration, max_iterations, exploitability } =>
-                    write!(f, "Flop '{flop_name}' CFR expl={exploitability:.4} ({iteration}/{max_iterations})"),
+                FlopStage::Solving { iteration, max_iterations, delta } =>
+                    write!(f, "Flop '{flop_name}' CFR \u{03b4}={delta:.4} ({iteration}/{max_iterations})"),
                 FlopStage::EstimatingEv { sample, total_samples, avg_delta } =>
                     write!(f, "Flop '{flop_name}' EV Estimation ({sample}/{total_samples}) \u{0394}={avg_delta:.4}"),
                 FlopStage::Done => write!(f, "Flop '{flop_name}' Done"),
@@ -484,10 +484,10 @@ pub fn compute_hand_avg_values(buckets: &StreetBuckets, values: &PostflopValues)
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Result of a single flop CFR solve.
-#[allow(dead_code)] // exploitability and iterations_used read in tests
+#[allow(dead_code)] // delta and iterations_used read in tests
 pub(crate) struct FlopSolveResult {
     pub strategy_sum: Vec<f64>,
-    pub exploitability: f64,
+    pub delta: f64,
     pub iterations_used: usize,
 }
 
@@ -850,14 +850,14 @@ mod tests {
             stage: FlopStage::Solving {
                 iteration: 45,
                 max_iterations: 200,
-                exploitability: 0.0032,
+                delta: 0.0032,
             },
         };
         let s = format!("{phase}");
         assert!(s.contains("AhKd7s"), "should show flop name: {s}");
         assert!(s.contains("45/200"), "should show iteration: {s}");
-        assert!(s.contains("expl="), "should show exploitability label: {s}");
-        assert!(s.contains("0.0032"), "should show exploitability value: {s}");
+        assert!(s.contains("δ="), "should show delta label: {s}");
+        assert!(s.contains("0.0032"), "should show delta value: {s}");
 
         let bucketing = BuildPhase::FlopProgress {
             flop_name: "AhKd7s".to_string(),

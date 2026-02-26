@@ -57,6 +57,12 @@ impl PreflopStrategy {
             .unwrap_or_default()
     }
 
+    /// Consume self and return the inner strategy map.
+    #[must_use]
+    pub fn into_inner(self) -> FxHashMap<u64, Vec<f64>> {
+        self.strategies
+    }
+
     /// Number of info sets with stored strategies.
     #[must_use]
     pub fn len(&self) -> usize {
