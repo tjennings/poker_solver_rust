@@ -35,8 +35,8 @@ use poker_solver_core::info_key::{
     spr_bucket,
 };
 use poker_solver_core::preflop::{
-    EquityTable, PostflopBundle, PostflopModelConfig, PreflopBundle, PreflopConfig, PreflopSolver,
-    PreflopTree,
+    EquityTable, PostflopBundle, PostflopModelConfig, PreflopAction, PreflopBundle, PreflopConfig,
+    PreflopNode, PreflopSolver, PreflopTree,
 };
 use poker_solver_core::preflop::postflop_abstraction::{BuildPhase, FlopStage, PostflopAbstraction};
 use rustc_hash::FxHashMap;
@@ -1261,6 +1261,13 @@ fn print_regret_sparkline(history: &[f64], height: usize) {
     println!("  {:>10} └{}", "", "─".repeat(width));
 }
 
+fn preflop_node_actions(tree: &PreflopTree, idx: u32) -> Option<&[PreflopAction]> {
+    match &tree.nodes[idx as usize] {
+        PreflopNode::Decision { action_labels, .. } => Some(action_labels),
+        PreflopNode::Terminal { .. } => None,
+    }
+}
+
 fn print_preflop_matrices(
     strategy: &poker_solver_core::preflop::PreflopStrategy,
     tree: &PreflopTree,
@@ -1269,16 +1276,19 @@ fn print_preflop_matrices(
     iteration: u64,
 ) {
     let sb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, 0);
-    lhe_viz::print_hand_matrix(&sb_matrix, &format!("SB RFI — iteration {iteration}"));
+    let sb_actions = preflop_node_actions(tree, 0);
+    lhe_viz::print_hand_matrix(&sb_matrix, &format!("SB RFI — iteration {iteration}"), sb_actions);
 
     if let Some(bb_idx) = bb_call_node {
         let bb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, bb_idx);
-        lhe_viz::print_hand_matrix(&bb_matrix, &format!("BB vs SB Call — iteration {iteration}"));
+        let bb_actions = preflop_node_actions(tree, bb_idx);
+        lhe_viz::print_hand_matrix(&bb_matrix, &format!("BB vs SB Call — iteration {iteration}"), bb_actions);
     }
 
     if let Some(bb_idx) = bb_raise_node {
         let bb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, bb_idx);
-        lhe_viz::print_hand_matrix(&bb_matrix, &format!("BB vs Raise — iteration {iteration}"));
+        let bb_actions = preflop_node_actions(tree, bb_idx);
+        lhe_viz::print_hand_matrix(&bb_matrix, &format!("BB vs Raise — iteration {iteration}"), bb_actions);
     }
 }
 
@@ -2110,11 +2120,11 @@ fn save_lhe_checkpoint(
 
     let rfi_matrix =
         lhe_viz::preflop_rfi_matrix(&policies, lhe_config, num_actions, board_samples, seed);
-    lhe_viz::print_hand_matrix(&rfi_matrix, "SB Preflop RFI (Fold/Call/Raise)");
+    lhe_viz::print_hand_matrix(&rfi_matrix, "SB Preflop RFI (Fold/Call/Raise)", None);
 
     let response_matrix =
         lhe_viz::preflop_response_matrix(&policies, lhe_config, num_actions, board_samples, seed);
-    lhe_viz::print_hand_matrix(&response_matrix, "BB vs SB Raise (Fold/Call/3-bet)");
+    lhe_viz::print_hand_matrix(&response_matrix, "BB vs SB Raise (Fold/Call/3-bet)", None);
 
     Ok(())
 }
@@ -2279,11 +2289,11 @@ fn run_eval_lhe(
 
     let rfi_matrix =
         lhe_viz::preflop_rfi_matrix(&policies, &lhe_config, num_actions, board_samples, seed);
-    lhe_viz::print_hand_matrix(&rfi_matrix, "SB Preflop RFI (Fold/Call/Raise)");
+    lhe_viz::print_hand_matrix(&rfi_matrix, "SB Preflop RFI (Fold/Call/Raise)", None);
 
     let response_matrix =
         lhe_viz::preflop_response_matrix(&policies, &lhe_config, num_actions, board_samples, seed);
-    lhe_viz::print_hand_matrix(&response_matrix, "BB vs SB Raise (Fold/Call/3-bet)");
+    lhe_viz::print_hand_matrix(&response_matrix, "BB vs SB Raise (Fold/Call/3-bet)", None);
 
     println!(
         "\nVisualization computed in {:.1}s",

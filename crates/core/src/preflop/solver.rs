@@ -746,19 +746,17 @@ fn normalize(sums: &[f64]) -> Vec<f64> {
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub(crate) fn postflop_showdown_value(
     pf_state: &PostflopState,
-    preflop_node_idx: u32,
+    _preflop_node_idx: u32,
     pot: u32,
     hero_inv: f64,
     hero_hand: u16,
     opp_hand: u16,
     hero_pos: u8,
 ) -> f64 {
-    let raise_count = pf_state.raise_counts[preflop_node_idx as usize];
-    let pot_type = PotType::from_raise_count(raise_count);
-
-    // Map physical player to tree position (0=OOP, 1=IP)
-    let ip_player = pot_type.default_ip_player();
-    let hero_tree_pos = u8::from(hero_pos == ip_player);
+    // Both preflop and postflop trees use the same position numbering:
+    // 0 = SB (IP in HU), 1 = BB (OOP in HU).
+    // No remapping needed — hero_pos maps directly to the EV table index.
+    let hero_tree_pos = hero_pos;
 
     // O(1) lookup into precomputed hand-averaged EV table.
     let pf_ev_frac = pf_state.abstraction.avg_ev(hero_tree_pos, hero_hand as usize, opp_hand as usize);
@@ -1238,6 +1236,67 @@ mod tests {
                 "CFR+ should not apply DCFR discounting to regrets"
             );
         }
+    }
+
+    /// Verify that `postflop_showdown_value` uses the correct position mapping:
+    /// hero_pos=0 (SB/IP) should read pos-0 values, hero_pos=1 (BB/OOP) should
+    /// read pos-1 values.
+    #[timed_test]
+    fn postflop_showdown_value_position_mapping() {
+        use crate::preflop::postflop_abstraction::{PostflopAbstraction, PostflopValues};
+        use crate::preflop::postflop_tree::{PostflopNode, PostflopTree, PotType};
+
+        // Build a tiny abstraction with n=2 hands and asymmetric IP vs OOP EVs.
+        // hand_avg_values layout: [pos0(IP) n*n entries] [pos1(OOP) n*n entries]
+        let n = 2;
+        let mut hand_avg_values = vec![0.0; 2 * n * n];
+        // IP (pos 0): hand 0 vs hand 1 = +0.3 pot fraction
+        hand_avg_values[0 * n * n + 0 * n + 1] = 0.3;
+        // OOP (pos 1): hand 1 vs hand 0 = -0.1 pot fraction
+        hand_avg_values[1 * n * n + 1 * n + 0] = -0.1;
+
+        let abstraction = PostflopAbstraction {
+            tree: PostflopTree {
+                nodes: vec![PostflopNode::Terminal {
+                    terminal_type: crate::preflop::postflop_tree::PostflopTerminalType::Showdown,
+                    pot_fraction: 1.0,
+                }],
+                pot_type: PotType::Raised,
+                spr: 5.0,
+            },
+            values: PostflopValues {
+                values: vec![],
+                num_buckets: n,
+                num_flops: 0,
+            },
+            hand_avg_values,
+            spr: 5.0,
+            flops: vec![],
+        };
+
+        let pf_state = PostflopState {
+            abstraction,
+            raise_counts: vec![1], // raise_count=1 → PotType::Raised
+        };
+
+        let pot = 10;
+        let hero_inv = 5.0;
+
+        // SB (hero_pos=0) looking up hand 0 vs opp hand 1 → should get IP value 0.3
+        let ev_sb = postflop_showdown_value(&pf_state, 0, pot, hero_inv, 0, 1, 0);
+        // Expected: 0.3 * 10 + (10/2 - 5) = 3.0
+        assert!(
+            (ev_sb - 3.0).abs() < 1e-10,
+            "SB should read IP (pos 0) values: got {ev_sb}, expected 3.0"
+        );
+
+        // BB (hero_pos=1) looking up hand 1 vs opp hand 0 → should get OOP value -0.1
+        let ev_bb = postflop_showdown_value(&pf_state, 0, pot, hero_inv, 1, 0, 1);
+        // Expected: -0.1 * 10 + (10/2 - 5) = -1.0
+        assert!(
+            (ev_bb - (-1.0)).abs() < 1e-10,
+            "BB should read OOP (pos 1) values: got {ev_bb}, expected -1.0"
+        );
     }
 
 }

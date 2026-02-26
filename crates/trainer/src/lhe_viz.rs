@@ -341,7 +341,10 @@ const RAISE_COLORS: &[&str] = &[
 ];
 
 /// Print a hand matrix with color-coded bars.
-pub fn print_hand_matrix(matrix: &HandMatrix, title: &str) {
+///
+/// When `actions` is provided, the legend shows the actual raise sizes
+/// (e.g. "2.5x", "3.0x", "all-in") instead of generic labels.
+pub fn print_hand_matrix(matrix: &HandMatrix, title: &str, actions: Option<&[PreflopAction]>) {
     println!("\n{BOLD}{title}{RESET}");
     println!();
 
@@ -364,14 +367,44 @@ pub fn print_hand_matrix(matrix: &HandMatrix, title: &str) {
         println!();
     }
 
-    // Legend
+    // Legend — use actual raise sizes when available
     println!();
-    let r0 = RAISE_COLORS[0];
-    let r2 = RAISE_COLORS[2];
-    let r4 = RAISE_COLORS[4];
+    let raise_labels = build_raise_legend(actions);
+    let raises_str = if raise_labels.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", raise_labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let color = RAISE_COLORS[i.min(RAISE_COLORS.len() - 1)];
+                format!("{color}#{RESET}={label}")
+            })
+            .collect::<Vec<_>>()
+            .join("  "))
+    };
     println!(
-        "  Legend: {GRAY}#{RESET}=fold  {GREEN}#{RESET}=call  {r0}#{RESET}=small raise  {r2}#{RESET}=mid raise  {r4}#{RESET}=all-in  |  Upper-right=suited  Lower-left=offsuit  Diagonal=pairs"
+        "  Legend: {GRAY}#{RESET}=fold  {GREEN}#{RESET}=call{raises_str}  |  Upper-right=suited  Lower-left=offsuit  Diagonal=pairs"
     );
+}
+
+/// Build legend labels from the raise/all-in actions in the node.
+fn build_raise_legend(actions: Option<&[PreflopAction]>) -> Vec<String> {
+    match actions {
+        Some(acts) => acts
+            .iter()
+            .filter_map(|a| match a {
+                PreflopAction::Raise(size) => Some(format!("{size}x")),
+                PreflopAction::AllIn => Some("all-in".to_string()),
+                _ => None,
+            })
+            .collect(),
+        None => vec![
+            "small raise".to_string(),
+            "mid raise".to_string(),
+            "all-in".to_string(),
+        ],
+    }
 }
 
 /// Compute the mean L1 strategy distance between two hand matrices.
