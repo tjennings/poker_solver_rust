@@ -271,7 +271,7 @@ postflop_model:
 
   # EV rebucketing (default: 1 = EHS only)
   # rebucket_rounds: 2
-  # cfr_delta_threshold: 0.001
+  # cfr_exploitability_threshold: 0.01  # early-stop per-flop CFR (pot fraction)
 
   # MCCFR-specific (only when solve_type: mccfr)
   # mccfr_sample_pct: 0.01         # fraction of deal space sampled per iteration
@@ -303,7 +303,7 @@ The `max_flop_boards` parameter controls how many canonical flop textures are us
 
 The `equity_rollout_fraction` parameter controls how bucket-pair equity is computed on flop boards. With `1.0` (default), all C(remaining,2) runouts are enumerated exactly (~990 per hand pair). With a fractional value like `0.1` or `0.2`, that fraction of runouts is sampled per pair — roughly 5-10x faster with good accuracy. Turn and river equity is always exact regardless of this setting.
 
-The `rebucket_rounds` parameter controls EV-based postflop rebucketing. With the default value of `1`, only EHS equity histograms are used (standard behavior). With `2` or more, the solver runs an additional loop: solve all flops, extract per-hand EV histograms from the converged strategy, re-cluster flop buckets on EV features, and re-solve. Each CFR solve uses early stopping when max strategy delta drops below `cfr_delta_threshold` (default 0.001). The `postflop_sprs` field accepts a scalar or list of SPR values for the shared postflop tree (replaces `postflop_spr`; scalar values are auto-wrapped for backward compatibility).
+The `rebucket_rounds` parameter controls EV-based postflop rebucketing. With the default value of `1`, only EHS equity histograms are used (standard behavior). With `2` or more, the solver runs an additional loop: solve all flops, extract per-hand EV histograms from the converged strategy, re-cluster flop buckets on EV features, and re-solve. Each CFR solve uses early stopping when exploitability drops below `cfr_exploitability_threshold` (default 0.01, in pot fractions). The `postflop_sprs` field accepts a scalar or list of SPR values for the shared postflop tree (replaces `postflop_spr`; scalar values are auto-wrapped for backward compatibility).
 
 ### Postflop Model Parameters
 
