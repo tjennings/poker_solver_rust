@@ -747,11 +747,6 @@ fn br_traverse(
         }
         PostflopNode::Decision { position, children, .. } => {
             let is_hero = *position == hero_pos;
-            let bucket = if is_hero { hero_bucket } else { opp_bucket };
-            let (start, _) = layout.slot(node_idx, bucket);
-            let num_actions = children.len();
-
-            let strategy = normalize_strategy_sum(strategy_sum, start, num_actions);
 
             if is_hero {
                 // Best response: pick the action with max value
@@ -763,6 +758,9 @@ fn br_traverse(
                     .fold(f64::NEG_INFINITY, f64::max)
             } else {
                 // Opponent plays average strategy
+                let (start, _) = layout.slot(node_idx, opp_bucket);
+                let num_actions = children.len();
+                let strategy = normalize_strategy_sum(strategy_sum, start, num_actions);
                 children.iter().enumerate()
                     .map(|(i, &child)| {
                         strategy[i] * br_traverse(

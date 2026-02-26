@@ -219,6 +219,11 @@ pub(crate) fn build_mccfr(
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Training loop for a single flop using MCCFR with concrete hands.
+///
+/// NOTE: The `exploitability` field in the result and progress reports contains
+/// `avg_positive_regret_flat` as a proxy — true exploitability would require
+/// equity tables that MCCFR doesn't build. This proxy bounds exploitability
+/// and serves the same convergence role.
 #[allow(clippy::too_many_arguments)]
 fn mccfr_solve_one_flop(
     tree: &PostflopTree,
