@@ -9,6 +9,7 @@ pub mod hand_buckets;
 pub mod postflop_abstraction;
 pub mod postflop_bundle;
 pub(crate) mod postflop_bucketed;
+pub mod postflop_hands;
 pub(crate) mod postflop_mccfr;
 pub mod postflop_model;
 pub mod postflop_tree;
