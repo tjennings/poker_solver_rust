@@ -232,7 +232,7 @@ enum Commands {
         /// Monte Carlo samples per hand matchup for equity table (0 = uniform)
         #[arg(long)]
         equity_samples: Option<u32>,
-        /// Postflop model preset: fast, medium, standard, or accurate.
+        /// Postflop model preset: fast, standard, exhaustive_fast, or exhaustive_standard.
         /// Overrides any postflop_model in the config file.
         #[arg(long)]
         postflop_model: Option<String>,
@@ -842,7 +842,7 @@ fn run_solve_preflop(
     if let Some(v) = cli_print_every { training.print_every = v; }
     if let Some(preset) = cli_postflop_model {
         training.game.postflop_model = Some(PostflopModelConfig::from_preset(preset)
-            .ok_or_else(|| format!("unknown postflop preset: {preset} (use fast/medium/standard/accurate)"))?);
+            .ok_or_else(|| format!("unknown postflop preset: {preset} (use fast/standard/exhaustive_fast/exhaustive_standard)"))?);
     }
 
     let postflop_model_path = training.postflop_model_path.take();

@@ -1,10 +1,10 @@
-# Preflop solver config — HU 25BB with medium postflop model
+# Preflop solver config -- HU 25BB with standard MCCFR postflop model
 #
 # Usage:
 #   cargo run -p poker-solver-trainer --release -- solve-preflop \
 #     -c preflop_medium.yaml -o preflop_hu_25bb
 
-# ── Training parameters ──────────────────────────────────────────────────────
+# -- Training parameters --
 
 iterations: 10000
 equity_samples: 10000
@@ -12,8 +12,8 @@ print_every: 1000
 preflop_exploitability_threshold_mbb: 25
 # checkpoint_every: 5000          # save intermediate bundles every N iterations
 
-# ── Game structure ───────────────────────────────────────────────────────────
-# Internal units: SB=1, BB=2. Stacks = stack_depth_bb × 2.
+# -- Game structure --
+# Internal units: SB=1, BB=2. Stacks = stack_depth_bb x 2.
 
 positions:
   - name: Small Blind
@@ -27,50 +27,41 @@ blinds:
 
 antes: []
 
-stacks: [50, 50]  # 25 BB × 2
+stacks: [50, 50]  # 25 BB x 2
 
-# raise_sizes[depth] — multiplier of current pot/bet at each raise depth.
+# raise_sizes[depth] -- multiplier of current pot/bet at each raise depth.
 # depth 0 = first open raise, depth 1 = 3-bet, etc.
 raise_sizes:
-  - [2.5]    # open raise: 2.5×
-  - [3.0]    # 3-bet: 3.0×
+  - [2.5]    # open raise: 2.5x
+  - [3.0]    # 3-bet: 3.0x
 
 raise_cap: 4
 
-# ── CFR variant ──────────────────────────────────────────────────────────────
-# "dcfr" (default): Discounted CFR with α/β/γ discounting + LCFR weighting.
-# "vanilla": Standard CFR — no discounting, uniform iteration weighting.
-# "cfrplus": CFR+ — regrets floored to zero, linear strategy weighting.
+# -- CFR variant --
+# "dcfr" (default): Discounted CFR with alpha/beta/gamma discounting + LCFR weighting.
+# "vanilla": Standard CFR -- no discounting, uniform iteration weighting.
+# "cfrplus": CFR+ -- regrets floored to zero, linear strategy weighting.
 cfr_variant: dcfr
 
-# ── DCFR discounting (ignored when cfr_variant is vanilla or cfrplus) ───────
+# -- DCFR discounting (ignored when cfr_variant is vanilla or cfrplus) --
 
 dcfr_alpha: 1.5     # positive regret discount exponent
 dcfr_beta: 0.5      # negative regret discount exponent
 dcfr_gamma: 2.0     # strategy sum discount exponent
 dcfr_warmup: 0      # iterations before discounting starts
 
-# ε-greedy exploration: each action gets at least ε/N probability during
-# traversal. Average strategy accumulates the intended (non-explored) strategy.
+# epsilon-greedy exploration
 exploration: 0.05
 
-# ── Postflop model ───────────────────────────────────────────────────────────
-# Replaces raw equity at showdown with an abstracted postflop game.
+# -- Postflop model (169-hand MCCFR) --
+# Replaces raw equity at showdown with solved postflop EVs.
 # Remove this section entirely to use raw equity (original behaviour).
 
 postflop_model:
-  # Hand abstraction: EHS k-means clustering per street.
-  num_hand_buckets_flop: 200
-  num_hand_buckets_turn: 200
-  num_hand_buckets_river: 200
-
-  # Postflop tree structure (single tree at fixed SPR, shared across all per-flop solves).
+  solve_type: mccfr
   bet_sizes: [0.5, 1.0, 2]    # fraction of pot
   max_raises_per_street: 1
-
-  # Fixed SPR for postflop solves.
   postflop_spr: 5.0
-
-  # Pre-solve: chance-sampled MCCFR to converge postflop before preflop training.
-  postflop_solve_iterations: 1000   # MCCFR iterations per flop
-  postflop_solve_samples: 100000        # bucket pairs sampled per iteration (0 = num_hand_buckets_flop)
+  postflop_solve_iterations: 1000
+  mccfr_sample_pct: 0.01
+  value_extraction_samples: 10000

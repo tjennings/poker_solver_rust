@@ -1,20 +1,20 @@
-# Smoke test: exercises the full postflop bucketed pipeline in ~1-2 minutes.
+# Smoke test: exercises the full postflop 169-hand MCCFR pipeline in ~1-2 minutes.
 # Tweak these values to debug specific phases.
 #
 # Usage:
 #   cargo run -p poker-solver-trainer --release -- solve-preflop \
-#     -c sample_configurations/smoke.yaml -o smoke_test
+#     -c sample_configurations/AKQr_vs_234r.yaml -o smoke_test
 #
 # Validation: AA (hand 0) should raise more than 72o (hand 168).
 
-# ── Training parameters ──────────────────────────────────────────────────────
+# -- Training parameters --
 
 iterations: 1000000
 equity_samples: 10000
 print_every: 500
 preflop_exploitability_threshold_mbb: 25
 
-# ── Game structure ───────────────────────────────────────────────────────────
+# -- Game structure --
 
 positions:
   - name: Small Blind
@@ -36,7 +36,7 @@ raise_sizes:
 
 raise_cap: 3
 
-# ── DCFR discounting ─────────────────────────────────────────────────────────
+# -- DCFR discounting --
 
 dcfr_alpha: 1.5
 dcfr_beta: 0.5
@@ -44,19 +44,15 @@ dcfr_gamma: 2.0
 dcfr_warmup: 0
 exploration: 0.05
 
-# ── Postflop model (minimal for fast validation) ─────────────────────────────
+# -- Postflop model (169-hand MCCFR, minimal for fast validation) --
 
 postflop_model:
   solve_type: mccfr
-  num_hand_buckets_flop: 169
   #max_flop_boards: 300
   fixed_flops: [ 'AhKsQd', '2c3h4d', '9s8s5h']
   #fixed_flops: ['KhKdTs', 'Kh8s7s', '9s8s5h', 'AsQs9h', 'KsTsTh', 'Js5h4d', '9s6s2s', 'AsQhQd', '6s4h2d', '8s6h2d', 'Ts8h3s', 'As6s5s', 'AsAhKs', '7s5h2s', 'QhJs8s', 'Ks9h3d', 'As7h3d', 'Ah5s4s', 'Js9h6s', 'QsTs2h', '9s7h4d', '8h4s3s', 'Qs7h5d', 'JhTs6s', 'Js4h3s']
   bet_sizes: [0.5, 1.0, 1.5, 3]
   max_raises_per_street: 3
   postflop_solve_iterations: 1000
-  postflop_solve_samples: 0
   cfr_convergence_threshold: 0.5
-  equity_rollout_fraction: 1
   value_extraction_samples: 20000
-

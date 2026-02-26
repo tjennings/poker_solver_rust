@@ -1,4 +1,4 @@
-# Smoke test: exercises the full postflop bucketed pipeline in ~1-2 minutes.
+# Smoke test: exercises the full 169-hand MCCFR postflop pipeline in ~1-2 minutes.
 # Tweak these values to debug specific phases.
 #
 # Usage:
@@ -7,14 +7,14 @@
 #
 # Validation: AA (hand 0) should raise more than 72o (hand 168).
 
-# ── Training parameters ──────────────────────────────────────────────────────
+# -- Training parameters --
 
 iterations: 2000
 equity_samples: 10000
 print_every: 500
 preflop_exploitability_threshold_mbb: 25
 
-# ── Game structure ───────────────────────────────────────────────────────────
+# -- Game structure --
 
 positions:
   - name: Small Blind
@@ -36,7 +36,7 @@ raise_sizes:
 
 raise_cap: 3
 
-# ── DCFR discounting ─────────────────────────────────────────────────────────
+# -- DCFR discounting --
 
 dcfr_alpha: 1.5
 dcfr_beta: 0.5
@@ -44,12 +44,10 @@ dcfr_gamma: 2.0
 dcfr_warmup: 0
 exploration: 0.05
 
-# ── Postflop model (minimal for fast validation) ─────────────────────────────
+# -- Postflop model (169-hand MCCFR, minimal for fast validation) --
 
 postflop_model:
-  num_hand_buckets_flop: 5
-  num_hand_buckets_turn: 5
-  num_hand_buckets_river: 10
+  solve_type: mccfr
   #max_flop_boards: 3
   #fixed_flops: ['KhKdTs', 'Kh8s7s', '9s8s5h', 'AsQs9h', 'KsTsTh', 'Js5h4d', '9s6s2s', 'AsQhQd', '6s4h2d', '8s6h2d', 'Ts8h3s', 'As6s5s', 'AsAhKs', '7s5h2s', 'QhJs8s', 'Ks9h3d', 'As7h3d', 'Ah5s4s', 'Js9h6s', 'QsTs2h', '9s7h4d', '8h4s3s', 'Qs7h5d', 'JhTs6s', 'Js4h3s']
   #fixed_flops: [ 'Kh8s7s', 'AsQs2h', 'Js5h4d', '2s3s4c']
@@ -58,9 +56,8 @@ postflop_model:
   bet_sizes: [0.5, 1.0, 1.5]
   max_raises_per_street: 3
   postflop_solve_iterations: 10
-  postflop_solve_samples: 0
   postflop_spr: 5.0
-  # EV rebucketing (default: 1 round = EHS only)
-  # rebucket_rounds: 2
   # cfr_convergence_threshold: 0.01
   # postflop_sprs: [3.5]
+  mccfr_sample_pct: 0.05
+  value_extraction_samples: 1000

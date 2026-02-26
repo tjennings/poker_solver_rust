@@ -2,23 +2,21 @@
 
 ## Overview
 
-The solver finds a Nash equilibrium for heads-up no-limit Texas Hold'em by splitting the game into two phases: a **preflop solver** that uses Linear CFR (LCFR) over 169 canonical hand matchups, and an **abstracted postflop model** that provides expected values at preflop showdown boundaries. The postflop model uses imperfect-recall card abstraction (Pluribus-style) with per-flop hand bucketing and a shared tree template at a fixed SPR.
+The solver finds a Nash equilibrium for heads-up no-limit Texas Hold'em by splitting the game into two phases: a **preflop solver** that uses Linear CFR (LCFR) over 169 canonical hand matchups, and an **abstracted postflop model** that provides expected values at preflop showdown boundaries. The postflop model uses direct 169-hand indexing per flop -- each canonical hand is its own info set, with no bucket clustering. Two backends are available: **MCCFR** (sampled concrete hands with real showdown eval) and **Exhaustive** (pre-computed equity tables with vanilla CFR).
 
 ```
-PreflopConfig ─► PreflopTree ─► PreflopSolver
-                                      │
-                                      ▼
+PreflopConfig -> PreflopTree -> PreflopSolver
+                                      |
+                                      v
                               PostflopAbstraction
-                              ┌───────────────────────────┐
-                              │ StreetBuckets.flop         │  ◄── flop bucket assignments (retained)
-                              │ PostflopTree (shared)      │  ◄── single tree at fixed SPR
-                              │ PostflopValues (per-flop)  │  ◄── solved EV table per flop
-                              └───────────────────────────┘
+                              +----------------------------+
+                              | ComboMap (per flop)         |  <-- 169 hands -> concrete card pairs
+                              | PostflopTree (shared)       |  <-- single tree at fixed SPR
+                              | PostflopValues (per-flop)   |  <-- solved EV table per flop
+                              +----------------------------+
 
-Streaming pipeline (per canonical flop, in parallel):
-  flop histograms → flop buckets → turn histograms → turn buckets
-  → river equities → river buckets → equity tables → transitions
-  → CFR solve → extract values → DROP intermediate data
+Per canonical flop (in parallel):
+  combo map -> MCCFR solve (or exhaustive CFR) -> extract values -> DROP intermediate data
 ```
 
 ## Project Structure
@@ -32,7 +30,7 @@ poker_solver_rust/
 │   │       ├── cfr/           # CFR variants (vanilla, MCCFR, sequence-form)
 │   │       ├── blueprint/     # Blueprint strategy, subgame solving, bundling
 │   │       ├── preflop/       # Preflop LCFR solver & postflop abstraction pipeline
-│   │       ├── abstraction/   # Card abstraction (EHS buckets, isomorphism)
+│   │       ├── abstraction/   # Card abstraction (isomorphism)
 │   │       ├── hand_class.rs  # 19-variant hand classification system
 │   │       ├── info_key.rs    # Info set key encoding (64-bit packed)
 │   │       ├── agent.rs       # Agent system (TOML-configured play styles)
@@ -57,30 +55,30 @@ poker_solver_rust/
 
 ### Component Summary
 
-**`core`** — The heart of the solver. Contains the `Game` trait and its implementations (heads-up no-limit, Kuhn poker, limit hold'em), multiple CFR solver backends (vanilla, MCCFR, sequence-form), the preflop LCFR solver with its full postflop abstraction pipeline (hand bucketing, equity tables, tree building, solving), the blueprint strategy system with subgame refinement, card abstractions, hand classification, and the agent simulation framework.
+**`core`** -- The heart of the solver. Contains the `Game` trait and its implementations (heads-up no-limit, Kuhn poker, limit hold'em), multiple CFR solver backends (vanilla, MCCFR, sequence-form), the preflop LCFR solver with its postflop abstraction pipeline (169-hand direct indexing, combo maps, tree building, solving), the blueprint strategy system with subgame refinement, card abstractions, hand classification, and the agent simulation framework.
 
-**`trainer`** — CLI entry point that orchestrates training runs, bucket diagnostics, hand tracing, and deal generation. Parses YAML configs and drives the core library.
+**`trainer`** -- CLI entry point that orchestrates training runs, diagnostics, hand tracing, and deal generation. Parses YAML configs and drives the core library.
 
-**`deep-cfr`** — Neural network approach to CFR using the candle ML framework. Encodes game states as card features, trains advantage networks via reservoir sampling, and supports both HUNL and limit hold'em.
+**`deep-cfr`** -- Neural network approach to CFR using the candle ML framework. Encodes game states as card features, trains advantage networks via reservoir sampling, and supports both HUNL and limit hold'em.
 
-**`gpu-cfr`** — GPU-accelerated sequence-form CFR using wgpu. Includes tabular and tiled solver variants with WGSL compute shaders for forward pass, backward pass, regret matching, and DCFR discounting.
+**`gpu-cfr`** -- GPU-accelerated sequence-form CFR using wgpu. Includes tabular and tiled solver variants with WGSL compute shaders for forward pass, backward pass, regret matching, and DCFR discounting.
 
-**`tauri-app`** — Desktop application for exploring solved strategies. Loads blueprint bundles, navigates the game tree, queries strategy/EV at any node, and runs agent simulations.
+**`tauri-app`** -- Desktop application for exploring solved strategies. Loads blueprint bundles, navigates the game tree, queries strategy/EV at any node, and runs agent simulations.
 
-**`devserver`** — Lightweight HTTP server that mirrors all Tauri exploration commands as POST endpoints, enabling browser-based UI development without the full Tauri build cycle.
+**`devserver`** -- Lightweight HTTP server that mirrors all Tauri exploration commands as POST endpoints, enabling browser-based UI development without the full Tauri build cycle.
 
-**`frontend`** — React/TypeScript UI shared between the Tauri app and dev server. Provides the strategy explorer (tree browsing, action frequencies, EV display) and agent simulator. Auto-detects Tauri vs browser environment.
+**`frontend`** -- React/TypeScript UI shared between the Tauri app and dev server. Provides the strategy explorer (tree browsing, action frequencies, EV display) and agent simulator. Auto-detects Tauri vs browser environment.
 
-**`agents/`** — TOML files defining agent play styles (tight-aggressive, loose-aggressive, etc.) that map hand classes to action frequency distributions for simulation.
+**`agents/`** -- TOML files defining agent play styles (tight-aggressive, loose-aggressive, etc.) that map hand classes to action frequency distributions for simulation.
 
 ## Preflop Solver
 
-**Algorithm:** Linear CFR (LCFR) with DCFR discounting. Both regret and strategy sums are weighted by iteration number. Simultaneous updates — both players traverse every iteration.
+**Algorithm:** Linear CFR (LCFR) with DCFR discounting. Both regret and strategy sums are weighted by iteration number. Simultaneous updates -- both players traverse every iteration.
 
 **Key types:**
-- `PreflopConfig` — game structure: blinds, stacks, raise sizes, DCFR params (alpha/beta/gamma), exploration epsilon
-- `PreflopTree` — arena-allocated game tree; nodes are Decision or Terminal (Fold/Showdown)
-- `PreflopSolver` — flat buffer layout: `regret_sum[node_idx * 169 + hand_idx]`, `strategy_sum[...]`
+- `PreflopConfig` -- game structure: blinds, stacks, raise sizes, DCFR params (alpha/beta/gamma), exploration epsilon
+- `PreflopTree` -- arena-allocated game tree; nodes are Decision or Terminal (Fold/Showdown)
+- `PreflopSolver` -- flat buffer layout: `regret_sum[node_idx * 169 + hand_idx]`, `strategy_sum[...]`
 
 **Flow:**
 1. Build `PreflopTree` from config (raise sizes, raise cap)
@@ -88,7 +86,7 @@ poker_solver_rust/
 3. Run LCFR iterations with epsilon-greedy exploration
 4. At showdown terminals: if postflop model exists, query it for EV; otherwise use raw preflop equity
 
-**Exploration:** epsilon-greedy — `intended` strategy (for strategy sums) vs `traversal` strategy (explored) ensure sufficient visits to all actions.
+**Exploration:** epsilon-greedy -- `intended` strategy (for strategy sums) vs `traversal` strategy (explored) ensure sufficient visits to all actions.
 
 **Files:**
 - Config: `crates/core/src/preflop/config.rs`
@@ -98,97 +96,64 @@ poker_solver_rust/
 
 ## Postflop Abstraction Pipeline
 
-The postflop model replaces raw equity evaluation at preflop showdown terminals with solved postflop EVs. It uses imperfect recall — each street clusters independently, and the player "forgets" prior-street bucket identity.
+The postflop model replaces raw equity evaluation at preflop showdown terminals with solved postflop EVs. It uses direct 169-hand indexing -- each canonical hand is its own info set per flop, with no bucket clustering.
+
+### 169-Hand Direct Indexing
+
+For each canonical flop, a **combo map** expands the 169 canonical hands into concrete (hero, opponent) card pairs that are compatible with the flop. Each hand index (0-168) corresponds to a canonical hand (AA, AKs, AKo, ..., 32s, 32o). The combo map handles card removal (dead cards blocked by the flop) and tracks the count of concrete combos per canonical hand for proper weighting.
+
+This replaces the prior EHS bucket-based approach. Instead of clustering hands into buckets via k-means on equity histograms, each of the 169 hands is its own "bucket". This eliminates information loss from clustering and simplifies the pipeline.
 
 ### Streaming Architecture
 
-The pipeline streams per-flop: for each canonical flop in parallel, it computes all data (buckets, equity tables, transition matrices), runs CFR to convergence, extracts the value row, then drops all intermediate data. Only flop bucket assignments and the per-flop value row persist. This reduces peak memory from ~6 GB (materializing all flops simultaneously) to ~30 MB.
+The pipeline streams per-flop: for each canonical flop in parallel, it builds the combo map, runs CFR to convergence, extracts the value row, then drops all intermediate data. Only the per-flop value rows persist.
 
 ```
 For each canonical flop (parallel):
-  1. Compute flop histograms → k-means → flop_buckets
-  2. Compute flop pairwise equity
-  3. Enumerate 47 turn cards → turn histograms → k-means → turn_buckets
-  4. Compute turn pairwise equity
-  5. Sample 10 turns → enumerate river cards → river equities → k-means → river_buckets
-  6. Compute river pairwise equity
-  7. Compute flop→turn and turn→river transition matrices
-  8. CFR solve using shared tree template + per-flop equity/transitions
-  9. Extract value row: values[hero_pos][hero_bucket][opp_bucket] → EV
-  10. DROP: turn/river buckets, equity tables, transitions, regret/strategy buffers
+  1. Build combo map: 169 hands -> concrete card pairs
+  2. Build shared postflop tree at fixed SPR
+  3. CFR solve (MCCFR or Exhaustive) using 169-hand indexing
+  4. Extract value row: values[hero_pos][hero_hand][opp_hand] -> EV
+  5. DROP: regret/strategy buffers, combo map
 ```
 
-**Entry point:** `process_single_flop()` (steps 1-7) + `stream_solve_and_extract_one_flop()` (steps 8-10)
+**Output retained at runtime:** `PostflopAbstraction` contains the shared tree and `PostflopValues`.
 
-**Output retained at runtime:** `PostflopAbstraction` contains only flop bucket assignments (`StreetBuckets.flop`), the shared tree, and `PostflopValues`.
+### MCCFR Backend
 
-### Per-Flop Bucketing
+The default backend (`solve_type: mccfr`). For each canonical flop:
+- Builds a combo map expanding 169 canonical hands to concrete card pairs
+- Samples random (hero_hand, opp_hand, turn, river) deals per iteration
+- Evaluates showdowns using `rank_hand()` on the actual 5-card board
+- Uses `mccfr_sample_pct` to control sampling density (default 1% of deal space)
+- Post-convergence: extracts per-hand EVs via Monte Carlo sampling (`value_extraction_samples`)
 
-Independent per-street k-means clustering on equity histogram CDF features:
+Embarrassingly parallel: one independent solve per canonical flop.
 
-**Flop:** For each canonical flop, cluster the 169 hands independently into N buckets. Each (hand, flop) pair's feature vector is the 10-bin equity CDF computed by enumerating 47 turn cards and computing equity vs uniform opponent. This gives each flop its own bucket assignments — "top pair on K72r" and "top pair on 987ss" get separate bucket IDs.
+### Exhaustive Backend
 
-**Turn:** Enumerate 47 live turn cards. For each of 169 hands × 47 turns, compute equity histogram CDF over 46 river cards → k-means. Independent clustering per flop.
-
-**River:** Sample 10 evenly-spaced turn cards, enumerate ~46 river cards each → ~460 five-card boards. Compute scalar equity per hand × board → k-means. Independent clustering per flop.
-
-The CDF representation means L2 distance equals Earth Mover's Distance for 1D distributions.
-
-**Files:**
-- Histogram CDFs & canonical boards: `crates/core/src/preflop/ehs.rs`
-- K-means & clustering pipeline: `crates/core/src/preflop/hand_buckets.rs`
-- Single-flop streaming: `process_single_flop()` in `hand_buckets.rs`
-
-### Equity Tables & Transition Matrices
-
-Per-street `BucketEquity` tables: 2D array `[bucket_a][bucket_b] → f32` storing average equity when bucket A faces bucket B. Computed via true pairwise hand-vs-hand evaluation. Used as leaf-node estimates during postflop CFR.
-
-Transition matrices connect streets: `flop_to_turn[flop_bucket][turn_bucket] → P(turn_bucket | flop_bucket)` and `turn_to_river[turn_bucket][river_bucket] → P(river_bucket | turn_bucket)`. Computed by counting (hand, board) assignments across adjacent streets and normalizing rows.
-
-In streaming mode, equity tables and transition matrices are computed per-flop, used for the solve, then dropped. They are not retained in the final `PostflopAbstraction` struct.
+Alternative backend (`solve_type: exhaustive`). For each canonical flop:
+- Pre-computes pairwise equity tables for all 169x169 hand pairs per street
+- Runs vanilla CFR with full traversal every iteration (no sampling)
+- Slower per iteration but converges with fewer iterations and no sampling variance
 
 ### Postflop Tree
 
-A single shared tree template at a fixed SPR (`postflop_spr`, default 5.0). All per-flop solves share this tree structure.
+A single shared tree template at a fixed SPR (`postflop_spr`, default 3.5). All per-flop solves share this tree structure.
 
 Each tree has three streets of Decision nodes (OOP=0, IP=1), Chance nodes at street transitions, and Terminals (Fold/Showdown). Bet sizes are pot fractions.
 
-`PostflopLayout` maps `(node_idx, bucket)` to flat buffer offsets for regret/strategy storage.
-
-### Postflop Solve
-
-MCCFR per-flop with bucket-level abstraction:
-- Embarrassingly parallel: one independent solve per canonical flop
-- Each solve uses the shared tree template but its own per-flop equity and transition matrices
-- Imperfect recall: each street's decision nodes use that street's independent per-flop bucket ID
-- At chance nodes (street transitions): iterate over all new-street bucket pairs, weighted by transition probabilities `P(new_bucket | old_bucket)`. Reach probabilities are multiplied by transition weights for correct regret weighting
-- Output: `PostflopValues` — flat 4D array `[flop_idx][hero_pos][hero_bucket][opp_bucket] → EV`
-
-**File:** `crates/core/src/preflop/postflop_abstraction.rs`
-
-### EV Rebucketing (Optional)
-
-When `rebucket_rounds > 1`, an outer loop refines flop bucket assignments using strategy-dependent EV features instead of raw equity:
-
-1. **Round 1 (EHS):** Standard streaming pipeline — cluster on equity histograms, solve all flops
-2. **Rounds 2+:** Extract per-hand EV histograms from the converged strategy (distribution of EVs across opponent buckets), re-cluster flop hands on EV features, then stream-solve again (turn/river recomputed fresh per flop)
-3. **Final round:** Use values from the last converged strategy
-
-This captures hand value nuances that equity alone misses. Nut hands and second-nut hands have similar equity (~95%+) but divergent EV profiles — nuts extract value from strong-but-second-best hands, while second-best pays off in those spots. EV rebucketing separates them.
-
-Each per-flop CFR solve uses **early stopping** when a convergence metric drops below `cfr_convergence_threshold` (default 0.01). The metric differs by solver: the **bucketed** solver uses BR-based exploitability (pot fraction), while the **MCCFR** solver uses `weighted_avg_strategy_delta` (regret-weighted max strategy probability change between iterations). Otherwise it runs to `postflop_solve_iterations`.
-
-With `rebucket_rounds: 1` (default), behavior is identical to the standard EHS-only pipeline.
-
-**File:** `crates/core/src/preflop/postflop_abstraction.rs`, `crates/core/src/preflop/hand_buckets.rs`
+`PostflopLayout` maps `(node_idx, hand_idx)` to flat buffer offsets for regret/strategy storage.
 
 ### Runtime Integration
 
 At each preflop showdown terminal:
 1. Loop over all canonical flops
-2. Per flop: look up hero and opponent bucket IDs via `StreetBuckets::flop_bucket_for_hand(hand_idx, flop_idx)`
-3. Lookup: `PostflopValues::get_by_flop(flop_idx, hero_pos, hero_bucket, opp_bucket) → EV fraction`
+2. Per flop: look up hero and opponent hand indices (0-168)
+3. Lookup: `PostflopValues::get_by_flop(flop_idx, hero_pos, hero_hand, opp_hand) -> EV fraction`
 4. Average across flops, then scale: `EV_fraction * actual_pot + (pot/2 - hero_investment)`
+
+**File:** `crates/core/src/preflop/postflop_abstraction.rs`
 
 ## Key Control Parameters
 
@@ -208,52 +173,32 @@ At each preflop showdown terminal:
 
 ### Postflop (`PostflopModelConfig`)
 
-| Parameter | Default | Presets (fast/med/std/acc) | Description |
-|-|-|-|-|
-| `solve_type` | bucketed | — | Postflop backend: `bucketed` or `mccfr` |
-| `num_hand_buckets_flop` | 20 | 10/15/20/30 | Per-flop k-means clusters (169 hands per flop) |
-| `num_hand_buckets_turn` | 500 | 50/200/500/1000 | Per-flop turn k-means clusters (bucketed only) |
-| `num_hand_buckets_river` | 500 | 50/200/500/1000 | Per-flop river k-means clusters (bucketed only) |
-| `bet_sizes` | [0.5, 1.0] | — | Pot-fraction bet sizes |
-| `max_raises_per_street` | 1 | — | Raise cap per postflop street |
-| `postflop_sprs` | [3.5] | — | SPR(s) for shared postflop tree (scalar or list) |
-| `postflop_solve_iterations` | 200 | — | CFR/MCCFR iterations per flop |
-| `postflop_solve_samples` | 0 | — | Bucket pairs per iteration; 0 = all (bucketed only) |
-| `max_flop_boards` | 0 | 10/200/0/0 | Max canonical flops for EHS features; 0 = all ~1,755 |
-| `fixed_flops` | none | — | Explicit flop boards (overrides `max_flop_boards`) |
-| `equity_rollout_fraction` | 1.0 | — | Fraction of runouts per hand pair; 1.0 = exact (bucketed only) |
-| `rebucket_rounds` | 1 | — | EV rebucketing rounds (1 = EHS only, 2+ = EV rebucketing) |
-| `cfr_convergence_threshold` | 0.01 | — | Convergence threshold for early per-flop CFR stopping (bucketed: exploitability in pot fractions; MCCFR: strategy delta) |
-| `mccfr_sample_pct` | 0.01 | — | Fraction of deal space per MCCFR iteration (MCCFR only) |
-| `value_extraction_samples` | 10,000 | — | Monte Carlo samples for EV extraction (MCCFR only) |
+| Parameter | Default | Description |
+|-|-|-|
+| `solve_type` | mccfr | Backend: `mccfr` (sampled concrete hands) or `exhaustive` (equity tables + vanilla CFR) |
+| `bet_sizes` | [0.5, 1.0] | Pot-fraction bet sizes |
+| `max_raises_per_street` | 1 | Raise cap per postflop street |
+| `postflop_sprs` | [3.5] | SPR(s) for shared postflop tree (scalar or list) |
+| `postflop_solve_iterations` | 500 | CFR/MCCFR iterations per flop |
+| `max_flop_boards` | 0 | Max canonical flops; 0 = all ~1,755 |
+| `fixed_flops` | none | Explicit flop boards (overrides `max_flop_boards`) |
+| `cfr_convergence_threshold` | 0.01 | Per-flop early stopping threshold |
+| `mccfr_sample_pct` | 0.01 | Fraction of deal space per MCCFR iteration (MCCFR only) |
+| `value_extraction_samples` | 10,000 | Monte Carlo samples for EV extraction (MCCFR only) |
+| `ev_convergence_threshold` | 0.001 | Early-stop EV estimation threshold (MCCFR only) |
 
 ## Caching & Bundles
 
 | Cache | Key | Stores | Status |
 |-|-|-|-|
 | `solve_cache` | config hash + equity flag | `PostflopValues` | Active |
-| `PostflopBundle` | directory path | `PostflopModelConfig` + `StreetBuckets` + `PostflopValues` + flops + SPR | Active |
+| `PostflopBundle` | directory path | `PostflopModelConfig` + `PostflopValues` + flops + SPR | Active |
 
 **Files:**
 - `crates/core/src/preflop/solve_cache.rs`
 - `crates/core/src/preflop/postflop_bundle.rs`
 
 **Postflop bundles:** Build a postflop abstraction once with `solve-postflop`, then reference the bundle directory via `postflop_model_path` in training configs to skip the expensive rebuild.
-
-
-### MCCFR Postflop Backend
-
-An alternative postflop solve backend selectable via `solve_type: mccfr` in config. Instead of abstract bucket transitions between streets, the MCCFR backend:
-
-- Uses concrete card pairs (expanded from canonical hands) assigned to flop buckets
-- Samples random (hero_hand, opp_hand, turn, river) deals per iteration
-- Evaluates showdowns using `rank_hand()` on the actual 5-card board
-- Uses only flop buckets (no turn/river bucket abstraction needed)
-
-Key config fields:
-- `solve_type`: `bucketed` (default) or `mccfr`
-- `mccfr_sample_pct`: fraction of deal space sampled per iteration (default 0.01)
-- `value_extraction_samples`: Monte Carlo samples for post-convergence EV extraction (default 10,000)
 
 ## Known Limitations
 
