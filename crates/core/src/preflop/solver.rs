@@ -332,7 +332,7 @@ impl PreflopSolver {
                 }
                 total / self.regret_sum.len() as f64 / self.iteration as f64
             }
-            CfrVariant::Dcfr => {
+            CfrVariant::Dcfr | CfrVariant::Linear => {
                 if self.last_instantaneous_regret.is_empty() {
                     return 0.0;
                 }
@@ -468,7 +468,7 @@ impl PreflopSolver {
     /// Apply DCFR discounting to both players' cumulative values.
     /// Skipped entirely for Vanilla CFR and CFR+.
     fn apply_discounting(&mut self) {
-        if self.cfr_variant != CfrVariant::Dcfr {
+        if !matches!(self.cfr_variant, CfrVariant::Dcfr | CfrVariant::Linear) {
             return;
         }
         if self.iteration > self.dcfr_warmup {
@@ -643,7 +643,7 @@ fn traverse_hero(
     #[allow(clippy::cast_precision_loss)]
     let (regret_weight, strategy_weight) = match ctx.cfr_variant {
         CfrVariant::Vanilla => (1.0, 1.0),
-        CfrVariant::Dcfr => {
+        CfrVariant::Dcfr | CfrVariant::Linear => {
             let w = ctx.iteration as f64;
             (w, w)
         }

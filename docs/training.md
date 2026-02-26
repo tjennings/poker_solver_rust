@@ -433,6 +433,36 @@ training:
   abstract_deals_dir: ./my_deals/
 ```
 
+**CFR variant selection** (sequence/GPU solvers):
+```yaml
+training:
+  cfr_variant: dcfr       # dcfr (default), linear, vanilla, cfrplus
+  dcfr_warmup: 100         # iterations before DCFR discounting starts
+  seq_exploration: 0.05    # ε-greedy exploration (0.0 = none)
+```
+
+| Variant | Regret weighting | Strategy weighting | Discounting |
+|-|-|-|-|
+| `dcfr` | linear (LCFR) | linear | α/β/γ DCFR |
+| `linear` | linear (LCFR) | linear | α=β=γ=1.0 |
+| `vanilla` | uniform | uniform | none |
+| `cfrplus` | uniform | linear | regrets floored to 0 |
+
+**CFR variant selection** (sequence/GPU solvers):
+```yaml
+training:
+  cfr_variant: dcfr       # dcfr (default), linear, vanilla, cfrplus
+  dcfr_warmup: 100         # iterations before DCFR discounting starts
+  seq_exploration: 0.05    # ε-greedy exploration (0.0 = none)
+```
+
+| Variant | Regret weighting | Strategy weighting | Discounting |
+|-|-|-|-|
+| `dcfr` | linear (LCFR) | linear | α/β/γ DCFR |
+| `linear` | linear (LCFR) | linear | α=β=γ=1.0 |
+| `vanilla` | uniform | uniform | none |
+| `cfrplus` | uniform | linear | regrets floored to 0 |
+
 ### Training Output
 
 ```

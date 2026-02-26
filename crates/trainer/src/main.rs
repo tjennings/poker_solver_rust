@@ -298,18 +298,7 @@ enum DealSortOrder {
     None,
 }
 
-/// CFR variant: `dcfr` (default) or `linear` (alpha=beta=gamma=1).
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum CfrVariant {
-    #[default]
-    Dcfr,
-    Linear,
-}
-
-fn default_cfr_variant() -> CfrVariant {
-    CfrVariant::Dcfr
-}
+use poker_solver_core::preflop::CfrVariant;
 
 #[derive(Debug, Deserialize)]
 struct TrainingConfig {
@@ -366,9 +355,15 @@ struct TrainingParams {
     /// regrets back above the line between probes.
     #[serde(default)]
     pruning_threshold: f64,
-    /// CFR variant: `dcfr` (default) or `linear` (alpha=beta=gamma=1).
-    #[serde(default = "default_cfr_variant")]
+    /// CFR variant: `dcfr` (default), `linear`, `vanilla`, or `cfrplus`.
+    #[serde(default)]
     cfr_variant: CfrVariant,
+    /// Number of initial iterations without DCFR discounting (warm-up phase).
+    #[serde(default)]
+    dcfr_warmup: u64,
+    /// Exploration factor (ε-greedy) for sequence-form CFR. Default 0.0.
+    #[serde(default)]
+    seq_exploration: f64,
     /// Use exhaustive abstract deal enumeration instead of random sampling.
     /// Only valid with `hand_class_v2` abstraction mode.
     #[serde(default)]
@@ -3009,10 +3004,14 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     );
 
     // Build solver
-    let seq_config = match config.training.cfr_variant {
+    let mut seq_config = match config.training.cfr_variant {
         CfrVariant::Linear => SequenceCfrConfig::linear_cfr(),
         CfrVariant::Dcfr => SequenceCfrConfig::default(),
+        CfrVariant::Vanilla => SequenceCfrConfig::vanilla(),
+        CfrVariant::CfrPlus => SequenceCfrConfig::cfr_plus(),
     };
+    seq_config.dcfr_warmup = config.training.dcfr_warmup;
+    seq_config.exploration = config.training.seq_exploration;
     let solver = SequenceCfrSolver::new(tree, deals, seq_config);
 
     // Build bundle config for saves

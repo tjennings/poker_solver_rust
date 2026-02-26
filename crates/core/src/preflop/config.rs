@@ -13,6 +13,8 @@ pub enum CfrVariant {
     Dcfr,
     /// CFR+ (Tammelin 2014): regrets floored to zero, linear strategy weighting.
     CfrPlus,
+    /// DCFR with all exponents = 1.0 (Pluribus linear weighting).
+    Linear,
 }
 
 fn default_exploration() -> f64 {
