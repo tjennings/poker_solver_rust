@@ -174,9 +174,17 @@ fn build_recursive(
         child_indices.push(child_idx);
     }
 
-    // Raises (if under raise cap)
+    // All-in is always available regardless of raise cap (if player has chips)
+    let player_stack = state.stacks[position as usize];
+    if player_stack > 0 {
+        let child_state = apply_all_in(state, position);
+        let child_idx = build_recursive(config, &child_state, nodes);
+        actions.push(PreflopAction::AllIn);
+        child_indices.push(child_idx);
+    }
+
+    // Sized raises (if under raise cap)
     if state.raise_count < config.raise_cap {
-        let player_stack = state.stacks[position as usize];
         let last_raise_depth = state.raise_count + 1 == config.raise_cap;
 
         // At the last raise depth, only offer all-in (no sized raises)
@@ -192,14 +200,6 @@ fn build_recursive(
                     child_indices.push(child_idx);
                 }
             }
-        }
-
-        // All-in (available if we have more chips than needed to call)
-        if player_stack > to_call {
-            let child_state = apply_all_in(state, position);
-            let child_idx = build_recursive(config, &child_state, nodes);
-            actions.push(PreflopAction::AllIn);
-            child_indices.push(child_idx);
         }
     }
 
@@ -424,12 +424,14 @@ mod tests {
         let config = PreflopConfig::heads_up(100);
         let tree = PreflopTree::build(&config);
 
-        // Walk down the tree following only raise actions and count them
-        let max_raises = count_max_raises(&tree, 0, 0);
+        // Sized raises are capped, but all-in shoves are always available beyond
+        // the cap. Each player can shove once beyond the cap, so max raises can
+        // be up to raise_cap + 2.
+        let max_sized = count_max_sized_raises(&tree, 0, 0);
         assert!(
-            max_raises <= u32::from(config.raise_cap),
-            "Max raises {} exceeds cap {}",
-            max_raises,
+            max_sized <= u32::from(config.raise_cap),
+            "Max sized raises {} exceeds cap {}",
+            max_sized,
             config.raise_cap
         );
     }
@@ -546,8 +548,67 @@ mod tests {
         }
     }
 
-    /// Recursively count the maximum number of raises along any path.
-    fn count_max_raises(tree: &PreflopTree, node_idx: usize, raises_so_far: u32) -> u32 {
+    #[timed_test]
+    fn allin_available_at_raise_cap() {
+        // With raise_cap=2 and deep stacks: SB opens, BB 3-bets all-in, SB faces
+        // decision at raise_count=2 (cap). SB should still have Fold, Call, AllIn
+        // because SB has chips beyond what's needed to call.
+        let mut config = PreflopConfig::heads_up(200);
+        config.raise_sizes = vec![vec![2.5], vec![3.0]];
+        config.raise_cap = 2;
+        let tree = PreflopTree::build(&config);
+
+        // SB opens Raise(2.5)
+        let (bb_node, _) = find_action_child(&tree, 0, PreflopAction::Raise(2.5));
+        // BB at last raise depth → only all-in offered
+        let (sb_node2, _) = find_action_child(&tree, bb_node, PreflopAction::AllIn);
+
+        // SB now at raise_count=2 (cap) with chips remaining beyond the call
+        match &tree.nodes[sb_node2] {
+            PreflopNode::Decision { action_labels, .. } => {
+                let has_all_in = action_labels.iter().any(|a| *a == PreflopAction::AllIn);
+                assert!(
+                    has_all_in,
+                    "at raise cap with deep stacks, all-in shove should be available, got: {:?}",
+                    action_labels
+                );
+                let has_fold = action_labels.iter().any(|a| *a == PreflopAction::Fold);
+                let has_call = action_labels.iter().any(|a| *a == PreflopAction::Call);
+                assert!(has_fold && has_call, "should have fold and call too");
+            }
+            other => panic!("Expected decision node at raise cap, got: {:?}", other),
+        }
+    }
+
+    #[timed_test]
+    fn allin_always_present_even_when_stack_equals_to_call() {
+        // When stack == to_call, all-in should still appear as an explicit option.
+        // With 50BB stacks and raise_cap=2: SB opens 3x, BB shoves, SB has exactly
+        // enough to call → [Fold, Call, AllIn] with AllIn present.
+        let mut config = PreflopConfig::heads_up(50);
+        config.raise_sizes = vec![vec![3.0]];
+        config.raise_cap = 2;
+        let tree = PreflopTree::build(&config);
+
+        let (bb_node, _) = find_action_child(&tree, 0, PreflopAction::Raise(3.0));
+        let (sb_node2, _) = find_action_child(&tree, bb_node, PreflopAction::AllIn);
+        match &tree.nodes[sb_node2] {
+            PreflopNode::Decision { action_labels, .. } => {
+                let has_all_in = action_labels.iter().any(|a| *a == PreflopAction::AllIn);
+                assert!(
+                    has_all_in,
+                    "all-in should always be present, even when stack ≈ to_call, got: {:?}",
+                    action_labels
+                );
+            }
+            PreflopNode::Terminal { .. } => {
+                // BB all-in may have ended hand if stacks too shallow
+            }
+        }
+    }
+
+    /// Recursively count the maximum number of sized raises (not all-in) along any path.
+    fn count_max_sized_raises(tree: &PreflopTree, node_idx: usize, raises_so_far: u32) -> u32 {
         match &tree.nodes[node_idx] {
             PreflopNode::Terminal { .. } => raises_so_far,
             PreflopNode::Decision {
@@ -558,10 +619,11 @@ mod tests {
                 let mut max = raises_so_far;
                 for (action, &child) in action_labels.iter().zip(children.iter()) {
                     let extra = match action {
-                        PreflopAction::Raise(_) | PreflopAction::AllIn => 1,
+                        PreflopAction::Raise(_) => 1,
                         _ => 0,
                     };
-                    let child_max = count_max_raises(tree, child as usize, raises_so_far + extra);
+                    let child_max =
+                        count_max_sized_raises(tree, child as usize, raises_so_far + extra);
                     if child_max > max {
                         max = child_max;
                     }
