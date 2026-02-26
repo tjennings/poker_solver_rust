@@ -1152,7 +1152,7 @@ fn run_solve_preflop(
     let chunk = if print_every > 0 { print_every } else { std::cmp::max(iterations / 100, 1) };
     let mut done = 0u64;
     let mut converged_early = false;
-    let mut regret_history: Vec<f64> = Vec::new();
+    let mut expl_history: Vec<f64> = Vec::new();
     while done < iterations {
         let batch = std::cmp::min(chunk, iterations - done);
         solver.train(batch);
@@ -1164,11 +1164,11 @@ fn run_solve_preflop(
             pb.suspend(|| {
                 print_preflop_matrices(&solver.strategy(), &tree, bb_node, bb_call_node, done);
                 let apr = solver.avg_positive_regret();
-                regret_history.push(apr);
                 let expl = solver.exploitability();
                 let mbb = expl * 500.0;
+                expl_history.push(mbb);
                 println!("  Avg +regret: {apr:.6}  Exploitability: {expl:.6} (mBB/hand: {mbb:.2})");
-                print_regret_sparkline(&regret_history, 10);
+                print_regret_sparkline(&expl_history, 10);
                 if apr < regret_threshold {
                     println!("Avg +regret {apr:.6} < {regret_threshold} — stopping early at iteration {done}");
                     early_stop = true;
@@ -1200,7 +1200,7 @@ fn run_solve_preflop(
     Ok(())
 }
 
-/// Print a small terminal chart of regret history (y=regret, x=iteration).
+/// Print a small terminal chart of exploitability history (y=mBB/hand, x=iteration).
 ///
 /// Uses Unicode braille characters for sub-cell resolution (2×4 dots per cell),
 /// giving effective resolution of `width*2 × height*4` pixels.
