@@ -855,6 +855,163 @@ fn print_postflop_ev_diagnostics(
 }
 
 // ---------------------------------------------------------------------------
+// Shared postflop progress infrastructure
+// ---------------------------------------------------------------------------
+
+/// Build a `PostflopAbstraction` with multi-bar progress display showing
+/// per-flop CFR delta / EV extraction progress alongside a main phase bar.
+fn build_postflop_with_progress(
+    pf_config: &PostflopModelConfig,
+    equity: Option<&EquityTable>,
+    cache_base: Option<&Path>,
+) -> Result<PostflopAbstraction, Box<dyn Error>> {
+    let bar_style = ProgressStyle::default_bar()
+        .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+        .expect("valid template")
+        .progress_chars("#>-");
+    let spinner_style = ProgressStyle::default_spinner()
+        .template("{spinner:.green} {msg}")
+        .expect("valid template");
+
+    let multi = MultiProgress::new();
+    let phase_bar = multi.add(ProgressBar::new_spinner());
+    phase_bar.set_style(spinner_style.clone());
+    phase_bar.set_message("Postflop abstraction");
+    phase_bar.enable_steady_tick(std::time::Duration::from_millis(500));
+
+    const MAX_FLOP_BARS: usize = 10;
+
+    struct FlopSlotData {
+        sort_key: f64,
+        position: u64,
+        length: u64,
+        message: String,
+    }
+
+    struct FlopBarState {
+        states: HashMap<String, FlopSlotData>,
+        slots: Vec<ProgressBar>,
+        last_refresh: Instant,
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn refresh_flop_slots(
+        states: &HashMap<String, FlopSlotData>,
+        slots: &mut Vec<ProgressBar>,
+        multi: &MultiProgress,
+        style: &ProgressStyle,
+    ) {
+        let mut sorted: Vec<_> = states.iter().collect();
+        sorted.sort_by(|a, b| {
+            b.1.sort_key
+                .partial_cmp(&a.1.sort_key)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let visible = sorted.len().min(MAX_FLOP_BARS);
+        while slots.len() < visible {
+            let b = multi.add(ProgressBar::new(0));
+            b.set_style(style.clone());
+            b.enable_steady_tick(std::time::Duration::from_millis(500));
+            slots.push(b);
+        }
+        while slots.len() > visible {
+            if let Some(bar) = slots.pop() {
+                bar.finish_and_clear();
+                multi.remove(&bar);
+            }
+        }
+        for (i, (_, data)) in sorted.iter().take(visible).enumerate() {
+            slots[i].set_length(data.length);
+            slots[i].set_position(data.position);
+            slots[i].set_message(data.message.clone());
+        }
+    }
+
+    let flop_state: Arc<Mutex<FlopBarState>> =
+        Arc::new(Mutex::new(FlopBarState {
+            states: HashMap::new(),
+            slots: Vec::new(),
+            last_refresh: Instant::now(),
+        }));
+
+    let pf_start = Instant::now();
+    let abstraction = PostflopAbstraction::build(
+        pf_config,
+        equity,
+        cache_base,
+        |phase| {
+            match &phase {
+                BuildPhase::FlopProgress { flop_name, stage } => {
+                    let mut guard = flop_state.lock().unwrap();
+                    let fbs = &mut *guard;
+                    match stage {
+                        FlopStage::Solving { iteration, max_iterations, delta, metric_label } => {
+                            #[allow(clippy::cast_precision_loss)]
+                            let key = 1.0 + *iteration as f64 / (*max_iterations).max(1) as f64;
+                            fbs.states.insert(flop_name.clone(), FlopSlotData {
+                                sort_key: key,
+                                position: *iteration as u64,
+                                length: *max_iterations as u64,
+                                message: format!("Flop '{flop_name}' CFR {metric_label}={delta:.4}"),
+                            });
+                        }
+                        FlopStage::EstimatingEv { sample, total_samples } => {
+                            #[allow(clippy::cast_precision_loss)]
+                            let key = 2.0 + *sample as f64 / (*total_samples).max(1) as f64;
+                            fbs.states.insert(flop_name.clone(), FlopSlotData {
+                                sort_key: key,
+                                position: *sample as u64,
+                                length: *total_samples as u64,
+                                message: format!("Flop '{flop_name}' EV Extraction"),
+                            });
+                        }
+                        FlopStage::Done => {
+                            fbs.states.remove(flop_name);
+                            refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
+                            fbs.last_refresh = Instant::now();
+                        }
+                    }
+                    if fbs.last_refresh.elapsed() >= std::time::Duration::from_secs(10) {
+                        fbs.last_refresh = Instant::now();
+                        refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
+                    }
+                }
+                BuildPhase::MccfrFlopsCompleted { completed, total } => {
+                    phase_bar.set_style(bar_style.clone());
+                    phase_bar.set_length(*total as u64);
+                    phase_bar.set_position(*completed as u64);
+                    phase_bar.set_message("MCCFR Solving");
+                }
+                _ => {
+                    phase_bar.set_style(spinner_style.clone());
+                    phase_bar.set_message(format!("{phase}..."));
+                }
+            }
+        },
+    )
+    .map_err(|e| format!("postflop abstraction: {e}"))?;
+
+    // Clean up any remaining flop bars.
+    {
+        let mut guard = flop_state.lock().unwrap();
+        let fbs = &mut *guard;
+        fbs.states.clear();
+        for bar in fbs.slots.drain(..) {
+            bar.finish_and_clear();
+            multi.remove(&bar);
+        }
+    }
+    phase_bar.set_style(bar_style);
+    phase_bar.finish_with_message(format!(
+        "done in {:.1?} (values: {} entries)",
+        pf_start.elapsed(),
+        abstraction.values.len(),
+    ));
+
+    Ok(abstraction)
+}
+
+// ---------------------------------------------------------------------------
 // Postflop bundle builder
 // ---------------------------------------------------------------------------
 
@@ -868,41 +1025,7 @@ fn run_solve_postflop(config_path: &Path, output: &Path) -> Result<(), Box<dyn E
 
     eprintln!("Building postflop abstraction...");
 
-    let bar_style = ProgressStyle::default_bar()
-        .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-        .expect("valid template")
-        .progress_chars("#>-");
-    let spinner_style = ProgressStyle::default_spinner()
-        .template("{spinner:.green} {msg}")
-        .expect("valid template");
-
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(spinner_style.clone());
-    pb.set_message("Postflop abstraction");
-    pb.enable_steady_tick(std::time::Duration::from_millis(500));
-
-    let pf_start = Instant::now();
-    let abstraction = PostflopAbstraction::build(&pf_config, None, None, |phase| {
-        match &phase {
-            BuildPhase::MccfrFlopsCompleted { completed, total } => {
-                pb.set_style(bar_style.clone());
-                pb.set_length(*total as u64);
-                pb.set_position(*completed as u64);
-                pb.set_message("MCCFR Solving");
-            }
-            _ => {
-                pb.set_style(spinner_style.clone());
-                pb.set_message(format!("{phase}..."));
-            }
-        }
-    })
-    .map_err(|e| format!("postflop abstraction: {e}"))?;
-
-    pb.finish_with_message(format!(
-        "done in {:.1?} (values: {} entries)",
-        pf_start.elapsed(),
-        abstraction.values.len(),
-    ));
+    let abstraction = build_postflop_with_progress(&pf_config, None, None)?;
 
     let bundle = PostflopBundle::from_abstraction(&pf_config, &abstraction);
     bundle.save(output)?;
@@ -1041,169 +1164,23 @@ fn run_solve_preflop(
         let has_eq = equity_samples > 0;
         let sk = solve_cache::cache_key(pf_config, has_eq);
 
-        // Always build the abstraction, but try solve cache for PostflopValues.
-        {
-            // Build with progress, then cache the values.
-            let bar_style = ProgressStyle::default_bar()
-                .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-                .expect("valid template")
-                .progress_chars("#>-");
-            let spinner_style = ProgressStyle::default_spinner()
-                .template("{spinner:.green} {msg}")
-                .expect("valid template");
+        let abstraction = build_postflop_with_progress(
+            pf_config,
+            Some(&equity),
+            Some(cache_base),
+        )?;
 
-            let multi = MultiProgress::new();
-            let phase_bar = multi.add(ProgressBar::new_spinner());
-            phase_bar.set_style(spinner_style.clone());
-            phase_bar.set_message("Postflop abstraction");
-            phase_bar.enable_steady_tick(std::time::Duration::from_millis(500));
-            // Per-flop display state. Shows top 10 most-progressed flops,
-            // refreshed every 10 seconds to keep the display stable.
-            const MAX_FLOP_BARS: usize = 10;
-
-            struct FlopSlotData {
-                sort_key: f64,
-                position: u64,
-                length: u64,
-                message: String,
-            }
-
-            struct FlopBarState {
-                states: HashMap<String, FlopSlotData>,
-                slots: Vec<ProgressBar>,
-                last_refresh: Instant,
-            }
-
-            #[allow(clippy::cast_precision_loss)]
-            fn refresh_flop_slots(
-                states: &HashMap<String, FlopSlotData>,
-                slots: &mut Vec<ProgressBar>,
-                multi: &MultiProgress,
-                style: &ProgressStyle,
-            ) {
-                let mut sorted: Vec<_> = states.iter().collect();
-                sorted.sort_by(|a, b| {
-                    b.1.sort_key
-                        .partial_cmp(&a.1.sort_key)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let visible = sorted.len().min(MAX_FLOP_BARS);
-                while slots.len() < visible {
-                    let b = multi.add(ProgressBar::new(0));
-                    b.set_style(style.clone());
-                    b.enable_steady_tick(std::time::Duration::from_millis(500));
-                    slots.push(b);
-                }
-                while slots.len() > visible {
-                    if let Some(bar) = slots.pop() {
-                        bar.finish_and_clear();
-                        multi.remove(&bar);
-                    }
-                }
-                for (i, (_, data)) in sorted.iter().take(visible).enumerate() {
-                    slots[i].set_length(data.length);
-                    slots[i].set_position(data.position);
-                    slots[i].set_message(data.message.clone());
-                }
-            }
-
-            let flop_state: Arc<Mutex<FlopBarState>> =
-                Arc::new(Mutex::new(FlopBarState {
-                    states: HashMap::new(),
-                    slots: Vec::new(),
-                    last_refresh: Instant::now(),
-                }));
-
-            let pf_start = Instant::now();
-            let abstraction = PostflopAbstraction::build(
-                pf_config,
-                Some(&equity),
-                Some(cache_base),
-                |phase| {
-                    match &phase {
-                        BuildPhase::FlopProgress { flop_name, stage } => {
-                            let mut guard = flop_state.lock().unwrap();
-                            let fbs = &mut *guard;
-                            match stage {
-                                FlopStage::Solving { iteration, max_iterations, delta, metric_label } => {
-                                    #[allow(clippy::cast_precision_loss)]
-                                    let key = 1.0 + *iteration as f64 / (*max_iterations).max(1) as f64;
-                                    fbs.states.insert(flop_name.clone(), FlopSlotData {
-                                        sort_key: key,
-                                        position: *iteration as u64,
-                                        length: *max_iterations as u64,
-                                        message: format!("Flop '{flop_name}' CFR {metric_label}={delta:.4}"),
-                                    });
-                                }
-                                FlopStage::EstimatingEv { sample, total_samples } => {
-                                    #[allow(clippy::cast_precision_loss)]
-                                    let key = 2.0 + *sample as f64 / (*total_samples).max(1) as f64;
-                                    fbs.states.insert(flop_name.clone(), FlopSlotData {
-                                        sort_key: key,
-                                        position: *sample as u64,
-                                        length: *total_samples as u64,
-                                        message: format!("Flop '{flop_name}' EV Extraction"),
-                                    });
-                                }
-                                FlopStage::Done => {
-                                    fbs.states.remove(flop_name);
-                                    // Refresh immediately so the finished flop disappears.
-                                    refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
-                                    fbs.last_refresh = Instant::now();
-                                }
-                            }
-                            if fbs.last_refresh.elapsed() >= std::time::Duration::from_secs(10) {
-                                fbs.last_refresh = Instant::now();
-                                refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
-                            }
-                        }
-                        BuildPhase::MccfrFlopsCompleted { completed, total } => {
-                            // Update the main progress bar without clearing per-flop sub-bars.
-                            // Active flop bars are managed by FlopProgress events and the
-                            // periodic refresh_flop_slots timer.
-                            phase_bar.set_style(bar_style.clone());
-                            phase_bar.set_length(*total as u64);
-                            phase_bar.set_position(*completed as u64);
-                            phase_bar.set_message("MCCFR Solving");
-                        }
-                        _ => {
-                            phase_bar.set_style(spinner_style.clone());
-                            phase_bar.set_message(format!("{phase}..."));
-                        }
-                    }
-                },
-            )
-            .map_err(|e| format!("postflop abstraction: {e}"))?;
-
-            // Clean up any remaining flop bars.
-            {
-                let mut guard = flop_state.lock().unwrap();
-                let fbs = &mut *guard;
-                fbs.states.clear();
-                for bar in fbs.slots.drain(..) {
-                    bar.finish_and_clear();
-                    multi.remove(&bar);
-                }
-            }
-            phase_bar.set_style(bar_style);
-            phase_bar.finish_with_message(format!(
-                "done in {:.1?} (values: {} entries)",
-                pf_start.elapsed(),
-                abstraction.values.len(),
-            ));
-
-            // Cache the solve values for next time.
-            if let Err(e) = solve_cache::save(cache_base, &sk, &abstraction.values) {
-                eprintln!("Warning: failed to save solve cache: {e}");
-            } else {
-                eprintln!(
-                    "Solve cache saved: {}",
-                    solve_cache::cache_dir(cache_base, &sk).display()
-                );
-            }
-
-            Some(abstraction)
+        // Cache the solve values for next time.
+        if let Err(e) = solve_cache::save(cache_base, &sk, &abstraction.values) {
+            eprintln!("Warning: failed to save solve cache: {e}");
+        } else {
+            eprintln!(
+                "Solve cache saved: {}",
+                solve_cache::cache_dir(cache_base, &sk).display()
+            );
         }
+
+        Some(abstraction)
     } else {
         None
     };
