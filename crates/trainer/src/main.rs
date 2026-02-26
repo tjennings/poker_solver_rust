@@ -694,8 +694,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             let pf_config = training.game.postflop_model
                 .ok_or("config file has no postflop_model section")?;
 
-            // Abstraction cache is disabled during StreetBuckets migration.
-            // Always build from scratch. Solve cache still works for PostflopValues.
             eprintln!("Building postflop abstraction from scratch...");
             let abstraction = PostflopAbstraction::build(
                 &pf_config, None, Some(&cache_dir), |phase| {
@@ -930,7 +928,6 @@ fn run_solve_preflop(
         let has_eq = equity_samples > 0;
         let sk = solve_cache::cache_key(pf_config, has_eq);
 
-        // Abstraction cache is disabled during StreetBuckets migration.
         // Always build the abstraction, but try solve cache for PostflopValues.
         {
             // Build with progress, then cache the values.
