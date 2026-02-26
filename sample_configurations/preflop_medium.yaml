@@ -10,6 +10,7 @@ iterations: 10000
 equity_samples: 10000
 print_every: 1000
 regret_threshold: 0.0001
+exploitability_every: 5000  # must be a multiple of print_every
 
 # ── Game structure ───────────────────────────────────────────────────────────
 # Internal units: SB=1, BB=2. Stacks = stack_depth_bb × 2.

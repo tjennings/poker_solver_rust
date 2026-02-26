@@ -731,6 +731,10 @@ struct PreflopTrainingConfig {
     /// instead of building the postflop abstraction from `postflop_model`.
     #[serde(default)]
     pub postflop_model_path: Option<PathBuf>,
+    /// Compute and print exploitability every N iterations. Must be a multiple
+    /// of `print_every`. `None` (default) disables exploitability computation.
+    #[serde(default)]
+    pub exploitability_every: Option<u64>,
 }
 
 fn default_iterations() -> u64 { 5000 }
@@ -834,6 +838,7 @@ fn run_solve_preflop(
             print_every: 1000,
             regret_threshold: default_regret_threshold(),
             postflop_model_path: None,
+            exploitability_every: None,
         }
     };
 
@@ -846,12 +851,26 @@ fn run_solve_preflop(
             .ok_or_else(|| format!("unknown postflop preset: {preset} (use fast/medium/standard/accurate)"))?);
     }
 
+    // Validate exploitability_every
+    if let Some(ee) = training.exploitability_every {
+        if ee == 0 {
+            return Err("exploitability_every must be > 0".into());
+        }
+        if training.print_every > 0 && ee % training.print_every != 0 {
+            return Err(format!(
+                "exploitability_every ({ee}) must be a multiple of print_every ({})",
+                training.print_every
+            ).into());
+        }
+    }
+
     let postflop_model_path = training.postflop_model_path.take();
     let config = training.game;
     let iterations = training.iterations;
     let equity_samples = training.equity_samples;
     let print_every = training.print_every;
     let regret_threshold = training.regret_threshold;
+    let exploitability_every = training.exploitability_every;
     let players = config.positions.len();
 
     let cache_base = std::path::Path::new("cache/postflop");
@@ -1167,6 +1186,13 @@ fn run_solve_preflop(
                 regret_history.push(apr);
                 println!("  Avg +regret: {apr:.6}");
                 print_regret_sparkline(&regret_history, 10);
+                if let Some(ee) = exploitability_every
+                    && done.is_multiple_of(ee)
+                {
+                    let expl = solver.exploitability();
+                    let mbb = expl * 500.0;
+                    println!("  Exploitability: {expl:.6} (mBB/hand: {mbb:.2})");
+                }
                 if apr < regret_threshold {
                     println!("Avg +regret {apr:.6} < {regret_threshold} — stopping early at iteration {done}");
                     early_stop = true;
@@ -1186,6 +1212,13 @@ fn run_solve_preflop(
     println!("{label} in {elapsed:.1?} — {done} iterations, {} info sets", strategy.len());
 
     print_preflop_matrices(&strategy, &tree, bb_node, bb_call_node, done);
+
+    // Final exploitability computation
+    if exploitability_every.is_some() {
+        let expl = solver.exploitability();
+        let mbb = expl * 500.0;
+        println!("  Final exploitability: {expl:.6} (mBB/hand: {mbb:.2})");
+    }
 
     let bundle = PreflopBundle::new(config, strategy);
     bundle.save(output)?;

@@ -129,10 +129,10 @@ struct Ctx<'a> {
 }
 
 /// Postflop state: pre-solved value table + raise counts for pot-type classification.
-struct PostflopState {
-    abstraction: PostflopAbstraction,
+pub(crate) struct PostflopState {
+    pub(crate) abstraction: PostflopAbstraction,
     /// Per-node raise counts for the preflop tree (to determine `PotType`).
-    raise_counts: Vec<u8>,
+    pub(crate) raise_counts: Vec<u8>,
 }
 
 /// Preflop CFR solver with alternating updates.
@@ -333,6 +333,22 @@ impl PreflopSolver {
                 total / self.last_instantaneous_regret.len() as f64 / self.iteration as f64
             }
         }
+    }
+
+    /// Compute exploitability of the current average strategy.
+    ///
+    /// Returns exploitability per hand in SB chip units (SB=1, BB=2).
+    /// Multiply by 500 to convert to mBB/hand.
+    /// A value of 0 means the strategy is a Nash equilibrium.
+    #[must_use]
+    pub fn exploitability(&self) -> f64 {
+        super::exploitability::compute_exploitability(
+            &self.tree,
+            &self.strategy(),
+            &self.equity,
+            &self.investments,
+            self.postflop.as_ref(),
+        )
     }
 
     /// Compute DCFR strategy discount: `(t / (t + 1))^γ`.
@@ -651,7 +667,7 @@ fn traverse_opponent(
 }
 
 /// Compute hero's utility at a terminal node.
-fn terminal_value(
+pub(crate) fn terminal_value(
     terminal_type: TerminalType,
     pot: u32,
     hero_inv: f64,
@@ -722,7 +738,7 @@ fn normalize(sums: &[f64]) -> Vec<f64> {
 /// nearest canonical SPR index, then looks up precomputed postflop EV.
 /// Returns EV in the same units as `terminal_value` (chips relative to start).
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
-fn postflop_showdown_value(
+pub(crate) fn postflop_showdown_value(
     pf_state: &PostflopState,
     preflop_node_idx: u32,
     pot: u32,
