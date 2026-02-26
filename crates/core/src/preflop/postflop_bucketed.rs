@@ -13,7 +13,7 @@ use super::postflop_model::PostflopModelConfig;
 use super::postflop_tree::{PostflopNode, PostflopTree};
 use super::postflop_abstraction::{
     BuildPhase, FlopSolveResult, FlopStage, PostflopLayout, PostflopValues,
-    add_buffers, avg_positive_regret_flat, regret_matching_into, normalize_strategy_sum,
+    add_buffers, regret_matching_into, normalize_strategy_sum,
     postflop_terminal_value, MAX_POSTFLOP_ACTIONS,
 };
 use crate::abstraction::Street;
@@ -284,7 +284,7 @@ fn solve_one_flop(
     let mut regret_sum = vec![0.0f64; buf_size];
     let mut strategy_sum = vec![0.0f64; buf_size];
     let use_exhaustive = num_flop_buckets * num_flop_buckets <= samples_per_iter;
-    let mut current_regret = 0.0;
+    let mut current_expl = 0.0;
     let mut iterations_used = 0;
 
     on_progress(BuildPhase::FlopProgress {
@@ -292,7 +292,7 @@ fn solve_one_flop(
         stage: FlopStage::Solving {
             iteration: 0,
             max_iterations: num_iterations,
-            avg_regret: 0.0,
+            exploitability: 0.0,
         },
     });
 
@@ -316,24 +316,24 @@ fn solve_one_flop(
         add_buffers(&mut strategy_sum, &ds);
         iterations_used = iter + 1;
 
-        current_regret = avg_positive_regret_flat(&regret_sum, iteration);
+        current_expl = postflop_exploitability(tree, layout, solve_eq, &strategy_sum, num_flop_buckets);
 
         on_progress(BuildPhase::FlopProgress {
             flop_name: flop_name.to_string(),
             stage: FlopStage::Solving {
                 iteration: iter + 1,
                 max_iterations: num_iterations,
-                avg_regret: current_regret,
+                exploitability: current_expl,
             },
         });
 
         // Early stopping after at least 2 iterations.
-        if iter >= 1 && current_regret < regret_threshold {
+        if iter >= 1 && current_expl < regret_threshold {
             break;
         }
     }
 
-    FlopSolveResult { strategy_sum, avg_regret: current_regret, iterations_used }
+    FlopSolveResult { strategy_sum, exploitability: current_expl, iterations_used }
 }
 
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
@@ -776,6 +776,22 @@ fn br_traverse(
     }
 }
 
+/// Exploitability of the current average strategy in pot fractions.
+///
+/// Sums best-response values for both players across all bucket pairs.
+/// At Nash equilibrium this is 0.
+fn postflop_exploitability(
+    tree: &PostflopTree,
+    layout: &PostflopLayout,
+    solve_eq: &SolveEquity<'_>,
+    strategy_sum: &[f64],
+    num_buckets: usize,
+) -> f64 {
+    let p0 = best_response_value(tree, layout, solve_eq, strategy_sum, 0, num_buckets, 0);
+    let p1 = best_response_value(tree, layout, solve_eq, strategy_sum, 0, num_buckets, 1);
+    (p0 + p1).max(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,7 +840,7 @@ mod tests {
         assert_eq!(result.strategy_sum.len(), buf_size);
         assert!(result.iterations_used >= 2);
         assert!(result.iterations_used <= 4);
-        assert!(result.avg_regret.is_finite());
+        assert!(result.exploitability.is_finite());
     }
 
     #[timed_test]
@@ -883,6 +899,44 @@ mod tests {
             0, "AhKd7s", &|_| {},
         );
         assert_eq!(result.iterations_used, 2, "huge threshold should stop at minimum 2 iterations");
+    }
+
+    #[timed_test(5)]
+    fn postflop_exploitability_decreases_with_training() {
+        let config = PostflopModelConfig::fast();
+        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
+        let streets = annotate_streets(&tree);
+        let layout = PostflopLayout::build(&tree, &streets, 5, 5, 5);
+        let buf_size = layout.total_size;
+
+        let eq = BucketEquity {
+            equity: vec![vec![0.5; 5]; 5],
+            num_buckets: 5,
+        };
+        let f2t = identity_transition(5);
+        let t2r = identity_transition(5);
+        let solve_eq = SolveEquity {
+            flop: &eq, turn: &eq, river: &eq,
+            flop_to_turn: &f2t, turn_to_river: &t2r,
+        };
+
+        // Few iterations
+        let early = solve_one_flop(
+            &tree, &layout, &solve_eq,
+            5, buf_size, 3, 25, 0.0,
+            0, "test", &|_| {},
+        );
+        // Many iterations
+        let late = solve_one_flop(
+            &tree, &layout, &solve_eq,
+            5, buf_size, 50, 25, 0.0,
+            0, "test", &|_| {},
+        );
+
+        assert!(early.exploitability > late.exploitability,
+            "exploitability should decrease: early={:.6}, late={:.6}",
+            early.exploitability, late.exploitability);
+        assert!(late.exploitability >= 0.0);
     }
 
     #[timed_test]

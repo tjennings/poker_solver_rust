@@ -286,7 +286,7 @@ fn mccfr_solve_one_flop(
             stage: FlopStage::Solving {
                 iteration: iterations_used,
                 max_iterations: num_iterations,
-                avg_regret: current_regret,
+                exploitability: current_regret,
             },
         });
 
@@ -297,7 +297,7 @@ fn mccfr_solve_one_flop(
 
     FlopSolveResult {
         strategy_sum,
-        avg_regret: current_regret,
+        exploitability: current_regret,
         iterations_used,
     }
 }
