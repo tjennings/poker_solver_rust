@@ -725,8 +725,10 @@ struct PreflopTrainingConfig {
     pub equity_samples: u32,
     #[serde(default = "default_print_every")]
     pub print_every: u64,
-    #[serde(default = "default_preflop_exploitability_threshold", alias = "convergence_threshold", alias = "regret_threshold")]
-    pub preflop_exploitability_threshold: f64,
+    /// Preflop exploitability stopping threshold in mBB/hand.
+    /// Training stops when exploitability drops below this value.
+    #[serde(default = "default_preflop_exploitability_threshold_mbb", alias = "convergence_threshold_mbb")]
+    pub preflop_exploitability_threshold_mbb: f64,
     /// Save a checkpoint bundle every N iterations during training.
     /// When `None`, no intermediate checkpoints are saved.
     #[serde(default)]
@@ -740,7 +742,7 @@ struct PreflopTrainingConfig {
 fn default_iterations() -> u64 { 5000 }
 fn default_equity_samples() -> u32 { 20000 }
 fn default_print_every() -> u64 { 1000 }
-fn default_preflop_exploitability_threshold() -> f64 { 0.05 }
+fn default_preflop_exploitability_threshold_mbb() -> f64 { 25.0 }
 
 // ---------------------------------------------------------------------------
 // Postflop bundle builder
@@ -836,7 +838,7 @@ fn run_solve_preflop(
             iterations: 5000,
             equity_samples: 20000,
             print_every: 1000,
-            preflop_exploitability_threshold: default_preflop_exploitability_threshold(),
+            preflop_exploitability_threshold_mbb: default_preflop_exploitability_threshold_mbb(),
             checkpoint_every: None,
             postflop_model_path: None,
         }
@@ -856,7 +858,7 @@ fn run_solve_preflop(
     let iterations = training.iterations;
     let equity_samples = training.equity_samples;
     let print_every = training.print_every;
-    let exploitability_threshold = training.preflop_exploitability_threshold;
+    let exploitability_threshold_mbb = training.preflop_exploitability_threshold_mbb;
     let checkpoint_every = training.checkpoint_every;
     let players = config.positions.len();
 
@@ -1180,8 +1182,8 @@ fn run_solve_preflop(
                 println!("  Strategy \u{03b4}: {delta:.6}  Exploitability: {expl:.6} (mBB/hand: {mbb:.2})");
                 prev_strategy = Some(strat_map);
                 print_regret_sparkline(&expl_history, 10);
-                if expl < exploitability_threshold {
-                    println!("Exploitability {expl:.6} < {exploitability_threshold} — stopping early at iteration {done}");
+                if mbb < exploitability_threshold_mbb {
+                    println!("Exploitability {mbb:.2} mBB/hand < {exploitability_threshold_mbb} — stopping early at iteration {done}");
                     early_stop = true;
                 }
             });

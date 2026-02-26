@@ -9,7 +9,7 @@
 iterations: 10000
 equity_samples: 10000
 print_every: 1000
-preflop_exploitability_threshold: 0.05
+preflop_exploitability_threshold_mbb: 25
 # checkpoint_every: 5000          # save intermediate bundles every N iterations
 
 # ── Game structure ───────────────────────────────────────────────────────────
