@@ -84,7 +84,6 @@ fn rank_label(v: Value) -> &'static str {
 }
 
 /// Hand label for a matrix cell (e.g., "AKs", "QQ", "72o").
-#[cfg(test)]
 fn hand_label(row: usize, col: usize) -> String {
     let r1 = rank_label(RANK_ORDER[row]);
     let r2 = rank_label(RANK_ORDER[col]);
@@ -386,6 +385,38 @@ pub fn print_hand_matrix(matrix: &HandMatrix, title: &str, actions: Option<&[Pre
     println!(
         "  Legend: {GRAY}#{RESET}=fold  {GREEN}#{RESET}=call{raises_str}  |  Upper-right=suited  Lower-left=offsuit  Diagonal=pairs"
     );
+}
+
+/// Print a hand matrix in plain text (no ANSI colors) for machine consumption.
+///
+/// Format: `TITLE hand=fold%/call%/raise1%/.../raiseN%` for each of 169 hands,
+/// one line per hand.
+pub fn print_hand_matrix_plain(matrix: &HandMatrix, title: &str, actions: Option<&[PreflopAction]>) {
+    let raise_labels = build_raise_legend(actions);
+    println!("[{title}]");
+    for (row, matrix_row) in matrix.iter().enumerate() {
+        for (col, cell) in matrix_row.iter().enumerate() {
+            let hand = hand_label(row, col);
+            match cell {
+                Some(s) => {
+                    let raise_total: f32 = s.raises.iter().sum();
+                    let call = (1.0 - s.fold - raise_total).max(0.0);
+                    let mut parts = Vec::new();
+                    parts.push(format!("fold={:.0}%", s.fold * 100.0));
+                    parts.push(format!("call={:.0}%", call * 100.0));
+                    for (i, &r) in s.raises.iter().enumerate() {
+                        let label = raise_labels.get(i).map_or_else(
+                            || format!("r{i}"),
+                            |l| l.clone(),
+                        );
+                        parts.push(format!("{label}={:.0}%", r * 100.0));
+                    }
+                    println!("  {hand:4} {}", parts.join(" "));
+                }
+                None => println!("  {hand:4} --"),
+            }
+        }
+    }
 }
 
 /// Build legend labels from the raise/all-in actions in the node.

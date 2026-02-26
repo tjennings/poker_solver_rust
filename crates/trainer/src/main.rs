@@ -236,6 +236,9 @@ enum Commands {
         /// Overrides any postflop_model in the config file.
         #[arg(long)]
         postflop_model: Option<String>,
+        /// Print strategy matrices in plain text (no ANSI colors) for machine consumption
+        #[arg(long)]
+        claude_debug: bool,
     },
     /// Build a postflop abstraction and save it as a reusable bundle
     SolvePostflop {
@@ -660,6 +663,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             print_every,
             equity_samples,
             postflop_model,
+            claude_debug,
         } => {
             run_solve_preflop(
                 config.as_deref(),
@@ -670,6 +674,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 print_every,
                 equity_samples,
                 postflop_model.as_deref(),
+                claude_debug,
             )?;
         }
         Commands::SolvePostflop { config, output } => {
@@ -1042,6 +1047,7 @@ fn run_solve_preflop(
     cli_print_every: Option<u64>,
     cli_equity_samples: Option<u32>,
     cli_postflop_model: Option<&str>,
+    claude_debug: bool,
 ) -> Result<(), Box<dyn Error>> {
     // Load config: from YAML file or defaults based on CLI args.
     let mut training = if let Some(path) = config_path {
@@ -1189,7 +1195,7 @@ fn run_solve_preflop(
         solver.attach_postflop(abstraction, &config);
     }
 
-    print_preflop_matrices(&solver.strategy(), &tree, bb_node, bb_call_node, 0);
+    print_preflop_matrices(&solver.strategy(), &tree, bb_node, bb_call_node, 0, claude_debug);
 
     let pb = ProgressBar::new(iterations);
     pb.set_style(
@@ -1214,7 +1220,7 @@ fn run_solve_preflop(
             let mut early_stop = false;
             pb.suspend(|| {
                 let strat = solver.strategy();
-                print_preflop_matrices(&strat, &tree, bb_node, bb_call_node, done);
+                print_preflop_matrices(&strat, &tree, bb_node, bb_call_node, done, claude_debug);
                 let strat_map = strat.into_inner();
                 let delta = prev_strategy.as_ref()
                     .map_or(0.0, |prev| convergence::strategy_delta(prev, &strat_map));
@@ -1256,7 +1262,7 @@ fn run_solve_preflop(
     let label = if converged_early { "Converged" } else { "Finished" };
     println!("{label} in {elapsed:.1?} — {done} iterations, {} info sets", strategy.len());
 
-    print_preflop_matrices(&strategy, &tree, bb_node, bb_call_node, done);
+    print_preflop_matrices(&strategy, &tree, bb_node, bb_call_node, done, claude_debug);
 
     let expl = solver.exploitability();
     let mbb = expl * 500.0;
@@ -1353,21 +1359,24 @@ fn print_preflop_matrices(
     bb_raise_node: Option<u32>,
     bb_call_node: Option<u32>,
     iteration: u64,
+    plain: bool,
 ) {
+    let print = if plain { lhe_viz::print_hand_matrix_plain } else { lhe_viz::print_hand_matrix };
+
     let sb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, 0);
     let sb_actions = preflop_node_actions(tree, 0);
-    lhe_viz::print_hand_matrix(&sb_matrix, &format!("SB RFI — iteration {iteration}"), sb_actions);
+    print(&sb_matrix, &format!("SB RFI — iteration {iteration}"), sb_actions);
 
     if let Some(bb_idx) = bb_call_node {
         let bb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, bb_idx);
         let bb_actions = preflop_node_actions(tree, bb_idx);
-        lhe_viz::print_hand_matrix(&bb_matrix, &format!("BB vs SB Call — iteration {iteration}"), bb_actions);
+        print(&bb_matrix, &format!("BB vs SB Call — iteration {iteration}"), bb_actions);
     }
 
     if let Some(bb_idx) = bb_raise_node {
         let bb_matrix = lhe_viz::preflop_strategy_matrix(strategy, tree, bb_idx);
         let bb_actions = preflop_node_actions(tree, bb_idx);
-        lhe_viz::print_hand_matrix(&bb_matrix, &format!("BB vs Raise — iteration {iteration}"), bb_actions);
+        print(&bb_matrix, &format!("BB vs Raise — iteration {iteration}"), bb_actions);
     }
 }
 
