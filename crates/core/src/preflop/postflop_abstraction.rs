@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::postflop_hands::{parse_flops, sample_canonical_flops, NUM_CANONICAL_HANDS};
+use super::postflop_exhaustive::build_exhaustive;
 use super::postflop_mccfr::build_mccfr;
 use super::postflop_model::{PostflopModelConfig, PostflopSolveType};
 use super::postflop_tree::{PostflopNode, PostflopTree};
@@ -310,7 +311,7 @@ impl PostflopAbstraction {
 
         let values = match config.solve_type {
             PostflopSolveType::Mccfr => build_mccfr(config, &tree, &layout, &node_streets, &flops, &on_progress),
-            PostflopSolveType::Exhaustive => todo!("Exhaustive backend not yet implemented"),
+            PostflopSolveType::Exhaustive => build_exhaustive(config, &tree, &layout, &node_streets, &flops, &on_progress),
         };
         on_progress(BuildPhase::ComputingValues);
         let hand_avg_values = compute_hand_avg_values(&values);
