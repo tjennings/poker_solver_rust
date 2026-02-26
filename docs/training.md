@@ -219,7 +219,7 @@ The preflop solver uses a YAML config with game structure and DCFR parameters. S
 iterations: 10000
 equity_samples: 10000
 print_every: 1000
-regret_threshold: 0.0001           # early-stop when avg +regret drops below this
+preflop_exploitability_threshold: 0.05  # early-stop when exploitability drops below this (SB/hand)
 # checkpoint_every: 5000           # save intermediate bundles every N iterations
 
 # Game structure (internal units: SB=1, BB=2)
@@ -294,8 +294,8 @@ postflop_model:
 
 Both metrics are printed every `print_every` iterations:
 
-- **Avg positive regret** (`regret_threshold`): proxy convergence metric. When it drops below the threshold, training stops early.
-- **Exploitability**: gold-standard metric. Computes the best-response value for both players — how much an optimal opponent could exploit the current strategy. Reported in both raw SB/hand and mBB/hand. At Nash equilibrium, exploitability is 0.
+- **Avg positive regret**: proxy convergence metric, printed for informational purposes.
+- **Exploitability** (`preflop_exploitability_threshold`): gold-standard metric. Computes the best-response value for both players — how much an optimal opponent could exploit the current strategy. Reported in both raw SB/hand and mBB/hand. At Nash equilibrium, exploitability is 0. When it drops below the threshold, training stops early.
 
 Set `checkpoint_every` to save intermediate strategy bundles at regular intervals (e.g. every 5000 iterations). Each checkpoint is saved to `{output}/checkpoint_{iteration}/` in the same format as the final bundle.
 
@@ -434,10 +434,10 @@ training:
   pruning_probe_interval: 20
 ```
 
-**Convergence-based stopping (avg positive regret):**
+**Convergence-based stopping (exploitability):**
 ```yaml
 training:
-  regret_threshold: 0.001
+  preflop_exploitability_threshold: 0.05  # SB/hand (= 25 mBB/hand)
   convergence_check_interval: 100
 ```
 
