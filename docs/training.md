@@ -220,7 +220,6 @@ iterations: 10000
 equity_samples: 10000
 print_every: 1000
 regret_threshold: 0.0001           # early-stop when avg +regret drops below this
-exploitability_every: 5000         # compute best-response exploitability every N iters (must be multiple of print_every)
 
 # Game structure (internal units: SB=1, BB=2)
 positions:
@@ -292,10 +291,10 @@ postflop_model:
 
 ### Convergence Metrics
 
-The solver tracks two convergence metrics during training:
+Both metrics are printed every `print_every` iterations:
 
-- **Avg positive regret** (`regret_threshold`): printed every `print_every` iterations. When it drops below the threshold, training stops early. This is a proxy metric.
-- **Exploitability** (`exploitability_every`): the gold-standard metric. Computes the best-response value for both players — i.e., how much an optimal opponent could exploit the current strategy. Reported in both raw SB/hand and mBB/hand. At Nash equilibrium, exploitability is 0. Must be a multiple of `print_every`. Costs ~2 full tree traversals over all 169×169 hand pairs, so use a less frequent interval than `print_every`.
+- **Avg positive regret** (`regret_threshold`): proxy convergence metric. When it drops below the threshold, training stops early.
+- **Exploitability**: gold-standard metric. Computes the best-response value for both players — how much an optimal opponent could exploit the current strategy. Reported in both raw SB/hand and mBB/hand. At Nash equilibrium, exploitability is 0.
 
 The `max_flop_boards` parameter controls how many canonical flop textures are used for EHS feature computation during hand bucketing. Lower values dramatically speed up the bucketing phase. Set to `0` (or omit) to use all ~1,755 canonical flops. Configurable in YAML via `max_flop_boards: 200`.
 
