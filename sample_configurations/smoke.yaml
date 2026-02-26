@@ -62,5 +62,5 @@ postflop_model:
   postflop_spr: 5.0
   # EV rebucketing (default: 1 round = EHS only)
   # rebucket_rounds: 2
-  # cfr_exploitability_threshold: 0.01
+  # cfr_convergence_threshold: 0.01
   # postflop_sprs: [3.5]

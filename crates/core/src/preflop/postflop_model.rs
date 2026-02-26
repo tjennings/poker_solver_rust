@@ -38,7 +38,7 @@ fn default_equity_rollout_fraction() -> f64 {
 fn default_rebucket_rounds() -> u16 {
     1
 }
-fn default_cfr_exploitability_threshold() -> f64 {
+fn default_cfr_convergence_threshold() -> f64 {
     0.01
 }
 
@@ -119,9 +119,11 @@ pub struct PostflopModelConfig {
     #[serde(default = "default_rebucket_rounds")]
     pub rebucket_rounds: u16,
 
-    /// Exploitability threshold for early per-flop CFR stopping (pot fraction).
-    #[serde(default = "default_cfr_exploitability_threshold", alias = "cfr_regret_threshold", alias = "cfr_delta_threshold")]
-    pub cfr_exploitability_threshold: f64,
+    /// Convergence threshold for early per-flop CFR stopping.
+    /// Bucketed solver: BR-based exploitability (pot fraction).
+    /// MCCFR solver: strategy delta (max probability change).
+    #[serde(default = "default_cfr_convergence_threshold", alias = "cfr_convergence_threshold", alias = "cfr_regret_threshold", alias = "cfr_delta_threshold")]
+    pub cfr_convergence_threshold: f64,
 
     /// Maximum number of canonical flop boards to use for EHS feature computation.
     /// 0 means use all canonical flops (~1,755). Lower values dramatically speed up
@@ -198,7 +200,7 @@ impl PostflopModelConfig {
             postflop_solve_samples: 0,
             postflop_sprs: vec![3.5],
             rebucket_rounds: 1,
-            cfr_exploitability_threshold: 0.01,
+            cfr_convergence_threshold: 0.01,
             max_flop_boards: 0,
             fixed_flops: None,
             equity_rollout_fraction: 1.0,
@@ -358,9 +360,9 @@ mod tests {
     }
 
     #[timed_test]
-    fn cfr_exploitability_threshold_defaults() {
+    fn cfr_convergence_threshold_defaults() {
         let cfg = PostflopModelConfig::standard();
-        assert!((cfg.cfr_exploitability_threshold - 0.01).abs() < 1e-9);
+        assert!((cfg.cfr_convergence_threshold - 0.01).abs() < 1e-9);
     }
 
     #[timed_test]

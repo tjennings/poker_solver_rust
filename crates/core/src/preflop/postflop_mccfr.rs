@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use super::hand_buckets::{self, StreetBuckets};
 use super::postflop_abstraction::{
     BuildPhase, FlopSolveResult, FlopStage, PostflopLayout, PostflopValues,
-    add_buffers, avg_positive_regret_flat, regret_matching_into, normalize_strategy_sum,
+    add_buffers, regret_matching_into, normalize_strategy_sum, weighted_avg_strategy_delta,
     MAX_POSTFLOP_ACTIONS,
 };
 use super::postflop_model::PostflopModelConfig;
@@ -159,7 +159,7 @@ pub(crate) fn build_mccfr(
                 flop,
                 num_iterations,
                 samples_per_iter,
-                config.cfr_exploitability_threshold,
+                config.cfr_convergence_threshold,
                 &flop_name,
                 on_progress,
             );
@@ -220,10 +220,10 @@ pub(crate) fn build_mccfr(
 
 /// Training loop for a single flop using MCCFR with concrete hands.
 ///
-/// NOTE: The `exploitability` field in the result and progress reports contains
-/// `avg_positive_regret_flat` as a proxy — true exploitability would require
-/// equity tables that MCCFR doesn't build. This proxy bounds exploitability
-/// and serves the same convergence role.
+/// Convergence is measured via `weighted_avg_strategy_delta`: the regret-weighted
+/// average of max per-action strategy probability change between consecutive
+/// iterations. This avoids the decay problem of `avg_positive_regret_flat` which
+/// divides cumulative regret by buffer_size × iterations.
 #[allow(clippy::too_many_arguments)]
 fn mccfr_solve_one_flop(
     tree: &PostflopTree,
@@ -232,18 +232,20 @@ fn mccfr_solve_one_flop(
     flop: &[Card; 3],
     num_iterations: usize,
     samples_per_iter: usize,
-    exploitability_threshold: f64,
+    convergence_threshold: f64,
     flop_name: &str,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> FlopSolveResult {
     let buf_size = layout.total_size;
     let mut regret_sum = vec![0.0f64; buf_size];
     let mut strategy_sum = vec![0.0f64; buf_size];
-    let mut current_expl = 0.0;
+    let mut current_delta = 0.0;
     let mut iterations_used = 0;
 
     for iter in 0..num_iterations {
         let iteration = iter as u64 + 1;
+
+        let prev_regrets = regret_sum.clone();
 
         // Sample deals and traverse
         let seed = iteration * 1_000_003 + flop_name.len() as u64;
@@ -284,25 +286,27 @@ fn mccfr_solve_one_flop(
         add_buffers(&mut strategy_sum, &ds);
         iterations_used = iter + 1;
 
-        current_expl = avg_positive_regret_flat(&regret_sum, iteration);
+        if iter >= 1 {
+            current_delta = weighted_avg_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
+        }
 
         on_progress(BuildPhase::FlopProgress {
             flop_name: flop_name.to_string(),
             stage: FlopStage::Solving {
                 iteration: iterations_used,
                 max_iterations: num_iterations,
-                exploitability: current_expl,
+                exploitability: current_delta,
             },
         });
 
-        if iter >= 1 && current_expl < exploitability_threshold {
+        if iter >= 1 && current_delta < convergence_threshold {
             break;
         }
     }
 
     FlopSolveResult {
         strategy_sum,
-        exploitability: current_expl,
+        exploitability: current_delta,
         iterations_used,
     }
 }
@@ -774,7 +778,7 @@ mod tests {
             postflop_solve_samples: 0,
             postflop_sprs: vec![3.5],
             rebucket_rounds: 1,
-            cfr_exploitability_threshold: 0.01,
+            cfr_convergence_threshold: 0.01,
             max_flop_boards: 1,
             fixed_flops: None,
             equity_rollout_fraction: 1.0,

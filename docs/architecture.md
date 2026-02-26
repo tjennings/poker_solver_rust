@@ -176,7 +176,7 @@ When `rebucket_rounds > 1`, an outer loop refines flop bucket assignments using 
 
 This captures hand value nuances that equity alone misses. Nut hands and second-nut hands have similar equity (~95%+) but divergent EV profiles — nuts extract value from strong-but-second-best hands, while second-best pays off in those spots. EV rebucketing separates them.
 
-Each per-flop CFR solve uses **early stopping**: when exploitability drops below `cfr_exploitability_threshold` (default 0.01, in pot fractions), the solve stops early. Otherwise it runs to `postflop_solve_iterations`.
+Each per-flop CFR solve uses **early stopping** when a convergence metric drops below `cfr_convergence_threshold` (default 0.01). The metric differs by solver: the **bucketed** solver uses BR-based exploitability (pot fraction), while the **MCCFR** solver uses `weighted_avg_strategy_delta` (regret-weighted max strategy probability change between iterations). Otherwise it runs to `postflop_solve_iterations`.
 
 With `rebucket_rounds: 1` (default), behavior is identical to the standard EHS-only pipeline.
 
@@ -223,7 +223,7 @@ At each preflop showdown terminal:
 | `fixed_flops` | none | — | Explicit flop boards (overrides `max_flop_boards`) |
 | `equity_rollout_fraction` | 1.0 | — | Fraction of runouts per hand pair; 1.0 = exact (bucketed only) |
 | `rebucket_rounds` | 1 | — | EV rebucketing rounds (1 = EHS only, 2+ = EV rebucketing) |
-| `cfr_exploitability_threshold` | 0.01 | — | Exploitability threshold for early per-flop CFR stopping (pot fraction) |
+| `cfr_convergence_threshold` | 0.01 | — | Convergence threshold for early per-flop CFR stopping (bucketed: exploitability in pot fractions; MCCFR: strategy delta) |
 | `mccfr_sample_pct` | 0.01 | — | Fraction of deal space per MCCFR iteration (MCCFR only) |
 | `value_extraction_samples` | 10,000 | — | Monte Carlo samples for EV extraction (MCCFR only) |
 
