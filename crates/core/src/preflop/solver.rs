@@ -130,6 +130,8 @@ struct Ctx<'a> {
     iteration: u64,
     /// CFR variant controlling iteration weighting.
     cfr_variant: CfrVariant,
+    /// Per-player starting stacks (SB units).
+    stacks: [u32; 2],
     /// Optional postflop abstraction for modeling postflop play at showdown terminals.
     postflop: Option<&'a PostflopState>,
 }
@@ -175,6 +177,8 @@ pub struct PreflopSolver {
     dcfr_warmup: u64,
     /// ε-greedy exploration factor.
     exploration: f64,
+    /// Per-player starting stacks (SB units).
+    stacks: [u32; 2],
     /// Optional postflop model state.
     postflop: Option<PostflopState>,
 }
@@ -216,6 +220,10 @@ impl PreflopSolver {
             dcfr_gamma: config.dcfr_gamma,
             dcfr_warmup: config.dcfr_warmup,
             exploration: config.exploration,
+            stacks: [
+                config.stacks.first().copied().unwrap_or(0),
+                config.stacks.get(1).copied().unwrap_or(0),
+            ],
             postflop: None,
         }
     }
@@ -354,6 +362,7 @@ impl PreflopSolver {
             &self.equity,
             &self.investments,
             self.postflop.as_ref(),
+            self.stacks,
         )
     }
 
@@ -441,6 +450,7 @@ impl PreflopSolver {
             exploration: self.exploration,
             iteration: self.iteration,
             cfr_variant: self.cfr_variant,
+            stacks: self.stacks,
             postflop: self.postflop.as_ref(),
         };
 
@@ -541,9 +551,11 @@ fn cfr_traverse(
         PreflopNode::Terminal { terminal_type, pot } => match terminal_type {
             TerminalType::Showdown => {
                 if let Some(pf_state) = ctx.postflop {
+                    let eq = ctx.equity.equity(hero_hand as usize, opp_hand as usize);
                     postflop_showdown_value(
                         pf_state, node_idx, *pot, hero_inv,
                         hero_hand, opp_hand, hero_pos,
+                        eq, ctx.stacks,
                     )
                 } else {
                     terminal_value(
@@ -739,10 +751,14 @@ fn normalize(sums: &[f64]) -> Vec<f64> {
     }
 }
 
-/// Look up pre-solved postflop EV from the value table.
+/// Look up pre-solved postflop EV from the value table with SPR scaling.
 ///
-/// Determines the pot type from the precomputed raise count, maps to the
-/// nearest canonical SPR index, then looks up precomputed postflop EV.
+/// The postflop model was solved at a fixed SPR (e.g. 3.5). When the actual
+/// remaining stacks at a preflop terminal are shallower than the model assumed,
+/// we interpolate between pure equity value and the model value based on the
+/// ratio of actual SPR to model SPR. This prevents physically impossible
+/// values when the model's SPR exceeds the actual stack depth.
+///
 /// Returns EV in the same units as `terminal_value` (chips relative to start).
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub(crate) fn postflop_showdown_value(
@@ -753,17 +769,37 @@ pub(crate) fn postflop_showdown_value(
     hero_hand: u16,
     opp_hand: u16,
     hero_pos: u8,
+    equity: f64,
+    stacks: [u32; 2],
 ) -> f64 {
-    // Both preflop and postflop trees use the same position numbering:
-    // 0 = SB (IP in HU), 1 = BB (OOP in HU).
-    // No remapping needed — hero_pos maps directly to the EV table index.
-    let hero_tree_pos = hero_pos;
+    let pot_f = f64::from(pot);
 
     // O(1) lookup into precomputed hand-averaged EV table.
-    let pf_ev_frac = pf_state.abstraction.avg_ev(hero_tree_pos, hero_hand as usize, opp_hand as usize);
+    let pf_ev_frac = pf_state.abstraction.avg_ev(
+        hero_pos, hero_hand as usize, opp_hand as usize,
+    );
 
-    // Scale: postflop EV fraction × actual pot size, offset by hero's investment.
-    pf_ev_frac * f64::from(pot) + (f64::from(pot) / 2.0 - hero_inv)
+    // Model value (what the postflop model predicts at its trained SPR).
+    let model_value = pf_ev_frac * pot_f + (pot_f / 2.0 - hero_inv);
+
+    // Pure equity value (fallback when no postflop play is possible).
+    let eq_value = equity * pot_f - hero_inv;
+
+    // Compute actual SPR at this terminal.
+    let opp_inv = pot_f - hero_inv;
+    let hero_remaining = f64::from(stacks[hero_pos as usize]) - hero_inv;
+    let opp_remaining = f64::from(stacks[1 - hero_pos as usize]) - opp_inv;
+    let effective_remaining = hero_remaining.min(opp_remaining).max(0.0);
+    let actual_spr = if pot > 0 { effective_remaining / pot_f } else { 0.0 };
+
+    let model_spr = pf_state.abstraction.spr;
+    if model_spr <= 0.0 || actual_spr >= model_spr {
+        return model_value;
+    }
+
+    // Interpolate: at actual_spr=0 use pure equity, at model_spr use full model.
+    let ratio = actual_spr / model_spr;
+    eq_value + (model_value - eq_value) * ratio
 }
 
 /// Precompute the raise count at every node in the preflop tree.
@@ -1282,9 +1318,12 @@ mod tests {
 
         let pot = 10;
         let hero_inv = 5.0;
+        // Stacks deep enough that actual_spr >= model_spr (no interpolation).
+        let stacks = [60, 60];
+        let equity = 0.5; // unused when actual_spr >= model_spr
 
         // SB (hero_pos=0) looking up hand 0 vs opp hand 1 → should get IP value 0.3
-        let ev_sb = postflop_showdown_value(&pf_state, 0, pot, hero_inv, 0, 1, 0);
+        let ev_sb = postflop_showdown_value(&pf_state, 0, pot, hero_inv, 0, 1, 0, equity, stacks);
         // Expected: 0.3 * 10 + (10/2 - 5) = 3.0
         assert!(
             (ev_sb - 3.0).abs() < 1e-10,
@@ -1292,12 +1331,13 @@ mod tests {
         );
 
         // BB (hero_pos=1) looking up hand 1 vs opp hand 0 → should get OOP value -0.1
-        let ev_bb = postflop_showdown_value(&pf_state, 0, pot, hero_inv, 1, 0, 1);
+        let ev_bb = postflop_showdown_value(&pf_state, 0, pot, hero_inv, 1, 0, 1, equity, stacks);
         // Expected: -0.1 * 10 + (10/2 - 5) = -1.0
         assert!(
             (ev_bb - (-1.0)).abs() < 1e-10,
             "BB should read OOP (pos 1) values: got {ev_bb}, expected -1.0"
         );
     }
+
 
 }
