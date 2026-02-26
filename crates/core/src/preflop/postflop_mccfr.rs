@@ -159,7 +159,7 @@ pub(crate) fn build_mccfr(
                 flop,
                 num_iterations,
                 samples_per_iter,
-                config.cfr_regret_threshold,
+                config.cfr_exploitability_threshold,
                 &flop_name,
                 on_progress,
             );
@@ -227,14 +227,14 @@ fn mccfr_solve_one_flop(
     flop: &[Card; 3],
     num_iterations: usize,
     samples_per_iter: usize,
-    regret_threshold: f64,
+    exploitability_threshold: f64,
     flop_name: &str,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> FlopSolveResult {
     let buf_size = layout.total_size;
     let mut regret_sum = vec![0.0f64; buf_size];
     let mut strategy_sum = vec![0.0f64; buf_size];
-    let mut current_regret = 0.0;
+    let mut current_expl = 0.0;
     let mut iterations_used = 0;
 
     for iter in 0..num_iterations {
@@ -279,25 +279,25 @@ fn mccfr_solve_one_flop(
         add_buffers(&mut strategy_sum, &ds);
         iterations_used = iter + 1;
 
-        current_regret = avg_positive_regret_flat(&regret_sum, iteration);
+        current_expl = avg_positive_regret_flat(&regret_sum, iteration);
 
         on_progress(BuildPhase::FlopProgress {
             flop_name: flop_name.to_string(),
             stage: FlopStage::Solving {
                 iteration: iterations_used,
                 max_iterations: num_iterations,
-                exploitability: current_regret,
+                exploitability: current_expl,
             },
         });
 
-        if iter >= 1 && current_regret < regret_threshold {
+        if iter >= 1 && current_expl < exploitability_threshold {
             break;
         }
     }
 
     FlopSolveResult {
         strategy_sum,
-        exploitability: current_regret,
+        exploitability: current_expl,
         iterations_used,
     }
 }
@@ -769,7 +769,7 @@ mod tests {
             postflop_solve_samples: 0,
             postflop_sprs: vec![3.5],
             rebucket_rounds: 1,
-            cfr_regret_threshold: 0.001,
+            cfr_exploitability_threshold: 0.01,
             max_flop_boards: 1,
             fixed_flops: None,
             equity_rollout_fraction: 1.0,

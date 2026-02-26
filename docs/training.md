@@ -322,7 +322,7 @@ The `rebucket_rounds` parameter controls EV-based postflop rebucketing. With the
 | `fixed_flops` | none | [string] | Explicit flop boards (overrides `max_flop_boards`) |
 | `equity_rollout_fraction` | 1.0 | f64 | Fraction of runouts per hand pair; 1.0 = exact (bucketed only) |
 | `rebucket_rounds` | 1 | u16 | EV rebucketing rounds; 1 = EHS only, 2+ = EV rebucketing |
-| `cfr_regret_threshold` | 0.001 | f64 | Avg positive regret threshold for early CFR stopping |
+| `cfr_exploitability_threshold` | 0.01 | f64 | Exploitability threshold for early per-flop CFR stopping (pot fraction) |
 | `mccfr_sample_pct` | 0.01 | f64 | Fraction of deal space sampled per iteration (MCCFR only) |
 | `value_extraction_samples` | 10,000 | u32 | Monte Carlo samples for post-convergence EV extraction (MCCFR only) |
 | `ev_convergence_threshold` | 0.001 | f64 | Weighted-avg delta threshold for early-stop EV estimation (MCCFR only) |

@@ -176,7 +176,7 @@ When `rebucket_rounds > 1`, an outer loop refines flop bucket assignments using 
 
 This captures hand value nuances that equity alone misses. Nut hands and second-nut hands have similar equity (~95%+) but divergent EV profiles — nuts extract value from strong-but-second-best hands, while second-best pays off in those spots. EV rebucketing separates them.
 
-Each per-flop CFR solve uses **early stopping**: when the average positive regret drops below `cfr_regret_threshold` (default 0.001), the solve stops early. Otherwise it runs to `postflop_solve_iterations`.
+Each per-flop CFR solve uses **early stopping**: when exploitability drops below `cfr_exploitability_threshold` (default 0.01, in pot fractions), the solve stops early. Otherwise it runs to `postflop_solve_iterations`.
 
 With `rebucket_rounds: 1` (default), behavior is identical to the standard EHS-only pipeline.
 
@@ -223,7 +223,7 @@ At each preflop showdown terminal:
 | `fixed_flops` | none | — | Explicit flop boards (overrides `max_flop_boards`) |
 | `equity_rollout_fraction` | 1.0 | — | Fraction of runouts per hand pair; 1.0 = exact (bucketed only) |
 | `rebucket_rounds` | 1 | — | EV rebucketing rounds (1 = EHS only, 2+ = EV rebucketing) |
-| `cfr_regret_threshold` | 0.001 | — | Avg positive regret threshold for early CFR stopping |
+| `cfr_exploitability_threshold` | 0.01 | — | Exploitability threshold for early per-flop CFR stopping (pot fraction) |
 | `mccfr_sample_pct` | 0.01 | — | Fraction of deal space per MCCFR iteration (MCCFR only) |
 | `value_extraction_samples` | 10,000 | — | Monte Carlo samples for EV extraction (MCCFR only) |
 

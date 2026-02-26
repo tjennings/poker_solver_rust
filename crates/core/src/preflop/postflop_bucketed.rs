@@ -94,7 +94,7 @@ pub(crate) fn build_bucketed(
                 nfb,
                 solve_iters,
                 samples,
-                config.cfr_regret_threshold,
+                config.cfr_exploitability_threshold,
                 flop_idx,
                 &flop_name,
                 on_progress,
@@ -178,7 +178,7 @@ pub(crate) fn build_bucketed(
                     nfb,
                     solve_iters,
                     samples,
-                    config.cfr_regret_threshold,
+                    config.cfr_exploitability_threshold,
                     flop_idx,
                     &flop_name,
                     on_progress,
@@ -224,7 +224,7 @@ fn stream_solve_and_extract_one_flop(
     num_flop_buckets: usize,
     num_iterations: usize,
     samples_per_iter: usize,
-    delta_threshold: f64,
+    exploitability_threshold: f64,
     flop_idx: usize,
     flop_name: &str,
     on_progress: &(impl Fn(BuildPhase) + Sync),
@@ -241,7 +241,7 @@ fn stream_solve_and_extract_one_flop(
     let result = solve_one_flop(
         tree, layout, &solve_eq,
         num_flop_buckets, buf_size,
-        num_iterations, samples_per_iter, delta_threshold,
+        num_iterations, samples_per_iter, exploitability_threshold,
         flop_idx, flop_name, on_progress,
     );
 
@@ -265,7 +265,7 @@ fn stream_solve_and_extract_one_flop(
 /// Run CFR for a single flop with the shared tree template.
 ///
 /// Runs up to `num_iterations` CFR iterations, stopping early when
-/// avg positive regret drops below `regret_threshold`.
+/// exploitability drops below `exploitability_threshold`.
 /// Early stopping requires at least 2 completed iterations.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn solve_one_flop(
@@ -276,7 +276,7 @@ fn solve_one_flop(
     buf_size: usize,
     num_iterations: usize,
     samples_per_iter: usize,
-    regret_threshold: f64,
+    exploitability_threshold: f64,
     flop_idx: usize,
     flop_name: &str,
     on_progress: &(impl Fn(BuildPhase) + Sync),
@@ -328,7 +328,7 @@ fn solve_one_flop(
         });
 
         // Early stopping after at least 2 iterations.
-        if iter >= 1 && current_expl < regret_threshold {
+        if iter >= 1 && current_expl < exploitability_threshold {
             break;
         }
     }
