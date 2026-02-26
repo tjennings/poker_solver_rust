@@ -513,21 +513,23 @@ fn constrained_bet_actions(bet_sizes: &[f32], pot_fraction: f64, max_pot: f64) -
         return actions;
     }
     let mut added_allin = false;
-    let mut any_capped = false;
     for &s in bet_sizes {
         if f64::from(s) < available - 1e-6 {
             actions.push(PostflopAction::Bet(s));
-        } else {
-            any_capped = true;
-            if !added_allin {
-                actions.push(PostflopAction::Bet(available as f32));
-                added_allin = true;
-            }
+        } else if !added_allin {
+            actions.push(PostflopAction::Bet(available as f32));
+            added_allin = true;
         }
     }
-    // Only add an implicit all-in if at least one bet was capped but none replaced yet
-    if !added_allin && any_capped && available > 0.01 {
-        actions.push(PostflopAction::Bet(available as f32));
+    // Always include all-in if not already present and meaningfully different from largest bet
+    if !added_allin && available > 0.01 {
+        let largest = actions.iter().filter_map(|a| match a {
+            PostflopAction::Bet(f) => Some(f64::from(*f)),
+            _ => None,
+        }).fold(0.0f64, f64::max);
+        if available - largest > 0.05 {
+            actions.push(PostflopAction::Bet(available as f32));
+        }
     }
     actions
 }
@@ -541,29 +543,45 @@ fn constrained_raise_actions(
     raises_remaining: u8,
 ) -> Vec<PostflopAction> {
     let mut actions = vec![PostflopAction::Fold, PostflopAction::Call];
-    if raises_remaining == 0 {
-        return actions;
-    }
     let available = max_pot / new_pot - 1.0;
+
+    // All-in is always available regardless of raise limit
+    if available > 0.01 {
+        actions.push(PostflopAction::Raise(available as f32));
+    }
+    if raises_remaining == 0 {
+        return actions; // [Fold, Call, All-in]
+    }
     if available <= 1e-9 {
         return actions;
     }
     let mut added_allin = false;
-    let mut any_capped = false;
     for &s in bet_sizes {
         if f64::from(s) < available - 1e-6 {
+            // Skip sized raises within 5% pot of all-in (redundant)
+            if available - f64::from(s) <= 0.05 {
+                continue;
+            }
             actions.push(PostflopAction::Raise(s));
         } else {
-            any_capped = true;
-            if !added_allin {
-                actions.push(PostflopAction::Raise(available as f32));
-                added_allin = true;
-            }
+            // This size exceeds stack — all-in already added above
+            added_allin = true;
         }
     }
-    // Only add an implicit all-in if at least one raise was capped but none replaced yet
-    if !added_allin && any_capped && available > 0.01 {
-        actions.push(PostflopAction::Raise(available as f32));
+    // If no size was capped, ensure all-in is meaningfully different from largest raise
+    if !added_allin {
+        let largest = actions.iter().filter_map(|a| match a {
+            PostflopAction::Raise(f) => Some(f64::from(*f)),
+            _ => None,
+        }).fold(0.0f64, f64::max);
+        // All-in already added above; remove it if too close to largest sized raise
+        if available - largest <= 0.05 {
+            // Remove the all-in we added at the top
+            actions.retain(|a| match a {
+                PostflopAction::Raise(f) => (f64::from(*f) - available).abs() > 1e-6,
+                _ => true,
+            });
+        }
     }
     actions
 }
@@ -775,7 +793,7 @@ fn build_after_facing_bet_spr(
                 new_pot,
                 raised_pot,
                 street,
-                raises_remaining - 1,
+                raises_remaining.saturating_sub(1),
                 max_pot,
             )
         }
@@ -1075,12 +1093,76 @@ mod tests {
     }
 
     #[timed_test]
-    fn spr_tree_deep_matches_unconstrained() {
-        // SPR=1000 → max_pot=2001 → no bet is capped → same tree as old build.
-        // Both builders now use consistent OOP=1(BB), IP=0(SB) positions.
+    fn spr_tree_deep_has_more_nodes_than_unconstrained() {
+        // SPR=1000 → max_pot=2001 → no bet is capped, but SPR tree always adds all-in.
+        // Both builders use consistent OOP=1(BB), IP=0(SB) positions.
         let cfg = fast_config();
         let spr_tree = PostflopTree::build_with_spr(&cfg, 1000.0).unwrap();
         let old_tree = PostflopTree::build(PotType::Raised, &cfg).unwrap();
-        assert_eq!(spr_tree.node_count(), old_tree.node_count());
+        assert!(
+            spr_tree.node_count() > old_tree.node_count(),
+            "SPR tree ({}) should have more nodes than unconstrained ({}) due to always-allin",
+            spr_tree.node_count(),
+            old_tree.node_count(),
+        );
+    }
+
+    #[timed_test]
+    fn spr_tree_deep_allin_always_present_in_bets() {
+        // With deep SPR, all-in should appear alongside configured bets
+        let cfg = fast_config(); // bet_sizes: [0.5, 1.0]
+        let tree = PostflopTree::build_with_spr(&cfg, 20.0).unwrap();
+        // Root is opening decision — should have Check, Bet(0.5), Bet(1.0), Bet(all-in)
+        match &tree.nodes[0] {
+            PostflopNode::Decision { action_labels, .. } => {
+                let bets: Vec<f32> = action_labels.iter().filter_map(|a| match a {
+                    PostflopAction::Bet(f) => Some(*f),
+                    _ => None,
+                }).collect();
+                assert!(
+                    bets.len() >= 3,
+                    "expected at least 3 bets (0.5, 1.0, all-in), got {bets:?}"
+                );
+                // Last bet should be the all-in (largest)
+                let max_bet = bets.iter().copied().fold(0.0f32, f32::max);
+                assert!(
+                    max_bet > 1.0,
+                    "largest bet should be all-in (> 1.0x pot), got {max_bet}"
+                );
+            }
+            _ => panic!("root should be Decision"),
+        }
+    }
+
+    #[timed_test]
+    fn spr_tree_allin_available_at_raise_limit() {
+        // At raise cap (raises_remaining=0), all-in shove should still be available
+        let cfg = PostflopModelConfig {
+            bet_sizes: vec![0.5, 1.0],
+            max_raises_per_street: 1,
+            ..PostflopModelConfig::fast()
+        };
+        let tree = PostflopTree::build_with_spr(&cfg, 5.0).unwrap();
+        // Walk the tree to find a node at the raise limit
+        // After: OOP bets, IP raises (1 raise used), OOP faces raise at limit
+        let mut found_allin_at_cap = false;
+        for node in &tree.nodes {
+            if let PostflopNode::Decision { action_labels, .. } = node {
+                let has_fold = action_labels.contains(&PostflopAction::Fold);
+                let has_call = action_labels.contains(&PostflopAction::Call);
+                let raises: Vec<&PostflopAction> = action_labels.iter()
+                    .filter(|a| matches!(a, PostflopAction::Raise(_)))
+                    .collect();
+                // A node with Fold + Call + exactly 1 raise (all-in only) = raise cap node
+                if has_fold && has_call && raises.len() == 1 {
+                    found_allin_at_cap = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_allin_at_cap,
+            "should find at least one node with Fold+Call+All-in at raise cap"
+        );
     }
 }
