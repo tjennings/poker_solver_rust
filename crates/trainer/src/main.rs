@@ -263,9 +263,6 @@ enum Commands {
         /// YAML config file (same format as solve-preflop)
         #[arg(short, long)]
         config: PathBuf,
-        /// Directory for abstraction cache
-        #[arg(long, default_value = "cache/postflop")]
-        cache_dir: PathBuf,
     },
 }
 
@@ -688,7 +685,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 std::process::exit(1);
             }
         }
-        Commands::TraceHand { config, cache_dir } => {
+        Commands::TraceHand { config } => {
             let yaml = std::fs::read_to_string(&config)?;
             let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
             let pf_config = training.game.postflop_model
@@ -696,7 +693,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             eprintln!("Building postflop abstraction from scratch...");
             let abstraction = PostflopAbstraction::build(
-                &pf_config, None, Some(&cache_dir), |phase| {
+                &pf_config, None, |phase| {
                     eprintln!("  {phase:?}");
                 },
             )?;
@@ -863,7 +860,6 @@ fn print_postflop_ev_diagnostics(
 fn build_postflop_with_progress(
     pf_config: &PostflopModelConfig,
     equity: Option<&EquityTable>,
-    cache_base: Option<&Path>,
 ) -> Result<PostflopAbstraction, Box<dyn Error>> {
     let bar_style = ProgressStyle::default_bar()
         .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
@@ -938,7 +934,6 @@ fn build_postflop_with_progress(
     let abstraction = PostflopAbstraction::build(
         pf_config,
         equity,
-        cache_base,
         |phase| {
             match &phase {
                 BuildPhase::FlopProgress { flop_name, stage } => {
@@ -1025,7 +1020,7 @@ fn run_solve_postflop(config_path: &Path, output: &Path) -> Result<(), Box<dyn E
 
     eprintln!("Building postflop abstraction...");
 
-    let abstraction = build_postflop_with_progress(&pf_config, None, None)?;
+    let abstraction = build_postflop_with_progress(&pf_config, None)?;
 
     let bundle = PostflopBundle::from_abstraction(&pf_config, &abstraction);
     bundle.save(output)?;
@@ -1159,26 +1154,10 @@ fn run_solve_preflop(
         );
         Some(abstraction)
     } else if let Some(pf_config) = &config.postflop_model {
-        use poker_solver_core::preflop::solve_cache;
-
-        let has_eq = equity_samples > 0;
-        let sk = solve_cache::cache_key(pf_config, has_eq);
-
         let abstraction = build_postflop_with_progress(
             pf_config,
             Some(&equity),
-            Some(cache_base),
         )?;
-
-        // Cache the solve values for next time.
-        if let Err(e) = solve_cache::save(cache_base, &sk, &abstraction.values) {
-            eprintln!("Warning: failed to save solve cache: {e}");
-        } else {
-            eprintln!(
-                "Solve cache saved: {}",
-                solve_cache::cache_dir(cache_base, &sk).display()
-            );
-        }
 
         Some(abstraction)
     } else {

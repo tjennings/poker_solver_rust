@@ -26,7 +26,7 @@ fn diag_value_table_strong_beats_weak() {
     };
 
     let abstraction = PostflopAbstraction::build(
-        &config, None, None, &|phase| eprintln!("  [build] {phase}"),
+        &config, None, &|phase| eprintln!("  [build] {phase}"),
     ).expect("build should succeed");
 
     let n = 169;
@@ -81,7 +81,7 @@ fn diag_end_to_end_aa_beats_72o() {
 
     let abstraction = PostflopAbstraction::build(
         config.postflop_model.as_ref().unwrap(),
-        None, None,
+        None,
         &|phase| eprintln!("  [build] {phase}"),
     ).expect("postflop build should succeed");
 

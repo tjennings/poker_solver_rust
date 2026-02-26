@@ -191,11 +191,9 @@ At each preflop showdown terminal:
 
 | Cache | Key | Stores | Status |
 |-|-|-|-|
-| `solve_cache` | config hash + equity flag | `PostflopValues` | Active |
 | `PostflopBundle` | directory path | `PostflopModelConfig` + `PostflopValues` + flops + SPR | Active |
 
 **Files:**
-- `crates/core/src/preflop/solve_cache.rs`
 - `crates/core/src/preflop/postflop_bundle.rs`
 
 **Postflop bundles:** Build a postflop abstraction once with `solve-postflop`, then reference the bundle directory via `postflop_model_path` in training configs to skip the expensive rebuild.

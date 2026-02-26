@@ -299,7 +299,6 @@ impl PostflopAbstraction {
     pub fn build(
         config: &PostflopModelConfig,
         _equity_table: Option<&super::equity::EquityTable>,
-        _cache_base: Option<&std::path::Path>,
         on_progress: impl Fn(BuildPhase) + Sync,
     ) -> Result<Self, PostflopAbstractionError> {
         let flops = if let Some(ref names) = config.fixed_flops {
@@ -752,7 +751,7 @@ mod tests {
             value_extraction_samples: 100,
             ..PostflopModelConfig::fast()
         };
-        let result = PostflopAbstraction::build(&config, None, None, |_| {}).unwrap();
+        let result = PostflopAbstraction::build(&config, None, |_| {}).unwrap();
         assert!(!result.values.is_empty());
         for h in 0..5u16 {
             for o in 0..5u16 {

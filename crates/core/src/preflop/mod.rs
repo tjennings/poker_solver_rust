@@ -1,6 +1,5 @@
 pub mod equity_cache;
 mod exploitability;
-mod fnv;
 pub mod bundle;
 pub mod config;
 pub mod equity;
@@ -11,7 +10,6 @@ pub(crate) mod postflop_exhaustive;
 pub(crate) mod postflop_mccfr;
 pub mod postflop_model;
 pub mod postflop_tree;
-pub mod solve_cache;
 pub mod solver;
 pub mod tree;
 
