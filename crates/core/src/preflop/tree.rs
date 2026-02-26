@@ -607,6 +607,121 @@ mod tests {
         }
     }
 
+    #[timed_test]
+    fn every_decision_node_has_allin() {
+        // Walk the entire tree tracking stacks. Every decision node where the
+        // acting player has chips must include AllIn.
+        for &stack_bb in &[25, 50, 100, 200] {
+            let config = PreflopConfig::heads_up(stack_bb);
+            let tree = PreflopTree::build(&config);
+
+            // Reproduce initial state from config (same as PreflopTree::build)
+            let num_players = config.num_players() as usize;
+            let mut initial_invested = vec![0u32; num_players];
+            let mut initial_stacks = config.stacks.clone();
+            for &(pos, amount) in &config.blinds {
+                let actual = amount.min(initial_stacks[pos]);
+                initial_invested[pos] = actual;
+                initial_stacks[pos] -= actual;
+            }
+            let current_bet = initial_invested.iter().copied().max().unwrap_or(0);
+
+            let mut violations = Vec::new();
+            assert_allin_recursive(
+                &tree,
+                &config,
+                0,
+                &initial_stacks,
+                &initial_invested,
+                current_bet,
+                &mut violations,
+            );
+            assert!(
+                violations.is_empty(),
+                "stack={stack_bb}bb: all-in missing at {} node(s):\n{}",
+                violations.len(),
+                violations.join("\n")
+            );
+        }
+    }
+
+    fn assert_allin_recursive(
+        tree: &PreflopTree,
+        config: &PreflopConfig,
+        node_idx: usize,
+        stacks: &[u32],
+        invested: &[u32],
+        current_bet: u32,
+        violations: &mut Vec<String>,
+    ) {
+        match &tree.nodes[node_idx] {
+            PreflopNode::Terminal { .. } => {}
+            PreflopNode::Decision {
+                position,
+                action_labels,
+                children,
+            } => {
+                let pos = *position as usize;
+                let player_stack = stacks[pos];
+
+                if player_stack > 0 {
+                    let has_allin = action_labels.iter().any(|a| *a == PreflopAction::AllIn);
+                    if !has_allin {
+                        violations.push(format!(
+                            "node {node_idx}: player {pos} stack={player_stack} \
+                             invested={} current_bet={current_bet} actions={action_labels:?}",
+                            invested[pos]
+                        ));
+                    }
+                }
+
+                // Recurse into children with updated state
+                for (action, &child) in action_labels.iter().zip(children.iter()) {
+                    let mut new_stacks = stacks.to_vec();
+                    let mut new_invested = invested.to_vec();
+                    let mut new_bet = current_bet;
+
+                    match action {
+                        PreflopAction::Fold => {}
+                        PreflopAction::Call => {
+                            let to_call = current_bet.saturating_sub(invested[pos]);
+                            let actual = to_call.min(stacks[pos]);
+                            new_invested[pos] += actual;
+                            new_stacks[pos] -= actual;
+                        }
+                        PreflopAction::Raise(size) => {
+                            let target = (f64::from(current_bet) * size) as u32;
+                            let target = target.max(current_bet + 1);
+                            let additional = target.saturating_sub(invested[pos]);
+                            let actual = additional.min(stacks[pos]);
+                            new_invested[pos] += actual;
+                            new_stacks[pos] -= actual;
+                            new_bet = new_invested[pos];
+                        }
+                        PreflopAction::AllIn => {
+                            let all_chips = stacks[pos];
+                            new_invested[pos] += all_chips;
+                            new_stacks[pos] = 0;
+                            if new_invested[pos] > current_bet {
+                                new_bet = new_invested[pos];
+                            }
+                        }
+                    }
+
+                    assert_allin_recursive(
+                        tree,
+                        config,
+                        child as usize,
+                        &new_stacks,
+                        &new_invested,
+                        new_bet,
+                        violations,
+                    );
+                }
+            }
+        }
+    }
+
     /// Recursively count the maximum number of sized raises (not all-in) along any path.
     fn count_max_sized_raises(tree: &PreflopTree, node_idx: usize, raises_so_far: u32) -> u32 {
         match &tree.nodes[node_idx] {

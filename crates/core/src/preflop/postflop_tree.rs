@@ -544,44 +544,36 @@ fn constrained_raise_actions(
 ) -> Vec<PostflopAction> {
     let mut actions = vec![PostflopAction::Fold, PostflopAction::Call];
     let available = max_pot / new_pot - 1.0;
-
-    // All-in is always available regardless of raise limit
-    if available > 0.01 {
-        actions.push(PostflopAction::Raise(available as f32));
-    }
-    if raises_remaining == 0 {
-        return actions; // [Fold, Call, All-in]
-    }
     if available <= 1e-9 {
         return actions;
     }
-    let mut added_allin = false;
+
+    if raises_remaining == 0 {
+        // At raise cap: only all-in shove (no sized raises)
+        if available > 0.01 {
+            actions.push(PostflopAction::Raise(available as f32));
+        }
+        return actions;
+    }
+
+    // Add sized raises that fit below all-in, skipping those within 5% of all-in
+    let mut largest_sized = 0.0f64;
     for &s in bet_sizes {
-        if f64::from(s) < available - 1e-6 {
-            // Skip sized raises within 5% pot of all-in (redundant)
-            if available - f64::from(s) <= 0.05 {
-                continue;
+        let sf = f64::from(s);
+        if sf < available - 1e-6 {
+            if available - sf <= 0.05 {
+                continue; // too close to all-in, redundant
             }
             actions.push(PostflopAction::Raise(s));
+            largest_sized = largest_sized.max(sf);
         } else {
-            // This size exceeds stack — all-in already added above
-            added_allin = true;
+            // This size exceeds stack — will be replaced by all-in below
         }
     }
-    // If no size was capped, ensure all-in is meaningfully different from largest raise
-    if !added_allin {
-        let largest = actions.iter().filter_map(|a| match a {
-            PostflopAction::Raise(f) => Some(f64::from(*f)),
-            _ => None,
-        }).fold(0.0f64, f64::max);
-        // All-in already added above; remove it if too close to largest sized raise
-        if available - largest <= 0.05 {
-            // Remove the all-in we added at the top
-            actions.retain(|a| match a {
-                PostflopAction::Raise(f) => (f64::from(*f) - available).abs() > 1e-6,
-                _ => true,
-            });
-        }
+
+    // Always add all-in if meaningfully different from largest sized raise (>5% pot gap)
+    if available > 0.01 && (available - largest_sized > 0.05 || largest_sized == 0.0) {
+        actions.push(PostflopAction::Raise(available as f32));
     }
     actions
 }
@@ -1164,5 +1156,95 @@ mod tests {
             found_allin_at_cap,
             "should find at least one node with Fold+Call+All-in at raise cap"
         );
+    }
+
+    /// Recursively walk the SPR tree, tracking pot, and verify every decision node
+    /// with remaining chips includes an all-in action.
+    fn assert_allin_at_every_node(
+        nodes: &[PostflopNode],
+        idx: u32,
+        pot: f64,
+        max_pot: f64,
+        spr: f64,
+        violations: &mut Vec<String>,
+    ) {
+        match &nodes[idx as usize] {
+            PostflopNode::Terminal { .. } => {}
+            PostflopNode::Chance { children, .. } => {
+                for &child in children {
+                    assert_allin_at_every_node(nodes, child, pot, max_pot, spr, violations);
+                }
+            }
+            PostflopNode::Decision { action_labels, children, .. } => {
+                let is_opening = action_labels.iter().any(|a| *a == PostflopAction::Check);
+                let available = max_pot / pot - 1.0;
+
+                if available > 0.01 {
+                    if is_opening {
+                        // Opening node: must have an all-in Bet
+                        let has_allin_bet = action_labels.iter().any(|a| match a {
+                            PostflopAction::Bet(f) => (f64::from(*f) - available).abs() < 0.02,
+                            _ => false,
+                        });
+                        if !has_allin_bet {
+                            let bets: Vec<f32> = action_labels.iter().filter_map(|a| match a {
+                                PostflopAction::Bet(f) => Some(*f),
+                                _ => None,
+                            }).collect();
+                            violations.push(format!(
+                                "SPR={spr} node {idx} (opening): available={available:.3}, \
+                                 no all-in bet (~{available:.2}), bets={bets:?}"
+                            ));
+                        }
+                    } else {
+                        // Facing-bet node: must have an all-in Raise
+                        let has_allin_raise = action_labels.iter().any(|a| match a {
+                            PostflopAction::Raise(f) => (f64::from(*f) - available).abs() < 0.02,
+                            _ => false,
+                        });
+                        if !has_allin_raise {
+                            let raises: Vec<f32> = action_labels.iter().filter_map(|a| match a {
+                                PostflopAction::Raise(f) => Some(*f),
+                                _ => None,
+                            }).collect();
+                            violations.push(format!(
+                                "SPR={spr} node {idx} (facing bet): available={available:.3}, \
+                                 no all-in raise (~{available:.2}), raises={raises:?}"
+                            ));
+                        }
+                    }
+                }
+
+                // Recurse into children, computing new pot for each action
+                for (action, &child) in action_labels.iter().zip(children.iter()) {
+                    let child_pot = match action {
+                        PostflopAction::Check => pot,
+                        PostflopAction::Bet(f) | PostflopAction::Raise(f) => {
+                            (pot * (1.0 + f64::from(*f))).min(max_pot)
+                        }
+                        PostflopAction::Call => pot, // caller matches bet; pot stays at new_pot
+                        PostflopAction::Fold => pot,
+                    };
+                    assert_allin_at_every_node(nodes, child, child_pot, max_pot, spr, violations);
+                }
+            }
+        }
+    }
+
+    #[timed_test]
+    fn spr_tree_every_decision_has_allin() {
+        for &spr in &[0.5, 2.0, 5.0, 10.0, 20.0] {
+            let cfg = fast_config();
+            let tree = PostflopTree::build_with_spr(&cfg, spr).unwrap();
+            let max_pot = 1.0 + 2.0 * spr;
+            let mut violations = Vec::new();
+            assert_allin_at_every_node(&tree.nodes, 0, 1.0, max_pot, spr, &mut violations);
+            assert!(
+                violations.is_empty(),
+                "All-in missing at {} node(s):\n{}",
+                violations.len(),
+                violations.join("\n")
+            );
+        }
     }
 }
