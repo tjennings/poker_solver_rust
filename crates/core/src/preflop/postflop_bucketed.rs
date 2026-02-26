@@ -663,6 +663,119 @@ fn eval_with_avg_strategy(
     }
 }
 
+/// Best-response tree traversal. Like `eval_with_avg_strategy` but at
+/// decision nodes where `hero_pos` is the acting player, picks the action
+/// with max value instead of mixing according to the average strategy.
+///
+/// Returns the expected value (in pot fractions) for `hero_pos` when playing
+/// optimally against the opponent's average strategy, averaged uniformly
+/// across all bucket pairs.
+pub(crate) fn best_response_value(
+    tree: &PostflopTree,
+    layout: &PostflopLayout,
+    solve_eq: &SolveEquity<'_>,
+    strategy_sum: &[f64],
+    node_idx: u32,
+    num_buckets: usize,
+    hero_pos: u8,
+) -> f64 {
+    let mut total = 0.0;
+    let count = num_buckets * num_buckets;
+    #[allow(clippy::cast_possible_truncation)] // num_buckets ≤ u16::MAX (bucket count)
+    for hb in 0..num_buckets as u16 {
+        for ob in 0..num_buckets as u16 {
+            total += br_traverse(
+                tree, layout, solve_eq, strategy_sum,
+                node_idx, hb, ob, hero_pos,
+            );
+        }
+    }
+    if count == 0 { 0.0 } else { total / count as f64 }
+}
+
+/// Recursive best-response traversal for a single bucket pair.
+fn br_traverse(
+    tree: &PostflopTree,
+    layout: &PostflopLayout,
+    solve_eq: &SolveEquity<'_>,
+    strategy_sum: &[f64],
+    node_idx: u32,
+    hero_bucket: u16,
+    opp_bucket: u16,
+    hero_pos: u8,
+) -> f64 {
+    match &tree.nodes[node_idx as usize] {
+        PostflopNode::Terminal { terminal_type, pot_fraction } => {
+            let current_street = layout.street(node_idx);
+            let eq_table = solve_equity_for_street(solve_eq, current_street);
+            postflop_terminal_value(
+                *terminal_type, *pot_fraction,
+                hero_bucket, opp_bucket, hero_pos, eq_table,
+            )
+        }
+        PostflopNode::Chance { children, street, .. } => {
+            let transition = match street {
+                Street::Turn => solve_eq.flop_to_turn,
+                Street::River => solve_eq.turn_to_river,
+                _ => {
+                    return children.iter()
+                        .map(|&child| br_traverse(
+                            tree, layout, solve_eq, strategy_sum,
+                            child, hero_bucket, opp_bucket, hero_pos,
+                        ))
+                        .sum::<f64>() / children.len().max(1) as f64;
+                }
+            };
+            debug_assert_eq!(children.len(), 1, "chance node should have exactly 1 structural child");
+            let child = children[0];
+            let num_new = transition[0].len();
+            let mut value = 0.0;
+            #[allow(clippy::cast_possible_truncation)]
+            for new_hero in 0..num_new {
+                let hw = transition[hero_bucket as usize][new_hero];
+                if hw < 1e-12 { continue; }
+                for new_opp in 0..num_new {
+                    let ow = transition[opp_bucket as usize][new_opp];
+                    if ow < 1e-12 { continue; }
+                    value += hw * ow * br_traverse(
+                        tree, layout, solve_eq, strategy_sum,
+                        child, new_hero as u16, new_opp as u16, hero_pos,
+                    );
+                }
+            }
+            value
+        }
+        PostflopNode::Decision { position, children, .. } => {
+            let is_hero = *position == hero_pos;
+            let bucket = if is_hero { hero_bucket } else { opp_bucket };
+            let (start, _) = layout.slot(node_idx, bucket);
+            let num_actions = children.len();
+
+            let strategy = normalize_strategy_sum(strategy_sum, start, num_actions);
+
+            if is_hero {
+                // Best response: pick the action with max value
+                children.iter()
+                    .map(|&child| br_traverse(
+                        tree, layout, solve_eq, strategy_sum,
+                        child, hero_bucket, opp_bucket, hero_pos,
+                    ))
+                    .fold(f64::NEG_INFINITY, f64::max)
+            } else {
+                // Opponent plays average strategy
+                children.iter().enumerate()
+                    .map(|(i, &child)| {
+                        strategy[i] * br_traverse(
+                            tree, layout, solve_eq, strategy_sum,
+                            child, hero_bucket, opp_bucket, hero_pos,
+                        )
+                    })
+                    .sum()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,5 +883,47 @@ mod tests {
             0, "AhKd7s", &|_| {},
         );
         assert_eq!(result.iterations_used, 2, "huge threshold should stop at minimum 2 iterations");
+    }
+
+    #[timed_test]
+    fn best_response_value_is_non_negative() {
+        // In any zero-sum game, the best-response value for one player
+        // against the opponent's avg strategy should be >= the game value.
+        // With uniform equity (0.5), values should be near 0.
+        let config = PostflopModelConfig::fast();
+        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
+        let streets = annotate_streets(&tree);
+        let layout = PostflopLayout::build(&tree, &streets, 5, 5, 5);
+        let buf_size = layout.total_size;
+
+        let eq = BucketEquity {
+            equity: vec![vec![0.5; 5]; 5],
+            num_buckets: 5,
+        };
+        let f2t = identity_transition(5);
+        let t2r = identity_transition(5);
+        let solve_eq = SolveEquity {
+            flop: &eq,
+            turn: &eq,
+            river: &eq,
+            flop_to_turn: &f2t,
+            turn_to_river: &t2r,
+        };
+
+        // Run a few CFR iterations to get a non-trivial strategy_sum
+        let result = solve_one_flop(
+            &tree, &layout, &solve_eq,
+            5, buf_size, 10, 25, 0.0,
+            0, "test", &|_| {},
+        );
+
+        // BR value for each player should be finite
+        for hero_pos in 0..2u8 {
+            let br = best_response_value(
+                &tree, &layout, &solve_eq, &result.strategy_sum,
+                0, 5, hero_pos,
+            );
+            assert!(br.is_finite(), "BR value should be finite, got {br}");
+        }
     }
 }
