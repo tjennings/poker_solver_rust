@@ -28,7 +28,7 @@ fn default_mccfr_sample_pct() -> f64 {
     0.01
 }
 fn default_value_extraction_samples() -> u32 {
-    10_000
+    10
 }
 fn default_ev_convergence_threshold() -> f64 {
     0.001
@@ -121,8 +121,9 @@ pub struct PostflopModelConfig {
     #[serde(default = "default_mccfr_sample_pct")]
     pub mccfr_sample_pct: f64,
 
-    /// Number of Monte Carlo samples for post-convergence value extraction.
-    /// Only used when solve_type is Mccfr. Default: 10,000.
+    /// Number of Monte Carlo runout samples *per canonical hand pair* for
+    /// post-convergence value extraction (MCCFR only). Default: 10.
+    /// Total samples = 169² × this value.
     #[serde(default = "default_value_extraction_samples")]
     pub value_extraction_samples: u32,
 
@@ -146,7 +147,7 @@ impl PostflopModelConfig {
             max_flop_boards: 10,
             fixed_flops: None,
             mccfr_sample_pct: 0.05,
-            value_extraction_samples: 1_000,
+            value_extraction_samples: 5,
             ev_convergence_threshold: 0.001,
         }
     }
@@ -164,7 +165,7 @@ impl PostflopModelConfig {
             max_flop_boards: 0,
             fixed_flops: None,
             mccfr_sample_pct: 0.01,
-            value_extraction_samples: 10_000,
+            value_extraction_samples: 10,
             ev_convergence_threshold: 0.001,
         }
     }

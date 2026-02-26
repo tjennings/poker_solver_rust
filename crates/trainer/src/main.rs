@@ -735,12 +735,124 @@ struct PreflopTrainingConfig {
     /// instead of building the postflop abstraction from `postflop_model`.
     #[serde(default)]
     pub postflop_model_path: Option<PathBuf>,
+    /// Comma-separated canonical hands for postflop EV diagnostics.
+    /// When set, prints avg EV per hand, pairwise matchups, and per-flop
+    /// breakdown after building the postflop abstraction.
+    /// Example: `"AA,KK,AKs,72o,65s"`
+    #[serde(default)]
+    pub ev_diagnostic_hands: Option<String>,
 }
 
 fn default_iterations() -> u64 { 5000 }
 fn default_equity_samples() -> u32 { 20000 }
 fn default_print_every() -> u64 { 1000 }
 fn default_preflop_exploitability_threshold_mbb() -> f64 { 25.0 }
+
+/// Parse a comma-separated list of canonical hands (e.g. "AA,KK,AKs,72o")
+/// into a deduplicated, ordered list of `(label, canonical_index)` pairs.
+fn parse_ev_diagnostic_hands(s: &str) -> Vec<(String, usize)> {
+    use poker_solver_core::hands::CanonicalHand;
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for token in s.split(',') {
+        let token = token.trim();
+        if token.is_empty() { continue; }
+        if let Ok(ch) = CanonicalHand::parse(token) {
+            if seen.insert(ch.index()) {
+                result.push((ch.to_string(), ch.index()));
+            }
+        } else {
+            eprintln!("warning: ignoring unrecognised hand '{token}'");
+        }
+    }
+    result
+}
+
+/// Print postflop EV diagnostics for the given hands.
+fn print_postflop_ev_diagnostics(
+    abstraction: &PostflopAbstraction,
+    hands: &[(String, usize)],
+) {
+    println!("\n=== Postflop EV Table (pot-fraction units) ===");
+    println!("{:>5} {:>10} {:>10}", "Hand", "IP(SB)EV", "OOP(BB)EV");
+    for (name, hi) in hands {
+        let mut ip_sum = 0.0f64;
+        let mut oop_sum = 0.0f64;
+        let mut count = 0;
+        for opp in 0..169 {
+            let ev_ip = abstraction.avg_ev(0, *hi, opp);
+            let ev_oop = abstraction.avg_ev(1, *hi, opp);
+            if ev_ip != 0.0 || ev_oop != 0.0 {
+                ip_sum += ev_ip;
+                oop_sum += ev_oop;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            println!(
+                "{:>5} {:>10.4} {:>10.4}  (avg over {count} opps)",
+                name,
+                ip_sum / count as f64,
+                oop_sum / count as f64,
+            );
+        } else {
+            println!("{:>5}  no data", name);
+        }
+    }
+
+    // Coverage
+    let mut nonzero_ip = 0usize;
+    let mut nonzero_oop = 0usize;
+    for h in 0..169 {
+        for o in 0..169 {
+            if abstraction.avg_ev(0, h, o) != 0.0 { nonzero_ip += 1; }
+            if abstraction.avg_ev(1, h, o) != 0.0 { nonzero_oop += 1; }
+        }
+    }
+    let total = 169 * 169;
+    println!("  Coverage (avg): IP {nonzero_ip}/{total} ({:.1}%)  OOP {nonzero_oop}/{total} ({:.1}%)",
+        100.0 * nonzero_ip as f64 / total as f64,
+        100.0 * nonzero_oop as f64 / total as f64,
+    );
+
+    // Per-flop coverage
+    for fi in 0..abstraction.values.num_flops() {
+        let mut nz = 0usize;
+        for h in 0..169u16 {
+            for o in 0..169u16 {
+                if abstraction.values.get_by_flop(fi, 0, h, o) != 0.0 { nz += 1; }
+            }
+        }
+        let flop_name = if fi < abstraction.flops.len() {
+            format!("{:?}", abstraction.flops[fi])
+        } else {
+            format!("flop {fi}")
+        };
+        println!("  Flop {fi} ({flop_name}): {nz}/{total} ({:.1}%) non-zero",
+            100.0 * nz as f64 / total as f64);
+    }
+
+    // Pairwise matchups
+    if hands.len() >= 2 {
+        println!("\n=== Pairwise matchups (avg_ev) ===");
+        for i in 0..hands.len() {
+            for j in (i+1)..hands.len() {
+                let (h_name, hi) = &hands[i];
+                let (o_name, oi) = &hands[j];
+                let ip = abstraction.avg_ev(0, *hi, *oi);
+                let oop = abstraction.avg_ev(1, *hi, *oi);
+                print!("  {h_name:>4} vs {o_name:>4}: IP(SB)={ip:+.4}  OOP(BB)={oop:+.4}");
+                for fi in 0..abstraction.values.num_flops() {
+                    let fip = abstraction.values.get_by_flop(fi, 0, *hi as u16, *oi as u16);
+                    let foop = abstraction.values.get_by_flop(fi, 1, *hi as u16, *oi as u16);
+                    print!("  |f{fi}: IP={fip:+.3} OOP={foop:+.3}");
+                }
+                println!();
+            }
+        }
+    }
+    println!();
+}
 
 // ---------------------------------------------------------------------------
 // Postflop bundle builder
@@ -833,6 +945,7 @@ fn run_solve_preflop(
             preflop_exploitability_threshold_mbb: default_preflop_exploitability_threshold_mbb(),
             checkpoint_every: None,
             postflop_model_path: None,
+            ev_diagnostic_hands: None,
         }
     };
 
@@ -1022,14 +1135,14 @@ fn run_solve_preflop(
                                         message: format!("Flop '{flop_name}' CFR {metric_label}={delta:.4}"),
                                     });
                                 }
-                                FlopStage::EstimatingEv { sample, total_samples, avg_delta } => {
+                                FlopStage::EstimatingEv { sample, total_samples } => {
                                     #[allow(clippy::cast_precision_loss)]
                                     let key = 2.0 + *sample as f64 / (*total_samples).max(1) as f64;
                                     fbs.states.insert(flop_name.clone(), FlopSlotData {
                                         sort_key: key,
                                         position: *sample as u64,
                                         length: *total_samples as u64,
-                                        message: format!("Flop '{flop_name}' EV \u{0394}={avg_delta:.4}"),
+                                        message: format!("Flop '{flop_name}' EV Extraction"),
                                     });
                                 }
                                 FlopStage::Done => {
@@ -1106,6 +1219,16 @@ fn run_solve_preflop(
     }
 
     let mut solver = PreflopSolver::new_with_equity(&config, equity);
+    // Parse ev_diagnostic_hands once for use in diagnostics and per-iteration output.
+    let ev_diagnostic_hands: Vec<(String, usize)> = training.ev_diagnostic_hands.as_deref()
+        .map(parse_ev_diagnostic_hands)
+        .unwrap_or_default();
+
+    if let Some(ref abstraction) = postflop {
+        if !ev_diagnostic_hands.is_empty() {
+            print_postflop_ev_diagnostics(abstraction, &ev_diagnostic_hands);
+        }
+    }
     if let Some(abstraction) = postflop {
         solver.attach_postflop(abstraction, &config);
     }

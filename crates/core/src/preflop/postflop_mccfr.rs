@@ -421,114 +421,131 @@ fn mccfr_traverse(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss
 )]
+/// Extract EV values by sampling a fixed number of runouts per hand pair.
+///
+/// `samples_per_pair` runouts are drawn for each of the `n × n` canonical hand
+/// pairs, guaranteeing 100% coverage. Pairs where no non-conflicting concrete
+/// combos exist on this flop are marked NaN (impossible on this board).
 fn mccfr_extract_values(
     tree: &PostflopTree,
     layout: &PostflopLayout,
     strategy_sum: &[f64],
     combo_map: &[Vec<(Card, Card)>],
     flop: &[Card; 3],
-    num_samples: usize,
+    samples_per_pair: usize,
     num_flop_buckets: usize,
-    convergence_threshold: f64,
+    _convergence_threshold: f64,
     flop_name: &str,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> Vec<f64> {
     let n = num_flop_buckets;
     let mut values = vec![0.0f64; 2 * n * n];
     let mut counts = vec![0u32; 2 * n * n];
-    let mut prev_means = vec![0.0f64; 2 * n * n];
 
     let mut rng = SmallRng::seed_from_u64(42);
-    // Need at least 2 checkpoints to measure convergence.
-    let min_samples = 2000usize.min(num_samples);
+    let total_pairs = n * n;
+    let mut pairs_done = 0usize;
 
-    let mut current_avg_delta = f64::INFINITY;
-    for sample_idx in 0..num_samples {
-        if sample_idx % 1000 == 0 {
-            // Check convergence: weighted-average change in bucket pair means.
-            // Weight by sample count so sparse cells don't dominate.
-            if sample_idx >= min_samples {
-                let mut weighted_delta_sum = 0.0f64;
-                let mut weight_sum = 0u64;
-                for (i, &sum) in values.iter().enumerate() {
-                    if counts[i] > 0 {
-                        let mean = sum / f64::from(counts[i]);
-                        let delta = (mean - prev_means[i]).abs();
-                        weighted_delta_sum += delta * f64::from(counts[i]);
-                        weight_sum += u64::from(counts[i]);
-                        prev_means[i] = mean;
-                    }
-                }
-                let avg_delta = if weight_sum > 0 {
-                    weighted_delta_sum / weight_sum as f64
-                } else {
-                    f64::INFINITY
-                };
-                current_avg_delta = avg_delta;
-                if avg_delta < convergence_threshold {
-                    on_progress(BuildPhase::FlopProgress {
-                        flop_name: flop_name.to_string(),
-                        stage: FlopStage::EstimatingEv {
-                            sample: sample_idx,
-                            total_samples: num_samples,
-                            avg_delta: current_avg_delta,
-                        },
-                    });
-                    break;
-                }
-            } else if sample_idx > 0 {
-                // Snapshot current means for next comparison.
-                for (i, &sum) in values.iter().enumerate() {
-                    if counts[i] > 0 {
-                        prev_means[i] = sum / f64::from(counts[i]);
-                    }
-                }
-            }
-
-            on_progress(BuildPhase::FlopProgress {
-                flop_name: flop_name.to_string(),
-                stage: FlopStage::EstimatingEv {
-                    sample: sample_idx,
-                    total_samples: num_samples,
-                    avg_delta: current_avg_delta,
-                },
-            });
+    for hb in 0..n as u16 {
+        let hero_combos = &combo_map[hb as usize];
+        if hero_combos.is_empty() {
+            pairs_done += n;
+            continue;
         }
 
-        let Some((hb, ob, hero_hand, opp_hand, turn, river)) =
-            sample_deal(combo_map, flop, &mut rng)
-        else {
-            continue;
-        };
-        let board = [flop[0], flop[1], flop[2], turn, river];
+        for ob in 0..n as u16 {
+            pairs_done += 1;
+            if pairs_done % 1000 == 0 {
+                on_progress(BuildPhase::FlopProgress {
+                    flop_name: flop_name.to_string(),
+                    stage: FlopStage::EstimatingEv {
+                        sample: pairs_done,
+                        total_samples: total_pairs,
+                    },
+                });
+            }
 
-        for hero_pos in 0..2u8 {
-            let ev = mccfr_eval_with_avg_strategy(
-                tree,
-                layout,
-                strategy_sum,
-                0,
-                hb,
-                ob,
-                hero_pos,
-                hero_hand,
-                opp_hand,
-                &board,
-            );
-            let idx = hero_pos as usize * n * n + hb as usize * n + ob as usize;
-            values[idx] += ev;
-            counts[idx] += 1;
+            let opp_combos = &combo_map[ob as usize];
+            if opp_combos.is_empty() {
+                continue;
+            }
+
+            for _ in 0..samples_per_pair {
+                let Some((hero_hand, opp_hand, turn, river)) =
+                    sample_runout_for_pair(hero_combos, opp_combos, flop, &mut rng)
+                else {
+                    break; // no non-conflicting combos exist for this pair
+                };
+                let board = [flop[0], flop[1], flop[2], turn, river];
+
+                for hero_pos in 0..2u8 {
+                    let ev = mccfr_eval_with_avg_strategy(
+                        tree, layout, strategy_sum, 0,
+                        hb, ob, hero_pos, hero_hand, opp_hand, &board,
+                    );
+                    let idx = hero_pos as usize * n * n + hb as usize * n + ob as usize;
+                    values[idx] += ev;
+                    counts[idx] += 1;
+                }
+            }
         }
     }
 
-    // Normalize by count
+    on_progress(BuildPhase::FlopProgress {
+        flop_name: flop_name.to_string(),
+        stage: FlopStage::EstimatingEv {
+            sample: total_pairs,
+            total_samples: total_pairs,
+        },
+    });
+
+    // Normalize; unsampled cells (impossible combos on this flop) become NaN.
     for (i, val) in values.iter_mut().enumerate() {
         if counts[i] > 0 {
             *val /= f64::from(counts[i]);
+        } else {
+            *val = f64::NAN;
         }
     }
 
     values
+}
+
+/// Sample a single runout (concrete hero/opp combo + turn + river) for a
+/// specific canonical hand pair on a given flop.
+fn sample_runout_for_pair(
+    hero_combos: &[(Card, Card)],
+    opp_combos: &[(Card, Card)],
+    flop: &[Card; 3],
+    rng: &mut SmallRng,
+) -> Option<([Card; 2], [Card; 2], Card, Card)> {
+    let hero_idx = rng.random_range(0..hero_combos.len());
+    let (h1, h2) = hero_combos[hero_idx];
+
+    // Find a non-conflicting opponent combo (up to 20 attempts).
+    let mut opp_hand = None;
+    for _ in 0..20 {
+        let idx = rng.random_range(0..opp_combos.len());
+        let (o1, o2) = opp_combos[idx];
+        if o1 != h1 && o1 != h2 && o2 != h1 && o2 != h2 {
+            opp_hand = Some((o1, o2));
+            break;
+        }
+    }
+    let (o1, o2) = opp_hand?;
+
+    let used = [flop[0], flop[1], flop[2], h1, h2, o1, o2];
+    let deck: Vec<Card> = all_cards_vec()
+        .into_iter()
+        .filter(|c| !used.contains(c))
+        .collect();
+    if deck.len() < 2 { return None; }
+
+    let t_idx = rng.random_range(0..deck.len());
+    let mut r_idx = rng.random_range(0..deck.len() - 1);
+    if r_idx >= t_idx { r_idx += 1; }
+
+    Some(([h1, h2], [o1, o2], deck[t_idx], deck[r_idx]))
 }
 
 /// Walk tree using averaged (converged) strategy with concrete hands.
@@ -869,17 +886,19 @@ mod tests {
     }
 
     #[timed_test]
-    fn mccfr_extract_values_correct_dimensions() {
+    fn mccfr_extract_values_subset() {
+        // Use only the first 10 canonical hands to keep the test fast (10² = 100 pairs).
         let config = test_config();
+        let n_subset = 10;
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
         let node_streets = annotate_streets(&tree);
-        let n = NUM_CANONICAL_HANDS;
-        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
+        let layout = PostflopLayout::build(&tree, &node_streets, n_subset, n_subset, n_subset);
 
         let flop = test_flop();
-        let combo_map = build_combo_map(&flop);
+        let full_combo_map = build_combo_map(&flop);
+        let combo_map: Vec<Vec<(Card, Card)>> = full_combo_map[..n_subset].to_vec();
 
-        // Solve first
+        // Solve with the subset
         let result = mccfr_solve_one_flop(
             &tree,
             &layout,
@@ -892,15 +911,53 @@ mod tests {
             &|_| {},
         );
 
-        let values =
-            mccfr_extract_values(&tree, &layout, &result.strategy_sum, &combo_map, &flop, 500, n, 0.001, "test", &|_| {});
-
-        assert_eq!(values.len(), 2 * n * n, "values should be 2*n*n");
-        // All values should be finite
-        assert!(
-            values.iter().all(|v| v.is_finite()),
-            "all values should be finite"
+        let values = mccfr_extract_values(
+            &tree, &layout, &result.strategy_sum, &combo_map, &flop,
+            3, n_subset, 0.001, "test", &|_| {},
         );
+
+        assert_eq!(values.len(), 2 * n_subset * n_subset, "values should be 2*n*n");
+        // Values should be finite or NaN (NaN = impossible combo on this flop)
+        let finite_count = values.iter().filter(|v| v.is_finite()).count();
+        assert!(
+            finite_count > 0,
+            "should have at least some finite values"
+        );
+        assert!(
+            values.iter().all(|v| v.is_finite() || v.is_nan()),
+            "values should be finite or NaN, no infinities"
+        );
+    }
+
+    #[timed_test]
+    fn sample_runout_for_pair_produces_valid_deals() {
+        let flop = test_flop();
+        let combo_map = build_combo_map(&flop);
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        // AA combos (index 0) should have valid deals against KK (index 1)
+        let hero_combos = &combo_map[0];
+        let opp_combos = &combo_map[1];
+        assert!(!hero_combos.is_empty(), "AA should have combos");
+        assert!(!opp_combos.is_empty(), "KK should have combos");
+
+        let mut got_deal = false;
+        for _ in 0..10 {
+            if let Some((hero, opp, turn, river)) =
+                sample_runout_for_pair(hero_combos, opp_combos, &flop, &mut rng)
+            {
+                // Cards should all be distinct
+                let all = [flop[0], flop[1], flop[2], hero[0], hero[1], opp[0], opp[1], turn, river];
+                for i in 0..all.len() {
+                    for j in (i+1)..all.len() {
+                        assert_ne!(all[i], all[j], "duplicate card in deal");
+                    }
+                }
+                got_deal = true;
+                break;
+            }
+        }
+        assert!(got_deal, "should produce at least one valid deal");
     }
 
     #[test]

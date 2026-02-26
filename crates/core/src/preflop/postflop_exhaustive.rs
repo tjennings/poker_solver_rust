@@ -434,13 +434,14 @@ fn exhaustive_extract_values(
     equity_table: &[f64],
 ) -> Vec<f64> {
     let n = NUM_CANONICAL_HANDS;
-    let mut values = vec![0.0f64; 2 * n * n];
+    // NaN = "no valid combos on this flop" — skipped during cross-flop averaging.
+    let mut values = vec![f64::NAN; 2 * n * n];
 
     for hero_hand in 0..n as u16 {
         for opp_hand in 0..n as u16 {
             let eq = equity_table[hero_hand as usize * n + opp_hand as usize];
             if eq.is_nan() {
-                continue;
+                continue; // remains NaN — signals missing data
             }
 
             for hero_pos in 0..2u8 {

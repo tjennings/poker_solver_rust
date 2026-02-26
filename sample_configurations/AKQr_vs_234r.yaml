@@ -9,10 +9,11 @@
 
 # -- Training parameters --
 
-iterations: 1000000
+iterations: 5
 equity_samples: 10000
-print_every: 500
+print_every: 1
 preflop_exploitability_threshold_mbb: 50
+ev_diagnostic_hands: "AA,KK,AKs,65s,JTs,A5s,72o"
 
 # -- Game structure --
 
@@ -47,12 +48,13 @@ exploration: 0.05
 # -- Postflop model (169-hand MCCFR, minimal for fast validation) --
 
 postflop_model:
-  solve_type: exhaustive
+  solve_type: mccfr
+  value_extraction_samples: 2
   #max_flop_boards: 300
-  fixed_flops: [ 'AhKsQd', '2c3h4d', '9s8s5h']
+  fixed_flops: [ 'AhKsQd', '2c3h4d']
   #fixed_flops: ['KhKdTs', 'Kh8s7s', '9s8s5h', 'AsQs9h', 'KsTsTh', 'Js5h4d', '9s6s2s', 'AsQhQd', '6s4h2d', '8s6h2d', 'Ts8h3s', 'As6s5s', 'AsAhKs', '7s5h2s', 'QhJs8s', 'Ks9h3d', 'As7h3d', 'Ah5s4s', 'Js9h6s', 'QsTs2h', '9s7h4d', '8h4s3s', 'Qs7h5d', 'JhTs6s', 'Js4h3s']
-  bet_sizes: [0.5, 1.0, 1.5, 3]
+  bet_sizes: [0.5, 1.0, 2.0]
   max_raises_per_street: 3
   postflop_solve_iterations: 1000
-  cfr_convergence_threshold: 50  # mBB/h for exhaustive mode
-  value_extraction_samples: 20000
+  cfr_convergence_threshold: 0.001  # mBB/h for exhaustive mode
+  ev_convergence_threshold: 0.5

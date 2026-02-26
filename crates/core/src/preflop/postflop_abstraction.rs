@@ -251,7 +251,7 @@ pub enum FlopStage {
         metric_label: String,
     },
     /// Extracting EV estimates from converged strategy.
-    EstimatingEv { sample: usize, total_samples: usize, avg_delta: f64 },
+    EstimatingEv { sample: usize, total_samples: usize },
     /// Flop complete — signal to clear the bar.
     Done,
 }
@@ -276,8 +276,8 @@ impl std::fmt::Display for BuildPhase {
             Self::FlopProgress { flop_name, stage } => match stage {
                 FlopStage::Solving { iteration, max_iterations, delta, metric_label } =>
                     write!(f, "Flop '{flop_name}' CFR {metric_label}={delta:.4} ({iteration}/{max_iterations})"),
-                FlopStage::EstimatingEv { sample, total_samples, avg_delta } =>
-                    write!(f, "Flop '{flop_name}' EV Estimation ({sample}/{total_samples}) \u{0394}={avg_delta:.4}"),
+                FlopStage::EstimatingEv { sample, total_samples } =>
+                    write!(f, "Flop '{flop_name}' EV Extraction ({sample}/{total_samples})"),
                 FlopStage::Done => write!(f, "Flop '{flop_name}' Done"),
             },
             Self::ComputingValues => write!(f, "Computing values"),
@@ -372,26 +372,44 @@ pub fn compute_hand_avg_values(values: &PostflopValues) -> Vec<f64> {
     let num_flops = values.num_flops;
     let num_hands = NUM_CANONICAL_HANDS;
     if num_flops == 0 { return vec![0.0; 2 * num_hands * num_hands]; }
-    let inv_flops = 1.0 / num_flops as f64;
     let mut out = vec![0.0f64; 2 * num_hands * num_hands];
-    let chunks: Vec<(usize, Vec<f64>)> = (0..num_hands)
+    // Each cell accumulates (sum, count) — NaN entries from unsampled/impossible
+    // hand pairs are skipped so they don't dilute the average.
+    let chunks: Vec<(usize, Vec<f64>, Vec<u32>)> = (0..num_hands)
         .into_par_iter()
         .map(|hero_hand| {
-            let mut local = vec![0.0f64; 2 * num_hands];
+            let mut sums = vec![0.0f64; 2 * num_hands];
+            let mut counts = vec![0u32; 2 * num_hands];
             for flop_idx in 0..num_flops {
                 for opp_hand in 0..num_hands {
-                    local[opp_hand] += values.get_by_flop(flop_idx, 0, hero_hand as u16, opp_hand as u16);
-                    local[num_hands + opp_hand] += values.get_by_flop(flop_idx, 1, hero_hand as u16, opp_hand as u16);
+                    let v0 = values.get_by_flop(flop_idx, 0, hero_hand as u16, opp_hand as u16);
+                    if !v0.is_nan() {
+                        sums[opp_hand] += v0;
+                        counts[opp_hand] += 1;
+                    }
+                    let v1 = values.get_by_flop(flop_idx, 1, hero_hand as u16, opp_hand as u16);
+                    if !v1.is_nan() {
+                        sums[num_hands + opp_hand] += v1;
+                        counts[num_hands + opp_hand] += 1;
+                    }
                 }
             }
-            (hero_hand, local)
+            (hero_hand, sums, counts)
         })
         .collect();
     let n = num_hands;
-    for (hero_hand, local) in chunks {
+    for (hero_hand, sums, counts) in chunks {
         for opp_hand in 0..n {
-            out[hero_hand * n + opp_hand] = local[opp_hand] * inv_flops;
-            out[n * n + hero_hand * n + opp_hand] = local[n + opp_hand] * inv_flops;
+            out[hero_hand * n + opp_hand] = if counts[opp_hand] > 0 {
+                sums[opp_hand] / f64::from(counts[opp_hand])
+            } else {
+                0.0
+            };
+            out[n * n + hero_hand * n + opp_hand] = if counts[n + opp_hand] > 0 {
+                sums[n + opp_hand] / f64::from(counts[n + opp_hand])
+            } else {
+                0.0
+            };
         }
     }
     out
