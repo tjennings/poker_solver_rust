@@ -221,50 +221,23 @@ pub fn compute_hand_bits_v2(
 /// Canonical hands: 13 pairs + 78 suited combos + 78 offsuit combos.
 /// Index layout: pairs first (AA=0..22=12), then suited (AKs=13..),
 /// then offsuit (...=91..168).
+///
+/// Delegates to `CanonicalHand` to ensure a single consistent ordering
+/// throughout the codebase.
 #[must_use]
 pub fn canonical_hand_index(holding: [Card; 2]) -> u16 {
-    let r1 = rank_ordinal(holding[0].value);
-    let r2 = rank_ordinal(holding[1].value);
-    let (high, low) = if r1 >= r2 { (r1, r2) } else { (r2, r1) };
-    let suited = holding[0].suit == holding[1].suit;
-
-    if high == low {
-        // Pair: index 0..12 (A=0, K=1, ..., 2=12)
-        u16::from(high)
-    } else if suited {
-        // Suited: 13 pairs already used, then upper triangle
-        // For (high, low) with high > low: index = 13 + triangle_offset(high, low)
-        13 + triangle_index(high, low)
-    } else {
-        // Offsuit: 13 + 78 suited = 91, then same triangle
-        91 + triangle_index(high, low)
-    }
+    crate::hands::CanonicalHand::from_cards(holding[0], holding[1]).index() as u16
 }
 
 /// Map a canonical hand string (e.g. "AKs", "QQ", "72o") to its index.
 ///
 /// Returns `None` if the string is not a valid canonical hand.
+/// Delegates to `CanonicalHand::parse` to ensure consistent indexing.
 #[must_use]
 pub fn canonical_hand_index_from_str(hand: &str) -> Option<u16> {
-    let chars: Vec<char> = hand.chars().collect();
-    if chars.len() < 2 || chars.len() > 3 {
-        return None;
-    }
-
-    let r1 = rank_ordinal_from_char(chars[0])?;
-    let r2 = rank_ordinal_from_char(chars[1])?;
-    let (high, low) = if r1 >= r2 { (r1, r2) } else { (r2, r1) };
-
-    if high == low {
-        Some(u16::from(high))
-    } else {
-        let suited = chars.get(2) == Some(&'s');
-        if suited {
-            Some(13 + triangle_index(high, low))
-        } else {
-            Some(91 + triangle_index(high, low))
-        }
-    }
+    crate::hands::CanonicalHand::parse(hand)
+        .ok()
+        .map(|h| h.index() as u16)
 }
 
 /// Upper-triangle index for (high, low) where high > low.
@@ -480,38 +453,16 @@ pub fn format_action_code_label(code: u8, bet_sizes: &[f32]) -> String {
 /// Map a canonical hand index (0..168) back to its string representation.
 ///
 /// Returns labels like `"AA"`, `"AKs"`, `"72o"`.
+/// Uses `CanonicalHand::from_index` to ensure consistent ordering.
 #[must_use]
 pub fn reverse_canonical_index(index: u16) -> &'static str {
-    const RANKS: [char; 13] = [
-        'A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2',
-    ];
+    use crate::hands::{all_hands, CanonicalHand};
 
     static HANDS: std::sync::LazyLock<[String; 169]> = std::sync::LazyLock::new(|| {
         let mut table: [String; 169] = std::array::from_fn(|_| String::new());
-        let mut idx = 0usize;
-
-        // Pairs: AA=0, KK=1, ..., 22=12
-        for r in RANKS {
-            table[idx] = format!("{r}{r}");
-            idx += 1;
+        for hand in all_hands() {
+            table[hand.index()] = hand.to_string();
         }
-
-        // Suited: triangle_index(high, low) = high*(high-1)/2 + low
-        for (high, &h) in RANKS.iter().enumerate().skip(1) {
-            for &l in &RANKS[..high] {
-                table[idx] = format!("{l}{h}s");
-                idx += 1;
-            }
-        }
-
-        // Offsuit: same triangle order
-        for (high, &h) in RANKS.iter().enumerate().skip(1) {
-            for &l in &RANKS[..high] {
-                table[idx] = format!("{l}{h}o");
-                idx += 1;
-            }
-        }
-
         table
     });
 
