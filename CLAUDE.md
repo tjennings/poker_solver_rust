@@ -39,14 +39,14 @@ cargo clippy                                        # lint (pedantic enabled in 
 cargo run -p poker-solver-trainer --release -- <subcommand>  # always --release for training/diag
 ```
 
-**Known timer failures** (pre-existing, not bugs): `cfr/vanilla`, `cfr/exploitability`, `blueprint/subgame_cfr`, `preflop/bundle`
+**Known timer failures** (pre-existing, not bugs): `blueprint/subgame_cfr`, `preflop/bundle`
 
 ## Crate Map
 
 | Crate | Purpose |
 |-|-|
-| `core` | Game logic, CFR solvers, preflop, hand eval, abstractions |
-| `trainer` | CLI: training, diagnostics, deal generation |
+| `core` | Preflop solver, postflop pipeline, CFR utilities, hand eval, abstractions |
+| `trainer` | CLI: preflop/postflop solving, diagnostics |
 | `tauri-app` | Desktop GUI exploration app |
 | `devserver` | HTTP mirror of Tauri API for browser debugging |
 | `test-macros` | `#[timed_test]` proc macro |

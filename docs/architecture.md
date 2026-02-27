@@ -27,8 +27,8 @@ poker_solver_rust/
 ├── crates/
 │   ├── core/                  # Core solver library
 │   │   └── src/
-│   │       ├── game/          # Game implementations (HUNL, Kuhn, LHE)
-│   │       ├── cfr/           # CFR variants (vanilla, MCCFR, sequence-form)
+│   │       ├── game/          # Action/Player types, PostflopConfig
+│   │       ├── cfr/           # CFR utilities (regret matching)
 │   │       ├── blueprint/     # Blueprint strategy, subgame solving, bundling
 │   │       ├── preflop/       # Preflop LCFR solver & postflop abstraction pipeline
 │   │       ├── abstraction/   # Card abstraction (isomorphism)
@@ -36,8 +36,7 @@ poker_solver_rust/
 │   │       ├── info_key.rs    # Info set key encoding (64-bit packed)
 │   │       ├── agent.rs       # Agent system (TOML-configured play styles)
 │   │       ├── simulation.rs  # Arena-based agent simulation
-│   │       └── abstract_game.rs  # Exhaustive deal enumeration
-│   ├── trainer/               # CLI for training, diagnostics, deal generation
+│   ├── trainer/               # CLI for training, diagnostics
 │   ├── tauri-app/             # Desktop strategy explorer (Tauri)
 │   ├── devserver/             # HTTP mirror of Tauri API for browser debugging
 │   └── test-macros/           # #[timed_test] proc macro
@@ -53,9 +52,9 @@ poker_solver_rust/
 
 ### Component Summary
 
-**`core`** -- The heart of the solver. Contains the `Game` trait and its implementations (heads-up no-limit, Kuhn poker, limit hold'em), multiple CFR solver backends (vanilla, MCCFR, sequence-form), the preflop LCFR solver with its postflop abstraction pipeline (169-hand direct indexing, combo maps, tree building, solving), the blueprint strategy system with subgame refinement, card abstractions, hand classification, and the agent simulation framework.
+**`core`** -- The heart of the solver. Contains the preflop LCFR solver with its postflop abstraction pipeline (169-hand direct indexing, combo maps, tree building, solving), CFR utilities (regret matching), the blueprint strategy system with subgame refinement, card abstractions, hand classification, and the agent simulation framework.
 
-**`trainer`** -- CLI entry point that orchestrates training runs, diagnostics, hand tracing, and deal generation. Parses YAML configs and drives the core library.
+**`trainer`** -- CLI entry point that orchestrates preflop/postflop solving, diagnostics, and hand tracing. Parses YAML configs and drives the core library.
 
 **`tauri-app`** -- Desktop application for exploring solved strategies. Loads blueprint bundles, navigates the game tree, queries strategy/EV at any node, and runs agent simulations.
 
