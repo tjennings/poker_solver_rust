@@ -298,6 +298,23 @@ impl PostflopAbstraction {
     /// Returns an error if tree building fails.
     pub fn build(
         config: &PostflopModelConfig,
+        equity_table: Option<&super::equity::EquityTable>,
+        on_progress: impl Fn(BuildPhase) + Sync,
+    ) -> Result<Self, PostflopAbstractionError> {
+        Self::build_for_spr(config, config.primary_spr(), equity_table, on_progress)
+    }
+
+    /// Build a `PostflopAbstraction` at an explicit SPR (instead of `config.primary_spr()`).
+    ///
+    /// The tree template is constructed for the given `spr`, but all other
+    /// config parameters (bet sizes, iterations, flops, etc.) come from `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tree building fails.
+    pub fn build_for_spr(
+        config: &PostflopModelConfig,
+        spr: f64,
         _equity_table: Option<&super::equity::EquityTable>,
         on_progress: impl Fn(BuildPhase) + Sync,
     ) -> Result<Self, PostflopAbstractionError> {
@@ -306,7 +323,7 @@ impl PostflopAbstraction {
         } else {
             sample_canonical_flops(config.max_flop_boards)
         };
-        let tree = PostflopTree::build_with_spr(config, config.primary_spr())?;
+        let tree = PostflopTree::build_with_spr(config, spr)?;
         let node_streets = annotate_streets(&tree);
         let layout = PostflopLayout::build(&tree, &node_streets, NUM_CANONICAL_HANDS, NUM_CANONICAL_HANDS, NUM_CANONICAL_HANDS);
 
@@ -317,7 +334,7 @@ impl PostflopAbstraction {
         on_progress(BuildPhase::ComputingValues);
         let flop_weights = crate::flops::lookup_flop_weights(&flops);
         let hand_avg_values = compute_hand_avg_values(&values, &flop_weights);
-        Ok(Self { tree, values, hand_avg_values, spr: config.primary_spr(), flops })
+        Ok(Self { tree, values, hand_avg_values, spr, flops })
     }
 
     /// Build `PostflopAbstraction` using pre-cached values, skipping the solve phase.
@@ -333,8 +350,26 @@ impl PostflopAbstraction {
         hand_avg_values: Vec<f64>,
         flops: Vec<[Card; 3]>,
     ) -> Result<Self, PostflopAbstractionError> {
-        let tree = PostflopTree::build_with_spr(config, config.primary_spr())?;
-        Ok(Self { tree, values, hand_avg_values, spr: config.primary_spr(), flops })
+        Self::build_from_cached_spr(config, config.primary_spr(), values, hand_avg_values, flops)
+    }
+
+    /// Build `PostflopAbstraction` from cached values at an explicit SPR.
+    ///
+    /// Like `build_from_cached`, but the tree is built for the given `spr`
+    /// instead of `config.primary_spr()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tree building fails.
+    pub fn build_from_cached_spr(
+        config: &PostflopModelConfig,
+        spr: f64,
+        values: PostflopValues,
+        hand_avg_values: Vec<f64>,
+        flops: Vec<[Card; 3]>,
+    ) -> Result<Self, PostflopAbstractionError> {
+        let tree = PostflopTree::build_with_spr(config, spr)?;
+        Ok(Self { tree, values, hand_avg_values, spr, flops })
     }
 
     /// Look up precomputed hand-averaged postflop EV.
@@ -801,5 +836,38 @@ mod tests {
                 assert!((v0 + v1).abs() < 0.5, "approximately zero-sum: v0={v0}, v1={v1}");
             }
         }
+    }
+
+    #[timed_test]
+    fn build_from_cached_spr_uses_explicit_spr() {
+        let config = PostflopModelConfig {
+            postflop_sprs: vec![3.5, 6.0],
+            ..PostflopModelConfig::exhaustive_fast()
+        };
+        // build_from_cached_spr should use the explicit SPR, not primary_spr().
+        let values = PostflopValues { values: vec![], num_buckets: 169, num_flops: 0 };
+        let hand_avg_values = vec![0.0; 2 * 169 * 169];
+        let result = PostflopAbstraction::build_from_cached_spr(
+            &config, 6.0, values, hand_avg_values, vec![],
+        );
+        assert!(result.is_ok());
+        let abs = result.unwrap();
+        assert!((abs.spr - 6.0).abs() < 1e-9, "spr should be 6.0, got {}", abs.spr);
+        assert!((abs.tree.spr - 6.0).abs() < 1e-9, "tree spr should be 6.0");
+    }
+
+    #[test]
+    #[ignore = "slow: full exhaustive postflop solve at explicit SPR"]
+    fn build_for_spr_solves_at_explicit_spr() {
+        let config = PostflopModelConfig {
+            postflop_sprs: vec![3.5, 6.0],
+            max_flop_boards: 1,
+            postflop_solve_iterations: 10,
+            ..PostflopModelConfig::exhaustive_fast()
+        };
+        let result = PostflopAbstraction::build_for_spr(&config, 6.0, None, |_| {});
+        assert!(result.is_ok());
+        let abs = result.unwrap();
+        assert!((abs.spr - 6.0).abs() < 1e-9, "spr should be 6.0, got {}", abs.spr);
     }
 }

@@ -634,12 +634,13 @@ fn print_postflop_ev_diagnostics(
 // Shared postflop progress infrastructure
 // ---------------------------------------------------------------------------
 
-/// Build a `PostflopAbstraction` with multi-bar progress display showing
-/// per-flop CFR delta / EV extraction progress alongside a main phase bar.
+/// Build one or more `PostflopAbstraction`s (one per configured SPR) with
+/// multi-bar progress display showing per-flop CFR delta / EV extraction
+/// progress alongside a main phase bar.
 fn build_postflop_with_progress(
     pf_config: &PostflopModelConfig,
     equity: Option<&EquityTable>,
-) -> Result<PostflopAbstraction, Box<dyn Error>> {
+) -> Result<Vec<PostflopAbstraction>, Box<dyn Error>> {
     let bar_style = ProgressStyle::default_bar()
         .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
         .expect("valid template")
@@ -710,79 +711,101 @@ fn build_postflop_with_progress(
         }));
 
     let pf_start = Instant::now();
-    let abstraction = PostflopAbstraction::build(
-        pf_config,
-        equity,
-        |phase| {
-            match &phase {
-                BuildPhase::FlopProgress { flop_name, stage } => {
-                    let mut guard = flop_state.lock().unwrap();
-                    let fbs = &mut *guard;
-                    match stage {
-                        FlopStage::Solving { iteration, max_iterations, delta, metric_label } => {
-                            #[allow(clippy::cast_precision_loss)]
-                            let key = 1.0 + *iteration as f64 / (*max_iterations).max(1) as f64;
-                            fbs.states.insert(flop_name.clone(), FlopSlotData {
-                                sort_key: key,
-                                position: *iteration as u64,
-                                length: *max_iterations as u64,
-                                message: format!("Flop '{flop_name}' CFR {metric_label}={delta:.4}"),
-                            });
-                        }
-                        FlopStage::EstimatingEv { sample, total_samples } => {
-                            #[allow(clippy::cast_precision_loss)]
-                            let key = 2.0 + *sample as f64 / (*total_samples).max(1) as f64;
-                            fbs.states.insert(flop_name.clone(), FlopSlotData {
-                                sort_key: key,
-                                position: *sample as u64,
-                                length: *total_samples as u64,
-                                message: format!("Flop '{flop_name}' EV Extraction"),
-                            });
-                        }
-                        FlopStage::Done => {
-                            fbs.states.remove(flop_name);
-                            refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
-                            fbs.last_refresh = Instant::now();
-                        }
-                    }
-                    if fbs.last_refresh.elapsed() >= std::time::Duration::from_secs(10) {
-                        fbs.last_refresh = Instant::now();
-                        refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
-                    }
-                }
-                BuildPhase::MccfrFlopsCompleted { completed, total } => {
-                    phase_bar.set_style(bar_style.clone());
-                    phase_bar.set_length(*total as u64);
-                    phase_bar.set_position(*completed as u64);
-                    phase_bar.set_message("MCCFR Solving");
-                }
-                _ => {
-                    phase_bar.set_style(spinner_style.clone());
-                    phase_bar.set_message(format!("{phase}..."));
-                }
-            }
-        },
-    )
-    .map_err(|e| format!("postflop abstraction: {e}"))?;
+    let sprs = &pf_config.postflop_sprs;
+    let total_sprs = sprs.len();
+    let mut abstractions = Vec::with_capacity(total_sprs);
 
-    // Clean up any remaining flop bars.
-    {
-        let mut guard = flop_state.lock().unwrap();
-        let fbs = &mut *guard;
-        fbs.states.clear();
-        for bar in fbs.slots.drain(..) {
-            bar.finish_and_clear();
-            multi.remove(&bar);
+    for (i, &spr) in sprs.iter().enumerate() {
+        phase_bar.set_style(spinner_style.clone());
+        phase_bar.set_message(format!(
+            "Postflop SPR={spr} ({}/{})",
+            i + 1,
+            total_sprs,
+        ));
+
+        let abstraction = PostflopAbstraction::build_for_spr(
+            pf_config,
+            spr,
+            equity,
+            |phase| {
+                match &phase {
+                    BuildPhase::FlopProgress { flop_name, stage } => {
+                        let mut guard = flop_state.lock().unwrap();
+                        let fbs = &mut *guard;
+                        match stage {
+                            FlopStage::Solving { iteration, max_iterations, delta, metric_label } => {
+                                #[allow(clippy::cast_precision_loss)]
+                                let key = 1.0 + *iteration as f64 / (*max_iterations).max(1) as f64;
+                                fbs.states.insert(flop_name.clone(), FlopSlotData {
+                                    sort_key: key,
+                                    position: *iteration as u64,
+                                    length: *max_iterations as u64,
+                                    message: format!("Flop '{flop_name}' CFR {metric_label}={delta:.4}"),
+                                });
+                            }
+                            FlopStage::EstimatingEv { sample, total_samples } => {
+                                #[allow(clippy::cast_precision_loss)]
+                                let key = 2.0 + *sample as f64 / (*total_samples).max(1) as f64;
+                                fbs.states.insert(flop_name.clone(), FlopSlotData {
+                                    sort_key: key,
+                                    position: *sample as u64,
+                                    length: *total_samples as u64,
+                                    message: format!("Flop '{flop_name}' EV Extraction"),
+                                });
+                            }
+                            FlopStage::Done => {
+                                fbs.states.remove(flop_name);
+                                refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
+                                fbs.last_refresh = Instant::now();
+                            }
+                        }
+                        if fbs.last_refresh.elapsed() >= std::time::Duration::from_secs(10) {
+                            fbs.last_refresh = Instant::now();
+                            refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
+                        }
+                    }
+                    BuildPhase::MccfrFlopsCompleted { completed, total } => {
+                        phase_bar.set_style(bar_style.clone());
+                        phase_bar.set_length(*total as u64);
+                        phase_bar.set_position(*completed as u64);
+                        phase_bar.set_message(format!("SPR={spr} MCCFR Solving"));
+                    }
+                    _ => {
+                        phase_bar.set_style(spinner_style.clone());
+                        phase_bar.set_message(format!("SPR={spr} {phase}..."));
+                    }
+                }
+            },
+        )
+        .map_err(|e| format!("postflop SPR={spr}: {e}"))?;
+
+        // Clean up flop bars between SPR solves.
+        {
+            let mut guard = flop_state.lock().unwrap();
+            let fbs = &mut *guard;
+            fbs.states.clear();
+            for bar in fbs.slots.drain(..) {
+                bar.finish_and_clear();
+                multi.remove(&bar);
+            }
         }
+
+        eprintln!(
+            "  SPR={spr} done ({}/{total_sprs}, values: {} entries)",
+            i + 1,
+            abstraction.values.len(),
+        );
+        abstractions.push(abstraction);
     }
+
     phase_bar.set_style(bar_style);
     phase_bar.finish_with_message(format!(
-        "done in {:.1?} (values: {} entries)",
+        "done in {:.1?} ({total_sprs} SPR model{})",
         pf_start.elapsed(),
-        abstraction.values.len(),
+        if total_sprs == 1 { "" } else { "s" },
     ));
 
-    Ok(abstraction)
+    Ok(abstractions)
 }
 
 // ---------------------------------------------------------------------------
@@ -794,15 +817,16 @@ fn run_solve_postflop(config_path: &Path, output: &Path) -> Result<(), Box<dyn E
     let config: PostflopSolveConfig = serde_yaml::from_str(&yaml)?;
     let pf_config = config.postflop_model;
 
-    eprintln!("Building postflop abstraction...");
+    eprintln!("Building postflop abstraction ({} SPR models)...", pf_config.postflop_sprs.len());
 
-    let abstraction = build_postflop_with_progress(&pf_config, None)?;
+    let abstractions = build_postflop_with_progress(&pf_config, None)?;
 
-    let bundle = PostflopBundle::from_abstraction(&pf_config, &abstraction);
-    bundle.save(output)?;
+    let refs: Vec<&PostflopAbstraction> = abstractions.iter().collect();
+    PostflopBundle::save_multi(&pf_config, &refs, output)?;
     eprintln!(
-        "Postflop bundle saved to {} (config.yaml + solve.bin)",
-        output.display()
+        "Postflop bundle saved to {} ({} SPR models)",
+        output.display(),
+        refs.len(),
     );
 
     Ok(())
@@ -885,19 +909,21 @@ fn run_solve_preflop(
     let bb_node = lhe_viz::find_raise_child(&tree, 0);
     let bb_call_node = lhe_viz::find_call_child(&tree, 0);
 
-    // Load postflop abstraction from pre-built bundle.
+    // Load multi-SPR postflop abstraction(s) from pre-built bundle.
     eprintln!("Loading postflop bundle from {}", postflop_model_path.display());
     let pf_start = Instant::now();
-    let bundle = PostflopBundle::load(&postflop_model_path)
+    let pf_config_yaml = std::fs::read_to_string(postflop_model_path.join("config.yaml"))
+        .map_err(|e| format!("failed to read postflop config: {e}"))?;
+    let pf_config: PostflopModelConfig = serde_yaml::from_str(&pf_config_yaml)
+        .map_err(|e| format!("failed to parse postflop config: {e}"))?;
+    let abstractions = PostflopBundle::load_multi(&pf_config, &postflop_model_path)
         .map_err(|e| format!("failed to load postflop bundle: {e}"))?;
-    let abstraction = bundle.into_abstraction()
-        .map_err(|e| format!("failed to reconstruct postflop abstraction: {e}"))?;
     eprintln!(
-        "Postflop bundle loaded in {:.1?} (values: {} entries)",
+        "Postflop bundle loaded in {:.1?} ({} SPR models)",
         pf_start.elapsed(),
-        abstraction.values.len(),
+        abstractions.len(),
     );
-    let postflop = Some(abstraction);
+    let postflop = Some(abstractions);
 
     let mut solver = PreflopSolver::new_with_equity(&config, equity);
     // Parse ev_diagnostic_hands once for use in diagnostics and per-iteration output.
@@ -905,16 +931,20 @@ fn run_solve_preflop(
         .map(parse_ev_diagnostic_hands)
         .unwrap_or_default();
 
-    // Clone hand_avg_values before the abstraction is consumed by attach_postflop.
-    let hand_avg_values = postflop.as_ref().map(|abs| abs.hand_avg_values.clone());
+    // Clone hand_avg_values from first model before abstractions are consumed.
+    let hand_avg_values = postflop.as_ref()
+        .and_then(|abs| abs.first())
+        .map(|a| a.hand_avg_values.clone());
 
-    if let Some(ref abstraction) = postflop {
+    if let Some(ref abstractions) = postflop {
         if !ev_diagnostic_hands.is_empty() {
-            print_postflop_ev_diagnostics(abstraction, &ev_diagnostic_hands);
+            if let Some(first) = abstractions.first() {
+                print_postflop_ev_diagnostics(first, &ev_diagnostic_hands);
+            }
         }
     }
-    if let Some(abstraction) = postflop {
-        solver.attach_postflop(abstraction, &config);
+    if let Some(abstractions) = postflop {
+        solver.attach_postflop(abstractions, &config);
     }
 
     print_preflop_matrices(&solver.strategy(), &tree, bb_node, bb_call_node, 0, claude_debug);

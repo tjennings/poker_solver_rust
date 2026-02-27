@@ -85,7 +85,7 @@ fn diag_end_to_end_aa_beats_72o() {
         &|phase| eprintln!("  [build] {phase}"),
     ).expect("postflop build should succeed");
 
-    solver.attach_postflop(abstraction, &config);
+    solver.attach_postflop(vec![abstraction], &config);
 
     solver.train(500);
     eprintln!("  preflop training done (500 iterations)");

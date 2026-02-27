@@ -153,6 +153,108 @@ impl PostflopBundle {
     pub fn exists(dir: &Path) -> bool {
         dir.join("config.yaml").exists() && dir.join("solve.bin").exists()
     }
+
+    /// Save multiple SPR abstractions to a directory.
+    ///
+    /// Layout:
+    /// ```text
+    /// dir/
+    /// ├── config.yaml
+    /// ├── spr_2.0/solve.bin
+    /// ├── spr_6.0/solve.bin
+    /// └── spr_20.0/solve.bin
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if directory creation, serialization, or file I/O fails.
+    pub fn save_multi(
+        config: &PostflopModelConfig,
+        abstractions: &[&PostflopAbstraction],
+        dir: &Path,
+    ) -> Result<(), std::io::Error> {
+        fs::create_dir_all(dir)?;
+        let config_yaml = serde_yaml::to_string(config).map_err(std::io::Error::other)?;
+        fs::write(dir.join("config.yaml"), config_yaml)?;
+
+        for abs in abstractions {
+            let spr_dir = dir.join(format!("spr_{}", abs.spr));
+            fs::create_dir_all(&spr_dir)?;
+            let data = PostflopBundleData {
+                values: PostflopValues::from_raw(
+                    abs.values.values.clone(),
+                    abs.values.num_buckets,
+                    abs.values.num_flops,
+                ),
+                hand_avg_values: abs.hand_avg_values.clone(),
+                flops: abs.flops.clone(),
+                spr: abs.spr,
+            };
+            let bytes = bincode::serialize(&data).map_err(std::io::Error::other)?;
+            fs::write(spr_dir.join("solve.bin"), bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Load multi-SPR abstractions from a directory.
+    ///
+    /// Handles both new multi-SPR layout (`spr_*/solve.bin`) and legacy
+    /// single-file layout (`solve.bin` at root).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no bundle is found, or if deserialization/tree building fails.
+    pub fn load_multi(
+        config: &PostflopModelConfig,
+        dir: &Path,
+    ) -> Result<Vec<PostflopAbstraction>, std::io::Error> {
+        // Try new layout: look for spr_* subdirectories
+        let mut spr_dirs: Vec<_> = fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map_or(false, |n| n.starts_with("spr_"))
+                    && e.path().join("solve.bin").exists()
+            })
+            .collect();
+
+        if !spr_dirs.is_empty() {
+            spr_dirs.sort_by_key(|e| e.file_name());
+            let mut result = Vec::with_capacity(spr_dirs.len());
+            for entry in &spr_dirs {
+                let data_bytes = fs::read(entry.path().join("solve.bin"))?;
+                let data: PostflopBundleData =
+                    bincode::deserialize(&data_bytes).map_err(std::io::Error::other)?;
+                let flop_weights = crate::flops::lookup_flop_weights(&data.flops);
+                let hand_avg = compute_hand_avg_values(&data.values, &flop_weights);
+                let abs = PostflopAbstraction::build_from_cached_spr(
+                    config,
+                    data.spr,
+                    data.values,
+                    hand_avg,
+                    data.flops,
+                )
+                .map_err(|e| std::io::Error::other(format!("{e}")))?;
+                result.push(abs);
+            }
+            return Ok(result);
+        }
+
+        // Legacy: single solve.bin at root
+        if dir.join("solve.bin").exists() {
+            let bundle = Self::load(dir)?;
+            let abs = bundle
+                .into_abstraction()
+                .map_err(|e| std::io::Error::other(format!("{e}")))?;
+            return Ok(vec![abs]);
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no postflop bundle found in {}", dir.display()),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +343,47 @@ mod tests {
         let loaded = PostflopBundle::load_hand_avg_values(&path.join("solve.bin")).unwrap();
         assert_eq!(loaded.len(), original_len);
         assert!(!loaded.is_empty());
+    }
+
+    #[timed_test]
+    fn multi_spr_bundle_roundtrip() {
+        let config = PostflopModelConfig::fast();
+        let values1 = PostflopValues::from_raw(vec![0.2; 8], 1, 1);
+        let values2 = PostflopValues::from_raw(vec![0.6; 8], 1, 1);
+        let flops: Vec<[Card; 3]> = vec![];
+        let flop_weights = crate::flops::lookup_flop_weights(&flops);
+        let hand_avg1 = compute_hand_avg_values(&values1, &flop_weights);
+        let hand_avg2 = compute_hand_avg_values(&values2, &flop_weights);
+
+        let abs1 = PostflopAbstraction::build_from_cached_spr(
+            &config, 2.0, values1, hand_avg1, vec![],
+        ).unwrap();
+        let abs2 = PostflopAbstraction::build_from_cached_spr(
+            &config, 6.0, values2, hand_avg2, vec![],
+        ).unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("multi_spr");
+
+        PostflopBundle::save_multi(&config, &[&abs1, &abs2], &path).unwrap();
+        let loaded = PostflopBundle::load_multi(&config, &path).unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert!((loaded[0].spr - 2.0).abs() < 1e-9);
+        assert!((loaded[1].spr - 6.0).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn legacy_single_bundle_loads_via_load_multi() {
+        let bundle = minimal_bundle();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy");
+        bundle.save(&path).unwrap();
+
+        let config = PostflopModelConfig::fast();
+        let loaded = PostflopBundle::load_multi(&config, &path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!((loaded[0].spr - 3.5).abs() < 1e-9);
     }
 
     #[timed_test]

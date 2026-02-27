@@ -8,15 +8,16 @@ The solver finds a Nash equilibrium for heads-up no-limit Texas Hold'em by split
 PreflopConfig -> PreflopTree -> PreflopSolver
                                       |
                                       v
-                              PostflopAbstraction
+                              Vec<PostflopAbstraction>  (one per configured SPR)
                               +----------------------------+
                               | ComboMap (per flop)         |  <-- 169 hands -> concrete card pairs
-                              | PostflopTree (shared)       |  <-- single tree at fixed SPR
+                              | PostflopTree (shared)       |  <-- single tree at this model's SPR
                               | PostflopValues (per-flop)   |  <-- solved EV table per flop
                               +----------------------------+
 
-Per canonical flop (in parallel):
-  combo map -> MCCFR solve (or exhaustive CFR) -> extract values -> DROP intermediate data
+Per SPR in postflop_sprs:
+  Per canonical flop (in parallel):
+    combo map -> MCCFR solve (or exhaustive CFR) -> extract values -> DROP intermediate data
 ```
 
 ## Project Structure
@@ -79,9 +80,9 @@ poker_solver_rust/
 
 **Flow:**
 1. Build `PreflopTree` from config (raise sizes, raise cap)
-2. Optionally build `PostflopAbstraction` (see below)
+2. Optionally build one `PostflopAbstraction` per configured SPR (see below)
 3. Run LCFR iterations with epsilon-greedy exploration
-4. At showdown terminals: if postflop model exists, query it for EV; otherwise use raw preflop equity
+4. At showdown terminals: if postflop models exist, select the closest SPR model and query it for EV; otherwise use raw preflop equity
 
 **Exploration:** epsilon-greedy -- `intended` strategy (for strategy sums) vs `traversal` strategy (explored) ensure sufficient visits to all actions.
 
@@ -136,19 +137,29 @@ Alternative backend (`solve_type: exhaustive`). For each canonical flop:
 
 ### Postflop Tree
 
-A single shared tree template at a fixed SPR (`postflop_spr`, default 3.5). All per-flop solves share this tree structure.
+Each `PostflopAbstraction` has its own tree template at a fixed SPR. All per-flop solves within that model share the same tree structure.
 
 Each tree has three streets of Decision nodes (OOP=0, IP=1), Chance nodes at street transitions, and Terminals (Fold/Showdown). Bet sizes are pot fractions.
 
 `PostflopLayout` maps `(node_idx, hand_idx)` to flat buffer offsets for regret/strategy storage.
 
+### Multi-SPR Model Selection
+
+When multiple SPRs are configured (e.g. `postflop_sprs: [2, 6, 20]`), a separate `PostflopAbstraction` is built for each. At runtime, the preflop solver selects the closest model by absolute SPR distance. No interpolation between models -- the existing within-model interpolation (`ratio = actual_spr / model_spr`) handles gaps between the actual and selected model SPR.
+
+Training time scales linearly with the number of SPR values (each builds its own tree and solves all flops independently).
+
 ### Runtime Integration
 
 At each preflop showdown terminal:
-1. Loop over all canonical flops
-2. Per flop: look up hero and opponent hand indices (0-168)
-3. Lookup: `PostflopValues::get_by_flop(flop_idx, hero_pos, hero_hand, opp_hand) -> EV fraction`
-4. Average across flops, then scale: `EV_fraction * actual_pot + (pot/2 - hero_investment)`
+1. Compute `actual_spr = effective_remaining / pot`
+2. Select the closest `PostflopAbstraction` by `|model.spr - actual_spr|`
+3. Loop over all canonical flops
+4. Per flop: look up hero and opponent hand indices (0-168)
+5. Lookup: `PostflopValues::get_by_flop(flop_idx, hero_pos, hero_hand, opp_hand) -> EV fraction`
+6. Average across flops, then scale: `EV_fraction * actual_pot + (pot/2 - hero_investment)`
+
+**Special cases:** Limped pots (raise_count=0) fall back to raw equity instead of the postflop model.
 
 **File:** `crates/core/src/preflop/postflop_abstraction.rs`
 
@@ -188,12 +199,14 @@ At each preflop showdown terminal:
 
 | Cache | Key | Stores | Status |
 |-|-|-|-|
-| `PostflopBundle` | directory path | `PostflopModelConfig` + `PostflopValues` + flops + SPR | Active |
+| `PostflopBundle` | directory path | `PostflopModelConfig` + per-SPR `PostflopValues` + flops | Active |
 
 **Files:**
 - `crates/core/src/preflop/postflop_bundle.rs`
 
 **Postflop bundles:** Build a postflop abstraction once with `solve-postflop`, then reference the bundle directory via `postflop_model_path` in training configs to skip the expensive rebuild.
+
+Multi-SPR bundles store one subdirectory per SPR (e.g. `spr_2.0/`, `spr_6.0/`, `spr_20.0/`). Legacy single-SPR bundles (flat `solve.bin`) are loaded with backward compatibility.
 
 ## Known Limitations
 

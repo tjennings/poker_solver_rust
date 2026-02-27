@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use super::config::{CfrVariant, PreflopConfig};
 use super::equity::EquityTable;
 use super::postflop_abstraction::PostflopAbstraction;
-use super::postflop_tree::PotType;
 use super::tree::{PreflopAction, PreflopNode, PreflopTree, TerminalType};
 
 const NUM_HANDS: usize = 169;
@@ -138,7 +137,7 @@ struct Ctx<'a> {
 
 /// Postflop state: pre-solved value table + raise counts for pot-type classification.
 pub(crate) struct PostflopState {
-    pub(crate) abstraction: PostflopAbstraction,
+    pub(crate) abstractions: Vec<PostflopAbstraction>,
     /// Per-node raise counts for the preflop tree (to determine `PotType`).
     pub(crate) raise_counts: Vec<u8>,
 }
@@ -235,10 +234,10 @@ impl PreflopSolver {
     ///
     /// When attached, showdown terminals in the preflop tree will use postflop
     /// CFR traversal instead of raw equity lookup.
-    pub fn attach_postflop(&mut self, abstraction: PostflopAbstraction, _config: &PreflopConfig) {
+    pub fn attach_postflop(&mut self, abstractions: Vec<PostflopAbstraction>, _config: &PreflopConfig) {
         let raise_counts = precompute_raise_counts(&self.tree);
         self.postflop = Some(PostflopState {
-            abstraction,
+            abstractions,
             raise_counts,
         });
     }
@@ -754,6 +753,19 @@ fn normalize(sums: &[f64]) -> Vec<f64> {
     }
 }
 
+/// Select the index of the closest SPR model to `actual_spr`.
+///
+/// `sprs` must be non-empty. Returns the index into `sprs` with the
+/// smallest absolute distance to `actual_spr`.
+fn select_closest_spr(sprs: &[f64], actual_spr: f64) -> usize {
+    sprs.iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (*a - actual_spr).abs().total_cmp(&(*b - actual_spr).abs())
+        })
+        .map_or(0, |(i, _)| i)
+}
+
 /// Look up pre-solved postflop EV from the value table with SPR scaling.
 ///
 /// The postflop model was solved at a fixed SPR (e.g. 3.5). When the actual
@@ -776,15 +788,11 @@ pub(crate) fn postflop_showdown_value(
     stacks: [u32; 2],
 ) -> f64 {
     let pot_f = f64::from(pot);
-
-    // Pure equity value (fallback when no postflop play is possible).
     let eq_value = equity * pot_f - hero_inv;
 
-    // The postflop model was trained for raised pots (PotType::Raised at a
-    // fixed SPR).  For limped-pot showdowns (raise_count == 0) applying the
-    // model inflates values by ~5× relative to fold terminals (e.g. AA showdown
-    // ≈ 10.87 chips vs fold ≈ 2 chips), creating a degenerate limp-trap
-    // equilibrium where SB never raises.  Fall back to raw equity here.
+    // Limped-pot showdowns (raise_count == 0) fall back to raw equity.
+    // The postflop model was trained for raised pots; applying it to limped
+    // pots inflates values ~5×, creating a degenerate limp-trap equilibrium.
     let raise_count = pf_state
         .raise_counts
         .get(preflop_node_idx as usize)
@@ -794,14 +802,6 @@ pub(crate) fn postflop_showdown_value(
         return eq_value;
     }
 
-    // O(1) lookup into precomputed hand-averaged EV table.
-    let pf_ev_frac = pf_state.abstraction.avg_ev(
-        hero_pos, hero_hand as usize, opp_hand as usize,
-    );
-
-    // Model value (what the postflop model predicts at its trained SPR).
-    let model_value = pf_ev_frac * pot_f + (pot_f / 2.0 - hero_inv);
-
     // Compute actual SPR at this terminal.
     let opp_inv = pot_f - hero_inv;
     let hero_remaining = f64::from(stacks[hero_pos as usize]) - hero_inv;
@@ -809,7 +809,15 @@ pub(crate) fn postflop_showdown_value(
     let effective_remaining = hero_remaining.min(opp_remaining).max(0.0);
     let actual_spr = if pot > 0 { effective_remaining / pot_f } else { 0.0 };
 
-    let model_spr = pf_state.abstraction.spr;
+    // Select the closest SPR model.
+    let sprs: Vec<f64> = pf_state.abstractions.iter().map(|a| a.spr).collect();
+    let idx = select_closest_spr(&sprs, actual_spr);
+    let selected = &pf_state.abstractions[idx];
+
+    let pf_ev_frac = selected.avg_ev(hero_pos, hero_hand as usize, opp_hand as usize);
+    let model_value = pf_ev_frac * pot_f + (pot_f / 2.0 - hero_inv);
+
+    let model_spr = selected.spr;
     if model_spr <= 0.0 || actual_spr >= model_spr {
         return model_value;
     }
@@ -1329,7 +1337,7 @@ mod tests {
         };
 
         let pf_state = PostflopState {
-            abstraction,
+            abstractions: vec![abstraction],
             raise_counts: vec![1], // raise_count=1 → PotType::Raised
         };
 
@@ -1386,7 +1394,7 @@ mod tests {
 
         // Node 0 has raise_count=0 (limped pot); Node 1 has raise_count=1 (raised pot).
         let pf_state = PostflopState {
-            abstraction,
+            abstractions: vec![abstraction],
             raise_counts: vec![0, 1],
         };
 
@@ -1416,5 +1424,88 @@ mod tests {
             ev_raised > ev_limped * 3.0,
             "Raised pot value ({ev_raised}) should be much larger than limped ({ev_limped})"
         );
+    }
+
+    #[timed_test]
+    fn select_closest_spr_picks_nearest() {
+        let sprs = [2.0, 6.0, 20.0];
+        assert_eq!(super::select_closest_spr(&sprs, 1.0), 0);
+        assert_eq!(super::select_closest_spr(&sprs, 3.0), 0);
+        assert_eq!(super::select_closest_spr(&sprs, 4.5), 1);
+        assert_eq!(super::select_closest_spr(&sprs, 5.0), 1);
+        assert_eq!(super::select_closest_spr(&sprs, 12.0), 1);
+        assert_eq!(super::select_closest_spr(&sprs, 13.5), 2);
+        assert_eq!(super::select_closest_spr(&sprs, 50.0), 2);
+    }
+
+    #[timed_test]
+    fn select_closest_spr_single_element() {
+        assert_eq!(super::select_closest_spr(&[3.5], 0.0), 0);
+        assert_eq!(super::select_closest_spr(&[3.5], 100.0), 0);
+    }
+
+    #[timed_test]
+    fn postflop_showdown_value_selects_closest_spr() {
+        use crate::preflop::postflop_abstraction::{PostflopAbstraction, PostflopValues};
+        use crate::preflop::postflop_tree::{PostflopNode, PostflopTree, PostflopTerminalType, PotType};
+
+        let n = 2;
+
+        // SPR=2 model: hand 0 vs hand 1 = +0.1
+        let mut avg2 = vec![0.0; 2 * n * n];
+        avg2[0 * n * n + 0 * n + 1] = 0.1;
+        let abs2 = PostflopAbstraction {
+            tree: PostflopTree {
+                nodes: vec![PostflopNode::Terminal {
+                    terminal_type: PostflopTerminalType::Showdown,
+                    pot_fraction: 1.0,
+                }],
+                pot_type: PotType::Raised,
+                spr: 2.0,
+            },
+            values: PostflopValues { values: vec![], num_buckets: n, num_flops: 0 },
+            hand_avg_values: avg2,
+            spr: 2.0,
+            flops: vec![],
+        };
+
+        // SPR=10 model: hand 0 vs hand 1 = +0.4
+        let mut avg10 = vec![0.0; 2 * n * n];
+        avg10[0 * n * n + 0 * n + 1] = 0.4;
+        let abs10 = PostflopAbstraction {
+            tree: PostflopTree {
+                nodes: vec![PostflopNode::Terminal {
+                    terminal_type: PostflopTerminalType::Showdown,
+                    pot_fraction: 1.0,
+                }],
+                pot_type: PotType::Raised,
+                spr: 10.0,
+            },
+            values: PostflopValues { values: vec![], num_buckets: n, num_flops: 0 },
+            hand_avg_values: avg10,
+            spr: 10.0,
+            flops: vec![],
+        };
+
+        let pf_state = super::PostflopState {
+            abstractions: vec![abs2, abs10],
+            raise_counts: vec![1],
+        };
+
+        let pot = 10;
+        let hero_inv = 5.0;
+        let equity = 0.5;
+
+        // Stacks [15,15] → remaining=10, actual_spr=10/10=1.0 → closest to SPR=2
+        // model_value = 0.1*10 + (5-5) = 1.0, ratio = 1.0/2.0 = 0.5
+        // eq_value = 0.5*10 - 5 = 0.0, interpolated = 0.0 + (1.0-0.0)*0.5 = 0.5
+        let ev_shallow = super::postflop_showdown_value(&pf_state, 0, pot, hero_inv, 0, 1, 0, equity, [15, 15]);
+        assert!((ev_shallow - 0.5).abs() < 1e-10, "shallow should use SPR=2: got {ev_shallow}");
+
+        // Stacks [100,100] → remaining=95, actual_spr=95/10=9.5 → closest to SPR=10
+        // model_value = 0.4*10 + 0 = 4.0, ratio = 9.5/10 = 0.95
+        // interpolated = 0.0 + (4.0-0.0)*0.95 = 3.8
+        let ev_deep = super::postflop_showdown_value(&pf_state, 0, pot, hero_inv, 0, 1, 0, equity, [100, 100]);
+        assert!((ev_deep - 3.8).abs() < 1e-10, "deep should use SPR=10: got {ev_deep}");
     }
 }
