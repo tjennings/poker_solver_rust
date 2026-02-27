@@ -133,6 +133,21 @@ impl PostflopBundle {
         &self.data.flops
     }
 
+    /// Load just the hand-averaged EV table from a solve.bin file.
+    ///
+    /// Useful when the companion config.yaml has been overwritten
+    /// (e.g. by a co-located `PreflopBundle`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is missing, unreadable, or deserialization fails.
+    pub fn load_hand_avg_values(solve_bin: &Path) -> Result<Vec<f64>, std::io::Error> {
+        let data_bytes = fs::read(solve_bin)?;
+        let data: PostflopBundleData =
+            bincode::deserialize(&data_bytes).map_err(std::io::Error::other)?;
+        Ok(data.hand_avg_values)
+    }
+
     /// Check whether a directory contains a complete bundle.
     #[must_use]
     pub fn exists(dir: &Path) -> bool {
@@ -213,6 +228,19 @@ mod tests {
         let vals = bundle.hand_avg_values();
         assert!(!vals.is_empty());
         assert_eq!(vals.len(), bundle.data.hand_avg_values.len());
+    }
+
+    #[timed_test]
+    fn load_hand_avg_values_from_solve_bin() {
+        let bundle = minimal_bundle();
+        let original_len = bundle.hand_avg_values().len();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pf_havg");
+        bundle.save(&path).unwrap();
+
+        let loaded = PostflopBundle::load_hand_avg_values(&path.join("solve.bin")).unwrap();
+        assert_eq!(loaded.len(), original_len);
+        assert!(!loaded.is_empty());
     }
 
     #[timed_test]
