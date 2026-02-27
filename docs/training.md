@@ -46,8 +46,15 @@ output/
 ├── strategy.bin      # PreflopStrategy
 └── postflop/         # PostflopBundle (auto-saved when postflop model is used)
     ├── config.yaml   # PostflopModelConfig
-    └── solve.bin     # Values, hand-averaged EVs, flops, SPR
+    ├── spr_2.0/      # Per-SPR solve data (one dir per configured SPR)
+    │   └── solve.bin
+    ├── spr_6.0/
+    │   └── solve.bin
+    └── spr_20.0/
+        └── solve.bin
 ```
+
+When multiple SPRs are configured (e.g. `postflop_sprs: [2, 6, 20]`), a separate postflop tree and value table is built for each SPR. At runtime, the preflop solver selects the closest SPR model for each showdown terminal. Legacy bundles with a flat `solve.bin` are loaded with backward compatibility.
 
 The Explorer loads this postflop data automatically and displays per-hand average postflop equity when a cell is selected. Old bundles without a `postflop/` subdirectory continue to work -- the equity panel simply doesn't appear.
 
@@ -70,7 +77,7 @@ Options:
 
 The bundle directory contains:
 - `config.yaml` -- Human-readable `PostflopModelConfig`
-- `solve.bin` -- Bincode-serialized values, flops, and SPR
+- `spr_X.Y/solve.bin` -- Bincode-serialized values, flops, and SPR (one per configured SPR)
 
 ### train
 
@@ -254,7 +261,7 @@ postflop_model:
 
   bet_sizes: [0.5, 1.0, 2.0]       # pot-fraction bet sizes for the postflop tree
   max_raises_per_street: 1          # raise cap per postflop street
-  postflop_sprs: [3.5]             # stack-to-pot ratio(s) for the postflop tree; scalar also accepted
+  postflop_sprs: [2, 6, 20]        # SPR(s) for postflop tree; one model built per SPR; scalar also accepted
 
   postflop_solve_iterations: 1000   # CFR/MCCFR iterations per flop
   cfr_convergence_threshold: 0.01   # per-flop early-stop threshold (strategy delta or exploitability)
@@ -285,7 +292,7 @@ Set `checkpoint_every` to save intermediate strategy bundles at regular interval
 
 The `max_flop_boards` parameter controls how many canonical flop textures are solved. Lower values dramatically speed up training. Set to `0` (or omit) to use all ~1,755 canonical flops.
 
-The `postflop_sprs` field accepts a scalar or list of SPR values for the shared postflop tree (replaces `postflop_spr`; scalar values are auto-wrapped for backward compatibility).
+The `postflop_sprs` field accepts a scalar or list of SPR values. Each SPR builds an independent postflop tree and value table. At runtime, the preflop solver selects the closest SPR model for each showdown terminal. N SPRs = ~Nx postflop build time. Scalar values are auto-wrapped for backward compatibility.
 
 ### Postflop Model Parameters
 
@@ -294,7 +301,7 @@ The `postflop_sprs` field accepts a scalar or list of SPR values for the shared 
 | `solve_type` | `mccfr` | string | Postflop backend: `mccfr` (sampled concrete hands) or `exhaustive` (pre-computed equity tables + vanilla CFR) |
 | `bet_sizes` | [0.5, 1.0] | [f32] | Pot-fraction bet sizes for postflop tree |
 | `max_raises_per_street` | 1 | u8 | Raise cap per postflop street |
-| `postflop_sprs` | [3.5] | [f64] | SPR(s) for shared postflop tree (scalar or list) |
+| `postflop_sprs` | [3.5] | [f64] | SPR(s) for postflop tree; one model built per SPR; closest selected at runtime |
 | `postflop_solve_iterations` | 500 | u32 | CFR/MCCFR iterations per flop |
 | `max_flop_boards` | 0 | usize | Max canonical flops to solve; 0 = all ~1,755 |
 | `fixed_flops` | none | [string] | Explicit flop boards (overrides `max_flop_boards`) |
@@ -314,7 +321,7 @@ postflop_model:
   value_extraction_samples: 10000  # Monte Carlo samples for EV extraction
   ev_convergence_threshold: 0.001 # early-stop when weighted-avg delta drops below this
   postflop_solve_iterations: 500
-  postflop_spr: 3.5
+  postflop_sprs: [2, 6, 20]       # one model per SPR; closest selected at runtime
   bet_sizes: [0.5, 1.0]
 ```
 
@@ -334,7 +341,7 @@ The exhaustive backend (`solve_type: exhaustive`) uses pre-computed pairwise equ
 postflop_model:
   solve_type: exhaustive
   postflop_solve_iterations: 1000
-  postflop_spr: 3.5
+  postflop_sprs: [3.5]
   bet_sizes: [0.5, 1.0]
 ```
 
@@ -480,6 +487,7 @@ my_strategy/
 | `sample_configurations/smoke.yaml` | Minimal smoke test (single flop, 10 iterations) |
 | `sample_configurations/ultra_fast.yaml` | Fast MCCFR with extended raise sizes |
 | `sample_configurations/AKQr_vs_234r.yaml` | Multi-flop texture comparison (AKQr vs 234r) |
+| `sample_configurations/full.yaml` | Full multi-SPR exhaustive postflop (SPR 2/6/20) with DCFR |
 
 ---
 
