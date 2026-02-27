@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use super::postflop_model::PostflopModelConfig;
 
 /// A raise size expressed as either a fixed BB amount or a fraction of pot.
 ///
@@ -169,14 +168,6 @@ pub struct PreflopConfig {
     /// Set to 0.0 for pure regret matching.  Typical value: 0.05.
     #[serde(default = "default_exploration")]
     pub exploration: f64,
-    /// Optional postflop model for equity realization.
-    ///
-    /// When `None`, showdown terminals use raw hand equity (current behaviour).
-    /// When `Some`, each preflop showdown terminal is replaced by a sampled
-    /// abstracted postflop subtree, allowing the solver to discover equity
-    /// realization endogenously.
-    #[serde(default)]
-    pub postflop_model: Option<PostflopModelConfig>,
 }
 
 impl PreflopConfig {
@@ -207,7 +198,6 @@ impl PreflopConfig {
             dcfr_gamma: 2.0,
             dcfr_warmup: 0,
             exploration: 0.05,
-            postflop_model: None,
         }
     }
 
@@ -254,7 +244,6 @@ impl PreflopConfig {
             dcfr_gamma: 2.0,
             dcfr_warmup: 0,
             exploration: 0.05,
-            postflop_model: None,
         }
     }
 

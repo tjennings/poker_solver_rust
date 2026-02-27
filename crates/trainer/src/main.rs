@@ -208,34 +208,24 @@ enum Commands {
         #[arg(long)]
         num_streets: Option<u8>,
     },
-    /// Solve preflop strategy using Linear CFR
+    /// Solve preflop strategy using Linear CFR.
+    /// Requires a config file with `postflop_model_path` pointing to a pre-built bundle.
     SolvePreflop {
-        /// YAML config file (contains PreflopConfig + training params).
-        /// CLI flags override values from the config file.
+        /// YAML config file (contains PreflopConfig + training params + postflop_model_path).
         #[arg(short, long)]
-        config: Option<PathBuf>,
-        /// Stack depth in big blinds
-        #[arg(long)]
-        stack_depth: Option<u32>,
-        /// Number of players (2 = HU, 6 = six-max)
-        #[arg(long)]
-        players: Option<u8>,
-        /// Number of LCFR iterations
+        config: PathBuf,
+        /// Number of LCFR iterations (overrides config)
         #[arg(long)]
         iterations: Option<u64>,
         /// Output directory for the preflop bundle
         #[arg(short, long)]
         output: PathBuf,
-        /// Print strategy matrices every N iterations (0 = only at end)
+        /// Print strategy matrices every N iterations (0 = only at end; overrides config)
         #[arg(long)]
         print_every: Option<u64>,
-        /// Monte Carlo samples per hand matchup for equity table (0 = uniform)
+        /// Monte Carlo samples per hand matchup for equity table (0 = uniform; overrides config)
         #[arg(long)]
         equity_samples: Option<u32>,
-        /// Postflop model preset: fast, standard, exhaustive_fast, or exhaustive_standard.
-        /// Overrides any postflop_model in the config file.
-        #[arg(long)]
-        postflop_model: Option<String>,
         /// Print strategy matrices in plain text (no ANSI colors) for machine consumption
         #[arg(long)]
         claude_debug: bool,
@@ -651,24 +641,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Commands::SolvePreflop {
             config,
-            stack_depth,
-            players,
             iterations,
             output,
             print_every,
             equity_samples,
-            postflop_model,
             claude_debug,
         } => {
             run_solve_preflop(
-                config.as_deref(),
-                stack_depth,
-                players,
+                &config,
                 iterations,
                 &output,
                 print_every,
                 equity_samples,
-                postflop_model.as_deref(),
                 claude_debug,
             )?;
         }
@@ -677,19 +661,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Commands::DiagBuckets { config, cache_dir, json } => {
             let yaml = std::fs::read_to_string(&config)?;
-            let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
-            let pf_config = training.game.postflop_model
-                .ok_or("config file has no postflop_model section")?;
-            let all_passed = bucket_diagnostics::run(&pf_config, &cache_dir, json);
+            let pf_solve: PostflopSolveConfig = serde_yaml::from_str(&yaml)?;
+            let all_passed = bucket_diagnostics::run(&pf_solve.postflop_model, &cache_dir, json);
             if !all_passed {
                 std::process::exit(1);
             }
         }
         Commands::TraceHand { config } => {
             let yaml = std::fs::read_to_string(&config)?;
-            let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
-            let pf_config = training.game.postflop_model
-                .ok_or("config file has no postflop_model section")?;
+            let pf_solve: PostflopSolveConfig = serde_yaml::from_str(&yaml)?;
+            let pf_config = pf_solve.postflop_model;
 
             eprintln!("Building postflop abstraction from scratch...");
             let abstraction = PostflopAbstraction::build(
@@ -728,10 +709,9 @@ struct PreflopTrainingConfig {
     /// When `None`, no intermediate checkpoints are saved.
     #[serde(default)]
     pub checkpoint_every: Option<u64>,
-    /// Path to a pre-built postflop bundle directory. When set, loads the bundle
-    /// instead of building the postflop abstraction from `postflop_model`.
-    #[serde(default)]
-    pub postflop_model_path: Option<PathBuf>,
+    /// Path to a pre-built postflop bundle directory.
+    /// Build one with `solve-postflop` first, then reference it here.
+    pub postflop_model_path: PathBuf,
     /// Comma-separated canonical hands for postflop EV diagnostics.
     /// When set, prints avg EV per hand, pairwise matchups, and per-flop
     /// breakdown after building the postflop abstraction.
@@ -1038,50 +1018,22 @@ fn run_solve_postflop(config_path: &Path, output: &Path) -> Result<(), Box<dyn E
 
 #[allow(clippy::too_many_arguments)]
 fn run_solve_preflop(
-    config_path: Option<&Path>,
-    cli_stack_depth: Option<u32>,
-    cli_players: Option<u8>,
+    config_path: &Path,
     cli_iterations: Option<u64>,
     output: &Path,
     cli_print_every: Option<u64>,
     cli_equity_samples: Option<u32>,
-    cli_postflop_model: Option<&str>,
     claude_debug: bool,
 ) -> Result<(), Box<dyn Error>> {
-    // Load config: from YAML file or defaults based on CLI args.
-    let mut training = if let Some(path) = config_path {
-        let yaml = std::fs::read_to_string(path)?;
-        serde_yaml::from_str::<PreflopTrainingConfig>(&yaml)?
-    } else {
-        let stack_depth = cli_stack_depth.unwrap_or(100);
-        let players = cli_players.unwrap_or(2);
-        let game = match players {
-            2 => PreflopConfig::heads_up(stack_depth),
-            6 => PreflopConfig::six_max(stack_depth),
-            n => return Err(format!("unsupported player count: {n} (use 2 or 6)").into()),
-        };
-        PreflopTrainingConfig {
-            game,
-            iterations: 5000,
-            equity_samples: 20000,
-            print_every: 1000,
-            preflop_exploitability_threshold_mbb: default_preflop_exploitability_threshold_mbb(),
-            checkpoint_every: None,
-            postflop_model_path: None,
-            ev_diagnostic_hands: None,
-        }
-    };
+    let yaml = std::fs::read_to_string(config_path)?;
+    let mut training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
 
     // CLI overrides
     if let Some(v) = cli_iterations { training.iterations = v; }
     if let Some(v) = cli_equity_samples { training.equity_samples = v; }
     if let Some(v) = cli_print_every { training.print_every = v; }
-    if let Some(preset) = cli_postflop_model {
-        training.game.postflop_model = Some(PostflopModelConfig::from_preset(preset)
-            .ok_or_else(|| format!("unknown postflop preset: {preset} (use fast/standard/exhaustive_fast/exhaustive_standard)"))?);
-    }
 
-    let postflop_model_path = training.postflop_model_path.take();
+    let postflop_model_path = training.postflop_model_path;
     let config = training.game;
     let iterations = training.iterations;
     let equity_samples = training.equity_samples;
@@ -1141,43 +1093,19 @@ fn run_solve_preflop(
     let bb_node = lhe_viz::find_raise_child(&tree, 0);
     let bb_call_node = lhe_viz::find_call_child(&tree, 0);
 
-    // Build or load postflop abstraction before the solver takes equity ownership.
-    let postflop = if let Some(bundle_path) = &postflop_model_path {
-        if config.postflop_model.is_some() {
-            eprintln!("Warning: both postflop_model_path and postflop_model are set; using postflop_model_path");
-        }
-        eprintln!("Loading postflop bundle from {}", bundle_path.display());
-        let pf_start = Instant::now();
-        let bundle = PostflopBundle::load(bundle_path)
-            .map_err(|e| format!("failed to load postflop bundle: {e}"))?;
-        let abstraction = bundle.into_abstraction()
-            .map_err(|e| format!("failed to reconstruct postflop abstraction: {e}"))?;
-        eprintln!(
-            "Postflop bundle loaded in {:.1?} (values: {} entries)",
-            pf_start.elapsed(),
-            abstraction.values.len(),
-        );
-        Some(abstraction)
-    } else if let Some(pf_config) = &config.postflop_model {
-        let abstraction = build_postflop_with_progress(
-            pf_config,
-            Some(&equity),
-        )?;
-
-        Some(abstraction)
-    } else {
-        None
-    };
-
-    // Save postflop bundle into output/postflop/ before the abstraction is consumed.
-    if let Some(ref abstraction) = postflop {
-        if let Some(pf_config) = &config.postflop_model {
-            let pf_bundle = PostflopBundle::from_abstraction(pf_config, abstraction);
-            let pf_dir = output.join("postflop");
-            pf_bundle.save(&pf_dir)?;
-            eprintln!("Postflop bundle saved to {}", pf_dir.display());
-        }
-    }
+    // Load postflop abstraction from pre-built bundle.
+    eprintln!("Loading postflop bundle from {}", postflop_model_path.display());
+    let pf_start = Instant::now();
+    let bundle = PostflopBundle::load(&postflop_model_path)
+        .map_err(|e| format!("failed to load postflop bundle: {e}"))?;
+    let abstraction = bundle.into_abstraction()
+        .map_err(|e| format!("failed to reconstruct postflop abstraction: {e}"))?;
+    eprintln!(
+        "Postflop bundle loaded in {:.1?} (values: {} entries)",
+        pf_start.elapsed(),
+        abstraction.values.len(),
+    );
+    let postflop = Some(abstraction);
 
     let mut solver = PreflopSolver::new_with_equity(&config, equity);
     // Parse ev_diagnostic_hands once for use in diagnostics and per-iteration output.

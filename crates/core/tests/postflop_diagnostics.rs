@@ -12,6 +12,7 @@ use poker_solver_core::preflop::postflop_abstraction::PostflopAbstraction;
 use poker_solver_core::preflop::postflop_model::PostflopModelConfig;
 use poker_solver_core::preflop::solver::PreflopSolver;
 
+
 /// After building the full postflop abstraction (169-hand MCCFR + values),
 /// the value table should show strong hands winning against weak hands.
 #[test]
@@ -73,14 +74,13 @@ fn diag_end_to_end_aa_beats_72o() {
         ..PostflopModelConfig::fast()
     };
 
-    let mut config = PreflopConfig::heads_up(25);
-    config.postflop_model = Some(pf_config);
+    let config = PreflopConfig::heads_up(25);
 
     let equity = EquityTable::new_computed(5000, |_| {});
     let mut solver = PreflopSolver::new_with_equity(&config, equity);
 
     let abstraction = PostflopAbstraction::build(
-        config.postflop_model.as_ref().unwrap(),
+        &pf_config,
         None,
         &|phase| eprintln!("  [build] {phase}"),
     ).expect("postflop build should succeed");

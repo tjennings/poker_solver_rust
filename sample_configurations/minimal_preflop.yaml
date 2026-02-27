@@ -1,0 +1,48 @@
+# Minimal preflop solver config.
+# Requires a pre-built postflop bundle (see solve-postflop).
+#
+# Usage:
+#   # 1. Build the postflop bundle first:
+#   cargo run -p poker-solver-trainer --release -- solve-postflop \
+#     -c sample_configurations/minimal_postflop.yaml -o minimal_postflop
+#
+#   # 2. Then solve preflop:
+#   cargo run -p poker-solver-trainer --release -- solve-preflop \
+#     -c sample_configurations/minimal_preflop.yaml -o minimal_preflop_output
+
+# -- Postflop bundle (required, built via solve-postflop) --
+postflop_model_path: minimal_postflop
+
+# -- Training --
+iterations: 200
+equity_samples: 5000
+print_every: 50
+ev_diagnostic_hands: "AA,72o"
+
+# -- Game structure --
+positions:
+  - name: Small Blind
+    short_name: SB
+  - name: Big Blind
+    short_name: BB
+
+blinds:
+  - [0, 1]   # SB posts 1
+  - [1, 2]   # BB posts 2
+
+antes: []
+stacks: [200, 200]  # 100 BB each (SB=1, BB=2)
+
+raise_sizes:
+  - ["2bb", "1.0p"]              # preflop: 2bb open, pot-sized 3bet
+  - ["0.5p", "1.0p"]             # flop
+  - ["0.5p", "1.0p"]             # turn/river
+
+raise_cap: 3
+
+# -- DCFR discounting --
+dcfr_alpha: 1.5
+dcfr_beta: 0.5
+dcfr_gamma: 2.0
+dcfr_warmup: 0
+exploration: 0.05

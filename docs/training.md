@@ -12,60 +12,54 @@ Always use `--release` for training and diagnostics.
 
 ### solve-preflop
 
-Solve preflop strategy using Linear CFR with optional postflop model.
+Solve preflop strategy using Linear CFR with a pre-built postflop bundle.
+
+**Workflow:** first build a postflop bundle with `solve-postflop`, then reference it via `postflop_model_path` in the preflop config.
 
 ```bash
-# From a config file
-cargo run -p poker-solver-trainer --release -- solve-preflop \
-  -c sample_configurations/preflop_medium.yaml -o preflop_hu_25bb
+# 1. Build the postflop bundle
+cargo run -p poker-solver-trainer --release -- solve-postflop \
+  -c sample_configurations/minimal_postflop.yaml -o postflop_models/medium
 
-# With postflop model preset override
+# 2. Solve preflop (config must include postflop_model_path)
 cargo run -p poker-solver-trainer --release -- solve-preflop \
-  -c config.yaml -o output/ --postflop-model standard
+  -c sample_configurations/minimal_preflop.yaml -o preflop_hu_25bb
 
-# CLI overrides (supplement or replace config file)
+# CLI overrides
 cargo run -p poker-solver-trainer --release -- solve-preflop \
-  -o output/ --stack-depth 25 --iterations 5000 --equity-samples 10000
+  -c config.yaml -o output/ --iterations 5000 --equity-samples 10000
 ```
 
 Options:
-- `-c, --config <FILE>` -- YAML config file (optional; CLI flags override config values)
+- `-c, --config <FILE>` -- YAML config file (required; must include `postflop_model_path`)
 - `-o, --output <DIR>` -- Output directory for preflop bundle
-- `--stack-depth <N>` -- Stack depth in BB
-- `--players <N>` -- Number of players (2=HU, 6=six-max)
-- `--iterations <N>` -- LCFR iterations
-- `--equity-samples <N>` -- Monte Carlo samples per hand matchup for equity table (0=uniform)
-- `--postflop-model <PRESET>` -- Postflop model preset: fast, standard, exhaustive_fast, exhaustive_standard
-- `--print-every <N>` -- Print strategy matrices every N iterations (0=only at end)
-
-When a postflop model is used, the postflop solve data is automatically saved into a `postflop/` subdirectory of the output:
+- `--iterations <N>` -- LCFR iterations (overrides config)
+- `--equity-samples <N>` -- Monte Carlo samples per hand matchup for equity table (0=uniform; overrides config)
+- `--print-every <N>` -- Print strategy matrices every N iterations (0=only at end; overrides config)
 
 ```
 output/
 ├── config.yaml       # PreflopConfig
 ├── strategy.bin      # PreflopStrategy
-└── postflop/         # PostflopBundle (auto-saved when postflop model is used)
-    ├── config.yaml   # PostflopModelConfig
-    └── solve.bin     # Values, hand-averaged EVs, flops, SPR
 ```
 
-The Explorer loads this postflop data automatically and displays per-hand average postflop equity when a cell is selected. Old bundles without a `postflop/` subdirectory continue to work -- the equity panel simply doesn't appear.
+The Explorer loads postflop data from the referenced bundle automatically and displays per-hand average postflop equity when a cell is selected.
 
 ### solve-postflop
 
-Build a postflop abstraction and save it as a reusable bundle. Use `postflop_model_path` in preflop training configs to load a pre-built bundle instead of rebuilding each time.
+Build a postflop abstraction and save it as a reusable bundle. The resulting bundle is referenced by `postflop_model_path` in preflop training configs.
 
 ```bash
-# Build a postflop bundle from a training config
+# Build a postflop bundle from a postflop config
 cargo run -p poker-solver-trainer --release -- solve-postflop \
-  -c sample_configurations/preflop_medium.yaml -o postflop_models/medium
+  -c sample_configurations/minimal_postflop.yaml -o postflop_models/medium
 
 # Then reference it in preflop training:
 # postflop_model_path: postflop_models/medium
 ```
 
 Options:
-- `-c, --config <FILE>` -- YAML config file (reads the `postflop_model` section)
+- `-c, --config <FILE>` -- YAML config file with a top-level `postflop_model` section (see `minimal_postflop.yaml`)
 - `-o, --output <DIR>` -- Output directory for the postflop bundle
 
 The bundle directory contains:
@@ -131,16 +125,16 @@ cargo run -p poker-solver-trainer --release -- diag-buckets -c config.yaml --jso
 ```
 
 Options:
-- `-c, --config <FILE>` -- YAML config (same format as solve-preflop)
+- `-c, --config <FILE>` -- YAML config with a `postflop_model` section (same format as solve-postflop)
 - `--cache-dir <DIR>` -- Abstraction cache directory (default: `cache/postflop`)
 - `--json` -- Output as JSON
 
 ### trace-hand
 
-Trace all 169 hands through the full postflop pipeline:
+Trace all 169 hands through the full postflop pipeline. Config uses the same format as `solve-postflop` (top-level `postflop_model` section):
 
 ```bash
-cargo run -p poker-solver-trainer --release -- trace-hand -c config.yaml
+cargo run -p poker-solver-trainer --release -- trace-hand -c sample_configurations/minimal_postflop.yaml
 ```
 
 ### generate-deals
@@ -212,9 +206,12 @@ Spot notation: `SB AA` (SB root), `BB.R AKs` (BB facing raise), `BB.C JTs` (BB a
 
 ## Preflop Config (solve-preflop)
 
-The preflop solver uses a YAML config with game structure and DCFR parameters. See `sample_configurations/preflop_medium.yaml` for a complete example.
+The preflop solver uses a YAML config with game structure, DCFR parameters, and a reference to a pre-built postflop bundle. See `sample_configurations/minimal_preflop.yaml` for a minimal example.
 
 ```yaml
+# Path to a pre-built postflop bundle (required — build with solve-postflop)
+postflop_model_path: postflop_models/medium
+
 iterations: 10000                   # number of LCFR iterations to run
 equity_samples: 10000               # Monte Carlo samples per hand matchup for equity table (0=uniform)
 print_every: 1000                   # print strategy matrices every N iterations (0=only at end)
@@ -241,38 +238,7 @@ dcfr_alpha: 1.5                     # positive regret discount exponent
 dcfr_beta: 0.5                      # negative regret discount exponent
 dcfr_gamma: 2.0                     # strategy sum discount exponent
 exploration: 0.05                   # epsilon-greedy exploration rate
-
-# Postflop model: either inline config or pre-built bundle path
-# Option A: reference a pre-built bundle (skips postflop build)
-# postflop_model_path: postflop_models/medium
-# Option B: build inline (existing behavior)
-postflop_model:
-  solve_type: mccfr                 # backend: "mccfr" (sampled) or "exhaustive" (full traversal)
-
-  max_flop_boards: 0                # canonical flops to solve; 0 = all ~1,755; lower = faster
-  # fixed_flops: ['AhKsQd']        # explicit flop boards (overrides max_flop_boards)
-
-  bet_sizes: [0.5, 1.0, 2.0]       # pot-fraction bet sizes for the postflop tree
-  max_raises_per_street: 1          # raise cap per postflop street
-  postflop_sprs: [3.5]             # stack-to-pot ratio(s) for the postflop tree; scalar also accepted
-
-  postflop_solve_iterations: 1000   # CFR/MCCFR iterations per flop
-  cfr_convergence_threshold: 0.01   # per-flop early-stop threshold (strategy delta or exploitability)
-
-  # MCCFR-specific (only when solve_type: mccfr)
-  mccfr_sample_pct: 0.01           # fraction of deal space sampled per iteration
-  value_extraction_samples: 10000   # Monte Carlo samples for post-convergence EV extraction
-  ev_convergence_threshold: 0.001   # weighted-avg delta threshold for early-stop EV estimation
 ```
-
-### Postflop Model Presets
-
-| Preset | Backend | Max boards | Sample % | Iterations | Use case |
-|-|-|-|-|-|-|
-| `fast` | mccfr | 10 | 5% | 100 | Quick testing (~1 min) |
-| `standard` | mccfr | all | 1% | 500 | Balanced accuracy and speed |
-| `exhaustive_fast` | exhaustive | 10 | -- | 200 | Quick exhaustive CFR testing |
-| `exhaustive_standard` | exhaustive | all | -- | 1000 | Full exhaustive CFR |
 
 ### Convergence Metrics
 
@@ -283,9 +249,23 @@ Both metrics are printed every `print_every` iterations:
 
 Set `checkpoint_every` to save intermediate strategy bundles at regular intervals (e.g. every 5000 iterations). Each checkpoint is saved to `{output}/checkpoint_{iteration}/` in the same format as the final bundle.
 
-The `max_flop_boards` parameter controls how many canonical flop textures are solved. Lower values dramatically speed up training. Set to `0` (or omit) to use all ~1,755 canonical flops.
+---
 
-The `postflop_sprs` field accepts a scalar or list of SPR values for the shared postflop tree (replaces `postflop_spr`; scalar values are auto-wrapped for backward compatibility).
+## Postflop Config (solve-postflop)
+
+The `solve-postflop` command reads a standalone YAML config with a top-level `postflop_model` section. See `sample_configurations/minimal_postflop.yaml` for a minimal example.
+
+```yaml
+postflop_model:
+  solve_type: exhaustive
+  fixed_flops: ['AhKsQd', '2c3h4d']
+  bet_sizes: [0.5, 1.0]
+  max_raises_per_street: 2
+  postflop_solve_iterations: 500
+  value_extraction_samples: 5
+  cfr_convergence_threshold: 200
+  ev_convergence_threshold: 0.5
+```
 
 ### Postflop Model Parameters
 
@@ -474,6 +454,8 @@ my_strategy/
 
 | Config | Purpose |
 |-|-|
+| `sample_configurations/minimal_postflop.yaml` | Minimal postflop-only config (2 flops, fast smoke test) |
+| `sample_configurations/minimal_preflop.yaml` | Minimal preflop config referencing a postflop bundle |
 | `sample_configurations/preflop_medium.yaml` | HU 25BB preflop solve with standard MCCFR postflop model |
 | `sample_configurations/fast_buckets.yaml` | Quick MCCFR postflop test |
 | `sample_configurations/mccfr_smoke.yaml` | MCCFR smoke test (single flop, fast) |
