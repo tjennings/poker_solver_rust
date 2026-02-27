@@ -93,6 +93,39 @@ const SUIT_SYMBOLS: Record<string, string> = {
 // Color utilities for action probabilities.
 // Bet/raise actions use a graduated red scale: lightest for the smallest
 // bet size, darkest for all-in.
+// Format a postflop EV value (in pot fractions, where 1.0 = the initial pot).
+// Display as percentage of pot: +10.5% means hero profits 10.5% of the pot.
+function formatEV(potFraction: number): string {
+  const pct = potFraction * 100;
+  const sign = pct >= 0 ? '+' : '';
+  return `${sign}${pct.toFixed(1)}%`;
+}
+
+// Order aggressive actions: sized raises (smallest → largest), then all-in last.
+function sortedBetActions(actions: ActionInfo[]): ActionInfo[] {
+  const raises = actions.filter((a) => a.action_type === 'bet' || a.action_type === 'raise');
+  const allins = actions.filter((a) => a.action_type === 'allin');
+  return [...raises, ...allins];
+}
+
+// Return indices into the actions array in display order: fold, check/call, raises by size, all-in last.
+function displayOrderIndices(actions: ActionInfo[]): number[] {
+  const passive: number[] = [];
+  const raises: number[] = [];
+  const allins: number[] = [];
+  actions.forEach((a, i) => {
+    if (a.action_type === 'fold' || a.action_type === 'check' || a.action_type === 'call') passive.push(i);
+    else if (a.action_type === 'allin') allins.push(i);
+    else raises.push(i);
+  });
+  return [...passive, ...raises, ...allins];
+}
+
+// Display order: fold, check/call, sized raises, all-in last.
+function displayOrderActions(actions: ActionInfo[]): ActionInfo[] {
+  return displayOrderIndices(actions).map((i) => actions[i]);
+}
+
 function getActionColor(action: ActionInfo, actions: ActionInfo[]): string {
   switch (action.action_type) {
     case 'fold':
@@ -103,12 +136,10 @@ function getActionColor(action: ActionInfo, actions: ActionInfo[]): string {
     case 'bet':
     case 'raise':
     case 'allin': {
-      const betActions = actions.filter((a) =>
-        a.action_type === 'bet' || a.action_type === 'raise' || a.action_type === 'allin',
-      );
-      const idx = betActions.findIndex((a) => a.id === action.id);
-      const count = betActions.length;
-      // Lightest (t=0) → darkest (t=1)
+      const ordered = sortedBetActions(actions);
+      const idx = ordered.findIndex((a) => a.id === action.id);
+      const count = ordered.length;
+      // Lightest (t=0) → darkest (t=1), all-in always darkest
       const t = count > 1 ? idx / (count - 1) : 1;
       // Interpolate from light red (255, 180, 180) to dark red (153, 27, 27)
       const r = Math.round(255 - t * (255 - 153));
@@ -184,9 +215,10 @@ function CellDetail({
     <div className="cell-detail">
       <div className="cell-detail-header">{cell.hand}</div>
       <div className="cell-detail-actions">
-        {cell.probabilities.map((prob, idx) => {
+        {displayOrderIndices(actions).map((idx) => {
+          const prob = cell.probabilities[idx];
           const action = actions[idx];
-          if (!action) return null;
+          if (!action || !prob) return null;
           const pct = prob.probability * 100;
           return (
             <div key={action.id} className="cell-detail-row">
@@ -300,7 +332,7 @@ function ActionBlock({
         <span className="stack">{stack}BB</span>
       </div>
       <div className="action-list">
-        {actions.map((action) => {
+        {displayOrderActions(actions).map((action) => {
           const color = getActionColor(action, actions);
           return (
             <button
@@ -552,6 +584,7 @@ export default function Explorer() {
   const [handResult, setHandResult] = useState<{ type: 'fold' | 'showdown'; pot: number } | null>(null);
   const [comboInfo, setComboInfo] = useState<ComboGroupInfo | null>(null);
   const [handEquity, setHandEquity] = useState<HandEquity | null>(null);
+  const [villainHand, setVillainHand] = useState('AA');
   const [threshold, setThreshold] = useState(2);
   const [remapInfo, setRemapInfo] = useState<{
     original: string[];
@@ -611,10 +644,13 @@ export default function Explorer() {
       return;
     }
 
-    invoke<HandEquity | null>('get_hand_equity', { hand: cell.hand })
+    invoke<HandEquity | null>('get_hand_equity', {
+      hand: cell.hand,
+      villain_hand: villainHand || null,
+    })
       .then(setHandEquity)
       .catch(() => setHandEquity(null));
-  }, [matrix, selectedCell, bundleInfo]);
+  }, [matrix, selectedCell, bundleInfo, villainHand]);
 
   const loadSource = useCallback(
     async (path: string) => {
@@ -1157,20 +1193,54 @@ export default function Explorer() {
                   )}
                   {handEquity && (
                     <div className="hand-equity-panel">
-                      <div className="cell-detail-header">Avg Postflop EV</div>
+                      <div className="cell-detail-header">Postflop EV (% of pot)</div>
                       <div className="hand-equity-rows">
+                        <div className="hand-equity-subheader">vs Range</div>
                         <div className="hand-equity-row">
                           <span className="hand-equity-label">As SB</span>
-                          <span className="hand-equity-value">{(handEquity.ev_pos0 * 100).toFixed(1)}%</span>
+                          <span className="hand-equity-value">{formatEV(handEquity.ev_pos0)}</span>
                         </div>
                         <div className="hand-equity-row">
                           <span className="hand-equity-label">As BB</span>
-                          <span className="hand-equity-value">{(handEquity.ev_pos1 * 100).toFixed(1)}%</span>
+                          <span className="hand-equity-value">{formatEV(handEquity.ev_pos1)}</span>
                         </div>
                         <div className="hand-equity-row hand-equity-avg">
                           <span className="hand-equity-label">Average</span>
-                          <span className="hand-equity-value">{(handEquity.ev_avg * 100).toFixed(1)}%</span>
+                          <span className="hand-equity-value">{formatEV(handEquity.ev_avg)}</span>
                         </div>
+                      </div>
+                      <div className="hand-equity-vs-hand">
+                        <div className="hand-equity-subheader">
+                          vs
+                          <input
+                            type="text"
+                            className="villain-hand-input"
+                            value={villainHand}
+                            onChange={(e) => setVillainHand(e.target.value.toUpperCase())}
+                            placeholder="AA"
+                            maxLength={3}
+                          />
+                        </div>
+                        {handEquity.ev_vs_hand ? (
+                          <div className="hand-equity-rows">
+                            <div className="hand-equity-row">
+                              <span className="hand-equity-label">As SB</span>
+                              <span className="hand-equity-value">{formatEV(handEquity.ev_vs_hand.ev_pos0)}</span>
+                            </div>
+                            <div className="hand-equity-row">
+                              <span className="hand-equity-label">As BB</span>
+                              <span className="hand-equity-value">{formatEV(handEquity.ev_vs_hand.ev_pos1)}</span>
+                            </div>
+                            <div className="hand-equity-row hand-equity-avg">
+                              <span className="hand-equity-label">Average</span>
+                              <span className="hand-equity-value">{formatEV(handEquity.ev_vs_hand.ev_avg)}</span>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="hand-equity-row">
+                            <span className="hand-equity-label" style={{ color: '#666' }}>Invalid hand</span>
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
