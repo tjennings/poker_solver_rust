@@ -215,56 +215,52 @@ Spot notation: `SB AA` (SB root), `BB.R AKs` (BB facing raise), `BB.C JTs` (BB a
 The preflop solver uses a YAML config with game structure and DCFR parameters. See `sample_configurations/preflop_medium.yaml` for a complete example.
 
 ```yaml
-# Training
-iterations: 10000
-equity_samples: 10000
-print_every: 1000
+iterations: 10000                   # number of LCFR iterations to run
+equity_samples: 10000               # Monte Carlo samples per hand matchup for equity table (0=uniform)
+print_every: 1000                   # print strategy matrices every N iterations (0=only at end)
 preflop_exploitability_threshold_mbb: 25  # early-stop when exploitability drops below this (mBB/hand)
 # checkpoint_every: 5000           # save intermediate bundles every N iterations
 
 # Game structure (internal units: SB=1, BB=2)
-positions:
-  - { name: Small Blind, short_name: SB }
-  - { name: Big Blind, short_name: BB }
-blinds:
-  - [0, 1]   # SB posts 1
-  - [1, 2]   # BB posts 2
-stacks: [50, 50]  # 25BB x 2
+positions:                          # ordered list of seats; index determines blind/stack mapping
+  - { name: Small Blind, short_name: SB }   # position 0
+  - { name: Big Blind, short_name: BB }      # position 1
+blinds:                             # [position_index, amount] pairs
+  - [0, 1]                         # position 0 (SB) posts 1 unit
+  - [1, 2]                         # position 1 (BB) posts 2 units
+stacks: [50, 50]                    # per-position starting stacks in SB units; index matches positions above
+                                    # here: both SB and BB start with 50 units = 25 BB each
 
-raise_sizes:
-  - [2.5]    # open raise
-  - [3.0]    # 3-bet
-raise_cap: 4
+raise_sizes:                        # raise multipliers indexed by raise depth
+  - [2.5]                          # depth 0 (open raise): 2.5x the current bet
+  - [3.0]                          # depth 1 (3-bet): 3.0x
+raise_cap: 4                        # max number of raises allowed per round
 
-# DCFR discounting
-dcfr_alpha: 1.5
-dcfr_beta: 0.5
-dcfr_gamma: 2.0
-exploration: 0.05
+# DCFR discounting (ignored when cfr_variant is vanilla or cfrplus)
+dcfr_alpha: 1.5                     # positive regret discount exponent
+dcfr_beta: 0.5                      # negative regret discount exponent
+dcfr_gamma: 2.0                     # strategy sum discount exponent
+exploration: 0.05                   # epsilon-greedy exploration rate
 
 # Postflop model: either inline config or pre-built bundle path
 # Option A: reference a pre-built bundle (skips postflop build)
 # postflop_model_path: postflop_models/medium
 # Option B: build inline (existing behavior)
 postflop_model:
-  # Backend selection: "mccfr" (default) or "exhaustive"
-  solve_type: mccfr
+  solve_type: mccfr                 # backend: "mccfr" (sampled) or "exhaustive" (full traversal)
 
-  # Flop board selection
-  max_flop_boards: 0              # 0 = all ~1,755 canonical flops; lower = faster
-  # fixed_flops: ['AhKsQd']      # explicit flops (overrides max_flop_boards)
+  max_flop_boards: 0                # canonical flops to solve; 0 = all ~1,755; lower = faster
+  # fixed_flops: ['AhKsQd']        # explicit flop boards (overrides max_flop_boards)
 
-  # Tree structure
-  bet_sizes: [0.5, 1.0, 2.0]
-  max_raises_per_street: 1
-  postflop_sprs: [3.5]            # SPR(s) for shared postflop tree (scalar also accepted)
+  bet_sizes: [0.5, 1.0, 2.0]       # pot-fraction bet sizes for the postflop tree
+  max_raises_per_street: 1          # raise cap per postflop street
+  postflop_sprs: [3.5]             # stack-to-pot ratio(s) for the postflop tree; scalar also accepted
 
-  # Solve parameters
-  postflop_solve_iterations: 1000
-  cfr_convergence_threshold: 0.01  # early-stop per-flop CFR (mccfr: strategy delta; exhaustive: exploitability)
+  postflop_solve_iterations: 1000   # CFR/MCCFR iterations per flop
+  cfr_convergence_threshold: 0.01   # per-flop early-stop threshold (strategy delta or exploitability)
 
   # MCCFR-specific (only when solve_type: mccfr)
-  mccfr_sample_pct: 0.01         # fraction of deal space sampled per iteration
+  mccfr_sample_pct: 0.01           # fraction of deal space sampled per iteration
   value_extraction_samples: 10000   # Monte Carlo samples for post-convergence EV extraction
   ev_convergence_threshold: 0.001   # weighted-avg delta threshold for early-stop EV estimation
 ```
@@ -359,23 +355,23 @@ Training configs have `game` and `training` sections.
 
 ```yaml
 game:
-  stack_depth: 100
-  bet_sizes: [0.33, 0.67, 1.0, 2.0, 3.0]
-  max_raises_per_street: 3
+  stack_depth: 100                  # effective stack in BB (stacks = stack_depth × 2 SB units)
+  bet_sizes: [0.33, 0.67, 1.0, 2.0, 3.0]  # pot-fraction bet sizes available postflop
+  max_raises_per_street: 3          # raise cap per postflop street
 ```
 
 ### Training Settings
 
 ```yaml
 training:
-  iterations: 5000
-  seed: 42
-  output_dir: "./my_strategy"
-  mccfr_samples: 5000
-  deal_count: 50000
-  abstraction_mode: hand_class_v2
-  strength_bits: 4
-  equity_bits: 4
+  iterations: 5000                  # number of CFR iterations to run
+  seed: 42                          # RNG seed for reproducibility
+  output_dir: "./my_strategy"       # where to save the trained strategy bundle
+  mccfr_samples: 5000              # deals sampled per MCCFR iteration
+  deal_count: 50000                 # total pre-generated deals in the deal pool
+  abstraction_mode: hand_class_v2   # info set abstraction: hand_class, hand_class_v2, or ehs2
+  strength_bits: 4                  # intra-class strength resolution (0-4 bits; hand_class_v2 only)
+  equity_bits: 4                    # equity bucket resolution (0-4 bits; hand_class_v2 only)
 ```
 
 ### Abstraction Modes
