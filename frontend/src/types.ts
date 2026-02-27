@@ -73,11 +73,20 @@ export interface ComboGroupInfo {
   stack_bucket: number;
 }
 
+// Villain-specific matchup EV
+export interface MatchupEquity {
+  villain_hand: string;
+  ev_pos0: number;
+  ev_pos1: number;
+  ev_avg: number;
+}
+
 // Hand equity from postflop bundle
 export interface HandEquity {
   ev_pos0: number;
   ev_pos1: number;
   ev_avg: number;
+  ev_vs_hand: MatchupEquity | null;
 }
 
 // Board canonicalization result
