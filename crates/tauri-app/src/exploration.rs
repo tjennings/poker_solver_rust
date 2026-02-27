@@ -255,16 +255,23 @@ pub async fn load_bundle_core(
             let preflop = poker_solver_core::preflop::PreflopBundle::load(&bp)
                 .map_err(|e| format!("Failed to load preflop bundle: {e}"))?;
 
-            // Try loading companion postflop bundle for hand equity data.
-            let postflop_dir = bp.join("postflop");
-            let hand_avg_values =
+            // Hand-averaged EV table: prefer PreflopBundle's embedded copy,
+            // fall back to postflop/ subdirectory, then co-located solve.bin.
+            let hand_avg_values = preflop.hand_avg_values.clone().or_else(|| {
+                // Fallback 1: postflop/ subdirectory (older training layout)
+                let postflop_dir = bp.join("postflop");
                 if poker_solver_core::preflop::PostflopBundle::exists(&postflop_dir) {
-                    poker_solver_core::preflop::PostflopBundle::load(&postflop_dir)
+                    return poker_solver_core::preflop::PostflopBundle::load(&postflop_dir)
                         .ok()
-                        .map(|b| b.hand_avg_values().to_vec())
-                } else {
-                    None
-                };
+                        .map(|b| b.hand_avg_values().to_vec());
+                }
+                // Fallback 2: solve.bin at root (solve-postflop output co-located with preflop)
+                let solve_bin = bp.join("solve.bin");
+                if solve_bin.exists() {
+                    return poker_solver_core::preflop::PostflopBundle::load_hand_avg_values(&solve_bin).ok();
+                }
+                None
+            });
 
             Ok::<_, String>((preflop, hand_avg_values))
         })
@@ -808,10 +815,7 @@ fn walk_preflop_tree_with_state(
             }
         };
 
-        let target_action = parse_preflop_action(action_str);
-        let child_pos = action_labels
-            .iter()
-            .position(|a| preflop_action_matches(a, &target_action))
+        let child_pos = find_action_position(action_str, action_labels)
             .ok_or_else(|| {
                 format!(
                     "Action '{action_str}' not available at node {node_idx}. \
@@ -873,36 +877,39 @@ fn walk_preflop_tree_with_state(
     })
 }
 
-/// Parse a history action string into a `PreflopAction` for matching.
-fn parse_preflop_action(s: &str) -> poker_solver_core::preflop::PreflopAction {
+/// Find the position of a history action string within the node's action labels.
+///
+/// For raise actions with `r:{idx}` format, uses the index directly to select
+/// the correct raise among multiple raise sizes at the same node.
+fn find_action_position(
+    action_str: &str,
+    action_labels: &[poker_solver_core::preflop::PreflopAction],
+) -> Option<usize> {
     use poker_solver_core::preflop::PreflopAction;
-    if s == "f" || s == "fold" {
-        PreflopAction::Fold
-    } else if s == "c" || s == "call" || s == "x" || s == "check" {
-        PreflopAction::Call
-    } else if s.starts_with("r:A") || s.starts_with("raise:A") || s.starts_with("b:A") || s.starts_with("bet:A") {
-        PreflopAction::AllIn
-    } else if s.starts_with("r:") || s.starts_with("raise:") || s.starts_with("b:") || s.starts_with("bet:") {
-        // Any raise maps to the tree raise action
-        PreflopAction::Raise(poker_solver_core::preflop::RaiseSize::Bb(0.0)) // size doesn't matter for matching
-    } else {
-        PreflopAction::Call // fallback
-    }
-}
 
-/// Check if a tree action matches a parsed action (ignoring raise size).
-fn preflop_action_matches(
-    tree_action: &poker_solver_core::preflop::PreflopAction,
-    target: &poker_solver_core::preflop::PreflopAction,
-) -> bool {
-    use poker_solver_core::preflop::PreflopAction;
-    matches!(
-        (tree_action, target),
-        (PreflopAction::Fold, PreflopAction::Fold)
-            | (PreflopAction::Call, PreflopAction::Call)
-            | (PreflopAction::AllIn, PreflopAction::AllIn)
-            | (PreflopAction::Raise(_), PreflopAction::Raise(_))
-    )
+    if action_str == "f" || action_str == "fold" {
+        return action_labels.iter().position(|a| matches!(a, PreflopAction::Fold));
+    }
+    if action_str == "c" || action_str == "call" || action_str == "x" || action_str == "check" {
+        return action_labels.iter().position(|a| matches!(a, PreflopAction::Call));
+    }
+
+    // Extract the suffix after the first ':'
+    let suffix = action_str.split(':').nth(1).unwrap_or("");
+
+    if suffix == "A" {
+        // All-in
+        return action_labels.iter().position(|a| matches!(a, PreflopAction::AllIn));
+    }
+
+    // Raise with index — r:{idx} where idx is the position in the action_labels array
+    if let Ok(idx) = suffix.parse::<usize>() {
+        if idx < action_labels.len() && matches!(action_labels[idx], PreflopAction::Raise(_)) {
+            return Some(idx);
+        }
+    }
+
+    None
 }
 
 /// Build an `ActionInfo` from a preflop tree action.
@@ -1054,24 +1061,37 @@ pub fn get_bundle_info(state: State<'_, ExplorationState>) -> Result<BundleInfo,
     get_bundle_info_core(&state)
 }
 
-/// Per-hand postflop equity data returned by `get_hand_equity`.
+/// EV for a specific hero-vs-villain matchup.
 #[derive(Debug, Clone, Serialize)]
-pub struct HandEquity {
-    /// Average postflop EV fraction when hero is position 0 (SB).
+pub struct MatchupEquity {
+    pub villain_hand: String,
     pub ev_pos0: f64,
-    /// Average postflop EV fraction when hero is position 1 (BB).
     pub ev_pos1: f64,
-    /// Overall average across both positions.
     pub ev_avg: f64,
 }
 
-/// Return the average postflop equity for a canonical hand (e.g. "AKs", "QQ", "72o").
+/// Per-hand postflop equity data returned by `get_hand_equity`.
+#[derive(Debug, Clone, Serialize)]
+pub struct HandEquity {
+    /// Average postflop EV (pot fractions) when hero is position 0 (SB).
+    pub ev_pos0: f64,
+    /// Average postflop EV (pot fractions) when hero is position 1 (BB).
+    pub ev_pos1: f64,
+    /// Overall average across both positions (pot fractions).
+    pub ev_avg: f64,
+    /// Optional matchup EV against a specific villain hand.
+    pub ev_vs_hand: Option<MatchupEquity>,
+}
+
+/// Return the average postflop EV for a canonical hand (e.g. "AKs", "QQ", "72o").
 ///
-/// Averages the hand-averaged EV across all opponents. Returns `None` if no
+/// Returns pot-fraction EV (where 1.0 = the initial postflop pot) averaged
+/// uniformly across all 169 opponent hands. Returns `None` if no
 /// postflop data is loaded or the hand string is unrecognised.
 pub fn get_hand_equity_core(
     state: &ExplorationState,
     hand: &str,
+    villain_hand: Option<&str>,
 ) -> Result<Option<HandEquity>, String> {
     let hand_index = match canonical_hand_index_from_str(hand) {
         Some(idx) => idx as usize,
@@ -1098,10 +1118,11 @@ pub fn get_hand_equity_core(
         return Ok(None);
     }
 
-    // Average EV across all opponent hands for each position.
+    // Average EV (pot fractions) across all opponent hands for each position.
     let avg_for_pos = |pos: usize| -> f64 {
         let base = pos * n * n + hand_index * n;
-        let sum: f64 = hand_avg[base..base + n].iter().sum();
+        let slice = &hand_avg[base..base + n];
+        let sum: f64 = slice.iter().sum();
         sum / n as f64
     };
 
@@ -1109,7 +1130,20 @@ pub fn get_hand_equity_core(
     let ev_pos1 = avg_for_pos(1);
     let ev_avg = (ev_pos0 + ev_pos1) / 2.0;
 
-    Ok(Some(HandEquity { ev_pos0, ev_pos1, ev_avg }))
+    let ev_vs_hand = villain_hand.and_then(|vh| {
+        let v_idx = canonical_hand_index_from_str(vh)? as usize;
+        if v_idx >= n { return None; }
+        let vp0 = hand_avg[0 * n * n + hand_index * n + v_idx];
+        let vp1 = hand_avg[1 * n * n + hand_index * n + v_idx];
+        Some(MatchupEquity {
+            villain_hand: vh.to_string(),
+            ev_pos0: vp0,
+            ev_pos1: vp1,
+            ev_avg: (vp0 + vp1) / 2.0,
+        })
+    });
+
+    Ok(Some(HandEquity { ev_pos0, ev_pos1, ev_avg, ev_vs_hand }))
 }
 
 /// Get postflop equity for a canonical hand (Tauri wrapper).
@@ -1117,8 +1151,9 @@ pub fn get_hand_equity_core(
 pub fn get_hand_equity(
     state: State<'_, ExplorationState>,
     hand: String,
+    villain_hand: Option<String>,
 ) -> Result<Option<HandEquity>, String> {
-    get_hand_equity_core(&state, &hand)
+    get_hand_equity_core(&state, &hand, villain_hand.as_deref())
 }
 
 /// Computation progress status.
@@ -2676,8 +2711,8 @@ mod tests {
     fn walk_preflop_tree_raise_tracks_state() {
         let config = poker_solver_core::preflop::PreflopConfig::heads_up(50);
         let tree = poker_solver_core::preflop::PreflopTree::build(&config);
-        // SB raises (action index varies by config, use "r:0" format)
-        let history = vec!["r:0".to_string()];
+        // SB raises — Raise(2.5) is at index 3: [Fold, Call, AllIn, Raise(2.5)]
+        let history = vec!["r:3".to_string()];
         let walk = walk_preflop_tree_with_state(&config, &tree, &history)
             .expect("should walk raise history");
         // After SB raise: pot should be > 3, SB stack should decrease
