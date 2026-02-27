@@ -51,9 +51,9 @@ cfr_variant: dcfr
 
 postflop_model:
   solve_type: exhaustive
-  bet_sizes: [0.5, 1.0, 2.0]
-  max_raises_per_street: 2
-  postflop_solve_iterations: 1000
+  bet_sizes: [0.3, 0.5, 1.0, 1.5]
+  max_raises_per_street: 3
+  postflop_sprs: [2, 6, 20] # captures roughly rfi > call, 3-bet, 4-bet SPRs against a 100bb stack
   value_extraction_samples: 20000
-  cfr_convergence_threshold: 250
+  cfr_convergence_threshold: 50
   ev_convergence_threshold: 0.5
