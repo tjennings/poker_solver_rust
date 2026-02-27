@@ -4,7 +4,8 @@
 //! ```text
 //! preflop_bundle/
 //! ├── config.yaml      # Human-readable PreflopConfig
-//! └── strategy.bin     # Bincode-serialized PreflopStrategy
+//! ├── strategy.bin     # Bincode-serialized PreflopStrategy
+//! └── ev_table.bin     # Optional: bincode-serialized hand_avg_values (Vec<f64>)
 //! ```
 
 use std::fs;
@@ -18,13 +19,26 @@ use super::solver::PreflopStrategy;
 pub struct PreflopBundle {
     pub config: PreflopConfig,
     pub strategy: PreflopStrategy,
+    /// Optional hand-averaged EV table from postflop model.
+    /// Layout: `[pos0: 169×169, pos1: 169×169]` — pot-fraction units.
+    pub hand_avg_values: Option<Vec<f64>>,
 }
 
 impl PreflopBundle {
     /// Create a new bundle from a config and a trained strategy.
     #[must_use]
     pub fn new(config: PreflopConfig, strategy: PreflopStrategy) -> Self {
-        Self { config, strategy }
+        Self { config, strategy, hand_avg_values: None }
+    }
+
+    /// Create a bundle with an optional EV table.
+    #[must_use]
+    pub fn with_ev_table(
+        config: PreflopConfig,
+        strategy: PreflopStrategy,
+        hand_avg_values: Option<Vec<f64>>,
+    ) -> Self {
+        Self { config, strategy, hand_avg_values }
     }
 
     /// Save the bundle to a directory (created if needed).
@@ -40,6 +54,11 @@ impl PreflopBundle {
 
         let strategy_bytes = bincode::serialize(&self.strategy).map_err(std::io::Error::other)?;
         fs::write(dir.join("strategy.bin"), strategy_bytes)?;
+
+        if let Some(ref ev) = self.hand_avg_values {
+            let ev_bytes = bincode::serialize(ev).map_err(std::io::Error::other)?;
+            fs::write(dir.join("ev_table.bin"), ev_bytes)?;
+        }
 
         Ok(())
     }
@@ -58,7 +77,17 @@ impl PreflopBundle {
         let strategy: PreflopStrategy =
             bincode::deserialize(&strategy_bytes).map_err(std::io::Error::other)?;
 
-        Ok(Self { config, strategy })
+        let hand_avg_values = {
+            let ev_path = dir.join("ev_table.bin");
+            if ev_path.exists() {
+                let ev_bytes = fs::read(&ev_path)?;
+                Some(bincode::deserialize(&ev_bytes).map_err(std::io::Error::other)?)
+            } else {
+                None
+            }
+        };
+
+        Ok(Self { config, strategy, hand_avg_values })
     }
 
     /// Check whether a directory contains a complete bundle.
@@ -119,5 +148,39 @@ mod tests {
     fn preflop_bundle_exists_false_for_missing() {
         let dir = TempDir::new().unwrap();
         assert!(!PreflopBundle::exists(&dir.path().join("nonexistent")));
+    }
+
+    #[timed_test]
+    fn preflop_bundle_ev_table_roundtrip() {
+        let config = tiny_config();
+        let mut solver = PreflopSolver::new(&config);
+        solver.train(1);
+        let strategy = solver.strategy();
+        let ev_data = vec![0.1_f64, 0.2, 0.3];
+        let bundle = PreflopBundle::with_ev_table(config, strategy, Some(ev_data.clone()));
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ev_test");
+        bundle.save(&path).unwrap();
+        assert!(path.join("ev_table.bin").exists());
+
+        let loaded = PreflopBundle::load(&path).unwrap();
+        assert_eq!(loaded.hand_avg_values.as_ref().unwrap(), &ev_data);
+    }
+
+    #[timed_test]
+    fn preflop_bundle_no_ev_table_backward_compat() {
+        let config = tiny_config();
+        let mut solver = PreflopSolver::new(&config);
+        solver.train(1);
+        let bundle = PreflopBundle::new(config, solver.strategy());
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("no_ev_test");
+        bundle.save(&path).unwrap();
+        assert!(!path.join("ev_table.bin").exists());
+
+        let loaded = PreflopBundle::load(&path).unwrap();
+        assert!(loaded.hand_avg_values.is_none());
     }
 }
