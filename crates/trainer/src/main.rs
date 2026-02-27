@@ -1190,7 +1190,7 @@ fn run_solve_preflop(
         }
     }
     if let Some(abstraction) = postflop {
-        solver.attach_postflop(abstraction, &config);
+        solver.attach_postflop(vec![abstraction], &config);
     }
 
     print_preflop_matrices(&solver.strategy(), &tree, bb_node, bb_call_node, 0, claude_debug);
