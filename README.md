@@ -90,7 +90,7 @@ poker_solver_rust/
 
 - **[Training Reference](docs/training.md)** — Config options, abstraction modes, solver backends, pruning, convergence
 - **[Strategy Explorer](docs/explorer.md)** — Desktop app usage guide
-- **[CLI Reference](docs/cli.md)** — All trainer subcommands: `tree`, `inspect-deals`, `generate-deals`, `flops`, `trace-lhe`, benchmarks
+- **[CLI Reference](docs/cli.md)** — All trainer subcommands: `tree`, `inspect-deals`, `generate-deals`, `flops`, benchmarks
 
 ## License
 

@@ -80,7 +80,7 @@ cargo run -p poker-solver-trainer --release -- train -c config.yaml -t 4  # limi
 Options:
 - `-c, --config <FILE>` -- Training config YAML
 - `-t, --threads <N>` -- Thread count (default: all cores)
-- `--solver <MODE>` -- Backend: `mccfr` (default), `sequence`, `gpu`, `sd-cfr`
+- `--solver <MODE>` -- Backend: `mccfr` (default), `sequence`, `gpu`
 
 ### tree
 
@@ -181,26 +181,6 @@ List all 1,755 canonical (suit-isomorphic) flops:
 cargo run -p poker-solver-trainer --release -- flops --format json --output flops.json
 cargo run -p poker-solver-trainer --release -- flops --format csv
 ```
-
-### eval-lhe
-
-Evaluate a trained LHE SD-CFR model (exploitability + strategy visualization):
-
-```bash
-cargo run -p poker-solver-trainer --release -- eval-lhe -d ./lhe_sdcfr
-cargo run -p poker-solver-trainer --release -- eval-lhe -d ./lhe_sdcfr --checkpoint lhe_checkpoint_100
-```
-
-### trace-lhe
-
-Trace strategy evolution across SD-CFR checkpoints:
-
-```bash
-cargo run -p poker-solver-trainer --release -- trace-lhe -d ./lhe_sdcfr \
-  --spot "SB AA" --spot "BB.R AKs"
-```
-
-Spot notation: `SB AA` (SB root), `BB.R AKs` (BB facing raise), `BB.C JTs` (BB after limp).
 
 ---
 
@@ -374,7 +354,6 @@ training:
 | `mccfr` | Large games, production training | Samples per iteration |
 | `sequence` | Small-medium games, exact convergence | Full traversal |
 | `gpu` | Same as sequence, faster on GPU | Full traversal on GPU |
-| `sd-cfr` | Neural network advantage estimation | SD-CFR checkpoints |
 
 ### Advanced Options
 

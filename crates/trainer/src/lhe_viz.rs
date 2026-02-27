@@ -8,21 +8,13 @@
 //! - Green = call
 //! - Yellow = raise/bet
 
-use poker_solver_core::game::{
-    Action, Game, LimitHoldem, LimitHoldemConfig, LimitHoldemState, Player,
-};
+#[cfg(test)]
+use poker_solver_core::game::Action;
 use poker_solver_core::hands::CanonicalHand;
-use poker_solver_core::poker::{Card, Suit, Value};
+use poker_solver_core::poker::Value;
 use poker_solver_core::preflop::{EquityTable, PreflopAction, PreflopNode, PreflopStrategy, PreflopTree};
 #[cfg(test)]
 use poker_solver_core::preflop::RaiseSize;
-use poker_solver_deep_cfr::eval::ExplicitPolicy;
-use poker_solver_deep_cfr::lhe_encoder::LheEncoder;
-use poker_solver_deep_cfr::traverse::StateEncoder;
-
-use rand::SeedableRng;
-use rand::prelude::SliceRandom;
-use rand::rngs::StdRng;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -95,227 +87,6 @@ fn hand_label(row: usize, col: usize) -> String {
         format!("{r1}{r2}s")
     } else {
         format!("{r1}{r2}o")
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Strategy computation
-// ---------------------------------------------------------------------------
-
-/// Configuration for computing a preflop strategy matrix.
-struct MatrixConfig<'a> {
-    policies: &'a [ExplicitPolicy; 2],
-    lhe_config: &'a LimitHoldemConfig,
-    board_samples: usize,
-    seed: u64,
-    target_player: Player,
-    preceding_action: Option<Action>,
-}
-
-/// Build the preflop RFI (raise first in) strategy matrix for SB.
-///
-/// At the preflop root, SB faces: Fold / Call / Raise.
-/// Averages over `board_samples` random boards for stability.
-pub fn preflop_rfi_matrix(
-    policies: &[ExplicitPolicy; 2],
-    lhe_config: &LimitHoldemConfig,
-    _num_actions: usize,
-    board_samples: usize,
-    seed: u64,
-) -> HandMatrix {
-    compute_preflop_matrix(&MatrixConfig {
-        policies,
-        lhe_config,
-        board_samples,
-        seed,
-        target_player: Player::Player1,
-        preceding_action: None,
-    })
-}
-
-/// Build the preflop response matrix for BB facing SB raise.
-///
-/// After SB raises, BB faces: Fold / Call / Raise(3-bet).
-/// Averages over `board_samples` random boards for stability.
-pub fn preflop_response_matrix(
-    policies: &[ExplicitPolicy; 2],
-    lhe_config: &LimitHoldemConfig,
-    _num_actions: usize,
-    board_samples: usize,
-    seed: u64,
-) -> HandMatrix {
-    compute_preflop_matrix(&MatrixConfig {
-        policies,
-        lhe_config,
-        board_samples,
-        seed,
-        target_player: Player::Player2,
-        preceding_action: Some(Action::Raise(0)),
-    })
-}
-
-/// Generic preflop matrix computation.
-///
-/// Creates deals with specific hole cards for the target player,
-/// optionally applies a preceding action, then queries the policy.
-fn compute_preflop_matrix(cfg: &MatrixConfig<'_>) -> HandMatrix {
-    let encoder = LheEncoder::new();
-    let game = LimitHoldem::new(cfg.lhe_config.clone(), 1, cfg.seed);
-    let mut matrix = std::array::from_fn(|_| std::array::from_fn(|_| None));
-
-    for (row, matrix_row) in matrix.iter_mut().enumerate() {
-        for (col, cell) in matrix_row.iter_mut().enumerate() {
-            *cell = Some(average_strategy_for_hand(&game, &encoder, cfg, row, col));
-        }
-    }
-
-    matrix
-}
-
-/// Average strategy for a specific hand (row, col) over random boards.
-fn average_strategy_for_hand(
-    game: &LimitHoldem,
-    encoder: &LheEncoder,
-    cfg: &MatrixConfig<'_>,
-    row: usize,
-    col: usize,
-) -> HandStrategy {
-    let hole = make_hole_cards(row, col);
-    let mut rng = StdRng::seed_from_u64(cfg.seed.wrapping_add(row as u64 * 13 + col as u64));
-    let deck = build_remaining_deck(&hole);
-
-    let mut fold_sum = 0.0f64;
-    let mut raise_sum = 0.0f64;
-    let mut count = 0;
-
-    for _ in 0..cfg.board_samples {
-        let board = sample_board(&deck, &mut rng);
-        let state = build_state(hole, board, cfg.target_player, cfg.lhe_config);
-
-        let state = match cfg.preceding_action {
-            Some(action) => game.next_state(&state, action),
-            None => state,
-        };
-
-        let pi = player_index(cfg.target_player);
-        let features = encoder.encode(&state, cfg.target_player);
-        let probs = match cfg.policies[pi].strategy(&features) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let actions = game.actions(&state);
-        let (f, _c, r) = classify_action_probs(&actions, &probs);
-        fold_sum += f64::from(f);
-        raise_sum += f64::from(r);
-        count += 1;
-    }
-
-    if count == 0 {
-        return HandStrategy {
-            fold: 1.0,
-            raises: vec![],
-        };
-    }
-
-    let n = count as f64;
-    HandStrategy {
-        fold: (fold_sum / n) as f32,
-        raises: vec![(raise_sum / n) as f32],
-    }
-}
-
-/// Create hole cards for a given matrix cell.
-fn make_hole_cards(row: usize, col: usize) -> [Card; 2] {
-    let rank1 = RANK_ORDER[row];
-    let rank2 = RANK_ORDER[col];
-    let is_suited = row < col;
-
-    let (suit1, suit2) = if is_suited {
-        (Suit::Spade, Suit::Spade)
-    } else {
-        // Pairs and offsuit both use different suits
-        (Suit::Spade, Suit::Heart)
-    };
-
-    [Card::new(rank1, suit1), Card::new(rank2, suit2)]
-}
-
-/// Build a state with specific hole cards for the target player.
-///
-/// Picks dummy opponent cards that don't collide with hole or board.
-fn build_state(
-    hole: [Card; 2],
-    board: [Card; 5],
-    target_player: Player,
-    config: &LimitHoldemConfig,
-) -> LimitHoldemState {
-    let dummy_opp = pick_dummy_opponent(&hole, &board);
-
-    match target_player {
-        Player::Player1 => {
-            LimitHoldemState::new_preflop(hole, dummy_opp, board, config.stack_depth)
-        }
-        Player::Player2 => {
-            LimitHoldemState::new_preflop(dummy_opp, hole, board, config.stack_depth)
-        }
-    }
-}
-
-/// Pick two cards that don't collide with hole cards or board.
-fn pick_dummy_opponent(hole: &[Card; 2], board: &[Card; 5]) -> [Card; 2] {
-    let used: std::collections::HashSet<Card> =
-        hole.iter().chain(board.iter()).copied().collect();
-    let mut dummy = Vec::with_capacity(2);
-    for card in poker_solver_core::poker::full_deck() {
-        if !used.contains(&card) {
-            dummy.push(card);
-            if dummy.len() == 2 {
-                break;
-            }
-        }
-    }
-    [dummy[0], dummy[1]]
-}
-
-/// Classify action probabilities into fold/call/raise buckets.
-fn classify_action_probs(actions: &[Action], probs: &[f32]) -> (f32, f32, f32) {
-    let mut fold = 0.0f32;
-    let mut call = 0.0f32;
-    let mut raise = 0.0f32;
-
-    for (i, &action) in actions.iter().enumerate() {
-        let p = if i < probs.len() { probs[i] } else { 0.0 };
-        match action {
-            Action::Fold => fold += p,
-            Action::Check | Action::Call => call += p,
-            Action::Bet(_) | Action::Raise(_) => raise += p,
-        }
-    }
-
-    (fold, call, raise)
-}
-
-/// Build a deck without the given hole cards.
-fn build_remaining_deck(hole: &[Card; 2]) -> Vec<Card> {
-    poker_solver_core::poker::full_deck()
-        .into_iter()
-        .filter(|c| *c != hole[0] && *c != hole[1])
-        .collect()
-}
-
-/// Sample 5 board cards from the remaining deck.
-fn sample_board(deck: &[Card], rng: &mut StdRng) -> [Card; 5] {
-    let mut pool = deck.to_vec();
-    pool.shuffle(rng);
-    [pool[0], pool[1], pool[2], pool[3], pool[4]]
-}
-
-/// Map Player enum to array index.
-const fn player_index(player: Player) -> usize {
-    match player {
-        Player::Player1 => 0,
-        Player::Player2 => 1,
     }
 }
 
@@ -698,6 +469,58 @@ pub fn find_raise_child(tree: &PreflopTree, node_idx: u32) -> Option<u32> {
 mod tests {
     use super::*;
     use poker_solver_core::hands::CanonicalHand as CH;
+    use poker_solver_core::poker::{Card, Suit, Value};
+    use rand::SeedableRng;
+    use rand::prelude::SliceRandom;
+    use rand::rngs::StdRng;
+
+    /// Create hole cards for a given matrix cell.
+    fn make_hole_cards(row: usize, col: usize) -> [Card; 2] {
+        let rank1 = RANK_ORDER[row];
+        let rank2 = RANK_ORDER[col];
+        let is_suited = row < col;
+
+        let (suit1, suit2) = if is_suited {
+            (Suit::Spade, Suit::Spade)
+        } else {
+            (Suit::Spade, Suit::Heart)
+        };
+
+        [Card::new(rank1, suit1), Card::new(rank2, suit2)]
+    }
+
+    /// Classify action probabilities into fold/call/raise buckets.
+    fn classify_action_probs(actions: &[Action], probs: &[f32]) -> (f32, f32, f32) {
+        let mut fold = 0.0f32;
+        let mut call = 0.0f32;
+        let mut raise = 0.0f32;
+
+        for (i, &action) in actions.iter().enumerate() {
+            let p = if i < probs.len() { probs[i] } else { 0.0 };
+            match action {
+                Action::Fold => fold += p,
+                Action::Check | Action::Call => call += p,
+                Action::Bet(_) | Action::Raise(_) => raise += p,
+            }
+        }
+
+        (fold, call, raise)
+    }
+
+    /// Build a deck without the given hole cards.
+    fn build_remaining_deck(hole: &[Card; 2]) -> Vec<Card> {
+        poker_solver_core::poker::full_deck()
+            .into_iter()
+            .filter(|c| *c != hole[0] && *c != hole[1])
+            .collect()
+    }
+
+    /// Sample 5 board cards from the remaining deck.
+    fn sample_board(deck: &[Card], rng: &mut StdRng) -> [Card; 5] {
+        let mut pool = deck.to_vec();
+        pool.shuffle(rng);
+        [pool[0], pool[1], pool[2], pool[3], pool[4]]
+    }
 
     // -----------------------------------------------------------------------
     // 1. Hand label correctness

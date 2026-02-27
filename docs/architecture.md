@@ -37,7 +37,6 @@ poker_solver_rust/
 │   │       ├── simulation.rs  # Arena-based agent simulation
 │   │       └── abstract_game.rs  # Exhaustive deal enumeration
 │   ├── trainer/               # CLI for training, diagnostics, deal generation
-│   ├── deep-cfr/              # Neural network SD-CFR (candle backend)
 │   ├── gpu-cfr/               # GPU sequence-form CFR (wgpu)
 │   │   └── src/shaders/       # WGSL compute shaders
 │   ├── tauri-app/             # Desktop strategy explorer (Tauri)
@@ -58,8 +57,6 @@ poker_solver_rust/
 **`core`** -- The heart of the solver. Contains the `Game` trait and its implementations (heads-up no-limit, Kuhn poker, limit hold'em), multiple CFR solver backends (vanilla, MCCFR, sequence-form), the preflop LCFR solver with its postflop abstraction pipeline (169-hand direct indexing, combo maps, tree building, solving), the blueprint strategy system with subgame refinement, card abstractions, hand classification, and the agent simulation framework.
 
 **`trainer`** -- CLI entry point that orchestrates training runs, diagnostics, hand tracing, and deal generation. Parses YAML configs and drives the core library.
-
-**`deep-cfr`** -- Neural network approach to CFR using the candle ML framework. Encodes game states as card features, trains advantage networks via reservoir sampling, and supports both HUNL and limit hold'em.
 
 **`gpu-cfr`** -- GPU-accelerated sequence-form CFR using wgpu. Includes tabular and tiled solver variants with WGSL compute shaders for forward pass, backward pass, regret matching, and DCFR discounting.
 
