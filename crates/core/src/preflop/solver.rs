@@ -763,7 +763,7 @@ fn normalize(sums: &[f64]) -> Vec<f64> {
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub(crate) fn postflop_showdown_value(
     pf_state: &PostflopState,
-    _preflop_node_idx: u32,
+    preflop_node_idx: u32,
     pot: u32,
     hero_inv: f64,
     hero_hand: u16,
@@ -774,6 +774,23 @@ pub(crate) fn postflop_showdown_value(
 ) -> f64 {
     let pot_f = f64::from(pot);
 
+    // Pure equity value (fallback when no postflop play is possible).
+    let eq_value = equity * pot_f - hero_inv;
+
+    // The postflop model was trained for raised pots (PotType::Raised at a
+    // fixed SPR).  For limped-pot showdowns (raise_count == 0) applying the
+    // model inflates values by ~5× relative to fold terminals (e.g. AA showdown
+    // ≈ 10.87 chips vs fold ≈ 2 chips), creating a degenerate limp-trap
+    // equilibrium where SB never raises.  Fall back to raw equity here.
+    let raise_count = pf_state
+        .raise_counts
+        .get(preflop_node_idx as usize)
+        .copied()
+        .unwrap_or(0);
+    if raise_count == 0 {
+        return eq_value;
+    }
+
     // O(1) lookup into precomputed hand-averaged EV table.
     let pf_ev_frac = pf_state.abstraction.avg_ev(
         hero_pos, hero_hand as usize, opp_hand as usize,
@@ -781,9 +798,6 @@ pub(crate) fn postflop_showdown_value(
 
     // Model value (what the postflop model predicts at its trained SPR).
     let model_value = pf_ev_frac * pot_f + (pot_f / 2.0 - hero_inv);
-
-    // Pure equity value (fallback when no postflop play is possible).
-    let eq_value = equity * pot_f - hero_inv;
 
     // Compute actual SPR at this terminal.
     let opp_inv = pot_f - hero_inv;
@@ -1339,5 +1353,65 @@ mod tests {
         );
     }
 
+    /// Limped-pot showdowns (raise_count=0) must fall back to raw equity,
+    /// not the postflop model. This prevents the limp-trap degeneracy where
+    /// inflated postflop model values make SB never raise.
+    #[timed_test]
+    fn postflop_showdown_value_limped_pot_uses_equity() {
+        use crate::preflop::postflop_abstraction::{PostflopAbstraction, PostflopValues};
+        use crate::preflop::postflop_tree::{PostflopNode, PostflopTree, PotType};
 
+        let n = 2;
+        let mut hand_avg_values = vec![0.0; 2 * n * n];
+        // Set a large postflop model value to verify it's NOT used.
+        hand_avg_values[0 * n * n + 0 * n + 1] = 2.7; // IP: hand 0 vs hand 1
+
+        let abstraction = PostflopAbstraction {
+            tree: PostflopTree {
+                nodes: vec![PostflopNode::Terminal {
+                    terminal_type: crate::preflop::postflop_tree::PostflopTerminalType::Showdown,
+                    pot_fraction: 1.0,
+                }],
+                pot_type: PotType::Raised,
+                spr: 5.0,
+            },
+            values: PostflopValues { values: vec![], num_buckets: n, num_flops: 0 },
+            hand_avg_values,
+            spr: 5.0,
+            flops: vec![],
+        };
+
+        // Node 0 has raise_count=0 (limped pot); Node 1 has raise_count=1 (raised pot).
+        let pf_state = PostflopState {
+            abstraction,
+            raise_counts: vec![0, 1],
+        };
+
+        let pot = 4;
+        let hero_inv = 2.0;
+        let stacks = [200, 200];
+        let equity = 0.85;
+
+        // Limped pot (node 0, raise_count=0): should use raw equity.
+        let ev_limped = postflop_showdown_value(&pf_state, 0, pot, hero_inv, 0, 1, 0, equity, stacks);
+        let expected_eq = equity * f64::from(pot) - hero_inv; // 0.85*4 - 2 = 1.4
+        assert!(
+            (ev_limped - expected_eq).abs() < 1e-10,
+            "Limped pot should use raw equity: got {ev_limped}, expected {expected_eq}"
+        );
+
+        // Raised pot (node 1, raise_count=1): should use postflop model.
+        let ev_raised = postflop_showdown_value(&pf_state, 1, pot, hero_inv, 0, 1, 0, equity, stacks);
+        // Model value: 2.7 * 4 + (4/2 - 2) = 10.8
+        assert!(
+            (ev_raised - 10.8).abs() < 1e-10,
+            "Raised pot should use postflop model: got {ev_raised}, expected 10.8"
+        );
+
+        // Key assertion: raised pot value >> limped pot value, so raising is incentivized.
+        assert!(
+            ev_raised > ev_limped * 3.0,
+            "Raised pot value ({ev_raised}) should be much larger than limped ({ev_limped})"
+        );
+    }
 }
