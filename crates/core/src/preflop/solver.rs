@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use super::config::{CfrVariant, PreflopConfig};
 use super::equity::EquityTable;
 use super::postflop_abstraction::PostflopAbstraction;
-use super::postflop_tree::PotType;
 use super::tree::{PreflopAction, PreflopNode, PreflopTree, TerminalType};
 
 const NUM_HANDS: usize = 169;
@@ -764,8 +763,7 @@ fn select_closest_spr(sprs: &[f64], actual_spr: f64) -> usize {
         .min_by(|(_, a), (_, b)| {
             (*a - actual_spr).abs().total_cmp(&(*b - actual_spr).abs())
         })
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+        .map_or(0, |(i, _)| i)
 }
 
 /// Look up pre-solved postflop EV from the value table with SPR scaling.
