@@ -315,7 +315,8 @@ impl PostflopAbstraction {
             PostflopSolveType::Exhaustive => build_exhaustive(config, &tree, &layout, &node_streets, &flops, &on_progress),
         };
         on_progress(BuildPhase::ComputingValues);
-        let hand_avg_values = compute_hand_avg_values(&values);
+        let flop_weights = crate::flops::lookup_flop_weights(&flops);
+        let hand_avg_values = compute_hand_avg_values(&values, &flop_weights);
         Ok(Self { tree, values, hand_avg_values, spr: config.primary_spr(), flops })
     }
 
@@ -362,50 +363,54 @@ impl PostflopAbstraction {
 
 /// Precompute hand-averaged postflop EV for all `(hero_pos, hero_hand, opp_hand)` triples.
 ///
-/// Averages `values.get_by_flop(flop_idx, pos, hand, opp)` across all flops for each
-/// canonical hand pair. Returns a flat `Vec<f64>` of size `2 * N * N` where
-/// N = 169 (canonical hands). Parallelized across hero hands with rayon.
+/// Each flop's contribution is weighted by its combinatorial multiplicity
+/// (`flop_weights[flop_idx]`), so that e.g. rainbow flops (weight 24) count 6×
+/// more than monotone flops (weight 4), matching their real-world frequency.
+///
+/// Returns a flat `Vec<f64>` of size `2 * N * N` where N = 169 (canonical hands).
+/// Parallelized across hero hands with rayon.
 #[allow(clippy::cast_precision_loss)]
-pub fn compute_hand_avg_values(values: &PostflopValues) -> Vec<f64> {
+pub fn compute_hand_avg_values(values: &PostflopValues, flop_weights: &[u16]) -> Vec<f64> {
     use rayon::prelude::*;
     let num_flops = values.num_flops;
     let num_hands = NUM_CANONICAL_HANDS;
     if num_flops == 0 { return vec![0.0; 2 * num_hands * num_hands]; }
     let mut out = vec![0.0f64; 2 * num_hands * num_hands];
-    // Each cell accumulates (sum, count) — NaN entries from unsampled/impossible
-    // hand pairs are skipped so they don't dilute the average.
-    let chunks: Vec<(usize, Vec<f64>, Vec<u32>)> = (0..num_hands)
+    // Each cell accumulates (weighted_sum, total_weight) — NaN entries from
+    // unsampled/impossible hand pairs are skipped so they don't dilute the average.
+    let chunks: Vec<(usize, Vec<f64>, Vec<f64>)> = (0..num_hands)
         .into_par_iter()
         .map(|hero_hand| {
             let mut sums = vec![0.0f64; 2 * num_hands];
-            let mut counts = vec![0u32; 2 * num_hands];
+            let mut weights = vec![0.0f64; 2 * num_hands];
             for flop_idx in 0..num_flops {
+                let w = f64::from(*flop_weights.get(flop_idx).unwrap_or(&1));
                 for opp_hand in 0..num_hands {
                     let v0 = values.get_by_flop(flop_idx, 0, hero_hand as u16, opp_hand as u16);
                     if !v0.is_nan() {
-                        sums[opp_hand] += v0;
-                        counts[opp_hand] += 1;
+                        sums[opp_hand] += v0 * w;
+                        weights[opp_hand] += w;
                     }
                     let v1 = values.get_by_flop(flop_idx, 1, hero_hand as u16, opp_hand as u16);
                     if !v1.is_nan() {
-                        sums[num_hands + opp_hand] += v1;
-                        counts[num_hands + opp_hand] += 1;
+                        sums[num_hands + opp_hand] += v1 * w;
+                        weights[num_hands + opp_hand] += w;
                     }
                 }
             }
-            (hero_hand, sums, counts)
+            (hero_hand, sums, weights)
         })
         .collect();
     let n = num_hands;
-    for (hero_hand, sums, counts) in chunks {
+    for (hero_hand, sums, weights) in chunks {
         for opp_hand in 0..n {
-            out[hero_hand * n + opp_hand] = if counts[opp_hand] > 0 {
-                sums[opp_hand] / f64::from(counts[opp_hand])
+            out[hero_hand * n + opp_hand] = if weights[opp_hand] > 0.0 {
+                sums[opp_hand] / weights[opp_hand]
             } else {
                 0.0
             };
-            out[n * n + hero_hand * n + opp_hand] = if counts[n + opp_hand] > 0 {
-                sums[n + opp_hand] / f64::from(counts[n + opp_hand])
+            out[n * n + hero_hand * n + opp_hand] = if weights[n + opp_hand] > 0.0 {
+                sums[n + opp_hand] / weights[n + opp_hand]
             } else {
                 0.0
             };
@@ -738,6 +743,42 @@ mod tests {
             stage: FlopStage::Done,
         };
         assert!(format!("{done}").contains("Done"));
+    }
+
+    #[timed_test]
+    fn compute_hand_avg_values_uses_flop_weights() {
+        // Two flops, 2 "hands" (tiny for speed).
+        // Flop 0: all EVs = 1.0, weight = 24 (rainbow)
+        // Flop 1: all EVs = 0.0, weight = 4 (monotone)
+        // Unweighted average would be 0.5.
+        // Weighted average should be 24/(24+4) * 1.0 + 4/(24+4) * 0.0 ≈ 0.857.
+        let num_flops = 2;
+        let num_buckets = 2;
+        let total = num_flops * 2 * num_buckets * num_buckets;
+        let mut raw = vec![0.0f64; total];
+        // Flop 0: all entries = 1.0
+        for i in 0..(2 * num_buckets * num_buckets) {
+            raw[i] = 1.0;
+        }
+        // Flop 1: all entries = 0.0 (already zero)
+        let values = PostflopValues::from_raw(raw, num_buckets, num_flops);
+        let weights: Vec<u16> = vec![24, 4];
+
+        let avg = compute_hand_avg_values(&values, &weights);
+        let expected = 24.0 / 28.0; // ≈ 0.857
+        // Check first entry (pos=0, hero=0, opp=0)
+        assert!(
+            (avg[0] - expected).abs() < 1e-9,
+            "weighted avg should be {expected}, got {}",
+            avg[0]
+        );
+        // Also verify pos=1 slice
+        let pos1_idx = num_buckets * num_buckets;
+        assert!(
+            (avg[pos1_idx] - expected).abs() < 1e-9,
+            "pos=1 weighted avg should be {expected}, got {}",
+            avg[pos1_idx]
+        );
     }
 
     #[test]

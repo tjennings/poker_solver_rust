@@ -280,6 +280,35 @@ pub fn all_flops() -> Vec<CanonicalFlop> {
     flops
 }
 
+/// Build a lookup map from canonical flop cards to their combinatorial weight.
+///
+/// The keys are the same `[Card; 3]` arrays returned by `all_flops()` and
+/// `canonical_flops()` in `postflop_hands`.
+#[must_use]
+pub fn flop_weight_map() -> HashMap<[Card; 3], u16> {
+    all_flops()
+        .into_iter()
+        .map(|f| (*f.cards(), f.weight()))
+        .collect()
+}
+
+/// Look up the combinatorial weight for a list of canonical flop boards.
+///
+/// Returns a weight for each flop in the input order. Flops not found in the
+/// canonical set get weight 1 (conservative fallback).
+#[must_use]
+pub fn lookup_flop_weights(flops: &[[Card; 3]]) -> Vec<u16> {
+    let map = flop_weight_map();
+    flops
+        .iter()
+        .map(|cards| {
+            let mut key = *cards;
+            sort_cards_for_key(&mut key);
+            map.get(&key).copied().unwrap_or(1)
+        })
+        .collect()
+}
+
 impl fmt::Display for CanonicalFlop {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let suit_label = match self.suit_texture {
@@ -629,6 +658,35 @@ mod tests {
             })
             .count();
         assert_eq!(monotone_unpaired, 286);
+    }
+
+    // === Weight lookup ===
+
+    #[timed_test]
+    fn lookup_flop_weights_returns_correct_values() {
+        // AKQ rainbow → weight 24, AKQ monotone → weight 4
+        let rainbow = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Diamond),
+        ];
+        let monotone = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::Queen, Suit::Spade),
+        ];
+        let weights = lookup_flop_weights(&[rainbow, monotone]);
+        assert_eq!(weights[0], 24, "rainbow AKQ should have weight 24");
+        assert_eq!(weights[1], 4, "monotone AKQ should have weight 4");
+    }
+
+    #[timed_test]
+    fn lookup_flop_weights_all_flops_sum_to_22100() {
+        let all = all_flops();
+        let cards: Vec<[Card; 3]> = all.iter().map(|f| *f.cards()).collect();
+        let weights = lookup_flop_weights(&cards);
+        let total: u32 = weights.iter().map(|&w| u32::from(w)).sum();
+        assert_eq!(total, 22_100);
     }
 
     // === Performance ===

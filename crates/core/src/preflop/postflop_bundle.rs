@@ -99,12 +99,11 @@ impl PostflopBundle {
     ///
     /// Returns an error if tree building fails.
     pub fn into_abstraction(self) -> Result<PostflopAbstraction, PostflopAbstractionError> {
-        let hand_avg = if self.data.hand_avg_values.is_empty() {
-            // Backward compat: recompute if bundle was saved without avg values.
-            compute_hand_avg_values(&self.data.values)
-        } else {
-            self.data.hand_avg_values
-        };
+        // Always recompute with correct flop weights — cached hand_avg_values
+        // from older bundles used equal weighting which overweights monotone
+        // boards ~3× and underweights rainbow ~0.5×.
+        let flop_weights = crate::flops::lookup_flop_weights(&self.data.flops);
+        let hand_avg = compute_hand_avg_values(&self.data.values, &flop_weights);
         PostflopAbstraction::build_from_cached(
             &self.config,
             self.data.values,
@@ -120,6 +119,18 @@ impl PostflopBundle {
     #[must_use]
     pub fn hand_avg_values(&self) -> &[f64] {
         &self.data.hand_avg_values
+    }
+
+    /// Return a reference to the per-flop postflop values table.
+    #[must_use]
+    pub fn values(&self) -> &PostflopValues {
+        &self.data.values
+    }
+
+    /// Return the solved flop boards.
+    #[must_use]
+    pub fn flops(&self) -> &[[Card; 3]] {
+        &self.data.flops
     }
 
     /// Check whether a directory contains a complete bundle.
@@ -138,8 +149,9 @@ mod tests {
     fn minimal_bundle() -> PostflopBundle {
         let config = PostflopModelConfig::fast();
         let values = PostflopValues::from_raw(vec![0.5; 8], 1, 1);
-        let hand_avg_values = compute_hand_avg_values(&values);
-        let flops = vec![];
+        let flops: Vec<[Card; 3]> = vec![];
+        let flop_weights = crate::flops::lookup_flop_weights(&flops);
+        let hand_avg_values = compute_hand_avg_values(&values, &flop_weights);
         PostflopBundle {
             config,
             data: PostflopBundleData {
