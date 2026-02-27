@@ -1181,6 +1181,9 @@ fn run_solve_preflop(
         .map(parse_ev_diagnostic_hands)
         .unwrap_or_default();
 
+    // Clone hand_avg_values before the abstraction is consumed by attach_postflop.
+    let hand_avg_values = postflop.as_ref().map(|abs| abs.hand_avg_values.clone());
+
     if let Some(ref abstraction) = postflop {
         if !ev_diagnostic_hands.is_empty() {
             print_postflop_ev_diagnostics(abstraction, &ev_diagnostic_hands);
@@ -1263,7 +1266,7 @@ fn run_solve_preflop(
     let mbb = expl * 500.0;
     println!("  Final exploitability: {expl:.6} (mBB/hand: {mbb:.2})");
 
-    let bundle = PreflopBundle::new(config, strategy);
+    let bundle = PreflopBundle::with_ev_table(config, strategy, hand_avg_values);
     bundle.save(output)?;
     println!("Saved to {}", output.display());
 
