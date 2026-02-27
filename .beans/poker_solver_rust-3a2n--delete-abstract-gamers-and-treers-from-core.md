@@ -5,7 +5,7 @@ status: completed
 type: task
 priority: normal
 created_at: 2026-02-27T23:18:06Z
-updated_at: 2026-02-27T23:29:25Z
+updated_at: 2026-02-27T23:30:20Z
 ---
 
 Delete abstract_game.rs and tree.rs. Update lib.rs to remove their pub mod declarations and fix re-exports (remove Game from pub use).

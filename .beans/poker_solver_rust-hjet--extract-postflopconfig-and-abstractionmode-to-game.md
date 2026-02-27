@@ -5,7 +5,7 @@ status: completed
 type: task
 priority: normal
 created_at: 2026-02-27T23:17:59Z
-updated_at: 2026-02-27T23:29:25Z
+updated_at: 2026-02-27T23:30:20Z
 ---
 
 Move PostflopConfig, AbstractionMode, default_max_raises from hunl_postflop.rs to new game/config.rs. Update game/mod.rs to export from config.rs.
