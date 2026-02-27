@@ -54,18 +54,48 @@ impl Serialize for RaiseSize {
 
 impl<'de> Deserialize<'de> for RaiseSize {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        if let Some(num) = s.strip_suffix("bb") {
-            let val: f64 = num.parse().map_err(serde::de::Error::custom)?;
-            Ok(Self::Bb(val))
-        } else if let Some(num) = s.strip_suffix('p') {
-            let val: f64 = num.parse().map_err(serde::de::Error::custom)?;
-            Ok(Self::PotFraction(val))
-        } else {
-            Err(serde::de::Error::custom(format!(
-                "invalid raise size '{s}': must end with 'bb' (e.g. \"2.5bb\") or 'p' (e.g. \"0.75p\")"
-            )))
+        struct RaiseSizeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RaiseSizeVisitor {
+            type Value = RaiseSize;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(
+                    "a string like \"2.5bb\" or \"0.75p\", or a plain number (pot fraction)",
+                )
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(RaiseSize::PotFraction(v))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                self.visit_f64(v as f64)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                self.visit_f64(v as f64)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                if let Some(num) = s.strip_suffix("bb") {
+                    let val: f64 = num.parse().map_err(serde::de::Error::custom)?;
+                    Ok(RaiseSize::Bb(val))
+                } else if let Some(num) = s.strip_suffix('p') {
+                    let val: f64 = num.parse().map_err(serde::de::Error::custom)?;
+                    Ok(RaiseSize::PotFraction(val))
+                } else if let Ok(val) = s.parse::<f64>() {
+                    // Backward compat: plain float string → pot fraction
+                    Ok(RaiseSize::PotFraction(val))
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "invalid raise size '{s}': must end with 'bb' or 'p', or be a plain number"
+                    )))
+                }
+            }
         }
+
+        deserializer.deserialize_any(RaiseSizeVisitor)
     }
 }
 
@@ -434,8 +464,14 @@ mod tests {
     }
 
     #[timed_test]
-    fn raise_size_rejects_bare_number() {
-        let result: Result<RaiseSize, _> = serde_yaml::from_str("2.5");
-        assert!(result.is_err());
+    fn raise_size_deserialize_plain_float_as_pot_fraction() {
+        let parsed: RaiseSize = serde_yaml::from_str("0.75").unwrap();
+        assert_eq!(parsed, RaiseSize::PotFraction(0.75));
+    }
+
+    #[timed_test]
+    fn raise_size_deserialize_plain_integer_as_pot_fraction() {
+        let parsed: RaiseSize = serde_yaml::from_str("2.0").unwrap();
+        assert_eq!(parsed, RaiseSize::PotFraction(2.0));
     }
 }
