@@ -14,6 +14,8 @@ use poker_solver_core::game::{
 use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{Card, Suit, Value};
 use poker_solver_core::preflop::{EquityTable, PreflopAction, PreflopNode, PreflopStrategy, PreflopTree};
+#[cfg(test)]
+use poker_solver_core::preflop::RaiseSize;
 use poker_solver_deep_cfr::eval::ExplicitPolicy;
 use poker_solver_deep_cfr::lhe_encoder::LheEncoder;
 use poker_solver_deep_cfr::traverse::StateEncoder;
@@ -425,7 +427,7 @@ fn build_raise_legend(actions: Option<&[PreflopAction]>) -> Vec<String> {
         Some(acts) => acts
             .iter()
             .filter_map(|a| match a {
-                PreflopAction::Raise(size) => Some(format!("{size}x")),
+                PreflopAction::Raise(size) => Some(format!("{size}")),
                 PreflopAction::AllIn => Some("all-in".to_string()),
                 _ => None,
             })
@@ -913,7 +915,7 @@ mod tests {
         let actions = [
             PreflopAction::Fold,
             PreflopAction::Call,
-            PreflopAction::Raise(2.0),
+            PreflopAction::Raise(RaiseSize::Bb(2.0)),
         ];
         let probs = [0.2, 0.3, 0.5];
         let s = classify_preflop_probs(&actions, &probs);
@@ -936,8 +938,8 @@ mod tests {
         let actions = [
             PreflopAction::Fold,
             PreflopAction::Call,
-            PreflopAction::Raise(2.0),
-            PreflopAction::Raise(3.0),
+            PreflopAction::Raise(RaiseSize::Bb(2.0)),
+            PreflopAction::Raise(RaiseSize::Bb(3.0)),
             PreflopAction::AllIn,
         ];
         let probs = [0.1, 0.2, 0.3, 0.25, 0.15];
@@ -977,7 +979,7 @@ mod tests {
     fn preflop_strategy_matrix_returns_169_cells() {
         use poker_solver_core::preflop::{PreflopConfig, PreflopSolver};
         let mut config = PreflopConfig::heads_up(10);
-        config.raise_sizes = vec![vec![3.0]];
+        config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
         config.raise_cap = 1;
         let mut solver = PreflopSolver::new(&config);
         solver.train(5);

@@ -3,14 +3,14 @@
 /// Arena-allocated: all nodes live in a flat `Vec`, with children referencing
 /// indices into that vec. Built once via `PreflopTree::build` and then
 /// traversed by the CFR solver.
-use super::config::PreflopConfig;
+use super::config::{PreflopConfig, RaiseSize};
 
 /// An action available at a preflop decision node.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PreflopAction {
     Fold,
     Call,
-    Raise(f64),
+    Raise(RaiseSize),
     AllIn,
 }
 
@@ -191,7 +191,7 @@ fn build_recursive(
         if !last_raise_depth {
             let depth = state.raise_count as usize;
             for &size in config.raise_sizes_for(position, depth) {
-                let new_bet = compute_raise_amount(state, size);
+                let new_bet = compute_raise_to(state, position, size);
                 let additional = new_bet.saturating_sub(state.invested[position as usize]);
                 if additional > 0 && additional < player_stack {
                     let child_state = apply_raise(state, position, new_bet);
@@ -260,12 +260,13 @@ fn is_round_complete(state: &BuildState) -> bool {
     active_investments.iter().all(|&inv| inv == target)
 }
 
-/// Compute the raise amount (additional chips beyond calling) based on a multiplier.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn compute_raise_amount(state: &BuildState, multiplier: f64) -> u32 {
-    // new_bet = current_bet * multiplier (always positive, fits u32)
-    let new_bet = (f64::from(state.current_bet) * multiplier) as u32;
-    new_bet.max(state.current_bet + 1) // at least a min-raise
+/// Resolve a `RaiseSize` to a concrete raise-to amount given the current build state.
+fn compute_raise_to(state: &BuildState, position: u8, size: RaiseSize) -> u32 {
+    let pot: u32 = state.invested.iter().sum();
+    let to_call = state
+        .current_bet
+        .saturating_sub(state.invested[position as usize]);
+    size.resolve(state.current_bet, pot, to_call)
 }
 
 /// Advance to the next player after the given position.
@@ -503,7 +504,7 @@ mod tests {
         let tree = PreflopTree::build(&config);
 
         // Find raise(2.5) child from root
-        let (raise_node, _) = find_action_child(&tree, 0, PreflopAction::Raise(2.5));
+        let (raise_node, _) = find_action_child(&tree, 0, PreflopAction::Raise(RaiseSize::Bb(2.5)));
 
         // BB folds after SB open → terminal pot should be SB(5) + BB(2) = 7
         let (fold_node, _) = find_action_child(&tree, raise_node, PreflopAction::Fold);
@@ -519,12 +520,12 @@ mod tests {
     fn last_raise_depth_only_offers_all_in() {
         // With raise_cap=2, the second raise depth should only have all-in (no sized raises)
         let mut config = PreflopConfig::heads_up(25);
-        config.raise_sizes = vec![vec![3.0]];
+        config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
         config.raise_cap = 2;
         let tree = PreflopTree::build(&config);
 
         // SB opens with Raise(3.0) → BB's decision
-        let (bb_node, _) = find_action_child(&tree, 0, PreflopAction::Raise(3.0));
+        let (bb_node, _) = find_action_child(&tree, 0, PreflopAction::Raise(RaiseSize::Bb(3.0)));
 
         // BB at depth 1 (last depth with cap=2): should have Fold, Call, AllIn but NO Raise
         match &tree.nodes[bb_node] {
@@ -554,12 +555,12 @@ mod tests {
         // decision at raise_count=2 (cap). SB should still have Fold, Call, AllIn
         // because SB has chips beyond what's needed to call.
         let mut config = PreflopConfig::heads_up(200);
-        config.raise_sizes = vec![vec![2.5], vec![3.0]];
+        config.raise_sizes = vec![vec![RaiseSize::Bb(2.5)], vec![RaiseSize::Bb(3.0)]];
         config.raise_cap = 2;
         let tree = PreflopTree::build(&config);
 
         // SB opens Raise(2.5)
-        let (bb_node, _) = find_action_child(&tree, 0, PreflopAction::Raise(2.5));
+        let (bb_node, _) = find_action_child(&tree, 0, PreflopAction::Raise(RaiseSize::Bb(2.5)));
         // BB at last raise depth → only all-in offered
         let (sb_node2, _) = find_action_child(&tree, bb_node, PreflopAction::AllIn);
 
@@ -586,11 +587,11 @@ mod tests {
         // With 50BB stacks and raise_cap=2: SB opens 3x, BB shoves, SB has exactly
         // enough to call → [Fold, Call, AllIn] with AllIn present.
         let mut config = PreflopConfig::heads_up(50);
-        config.raise_sizes = vec![vec![3.0]];
+        config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
         config.raise_cap = 2;
         let tree = PreflopTree::build(&config);
 
-        let (bb_node, _) = find_action_child(&tree, 0, PreflopAction::Raise(3.0));
+        let (bb_node, _) = find_action_child(&tree, 0, PreflopAction::Raise(RaiseSize::Bb(3.0)));
         let (sb_node2, _) = find_action_child(&tree, bb_node, PreflopAction::AllIn);
         match &tree.nodes[sb_node2] {
             PreflopNode::Decision { action_labels, .. } => {
@@ -690,8 +691,9 @@ mod tests {
                             new_stacks[pos] -= actual;
                         }
                         PreflopAction::Raise(size) => {
-                            let target = (f64::from(current_bet) * size) as u32;
-                            let target = target.max(current_bet + 1);
+                            let pot: u32 = invested.iter().sum();
+                            let to_call = current_bet.saturating_sub(invested[pos]);
+                            let target = size.resolve(current_bet, pot, to_call);
                             let additional = target.saturating_sub(invested[pos]);
                             let actual = additional.min(stacks[pos]);
                             new_invested[pos] += actual;

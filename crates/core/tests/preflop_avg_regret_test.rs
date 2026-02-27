@@ -1,9 +1,9 @@
-use poker_solver_core::preflop::{CfrVariant, PreflopConfig, PreflopSolver};
+use poker_solver_core::preflop::{CfrVariant, PreflopConfig, PreflopSolver, RaiseSize};
 
 #[test]
 fn preflop_avg_positive_regret_positive_after_training() {
     let mut config = PreflopConfig::heads_up(10);
-    config.raise_sizes = vec![vec![3.0]];
+    config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
     config.raise_cap = 1;
 
     let mut solver = PreflopSolver::new(&config);
@@ -26,7 +26,7 @@ fn preflop_avg_positive_regret_zero_before_training() {
 #[test]
 fn vanilla_avg_positive_regret_decreases_over_training() {
     let mut config = PreflopConfig::heads_up(10);
-    config.raise_sizes = vec![vec![3.0]];
+    config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
     config.raise_cap = 1;
     config.cfr_variant = CfrVariant::Vanilla;
 
@@ -74,7 +74,7 @@ fn vanilla_avg_positive_regret_decreases_over_training() {
 #[test]
 fn cfrplus_avg_positive_regret_decreases_over_training() {
     let mut config = PreflopConfig::heads_up(10);
-    config.raise_sizes = vec![vec![3.0]];
+    config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
     config.raise_cap = 1;
     config.cfr_variant = CfrVariant::CfrPlus;
 
@@ -115,7 +115,7 @@ fn cfrplus_avg_positive_regret_decreases_over_training() {
 #[ignore]
 fn dcfr_avg_positive_regret_decreases_over_training() {
     let mut config = PreflopConfig::heads_up(10);
-    config.raise_sizes = vec![vec![3.0]];
+    config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
     config.raise_cap = 1;
     config.cfr_variant = CfrVariant::Dcfr;
 

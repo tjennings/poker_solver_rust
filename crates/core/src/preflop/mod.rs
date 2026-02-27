@@ -14,7 +14,7 @@ pub mod solver;
 pub mod tree;
 
 pub use bundle::PreflopBundle;
-pub use config::{CfrVariant, PositionInfo, PreflopConfig};
+pub use config::{CfrVariant, PositionInfo, PreflopConfig, RaiseSize};
 pub use equity::EquityTable;
 pub use postflop_bundle::PostflopBundle;
 pub use postflop_model::{PostflopModelConfig, PostflopSolveType};

@@ -28,11 +28,11 @@ antes: []
 
 stacks: [50, 50]  # 25 BB x 2
 
-# raise_sizes[depth] -- multiplier of current pot/bet at each raise depth.
+# raise_sizes[depth] -- raise sizes at each depth ("Xbb" = raise to X BB, "Xp" = raise by X × pot).
 # depth 0 = first open raise, depth 1 = 3-bet, etc.
 raise_sizes:
-  - [2.5]    # open raise: 2.5x
-  - [3.0]    # 3-bet: 3.0x
+  - ["2.5bb"]    # open raise: to 2.5 BB
+  - ["3.0bb"]    # 3-bet: to 3 BB
 
 raise_cap: 4
 

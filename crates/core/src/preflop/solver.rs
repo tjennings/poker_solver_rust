@@ -957,13 +957,13 @@ fn first_terminal_pot(tree: &PreflopTree, node_idx: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::preflop::PreflopConfig;
+    use crate::preflop::{PreflopConfig, RaiseSize};
     use test_macros::timed_test;
 
     /// A minimal config with a tiny tree for fast unit tests.
     fn tiny_config() -> PreflopConfig {
         let mut config = PreflopConfig::heads_up(3);
-        config.raise_sizes = vec![vec![3.0]];
+        config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
         config.raise_cap = 1;
         config
     }

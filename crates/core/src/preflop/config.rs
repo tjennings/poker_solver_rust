@@ -2,6 +2,73 @@ use serde::{Deserialize, Serialize};
 
 use super::postflop_model::PostflopModelConfig;
 
+/// A raise size expressed as either a fixed BB amount or a fraction of pot.
+///
+/// Serialized as tagged strings: `"2.5bb"` for BB amounts, `"0.75p"` for pot fractions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RaiseSize {
+    /// Fixed BB amount — raise TO this many big blinds.
+    Bb(f64),
+    /// Pot fraction — raise BY `fraction × pot_after_call`.
+    PotFraction(f64),
+}
+
+const BB_SIZE: u32 = 2;
+
+impl RaiseSize {
+    /// Resolve this raise size to a concrete raise-to amount in internal units.
+    ///
+    /// - `Bb(x)`: raise to `x * bb_size`
+    /// - `PotFraction(f)`: raise to `current_bet + f * (pot + to_call)`
+    ///
+    /// Result is clamped to at least `current_bet + 1` (min-raise).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn resolve(self, current_bet: u32, pot: u32, to_call: u32) -> u32 {
+        let raise_to = match self {
+            Self::Bb(x) => (x * f64::from(BB_SIZE)) as u32,
+            Self::PotFraction(f) => {
+                let pot_after_call = pot + to_call;
+                let raise_amount = (f * f64::from(pot_after_call)) as u32;
+                current_bet + raise_amount
+            }
+        };
+        raise_to.max(current_bet + 1)
+    }
+}
+
+impl std::fmt::Display for RaiseSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bb(x) => write!(f, "{x}bb"),
+            Self::PotFraction(x) => write!(f, "{x}p"),
+        }
+    }
+}
+
+impl Serialize for RaiseSize {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for RaiseSize {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        if let Some(num) = s.strip_suffix("bb") {
+            let val: f64 = num.parse().map_err(serde::de::Error::custom)?;
+            Ok(Self::Bb(val))
+        } else if let Some(num) = s.strip_suffix('p') {
+            let val: f64 = num.parse().map_err(serde::de::Error::custom)?;
+            Ok(Self::PotFraction(val))
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "invalid raise size '{s}': must end with 'bb' (e.g. \"2.5bb\") or 'p' (e.g. \"0.75p\")"
+            )))
+        }
+    }
+}
+
 /// Which CFR variant the preflop solver should use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -41,11 +108,13 @@ pub struct PreflopConfig {
     pub antes: Vec<(usize, u32)>,
     /// Per-position stack sizes in internal units (1 SB = 1).
     pub stacks: Vec<u32>,
-    /// Raise size multipliers indexed by raise depth (fallback).
-    pub raise_sizes: Vec<Vec<f64>>,
+    /// Raise sizes indexed by raise depth (fallback).
+    ///
+    /// Each entry is `"Xbb"` (raise TO X big blinds) or `"Xp"` (raise BY X * pot).
+    pub raise_sizes: Vec<Vec<RaiseSize>>,
     /// Per-position raise size overrides indexed as `[position][depth][size_idx]`.
     /// When set, overrides `raise_sizes` for the given position and depth.
-    pub position_raise_sizes: Option<Vec<Vec<Vec<f64>>>>,
+    pub position_raise_sizes: Option<Vec<Vec<Vec<RaiseSize>>>>,
     /// Maximum number of raises allowed per round.
     pub raise_cap: u8,
     /// CFR variant: `vanilla`, `dcfr` (default), or `cfrplus`.
@@ -99,7 +168,7 @@ impl PreflopConfig {
             blinds: vec![(0, 1), (1, 2)],
             antes: vec![],
             stacks: vec![stacks_internal, stacks_internal],
-            raise_sizes: vec![vec![2.5], vec![3.0]],
+            raise_sizes: vec![vec![RaiseSize::Bb(2.5)], vec![RaiseSize::Bb(3.0)]],
             position_raise_sizes: None,
             raise_cap: 4,
             cfr_variant: CfrVariant::Dcfr,
@@ -146,7 +215,7 @@ impl PreflopConfig {
             blinds: vec![(4, 1), (5, 2)],
             antes: vec![],
             stacks: vec![stacks_internal; 6],
-            raise_sizes: vec![vec![2.5], vec![3.0]],
+            raise_sizes: vec![vec![RaiseSize::Bb(2.5)], vec![RaiseSize::Bb(3.0)]],
             position_raise_sizes: None,
             raise_cap: 4,
             cfr_variant: CfrVariant::Dcfr,
@@ -172,7 +241,7 @@ impl PreflopConfig {
     /// Uses `position_raise_sizes` if set for that position, otherwise falls
     /// back to `raise_sizes`.
     #[must_use]
-    pub fn raise_sizes_for(&self, position: u8, depth: usize) -> &[f64] {
+    pub fn raise_sizes_for(&self, position: u8, depth: usize) -> &[RaiseSize] {
         if let Some(ref pos_sizes) = self.position_raise_sizes {
             let pos = position as usize;
             if pos < pos_sizes.len() && !pos_sizes[pos].is_empty() {
@@ -266,7 +335,7 @@ mod tests {
             blinds: [[0, 1], [1, 2]]
             antes: []
             stacks: [200, 200]
-            raise_sizes: [[2.5]]
+            raise_sizes: [["2.5bb"]]
             raise_cap: 4
             cfr_variant: vanilla
             dcfr_alpha: 1.5
@@ -289,7 +358,7 @@ mod tests {
             blinds: [[0, 1], [1, 2]]
             antes: []
             stacks: [200, 200]
-            raise_sizes: [[2.5]]
+            raise_sizes: [["2.5bb"]]
             raise_cap: 4
             dcfr_alpha: 1.5
             dcfr_beta: 0.5
@@ -311,7 +380,7 @@ mod tests {
             blinds: [[0, 1], [1, 2]]
             antes: []
             stacks: [200, 200]
-            raise_sizes: [[2.5]]
+            raise_sizes: [["2.5bb"]]
             raise_cap: 4
             cfr_variant: cfrplus
             dcfr_alpha: 1.5
@@ -328,5 +397,45 @@ mod tests {
         let mut config = PreflopConfig::heads_up(100);
         config.antes = vec![(0, 1), (1, 1)];
         assert_eq!(config.initial_pot(), 5); // SB(1) + BB(2) + ante(1) + ante(1) = 5
+    }
+
+    #[timed_test]
+    fn raise_size_bb_resolve() {
+        // Bb(2.5) at open: raise to 2.5 BB = 5 SB
+        let size = RaiseSize::Bb(2.5);
+        assert_eq!(size.resolve(2, 3, 1), 5); // current_bet=BB=2, pot=3, to_call=1
+    }
+
+    #[timed_test]
+    fn raise_size_pot_fraction_resolve() {
+        // PotFraction(0.75) at open: pot_after_call=3+1=4, raise_amount=3, raise_to=2+3=5
+        let size = RaiseSize::PotFraction(0.75);
+        assert_eq!(size.resolve(2, 3, 1), 5);
+    }
+
+    #[timed_test]
+    fn raise_size_clamps_to_min_raise() {
+        // Bb(0.5) resolves to 1 SB, clamped to current_bet+1 = 3
+        let size = RaiseSize::Bb(0.5);
+        assert_eq!(size.resolve(2, 3, 1), 3);
+    }
+
+    #[timed_test]
+    fn raise_size_serde_roundtrip() {
+        let bb = RaiseSize::Bb(2.5);
+        let yaml = serde_yaml::to_string(&bb).unwrap();
+        let parsed: RaiseSize = serde_yaml::from_str(yaml.trim()).unwrap();
+        assert_eq!(parsed, bb);
+
+        let pf = RaiseSize::PotFraction(0.75);
+        let yaml = serde_yaml::to_string(&pf).unwrap();
+        let parsed: RaiseSize = serde_yaml::from_str(yaml.trim()).unwrap();
+        assert_eq!(parsed, pf);
+    }
+
+    #[timed_test]
+    fn raise_size_rejects_bare_number() {
+        let result: Result<RaiseSize, _> = serde_yaml::from_str("2.5");
+        assert!(result.is_err());
     }
 }

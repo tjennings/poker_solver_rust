@@ -830,9 +830,10 @@ fn walk_preflop_tree_with_state(
                 invested[p] += actual;
                 stacks[p] -= actual;
             }
-            PreflopAction::Raise(multiplier) => {
-                let new_bet = (f64::from(current_bet) * multiplier) as u32;
-                let new_bet = new_bet.max(current_bet + 1);
+            PreflopAction::Raise(size) => {
+                let pot: u32 = invested.iter().sum();
+                let to_call = current_bet.saturating_sub(invested[p]);
+                let new_bet = size.resolve(current_bet, pot, to_call);
                 let total = new_bet.saturating_sub(invested[p]);
                 let actual = total.min(stacks[p]);
                 invested[p] += actual;
@@ -883,7 +884,7 @@ fn parse_preflop_action(s: &str) -> poker_solver_core::preflop::PreflopAction {
         PreflopAction::AllIn
     } else if s.starts_with("r:") || s.starts_with("raise:") || s.starts_with("b:") || s.starts_with("bet:") {
         // Any raise maps to the tree raise action
-        PreflopAction::Raise(0.0) // size doesn't matter for matching
+        PreflopAction::Raise(poker_solver_core::preflop::RaiseSize::Bb(0.0)) // size doesn't matter for matching
     } else {
         PreflopAction::Call // fallback
     }
@@ -934,7 +935,7 @@ fn preflop_action_info(
         },
         PreflopAction::Raise(size) => ActionInfo {
             id: format!("r:{idx}"),
-            label: format!("Raise {size:.1}x"),
+            label: format!("Raise {size}"),
             action_type: "raise".to_string(),
             size_key: Some(format!("{size}")),
         },

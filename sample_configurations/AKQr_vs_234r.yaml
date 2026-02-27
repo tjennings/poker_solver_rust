@@ -32,8 +32,8 @@ antes: []
 stacks: [50, 50]  # 25 BB
 
 raise_sizes:
-  - [2.5]
-  - [3.0]
+  - ["2.5bb"]
+  - ["3.0bb"]
 
 raise_cap: 3
 

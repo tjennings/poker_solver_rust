@@ -231,9 +231,9 @@ blinds:                             # [position_index, amount] pairs
 stacks: [50, 50]                    # per-position starting stacks in SB units; index matches positions above
                                     # here: both SB and BB start with 50 units = 25 BB each
 
-raise_sizes:                        # raise multipliers indexed by raise depth
-  - [2.5]                          # depth 0 (open raise): 2.5x the current bet
-  - [3.0]                          # depth 1 (3-bet): 3.0x
+raise_sizes:                        # raise sizes indexed by depth ("Xbb" = to X BB, "Xp" = by X × pot)
+  - ["2.5bb"]                      # depth 0 (open raise): raise to 2.5 BB
+  - ["3.0bb"]                      # depth 1 (3-bet): raise to 3 BB
 raise_cap: 4                        # max number of raises allowed per round
 
 # DCFR discounting (ignored when cfr_variant is vanilla or cfrplus)

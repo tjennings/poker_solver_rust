@@ -2,12 +2,12 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use poker_solver_core::preflop::{PreflopConfig, PreflopSolver};
+use poker_solver_core::preflop::{PreflopConfig, PreflopSolver, RaiseSize};
 
 /// A minimal config with a tiny tree (matches unit test tiny_config).
 fn tiny_config() -> PreflopConfig {
     let mut config = PreflopConfig::heads_up(3);
-    config.raise_sizes = vec![vec![3.0]];
+    config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
     config.raise_cap = 1;
     config
 }
