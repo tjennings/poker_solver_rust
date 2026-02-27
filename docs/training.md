@@ -68,19 +68,18 @@ The bundle directory contains:
 
 ### train
 
-Run MCCFR/sequence/GPU training for the postflop HUNL game.
+Run MCCFR/sequence training for the postflop HUNL game.
 
 ```bash
 cargo run -p poker-solver-trainer --release -- train -c config.yaml
 cargo run -p poker-solver-trainer --release -- train -c config.yaml --solver sequence
-cargo run -p poker-solver-trainer --features gpu --release -- train -c config.yaml --solver gpu
 cargo run -p poker-solver-trainer --release -- train -c config.yaml -t 4  # limit threads
 ```
 
 Options:
 - `-c, --config <FILE>` -- Training config YAML
 - `-t, --threads <N>` -- Thread count (default: all cores)
-- `--solver <MODE>` -- Backend: `mccfr` (default), `sequence`, `gpu`
+- `--solver <MODE>` -- Backend: `mccfr` (default), `sequence`
 
 ### tree
 
@@ -139,7 +138,7 @@ cargo run -p poker-solver-trainer --release -- trace-hand -c sample_configuratio
 
 ### generate-deals
 
-Pre-generate exhaustive abstract deals for sequence/GPU solvers:
+Pre-generate exhaustive abstract deals for the sequence solver:
 
 ```bash
 # Estimate size
@@ -353,7 +352,6 @@ training:
 |-|-|-|
 | `mccfr` | Large games, production training | Samples per iteration |
 | `sequence` | Small-medium games, exact convergence | Full traversal |
-| `gpu` | Same as sequence, faster on GPU | Full traversal on GPU |
 
 ### Advanced Options
 
@@ -388,7 +386,7 @@ training:
   abstract_deals_dir: ./my_deals/
 ```
 
-**CFR variant selection** (sequence/GPU solvers):
+**CFR variant selection** (sequence solver):
 ```yaml
 training:
   cfr_variant: dcfr       # dcfr (default), linear, vanilla, cfrplus
@@ -403,7 +401,7 @@ training:
 | `vanilla` | uniform | uniform | none |
 | `cfrplus` | uniform | linear | regrets floored to 0 |
 
-**CFR variant selection** (sequence/GPU solvers):
+**CFR variant selection** (sequence solver):
 ```yaml
 training:
   cfr_variant: dcfr       # dcfr (default), linear, vanilla, cfrplus
