@@ -24,8 +24,8 @@
 use rustc_hash::FxHashMap;
 
 use super::game_tree::{GameTree, NodeType};
-use super::regret::regret_match;
-use crate::game::Player;
+use super::regret::{regret_match, regret_match_into};
+use crate::game::{Player, MAX_ACTIONS};
 use crate::preflop::CfrVariant;
 
 /// Configuration for sequence-form CFR training.
@@ -146,6 +146,17 @@ pub struct SequenceCfrSolver {
     player_map: FxHashMap<u64, Player>,
     /// Number of completed iterations.
     iterations: u64,
+    // --- Scratch buffers (reused across deal traversals) ---
+    /// Per-node P1 reach probabilities (reused per deal).
+    scratch_reach_p1: Vec<f64>,
+    /// Per-node P2 reach probabilities (reused per deal).
+    scratch_reach_p2: Vec<f64>,
+    /// Per-node P1 utility values (reused per deal).
+    scratch_utility: Vec<f64>,
+    /// Current strategy from regret matching (reused per decision node).
+    scratch_strategy: Vec<f64>,
+    /// Exploration-blended traversal strategy (reused per decision node).
+    scratch_traversal: Vec<f64>,
 }
 
 impl SequenceCfrSolver {
@@ -155,6 +166,7 @@ impl SequenceCfrSolver {
     /// but differ in `hand_bits` and showdown outcomes.
     #[must_use]
     pub fn new(tree: GameTree, deals: Vec<DealInfo>, config: SequenceCfrConfig) -> Self {
+        let num_nodes = tree.nodes.len();
         Self {
             trees: vec![tree],
             deals,
@@ -164,6 +176,11 @@ impl SequenceCfrSolver {
             num_actions: FxHashMap::default(),
             player_map: FxHashMap::default(),
             iterations: 0,
+            scratch_reach_p1: vec![0.0; num_nodes],
+            scratch_reach_p2: vec![0.0; num_nodes],
+            scratch_utility: vec![0.0; num_nodes],
+            scratch_strategy: Vec::with_capacity(MAX_ACTIONS),
+            scratch_traversal: Vec::with_capacity(MAX_ACTIONS),
         }
     }
 
@@ -182,6 +199,7 @@ impl SequenceCfrSolver {
         config: SequenceCfrConfig,
     ) -> Self {
         assert_eq!(trees.len(), deals.len(), "Must have one tree per deal");
+        let max_nodes = trees.iter().map(|t| t.nodes.len()).max().unwrap_or(0);
         Self {
             trees,
             deals,
@@ -191,6 +209,11 @@ impl SequenceCfrSolver {
             num_actions: FxHashMap::default(),
             player_map: FxHashMap::default(),
             iterations: 0,
+            scratch_reach_p1: vec![0.0; max_nodes],
+            scratch_reach_p2: vec![0.0; max_nodes],
+            scratch_utility: vec![0.0; max_nodes],
+            scratch_strategy: Vec::with_capacity(MAX_ACTIONS),
+            scratch_traversal: Vec::with_capacity(MAX_ACTIONS),
         }
     }
 
@@ -309,10 +332,17 @@ impl SequenceCfrSolver {
     fn process_single_deal(&mut self, tree_idx: usize, deal: &DealInfo, hero: Player) {
         let num_nodes = self.trees[tree_idx].nodes.len();
 
-        let mut reach_p1 = vec![0.0_f64; num_nodes];
-        let mut reach_p2 = vec![0.0_f64; num_nodes];
-        let mut utility_p1 = vec![0.0_f64; num_nodes];
+        // Temporarily take scratch buffers out of self to avoid conflicting borrows.
+        // std::mem::take swaps Vec headers (zero-cost, no alloc).
+        let mut reach_p1 = std::mem::take(&mut self.scratch_reach_p1);
+        let mut reach_p2 = std::mem::take(&mut self.scratch_reach_p2);
+        let mut utility = std::mem::take(&mut self.scratch_utility);
+        let mut strategy = std::mem::take(&mut self.scratch_strategy);
+        let mut traversal_buf = std::mem::take(&mut self.scratch_traversal);
 
+        reach_p1[..num_nodes].fill(0.0);
+        reach_p2[..num_nodes].fill(0.0);
+        utility[..num_nodes].fill(0.0);
         reach_p1[0] = 1.0;
         reach_p2[0] = 1.0;
 
@@ -320,18 +350,20 @@ impl SequenceCfrSolver {
             &self.trees[tree_idx],
             deal,
             &self.regret_sum,
-            &mut reach_p1,
-            &mut reach_p2,
+            &mut reach_p1[..num_nodes],
+            &mut reach_p2[..num_nodes],
             hero,
             self.config.exploration,
+            &mut strategy,
+            &mut traversal_buf,
         );
 
         backward_pass(
             &self.trees[tree_idx],
             deal,
-            &reach_p1,
-            &reach_p2,
-            &mut utility_p1,
+            &reach_p1[..num_nodes],
+            &reach_p2[..num_nodes],
+            &mut utility[..num_nodes],
             hero,
             self.iterations,
             self.config.cfr_variant,
@@ -340,7 +372,16 @@ impl SequenceCfrSolver {
             &mut self.strategy_sum,
             &mut self.num_actions,
             &mut self.player_map,
+            &mut strategy,
+            &mut traversal_buf,
         );
+
+        // Put scratch buffers back.
+        self.scratch_reach_p1 = reach_p1;
+        self.scratch_reach_p2 = reach_p2;
+        self.scratch_utility = utility;
+        self.scratch_strategy = strategy;
+        self.scratch_traversal = traversal_buf;
     }
 
     /// Pre-deal discounting: discount old regrets/strategy before adding new ones.
@@ -433,18 +474,20 @@ fn deal_info_key(tree: &GameTree, node_idx: u32, deal: &DealInfo) -> u64 {
     }
 }
 
-/// Get current strategy from regret matching for an info set.
-fn current_strategy_from(
+/// Write current strategy from regret matching into `out`, reusing its allocation.
+fn current_strategy_into(
     regret_sum: &FxHashMap<u64, Vec<f64>>,
     info_key: u64,
     num_actions: usize,
-) -> Vec<f64> {
+    out: &mut Vec<f64>,
+) {
     if let Some(regrets) = regret_sum.get(&info_key) {
-        regret_match(regrets)
+        regret_match_into(regrets, out);
     } else {
         #[allow(clippy::cast_precision_loss)]
         let uniform = 1.0 / num_actions as f64;
-        vec![uniform; num_actions]
+        out.clear();
+        out.resize(num_actions, uniform);
     }
 }
 
@@ -452,6 +495,8 @@ fn current_strategy_from(
 ///
 /// At hero decision nodes with `exploration > 0`, the traversal strategy
 /// is blended with uniform to ensure off-path subtrees are visited.
+/// `scratch_strategy` and `scratch_traversal` are caller-provided buffers
+/// reused across nodes to avoid per-node allocations.
 #[allow(clippy::too_many_arguments)]
 fn forward_pass(
     tree: &GameTree,
@@ -461,6 +506,8 @@ fn forward_pass(
     reach_p2: &mut [f64],
     hero: Player,
     exploration: f64,
+    scratch_strategy: &mut Vec<f64>,
+    scratch_traversal: &mut Vec<f64>,
 ) {
     for level in &tree.levels {
         for &node_idx in level {
@@ -469,24 +516,27 @@ fn forward_pass(
             if let NodeType::Decision { player, .. } = &node.node_type {
                 let info_key = deal_info_key(tree, node_idx, deal);
                 let num_actions = node.children.len();
-                let strategy = current_strategy_from(regret_sum, info_key, num_actions);
+                current_strategy_into(regret_sum, info_key, num_actions, scratch_strategy);
 
-                // Apply ε-greedy exploration to hero's strategy only
-                let traversal = if *player == hero && exploration > 0.0 {
+                // Determine which buffer to use for reach propagation
+                let probs: &[f64] = if *player == hero && exploration > 0.0 {
                     #[allow(clippy::cast_precision_loss)]
                     let n_inv = 1.0 / num_actions as f64;
-                    strategy
-                        .iter()
-                        .map(|&s| (1.0 - exploration).mul_add(s, exploration * n_inv))
-                        .collect::<Vec<_>>()
+                    scratch_traversal.clear();
+                    scratch_traversal.extend(
+                        scratch_strategy
+                            .iter()
+                            .map(|&s| (1.0 - exploration).mul_add(s, exploration * n_inv)),
+                    );
+                    scratch_traversal
                 } else {
-                    strategy
+                    scratch_strategy
                 };
 
                 for (action_idx, &child_idx) in node.children.iter().enumerate() {
                     let ci = child_idx as usize;
                     let ni = node_idx as usize;
-                    let prob = traversal[action_idx];
+                    let prob = probs[action_idx];
 
                     match player {
                         Player::Player1 => {
@@ -508,6 +558,8 @@ fn forward_pass(
 ///
 /// Only updates regrets and strategy sums for the `hero` player's decision nodes.
 /// Opponent nodes still compute utilities for propagation but skip regret updates.
+/// `scratch_strategy` and `scratch_traversal` are caller-provided buffers
+/// reused across nodes to avoid per-node allocations.
 #[allow(clippy::too_many_arguments)]
 fn backward_pass(
     tree: &GameTree,
@@ -523,6 +575,8 @@ fn backward_pass(
     strategy_sum: &mut FxHashMap<u64, Vec<f64>>,
     num_actions_map: &mut FxHashMap<u64, usize>,
     player_map: &mut FxHashMap<u64, Player>,
+    scratch_strategy: &mut Vec<f64>,
+    scratch_traversal: &mut Vec<f64>,
 ) {
     // Iteration weighting per variant
     #[allow(clippy::cast_precision_loss)]
@@ -547,24 +601,31 @@ fn backward_pass(
                 NodeType::Decision { player, .. } => {
                     let info_key = deal_info_key(tree, node_idx, deal);
                     let num_actions = node.children.len();
-                    let intended = current_strategy_from(regret_sum, info_key, num_actions);
+                    current_strategy_into(regret_sum, info_key, num_actions, scratch_strategy);
 
-                    // Use explored strategy for node_util at hero nodes
-                    let traversal = if *player == hero && exploration > 0.0 {
+                    // Determine traversal strategy for node_util computation
+                    let use_exploration = *player == hero && exploration > 0.0;
+                    if use_exploration {
                         #[allow(clippy::cast_precision_loss)]
                         let n_inv = 1.0 / num_actions as f64;
-                        intended
-                            .iter()
-                            .map(|&s| (1.0 - exploration).mul_add(s, exploration * n_inv))
-                            .collect::<Vec<_>>()
+                        scratch_traversal.clear();
+                        scratch_traversal.extend(
+                            scratch_strategy
+                                .iter()
+                                .map(|&s| (1.0 - exploration).mul_add(s, exploration * n_inv)),
+                        );
+                    }
+
+                    let probs = if use_exploration {
+                        &*scratch_traversal
                     } else {
-                        intended.clone()
+                        &*scratch_strategy
                     };
 
                     // Compute node utility
                     let mut node_util = 0.0;
                     for (action_idx, &child_idx) in node.children.iter().enumerate() {
-                        node_util += traversal[action_idx] * utility_p1[child_idx as usize];
+                        node_util += probs[action_idx] * utility_p1[child_idx as usize];
                     }
                     utility_p1[ni] = node_util;
 
@@ -595,11 +656,12 @@ fn backward_pass(
                         }
 
                         // Accumulate strategy sum using *intended* (non-explored) strategy
+                        // scratch_strategy still holds the intended strategy
                         if strategy_weight > 0.0 {
                             let strat_sums = strategy_sum
                                 .entry(info_key)
                                 .or_insert_with(|| vec![0.0; num_actions]);
-                            for (i, &prob) in intended.iter().enumerate() {
+                            for (i, &prob) in scratch_strategy.iter().enumerate() {
                                 strat_sums[i] +=
                                     my_reach * prob * strategy_weight * deal.weight;
                             }
