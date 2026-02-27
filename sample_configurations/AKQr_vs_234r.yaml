@@ -9,10 +9,10 @@
 
 # -- Training parameters --
 
-iterations: 1000
+iterations: 400
 equity_samples: 10000
-print_every: 50
-preflop_exploitability_threshold_mbb: 50
+print_every: 100
+preflop_exploitability_threshold_mbb: 1
 ev_diagnostic_hands: "AA,KK,AKs,65s,JTs,A5s,72o"
 
 # -- Game structure --
@@ -29,13 +29,14 @@ blinds:
 
 antes: []
 
-stacks: [50, 50]  # 25 BB
+stacks: [200, 200]
 
 raise_sizes:
-  - ["2.5bb"]
-  - ["3.0bb"]
+  - ["2bb", "1.0p", "2.0p"]
+  - ["0.33p", "0.5p", "1.0p", "1.3p", "2.0p"]
+  - ["0.33p", "0.5p", "1.0p", "1.3p", "2.0p"]
 
-raise_cap: 3
+raise_cap: 4
 
 # -- DCFR discounting --
 
@@ -46,13 +47,13 @@ dcfr_warmup: 0
 exploration: 0.05
 
 # -- Postflop model (169-hand MCCFR, minimal for fast validation) --
-postflop_model_path: ./local_data/AKQr_vs_234r
-## postflop_model:
-##  solve_type: exhaustive
+postflop_model_path: ./local_data/smoke_test_2/postflop
+#postflop_model:
+#  solve_type: exhaustive
 #  value_extraction_samples: 5
 #  #max_flop_boards: 300
-#  fixed_flops: [ 'AhKsQd', '2c3h4d']
-#  #fixed_flops: ['KhKdTs', 'Kh8s7s', '9s8s5h', 'AsQs9h', 'KsTsTh', 'Js5h4d', '9s6s2s', 'AsQhQd', '6s4h2d', '8s6h2d', 'Ts8h3s', 'As6s5s', 'AsAhKs', '7s5h2s', 'QhJs8s', 'Ks9h3d', 'As7h3d', 'Ah5s4s', 'Js9h6s', 'QsTs2h', '9s7h4d', '8h4s3s', 'Qs7h5d', 'JhTs6s', 'Js4h3s']
+#  #fixed_flops: [ 'AhKsQd', '2c3h4d']
+#  fixed_flops: ['KhKdTs', 'Kh8s7s', '9s8s5h', 'AsQs9h', 'KsTsTh', 'Js5h4d', '9s6s2s', 'AsQhQd', '6s4h2d', '8s6h2d', 'Ts8h3s', 'As6s5s', 'AsAhKs', '7s5h2s', 'QhJs8s', 'Ks9h3d', 'As7h3d', 'Ah5s4s', 'Js9h6s', 'QsTs2h', '9s7h4d', '8h4s3s', 'Qs7h5d', 'JhTs6s', 'Js4h3s']
 #  bet_sizes: [0.5, 1.0, 2.0]
 #  max_raises_per_street: 3
 #  postflop_solve_iterations: 1000
