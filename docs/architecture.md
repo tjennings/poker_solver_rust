@@ -38,8 +38,6 @@ poker_solver_rust/
 │   │       ├── simulation.rs  # Arena-based agent simulation
 │   │       └── abstract_game.rs  # Exhaustive deal enumeration
 │   ├── trainer/               # CLI for training, diagnostics, deal generation
-│   ├── gpu-cfr/               # GPU sequence-form CFR (wgpu)
-│   │   └── src/shaders/       # WGSL compute shaders
 │   ├── tauri-app/             # Desktop strategy explorer (Tauri)
 │   ├── devserver/             # HTTP mirror of Tauri API for browser debugging
 │   └── test-macros/           # #[timed_test] proc macro
@@ -58,8 +56,6 @@ poker_solver_rust/
 **`core`** -- The heart of the solver. Contains the `Game` trait and its implementations (heads-up no-limit, Kuhn poker, limit hold'em), multiple CFR solver backends (vanilla, MCCFR, sequence-form), the preflop LCFR solver with its postflop abstraction pipeline (169-hand direct indexing, combo maps, tree building, solving), the blueprint strategy system with subgame refinement, card abstractions, hand classification, and the agent simulation framework.
 
 **`trainer`** -- CLI entry point that orchestrates training runs, diagnostics, hand tracing, and deal generation. Parses YAML configs and drives the core library.
-
-**`gpu-cfr`** -- GPU-accelerated sequence-form CFR using wgpu. Includes tabular and tiled solver variants with WGSL compute shaders for forward pass, backward pass, regret matching, and DCFR discounting.
 
 **`tauri-app`** -- Desktop application for exploring solved strategies. Loads blueprint bundles, navigates the game tree, queries strategy/EV at any node, and runs agent simulations.
 

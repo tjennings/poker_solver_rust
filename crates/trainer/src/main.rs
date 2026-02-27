@@ -201,9 +201,6 @@ enum SolverMode {
     Mccfr,
     /// Full-traversal sequence-form CFR on materialized game tree.
     Sequence,
-    /// GPU-accelerated sequence-form CFR via wgpu compute shaders.
-    /// Requires `--features gpu` at build time.
-    Gpu,
 }
 
 /// Output format for the flops command.
@@ -295,11 +292,6 @@ struct TrainingParams {
     /// If absent with `exhaustive: true`, generates in-memory.
     #[serde(default)]
     abstract_deals_dir: Option<String>,
-    /// GPU tile size for tiled solver. `None` or absent = auto-detect,
-    /// `Some(0)` = force untiled solver.
-    #[serde(default)]
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-    tile_size: Option<u32>,
 }
 
 fn default_convergence_check_interval() -> u64 {
@@ -357,22 +349,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             match solver {
                 SolverMode::Mccfr => run_mccfr_training(training_config)?,
                 SolverMode::Sequence => run_sequence_training(training_config)?,
-                SolverMode::Gpu => {
-                    #[cfg(feature = "gpu")]
-                    {
-                        run_gpu_training(training_config)?;
-                    }
-                    #[cfg(not(feature = "gpu"))]
-                    {
-                        eprintln!(
-                            "Error: GPU solver requires `--features gpu` at build time."
-                        );
-                        eprintln!(
-                            "Build with: cargo run -p poker-solver-trainer --features gpu --release -- train ..."
-                        );
-                        std::process::exit(1);
-                    }
-                }
             }
         }
         Commands::GenerateDeals {
@@ -1467,13 +1443,13 @@ where
     }
 }
 
-/// Minimal interface that both `SequenceCfrSolver` and `TabularGpuCfrSolver` satisfy.
+/// Minimal interface for training solver backends.
 trait SimpleTrainingSolverBackend {
     fn train_with_cb(&mut self, iterations: u64, callback: &dyn Fn(u64));
     fn strategies(&self) -> FxHashMap<u64, Vec<f64>>;
     fn strategies_best_effort(&self) -> FxHashMap<u64, Vec<f64>>;
     fn iters(&self) -> u64;
-    /// GPU max regret (upper bound on exploitability). `None` for CPU solvers.
+    /// Max regret (upper bound on exploitability). `None` by default.
     fn max_regret(&self) -> Option<f32> {
         None
     }
@@ -1491,44 +1467,6 @@ impl SimpleTrainingSolverBackend for SequenceCfrSolver {
     }
     fn iters(&self) -> u64 {
         self.iterations()
-    }
-}
-
-#[cfg(feature = "gpu")]
-impl SimpleTrainingSolverBackend for poker_solver_gpu_cfr::tabular::TabularGpuCfrSolver {
-    fn train_with_cb(&mut self, iterations: u64, callback: &dyn Fn(u64)) {
-        self.train_with_callback(iterations, callback);
-    }
-    fn strategies(&self) -> FxHashMap<u64, Vec<f64>> {
-        self.all_strategies()
-    }
-    fn strategies_best_effort(&self) -> FxHashMap<u64, Vec<f64>> {
-        self.all_strategies()
-    }
-    fn iters(&self) -> u64 {
-        self.iterations()
-    }
-    fn max_regret(&self) -> Option<f32> {
-        Some(self.max_regret())
-    }
-}
-
-#[cfg(feature = "gpu")]
-impl SimpleTrainingSolverBackend for poker_solver_gpu_cfr::tiled::TiledTabularGpuCfrSolver {
-    fn train_with_cb(&mut self, iterations: u64, callback: &dyn Fn(u64)) {
-        self.train_with_callback(iterations, callback);
-    }
-    fn strategies(&self) -> FxHashMap<u64, Vec<f64>> {
-        self.all_strategies()
-    }
-    fn strategies_best_effort(&self) -> FxHashMap<u64, Vec<f64>> {
-        self.all_strategies()
-    }
-    fn iters(&self) -> u64 {
-        self.iterations()
-    }
-    fn max_regret(&self) -> Option<f32> {
-        Some(self.max_regret())
     }
 }
 
@@ -2157,199 +2095,6 @@ fn run_sequence_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
     };
 
     run_training_loop(&mut wrapper, &loop_config)
-}
-
-#[cfg(feature = "gpu")]
-fn run_gpu_training(config: TrainingConfig) -> Result<(), Box<dyn Error>> {
-    use poker_solver_gpu_cfr::GpuCfrConfig;
-    use poker_solver_gpu_cfr::tabular::TabularGpuCfrSolver;
-    use poker_solver_gpu_cfr::tiled::TiledTabularGpuCfrSolver;
-
-    let abs_mode = config.training.abstraction_mode;
-    let abstraction_mode = build_abstraction_mode(&config);
-    let abstraction_for_deals = build_abstraction_mode(&config);
-
-    println!("=== Poker Blueprint Trainer (Tabular GPU CFR) ===\n");
-    println!("Game config:");
-    println!("  Stack depth: {} BB", config.game.stack_depth);
-    println!("  Bet sizes: {:?} pot", config.game.bet_sizes);
-    if config.training.exhaustive {
-        println!("  Mode: exhaustive abstract deals");
-    } else {
-        println!("  Deal pool size: {}", config.training.deal_count);
-    }
-    println!();
-
-    let iterations = if let Some(threshold) = config.training.regret_threshold {
-        println!("Convergence mode: delta < {threshold:.6}");
-        u64::MAX
-    } else if config.training.iterations > 0 {
-        config.training.iterations
-    } else {
-        return Err("Either iterations or regret_threshold must be set".into());
-    };
-
-    // Build deals: either exhaustive abstract or random concrete
-    println!("Step 1/4: Loading deals...");
-    let step_start = Instant::now();
-    let deals = if config.training.exhaustive {
-        build_exhaustive_deals(&config)?
-    } else if let Some(ref dir) = config.training.abstract_deals_dir {
-        load_abstract_deals(dir)?
-    } else {
-        let mut game = HunlPostflop::new(
-            config.game.clone(),
-            abstraction_mode.clone(),
-            config.training.deal_count,
-        );
-        if config.training.min_deals_per_class > 0 {
-            game = game.with_stratification(
-                config.training.min_deals_per_class,
-                config.training.max_rejections_per_class,
-            );
-        }
-        let states = game.initial_states();
-        println!("  Building deal info for {} deals...", states.len());
-        let start = Instant::now();
-        let deals = build_deal_infos(&game, &states, &abstraction_for_deals);
-        println!("  Deal info built in {:?}", start.elapsed());
-        deals
-    };
-    println!(
-        "  {} deals loaded in {:?}\n",
-        deals.len(),
-        step_start.elapsed()
-    );
-
-    println!("Step 2/4: Materializing game tree...");
-    let start = Instant::now();
-    let tree_game = HunlPostflop::new(config.game.clone(), None, 1);
-    let tree_states = tree_game.initial_states();
-    let tree = materialize_postflop(&tree_game, &tree_states[0]);
-    println!(
-        "  {} nodes, done in {:?}\n",
-        tree.stats.total_nodes,
-        start.elapsed()
-    );
-
-    println!("Step 3/4: Initializing tabular GPU solver...");
-    let start = Instant::now();
-    let gpu_config = GpuCfrConfig {
-        dcfr_alpha: 1.5,
-        dcfr_beta: 0.5,
-        dcfr_gamma: 2.0,
-        tile_size: config.training.tile_size,
-        ..Default::default()
-    };
-
-    // Choose tiled vs untiled solver based on tile_size config.
-    // tile_size: None => auto-detect (use tiled if coupling matrices too large)
-    // tile_size: Some(0) => force untiled
-    // tile_size: Some(n) => force tiled with given tile size
-    let use_tiled = match config.training.tile_size {
-        Some(0) => false,
-        Some(_) => true,
-        None => {
-            // Auto-detect: use tiled if coupling matrices would exceed ~8 GB
-            let n1 = deals
-                .iter()
-                .map(|d| d.hand_bits_p1)
-                .collect::<std::collections::HashSet<_>>()
-                .len() as u64;
-            let n2 = deals
-                .iter()
-                .map(|d| d.hand_bits_p2)
-                .collect::<std::collections::HashSet<_>>()
-                .len() as u64;
-            let coupling_bytes = 6 * n1 * n2 * 4; // 6 matrices (3 + 3 transposed) x f32
-            coupling_bytes > 8 * 1024 * 1024 * 1024
-        }
-    };
-
-    // Build bundle config for saves (shared by both paths)
-    let bundle_config = BundleConfig {
-        game: config.game.clone(),
-        abstraction: config.abstraction.clone(),
-        abstraction_mode: abs_mode,
-        strength_bits: if abs_mode == AbstractionModeConfig::HandClassV2 {
-            config.training.strength_bits
-        } else {
-            0
-        },
-        equity_bits: if abs_mode == AbstractionModeConfig::HandClassV2 {
-            config.training.equity_bits
-        } else {
-            0
-        },
-        ..BundleConfig::default()
-    };
-    let boundaries = None;
-    let actions = tree_game.actions(&tree_states[0]);
-    let action_labels = format_action_labels(&actions);
-    let header = format_table_header(&action_labels);
-
-    if use_tiled {
-        let tile_sz = config.training.tile_size.unwrap_or(32_768);
-        println!("  Using tiled solver (tile_size={tile_sz})");
-        let solver = TiledTabularGpuCfrSolver::new(&tree, deals, gpu_config)?;
-        println!(
-            "  {} info sets, initialized in {:?}\n",
-            solver.num_info_sets(),
-            start.elapsed()
-        );
-        let mut wrapper = SimpleTrainingSolver {
-            solver,
-            prefix: "gpu_checkpoint_",
-            prev_strategies: None,
-            last_delta: 0.0,
-            training_start: Instant::now(),
-            header,
-            action_labels,
-            stack_depth: config.game.stack_depth,
-            abs_mode,
-            regret_threshold: config.training.regret_threshold,
-        };
-        let loop_config = TrainingLoopConfig {
-            regret_threshold: config.training.regret_threshold,
-            check_interval: config.training.convergence_check_interval,
-            iterations,
-            output_dir: &config.training.output_dir,
-            bundle_config: &bundle_config,
-            boundaries: &boundaries,
-        };
-        println!("Step 4/4: Training ({iterations} iterations)...\n");
-        run_training_loop(&mut wrapper, &loop_config)
-    } else {
-        println!("  Using untiled solver");
-        let solver = TabularGpuCfrSolver::new(&tree, deals, gpu_config)?;
-        println!(
-            "  {} info sets, initialized in {:?}\n",
-            solver.num_info_sets(),
-            start.elapsed()
-        );
-        let mut wrapper = SimpleTrainingSolver {
-            solver,
-            prefix: "gpu_checkpoint_",
-            prev_strategies: None,
-            last_delta: 0.0,
-            training_start: Instant::now(),
-            header,
-            action_labels,
-            stack_depth: config.game.stack_depth,
-            abs_mode,
-            regret_threshold: config.training.regret_threshold,
-        };
-        let loop_config = TrainingLoopConfig {
-            regret_threshold: config.training.regret_threshold,
-            check_interval: config.training.convergence_check_interval,
-            iterations,
-            output_dir: &config.training.output_dir,
-            bundle_config: &bundle_config,
-            boundaries: &boundaries,
-        };
-        println!("Step 4/4: Training ({iterations} iterations)...\n");
-        run_training_loop(&mut wrapper, &loop_config)
-    }
 }
 
 fn save_checkpoint(

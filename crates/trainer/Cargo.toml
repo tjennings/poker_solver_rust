@@ -8,7 +8,6 @@ description = "CLI tool for training poker blueprint strategies"
 
 [dependencies]
 poker-solver-core = { path = "../core" }
-poker-solver-gpu-cfr = { path = "../gpu-cfr", optional = true }
 clap = { version = "4", features = ["derive"] }
 rayon.workspace = true
 indicatif = "0.17"
@@ -21,6 +20,3 @@ rand = "0.9.2"
 
 [dev-dependencies]
 tempfile = "3"
-
-[features]
-gpu = ["dep:poker-solver-gpu-cfr"]

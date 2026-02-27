@@ -47,7 +47,6 @@ cargo run -p poker-solver-trainer --release -- <subcommand>  # always --release 
 |-|-|
 | `core` | Game logic, CFR solvers, preflop, hand eval, abstractions |
 | `trainer` | CLI: training, diagnostics, deal generation |
-| `gpu-cfr` | GPU sequence-form CFR (wgpu) |
 | `tauri-app` | Desktop GUI exploration app |
 | `devserver` | HTTP mirror of Tauri API for browser debugging |
 | `test-macros` | `#[timed_test]` proc macro |
