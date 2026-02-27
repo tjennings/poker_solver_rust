@@ -1,0 +1,16 @@
+# Minimal postflop solver config.
+# Solves postflop game trees on fixed flops.
+#
+# Usage:
+#   cargo run -p poker-solver-trainer --release -- solve-postflop \
+#     -c sample_configurations/minimal_postflop.yaml -o minimal_postflop
+
+postflop_model:
+  solve_type: exhaustive
+  fixed_flops: ['AhKsQd', '2c3h4d']   # 2 flops — fast smoke test
+  bet_sizes: [0.5, 1.0]
+  max_raises_per_street: 2
+  postflop_solve_iterations: 500
+  value_extraction_samples: 5
+  cfr_convergence_threshold: 200       # mBB/h — loose for speed
+  ev_convergence_threshold: 0.5

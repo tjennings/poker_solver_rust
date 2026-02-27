@@ -740,6 +740,13 @@ struct PreflopTrainingConfig {
     pub ev_diagnostic_hands: Option<String>,
 }
 
+/// Lightweight config wrapper for `solve-postflop` — avoids requiring
+/// the full `PreflopTrainingConfig` (positions, blinds, stacks, etc.).
+#[derive(Debug, Deserialize)]
+struct PostflopSolveConfig {
+    postflop_model: PostflopModelConfig,
+}
+
 fn default_iterations() -> u64 { 5000 }
 fn default_equity_samples() -> u32 { 20000 }
 fn default_print_every() -> u64 { 1000 }
@@ -1012,11 +1019,8 @@ fn build_postflop_with_progress(
 
 fn run_solve_postflop(config_path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     let yaml = std::fs::read_to_string(config_path)?;
-    let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
-    let pf_config = training
-        .game
-        .postflop_model
-        .ok_or("config file has no postflop_model section")?;
+    let config: PostflopSolveConfig = serde_yaml::from_str(&yaml)?;
+    let pf_config = config.postflop_model;
 
     eprintln!("Building postflop abstraction...");
 
