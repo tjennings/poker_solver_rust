@@ -258,14 +258,15 @@ pub async fn load_bundle_core(
             // Hand-averaged EV table: prefer PreflopBundle's embedded copy,
             // fall back to postflop/ subdirectory, then co-located solve.bin.
             let hand_avg_values = preflop.hand_avg_values.clone().or_else(|| {
-                // Fallback 1: postflop/ subdirectory (older training layout)
                 let postflop_dir = bp.join("postflop");
-                if poker_solver_core::preflop::PostflopBundle::exists(&postflop_dir) {
-                    return poker_solver_core::preflop::PostflopBundle::load(&postflop_dir)
-                        .ok()
-                        .map(|b| b.hand_avg_values().to_vec());
+                // Try multi-SPR bundle (handles both new and legacy layouts)
+                if let Ok(abstractions) = poker_solver_core::preflop::PostflopBundle::load_multi(
+                    &poker_solver_core::preflop::PostflopModelConfig::default(),
+                    &postflop_dir,
+                ) {
+                    return abstractions.into_iter().next().map(|a| a.hand_avg_values);
                 }
-                // Fallback 2: solve.bin at root (solve-postflop output co-located with preflop)
+                // Legacy: co-located solve.bin at root
                 let solve_bin = bp.join("solve.bin");
                 if solve_bin.exists() {
                     return poker_solver_core::preflop::PostflopBundle::load_hand_avg_values(&solve_bin).ok();
@@ -341,15 +342,17 @@ pub async fn load_preflop_solve_core(
         let preflop = poker_solver_core::preflop::PreflopBundle::load(&bundle_path)
             .map_err(|e| format!("Failed to load preflop bundle: {e}"))?;
 
-        let postflop_dir = bundle_path.join("postflop");
-        let hand_avg_values =
-            if poker_solver_core::preflop::PostflopBundle::exists(&postflop_dir) {
-                poker_solver_core::preflop::PostflopBundle::load(&postflop_dir)
-                    .ok()
-                    .map(|b| b.hand_avg_values().to_vec())
+        let hand_avg_values = {
+            let postflop_dir = bundle_path.join("postflop");
+            if let Ok(abstractions) = poker_solver_core::preflop::PostflopBundle::load_multi(
+                &poker_solver_core::preflop::PostflopModelConfig::default(),
+                &postflop_dir,
+            ) {
+                abstractions.into_iter().next().map(|a| a.hand_avg_values)
             } else {
                 None
-            };
+            }
+        };
 
         Ok::<_, String>((preflop, hand_avg_values))
     })
