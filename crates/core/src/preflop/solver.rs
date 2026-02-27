@@ -181,6 +181,8 @@ pub struct PreflopSolver {
     stacks: [u32; 2],
     /// Optional postflop model state.
     postflop: Option<PostflopState>,
+    /// Reusable snapshot buffer for frozen regrets (avoids per-iteration allocation).
+    snapshot_buf: Vec<f64>,
 }
 
 impl PreflopSolver {
@@ -225,6 +227,7 @@ impl PreflopSolver {
                 config.stacks.get(1).copied().unwrap_or(0),
             ],
             postflop: None,
+            snapshot_buf: vec![0.0; buf_size],
         }
     }
 
@@ -439,14 +442,14 @@ impl PreflopSolver {
     /// using the same frozen regret snapshot.
     #[allow(clippy::cast_precision_loss)]
     fn train_one_iteration(&mut self) {
-        let snapshot = self.regret_sum.clone();
+        self.snapshot_buf.clone_from(&self.regret_sum);
 
         let ctx = Ctx {
             tree: &self.tree,
             investments: &self.investments,
             equity: &self.equity,
             layout: &self.layout,
-            snapshot: &snapshot,
+            snapshot: &self.snapshot_buf,
             exploration: self.exploration,
             iteration: self.iteration,
             cfr_variant: self.cfr_variant,
