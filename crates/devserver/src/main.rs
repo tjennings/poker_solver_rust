@@ -64,6 +64,7 @@ struct ComboClassesParams {
 #[derive(Deserialize)]
 struct HandEquityParams {
     hand: String,
+    villain_hand: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +191,7 @@ async fn handle_get_hand_equity(
     result_to_response(poker_solver_tauri::get_hand_equity_core(
         &state,
         &params.hand,
+        params.villain_hand.as_deref(),
     ))
 }
 
