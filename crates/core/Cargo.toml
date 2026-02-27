@@ -33,3 +33,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "sequence_cfr_bench"
 harness = false
+
+[[bench]]
+name = "preflop_solver_bench"
+harness = false
