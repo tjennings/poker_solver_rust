@@ -754,6 +754,20 @@ fn normalize(sums: &[f64]) -> Vec<f64> {
     }
 }
 
+/// Select the index of the closest SPR model to `actual_spr`.
+///
+/// `sprs` must be non-empty. Returns the index into `sprs` with the
+/// smallest absolute distance to `actual_spr`.
+fn select_closest_spr(sprs: &[f64], actual_spr: f64) -> usize {
+    sprs.iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (*a - actual_spr).abs().total_cmp(&(*b - actual_spr).abs())
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
 /// Look up pre-solved postflop EV from the value table with SPR scaling.
 ///
 /// The postflop model was solved at a fixed SPR (e.g. 3.5). When the actual
@@ -1416,5 +1430,23 @@ mod tests {
             ev_raised > ev_limped * 3.0,
             "Raised pot value ({ev_raised}) should be much larger than limped ({ev_limped})"
         );
+    }
+
+    #[timed_test]
+    fn select_closest_spr_picks_nearest() {
+        let sprs = [2.0, 6.0, 20.0];
+        assert_eq!(super::select_closest_spr(&sprs, 1.0), 0);
+        assert_eq!(super::select_closest_spr(&sprs, 3.0), 0);
+        assert_eq!(super::select_closest_spr(&sprs, 4.5), 1);
+        assert_eq!(super::select_closest_spr(&sprs, 5.0), 1);
+        assert_eq!(super::select_closest_spr(&sprs, 12.0), 1);
+        assert_eq!(super::select_closest_spr(&sprs, 13.5), 2);
+        assert_eq!(super::select_closest_spr(&sprs, 50.0), 2);
+    }
+
+    #[timed_test]
+    fn select_closest_spr_single_element() {
+        assert_eq!(super::select_closest_spr(&[3.5], 0.0), 0);
+        assert_eq!(super::select_closest_spr(&[3.5], 100.0), 0);
     }
 }
