@@ -6,8 +6,8 @@
 use rayon::prelude::*;
 
 use super::postflop_abstraction::{
-    regret_matching_into, normalize_strategy_sum, BuildPhase,
-    FlopSolveResult, FlopStage, PostflopLayout, PostflopValues, MAX_POSTFLOP_ACTIONS,
+    normalize_strategy_sum, regret_matching_into, BuildPhase, FlopSolveResult, FlopStage,
+    PostflopLayout, PostflopValues, MAX_POSTFLOP_ACTIONS,
 };
 use super::postflop_hands::{all_cards_vec, build_combo_map, NUM_CANONICAL_HANDS};
 use super::postflop_model::PostflopModelConfig;
@@ -110,6 +110,11 @@ fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec
 
 /// CFR traversal with equity table lookups at showdown.
 ///
+/// Reads strategy from a frozen `snapshot` and writes regret/strategy deltas
+/// to separate `dr`/`ds` buffers. This split enables future parallelisation:
+/// multiple threads can share a read-only snapshot while writing to thread-local
+/// delta buffers.
+///
 /// Both players are traversed every iteration. Chance nodes pass through
 /// to their single child (board cards are implicit in the equity table).
 /// Supports LCFR/DCFR iteration weighting via `dcfr` params.
@@ -118,8 +123,9 @@ fn exhaustive_cfr_traverse(
     tree: &PostflopTree,
     layout: &PostflopLayout,
     equity_table: &[f64],
-    regret_sum: &mut [f64],
-    strategy_sum: &mut [f64],
+    snapshot: &[f64],
+    dr: &mut [f64],
+    ds: &mut [f64],
     node_idx: u32,
     hero_hand: u16,
     opp_hand: u16,
@@ -134,14 +140,33 @@ fn exhaustive_cfr_traverse(
         PostflopNode::Terminal {
             terminal_type,
             pot_fraction,
-        } => terminal_payoff(*terminal_type, *pot_fraction, equity_table, hero_hand, opp_hand, hero_pos, n),
+        } => terminal_payoff(
+            *terminal_type,
+            *pot_fraction,
+            equity_table,
+            hero_hand,
+            opp_hand,
+            hero_pos,
+            n,
+        ),
 
         PostflopNode::Chance { children, .. } => {
             debug_assert!(!children.is_empty());
             exhaustive_cfr_traverse(
-                tree, layout, equity_table, regret_sum, strategy_sum,
-                children[0], hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
-                iteration, dcfr,
+                tree,
+                layout,
+                equity_table,
+                snapshot,
+                dr,
+                ds,
+                children[0],
+                hero_hand,
+                opp_hand,
+                hero_pos,
+                reach_hero,
+                reach_opp,
+                iteration,
+                dcfr,
             )
         }
 
@@ -154,16 +179,26 @@ fn exhaustive_cfr_traverse(
             let num_actions = children.len();
 
             let mut strategy = [0.0f64; MAX_POSTFLOP_ACTIONS];
-            regret_matching_into(regret_sum, start, &mut strategy[..num_actions]);
+            regret_matching_into(snapshot, start, &mut strategy[..num_actions]);
 
             if is_hero {
                 let mut action_values = [0.0f64; MAX_POSTFLOP_ACTIONS];
                 for (i, &child) in children.iter().enumerate() {
                     action_values[i] = exhaustive_cfr_traverse(
-                        tree, layout, equity_table, regret_sum, strategy_sum,
-                        child, hero_hand, opp_hand, hero_pos,
-                        reach_hero * strategy[i], reach_opp,
-                        iteration, dcfr,
+                        tree,
+                        layout,
+                        equity_table,
+                        snapshot,
+                        dr,
+                        ds,
+                        child,
+                        hero_hand,
+                        opp_hand,
+                        hero_pos,
+                        reach_hero * strategy[i],
+                        reach_opp,
+                        iteration,
+                        dcfr,
                     );
                 }
                 let node_value: f64 = strategy[..num_actions]
@@ -174,10 +209,10 @@ fn exhaustive_cfr_traverse(
 
                 let (regret_weight, strategy_weight) = dcfr.iteration_weights(iteration);
                 for (i, val) in action_values[..num_actions].iter().enumerate() {
-                    regret_sum[start + i] += regret_weight * reach_opp * (val - node_value);
+                    dr[start + i] += regret_weight * reach_opp * (val - node_value);
                 }
                 for (i, &s) in strategy[..num_actions].iter().enumerate() {
-                    strategy_sum[start + i] += strategy_weight * reach_hero * s;
+                    ds[start + i] += strategy_weight * reach_hero * s;
                 }
                 node_value
             } else {
@@ -187,10 +222,20 @@ fn exhaustive_cfr_traverse(
                     .map(|(i, &child)| {
                         strategy[i]
                             * exhaustive_cfr_traverse(
-                                tree, layout, equity_table, regret_sum, strategy_sum,
-                                child, hero_hand, opp_hand, hero_pos,
-                                reach_hero, reach_opp * strategy[i],
-                                iteration, dcfr,
+                                tree,
+                                layout,
+                                equity_table,
+                                snapshot,
+                                dr,
+                                ds,
+                                child,
+                                hero_hand,
+                                opp_hand,
+                                hero_pos,
+                                reach_hero,
+                                reach_opp * strategy[i],
+                                iteration,
+                                dcfr,
                             )
                     })
                     .sum()
@@ -252,11 +297,25 @@ fn best_response_ev(
         PostflopNode::Terminal {
             terminal_type,
             pot_fraction,
-        } => terminal_payoff(*terminal_type, *pot_fraction, equity_table, hero_hand, opp_hand, br_player, n),
+        } => terminal_payoff(
+            *terminal_type,
+            *pot_fraction,
+            equity_table,
+            hero_hand,
+            opp_hand,
+            br_player,
+            n,
+        ),
 
         PostflopNode::Chance { children, .. } => best_response_ev(
-            tree, layout, strategy_sum, equity_table,
-            children[0], hero_hand, opp_hand, br_player,
+            tree,
+            layout,
+            strategy_sum,
+            equity_table,
+            children[0],
+            hero_hand,
+            opp_hand,
+            br_player,
         ),
 
         PostflopNode::Decision {
@@ -273,8 +332,14 @@ fn best_response_ev(
                     .iter()
                     .map(|&child| {
                         best_response_ev(
-                            tree, layout, strategy_sum, equity_table,
-                            child, hero_hand, opp_hand, br_player,
+                            tree,
+                            layout,
+                            strategy_sum,
+                            equity_table,
+                            child,
+                            hero_hand,
+                            opp_hand,
+                            br_player,
                         )
                     })
                     .fold(f64::NEG_INFINITY, f64::max)
@@ -287,8 +352,14 @@ fn best_response_ev(
                     .map(|(i, &child)| {
                         strategy[i]
                             * best_response_ev(
-                                tree, layout, strategy_sum, equity_table,
-                                child, hero_hand, opp_hand, br_player,
+                                tree,
+                                layout,
+                                strategy_sum,
+                                equity_table,
+                                child,
+                                hero_hand,
+                                opp_hand,
+                                br_player,
                             )
                     })
                     .sum()
@@ -299,7 +370,7 @@ fn best_response_ev(
 
 /// Assumed initial pot size in BB for mBB/h conversion.
 ///
-/// Standard HU open (~3× pot entering flop). This matches the preflop
+/// Standard HU open (~3x pot entering flop). This matches the preflop
 /// solver's convention of reporting exploitability in mBB.
 const INITIAL_POT_BB: f64 = 3.0;
 
@@ -332,8 +403,7 @@ fn compute_exploitability(
                 }
 
                 total += best_response_ev(
-                    tree, layout, strategy_sum, equity_table,
-                    0, hero_hand, opp_hand, br_player,
+                    tree, layout, strategy_sum, equity_table, 0, hero_hand, opp_hand, br_player,
                 );
                 count += 1;
             }
@@ -374,6 +444,7 @@ fn exhaustive_solve_one_flop(
     let n = NUM_CANONICAL_HANDS;
 
     for iter in 0..num_iterations {
+        let snapshot = regret_sum.clone();
         // Traverse all hand pairs
         for hero_hand in 0..n as u16 {
             for opp_hand in 0..n as u16 {
@@ -387,6 +458,7 @@ fn exhaustive_solve_one_flop(
                         tree,
                         layout,
                         equity_table,
+                        &snapshot,
                         &mut regret_sum,
                         &mut strategy_sum,
                         0,
@@ -455,14 +527,14 @@ fn exhaustive_extract_values(
     equity_table: &[f64],
 ) -> Vec<f64> {
     let n = NUM_CANONICAL_HANDS;
-    // NaN = "no valid combos on this flop" — skipped during cross-flop averaging.
+    // NaN = "no valid combos on this flop" -- skipped during cross-flop averaging.
     let mut values = vec![f64::NAN; 2 * n * n];
 
     for hero_hand in 0..n as u16 {
         for opp_hand in 0..n as u16 {
             let eq = equity_table[hero_hand as usize * n + opp_hand as usize];
             if eq.is_nan() {
-                continue; // remains NaN — signals missing data
+                continue; // remains NaN -- signals missing data
             }
 
             for hero_pos in 0..2u8 {
@@ -848,10 +920,12 @@ mod tests {
         });
 
         if let Some((node_idx, folder, pot_fraction)) = fold_node {
+            let snapshot = regret_sum.clone();
             let ev = exhaustive_cfr_traverse(
                 &tree,
                 &layout,
                 &equity_table,
+                &snapshot,
                 &mut regret_sum,
                 &mut strategy_sum,
                 node_idx,
@@ -916,10 +990,12 @@ mod tests {
             let opp_hand = 50u16;
             let eq = equity_table[hero_hand as usize * n + opp_hand as usize];
 
+            let snapshot = regret_sum.clone();
             let ev = exhaustive_cfr_traverse(
                 &tree,
                 &layout,
                 &equity_table,
+                &snapshot,
                 &mut regret_sum,
                 &mut strategy_sum,
                 node_idx,
@@ -959,10 +1035,13 @@ mod tests {
     #[timed_test(2)]
     fn exploitability_is_positive_for_uniform_strategy() {
         let (tree, layout, equity_table) = expl_test_fixtures();
-        // All-zero strategy_sum → normalize_strategy_sum returns uniform
+        // All-zero strategy_sum -> normalize_strategy_sum returns uniform
         let strategy_sum = vec![0.0f64; layout.total_size];
         let expl = compute_exploitability(&tree, &layout, &strategy_sum, &equity_table);
-        assert!(expl > 0.0, "uniform strategy should be exploitable, got {expl}");
+        assert!(
+            expl > 0.0,
+            "uniform strategy should be exploitable, got {expl}"
+        );
     }
 
     #[timed_test(10)]
@@ -971,26 +1050,36 @@ mod tests {
         // Uniform strategy exploitability (baseline).
         let uniform_sum = vec![0.0f64; layout.total_size];
         let expl_uniform = compute_exploitability(&tree, &layout, &uniform_sum, &equity_table);
-        // 2 CFR iterations with no early stop → result.delta is exploitability after iter 1.
+        // 3 CFR iterations with no early stop. With snapshot-based CFR the first
+        // iteration reads uniform regrets, so convergence needs one extra iteration
+        // compared to in-place updates.
         let dcfr = DcfrParams::linear();
         let result = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 2, 0.0, "test", &dcfr, &|_| {},
+            &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, &|_| {},
         );
         assert!(
             result.delta < expl_uniform,
             "trained exploitability ({:.6}) should be less than uniform ({:.6})",
-            result.delta, expl_uniform
+            result.delta,
+            expl_uniform
         );
     }
 
     #[timed_test(5)]
     fn exploitability_early_stopping_triggers() {
         let (tree, layout, equity_table) = expl_test_fixtures();
-        // Very generous threshold (30 BB/h) — stops at first exploitability check.
+        // Very generous threshold (30 BB/h) -- stops at first exploitability check.
         let threshold_mbb = 30_000.0;
         let dcfr = DcfrParams::linear();
         let result = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 30, threshold_mbb, "test", &dcfr, &|_| {},
+            &tree,
+            &layout,
+            &equity_table,
+            30,
+            threshold_mbb,
+            "test",
+            &dcfr,
+            &|_| {},
         );
         assert_eq!(
             result.iterations_used, 2,
