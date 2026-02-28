@@ -33,10 +33,35 @@ blinds:
 antes: []
 stacks: [200, 200]  # 100 BB each (SB=1, BB=2)
 
+# -- Raise / bet sizes --
+# Format: "Xbb" for big-blind multiples (preflop opens),
+#          "Xp" for pot fractions (postflop sizing).
+#
+# Geometric sizing: pick pot fractions that get all-in over remaining streets.
+#   g = ((2*SPR + 1)^(1/n) - 1) / 2
+#
+# At 100BB with a 3BB open (pot ≈ 7BB, SPR ≈ 14):
+#   3 streets (flop):  g ≈ 1.28    →  "1.3p"
+#   2 streets (turn):  g ≈ 2.85    →  "2.85p"  (or just all-in)
+#   1 street  (river): all-in      →  solver adds all-in automatically
+#
+# Standard static sizing (original):
+# raise_sizes:
+#   - ["2bb", "1.0p"]           # preflop: 2bb open, pot-sized 3bet
+#   - ["0.5p", "1.0p"]          # flop
+#   - ["0.5p", "1.0p"]          # turn/river
+#
+# Geometric sizing for ~100BB deep play:
+# raise_sizes:
+#   - ["2bb", "1.0p"]           # preflop: 2bb open, pot-sized 3bet
+#   - ["0.67p", "1.3p"]         # flop: geometric for SPR ≈ 6-14
+#   - ["1.0p", "2.0p"]          # turn/river: larger to get stacks in
+#
+# Hybrid (default): geometric anchors + traditional sizes
 raise_sizes:
   - ["2bb", "1.0p"]              # preflop: 2bb open, pot-sized 3bet
-  - ["0.5p", "1.0p"]             # flop
-  - ["0.5p", "1.0p"]             # turn/river
+  - ["0.5p", "0.67p", "1.0p"]   # flop: half-pot, geo(SPR6), pot
+  - ["0.67p", "1.0p", "1.3p"]   # turn/river: geo(SPR6), pot, geo(SPR14)
 
 raise_cap: 3
 
