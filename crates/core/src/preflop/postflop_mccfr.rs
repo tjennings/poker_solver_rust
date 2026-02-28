@@ -653,6 +653,7 @@ mod tests {
     use super::*;
     use crate::poker::{Suit, Value};
     use crate::preflop::postflop_abstraction::annotate_streets;
+    use crate::preflop::config::CfrVariant;
     use crate::preflop::postflop_model::PostflopSolveType;
     use test_macros::timed_test;
 
@@ -683,6 +684,7 @@ mod tests {
             mccfr_sample_pct: 0.01,
             value_extraction_samples: 1000,
             ev_convergence_threshold: 0.001,
+            cfr_variant: CfrVariant::Linear,
         }
     }
 

@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
+use crate::cfr::dcfr::DcfrParams;
 use super::config::{CfrVariant, PreflopConfig};
 use super::equity::EquityTable;
 use super::postflop_abstraction::PostflopAbstraction;
@@ -127,8 +128,8 @@ struct Ctx<'a> {
     /// Current iteration number (1-based). Used for LCFR linear weighting
     /// of strategy contributions: `ds += iteration * reach * strategy`.
     iteration: u64,
-    /// CFR variant controlling iteration weighting.
-    cfr_variant: CfrVariant,
+    /// DCFR parameters (variant, discounting, warmup).
+    dcfr: &'a DcfrParams,
     /// Per-player starting stacks (SB units).
     stacks: [u32; 2],
     /// Optional postflop abstraction for modeling postflop play at showdown terminals.
@@ -164,16 +165,8 @@ pub struct PreflopSolver {
     /// Used for convergence metrics instead of cumulative regret sums,
     /// which are unsuitable under DCFR's asymmetric discounting.
     last_instantaneous_regret: Vec<f64>,
-    /// CFR variant (Vanilla, DCFR, or CFR+).
-    cfr_variant: CfrVariant,
-    /// DCFR positive regret discount exponent.
-    dcfr_alpha: f64,
-    /// DCFR negative regret discount exponent.
-    dcfr_beta: f64,
-    /// DCFR strategy sum discount exponent.
-    dcfr_gamma: f64,
-    /// Number of initial iterations without DCFR discounting.
-    dcfr_warmup: u64,
+    /// DCFR parameters (variant, discounting, warmup).
+    dcfr: DcfrParams,
     /// ε-greedy exploration factor.
     exploration: f64,
     /// Per-player starting stacks (SB units).
@@ -215,11 +208,13 @@ impl PreflopSolver {
             strategy_sum: vec![0.0; buf_size],
             iteration: 0,
             last_instantaneous_regret: Vec::new(),
-            cfr_variant: config.cfr_variant,
-            dcfr_alpha: config.dcfr_alpha,
-            dcfr_beta: config.dcfr_beta,
-            dcfr_gamma: config.dcfr_gamma,
-            dcfr_warmup: config.dcfr_warmup,
+            dcfr: DcfrParams::from_config(
+                config.cfr_variant,
+                config.dcfr_alpha,
+                config.dcfr_beta,
+                config.dcfr_gamma,
+                config.dcfr_warmup,
+            ),
             exploration: config.exploration,
             stacks: [
                 config.stacks.first().copied().unwrap_or(0),
@@ -321,7 +316,7 @@ impl PreflopSolver {
             return 0.0;
         }
 
-        match self.cfr_variant {
+        match self.dcfr.variant {
             CfrVariant::Vanilla | CfrVariant::CfrPlus => {
                 if self.regret_sum.is_empty() {
                     return 0.0;
@@ -368,27 +363,14 @@ impl PreflopSolver {
         )
     }
 
-    /// Compute DCFR strategy discount: `(t / (t + 1))^γ`.
-    #[allow(clippy::cast_precision_loss)]
-    fn strategy_discount(&self) -> f64 {
-        let t = self.iteration as f64;
-        (t / (t + 1.0)).powf(self.dcfr_gamma)
-    }
-
     /// Apply DCFR cumulative regret discounting to the hero's nodes only.
     ///
     /// With alternating updates, only the traversing player's regrets are
     /// updated each iteration. Discounting must match: only discount the
     /// hero's regrets so each player's regrets are discounted once per
     /// their update, matching standard simultaneous-update DCFR behavior.
-    ///
-    /// Positive regrets multiplied by `t^α / (t^α + 1)`.
-    /// Negative regrets multiplied by `t^β / (t^β + 1)`.
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation)]
     fn discount_regrets(&mut self, hero_pos: u8) {
-        let t = (self.iteration + 1) as f64;
-        let pos_factor = t.powf(self.dcfr_alpha) / (t.powf(self.dcfr_alpha) + 1.0);
-        let neg_factor = t.powf(self.dcfr_beta) / (t.powf(self.dcfr_beta) + 1.0);
         for (node_idx, node) in self.tree.nodes.iter().enumerate() {
             let (position, num_actions) = match node {
                 PreflopNode::Decision {
@@ -401,13 +383,7 @@ impl PreflopSolver {
             }
             let (base, _) = self.layout.slot(node_idx as u32, 0);
             let end = base + NUM_HANDS * num_actions;
-            for r in &mut self.regret_sum[base..end] {
-                if *r > 0.0 {
-                    *r *= pos_factor;
-                } else if *r < 0.0 {
-                    *r *= neg_factor;
-                }
-            }
+            self.dcfr.discount_regrets(&mut self.regret_sum[base..end], self.iteration);
         }
     }
 
@@ -416,7 +392,7 @@ impl PreflopSolver {
     /// Standard DCFR: `S^{T+1} = sd * S^T + new_contribution`.
     /// This ensures early (poor) strategies get exponentially washed out.
     #[allow(clippy::cast_possible_truncation)]
-    fn discount_strategy_sums(&mut self, hero_pos: u8, sd: f64) {
+    fn discount_strategy_sums(&mut self, hero_pos: u8) {
         for (node_idx, node) in self.tree.nodes.iter().enumerate() {
             let (position, num_actions) = match node {
                 PreflopNode::Decision {
@@ -429,9 +405,7 @@ impl PreflopSolver {
             }
             let (base, _) = self.layout.slot(node_idx as u32, 0);
             let end = base + NUM_HANDS * num_actions;
-            for s in &mut self.strategy_sum[base..end] {
-                *s *= sd;
-            }
+            self.dcfr.discount_strategy_sums(&mut self.strategy_sum[base..end], self.iteration);
         }
     }
 
@@ -451,7 +425,7 @@ impl PreflopSolver {
             snapshot: &self.snapshot_buf,
             exploration: self.exploration,
             iteration: self.iteration,
-            cfr_variant: self.cfr_variant,
+            dcfr: &self.dcfr,
             stacks: self.stacks,
             postflop: self.postflop.as_ref(),
         };
@@ -461,7 +435,7 @@ impl PreflopSolver {
         self.apply_discounting();
         add_into(&mut self.regret_sum, &mr);
         add_into(&mut self.strategy_sum, &ms);
-        if self.cfr_variant == CfrVariant::CfrPlus {
+        if self.dcfr.should_floor_regrets() {
             self.floor_regrets();
         }
         self.last_instantaneous_regret = mr;
@@ -470,25 +444,17 @@ impl PreflopSolver {
     /// Apply DCFR discounting to both players' cumulative values.
     /// Skipped entirely for Vanilla CFR and CFR+.
     fn apply_discounting(&mut self) {
-        if !matches!(self.cfr_variant, CfrVariant::Dcfr | CfrVariant::Linear) {
-            return;
-        }
-        if self.iteration > self.dcfr_warmup {
-            let sd = self.strategy_discount();
+        if self.dcfr.should_discount(self.iteration) {
             for pos in 0..2u8 {
                 self.discount_regrets(pos);
-                self.discount_strategy_sums(pos, sd);
+                self.discount_strategy_sums(pos);
             }
         }
     }
 
     /// Floor all cumulative regrets to zero (CFR+ update rule).
     fn floor_regrets(&mut self) {
-        for r in &mut self.regret_sum {
-            if *r < 0.0 {
-                *r = 0.0;
-            }
-        }
+        self.dcfr.floor_regrets(&mut self.regret_sum);
     }
 }
 
@@ -640,17 +606,7 @@ fn traverse_hero(
         .map(|(s, v)| s * v)
         .sum();
 
-    // Regret weighting: DCFR uses linear (LCFR), Vanilla and CFR+ use uniform.
-    // Strategy weighting: DCFR and CFR+ use linear, Vanilla uses uniform.
-    #[allow(clippy::cast_precision_loss)]
-    let (regret_weight, strategy_weight) = match ctx.cfr_variant {
-        CfrVariant::Vanilla => (1.0, 1.0),
-        CfrVariant::Dcfr | CfrVariant::Linear => {
-            let w = ctx.iteration as f64;
-            (w, w)
-        }
-        CfrVariant::CfrPlus => (1.0, ctx.iteration as f64),
-    };
+    let (regret_weight, strategy_weight) = ctx.dcfr.iteration_weights(ctx.iteration);
 
     for (i, val) in action_values[..num_actions].iter().enumerate() {
         dr[slot_start + i] += regret_weight * reach_opp * (val - node_value);
@@ -1026,9 +982,9 @@ mod tests {
     fn solver_stores_dcfr_params_from_config() {
         let config = tiny_config();
         let solver = PreflopSolver::new(&config);
-        assert!((solver.dcfr_alpha - 1.5).abs() < f64::EPSILON);
-        assert!((solver.dcfr_beta - 0.5).abs() < f64::EPSILON);
-        assert!((solver.dcfr_gamma - 2.0).abs() < f64::EPSILON);
+        assert!((solver.dcfr.alpha - 1.5).abs() < f64::EPSILON);
+        assert!((solver.dcfr.beta - 0.5).abs() < f64::EPSILON);
+        assert!((solver.dcfr.gamma - 2.0).abs() < f64::EPSILON);
     }
 
     #[timed_test]
@@ -1057,9 +1013,8 @@ mod tests {
     #[timed_test]
     fn strategy_discount_formula() {
         let config = tiny_config();
-        let mut solver = PreflopSolver::new(&config);
-        solver.iteration = 10;
-        let sd = solver.strategy_discount();
+        let solver = PreflopSolver::new(&config);
+        let sd = solver.dcfr.strategy_discount(10);
         let expected = (10.0_f64 / 11.0).powf(2.0);
         assert!(
             (sd - expected).abs() < 1e-10,

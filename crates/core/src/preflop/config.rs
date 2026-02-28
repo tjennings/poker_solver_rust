@@ -98,20 +98,7 @@ impl<'de> Deserialize<'de> for RaiseSize {
     }
 }
 
-/// Which CFR variant the preflop solver should use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum CfrVariant {
-    /// Standard CFR: no discounting, uniform iteration weighting.
-    Vanilla,
-    /// Discounted CFR with α/β/γ discounting and linear (LCFR) iteration weighting.
-    #[default]
-    Dcfr,
-    /// CFR+ (Tammelin 2014): regrets floored to zero, linear strategy weighting.
-    CfrPlus,
-    /// DCFR with all exponents = 1.0 (Pluribus linear weighting).
-    Linear,
-}
+pub use crate::cfr::dcfr::CfrVariant;
 
 fn default_exploration() -> f64 {
     0.05

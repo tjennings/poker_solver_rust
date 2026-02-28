@@ -2,6 +2,8 @@
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
+use crate::cfr::CfrVariant;
+
 fn default_bet_sizes() -> Vec<f32> {
     vec![0.5, 1.0]
 }
@@ -19,6 +21,10 @@ fn default_max_flop_boards() -> usize {
 }
 fn default_cfr_convergence_threshold() -> f64 {
     0.01
+}
+
+fn default_cfr_variant() -> CfrVariant {
+    CfrVariant::Linear
 }
 
 fn default_solve_type() -> PostflopSolveType {
@@ -131,6 +137,11 @@ pub struct PostflopModelConfig {
     /// Only used when solve_type is Mccfr. Default: 0.001.
     #[serde(default = "default_ev_convergence_threshold")]
     pub ev_convergence_threshold: f64,
+
+    /// CFR variant for the postflop solver.
+    /// Default: `linear` (LCFR -- linear iteration weighting, no discounting).
+    #[serde(default = "default_cfr_variant")]
+    pub cfr_variant: CfrVariant,
 }
 
 impl PostflopModelConfig {
@@ -149,6 +160,7 @@ impl PostflopModelConfig {
             mccfr_sample_pct: 0.05,
             value_extraction_samples: 5,
             ev_convergence_threshold: 0.001,
+            cfr_variant: CfrVariant::Linear,
         }
     }
 
@@ -167,6 +179,7 @@ impl PostflopModelConfig {
             mccfr_sample_pct: 0.01,
             value_extraction_samples: 10,
             ev_convergence_threshold: 0.001,
+            cfr_variant: CfrVariant::Linear,
         }
     }
 

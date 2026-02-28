@@ -13,7 +13,9 @@ use super::postflop_hands::{all_cards_vec, build_combo_map, NUM_CANONICAL_HANDS}
 use super::postflop_model::PostflopModelConfig;
 use super::postflop_tree::{PostflopNode, PostflopTerminalType, PostflopTree};
 use crate::abstraction::Street;
+use crate::cfr::dcfr::DcfrParams;
 use crate::poker::Card;
+use crate::preflop::CfrVariant;
 use crate::showdown_equity::rank_hand;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -106,10 +108,11 @@ fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec
 // CFR traversal
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Vanilla CFR traversal with equity table lookups at showdown.
+/// CFR traversal with equity table lookups at showdown.
 ///
 /// Both players are traversed every iteration. Chance nodes pass through
 /// to their single child (board cards are implicit in the equity table).
+/// Supports LCFR/DCFR iteration weighting via `dcfr` params.
 #[allow(clippy::too_many_arguments)]
 fn exhaustive_cfr_traverse(
     tree: &PostflopTree,
@@ -123,6 +126,8 @@ fn exhaustive_cfr_traverse(
     hero_pos: u8,
     reach_hero: f64,
     reach_opp: f64,
+    iteration: u64,
+    dcfr: &DcfrParams,
 ) -> f64 {
     let n = NUM_CANONICAL_HANDS;
     match &tree.nodes[node_idx as usize] {
@@ -136,6 +141,7 @@ fn exhaustive_cfr_traverse(
             exhaustive_cfr_traverse(
                 tree, layout, equity_table, regret_sum, strategy_sum,
                 children[0], hero_hand, opp_hand, hero_pos, reach_hero, reach_opp,
+                iteration, dcfr,
             )
         }
 
@@ -157,6 +163,7 @@ fn exhaustive_cfr_traverse(
                         tree, layout, equity_table, regret_sum, strategy_sum,
                         child, hero_hand, opp_hand, hero_pos,
                         reach_hero * strategy[i], reach_opp,
+                        iteration, dcfr,
                     );
                 }
                 let node_value: f64 = strategy[..num_actions]
@@ -165,11 +172,12 @@ fn exhaustive_cfr_traverse(
                     .map(|(s, v)| s * v)
                     .sum();
 
+                let (regret_weight, strategy_weight) = dcfr.iteration_weights(iteration);
                 for (i, val) in action_values[..num_actions].iter().enumerate() {
-                    regret_sum[start + i] += reach_opp * (val - node_value);
+                    regret_sum[start + i] += regret_weight * reach_opp * (val - node_value);
                 }
                 for (i, &s) in strategy[..num_actions].iter().enumerate() {
-                    strategy_sum[start + i] += reach_hero * s;
+                    strategy_sum[start + i] += strategy_weight * reach_hero * s;
                 }
                 node_value
             } else {
@@ -182,6 +190,7 @@ fn exhaustive_cfr_traverse(
                                 tree, layout, equity_table, regret_sum, strategy_sum,
                                 child, hero_hand, opp_hand, hero_pos,
                                 reach_hero, reach_opp * strategy[i],
+                                iteration, dcfr,
                             )
                     })
                     .sum()
@@ -345,7 +354,7 @@ fn compute_exploitability(
 // Solve one flop
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Solve a single flop using exhaustive vanilla CFR.
+/// Solve a single flop using exhaustive CFR with configurable iteration weighting.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn exhaustive_solve_one_flop(
     tree: &PostflopTree,
@@ -354,6 +363,7 @@ fn exhaustive_solve_one_flop(
     num_iterations: usize,
     convergence_threshold: f64,
     flop_name: &str,
+    dcfr: &DcfrParams,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> FlopSolveResult {
     let buf_size = layout.total_size;
@@ -385,9 +395,20 @@ fn exhaustive_solve_one_flop(
                         hero_pos,
                         1.0,
                         1.0,
+                        iter as u64,
+                        dcfr,
                     );
                 }
             }
+        }
+
+        // Apply DCFR discounting after each full iteration (all hand pairs, both positions).
+        if dcfr.should_discount(iter as u64) {
+            dcfr.discount_regrets(&mut regret_sum, iter as u64);
+            dcfr.discount_strategy_sums(&mut strategy_sum, iter as u64);
+        }
+        if dcfr.should_floor_regrets() {
+            dcfr.floor_regrets(&mut regret_sum);
         }
 
         iterations_used = iter + 1;
@@ -543,7 +564,7 @@ fn eval_with_avg_strategy(
 // Entry point
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Build postflop values using exhaustive vanilla CFR with equity tables.
+/// Build postflop values using exhaustive CFR with equity tables.
 pub(crate) fn build_exhaustive(
     config: &PostflopModelConfig,
     tree: &PostflopTree,
@@ -557,6 +578,13 @@ pub(crate) fn build_exhaustive(
     let num_iterations = config.postflop_solve_iterations as usize;
     let _ = node_streets;
     let completed = AtomicUsize::new(0);
+
+    let dcfr = match config.cfr_variant {
+        CfrVariant::Linear => DcfrParams::linear(),
+        CfrVariant::Dcfr => DcfrParams::default(),
+        CfrVariant::Vanilla => DcfrParams::vanilla(),
+        CfrVariant::CfrPlus => DcfrParams::from_config(CfrVariant::CfrPlus, 0.0, 0.0, 0.0, 0),
+    };
 
     let results: Vec<Vec<f64>> = (0..num_flops)
         .into_par_iter()
@@ -574,6 +602,7 @@ pub(crate) fn build_exhaustive(
                 num_iterations,
                 config.cfr_convergence_threshold,
                 &flop_name,
+                &dcfr,
                 on_progress,
             );
 
@@ -611,6 +640,7 @@ pub(crate) fn build_exhaustive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfr::dcfr::DcfrParams;
     use crate::poker::{Suit, Value};
     use crate::preflop::postflop_abstraction::annotate_streets;
     use test_macros::timed_test;
@@ -732,6 +762,7 @@ mod tests {
         let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
 
         let equity_table = synthetic_equity_table();
+        let dcfr = DcfrParams::linear();
 
         let result = exhaustive_solve_one_flop(
             &tree,
@@ -740,6 +771,7 @@ mod tests {
             3,
             0.001,
             "test",
+            &dcfr,
             &|_| {},
         );
 
@@ -762,6 +794,7 @@ mod tests {
         let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
 
         let equity_table = synthetic_equity_table();
+        let dcfr = DcfrParams::linear();
 
         let result = exhaustive_solve_one_flop(
             &tree,
@@ -770,6 +803,7 @@ mod tests {
             2,
             0.001,
             "test",
+            &dcfr,
             &|_| {},
         );
 
@@ -798,6 +832,7 @@ mod tests {
         let equity_table = synthetic_equity_table();
         let mut regret_sum = vec![0.0f64; layout.total_size];
         let mut strategy_sum = vec![0.0f64; layout.total_size];
+        let dcfr = DcfrParams::linear();
 
         // Find a fold terminal and verify payoff
         let fold_node = tree.nodes.iter().enumerate().find_map(|(i, n)| {
@@ -825,6 +860,8 @@ mod tests {
                 0, // hero_pos = 0
                 1.0,
                 1.0,
+                0,
+                &dcfr,
             );
 
             if folder == 0 {
@@ -858,6 +895,7 @@ mod tests {
         let equity_table = synthetic_equity_table();
         let mut regret_sum = vec![0.0f64; layout.total_size];
         let mut strategy_sum = vec![0.0f64; layout.total_size];
+        let dcfr = DcfrParams::linear();
 
         // Find a showdown terminal
         let sd_node = tree.nodes.iter().enumerate().find_map(|(i, n)| {
@@ -890,6 +928,8 @@ mod tests {
                 0,
                 1.0,
                 1.0,
+                0,
+                &dcfr,
             );
 
             let expected = eq * pot_fraction - pot_fraction / 2.0;
@@ -932,8 +972,9 @@ mod tests {
         let uniform_sum = vec![0.0f64; layout.total_size];
         let expl_uniform = compute_exploitability(&tree, &layout, &uniform_sum, &equity_table);
         // 2 CFR iterations with no early stop → result.delta is exploitability after iter 1.
+        let dcfr = DcfrParams::linear();
         let result = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 2, 0.0, "test", &|_| {},
+            &tree, &layout, &equity_table, 2, 0.0, "test", &dcfr, &|_| {},
         );
         assert!(
             result.delta < expl_uniform,
@@ -947,8 +988,9 @@ mod tests {
         let (tree, layout, equity_table) = expl_test_fixtures();
         // Very generous threshold (30 BB/h) — stops at first exploitability check.
         let threshold_mbb = 30_000.0;
+        let dcfr = DcfrParams::linear();
         let result = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 30, threshold_mbb, "test", &|_| {},
+            &tree, &layout, &equity_table, 30, threshold_mbb, "test", &dcfr, &|_| {},
         );
         assert_eq!(
             result.iterations_used, 2,
