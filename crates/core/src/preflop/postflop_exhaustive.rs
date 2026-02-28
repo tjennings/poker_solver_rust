@@ -478,6 +478,11 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
 }
 
 /// Solve a single flop using exhaustive CFR with configurable iteration weighting.
+///
+/// When `use_inner_parallelism` is false, inner `parallel_traverse` and
+/// `compute_exploitability` run on a single-thread pool. This avoids
+/// 3-level rayon nesting when the outer `build_exhaustive` already
+/// parallelises over multiple flops.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn exhaustive_solve_one_flop(
     tree: &PostflopTree,
@@ -487,6 +492,7 @@ fn exhaustive_solve_one_flop(
     convergence_threshold: f64,
     flop_name: &str,
     dcfr: &DcfrParams,
+    use_inner_parallelism: bool,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> FlopSolveResult {
     let buf_size = layout.total_size;
@@ -504,6 +510,20 @@ fn exhaustive_solve_one_flop(
 
     let mut snapshot = vec![0.0f64; buf_size];
 
+    // When inner parallelism is disabled, run traverse and exploitability
+    // on a 1-thread pool to avoid rayon nesting contention.
+    let serial_pool = if !use_inner_parallelism {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                // INVARIANT: ThreadPoolBuilder with valid num_threads always succeeds.
+                .expect("failed to build single-thread rayon pool"),
+        )
+    } else {
+        None
+    };
+
     for iter in 0..num_iterations {
         snapshot.clone_from(&regret_sum);
 
@@ -516,7 +536,11 @@ fn exhaustive_solve_one_flop(
             dcfr,
         };
 
-        let (dr, ds) = parallel_traverse(&ctx, &pairs);
+        let (dr, ds) = if let Some(pool) = &serial_pool {
+            pool.install(|| parallel_traverse(&ctx, &pairs))
+        } else {
+            parallel_traverse(&ctx, &pairs)
+        };
 
         // Apply DCFR discounting before merging deltas.
         if dcfr.should_discount(iter as u64) {
@@ -531,8 +555,11 @@ fn exhaustive_solve_one_flop(
 
         iterations_used = iter + 1;
         if iter >= 1 && (iter % 2 == 1 || iter == num_iterations - 1) {
-            current_exploitability =
-                compute_exploitability(tree, layout, &strategy_sum, equity_table);
+            current_exploitability = if let Some(pool) = &serial_pool {
+                pool.install(|| compute_exploitability(tree, layout, &strategy_sum, equity_table))
+            } else {
+                compute_exploitability(tree, layout, &strategy_sum, equity_table)
+            };
         }
 
         on_progress(BuildPhase::FlopProgress {
@@ -715,6 +742,7 @@ pub(crate) fn build_exhaustive(
                 config.cfr_convergence_threshold,
                 &flop_name,
                 &dcfr,
+                num_flops == 1,
                 on_progress,
             );
 
@@ -884,6 +912,7 @@ mod tests {
             0.001,
             "test",
             &dcfr,
+            true,
             &|_| {},
         );
 
@@ -916,6 +945,7 @@ mod tests {
             0.001,
             "test",
             &dcfr,
+            true,
             &|_| {},
         );
 
@@ -1095,7 +1125,7 @@ mod tests {
         // compared to in-place updates.
         let dcfr = DcfrParams::linear();
         let result = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, &|_| {},
+            &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, true, &|_| {},
         );
         assert!(
             result.delta < expl_uniform,
@@ -1122,7 +1152,7 @@ mod tests {
 
         // Solve with default thread pool (parallel)
         let result_par = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, &|_| {},
+            &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, true, &|_| {},
         );
 
         // Solve with 1 thread (sequential)
@@ -1132,7 +1162,7 @@ mod tests {
             .unwrap();
         let result_seq = pool.install(|| {
             exhaustive_solve_one_flop(
-                &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, &|_| {},
+                &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, true, &|_| {},
             )
         });
 
@@ -1163,6 +1193,7 @@ mod tests {
             threshold_mbb,
             "test",
             &dcfr,
+            true,
             &|_| {},
         );
         assert_eq!(
