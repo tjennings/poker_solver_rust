@@ -90,13 +90,14 @@ impl PostflopValues {
 ///
 /// Each decision node reserves `num_buckets × num_actions` slots.
 /// The bucket count varies by the street of the node.
+#[derive(Debug)]
 pub(crate) struct PostflopLayout {
     entries: Vec<NodeEntry>,
     /// Total buffer size for this tree.
     pub total_size: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct NodeEntry {
     pub(crate) offset: usize,
     pub(crate) num_actions: usize,

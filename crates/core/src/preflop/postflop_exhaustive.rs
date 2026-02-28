@@ -434,6 +434,7 @@ fn compute_exploitability(
 
 /// Immutable context for one postflop CFR iteration.
 /// Strategy is read from `snapshot`; deltas written to thread-local buffers.
+#[derive(Debug)]
 struct PostflopCfrCtx<'a> {
     tree: &'a PostflopTree,
     layout: &'a PostflopLayout,
@@ -448,9 +449,9 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
         self.layout.total_size
     }
 
-    fn traverse_pair(&self, dr: &mut [f64], ds: &mut [f64], h1: u16, h2: u16) {
+    fn traverse_pair(&self, regret_delta: &mut [f64], strategy_delta: &mut [f64], hero: u16, opponent: u16) {
         let n = NUM_CANONICAL_HANDS;
-        let eq = self.equity_table[h1 as usize * n + h2 as usize];
+        let eq = self.equity_table[hero as usize * n + opponent as usize];
         if eq.is_nan() {
             return;
         }
@@ -460,11 +461,11 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
                 self.layout,
                 self.equity_table,
                 self.snapshot,
-                dr,
-                ds,
+                regret_delta,
+                strategy_delta,
                 0,
-                h1,
-                h2,
+                hero,
+                opponent,
                 hero_pos,
                 1.0,
                 1.0,
@@ -618,22 +619,15 @@ fn eval_with_avg_strategy(
         PostflopNode::Terminal {
             terminal_type,
             pot_fraction,
-        } => match terminal_type {
-            PostflopTerminalType::Fold { folder } => {
-                if *folder == hero_pos {
-                    -pot_fraction / 2.0
-                } else {
-                    pot_fraction / 2.0
-                }
-            }
-            PostflopTerminalType::Showdown => {
-                let eq = equity_table[hero_hand as usize * n + opp_hand as usize];
-                if eq.is_nan() {
-                    return 0.0;
-                }
-                eq * pot_fraction - pot_fraction / 2.0
-            }
-        },
+        } => terminal_payoff(
+            *terminal_type,
+            *pot_fraction,
+            equity_table,
+            hero_hand,
+            opp_hand,
+            hero_pos,
+            n,
+        ),
         PostflopNode::Chance { children, .. } => eval_with_avg_strategy(
             tree,
             layout,

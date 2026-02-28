@@ -17,7 +17,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::cfr::dcfr::DcfrParams;
-use crate::cfr::parallel::{ParallelCfr, parallel_traverse as shared_parallel_traverse, add_into};
+use crate::cfr::parallel::{ParallelCfr, parallel_traverse, add_into};
 use super::config::{CfrVariant, PreflopConfig};
 use super::equity::EquityTable;
 use super::postflop_abstraction::PostflopAbstraction;
@@ -141,11 +141,11 @@ impl ParallelCfr for Ctx<'_> {
         self.layout.total_size
     }
 
-    fn traverse_pair(&self, dr: &mut [f64], ds: &mut [f64], h1: u16, h2: u16) {
-        let w = self.equity.weight(h1 as usize, h2 as usize);
+    fn traverse_pair(&self, regret_delta: &mut [f64], strategy_delta: &mut [f64], hero: u16, opponent: u16) {
+        let w = self.equity.weight(hero as usize, opponent as usize);
         for hero_pos in 0..2u8 {
-            let (hh, oh) = if hero_pos == 0 { (h1, h2) } else { (h2, h1) };
-            cfr_traverse(self, dr, ds, 0, hh, oh, hero_pos, 1.0, w);
+            let (hh, oh) = if hero_pos == 0 { (hero, opponent) } else { (opponent, hero) };
+            cfr_traverse(self, regret_delta, strategy_delta, 0, hh, oh, hero_pos, 1.0, w);
         }
     }
 }
@@ -444,7 +444,7 @@ impl PreflopSolver {
             postflop: self.postflop.as_ref(),
         };
 
-        let (mr, ms) = shared_parallel_traverse(&ctx, &self.pairs);
+        let (mr, ms) = parallel_traverse(&ctx, &self.pairs);
 
         self.apply_discounting();
         add_into(&mut self.regret_sum, &mr);

@@ -14,8 +14,8 @@ pub trait ParallelCfr: Sync {
     fn buffer_size(&self) -> usize;
 
     /// Traverse one hand pair (both hero positions), accumulating
-    /// regret deltas into `dr` and strategy deltas into `ds`.
-    fn traverse_pair(&self, dr: &mut [f64], ds: &mut [f64], h1: u16, h2: u16);
+    /// regret deltas into `regret_delta` and strategy deltas into `strategy_delta`.
+    fn traverse_pair(&self, regret_delta: &mut [f64], strategy_delta: &mut [f64], hero: u16, opponent: u16);
 }
 
 /// Parallel fold+reduce over hand pairs. Returns merged `(regret_delta, strategy_delta)`.
@@ -68,9 +68,9 @@ mod tests {
             2
         }
 
-        fn traverse_pair(&self, dr: &mut [f64], ds: &mut [f64], h1: u16, h2: u16) {
-            dr[0] += f64::from(h1) + f64::from(h2);
-            ds[0] += f64::from(h1) * f64::from(h2);
+        fn traverse_pair(&self, regret_delta: &mut [f64], strategy_delta: &mut [f64], hero: u16, opponent: u16) {
+            regret_delta[0] += f64::from(hero) + f64::from(opponent);
+            strategy_delta[0] += f64::from(hero) * f64::from(opponent);
         }
     }
 
