@@ -13,11 +13,11 @@
 //! Storage uses flat `Vec<f64>` buffers indexed by `(node, hand, action)`
 //! for cache-friendly access and fast clone/merge operations.
 
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::cfr::dcfr::DcfrParams;
+use crate::cfr::parallel::{ParallelCfr, parallel_traverse as shared_parallel_traverse, add_into};
 use super::config::{CfrVariant, PreflopConfig};
 use super::equity::EquityTable;
 use super::postflop_abstraction::PostflopAbstraction;
@@ -134,6 +134,20 @@ struct Ctx<'a> {
     stacks: [u32; 2],
     /// Optional postflop abstraction for modeling postflop play at showdown terminals.
     postflop: Option<&'a PostflopState>,
+}
+
+impl ParallelCfr for Ctx<'_> {
+    fn buffer_size(&self) -> usize {
+        self.layout.total_size
+    }
+
+    fn traverse_pair(&self, dr: &mut [f64], ds: &mut [f64], h1: u16, h2: u16) {
+        let w = self.equity.weight(h1 as usize, h2 as usize);
+        for hero_pos in 0..2u8 {
+            let (hh, oh) = if hero_pos == 0 { (h1, h2) } else { (h2, h1) };
+            cfr_traverse(self, dr, ds, 0, hh, oh, hero_pos, 1.0, w);
+        }
+    }
 }
 
 /// Postflop state: pre-solved value table + raise counts for pot-type classification.
@@ -430,7 +444,7 @@ impl PreflopSolver {
             postflop: self.postflop.as_ref(),
         };
 
-        let (mr, ms) = parallel_traverse(&ctx, &self.pairs);
+        let (mr, ms) = shared_parallel_traverse(&ctx, &self.pairs);
 
         self.apply_discounting();
         add_into(&mut self.regret_sum, &mr);
@@ -455,44 +469,6 @@ impl PreflopSolver {
     /// Floor all cumulative regrets to zero (CFR+ update rule).
     fn floor_regrets(&mut self) {
         self.dcfr.floor_regrets(&mut self.regret_sum);
-    }
-}
-
-/// Parallel fold+reduce over all hand pairs, returning merged deltas.
-fn parallel_traverse(
-    ctx: &Ctx<'_>,
-    pairs: &[(u16, u16)],
-) -> (Vec<f64>, Vec<f64>) {
-    let buf_size = ctx.layout.total_size;
-
-    pairs
-        .par_iter()
-        .fold(
-            || (vec![0.0f64; buf_size], vec![0.0f64; buf_size]),
-            |(mut dr, mut ds), &(h1, h2)| {
-                let w = ctx.equity.weight(h1 as usize, h2 as usize);
-                for hero_pos in 0..2u8 {
-                    let (hh, oh) = if hero_pos == 0 { (h1, h2) } else { (h2, h1) };
-                    cfr_traverse(ctx, &mut dr, &mut ds, 0, hh, oh, hero_pos, 1.0, w);
-                }
-                (dr, ds)
-            },
-        )
-        .reduce(
-            || (vec![0.0; buf_size], vec![0.0; buf_size]),
-            |(mut ar, mut a_s), (br, bs)| {
-                add_into(&mut ar, &br);
-                add_into(&mut a_s, &bs);
-                (ar, a_s)
-            },
-        )
-}
-
-/// Element-wise `dst[i] += src[i]`.
-#[inline]
-fn add_into(dst: &mut [f64], src: &[f64]) {
-    for (d, s) in dst.iter_mut().zip(src) {
-        *d += s;
     }
 }
 
