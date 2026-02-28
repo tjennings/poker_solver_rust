@@ -50,6 +50,38 @@ pub fn parallel_traverse<T: ParallelCfr>(
     (regret, strategy)
 }
 
+/// Like [`parallel_traverse`], but merges results into caller-provided buffers
+/// instead of allocating new ones. Zeroes both output slices before accumulating.
+///
+/// This avoids two `Vec` allocations per call, which matters when the caller
+/// invokes traversal in a tight loop (e.g. exhaustive CFR iterations).
+pub fn parallel_traverse_into<T: ParallelCfr>(
+    ctx: &T,
+    pairs: &[(u16, u16)],
+    regret_out: &mut [f64],
+    strategy_out: &mut [f64],
+) {
+    regret_out.iter_mut().for_each(|v| *v = 0.0);
+    strategy_out.iter_mut().for_each(|v| *v = 0.0);
+
+    let buf_size = ctx.buffer_size();
+    let partitions: Vec<(Vec<f64>, Vec<f64>)> = pairs
+        .par_iter()
+        .fold(
+            || (vec![0.0_f64; buf_size], vec![0.0_f64; buf_size]),
+            |(mut dr, mut ds), &(h1, h2)| {
+                ctx.traverse_pair(&mut dr, &mut ds, h1, h2);
+                (dr, ds)
+            },
+        )
+        .collect();
+
+    for (dr, ds) in partitions {
+        add_into(regret_out, &dr);
+        add_into(strategy_out, &ds);
+    }
+}
+
 /// Element-wise `dst[i] += src[i]`.
 #[inline]
 pub fn add_into(dst: &mut [f64], src: &[f64]) {
@@ -90,6 +122,32 @@ mod tests {
         }
 
         let (dr, ds) = parallel_traverse(&MockCfr, &pairs);
+
+        assert!(
+            (dr[0] - exp_dr[0]).abs() < 1e-9,
+            "dr mismatch: {} vs {}",
+            dr[0],
+            exp_dr[0]
+        );
+        assert!(
+            (ds[0] - exp_ds[0]).abs() < 1e-9,
+            "ds mismatch: {} vs {}",
+            ds[0],
+            exp_ds[0]
+        );
+    }
+
+    #[timed_test]
+    fn parallel_traverse_into_matches_parallel_traverse() {
+        let pairs: Vec<(u16, u16)> = (0..10_u16)
+            .flat_map(|h1| (0..10_u16).map(move |h2| (h1, h2)))
+            .collect();
+
+        let (exp_dr, exp_ds) = parallel_traverse(&MockCfr, &pairs);
+
+        let mut dr = vec![0.0_f64; 2];
+        let mut ds = vec![0.0_f64; 2];
+        parallel_traverse_into(&MockCfr, &pairs, &mut dr, &mut ds);
 
         assert!(
             (dr[0] - exp_dr[0]).abs() < 1e-9,

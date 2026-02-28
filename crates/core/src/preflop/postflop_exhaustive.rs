@@ -5,7 +5,7 @@
 
 use rayon::prelude::*;
 
-use crate::cfr::parallel::{add_into, parallel_traverse, ParallelCfr};
+use crate::cfr::parallel::{add_into, parallel_traverse_into, ParallelCfr};
 
 use super::postflop_abstraction::{
     normalize_strategy_sum_into, regret_matching_into, BuildPhase, FlopSolveResult, FlopStage,
@@ -479,7 +479,7 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
 
 /// Solve a single flop using exhaustive CFR with configurable iteration weighting.
 ///
-/// When `use_inner_parallelism` is false, inner `parallel_traverse` and
+/// When `use_inner_parallelism` is false, inner `parallel_traverse_into` and
 /// `compute_exploitability` run on a single-thread pool. This avoids
 /// 3-level rayon nesting when the outer `build_exhaustive` already
 /// parallelises over multiple flops.
@@ -510,6 +510,11 @@ fn exhaustive_solve_one_flop(
 
     let mut snapshot = vec![0.0f64; buf_size];
 
+    // Pre-allocate delta buffers reused across iterations to avoid
+    // two Vec allocations per iteration (parallel_traverse_into zeroes them).
+    let mut dr = vec![0.0f64; buf_size];
+    let mut ds = vec![0.0f64; buf_size];
+
     // When inner parallelism is disabled, run traverse and exploitability
     // on a 1-thread pool to avoid rayon nesting contention.
     let serial_pool = if !use_inner_parallelism {
@@ -524,6 +529,8 @@ fn exhaustive_solve_one_flop(
         None
     };
 
+    let flop_name_owned = flop_name.to_string();
+
     for iter in 0..num_iterations {
         snapshot.clone_from(&regret_sum);
 
@@ -536,11 +543,11 @@ fn exhaustive_solve_one_flop(
             dcfr,
         };
 
-        let (dr, ds) = if let Some(pool) = &serial_pool {
-            pool.install(|| parallel_traverse(&ctx, &pairs))
+        if let Some(pool) = &serial_pool {
+            pool.install(|| parallel_traverse_into(&ctx, &pairs, &mut dr, &mut ds));
         } else {
-            parallel_traverse(&ctx, &pairs)
-        };
+            parallel_traverse_into(&ctx, &pairs, &mut dr, &mut ds);
+        }
 
         // Apply DCFR discounting before merging deltas.
         if dcfr.should_discount(iter as u64) {
@@ -563,12 +570,12 @@ fn exhaustive_solve_one_flop(
         }
 
         on_progress(BuildPhase::FlopProgress {
-            flop_name: flop_name.to_string(),
+            flop_name: flop_name_owned.clone(),
             stage: FlopStage::Solving {
                 iteration: iterations_used,
                 max_iterations: num_iterations,
                 delta: current_exploitability,
-                metric_label: "mBB/h".to_string(),
+                metric_label: "mBB/h".into(),
             },
         });
 
