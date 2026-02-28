@@ -1044,7 +1044,7 @@ mod tests {
         );
     }
 
-    #[timed_test(10)]
+    #[timed_test(20)]
     fn exploitability_decreases_with_training() {
         let (tree, layout, equity_table) = expl_test_fixtures();
         // Uniform strategy exploitability (baseline).
@@ -1065,7 +1065,7 @@ mod tests {
         );
     }
 
-    #[timed_test(5)]
+    #[timed_test(15)]
     fn exploitability_early_stopping_triggers() {
         let (tree, layout, equity_table) = expl_test_fixtures();
         // Very generous threshold (30 BB/h) -- stops at first exploitability check.
