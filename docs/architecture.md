@@ -2,7 +2,7 @@
 
 ## Overview
 
-The solver finds a Nash equilibrium for heads-up no-limit Texas Hold'em by splitting the game into two phases: a **preflop solver** that uses Linear CFR (LCFR) over 169 canonical hand matchups, and an **abstracted postflop model** that provides expected values at preflop showdown boundaries. The postflop model uses direct 169-hand indexing per flop -- each canonical hand is its own info set, with no bucket clustering. Two backends are available: **MCCFR** (sampled concrete hands with real showdown eval) and **Exhaustive** (pre-computed equity tables with vanilla CFR).
+The solver finds a Nash equilibrium for heads-up no-limit Texas Hold'em by splitting the game into two phases: a **preflop solver** that uses Linear CFR (LCFR) over 169 canonical hand matchups, and an **abstracted postflop model** that provides expected values at preflop showdown boundaries. The postflop model uses direct 169-hand indexing per flop -- each canonical hand is its own info set, with no bucket clustering. Two backends are available: **MCCFR** (sampled concrete hands with real showdown eval) and **Exhaustive** (pre-computed equity tables with configurable CFR variant). Both solvers share a common DCFR module (`cfr/dcfr.rs`) for iteration weighting and regret discounting.
 
 ```
 PreflopConfig -> PreflopTree -> PreflopSolver
@@ -28,7 +28,7 @@ poker_solver_rust/
 │   ├── core/                  # Core solver library
 │   │   └── src/
 │   │       ├── game/          # Action/Player types, PostflopConfig
-│   │       ├── cfr/           # CFR utilities (regret matching)
+│   │       ├── cfr/           # CFR utilities (regret matching, shared DCFR/LCFR logic)
 │   │       ├── blueprint/     # Blueprint strategy, subgame solving, bundling
 │   │       ├── preflop/       # Preflop LCFR solver & postflop abstraction pipeline
 │   │       ├── abstraction/   # Card abstraction (isomorphism)
@@ -52,7 +52,7 @@ poker_solver_rust/
 
 ### Component Summary
 
-**`core`** -- The heart of the solver. Contains the preflop LCFR solver with its postflop abstraction pipeline (169-hand direct indexing, combo maps, tree building, solving), CFR utilities (regret matching), the blueprint strategy system with subgame refinement, card abstractions, hand classification, and the agent simulation framework.
+**`core`** -- The heart of the solver. Contains the preflop LCFR solver with its postflop abstraction pipeline (169-hand direct indexing, combo maps, tree building, solving), shared CFR utilities (regret matching, DCFR/LCFR iteration weighting and discounting via `cfr/dcfr.rs`), the blueprint strategy system with subgame refinement, card abstractions, hand classification, and the agent simulation framework.
 
 **`trainer`** -- CLI entry point that orchestrates preflop/postflop solving, diagnostics, and hand tracing. Parses YAML configs and drives the core library.
 
@@ -66,12 +66,12 @@ poker_solver_rust/
 
 ## Preflop Solver
 
-**Algorithm:** Linear CFR (LCFR) with DCFR discounting. Both regret and strategy sums are weighted by iteration number. Simultaneous updates -- both players traverse every iteration.
+**Algorithm:** Linear CFR (LCFR) with DCFR discounting. Both regret and strategy sums are weighted by iteration number. Simultaneous updates -- both players traverse every iteration. DCFR logic (iteration weighting, regret discounting, strategy discounting, CFR+ flooring) is delegated to the shared `DcfrParams` module in `cfr/dcfr.rs`.
 
 **Key types:**
 - `PreflopConfig` -- game structure: blinds, stacks, raise sizes, DCFR params (alpha/beta/gamma), exploration epsilon
 - `PreflopTree` -- arena-allocated game tree; nodes are Decision or Terminal (Fold/Showdown)
-- `PreflopSolver` -- flat buffer layout: `regret_sum[node_idx * 169 + hand_idx]`, `strategy_sum[...]`
+- `PreflopSolver` -- flat buffer layout: `regret_sum[node_idx * 169 + hand_idx]`, `strategy_sum[...]`; holds a `DcfrParams` instance for all discounting operations
 
 **Flow:**
 1. Build `PreflopTree` from config (raise sizes, raise cap)
@@ -127,7 +127,8 @@ Embarrassingly parallel: one independent solve per canonical flop.
 
 Alternative backend (`solve_type: exhaustive`). For each canonical flop:
 - Pre-computes pairwise equity tables for all 169x169 hand pairs per street
-- Runs vanilla CFR with full traversal every iteration (no sampling)
+- Runs CFR with configurable variant (default: LCFR linear iteration weighting) using the shared `DcfrParams` module
+- Supports all four variants: Vanilla, DCFR, CFR+, Linear (LCFR)
 - Slower per iteration but converges with fewer iterations and no sampling variance
 
 ### Postflop Tree
@@ -178,7 +179,7 @@ At each preflop showdown terminal:
 
 | Parameter | Default | Description |
 |-|-|-|
-| `solve_type` | mccfr | Backend: `mccfr` (sampled concrete hands) or `exhaustive` (equity tables + vanilla CFR) |
+| `solve_type` | mccfr | Backend: `mccfr` (sampled concrete hands) or `exhaustive` (equity tables + configurable CFR) |
 | `bet_sizes` | [0.5, 1.0] | Pot-fraction bet sizes |
 | `max_raises_per_street` | 1 | Raise cap per postflop street |
 | `postflop_sprs` | [3.5] | SPR(s) for shared postflop tree (scalar or list) |
@@ -188,6 +189,7 @@ At each preflop showdown terminal:
 | `cfr_convergence_threshold` | 0.01 | Per-flop early stopping threshold |
 | `mccfr_sample_pct` | 0.01 | Fraction of deal space per MCCFR iteration (MCCFR only) |
 | `value_extraction_samples` | 10,000 | Monte Carlo samples for EV extraction (MCCFR only) |
+| `cfr_variant` | linear | CFR variant for postflop solver: `vanilla`, `dcfr`, `cfrplus`, `linear` |
 | `ev_convergence_threshold` | 0.001 | Early-stop EV estimation threshold (MCCFR only) |
 
 ## Caching & Bundles

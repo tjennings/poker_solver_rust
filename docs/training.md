@@ -153,6 +153,7 @@ The `solve-postflop` command reads a standalone YAML config with a top-level `po
 ```yaml
 postflop_model:
   solve_type: exhaustive
+  cfr_variant: linear                # linear (LCFR), vanilla, dcfr, or cfrplus
   postflop_sprs: [2, 6, 20]
   fixed_flops: ['AhKsQd', '2c3h4d']
   bet_sizes: [0.5, 1.0]
@@ -171,7 +172,7 @@ Multi-SPR bundles store one subdirectory per SPR (e.g. `spr_2.0/`, `spr_6.0/`, `
 
 | Parameter | Default | Type | Description |
 |-|-|-|-|
-| `solve_type` | `mccfr` | string | Postflop backend: `mccfr` (sampled concrete hands) or `exhaustive` (pre-computed equity tables + vanilla CFR) |
+| `solve_type` | `mccfr` | string | Postflop backend: `mccfr` (sampled concrete hands) or `exhaustive` (pre-computed equity tables + configurable CFR) |
 | `bet_sizes` | [0.5, 1.0] | [f32] | Pot-fraction bet sizes for postflop tree |
 | `max_raises_per_street` | 1 | u8 | Raise cap per postflop street |
 | `postflop_sprs` | [3.5] | [f64] | SPR(s) for postflop tree; one model built per SPR; closest selected at runtime |
@@ -181,6 +182,7 @@ Multi-SPR bundles store one subdirectory per SPR (e.g. `spr_2.0/`, `spr_6.0/`, `
 | `cfr_convergence_threshold` | 0.01 | f64 | Early per-flop CFR stopping threshold (mccfr: strategy delta; exhaustive: exploitability in pot fractions) |
 | `mccfr_sample_pct` | 0.01 | f64 | Fraction of deal space per MCCFR iteration (MCCFR only) |
 | `value_extraction_samples` | 10,000 | u32 | Monte Carlo samples for post-convergence EV extraction (MCCFR only) |
+| `cfr_variant` | `linear` | string | CFR variant for postflop solver: `vanilla`, `dcfr`, `cfrplus`, `linear` (LCFR) |
 | `ev_convergence_threshold` | 0.001 | f64 | Weighted-avg delta threshold for early-stop EV estimation (MCCFR only) |
 
 ### MCCFR Backend
@@ -208,11 +210,12 @@ Key characteristics:
 
 ### Exhaustive Backend
 
-The exhaustive backend (`solve_type: exhaustive`) uses pre-computed pairwise equity tables and vanilla CFR over all 169x169 hand pairs per flop. No sampling -- full traversal every iteration.
+The exhaustive backend (`solve_type: exhaustive`) uses pre-computed pairwise equity tables and CFR with configurable iteration weighting over all 169x169 hand pairs per flop. No sampling -- full traversal every iteration.
 
 ```yaml
 postflop_model:
   solve_type: exhaustive
+  cfr_variant: linear              # linear (LCFR, default), vanilla, dcfr, or cfrplus
   postflop_solve_iterations: 1000
   postflop_sprs: [3.5]
   bet_sizes: [0.5, 1.0]
@@ -220,7 +223,8 @@ postflop_model:
 
 Key characteristics:
 - **Pre-computed equity**: pairwise equity tables for all hand pairs per street
-- **Vanilla CFR**: deterministic full traversal, no sampling variance
+- **Configurable CFR variant**: supports `linear` (LCFR, default), `vanilla`, `dcfr` (α/β/γ discounting), and `cfrplus` (regret flooring + linear strategy)
+- **Full traversal**: deterministic, no sampling variance
 - **Slower per iteration** but converges with fewer iterations than MCCFR
 
 Presets: `exhaustive_fast` (10 boards, 200 iterations) and `exhaustive_standard` (all boards, 1000 iterations).
