@@ -12,7 +12,6 @@
 //! - `error` - Error types
 //! - `poker` - Re-exported poker domain types from `rs_poker`
 
-pub mod abstract_game;
 pub mod abstraction;
 pub mod agent;
 pub mod blueprint;
@@ -28,12 +27,11 @@ pub mod info_key;
 pub mod preflop;
 pub mod showdown_equity;
 pub mod simulation;
-pub mod tree;
 
 pub use agent::AgentConfig;
 pub use error::SolverError;
 pub use flops::{CanonicalFlop, HighCardClass, RankTexture, SuitTexture, all_flops};
-pub use game::{Action, Game, Player};
+pub use game::{Action, Player};
 pub use hand_class::{
     ClassifyError, HandClass, HandClassification, classify, intra_class_strength,
 };

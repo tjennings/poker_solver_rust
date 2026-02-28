@@ -240,55 +240,6 @@ pub fn canonical_hand_index_from_str(hand: &str) -> Option<u16> {
         .map(|h| h.index() as u16)
 }
 
-/// Upper-triangle index for (high, low) where high > low.
-///
-/// Enumerates pairs (high, low) with high in 0..12, low in 0..high.
-/// For high=1,low=0 → 0; high=2,low=0 → 1; high=2,low=1 → 2; ...
-fn triangle_index(high: u8, low: u8) -> u16 {
-    // Number of pairs before row `high` = high*(high-1)/2
-    let base = u16::from(high) * (u16::from(high) - 1) / 2;
-    base + u16::from(low)
-}
-
-/// Map card rank to ordinal: A=0, K=1, Q=2, ..., 2=12.
-fn rank_ordinal(value: Value) -> u8 {
-    match value {
-        Value::Ace => 0,
-        Value::King => 1,
-        Value::Queen => 2,
-        Value::Jack => 3,
-        Value::Ten => 4,
-        Value::Nine => 5,
-        Value::Eight => 6,
-        Value::Seven => 7,
-        Value::Six => 8,
-        Value::Five => 9,
-        Value::Four => 10,
-        Value::Three => 11,
-        Value::Two => 12,
-    }
-}
-
-/// Map a rank character to its ordinal.
-fn rank_ordinal_from_char(c: char) -> Option<u8> {
-    match c {
-        'A' => Some(0),
-        'K' => Some(1),
-        'Q' => Some(2),
-        'J' => Some(3),
-        'T' => Some(4),
-        '9' => Some(5),
-        '8' => Some(6),
-        '7' => Some(7),
-        '6' => Some(8),
-        '5' => Some(9),
-        '4' => Some(10),
-        '3' => Some(11),
-        '2' => Some(12),
-        _ => None,
-    }
-}
-
 /// Map a rank character and suited flag to representative cards.
 ///
 /// Uses Spade for first card; second card is same suit if suited,
@@ -456,7 +407,7 @@ pub fn format_action_code_label(code: u8, bet_sizes: &[f32]) -> String {
 /// Uses `CanonicalHand::from_index` to ensure consistent ordering.
 #[must_use]
 pub fn reverse_canonical_index(index: u16) -> &'static str {
-    use crate::hands::{all_hands, CanonicalHand};
+    use crate::hands::all_hands;
 
     static HANDS: std::sync::LazyLock<[String; 169]> = std::sync::LazyLock::new(|| {
         let mut table: [String; 169] = std::array::from_fn(|_| String::new());
