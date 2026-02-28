@@ -91,16 +91,49 @@ cd frontend && npm run dev              # Vite on :5173
 - Invoke wrapper: `frontend/src/invoke.ts`
 - Core functions: `crates/tauri-app/src/exploration.rs` (`_core` suffix variants)
 
+## Session Behavior: Manager Mode
+
+The default session acts as a **coordinator**, not an implementer. It must:
+
+1. **Never write Rust code directly** — delegate all implementation to `rust-developer` agents
+2. **Never review code directly** — delegate to review agents
+3. **Always follow the pipeline**: research → brainstorm → plan → dispatch → review → integrate
+4. **Use beans** to track every work item before dispatching
+
+### Dispatch Rules
+
+- Algorithm/design questions, game theory, poker AI → `ml-researcher` agent (read-only advisor)
+- Implementation tasks → `rust-developer` agent (use worktree isolation)
+- Architecture review → `software-architect` agent
+- Code quality review → `idiomatic-rust-enforcer` agent
+- Performance review → `rust-perf-reviewer` agent
+- Plan verification → `code-reviewer` agent
+- Independent tasks → dispatch in parallel via `dispatching-parallel-agents`
+- Multi-step plans → use `subagent-driven-development`
+
+### What the manager does directly
+
+- Clarifies requirements with the user
+- Creates and decomposes plans (via skills)
+- Dispatches agents and synthesizes their results
+- Manages beans lifecycle
+- Commits, manages git, creates PRs
+- Updates CLAUDE.md and documentation
+
+## Implementation Workflow
+
+1. **Research** — dispatch `ml-researcher` for algorithm/design questions
+2. **Brainstorm** — invoke `superpowers:brainstorming` to explore requirements
+3. **Plan** — invoke `superpowers:writing-plans` to create a structured plan
+4. **Dispatch** — `rust-developer` agents in parallel (via `superpowers:subagent-driven-development`)
+5. **Review** — `software-architect` + `idiomatic-rust-enforcer` + `rust-perf-reviewer`
+6. **Verify** — invoke `superpowers:verification-before-completion` before claiming done
+7. **Finish** — invoke `superpowers:finishing-a-development-branch` to merge/PR
+
 ## Git Workflow
+
 - Always use worktrees for implementing plans
 - Write clear commit messages describing **what** and **why**
 - Keep commits atomic: one logical change per commit
 - Run tests before pushing: `cargo test`
 - Use feature branches for non-trivial changes
-
-## Implementation
-- Always use agent teams to implement plans
-- Always use TDD to implement features.  
-- A rust architect who is responsible for the high level implementation
-- A code reviewer who prodives feedback on each complete task.  Ensure tests are sufficient, ensure best rust best practices are followed. 
-- Up to three developer agents who implement tasks
