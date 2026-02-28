@@ -61,10 +61,12 @@ pub fn parallel_traverse_into<T: ParallelCfr>(
     regret_out: &mut [f64],
     strategy_out: &mut [f64],
 ) {
-    regret_out.iter_mut().for_each(|v| *v = 0.0);
-    strategy_out.iter_mut().for_each(|v| *v = 0.0);
-
     let buf_size = ctx.buffer_size();
+    debug_assert_eq!(regret_out.len(), buf_size);
+    debug_assert_eq!(strategy_out.len(), buf_size);
+
+    regret_out.fill(0.0);
+    strategy_out.fill(0.0);
     let partitions: Vec<(Vec<f64>, Vec<f64>)> = pairs
         .par_iter()
         .fold(
