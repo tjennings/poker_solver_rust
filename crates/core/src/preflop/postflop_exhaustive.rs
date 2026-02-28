@@ -530,7 +530,7 @@ fn exhaustive_solve_one_flop(
         }
 
         iterations_used = iter + 1;
-        if iter >= 1 {
+        if iter >= 1 && (iter % 2 == 1 || iter == num_iterations - 1) {
             current_exploitability =
                 compute_exploitability(tree, layout, &strategy_sum, equity_table);
         }
