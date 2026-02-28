@@ -394,22 +394,28 @@ fn compute_exploitability(
     let mut br_values = [0.0f64; 2];
 
     for br_player in 0..2u8 {
-        let mut total = 0.0f64;
-        let mut count = 0u64;
-
-        for hero_hand in 0..n as u16 {
-            for opp_hand in 0..n as u16 {
-                let eq = equity_table[hero_hand as usize * n + opp_hand as usize];
-                if eq.is_nan() {
-                    continue;
-                }
-
-                total += best_response_ev(
+        let (total, count) = (0..n as u16)
+            .into_par_iter()
+            .flat_map_iter(|hero_hand| {
+                (0..n as u16)
+                    .filter(move |&opp_hand| {
+                        !equity_table[hero_hand as usize * n + opp_hand as usize].is_nan()
+                    })
+                    .map(move |opp_hand| (hero_hand, opp_hand))
+            })
+            .map(|(hero_hand, opp_hand)| {
+                best_response_ev(
                     tree, layout, strategy_sum, equity_table, 0, hero_hand, opp_hand, br_player,
-                );
-                count += 1;
-            }
-        }
+                )
+            })
+            .fold(
+                || (0.0f64, 0u64),
+                |(t, c), v| (t + v, c + 1),
+            )
+            .reduce(
+                || (0.0, 0),
+                |(t1, c1), (t2, c2)| (t1 + t2, c1 + c2),
+            );
 
         br_values[br_player as usize] = if count > 0 {
             total / count as f64
