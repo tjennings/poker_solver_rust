@@ -571,6 +571,24 @@ pub(crate) fn normalize_strategy_sum(strategy_sum: &[f64], start: usize, num_act
     }
 }
 
+/// Normalize strategy sum into a caller-provided stack buffer.
+/// Avoids heap allocation in hot paths (exploitability computation).
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn normalize_strategy_sum_into(strategy_sum: &[f64], start: usize, out: &mut [f64]) {
+    let num_actions = out.len();
+    let total: f64 = (0..num_actions)
+        .map(|i| strategy_sum.get(start + i).copied().unwrap_or(0.0).max(0.0))
+        .sum();
+    if total > 0.0 {
+        for i in 0..num_actions {
+            out[i] = strategy_sum.get(start + i).copied().unwrap_or(0.0).max(0.0) / total;
+        }
+    } else {
+        let uniform = 1.0 / num_actions as f64;
+        out.iter_mut().for_each(|v| *v = uniform);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Shared helpers for CFR traversal and value evaluation
 // ──────────────────────────────────────────────────────────────────────────────

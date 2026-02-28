@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use crate::cfr::parallel::{add_into, parallel_traverse, ParallelCfr};
 
 use super::postflop_abstraction::{
-    normalize_strategy_sum, regret_matching_into, BuildPhase, FlopSolveResult, FlopStage,
+    normalize_strategy_sum_into, regret_matching_into, BuildPhase, FlopSolveResult, FlopStage,
     PostflopLayout, PostflopValues, MAX_POSTFLOP_ACTIONS,
 };
 use super::postflop_hands::{all_cards_vec, build_combo_map, NUM_CANONICAL_HANDS};
@@ -347,7 +347,8 @@ fn best_response_ev(
                     .fold(f64::NEG_INFINITY, f64::max)
             } else {
                 // Opponent plays average strategy
-                let strategy = normalize_strategy_sum(strategy_sum, start, num_actions);
+                let mut strategy = [0.0f64; MAX_POSTFLOP_ACTIONS];
+                normalize_strategy_sum_into(strategy_sum, start, &mut strategy[..num_actions]);
                 children
                     .iter()
                     .enumerate()
@@ -648,7 +649,8 @@ fn eval_with_avg_strategy(
             };
             let (start, _) = layout.slot(node_idx, bucket);
             let num_actions = children.len();
-            let strategy = normalize_strategy_sum(strategy_sum, start, num_actions);
+            let mut strategy = [0.0f64; MAX_POSTFLOP_ACTIONS];
+            normalize_strategy_sum_into(strategy_sum, start, &mut strategy[..num_actions]);
             children
                 .iter()
                 .enumerate()
