@@ -390,6 +390,8 @@ fn build_postflop_with_progress(
 
     for (i, &spr) in sprs.iter().enumerate() {
         phase_bar.set_style(spinner_style.clone());
+        phase_bar.set_length(0);
+        phase_bar.set_position(0);
         phase_bar.set_message(format!(
             "Postflop SPR={spr} ({}/{})",
             i + 1,
@@ -461,6 +463,7 @@ fn build_postflop_with_progress(
                 bar.finish_and_clear();
                 multi.remove(&bar);
             }
+            fbs.last_refresh = Instant::now();
         }
 
         eprintln!(
