@@ -5,6 +5,8 @@
 
 use rayon::prelude::*;
 
+use crate::cfr::parallel::{add_into, parallel_traverse, ParallelCfr};
+
 use super::postflop_abstraction::{
     normalize_strategy_sum, regret_matching_into, BuildPhase, FlopSolveResult, FlopStage,
     PostflopLayout, PostflopValues, MAX_POSTFLOP_ACTIONS,
@@ -424,6 +426,49 @@ fn compute_exploitability(
 // Solve one flop
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Immutable context for one postflop CFR iteration.
+/// Strategy is read from `snapshot`; deltas written to thread-local buffers.
+struct PostflopCfrCtx<'a> {
+    tree: &'a PostflopTree,
+    layout: &'a PostflopLayout,
+    equity_table: &'a [f64],
+    snapshot: &'a [f64],
+    iteration: u64,
+    dcfr: &'a DcfrParams,
+}
+
+impl ParallelCfr for PostflopCfrCtx<'_> {
+    fn buffer_size(&self) -> usize {
+        self.layout.total_size
+    }
+
+    fn traverse_pair(&self, dr: &mut [f64], ds: &mut [f64], h1: u16, h2: u16) {
+        let n = NUM_CANONICAL_HANDS;
+        let eq = self.equity_table[h1 as usize * n + h2 as usize];
+        if eq.is_nan() {
+            return;
+        }
+        for hero_pos in 0..2u8 {
+            exhaustive_cfr_traverse(
+                self.tree,
+                self.layout,
+                self.equity_table,
+                self.snapshot,
+                dr,
+                ds,
+                0,
+                h1,
+                h2,
+                hero_pos,
+                1.0,
+                1.0,
+                self.iteration,
+                self.dcfr,
+            );
+        }
+    }
+}
+
 /// Solve a single flop using exhaustive CFR with configurable iteration weighting.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn exhaustive_solve_one_flop(
@@ -443,42 +488,35 @@ fn exhaustive_solve_one_flop(
     let mut iterations_used = 0;
     let n = NUM_CANONICAL_HANDS;
 
+    // Pre-build valid hand pairs (filter NaN equity pairs once).
+    let pairs: Vec<(u16, u16)> = (0..n as u16)
+        .flat_map(|h1| (0..n as u16).map(move |h2| (h1, h2)))
+        .filter(|&(h1, h2)| !equity_table[h1 as usize * n + h2 as usize].is_nan())
+        .collect();
+
+    let mut snapshot = vec![0.0f64; buf_size];
+
     for iter in 0..num_iterations {
-        let snapshot = regret_sum.clone();
-        // Traverse all hand pairs
-        for hero_hand in 0..n as u16 {
-            for opp_hand in 0..n as u16 {
-                let eq = equity_table[hero_hand as usize * n + opp_hand as usize];
-                if eq.is_nan() {
-                    continue;
-                } // No valid combos
+        snapshot.clone_from(&regret_sum);
 
-                for hero_pos in 0..2u8 {
-                    exhaustive_cfr_traverse(
-                        tree,
-                        layout,
-                        equity_table,
-                        &snapshot,
-                        &mut regret_sum,
-                        &mut strategy_sum,
-                        0,
-                        hero_hand,
-                        opp_hand,
-                        hero_pos,
-                        1.0,
-                        1.0,
-                        iter as u64,
-                        dcfr,
-                    );
-                }
-            }
-        }
+        let ctx = PostflopCfrCtx {
+            tree,
+            layout,
+            equity_table,
+            snapshot: &snapshot,
+            iteration: iter as u64,
+            dcfr,
+        };
 
-        // Apply DCFR discounting after each full iteration (all hand pairs, both positions).
+        let (dr, ds) = parallel_traverse(&ctx, &pairs);
+
+        // Apply DCFR discounting before merging deltas.
         if dcfr.should_discount(iter as u64) {
             dcfr.discount_regrets(&mut regret_sum, iter as u64);
             dcfr.discount_strategy_sums(&mut strategy_sum, iter as u64);
         }
+        add_into(&mut regret_sum, &dr);
+        add_into(&mut strategy_sum, &ds);
         if dcfr.should_floor_regrets() {
             dcfr.floor_regrets(&mut regret_sum);
         }
@@ -1063,6 +1101,50 @@ mod tests {
             result.delta,
             expl_uniform
         );
+    }
+
+    #[timed_test(30)]
+    fn parallel_solve_matches_sequential_result() {
+        let config = PostflopModelConfig {
+            bet_sizes: vec![1.0],
+            max_raises_per_street: 0,
+            postflop_solve_iterations: 5,
+            ..PostflopModelConfig::exhaustive_fast()
+        };
+        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
+        let node_streets = annotate_streets(&tree);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
+        let equity_table = synthetic_equity_table();
+        let dcfr = DcfrParams::linear();
+
+        // Solve with default thread pool (parallel)
+        let result_par = exhaustive_solve_one_flop(
+            &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, &|_| {},
+        );
+
+        // Solve with 1 thread (sequential)
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let result_seq = pool.install(|| {
+            exhaustive_solve_one_flop(
+                &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, &|_| {},
+            )
+        });
+
+        assert_eq!(result_par.iterations_used, result_seq.iterations_used);
+        for (p, s) in result_par
+            .strategy_sum
+            .iter()
+            .zip(result_seq.strategy_sum.iter())
+        {
+            assert!(
+                (p - s).abs() < 1e-6,
+                "strategy_sum mismatch: parallel={p}, sequential={s}"
+            );
+        }
     }
 
     #[timed_test(15)]
