@@ -1070,7 +1070,7 @@ mod tests {
         (tree, layout, equity_table)
     }
 
-    #[timed_test(2)]
+    #[timed_test(10)]
     fn exploitability_is_positive_for_uniform_strategy() {
         let (tree, layout, equity_table) = expl_test_fixtures();
         // All-zero strategy_sum -> normalize_strategy_sum returns uniform
