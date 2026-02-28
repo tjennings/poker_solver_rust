@@ -18,17 +18,19 @@ pub trait ParallelCfr: Sync {
     fn traverse_pair(&self, regret_delta: &mut [f64], strategy_delta: &mut [f64], hero: u16, opponent: u16);
 }
 
-/// Parallel fold+reduce over hand pairs. Returns merged `(regret_delta, strategy_delta)`.
+/// Parallel fold+collect over hand pairs. Returns merged `(regret_delta, strategy_delta)`.
 ///
 /// Each rayon worker thread gets its own zero-initialized delta buffers.
-/// After all pairs are traversed, deltas are merged via element-wise addition.
+/// After all pairs are traversed, per-thread partitions are collected and
+/// merged sequentially. This avoids the O(chunks) identity allocations
+/// that `reduce()` requires, cutting allocations to O(threads).
 /// Results are mathematically identical to sequential traversal.
 pub fn parallel_traverse<T: ParallelCfr>(
     ctx: &T,
     pairs: &[(u16, u16)],
 ) -> (Vec<f64>, Vec<f64>) {
     let buf_size = ctx.buffer_size();
-    pairs
+    let partitions: Vec<(Vec<f64>, Vec<f64>)> = pairs
         .par_iter()
         .fold(
             || (vec![0.0_f64; buf_size], vec![0.0_f64; buf_size]),
@@ -37,14 +39,15 @@ pub fn parallel_traverse<T: ParallelCfr>(
                 (dr, ds)
             },
         )
-        .reduce(
-            || (vec![0.0; buf_size], vec![0.0; buf_size]),
-            |(mut ar, mut a_s), (br, bs)| {
-                add_into(&mut ar, &br);
-                add_into(&mut a_s, &bs);
-                (ar, a_s)
-            },
-        )
+        .collect();
+
+    let mut regret = vec![0.0_f64; buf_size];
+    let mut strategy = vec![0.0_f64; buf_size];
+    for (dr, ds) in partitions {
+        add_into(&mut regret, &dr);
+        add_into(&mut strategy, &ds);
+    }
+    (regret, strategy)
 }
 
 /// Element-wise `dst[i] += src[i]`.
