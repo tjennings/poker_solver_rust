@@ -1,0 +1,15 @@
+postflop_model:
+  solve_type: exhaustive
+  value_extraction_samples: 5
+  #max_flop_boards: 300
+  fixed_flops: [ 'AhKsQd', '2c3h4d']
+  #fixed_flops: ['KhKdTs', 'Kh8s7s', '9s8s5h', 'AsQs9h', 'KsTsTh', 'Js5h4d', '9s6s2s', 'AsQhQd', '6s4h2d', '8s6h2d', 'Ts8h3s', 'As6s5s', 'AsAhKs', '7s5h2s', 'QhJs8s', 'Ks9h3d', 'As7h3d', 'Ah5s4s', 'Js9h6s', 'QsTs2h', '9s7h4d', '8h4s3s', 'Qs7h5d', 'JhTs6s', 'Js4h3s']
+  postflop_sprs: [20]
+  bet_sizes: [0.5, 1.0, 1.5]
+  max_raises_per_street: 2
+  postflop_solve_iterations: 10
+  cfr_convergence_threshold: 1  # mBB/h for exhaustive mode
+  ev_convergence_threshold: 0.5
+  prune_warmup: 2          # iterations before pruning starts (0 = disabled)
+  prune_explore_freq: 5   # explore all actions every 20 iters (5% rate)
+  regret_floor: 1000000    # clamp negative regrets
