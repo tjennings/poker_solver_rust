@@ -399,6 +399,7 @@ fn build_postflop_with_progress(
         counters.pruned_traversal_count.store(0, Ordering::Relaxed);
         counters.total_action_slots.store(0, Ordering::Relaxed);
         counters.pruned_action_slots.store(0, Ordering::Relaxed);
+        counters.total_expected_traversals.store(0, Ordering::Relaxed);
         if !use_tui {
             eprintln!("SPR={spr} ({}/{total_sprs})", i + 1);
         }

@@ -37,6 +37,9 @@ pub struct SolverCounters {
     pub total_action_slots: AtomicU64,
     /// Action slots skipped by regret-based pruning.
     pub pruned_action_slots: AtomicU64,
+    /// Total expected `traverse_pair` calls for the current SPR.
+    /// Each flop adds `pairs.len() * num_iterations` when it starts solving.
+    pub total_expected_traversals: AtomicU64,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -601,6 +604,12 @@ fn exhaustive_solve_one_flop(
         .flat_map(|h1| (0..n as u16).map(move |h2| (h1, h2)))
         .filter(|&(h1, h2)| !equity_table[h1 as usize * n + h2 as usize].is_nan())
         .collect();
+
+    // Tell the TUI how many traversals this flop will contribute.
+    if let Some(c) = counters {
+        c.total_expected_traversals
+            .fetch_add((pairs.len() * num_iterations) as u64, Ordering::Relaxed);
+    }
 
     let mut snapshot = vec![0.0f64; buf_size];
 
@@ -1466,12 +1475,7 @@ mod tests {
         let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
         let equity_table = synthetic_equity_table();
         let dcfr = DcfrParams::linear();
-        let counters = SolverCounters {
-            traversal_count: AtomicU64::new(0),
-            pruned_traversal_count: AtomicU64::new(0),
-            total_action_slots: AtomicU64::new(0),
-            pruned_action_slots: AtomicU64::new(0),
-        };
+        let counters = SolverCounters::default();
         let _result = exhaustive_solve_one_flop(
             &tree, &layout, &equity_table, 5, 0.0, "test", &dcfr, &config,
             &|_| {}, Some(&counters),

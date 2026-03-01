@@ -31,7 +31,6 @@ pub struct TuiApp {
 
     // Sparkline histories
     traversals_per_sec: Vec<u64>,
-    total_traversals: Vec<u64>,
     pct_traversals_pruned: Vec<u64>,
     pct_actions_pruned: Vec<u64>,
 
@@ -52,7 +51,6 @@ impl TuiApp {
             counters,
             start_time: Instant::now(),
             traversals_per_sec: Vec::with_capacity(SPARKLINE_HISTORY),
-            total_traversals: Vec::with_capacity(SPARKLINE_HISTORY),
             pct_traversals_pruned: Vec::with_capacity(SPARKLINE_HISTORY),
             pct_actions_pruned: Vec::with_capacity(SPARKLINE_HISTORY),
             prev_traversal_count: 0,
@@ -83,9 +81,6 @@ impl TuiApp {
         };
         push_bounded(&mut self.traversals_per_sec, tps, SPARKLINE_HISTORY);
 
-        // Total traversals (cumulative count for this SPR)
-        push_bounded(&mut self.total_traversals, t, SPARKLINE_HISTORY);
-
         // Pruning percentages (0-100)
         let pct_trav = (dpt * 100).checked_div(dt).unwrap_or(0);
         push_bounded(&mut self.pct_traversals_pruned, pct_trav, SPARKLINE_HISTORY);
@@ -106,9 +101,8 @@ impl TuiApp {
             .constraints([
                 Constraint::Length(1), // SPR gauge
                 Constraint::Length(1), // Flop gauge
-                Constraint::Length(1), // spacer
+                Constraint::Length(1), // Traversal progress gauge
                 Constraint::Length(2), // traversals/sec sparkline
-                Constraint::Length(2), // remaining sparkline
                 Constraint::Length(2), // % traversals pruned
                 Constraint::Length(2), // % actions pruned
                 Constraint::Length(1), // section header
@@ -119,6 +113,7 @@ impl TuiApp {
 
         self.render_spr_gauge(frame, chunks[0]);
         self.render_flop_gauge(frame, chunks[1]);
+        self.render_traversal_gauge(frame, chunks[2]);
         self.render_sparkline_row(
             frame,
             chunks[3],
@@ -129,27 +124,20 @@ impl TuiApp {
         self.render_sparkline_row(
             frame,
             chunks[4],
-            "Total traversals",
-            &self.total_traversals,
-            Color::Yellow,
-        );
-        self.render_sparkline_row(
-            frame,
-            chunks[5],
             "% Trav pruned",
             &self.pct_traversals_pruned,
             Color::Green,
         );
         self.render_sparkline_row(
             frame,
-            chunks[6],
+            chunks[5],
             "% Actions pruned",
             &self.pct_actions_pruned,
             Color::Green,
         );
-        self.render_active_flops_header(frame, chunks[7]);
-        self.render_active_flops(frame, chunks[8]);
-        self.render_footer(frame, chunks[9]);
+        self.render_active_flops_header(frame, chunks[6]);
+        self.render_active_flops(frame, chunks[7]);
+        self.render_footer(frame, chunks[8]);
     }
 
     fn render_spr_gauge(&self, frame: &mut Frame, area: Rect) {
@@ -180,6 +168,25 @@ impl TuiApp {
             .gauge_style(Style::default().fg(Color::Green))
             .ratio(ratio.clamp(0.0, 1.0))
             .label(format!("Flop Progress: {done}/{total}"));
+        frame.render_widget(gauge, area);
+    }
+
+    fn render_traversal_gauge(&self, frame: &mut Frame, area: Rect) {
+        let done = self.counters.traversal_count.load(Ordering::Relaxed);
+        let total = self.counters.total_expected_traversals.load(Ordering::Relaxed);
+        let ratio = if total > 0 {
+            done as f64 / total as f64
+        } else {
+            0.0
+        };
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Yellow))
+            .ratio(ratio.clamp(0.0, 1.0))
+            .label(format!(
+                "Traversals: {}/{}",
+                format_count(done),
+                format_count(total),
+            ));
         frame.render_widget(gauge, area);
     }
 
