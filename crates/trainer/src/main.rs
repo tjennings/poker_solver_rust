@@ -11,12 +11,15 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
 use poker_solver_core::preflop::{
-    EquityTable, PostflopBundle, PostflopModelConfig, PreflopAction, PreflopBundle, PreflopConfig,
-    PreflopNode, PreflopSolver, PreflopTree,
+    EquityTable, PostflopBundle, PostflopModelConfig, PostflopSolveType, PreflopAction,
+    PreflopBundle, PreflopConfig, PreflopNode, PreflopSolver, PreflopTree,
 };
 use poker_solver_core::preflop::postflop_abstraction::{BuildPhase, FlopStage, PostflopAbstraction};
+use poker_solver_core::preflop::postflop_hands::{build_combo_map, parse_flops, sample_canonical_flops};
+use poker_solver_core::preflop::postflop_exhaustive::compute_equity_table;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -388,6 +391,36 @@ fn build_postflop_with_progress(
     let total_sprs = sprs.len();
     let mut abstractions = Vec::with_capacity(total_sprs);
 
+    // Pre-compute equity tables once when solving multiple SPRs with the
+    // exhaustive backend. Equity depends only on flop cards, not SPR, so
+    // this avoids redundant O(169^2 * runouts) work per extra SPR.
+    let equity_tables: Vec<Vec<f64>> =
+        if pf_config.solve_type == PostflopSolveType::Exhaustive && sprs.len() > 1 {
+            let flops = if let Some(ref names) = pf_config.fixed_flops {
+                parse_flops(names).map_err(|e| format!("invalid flops: {e}"))?
+            } else {
+                sample_canonical_flops(pf_config.max_flop_boards)
+            };
+            eprintln!(
+                "Pre-computing equity tables for {} flops...",
+                flops.len()
+            );
+            flops
+                .par_iter()
+                .map(|flop| {
+                    let combo_map = build_combo_map(flop);
+                    compute_equity_table(&combo_map, *flop)
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+    let pre_tables = if equity_tables.is_empty() {
+        None
+    } else {
+        Some(equity_tables.as_slice())
+    };
+
     for (i, &spr) in sprs.iter().enumerate() {
         phase_bar.set_style(spinner_style.clone());
         phase_bar.set_length(0);
@@ -402,6 +435,7 @@ fn build_postflop_with_progress(
             pf_config,
             spr,
             equity,
+            pre_tables,
             |phase| {
                 match &phase {
                     BuildPhase::FlopProgress { flop_name, stage } => {

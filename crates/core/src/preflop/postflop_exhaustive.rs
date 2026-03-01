@@ -790,6 +790,7 @@ pub(crate) fn build_exhaustive(
     layout: &PostflopLayout,
     node_streets: &[Street],
     flops: &[[Card; 3]],
+    pre_equity_tables: Option<&[Vec<f64>]>,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> PostflopValues {
     let num_flops = flops.len();
@@ -811,8 +812,12 @@ pub(crate) fn build_exhaustive(
             let flop = flops[flop_idx];
             let flop_name = format!("{}{}{}", flop[0], flop[1], flop[2]);
 
-            let combo_map = build_combo_map(&flop);
-            let equity_table = compute_equity_table(&combo_map, flop);
+            let equity_table = if let Some(tables) = pre_equity_tables {
+                tables[flop_idx].clone()
+            } else {
+                let combo_map = build_combo_map(&flop);
+                compute_equity_table(&combo_map, flop)
+            };
 
             let result = exhaustive_solve_one_flop(
                 tree,
