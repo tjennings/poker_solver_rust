@@ -87,9 +87,9 @@ impl TuiApp {
         push_bounded(&mut self.total_traversals, t, SPARKLINE_HISTORY);
 
         // Pruning percentages (0-100)
-        let pct_trav = if dt > 0 { (dpt * 100) / dt } else { 0 };
+        let pct_trav = (dpt * 100).checked_div(dt).unwrap_or(0);
         push_bounded(&mut self.pct_traversals_pruned, pct_trav, SPARKLINE_HISTORY);
-        let pct_act = if dta > 0 { (dpa * 100) / dta } else { 0 };
+        let pct_act = (dpa * 100).checked_div(dta).unwrap_or(0);
         push_bounded(&mut self.pct_actions_pruned, pct_act, SPARKLINE_HISTORY);
 
         self.prev_traversal_count = t;
@@ -231,7 +231,7 @@ impl TuiApp {
             items.push((state.iteration, line));
         }
         // Sort by iteration progress descending (most-progressed first)
-        items.sort_by(|a, b| b.0.cmp(&a.0));
+        items.sort_by_key(|item| std::cmp::Reverse(item.0));
         let mut list_items: Vec<ListItem> = items
             .into_iter()
             .map(|(_, text)| ListItem::new(text))
@@ -317,12 +317,10 @@ fn run_tui_inner(
         app.tick();
         terminal.draw(|frame| app.render(frame))?;
 
-        if event::poll(refresh_interval)? {
-            if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') {
-                    break;
-                }
-            }
+        if event::poll(refresh_interval)?
+            && matches!(event::read()?, Event::Key(key) if key.code == KeyCode::Char('q'))
+        {
+            break;
         }
 
         if done.load(Ordering::Relaxed) {
