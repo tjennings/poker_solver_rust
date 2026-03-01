@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
 
@@ -14,12 +14,6 @@ pub struct FlopTuiState {
 /// Solver threads increment atomic counters in the hot path.
 /// The TUI thread samples them at its refresh interval.
 pub struct TuiMetrics {
-    // Global traversal counters (incremented per hand-pair traversal)
-    pub traversal_count: AtomicU64,
-    pub pruned_traversal_count: AtomicU64,
-    pub total_action_slots: AtomicU64,
-    pub pruned_action_slots: AtomicU64,
-
     // SPR-level progress (set by outer loop)
     pub current_spr: AtomicU32,
     pub total_sprs: AtomicU32,
@@ -33,10 +27,6 @@ pub struct TuiMetrics {
 impl TuiMetrics {
     pub fn new(total_sprs: u32, total_flops: u32) -> Self {
         Self {
-            traversal_count: AtomicU64::new(0),
-            pruned_traversal_count: AtomicU64::new(0),
-            total_action_slots: AtomicU64::new(0),
-            pruned_action_slots: AtomicU64::new(0),
             current_spr: AtomicU32::new(0),
             total_sprs: AtomicU32::new(total_sprs),
             flops_completed: AtomicU32::new(0),
@@ -50,10 +40,6 @@ impl TuiMetrics {
         self.current_spr.store(spr_index, Ordering::Relaxed);
         self.flops_completed.store(0, Ordering::Relaxed);
         self.total_flops.store(total_flops, Ordering::Relaxed);
-        self.traversal_count.store(0, Ordering::Relaxed);
-        self.pruned_traversal_count.store(0, Ordering::Relaxed);
-        self.total_action_slots.store(0, Ordering::Relaxed);
-        self.pruned_action_slots.store(0, Ordering::Relaxed);
         self.flop_states.clear();
     }
 
@@ -90,10 +76,8 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[test]
-    fn tui_metrics_atomic_increment() {
+    fn tui_metrics_init() {
         let m = TuiMetrics::new(7, 200);
-        m.traversal_count.fetch_add(100, Ordering::Relaxed);
-        assert_eq!(m.traversal_count.load(Ordering::Relaxed), 100);
         assert_eq!(m.total_sprs.load(Ordering::Relaxed), 7);
         assert_eq!(m.total_flops.load(Ordering::Relaxed), 200);
     }
@@ -115,13 +99,11 @@ mod tests {
     #[test]
     fn start_spr_resets_counters() {
         let m = TuiMetrics::new(3, 100);
-        m.traversal_count.fetch_add(5000, Ordering::Relaxed);
         m.flops_completed.store(50, Ordering::Relaxed);
         m.update_flop("test", 10, 50, 42.0);
 
         m.start_spr(1, 200);
 
-        assert_eq!(m.traversal_count.load(Ordering::Relaxed), 0);
         assert_eq!(m.flops_completed.load(Ordering::Relaxed), 0);
         assert_eq!(m.total_flops.load(Ordering::Relaxed), 200);
         assert_eq!(m.current_spr.load(Ordering::Relaxed), 1);

@@ -15,6 +15,7 @@ use crossterm::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
+use poker_solver_core::preflop::SolverCounters;
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline};
 
 use crate::tui_metrics::TuiMetrics;
@@ -25,6 +26,7 @@ const SPARKLINE_HISTORY: usize = 60;
 /// Application state owned by the TUI thread.
 pub struct TuiApp {
     metrics: Arc<TuiMetrics>,
+    counters: Arc<SolverCounters>,
     start_time: Instant,
 
     // Sparkline histories
@@ -47,9 +49,10 @@ pub struct TuiApp {
 }
 
 impl TuiApp {
-    pub fn new(metrics: Arc<TuiMetrics>, refresh_secs: f64) -> Self {
+    pub fn new(metrics: Arc<TuiMetrics>, counters: Arc<SolverCounters>, refresh_secs: f64) -> Self {
         Self {
             metrics,
+            counters,
             start_time: Instant::now(),
             traversals_per_sec: Vec::with_capacity(SPARKLINE_HISTORY),
             remaining_pairs: Vec::with_capacity(SPARKLINE_HISTORY),
@@ -70,10 +73,10 @@ impl TuiApp {
 
     /// Sample metrics and update sparkline histories.
     pub fn tick(&mut self) {
-        let t = self.metrics.traversal_count.load(Ordering::Relaxed);
-        let pt = self.metrics.pruned_traversal_count.load(Ordering::Relaxed);
-        let ta = self.metrics.total_action_slots.load(Ordering::Relaxed);
-        let pa = self.metrics.pruned_action_slots.load(Ordering::Relaxed);
+        let t = self.counters.traversal_count.load(Ordering::Relaxed);
+        let pt = self.counters.pruned_traversal_count.load(Ordering::Relaxed);
+        let ta = self.counters.total_action_slots.load(Ordering::Relaxed);
+        let pa = self.counters.pruned_action_slots.load(Ordering::Relaxed);
 
         let dt = t.saturating_sub(self.prev_traversal_count);
         let dpt = pt.saturating_sub(self.prev_pruned_traversal_count);
@@ -234,12 +237,19 @@ impl TuiApp {
             );
             items.push((state.iteration, line));
         }
-        // Sort by iteration progress descending
+        // Sort by iteration progress descending (most-progressed first)
         items.sort_by(|a, b| b.0.cmp(&a.0));
-        let list_items: Vec<ListItem> = items
+        let mut list_items: Vec<ListItem> = items
             .into_iter()
             .map(|(_, text)| ListItem::new(text))
             .collect();
+        // Truncate to visible rows, showing "+N more" if clipped
+        let visible_rows = area.height as usize;
+        if list_items.len() > visible_rows && visible_rows > 0 {
+            let hidden = list_items.len() - (visible_rows - 1);
+            list_items.truncate(visible_rows - 1);
+            list_items.push(ListItem::new(format!("  ... +{hidden} more flops")));
+        }
         let list = List::new(list_items).block(Block::default().borders(Borders::NONE));
         frame.render_widget(list, area);
     }
@@ -283,12 +293,13 @@ impl TuiApp {
 /// The TUI exits when `done` is set to `true` or user presses 'q'.
 pub fn run_tui(
     metrics: Arc<TuiMetrics>,
+    counters: Arc<SolverCounters>,
     refresh_interval: Duration,
     done: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     let refresh_secs = refresh_interval.as_secs_f64();
     std::thread::spawn(move || {
-        if let Err(e) = run_tui_inner(metrics, refresh_interval, refresh_secs, done) {
+        if let Err(e) = run_tui_inner(metrics, counters, refresh_interval, refresh_secs, done) {
             eprintln!("TUI error: {e}");
         }
     })
@@ -296,6 +307,7 @@ pub fn run_tui(
 
 fn run_tui_inner(
     metrics: Arc<TuiMetrics>,
+    counters: Arc<SolverCounters>,
     refresh_interval: Duration,
     refresh_secs: f64,
     done: Arc<AtomicBool>,
@@ -306,7 +318,7 @@ fn run_tui_inner(
     let backend = CrosstermBackend::new(stderr);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = TuiApp::new(metrics, refresh_secs);
+    let mut app = TuiApp::new(metrics, counters, refresh_secs);
 
     loop {
         app.tick();
@@ -376,11 +388,21 @@ mod tests {
     use super::*;
     use crate::tui_metrics::TuiMetrics;
 
+    fn make_counters() -> Arc<SolverCounters> {
+        Arc::new(SolverCounters {
+            traversal_count: Default::default(),
+            pruned_traversal_count: Default::default(),
+            total_action_slots: Default::default(),
+            pruned_action_slots: Default::default(),
+        })
+    }
+
     #[test]
     fn tui_app_renders_without_panic() {
         let metrics = Arc::new(TuiMetrics::new(3, 200));
-        let mut app = TuiApp::new(Arc::clone(&metrics), 1.0);
-        metrics.traversal_count.fetch_add(1000, Ordering::Relaxed);
+        let counters = make_counters();
+        let mut app = TuiApp::new(Arc::clone(&metrics), Arc::clone(&counters), 1.0);
+        counters.traversal_count.fetch_add(1000, Ordering::Relaxed);
         app.tick();
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -390,13 +412,14 @@ mod tests {
     #[test]
     fn tick_computes_deltas() {
         let metrics = Arc::new(TuiMetrics::new(1, 10));
-        let mut app = TuiApp::new(Arc::clone(&metrics), 1.0);
+        let counters = make_counters();
+        let mut app = TuiApp::new(Arc::clone(&metrics), Arc::clone(&counters), 1.0);
 
-        metrics.traversal_count.fetch_add(500, Ordering::Relaxed);
+        counters.traversal_count.fetch_add(500, Ordering::Relaxed);
         app.tick();
         assert_eq!(app.traversals_per_sec.last(), Some(&500));
 
-        metrics.traversal_count.fetch_add(300, Ordering::Relaxed);
+        counters.traversal_count.fetch_add(300, Ordering::Relaxed);
         app.tick();
         assert_eq!(app.traversals_per_sec.last(), Some(&300));
     }

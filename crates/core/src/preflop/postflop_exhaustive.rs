@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub struct SolverCounters {
     /// Number of `traverse_pair` calls (one per hero/opponent hand pair per iteration).
     pub traversal_count: AtomicU64,
-    /// Reserved for future use (per-traversal pruning tracking).
+    /// Number of `traverse_pair` calls where pruning was active.
     pub pruned_traversal_count: AtomicU64,
     /// Total action slots visited at hero decision nodes.
     pub total_action_slots: AtomicU64,
@@ -515,6 +515,9 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
         }
         if let Some(c) = self.counters {
             c.traversal_count.fetch_add(1, Ordering::Relaxed);
+            if self.prune_active {
+                c.pruned_traversal_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
         for hero_pos in 0..2u8 {
             exhaustive_cfr_traverse(
