@@ -1,21 +1,23 @@
 mod bucket_diagnostics;
 mod hand_trace;
 mod lhe_viz;
+mod tui;
+mod tui_metrics;
 
 use std::error::Error;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
 use poker_solver_core::preflop::{
     EquityTable, PostflopBundle, PostflopModelConfig, PostflopSolveType, PreflopAction,
-    PreflopBundle, PreflopConfig, PreflopNode, PreflopSolver, PreflopTree,
+    PreflopBundle, PreflopConfig, PreflopNode, PreflopSolver, PreflopTree, SolverCounters,
 };
 use poker_solver_core::preflop::postflop_abstraction::{BuildPhase, FlopStage, PostflopAbstraction};
 use poker_solver_core::preflop::postflop_hands::{build_combo_map, parse_flops, sample_canonical_flops};
@@ -63,6 +65,9 @@ enum Commands {
         /// Output directory for the postflop bundle
         #[arg(short, long)]
         output: PathBuf,
+        /// TUI dashboard refresh interval in seconds (default: 1.0)
+        #[arg(long, default_value = "1.0")]
+        tui_refresh: f64,
     },
     /// List all 1,755 canonical (suit-isomorphic) flops
     Flops {
@@ -121,8 +126,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 claude_debug,
             )?;
         }
-        Commands::SolvePostflop { config, output } => {
-            run_solve_postflop(&config, &output)?;
+        Commands::SolvePostflop { config, output, tui_refresh } => {
+            run_solve_postflop(&config, &output, tui_refresh)?;
         }
         Commands::Flops { format, output } => {
             run_flops(format, output)?;
@@ -311,85 +316,49 @@ fn print_postflop_ev_diagnostics(
 // ---------------------------------------------------------------------------
 
 /// Build one or more `PostflopAbstraction`s (one per configured SPR) with
-/// multi-bar progress display showing per-flop CFR delta / EV extraction
-/// progress alongside a main phase bar.
+/// a full-screen TUI dashboard showing per-flop convergence, pruning stats,
+/// and traversal throughput.
+///
+/// When stderr is not a TTY (piped output, CI, etc.), falls back to simple
+/// line-based progress logging to avoid corrupting output with ANSI escape
+/// sequences.
 fn build_postflop_with_progress(
     pf_config: &PostflopModelConfig,
     equity: Option<&EquityTable>,
+    tui_refresh: f64,
 ) -> Result<Vec<PostflopAbstraction>, Box<dyn Error>> {
-    let bar_style = ProgressStyle::default_bar()
-        .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-        .expect("valid template")
-        .progress_chars("#>-");
-    let spinner_style = ProgressStyle::default_spinner()
-        .template("{spinner:.green} {msg}")
-        .expect("valid template");
+    let sprs = &pf_config.postflop_sprs;
+    let total_sprs = sprs.len() as u32;
+    let use_tui = std::io::stderr().is_terminal();
 
-    let multi = MultiProgress::new();
-    let phase_bar = multi.add(ProgressBar::new_spinner());
-    phase_bar.set_style(spinner_style.clone());
-    phase_bar.set_message("Postflop abstraction");
-    phase_bar.enable_steady_tick(std::time::Duration::from_millis(500));
+    // Use max_flop_boards as an estimate; 0 means all ~1,755 canonical flops.
+    let estimated_flops = if pf_config.max_flop_boards == 0 { 1755 } else { pf_config.max_flop_boards } as u32;
+    let counters = Arc::new(SolverCounters::default());
 
-    const MAX_FLOP_BARS: usize = 10;
-
-    struct FlopSlotData {
-        sort_key: f64,
-        position: u64,
-        length: u64,
-        message: String,
-    }
-
-    struct FlopBarState {
-        states: HashMap<String, FlopSlotData>,
-        slots: Vec<ProgressBar>,
-        last_refresh: Instant,
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    fn refresh_flop_slots(
-        states: &HashMap<String, FlopSlotData>,
-        slots: &mut Vec<ProgressBar>,
-        multi: &MultiProgress,
-        style: &ProgressStyle,
-    ) {
-        let mut sorted: Vec<_> = states.iter().collect();
-        sorted.sort_by(|a, b| {
-            b.1.sort_key
-                .partial_cmp(&a.1.sort_key)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let visible = sorted.len().min(MAX_FLOP_BARS);
-        while slots.len() < visible {
-            let b = multi.add(ProgressBar::new(0));
-            b.set_style(style.clone());
-            b.enable_steady_tick(std::time::Duration::from_millis(500));
-            slots.push(b);
-        }
-        while slots.len() > visible {
-            if let Some(bar) = slots.pop() {
-                bar.finish_and_clear();
-                multi.remove(&bar);
-            }
-        }
-        for (i, (_, data)) in sorted.iter().take(visible).enumerate() {
-            slots[i].set_length(data.length);
-            slots[i].set_position(data.position);
-            slots[i].set_message(data.message.clone());
-        }
-    }
-
-    let flop_state: Arc<Mutex<FlopBarState>> =
-        Arc::new(Mutex::new(FlopBarState {
-            states: HashMap::new(),
-            slots: Vec::new(),
-            last_refresh: Instant::now(),
-        }));
+    // TUI-mode resources: only allocated when stderr is a TTY.
+    let metrics = if use_tui {
+        Some(Arc::new(tui_metrics::TuiMetrics::new(total_sprs, estimated_flops)))
+    } else {
+        None
+    };
+    let done = if use_tui {
+        Some(Arc::new(AtomicBool::new(false)))
+    } else {
+        None
+    };
+    let tui_handle = if let (Some(m), Some(d)) = (&metrics, &done) {
+        Some(tui::run_tui(
+            Arc::clone(m),
+            Arc::clone(&counters),
+            Duration::from_secs_f64(tui_refresh),
+            Arc::clone(d),
+        ))
+    } else {
+        None
+    };
 
     let pf_start = Instant::now();
-    let sprs = &pf_config.postflop_sprs;
-    let total_sprs = sprs.len();
-    let mut abstractions = Vec::with_capacity(total_sprs);
+    let mut abstractions = Vec::with_capacity(sprs.len());
 
     // Pre-compute equity tables once when solving multiple SPRs with the
     // exhaustive backend. Equity depends only on flop cards, not SPR, so
@@ -422,98 +391,87 @@ fn build_postflop_with_progress(
     };
 
     for (i, &spr) in sprs.iter().enumerate() {
-        phase_bar.set_style(spinner_style.clone());
-        phase_bar.set_length(0);
-        phase_bar.set_position(0);
-        phase_bar.set_message(format!(
-            "Postflop SPR={spr} ({}/{})",
-            i + 1,
-            total_sprs,
-        ));
+        if let Some(m) = &metrics {
+            m.start_spr(i as u32, estimated_flops);
+        }
+        // Reset solver counters for each SPR so TUI shows per-SPR rates.
+        counters.traversal_count.store(0, Ordering::Relaxed);
+        counters.pruned_traversal_count.store(0, Ordering::Relaxed);
+        counters.total_action_slots.store(0, Ordering::Relaxed);
+        counters.pruned_action_slots.store(0, Ordering::Relaxed);
+        if !use_tui {
+            eprintln!("SPR={spr} ({}/{total_sprs})", i + 1);
+        }
+
+        let metrics_ref = &metrics;
 
         let abstraction = PostflopAbstraction::build_for_spr(
             pf_config,
             spr,
             equity,
             pre_tables,
+            Some(&*counters),
             |phase| {
-                match &phase {
-                    BuildPhase::FlopProgress { flop_name, stage } => {
-                        let mut guard = flop_state.lock().unwrap();
-                        let fbs = &mut *guard;
-                        match stage {
-                            FlopStage::Solving { iteration, max_iterations, delta, metric_label } => {
-                                #[allow(clippy::cast_precision_loss)]
-                                let key = 1.0 + *iteration as f64 / (*max_iterations).max(1) as f64;
-                                fbs.states.insert(flop_name.clone(), FlopSlotData {
-                                    sort_key: key,
-                                    position: *iteration as u64,
-                                    length: *max_iterations as u64,
-                                    message: format!("Flop '{flop_name}' CFR {metric_label}={delta:.4}"),
-                                });
-                            }
-                            FlopStage::EstimatingEv { sample, total_samples } => {
-                                #[allow(clippy::cast_precision_loss)]
-                                let key = 2.0 + *sample as f64 / (*total_samples).max(1) as f64;
-                                fbs.states.insert(flop_name.clone(), FlopSlotData {
-                                    sort_key: key,
-                                    position: *sample as u64,
-                                    length: *total_samples as u64,
-                                    message: format!("Flop '{flop_name}' EV Extraction"),
-                                });
-                            }
-                            FlopStage::Done => {
-                                fbs.states.remove(flop_name);
-                                refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
-                                fbs.last_refresh = Instant::now();
+                if let Some(m) = metrics_ref {
+                    match &phase {
+                        BuildPhase::FlopProgress { flop_name, stage } => {
+                            match stage {
+                                FlopStage::Solving { iteration, max_iterations, delta, .. } => {
+                                    m.update_flop(flop_name, *iteration, *max_iterations, *delta);
+                                }
+                                FlopStage::EstimatingEv { .. } => {}
+                                FlopStage::Done => {
+                                    m.remove_flop(flop_name);
+                                }
                             }
                         }
-                        if fbs.last_refresh.elapsed() >= std::time::Duration::from_secs(10) {
-                            fbs.last_refresh = Instant::now();
-                            refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
+                        BuildPhase::MccfrFlopsCompleted { completed, total } => {
+                            m.flops_completed.store(*completed as u32, Ordering::Relaxed);
+                            m.total_flops.store(*total as u32, Ordering::Relaxed);
                         }
+                        BuildPhase::ComputingValues => {}
                     }
-                    BuildPhase::MccfrFlopsCompleted { completed, total } => {
-                        phase_bar.set_style(bar_style.clone());
-                        phase_bar.set_length(*total as u64);
-                        phase_bar.set_position(*completed as u64);
-                        phase_bar.set_message(format!("SPR={spr} Solving"));
-                    }
-                    _ => {
-                        phase_bar.set_style(spinner_style.clone());
-                        phase_bar.set_message(format!("SPR={spr} {phase}..."));
+                } else {
+                    // Non-TTY fallback: line-based progress to stderr.
+                    match &phase {
+                        BuildPhase::FlopProgress { flop_name, stage } => {
+                            if let FlopStage::Solving { iteration, max_iterations, delta, metric_label } = stage {
+                                // Log every ~10 iterations to avoid flooding.
+                                if *iteration % 10 == 0 || *iteration == *max_iterations {
+                                    eprintln!(
+                                        "    {flop_name}: iter {iteration}/{max_iterations} {metric_label}={delta:.2}",
+                                    );
+                                }
+                            }
+                        }
+                        BuildPhase::MccfrFlopsCompleted { completed, total } => {
+                            eprintln!("  SPR={spr}: {completed}/{total} flops completed");
+                        }
+                        BuildPhase::ComputingValues => {
+                            eprintln!("  Computing hand average values...");
+                        }
                     }
                 }
             },
         )
         .map_err(|e| format!("postflop SPR={spr}: {e}"))?;
 
-        // Clean up flop bars between SPR solves.
-        {
-            let mut guard = flop_state.lock().unwrap();
-            let fbs = &mut *guard;
-            fbs.states.clear();
-            for bar in fbs.slots.drain(..) {
-                bar.finish_and_clear();
-                multi.remove(&bar);
-            }
-            fbs.last_refresh = Instant::now();
-        }
-
-        eprintln!(
-            "  SPR={spr} done ({}/{total_sprs}, values: {} entries)",
-            i + 1,
-            abstraction.values.len(),
-        );
         abstractions.push(abstraction);
     }
 
-    phase_bar.set_style(bar_style);
-    phase_bar.finish_with_message(format!(
-        "done in {:.1?} ({total_sprs} SPR model{})",
+    // Signal the TUI to exit and wait for it to restore the terminal.
+    if let Some(d) = &done {
+        d.store(true, Ordering::Relaxed);
+    }
+    if let Some(handle) = tui_handle {
+        let _ = handle.join();
+    }
+
+    eprintln!(
+        "Postflop solve complete in {:.1?} ({total_sprs} SPR model{})",
         pf_start.elapsed(),
         if total_sprs == 1 { "" } else { "s" },
-    ));
+    );
 
     Ok(abstractions)
 }
@@ -522,14 +480,14 @@ fn build_postflop_with_progress(
 // Postflop bundle builder
 // ---------------------------------------------------------------------------
 
-fn run_solve_postflop(config_path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+fn run_solve_postflop(config_path: &Path, output: &Path, tui_refresh: f64) -> Result<(), Box<dyn Error>> {
     let yaml = std::fs::read_to_string(config_path)?;
     let config: PostflopSolveConfig = serde_yaml::from_str(&yaml)?;
     let pf_config = config.postflop_model;
 
     eprintln!("Building postflop abstraction ({} SPR models)...", pf_config.postflop_sprs.len());
 
-    let abstractions = build_postflop_with_progress(&pf_config, None)?;
+    let abstractions = build_postflop_with_progress(&pf_config, None, tui_refresh)?;
 
     let refs: Vec<&PostflopAbstraction> = abstractions.iter().collect();
     PostflopBundle::save_multi(&pf_config, &refs, output)?;
