@@ -42,19 +42,18 @@ impl PreflopStrategy {
 
     /// Action probabilities for a hand at the root node (index 0).
     #[must_use]
-    pub fn get_root_probs(&self, hand_idx: usize) -> Vec<f64> {
+    pub fn get_root_probs(&self, hand_idx: usize) -> &[f64] {
         self.get_probs(0, hand_idx)
     }
 
     /// Action probabilities for a hand at any node.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn get_probs(&self, node_idx: u32, hand_idx: usize) -> Vec<f64> {
+    pub fn get_probs(&self, node_idx: u32, hand_idx: usize) -> &[f64] {
         // Safe: hand_idx is always < 169, well within u16 range
         self.strategies
             .get(&Self::key(node_idx, hand_idx as u16))
-            .cloned()
-            .unwrap_or_default()
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Consume self and return the inner strategy map.
