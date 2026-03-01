@@ -84,6 +84,53 @@ pub fn parallel_traverse_into<T: ParallelCfr>(
     }
 }
 
+/// Traverse all hand pairs in parallel using a pre-allocated buffer pool.
+///
+/// Each pool entry is zeroed, then accumulates deltas for a chunk of pairs.
+/// The caller merges pool entries into final regret/strategy buffers.
+///
+/// This avoids the O(threads × buf_size) allocation that `parallel_traverse_into`
+/// performs every call via rayon `fold`. The pool is allocated once and reused
+/// across iterations.
+pub fn parallel_traverse_pooled<T: ParallelCfr>(
+    ctx: &T,
+    pairs: &[(u16, u16)],
+    pool: &mut [(Vec<f64>, Vec<f64>)],
+) {
+    if pool.is_empty() || pairs.is_empty() {
+        for (dr, ds) in pool.iter_mut() {
+            dr.fill(0.0);
+            ds.fill(0.0);
+        }
+        return;
+    }
+
+    if let Some((dr, _)) = pool.first() {
+        debug_assert_eq!(
+            dr.len(),
+            ctx.buffer_size(),
+            "pool buffer size mismatch: got {} expected {}",
+            dr.len(),
+            ctx.buffer_size()
+        );
+    }
+
+    let n = pool.len();
+    let chunk_size = (pairs.len() + n - 1) / n;
+
+    pool.par_iter_mut()
+        .enumerate()
+        .for_each(|(i, (dr, ds))| {
+            dr.fill(0.0);
+            ds.fill(0.0);
+            let start = i * chunk_size;
+            let end = (start + chunk_size).min(pairs.len());
+            for &(h1, h2) in &pairs[start..end] {
+                ctx.traverse_pair(dr, ds, h1, h2);
+            }
+        });
+}
+
 /// Element-wise `dst[i] += src[i]`.
 #[inline]
 pub fn add_into(dst: &mut [f64], src: &[f64]) {
@@ -180,5 +227,46 @@ mod tests {
         let src = vec![10.0, 20.0, 30.0];
         add_into(&mut dst, &src);
         assert_eq!(dst, vec![11.0, 22.0, 33.0]);
+    }
+
+    #[timed_test]
+    fn parallel_traverse_pooled_matches_sequential() {
+        let pairs: Vec<(u16, u16)> = (0..10_u16)
+            .flat_map(|h1| (0..10_u16).map(move |h2| (h1, h2)))
+            .collect();
+
+        let mut exp_dr = vec![0.0_f64; 2];
+        let mut exp_ds = vec![0.0_f64; 2];
+        for &(h1, h2) in &pairs {
+            MockCfr.traverse_pair(&mut exp_dr, &mut exp_ds, h1, h2);
+        }
+
+        let mut pool: Vec<(Vec<f64>, Vec<f64>)> = (0..4)
+            .map(|_| (vec![0.0f64; 2], vec![0.0f64; 2]))
+            .collect();
+        parallel_traverse_pooled(&MockCfr, &pairs, &mut pool);
+
+        let mut dr = vec![0.0f64; 2];
+        let mut ds = vec![0.0f64; 2];
+        for (pdr, pds) in &pool {
+            add_into(&mut dr, pdr);
+            add_into(&mut ds, pds);
+        }
+
+        assert!((dr[0] - exp_dr[0]).abs() < 1e-9, "dr mismatch: {} vs {}", dr[0], exp_dr[0]);
+        assert!((ds[0] - exp_ds[0]).abs() < 1e-9, "ds mismatch: {} vs {}", ds[0], exp_ds[0]);
+    }
+
+    #[timed_test]
+    fn parallel_traverse_pooled_empty_pairs() {
+        let mut pool: Vec<(Vec<f64>, Vec<f64>)> = (0..2)
+            .map(|_| (vec![1.0f64; 2], vec![1.0f64; 2]))
+            .collect();
+        parallel_traverse_pooled(&MockCfr, &[], &mut pool);
+        // Pool should be zeroed even with no pairs
+        for (dr, ds) in &pool {
+            assert!(dr[0].abs() < 1e-15);
+            assert!(ds[0].abs() < 1e-15);
+        }
     }
 }
