@@ -1,0 +1,42 @@
+# Minimal postflop solver config.
+# Solves postflop game trees on fixed flops.
+#
+# Usage:
+#   cargo run -p poker-solver-trainer --release -- solve-postflop \
+#     -c sample_configurations/minimal_postflop.yaml -o minimal_postflop
+
+postflop_model:
+  solve_type: exhaustive
+  fixed_flops: ['AhKsQd', '2c3h4d']   # 2 flops — fast smoke test
+  postflop_sprs: [2, 6]
+
+  # -- Bet sizing --
+  # bet_sizes are pot fractions used on every street (flop/turn/river).
+  # The solver also adds all-in as an option when effective stacks are shallow.
+  #
+  # Geometric sizing: a single pot-fraction bet that, if used every remaining
+  # street, gets exactly all-in. Formula for SPR S over n streets:
+  #   g = ((2S + 1)^(1/n) - 1) / 2
+  #
+  # Geometric pot fractions for these SPRs:
+  #
+  #   SPR  | 3 streets (flop) | 2 streets (turn) | 1 street (river)
+  #   -----+------------------+-------------------+-----------------
+  #     2  |      0.36        |      0.62         |     2.00
+  #     6  |      0.68        |      1.30         |     6.00
+  #    20  |      1.22        |      2.70         |    20.00
+  #
+  # Standard sizing (original): covers common static pot fractions
+  # bet_sizes: [0.3, 0.5, 1.0, 2]
+  #
+  # Geometric sizing: one size per SPR's 3-street geometric, plus all-in handles the rest
+  # bet_sizes: [0.36, 0.68, 1.22]
+  #
+  # Hybrid: geometric anchors + traditional half-pot and overbet
+  bet_sizes: [0.30, 2.0]
+
+  max_raises_per_street: 2
+  postflop_solve_iterations: 500
+  value_extraction_samples: 5000
+  cfr_convergence_threshold: 400       # mBB/h — loose for speed
+  ev_convergence_threshold: 0.5

@@ -593,7 +593,7 @@ pub(crate) fn normalize_strategy_sum_into(strategy_sum: &[f64], start: usize, ou
 // Shared helpers for CFR traversal and value evaluation
 // ──────────────────────────────────────────────────────────────────────────────
 
-pub(crate) const MAX_POSTFLOP_ACTIONS: usize = 8;
+pub(crate) const MAX_POSTFLOP_ACTIONS: usize = 12;
 
 /// Regret matching: normalize positive regrets into a strategy.
 #[allow(clippy::cast_precision_loss)]

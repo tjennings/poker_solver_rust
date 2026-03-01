@@ -6,6 +6,7 @@
 use crate::abstraction::Street;
 use thiserror::Error;
 
+use super::postflop_abstraction::MAX_POSTFLOP_ACTIONS;
 use super::postflop_model::PostflopModelConfig;
 
 /// Classification of a preflop pot that determines which postflop tree to use.
@@ -72,6 +73,8 @@ pub enum PostflopNode {
 pub enum PostflopTreeError {
     #[error("bet_sizes must be non-empty")]
     EmptyBetSizes,
+    #[error("too many bet sizes ({count}): maximum is {max} (each bet size adds an action to decision nodes)")]
+    TooManyBetSizes { count: usize, max: usize },
 }
 
 /// A complete postflop game tree template for one pot type.
@@ -193,6 +196,14 @@ impl PostflopTree {
 fn validate_config(config: &PostflopModelConfig) -> Result<(), PostflopTreeError> {
     if config.bet_sizes.is_empty() {
         return Err(PostflopTreeError::EmptyBetSizes);
+    }
+    // Worst case: constrained_raise_actions = fold + call + all sizes + all-in
+    let max_actions = config.bet_sizes.len() + 3;
+    if max_actions > MAX_POSTFLOP_ACTIONS {
+        return Err(PostflopTreeError::TooManyBetSizes {
+            count: config.bet_sizes.len(),
+            max: MAX_POSTFLOP_ACTIONS - 3,
+        });
     }
     Ok(())
 }
