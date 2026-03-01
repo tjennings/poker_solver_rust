@@ -40,6 +40,16 @@ fn default_ev_convergence_threshold() -> f64 {
     0.001
 }
 
+fn default_prune_warmup() -> usize {
+    200
+}
+fn default_prune_explore_freq() -> usize {
+    20
+}
+fn default_regret_floor() -> f64 {
+    1_000_000.0
+}
+
 /// Deserialize either a scalar `f64` or a `Vec<f64>` into `Vec<f64>`.
 /// Supports backward-compatible YAML: `postflop_spr: 4.0` → `vec![4.0]`.
 fn deserialize_sprs<'de, D>(deserializer: D) -> Result<Vec<f64>, D::Error>
@@ -142,6 +152,18 @@ pub struct PostflopModelConfig {
     /// Default: `linear` (LCFR -- linear iteration weighting, no discounting).
     #[serde(default = "default_cfr_variant")]
     pub cfr_variant: CfrVariant,
+
+    /// Iterations before regret-based pruning activates. 0 = no pruning.
+    #[serde(default = "default_prune_warmup")]
+    pub prune_warmup: usize,
+
+    /// Explore all actions (disable pruning) every N iterations. Default: 20.
+    #[serde(default = "default_prune_explore_freq")]
+    pub prune_explore_freq: usize,
+
+    /// Maximum magnitude of negative cumulative regret clamp. Default: 1,000,000.
+    #[serde(default = "default_regret_floor")]
+    pub regret_floor: f64,
 }
 
 impl PostflopModelConfig {
@@ -161,6 +183,9 @@ impl PostflopModelConfig {
             value_extraction_samples: 5,
             ev_convergence_threshold: 0.001,
             cfr_variant: CfrVariant::Linear,
+            prune_warmup: 0,
+            prune_explore_freq: 20,
+            regret_floor: 1_000_000.0,
         }
     }
 
@@ -180,6 +205,9 @@ impl PostflopModelConfig {
             value_extraction_samples: 10,
             ev_convergence_threshold: 0.001,
             cfr_variant: CfrVariant::Linear,
+            prune_warmup: 0,
+            prune_explore_freq: 20,
+            regret_floor: 1_000_000.0,
         }
     }
 

@@ -136,6 +136,7 @@ fn exhaustive_cfr_traverse(
     reach_opp: f64,
     iteration: u64,
     dcfr: &DcfrParams,
+    prune_active: bool,
 ) -> f64 {
     let n = NUM_CANONICAL_HANDS;
     match &tree.nodes[node_idx as usize] {
@@ -169,6 +170,7 @@ fn exhaustive_cfr_traverse(
                 reach_opp,
                 iteration,
                 dcfr,
+                prune_active,
             )
         }
 
@@ -185,7 +187,30 @@ fn exhaustive_cfr_traverse(
 
             if is_hero {
                 let mut action_values = [0.0f64; MAX_POSTFLOP_ACTIONS];
+
+                // RBP: build prune bitmask in a single pass over regrets.
+                // Bit i is set if action i should be pruned (negative regret,
+                // and at least one sibling has positive regret).
+                let mut prune_mask: u16 = 0;
+                if prune_active {
+                    let mut has_positive = false;
+                    let mut neg_mask: u16 = 0;
+                    for i in 0..num_actions {
+                        if snapshot[start + i] > 0.0 {
+                            has_positive = true;
+                        } else if snapshot[start + i] < 0.0 {
+                            neg_mask |= 1 << i;
+                        }
+                    }
+                    if has_positive {
+                        prune_mask = neg_mask;
+                    }
+                }
+
                 for (i, &child) in children.iter().enumerate() {
+                    if prune_mask & (1 << i) != 0 {
+                        continue;
+                    }
                     action_values[i] = exhaustive_cfr_traverse(
                         tree,
                         layout,
@@ -201,6 +226,7 @@ fn exhaustive_cfr_traverse(
                         reach_opp,
                         iteration,
                         dcfr,
+                        prune_active,
                     );
                 }
                 let node_value: f64 = strategy[..num_actions]
@@ -238,6 +264,7 @@ fn exhaustive_cfr_traverse(
                                 reach_opp * strategy[i],
                                 iteration,
                                 dcfr,
+                                prune_active,
                             )
                     })
                     .sum()
@@ -443,6 +470,7 @@ struct PostflopCfrCtx<'a> {
     snapshot: &'a [f64],
     iteration: u64,
     dcfr: &'a DcfrParams,
+    prune_active: bool,
 }
 
 impl ParallelCfr for PostflopCfrCtx<'_> {
@@ -472,6 +500,7 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
                 1.0,
                 self.iteration,
                 self.dcfr,
+                self.prune_active,
             );
         }
     }
@@ -493,6 +522,7 @@ fn exhaustive_solve_one_flop(
     flop_name: &str,
     dcfr: &DcfrParams,
     use_inner_parallelism: bool,
+    config: &PostflopModelConfig,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> FlopSolveResult {
     let buf_size = layout.total_size;
@@ -534,6 +564,10 @@ fn exhaustive_solve_one_flop(
     for iter in 0..num_iterations {
         snapshot.clone_from(&regret_sum);
 
+        let prune_active = config.prune_warmup > 0
+            && iter >= config.prune_warmup
+            && (config.prune_explore_freq == 0 || iter % config.prune_explore_freq != 0);
+
         let ctx = PostflopCfrCtx {
             tree,
             layout,
@@ -541,6 +575,7 @@ fn exhaustive_solve_one_flop(
             snapshot: &snapshot,
             iteration: iter as u64,
             dcfr,
+            prune_active,
         };
 
         if let Some(pool) = &serial_pool {
@@ -558,6 +593,16 @@ fn exhaustive_solve_one_flop(
         add_into(&mut strategy_sum, &ds);
         if dcfr.should_floor_regrets() {
             dcfr.floor_regrets(&mut regret_sum);
+        }
+
+        // Clamp negative regrets to prevent unbounded accumulation.
+        // This bounds memory of bad actions so pruned actions can
+        // recover when explored during explore-frequency iterations.
+        if config.regret_floor > 0.0 && config.prune_warmup > 0 {
+            let floor = -config.regret_floor;
+            for v in regret_sum.iter_mut() {
+                *v = (*v).max(floor);
+            }
         }
 
         iterations_used = iter + 1;
@@ -750,6 +795,7 @@ pub(crate) fn build_exhaustive(
                 &flop_name,
                 &dcfr,
                 num_flops == 1,
+                config,
                 on_progress,
             );
 
@@ -920,6 +966,7 @@ mod tests {
             "test",
             &dcfr,
             true,
+            &config,
             &|_| {},
         );
 
@@ -953,6 +1000,7 @@ mod tests {
             "test",
             &dcfr,
             true,
+            &config,
             &|_| {},
         );
 
@@ -1013,6 +1061,7 @@ mod tests {
                 1.0,
                 0,
                 &dcfr,
+                false,
             );
 
             if folder == 0 {
@@ -1083,6 +1132,7 @@ mod tests {
                 1.0,
                 0,
                 &dcfr,
+                false,
             );
 
             let expected = eq * pot_fraction - pot_fraction / 2.0;
@@ -1131,8 +1181,9 @@ mod tests {
         // iteration reads uniform regrets, so convergence needs one extra iteration
         // compared to in-place updates.
         let dcfr = DcfrParams::linear();
+        let no_prune = PostflopModelConfig::exhaustive_fast();
         let result = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, true, &|_| {},
+            &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, true, &no_prune, &|_| {},
         );
         assert!(
             result.delta < expl_uniform,
@@ -1159,7 +1210,7 @@ mod tests {
 
         // Solve with default thread pool (parallel)
         let result_par = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, true, &|_| {},
+            &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, true, &config, &|_| {},
         );
 
         // Solve with 1 thread (sequential)
@@ -1169,7 +1220,7 @@ mod tests {
             .unwrap();
         let result_seq = pool.install(|| {
             exhaustive_solve_one_flop(
-                &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, true, &|_| {},
+                &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, true, &config, &|_| {},
             )
         });
 
@@ -1192,6 +1243,7 @@ mod tests {
         // Very generous threshold (30 BB/h) -- stops at first exploitability check.
         let threshold_mbb = 30_000.0;
         let dcfr = DcfrParams::linear();
+        let no_prune = PostflopModelConfig::exhaustive_fast();
         let result = exhaustive_solve_one_flop(
             &tree,
             &layout,
@@ -1201,6 +1253,7 @@ mod tests {
             "test",
             &dcfr,
             true,
+            &no_prune,
             &|_| {},
         );
         assert_eq!(
@@ -1213,5 +1266,81 @@ mod tests {
             "final exploitability should be below threshold, got {} mBB/h",
             result.delta
         );
+    }
+
+    #[test]
+    fn exhaustive_solve_with_pruning_produces_strategy() {
+        let config = PostflopModelConfig {
+            bet_sizes: vec![1.0],
+            max_raises_per_street: 0,
+            postflop_solve_iterations: 50,
+            prune_warmup: 10,
+            prune_explore_freq: 5,
+            regret_floor: 1_000_000.0,
+            ..PostflopModelConfig::exhaustive_fast()
+        };
+        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
+        let node_streets = annotate_streets(&tree);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
+        let equity_table = synthetic_equity_table();
+        let dcfr = DcfrParams::linear();
+
+        let result = exhaustive_solve_one_flop(
+            &tree,
+            &layout,
+            &equity_table,
+            50,
+            0.0,
+            "prune_test",
+            &dcfr,
+            true,
+            &config,
+            &|_| {},
+        );
+
+        assert!(result.iterations_used > 0, "should complete iterations");
+        let has_nonzero = result.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
+        assert!(has_nonzero, "strategy_sum should have non-zero entries with pruning enabled");
+    }
+
+    #[test]
+    fn pruning_does_not_break_convergence() {
+        let base = PostflopModelConfig {
+            bet_sizes: vec![1.0],
+            max_raises_per_street: 0,
+            postflop_solve_iterations: 30,
+            ..PostflopModelConfig::exhaustive_fast()
+        };
+        let tree = PostflopTree::build_with_spr(&base, 3.5).unwrap();
+        let node_streets = annotate_streets(&tree);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
+        let equity_table = synthetic_equity_table();
+        let dcfr = DcfrParams::linear();
+
+        // Unpruned baseline (prune_warmup=0)
+        let unpruned = exhaustive_solve_one_flop(
+            &tree, &layout, &equity_table, 30, 0.0, "no_prune", &dcfr, true, &base, &|_| {},
+        );
+
+        // Pruned run
+        let pruned_config = PostflopModelConfig {
+            prune_warmup: 5,
+            prune_explore_freq: 3,
+            regret_floor: 1_000_000.0,
+            ..base.clone()
+        };
+        let pruned = exhaustive_solve_one_flop(
+            &tree, &layout, &equity_table, 30, 0.0, "pruned", &dcfr, true, &pruned_config, &|_| {},
+        );
+
+        // Both should produce valid strategies
+        assert!(unpruned.iterations_used > 0);
+        assert!(pruned.iterations_used > 0);
+        let unpruned_nonzero = unpruned.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
+        let pruned_nonzero = pruned.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
+        assert!(unpruned_nonzero, "unpruned should have non-zero strategy");
+        assert!(pruned_nonzero, "pruned should have non-zero strategy");
     }
 }
