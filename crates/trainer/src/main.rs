@@ -7,16 +7,16 @@ mod tui_metrics;
 use std::error::Error;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use poker_solver_core::flops::{self, CanonicalFlop, RankTexture, SuitTexture};
 use poker_solver_core::preflop::{
     EquityTable, PostflopBundle, PostflopModelConfig, PreflopAction, PreflopBundle, PreflopConfig,
-    PreflopNode, PreflopSolver, PreflopTree,
+    PreflopNode, PreflopSolver, PreflopTree, SolverCounters,
 };
 use poker_solver_core::preflop::postflop_abstraction::{BuildPhase, FlopStage, PostflopAbstraction};
 use rustc_hash::FxHashMap;
@@ -62,6 +62,9 @@ enum Commands {
         /// Output directory for the postflop bundle
         #[arg(short, long)]
         output: PathBuf,
+        /// TUI dashboard refresh interval in seconds (default: 1.0)
+        #[arg(long, default_value = "1.0")]
+        tui_refresh: f64,
     },
     /// List all 1,755 canonical (suit-isomorphic) flops
     Flops {
@@ -120,8 +123,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 claude_debug,
             )?;
         }
-        Commands::SolvePostflop { config, output } => {
-            run_solve_postflop(&config, &output)?;
+        Commands::SolvePostflop { config, output, tui_refresh } => {
+            run_solve_postflop(&config, &output, tui_refresh)?;
         }
         Commands::Flops { format, output } => {
             run_flops(format, output)?;
@@ -310,179 +313,114 @@ fn print_postflop_ev_diagnostics(
 // ---------------------------------------------------------------------------
 
 /// Build one or more `PostflopAbstraction`s (one per configured SPR) with
-/// multi-bar progress display showing per-flop CFR delta / EV extraction
-/// progress alongside a main phase bar.
+/// a full-screen TUI dashboard showing per-flop convergence, pruning stats,
+/// and traversal throughput.
 fn build_postflop_with_progress(
     pf_config: &PostflopModelConfig,
     equity: Option<&EquityTable>,
+    tui_refresh: f64,
 ) -> Result<Vec<PostflopAbstraction>, Box<dyn Error>> {
-    let bar_style = ProgressStyle::default_bar()
-        .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-        .expect("valid template")
-        .progress_chars("#>-");
-    let spinner_style = ProgressStyle::default_spinner()
-        .template("{spinner:.green} {msg}")
-        .expect("valid template");
+    let sprs = &pf_config.postflop_sprs;
+    let total_sprs = sprs.len() as u32;
 
-    let multi = MultiProgress::new();
-    let phase_bar = multi.add(ProgressBar::new_spinner());
-    phase_bar.set_style(spinner_style.clone());
-    phase_bar.set_message("Postflop abstraction");
-    phase_bar.enable_steady_tick(std::time::Duration::from_millis(500));
+    // Use max_flop_boards as an estimate; 0 means all ~1,755 canonical flops.
+    let estimated_flops = if pf_config.max_flop_boards == 0 { 1755 } else { pf_config.max_flop_boards } as u32;
+    let metrics = Arc::new(tui_metrics::TuiMetrics::new(total_sprs, estimated_flops));
+    let counters = SolverCounters {
+        traversal_count: Default::default(),
+        pruned_traversal_count: Default::default(),
+        total_action_slots: Default::default(),
+        pruned_action_slots: Default::default(),
+    };
 
-    const MAX_FLOP_BARS: usize = 10;
+    // Wire TuiMetrics atomics to mirror SolverCounters so the TUI reads
+    // from its own fields while the solver increments the canonical counters.
+    // We share the same underlying atomics by copying values in the on_progress
+    // callback, but more efficiently, we can just let the TUI read from the
+    // SolverCounters directly. Instead, we point TuiMetrics atomics at the
+    // SolverCounters values in each tick by having the TUI read from metrics.
+    // The simplest correct approach: copy counter values into metrics atomics
+    // inside the on_progress callback (called frequently enough).
 
-    struct FlopSlotData {
-        sort_key: f64,
-        position: u64,
-        length: u64,
-        message: String,
-    }
+    let done = Arc::new(AtomicBool::new(false));
+    let refresh_interval = Duration::from_secs_f64(tui_refresh);
 
-    struct FlopBarState {
-        states: HashMap<String, FlopSlotData>,
-        slots: Vec<ProgressBar>,
-        last_refresh: Instant,
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    fn refresh_flop_slots(
-        states: &HashMap<String, FlopSlotData>,
-        slots: &mut Vec<ProgressBar>,
-        multi: &MultiProgress,
-        style: &ProgressStyle,
-    ) {
-        let mut sorted: Vec<_> = states.iter().collect();
-        sorted.sort_by(|a, b| {
-            b.1.sort_key
-                .partial_cmp(&a.1.sort_key)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let visible = sorted.len().min(MAX_FLOP_BARS);
-        while slots.len() < visible {
-            let b = multi.add(ProgressBar::new(0));
-            b.set_style(style.clone());
-            b.enable_steady_tick(std::time::Duration::from_millis(500));
-            slots.push(b);
-        }
-        while slots.len() > visible {
-            if let Some(bar) = slots.pop() {
-                bar.finish_and_clear();
-                multi.remove(&bar);
-            }
-        }
-        for (i, (_, data)) in sorted.iter().take(visible).enumerate() {
-            slots[i].set_length(data.length);
-            slots[i].set_position(data.position);
-            slots[i].set_message(data.message.clone());
-        }
-    }
-
-    let flop_state: Arc<Mutex<FlopBarState>> =
-        Arc::new(Mutex::new(FlopBarState {
-            states: HashMap::new(),
-            slots: Vec::new(),
-            last_refresh: Instant::now(),
-        }));
+    let tui_handle = tui::run_tui(
+        Arc::clone(&metrics),
+        refresh_interval,
+        Arc::clone(&done),
+    );
 
     let pf_start = Instant::now();
-    let sprs = &pf_config.postflop_sprs;
-    let total_sprs = sprs.len();
-    let mut abstractions = Vec::with_capacity(total_sprs);
+    let mut abstractions = Vec::with_capacity(sprs.len());
 
     for (i, &spr) in sprs.iter().enumerate() {
-        phase_bar.set_style(spinner_style.clone());
-        phase_bar.set_length(0);
-        phase_bar.set_position(0);
-        phase_bar.set_message(format!(
-            "Postflop SPR={spr} ({}/{})",
-            i + 1,
-            total_sprs,
-        ));
+        metrics.start_spr(i as u32, estimated_flops);
+
+        let m = &metrics;
+        let c = &counters;
 
         let abstraction = PostflopAbstraction::build_for_spr(
             pf_config,
             spr,
             equity,
-            None,
+            Some(&counters),
             |phase| {
+                // Sync SolverCounters into TuiMetrics atomics so the TUI
+                // thread picks up traversal/pruning data on its next tick.
+                m.traversal_count.store(
+                    c.traversal_count.load(AtomicOrdering::Relaxed),
+                    AtomicOrdering::Relaxed,
+                );
+                m.pruned_traversal_count.store(
+                    c.pruned_traversal_count.load(AtomicOrdering::Relaxed),
+                    AtomicOrdering::Relaxed,
+                );
+                m.total_action_slots.store(
+                    c.total_action_slots.load(AtomicOrdering::Relaxed),
+                    AtomicOrdering::Relaxed,
+                );
+                m.pruned_action_slots.store(
+                    c.pruned_action_slots.load(AtomicOrdering::Relaxed),
+                    AtomicOrdering::Relaxed,
+                );
+
                 match &phase {
                     BuildPhase::FlopProgress { flop_name, stage } => {
-                        let mut guard = flop_state.lock().unwrap();
-                        let fbs = &mut *guard;
                         match stage {
-                            FlopStage::Solving { iteration, max_iterations, delta, metric_label } => {
-                                #[allow(clippy::cast_precision_loss)]
-                                let key = 1.0 + *iteration as f64 / (*max_iterations).max(1) as f64;
-                                fbs.states.insert(flop_name.clone(), FlopSlotData {
-                                    sort_key: key,
-                                    position: *iteration as u64,
-                                    length: *max_iterations as u64,
-                                    message: format!("Flop '{flop_name}' CFR {metric_label}={delta:.4}"),
-                                });
+                            FlopStage::Solving { iteration, max_iterations, delta, .. } => {
+                                m.update_flop(flop_name, *iteration, *max_iterations, *delta);
                             }
-                            FlopStage::EstimatingEv { sample, total_samples } => {
-                                #[allow(clippy::cast_precision_loss)]
-                                let key = 2.0 + *sample as f64 / (*total_samples).max(1) as f64;
-                                fbs.states.insert(flop_name.clone(), FlopSlotData {
-                                    sort_key: key,
-                                    position: *sample as u64,
-                                    length: *total_samples as u64,
-                                    message: format!("Flop '{flop_name}' EV Extraction"),
-                                });
+                            FlopStage::EstimatingEv { .. } => {
+                                // EV estimation is fast; no per-sample TUI update needed.
                             }
                             FlopStage::Done => {
-                                fbs.states.remove(flop_name);
-                                refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
-                                fbs.last_refresh = Instant::now();
+                                m.remove_flop(flop_name);
                             }
-                        }
-                        if fbs.last_refresh.elapsed() >= std::time::Duration::from_secs(10) {
-                            fbs.last_refresh = Instant::now();
-                            refresh_flop_slots(&fbs.states, &mut fbs.slots, &multi, &bar_style);
                         }
                     }
                     BuildPhase::MccfrFlopsCompleted { completed, total } => {
-                        phase_bar.set_style(bar_style.clone());
-                        phase_bar.set_length(*total as u64);
-                        phase_bar.set_position(*completed as u64);
-                        phase_bar.set_message(format!("SPR={spr} MCCFR Solving"));
+                        m.flops_completed.store(*completed as u32, AtomicOrdering::Relaxed);
+                        m.total_flops.store(*total as u32, AtomicOrdering::Relaxed);
                     }
-                    _ => {
-                        phase_bar.set_style(spinner_style.clone());
-                        phase_bar.set_message(format!("SPR={spr} {phase}..."));
-                    }
+                    _ => {}
                 }
             },
         )
         .map_err(|e| format!("postflop SPR={spr}: {e}"))?;
 
-        // Clean up flop bars between SPR solves.
-        {
-            let mut guard = flop_state.lock().unwrap();
-            let fbs = &mut *guard;
-            fbs.states.clear();
-            for bar in fbs.slots.drain(..) {
-                bar.finish_and_clear();
-                multi.remove(&bar);
-            }
-            fbs.last_refresh = Instant::now();
-        }
-
-        eprintln!(
-            "  SPR={spr} done ({}/{total_sprs}, values: {} entries)",
-            i + 1,
-            abstraction.values.len(),
-        );
         abstractions.push(abstraction);
     }
 
-    phase_bar.set_style(bar_style);
-    phase_bar.finish_with_message(format!(
-        "done in {:.1?} ({total_sprs} SPR model{})",
+    // Signal the TUI to exit and wait for it to restore the terminal.
+    done.store(true, AtomicOrdering::Relaxed);
+    let _ = tui_handle.join();
+
+    eprintln!(
+        "Postflop solve complete in {:.1?} ({total_sprs} SPR model{})",
         pf_start.elapsed(),
         if total_sprs == 1 { "" } else { "s" },
-    ));
+    );
 
     Ok(abstractions)
 }
@@ -491,14 +429,14 @@ fn build_postflop_with_progress(
 // Postflop bundle builder
 // ---------------------------------------------------------------------------
 
-fn run_solve_postflop(config_path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+fn run_solve_postflop(config_path: &Path, output: &Path, tui_refresh: f64) -> Result<(), Box<dyn Error>> {
     let yaml = std::fs::read_to_string(config_path)?;
     let config: PostflopSolveConfig = serde_yaml::from_str(&yaml)?;
     let pf_config = config.postflop_model;
 
     eprintln!("Building postflop abstraction ({} SPR models)...", pf_config.postflop_sprs.len());
 
-    let abstractions = build_postflop_with_progress(&pf_config, None)?;
+    let abstractions = build_postflop_with_progress(&pf_config, None, tui_refresh)?;
 
     let refs: Vec<&PostflopAbstraction> = abstractions.iter().collect();
     PostflopBundle::save_multi(&pf_config, &refs, output)?;
