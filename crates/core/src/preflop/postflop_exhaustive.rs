@@ -1255,4 +1255,80 @@ mod tests {
             result.delta
         );
     }
+
+    #[test]
+    fn exhaustive_solve_with_pruning_produces_strategy() {
+        let config = PostflopModelConfig {
+            bet_sizes: vec![1.0],
+            max_raises_per_street: 0,
+            postflop_solve_iterations: 50,
+            prune_warmup: 10,
+            prune_explore_freq: 5,
+            regret_floor: 1_000_000.0,
+            ..PostflopModelConfig::exhaustive_fast()
+        };
+        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
+        let node_streets = annotate_streets(&tree);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
+        let equity_table = synthetic_equity_table();
+        let dcfr = DcfrParams::linear();
+
+        let result = exhaustive_solve_one_flop(
+            &tree,
+            &layout,
+            &equity_table,
+            50,
+            0.0,
+            "prune_test",
+            &dcfr,
+            true,
+            &config,
+            &|_| {},
+        );
+
+        assert!(result.iterations_used > 0, "should complete iterations");
+        let has_nonzero = result.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
+        assert!(has_nonzero, "strategy_sum should have non-zero entries with pruning enabled");
+    }
+
+    #[test]
+    fn pruning_does_not_break_convergence() {
+        let base = PostflopModelConfig {
+            bet_sizes: vec![1.0],
+            max_raises_per_street: 0,
+            postflop_solve_iterations: 30,
+            ..PostflopModelConfig::exhaustive_fast()
+        };
+        let tree = PostflopTree::build_with_spr(&base, 3.5).unwrap();
+        let node_streets = annotate_streets(&tree);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
+        let equity_table = synthetic_equity_table();
+        let dcfr = DcfrParams::linear();
+
+        // Unpruned baseline (prune_warmup=0)
+        let unpruned = exhaustive_solve_one_flop(
+            &tree, &layout, &equity_table, 30, 0.0, "no_prune", &dcfr, true, &base, &|_| {},
+        );
+
+        // Pruned run
+        let pruned_config = PostflopModelConfig {
+            prune_warmup: 5,
+            prune_explore_freq: 3,
+            regret_floor: 1_000_000.0,
+            ..base.clone()
+        };
+        let pruned = exhaustive_solve_one_flop(
+            &tree, &layout, &equity_table, 30, 0.0, "pruned", &dcfr, true, &pruned_config, &|_| {},
+        );
+
+        // Both should produce valid strategies
+        assert!(unpruned.iterations_used > 0);
+        assert!(pruned.iterations_used > 0);
+        let unpruned_nonzero = unpruned.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
+        let pruned_nonzero = pruned.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
+        assert!(unpruned_nonzero, "unpruned should have non-zero strategy");
+        assert!(pruned_nonzero, "pruned should have non-zero strategy");
+    }
 }
