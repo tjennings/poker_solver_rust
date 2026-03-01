@@ -443,7 +443,7 @@ fn build_postflop_with_progress(
                         phase_bar.set_style(bar_style.clone());
                         phase_bar.set_length(*total as u64);
                         phase_bar.set_position(*completed as u64);
-                        phase_bar.set_message(format!("SPR={spr} MCCFR Solving"));
+                        phase_bar.set_message(format!("SPR={spr} Solving"));
                     }
                     _ => {
                         phase_bar.set_style(spinner_style.clone());

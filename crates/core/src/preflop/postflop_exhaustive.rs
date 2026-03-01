@@ -508,10 +508,10 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
 
 /// Solve a single flop using exhaustive CFR with configurable iteration weighting.
 ///
-/// When `use_inner_parallelism` is false, inner `parallel_traverse_into` and
-/// `compute_exploitability` run on a single-thread pool. This avoids
-/// 3-level rayon nesting when the outer `build_exhaustive` already
-/// parallelises over multiple flops.
+/// Inner `parallel_traverse_into` and `compute_exploitability` use rayon's
+/// global thread pool. When called from `build_exhaustive` (which parallelises
+/// over flops), rayon's work-stealing distributes hand-pair work across all
+/// available cores, dynamically rebalancing as flops converge at different rates.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn exhaustive_solve_one_flop(
     tree: &PostflopTree,
@@ -521,7 +521,6 @@ fn exhaustive_solve_one_flop(
     convergence_threshold: f64,
     flop_name: &str,
     dcfr: &DcfrParams,
-    use_inner_parallelism: bool,
     config: &PostflopModelConfig,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> FlopSolveResult {
@@ -545,20 +544,6 @@ fn exhaustive_solve_one_flop(
     let mut dr = vec![0.0f64; buf_size];
     let mut ds = vec![0.0f64; buf_size];
 
-    // When inner parallelism is disabled, run traverse and exploitability
-    // on a 1-thread pool to avoid rayon nesting contention.
-    let serial_pool = if !use_inner_parallelism {
-        Some(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                // INVARIANT: ThreadPoolBuilder with valid num_threads always succeeds.
-                .expect("failed to build single-thread rayon pool"),
-        )
-    } else {
-        None
-    };
-
     let flop_name_owned = flop_name.to_string();
 
     for iter in 0..num_iterations {
@@ -578,11 +563,7 @@ fn exhaustive_solve_one_flop(
             prune_active,
         };
 
-        if let Some(pool) = &serial_pool {
-            pool.install(|| parallel_traverse_into(&ctx, &pairs, &mut dr, &mut ds));
-        } else {
-            parallel_traverse_into(&ctx, &pairs, &mut dr, &mut ds);
-        }
+        parallel_traverse_into(&ctx, &pairs, &mut dr, &mut ds);
 
         // Apply DCFR discounting before merging deltas.
         if dcfr.should_discount(iter as u64) {
@@ -607,11 +588,8 @@ fn exhaustive_solve_one_flop(
 
         iterations_used = iter + 1;
         if iter >= 1 && (iter % 2 == 1 || iter == num_iterations - 1) {
-            current_exploitability = if let Some(pool) = &serial_pool {
-                pool.install(|| compute_exploitability(tree, layout, &strategy_sum, equity_table))
-            } else {
-                compute_exploitability(tree, layout, &strategy_sum, equity_table)
-            };
+            current_exploitability =
+                compute_exploitability(tree, layout, &strategy_sum, equity_table);
         }
 
         on_progress(BuildPhase::FlopProgress {
@@ -794,7 +772,6 @@ pub(crate) fn build_exhaustive(
                 config.cfr_convergence_threshold,
                 &flop_name,
                 &dcfr,
-                num_flops == 1,
                 config,
                 on_progress,
             );
@@ -965,7 +942,6 @@ mod tests {
             0.001,
             "test",
             &dcfr,
-            true,
             &config,
             &|_| {},
         );
@@ -999,7 +975,6 @@ mod tests {
             0.001,
             "test",
             &dcfr,
-            true,
             &config,
             &|_| {},
         );
@@ -1183,7 +1158,7 @@ mod tests {
         let dcfr = DcfrParams::linear();
         let no_prune = PostflopModelConfig::exhaustive_fast();
         let result = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, true, &no_prune, &|_| {},
+            &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, &no_prune, &|_| {},
         );
         assert!(
             result.delta < expl_uniform,
@@ -1210,7 +1185,7 @@ mod tests {
 
         // Solve with default thread pool (parallel)
         let result_par = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, true, &config, &|_| {},
+            &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, &config, &|_| {},
         );
 
         // Solve with 1 thread (sequential)
@@ -1220,7 +1195,7 @@ mod tests {
             .unwrap();
         let result_seq = pool.install(|| {
             exhaustive_solve_one_flop(
-                &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, true, &config, &|_| {},
+                &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, &config, &|_| {},
             )
         });
 
@@ -1252,7 +1227,6 @@ mod tests {
             threshold_mbb,
             "test",
             &dcfr,
-            true,
             &no_prune,
             &|_| {},
         );
@@ -1294,7 +1268,6 @@ mod tests {
             0.0,
             "prune_test",
             &dcfr,
-            true,
             &config,
             &|_| {},
         );
@@ -1321,7 +1294,7 @@ mod tests {
 
         // Unpruned baseline (prune_warmup=0)
         let unpruned = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 30, 0.0, "no_prune", &dcfr, true, &base, &|_| {},
+            &tree, &layout, &equity_table, 30, 0.0, "no_prune", &dcfr, &base, &|_| {},
         );
 
         // Pruned run
@@ -1332,7 +1305,7 @@ mod tests {
             ..base.clone()
         };
         let pruned = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 30, 0.0, "pruned", &dcfr, true, &pruned_config, &|_| {},
+            &tree, &layout, &equity_table, 30, 0.0, "pruned", &dcfr, &pruned_config, &|_| {},
         );
 
         // Both should produce valid strategies
