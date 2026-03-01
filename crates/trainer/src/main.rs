@@ -331,8 +331,13 @@ fn build_postflop_with_progress(
     let total_sprs = sprs.len() as u32;
     let use_tui = std::io::stderr().is_terminal();
 
-    // Use max_flop_boards as an estimate; 0 means all ~1,755 canonical flops.
-    let estimated_flops = if pf_config.max_flop_boards == 0 { 1755 } else { pf_config.max_flop_boards } as u32;
+    // Resolve the actual flop list so the TUI shows the correct count.
+    let flops = if let Some(ref names) = pf_config.fixed_flops {
+        parse_flops(names).map_err(|e| format!("invalid flops: {e}"))?
+    } else {
+        sample_canonical_flops(pf_config.max_flop_boards)
+    };
+    let estimated_flops = flops.len() as u32;
     let counters = Arc::new(SolverCounters::default());
 
     // TUI-mode resources: only allocated when stderr is a TTY.
@@ -365,11 +370,6 @@ fn build_postflop_with_progress(
     // this avoids redundant O(169^2 * runouts) work per extra SPR.
     let equity_tables: Vec<Vec<f64>> =
         if pf_config.solve_type == PostflopSolveType::Exhaustive && sprs.len() > 1 {
-            let flops = if let Some(ref names) = pf_config.fixed_flops {
-                parse_flops(names).map_err(|e| format!("invalid flops: {e}"))?
-            } else {
-                sample_canonical_flops(pf_config.max_flop_boards)
-            };
             eprintln!(
                 "Pre-computing equity tables for {} flops...",
                 flops.len()
