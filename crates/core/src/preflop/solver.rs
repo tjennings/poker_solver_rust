@@ -698,13 +698,12 @@ fn normalize(sums: &[f64]) -> Vec<f64> {
 
 /// Select the index of the closest SPR model to `actual_spr`.
 ///
-/// `sprs` must be non-empty. Returns the index into `sprs` with the
-/// smallest absolute distance to `actual_spr`.
-fn select_closest_spr(sprs: &[f64], actual_spr: f64) -> usize {
-    sprs.iter()
-        .enumerate()
+/// Returns the index of the element in `sprs` closest to `actual_spr`.
+/// The iterator must be non-empty.
+fn select_closest_spr(sprs: impl Iterator<Item = f64>, actual_spr: f64) -> usize {
+    sprs.enumerate()
         .min_by(|(_, a), (_, b)| {
-            (*a - actual_spr).abs().total_cmp(&(*b - actual_spr).abs())
+            (a - actual_spr).abs().total_cmp(&(b - actual_spr).abs())
         })
         .map_or(0, |(i, _)| i)
 }
@@ -753,8 +752,10 @@ pub(crate) fn postflop_showdown_value(
     let actual_spr = if pot > 0 { effective_remaining / pot_f } else { 0.0 };
 
     // Select the closest SPR model.
-    let sprs: Vec<f64> = pf_state.abstractions.iter().map(|a| a.spr).collect();
-    let idx = select_closest_spr(&sprs, actual_spr);
+    let idx = select_closest_spr(
+        pf_state.abstractions.iter().map(|a| a.spr),
+        actual_spr,
+    );
     let selected = &pf_state.abstractions[idx];
 
     let pf_ev_frac = selected.avg_ev(hero_pos, hero_hand as usize, opp_hand as usize);
@@ -1371,19 +1372,19 @@ mod tests {
     #[timed_test]
     fn select_closest_spr_picks_nearest() {
         let sprs = [2.0, 6.0, 20.0];
-        assert_eq!(super::select_closest_spr(&sprs, 1.0), 0);
-        assert_eq!(super::select_closest_spr(&sprs, 3.0), 0);
-        assert_eq!(super::select_closest_spr(&sprs, 4.5), 1);
-        assert_eq!(super::select_closest_spr(&sprs, 5.0), 1);
-        assert_eq!(super::select_closest_spr(&sprs, 12.0), 1);
-        assert_eq!(super::select_closest_spr(&sprs, 13.5), 2);
-        assert_eq!(super::select_closest_spr(&sprs, 50.0), 2);
+        assert_eq!(super::select_closest_spr(sprs.iter().copied(), 1.0), 0);
+        assert_eq!(super::select_closest_spr(sprs.iter().copied(), 3.0), 0);
+        assert_eq!(super::select_closest_spr(sprs.iter().copied(), 4.5), 1);
+        assert_eq!(super::select_closest_spr(sprs.iter().copied(), 5.0), 1);
+        assert_eq!(super::select_closest_spr(sprs.iter().copied(), 12.0), 1);
+        assert_eq!(super::select_closest_spr(sprs.iter().copied(), 13.5), 2);
+        assert_eq!(super::select_closest_spr(sprs.iter().copied(), 50.0), 2);
     }
 
     #[timed_test]
     fn select_closest_spr_single_element() {
-        assert_eq!(super::select_closest_spr(&[3.5], 0.0), 0);
-        assert_eq!(super::select_closest_spr(&[3.5], 100.0), 0);
+        assert_eq!(super::select_closest_spr([3.5].iter().copied(), 0.0), 0);
+        assert_eq!(super::select_closest_spr([3.5].iter().copied(), 100.0), 0);
     }
 
     #[timed_test]
