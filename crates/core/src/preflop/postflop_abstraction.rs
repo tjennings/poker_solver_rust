@@ -250,6 +250,10 @@ pub enum FlopStage {
         delta: f64,
         /// Label for the convergence metric (e.g. "δ" for strategy delta, "expl" for exploitability).
         metric_label: String,
+        /// Cumulative action slots evaluated for this flop so far.
+        total_action_slots: u64,
+        /// Cumulative action slots pruned for this flop so far.
+        pruned_action_slots: u64,
     },
     /// Extracting EV estimates from converged strategy.
     EstimatingEv { sample: usize, total_samples: usize },
@@ -281,7 +285,7 @@ impl std::fmt::Display for BuildPhase {
             Self::BuildingTree => write!(f, "Building game tree"),
             Self::ComputingEquityTables => write!(f, "Computing equity tables"),
             Self::FlopProgress { flop_name, stage } => match stage {
-                FlopStage::Solving { iteration, max_iterations, delta, metric_label } =>
+                FlopStage::Solving { iteration, max_iterations, delta, metric_label, .. } =>
                     write!(f, "Flop '{flop_name}' CFR {metric_label}={delta:.4} ({iteration}/{max_iterations})"),
                 FlopStage::EstimatingEv { sample, total_samples } =>
                     write!(f, "Flop '{flop_name}' EV Extraction ({sample}/{total_samples})"),
@@ -793,6 +797,8 @@ mod tests {
                 max_iterations: 200,
                 delta: 0.0032,
                 metric_label: "\u{03b4}".to_string(),
+                total_action_slots: 0,
+                pruned_action_slots: 0,
             },
         };
         let s = format!("{phase}");

@@ -425,8 +425,13 @@ fn build_postflop_with_progress(
                                 m.set_phase(2);
                             }
                             match stage {
-                                FlopStage::Solving { iteration, max_iterations, delta, .. } => {
-                                    m.update_flop(flop_name, *iteration, *max_iterations, *delta);
+                                FlopStage::Solving { iteration, max_iterations, delta, total_action_slots, pruned_action_slots, .. } => {
+                                    let pct_act = if *total_action_slots > 0 {
+                                        *pruned_action_slots as f64 * 100.0 / *total_action_slots as f64
+                                    } else {
+                                        0.0
+                                    };
+                                    m.update_flop(flop_name, *iteration, *max_iterations, *delta, pct_act);
                                 }
                                 FlopStage::EstimatingEv { .. } => {}
                                 FlopStage::Done => {
@@ -452,7 +457,7 @@ fn build_postflop_with_progress(
                             eprintln!("  Computing equity tables...");
                         }
                         BuildPhase::FlopProgress { flop_name, stage } => {
-                            if let FlopStage::Solving { iteration, max_iterations, delta, metric_label } = stage {
+                            if let FlopStage::Solving { iteration, max_iterations, delta, metric_label, .. } = stage {
                                 // Log every ~10 iterations to avoid flooding.
                                 if *iteration % 10 == 0 || *iteration == *max_iterations {
                                     eprintln!(

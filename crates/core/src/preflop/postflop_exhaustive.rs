@@ -618,10 +618,20 @@ fn exhaustive_solve_one_flop(
     let mut dr = vec![0.0f64; buf_size];
     let mut ds = vec![0.0f64; buf_size];
 
+    // Per-flop pruning accumulators: track action-slot pruning for this flop
+    // by snapshotting the global counters before/after each iteration.
+    let mut flop_total_action_slots: u64 = 0;
+    let mut flop_pruned_action_slots: u64 = 0;
+
     let flop_name_owned = flop_name.to_string();
 
     for iter in 0..num_iterations {
         snapshot.clone_from(&regret_sum);
+
+        // Snapshot global counters before traversal so we can attribute
+        // the delta to this flop.
+        let prev_ta = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
+        let prev_pa = counters.map_or(0, |c| c.pruned_action_slots.load(Ordering::Relaxed));
 
         let prune_active = config.prune_warmup > 0
             && iter >= config.prune_warmup
@@ -639,6 +649,12 @@ fn exhaustive_solve_one_flop(
         };
 
         parallel_traverse_into(&ctx, &pairs, &mut dr, &mut ds);
+
+        // Accumulate per-flop pruning stats from global counter deltas.
+        let cur_ta = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
+        let cur_pa = counters.map_or(0, |c| c.pruned_action_slots.load(Ordering::Relaxed));
+        flop_total_action_slots += cur_ta.saturating_sub(prev_ta);
+        flop_pruned_action_slots += cur_pa.saturating_sub(prev_pa);
 
         // Apply DCFR discounting before merging deltas.
         if dcfr.should_discount(iter as u64) {
@@ -674,6 +690,8 @@ fn exhaustive_solve_one_flop(
                 max_iterations: num_iterations,
                 delta: current_exploitability,
                 metric_label: "mBB/h".into(),
+                total_action_slots: flop_total_action_slots,
+                pruned_action_slots: flop_pruned_action_slots,
             },
         });
 

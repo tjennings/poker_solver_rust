@@ -31,14 +31,9 @@ pub struct TuiApp {
 
     // Sparkline histories
     traversals_per_sec: Vec<u64>,
-    pct_traversals_pruned: Vec<u64>,
-    pct_actions_pruned: Vec<u64>,
 
     // Previous tick counters for computing deltas
     prev_traversal_count: u64,
-    prev_pruned_traversal_count: u64,
-    prev_total_action_slots: u64,
-    prev_pruned_action_slots: u64,
 
     // Refresh interval for rate calculation
     refresh_secs: f64,
@@ -51,12 +46,7 @@ impl TuiApp {
             counters,
             start_time: Instant::now(),
             traversals_per_sec: Vec::with_capacity(SPARKLINE_HISTORY),
-            pct_traversals_pruned: Vec::with_capacity(SPARKLINE_HISTORY),
-            pct_actions_pruned: Vec::with_capacity(SPARKLINE_HISTORY),
             prev_traversal_count: 0,
-            prev_pruned_traversal_count: 0,
-            prev_total_action_slots: 0,
-            prev_pruned_action_slots: 0,
             refresh_secs,
         }
     }
@@ -64,14 +54,7 @@ impl TuiApp {
     /// Sample metrics and update sparkline histories.
     pub fn tick(&mut self) {
         let t = self.counters.traversal_count.load(Ordering::Relaxed);
-        let pt = self.counters.pruned_traversal_count.load(Ordering::Relaxed);
-        let ta = self.counters.total_action_slots.load(Ordering::Relaxed);
-        let pa = self.counters.pruned_action_slots.load(Ordering::Relaxed);
-
         let dt = t.saturating_sub(self.prev_traversal_count);
-        let dpt = pt.saturating_sub(self.prev_pruned_traversal_count);
-        let dta = ta.saturating_sub(self.prev_total_action_slots);
-        let dpa = pa.saturating_sub(self.prev_pruned_action_slots);
 
         // Traversals per second (scale by refresh interval)
         let tps = if self.refresh_secs > 0.0 {
@@ -81,16 +64,7 @@ impl TuiApp {
         };
         push_bounded(&mut self.traversals_per_sec, tps, SPARKLINE_HISTORY);
 
-        // Pruning percentages (0-100)
-        let pct_trav = (dpt * 100).checked_div(dt).unwrap_or(0);
-        push_bounded(&mut self.pct_traversals_pruned, pct_trav, SPARKLINE_HISTORY);
-        let pct_act = (dpa * 100).checked_div(dta).unwrap_or(0);
-        push_bounded(&mut self.pct_actions_pruned, pct_act, SPARKLINE_HISTORY);
-
         self.prev_traversal_count = t;
-        self.prev_pruned_traversal_count = pt;
-        self.prev_total_action_slots = ta;
-        self.prev_pruned_action_slots = pa;
     }
 
     /// Render the full dashboard to the given frame.
@@ -103,8 +77,6 @@ impl TuiApp {
                 Constraint::Length(1), // SPR phase gauge
                 Constraint::Length(1), // Traversal progress gauge
                 Constraint::Length(2), // traversals/sec sparkline
-                Constraint::Length(2), // % traversals pruned
-                Constraint::Length(2), // % actions pruned
                 Constraint::Length(1), // section header (includes flop progress)
                 Constraint::Min(3),   // active flops list
                 Constraint::Length(1), // footer
@@ -121,23 +93,9 @@ impl TuiApp {
             &self.traversals_per_sec,
             Color::Cyan,
         );
-        self.render_sparkline_row(
-            frame,
-            chunks[4],
-            "% Trav pruned",
-            &self.pct_traversals_pruned,
-            Color::Green,
-        );
-        self.render_sparkline_row(
-            frame,
-            chunks[5],
-            "% Actions pruned",
-            &self.pct_actions_pruned,
-            Color::Green,
-        );
-        self.render_active_flops_header(frame, chunks[6]);
-        self.render_active_flops(frame, chunks[7]);
-        self.render_footer(frame, chunks[8]);
+        self.render_active_flops_header(frame, chunks[4]);
+        self.render_active_flops(frame, chunks[5]);
+        self.render_footer(frame, chunks[6]);
     }
 
     fn render_spr_gauge(&self, frame: &mut Frame, area: Rect) {
@@ -227,7 +185,7 @@ impl TuiApp {
     }
 
     fn render_active_flops(&self, frame: &mut Frame, area: Rect) {
-        let mut items: Vec<(usize, String)> = Vec::new();
+        let mut items: Vec<(usize, Vec<Line>)> = Vec::new();
         for entry in self.metrics.flop_states.iter() {
             let name = entry.key();
             let state = entry.value();
@@ -243,23 +201,28 @@ impl TuiApp {
                 .rev()
                 .map(|&v| sparkline_char(v, hist_min, hist_max))
                 .collect();
-            let line = format!(
+            let main_line = Line::from(format!(
                 "{:<8} expl {} {:>8.1} mBB/h  iter {}/{}",
                 name, spark_text, latest_expl, state.iteration, state.max_iterations,
-            );
-            items.push((state.iteration, line));
+            ));
+            let prune_line = Line::from(Span::styled(
+                format!("  actions pruned: {:.1}%", state.pct_actions_pruned),
+                Style::default().fg(Color::DarkGray),
+            ));
+            items.push((state.iteration, vec![main_line, prune_line]));
         }
         // Sort by iteration progress descending (most-progressed first)
         items.sort_by_key(|item| std::cmp::Reverse(item.0));
         let mut list_items: Vec<ListItem> = items
             .into_iter()
-            .map(|(_, text)| ListItem::new(text))
+            .map(|(_, lines)| ListItem::new(lines))
             .collect();
-        // Truncate to visible rows, showing "+N more" if clipped
+        // Each item takes 2 rows; truncate to fit visible area
         let visible_rows = area.height as usize;
-        if list_items.len() > visible_rows && visible_rows > 0 {
-            let hidden = list_items.len() - (visible_rows - 1);
-            list_items.truncate(visible_rows - 1);
+        let max_items = visible_rows / 2;
+        if list_items.len() > max_items && max_items > 0 {
+            let hidden = list_items.len() - (max_items - 1);
+            list_items.truncate(max_items - 1);
             list_items.push(ListItem::new(format!("  ... +{hidden} more flops")));
         }
         let list = List::new(list_items).block(Block::default().borders(Borders::NONE));
