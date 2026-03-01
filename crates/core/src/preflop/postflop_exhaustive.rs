@@ -185,6 +185,7 @@ fn exhaustive_cfr_traverse(
     iteration: u64,
     dcfr: &DcfrParams,
     prune_active: bool,
+    prune_explore_pct: f64,
     counters: Option<&SolverCounters>,
 ) -> f64 {
     let n = NUM_CANONICAL_HANDS;
@@ -220,6 +221,7 @@ fn exhaustive_cfr_traverse(
                 iteration,
                 dcfr,
                 prune_active,
+                prune_explore_pct,
                 counters,
             )
         }
@@ -238,9 +240,9 @@ fn exhaustive_cfr_traverse(
             if is_hero {
                 let mut action_values = [0.0f64; MAX_POSTFLOP_ACTIONS];
 
-                // RBP: build prune bitmask in a single pass over regrets.
-                // Bit i is set if action i should be pruned (negative regret,
-                // and at least one sibling has positive regret).
+                // RBP: build prune bitmask. Each negative-regret action is
+                // pruned with probability (1 - prune_explore_pct), allowing
+                // stochastic exploration of dominated actions.
                 let mut prune_mask: u16 = 0;
                 if prune_active {
                     let mut has_positive = false;
@@ -249,7 +251,10 @@ fn exhaustive_cfr_traverse(
                         if snapshot[start + i] > 0.0 {
                             has_positive = true;
                         } else if snapshot[start + i] < 0.0 {
-                            neg_mask |= 1 << i;
+                            // Roll per-action: explore with probability prune_explore_pct
+                            if fastrand::f64() >= prune_explore_pct {
+                                neg_mask |= 1 << i;
+                            }
                         }
                     }
                     if has_positive {
@@ -284,6 +289,7 @@ fn exhaustive_cfr_traverse(
                         iteration,
                         dcfr,
                         prune_active,
+                        prune_explore_pct,
                         counters,
                     );
                 }
@@ -323,6 +329,7 @@ fn exhaustive_cfr_traverse(
                                 iteration,
                                 dcfr,
                                 prune_active,
+                                prune_explore_pct,
                                 counters,
                             )
                     })
@@ -530,6 +537,8 @@ struct PostflopCfrCtx<'a> {
     iteration: u64,
     dcfr: &'a DcfrParams,
     prune_active: bool,
+    /// Per-action probability of exploring a negative-regret action.
+    prune_explore_pct: f64,
     counters: Option<&'a SolverCounters>,
 }
 
@@ -567,6 +576,7 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
                 self.iteration,
                 self.dcfr,
                 self.prune_active,
+                self.prune_explore_pct,
                 self.counters,
             );
         }
@@ -633,9 +643,7 @@ fn exhaustive_solve_one_flop(
         let prev_ta = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
         let prev_pa = counters.map_or(0, |c| c.pruned_action_slots.load(Ordering::Relaxed));
 
-        let prune_active = config.prune_warmup > 0
-            && iter >= config.prune_warmup
-            && (config.prune_explore_freq == 0 || iter % config.prune_explore_freq != 0);
+        let prune_active = config.prune_warmup > 0 && iter >= config.prune_warmup;
 
         let ctx = PostflopCfrCtx {
             tree,
@@ -645,6 +653,7 @@ fn exhaustive_solve_one_flop(
             iteration: iter as u64,
             dcfr,
             prune_active,
+            prune_explore_pct: config.prune_explore_pct,
             counters,
         };
 
@@ -669,7 +678,7 @@ fn exhaustive_solve_one_flop(
 
         // Clamp negative regrets to prevent unbounded accumulation.
         // This bounds memory of bad actions so pruned actions can
-        // recover when explored during explore-frequency iterations.
+        // recover when stochastically explored (prune_explore_pct).
         if config.regret_floor > 0.0 && config.prune_warmup > 0 {
             let floor = -config.regret_floor;
             for v in regret_sum.iter_mut() {
@@ -1195,6 +1204,7 @@ mod tests {
                 0,
                 &dcfr,
                 false,
+                0.0,
                 None,
             );
 
@@ -1267,6 +1277,7 @@ mod tests {
                 0,
                 &dcfr,
                 false,
+                0.0,
                 None,
             );
 
@@ -1410,7 +1421,7 @@ mod tests {
             max_raises_per_street: 0,
             postflop_solve_iterations: 50,
             prune_warmup: 10,
-            prune_explore_freq: 5,
+            prune_explore_pct: 0.05,
             regret_floor: 1_000_000.0,
             ..PostflopModelConfig::exhaustive_fast()
         };
@@ -1462,7 +1473,7 @@ mod tests {
         // Pruned run
         let pruned_config = PostflopModelConfig {
             prune_warmup: 5,
-            prune_explore_freq: 3,
+            prune_explore_pct: 0.05,
             regret_floor: 1_000_000.0,
             ..base.clone()
         };

@@ -688,7 +688,7 @@ mod tests {
             ev_convergence_threshold: 0.001,
             cfr_variant: CfrVariant::Linear,
             prune_warmup: 0,
-            prune_explore_freq: 20,
+            prune_explore_pct: 0.05,
             regret_floor: 1_000_000.0,
         }
     }
