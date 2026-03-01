@@ -6,7 +6,7 @@ pub mod equity;
 pub mod postflop_abstraction;
 pub mod postflop_bundle;
 pub mod postflop_hands;
-pub(crate) mod postflop_exhaustive;
+pub mod postflop_exhaustive;
 pub(crate) mod postflop_mccfr;
 pub mod postflop_model;
 pub mod postflop_tree;

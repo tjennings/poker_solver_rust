@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Value is hero's equity (0.0 to 1.0), or `NaN` if the hand pair has
 /// no non-conflicting combos.
 #[allow(clippy::cast_precision_loss)]
-fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec<f64> {
+pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec<f64> {
     let n = NUM_CANONICAL_HANDS;
     let deck = all_cards_vec();
 
