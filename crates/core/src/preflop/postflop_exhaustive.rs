@@ -188,13 +188,27 @@ fn exhaustive_cfr_traverse(
             if is_hero {
                 let mut action_values = [0.0f64; MAX_POSTFLOP_ACTIONS];
 
-                // RBP: skip negative-regret subtrees if pruning is active
-                // and at least one action has positive regret.
-                let any_positive = prune_active
-                    && (0..num_actions).any(|i| snapshot[start + i] > 0.0);
+                // RBP: build prune bitmask in a single pass over regrets.
+                // Bit i is set if action i should be pruned (negative regret,
+                // and at least one sibling has positive regret).
+                let mut prune_mask: u16 = 0;
+                if prune_active {
+                    let mut has_positive = false;
+                    let mut neg_mask: u16 = 0;
+                    for i in 0..num_actions {
+                        if snapshot[start + i] > 0.0 {
+                            has_positive = true;
+                        } else if snapshot[start + i] < 0.0 {
+                            neg_mask |= 1 << i;
+                        }
+                    }
+                    if has_positive {
+                        prune_mask = neg_mask;
+                    }
+                }
 
                 for (i, &child) in children.iter().enumerate() {
-                    if any_positive && snapshot[start + i] < 0.0 {
+                    if prune_mask & (1 << i) != 0 {
                         continue;
                     }
                     action_values[i] = exhaustive_cfr_traverse(
@@ -587,9 +601,7 @@ fn exhaustive_solve_one_flop(
         if config.regret_floor > 0.0 && config.prune_warmup > 0 {
             let floor = -config.regret_floor;
             for v in regret_sum.iter_mut() {
-                if *v < floor {
-                    *v = floor;
-                }
+                *v = (*v).max(floor);
             }
         }
 
