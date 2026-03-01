@@ -1,6 +1,7 @@
 mod bucket_diagnostics;
 mod hand_trace;
 mod lhe_viz;
+mod tui;
 mod tui_metrics;
 
 use std::error::Error;
@@ -403,6 +404,7 @@ fn build_postflop_with_progress(
             pf_config,
             spr,
             equity,
+            None,
             |phase| {
                 match &phase {
                     BuildPhase::FlopProgress { flop_name, stage } => {
