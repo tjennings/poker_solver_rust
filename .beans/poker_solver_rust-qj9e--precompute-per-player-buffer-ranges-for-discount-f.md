@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-qj9e
 title: Precompute per-player buffer ranges for discount functions
-status: todo
+status: completed
 type: task
 priority: normal
 created_at: 2026-02-28T23:58:14Z
-updated_at: 2026-02-28T23:58:14Z
+updated_at: 2026-03-01T00:13:36Z
 ---
 
 ## Problem
@@ -24,3 +24,5 @@ Store `player_node_ranges: [Range<usize>; 2]` (or equivalent start/end indices i
 - [ ] Refactor discount_regrets to use precomputed ranges
 - [ ] Refactor discount_strategy_sums to use precomputed ranges
 - [ ] Run tests and clippy
+
+## Summary of Changes\nAdded `player_buf_ranges` to `NodeLayout`, precomputed during `from_tree()`. `discount_regrets` and `discount_strategy_sums` now iterate precomputed per-player ranges instead of scanning all nodes with position filtering.

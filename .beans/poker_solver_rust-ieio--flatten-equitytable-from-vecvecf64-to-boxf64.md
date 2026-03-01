@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-ieio
 title: Flatten EquityTable from Vec<Vec<f64>> to Box<[f64]>
-status: todo
+status: completed
 type: task
 priority: normal
 created_at: 2026-02-28T23:58:10Z
-updated_at: 2026-02-28T23:58:10Z
+updated_at: 2026-03-01T00:13:33Z
 ---
 
 ## Problem
@@ -25,3 +25,5 @@ Replace with flat `Vec<f64>` of size 169×169 (or `Box<[f64; 28561]>`). Index as
 - [ ] Update construction code (compute_equity_table, etc.)
 - [ ] Update any serialization/deserialization
 - [ ] Run tests and clippy
+
+## Summary of Changes\nFlattened `EquityTable` from `Vec<Vec<f64>>` (169 heap rows) to flat `Vec<f64>` (28561 elements). Eliminates double-dereference on every equity/weight lookup in the inner CFR loop.

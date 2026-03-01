@@ -154,41 +154,6 @@ Solved heads-up limit hold'em — first nontrivial imperfect-information game so
 
 **Practical recommendation**: Use Nash blueprint as the foundation. Add exploitative adjustments only when: (1) the opponent is demonstrably non-Nash, (2) you have high-confidence opponent model, and (3) the potential gain exceeds counter-exploitation risk.
 
----
-
-## The User's Solver Architecture
-
-This is a heads-up no-limit Texas Hold'em solver with:
-
-**Preflop solver**: Linear CFR (LCFR) over 169 canonical hand matchups with epsilon-greedy exploration and DCFR discounting. Simultaneous updates. At showdown terminals, queries postflop models for EV (or falls back to raw equity for limped pots).
-
-**Postflop abstraction pipeline**: 169-hand direct indexing per canonical flop — each hand is its own info set, no bucket clustering. Streaming architecture: per-flop build combo map, CFR solve, extract values, drop intermediates. Two backends: MCCFR (sampled concrete hands) and Exhaustive (pre-computed equity tables + vanilla CFR).
-
-**Multi-SPR model selection**: Separate PostflopAbstraction per configured SPR. At runtime, selects closest model by absolute SPR distance. No interpolation between models.
-
-**Info set key encoding**: 64-bit packed — hand(28) | street(2) | spr(5) | reserved(5) | actions(24). Actions: 6 slots x 4 bits, MSB-first. HandClassV2 encodes class_id(5) | strength(4) | equity(4) | draw_flags(6) | spare(9).
-
-**19 hand classes**: StraightFlush through HighCard (13 made hands) plus 6 draw types. `strongest_made_id()` uses mask 0x1FFF, `draw_flags()` shifts right 13.
-
-**Current limitations**:
-- No real-time subgame solving (static blueprint only)
-- No multi-valued opponent states at subgame leaves
-- Limped pots fall back to raw equity (not postflop model)
-- AA/KK still prefer calling ~60% due to BB raise-back creating raised pots
-- Preflop-only model finds limp-trap equilibrium vs full-game GTO
-
-**Key files**:
-- Preflop solver: `crates/core/src/preflop/solver.rs`
-- Preflop tree: `crates/core/src/preflop/tree.rs`
-- Postflop abstraction: `crates/core/src/preflop/postflop_abstraction.rs`
-- MCCFR solver: `crates/core/src/cfr/mccfr.rs`
-- Blueprint: `crates/core/src/blueprint/`
-- Hand classes: `crates/core/src/hand_class.rs`
-- Info set keys: `crates/core/src/info_key.rs`
-- Game types: `crates/core/src/game/hunl_postflop.rs`
-
----
-
 ## How to Respond
 
 1. **Lead with your recommendation.** State the answer or design decision clearly upfront.

@@ -11,7 +11,7 @@
 #     -c sample_configurations/minimal_preflop.yaml -o minimal_preflop_output
 
 # -- Postflop bundle (required, built via solve-postflop) --
-postflop_model_path: minimal_postflop
+postflop_model_path: ./local_data/akq_vs_234_postflop
 
 # -- Training --
 iterations: 200

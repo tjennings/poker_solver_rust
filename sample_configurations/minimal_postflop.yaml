@@ -33,7 +33,7 @@ postflop_model:
   # bet_sizes: [0.36, 0.68, 1.22]
   #
   # Hybrid: geometric anchors + traditional half-pot and overbet
-  bet_sizes: [0.36, 0.5, 0.68, 1.0, 1.22, 2.0]
+  bet_sizes: [0.30, 0.5, 0.70, 1.0, 1.20, 2.0]
 
   max_raises_per_street: 4
   postflop_solve_iterations: 500

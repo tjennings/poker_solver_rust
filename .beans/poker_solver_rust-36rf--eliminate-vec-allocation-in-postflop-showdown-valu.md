@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-36rf
 title: Eliminate Vec allocation in postflop_showdown_value hot path
-status: todo
+status: completed
 type: task
 priority: high
 created_at: 2026-02-28T23:58:04Z
-updated_at: 2026-02-28T23:58:04Z
+updated_at: 2026-03-01T00:13:31Z
 ---
 
 ## Problem
@@ -22,3 +22,5 @@ Change `select_closest_spr` to accept `&[PostflopAbstraction]` directly instead 
 - [ ] Refactor select_closest_spr to accept &[PostflopAbstraction] or iterate inline
 - [ ] Remove the Vec<f64> collection at the call site
 - [ ] Run tests and clippy
+
+## Summary of Changes\nChanged `select_closest_spr` to accept an iterator over SPR values instead of `&[f64]`, removing the per-call `Vec<f64>` allocation in `postflop_showdown_value`.
