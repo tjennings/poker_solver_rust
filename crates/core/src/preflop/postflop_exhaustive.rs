@@ -26,6 +26,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // Equity table
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Map a card to a unique bit position (0..51) for bitmask collision checks.
+///
+/// Encoding: `value * 4 + suit` using `#[repr(u8)]` discriminants.
+/// This is the same scheme used in `showdown_equity::card_bit`.
+#[inline]
+fn card_bit(card: Card) -> u8 {
+    card.value as u8 * 4 + card.suit as u8
+}
+
 /// Pre-compute flop-only equity table for all 169x169 hand pairs.
 ///
 /// For each `(hero_hand, opp_hand)` canonical pair, enumerates all concrete
@@ -39,6 +48,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec<f64> {
     let n = NUM_CANONICAL_HANDS;
     let deck = all_cards_vec();
+
+    // Pre-compute bit position for each deck index, avoiding repeated
+    // value/suit → u8 conversions in the inner loop.
+    let mut deck_bits = [0u8; 52];
+    for (i, &c) in deck.iter().enumerate() {
+        deck_bits[i] = card_bit(c);
+    }
+
+    // Flop mask — set once, reused by every thread.
+    let flop_mask: u64 = (1u64 << card_bit(flop[0]))
+        | (1u64 << card_bit(flop[1]))
+        | (1u64 << card_bit(flop[2]));
 
     // Parallel over hero hands
     let rows: Vec<Vec<f64>> = (0..n)
@@ -66,14 +87,21 @@ pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) ->
                             continue;
                         }
 
+                        // 64-bit bitmask of all 7 used cards (flop + both holes).
+                        let used: u64 = flop_mask
+                            | (1u64 << card_bit(h1))
+                            | (1u64 << card_bit(h2))
+                            | (1u64 << card_bit(o1))
+                            | (1u64 << card_bit(o2));
+
                         // Enumerate all turn+river runouts
-                        let used = [flop[0], flop[1], flop[2], h1, h2, o1, o2];
                         for (ti, &turn) in deck.iter().enumerate() {
-                            if used.contains(&turn) {
+                            if used & (1u64 << deck_bits[ti]) != 0 {
                                 continue;
                             }
-                            for &river in &deck[ti + 1..] {
-                                if used.contains(&river) {
+                            for (ri, &river) in deck[ti + 1..].iter().enumerate() {
+                                let river_idx = ti + 1 + ri;
+                                if used & (1u64 << deck_bits[river_idx]) != 0 {
                                     continue;
                                 }
                                 let board = [flop[0], flop[1], flop[2], turn, river];
@@ -869,6 +897,62 @@ mod tests {
             }
         }
         table
+    }
+
+    #[timed_test]
+    fn bitmask_matches_contains_for_card_exclusion() {
+        // Verify the bitmask approach agrees with slice::contains for a small
+        // set of cards. This guards against bit-encoding mismatches.
+        let deck = all_cards_vec();
+        let flop = test_flop();
+
+        let mut deck_bits = [0u8; 52];
+        for (i, &c) in deck.iter().enumerate() {
+            deck_bits[i] = card_bit(c);
+        }
+
+        // Pick two hole cards and two opponent cards that don't overlap with
+        // the flop. Use deck positions to avoid accidental collisions.
+        let h1 = Card::new(Value::Ace, Suit::Spade);
+        let h2 = Card::new(Value::King, Suit::Club);
+        let o1 = Card::new(Value::Ten, Suit::Heart);
+        let o2 = Card::new(Value::Nine, Suit::Diamond);
+
+        let used_arr = [flop[0], flop[1], flop[2], h1, h2, o1, o2];
+        let used_mask: u64 = (1u64 << card_bit(flop[0]))
+            | (1u64 << card_bit(flop[1]))
+            | (1u64 << card_bit(flop[2]))
+            | (1u64 << card_bit(h1))
+            | (1u64 << card_bit(h2))
+            | (1u64 << card_bit(o1))
+            | (1u64 << card_bit(o2));
+
+        // Verify every card in the deck: bitmask matches array contains.
+        for (i, &c) in deck.iter().enumerate() {
+            let arr_hit = used_arr.contains(&c);
+            let mask_hit = used_mask & (1u64 << deck_bits[i]) != 0;
+            assert_eq!(
+                arr_hit, mask_hit,
+                "mismatch for card {c} at deck pos {i}: contains={arr_hit}, bitmask={mask_hit}"
+            );
+        }
+
+        // Also verify that exactly 7 bits are set.
+        assert_eq!(used_mask.count_ones(), 7, "should have exactly 7 used cards");
+    }
+
+    #[timed_test]
+    fn card_bit_produces_unique_indices() {
+        let deck = all_cards_vec();
+        let mut seen = 0u64;
+        for &c in &deck {
+            let bit = card_bit(c);
+            assert!(bit < 52, "card_bit out of range: {bit}");
+            let mask = 1u64 << bit;
+            assert_eq!(seen & mask, 0, "duplicate bit {bit} for card {c}");
+            seen |= mask;
+        }
+        assert_eq!(seen.count_ones(), 52);
     }
 
     #[test]
