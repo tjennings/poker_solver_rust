@@ -315,6 +315,10 @@ fn print_postflop_ev_diagnostics(
 /// Build one or more `PostflopAbstraction`s (one per configured SPR) with
 /// a full-screen TUI dashboard showing per-flop convergence, pruning stats,
 /// and traversal throughput.
+///
+/// When stderr is not a TTY (piped output, CI, etc.), falls back to simple
+/// line-based progress logging to avoid corrupting output with ANSI escape
+/// sequences.
 fn build_postflop_with_progress(
     pf_config: &PostflopModelConfig,
     equity: Option<&EquityTable>,
@@ -322,10 +326,10 @@ fn build_postflop_with_progress(
 ) -> Result<Vec<PostflopAbstraction>, Box<dyn Error>> {
     let sprs = &pf_config.postflop_sprs;
     let total_sprs = sprs.len() as u32;
+    let use_tui = atty::is(atty::Stream::Stderr);
 
     // Use max_flop_boards as an estimate; 0 means all ~1,755 canonical flops.
     let estimated_flops = if pf_config.max_flop_boards == 0 { 1755 } else { pf_config.max_flop_boards } as u32;
-    let metrics = Arc::new(tui_metrics::TuiMetrics::new(total_sprs, estimated_flops));
     let counters = SolverCounters {
         traversal_count: Default::default(),
         pruned_traversal_count: Default::default(),
@@ -333,31 +337,39 @@ fn build_postflop_with_progress(
         pruned_action_slots: Default::default(),
     };
 
-    // Wire TuiMetrics atomics to mirror SolverCounters so the TUI reads
-    // from its own fields while the solver increments the canonical counters.
-    // We share the same underlying atomics by copying values in the on_progress
-    // callback, but more efficiently, we can just let the TUI read from the
-    // SolverCounters directly. Instead, we point TuiMetrics atomics at the
-    // SolverCounters values in each tick by having the TUI read from metrics.
-    // The simplest correct approach: copy counter values into metrics atomics
-    // inside the on_progress callback (called frequently enough).
-
-    let done = Arc::new(AtomicBool::new(false));
-    let refresh_interval = Duration::from_secs_f64(tui_refresh);
-
-    let tui_handle = tui::run_tui(
-        Arc::clone(&metrics),
-        refresh_interval,
-        Arc::clone(&done),
-    );
+    // TUI-mode resources: only allocated when stderr is a TTY.
+    let metrics = if use_tui {
+        Some(Arc::new(tui_metrics::TuiMetrics::new(total_sprs, estimated_flops)))
+    } else {
+        None
+    };
+    let done = if use_tui {
+        Some(Arc::new(AtomicBool::new(false)))
+    } else {
+        None
+    };
+    let tui_handle = if let (Some(m), Some(d)) = (&metrics, &done) {
+        Some(tui::run_tui(
+            Arc::clone(m),
+            Duration::from_secs_f64(tui_refresh),
+            Arc::clone(d),
+        ))
+    } else {
+        None
+    };
 
     let pf_start = Instant::now();
     let mut abstractions = Vec::with_capacity(sprs.len());
 
     for (i, &spr) in sprs.iter().enumerate() {
-        metrics.start_spr(i as u32, estimated_flops);
+        if let Some(m) = &metrics {
+            m.start_spr(i as u32, estimated_flops);
+        }
+        if !use_tui {
+            eprintln!("SPR={spr} ({}/{total_sprs})", i + 1);
+        }
 
-        let m = &metrics;
+        let metrics_ref = &metrics;
         let c = &counters;
 
         let abstraction = PostflopAbstraction::build_for_spr(
@@ -366,44 +378,62 @@ fn build_postflop_with_progress(
             equity,
             Some(&counters),
             |phase| {
-                // Sync SolverCounters into TuiMetrics atomics so the TUI
-                // thread picks up traversal/pruning data on its next tick.
-                m.traversal_count.store(
-                    c.traversal_count.load(AtomicOrdering::Relaxed),
-                    AtomicOrdering::Relaxed,
-                );
-                m.pruned_traversal_count.store(
-                    c.pruned_traversal_count.load(AtomicOrdering::Relaxed),
-                    AtomicOrdering::Relaxed,
-                );
-                m.total_action_slots.store(
-                    c.total_action_slots.load(AtomicOrdering::Relaxed),
-                    AtomicOrdering::Relaxed,
-                );
-                m.pruned_action_slots.store(
-                    c.pruned_action_slots.load(AtomicOrdering::Relaxed),
-                    AtomicOrdering::Relaxed,
-                );
+                if let Some(m) = metrics_ref {
+                    // TUI mode: sync SolverCounters into TuiMetrics atomics
+                    // so the TUI thread picks up traversal/pruning data.
+                    m.traversal_count.store(
+                        c.traversal_count.load(AtomicOrdering::Relaxed),
+                        AtomicOrdering::Relaxed,
+                    );
+                    m.pruned_traversal_count.store(
+                        c.pruned_traversal_count.load(AtomicOrdering::Relaxed),
+                        AtomicOrdering::Relaxed,
+                    );
+                    m.total_action_slots.store(
+                        c.total_action_slots.load(AtomicOrdering::Relaxed),
+                        AtomicOrdering::Relaxed,
+                    );
+                    m.pruned_action_slots.store(
+                        c.pruned_action_slots.load(AtomicOrdering::Relaxed),
+                        AtomicOrdering::Relaxed,
+                    );
 
-                match &phase {
-                    BuildPhase::FlopProgress { flop_name, stage } => {
-                        match stage {
-                            FlopStage::Solving { iteration, max_iterations, delta, .. } => {
-                                m.update_flop(flop_name, *iteration, *max_iterations, *delta);
-                            }
-                            FlopStage::EstimatingEv { .. } => {
-                                // EV estimation is fast; no per-sample TUI update needed.
-                            }
-                            FlopStage::Done => {
-                                m.remove_flop(flop_name);
+                    match &phase {
+                        BuildPhase::FlopProgress { flop_name, stage } => {
+                            match stage {
+                                FlopStage::Solving { iteration, max_iterations, delta, .. } => {
+                                    m.update_flop(flop_name, *iteration, *max_iterations, *delta);
+                                }
+                                FlopStage::EstimatingEv { .. } => {}
+                                FlopStage::Done => {
+                                    m.remove_flop(flop_name);
+                                }
                             }
                         }
+                        BuildPhase::MccfrFlopsCompleted { completed, total } => {
+                            m.flops_completed.store(*completed as u32, AtomicOrdering::Relaxed);
+                            m.total_flops.store(*total as u32, AtomicOrdering::Relaxed);
+                        }
+                        _ => {}
                     }
-                    BuildPhase::MccfrFlopsCompleted { completed, total } => {
-                        m.flops_completed.store(*completed as u32, AtomicOrdering::Relaxed);
-                        m.total_flops.store(*total as u32, AtomicOrdering::Relaxed);
+                } else {
+                    // Non-TTY fallback: line-based progress to stderr.
+                    match &phase {
+                        BuildPhase::FlopProgress { flop_name, stage } => {
+                            if let FlopStage::Solving { iteration, max_iterations, delta, metric_label } = stage {
+                                // Log every ~10 iterations to avoid flooding.
+                                if *iteration % 10 == 0 || *iteration == *max_iterations {
+                                    eprintln!(
+                                        "    {flop_name}: iter {iteration}/{max_iterations} {metric_label}={delta:.2}",
+                                    );
+                                }
+                            }
+                        }
+                        BuildPhase::MccfrFlopsCompleted { completed, total } => {
+                            eprintln!("  SPR={spr}: {completed}/{total} flops completed");
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             },
         )
@@ -413,8 +443,12 @@ fn build_postflop_with_progress(
     }
 
     // Signal the TUI to exit and wait for it to restore the terminal.
-    done.store(true, AtomicOrdering::Relaxed);
-    let _ = tui_handle.join();
+    if let Some(d) = &done {
+        d.store(true, AtomicOrdering::Relaxed);
+    }
+    if let Some(handle) = tui_handle {
+        let _ = handle.join();
+    }
 
     eprintln!(
         "Postflop solve complete in {:.1?} ({total_sprs} SPR model{})",
