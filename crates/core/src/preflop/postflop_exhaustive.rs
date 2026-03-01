@@ -136,6 +136,7 @@ fn exhaustive_cfr_traverse(
     reach_opp: f64,
     iteration: u64,
     dcfr: &DcfrParams,
+    prune_active: bool,
 ) -> f64 {
     let n = NUM_CANONICAL_HANDS;
     match &tree.nodes[node_idx as usize] {
@@ -169,6 +170,7 @@ fn exhaustive_cfr_traverse(
                 reach_opp,
                 iteration,
                 dcfr,
+                prune_active,
             )
         }
 
@@ -185,7 +187,16 @@ fn exhaustive_cfr_traverse(
 
             if is_hero {
                 let mut action_values = [0.0f64; MAX_POSTFLOP_ACTIONS];
+
+                // RBP: skip negative-regret subtrees if pruning is active
+                // and at least one action has positive regret.
+                let any_positive = prune_active
+                    && (0..num_actions).any(|i| snapshot[start + i] > 0.0);
+
                 for (i, &child) in children.iter().enumerate() {
+                    if any_positive && snapshot[start + i] < 0.0 {
+                        continue;
+                    }
                     action_values[i] = exhaustive_cfr_traverse(
                         tree,
                         layout,
@@ -201,6 +212,7 @@ fn exhaustive_cfr_traverse(
                         reach_opp,
                         iteration,
                         dcfr,
+                        prune_active,
                     );
                 }
                 let node_value: f64 = strategy[..num_actions]
@@ -238,6 +250,7 @@ fn exhaustive_cfr_traverse(
                                 reach_opp * strategy[i],
                                 iteration,
                                 dcfr,
+                                prune_active,
                             )
                     })
                     .sum()
@@ -443,6 +456,7 @@ struct PostflopCfrCtx<'a> {
     snapshot: &'a [f64],
     iteration: u64,
     dcfr: &'a DcfrParams,
+    prune_active: bool,
 }
 
 impl ParallelCfr for PostflopCfrCtx<'_> {
@@ -472,6 +486,7 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
                 1.0,
                 self.iteration,
                 self.dcfr,
+                self.prune_active,
             );
         }
     }
@@ -541,6 +556,7 @@ fn exhaustive_solve_one_flop(
             snapshot: &snapshot,
             iteration: iter as u64,
             dcfr,
+            prune_active: false,
         };
 
         if let Some(pool) = &serial_pool {
@@ -1013,6 +1029,7 @@ mod tests {
                 1.0,
                 0,
                 &dcfr,
+                false,
             );
 
             if folder == 0 {
@@ -1083,6 +1100,7 @@ mod tests {
                 1.0,
                 0,
                 &dcfr,
+                false,
             );
 
             let expected = eq * pot_fraction - pot_fraction / 2.0;
