@@ -88,15 +88,27 @@ struct NodeLayout {
     entries: Vec<(usize, usize)>,
     /// Total buffer size in `f64` elements.
     total_size: usize,
+    /// Precomputed buffer ranges `(base, end)` for each player's decision nodes.
+    /// Avoids per-iteration tree scanning in discount functions.
+    player_buf_ranges: [Vec<(usize, usize)>; 2],
 }
 
 impl NodeLayout {
     fn from_tree(tree: &PreflopTree) -> Self {
         let mut entries = Vec::with_capacity(tree.nodes.len());
+        let mut player_buf_ranges: [Vec<(usize, usize)>; 2] = [Vec::new(), Vec::new()];
         let mut offset = 0;
         for node in &tree.nodes {
             let num_actions = match node {
-                PreflopNode::Decision { children, .. } => children.len(),
+                PreflopNode::Decision {
+                    position, children, ..
+                } => {
+                    let n = children.len();
+                    let base = offset;
+                    let end = base + NUM_HANDS * n;
+                    player_buf_ranges[*position as usize].push((base, end));
+                    n
+                }
                 PreflopNode::Terminal { .. } => 0,
             };
             entries.push((offset, num_actions));
@@ -105,6 +117,7 @@ impl NodeLayout {
         Self {
             entries,
             total_size: offset,
+            player_buf_ranges,
         }
     }
 
@@ -383,20 +396,10 @@ impl PreflopSolver {
     /// updated each iteration. Discounting must match: only discount the
     /// hero's regrets so each player's regrets are discounted once per
     /// their update, matching standard simultaneous-update DCFR behavior.
-    #[allow(clippy::cast_possible_truncation)]
+    ///
+    /// Uses precomputed per-player buffer ranges to avoid scanning all nodes.
     fn discount_regrets(&mut self, hero_pos: u8) {
-        for (node_idx, node) in self.tree.nodes.iter().enumerate() {
-            let (position, num_actions) = match node {
-                PreflopNode::Decision {
-                    position, children, ..
-                } => (*position, children.len()),
-                PreflopNode::Terminal { .. } => continue,
-            };
-            if position != hero_pos {
-                continue;
-            }
-            let (base, _) = self.layout.slot(node_idx as u32, 0);
-            let end = base + NUM_HANDS * num_actions;
+        for &(base, end) in &self.layout.player_buf_ranges[hero_pos as usize] {
             self.dcfr.discount_regrets(&mut self.regret_sum[base..end], self.iteration);
         }
     }
@@ -405,20 +408,10 @@ impl PreflopSolver {
     ///
     /// Standard DCFR: `S^{T+1} = sd * S^T + new_contribution`.
     /// This ensures early (poor) strategies get exponentially washed out.
-    #[allow(clippy::cast_possible_truncation)]
+    ///
+    /// Uses precomputed per-player buffer ranges to avoid scanning all nodes.
     fn discount_strategy_sums(&mut self, hero_pos: u8) {
-        for (node_idx, node) in self.tree.nodes.iter().enumerate() {
-            let (position, num_actions) = match node {
-                PreflopNode::Decision {
-                    position, children, ..
-                } => (*position, children.len()),
-                PreflopNode::Terminal { .. } => continue,
-            };
-            if position != hero_pos {
-                continue;
-            }
-            let (base, _) = self.layout.slot(node_idx as u32, 0);
-            let end = base + NUM_HANDS * num_actions;
+        for &(base, end) in &self.layout.player_buf_ranges[hero_pos as usize] {
             self.dcfr.discount_strategy_sums(&mut self.strategy_sum[base..end], self.iteration);
         }
     }
