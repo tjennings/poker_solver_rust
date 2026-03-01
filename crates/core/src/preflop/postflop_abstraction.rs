@@ -260,6 +260,10 @@ pub enum FlopStage {
 /// Progress report during postflop abstraction construction.
 #[derive(Debug, Clone)]
 pub enum BuildPhase {
+    /// Building the game tree, annotating streets, and allocating layout.
+    BuildingTree,
+    /// Computing per-flop equity tables (skipped when pre-cached).
+    ComputingEquityTables,
     /// Per-flop streaming progress.
     FlopProgress {
         flop_name: String,
@@ -274,6 +278,8 @@ pub enum BuildPhase {
 impl std::fmt::Display for BuildPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BuildingTree => write!(f, "Building game tree"),
+            Self::ComputingEquityTables => write!(f, "Computing equity tables"),
             Self::FlopProgress { flop_name, stage } => match stage {
                 FlopStage::Solving { iteration, max_iterations, delta, metric_label } =>
                     write!(f, "Flop '{flop_name}' CFR {metric_label}={delta:.4} ({iteration}/{max_iterations})"),
@@ -326,6 +332,7 @@ impl PostflopAbstraction {
         } else {
             sample_canonical_flops(config.max_flop_boards)
         };
+        on_progress(BuildPhase::BuildingTree);
         let tree = PostflopTree::build_with_spr(config, spr)?;
         let node_streets = annotate_streets(&tree);
         let layout = PostflopLayout::build(&tree, &node_streets, NUM_CANONICAL_HANDS, NUM_CANONICAL_HANDS, NUM_CANONICAL_HANDS);

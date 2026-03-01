@@ -100,6 +100,7 @@ impl TuiApp {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1), // SPR gauge
+                Constraint::Length(1), // SPR phase gauge
                 Constraint::Length(1), // Traversal progress gauge
                 Constraint::Length(2), // traversals/sec sparkline
                 Constraint::Length(2), // % traversals pruned
@@ -111,31 +112,32 @@ impl TuiApp {
             .split(area);
 
         self.render_spr_gauge(frame, chunks[0]);
-        self.render_traversal_gauge(frame, chunks[1]);
+        self.render_phase_gauge(frame, chunks[1]);
+        self.render_traversal_gauge(frame, chunks[2]);
         self.render_sparkline_row(
             frame,
-            chunks[2],
+            chunks[3],
             "Traversals/sec",
             &self.traversals_per_sec,
             Color::Cyan,
         );
         self.render_sparkline_row(
             frame,
-            chunks[3],
+            chunks[4],
             "% Trav pruned",
             &self.pct_traversals_pruned,
             Color::Green,
         );
         self.render_sparkline_row(
             frame,
-            chunks[4],
+            chunks[5],
             "% Actions pruned",
             &self.pct_actions_pruned,
             Color::Green,
         );
-        self.render_active_flops_header(frame, chunks[5]);
-        self.render_active_flops(frame, chunks[6]);
-        self.render_footer(frame, chunks[7]);
+        self.render_active_flops_header(frame, chunks[6]);
+        self.render_active_flops(frame, chunks[7]);
+        self.render_footer(frame, chunks[8]);
     }
 
     fn render_spr_gauge(&self, frame: &mut Frame, area: Rect) {
@@ -151,6 +153,31 @@ impl TuiApp {
             .gauge_style(Style::default().fg(Color::Cyan))
             .ratio(ratio.clamp(0.0, 1.0))
             .label(format!("SPR Progress: {idx}/{total}    {elapsed}"));
+        frame.render_widget(gauge, area);
+    }
+
+    fn render_phase_gauge(&self, frame: &mut Frame, area: Rect) {
+        let phase = self.metrics.spr_phase.load(Ordering::Relaxed);
+        let (label, ratio): (String, f64) = match phase {
+            0 => ("Idle".to_string(), 0.0),
+            1 => {
+                let elapsed = format_duration(self.metrics.phase_elapsed_secs());
+                (format!("Building Tree  {elapsed}"), 0.0)
+            }
+            2 => {
+                let elapsed = format_duration(self.metrics.phase_elapsed_secs());
+                (format!("Solving Flops  {elapsed}"), 1.0 / 3.0)
+            }
+            3 => {
+                let elapsed = format_duration(self.metrics.phase_elapsed_secs());
+                (format!("Computing Values  {elapsed}"), 2.0 / 3.0)
+            }
+            _ => ("Done".to_string(), 1.0),
+        };
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Magenta))
+            .ratio(ratio.clamp(0.0, 1.0))
+            .label(label);
         frame.render_widget(gauge, area);
     }
 

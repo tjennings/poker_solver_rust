@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use dashmap::DashMap;
 
@@ -22,6 +22,11 @@ pub struct TuiMetrics {
     pub flops_completed: AtomicU32,
     pub total_flops: AtomicU32,
 
+    // Current SPR phase: 0=idle, 1=BuildingTree, 2=SolvingFlops, 3=ComputingValues
+    pub spr_phase: AtomicU32,
+    /// Milliseconds since Unix epoch when the current phase started.
+    pub phase_start_ms: AtomicU64,
+
     // Per-flop exploitability (written from on_progress callback)
     pub flop_states: DashMap<String, FlopTuiState>,
 }
@@ -33,8 +38,33 @@ impl TuiMetrics {
             total_sprs: AtomicU32::new(total_sprs),
             flops_completed: AtomicU32::new(0),
             total_flops: AtomicU32::new(total_flops),
+            spr_phase: AtomicU32::new(0),
+            phase_start_ms: AtomicU64::new(0),
             flop_states: DashMap::new(),
         }
+    }
+
+    /// Set the current SPR phase and record when it started.
+    pub fn set_phase(&self, phase: u32) {
+        self.spr_phase.store(phase, Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.phase_start_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Get seconds elapsed since the current phase started.
+    pub fn phase_elapsed_secs(&self) -> f64 {
+        let start_ms = self.phase_start_ms.load(Ordering::Relaxed);
+        if start_ms == 0 {
+            return 0.0;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        now_ms.saturating_sub(start_ms) as f64 / 1000.0
     }
 
     /// Reset per-SPR counters when starting a new SPR solve.
@@ -42,6 +72,8 @@ impl TuiMetrics {
         self.current_spr.store(spr_index, Ordering::Relaxed);
         self.flops_completed.store(0, Ordering::Relaxed);
         self.total_flops.store(total_flops, Ordering::Relaxed);
+        self.spr_phase.store(0, Ordering::Relaxed);
+        self.phase_start_ms.store(0, Ordering::Relaxed);
         self.flop_states.clear();
     }
 

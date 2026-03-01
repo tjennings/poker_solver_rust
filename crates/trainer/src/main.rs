@@ -415,7 +415,15 @@ fn build_postflop_with_progress(
             |phase| {
                 if let Some(m) = metrics_ref {
                     match &phase {
+                        BuildPhase::BuildingTree => {
+                            m.set_phase(1);
+                        }
+                        BuildPhase::ComputingEquityTables => {}
                         BuildPhase::FlopProgress { flop_name, stage } => {
+                            // Transition to solving phase on first flop progress.
+                            if m.spr_phase.load(Ordering::Relaxed) < 2 {
+                                m.set_phase(2);
+                            }
                             match stage {
                                 FlopStage::Solving { iteration, max_iterations, delta, .. } => {
                                     m.update_flop(flop_name, *iteration, *max_iterations, *delta);
@@ -430,11 +438,19 @@ fn build_postflop_with_progress(
                             m.flops_completed.store(*completed as u32, Ordering::Relaxed);
                             m.total_flops.store(*total as u32, Ordering::Relaxed);
                         }
-                        BuildPhase::ComputingValues => {}
+                        BuildPhase::ComputingValues => {
+                            m.set_phase(3);
+                        }
                     }
                 } else {
                     // Non-TTY fallback: line-based progress to stderr.
                     match &phase {
+                        BuildPhase::BuildingTree => {
+                            eprintln!("  Building game tree...");
+                        }
+                        BuildPhase::ComputingEquityTables => {
+                            eprintln!("  Computing equity tables...");
+                        }
                         BuildPhase::FlopProgress { flop_name, stage } => {
                             if let FlopStage::Solving { iteration, max_iterations, delta, metric_label } = stage {
                                 // Log every ~10 iterations to avoid flooding.
