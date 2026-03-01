@@ -1,6 +1,7 @@
 mod bucket_diagnostics;
 mod hand_trace;
 mod lhe_viz;
+mod tui_metrics;
 
 use std::error::Error;
 use std::io::Write;
