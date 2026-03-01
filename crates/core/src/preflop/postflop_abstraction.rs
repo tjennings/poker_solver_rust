@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::postflop_hands::{parse_flops, sample_canonical_flops, NUM_CANONICAL_HANDS};
-use super::postflop_exhaustive::build_exhaustive;
+use super::postflop_exhaustive::{build_exhaustive, SolverCounters};
 use super::postflop_mccfr::build_mccfr;
 use super::postflop_model::{PostflopModelConfig, PostflopSolveType};
 use super::postflop_tree::{PostflopNode, PostflopTree};
@@ -302,7 +302,7 @@ impl PostflopAbstraction {
         equity_table: Option<&super::equity::EquityTable>,
         on_progress: impl Fn(BuildPhase) + Sync,
     ) -> Result<Self, PostflopAbstractionError> {
-        Self::build_for_spr(config, config.primary_spr(), equity_table, on_progress)
+        Self::build_for_spr(config, config.primary_spr(), equity_table, None, on_progress)
     }
 
     /// Build a `PostflopAbstraction` at an explicit SPR (instead of `config.primary_spr()`).
@@ -317,6 +317,7 @@ impl PostflopAbstraction {
         config: &PostflopModelConfig,
         spr: f64,
         _equity_table: Option<&super::equity::EquityTable>,
+        counters: Option<&SolverCounters>,
         on_progress: impl Fn(BuildPhase) + Sync,
     ) -> Result<Self, PostflopAbstractionError> {
         let flops = if let Some(ref names) = config.fixed_flops {
@@ -330,7 +331,7 @@ impl PostflopAbstraction {
 
         let values = match config.solve_type {
             PostflopSolveType::Mccfr => build_mccfr(config, &tree, &layout, &node_streets, &flops, &on_progress),
-            PostflopSolveType::Exhaustive => build_exhaustive(config, &tree, &layout, &node_streets, &flops, &on_progress),
+            PostflopSolveType::Exhaustive => build_exhaustive(config, &tree, &layout, &node_streets, &flops, &on_progress, counters),
         };
         on_progress(BuildPhase::ComputingValues);
         let flop_weights = crate::flops::lookup_flop_weights(&flops);
@@ -884,7 +885,7 @@ mod tests {
             postflop_solve_iterations: 10,
             ..PostflopModelConfig::exhaustive_fast()
         };
-        let result = PostflopAbstraction::build_for_spr(&config, 6.0, None, |_| {});
+        let result = PostflopAbstraction::build_for_spr(&config, 6.0, None, None, |_| {});
         assert!(result.is_ok());
         let abs = result.unwrap();
         assert!((abs.spr - 6.0).abs() < 1e-9, "spr should be 6.0, got {}", abs.spr);

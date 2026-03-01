@@ -20,7 +20,24 @@ use crate::poker::Card;
 use crate::preflop::CfrVariant;
 use crate::showdown_equity::rank_hand;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// Optional atomic counters for external progress monitoring (e.g. TUI).
+///
+/// When provided, the solver hot path increments these with `Relaxed` ordering
+/// so an observer thread can sample throughput and pruning rates without
+/// blocking the solver.
+#[derive(Debug)]
+pub struct SolverCounters {
+    /// Number of `traverse_pair` calls (one per hero/opponent hand pair per iteration).
+    pub traversal_count: AtomicU64,
+    /// Reserved for future use (per-traversal pruning tracking).
+    pub pruned_traversal_count: AtomicU64,
+    /// Total action slots visited at hero decision nodes.
+    pub total_action_slots: AtomicU64,
+    /// Action slots skipped by regret-based pruning.
+    pub pruned_action_slots: AtomicU64,
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Equity table
@@ -137,6 +154,7 @@ fn exhaustive_cfr_traverse(
     iteration: u64,
     dcfr: &DcfrParams,
     prune_active: bool,
+    counters: Option<&SolverCounters>,
 ) -> f64 {
     let n = NUM_CANONICAL_HANDS;
     match &tree.nodes[node_idx as usize] {
@@ -171,6 +189,7 @@ fn exhaustive_cfr_traverse(
                 iteration,
                 dcfr,
                 prune_active,
+                counters,
             )
         }
 
@@ -207,6 +226,13 @@ fn exhaustive_cfr_traverse(
                     }
                 }
 
+                if let Some(c) = counters {
+                    let total = num_actions as u64;
+                    let pruned = prune_mask.count_ones() as u64;
+                    c.total_action_slots.fetch_add(total, Ordering::Relaxed);
+                    c.pruned_action_slots.fetch_add(pruned, Ordering::Relaxed);
+                }
+
                 for (i, &child) in children.iter().enumerate() {
                     if prune_mask & (1 << i) != 0 {
                         continue;
@@ -227,6 +253,7 @@ fn exhaustive_cfr_traverse(
                         iteration,
                         dcfr,
                         prune_active,
+                        counters,
                     );
                 }
                 let node_value: f64 = strategy[..num_actions]
@@ -265,6 +292,7 @@ fn exhaustive_cfr_traverse(
                                 iteration,
                                 dcfr,
                                 prune_active,
+                                counters,
                             )
                     })
                     .sum()
@@ -471,6 +499,7 @@ struct PostflopCfrCtx<'a> {
     iteration: u64,
     dcfr: &'a DcfrParams,
     prune_active: bool,
+    counters: Option<&'a SolverCounters>,
 }
 
 impl ParallelCfr for PostflopCfrCtx<'_> {
@@ -483,6 +512,9 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
         let eq = self.equity_table[hero as usize * n + opponent as usize];
         if eq.is_nan() {
             return;
+        }
+        if let Some(c) = self.counters {
+            c.traversal_count.fetch_add(1, Ordering::Relaxed);
         }
         for hero_pos in 0..2u8 {
             exhaustive_cfr_traverse(
@@ -501,6 +533,7 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
                 self.iteration,
                 self.dcfr,
                 self.prune_active,
+                self.counters,
             );
         }
     }
@@ -524,6 +557,7 @@ fn exhaustive_solve_one_flop(
     use_inner_parallelism: bool,
     config: &PostflopModelConfig,
     on_progress: &(impl Fn(BuildPhase) + Sync),
+    counters: Option<&SolverCounters>,
 ) -> FlopSolveResult {
     let buf_size = layout.total_size;
     let mut regret_sum = vec![0.0f64; buf_size];
@@ -576,6 +610,7 @@ fn exhaustive_solve_one_flop(
             iteration: iter as u64,
             dcfr,
             prune_active,
+            counters,
         };
 
         if let Some(pool) = &serial_pool {
@@ -763,6 +798,7 @@ pub(crate) fn build_exhaustive(
     node_streets: &[Street],
     flops: &[[Card; 3]],
     on_progress: &(impl Fn(BuildPhase) + Sync),
+    counters: Option<&SolverCounters>,
 ) -> PostflopValues {
     let num_flops = flops.len();
     let n = NUM_CANONICAL_HANDS;
@@ -797,6 +833,7 @@ pub(crate) fn build_exhaustive(
                 num_flops == 1,
                 config,
                 on_progress,
+                counters,
             );
 
             let values =
@@ -968,6 +1005,7 @@ mod tests {
             true,
             &config,
             &|_| {},
+            None,
         );
 
         assert!(result.iterations_used > 0);
@@ -1002,6 +1040,7 @@ mod tests {
             true,
             &config,
             &|_| {},
+            None,
         );
 
         let values =
@@ -1062,6 +1101,7 @@ mod tests {
                 0,
                 &dcfr,
                 false,
+                None,
             );
 
             if folder == 0 {
@@ -1133,6 +1173,7 @@ mod tests {
                 0,
                 &dcfr,
                 false,
+                None,
             );
 
             let expected = eq * pot_fraction - pot_fraction / 2.0;
@@ -1183,7 +1224,7 @@ mod tests {
         let dcfr = DcfrParams::linear();
         let no_prune = PostflopModelConfig::exhaustive_fast();
         let result = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, true, &no_prune, &|_| {},
+            &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, true, &no_prune, &|_| {}, None,
         );
         assert!(
             result.delta < expl_uniform,
@@ -1210,7 +1251,7 @@ mod tests {
 
         // Solve with default thread pool (parallel)
         let result_par = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, true, &config, &|_| {},
+            &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, true, &config, &|_| {}, None,
         );
 
         // Solve with 1 thread (sequential)
@@ -1220,7 +1261,7 @@ mod tests {
             .unwrap();
         let result_seq = pool.install(|| {
             exhaustive_solve_one_flop(
-                &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, true, &config, &|_| {},
+                &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, true, &config, &|_| {}, None,
             )
         });
 
@@ -1255,6 +1296,7 @@ mod tests {
             true,
             &no_prune,
             &|_| {},
+            None,
         );
         assert_eq!(
             result.iterations_used, 2,
@@ -1297,6 +1339,7 @@ mod tests {
             true,
             &config,
             &|_| {},
+            None,
         );
 
         assert!(result.iterations_used > 0, "should complete iterations");
@@ -1321,7 +1364,7 @@ mod tests {
 
         // Unpruned baseline (prune_warmup=0)
         let unpruned = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 30, 0.0, "no_prune", &dcfr, true, &base, &|_| {},
+            &tree, &layout, &equity_table, 30, 0.0, "no_prune", &dcfr, true, &base, &|_| {}, None,
         );
 
         // Pruned run
@@ -1332,7 +1375,7 @@ mod tests {
             ..base.clone()
         };
         let pruned = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 30, 0.0, "pruned", &dcfr, true, &pruned_config, &|_| {},
+            &tree, &layout, &equity_table, 30, 0.0, "pruned", &dcfr, true, &pruned_config, &|_| {}, None,
         );
 
         // Both should produce valid strategies
@@ -1342,5 +1385,35 @@ mod tests {
         let pruned_nonzero = pruned.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
         assert!(unpruned_nonzero, "unpruned should have non-zero strategy");
         assert!(pruned_nonzero, "pruned should have non-zero strategy");
+    }
+
+    #[test]
+    fn solver_counters_are_incremented() {
+        let config = PostflopModelConfig {
+            bet_sizes: vec![1.0],
+            max_raises_per_street: 0,
+            postflop_solve_iterations: 5,
+            ..PostflopModelConfig::exhaustive_fast()
+        };
+        let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();
+        let node_streets = annotate_streets(&tree);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
+        let equity_table = synthetic_equity_table();
+        let dcfr = DcfrParams::linear();
+        let counters = SolverCounters {
+            traversal_count: AtomicU64::new(0),
+            pruned_traversal_count: AtomicU64::new(0),
+            total_action_slots: AtomicU64::new(0),
+            pruned_action_slots: AtomicU64::new(0),
+        };
+        let _result = exhaustive_solve_one_flop(
+            &tree, &layout, &equity_table, 5, 0.0, "test", &dcfr, true, &config,
+            &|_| {}, Some(&counters),
+        );
+        let traversals = counters.traversal_count.load(Ordering::Relaxed);
+        assert!(traversals > 0, "traversal counter should be incremented, got {traversals}");
+        let total_actions = counters.total_action_slots.load(Ordering::Relaxed);
+        assert!(total_actions > 0, "action counter should be incremented, got {total_actions}");
     }
 }
