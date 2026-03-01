@@ -17,7 +17,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::cfr::dcfr::DcfrParams;
-use crate::cfr::parallel::{ParallelCfr, parallel_traverse, add_into};
+use crate::cfr::parallel::{ParallelCfr, parallel_traverse_into, add_into};
 use super::config::{CfrVariant, PreflopConfig};
 use super::equity::EquityTable;
 use super::postflop_abstraction::PostflopAbstraction;
@@ -189,6 +189,9 @@ pub struct PreflopSolver {
     postflop: Option<PostflopState>,
     /// Reusable snapshot buffer for frozen regrets (avoids per-iteration allocation).
     snapshot_buf: Vec<f64>,
+    /// Reusable delta buffers for parallel traversal (avoids per-iteration allocation).
+    regret_delta_buf: Vec<f64>,
+    strategy_delta_buf: Vec<f64>,
 }
 
 impl PreflopSolver {
@@ -236,6 +239,8 @@ impl PreflopSolver {
             ],
             postflop: None,
             snapshot_buf: vec![0.0; buf_size],
+            regret_delta_buf: vec![0.0; buf_size],
+            strategy_delta_buf: vec![0.0; buf_size],
         }
     }
 
@@ -444,15 +449,21 @@ impl PreflopSolver {
             postflop: self.postflop.as_ref(),
         };
 
-        let (mr, ms) = parallel_traverse(&ctx, &self.pairs);
+        parallel_traverse_into(
+            &ctx,
+            &self.pairs,
+            &mut self.regret_delta_buf,
+            &mut self.strategy_delta_buf,
+        );
 
         self.apply_discounting();
-        add_into(&mut self.regret_sum, &mr);
-        add_into(&mut self.strategy_sum, &ms);
+        add_into(&mut self.regret_sum, &self.regret_delta_buf);
+        add_into(&mut self.strategy_sum, &self.strategy_delta_buf);
         if self.dcfr.should_floor_regrets() {
             self.floor_regrets();
         }
-        self.last_instantaneous_regret = mr;
+        self.last_instantaneous_regret
+            .clone_from(&self.regret_delta_buf);
     }
 
     /// Apply DCFR discounting to both players' cumulative values.
