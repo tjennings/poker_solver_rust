@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// When provided, the solver hot path increments these with `Relaxed` ordering
 /// so an observer thread can sample throughput and pruning rates without
 /// blocking the solver.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SolverCounters {
     /// Number of `traverse_pair` calls (one per hero/opponent hand pair per iteration).
     pub traversal_count: AtomicU64,

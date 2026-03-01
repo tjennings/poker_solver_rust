@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use dashmap::DashMap;
 
 /// Per-flop convergence state, written from the on_progress callback.
+#[derive(Debug)]
 pub struct FlopTuiState {
     pub exploitability_history: Vec<f64>,
     pub iteration: usize,
@@ -13,6 +14,7 @@ pub struct FlopTuiState {
 ///
 /// Solver threads increment atomic counters in the hot path.
 /// The TUI thread samples them at its refresh interval.
+#[derive(Debug)]
 pub struct TuiMetrics {
     // SPR-level progress (set by outer loop)
     pub current_spr: AtomicU32,

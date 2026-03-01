@@ -31,7 +31,7 @@ pub struct TuiApp {
 
     // Sparkline histories
     traversals_per_sec: Vec<u64>,
-    remaining_pairs: Vec<u64>,
+    total_traversals: Vec<u64>,
     pct_traversals_pruned: Vec<u64>,
     pct_actions_pruned: Vec<u64>,
 
@@ -40,9 +40,6 @@ pub struct TuiApp {
     prev_pruned_traversal_count: u64,
     prev_total_action_slots: u64,
     prev_pruned_action_slots: u64,
-
-    // For "remaining" computation
-    total_expected_traversals: u64,
 
     // Refresh interval for rate calculation
     refresh_secs: f64,
@@ -55,20 +52,15 @@ impl TuiApp {
             counters,
             start_time: Instant::now(),
             traversals_per_sec: Vec::with_capacity(SPARKLINE_HISTORY),
-            remaining_pairs: Vec::with_capacity(SPARKLINE_HISTORY),
+            total_traversals: Vec::with_capacity(SPARKLINE_HISTORY),
             pct_traversals_pruned: Vec::with_capacity(SPARKLINE_HISTORY),
             pct_actions_pruned: Vec::with_capacity(SPARKLINE_HISTORY),
             prev_traversal_count: 0,
             prev_pruned_traversal_count: 0,
             prev_total_action_slots: 0,
             prev_pruned_action_slots: 0,
-            total_expected_traversals: 0,
             refresh_secs,
         }
-    }
-
-    pub fn set_total_expected_traversals(&mut self, total: u64) {
-        self.total_expected_traversals = total;
     }
 
     /// Sample metrics and update sparkline histories.
@@ -91,9 +83,8 @@ impl TuiApp {
         };
         push_bounded(&mut self.traversals_per_sec, tps, SPARKLINE_HISTORY);
 
-        // Remaining pairs
-        let remaining = self.total_expected_traversals.saturating_sub(t);
-        push_bounded(&mut self.remaining_pairs, remaining, SPARKLINE_HISTORY);
+        // Total traversals (cumulative count for this SPR)
+        push_bounded(&mut self.total_traversals, t, SPARKLINE_HISTORY);
 
         // Pruning percentages (0-100)
         let pct_trav = if dt > 0 { (dpt * 100) / dt } else { 0 };
@@ -138,8 +129,8 @@ impl TuiApp {
         self.render_sparkline_row(
             frame,
             chunks[4],
-            "Remaining",
-            &self.remaining_pairs,
+            "Total traversals",
+            &self.total_traversals,
             Color::Yellow,
         );
         self.render_sparkline_row(
@@ -222,14 +213,16 @@ impl TuiApp {
             let name = entry.key();
             let state = entry.value();
             let latest_expl = state.exploitability_history.last().copied().unwrap_or(0.0);
+            // Pre-compute min/max once for this flop's history.
+            let hist = &state.exploitability_history;
+            let (hist_min, hist_max) = hist_min_max(hist);
             // Build mini sparkline from history (last 20 values)
-            let spark_text: String = state
-                .exploitability_history
+            let spark_text: String = hist
                 .iter()
                 .rev()
                 .take(20)
                 .rev()
-                .map(|&v| sparkline_char(v, &state.exploitability_history))
+                .map(|&v| sparkline_char(v, hist_min, hist_max))
                 .collect();
             let line = format!(
                 "{:<8} expl {} {:>8.1} mBB/h  iter {}/{}",
@@ -372,9 +365,13 @@ fn format_count(n: u64) -> String {
     }
 }
 
-fn sparkline_char(value: f64, history: &[f64]) -> char {
-    let max = history.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+fn hist_min_max(history: &[f64]) -> (f64, f64) {
     let min = history.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = history.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    (min, max)
+}
+
+fn sparkline_char(value: f64, min: f64, max: f64) -> char {
     let range = (max - min).max(1e-9);
     let normalized = ((value - min) / range * 7.0) as usize;
     const CHARS: [char; 8] = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
@@ -389,12 +386,7 @@ mod tests {
     use crate::tui_metrics::TuiMetrics;
 
     fn make_counters() -> Arc<SolverCounters> {
-        Arc::new(SolverCounters {
-            traversal_count: Default::default(),
-            pruned_traversal_count: Default::default(),
-            total_action_slots: Default::default(),
-            pruned_action_slots: Default::default(),
-        })
+        Arc::new(SolverCounters::default())
     }
 
     #[test]

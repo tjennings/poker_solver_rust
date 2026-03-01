@@ -7,7 +7,7 @@ mod tui_metrics;
 use std::error::Error;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -330,12 +330,7 @@ fn build_postflop_with_progress(
 
     // Use max_flop_boards as an estimate; 0 means all ~1,755 canonical flops.
     let estimated_flops = if pf_config.max_flop_boards == 0 { 1755 } else { pf_config.max_flop_boards } as u32;
-    let counters = Arc::new(SolverCounters {
-        traversal_count: Default::default(),
-        pruned_traversal_count: Default::default(),
-        total_action_slots: Default::default(),
-        pruned_action_slots: Default::default(),
-    });
+    let counters = Arc::new(SolverCounters::default());
 
     // TUI-mode resources: only allocated when stderr is a TTY.
     let metrics = if use_tui {
@@ -367,10 +362,10 @@ fn build_postflop_with_progress(
             m.start_spr(i as u32, estimated_flops);
         }
         // Reset solver counters for each SPR so TUI shows per-SPR rates.
-        counters.traversal_count.store(0, AtomicOrdering::Relaxed);
-        counters.pruned_traversal_count.store(0, AtomicOrdering::Relaxed);
-        counters.total_action_slots.store(0, AtomicOrdering::Relaxed);
-        counters.pruned_action_slots.store(0, AtomicOrdering::Relaxed);
+        counters.traversal_count.store(0, Ordering::Relaxed);
+        counters.pruned_traversal_count.store(0, Ordering::Relaxed);
+        counters.total_action_slots.store(0, Ordering::Relaxed);
+        counters.pruned_action_slots.store(0, Ordering::Relaxed);
         if !use_tui {
             eprintln!("SPR={spr} ({}/{total_sprs})", i + 1);
         }
@@ -397,10 +392,10 @@ fn build_postflop_with_progress(
                             }
                         }
                         BuildPhase::MccfrFlopsCompleted { completed, total } => {
-                            m.flops_completed.store(*completed as u32, AtomicOrdering::Relaxed);
-                            m.total_flops.store(*total as u32, AtomicOrdering::Relaxed);
+                            m.flops_completed.store(*completed as u32, Ordering::Relaxed);
+                            m.total_flops.store(*total as u32, Ordering::Relaxed);
                         }
-                        _ => {}
+                        BuildPhase::ComputingValues => {}
                     }
                 } else {
                     // Non-TTY fallback: line-based progress to stderr.
@@ -418,7 +413,9 @@ fn build_postflop_with_progress(
                         BuildPhase::MccfrFlopsCompleted { completed, total } => {
                             eprintln!("  SPR={spr}: {completed}/{total} flops completed");
                         }
-                        _ => {}
+                        BuildPhase::ComputingValues => {
+                            eprintln!("  Computing hand average values...");
+                        }
                     }
                 }
             },
@@ -430,7 +427,7 @@ fn build_postflop_with_progress(
 
     // Signal the TUI to exit and wait for it to restore the terminal.
     if let Some(d) = &done {
-        d.store(true, AtomicOrdering::Relaxed);
+        d.store(true, Ordering::Relaxed);
     }
     if let Some(handle) = tui_handle {
         let _ = handle.join();
