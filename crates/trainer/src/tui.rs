@@ -100,44 +100,42 @@ impl TuiApp {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1), // SPR gauge
-                Constraint::Length(1), // Flop gauge
                 Constraint::Length(1), // Traversal progress gauge
                 Constraint::Length(2), // traversals/sec sparkline
                 Constraint::Length(2), // % traversals pruned
                 Constraint::Length(2), // % actions pruned
-                Constraint::Length(1), // section header
+                Constraint::Length(1), // section header (includes flop progress)
                 Constraint::Min(3),   // active flops list
                 Constraint::Length(1), // footer
             ])
             .split(area);
 
         self.render_spr_gauge(frame, chunks[0]);
-        self.render_flop_gauge(frame, chunks[1]);
-        self.render_traversal_gauge(frame, chunks[2]);
+        self.render_traversal_gauge(frame, chunks[1]);
         self.render_sparkline_row(
             frame,
-            chunks[3],
+            chunks[2],
             "Traversals/sec",
             &self.traversals_per_sec,
             Color::Cyan,
         );
         self.render_sparkline_row(
             frame,
-            chunks[4],
+            chunks[3],
             "% Trav pruned",
             &self.pct_traversals_pruned,
             Color::Green,
         );
         self.render_sparkline_row(
             frame,
-            chunks[5],
+            chunks[4],
             "% Actions pruned",
             &self.pct_actions_pruned,
             Color::Green,
         );
-        self.render_active_flops_header(frame, chunks[6]);
-        self.render_active_flops(frame, chunks[7]);
-        self.render_footer(frame, chunks[8]);
+        self.render_active_flops_header(frame, chunks[5]);
+        self.render_active_flops(frame, chunks[6]);
+        self.render_footer(frame, chunks[7]);
     }
 
     fn render_spr_gauge(&self, frame: &mut Frame, area: Rect) {
@@ -153,21 +151,6 @@ impl TuiApp {
             .gauge_style(Style::default().fg(Color::Cyan))
             .ratio(ratio.clamp(0.0, 1.0))
             .label(format!("SPR Progress: {idx}/{total}    {elapsed}"));
-        frame.render_widget(gauge, area);
-    }
-
-    fn render_flop_gauge(&self, frame: &mut Frame, area: Rect) {
-        let done = self.metrics.flops_completed.load(Ordering::Relaxed);
-        let total = self.metrics.total_flops.load(Ordering::Relaxed);
-        let ratio = if total > 0 {
-            done as f64 / total as f64
-        } else {
-            0.0
-        };
-        let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(Color::Green))
-            .ratio(ratio.clamp(0.0, 1.0))
-            .label(format!("Flop Progress: {done}/{total}"));
         frame.render_widget(gauge, area);
     }
 
@@ -209,8 +192,10 @@ impl TuiApp {
     }
 
     fn render_active_flops_header(&self, frame: &mut Frame, area: Rect) {
-        let header =
-            Paragraph::new("── Active Flops ──").style(Style::default().fg(Color::Yellow));
+        let done = self.metrics.flops_completed.load(Ordering::Relaxed);
+        let total = self.metrics.total_flops.load(Ordering::Relaxed);
+        let header = Paragraph::new(format!("── Active Flops ── {done}/{total}"))
+            .style(Style::default().fg(Color::Yellow));
         frame.render_widget(header, area);
     }
 
