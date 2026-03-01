@@ -508,6 +508,7 @@ fn exhaustive_solve_one_flop(
     flop_name: &str,
     dcfr: &DcfrParams,
     use_inner_parallelism: bool,
+    config: &PostflopModelConfig,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> FlopSolveResult {
     let buf_size = layout.total_size;
@@ -549,6 +550,10 @@ fn exhaustive_solve_one_flop(
     for iter in 0..num_iterations {
         snapshot.clone_from(&regret_sum);
 
+        let prune_active = config.prune_warmup > 0
+            && iter >= config.prune_warmup
+            && (config.prune_explore_freq == 0 || iter % config.prune_explore_freq != 0);
+
         let ctx = PostflopCfrCtx {
             tree,
             layout,
@@ -556,7 +561,7 @@ fn exhaustive_solve_one_flop(
             snapshot: &snapshot,
             iteration: iter as u64,
             dcfr,
-            prune_active: false,
+            prune_active,
         };
 
         if let Some(pool) = &serial_pool {
@@ -574,6 +579,18 @@ fn exhaustive_solve_one_flop(
         add_into(&mut strategy_sum, &ds);
         if dcfr.should_floor_regrets() {
             dcfr.floor_regrets(&mut regret_sum);
+        }
+
+        // Clamp negative regrets to prevent unbounded accumulation.
+        // This bounds memory of bad actions so pruned actions can
+        // recover when explored during explore-frequency iterations.
+        if config.regret_floor > 0.0 && config.prune_warmup > 0 {
+            let floor = -config.regret_floor;
+            for v in regret_sum.iter_mut() {
+                if *v < floor {
+                    *v = floor;
+                }
+            }
         }
 
         iterations_used = iter + 1;
@@ -766,6 +783,7 @@ pub(crate) fn build_exhaustive(
                 &flop_name,
                 &dcfr,
                 num_flops == 1,
+                config,
                 on_progress,
             );
 
@@ -936,6 +954,7 @@ mod tests {
             "test",
             &dcfr,
             true,
+            &config,
             &|_| {},
         );
 
@@ -969,6 +988,7 @@ mod tests {
             "test",
             &dcfr,
             true,
+            &config,
             &|_| {},
         );
 
@@ -1149,8 +1169,9 @@ mod tests {
         // iteration reads uniform regrets, so convergence needs one extra iteration
         // compared to in-place updates.
         let dcfr = DcfrParams::linear();
+        let no_prune = PostflopModelConfig::exhaustive_fast();
         let result = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, true, &|_| {},
+            &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, true, &no_prune, &|_| {},
         );
         assert!(
             result.delta < expl_uniform,
@@ -1177,7 +1198,7 @@ mod tests {
 
         // Solve with default thread pool (parallel)
         let result_par = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, true, &|_| {},
+            &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, true, &config, &|_| {},
         );
 
         // Solve with 1 thread (sequential)
@@ -1187,7 +1208,7 @@ mod tests {
             .unwrap();
         let result_seq = pool.install(|| {
             exhaustive_solve_one_flop(
-                &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, true, &|_| {},
+                &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, true, &config, &|_| {},
             )
         });
 
@@ -1210,6 +1231,7 @@ mod tests {
         // Very generous threshold (30 BB/h) -- stops at first exploitability check.
         let threshold_mbb = 30_000.0;
         let dcfr = DcfrParams::linear();
+        let no_prune = PostflopModelConfig::exhaustive_fast();
         let result = exhaustive_solve_one_flop(
             &tree,
             &layout,
@@ -1219,6 +1241,7 @@ mod tests {
             "test",
             &dcfr,
             true,
+            &no_prune,
             &|_| {},
         );
         assert_eq!(
