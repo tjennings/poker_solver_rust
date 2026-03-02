@@ -206,7 +206,12 @@ impl TuiApp {
                 name, spark_text, latest_expl, state.iteration, state.max_iterations,
             ));
             let prune_line = Line::from(Span::styled(
-                format!("  actions pruned: {:.1}%", state.pct_actions_pruned),
+                format!(
+                    "  pruned: {:.1}%  regret +{:.0} / {:.0}",
+                    state.pct_actions_pruned,
+                    state.median_positive_regret,
+                    state.median_negative_regret,
+                ),
                 Style::default().fg(Color::DarkGray),
             ));
             items.push((state.iteration, vec![main_line, prune_line]));
