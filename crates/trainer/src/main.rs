@@ -172,6 +172,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .unwrap()
                     .progress_chars("=>-"),
             );
+            pb.enable_steady_tick(Duration::from_millis(200));
+            eprintln!("Computing equity tables for {total} canonical flops...");
 
             let start = Instant::now();
             let cache = EquityTableCache::build(|completed, _total| {
