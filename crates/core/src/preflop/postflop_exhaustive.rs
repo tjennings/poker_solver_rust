@@ -657,6 +657,8 @@ fn exhaustive_solve_one_flop(
     let flop_name_owned = flop_name.to_string();
 
     for iter in 0..num_iterations {
+        let iteration = iter as u64 + 1; // 1-indexed to match LCFR convention
+
         // Snapshot global counters before traversal so we can attribute
         // the delta to this flop.
         let prev_ta = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
@@ -675,7 +677,7 @@ fn exhaustive_solve_one_flop(
                 layout,
                 equity_table,
                 snapshot: &regret_sum,
-                iteration: iter as u64,
+                iteration,
                 dcfr,
                 prune_active,
                 prune_regret_threshold: config.prune_regret_threshold,
@@ -692,9 +694,9 @@ fn exhaustive_solve_one_flop(
         flop_pruned_action_slots += cur_pa.saturating_sub(prev_pa);
 
         // Apply DCFR discounting before merging deltas.
-        if dcfr.should_discount(iter as u64) {
-            dcfr.discount_regrets(&mut regret_sum, iter as u64);
-            dcfr.discount_strategy_sums(&mut strategy_sum, iter as u64);
+        if dcfr.should_discount(iteration) {
+            dcfr.discount_regrets(&mut regret_sum, iteration);
+            dcfr.discount_strategy_sums(&mut strategy_sum, iteration);
         }
         // Merge pool partition deltas directly into accumulators.
         for (pdr, pds) in pool.iter() {

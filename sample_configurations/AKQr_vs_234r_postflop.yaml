@@ -4,12 +4,13 @@ postflop_model:
   #max_flop_boards: 300
   fixed_flops: [ 'AhKsQd', '2c3h4d']
   #fixed_flops: ['KhKdTs', 'Kh8s7s', '9s8s5h', 'AsQs9h', 'KsTsTh', 'Js5h4d', '9s6s2s', 'AsQhQd', '6s4h2d', '8s6h2d', 'Ts8h3s', 'As6s5s', 'AsAhKs', '7s5h2s', 'QhJs8s', 'Ks9h3d', 'As7h3d', 'Ah5s4s', 'Js9h6s', 'QsTs2h', '9s7h4d', '8h4s3s', 'Qs7h5d', 'JhTs6s', 'Js4h3s']
-  postflop_sprs: [2, 6, 20]
+  postflop_sprs: [1, 2, 3.5, 6]
   bet_sizes: [0.5, 1.0, 2.0]
   max_raises_per_street: 3
-  postflop_solve_iterations: 1000
+  postflop_solve_iterations: 30
   cfr_convergence_threshold: 50  # mBB/h for exhaustive mode
+  cfr_variant: dcfr
   ev_convergence_threshold: 0.5
-  prune_warmup: 2
-  prune_explore_freq: 20
-  prune_regret_threshold: -10
+  # prune_warmup: 0
+  # prune_explore_freq: 0
+  # prune_regret_threshold: 0

@@ -24,7 +24,7 @@ fn default_cfr_convergence_threshold() -> f64 {
 }
 
 fn default_cfr_variant() -> CfrVariant {
-    CfrVariant::Linear
+    CfrVariant::Dcfr
 }
 
 fn default_solve_type() -> PostflopSolveType {
