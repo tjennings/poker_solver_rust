@@ -130,6 +130,13 @@ impl TuiApp {
                 let elapsed = format_duration(self.metrics.phase_elapsed_secs());
                 (format!("Computing Values  {elapsed}"), 2.0 / 3.0)
             }
+            4 => {
+                let done = self.metrics.equity_tables_completed.load(Ordering::Relaxed);
+                let total = self.metrics.equity_tables_total.load(Ordering::Relaxed);
+                let elapsed = format_duration(self.metrics.phase_elapsed_secs());
+                let ratio = if total > 0 { done as f64 / total as f64 } else { 0.0 };
+                (format!("Computing Equity Tables  {done}/{total}  {elapsed}"), ratio)
+            }
             _ => ("Done".to_string(), 1.0),
         };
         let gauge = Gauge::default()

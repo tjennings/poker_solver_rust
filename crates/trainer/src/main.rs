@@ -7,7 +7,7 @@ mod tui_metrics;
 use std::error::Error;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -370,17 +370,33 @@ fn build_postflop_with_progress(
     // this avoids redundant O(169^2 * runouts) work per extra SPR.
     let equity_tables: Vec<Vec<f64>> =
         if pf_config.solve_type == PostflopSolveType::Exhaustive && sprs.len() > 1 {
-            eprintln!(
-                "Pre-computing equity tables for {} flops...",
-                flops.len()
-            );
-            flops
+            if let Some(m) = &metrics {
+                m.equity_tables_total.store(flops.len() as u32, Ordering::Relaxed);
+                m.set_phase(4); // equity table pre-computation phase
+            }
+            if !use_tui {
+                eprintln!(
+                    "Pre-computing equity tables for {} flops...",
+                    flops.len()
+                );
+            }
+            let eq_completed = AtomicU32::new(0);
+            let tables: Vec<Vec<f64>> = flops
                 .par_iter()
                 .map(|flop| {
                     let combo_map = build_combo_map(flop);
-                    compute_equity_table(&combo_map, *flop)
+                    let table = compute_equity_table(&combo_map, *flop);
+                    let done = eq_completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(m) = &metrics {
+                        m.equity_tables_completed.store(done, Ordering::Relaxed);
+                    }
+                    table
                 })
-                .collect()
+                .collect();
+            if let Some(m) = &metrics {
+                m.set_phase(0); // back to idle before SPR loop
+            }
+            tables
         } else {
             vec![]
         };

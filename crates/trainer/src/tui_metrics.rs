@@ -25,10 +25,15 @@ pub struct TuiMetrics {
     pub flops_completed: AtomicU32,
     pub total_flops: AtomicU32,
 
-    // Current SPR phase: 0=idle, 1=BuildingTree, 2=SolvingFlops, 3=ComputingValues
+    // Current SPR phase: 0=idle, 1=BuildingTree, 2=SolvingFlops, 3=ComputingValues,
+    // 4=ComputingEquityTables (pre-SPR)
     pub spr_phase: AtomicU32,
     /// Milliseconds since Unix epoch when the current phase started.
     pub phase_start_ms: AtomicU64,
+
+    /// Equity table pre-computation progress (pre-SPR phase).
+    pub equity_tables_completed: AtomicU32,
+    pub equity_tables_total: AtomicU32,
 
     // Per-flop exploitability (written from on_progress callback)
     pub flop_states: DashMap<String, FlopTuiState>,
@@ -43,6 +48,8 @@ impl TuiMetrics {
             total_flops: AtomicU32::new(total_flops),
             spr_phase: AtomicU32::new(0),
             phase_start_ms: AtomicU64::new(0),
+            equity_tables_completed: AtomicU32::new(0),
+            equity_tables_total: AtomicU32::new(0),
             flop_states: DashMap::new(),
         }
     }
