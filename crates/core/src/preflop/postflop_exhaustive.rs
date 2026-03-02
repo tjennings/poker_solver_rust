@@ -590,6 +590,34 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
     }
 }
 
+/// Compute median of positive and negative values in a regret buffer.
+/// Returns `(median_positive, median_negative)`. If no values exist for
+/// a sign, returns 0.0.
+fn median_regrets(regret_sum: &[f64]) -> (f64, f64) {
+    let mut positives: Vec<f64> = Vec::new();
+    let mut negatives: Vec<f64> = Vec::new();
+    for &v in regret_sum {
+        if v > 0.0 {
+            positives.push(v);
+        } else if v < 0.0 {
+            negatives.push(v);
+        }
+    }
+    let med_pos = if positives.is_empty() {
+        0.0
+    } else {
+        positives.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        positives[positives.len() / 2]
+    };
+    let med_neg = if negatives.is_empty() {
+        0.0
+    } else {
+        negatives.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        negatives[negatives.len() / 2]
+    };
+    (med_pos, med_neg)
+}
+
 /// Solve a single flop using exhaustive CFR with configurable iteration weighting.
 ///
 /// Inner `parallel_traverse_pooled` and `compute_exploitability` use rayon's
@@ -613,6 +641,8 @@ fn exhaustive_solve_one_flop(
     let mut regret_sum = vec![0.0f64; buf_size];
     let mut strategy_sum = vec![0.0f64; buf_size];
     let mut current_exploitability = f64::INFINITY;
+    let mut current_med_pos = 0.0f64;
+    let mut current_med_neg = 0.0f64;
     let mut iterations_used = 0;
     let n = NUM_CANONICAL_HANDS;
 
@@ -701,6 +731,14 @@ fn exhaustive_solve_one_flop(
         }
 
         iterations_used = iter + 1;
+
+        // Compute median regrets periodically (every 10 iters + final).
+        if iter % 10 == 0 || iter == num_iterations - 1 {
+            let (mp, mn) = median_regrets(&regret_sum);
+            current_med_pos = mp;
+            current_med_neg = mn;
+        }
+
         if iter >= 1 && (iter % 2 == 1 || iter == num_iterations - 1) {
             current_exploitability =
                 compute_exploitability(tree, layout, &strategy_sum, equity_table);
@@ -715,8 +753,8 @@ fn exhaustive_solve_one_flop(
                 metric_label: "mBB/h".into(),
                 total_action_slots: flop_total_action_slots,
                 pruned_action_slots: flop_pruned_action_slots,
-                median_positive_regret: 0.0,
-                median_negative_regret: 0.0,
+                median_positive_regret: current_med_pos,
+                median_negative_regret: current_med_neg,
             },
         });
 
