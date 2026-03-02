@@ -71,6 +71,17 @@ cd crates/tauri-app && cargo tauri dev
 
 Click **Load Strategy Bundle** and select the `quickstart_strategy/` directory. The 13x13 hand matrix shows action probabilities for every starting hand — click actions to walk the game tree, enter board cards for postflop play.
 
+## Testing
+
+```bash
+cargo test --workspace --release    # full suite (~600 tests, ~5s in release)
+cargo test -p poker-solver-core     # core crate only
+cargo test -p poker-solver-trainer  # trainer crate only
+cargo clippy --workspace            # lint
+```
+
+All tests use `#[timed_test]` with automatic timeout enforcement (default 1s, longer for compute-heavy tests). Tests printing `[timer] ... exceeded` are genuinely slow, not flaky — run with `--release` to fix.
+
 ## Project Structure
 
 ```
