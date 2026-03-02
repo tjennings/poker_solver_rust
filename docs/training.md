@@ -97,6 +97,22 @@ cargo run -p poker-solver-trainer --release -- flops --format json --output flop
 cargo run -p poker-solver-trainer --release -- flops --format csv
 ```
 
+### precompute-equity
+
+Precompute all 1,755 canonical flop equity tables and save to disk. This
+eliminates the expensive per-flop equity computation during postflop solves.
+
+```bash
+cargo run -p poker-solver-trainer --release -- precompute-equity [-o cache/equity_tables.bin]
+```
+
+The `solve-postflop` command auto-detects the cache at `cache/equity_tables.bin`
+and loads it if present. No additional flags needed.
+
+**Recommended workflow:**
+1. Run `precompute-equity` once (takes several minutes)
+2. Run `solve-postflop` as many times as needed — equity tables load instantly from cache
+
 ---
 
 ## Preflop Config (solve-preflop)
