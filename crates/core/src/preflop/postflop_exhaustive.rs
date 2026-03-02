@@ -186,6 +186,7 @@ fn exhaustive_cfr_traverse(
     dcfr: &DcfrParams,
     prune_active: bool,
     prune_explore_pct: f64,
+    prune_regret_threshold: f64,
     counters: Option<&SolverCounters>,
 ) -> f64 {
     let n = NUM_CANONICAL_HANDS;
@@ -222,6 +223,7 @@ fn exhaustive_cfr_traverse(
                 dcfr,
                 prune_active,
                 prune_explore_pct,
+                prune_regret_threshold,
                 counters,
             )
         }
@@ -250,7 +252,7 @@ fn exhaustive_cfr_traverse(
                     for i in 0..num_actions {
                         if snapshot[start + i] > 0.0 {
                             has_positive = true;
-                        } else if snapshot[start + i] < 0.0 {
+                        } else if snapshot[start + i] < prune_regret_threshold {
                             // Roll per-action: explore with probability prune_explore_pct
                             if fastrand::f64() >= prune_explore_pct {
                                 neg_mask |= 1 << i;
@@ -290,6 +292,7 @@ fn exhaustive_cfr_traverse(
                         dcfr,
                         prune_active,
                         prune_explore_pct,
+                        prune_regret_threshold,
                         counters,
                     );
                 }
@@ -330,6 +333,7 @@ fn exhaustive_cfr_traverse(
                                 dcfr,
                                 prune_active,
                                 prune_explore_pct,
+                                prune_regret_threshold,
                                 counters,
                             )
                     })
@@ -539,6 +543,8 @@ struct PostflopCfrCtx<'a> {
     prune_active: bool,
     /// Per-action probability of exploring a negative-regret action.
     prune_explore_pct: f64,
+    /// Cumulative regret below this threshold triggers pruning candidacy.
+    prune_regret_threshold: f64,
     counters: Option<&'a SolverCounters>,
 }
 
@@ -577,6 +583,7 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
                 self.dcfr,
                 self.prune_active,
                 self.prune_explore_pct,
+                self.prune_regret_threshold,
                 self.counters,
             );
         }
@@ -656,6 +663,7 @@ fn exhaustive_solve_one_flop(
                 dcfr,
                 prune_active,
                 prune_explore_pct: config.prune_explore_pct,
+                prune_regret_threshold: config.prune_regret_threshold,
                 counters,
             };
 
@@ -1211,6 +1219,7 @@ mod tests {
                 &dcfr,
                 false,
                 0.0,
+                0.0,
                 None,
             );
 
@@ -1283,6 +1292,7 @@ mod tests {
                 0,
                 &dcfr,
                 false,
+                0.0,
                 0.0,
                 None,
             );
