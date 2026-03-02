@@ -127,15 +127,16 @@ impl TuiMetrics {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test(10)]
     fn tui_metrics_init() {
         let m = TuiMetrics::new(7, 200);
         assert_eq!(m.total_sprs.load(Ordering::Relaxed), 7);
         assert_eq!(m.total_flops.load(Ordering::Relaxed), 200);
     }
 
-    #[test]
+    #[timed_test(10)]
     fn flop_state_lifecycle() {
         let m = TuiMetrics::new(1, 10);
         m.update_flop("AhKs2d", 0, 50, 120.5, 0.0, 0.0, 0.0);
@@ -149,7 +150,7 @@ mod tests {
         assert!(m.flop_states.get("AhKs2d").is_none());
     }
 
-    #[test]
+    #[timed_test(10)]
     fn start_spr_resets_counters() {
         let m = TuiMetrics::new(3, 100);
         m.flops_completed.store(50, Ordering::Relaxed);

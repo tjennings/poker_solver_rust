@@ -185,8 +185,9 @@ impl EquityTableCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_macros::timed_test;
 
-    #[test]
+    #[timed_test(10)]
     fn card_round_trip() {
         use rs_poker::core::{Suit, Value};
         let card = Card {
@@ -198,7 +199,7 @@ mod tests {
         assert_eq!(card, decoded);
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore] // compute_equity_table is expensive (~seconds per flop)
     fn save_load_round_trip() {
         // Build a tiny cache with just 1 flop to test serialization
@@ -231,7 +232,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore] // compute_equity_table is expensive (~seconds per flop)
     fn extract_tables_finds_cached_flop() {
         let flops = canonical_flops();
@@ -252,7 +253,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test(10)]
     fn extract_tables_returns_none_for_missing_flop() {
         let flops = canonical_flops();
         let cache = EquityTableCache {
@@ -263,14 +264,14 @@ mod tests {
         assert!(cache.extract_tables(&[flops[1]]).is_none());
     }
 
-    #[test]
+    #[timed_test(10)]
     fn load_returns_none_for_missing_file() {
         assert!(
             EquityTableCache::load(Path::new("/tmp/nonexistent_equity_cache_xyz.bin")).is_none()
         );
     }
 
-    #[test]
+    #[timed_test(10)]
     fn load_returns_none_for_bad_magic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad_magic.bin");
@@ -286,7 +287,7 @@ mod tests {
         assert!(EquityTableCache::load(&path).is_none());
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore] // compute_equity_table is expensive (~seconds per flop)
     fn build_small_save_load_extract() {
         let flops = canonical_flops();

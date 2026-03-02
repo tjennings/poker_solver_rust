@@ -473,6 +473,7 @@ mod tests {
     use rand::SeedableRng;
     use rand::prelude::SliceRandom;
     use rand::rngs::StdRng;
+    use test_macros::timed_test;
 
     /// Create hole cards for a given matrix cell.
     fn make_hole_cards(row: usize, col: usize) -> [Card; 2] {
@@ -526,21 +527,21 @@ mod tests {
     // 1. Hand label correctness
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[timed_test(10)]
     fn hand_label_pairs() {
         assert_eq!(hand_label(0, 0), "AA");
         assert_eq!(hand_label(1, 1), "KK");
         assert_eq!(hand_label(12, 12), "22");
     }
 
-    #[test]
+    #[timed_test(10)]
     fn hand_label_suited() {
         // Upper triangle: row < col
         assert_eq!(hand_label(0, 1), "AKs");
         assert_eq!(hand_label(0, 12), "A2s");
     }
 
-    #[test]
+    #[timed_test(10)]
     fn hand_label_offsuit() {
         // Lower triangle: row > col
         assert_eq!(hand_label(1, 0), "KAo");
@@ -551,7 +552,7 @@ mod tests {
     // 2. Classify action probabilities
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[timed_test(10)]
     fn classify_fold_call_raise() {
         let actions = [Action::Fold, Action::Call, Action::Raise(0)];
         let probs = [0.2f32, 0.3, 0.5];
@@ -561,7 +562,7 @@ mod tests {
         assert!((r - 0.5).abs() < 1e-6);
     }
 
-    #[test]
+    #[timed_test(10)]
     fn classify_check_bet() {
         let actions = [Action::Check, Action::Bet(0)];
         let probs = [0.7f32, 0.3];
@@ -571,7 +572,7 @@ mod tests {
         assert!((r - 0.3).abs() < 1e-6);
     }
 
-    #[test]
+    #[timed_test(10)]
     fn classify_handles_empty_probs() {
         let actions = [Action::Fold, Action::Call];
         let probs: &[f32] = &[];
@@ -585,7 +586,7 @@ mod tests {
     // 3. Render bar
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[timed_test(10)]
     fn render_bar_all_raise() {
         let s = HandStrategy {
             fold: 0.0,
@@ -599,7 +600,7 @@ mod tests {
         assert!(!bar.contains(GREEN));
     }
 
-    #[test]
+    #[timed_test(10)]
     fn render_bar_all_fold() {
         let s = HandStrategy {
             fold: 1.0,
@@ -610,7 +611,7 @@ mod tests {
         assert!(bar.contains(GRAY));
     }
 
-    #[test]
+    #[timed_test(10)]
     fn render_bar_multiple_raises() {
         let s = HandStrategy {
             fold: 0.0,
@@ -629,7 +630,7 @@ mod tests {
     // 4. Build remaining deck excludes hole cards
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[timed_test(10)]
     fn remaining_deck_has_50_cards() {
         let hole = [
             Card::new(Value::Ace, Suit::Spade),
@@ -645,7 +646,7 @@ mod tests {
     // 5. Sample board returns 5 unique cards
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[timed_test(10)]
     fn sample_board_returns_five_cards() {
         let hole = [
             Card::new(Value::Ace, Suit::Spade),
@@ -664,7 +665,7 @@ mod tests {
     // 6. Rank ordering is correct
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[timed_test(10)]
     fn rank_order_starts_with_ace() {
         assert_eq!(RANK_ORDER[0], Value::Ace);
         assert_eq!(RANK_ORDER[12], Value::Two);
@@ -674,20 +675,20 @@ mod tests {
     // 7. Make hole cards
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[timed_test(10)]
     fn make_hole_cards_suited() {
         let cards = make_hole_cards(0, 1); // AKs
         assert_eq!(cards[0].suit, Suit::Spade);
         assert_eq!(cards[1].suit, Suit::Spade);
     }
 
-    #[test]
+    #[timed_test(10)]
     fn make_hole_cards_offsuit() {
         let cards = make_hole_cards(1, 0); // KAo
         assert_ne!(cards[0].suit, cards[1].suit);
     }
 
-    #[test]
+    #[timed_test(10)]
     fn make_hole_cards_pair() {
         let cards = make_hole_cards(0, 0); // AA
         assert_ne!(cards[0].suit, cards[1].suit);
@@ -698,25 +699,25 @@ mod tests {
     // 8. Canonical hand index
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[timed_test(10)]
     fn canonical_index_pairs() {
         assert_eq!(canonical_hand_index(0, 0), CH::parse("AA").unwrap().index());
         assert_eq!(canonical_hand_index(12, 12), CH::parse("22").unwrap().index());
     }
 
-    #[test]
+    #[timed_test(10)]
     fn canonical_index_suited() {
         assert_eq!(canonical_hand_index(0, 1), CH::parse("AKs").unwrap().index());
         assert_eq!(canonical_hand_index(11, 12), CH::parse("32s").unwrap().index());
     }
 
-    #[test]
+    #[timed_test(10)]
     fn canonical_index_offsuit() {
         assert_eq!(canonical_hand_index(1, 0), CH::parse("AKo").unwrap().index());
         assert_eq!(canonical_hand_index(12, 11), CH::parse("32o").unwrap().index());
     }
 
-    #[test]
+    #[timed_test(10)]
     fn canonical_index_covers_169() {
         let mut seen = std::collections::HashSet::new();
         for row in 0..13 {
@@ -733,7 +734,7 @@ mod tests {
     // 9. Classify preflop action probs
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[timed_test(10)]
     fn classify_preflop_fold_call_raise() {
         let actions = [
             PreflopAction::Fold,
@@ -747,7 +748,7 @@ mod tests {
         assert!((s.raises[0] - 0.5).abs() < 1e-6);
     }
 
-    #[test]
+    #[timed_test(10)]
     fn classify_preflop_all_in_counts_as_raise() {
         let actions = [PreflopAction::Fold, PreflopAction::Call, PreflopAction::AllIn];
         let probs = [0.1, 0.2, 0.7];
@@ -756,7 +757,7 @@ mod tests {
         assert!((s.raises[0] - 0.7).abs() < 1e-6);
     }
 
-    #[test]
+    #[timed_test(10)]
     fn classify_preflop_multiple_raises() {
         let actions = [
             PreflopAction::Fold,
@@ -778,7 +779,7 @@ mod tests {
     // 10. find_raise_child
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[timed_test(10)]
     fn find_raise_child_in_hu_tree() {
         use poker_solver_core::preflop::PreflopConfig;
         let config = PreflopConfig::heads_up(25);
@@ -798,7 +799,7 @@ mod tests {
     // 11. preflop_strategy_matrix
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[timed_test(10)]
     fn preflop_strategy_matrix_returns_169_cells() {
         use poker_solver_core::preflop::{PreflopConfig, PreflopSolver};
         let mut config = PreflopConfig::heads_up(10);

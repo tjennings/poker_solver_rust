@@ -376,12 +376,13 @@ fn sparkline_char(value: f64, min: f64, max: f64) -> char {
 mod tests {
     use super::*;
     use crate::tui_metrics::TuiMetrics;
+    use test_macros::timed_test;
 
     fn make_counters() -> Arc<SolverCounters> {
         Arc::new(SolverCounters::default())
     }
 
-    #[test]
+    #[timed_test(10)]
     fn tui_app_renders_without_panic() {
         let metrics = Arc::new(TuiMetrics::new(3, 200));
         let counters = make_counters();
@@ -393,7 +394,7 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
     }
 
-    #[test]
+    #[timed_test(10)]
     fn tick_computes_deltas() {
         let metrics = Arc::new(TuiMetrics::new(1, 10));
         let counters = make_counters();
@@ -408,7 +409,7 @@ mod tests {
         assert_eq!(app.traversals_per_sec.last(), Some(&300));
     }
 
-    #[test]
+    #[timed_test(10)]
     fn push_bounded_caps_at_max() {
         let mut buf = Vec::new();
         for i in 0..100 {
@@ -419,14 +420,14 @@ mod tests {
         assert_eq!(*buf.last().unwrap(), 99);
     }
 
-    #[test]
+    #[timed_test(10)]
     fn format_count_scales() {
         assert_eq!(format_count(500), "500");
         assert_eq!(format_count(1_500), "1.5K");
         assert_eq!(format_count(2_500_000), "2.5M");
     }
 
-    #[test]
+    #[timed_test(10)]
     fn format_duration_works() {
         assert_eq!(format_duration(0.0), "00:00:00");
         assert_eq!(format_duration(3661.0), "01:01:01");

@@ -5,8 +5,9 @@
 //! strategies sum to 1.0 and the solver produces entries for every hand.
 
 use poker_solver_core::preflop::{PreflopConfig, PreflopSolver, RaiseSize};
+use test_macros::timed_test;
 
-#[test]
+#[timed_test(10)]
 fn hu_preflop_converges_in_500_iterations() {
     // Use a small stack depth and restricted raise sizes for a compact tree.
     let mut config = PreflopConfig::heads_up(10);
@@ -53,7 +54,7 @@ fn hu_preflop_converges_in_500_iterations() {
     }
 }
 
-#[test]
+#[timed_test(10)]
 fn solver_iteration_count_tracks_correctly() {
     let mut config = PreflopConfig::heads_up(5);
     config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
@@ -85,7 +86,7 @@ fn solver_iteration_count_tracks_correctly() {
 /// 4. Raise ordering: KK raises more than off-suit rags
 ///
 /// Run with: `cargo test -p poker-solver-core --release --test preflop_convergence -- --ignored --nocapture`
-#[test]
+#[timed_test(10)]
 #[ignore]
 fn solver_matches_gto_reference_25bb() {
     use poker_solver_core::hands::CanonicalHand;

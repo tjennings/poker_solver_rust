@@ -11,6 +11,7 @@ use poker_solver_core::blueprint::{
 };
 use poker_solver_core::poker::{Card, Suit, Value};
 use poker_solver_core::preflop::{PreflopConfig, PreflopSolver, PreflopStrategy};
+use test_macros::timed_test;
 
 // -----------------------------------------------------------------------
 // Helpers
@@ -64,7 +65,7 @@ const SUBGAME_ITERATIONS: u32 = 200;
 // Step 1 & 2: Preflop
 // -----------------------------------------------------------------------
 
-#[test]
+#[timed_test(10)]
 fn step1_preflop_solver_produces_valid_strategy() {
     let config = PreflopConfig::heads_up(20);
     let mut solver = PreflopSolver::new(&config);
@@ -104,7 +105,7 @@ fn step1_preflop_solver_produces_valid_strategy() {
 // Step 3 & 4: Subgame
 // -----------------------------------------------------------------------
 
-#[test]
+#[timed_test(10)]
 fn step3_subgame_solver_produces_valid_strategy() {
     let board = river_board();
 
@@ -159,7 +160,7 @@ fn step3_subgame_solver_produces_valid_strategy() {
     }
 }
 
-#[test]
+#[timed_test(10)]
 fn step3_subgame_full_enumeration_creates_correct_combo_count() {
     let board = river_board();
     let hands = SubgameHands::enumerate(&board);
@@ -175,7 +176,7 @@ fn step3_subgame_full_enumeration_creates_correct_combo_count() {
 // Step 5: Blueprint strategy (structural test, no training needed)
 // -----------------------------------------------------------------------
 
-#[test]
+#[timed_test(10)]
 fn step5_blueprint_strategy_stores_and_retrieves() {
     let mut blueprint = BlueprintStrategy::new();
     assert!(blueprint.is_empty());
@@ -200,7 +201,7 @@ fn step5_blueprint_strategy_stores_and_retrieves() {
 // Full end-to-end: preflop + subgame in one test
 // -----------------------------------------------------------------------
 
-#[test]
+#[timed_test(10)]
 fn full_pipeline_preflop_then_subgame() {
     // -- Preflop phase --
     let config = PreflopConfig::heads_up(20);

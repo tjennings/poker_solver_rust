@@ -856,7 +856,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore = "slow: full MCCFR postflop pipeline via config dispatch"]
     fn build_mccfr_via_config_produces_values() {
         let config = PostflopModelConfig {
@@ -896,7 +896,7 @@ mod tests {
         assert!((abs.tree.spr - 6.0).abs() < 1e-9, "tree spr should be 6.0");
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore = "slow: full exhaustive postflop solve at explicit SPR"]
     fn build_for_spr_solves_at_explicit_spr() {
         let config = PostflopModelConfig {

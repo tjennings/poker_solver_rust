@@ -970,7 +970,7 @@ mod tests {
         assert!(got_deal, "should produce at least one valid deal");
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore = "slow: full MCCFR pipeline for single flop"]
     fn build_mccfr_single_flop() {
         let config = test_config();

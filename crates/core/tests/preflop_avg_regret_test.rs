@@ -1,6 +1,7 @@
 use poker_solver_core::preflop::{CfrVariant, PreflopConfig, PreflopSolver, RaiseSize};
+use test_macros::timed_test;
 
-#[test]
+#[timed_test(10)]
 fn preflop_avg_positive_regret_positive_after_training() {
     let mut config = PreflopConfig::heads_up(10);
     config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
@@ -14,7 +15,7 @@ fn preflop_avg_positive_regret_positive_after_training() {
     assert!(apr.is_finite(), "avg positive regret should be finite, got {apr}");
 }
 
-#[test]
+#[timed_test(10)]
 fn preflop_avg_positive_regret_zero_before_training() {
     let config = PreflopConfig::heads_up(10);
     let solver = PreflopSolver::new(&config);
@@ -23,7 +24,7 @@ fn preflop_avg_positive_regret_zero_before_training() {
 
 /// Vanilla CFR: avg_positive_regret decreases over training (O(1/sqrt(T)) convergence).
 /// Also verifies the metric history is plottable (finite, positive values).
-#[test]
+#[timed_test(10)]
 fn vanilla_avg_positive_regret_decreases_over_training() {
     let mut config = PreflopConfig::heads_up(10);
     config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
@@ -71,7 +72,7 @@ fn vanilla_avg_positive_regret_decreases_over_training() {
 
 /// CFR+: avg_positive_regret decreases over training. Since regrets are always ≥ 0,
 /// the cumulative metric converges smoothly like Vanilla CFR.
-#[test]
+#[timed_test(10)]
 fn cfrplus_avg_positive_regret_decreases_over_training() {
     let mut config = PreflopConfig::heads_up(10);
     config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
@@ -111,7 +112,7 @@ fn cfrplus_avg_positive_regret_decreases_over_training() {
 /// on this small tree — the metric is inherently noisy under asymmetric discounting.
 ///
 /// Run with: `cargo test -p poker-solver-core --release --test preflop_avg_regret_test -- --ignored`
-#[test]
+#[timed_test(10)]
 #[ignore]
 fn dcfr_avg_positive_regret_decreases_over_training() {
     let mut config = PreflopConfig::heads_up(10);

@@ -1054,7 +1054,7 @@ mod tests {
         assert_eq!(seen.count_ones(), 52);
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore = "slow: full 169x169 equity table computation"]
     fn equity_table_has_correct_size() {
         let flop = test_flop();
@@ -1063,7 +1063,7 @@ mod tests {
         assert_eq!(eq.len(), 169 * 169);
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore = "slow: full 169x169 equity table computation"]
     fn equity_table_diagonal_pairs_are_half() {
         // Same hand vs same hand should have ~0.5 equity (ties)
@@ -1083,7 +1083,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore = "slow: full 169x169 equity table computation"]
     fn equity_table_symmetric() {
         let flop = test_flop();
@@ -1124,7 +1124,7 @@ mod tests {
         assert!(table[168 * n + 0] > 0.5);
     }
 
-    #[test]
+    #[timed_test(10)]
     fn exhaustive_solve_produces_strategy() {
         let config = PostflopModelConfig {
             bet_sizes: vec![1.0],
@@ -1158,7 +1158,7 @@ mod tests {
         assert!(has_nonzero, "strategy_sum should have non-zero entries");
     }
 
-    #[test]
+    #[timed_test(10)]
     fn exhaustive_extract_values_dimensions() {
         let config = PostflopModelConfig {
             bet_sizes: vec![1.0],
@@ -1346,7 +1346,7 @@ mod tests {
         (tree, layout, equity_table)
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore = "slow: O(169²) best-response in debug mode"]
     fn exploitability_is_positive_for_uniform_strategy() {
         let (tree, layout, equity_table) = expl_test_fixtures();
@@ -1359,7 +1359,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore = "slow: O(169²) best-response in debug mode"]
     fn exploitability_decreases_with_training() {
         let (tree, layout, equity_table) = expl_test_fixtures();
@@ -1382,7 +1382,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore = "slow: sequential + parallel solve comparison in debug mode"]
     fn parallel_solve_matches_sequential_result() {
         let config = PostflopModelConfig {
@@ -1427,7 +1427,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore = "slow: O(169²) best-response in debug mode"]
     fn exploitability_early_stopping_triggers() {
         let (tree, layout, equity_table) = expl_test_fixtures();
@@ -1459,7 +1459,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[timed_test(10)]
     fn exhaustive_solve_with_pruning_produces_strategy() {
         let config = PostflopModelConfig {
             bet_sizes: vec![1.0],
@@ -1495,7 +1495,7 @@ mod tests {
         assert!(has_nonzero, "strategy_sum should have non-zero entries with pruning enabled");
     }
 
-    #[test]
+    #[timed_test(10)]
     fn pruning_does_not_break_convergence() {
         let base = PostflopModelConfig {
             bet_sizes: vec![1.0],
@@ -1535,7 +1535,7 @@ mod tests {
         assert!(pruned_nonzero, "pruned should have non-zero strategy");
     }
 
-    #[test]
+    #[timed_test(10)]
     fn solver_counters_are_incremented() {
         let config = PostflopModelConfig {
             bet_sizes: vec![1.0],

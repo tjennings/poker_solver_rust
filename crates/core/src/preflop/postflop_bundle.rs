@@ -295,7 +295,7 @@ mod tests {
         assert!(!loaded.data.hand_avg_values.is_empty());
     }
 
-    #[timed_test]
+    #[timed_test(5)]
     fn postflop_bundle_files_on_disk() {
         let bundle = minimal_bundle();
         let dir = TempDir::new().unwrap();
@@ -345,7 +345,7 @@ mod tests {
         assert!(!loaded.is_empty());
     }
 
-    #[timed_test]
+    #[timed_test(5)]
     fn multi_spr_bundle_roundtrip() {
         let config = PostflopModelConfig::fast();
         let values1 = PostflopValues::from_raw(vec![0.2; 8], 1, 1);

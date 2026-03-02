@@ -160,7 +160,7 @@ mod tests {
     use crate::hands::CanonicalHand as CH;
     use test_macros::timed_test;
 
-    #[test]
+    #[timed_test(10)]
     #[ignore] // ~60s in debug mode (14,196 MC equity computations)
     fn computed_table_has_real_equities() {
         let table = EquityTable::new_computed(500, |_| {});
@@ -170,7 +170,7 @@ mod tests {
         assert!(eq > 0.80, "AA vs 72o equity should be > 0.80, got {eq}");
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore] // ~25s in debug mode
     fn computed_equities_are_symmetric() {
         let table = EquityTable::new_computed(200, |_| {});
@@ -185,7 +185,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[timed_test(10)]
     #[ignore] // ~25s in debug mode
     fn computed_table_self_matchup_is_half() {
         let table = EquityTable::new_computed(200, |_| {});

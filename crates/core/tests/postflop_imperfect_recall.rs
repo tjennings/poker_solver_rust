@@ -13,7 +13,9 @@ use poker_solver_core::preflop::postflop_model::PostflopModelConfig;
 /// canonical boards -> combo maps -> per-flop MCCFR solve -> value table extraction.
 ///
 /// Run with: `cargo test -p poker-solver-core --test postflop_imperfect_recall --release -- --ignored --nocapture`
-#[test]
+use test_macros::timed_test;
+
+#[timed_test(10)]
 #[ignore = "slow (~5 min in release): full postflop abstraction pipeline"]
 fn postflop_abstraction_with_169_hands_builds_and_solves() {
     // Minimal config: single SPR, 50 CFR iterations.
