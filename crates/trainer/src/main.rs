@@ -22,6 +22,7 @@ use poker_solver_core::preflop::{
 use poker_solver_core::preflop::postflop_abstraction::{BuildPhase, FlopStage, PostflopAbstraction};
 use poker_solver_core::preflop::postflop_hands::{build_combo_map, parse_flops, sample_canonical_flops};
 use poker_solver_core::preflop::postflop_exhaustive::compute_equity_table;
+use poker_solver_core::preflop::equity_table_cache::EquityTableCache;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +97,14 @@ enum Commands {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Precompute equity tables for all 1,755 canonical flops and save to disk.
+    /// These tables are auto-loaded by solve-postflop to skip the expensive
+    /// per-flop equity computation at startup.
+    PrecomputeEquity {
+        /// Output file path
+        #[arg(short, long, default_value = "cache/equity_tables.bin")]
+        output: PathBuf,
+    },
 }
 
 /// Output format for the flops command.
@@ -153,6 +162,32 @@ fn main() -> Result<(), Box<dyn Error>> {
             )?;
 
             hand_trace::run_with_abstraction(&pf_config, &abstraction)?;
+        }
+        Commands::PrecomputeEquity { output } => {
+            let total = 1755_u64; // all canonical flops
+            let pb = ProgressBar::new(total);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} flops ({eta})")
+                    .unwrap()
+                    .progress_chars("=>-"),
+            );
+
+            let start = Instant::now();
+            let cache = EquityTableCache::build(|completed, _total| {
+                pb.set_position(completed as u64);
+            });
+            pb.finish_with_message("done");
+
+            let elapsed = start.elapsed();
+            eprintln!(
+                "Computed {} equity tables in {:.1}s",
+                cache.num_flops(),
+                elapsed.as_secs_f64()
+            );
+
+            cache.save(&output)?;
+            eprintln!("Saved to {}", output.display());
         }
     }
 
@@ -365,38 +400,60 @@ fn build_postflop_with_progress(
     let pf_start = Instant::now();
     let mut abstractions = Vec::with_capacity(sprs.len());
 
-    // Pre-compute equity tables once when solving multiple SPRs with the
-    // exhaustive backend. Equity depends only on flop cards, not SPR, so
-    // this avoids redundant O(169^2 * runouts) work per extra SPR.
+    // Try loading pre-computed equity tables from disk cache.
+    // Falls back to inline computation if cache is missing/invalid.
+    let cache_path = Path::new("cache/equity_tables.bin");
     let equity_tables: Vec<Vec<f64>> =
-        if pf_config.solve_type == PostflopSolveType::Exhaustive && sprs.len() > 1 {
-            if let Some(m) = &metrics {
-                m.equity_tables_total.store(flops.len() as u32, Ordering::Relaxed);
-                m.set_phase(4); // equity table pre-computation phase
-            }
-            if !use_tui {
-                eprintln!(
-                    "Pre-computing equity tables for {} flops...",
-                    flops.len()
-                );
-            }
-            let eq_completed = AtomicU32::new(0);
-            let tables: Vec<Vec<f64>> = flops
-                .par_iter()
-                .map(|flop| {
-                    let combo_map = build_combo_map(flop);
-                    let table = compute_equity_table(&combo_map, *flop);
-                    let done = eq_completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if let Some(m) = &metrics {
-                        m.equity_tables_completed.store(done, Ordering::Relaxed);
+        if pf_config.solve_type == PostflopSolveType::Exhaustive {
+            if let Some(cache) = EquityTableCache::load(cache_path) {
+                match cache.extract_tables(&flops) {
+                    Some(tables) => {
+                        eprintln!(
+                            "Loaded equity tables for {}/{} flops from cache",
+                            tables.len(),
+                            cache.num_flops(),
+                        );
+                        tables
                     }
-                    table
-                })
-                .collect();
-            if let Some(m) = &metrics {
-                m.set_phase(0); // back to idle before SPR loop
+                    None => {
+                        eprintln!(
+                            "Warning: cache missing some requested flops, falling back to inline computation"
+                        );
+                        vec![]
+                    }
+                }
+            } else if sprs.len() > 1 {
+                // No cache — fall back to inline pre-computation for multi-SPR runs.
+                if let Some(m) = &metrics {
+                    m.equity_tables_total.store(flops.len() as u32, Ordering::Relaxed);
+                    m.set_phase(4); // equity table pre-computation phase
+                }
+                if !use_tui {
+                    eprintln!(
+                        "Pre-computing equity tables for {} flops...",
+                        flops.len()
+                    );
+                }
+                let eq_completed = AtomicU32::new(0);
+                let tables: Vec<Vec<f64>> = flops
+                    .par_iter()
+                    .map(|flop| {
+                        let combo_map = build_combo_map(flop);
+                        let table = compute_equity_table(&combo_map, *flop);
+                        let done = eq_completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(m) = &metrics {
+                            m.equity_tables_completed.store(done, Ordering::Relaxed);
+                        }
+                        table
+                    })
+                    .collect();
+                if let Some(m) = &metrics {
+                    m.set_phase(0); // back to idle before SPR loop
+                }
+                tables
+            } else {
+                vec![]
             }
-            tables
         } else {
             vec![]
         };
