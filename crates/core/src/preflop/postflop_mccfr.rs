@@ -188,8 +188,8 @@ fn mccfr_solve_one_flop(
                 metric_label: "\u{03b4}".to_string(),
                 total_action_slots: 0,
                 pruned_action_slots: 0,
-                median_positive_regret: 0.0,
-                median_negative_regret: 0.0,
+                max_positive_regret: 0.0,
+                min_negative_regret: 0.0,
             },
         });
 
@@ -690,7 +690,7 @@ mod tests {
             ev_convergence_threshold: 0.001,
             cfr_variant: CfrVariant::Linear,
             prune_warmup: 0,
-            prune_explore_pct: 0.05,
+            prune_explore_freq: 20,
             prune_regret_threshold: 0.0,
             regret_floor: 1_000_000.0,
         }

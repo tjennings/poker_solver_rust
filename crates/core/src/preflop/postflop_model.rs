@@ -43,8 +43,8 @@ fn default_ev_convergence_threshold() -> f64 {
 fn default_prune_warmup() -> usize {
     200
 }
-fn default_prune_explore_pct() -> f64 {
-    0.05
+fn default_prune_explore_freq() -> usize {
+    20
 }
 fn default_prune_regret_threshold() -> f64 {
     0.0
@@ -160,14 +160,10 @@ pub struct PostflopModelConfig {
     #[serde(default = "default_prune_warmup")]
     pub prune_warmup: usize,
 
-    /// Per-action probability (0.0–1.0) that a negative-regret action is
-    /// explored despite pruning. Applied independently each traversal.
-    /// Default: 0.05 (5%).
-    #[serde(
-        default = "default_prune_explore_pct",
-        alias = "prune_explore_freq"
-    )]
-    pub prune_explore_pct: f64,
+    /// Disable pruning every N iterations to let pruned actions recover. Default: 20.
+    /// 0 = never disable pruning.
+    #[serde(default = "default_prune_explore_freq")]
+    pub prune_explore_freq: usize,
 
     /// Cumulative regret threshold below which an action becomes a pruning
     /// candidate. Default: 0.0 (any negative regret triggers pruning).
@@ -198,7 +194,7 @@ impl PostflopModelConfig {
             ev_convergence_threshold: 0.001,
             cfr_variant: CfrVariant::Linear,
             prune_warmup: 0,
-            prune_explore_pct: 0.05,
+            prune_explore_freq: 20,
             prune_regret_threshold: 0.0,
             regret_floor: 1_000_000.0,
         }
@@ -221,7 +217,7 @@ impl PostflopModelConfig {
             ev_convergence_threshold: 0.001,
             cfr_variant: CfrVariant::Linear,
             prune_warmup: 0,
-            prune_explore_pct: 0.05,
+            prune_explore_freq: 20,
             prune_regret_threshold: 0.0,
             regret_floor: 1_000_000.0,
         }

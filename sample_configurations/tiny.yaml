@@ -11,6 +11,6 @@ postflop_model:
   cfr_convergence_threshold: 1  # mBB/h for exhaustive mode
   ev_convergence_threshold: 0.5
   prune_warmup: 2          # iterations before pruning starts (0 = disabled)
-  prune_explore_pct: 0.05  # 5% chance each negative-regret action is explored
+  prune_explore_freq: 5    # disable pruning every N iterations
   prune_regret_threshold: 0  # cumulative regret below this triggers pruning
   regret_floor: 1000000    # clamp negative regrets
