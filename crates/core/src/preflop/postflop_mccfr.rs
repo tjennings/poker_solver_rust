@@ -188,6 +188,8 @@ fn mccfr_solve_one_flop(
                 metric_label: "\u{03b4}".to_string(),
                 total_action_slots: 0,
                 pruned_action_slots: 0,
+                median_positive_regret: 0.0,
+                median_negative_regret: 0.0,
             },
         });
 

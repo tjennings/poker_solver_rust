@@ -715,6 +715,8 @@ fn exhaustive_solve_one_flop(
                 metric_label: "mBB/h".into(),
                 total_action_slots: flop_total_action_slots,
                 pruned_action_slots: flop_pruned_action_slots,
+                median_positive_regret: 0.0,
+                median_negative_regret: 0.0,
             },
         });
 

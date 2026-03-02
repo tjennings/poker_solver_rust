@@ -9,6 +9,8 @@ pub struct FlopTuiState {
     pub iteration: usize,
     pub max_iterations: usize,
     pub pct_actions_pruned: f64,
+    pub median_positive_regret: f64,
+    pub median_negative_regret: f64,
 }
 
 /// Shared metrics between solver threads and the TUI renderer.
@@ -86,6 +88,8 @@ impl TuiMetrics {
         max_iterations: usize,
         exploitability: f64,
         pct_actions_pruned: f64,
+        median_positive_regret: f64,
+        median_negative_regret: f64,
     ) {
         let mut entry = self
             .flop_states
@@ -95,11 +99,15 @@ impl TuiMetrics {
                 iteration: 0,
                 max_iterations,
                 pct_actions_pruned: 0.0,
+                median_positive_regret: 0.0,
+                median_negative_regret: 0.0,
             });
         entry.iteration = iteration;
         entry.max_iterations = max_iterations;
         entry.exploitability_history.push(exploitability);
         entry.pct_actions_pruned = pct_actions_pruned;
+        entry.median_positive_regret = median_positive_regret;
+        entry.median_negative_regret = median_negative_regret;
     }
 
     /// Remove a flop entry when it finishes (called from on_progress).
@@ -123,8 +131,8 @@ mod tests {
     #[test]
     fn flop_state_lifecycle() {
         let m = TuiMetrics::new(1, 10);
-        m.update_flop("AhKs2d", 0, 50, 120.5, 0.0);
-        m.update_flop("AhKs2d", 1, 50, 95.3, 12.5);
+        m.update_flop("AhKs2d", 0, 50, 120.5, 0.0, 0.0, 0.0);
+        m.update_flop("AhKs2d", 1, 50, 95.3, 12.5, 0.0, 0.0);
         {
             let entry = m.flop_states.get("AhKs2d").unwrap();
             assert_eq!(entry.iteration, 1);
@@ -138,7 +146,7 @@ mod tests {
     fn start_spr_resets_counters() {
         let m = TuiMetrics::new(3, 100);
         m.flops_completed.store(50, Ordering::Relaxed);
-        m.update_flop("test", 10, 50, 42.0, 0.0);
+        m.update_flop("test", 10, 50, 42.0, 0.0, 0.0, 0.0);
 
         m.start_spr(1, 200);
 
