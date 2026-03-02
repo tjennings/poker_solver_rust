@@ -5,7 +5,7 @@
 
 use rayon::prelude::*;
 
-use crate::cfr::parallel::{add_into, parallel_traverse_into, ParallelCfr};
+use crate::cfr::parallel::{add_into, parallel_traverse_pooled, ParallelCfr};
 
 use super::postflop_abstraction::{
     normalize_strategy_sum_into, regret_matching_into, BuildPhase, FlopSolveResult, FlopStage,
@@ -585,7 +585,7 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
 
 /// Solve a single flop using exhaustive CFR with configurable iteration weighting.
 ///
-/// Inner `parallel_traverse_into` and `compute_exploitability` use rayon's
+/// Inner `parallel_traverse_pooled` and `compute_exploitability` use rayon's
 /// global thread pool. When called from `build_exhaustive` (which parallelises
 /// over flops), rayon's work-stealing distributes hand-pair work across all
 /// available cores, dynamically rebalancing as flops converge at different rates.
@@ -621,12 +621,12 @@ fn exhaustive_solve_one_flop(
             .fetch_add((pairs.len() * num_iterations) as u64, Ordering::Relaxed);
     }
 
-    let mut snapshot = vec![0.0f64; buf_size];
-
-    // Pre-allocate delta buffers reused across iterations to avoid
-    // two Vec allocations per iteration (parallel_traverse_into zeroes them).
-    let mut dr = vec![0.0f64; buf_size];
-    let mut ds = vec![0.0f64; buf_size];
+    // Pre-allocate thread buffer pool once per flop, reused across all iterations.
+    // Each partition holds (regret_delta, strategy_delta) buffers zeroed before use.
+    let n_partitions = rayon::current_num_threads().max(1);
+    let mut pool: Vec<(Vec<f64>, Vec<f64>)> = (0..n_partitions)
+        .map(|_| (vec![0.0f64; buf_size], vec![0.0f64; buf_size]))
+        .collect();
 
     // Per-flop pruning accumulators: track action-slot pruning for this flop
     // by snapshotting the global counters before/after each iteration.
@@ -636,8 +636,6 @@ fn exhaustive_solve_one_flop(
     let flop_name_owned = flop_name.to_string();
 
     for iter in 0..num_iterations {
-        snapshot.clone_from(&regret_sum);
-
         // Snapshot global counters before traversal so we can attribute
         // the delta to this flop.
         let prev_ta = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
@@ -645,19 +643,24 @@ fn exhaustive_solve_one_flop(
 
         let prune_active = config.prune_warmup > 0 && iter >= config.prune_warmup;
 
-        let ctx = PostflopCfrCtx {
-            tree,
-            layout,
-            equity_table,
-            snapshot: &snapshot,
-            iteration: iter as u64,
-            dcfr,
-            prune_active,
-            prune_explore_pct: config.prune_explore_pct,
-            counters,
-        };
+        // Scoped borrow: ctx borrows &regret_sum immutably during traversal.
+        // No snapshot clone needed — regret_sum is not mutated until after
+        // traversal completes (discounting + merge happen below).
+        {
+            let ctx = PostflopCfrCtx {
+                tree,
+                layout,
+                equity_table,
+                snapshot: &regret_sum,
+                iteration: iter as u64,
+                dcfr,
+                prune_active,
+                prune_explore_pct: config.prune_explore_pct,
+                counters,
+            };
 
-        parallel_traverse_into(&ctx, &pairs, &mut dr, &mut ds);
+            parallel_traverse_pooled(&ctx, &pairs, &mut pool);
+        } // ctx dropped — &regret_sum borrow released
 
         // Accumulate per-flop pruning stats from global counter deltas.
         let cur_ta = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
@@ -670,8 +673,11 @@ fn exhaustive_solve_one_flop(
             dcfr.discount_regrets(&mut regret_sum, iter as u64);
             dcfr.discount_strategy_sums(&mut strategy_sum, iter as u64);
         }
-        add_into(&mut regret_sum, &dr);
-        add_into(&mut strategy_sum, &ds);
+        // Merge pool partition deltas directly into accumulators.
+        for (pdr, pds) in pool.iter() {
+            add_into(&mut regret_sum, pdr);
+            add_into(&mut strategy_sum, pds);
+        }
         if dcfr.should_floor_regrets() {
             dcfr.floor_regrets(&mut regret_sum);
         }
