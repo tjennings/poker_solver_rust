@@ -689,6 +689,7 @@ mod tests {
             cfr_variant: CfrVariant::Linear,
             prune_warmup: 0,
             prune_explore_pct: 0.05,
+            prune_regret_threshold: 0.0,
             regret_floor: 1_000_000.0,
         }
     }

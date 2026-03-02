@@ -46,6 +46,9 @@ fn default_prune_warmup() -> usize {
 fn default_prune_explore_pct() -> f64 {
     0.05
 }
+fn default_prune_regret_threshold() -> f64 {
+    0.0
+}
 fn default_regret_floor() -> f64 {
     1_000_000.0
 }
@@ -166,6 +169,12 @@ pub struct PostflopModelConfig {
     )]
     pub prune_explore_pct: f64,
 
+    /// Cumulative regret threshold below which an action becomes a pruning
+    /// candidate. Default: 0.0 (any negative regret triggers pruning).
+    /// Set to e.g. -500.0 to only prune deeply negative actions.
+    #[serde(default = "default_prune_regret_threshold")]
+    pub prune_regret_threshold: f64,
+
     /// Maximum magnitude of negative cumulative regret clamp. Default: 1,000,000.
     #[serde(default = "default_regret_floor")]
     pub regret_floor: f64,
@@ -190,6 +199,7 @@ impl PostflopModelConfig {
             cfr_variant: CfrVariant::Linear,
             prune_warmup: 0,
             prune_explore_pct: 0.05,
+            prune_regret_threshold: 0.0,
             regret_floor: 1_000_000.0,
         }
     }
@@ -212,6 +222,7 @@ impl PostflopModelConfig {
             cfr_variant: CfrVariant::Linear,
             prune_warmup: 0,
             prune_explore_pct: 0.05,
+            prune_regret_threshold: 0.0,
             regret_floor: 1_000_000.0,
         }
     }
