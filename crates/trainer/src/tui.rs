@@ -209,8 +209,8 @@ impl TuiApp {
                 format!(
                     "  pruned: {:.1}%  regret +{:.0} / {:.0}",
                     state.pct_actions_pruned,
-                    state.median_positive_regret,
-                    state.median_negative_regret,
+                    state.max_positive_regret,
+                    state.min_negative_regret,
                 ),
                 Style::default().fg(Color::DarkGray),
             ));

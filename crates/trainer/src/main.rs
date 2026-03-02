@@ -425,13 +425,13 @@ fn build_postflop_with_progress(
                                 m.set_phase(2);
                             }
                             match stage {
-                                FlopStage::Solving { iteration, max_iterations, delta, total_action_slots, pruned_action_slots, median_positive_regret, median_negative_regret, .. } => {
+                                FlopStage::Solving { iteration, max_iterations, delta, total_action_slots, pruned_action_slots, max_positive_regret, min_negative_regret, .. } => {
                                     let pct_act = if *total_action_slots > 0 {
                                         *pruned_action_slots as f64 * 100.0 / *total_action_slots as f64
                                     } else {
                                         0.0
                                     };
-                                    m.update_flop(flop_name, *iteration, *max_iterations, *delta, pct_act, *median_positive_regret, *median_negative_regret);
+                                    m.update_flop(flop_name, *iteration, *max_iterations, *delta, pct_act, *max_positive_regret, *min_negative_regret);
                                 }
                                 FlopStage::EstimatingEv { .. } => {}
                                 FlopStage::Done => {

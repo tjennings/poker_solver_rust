@@ -254,10 +254,10 @@ pub enum FlopStage {
         total_action_slots: u64,
         /// Cumulative action slots pruned for this flop so far.
         pruned_action_slots: u64,
-        /// Median of positive regret values across all slots.
-        median_positive_regret: f64,
-        /// Median of negative regret values across all slots.
-        median_negative_regret: f64,
+        /// Maximum positive regret value across all slots.
+        max_positive_regret: f64,
+        /// Minimum (most negative) regret value across all slots.
+        min_negative_regret: f64,
     },
     /// Extracting EV estimates from converged strategy.
     EstimatingEv { sample: usize, total_samples: usize },
@@ -803,8 +803,8 @@ mod tests {
                 metric_label: "\u{03b4}".to_string(),
                 total_action_slots: 0,
                 pruned_action_slots: 0,
-                median_positive_regret: 0.0,
-                median_negative_regret: 0.0,
+                max_positive_regret: 0.0,
+                min_negative_regret: 0.0,
             },
         };
         let s = format!("{phase}");
