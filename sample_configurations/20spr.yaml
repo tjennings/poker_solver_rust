@@ -13,3 +13,4 @@ postflop_model:
 
   #prune_warmup: 0
   #regret_floor: 0
+  #prune_regret_threshold: 0  # 0 = prune any negative regret
