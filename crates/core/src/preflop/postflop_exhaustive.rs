@@ -594,26 +594,19 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
 /// Returns `(median_positive, median_negative)`. If no values exist for
 /// a sign, returns 0.0.
 fn median_regrets(regret_sum: &[f64]) -> (f64, f64) {
-    let mut positives: Vec<f64> = Vec::new();
-    let mut negatives: Vec<f64> = Vec::new();
-    for &v in regret_sum {
-        if v > 0.0 {
-            positives.push(v);
-        } else if v < 0.0 {
-            negatives.push(v);
-        }
-    }
+    let mut positives: Vec<f64> = regret_sum.iter().copied().filter(|&v| v > 0.0).collect();
+    let mut negatives: Vec<f64> = regret_sum.iter().copied().filter(|&v| v < 0.0).collect();
     let med_pos = if positives.is_empty() {
         0.0
     } else {
-        positives.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        positives[positives.len() / 2]
+        let mid = positives.len() / 2;
+        *positives.select_nth_unstable_by(mid, f64::total_cmp).1
     };
     let med_neg = if negatives.is_empty() {
         0.0
     } else {
-        negatives.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        negatives[negatives.len() / 2]
+        let mid = negatives.len() / 2;
+        *negatives.select_nth_unstable_by(mid, f64::total_cmp).1
     };
     (med_pos, med_neg)
 }
