@@ -201,6 +201,7 @@ pub(crate) fn cache_size() -> usize {
 /// overhead during CFR traversal. Computes all 169×169 = 28,561 equity pairs.
 ///
 /// Returns the number of equity pairs computed.
+#[allow(dead_code)] // kept for potential future use in cache warming utilities
 pub(crate) fn prewarm_cache() -> usize {
     let hands: Vec<_> = all_hands().collect();
     let mut computed = 0;

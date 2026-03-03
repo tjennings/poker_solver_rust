@@ -344,7 +344,7 @@ mod tests {
         let tree = PreflopTree::build(&config);
         match &tree.nodes[0] {
             PreflopNode::Decision { position, .. } => assert_eq!(*position, 0),
-            _ => panic!("root should be a decision node"),
+            PreflopNode::Terminal { .. } => panic!("root should be a decision node"),
         }
     }
 
@@ -376,7 +376,7 @@ mod tests {
                     tree.nodes[child]
                 );
             }
-            _ => panic!("root should be a decision node"),
+            PreflopNode::Terminal { .. } => panic!("root should be a decision node"),
         }
     }
 
@@ -416,7 +416,9 @@ mod tests {
                     tree.nodes[terminal_idx]
                 );
             }
-            other => panic!("Expected BB decision node, got: {:?}", other),
+            other @ PreflopNode::Terminal { .. } => {
+                panic!("Expected BB decision node, got: {other:?}")
+            }
         }
     }
 
@@ -450,7 +452,7 @@ mod tests {
             PreflopNode::Terminal { pot, .. } => {
                 assert_eq!(*pot, 4, "Pot after limp + check should be 4 (SB=2, BB=2)");
             }
-            other => panic!("Expected terminal, got: {:?}", other),
+            other @ PreflopNode::Decision { .. } => panic!("Expected terminal, got: {other:?}"),
         }
     }
 
@@ -466,7 +468,7 @@ mod tests {
             PreflopNode::Terminal { pot, .. } => {
                 assert_eq!(*pot, 3, "Pot after SB fold should be 3 (SB=1, BB=2)");
             }
-            other => panic!("Expected terminal, got: {:?}", other),
+            other @ PreflopNode::Decision { .. } => panic!("Expected terminal, got: {other:?}"),
         }
     }
 
@@ -487,13 +489,14 @@ mod tests {
                     .position(|a| *a == action)
                     .unwrap_or_else(|| {
                         panic!(
-                            "Action {:?} not found at node {}. Available: {:?}",
-                            action, node_idx, action_labels
+                            "Action {action:?} not found at node {node_idx}. Available: {action_labels:?}"
                         )
                     });
                 (children[pos] as usize, pos)
             }
-            other => panic!("Expected decision node at {}, got: {:?}", node_idx, other),
+            other @ PreflopNode::Terminal { .. } => {
+                panic!("Expected decision node at {node_idx}, got: {other:?}")
+            }
         }
     }
 
@@ -510,9 +513,12 @@ mod tests {
         let (fold_node, _) = find_action_child(&tree, raise_node, PreflopAction::Fold);
         match &tree.nodes[fold_node] {
             PreflopNode::Terminal { pot, .. } => {
-                assert_eq!(*pot, 7, "After SB open 2.5x (to 5) + BB fold: pot should be 7");
+                assert_eq!(
+                    *pot, 7,
+                    "After SB open 2.5x (to 5) + BB fold: pot should be 7"
+                );
             }
-            other => panic!("Expected terminal, got: {:?}", other),
+            other @ PreflopNode::Decision { .. } => panic!("Expected terminal, got: {other:?}"),
         }
     }
 
@@ -535,17 +541,17 @@ mod tests {
                     .any(|a| matches!(a, PreflopAction::Raise(_)));
                 assert!(
                     !has_raise,
-                    "Last raise depth should not have sized raises, got: {:?}",
-                    action_labels
+                    "Last raise depth should not have sized raises, got: {action_labels:?}"
                 );
-                let has_all_in = action_labels.iter().any(|a| *a == PreflopAction::AllIn);
+                let has_all_in = action_labels.contains(&PreflopAction::AllIn);
                 assert!(
                     has_all_in,
-                    "Last raise depth should offer all-in, got: {:?}",
-                    action_labels
+                    "Last raise depth should offer all-in, got: {action_labels:?}"
                 );
             }
-            other => panic!("Expected decision node, got: {:?}", other),
+            other @ PreflopNode::Terminal { .. } => {
+                panic!("Expected decision node, got: {other:?}")
+            }
         }
     }
 
@@ -567,17 +573,18 @@ mod tests {
         // SB now at raise_count=2 (cap) with chips remaining beyond the call
         match &tree.nodes[sb_node2] {
             PreflopNode::Decision { action_labels, .. } => {
-                let has_all_in = action_labels.iter().any(|a| *a == PreflopAction::AllIn);
+                let has_all_in = action_labels.contains(&PreflopAction::AllIn);
                 assert!(
                     has_all_in,
-                    "at raise cap with deep stacks, all-in shove should be available, got: {:?}",
-                    action_labels
+                    "at raise cap with deep stacks, all-in shove should be available, got: {action_labels:?}"
                 );
-                let has_fold = action_labels.iter().any(|a| *a == PreflopAction::Fold);
-                let has_call = action_labels.iter().any(|a| *a == PreflopAction::Call);
+                let has_fold = action_labels.contains(&PreflopAction::Fold);
+                let has_call = action_labels.contains(&PreflopAction::Call);
                 assert!(has_fold && has_call, "should have fold and call too");
             }
-            other => panic!("Expected decision node at raise cap, got: {:?}", other),
+            other @ PreflopNode::Terminal { .. } => {
+                panic!("Expected decision node at raise cap, got: {other:?}")
+            }
         }
     }
 
@@ -595,11 +602,10 @@ mod tests {
         let (sb_node2, _) = find_action_child(&tree, bb_node, PreflopAction::AllIn);
         match &tree.nodes[sb_node2] {
             PreflopNode::Decision { action_labels, .. } => {
-                let has_all_in = action_labels.iter().any(|a| *a == PreflopAction::AllIn);
+                let has_all_in = action_labels.contains(&PreflopAction::AllIn);
                 assert!(
                     has_all_in,
-                    "all-in should always be present, even when stack ≈ to_call, got: {:?}",
-                    action_labels
+                    "all-in should always be present, even when stack \u{2248} to_call, got: {action_labels:?}"
                 );
             }
             PreflopNode::Terminal { .. } => {
@@ -646,6 +652,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn assert_allin_recursive(
         tree: &PreflopTree,
         config: &PreflopConfig,
@@ -666,7 +673,7 @@ mod tests {
                 let player_stack = stacks[pos];
 
                 if player_stack > 0 {
-                    let has_allin = action_labels.iter().any(|a| *a == PreflopAction::AllIn);
+                    let has_allin = action_labels.contains(&PreflopAction::AllIn);
                     if !has_allin {
                         violations.push(format!(
                             "node {node_idx}: player {pos} stack={player_stack} \

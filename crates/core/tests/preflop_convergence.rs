@@ -154,10 +154,10 @@ fn solver_matches_gto_reference_25bb() {
             .unwrap();
 
         let mut cur_raise_pcts = vec![0.0f64; 169];
-        for h in 0..169 {
+        for (h, raise_pct) in cur_raise_pcts.iter_mut().enumerate() {
             let probs = strat.get_root_probs(h);
             let fold_p = fi.map_or(0.0, |i| probs[i]);
-            cur_raise_pcts[h] = (1.0 - fold_p - probs[ci]) * 100.0;
+            *raise_pct = (1.0 - fold_p - probs[ci]) * 100.0;
         }
 
         let mean_delta: f64 = cur_raise_pcts
@@ -167,7 +167,7 @@ fn solver_matches_gto_reference_25bb() {
             .sum::<f64>()
             / 169.0;
 
-        if solver.iteration() % 5000 == 0 || mean_delta < convergence_threshold {
+        if solver.iteration().is_multiple_of(5000) || mean_delta < convergence_threshold {
             eprintln!(
                 "iter {:>6}: mean_delta={:.4}pp",
                 solver.iteration(),
@@ -175,7 +175,7 @@ fn solver_matches_gto_reference_25bb() {
             );
         }
 
-        if mean_delta < convergence_threshold && solver.iteration() >= chunk as u64 * 2 {
+        if mean_delta < convergence_threshold && solver.iteration() >= chunk * 2 {
             eprintln!("Converged at iteration {}", solver.iteration());
             converged = true;
             break;

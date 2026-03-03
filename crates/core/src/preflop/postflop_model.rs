@@ -138,8 +138,8 @@ pub struct PostflopModelConfig {
     #[serde(default = "default_solve_type")]
     pub solve_type: PostflopSolveType,
 
-    /// Fraction of total (hand_pair × turn × river) sample space per flop.
-    /// Only used when solve_type is Mccfr. Default: 0.01 (1%).
+    /// Fraction of total (`hand_pair` x turn x river) sample space per flop.
+    /// Only used when `solve_type` is Mccfr. Default: 0.01 (1%).
     #[serde(default = "default_mccfr_sample_pct")]
     pub mccfr_sample_pct: f64,
 
@@ -150,7 +150,7 @@ pub struct PostflopModelConfig {
     pub value_extraction_samples: u32,
 
     /// Early-stop threshold for EV estimation (weighted-average delta).
-    /// Only used when solve_type is Mccfr. Default: 0.001.
+    /// Only used when `solve_type` is Mccfr. Default: 0.001.
     #[serde(default = "default_ev_convergence_threshold")]
     pub ev_convergence_threshold: f64,
 
@@ -179,7 +179,7 @@ pub struct PostflopModelConfig {
     pub regret_floor: f64,
 
     /// Compute exploitability every N iterations (exhaustive solver only).
-    /// Higher values reduce overhead from nested par_iter in `compute_exploitability`.
+    /// Higher values reduce overhead from nested `par_iter` in `compute_exploitability`.
     /// Default: 2.
     #[serde(default = "default_exploitability_freq")]
     pub exploitability_freq: usize,

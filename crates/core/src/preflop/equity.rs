@@ -161,7 +161,7 @@ mod tests {
     use test_macros::timed_test;
 
     #[timed_test(10)]
-    #[ignore] // ~60s in debug mode (14,196 MC equity computations)
+    #[ignore = "slow: ~60s in debug mode (14,196 MC equity computations)"]
     fn computed_table_has_real_equities() {
         let table = EquityTable::new_computed(500, |_| {});
         let aa = CH::parse("AA").unwrap().index();
@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[timed_test(10)]
-    #[ignore] // ~25s in debug mode
+    #[ignore = "slow: ~25s in debug mode"]
     fn computed_equities_are_symmetric() {
         let table = EquityTable::new_computed(200, |_| {});
         for i in 0..NUM_CANONICAL_HANDS {
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[timed_test(10)]
-    #[ignore] // ~25s in debug mode
+    #[ignore = "slow: ~25s in debug mode"]
     fn computed_table_self_matchup_is_half() {
         let table = EquityTable::new_computed(200, |_| {});
         for i in 0..NUM_CANONICAL_HANDS {
@@ -241,7 +241,10 @@ mod tests {
         let weights = compute_card_removal_weights();
         let aa = CH::parse("AA").unwrap().index();
         let kk = CH::parse("KK").unwrap().index();
-        assert_eq!(w(&weights, aa, kk), 36.0, "AA vs KK: 6x6, no shared ranks");
+        assert!(
+            (w(&weights, aa, kk) - 36.0).abs() < f64::EPSILON,
+            "AA vs KK: 6x6, no shared ranks"
+        );
     }
 
     #[timed_test]
@@ -249,8 +252,8 @@ mod tests {
         let weights = compute_card_removal_weights();
         let aa = CH::parse("AA").unwrap().index();
         let aks = CH::parse("AKs").unwrap().index();
-        assert_eq!(
-            w(&weights, aa, aks), 12.0,
+        assert!(
+            (w(&weights, aa, aks) - 12.0).abs() < f64::EPSILON,
             "AA vs AKs: shared ace reduces combos"
         );
     }
@@ -260,7 +263,10 @@ mod tests {
         let weights = compute_card_removal_weights();
         let aks = CH::parse("AKs").unwrap().index();
         let ako = CH::parse("AKo").unwrap().index();
-        assert_eq!(w(&weights, aks, ako), 24.0, "AKs vs AKo: shared A and K");
+        assert!(
+            (w(&weights, aks, ako) - 24.0).abs() < f64::EPSILON,
+            "AKs vs AKo: shared A and K"
+        );
     }
 
     #[timed_test]
@@ -270,7 +276,7 @@ mod tests {
         // C(4,2) ways to split 4 aces into two non-overlapping pairs = 3
         // But we count ordered pairs: (combo_a, combo_b) where a != b
         // 6 combos x 6 combos = 36, minus 6 self-overlaps, minus 24 card-overlaps = 6
-        assert_eq!(w(&weights, aa, aa), 6.0);
+        assert!((w(&weights, aa, aa) - 6.0).abs() < f64::EPSILON);
     }
 
     #[timed_test]
@@ -278,8 +284,8 @@ mod tests {
         let weights = compute_card_removal_weights();
         for i in 0..NUM_CANONICAL_HANDS {
             for j in (i + 1)..NUM_CANONICAL_HANDS {
-                assert_eq!(
-                    w(&weights, i, j), w(&weights, j, i),
+                assert!(
+                    (w(&weights, i, j) - w(&weights, j, i)).abs() < f64::EPSILON,
                     "weight[{i}][{j}] != weight[{j}][{i}]"
                 );
             }
@@ -294,7 +300,10 @@ mod tests {
         let eight_three = CH::parse("83o").unwrap();
         let wt = w(&weights, seven_two.index(), eight_three.index());
         let expected = f64::from(seven_two.num_combos()) * f64::from(eight_three.num_combos());
-        assert_eq!(wt, expected, "no shared ranks should give full product");
+        assert!(
+            (wt - expected).abs() < f64::EPSILON,
+            "no shared ranks should give full product"
+        );
     }
 
     #[timed_test]
@@ -303,6 +312,6 @@ mod tests {
         let aks = CH::parse("AKs").unwrap().index();
         // 4 suited combos: AsKs, AhKh, AdKd, AcKc
         // Ordered pairs (a, b) with different suits: 4 * 3 = 12
-        assert_eq!(w(&weights, aks, aks), 12.0);
+        assert!((w(&weights, aks, aks) - 12.0).abs() < f64::EPSILON);
     }
 }

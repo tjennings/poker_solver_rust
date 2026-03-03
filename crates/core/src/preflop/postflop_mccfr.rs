@@ -2,10 +2,10 @@
 //!
 //! Instead of abstract bucket-to-bucket transitions at street changes, this
 //! backend uses **concrete hands** (actual `Card` pairs). For each sample it
-//! picks two non-conflicting hands from canonical hand combos and a random turn
-//! + river. At showdown terminals it uses `rank_hand()` to evaluate actual hands
-//! against the full 5-card board. Strategies and regrets are indexed by canonical
-//! hand index (0..168).
+//! picks two non-conflicting hands from canonical hand combos and a random
+//! turn/river. At showdown terminals it uses `rank_hand()` to evaluate actual
+//! hands against the full 5-card board. Strategies and regrets are indexed by
+//! canonical hand index (0..168).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -55,11 +55,11 @@ pub(crate) fn build_mccfr(
     let results: Vec<Vec<f64>> = (0..num_flops)
         .into_par_iter()
         .map(|flop_idx| {
-            let flop = &flops[flop_idx];
+            let flop = flops[flop_idx];
             let flop_name = format!("{}{}{}", flop[0], flop[1], flop[2]);
 
             // Build combo map — no clustering needed
-            let combo_map = build_combo_map(flop);
+            let combo_map = build_combo_map(&flop);
 
             // Compute sample count
             let total_non_conflicting: usize = combo_map.iter().map(Vec::len).sum();
@@ -71,9 +71,8 @@ pub(crate) fn build_mccfr(
 
             // Solve
             let result = mccfr_solve_one_flop(
-                tree, layout, &combo_map, flop,
-                num_iterations, samples_per_iter,
-                config.cfr_convergence_threshold,
+                tree, layout, &combo_map, flop, num_iterations,
+                samples_per_iter, config.cfr_convergence_threshold,
                 &flop_name, on_progress,
             );
 
@@ -112,13 +111,13 @@ pub(crate) fn build_mccfr(
 /// Convergence is measured via `weighted_avg_strategy_delta`: the regret-weighted
 /// average of max per-action strategy probability change between consecutive
 /// iterations. This avoids the decay problem of `avg_positive_regret_flat` which
-/// divides cumulative regret by buffer_size × iterations.
+/// divides cumulative regret by `buffer_size` × iterations.
 #[allow(clippy::too_many_arguments)]
 fn mccfr_solve_one_flop(
     tree: &PostflopTree,
     layout: &PostflopLayout,
     combo_map: &[Vec<(Card, Card)>],
-    flop: &[Card; 3],
+    flop: [Card; 3],
     num_iterations: usize,
     samples_per_iter: usize,
     convergence_threshold: f64,
@@ -209,6 +208,9 @@ fn mccfr_solve_one_flop(
 // Deal sampling
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// `(hero_hand_idx, opp_hand_idx, hero_hand, opp_hand, turn_card, river_card)`.
+type SampledDeal = (u16, u16, [Card; 2], [Card; 2], Card, Card);
+
 /// Sample a concrete deal: two non-conflicting hands from random canonical hand
 /// indices plus random turn + river cards.
 ///
@@ -216,9 +218,9 @@ fn mccfr_solve_one_flop(
 #[allow(clippy::cast_possible_truncation)]
 fn sample_deal(
     combo_map: &[Vec<(Card, Card)>],
-    flop: &[Card; 3],
+    flop: [Card; 3],
     rng: &mut SmallRng,
-) -> Option<(u16, u16, [Card; 2], [Card; 2], Card, Card)> {
+) -> Option<SampledDeal> {
     let n = combo_map.len();
     let hero_hand_idx = rng.random_range(0..n) as u16;
     let opp_hand_idx = rng.random_range(0..n) as u16;
@@ -266,7 +268,7 @@ fn sample_deal(
 /// At chance nodes the board is already dealt, so we just pass through to
 /// the single structural child. At showdown terminals we use `rank_hand`
 /// for card-based evaluation.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn mccfr_traverse(
     tree: &PostflopTree,
     layout: &PostflopLayout,
@@ -435,7 +437,7 @@ fn mccfr_extract_values(
     layout: &PostflopLayout,
     strategy_sum: &[f64],
     combo_map: &[Vec<(Card, Card)>],
-    flop: &[Card; 3],
+    flop: [Card; 3],
     samples_per_pair: usize,
     num_flop_buckets: usize,
     _convergence_threshold: f64,
@@ -459,7 +461,7 @@ fn mccfr_extract_values(
 
         for ob in 0..n as u16 {
             pairs_done += 1;
-            if pairs_done % 1000 == 0 {
+            if pairs_done.is_multiple_of(1000) {
                 on_progress(BuildPhase::FlopProgress {
                     flop_name: flop_name.to_string(),
                     stage: FlopStage::EstimatingEv {
@@ -520,7 +522,7 @@ fn mccfr_extract_values(
 fn sample_runout_for_pair(
     hero_combos: &[(Card, Card)],
     opp_combos: &[(Card, Card)],
-    flop: &[Card; 3],
+    flop: [Card; 3],
     rng: &mut SmallRng,
 ) -> Option<([Card; 2], [Card; 2], Card, Card)> {
     let hero_idx = rng.random_range(0..hero_combos.len());
@@ -737,6 +739,7 @@ mod tests {
                 pot_fraction,
             } = n
             {
+                #[allow(clippy::cast_possible_truncation)]
                 Some((i as u32, *folder, *pot_fraction))
             } else {
                 None
@@ -816,6 +819,7 @@ mod tests {
                 pot_fraction,
             } = n
             {
+                #[allow(clippy::cast_possible_truncation)]
                 Some((i as u32, *pot_fraction))
             } else {
                 None
@@ -882,7 +886,7 @@ mod tests {
             &tree,
             &layout,
             &combo_map,
-            &flop,
+            flop,
             50,
             20,
             0.0001,
@@ -914,7 +918,7 @@ mod tests {
             &tree,
             &layout,
             &combo_map,
-            &flop,
+            flop,
             20,
             10,
             0.001,
@@ -923,7 +927,7 @@ mod tests {
         );
 
         let values = mccfr_extract_values(
-            &tree, &layout, &result.strategy_sum, &combo_map, &flop,
+            &tree, &layout, &result.strategy_sum, &combo_map, flop,
             3, n_subset, 0.001, "test", &|_| {},
         );
 
@@ -955,7 +959,7 @@ mod tests {
         let mut got_deal = false;
         for _ in 0..10 {
             if let Some((hero, opp, turn, river)) =
-                sample_runout_for_pair(hero_combos, opp_combos, &flop, &mut rng)
+                sample_runout_for_pair(hero_combos, opp_combos, flop, &mut rng)
             {
                 // Cards should all be distinct
                 let all = [flop[0], flop[1], flop[2], hero[0], hero[1], opp[0], opp[1], turn, river];
@@ -991,8 +995,10 @@ mod tests {
         // Check approximately zero-sum: sum of pos0 + pos1 should be near 0
         let mut total_ev = 0.0f64;
         let mut count = 0;
-        for hb in 0..n as u16 {
-            for ob in 0..n as u16 {
+        #[allow(clippy::cast_possible_truncation)]
+        let n_u16 = n as u16;
+        for hb in 0..n_u16 {
+            for ob in 0..n_u16 {
                 let ev0 = values.get_by_flop(0, 0, hb, ob);
                 let ev1 = values.get_by_flop(0, 1, hb, ob);
                 total_ev += ev0 + ev1;
@@ -1000,7 +1006,7 @@ mod tests {
             }
         }
         // Zero-sum check: average should be close to 0
-        let avg = total_ev / count as f64;
+        let avg = total_ev / f64::from(count);
         assert!(
             avg.abs() < 0.5,
             "average EV across all matchups should be roughly zero-sum, got {avg}"

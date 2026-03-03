@@ -24,7 +24,7 @@ fn diag_value_table_strong_beats_weak() {
     };
 
     let abstraction = PostflopAbstraction::build(
-        &config, None, &|phase| eprintln!("  [build] {phase}"),
+        &config, None, |phase| eprintln!("  [build] {phase}"),
     ).expect("build should succeed");
 
     let n = 169;

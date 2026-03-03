@@ -11,7 +11,7 @@
 #     -c sample_configurations/minimal_preflop.yaml -o minimal_preflop_output
 
 # -- Postflop bundle (required, built via solve-postflop) --
-postflop_model_path: ./local_data/akq_vs_234_postflop
+postflop_model_path: ./local_data/akr_vs_234_postflop_deuce
 
 # -- Training --
 iterations: 200
@@ -31,14 +31,14 @@ blinds:
   - [1, 2]   # BB posts 2
 
 antes: []
-stacks: [200, 200]  # 100 BB each (SB=1, BB=2)
+stacks: [25, 25]  # 100 BB each (SB=1, BB=2)
 
 raise_sizes:
-  - ["2bb", "1.0p"]              # preflop: 2bb open, pot-sized 3bet
-  - ["0.5p", "1.0p"]             # flop
-  - ["0.5p", "1.0p"]             # turn/river
+  - ["2bb", "6bb", "1.5p"]              # preflop: 2bb open, pot-sized 3bet
+  - ["0.3p", "0.5p", "0.75p", "1.0p", "1.5p"]             # flop
+  - ["0.3p", "0.5p", "0.75p", "1.0p", "3p"]             # turn/river
 
-raise_cap: 3
+raise_cap: 4
 
 # -- DCFR discounting --
 dcfr_alpha: 1.5

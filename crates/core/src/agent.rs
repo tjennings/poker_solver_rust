@@ -361,7 +361,7 @@ mod tests {
     use super::*;
     use test_macros::timed_test;
 
-    const MINIMAL_TOML: &str = r#"
+    const MINIMAL_TOML: &str = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
@@ -375,7 +375,7 @@ raise = 0.33
 fold = 0.1
 call = 0.5
 raise = 0.4
-"#;
+";
 
     const TOML_WITH_RANGES: &str = r#"
 [game]
@@ -437,7 +437,7 @@ allin = 0.02
 
     #[timed_test]
     fn invalid_class_name_rejected() {
-        let toml = r#"
+        let toml = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5]
@@ -451,14 +451,14 @@ raise = 0.2
 fold = 0.5
 call = 0.3
 raise = 0.2
-"#;
+";
         let result = AgentConfig::from_toml(toml);
         assert!(matches!(result, Err(AgentError::InvalidClass(_))));
     }
 
     #[timed_test]
     fn negative_frequency_rejected() {
-        let toml = r#"
+        let toml = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5]
@@ -467,14 +467,14 @@ bet_sizes = [0.5]
 fold = -0.1
 call = 0.6
 raise = 0.5
-"#;
+";
         let result = AgentConfig::from_toml(toml);
         assert!(matches!(result, Err(AgentError::InvalidFrequency(_))));
     }
 
     #[timed_test]
     fn zero_sum_frequency_rejected() {
-        let toml = r#"
+        let toml = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5]
@@ -483,14 +483,14 @@ bet_sizes = [0.5]
 fold = 0.0
 call = 0.0
 raise = 0.0
-"#;
+";
         let result = AgentConfig::from_toml(toml);
         assert!(matches!(result, Err(AgentError::InvalidFrequency(_))));
     }
 
     #[timed_test]
     fn unnormalized_frequencies_get_normalized() {
-        let toml = r#"
+        let toml = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5]
@@ -499,7 +499,7 @@ bet_sizes = [0.5]
 fold = 1.0
 call = 1.0
 raise = 2.0
-"#;
+";
         let config = AgentConfig::from_toml(toml).unwrap();
         assert!((config.default.fold - 0.25).abs() < 1e-5);
         assert!((config.default.call - 0.25).abs() < 1e-5);
@@ -598,7 +598,7 @@ raise = 2.0
 
     #[timed_test]
     fn legacy_single_raise_still_works() {
-        let toml = r#"
+        let toml = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
@@ -607,7 +607,7 @@ bet_sizes = [0.5, 1.0]
 fold = 0.3
 call = 0.3
 raise = 0.4
-"#;
+";
         let config = AgentConfig::from_toml(toml).unwrap();
         assert!((config.default.raise - 0.4).abs() < 1e-5);
         assert!(config.default.raise_sizes.is_none());
@@ -655,7 +655,7 @@ raise = 0.4
     fn resolve_enum_order_strongest_first() {
         // If a hand has both Set and FlushDraw, and config overrides both,
         // Set (index 5) should win over FlushDraw (index 16) since it comes first
-        let toml = r#"
+        let toml = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5]
@@ -674,7 +674,7 @@ raise = 0.8
 fold = 0.1
 call = 0.6
 raise = 0.3
-"#;
+";
         let config = AgentConfig::from_toml(toml).unwrap();
         let mut classification = HandClassification::new();
         classification.add(HandClass::Set);
@@ -706,7 +706,7 @@ raise = 0.2
 
     #[timed_test]
     fn multiple_class_overrides() {
-        let toml = r#"
+        let toml = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
@@ -735,7 +735,7 @@ raise = 0.55
 fold = 0.35
 call = 0.3
 raise = 0.35
-"#;
+";
         let config = AgentConfig::from_toml(toml).unwrap();
         assert_eq!(config.classes.len(), 4);
         assert!(config.classes.contains_key(&HandClass::StraightFlush));

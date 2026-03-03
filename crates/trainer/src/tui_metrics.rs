@@ -88,6 +88,7 @@ impl TuiMetrics {
     }
 
     /// Update per-flop exploitability state (called from on_progress).
+    #[allow(clippy::too_many_arguments)]
     pub fn update_flop(
         &self,
         flop_name: &str,

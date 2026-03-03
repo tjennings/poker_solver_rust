@@ -1236,8 +1236,9 @@ mod tests {
     }
 
     /// Verify that `postflop_showdown_value` uses the correct position mapping:
-    /// hero_pos=0 (SB/IP) should read pos-0 values, hero_pos=1 (BB/OOP) should
+    /// `hero_pos=0` (SB/IP) should read pos-0 values, `hero_pos=1` (BB/OOP) should
     /// read pos-1 values.
+    #[allow(clippy::erasing_op, clippy::identity_op)]
     #[timed_test]
     fn postflop_showdown_value_position_mapping() {
         use crate::preflop::postflop_abstraction::{PostflopAbstraction, PostflopValues};
@@ -1299,9 +1300,10 @@ mod tests {
         );
     }
 
-    /// Limped-pot showdowns (raise_count=0) must fall back to raw equity,
+    /// Limped-pot showdowns (`raise_count=0`) must fall back to raw equity,
     /// not the postflop model. This prevents the limp-trap degeneracy where
     /// inflated postflop model values make SB never raise.
+    #[allow(clippy::erasing_op, clippy::identity_op)]
     #[timed_test]
     fn postflop_showdown_value_limped_pot_uses_equity() {
         use crate::preflop::postflop_abstraction::{PostflopAbstraction, PostflopValues};
@@ -1379,6 +1381,7 @@ mod tests {
         assert_eq!(super::select_closest_spr([3.5].iter().copied(), 100.0), 0);
     }
 
+    #[allow(clippy::erasing_op, clippy::identity_op)]
     #[timed_test]
     fn postflop_showdown_value_selects_closest_spr() {
         use crate::preflop::postflop_abstraction::{PostflopAbstraction, PostflopValues};

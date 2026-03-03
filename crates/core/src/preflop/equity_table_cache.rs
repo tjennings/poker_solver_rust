@@ -27,7 +27,7 @@ struct CacheData {
     num_flops: u32,
     /// Flops encoded as [value*4+suit; 3] per flop, flattened.
     flop_bytes: Vec<u8>,
-    /// Equity tables flattened: num_flops × 169 × 169 f64s.
+    /// Equity tables flattened: `num_flops` x 169 x 169 f64s.
     tables_flat: Vec<f64>,
 }
 
@@ -90,6 +90,10 @@ impl EquityTableCache {
     }
 
     /// Save the cache to a binary file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if directory creation, serialization, or file writing fails.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -103,12 +107,13 @@ impl EquityTableCache {
         let data = CacheData {
             magic: MAGIC,
             version: VERSION,
+            #[allow(clippy::cast_possible_truncation)]
             num_flops: self.flops.len() as u32,
             flop_bytes,
             tables_flat: self.tables_flat.clone(),
         };
         let bytes =
-            bincode::serialize(&data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            bincode::serialize(&data).map_err(|e| io::Error::other(e.to_string()))?;
         std::fs::write(path, bytes)
     }
 
@@ -116,6 +121,7 @@ impl EquityTableCache {
     ///
     /// Returns `None` if the file doesn't exist, has an invalid magic/version,
     /// or fails to deserialize.
+    #[must_use]
     pub fn load(path: &Path) -> Option<Self> {
         let bytes = std::fs::read(path).ok()?;
         let data: CacheData = bincode::deserialize(&bytes).ok()?;
@@ -145,6 +151,7 @@ impl EquityTableCache {
     }
 
     /// Number of flops in the cache.
+    #[must_use]
     pub fn num_flops(&self) -> usize {
         self.flops.len()
     }
@@ -154,6 +161,7 @@ impl EquityTableCache {
     /// For each requested flop, looks up its index in the cache and copies
     /// the corresponding 169x169 table. Returns `None` for any flop not
     /// found in the cache.
+    #[must_use]
     pub fn extract_tables(&self, requested_flops: &[[Card; 3]]) -> Option<Vec<Vec<f64>>> {
         use rustc_hash::FxHashMap;
         let mut index_map: FxHashMap<[u8; 3], usize> = FxHashMap::default();
@@ -200,7 +208,7 @@ mod tests {
     }
 
     #[timed_test(10)]
-    #[ignore] // compute_equity_table is expensive (~seconds per flop)
+    #[ignore = "compute_equity_table is expensive (~seconds per flop)"]
     fn save_load_round_trip() {
         // Build a tiny cache with just 1 flop to test serialization
         let flops = canonical_flops();
@@ -233,7 +241,7 @@ mod tests {
     }
 
     #[timed_test(10)]
-    #[ignore] // compute_equity_table is expensive (~seconds per flop)
+    #[ignore = "compute_equity_table is expensive (~seconds per flop)"]
     fn extract_tables_finds_cached_flop() {
         let flops = canonical_flops();
         let flop = flops[0];
@@ -288,7 +296,7 @@ mod tests {
     }
 
     #[timed_test(10)]
-    #[ignore] // compute_equity_table is expensive (~seconds per flop)
+    #[ignore = "compute_equity_table is expensive (~seconds per flop)"]
     fn build_small_save_load_extract() {
         let flops = canonical_flops();
         let first_three: Vec<[Card; 3]> = flops[..3].to_vec();

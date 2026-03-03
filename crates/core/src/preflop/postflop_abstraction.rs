@@ -22,7 +22,7 @@ pub struct PostflopAbstraction {
     /// Hand-averaged EV: `hand_avg_values[hero_pos * 169 * 169 + hero_hand * 169 + opp_hand]`.
     ///
     /// Precomputed average of `values.get_by_flop` across all flops for each
-    /// `(hero_pos, hero_hand, opp_hand)` triple. This turns O(num_flops) showdown
+    /// `(hero_pos, hero_hand, opp_hand)` triple. This turns O(`num_flops`) showdown
     /// lookups into O(1) during preflop solving.
     pub hand_avg_values: Vec<f64>,
     /// The fixed SPR used for all postflop solves.
@@ -408,6 +408,7 @@ impl PostflopAbstraction {
         // Table is 2 * n * n, so n = isqrt(len / 2)
         let half = self.hand_avg_values.len() / 2;
         if half == 0 { return 0; }
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let n = (half as f64).sqrt() as usize;
         debug_assert_eq!(n * n, half, "hand_avg_values has unexpected size");
         n
@@ -422,7 +423,8 @@ impl PostflopAbstraction {
 ///
 /// Returns a flat `Vec<f64>` of size `2 * N * N` where N = 169 (canonical hands).
 /// Parallelized across hero hands with rayon.
-#[allow(clippy::cast_precision_loss)]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 pub fn compute_hand_avg_values(values: &PostflopValues, flop_weights: &[u16]) -> Vec<f64> {
     use rayon::prelude::*;
     let num_flops = values.num_flops;
@@ -504,7 +506,11 @@ pub(crate) fn avg_positive_regret_flat(regret_sum: &[f64], iterations: u64) -> f
         return 0.0;
     }
     let total: f64 = regret_sum.iter().filter(|&&r| r > 0.0).sum();
-    total / regret_sum.len() as f64 / iterations as f64
+    #[allow(clippy::cast_precision_loss)]
+    let len = regret_sum.len() as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let iters = iterations as f64;
+    total / len / iters
 }
 
 /// Compute max strategy change between two regret buffers across all decision nodes.
@@ -597,12 +603,12 @@ pub(crate) fn normalize_strategy_sum_into(strategy_sum: &[f64], start: usize, ou
         .map(|i| strategy_sum.get(start + i).copied().unwrap_or(0.0).max(0.0))
         .sum();
     if total > 0.0 {
-        for i in 0..num_actions {
-            out[i] = strategy_sum.get(start + i).copied().unwrap_or(0.0).max(0.0) / total;
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = strategy_sum.get(start + i).copied().unwrap_or(0.0).max(0.0) / total;
         }
     } else {
         let uniform = 1.0 / num_actions as f64;
-        out.iter_mut().for_each(|v| *v = uniform);
+        out.fill(uniform);
     }
 }
 
@@ -734,6 +740,7 @@ mod tests {
         assert!(base + num_actions <= layout.total_size);
     }
 
+    #[allow(clippy::erasing_op, clippy::identity_op)]
     #[timed_test]
     fn postflop_values_get_by_flop_index() {
         let num_flops = 2;
@@ -832,8 +839,8 @@ mod tests {
         let total = num_flops * 2 * num_buckets * num_buckets;
         let mut raw = vec![0.0f64; total];
         // Flop 0: all entries = 1.0
-        for i in 0..(2 * num_buckets * num_buckets) {
-            raw[i] = 1.0;
+        for entry in &mut raw[..(2 * num_buckets * num_buckets)] {
+            *entry = 1.0;
         }
         // Flop 1: all entries = 0.0 (already zero)
         let values = PostflopValues::from_raw(raw, num_buckets, num_flops);

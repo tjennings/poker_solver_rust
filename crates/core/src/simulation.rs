@@ -723,7 +723,7 @@ mod tests {
 
     #[timed_test]
     fn rule_based_agent_generator_creates_agents() {
-        let toml = r#"
+        let toml = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
@@ -732,7 +732,7 @@ bet_sizes = [0.5, 1.0]
 fold = 0.33
 call = 0.34
 raise = 0.33
-"#;
+";
         let config = Arc::new(AgentConfig::from_toml(toml).unwrap());
         let generator = RuleBasedAgentGenerator::new(config);
         let gs = GameState::new_starting(vec![100.0, 100.0], 2.0, 1.0, 0.0, 0);
@@ -783,7 +783,7 @@ raise = 0.33
     #[timed_test]
     fn run_simulation_rule_based_agents() {
         // Two rule-based agents with different strategies should complete without error
-        let aggressive_toml = r#"
+        let aggressive_toml = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
@@ -792,8 +792,8 @@ bet_sizes = [0.5, 1.0]
 fold = 0.1
 call = 0.3
 raise = 0.6
-"#;
-        let passive_toml = r#"
+";
+        let passive_toml = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
@@ -802,7 +802,7 @@ bet_sizes = [0.5, 1.0]
 fold = 0.3
 call = 0.6
 raise = 0.1
-"#;
+";
 
         let agg_config = Arc::new(AgentConfig::from_toml(aggressive_toml).unwrap());
         let passive_config = Arc::new(AgentConfig::from_toml(passive_toml).unwrap());
@@ -821,7 +821,7 @@ raise = 0.1
 
     #[timed_test]
     fn run_simulation_cancellation() {
-        let toml = r#"
+        let toml = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
@@ -830,7 +830,7 @@ bet_sizes = [0.5, 1.0]
 fold = 0.33
 call = 0.34
 raise = 0.33
-"#;
+";
         let config = Arc::new(AgentConfig::from_toml(toml).unwrap());
 
         let p1_gen: Box<dyn AgentGenerator> =
@@ -846,7 +846,7 @@ raise = 0.33
 
     #[timed_test]
     fn run_simulation_equity_curve_populated() {
-        let toml = r#"
+        let toml = r"
 [game]
 stack_depth = 100
 bet_sizes = [0.5, 1.0]
@@ -855,7 +855,7 @@ bet_sizes = [0.5, 1.0]
 fold = 0.2
 call = 0.4
 raise = 0.4
-"#;
+";
         let config = Arc::new(AgentConfig::from_toml(toml).unwrap());
 
         let p1_gen: Box<dyn AgentGenerator> =

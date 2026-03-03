@@ -226,7 +226,10 @@ pub fn compute_hand_bits_v2(
 /// throughout the codebase.
 #[must_use]
 pub fn canonical_hand_index(holding: [Card; 2]) -> u16 {
-    crate::hands::CanonicalHand::from_cards(holding[0], holding[1]).index() as u16
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        crate::hands::CanonicalHand::from_cards(holding[0], holding[1]).index() as u16
+    }
 }
 
 /// Map a canonical hand string (e.g. "AKs", "QQ", "72o") to its index.
@@ -234,6 +237,7 @@ pub fn canonical_hand_index(holding: [Card; 2]) -> u16 {
 /// Returns `None` if the string is not a valid canonical hand.
 /// Delegates to `CanonicalHand::parse` to ensure consistent indexing.
 #[must_use]
+#[allow(clippy::cast_possible_truncation)]
 pub fn canonical_hand_index_from_str(hand: &str) -> Option<u16> {
     crate::hands::CanonicalHand::parse(hand)
         .ok()

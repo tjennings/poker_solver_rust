@@ -244,7 +244,7 @@ mod tests {
         assert!((buf[1] - (-5.0 * neg)).abs() < 1e-10);
         assert!((buf[2]).abs() < 1e-10); // zero unchanged
         assert!((buf[3] - 3.0 * pos).abs() < 1e-10);
-        assert!((buf[4] - (-1.0 * neg)).abs() < 1e-10);
+        assert!((buf[4] - (-neg)).abs() < 1e-10);
     }
 
     #[timed_test]

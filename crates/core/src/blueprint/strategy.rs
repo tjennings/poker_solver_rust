@@ -566,6 +566,7 @@ mod tests {
     }
 
     #[timed_test]
+    #[allow(clippy::cast_possible_truncation)]
     fn opponent_reach_all_narrows_after_action() {
         let mut bp = BlueprintStrategy::new();
         // Hand 0: raises 100% (action index 2)
@@ -599,6 +600,7 @@ mod tests {
     }
 
     #[timed_test]
+    #[allow(clippy::cast_possible_truncation)]
     fn opponent_reach_all_multiple_decisions() {
         let mut bp = BlueprintStrategy::new();
         // Decision 1: hand 0 calls 80%, hand 1 calls 40%

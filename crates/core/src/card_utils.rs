@@ -41,6 +41,7 @@ mod tests {
     }
 
     #[timed_test]
+    #[allow(clippy::cast_possible_truncation)]
     fn value_rank_all_values_ascending() {
         let values = [
             Value::Two,

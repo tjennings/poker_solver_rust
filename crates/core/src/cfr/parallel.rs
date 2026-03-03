@@ -89,7 +89,7 @@ pub fn parallel_traverse_into<T: ParallelCfr>(
 /// Each pool entry is zeroed, then accumulates deltas for a chunk of pairs.
 /// The caller merges pool entries into final regret/strategy buffers.
 ///
-/// This avoids the O(threads × buf_size) allocation that `parallel_traverse_into`
+/// This avoids the O(threads × `buf_size`) allocation that `parallel_traverse_into`
 /// performs every call via rayon `fold`. The pool is allocated once and reused
 /// across iterations.
 pub fn parallel_traverse_pooled<T: ParallelCfr>(
@@ -116,7 +116,7 @@ pub fn parallel_traverse_pooled<T: ParallelCfr>(
     }
 
     let n = pool.len();
-    let chunk_size = (pairs.len() + n - 1) / n;
+    let chunk_size = pairs.len().div_ceil(n);
 
     pool.par_iter_mut()
         .enumerate()

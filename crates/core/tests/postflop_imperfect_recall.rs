@@ -31,7 +31,7 @@ fn postflop_abstraction_with_169_hands_builds_and_solves() {
     let result = PostflopAbstraction::build(
         &config,
         None, // no equity table
-        &|phase| eprintln!("  [build] {phase}"),
+        |phase| eprintln!("  [build] {phase}"),
     );
 
     assert!(

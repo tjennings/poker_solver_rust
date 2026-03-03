@@ -408,8 +408,7 @@ mod tests {
                 assert_eq!(
                     flop.weight(),
                     24,
-                    "rainbow unpaired flop {} has wrong weight",
-                    flop
+                    "rainbow unpaired flop {flop} has wrong weight"
                 );
             }
         }
@@ -425,8 +424,7 @@ mod tests {
                 assert_eq!(
                     flop.weight(),
                     12,
-                    "two-tone unpaired flop {} has wrong weight",
-                    flop
+                    "two-tone unpaired flop {flop} has wrong weight"
                 );
             }
         }
@@ -442,8 +440,7 @@ mod tests {
                 assert_eq!(
                     flop.weight(),
                     4,
-                    "monotone unpaired flop {} has wrong weight",
-                    flop
+                    "monotone unpaired flop {flop} has wrong weight"
                 );
             }
         }
@@ -454,7 +451,7 @@ mod tests {
         let flops = all_flops();
         for flop in &flops {
             if flop.rank_texture() == RankTexture::Paired {
-                assert_eq!(flop.weight(), 12, "paired flop {} has wrong weight", flop);
+                assert_eq!(flop.weight(), 12, "paired flop {flop} has wrong weight");
             }
         }
     }
@@ -464,7 +461,7 @@ mod tests {
         let flops = all_flops();
         for flop in &flops {
             if flop.rank_texture() == RankTexture::Trips {
-                assert_eq!(flop.weight(), 4, "trips flop {} has wrong weight", flop);
+                assert_eq!(flop.weight(), 4, "trips flop {flop} has wrong weight");
             }
         }
     }

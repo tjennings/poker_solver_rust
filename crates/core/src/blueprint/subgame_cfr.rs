@@ -554,9 +554,9 @@ mod tests {
         let hands = small_hands(&board, 50);
         let matrix = compute_equity_matrix(&hands.combos, &board);
         let n = hands.combos.len();
-        for i in 0..n {
+        for (i, row_i) in matrix.iter().enumerate() {
             for j in (i + 1)..n {
-                let sum = matrix[i][j] + matrix[j][i];
+                let sum = row_i[j] + matrix[j][i];
                 assert!(
                     (sum - 1.0).abs() < 1e-10,
                     "equity[{i}][{j}] + equity[{j}][{i}] = {sum}, expected 1.0"
@@ -676,7 +676,7 @@ mod tests {
         for i in 0..n {
             let v = solver.showdown_value(i, 50.0);
             assert!(
-                v >= -50.0 - 1e-10 && v <= 50.0 + 1e-10,
+                (-50.0 - 1e-10..=50.0 + 1e-10).contains(&v),
                 "showdown value {v} out of range for combo {i}"
             );
         }

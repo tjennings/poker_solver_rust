@@ -55,7 +55,7 @@ impl<'de> Deserialize<'de> for RaiseSize {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct RaiseSizeVisitor;
 
-        impl<'de> serde::de::Visitor<'de> for RaiseSizeVisitor {
+        impl serde::de::Visitor<'_> for RaiseSizeVisitor {
             type Value = RaiseSize;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -69,10 +69,12 @@ impl<'de> Deserialize<'de> for RaiseSize {
             }
 
             fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                #[allow(clippy::cast_precision_loss)]
                 self.visit_f64(v as f64)
             }
 
             fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                #[allow(clippy::cast_precision_loss)]
                 self.visit_f64(v as f64)
             }
 

@@ -64,6 +64,7 @@ fn card_bit(card: Card) -> u8 {
 /// Returns a flat `Vec` of size 169*169, indexed as `hero*169 + opp`.
 /// Value is hero's equity (0.0 to 1.0), or `NaN` if the hand pair has
 /// no non-conflicting combos.
+#[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec<f64> {
     let n = NUM_CANONICAL_HANDS;
@@ -168,7 +169,7 @@ pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) ->
 /// Both players are traversed every iteration. Chance nodes pass through
 /// to their single child (board cards are implicit in the equity table).
 /// Supports LCFR/DCFR iteration weighting via `dcfr` params.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn exhaustive_cfr_traverse(
     tree: &PostflopTree,
     layout: &PostflopLayout,
@@ -261,7 +262,7 @@ fn exhaustive_cfr_traverse(
 
                 if let Some(c) = counters {
                     let total = num_actions as u64;
-                    let pruned = prune_mask.count_ones() as u64;
+                    let pruned = u64::from(prune_mask.count_ones());
                     c.total_action_slots.fetch_add(total, Ordering::Relaxed);
                     c.pruned_action_slots.fetch_add(pruned, Ordering::Relaxed);
                 }
@@ -491,10 +492,12 @@ fn compute_exploitability(
     let mut br_values = [0.0f64; 2];
 
     for br_player in 0..2u8 {
-        let (total, count) = (0..n as u16)
+        #[allow(clippy::cast_possible_truncation)]
+        let n_u16 = n as u16;
+        let (total, count) = (0..n_u16)
             .into_par_iter()
             .flat_map_iter(|hero_hand| {
-                (0..n as u16)
+                (0..n_u16)
                     .filter(move |&opp_hand| {
                         !equity_table[hero_hand as usize * n + opp_hand as usize].is_nan()
                     })
@@ -521,7 +524,7 @@ fn compute_exploitability(
         };
     }
 
-    let pot_fraction = (br_values[0] + br_values[1]) / 2.0;
+    let pot_fraction = f64::midpoint(br_values[0], br_values[1]);
     pot_fraction * INITIAL_POT_BB * 1000.0
 }
 
@@ -608,7 +611,7 @@ fn extremal_regrets(regret_sum: &[f64]) -> (f64, f64) {
 /// global thread pool. When called from `build_exhaustive` (which parallelises
 /// over flops), rayon's work-stealing distributes hand-pair work across all
 /// available cores, dynamically rebalancing as flops converge at different rates.
-#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
 fn exhaustive_solve_one_flop(
     tree: &PostflopTree,
     layout: &PostflopLayout,
@@ -673,8 +676,8 @@ fn exhaustive_solve_one_flop(
 
         // Snapshot global counters before traversal so we can attribute
         // the delta to this flop.
-        let prev_ta = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
-        let prev_pa = counters.map_or(0, |c| c.pruned_action_slots.load(Ordering::Relaxed));
+        let prev_total = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
+        let prev_pruned = counters.map_or(0, |c| c.pruned_action_slots.load(Ordering::Relaxed));
 
         let prune_active = config.prune_warmup > 0
             && iter >= config.prune_warmup
@@ -700,10 +703,10 @@ fn exhaustive_solve_one_flop(
         } // ctx dropped — &regret_sum borrow released
 
         // Accumulate per-flop pruning stats from global counter deltas.
-        let cur_ta = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
-        let cur_pa = counters.map_or(0, |c| c.pruned_action_slots.load(Ordering::Relaxed));
-        flop_total_action_slots += cur_ta.saturating_sub(prev_ta);
-        flop_pruned_action_slots += cur_pa.saturating_sub(prev_pa);
+        let cur_total = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
+        let cur_pruned = counters.map_or(0, |c| c.pruned_action_slots.load(Ordering::Relaxed));
+        flop_total_action_slots += cur_total.saturating_sub(prev_total);
+        flop_pruned_action_slots += cur_pruned.saturating_sub(prev_pruned);
 
         // Apply DCFR discounting before merging deltas.
         if dcfr.should_discount(iteration) {
@@ -722,7 +725,7 @@ fn exhaustive_solve_one_flop(
         // recover when explored during explore-frequency iterations.
         if config.regret_floor > 0.0 && config.prune_warmup > 0 {
             let floor = -config.regret_floor;
-            for v in regret_sum.iter_mut() {
+            for v in &mut regret_sum {
                 *v = (*v).max(floor);
             }
         }
@@ -888,6 +891,7 @@ fn eval_with_avg_strategy(
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Build postflop values using exhaustive CFR with equity tables.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_exhaustive(
     config: &PostflopModelConfig,
     tree: &PostflopTree,
@@ -1116,6 +1120,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::erasing_op, clippy::identity_op)]
     #[timed_test]
     fn synthetic_equity_table_is_consistent() {
         let table = synthetic_equity_table();
@@ -1232,6 +1237,7 @@ mod tests {
                 pot_fraction,
             } = n
             {
+                #[allow(clippy::cast_possible_truncation)]
                 Some((i as u32, *folder, *pot_fraction))
             } else {
                 None
@@ -1300,6 +1306,7 @@ mod tests {
                 pot_fraction,
             } = n
             {
+                #[allow(clippy::cast_possible_truncation)]
                 Some((i as u32, *pot_fraction))
             } else {
                 None

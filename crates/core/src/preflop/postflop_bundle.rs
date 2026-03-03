@@ -210,17 +210,17 @@ impl PostflopBundle {
     ) -> Result<Vec<PostflopAbstraction>, std::io::Error> {
         // Try new layout: look for spr_* subdirectories
         let mut spr_dirs: Vec<_> = fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter(|e| {
                 e.file_name()
                     .to_str()
-                    .map_or(false, |n| n.starts_with("spr_"))
+                    .is_some_and(|n| n.starts_with("spr_"))
                     && e.path().join("solve.bin").exists()
             })
             .collect();
 
         if !spr_dirs.is_empty() {
-            spr_dirs.sort_by_key(|e| e.file_name());
+            spr_dirs.sort_by_key(std::fs::DirEntry::file_name);
             let mut result = Vec::with_capacity(spr_dirs.len());
             for entry in &spr_dirs {
                 let data_bytes = fs::read(entry.path().join("solve.bin"))?;

@@ -87,7 +87,7 @@ fn step1_preflop_solver_produces_valid_strategy() {
     // Check root action probabilities for every canonical hand.
     for hand_idx in 0..169 {
         let probs = strategy.get_root_probs(hand_idx);
-        assert_valid_distribution(&probs, &format!("hand {hand_idx} root"));
+        assert_valid_distribution(probs, &format!("hand {hand_idx} root"));
     }
 
     // Spot-check a few non-root nodes.
@@ -95,7 +95,7 @@ fn step1_preflop_solver_produces_valid_strategy() {
         for hand_idx in [0_usize, 84, 168] {
             let probs = strategy.get_probs(node_idx, hand_idx);
             if !probs.is_empty() {
-                assert_valid_distribution(&probs, &format!("node {node_idx} hand {hand_idx}"));
+                assert_valid_distribution(probs, &format!("node {node_idx} hand {hand_idx}"));
             }
         }
     }
@@ -213,7 +213,7 @@ fn full_pipeline_preflop_then_subgame() {
 
     // Verify AA (hand index 0) has a valid strategy at the root.
     let aa_probs = preflop_strategy.get_root_probs(0);
-    assert_valid_distribution(&aa_probs, "AA root");
+    assert_valid_distribution(aa_probs, "AA root");
 
     // -- Subgame phase --
     let board = river_board();

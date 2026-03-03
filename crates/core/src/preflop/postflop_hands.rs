@@ -176,11 +176,11 @@ mod tests {
             card(Value::Queen, Suit::Diamond),
         ];
         let map = build_combo_map(&flop);
-        for i in 0..13 {
+        for (i, combos) in map.iter().enumerate().take(13) {
             assert!(
-                map[i].len() <= 6,
+                combos.len() <= 6,
                 "pair hand {i} has {} combos",
-                map[i].len()
+                combos.len()
             );
         }
     }

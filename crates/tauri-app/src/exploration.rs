@@ -22,6 +22,9 @@ use poker_solver_core::info_key::{canonical_hand_index, canonical_hand_index_fro
 use poker_solver_core::showdown_equity;
 use poker_solver_core::poker::{Card, Suit, Value};
 
+/// Callback for reporting bucket computation progress: `(completed, total, board_key)`.
+type ProgressCallback = Box<dyn Fn(usize, usize, &str) + Send + 'static>;
+
 /// Event payload for bucket computation progress.
 #[derive(Debug, Clone, Serialize)]
 pub struct BucketProgressEvent {
@@ -1091,6 +1094,7 @@ pub struct HandEquity {
 /// Returns pot-fraction EV (where 1.0 = the initial postflop pot) averaged
 /// uniformly across all 169 opponent hands. Returns `None` if no
 /// postflop data is loaded or the hand string is unrecognised.
+#[allow(clippy::erasing_op, clippy::identity_op)]
 pub fn get_hand_equity_core(
     state: &ExplorationState,
     hand: &str,
@@ -1192,7 +1196,7 @@ pub fn get_computation_status(state: State<'_, ExplorationState>) -> Computation
 pub fn start_bucket_computation_core(
     state: &ExplorationState,
     board: Vec<String>,
-    on_progress: Option<Box<dyn Fn(usize, usize, &str) + Send + 'static>>,
+    on_progress: Option<ProgressCallback>,
 ) -> Result<String, String> {
     let board_key = board.join("");
 

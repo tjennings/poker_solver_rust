@@ -962,6 +962,7 @@ mod tests {
     #[timed_test]
     fn decision_children_are_valid_indices() {
         let tree = PostflopTree::build(PotType::Raised, &fast_config()).unwrap();
+        #[allow(clippy::cast_possible_truncation)]
         let n = tree.node_count() as u32;
         for node in &tree.nodes {
             if let PostflopNode::Decision { children, .. } = node {
@@ -975,6 +976,7 @@ mod tests {
     #[timed_test]
     fn chance_children_are_valid_indices() {
         let tree = PostflopTree::build(PotType::Raised, &fast_config()).unwrap();
+        #[allow(clippy::cast_possible_truncation)]
         let n = tree.node_count() as u32;
         for node in &tree.nodes {
             if let PostflopNode::Chance { children, .. } = node {
@@ -1187,7 +1189,7 @@ mod tests {
                 }
             }
             PostflopNode::Decision { action_labels, children, .. } => {
-                let is_opening = action_labels.iter().any(|a| *a == PostflopAction::Check);
+                let is_opening = action_labels.contains(&PostflopAction::Check);
                 let available = max_pot / pot - 1.0;
 
                 if available > 0.01 {
@@ -1229,12 +1231,10 @@ mod tests {
                 // Recurse into children, computing new pot for each action
                 for (action, &child) in action_labels.iter().zip(children.iter()) {
                     let child_pot = match action {
-                        PostflopAction::Check => pot,
                         PostflopAction::Bet(f) | PostflopAction::Raise(f) => {
                             (pot * (1.0 + f64::from(*f))).min(max_pot)
                         }
-                        PostflopAction::Call => pot, // caller matches bet; pot stays at new_pot
-                        PostflopAction::Fold => pot,
+                        PostflopAction::Check | PostflopAction::Call | PostflopAction::Fold => pot,
                     };
                     assert_allin_at_every_node(nodes, child, child_pot, max_pot, spr, violations);
                 }

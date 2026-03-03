@@ -7,9 +7,9 @@ postflop_model:
   postflop_sprs: [20]
   bet_sizes: [1, 5]
   max_raises_per_street: 2
-  postflop_solve_iterations: 1000
+  postflop_solve_iterations: 100
   cfr_convergence_threshold: 50  # mBB/h for exhaustive mode
   ev_convergence_threshold: 0.5
   prune_warmup: 2
-  prune_explore_freq: 20
-  prune_regret_threshold: -10  # 0 = prune any negative regret
+  prune_explore_freq: 10
+  prune_regret_threshold: 0  # 0 = prune any negative regret

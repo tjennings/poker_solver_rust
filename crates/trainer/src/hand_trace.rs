@@ -93,14 +93,14 @@ fn build_trace_output(
             let mut ev_bb_sum = 0.0_f64;
             let mut ev_count = 0_usize;
 
-            for tex_id in 0..num_textures {
+            for (tex_id, flop) in flops.iter().enumerate().take(num_textures) {
                 let postflop_ev = compute_postflop_ev(abstraction, hand_idx as u16, num_hands);
 
                 ev_sb_sum += postflop_ev.avg_sb;
                 ev_bb_sum += postflop_ev.avg_bb;
                 ev_count += 1;
 
-                let flop_str = format_flop(&flops[tex_id]);
+                let flop_str = format_flop(flop);
 
                 textures.push(TextureTrace {
                     texture_id: tex_id,

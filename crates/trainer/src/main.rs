@@ -701,12 +701,11 @@ fn run_solve_preflop(
         .and_then(|abs| abs.first())
         .map(|a| a.hand_avg_values.clone());
 
-    if let Some(ref abstractions) = postflop {
-        if !ev_diagnostic_hands.is_empty() {
-            if let Some(first) = abstractions.first() {
-                print_postflop_ev_diagnostics(first, &ev_diagnostic_hands);
-            }
-        }
+    if let Some(ref abstractions) = postflop
+        && !ev_diagnostic_hands.is_empty()
+        && let Some(first) = abstractions.first()
+    {
+        print_postflop_ev_diagnostics(first, &ev_diagnostic_hands);
     }
     if let Some(abstractions) = postflop {
         solver.attach_postflop(abstractions, &config);
@@ -759,17 +758,17 @@ fn run_solve_preflop(
         }
 
         // Periodic checkpoint save
-        if let Some(interval) = checkpoint_every {
-            if interval > 0 && done.is_multiple_of(interval) {
-                pb.suspend(|| {
-                    let cp_dir = output.join(format!("checkpoint_{done}"));
-                    let bundle = PreflopBundle::new(config.clone(), solver.strategy());
-                    match bundle.save(&cp_dir) {
-                        Ok(()) => println!("  Saved checkpoint to {}/", cp_dir.display()),
-                        Err(e) => eprintln!("  Warning: failed to save checkpoint: {e}"),
-                    }
-                });
-            }
+        if let Some(interval) = checkpoint_every
+            && interval > 0 && done.is_multiple_of(interval)
+        {
+            pb.suspend(|| {
+                let cp_dir = output.join(format!("checkpoint_{done}"));
+                let bundle = PreflopBundle::new(config.clone(), solver.strategy());
+                match bundle.save(&cp_dir) {
+                    Ok(()) => println!("  Saved checkpoint to {}/", cp_dir.display()),
+                    Err(e) => eprintln!("  Warning: failed to save checkpoint: {e}"),
+                }
+            });
         }
     }
     pb.finish_with_message("done");
@@ -885,7 +884,7 @@ fn print_regret_sparkline(history: &[f64], height: usize) {
     }
 
     // Print with y-axis labels.
-    for row in 0..height {
+    for (row, cells) in grid.iter().enumerate() {
         let label = if row == 0 {
             format!("{y_max:.1}")
         } else if row == height - 1 {
@@ -893,7 +892,7 @@ fn print_regret_sparkline(history: &[f64], height: usize) {
         } else {
             String::new()
         };
-        let braille: String = grid[row]
+        let braille: String = cells
             .iter()
             .map(|&bits| char::from_u32(0x2800 + bits).unwrap_or(' '))
             .collect();

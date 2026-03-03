@@ -228,8 +228,8 @@ pub fn print_equity_matrix(equity: &EquityTable) {
     }
     println!();
 
-    for row in 0..13 {
-        print!("  {} ", rank_label(RANK_ORDER[row]));
+    for (row, &rank) in RANK_ORDER.iter().enumerate() {
+        print!("  {} ", rank_label(rank));
         for col in 0..13 {
             let hand_idx = canonical_hand_index(row, col);
             let eq = equity.avg_equity(hand_idx);
@@ -367,7 +367,7 @@ pub fn preflop_strategy_matrix(
         for (col, cell) in matrix_row.iter_mut().enumerate() {
             let hand_idx = canonical_hand_index(row, col);
             let probs = strategy.get_probs(node_idx, hand_idx);
-            *cell = Some(classify_preflop_probs(action_labels, &probs));
+            *cell = Some(classify_preflop_probs(action_labels, probs));
         }
     }
     matrix
