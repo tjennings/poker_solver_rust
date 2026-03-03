@@ -642,12 +642,9 @@ fn exhaustive_solve_one_flop(
             .fetch_add((pairs.len() * num_iterations) as u64, Ordering::Relaxed);
     }
 
-    // Pre-allocate thread buffer pool once per flop, reused across all iterations.
-    // Each partition holds (regret_delta, strategy_delta) buffers zeroed before use.
-    let n_partitions = rayon::current_num_threads().max(1);
-    let mut pool: Vec<(Vec<f64>, Vec<f64>)> = (0..n_partitions)
-        .map(|_| (vec![0.0f64; buf_size], vec![0.0f64; buf_size]))
-        .collect();
+    // Single buffer pair: this function runs inside a par_iter over flops,
+    // so the outer parallelism already saturates the thread pool.
+    let mut buf = (vec![0.0f64; buf_size], vec![0.0f64; buf_size]);
 
     // Per-flop pruning accumulators: track action-slot pruning for this flop
     // by snapshotting the global counters before/after each iteration.
@@ -684,7 +681,7 @@ fn exhaustive_solve_one_flop(
                 counters,
             };
 
-            parallel_traverse_pooled(&ctx, &pairs, &mut pool);
+            parallel_traverse_pooled(&ctx, &pairs, std::slice::from_mut(&mut buf));
         } // ctx dropped — &regret_sum borrow released
 
         // Accumulate per-flop pruning stats from global counter deltas.
@@ -698,11 +695,9 @@ fn exhaustive_solve_one_flop(
             dcfr.discount_regrets(&mut regret_sum, iteration);
             dcfr.discount_strategy_sums(&mut strategy_sum, iteration);
         }
-        // Merge pool partition deltas directly into accumulators.
-        for (pdr, pds) in pool.iter() {
-            add_into(&mut regret_sum, pdr);
-            add_into(&mut strategy_sum, pds);
-        }
+        // Merge deltas into accumulators.
+        add_into(&mut regret_sum, &buf.0);
+        add_into(&mut strategy_sum, &buf.1);
         if dcfr.should_floor_regrets() {
             dcfr.floor_regrets(&mut regret_sum);
         }
