@@ -169,6 +169,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::PrecomputeEquity { output } => {
             use poker_solver_core::preflop::postflop_hands::canonical_flops;
 
+            if output.exists() {
+                eprintln!("Equity tables already exist at {}, skipping", output.display());
+                return Ok(());
+            }
+
             // Rank cache sits beside the equity table output
             let rank_cache_path = output.with_file_name("rank_arrays.bin");
             let total = 1755_u64;
