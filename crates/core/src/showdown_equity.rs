@@ -90,6 +90,34 @@ fn remaining_cards(hole: [Card; 2], board: &[Card]) -> arrayvec::ArrayVec<Card, 
     remaining
 }
 
+/// Convert a [`Rank`] to a `u32` ordinal that preserves comparison ordering.
+///
+/// The encoding places the hand category in bits 26..28 and the kicker
+/// value in bits 0..25. This guarantees that for any two ranks `a` and `b`,
+/// `a.cmp(&b) == rank_to_ordinal(a).cmp(&rank_to_ordinal(b))`.
+///
+/// The maximum kicker value across all `rs_poker` hand categories is <2^26
+/// (verified empirically: TwoPair's `(pairs << 13) | low` maxes at ~50M).
+#[must_use]
+pub fn rank_to_ordinal(rank: Rank) -> u32 {
+    let (cat, kicker) = match rank {
+        Rank::HighCard(k) => (0u32, k),
+        Rank::OnePair(k) => (1, k),
+        Rank::TwoPair(k) => (2, k),
+        Rank::ThreeOfAKind(k) => (3, k),
+        Rank::Straight(k) => (4, k),
+        Rank::Flush(k) => (5, k),
+        Rank::FullHouse(k) => (6, k),
+        Rank::FourOfAKind(k) => (7, k),
+        Rank::StraightFlush(k) => (8, k),
+    };
+    debug_assert!(
+        kicker < (1 << 26),
+        "kicker overflow: {kicker} for category {cat}"
+    );
+    (cat << 26) | kicker
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +223,67 @@ mod tests {
         for &b in &board {
             assert!(!remaining.contains(&b));
         }
+    }
+
+    #[timed_test]
+    fn rank_to_ordinal_preserves_ordering() {
+        // Build a set of known hands with known relative ranking
+        let board = [
+            card(King, Diamond),
+            card(Seven, Club),
+            card(Three, Spade),
+            card(Nine, Heart),
+            card(Two, Diamond),
+        ];
+
+        // Weakest to strongest
+        let hands = [
+            [card(Four, Heart), card(Six, Club)],      // high card
+            [card(Three, Heart), card(Five, Club)],     // pair of 3s
+            [card(Nine, Spade), card(Four, Club)],      // pair of 9s
+            [card(King, Heart), card(Four, Club)],      // pair of Ks
+            [card(Seven, Heart), card(Nine, Club)],     // two pair 9s and 7s
+            [card(King, Spade), card(Seven, Diamond)],  // two pair Ks and 7s
+            [card(King, Club), card(Nine, Diamond)],    // two pair Ks and 9s
+            [card(Three, Club), card(Three, Diamond)],  // trips 3s
+        ];
+
+        let ordinals: Vec<u32> = hands
+            .iter()
+            .map(|h| rank_to_ordinal(rank_hand(*h, &board)))
+            .collect();
+
+        // Verify strictly increasing (stronger hand = higher ordinal)
+        for i in 0..ordinals.len() - 1 {
+            assert!(
+                ordinals[i] < ordinals[i + 1],
+                "ordinal[{i}] ({}) should be < ordinal[{}] ({})",
+                ordinals[i],
+                i + 1,
+                ordinals[i + 1],
+            );
+        }
+    }
+
+    #[timed_test]
+    fn rank_to_ordinal_category_boundaries() {
+        // Any pair beats any high card
+        let board = [
+            card(King, Diamond),
+            card(Seven, Club),
+            card(Three, Spade),
+            card(Nine, Heart),
+            card(Two, Diamond),
+        ];
+        let high_card = rank_to_ordinal(rank_hand(
+            [card(Ace, Heart), card(Jack, Club)],
+            &board,
+        ));
+        let low_pair = rank_to_ordinal(rank_hand(
+            [card(Two, Heart), card(Two, Club)],
+            &board,
+        ));
+        assert!(high_card < low_pair, "any pair should beat any high card");
     }
 
     #[timed_test]
