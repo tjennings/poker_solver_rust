@@ -693,6 +693,7 @@ mod tests {
             prune_explore_freq: 20,
             prune_regret_threshold: 0.0,
             regret_floor: 1_000_000.0,
+            exploitability_freq: 2,
         }
     }
 

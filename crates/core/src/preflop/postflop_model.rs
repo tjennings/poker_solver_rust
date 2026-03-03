@@ -52,6 +52,9 @@ fn default_prune_regret_threshold() -> f64 {
 fn default_regret_floor() -> f64 {
     1_000_000.0
 }
+fn default_exploitability_freq() -> usize {
+    2
+}
 
 /// Deserialize either a scalar `f64` or a `Vec<f64>` into `Vec<f64>`.
 /// Supports backward-compatible YAML: `postflop_spr: 4.0` → `vec![4.0]`.
@@ -174,6 +177,12 @@ pub struct PostflopModelConfig {
     /// Maximum magnitude of negative cumulative regret clamp. Default: 1,000,000.
     #[serde(default = "default_regret_floor")]
     pub regret_floor: f64,
+
+    /// Compute exploitability every N iterations (exhaustive solver only).
+    /// Higher values reduce overhead from nested par_iter in `compute_exploitability`.
+    /// Default: 2.
+    #[serde(default = "default_exploitability_freq")]
+    pub exploitability_freq: usize,
 }
 
 impl PostflopModelConfig {
@@ -197,6 +206,7 @@ impl PostflopModelConfig {
             prune_explore_freq: 20,
             prune_regret_threshold: 0.0,
             regret_floor: 1_000_000.0,
+            exploitability_freq: 2,
         }
     }
 
@@ -220,6 +230,7 @@ impl PostflopModelConfig {
             prune_explore_freq: 20,
             prune_regret_threshold: 0.0,
             regret_floor: 1_000_000.0,
+            exploitability_freq: 2,
         }
     }
 

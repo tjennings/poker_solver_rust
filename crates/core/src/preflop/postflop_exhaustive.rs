@@ -721,7 +721,8 @@ fn exhaustive_solve_one_flop(
             current_min_neg = mn;
         }
 
-        if iter >= 1 && (iter % 2 == 1 || iter == num_iterations - 1) {
+        let expl_freq = config.exploitability_freq.max(1);
+        if iter >= 1 && (iter % expl_freq == expl_freq - 1 || iter == num_iterations - 1) {
             current_exploitability =
                 compute_exploitability(tree, layout, &strategy_sum, equity_table);
         }
