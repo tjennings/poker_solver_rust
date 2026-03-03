@@ -191,12 +191,11 @@ fn compute_equity_table_reference(combo_map: &[Vec<(Card, Card)>], flop: [Card; 
     table
 }
 
-/// Restructured equity table computation: evaluate each combo once per board.
+/// Pre-compute flop-only equity table for all 169x169 hand pairs.
 ///
-/// Instead of evaluating `rank_hand` for every (hero combo, opp combo) pair on
-/// every board, this evaluates each concrete combo exactly once per (turn, river)
-/// runout and stores a `u32` rank ordinal. Pairwise comparison then uses cheap
-/// `u32` comparisons rather than repeated 7-card evaluations.
+/// Two-phase implementation: evaluates each concrete combo exactly once per
+/// (turn, river) runout via `rank_to_ordinal(rank_hand(...))`, then derives
+/// equity via cheap `u32` comparison of precomputed rank ordinals.
 ///
 /// **Phase 1** (per board): compute `rank_to_ordinal(rank_hand(...))` for every
 /// concrete combo whose cards do not conflict with the 5-card board.
@@ -204,12 +203,6 @@ fn compute_equity_table_reference(combo_map: &[Vec<(Card, Card)>], flop: [Card; 
 /// **Phase 2** (per board): for every canonical (hero, opp) pair, compare
 /// precomputed rank ordinals using `u32` comparison. Accumulate `(equity_sum,
 /// count)` per canonical pair across all boards.
-///
-/// Pre-compute flop-only equity table for all 169x169 hand pairs.
-///
-/// Restructured two-phase implementation: evaluates each concrete combo once
-/// per board via `rank_to_ordinal(rank_hand(...))`, then derives equity via
-/// cheap `u32` comparison of precomputed rank ordinals.
 ///
 /// Returns a flat `Vec` of size 169*169, indexed as `hero*169 + opp`.
 /// Value is hero's equity (0.0 to 1.0), or `NaN` if the hand pair has
