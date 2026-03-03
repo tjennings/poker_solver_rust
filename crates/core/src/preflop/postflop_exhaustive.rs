@@ -87,7 +87,7 @@ fn card_bit(card: Card) -> u8 {
     card.value as u8 * 4 + card.suit as u8
 }
 
-/// Pre-compute flop-only equity table for all 169x169 hand pairs.
+/// Reference implementation: pre-compute flop-only equity table for all 169x169 hand pairs.
 ///
 /// For each `(hero_hand, opp_hand)` canonical pair, enumerates all concrete
 /// combo pairs that don't conflict with each other or the flop, then
@@ -96,9 +96,13 @@ fn card_bit(card: Card) -> u8 {
 /// Returns a flat `Vec` of size 169*169, indexed as `hero*169 + opp`.
 /// Value is hero's equity (0.0 to 1.0), or `NaN` if the hand pair has
 /// no non-conflicting combos.
+///
+/// Kept behind `#[cfg(test)]` for correctness verification against
+/// [`compute_equity_table`].
+#[cfg(test)]
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec<f64> {
+fn compute_equity_table_reference(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec<f64> {
     let n = NUM_CANONICAL_HANDS;
     let deck = all_cards_vec();
 
@@ -201,11 +205,18 @@ pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) ->
 /// precomputed rank ordinals using `u32` comparison. Accumulate `(equity_sum,
 /// count)` per canonical pair across all boards.
 ///
-/// The result is identical to [`compute_equity_table`] but restructured so the
-/// inner loop is dominated by integer comparison rather than hand evaluation.
+/// Pre-compute flop-only equity table for all 169x169 hand pairs.
+///
+/// Restructured two-phase implementation: evaluates each concrete combo once
+/// per board via `rank_to_ordinal(rank_hand(...))`, then derives equity via
+/// cheap `u32` comparison of precomputed rank ordinals.
+///
+/// Returns a flat `Vec` of size 169*169, indexed as `hero*169 + opp`.
+/// Value is hero's equity (0.0 to 1.0), or `NaN` if the hand pair has
+/// no non-conflicting combos.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-pub fn compute_equity_table_fast(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec<f64> {
+pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec<f64> {
     use std::ops::Range;
 
     /// Sentinel value for combos that conflict with the board.
@@ -1789,8 +1800,8 @@ mod tests {
     fn restructured_equity_table_matches_original() {
         let flop = test_flop();
         let combo_map = build_combo_map(&flop);
-        let original = compute_equity_table(&combo_map, flop);
-        let restructured = compute_equity_table_fast(&combo_map, flop);
+        let original = compute_equity_table_reference(&combo_map, flop);
+        let restructured = compute_equity_table(&combo_map, flop);
         assert_eq!(original.len(), restructured.len());
         let n = NUM_CANONICAL_HANDS;
         for h in 0..n {
