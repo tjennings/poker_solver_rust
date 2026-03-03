@@ -1,6 +1,7 @@
 pub mod equity_cache;
 pub mod equity_table_cache;
 mod exploitability;
+pub mod rank_array_cache;
 pub mod bundle;
 pub mod config;
 pub mod equity;
