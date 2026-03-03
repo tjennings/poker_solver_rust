@@ -169,16 +169,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::PrecomputeEquity { output } => {
             use poker_solver_core::preflop::postflop_hands::canonical_flops;
 
-            if output.exists() {
-                eprintln!("Equity tables already exist at {}, skipping", output.display());
+            let rank_cache_path = output.with_file_name("rank_arrays.bin");
+            let have_rank_cache = rank_cache_path.exists();
+            let have_equity_cache = output.exists();
+
+            if have_rank_cache && have_equity_cache {
+                eprintln!("Both caches already exist, nothing to do");
+                eprintln!("  rank arrays:   {}", rank_cache_path.display());
+                eprintln!("  equity tables: {}", output.display());
                 return Ok(());
             }
 
-            // Rank cache sits beside the equity table output
-            let rank_cache_path = output.with_file_name("rank_arrays.bin");
             let total = 1755_u64;
 
-            // Try loading existing rank cache
+            // Step 1: Build or load rank arrays
             let rank_cache = if let Some(cache) = RankArrayCache::load(&rank_cache_path) {
                 eprintln!(
                     "Loaded rank arrays for {} flops from cache",
@@ -230,27 +234,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                 cache
             };
 
-            // Derive equity tables from rank arrays
-            eprintln!("Deriving equity tables from rank arrays...");
-            let derive_start = Instant::now();
-            let flops = rank_cache.flops.clone();
-            let tables: Vec<Vec<f64>> = flops
-                .par_iter()
-                .enumerate()
-                .map(|(i, flop)| {
-                    let combo_map = build_combo_map(flop);
-                    derive_equity_table(&rank_cache.entries[i], &combo_map)
-                })
-                .collect();
-            eprintln!(
-                "Derived {} equity tables in {:.1}s",
-                tables.len(),
-                derive_start.elapsed().as_secs_f64()
-            );
+            // Step 2: Derive equity tables (skip if already cached)
+            if have_equity_cache {
+                eprintln!("Equity tables already exist at {}, skipping derivation", output.display());
+            } else {
+                eprintln!("Deriving equity tables from rank arrays...");
+                let derive_start = Instant::now();
+                let flops = rank_cache.flops.clone();
+                let tables: Vec<Vec<f64>> = flops
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, flop)| {
+                        let combo_map = build_combo_map(flop);
+                        derive_equity_table(&rank_cache.entries[i], &combo_map)
+                    })
+                    .collect();
+                eprintln!(
+                    "Derived {} equity tables in {:.1}s",
+                    tables.len(),
+                    derive_start.elapsed().as_secs_f64()
+                );
 
-            let eq_cache = EquityTableCache::from_parts(flops, tables);
-            eq_cache.save(&output)?;
-            eprintln!("Saved to {}", output.display());
+                let eq_cache = EquityTableCache::from_parts(flops, tables);
+                eq_cache.save(&output)?;
+                eprintln!("Saved equity tables to {}", output.display());
+            }
         }
     }
 
