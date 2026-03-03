@@ -19,7 +19,7 @@ use crate::abstraction::Street;
 use crate::cfr::dcfr::DcfrParams;
 use crate::poker::Card;
 use crate::preflop::CfrVariant;
-use crate::showdown_equity::rank_hand;
+use crate::showdown_equity::{rank_hand, rank_to_ordinal};
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -183,6 +183,153 @@ pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) ->
     let mut table = vec![f64::NAN; n * n];
     for (hero_idx, row) in rows.into_iter().enumerate() {
         table[hero_idx * n..hero_idx * n + n].copy_from_slice(&row);
+    }
+    table
+}
+
+/// Restructured equity table computation: evaluate each combo once per board.
+///
+/// Instead of evaluating `rank_hand` for every (hero combo, opp combo) pair on
+/// every board, this evaluates each concrete combo exactly once per (turn, river)
+/// runout and stores a `u32` rank ordinal. Pairwise comparison then uses cheap
+/// `u32` comparisons rather than repeated 7-card evaluations.
+///
+/// **Phase 1** (per board): compute `rank_to_ordinal(rank_hand(...))` for every
+/// concrete combo whose cards do not conflict with the 5-card board.
+///
+/// **Phase 2** (per board): for every canonical (hero, opp) pair, compare
+/// precomputed rank ordinals using `u32` comparison. Accumulate `(equity_sum,
+/// count)` per canonical pair across all boards.
+///
+/// The result is identical to [`compute_equity_table`] but restructured so the
+/// inner loop is dominated by integer comparison rather than hand evaluation.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn compute_equity_table_fast(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec<f64> {
+    use std::ops::Range;
+
+    /// Sentinel value for combos that conflict with the board.
+    const CONFLICT: u32 = u32::MAX;
+
+    let n = NUM_CANONICAL_HANDS;
+    let deck = all_cards_vec();
+
+    // ── Build flat combo index ──────────────────────────────────────────────
+    // combo_cards[i] = the two hole cards for flat combo i
+    // combo_mask[i]  = bitmask of those two cards (for conflict checks)
+    // canonical_range[h] = Range<usize> into combo_cards for canonical hand h
+
+    let mut combo_cards: Vec<(Card, Card)> = Vec::new();
+    let mut combo_mask: Vec<u64> = Vec::new();
+    let mut canonical_range: Vec<Range<usize>> = Vec::with_capacity(n);
+
+    for hand_combos in combo_map.iter().take(n) {
+        let start = combo_cards.len();
+        for &(c1, c2) in hand_combos {
+            combo_cards.push((c1, c2));
+            combo_mask.push((1u64 << card_bit(c1)) | (1u64 << card_bit(c2)));
+        }
+        canonical_range.push(start..combo_cards.len());
+    }
+
+    let total_combos = combo_cards.len();
+
+    // ── Pre-compute deck bit positions ──────────────────────────────────────
+    let mut deck_bits = [0u8; 52];
+    for (i, &c) in deck.iter().enumerate() {
+        deck_bits[i] = card_bit(c);
+    }
+
+    // Flop mask — set once, reused by every thread.
+    let flop_mask: u64 = (1u64 << card_bit(flop[0]))
+        | (1u64 << card_bit(flop[1]))
+        | (1u64 << card_bit(flop[2]));
+
+    // ── Enumerate all (turn, river) boards and accumulate ───────────────────
+    // Collect board pairs so we can par_iter over them.
+    let mut boards: Vec<(usize, usize)> = Vec::new();
+    for (ti, &ti_bit) in deck_bits.iter().enumerate() {
+        if flop_mask & (1u64 << ti_bit) != 0 {
+            continue;
+        }
+        for (ri, &ri_bit) in deck_bits.iter().enumerate().skip(ti + 1) {
+            if flop_mask & (1u64 << ri_bit) != 0 {
+                continue;
+            }
+            boards.push((ti, ri));
+        }
+    }
+
+    let (eq_sum, eq_count) = boards
+        .par_iter()
+        .fold(
+            || (vec![0.0f64; n * n], vec![0u64; n * n]),
+            |(mut local_eq, mut local_count), &(ti, ri)| {
+                let turn = deck[ti];
+                let river = deck[ri];
+                let board = [flop[0], flop[1], flop[2], turn, river];
+                let board_mask: u64 =
+                    flop_mask | (1u64 << deck_bits[ti]) | (1u64 << deck_bits[ri]);
+
+                // Phase 1: evaluate every combo against this board.
+                let mut ranks = vec![CONFLICT; total_combos];
+                for (ci, &(c1, c2)) in combo_cards.iter().enumerate() {
+                    if combo_mask[ci] & board_mask != 0 {
+                        continue; // combo conflicts with board
+                    }
+                    ranks[ci] = rank_to_ordinal(rank_hand([c1, c2], &board));
+                }
+
+                // Phase 2: for each canonical (hero, opp) pair, compare ranks.
+                for (h_idx, h_range) in canonical_range.iter().enumerate() {
+                    for (o_idx, o_range) in canonical_range.iter().enumerate() {
+                        let pair_idx = h_idx * n + o_idx;
+                        for hi in h_range.clone() {
+                            let h_rank = ranks[hi];
+                            if h_rank == CONFLICT {
+                                continue;
+                            }
+                            let h_mask = combo_mask[hi];
+                            for oi in o_range.clone() {
+                                let o_rank = ranks[oi];
+                                if o_rank == CONFLICT {
+                                    continue;
+                                }
+                                // Hero/opp card overlap check.
+                                if h_mask & combo_mask[oi] != 0 {
+                                    continue;
+                                }
+                                local_eq[pair_idx] += match h_rank.cmp(&o_rank) {
+                                    std::cmp::Ordering::Greater => 1.0,
+                                    std::cmp::Ordering::Equal => 0.5,
+                                    std::cmp::Ordering::Less => 0.0,
+                                };
+                                local_count[pair_idx] += 1;
+                            }
+                        }
+                    }
+                }
+
+                (local_eq, local_count)
+            },
+        )
+        .reduce(
+            || (vec![0.0f64; n * n], vec![0u64; n * n]),
+            |(mut a_eq, mut a_count), (b_eq, b_count)| {
+                for i in 0..a_eq.len() {
+                    a_eq[i] += b_eq[i];
+                    a_count[i] += b_count[i];
+                }
+                (a_eq, a_count)
+            },
+        );
+
+    // ── Convert to equity fractions ─────────────────────────────────────────
+    let mut table = vec![f64::NAN; n * n];
+    for i in 0..n * n {
+        if eq_count[i] > 0 {
+            table[i] = eq_sum[i] / eq_count[i] as f64;
+        }
     }
     table
 }
@@ -1635,5 +1782,28 @@ mod tests {
         assert!(traversals > 0, "traversal counter should be incremented, got {traversals}");
         let total_actions = counters.total_action_slots.load(Ordering::Relaxed);
         assert!(total_actions > 0, "action counter should be incremented, got {total_actions}");
+    }
+
+    #[timed_test(300)]
+    #[ignore = "slow: compares old vs new equity table"]
+    fn restructured_equity_table_matches_original() {
+        let flop = test_flop();
+        let combo_map = build_combo_map(&flop);
+        let original = compute_equity_table(&combo_map, flop);
+        let restructured = compute_equity_table_fast(&combo_map, flop);
+        assert_eq!(original.len(), restructured.len());
+        let n = NUM_CANONICAL_HANDS;
+        for h in 0..n {
+            for o in 0..n {
+                let idx = h * n + o;
+                let a = original[idx];
+                let b = restructured[idx];
+                if a.is_nan() {
+                    assert!(b.is_nan(), "at [{h}][{o}]: original=NaN, new={b}");
+                } else {
+                    assert!((a - b).abs() < 1e-10, "at [{h}][{o}]: orig={a}, new={b}, diff={}", (a - b).abs());
+                }
+            }
+        }
     }
 }
