@@ -23,6 +23,9 @@ use poker_solver_core::preflop::postflop_abstraction::{BuildPhase, FlopStage, Po
 use poker_solver_core::preflop::postflop_hands::{build_combo_map, parse_flops, sample_canonical_flops};
 use poker_solver_core::preflop::postflop_exhaustive::compute_equity_table;
 use poker_solver_core::preflop::equity_table_cache::EquityTableCache;
+use poker_solver_core::preflop::rank_array_cache::{
+    compute_rank_arrays, derive_equity_table, RankArrayCache,
+};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -164,31 +167,84 @@ fn main() -> Result<(), Box<dyn Error>> {
             hand_trace::run_with_abstraction(&pf_config, &abstraction)?;
         }
         Commands::PrecomputeEquity { output } => {
-            let total = 1755_u64; // all canonical flops
-            let pb = ProgressBar::new(total);
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} flops ({eta})")
-                    .unwrap()
-                    .progress_chars("=>-"),
-            );
-            pb.enable_steady_tick(Duration::from_millis(200));
-            eprintln!("Computing equity tables for {total} canonical flops...");
+            use poker_solver_core::preflop::postflop_hands::canonical_flops;
 
-            let start = Instant::now();
-            let cache = EquityTableCache::build(|completed, _total| {
-                pb.set_position(completed as u64);
-            });
-            pb.finish_with_message("done");
+            // Rank cache sits beside the equity table output
+            let rank_cache_path = output.with_file_name("rank_arrays.bin");
+            let total = 1755_u64;
 
-            let elapsed = start.elapsed();
+            // Try loading existing rank cache
+            let rank_cache = if let Some(cache) = RankArrayCache::load(&rank_cache_path) {
+                eprintln!(
+                    "Loaded rank arrays for {} flops from cache",
+                    cache.num_flops()
+                );
+                cache
+            } else {
+                let pb = ProgressBar::new(total);
+                pb.set_style(
+                    ProgressStyle::default_bar()
+                        .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} flops ({eta})")
+                        .unwrap()
+                        .progress_chars("=>-"),
+                );
+                pb.enable_steady_tick(Duration::from_millis(200));
+                eprintln!("Computing rank arrays for {total} canonical flops...");
+
+                let flops = canonical_flops();
+                let start = Instant::now();
+                let completed = AtomicU32::new(0);
+
+                let entries: Vec<_> = flops
+                    .par_iter()
+                    .map(|flop| {
+                        let combo_map = build_combo_map(flop);
+                        let data = compute_rank_arrays(&combo_map, *flop);
+                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        pb.set_position(u64::from(done));
+                        data
+                    })
+                    .collect();
+
+                pb.finish_with_message("done");
+                let elapsed = start.elapsed();
+                eprintln!(
+                    "Computed rank arrays in {:.1}s",
+                    elapsed.as_secs_f64()
+                );
+
+                let cache = RankArrayCache {
+                    flops: flops.clone(),
+                    entries,
+                };
+                if let Err(e) = cache.save(&rank_cache_path) {
+                    eprintln!("Warning: failed to save rank cache: {e}");
+                } else {
+                    eprintln!("Rank cache saved to {}", rank_cache_path.display());
+                }
+                cache
+            };
+
+            // Derive equity tables from rank arrays
+            eprintln!("Deriving equity tables from rank arrays...");
+            let derive_start = Instant::now();
+            let flops = rank_cache.flops.clone();
+            let tables: Vec<Vec<f64>> = flops
+                .par_iter()
+                .enumerate()
+                .map(|(i, flop)| {
+                    let combo_map = build_combo_map(flop);
+                    derive_equity_table(&rank_cache.entries[i], &combo_map)
+                })
+                .collect();
             eprintln!(
-                "Computed {} equity tables in {:.1}s",
-                cache.num_flops(),
-                elapsed.as_secs_f64()
+                "Derived {} equity tables in {:.1}s",
+                tables.len(),
+                derive_start.elapsed().as_secs_f64()
             );
 
-            cache.save(&output)?;
+            let eq_cache = EquityTableCache::from_parts(flops, tables);
+            eq_cache.save(&output)?;
             eprintln!("Saved to {}", output.display());
         }
     }
@@ -424,37 +480,62 @@ fn build_postflop_with_progress(
                         vec![]
                     }
                 }
-            } else if sprs.len() > 1 {
-                // No cache — fall back to inline pre-computation for multi-SPR runs.
-                if let Some(m) = &metrics {
-                    m.equity_tables_total.store(flops.len() as u32, Ordering::Relaxed);
-                    m.set_phase(4); // equity table pre-computation phase
-                }
-                if !use_tui {
-                    eprintln!(
-                        "Pre-computing equity tables for {} flops...",
-                        flops.len()
-                    );
-                }
-                let eq_completed = AtomicU32::new(0);
-                let tables: Vec<Vec<f64>> = flops
-                    .par_iter()
-                    .map(|flop| {
-                        let combo_map = build_combo_map(flop);
-                        let table = compute_equity_table(&combo_map, *flop);
-                        let done = eq_completed.fetch_add(1, Ordering::Relaxed) + 1;
-                        if let Some(m) = &metrics {
-                            m.equity_tables_completed.store(done, Ordering::Relaxed);
-                        }
-                        table
-                    })
-                    .collect();
-                if let Some(m) = &metrics {
-                    m.set_phase(0); // back to idle before SPR loop
-                }
-                tables
             } else {
-                vec![]
+                // No equity table cache — try rank array cache
+                let rank_cache_path = Path::new("cache/rank_arrays.bin");
+                if let Some(rank_cache) = RankArrayCache::load(rank_cache_path) {
+                    if !use_tui {
+                        eprintln!(
+                            "Deriving equity tables from rank cache ({} flops)...",
+                            rank_cache.num_flops()
+                        );
+                    }
+                    let tables: Vec<Vec<f64>> = flops
+                        .par_iter()
+                        .map(|flop| {
+                            if let Some(data) = rank_cache.get_flop_data(flop) {
+                                let combo_map = build_combo_map(flop);
+                                derive_equity_table(data, &combo_map)
+                            } else {
+                                // Flop not in rank cache, compute directly
+                                let combo_map = build_combo_map(flop);
+                                compute_equity_table(&combo_map, *flop)
+                            }
+                        })
+                        .collect();
+                    tables
+                } else if sprs.len() > 1 {
+                    // No cache at all — fall back to inline pre-computation for multi-SPR runs.
+                    if let Some(m) = &metrics {
+                        m.equity_tables_total.store(flops.len() as u32, Ordering::Relaxed);
+                        m.set_phase(4); // equity table pre-computation phase
+                    }
+                    if !use_tui {
+                        eprintln!(
+                            "Pre-computing equity tables for {} flops...",
+                            flops.len()
+                        );
+                    }
+                    let eq_completed = AtomicU32::new(0);
+                    let tables: Vec<Vec<f64>> = flops
+                        .par_iter()
+                        .map(|flop| {
+                            let combo_map = build_combo_map(flop);
+                            let table = compute_equity_table(&combo_map, *flop);
+                            let done = eq_completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            if let Some(m) = &metrics {
+                                m.equity_tables_completed.store(done, Ordering::Relaxed);
+                            }
+                            table
+                        })
+                        .collect();
+                    if let Some(m) = &metrics {
+                        m.set_phase(0); // back to idle before SPR loop
+                    }
+                    tables
+                } else {
+                    vec![]
+                }
             }
         } else {
             vec![]

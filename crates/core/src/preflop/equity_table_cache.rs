@@ -59,6 +59,21 @@ impl EquityTableCache {
     /// Number of entries per equity table (169 × 169).
     const TABLE_SIZE: usize = NUM_CANONICAL_HANDS * NUM_CANONICAL_HANDS;
 
+    /// Construct an `EquityTableCache` from pre-computed parts.
+    ///
+    /// `flops` and `tables` must have the same length, and each table must
+    /// contain exactly 169 × 169 entries.
+    #[must_use]
+    pub fn from_parts(flops: Vec<[Card; 3]>, tables: Vec<Vec<f64>>) -> Self {
+        debug_assert_eq!(flops.len(), tables.len());
+        let mut tables_flat = Vec::with_capacity(flops.len() * Self::TABLE_SIZE);
+        for table in tables {
+            debug_assert_eq!(table.len(), Self::TABLE_SIZE);
+            tables_flat.extend_from_slice(&table);
+        }
+        Self { flops, tables_flat }
+    }
+
     /// Build the cache by computing equity tables for all canonical flops.
     ///
     /// Calls `on_progress(completed, total)` after each flop finishes.
