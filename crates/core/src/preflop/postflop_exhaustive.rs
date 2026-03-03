@@ -4,12 +4,13 @@
 //! enumerated (no sampling), and showdown terminals use O(1) equity lookups.
 
 use rayon::prelude::*;
+use std::cell::RefCell;
 
 use crate::cfr::parallel::{add_into, parallel_traverse_pooled, ParallelCfr};
 
 use super::postflop_abstraction::{
-    normalize_strategy_sum_into, regret_matching_into, BuildPhase, FlopSolveResult, FlopStage,
-    PostflopLayout, PostflopValues, MAX_POSTFLOP_ACTIONS,
+    normalize_strategy_sum_into, regret_matching_into, BuildPhase, FlopStage, PostflopLayout,
+    PostflopValues, MAX_POSTFLOP_ACTIONS,
 };
 use super::postflop_hands::{all_cards_vec, build_combo_map, NUM_CANONICAL_HANDS};
 use super::postflop_model::PostflopModelConfig;
@@ -40,6 +41,37 @@ pub struct SolverCounters {
     /// Total expected `traverse_pair` calls for the current SPR.
     /// Each flop adds `pairs.len() * num_iterations` when it starts solving.
     pub total_expected_traversals: AtomicU64,
+}
+
+/// Reusable per-thread buffers for exhaustive CFR solving.
+///
+/// Allocated once per rayon worker thread and reused across flops to avoid
+/// repeated allocation of large vectors (e.g. 277 MB per flop at SPR=6).
+pub(crate) struct FlopBuffers {
+    pub regret_sum: Vec<f64>,
+    pub strategy_sum: Vec<f64>,
+    pub delta: (Vec<f64>, Vec<f64>),
+}
+
+impl FlopBuffers {
+    /// Allocate zeroed buffers of the given size.
+    pub(crate) fn new(size: usize) -> Self {
+        Self {
+            regret_sum: vec![0.0; size],
+            strategy_sum: vec![0.0; size],
+            delta: (vec![0.0; size], vec![0.0; size]),
+        }
+    }
+
+    /// Zero all buffers for reuse with the next flop.
+    fn reset(&mut self) {
+        self.regret_sum.fill(0.0);
+        self.strategy_sum.fill(0.0);
+        // delta buffers are zeroed per-iteration by parallel_traverse_pooled,
+        // but zero them here too for clean state between flops.
+        self.delta.0.fill(0.0);
+        self.delta.1.fill(0.0);
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -623,10 +655,8 @@ fn exhaustive_solve_one_flop(
     config: &PostflopModelConfig,
     on_progress: &(impl Fn(BuildPhase) + Sync),
     counters: Option<&SolverCounters>,
-) -> FlopSolveResult {
-    let buf_size = layout.total_size;
-    let mut regret_sum = vec![0.0f64; buf_size];
-    let mut strategy_sum = vec![0.0f64; buf_size];
+    bufs: &mut FlopBuffers,
+) -> (f64, usize) {
     let mut current_exploitability = f64::INFINITY;
     let mut current_max_pos = 0.0f64;
     let mut current_min_neg = 0.0f64;
@@ -644,10 +674,6 @@ fn exhaustive_solve_one_flop(
         c.total_expected_traversals
             .fetch_add((pairs.len() * num_iterations) as u64, Ordering::Relaxed);
     }
-
-    // Single buffer pair: this function runs inside a par_iter over flops,
-    // so the outer parallelism already saturates the thread pool.
-    let mut buf = (vec![0.0f64; buf_size], vec![0.0f64; buf_size]);
 
     // Per-flop pruning accumulators: track action-slot pruning for this flop
     // by snapshotting the global counters before/after each iteration.
@@ -691,7 +717,7 @@ fn exhaustive_solve_one_flop(
                 tree,
                 layout,
                 equity_table,
-                snapshot: &regret_sum,
+                snapshot: &bufs.regret_sum,
                 iteration,
                 dcfr,
                 prune_active,
@@ -699,8 +725,8 @@ fn exhaustive_solve_one_flop(
                 counters,
             };
 
-            parallel_traverse_pooled(&ctx, &pairs, std::slice::from_mut(&mut buf));
-        } // ctx dropped — &regret_sum borrow released
+            parallel_traverse_pooled(&ctx, &pairs, std::slice::from_mut(&mut bufs.delta));
+        } // ctx dropped — &bufs.regret_sum borrow released
 
         // Accumulate per-flop pruning stats from global counter deltas.
         let cur_total = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
@@ -710,14 +736,14 @@ fn exhaustive_solve_one_flop(
 
         // Apply DCFR discounting before merging deltas.
         if dcfr.should_discount(iteration) {
-            dcfr.discount_regrets(&mut regret_sum, iteration);
-            dcfr.discount_strategy_sums(&mut strategy_sum, iteration);
+            dcfr.discount_regrets(&mut bufs.regret_sum, iteration);
+            dcfr.discount_strategy_sums(&mut bufs.strategy_sum, iteration);
         }
         // Merge deltas into accumulators.
-        add_into(&mut regret_sum, &buf.0);
-        add_into(&mut strategy_sum, &buf.1);
+        add_into(&mut bufs.regret_sum, &bufs.delta.0);
+        add_into(&mut bufs.strategy_sum, &bufs.delta.1);
         if dcfr.should_floor_regrets() {
-            dcfr.floor_regrets(&mut regret_sum);
+            dcfr.floor_regrets(&mut bufs.regret_sum);
         }
 
         // Clamp negative regrets to prevent unbounded accumulation.
@@ -725,7 +751,7 @@ fn exhaustive_solve_one_flop(
         // recover when explored during explore-frequency iterations.
         if config.regret_floor > 0.0 && config.prune_warmup > 0 {
             let floor = -config.regret_floor;
-            for v in &mut regret_sum {
+            for v in bufs.regret_sum.iter_mut() {
                 *v = (*v).max(floor);
             }
         }
@@ -734,7 +760,7 @@ fn exhaustive_solve_one_flop(
 
         // Compute median regrets periodically (every 10 iters + final).
         if iter % 10 == 0 || iter == num_iterations - 1 {
-            let (mp, mn) = extremal_regrets(&regret_sum);
+            let (mp, mn) = extremal_regrets(&bufs.regret_sum);
             current_max_pos = mp;
             current_min_neg = mn;
         }
@@ -742,7 +768,7 @@ fn exhaustive_solve_one_flop(
         let expl_freq = config.exploitability_freq.max(1);
         if iter >= 1 && (iter % expl_freq == expl_freq - 1 || iter == num_iterations - 1) {
             current_exploitability =
-                compute_exploitability(tree, layout, &strategy_sum, equity_table);
+                compute_exploitability(tree, layout, &bufs.strategy_sum, equity_table);
         }
 
         on_progress(BuildPhase::FlopProgress {
@@ -764,11 +790,7 @@ fn exhaustive_solve_one_flop(
         }
     }
 
-    FlopSolveResult {
-        strategy_sum,
-        delta: current_exploitability,
-        iterations_used,
-    }
+    (current_exploitability, iterations_used)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -915,6 +937,12 @@ pub(crate) fn build_exhaustive(
         CfrVariant::CfrPlus => DcfrParams::from_config(CfrVariant::CfrPlus, 0.0, 0.0, 0.0, 0),
     };
 
+    let buf_size = layout.total_size;
+
+    thread_local! {
+        static FLOP_BUFS: RefCell<Option<FlopBuffers>> = const { RefCell::new(None) };
+    }
+
     let results: Vec<Vec<f64>> = (0..num_flops)
         .into_par_iter()
         .map(|flop_idx| {
@@ -928,33 +956,45 @@ pub(crate) fn build_exhaustive(
                 compute_equity_table(&combo_map, flop)
             };
 
-            let result = exhaustive_solve_one_flop(
-                tree,
-                layout,
-                &equity_table,
-                num_iterations,
-                config.cfr_convergence_threshold,
-                &flop_name,
-                &dcfr,
-                config,
-                on_progress,
-                counters,
-            );
+            FLOP_BUFS.with(|cell| {
+                let mut borrow = cell.borrow_mut();
+                // Reallocate if buffer size changed (different SPR = different tree).
+                if borrow.as_ref().map_or(true, |b| b.regret_sum.len() != buf_size) {
+                    *borrow = Some(FlopBuffers::new(buf_size));
+                } else {
+                    borrow.as_mut().unwrap().reset();
+                }
+                let bufs = borrow.as_mut().unwrap();
 
-            let values =
-                exhaustive_extract_values(tree, layout, &result.strategy_sum, &equity_table);
+                let (_delta, _iterations_used) = exhaustive_solve_one_flop(
+                    tree,
+                    layout,
+                    &equity_table,
+                    num_iterations,
+                    config.cfr_convergence_threshold,
+                    &flop_name,
+                    &dcfr,
+                    config,
+                    on_progress,
+                    counters,
+                    bufs,
+                );
 
-            on_progress(BuildPhase::FlopProgress {
-                flop_name: flop_name.clone(),
-                stage: FlopStage::Done,
-            });
-            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            on_progress(BuildPhase::MccfrFlopsCompleted {
-                completed: done,
-                total: num_flops,
-            });
+                let values =
+                    exhaustive_extract_values(tree, layout, &bufs.strategy_sum, &equity_table);
 
-            values
+                on_progress(BuildPhase::FlopProgress {
+                    flop_name: flop_name.clone(),
+                    stage: FlopStage::Done,
+                });
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                on_progress(BuildPhase::MccfrFlopsCompleted {
+                    completed: done,
+                    total: num_flops,
+                });
+
+                values
+            })
         })
         .collect();
 
@@ -1155,8 +1195,9 @@ mod tests {
 
         let equity_table = synthetic_equity_table();
         let dcfr = DcfrParams::linear();
+        let mut bufs = FlopBuffers::new(layout.total_size);
 
-        let result = exhaustive_solve_one_flop(
+        let (_delta, iterations_used) = exhaustive_solve_one_flop(
             &tree,
             &layout,
             &equity_table,
@@ -1167,10 +1208,11 @@ mod tests {
             &config,
             &|_| {},
             None,
+            &mut bufs,
         );
 
-        assert!(result.iterations_used > 0);
-        let has_nonzero = result.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
+        assert!(iterations_used > 0);
+        let has_nonzero = bufs.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
         assert!(has_nonzero, "strategy_sum should have non-zero entries");
     }
 
@@ -1189,8 +1231,9 @@ mod tests {
 
         let equity_table = synthetic_equity_table();
         let dcfr = DcfrParams::linear();
+        let mut bufs = FlopBuffers::new(layout.total_size);
 
-        let result = exhaustive_solve_one_flop(
+        let (_delta, _iterations_used) = exhaustive_solve_one_flop(
             &tree,
             &layout,
             &equity_table,
@@ -1201,10 +1244,11 @@ mod tests {
             &config,
             &|_| {},
             None,
+            &mut bufs,
         );
 
         let values =
-            exhaustive_extract_values(&tree, &layout, &result.strategy_sum, &equity_table);
+            exhaustive_extract_values(&tree, &layout, &bufs.strategy_sum, &equity_table);
         assert_eq!(values.len(), 2 * n * n);
         assert!(
             values.iter().all(|v| v.is_finite()),
@@ -1389,13 +1433,15 @@ mod tests {
         // compared to in-place updates.
         let dcfr = DcfrParams::linear();
         let no_prune = PostflopModelConfig::exhaustive_fast();
-        let result = exhaustive_solve_one_flop(
+        let mut bufs = FlopBuffers::new(layout.total_size);
+        let (delta, _iterations_used) = exhaustive_solve_one_flop(
             &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, &no_prune, &|_| {}, None,
+            &mut bufs,
         );
         assert!(
-            result.delta < expl_uniform,
+            delta < expl_uniform,
             "trained exploitability ({:.6}) should be less than uniform ({:.6})",
-            result.delta,
+            delta,
             expl_uniform
         );
     }
@@ -1417,8 +1463,10 @@ mod tests {
         let dcfr = DcfrParams::linear();
 
         // Solve with default thread pool (parallel)
-        let result_par = exhaustive_solve_one_flop(
+        let mut bufs_par = FlopBuffers::new(layout.total_size);
+        let (_delta_par, iterations_par) = exhaustive_solve_one_flop(
             &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, &config, &|_| {}, None,
+            &mut bufs_par,
         );
 
         // Solve with 1 thread (sequential)
@@ -1426,17 +1474,19 @@ mod tests {
             .num_threads(1)
             .build()
             .unwrap();
-        let result_seq = pool.install(|| {
+        let mut bufs_seq = FlopBuffers::new(layout.total_size);
+        let (_delta_seq, iterations_seq) = pool.install(|| {
             exhaustive_solve_one_flop(
                 &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, &config, &|_| {}, None,
+                &mut bufs_seq,
             )
         });
 
-        assert_eq!(result_par.iterations_used, result_seq.iterations_used);
-        for (p, s) in result_par
+        assert_eq!(iterations_par, iterations_seq);
+        for (p, s) in bufs_par
             .strategy_sum
             .iter()
-            .zip(result_seq.strategy_sum.iter())
+            .zip(bufs_seq.strategy_sum.iter())
         {
             assert!(
                 (p - s).abs() < 1e-6,
@@ -1453,7 +1503,8 @@ mod tests {
         let threshold_mbb = 30_000.0;
         let dcfr = DcfrParams::linear();
         let no_prune = PostflopModelConfig::exhaustive_fast();
-        let result = exhaustive_solve_one_flop(
+        let mut bufs = FlopBuffers::new(layout.total_size);
+        let (delta, iterations_used) = exhaustive_solve_one_flop(
             &tree,
             &layout,
             &equity_table,
@@ -1464,16 +1515,17 @@ mod tests {
             &no_prune,
             &|_| {},
             None,
+            &mut bufs,
         );
         assert_eq!(
-            result.iterations_used, 2,
+            iterations_used, 2,
             "should stop at first exploitability check (iter 1), used {}",
-            result.iterations_used
+            iterations_used
         );
         assert!(
-            result.delta < threshold_mbb,
+            delta < threshold_mbb,
             "final exploitability should be below threshold, got {} mBB/h",
-            result.delta
+            delta
         );
     }
 
@@ -1494,8 +1546,9 @@ mod tests {
         let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
         let equity_table = synthetic_equity_table();
         let dcfr = DcfrParams::linear();
+        let mut bufs = FlopBuffers::new(layout.total_size);
 
-        let result = exhaustive_solve_one_flop(
+        let (_delta, iterations_used) = exhaustive_solve_one_flop(
             &tree,
             &layout,
             &equity_table,
@@ -1506,10 +1559,11 @@ mod tests {
             &config,
             &|_| {},
             None,
+            &mut bufs,
         );
 
-        assert!(result.iterations_used > 0, "should complete iterations");
-        let has_nonzero = result.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
+        assert!(iterations_used > 0, "should complete iterations");
+        let has_nonzero = bufs.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
         assert!(has_nonzero, "strategy_sum should have non-zero entries with pruning enabled");
     }
 
@@ -1529,8 +1583,10 @@ mod tests {
         let dcfr = DcfrParams::linear();
 
         // Unpruned baseline (prune_warmup=0)
-        let unpruned = exhaustive_solve_one_flop(
+        let mut bufs_unpruned = FlopBuffers::new(layout.total_size);
+        let (_delta_unpruned, iterations_unpruned) = exhaustive_solve_one_flop(
             &tree, &layout, &equity_table, 5, 0.0, "no_prune", &dcfr, &base, &|_| {}, None,
+            &mut bufs_unpruned,
         );
 
         // Pruned run
@@ -1540,15 +1596,17 @@ mod tests {
             regret_floor: 1_000_000.0,
             ..base.clone()
         };
-        let pruned = exhaustive_solve_one_flop(
+        let mut bufs_pruned = FlopBuffers::new(layout.total_size);
+        let (_delta_pruned, iterations_pruned) = exhaustive_solve_one_flop(
             &tree, &layout, &equity_table, 5, 0.0, "pruned", &dcfr, &pruned_config, &|_| {}, None,
+            &mut bufs_pruned,
         );
 
         // Both should produce valid strategies
-        assert!(unpruned.iterations_used > 0);
-        assert!(pruned.iterations_used > 0);
-        let unpruned_nonzero = unpruned.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
-        let pruned_nonzero = pruned.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
+        assert!(iterations_unpruned > 0);
+        assert!(iterations_pruned > 0);
+        let unpruned_nonzero = bufs_unpruned.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
+        let pruned_nonzero = bufs_pruned.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
         assert!(unpruned_nonzero, "unpruned should have non-zero strategy");
         assert!(pruned_nonzero, "pruned should have non-zero strategy");
     }
@@ -1568,9 +1626,10 @@ mod tests {
         let equity_table = synthetic_equity_table();
         let dcfr = DcfrParams::linear();
         let counters = SolverCounters::default();
+        let mut bufs = FlopBuffers::new(layout.total_size);
         let _result = exhaustive_solve_one_flop(
             &tree, &layout, &equity_table, 5, 0.0, "test", &dcfr, &config,
-            &|_| {}, Some(&counters),
+            &|_| {}, Some(&counters), &mut bufs,
         );
         let traversals = counters.traversal_count.load(Ordering::Relaxed);
         assert!(traversals > 0, "traversal counter should be incremented, got {traversals}");
