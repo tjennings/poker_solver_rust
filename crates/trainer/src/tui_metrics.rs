@@ -111,7 +111,9 @@ impl TuiMetrics {
             });
         entry.iteration = iteration;
         entry.max_iterations = max_iterations;
-        entry.exploitability_history.push(exploitability);
+        if exploitability.is_finite() {
+            entry.exploitability_history.push(exploitability);
+        }
         entry.pct_actions_pruned = pct_actions_pruned;
         entry.max_positive_regret = max_positive_regret;
         entry.min_negative_regret = min_negative_regret;

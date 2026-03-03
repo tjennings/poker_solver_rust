@@ -653,6 +653,21 @@ fn exhaustive_solve_one_flop(
 
     let flop_name_owned = flop_name.to_string();
 
+    // Signal 0/N so the TUI shows this flop immediately.
+    on_progress(BuildPhase::FlopProgress {
+        flop_name: flop_name_owned.clone(),
+        stage: FlopStage::Solving {
+            iteration: 0,
+            max_iterations: num_iterations,
+            delta: f64::INFINITY,
+            metric_label: "mBB/h".into(),
+            total_action_slots: 0,
+            pruned_action_slots: 0,
+            max_positive_regret: 0.0,
+            min_negative_regret: 0.0,
+        },
+    });
+
     for iter in 0..num_iterations {
         let iteration = iter as u64 + 1; // 1-indexed to match LCFR convention
 
