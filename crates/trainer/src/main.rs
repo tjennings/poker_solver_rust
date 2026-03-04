@@ -693,6 +693,7 @@ fn build_postflop_with_progress(
 
 fn run_solve_postflop(config_path: &Path, output: &Path, tui_refresh: f64) -> Result<(), Box<dyn Error>> {
     log_file::init_log_file();
+    log_file::install_panic_hook();
 
     let yaml = std::fs::read_to_string(config_path)?;
     let config: PostflopSolveConfig = serde_yaml::from_str(&yaml)?;

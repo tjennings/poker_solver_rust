@@ -1100,7 +1100,27 @@ pub(crate) fn build_exhaustive(
 
     let results: Vec<Vec<f64>> = (0..flops.len())
         .into_par_iter()
-        .map(|flop_idx| ctx.solve_and_extract_flop(flop_idx))
+        .map(|flop_idx| {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ctx.solve_and_extract_flop(flop_idx)
+            })) {
+                Ok(values) => values,
+                Err(panic) => {
+                    let flop = flops[flop_idx];
+                    let flop_name = format!("{}{}{}", flop[0], flop[1], flop[2]);
+                    let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = panic.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    eprintln!("PANIC solving flop {flop_name} (idx={flop_idx}): {msg}");
+                    // Return NaN values so the solve can continue with other flops.
+                    vec![f64::NAN; 2 * n * n]
+                }
+            }
+        })
         .collect();
 
     let num_flops = flops.len();
@@ -1749,6 +1769,71 @@ mod tests {
         assert!(traversals > 0, "traversal counter should be incremented, got {traversals}");
         let total_actions = counters.total_action_slots.load(Ordering::Relaxed);
         assert!(total_actions > 0, "action counter should be incremented, got {total_actions}");
+    }
+
+    /// Test with full.yaml-equivalent config (2 bet sizes, 2 max raises, SPR=2).
+    /// This exercises the deeper tree that the production solve uses.
+    #[timed_test(120)]
+    fn full_config_spr2_does_not_panic() {
+        let config = PostflopModelConfig {
+            bet_sizes: vec![0.3, 0.75],
+            max_raises_per_street: 2,
+            postflop_solve_iterations: 3,
+            cfr_convergence_threshold: 100.0,
+            prune_warmup: 2,
+            prune_explore_freq: 10,
+            prune_regret_threshold: 0.0,
+            ..PostflopModelConfig::exhaustive_fast()
+        };
+        let tree = PostflopTree::build_with_spr(&config, 2.0).unwrap();
+        let node_streets = annotate_streets(&tree);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
+
+        eprintln!("tree nodes: {}, layout total_size: {}", tree.node_count(), layout.total_size);
+
+        let equity_table = synthetic_equity_table();
+        let dcfr = DcfrParams::default(); // DCFR variant
+        let mut bufs = FlopBuffers::new(layout.total_size);
+
+        let (_delta, iterations_used) = exhaustive_solve_one_flop(
+            &tree, &layout, &equity_table, 3, 100.0, "test_full", &dcfr,
+            &config, &|_| {}, None, &mut bufs,
+        );
+
+        assert!(iterations_used > 0, "should complete at least 1 iteration");
+        let has_nonzero = bufs.strategy_sum.iter().any(|&v| v.abs() > 1e-15);
+        assert!(has_nonzero, "strategy_sum should have non-zero entries");
+    }
+
+    /// Test build_exhaustive with full.yaml config on multiple flops to exercise
+    /// the parallel solve path and catch_unwind protection.
+    #[timed_test(120)]
+    fn full_config_parallel_multi_flop() {
+        use crate::preflop::postflop_hands::sample_canonical_flops;
+
+        let config = PostflopModelConfig {
+            bet_sizes: vec![0.3, 0.75],
+            max_raises_per_street: 2,
+            postflop_solve_iterations: 3,
+            cfr_convergence_threshold: 100.0,
+            prune_warmup: 2,
+            prune_explore_freq: 10,
+            prune_regret_threshold: 0.0,
+            max_flop_boards: 10,
+            ..PostflopModelConfig::exhaustive_fast()
+        };
+        let tree = PostflopTree::build_with_spr(&config, 2.0).unwrap();
+        let node_streets = annotate_streets(&tree);
+        let n = NUM_CANONICAL_HANDS;
+        let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
+        let flops = sample_canonical_flops(config.max_flop_boards);
+
+        let values = build_exhaustive(
+            &config, &tree, &layout, &node_streets, &flops, None, &|_| {}, None,
+        );
+
+        assert_eq!(values.num_flops, flops.len());
     }
 
     #[timed_test(300)]

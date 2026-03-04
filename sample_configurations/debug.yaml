@@ -1,0 +1,9 @@
+postflop_model:
+  solve_type: exhaustive
+  postflop_solve_iterations: 50
+  bet_sizes: [0.30]
+  max_raises_per_street: 1
+  postflop_sprs: [100] # captures roughly rfi > call, 3-bet, 4-bet SPRs against a 100bb stack
+  value_extraction_samples: 20000
+  cfr_convergence_threshold: 50
+  ev_convergence_threshold: 0.5

@@ -7,7 +7,7 @@
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -115,6 +115,56 @@ macro_rules! solver_print {
             println!("{}", msg);
         }
     }};
+}
+
+/// Install a custom panic hook that logs panic info to the log file and
+/// restores the terminal if the TUI is active.
+///
+/// Must be called after `init_log_file()`. The hook:
+/// 1. Restores normal terminal mode (disables raw mode, leaves alternate screen)
+///    so the panic message is visible rather than garbled by the TUI.
+/// 2. Writes the full panic message + backtrace to the log file.
+/// 3. Prints the panic to stderr (now readable after terminal restoration).
+pub fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Restore terminal FIRST so panic output is readable.
+        if TUI_ACTIVE.load(Ordering::Relaxed) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(
+                std::io::stderr(),
+                crossterm::terminal::LeaveAlternateScreen
+            );
+            TUI_ACTIVE.store(false, Ordering::Relaxed);
+        }
+
+        // Format the panic message.
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<dyn Any>".to_string()
+        };
+
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "<unknown>".into());
+
+        let bt = std::backtrace::Backtrace::force_capture();
+        let msg = format!(
+            "PANIC at {location}: {payload}\n\nBacktrace:\n{bt}"
+        );
+
+        // Write to log file.
+        write_to_log("========== PANIC ==========");
+        write_to_log(&msg);
+        write_to_log("===========================");
+
+        // Also invoke the previous hook (prints to stderr).
+        prev(info);
+    }));
 }
 
 #[cfg(test)]
