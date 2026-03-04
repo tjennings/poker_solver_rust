@@ -47,15 +47,15 @@ pub struct SolverCounters {
 ///
 /// Allocated once per rayon worker thread and reused across flops to avoid
 /// repeated allocation of large vectors (e.g. 277 MB per flop at SPR=6).
-pub(crate) struct FlopBuffers {
-    pub regret_sum: Vec<f64>,
-    pub strategy_sum: Vec<f64>,
-    pub delta: (Vec<f64>, Vec<f64>),
+pub struct FlopBuffers {
+    pub(crate) regret_sum: Vec<f64>,
+    pub(crate) strategy_sum: Vec<f64>,
+    pub(crate) delta: (Vec<f64>, Vec<f64>),
 }
 
 impl FlopBuffers {
     /// Allocate zeroed buffers of the given size.
-    pub(crate) fn new(size: usize) -> Self {
+    pub fn new(size: usize) -> Self {
         Self {
             regret_sum: vec![0.0; size],
             strategy_sum: vec![0.0; size],
@@ -795,7 +795,7 @@ fn extremal_regrets(regret_sum: &[f64]) -> (f64, f64) {
 /// over flops), rayon's work-stealing distributes hand-pair work across all
 /// available cores, dynamically rebalancing as flops converge at different rates.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
-fn exhaustive_solve_one_flop(
+pub fn exhaustive_solve_one_flop(
     tree: &PostflopTree,
     layout: &PostflopLayout,
     equity_table: &[f64],
