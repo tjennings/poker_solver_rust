@@ -38,3 +38,7 @@ harness = false
 [[bench]]
 name = "equity_table_bench"
 harness = false
+
+[[bench]]
+name = "postflop_solve_bench"
+harness = false
