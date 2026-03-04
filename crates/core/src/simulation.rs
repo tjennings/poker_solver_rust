@@ -340,6 +340,72 @@ impl AgentGenerator for LoggingAgentGeneratorWrapper {
 // Competition runner
 // ============================================================================
 
+/// Build a `HoldemCompetition` with logging-wrapped agent generators.
+#[allow(clippy::cast_precision_loss)]
+fn setup_competition(
+    p1_gen: Box<dyn AgentGenerator>,
+    p2_gen: Box<dyn AgentGenerator>,
+    stack_depth: u32,
+    bet_sizes: &[f32],
+) -> HoldemCompetition<StandardSimulationIterator<RotatingDealerGenerator>> {
+    // stack_depth is in BB. Internal units: 1 BB = 2 units, so
+    // arena stacks = stack_depth * 2 (with big_blind=2.0, small_blind=1.0).
+    let stacks = vec![(stack_depth * 2) as f32; 2];
+    let game_state = GameState::new_starting(stacks, 2.0, 1.0, 0.0, 0);
+
+    let p1_wrapped: Box<dyn AgentGenerator> = Box::new(LoggingAgentGeneratorWrapper {
+        inner: p1_gen,
+        bet_sizes: bet_sizes.to_vec(),
+    });
+    let p2_wrapped: Box<dyn AgentGenerator> = Box::new(LoggingAgentGeneratorWrapper {
+        inner: p2_gen,
+        bet_sizes: bet_sizes.to_vec(),
+    });
+
+    let sim_gen = StandardSimulationIterator::new(
+        vec![p1_wrapped, p2_wrapped],
+        vec![],
+        RotatingDealerGenerator::new(game_state),
+    );
+    HoldemCompetition::new(sim_gen)
+}
+
+/// Play hands in batches, reporting progress and collecting the equity curve.
+#[allow(clippy::cast_precision_loss)]
+fn play_hands(
+    competition: &mut HoldemCompetition<StandardSimulationIterator<RotatingDealerGenerator>>,
+    num_hands: u64,
+    stop: &AtomicBool,
+    mut on_progress: impl FnMut(&SimProgress),
+) -> Result<(u64, Vec<f64>), String> {
+    let batch_size = 100u64;
+    let mut hands_played = 0u64;
+    let mut equity_curve = Vec::new();
+
+    while hands_played < num_hands && !stop.load(Ordering::Relaxed) {
+        let batch = batch_size.min(num_hands - hands_played);
+        #[allow(clippy::cast_possible_truncation)]
+        let n = batch as usize;
+        competition
+            .run(n)
+            .map_err(|e| format!("Simulation error: {e:?}"))?;
+        hands_played += batch;
+
+        let p1_profit_bb = f64::from(competition.total_change[0]);
+        let mbbh = (p1_profit_bb / hands_played as f64) * 1000.0;
+        equity_curve.push(mbbh);
+
+        on_progress(&SimProgress {
+            hands_played,
+            total_hands: num_hands,
+            p1_profit_bb,
+            current_mbbh: mbbh,
+        });
+    }
+
+    Ok((hands_played, equity_curve))
+}
+
 /// Run a simulation between two agent generators.
 ///
 /// Both generators are wrapped with `LoggingAgentGeneratorWrapper` so that
@@ -363,55 +429,12 @@ pub fn run_simulation(
     stack_depth: u32,
     stop: &AtomicBool,
     bet_sizes: &[f32],
-    mut on_progress: impl FnMut(&SimProgress),
+    on_progress: impl FnMut(&SimProgress),
 ) -> Result<SimResult, String> {
-    // stack_depth is in BB.  Internal units: 1 BB = 2 units, so
-    // arena stacks = stack_depth * 2 (with big_blind=2.0, small_blind=1.0).
-    let stacks = vec![(stack_depth * 2) as f32; 2];
-    let game_state = GameState::new_starting(stacks, 2.0, 1.0, 0.0, 0);
-
-    // Wrap both generators so every action is logged for position-aware keys
-    let p1_wrapped: Box<dyn AgentGenerator> = Box::new(LoggingAgentGeneratorWrapper {
-        inner: p1_gen,
-        bet_sizes: bet_sizes.to_vec(),
-    });
-    let p2_wrapped: Box<dyn AgentGenerator> = Box::new(LoggingAgentGeneratorWrapper {
-        inner: p2_gen,
-        bet_sizes: bet_sizes.to_vec(),
-    });
-
-    let sim_gen = StandardSimulationIterator::new(
-        vec![p1_wrapped, p2_wrapped],
-        vec![],
-        RotatingDealerGenerator::new(game_state),
-    );
-    let mut competition = HoldemCompetition::new(sim_gen);
-
-    let batch_size = 100u64;
-    let mut hands_played = 0u64;
-    let mut equity_curve = Vec::new();
+    let mut competition = setup_competition(p1_gen, p2_gen, stack_depth, bet_sizes);
     let start = std::time::Instant::now();
 
-    while hands_played < num_hands && !stop.load(Ordering::Relaxed) {
-        let batch = batch_size.min(num_hands - hands_played);
-        #[allow(clippy::cast_possible_truncation)]
-        let n = batch as usize;
-        competition
-            .run(n)
-            .map_err(|e| format!("Simulation error: {e:?}"))?;
-        hands_played += batch;
-
-        let p1_profit_bb = f64::from(competition.total_change[0]);
-        let mbbh = (p1_profit_bb / hands_played as f64) * 1000.0;
-        equity_curve.push(mbbh);
-
-        on_progress(&SimProgress {
-            hands_played,
-            total_hands: num_hands,
-            p1_profit_bb,
-            current_mbbh: mbbh,
-        });
-    }
+    let (hands_played, equity_curve) = play_hands(&mut competition, num_hands, stop, on_progress)?;
 
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_ms = start.elapsed().as_millis() as u64;

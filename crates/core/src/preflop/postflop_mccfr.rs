@@ -29,15 +29,43 @@ use crate::showdown_equity::rank_hand;
 // Entry point
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Solve one flop and extract EV values using MCCFR.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+fn solve_and_extract_mccfr_flop(
+    config: &PostflopModelConfig,
+    tree: &PostflopTree,
+    layout: &PostflopLayout,
+    flop: [Card; 3],
+    num_iterations: usize,
+    n: usize,
+    on_progress: &(impl Fn(BuildPhase) + Sync),
+) -> Vec<f64> {
+    let flop_name = format!("{}{}{}", flop[0], flop[1], flop[2]);
+    let combo_map = build_combo_map(&flop);
+
+    let total_non_conflicting: usize = combo_map.iter().map(Vec::len).sum();
+    let total_space = total_non_conflicting.saturating_mul(45 * 44);
+    let samples_per_iter = ((total_space as f64 * config.mccfr_sample_pct) as usize
+        / num_iterations.max(1)).max(1);
+
+    let result = mccfr_solve_one_flop(
+        tree, layout, &combo_map, flop, num_iterations,
+        samples_per_iter, config.cfr_convergence_threshold, &flop_name, on_progress,
+    );
+    let values = mccfr_extract_values(
+        tree, layout, &result.strategy_sum, &combo_map, flop,
+        config.value_extraction_samples as usize, n, &flop_name, on_progress,
+    );
+    on_progress(BuildPhase::FlopProgress { flop_name, stage: FlopStage::Done });
+    values
+}
+
 /// Build postflop abstraction using MCCFR with sampled concrete hands.
 ///
 /// Pipeline per flop (parallelised via rayon):
-/// 1. Build combo map — each canonical hand (0..168) maps to its concrete combos.
+/// 1. Build combo map -- each canonical hand (0..168) maps to its concrete combos.
 /// 2. Run MCCFR training loop (`mccfr_solve_one_flop`).
 /// 3. Extract EV table from converged strategy (`mccfr_extract_values`).
-///
-/// Returns `PostflopValues` indexed by canonical hand indices (169).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_mccfr(
     config: &PostflopModelConfig,
     tree: &PostflopTree,
@@ -49,56 +77,27 @@ pub(crate) fn build_mccfr(
     let num_flops = flops.len();
     let n = NUM_CANONICAL_HANDS;
     let num_iterations = config.postflop_solve_iterations as usize;
-    let _ = node_streets; // Streets are embedded in the layout already.
+    let _ = node_streets;
     let completed = AtomicUsize::new(0);
 
     let results: Vec<Vec<f64>> = (0..num_flops)
         .into_par_iter()
         .map(|flop_idx| {
-            let flop = flops[flop_idx];
-            let flop_name = format!("{}{}{}", flop[0], flop[1], flop[2]);
-
-            // Build combo map — no clustering needed
-            let combo_map = build_combo_map(&flop);
-
-            // Compute sample count
-            let total_non_conflicting: usize = combo_map.iter().map(Vec::len).sum();
-            let live_runouts = 45usize * 44;
-            let total_space = total_non_conflicting.saturating_mul(live_runouts);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
-            let samples_per_iter = ((total_space as f64 * config.mccfr_sample_pct) as usize
-                / num_iterations.max(1)).max(1);
-
-            // Solve
-            let result = mccfr_solve_one_flop(
-                tree, layout, &combo_map, flop, num_iterations,
-                samples_per_iter, config.cfr_convergence_threshold,
-                &flop_name, on_progress,
+            let values = solve_and_extract_mccfr_flop(
+                config, tree, layout, flops[flop_idx], num_iterations, n, on_progress,
             );
-
-            // Extract values
-            let values = mccfr_extract_values(
-                tree, layout, &result.strategy_sum, &combo_map, flop,
-                config.value_extraction_samples as usize, n,
-                config.ev_convergence_threshold, &flop_name, on_progress,
-            );
-
-            on_progress(BuildPhase::FlopProgress { flop_name: flop_name.clone(), stage: FlopStage::Done });
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             on_progress(BuildPhase::MccfrFlopsCompleted { completed: done, total: num_flops });
-
             values
         })
         .collect();
 
-    // Assemble
     let mut all_values = vec![0.0f64; num_flops * 2 * n * n];
     for (flop_idx, vals) in results.into_iter().enumerate() {
         let offset = flop_idx * 2 * n * n;
         let copy_len = vals.len().min(2 * n * n);
         all_values[offset..offset + copy_len].copy_from_slice(&vals[..copy_len]);
     }
-
     PostflopValues::from_raw(all_values, n, num_flops)
 }
 
@@ -106,12 +105,70 @@ pub(crate) fn build_mccfr(
 // Core solve loop
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Sample deals and run MCCFR traversal for one iteration, accumulating
+/// regret and strategy deltas into `dr`/`ds`.
+#[allow(clippy::too_many_arguments)]
+fn mccfr_sample_and_traverse(
+    tree: &PostflopTree,
+    layout: &PostflopLayout,
+    regret_sum: &[f64],
+    dr: &mut [f64],
+    ds: &mut [f64],
+    combo_map: &[Vec<(Card, Card)>],
+    flop: [Card; 3],
+    samples_per_iter: usize,
+    iteration: u64,
+    flop_name: &str,
+) {
+    let seed = iteration * 1_000_003 + flop_name.len() as u64;
+    let mut rng = SmallRng::seed_from_u64(seed);
+
+    for _ in 0..samples_per_iter {
+        let Some((hb, ob, hero_hand, opp_hand, turn, river)) =
+            sample_deal(combo_map, flop, &mut rng)
+        else {
+            continue;
+        };
+        let board = [flop[0], flop[1], flop[2], turn, river];
+        let ctx = MccfrTraverseCtx { tree, layout, snapshot: regret_sum, board: &board, iteration };
+        for hero_pos in 0..2u8 {
+            let args = MccfrTraverseArgs {
+                node_idx: 0, hero_bucket: hb, opp_bucket: ob, hero_pos,
+                hero_hand, opp_hand, reach_hero: 1.0, reach_opp: 1.0,
+            };
+            ctx.traverse(dr, ds, &args);
+        }
+    }
+}
+
+/// Report solving progress for one iteration.
+fn report_solve_progress(
+    on_progress: &(impl Fn(BuildPhase) + Sync),
+    flop_name: &str,
+    iterations_used: usize,
+    max_iterations: usize,
+    delta: f64,
+) {
+    on_progress(BuildPhase::FlopProgress {
+        flop_name: flop_name.to_string(),
+        stage: FlopStage::Solving {
+            iteration: iterations_used,
+            max_iterations,
+            delta,
+            metric_label: "\u{03b4}".to_string(),
+            total_action_slots: 0,
+            pruned_action_slots: 0,
+            max_positive_regret: 0.0,
+            min_negative_regret: 0.0,
+        },
+    });
+}
+
 /// Training loop for a single flop using MCCFR with concrete hands.
 ///
 /// Convergence is measured via `weighted_avg_strategy_delta`: the regret-weighted
 /// average of max per-action strategy probability change between consecutive
-/// iterations. This avoids the decay problem of `avg_positive_regret_flat` which
-/// divides cumulative regret by `buffer_size` × iterations.
+/// iterations.
 #[allow(clippy::too_many_arguments)]
 fn mccfr_solve_one_flop(
     tree: &PostflopTree,
@@ -132,43 +189,14 @@ fn mccfr_solve_one_flop(
 
     for iter in 0..num_iterations {
         let iteration = iter as u64 + 1;
-
         let prev_regrets = regret_sum.clone();
-
-        // Sample deals and traverse
-        let seed = iteration * 1_000_003 + flop_name.len() as u64;
-        let mut rng = SmallRng::seed_from_u64(seed);
 
         let mut dr = vec![0.0f64; buf_size];
         let mut ds = vec![0.0f64; buf_size];
-
-        for _ in 0..samples_per_iter {
-            let deal = sample_deal(combo_map, flop, &mut rng);
-            let Some((hb, ob, hero_hand, opp_hand, turn, river)) = deal else {
-                continue;
-            };
-            let board = [flop[0], flop[1], flop[2], turn, river];
-
-            for hero_pos in 0..2u8 {
-                mccfr_traverse(
-                    tree,
-                    layout,
-                    &regret_sum,
-                    &mut dr,
-                    &mut ds,
-                    0,
-                    hb,
-                    ob,
-                    hero_pos,
-                    hero_hand,
-                    opp_hand,
-                    &board,
-                    1.0,
-                    1.0,
-                    iteration,
-                );
-            }
-        }
+        mccfr_sample_and_traverse(
+            tree, layout, &regret_sum, &mut dr, &mut ds,
+            combo_map, flop, samples_per_iter, iteration, flop_name,
+        );
 
         add_buffers(&mut regret_sum, &dr);
         add_buffers(&mut strategy_sum, &ds);
@@ -177,31 +205,13 @@ fn mccfr_solve_one_flop(
         if iter >= 1 {
             current_delta = weighted_avg_strategy_delta(&prev_regrets, &regret_sum, layout, tree);
         }
-
-        on_progress(BuildPhase::FlopProgress {
-            flop_name: flop_name.to_string(),
-            stage: FlopStage::Solving {
-                iteration: iterations_used,
-                max_iterations: num_iterations,
-                delta: current_delta,
-                metric_label: "\u{03b4}".to_string(),
-                total_action_slots: 0,
-                pruned_action_slots: 0,
-                max_positive_regret: 0.0,
-                min_negative_regret: 0.0,
-            },
-        });
-
+        report_solve_progress(on_progress, flop_name, iterations_used, num_iterations, current_delta);
         if iter >= 1 && current_delta < convergence_threshold {
             break;
         }
     }
 
-    FlopSolveResult {
-        strategy_sum,
-        delta: current_delta,
-        iterations_used,
-    }
+    FlopSolveResult { strategy_sum, delta: current_delta, iterations_used }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -263,175 +273,207 @@ fn sample_deal(
 // CFR traversal with concrete hands
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Recursive CFR traversal using concrete hands (not bucket transitions).
-///
-/// At chance nodes the board is already dealt, so we just pass through to
-/// the single structural child. At showdown terminals we use `rank_hand`
-/// for card-based evaluation.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn mccfr_traverse(
-    tree: &PostflopTree,
-    layout: &PostflopLayout,
-    snapshot: &[f64],
-    dr: &mut [f64],
-    ds: &mut [f64],
+/// Immutable context shared across all recursive `mccfr_traverse` calls.
+struct MccfrTraverseCtx<'a> {
+    tree: &'a PostflopTree,
+    layout: &'a PostflopLayout,
+    snapshot: &'a [f64],
+    board: &'a [Card; 5],
+    iteration: u64,
+}
+
+/// Per-call varying state for `mccfr_traverse`.
+struct MccfrTraverseArgs {
     node_idx: u32,
     hero_bucket: u16,
     opp_bucket: u16,
     hero_pos: u8,
     hero_hand: [Card; 2],
     opp_hand: [Card; 2],
-    board: &[Card; 5],
     reach_hero: f64,
     reach_opp: f64,
-    iteration: u64,
+}
+
+/// Compute terminal payoff for fold or showdown with concrete hand ranking.
+#[inline]
+fn mccfr_terminal_payoff(
+    terminal_type: PostflopTerminalType,
+    pot_fraction: f64,
+    hero_hand: [Card; 2],
+    opp_hand: [Card; 2],
+    board: &[Card; 5],
+    hero_pos: u8,
 ) -> f64 {
-    match &tree.nodes[node_idx as usize] {
-        PostflopNode::Terminal {
-            terminal_type,
-            pot_fraction,
-        } => match terminal_type {
-            PostflopTerminalType::Fold { folder } => {
-                if *folder == hero_pos {
-                    -pot_fraction / 2.0
-                } else {
-                    pot_fraction / 2.0
-                }
-            }
-            PostflopTerminalType::Showdown => {
-                let hero_rank = rank_hand(hero_hand, board);
-                let opp_rank = rank_hand(opp_hand, board);
-                let eq = match hero_rank.cmp(&opp_rank) {
-                    std::cmp::Ordering::Greater => 1.0,
-                    std::cmp::Ordering::Less => 0.0,
-                    std::cmp::Ordering::Equal => 0.5,
-                };
-                eq * pot_fraction - pot_fraction / 2.0
-            }
-        },
-
-        PostflopNode::Chance { children, .. } => {
-            // Board already dealt — pass through to single structural child.
-            debug_assert!(
-                !children.is_empty(),
-                "chance node must have at least one child"
-            );
-            mccfr_traverse(
-                tree,
-                layout,
-                snapshot,
-                dr,
-                ds,
-                children[0],
-                hero_bucket,
-                opp_bucket,
-                hero_pos,
-                hero_hand,
-                opp_hand,
-                board,
-                reach_hero,
-                reach_opp,
-                iteration,
-            )
+    match terminal_type {
+        PostflopTerminalType::Fold { folder } => {
+            if folder == hero_pos { -pot_fraction / 2.0 } else { pot_fraction / 2.0 }
         }
+        PostflopTerminalType::Showdown => {
+            let hero_rank = rank_hand(hero_hand, board);
+            let opp_rank = rank_hand(opp_hand, board);
+            let eq = match hero_rank.cmp(&opp_rank) {
+                std::cmp::Ordering::Greater => 1.0,
+                std::cmp::Ordering::Less => 0.0,
+                std::cmp::Ordering::Equal => 0.5,
+            };
+            eq * pot_fraction - pot_fraction / 2.0
+        }
+    }
+}
 
-        PostflopNode::Decision {
-            position, children, ..
-        } => {
-            let is_hero = *position == hero_pos;
-            let bucket = if is_hero { hero_bucket } else { opp_bucket };
-            let (start, _) = layout.slot(node_idx, bucket);
-            let num_actions = children.len();
+impl MccfrTraverseCtx<'_> {
+    /// Hero decision: traverse all actions, accumulate regret and strategy deltas.
+    #[inline]
+    fn traverse_hero(
+        &self,
+        dr: &mut [f64],
+        ds: &mut [f64],
+        children: &[u32],
+        strategy: &[f64],
+        start: usize,
+        args: &MccfrTraverseArgs,
+    ) -> f64 {
+        let num_actions = children.len();
+        let mut action_values = [0.0f64; MAX_POSTFLOP_ACTIONS];
+        for (i, &child) in children.iter().enumerate() {
+            let mut child_args = MccfrTraverseArgs { node_idx: child, ..*args };
+            child_args.reach_hero = args.reach_hero * strategy[i];
+            action_values[i] = self.traverse(dr, ds, &child_args);
+        }
+        let node_value: f64 = strategy[..num_actions]
+            .iter()
+            .zip(&action_values[..num_actions])
+            .map(|(s, v)| s * v)
+            .sum();
 
-            let mut strategy = [0.0f64; MAX_POSTFLOP_ACTIONS];
-            regret_matching_into(snapshot, start, &mut strategy[..num_actions]);
+        #[allow(clippy::cast_precision_loss)]
+        let weight = self.iteration as f64;
+        for (i, val) in action_values[..num_actions].iter().enumerate() {
+            dr[start + i] += weight * args.reach_opp * (val - node_value);
+        }
+        for (i, &s) in strategy[..num_actions].iter().enumerate() {
+            ds[start + i] += weight * args.reach_hero * s;
+        }
+        node_value
+    }
 
-            if is_hero {
-                let mut action_values = [0.0f64; MAX_POSTFLOP_ACTIONS];
-                for (i, &child) in children.iter().enumerate() {
-                    action_values[i] = mccfr_traverse(
-                        tree,
-                        layout,
-                        snapshot,
-                        dr,
-                        ds,
-                        child,
-                        hero_bucket,
-                        opp_bucket,
-                        hero_pos,
-                        hero_hand,
-                        opp_hand,
-                        board,
-                        reach_hero * strategy[i],
-                        reach_opp,
-                        iteration,
-                    );
+    /// Opponent decision: strategy-weighted traversal.
+    #[inline]
+    fn traverse_opponent(
+        &self,
+        dr: &mut [f64],
+        ds: &mut [f64],
+        children: &[u32],
+        strategy: &[f64],
+        args: &MccfrTraverseArgs,
+    ) -> f64 {
+        children
+            .iter()
+            .enumerate()
+            .map(|(i, &child)| {
+                let child_args = MccfrTraverseArgs {
+                    node_idx: child,
+                    reach_opp: args.reach_opp * strategy[i],
+                    ..*args
+                };
+                strategy[i] * self.traverse(dr, ds, &child_args)
+            })
+            .sum()
+    }
+
+    /// Recursive CFR traversal using concrete hands (not bucket transitions).
+    ///
+    /// At chance nodes the board is already dealt, so we just pass through to
+    /// the single structural child. At showdown terminals we use `rank_hand`
+    /// for card-based evaluation.
+    fn traverse(&self, dr: &mut [f64], ds: &mut [f64], args: &MccfrTraverseArgs) -> f64 {
+        match &self.tree.nodes[args.node_idx as usize] {
+            PostflopNode::Terminal { terminal_type, pot_fraction } => {
+                mccfr_terminal_payoff(
+                    *terminal_type, *pot_fraction,
+                    args.hero_hand, args.opp_hand, self.board, args.hero_pos,
+                )
+            }
+            PostflopNode::Chance { children, .. } => {
+                debug_assert!(!children.is_empty(), "chance node must have at least one child");
+                let child_args = MccfrTraverseArgs { node_idx: children[0], ..*args };
+                self.traverse(dr, ds, &child_args)
+            }
+            PostflopNode::Decision { position, children, .. } => {
+                let is_hero = *position == args.hero_pos;
+                let bucket = if is_hero { args.hero_bucket } else { args.opp_bucket };
+                let (start, _) = self.layout.slot(args.node_idx, bucket);
+                let mut strategy = [0.0f64; MAX_POSTFLOP_ACTIONS];
+                regret_matching_into(self.snapshot, start, &mut strategy[..children.len()]);
+                if is_hero {
+                    self.traverse_hero(dr, ds, children, &strategy, start, args)
+                } else {
+                    self.traverse_opponent(dr, ds, children, &strategy, args)
                 }
-                let node_value: f64 = strategy[..num_actions]
-                    .iter()
-                    .zip(&action_values[..num_actions])
-                    .map(|(s, v)| s * v)
-                    .sum();
-
-                #[allow(clippy::cast_precision_loss)]
-                let weight = iteration as f64; // LCFR weighting
-                for (i, val) in action_values[..num_actions].iter().enumerate() {
-                    dr[start + i] += weight * reach_opp * (val - node_value);
-                }
-                for (i, &s) in strategy[..num_actions].iter().enumerate() {
-                    ds[start + i] += weight * reach_hero * s;
-                }
-                node_value
-            } else {
-                // Opponent: weighted traversal
-                children
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &child)| {
-                        strategy[i]
-                            * mccfr_traverse(
-                                tree,
-                                layout,
-                                snapshot,
-                                dr,
-                                ds,
-                                child,
-                                hero_bucket,
-                                opp_bucket,
-                                hero_pos,
-                                hero_hand,
-                                opp_hand,
-                                board,
-                                reach_hero,
-                                reach_opp * strategy[i],
-                                iteration,
-                            )
-                    })
-                    .sum()
             }
         }
     }
 }
 
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Value extraction
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Monte Carlo value extraction after convergence.
-///
-/// Samples random deals, evaluates using the averaged strategy, and
-/// accumulates per `(hero_pos, hero_hand_idx, opp_hand_idx)`. Returns a flat
-/// `Vec<f64>` of size `2 * n * n`.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss
-)]
+/// Evaluate one hand pair by sampling runouts and accumulating EV.
+#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
+fn evaluate_hand_pair(
+    tree: &PostflopTree,
+    layout: &PostflopLayout,
+    strategy_sum: &[f64],
+    hero_combos: &[(Card, Card)],
+    opp_combos: &[(Card, Card)],
+    flop: [Card; 3],
+    hb: u16,
+    ob: u16,
+    n: usize,
+    samples_per_pair: usize,
+    values: &mut [f64],
+    counts: &mut [u32],
+    rng: &mut SmallRng,
+) {
+    for _ in 0..samples_per_pair {
+        let Some((hero_hand, opp_hand, turn, river)) =
+            sample_runout_for_pair(hero_combos, opp_combos, flop, rng)
+        else {
+            break;
+        };
+        let board = [flop[0], flop[1], flop[2], turn, river];
+        for hero_pos in 0..2u8 {
+            let ctx = MccfrEvalCtx {
+                tree, layout, strategy_sum, board: &board,
+                hero_bucket: hb, opp_bucket: ob, hero_pos, hero_hand, opp_hand,
+            };
+            let ev = ctx.eval(0);
+            let idx = hero_pos as usize * n * n + hb as usize * n + ob as usize;
+            values[idx] += ev;
+            counts[idx] += 1;
+        }
+    }
+}
+
+/// Normalize accumulated EV values; unsampled cells become NaN.
+fn normalize_ev_values(values: &mut [f64], counts: &[u32]) {
+    for (i, val) in values.iter_mut().enumerate() {
+        if counts[i] > 0 {
+            *val /= f64::from(counts[i]);
+        } else {
+            *val = f64::NAN;
+        }
+    }
+}
+
 /// Extract EV values by sampling a fixed number of runouts per hand pair.
 ///
-/// `samples_per_pair` runouts are drawn for each of the `n × n` canonical hand
+/// `samples_per_pair` runouts are drawn for each of the `n * n` canonical hand
 /// pairs, guaranteeing 100% coverage. Pairs where no non-conflicting concrete
 /// combos exist on this flop are marked NaN (impossible on this board).
+#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
 fn mccfr_extract_values(
     tree: &PostflopTree,
     layout: &PostflopLayout,
@@ -440,14 +482,12 @@ fn mccfr_extract_values(
     flop: [Card; 3],
     samples_per_pair: usize,
     num_flop_buckets: usize,
-    _convergence_threshold: f64,
     flop_name: &str,
     on_progress: &(impl Fn(BuildPhase) + Sync),
 ) -> Vec<f64> {
     let n = num_flop_buckets;
     let mut values = vec![0.0f64; 2 * n * n];
     let mut counts = vec![0u32; 2 * n * n];
-
     let mut rng = SmallRng::seed_from_u64(42);
     let total_pairs = n * n;
     let mut pairs_done = 0usize;
@@ -458,62 +498,28 @@ fn mccfr_extract_values(
             pairs_done += n;
             continue;
         }
-
         for ob in 0..n as u16 {
             pairs_done += 1;
             if pairs_done.is_multiple_of(1000) {
                 on_progress(BuildPhase::FlopProgress {
                     flop_name: flop_name.to_string(),
-                    stage: FlopStage::EstimatingEv {
-                        sample: pairs_done,
-                        total_samples: total_pairs,
-                    },
+                    stage: FlopStage::EstimatingEv { sample: pairs_done, total_samples: total_pairs },
                 });
             }
-
             let opp_combos = &combo_map[ob as usize];
-            if opp_combos.is_empty() {
-                continue;
-            }
-
-            for _ in 0..samples_per_pair {
-                let Some((hero_hand, opp_hand, turn, river)) =
-                    sample_runout_for_pair(hero_combos, opp_combos, flop, &mut rng)
-                else {
-                    break; // no non-conflicting combos exist for this pair
-                };
-                let board = [flop[0], flop[1], flop[2], turn, river];
-
-                for hero_pos in 0..2u8 {
-                    let ev = mccfr_eval_with_avg_strategy(
-                        tree, layout, strategy_sum, 0,
-                        hb, ob, hero_pos, hero_hand, opp_hand, &board,
-                    );
-                    let idx = hero_pos as usize * n * n + hb as usize * n + ob as usize;
-                    values[idx] += ev;
-                    counts[idx] += 1;
-                }
-            }
+            if opp_combos.is_empty() { continue; }
+            evaluate_hand_pair(
+                tree, layout, strategy_sum, hero_combos, opp_combos,
+                flop, hb, ob, n, samples_per_pair, &mut values, &mut counts, &mut rng,
+            );
         }
     }
 
     on_progress(BuildPhase::FlopProgress {
         flop_name: flop_name.to_string(),
-        stage: FlopStage::EstimatingEv {
-            sample: total_pairs,
-            total_samples: total_pairs,
-        },
+        stage: FlopStage::EstimatingEv { sample: total_pairs, total_samples: total_pairs },
     });
-
-    // Normalize; unsampled cells (impossible combos on this flop) become NaN.
-    for (i, val) in values.iter_mut().enumerate() {
-        if counts[i] > 0 {
-            *val /= f64::from(counts[i]);
-        } else {
-            *val = f64::NAN;
-        }
-    }
-
+    normalize_ev_values(&mut values, &counts);
     values
 }
 
@@ -554,101 +560,48 @@ fn sample_runout_for_pair(
     Some(([h1, h2], [o1, o2], deck[t_idx], deck[r_idx]))
 }
 
-/// Walk tree using averaged (converged) strategy with concrete hands.
-///
-/// Same structure as `mccfr_traverse` but read-only: uses
-/// `normalize_strategy_sum` and does no regret updates.
-#[allow(clippy::too_many_arguments)]
-fn mccfr_eval_with_avg_strategy(
-    tree: &PostflopTree,
-    layout: &PostflopLayout,
-    strategy_sum: &[f64],
-    node_idx: u32,
+/// Immutable context for evaluating converged strategy (read-only traversal).
+struct MccfrEvalCtx<'a> {
+    tree: &'a PostflopTree,
+    layout: &'a PostflopLayout,
+    strategy_sum: &'a [f64],
+    board: &'a [Card; 5],
     hero_bucket: u16,
     opp_bucket: u16,
     hero_pos: u8,
     hero_hand: [Card; 2],
     opp_hand: [Card; 2],
-    board: &[Card; 5],
-) -> f64 {
-    match &tree.nodes[node_idx as usize] {
-        PostflopNode::Terminal {
-            terminal_type,
-            pot_fraction,
-        } => match terminal_type {
-            PostflopTerminalType::Fold { folder } => {
-                if *folder == hero_pos {
-                    -pot_fraction / 2.0
-                } else {
-                    pot_fraction / 2.0
-                }
+}
+
+impl MccfrEvalCtx<'_> {
+    /// Walk tree using averaged (converged) strategy with concrete hands.
+    ///
+    /// Same structure as `MccfrTraverseCtx::traverse` but read-only: uses
+    /// `normalize_strategy_sum` and does no regret updates.
+    fn eval(&self, node_idx: u32) -> f64 {
+        match &self.tree.nodes[node_idx as usize] {
+            PostflopNode::Terminal { terminal_type, pot_fraction } => {
+                mccfr_terminal_payoff(
+                    *terminal_type, *pot_fraction,
+                    self.hero_hand, self.opp_hand, self.board, self.hero_pos,
+                )
             }
-            PostflopTerminalType::Showdown => {
-                let hero_rank = rank_hand(hero_hand, board);
-                let opp_rank = rank_hand(opp_hand, board);
-                let eq = match hero_rank.cmp(&opp_rank) {
-                    std::cmp::Ordering::Greater => 1.0,
-                    std::cmp::Ordering::Less => 0.0,
-                    std::cmp::Ordering::Equal => 0.5,
-                };
-                eq * pot_fraction - pot_fraction / 2.0
+            PostflopNode::Chance { children, .. } => {
+                debug_assert!(!children.is_empty(), "chance node must have at least one child");
+                self.eval(children[0])
             }
-        },
-
-        PostflopNode::Chance { children, .. } => {
-            debug_assert!(
-                !children.is_empty(),
-                "chance node must have at least one child"
-            );
-            mccfr_eval_with_avg_strategy(
-                tree,
-                layout,
-                strategy_sum,
-                children[0],
-                hero_bucket,
-                opp_bucket,
-                hero_pos,
-                hero_hand,
-                opp_hand,
-                board,
-            )
-        }
-
-        PostflopNode::Decision {
-            position, children, ..
-        } => {
-            let bucket = if *position == hero_pos {
-                hero_bucket
-            } else {
-                opp_bucket
-            };
-            let (start, _) = layout.slot(node_idx, bucket);
-            let num_actions = children.len();
-
-            let strategy = normalize_strategy_sum(strategy_sum, start, num_actions);
-
-            children
-                .iter()
-                .enumerate()
-                .map(|(i, &child)| {
-                    strategy[i]
-                        * mccfr_eval_with_avg_strategy(
-                            tree,
-                            layout,
-                            strategy_sum,
-                            child,
-                            hero_bucket,
-                            opp_bucket,
-                            hero_pos,
-                            hero_hand,
-                            opp_hand,
-                            board,
-                        )
-                })
-                .sum()
+            PostflopNode::Decision { position, children, .. } => {
+                let bucket = if *position == self.hero_pos { self.hero_bucket } else { self.opp_bucket };
+                let (start, _) = self.layout.slot(node_idx, bucket);
+                let strategy = normalize_strategy_sum(self.strategy_sum, start, children.len());
+                children.iter().enumerate()
+                    .map(|(i, &child)| strategy[i] * self.eval(child))
+                    .sum()
+            }
         }
     }
 }
+
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests
@@ -763,23 +716,15 @@ mod tests {
                 card(Value::Eight, Suit::Heart),
             ];
 
-            let ev = mccfr_traverse(
-                &tree,
-                &layout,
-                &snapshot,
-                &mut dr,
-                &mut ds,
-                node_idx,
-                0,
-                1,
-                0,
-                hero_hand,
-                opp_hand,
-                &board,
-                1.0,
-                1.0,
-                1,
-            );
+            let ctx = MccfrTraverseCtx {
+                tree: &tree, layout: &layout, snapshot: &snapshot,
+                board: &board, iteration: 1,
+            };
+            let args = MccfrTraverseArgs {
+                node_idx, hero_bucket: 0, opp_bucket: 1, hero_pos: 0,
+                hero_hand, opp_hand, reach_hero: 1.0, reach_opp: 1.0,
+            };
+            let ev = ctx.traverse(&mut dr, &mut ds, &args);
 
             if folder == 0 {
                 // Hero folds → loses
@@ -844,23 +789,15 @@ mod tests {
                 card(Value::Eight, Suit::Diamond),
             ];
 
-            let ev = mccfr_traverse(
-                &tree,
-                &layout,
-                &snapshot,
-                &mut dr,
-                &mut ds,
-                node_idx,
-                0,
-                1,
-                0,
-                hero_hand,
-                opp_hand,
-                &board,
-                1.0,
-                1.0,
-                1,
-            );
+            let ctx = MccfrTraverseCtx {
+                tree: &tree, layout: &layout, snapshot: &snapshot,
+                board: &board, iteration: 1,
+            };
+            let args = MccfrTraverseArgs {
+                node_idx, hero_bucket: 0, opp_bucket: 1, hero_pos: 0,
+                hero_hand, opp_hand, reach_hero: 1.0, reach_opp: 1.0,
+            };
+            let ev = ctx.traverse(&mut dr, &mut ds, &args);
 
             // AA beats KK → eq=1.0 → ev = 1.0 * pot_frac - pot_frac/2 = pot_frac/2
             let expected = pot_fraction / 2.0;
@@ -928,7 +865,7 @@ mod tests {
 
         let values = mccfr_extract_values(
             &tree, &layout, &result.strategy_sum, &combo_map, flop,
-            3, n_subset, 0.001, "test", &|_| {},
+            3, n_subset, "test", &|_| {},
         );
 
         assert_eq!(values.len(), 2 * n_subset * n_subset, "values should be 2*n*n");

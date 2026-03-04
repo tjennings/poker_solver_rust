@@ -111,14 +111,9 @@ impl PreflopTree {
     }
 }
 
-/// Recursively builds the tree, returning the index of the node created.
+/// Check for terminal states and return the terminal node if applicable.
 #[allow(clippy::cast_possible_truncation)]
-fn build_recursive(
-    config: &PreflopConfig,
-    state: &BuildState,
-    nodes: &mut Vec<PreflopNode>,
-) -> u32 {
-    // Check if only one player remains (everyone else folded)
+fn check_terminal(state: &BuildState, nodes: &mut Vec<PreflopNode>) -> Option<u32> {
     if state.num_active == 1 {
         let pot: u32 = state.invested.iter().sum();
         let folder = find_last_folder(state);
@@ -127,11 +122,9 @@ fn build_recursive(
             terminal_type: TerminalType::Fold { folder },
             pot,
         });
-        return idx;
+        return Some(idx);
     }
 
-    // Check if round is complete: all active players have acted since last raise
-    // and all investments are equal among active players
     if is_round_complete(state) {
         let pot: u32 = state.invested.iter().sum();
         let idx = nodes.len() as u32;
@@ -139,75 +132,87 @@ fn build_recursive(
             terminal_type: TerminalType::Showdown,
             pot,
         });
-        return idx;
+        return Some(idx);
     }
 
-    // Skip folded players
-    let position = find_next_active(state);
+    None
+}
+
+/// Generate available actions and their resulting states for a decision node.
+fn generate_actions(
+    config: &PreflopConfig,
+    state: &BuildState,
+    position: u8,
+) -> Vec<(PreflopAction, BuildState)> {
     let to_call = state
         .current_bet
         .saturating_sub(state.invested[position as usize]);
+    let player_stack = state.stacks[position as usize];
 
     let mut actions = Vec::new();
-    let mut child_indices = Vec::new();
 
-    // Reserve a slot for this decision node
-    let node_idx = nodes.len() as u32;
-    nodes.push(PreflopNode::Terminal {
-        terminal_type: TerminalType::Showdown,
-        pot: 0,
-    }); // placeholder
-
-    // Fold (always available if there's something to call, or if we want to fold anyway)
     if to_call > 0 {
-        let child_state = apply_fold(state, position);
-        let child_idx = build_recursive(config, &child_state, nodes);
-        actions.push(PreflopAction::Fold);
-        child_indices.push(child_idx);
+        actions.push((PreflopAction::Fold, apply_fold(state, position)));
     }
+    actions.push((PreflopAction::Call, apply_call(state, position, to_call)));
 
-    // Call/Check
-    {
-        let child_state = apply_call(state, position, to_call);
-        let child_idx = build_recursive(config, &child_state, nodes);
-        actions.push(PreflopAction::Call);
-        child_indices.push(child_idx);
-    }
-
-    // All-in is always available regardless of raise cap (if player has chips)
-    let player_stack = state.stacks[position as usize];
     if player_stack > 0 {
-        let child_state = apply_all_in(state, position);
-        let child_idx = build_recursive(config, &child_state, nodes);
-        actions.push(PreflopAction::AllIn);
-        child_indices.push(child_idx);
+        actions.push((PreflopAction::AllIn, apply_all_in(state, position)));
     }
 
-    // Sized raises (if under raise cap)
     if state.raise_count < config.raise_cap {
         let last_raise_depth = state.raise_count + 1 == config.raise_cap;
-
-        // At the last raise depth, only offer all-in (no sized raises)
         if !last_raise_depth {
             let depth = state.raise_count as usize;
             for &size in config.raise_sizes_for(position, depth) {
                 let new_bet = compute_raise_to(state, position, size);
                 let additional = new_bet.saturating_sub(state.invested[position as usize]);
                 if additional > 0 && additional < player_stack {
-                    let child_state = apply_raise(state, position, new_bet);
-                    let child_idx = build_recursive(config, &child_state, nodes);
-                    actions.push(PreflopAction::Raise(size));
-                    child_indices.push(child_idx);
+                    actions.push((
+                        PreflopAction::Raise(size),
+                        apply_raise(state, position, new_bet),
+                    ));
                 }
             }
         }
     }
 
-    // Replace placeholder with the real decision node
+    actions
+}
+
+/// Recursively builds the tree, returning the index of the node created.
+#[allow(clippy::cast_possible_truncation)]
+fn build_recursive(
+    config: &PreflopConfig,
+    state: &BuildState,
+    nodes: &mut Vec<PreflopNode>,
+) -> u32 {
+    if let Some(idx) = check_terminal(state, nodes) {
+        return idx;
+    }
+
+    let position = find_next_active(state);
+    let available = generate_actions(config, state, position);
+
+    // Reserve a slot for this decision node (placeholder)
+    let node_idx = nodes.len() as u32;
+    nodes.push(PreflopNode::Terminal {
+        terminal_type: TerminalType::Showdown,
+        pot: 0,
+    });
+
+    let mut action_labels = Vec::with_capacity(available.len());
+    let mut children = Vec::with_capacity(available.len());
+    for (action, child_state) in &available {
+        let child_idx = build_recursive(config, child_state, nodes);
+        action_labels.push(*action);
+        children.push(child_idx);
+    }
+
     nodes[node_idx as usize] = PreflopNode::Decision {
         position,
-        children: child_indices,
-        action_labels: actions,
+        children,
+        action_labels,
     };
 
     node_idx

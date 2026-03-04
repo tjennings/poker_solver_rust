@@ -475,10 +475,39 @@ impl PreflopSolver {
     }
 }
 
+/// Compute the showdown value at a terminal node, dispatching to either
+/// the postflop model or raw equity depending on context.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn terminal_showdown_value(
+    ctx: &Ctx<'_>,
+    node_idx: u32,
+    pot: u32,
+    hero_inv: f64,
+    hero_hand: u16,
+    opp_hand: u16,
+    hero_pos: u8,
+) -> f64 {
+    if let Some(pf_state) = ctx.postflop {
+        let eq = ctx.equity.equity(hero_hand as usize, opp_hand as usize);
+        postflop_showdown_value(
+            pf_state, node_idx, pot, hero_inv,
+            hero_hand, opp_hand, hero_pos,
+            eq, ctx.stacks,
+        )
+    } else {
+        terminal_value(
+            TerminalType::Showdown, pot, hero_inv,
+            hero_hand, opp_hand, hero_pos, ctx.equity,
+        )
+    }
+}
+
 /// Recursive CFR traversal. Returns expected value for the hero player.
 ///
 /// Reads strategy from `ctx.snapshot` (frozen for the iteration),
 /// writes regret and strategy deltas to flat `dr` / `ds` buffers.
+#[inline]
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 fn cfr_traverse(
     ctx: &Ctx<'_>,
@@ -497,19 +526,7 @@ fn cfr_traverse(
     match &ctx.tree.nodes[node_idx as usize] {
         PreflopNode::Terminal { terminal_type, pot } => match terminal_type {
             TerminalType::Showdown => {
-                if let Some(pf_state) = ctx.postflop {
-                    let eq = ctx.equity.equity(hero_hand as usize, opp_hand as usize);
-                    postflop_showdown_value(
-                        pf_state, node_idx, *pot, hero_inv,
-                        hero_hand, opp_hand, hero_pos,
-                        eq, ctx.stacks,
-                    )
-                } else {
-                    terminal_value(
-                        *terminal_type, *pot, hero_inv,
-                        hero_hand, opp_hand, hero_pos, ctx.equity,
-                    )
-                }
+                terminal_showdown_value(ctx, node_idx, *pot, hero_inv, hero_hand, opp_hand, hero_pos)
             }
             TerminalType::Fold { .. } => terminal_value(
                 *terminal_type, *pot, hero_inv,
@@ -528,8 +545,6 @@ fn cfr_traverse(
             regret_matching_into(ctx.snapshot, start, &mut intended[..num_actions]);
 
             if is_hero {
-                // Epsilon-greedy exploration: only applied to the traversing
-                // player's strategy. The opponent plays pure regret-matched.
                 let mut traversal = intended;
                 if ctx.exploration > 0.0 {
                     let eps = ctx.exploration;
@@ -555,6 +570,7 @@ fn cfr_traverse(
 }
 
 /// Hero's decision: compute regrets and update strategy/regret deltas.
+#[inline]
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 fn traverse_hero(
     ctx: &Ctx<'_>,

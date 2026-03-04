@@ -207,51 +207,42 @@ fn compute_equity_table_reference(combo_map: &[Vec<(Card, Card)>], flop: [Card; 
 /// Returns a flat `Vec` of size 169*169, indexed as `hero*169 + opp`.
 /// Value is hero's equity (0.0 to 1.0), or `NaN` if the hand pair has
 /// no non-conflicting combos.
-#[must_use]
-#[allow(clippy::cast_precision_loss)]
-pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec<f64> {
-    use std::ops::Range;
+/// Flat combo index for efficient equity computation.
+///
+/// Maps canonical hands to a flat array of concrete combos, enabling
+/// O(1) bitmask-based conflict checks during board enumeration.
+struct ComboIndex {
+    cards: Vec<(Card, Card)>,
+    masks: Vec<u64>,
+    ranges: Vec<std::ops::Range<usize>>,
+}
 
-    /// Sentinel value for combos that conflict with the board.
-    const CONFLICT: u32 = u32::MAX;
+/// Build a flat combo index from the canonical combo map.
+///
+/// `cards[i]` = the two hole cards for flat combo i,
+/// `masks[i]` = bitmask of those two cards (for conflict checks),
+/// `ranges[h]` = `Range<usize>` into `cards` for canonical hand h.
+fn build_combo_index(combo_map: &[Vec<(Card, Card)>], n: usize) -> ComboIndex {
+    let mut cards: Vec<(Card, Card)> = Vec::new();
+    let mut masks: Vec<u64> = Vec::new();
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(n);
 
-    let n = NUM_CANONICAL_HANDS;
-    let deck = all_cards_vec();
-
-    // ── Build flat combo index ──────────────────────────────────────────────
-    // combo_cards[i] = the two hole cards for flat combo i
-    // combo_mask[i]  = bitmask of those two cards (for conflict checks)
-    // canonical_range[h] = Range<usize> into combo_cards for canonical hand h
-
-    let mut combo_cards: Vec<(Card, Card)> = Vec::new();
-    let mut combo_mask: Vec<u64> = Vec::new();
-    let mut canonical_range: Vec<Range<usize>> = Vec::with_capacity(n);
-
-    for hand_combos in combo_map.iter().take(n) {
-        let start = combo_cards.len();
+    debug_assert_eq!(combo_map.len(), n, "combo_map must have exactly n entries");
+    for hand_combos in combo_map {
+        let start = cards.len();
         for &(c1, c2) in hand_combos {
-            combo_cards.push((c1, c2));
-            combo_mask.push((1u64 << card_bit(c1)) | (1u64 << card_bit(c2)));
+            cards.push((c1, c2));
+            masks.push((1u64 << card_bit(c1)) | (1u64 << card_bit(c2)));
         }
-        canonical_range.push(start..combo_cards.len());
+        ranges.push(start..cards.len());
     }
+    ComboIndex { cards, masks, ranges }
+}
 
-    let total_combos = combo_cards.len();
-
-    // ── Pre-compute deck bit positions ──────────────────────────────────────
-    let mut deck_bits = [0u8; 52];
-    for (i, &c) in deck.iter().enumerate() {
-        deck_bits[i] = card_bit(c);
-    }
-
-    // Flop mask — set once, reused by every thread.
-    let flop_mask: u64 = (1u64 << card_bit(flop[0]))
-        | (1u64 << card_bit(flop[1]))
-        | (1u64 << card_bit(flop[2]));
-
-    // ── Enumerate all (turn, river) boards and accumulate ───────────────────
-    // Collect board pairs so we can par_iter over them.
-    let mut boards: Vec<(usize, usize)> = Vec::new();
+/// Enumerate all (`turn_deck_idx`, `river_deck_idx`) pairs that don't overlap
+/// with the flop. Returns deck-index pairs for ordered (turn < river).
+fn enumerate_non_flop_boards(deck_bits: &[u8; 52], flop_mask: u64) -> Vec<(usize, usize)> {
+    let mut boards = Vec::new();
     for (ti, &ti_bit) in deck_bits.iter().enumerate() {
         if flop_mask & (1u64 << ti_bit) != 0 {
             continue;
@@ -263,44 +254,61 @@ pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) ->
             boards.push((ti, ri));
         }
     }
+    boards
+}
+
+/// Sentinel value for combos that conflict with the board.
+const COMBO_CONFLICT: u32 = u32::MAX;
+
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> Vec<f64> {
+    let n = NUM_CANONICAL_HANDS;
+    let deck = all_cards_vec();
+    let idx = build_combo_index(combo_map, n);
+
+    let mut deck_bits = [0u8; 52];
+    for (i, &c) in deck.iter().enumerate() {
+        deck_bits[i] = card_bit(c);
+    }
+    let flop_mask: u64 = (1u64 << card_bit(flop[0]))
+        | (1u64 << card_bit(flop[1]))
+        | (1u64 << card_bit(flop[2]));
+
+    let boards = enumerate_non_flop_boards(&deck_bits, flop_mask);
+    let total_combos = idx.cards.len();
 
     let (eq_sum, eq_count) = boards
         .par_iter()
         .fold(
             || (vec![0.0f64; n * n], vec![0u64; n * n]),
             |(mut local_eq, mut local_count), &(ti, ri)| {
-                let turn = deck[ti];
-                let river = deck[ri];
-                let board = [flop[0], flop[1], flop[2], turn, river];
+                let board = [flop[0], flop[1], flop[2], deck[ti], deck[ri]];
                 let board_mask: u64 =
                     flop_mask | (1u64 << deck_bits[ti]) | (1u64 << deck_bits[ri]);
 
                 // Phase 1: evaluate every combo against this board.
-                let mut ranks = vec![CONFLICT; total_combos];
-                for (ci, &(c1, c2)) in combo_cards.iter().enumerate() {
-                    if combo_mask[ci] & board_mask != 0 {
-                        continue; // combo conflicts with board
+                let mut ranks = vec![COMBO_CONFLICT; total_combos];
+                for (ci, &(c1, c2)) in idx.cards.iter().enumerate() {
+                    if idx.masks[ci] & board_mask != 0 {
+                        continue;
                     }
                     ranks[ci] = rank_to_ordinal(rank_hand([c1, c2], &board));
                 }
 
                 // Phase 2: for each canonical (hero, opp) pair, compare ranks.
-                for (h_idx, h_range) in canonical_range.iter().enumerate() {
-                    for (o_idx, o_range) in canonical_range.iter().enumerate() {
+                for (h_idx, h_range) in idx.ranges.iter().enumerate() {
+                    for (o_idx, o_range) in idx.ranges.iter().enumerate() {
                         let pair_idx = h_idx * n + o_idx;
                         for hi in h_range.clone() {
                             let h_rank = ranks[hi];
-                            if h_rank == CONFLICT {
+                            if h_rank == COMBO_CONFLICT {
                                 continue;
                             }
-                            let h_mask = combo_mask[hi];
+                            let h_mask = idx.masks[hi];
                             for oi in o_range.clone() {
                                 let o_rank = ranks[oi];
-                                if o_rank == CONFLICT {
-                                    continue;
-                                }
-                                // Hero/opp card overlap check.
-                                if h_mask & combo_mask[oi] != 0 {
+                                if o_rank == COMBO_CONFLICT || h_mask & idx.masks[oi] != 0 {
                                     continue;
                                 }
                                 local_eq[pair_idx] += match h_rank.cmp(&o_rank) {
@@ -313,7 +321,6 @@ pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) ->
                         }
                     }
                 }
-
                 (local_eq, local_count)
             },
         )
@@ -328,7 +335,6 @@ pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) ->
             },
         );
 
-    // ── Convert to equity fractions ─────────────────────────────────────────
     let mut table = vec![f64::NAN; n * n];
     for i in 0..n * n {
         if eq_count[i] > 0 {
@@ -559,96 +565,90 @@ fn terminal_payoff(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Exploitability
+// Strategy evaluation context
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Compute best-response EV for one player against the opponent's average strategy.
+/// Read-only context for tree evaluation using the averaged strategy.
 ///
-/// At `br_player`'s decision nodes: pick the action with highest EV (best response).
-/// At opponent's decision nodes: play the average strategy from `strategy_sum`.
-/// At terminals: use equity table for showdown, `pot_fraction` for folds.
-#[allow(clippy::too_many_arguments)]
-fn best_response_ev(
-    tree: &PostflopTree,
-    layout: &PostflopLayout,
-    strategy_sum: &[f64],
-    equity_table: &[f64],
-    node_idx: u32,
-    hero_hand: u16,
-    opp_hand: u16,
-    br_player: u8,
-) -> f64 {
-    let n = NUM_CANONICAL_HANDS;
-    match &tree.nodes[node_idx as usize] {
-        PostflopNode::Terminal {
-            terminal_type,
-            pot_fraction,
-        } => terminal_payoff(
-            *terminal_type,
-            *pot_fraction,
-            equity_table,
-            hero_hand,
-            opp_hand,
-            br_player,
-            n,
-        ),
+/// Shared by best-response computation (`best_response_ev`) and
+/// value extraction (`eval_with_avg_strategy`), eliminating parameter
+/// threading through recursive calls.
+struct EvalCtx<'a> {
+    tree: &'a PostflopTree,
+    layout: &'a PostflopLayout,
+    strategy_sum: &'a [f64],
+    equity_table: &'a [f64],
+}
 
-        PostflopNode::Chance { children, .. } => best_response_ev(
-            tree,
-            layout,
-            strategy_sum,
-            equity_table,
-            children[0],
-            hero_hand,
-            opp_hand,
-            br_player,
-        ),
+impl EvalCtx<'_> {
+    /// Compute best-response EV for `br_player` against the opponent's
+    /// average strategy, starting at `node_idx`.
+    fn best_response_ev(
+        &self, node_idx: u32, hero_hand: u16, opp_hand: u16, br_player: u8,
+    ) -> f64 {
+        let n = NUM_CANONICAL_HANDS;
+        match &self.tree.nodes[node_idx as usize] {
+            PostflopNode::Terminal { terminal_type, pot_fraction } => terminal_payoff(
+                *terminal_type, *pot_fraction, self.equity_table,
+                hero_hand, opp_hand, br_player, n,
+            ),
+            PostflopNode::Chance { children, .. } => {
+                self.best_response_ev(children[0], hero_hand, opp_hand, br_player)
+            }
+            PostflopNode::Decision { position, children, .. } => {
+                let is_br = *position == br_player;
+                let bucket = if is_br { hero_hand } else { opp_hand };
+                let (start, _) = self.layout.slot(node_idx, bucket);
 
-        PostflopNode::Decision {
-            position, children, ..
-        } => {
-            let is_br = *position == br_player;
-            let bucket = if is_br { hero_hand } else { opp_hand };
-            let (start, _) = layout.slot(node_idx, bucket);
-            let num_actions = children.len();
+                if is_br {
+                    self.br_hero_decision(children, hero_hand, opp_hand, br_player)
+                } else {
+                    self.br_opp_decision(children, start, hero_hand, opp_hand, br_player)
+                }
+            }
+        }
+    }
 
-            if is_br {
-                // Best response: pick the action with highest EV
-                children
-                    .iter()
-                    .map(|&child| {
-                        best_response_ev(
-                            tree,
-                            layout,
-                            strategy_sum,
-                            equity_table,
-                            child,
-                            hero_hand,
-                            opp_hand,
-                            br_player,
-                        )
-                    })
-                    .fold(f64::NEG_INFINITY, f64::max)
-            } else {
-                // Opponent plays average strategy
+    /// Hero best-response: pick the action with maximum EV.
+    fn br_hero_decision(
+        &self, children: &[u32], hero_hand: u16, opp_hand: u16, br_player: u8,
+    ) -> f64 {
+        children.iter()
+            .map(|&child| self.best_response_ev(child, hero_hand, opp_hand, br_player))
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    /// Opponent decision: weight actions by the opponent's average strategy.
+    fn br_opp_decision(
+        &self, children: &[u32], start: usize, hero_hand: u16, opp_hand: u16, br_player: u8,
+    ) -> f64 {
+        let mut strategy = [0.0f64; MAX_POSTFLOP_ACTIONS];
+        normalize_strategy_sum_into(self.strategy_sum, start, &mut strategy[..children.len()]);
+        children.iter().enumerate()
+            .map(|(i, &child)| strategy[i] * self.best_response_ev(child, hero_hand, opp_hand, br_player))
+            .sum()
+    }
+
+    /// Walk tree using the averaged strategy for both players.
+    fn eval_with_avg_strategy(
+        &self, node_idx: u32, hero_hand: u16, opp_hand: u16, hero_pos: u8,
+    ) -> f64 {
+        let n = NUM_CANONICAL_HANDS;
+        match &self.tree.nodes[node_idx as usize] {
+            PostflopNode::Terminal { terminal_type, pot_fraction } => terminal_payoff(
+                *terminal_type, *pot_fraction, self.equity_table,
+                hero_hand, opp_hand, hero_pos, n,
+            ),
+            PostflopNode::Chance { children, .. } => {
+                self.eval_with_avg_strategy(children[0], hero_hand, opp_hand, hero_pos)
+            }
+            PostflopNode::Decision { position, children, .. } => {
+                let bucket = if *position == hero_pos { hero_hand } else { opp_hand };
+                let (start, _) = self.layout.slot(node_idx, bucket);
                 let mut strategy = [0.0f64; MAX_POSTFLOP_ACTIONS];
-                normalize_strategy_sum_into(strategy_sum, start, &mut strategy[..num_actions]);
-                children
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &child)| {
-                        strategy[i]
-                            * best_response_ev(
-                                tree,
-                                layout,
-                                strategy_sum,
-                                equity_table,
-                                child,
-                                hero_hand,
-                                opp_hand,
-                                br_player,
-                            )
-                    })
+                normalize_strategy_sum_into(self.strategy_sum, start, &mut strategy[..children.len()]);
+                children.iter().enumerate()
+                    .map(|(i, &child)| strategy[i] * self.eval_with_avg_strategy(child, hero_hand, opp_hand, hero_pos))
                     .sum()
             }
         }
@@ -675,6 +675,7 @@ fn compute_exploitability(
     strategy_sum: &[f64],
     equity_table: &[f64],
 ) -> f64 {
+    let ctx = EvalCtx { tree, layout, strategy_sum, equity_table };
     let n = NUM_CANONICAL_HANDS;
     let mut br_values = [0.0f64; 2];
 
@@ -691,9 +692,7 @@ fn compute_exploitability(
                     .map(move |opp_hand| (hero_hand, opp_hand))
             })
             .map(|(hero_hand, opp_hand)| {
-                best_response_ev(
-                    tree, layout, strategy_sum, equity_table, 0, hero_hand, opp_hand, br_player,
-                )
+                ctx.best_response_ev(0, hero_hand, opp_hand, br_player)
             })
             .fold(
                 || (0.0f64, 0u64),
@@ -792,13 +791,117 @@ fn extremal_regrets(regret_sum: &[f64]) -> (f64, f64) {
     (max_pos, min_neg)
 }
 
+/// Immutable context for solving a single flop via exhaustive CFR.
+///
+/// Bundles all read-only arguments so the solve loop and its helpers
+/// have a single receiver instead of 10+ parameters.
+struct SolveLoopCtx<'a, F: Fn(BuildPhase) + Sync> {
+    tree: &'a PostflopTree,
+    layout: &'a PostflopLayout,
+    equity_table: &'a [f64],
+    dcfr: &'a DcfrParams,
+    config: &'a PostflopModelConfig,
+    on_progress: &'a F,
+    counters: Option<&'a SolverCounters>,
+    flop_name: &'a str,
+    pairs: &'a [(u16, u16)],
+}
+
+impl<F: Fn(BuildPhase) + Sync> SolveLoopCtx<'_, F> {
+    /// Run one CFR traversal iteration. Returns the per-flop pruning delta
+    /// `(total_action_slots_delta, pruned_action_slots_delta)`.
+    #[inline]
+    fn run_traversal(&self, bufs: &mut FlopBuffers, iteration: u64, prune_active: bool) -> (u64, u64) {
+        let prev_total = self.counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
+        let prev_pruned = self.counters.map_or(0, |c| c.pruned_action_slots.load(Ordering::Relaxed));
+
+        {
+            let ctx = PostflopCfrCtx {
+                tree: self.tree,
+                layout: self.layout,
+                equity_table: self.equity_table,
+                snapshot: &bufs.regret_sum,
+                iteration,
+                dcfr: self.dcfr,
+                prune_active,
+                prune_regret_threshold: self.config.prune_regret_threshold,
+                counters: self.counters,
+            };
+            parallel_traverse_pooled(&ctx, self.pairs, std::slice::from_mut(&mut bufs.delta));
+        }
+
+        let cur_total = self.counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
+        let cur_pruned = self.counters.map_or(0, |c| c.pruned_action_slots.load(Ordering::Relaxed));
+        (cur_total.saturating_sub(prev_total), cur_pruned.saturating_sub(prev_pruned))
+    }
+
+    /// Apply DCFR discounting, merge per-iteration deltas into accumulators,
+    /// and clamp negative regrets when configured.
+    #[inline]
+    fn apply_dcfr_and_merge_deltas(&self, bufs: &mut FlopBuffers, iteration: u64) {
+        if self.dcfr.should_discount(iteration) {
+            self.dcfr.discount_regrets(&mut bufs.regret_sum, iteration);
+            self.dcfr.discount_strategy_sums(&mut bufs.strategy_sum, iteration);
+        }
+        add_into(&mut bufs.regret_sum, &bufs.delta.0);
+        add_into(&mut bufs.strategy_sum, &bufs.delta.1);
+        if self.dcfr.should_floor_regrets() {
+            self.dcfr.floor_regrets(&mut bufs.regret_sum);
+        }
+        if self.config.regret_floor > 0.0 && self.config.prune_warmup > 0 {
+            let floor = -self.config.regret_floor;
+            for v in &mut bufs.regret_sum {
+                *v = (*v).max(floor);
+            }
+        }
+    }
+
+    /// Conditionally compute exploitability if the current iteration matches
+    /// the configured frequency. Returns `Some(mBB/h)` when computed.
+    fn check_exploitability(&self, bufs: &FlopBuffers, iter: usize, num_iterations: usize) -> Option<f64> {
+        let expl_freq = self.config.exploitability_freq.max(1);
+        if iter >= 1 && (iter % expl_freq == expl_freq - 1 || iter == num_iterations - 1) {
+            Some(compute_exploitability(self.tree, self.layout, &bufs.strategy_sum, self.equity_table))
+        } else {
+            None
+        }
+    }
+
+    /// Emit a `FlopProgress` callback with the current solve metrics.
+    fn report_iteration_progress(&self, metrics: &IterationMetrics, num_iterations: usize) {
+        (self.on_progress)(BuildPhase::FlopProgress {
+            flop_name: self.flop_name.to_owned(),
+            stage: FlopStage::Solving {
+                iteration: metrics.iterations_used,
+                max_iterations: num_iterations,
+                delta: metrics.exploitability,
+                metric_label: "mBB/h".into(),
+                total_action_slots: metrics.flop_total_slots,
+                pruned_action_slots: metrics.flop_pruned_slots,
+                max_positive_regret: metrics.max_pos,
+                min_negative_regret: metrics.min_neg,
+            },
+        });
+    }
+}
+
+/// Mutable per-flop iteration state accumulated across the solve loop.
+struct IterationMetrics {
+    exploitability: f64,
+    max_pos: f64,
+    min_neg: f64,
+    flop_total_slots: u64,
+    flop_pruned_slots: u64,
+    iterations_used: usize,
+}
+
 /// Solve a single flop using exhaustive CFR with configurable iteration weighting.
 ///
 /// Inner `parallel_traverse_pooled` and `compute_exploitability` use rayon's
 /// global thread pool. When called from `build_exhaustive` (which parallelises
 /// over flops), rayon's work-stealing distributes hand-pair work across all
 /// available cores, dynamically rebalancing as flops converge at different rates.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn exhaustive_solve_one_flop(
     tree: &PostflopTree,
     layout: &PostflopLayout,
@@ -812,140 +915,56 @@ fn exhaustive_solve_one_flop(
     counters: Option<&SolverCounters>,
     bufs: &mut FlopBuffers,
 ) -> (f64, usize) {
-    let mut current_exploitability = f64::INFINITY;
-    let mut current_max_pos = 0.0f64;
-    let mut current_min_neg = 0.0f64;
-    let mut iterations_used = 0;
     let n = NUM_CANONICAL_HANDS;
-
-    // Pre-build valid hand pairs (filter NaN equity pairs once).
     let pairs: Vec<(u16, u16)> = (0..n as u16)
         .flat_map(|h1| (0..n as u16).map(move |h2| (h1, h2)))
         .filter(|&(h1, h2)| !equity_table[h1 as usize * n + h2 as usize].is_nan())
         .collect();
 
-    // Tell the TUI how many traversals this flop will contribute.
     if let Some(c) = counters {
         c.total_expected_traversals
             .fetch_add((pairs.len() * num_iterations) as u64, Ordering::Relaxed);
     }
 
-    // Per-flop pruning accumulators: track action-slot pruning for this flop
-    // by snapshotting the global counters before/after each iteration.
-    let mut flop_total_action_slots: u64 = 0;
-    let mut flop_pruned_action_slots: u64 = 0;
-
-    let flop_name_owned = flop_name.to_string();
-
-    // Signal 0/N so the TUI shows this flop immediately.
-    on_progress(BuildPhase::FlopProgress {
-        flop_name: flop_name_owned.clone(),
-        stage: FlopStage::Solving {
-            iteration: 0,
-            max_iterations: num_iterations,
-            delta: f64::INFINITY,
-            metric_label: "mBB/h".into(),
-            total_action_slots: 0,
-            pruned_action_slots: 0,
-            max_positive_regret: 0.0,
-            min_negative_regret: 0.0,
-        },
-    });
+    let ctx = SolveLoopCtx {
+        tree, layout, equity_table, dcfr, config, on_progress, counters,
+        flop_name,
+        pairs: &pairs,
+    };
+    let mut m = IterationMetrics {
+        exploitability: f64::INFINITY,
+        max_pos: 0.0, min_neg: 0.0,
+        flop_total_slots: 0, flop_pruned_slots: 0,
+        iterations_used: 0,
+    };
+    ctx.report_iteration_progress(&m, num_iterations);
 
     for iter in 0..num_iterations {
-        let iteration = iter as u64 + 1; // 1-indexed to match LCFR convention
-
-        // Snapshot global counters before traversal so we can attribute
-        // the delta to this flop.
-        let prev_total = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
-        let prev_pruned = counters.map_or(0, |c| c.pruned_action_slots.load(Ordering::Relaxed));
-
+        let iteration = iter as u64 + 1;
         let prune_active = config.prune_warmup > 0
             && iter >= config.prune_warmup
             && (config.prune_explore_freq == 0 || iter % config.prune_explore_freq != 0);
 
-        // Scoped borrow: ctx borrows &regret_sum immutably during traversal.
-        // No snapshot clone needed — regret_sum is not mutated until after
-        // traversal completes (discounting + merge happen below).
-        {
-            let ctx = PostflopCfrCtx {
-                tree,
-                layout,
-                equity_table,
-                snapshot: &bufs.regret_sum,
-                iteration,
-                dcfr,
-                prune_active,
-                prune_regret_threshold: config.prune_regret_threshold,
-                counters,
-            };
+        let (dt, dp) = ctx.run_traversal(bufs, iteration, prune_active);
+        m.flop_total_slots += dt;
+        m.flop_pruned_slots += dp;
 
-            parallel_traverse_pooled(&ctx, &pairs, std::slice::from_mut(&mut bufs.delta));
-        } // ctx dropped — &bufs.regret_sum borrow released
+        ctx.apply_dcfr_and_merge_deltas(bufs, iteration);
+        m.iterations_used = iter + 1;
 
-        // Accumulate per-flop pruning stats from global counter deltas.
-        let cur_total = counters.map_or(0, |c| c.total_action_slots.load(Ordering::Relaxed));
-        let cur_pruned = counters.map_or(0, |c| c.pruned_action_slots.load(Ordering::Relaxed));
-        flop_total_action_slots += cur_total.saturating_sub(prev_total);
-        flop_pruned_action_slots += cur_pruned.saturating_sub(prev_pruned);
-
-        // Apply DCFR discounting before merging deltas.
-        if dcfr.should_discount(iteration) {
-            dcfr.discount_regrets(&mut bufs.regret_sum, iteration);
-            dcfr.discount_strategy_sums(&mut bufs.strategy_sum, iteration);
-        }
-        // Merge deltas into accumulators.
-        add_into(&mut bufs.regret_sum, &bufs.delta.0);
-        add_into(&mut bufs.strategy_sum, &bufs.delta.1);
-        if dcfr.should_floor_regrets() {
-            dcfr.floor_regrets(&mut bufs.regret_sum);
-        }
-
-        // Clamp negative regrets to prevent unbounded accumulation.
-        // This bounds memory of bad actions so pruned actions can
-        // recover when explored during explore-frequency iterations.
-        if config.regret_floor > 0.0 && config.prune_warmup > 0 {
-            let floor = -config.regret_floor;
-            for v in bufs.regret_sum.iter_mut() {
-                *v = (*v).max(floor);
-            }
-        }
-
-        iterations_used = iter + 1;
-
-        // Compute median regrets periodically (every 10 iters + final).
         if iter % 10 == 0 || iter == num_iterations - 1 {
-            let (mp, mn) = extremal_regrets(&bufs.regret_sum);
-            current_max_pos = mp;
-            current_min_neg = mn;
+            (m.max_pos, m.min_neg) = extremal_regrets(&bufs.regret_sum);
         }
-
-        let expl_freq = config.exploitability_freq.max(1);
-        if iter >= 1 && (iter % expl_freq == expl_freq - 1 || iter == num_iterations - 1) {
-            current_exploitability =
-                compute_exploitability(tree, layout, &bufs.strategy_sum, equity_table);
+        if let Some(e) = ctx.check_exploitability(bufs, iter, num_iterations) {
+            m.exploitability = e;
         }
-
-        on_progress(BuildPhase::FlopProgress {
-            flop_name: flop_name_owned.clone(),
-            stage: FlopStage::Solving {
-                iteration: iterations_used,
-                max_iterations: num_iterations,
-                delta: current_exploitability,
-                metric_label: "mBB/h".into(),
-                total_action_slots: flop_total_action_slots,
-                pruned_action_slots: flop_pruned_action_slots,
-                max_positive_regret: current_max_pos,
-                min_negative_regret: current_min_neg,
-            },
-        });
-
-        if iter >= 1 && current_exploitability < convergence_threshold {
+        ctx.report_iteration_progress(&m, num_iterations);
+        if iter >= 1 && m.exploitability < convergence_threshold {
             break;
         }
     }
 
-    (current_exploitability, iterations_used)
+    (m.exploitability, m.iterations_used)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -963,30 +982,18 @@ fn exhaustive_extract_values(
     strategy_sum: &[f64],
     equity_table: &[f64],
 ) -> Vec<f64> {
+    let ctx = EvalCtx { tree, layout, strategy_sum, equity_table };
     let n = NUM_CANONICAL_HANDS;
-    // NaN = "no valid combos on this flop" -- skipped during cross-flop averaging.
     let mut values = vec![f64::NAN; 2 * n * n];
 
     for hero_hand in 0..n as u16 {
         for opp_hand in 0..n as u16 {
-            let eq = equity_table[hero_hand as usize * n + opp_hand as usize];
-            if eq.is_nan() {
-                continue; // remains NaN -- signals missing data
+            if equity_table[hero_hand as usize * n + opp_hand as usize].is_nan() {
+                continue;
             }
-
             for hero_pos in 0..2u8 {
-                let ev = eval_with_avg_strategy(
-                    tree,
-                    layout,
-                    strategy_sum,
-                    equity_table,
-                    0,
-                    hero_hand,
-                    opp_hand,
-                    hero_pos,
-                );
-                let idx =
-                    hero_pos as usize * n * n + hero_hand as usize * n + opp_hand as usize;
+                let ev = ctx.eval_with_avg_strategy(0, hero_hand, opp_hand, hero_pos);
+                let idx = hero_pos as usize * n * n + hero_hand as usize * n + opp_hand as usize;
                 values[idx] = ev;
             }
         }
@@ -994,78 +1001,74 @@ fn exhaustive_extract_values(
     values
 }
 
-/// Walk tree using averaged strategy with equity table lookups.
-#[allow(clippy::too_many_arguments)]
-fn eval_with_avg_strategy(
-    tree: &PostflopTree,
-    layout: &PostflopLayout,
-    strategy_sum: &[f64],
-    equity_table: &[f64],
-    node_idx: u32,
-    hero_hand: u16,
-    opp_hand: u16,
-    hero_pos: u8,
-) -> f64 {
-    let n = NUM_CANONICAL_HANDS;
-    match &tree.nodes[node_idx as usize] {
-        PostflopNode::Terminal {
-            terminal_type,
-            pot_fraction,
-        } => terminal_payoff(
-            *terminal_type,
-            *pot_fraction,
-            equity_table,
-            hero_hand,
-            opp_hand,
-            hero_pos,
-            n,
-        ),
-        PostflopNode::Chance { children, .. } => eval_with_avg_strategy(
-            tree,
-            layout,
-            strategy_sum,
-            equity_table,
-            children[0],
-            hero_hand,
-            opp_hand,
-            hero_pos,
-        ),
-        PostflopNode::Decision {
-            position, children, ..
-        } => {
-            let bucket = if *position == hero_pos {
-                hero_hand
-            } else {
-                opp_hand
-            };
-            let (start, _) = layout.slot(node_idx, bucket);
-            let num_actions = children.len();
-            let mut strategy = [0.0f64; MAX_POSTFLOP_ACTIONS];
-            normalize_strategy_sum_into(strategy_sum, start, &mut strategy[..num_actions]);
-            children
-                .iter()
-                .enumerate()
-                .map(|(i, &child)| {
-                    strategy[i]
-                        * eval_with_avg_strategy(
-                            tree,
-                            layout,
-                            strategy_sum,
-                            equity_table,
-                            child,
-                            hero_hand,
-                            opp_hand,
-                            hero_pos,
-                        )
-                })
-                .sum()
-        }
-    }
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Shared immutable context for building postflop values across all flops.
+///
+/// Bundles the read-only state that every per-flop solve needs, avoiding
+/// 13-parameter function signatures.
+struct BuildCtx<'a, F: Fn(BuildPhase) + Sync> {
+    config: &'a PostflopModelConfig,
+    tree: &'a PostflopTree,
+    layout: &'a PostflopLayout,
+    flops: &'a [[Card; 3]],
+    pre_equity_tables: Option<&'a [Vec<f64>]>,
+    dcfr: DcfrParams,
+    on_progress: &'a F,
+    counters: Option<&'a SolverCounters>,
+    completed: AtomicUsize,
+    num_iterations: usize,
+}
+
+impl<F: Fn(BuildPhase) + Sync> BuildCtx<'_, F> {
+    /// Solve one flop and extract its strategy values.
+    fn solve_and_extract_flop(&self, flop_idx: usize) -> Vec<f64> {
+        let flop = self.flops[flop_idx];
+        let flop_name = format!("{}{}{}", flop[0], flop[1], flop[2]);
+
+        let equity_table = if let Some(tables) = self.pre_equity_tables {
+            tables[flop_idx].clone()
+        } else {
+            let combo_map = build_combo_map(&flop);
+            compute_equity_table(&combo_map, flop)
+        };
+
+        thread_local! {
+            static FLOP_BUFS: RefCell<Option<FlopBuffers>> = const { RefCell::new(None) };
+        }
+
+        let buf_size = self.layout.total_size;
+        FLOP_BUFS.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            if borrow.as_ref().is_none_or(|b| b.regret_sum.len() != buf_size) {
+                *borrow = Some(FlopBuffers::new(buf_size));
+            } else {
+                borrow.as_mut().unwrap().reset();
+            }
+            let bufs = borrow.as_mut().unwrap();
+
+            exhaustive_solve_one_flop(
+                self.tree, self.layout, &equity_table, self.num_iterations,
+                self.config.cfr_convergence_threshold, &flop_name, &self.dcfr,
+                self.config, self.on_progress, self.counters, bufs,
+            );
+
+            let values = exhaustive_extract_values(
+                self.tree, self.layout, &bufs.strategy_sum, &equity_table,
+            );
+
+            (self.on_progress)(BuildPhase::FlopProgress { flop_name, stage: FlopStage::Done });
+            let done = self.completed.fetch_add(1, Ordering::Relaxed) + 1;
+            (self.on_progress)(BuildPhase::MccfrFlopsCompleted {
+                completed: done, total: self.flops.len(),
+            });
+
+            values
+        })
+    }
+}
 
 /// Build postflop values using exhaustive CFR with equity tables.
 #[allow(clippy::too_many_arguments)]
@@ -1079,80 +1082,28 @@ pub(crate) fn build_exhaustive(
     on_progress: &(impl Fn(BuildPhase) + Sync),
     counters: Option<&SolverCounters>,
 ) -> PostflopValues {
-    let num_flops = flops.len();
-    let n = NUM_CANONICAL_HANDS;
-    let num_iterations = config.postflop_solve_iterations as usize;
     let _ = node_streets;
-    let completed = AtomicUsize::new(0);
+    let n = NUM_CANONICAL_HANDS;
 
-    let dcfr = match config.cfr_variant {
-        CfrVariant::Linear => DcfrParams::linear(),
-        CfrVariant::Dcfr => DcfrParams::default(),
-        CfrVariant::Vanilla => DcfrParams::vanilla(),
-        CfrVariant::CfrPlus => DcfrParams::from_config(CfrVariant::CfrPlus, 0.0, 0.0, 0.0, 0),
+    let ctx = BuildCtx {
+        config, tree, layout, flops, pre_equity_tables,
+        dcfr: match config.cfr_variant {
+            CfrVariant::Linear => DcfrParams::linear(),
+            CfrVariant::Dcfr => DcfrParams::default(),
+            CfrVariant::Vanilla => DcfrParams::vanilla(),
+            CfrVariant::CfrPlus => DcfrParams::from_config(CfrVariant::CfrPlus, 0.0, 0.0, 0.0, 0),
+        },
+        on_progress, counters,
+        completed: AtomicUsize::new(0),
+        num_iterations: config.postflop_solve_iterations as usize,
     };
 
-    let buf_size = layout.total_size;
-
-    thread_local! {
-        static FLOP_BUFS: RefCell<Option<FlopBuffers>> = const { RefCell::new(None) };
-    }
-
-    let results: Vec<Vec<f64>> = (0..num_flops)
+    let results: Vec<Vec<f64>> = (0..flops.len())
         .into_par_iter()
-        .map(|flop_idx| {
-            let flop = flops[flop_idx];
-            let flop_name = format!("{}{}{}", flop[0], flop[1], flop[2]);
-
-            let equity_table = if let Some(tables) = pre_equity_tables {
-                tables[flop_idx].clone()
-            } else {
-                let combo_map = build_combo_map(&flop);
-                compute_equity_table(&combo_map, flop)
-            };
-
-            FLOP_BUFS.with(|cell| {
-                let mut borrow = cell.borrow_mut();
-                // Reallocate if buffer size changed (different SPR = different tree).
-                if borrow.as_ref().map_or(true, |b| b.regret_sum.len() != buf_size) {
-                    *borrow = Some(FlopBuffers::new(buf_size));
-                } else {
-                    borrow.as_mut().unwrap().reset();
-                }
-                let bufs = borrow.as_mut().unwrap();
-
-                let (_delta, _iterations_used) = exhaustive_solve_one_flop(
-                    tree,
-                    layout,
-                    &equity_table,
-                    num_iterations,
-                    config.cfr_convergence_threshold,
-                    &flop_name,
-                    &dcfr,
-                    config,
-                    on_progress,
-                    counters,
-                    bufs,
-                );
-
-                let values =
-                    exhaustive_extract_values(tree, layout, &bufs.strategy_sum, &equity_table);
-
-                on_progress(BuildPhase::FlopProgress {
-                    flop_name: flop_name.clone(),
-                    stage: FlopStage::Done,
-                });
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                on_progress(BuildPhase::MccfrFlopsCompleted {
-                    completed: done,
-                    total: num_flops,
-                });
-
-                values
-            })
-        })
+        .map(|flop_idx| ctx.solve_and_extract_flop(flop_idx))
         .collect();
 
+    let num_flops = flops.len();
     let mut all_values = vec![0.0f64; num_flops * 2 * n * n];
     for (flop_idx, vals) in results.into_iter().enumerate() {
         let offset = flop_idx * 2 * n * n;

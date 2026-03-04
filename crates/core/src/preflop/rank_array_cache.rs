@@ -24,6 +24,7 @@ const VERSION: u32 = 1;
 // Card encoding helpers (local copies -- same scheme as equity_table_cache)
 // ──────────────────────────────────────────────────────────────────────────────
 
+#[inline]
 fn encode_card(c: Card) -> u8 {
     c.value as u8 * 4 + c.suit as u8
 }
@@ -38,10 +39,6 @@ fn decode_card(b: u8) -> Card {
     // b%4 is always in range 0..=3.
     let suit = unsafe { std::mem::transmute::<u8, Suit>(b % 4) };
     Card { value, suit }
-}
-
-fn card_bit(card: Card) -> u8 {
-    card.value as u8 * 4 + card.suit as u8
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -174,54 +171,47 @@ impl RankArrayCache {
 // Computation
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Compute rank arrays for a single flop.
-///
-/// For every (turn, river) board, evaluates every concrete combo's rank
-/// ordinal. Parallelised over boards via rayon.
-#[must_use]
-#[allow(clippy::cast_possible_truncation)]
-pub fn compute_rank_arrays(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> FlopRankData {
-    let deck = all_cards_vec();
-    let flop_mask: u64 =
-        (1u64 << card_bit(flop[0])) | (1u64 << card_bit(flop[1])) | (1u64 << card_bit(flop[2]));
+/// Flattened combo data extracted from a combo map.
+struct FlatComboList {
+    cards: Vec<(Card, Card)>,
+    canonical: Vec<u16>,
+    masks: Vec<u64>,
+}
 
-    // Build flat combo list.
-    let mut combo_cards_raw: Vec<(Card, Card)> = Vec::new();
-    let mut combo_canonical: Vec<u16> = Vec::new();
-    let mut combo_masks: Vec<u64> = Vec::new();
+/// Build a flat combo list from the hierarchical combo map.
+#[allow(clippy::cast_possible_truncation)]
+fn build_combo_list(combo_map: &[Vec<(Card, Card)>]) -> FlatComboList {
+    let mut cards = Vec::new();
+    let mut canonical = Vec::new();
+    let mut masks = Vec::new();
     for (idx, combos) in combo_map.iter().enumerate() {
         for &(c1, c2) in combos {
-            combo_cards_raw.push((c1, c2));
-            combo_canonical.push(idx as u16);
-            combo_masks.push((1u64 << card_bit(c1)) | (1u64 << card_bit(c2)));
+            cards.push((c1, c2));
+            canonical.push(idx as u16);
+            masks.push((1u64 << encode_card(c1)) | (1u64 << encode_card(c2)));
         }
     }
-    let num_combos = combo_cards_raw.len();
-
-    // Enumerate all valid (turn, river) boards.
-    let mut boards: Vec<(Card, Card, u64)> = Vec::with_capacity(1176);
-    for (ti, &turn) in deck.iter().enumerate() {
-        let tb = 1u64 << card_bit(turn);
-        if flop_mask & tb != 0 {
-            continue;
-        }
-        for &river in &deck[ti + 1..] {
-            let rb = 1u64 << card_bit(river);
-            if flop_mask & rb != 0 {
-                continue;
-            }
-            boards.push((turn, river, flop_mask | tb | rb));
-        }
+    FlatComboList {
+        cards,
+        canonical,
+        masks,
     }
+}
 
-    // Compute ranks: parallel over boards.
-    let board_ranks_nested: Vec<Vec<u32>> = boards
+/// Evaluate rank ordinals for all combos on each board in parallel.
+fn evaluate_combo_ranks(
+    flop: [Card; 3],
+    boards: &[(Card, Card, u64)],
+    combos: &FlatComboList,
+) -> Vec<u32> {
+    let num_combos = combos.cards.len();
+    let nested: Vec<Vec<u32>> = boards
         .par_iter()
         .map(|&(turn, river, board_mask)| {
             let board = [flop[0], flop[1], flop[2], turn, river];
             let mut ranks = vec![u32::MAX; num_combos];
-            for (ci, &(c1, c2)) in combo_cards_raw.iter().enumerate() {
-                if board_mask & combo_masks[ci] != 0 {
+            for (ci, &(c1, c2)) in combos.cards.iter().enumerate() {
+                if board_mask & combos.masks[ci] != 0 {
                     continue;
                 }
                 ranks[ci] = rank_to_ordinal(rank_hand([c1, c2], &board));
@@ -230,23 +220,120 @@ pub fn compute_rank_arrays(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> 
         })
         .collect();
 
-    // Flatten into a single array.
-    let mut flat_ranks = Vec::with_capacity(boards.len() * num_combos);
-    for board_rank in &board_ranks_nested {
-        flat_ranks.extend_from_slice(board_rank);
+    let mut flat = Vec::with_capacity(boards.len() * num_combos);
+    for board_rank in &nested {
+        flat.extend_from_slice(board_rank);
     }
+    flat
+}
+
+/// Compute rank arrays for a single flop.
+///
+/// For every (turn, river) board, evaluates every concrete combo's rank
+/// ordinal. Parallelised over boards via rayon.
+#[must_use]
+pub fn compute_rank_arrays(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) -> FlopRankData {
+    let deck = all_cards_vec();
+    let flop_mask: u64 =
+        (1u64 << encode_card(flop[0])) | (1u64 << encode_card(flop[1])) | (1u64 << encode_card(flop[2]));
+
+    let combos = build_combo_list(combo_map);
+
+    let mut boards: Vec<(Card, Card, u64)> = Vec::with_capacity(1176);
+    for (ti, &turn) in deck.iter().enumerate() {
+        let tb = 1u64 << encode_card(turn);
+        if flop_mask & tb != 0 {
+            continue;
+        }
+        for &river in &deck[ti + 1..] {
+            let rb = 1u64 << encode_card(river);
+            if flop_mask & rb != 0 {
+                continue;
+            }
+            boards.push((turn, river, flop_mask | tb | rb));
+        }
+    }
+
+    let flat_ranks = evaluate_combo_ranks(flop, &boards, &combos);
 
     FlopRankData {
         board_cards: boards
             .iter()
             .map(|&(t, r, _)| (encode_card(t), encode_card(r)))
             .collect(),
-        combo_cards: combo_cards_raw
+        combo_cards: combos
+            .cards
             .iter()
             .map(|&(c1, c2)| (encode_card(c1), encode_card(c2)))
             .collect(),
-        combo_canonical,
+        combo_canonical: combos.canonical,
         board_ranks: flat_ranks,
+    }
+}
+
+/// Build canonical hand index ranges from the combo map.
+///
+/// Returns a vec where `ranges[h]` is the start..end of combo indices
+/// belonging to canonical hand `h`.
+fn build_canonical_ranges(combo_map: &[Vec<(Card, Card)>]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::with_capacity(combo_map.len());
+    let mut ci = 0;
+    for combos in combo_map {
+        let start = ci;
+        ci += combos.len();
+        ranges.push(start..ci);
+    }
+    ranges
+}
+
+/// Accumulate equity for one board into the running totals.
+///
+/// For each (hero, opponent) canonical hand pair, compares rank ordinals
+/// across all concrete combo matchups and adds to the (equity_sum, count) cell.
+#[inline]
+fn accumulate_board_equity(
+    accum: &mut [(f64, u64)],
+    ranks: &[u32],
+    combo_masks: &[u64],
+    canonical_range: &[std::ops::Range<usize>],
+    n: usize,
+) {
+    for hero_idx in 0..n {
+        let hero_range = &canonical_range[hero_idx];
+        if hero_range.is_empty() {
+            continue;
+        }
+        for opp_idx in 0..n {
+            let opp_range = &canonical_range[opp_idx];
+            if opp_range.is_empty() {
+                continue;
+            }
+            let cell = &mut accum[hero_idx * n + opp_idx];
+
+            for hi in hero_range.clone() {
+                let hero_rank = ranks[hi];
+                if hero_rank == u32::MAX {
+                    continue;
+                }
+                let hm = combo_masks[hi];
+
+                for oi in opp_range.clone() {
+                    let opp_rank = ranks[oi];
+                    if opp_rank == u32::MAX {
+                        continue;
+                    }
+                    if hm & combo_masks[oi] != 0 {
+                        continue;
+                    }
+                    cell.0 += match hero_rank.cmp(&opp_rank) {
+                        std::cmp::Ordering::Greater => 1.0,
+                        std::cmp::Ordering::Equal => 0.5,
+                        std::cmp::Ordering::Less => 0.0,
+                    };
+                    cell.1 += 1;
+                }
+            }
+        }
     }
 }
 
@@ -261,23 +348,14 @@ pub fn derive_equity_table(data: &FlopRankData, combo_map: &[Vec<(Card, Card)>])
     let num_combos = data.combo_cards.len();
     let num_boards = data.board_cards.len();
 
-    // Build combo masks for hero/opp conflict detection.
     let combo_masks: Vec<u64> = data
         .combo_cards
         .iter()
         .map(|&(c1, c2)| (1u64 << c1) | (1u64 << c2))
         .collect();
 
-    // Build canonical ranges: for each canonical hand h, combo indices start..end.
-    let mut canonical_range: Vec<std::ops::Range<usize>> = Vec::with_capacity(n);
-    let mut ci = 0;
-    for combos in combo_map {
-        let start = ci;
-        ci += combos.len();
-        canonical_range.push(start..ci);
-    }
+    let canonical_range = build_canonical_ranges(combo_map);
 
-    // Parallel fold/reduce over boards.
     let accum = (0..num_boards)
         .into_par_iter()
         .fold(
@@ -285,44 +363,7 @@ pub fn derive_equity_table(data: &FlopRankData, combo_map: &[Vec<(Card, Card)>])
             |mut accum, board_idx| {
                 let ranks =
                     &data.board_ranks[board_idx * num_combos..(board_idx + 1) * num_combos];
-
-                for hero_idx in 0..n {
-                    let hero_range = &canonical_range[hero_idx];
-                    if hero_range.is_empty() {
-                        continue;
-                    }
-                    for opp_idx in 0..n {
-                        let opp_range = &canonical_range[opp_idx];
-                        if opp_range.is_empty() {
-                            continue;
-                        }
-                        let cell = &mut accum[hero_idx * n + opp_idx];
-
-                        for hi in hero_range.clone() {
-                            let hero_rank = ranks[hi];
-                            if hero_rank == u32::MAX {
-                                continue;
-                            }
-                            let hm = combo_masks[hi];
-
-                            for oi in opp_range.clone() {
-                                let opp_rank = ranks[oi];
-                                if opp_rank == u32::MAX {
-                                    continue;
-                                }
-                                if hm & combo_masks[oi] != 0 {
-                                    continue;
-                                }
-                                cell.0 += match hero_rank.cmp(&opp_rank) {
-                                    std::cmp::Ordering::Greater => 1.0,
-                                    std::cmp::Ordering::Equal => 0.5,
-                                    std::cmp::Ordering::Less => 0.0,
-                                };
-                                cell.1 += 1;
-                            }
-                        }
-                    }
-                }
+                accumulate_board_equity(&mut accum, ranks, &combo_masks, &canonical_range, n);
                 accum
             },
         )
@@ -337,7 +378,6 @@ pub fn derive_equity_table(data: &FlopRankData, combo_map: &[Vec<(Card, Card)>])
             },
         );
 
-    // Convert accumulated (sum, count) pairs to equity values.
     let mut table = vec![f64::NAN; n * n];
     for i in 0..n * n {
         let (eq_sum, count) = accum[i];
