@@ -91,7 +91,7 @@ impl PostflopValues {
 /// Each decision node reserves `num_buckets × num_actions` slots.
 /// The bucket count varies by the street of the node.
 #[derive(Debug)]
-pub(crate) struct PostflopLayout {
+pub struct PostflopLayout {
     entries: Vec<NodeEntry>,
     /// Total buffer size for this tree.
     pub total_size: usize,
@@ -107,7 +107,7 @@ pub(crate) struct NodeEntry {
 
 impl PostflopLayout {
     /// Build the layout from a single postflop tree and bucket counts.
-    pub(crate) fn build(
+    pub fn build(
         tree: &PostflopTree,
         node_streets: &[Street],
         num_flop_buckets: usize,
@@ -197,7 +197,7 @@ pub(crate) fn buckets_for_street(
 ///
 /// Walks the tree from root, tracking the current street.
 /// Chance nodes transition to their `next_street` for their children.
-pub(crate) fn annotate_streets(tree: &PostflopTree) -> Vec<Street> {
+pub fn annotate_streets(tree: &PostflopTree) -> Vec<Street> {
     let mut streets = vec![Street::Flop; tree.nodes.len()];
     annotate_recursive(&tree.nodes, 0, Street::Flop, &mut streets);
     streets
