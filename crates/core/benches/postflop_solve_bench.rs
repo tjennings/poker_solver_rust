@@ -30,13 +30,13 @@ fn load_or_compute_equity(flop: [Card; 3], combo_map: &[Vec<(Card, Card)>]) -> V
     let ws_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
-        .expect("workspace root");
+        .expect("CARGO_MANIFEST_DIR must have a grandparent (workspace root)");
 
     let eq_path = ws_root.join("cache/equity_tables.bin");
     if let Some(cache) = EquityTableCache::load(&eq_path) {
-        if let Some(mut tables) = cache.extract_tables(&[flop]) {
+        if let Some(tables) = cache.extract_tables(&[flop]) {
             eprintln!("[bench] equity table loaded from cache");
-            return tables.remove(0);
+            return tables.into_iter().next().expect("single table");
         }
     }
 

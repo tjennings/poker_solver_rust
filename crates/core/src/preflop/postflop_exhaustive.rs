@@ -48,9 +48,9 @@ pub struct SolverCounters {
 /// Allocated once per rayon worker thread and reused across flops to avoid
 /// repeated allocation of large vectors (e.g. 277 MB per flop at SPR=6).
 pub struct FlopBuffers {
-    pub regret_sum: Vec<f64>,
-    pub strategy_sum: Vec<f64>,
-    pub delta: (Vec<f64>, Vec<f64>),
+    pub(crate) regret_sum: Vec<f64>,
+    pub(crate) strategy_sum: Vec<f64>,
+    pub(crate) delta: (Vec<f64>, Vec<f64>),
 }
 
 impl FlopBuffers {
