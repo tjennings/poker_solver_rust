@@ -29,6 +29,9 @@ worktrees/
 # Dolt
 .dolt/
 
+# Solver logs
+logs/
+
 # Cache
 cache/
 

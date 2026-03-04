@@ -1,6 +1,7 @@
 mod bucket_diagnostics;
 mod hand_trace;
 mod lhe_viz;
+mod log_file;
 mod tree_dump;
 mod tui;
 mod tui_metrics;
@@ -357,8 +358,8 @@ fn print_postflop_ev_diagnostics(
     abstraction: &PostflopAbstraction,
     hands: &[(String, usize)],
 ) {
-    println!("\n=== Postflop EV Table (pot-fraction units) ===");
-    println!("{:>5} {:>10} {:>10}", "Hand", "IP(SB)EV", "OOP(BB)EV");
+    solver_print!("\n=== Postflop EV Table (pot-fraction units) ===");
+    solver_print!("{:>5} {:>10} {:>10}", "Hand", "IP(SB)EV", "OOP(BB)EV");
     for (name, hi) in hands {
         let mut ip_sum = 0.0f64;
         let mut oop_sum = 0.0f64;
@@ -373,14 +374,14 @@ fn print_postflop_ev_diagnostics(
             }
         }
         if count > 0 {
-            println!(
+            solver_print!(
                 "{:>5} {:>10.4} {:>10.4}  (avg over {count} opps)",
                 name,
                 ip_sum / count as f64,
                 oop_sum / count as f64,
             );
         } else {
-            println!("{:>5}  no data", name);
+            solver_print!("{:>5}  no data", name);
         }
     }
 
@@ -394,7 +395,7 @@ fn print_postflop_ev_diagnostics(
         }
     }
     let total = 169 * 169;
-    println!("  Coverage (avg): IP {nonzero_ip}/{total} ({:.1}%)  OOP {nonzero_oop}/{total} ({:.1}%)",
+    solver_print!("  Coverage (avg): IP {nonzero_ip}/{total} ({:.1}%)  OOP {nonzero_oop}/{total} ({:.1}%)",
         100.0 * nonzero_ip as f64 / total as f64,
         100.0 * nonzero_oop as f64 / total as f64,
     );
@@ -412,30 +413,31 @@ fn print_postflop_ev_diagnostics(
         } else {
             format!("flop {fi}")
         };
-        println!("  Flop {fi} ({flop_name}): {nz}/{total} ({:.1}%) non-zero",
+        solver_print!("  Flop {fi} ({flop_name}): {nz}/{total} ({:.1}%) non-zero",
             100.0 * nz as f64 / total as f64);
     }
 
     // Pairwise matchups
     if hands.len() >= 2 {
-        println!("\n=== Pairwise matchups (avg_ev) ===");
+        solver_print!("\n=== Pairwise matchups (avg_ev) ===");
         for i in 0..hands.len() {
             for j in (i+1)..hands.len() {
                 let (h_name, hi) = &hands[i];
                 let (o_name, oi) = &hands[j];
                 let ip = abstraction.avg_ev(0, *hi, *oi);
                 let oop = abstraction.avg_ev(1, *hi, *oi);
-                print!("  {h_name:>4} vs {o_name:>4}: IP(SB)={ip:+.4}  OOP(BB)={oop:+.4}");
+                let mut line = format!("  {h_name:>4} vs {o_name:>4}: IP(SB)={ip:+.4}  OOP(BB)={oop:+.4}");
                 for fi in 0..abstraction.values.num_flops() {
                     let fip = abstraction.values.get_by_flop(fi, 0, *hi as u16, *oi as u16);
                     let foop = abstraction.values.get_by_flop(fi, 1, *hi as u16, *oi as u16);
-                    print!("  |f{fi}: IP={fip:+.3} OOP={foop:+.3}");
+                    use std::fmt::Write as _;
+                    let _ = write!(line, "  |f{fi}: IP={fip:+.3} OOP={foop:+.3}");
                 }
-                println!();
+                solver_print!("{line}");
             }
         }
     }
-    println!();
+    solver_print!("");
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +456,8 @@ fn build_postflop_with_progress(
     equity: Option<&EquityTable>,
     tui_refresh: f64,
 ) -> Result<Vec<PostflopAbstraction>, Box<dyn Error>> {
+    log_file::init_log_file();
+
     let sprs = &pf_config.postflop_sprs;
     let total_sprs = sprs.len() as u32;
     let use_tui = std::io::stderr().is_terminal();
@@ -479,6 +483,7 @@ fn build_postflop_with_progress(
         None
     };
     let tui_handle = if let (Some(m), Some(d)) = (&metrics, &done) {
+        log_file::TUI_ACTIVE.store(true, Ordering::Relaxed);
         Some(tui::run_tui(
             Arc::clone(m),
             Arc::clone(&counters),
@@ -500,7 +505,7 @@ fn build_postflop_with_progress(
             if let Some(cache) = EquityTableCache::load(cache_path) {
                 match cache.extract_tables(&flops) {
                     Some(tables) => {
-                        eprintln!(
+                        solver_log!(
                             "Loaded equity tables for {}/{} flops from cache",
                             tables.len(),
                             cache.num_flops(),
@@ -508,7 +513,7 @@ fn build_postflop_with_progress(
                         tables
                     }
                     None => {
-                        eprintln!(
+                        solver_log!(
                             "Warning: cache missing some requested flops, falling back to inline computation"
                         );
                         vec![]
@@ -518,12 +523,10 @@ fn build_postflop_with_progress(
                 // No equity table cache — try rank array cache
                 let rank_cache_path = cache_path.with_file_name("rank_arrays.bin");
                 if let Some(rank_cache) = RankArrayCache::load(&rank_cache_path) {
-                    if !use_tui {
-                        eprintln!(
-                            "Deriving equity tables from rank cache ({} flops)...",
-                            rank_cache.num_flops()
-                        );
-                    }
+                    solver_log!(
+                        "Deriving equity tables from rank cache ({} flops)...",
+                        rank_cache.num_flops()
+                    );
                     let tables: Vec<Vec<f64>> = flops
                         .par_iter()
                         .map(|flop| {
@@ -543,12 +546,10 @@ fn build_postflop_with_progress(
                         m.equity_tables_total.store(flops.len() as u32, Ordering::Relaxed);
                         m.set_phase(4); // equity table pre-computation phase
                     }
-                    if !use_tui {
-                        eprintln!(
-                            "Pre-computing equity tables for {} flops...",
-                            flops.len()
-                        );
-                    }
+                    solver_log!(
+                        "Pre-computing equity tables for {} flops...",
+                        flops.len()
+                    );
                     let eq_completed = AtomicU32::new(0);
                     let tables: Vec<Vec<f64>> = flops
                         .par_iter()
@@ -589,9 +590,7 @@ fn build_postflop_with_progress(
         counters.total_action_slots.store(0, Ordering::Relaxed);
         counters.pruned_action_slots.store(0, Ordering::Relaxed);
         counters.total_expected_traversals.store(0, Ordering::Relaxed);
-        if !use_tui {
-            eprintln!("SPR={spr} ({}/{total_sprs})", i + 1);
-        }
+        solver_log!("SPR={spr} ({}/{total_sprs})", i + 1);
 
         let metrics_ref = &metrics;
 
@@ -637,29 +636,29 @@ fn build_postflop_with_progress(
                         }
                     }
                 } else {
-                    // Non-TTY fallback: line-based progress to stderr.
+                    // Non-TTY fallback: line-based progress to log + stderr.
                     match &phase {
                         BuildPhase::BuildingTree => {
-                            eprintln!("  Building game tree...");
+                            solver_log!("  Building game tree...");
                         }
                         BuildPhase::ComputingEquityTables => {
-                            eprintln!("  Computing equity tables...");
+                            solver_log!("  Computing equity tables...");
                         }
                         BuildPhase::FlopProgress { flop_name, stage } => {
                             if let FlopStage::Solving { iteration, max_iterations, delta, metric_label, .. } = stage {
                                 // Log every ~10 iterations to avoid flooding.
                                 if *iteration % 10 == 0 || *iteration == *max_iterations {
-                                    eprintln!(
+                                    solver_log!(
                                         "    {flop_name}: iter {iteration}/{max_iterations} {metric_label}={delta:.2}",
                                     );
                                 }
                             }
                         }
                         BuildPhase::MccfrFlopsCompleted { completed, total } => {
-                            eprintln!("  SPR={spr}: {completed}/{total} flops completed");
+                            solver_log!("  SPR={spr}: {completed}/{total} flops completed");
                         }
                         BuildPhase::ComputingValues => {
-                            eprintln!("  Computing hand average values...");
+                            solver_log!("  Computing hand average values...");
                         }
                     }
                 }
@@ -677,8 +676,9 @@ fn build_postflop_with_progress(
     if let Some(handle) = tui_handle {
         let _ = handle.join();
     }
+    log_file::TUI_ACTIVE.store(false, Ordering::Relaxed);
 
-    eprintln!(
+    solver_log!(
         "Postflop solve complete in {:.1?} ({total_sprs} SPR model{})",
         pf_start.elapsed(),
         if total_sprs == 1 { "" } else { "s" },
@@ -692,17 +692,19 @@ fn build_postflop_with_progress(
 // ---------------------------------------------------------------------------
 
 fn run_solve_postflop(config_path: &Path, output: &Path, tui_refresh: f64) -> Result<(), Box<dyn Error>> {
+    log_file::init_log_file();
+
     let yaml = std::fs::read_to_string(config_path)?;
     let config: PostflopSolveConfig = serde_yaml::from_str(&yaml)?;
     let pf_config = config.postflop_model;
 
-    eprintln!("Building postflop abstraction ({} SPR models)...", pf_config.postflop_sprs.len());
+    solver_log!("Building postflop abstraction ({} SPR models)...", pf_config.postflop_sprs.len());
 
     let abstractions = build_postflop_with_progress(&pf_config, None, tui_refresh)?;
 
     let refs: Vec<&PostflopAbstraction> = abstractions.iter().collect();
     PostflopBundle::save_multi(&pf_config, &refs, output)?;
-    eprintln!(
+    solver_log!(
         "Postflop bundle saved to {} ({} SPR models)",
         output.display(),
         refs.len(),
