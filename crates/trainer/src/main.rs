@@ -1,6 +1,7 @@
 mod bucket_diagnostics;
 mod hand_trace;
 mod lhe_viz;
+mod tree_dump;
 mod tui;
 mod tui_metrics;
 
@@ -108,6 +109,24 @@ enum Commands {
         #[arg(short, long, default_value = "cache/equity_tables.bin")]
         output: PathBuf,
     },
+    /// Dump the postflop betting tree as indented text or Graphviz DOT.
+    DumpTree {
+        /// YAML config file (same format as solve-postflop)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Emit Graphviz DOT instead of indented text
+        #[arg(long)]
+        dot: bool,
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Stack-to-pot ratio
+        #[arg(long, default_value = "3.0")]
+        spr: f64,
+        /// Pot type label (limped, raised, 3bet, 4bet)
+        #[arg(long, default_value = "raised")]
+        pot_type: String,
+    },
 }
 
 /// Output format for the flops command.
@@ -170,20 +189,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             use poker_solver_core::preflop::postflop_hands::canonical_flops;
 
             let rank_cache_path = output.with_file_name("rank_arrays.bin");
-            let have_rank_cache = rank_cache_path.exists();
-            let have_equity_cache = output.exists();
-
-            if have_rank_cache && have_equity_cache {
-                eprintln!("Both caches already exist, nothing to do");
-                eprintln!("  rank arrays:   {}", rank_cache_path.display());
-                eprintln!("  equity tables: {}", output.display());
-                return Ok(());
-            }
 
             let total = 1755_u64;
 
             // Step 1: Build or load rank arrays
             let rank_cache = if let Some(cache) = RankArrayCache::load(&rank_cache_path) {
+                // Early exit if equity tables also exist already
+                if output.exists() {
+                    eprintln!("Both caches already exist, nothing to do");
+                    eprintln!("  rank arrays:   {}", rank_cache_path.display());
+                    eprintln!("  equity tables: {}", output.display());
+                    return Ok(());
+                }
                 eprintln!(
                     "Loaded rank arrays for {} flops from cache",
                     cache.num_flops()
@@ -235,18 +252,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
 
             // Step 2: Derive equity tables (skip if already cached)
-            if have_equity_cache {
+            // Destructure so we can borrow entries for par_iter and move flops into from_parts.
+            let RankArrayCache { flops: rc_flops, entries: rc_entries } = rank_cache;
+            if output.exists() {
                 eprintln!("Equity tables already exist at {}, skipping derivation", output.display());
             } else {
                 eprintln!("Deriving equity tables from rank arrays...");
                 let derive_start = Instant::now();
-                let flops = rank_cache.flops.clone();
-                let tables: Vec<Vec<f64>> = flops
+                let tables: Vec<Vec<f64>> = rc_flops
                     .par_iter()
-                    .enumerate()
-                    .map(|(i, flop)| {
+                    .zip(rc_entries.par_iter())
+                    .map(|(flop, entry)| {
                         let combo_map = build_combo_map(flop);
-                        derive_equity_table(&rank_cache.entries[i], &combo_map)
+                        derive_equity_table(entry, &combo_map)
                     })
                     .collect();
                 eprintln!(
@@ -255,10 +273,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     derive_start.elapsed().as_secs_f64()
                 );
 
-                let eq_cache = EquityTableCache::from_parts(flops, tables);
+                let eq_cache = EquityTableCache::from_parts(rc_flops, tables);
                 eq_cache.save(&output)?;
                 eprintln!("Saved equity tables to {}", output.display());
             }
+        }
+        Commands::DumpTree { config, dot, output, spr, pot_type } => {
+            tree_dump::run(dot, output, config, spr, pot_type)?;
         }
     }
 
@@ -302,7 +323,7 @@ struct PreflopTrainingConfig {
 /// Lightweight config wrapper for `solve-postflop` — avoids requiring
 /// the full `PreflopTrainingConfig` (positions, blinds, stacks, etc.).
 #[derive(Debug, Deserialize)]
-struct PostflopSolveConfig {
+pub(crate) struct PostflopSolveConfig {
     postflop_model: PostflopModelConfig,
 }
 
@@ -495,8 +516,8 @@ fn build_postflop_with_progress(
                 }
             } else {
                 // No equity table cache — try rank array cache
-                let rank_cache_path = Path::new("cache/rank_arrays.bin");
-                if let Some(rank_cache) = RankArrayCache::load(rank_cache_path) {
+                let rank_cache_path = cache_path.with_file_name("rank_arrays.bin");
+                if let Some(rank_cache) = RankArrayCache::load(&rank_cache_path) {
                     if !use_tui {
                         eprintln!(
                             "Deriving equity tables from rank cache ({} flops)...",
@@ -506,12 +527,11 @@ fn build_postflop_with_progress(
                     let tables: Vec<Vec<f64>> = flops
                         .par_iter()
                         .map(|flop| {
+                            let combo_map = build_combo_map(flop);
                             if let Some(data) = rank_cache.get_flop_data(flop) {
-                                let combo_map = build_combo_map(flop);
                                 derive_equity_table(data, &combo_map)
                             } else {
                                 // Flop not in rank cache, compute directly
-                                let combo_map = build_combo_map(flop);
                                 compute_equity_table(&combo_map, *flop)
                             }
                         })

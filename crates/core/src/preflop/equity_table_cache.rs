@@ -39,11 +39,11 @@ pub struct EquityTableCache {
     tables_flat: Vec<f64>,
 }
 
-fn encode_card(c: Card) -> u8 {
+pub(crate) fn encode_card(c: Card) -> u8 {
     c.value as u8 * 4 + c.suit as u8
 }
 
-fn decode_card(b: u8) -> Card {
+pub(crate) fn decode_card(b: u8) -> Card {
     use rs_poker::core::{Suit, Value};
     // SAFETY: Value is repr(u8) with contiguous variants 0..=12 (Two..Ace).
     // b/4 is in range 0..=12 because encode_card produces value*4+suit where
