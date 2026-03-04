@@ -47,15 +47,15 @@ pub struct SolverCounters {
 ///
 /// Allocated once per rayon worker thread and reused across flops to avoid
 /// repeated allocation of large vectors (e.g. 277 MB per flop at SPR=6).
-pub struct FlopBuffers {
-    pub(crate) regret_sum: Vec<f64>,
-    pub(crate) strategy_sum: Vec<f64>,
-    pub(crate) delta: (Vec<f64>, Vec<f64>),
+pub(crate) struct FlopBuffers {
+    pub regret_sum: Vec<f64>,
+    pub strategy_sum: Vec<f64>,
+    pub delta: (Vec<f64>, Vec<f64>),
 }
 
 impl FlopBuffers {
     /// Allocate zeroed buffers of the given size.
-    pub fn new(size: usize) -> Self {
+    pub(crate) fn new(size: usize) -> Self {
         Self {
             regret_sum: vec![0.0; size],
             strategy_sum: vec![0.0; size],
@@ -342,187 +342,191 @@ pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) ->
 // CFR traversal
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// CFR traversal with equity table lookups at showdown.
+/// Per-call varying arguments for CFR traversal.
 ///
-/// Reads strategy from a frozen `snapshot` and writes regret/strategy deltas
-/// to separate `dr`/`ds` buffers. This split enables future parallelisation:
-/// multiple threads can share a read-only snapshot while writing to thread-local
-/// delta buffers.
-///
-/// Both players are traversed every iteration. Chance nodes pass through
-/// to their single child (board cards are implicit in the equity table).
-/// Supports LCFR/DCFR iteration weighting via `dcfr` params.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn exhaustive_cfr_traverse(
-    tree: &PostflopTree,
-    layout: &PostflopLayout,
-    equity_table: &[f64],
-    snapshot: &[f64],
-    dr: &mut [f64],
-    ds: &mut [f64],
+/// Bundles the state that changes across recursive calls, keeping method
+/// signatures focused and avoiding `clippy::too_many_arguments`.
+#[derive(Clone, Copy)]
+struct TraverseArgs {
     node_idx: u32,
     hero_hand: u16,
     opp_hand: u16,
     hero_pos: u8,
     reach_hero: f64,
     reach_opp: f64,
+}
+
+/// Immutable arguments for recursive CFR traversal.
+///
+/// Bundles the read-only state that never changes across recursive calls,
+/// keeping the per-call `traverse` signature focused on what varies:
+/// node index, hands, reach probabilities, and the mutable delta buffers.
+struct TraverseCtx<'a> {
+    tree: &'a PostflopTree,
+    layout: &'a PostflopLayout,
+    equity_table: &'a [f64],
+    snapshot: &'a [f64],
     iteration: u64,
-    dcfr: &DcfrParams,
+    dcfr: &'a DcfrParams,
     prune_active: bool,
     prune_regret_threshold: f64,
-    counters: Option<&SolverCounters>,
-) -> f64 {
-    let n = NUM_CANONICAL_HANDS;
-    match &tree.nodes[node_idx as usize] {
-        PostflopNode::Terminal {
-            terminal_type,
-            pot_fraction,
-        } => terminal_payoff(
-            *terminal_type,
-            *pot_fraction,
-            equity_table,
-            hero_hand,
-            opp_hand,
-            hero_pos,
-            n,
-        ),
+    counters: Option<&'a SolverCounters>,
+}
 
-        PostflopNode::Chance { children, .. } => {
-            debug_assert!(!children.is_empty());
-            exhaustive_cfr_traverse(
-                tree,
-                layout,
-                equity_table,
-                snapshot,
-                dr,
-                ds,
-                children[0],
-                hero_hand,
-                opp_hand,
-                hero_pos,
-                reach_hero,
-                reach_opp,
-                iteration,
-                dcfr,
-                prune_active,
-                prune_regret_threshold,
-                counters,
-            )
-        }
+impl TraverseCtx<'_> {
+    /// CFR traversal with equity table lookups at showdown.
+    ///
+    /// Dispatches on node type: terminals return payoff, chance nodes pass
+    /// through, decision nodes delegate to hero/opponent helpers.
+    #[inline]
+    fn traverse(
+        &self,
+        dr: &mut [f64],
+        ds: &mut [f64],
+        args: TraverseArgs,
+    ) -> f64 {
+        match &self.tree.nodes[args.node_idx as usize] {
+            PostflopNode::Terminal {
+                terminal_type,
+                pot_fraction,
+            } => terminal_payoff(
+                *terminal_type,
+                *pot_fraction,
+                self.equity_table,
+                args.hero_hand,
+                args.opp_hand,
+                args.hero_pos,
+                NUM_CANONICAL_HANDS,
+            ),
 
-        PostflopNode::Decision {
-            position, children, ..
-        } => {
-            let is_hero = *position == hero_pos;
-            let bucket = if is_hero { hero_hand } else { opp_hand };
-            let (start, _) = layout.slot(node_idx, bucket);
-            let num_actions = children.len();
+            PostflopNode::Chance { children, .. } => {
+                debug_assert!(!children.is_empty());
+                self.traverse(dr, ds, TraverseArgs { node_idx: children[0], ..args })
+            }
 
-            let mut strategy = [0.0f64; MAX_POSTFLOP_ACTIONS];
-            regret_matching_into(snapshot, start, &mut strategy[..num_actions]);
+            PostflopNode::Decision {
+                position, children, ..
+            } => {
+                let is_hero = *position == args.hero_pos;
+                let bucket = if is_hero { args.hero_hand } else { args.opp_hand };
+                let (start, _) = self.layout.slot(args.node_idx, bucket);
+                let num_actions = children.len();
 
-            if is_hero {
-                let mut action_values = [0.0f64; MAX_POSTFLOP_ACTIONS];
+                let mut strategy = [0.0f64; MAX_POSTFLOP_ACTIONS];
+                regret_matching_into(self.snapshot, start, &mut strategy[..num_actions]);
 
-                // RBP: build prune bitmask in a single pass over regrets.
-                // Bit i is set if action i should be pruned (negative regret,
-                // and at least one sibling has positive regret).
-                let mut prune_mask: u16 = 0;
-                if prune_active {
-                    let mut has_positive = false;
-                    let mut neg_mask: u16 = 0;
-                    for i in 0..num_actions {
-                        if snapshot[start + i] > 0.0 {
-                            has_positive = true;
-                        } else if snapshot[start + i] < prune_regret_threshold {
-                            neg_mask |= 1 << i;
-                        }
-                    }
-                    if has_positive {
-                        prune_mask = neg_mask;
-                    }
+                if is_hero {
+                    self.traverse_hero(dr, ds, children, &strategy, start, args)
+                } else {
+                    self.traverse_opponent(dr, ds, children, &strategy, args)
                 }
-
-                if let Some(c) = counters {
-                    let total = num_actions as u64;
-                    let pruned = u64::from(prune_mask.count_ones());
-                    c.total_action_slots.fetch_add(total, Ordering::Relaxed);
-                    c.pruned_action_slots.fetch_add(pruned, Ordering::Relaxed);
-                }
-
-                for (i, &child) in children.iter().enumerate() {
-                    if prune_mask & (1 << i) != 0 {
-                        continue;
-                    }
-                    action_values[i] = exhaustive_cfr_traverse(
-                        tree,
-                        layout,
-                        equity_table,
-                        snapshot,
-                        dr,
-                        ds,
-                        child,
-                        hero_hand,
-                        opp_hand,
-                        hero_pos,
-                        reach_hero * strategy[i],
-                        reach_opp,
-                        iteration,
-                        dcfr,
-                        prune_active,
-                        prune_regret_threshold,
-                        counters,
-                    );
-                }
-                let node_value: f64 = strategy[..num_actions]
-                    .iter()
-                    .zip(&action_values[..num_actions])
-                    .map(|(s, v)| s * v)
-                    .sum();
-
-                let (regret_weight, strategy_weight) = dcfr.iteration_weights(iteration);
-                for (i, val) in action_values[..num_actions].iter().enumerate() {
-                    if prune_mask & (1 << i) != 0 {
-                        continue; // RBP: don't update regret for pruned (untraversed) actions
-                    }
-                    dr[start + i] += regret_weight * reach_opp * (val - node_value);
-                }
-                for (i, &s) in strategy[..num_actions].iter().enumerate() {
-                    if prune_mask & (1 << i) != 0 {
-                        continue;
-                    }
-                    ds[start + i] += strategy_weight * reach_hero * s;
-                }
-                node_value
-            } else {
-                children
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &child)| {
-                        strategy[i]
-                            * exhaustive_cfr_traverse(
-                                tree,
-                                layout,
-                                equity_table,
-                                snapshot,
-                                dr,
-                                ds,
-                                child,
-                                hero_hand,
-                                opp_hand,
-                                hero_pos,
-                                reach_hero,
-                                reach_opp * strategy[i],
-                                iteration,
-                                dcfr,
-                                prune_active,
-                                prune_regret_threshold,
-                                counters,
-                            )
-                    })
-                    .sum()
             }
         }
+    }
+
+    /// Hero decision: compute per-action values, apply RBP pruning, update
+    /// regret and strategy deltas.
+    #[inline]
+    fn traverse_hero(
+        &self,
+        dr: &mut [f64],
+        ds: &mut [f64],
+        children: &[u32],
+        strategy: &[f64; MAX_POSTFLOP_ACTIONS],
+        start: usize,
+        args: TraverseArgs,
+    ) -> f64 {
+        let num_actions = children.len();
+        let prune_mask = self.build_prune_mask(start, num_actions);
+
+        if let Some(c) = self.counters {
+            c.total_action_slots
+                .fetch_add(num_actions as u64, Ordering::Relaxed);
+            c.pruned_action_slots
+                .fetch_add(u64::from(prune_mask.count_ones()), Ordering::Relaxed);
+        }
+
+        let mut action_values = [0.0f64; MAX_POSTFLOP_ACTIONS];
+        for (i, &child) in children.iter().enumerate() {
+            if prune_mask & (1 << i) != 0 {
+                continue;
+            }
+            action_values[i] = self.traverse(
+                dr,
+                ds,
+                TraverseArgs {
+                    node_idx: child,
+                    reach_hero: args.reach_hero * strategy[i],
+                    ..args
+                },
+            );
+        }
+
+        let node_value: f64 = strategy[..num_actions]
+            .iter()
+            .zip(&action_values[..num_actions])
+            .map(|(s, v)| s * v)
+            .sum();
+
+        let (rw, sw) = self.dcfr.iteration_weights(self.iteration);
+        for (i, val) in action_values[..num_actions].iter().enumerate() {
+            if prune_mask & (1 << i) == 0 {
+                dr[start + i] += rw * args.reach_opp * (val - node_value);
+            }
+        }
+        for (i, &s) in strategy[..num_actions].iter().enumerate() {
+            if prune_mask & (1 << i) == 0 {
+                ds[start + i] += sw * args.reach_hero * s;
+            }
+        }
+        node_value
+    }
+
+    /// Opponent decision: weight-sum over all actions using opponent's strategy.
+    #[inline]
+    fn traverse_opponent(
+        &self,
+        dr: &mut [f64],
+        ds: &mut [f64],
+        children: &[u32],
+        strategy: &[f64; MAX_POSTFLOP_ACTIONS],
+        args: TraverseArgs,
+    ) -> f64 {
+        children
+            .iter()
+            .enumerate()
+            .map(|(i, &child)| {
+                strategy[i]
+                    * self.traverse(
+                        dr,
+                        ds,
+                        TraverseArgs {
+                            node_idx: child,
+                            reach_opp: args.reach_opp * strategy[i],
+                            ..args
+                        },
+                    )
+            })
+            .sum()
+    }
+
+    /// Build regret-based pruning bitmask. Bit `i` is set when action `i`
+    /// has negative regret below threshold and at least one sibling is positive.
+    #[inline]
+    fn build_prune_mask(&self, start: usize, num_actions: usize) -> u16 {
+        if !self.prune_active {
+            return 0;
+        }
+        let mut has_positive = false;
+        let mut neg_mask: u16 = 0;
+        for i in 0..num_actions {
+            if self.snapshot[start + i] > 0.0 {
+                has_positive = true;
+            } else if self.snapshot[start + i] < self.prune_regret_threshold {
+                neg_mask |= 1 << i;
+            }
+        }
+        if has_positive { neg_mask } else { 0 }
     }
 }
 
@@ -748,26 +752,26 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
                 c.pruned_traversal_count.fetch_add(1, Ordering::Relaxed);
             }
         }
+        let ctx = TraverseCtx {
+            tree: self.tree,
+            layout: self.layout,
+            equity_table: self.equity_table,
+            snapshot: self.snapshot,
+            iteration: self.iteration,
+            dcfr: self.dcfr,
+            prune_active: self.prune_active,
+            prune_regret_threshold: self.prune_regret_threshold,
+            counters: self.counters,
+        };
         for hero_pos in 0..2u8 {
-            exhaustive_cfr_traverse(
-                self.tree,
-                self.layout,
-                self.equity_table,
-                self.snapshot,
-                regret_delta,
-                strategy_delta,
-                0,
-                hero,
-                opponent,
+            ctx.traverse(regret_delta, strategy_delta, TraverseArgs {
+                node_idx: 0,
+                hero_hand: hero,
+                opp_hand: opponent,
                 hero_pos,
-                1.0,
-                1.0,
-                self.iteration,
-                self.dcfr,
-                self.prune_active,
-                self.prune_regret_threshold,
-                self.counters,
-            );
+                reach_hero: 1.0,
+                reach_opp: 1.0,
+            });
         }
     }
 }
@@ -795,7 +799,7 @@ fn extremal_regrets(regret_sum: &[f64]) -> (f64, f64) {
 /// over flops), rayon's work-stealing distributes hand-pair work across all
 /// available cores, dynamically rebalancing as flops converge at different rates.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
-pub fn exhaustive_solve_one_flop(
+fn exhaustive_solve_one_flop(
     tree: &PostflopTree,
     layout: &PostflopLayout,
     equity_table: &[f64],
@@ -1441,24 +1445,28 @@ mod tests {
 
         if let Some((node_idx, folder, pot_fraction)) = fold_node {
             let snapshot = regret_sum.clone();
-            let ev = exhaustive_cfr_traverse(
-                &tree,
-                &layout,
-                &equity_table,
-                &snapshot,
+            let ctx = TraverseCtx {
+                tree: &tree,
+                layout: &layout,
+                equity_table: &equity_table,
+                snapshot: &snapshot,
+                iteration: 0,
+                dcfr: &dcfr,
+                prune_active: false,
+                prune_regret_threshold: 0.0,
+                counters: None,
+            };
+            let ev = ctx.traverse(
                 &mut regret_sum,
                 &mut strategy_sum,
-                node_idx,
-                0,
-                1,
-                0, // hero_pos = 0
-                1.0,
-                1.0,
-                0,
-                &dcfr,
-                false,
-                0.0,
-                None,
+                TraverseArgs {
+                    node_idx,
+                    hero_hand: 0,
+                    opp_hand: 1,
+                    hero_pos: 0,
+                    reach_hero: 1.0,
+                    reach_opp: 1.0,
+                },
             );
 
             if folder == 0 {
@@ -1515,24 +1523,28 @@ mod tests {
             let eq = equity_table[hero_hand as usize * n + opp_hand as usize];
 
             let snapshot = regret_sum.clone();
-            let ev = exhaustive_cfr_traverse(
-                &tree,
-                &layout,
-                &equity_table,
-                &snapshot,
+            let ctx = TraverseCtx {
+                tree: &tree,
+                layout: &layout,
+                equity_table: &equity_table,
+                snapshot: &snapshot,
+                iteration: 0,
+                dcfr: &dcfr,
+                prune_active: false,
+                prune_regret_threshold: 0.0,
+                counters: None,
+            };
+            let ev = ctx.traverse(
                 &mut regret_sum,
                 &mut strategy_sum,
-                node_idx,
-                hero_hand,
-                opp_hand,
-                0,
-                1.0,
-                1.0,
-                0,
-                &dcfr,
-                false,
-                0.0,
-                None,
+                TraverseArgs {
+                    node_idx,
+                    hero_hand,
+                    opp_hand,
+                    hero_pos: 0,
+                    reach_hero: 1.0,
+                    reach_opp: 1.0,
+                },
             );
 
             let expected = eq * pot_fraction - pot_fraction / 2.0;
