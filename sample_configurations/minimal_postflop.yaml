@@ -7,8 +7,8 @@
 
 postflop_model:
   solve_type: exhaustive
-  fixed_flops: ['AhKsQd', '2c3h4d']   # 2 flops — fast smoke test
-  postflop_sprs: [2, 6, 20]
+  #fixed_flops: ['AhKsQd', '2c3h4d']   # 2 flops — fast smoke test
+  postflop_sprs: [8, 3.5, 1]
 
   # -- Bet sizing --
   # bet_sizes are pot fractions used on every street (flop/turn/river).
@@ -33,10 +33,10 @@ postflop_model:
   # bet_sizes: [0.36, 0.68, 1.22]
   #
   # Hybrid: geometric anchors + traditional half-pot and overbet
-  bet_sizes: [0.30, 0.5, 0.70, 1.0, 1.20, 2.0]
+  bet_sizes: [0.5]
 
-  max_raises_per_street: 4
-  postflop_solve_iterations: 500
+  max_raises_per_street: 1
+  postflop_solve_iterations: 30
   value_extraction_samples: 5
   cfr_convergence_threshold: 250       # mBB/h — loose for speed
   ev_convergence_threshold: 0.5

@@ -9,11 +9,13 @@
 
 # -- Training parameters --
 
-iterations: 400
+iterations: 80000
+
+print_every: 200
+preflop_exploitability_threshold_mbb: 0.01
+ev_diagnostic_hands: "AA,KK,QQ,AKs,AKo,K9s,K7s,K5s,Q9s,Q8s,Q7s,JTs,J9s,T9s,T8s,98s,87s,76s,65s,A5s,72o"
 equity_samples: 10000
-print_every: 100
-preflop_exploitability_threshold_mbb: 1
-ev_diagnostic_hands: "AA,KK,AKs,65s,JTs,A5s,72o"
+checkpoint_every: 1000
 
 # -- Game structure --
 
@@ -29,12 +31,12 @@ blinds:
 
 antes: []
 
-stacks: [25, 25]  # 25 BB
+stacks: [100, 100]  # 25 BB
 
 raise_sizes:
   - ["2bb", "6bb", "18bb"]
-  - ["0.33p", "0.5p", "1.0p", "1.3p", "2.0p"]
-  - ["0.33p", "0.5p", "1.0p", "1.3p", "2.0p"]
+  - ["0.33p", "0.5p", "1.0p", "1.3p"]
+  - ["0.33p", "0.5p", "1.0p", "1.3p"]
 
 raise_cap: 4
 
@@ -43,8 +45,8 @@ raise_cap: 4
 dcfr_alpha: 1.5
 dcfr_beta: 0.5
 dcfr_gamma: 2.0
-dcfr_warmup: 0
-exploration: 0.05
+dcfr_warmup: 500
+exploration: 0.07
 
 # -- Postflop model (169-hand MCCFR, minimal for fast validation) --
 postflop_model_path: ./local_data/full_postflop
