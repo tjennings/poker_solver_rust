@@ -74,7 +74,7 @@ body {
 
 .main-pane {
   flex: 1;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 1.5rem 2rem;
 }
 
