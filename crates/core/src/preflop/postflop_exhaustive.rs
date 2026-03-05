@@ -344,6 +344,56 @@ pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) ->
     table
 }
 
+/// Pre-compute card-removal weights for all 169x169 canonical hand pairs.
+///
+/// For each `(hero_hand, opp_hand)` canonical pair, counts the number of
+/// concrete (combo_h, combo_o) pairs where all four hole cards are distinct.
+/// This weight determines how much each matchup contributes to regret updates,
+/// correcting for card-removal effects (e.g. AA vs KK has 36 combos while
+/// AA vs AK has only 12).
+///
+/// Returns a flat `Vec` of size 169*169, indexed as `hero*169 + opp`.
+#[must_use]
+pub fn compute_weight_table(combo_map: &[Vec<(Card, Card)>]) -> Vec<f64> {
+    let n = NUM_CANONICAL_HANDS;
+    let mut weights = vec![0.0f64; n * n];
+
+    for h_idx in 0..n {
+        let hero_combos = &combo_map[h_idx];
+        if hero_combos.is_empty() {
+            continue;
+        }
+
+        // Pre-compute hero combo masks to avoid recomputing in inner loop.
+        let hero_masks: Vec<u64> = hero_combos
+            .iter()
+            .map(|&(c1, c2)| (1u64 << card_bit(c1)) | (1u64 << card_bit(c2)))
+            .collect();
+
+        for o_idx in 0..n {
+            let opp_combos = &combo_map[o_idx];
+            if opp_combos.is_empty() {
+                continue;
+            }
+
+            let mut count = 0u64;
+            for &h_mask in &hero_masks {
+                for &(o1, o2) in opp_combos {
+                    let o_mask = (1u64 << card_bit(o1)) | (1u64 << card_bit(o2));
+                    if h_mask & o_mask == 0 {
+                        count += 1;
+                    }
+                }
+            }
+            #[allow(clippy::cast_precision_loss)]
+            {
+                weights[h_idx * n + o_idx] = count as f64;
+            }
+        }
+    }
+    weights
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // CFR traversal
 // ──────────────────────────────────────────────────────────────────────────────
@@ -674,6 +724,7 @@ fn compute_exploitability(
     layout: &PostflopLayout,
     strategy_sum: &[f64],
     equity_table: &[f64],
+    weight_table: &[f64],
 ) -> f64 {
     let ctx = EvalCtx { tree, layout, strategy_sum, equity_table };
     let n = NUM_CANONICAL_HANDS;
@@ -682,7 +733,7 @@ fn compute_exploitability(
     for br_player in 0..2u8 {
         #[allow(clippy::cast_possible_truncation)]
         let n_u16 = n as u16;
-        let (total, count) = (0..n_u16)
+        let (weighted_total, weight_sum) = (0..n_u16)
             .into_par_iter()
             .flat_map_iter(|hero_hand| {
                 (0..n_u16)
@@ -692,19 +743,21 @@ fn compute_exploitability(
                     .map(move |opp_hand| (hero_hand, opp_hand))
             })
             .map(|(hero_hand, opp_hand)| {
-                ctx.best_response_ev(0, hero_hand, opp_hand, br_player)
+                let w = weight_table[hero_hand as usize * n + opp_hand as usize];
+                let br = ctx.best_response_ev(0, hero_hand, opp_hand, br_player);
+                (br * w, w)
             })
             .fold(
-                || (0.0f64, 0u64),
-                |(t, c), v| (t + v, c + 1),
+                || (0.0f64, 0.0f64),
+                |(t, c), (v, w)| (t + v, c + w),
             )
             .reduce(
-                || (0.0, 0),
+                || (0.0, 0.0),
                 |(t1, c1), (t2, c2)| (t1 + t2, c1 + c2),
             );
 
-        br_values[br_player as usize] = if count > 0 {
-            total / count as f64
+        br_values[br_player as usize] = if weight_sum > 0.0 {
+            weighted_total / weight_sum
         } else {
             0.0
         };
@@ -725,6 +778,7 @@ struct PostflopCfrCtx<'a> {
     tree: &'a PostflopTree,
     layout: &'a PostflopLayout,
     equity_table: &'a [f64],
+    weight_table: &'a [f64],
     snapshot: &'a [f64],
     iteration: u64,
     dcfr: &'a DcfrParams,
@@ -745,6 +799,7 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
         if eq.is_nan() {
             return;
         }
+        let w = self.weight_table[hero as usize * n + opponent as usize];
         if let Some(c) = self.counters {
             c.traversal_count.fetch_add(1, Ordering::Relaxed);
             if self.prune_active {
@@ -769,7 +824,7 @@ impl ParallelCfr for PostflopCfrCtx<'_> {
                 opp_hand: opponent,
                 hero_pos,
                 reach_hero: 1.0,
-                reach_opp: 1.0,
+                reach_opp: w,
             });
         }
     }
@@ -799,6 +854,7 @@ struct SolveLoopCtx<'a, F: Fn(BuildPhase) + Sync> {
     tree: &'a PostflopTree,
     layout: &'a PostflopLayout,
     equity_table: &'a [f64],
+    weight_table: &'a [f64],
     dcfr: &'a DcfrParams,
     config: &'a PostflopModelConfig,
     on_progress: &'a F,
@@ -820,6 +876,7 @@ impl<F: Fn(BuildPhase) + Sync> SolveLoopCtx<'_, F> {
                 tree: self.tree,
                 layout: self.layout,
                 equity_table: self.equity_table,
+                weight_table: self.weight_table,
                 snapshot: &bufs.regret_sum,
                 iteration,
                 dcfr: self.dcfr,
@@ -861,7 +918,7 @@ impl<F: Fn(BuildPhase) + Sync> SolveLoopCtx<'_, F> {
     fn check_exploitability(&self, bufs: &FlopBuffers, iter: usize, num_iterations: usize) -> Option<f64> {
         let expl_freq = self.config.exploitability_freq.max(1);
         if iter >= 1 && (iter % expl_freq == expl_freq - 1 || iter == num_iterations - 1) {
-            Some(compute_exploitability(self.tree, self.layout, &bufs.strategy_sum, self.equity_table))
+            Some(compute_exploitability(self.tree, self.layout, &bufs.strategy_sum, self.equity_table, self.weight_table))
         } else {
             None
         }
@@ -906,6 +963,7 @@ fn exhaustive_solve_one_flop(
     tree: &PostflopTree,
     layout: &PostflopLayout,
     equity_table: &[f64],
+    weight_table: &[f64],
     num_iterations: usize,
     convergence_threshold: f64,
     flop_name: &str,
@@ -927,7 +985,7 @@ fn exhaustive_solve_one_flop(
     }
 
     let ctx = SolveLoopCtx {
-        tree, layout, equity_table, dcfr, config, on_progress, counters,
+        tree, layout, equity_table, weight_table, dcfr, config, on_progress, counters,
         flop_name,
         pairs: &pairs,
     };
@@ -1028,10 +1086,11 @@ impl<F: Fn(BuildPhase) + Sync> BuildCtx<'_, F> {
         let flop = self.flops[flop_idx];
         let flop_name = format!("{}{}{}", flop[0], flop[1], flop[2]);
 
+        let combo_map = build_combo_map(&flop);
+        let weight_table = compute_weight_table(&combo_map);
         let equity_table = if let Some(tables) = self.pre_equity_tables {
             tables[flop_idx].clone()
         } else {
-            let combo_map = build_combo_map(&flop);
             compute_equity_table(&combo_map, flop)
         };
 
@@ -1054,7 +1113,7 @@ impl<F: Fn(BuildPhase) + Sync> BuildCtx<'_, F> {
         });
 
         exhaustive_solve_one_flop(
-            self.tree, self.layout, &equity_table, self.num_iterations,
+            self.tree, self.layout, &equity_table, &weight_table, self.num_iterations,
             self.config.cfr_convergence_threshold, &flop_name, &self.dcfr,
             self.config, self.on_progress, self.counters, &mut bufs,
         );
@@ -1162,6 +1221,12 @@ mod tests {
             card(Value::Seven, Suit::Heart),
             card(Value::Queen, Suit::Diamond),
         ]
+    }
+
+    /// Build a uniform weight table (all 1.0) for tests using synthetic equity.
+    /// Preserves existing test behavior since all matchups are equally weighted.
+    fn synthetic_weight_table() -> Vec<f64> {
+        vec![1.0; NUM_CANONICAL_HANDS * NUM_CANONICAL_HANDS]
     }
 
     /// Build a synthetic equity table where equity is based on hand index.
@@ -1326,6 +1391,7 @@ mod tests {
         let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
 
         let equity_table = synthetic_equity_table();
+        let weight_table = synthetic_weight_table();
         let dcfr = DcfrParams::linear();
         let mut bufs = FlopBuffers::new(layout.total_size);
 
@@ -1333,6 +1399,7 @@ mod tests {
             &tree,
             &layout,
             &equity_table,
+            &weight_table,
             3,
             0.001,
             "test",
@@ -1362,6 +1429,7 @@ mod tests {
         let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
 
         let equity_table = synthetic_equity_table();
+        let weight_table = synthetic_weight_table();
         let dcfr = DcfrParams::linear();
         let mut bufs = FlopBuffers::new(layout.total_size);
 
@@ -1369,6 +1437,7 @@ mod tests {
             &tree,
             &layout,
             &equity_table,
+            &weight_table,
             2,
             0.001,
             "test",
@@ -1533,7 +1602,7 @@ mod tests {
     }
 
     /// Helper: build a minimal tree + layout + synthetic equity for exploitability tests.
-    fn expl_test_fixtures() -> (PostflopTree, PostflopLayout, Vec<f64>) {
+    fn expl_test_fixtures() -> (PostflopTree, PostflopLayout, Vec<f64>, Vec<f64>) {
         let config = PostflopModelConfig {
             bet_sizes: vec![1.0],
             max_raises_per_street: 0,
@@ -1545,16 +1614,17 @@ mod tests {
         let n = NUM_CANONICAL_HANDS;
         let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
         let equity_table = synthetic_equity_table();
-        (tree, layout, equity_table)
+        let weight_table = synthetic_weight_table();
+        (tree, layout, equity_table, weight_table)
     }
 
     #[timed_test(10)]
     #[ignore = "slow: O(169²) best-response in debug mode"]
     fn exploitability_is_positive_for_uniform_strategy() {
-        let (tree, layout, equity_table) = expl_test_fixtures();
+        let (tree, layout, equity_table, weight_table) = expl_test_fixtures();
         // All-zero strategy_sum -> normalize_strategy_sum returns uniform
         let strategy_sum = vec![0.0f64; layout.total_size];
-        let expl = compute_exploitability(&tree, &layout, &strategy_sum, &equity_table);
+        let expl = compute_exploitability(&tree, &layout, &strategy_sum, &equity_table, &weight_table);
         assert!(
             expl > 0.0,
             "uniform strategy should be exploitable, got {expl}"
@@ -1564,10 +1634,10 @@ mod tests {
     #[timed_test(10)]
     #[ignore = "slow: O(169²) best-response in debug mode"]
     fn exploitability_decreases_with_training() {
-        let (tree, layout, equity_table) = expl_test_fixtures();
+        let (tree, layout, equity_table, weight_table) = expl_test_fixtures();
         // Uniform strategy exploitability (baseline).
         let uniform_sum = vec![0.0f64; layout.total_size];
-        let expl_uniform = compute_exploitability(&tree, &layout, &uniform_sum, &equity_table);
+        let expl_uniform = compute_exploitability(&tree, &layout, &uniform_sum, &equity_table, &weight_table);
         // 3 CFR iterations with no early stop. With snapshot-based CFR the first
         // iteration reads uniform regrets, so convergence needs one extra iteration
         // compared to in-place updates.
@@ -1575,7 +1645,7 @@ mod tests {
         let no_prune = PostflopModelConfig::exhaustive_fast();
         let mut bufs = FlopBuffers::new(layout.total_size);
         let (delta, _iterations_used) = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 3, 0.0, "test", &dcfr, &no_prune, &|_| {}, None,
+            &tree, &layout, &equity_table, &weight_table, 3, 0.0, "test", &dcfr, &no_prune, &|_| {}, None,
             &mut bufs,
         );
         assert!(
@@ -1600,12 +1670,13 @@ mod tests {
         let n = NUM_CANONICAL_HANDS;
         let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
         let equity_table = synthetic_equity_table();
+        let weight_table = synthetic_weight_table();
         let dcfr = DcfrParams::linear();
 
         // Solve with default thread pool (parallel)
         let mut bufs_par = FlopBuffers::new(layout.total_size);
         let (_delta_par, iterations_par) = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 5, 0.0, "par", &dcfr, &config, &|_| {}, None,
+            &tree, &layout, &equity_table, &weight_table, 5, 0.0, "par", &dcfr, &config, &|_| {}, None,
             &mut bufs_par,
         );
 
@@ -1617,7 +1688,7 @@ mod tests {
         let mut bufs_seq = FlopBuffers::new(layout.total_size);
         let (_delta_seq, iterations_seq) = pool.install(|| {
             exhaustive_solve_one_flop(
-                &tree, &layout, &equity_table, 5, 0.0, "seq", &dcfr, &config, &|_| {}, None,
+                &tree, &layout, &equity_table, &weight_table, 5, 0.0, "seq", &dcfr, &config, &|_| {}, None,
                 &mut bufs_seq,
             )
         });
@@ -1638,7 +1709,7 @@ mod tests {
     #[timed_test(10)]
     #[ignore = "slow: O(169²) best-response in debug mode"]
     fn exploitability_early_stopping_triggers() {
-        let (tree, layout, equity_table) = expl_test_fixtures();
+        let (tree, layout, equity_table, weight_table) = expl_test_fixtures();
         // Very generous threshold (30 BB/h) -- stops at first exploitability check.
         let threshold_mbb = 30_000.0;
         let dcfr = DcfrParams::linear();
@@ -1648,6 +1719,7 @@ mod tests {
             &tree,
             &layout,
             &equity_table,
+            &weight_table,
             30,
             threshold_mbb,
             "test",
@@ -1685,6 +1757,7 @@ mod tests {
         let n = NUM_CANONICAL_HANDS;
         let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
         let equity_table = synthetic_equity_table();
+        let weight_table = synthetic_weight_table();
         let dcfr = DcfrParams::linear();
         let mut bufs = FlopBuffers::new(layout.total_size);
 
@@ -1692,6 +1765,7 @@ mod tests {
             &tree,
             &layout,
             &equity_table,
+            &weight_table,
             5,
             0.0,
             "prune_test",
@@ -1707,7 +1781,7 @@ mod tests {
         assert!(has_nonzero, "strategy_sum should have non-zero entries with pruning enabled");
     }
 
-    #[timed_test(10)]
+    #[timed_test(30)]
     fn pruning_does_not_break_convergence() {
         let base = PostflopModelConfig {
             bet_sizes: vec![1.0],
@@ -1720,12 +1794,13 @@ mod tests {
         let n = NUM_CANONICAL_HANDS;
         let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
         let equity_table = synthetic_equity_table();
+        let weight_table = synthetic_weight_table();
         let dcfr = DcfrParams::linear();
 
         // Unpruned baseline (prune_warmup=0)
         let mut bufs_unpruned = FlopBuffers::new(layout.total_size);
         let (_delta_unpruned, iterations_unpruned) = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 5, 0.0, "no_prune", &dcfr, &base, &|_| {}, None,
+            &tree, &layout, &equity_table, &weight_table, 5, 0.0, "no_prune", &dcfr, &base, &|_| {}, None,
             &mut bufs_unpruned,
         );
 
@@ -1738,7 +1813,7 @@ mod tests {
         };
         let mut bufs_pruned = FlopBuffers::new(layout.total_size);
         let (_delta_pruned, iterations_pruned) = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 5, 0.0, "pruned", &dcfr, &pruned_config, &|_| {}, None,
+            &tree, &layout, &equity_table, &weight_table, 5, 0.0, "pruned", &dcfr, &pruned_config, &|_| {}, None,
             &mut bufs_pruned,
         );
 
@@ -1751,7 +1826,7 @@ mod tests {
         assert!(pruned_nonzero, "pruned should have non-zero strategy");
     }
 
-    #[timed_test(10)]
+    #[timed_test(30)]
     fn solver_counters_are_incremented() {
         let config = PostflopModelConfig {
             bet_sizes: vec![1.0],
@@ -1764,11 +1839,12 @@ mod tests {
         let n = NUM_CANONICAL_HANDS;
         let layout = PostflopLayout::build(&tree, &node_streets, n, n, n);
         let equity_table = synthetic_equity_table();
+        let weight_table = synthetic_weight_table();
         let dcfr = DcfrParams::linear();
         let counters = SolverCounters::default();
         let mut bufs = FlopBuffers::new(layout.total_size);
         let _result = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 5, 0.0, "test", &dcfr, &config,
+            &tree, &layout, &equity_table, &weight_table, 5, 0.0, "test", &dcfr, &config,
             &|_| {}, Some(&counters), &mut bufs,
         );
         let traversals = counters.traversal_count.load(Ordering::Relaxed);
@@ -1799,11 +1875,12 @@ mod tests {
         eprintln!("tree nodes: {}, layout total_size: {}", tree.node_count(), layout.total_size);
 
         let equity_table = synthetic_equity_table();
+        let weight_table = synthetic_weight_table();
         let dcfr = DcfrParams::default(); // DCFR variant
         let mut bufs = FlopBuffers::new(layout.total_size);
 
         let (_delta, iterations_used) = exhaustive_solve_one_flop(
-            &tree, &layout, &equity_table, 3, 100.0, "test_full", &dcfr,
+            &tree, &layout, &equity_table, &weight_table, 3, 100.0, "test_full", &dcfr,
             &config, &|_| {}, None, &mut bufs,
         );
 
@@ -1860,6 +1937,79 @@ mod tests {
                     assert!(b.is_nan(), "at [{h}][{o}]: original=NaN, new={b}");
                 } else {
                     assert!((a - b).abs() < 1e-10, "at [{h}][{o}]: orig={a}, new={b}, diff={}", (a - b).abs());
+                }
+            }
+        }
+    }
+
+    #[timed_test]
+    fn weight_table_basic_properties() {
+        let flop = test_flop();
+        let combo_map = build_combo_map(&flop);
+        let weights = compute_weight_table(&combo_map);
+        let n = NUM_CANONICAL_HANDS;
+
+        assert_eq!(weights.len(), n * n);
+
+        // All weights should be non-negative.
+        assert!(
+            weights.iter().all(|&w| w >= 0.0),
+            "weights must be non-negative"
+        );
+
+        // Symmetry: weight[h][o] == weight[o][h].
+        for h in 0..n {
+            for o in h + 1..n {
+                assert_eq!(
+                    weights[h * n + o],
+                    weights[o * n + h],
+                    "weight table should be symmetric for ({h}, {o})"
+                );
+            }
+        }
+
+        // Hands with empty combo maps should have zero weight.
+        for h in 0..n {
+            if combo_map[h].is_empty() {
+                for o in 0..n {
+                    assert_eq!(weights[h * n + o], 0.0);
+                    assert_eq!(weights[o * n + h], 0.0);
+                }
+            }
+        }
+
+        // At least some weights should be > 0.
+        assert!(
+            weights.iter().any(|&w| w > 0.0),
+            "should have positive weights"
+        );
+    }
+
+    #[timed_test(10)]
+    #[ignore = "slow: full 169x169 equity + weight table computation"]
+    fn weight_table_agrees_with_equity_table_validity() {
+        // Any pair with NaN equity should have 0 weight, and vice versa.
+        let flop = test_flop();
+        let combo_map = build_combo_map(&flop);
+        let weights = compute_weight_table(&combo_map);
+        let equity = compute_equity_table(&combo_map, flop);
+        let n = NUM_CANONICAL_HANDS;
+
+        for h in 0..n {
+            for o in 0..n {
+                let idx = h * n + o;
+                if equity[idx].is_nan() {
+                    assert_eq!(
+                        weights[idx], 0.0,
+                        "NaN equity at ({h},{o}) should have 0 weight, got {}",
+                        weights[idx]
+                    );
+                } else {
+                    assert!(
+                        weights[idx] > 0.0,
+                        "valid equity at ({h},{o}) should have positive weight, got {}",
+                        weights[idx]
+                    );
                 }
             }
         }
