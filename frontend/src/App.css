@@ -76,6 +76,16 @@ body {
   flex: 1;
   overflow: hidden;
   padding: 1.5rem 2rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.view-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 /* Stub views */
@@ -199,6 +209,10 @@ button:disabled {
 .explorer {
   width: 100%;
   position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
 }
 
 /* Dataset switcher card in action strip */
@@ -460,6 +474,7 @@ button:disabled {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
   border-radius: 4px;
   margin-bottom: 1rem;
+  flex-shrink: 0;
 }
 
 .action-block {
@@ -532,28 +547,31 @@ button:disabled {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
   border-radius: 8px;
   padding: 1rem;
+  flex: 1;
+  min-height: 0;
+  display: flex;
 }
 
 .hand-matrix {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: repeat(13, 1fr);
   gap: 1px;
   background: #333;
   border: 1px solid #333;
   border-radius: 4px;
   overflow: hidden;
+  aspect-ratio: 1;
+  max-height: 100%;
 }
 
 .matrix-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(13, 1fr);
   gap: 1px;
+  min-height: 0;
 }
 
 .matrix-cell {
-  --matrix-size: min(calc(100vh - 220px), calc(100vw - 380px));
-  --cell: calc(var(--matrix-size) / 13);
-  width: var(--cell);
-  height: var(--cell);
   display: flex;
   align-items: flex-start;
   justify-content: flex-start;
@@ -561,6 +579,8 @@ button:disabled {
   cursor: pointer;
   transition: transform 0.1s;
   position: relative;
+  min-width: 0;
+  min-height: 0;
 }
 
 .matrix-cell:hover {
@@ -584,7 +604,7 @@ button:disabled {
 }
 
 .cell-label {
-  font-size: clamp(0.5rem, calc(var(--cell, 54px) * 0.28), 1rem);
+  font-size: clamp(0.45rem, 1.2vmin, 0.9rem);
   font-weight: bold;
   color: #fff;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
@@ -595,6 +615,8 @@ button:disabled {
   display: flex;
   gap: 1rem;
   align-items: flex-start;
+  flex: 1;
+  min-height: 0;
 }
 
 .detail-column {
