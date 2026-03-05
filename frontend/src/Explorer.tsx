@@ -1,7 +1,6 @@
-import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import { useState, useCallback, useMemo, useEffect } from 'react';
 import { invoke } from './invoke';
 import {
-  AgentInfo,
   BundleInfo,
   CanonicalizeResult,
   HandEquity,
@@ -11,69 +10,6 @@ import {
   MatrixCell,
   ComboGroupInfo,
 } from './types';
-
-function HamburgerMenu({
-  agents,
-  activeAgentName,
-  loading,
-  onSelectAgent,
-  onLoadBundle,
-}: {
-  agents: AgentInfo[];
-  activeAgentName: string | null;
-  loading: boolean;
-  onSelectAgent: (path: string) => void;
-  onLoadBundle: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const menuRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, []);
-
-  return (
-    <div className="hamburger-menu" ref={menuRef}>
-      <button className="hamburger-button" onClick={() => setOpen(!open)}>
-        <span className="hamburger-icon" />
-      </button>
-      {open && (
-        <div className="hamburger-dropdown">
-          {agents.length > 0 && (
-            <div className="menu-section">
-              <div className="menu-section-label">Agents</div>
-              {agents.map((agent) => (
-                <button
-                  key={agent.path}
-                  className={`menu-item ${activeAgentName === agent.name ? 'active' : ''}`}
-                  disabled={loading}
-                  onClick={() => { onSelectAgent(agent.path); setOpen(false); }}
-                >
-                  {agent.name}
-                </button>
-              ))}
-            </div>
-          )}
-          <div className="menu-section">
-            <button
-              className="menu-item"
-              disabled={loading}
-              onClick={() => { onLoadBundle(); setOpen(false); }}
-            >
-              Load Dataset...
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
 // Suit colors matching the reference image
 const SUIT_COLORS: Record<string, string> = {
@@ -577,7 +513,6 @@ export default function Explorer() {
     stack_p2: number;
     expectedCards: number;
   } | null>(null);
-  const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [selectedCell, setSelectedCell] = useState<{ row: number; col: number } | null>(null);
@@ -591,13 +526,6 @@ export default function Explorer() {
     canonical: string[];
     suitMap: Record<string, string>;
   } | null>(null);
-
-  // Fetch available agents on mount
-  useEffect(() => {
-    invoke<AgentInfo[]>('list_agents')
-      .then(setAgents)
-      .catch(() => setAgents([]));
-  }, []);
 
   // Re-fetch matrix when threshold changes (if a matrix is displayed)
   useEffect(() => {
@@ -690,13 +618,6 @@ export default function Explorer() {
       }
     },
     [threshold]
-  );
-
-  const handleLoadAgent = useCallback(
-    (agentPath: string) => {
-      loadSource(agentPath);
-    },
-    [loadSource]
   );
 
   const handleLoadDataset = useCallback(async () => {
@@ -1081,14 +1002,6 @@ export default function Explorer() {
 
   return (
     <div className="explorer">
-      <HamburgerMenu
-        agents={agents}
-        activeAgentName={bundleInfo?.name ?? null}
-        loading={loading}
-        onSelectAgent={handleLoadAgent}
-        onLoadBundle={handleLoadDataset}
-      />
-
       {error && <div className="error">{error}</div>}
 
       {bundleInfo && (
@@ -1279,25 +1192,17 @@ export default function Explorer() {
       )}
 
       {!bundleInfo && !loading && (
-        <div className="empty-state">
-          {agents.length > 0 && (
-            <>
-              <p>Select an agent to explore rule-based strategies:</p>
-              <div className="agent-cards">
-                {agents.map((agent) => (
-                  <button
-                    key={agent.path}
-                    className="agent-card"
-                    onClick={() => handleLoadAgent(agent.path)}
-                  >
-                    {agent.name}
-                  </button>
-                ))}
-              </div>
-              <p className="or-divider">or</p>
-            </>
-          )}
-          <p>Load a trained strategy bundle to explore HUNL strategies.</p>
+        <div className="action-strip">
+          <div className="action-block load-dataset-card" onClick={handleLoadDataset}>
+            <div className="load-dataset-icon">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                <line x1="12" y1="11" x2="12" y2="17" />
+                <line x1="9" y1="14" x2="15" y2="14" />
+              </svg>
+            </div>
+            <span className="load-dataset-label">Load Dataset</span>
+          </div>
         </div>
       )}
 
