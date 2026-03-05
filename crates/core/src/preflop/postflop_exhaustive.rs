@@ -1040,33 +1040,39 @@ impl<F: Fn(BuildPhase) + Sync> BuildCtx<'_, F> {
         }
 
         let buf_size = self.layout.total_size;
-        FLOP_BUFS.with(|cell| {
-            let mut borrow = cell.borrow_mut();
-            if borrow.as_ref().is_none_or(|b| b.regret_sum.len() != buf_size) {
-                *borrow = Some(FlopBuffers::new(buf_size));
-            } else {
-                borrow.as_mut().unwrap().reset();
-            }
-            let bufs = borrow.as_mut().unwrap();
 
-            exhaustive_solve_one_flop(
-                self.tree, self.layout, &equity_table, self.num_iterations,
-                self.config.cfr_convergence_threshold, &flop_name, &self.dcfr,
-                self.config, self.on_progress, self.counters, bufs,
-            );
+        // Take ownership of the cached buffer (if any) from the thread-local,
+        // then immediately drop the RefCell borrow. This avoids holding a
+        // borrow_mut across nested rayon parallelism (compute_exploitability
+        // and parallel_traverse_pooled both use par_iter), which would panic
+        // if rayon work-stealing re-enters this function on the same thread.
+        let mut bufs = FLOP_BUFS.with(|cell| {
+            cell.borrow_mut()
+                .take()
+                .filter(|b| b.regret_sum.len() == buf_size)
+                .map_or_else(|| FlopBuffers::new(buf_size), |mut b| { b.reset(); b })
+        });
 
-            let values = exhaustive_extract_values(
-                self.tree, self.layout, &bufs.strategy_sum, &equity_table,
-            );
+        exhaustive_solve_one_flop(
+            self.tree, self.layout, &equity_table, self.num_iterations,
+            self.config.cfr_convergence_threshold, &flop_name, &self.dcfr,
+            self.config, self.on_progress, self.counters, &mut bufs,
+        );
 
-            (self.on_progress)(BuildPhase::FlopProgress { flop_name, stage: FlopStage::Done });
-            let done = self.completed.fetch_add(1, Ordering::Relaxed) + 1;
-            (self.on_progress)(BuildPhase::MccfrFlopsCompleted {
-                completed: done, total: self.flops.len(),
-            });
+        let values = exhaustive_extract_values(
+            self.tree, self.layout, &bufs.strategy_sum, &equity_table,
+        );
 
-            values
-        })
+        // Return buffer to thread-local cache for reuse by the next flop.
+        FLOP_BUFS.with(|cell| { cell.borrow_mut().replace(bufs); });
+
+        (self.on_progress)(BuildPhase::FlopProgress { flop_name, stage: FlopStage::Done });
+        let done = self.completed.fetch_add(1, Ordering::Relaxed) + 1;
+        (self.on_progress)(BuildPhase::MccfrFlopsCompleted {
+            completed: done, total: self.flops.len(),
+        });
+
+        values
     }
 }
 
