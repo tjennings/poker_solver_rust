@@ -128,6 +128,63 @@ enum Commands {
         #[arg(long, default_value = "raised")]
         pot_type: String,
     },
+    /// Inspect a saved preflop bundle: dump strategy & action labels at key nodes.
+    InspectPreflop {
+        /// Path to preflop bundle directory (or checkpoint directory)
+        #[arg(short, long)]
+        path: PathBuf,
+        /// Comma-separated hand names (e.g. "AA,Q8s,K5s")
+        #[arg(long, default_value = "AA,KK,AKs,K9s,K7s,K5s,Q9s,Q8s,Q7s,JTs,J9s,T9s,T8s,98s,87s,76s,65s,A5s,72o")]
+        hands: String,
+        /// Walk to a specific node by action history (e.g. "r:3" for BB facing SB 2bb raise)
+        #[arg(long)]
+        history: Option<String>,
+    },
+    /// Trace raw regret/strategy-sum evolution for specific hands over first N iterations.
+    TraceRegrets {
+        /// YAML config file (same as solve-preflop)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Number of iterations to trace
+        #[arg(long, default_value = "10")]
+        iterations: u64,
+        /// Comma-separated hand names
+        #[arg(long, default_value = "AA,Q8s,K5s,T9s,87s,72o")]
+        hands: String,
+        /// Action history to reach the target node (e.g. "r:3")
+        #[arg(long, default_value = "r:3")]
+        history: String,
+    },
+    /// Decompose per-opponent regret contributions at a target node after N iterations.
+    DecomposeRegrets {
+        /// YAML config file (same as solve-preflop)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Warm-up iterations before decomposition
+        #[arg(long, default_value = "5")]
+        iterations: u64,
+        /// Hero hand to decompose (e.g. "Q8s")
+        #[arg(long)]
+        hand: String,
+        /// Action history to reach the target node (e.g. "r:3")
+        #[arg(long, default_value = "r:3")]
+        history: String,
+    },
+    /// Dump terminal node values from a decision node for a specific matchup.
+    TraceTerminals {
+        /// YAML config file (same as solve-preflop)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Hero hand (e.g. "AA")
+        #[arg(long)]
+        hero: String,
+        /// Opponent hand (e.g. "72o")
+        #[arg(long)]
+        opp: String,
+        /// Action history to reach the target node (e.g. "call,r:3")
+        #[arg(long, default_value = "call,r:3")]
+        history: String,
+    },
 }
 
 /// Output format for the flops command.
@@ -281,6 +338,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Commands::DumpTree { config, dot, output, spr, pot_type } => {
             tree_dump::run(dot, output, config, spr, pot_type)?;
+        }
+        Commands::InspectPreflop { path, hands, history } => {
+            run_inspect_preflop(&path, &hands, history.as_deref())?;
+        }
+        Commands::TraceRegrets { config, iterations, hands, history } => {
+            run_trace_regrets(&config, iterations, &hands, &history)?;
+        }
+        Commands::DecomposeRegrets { config, iterations, hand, history } => {
+            run_decompose_regrets(&config, iterations, &hand, &history)?;
+        }
+        Commands::TraceTerminals { config, hero, opp, history } => {
+            run_trace_terminals(&config, &hero, &opp, &history)?;
         }
     }
 
@@ -1156,5 +1225,445 @@ fn write_flops_csv(flops: &[CanonicalFlop], writer: &mut dyn Write) -> Result<()
             f.weight(),
         )?;
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Inspect preflop bundle
+// ---------------------------------------------------------------------------
+
+fn run_inspect_preflop(
+    path: &Path,
+    hands_str: &str,
+    history: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::info_key::canonical_hand_index_from_str;
+    use poker_solver_core::preflop::{PreflopNode, PreflopTree};
+
+    let bundle = PreflopBundle::load(path)?;
+    let tree = PreflopTree::build(&bundle.config);
+
+    // Resolve hand names to indices
+    let hand_names: Vec<&str> = hands_str.split(',').map(str::trim).collect();
+    let hand_indices: Vec<(usize, &str)> = hand_names
+        .iter()
+        .filter_map(|&name| {
+            canonical_hand_index_from_str(name).map(|idx| (idx as usize, name))
+        })
+        .collect();
+
+    // Determine which nodes to inspect
+    let nodes_to_inspect = if let Some(hist) = history {
+        // Walk tree following action history like "r:3" or "r:3,call"
+        let actions: Vec<&str> = hist.split(',').map(str::trim).collect();
+        let mut node_idx = 0u32;
+        for action_str in &actions {
+            node_idx = find_child_by_label(&tree, node_idx, action_str)
+                .ok_or_else(|| format!("Action '{}' not found at node {}", action_str, node_idx))?;
+        }
+        vec![(node_idx, format!("after {}", hist))]
+    } else {
+        // Default: root (SB decision) + BB-vs-raise nodes
+        let mut nodes = vec![(0u32, "SB root".to_string())];
+        // Find all raise children from root (BB facing different raise sizes)
+        if let PreflopNode::Decision { action_labels, children, .. } = &tree.nodes[0] {
+            for (i, action) in action_labels.iter().enumerate() {
+                if matches!(action, PreflopAction::Raise(_) | PreflopAction::AllIn) {
+                    nodes.push((children[i], format!("BB vs {action:?}")));
+                }
+            }
+            // Also add BB-vs-limp (call child)
+            for (i, action) in action_labels.iter().enumerate() {
+                if matches!(action, PreflopAction::Call) {
+                    nodes.push((children[i], "BB vs limp".to_string()));
+                }
+            }
+        }
+        nodes
+    };
+
+    // Print strategy at each node
+    for (node_idx, label) in &nodes_to_inspect {
+        let (action_labels, _) = match &tree.nodes[*node_idx as usize] {
+            PreflopNode::Decision { action_labels, children, position, .. } => {
+                println!("\n=== Node {} ({}) — position {} ===", node_idx, label, position);
+                (action_labels.clone(), children.clone())
+            }
+            PreflopNode::Terminal { .. } => {
+                println!("\n=== Node {} ({}) — TERMINAL ===", node_idx, label);
+                continue;
+            }
+        };
+
+        // Header
+        let action_strs: Vec<String> = action_labels.iter().map(|a| format!("{a:?}")).collect();
+        print!("{:>5}", "Hand");
+        for a in &action_strs {
+            print!("  {:>8}", a);
+        }
+        println!();
+
+        // Per-hand strategy
+        for &(hand_idx, name) in &hand_indices {
+            let probs = bundle.strategy.get_probs(*node_idx, hand_idx);
+            print!("{:>5}", name);
+            if probs.is_empty() {
+                println!("  (no data)");
+            } else {
+                for &p in probs {
+                    print!("  {:>7.1}%", p * 100.0);
+                }
+                println!();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Find a child node by action label string (e.g. "r:3", "call", "fold", "allin").
+fn find_child_by_label(
+    tree: &PreflopTree,
+    node_idx: u32,
+    action_str: &str,
+) -> Option<u32> {
+    use poker_solver_core::preflop::PreflopNode;
+    match &tree.nodes[node_idx as usize] {
+        PreflopNode::Decision { action_labels, children, .. } => {
+            for (i, action) in action_labels.iter().enumerate() {
+                let matches = match action_str.to_lowercase().as_str() {
+                    "fold" => matches!(action, PreflopAction::Fold),
+                    "call" => matches!(action, PreflopAction::Call),
+                    "allin" | "all-in" => matches!(action, PreflopAction::AllIn),
+                    s if s.starts_with("r:") => {
+                        // Match by action index: "r:3" means 3rd action (0-indexed)
+                        if let Ok(idx) = s[2..].parse::<usize>() {
+                            i == idx
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if matches {
+                    return Some(children[i]);
+                }
+            }
+            None
+        }
+        PreflopNode::Terminal { .. } => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trace regret / strategy-sum evolution
+// ---------------------------------------------------------------------------
+
+fn run_trace_regrets(
+    config_path: &Path,
+    iterations: u64,
+    hands_str: &str,
+    history: &str,
+) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::info_key::canonical_hand_index_from_str;
+    use poker_solver_core::preflop::{PreflopNode, PreflopTree};
+
+    let yaml = std::fs::read_to_string(config_path)?;
+    let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
+
+    let postflop_model_path = training.postflop_model_path;
+    let config = training.game;
+
+    // Load equity
+    let cache_base = Path::new("cache/postflop");
+    let equity = if training.equity_samples > 0 {
+        use poker_solver_core::preflop::equity_cache;
+        equity_cache::load(cache_base, training.equity_samples)
+            .ok_or("Equity cache not found — run solve-preflop first to build it")?
+    } else {
+        EquityTable::new_uniform()
+    };
+
+    // Build tree + solver
+    let tree = PreflopTree::build(&config);
+    let mut solver = PreflopSolver::new_with_equity(&config, equity);
+
+    // Load postflop model
+    let pf_config_yaml = std::fs::read_to_string(postflop_model_path.join("config.yaml"))?;
+    let pf_config: PostflopModelConfig = serde_yaml::from_str(&pf_config_yaml)?;
+    let abstractions = PostflopBundle::load_multi(&pf_config, &postflop_model_path)?;
+    solver.attach_postflop(abstractions, &config);
+
+    // Resolve target node
+    let actions: Vec<&str> = history.split(',').map(str::trim).collect();
+    let mut node_idx = 0u32;
+    for action_str in &actions {
+        node_idx = find_child_by_label(&tree, node_idx, action_str)
+            .ok_or_else(|| format!("Action '{}' not found at node {}", action_str, node_idx))?;
+    }
+
+    // Get action labels at target node
+    let action_labels = match &tree.nodes[node_idx as usize] {
+        PreflopNode::Decision { action_labels, .. } => action_labels.clone(),
+        PreflopNode::Terminal { .. } => return Err("Target node is terminal".into()),
+    };
+    let action_strs: Vec<String> = action_labels.iter().map(|a| format!("{a:?}")).collect();
+
+    // Resolve hand names
+    let hand_entries: Vec<(usize, &str)> = hands_str
+        .split(',')
+        .filter_map(|name| {
+            let name = name.trim();
+            canonical_hand_index_from_str(name).map(|idx| (idx as usize, name))
+        })
+        .collect();
+
+    println!("Tracing node {} (after {}) — {} actions: {:?}",
+        node_idx, history, action_strs.len(), action_strs);
+    println!();
+
+    // Run iteration by iteration
+    for iter in 0..iterations {
+        solver.train(1);
+
+        println!("=== After iteration {} ===", iter + 1);
+        for &(hand_idx, name) in &hand_entries {
+            let regrets = solver.regret_at(node_idx, hand_idx);
+            let strat_sums = solver.strategy_sum_at(node_idx, hand_idx);
+
+            // Compute current strategy from regret matching
+            let total_pos: f64 = regrets.iter().filter(|&&r| r > 0.0).sum();
+            let current_strat: Vec<f64> = if total_pos > 0.0 {
+                regrets.iter().map(|&r| if r > 0.0 { r / total_pos } else { 0.0 }).collect()
+            } else {
+                vec![1.0 / regrets.len() as f64; regrets.len()]
+            };
+
+            // Compute average strategy from strategy sums
+            let total_ss: f64 = strat_sums.iter().sum();
+            let avg_strat: Vec<f64> = if total_ss > 0.0 {
+                strat_sums.iter().map(|&s| s / total_ss).collect()
+            } else {
+                vec![1.0 / strat_sums.len() as f64; strat_sums.len()]
+            };
+
+            print!("  {:<5} regret_sum: [", name);
+            for (i, r) in regrets.iter().enumerate() {
+                if i > 0 { print!(", "); }
+                print!("{:>10.2}", r);
+            }
+            println!("]");
+
+            print!("  {:<5} strat_sum:  [", "");
+            for (i, s) in strat_sums.iter().enumerate() {
+                if i > 0 { print!(", "); }
+                print!("{:>10.2}", s);
+            }
+            println!("]");
+
+            print!("  {:<5} curr_strat: [", "");
+            for (i, s) in current_strat.iter().enumerate() {
+                if i > 0 { print!(", "); }
+                print!("{:>10.1}%", s * 100.0);
+            }
+            println!("]");
+
+            print!("  {:<5} avg_strat:  [", "");
+            for (i, s) in avg_strat.iter().enumerate() {
+                if i > 0 { print!(", "); }
+                print!("{:>10.1}%", s * 100.0);
+            }
+            println!("]");
+            println!();
+        }
+    }
+
+    println!("Actions: {:?}", action_strs);
+
+    Ok(())
+}
+
+fn run_decompose_regrets(
+    config_path: &Path,
+    iterations: u64,
+    hand_str: &str,
+    history: &str,
+) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::hands::CanonicalHand;
+    use poker_solver_core::info_key::canonical_hand_index_from_str;
+    use poker_solver_core::preflop::{PreflopNode, PreflopTree};
+
+    let yaml = std::fs::read_to_string(config_path)?;
+    let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
+
+    let postflop_model_path = training.postflop_model_path;
+    let config = training.game;
+
+    // Load equity
+    let cache_base = Path::new("cache/postflop");
+    let equity = if training.equity_samples > 0 {
+        use poker_solver_core::preflop::equity_cache;
+        equity_cache::load(cache_base, training.equity_samples)
+            .ok_or("Equity cache not found — run solve-preflop first to build it")?
+    } else {
+        EquityTable::new_uniform()
+    };
+
+    // Build tree + solver
+    let tree = PreflopTree::build(&config);
+    let mut solver = PreflopSolver::new_with_equity(&config, equity);
+
+    // Load postflop model
+    let pf_config_yaml = std::fs::read_to_string(postflop_model_path.join("config.yaml"))?;
+    let pf_config: PostflopModelConfig = serde_yaml::from_str(&pf_config_yaml)?;
+    let abstractions = PostflopBundle::load_multi(&pf_config, &postflop_model_path)?;
+    solver.attach_postflop(abstractions, &config);
+
+    // Resolve hero hand
+    let hero_hand = canonical_hand_index_from_str(hand_str)
+        .ok_or_else(|| format!("Invalid hand: {hand_str}"))?;
+
+    // Resolve target node
+    let actions: Vec<&str> = history.split(',').map(str::trim).collect();
+    let mut node_idx = 0u32;
+    for action_str in &actions {
+        node_idx = find_child_by_label(&tree, node_idx, action_str)
+            .ok_or_else(|| format!("Action '{}' not found at node {}", action_str, node_idx))?;
+    }
+
+    // Get action labels and hero position at target node
+    let (hero_pos, action_labels) = match &tree.nodes[node_idx as usize] {
+        PreflopNode::Decision { position, action_labels, .. } => (*position, action_labels.clone()),
+        PreflopNode::Terminal { .. } => return Err("Target node is terminal".into()),
+    };
+    let action_strs: Vec<String> = action_labels.iter().map(|a| format!("{a:?}")).collect();
+
+    println!("Decomposing regrets for {} (index {}) at node {} (hero_pos={})",
+        hand_str, hero_hand, node_idx, hero_pos);
+    println!("Actions: {:?}", action_strs);
+    println!("Running {} warm-up iterations...", iterations);
+
+    // Run warm-up iterations
+    solver.train(iterations);
+
+    // Show aggregate regrets first
+    let regrets = solver.regret_at(node_idx, hero_hand as usize);
+    println!("\nAggregate regret_sum after {} iterations:", iterations);
+    for (i, label) in action_strs.iter().enumerate() {
+        println!("  {:>12}: {:>12.2}", label, regrets[i]);
+    }
+
+    // Decompose
+    println!("\nPer-opponent breakdown (sorted by fold-call delta, descending):");
+    println!("{:>6} {:>8} {:>12} {:>12} {:>12}   (remaining actions...)",
+        "Opp", "Weight", "Fold Δ", "Call Δ", "F-C diff");
+    println!("{}", "-".repeat(80));
+
+    let mut results = solver.decompose_regrets_at(node_idx, hero_hand, hero_pos);
+
+    // Sort by (fold_delta - call_delta) descending — shows which opponents make fold look better
+    results.sort_by(|a, b| {
+        let diff_a = if a.2.len() >= 2 { a.2[0] - a.2[1] } else { 0.0 };
+        let diff_b = if b.2.len() >= 2 { b.2[0] - b.2[1] } else { 0.0 };
+        diff_b.partial_cmp(&diff_a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut total_fold = 0.0;
+    let mut total_call = 0.0;
+    let mut count = 0;
+
+    for (opp_hand, weight, deltas, _) in &results {
+        let opp_name = CanonicalHand::from_index(*opp_hand as usize)
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| format!("#{opp_hand}"));
+        let fold_d = deltas.first().copied().unwrap_or(0.0);
+        let call_d = deltas.get(1).copied().unwrap_or(0.0);
+        let diff = fold_d - call_d;
+
+        total_fold += fold_d;
+        total_call += call_d;
+        count += 1;
+
+        // Print top 30 and bottom 30
+        if count <= 30 || results.len() - count < 30 {
+            print!("{:>6} {:>8.4} {:>12.2} {:>12.2} {:>12.2}",
+                opp_name, weight, fold_d, call_d, diff);
+            // Print remaining action deltas
+            for d in deltas.iter().skip(2) {
+                print!("  {:>10.2}", d);
+            }
+            println!();
+        } else if count == 31 {
+            println!("  ... ({} more opponents) ...", results.len() - 60);
+        }
+    }
+
+    println!("{}", "-".repeat(80));
+    println!("{:>6} {:>8} {:>12.2} {:>12.2} {:>12.2}",
+        "TOTAL", "", total_fold, total_call, total_fold - total_call);
+
+    println!("\nIf fold-call diff > 0, those opponents make fold look better than call.");
+    println!("If fold-call diff < 0, those opponents make call look better than fold.");
+
+    Ok(())
+}
+
+fn run_trace_terminals(
+    config_path: &Path,
+    hero_str: &str,
+    opp_str: &str,
+    history: &str,
+) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::info_key::canonical_hand_index_from_str;
+
+    let yaml = std::fs::read_to_string(config_path)?;
+    let training: PreflopTrainingConfig = serde_yaml::from_str(&yaml)?;
+
+    let postflop_model_path = training.postflop_model_path;
+    let config = training.game;
+
+    // Load equity
+    let cache_base = Path::new("cache/postflop");
+    let equity = if training.equity_samples > 0 {
+        use poker_solver_core::preflop::equity_cache;
+        equity_cache::load(cache_base, training.equity_samples)
+            .ok_or("Equity cache not found — run solve-preflop first to build it")?
+    } else {
+        EquityTable::new_uniform()
+    };
+
+    // Build solver
+    let tree = PreflopTree::build(&config);
+    let mut solver = PreflopSolver::new_with_equity(&config, equity);
+
+    // Load postflop model
+    let pf_config_yaml = std::fs::read_to_string(postflop_model_path.join("config.yaml"))?;
+    let pf_config: PostflopModelConfig = serde_yaml::from_str(&pf_config_yaml)?;
+    let abstractions = PostflopBundle::load_multi(&pf_config, &postflop_model_path)?;
+    solver.attach_postflop(abstractions, &config);
+
+    // Resolve hands
+    let hero_hand = canonical_hand_index_from_str(hero_str)
+        .ok_or_else(|| format!("Invalid hand: {hero_str}"))?;
+    let opp_hand = canonical_hand_index_from_str(opp_str)
+        .ok_or_else(|| format!("Invalid hand: {opp_str}"))?;
+
+    // Resolve target node
+    let actions: Vec<&str> = history.split(',').map(str::trim).collect();
+    let mut node_idx = 0u32;
+    for action_str in &actions {
+        node_idx = find_child_by_label(&tree, node_idx, action_str)
+            .ok_or_else(|| format!("Action '{}' not found at node {}", action_str, node_idx))?;
+    }
+
+    // Get hero position
+    let hero_pos = match &tree.nodes[node_idx as usize] {
+        PreflopNode::Decision { position, .. } => *position,
+        PreflopNode::Terminal { .. } => return Err("Target node is terminal".into()),
+    };
+
+    println!("Hero: {} (idx {}), Opp: {} (idx {})", hero_str, hero_hand, opp_str, opp_hand);
+    solver.dump_terminal_values(node_idx, hero_hand as u16, opp_hand as u16, hero_pos);
+
     Ok(())
 }

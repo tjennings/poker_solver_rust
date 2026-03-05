@@ -333,6 +333,199 @@ impl PreflopSolver {
         self.strategy_sum[start..start + num_actions].to_vec()
     }
 
+    /// Decompose regret contributions at a node for a hero hand, broken down by opponent.
+    ///
+    /// Returns a Vec of `(opp_hand, reach_opp, action_values, node_value)` for each
+    /// opponent hand that has nonzero reach at this node.
+    /// `hero_pos` is the hero's position (0=SB, 1=BB).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn decompose_regrets_at(
+        &self,
+        target_node: u32,
+        hero_hand: u16,
+        hero_pos: u8,
+    ) -> Vec<(u16, f64, Vec<f64>, f64)> {
+        let num_actions = match &self.tree.nodes[target_node as usize] {
+            PreflopNode::Decision { children, .. } => children.len(),
+            PreflopNode::Terminal { .. } => return vec![],
+        };
+
+        // Snapshot current regrets for strategy computation
+        let snapshot = self.regret_sum.clone();
+
+        let ctx = Ctx {
+            tree: &self.tree,
+            investments: &self.investments,
+            equity: &self.equity,
+            layout: &self.layout,
+            snapshot: &snapshot,
+            exploration: self.exploration,
+            iteration: self.iteration,
+            dcfr: &self.dcfr,
+            stacks: self.stacks,
+            postflop: self.postflop.as_ref(),
+        };
+
+        let mut results = Vec::new();
+
+        for opp_hand in 0..169u16 {
+            let w = self.equity.weight(hero_hand as usize, opp_hand as usize);
+            if w <= 0.0 { continue; }
+
+            // Compute reach_opp at target_node by traversing from root.
+            // For BB facing SB raise: reach_opp = w * SB_strategy[raise_action]
+            // We'll use a lightweight traversal to get action values at the target node.
+            let mut dr = vec![0.0f64; self.layout.total_size];
+            let mut ds = vec![0.0f64; self.layout.total_size];
+
+            // cfr_traverse convention: hero_hand = traversal hero's hand,
+            // opp_hand = opponent's hand. hero_pos tells which position is hero.
+            cfr_traverse(&ctx, &mut dr, &mut ds, 0, hero_hand, opp_hand, hero_pos, 1.0, w);
+
+            // Extract regret deltas at the target node for this hero hand
+            let (start, _) = self.layout.slot(target_node, hero_hand);
+            let deltas: Vec<f64> = dr[start..start + num_actions].to_vec();
+
+            // If all zeros, this opponent didn't contribute (zero reach)
+            if deltas.iter().all(|&d| d == 0.0) { continue; }
+
+            // The regret delta is: regret_weight * reach_opp * (action_val - node_val)
+            // We want action_val and node_val. The regret_weight and reach_opp are baked in.
+            // Recover reach_opp * regret_weight from the sum: Σ deltas = 0 (they cancel)
+            // Instead, compute action values directly from the deltas.
+            // delta[i] = rw * reach_opp * (v[i] - V). Sum of deltas = 0.
+            // We can extract the relative values but not absolute without more info.
+
+            // For now, just report the raw deltas which show the contribution to regret.
+            let node_contribution: f64 = deltas.iter().sum(); // should be ~0
+            results.push((opp_hand, w, deltas, node_contribution));
+        }
+
+        results
+    }
+
+    /// Dump terminal node values reachable from a decision node for a specific matchup.
+    ///
+    /// Walks the subtree from each child action of `node_idx` and prints
+    /// pot, investments, SPR, equity value, and model value at each terminal.
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+    pub fn dump_terminal_values(
+        &self,
+        node_idx: u32,
+        hero_hand: u16,
+        opp_hand: u16,
+        hero_pos: u8,
+    ) {
+        let (children, action_labels) = match &self.tree.nodes[node_idx as usize] {
+            PreflopNode::Decision { children, action_labels, .. } => {
+                (children.clone(), action_labels.clone())
+            }
+            PreflopNode::Terminal { .. } => {
+                eprintln!("Node {} is terminal", node_idx);
+                return;
+            }
+        };
+
+        let eq = self.equity.equity(hero_hand as usize, opp_hand as usize);
+        println!("Terminal values from node {} (hero_pos={}, eq={:.4}):", node_idx, hero_pos, eq);
+        println!("  stacks = {:?}", self.stacks);
+
+        for (i, (&child_idx, action)) in children.iter().zip(action_labels.iter()).enumerate() {
+            println!("\n  Action {}: {:?} → child node {}", i, action, child_idx);
+            self.walk_terminals(child_idx, hero_hand, opp_hand, hero_pos, eq, 2);
+        }
+    }
+
+    /// Recursively walk a subtree printing terminal node values.
+    #[allow(clippy::cast_precision_loss)]
+    fn walk_terminals(
+        &self,
+        node_idx: u32,
+        hero_hand: u16,
+        opp_hand: u16,
+        hero_pos: u8,
+        eq: f64,
+        depth: usize,
+    ) {
+        let indent = " ".repeat(depth * 2);
+        let inv = &self.investments[node_idx as usize];
+        let hero_inv = f64::from(inv[hero_pos as usize]);
+        let pot = inv[0] + inv[1];
+
+        match &self.tree.nodes[node_idx as usize] {
+            PreflopNode::Terminal { terminal_type, pot: tree_pot } => {
+                let pot_f = f64::from(*tree_pot);
+                let eq_value = eq * pot_f - hero_inv;
+
+                match terminal_type {
+                    TerminalType::Fold { folder } => {
+                        let val = if *folder == hero_pos { -hero_inv } else { pot_f - hero_inv };
+                        println!("{}TERMINAL node {} (Fold by p{}): pot={}, inv={:?}, val={:.2}",
+                            indent, node_idx, folder, tree_pot, inv, val);
+                    }
+                    TerminalType::Showdown => {
+                        // Compute SPR
+                        let opp_inv = pot_f - hero_inv;
+                        let hero_remaining = f64::from(self.stacks[hero_pos as usize]) - hero_inv;
+                        let opp_remaining = f64::from(self.stacks[1 - hero_pos as usize]) - opp_inv;
+                        let effective_remaining = hero_remaining.min(opp_remaining).max(0.0);
+                        let actual_spr = if *tree_pot > 0 { effective_remaining / pot_f } else { 0.0 };
+
+                        // Check raise count
+                        let raise_count = self.postflop.as_ref()
+                            .and_then(|pf| pf.raise_counts.get(node_idx as usize).copied())
+                            .unwrap_or(0);
+
+                        println!("{}SHOWDOWN node {} : pot={}, inv={:?}, hero_inv={:.0}, actual_spr={:.2}, raise_count={}",
+                            indent, node_idx, tree_pot, inv, hero_inv, actual_spr, raise_count);
+
+                        // Raw equity value
+                        println!("{}  eq_value = {:.4} * {:.0} - {:.0} = {:.2}",
+                            indent, eq, pot_f, hero_inv, eq_value);
+
+                        // Postflop model value if available
+                        if let Some(pf_state) = &self.postflop {
+                            if raise_count > 0 {
+                                let idx = select_closest_spr(
+                                    pf_state.abstractions.iter().map(|a| a.spr),
+                                    actual_spr,
+                                );
+                                let selected = &pf_state.abstractions[idx];
+                                let pf_ev_frac = selected.avg_ev(hero_pos, hero_hand as usize, opp_hand as usize);
+                                let model_value = pf_ev_frac * pot_f + (pot_f / 2.0 - hero_inv);
+                                let model_spr = selected.spr;
+
+                                println!("{}  model: spr={:.2}, pf_ev_frac={:.4}, model_value={:.2}",
+                                    indent, model_spr, pf_ev_frac, model_value);
+
+                                if model_spr > 0.0 && actual_spr < model_spr {
+                                    let ratio = actual_spr / model_spr;
+                                    let interp = eq_value + (model_value - eq_value) * ratio;
+                                    println!("{}  INTERPOLATED: ratio={:.4}, final={:.2} (eq={:.2}, model={:.2})",
+                                        indent, ratio, interp, eq_value, model_value);
+                                } else {
+                                    println!("{}  final = model_value = {:.2} (no interpolation, actual_spr >= model_spr)",
+                                        indent, model_value);
+                                }
+                            } else {
+                                println!("{}  LIMPED POT: using eq_value = {:.2}", indent, eq_value);
+                            }
+                        }
+                    }
+                }
+            }
+            PreflopNode::Decision { position, children, action_labels } => {
+                println!("{}DECISION node {} (p{} acts): inv={:?}, pot={}",
+                    indent, node_idx, position, inv, pot);
+                for (&child_idx, action) in children.iter().zip(action_labels.iter()) {
+                    println!("{}  → {:?} (child {})", indent, action, child_idx);
+                    self.walk_terminals(child_idx, hero_hand, opp_hand, hero_pos, eq, depth + 1);
+                }
+            }
+        }
+    }
+
     /// Average positive regret per slot.
     ///
     /// - **DCFR**: Uses the most recent iteration's instantaneous regret to avoid
