@@ -265,7 +265,7 @@ function ActionBlock({
         onClick={onHeaderClick}
       >
         <span className="position">{position}</span>
-        <span className="stack">{stack}BB</span>
+        <span className="stack">{Math.round(stack / 2)}BB</span>
       </div>
       <div className="action-list">
         {displayOrderActions(actions).map((action) => {
@@ -520,7 +520,7 @@ export default function Explorer() {
   const [comboInfo, setComboInfo] = useState<ComboGroupInfo | null>(null);
   const [handEquity, setHandEquity] = useState<HandEquity | null>(null);
   const [villainHand, setVillainHand] = useState('AA');
-  const [threshold, setThreshold] = useState(2);
+  const [threshold, _setThreshold] = useState(2);
   const [remapInfo, setRemapInfo] = useState<{
     original: string[];
     canonical: string[];
@@ -1005,35 +1005,15 @@ export default function Explorer() {
       {error && <div className="error">{error}</div>}
 
       {bundleInfo && (
-        <div className="bundle-info">
-          {bundleInfo.name && <span className="bundle-name">{bundleInfo.name}</span>}
-          <span>Stack: {bundleInfo.stack_depth}BB</span>
-          <span>Bet sizes: {bundleInfo.bet_sizes.map((s) => `${s * 100}%`).join(', ')}</span>
-          {bundleInfo.info_sets > 0 && (
-            <span>Info sets: {bundleInfo.info_sets.toLocaleString()}</span>
-          )}
-          {bundleInfo.iterations > 0 && (
-            <span>Iterations: {bundleInfo.iterations.toLocaleString()}</span>
-          )}
-          <span className="threshold-control">
-            Filter &lt;
-            <input
-              type="number"
-              className="threshold-input"
-              value={threshold}
-              onChange={(e) => setThreshold(Math.max(0, Math.min(50, Number(e.target.value))))}
-              min={0}
-              max={50}
-              step={1}
-            />
-            %
-          </span>
-        </div>
-      )}
-
-      {bundleInfo && (
         <>
           <div className="action-strip">
+            <div className="dataset-switcher" onClick={handleLoadDataset} title="Load Dataset">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                <line x1="12" y1="11" x2="12" y2="17" />
+                <line x1="9" y1="14" x2="15" y2="14" />
+              </svg>
+            </div>
             {historyItems.map((item, idx) =>
               item.type === 'action' ? (
                 <ActionBlock

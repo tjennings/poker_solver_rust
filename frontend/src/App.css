@@ -201,55 +201,26 @@ button:disabled {
   position: relative;
 }
 
-/* Bundle info bar */
-.bundle-info {
-  display: flex;
-  gap: 2rem;
-  padding: 0.5rem 1rem;
-  background: linear-gradient(135deg, #14142a 0%, #1a1a3a 100%);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
-  border-radius: 4px;
-  margin-bottom: 1rem;
-  font-size: 0.85rem;
-  color: #888;
-}
-
-.bundle-name {
-  font-weight: 600;
-  color: #00d9ff;
-}
-
-.threshold-control {
+/* Dataset switcher card in action strip */
+.dataset-switcher {
+  min-width: 40px;
+  max-width: 40px;
   display: flex;
   align-items: center;
-  gap: 0.25rem;
-  margin-left: auto;
-  color: #888;
-  font-size: 0.8rem;
+  justify-content: center;
+  background: linear-gradient(135deg, #12122a 0%, #18183a 100%);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 4px;
+  color: #555;
+  cursor: pointer;
+  transition: all 0.15s;
+  flex-shrink: 0;
 }
 
-.threshold-input {
-  width: 36px;
-  padding: 0.15rem 0.3rem;
-  font-size: 0.8rem;
-  background: #1a1a2e;
-  color: #eee;
-  border: 1px solid #333;
-  border-radius: 3px;
-  text-align: center;
-  -moz-appearance: textfield;
-}
-
-.threshold-input::-webkit-inner-spin-button,
-.threshold-input::-webkit-outer-spin-button {
-  -webkit-appearance: none;
-  margin: 0;
-}
-
-.threshold-input:focus {
-  outline: none;
+.dataset-switcher:hover {
+  color: #00d9ff;
   border-color: #00d9ff;
+  background: rgba(0, 217, 255, 0.05);
 }
 
 /* Street block (FLOP, TURN, RIVER) */
