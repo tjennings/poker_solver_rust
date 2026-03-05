@@ -81,10 +81,10 @@ function App() {
         ))}
       </nav>
       <main className="main-pane">
-        {view === 'explore' && <Explorer />}
-        {view === 'train' && <Train />}
-        {view === 'arena' && <Simulator />}
-        {view === 'settings' && <Settings />}
+        <div style={{ display: view === 'explore' ? undefined : 'none' }}><Explorer /></div>
+        <div style={{ display: view === 'train' ? undefined : 'none' }}><Train /></div>
+        <div style={{ display: view === 'arena' ? undefined : 'none' }}><Simulator /></div>
+        <div style={{ display: view === 'settings' ? undefined : 'none' }}><Settings /></div>
       </main>
     </div>
   );
