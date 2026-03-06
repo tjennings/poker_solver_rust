@@ -158,6 +158,8 @@ function CellDetail({
           const pct = prob.probability * 100;
           return (
             <div key={action.id} className="cell-detail-row">
+              <span className="cell-detail-label">{action.label}</span>
+              <span className="cell-detail-pct">{pct.toFixed(1)}%</span>
               <div className="cell-detail-bar-bg">
                 <div
                   className="cell-detail-bar-fill"
@@ -167,8 +169,6 @@ function CellDetail({
                   }}
                 />
               </div>
-              <span className="cell-detail-label">{action.label}</span>
-              <span className="cell-detail-pct">{pct.toFixed(1)}%</span>
             </div>
           );
         })}
