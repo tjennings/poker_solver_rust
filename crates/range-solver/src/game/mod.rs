@@ -1,3 +1,4 @@
+mod interpreter;
 mod node;
 
 use crate::action_tree::*;
@@ -12,7 +13,7 @@ use std::collections::BTreeMap;
 /// Hand-strength entry: pairs a strength rank with a hand index.
 ///
 /// Used in sorted order (ascending strength) to evaluate showdown equity.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct StrengthItem {
     pub(crate) strength: u16,
     pub(crate) index: u16,
@@ -129,14 +130,6 @@ pub struct PostFlopGame {
 
     // -- bunching effect (not yet implemented) --
     pub(crate) bunching_num_dead_cards: usize,
-    pub(crate) bunching_num_combinations: f64,
-    pub(crate) bunching_arena: Vec<f32>,
-    pub(crate) bunching_strength: Vec<[Vec<u16>; 2]>,
-    pub(crate) bunching_num_flop: [Vec<usize>; 2],
-    pub(crate) bunching_num_turn: [Vec<Vec<usize>>; 2],
-    pub(crate) bunching_num_river: [Vec<Vec<usize>>; 2],
-    pub(crate) bunching_coef_flop: [Vec<usize>; 2],
-    pub(crate) bunching_coef_turn: [Vec<Vec<usize>>; 2],
 
     // -- storage mode --
     pub(crate) storage_mode: BoardState,
@@ -198,8 +191,6 @@ mod tests {
         assert!(game.action_history.is_empty());
         assert!(game.node_history.is_empty());
         assert!(!game.is_normalized_weight_cached);
-        // Default u8 is 0; `turn` and `river` are set to meaningful values
-        // by `apply_history()` after tree construction, not by Default.
         assert_eq!(game.turn, 0);
         assert_eq!(game.river, 0);
         assert!(game.turn_swapped_suit.is_none());

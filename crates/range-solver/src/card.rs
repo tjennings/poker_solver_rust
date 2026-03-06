@@ -1,5 +1,7 @@
 use std::mem;
 
+use crate::game::StrengthItem;
+use crate::hand::Hand;
 use crate::range::Range;
 
 /// A type representing a card, defined as an alias of `u8`.
@@ -65,6 +67,164 @@ pub fn index_to_card_pair(index: usize) -> (Card, Card) {
 // ---------------------------------------------------------------------------
 // Character / string conversions
 // ---------------------------------------------------------------------------
+
+type PrivateCards = [Vec<(Card, Card)>; 2];
+type Indices = [Vec<u16>; 2];
+
+impl CardConfig {
+    /// Computes valid hand indices for each board runout.
+    ///
+    /// Returns `(flop_indices, turn_indices, river_indices)`:
+    /// - `flop_indices`: per-player indices not blocked by any board card beyond the flop
+    /// - `turn_indices`: indexed by turn card (0..52)
+    /// - `river_indices`: indexed by `card_pair_to_index(turn, river)` (0..1326)
+    pub(crate) fn valid_indices(
+        &self,
+        private_cards: &PrivateCards,
+    ) -> (Indices, Vec<Indices>, Vec<Indices>) {
+        let ret_flop = if self.turn == NOT_DEALT {
+            [
+                (0..private_cards[0].len() as u16).collect(),
+                (0..private_cards[1].len() as u16).collect(),
+            ]
+        } else {
+            Indices::default()
+        };
+
+        let mut ret_turn = vec![Indices::default(); 52];
+        for board in 0..52 {
+            if !self.flop.contains(&board)
+                && (self.turn == NOT_DEALT || self.turn == board)
+                && self.river == NOT_DEALT
+            {
+                ret_turn[board as usize] =
+                    Self::valid_indices_internal(private_cards, board, NOT_DEALT);
+            }
+        }
+
+        let mut ret_river = vec![Indices::default(); 52 * 51 / 2];
+        for board1 in 0..52 {
+            for board2 in board1 + 1..52 {
+                if !self.flop.contains(&board1)
+                    && !self.flop.contains(&board2)
+                    && (self.turn == NOT_DEALT || board1 == self.turn || board2 == self.turn)
+                    && (self.river == NOT_DEALT || board1 == self.river || board2 == self.river)
+                {
+                    let index = card_pair_to_index(board1, board2);
+                    ret_river[index] =
+                        Self::valid_indices_internal(private_cards, board1, board2);
+                }
+            }
+        }
+
+        (ret_flop, ret_turn, ret_river)
+    }
+
+    fn valid_indices_internal(
+        private_cards: &PrivateCards,
+        board1: Card,
+        board2: Card,
+    ) -> Indices {
+        let mut ret = [
+            Vec::with_capacity(private_cards[0].len()),
+            Vec::with_capacity(private_cards[1].len()),
+        ];
+
+        let mut board_mask: u64 = 0;
+        if board1 != NOT_DEALT {
+            board_mask |= 1 << board1;
+        }
+        if board2 != NOT_DEALT {
+            board_mask |= 1 << board2;
+        }
+
+        for player in 0..2 {
+            ret[player].extend(private_cards[player].iter().enumerate().filter_map(
+                |(index, &(c1, c2))| {
+                    let hand_mask: u64 = (1 << c1) | (1 << c2);
+                    if hand_mask & board_mask == 0 {
+                        Some(index as u16)
+                    } else {
+                        None
+                    }
+                },
+            ));
+            ret[player].shrink_to_fit();
+        }
+
+        ret
+    }
+
+    /// Computes per-runout hand strength arrays for showdown evaluation.
+    ///
+    /// Returns a `Vec` indexed by `card_pair_to_index(turn, river)`. Each entry
+    /// is a `[Vec<StrengthItem>; 2]` containing sorted (ascending) strength
+    /// items for each player, bracketed by sentinel items at both ends.
+    pub(crate) fn hand_strength(
+        &self,
+        private_cards: &PrivateCards,
+    ) -> Vec<[Vec<StrengthItem>; 2]> {
+        let mut ret = vec![Default::default(); 52 * 51 / 2];
+
+        let mut board = Hand::new();
+        for &card in &self.flop {
+            board = board.add_card(card as usize);
+        }
+
+        for board1 in 0..52 {
+            for board2 in board1 + 1..52 {
+                if !board.contains(board1 as usize)
+                    && !board.contains(board2 as usize)
+                    && (self.turn == NOT_DEALT || board1 == self.turn || board2 == self.turn)
+                    && (self.river == NOT_DEALT || board1 == self.river || board2 == self.river)
+                {
+                    let full_board = board.add_card(board1 as usize).add_card(board2 as usize);
+                    let mut strength = [
+                        Vec::with_capacity(private_cards[0].len() + 2),
+                        Vec::with_capacity(private_cards[1].len() + 2),
+                    ];
+
+                    for player in 0..2 {
+                        // Sentinel: weakest possible
+                        strength[player].push(StrengthItem {
+                            strength: 0,
+                            index: 0,
+                        });
+                        // Sentinel: strongest possible
+                        strength[player].push(StrengthItem {
+                            strength: u16::MAX,
+                            index: u16::MAX,
+                        });
+
+                        strength[player].extend(
+                            private_cards[player].iter().enumerate().filter_map(
+                                |(index, &(c1, c2))| {
+                                    let (c1, c2) = (c1 as usize, c2 as usize);
+                                    if full_board.contains(c1) || full_board.contains(c2) {
+                                        None
+                                    } else {
+                                        let hand = full_board.add_card(c1).add_card(c2);
+                                        Some(StrengthItem {
+                                            strength: hand.evaluate() + 1,
+                                            index: index as u16,
+                                        })
+                                    }
+                                },
+                            ),
+                        );
+
+                        strength[player].shrink_to_fit();
+                        strength[player].sort_unstable();
+                    }
+
+                    ret[card_pair_to_index(board1, board2)] = strength;
+                }
+            }
+        }
+
+        ret
+    }
+}
 
 /// Attempts to convert a rank character to a rank index.
 ///
