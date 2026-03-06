@@ -5,7 +5,7 @@ status: in-progress
 type: epic
 priority: normal
 created_at: 2026-03-06T08:21:33Z
-updated_at: 2026-03-06T09:51:49Z
+updated_at: 2026-03-06T13:05:47Z
 ---
 
 Full-game MCCFR solver training all 4 streets with potential-aware clustering.
@@ -43,4 +43,4 @@ Plan: docs/plans/2026-03-06-blueprint-v2-plan.md
 - [x] Task 17: Sample configs
 
 ### Phase 6: E2E
-- [ ] Task 18: E2E test
+- [x] Task 18: E2E test
