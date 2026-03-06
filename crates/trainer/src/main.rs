@@ -449,6 +449,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             node_idx,
                             grid: blueprint_tui_widgets::HandGridState {
                                 cells: grid,
+                                prev_cells: None,
                                 scenario_name: sc.name.clone(),
                                 action_path: sc.actions.clone(),
                                 board_display: sc
@@ -464,6 +465,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                     })
                     .collect();
+
+                // Wire strategy refresh callback from trainer to TUI metrics.
+                let scenarios_node_indices: Vec<u32> =
+                    scenarios.iter().map(|s| s.node_idx).collect();
+                trainer.scenario_node_indices = scenarios_node_indices;
+                trainer.strategy_refresh_interval_secs =
+                    tui_config.telemetry.strategy_delta_interval_seconds;
+
+                let metrics_for_refresh = Arc::clone(&metrics);
+                trainer.on_strategy_refresh =
+                    Some(Box::new(move |scenario_idx, node_idx, storage| {
+                        let probs = storage.average_strategy(node_idx, 0);
+                        metrics_for_refresh.update_scenario_strategy(scenario_idx, probs);
+                    }));
 
                 let refresh_ms = tui_config.refresh_rate_ms;
                 let refresh = Duration::from_millis(refresh_ms);

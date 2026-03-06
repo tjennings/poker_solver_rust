@@ -93,6 +93,17 @@ pub struct BlueprintTrainer {
     pub quit_requested: Arc<AtomicBool>,
     /// One-shot trigger: the TUI sets this to request an immediate snapshot.
     pub snapshot_trigger: Arc<AtomicBool>,
+
+    // --- TUI strategy refresh ---
+    /// Seconds between strategy refresh pushes to TUI.
+    pub strategy_refresh_interval_secs: u64,
+    /// Node indices for scenarios to refresh.
+    pub scenario_node_indices: Vec<u32>,
+    /// Callback to push strategy data to TUI metrics.
+    /// Args: (scenario_index, node_idx, &BlueprintStorage)
+    pub on_strategy_refresh: Option<Box<dyn Fn(usize, u32, &BlueprintStorage) + Send>>,
+    /// Last time (in seconds) a strategy refresh was performed.
+    last_strategy_refresh_secs: u64,
 }
 
 impl BlueprintTrainer {
@@ -152,6 +163,10 @@ impl BlueprintTrainer {
             paused: Arc::new(AtomicBool::new(false)),
             quit_requested: Arc::new(AtomicBool::new(false)),
             snapshot_trigger: Arc::new(AtomicBool::new(false)),
+            strategy_refresh_interval_secs: 30,
+            scenario_node_indices: Vec::new(),
+            on_strategy_refresh: None,
+            last_strategy_refresh_secs: 0,
         }
     }
 
@@ -306,6 +321,20 @@ impl BlueprintTrainer {
                     >= self.last_snapshot_time + self.config.snapshots.snapshot_every_minutes)
         {
             self.save_snapshot()?;
+        }
+
+        // Strategy refresh for TUI.
+        // An interval of 0 means refresh on every check.
+        let elapsed_secs = self.start_time.elapsed().as_secs();
+        if elapsed_secs
+            >= self.last_strategy_refresh_secs + self.strategy_refresh_interval_secs
+        {
+            if let Some(ref callback) = self.on_strategy_refresh {
+                for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
+                    callback(i, node_idx, &self.storage);
+                }
+            }
+            self.last_strategy_refresh_secs = elapsed_secs;
         }
 
         Ok(())
