@@ -5,6 +5,7 @@ pub mod config;
 pub mod game_tree;
 pub mod mccfr;
 pub mod storage;
+pub mod trainer;
 
 use serde::{Deserialize, Serialize};
 
