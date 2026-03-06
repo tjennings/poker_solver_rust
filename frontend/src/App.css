@@ -562,6 +562,8 @@ button:disabled {
   overflow: hidden;
   aspect-ratio: 1;
   max-height: 100%;
+  flex: 1;
+  min-width: 0;
 }
 
 .matrix-row {
