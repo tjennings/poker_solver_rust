@@ -208,6 +208,51 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// Solve a postflop spot with exact (no abstraction) DCFR
+    RangeSolve {
+        /// OOP player's range (PioSOLVER format, e.g. "QQ+,AKs,AKo")
+        #[arg(long)]
+        oop_range: String,
+        /// IP player's range
+        #[arg(long)]
+        ip_range: String,
+        /// Flop cards (e.g. "Qs Jh 2c")
+        #[arg(long)]
+        flop: String,
+        /// Turn card (optional, e.g. "8d")
+        #[arg(long)]
+        turn: Option<String>,
+        /// River card (optional, e.g. "3s")
+        #[arg(long)]
+        river: Option<String>,
+        /// Starting pot size
+        #[arg(long, default_value = "100")]
+        pot: i32,
+        /// Effective stack size
+        #[arg(long, default_value = "100")]
+        effective_stack: i32,
+        /// Maximum iterations
+        #[arg(long, default_value = "1000")]
+        iterations: u32,
+        /// Target exploitability (stops early if reached)
+        #[arg(long, default_value = "0.5")]
+        target_exploitability: f32,
+        /// OOP bet sizes (comma-separated, e.g. "50%,100%,a")
+        #[arg(long, default_value = "50%,100%")]
+        oop_bet_sizes: String,
+        /// OOP raise sizes
+        #[arg(long, default_value = "60%,100%")]
+        oop_raise_sizes: String,
+        /// IP bet sizes
+        #[arg(long, default_value = "50%,100%")]
+        ip_bet_sizes: String,
+        /// IP raise sizes
+        #[arg(long, default_value = "60%,100%")]
+        ip_raise_sizes: String,
+        /// Use 16-bit compressed storage
+        #[arg(long)]
+        compressed: bool,
+    },
 }
 
 /// Output format for the flops command.
@@ -442,6 +487,39 @@ fn main() -> Result<(), Box<dyn Error>> {
             )?;
 
             eprintln!("\nClustering complete. Files saved to {}", output.display());
+        }
+        Commands::RangeSolve {
+            oop_range,
+            ip_range,
+            flop,
+            turn,
+            river,
+            pot,
+            effective_stack,
+            iterations,
+            target_exploitability,
+            oop_bet_sizes,
+            oop_raise_sizes,
+            ip_bet_sizes,
+            ip_raise_sizes,
+            compressed,
+        } => {
+            run_range_solve(
+                &oop_range,
+                &ip_range,
+                &flop,
+                turn.as_deref(),
+                river.as_deref(),
+                pot,
+                effective_stack,
+                iterations,
+                target_exploitability,
+                &oop_bet_sizes,
+                &oop_raise_sizes,
+                &ip_bet_sizes,
+                &ip_raise_sizes,
+                compressed,
+            )?;
         }
     }
 
@@ -1758,4 +1836,184 @@ fn run_trace_terminals(
     solver.dump_terminal_values(node_idx, hero_hand as u16, opp_hand as u16, hero_pos);
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Range solver
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn run_range_solve(
+    oop_range_str: &str,
+    ip_range_str: &str,
+    flop_str: &str,
+    turn_str: Option<&str>,
+    river_str: Option<&str>,
+    pot: i32,
+    effective_stack: i32,
+    iterations: u32,
+    target_exploitability: f32,
+    oop_bet_str: &str,
+    oop_raise_str: &str,
+    ip_bet_str: &str,
+    ip_raise_str: &str,
+    compressed: bool,
+) -> Result<(), Box<dyn Error>> {
+    use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
+    use range_solver::bet_size::BetSizeOptions;
+    use range_solver::card::{card_from_str, flop_from_str, hole_to_string, CardConfig, NOT_DEALT};
+    use range_solver::range::Range;
+    use range_solver::{solve, PostFlopGame};
+
+    // --- Parse inputs ---
+    let oop_range: Range = oop_range_str
+        .parse()
+        .map_err(|e: String| format!("Invalid OOP range: {e}"))?;
+    let ip_range: Range = ip_range_str
+        .parse()
+        .map_err(|e: String| format!("Invalid IP range: {e}"))?;
+
+    let flop = flop_from_str(flop_str).map_err(|e| format!("Invalid flop: {e}"))?;
+
+    let turn = match turn_str {
+        Some(s) => card_from_str(s).map_err(|e| format!("Invalid turn card: {e}"))?,
+        None => NOT_DEALT,
+    };
+
+    let river = match river_str {
+        Some(s) => card_from_str(s).map_err(|e| format!("Invalid river card: {e}"))?,
+        None => NOT_DEALT,
+    };
+
+    // Determine initial board state
+    let initial_state = if river != NOT_DEALT {
+        BoardState::River
+    } else if turn != NOT_DEALT {
+        BoardState::Turn
+    } else {
+        BoardState::Flop
+    };
+
+    // Parse bet sizes
+    let oop_sizes = BetSizeOptions::try_from((oop_bet_str, oop_raise_str))
+        .map_err(|e| format!("Invalid OOP bet sizes: {e}"))?;
+    let ip_sizes = BetSizeOptions::try_from((ip_bet_str, ip_raise_str))
+        .map_err(|e| format!("Invalid IP bet sizes: {e}"))?;
+
+    // --- Build game ---
+    let card_config = CardConfig {
+        range: [oop_range, ip_range],
+        flop,
+        turn,
+        river,
+    };
+
+    let tree_config = TreeConfig {
+        initial_state,
+        starting_pot: pot,
+        effective_stack,
+        flop_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
+        turn_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
+        river_bet_sizes: [oop_sizes, ip_sizes],
+        add_allin_threshold: 1.5,
+        force_allin_threshold: 0.15,
+        merging_threshold: 0.1,
+        ..Default::default()
+    };
+
+    let action_tree =
+        ActionTree::new(tree_config).map_err(|e| format!("Failed to build action tree: {e}"))?;
+
+    let mut game = PostFlopGame::with_config(card_config, action_tree)
+        .map_err(|e| format!("Failed to build game: {e}"))?;
+
+    // --- Print game info ---
+    let (mem_uncompressed, mem_compressed) = game.memory_usage();
+    let mem = if compressed {
+        mem_compressed
+    } else {
+        mem_uncompressed
+    };
+    eprintln!("Range Solver (Discounted CFR)");
+    eprintln!("  Board: {flop_str}{}", format_board_suffix(turn_str, river_str));
+    eprintln!("  Initial state: {initial_state}");
+    eprintln!("  Pot: {pot}, Effective stack: {effective_stack}");
+    eprintln!(
+        "  OOP hands: {}, IP hands: {}",
+        game.private_cards(0).len(),
+        game.private_cards(1).len(),
+    );
+    eprintln!("  Memory: {:.1} MB", mem as f64 / (1024.0 * 1024.0));
+    eprintln!(
+        "  Compression: {}",
+        if compressed { "enabled" } else { "disabled" }
+    );
+    eprintln!();
+
+    // --- Allocate and solve ---
+    game.allocate_memory(compressed);
+
+    let start = Instant::now();
+    let exploitability = solve(&mut game, iterations, target_exploitability, true);
+    let elapsed = start.elapsed();
+
+    eprintln!();
+    eprintln!(
+        "Solved in {:.2}s ({} iterations)",
+        elapsed.as_secs_f64(),
+        iterations,
+    );
+    eprintln!("Final exploitability: {exploitability:.4}");
+    eprintln!();
+
+    // --- Print root actions and strategy summary ---
+    game.back_to_root();
+    let actions = game.available_actions();
+    let player = game.current_player();
+    let hands = game.private_cards(player);
+    let strategy = game.strategy();
+    let num_hands = hands.len();
+    let num_actions = actions.len();
+
+    println!("Root node: {} to act ({num_actions} actions, {num_hands} hands)",
+        if player == 0 { "OOP" } else { "IP" });
+    println!();
+
+    // Print header
+    print!("{:<10}", "Hand");
+    for action in &actions {
+        print!("  {:>10}", action.to_string());
+    }
+    println!();
+
+    // Print per-hand strategy (limit to first 30 hands for readability)
+    let display_count = num_hands.min(30);
+    for h in 0..display_count {
+        let hand_str = hole_to_string(hands[h]).unwrap_or_else(|_| "??".to_string());
+        print!("{:<10}", hand_str);
+        for a in 0..num_actions {
+            let prob = strategy[a * num_hands + h];
+            print!("  {:>10.1}%", prob * 100.0);
+        }
+        println!();
+    }
+
+    if num_hands > display_count {
+        println!("... and {} more hands", num_hands - display_count);
+    }
+
+    Ok(())
+}
+
+fn format_board_suffix(turn: Option<&str>, river: Option<&str>) -> String {
+    let mut s = String::new();
+    if let Some(t) = turn {
+        s.push(' ');
+        s.push_str(t);
+    }
+    if let Some(r) = river {
+        s.push(' ');
+        s.push_str(r);
+    }
+    s
 }
