@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rand::prelude::*;
-use rand::rngs::StdRng;
+use rand::rngs::{SmallRng, StdRng};
+use rayon::prelude::*;
 
 use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
@@ -176,6 +177,8 @@ impl BlueprintTrainer {
     ///
     /// Returns an error if a snapshot write fails.
     pub fn train(&mut self) -> Result<(), Box<dyn Error>> {
+        let batch_size = self.config.training.batch_size;
+
         while !self.should_stop() {
             // Honour pause requests from the TUI.
             while self.paused.load(Ordering::Relaxed) {
@@ -185,37 +188,42 @@ impl BlueprintTrainer {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
 
-            let deal = self.sample_deal();
+            // Calculate how many iterations remain (respect iteration limit).
+            let remaining = self
+                .config
+                .training
+                .iterations
+                .map(|max| max.saturating_sub(self.iterations))
+                .unwrap_or(batch_size);
+            let this_batch = batch_size.min(remaining);
+            if this_batch == 0 {
+                break;
+            }
+
+            // 1. Generate batch of deals (sequential, fast).
+            let deals: Vec<Deal> = (0..this_batch).map(|_| self.sample_deal()).collect();
+
             let prune = self.should_prune();
             let threshold = self.config.training.prune_threshold;
 
-            // Traverse as player 0.
-            traverse_external(
-                &self.tree,
-                &mut self.storage,
-                &self.buckets,
-                &deal,
-                0,
-                self.tree.root,
-                prune,
-                threshold,
-                &mut self.rng,
-            );
+            // 2. Parallel traversal.
+            let tree = &self.tree;
+            let storage = &self.storage;
+            let buckets = &self.buckets;
 
-            // Traverse as player 1.
-            traverse_external(
-                &self.tree,
-                &mut self.storage,
-                &self.buckets,
-                &deal,
-                1,
-                self.tree.root,
-                prune,
-                threshold,
-                &mut self.rng,
-            );
+            deals.par_iter().for_each(|deal| {
+                let mut rng = SmallRng::from_os_rng();
 
-            self.iterations += 1;
+                traverse_external(
+                    tree, storage, buckets, deal, 0, tree.root, prune, threshold, &mut rng,
+                );
+                traverse_external(
+                    tree, storage, buckets, deal, 1, tree.root, prune, threshold, &mut rng,
+                );
+            });
+
+            // 3. Sequential: update counters and check timed actions.
+            self.iterations += this_batch;
             self.shared_iterations
                 .store(self.iterations, Ordering::Relaxed);
             self.check_timed_actions()?;
@@ -349,11 +357,13 @@ impl BlueprintTrainer {
         let t = elapsed_min / interval;
         let d = t as f64 / (t as f64 + 1.0);
 
-        for r in &mut self.storage.regrets {
-            *r = (f64::from(*r) * d) as i32;
+        for atom in &self.storage.regrets {
+            let v = atom.load(Ordering::Relaxed);
+            atom.store((f64::from(v) * d) as i32, Ordering::Relaxed);
         }
-        for s in &mut self.storage.strategy_sums {
-            *s = (*s as f64 * d) as i64;
+        for atom in &self.storage.strategy_sums {
+            let v = atom.load(Ordering::Relaxed);
+            atom.store((v as f64 * d) as i64, Ordering::Relaxed);
         }
 
         self.last_discount_time = elapsed_min;
@@ -387,7 +397,8 @@ impl BlueprintTrainer {
             .storage
             .regrets
             .iter()
-            .fold((0.0_f64, 0_u64), |(s, c), &r| {
+            .fold((0.0_f64, 0_u64), |(s, c), atom| {
+                let r = atom.load(Ordering::Relaxed);
                 if r > 0 {
                     (s + f64::from(r), c + 1)
                 } else {
@@ -436,6 +447,8 @@ impl BlueprintTrainer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::blueprint_v2::config::*;
 
@@ -524,12 +537,20 @@ mod tests {
         config.training.iterations = Some(20);
         let mut trainer = BlueprintTrainer::new(config);
 
-        assert!(trainer.storage.regrets.iter().all(|&r| r == 0));
+        assert!(trainer
+            .storage
+            .regrets
+            .iter()
+            .all(|r| r.load(Ordering::Relaxed) == 0));
 
         trainer.train().expect("training should complete");
 
         assert!(
-            trainer.storage.regrets.iter().any(|&r| r != 0),
+            trainer
+                .storage
+                .regrets
+                .iter()
+                .any(|r| r.load(Ordering::Relaxed) != 0),
             "regrets should be updated after training"
         );
     }
@@ -537,7 +558,7 @@ mod tests {
     #[test]
     fn mean_positive_regret_initially_zero() {
         let config = toy_config();
-        let mut trainer = BlueprintTrainer::new(config);
+        let trainer = BlueprintTrainer::new(config);
 
         assert!(
             (trainer.mean_positive_regret() - 0.0).abs() < 1e-10,
@@ -545,9 +566,9 @@ mod tests {
         );
 
         if trainer.storage.regrets.len() >= 3 {
-            trainer.storage.regrets[0] = 100;
-            trainer.storage.regrets[1] = -50;
-            trainer.storage.regrets[2] = 200;
+            trainer.storage.regrets[0].store(100, Ordering::Relaxed);
+            trainer.storage.regrets[1].store(-50, Ordering::Relaxed);
+            trainer.storage.regrets[2].store(200, Ordering::Relaxed);
         }
 
         let mean = trainer.mean_positive_regret();
@@ -559,14 +580,17 @@ mod tests {
         let config = toy_config();
         let mut trainer = BlueprintTrainer::new(config);
 
-        trainer.storage.regrets[0] = 1000;
-        trainer.storage.strategy_sums[0] = 2000;
+        trainer.storage.regrets[0].store(1000, Ordering::Relaxed);
+        trainer.storage.strategy_sums[0].store(2000, Ordering::Relaxed);
 
         // t = elapsed_min / interval = 0 / 1 = 0, so d = 0/(0+1) = 0.
         trainer.apply_lcfr_discount();
 
-        assert_eq!(trainer.storage.regrets[0], 0);
-        assert_eq!(trainer.storage.strategy_sums[0], 0);
+        assert_eq!(trainer.storage.regrets[0].load(Ordering::Relaxed), 0);
+        assert_eq!(
+            trainer.storage.strategy_sums[0].load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -584,5 +608,45 @@ mod tests {
         assert!(snapshot_dir.join("strategy.bin").exists());
         assert!(snapshot_dir.join("regrets.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
+    }
+
+    #[test]
+    fn train_batch_iterations() {
+        let mut config = toy_config();
+        config.training.iterations = Some(50);
+        config.training.batch_size = 10;
+        let mut trainer = BlueprintTrainer::new(config);
+        trainer.train().expect("training should complete");
+        assert_eq!(trainer.iterations, 50);
+    }
+
+    #[test]
+    fn parallel_batch_produces_regret_updates() {
+        let mut config = toy_config();
+        config.training.iterations = Some(200);
+        config.training.batch_size = 50;
+        let mut trainer = BlueprintTrainer::new(config);
+        trainer.train().expect("training should complete");
+        assert_eq!(trainer.iterations, 200);
+        assert!(trainer
+            .storage
+            .regrets
+            .iter()
+            .any(|r| r.load(Ordering::Relaxed) != 0));
+        assert!(trainer
+            .storage
+            .strategy_sums
+            .iter()
+            .any(|s| s.load(Ordering::Relaxed) != 0));
+    }
+
+    #[test]
+    fn batch_size_larger_than_iterations() {
+        let mut config = toy_config();
+        config.training.iterations = Some(10);
+        config.training.batch_size = 200;
+        let mut trainer = BlueprintTrainer::new(config);
+        trainer.train().expect("training should complete");
+        assert_eq!(trainer.iterations, 10);
     }
 }
