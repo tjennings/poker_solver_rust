@@ -5,7 +5,7 @@ status: in-progress
 type: epic
 priority: normal
 created_at: 2026-03-06T08:21:33Z
-updated_at: 2026-03-06T09:22:05Z
+updated_at: 2026-03-06T09:37:43Z
 ---
 
 Full-game MCCFR solver training all 4 streets with potential-aware clustering.
@@ -24,7 +24,7 @@ Plan: docs/plans/2026-03-06-blueprint-v2-plan.md
 - [x] Task 4: River clustering
 - [x] Task 5: Turn clustering
 - [x] Task 6: Flop clustering
-- [ ] Task 7: Preflop clustering
+- [x] Task 7: Preflop clustering
 - [ ] Task 8: Cluster CLI
 - [ ] Task 9: Cluster diagnostics
 
