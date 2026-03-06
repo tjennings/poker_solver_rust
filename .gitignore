@@ -37,3 +37,6 @@ cache/
 
 # Cloud local config
 cloud/config.local.sh
+
+# External solver symlinks (for comparison tests)
+external/
