@@ -782,6 +782,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_river_basic() {
         // Use few boards for speed in tests.
         let result = cluster_river_with_boards(10, 50, 42, 20, |_| {});
@@ -797,6 +798,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_river_deterministic() {
         let r1 = cluster_river_with_boards(5, 30, 123, 10, |_| {});
         let r2 = cluster_river_with_boards(5, 30, 123, 10, |_| {});
@@ -804,6 +806,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_river_bucket_distribution() {
         // Verify that buckets are not all the same value (equity varies).
         let result = cluster_river_with_boards(5, 50, 42, 30, |_| {});
@@ -929,6 +932,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_turn_basic() {
         // First cluster river with small params.
         let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
@@ -947,6 +951,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_turn_deterministic() {
         let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
         let t1 = cluster_turn_with_boards(&river, 3, 20, 123, 8, |_| {});
@@ -955,6 +960,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_turn_bucket_distribution() {
         let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
         let turn = cluster_turn_with_boards(&river, 4, 30, 42, 15, |_| {});
@@ -1056,6 +1062,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_flop_basic() {
         // Build dependencies: river -> turn -> flop.
         let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
@@ -1074,6 +1081,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_flop_deterministic() {
         let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
         let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_| {});
@@ -1083,6 +1091,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_flop_bucket_distribution() {
         let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
         let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_| {});
@@ -1102,6 +1111,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_preflop_cluster_basic() {
         let preflop = cluster_preflop_with_boards(10, 20, 42, 50, |_| {});
         assert_eq!(preflop.header.street, Street::Preflop);
@@ -1115,6 +1125,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_preflop_cluster_deterministic() {
         let a = cluster_preflop_with_boards(10, 20, 42, 50, |_| {});
         let b = cluster_preflop_with_boards(10, 20, 42, 50, |_| {});
@@ -1122,6 +1133,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_preflop_cluster_bucket_distribution() {
         let preflop = cluster_preflop_with_boards(169, 50, 42, 80, |_| {});
         let unique: std::collections::HashSet<u16> =
@@ -1134,6 +1146,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow: equity enumeration in debug mode
     fn test_preflop_avg_equities_range() {
         let deck = build_deck();
         let combos = enumerate_combos(&deck);

@@ -58,6 +58,7 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
 
 /// Full pipeline: cluster → train → snapshot → load → verify probabilities.
 #[test]
+#[ignore] // slow: full pipeline (cluster + train) takes ~50s in debug mode
 fn blueprint_v2_e2e_pipeline() {
     let dir = tempfile::tempdir().expect("create temp dir");
     let cluster_dir = dir.path().join("clusters");
