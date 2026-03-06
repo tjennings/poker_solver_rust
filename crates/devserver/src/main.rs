@@ -36,7 +36,6 @@ struct BlueprintPathParams {
 #[derive(Deserialize)]
 struct StrategyMatrixParams {
     position: poker_solver_tauri::ExplorationPosition,
-    threshold: Option<f32>,
     street_histories: Option<Vec<Vec<String>>>,
 }
 
@@ -134,7 +133,6 @@ async fn handle_get_strategy_matrix(
     result_to_response(poker_solver_tauri::get_strategy_matrix_core(
         &state,
         params.position,
-        params.threshold,
         params.street_histories,
     ))
 }

@@ -133,8 +133,6 @@ pub struct MatrixCell {
     pub pair: bool,
     /// Action probabilities (fold, check/call, bets/raises...)
     pub probabilities: Vec<ActionProb>,
-    /// Whether this hand was filtered out by the range threshold.
-    pub filtered: bool,
 }
 
 /// An action with its probability.
@@ -165,6 +163,10 @@ pub struct StrategyMatrix {
     pub stack_p2: u32,
     /// Per-player stacks (N-player generalized)
     pub stacks: Vec<u32>,
+    /// Reaching probability for player 1 (SB). Length 169, indexed by `CanonicalHand::index()`.
+    pub reaching_p1: Vec<f64>,
+    /// Reaching probability for player 2 (BB). Length 169, indexed by `CanonicalHand::index()`.
+    pub reaching_p2: Vec<f64>,
 }
 
 /// Information about an available action.
@@ -480,13 +482,12 @@ pub async fn load_subgame_source(
 
 /// Get the strategy matrix for a given position (core logic, no Tauri dependency).
 ///
-/// `threshold` filters out hands whose prior action probabilities fell below
-/// this value (range narrowing).  `street_histories` supplies the action
-/// sequences of all completed streets so the filter can replay the game.
+/// `street_histories` supplies the action sequences of all completed streets
+/// so that `compute_reaching_range` can replay the game and return cumulative
+/// reaching probabilities for each canonical hand.
 pub fn get_strategy_matrix_core(
     state: &ExplorationState,
     position: ExplorationPosition,
-    threshold: Option<f32>,
     street_histories: Option<Vec<Vec<String>>>,
 ) -> Result<StrategyMatrix, String> {
     let source_guard = state.source.read();
@@ -495,11 +496,10 @@ pub fn get_strategy_matrix_core(
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
     let sh = street_histories.unwrap_or_default();
-    let thresh = threshold.unwrap_or(0.0);
 
     match source {
         StrategySource::Bundle { config, blueprint } => {
-            get_strategy_matrix_bundle(config, blueprint, state, &position, thresh, &sh)
+            get_strategy_matrix_bundle(config, blueprint, state, &position, &sh)
         }
         StrategySource::Agent(agent) => get_strategy_matrix_agent(agent, &position),
         StrategySource::PreflopSolve { config, strategy, .. } => {
@@ -514,7 +514,6 @@ pub fn get_strategy_matrix_core(
             blueprint,
             state,
             &position,
-            thresh,
             &sh,
         ),
     }
@@ -525,10 +524,9 @@ pub fn get_strategy_matrix_core(
 pub fn get_strategy_matrix(
     state: State<'_, ExplorationState>,
     position: ExplorationPosition,
-    threshold: Option<f32>,
     street_histories: Option<Vec<Vec<String>>>,
 ) -> Result<StrategyMatrix, String> {
-    get_strategy_matrix_core(&state, position, threshold, street_histories)
+    get_strategy_matrix_core(&state, position, street_histories)
 }
 
 fn get_strategy_matrix_bundle(
@@ -536,7 +534,6 @@ fn get_strategy_matrix_bundle(
     blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
     state: &ExplorationState,
     position: &ExplorationPosition,
-    threshold: f32,
     street_histories: &[Vec<String>],
 ) -> Result<StrategyMatrix, String> {
     let board = parse_board(&position.board)?;
@@ -562,31 +559,30 @@ fn get_strategy_matrix_bundle(
             None
         };
 
-    // Range filtering: only for hand_class bundles with a positive threshold
-    let apply_filter = use_hand_class && threshold > 0.0;
+    // Compute reaching probabilities for both players
+    let reaching_p1 = compute_reaching_range(
+        config,
+        blueprint,
+        &board,
+        street_histories,
+        &position.history,
+        0,
+    );
+    let reaching_p2 = compute_reaching_range(
+        config,
+        blueprint,
+        &board,
+        street_histories,
+        &position.history,
+        1,
+    );
 
     for (row, &rank1) in ranks.iter().enumerate() {
         let mut row_cells = Vec::with_capacity(13);
         for (col, &rank2) in ranks.iter().enumerate() {
             let (hand_label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
 
-            let filtered = apply_filter
-                && !is_hand_in_range(
-                    config,
-                    blueprint,
-                    &board,
-                    street_histories,
-                    &position.history,
-                    position.to_act,
-                    threshold,
-                    rank1,
-                    rank2,
-                    suited,
-                );
-
-            let probabilities = if filtered {
-                vec![]
-            } else {
+            let probabilities = {
                 let hand_bits = if mode == AbstractionModeConfig::HandClassV2 {
                     hand_bits_hand_class_v2(config, street, &board, rank1, rank2, suited)
                 } else {
@@ -608,7 +604,6 @@ fn get_strategy_matrix_bundle(
                 suited,
                 pair,
                 probabilities,
-                filtered,
             });
         }
         cells.push(row_cells);
@@ -628,6 +623,8 @@ fn get_strategy_matrix_bundle(
         stack_p1: pos_state.stack_p1,
         stack_p2: pos_state.stack_p2,
         stacks: vec![pos_state.stack_p1, pos_state.stack_p2],
+        reaching_p1: reaching_p1.to_vec(),
+        reaching_p2: reaching_p2.to_vec(),
     })
 }
 
@@ -665,7 +662,6 @@ fn get_strategy_matrix_agent(
                 suited,
                 pair,
                 probabilities,
-                filtered: false,
             });
         }
         cells.push(row_cells);
@@ -687,6 +683,8 @@ fn get_strategy_matrix_agent(
         stack_p1: pos_state.stack_p1,
         stack_p2: pos_state.stack_p2,
         stacks: vec![pos_state.stack_p1, pos_state.stack_p2],
+        reaching_p1: vec![1.0; 169],
+        reaching_p2: vec![1.0; 169],
     })
 }
 
@@ -747,7 +745,6 @@ fn get_strategy_matrix_preflop(
                 suited,
                 pair,
                 probabilities,
-                filtered: false,
             });
         }
         cells.push(row_cells);
@@ -763,6 +760,8 @@ fn get_strategy_matrix_preflop(
         stack_p1: walk.stacks.first().copied().unwrap_or(0),
         stack_p2: walk.stacks.get(1).copied().unwrap_or(0),
         stacks: walk.stacks,
+        reaching_p1: vec![1.0; 169],
+        reaching_p2: vec![1.0; 169],
     })
 }
 
@@ -1837,35 +1836,30 @@ fn value_to_char(v: Value) -> char {
 }
 
 // ============================================================================
-// Range filtering
+// Reaching range computation
 // ============================================================================
 
-/// Check if a hand would be in the viewing player's range at the current position.
+/// Compute reaching probability for all 169 canonical hands by replaying
+/// the action history through the blueprint strategy.
 ///
-/// Replays the full game history (completed streets + current street) and
-/// checks that at each prior decision point of the viewing player, the action
-/// taken had at least `threshold` probability in the blueprint.
-#[allow(clippy::too_many_arguments)]
-fn is_hand_in_range(
+/// Returns `[f64; 169]` where each element is the cumulative product of
+/// action probabilities for the given player across all streets.
+fn compute_reaching_range(
     config: &BundleConfig,
     blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
     full_board: &[Card],
     street_histories: &[Vec<String>],
     current_history: &[String],
     viewing_player: u8,
-    threshold: f32,
-    rank1: char,
-    rank2: char,
-    suited: bool,
-) -> bool {
+) -> [f64; 169] {
     let bet_sizes = &config.game.bet_sizes;
+    let mut reaching = [1.0f64; 169];
     let mut stacks = [
         config.game.stack_depth * 2 - 1,
         config.game.stack_depth * 2 - 2,
     ];
     let mut pot = 3u32;
 
-    // Process completed streets, then the current street
     let all_streets: Vec<&[String]> = street_histories
         .iter()
         .map(|v| v.as_slice())
@@ -1880,32 +1874,66 @@ fn is_hand_in_range(
         for (i, action) in street_actions.iter().enumerate() {
             let acting_player = (i % 2) as u8;
 
-            if acting_player == viewing_player
-                && !action_meets_threshold(
-                    blueprint,
-                    config,
-                    board_for_street,
-                    street_idx,
-                    &action_codes,
-                    pot,
-                    &stacks,
-                    to_call,
-                    action,
-                    threshold,
-                    rank1,
-                    rank2,
-                    suited,
-                )
-            {
-                return false;
+            if acting_player == viewing_player {
+                let code = action_to_code(action);
+                let action_idx =
+                    action_code_to_strategy_index(code, to_call, bet_sizes.len());
+
+                for (hand_idx, reach) in reaching.iter_mut().enumerate() {
+                    if *reach < 1e-15 {
+                        continue;
+                    }
+                    let hand = match CanonicalHand::from_index(hand_idx) {
+                        Some(h) => h,
+                        None => continue,
+                    };
+                    let rank1 = value_to_char(hand.high_value());
+                    let rank2 = value_to_char(hand.low_value());
+                    let suited = hand.is_suited();
+
+                    let hand_bits = hand_bits_at_street(
+                        config,
+                        rank1,
+                        rank2,
+                        suited,
+                        board_for_street,
+                        street_idx,
+                    );
+                    let street_num = street_idx.min(3) as u8;
+                    let eff_stack = stacks[0].min(stacks[1]);
+                    let key = InfoKey::new(
+                        hand_bits,
+                        street_num,
+                        spr_bucket(pot, eff_stack),
+                        &action_codes,
+                    )
+                    .as_u64();
+
+                    let prob = match blueprint.lookup(key) {
+                        Some(strategy) => action_idx
+                            .and_then(|idx| strategy.get(idx))
+                            .copied()
+                            .map(f64::from)
+                            .unwrap_or(1.0),
+                        None => 1.0,
+                    };
+                    *reach *= prob;
+                }
             }
 
             action_codes.push(action_to_code(action));
-            apply_action(action, i % 2, &mut stacks, &mut pot, &mut to_call, bet_sizes);
+            apply_action(
+                action,
+                i % 2,
+                &mut stacks,
+                &mut pot,
+                &mut to_call,
+                bet_sizes,
+            );
         }
     }
 
-    true
+    reaching
 }
 
 /// Board cards visible during a given street.
@@ -1926,42 +1954,6 @@ fn initial_to_call(street_idx: usize, stacks: &[u32; 2]) -> u32 {
         stacks[0].saturating_sub(stacks[1])
     } else {
         0
-    }
-}
-
-/// Check whether a single action's blueprint probability meets the threshold.
-#[allow(clippy::too_many_arguments)]
-fn action_meets_threshold(
-    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
-    config: &BundleConfig,
-    board: &[Card],
-    street_idx: usize,
-    action_codes: &[u8],
-    pot: u32,
-    stacks: &[u32; 2],
-    to_call: u32,
-    action: &str,
-    threshold: f32,
-    rank1: char,
-    rank2: char,
-    suited: bool,
-) -> bool {
-    let hand_bits = hand_bits_at_street(config, rank1, rank2, suited, board, street_idx);
-    let street_num = street_idx.min(3) as u8;
-    let eff_stack = stacks[0].min(stacks[1]);
-    let key = InfoKey::new(hand_bits, street_num, spr_bucket(pot, eff_stack), action_codes).as_u64();
-
-    let strategy = match blueprint.lookup(key) {
-        Some(s) => s,
-        None => return true, // no data → assume in range
-    };
-
-    let code = action_to_code(action);
-    let idx = action_code_to_strategy_index(code, to_call, config.game.bet_sizes.len());
-
-    match idx.and_then(|i| strategy.get(i)) {
-        Some(&prob) => prob >= threshold,
-        None => true,
     }
 }
 

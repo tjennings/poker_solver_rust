@@ -22,7 +22,6 @@ export interface MatrixCell {
   suited: boolean;
   pair: boolean;
   probabilities: ActionProb[];
-  filtered: boolean;
 }
 
 export interface ActionInfo {
@@ -41,6 +40,8 @@ export interface StrategyMatrix {
   to_call: number;
   stack_p1: number;
   stack_p2: number;
+  reaching_p1: number[];
+  reaching_p2: number[];
 }
 
 export interface ExplorationPosition {
@@ -94,6 +95,19 @@ export interface CanonicalizeResult {
   canonical_cards: string[];
   remapped: boolean;
   suit_map: Record<string, string> | null;
+}
+
+// Range editing types
+export interface PlayerRange {
+  hands: number[];           // [169] reaching probabilities
+  source: 'computed' | 'edited' | 'manual';
+  overrides: number[];       // indices of manually edited hands
+}
+
+export interface RangeSnapshot {
+  p1_range: PlayerRange;
+  p2_range: PlayerRange;
+  node_index: number;
 }
 
 // Simulation types

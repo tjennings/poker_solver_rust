@@ -603,11 +603,19 @@ button:disabled {
   z-index: 2;
 }
 
-.matrix-cell.filtered {
-  background: #16213e !important;
+.cell-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  border-radius: inherit;
 }
 
-.matrix-cell.filtered .cell-label {
+.matrix-cell.unreachable {
+  background: #16213e;
+}
+
+.matrix-cell.unreachable .cell-label {
   opacity: 0.2;
 }
 
@@ -616,6 +624,8 @@ button:disabled {
   font-weight: bold;
   color: #fff;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+  position: relative;
+  z-index: 1;
 }
 
 /* Matrix + detail layout */
@@ -1017,4 +1027,53 @@ button:disabled {
 
 .combo-group-bar {
   height: 100%;
+}
+
+/* Range editing toolbar */
+.range-toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 4px 8px;
+  align-items: center;
+}
+
+.range-edit-btn {
+  padding: 4px 12px;
+  border: 1px solid #444;
+  border-radius: 4px;
+  background: #1e293b;
+  color: #ccc;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.range-edit-btn:hover {
+  background: #334155;
+}
+
+.range-edit-btn.active {
+  background: #1d4ed8;
+  border-color: #3b82f6;
+  color: #fff;
+}
+
+.range-edit-btn.reset {
+  border-color: #dc2626;
+  color: #fca5a5;
+}
+
+.matrix-cell.editing {
+  cursor: crosshair;
+}
+
+.matrix-cell.edited::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #facc15;
+  z-index: 2;
 }
