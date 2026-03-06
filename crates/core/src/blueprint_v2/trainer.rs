@@ -19,12 +19,47 @@ use std::time::Instant;
 use rand::prelude::*;
 use rand::rngs::StdRng;
 
+use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
 use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
 use super::mccfr::{traverse_external, AllBuckets, Deal};
 use super::storage::BlueprintStorage;
 use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
+
+/// Attempt to load `.buckets` files from the given directory.
+///
+/// Looks for `preflop.buckets`, `flop.buckets`, `turn.buckets`, and
+/// `river.buckets`. Missing files are silently skipped (returning `None`
+/// for that street). Load errors are logged to stderr but do not cause
+/// a hard failure.
+fn load_bucket_files(dir: &Path) -> [Option<BucketFile>; 4] {
+    const NAMES: [&str; 4] = [
+        "preflop.buckets",
+        "flop.buckets",
+        "turn.buckets",
+        "river.buckets",
+    ];
+    let mut files: [Option<BucketFile>; 4] = [None, None, None, None];
+    for (i, name) in NAMES.iter().enumerate() {
+        let path = dir.join(name);
+        if path.exists() {
+            match BucketFile::load(&path) {
+                Ok(bf) => {
+                    eprintln!("  Loaded bucket file: {} ({} boards, {} combos/board, {} buckets)",
+                        path.display(),
+                        bf.header.board_count,
+                        bf.header.combos_per_board,
+                        bf.header.bucket_count,
+                    );
+                    files[i] = Some(bf);
+                }
+                Err(e) => eprintln!("Warning: failed to load {}: {e}", path.display()),
+            }
+        }
+    }
+    files
+}
 
 /// Outer training driver for Blueprint V2.
 ///
@@ -72,7 +107,11 @@ impl BlueprintTrainer {
         ];
 
         let storage = BlueprintStorage::new(&tree, bucket_counts);
-        let buckets = AllBuckets { bucket_counts };
+        let bucket_files = load_bucket_files(Path::new(&config.training.cluster_path));
+        let buckets = AllBuckets {
+            bucket_counts,
+            bucket_files,
+        };
         let rng = StdRng::seed_from_u64(config.clustering.seed);
 
         let mut deck = [Card::new(ALL_VALUES[0], ALL_SUITS[0]); 52];

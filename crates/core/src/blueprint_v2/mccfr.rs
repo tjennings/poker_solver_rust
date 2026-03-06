@@ -18,6 +18,7 @@ use std::cmp::Ordering;
 
 use rand::Rng;
 
+use super::bucket_file::BucketFile;
 use super::game_tree::{GameNode, GameTree, TerminalKind};
 use super::storage::BlueprintStorage;
 use super::Street;
@@ -40,20 +41,33 @@ pub struct Deal {
 /// Loaded bucket assignments for all 4 streets.
 ///
 /// During MCCFR, we look up buckets by street using the deal's cards.
-/// Uses equity-based bucketing as a simplified approach that will be
-/// refined when the full bucket-file pipeline is integrated.
+/// When bucket files are loaded from the clustering pipeline, lookups
+/// will use those; otherwise falls back to raw equity-based bucketing.
 pub struct AllBuckets {
     pub bucket_counts: [u16; 4],
+    /// Per-street bucket files produced by the clustering pipeline.
+    /// `None` = fallback to raw-equity buckets for that street.
+    pub bucket_files: [Option<BucketFile>; 4],
 }
 
 impl AllBuckets {
     /// Look up the bucket for a player's hole cards at a given street.
     ///
-    /// Uses equity-based bucketing: compute showdown equity against a
-    /// random opponent, then linearly map into `bucket_counts[street]`
-    /// bins.
+    /// When a `BucketFile` is loaded for the given street, the lookup
+    /// will use the file's pre-computed cluster assignments. Currently
+    /// falls back to equity-based bucketing (compute showdown equity
+    /// against a random opponent, then linearly map into
+    /// `bucket_counts[street]` bins).
+    ///
+    /// TODO: When a `bucket_files[street]` is `Some`, look up the
+    /// bucket from the file using `BucketFile::get_bucket(board_idx,
+    /// combo_idx)`. This requires a canonical board→index mapping and
+    /// a hole-cards→combo_idx mapping that match the enumeration order
+    /// used during clustering.
     #[must_use]
     pub fn get_bucket(&self, street: Street, hole_cards: [Card; 2], board: &[Card]) -> u16 {
+        // TODO: use self.bucket_files[street as usize] when a board→index
+        // mapping is available from the clustering pipeline.
         let equity = crate::showdown_equity::compute_equity(hole_cards, board);
         let k = self.bucket_counts[street as usize];
         let bucket = (equity * f64::from(k)) as u16;
@@ -375,6 +389,7 @@ mod tests {
         let mut storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
         let buckets = AllBuckets {
             bucket_counts: [10, 10, 10, 10],
+            bucket_files: [None, None, None, None],
         };
         let deal = make_deal();
         let mut rng = StdRng::seed_from_u64(42);
@@ -399,6 +414,7 @@ mod tests {
         let mut storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
         let buckets = AllBuckets {
             bucket_counts: [10, 10, 10, 10],
+            bucket_files: [None, None, None, None],
         };
         let deal = make_deal();
         let mut rng = StdRng::seed_from_u64(42);
@@ -436,6 +452,7 @@ mod tests {
         let mut storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
         let buckets = AllBuckets {
             bucket_counts: [10, 10, 10, 10],
+            bucket_files: [None, None, None, None],
         };
         let deal = make_deal();
         let mut rng = StdRng::seed_from_u64(42);
@@ -466,6 +483,7 @@ mod tests {
         let mut storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
         let buckets = AllBuckets {
             bucket_counts: [10, 10, 10, 10],
+            bucket_files: [None, None, None, None],
         };
         let deal = make_deal();
         let mut rng = StdRng::seed_from_u64(42);
@@ -494,6 +512,7 @@ mod tests {
         let mut storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
         let buckets = AllBuckets {
             bucket_counts: [10, 10, 10, 10],
+            bucket_files: [None, None, None, None],
         };
         let deal = make_deal();
         let mut rng = StdRng::seed_from_u64(42);
@@ -545,6 +564,7 @@ mod tests {
         let mut storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
         let buckets = AllBuckets {
             bucket_counts: [10, 10, 10, 10],
+            bucket_files: [None, None, None, None],
         };
         let deal = make_deal();
         let mut rng = StdRng::seed_from_u64(42);
