@@ -1908,6 +1908,103 @@ fn is_hand_in_range(
     true
 }
 
+/// Compute reaching probability for all 169 canonical hands by replaying
+/// the action history through the blueprint strategy.
+///
+/// Returns `[f64; 169]` where each element is the cumulative product of
+/// action probabilities for the given player across all streets.
+fn compute_reaching_range(
+    config: &BundleConfig,
+    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
+    full_board: &[Card],
+    street_histories: &[Vec<String>],
+    current_history: &[String],
+    viewing_player: u8,
+) -> [f64; 169] {
+    let bet_sizes = &config.game.bet_sizes;
+    let mut reaching = [1.0f64; 169];
+    let mut stacks = [
+        config.game.stack_depth * 2 - 1,
+        config.game.stack_depth * 2 - 2,
+    ];
+    let mut pot = 3u32;
+
+    let all_streets: Vec<&[String]> = street_histories
+        .iter()
+        .map(|v| v.as_slice())
+        .chain(std::iter::once(current_history))
+        .collect();
+
+    for (street_idx, street_actions) in all_streets.iter().enumerate() {
+        let board_for_street = board_at_street(full_board, street_idx);
+        let mut to_call = initial_to_call(street_idx, &stacks);
+        let mut action_codes: Vec<u8> = Vec::new();
+
+        for (i, action) in street_actions.iter().enumerate() {
+            let acting_player = (i % 2) as u8;
+
+            if acting_player == viewing_player {
+                let code = action_to_code(action);
+                let action_idx =
+                    action_code_to_strategy_index(code, to_call, bet_sizes.len());
+
+                for (hand_idx, reach) in reaching.iter_mut().enumerate() {
+                    if *reach < 1e-15 {
+                        continue;
+                    }
+                    let hand = match CanonicalHand::from_index(hand_idx) {
+                        Some(h) => h,
+                        None => continue,
+                    };
+                    let rank1 = value_to_char(hand.high_value());
+                    let rank2 = value_to_char(hand.low_value());
+                    let suited = hand.is_suited();
+
+                    let hand_bits = hand_bits_at_street(
+                        config,
+                        rank1,
+                        rank2,
+                        suited,
+                        board_for_street,
+                        street_idx,
+                    );
+                    let street_num = street_idx.min(3) as u8;
+                    let eff_stack = stacks[0].min(stacks[1]);
+                    let key = InfoKey::new(
+                        hand_bits,
+                        street_num,
+                        spr_bucket(pot, eff_stack),
+                        &action_codes,
+                    )
+                    .as_u64();
+
+                    let prob = match blueprint.lookup(key) {
+                        Some(strategy) => action_idx
+                            .and_then(|idx| strategy.get(idx))
+                            .copied()
+                            .map(f64::from)
+                            .unwrap_or(1.0),
+                        None => 1.0,
+                    };
+                    *reach *= prob;
+                }
+            }
+
+            action_codes.push(action_to_code(action));
+            apply_action(
+                action,
+                i % 2,
+                &mut stacks,
+                &mut pot,
+                &mut to_call,
+                bet_sizes,
+            );
+        }
+    }
+
+    reaching
+}
+
 /// Board cards visible during a given street.
 fn board_at_street(full_board: &[Card], street_idx: usize) -> &[Card] {
     let n = match street_idx {
