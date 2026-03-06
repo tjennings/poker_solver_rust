@@ -1,0 +1,47 @@
+# Blueprint V2 Toy Config — 10BB, small buckets, trains in minutes
+game:
+  players: 2
+  stack_depth: 10.0
+  small_blind: 0.5
+  big_blind: 1.0
+
+clustering:
+  algorithm: potential_aware_emd
+  preflop:
+    buckets: 50
+  flop:
+    buckets: 50
+  turn:
+    buckets: 50
+  river:
+    buckets: 50
+  seed: 42
+  kmeans_iterations: 50
+
+action_abstraction:
+  preflop:
+    - ["2.5bb"]
+    - ["3.0x"]
+  flop:
+    - [0.5, 1.0]
+    - [1.0]
+  turn:
+    - [0.5, 1.0]
+  river:
+    - [0.5, 1.0]
+  max_raises: 2
+
+training:
+  cluster_path: clusters/toy/
+  time_limit_minutes: 5
+  lcfr_warmup_minutes: 2
+  lcfr_discount_interval: 1
+  prune_after_minutes: 2
+  prune_threshold: -310000000
+  prune_explore_pct: 0.05
+  print_every_minutes: 1
+
+snapshots:
+  warmup_minutes: 1
+  snapshot_every_minutes: 1
+  output_dir: runs/toy/
