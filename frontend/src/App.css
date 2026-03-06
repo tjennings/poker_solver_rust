@@ -667,7 +667,8 @@ button:disabled {
 }
 
 .cell-detail-bar-bg {
-  flex: 1;
+  width: 60px;
+  flex-shrink: 0;
   height: 6px;
   background: #333;
   border-radius: 3px;
