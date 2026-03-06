@@ -19,6 +19,7 @@ use std::time::Instant;
 use rand::prelude::*;
 use rand::rngs::StdRng;
 
+use super::bundle::{self, BlueprintV2Strategy};
 use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
 use super::mccfr::{traverse_external, AllBuckets, Deal};
@@ -284,10 +285,10 @@ impl BlueprintTrainer {
         std::fs::create_dir_all(output_dir)?;
 
         let snapshot_dir = output_dir.join(format!("snapshot_{:04}", self.snapshot_count));
-        std::fs::create_dir_all(&snapshot_dir)?;
 
-        self.storage
-            .save_regrets(&snapshot_dir.join("regrets.bin"))?;
+        let mut strategy = BlueprintV2Strategy::from_storage(&self.storage, &self.tree);
+        strategy.iterations = self.iterations;
+        strategy.elapsed_minutes = self.elapsed_minutes();
 
         let metadata = format!(
             "{{\"iteration\": {}, \"elapsed_minutes\": {}, \"mean_positive_regret\": {:.2}}}",
@@ -295,7 +296,8 @@ impl BlueprintTrainer {
             self.elapsed_minutes(),
             self.mean_positive_regret(),
         );
-        std::fs::write(snapshot_dir.join("metadata.json"), metadata)?;
+
+        bundle::save_snapshot(&snapshot_dir, &strategy, &self.storage, &metadata)?;
 
         self.snapshot_count += 1;
         self.last_snapshot_time = self.elapsed_minutes();
@@ -451,6 +453,7 @@ mod tests {
         trainer.save_snapshot().expect("snapshot should save");
 
         let snapshot_dir = dir.path().join("snapshot_0000");
+        assert!(snapshot_dir.join("strategy.bin").exists());
         assert!(snapshot_dir.join("regrets.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
     }
