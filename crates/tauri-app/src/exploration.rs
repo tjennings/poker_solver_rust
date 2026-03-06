@@ -768,14 +768,16 @@ fn get_strategy_matrix_preflop(
 /// Compute reaching probabilities for a player by replaying the preflop tree.
 ///
 /// At each decision node where `viewing_player` acts, multiply each hand's
-/// reaching probability by the strategy probability of the chosen action.
+/// reaching probability by `1 - fold_probability`. This filters out only
+/// hands that would have folded, keeping all non-folding hands at full weight
+/// regardless of which specific sizing they chose.
 fn compute_reaching_range_preflop(
     config: &poker_solver_core::preflop::PreflopConfig,
     strategy: &poker_solver_core::preflop::PreflopStrategy,
     history: &[String],
     viewing_player: u8,
 ) -> [f64; 169] {
-    use poker_solver_core::preflop::{PreflopNode, PreflopTree};
+    use poker_solver_core::preflop::{PreflopAction, PreflopNode, PreflopTree};
 
     let tree = PreflopTree::build(config);
     let mut reaching = [1.0f64; 169];
@@ -797,16 +799,22 @@ fn compute_reaching_range_preflop(
             None => break,
         };
 
-        // If this is the viewing player's decision, multiply reaching by action prob
+        // If this is the viewing player's decision, multiply by (1 - fold_prob)
         if position == viewing_player {
-            for hand_idx in 0..169 {
-                if reaching[hand_idx] < 1e-15 {
-                    continue;
+            let fold_idx = action_labels
+                .iter()
+                .position(|a| matches!(a, PreflopAction::Fold));
+            if let Some(fi) = fold_idx {
+                for hand_idx in 0..169 {
+                    if reaching[hand_idx] < 1e-15 {
+                        continue;
+                    }
+                    let probs = strategy.get_probs(node_idx, hand_idx);
+                    let fold_prob = probs.get(fi).copied().unwrap_or(0.0);
+                    reaching[hand_idx] *= 1.0 - fold_prob;
                 }
-                let probs = strategy.get_probs(node_idx, hand_idx);
-                let prob = probs.get(child_pos).copied().unwrap_or(1.0);
-                reaching[hand_idx] *= prob;
             }
+            // If no fold action exists at this node, reaching stays unchanged
         }
 
         node_idx = children[child_pos];
@@ -1966,7 +1974,9 @@ fn value_to_char(v: Value) -> char {
 /// the action history through the blueprint strategy.
 ///
 /// Returns `[f64; 169]` where each element is the cumulative product of
-/// action probabilities for the given player across all streets.
+/// `(1 - fold_probability)` for the given player across all streets.
+/// Only hands that fold are removed from the range; specific bet sizing
+/// choices do not narrow the range.
 fn compute_reaching_range(
     config: &BundleConfig,
     blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
@@ -1998,50 +2008,53 @@ fn compute_reaching_range(
             let acting_player = (i % 2) as u8;
 
             if acting_player == viewing_player {
-                let code = action_to_code(action);
-                let action_idx =
-                    action_code_to_strategy_index(code, to_call, bet_sizes.len());
+                // Fold is only possible when facing a bet (to_call > 0).
+                // Fold index in the strategy vector is always 0 when it exists.
+                let fold_idx = if to_call > 0 { Some(0usize) } else { None };
 
-                for (hand_idx, reach) in reaching.iter_mut().enumerate() {
-                    if *reach < 1e-15 {
-                        continue;
+                if let Some(fi) = fold_idx {
+                    for (hand_idx, reach) in reaching.iter_mut().enumerate() {
+                        if *reach < 1e-15 {
+                            continue;
+                        }
+                        let hand = match CanonicalHand::from_index(hand_idx) {
+                            Some(h) => h,
+                            None => continue,
+                        };
+                        let rank1 = value_to_char(hand.high_value());
+                        let rank2 = value_to_char(hand.low_value());
+                        let suited = hand.is_suited();
+
+                        let hand_bits = hand_bits_at_street(
+                            config,
+                            rank1,
+                            rank2,
+                            suited,
+                            board_for_street,
+                            street_idx,
+                        );
+                        let street_num = street_idx.min(3) as u8;
+                        let eff_stack = stacks[0].min(stacks[1]);
+                        let key = InfoKey::new(
+                            hand_bits,
+                            street_num,
+                            spr_bucket(pot, eff_stack),
+                            &action_codes,
+                        )
+                        .as_u64();
+
+                        let fold_prob = match blueprint.lookup(key) {
+                            Some(strategy) => strategy
+                                .get(fi)
+                                .copied()
+                                .map(f64::from)
+                                .unwrap_or(0.0),
+                            None => 0.0,
+                        };
+                        *reach *= 1.0 - fold_prob;
                     }
-                    let hand = match CanonicalHand::from_index(hand_idx) {
-                        Some(h) => h,
-                        None => continue,
-                    };
-                    let rank1 = value_to_char(hand.high_value());
-                    let rank2 = value_to_char(hand.low_value());
-                    let suited = hand.is_suited();
-
-                    let hand_bits = hand_bits_at_street(
-                        config,
-                        rank1,
-                        rank2,
-                        suited,
-                        board_for_street,
-                        street_idx,
-                    );
-                    let street_num = street_idx.min(3) as u8;
-                    let eff_stack = stacks[0].min(stacks[1]);
-                    let key = InfoKey::new(
-                        hand_bits,
-                        street_num,
-                        spr_bucket(pot, eff_stack),
-                        &action_codes,
-                    )
-                    .as_u64();
-
-                    let prob = match blueprint.lookup(key) {
-                        Some(strategy) => action_idx
-                            .and_then(|idx| strategy.get(idx))
-                            .copied()
-                            .map(f64::from)
-                            .unwrap_or(1.0),
-                        None => 1.0,
-                    };
-                    *reach *= prob;
                 }
+                // If no fold action possible (check spot), reaching unchanged
             }
 
             action_codes.push(action_to_code(action));
@@ -2117,26 +2130,6 @@ fn hand_bits_at_street(
         )
     } else {
         classification.bits()
-    }
-}
-
-/// Map an action code to its index in the strategy probability vector.
-fn action_code_to_strategy_index(code: u8, to_call: u32, num_bet_sizes: usize) -> Option<usize> {
-    match code {
-        1 => {
-            // fold — only valid when facing a bet
-            if to_call > 0 { Some(0) } else { None }
-        }
-        2 => Some(if to_call > 0 { 1 } else { 0 }), // check
-        3 => {
-            // call
-            if to_call > 0 { Some(1) } else { None }
-        }
-        4..=8 => Some(1 + (code - 4) as usize),                 // bet:idx (to_call == 0)
-        9..=13 => Some(2 + (code - 9) as usize),               // raise:idx (to_call > 0)
-        14 => Some(1 + num_bet_sizes),                          // bet all-in
-        15 => Some(2 + num_bet_sizes),                          // raise all-in
-        _ => None,
     }
 }
 
