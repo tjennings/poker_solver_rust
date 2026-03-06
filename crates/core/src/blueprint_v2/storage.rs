@@ -128,6 +128,35 @@ impl BlueprintStorage {
         }
     }
 
+    /// Write the current regret-matched strategy into a caller-supplied buffer.
+    ///
+    /// Same semantics as [`current_strategy`](Self::current_strategy) but
+    /// avoids heap allocation on every call — critical for the MCCFR hot path.
+    ///
+    /// `out` must have length >= `num_actions` for this node; only the first
+    /// `num_actions` entries are written.
+    #[inline]
+    pub fn current_strategy_into(&self, node_idx: u32, bucket: u16, out: &mut [f64]) {
+        let regrets = self.get_regrets(node_idx, bucket);
+        let num_actions = regrets.len();
+        debug_assert!(
+            out.len() >= num_actions,
+            "buffer too small: {} < {num_actions}",
+            out.len()
+        );
+        let out = &mut out[..num_actions];
+
+        let positive_sum: f64 = regrets.iter().map(|&r| f64::from(r.max(0))).sum();
+        if positive_sum > 0.0 {
+            for (o, &r) in out.iter_mut().zip(regrets) {
+                *o = f64::from(r.max(0)) / positive_sum;
+            }
+        } else {
+            let u = 1.0 / num_actions as f64;
+            out.fill(u);
+        }
+    }
+
     /// Average strategy from strategy sums (the final output).
     ///
     /// Returns action probabilities summing to 1.0. Falls back to

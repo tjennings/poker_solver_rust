@@ -23,6 +23,13 @@ use super::storage::BlueprintStorage;
 use super::Street;
 use crate::poker::{Card, Hand, Rankable};
 
+/// Maximum number of actions at any decision node.
+///
+/// Covers fold/check/call plus up to 13 bet/raise sizing choices.
+/// Used for stack-allocated strategy and value buffers in the MCCFR
+/// traversal hot path.
+const MAX_ACTIONS: usize = 16;
+
 /// A sampled deal: hole cards for each player plus the full 5-card board.
 #[derive(Debug, Clone)]
 pub struct Deal {
@@ -125,7 +132,6 @@ pub fn traverse_external(
         } => {
             let player = *player;
             let street = *street;
-            let children = children.clone();
             let num_actions = children.len();
 
             let visible_board = AllBuckets::board_for_street(&deal.board, street);
@@ -140,7 +146,7 @@ pub fn traverse_external(
                     traverser,
                     node_idx,
                     bucket,
-                    &children,
+                    children,
                     num_actions,
                     prune,
                     prune_threshold,
@@ -155,7 +161,7 @@ pub fn traverse_external(
                     traverser,
                     node_idx,
                     bucket,
-                    &children,
+                    children,
                     num_actions,
                     prune,
                     prune_threshold,
@@ -212,8 +218,13 @@ fn traverse_traverser(
     prune_threshold: i32,
     rng: &mut impl Rng,
 ) -> f64 {
-    let strategy = storage.current_strategy(node_idx, bucket);
-    let mut action_values = vec![0.0f64; num_actions];
+    debug_assert!(num_actions <= MAX_ACTIONS);
+    let mut strategy_buf = [0.0f64; MAX_ACTIONS];
+    storage.current_strategy_into(node_idx, bucket, &mut strategy_buf[..num_actions]);
+    let strategy = &strategy_buf[..num_actions];
+
+    let mut action_values_buf = [0.0f64; MAX_ACTIONS];
+    let action_values = &mut action_values_buf[..num_actions];
     let mut node_value = 0.0f64;
 
     for (a, &child_idx) in children.iter().enumerate() {
@@ -274,7 +285,10 @@ fn traverse_opponent(
     prune_threshold: i32,
     rng: &mut impl Rng,
 ) -> f64 {
-    let strategy = storage.current_strategy(node_idx, bucket);
+    debug_assert!(num_actions <= MAX_ACTIONS);
+    let mut strategy_buf = [0.0f64; MAX_ACTIONS];
+    storage.current_strategy_into(node_idx, bucket, &mut strategy_buf[..num_actions]);
+    let strategy = &strategy_buf[..num_actions];
 
     let r: f64 = rng.random();
     let mut cumulative = 0.0;
