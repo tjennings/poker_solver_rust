@@ -1,4 +1,5 @@
 pub mod bucket_file;
+pub mod bundle;
 pub mod cluster_pipeline;
 pub mod clustering;
 pub mod config;
