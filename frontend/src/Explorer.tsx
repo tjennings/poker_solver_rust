@@ -65,10 +65,10 @@ function displayOrderActions(actions: ActionInfo[]): ActionInfo[] {
 function getActionColor(action: ActionInfo, actions: ActionInfo[]): string {
   switch (action.action_type) {
     case 'fold':
-      return 'rgba(59, 130, 246, 1)'; // Blue
+      return 'rgba(70, 120, 200, 0.7)'; // Dusty blue
     case 'check':
     case 'call':
-      return 'rgba(34, 197, 94, 1)'; // Green
+      return 'rgba(50, 160, 90, 0.7)'; // Muted green
     case 'bet':
     case 'raise':
     case 'allin': {
@@ -77,14 +77,14 @@ function getActionColor(action: ActionInfo, actions: ActionInfo[]): string {
       const count = ordered.length;
       // Lightest (t=0) → darkest (t=1), all-in always darkest
       const t = count > 1 ? idx / (count - 1) : 1;
-      // Interpolate from light red (255, 180, 180) to dark red (153, 27, 27)
-      const r = Math.round(255 - t * (255 - 153));
-      const g = Math.round(180 - t * (180 - 27));
-      const b = Math.round(180 - t * (180 - 27));
-      return `rgba(${r}, ${g}, ${b}, 1)`;
+      // Interpolate from dusty rose (200, 130, 130) to wine (160, 50, 50)
+      const r = Math.round(200 - t * (200 - 160));
+      const g = Math.round(130 - t * (130 - 50));
+      const b = Math.round(130 - t * (130 - 50));
+      return `rgba(${r}, ${g}, ${b}, 0.7)`;
     }
     default:
-      return 'rgba(156, 163, 175, 1)'; // Gray
+      return 'rgba(140, 145, 155, 0.7)'; // Soft gray
   }
 }
 
