@@ -244,6 +244,7 @@ function ComboClassPanel({
 function ActionBlock({
   position,
   stack,
+  pot,
   actions,
   selectedAction,
   onSelect,
@@ -252,6 +253,7 @@ function ActionBlock({
 }: {
   position: string;
   stack: number;
+  pot: number;
   actions: ActionInfo[];
   selectedAction?: string;
   onSelect: (actionId: string) => void;
@@ -265,7 +267,7 @@ function ActionBlock({
         onClick={onHeaderClick}
       >
         <span className="position">{position}</span>
-        <span className="stack">{Math.round(stack / 2)}BB</span>
+        <span className="stack">{Math.round(stack / 2)}BB / {Math.round(pot / 2)}BB</span>
       </div>
       <div className="action-list">
         {displayOrderActions(actions).map((action) => {
@@ -460,7 +462,7 @@ function StreetBlock({
 
 // History item type
 type HistoryItem =
-  | { type: 'action'; position: string; stack: number; actions: ActionInfo[]; selected: string }
+  | { type: 'action'; position: string; stack: number; pot: number; actions: ActionInfo[]; selected: string }
   | { type: 'street'; street: string; pot: number; stack_p1: number; stack_p2: number; cards: string[] };
 
 // Extract completed-street action sequences from history items.
@@ -702,6 +704,7 @@ export default function Explorer() {
           type: 'action',
           position: position.to_act === 0 ? 'SB' : 'BB',
           stack: matrix.stack,
+          pot: matrix.pot,
           actions: matrix.actions,
           selected: actionId,
         };
@@ -1020,6 +1023,7 @@ export default function Explorer() {
                   key={idx}
                   position={item.position}
                   stack={item.stack}
+                  pot={item.pot}
                   actions={item.actions}
                   selectedAction={item.selected}
                   onSelect={() => handleHistoryRewind(idx)}
@@ -1052,6 +1056,7 @@ export default function Explorer() {
               <ActionBlock
                 position={position.to_act === 0 ? 'SB' : 'BB'}
                 stack={matrix.stack}
+                pot={matrix.pot}
                 actions={matrix.actions}
                 onSelect={handleActionSelect}
                 isCurrent={true}
