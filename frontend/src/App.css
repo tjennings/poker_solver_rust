@@ -493,6 +493,7 @@ button:disabled {
 .action-block-header {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   padding-bottom: 0.5rem;
   border-bottom: 1px solid #333;
   margin-bottom: 0.5rem;
