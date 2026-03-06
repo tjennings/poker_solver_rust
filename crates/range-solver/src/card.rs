@@ -1,5 +1,7 @@
 use std::mem;
 
+use crate::range::Range;
+
 /// A type representing a card, defined as an alias of `u8`.
 ///
 /// The correspondence between the card and its ID is defined as follows:
@@ -14,8 +16,8 @@ pub const NOT_DEALT: Card = Card::MAX;
 /// A struct containing the card configuration.
 #[derive(Debug, Clone)]
 pub struct CardConfig {
-    /// Initial range of each player (weights for each of the 1326 hole-card combos).
-    pub range: [Vec<f32>; 2],
+    /// Initial range of each player.
+    pub range: [Range; 2],
 
     /// Flop cards: each card must be unique.
     pub flop: [Card; 3],
@@ -68,7 +70,7 @@ pub fn index_to_card_pair(index: usize) -> (Card, Card) {
 ///
 /// `'A'` => `12`, `'K'` => `11`, ..., `'2'` => `0`.
 #[inline]
-fn char_to_rank(c: char) -> Result<u8, String> {
+pub(crate) fn char_to_rank(c: char) -> Result<u8, String> {
     match c {
         'A' | 'a' => Ok(12),
         'K' | 'k' => Ok(11),
@@ -84,7 +86,7 @@ fn char_to_rank(c: char) -> Result<u8, String> {
 ///
 /// `'c'` => `0`, `'d'` => `1`, `'h'` => `2`, `'s'` => `3`.
 #[inline]
-fn char_to_suit(c: char) -> Result<u8, String> {
+pub(crate) fn char_to_suit(c: char) -> Result<u8, String> {
     match c {
         'c' => Ok(0),
         'd' => Ok(1),
@@ -98,7 +100,7 @@ fn char_to_suit(c: char) -> Result<u8, String> {
 ///
 /// `12` => `'A'`, `11` => `'K'`, ..., `0` => `'2'`.
 #[inline]
-fn rank_to_char(rank: u8) -> Result<char, String> {
+pub(crate) fn rank_to_char(rank: u8) -> Result<char, String> {
     match rank {
         12 => Ok('A'),
         11 => Ok('K'),
@@ -114,7 +116,7 @@ fn rank_to_char(rank: u8) -> Result<char, String> {
 ///
 /// `0` => `'c'`, `1` => `'d'`, `2` => `'h'`, `3` => `'s'`.
 #[inline]
-fn suit_to_char(suit: u8) -> Result<char, String> {
+pub(crate) fn suit_to_char(suit: u8) -> Result<char, String> {
     match suit {
         0 => Ok('c'),
         1 => Ok('d'),
@@ -125,7 +127,7 @@ fn suit_to_char(suit: u8) -> Result<char, String> {
 }
 
 #[inline]
-fn check_card(card: Card) -> Result<(), String> {
+pub(crate) fn check_card(card: Card) -> Result<(), String> {
     if card < 52 {
         Ok(())
     } else {
