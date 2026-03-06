@@ -9,6 +9,8 @@ import {
   ActionInfo,
   MatrixCell,
   ComboGroupInfo,
+  PlayerRange,
+  RangeSnapshot,
 } from './types';
 
 // Suit colors matching the reference image
@@ -116,12 +118,16 @@ function HandCell({
   actions,
   reachWeight,
   isSelected,
+  isEditing,
+  isEdited,
   onClick,
 }: {
   cell: MatrixCell;
   actions: ActionInfo[];
   reachWeight: number;
   isSelected: boolean;
+  isEditing?: boolean;
+  isEdited?: boolean;
   onClick: () => void;
 }) {
   const gradientStops = useMemo(() => {
@@ -156,7 +162,7 @@ function HandCell({
 
   return (
     <div
-      className={`matrix-cell ${isSelected ? 'selected' : ''} ${isUnreachable ? 'unreachable' : ''}`}
+      className={`matrix-cell ${isSelected ? 'selected' : ''} ${isUnreachable ? 'unreachable' : ''} ${isEditing ? 'editing' : ''} ${isEdited ? 'edited' : ''}`}
       onClick={onClick}
     >
       <div
@@ -559,6 +565,62 @@ export default function Explorer() {
     canonical: string[];
     suitMap: Record<string, string>;
   } | null>(null);
+  const [p1Range, setP1Range] = useState<PlayerRange>({
+    hands: Array(169).fill(1.0),
+    source: 'computed',
+    overrides: [],
+  });
+  const [p2Range, setP2Range] = useState<PlayerRange>({
+    hands: Array(169).fill(1.0),
+    source: 'computed',
+    overrides: [],
+  });
+  const [rangeSnapshots, setRangeSnapshots] = useState<RangeSnapshot[]>([]);
+  const [editingPlayer, setEditingPlayer] = useState<0 | 1 | null>(null);
+
+  const updateRangesFromMatrix = useCallback((m: StrategyMatrix) => {
+    setP1Range(prev => {
+      const newHands = m.reaching_p1.length === 169 ? [...m.reaching_p1] : Array(169).fill(1.0);
+      for (const idx of prev.overrides) {
+        newHands[idx] = prev.hands[idx];
+      }
+      return {
+        hands: newHands,
+        source: prev.overrides.length > 0 ? 'edited' : 'computed',
+        overrides: prev.overrides,
+      };
+    });
+    setP2Range(prev => {
+      const newHands = m.reaching_p2.length === 169 ? [...m.reaching_p2] : Array(169).fill(1.0);
+      for (const idx of prev.overrides) {
+        newHands[idx] = prev.hands[idx];
+      }
+      return {
+        hands: newHands,
+        source: prev.overrides.length > 0 ? 'edited' : 'computed',
+        overrides: prev.overrides,
+      };
+    });
+  }, []);
+
+  const handleCellEdit = useCallback((row: number, col: number) => {
+    if (editingPlayer === null) return;
+    const handIdx = matrixToHandIndex(row, col);
+    const setRange = editingPlayer === 0 ? setP1Range : setP2Range;
+
+    setRange(prev => {
+      const newHands = [...prev.hands];
+      // Cycle: 1.0 -> 0.5 -> 0.0 -> 1.0
+      const current = newHands[handIdx];
+      newHands[handIdx] = current > 0.75 ? 0.5 : current > 0.25 ? 0.0 : 1.0;
+      const newOverrides = [...new Set([...prev.overrides, handIdx])];
+      return {
+        hands: newHands,
+        source: 'edited',
+        overrides: newOverrides,
+      };
+    });
+  }, [editingPlayer]);
 
   // Fetch combo classification when a cell is selected on postflop
   useEffect(() => {
@@ -630,6 +692,7 @@ export default function Explorer() {
           position: initialPosition,
         });
         setMatrix(initialMatrix);
+        updateRangesFromMatrix(initialMatrix);
       } catch (e) {
         setError(String(e));
       } finally {
@@ -693,6 +756,13 @@ export default function Explorer() {
 
       try {
         setLoading(true);
+
+        // Snapshot current ranges before advancing
+        setRangeSnapshots(prev => [...prev, {
+          p1_range: { ...p1Range, hands: [...p1Range.hands], overrides: [...p1Range.overrides] },
+          p2_range: { ...p2Range, hands: [...p2Range.hands], overrides: [...p2Range.overrides] },
+          node_index: historyItems.length,
+        }]);
 
         let newHistory = [...position.history];
         let newToAct = position.to_act === 0 ? 1 : 0;
@@ -787,6 +857,7 @@ export default function Explorer() {
             street_histories: extractStreetHistories(historyItems),
           });
           setMatrix(newMatrix);
+          updateRangesFromMatrix(newMatrix);
         }
       } catch (e) {
         setError(String(e));
@@ -794,7 +865,7 @@ export default function Explorer() {
         setLoading(false);
       }
     },
-    [matrix, position, checkStreetTransition, historyItems, bundleInfo]
+    [matrix, position, checkStreetTransition, historyItems, bundleInfo, p1Range, p2Range, updateRangesFromMatrix]
   );
 
   const handleStreetCardsSet = useCallback(
@@ -869,6 +940,7 @@ export default function Explorer() {
           street_histories: sh,
         });
         setMatrix(newMatrix);
+        updateRangesFromMatrix(newMatrix);
       } catch (e) {
         setError(String(e));
       } finally {
@@ -940,18 +1012,27 @@ export default function Explorer() {
         setHandResult(null);
         setPosition(pos);
 
+        // Restore range snapshot
+        const snapshot = rangeSnapshots.find(s => s.node_index <= index);
+        if (snapshot) {
+          setP1Range(snapshot.p1_range);
+          setP2Range(snapshot.p2_range);
+        }
+        setRangeSnapshots(prev => prev.filter(s => s.node_index < index));
+
         const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
           position: pos,
           street_histories: extractStreetHistories(items),
         });
         setMatrix(newMatrix);
+        updateRangesFromMatrix(newMatrix);
       } catch (e) {
         setError(String(e));
       } finally {
         setLoading(false);
       }
     },
-    [rebuildState]
+    [rebuildState, rangeSnapshots, updateRangesFromMatrix]
   );
 
   // Rewind to a street transition, re-showing the card picker for that street.
@@ -1005,16 +1086,21 @@ export default function Explorer() {
       setSelectedCell(null);
       setComboInfo(null);
       setRemapInfo(null);
+      setP1Range({ hands: Array(169).fill(1.0), source: 'computed', overrides: [] });
+      setP2Range({ hands: Array(169).fill(1.0), source: 'computed', overrides: [] });
+      setRangeSnapshots([]);
+      setEditingPlayer(null);
       const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
         position: initialPosition,
       });
       setMatrix(newMatrix);
+      updateRangesFromMatrix(newMatrix);
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
     }
-  }, [bundleInfo]);
+  }, [bundleInfo, updateRangesFromMatrix]);
 
   return (
     <div className="explorer">
@@ -1078,6 +1164,35 @@ export default function Explorer() {
           </div>
 
           {matrix && (
+            <div className="range-toolbar">
+              <button
+                className={`range-edit-btn ${editingPlayer === 0 ? 'active' : ''}`}
+                onClick={() => setEditingPlayer(editingPlayer === 0 ? null : 0)}
+              >
+                {editingPlayer === 0 ? 'Done' : 'Edit SB Range'}
+              </button>
+              <button
+                className={`range-edit-btn ${editingPlayer === 1 ? 'active' : ''}`}
+                onClick={() => setEditingPlayer(editingPlayer === 1 ? null : 1)}
+              >
+                {editingPlayer === 1 ? 'Done' : 'Edit BB Range'}
+              </button>
+              {(p1Range.overrides.length > 0 || p2Range.overrides.length > 0) && (
+                <button
+                  className="range-edit-btn reset"
+                  onClick={() => {
+                    setP1Range({ hands: matrix.reaching_p1.length === 169 ? [...matrix.reaching_p1] : Array(169).fill(1.0), source: 'computed', overrides: [] });
+                    setP2Range({ hands: matrix.reaching_p2.length === 169 ? [...matrix.reaching_p2] : Array(169).fill(1.0), source: 'computed', overrides: [] });
+                    setEditingPlayer(null);
+                  }}
+                >
+                  Reset Ranges
+                </button>
+              )}
+            </div>
+          )}
+
+          {matrix && (
             <div className="matrix-container">
               <div className="matrix-with-detail">
                 <div className="hand-matrix">
@@ -1085,9 +1200,17 @@ export default function Explorer() {
                     <div key={rowIdx} className="matrix-row">
                       {row.map((cell, colIdx) => {
                         const handIdx = matrixToHandIndex(rowIdx, colIdx);
-                        const reachWeight = position.to_act === 0
-                          ? (matrix.reaching_p1[handIdx] ?? 1.0)
-                          : (matrix.reaching_p2[handIdx] ?? 1.0);
+                        const reachWeight = (() => {
+                          if (editingPlayer !== null) {
+                            const range = position.to_act === 0 ? p1Range : p2Range;
+                            return range.hands[handIdx] ?? 1.0;
+                          }
+                          return position.to_act === 0
+                            ? (matrix.reaching_p1[handIdx] ?? 1.0)
+                            : (matrix.reaching_p2[handIdx] ?? 1.0);
+                        })();
+                        const isEdited = editingPlayer !== null &&
+                          (position.to_act === 0 ? p1Range : p2Range).overrides.includes(handIdx);
                         return (
                           <HandCell
                             key={colIdx}
@@ -1095,7 +1218,15 @@ export default function Explorer() {
                             actions={matrix.actions}
                             reachWeight={reachWeight}
                             isSelected={selectedCell?.row === rowIdx && selectedCell?.col === colIdx}
-                            onClick={() => setSelectedCell({ row: rowIdx, col: colIdx })}
+                            isEditing={editingPlayer !== null}
+                            isEdited={isEdited}
+                            onClick={() => {
+                              if (editingPlayer !== null) {
+                                handleCellEdit(rowIdx, colIdx);
+                              } else {
+                                setSelectedCell({ row: rowIdx, col: colIdx });
+                              }
+                            }}
                           />
                         );
                       })}

@@ -97,6 +97,19 @@ export interface CanonicalizeResult {
   suit_map: Record<string, string> | null;
 }
 
+// Range editing types
+export interface PlayerRange {
+  hands: number[];           // [169] reaching probabilities
+  source: 'computed' | 'edited' | 'manual';
+  overrides: number[];       // indices of manually edited hands
+}
+
+export interface RangeSnapshot {
+  p1_range: PlayerRange;
+  p2_range: PlayerRange;
+  node_index: number;
+}
+
 // Simulation types
 export interface StrategySourceInfo {
   name: string;
