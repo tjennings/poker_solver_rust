@@ -1,3 +1,8 @@
+mod blueprint_tui;
+mod blueprint_tui_config;
+mod blueprint_tui_metrics;
+mod blueprint_tui_scenarios;
+mod blueprint_tui_widgets;
 mod bucket_diagnostics;
 mod hand_trace;
 mod lhe_viz;
@@ -198,6 +203,9 @@ enum Commands {
         /// YAML config file (BlueprintV2Config)
         #[arg(short, long)]
         config: PathBuf,
+        /// Disable the TUI dashboard even when tui.enabled is true in config
+        #[arg(long)]
+        no_tui: bool,
     },
     /// Run the clustering pipeline to build bucket assignments (Blueprint V2)
     Cluster {
@@ -429,9 +437,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::TraceTerminals { config, hero, opp, history } => {
             run_trace_terminals(&config, &hero, &opp, &history)?;
         }
-        Commands::TrainBlueprint { config } => {
+        Commands::TrainBlueprint { config, no_tui } => {
             let yaml = std::fs::read_to_string(&config)?;
             let bp_config: BlueprintV2Config = serde_yaml::from_str(&yaml)?;
+            let tui_config = blueprint_tui_config::parse_tui_config(&yaml);
 
             eprintln!("Blueprint V2 Training");
             eprintln!("  Stack: {}BB", bp_config.game.stack_depth);
@@ -452,7 +461,89 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!();
 
             let mut trainer = BlueprintTrainer::new(bp_config);
-            trainer.train()?;
+            let use_tui = tui_config.enabled && !no_tui;
+
+            if use_tui {
+                let metrics = Arc::new(blueprint_tui_metrics::BlueprintTuiMetrics::new(
+                    trainer.config.training.iterations,
+                ));
+
+                // Share atomics between trainer and TUI.
+                trainer.paused = Arc::clone(&metrics.paused);
+                trainer.quit_requested = Arc::clone(&metrics.quit_requested);
+                trainer.shared_iterations = Arc::clone(&metrics.iterations);
+                trainer.snapshot_trigger = Arc::clone(&metrics.snapshot_trigger);
+
+                // Resolve scenarios to game-tree nodes.
+                let scenarios: Vec<blueprint_tui::ResolvedScenario> = tui_config
+                    .scenarios
+                    .iter()
+                    .map(|sc| {
+                        let node_idx = blueprint_tui_scenarios::resolve_action_path(
+                            &trainer.tree,
+                            &sc.actions,
+                        )
+                        .unwrap_or(trainer.tree.root);
+                        let grid = blueprint_tui_scenarios::extract_strategy_grid(
+                            &trainer.tree,
+                            &trainer.storage,
+                            node_idx,
+                        );
+                        blueprint_tui::ResolvedScenario {
+                            name: sc.name.clone(),
+                            node_idx,
+                            grid: blueprint_tui_widgets::HandGridState {
+                                cells: grid,
+                                prev_cells: None,
+                                scenario_name: sc.name.clone(),
+                                action_path: sc.actions.clone(),
+                                board_display: sc
+                                    .board
+                                    .as_ref()
+                                    .map(|b| b.join(" ")),
+                                cluster_id: None,
+                                street_label: sc
+                                    .street
+                                    .map_or("Preflop".into(), |s| format!("{s:?}")),
+                                iteration_at_snapshot: 0,
+                            },
+                        }
+                    })
+                    .collect();
+
+                // Wire strategy refresh callback from trainer to TUI metrics.
+                let scenarios_node_indices: Vec<u32> =
+                    scenarios.iter().map(|s| s.node_idx).collect();
+                trainer.scenario_node_indices = scenarios_node_indices;
+                trainer.strategy_refresh_interval_secs =
+                    tui_config.telemetry.strategy_delta_interval_seconds;
+
+                let metrics_for_refresh = Arc::clone(&metrics);
+                trainer.on_strategy_refresh =
+                    Some(Box::new(move |scenario_idx, node_idx, storage| {
+                        let probs = storage.average_strategy(node_idx, 0);
+                        metrics_for_refresh.update_scenario_strategy(scenario_idx, probs);
+                    }));
+
+                let refresh_ms = tui_config.refresh_rate_ms;
+                let refresh = Duration::from_millis(refresh_ms);
+                let refresh_hz = 1000.0 / refresh_ms as f64;
+                let tui_handle = blueprint_tui::run_blueprint_tui(
+                    Arc::clone(&metrics),
+                    scenarios,
+                    tui_config.telemetry.clone(),
+                    refresh,
+                    refresh_hz,
+                );
+
+                trainer.train()?;
+                metrics
+                    .quit_requested
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = tui_handle.join();
+            } else {
+                trainer.train()?;
+            }
 
             eprintln!("\nTraining complete: {} iterations", trainer.iterations);
         }
