@@ -473,6 +473,7 @@ mod tests {
                 prune_threshold: -310_000_000,
                 prune_explore_pct: 0.05,
                 print_every_minutes: 9999,
+                batch_size: 200,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 9999,
