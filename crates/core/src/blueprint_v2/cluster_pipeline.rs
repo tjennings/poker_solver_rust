@@ -20,6 +20,8 @@
 //! Each street produces a [`BucketFile`] mapping `(board, combo)` to a bucket
 //! index.
 
+use std::path::Path;
+
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
@@ -29,6 +31,7 @@ use crate::showdown_equity::compute_equity;
 
 use super::bucket_file::{BucketFile, BucketFileHeader};
 use super::clustering::{kmeans_1d, kmeans_emd};
+use super::config::ClusteringConfig;
 use super::Street;
 
 /// Number of sample 5-card boards for river clustering when no explicit count
@@ -559,6 +562,71 @@ fn compute_combo_avg_equities(
             sum / f64::from(count)
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Full pipeline orchestrator
+// ---------------------------------------------------------------------------
+
+/// Run the full bottom-up clustering pipeline: river -> turn -> flop -> preflop.
+///
+/// Each street's bucket file is saved to `output_dir` as it completes, so
+/// partial results are available even if a later stage fails or is interrupted.
+///
+/// The `progress` callback receives the street name (`"river"`, `"turn"`,
+/// `"flop"`, `"preflop"`) and a value in `[0.0, 1.0]` for that street.
+///
+/// # Errors
+///
+/// Returns an error if any bucket file cannot be saved (I/O failure).
+pub fn run_clustering_pipeline(
+    config: &ClusteringConfig,
+    output_dir: &Path,
+    progress: impl Fn(&str, f64) + Sync,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. River
+    progress("river", 0.0);
+    let river = cluster_river(
+        config.river.buckets,
+        config.kmeans_iterations,
+        config.seed,
+        |p| progress("river", p),
+    );
+    river.save(&output_dir.join("river.buckets"))?;
+
+    // 2. Turn (depends on river)
+    progress("turn", 0.0);
+    let turn = cluster_turn(
+        &river,
+        config.turn.buckets,
+        config.kmeans_iterations,
+        config.seed,
+        |p| progress("turn", p),
+    );
+    turn.save(&output_dir.join("turn.buckets"))?;
+
+    // 3. Flop (depends on turn)
+    progress("flop", 0.0);
+    let flop = cluster_flop(
+        &turn,
+        config.flop.buckets,
+        config.kmeans_iterations,
+        config.seed,
+        |p| progress("flop", p),
+    );
+    flop.save(&output_dir.join("flop.buckets"))?;
+
+    // 4. Preflop (independent, but run last by convention)
+    progress("preflop", 0.0);
+    let preflop = cluster_preflop(
+        config.preflop.buckets,
+        config.kmeans_iterations,
+        config.seed,
+        |p| progress("preflop", p),
+    );
+    preflop.save(&output_dir.join("preflop.buckets"))?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

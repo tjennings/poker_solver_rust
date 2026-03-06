@@ -403,43 +403,27 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             eprintln!("Blueprint V2 Clustering Pipeline");
             eprintln!("  Output: {}", output.display());
-
-            // River clustering
             eprintln!(
-                "\n[1/4] Clustering river ({} buckets)...",
-                bp_config.clustering.river.buckets
-            );
-            let river = poker_solver_core::blueprint_v2::cluster_pipeline::cluster_river(
-                bp_config.clustering.river.buckets,
-                bp_config.clustering.kmeans_iterations,
-                bp_config.clustering.seed,
-                |p| {
-                    if (p * 100.0) as u32 % 10 == 0 {
-                        eprint!(".");
-                    }
-                },
-            );
-            river.save(&output.join("river.buckets"))?;
-            eprintln!(" done");
-
-            // Turn clustering
-            eprintln!(
-                "[2/4] Clustering turn ({} buckets)...",
-                bp_config.clustering.turn.buckets
-            );
-            let turn = poker_solver_core::blueprint_v2::cluster_pipeline::cluster_turn(
-                &river,
+                "  Buckets: preflop={}, flop={}, turn={}, river={}",
+                bp_config.clustering.preflop.buckets,
+                bp_config.clustering.flop.buckets,
                 bp_config.clustering.turn.buckets,
-                bp_config.clustering.kmeans_iterations,
-                bp_config.clustering.seed,
-                |p| {
+                bp_config.clustering.river.buckets,
+            );
+            eprintln!();
+
+            poker_solver_core::blueprint_v2::cluster_pipeline::run_clustering_pipeline(
+                &bp_config.clustering,
+                &output,
+                |street, p| {
                     if (p * 100.0) as u32 % 10 == 0 {
-                        eprint!(".");
+                        eprint!("\r  [{street}] {:.0}%", p * 100.0);
+                    }
+                    if p >= 1.0 {
+                        eprintln!(" done");
                     }
                 },
-            );
-            turn.save(&output.join("turn.buckets"))?;
-            eprintln!(" done");
+            )?;
 
             eprintln!("\nClustering complete. Files saved to {}", output.display());
         }
