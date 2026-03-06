@@ -7,5 +7,7 @@ pub mod mutex_like;
 pub mod game;
 pub mod solver;
 
+pub(crate) mod isomorphism;
+
 mod hand_table;
 pub(crate) mod hand;
