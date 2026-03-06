@@ -38,15 +38,15 @@ impl Game for PostFlopGame {
         &self.initial_weights[player]
     }
 
+    #[inline]
     fn evaluate(
         &self,
-        _result: &mut [mem::MaybeUninit<f32>],
-        _node: &Self::Node,
-        _player: usize,
-        _cfreach: &[f32],
+        result: &mut [mem::MaybeUninit<f32>],
+        node: &Self::Node,
+        player: usize,
+        cfreach: &[f32],
     ) {
-        // Full implementation in Task 15
-        unimplemented!("evaluate: implemented in Task 15")
+        self.evaluate_internal(result, node, player, cfreach);
     }
 
     #[inline]

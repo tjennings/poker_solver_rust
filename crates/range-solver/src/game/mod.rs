@@ -1,3 +1,4 @@
+mod evaluation;
 mod interpreter;
 mod node;
 
