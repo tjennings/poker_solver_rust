@@ -16,6 +16,9 @@ use poker_solver_core::abstraction::{CardAbstraction, Street};
 use poker_solver_core::abstraction::isomorphism::{CanonicalBoard, SuitMapping};
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint::{AbstractionModeConfig, BundleConfig, StrategyBundle};
+use poker_solver_core::blueprint_v2::bundle::{self as v2_bundle, BlueprintV2Strategy};
+use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
+use poker_solver_core::blueprint_v2::game_tree::{GameNode as V2GameNode, GameTree as V2GameTree, TreeAction};
 use poker_solver_core::hand_class::{classify, intra_class_strength, HandClass};
 use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::info_key::{canonical_hand_index, canonical_hand_index_from_str, cards_from_rank_chars, encode_hand_v2, spr_bucket, InfoKey};
@@ -87,6 +90,13 @@ enum StrategySource {
         #[allow(dead_code)]
         solve_cache: Arc<RwLock<HashMap<u64, poker_solver_core::blueprint::SubgameStrategy>>>,
     },
+    BlueprintV2 {
+        config: Box<BlueprintV2Config>,
+        strategy: Box<BlueprintV2Strategy>,
+        tree: Box<V2GameTree>,
+        /// Arena-index to decision-node-index mapping.
+        decision_map: Vec<u32>,
+    },
 }
 
 impl Default for ExplorationState {
@@ -133,6 +143,8 @@ pub struct MatrixCell {
     pub pair: bool,
     /// Action probabilities (fold, check/call, bets/raises...)
     pub probabilities: Vec<ActionProb>,
+    /// Whether this hand was filtered out by the range threshold.
+    pub filtered: bool,
 }
 
 /// An action with its probability.
@@ -163,10 +175,6 @@ pub struct StrategyMatrix {
     pub stack_p2: u32,
     /// Per-player stacks (N-player generalized)
     pub stacks: Vec<u32>,
-    /// Reaching probability for player 1 (SB). Length 169, indexed by `CanonicalHand::index()`.
-    pub reaching_p1: Vec<f64>,
-    /// Reaching probability for player 2 (BB). Length 169, indexed by `CanonicalHand::index()`.
-    pub reaching_p2: Vec<f64>,
 }
 
 /// Information about an available action.
@@ -299,9 +307,12 @@ pub async fn load_bundle_core(
             hand_avg_values,
         };
         (info, source, None)
+    } else if bundle_path.join("config.yaml").exists() {
+        // Blueprint V2 bundle — delegate to the dedicated loader.
+        return load_blueprint_v2_core(state, path).await;
     } else {
         return Err(
-            "Directory contains neither blueprint.bin nor strategy.bin".to_string(),
+            "Directory contains neither blueprint.bin, strategy.bin, nor config.yaml".to_string(),
         );
     };
 
@@ -480,14 +491,108 @@ pub async fn load_subgame_source(
     load_subgame_source_core(&state, blueprint_path).await
 }
 
+/// Load a Blueprint V2 bundle from a directory (core logic, no Tauri dependency).
+///
+/// Expects:
+///   `dir_path/config.yaml` — `BlueprintV2Config`
+///   `dir_path/strategy.bin` or `dir_path/final/strategy.bin` — `BlueprintV2Strategy`
+pub async fn load_blueprint_v2_core(
+    state: &ExplorationState,
+    dir_path: String,
+) -> Result<BundleInfo, String> {
+    let dir = PathBuf::from(&dir_path);
+    let (config, strategy) = tokio::task::spawn_blocking(move || {
+        let cfg = v2_bundle::load_config(&dir)
+            .map_err(|e| format!("Failed to load config.yaml: {e}"))?;
+
+        // Try final/strategy.bin first, then strategy.bin at root.
+        let strat_path = if dir.join("final/strategy.bin").exists() {
+            dir.join("final/strategy.bin")
+        } else if dir.join("strategy.bin").exists() {
+            dir.join("strategy.bin")
+        } else {
+            // Look for the latest snapshot_NNNN directory.
+            let mut snapshots: Vec<_> = std::fs::read_dir(&dir)
+                .map_err(|e| format!("Cannot read directory: {e}"))?
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("snapshot_"))
+                })
+                .collect();
+            snapshots.sort_by_key(|e| e.file_name());
+            match snapshots.last() {
+                Some(entry) => entry.path().join("strategy.bin"),
+                None => {
+                    return Err(
+                        "No strategy.bin found in bundle directory".to_string()
+                    )
+                }
+            }
+        };
+
+        let strat = BlueprintV2Strategy::load(&strat_path)
+            .map_err(|e| format!("Failed to load strategy.bin: {e}"))?;
+
+        Ok::<_, String>((cfg, strat))
+    })
+    .await
+    .map_err(|e| format!("Load task panicked: {e}"))??;
+
+    let aa = &config.action_abstraction;
+    let tree = V2GameTree::build(
+        config.game.stack_depth,
+        config.game.small_blind,
+        config.game.big_blind,
+        &aa.preflop,
+        &aa.flop,
+        &aa.turn,
+        &aa.river,
+        aa.max_raises,
+    );
+    let decision_map = tree.decision_index_map();
+
+    let (decision_nodes, _, _) = tree.node_counts();
+    let info = BundleInfo {
+        name: Some("Blueprint V2".to_string()),
+        stack_depth: config.game.stack_depth as u32,
+        bet_sizes: vec![],
+        info_sets: decision_nodes,
+        iterations: strategy.iterations,
+        preflop_only: false,
+    };
+
+    *state.source.write() = Some(StrategySource::BlueprintV2 {
+        config: Box::new(config),
+        strategy: Box::new(strategy),
+        tree: Box::new(tree),
+        decision_map,
+    });
+    state.bucket_cache.write().clear();
+    *state.suit_mapping.write() = None;
+
+    Ok(info)
+}
+
+/// Load a Blueprint V2 bundle (Tauri wrapper).
+#[tauri::command]
+pub async fn load_blueprint_v2(
+    state: State<'_, ExplorationState>,
+    path: String,
+) -> Result<BundleInfo, String> {
+    load_blueprint_v2_core(&state, path).await
+}
+
 /// Get the strategy matrix for a given position (core logic, no Tauri dependency).
 ///
-/// `street_histories` supplies the action sequences of all completed streets
-/// so that `compute_reaching_range` can replay the game and return cumulative
-/// reaching probabilities for each canonical hand.
+/// `threshold` filters out hands whose prior action probabilities fell below
+/// this value (range narrowing).  `street_histories` supplies the action
+/// sequences of all completed streets so the filter can replay the game.
 pub fn get_strategy_matrix_core(
     state: &ExplorationState,
     position: ExplorationPosition,
+    threshold: Option<f32>,
     street_histories: Option<Vec<Vec<String>>>,
 ) -> Result<StrategyMatrix, String> {
     let source_guard = state.source.read();
@@ -496,10 +601,11 @@ pub fn get_strategy_matrix_core(
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
     let sh = street_histories.unwrap_or_default();
+    let thresh = threshold.unwrap_or(0.0);
 
     match source {
         StrategySource::Bundle { config, blueprint } => {
-            get_strategy_matrix_bundle(config, blueprint, state, &position, &sh)
+            get_strategy_matrix_bundle(config, blueprint, state, &position, thresh, &sh)
         }
         StrategySource::Agent(agent) => get_strategy_matrix_agent(agent, &position),
         StrategySource::PreflopSolve { config, strategy, .. } => {
@@ -514,8 +620,15 @@ pub fn get_strategy_matrix_core(
             blueprint,
             state,
             &position,
+            thresh,
             &sh,
         ),
+        StrategySource::BlueprintV2 {
+            config,
+            strategy,
+            tree,
+            decision_map,
+        } => get_strategy_matrix_v2(config, strategy, tree, decision_map, &position),
     }
 }
 
@@ -524,9 +637,10 @@ pub fn get_strategy_matrix_core(
 pub fn get_strategy_matrix(
     state: State<'_, ExplorationState>,
     position: ExplorationPosition,
+    threshold: Option<f32>,
     street_histories: Option<Vec<Vec<String>>>,
 ) -> Result<StrategyMatrix, String> {
-    get_strategy_matrix_core(&state, position, street_histories)
+    get_strategy_matrix_core(&state, position, threshold, street_histories)
 }
 
 fn get_strategy_matrix_bundle(
@@ -534,6 +648,7 @@ fn get_strategy_matrix_bundle(
     blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
     state: &ExplorationState,
     position: &ExplorationPosition,
+    threshold: f32,
     street_histories: &[Vec<String>],
 ) -> Result<StrategyMatrix, String> {
     let board = parse_board(&position.board)?;
@@ -559,30 +674,31 @@ fn get_strategy_matrix_bundle(
             None
         };
 
-    // Compute reaching probabilities for both players
-    let reaching_p1 = compute_reaching_range(
-        config,
-        blueprint,
-        &board,
-        street_histories,
-        &position.history,
-        0,
-    );
-    let reaching_p2 = compute_reaching_range(
-        config,
-        blueprint,
-        &board,
-        street_histories,
-        &position.history,
-        1,
-    );
+    // Range filtering: only for hand_class bundles with a positive threshold
+    let apply_filter = use_hand_class && threshold > 0.0;
 
     for (row, &rank1) in ranks.iter().enumerate() {
         let mut row_cells = Vec::with_capacity(13);
         for (col, &rank2) in ranks.iter().enumerate() {
             let (hand_label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
 
-            let probabilities = {
+            let filtered = apply_filter
+                && !is_hand_in_range(
+                    config,
+                    blueprint,
+                    &board,
+                    street_histories,
+                    &position.history,
+                    position.to_act,
+                    threshold,
+                    rank1,
+                    rank2,
+                    suited,
+                );
+
+            let probabilities = if filtered {
+                vec![]
+            } else {
                 let hand_bits = if mode == AbstractionModeConfig::HandClassV2 {
                     hand_bits_hand_class_v2(config, street, &board, rank1, rank2, suited)
                 } else {
@@ -604,6 +720,7 @@ fn get_strategy_matrix_bundle(
                 suited,
                 pair,
                 probabilities,
+                filtered,
             });
         }
         cells.push(row_cells);
@@ -623,8 +740,6 @@ fn get_strategy_matrix_bundle(
         stack_p1: pos_state.stack_p1,
         stack_p2: pos_state.stack_p2,
         stacks: vec![pos_state.stack_p1, pos_state.stack_p2],
-        reaching_p1: reaching_p1.to_vec(),
-        reaching_p2: reaching_p2.to_vec(),
     })
 }
 
@@ -662,6 +777,7 @@ fn get_strategy_matrix_agent(
                 suited,
                 pair,
                 probabilities,
+                filtered: false,
             });
         }
         cells.push(row_cells);
@@ -683,8 +799,6 @@ fn get_strategy_matrix_agent(
         stack_p1: pos_state.stack_p1,
         stack_p2: pos_state.stack_p2,
         stacks: vec![pos_state.stack_p1, pos_state.stack_p2],
-        reaching_p1: vec![1.0; 169],
-        reaching_p2: vec![1.0; 169],
     })
 }
 
@@ -745,6 +859,7 @@ fn get_strategy_matrix_preflop(
                 suited,
                 pair,
                 probabilities,
+                filtered: false,
             });
         }
         cells.push(row_cells);
@@ -760,67 +875,7 @@ fn get_strategy_matrix_preflop(
         stack_p1: walk.stacks.first().copied().unwrap_or(0),
         stack_p2: walk.stacks.get(1).copied().unwrap_or(0),
         stacks: walk.stacks,
-        reaching_p1: compute_reaching_range_preflop(config, strategy, &position.history, 0).to_vec(),
-        reaching_p2: compute_reaching_range_preflop(config, strategy, &position.history, 1).to_vec(),
     })
-}
-
-/// Compute reaching probabilities for a player by replaying the preflop tree.
-///
-/// At each decision node where `viewing_player` acts, multiply each hand's
-/// reaching probability by `1 - fold_probability`. This filters out only
-/// hands that would have folded, keeping all non-folding hands at full weight
-/// regardless of which specific sizing they chose.
-fn compute_reaching_range_preflop(
-    config: &poker_solver_core::preflop::PreflopConfig,
-    strategy: &poker_solver_core::preflop::PreflopStrategy,
-    history: &[String],
-    viewing_player: u8,
-) -> [f64; 169] {
-    use poker_solver_core::preflop::{PreflopAction, PreflopNode, PreflopTree};
-
-    let tree = PreflopTree::build(config);
-    let mut reaching = [1.0f64; 169];
-    let mut node_idx = 0u32;
-
-    for action_str in history {
-        let node = &tree.nodes[node_idx as usize];
-        let (action_labels, children, position) = match node {
-            PreflopNode::Decision {
-                action_labels,
-                children,
-                position,
-            } => (action_labels, children, *position),
-            PreflopNode::Terminal { .. } => break,
-        };
-
-        let child_pos = match find_action_position(action_str, action_labels) {
-            Some(p) => p,
-            None => break,
-        };
-
-        // If this is the viewing player's decision, multiply by (1 - fold_prob)
-        if position == viewing_player {
-            let fold_idx = action_labels
-                .iter()
-                .position(|a| matches!(a, PreflopAction::Fold));
-            if let Some(fi) = fold_idx {
-                for hand_idx in 0..169 {
-                    if reaching[hand_idx] < 1e-15 {
-                        continue;
-                    }
-                    let probs = strategy.get_probs(node_idx, hand_idx);
-                    let fold_prob = probs.get(fi).copied().unwrap_or(0.0);
-                    reaching[hand_idx] *= 1.0 - fold_prob;
-                }
-            }
-            // If no fold action exists at this node, reaching stays unchanged
-        }
-
-        node_idx = children[child_pos];
-    }
-
-    reaching
 }
 
 /// Result of walking the preflop tree with full state tracking.
@@ -1018,6 +1073,302 @@ fn preflop_action_info(
     }
 }
 
+// ── Blueprint V2 helpers ─────────────────────────────────────────────
+
+/// Result of walking the V2 game tree following an action history.
+struct V2WalkState {
+    node_idx: u32,
+    #[allow(dead_code)]
+    pot: f64,
+    #[allow(dead_code)]
+    stacks: [f64; 2],
+    #[allow(dead_code)]
+    to_call: f64,
+    #[allow(dead_code)]
+    to_act: u8,
+}
+
+/// Walk the V2 game tree following an action history.
+///
+/// Action strings: `"f"` fold, `"c"` call/check, `"r:{idx}"` raise by
+/// action index, `"r:A"` all-in.
+fn walk_v2_tree(
+    tree: &V2GameTree,
+    history: &[String],
+) -> Result<V2WalkState, String> {
+    let mut node_idx = tree.root;
+
+    for action_str in history {
+        let node = &tree.nodes[node_idx as usize];
+        let (actions, children) = match node {
+            V2GameNode::Decision {
+                actions, children, ..
+            } => (actions, children),
+            V2GameNode::Chance { child, .. } => {
+                // Skip chance nodes automatically.
+                node_idx = *child;
+                let node2 = &tree.nodes[node_idx as usize];
+                match node2 {
+                    V2GameNode::Decision {
+                        actions, children, ..
+                    } => (actions, children),
+                    _ => {
+                        return Err(format!(
+                            "Expected decision after chance, got terminal at node {node_idx}"
+                        ));
+                    }
+                }
+            }
+            V2GameNode::Terminal { .. } => {
+                return Err(format!(
+                    "Reached terminal before processing action '{action_str}'"
+                ));
+            }
+        };
+
+        let child_pos = find_v2_action_position(action_str, actions)
+            .ok_or_else(|| {
+                format!(
+                    "Action '{action_str}' not available at node {node_idx}. \
+                     Available: {actions:?}"
+                )
+            })?;
+
+        node_idx = children[child_pos];
+
+        // If we land on a Chance node, advance through it automatically.
+        if let V2GameNode::Chance { child, .. } = &tree.nodes[node_idx as usize] {
+            node_idx = *child;
+        }
+    }
+
+    // Compute pot, stacks, to_call from the current node.
+    let (to_act, pot, stacks, to_call) = v2_node_state(tree, node_idx);
+
+    Ok(V2WalkState {
+        node_idx,
+        pot,
+        stacks,
+        to_call,
+        to_act,
+    })
+}
+
+/// Compute pot/stacks/to_call at a V2 tree node.
+///
+/// For terminal and chance nodes, returns zeros for to_call.
+fn v2_node_state(tree: &V2GameTree, node_idx: u32) -> (u8, f64, [f64; 2], f64) {
+    match &tree.nodes[node_idx as usize] {
+        V2GameNode::Decision {
+            player, ..
+        } => {
+            // Walk up to find invested amounts from the nearest terminal child
+            // or from root state. For simplicity in the explorer, recompute
+            // from the tree structure: invested amounts are tracked in terminals.
+            //
+            // Since we don't have parent pointers, we use a simpler approach:
+            // we pass the position's pot/stacks from the ExplorationPosition.
+            // This function returns defaults that get overridden.
+            (*player, 0.0, [0.0; 2], 0.0)
+        }
+        V2GameNode::Terminal { pot, invested, .. } => (0, *pot, *invested, 0.0),
+        V2GameNode::Chance { child, .. } => v2_node_state(tree, *child),
+    }
+}
+
+/// Find the position of a history action string within V2 tree actions.
+fn find_v2_action_position(action_str: &str, actions: &[TreeAction]) -> Option<usize> {
+    match action_str {
+        "f" | "fold" => actions.iter().position(|a| matches!(a, TreeAction::Fold)),
+        "c" | "call" | "x" | "check" => actions
+            .iter()
+            .position(|a| matches!(a, TreeAction::Check | TreeAction::Call)),
+        _ => {
+            let suffix = action_str.split(':').nth(1).unwrap_or("");
+            if suffix == "A" {
+                return actions
+                    .iter()
+                    .position(|a| matches!(a, TreeAction::AllIn));
+            }
+            if let Ok(idx) = suffix.parse::<usize>() {
+                if idx < actions.len() {
+                    return Some(idx);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Build `ActionInfo` items for actions at a V2 tree node.
+fn v2_actions_at_node(tree: &V2GameTree, node_idx: u32) -> Vec<ActionInfo> {
+    match &tree.nodes[node_idx as usize] {
+        V2GameNode::Decision { actions, .. } => actions
+            .iter()
+            .enumerate()
+            .map(|(i, a)| v2_action_info(a, i))
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// Convert a V2 `TreeAction` to an `ActionInfo`.
+#[allow(clippy::cast_possible_truncation)]
+fn v2_action_info(action: &TreeAction, idx: usize) -> ActionInfo {
+    match action {
+        TreeAction::Fold => ActionInfo {
+            id: "fold".to_string(),
+            label: "Fold".to_string(),
+            action_type: "fold".to_string(),
+            size_key: None,
+        },
+        TreeAction::Check => ActionInfo {
+            id: "check".to_string(),
+            label: "Check".to_string(),
+            action_type: "check".to_string(),
+            size_key: None,
+        },
+        TreeAction::Call => ActionInfo {
+            id: "call".to_string(),
+            label: "Call".to_string(),
+            action_type: "call".to_string(),
+            size_key: None,
+        },
+        TreeAction::Bet(amount) => ActionInfo {
+            id: format!("r:{idx}"),
+            label: format!("{:.1}bb", amount),
+            action_type: "bet".to_string(),
+            size_key: Some(format!("{amount:.2}")),
+        },
+        TreeAction::Raise(amount) => ActionInfo {
+            id: format!("r:{idx}"),
+            label: format!("{:.1}bb", amount),
+            action_type: "raise".to_string(),
+            size_key: Some(format!("{amount:.2}")),
+        },
+        TreeAction::AllIn => ActionInfo {
+            id: "r:A".to_string(),
+            label: "All-in".to_string(),
+            action_type: "allin".to_string(),
+            size_key: Some("allin".to_string()),
+        },
+    }
+}
+
+/// Get the strategy matrix for a BlueprintV2 source.
+#[allow(clippy::cast_possible_truncation)]
+fn get_strategy_matrix_v2(
+    _config: &BlueprintV2Config,
+    strategy: &BlueprintV2Strategy,
+    tree: &V2GameTree,
+    decision_map: &[u32],
+    position: &ExplorationPosition,
+) -> Result<StrategyMatrix, String> {
+    let walk = walk_v2_tree(tree, &position.history)?;
+    let actions = v2_actions_at_node(tree, walk.node_idx);
+
+    if actions.is_empty() {
+        return Err("Position is at a terminal node".to_string());
+    }
+
+    let decision_idx = decision_map
+        .get(walk.node_idx as usize)
+        .copied()
+        .unwrap_or(u32::MAX);
+
+    if decision_idx == u32::MAX {
+        return Err(format!(
+            "Node {} is not a decision node",
+            walk.node_idx
+        ));
+    }
+
+    // Determine the street from the node.
+    let street_name = match &tree.nodes[walk.node_idx as usize] {
+        V2GameNode::Decision { street, .. } => match street {
+            poker_solver_core::blueprint_v2::Street::Preflop => "Preflop",
+            poker_solver_core::blueprint_v2::Street::Flop => "Flop",
+            poker_solver_core::blueprint_v2::Street::Turn => "Turn",
+            poker_solver_core::blueprint_v2::Street::River => "River",
+        },
+        _ => "Unknown",
+    };
+
+    let is_preflop = street_name == "Preflop";
+    let num_buckets = strategy.bucket_counts[
+        strategy.node_street_indices[decision_idx as usize] as usize
+    ] as usize;
+
+    let ranks = RANKS;
+    let mut cells = Vec::with_capacity(13);
+
+    for (row, &rank1) in ranks.iter().enumerate() {
+        let mut row_cells = Vec::with_capacity(13);
+        for (col, &rank2) in ranks.iter().enumerate() {
+            let (hand_label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
+
+            let probabilities = if is_preflop {
+                // For preflop, canonical hand index maps directly to bucket.
+                let hand_idx = canonical_hand_index_from_ranks(rank1, rank2, suited);
+                let bucket = if num_buckets == 169 {
+                    hand_idx as u16
+                } else {
+                    // If fewer buckets, use modulo as a placeholder.
+                    (hand_idx % num_buckets) as u16
+                };
+                let probs = strategy.get_action_probs(decision_idx as usize, bucket);
+                actions
+                    .iter()
+                    .zip(probs.iter().chain(std::iter::repeat(&0.0f32)))
+                    .map(|(a, &p)| ActionProb {
+                        action: a.label.clone(),
+                        probability: p,
+                    })
+                    .collect()
+            } else {
+                // Postflop: bucket assignment requires cluster data which
+                // is not yet loaded. Return uniform distribution.
+                let n = actions.len();
+                let uniform = 1.0 / n as f32;
+                actions
+                    .iter()
+                    .map(|a| ActionProb {
+                        action: a.label.clone(),
+                        probability: uniform,
+                    })
+                    .collect()
+            };
+
+            row_cells.push(MatrixCell {
+                hand: hand_label,
+                suited,
+                pair,
+                probabilities,
+                filtered: false,
+            });
+        }
+        cells.push(row_cells);
+    }
+
+    // Compute pot/stacks from the ExplorationPosition (the canonical source).
+    let pot = position.pot;
+    let stack_p1 = position.stacks.first().copied().unwrap_or(0);
+    let stack_p2 = position.stacks.get(1).copied().unwrap_or(0);
+    let to_call = 0; // The frontend computes this from position data.
+
+    Ok(StrategyMatrix {
+        cells,
+        actions,
+        street: street_name.to_string(),
+        pot,
+        stack: if position.to_act == 0 { stack_p1 } else { stack_p2 },
+        to_call,
+        stack_p1,
+        stack_p2,
+        stacks: position.stacks.clone(),
+    })
+}
+
 /// Get the canonical hand index (0..169) from rank characters.
 fn canonical_hand_index_from_ranks(rank1: char, rank2: char, suited: bool) -> usize {
     let v1 = char_to_value(rank1);
@@ -1036,6 +1387,12 @@ pub fn get_available_actions_core(
         .as_ref()
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
+    // BlueprintV2 derives actions from the game tree rather than bet sizes.
+    if let StrategySource::BlueprintV2 { tree, .. } = source {
+        let walk = walk_v2_tree(tree, &position.history)?;
+        return Ok(v2_actions_at_node(tree, walk.node_idx));
+    }
+
     let (stack_depth, bet_sizes) = match source {
         StrategySource::Bundle { config, .. } | StrategySource::SubgameSolve { blueprint_config: config, .. } => {
             (config.game.stack_depth, config.game.bet_sizes.as_slice())
@@ -1046,6 +1403,7 @@ pub fn get_available_actions_core(
             // Preflop uses tree-based actions, return empty bet_sizes
             (depth, [].as_slice())
         }
+        StrategySource::BlueprintV2 { .. } => unreachable!(),
     };
 
     Ok(get_actions_for_position(stack_depth, bet_sizes, &position))
@@ -1115,6 +1473,22 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
             iterations: blueprint.iterations_trained(),
             preflop_only: false,
         },
+        StrategySource::BlueprintV2 {
+            config,
+            strategy,
+            tree,
+            ..
+        } => {
+            let (decision_nodes, _, _) = tree.node_counts();
+            BundleInfo {
+                name: Some("Blueprint V2".to_string()),
+                stack_depth: config.game.stack_depth as u32,
+                bet_sizes: vec![],
+                info_sets: decision_nodes,
+                iterations: strategy.iterations,
+                preflop_only: false,
+            }
+        }
     })
 }
 
@@ -1261,7 +1635,11 @@ pub fn start_bucket_computation_core(
     {
         let source_guard = state.source.read();
         match source_guard.as_ref() {
-            Some(StrategySource::Agent(_) | StrategySource::PreflopSolve { .. }) => {
+            Some(
+                StrategySource::Agent(_)
+                | StrategySource::PreflopSolve { .. }
+                | StrategySource::BlueprintV2 { .. },
+            ) => {
                 return Ok(board_key);
             }
             Some(StrategySource::Bundle { config, .. })
@@ -1521,74 +1899,6 @@ fn format_card_short(card: &Card) -> String {
     format!("{rank}{suit}")
 }
 
-/// Information about a discoverable dataset (strategy bundle or agent).
-#[derive(Debug, Clone, Serialize)]
-pub struct DatasetInfo {
-    pub name: String,
-    pub path: String,
-    pub kind: &'static str, // "preflop", "postflop", "agent"
-}
-
-/// List all loadable datasets from `local_data/` and `agents/` directories.
-#[tauri::command]
-pub fn list_datasets() -> Result<Vec<DatasetInfo>, String> {
-    let mut datasets = Vec::new();
-
-    // Scan local_data/ for strategy bundles
-    if let Some(data_dir) = find_dir("local_data") {
-        if let Ok(entries) = std::fs::read_dir(&data_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let kind = if path.join("blueprint.bin").exists() {
-                    "postflop"
-                } else if path.join("strategy.bin").exists() {
-                    "preflop"
-                } else {
-                    continue;
-                };
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                datasets.push(DatasetInfo {
-                    name,
-                    path: path.to_string_lossy().to_string(),
-                    kind,
-                });
-            }
-        }
-    }
-
-    // Scan agents/
-    if let Some(agents_dir) = find_dir("agents") {
-        if let Ok(entries) = std::fs::read_dir(&agents_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                    continue;
-                }
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                datasets.push(DatasetInfo {
-                    name,
-                    path: path.to_string_lossy().to_string(),
-                    kind: "agent",
-                });
-            }
-        }
-    }
-
-    datasets.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
-    Ok(datasets)
-}
-
 /// List available agent configs from the agents/ directory.
 ///
 /// Searches for `agents/` in the current directory and up to 4 parent
@@ -1630,11 +1940,11 @@ pub fn list_agents() -> Result<Vec<AgentInfo>, String> {
     Ok(agents)
 }
 
-/// Walk up from CWD looking for a named directory (max 4 levels).
-fn find_dir(name: &str) -> Option<PathBuf> {
+/// Walk up from CWD looking for an `agents/` directory (max 4 levels).
+fn find_agents_dir() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     for _ in 0..5 {
-        let candidate = dir.join(name);
+        let candidate = dir.join("agents");
         if candidate.is_dir() {
             return Some(candidate);
         }
@@ -1643,11 +1953,6 @@ fn find_dir(name: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Walk up from CWD looking for an `agents/` directory (max 4 levels).
-fn find_agents_dir() -> Option<PathBuf> {
-    find_dir("agents")
 }
 
 /// A group of combos sharing the same hand classification.
@@ -1704,7 +2009,9 @@ pub fn get_combo_classes_core(
             blueprint,
             ..
         } => (blueprint_config, blueprint.as_ref()),
-        StrategySource::Agent(_) | StrategySource::PreflopSolve { .. } => {
+        StrategySource::Agent(_)
+        | StrategySource::PreflopSolve { .. }
+        | StrategySource::BlueprintV2 { .. } => {
             return Ok(empty_combo_info(&hand));
         }
     };
@@ -1967,32 +2274,35 @@ fn value_to_char(v: Value) -> char {
 }
 
 // ============================================================================
-// Reaching range computation
+// Range filtering
 // ============================================================================
 
-/// Compute reaching probability for all 169 canonical hands by replaying
-/// the action history through the blueprint strategy.
+/// Check if a hand would be in the viewing player's range at the current position.
 ///
-/// Returns `[f64; 169]` where each element is the cumulative product of
-/// `(1 - fold_probability)` for the given player across all streets.
-/// Only hands that fold are removed from the range; specific bet sizing
-/// choices do not narrow the range.
-fn compute_reaching_range(
+/// Replays the full game history (completed streets + current street) and
+/// checks that at each prior decision point of the viewing player, the action
+/// taken had at least `threshold` probability in the blueprint.
+#[allow(clippy::too_many_arguments)]
+fn is_hand_in_range(
     config: &BundleConfig,
     blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
     full_board: &[Card],
     street_histories: &[Vec<String>],
     current_history: &[String],
     viewing_player: u8,
-) -> [f64; 169] {
+    threshold: f32,
+    rank1: char,
+    rank2: char,
+    suited: bool,
+) -> bool {
     let bet_sizes = &config.game.bet_sizes;
-    let mut reaching = [1.0f64; 169];
     let mut stacks = [
         config.game.stack_depth * 2 - 1,
         config.game.stack_depth * 2 - 2,
     ];
     let mut pot = 3u32;
 
+    // Process completed streets, then the current street
     let all_streets: Vec<&[String]> = street_histories
         .iter()
         .map(|v| v.as_slice())
@@ -2007,69 +2317,32 @@ fn compute_reaching_range(
         for (i, action) in street_actions.iter().enumerate() {
             let acting_player = (i % 2) as u8;
 
-            if acting_player == viewing_player {
-                // Fold is only possible when facing a bet (to_call > 0).
-                // Fold index in the strategy vector is always 0 when it exists.
-                let fold_idx = if to_call > 0 { Some(0usize) } else { None };
-
-                if let Some(fi) = fold_idx {
-                    for (hand_idx, reach) in reaching.iter_mut().enumerate() {
-                        if *reach < 1e-15 {
-                            continue;
-                        }
-                        let hand = match CanonicalHand::from_index(hand_idx) {
-                            Some(h) => h,
-                            None => continue,
-                        };
-                        let rank1 = value_to_char(hand.high_value());
-                        let rank2 = value_to_char(hand.low_value());
-                        let suited = hand.is_suited();
-
-                        let hand_bits = hand_bits_at_street(
-                            config,
-                            rank1,
-                            rank2,
-                            suited,
-                            board_for_street,
-                            street_idx,
-                        );
-                        let street_num = street_idx.min(3) as u8;
-                        let eff_stack = stacks[0].min(stacks[1]);
-                        let key = InfoKey::new(
-                            hand_bits,
-                            street_num,
-                            spr_bucket(pot, eff_stack),
-                            &action_codes,
-                        )
-                        .as_u64();
-
-                        let fold_prob = match blueprint.lookup(key) {
-                            Some(strategy) => strategy
-                                .get(fi)
-                                .copied()
-                                .map(f64::from)
-                                .unwrap_or(0.0),
-                            None => 0.0,
-                        };
-                        *reach *= 1.0 - fold_prob;
-                    }
-                }
-                // If no fold action possible (check spot), reaching unchanged
+            if acting_player == viewing_player
+                && !action_meets_threshold(
+                    blueprint,
+                    config,
+                    board_for_street,
+                    street_idx,
+                    &action_codes,
+                    pot,
+                    &stacks,
+                    to_call,
+                    action,
+                    threshold,
+                    rank1,
+                    rank2,
+                    suited,
+                )
+            {
+                return false;
             }
 
             action_codes.push(action_to_code(action));
-            apply_action(
-                action,
-                i % 2,
-                &mut stacks,
-                &mut pot,
-                &mut to_call,
-                bet_sizes,
-            );
+            apply_action(action, i % 2, &mut stacks, &mut pot, &mut to_call, bet_sizes);
         }
     }
 
-    reaching
+    true
 }
 
 /// Board cards visible during a given street.
@@ -2090,6 +2363,42 @@ fn initial_to_call(street_idx: usize, stacks: &[u32; 2]) -> u32 {
         stacks[0].saturating_sub(stacks[1])
     } else {
         0
+    }
+}
+
+/// Check whether a single action's blueprint probability meets the threshold.
+#[allow(clippy::too_many_arguments)]
+fn action_meets_threshold(
+    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
+    config: &BundleConfig,
+    board: &[Card],
+    street_idx: usize,
+    action_codes: &[u8],
+    pot: u32,
+    stacks: &[u32; 2],
+    to_call: u32,
+    action: &str,
+    threshold: f32,
+    rank1: char,
+    rank2: char,
+    suited: bool,
+) -> bool {
+    let hand_bits = hand_bits_at_street(config, rank1, rank2, suited, board, street_idx);
+    let street_num = street_idx.min(3) as u8;
+    let eff_stack = stacks[0].min(stacks[1]);
+    let key = InfoKey::new(hand_bits, street_num, spr_bucket(pot, eff_stack), action_codes).as_u64();
+
+    let strategy = match blueprint.lookup(key) {
+        Some(s) => s,
+        None => return true, // no data → assume in range
+    };
+
+    let code = action_to_code(action);
+    let idx = action_code_to_strategy_index(code, to_call, config.game.bet_sizes.len());
+
+    match idx.and_then(|i| strategy.get(i)) {
+        Some(&prob) => prob >= threshold,
+        None => true,
     }
 }
 
@@ -2130,6 +2439,26 @@ fn hand_bits_at_street(
         )
     } else {
         classification.bits()
+    }
+}
+
+/// Map an action code to its index in the strategy probability vector.
+fn action_code_to_strategy_index(code: u8, to_call: u32, num_bet_sizes: usize) -> Option<usize> {
+    match code {
+        1 => {
+            // fold — only valid when facing a bet
+            if to_call > 0 { Some(0) } else { None }
+        }
+        2 => Some(if to_call > 0 { 1 } else { 0 }), // check
+        3 => {
+            // call
+            if to_call > 0 { Some(1) } else { None }
+        }
+        4..=8 => Some(1 + (code - 4) as usize),                 // bet:idx (to_call == 0)
+        9..=13 => Some(2 + (code - 9) as usize),               // raise:idx (to_call > 0)
+        14 => Some(1 + num_bet_sizes),                          // bet all-in
+        15 => Some(2 + num_bet_sizes),                          // raise all-in
+        _ => None,
     }
 }
 

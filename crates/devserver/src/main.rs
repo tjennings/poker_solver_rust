@@ -36,6 +36,7 @@ struct BlueprintPathParams {
 #[derive(Deserialize)]
 struct StrategyMatrixParams {
     position: poker_solver_tauri::ExplorationPosition,
+    threshold: Option<f32>,
     street_histories: Option<Vec<Vec<String>>>,
 }
 
@@ -122,6 +123,15 @@ async fn handle_load_subgame_source(
     )
 }
 
+async fn handle_load_blueprint_v2(
+    AxumState(state): AxumState<AppState>,
+    Json(params): Json<PathParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(
+        poker_solver_tauri::load_blueprint_v2_core(&state, params.path).await,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Handlers — sync core functions (with params)
 // ---------------------------------------------------------------------------
@@ -133,6 +143,7 @@ async fn handle_get_strategy_matrix(
     result_to_response(poker_solver_tauri::get_strategy_matrix_core(
         &state,
         params.position,
+        params.threshold,
         params.street_histories,
     ))
 }
@@ -225,11 +236,6 @@ async fn handle_list_agents(
     result_to_response(poker_solver_tauri::list_agents())
 }
 
-async fn handle_list_datasets(
-) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::list_datasets())
-}
-
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -248,6 +254,7 @@ async fn main() {
         .route("/api/load_preflop_solve", post(handle_load_preflop_solve))
         .route("/api/solve_preflop_live", post(handle_solve_preflop_live))
         .route("/api/load_subgame_source", post(handle_load_subgame_source))
+        .route("/api/load_blueprint_v2", post(handle_load_blueprint_v2))
         .route("/api/get_strategy_matrix", post(handle_get_strategy_matrix))
         .route(
             "/api/get_available_actions",
@@ -266,7 +273,6 @@ async fn main() {
         )
         .route("/api/is_board_cached", post(handle_is_board_cached))
         .route("/api/list_agents", post(handle_list_agents))
-        .route("/api/list_datasets", post(handle_list_datasets))
         .route("/api/get_combo_classes", post(handle_get_combo_classes))
         .route("/api/get_hand_equity", post(handle_get_hand_equity))
         .layer(cors)

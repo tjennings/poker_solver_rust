@@ -28,6 +28,8 @@ use poker_solver_core::preflop::equity_table_cache::EquityTableCache;
 use poker_solver_core::preflop::rank_array_cache::{
     compute_rank_arrays, derive_equity_table, RankArrayCache,
 };
+use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
+use poker_solver_core::blueprint_v2::trainer::BlueprintTrainer;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -170,6 +172,12 @@ enum Commands {
         #[arg(long, default_value = "r:3")]
         history: String,
     },
+    /// Show diagnostics for pre-computed cluster bucket files (Blueprint V2)
+    DiagClusters {
+        /// Directory containing .buckets files
+        #[arg(short = 'd', long)]
+        cluster_dir: PathBuf,
+    },
     /// Dump terminal node values from a decision node for a specific matchup.
     TraceTerminals {
         /// YAML config file (same as solve-preflop)
@@ -184,6 +192,21 @@ enum Commands {
         /// Action history to reach the target node (e.g. "call,r:3")
         #[arg(long, default_value = "call,r:3")]
         history: String,
+    },
+    /// Train a full-game blueprint strategy using MCCFR (Blueprint V2)
+    TrainBlueprint {
+        /// YAML config file (BlueprintV2Config)
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Run the clustering pipeline to build bucket assignments (Blueprint V2)
+    Cluster {
+        /// YAML config file (BlueprintV2Config — uses clustering section)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Output directory for bucket files
+        #[arg(short, long)]
+        output: PathBuf,
     },
 }
 
@@ -348,8 +371,77 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::DecomposeRegrets { config, iterations, hand, history } => {
             run_decompose_regrets(&config, iterations, &hand, &history)?;
         }
+        Commands::DiagClusters { cluster_dir } => {
+            let reports = poker_solver_core::blueprint_v2::cluster_diagnostics::diagnose_cluster_dir(&cluster_dir)?;
+            if reports.is_empty() {
+                eprintln!("No .buckets files found in {}", cluster_dir.display());
+            } else {
+                for report in &reports {
+                    eprintln!("{}", report.summary());
+                }
+            }
+        }
         Commands::TraceTerminals { config, hero, opp, history } => {
             run_trace_terminals(&config, &hero, &opp, &history)?;
+        }
+        Commands::TrainBlueprint { config } => {
+            let yaml = std::fs::read_to_string(&config)?;
+            let bp_config: BlueprintV2Config = serde_yaml::from_str(&yaml)?;
+
+            eprintln!("Blueprint V2 Training");
+            eprintln!("  Stack: {}BB", bp_config.game.stack_depth);
+            eprintln!(
+                "  Buckets: preflop={}, flop={}, turn={}, river={}",
+                bp_config.clustering.preflop.buckets,
+                bp_config.clustering.flop.buckets,
+                bp_config.clustering.turn.buckets,
+                bp_config.clustering.river.buckets,
+            );
+            eprintln!("  Actions: max_raises={}", bp_config.action_abstraction.max_raises);
+            if let Some(iters) = bp_config.training.iterations {
+                eprintln!("  Iterations: {iters}");
+            }
+            if let Some(mins) = bp_config.training.time_limit_minutes {
+                eprintln!("  Time limit: {mins} min");
+            }
+            eprintln!();
+
+            let mut trainer = BlueprintTrainer::new(bp_config);
+            trainer.train()?;
+
+            eprintln!("\nTraining complete: {} iterations", trainer.iterations);
+        }
+        Commands::Cluster { config, output } => {
+            let yaml = std::fs::read_to_string(&config)?;
+            let bp_config: BlueprintV2Config = serde_yaml::from_str(&yaml)?;
+
+            std::fs::create_dir_all(&output)?;
+
+            eprintln!("Blueprint V2 Clustering Pipeline");
+            eprintln!("  Output: {}", output.display());
+            eprintln!(
+                "  Buckets: preflop={}, flop={}, turn={}, river={}",
+                bp_config.clustering.preflop.buckets,
+                bp_config.clustering.flop.buckets,
+                bp_config.clustering.turn.buckets,
+                bp_config.clustering.river.buckets,
+            );
+            eprintln!();
+
+            poker_solver_core::blueprint_v2::cluster_pipeline::run_clustering_pipeline(
+                &bp_config.clustering,
+                &output,
+                |street, p| {
+                    if (p * 100.0) as u32 % 10 == 0 {
+                        eprint!("\r  [{street}] {:.0}%", p * 100.0);
+                    }
+                    if p >= 1.0 {
+                        eprintln!(" done");
+                    }
+                },
+            )?;
+
+            eprintln!("\nClustering complete. Files saved to {}", output.display());
         }
     }
 

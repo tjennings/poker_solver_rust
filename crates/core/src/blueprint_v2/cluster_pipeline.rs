@@ -1,0 +1,1163 @@
+//! Card abstraction clustering pipeline.
+//!
+//! **Preflop:** samples random 5-card boards, computes average showdown equity
+//! for each of the 1326 hole-card combos across all non-conflicting boards,
+//! and clusters the average equities into K buckets using 1-D k-means.
+//!
+//! **River:** samples random 5-card boards, computes showdown equity for every
+//! valid hole-card combo on each board, and clusters the equity values into K
+//! buckets using 1-D k-means.
+//!
+//! **Turn:** samples random 4-card (flop+turn) boards, enumerates all possible
+//! river cards for each valid combo, builds a histogram over river equity bins,
+//! and clusters these histograms using k-means with Earth Mover's Distance.
+//!
+//! **Flop:** samples random 3-card flop boards, enumerates all possible turn
+//! cards for each valid combo, computes equity on the resulting 4-card board,
+//! maps to turn buckets via uniform binning, builds a histogram over turn
+//! buckets, and clusters with k-means EMD.
+//!
+//! Each street produces a [`BucketFile`] mapping `(board, combo)` to a bucket
+//! index.
+
+use std::path::Path;
+
+use rand::prelude::*;
+use rand::rngs::StdRng;
+use rayon::prelude::*;
+
+use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
+use crate::showdown_equity::compute_equity;
+
+use super::bucket_file::{BucketFile, BucketFileHeader};
+use super::clustering::{kmeans_1d, kmeans_emd};
+use super::config::ClusteringConfig;
+use super::Street;
+
+/// Number of sample 5-card boards for river clustering when no explicit count
+/// is provided.
+const DEFAULT_NUM_BOARDS: usize = 1_000;
+
+/// Number of sample 4-card boards for turn clustering.
+const DEFAULT_TURN_BOARDS: usize = 500;
+
+/// Number of sample 3-card boards for flop clustering (fewer than turn because
+/// each board requires enumerating all ~47 turn cards per combo).
+const DEFAULT_FLOP_BOARDS: usize = 200;
+
+/// Number of sample 5-card boards for preflop equity estimation.
+const DEFAULT_PREFLOP_BOARDS: usize = 200;
+
+/// Total number of 2-card combos from a 52-card deck: C(52,2) = 1326.
+const TOTAL_COMBOS: u16 = 1326;
+
+/// Cluster all river information situations by equity.
+///
+/// Samples `num_boards` random 5-card boards from the 52-card deck, computes
+/// showdown equity for every valid hole-card combo on each board, then clusters
+/// all equity values into `bucket_count` buckets using 1-D k-means.
+///
+/// Returns a `BucketFile` with:
+/// - `board_count` = `num_boards`
+/// - `combos_per_board` = 1326 (all 2-card combos from 52 cards)
+/// - Entries where the combo conflicts with the board get bucket 0 (sentinel)
+///
+/// The `progress` callback receives values in `[0.0, 1.0]` as boards are
+/// processed.
+pub fn cluster_river(
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    cluster_river_with_boards(
+        bucket_count,
+        kmeans_iterations,
+        seed,
+        DEFAULT_NUM_BOARDS,
+        progress,
+    )
+}
+
+/// Like [`cluster_river`] but with an explicit board sample count.
+pub fn cluster_river_with_boards(
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    num_boards: usize,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let boards = sample_boards(&deck, num_boards, seed);
+
+    // --- Compute equity for each (board, combo) pair in parallel. -----------
+    // Each board produces a Vec<Option<f64>>: Some(equity) for valid combos,
+    // None for combos blocked by the board.
+    let board_equities: Vec<Vec<Option<f64>>> = boards
+        .par_iter()
+        .enumerate()
+        .map(|(i, board)| {
+            let eq = compute_board_equities(*board, &combos);
+            // Report progress (approximate — may interleave but that's fine).
+            #[allow(clippy::cast_precision_loss)]
+            progress((i + 1) as f64 / num_boards as f64);
+            eq
+        })
+        .collect();
+
+    // --- Collect all valid equity values for k-means. -----------------------
+    let all_equities: Vec<f64> = board_equities
+        .iter()
+        .flat_map(|eqs| eqs.iter().filter_map(|&e| e))
+        .collect();
+
+    // --- Run 1-D k-means to find bucket boundaries. -------------------------
+    let cluster_labels = kmeans_1d(&all_equities, bucket_count as usize, kmeans_iterations);
+
+    // Build a mapping from the flat valid-equity index back to the per-combo
+    // bucket assignment in the full (board * 1326) layout.
+    let total = num_boards * TOTAL_COMBOS as usize;
+    let mut buckets = vec![0_u16; total];
+
+    let mut flat_idx = 0_usize;
+    for (board_idx, eqs) in board_equities.iter().enumerate() {
+        for (combo_idx, eq) in eqs.iter().enumerate() {
+            if eq.is_some() {
+                buckets[board_idx * TOTAL_COMBOS as usize + combo_idx] = cluster_labels[flat_idx];
+                flat_idx += 1;
+            }
+            // Blocked combos keep bucket 0 (sentinel).
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let header = BucketFileHeader {
+        street: Street::River,
+        bucket_count,
+        board_count: num_boards as u32,
+        combos_per_board: TOTAL_COMBOS,
+    };
+
+    BucketFile { header, buckets }
+}
+
+// ---------------------------------------------------------------------------
+// Turn clustering
+// ---------------------------------------------------------------------------
+
+/// Cluster turn information situations using potential-aware features.
+///
+/// For each sampled 4-card (flop+turn) board and each valid hole-card combo:
+/// 1. Enumerate all possible river cards (52 - 4 board - 2 hole = 46).
+/// 2. For each river card, compute showdown equity on the resulting 5-card
+///    board and map the equity to a river bucket via uniform binning.
+/// 3. Build a histogram (probability distribution) over river buckets.
+/// 4. Cluster all histograms with k-means using Earth Mover's Distance.
+///
+/// The `river_buckets` file defines how many river equity bins to use (its
+/// `bucket_count` determines the histogram dimensionality).
+///
+/// Returns a `BucketFile` with `street = Turn` and the given `bucket_count`.
+/// Blocked combos (overlapping with the board) receive bucket 0 as a sentinel.
+pub fn cluster_turn(
+    river_buckets: &BucketFile,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    cluster_turn_with_boards(
+        river_buckets,
+        bucket_count,
+        kmeans_iterations,
+        seed,
+        DEFAULT_TURN_BOARDS,
+        progress,
+    )
+}
+
+/// Like [`cluster_turn`] but with an explicit board sample count.
+pub fn cluster_turn_with_boards(
+    river_buckets: &BucketFile,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    num_boards: usize,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let boards = sample_turn_boards(&deck, num_boards, seed);
+    let num_river_buckets = river_buckets.header.bucket_count;
+
+    // For each board, compute a histogram feature vector for every combo.
+    // `None` means the combo is blocked by the board.
+    let board_features: Vec<Vec<Option<Vec<f64>>>> = boards
+        .par_iter()
+        .enumerate()
+        .map(|(board_idx, board)| {
+            let features: Vec<Option<Vec<f64>>> = combos
+                .iter()
+                .map(|combo| {
+                    if cards_overlap(*combo, board) {
+                        return None;
+                    }
+                    Some(build_next_street_histogram(*combo, board, &deck, num_river_buckets))
+                })
+                .collect();
+
+            #[allow(clippy::cast_precision_loss)]
+            progress((board_idx + 1) as f64 / num_boards as f64);
+
+            features
+        })
+        .collect();
+
+    // Collect all valid feature vectors for k-means, tracking their position.
+    let mut all_features: Vec<Vec<f64>> = Vec::new();
+    let mut feature_positions: Vec<(usize, usize)> = Vec::new();
+
+    for (board_idx, board_feats) in board_features.iter().enumerate() {
+        for (combo_idx, feat) in board_feats.iter().enumerate() {
+            if let Some(histogram) = feat {
+                all_features.push(histogram.clone());
+                feature_positions.push((board_idx, combo_idx));
+            }
+        }
+    }
+
+    // Cluster with k-means EMD.
+    let cluster_labels = kmeans_emd(
+        &all_features,
+        bucket_count as usize,
+        kmeans_iterations,
+        seed,
+    );
+
+    // Map cluster labels back to the flat (board * 1326) bucket array.
+    let total = num_boards * TOTAL_COMBOS as usize;
+    let mut buckets = vec![0_u16; total];
+
+    for (flat_idx, &(board_idx, combo_idx)) in feature_positions.iter().enumerate() {
+        buckets[board_idx * TOTAL_COMBOS as usize + combo_idx] = cluster_labels[flat_idx];
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let header = BucketFileHeader {
+        street: Street::Turn,
+        bucket_count,
+        board_count: num_boards as u32,
+        combos_per_board: TOTAL_COMBOS,
+    };
+
+    BucketFile { header, buckets }
+}
+
+/// Build a probability distribution over equity bins for the given combo
+/// on a partial board.
+///
+/// Enumerates every card not in the board or combo as a potential next-street
+/// card, computes equity on the extended board, maps equity to a bin, and
+/// normalises the histogram.
+fn build_next_street_histogram(
+    combo: [Card; 2],
+    board: &[Card],
+    deck: &[Card],
+    num_buckets: u16,
+) -> Vec<f64> {
+    let mut histogram = vec![0.0_f64; num_buckets as usize];
+    let mut count = 0_u32;
+    let mut extended = Vec::with_capacity(board.len() + 1);
+    extended.extend_from_slice(board);
+    extended.push(Card::new(crate::poker::Value::Two, crate::poker::Suit::Club)); // placeholder
+
+    for &next_card in deck {
+        if board.contains(&next_card)
+            || next_card == combo[0]
+            || next_card == combo[1]
+        {
+            continue;
+        }
+
+        *extended.last_mut().expect("non-empty") = next_card;
+        let eq = compute_equity(combo, &extended);
+        let bucket = equity_to_bucket(eq, num_buckets);
+        histogram[bucket as usize] += 1.0;
+        count += 1;
+    }
+
+    // Normalise to a probability distribution.
+    if count > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let inv = 1.0 / f64::from(count);
+        for h in &mut histogram {
+            *h *= inv;
+        }
+    }
+
+    histogram
+}
+
+/// Map an equity value in [0, 1] to a bucket index via uniform binning.
+///
+/// `equity_to_bucket(0.0, K) = 0` and `equity_to_bucket(1.0, K) = K - 1`.
+fn equity_to_bucket(equity: f64, num_buckets: u16) -> u16 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let bucket = (equity * f64::from(num_buckets)) as u16;
+    bucket.min(num_buckets - 1)
+}
+
+// ---------------------------------------------------------------------------
+// Flop clustering
+// ---------------------------------------------------------------------------
+
+/// Cluster flop information situations using potential-aware features.
+///
+/// For each sampled 3-card flop and each valid hole-card combo:
+/// 1. Enumerate all possible turn cards (52 - 3 board - 2 hole = 47).
+/// 2. For each turn card, compute equity on the resulting 4-card board and
+///    map the equity to a turn bucket via uniform binning.
+/// 3. Build a histogram (probability distribution) over turn buckets.
+/// 4. Cluster all histograms with k-means using Earth Mover's Distance.
+///
+/// The `turn_buckets` file defines the histogram dimensionality (its
+/// `bucket_count` determines the number of bins).
+///
+/// Returns a `BucketFile` with `street = Flop` and the given `bucket_count`.
+/// Blocked combos (overlapping with the board) receive bucket 0 as a sentinel.
+pub fn cluster_flop(
+    turn_buckets: &BucketFile,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    cluster_flop_with_boards(
+        turn_buckets,
+        bucket_count,
+        kmeans_iterations,
+        seed,
+        DEFAULT_FLOP_BOARDS,
+        progress,
+    )
+}
+
+/// Like [`cluster_flop`] but with an explicit board sample count.
+pub fn cluster_flop_with_boards(
+    turn_buckets: &BucketFile,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    num_boards: usize,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let boards = sample_flop_boards(&deck, num_boards, seed);
+    let num_turn_buckets = turn_buckets.header.bucket_count;
+
+    // For each board, compute a histogram feature vector for every combo.
+    // `None` means the combo is blocked by the board.
+    let board_features: Vec<Vec<Option<Vec<f64>>>> = boards
+        .par_iter()
+        .enumerate()
+        .map(|(board_idx, board)| {
+            let features: Vec<Option<Vec<f64>>> = combos
+                .iter()
+                .map(|combo| {
+                    if cards_overlap(*combo, board) {
+                        return None;
+                    }
+                    Some(build_next_street_histogram(*combo, board, &deck, num_turn_buckets))
+                })
+                .collect();
+
+            #[allow(clippy::cast_precision_loss)]
+            progress((board_idx + 1) as f64 / num_boards as f64);
+
+            features
+        })
+        .collect();
+
+    // Collect all valid feature vectors for k-means, tracking their position.
+    let mut all_features: Vec<Vec<f64>> = Vec::new();
+    let mut feature_positions: Vec<(usize, usize)> = Vec::new();
+
+    for (board_idx, board_feats) in board_features.iter().enumerate() {
+        for (combo_idx, feat) in board_feats.iter().enumerate() {
+            if let Some(histogram) = feat {
+                all_features.push(histogram.clone());
+                feature_positions.push((board_idx, combo_idx));
+            }
+        }
+    }
+
+    // Cluster with k-means EMD.
+    let cluster_labels = kmeans_emd(
+        &all_features,
+        bucket_count as usize,
+        kmeans_iterations,
+        seed,
+    );
+
+    // Map cluster labels back to the flat (board * 1326) bucket array.
+    let total = num_boards * TOTAL_COMBOS as usize;
+    let mut buckets = vec![0_u16; total];
+
+    for (flat_idx, &(board_idx, combo_idx)) in feature_positions.iter().enumerate() {
+        buckets[board_idx * TOTAL_COMBOS as usize + combo_idx] = cluster_labels[flat_idx];
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let header = BucketFileHeader {
+        street: Street::Flop,
+        bucket_count,
+        board_count: num_boards as u32,
+        combos_per_board: TOTAL_COMBOS,
+    };
+
+    BucketFile { header, buckets }
+}
+
+
+
+
+// ---------------------------------------------------------------------------
+// Preflop clustering
+// ---------------------------------------------------------------------------
+
+/// Cluster preflop hole-card combos by average showdown equity.
+///
+/// Samples random 5-card boards and computes the mean equity of each of the
+/// 1326 two-card combos across all non-conflicting boards. The resulting
+/// average equities are clustered into `bucket_count` groups using 1-D k-means.
+///
+/// Returns a `BucketFile` with `board_count = 1` and `combos_per_board = 1326`.
+/// Every combo receives a valid bucket (no sentinels needed since there is no
+/// board to conflict with preflop).
+///
+/// The `progress` callback receives values in `[0.0, 1.0]` as boards are
+/// processed.
+pub fn cluster_preflop(
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    cluster_preflop_with_boards(
+        bucket_count,
+        kmeans_iterations,
+        seed,
+        DEFAULT_PREFLOP_BOARDS,
+        progress,
+    )
+}
+
+/// Like [`cluster_preflop`] but with an explicit board sample count.
+pub fn cluster_preflop_with_boards(
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    num_boards: usize,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let boards = sample_boards(&deck, num_boards, seed);
+
+    // Compute average equity for each combo across all sampled boards.
+    let avg_equities = compute_combo_avg_equities(&combos, &boards, &progress);
+
+    // Cluster the average equities with 1-D k-means.
+    let cluster_labels = kmeans_1d(&avg_equities, bucket_count as usize, kmeans_iterations);
+
+    let header = BucketFileHeader {
+        street: Street::Preflop,
+        bucket_count,
+        board_count: 1,
+        combos_per_board: TOTAL_COMBOS,
+    };
+
+    BucketFile {
+        header,
+        buckets: cluster_labels,
+    }
+}
+
+/// Compute the average showdown equity for each combo across a set of 5-card
+/// boards.
+///
+/// For each combo, sums equity over all boards that don't conflict with the
+/// combo's cards and divides by the count.
+fn compute_combo_avg_equities(
+    combos: &[[Card; 2]],
+    boards: &[[Card; 5]],
+    progress: &(impl Fn(f64) + Sync),
+) -> Vec<f64> {
+    combos
+        .par_iter()
+        .enumerate()
+        .map(|(combo_idx, &combo)| {
+            let mut sum = 0.0_f64;
+            let mut count = 0_u32;
+
+            for board in boards {
+                if cards_overlap(combo, board) {
+                    continue;
+                }
+                sum += compute_equity(combo, board);
+                count += 1;
+            }
+
+            #[allow(clippy::cast_precision_loss)]
+            progress((combo_idx + 1) as f64 / combos.len() as f64);
+
+            debug_assert!(count > 0, "combo matched zero boards");
+            sum / f64::from(count)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Full pipeline orchestrator
+// ---------------------------------------------------------------------------
+
+/// Run the full bottom-up clustering pipeline: river -> turn -> flop -> preflop.
+///
+/// Each street's bucket file is saved to `output_dir` as it completes, so
+/// partial results are available even if a later stage fails or is interrupted.
+///
+/// The `progress` callback receives the street name (`"river"`, `"turn"`,
+/// `"flop"`, `"preflop"`) and a value in `[0.0, 1.0]` for that street.
+///
+/// # Errors
+///
+/// Returns an error if any bucket file cannot be saved (I/O failure).
+pub fn run_clustering_pipeline(
+    config: &ClusteringConfig,
+    output_dir: &Path,
+    progress: impl Fn(&str, f64) + Sync,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. River
+    progress("river", 0.0);
+    let river = cluster_river(
+        config.river.buckets,
+        config.kmeans_iterations,
+        config.seed,
+        |p| progress("river", p),
+    );
+    river.save(&output_dir.join("river.buckets"))?;
+
+    // 2. Turn (depends on river)
+    progress("turn", 0.0);
+    let turn = cluster_turn(
+        &river,
+        config.turn.buckets,
+        config.kmeans_iterations,
+        config.seed,
+        |p| progress("turn", p),
+    );
+    turn.save(&output_dir.join("turn.buckets"))?;
+
+    // 3. Flop (depends on turn)
+    progress("flop", 0.0);
+    let flop = cluster_flop(
+        &turn,
+        config.flop.buckets,
+        config.kmeans_iterations,
+        config.seed,
+        |p| progress("flop", p),
+    );
+    flop.save(&output_dir.join("flop.buckets"))?;
+
+    // 4. Preflop (independent, but run last by convention)
+    progress("preflop", 0.0);
+    let preflop = cluster_preflop(
+        config.preflop.buckets,
+        config.kmeans_iterations,
+        config.seed,
+        |p| progress("preflop", p),
+    );
+    preflop.save(&output_dir.join("preflop.buckets"))?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build the standard 52-card deck in a deterministic order.
+fn build_deck() -> Vec<Card> {
+    let mut deck = Vec::with_capacity(52);
+    for &v in &ALL_VALUES {
+        for &s in &ALL_SUITS {
+            deck.push(Card::new(v, s));
+        }
+    }
+    deck
+}
+
+/// Enumerate all C(52,2) = 1326 two-card combos from the deck.
+///
+/// The combos are stored as `(Card, Card)` with `c0 < c1` by deck index.
+/// The ordering is deterministic and matches the canonical combo index used
+/// throughout the bucket file.
+fn enumerate_combos(deck: &[Card]) -> Vec<[Card; 2]> {
+    let mut combos = Vec::with_capacity(TOTAL_COMBOS as usize);
+    for i in 0..deck.len() {
+        for j in (i + 1)..deck.len() {
+            combos.push([deck[i], deck[j]]);
+        }
+    }
+    debug_assert_eq!(combos.len(), TOTAL_COMBOS as usize);
+    combos
+}
+
+/// Sample `count` random boards of `card_count` cards from the deck.
+///
+/// Each board is drawn via partial Fisher-Yates. Boards are sampled
+/// independently (duplicates possible but astronomically unlikely).
+fn sample_n_card_boards(
+    deck: &[Card],
+    card_count: usize,
+    count: usize,
+    seed: u64,
+) -> Vec<Vec<Card>> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut boards = Vec::with_capacity(count);
+    let indices: Vec<usize> = (0..deck.len()).collect();
+
+    for _ in 0..count {
+        let mut pool = indices.clone();
+        for k in 0..card_count {
+            let j = rng.random_range(k..pool.len());
+            pool.swap(k, j);
+        }
+        boards.push(pool[..card_count].iter().map(|&i| deck[i]).collect());
+    }
+
+    boards
+}
+
+/// Sample `n` random 5-card boards from the deck without replacement.
+fn sample_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 5]> {
+    sample_n_card_boards(deck, 5, n, seed)
+        .into_iter()
+        .map(|v| [v[0], v[1], v[2], v[3], v[4]])
+        .collect()
+}
+
+/// Compute equity for all 1326 combos on a given 5-card board.
+///
+/// Returns `None` for combos that share a card with the board (blocked).
+fn compute_board_equities(board: [Card; 5], combos: &[[Card; 2]]) -> Vec<Option<f64>> {
+    combos
+        .iter()
+        .map(|&combo| {
+            if cards_overlap(combo, &board) {
+                None
+            } else {
+                Some(compute_equity(combo, &board))
+            }
+        })
+        .collect()
+}
+
+/// Check whether any card in `combo` appears in a board of any size.
+fn cards_overlap(combo: [Card; 2], board: &[Card]) -> bool {
+    board.iter().any(|b| *b == combo[0] || *b == combo[1])
+}
+
+/// Sample `n` random 4-card boards from the deck without replacement.
+fn sample_turn_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 4]> {
+    sample_n_card_boards(deck, 4, n, seed)
+        .into_iter()
+        .map(|v| [v[0], v[1], v[2], v[3]])
+        .collect()
+}
+
+/// Sample `n` random 3-card flop boards from the deck without replacement.
+fn sample_flop_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 3]> {
+    sample_n_card_boards(deck, 3, n, seed)
+        .into_iter()
+        .map(|v| [v[0], v[1], v[2]])
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_enumerate_combos_count() {
+        let deck = build_deck();
+        assert_eq!(deck.len(), 52);
+        let combos = enumerate_combos(&deck);
+        assert_eq!(combos.len(), 1326);
+    }
+
+    #[test]
+    fn test_enumerate_combos_no_duplicates() {
+        let deck = build_deck();
+        let combos = enumerate_combos(&deck);
+        for combo in &combos {
+            assert_ne!(combo[0], combo[1], "combo has duplicate card");
+        }
+    }
+
+    #[test]
+    fn test_sample_boards_count() {
+        let deck = build_deck();
+        let boards = sample_boards(&deck, 100, 42);
+        assert_eq!(boards.len(), 100);
+    }
+
+    #[test]
+    fn test_sample_boards_no_internal_duplicates() {
+        let deck = build_deck();
+        let boards = sample_boards(&deck, 50, 99);
+        for board in &boards {
+            for i in 0..5 {
+                for j in (i + 1)..5 {
+                    assert_ne!(board[i], board[j], "board has duplicate card");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sample_boards_deterministic() {
+        let deck = build_deck();
+        let b1 = sample_boards(&deck, 20, 123);
+        let b2 = sample_boards(&deck, 20, 123);
+        assert_eq!(b1, b2);
+    }
+
+    #[test]
+    fn test_cards_overlap_true() {
+        let deck = build_deck();
+        let combo = [deck[0], deck[1]];
+        let board = [deck[0], deck[5], deck[10], deck[15], deck[20]];
+        assert!(cards_overlap(combo, &board));
+    }
+
+    #[test]
+    fn test_cards_overlap_false() {
+        let deck = build_deck();
+        let combo = [deck[0], deck[1]];
+        let board = [deck[2], deck[5], deck[10], deck[15], deck[20]];
+        assert!(!cards_overlap(combo, &board));
+    }
+
+    #[test]
+    fn test_compute_board_equities_blocked_combos() {
+        let deck = build_deck();
+        let combos = enumerate_combos(&deck);
+        let board = [deck[0], deck[1], deck[2], deck[3], deck[4]];
+        let equities = compute_board_equities(board, &combos);
+
+        assert_eq!(equities.len(), 1326);
+
+        // Count blocked vs valid.
+        let blocked = equities.iter().filter(|e| e.is_none()).count();
+        let valid = equities.iter().filter(|e| e.is_some()).count();
+
+        // With 5 board cards removed, valid combos = C(47,2) = 1081
+        assert_eq!(valid, 1081);
+        assert_eq!(blocked, 1326 - 1081);
+
+        // All valid equities should be in [0, 1].
+        for eq in equities.iter().flatten() {
+            assert!(
+                (0.0..=1.0).contains(eq),
+                "equity out of range: {eq}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_river_basic() {
+        // Use few boards for speed in tests.
+        let result = cluster_river_with_boards(10, 50, 42, 20, |_| {});
+        assert_eq!(result.header.street, Street::River);
+        assert_eq!(result.header.bucket_count, 10);
+        assert_eq!(result.header.board_count, 20);
+        assert_eq!(result.header.combos_per_board, 1326);
+        assert_eq!(result.buckets.len(), 20 * 1326);
+        // All bucket IDs should be in [0, 10).
+        for &b in &result.buckets {
+            assert!(b < 10, "bucket {b} out of range");
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_river_deterministic() {
+        let r1 = cluster_river_with_boards(5, 30, 123, 10, |_| {});
+        let r2 = cluster_river_with_boards(5, 30, 123, 10, |_| {});
+        assert_eq!(r1.buckets, r2.buckets);
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_river_bucket_distribution() {
+        // Verify that buckets are not all the same value (equity varies).
+        let result = cluster_river_with_boards(5, 50, 42, 30, |_| {});
+        let mut seen = std::collections::HashSet::new();
+        for &b in &result.buckets {
+            seen.insert(b);
+        }
+        // With 30 boards and 5 buckets, we should see at least 2 distinct
+        // buckets (bucket 0 for blocked combos, plus at least one real one).
+        assert!(
+            seen.len() >= 2,
+            "expected at least 2 distinct buckets, got {seen:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Turn clustering tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sample_turn_boards_count() {
+        let deck = build_deck();
+        let boards = sample_turn_boards(&deck, 50, 42);
+        assert_eq!(boards.len(), 50);
+    }
+
+    #[test]
+    fn test_sample_turn_boards_no_duplicates() {
+        let deck = build_deck();
+        let boards = sample_turn_boards(&deck, 50, 42);
+        for board in &boards {
+            for i in 0..4 {
+                for j in (i + 1)..4 {
+                    assert_ne!(board[i], board[j], "board has duplicate card");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sample_turn_boards_deterministic() {
+        let deck = build_deck();
+        let b1 = sample_turn_boards(&deck, 20, 123);
+        let b2 = sample_turn_boards(&deck, 20, 123);
+        assert_eq!(b1, b2);
+    }
+
+    #[test]
+    fn test_cards_overlap_4_true() {
+        let deck = build_deck();
+        let combo = [deck[0], deck[1]];
+        let board = [deck[0], deck[5], deck[10], deck[15]];
+        assert!(cards_overlap(combo, &board));
+    }
+
+    #[test]
+    fn test_cards_overlap_4_false() {
+        let deck = build_deck();
+        let combo = [deck[0], deck[1]];
+        let board = [deck[2], deck[5], deck[10], deck[15]];
+        assert!(!cards_overlap(combo, &board));
+    }
+
+    #[test]
+    fn test_equity_to_bucket_bounds() {
+        // equity=0.0 should map to bucket 0
+        assert_eq!(equity_to_bucket(0.0, 10), 0);
+        // equity=1.0 should map to the last bucket (9 for K=10)
+        assert_eq!(equity_to_bucket(1.0, 10), 9);
+        // equity=0.5 with 10 buckets → bucket 5
+        assert_eq!(equity_to_bucket(0.5, 10), 5);
+        // equity just below 1.0
+        assert_eq!(equity_to_bucket(0.99, 10), 9);
+    }
+
+    #[test]
+    fn test_equity_to_bucket_single_bucket() {
+        // With 1 bucket, everything maps to 0.
+        assert_eq!(equity_to_bucket(0.0, 1), 0);
+        assert_eq!(equity_to_bucket(0.5, 1), 0);
+        assert_eq!(equity_to_bucket(1.0, 1), 0);
+    }
+
+    #[test]
+    fn test_build_next_street_histogram_river_sums_to_one() {
+        let deck = build_deck();
+        // combo: first two cards, board: next four cards (no overlap)
+        let combo = [deck[0], deck[1]];
+        let board = [deck[2], deck[3], deck[4], deck[5]];
+        let histogram = build_next_street_histogram(combo, &board, &deck, 10);
+
+        assert_eq!(histogram.len(), 10);
+
+        let sum: f64 = histogram.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-10,
+            "histogram should sum to 1.0, got {sum}"
+        );
+
+        // Every entry should be non-negative.
+        for &h in &histogram {
+            assert!(h >= 0.0);
+        }
+    }
+
+    #[test]
+    fn test_build_next_street_histogram_river_card_count() {
+        // With 4 board cards + 2 hole cards = 6 used, there are 46 river cards.
+        let deck = build_deck();
+        let combo = [deck[0], deck[1]];
+        let board = [deck[2], deck[3], deck[4], deck[5]];
+        let histogram = build_next_street_histogram(combo, &board, &deck, 5);
+
+        // The histogram entries times 46 should give integer counts.
+        let total_rivers = 46.0;
+        for &h in &histogram {
+            let count = h * total_rivers;
+            assert!(
+                (count - count.round()).abs() < 1e-8,
+                "expected integer count, got {count}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_turn_basic() {
+        // First cluster river with small params.
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
+        // Then cluster turn using river buckets.
+        let turn = cluster_turn_with_boards(&river, 5, 30, 42, 10, |_| {});
+
+        assert_eq!(turn.header.street, Street::Turn);
+        assert_eq!(turn.header.bucket_count, 5);
+        assert_eq!(turn.header.board_count, 10);
+        assert_eq!(turn.header.combos_per_board, 1326);
+        assert_eq!(turn.buckets.len(), 10 * 1326);
+
+        for &b in &turn.buckets {
+            assert!(b < 5, "bucket {b} out of range");
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_turn_deterministic() {
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
+        let t1 = cluster_turn_with_boards(&river, 3, 20, 123, 8, |_| {});
+        let t2 = cluster_turn_with_boards(&river, 3, 20, 123, 8, |_| {});
+        assert_eq!(t1.buckets, t2.buckets);
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_turn_bucket_distribution() {
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
+        let turn = cluster_turn_with_boards(&river, 4, 30, 42, 15, |_| {});
+        let mut seen = std::collections::HashSet::new();
+        for &b in &turn.buckets {
+            seen.insert(b);
+        }
+        // Should see at least 2 distinct buckets.
+        assert!(
+            seen.len() >= 2,
+            "expected at least 2 distinct turn buckets, got {seen:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Flop clustering tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sample_flop_boards_count() {
+        let deck = build_deck();
+        let boards = sample_flop_boards(&deck, 50, 42);
+        assert_eq!(boards.len(), 50);
+    }
+
+    #[test]
+    fn test_sample_flop_boards_no_duplicates() {
+        let deck = build_deck();
+        let boards = sample_flop_boards(&deck, 50, 42);
+        for board in &boards {
+            for i in 0..3 {
+                for j in (i + 1)..3 {
+                    assert_ne!(board[i], board[j], "board has duplicate card");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sample_flop_boards_deterministic() {
+        let deck = build_deck();
+        let b1 = sample_flop_boards(&deck, 20, 123);
+        let b2 = sample_flop_boards(&deck, 20, 123);
+        assert_eq!(b1, b2);
+    }
+
+    #[test]
+    fn test_cards_overlap_3_true() {
+        let deck = build_deck();
+        let combo = [deck[0], deck[1]];
+        let board = [deck[0], deck[5], deck[10]];
+        assert!(cards_overlap(combo, &board));
+    }
+
+    #[test]
+    fn test_cards_overlap_3_false() {
+        let deck = build_deck();
+        let combo = [deck[0], deck[1]];
+        let board = [deck[2], deck[5], deck[10]];
+        assert!(!cards_overlap(combo, &board));
+    }
+
+    #[test]
+    fn test_build_next_street_histogram_turn_sums_to_one() {
+        let deck = build_deck();
+        let combo = [deck[0], deck[1]];
+        let board = [deck[10], deck[20], deck[30]];
+        let hist = build_next_street_histogram(combo, &board, &deck, 5);
+
+        assert_eq!(hist.len(), 5);
+
+        let sum: f64 = hist.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-10,
+            "histogram should sum to 1.0, got {sum}"
+        );
+
+        for &h in &hist {
+            assert!(h >= 0.0);
+        }
+    }
+
+    #[test]
+    fn test_build_next_street_histogram_turn_card_count() {
+        // With 3 board cards + 2 hole cards = 5 used, there are 47 turn cards.
+        let deck = build_deck();
+        let combo = [deck[0], deck[1]];
+        let board = [deck[10], deck[20], deck[30]];
+        let histogram = build_next_street_histogram(combo, &board, &deck, 5);
+
+        let total_turns = 47.0;
+        for &h in &histogram {
+            let count = h * total_turns;
+            assert!(
+                (count - count.round()).abs() < 1e-8,
+                "expected integer count, got {count}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_flop_basic() {
+        // Build dependencies: river -> turn -> flop.
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
+        let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_| {});
+        let flop = cluster_flop_with_boards(&turn, 3, 20, 42, 5, |_| {});
+
+        assert_eq!(flop.header.street, Street::Flop);
+        assert_eq!(flop.header.bucket_count, 3);
+        assert_eq!(flop.header.board_count, 5);
+        assert_eq!(flop.header.combos_per_board, 1326);
+        assert_eq!(flop.buckets.len(), 5 * 1326);
+
+        for &b in &flop.buckets {
+            assert!(b < 3, "bucket {b} out of range");
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_flop_deterministic() {
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
+        let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_| {});
+        let f1 = cluster_flop_with_boards(&turn, 3, 20, 123, 5, |_| {});
+        let f2 = cluster_flop_with_boards(&turn, 3, 20, 123, 5, |_| {});
+        assert_eq!(f1.buckets, f2.buckets);
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_flop_bucket_distribution() {
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
+        let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_| {});
+        let flop = cluster_flop_with_boards(&turn, 4, 20, 42, 10, |_| {});
+        let mut seen = std::collections::HashSet::new();
+        for &b in &flop.buckets {
+            seen.insert(b);
+        }
+        assert!(
+            seen.len() >= 2,
+            "expected at least 2 distinct flop buckets, got {seen:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Preflop clustering tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_preflop_cluster_basic() {
+        let preflop = cluster_preflop_with_boards(10, 20, 42, 50, |_| {});
+        assert_eq!(preflop.header.street, Street::Preflop);
+        assert_eq!(preflop.header.bucket_count, 10);
+        assert_eq!(preflop.header.board_count, 1);
+        assert_eq!(preflop.header.combos_per_board, 1326);
+        assert_eq!(preflop.buckets.len(), 1326);
+        for &b in &preflop.buckets {
+            assert!(b < 10, "bucket {b} out of range");
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_preflop_cluster_deterministic() {
+        let a = cluster_preflop_with_boards(10, 20, 42, 50, |_| {});
+        let b = cluster_preflop_with_boards(10, 20, 42, 50, |_| {});
+        assert_eq!(a.buckets, b.buckets);
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_preflop_cluster_bucket_distribution() {
+        let preflop = cluster_preflop_with_boards(169, 50, 42, 80, |_| {});
+        let unique: std::collections::HashSet<u16> =
+            preflop.buckets.iter().copied().collect();
+        assert!(
+            unique.len() > 100,
+            "expected many unique buckets, got {}",
+            unique.len()
+        );
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_preflop_avg_equities_range() {
+        let deck = build_deck();
+        let combos = enumerate_combos(&deck);
+        let boards = sample_boards(&deck, 30, 42);
+        let equities = compute_combo_avg_equities(&combos, &boards, &|_| {});
+        assert_eq!(equities.len(), 1326);
+        for &eq in &equities {
+            assert!(
+                (0.0..=1.0).contains(&eq),
+                "average equity out of range: {eq}"
+            );
+        }
+    }
+}
