@@ -36,6 +36,8 @@ poker_solver_rust/
 │   │       ├── info_key.rs    # Info set key encoding (64-bit packed)
 │   │       ├── agent.rs       # Agent system (TOML-configured play styles)
 │   │       ├── simulation.rs  # Arena-based agent simulation
+│   ├── range-solver/          # Exact postflop range solver (DCFR, PioSOLVER-compatible)
+│   ├── range-solver-compare/  # Comparison harness vs b-inary/postflop-solver
 │   ├── trainer/               # CLI for training, diagnostics
 │   ├── tauri-app/             # Desktop strategy explorer (Tauri)
 │   ├── devserver/             # HTTP mirror of Tauri API for browser debugging
@@ -61,6 +63,10 @@ poker_solver_rust/
 **`devserver`** -- Lightweight HTTP server that mirrors all Tauri exploration commands as POST endpoints, enabling browser-based UI development without the full Tauri build cycle.
 
 **`frontend`** -- React/TypeScript UI shared between the Tauri app and dev server. Provides the strategy explorer (tree browsing, action frequencies, EV display) and agent simulator. Auto-detects Tauri vs browser environment.
+
+**`range-solver`** -- Self-contained postflop range solver that takes hero/villain ranges, bet sizes, and board cards, then solves to Nash equilibrium using Discounted CFR. Output-identical (exact f32 equality) to b-inary/postflop-solver. Supports PioSOLVER-compatible range syntax and bet size notation (pot-relative, previous-bet-relative, geometric, additive, all-in). Handles suit isomorphism for turn/river to skip redundant chance nodes.
+
+**`range-solver-compare`** -- Test harness that generates random game configurations and verifies exact output identity between our range-solver and the original postflop-solver. Includes fast default tests (1000 river configs in ~21s) and slow soak tests for overnight validation.
 
 **`agents/`** -- TOML files defining agent play styles (tight-aggressive, loose-aggressive, etc.) that map hand classes to action frequency distributions for simulation.
 
@@ -204,6 +210,25 @@ At each preflop showdown terminal:
 **Postflop bundles:** Build a postflop abstraction once with `solve-postflop`, then reference the bundle directory via `postflop_model_path` in training configs to skip the expensive rebuild.
 
 Multi-SPR bundles store one subdirectory per SPR (e.g. `spr_2.0/`, `spr_6.0/`, `spr_20.0/`). Legacy single-SPR bundles (flat `solve.bin`) are loaded with backward compatibility.
+
+## Range Solver (Exact Postflop Solver)
+
+A self-contained postflop solver that computes Nash equilibrium strategies for specific hero/villain ranges on a given board. Unlike the abstracted postflop model above (which uses 169-hand indexing for the preflop solver), the range solver works with concrete hand combinations and produces exact strategies.
+
+**Algorithm:** Discounted CFR (DCFR) with α=1.5, β=0.5, γ=3.0. Strategy resets at power-of-4 iterations (4, 16, 64, ...).
+
+**Key features:**
+- PioSOLVER-compatible range syntax (AA, AKs, QQ-88, TT+, weights)
+- Bet size notation: pot-relative (50%), previous-bet-relative (2.5x), geometric (2e), additive (100c), all-in (a)
+- Suit isomorphism detection on turn/river to skip redundant chance nodes
+- Arena-allocated game tree with `MutexLike` for lock-free interior mutability
+- Two-pass O(n) terminal evaluation using sorted hand strength arrays
+
+**CLI:** `cargo run -p poker-solver-trainer --release -- range-solve` — see `docs/training.md` for full usage.
+
+**Files:**
+- `crates/range-solver/src/` — solver, action tree, game tree, evaluation, isomorphism, hand evaluator
+- `crates/range-solver-compare/` — comparison harness and identity tests
 
 ## Known Limitations
 

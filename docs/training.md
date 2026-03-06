@@ -113,6 +113,73 @@ and loads it if present. No additional flags needed.
 1. Run `precompute-equity` once (takes several minutes)
 2. Run `solve-postflop` as many times as needed — equity tables load instantly from cache
 
+### range-solve
+
+Solve a postflop spot with exact (no abstraction) Discounted CFR. Uses the `range-solver` crate — a self-contained reimplementation of b-inary/postflop-solver producing identical output.
+
+Unlike the abstracted `solve-postflop` pipeline, this solves a **single spot** with full hand granularity (1326 hole card combos, no bucketing) and suit isomorphism reduction.
+
+```bash
+# River spot with specific ranges
+cargo run -p poker-solver-trainer --release -- range-solve \
+  --oop-range "QQ+,AKs,AKo" \
+  --ip-range "22+,A2s+,KQs" \
+  --flop "Qs Jh 2c" --turn "8d" --river "3s" \
+  --pot 100 --effective-stack 200 \
+  --iterations 1000
+
+# Flop spot (turn + river solved internally via chance nodes)
+cargo run -p poker-solver-trainer --release -- range-solve \
+  --oop-range "AA,KK,QQ,AKs" \
+  --ip-range "TT-66,AQs-ATs,KQs,QJs" \
+  --flop "Qs Jh 2c" \
+  --pot 100 --effective-stack 300 \
+  --iterations 500
+
+# Custom bet sizing
+cargo run -p poker-solver-trainer --release -- range-solve \
+  --oop-range "QQ+,AKs" --ip-range "22+,A2s+" \
+  --flop "Ah Kd 7c" --turn "2s" \
+  --pot 80 --effective-stack 160 \
+  --oop-bet-sizes "33%,67%,a" --oop-raise-sizes "2.5x" \
+  --ip-bet-sizes "33%,67%,a" --ip-raise-sizes "2.5x" \
+  --iterations 1000 --target-exploitability 0.3
+```
+
+Options:
+- `--oop-range <RANGE>` -- OOP player's range in PioSOLVER format (required)
+- `--ip-range <RANGE>` -- IP player's range (required)
+- `--flop <CARDS>` -- Flop cards, e.g. `"Qs Jh 2c"` (required)
+- `--turn <CARD>` -- Turn card, e.g. `"8d"` (optional)
+- `--river <CARD>` -- River card, e.g. `"3s"` (optional; requires `--turn`)
+- `--pot <N>` -- Starting pot size (default: 100)
+- `--effective-stack <N>` -- Effective stack size (default: 100)
+- `--iterations <N>` -- Maximum DCFR iterations (default: 1000)
+- `--target-exploitability <F>` -- Stop early when exploitability drops below this (default: 0.5)
+- `--oop-bet-sizes <SIZES>` -- OOP bet sizes, comma-separated (default: `"50%,100%"`)
+- `--oop-raise-sizes <SIZES>` -- OOP raise sizes (default: `"60%,100%"`)
+- `--ip-bet-sizes <SIZES>` -- IP bet sizes (default: `"50%,100%"`)
+- `--ip-raise-sizes <SIZES>` -- IP raise sizes (default: `"60%,100%"`)
+- `--compressed` -- Use 16-bit compressed storage (less memory, slightly less precision)
+
+**Bet size syntax:**
+| Format | Meaning | Example |
+|-|-|-|
+| `N%` | Pot-relative | `50%` = half pot |
+| `Nx` | Previous-bet-relative (raises only) | `2.5x` = 2.5× previous bet |
+| `Ne` | Geometric over N streets | `2e` = geometric over 2 streets |
+| `Nc` | Additive (chips) | `100c` = 100 chips |
+| `a` | All-in | |
+
+**Output:** Per-iteration exploitability, then a per-hand strategy table at the root node showing action probabilities for each hole card combo.
+
+**Street determination:** Automatically set from which cards are provided:
+- Flop only → solves from flop (turn + river as chance nodes)
+- Flop + turn → solves from turn (river as chance node)
+- Flop + turn + river → solves river only (fastest)
+
+**Algorithm:** Discounted CFR with α=1.5, β=0.5, γ=3.0. Strategy resets at power-of-4 iterations. Multithreaded via rayon.
+
 ---
 
 ## Preflop Config (solve-preflop)

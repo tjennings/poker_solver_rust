@@ -21,7 +21,6 @@ The default session acts as a **coordinator**, not an implementer. It must:
 - Architecture review → `software-architect` agent
 - Code quality review → `idiomatic-rust-enforcer` agent
 - Performance review → `rust-perf-reviewer` agent
-- Plan verification → `code-reviewer` agent
 - Independent tasks → dispatch in parallel via `dispatching-parallel-agents`
 - Multi-step plans → use `subagent-driven-development`
 
@@ -34,26 +33,27 @@ The default session acts as a **coordinator**, not an implementer. It must:
 - Commits, manages git, creates PRs
 - Updates CLAUDE.md and documentation
 
-## **REQUIRED** Implementation Workflow
-Every time I ask for a change to the system, you MUST dispatch this workflow: 
+## **REQUIRED** Planning Workflow
+Every time I ask for a change to the system, you MUST dispatch this workflow:
 
 1. **Research** — dispatch `ml-researcher` for algorithm/design questions
-2. **Brainstorm** — invoke `superpowers:brainstorming` to explore requirements 
-    1. Brainstorming MUST use the ml-researcher and/or software-architect for the appropriate context. 
-3. **Plan** — invoke `superpowers:writing-plans` to create a structured plan 
-    1. Plans MUST include a "Agent Team & Execution Order" section breaking down which agents are owning what work, and what will be done in parallel
-4. **Dispatch** — `rust-developer` agents in parallel (via `superpowers:subagent-driven-development`)
-5. **Review** — `software-architect` + `idiomatic-rust-enforcer` + `rust-perf-reviewer`
-    1. The review process must be done TWICE. 
-6. **Verify** — invoke `superpowers:verification-before-completion` before claiming done
-7. **Finish** — invoke `superpowers:finishing-a-development-branch` to merge/PR
+2. **Brainstorm** — invoke `hex:brainstorming` to explore requirements 
+    1. Brainstorming MUST use the ml-researcher and/or software-architect for the appropriate context.
+
+## **REQUIRED** Software Development workflow - BEFORE you start work follow these rules
+
+- Ensure the working tree is clean, if it isn't prompt the user to assist you in cleanup
+- Run the entire test suite, it MUST complete in less than 1 minute.  If it does not, pause your current project and fix the tests
+
+## **REQUIRED** Software Development workflow - AFTER code is complete
+- Ensure the ENTIRE test suite passes. If not you MUST repair the tests
+- Ensure the ENTIRE test suite runs in less than 1 minute.  If not you MUST fix it. 
 
 ## Git Workflow
 
 - Always use worktrees for implementing plans
 - Write clear commit messages describing **what** and **why**
 - Keep commits atomic: one logical change per commit
-- Run tests before pushing: `cargo test`
 - Use feature branches for non-trivial changes
 
 ## Architecture
@@ -79,40 +79,25 @@ See [`docs/explorer.md`](docs/explorer.md) for the strategy explorer desktop app
 See [`docs/cloud.md`](docs/cloud.md) for the AWS compute CLI: setup, launching training jobs, monitoring, downloading models, and configuration.
 
 **Keep it current:** When adding/changing cloud commands, AWS resources, configuration variables, or the job lifecycle, update `docs/cloud.md` to reflect the new state.
-
-## Code Search
-
-**REQUIRED**: Use `ast-grep` for Rust code pattern searches (function calls, struct definitions, impl blocks, etc.):
-- `ast-grep run --pattern '<pattern>' --lang rust .` for simple pattern matches
-- `ast-grep scan --rule <rule.yml> .` for complex structural queries
-- Metavariables: `$NAME` (single node), `$$$ARGS` (multiple nodes)
-- **Limitation**: ast-grep cannot match Rust macro invocations (`println!`, `vec!`, `assert!`, etc.) — use `Grep` for these
-- Fall back to `Grep` for non-structural text search (comments, strings, config files), macro invocations, or if ast-grep is unavailable
-
-Examples (verified working):
-```bash
-ast-grep run --pattern 'impl $TRAIT for $TYPE { $$$BODY }' --lang rust .  # find trait impls
-ast-grep run --pattern 'fn $NAME($$$PARAMS) -> Result<$$$RET> { $$$BODY }' --lang rust .  # find fallible functions
-```
-
 ## Build & Test
 
 ```bash
 cargo test                                          # all tests
 cargo test -p poker-solver-core                     # core only
 cargo test -p poker-solver-trainer                  # trainer only
+cargo test -p range-solver                          # range solver only
+cargo test -p range-solver-compare --release        # identity tests (needs --release)
 cargo clippy                                        # lint (pedantic enabled in core)
 cargo run -p poker-solver-trainer --release -- <subcommand>  # always --release for training/diag
 ```
-
-**Known timer failures** (pre-existing, not bugs): `blueprint/subgame_cfr`, `preflop/bundle`
-
 ## Crate Map
 
 | Crate | Purpose |
 |-|-|
 | `core` | Preflop solver, postflop pipeline, CFR utilities, hand eval, abstractions |
-| `trainer` | CLI: preflop/postflop solving, diagnostics |
+| `trainer` | CLI: preflop/postflop solving, range-solve, diagnostics |
+| `range-solver` | Exact (no-abstraction) postflop DCFR solver for single-spot analysis |
+| `range-solver-compare` | Identity test harness comparing range-solver against reference impl |
 | `tauri-app` | Desktop GUI exploration app |
 | `devserver` | HTTP mirror of Tauri API for browser debugging |
 | `test-macros` | `#[timed_test]` proc macro |
