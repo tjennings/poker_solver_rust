@@ -259,6 +259,28 @@ Presets: `exhaustive_fast` (10 boards, 200 iterations) and `exhaustive_standard`
 
 ---
 
+## Training TUI Dashboard
+
+When `tui.enabled: true` in the config, `train-blueprint` launches a full-screen terminal dashboard instead of text output.
+
+**Left panel:** iteration progress, throughput sparkline, exploitability chart
+**Right panel:** tabbed 13x13 strategy grids for configured scenarios
+
+**Hotkeys:**
+- `p` -- pause/resume training
+- `s` -- trigger immediate snapshot
+- `e` -- trigger exploitability calculation
+- left/right arrows -- switch scenario tabs
+- `q` -- quit gracefully
+
+**Convergence indicators:** Cells where strategy has stabilized (delta < 0.01) show a bright green border. As training progresses, more cells "light up" -- giving visual feedback on convergence.
+
+Use `--no-tui` to disable the dashboard and use text output instead.
+
+See `sample_configurations/blueprint_v2_with_tui.yaml` for a complete example.
+
+---
+
 ## Cloud Training (AWS)
 
 See [`docs/cloud.md`](cloud.md) for running training jobs on AWS EC2 instances via the `solver-cloud` CLI.
