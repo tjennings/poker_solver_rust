@@ -172,6 +172,12 @@ enum Commands {
         #[arg(long, default_value = "r:3")]
         history: String,
     },
+    /// Show diagnostics for pre-computed cluster bucket files (Blueprint V2)
+    DiagClusters {
+        /// Directory containing .buckets files
+        #[arg(short = 'd', long)]
+        cluster_dir: PathBuf,
+    },
     /// Dump terminal node values from a decision node for a specific matchup.
     TraceTerminals {
         /// YAML config file (same as solve-preflop)
@@ -364,6 +370,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Commands::DecomposeRegrets { config, iterations, hand, history } => {
             run_decompose_regrets(&config, iterations, &hand, &history)?;
+        }
+        Commands::DiagClusters { cluster_dir } => {
+            let reports = poker_solver_core::blueprint_v2::cluster_diagnostics::diagnose_cluster_dir(&cluster_dir)?;
+            if reports.is_empty() {
+                eprintln!("No .buckets files found in {}", cluster_dir.display());
+            } else {
+                for report in &reports {
+                    eprintln!("{}", report.summary());
+                }
+            }
         }
         Commands::TraceTerminals { config, hero, opp, history } => {
             run_trace_terminals(&config, &hero, &opp, &history)?;
