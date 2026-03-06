@@ -62,6 +62,24 @@ function displayOrderActions(actions: ActionInfo[]): ActionInfo[] {
   return displayOrderIndices(actions).map((i) => actions[i]);
 }
 
+// Format action labels: strip "Raise"/"Bet" prefix, use pot-relative sizing.
+function formatActionLabel(action: ActionInfo): string {
+  if (action.action_type === 'fold') return 'Fold';
+  if (action.action_type === 'check') return 'Check';
+  if (action.action_type === 'call') return action.label; // "Call 2" etc.
+  if (action.action_type === 'allin') return 'All-in';
+  // Bet/raise — use size_key to show pot-relative label
+  if (action.size_key) {
+    const frac = parseFloat(action.size_key);
+    if (!isNaN(frac)) {
+      if (frac === 1.0) return 'Pot';
+      if (frac < 1.0) return `${Math.round(frac * 100)}%`;
+      return `${frac}x`;
+    }
+  }
+  return action.label;
+}
+
 function getActionColor(action: ActionInfo, actions: ActionInfo[]): string {
   switch (action.action_type) {
     case 'fold':
@@ -158,7 +176,7 @@ function CellDetail({
           const pct = prob.probability * 100;
           return (
             <div key={action.id} className="cell-detail-row">
-              <span className="cell-detail-label">{action.label}</span>
+              <span className="cell-detail-label">{formatActionLabel(action)}</span>
               <span className="cell-detail-pct">{pct.toFixed(1)}%</span>
               <div className="cell-detail-bar-bg">
                 <div
@@ -281,7 +299,7 @@ function ActionBlock({
               style={{ borderLeft: `3px solid ${color}` }}
               onClick={() => onSelect(action.id)}
             >
-              {action.label}
+              {formatActionLabel(action)}
             </button>
           );
         })}
