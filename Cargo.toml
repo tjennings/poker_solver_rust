@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/tauri-app", "crates/trainer", "crates/test-macros", "crates/devserver", "crates/range-solver"]
+members = ["crates/core", "crates/tauri-app", "crates/trainer", "crates/test-macros", "crates/devserver", "crates/range-solver", "crates/range-solver-compare"]
 
 [workspace.package]
 version = "0.1.0"

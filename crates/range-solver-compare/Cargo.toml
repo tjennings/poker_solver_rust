@@ -1,0 +1,10 @@
+[package]
+name = "range-solver-compare"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+range-solver = { path = "../range-solver" }
+postflop-solver = { path = "../../external/postflop-solver", default-features = false, features = ["rayon"] }
+rand = "0.8"
+rand_chacha = "0.3"
