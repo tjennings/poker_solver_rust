@@ -1,5 +1,9 @@
 //! Card abstraction clustering pipeline.
 //!
+//! **Preflop:** samples random 5-card boards, computes average showdown equity
+//! for each of the 1326 hole-card combos across all non-conflicting boards,
+//! and clusters the average equities into K buckets using 1-D k-means.
+//!
 //! **River:** samples random 5-card boards, computes showdown equity for every
 //! valid hole-card combo on each board, and clusters the equity values into K
 //! buckets using 1-D k-means.
@@ -37,6 +41,9 @@ const DEFAULT_TURN_BOARDS: usize = 500;
 /// Number of sample 3-card boards for flop clustering (fewer than turn because
 /// each board requires enumerating all ~47 turn cards per combo).
 const DEFAULT_FLOP_BOARDS: usize = 200;
+
+/// Number of sample 5-card boards for preflop equity estimation.
+const DEFAULT_PREFLOP_BOARDS: usize = 200;
 
 /// Total number of 2-card combos from a 52-card deck: C(52,2) = 1326.
 const TOTAL_COMBOS: u16 = 1326;
@@ -456,6 +463,102 @@ fn equity_to_turn_bucket(equity: f64, num_turn_buckets: u16) -> u16 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let bucket = (equity * f64::from(num_turn_buckets)) as u16;
     bucket.min(num_turn_buckets - 1)
+}
+
+// ---------------------------------------------------------------------------
+// Preflop clustering
+// ---------------------------------------------------------------------------
+
+/// Cluster preflop hole-card combos by average showdown equity.
+///
+/// Samples random 5-card boards and computes the mean equity of each of the
+/// 1326 two-card combos across all non-conflicting boards. The resulting
+/// average equities are clustered into `bucket_count` groups using 1-D k-means.
+///
+/// Returns a `BucketFile` with `board_count = 1` and `combos_per_board = 1326`.
+/// Every combo receives a valid bucket (no sentinels needed since there is no
+/// board to conflict with preflop).
+///
+/// The `progress` callback receives values in `[0.0, 1.0]` as boards are
+/// processed.
+pub fn cluster_preflop(
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    cluster_preflop_with_boards(
+        bucket_count,
+        kmeans_iterations,
+        seed,
+        DEFAULT_PREFLOP_BOARDS,
+        progress,
+    )
+}
+
+/// Like [`cluster_preflop`] but with an explicit board sample count.
+pub fn cluster_preflop_with_boards(
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    num_boards: usize,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let boards = sample_boards(&deck, num_boards, seed);
+
+    // Compute average equity for each combo across all sampled boards.
+    let avg_equities = compute_combo_avg_equities(&combos, &boards, &progress);
+
+    // Cluster the average equities with 1-D k-means.
+    let cluster_labels = kmeans_1d(&avg_equities, bucket_count as usize, kmeans_iterations);
+
+    let header = BucketFileHeader {
+        street: Street::Preflop,
+        bucket_count,
+        board_count: 1,
+        combos_per_board: TOTAL_COMBOS,
+    };
+
+    BucketFile {
+        header,
+        buckets: cluster_labels,
+    }
+}
+
+/// Compute the average showdown equity for each combo across a set of 5-card
+/// boards.
+///
+/// For each combo, sums equity over all boards that don't conflict with the
+/// combo's cards and divides by the count.
+fn compute_combo_avg_equities(
+    combos: &[[Card; 2]],
+    boards: &[[Card; 5]],
+    progress: &(impl Fn(f64) + Sync),
+) -> Vec<f64> {
+    combos
+        .par_iter()
+        .enumerate()
+        .map(|(combo_idx, &combo)| {
+            let mut sum = 0.0_f64;
+            let mut count = 0_u32;
+
+            for &board in boards {
+                if cards_overlap(combo, board) {
+                    continue;
+                }
+                sum += compute_equity(combo, &board);
+                count += 1;
+            }
+
+            #[allow(clippy::cast_precision_loss)]
+            progress((combo_idx + 1) as f64 / combos.len() as f64);
+
+            debug_assert!(count > 0, "combo matched zero boards");
+            sum / f64::from(count)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,5 +1118,56 @@ mod tests {
             seen.len() >= 2,
             "expected at least 2 distinct flop buckets, got {seen:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Preflop clustering tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_preflop_cluster_basic() {
+        let preflop = cluster_preflop_with_boards(10, 20, 42, 50, |_| {});
+        assert_eq!(preflop.header.street, Street::Preflop);
+        assert_eq!(preflop.header.bucket_count, 10);
+        assert_eq!(preflop.header.board_count, 1);
+        assert_eq!(preflop.header.combos_per_board, 1326);
+        assert_eq!(preflop.buckets.len(), 1326);
+        for &b in &preflop.buckets {
+            assert!(b < 10, "bucket {b} out of range");
+        }
+    }
+
+    #[test]
+    fn test_preflop_cluster_deterministic() {
+        let a = cluster_preflop_with_boards(10, 20, 42, 50, |_| {});
+        let b = cluster_preflop_with_boards(10, 20, 42, 50, |_| {});
+        assert_eq!(a.buckets, b.buckets);
+    }
+
+    #[test]
+    fn test_preflop_cluster_bucket_distribution() {
+        let preflop = cluster_preflop_with_boards(169, 50, 42, 80, |_| {});
+        let unique: std::collections::HashSet<u16> =
+            preflop.buckets.iter().copied().collect();
+        assert!(
+            unique.len() > 100,
+            "expected many unique buckets, got {}",
+            unique.len()
+        );
+    }
+
+    #[test]
+    fn test_preflop_avg_equities_range() {
+        let deck = build_deck();
+        let combos = enumerate_combos(&deck);
+        let boards = sample_boards(&deck, 30, 42);
+        let equities = compute_combo_avg_equities(&combos, &boards, &|_| {});
+        assert_eq!(equities.len(), 1326);
+        for &eq in &equities {
+            assert!(
+                (0.0..=1.0).contains(&eq),
+                "average equity out of range: {eq}"
+            );
+        }
     }
 }
