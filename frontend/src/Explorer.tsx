@@ -62,22 +62,13 @@ function displayOrderActions(actions: ActionInfo[]): ActionInfo[] {
   return displayOrderIndices(actions).map((i) => actions[i]);
 }
 
-// Format action labels: strip "Raise"/"Bet" prefix, use pot-relative sizing.
+// Format action labels: strip "Raise to"/"Bet" prefix, keep chip amount only.
 function formatActionLabel(action: ActionInfo): string {
   if (action.action_type === 'fold') return 'Fold';
   if (action.action_type === 'check') return 'Check';
-  if (action.action_type === 'call') return action.label; // "Call 2" etc.
+  if (action.action_type === 'call') return action.label;
   if (action.action_type === 'allin') return 'All-in';
-  // Bet/raise — use size_key to show pot-relative label
-  if (action.size_key) {
-    const frac = parseFloat(action.size_key);
-    if (!isNaN(frac)) {
-      if (frac === 1.0) return 'Pot';
-      if (frac < 1.0) return `${Math.round(frac * 100)}%`;
-      return `${frac}x`;
-    }
-  }
-  return action.label;
+  return action.label.replace(/^(?:Raise(?: to)? |Bet )\s*/i, '');
 }
 
 function getActionColor(action: ActionInfo, actions: ActionInfo[]): string {
