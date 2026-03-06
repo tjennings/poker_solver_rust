@@ -88,15 +88,39 @@ function getActionColor(action: ActionInfo, actions: ActionInfo[]): string {
   }
 }
 
+/**
+ * Map (row, col) in the 13x13 matrix to a canonical hand index (0..168).
+ * Diagonal = pairs (0..12), above diagonal = suited (13..90), below = offsuit (91..168).
+ */
+function matrixToHandIndex(row: number, col: number): number {
+  if (row === col) {
+    return row; // pair
+  } else if (col > row) {
+    // suited: above diagonal
+    let idx = 0;
+    for (let r = 0; r < row; r++) idx += (12 - r);
+    idx += (col - row - 1);
+    return 13 + idx;
+  } else {
+    // offsuit: below diagonal (row > col)
+    let idx = 0;
+    for (let r = 0; r < col; r++) idx += (12 - r);
+    idx += (row - col - 1);
+    return 91 + idx;
+  }
+}
+
 // Hand matrix cell component
 function HandCell({
   cell,
   actions,
+  reachWeight,
   isSelected,
   onClick,
 }: {
   cell: MatrixCell;
   actions: ActionInfo[];
+  reachWeight: number;
   isSelected: boolean;
   onClick: () => void;
 }) {
@@ -108,7 +132,6 @@ function HandCell({
     const stops: string[] = [];
     let position = 0;
 
-    // Reverse order: all-in / largest raise first (left), fold last (right)
     for (let idx = cell.probabilities.length - 1; idx >= 0; idx--) {
       const prob = cell.probabilities[idx];
       const action = actions[idx];
@@ -128,12 +151,21 @@ function HandCell({
     return `linear-gradient(to right, ${stops.join(', ')})`;
   }, [cell.probabilities, actions]);
 
+  const barHeight = Math.max(reachWeight * 100, 0);
+  const isUnreachable = reachWeight < 0.01;
+
   return (
     <div
-      className={`matrix-cell ${isSelected ? 'selected' : ''} ${cell.filtered ? 'filtered' : ''}`}
-      style={{ background: cell.filtered ? undefined : gradientStops }}
+      className={`matrix-cell ${isSelected ? 'selected' : ''} ${isUnreachable ? 'unreachable' : ''}`}
       onClick={onClick}
     >
+      <div
+        className="cell-bar"
+        style={{
+          background: isUnreachable ? undefined : gradientStops,
+          height: `${barHeight}%`,
+        }}
+      />
       <span className="cell-label">{cell.hand}</span>
     </div>
   );
@@ -522,25 +554,11 @@ export default function Explorer() {
   const [comboInfo, setComboInfo] = useState<ComboGroupInfo | null>(null);
   const [handEquity, setHandEquity] = useState<HandEquity | null>(null);
   const [villainHand, setVillainHand] = useState('AA');
-  const [threshold, _setThreshold] = useState(2);
   const [remapInfo, setRemapInfo] = useState<{
     original: string[];
     canonical: string[];
     suitMap: Record<string, string>;
   } | null>(null);
-
-  // Re-fetch matrix when threshold changes (if a matrix is displayed)
-  useEffect(() => {
-    if (!matrix) return;
-    invoke<StrategyMatrix>('get_strategy_matrix', {
-      position,
-      threshold: threshold / 100,
-      street_histories: extractStreetHistories(historyItems),
-    })
-      .then(setMatrix)
-      .catch((e) => setError(String(e)));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [threshold]);
 
   // Fetch combo classification when a cell is selected on postflop
   useEffect(() => {
@@ -549,7 +567,7 @@ export default function Explorer() {
       return;
     }
     const cell = matrix.cells[selectedCell.row]?.[selectedCell.col];
-    if (!cell || cell.filtered) {
+    if (!cell) {
       setComboInfo(null);
       return;
     }
@@ -569,7 +587,7 @@ export default function Explorer() {
       return;
     }
     const cell = matrix.cells[selectedCell.row]?.[selectedCell.col];
-    if (!cell || cell.filtered) {
+    if (!cell) {
       setHandEquity(null);
       return;
     }
@@ -610,7 +628,6 @@ export default function Explorer() {
         setSelectedCell(null);
         const initialMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
           position: initialPosition,
-          threshold: threshold / 100,
         });
         setMatrix(initialMatrix);
       } catch (e) {
@@ -619,7 +636,7 @@ export default function Explorer() {
         setLoading(false);
       }
     },
-    [threshold]
+    []
   );
 
   const handleLoadDataset = useCallback(async () => {
@@ -767,7 +784,6 @@ export default function Explorer() {
 
           const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
             position: newPosition,
-            threshold: threshold / 100,
             street_histories: extractStreetHistories(historyItems),
           });
           setMatrix(newMatrix);
@@ -778,7 +794,7 @@ export default function Explorer() {
         setLoading(false);
       }
     },
-    [matrix, position, checkStreetTransition, threshold, historyItems, bundleInfo]
+    [matrix, position, checkStreetTransition, historyItems, bundleInfo]
   );
 
   const handleStreetCardsSet = useCallback(
@@ -850,7 +866,6 @@ export default function Explorer() {
 
         const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
           position: newPosition,
-          threshold: threshold / 100,
           street_histories: sh,
         });
         setMatrix(newMatrix);
@@ -860,7 +875,7 @@ export default function Explorer() {
         setLoading(false);
       }
     },
-    [pendingStreet, position, threshold, historyItems]
+    [pendingStreet, position, historyItems]
   );
 
   // Rebuild position from history items up to (but not including) the given index.
@@ -927,7 +942,6 @@ export default function Explorer() {
 
         const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
           position: pos,
-          threshold: threshold / 100,
           street_histories: extractStreetHistories(items),
         });
         setMatrix(newMatrix);
@@ -937,7 +951,7 @@ export default function Explorer() {
         setLoading(false);
       }
     },
-    [rebuildState, threshold]
+    [rebuildState]
   );
 
   // Rewind to a street transition, re-showing the card picker for that street.
@@ -993,7 +1007,6 @@ export default function Explorer() {
       setRemapInfo(null);
       const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
         position: initialPosition,
-        threshold: threshold / 100,
       });
       setMatrix(newMatrix);
     } catch (e) {
@@ -1001,7 +1014,7 @@ export default function Explorer() {
     } finally {
       setLoading(false);
     }
-  }, [bundleInfo, threshold]);
+  }, [bundleInfo]);
 
   return (
     <div className="explorer">
@@ -1070,15 +1083,22 @@ export default function Explorer() {
                 <div className="hand-matrix">
                   {matrix.cells.map((row, rowIdx) => (
                     <div key={rowIdx} className="matrix-row">
-                      {row.map((cell, colIdx) => (
-                        <HandCell
-                          key={colIdx}
-                          cell={cell}
-                          actions={matrix.actions}
-                          isSelected={selectedCell?.row === rowIdx && selectedCell?.col === colIdx}
-                          onClick={() => setSelectedCell({ row: rowIdx, col: colIdx })}
-                        />
-                      ))}
+                      {row.map((cell, colIdx) => {
+                        const handIdx = matrixToHandIndex(rowIdx, colIdx);
+                        const reachWeight = position.to_act === 0
+                          ? (matrix.reaching_p1[handIdx] ?? 1.0)
+                          : (matrix.reaching_p2[handIdx] ?? 1.0);
+                        return (
+                          <HandCell
+                            key={colIdx}
+                            cell={cell}
+                            actions={matrix.actions}
+                            reachWeight={reachWeight}
+                            isSelected={selectedCell?.row === rowIdx && selectedCell?.col === colIdx}
+                            onClick={() => setSelectedCell({ row: rowIdx, col: colIdx })}
+                          />
+                        );
+                      })}
                     </div>
                   ))}
                 </div>

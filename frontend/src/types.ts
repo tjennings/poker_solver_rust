@@ -22,7 +22,6 @@ export interface MatrixCell {
   suited: boolean;
   pair: boolean;
   probabilities: ActionProb[];
-  filtered: boolean;
 }
 
 export interface ActionInfo {
@@ -41,6 +40,8 @@ export interface StrategyMatrix {
   to_call: number;
   stack_p1: number;
   stack_p2: number;
+  reaching_p1: number[];
+  reaching_p2: number[];
 }
 
 export interface ExplorationPosition {

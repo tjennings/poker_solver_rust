@@ -603,11 +603,19 @@ button:disabled {
   z-index: 2;
 }
 
-.matrix-cell.filtered {
-  background: #16213e !important;
+.cell-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  border-radius: inherit;
 }
 
-.matrix-cell.filtered .cell-label {
+.matrix-cell.unreachable {
+  background: #16213e;
+}
+
+.matrix-cell.unreachable .cell-label {
   opacity: 0.2;
 }
 
@@ -616,6 +624,8 @@ button:disabled {
   font-weight: bold;
   color: #fff;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+  position: relative;
+  z-index: 1;
 }
 
 /* Matrix + detail layout */
