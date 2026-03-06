@@ -1,10 +1,7 @@
-#[allow(dead_code)] // Wired in by later TUI tasks.
+mod blueprint_tui;
 mod blueprint_tui_config;
-#[allow(dead_code)] // Wired in by later TUI tasks.
 mod blueprint_tui_metrics;
-#[allow(dead_code)] // Wired in by later TUI tasks.
 mod blueprint_tui_scenarios;
-#[allow(dead_code)] // Wired in by later TUI tasks.
 mod blueprint_tui_widgets;
 mod bucket_diagnostics;
 mod hand_trace;

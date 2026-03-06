@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -27,14 +28,15 @@ pub struct RandomScenarioState {
 #[derive(Debug)]
 pub struct BlueprintTuiMetrics {
     // --- lock-free atomics (hot path) ---
-    pub iterations: AtomicU64,
+    /// Shared with the training thread via `Arc` cloning.
+    pub iterations: Arc<AtomicU64>,
     pub target_iterations: Option<u64>,
     pub start_time: Instant,
 
-    // --- control flags ---
-    pub paused: AtomicBool,
-    pub quit_requested: AtomicBool,
-    snapshot_trigger: AtomicBool,
+    // --- control flags (shared with training thread) ---
+    pub paused: Arc<AtomicBool>,
+    pub quit_requested: Arc<AtomicBool>,
+    pub snapshot_trigger: Arc<AtomicBool>,
     exploitability_trigger: AtomicBool,
 
     // --- infrequent bulk data (behind Mutex) ---
@@ -57,13 +59,13 @@ impl BlueprintTuiMetrics {
         }
 
         Self {
-            iterations: AtomicU64::new(0),
+            iterations: Arc::new(AtomicU64::new(0)),
             target_iterations,
             start_time: Instant::now(),
 
-            paused: AtomicBool::new(false),
-            quit_requested: AtomicBool::new(false),
-            snapshot_trigger: AtomicBool::new(false),
+            paused: Arc::new(AtomicBool::new(false)),
+            quit_requested: Arc::new(AtomicBool::new(false)),
+            snapshot_trigger: Arc::new(AtomicBool::new(false)),
             exploitability_trigger: AtomicBool::new(false),
 
             strategy_snapshots: Mutex::new(snapshots),
