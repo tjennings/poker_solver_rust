@@ -3,6 +3,7 @@ import { invoke } from './invoke';
 import {
   BundleInfo,
   CanonicalizeResult,
+  DatasetInfo,
   HandEquity,
   StrategyMatrix,
   ExplorationPosition,
@@ -196,7 +197,28 @@ function CellDetail({
 }) {
   return (
     <div className="cell-detail">
-      <div className="cell-detail-header">{cell.hand}</div>
+      <div className="cell-detail-header">
+        <span>{cell.hand}</span>
+        <div className="cell-detail-summary-bar">
+          {[...displayOrderIndices(actions)].reverse().map((idx) => {
+            const prob = cell.probabilities[idx];
+            const action = actions[idx];
+            if (!action || !prob) return null;
+            const pct = prob.probability * 100;
+            if (pct < 0.1) return null;
+            return (
+              <div
+                key={action.id}
+                className="cell-detail-summary-segment"
+                style={{
+                  width: `${pct}%`,
+                  backgroundColor: getActionColor(action, actions),
+                }}
+              />
+            );
+          })}
+        </div>
+      </div>
       <div className="cell-detail-actions">
         {displayOrderIndices(actions).map((idx) => {
           const prob = cell.probabilities[idx];
@@ -206,7 +228,6 @@ function CellDetail({
           return (
             <div key={action.id} className="cell-detail-row">
               <span className="cell-detail-label">{formatActionLabel(action)}</span>
-              <span className="cell-detail-pct">{pct.toFixed(1)}%</span>
               <div className="cell-detail-bar-bg">
                 <div
                   className="cell-detail-bar-fill"
@@ -216,6 +237,7 @@ function CellDetail({
                   }}
                 />
               </div>
+              <span className="cell-detail-pct">{pct.toFixed(1)}%</span>
             </div>
           );
         })}
@@ -711,18 +733,25 @@ export default function Explorer() {
     []
   );
 
+  const [datasets, setDatasets] = useState<DatasetInfo[] | null>(null);
+  const [showDatasetPicker, setShowDatasetPicker] = useState(false);
+
   const handleLoadDataset = useCallback(async () => {
-    try {
-      let path: string | null = null;
-      if ('__TAURI__' in window) {
+    if ('__TAURI__' in window) {
+      try {
         const { open } = await import('@tauri-apps/plugin-dialog');
-        path = await open({ directory: true, title: 'Select Dataset Directory' });
-      } else {
-        path = window.prompt('Enter dataset directory path:');
+        const path = await open({ directory: true, title: 'Select Dataset Directory' });
+        if (path) loadSource(path);
+      } catch (e) {
+        setError(String(e));
       }
-      if (path) {
-        loadSource(path);
-      }
+      return;
+    }
+    // Browser mode: fetch dataset list from backend
+    try {
+      const list = await invoke<DatasetInfo[]>('list_datasets', {});
+      setDatasets(list);
+      setShowDatasetPicker(true);
     } catch (e) {
       setError(String(e));
     }
@@ -1336,7 +1365,7 @@ export default function Explorer() {
         </>
       )}
 
-      {!bundleInfo && !loading && (
+      {!bundleInfo && !loading && !showDatasetPicker && (
         <div className="action-strip">
           <div className="action-block load-dataset-card" onClick={handleLoadDataset}>
             <div className="load-dataset-icon">
@@ -1348,6 +1377,34 @@ export default function Explorer() {
             </div>
             <span className="load-dataset-label">Load Dataset</span>
           </div>
+        </div>
+      )}
+
+      {showDatasetPicker && datasets && (
+        <div className="dataset-picker">
+          <div className="dataset-picker-header">
+            <h3>Select Dataset</h3>
+            <button className="dataset-picker-close" onClick={() => setShowDatasetPicker(false)}>×</button>
+          </div>
+          {datasets.length === 0 ? (
+            <p className="dataset-picker-empty">No datasets found in local_data/ or agents/</p>
+          ) : (
+            <div className="dataset-picker-list">
+              {datasets.map((ds) => (
+                <div
+                  key={ds.path}
+                  className="dataset-picker-item"
+                  onClick={() => {
+                    setShowDatasetPicker(false);
+                    loadSource(ds.path);
+                  }}
+                >
+                  <span className={`dataset-kind-badge ${ds.kind}`}>{ds.kind}</span>
+                  <span className="dataset-name">{ds.name}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 

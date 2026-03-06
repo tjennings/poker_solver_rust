@@ -760,9 +760,59 @@ fn get_strategy_matrix_preflop(
         stack_p1: walk.stacks.first().copied().unwrap_or(0),
         stack_p2: walk.stacks.get(1).copied().unwrap_or(0),
         stacks: walk.stacks,
-        reaching_p1: vec![1.0; 169],
-        reaching_p2: vec![1.0; 169],
+        reaching_p1: compute_reaching_range_preflop(config, strategy, &position.history, 0).to_vec(),
+        reaching_p2: compute_reaching_range_preflop(config, strategy, &position.history, 1).to_vec(),
     })
+}
+
+/// Compute reaching probabilities for a player by replaying the preflop tree.
+///
+/// At each decision node where `viewing_player` acts, multiply each hand's
+/// reaching probability by the strategy probability of the chosen action.
+fn compute_reaching_range_preflop(
+    config: &poker_solver_core::preflop::PreflopConfig,
+    strategy: &poker_solver_core::preflop::PreflopStrategy,
+    history: &[String],
+    viewing_player: u8,
+) -> [f64; 169] {
+    use poker_solver_core::preflop::{PreflopNode, PreflopTree};
+
+    let tree = PreflopTree::build(config);
+    let mut reaching = [1.0f64; 169];
+    let mut node_idx = 0u32;
+
+    for action_str in history {
+        let node = &tree.nodes[node_idx as usize];
+        let (action_labels, children, position) = match node {
+            PreflopNode::Decision {
+                action_labels,
+                children,
+                position,
+            } => (action_labels, children, *position),
+            PreflopNode::Terminal { .. } => break,
+        };
+
+        let child_pos = match find_action_position(action_str, action_labels) {
+            Some(p) => p,
+            None => break,
+        };
+
+        // If this is the viewing player's decision, multiply reaching by action prob
+        if position == viewing_player {
+            for hand_idx in 0..169 {
+                if reaching[hand_idx] < 1e-15 {
+                    continue;
+                }
+                let probs = strategy.get_probs(node_idx, hand_idx);
+                let prob = probs.get(child_pos).copied().unwrap_or(1.0);
+                reaching[hand_idx] *= prob;
+            }
+        }
+
+        node_idx = children[child_pos];
+    }
+
+    reaching
 }
 
 /// Result of walking the preflop tree with full state tracking.
@@ -1463,6 +1513,74 @@ fn format_card_short(card: &Card) -> String {
     format!("{rank}{suit}")
 }
 
+/// Information about a discoverable dataset (strategy bundle or agent).
+#[derive(Debug, Clone, Serialize)]
+pub struct DatasetInfo {
+    pub name: String,
+    pub path: String,
+    pub kind: &'static str, // "preflop", "postflop", "agent"
+}
+
+/// List all loadable datasets from `local_data/` and `agents/` directories.
+#[tauri::command]
+pub fn list_datasets() -> Result<Vec<DatasetInfo>, String> {
+    let mut datasets = Vec::new();
+
+    // Scan local_data/ for strategy bundles
+    if let Some(data_dir) = find_dir("local_data") {
+        if let Ok(entries) = std::fs::read_dir(&data_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let kind = if path.join("blueprint.bin").exists() {
+                    "postflop"
+                } else if path.join("strategy.bin").exists() {
+                    "preflop"
+                } else {
+                    continue;
+                };
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                datasets.push(DatasetInfo {
+                    name,
+                    path: path.to_string_lossy().to_string(),
+                    kind,
+                });
+            }
+        }
+    }
+
+    // Scan agents/
+    if let Some(agents_dir) = find_dir("agents") {
+        if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    continue;
+                }
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                datasets.push(DatasetInfo {
+                    name,
+                    path: path.to_string_lossy().to_string(),
+                    kind: "agent",
+                });
+            }
+        }
+    }
+
+    datasets.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
+    Ok(datasets)
+}
+
 /// List available agent configs from the agents/ directory.
 ///
 /// Searches for `agents/` in the current directory and up to 4 parent
@@ -1504,11 +1622,11 @@ pub fn list_agents() -> Result<Vec<AgentInfo>, String> {
     Ok(agents)
 }
 
-/// Walk up from CWD looking for an `agents/` directory (max 4 levels).
-fn find_agents_dir() -> Option<PathBuf> {
+/// Walk up from CWD looking for a named directory (max 4 levels).
+fn find_dir(name: &str) -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     for _ in 0..5 {
-        let candidate = dir.join("agents");
+        let candidate = dir.join(name);
         if candidate.is_dir() {
             return Some(candidate);
         }
@@ -1517,6 +1635,11 @@ fn find_agents_dir() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Walk up from CWD looking for an `agents/` directory (max 4 levels).
+fn find_agents_dir() -> Option<PathBuf> {
+    find_dir("agents")
 }
 
 /// A group of combos sharing the same hand classification.

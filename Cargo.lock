@@ -3007,6 +3007,7 @@ dependencies = [
  "rs_poker",
  "rustc-hash",
  "serde",
+ "serde_json",
  "serde_yaml",
  "sled",
  "tempfile",

@@ -12,6 +12,12 @@ export interface AgentInfo {
   path: string;
 }
 
+export interface DatasetInfo {
+  name: string;
+  path: string;
+  kind: 'preflop' | 'postflop' | 'agent';
+}
+
 export interface ActionProb {
   action: string;
   probability: number;

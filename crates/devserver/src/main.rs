@@ -225,6 +225,11 @@ async fn handle_list_agents(
     result_to_response(poker_solver_tauri::list_agents())
 }
 
+async fn handle_list_datasets(
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::list_datasets())
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -261,6 +266,7 @@ async fn main() {
         )
         .route("/api/is_board_cached", post(handle_is_board_cached))
         .route("/api/list_agents", post(handle_list_agents))
+        .route("/api/list_datasets", post(handle_list_datasets))
         .route("/api/get_combo_classes", post(handle_get_combo_classes))
         .route("/api/get_hand_equity", post(handle_get_hand_equity))
         .layer(cors)

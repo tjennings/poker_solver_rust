@@ -149,6 +149,97 @@ body {
   color: #00d9ff;
 }
 
+/* Dataset picker */
+.dataset-picker {
+  margin: 12px;
+  max-width: 400px;
+  background: rgba(15, 23, 42, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.dataset-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.dataset-picker-header h3 {
+  margin: 0;
+  font-size: 0.9rem;
+  color: #ccc;
+}
+
+.dataset-picker-close {
+  all: unset;
+  cursor: pointer;
+  font-size: 1.2rem;
+  color: #666;
+  padding: 0 4px;
+}
+
+.dataset-picker-close:hover {
+  color: #fff;
+}
+
+.dataset-picker-empty {
+  padding: 20px 14px;
+  color: #666;
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.dataset-picker-list {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.dataset-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.dataset-picker-item:hover {
+  background: rgba(0, 217, 255, 0.08);
+}
+
+.dataset-kind-badge {
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 3px;
+  min-width: 52px;
+  text-align: center;
+}
+
+.dataset-kind-badge.preflop {
+  background: rgba(59, 130, 246, 0.2);
+  color: #60a5fa;
+}
+
+.dataset-kind-badge.postflop {
+  background: rgba(16, 185, 129, 0.2);
+  color: #34d399;
+}
+
+.dataset-kind-badge.agent {
+  background: rgba(251, 191, 36, 0.2);
+  color: #fbbf24;
+}
+
+.dataset-name {
+  font-size: 0.85rem;
+  color: #ddd;
+}
+
 button {
   padding: 0.5rem 1.5rem;
   font-size: 1rem;
@@ -646,7 +737,8 @@ button:disabled {
 
 /* Cell detail panel */
 .cell-detail {
-  min-width: 180px;
+  width: 320px;
+  flex-shrink: 0;
   background: linear-gradient(135deg, #12122a 0%, #1a1a32 100%);
   border: 1px solid rgba(255, 255, 255, 0.06);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
@@ -656,12 +748,28 @@ button:disabled {
 }
 
 .cell-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
   font-size: 1.1rem;
   font-weight: bold;
   color: #eee;
   margin-bottom: 0.75rem;
   padding-bottom: 0.5rem;
   border-bottom: 1px solid #333;
+}
+
+.cell-detail-summary-bar {
+  flex: 1;
+  display: flex;
+  height: 12px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #222;
+}
+
+.cell-detail-summary-segment {
+  height: 100%;
 }
 
 .cell-detail-actions {
@@ -695,7 +803,7 @@ button:disabled {
   font-size: 0.75rem;
   color: #ccc;
   white-space: nowrap;
-  flex: 1;
+  flex: 0 0 4.5em;
 }
 
 .cell-detail-pct {

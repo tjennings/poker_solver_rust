@@ -5,8 +5,8 @@ pub use exploration::{
     // Tauri command wrappers
     canonicalize_board, get_available_actions, get_bundle_info, get_combo_classes,
     get_computation_status, get_hand_equity, get_strategy_matrix, is_board_cached,
-    is_bundle_loaded, list_agents, load_bundle, load_preflop_solve, load_subgame_source,
-    solve_preflop_live, start_bucket_computation,
+    is_bundle_loaded, list_agents, list_datasets, load_bundle, load_preflop_solve,
+    load_subgame_source, solve_preflop_live, start_bucket_computation,
     // Core functions (no Tauri dependency, usable from Axum or other runtimes)
     canonicalize_board_core, get_available_actions_core, get_bundle_info_core,
     get_combo_classes_core, get_computation_status_core, get_hand_equity_core,
@@ -17,8 +17,8 @@ pub use exploration::{
     ExplorationState, SubgameProgressEvent,
     // Additional types needed by consumers of core functions
     ActionInfo, ActionProb, BucketProgressEvent, BundleInfo, CanonicalizeResult,
-    ComboGroup, ComboGroupInfo, ComputationStatus, ExplorationPosition, HandEquity,
-    MatrixCell, StrategyMatrix,
+    ComboGroup, ComboGroupInfo, ComputationStatus, DatasetInfo, ExplorationPosition,
+    HandEquity, MatrixCell, StrategyMatrix,
 };
 
 pub use simulation::{
