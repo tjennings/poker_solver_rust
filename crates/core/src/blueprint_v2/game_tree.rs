@@ -697,6 +697,24 @@ impl GameTree {
         }
         (decision, chance, terminal)
     }
+
+    /// Build a mapping from arena index to decision-node index.
+    ///
+    /// For every `Decision` node in the arena, assigns a sequential
+    /// index (0, 1, 2, ...) in arena order. Non-decision nodes map to
+    /// `u32::MAX`.
+    #[must_use]
+    pub fn decision_index_map(&self) -> Vec<u32> {
+        let mut map = vec![u32::MAX; self.nodes.len()];
+        let mut idx = 0u32;
+        for (i, node) in self.nodes.iter().enumerate() {
+            if matches!(node, GameNode::Decision { .. }) {
+                map[i] = idx;
+                idx += 1;
+            }
+        }
+        map
+    }
 }
 
 #[cfg(test)]

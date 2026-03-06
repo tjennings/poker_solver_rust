@@ -116,6 +116,46 @@ impl BlueprintV2Strategy {
         bincode::deserialize_from(reader)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
+
+    /// Get the action probability slice for a given decision node and bucket.
+    ///
+    /// Returns a slice of `f32` probabilities, one per action, or
+    /// an empty slice if the index or bucket is out of range.
+    #[must_use]
+    pub fn get_action_probs(&self, decision_idx: usize, bucket: u16) -> &[f32] {
+        if decision_idx >= self.node_action_counts.len() {
+            return &[];
+        }
+        let num_actions = self.node_action_counts[decision_idx] as usize;
+        let street_idx = self.node_street_indices[decision_idx] as usize;
+        let buckets = self.bucket_counts[street_idx] as usize;
+
+        if bucket as usize >= buckets {
+            return &[];
+        }
+
+        // Compute offset: sum of (buckets_for_street * num_actions) for
+        // all prior decision nodes.
+        let mut offset = 0usize;
+        for i in 0..decision_idx {
+            let n_act = self.node_action_counts[i] as usize;
+            let st = self.node_street_indices[i] as usize;
+            let bk = self.bucket_counts[st] as usize;
+            offset += bk * n_act;
+        }
+        offset += bucket as usize * num_actions;
+
+        if offset + num_actions > self.action_probs.len() {
+            return &[];
+        }
+        &self.action_probs[offset..offset + num_actions]
+    }
+
+    /// The number of decision nodes in this strategy.
+    #[must_use]
+    pub fn num_decision_nodes(&self) -> usize {
+        self.node_action_counts.len()
+    }
 }
 
 /// Save a full snapshot directory with strategy, metadata JSON, and
