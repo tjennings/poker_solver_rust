@@ -12,15 +12,16 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 
 use super::game_tree::{GameNode, GameTree};
 
 /// Flat-buffer storage for regrets and strategy sums.
 pub struct BlueprintStorage {
-    /// Cumulative regrets: one `i32` per (decision node, bucket, action).
-    pub regrets: Vec<i32>,
-    /// Strategy sums: one `i64` per (decision node, bucket, action).
-    pub strategy_sums: Vec<i64>,
+    /// Cumulative regrets: one `AtomicI32` per (decision node, bucket, action).
+    pub regrets: Vec<AtomicI32>,
+    /// Strategy sums: one `AtomicI64` per (decision node, bucket, action).
+    pub strategy_sums: Vec<AtomicI64>,
     /// Number of buckets per street `[preflop, flop, turn, river]`.
     pub bucket_counts: [u16; 4],
     /// Per-node layout metadata. Non-decision nodes use the `Default`
@@ -66,47 +67,45 @@ impl BlueprintStorage {
         }
 
         Self {
-            regrets: vec![0i32; total],
-            strategy_sums: vec![0i64; total],
+            regrets: (0..total).map(|_| AtomicI32::new(0)).collect(),
+            strategy_sums: (0..total).map(|_| AtomicI64::new(0)).collect(),
             bucket_counts,
             layout,
         }
     }
 
-    /// Regret slice for a decision node and bucket (length = `num_actions`).
+    /// Read a single regret value atomically.
     #[inline]
     #[must_use]
-    pub fn get_regrets(&self, node_idx: u32, bucket: u16) -> &[i32] {
+    pub fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
         let nl = &self.layout[node_idx as usize];
-        let start = Self::slot_offset(nl, bucket);
-        &self.regrets[start..start + nl.num_actions as usize]
+        let idx = Self::slot_offset(nl, bucket) + action;
+        self.regrets[idx].load(Ordering::Relaxed)
     }
 
-    /// Mutable regret slice for a decision node and bucket.
+    /// Add a delta to a single regret value atomically.
     #[inline]
-    pub fn get_regrets_mut(&mut self, node_idx: u32, bucket: u16) -> &mut [i32] {
-        let nl = self.layout[node_idx as usize];
-        let start = Self::slot_offset(&nl, bucket);
-        let end = start + nl.num_actions as usize;
-        &mut self.regrets[start..end]
+    pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
+        let nl = &self.layout[node_idx as usize];
+        let idx = Self::slot_offset(nl, bucket) + action;
+        self.regrets[idx].fetch_add(delta, Ordering::Relaxed);
     }
 
-    /// Strategy-sum slice for a decision node and bucket.
+    /// Read a single strategy sum value atomically.
     #[inline]
     #[must_use]
-    pub fn get_strategy_sums(&self, node_idx: u32, bucket: u16) -> &[i64] {
+    pub fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64 {
         let nl = &self.layout[node_idx as usize];
-        let start = Self::slot_offset(nl, bucket);
-        &self.strategy_sums[start..start + nl.num_actions as usize]
+        let idx = Self::slot_offset(nl, bucket) + action;
+        self.strategy_sums[idx].load(Ordering::Relaxed)
     }
 
-    /// Mutable strategy-sum slice for a decision node and bucket.
+    /// Add a delta to a single strategy sum value atomically.
     #[inline]
-    pub fn get_strategy_sums_mut(&mut self, node_idx: u32, bucket: u16) -> &mut [i64] {
-        let nl = self.layout[node_idx as usize];
-        let start = Self::slot_offset(&nl, bucket);
-        let end = start + nl.num_actions as usize;
-        &mut self.strategy_sums[start..end]
+    pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
+        let nl = &self.layout[node_idx as usize];
+        let idx = Self::slot_offset(nl, bucket) + action;
+        self.strategy_sums[idx].fetch_add(delta, Ordering::Relaxed);
     }
 
     /// Current strategy via regret matching.
@@ -115,16 +114,22 @@ impl BlueprintStorage {
     /// non-positive the uniform distribution is returned.
     #[must_use]
     pub fn current_strategy(&self, node_idx: u32, bucket: u16) -> Vec<f64> {
-        let regrets = self.get_regrets(node_idx, bucket);
-        let positive_sum: f64 = regrets.iter().map(|&r| f64::from(r.max(0))).sum();
+        let nl = &self.layout[node_idx as usize];
+        let num_actions = nl.num_actions as usize;
+        let start = Self::slot_offset(nl, bucket);
+
+        let mut positive_sum = 0.0_f64;
+        let mut positives = Vec::with_capacity(num_actions);
+        for i in 0..num_actions {
+            let r = f64::from(self.regrets[start + i].load(Ordering::Relaxed).max(0));
+            positives.push(r);
+            positive_sum += r;
+        }
+
         if positive_sum > 0.0 {
-            regrets
-                .iter()
-                .map(|&r| f64::from(r.max(0)) / positive_sum)
-                .collect()
+            positives.iter().map(|&r| r / positive_sum).collect()
         } else {
-            let n = regrets.len() as f64;
-            vec![1.0 / n; regrets.len()]
+            vec![1.0 / num_actions as f64; num_actions]
         }
     }
 
@@ -137,23 +142,28 @@ impl BlueprintStorage {
     /// `num_actions` entries are written.
     #[inline]
     pub fn current_strategy_into(&self, node_idx: u32, bucket: u16, out: &mut [f64]) {
-        let regrets = self.get_regrets(node_idx, bucket);
-        let num_actions = regrets.len();
+        let nl = &self.layout[node_idx as usize];
+        let num_actions = nl.num_actions as usize;
         debug_assert!(
             out.len() >= num_actions,
             "buffer too small: {} < {num_actions}",
             out.len()
         );
         let out = &mut out[..num_actions];
+        let start = Self::slot_offset(nl, bucket);
 
-        let positive_sum: f64 = regrets.iter().map(|&r| f64::from(r.max(0))).sum();
+        let mut positive_sum = 0.0_f64;
+        for i in 0..num_actions {
+            let r = self.regrets[start + i].load(Ordering::Relaxed).max(0);
+            out[i] = f64::from(r);
+            positive_sum += out[i];
+        }
         if positive_sum > 0.0 {
-            for (o, &r) in out.iter_mut().zip(regrets) {
-                *o = f64::from(r.max(0)) / positive_sum;
+            for o in out.iter_mut() {
+                *o /= positive_sum;
             }
         } else {
-            let u = 1.0 / num_actions as f64;
-            out.fill(u);
+            out.fill(1.0 / num_actions as f64);
         }
     }
 
@@ -163,13 +173,22 @@ impl BlueprintStorage {
     /// uniform when no strategy mass has been accumulated.
     #[must_use]
     pub fn average_strategy(&self, node_idx: u32, bucket: u16) -> Vec<f64> {
-        let sums = self.get_strategy_sums(node_idx, bucket);
-        let total: f64 = sums.iter().map(|&s| s as f64).sum();
+        let nl = &self.layout[node_idx as usize];
+        let num_actions = nl.num_actions as usize;
+        let start = Self::slot_offset(nl, bucket);
+
+        let mut total = 0.0_f64;
+        let mut sums = Vec::with_capacity(num_actions);
+        for i in 0..num_actions {
+            let s = self.strategy_sums[start + i].load(Ordering::Relaxed) as f64;
+            sums.push(s);
+            total += s;
+        }
+
         if total > 0.0 {
-            sums.iter().map(|&s| s as f64 / total).collect()
+            sums.iter().map(|&s| s / total).collect()
         } else {
-            let n = sums.len() as f64;
-            vec![1.0 / n; sums.len()]
+            vec![1.0 / num_actions as f64; num_actions]
         }
     }
 
@@ -196,11 +215,18 @@ impl BlueprintStorage {
         let file = std::fs::File::create(path)?;
         let mut writer = std::io::BufWriter::new(file);
 
-        let payload = (
-            &self.bucket_counts,
-            &self.regrets,
-            &self.strategy_sums,
-        );
+        let regrets_plain: Vec<i32> = self
+            .regrets
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
+        let sums_plain: Vec<i64> = self
+            .strategy_sums
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
+
+        let payload = (&self.bucket_counts, &regrets_plain, &sums_plain);
         bincode::serialize_into(&mut writer, &payload)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -221,7 +247,7 @@ impl BlueprintStorage {
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
 
-        let (stored_counts, regrets, strategy_sums): ([u16; 4], Vec<i32>, Vec<i64>) =
+        let (stored_counts, regrets_plain, sums_plain): ([u16; 4], Vec<i32>, Vec<i64>) =
             bincode::deserialize_from(reader)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -235,31 +261,36 @@ impl BlueprintStorage {
         }
 
         // Rebuild layout from tree (the layout is not serialized).
-        let mut storage = Self::new(tree, bucket_counts);
+        let storage = Self::new(tree, bucket_counts);
 
-        if regrets.len() != storage.regrets.len() {
+        if regrets_plain.len() != storage.regrets.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "regret buffer length mismatch: file has {}, expected {}",
-                    regrets.len(),
+                    regrets_plain.len(),
                     storage.regrets.len()
                 ),
             ));
         }
-        if strategy_sums.len() != storage.strategy_sums.len() {
+        if sums_plain.len() != storage.strategy_sums.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "strategy_sums buffer length mismatch: file has {}, expected {}",
-                    strategy_sums.len(),
+                    sums_plain.len(),
                     storage.strategy_sums.len()
                 ),
             ));
         }
 
-        storage.regrets = regrets;
-        storage.strategy_sums = strategy_sums;
+        for (atom, &val) in storage.regrets.iter().zip(regrets_plain.iter()) {
+            atom.store(val, Ordering::Relaxed);
+        }
+        for (atom, &val) in storage.strategy_sums.iter().zip(sums_plain.iter()) {
+            atom.store(val, Ordering::Relaxed);
+        }
+
         Ok(storage)
     }
 
@@ -325,7 +356,7 @@ mod tests {
     #[test]
     fn regret_update_changes_strategy() {
         let tree = toy_tree();
-        let mut storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
+        let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
 
         let node_idx = tree
             .nodes
@@ -333,13 +364,10 @@ mod tests {
             .position(|n| matches!(n, GameNode::Decision { .. }))
             .expect("need a decision node") as u32;
 
-        let regrets = storage.get_regrets_mut(node_idx, 0);
-        if regrets.len() >= 2 {
-            regrets[0] = 1000;
-            regrets[1] = 0;
-            for r in regrets.iter_mut().skip(2) {
-                *r = 0;
-            }
+        let num_actions = storage.num_actions(node_idx) as usize;
+        if num_actions >= 2 {
+            storage.add_regret(node_idx, 0, 0, 1000);
+            // Actions 1..n stay at 0
         }
 
         let strategy = storage.current_strategy(node_idx, 0);
@@ -353,7 +381,7 @@ mod tests {
     #[test]
     fn average_strategy_proportional() {
         let tree = toy_tree();
-        let mut storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
+        let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
 
         let node_idx = tree
             .nodes
@@ -361,13 +389,11 @@ mod tests {
             .position(|n| matches!(n, GameNode::Decision { .. }))
             .expect("need a decision node") as u32;
 
-        let sums = storage.get_strategy_sums_mut(node_idx, 0);
-        if sums.len() >= 2 {
-            sums[0] = 300;
-            sums[1] = 700;
-            for s in sums.iter_mut().skip(2) {
-                *s = 0;
-            }
+        let num_actions = storage.num_actions(node_idx) as usize;
+        if num_actions >= 2 {
+            storage.add_strategy_sum(node_idx, 0, 0, 300);
+            storage.add_strategy_sum(node_idx, 0, 1, 700);
+            // Actions 2..n stay at 0
         }
 
         let avg = storage.average_strategy(node_idx, 0);
@@ -378,7 +404,7 @@ mod tests {
     #[test]
     fn save_load_round_trip() {
         let tree = toy_tree();
-        let mut storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
 
         let node_idx = tree
             .nodes
@@ -386,8 +412,8 @@ mod tests {
             .position(|n| matches!(n, GameNode::Decision { .. }))
             .expect("need a decision node") as u32;
 
-        storage.get_regrets_mut(node_idx, 5)[0] = 42;
-        storage.get_strategy_sums_mut(node_idx, 5)[0] = 999;
+        storage.add_regret(node_idx, 5, 0, 42);
+        storage.add_strategy_sum(node_idx, 5, 0, 999);
 
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("storage.bin");
@@ -396,8 +422,8 @@ mod tests {
         let loaded =
             BlueprintStorage::load_regrets(&path, &tree, [50, 50, 50, 50]).expect("load");
 
-        assert_eq!(loaded.get_regrets(node_idx, 5)[0], 42);
-        assert_eq!(loaded.get_strategy_sums(node_idx, 5)[0], 999);
+        assert_eq!(loaded.get_regret(node_idx, 5, 0), 42);
+        assert_eq!(loaded.get_strategy_sum(node_idx, 5, 0), 999);
     }
 
     #[test]
@@ -416,7 +442,7 @@ mod tests {
     #[test]
     fn different_buckets_are_independent() {
         let tree = toy_tree();
-        let mut storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
 
         let node_idx = tree
             .nodes
@@ -424,11 +450,11 @@ mod tests {
             .position(|n| matches!(n, GameNode::Decision { .. }))
             .expect("need a decision node") as u32;
 
-        storage.get_regrets_mut(node_idx, 0)[0] = 100;
-        storage.get_regrets_mut(node_idx, 1)[0] = 200;
+        storage.add_regret(node_idx, 0, 0, 100);
+        storage.add_regret(node_idx, 1, 0, 200);
 
-        assert_eq!(storage.get_regrets(node_idx, 0)[0], 100);
-        assert_eq!(storage.get_regrets(node_idx, 1)[0], 200);
+        assert_eq!(storage.get_regret(node_idx, 0, 0), 100);
+        assert_eq!(storage.get_regret(node_idx, 1, 0), 200);
     }
 
     #[test]
