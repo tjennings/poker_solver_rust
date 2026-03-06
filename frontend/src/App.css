@@ -516,6 +516,7 @@ button:disabled {
 
 .action-block-header .stack {
   color: #888;
+  font-size: 0.65rem;
 }
 
 .action-list {

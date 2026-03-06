@@ -267,7 +267,7 @@ function ActionBlock({
         onClick={onHeaderClick}
       >
         <span className="position">{position}</span>
-        <span className="stack">{Math.round(stack / 2)}BB / {Math.round(pot / 2)}BB</span>
+        <span className="stack">{isNaN(stack) ? '--' : `${Math.round(stack / 2)}BB`} / {isNaN(pot) ? '--' : `${Math.round(pot / 2)}BB`}</span>
       </div>
       <div className="action-list">
         {displayOrderActions(actions).map((action) => {
