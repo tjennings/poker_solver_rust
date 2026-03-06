@@ -14,6 +14,8 @@
 
 use std::error::Error;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use rand::prelude::*;
@@ -81,6 +83,16 @@ pub struct BlueprintTrainer {
     /// Pre-allocated deck for [`sample_deal`](Self::sample_deal), avoiding
     /// a 52-element `Vec` allocation on every call.
     deck: [Card; 52],
+
+    // --- TUI shared state ---
+    /// Iteration counter visible to the TUI thread.
+    pub shared_iterations: Arc<AtomicU64>,
+    /// When `true`, the training loop sleeps until unpaused.
+    pub paused: Arc<AtomicBool>,
+    /// When `true`, the training loop exits at the next iteration boundary.
+    pub quit_requested: Arc<AtomicBool>,
+    /// One-shot trigger: the TUI sets this to request an immediate snapshot.
+    pub snapshot_trigger: Arc<AtomicBool>,
 }
 
 impl BlueprintTrainer {
@@ -136,6 +148,10 @@ impl BlueprintTrainer {
             last_snapshot_time: 0,
             snapshot_count: 0,
             deck,
+            shared_iterations: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
+            quit_requested: Arc::new(AtomicBool::new(false)),
+            snapshot_trigger: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -146,6 +162,14 @@ impl BlueprintTrainer {
     /// Returns an error if a snapshot write fails.
     pub fn train(&mut self) -> Result<(), Box<dyn Error>> {
         while !self.should_stop() {
+            // Honour pause requests from the TUI.
+            while self.paused.load(Ordering::Relaxed) {
+                if self.quit_requested.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
             let deal = self.sample_deal();
             let prune = self.should_prune();
             let threshold = self.config.training.prune_threshold;
@@ -177,6 +201,8 @@ impl BlueprintTrainer {
             );
 
             self.iterations += 1;
+            self.shared_iterations
+                .store(self.iterations, Ordering::Relaxed);
             self.check_timed_actions()?;
         }
         Ok(())
@@ -219,6 +245,9 @@ impl BlueprintTrainer {
 
     /// True when either the iteration limit or time limit has been reached.
     fn should_stop(&self) -> bool {
+        if self.quit_requested.load(Ordering::Relaxed) {
+            return true;
+        }
         if let Some(max_iter) = self.config.training.iterations
             && self.iterations >= max_iter
         {
@@ -269,9 +298,12 @@ impl BlueprintTrainer {
             self.print_metrics();
         }
 
-        // Snapshot.
-        if elapsed_min >= self.config.snapshots.warmup_minutes
-            && elapsed_min >= self.last_snapshot_time + self.config.snapshots.snapshot_every_minutes
+        // Snapshot: either timed or TUI-triggered.
+        let tui_triggered = self.snapshot_trigger.swap(false, Ordering::Relaxed);
+        if tui_triggered
+            || (elapsed_min >= self.config.snapshots.warmup_minutes
+                && elapsed_min
+                    >= self.last_snapshot_time + self.config.snapshots.snapshot_every_minutes)
         {
             self.save_snapshot()?;
         }

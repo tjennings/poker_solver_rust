@@ -315,20 +315,20 @@ fn run_tui_inner(
         app.tick();
         terminal.draw(|frame| app.render(frame))?;
 
-        if event::poll(refresh_interval)? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        metrics.quit_requested.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    KeyCode::Right | KeyCode::Tab => app.next_tab(),
-                    KeyCode::Left | KeyCode::BackTab => app.prev_tab(),
-                    KeyCode::Char('p') => metrics.toggle_pause(),
-                    KeyCode::Char('s') => metrics.request_snapshot(),
-                    KeyCode::Char('e') => metrics.request_exploitability(),
-                    _ => {}
+        if event::poll(refresh_interval)?
+            && let Event::Key(key) = event::read()?
+        {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    metrics.quit_requested.store(true, Ordering::Relaxed);
+                    break;
                 }
+                KeyCode::Right | KeyCode::Tab => app.next_tab(),
+                KeyCode::Left | KeyCode::BackTab => app.prev_tab(),
+                KeyCode::Char('p') => metrics.toggle_pause(),
+                KeyCode::Char('s') => metrics.request_snapshot(),
+                KeyCode::Char('e') => metrics.request_exploitability(),
+                _ => {}
             }
         }
 
