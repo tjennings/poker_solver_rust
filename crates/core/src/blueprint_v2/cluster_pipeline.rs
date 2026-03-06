@@ -200,10 +200,10 @@ pub fn cluster_turn_with_boards(
             let features: Vec<Option<Vec<f64>>> = combos
                 .iter()
                 .map(|combo| {
-                    if cards_overlap_4(*combo, *board) {
+                    if cards_overlap(*combo, board) {
                         return None;
                     }
-                    Some(build_river_histogram(*combo, *board, &deck, num_river_buckets))
+                    Some(build_next_street_histogram(*combo, board, &deck, num_river_buckets))
                 })
                 .collect();
 
@@ -254,32 +254,35 @@ pub fn cluster_turn_with_boards(
     BucketFile { header, buckets }
 }
 
-/// Build a probability distribution over river equity bins for the given
-/// combo on a 4-card turn board.
+/// Build a probability distribution over equity bins for the given combo
+/// on a partial board.
 ///
-/// Enumerates every card not in the board or combo as a potential river card,
-/// computes equity on the resulting 5-card board, maps equity to a bin, and
+/// Enumerates every card not in the board or combo as a potential next-street
+/// card, computes equity on the extended board, maps equity to a bin, and
 /// normalises the histogram.
-fn build_river_histogram(
+fn build_next_street_histogram(
     combo: [Card; 2],
-    board: [Card; 4],
+    board: &[Card],
     deck: &[Card],
-    num_river_buckets: u16,
+    num_buckets: u16,
 ) -> Vec<f64> {
-    let mut histogram = vec![0.0_f64; num_river_buckets as usize];
+    let mut histogram = vec![0.0_f64; num_buckets as usize];
     let mut count = 0_u32;
+    let mut extended = Vec::with_capacity(board.len() + 1);
+    extended.extend_from_slice(board);
+    extended.push(Card::new(crate::poker::Value::Two, crate::poker::Suit::Club)); // placeholder
 
-    for &river_card in deck {
-        if board.contains(&river_card)
-            || river_card == combo[0]
-            || river_card == combo[1]
+    for &next_card in deck {
+        if board.contains(&next_card)
+            || next_card == combo[0]
+            || next_card == combo[1]
         {
             continue;
         }
 
-        let five_board = [board[0], board[1], board[2], board[3], river_card];
-        let eq = compute_equity(combo, &five_board);
-        let bucket = equity_to_river_bucket(eq, num_river_buckets);
+        *extended.last_mut().expect("non-empty") = next_card;
+        let eq = compute_equity(combo, &extended);
+        let bucket = equity_to_bucket(eq, num_buckets);
         histogram[bucket as usize] += 1.0;
         count += 1;
     }
@@ -296,13 +299,13 @@ fn build_river_histogram(
     histogram
 }
 
-/// Map an equity value in [0, 1] to a river bucket index via uniform binning.
+/// Map an equity value in [0, 1] to a bucket index via uniform binning.
 ///
-/// `equity_to_river_bucket(0.0, K) = 0` and `equity_to_river_bucket(1.0, K) = K - 1`.
-fn equity_to_river_bucket(equity: f64, num_river_buckets: u16) -> u16 {
+/// `equity_to_bucket(0.0, K) = 0` and `equity_to_bucket(1.0, K) = K - 1`.
+fn equity_to_bucket(equity: f64, num_buckets: u16) -> u16 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let bucket = (equity * f64::from(num_river_buckets)) as u16;
-    bucket.min(num_river_buckets - 1)
+    let bucket = (equity * f64::from(num_buckets)) as u16;
+    bucket.min(num_buckets - 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -363,10 +366,10 @@ pub fn cluster_flop_with_boards(
             let features: Vec<Option<Vec<f64>>> = combos
                 .iter()
                 .map(|combo| {
-                    if cards_overlap_3(*combo, *board) {
+                    if cards_overlap(*combo, board) {
                         return None;
                     }
-                    Some(build_turn_histogram(*combo, *board, &deck, num_turn_buckets))
+                    Some(build_next_street_histogram(*combo, board, &deck, num_turn_buckets))
                 })
                 .collect();
 
@@ -417,56 +420,8 @@ pub fn cluster_flop_with_boards(
     BucketFile { header, buckets }
 }
 
-/// Build a probability distribution over turn buckets for the given combo
-/// on a 3-card flop.
-///
-/// Enumerates every card not in the flop or combo as a potential turn card,
-/// computes equity on the resulting 4-card board, maps equity to a turn
-/// bucket via uniform binning, and normalises the histogram.
-fn build_turn_histogram(
-    combo: [Card; 2],
-    board: [Card; 3],
-    deck: &[Card],
-    num_turn_buckets: u16,
-) -> Vec<f64> {
-    let mut histogram = vec![0.0_f64; num_turn_buckets as usize];
-    let mut count = 0_u32;
 
-    for &turn_card in deck {
-        if board.contains(&turn_card)
-            || turn_card == combo[0]
-            || turn_card == combo[1]
-        {
-            continue;
-        }
 
-        let four_board = [board[0], board[1], board[2], turn_card];
-        let eq = compute_equity(combo, &four_board);
-        let bucket = equity_to_turn_bucket(eq, num_turn_buckets);
-        histogram[bucket as usize] += 1.0;
-        count += 1;
-    }
-
-    // Normalise to a probability distribution.
-    if count > 0 {
-        #[allow(clippy::cast_precision_loss)]
-        let inv = 1.0 / f64::from(count);
-        for h in &mut histogram {
-            *h *= inv;
-        }
-    }
-
-    histogram
-}
-
-/// Map an equity value in [0, 1] to a turn bucket index via uniform binning.
-///
-/// `equity_to_turn_bucket(0.0, K) = 0` and `equity_to_turn_bucket(1.0, K) = K - 1`.
-fn equity_to_turn_bucket(equity: f64, num_turn_buckets: u16) -> u16 {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let bucket = (equity * f64::from(num_turn_buckets)) as u16;
-    bucket.min(num_turn_buckets - 1)
-}
 
 // ---------------------------------------------------------------------------
 // Preflop clustering
@@ -547,11 +502,11 @@ fn compute_combo_avg_equities(
             let mut sum = 0.0_f64;
             let mut count = 0_u32;
 
-            for &board in boards {
+            for board in boards {
                 if cards_overlap(combo, board) {
                     continue;
                 }
-                sum += compute_equity(combo, &board);
+                sum += compute_equity(combo, board);
                 count += 1;
             }
 
@@ -660,33 +615,38 @@ fn enumerate_combos(deck: &[Card]) -> Vec<[Card; 2]> {
     combos
 }
 
-/// Sample `n` random 5-card boards from the deck without replacement.
+/// Sample `count` random boards of `card_count` cards from the deck.
 ///
-/// Each board is a sorted 5-card subset. Boards are sampled independently
-/// (duplicates are possible but astronomically unlikely for reasonable n).
-fn sample_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 5]> {
+/// Each board is drawn via partial Fisher-Yates. Boards are sampled
+/// independently (duplicates possible but astronomically unlikely).
+fn sample_n_card_boards(
+    deck: &[Card],
+    card_count: usize,
+    count: usize,
+    seed: u64,
+) -> Vec<Vec<Card>> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut boards = Vec::with_capacity(n);
+    let mut boards = Vec::with_capacity(count);
     let indices: Vec<usize> = (0..deck.len()).collect();
 
-    for _ in 0..n {
-        // Partial Fisher-Yates: pick 5 indices without replacement.
+    for _ in 0..count {
         let mut pool = indices.clone();
-        for k in 0..5 {
+        for k in 0..card_count {
             let j = rng.random_range(k..pool.len());
             pool.swap(k, j);
         }
-        let board = [
-            deck[pool[0]],
-            deck[pool[1]],
-            deck[pool[2]],
-            deck[pool[3]],
-            deck[pool[4]],
-        ];
-        boards.push(board);
+        boards.push(pool[..card_count].iter().map(|&i| deck[i]).collect());
     }
 
     boards
+}
+
+/// Sample `n` random 5-card boards from the deck without replacement.
+fn sample_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 5]> {
+    sample_n_card_boards(deck, 5, n, seed)
+        .into_iter()
+        .map(|v| [v[0], v[1], v[2], v[3], v[4]])
+        .collect()
 }
 
 /// Compute equity for all 1326 combos on a given 5-card board.
@@ -696,7 +656,7 @@ fn compute_board_equities(board: [Card; 5], combos: &[[Card; 2]]) -> Vec<Option<
     combos
         .iter()
         .map(|&combo| {
-            if cards_overlap(combo, board) {
+            if cards_overlap(combo, &board) {
                 None
             } else {
                 Some(compute_equity(combo, &board))
@@ -705,61 +665,25 @@ fn compute_board_equities(board: [Card; 5], combos: &[[Card; 2]]) -> Vec<Option<
         .collect()
 }
 
-/// Check whether any card in `combo` appears in a 5-card `board`.
-fn cards_overlap(combo: [Card; 2], board: [Card; 5]) -> bool {
-    board.iter().any(|b| *b == combo[0] || *b == combo[1])
-}
-
-/// Check whether any card in `combo` appears in a 4-card `board`.
-fn cards_overlap_4(combo: [Card; 2], board: [Card; 4]) -> bool {
-    board.iter().any(|b| *b == combo[0] || *b == combo[1])
-}
-
-/// Check whether any card in `combo` appears in a 3-card `board`.
-fn cards_overlap_3(combo: [Card; 2], board: [Card; 3]) -> bool {
+/// Check whether any card in `combo` appears in a board of any size.
+fn cards_overlap(combo: [Card; 2], board: &[Card]) -> bool {
     board.iter().any(|b| *b == combo[0] || *b == combo[1])
 }
 
 /// Sample `n` random 4-card boards from the deck without replacement.
-///
-/// Each board is a 4-card subset drawn via partial Fisher-Yates. Boards are
-/// sampled independently (duplicates possible but astronomically unlikely).
 fn sample_turn_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 4]> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut boards = Vec::with_capacity(n);
-    let indices: Vec<usize> = (0..deck.len()).collect();
-
-    for _ in 0..n {
-        let mut pool = indices.clone();
-        for k in 0..4 {
-            let j = rng.random_range(k..pool.len());
-            pool.swap(k, j);
-        }
-        boards.push([deck[pool[0]], deck[pool[1]], deck[pool[2]], deck[pool[3]]]);
-    }
-
-    boards
+    sample_n_card_boards(deck, 4, n, seed)
+        .into_iter()
+        .map(|v| [v[0], v[1], v[2], v[3]])
+        .collect()
 }
 
 /// Sample `n` random 3-card flop boards from the deck without replacement.
-///
-/// Each board is a 3-card subset drawn via partial Fisher-Yates. Boards are
-/// sampled independently (duplicates possible but astronomically unlikely).
 fn sample_flop_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 3]> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut boards = Vec::with_capacity(n);
-    let indices: Vec<usize> = (0..deck.len()).collect();
-
-    for _ in 0..n {
-        let mut pool = indices.clone();
-        for k in 0..3 {
-            let j = rng.random_range(k..pool.len());
-            pool.swap(k, j);
-        }
-        boards.push([deck[pool[0]], deck[pool[1]], deck[pool[2]]]);
-    }
-
-    boards
+    sample_n_card_boards(deck, 3, n, seed)
+        .into_iter()
+        .map(|v| [v[0], v[1], v[2]])
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +744,7 @@ mod tests {
         let deck = build_deck();
         let combo = [deck[0], deck[1]];
         let board = [deck[0], deck[5], deck[10], deck[15], deck[20]];
-        assert!(cards_overlap(combo, board));
+        assert!(cards_overlap(combo, &board));
     }
 
     #[test]
@@ -828,7 +752,7 @@ mod tests {
         let deck = build_deck();
         let combo = [deck[0], deck[1]];
         let board = [deck[2], deck[5], deck[10], deck[15], deck[20]];
-        assert!(!cards_overlap(combo, board));
+        assert!(!cards_overlap(combo, &board));
     }
 
     #[test]
@@ -932,7 +856,7 @@ mod tests {
         let deck = build_deck();
         let combo = [deck[0], deck[1]];
         let board = [deck[0], deck[5], deck[10], deck[15]];
-        assert!(cards_overlap_4(combo, board));
+        assert!(cards_overlap(combo, &board));
     }
 
     #[test]
@@ -940,36 +864,36 @@ mod tests {
         let deck = build_deck();
         let combo = [deck[0], deck[1]];
         let board = [deck[2], deck[5], deck[10], deck[15]];
-        assert!(!cards_overlap_4(combo, board));
+        assert!(!cards_overlap(combo, &board));
     }
 
     #[test]
-    fn test_equity_to_river_bucket_bounds() {
+    fn test_equity_to_bucket_bounds() {
         // equity=0.0 should map to bucket 0
-        assert_eq!(equity_to_river_bucket(0.0, 10), 0);
+        assert_eq!(equity_to_bucket(0.0, 10), 0);
         // equity=1.0 should map to the last bucket (9 for K=10)
-        assert_eq!(equity_to_river_bucket(1.0, 10), 9);
+        assert_eq!(equity_to_bucket(1.0, 10), 9);
         // equity=0.5 with 10 buckets → bucket 5
-        assert_eq!(equity_to_river_bucket(0.5, 10), 5);
+        assert_eq!(equity_to_bucket(0.5, 10), 5);
         // equity just below 1.0
-        assert_eq!(equity_to_river_bucket(0.99, 10), 9);
+        assert_eq!(equity_to_bucket(0.99, 10), 9);
     }
 
     #[test]
-    fn test_equity_to_river_bucket_single_bucket() {
+    fn test_equity_to_bucket_single_bucket() {
         // With 1 bucket, everything maps to 0.
-        assert_eq!(equity_to_river_bucket(0.0, 1), 0);
-        assert_eq!(equity_to_river_bucket(0.5, 1), 0);
-        assert_eq!(equity_to_river_bucket(1.0, 1), 0);
+        assert_eq!(equity_to_bucket(0.0, 1), 0);
+        assert_eq!(equity_to_bucket(0.5, 1), 0);
+        assert_eq!(equity_to_bucket(1.0, 1), 0);
     }
 
     #[test]
-    fn test_build_river_histogram_sums_to_one() {
+    fn test_build_next_street_histogram_river_sums_to_one() {
         let deck = build_deck();
         // combo: first two cards, board: next four cards (no overlap)
         let combo = [deck[0], deck[1]];
         let board = [deck[2], deck[3], deck[4], deck[5]];
-        let histogram = build_river_histogram(combo, board, &deck, 10);
+        let histogram = build_next_street_histogram(combo, &board, &deck, 10);
 
         assert_eq!(histogram.len(), 10);
 
@@ -986,12 +910,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_river_histogram_river_card_count() {
+    fn test_build_next_street_histogram_river_card_count() {
         // With 4 board cards + 2 hole cards = 6 used, there are 46 river cards.
         let deck = build_deck();
         let combo = [deck[0], deck[1]];
         let board = [deck[2], deck[3], deck[4], deck[5]];
-        let histogram = build_river_histogram(combo, board, &deck, 5);
+        let histogram = build_next_street_histogram(combo, &board, &deck, 5);
 
         // The histogram entries times 46 should give integer counts.
         let total_rivers = 46.0;
@@ -1082,7 +1006,7 @@ mod tests {
         let deck = build_deck();
         let combo = [deck[0], deck[1]];
         let board = [deck[0], deck[5], deck[10]];
-        assert!(cards_overlap_3(combo, board));
+        assert!(cards_overlap(combo, &board));
     }
 
     #[test]
@@ -1090,30 +1014,15 @@ mod tests {
         let deck = build_deck();
         let combo = [deck[0], deck[1]];
         let board = [deck[2], deck[5], deck[10]];
-        assert!(!cards_overlap_3(combo, board));
+        assert!(!cards_overlap(combo, &board));
     }
 
     #[test]
-    fn test_equity_to_turn_bucket_bounds() {
-        assert_eq!(equity_to_turn_bucket(0.0, 10), 0);
-        assert_eq!(equity_to_turn_bucket(1.0, 10), 9);
-        assert_eq!(equity_to_turn_bucket(0.5, 10), 5);
-        assert_eq!(equity_to_turn_bucket(0.99, 10), 9);
-    }
-
-    #[test]
-    fn test_equity_to_turn_bucket_single_bucket() {
-        assert_eq!(equity_to_turn_bucket(0.0, 1), 0);
-        assert_eq!(equity_to_turn_bucket(0.5, 1), 0);
-        assert_eq!(equity_to_turn_bucket(1.0, 1), 0);
-    }
-
-    #[test]
-    fn test_build_turn_histogram_sums_to_one() {
+    fn test_build_next_street_histogram_turn_sums_to_one() {
         let deck = build_deck();
         let combo = [deck[0], deck[1]];
         let board = [deck[10], deck[20], deck[30]];
-        let hist = build_turn_histogram(combo, board, &deck, 5);
+        let hist = build_next_street_histogram(combo, &board, &deck, 5);
 
         assert_eq!(hist.len(), 5);
 
@@ -1129,12 +1038,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_turn_histogram_turn_card_count() {
+    fn test_build_next_street_histogram_turn_card_count() {
         // With 3 board cards + 2 hole cards = 5 used, there are 47 turn cards.
         let deck = build_deck();
         let combo = [deck[0], deck[1]];
         let board = [deck[10], deck[20], deck[30]];
-        let histogram = build_turn_histogram(combo, board, &deck, 5);
+        let histogram = build_next_street_histogram(combo, &board, &deck, 5);
 
         let total_turns = 47.0;
         for &h in &histogram {
