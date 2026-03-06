@@ -685,7 +685,7 @@ button:disabled {
   font-size: 0.75rem;
   color: #ccc;
   white-space: nowrap;
-  flex-shrink: 0;
+  flex: 1;
 }
 
 .cell-detail-pct {
