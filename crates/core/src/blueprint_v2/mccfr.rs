@@ -98,7 +98,7 @@ impl AllBuckets {
 ///
 /// # Arguments
 /// * `tree` - The game tree
-/// * `storage` - Mutable regret/strategy storage
+/// * `storage` - Atomic regret/strategy storage (shared across threads)
 /// * `buckets` - Bucket lookup for all streets
 /// * `deal` - The sampled deal (hole cards + board)
 /// * `traverser` - Which player is traversing (0 or 1)
@@ -109,7 +109,7 @@ impl AllBuckets {
 #[allow(clippy::too_many_arguments)]
 pub fn traverse_external(
     tree: &GameTree,
-    storage: &mut BlueprintStorage,
+    storage: &BlueprintStorage,
     buckets: &AllBuckets,
     deal: &Deal,
     traverser: u8,
@@ -220,7 +220,7 @@ fn terminal_value(
 #[allow(clippy::too_many_arguments)]
 fn traverse_traverser(
     tree: &GameTree,
-    storage: &mut BlueprintStorage,
+    storage: &BlueprintStorage,
     buckets: &AllBuckets,
     deal: &Deal,
     traverser: u8,
@@ -242,13 +242,10 @@ fn traverse_traverser(
     let mut node_value = 0.0f64;
 
     for (a, &child_idx) in children.iter().enumerate() {
-        if prune {
-            let regrets = storage.get_regrets(node_idx, bucket);
-            if regrets[a] < prune_threshold {
-                // Pruned actions keep value 0.0 and do not contribute
-                // to the node value via their strategy weight.
-                continue;
-            }
+        if prune && storage.get_regret(node_idx, bucket, a) < prune_threshold {
+            // Pruned actions keep value 0.0 and do not contribute
+            // to the node value via their strategy weight.
+            continue;
         }
 
         action_values[a] = traverse_external(
@@ -267,16 +264,14 @@ fn traverse_traverser(
 
     // Update regrets: delta = action_value - node_value, scaled to
     // integer by ×1000 for precision.
-    let regrets = storage.get_regrets_mut(node_idx, bucket);
     for a in 0..num_actions {
         let delta = action_values[a] - node_value;
-        regrets[a] += (delta * 1000.0) as i32;
+        storage.add_regret(node_idx, bucket, a, (delta * 1000.0) as i32);
     }
 
     // Accumulate strategy sums (for computing the average strategy).
-    let strategy_sums = storage.get_strategy_sums_mut(node_idx, bucket);
     for a in 0..num_actions {
-        strategy_sums[a] += (strategy[a] * 1000.0) as i64;
+        storage.add_strategy_sum(node_idx, bucket, a, (strategy[a] * 1000.0) as i64);
     }
 
     node_value
@@ -287,7 +282,7 @@ fn traverse_traverser(
 #[allow(clippy::too_many_arguments)]
 fn traverse_opponent(
     tree: &GameTree,
-    storage: &mut BlueprintStorage,
+    storage: &BlueprintStorage,
     buckets: &AllBuckets,
     deal: &Deal,
     traverser: u8,
@@ -347,6 +342,7 @@ mod tests {
     use crate::poker::{Card, Suit, Value};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use std::sync::atomic::Ordering;
 
     fn make_deal() -> Deal {
         Deal {
@@ -386,7 +382,7 @@ mod tests {
     #[test]
     fn traverse_returns_finite() {
         let tree = toy_tree();
-        let mut storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
         let buckets = AllBuckets {
             bucket_counts: [10, 10, 10, 10],
             bucket_files: [None, None, None, None],
@@ -396,7 +392,7 @@ mod tests {
 
         let ev = traverse_external(
             &tree,
-            &mut storage,
+            &storage,
             &buckets,
             &deal,
             0,
@@ -411,7 +407,7 @@ mod tests {
     #[test]
     fn traverse_both_players() {
         let tree = toy_tree();
-        let mut storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
         let buckets = AllBuckets {
             bucket_counts: [10, 10, 10, 10],
             bucket_files: [None, None, None, None],
@@ -421,7 +417,7 @@ mod tests {
 
         let ev0 = traverse_external(
             &tree,
-            &mut storage,
+            &storage,
             &buckets,
             &deal,
             0,
@@ -432,7 +428,7 @@ mod tests {
         );
         let ev1 = traverse_external(
             &tree,
-            &mut storage,
+            &storage,
             &buckets,
             &deal,
             1,
@@ -449,7 +445,7 @@ mod tests {
     #[test]
     fn traverse_updates_regrets() {
         let tree = toy_tree();
-        let mut storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
         let buckets = AllBuckets {
             bucket_counts: [10, 10, 10, 10],
             bucket_files: [None, None, None, None],
@@ -457,11 +453,11 @@ mod tests {
         let deal = make_deal();
         let mut rng = StdRng::seed_from_u64(42);
 
-        assert!(storage.regrets.iter().all(|&r| r == 0));
+        assert!(storage.regrets.iter().all(|r| r.load(Ordering::Relaxed) == 0));
 
         traverse_external(
             &tree,
-            &mut storage,
+            &storage,
             &buckets,
             &deal,
             0,
@@ -472,7 +468,7 @@ mod tests {
         );
 
         assert!(
-            storage.regrets.iter().any(|&r| r != 0),
+            storage.regrets.iter().any(|r| r.load(Ordering::Relaxed) != 0),
             "regrets should be updated after traversal"
         );
     }
@@ -480,7 +476,7 @@ mod tests {
     #[test]
     fn traverse_updates_strategy_sums() {
         let tree = toy_tree();
-        let mut storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
         let buckets = AllBuckets {
             bucket_counts: [10, 10, 10, 10],
             bucket_files: [None, None, None, None],
@@ -490,7 +486,7 @@ mod tests {
 
         traverse_external(
             &tree,
-            &mut storage,
+            &storage,
             &buckets,
             &deal,
             0,
@@ -501,7 +497,7 @@ mod tests {
         );
 
         assert!(
-            storage.strategy_sums.iter().any(|&s| s != 0),
+            storage.strategy_sums.iter().any(|s| s.load(Ordering::Relaxed) != 0),
             "strategy sums should be updated after traversal"
         );
     }
@@ -509,7 +505,7 @@ mod tests {
     #[test]
     fn multiple_iterations_change_strategy() {
         let tree = toy_tree();
-        let mut storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
         let buckets = AllBuckets {
             bucket_counts: [10, 10, 10, 10],
             bucket_files: [None, None, None, None],
@@ -520,7 +516,7 @@ mod tests {
         for _ in 0..50 {
             traverse_external(
                 &tree,
-                &mut storage,
+                &storage,
                 &buckets,
                 &deal,
                 0,
@@ -531,7 +527,7 @@ mod tests {
             );
             traverse_external(
                 &tree,
-                &mut storage,
+                &storage,
                 &buckets,
                 &deal,
                 1,
@@ -561,7 +557,7 @@ mod tests {
     #[test]
     fn traverse_with_pruning() {
         let tree = toy_tree();
-        let mut storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
         let buckets = AllBuckets {
             bucket_counts: [10, 10, 10, 10],
             bucket_files: [None, None, None, None],
@@ -570,13 +566,13 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         // Force some very negative regrets.
-        for r in storage.regrets.iter_mut().step_by(3) {
-            *r = -400_000_000;
+        for r in storage.regrets.iter().step_by(3) {
+            r.store(-400_000_000, Ordering::Relaxed);
         }
 
         let ev = traverse_external(
             &tree,
-            &mut storage,
+            &storage,
             &buckets,
             &deal,
             0,
