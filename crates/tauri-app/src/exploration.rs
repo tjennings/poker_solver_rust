@@ -482,9 +482,9 @@ pub async fn load_subgame_source(
 
 /// Get the strategy matrix for a given position (core logic, no Tauri dependency).
 ///
-/// `threshold` filters out hands whose prior action probabilities fell below
-/// this value (range narrowing).  `street_histories` supplies the action
-/// sequences of all completed streets so the filter can replay the game.
+/// `street_histories` supplies the action sequences of all completed streets
+/// so that `compute_reaching_range` can replay the game and return cumulative
+/// reaching probabilities for each canonical hand.
 pub fn get_strategy_matrix_core(
     state: &ExplorationState,
     position: ExplorationPosition,

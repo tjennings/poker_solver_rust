@@ -1013,7 +1013,7 @@ export default function Explorer() {
         setPosition(pos);
 
         // Restore range snapshot
-        const snapshot = rangeSnapshots.find(s => s.node_index <= index);
+        const snapshot = [...rangeSnapshots].reverse().find(s => s.node_index <= index);
         if (snapshot) {
           setP1Range(snapshot.p1_range);
           setP2Range(snapshot.p2_range);
