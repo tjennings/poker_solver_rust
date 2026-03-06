@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use range_solver_compare::*;
 
 /// Fast smoke test: 5 random configs across all street depths.
@@ -132,6 +134,44 @@ fn run_identity_test(configs: &[TestConfig], iterations: u32) {
         }
         panic!("{} / {} configs mismatched", failures.len(), num_configs);
     }
+}
+
+/// Performance parity benchmark: 10 river configs x 1000 iterations.
+/// Run with: cargo test -p range-solver-compare --release test_performance_parity -- --nocapture --test-threads=1
+#[test]
+fn test_performance_parity() {
+    let configs = generate_river_configs(10, 99);
+    let iterations = 1000;
+
+    let mut total_ours_ms = 0u128;
+    let mut total_orig_ms = 0u128;
+
+    for (i, config) in configs.iter().enumerate() {
+        let t1 = Instant::now();
+        let _ours = run_ours(config, iterations);
+        let ours_ms = t1.elapsed().as_millis();
+
+        let t2 = Instant::now();
+        let _orig = run_original(config, iterations);
+        let orig_ms = t2.elapsed().as_millis();
+
+        total_ours_ms += ours_ms;
+        total_orig_ms += orig_ms;
+
+        let ratio = ours_ms as f64 / orig_ms.max(1) as f64;
+        eprintln!(
+            "Config {i}: ours={ours_ms}ms orig={orig_ms}ms ratio={ratio:.2}x"
+        );
+    }
+
+    let overall_ratio = total_ours_ms as f64 / total_orig_ms.max(1) as f64;
+    eprintln!(
+        "\nOverall: ours={total_ours_ms}ms orig={total_orig_ms}ms ratio={overall_ratio:.2}x"
+    );
+    assert!(
+        overall_ratio < 1.5,
+        "Performance regression: {overall_ratio:.2}x slower overall"
+    );
 }
 
 fn config_summary(config: &TestConfig) -> String {
