@@ -13,3 +13,9 @@ pub(crate) mod utility;
 
 mod hand_table;
 pub(crate) mod hand;
+
+// Convenience re-exports
+pub use game::PostFlopGame;
+pub use solver::{solve, solve_step, compute_exploitability, compute_average};
+pub use card::CardConfig;
+pub use action_tree::{Action, ActionTree, TreeConfig, BoardState};
