@@ -12,6 +12,12 @@ fn test_identity_50_river() {
     run_identity_test(&generate_river_configs(50, 99), 200);
 }
 
+/// 1000 river-only configs — practical identity test (~2 min release).
+#[test]
+fn test_identity_1000_river() {
+    run_identity_test(&generate_river_configs(1000, 42), 200);
+}
+
 /// Soak test: 1000 configs across all street depths.
 /// Takes hours to run -- use `cargo test --release -- --ignored` explicitly.
 #[test]
