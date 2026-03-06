@@ -15,6 +15,7 @@
 pub mod abstraction;
 pub mod agent;
 pub mod blueprint;
+pub mod blueprint_v2;
 pub mod card_utils;
 pub mod cfr;
 pub mod equity;
