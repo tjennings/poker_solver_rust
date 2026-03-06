@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use super::Street;
 
 const MAGIC: [u8; 4] = *b"BKT2";
 const VERSION: u8 = 1;
@@ -27,31 +27,6 @@ const VERSION: u8 = 1;
 /// Header size in bytes: 4 (magic) + 1 (version) + 1 (street) + 2 (`bucket_count`)
 ///                       + 4 (`board_count`) + 2 (`combos_per_board`) = 14
 const HEADER_SIZE: usize = 14;
-
-/// A poker street.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum Street {
-    Preflop = 0,
-    Flop = 1,
-    Turn = 2,
-    River = 3,
-}
-
-impl Street {
-    fn from_u8(v: u8) -> io::Result<Self> {
-        match v {
-            0 => Ok(Self::Preflop),
-            1 => Ok(Self::Flop),
-            2 => Ok(Self::Turn),
-            3 => Ok(Self::River),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid street value: {v}"),
-            )),
-        }
-    }
-}
 
 /// Metadata describing a bucket file's dimensions.
 #[derive(Debug, Clone)]
@@ -141,7 +116,12 @@ impl BucketFile {
             ));
         }
 
-        let street = Street::from_u8(header_buf[5])?;
+        let street = Street::from_u8(header_buf[5]).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid street value: {}", header_buf[5]),
+            )
+        })?;
         let bucket_count = u16::from_le_bytes([header_buf[6], header_buf[7]]);
         let board_count = u32::from_le_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]]);
         let combos_per_board = u16::from_le_bytes([header_buf[12], header_buf[13]]);
