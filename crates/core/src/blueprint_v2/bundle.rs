@@ -49,6 +49,9 @@ pub struct BlueprintV2Strategy {
     pub iterations: u64,
     /// Wall-clock minutes elapsed when this snapshot was taken.
     pub elapsed_minutes: u64,
+    /// Pre-computed flat offset for each decision node (not serialized).
+    #[serde(skip)]
+    node_offsets: Vec<usize>,
 }
 
 impl BlueprintV2Strategy {
@@ -82,6 +85,12 @@ impl BlueprintV2Strategy {
             }
         }
 
+        let node_offsets = compute_node_offsets(
+            &node_action_counts,
+            &node_street_indices,
+            storage.bucket_counts,
+        );
+
         Self {
             action_probs,
             node_action_counts,
@@ -89,7 +98,18 @@ impl BlueprintV2Strategy {
             bucket_counts: storage.bucket_counts,
             iterations: 0,
             elapsed_minutes: 0,
+            node_offsets,
         }
+    }
+
+    /// Rebuild transient fields that are not serialized (e.g.
+    /// `node_offsets`).  Must be called after deserialization.
+    fn post_deserialize(&mut self) {
+        self.node_offsets = compute_node_offsets(
+            &self.node_action_counts,
+            &self.node_street_indices,
+            self.bucket_counts,
+        );
     }
 
     /// Serialize this strategy to a binary file via bincode.
@@ -113,8 +133,10 @@ impl BlueprintV2Strategy {
     pub fn load(path: &Path) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
-        bincode::deserialize_from(reader)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let mut strat: Self = bincode::deserialize_from(reader)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        strat.post_deserialize();
+        Ok(strat)
     }
 
     /// Get the action probability slice for a given decision node and bucket.
@@ -134,16 +156,7 @@ impl BlueprintV2Strategy {
             return &[];
         }
 
-        // Compute offset: sum of (buckets_for_street * num_actions) for
-        // all prior decision nodes.
-        let mut offset = 0usize;
-        for i in 0..decision_idx {
-            let n_act = self.node_action_counts[i] as usize;
-            let st = self.node_street_indices[i] as usize;
-            let bk = self.bucket_counts[st] as usize;
-            offset += bk * n_act;
-        }
-        offset += bucket as usize * num_actions;
+        let offset = self.node_offsets[decision_idx] + bucket as usize * num_actions;
 
         if offset + num_actions > self.action_probs.len() {
             return &[];
@@ -156,6 +169,23 @@ impl BlueprintV2Strategy {
     pub fn num_decision_nodes(&self) -> usize {
         self.node_action_counts.len()
     }
+}
+
+/// Build a prefix-sum offset table so `get_action_probs` is O(1).
+fn compute_node_offsets(
+    node_action_counts: &[u16],
+    node_street_indices: &[u8],
+    bucket_counts: [u16; 4],
+) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(node_action_counts.len());
+    let mut offset = 0_usize;
+    for (i, &n_act) in node_action_counts.iter().enumerate() {
+        offsets.push(offset);
+        let st = node_street_indices[i] as usize;
+        let bk = bucket_counts[st] as usize;
+        offset += bk * n_act as usize;
+    }
+    offsets
 }
 
 /// Save a full snapshot directory with strategy, metadata JSON, and
