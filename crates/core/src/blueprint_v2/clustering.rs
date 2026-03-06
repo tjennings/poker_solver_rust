@@ -23,12 +23,12 @@ use rand::rngs::StdRng;
 pub fn emd(p: &[f64], q: &[f64]) -> f64 {
     debug_assert_eq!(p.len(), q.len());
     let mut cdf_diff = 0.0_f64;
-    let mut total = 0.0_f64;
-    for i in 0..p.len() {
-        cdf_diff += p[i] - q[i];
-        total += cdf_diff.abs();
+    let mut distance = 0.0_f64;
+    for (&pi, &qi) in p.iter().zip(q) {
+        cdf_diff += pi - qi;
+        distance += cdf_diff.abs();
     }
-    total
+    distance
 }
 
 // ---------------------------------------------------------------------------

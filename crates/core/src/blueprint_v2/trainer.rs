@@ -43,6 +43,9 @@ pub struct BlueprintTrainer {
     last_print_time: u64,
     last_snapshot_time: u64,
     snapshot_count: u32,
+    /// Pre-allocated deck for [`sample_deal`](Self::sample_deal), avoiding
+    /// a 52-element `Vec` allocation on every call.
+    deck: [Card; 52],
 }
 
 impl BlueprintTrainer {
@@ -72,6 +75,15 @@ impl BlueprintTrainer {
         let buckets = AllBuckets { bucket_counts };
         let rng = StdRng::seed_from_u64(config.clustering.seed);
 
+        let mut deck = [Card::new(ALL_VALUES[0], ALL_SUITS[0]); 52];
+        let mut idx = 0;
+        for &v in &ALL_VALUES {
+            for &s in &ALL_SUITS {
+                deck[idx] = Card::new(v, s);
+                idx += 1;
+            }
+        }
+
         Self {
             tree,
             storage,
@@ -84,6 +96,7 @@ impl BlueprintTrainer {
             last_print_time: 0,
             last_snapshot_time: 0,
             snapshot_count: 0,
+            deck,
         }
     }
 
@@ -131,23 +144,37 @@ impl BlueprintTrainer {
     }
 
     /// Sample a random deal by partial Fisher-Yates on a 52-card deck.
+    ///
+    /// Re-initialises the deck from canonical order each call, then
+    /// shuffles only the first 9 positions (2×2 hole + 5 board).
     pub fn sample_deal(&mut self) -> Deal {
-        let mut deck: Vec<Card> = Vec::with_capacity(52);
+        // Reset deck to canonical order (avoids tracking swap state).
+        let mut idx = 0;
         for &v in &ALL_VALUES {
             for &s in &ALL_SUITS {
-                deck.push(Card::new(v, s));
+                self.deck[idx] = Card::new(v, s);
+                idx += 1;
             }
         }
 
         // Partial Fisher-Yates: shuffle only the first 9 positions.
         for i in 0..9 {
-            let j = self.rng.random_range(i..deck.len());
-            deck.swap(i, j);
+            let j = self.rng.random_range(i..52);
+            self.deck.swap(i, j);
         }
 
         Deal {
-            hole_cards: [[deck[0], deck[1]], [deck[2], deck[3]]],
-            board: [deck[4], deck[5], deck[6], deck[7], deck[8]],
+            hole_cards: [
+                [self.deck[0], self.deck[1]],
+                [self.deck[2], self.deck[3]],
+            ],
+            board: [
+                self.deck[4],
+                self.deck[5],
+                self.deck[6],
+                self.deck[7],
+                self.deck[8],
+            ],
         }
     }
 
