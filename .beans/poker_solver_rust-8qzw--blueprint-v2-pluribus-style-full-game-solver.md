@@ -5,7 +5,7 @@ status: in-progress
 type: epic
 priority: normal
 created_at: 2026-03-06T08:21:33Z
-updated_at: 2026-03-06T09:45:07Z
+updated_at: 2026-03-06T09:49:38Z
 ---
 
 Full-game MCCFR solver training all 4 streets with potential-aware clustering.
@@ -38,7 +38,7 @@ Plan: docs/plans/2026-03-06-blueprint-v2-plan.md
 
 ### Phase 5: Output & Integration
 - [x] Task 14: Bundle format
-- [ ] Task 15: Explorer integration
+- [x] Task 15: Explorer integration
 - [x] Task 16: train-blueprint CLI
 - [x] Task 17: Sample configs
 
