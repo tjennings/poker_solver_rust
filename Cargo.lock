@@ -3358,6 +3358,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "range-solver"
+version = "0.1.0"
+dependencies = [
+ "once_cell",
+ "rand 0.8.5",
+ "rayon",
+ "regex",
+]
+
+[[package]]
 name = "ratatui"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
