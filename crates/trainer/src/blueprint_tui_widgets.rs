@@ -57,6 +57,8 @@ impl CellStrategy {
 #[derive(Debug, Clone)]
 pub struct HandGridState {
     pub cells: [[CellStrategy; 13]; 13],
+    /// Previous strategy snapshot for convergence detection.
+    pub prev_cells: Option<[[CellStrategy; 13]; 13]>,
     pub scenario_name: String,
     pub action_path: Vec<String>,
     pub board_display: Option<String>,
@@ -64,6 +66,14 @@ pub struct HandGridState {
     pub street_label: String,
     pub iteration_at_snapshot: u64,
 }
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+
+/// L1 threshold below which a cell is considered converged.
+const CONVERGENCE_THRESHOLD: f32 = 0.01;
+
+/// Bright green used for the convergence border indicator.
+const CONVERGENCE_COLOR: Color = Color::Rgb(100, 255, 100);
 
 // ─── Color helpers ───────────────────────────────────────────────────────────
 
@@ -174,8 +184,31 @@ impl Widget for &HandGridWidget<'_> {
 
                 let x = grid_x0 + c * cell_w;
                 if x + cell_w <= area.x + area.width {
-                    let style = Style::default().bg(bg).fg(Color::Black);
-                    buf.set_string(x, y, &label, style);
+                    // Convergence indicator: bright green left border when
+                    // the cell's strategy has stabilized vs the previous
+                    // snapshot. Only rendered when cell_w >= 4 so there is
+                    // room for the extra character.
+                    if cell_w >= 4 {
+                        let converged = self.state.prev_cells.as_ref().is_some_and(|prev| {
+                            cell.is_converged(
+                                &prev[r as usize][c as usize],
+                                CONVERGENCE_THRESHOLD,
+                            )
+                        });
+                        if converged {
+                            let border_style = Style::default()
+                                .fg(CONVERGENCE_COLOR)
+                                .bg(bg);
+                            buf.set_string(x, y, "\u{2502}", border_style);
+                        } else {
+                            buf.set_string(x, y, " ", Style::default().bg(bg));
+                        }
+                        let style = Style::default().bg(bg).fg(Color::Black);
+                        buf.set_string(x + 1, y, &label, style);
+                    } else {
+                        let style = Style::default().bg(bg).fg(Color::Black);
+                        buf.set_string(x, y, &label, style);
+                    }
                 }
             }
         }
@@ -249,6 +282,7 @@ mod tests {
         });
         let mut state = HandGridState {
             cells,
+            prev_cells: None,
             scenario_name: "UTG open".to_string(),
             action_path: vec!["raise".to_string()],
             board_display: Some("Ah Kd 7c".to_string()),
@@ -345,5 +379,29 @@ mod tests {
                 frame.render_widget(&widget, frame.area());
             })
             .unwrap();
+    }
+
+    #[timed_test(10)]
+    fn widget_renders_convergence_border() {
+        // Create grid with prev_cells that are very similar -> converged
+        // cells should render the bright green left border.
+        let mut state = mock_grid_state();
+        let mut prev = state.cells.clone();
+        // Slightly perturb prev to make them converged (delta < 0.01)
+        if let Some(action) = prev[0][0].actions.get_mut(0) {
+            action.1 += 0.005;
+        }
+        state.prev_cells = Some(prev);
+
+        // Use a wide terminal so cell_w >= 4, enabling the indicator.
+        let backend = TestBackend::new(160, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(&HandGridWidget { state: &state }, area);
+            })
+            .unwrap();
+        // No panic = success
     }
 }

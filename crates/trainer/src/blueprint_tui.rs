@@ -413,6 +413,7 @@ mod tests {
             node_idx: 0,
             grid: HandGridState {
                 cells,
+                prev_cells: None,
                 scenario_name: name.to_string(),
                 action_path: vec![],
                 board_display: None,
