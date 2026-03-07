@@ -26,7 +26,7 @@ import {
 } from './matrix-utils';
 
 // Hand matrix cell component
-function HandCell({
+export function HandCell({
   cell,
   actions,
   reachWeight,
@@ -91,7 +91,7 @@ function HandCell({
 }
 
 // Detail panel showing action frequencies for a selected cell
-function CellDetail({
+export function CellDetail({
   cell,
   actions,
 }: {

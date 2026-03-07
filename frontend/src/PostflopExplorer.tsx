@@ -2,10 +2,10 @@ import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { invoke } from './invoke';
 import {
   ActionInfo,
+  MatrixCell,
   PostflopConfig,
   PostflopConfigSummary,
   PostflopActionInfo,
-  PostflopMatrixCell,
   PostflopStrategyMatrix,
   PostflopProgress,
   PostflopPlayResult,
@@ -17,7 +17,7 @@ import {
   getActionColor,
   formatActionLabel,
 } from './matrix-utils';
-import { ActionBlock } from './Explorer';
+import { ActionBlock, HandCell, CellDetail } from './Explorer';
 
 /** Convert PostflopActionInfo → ActionInfo so shared color/label utils work. */
 function toActionInfo(a: PostflopActionInfo): ActionInfo {
@@ -31,6 +31,19 @@ function toActionInfo(a: PostflopActionInfo): ActionInfo {
 
 function toActionInfos(actions: PostflopActionInfo[]): ActionInfo[] {
   return actions.map(toActionInfo);
+}
+
+/** Convert postflop cell to shared MatrixCell format. */
+function toMatrixCell(cell: { hand: string; suited: boolean; pair: boolean; probabilities: number[] }, actions: PostflopActionInfo[]): MatrixCell {
+  return {
+    hand: cell.hand,
+    suited: cell.suited,
+    pair: cell.pair,
+    probabilities: cell.probabilities.map((p, i) => ({
+      action: actions[i]?.label ?? '',
+      probability: p,
+    })),
+  };
 }
 
 interface PostflopExplorerProps {
@@ -66,6 +79,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   const [showNextCardPicker, setShowNextCardPicker] = useState(false);
   const [awaitingCard, setAwaitingCard] = useState(false);
   const [terminal, setTerminal] = useState(false);
+  const [selectedCell, setSelectedCell] = useState<{row: number; col: number} | null>(null);
   // Track actions per street for close_street call
   const [streetActions, setStreetActions] = useState<number[]>([]);
 
@@ -122,6 +136,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   const handleAction = useCallback(async (actionIndex: number) => {
     if (solving) return;
     setError(null);
+    setSelectedCell(null);
     try {
       const result = await invoke<PostflopPlayResult>('postflop_play_action', { action: actionIndex });
 
@@ -156,6 +171,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   const handleReset = useCallback(() => {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
     setMatrix(null);
+    setSelectedCell(null);
     setActionHistory([]);
     setStreetActions([]);
     setBoardInput('');
@@ -342,25 +358,39 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       )}
 
       {/* Strategy matrix */}
-      {matrix && (
-        <div className="matrix-container">
-          <div className="matrix-with-detail">
-            <div className="hand-matrix">
-              {matrix.cells.map((row, rowIdx) => (
-                <div key={rowIdx} className="matrix-row">
-                  {row.map((cell, colIdx) => (
-                    <PostflopCell
-                      key={colIdx}
-                      cell={cell}
-                      actions={matrix.actions}
-                    />
-                  ))}
-                </div>
-              ))}
+      {matrix && (() => {
+        const actionInfos = toActionInfos(matrix.actions);
+        return (
+          <div className="matrix-container">
+            <div className="matrix-with-detail">
+              <div className="hand-matrix">
+                {matrix.cells.map((row, rowIdx) => (
+                  <div key={rowIdx} className="matrix-row">
+                    {row.map((cell, colIdx) => (
+                      <HandCell
+                        key={colIdx}
+                        cell={toMatrixCell(cell, matrix.actions)}
+                        actions={actionInfos}
+                        reachWeight={cell.combo_count > 0 ? 1 : 0}
+                        isSelected={selectedCell?.row === rowIdx && selectedCell?.col === colIdx}
+                        onClick={() => setSelectedCell({ row: rowIdx, col: colIdx })}
+                      />
+                    ))}
+                  </div>
+                ))}
+              </div>
+              <div className="detail-column">
+                {selectedCell && matrix.cells[selectedCell.row]?.[selectedCell.col] && (
+                  <CellDetail
+                    cell={toMatrixCell(matrix.cells[selectedCell.row][selectedCell.col], matrix.actions)}
+                    actions={actionInfos}
+                  />
+                )}
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Terminal state */}
       {terminal && (
@@ -528,47 +558,3 @@ function NextCardPicker({ deadCards, onConfirm }: { deadCards: string[]; onConfi
   );
 }
 
-function PostflopCell({ cell, actions }: {
-  cell: PostflopMatrixCell;
-  actions: PostflopActionInfo[];
-}) {
-  const isUnreachable = cell.combo_count === 0;
-  const actionInfos = useMemo(() => toActionInfos(actions), [actions]);
-
-  const gradientStops = useMemo(() => {
-    if (isUnreachable || cell.probabilities.length === 0) {
-      return 'rgba(30, 41, 59, 1)';
-    }
-
-    const stops: string[] = [];
-    let position = 0;
-
-    // Build gradient from last action to first (aggressive on left)
-    for (let idx = cell.probabilities.length - 1; idx >= 0; idx--) {
-      const prob = cell.probabilities[idx];
-      if (prob <= 0) continue;
-
-      const color = getActionColor(actionInfos[idx], actionInfos);
-      const width = prob * 100;
-      stops.push(`${color} ${position}%`);
-      stops.push(`${color} ${position + width}%`);
-      position += width;
-    }
-
-    if (stops.length === 0) return 'rgba(30, 41, 59, 1)';
-    return `linear-gradient(to right, ${stops.join(', ')})`;
-  }, [cell.probabilities, actionInfos, isUnreachable]);
-
-  return (
-    <div className={`matrix-cell ${isUnreachable ? 'unreachable' : ''}`}>
-      <div
-        className="cell-bar"
-        style={{
-          background: isUnreachable ? undefined : gradientStops,
-          height: '100%',
-        }}
-      />
-      <span className="cell-label">{cell.hand}</span>
-    </div>
-  );
-}
