@@ -13,11 +13,9 @@ pub const MAX_SCENARIOS: usize = 16;
 pub struct RandomScenarioState {
     pub name: String,
     pub node_idx: u32,
-    pub strategy: Vec<f64>,
-    pub board_display: Option<String>,
-    pub cluster_id: Option<u32>,
-    pub action_path: Vec<String>,
-    pub started_at: Instant,
+    pub grid: [[CellStrategy; 13]; 13],
+    pub board_display: String,
+    pub street_label: String,
 }
 
 /// Shared state bridging the Blueprint V2 training thread and the TUI render
@@ -150,6 +148,28 @@ impl BlueprintTuiMetrics {
     pub fn push_leaf_movement(&self, pct: f64) {
         let mut hist = self.leaf_movement_history.lock().unwrap_or_else(|e| e.into_inner());
         hist.push(pct);
+    }
+
+    /// Push a new random scenario to be picked up by the TUI on its next tick.
+    pub fn update_random_scenario(
+        &self,
+        name: String,
+        node_idx: u32,
+        grid: [[CellStrategy; 13]; 13],
+        board_display: String,
+        street_label: String,
+    ) {
+        let mut rs = self
+            .random_scenario
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *rs = Some(RandomScenarioState {
+            name,
+            node_idx,
+            grid,
+            board_display,
+            street_label,
+        });
     }
 
     /// Seconds elapsed since this metrics instance was created.

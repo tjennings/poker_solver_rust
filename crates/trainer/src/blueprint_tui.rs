@@ -48,6 +48,8 @@ pub struct BlueprintTuiApp {
     delta_history: Vec<u64>,
     // Leaf movement sparkline data
     leaf_movement_history: Vec<u64>,
+    // Random scenario carousel tracking
+    has_random_tab: bool,
 }
 
 impl BlueprintTuiApp {
@@ -68,6 +70,7 @@ impl BlueprintTuiApp {
             refresh_rate_hz,
             delta_history: Vec::with_capacity(SPARKLINE_HISTORY),
             leaf_movement_history: Vec::with_capacity(SPARKLINE_HISTORY),
+            has_random_tab: false,
         }
     }
 
@@ -138,6 +141,47 @@ impl BlueprintTuiApp {
                     self.scenarios[i].grid.prev_cells = Some(old);
                     self.scenarios[i].grid.iteration_at_snapshot =
                         self.metrics.iterations.load(Ordering::Relaxed);
+                }
+            }
+        }
+
+        // Random scenario carousel
+        {
+            let mut rs = self
+                .metrics
+                .random_scenario
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(state) = rs.take() {
+                let scenario_name = state.name.clone();
+                let grid_state = HandGridState {
+                    cells: state.grid,
+                    prev_cells: None,
+                    scenario_name: scenario_name.clone(),
+                    action_path: vec![],
+                    board_display: if state.board_display.is_empty() {
+                        None
+                    } else {
+                        Some(state.board_display)
+                    },
+                    cluster_id: None,
+                    street_label: state.street_label,
+                    iteration_at_snapshot: self.metrics.iterations.load(Ordering::Relaxed),
+                };
+
+                let scenario = ResolvedScenario {
+                    name: scenario_name,
+                    node_idx: state.node_idx,
+                    grid: grid_state,
+                };
+
+                if self.has_random_tab {
+                    if let Some(last) = self.scenarios.last_mut() {
+                        *last = scenario;
+                    }
+                } else {
+                    self.scenarios.push(scenario);
+                    self.has_random_tab = true;
                 }
             }
         }

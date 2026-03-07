@@ -1,9 +1,12 @@
 //! Scenario resolution: walk a game tree following an action path and
 //! extract a 13x13 strategy grid for the target decision node.
 
+use rand::seq::SliceRandom;
+
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
-use poker_solver_core::poker::Card;
+use poker_solver_core::blueprint_v2::Street;
+use poker_solver_core::poker::{Card, full_deck};
 
 use crate::blueprint_tui_widgets::CellStrategy;
 
@@ -122,6 +125,65 @@ pub fn extract_strategy_grid(
     }
 
     grid
+}
+
+// ── Random scenario helpers ──────────────────────────────────────────────────
+
+/// Collect all decision node indices at the given street.
+pub fn decision_nodes_at_street(tree: &GameTree, street: Street) -> Vec<u32> {
+    tree.nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, node)| {
+            if let GameNode::Decision { street: s, .. } = node {
+                if *s == street {
+                    Some(i as u32)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Build a human-readable name for a random scenario node.
+pub fn random_scenario_name(tree: &GameTree, node_idx: u32, board_display: &str) -> String {
+    if let GameNode::Decision {
+        player, street, ..
+    } = &tree.nodes[node_idx as usize]
+    {
+        let player_name = if *player == 0 { "SB" } else { "BB" };
+        let board_suffix = if board_display.is_empty() {
+            String::new()
+        } else {
+            format!(" {board_display}")
+        };
+        format!("Random {player_name} | {street:?}{board_suffix}")
+    } else {
+        "Random".to_string()
+    }
+}
+
+/// Deal a random board for the given street.
+///
+/// Returns 0 cards for preflop, 3 for flop, 4 for turn, 5 for river.
+pub fn random_board(street: Street, rng: &mut impl rand::Rng) -> Vec<Card> {
+    let num_cards = match street {
+        Street::Preflop => 0,
+        Street::Flop => 3,
+        Street::Turn => 4,
+        Street::River => 5,
+    };
+    if num_cards == 0 {
+        return vec![];
+    }
+
+    let mut deck = full_deck();
+    deck.shuffle(rng);
+    deck.truncate(num_cards);
+    deck
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

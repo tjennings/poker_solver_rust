@@ -121,6 +121,15 @@ pub struct BlueprintTrainer {
     pub last_strategy_delta: f64,
     /// Most recent fraction of info sets with max action delta > 0.20.
     pub last_pct_moving: f64,
+
+    // --- Random scenario carousel ---
+    /// Callback to push a random scenario to TUI.
+    /// Receives a reference to storage and the game tree.
+    pub on_random_scenario: Option<Box<dyn Fn(&BlueprintStorage, &GameTree) + Send>>,
+    /// Minutes between random scenario rotations.
+    pub random_scenario_hold_minutes: u64,
+    /// Last time (in minutes) a random scenario was pushed.
+    last_random_scenario_min: u64,
 }
 
 impl BlueprintTrainer {
@@ -190,6 +199,9 @@ impl BlueprintTrainer {
             prev_strategy_sums: None,
             last_strategy_delta: f64::INFINITY,
             last_pct_moving: 1.0,
+            on_random_scenario: None,
+            random_scenario_hold_minutes: 3,
+            last_random_scenario_min: 0,
         }
     }
 
@@ -468,6 +480,14 @@ impl BlueprintTrainer {
                 }
             }
             self.last_strategy_refresh_secs = elapsed_secs;
+        }
+
+        // Random scenario carousel rotation.
+        if let Some(ref callback) = self.on_random_scenario {
+            if elapsed_min >= self.last_random_scenario_min + self.random_scenario_hold_minutes {
+                callback(&self.storage, &self.tree);
+                self.last_random_scenario_min = elapsed_min;
+            }
         }
 
         Ok(())

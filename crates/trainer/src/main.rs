@@ -578,6 +578,69 @@ fn main() -> Result<(), Box<dyn Error>> {
                     metrics_for_leaf.push_leaf_movement(pct);
                 }));
 
+                // Random scenario carousel.
+                if tui_config.random_scenario.enabled {
+                    trainer.random_scenario_hold_minutes =
+                        tui_config.random_scenario.hold_minutes;
+                    let metrics_for_random = Arc::clone(&metrics);
+                    let pool = tui_config.random_scenario.pool.clone();
+                    trainer.on_random_scenario =
+                        Some(Box::new(move |storage, tree| {
+                            use rand::seq::IndexedRandom;
+                            let mut rng = rand::rng();
+
+                            let Some(street_label) = pool.choose(&mut rng) else {
+                                return;
+                            };
+                            let street = match street_label {
+                                blueprint_tui_config::StreetLabel::Preflop => {
+                                    poker_solver_core::blueprint_v2::Street::Preflop
+                                }
+                                blueprint_tui_config::StreetLabel::Flop => {
+                                    poker_solver_core::blueprint_v2::Street::Flop
+                                }
+                                blueprint_tui_config::StreetLabel::Turn => {
+                                    poker_solver_core::blueprint_v2::Street::Turn
+                                }
+                                blueprint_tui_config::StreetLabel::River => {
+                                    poker_solver_core::blueprint_v2::Street::River
+                                }
+                            };
+
+                            let candidates =
+                                blueprint_tui_scenarios::decision_nodes_at_street(tree, street);
+                            let Some(&node_idx) = candidates.choose(&mut rng) else {
+                                return;
+                            };
+
+                            let board =
+                                blueprint_tui_scenarios::random_board(street, &mut rng);
+                            let board_display = if board.is_empty() {
+                                String::new()
+                            } else {
+                                board
+                                    .iter()
+                                    .map(|c| format!("{c}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            };
+
+                            let grid = blueprint_tui_scenarios::extract_strategy_grid(
+                                tree, storage, node_idx, &board,
+                            );
+
+                            let name = blueprint_tui_scenarios::random_scenario_name(
+                                tree, node_idx, &board_display,
+                            );
+
+                            let street_label_str = format!("{street:?}");
+
+                            metrics_for_random.update_random_scenario(
+                                name, node_idx, grid, board_display, street_label_str,
+                            );
+                        }));
+                }
+
                 trainer.tui_active = true;
 
                 let refresh_ms = tui_config.refresh_rate_ms;
