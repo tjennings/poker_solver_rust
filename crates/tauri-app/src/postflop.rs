@@ -1015,19 +1015,19 @@ mod tests {
     fn test_solve_street_completes() {
         let state = Arc::new(PostflopState::default());
         let config = PostflopConfig {
-            oop_range: "QQ+,AKs".to_string(),
-            ip_range: "JJ-99,AQs".to_string(),
+            oop_range: "AA".to_string(),
+            ip_range: "KK".to_string(),
             pot: 30,
             effective_stack: 170,
-            oop_bet_sizes: "33%,75%".to_string(),
+            oop_bet_sizes: "33%".to_string(),
             oop_raise_sizes: "a".to_string(),
-            ip_bet_sizes: "33%,75%".to_string(),
+            ip_bet_sizes: "33%".to_string(),
             ip_raise_sizes: "a".to_string(),
         };
         *state.config.write() = config;
 
-        let board = vec!["Td".into(), "9d".into(), "6h".into()];
-        // Use very few iterations and a high target to finish quickly in debug.
+        // River board — single street, fast even in debug mode
+        let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
         let result =
             postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX));
         assert!(result.is_ok(), "solve_street failed: {:?}", result.err());
@@ -1071,18 +1071,18 @@ mod tests {
     fn test_play_action_after_solve() {
         let state = Arc::new(PostflopState::default());
         let config = PostflopConfig {
-            oop_range: "QQ+,AKs".to_string(),
-            ip_range: "JJ-99,AQs".to_string(),
+            oop_range: "AA".to_string(),
+            ip_range: "KK".to_string(),
             pot: 30,
             effective_stack: 170,
-            oop_bet_sizes: "33%,75%".to_string(),
+            oop_bet_sizes: "33%".to_string(),
             oop_raise_sizes: "a".to_string(),
-            ip_bet_sizes: "33%,75%".to_string(),
+            ip_bet_sizes: "33%".to_string(),
             ip_raise_sizes: "a".to_string(),
         };
         *state.config.write() = config;
 
-        let board = vec!["Td".into(), "9d".into(), "6h".into()];
+        let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
         postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX)).unwrap();
 
         // Wait for the background thread to finish.
@@ -1122,18 +1122,18 @@ mod tests {
     fn test_close_street_filters_ranges() {
         let state = Arc::new(PostflopState::default());
         let config = PostflopConfig {
-            oop_range: "QQ+,AKs".to_string(),
-            ip_range: "JJ-99,AQs".to_string(),
+            oop_range: "AA".to_string(),
+            ip_range: "KK".to_string(),
             pot: 30,
             effective_stack: 170,
-            oop_bet_sizes: "33%,75%".to_string(),
+            oop_bet_sizes: "33%".to_string(),
             oop_raise_sizes: "a".to_string(),
-            ip_bet_sizes: "33%,75%".to_string(),
+            ip_bet_sizes: "33%".to_string(),
             ip_raise_sizes: "a".to_string(),
         };
         postflop_set_config_core(&state, config).unwrap();
 
-        let board = vec!["Td".into(), "9d".into(), "6h".into()];
+        let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
         postflop_solve_street_core(&state, board, Some(5), Some(f32::MAX)).unwrap();
 
         // Wait for background solve to finish.

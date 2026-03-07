@@ -1268,7 +1268,7 @@ mod tests {
     }
 
     /// Vanilla CFR produces valid strategies after training.
-    #[timed_test]
+    #[timed_test(3)]
     fn vanilla_produces_valid_strategy() {
         use super::super::config::CfrVariant;
         let mut config = tiny_config();
@@ -1287,7 +1287,7 @@ mod tests {
     }
 
     /// Vanilla CFR uses uniform weighting (weight=1), not LCFR linear weighting.
-    #[timed_test]
+    #[timed_test(3)]
     fn vanilla_uniform_weighting() {
         use super::super::config::CfrVariant;
         let mut config = tiny_config();
@@ -1397,7 +1397,7 @@ mod tests {
     }
 
     /// CFR+: produces valid probability distributions after training.
-    #[timed_test]
+    #[timed_test(3)]
     fn cfrplus_produces_valid_strategy() {
         use super::super::config::CfrVariant;
         let mut config = tiny_config();

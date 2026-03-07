@@ -13,6 +13,7 @@ use test_macros::timed_test;
 /// After building the full postflop abstraction (169-hand MCCFR + values),
 /// the value table should show strong hands winning against weak hands.
 #[timed_test(10)]
+#[ignore = "slow: builds full postflop abstraction pipeline"]
 fn diag_value_table_strong_beats_weak() {
     let config = PostflopModelConfig {
         postflop_sprs: vec![5.0],

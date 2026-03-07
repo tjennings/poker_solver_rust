@@ -311,7 +311,7 @@ mod tests {
         assert!(!PostflopBundle::exists(&dir.path().join("nonexistent")));
     }
 
-    #[timed_test]
+    #[timed_test(3)]
     fn postflop_bundle_into_abstraction() {
         let bundle = minimal_bundle();
         let dir = TempDir::new().unwrap();

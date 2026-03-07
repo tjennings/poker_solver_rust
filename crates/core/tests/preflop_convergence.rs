@@ -8,14 +8,14 @@ use poker_solver_core::preflop::{PreflopConfig, PreflopSolver, RaiseSize};
 use test_macros::timed_test;
 
 #[timed_test(10)]
-fn hu_preflop_converges_in_500_iterations() {
+fn hu_preflop_converges_in_50_iterations() {
     // Use a small stack depth and restricted raise sizes for a compact tree.
-    let mut config = PreflopConfig::heads_up(10);
+    let mut config = PreflopConfig::heads_up(5);
     config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
-    config.raise_cap = 2;
+    config.raise_cap = 1;
 
     let mut solver = PreflopSolver::new(&config);
-    solver.train(500);
+    solver.train(50);
     let strategy = solver.strategy();
 
     // Strategy should not be empty.

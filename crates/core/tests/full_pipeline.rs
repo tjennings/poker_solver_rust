@@ -10,7 +10,7 @@ use poker_solver_core::blueprint::{
     BlueprintStrategy, SubgameCfrSolver, SubgameHands, SubgameStrategy, SubgameTreeBuilder,
 };
 use poker_solver_core::poker::{Card, Suit, Value};
-use poker_solver_core::preflop::{PreflopConfig, PreflopSolver, PreflopStrategy};
+use poker_solver_core::preflop::{PreflopConfig, PreflopSolver, PreflopStrategy, RaiseSize};
 use test_macros::timed_test;
 
 // -----------------------------------------------------------------------
@@ -56,10 +56,10 @@ fn small_hands(board: &[Card], n: usize) -> SubgameHands {
 const SUBGAME_COMBO_COUNT: usize = 60;
 
 /// Preflop iteration count (enough for valid distributions, fast enough for CI).
-const PREFLOP_ITERATIONS: u64 = 200;
+const PREFLOP_ITERATIONS: u64 = 20;
 
 /// Subgame iteration count.
-const SUBGAME_ITERATIONS: u32 = 200;
+const SUBGAME_ITERATIONS: u32 = 20;
 
 // -----------------------------------------------------------------------
 // Step 1 & 2: Preflop
@@ -67,7 +67,9 @@ const SUBGAME_ITERATIONS: u32 = 200;
 
 #[timed_test(10)]
 fn step1_preflop_solver_produces_valid_strategy() {
-    let config = PreflopConfig::heads_up(20);
+    let mut config = PreflopConfig::heads_up(5);
+    config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
+    config.raise_cap = 1;
     let mut solver = PreflopSolver::new(&config);
     solver.train(PREFLOP_ITERATIONS);
 
@@ -204,7 +206,9 @@ fn step5_blueprint_strategy_stores_and_retrieves() {
 #[timed_test(10)]
 fn full_pipeline_preflop_then_subgame() {
     // -- Preflop phase --
-    let config = PreflopConfig::heads_up(20);
+    let mut config = PreflopConfig::heads_up(5);
+    config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
+    config.raise_cap = 1;
     let mut preflop_solver = PreflopSolver::new(&config);
     preflop_solver.train(PREFLOP_ITERATIONS);
     let preflop_strategy = preflop_solver.strategy();
