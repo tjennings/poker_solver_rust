@@ -137,3 +137,71 @@ export interface SimulationResult {
   equity_curve: number[];
   elapsed_ms: number;
 }
+
+// Postflop solver types
+
+export interface PostflopConfig {
+  oop_range: string;
+  ip_range: string;
+  pot: number;
+  effective_stack: number;
+  oop_bet_sizes: string;
+  oop_raise_sizes: string;
+  ip_bet_sizes: string;
+  ip_raise_sizes: string;
+}
+
+export interface PostflopConfigSummary {
+  config: PostflopConfig;
+  oop_combos: number;
+  ip_combos: number;
+}
+
+export interface PostflopActionInfo {
+  index: number;
+  label: string;
+  action_type: string;
+  amount: number | null;
+}
+
+export interface PostflopMatrixCell {
+  hand: string;
+  suited: boolean;
+  pair: boolean;
+  probabilities: number[];
+  combo_count: number;
+  ev: number | null;
+}
+
+export interface PostflopStrategyMatrix {
+  cells: PostflopMatrixCell[][];
+  actions: PostflopActionInfo[];
+  player: number;
+  pot: number;
+  stacks: [number, number];
+  board: string[];
+}
+
+export interface PostflopProgress {
+  iteration: number;
+  max_iterations: number;
+  exploitability: number;
+  is_complete: boolean;
+  matrix: PostflopStrategyMatrix | null;
+}
+
+export interface PostflopStreetResult {
+  filtered_oop_range: number[];
+  filtered_ip_range: number[];
+  pot: number;
+  effective_stack: number;
+}
+
+export interface PostflopPlayResult {
+  matrix: PostflopStrategyMatrix | null;
+  is_terminal: boolean;
+  is_chance: boolean;
+  current_player: number | null;
+  pot: number;
+  stacks: [number, number];
+}
