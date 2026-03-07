@@ -113,6 +113,8 @@ pub struct BlueprintTrainer {
     pub on_leaf_movement: Option<Box<dyn Fn(f64) + Send>>,
     /// Callback to push the minimum (most-negative) regret value to TUI metrics.
     pub on_min_regret: Option<Box<dyn Fn(f64) + Send>>,
+    /// Callback to push fraction of actions below prune threshold to TUI.
+    pub on_prune_fraction: Option<Box<dyn Fn(f64) + Send>>,
     /// Last time (in seconds) a strategy refresh was performed.
     last_strategy_refresh_secs: u64,
 
@@ -198,6 +200,7 @@ impl BlueprintTrainer {
             on_strategy_delta: None,
             on_leaf_movement: None,
             on_min_regret: None,
+            on_prune_fraction: None,
             last_strategy_refresh_secs: 0,
             prev_strategy_sums: None,
             last_strategy_delta: f64::INFINITY,
@@ -532,6 +535,9 @@ impl BlueprintTrainer {
             if let Some(ref cb) = self.on_min_regret {
                 cb(self.min_regret());
             }
+            if let Some(ref cb) = self.on_prune_fraction {
+                cb(self.prune_fraction());
+            }
         }
         self.prev_strategy_sums = Some(self.storage.snapshot_strategy_sums());
     }
@@ -574,6 +580,23 @@ impl BlueprintTrainer {
             .min()
             .unwrap_or(0);
         f64::from(min_raw) / 1000.0
+    }
+
+    /// Fraction of regret entries below the prune threshold (0.0–1.0).
+    #[must_use]
+    pub fn prune_fraction(&self) -> f64 {
+        let threshold = self.config.training.prune_threshold;
+        let total = self.storage.regrets.len() as f64;
+        if total == 0.0 {
+            return 0.0;
+        }
+        let below = self
+            .storage
+            .regrets
+            .iter()
+            .filter(|atom| atom.load(Ordering::Relaxed) < threshold)
+            .count() as f64;
+        below / total
     }
 
     /// Mean of all strictly-positive regret entries.

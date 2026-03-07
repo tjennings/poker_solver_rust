@@ -50,6 +50,8 @@ pub struct BlueprintTuiApp {
     leaf_movement_history: Vec<u64>,
     // Max negative regret sparkline data (stored as abs value × 1000 for sparkline)
     min_regret_history: Vec<u64>,
+    // Current prune fraction (0.0–1.0)
+    prune_fraction: f64,
     // Random scenario carousel tracking
     has_random_tab: bool,
 }
@@ -73,6 +75,7 @@ impl BlueprintTuiApp {
             delta_history: Vec::with_capacity(SPARKLINE_HISTORY),
             leaf_movement_history: Vec::with_capacity(SPARKLINE_HISTORY),
             min_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
+            prune_fraction: 0.0,
             has_random_tab: false,
         }
     }
@@ -145,6 +148,12 @@ impl BlueprintTuiApp {
                 );
             }
             hist.clear();
+        }
+
+        // Prune fraction
+        {
+            let pf = self.metrics.prune_fraction.lock().unwrap_or_else(|e| e.into_inner());
+            self.prune_fraction = *pf;
         }
 
         // Strategy grid refresh from trainer
@@ -245,6 +254,7 @@ impl BlueprintTuiApp {
                 Constraint::Length(3), // Strategy delta sparkline
                 Constraint::Length(3), // Leaf movement sparkline
                 Constraint::Length(3), // Max negative regret sparkline
+                Constraint::Length(1), // Actions pruned bar
                 Constraint::Min(0),   // Spacer
                 Constraint::Length(1), // Hotkeys footer
             ])
@@ -257,7 +267,8 @@ impl BlueprintTuiApp {
         self.render_strategy_delta(frame, chunks[4]);
         self.render_leaf_movement(frame, chunks[5]);
         self.render_min_regret(frame, chunks[6]);
-        self.render_hotkeys(frame, chunks[8]);
+        self.render_prune_bar(frame, chunks[7]);
+        self.render_hotkeys(frame, chunks[9]);
     }
 
     fn render_iterations(&self, frame: &mut Frame, area: Rect) {
@@ -371,6 +382,15 @@ impl BlueprintTuiApp {
             .data(&self.min_regret_history)
             .style(Style::default().fg(Color::Red));
         frame.render_widget(sparkline, area);
+    }
+
+    fn render_prune_bar(&self, frame: &mut Frame, area: Rect) {
+        let pct = self.prune_fraction * 100.0;
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Magenta))
+            .ratio(self.prune_fraction.clamp(0.0, 1.0))
+            .label(format!("Actions pruned: {pct:.1}%"));
+        frame.render_widget(gauge, area);
     }
 
     fn render_hotkeys(&self, frame: &mut Frame, area: Rect) {

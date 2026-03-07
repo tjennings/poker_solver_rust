@@ -583,6 +583,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     metrics_for_regret.push_min_regret(val);
                 }));
 
+                let metrics_for_prune = Arc::clone(&metrics);
+                trainer.on_prune_fraction = Some(Box::new(move |frac| {
+                    metrics_for_prune.set_prune_fraction(frac);
+                }));
+
                 // Random scenario carousel.
                 if tui_config.random_scenario.enabled {
                     trainer.random_scenario_hold_minutes =

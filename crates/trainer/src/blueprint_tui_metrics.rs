@@ -48,6 +48,7 @@ pub struct BlueprintTuiMetrics {
     pub strategy_delta_history: Mutex<Vec<f64>>,
     pub leaf_movement_history: Mutex<Vec<f64>>,
     pub min_regret_history: Mutex<Vec<f64>>,
+    pub prune_fraction: Mutex<f64>,
 }
 
 impl BlueprintTuiMetrics {
@@ -81,6 +82,7 @@ impl BlueprintTuiMetrics {
             strategy_delta_history: Mutex::new(Vec::new()),
             leaf_movement_history: Mutex::new(Vec::new()),
             min_regret_history: Mutex::new(Vec::new()),
+            prune_fraction: Mutex::new(0.0),
         }
     }
 
@@ -144,6 +146,12 @@ impl BlueprintTuiMetrics {
     pub fn push_strategy_delta(&self, delta: f64) {
         let mut hist = self.strategy_delta_history.lock().unwrap_or_else(|e| e.into_inner());
         hist.push(delta);
+    }
+
+    /// Update the current prune fraction (0.0–1.0).
+    pub fn set_prune_fraction(&self, frac: f64) {
+        let mut pf = self.prune_fraction.lock().unwrap_or_else(|e| e.into_inner());
+        *pf = frac;
     }
 
     /// Push a min-regret sample into the sparkline history.
