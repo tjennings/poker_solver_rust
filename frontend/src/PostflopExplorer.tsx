@@ -235,19 +235,31 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
         ))}
 
         {/* Available actions */}
-        {matrix && !terminal && !awaitingCard && matrix.actions.map((action) => (
-          <div
-            key={`act-${action.index}`}
-            className={`action-block action-block-choice${solving ? ' disabled' : ''}`}
-            style={{
-              borderLeft: `3px solid ${getActionColor(toActionInfo(action), toActionInfos(matrix.actions))}`,
-              cursor: solving ? 'default' : 'pointer',
-            }}
-            onClick={() => !solving && handleAction(action.index)}
-          >
-            <span style={{ fontSize: '0.85em' }}>{formatActionLabel(toActionInfo(action))}</span>
+        {matrix && !terminal && !awaitingCard && (
+          <div className={`action-block${solving ? '' : ' current'}`}>
+            <div className="action-block-header">
+              <span className="position">{matrix.player === 0 ? 'OOP' : 'IP'}</span>
+              <span className="stack">{Math.round(matrix.stacks[matrix.player] / 2)}BB / {Math.round(matrix.pot / 2)}BB</span>
+            </div>
+            <div className="action-list">
+              {matrix.actions.map((action) => {
+                const info = toActionInfo(action);
+                const color = getActionColor(info, toActionInfos(matrix.actions));
+                return (
+                  <button
+                    key={action.index}
+                    className="action-button"
+                    style={{ borderLeft: `3px solid ${color}` }}
+                    disabled={solving}
+                    onClick={() => handleAction(action.index)}
+                  >
+                    {formatActionLabel(info)}
+                  </button>
+                );
+              })}
+            </div>
           </div>
-        ))}
+        )}
 
         {/* Next street card (turn/river) */}
         {awaitingCard && (
