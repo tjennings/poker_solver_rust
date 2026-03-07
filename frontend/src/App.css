@@ -568,7 +568,10 @@ button:disabled {
   cursor: pointer;
   border-color: #d4a017;
   border-width: 2px;
+  min-width: 0;
+  width: 40px;
   min-height: 80px;
+  padding: 0.5rem 0;
   transition: border-color 0.2s, background 0.2s;
 }
 .action-block.solve-block:hover {
@@ -584,8 +587,10 @@ button:disabled {
 }
 .solve-label {
   font-weight: 700;
-  font-size: 1rem;
+  font-size: 0.7rem;
   letter-spacing: 0.1em;
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
   color: #d4a017;
 }
 .action-block.solve-block.solving .solve-label {
