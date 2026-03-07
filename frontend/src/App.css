@@ -1299,20 +1299,23 @@ button:disabled {
   height: 100%;
   background: rgba(255,255,255,0.04);
   border-radius: 4px;
-  overflow: hidden;
 }
 .progress-bar-track .progress-bar-fill {
-  height: 100%;
+  position: absolute;
+  inset: 0;
+  right: auto;
   background: linear-gradient(90deg, #00d9ff33, #00d9ff66);
+  border-radius: 4px;
   transition: width 0.3s;
 }
 .progress-bar-track .progress-text {
-  position: absolute;
-  inset: 0;
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 0.8em;
+  height: 100%;
+  font-size: 0.75em;
   color: #e2e8f0;
   white-space: nowrap;
 }
