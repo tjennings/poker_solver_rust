@@ -4,12 +4,13 @@ use axum::{
     extract::State as AxumState,
     http::{HeaderValue, Method},
     routing::post,
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::Deserialize;
 use tower_http::cors::CorsLayer;
 
 use poker_solver_tauri::ExplorationState;
+use poker_solver_tauri::PostflopState;
 
 type AppState = Arc<ExplorationState>;
 
@@ -65,6 +66,28 @@ struct ComboClassesParams {
 struct HandEquityParams {
     hand: String,
     villain_hand: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PostflopConfigParams {
+    config: poker_solver_tauri::postflop::PostflopConfig,
+}
+
+#[derive(Deserialize)]
+struct PostflopSolveParams {
+    board: Vec<String>,
+    max_iterations: Option<u32>,
+    target_exploitability: Option<f32>,
+}
+
+#[derive(Deserialize)]
+struct PostflopActionParams {
+    action: usize,
+}
+
+#[derive(Deserialize)]
+struct PostflopCloseStreetParams {
+    action_history: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,12 +260,65 @@ async fn handle_list_agents(
 }
 
 // ---------------------------------------------------------------------------
+// Handlers — postflop
+// ---------------------------------------------------------------------------
+
+async fn handle_postflop_set_config(
+    Extension(state): Extension<Arc<PostflopState>>,
+    Json(params): Json<PostflopConfigParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::postflop_set_config_core(
+        &state,
+        params.config,
+    ))
+}
+
+async fn handle_postflop_solve_street(
+    Extension(state): Extension<Arc<PostflopState>>,
+    Json(params): Json<PostflopSolveParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::postflop_solve_street_core(
+        &state,
+        params.board,
+        params.max_iterations,
+        params.target_exploitability,
+    ))
+}
+
+async fn handle_postflop_get_progress(
+    Extension(state): Extension<Arc<PostflopState>>,
+) -> Json<serde_json::Value> {
+    to_json_value(poker_solver_tauri::postflop_get_progress_core(&state))
+}
+
+async fn handle_postflop_play_action(
+    Extension(state): Extension<Arc<PostflopState>>,
+    Json(params): Json<PostflopActionParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::postflop_play_action_core(
+        &state,
+        params.action,
+    ))
+}
+
+async fn handle_postflop_close_street(
+    Extension(state): Extension<Arc<PostflopState>>,
+    Json(params): Json<PostflopCloseStreetParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::postflop_close_street_core(
+        &state,
+        params.action_history,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
     let state: AppState = Arc::new(ExplorationState::default());
+    let postflop_state: Arc<PostflopState> = Arc::new(PostflopState::default());
 
     let cors = CorsLayer::new()
         .allow_origin("*".parse::<HeaderValue>().expect("valid header value"))
@@ -275,6 +351,28 @@ async fn main() {
         .route("/api/list_agents", post(handle_list_agents))
         .route("/api/get_combo_classes", post(handle_get_combo_classes))
         .route("/api/get_hand_equity", post(handle_get_hand_equity))
+        // Postflop explorer endpoints
+        .route(
+            "/api/postflop_set_config",
+            post(handle_postflop_set_config),
+        )
+        .route(
+            "/api/postflop_solve_street",
+            post(handle_postflop_solve_street),
+        )
+        .route(
+            "/api/postflop_get_progress",
+            post(handle_postflop_get_progress),
+        )
+        .route(
+            "/api/postflop_play_action",
+            post(handle_postflop_play_action),
+        )
+        .route(
+            "/api/postflop_close_street",
+            post(handle_postflop_close_street),
+        )
+        .layer(Extension(postflop_state))
         .layer(cors)
         .with_state(state);
 

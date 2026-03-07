@@ -23,9 +23,10 @@ pub use exploration::{
 };
 
 pub use postflop::{
-    postflop_get_progress, postflop_get_progress_core, postflop_play_action,
-    postflop_play_action_core, postflop_set_config, postflop_set_config_core,
-    postflop_solve_street, postflop_solve_street_core, PostflopState,
+    postflop_close_street, postflop_close_street_core, postflop_get_progress,
+    postflop_get_progress_core, postflop_play_action, postflop_play_action_core,
+    postflop_set_config, postflop_set_config_core, postflop_solve_street,
+    postflop_solve_street_core, PostflopState,
 };
 
 pub use simulation::{

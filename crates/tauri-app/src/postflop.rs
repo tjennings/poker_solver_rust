@@ -1,7 +1,7 @@
 use parking_lot::{Mutex, RwLock};
 use range_solver::action_tree::{Action, ActionTree, BoardState, TreeConfig};
 use range_solver::bet_size::BetSizeOptions;
-use range_solver::card::{card_from_str, card_to_string, CardConfig, NOT_DEALT};
+use range_solver::card::{card_from_str, card_pair_to_index, card_to_string, CardConfig, NOT_DEALT};
 use range_solver::interface::Game;
 use range_solver::range::Range;
 use range_solver::{compute_exploitability, finalize, solve_step, PostFlopGame};
@@ -711,6 +711,95 @@ pub fn postflop_play_action(
 }
 
 // ---------------------------------------------------------------------------
+// postflop_close_street
+// ---------------------------------------------------------------------------
+
+/// Walks the action history of a completed street, multiplying each acting
+/// player's range weights by the strategy frequency for the chosen action.
+/// Stores the filtered weights for the next street's solve.
+pub fn postflop_close_street_core(
+    state: &PostflopState,
+    action_history: Vec<usize>,
+) -> Result<PostflopStreetResult, String> {
+    let mut game_guard = state.game.lock();
+    let game = game_guard.as_mut().ok_or("No game loaded")?;
+
+    game.back_to_root();
+
+    // Start from current filtered weights, or fall back to the config ranges.
+    let config = state.config.read().clone();
+    let oop_range: Range = config
+        .oop_range
+        .parse()
+        .map_err(|e: String| format!("Invalid OOP range: {e}"))?;
+    let ip_range: Range = config
+        .ip_range
+        .parse()
+        .map_err(|e: String| format!("Invalid IP range: {e}"))?;
+
+    let mut oop_weights: Vec<f32> = state
+        .filtered_oop_weights
+        .read()
+        .clone()
+        .unwrap_or_else(|| oop_range.raw_data().to_vec());
+    let mut ip_weights: Vec<f32> = state
+        .filtered_ip_weights
+        .read()
+        .clone()
+        .unwrap_or_else(|| ip_range.raw_data().to_vec());
+
+    // Walk each action, filtering the acting player's range at each step.
+    for &action_idx in &action_history {
+        if game.is_terminal_node() || game.is_chance_node() {
+            break;
+        }
+
+        let player = game.current_player();
+        let num_hands = game.num_private_hands(player);
+        let strategy = game.strategy();
+        let private_cards = game.private_cards(player);
+
+        let weights = if player == 0 {
+            &mut oop_weights
+        } else {
+            &mut ip_weights
+        };
+        for (hand_idx, &(c1, c2)) in private_cards.iter().enumerate().take(num_hands) {
+            let ci = card_pair_to_index(c1, c2);
+            let action_prob = strategy[action_idx * num_hands + hand_idx];
+            weights[ci] *= action_prob;
+        }
+
+        game.play(action_idx);
+    }
+
+    // Compute pot/stacks at the final node.
+    let bet_amounts = game.total_bet_amount();
+    let tc = game.tree_config();
+    let pot = tc.starting_pot + bet_amounts[0] + bet_amounts[1];
+    let effective_stack = tc.effective_stack - bet_amounts[0].max(bet_amounts[1]);
+
+    // Store filtered weights for the next street.
+    *state.filtered_oop_weights.write() = Some(oop_weights.clone());
+    *state.filtered_ip_weights.write() = Some(ip_weights.clone());
+
+    Ok(PostflopStreetResult {
+        filtered_oop_range: oop_weights,
+        filtered_ip_range: ip_weights,
+        pot,
+        effective_stack,
+    })
+}
+
+#[tauri::command]
+pub fn postflop_close_street(
+    state: tauri::State<'_, Arc<PostflopState>>,
+    action_history: Vec<usize>,
+) -> Result<PostflopStreetResult, String> {
+    postflop_close_street_core(&state, action_history)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1019,5 +1108,60 @@ mod tests {
         assert_eq!(progress.max_iterations, 0);
         assert!(!progress.is_complete);
         assert!(progress.matrix.is_none());
+    }
+
+    #[test]
+    fn test_close_street_no_game() {
+        let state = PostflopState::default();
+        let result = postflop_close_street_core(&state, vec![0]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No game loaded"));
+    }
+
+    #[test]
+    fn test_close_street_filters_ranges() {
+        let state = Arc::new(PostflopState::default());
+        let config = PostflopConfig {
+            oop_range: "QQ+,AKs".to_string(),
+            ip_range: "JJ-99,AQs".to_string(),
+            pot: 30,
+            effective_stack: 170,
+            oop_bet_sizes: "33%,75%".to_string(),
+            oop_raise_sizes: "a".to_string(),
+            ip_bet_sizes: "33%,75%".to_string(),
+            ip_raise_sizes: "a".to_string(),
+        };
+        postflop_set_config_core(&state, config).unwrap();
+
+        let board = vec!["Td".into(), "9d".into(), "6h".into()];
+        postflop_solve_street_core(&state, board, Some(5), Some(f32::MAX)).unwrap();
+
+        // Wait for background solve to finish.
+        for _ in 0..600 {
+            if state.solve_complete.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(state.solve_complete.load(Ordering::Relaxed));
+
+        // Find a non-fold action from the matrix snapshot.
+        let progress = postflop_get_progress_core(&state);
+        let matrix = progress.matrix.unwrap();
+        let action_idx = matrix
+            .actions
+            .iter()
+            .find(|a| a.action_type != "fold")
+            .map(|a| a.index)
+            .expect("should have at least one non-fold action");
+
+        let result = postflop_close_street_core(&state, vec![action_idx]).unwrap();
+        assert_eq!(result.filtered_oop_range.len(), 1326);
+        assert_eq!(result.filtered_ip_range.len(), 1326);
+        assert!(result.pot > 0);
+
+        // Verify weights were stored in state.
+        assert!(state.filtered_oop_weights.read().is_some());
+        assert!(state.filtered_ip_weights.read().is_some());
     }
 }
