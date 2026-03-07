@@ -271,6 +271,7 @@ impl BlueprintTrainer {
         // Seed the strategy-delta baseline so the first check after resume
         // compares against the loaded state instead of producing zero.
         self.prev_strategy_sums = Some(self.storage.snapshot_strategy_sums());
+
         eprintln!(
             "Resumed from {}: {} iterations, mean_pos_regret={:.2}",
             snapshot_dir.display(),
@@ -431,7 +432,7 @@ impl BlueprintTrainer {
             self.apply_lcfr_discount();
         }
 
-        // Strategy delta computation (same cadence as progress logging).
+        // Progress logging.
         if elapsed_min >= self.last_print_time + self.config.training.print_every_minutes {
             self.update_strategy_delta();
             self.print_metrics();
@@ -453,6 +454,7 @@ impl BlueprintTrainer {
         if elapsed_secs
             >= self.last_strategy_refresh_secs + self.strategy_refresh_interval_secs
         {
+            self.update_strategy_delta();
             if let Some(ref callback) = self.on_strategy_refresh {
                 for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
                     callback(i, node_idx, &self.storage, &self.tree);
