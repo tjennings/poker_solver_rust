@@ -55,6 +55,7 @@ fn toy_config() -> BlueprintV2Config {
 #[test]
 fn shared_iterations_tracks_training() {
     let mut trainer = BlueprintTrainer::new(toy_config());
+    trainer.skip_bucket_validation = true;
     assert_eq!(trainer.shared_iterations.load(Ordering::Relaxed), 0);
     trainer.train().expect("training should complete");
     assert_eq!(trainer.shared_iterations.load(Ordering::Relaxed), 100);
@@ -65,6 +66,7 @@ fn quit_requested_stops_training() {
     let mut config = toy_config();
     config.training.iterations = Some(1_000_000); // would take forever
     let mut trainer = BlueprintTrainer::new(config);
+    trainer.skip_bucket_validation = true;
     trainer.quit_requested.store(true, Ordering::Relaxed);
     trainer.train().expect("should exit immediately");
     assert_eq!(trainer.iterations, 0);
@@ -78,6 +80,7 @@ fn strategy_refresh_callback_fires() {
     let mut config = toy_config();
     config.training.iterations = Some(50);
     let mut trainer = BlueprintTrainer::new(config);
+    trainer.skip_bucket_validation = true;
     trainer.scenario_node_indices = vec![trainer.tree.root];
     trainer.strategy_refresh_interval_secs = 0; // fire every check
     trainer.on_strategy_refresh = Some(Box::new(move |_, _, _, _| {

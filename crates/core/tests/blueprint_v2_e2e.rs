@@ -147,6 +147,7 @@ fn blueprint_v2_e2e_pipeline() {
 
     // ── 3. Train ────────────────────────────────────────────────────────
     let mut trainer = BlueprintTrainer::new(config.clone());
+    trainer.skip_bucket_validation = true;
     trainer.train().expect("training should complete");
     assert_eq!(trainer.iterations, 50, "should have run 50 iterations");
 

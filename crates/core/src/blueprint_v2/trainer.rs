@@ -88,6 +88,8 @@ pub struct BlueprintTrainer {
     // --- TUI shared state ---
     /// Iteration counter visible to the TUI thread.
     pub shared_iterations: Arc<AtomicU64>,
+    /// Skip the bucket-file validation check in `train()`. Only for tests.
+    pub skip_bucket_validation: bool,
     /// When `true`, the training loop sleeps until unpaused.
     pub paused: Arc<AtomicBool>,
     /// When `true`, the training loop exits at the next iteration boundary.
@@ -189,6 +191,7 @@ impl BlueprintTrainer {
             last_snapshot_time: 0,
             snapshot_count: 0,
             deck,
+            skip_bucket_validation: false,
             shared_iterations: Arc::new(AtomicU64::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
             quit_requested: Arc::new(AtomicBool::new(false)),
@@ -304,8 +307,32 @@ impl BlueprintTrainer {
     ///
     /// # Errors
     ///
-    /// Returns an error if a snapshot write fails.
+    /// Returns an error if no postflop bucket files are found (equity
+    /// fallback produces meaningless abstractions) or if a snapshot
+    /// write fails.
     pub fn train(&mut self) -> Result<(), Box<dyn Error>> {
+        // Refuse to train without proper bucket files — equity-based
+        // fallback produces meaningless postflop abstractions.
+        if !self.skip_bucket_validation {
+        const STREET_NAMES: [&str; 3] = ["flop", "turn", "river"];
+        let mut missing = Vec::new();
+        for (i, name) in STREET_NAMES.iter().enumerate() {
+            if self.buckets.bucket_files[i + 1].is_none() {
+                missing.push(*name);
+            }
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "No bucket files found for: {}. \
+                 Run the clustering pipeline first (cluster_path: {:?}). \
+                 Training without proper buckets produces meaningless strategies.",
+                missing.join(", "),
+                self.config.training.cluster_path,
+            )
+            .into());
+        }
+        }
+
         let batch_size = self.config.training.batch_size;
 
         while !self.should_stop() {
@@ -725,6 +752,12 @@ mod tests {
         }
     }
 
+    fn toy_trainer(config: BlueprintV2Config) -> BlueprintTrainer {
+        let mut t = BlueprintTrainer::new(config);
+        t.skip_bucket_validation = true;
+        t
+    }
+
     #[test]
     fn trainer_creation() {
         let config = toy_config();
@@ -755,7 +788,7 @@ mod tests {
     fn train_runs_iterations() {
         let mut config = toy_config();
         config.training.iterations = Some(50);
-        let mut trainer = BlueprintTrainer::new(config);
+        let mut trainer = toy_trainer(config);
         trainer.train().expect("training should complete");
         assert_eq!(trainer.iterations, 50);
     }
@@ -764,7 +797,7 @@ mod tests {
     fn train_updates_storage() {
         let mut config = toy_config();
         config.training.iterations = Some(20);
-        let mut trainer = BlueprintTrainer::new(config);
+        let mut trainer = toy_trainer(config);
 
         assert!(trainer
             .storage
@@ -828,7 +861,7 @@ mod tests {
         let mut config = toy_config();
         config.snapshots.output_dir = dir.path().to_string_lossy().to_string();
         config.training.iterations = Some(10);
-        let mut trainer = BlueprintTrainer::new(config);
+        let mut trainer = toy_trainer(config);
 
         trainer.train().expect("training should complete");
         trainer.save_snapshot().expect("snapshot should save");
@@ -844,7 +877,7 @@ mod tests {
         let mut config = toy_config();
         config.training.iterations = Some(50);
         config.training.batch_size = 10;
-        let mut trainer = BlueprintTrainer::new(config);
+        let mut trainer = toy_trainer(config);
         trainer.train().expect("training should complete");
         assert_eq!(trainer.iterations, 50);
     }
@@ -854,7 +887,7 @@ mod tests {
         let mut config = toy_config();
         config.training.iterations = Some(200);
         config.training.batch_size = 50;
-        let mut trainer = BlueprintTrainer::new(config);
+        let mut trainer = toy_trainer(config);
         trainer.train().expect("training should complete");
         assert_eq!(trainer.iterations, 200);
         assert!(trainer
@@ -874,7 +907,7 @@ mod tests {
         let mut config = toy_config();
         config.training.iterations = Some(10);
         config.training.batch_size = 200;
-        let mut trainer = BlueprintTrainer::new(config);
+        let mut trainer = toy_trainer(config);
         trainer.train().expect("training should complete");
         assert_eq!(trainer.iterations, 10);
     }
@@ -888,7 +921,7 @@ mod tests {
         config.training.target_strategy_delta = Some(0.5);
         config.training.print_every_minutes = 0; // check every batch
         config.training.batch_size = 50;
-        let mut trainer = BlueprintTrainer::new(config);
+        let mut trainer = toy_trainer(config);
         trainer.train().expect("training should complete");
         // Should have stopped due to delta, not the 1-minute limit.
         assert!(trainer.iterations > 0, "should have run some iterations");
@@ -916,7 +949,7 @@ mod tests {
         let mut config = toy_config();
         config.training.iterations = Some(20);
         config.snapshots.output_dir = dir.path().to_string_lossy().to_string();
-        let mut trainer = BlueprintTrainer::new(config.clone());
+        let mut trainer = toy_trainer(config.clone());
         trainer.train().expect("initial training");
         trainer.save_snapshot().expect("save snapshot");
         assert!(snapshot_dir.join("regrets.bin").exists());
@@ -924,7 +957,7 @@ mod tests {
         // Create a new trainer with resume=true and train 20 more.
         config.training.iterations = Some(40); // total target
         config.snapshots.resume = true;
-        let mut trainer2 = BlueprintTrainer::new(config);
+        let mut trainer2 = toy_trainer(config);
         trainer2.try_resume().expect("resume should succeed");
         assert_eq!(trainer2.iterations, 20, "should resume at iteration 20");
         assert_eq!(trainer2.snapshot_count, 1, "should start at snapshot 1");
