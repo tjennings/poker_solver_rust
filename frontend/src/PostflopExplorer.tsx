@@ -274,14 +274,14 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
         ))}
 
         {/* Solve button */}
-        {(needsSolve || solving) && !matrix && (
+        {(needsSolve || solving) && (
           <div className={`action-block solve-block ${solving ? 'solving' : ''}`} onClick={handleSolve}>
             <span className="solve-label">{solving ? 'CANCEL' : 'SOLVE'}</span>
           </div>
         )}
 
         {/* Available actions */}
-        {matrix && !terminal && !awaitingCard && (
+        {matrix && !solving && !terminal && !awaitingCard && (
           <ActionBlock
             position={matrix.player === 0 ? 'SB' : 'BB'}
             stack={matrix.stacks[matrix.player]}
