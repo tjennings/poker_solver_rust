@@ -34,6 +34,7 @@ fn main() {
             poker_solver_tauri::postflop_set_config,
             poker_solver_tauri::postflop_solve_street,
             poker_solver_tauri::postflop_get_progress,
+            poker_solver_tauri::postflop_play_action,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

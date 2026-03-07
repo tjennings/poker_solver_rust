@@ -649,6 +649,68 @@ pub fn postflop_get_progress(
 }
 
 // ---------------------------------------------------------------------------
+// postflop_play_action
+// ---------------------------------------------------------------------------
+
+pub fn postflop_play_action_core(
+    state: &PostflopState,
+    action: usize,
+) -> Result<PostflopPlayResult, String> {
+    let mut game_guard = state.game.lock();
+    let game = game_guard.as_mut().ok_or("No game loaded")?;
+
+    game.play(action);
+
+    let bet_amounts = game.total_bet_amount();
+    let tree_config = game.tree_config();
+    let pot = tree_config.starting_pot + bet_amounts[0] + bet_amounts[1];
+    let stacks = [
+        tree_config.effective_stack - bet_amounts[0],
+        tree_config.effective_stack - bet_amounts[1],
+    ];
+
+    if game.is_terminal_node() {
+        return Ok(PostflopPlayResult {
+            matrix: None,
+            is_terminal: true,
+            is_chance: false,
+            current_player: None,
+            pot,
+            stacks,
+        });
+    }
+
+    if game.is_chance_node() {
+        return Ok(PostflopPlayResult {
+            matrix: None,
+            is_terminal: false,
+            is_chance: true,
+            current_player: None,
+            pot,
+            stacks,
+        });
+    }
+
+    let matrix = build_strategy_matrix(game);
+    Ok(PostflopPlayResult {
+        matrix: Some(matrix),
+        is_terminal: false,
+        is_chance: false,
+        current_player: Some(game.current_player()),
+        pot,
+        stacks,
+    })
+}
+
+#[tauri::command]
+pub fn postflop_play_action(
+    state: tauri::State<'_, Arc<PostflopState>>,
+    action: usize,
+) -> Result<PostflopPlayResult, String> {
+    postflop_play_action_core(&state, action)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -906,6 +968,47 @@ mod tests {
             postflop_solve_street_core(&state, board, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
+    }
+
+    #[test]
+    fn test_play_action_no_game() {
+        let state = PostflopState::default();
+        let result = postflop_play_action_core(&state, 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No game loaded"));
+    }
+
+    #[test]
+    fn test_play_action_after_solve() {
+        let state = Arc::new(PostflopState::default());
+        let config = PostflopConfig {
+            oop_range: "QQ+,AKs".to_string(),
+            ip_range: "JJ-99,AQs".to_string(),
+            pot: 30,
+            effective_stack: 170,
+            oop_bet_sizes: "33%,75%".to_string(),
+            oop_raise_sizes: "a".to_string(),
+            ip_bet_sizes: "33%,75%".to_string(),
+            ip_raise_sizes: "a".to_string(),
+        };
+        *state.config.write() = config;
+
+        let board = vec!["Td".into(), "9d".into(), "6h".into()];
+        postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX)).unwrap();
+
+        // Wait for the background thread to finish.
+        for _ in 0..600 {
+            if state.solve_complete.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(state.solve_complete.load(Ordering::Relaxed));
+
+        // Play first available action.
+        let result = postflop_play_action_core(&state, 0).unwrap();
+        // First action should yield a terminal, chance, or player node.
+        assert!(result.is_terminal || result.matrix.is_some() || result.is_chance);
     }
 
     #[test]
