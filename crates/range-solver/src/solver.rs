@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::mem::MaybeUninit;
 
 // Re-export utility functions that belong to the solver's public API.
-pub use crate::utility::{compute_exploitability, compute_average};
+pub use crate::utility::{compute_exploitability, compute_average, finalize};
 
 // ---------------------------------------------------------------------------
 // Discount parameters

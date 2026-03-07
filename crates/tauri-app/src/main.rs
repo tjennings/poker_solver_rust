@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::sync::Arc;
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(poker_solver_tauri::ExplorationState::default())
         .manage(poker_solver_tauri::SimulationState::default())
-        .manage(poker_solver_tauri::PostflopState::default())
+        .manage(Arc::new(poker_solver_tauri::PostflopState::default()))
         .invoke_handler(tauri::generate_handler![
             // Exploration commands
             poker_solver_tauri::load_bundle,
@@ -30,6 +32,7 @@ fn main() {
             poker_solver_tauri::get_simulation_result,
             // Postflop solver commands
             poker_solver_tauri::postflop_set_config,
+            poker_solver_tauri::postflop_solve_street,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

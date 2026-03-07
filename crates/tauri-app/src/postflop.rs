@@ -1,12 +1,13 @@
 use parking_lot::{Mutex, RwLock};
-use range_solver::action_tree::Action;
+use range_solver::action_tree::{Action, ActionTree, BoardState, TreeConfig};
 use range_solver::bet_size::BetSizeOptions;
-use range_solver::card::{card_to_string, NOT_DEALT};
+use range_solver::card::{card_from_str, card_to_string, CardConfig, NOT_DEALT};
 use range_solver::interface::Game;
 use range_solver::range::Range;
-use range_solver::PostFlopGame;
+use range_solver::{compute_exploitability, finalize, solve_step, PostFlopGame};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -410,10 +411,214 @@ pub fn postflop_set_config_core(
 
 #[tauri::command]
 pub fn postflop_set_config(
-    state: tauri::State<'_, PostflopState>,
+    state: tauri::State<'_, Arc<PostflopState>>,
     config: PostflopConfig,
 ) -> Result<PostflopConfigSummary, String> {
     postflop_set_config_core(&state, config)
+}
+
+// ---------------------------------------------------------------------------
+// postflop_solve_street
+// ---------------------------------------------------------------------------
+
+/// Determines the `BoardState` and parses board cards from a list of card strings.
+///
+/// Returns `(flop, turn, river, initial_state)`.
+fn parse_board(board: &[String]) -> Result<([u8; 3], u8, u8, BoardState), String> {
+    match board.len() {
+        3 => {
+            let flop_str = format!("{}{}{}", board[0], board[1], board[2]);
+            let flop = range_solver::card::flop_from_str(&flop_str)
+                .map_err(|e| format!("Invalid flop: {e}"))?;
+            Ok((flop, NOT_DEALT, NOT_DEALT, BoardState::Flop))
+        }
+        4 => {
+            let flop_str = format!("{}{}{}", board[0], board[1], board[2]);
+            let flop = range_solver::card::flop_from_str(&flop_str)
+                .map_err(|e| format!("Invalid flop: {e}"))?;
+            let turn =
+                card_from_str(&board[3]).map_err(|e| format!("Invalid turn card: {e}"))?;
+            Ok((flop, turn, NOT_DEALT, BoardState::Turn))
+        }
+        5 => {
+            let flop_str = format!("{}{}{}", board[0], board[1], board[2]);
+            let flop = range_solver::card::flop_from_str(&flop_str)
+                .map_err(|e| format!("Invalid flop: {e}"))?;
+            let turn =
+                card_from_str(&board[3]).map_err(|e| format!("Invalid turn card: {e}"))?;
+            let river =
+                card_from_str(&board[4]).map_err(|e| format!("Invalid river card: {e}"))?;
+            Ok((flop, turn, river, BoardState::River))
+        }
+        n => Err(format!("Board must have 3-5 cards, got {n}")),
+    }
+}
+
+/// Builds the range-solver `PostFlopGame` from the current config, board, and
+/// optional filtered weights.
+fn build_game(
+    config: &PostflopConfig,
+    board: &[String],
+    filtered_oop: &Option<Vec<f32>>,
+    filtered_ip: &Option<Vec<f32>>,
+) -> Result<PostFlopGame, String> {
+    let (flop, turn, river, initial_state) = parse_board(board)?;
+
+    // Parse ranges (or use filtered weights if available from multi-street).
+    let oop_range = match filtered_oop {
+        Some(weights) => {
+            Range::from_raw_data(weights).map_err(|e| format!("Bad OOP weights: {e}"))?
+        }
+        None => config
+            .oop_range
+            .parse()
+            .map_err(|e: String| format!("Invalid OOP range: {e}"))?,
+    };
+    let ip_range = match filtered_ip {
+        Some(weights) => {
+            Range::from_raw_data(weights).map_err(|e| format!("Bad IP weights: {e}"))?
+        }
+        None => config
+            .ip_range
+            .parse()
+            .map_err(|e: String| format!("Invalid IP range: {e}"))?,
+    };
+
+    // Parse bet sizes.
+    let oop_sizes = BetSizeOptions::try_from((
+        config.oop_bet_sizes.as_str(),
+        config.oop_raise_sizes.as_str(),
+    ))
+    .map_err(|e| format!("Invalid OOP bet sizes: {e}"))?;
+    let ip_sizes = BetSizeOptions::try_from((
+        config.ip_bet_sizes.as_str(),
+        config.ip_raise_sizes.as_str(),
+    ))
+    .map_err(|e| format!("Invalid IP bet sizes: {e}"))?;
+
+    let card_config = CardConfig {
+        range: [oop_range, ip_range],
+        flop,
+        turn,
+        river,
+    };
+
+    let tree_config = TreeConfig {
+        initial_state,
+        starting_pot: config.pot,
+        effective_stack: config.effective_stack,
+        rake_rate: 0.0,
+        rake_cap: 0.0,
+        flop_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
+        turn_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
+        river_bet_sizes: [oop_sizes, ip_sizes],
+        turn_donk_sizes: None,
+        river_donk_sizes: None,
+        add_allin_threshold: 1.5,
+        force_allin_threshold: 0.15,
+        merging_threshold: 0.1,
+    };
+
+    let action_tree =
+        ActionTree::new(tree_config).map_err(|e| format!("Failed to build tree: {e}"))?;
+    let mut game = PostFlopGame::with_config(card_config, action_tree)
+        .map_err(|e| format!("Failed to build game: {e}"))?;
+    game.allocate_memory(false);
+    Ok(game)
+}
+
+pub fn postflop_solve_street_core(
+    state: &Arc<PostflopState>,
+    board: Vec<String>,
+    max_iterations: Option<u32>,
+    target_exploitability: Option<f32>,
+) -> Result<(), String> {
+    // Guard: reject if already solving.
+    if state.solving.load(Ordering::Relaxed) {
+        return Err("A solve is already in progress".to_string());
+    }
+
+    let max_iters = max_iterations.unwrap_or(200);
+    let target_exp = target_exploitability.unwrap_or(0.01);
+
+    // Snapshot config and filtered weights under their locks.
+    let config = state.config.read().clone();
+    let filtered_oop = state.filtered_oop_weights.read().clone();
+    let filtered_ip = state.filtered_ip_weights.read().clone();
+
+    // Build game (expensive but runs on the calling thread before spawn).
+    let mut game = build_game(&config, &board, &filtered_oop, &filtered_ip)?;
+
+    // Reset progress atomics.
+    state.current_iteration.store(0, Ordering::Relaxed);
+    state.max_iterations.store(max_iters, Ordering::Relaxed);
+    state
+        .exploitability_bits
+        .store(f32::MAX.to_bits(), Ordering::Relaxed);
+    state.solve_complete.store(false, Ordering::Relaxed);
+    state.solving.store(true, Ordering::Release);
+
+    // Take initial matrix snapshot.
+    {
+        let matrix = build_strategy_matrix(&game);
+        *state.matrix_snapshot.write() = Some(matrix);
+    }
+
+    // Clone the Arc for the background thread.
+    let shared = Arc::clone(state);
+
+    std::thread::spawn(move || {
+        for t in 0..max_iters {
+            // Check if we've been asked to stop (e.g. config reset clears `solving`).
+            if !shared.solving.load(Ordering::Relaxed) {
+                break;
+            }
+
+            solve_step(&game, t);
+
+            let exp = compute_exploitability(&game);
+            shared.current_iteration.store(t + 1, Ordering::Relaxed);
+            shared
+                .exploitability_bits
+                .store(exp.to_bits(), Ordering::Relaxed);
+
+            // Snapshot the matrix every 10 iterations (or on the first).
+            if (t + 1) % 10 == 0 || t == 0 {
+                let matrix = build_strategy_matrix(&game);
+                *shared.matrix_snapshot.write() = Some(matrix);
+            }
+
+            if exp <= target_exp {
+                break;
+            }
+        }
+
+        // Finalize: compute EV / normalize strategy.
+        finalize(&mut game);
+
+        // Final matrix snapshot.
+        {
+            let matrix = build_strategy_matrix(&game);
+            *shared.matrix_snapshot.write() = Some(matrix);
+        }
+
+        // Store the solved game so other commands can navigate it.
+        *shared.game.lock() = Some(game);
+        shared.solve_complete.store(true, Ordering::Relaxed);
+        shared.solving.store(false, Ordering::Release);
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn postflop_solve_street(
+    state: tauri::State<'_, Arc<PostflopState>>,
+    board: Vec<String>,
+    max_iterations: Option<u32>,
+    target_exploitability: Option<f32>,
+) -> Result<(), String> {
+    postflop_solve_street_core(&state, board, max_iterations, target_exploitability)
 }
 
 // ---------------------------------------------------------------------------
@@ -578,5 +783,101 @@ mod tests {
         let (r1, c1, s1) = card_pair_to_matrix(51, 47);
         let (r2, c2, s2) = card_pair_to_matrix(47, 51);
         assert_eq!((r1, c1, s1), (r2, c2, s2));
+    }
+
+    #[test]
+    fn test_parse_board_flop() {
+        let (flop, turn, river, state) =
+            parse_board(&["Ah".into(), "Kd".into(), "7c".into()]).unwrap();
+        assert_eq!(state, BoardState::Flop);
+        assert_eq!(turn, NOT_DEALT);
+        assert_eq!(river, NOT_DEALT);
+        // flop_from_str sorts, so just check all three are valid cards.
+        assert!(flop.iter().all(|&c| c < 52));
+    }
+
+    #[test]
+    fn test_parse_board_turn() {
+        let (_, turn, river, state) =
+            parse_board(&["Ah".into(), "Kd".into(), "7c".into(), "2s".into()]).unwrap();
+        assert_eq!(state, BoardState::Turn);
+        assert!(turn < 52);
+        assert_eq!(river, NOT_DEALT);
+    }
+
+    #[test]
+    fn test_parse_board_river() {
+        let (_, turn, river, state) = parse_board(&[
+            "Ah".into(),
+            "Kd".into(),
+            "7c".into(),
+            "2s".into(),
+            "Ts".into(),
+        ])
+        .unwrap();
+        assert_eq!(state, BoardState::River);
+        assert!(turn < 52);
+        assert!(river < 52);
+    }
+
+    #[test]
+    fn test_parse_board_invalid_count() {
+        assert!(parse_board(&["Ah".into(), "Kd".into()]).is_err());
+    }
+
+    #[test]
+    fn test_build_game_flop() {
+        let config = PostflopConfig::default();
+        let board = vec!["Td".into(), "9d".into(), "6h".into()];
+        let game = build_game(&config, &board, &None, &None);
+        assert!(game.is_ok(), "build_game failed: {:?}", game.err());
+    }
+
+    #[test]
+    fn test_solve_street_completes() {
+        let state = Arc::new(PostflopState::default());
+        let config = PostflopConfig {
+            oop_range: "QQ+,AKs".to_string(),
+            ip_range: "JJ-99,AQs".to_string(),
+            pot: 30,
+            effective_stack: 170,
+            oop_bet_sizes: "33%,75%".to_string(),
+            oop_raise_sizes: "a".to_string(),
+            ip_bet_sizes: "33%,75%".to_string(),
+            ip_raise_sizes: "a".to_string(),
+        };
+        *state.config.write() = config;
+
+        let board = vec!["Td".into(), "9d".into(), "6h".into()];
+        // Use very few iterations and a high target to finish quickly in debug.
+        let result =
+            postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX));
+        assert!(result.is_ok(), "solve_street failed: {:?}", result.err());
+
+        // Wait for the background thread to finish (generous timeout for debug builds).
+        for _ in 0..600 {
+            if state.solve_complete.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        assert!(state.solve_complete.load(Ordering::Relaxed));
+        assert!(!state.solving.load(Ordering::Relaxed));
+        assert!(state.current_iteration.load(Ordering::Relaxed) > 0);
+        assert!(state.game.lock().is_some());
+        assert!(state.matrix_snapshot.read().is_some());
+    }
+
+    #[test]
+    fn test_solve_street_rejects_double_solve() {
+        let state = Arc::new(PostflopState::default());
+        state.solving.store(true, Ordering::Relaxed);
+
+        let board = vec!["Td".into(), "9d".into(), "6h".into()];
+        let result =
+            postflop_solve_street_core(&state, board, None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already in progress"));
     }
 }
