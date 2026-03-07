@@ -33,6 +33,7 @@ fn main() {
             // Postflop solver commands
             poker_solver_tauri::postflop_set_config,
             poker_solver_tauri::postflop_solve_street,
+            poker_solver_tauri::postflop_get_progress,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

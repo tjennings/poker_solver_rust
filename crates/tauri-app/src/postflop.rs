@@ -622,6 +622,33 @@ pub async fn postflop_solve_street(
 }
 
 // ---------------------------------------------------------------------------
+// postflop_get_progress
+// ---------------------------------------------------------------------------
+
+pub fn postflop_get_progress_core(state: &PostflopState) -> PostflopProgress {
+    let iteration = state.current_iteration.load(Ordering::Relaxed);
+    let max_iterations = state.max_iterations.load(Ordering::Relaxed);
+    let exploitability = f32::from_bits(state.exploitability_bits.load(Ordering::Relaxed));
+    let is_complete = state.solve_complete.load(Ordering::Relaxed);
+    let matrix = state.matrix_snapshot.read().clone();
+
+    PostflopProgress {
+        iteration,
+        max_iterations,
+        exploitability,
+        is_complete,
+        matrix,
+    }
+}
+
+#[tauri::command]
+pub fn postflop_get_progress(
+    state: tauri::State<'_, Arc<PostflopState>>,
+) -> PostflopProgress {
+    postflop_get_progress_core(&state)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -879,5 +906,15 @@ mod tests {
             postflop_solve_street_core(&state, board, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
+    }
+
+    #[test]
+    fn test_get_progress_before_solve() {
+        let state = PostflopState::default();
+        let progress = postflop_get_progress_core(&state);
+        assert_eq!(progress.iteration, 0);
+        assert_eq!(progress.max_iterations, 0);
+        assert!(!progress.is_complete);
+        assert!(progress.matrix.is_none());
     }
 }
