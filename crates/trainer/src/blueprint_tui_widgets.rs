@@ -67,24 +67,19 @@ pub struct HandGridState {
     pub iteration_at_snapshot: u64,
 }
 
-// ─── Constants ──────────────────────────────────────────────────────────────
-
-/// L1 threshold below which a cell is considered converged.
-const CONVERGENCE_THRESHOLD: f32 = 0.01;
-
-/// Bright green used for the convergence border indicator.
-const CONVERGENCE_COLOR: Color = Color::Rgb(100, 255, 100);
-
 // ─── Color helpers ───────────────────────────────────────────────────────────
 
 /// Map an action name to a base colour.
+///
+/// Fold = grey, Check = blue, Call = green,
+/// Bets/Raises = light red → dark red, All-in = darkest red.
 pub fn action_color(name: &str) -> Color {
     let lower = name.to_ascii_lowercase();
     if lower == "fold" {
-        return Color::Rgb(180, 60, 60);
+        return Color::Rgb(140, 140, 140);
     }
     if lower == "check" {
-        return Color::Rgb(100, 149, 237);
+        return Color::Rgb(80, 140, 220);
     }
     if lower == "call" {
         return Color::Rgb(60, 179, 113);
@@ -92,39 +87,17 @@ pub fn action_color(name: &str) -> Color {
     if lower.starts_with("bet") || lower.starts_with("raise") {
         let digit = lower.chars().last().and_then(|c| c.to_digit(10));
         return match digit {
-            Some(0) => Color::Rgb(230, 190, 50),
-            Some(1) => Color::Rgb(230, 150, 40),
-            Some(2) => Color::Rgb(220, 120, 40),
-            Some(3) => Color::Rgb(200, 80, 120),
-            _ => Color::Rgb(180, 60, 180),
+            Some(0) => Color::Rgb(255, 120, 100),
+            Some(1) => Color::Rgb(230, 90, 80),
+            Some(2) => Color::Rgb(200, 65, 60),
+            Some(3) => Color::Rgb(170, 45, 40),
+            _ => Color::Rgb(140, 30, 30),
         };
     }
     if lower.contains("all") || lower.contains("ai") {
-        return Color::Rgb(255, 255, 255);
+        return Color::Rgb(100, 15, 15);
     }
     Color::DarkGray
-}
-
-/// Scale a colour's brightness by `dominance` (the dominant action's
-/// frequency).  Maps the range `[0.33, 1.0]` to brightness `[40%, 100%]`.
-/// Values outside the range are clamped.
-pub fn dim_color(color: Color, dominance: f32) -> Color {
-    let factor = if dominance <= 0.33 {
-        0.4
-    } else if dominance >= 1.0 {
-        1.0
-    } else {
-        // Linear interpolation: 0.33 → 0.4, 1.0 → 1.0
-        0.4 + (dominance - 0.33) / (1.0 - 0.33) * 0.6
-    };
-
-    match color {
-        Color::Rgb(r, g, b) => {
-            let scale = |v: u8| (f32::from(v) * factor).round().min(255.0) as u8;
-            Color::Rgb(scale(r), scale(g), scale(b))
-        }
-        other => other,
-    }
 }
 
 // ─── Widget ──────────────────────────────────────────────────────────────────
@@ -172,43 +145,20 @@ impl Widget for &HandGridWidget<'_> {
 
             for c in 0..13u16 {
                 let cell = &self.state.cells[r as usize][c as usize];
-                let (action, freq) = cell.dominant_action();
-                let base = action_color(action);
-                let bg = dim_color(base, freq);
-                let pct = (freq * 100.0).round() as u32;
-                let label = if pct > 0 {
-                    format!("{pct:>3}")
-                } else {
-                    "   ".to_string()
-                };
-
                 let x = grid_x0 + c * cell_w;
-                if x + cell_w <= area.x + area.width {
-                    // Convergence indicator: bright green left border when
-                    // the cell's strategy has stabilized vs the previous
-                    // snapshot. Only rendered when cell_w >= 4 so there is
-                    // room for the extra character.
-                    if cell_w >= 4 {
-                        let converged = self.state.prev_cells.as_ref().is_some_and(|prev| {
-                            cell.is_converged(
-                                &prev[r as usize][c as usize],
-                                CONVERGENCE_THRESHOLD,
-                            )
-                        });
-                        if converged {
-                            let border_style = Style::default()
-                                .fg(CONVERGENCE_COLOR)
-                                .bg(bg);
-                            buf.set_string(x, y, "\u{2502}", border_style);
-                        } else {
-                            buf.set_string(x, y, " ", Style::default().bg(bg));
-                        }
-                        let style = Style::default().bg(bg).fg(Color::Black);
-                        buf.set_string(x + 1, y, &label, style);
-                    } else {
-                        let style = Style::default().bg(bg).fg(Color::Black);
-                        buf.set_string(x, y, &label, style);
+                if x + cell_w > area.x + area.width {
+                    continue;
+                }
+
+                // Stacked color bar: each character gets the color of the
+                // action whose cumulative frequency covers that position.
+                if cell.actions.is_empty() {
+                    let style = Style::default().bg(Color::Rgb(40, 40, 40));
+                    for dx in 0..cell_w {
+                        buf.set_string(x + dx, y, " ", style);
                     }
+                } else {
+                    render_color_bar(buf, x, y, cell_w, &cell.actions);
                 }
             }
         }
@@ -244,9 +194,9 @@ impl Widget for &HandGridWidget<'_> {
                 ("FOLD", action_color("fold")),
                 ("CHK", action_color("check")),
                 ("CALL", action_color("call")),
-                ("BET-S", action_color("bet0")),
-                ("BET-M", action_color("bet2")),
-                ("BET-L", action_color("bet4")),
+                ("BET", action_color("bet0")),
+                ("RAISE", action_color("raise2")),
+                ("AI", action_color("allin")),
             ];
             let mut x = area.x;
             for (label, color) in legend_items {
@@ -254,6 +204,40 @@ impl Widget for &HandGridWidget<'_> {
                 buf.set_string(x, legend_y, format!(" {label} "), style);
                 x += label.len() as u16 + 3; // label + padding
             }
+        }
+    }
+}
+
+/// Render a stacked color bar for a cell's action distribution.
+///
+/// Each character position maps to a fraction of the cell width. Actions
+/// are drawn left-to-right in their natural order, each getting a number
+/// of characters proportional to its frequency.
+fn render_color_bar(buf: &mut Buffer, x: u16, y: u16, w: u16, actions: &[(String, f32)]) {
+    let total: f32 = actions.iter().map(|(_, f)| f).sum();
+    if total <= 0.0 {
+        let style = Style::default().bg(Color::Rgb(40, 40, 40));
+        for dx in 0..w {
+            buf.set_string(x + dx, y, " ", style);
+        }
+        return;
+    }
+
+    let mut col = 0_u16;
+    let mut cumulative = 0.0_f32;
+    for (i, (name, freq)) in actions.iter().enumerate() {
+        cumulative += freq / total;
+        // Last action gets all remaining columns to avoid rounding gaps.
+        let end = if i == actions.len() - 1 {
+            w
+        } else {
+            (cumulative * w as f32).round() as u16
+        };
+        let color = action_color(name);
+        let style = Style::default().bg(color);
+        while col < end && col < w {
+            buf.set_string(x + col, y, " ", style);
+            col += 1;
         }
     }
 }
@@ -314,10 +298,10 @@ mod tests {
 
     #[timed_test(10)]
     fn action_color_mapping() {
-        assert_eq!(action_color("fold"), Color::Rgb(180, 60, 60));
-        assert_eq!(action_color("check"), Color::Rgb(100, 149, 237));
+        assert_eq!(action_color("fold"), Color::Rgb(140, 140, 140));
+        assert_eq!(action_color("check"), Color::Rgb(80, 140, 220));
         assert_eq!(action_color("call"), Color::Rgb(60, 179, 113));
-        assert_eq!(action_color("raise0"), Color::Rgb(230, 190, 50));
+        assert_eq!(action_color("raise0"), Color::Rgb(255, 120, 100));
     }
 
     #[timed_test(10)]

@@ -1,0 +1,14 @@
+postflop_model:
+  solve_type: exhaustive
+  bet_sizes: [0.3, 0.5]
+  max_raises_per_street: 2
+  postflop_sprs: [3]
+  fixed_flops: [ 'AhKsQd']
+  value_extraction_samples: 20000
+  cfr_convergence_threshold: 500
+  postflop_solve_iterations: 1
+  ev_convergence_threshold: 0.5
+  cfr_variant: dcfr
+  prune_warmup: 1
+  prune_explore_freq: 10
+  prune_regret_threshold: -25

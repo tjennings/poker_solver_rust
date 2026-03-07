@@ -11,12 +11,13 @@
 #     -c sample_configurations/minimal_preflop.yaml -o minimal_preflop_output
 
 # -- Postflop bundle (required, built via solve-postflop) --
-postflop_model_path: minimal_postflop
+postflop_model_path: ./local_data/full_postflop_spr_two_bets
 
 # -- Training --
-iterations: 200
+iterations: 20000
 equity_samples: 5000
-print_every: 50
+print_every: 200
+preflop_exploitability_threshold_mbb: 1
 ev_diagnostic_hands: "AA,72o"
 
 # -- Game structure --
@@ -59,9 +60,9 @@ stacks: [200, 200]  # 100 BB each (SB=1, BB=2)
 #
 # Hybrid (default): geometric anchors + traditional sizes
 raise_sizes:
-  - ["2bb", "1.0p"]              # preflop: 2bb open, pot-sized 3bet
-  - ["0.5p", "0.67p", "1.0p"]   # flop: half-pot, geo(SPR6), pot
-  - ["0.67p", "1.0p", "1.3p"]   # turn/river: geo(SPR6), pot, geo(SPR14)
+  - ["2bb", "6bb", "1.0p", "1.5p"]              # preflop: 2bb open, pot-sized 3bet
+  - ["0.3p", "0.67p", "1.0p", "1.5p"]   # flop: half-pot, geo(SPR6), pot
+  - ["0.3p", "0.75p", "2p"]   # turn/river: geo(SPR6), pot, geo(SPR14)
 
 raise_cap: 3
 
@@ -71,3 +72,6 @@ dcfr_beta: 0.5
 dcfr_gamma: 2.0
 dcfr_warmup: 0
 exploration: 0.05
+prune_warmup: 200
+prune_explore_freq: 10
+prune_regret_threshold: 0
