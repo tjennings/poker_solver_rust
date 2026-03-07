@@ -238,7 +238,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
         {/* Available actions */}
         {matrix && !terminal && !awaitingCard && (
           <ActionBlock
-            position={matrix.player === 0 ? 'OOP' : 'IP'}
+            position={matrix.player === 0 ? 'SB' : 'BB'}
             stack={matrix.stacks[matrix.player]}
             pot={matrix.pot}
             actions={toActionInfos(matrix.actions)}
