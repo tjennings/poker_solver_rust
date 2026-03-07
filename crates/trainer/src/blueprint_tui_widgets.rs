@@ -100,7 +100,7 @@ pub fn action_color(name: &str) -> Color {
         return Color::Rgb(r, g, b);
     }
     if lower.contains("all") || lower.contains("ai") {
-        return Color::Rgb(100, 15, 15);
+        return Color::Rgb(180, 30, 180); // purple for all-in — distinct from red gradient
     }
     Color::DarkGray
 }
@@ -316,7 +316,7 @@ mod tests {
         assert!(matches!(action_color("bet 0.3"), Color::Rgb(..)));
         assert!(matches!(action_color("raise 1.0"), Color::Rgb(..)));
         // All-in is darkest
-        assert_eq!(action_color("all-in"), Color::Rgb(100, 15, 15));
+        assert_eq!(action_color("all-in"), Color::Rgb(180, 30, 180));
     }
 
     #[timed_test(10)]
