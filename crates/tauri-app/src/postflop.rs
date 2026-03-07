@@ -23,6 +23,7 @@ pub struct PostflopConfig {
     pub oop_raise_sizes: String,
     pub ip_bet_sizes: String,
     pub ip_raise_sizes: String,
+    pub target_exploitability: f32,
 }
 
 impl Default for PostflopConfig {
@@ -32,10 +33,11 @@ impl Default for PostflopConfig {
             ip_range: "TT+,AQs+,AKo".to_string(),
             pot: 30,
             effective_stack: 170,
-            oop_bet_sizes: "25%,33%,75%".to_string(),
+            oop_bet_sizes: "25%,33%,75%,a".to_string(),
             oop_raise_sizes: "a".to_string(),
-            ip_bet_sizes: "25%,33%,75%".to_string(),
+            ip_bet_sizes: "25%,33%,75%,a".to_string(),
             ip_raise_sizes: "a".to_string(),
+            target_exploitability: 3.0,
         }
     }
 }
@@ -551,10 +553,10 @@ pub fn postflop_solve_street_core(
     }
 
     let max_iters = max_iterations.unwrap_or(200);
-    let target_exp = target_exploitability.unwrap_or(0.01);
 
     // Snapshot config and filtered weights under their locks.
     let config = state.config.read().clone();
+    let target_exp = target_exploitability.unwrap_or(config.target_exploitability);
     let filtered_oop = state.filtered_oop_weights.read().clone();
     let filtered_ip = state.filtered_ip_weights.read().clone();
 
@@ -1035,6 +1037,7 @@ mod tests {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "33%".to_string(),
             ip_raise_sizes: "a".to_string(),
+            target_exploitability: 3.0,
         };
         *state.config.write() = config;
 
@@ -1091,6 +1094,7 @@ mod tests {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "33%".to_string(),
             ip_raise_sizes: "a".to_string(),
+            target_exploitability: 3.0,
         };
         *state.config.write() = config;
 
@@ -1142,6 +1146,7 @@ mod tests {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "33%".to_string(),
             ip_raise_sizes: "a".to_string(),
+            target_exploitability: 3.0,
         };
         postflop_set_config_core(&state, config).unwrap();
 
