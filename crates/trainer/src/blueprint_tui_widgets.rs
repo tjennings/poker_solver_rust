@@ -165,6 +165,21 @@ impl Widget for &HandGridWidget<'_> {
                 } else {
                     render_color_bar(buf, x, y, cell_w, &cell.actions);
                 }
+
+                // Blue underline on cells that changed since last snapshot.
+                if let Some(ref prev) = self.state.prev_cells {
+                    if !cell.is_converged(&prev[r as usize][c as usize], 0.01) {
+                        for dx in 0..cell_w {
+                            let buf_cell = &mut buf[(x + dx, y)];
+                            buf_cell.set_style(
+                                buf_cell
+                                    .style()
+                                    .underlined()
+                                    .underline_color(Color::Rgb(60, 120, 255)),
+                            );
+                        }
+                    }
+                }
             }
         }
 
