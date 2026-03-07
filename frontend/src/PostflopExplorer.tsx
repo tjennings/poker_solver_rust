@@ -293,12 +293,52 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
           />
         )}
 
-        {/* Next street card (turn/river) */}
+        {/* Turn card */}
+        {boardCards.length >= 4 && (() => {
+          const card = boardCards[3];
+          const rank = card[0]?.toUpperCase();
+          const suit = card[1]?.toLowerCase();
+          return (
+            <div className="street-block">
+              <div className="street-block-header">
+                <span className="street-name">TURN</span>
+              </div>
+              <div className="street-cards">
+                <div className="street-card" style={{ backgroundColor: SUIT_COLORS[suit] || '#333' }}>
+                  <span className="card-rank">{rank}</span>
+                  <span className="card-suit">{SUIT_SYMBOLS[suit] || '?'}</span>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* River card */}
+        {boardCards.length >= 5 && (() => {
+          const card = boardCards[4];
+          const rank = card[0]?.toUpperCase();
+          const suit = card[1]?.toLowerCase();
+          return (
+            <div className="street-block">
+              <div className="street-block-header">
+                <span className="street-name">RIVER</span>
+              </div>
+              <div className="street-cards">
+                <div className="street-card" style={{ backgroundColor: SUIT_COLORS[suit] || '#333' }}>
+                  <span className="card-rank">{rank}</span>
+                  <span className="card-suit">{SUIT_SYMBOLS[suit] || '?'}</span>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* Next street card picker */}
         {awaitingCard && (
           <div className="street-block pending" style={{ cursor: 'pointer' }}
             onClick={() => setShowNextCardPicker(true)}>
             <div className="street-block-header">
-              <span className="street-name">{boardCards.length === 3 ? 'TURN' : 'RIVER'}</span>
+              <span className="street-name">{boardCards.length === 3 ? 'TURN' : boardCards.length === 4 ? 'RIVER' : '?'}</span>
             </div>
             <div className="street-cards">
               <div className="street-card empty"><span>?</span></div>
