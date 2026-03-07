@@ -268,6 +268,9 @@ impl BlueprintTrainer {
 
         self.snapshot_count = snapshot_num + 1;
 
+        // Seed the strategy-delta baseline so the first check after resume
+        // compares against the loaded state instead of producing zero.
+        self.prev_strategy_sums = Some(self.storage.snapshot_strategy_sums());
         eprintln!(
             "Resumed from {}: {} iterations, mean_pos_regret={:.2}",
             snapshot_dir.display(),
