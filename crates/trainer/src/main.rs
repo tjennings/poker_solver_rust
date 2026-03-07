@@ -583,8 +583,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &bp_config.clustering,
                 &output,
                 |street, p| {
-                    if (p * 100.0) as u32 % 10 == 0 {
-                        eprint!("\r  [{street}] {:.0}%", p * 100.0);
+                    let pct = (p * 100.0) as u32;
+                    if p < 0.8 {
+                        eprint!("\r  [{street}] features {pct}%");
+                    } else {
+                        eprint!("\r  [{street}] k-means {pct}% ");
                     }
                     if p >= 1.0 {
                         eprintln!(" done");

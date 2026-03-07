@@ -30,7 +30,7 @@ use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
 use crate::showdown_equity::compute_equity;
 
 use super::bucket_file::{BucketFile, BucketFileHeader};
-use super::clustering::{kmeans_1d, kmeans_emd};
+use super::clustering::{kmeans_1d, kmeans_emd_with_progress};
 use super::config::ClusteringConfig;
 use super::Street;
 
@@ -208,7 +208,7 @@ pub fn cluster_turn_with_boards(
                 .collect();
 
             #[allow(clippy::cast_precision_loss)]
-            progress((board_idx + 1) as f64 / num_boards as f64);
+            progress((board_idx + 1) as f64 / num_boards as f64 * 0.8);
 
             features
         })
@@ -227,12 +227,16 @@ pub fn cluster_turn_with_boards(
         }
     }
 
-    // Cluster with k-means EMD.
-    let cluster_labels = kmeans_emd(
+    // Cluster with k-means EMD (parallel assignment step + progress).
+    let cluster_labels = kmeans_emd_with_progress(
         &all_features,
         bucket_count as usize,
         kmeans_iterations,
         seed,
+        |iter, max_iter| {
+            #[allow(clippy::cast_precision_loss)]
+            progress(0.8 + 0.2 * iter as f64 / max_iter as f64);
+        },
     );
 
     // Map cluster labels back to the flat (board * 1326) bucket array.
@@ -374,7 +378,7 @@ pub fn cluster_flop_with_boards(
                 .collect();
 
             #[allow(clippy::cast_precision_loss)]
-            progress((board_idx + 1) as f64 / num_boards as f64);
+            progress((board_idx + 1) as f64 / num_boards as f64 * 0.8);
 
             features
         })
@@ -393,12 +397,16 @@ pub fn cluster_flop_with_boards(
         }
     }
 
-    // Cluster with k-means EMD.
-    let cluster_labels = kmeans_emd(
+    // Cluster with k-means EMD (parallel assignment step + progress).
+    let cluster_labels = kmeans_emd_with_progress(
         &all_features,
         bucket_count as usize,
         kmeans_iterations,
         seed,
+        |iter, max_iter| {
+            #[allow(clippy::cast_precision_loss)]
+            progress(0.8 + 0.2 * iter as f64 / max_iter as f64);
+        },
     );
 
     // Map cluster labels back to the flat (board * 1326) bucket array.

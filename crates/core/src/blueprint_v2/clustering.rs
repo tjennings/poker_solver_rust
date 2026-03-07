@@ -7,6 +7,7 @@
 
 use rand::prelude::*;
 use rand::rngs::StdRng;
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Earth Mover's Distance
@@ -51,6 +52,18 @@ pub fn emd(p: &[f64], q: &[f64]) -> f64 {
 #[allow(clippy::cast_possible_truncation)] // k and n fit in u16 for any realistic clustering
 #[must_use]
 pub fn kmeans_emd(data: &[Vec<f64>], k: usize, max_iterations: u32, seed: u64) -> Vec<u16> {
+    kmeans_emd_with_progress(data, k, max_iterations, seed, |_, _| {})
+}
+
+/// Like [`kmeans_emd`] but with a progress callback `(iteration, max_iterations)`.
+#[allow(clippy::cast_possible_truncation)]
+pub fn kmeans_emd_with_progress(
+    data: &[Vec<f64>],
+    k: usize,
+    max_iterations: u32,
+    seed: u64,
+    progress: impl Fn(u32, u32),
+) -> Vec<u16> {
     assert!(!data.is_empty(), "data must not be empty");
     assert!(k > 0, "k must be positive");
 
@@ -69,23 +82,26 @@ pub fn kmeans_emd(data: &[Vec<f64>], k: usize, max_iterations: u32, seed: u64) -
     let mut assignments = vec![0_u16; n];
     let mut counts = vec![0_usize; k];
 
-    for _iter in 0..max_iterations {
-        // -- Assignment step -----------------------------------------------
-        let mut changed = false;
-        for (i, point) in data.iter().enumerate() {
-            let nearest = nearest_centroid(point, &centroids);
-            if assignments[i] != nearest {
-                assignments[i] = nearest;
-                changed = true;
-            }
-        }
+    for iter in 0..max_iterations {
+        progress(iter, max_iterations);
+
+        // -- Assignment step (parallel) ------------------------------------
+        let new_assignments: Vec<u16> = data
+            .par_iter()
+            .map(|point| nearest_centroid(point, &centroids))
+            .collect();
+
+        let changed = assignments
+            .iter()
+            .zip(new_assignments.iter())
+            .any(|(old, new)| old != new);
+        assignments = new_assignments;
 
         if !changed {
             break;
         }
 
-        // -- Update step ---------------------------------------------------
-        // Zero-out centroids and counts.
+        // -- Update step (sequential — accumulates into centroids) ---------
         for c in &mut centroids {
             c.fill(0.0);
         }
@@ -102,13 +118,11 @@ pub fn kmeans_emd(data: &[Vec<f64>], k: usize, max_iterations: u32, seed: u64) -
         // Average and handle empty clusters.
         for ci in 0..k {
             if counts[ci] == 0 {
-                // Reinitialise from the point with the largest EMD to its
-                // current centroid.
                 let farthest = farthest_point(data, &assignments, &centroids);
                 centroids[ci].clone_from(&data[farthest]);
                 assignments[farthest] = ci as u16;
             } else {
-                #[allow(clippy::cast_precision_loss)] // count fits in f64 mantissa
+                #[allow(clippy::cast_precision_loss)]
                 let inv = 1.0 / counts[ci] as f64;
                 for v in &mut centroids[ci] {
                     *v *= inv;
@@ -117,10 +131,12 @@ pub fn kmeans_emd(data: &[Vec<f64>], k: usize, max_iterations: u32, seed: u64) -
         }
     }
 
-    // Final assignment pass to ensure consistency after last update.
-    for (i, point) in data.iter().enumerate() {
-        assignments[i] = nearest_centroid(point, &centroids);
-    }
+    // Final assignment pass (parallel).
+    data.par_iter()
+        .zip(assignments.par_iter_mut())
+        .for_each(|(point, assign)| {
+            *assign = nearest_centroid(point, &centroids);
+        });
 
     assignments
 }
