@@ -1,9 +1,11 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { invoke } from './invoke';
 import {
+  ActionInfo,
   PostflopConfig,
   PostflopConfigSummary,
   PostflopActionInfo,
+  PostflopMatrixCell,
   PostflopStrategyMatrix,
   PostflopProgress,
 } from './types';
@@ -11,6 +13,20 @@ import {
   getActionColor,
   formatActionLabel,
 } from './matrix-utils';
+
+/** Convert PostflopActionInfo → ActionInfo so shared color/label utils work. */
+function toActionInfo(a: PostflopActionInfo): ActionInfo {
+  return {
+    id: String(a.index),
+    label: a.label,
+    action_type: a.action_type,
+    size_key: a.amount != null ? String(a.amount) : null,
+  };
+}
+
+function toActionInfos(actions: PostflopActionInfo[]): ActionInfo[] {
+  return actions.map(toActionInfo);
+}
 
 interface PostflopExplorerProps {
   onBack: () => void;
@@ -33,11 +49,12 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   const [boardInput, setBoardInput] = useState('');
   const [error, setError] = useState<string | null>(null);
 
-  // Placeholders for Tasks 10-11
-  const [matrix, _setMatrix] = useState<PostflopStrategyMatrix | null>(null);
-  const [_solving, _setSolving] = useState(false);
-  const [_progress, _setProgress] = useState<PostflopProgress | null>(null);
+  // Solve state
+  const [matrix, setMatrix] = useState<PostflopStrategyMatrix | null>(null);
+  const [solving, setSolving] = useState(false);
+  const [progress, setProgress] = useState<PostflopProgress | null>(null);
   const [actionHistory, _setActionHistory] = useState<{index: number; info: PostflopActionInfo}[]>([]);
+  const pollRef = useRef<number | null>(null);
 
   useEffect(() => {
     invoke<PostflopConfigSummary>('postflop_set_config', { config })
@@ -56,6 +73,50 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       setConfigError(String(e));
     }
   }, []);
+
+  const handleSolve = useCallback(async () => {
+    const cards = boardInput.trim().split(/\s+/);
+    if (cards.length < 3 || cards.length > 5) {
+      setError('Enter 3-5 cards (e.g. Ah Kd 7c)');
+      return;
+    }
+
+    setError(null);
+    setSolving(true);
+    _setActionHistory([]);
+    setMatrix(null);
+    setProgress(null);
+
+    try {
+      await invoke('postflop_solve_street', { board: cards });
+    } catch (e) {
+      setError(String(e));
+      setSolving(false);
+      return;
+    }
+
+    const poll = async () => {
+      try {
+        const p = await invoke<PostflopProgress>('postflop_get_progress', {});
+        setProgress(p);
+        if (p.matrix) setMatrix(p.matrix);
+        if (p.is_complete) {
+          setSolving(false);
+          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+        }
+      } catch (e) {
+        setError(String(e));
+        setSolving(false);
+        if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      }
+    };
+
+    poll(); // immediate first poll
+    pollRef.current = window.setInterval(poll, 2000);
+  }, [boardInput]);
+
+  // Cleanup polling on unmount
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
   return (
     <div className="explorer-root">
@@ -90,22 +151,74 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
             placeholder="Ah Kd 7c"
             value={boardInput}
             onChange={(e) => setBoardInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleSolve(); }}
             className="postflop-card-input"
+            disabled={solving}
           />
         </div>
 
         {/* Action history blocks (Task 11) */}
         {actionHistory.map((item, i) => (
           <div key={i} className="action-block" style={{
-            borderLeft: `3px solid ${getActionColor(item.info as any, (matrix?.actions ?? []) as any)}`,
+            borderLeft: `3px solid ${getActionColor(toActionInfo(item.info), toActionInfos(matrix?.actions ?? []))}`,
           }}>
-            <span style={{ fontSize: '0.85em' }}>{formatActionLabel(item.info as any)}</span>
+            <span style={{ fontSize: '0.85em' }}>{formatActionLabel(toActionInfo(item.info))}</span>
           </div>
         ))}
       </div>
 
-      {/* Matrix placeholder (Task 10) */}
-      {matrix && <div>Matrix goes here</div>}
+      {/* Progress bar */}
+      {solving && progress && (
+        <div className="progress-bar-container">
+          <div className="progress-bar" style={{
+            width: `${(progress.iteration / Math.max(progress.max_iterations, 1)) * 100}%`,
+          }} />
+          <span className="progress-text">
+            {progress.iteration}/{progress.max_iterations} — exploit: {progress.exploitability.toExponential(2)}
+          </span>
+        </div>
+      )}
+
+      {/* Player indicator */}
+      {matrix && (
+        <div style={{ fontSize: '0.85em', opacity: 0.6, padding: '4px 12px' }}>
+          {matrix.player === 0 ? 'OOP' : 'IP'} to act — Board: {matrix.board.join(' ')}
+        </div>
+      )}
+
+      {/* Strategy matrix */}
+      {matrix && (
+        <div className="matrix-container">
+          <div className="matrix-with-detail">
+            <div className="hand-matrix">
+              {matrix.cells.map((row, rowIdx) => (
+                <div key={rowIdx} className="matrix-row">
+                  {row.map((cell, colIdx) => (
+                    <PostflopCell
+                      key={colIdx}
+                      cell={cell}
+                      actions={matrix.actions}
+                    />
+                  ))}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Action legend */}
+          <div className="action-buttons">
+            {matrix.actions.map((action) => (
+              <div
+                key={action.index}
+                className="action-button"
+                style={{ borderColor: getActionColor(toActionInfo(action), toActionInfos(matrix.actions)) }}
+              >
+                {formatActionLabel(toActionInfo(action))}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Config Modal */}
       {showConfigModal && (
@@ -187,6 +300,51 @@ function ConfigModal({ config, error, onSubmit, onClose }: {
           <button className="modal-primary" onClick={() => onSubmit(draft)}>Apply</button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function PostflopCell({ cell, actions }: {
+  cell: PostflopMatrixCell;
+  actions: PostflopActionInfo[];
+}) {
+  const isUnreachable = cell.combo_count === 0;
+  const actionInfos = useMemo(() => toActionInfos(actions), [actions]);
+
+  const gradientStops = useMemo(() => {
+    if (isUnreachable || cell.probabilities.length === 0) {
+      return 'rgba(30, 41, 59, 1)';
+    }
+
+    const stops: string[] = [];
+    let position = 0;
+
+    // Build gradient from last action to first (aggressive on left)
+    for (let idx = cell.probabilities.length - 1; idx >= 0; idx--) {
+      const prob = cell.probabilities[idx];
+      if (prob <= 0) continue;
+
+      const color = getActionColor(actionInfos[idx], actionInfos);
+      const width = prob * 100;
+      stops.push(`${color} ${position}%`);
+      stops.push(`${color} ${position + width}%`);
+      position += width;
+    }
+
+    if (stops.length === 0) return 'rgba(30, 41, 59, 1)';
+    return `linear-gradient(to right, ${stops.join(', ')})`;
+  }, [cell.probabilities, actionInfos, isUnreachable]);
+
+  return (
+    <div className={`matrix-cell ${isUnreachable ? 'unreachable' : ''}`}>
+      <div
+        className="cell-bar"
+        style={{
+          background: isUnreachable ? undefined : gradientStops,
+          height: '100%',
+        }}
+      />
+      <span className="cell-label">{cell.hand}</span>
     </div>
   );
 }
