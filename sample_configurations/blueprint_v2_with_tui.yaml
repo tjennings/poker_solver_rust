@@ -10,11 +10,11 @@ clustering:
   preflop:
     buckets: 169
   flop:
-    buckets: 200
+    buckets: 100
   turn:
-    buckets: 200
+    buckets: 100
   river:
-    buckets: 200
+    buckets: 100
 
 action_abstraction:
   preflop:
@@ -36,10 +36,10 @@ training:
   time_limit_minutes: 720
   lcfr_warmup_minutes: 200
   prune_after_minutes: 200
-  batch_size: 200
-  # target_strategy_delta: 0.001  # stop when strategy stabilises
+  batch_size: 600
 
 snapshots:
+  resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
   output_dir: "snapshots/"
@@ -47,7 +47,7 @@ snapshots:
 
 tui:
   enabled: true
-  refresh_rate_ms: 250
+  refresh_rate_ms: 500
   telemetry:
     exploitability_interval_minutes: 5
     strategy_delta_interval_seconds: 30
