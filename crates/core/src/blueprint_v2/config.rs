@@ -97,6 +97,9 @@ pub struct TrainingConfig {
     /// Minutes between progress log lines.
     #[serde(default = "default_print_every")]
     pub print_every_minutes: u64,
+    /// Number of iterations per parallel batch.
+    #[serde(default = "default_batch_size")]
+    pub batch_size: u64,
 }
 
 /// Snapshot (checkpoint) output settings.
@@ -142,6 +145,10 @@ const fn default_prune_explore() -> f64 {
 
 const fn default_print_every() -> u64 {
     10
+}
+
+const fn default_batch_size() -> u64 {
+    200
 }
 
 #[cfg(test)]
@@ -233,6 +240,7 @@ snapshots:
         assert_eq!(cfg.training.prune_threshold, default_prune_threshold());
         assert!((cfg.training.prune_explore_pct - default_prune_explore()).abs() < f64::EPSILON);
         assert_eq!(cfg.training.print_every_minutes, default_print_every());
+        assert_eq!(cfg.training.batch_size, default_batch_size());
 
         // Snapshots
         assert_eq!(cfg.snapshots.warmup_minutes, 60);
@@ -275,6 +283,7 @@ snapshots:
                 prune_threshold: -310_000_000,
                 prune_explore_pct: 0.05,
                 print_every_minutes: 10,
+                batch_size: 200,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 120,

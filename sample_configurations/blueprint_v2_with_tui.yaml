@@ -36,6 +36,7 @@ training:
   time_limit_minutes: 720
   lcfr_warmup_minutes: 200
   prune_after_minutes: 200
+  batch_size: 200
 
 snapshots:
   warmup_minutes: 60
