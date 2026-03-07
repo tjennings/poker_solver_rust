@@ -1,8 +1,9 @@
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
+
+use crate::blueprint_tui_widgets::CellStrategy;
 
 /// Maximum number of monitored scenarios.
 pub const MAX_SCENARIOS: usize = 16;
@@ -23,12 +24,10 @@ pub struct RandomScenarioState {
 /// thread.
 ///
 /// Hot-path counters use lock-free atomics. Infrequent bulk data (strategy
-/// snapshots, exploitability history) sit behind `Mutex` locks that the TUI
+/// snapshots, grids, delta histories) sit behind `Mutex` locks that the TUI
 /// samples at its refresh interval.
-#[derive(Debug)]
 pub struct BlueprintTuiMetrics {
     // --- lock-free atomics (hot path) ---
-    /// Shared with the training thread via `Arc` cloning.
     pub iterations: Arc<AtomicU64>,
     pub target_iterations: Option<u64>,
     pub start_time: Instant,
@@ -37,14 +36,19 @@ pub struct BlueprintTuiMetrics {
     pub paused: Arc<AtomicBool>,
     pub quit_requested: Arc<AtomicBool>,
     pub snapshot_trigger: Arc<AtomicBool>,
-    exploitability_trigger: AtomicBool,
 
     // --- infrequent bulk data (behind Mutex) ---
     pub strategy_snapshots: Mutex<Vec<Vec<f64>>>,
     pub prev_strategy_snapshots: Mutex<Vec<Vec<f64>>>,
     pub strategy_deltas: Mutex<Vec<f64>>,
-    pub exploitability_history: Mutex<VecDeque<(f64, f64)>>,
     pub random_scenario: Mutex<Option<RandomScenarioState>>,
+
+    // --- strategy grids for TUI scenario refresh ---
+    pub strategy_grids: Mutex<Vec<Option<[[CellStrategy; 13]; 13]>>>,
+
+    // --- sparkline history ---
+    pub strategy_delta_history: Mutex<Vec<f64>>,
+    pub leaf_movement_history: Mutex<Vec<f64>>,
 }
 
 impl BlueprintTuiMetrics {
@@ -52,10 +56,12 @@ impl BlueprintTuiMetrics {
         let mut snapshots = Vec::with_capacity(MAX_SCENARIOS);
         let mut prev_snapshots = Vec::with_capacity(MAX_SCENARIOS);
         let mut deltas = Vec::with_capacity(MAX_SCENARIOS);
+        let mut grids = Vec::with_capacity(MAX_SCENARIOS);
         for _ in 0..MAX_SCENARIOS {
             snapshots.push(Vec::new());
             prev_snapshots.push(Vec::new());
             deltas.push(0.0);
+            grids.push(None);
         }
 
         Self {
@@ -66,13 +72,15 @@ impl BlueprintTuiMetrics {
             paused: Arc::new(AtomicBool::new(false)),
             quit_requested: Arc::new(AtomicBool::new(false)),
             snapshot_trigger: Arc::new(AtomicBool::new(false)),
-            exploitability_trigger: AtomicBool::new(false),
 
             strategy_snapshots: Mutex::new(snapshots),
             prev_strategy_snapshots: Mutex::new(prev_snapshots),
             strategy_deltas: Mutex::new(deltas),
-            exploitability_history: Mutex::new(VecDeque::new()),
             random_scenario: Mutex::new(None),
+
+            strategy_grids: Mutex::new(grids),
+            strategy_delta_history: Mutex::new(Vec::new()),
+            leaf_movement_history: Mutex::new(Vec::new()),
         }
     }
 
@@ -89,21 +97,14 @@ impl BlueprintTuiMetrics {
     }
 
     /// Consume the snapshot trigger, returning `true` if it was set.
+    #[allow(dead_code)]
     pub fn take_snapshot_trigger(&self) -> bool {
         self.snapshot_trigger.swap(false, Ordering::Relaxed)
     }
 
-    pub fn request_exploitability(&self) {
-        self.exploitability_trigger.store(true, Ordering::Relaxed);
-    }
-
-    /// Consume the exploitability trigger, returning `true` if it was set.
-    pub fn take_exploitability_trigger(&self) -> bool {
-        self.exploitability_trigger.swap(false, Ordering::Relaxed)
-    }
-
     /// Update the strategy snapshot for a scenario, computing the L1 delta
     /// against the previous snapshot before overwriting.
+    #[allow(dead_code)]
     pub fn update_scenario_strategy(&self, scenario_idx: usize, probs: Vec<f64>) {
         if scenario_idx >= MAX_SCENARIOS {
             return;
@@ -126,16 +127,29 @@ impl BlueprintTuiMetrics {
         };
         deltas[scenario_idx] = delta;
 
-        // Rotate current → previous, install new.
+        // Rotate current -> previous, install new.
         prev[scenario_idx] = std::mem::take(&mut snaps[scenario_idx]);
         snaps[scenario_idx] = probs;
     }
 
-    /// Push an exploitability measurement into the history ring.
-    pub fn push_exploitability(&self, mbb: f64) {
-        let elapsed = self.elapsed_secs();
-        let mut hist = self.exploitability_history.lock().unwrap();
-        hist.push_back((elapsed, mbb));
+    /// Store a refreshed strategy grid for a scenario.
+    pub fn update_scenario_grid(&self, idx: usize, grid: [[CellStrategy; 13]; 13]) {
+        let mut grids = self.strategy_grids.lock().unwrap_or_else(|e| e.into_inner());
+        if idx < grids.len() {
+            grids[idx] = Some(grid);
+        }
+    }
+
+    /// Push a strategy delta sample into the sparkline history.
+    pub fn push_strategy_delta(&self, delta: f64) {
+        let mut hist = self.strategy_delta_history.lock().unwrap_or_else(|e| e.into_inner());
+        hist.push(delta);
+    }
+
+    /// Push a leaf movement sample into the sparkline history.
+    pub fn push_leaf_movement(&self, pct: f64) {
+        let mut hist = self.leaf_movement_history.lock().unwrap_or_else(|e| e.into_inner());
+        hist.push(pct);
     }
 
     /// Seconds elapsed since this metrics instance was created.
@@ -157,7 +171,6 @@ mod tests {
         assert!(!m.paused.load(Ordering::Relaxed));
         assert!(!m.quit_requested.load(Ordering::Relaxed));
         assert!(!m.take_snapshot_trigger());
-        assert!(!m.take_exploitability_trigger());
         assert_eq!(m.target_iterations, Some(1000));
     }
 
@@ -165,14 +178,14 @@ mod tests {
     fn strategy_snapshot_lifecycle() {
         let m = BlueprintTuiMetrics::new(None);
 
-        // First update — no previous, delta should be 0.
+        // First update -- no previous, delta should be 0.
         m.update_scenario_strategy(0, vec![0.5, 0.3, 0.2]);
         {
             let snaps = m.strategy_snapshots.lock().unwrap();
             assert_eq!(snaps[0], vec![0.5, 0.3, 0.2]);
         }
 
-        // Second update — delta computed against previous.
+        // Second update -- delta computed against previous.
         m.update_scenario_strategy(0, vec![0.4, 0.4, 0.2]);
         {
             let snaps = m.strategy_snapshots.lock().unwrap();
@@ -185,18 +198,6 @@ mod tests {
             // |0.5-0.4| + |0.3-0.4| + |0.2-0.2| = 0.1 + 0.1 + 0.0 = 0.2
             assert!((deltas[0] - 0.2).abs() < 1e-9);
         }
-    }
-
-    #[timed_test(10)]
-    fn exploitability_history_push() {
-        let m = BlueprintTuiMetrics::new(None);
-        m.push_exploitability(150.0);
-        m.push_exploitability(120.0);
-
-        let hist = m.exploitability_history.lock().unwrap();
-        assert_eq!(hist.len(), 2);
-        assert_eq!(hist[0].1, 150.0);
-        assert_eq!(hist[1].1, 120.0);
     }
 
     #[timed_test(10)]
@@ -222,12 +223,38 @@ mod tests {
         m.request_snapshot();
         assert!(m.take_snapshot_trigger());
 
-        // Consumed — second take returns false.
+        // Consumed -- second take returns false.
         assert!(!m.take_snapshot_trigger());
+    }
 
-        // Same for exploitability.
-        m.request_exploitability();
-        assert!(m.take_exploitability_trigger());
-        assert!(!m.take_exploitability_trigger());
+    #[timed_test(10)]
+    fn strategy_delta_history() {
+        let m = BlueprintTuiMetrics::new(None);
+        m.push_strategy_delta(0.1);
+        m.push_strategy_delta(0.05);
+        let hist = m.strategy_delta_history.lock().unwrap();
+        assert_eq!(hist.len(), 2);
+        assert!((hist[0] - 0.1).abs() < 1e-9);
+        assert!((hist[1] - 0.05).abs() < 1e-9);
+    }
+
+    #[timed_test(10)]
+    fn leaf_movement_history() {
+        let m = BlueprintTuiMetrics::new(None);
+        m.push_leaf_movement(0.8);
+        m.push_leaf_movement(0.3);
+        let hist = m.leaf_movement_history.lock().unwrap();
+        assert_eq!(hist.len(), 2);
+        assert!((hist[0] - 0.8).abs() < 1e-9);
+    }
+
+    #[timed_test(10)]
+    fn scenario_grid_update() {
+        let m = BlueprintTuiMetrics::new(None);
+        let grid: [[CellStrategy; 13]; 13] =
+            std::array::from_fn(|_| std::array::from_fn(|_| CellStrategy::default()));
+        m.update_scenario_grid(0, grid);
+        let grids = m.strategy_grids.lock().unwrap();
+        assert!(grids[0].is_some());
     }
 }

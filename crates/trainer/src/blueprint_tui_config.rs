@@ -34,8 +34,6 @@ pub struct ScenarioConfig {
 /// Controls how often telemetry signals are sampled.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryConfig {
-    #[serde(default = "default_exploit_interval")]
-    pub exploitability_interval_minutes: u64,
     #[serde(default = "default_delta_interval")]
     pub strategy_delta_interval_seconds: u64,
     #[serde(default = "default_sparkline_window")]
@@ -45,7 +43,6 @@ pub struct TelemetryConfig {
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
-            exploitability_interval_minutes: default_exploit_interval(),
             strategy_delta_interval_seconds: default_delta_interval(),
             sparkline_window: default_sparkline_window(),
         }
@@ -105,9 +102,6 @@ impl Default for BlueprintTuiConfig {
 fn default_refresh_rate_ms() -> u64 {
     250
 }
-fn default_exploit_interval() -> u64 {
-    5
-}
 fn default_delta_interval() -> u64 {
     30
 }
@@ -151,7 +145,6 @@ tui:
   enabled: true
   refresh_rate_ms: 100
   telemetry:
-    exploitability_interval_minutes: 10
     strategy_delta_interval_seconds: 15
     sparkline_window: 120
   scenarios:
@@ -171,7 +164,6 @@ tui:
         let cfg = parse_tui_config(yaml);
         assert!(cfg.enabled);
         assert_eq!(cfg.refresh_rate_ms, 100);
-        assert_eq!(cfg.telemetry.exploitability_interval_minutes, 10);
         assert_eq!(cfg.telemetry.strategy_delta_interval_seconds, 15);
         assert_eq!(cfg.telemetry.sparkline_window, 120);
         assert_eq!(cfg.scenarios.len(), 2);
@@ -199,7 +191,6 @@ tui:
         let cfg = parse_tui_config("");
         assert!(!cfg.enabled);
         assert_eq!(cfg.refresh_rate_ms, 250);
-        assert_eq!(cfg.telemetry.exploitability_interval_minutes, 5);
         assert_eq!(cfg.telemetry.strategy_delta_interval_seconds, 30);
         assert_eq!(cfg.telemetry.sparkline_window, 60);
         assert!(cfg.scenarios.is_empty());

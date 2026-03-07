@@ -520,10 +520,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 let metrics_for_refresh = Arc::clone(&metrics);
                 trainer.on_strategy_refresh =
-                    Some(Box::new(move |scenario_idx, node_idx, storage| {
-                        let probs = storage.average_strategy(node_idx, 0);
-                        metrics_for_refresh.update_scenario_strategy(scenario_idx, probs);
+                    Some(Box::new(move |scenario_idx, node_idx, storage, tree| {
+                        let grid = blueprint_tui_scenarios::extract_strategy_grid(
+                            tree, storage, node_idx,
+                        );
+                        metrics_for_refresh.update_scenario_grid(scenario_idx, grid);
                     }));
+
+                let metrics_for_delta = Arc::clone(&metrics);
+                trainer.on_strategy_delta = Some(Box::new(move |delta| {
+                    metrics_for_delta.push_strategy_delta(delta);
+                }));
+
+                let metrics_for_leaf = Arc::clone(&metrics);
+                trainer.on_leaf_movement = Some(Box::new(move |pct| {
+                    metrics_for_leaf.push_leaf_movement(pct);
+                }));
+
+                trainer.tui_active = true;
 
                 let refresh_ms = tui_config.refresh_rate_ms;
                 let refresh = Duration::from_millis(refresh_ms);

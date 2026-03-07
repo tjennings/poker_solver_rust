@@ -95,14 +95,22 @@ pub struct BlueprintTrainer {
     /// One-shot trigger: the TUI sets this to request an immediate snapshot.
     pub snapshot_trigger: Arc<AtomicBool>,
 
+    // --- TUI integration ---
+    /// When `true`, suppress `eprintln!()` output that would corrupt the TUI.
+    pub tui_active: bool,
+
     // --- TUI strategy refresh ---
     /// Seconds between strategy refresh pushes to TUI.
     pub strategy_refresh_interval_secs: u64,
     /// Node indices for scenarios to refresh.
     pub scenario_node_indices: Vec<u32>,
     /// Callback to push strategy data to TUI metrics.
-    /// Args: (scenario_index, node_idx, &BlueprintStorage)
-    pub on_strategy_refresh: Option<Box<dyn Fn(usize, u32, &BlueprintStorage) + Send>>,
+    /// Args: (scenario_index, node_idx, &BlueprintStorage, &GameTree)
+    pub on_strategy_refresh: Option<Box<dyn Fn(usize, u32, &BlueprintStorage, &GameTree) + Send>>,
+    /// Callback to push strategy delta values to TUI metrics.
+    pub on_strategy_delta: Option<Box<dyn Fn(f64) + Send>>,
+    /// Callback to push leaf movement fraction to TUI metrics.
+    pub on_leaf_movement: Option<Box<dyn Fn(f64) + Send>>,
     /// Last time (in seconds) a strategy refresh was performed.
     last_strategy_refresh_secs: u64,
 
@@ -111,6 +119,8 @@ pub struct BlueprintTrainer {
     prev_strategy_sums: Option<Vec<i64>>,
     /// Most recent strategy delta value.
     pub last_strategy_delta: f64,
+    /// Most recent fraction of info sets with max action delta > 0.20.
+    pub last_pct_moving: f64,
 }
 
 impl BlueprintTrainer {
@@ -170,12 +180,16 @@ impl BlueprintTrainer {
             paused: Arc::new(AtomicBool::new(false)),
             quit_requested: Arc::new(AtomicBool::new(false)),
             snapshot_trigger: Arc::new(AtomicBool::new(false)),
+            tui_active: false,
             strategy_refresh_interval_secs: 30,
             scenario_node_indices: Vec::new(),
             on_strategy_refresh: None,
+            on_strategy_delta: None,
+            on_leaf_movement: None,
             last_strategy_refresh_secs: 0,
             prev_strategy_sums: None,
             last_strategy_delta: f64::INFINITY,
+            last_pct_moving: 1.0,
         }
     }
 
@@ -353,7 +367,7 @@ impl BlueprintTrainer {
         {
             if let Some(ref callback) = self.on_strategy_refresh {
                 for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
-                    callback(i, node_idx, &self.storage);
+                    callback(i, node_idx, &self.storage, &self.tree);
                 }
             }
             self.last_strategy_refresh_secs = elapsed_secs;
@@ -386,13 +400,26 @@ impl BlueprintTrainer {
     /// Compute and store the strategy delta vs the previous snapshot.
     fn update_strategy_delta(&mut self) {
         if let Some(ref prev) = self.prev_strategy_sums {
-            self.last_strategy_delta = self.storage.strategy_delta(prev);
+            let (delta, pct_moving) = self.storage.strategy_delta(prev);
+            self.last_strategy_delta = delta;
+            self.last_pct_moving = pct_moving;
+            if let Some(ref cb) = self.on_strategy_delta {
+                cb(delta);
+            }
+            if let Some(ref cb) = self.on_leaf_movement {
+                cb(pct_moving);
+            }
         }
         self.prev_strategy_sums = Some(self.storage.snapshot_strategy_sums());
     }
 
     /// Log a one-line progress summary to stderr.
     fn print_metrics(&mut self) {
+        self.last_print_time = self.elapsed_minutes();
+        if self.tui_active {
+            return;
+        }
+
         let elapsed = self.start_time.elapsed();
         let secs = elapsed.as_secs_f64();
         let its_per_sec = if secs > 0.0 {
@@ -402,15 +429,14 @@ impl BlueprintTrainer {
         };
 
         eprintln!(
-            "[{:>6.1}m] iter={:<10} {:.0} it/s  mean_pos_regret={:.2}  δ={:.6}",
+            "[{:>6.1}m] iter={:<10} {:.0} it/s  mean_pos_regret={:.2}  δ={:.6}  moving={:.1}%",
             secs / 60.0,
             self.iterations,
             its_per_sec,
             self.mean_positive_regret(),
             self.last_strategy_delta,
+            self.last_pct_moving * 100.0,
         );
-
-        self.last_print_time = self.elapsed_minutes();
     }
 
     /// Mean of all strictly-positive regret entries.
@@ -463,7 +489,9 @@ impl BlueprintTrainer {
         self.snapshot_count += 1;
         self.last_snapshot_time = self.elapsed_minutes();
 
-        eprintln!("  Snapshot saved to {}", snapshot_dir.display());
+        if !self.tui_active {
+            eprintln!("  Snapshot saved to {}", snapshot_dir.display());
+        }
         Ok(())
     }
 }

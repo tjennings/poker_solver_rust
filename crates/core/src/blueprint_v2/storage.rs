@@ -211,14 +211,17 @@ impl BlueprintStorage {
     /// `prev_sums` must have the same length as `self.strategy_sums`.
     /// For each (node, bucket) group, normalises both old and new sums to
     /// probability distributions, then takes the max absolute difference
-    /// across actions. Returns the mean of these per-group max deltas.
+    /// across actions.
     ///
-    /// A value near 0 means the average strategy has stabilised.
+    /// Returns `(mean_delta, pct_moving)` where `mean_delta` is the mean of
+    /// per-group max deltas (near 0 = stabilised) and `pct_moving` is the
+    /// fraction of groups whose max delta exceeds 0.20.
     #[must_use]
-    pub fn strategy_delta(&self, prev_sums: &[i64]) -> f64 {
+    pub fn strategy_delta(&self, prev_sums: &[i64]) -> (f64, f64) {
         assert_eq!(prev_sums.len(), self.strategy_sums.len());
         let mut total_delta = 0.0_f64;
         let mut num_groups = 0_u64;
+        let mut moving_count = 0_u64;
 
         for nl in &self.layout {
             if nl.num_actions == 0 {
@@ -251,14 +254,20 @@ impl BlueprintStorage {
                     max_diff = max_diff.max((p - c).abs());
                 }
                 total_delta += max_diff;
+                if max_diff > 0.20 {
+                    moving_count += 1;
+                }
                 num_groups += 1;
             }
         }
 
         if num_groups > 0 {
-            total_delta / num_groups as f64
+            (
+                total_delta / num_groups as f64,
+                moving_count as f64 / num_groups as f64,
+            )
         } else {
-            0.0
+            (0.0, 0.0)
         }
     }
 
@@ -543,8 +552,9 @@ mod tests {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
         let snap = storage.snapshot_strategy_sums();
-        let delta = storage.strategy_delta(&snap);
+        let (delta, pct) = storage.strategy_delta(&snap);
         assert!((delta - 0.0).abs() < 1e-10, "identical snapshots → delta 0, got {delta}");
+        assert!((pct - 0.0).abs() < 1e-10, "identical snapshots → pct_moving 0, got {pct}");
     }
 
     #[test]
@@ -564,7 +574,7 @@ mod tests {
         // Now change one action to dominate.
         storage.add_strategy_sum(node_idx, 0, 0, 1000);
 
-        let delta = storage.strategy_delta(&snap);
+        let (delta, _pct) = storage.strategy_delta(&snap);
         assert!(delta > 0.0, "changed strategy should have delta > 0, got {delta}");
     }
 }

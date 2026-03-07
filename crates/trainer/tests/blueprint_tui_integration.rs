@@ -79,7 +79,7 @@ fn strategy_refresh_callback_fires() {
     let mut trainer = BlueprintTrainer::new(config);
     trainer.scenario_node_indices = vec![trainer.tree.root];
     trainer.strategy_refresh_interval_secs = 0; // fire every check
-    trainer.on_strategy_refresh = Some(Box::new(move |_, _, _| {
+    trainer.on_strategy_refresh = Some(Box::new(move |_, _, _, _| {
         cc.fetch_add(1, Ordering::Relaxed);
     }));
 

@@ -1,8 +1,9 @@
 //! Main TUI application for the Blueprint V2 training dashboard.
 //!
 //! Provides a split-panel layout: left side shows training telemetry
-//! (iterations, throughput sparkline, exploitability, strategy delta),
-//! right side shows tabbed 13x13 hand grids for monitored scenarios.
+//! (iterations, throughput sparkline, strategy delta sparkline, leaf
+//! movement sparkline), right side shows tabbed 13x13 hand grids for
+//! monitored scenarios.
 
 use std::io;
 use std::sync::atomic::Ordering;
@@ -38,11 +39,15 @@ pub struct BlueprintTuiApp {
     scenarios: Vec<ResolvedScenario>,
     active_tab: usize,
     telemetry_config: TelemetryConfig,
-    // Sparkline data
+    // Throughput sparkline data
     iter_per_sec_history: Vec<u64>,
     prev_iterations: u64,
     peak_iter_per_sec: u64,
     refresh_rate_hz: f64,
+    // Strategy delta sparkline data
+    delta_history: Vec<u64>,
+    // Leaf movement sparkline data
+    leaf_movement_history: Vec<u64>,
 }
 
 impl BlueprintTuiApp {
@@ -61,11 +66,16 @@ impl BlueprintTuiApp {
             prev_iterations: 0,
             peak_iter_per_sec: 0,
             refresh_rate_hz,
+            delta_history: Vec::with_capacity(SPARKLINE_HISTORY),
+            leaf_movement_history: Vec::with_capacity(SPARKLINE_HISTORY),
         }
     }
 
-    /// Sample iteration counter, compute delta, update sparkline history.
+    /// Sample iteration counter, compute delta, update sparkline histories.
     pub fn tick(&mut self) {
+        let sparkline_max = self.telemetry_config.sparkline_window.min(SPARKLINE_HISTORY);
+
+        // Throughput
         let current = self.metrics.iterations.load(Ordering::Relaxed);
         let delta = current.saturating_sub(self.prev_iterations);
         let ips = if self.refresh_rate_hz > 0.0 {
@@ -73,15 +83,64 @@ impl BlueprintTuiApp {
         } else {
             delta
         };
-        push_bounded(
-            &mut self.iter_per_sec_history,
-            ips,
-            self.telemetry_config.sparkline_window.min(SPARKLINE_HISTORY),
-        );
+        push_bounded(&mut self.iter_per_sec_history, ips, sparkline_max);
         if ips > self.peak_iter_per_sec {
             self.peak_iter_per_sec = ips;
         }
         self.prev_iterations = current;
+
+        // Strategy delta sparkline: read all new values
+        {
+            let mut hist = self
+                .metrics
+                .strategy_delta_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for &v in hist.iter() {
+                push_bounded(
+                    &mut self.delta_history,
+                    (v * 10000.0) as u64,
+                    sparkline_max,
+                );
+            }
+            hist.clear();
+        }
+
+        // Leaf movement sparkline: read all new values
+        {
+            let mut hist = self
+                .metrics
+                .leaf_movement_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for &v in hist.iter() {
+                push_bounded(
+                    &mut self.leaf_movement_history,
+                    (v * 100.0) as u64,
+                    sparkline_max,
+                );
+            }
+            hist.clear();
+        }
+
+        // Strategy grid refresh from trainer
+        {
+            let mut grids = self
+                .metrics
+                .strategy_grids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (i, grid_opt) in grids.iter_mut().enumerate() {
+                if let Some(new_grid) = grid_opt.take()
+                    && i < self.scenarios.len()
+                {
+                    let old = std::mem::replace(&mut self.scenarios[i].grid.cells, new_grid);
+                    self.scenarios[i].grid.prev_cells = Some(old);
+                    self.scenarios[i].grid.iteration_at_snapshot =
+                        self.metrics.iterations.load(Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     pub fn next_tab(&mut self) {
@@ -118,8 +177,8 @@ impl BlueprintTuiApp {
                 Constraint::Length(1), // Progress gauge
                 Constraint::Length(1), // Runtime + ETA
                 Constraint::Length(3), // Throughput sparkline
-                Constraint::Length(2), // Exploitability placeholder
-                Constraint::Length(1), // Strategy delta
+                Constraint::Length(3), // Strategy delta sparkline
+                Constraint::Length(3), // Leaf movement sparkline
                 Constraint::Min(0),   // Spacer
                 Constraint::Length(1), // Hotkeys footer
             ])
@@ -129,8 +188,8 @@ impl BlueprintTuiApp {
         self.render_progress_gauge(frame, chunks[1]);
         self.render_runtime(frame, chunks[2]);
         self.render_sparkline(frame, chunks[3]);
-        self.render_exploitability(frame, chunks[4]);
-        self.render_strategy_delta(frame, chunks[5]);
+        self.render_strategy_delta(frame, chunks[4]);
+        self.render_leaf_movement(frame, chunks[5]);
         self.render_hotkeys(frame, chunks[7]);
     }
 
@@ -203,35 +262,36 @@ impl BlueprintTuiApp {
         frame.render_widget(sparkline, area);
     }
 
-    fn render_exploitability(&self, frame: &mut Frame, area: Rect) {
-        let hist = self.metrics.exploitability_history.lock().unwrap_or_else(|e| e.into_inner());
-        let text = if let Some(&(_, mbb)) = hist.back() {
-            format!("Exploitability: {mbb:.1} mBB/h  ({} samples)", hist.len())
-        } else {
-            "Exploitability: -- (press [e] to trigger)".to_string()
-        };
-        frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::Magenta)),
-            area,
-        );
+    fn render_strategy_delta(&self, frame: &mut Frame, area: Rect) {
+        let latest = self
+            .delta_history
+            .last()
+            .map(|&v| v as f64 / 10000.0)
+            .unwrap_or(0.0);
+        let title = format!("Strategy delta: {latest:.6}");
+        let sparkline = Sparkline::default()
+            .block(Block::default().title(title).borders(Borders::NONE))
+            .data(&self.delta_history)
+            .style(Style::default().fg(Color::Yellow));
+        frame.render_widget(sparkline, area);
     }
 
-    fn render_strategy_delta(&self, frame: &mut Frame, area: Rect) {
-        let deltas = self.metrics.strategy_deltas.lock().unwrap_or_else(|e| e.into_inner());
-        let max_delta = deltas
-            .iter()
-            .take(self.scenarios.len())
-            .cloned()
-            .fold(0.0_f64, f64::max);
-        let text = format!("Strategy delta (L1): {max_delta:.4}");
-        frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::Yellow)),
-            area,
-        );
+    fn render_leaf_movement(&self, frame: &mut Frame, area: Rect) {
+        let latest = self
+            .leaf_movement_history
+            .last()
+            .map(|&v| v as f64)
+            .unwrap_or(0.0);
+        let title = format!("Leaves moving (>20%): {latest:.1}%");
+        let sparkline = Sparkline::default()
+            .block(Block::default().title(title).borders(Borders::NONE))
+            .data(&self.leaf_movement_history)
+            .style(Style::default().fg(Color::Green));
+        frame.render_widget(sparkline, area);
     }
 
     fn render_hotkeys(&self, frame: &mut Frame, area: Rect) {
-        let text = "[p]ause [s]napshot [e]xploitability [?]help [q]uit";
+        let text = "[p]ause [s]napshot [?]help [q]uit";
         frame.render_widget(
             Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
             area,
@@ -327,7 +387,6 @@ fn run_tui_inner(
                 KeyCode::Left | KeyCode::BackTab => app.prev_tab(),
                 KeyCode::Char('p') => metrics.toggle_pause(),
                 KeyCode::Char('s') => metrics.request_snapshot(),
-                KeyCode::Char('e') => metrics.request_exploitability(),
                 _ => {}
             }
         }
@@ -346,7 +405,7 @@ fn run_tui_inner(
     Ok(())
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────
+// -- Helpers --
 
 fn push_bounded(buf: &mut Vec<u64>, value: u64, max_len: usize) {
     if buf.len() >= max_len {
@@ -392,7 +451,7 @@ fn format_eta(current: u64, target: u64, elapsed_secs: f64) -> String {
     format_duration(remaining)
 }
 
-// ── Tests ────────────────────────────────────────────────────────────
+// -- Tests --
 
 #[cfg(test)]
 mod tests {
