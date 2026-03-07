@@ -14,8 +14,6 @@ import {
 import {
   SUIT_COLORS,
   SUIT_SYMBOLS,
-  getActionColor,
-  formatActionLabel,
 } from './matrix-utils';
 import { ActionBlock, HandCell, CellDetail } from './Explorer';
 
@@ -72,7 +70,13 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   const [matrix, setMatrix] = useState<PostflopStrategyMatrix | null>(null);
   const [solving, setSolving] = useState(false);
   const [progress, setProgress] = useState<PostflopProgress | null>(null);
-  const [actionHistory, setActionHistory] = useState<{index: number; info: PostflopActionInfo}[]>([]);
+  const [actionHistory, setActionHistory] = useState<{
+    selectedId: string;
+    position: string;
+    stack: number;
+    pot: number;
+    actions: ActionInfo[];
+  }[]>([]);
   const pollRef = useRef<number | null>(null);
 
   // Navigation state
@@ -177,9 +181,14 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     try {
       const result = await invoke<PostflopPlayResult>('postflop_play_action', { action: actionIndex });
 
-      const actionInfo = matrix?.actions[actionIndex];
-      if (actionInfo) {
-        setActionHistory(prev => [...prev, { index: actionIndex, info: actionInfo }]);
+      if (matrix) {
+        setActionHistory(prev => [...prev, {
+          selectedId: String(actionIndex),
+          position: matrix.player === 0 ? 'SB' : 'BB',
+          stack: matrix.stacks[matrix.player],
+          pot: matrix.pot,
+          actions: toActionInfos(matrix.actions),
+        }]);
       }
       setStreetActions(prev => [...prev, actionIndex]);
 
@@ -267,11 +276,16 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
 
         {/* Action history blocks */}
         {actionHistory.map((item, i) => (
-          <div key={i} className="action-block" style={{
-            borderLeft: `3px solid ${getActionColor(toActionInfo(item.info), toActionInfos(matrix?.actions ?? []))}`,
-          }}>
-            <span style={{ fontSize: '0.85em' }}>{formatActionLabel(toActionInfo(item.info))}</span>
-          </div>
+          <ActionBlock
+            key={i}
+            position={item.position}
+            stack={item.stack}
+            pot={item.pot}
+            actions={item.actions}
+            selectedAction={item.selectedId}
+            onSelect={() => {}}
+            isCurrent={false}
+          />
         ))}
 
         {/* Solve button */}
