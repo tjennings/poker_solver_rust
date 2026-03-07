@@ -8,6 +8,8 @@ import {
   PostflopMatrixCell,
   PostflopStrategyMatrix,
   PostflopProgress,
+  PostflopPlayResult,
+  PostflopStreetResult,
 } from './types';
 import {
   getActionColor,
@@ -53,8 +55,15 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   const [matrix, setMatrix] = useState<PostflopStrategyMatrix | null>(null);
   const [solving, setSolving] = useState(false);
   const [progress, setProgress] = useState<PostflopProgress | null>(null);
-  const [actionHistory, _setActionHistory] = useState<{index: number; info: PostflopActionInfo}[]>([]);
+  const [actionHistory, setActionHistory] = useState<{index: number; info: PostflopActionInfo}[]>([]);
   const pollRef = useRef<number | null>(null);
+
+  // Navigation state
+  const [awaitingCard, setAwaitingCard] = useState(false);
+  const [nextCardInput, setNextCardInput] = useState('');
+  const [terminal, setTerminal] = useState(false);
+  // Track actions per street for close_street call
+  const [streetActions, setStreetActions] = useState<number[]>([]);
 
   useEffect(() => {
     invoke<PostflopConfigSummary>('postflop_set_config', { config })
@@ -74,27 +83,11 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     }
   }, []);
 
-  const handleSolve = useCallback(async () => {
-    const cards = boardInput.trim().split(/\s+/);
-    if (cards.length < 3 || cards.length > 5) {
-      setError('Enter 3-5 cards (e.g. Ah Kd 7c)');
-      return;
-    }
+  // Cleanup polling on unmount
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
-    setError(null);
-    setSolving(true);
-    _setActionHistory([]);
-    setMatrix(null);
-    setProgress(null);
-
-    try {
-      await invoke('postflop_solve_street', { board: cards });
-    } catch (e) {
-      setError(String(e));
-      setSolving(false);
-      return;
-    }
-
+  /** Start polling for solve progress (shared by initial solve and multi-street). */
+  const startPolling = useCallback(() => {
     const poll = async () => {
       try {
         const p = await invoke<PostflopProgress>('postflop_get_progress', {});
@@ -110,13 +103,119 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
         if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
       }
     };
-
-    poll(); // immediate first poll
+    poll();
     pollRef.current = window.setInterval(poll, 2000);
-  }, [boardInput]);
+  }, []);
 
-  // Cleanup polling on unmount
-  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
+  const handleSolve = useCallback(async () => {
+    const cards = boardInput.trim().split(/\s+/);
+    if (cards.length < 3 || cards.length > 5) {
+      setError('Enter 3-5 cards (e.g. Ah Kd 7c)');
+      return;
+    }
+
+    setError(null);
+    setSolving(true);
+    setActionHistory([]);
+    setStreetActions([]);
+    setMatrix(null);
+    setProgress(null);
+    setTerminal(false);
+    setAwaitingCard(false);
+    setNextCardInput('');
+
+    try {
+      await invoke('postflop_solve_street', { board: cards });
+    } catch (e) {
+      setError(String(e));
+      setSolving(false);
+      return;
+    }
+
+    startPolling();
+  }, [boardInput, startPolling]);
+
+  /** Navigate the solved tree by clicking an action button. */
+  const handleAction = useCallback(async (actionIndex: number) => {
+    if (solving) return;
+    setError(null);
+    try {
+      const result = await invoke<PostflopPlayResult>('postflop_play_action', { action: actionIndex });
+
+      const actionInfo = matrix?.actions[actionIndex];
+      if (actionInfo) {
+        setActionHistory(prev => [...prev, { index: actionIndex, info: actionInfo }]);
+      }
+      setStreetActions(prev => [...prev, actionIndex]);
+
+      if (result.is_terminal) {
+        setMatrix(null);
+        setTerminal(true);
+        return;
+      }
+
+      if (result.is_chance) {
+        setMatrix(null);
+        setAwaitingCard(true);
+        return;
+      }
+
+      if (result.matrix) {
+        setMatrix(result.matrix);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [solving, matrix]);
+
+  /** Deal the next street card (turn or river). */
+  const handleNextCard = useCallback(async () => {
+    const card = nextCardInput.trim();
+    if (!card) return;
+
+    setError(null);
+    setAwaitingCard(false);
+
+    try {
+      // Filter ranges through the completed street's action history.
+      await invoke<PostflopStreetResult>('postflop_close_street', {
+        action_history: streetActions,
+      });
+
+      // Build new board: current board + new card.
+      const currentCards = boardInput.trim().split(/\s+/);
+      const newBoard = [...currentCards, card];
+      setBoardInput(newBoard.join(' '));
+      setStreetActions([]);
+      setNextCardInput('');
+
+      // Solve the new street.
+      setSolving(true);
+      setMatrix(null);
+      setProgress(null);
+      await invoke('postflop_solve_street', { board: newBoard });
+
+      startPolling();
+    } catch (e) {
+      setError(String(e));
+      setSolving(false);
+    }
+  }, [nextCardInput, boardInput, streetActions, startPolling]);
+
+  /** Reset everything for a new hand. */
+  const handleReset = useCallback(() => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+    setMatrix(null);
+    setActionHistory([]);
+    setStreetActions([]);
+    setBoardInput('');
+    setTerminal(false);
+    setAwaitingCard(false);
+    setProgress(null);
+    setError(null);
+    setNextCardInput('');
+    setSolving(false);
+  }, []);
 
   return (
     <div className="explorer-root">
@@ -157,7 +256,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
           />
         </div>
 
-        {/* Action history blocks (Task 11) */}
+        {/* Action history blocks */}
         {actionHistory.map((item, i) => (
           <div key={i} className="action-block" style={{
             borderLeft: `3px solid ${getActionColor(toActionInfo(item.info), toActionInfos(matrix?.actions ?? []))}`,
@@ -165,6 +264,24 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
             <span style={{ fontSize: '0.85em' }}>{formatActionLabel(toActionInfo(item.info))}</span>
           </div>
         ))}
+
+        {/* Next street card input */}
+        {awaitingCard && (
+          <div className="action-block postflop-board-input">
+            <div className="postflop-config-label">
+              {boardInput.trim().split(/\s+/).length === 3 ? 'Turn' : 'River'}
+            </div>
+            <input
+              type="text"
+              placeholder="5s"
+              value={nextCardInput}
+              onChange={(e) => setNextCardInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleNextCard(); }}
+              className="postflop-card-input"
+              autoFocus
+            />
+          </div>
+        )}
       </div>
 
       {/* Progress bar */}
@@ -205,18 +322,35 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
             </div>
           </div>
 
-          {/* Action legend */}
+          {/* Action buttons */}
           <div className="action-buttons">
             {matrix.actions.map((action) => (
-              <div
+              <button
                 key={action.index}
                 className="action-button"
                 style={{ borderColor: getActionColor(toActionInfo(action), toActionInfos(matrix.actions)) }}
+                onClick={() => handleAction(action.index)}
+                disabled={solving}
               >
                 {formatActionLabel(toActionInfo(action))}
-              </div>
+              </button>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Terminal state */}
+      {terminal && (
+        <div style={{ padding: 24, textAlign: 'center', opacity: 0.6 }}>
+          Hand complete.{' '}
+          <button className="action-button" onClick={handleReset}>New Hand</button>
+        </div>
+      )}
+
+      {/* Awaiting card (no matrix visible) */}
+      {awaitingCard && !matrix && !solving && (
+        <div style={{ padding: 24, textAlign: 'center', opacity: 0.6 }}>
+          Enter the next community card above to continue.
         </div>
       )}
 
