@@ -248,37 +248,39 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
         )}
       </div>
 
-      {/* Flop card picker */}
+      {/* Flop card picker modal */}
       {showFlopPicker && (
-        <div className="card-picker-container">
-          <p className="card-picker-prompt">Select 3 flop cards</p>
-          <FlopPicker
-            deadCards={[]}
-            onConfirm={(cards) => {
-              setBoardInput(cards.join(' '));
-              setShowFlopPicker(false);
-              // Auto-solve after selecting flop
-              setTimeout(() => {
-                setError(null);
-                setSolving(true);
-                setActionHistory([]);
-                setStreetActions([]);
-                setMatrix(null);
-                setProgress(null);
-                setTerminal(false);
-                setAwaitingCard(false);
-                            invoke('postflop_solve_street', { board: cards })
-                  .then(() => startPolling())
-                  .catch((e) => { setError(String(e)); setSolving(false); });
-              }, 0);
-            }}
-          />
+        <div className="modal-overlay" onClick={() => setShowFlopPicker(false)}>
+          <div className="card-picker-container" onClick={(e) => e.stopPropagation()}>
+            <p className="card-picker-prompt">Select 3 flop cards</p>
+            <FlopPicker
+              deadCards={[]}
+              onConfirm={(cards) => {
+                setBoardInput(cards.join(' '));
+                setShowFlopPicker(false);
+                setTimeout(() => {
+                  setError(null);
+                  setSolving(true);
+                  setActionHistory([]);
+                  setStreetActions([]);
+                  setMatrix(null);
+                  setProgress(null);
+                  setTerminal(false);
+                  setAwaitingCard(false);
+                  invoke('postflop_solve_street', { board: cards })
+                    .then(() => startPolling())
+                    .catch((e) => { setError(String(e)); setSolving(false); });
+                }, 0);
+              }}
+            />
+          </div>
         </div>
       )}
 
-      {/* Next card picker (turn/river) */}
+      {/* Next card picker modal (turn/river) */}
       {showNextCardPicker && awaitingCard && (
-        <div className="card-picker-container">
+        <div className="modal-overlay" onClick={() => setShowNextCardPicker(false)}>
+          <div className="card-picker-container" onClick={(e) => e.stopPropagation()}>
           <p className="card-picker-prompt">Select {boardCards.length === 3 ? 'turn' : 'river'} card</p>
           <NextCardPicker
             deadCards={boardCards}
@@ -303,6 +305,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
               }, 0);
             }}
           />
+          </div>
         </div>
       )}
 
@@ -467,13 +470,19 @@ const PICKER_COLORS: Record<string, string> = { s: '#fff', h: '#dc2626', d: '#25
 function FlopPicker({ deadCards, onConfirm }: { deadCards: string[]; onConfirm: (cards: string[]) => void }) {
   const [selected, setSelected] = useState<string[]>([]);
   const deadSet = useMemo(() => new Set(deadCards.map((c) => c.toLowerCase())), [deadCards]);
+  const confirmedRef = useRef(false);
 
   const handleCardClick = (card: string) => {
     if (deadSet.has(card.toLowerCase())) return;
     setSelected((prev) => {
       if (prev.includes(card)) return prev.filter((c) => c !== card);
       if (prev.length >= 3) return prev;
-      return [...prev, card];
+      const next = [...prev, card];
+      if (next.length === 3 && !confirmedRef.current) {
+        confirmedRef.current = true;
+        setTimeout(() => onConfirm(next), 0);
+      }
+      return next;
     });
   };
 
@@ -500,13 +509,6 @@ function FlopPicker({ deadCards, onConfirm }: { deadCards: string[]; onConfirm: 
           })}
         </div>
       ))}
-      <button
-        className="card-picker-confirm"
-        disabled={selected.length !== 3}
-        onClick={() => onConfirm(selected)}
-      >
-        Deal {selected.length}/3
-      </button>
     </div>
   );
 }

@@ -72,7 +72,7 @@ pub struct HandGridState {
 /// Map an action name to a base colour.
 ///
 /// Fold = grey, Check = blue, Call = green,
-/// Bets/Raises = light red → dark red, All-in = darkest red.
+/// Bets/Raises = light red → dark red (scaled by bet size), All-in = darkest red.
 pub fn action_color(name: &str) -> Color {
     let lower = name.to_ascii_lowercase();
     if lower == "fold" {
@@ -85,14 +85,19 @@ pub fn action_color(name: &str) -> Color {
         return Color::Rgb(60, 179, 113);
     }
     if lower.starts_with("bet") || lower.starts_with("raise") {
-        let digit = lower.chars().last().and_then(|c| c.to_digit(10));
-        return match digit {
-            Some(0) => Color::Rgb(255, 120, 100),
-            Some(1) => Color::Rgb(230, 90, 80),
-            Some(2) => Color::Rgb(200, 65, 60),
-            Some(3) => Color::Rgb(170, 45, 40),
-            _ => Color::Rgb(140, 30, 30),
-        };
+        // Parse numeric value from e.g. "bet 0.3", "raise 1.0", "bet0", "raise2"
+        let size: f64 = lower
+            .trim_start_matches("bet")
+            .trim_start_matches("raise")
+            .trim()
+            .parse()
+            .unwrap_or(0.5);
+        // Map size 0.0→1.0 to light→dark red, clamped. Sizes >1.0 get darker.
+        let t = (size / 3.0).min(1.0); // normalise against max ~3x pot
+        let r = (255.0 - 115.0 * t) as u8; // 255 → 140
+        let g = (120.0 - 90.0 * t) as u8;  // 120 → 30
+        let b = (100.0 - 70.0 * t) as u8;  // 100 → 30
+        return Color::Rgb(r, g, b);
     }
     if lower.contains("all") || lower.contains("ai") {
         return Color::Rgb(100, 15, 15);
@@ -190,19 +195,25 @@ impl Widget for &HandGridWidget<'_> {
         // ── Legend row ──────────────────────────────────────────────
         let legend_y = footer_y + 1;
         if legend_y < area.y + area.height {
-            let legend_items: &[(&str, Color)] = &[
-                ("FOLD", action_color("fold")),
-                ("CHK", action_color("check")),
-                ("CALL", action_color("call")),
-                ("BET", action_color("bet0")),
-                ("RAISE", action_color("raise2")),
-                ("AI", action_color("allin")),
-            ];
+            // Collect unique action names from the grid, preserving first-seen order.
+            let mut seen = Vec::new();
+            for row in &self.state.cells {
+                for cell in row {
+                    for (name, _) in &cell.actions {
+                        if !seen.iter().any(|s: &String| s == name) {
+                            seen.push(name.clone());
+                        }
+                    }
+                }
+            }
+
             let mut x = area.x;
-            for (label, color) in legend_items {
-                let style = Style::default().bg(*color).fg(Color::Black);
-                buf.set_string(x, legend_y, format!(" {label} "), style);
-                x += label.len() as u16 + 3; // label + padding
+            for label in &seen {
+                let color = action_color(label);
+                let style = Style::default().bg(color).fg(Color::Black);
+                let display = label.to_ascii_uppercase();
+                buf.set_string(x, legend_y, format!(" {display} "), style);
+                x += display.len() as u16 + 3;
             }
         }
     }
@@ -278,7 +289,7 @@ mod tests {
         // AA is row=0, col=0 (pair on diagonal)
         state.cells[0][0] = CellStrategy {
             actions: vec![
-                ("raise0".to_string(), 0.80),
+                ("raise 1.0".to_string(), 0.80),
                 ("fold".to_string(), 0.10),
                 ("call".to_string(), 0.10),
             ],
@@ -289,7 +300,7 @@ mod tests {
             actions: vec![
                 ("fold".to_string(), 0.90),
                 ("call".to_string(), 0.05),
-                ("raise0".to_string(), 0.05),
+                ("raise 1.0".to_string(), 0.05),
             ],
         };
 
@@ -301,7 +312,11 @@ mod tests {
         assert_eq!(action_color("fold"), Color::Rgb(140, 140, 140));
         assert_eq!(action_color("check"), Color::Rgb(80, 140, 220));
         assert_eq!(action_color("call"), Color::Rgb(60, 179, 113));
-        assert_eq!(action_color("raise0"), Color::Rgb(255, 120, 100));
+        // Bets/raises: smaller size → lighter red
+        assert!(matches!(action_color("bet 0.3"), Color::Rgb(..)));
+        assert!(matches!(action_color("raise 1.0"), Color::Rgb(..)));
+        // All-in is darkest
+        assert_eq!(action_color("all-in"), Color::Rgb(100, 15, 15));
     }
 
     #[timed_test(10)]
@@ -310,7 +325,7 @@ mod tests {
             actions: vec![
                 ("fold".to_string(), 0.2),
                 ("call".to_string(), 0.7),
-                ("raise0".to_string(), 0.1),
+                ("raise 1.0".to_string(), 0.1),
             ],
         };
         let (name, freq) = cell.dominant_action();
