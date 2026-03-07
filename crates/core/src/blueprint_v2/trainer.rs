@@ -432,9 +432,21 @@ impl BlueprintTrainer {
             self.apply_lcfr_discount();
         }
 
-        // Progress logging.
-        if elapsed_min >= self.last_print_time + self.config.training.print_every_minutes {
+        // Strategy delta: compute on whichever cadence fires first (print
+        // interval or TUI refresh interval). Only compute once per check to
+        // avoid overwriting prev_strategy_sums and getting a near-zero second
+        // reading.
+        let elapsed_secs = self.start_time.elapsed().as_secs();
+        let print_due =
+            elapsed_min >= self.last_print_time + self.config.training.print_every_minutes;
+        let refresh_due =
+            elapsed_secs >= self.last_strategy_refresh_secs + self.strategy_refresh_interval_secs;
+
+        if print_due || refresh_due {
             self.update_strategy_delta();
+        }
+
+        if print_due {
             self.print_metrics();
         }
 
@@ -449,12 +461,7 @@ impl BlueprintTrainer {
         }
 
         // Strategy refresh for TUI.
-        // An interval of 0 means refresh on every check.
-        let elapsed_secs = self.start_time.elapsed().as_secs();
-        if elapsed_secs
-            >= self.last_strategy_refresh_secs + self.strategy_refresh_interval_secs
-        {
-            self.update_strategy_delta();
+        if refresh_due {
             if let Some(ref callback) = self.on_strategy_refresh {
                 for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
                     callback(i, node_idx, &self.storage, &self.tree);
