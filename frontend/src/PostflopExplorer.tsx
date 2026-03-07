@@ -364,7 +364,8 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
               width: `${(progress.iteration / Math.max(progress.max_iterations, 1)) * 100}%`,
             }} />
             <span className="progress-text">
-              {progress.iteration}/{progress.max_iterations} — exploit: {progress.exploitability.toExponential(2)}
+              {progress.iteration}/{progress.max_iterations} iters
+              {progress.exploitability < 1e30 && ` — ${(progress.exploitability / Math.max(config.pot, 1) * 100).toFixed(1)}% pot expl`}
             </span>
           </div>
         </div>
