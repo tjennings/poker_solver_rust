@@ -149,20 +149,81 @@ pub fn decision_nodes_at_street(tree: &GameTree, street: Street) -> Vec<u32> {
 }
 
 /// Build a human-readable name for a random scenario node.
+///
+/// Traces the action path from root to `node_idx` and formats it as
+/// e.g. "SB r2.5→call | Flop Ah 7s 2d".
 pub fn random_scenario_name(tree: &GameTree, node_idx: u32, board_display: &str) -> String {
-    if let GameNode::Decision {
-        player, street, ..
-    } = &tree.nodes[node_idx as usize]
-    {
-        let player_name = if *player == 0 { "SB" } else { "BB" };
-        let board_suffix = if board_display.is_empty() {
-            String::new()
-        } else {
-            format!(" {board_display}")
-        };
-        format!("Random {player_name} | {street:?}{board_suffix}")
+    let player_name = match &tree.nodes[node_idx as usize] {
+        GameNode::Decision { player, .. } => {
+            if *player == 0 { "SB" } else { "BB" }
+        }
+        _ => return "Random".to_string(),
+    };
+
+    let path = trace_action_path(tree, node_idx);
+    let street = match &tree.nodes[node_idx as usize] {
+        GameNode::Decision { street, .. } => format!("{street:?}"),
+        _ => String::new(),
+    };
+
+    let board_suffix = if board_display.is_empty() {
+        String::new()
     } else {
-        "Random".to_string()
+        format!(" {board_display}")
+    };
+
+    if path.is_empty() {
+        format!("{player_name} open | {street}{board_suffix}")
+    } else {
+        format!("{player_name} {path} | {street}{board_suffix}")
+    }
+}
+
+/// Trace the action path from root to `target` via DFS.
+///
+/// Returns a compact string like "r2.5→call→bet0.5".
+fn trace_action_path(tree: &GameTree, target: u32) -> String {
+    let mut path = Vec::new();
+    if dfs_path(tree, tree.root, target, &mut path) {
+        path.iter()
+            .map(|a| short_action_label(a))
+            .collect::<Vec<_>>()
+            .join("→")
+    } else {
+        String::new()
+    }
+}
+
+/// DFS to find a path of `TreeAction`s from `current` to `target`.
+fn dfs_path(tree: &GameTree, current: u32, target: u32, path: &mut Vec<TreeAction>) -> bool {
+    if current == target {
+        return true;
+    }
+    match &tree.nodes[current as usize] {
+        GameNode::Decision { actions, children, .. } => {
+            for (action, &child) in actions.iter().zip(children.iter()) {
+                path.push(action.clone());
+                if dfs_path(tree, child, target, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+        GameNode::Chance { child, .. } => dfs_path(tree, *child, target, path),
+        GameNode::Terminal { .. } => false,
+    }
+}
+
+/// Compact action label for the scenario name.
+fn short_action_label(action: &TreeAction) -> String {
+    match action {
+        TreeAction::Fold => "fold".into(),
+        TreeAction::Check => "x".into(),
+        TreeAction::Call => "call".into(),
+        TreeAction::AllIn => "ai".into(),
+        TreeAction::Bet(v) => format!("b{v:.1}"),
+        TreeAction::Raise(v) => format!("r{v:.1}"),
     }
 }
 
