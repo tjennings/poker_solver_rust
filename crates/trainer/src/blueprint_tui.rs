@@ -48,6 +48,8 @@ pub struct BlueprintTuiApp {
     delta_history: Vec<u64>,
     // Leaf movement sparkline data
     leaf_movement_history: Vec<u64>,
+    // Max negative regret sparkline data (stored as abs value × 1000 for sparkline)
+    min_regret_history: Vec<u64>,
     // Random scenario carousel tracking
     has_random_tab: bool,
 }
@@ -70,6 +72,7 @@ impl BlueprintTuiApp {
             refresh_rate_hz,
             delta_history: Vec::with_capacity(SPARKLINE_HISTORY),
             leaf_movement_history: Vec::with_capacity(SPARKLINE_HISTORY),
+            min_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
             has_random_tab: false,
         }
     }
@@ -120,6 +123,24 @@ impl BlueprintTuiApp {
                 push_bounded(
                     &mut self.leaf_movement_history,
                     (v * 100.0) as u64,
+                    sparkline_max,
+                );
+            }
+            hist.clear();
+        }
+
+        // Min regret sparkline: read all new values
+        {
+            let mut hist = self
+                .metrics
+                .min_regret_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for &v in hist.iter() {
+                // Store absolute value scaled up for sparkline (regret is negative)
+                push_bounded(
+                    &mut self.min_regret_history,
+                    (v.abs() * 1000.0) as u64,
                     sparkline_max,
                 );
             }
@@ -223,6 +244,7 @@ impl BlueprintTuiApp {
                 Constraint::Length(3), // Throughput sparkline
                 Constraint::Length(3), // Strategy delta sparkline
                 Constraint::Length(3), // Leaf movement sparkline
+                Constraint::Length(3), // Max negative regret sparkline
                 Constraint::Min(0),   // Spacer
                 Constraint::Length(1), // Hotkeys footer
             ])
@@ -234,7 +256,8 @@ impl BlueprintTuiApp {
         self.render_sparkline(frame, chunks[3]);
         self.render_strategy_delta(frame, chunks[4]);
         self.render_leaf_movement(frame, chunks[5]);
-        self.render_hotkeys(frame, chunks[7]);
+        self.render_min_regret(frame, chunks[6]);
+        self.render_hotkeys(frame, chunks[8]);
     }
 
     fn render_iterations(&self, frame: &mut Frame, area: Rect) {
@@ -331,6 +354,22 @@ impl BlueprintTuiApp {
             .block(Block::default().title(title).borders(Borders::NONE))
             .data(&self.leaf_movement_history)
             .style(Style::default().fg(Color::Green));
+        frame.render_widget(sparkline, area);
+    }
+
+    fn render_min_regret(&self, frame: &mut Frame, area: Rect) {
+        // Display value: stored as abs(regret) × 1000 for sparkline resolution,
+        // convert back to the original (already ÷1000 from storage scaling).
+        let latest = self
+            .min_regret_history
+            .last()
+            .map(|&v| v as f64 / 1000.0)
+            .unwrap_or(0.0);
+        let title = format!("Max neg regret: -{latest:.1}");
+        let sparkline = Sparkline::default()
+            .block(Block::default().title(title).borders(Borders::NONE))
+            .data(&self.min_regret_history)
+            .style(Style::default().fg(Color::Red));
         frame.render_widget(sparkline, area);
     }
 

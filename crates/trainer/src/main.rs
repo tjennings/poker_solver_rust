@@ -578,6 +578,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     metrics_for_leaf.push_leaf_movement(pct);
                 }));
 
+                let metrics_for_regret = Arc::clone(&metrics);
+                trainer.on_min_regret = Some(Box::new(move |val| {
+                    metrics_for_regret.push_min_regret(val);
+                }));
+
                 // Random scenario carousel.
                 if tui_config.random_scenario.enabled {
                     trainer.random_scenario_hold_minutes =

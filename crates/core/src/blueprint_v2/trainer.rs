@@ -111,6 +111,8 @@ pub struct BlueprintTrainer {
     pub on_strategy_delta: Option<Box<dyn Fn(f64) + Send>>,
     /// Callback to push leaf movement fraction to TUI metrics.
     pub on_leaf_movement: Option<Box<dyn Fn(f64) + Send>>,
+    /// Callback to push the minimum (most-negative) regret value to TUI metrics.
+    pub on_min_regret: Option<Box<dyn Fn(f64) + Send>>,
     /// Last time (in seconds) a strategy refresh was performed.
     last_strategy_refresh_secs: u64,
 
@@ -195,6 +197,7 @@ impl BlueprintTrainer {
             on_strategy_refresh: None,
             on_strategy_delta: None,
             on_leaf_movement: None,
+            on_min_regret: None,
             last_strategy_refresh_secs: 0,
             prev_strategy_sums: None,
             last_strategy_delta: f64::INFINITY,
@@ -526,6 +529,9 @@ impl BlueprintTrainer {
             if let Some(ref cb) = self.on_leaf_movement {
                 cb(pct_moving);
             }
+            if let Some(ref cb) = self.on_min_regret {
+                cb(self.min_regret());
+            }
         }
         self.prev_strategy_sums = Some(self.storage.snapshot_strategy_sums());
     }
@@ -554,6 +560,20 @@ impl BlueprintTrainer {
             self.last_strategy_delta,
             self.last_pct_moving * 100.0,
         );
+    }
+
+    /// The most-negative regret value across all info-set entries,
+    /// divided by the ×1000 scaling factor used in storage.
+    #[must_use]
+    pub fn min_regret(&self) -> f64 {
+        let min_raw = self
+            .storage
+            .regrets
+            .iter()
+            .map(|atom| atom.load(Ordering::Relaxed))
+            .min()
+            .unwrap_or(0);
+        f64::from(min_raw) / 1000.0
     }
 
     /// Mean of all strictly-positive regret entries.
