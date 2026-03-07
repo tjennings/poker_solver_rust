@@ -1,4 +1,5 @@
 mod exploration;
+pub mod postflop;
 mod simulation;
 
 pub use exploration::{
@@ -19,6 +20,13 @@ pub use exploration::{
     ActionInfo, ActionProb, BucketProgressEvent, BundleInfo, CanonicalizeResult,
     ComboGroup, ComboGroupInfo, ComputationStatus, ExplorationPosition, HandEquity,
     MatrixCell, StrategyMatrix,
+};
+
+pub use postflop::{
+    postflop_close_street, postflop_close_street_core, postflop_get_progress,
+    postflop_get_progress_core, postflop_play_action, postflop_play_action_core,
+    postflop_set_config, postflop_set_config_core, postflop_solve_street,
+    postflop_solve_street_core, PostflopState,
 };
 
 pub use simulation::{

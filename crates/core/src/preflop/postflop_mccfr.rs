@@ -808,7 +808,7 @@ mod tests {
         }
     }
 
-    #[timed_test]
+    #[timed_test(3)]
     fn mccfr_solve_tiny_tree_converges() {
         let config = test_config();
         let tree = PostflopTree::build_with_spr(&config, 3.5).unwrap();

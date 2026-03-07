@@ -3036,6 +3036,7 @@ version = "0.1.0"
 dependencies = [
  "parking_lot 0.12.5",
  "poker-solver-core",
+ "range-solver",
  "rs_poker",
  "serde",
  "serde_json",

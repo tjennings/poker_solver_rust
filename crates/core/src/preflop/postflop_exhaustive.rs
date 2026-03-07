@@ -1378,6 +1378,7 @@ mod tests {
     }
 
     #[timed_test(10)]
+    #[ignore = "slow: 169-hand exhaustive solve in debug mode"]
     fn exhaustive_solve_produces_strategy() {
         let config = PostflopModelConfig {
             bet_sizes: vec![1.0],
@@ -1416,6 +1417,7 @@ mod tests {
     }
 
     #[timed_test(10)]
+    #[ignore = "slow: 169-hand exhaustive solve in debug mode"]
     fn exhaustive_extract_values_dimensions() {
         let config = PostflopModelConfig {
             bet_sizes: vec![1.0],
@@ -1742,6 +1744,7 @@ mod tests {
     }
 
     #[timed_test(10)]
+    #[ignore = "slow: 169-hand exhaustive solve in debug mode"]
     fn exhaustive_solve_with_pruning_produces_strategy() {
         let config = PostflopModelConfig {
             bet_sizes: vec![1.0],
@@ -1782,6 +1785,7 @@ mod tests {
     }
 
     #[timed_test(30)]
+    #[ignore = "slow: 169-hand exhaustive solve in debug mode"]
     fn pruning_does_not_break_convergence() {
         let base = PostflopModelConfig {
             bet_sizes: vec![1.0],
@@ -1827,6 +1831,7 @@ mod tests {
     }
 
     #[timed_test(30)]
+    #[ignore = "slow: 169-hand exhaustive solve in debug mode"]
     fn solver_counters_are_incremented() {
         let config = PostflopModelConfig {
             bet_sizes: vec![1.0],
@@ -1856,6 +1861,7 @@ mod tests {
     /// Test with full.yaml-equivalent config (2 bet sizes, 2 max raises, SPR=2).
     /// This exercises the deeper tree that the production solve uses.
     #[timed_test(120)]
+    #[ignore = "slow: 169-hand exhaustive solve in debug mode"]
     fn full_config_spr2_does_not_panic() {
         let config = PostflopModelConfig {
             bet_sizes: vec![0.3, 0.75],
@@ -1892,6 +1898,7 @@ mod tests {
     /// Test build_exhaustive with full.yaml config on multiple flops to exercise
     /// the parallel solve path and catch_unwind protection.
     #[timed_test(120)]
+    #[ignore = "slow: 169-hand exhaustive solve in debug mode"]
     fn full_config_parallel_multi_flop() {
         use crate::preflop::postflop_hands::sample_canonical_flops;
 

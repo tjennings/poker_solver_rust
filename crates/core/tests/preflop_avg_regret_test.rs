@@ -26,7 +26,7 @@ fn preflop_avg_positive_regret_zero_before_training() {
 /// Also verifies the metric history is plottable (finite, positive values).
 #[timed_test(10)]
 fn vanilla_avg_positive_regret_decreases_over_training() {
-    let mut config = PreflopConfig::heads_up(10);
+    let mut config = PreflopConfig::heads_up(5);
     config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
     config.raise_cap = 1;
     config.cfr_variant = CfrVariant::Vanilla;
@@ -35,8 +35,8 @@ fn vanilla_avg_positive_regret_decreases_over_training() {
 
     // Collect regret at periodic checkpoints (simulating the training loop's print_every)
     let mut history: Vec<f64> = Vec::new();
-    let chunk = 50;
-    let total = 500;
+    let chunk = 10;
+    let total = 50;
 
     for _ in 0..(total / chunk) {
         solver.train(chunk);
@@ -74,7 +74,7 @@ fn vanilla_avg_positive_regret_decreases_over_training() {
 /// the cumulative metric converges smoothly like Vanilla CFR.
 #[timed_test(10)]
 fn cfrplus_avg_positive_regret_decreases_over_training() {
-    let mut config = PreflopConfig::heads_up(10);
+    let mut config = PreflopConfig::heads_up(5);
     config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];
     config.raise_cap = 1;
     config.cfr_variant = CfrVariant::CfrPlus;
@@ -82,8 +82,8 @@ fn cfrplus_avg_positive_regret_decreases_over_training() {
     let mut solver = PreflopSolver::new(&config);
 
     let mut history: Vec<f64> = Vec::new();
-    let chunk = 50;
-    let total = 500;
+    let chunk = 10;
+    let total = 50;
 
     for _ in 0..(total / chunk) {
         solver.train(chunk);

@@ -1,5 +1,6 @@
 import { useState, useCallback, useMemo, useEffect } from 'react';
 import { invoke } from './invoke';
+import PostflopExplorer from './PostflopExplorer';
 import {
   BundleInfo,
   CanonicalizeResult,
@@ -13,114 +14,16 @@ import {
   PlayerRange,
   RangeSnapshot,
 } from './types';
-
-// Suit colors matching the reference image
-const SUIT_COLORS: Record<string, string> = {
-  s: '#1a1a2e', // Spades - dark
-  h: '#dc2626', // Hearts - red
-  d: '#2563eb', // Diamonds - blue
-  c: '#16a34a', // Clubs - green
-};
-
-const SUIT_SYMBOLS: Record<string, string> = {
-  s: '♠',
-  h: '♥',
-  d: '♦',
-  c: '♣',
-};
-
-// Color utilities for action probabilities.
-// Bet/raise actions use a graduated red scale: lightest for the smallest
-// bet size, darkest for all-in.
-// Format a postflop EV value (in pot fractions, where 1.0 = the initial pot).
-// Display as percentage of pot: +10.5% means hero profits 10.5% of the pot.
-function formatEV(potFraction: number): string {
-  const pct = potFraction * 100;
-  const sign = pct >= 0 ? '+' : '';
-  return `${sign}${pct.toFixed(1)}%`;
-}
-
-// Order aggressive actions: sized raises (smallest → largest), then all-in last.
-function sortedBetActions(actions: ActionInfo[]): ActionInfo[] {
-  const raises = actions.filter((a) => a.action_type === 'bet' || a.action_type === 'raise');
-  const allins = actions.filter((a) => a.action_type === 'allin');
-  return [...raises, ...allins];
-}
-
-// Return indices into the actions array in display order: fold, check/call, raises by size, all-in last.
-function displayOrderIndices(actions: ActionInfo[]): number[] {
-  const passive: number[] = [];
-  const raises: number[] = [];
-  const allins: number[] = [];
-  actions.forEach((a, i) => {
-    if (a.action_type === 'fold' || a.action_type === 'check' || a.action_type === 'call') passive.push(i);
-    else if (a.action_type === 'allin') allins.push(i);
-    else raises.push(i);
-  });
-  return [...passive, ...raises, ...allins];
-}
-
-// Display order: fold, check/call, sized raises, all-in last.
-function displayOrderActions(actions: ActionInfo[]): ActionInfo[] {
-  return displayOrderIndices(actions).map((i) => actions[i]);
-}
-
-// Format action labels: strip "Raise to"/"Bet" prefix, keep chip amount only.
-function formatActionLabel(action: ActionInfo): string {
-  if (action.action_type === 'fold') return 'Fold';
-  if (action.action_type === 'check') return 'Check';
-  if (action.action_type === 'call') return action.label;
-  if (action.action_type === 'allin') return 'All-in';
-  return action.label.replace(/^(?:Raise(?: to)? |Bet )\s*/i, '');
-}
-
-function getActionColor(action: ActionInfo, actions: ActionInfo[]): string {
-  switch (action.action_type) {
-    case 'fold':
-      return 'rgba(70, 120, 200, 0.7)'; // Dusty blue
-    case 'check':
-    case 'call':
-      return 'rgba(50, 160, 90, 0.7)'; // Muted green
-    case 'bet':
-    case 'raise':
-    case 'allin': {
-      const ordered = sortedBetActions(actions);
-      const idx = ordered.findIndex((a) => a.id === action.id);
-      const count = ordered.length;
-      // Lightest (t=0) → darkest (t=1), all-in always darkest
-      const t = count > 1 ? idx / (count - 1) : 1;
-      // Interpolate from dusty rose (200, 130, 130) to wine (160, 50, 50)
-      const r = Math.round(200 - t * (200 - 160));
-      const g = Math.round(130 - t * (130 - 50));
-      const b = Math.round(130 - t * (130 - 50));
-      return `rgba(${r}, ${g}, ${b}, 0.7)`;
-    }
-    default:
-      return 'rgba(140, 145, 155, 0.7)'; // Soft gray
-  }
-}
-
-/**
- * Map (row, col) in the 13x13 matrix to a canonical hand index (0..168).
- * Diagonal = pairs (0..12), above diagonal = suited (13..90), below = offsuit (91..168).
- */
-function matrixToHandIndex(row: number, col: number): number {
-  if (row === col) {
-    return row; // pair
-  } else if (col > row) {
-    // suited: above diagonal
-    let idx = 0;
-    for (let r = 0; r < row; r++) idx += (12 - r);
-    idx += (col - row - 1);
-    return 13 + idx;
-  } else {
-    // offsuit: below diagonal (row > col)
-    let idx = 0;
-    for (let r = 0; r < col; r++) idx += (12 - r);
-    idx += (row - col - 1);
-    return 91 + idx;
-  }
-}
+import {
+  SUIT_COLORS,
+  SUIT_SYMBOLS,
+  formatEV,
+  displayOrderIndices,
+  displayOrderActions,
+  formatActionLabel,
+  getActionColor,
+  matrixToHandIndex,
+} from './matrix-utils';
 
 // Hand matrix cell component
 function HandCell({
@@ -735,6 +638,7 @@ export default function Explorer() {
 
   const [datasets, setDatasets] = useState<DatasetInfo[] | null>(null);
   const [showDatasetPicker, setShowDatasetPicker] = useState(false);
+  const [showPostflop, setShowPostflop] = useState(false);
 
   const handleLoadDataset = useCallback(async () => {
     if ('__TAURI__' in window) {
@@ -1365,19 +1269,33 @@ export default function Explorer() {
         </>
       )}
 
-      {!bundleInfo && !loading && !showDatasetPicker && (
-        <div className="action-strip">
-          <div className="action-block load-dataset-card" onClick={handleLoadDataset}>
-            <div className="load-dataset-icon">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      {!bundleInfo && !loading && !showDatasetPicker && !showPostflop && (
+        <div className="mode-selection">
+          <div className="mode-card" onClick={handleLoadDataset}>
+            <div className="mode-icon">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
                 <line x1="12" y1="11" x2="12" y2="17" />
                 <line x1="9" y1="14" x2="15" y2="14" />
               </svg>
             </div>
-            <span className="load-dataset-label">Load Dataset</span>
+            <span className="mode-label">Load Dataset</span>
+            <span className="mode-desc">Open a solved strategy bundle</span>
+          </div>
+          <div className="mode-card" onClick={() => setShowPostflop(true)}>
+            <div className="mode-icon">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.315 8.685a.98.98 0 0 1 .837-.276c.47.07.802.48.968.925a2.501 2.501 0 1 0 3.214-3.214c-.446-.166-.855-.497-.925-.968a.979.979 0 0 1 .276-.837l1.61-1.61a2.404 2.404 0 0 1 1.705-.707c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z" />
+              </svg>
+            </div>
+            <span className="mode-label">Postflop Solver</span>
+            <span className="mode-desc">Solve ranges on a specific board</span>
           </div>
         </div>
+      )}
+
+      {showPostflop && (
+        <PostflopExplorer onBack={() => setShowPostflop(false)} />
       )}
 
       {showDatasetPicker && datasets && (
