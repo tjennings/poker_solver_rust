@@ -38,8 +38,8 @@ interface PostflopExplorerProps {
 
 export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   const [config, setConfig] = useState<PostflopConfig>({
-    oop_range: 'QQ+,AKs,AKo',
-    ip_range: 'JJ-66,AQs-ATs,AQo,KQs',
+    oop_range: '22+,A2s+,K2s+,Q2s+,J4s+,T6s+,96s+,86s+,76s,65s,54s,A2o+,K5o+,Q7o+,J8o+,T8o+,98o',
+    ip_range: '22+,A2s+,K2s+,Q5s+,J7s+,T7s+,97s+,87s,76s,65s,A2o+,K7o+,Q9o+,J9o+,T9o',
     pot: 30,
     effective_stack: 170,
     oop_bet_sizes: '25%,33%,75%',
@@ -234,6 +234,21 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
           </div>
         ))}
 
+        {/* Available actions */}
+        {matrix && !terminal && !awaitingCard && matrix.actions.map((action) => (
+          <div
+            key={`act-${action.index}`}
+            className={`action-block action-block-choice${solving ? ' disabled' : ''}`}
+            style={{
+              borderLeft: `3px solid ${getActionColor(toActionInfo(action), toActionInfos(matrix.actions))}`,
+              cursor: solving ? 'default' : 'pointer',
+            }}
+            onClick={() => !solving && handleAction(action.index)}
+          >
+            <span style={{ fontSize: '0.85em' }}>{formatActionLabel(toActionInfo(action))}</span>
+          </div>
+        ))}
+
         {/* Next street card (turn/river) */}
         {awaitingCard && (
           <div className="street-block pending" style={{ cursor: 'pointer' }}
@@ -325,23 +340,6 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       {matrix && (
         <div style={{ fontSize: '0.85em', opacity: 0.6, padding: '4px 12px' }}>
           {matrix.player === 0 ? 'OOP' : 'IP'} to act — Board: {matrix.board.join(' ')}
-        </div>
-      )}
-
-      {/* Action buttons */}
-      {matrix && (
-        <div className="action-buttons">
-          {matrix.actions.map((action) => (
-            <button
-              key={action.index}
-              className="action-button"
-              style={{ borderColor: getActionColor(toActionInfo(action), toActionInfos(matrix.actions)) }}
-              onClick={() => handleAction(action.index)}
-              disabled={solving}
-            >
-              {formatActionLabel(toActionInfo(action))}
-            </button>
-          ))}
         </div>
       )}
 
