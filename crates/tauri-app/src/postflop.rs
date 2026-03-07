@@ -28,8 +28,8 @@ pub struct PostflopConfig {
 impl Default for PostflopConfig {
     fn default() -> Self {
         Self {
-            oop_range: "22+,A2s+,K2s+,Q2s+,J4s+,T6s+,96s+,86s+,76s,65s,54s,A2o+,K5o+,Q7o+,J8o+,T8o+,98o".to_string(),
-            ip_range: "22+,A2s+,K2s+,Q5s+,J7s+,T7s+,97s+,87s,76s,65s,A2o+,K7o+,Q9o+,J9o+,T9o".to_string(),
+            oop_range: "QQ+,AKs,AKo".to_string(),
+            ip_range: "TT+,AQs+,AKo".to_string(),
             pot: 30,
             effective_stack: 170,
             oop_bet_sizes: "25%,33%,75%".to_string(),

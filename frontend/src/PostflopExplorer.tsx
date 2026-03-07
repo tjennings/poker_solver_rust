@@ -39,8 +39,8 @@ interface PostflopExplorerProps {
 
 export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   const [config, setConfig] = useState<PostflopConfig>({
-    oop_range: '22+,A2s+,K2s+,Q2s+,J4s+,T6s+,96s+,86s+,76s,65s,54s,A2o+,K5o+,Q7o+,J8o+,T8o+,98o',
-    ip_range: '22+,A2s+,K2s+,Q5s+,J7s+,T7s+,97s+,87s,76s,65s,A2o+,K7o+,Q9o+,J9o+,T9o',
+    oop_range: 'QQ+,AKs,AKo',
+    ip_range: 'TT+,AQs+,AKo',
     pot: 30,
     effective_stack: 170,
     oop_bet_sizes: '25%,33%,75%',
