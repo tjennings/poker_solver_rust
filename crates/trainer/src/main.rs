@@ -461,6 +461,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!();
 
             let mut trainer = BlueprintTrainer::new(bp_config);
+            trainer.try_resume()?;
             let use_tui = tui_config.enabled && !no_tui;
 
             if use_tui {

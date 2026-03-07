@@ -354,6 +354,7 @@ mod tests {
                 warmup_minutes: 60,
                 snapshot_every_minutes: 30,
                 output_dir: "runs/".into(),
+                resume: false,
             },
         };
 

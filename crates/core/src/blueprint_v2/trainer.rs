@@ -193,6 +193,91 @@ impl BlueprintTrainer {
         }
     }
 
+    /// Attempt to resume from the latest snapshot in `output_dir`.
+    ///
+    /// When `config.snapshots.resume` is `true`, scans for `snapshot_NNNN`
+    /// directories (and a `final/` directory), picks the one with the
+    /// highest number, and loads its `regrets.bin` and `metadata.json`.
+    ///
+    /// Does nothing if `resume` is `false` or `output_dir` does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a snapshot directory is found but its files
+    /// cannot be read or parsed.
+    pub fn try_resume(&mut self) -> Result<(), Box<dyn Error>> {
+        if !self.config.snapshots.resume {
+            return Ok(());
+        }
+
+        let output_dir = Path::new(&self.config.snapshots.output_dir);
+        if !output_dir.exists() {
+            return Ok(());
+        }
+
+        // Find the latest snapshot directory.
+        let mut best: Option<(u32, std::path::PathBuf)> = None;
+
+        if let Ok(entries) = std::fs::read_dir(output_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if let Some(num_str) = name_str.strip_prefix("snapshot_") {
+                    if let Ok(num) = num_str.parse::<u32>() {
+                        if entry.path().join("regrets.bin").exists()
+                            && best.as_ref().map_or(true, |(n, _)| num > *n)
+                        {
+                            best = Some((num, entry.path()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // A `final/` directory always wins over numbered snapshots.
+        let final_dir = output_dir.join("final");
+        if final_dir.join("regrets.bin").exists() {
+            let num = best.as_ref().map_or(0, |(n, _)| n + 1);
+            best = Some((num, final_dir));
+        }
+
+        let Some((snapshot_num, snapshot_dir)) = best else {
+            eprintln!("Resume: no snapshots found in {}", output_dir.display());
+            return Ok(());
+        };
+
+        // Load regrets.
+        let regrets_path = snapshot_dir.join("regrets.bin");
+        let bucket_counts = [
+            self.config.clustering.preflop.buckets,
+            self.config.clustering.flop.buckets,
+            self.config.clustering.turn.buckets,
+            self.config.clustering.river.buckets,
+        ];
+        self.storage = BlueprintStorage::load_regrets(&regrets_path, &self.tree, bucket_counts)?;
+
+        // Load metadata for iteration count.
+        let meta_path = snapshot_dir.join("metadata.json");
+        if meta_path.exists() {
+            let meta_str = std::fs::read_to_string(&meta_path)?;
+            if let Some(iter_val) = extract_json_u64(&meta_str, "iteration") {
+                self.iterations = iter_val;
+                self.shared_iterations.store(iter_val, Ordering::Relaxed);
+            }
+        }
+
+        self.snapshot_count = snapshot_num + 1;
+
+        eprintln!(
+            "Resumed from {}: {} iterations, mean_pos_regret={:.2}",
+            snapshot_dir.display(),
+            self.iterations,
+            self.mean_positive_regret(),
+        );
+
+        Ok(())
+    }
+
     /// Run the training loop until a stopping criterion is met.
     ///
     /// # Errors
@@ -496,6 +581,22 @@ impl BlueprintTrainer {
     }
 }
 
+/// Extract a `u64` value for the given `key` from a simple JSON string.
+///
+/// Avoids pulling in `serde_json` for a single metadata read.
+fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
+    let pattern = format!("\"{key}\"");
+    let idx = json.find(&pattern)?;
+    let after_key = &json[idx + pattern.len()..];
+    let colon_idx = after_key.find(':')?;
+    let after_colon = after_key[colon_idx + 1..].trim_start();
+    let num_str: String = after_colon
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    num_str.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -544,6 +645,7 @@ mod tests {
                 warmup_minutes: 9999,
                 snapshot_every_minutes: 9999,
                 output_dir: "/tmp/test_blueprint_v2_snapshots".into(),
+                resume: false,
             },
         }
     }
@@ -720,5 +822,49 @@ mod tests {
             "should have stopped when delta <= 0.5, got {}",
             trainer.last_strategy_delta,
         );
+    }
+
+    #[test]
+    fn extract_json_u64_works() {
+        let json = r#"{"iteration": 12345, "elapsed_minutes": 5}"#;
+        assert_eq!(extract_json_u64(json, "iteration"), Some(12345));
+        assert_eq!(extract_json_u64(json, "elapsed_minutes"), Some(5));
+        assert_eq!(extract_json_u64(json, "missing"), None);
+    }
+
+    #[test]
+    fn resume_from_snapshot() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let snapshot_dir = dir.path().join("snapshot_0000");
+
+        // Train 20 iterations and save a snapshot.
+        let mut config = toy_config();
+        config.training.iterations = Some(20);
+        config.snapshots.output_dir = dir.path().to_string_lossy().to_string();
+        let mut trainer = BlueprintTrainer::new(config.clone());
+        trainer.train().expect("initial training");
+        trainer.save_snapshot().expect("save snapshot");
+        assert!(snapshot_dir.join("regrets.bin").exists());
+
+        // Create a new trainer with resume=true and train 20 more.
+        config.training.iterations = Some(40); // total target
+        config.snapshots.resume = true;
+        let mut trainer2 = BlueprintTrainer::new(config);
+        trainer2.try_resume().expect("resume should succeed");
+        assert_eq!(trainer2.iterations, 20, "should resume at iteration 20");
+        assert_eq!(trainer2.snapshot_count, 1, "should start at snapshot 1");
+
+        // Regrets should be non-zero (loaded from snapshot).
+        assert!(
+            trainer2
+                .storage
+                .regrets
+                .iter()
+                .any(|r| r.load(Ordering::Relaxed) != 0),
+            "regrets should be loaded from snapshot"
+        );
+
+        trainer2.train().expect("resumed training");
+        assert_eq!(trainer2.iterations, 40, "should reach 40 total");
     }
 }

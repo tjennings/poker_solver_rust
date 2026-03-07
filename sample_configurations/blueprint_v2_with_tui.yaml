@@ -43,6 +43,7 @@ snapshots:
   warmup_minutes: 60
   snapshot_every_minutes: 30
   output_dir: "snapshots/"
+  # resume: true  # resume from latest snapshot if output_dir has existing snapshots
 
 tui:
   enabled: true

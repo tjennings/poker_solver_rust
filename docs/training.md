@@ -334,6 +334,8 @@ When `tui.enabled: true` in the config, `train-blueprint` launches a full-screen
 
 **Strategy Delta Stopping:** Set `target_strategy_delta` in the training config to auto-stop when the average strategy stabilises. The delta is the mean max absolute probability change across all (node, bucket) information sets between metric checks. Checked every `print_every_minutes`. Example: `target_strategy_delta: 0.001` stops when the strategy is changing by less than 0.1% on average.
 
+**Resume Training:** Set `resume: true` under `snapshots:` to continue from the latest snapshot in `output_dir`. The trainer loads regrets and iteration count from the highest-numbered `snapshot_NNNN/` directory (or `final/` if present).
+
 **Left panel:** iteration progress, throughput sparkline, exploitability chart
 **Right panel:** tabbed 13x13 strategy grids for configured scenarios
 

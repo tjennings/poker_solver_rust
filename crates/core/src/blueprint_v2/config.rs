@@ -115,6 +115,10 @@ pub struct SnapshotConfig {
     pub snapshot_every_minutes: u64,
     /// Directory to write snapshot files.
     pub output_dir: String,
+    /// If true, scan `output_dir` for the latest snapshot and resume training
+    /// from its regrets. The snapshot with the highest number is used.
+    #[serde(default)]
+    pub resume: bool,
 }
 
 // ── Default value functions ──────────────────────────────────────────
@@ -294,6 +298,7 @@ snapshots:
                 warmup_minutes: 120,
                 snapshot_every_minutes: 60,
                 output_dir: "/data/snapshots".to_owned(),
+                resume: false,
             },
         };
 
