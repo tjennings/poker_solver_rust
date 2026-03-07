@@ -105,6 +105,12 @@ pub struct BlueprintTrainer {
     pub on_strategy_refresh: Option<Box<dyn Fn(usize, u32, &BlueprintStorage) + Send>>,
     /// Last time (in seconds) a strategy refresh was performed.
     last_strategy_refresh_secs: u64,
+
+    // --- Strategy delta stopping ---
+    /// Previous strategy-sum snapshot for delta computation.
+    prev_strategy_sums: Option<Vec<i64>>,
+    /// Most recent strategy delta value.
+    pub last_strategy_delta: f64,
 }
 
 impl BlueprintTrainer {
@@ -168,6 +174,8 @@ impl BlueprintTrainer {
             scenario_node_indices: Vec::new(),
             on_strategy_refresh: None,
             last_strategy_refresh_secs: 0,
+            prev_strategy_sums: None,
+            last_strategy_delta: f64::INFINITY,
         }
     }
 
@@ -281,6 +289,11 @@ impl BlueprintTrainer {
         {
             return true;
         }
+        if let Some(target) = self.config.training.target_strategy_delta
+            && self.last_strategy_delta <= target
+        {
+            return true;
+        }
         false
     }
 
@@ -316,8 +329,9 @@ impl BlueprintTrainer {
             self.apply_lcfr_discount();
         }
 
-        // Progress logging.
+        // Strategy delta computation (same cadence as progress logging).
         if elapsed_min >= self.last_print_time + self.config.training.print_every_minutes {
+            self.update_strategy_delta();
             self.print_metrics();
         }
 
@@ -369,6 +383,14 @@ impl BlueprintTrainer {
         self.last_discount_time = elapsed_min;
     }
 
+    /// Compute and store the strategy delta vs the previous snapshot.
+    fn update_strategy_delta(&mut self) {
+        if let Some(ref prev) = self.prev_strategy_sums {
+            self.last_strategy_delta = self.storage.strategy_delta(prev);
+        }
+        self.prev_strategy_sums = Some(self.storage.snapshot_strategy_sums());
+    }
+
     /// Log a one-line progress summary to stderr.
     fn print_metrics(&mut self) {
         let elapsed = self.start_time.elapsed();
@@ -380,11 +402,12 @@ impl BlueprintTrainer {
         };
 
         eprintln!(
-            "[{:>6.1}m] iter={:<10} {:.0} it/s  mean_pos_regret={:.2}",
+            "[{:>6.1}m] iter={:<10} {:.0} it/s  mean_pos_regret={:.2}  δ={:.6}",
             secs / 60.0,
             self.iterations,
             its_per_sec,
             self.mean_positive_regret(),
+            self.last_strategy_delta,
         );
 
         self.last_print_time = self.elapsed_minutes();
@@ -487,6 +510,7 @@ mod tests {
                 prune_explore_pct: 0.05,
                 print_every_minutes: 9999,
                 batch_size: 200,
+                target_strategy_delta: None,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 9999,
@@ -648,5 +672,25 @@ mod tests {
         let mut trainer = BlueprintTrainer::new(config);
         trainer.train().expect("training should complete");
         assert_eq!(trainer.iterations, 10);
+    }
+
+    #[test]
+    fn strategy_delta_stops_training() {
+        let mut config = toy_config();
+        // No iteration limit — only delta-based stopping.
+        config.training.iterations = None;
+        config.training.time_limit_minutes = Some(1); // safety timeout
+        config.training.target_strategy_delta = Some(0.5);
+        config.training.print_every_minutes = 0; // check every batch
+        config.training.batch_size = 50;
+        let mut trainer = BlueprintTrainer::new(config);
+        trainer.train().expect("training should complete");
+        // Should have stopped due to delta, not the 1-minute limit.
+        assert!(trainer.iterations > 0, "should have run some iterations");
+        assert!(
+            trainer.last_strategy_delta <= 0.5,
+            "should have stopped when delta <= 0.5, got {}",
+            trainer.last_strategy_delta,
+        );
     }
 }

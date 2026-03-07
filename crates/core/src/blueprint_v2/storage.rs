@@ -206,6 +206,71 @@ impl BlueprintStorage {
         self.layout[node_idx as usize].street_idx
     }
 
+    /// Compute mean absolute strategy change vs a previous strategy-sum snapshot.
+    ///
+    /// `prev_sums` must have the same length as `self.strategy_sums`.
+    /// For each (node, bucket) group, normalises both old and new sums to
+    /// probability distributions, then takes the max absolute difference
+    /// across actions. Returns the mean of these per-group max deltas.
+    ///
+    /// A value near 0 means the average strategy has stabilised.
+    #[must_use]
+    pub fn strategy_delta(&self, prev_sums: &[i64]) -> f64 {
+        assert_eq!(prev_sums.len(), self.strategy_sums.len());
+        let mut total_delta = 0.0_f64;
+        let mut num_groups = 0_u64;
+
+        for nl in &self.layout {
+            if nl.num_actions == 0 {
+                continue;
+            }
+            let n = nl.num_actions as usize;
+            let buckets = self.bucket_counts[nl.street_idx as usize] as usize;
+            for b in 0..buckets {
+                let start = nl.offset + b * n;
+
+                // Normalise previous sums.
+                let prev_total: f64 = (0..n).map(|i| prev_sums[start + i] as f64).sum();
+                // Normalise current sums.
+                let curr_total: f64 = (0..n)
+                    .map(|i| self.strategy_sums[start + i].load(Ordering::Relaxed) as f64)
+                    .sum();
+
+                let mut max_diff = 0.0_f64;
+                for i in 0..n {
+                    let p = if prev_total > 0.0 {
+                        prev_sums[start + i] as f64 / prev_total
+                    } else {
+                        1.0 / n as f64
+                    };
+                    let c = if curr_total > 0.0 {
+                        self.strategy_sums[start + i].load(Ordering::Relaxed) as f64 / curr_total
+                    } else {
+                        1.0 / n as f64
+                    };
+                    max_diff = max_diff.max((p - c).abs());
+                }
+                total_delta += max_diff;
+                num_groups += 1;
+            }
+        }
+
+        if num_groups > 0 {
+            total_delta / num_groups as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Snapshot the current strategy sums as plain `i64` values.
+    #[must_use]
+    pub fn snapshot_strategy_sums(&self) -> Vec<i64> {
+        self.strategy_sums
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect()
+    }
+
     /// Serialize regrets and strategy sums to a binary file.
     ///
     /// # Errors
@@ -471,5 +536,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn strategy_delta_zero_for_identical() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let snap = storage.snapshot_strategy_sums();
+        let delta = storage.strategy_delta(&snap);
+        assert!((delta - 0.0).abs() < 1e-10, "identical snapshots → delta 0, got {delta}");
+    }
+
+    #[test]
+    fn strategy_delta_detects_change() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+
+        // Snapshot with initial strategy sums (all zero → uniform).
+        let snap = storage.snapshot_strategy_sums();
+
+        // Now change one action to dominate.
+        storage.add_strategy_sum(node_idx, 0, 0, 1000);
+
+        let delta = storage.strategy_delta(&snap);
+        assert!(delta > 0.0, "changed strategy should have delta > 0, got {delta}");
     }
 }

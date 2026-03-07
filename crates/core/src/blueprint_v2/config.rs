@@ -100,6 +100,10 @@ pub struct TrainingConfig {
     /// Number of iterations per parallel batch.
     #[serde(default = "default_batch_size")]
     pub batch_size: u64,
+    /// Stop when mean strategy delta falls below this threshold.
+    /// Checked every `print_every_minutes`. `None` = never stop on delta.
+    #[serde(default)]
+    pub target_strategy_delta: Option<f64>,
 }
 
 /// Snapshot (checkpoint) output settings.
@@ -284,6 +288,7 @@ snapshots:
                 prune_explore_pct: 0.05,
                 print_every_minutes: 10,
                 batch_size: 200,
+                target_strategy_delta: None,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 120,

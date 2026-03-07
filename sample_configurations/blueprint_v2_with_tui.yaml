@@ -37,6 +37,7 @@ training:
   lcfr_warmup_minutes: 200
   prune_after_minutes: 200
   batch_size: 200
+  # target_strategy_delta: 0.001  # stop when strategy stabilises
 
 snapshots:
   warmup_minutes: 60

@@ -48,6 +48,7 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
             prune_explore_pct: 0.05,
             print_every_minutes: 9999,
             batch_size: 1,
+            target_strategy_delta: None,
         },
         snapshots: SnapshotConfig {
             warmup_minutes: 9999,

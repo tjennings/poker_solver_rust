@@ -332,6 +332,8 @@ When `tui.enabled: true` in the config, `train-blueprint` launches a full-screen
 
 **Parallel Training:** Blueprint V2 automatically uses all available CPU cores. Each batch of `batch_size` deals (default: 200) is processed in parallel using Rayon's thread pool. LCFR discount and snapshots run between batches. Set `RAYON_NUM_THREADS=N` to limit core usage.
 
+**Strategy Delta Stopping:** Set `target_strategy_delta` in the training config to auto-stop when the average strategy stabilises. The delta is the mean max absolute probability change across all (node, bucket) information sets between metric checks. Checked every `print_every_minutes`. Example: `target_strategy_delta: 0.001` stops when the strategy is changing by less than 0.1% on average.
+
 **Left panel:** iteration progress, throughput sparkline, exploitability chart
 **Right panel:** tabbed 13x13 strategy grids for configured scenarios
 
