@@ -213,7 +213,7 @@ function ComboClassPanel({
 }
 
 // Action block in the navigation strip
-function ActionBlock({
+export function ActionBlock({
   position,
   stack,
   pot,

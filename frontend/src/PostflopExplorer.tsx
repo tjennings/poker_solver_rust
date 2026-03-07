@@ -17,6 +17,7 @@ import {
   getActionColor,
   formatActionLabel,
 } from './matrix-utils';
+import { ActionBlock } from './Explorer';
 
 /** Convert PostflopActionInfo → ActionInfo so shared color/label utils work. */
 function toActionInfo(a: PostflopActionInfo): ActionInfo {
@@ -236,29 +237,14 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
 
         {/* Available actions */}
         {matrix && !terminal && !awaitingCard && (
-          <div className={`action-block${solving ? '' : ' current'}`}>
-            <div className="action-block-header">
-              <span className="position">{matrix.player === 0 ? 'OOP' : 'IP'}</span>
-              <span className="stack">{Math.round(matrix.stacks[matrix.player] / 2)}BB / {Math.round(matrix.pot / 2)}BB</span>
-            </div>
-            <div className="action-list">
-              {matrix.actions.map((action) => {
-                const info = toActionInfo(action);
-                const color = getActionColor(info, toActionInfos(matrix.actions));
-                return (
-                  <button
-                    key={action.index}
-                    className="action-button"
-                    style={{ borderLeft: `3px solid ${color}` }}
-                    disabled={solving}
-                    onClick={() => handleAction(action.index)}
-                  >
-                    {formatActionLabel(info)}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+          <ActionBlock
+            position={matrix.player === 0 ? 'OOP' : 'IP'}
+            stack={matrix.stacks[matrix.player]}
+            pot={matrix.pot}
+            actions={toActionInfos(matrix.actions)}
+            onSelect={(actionId) => !solving && handleAction(Number(actionId))}
+            isCurrent={!solving}
+          />
         )}
 
         {/* Next street card (turn/river) */}
