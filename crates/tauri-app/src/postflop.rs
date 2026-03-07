@@ -162,8 +162,18 @@ fn matrix_cell_label(row: usize, col: usize) -> (String, bool, bool) {
     }
 }
 
+/// Format a chip amount as a pot-percentage string (e.g. "33%" or "120%").
+fn format_pot_pct(amt: i32, pot: i32) -> String {
+    if pot > 0 {
+        let pct = (amt as f64 / pot as f64 * 100.0).round() as i32;
+        format!("{pct}%")
+    } else {
+        format!("{amt}")
+    }
+}
+
 /// Converts a range-solver `Action` to a serializable `PostflopActionInfo`.
-fn action_to_info(action: &Action, index: usize) -> PostflopActionInfo {
+fn action_to_info(action: &Action, index: usize, pot: i32) -> PostflopActionInfo {
     match action {
         Action::Fold => PostflopActionInfo {
             index,
@@ -185,13 +195,13 @@ fn action_to_info(action: &Action, index: usize) -> PostflopActionInfo {
         },
         Action::Bet(amt) => PostflopActionInfo {
             index,
-            label: format!("Bet {amt}"),
+            label: format!("Bet {}", format_pot_pct(*amt, pot)),
             action_type: "bet".to_string(),
             amount: Some(*amt),
         },
         Action::Raise(amt) => PostflopActionInfo {
             index,
-            label: format!("Raise {amt}"),
+            label: format!("Raise {}", format_pot_pct(*amt, pot)),
             action_type: "raise".to_string(),
             amount: Some(*amt),
         },
@@ -259,10 +269,15 @@ pub fn build_strategy_matrix(game: &PostFlopGame) -> PostflopStrategyMatrix {
     let num_hands = game.num_private_hands(player);
     let num_actions = actions.len();
 
+    // Compute pot first so action labels can show pot-relative percentages.
+    let tree_config = game.tree_config();
+    let bet_amounts = game.total_bet_amount();
+    let pot = tree_config.starting_pot + bet_amounts[0] + bet_amounts[1];
+
     let action_infos: Vec<PostflopActionInfo> = actions
         .iter()
         .enumerate()
-        .map(|(i, a)| action_to_info(a, i))
+        .map(|(i, a)| action_to_info(a, i, pot))
         .collect();
 
     // Initialize the 13x13 matrix with zeroed probability accumulators.
@@ -319,10 +334,7 @@ pub fn build_strategy_matrix(game: &PostFlopGame) -> PostflopStrategyMatrix {
         .filter_map(|&c| card_to_string(c).ok())
         .collect();
 
-    // Pot and stacks.
-    let tree_config = game.tree_config();
-    let bet_amounts = game.total_bet_amount();
-    let pot = tree_config.starting_pot + bet_amounts[0] + bet_amounts[1];
+    // Stacks (pot and bet_amounts already computed above).
     let stacks = [
         tree_config.effective_stack - bet_amounts[0],
         tree_config.effective_stack - bet_amounts[1],
@@ -868,17 +880,17 @@ mod tests {
 
     #[test]
     fn test_action_to_info() {
-        let info = action_to_info(&Action::Fold, 0);
+        let info = action_to_info(&Action::Fold, 0, 100);
         assert_eq!(info.label, "Fold");
         assert_eq!(info.action_type, "fold");
         assert!(info.amount.is_none());
 
-        let info = action_to_info(&Action::Bet(50), 1);
-        assert_eq!(info.label, "Bet 50");
+        let info = action_to_info(&Action::Bet(50), 1, 100);
+        assert_eq!(info.label, "Bet 50%");
         assert_eq!(info.action_type, "bet");
         assert_eq!(info.amount, Some(50));
 
-        let info = action_to_info(&Action::AllIn(200), 2);
+        let info = action_to_info(&Action::AllIn(200), 2, 100);
         assert_eq!(info.label, "All-in 200");
         assert_eq!(info.action_type, "allin");
         assert_eq!(info.amount, Some(200));

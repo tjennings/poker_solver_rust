@@ -196,7 +196,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
           </div>
           {configSummary && (
             <div className="postflop-config-combos">
-              OOP: {configSummary.oop_combos} &middot; IP: {configSummary.ip_combos}
+              SB: {configSummary.oop_combos} &middot; BB: {configSummary.ip_combos}
             </div>
           )}
         </div>
@@ -337,7 +337,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       {/* Player indicator */}
       {matrix && (
         <div style={{ fontSize: '0.85em', opacity: 0.6, padding: '4px 12px' }}>
-          {matrix.player === 0 ? 'OOP' : 'IP'} to act — Board: {matrix.board.join(' ')}
+          {matrix.player === 0 ? 'SB' : 'BB'} to act — Board: {matrix.board.join(' ')}
         </div>
       )}
 
