@@ -47,6 +47,7 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
             prune_threshold: -310_000_000,
             prune_explore_pct: 0.05,
             print_every_minutes: 9999,
+            batch_size: 1,
         },
         snapshots: SnapshotConfig {
             warmup_minutes: 9999,
@@ -149,7 +150,7 @@ fn blueprint_v2_e2e_pipeline() {
 
     // After training, some regrets should be non-zero.
     assert!(
-        trainer.storage.regrets.iter().any(|&r| r != 0),
+        trainer.storage.regrets.iter().any(|r| r.load(std::sync::atomic::Ordering::Relaxed) != 0),
         "regrets should be updated after training"
     );
 
