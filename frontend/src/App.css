@@ -561,6 +561,37 @@ button:disabled {
   border-width: 2px;
 }
 
+.action-block.solve-block {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border-color: #d4a017;
+  border-width: 2px;
+  min-height: 80px;
+  transition: border-color 0.2s, background 0.2s;
+}
+.action-block.solve-block:hover {
+  background: linear-gradient(135deg, #1a1a30 0%, #252545 100%);
+  border-color: #f0c030;
+}
+.action-block.solve-block.solving {
+  border-color: #dc2626;
+}
+.action-block.solve-block.solving:hover {
+  border-color: #ef4444;
+  background: linear-gradient(135deg, #1a1215 0%, #2a1520 100%);
+}
+.solve-label {
+  font-weight: 700;
+  font-size: 1rem;
+  letter-spacing: 0.1em;
+  color: #d4a017;
+}
+.action-block.solve-block.solving .solve-label {
+  color: #dc2626;
+}
+
 .action-block-header {
   display: flex;
   justify-content: space-between;
@@ -1256,25 +1287,6 @@ button:disabled {
   gap: 8px;
   height: 28px;
   margin: 8px 0;
-}
-.progress-bar-cancel {
-  flex-shrink: 0;
-  width: 22px;
-  height: 22px;
-  border: none;
-  border-radius: 4px;
-  background: rgba(220, 38, 38, 0.7);
-  color: #fff;
-  font-size: 14px;
-  line-height: 1;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-}
-.progress-bar-cancel:hover {
-  background: rgba(220, 38, 38, 1);
 }
 .progress-bar-track {
   position: relative;

@@ -80,6 +80,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   const [awaitingCard, setAwaitingCard] = useState(false);
   const [terminal, setTerminal] = useState(false);
   const [selectedCell, setSelectedCell] = useState<{row: number; col: number} | null>(null);
+  const [needsSolve, setNeedsSolve] = useState(false);
   // Track actions per street for close_street call
   const [streetActions, setStreetActions] = useState<number[]>([]);
 
@@ -132,6 +133,41 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   }, []);
 
 
+  /** Reset everything for a new hand. */
+  const handleReset = useCallback(() => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+    setMatrix(null);
+    setSelectedCell(null);
+    setNeedsSolve(false);
+    setActionHistory([]);
+    setStreetActions([]);
+    setBoardInput('');
+    setTerminal(false);
+    setAwaitingCard(false);
+    setProgress(null);
+    setError(null);
+    setSolving(false);
+  }, []);
+
+  /** Start or cancel solve for the current board. */
+  const handleSolve = useCallback(() => {
+    if (solving) {
+      // Cancel
+      handleReset();
+      return;
+    }
+    const cards = boardInput.trim().split(/\s+/);
+    if (cards.length < 3) return;
+    setError(null);
+    setSolving(true);
+    setNeedsSolve(false);
+    setMatrix(null);
+    setProgress(null);
+    invoke('postflop_solve_street', { board: cards })
+      .then(() => startPolling())
+      .catch((e) => { setError(String(e)); setSolving(false); });
+  }, [solving, boardInput, handleReset, startPolling]);
+
   /** Navigate the solved tree by clicking an action button. */
   const handleAction = useCallback(async (actionIndex: number) => {
     if (solving) return;
@@ -168,20 +204,6 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
 
 
   /** Reset everything for a new hand. */
-  const handleReset = useCallback(() => {
-    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-    setMatrix(null);
-    setSelectedCell(null);
-    setActionHistory([]);
-    setStreetActions([]);
-    setBoardInput('');
-    setTerminal(false);
-    setAwaitingCard(false);
-    setProgress(null);
-    setError(null);
-    setSolving(false);
-  }, []);
-
   return (
     <div className="explorer-root">
       {error && <div className="error">{error}</div>}
@@ -251,6 +273,13 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
           </div>
         ))}
 
+        {/* Solve button */}
+        {(needsSolve || solving) && !matrix && (
+          <div className={`action-block solve-block ${solving ? 'solving' : ''}`} onClick={handleSolve}>
+            <span className="solve-label">{solving ? 'CANCEL' : 'SOLVE'}</span>
+          </div>
+        )}
+
         {/* Available actions */}
         {matrix && !terminal && !awaitingCard && (
           <ActionBlock
@@ -287,19 +316,13 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
               onConfirm={(cards) => {
                 setBoardInput(cards.join(' '));
                 setShowFlopPicker(false);
-                setTimeout(() => {
-                  setError(null);
-                  setSolving(true);
-                  setActionHistory([]);
-                  setStreetActions([]);
-                  setMatrix(null);
-                  setProgress(null);
-                  setTerminal(false);
-                  setAwaitingCard(false);
-                  invoke('postflop_solve_street', { board: cards })
-                    .then(() => startPolling())
-                    .catch((e) => { setError(String(e)); setSolving(false); });
-                }, 0);
+                setActionHistory([]);
+                setStreetActions([]);
+                setMatrix(null);
+                setProgress(null);
+                setTerminal(false);
+                setAwaitingCard(false);
+                setNeedsSolve(true);
               }}
             />
           </div>
@@ -315,23 +338,18 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
             deadCards={boardCards}
             onConfirm={(card) => {
               setShowNextCardPicker(false);
-              // Trigger the next card logic
-              setTimeout(() => {
-                setAwaitingCard(false);
-                setError(null);
-                invoke<PostflopStreetResult>('postflop_close_street', { action_history: streetActions })
-                  .then(() => {
-                    const newBoard = [...boardCards, card];
-                    setBoardInput(newBoard.join(' '));
-                    setStreetActions([]);
-                                    setSolving(true);
-                    setMatrix(null);
-                    setProgress(null);
-                    return invoke('postflop_solve_street', { board: newBoard });
-                  })
-                  .then(() => startPolling())
-                  .catch((e) => { setError(String(e)); setSolving(false); });
-              }, 0);
+              setAwaitingCard(false);
+              setError(null);
+              invoke<PostflopStreetResult>('postflop_close_street', { action_history: streetActions })
+                .then(() => {
+                  const newBoard = [...boardCards, card];
+                  setBoardInput(newBoard.join(' '));
+                  setStreetActions([]);
+                  setMatrix(null);
+                  setProgress(null);
+                  setNeedsSolve(true);
+                })
+                .catch((e) => { setError(String(e)); });
             }}
           />
           </div>
@@ -341,7 +359,6 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       {/* Progress bar */}
       {solving && progress && (
         <div className="progress-bar-container">
-          <button className="progress-bar-cancel" title="Cancel solve" onClick={handleReset}>✕</button>
           <div className="progress-bar-track">
             <div className="progress-bar-fill" style={{
               width: `${(progress.iteration / Math.max(progress.max_iterations, 1)) * 100}%`,
