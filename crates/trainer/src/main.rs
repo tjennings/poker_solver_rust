@@ -492,11 +492,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                 trainer.shared_iterations = Arc::clone(&metrics.iterations);
                 trainer.snapshot_trigger = Arc::clone(&metrics.snapshot_trigger);
 
+                // Pre-compute board cards for each scenario.
+                let scenario_boards: Vec<Vec<poker_solver_core::poker::Card>> = tui_config
+                    .scenarios
+                    .iter()
+                    .map(|sc| {
+                        sc.board
+                            .as_ref()
+                            .map(|strings| {
+                                strings
+                                    .iter()
+                                    .filter_map(|s| {
+                                        poker_solver_core::preflop::postflop_hands::parse_card(s)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect();
+
                 // Resolve scenarios to game-tree nodes.
                 let scenarios: Vec<blueprint_tui::ResolvedScenario> = tui_config
                     .scenarios
                     .iter()
-                    .map(|sc| {
+                    .enumerate()
+                    .map(|(i, sc)| {
                         let node_idx = blueprint_tui_scenarios::resolve_action_path(
                             &trainer.tree,
                             &sc.actions,
@@ -506,6 +526,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             &trainer.tree,
                             &trainer.storage,
                             node_idx,
+                            &scenario_boards[i],
                         );
                         blueprint_tui::ResolvedScenario {
                             name: sc.name.clone(),
@@ -537,10 +558,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     tui_config.telemetry.strategy_delta_interval_seconds;
 
                 let metrics_for_refresh = Arc::clone(&metrics);
+                let boards_for_refresh = scenario_boards;
                 trainer.on_strategy_refresh =
                     Some(Box::new(move |scenario_idx, node_idx, storage, tree| {
+                        let board = &boards_for_refresh[scenario_idx];
                         let grid = blueprint_tui_scenarios::extract_strategy_grid(
-                            tree, storage, node_idx,
+                            tree, storage, node_idx, board,
                         );
                         metrics_for_refresh.update_scenario_grid(scenario_idx, grid);
                     }));

@@ -3,6 +3,7 @@
 
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
+use poker_solver_core::poker::Card;
 
 use crate::blueprint_tui_widgets::CellStrategy;
 
@@ -51,14 +52,15 @@ pub fn format_tree_action(action: &TreeAction) -> String {
 
 /// Build the 13x13 strategy grid for the decision node at `node_idx`.
 ///
-/// For preflop, bucket = canonical hand index (`row * 13 + col`) mod
-/// `num_buckets`. For postflop streets the bucket is fixed at 0 — real
-/// cluster-based resolution requires clustering data wired in later.
+/// For preflop, bucket = canonical hand index mod `num_buckets`.
+/// For postflop streets, equity-based bucketing is used to match the
+/// solver's `AllBuckets::get_bucket()` logic.
 #[allow(clippy::cast_possible_truncation)]
 pub fn extract_strategy_grid(
     tree: &GameTree,
     storage: &BlueprintStorage,
     node_idx: u32,
+    board: &[Card],
 ) -> [[CellStrategy; 13]; 13] {
     let mut grid: [[CellStrategy; 13]; 13] =
         std::array::from_fn(|_| std::array::from_fn(|_| CellStrategy::default()));
@@ -89,7 +91,21 @@ pub fn extract_strategy_grid(
                 ).expect("valid 13x13 matrix position");
                 (hand.index() as u16) % num_buckets
             } else {
-                0
+                // Postflop: equity-based bucketing matching the solver.
+                let hand = poker_solver_core::hands::CanonicalHand::from_matrix_position(
+                    row as usize, col as usize,
+                ).expect("valid 13x13 matrix position");
+                let combo = hand.combos().into_iter().find(|(c1, c2)| {
+                    !board.contains(c1) && !board.contains(c2)
+                });
+                if let Some((c1, c2)) = combo {
+                    let equity = poker_solver_core::showdown_equity::compute_equity(
+                        [c1, c2], board,
+                    );
+                    ((equity * f64::from(num_buckets)) as u16).min(num_buckets - 1)
+                } else {
+                    0 // hand fully blocked by board
+                }
             };
 
             let probs = storage.average_strategy(node_idx, bucket);
@@ -214,7 +230,7 @@ mod tests {
     fn extract_grid_returns_169_cells() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
-        let grid = extract_strategy_grid(&tree, &storage, tree.root);
+        let grid = extract_strategy_grid(&tree, &storage, tree.root, &[]);
         for row in &grid {
             for cell in row {
                 assert!(
