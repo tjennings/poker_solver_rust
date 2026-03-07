@@ -597,7 +597,7 @@ pub fn run_clustering_pipeline(
 // ---------------------------------------------------------------------------
 
 /// Build the standard 52-card deck in a deterministic order.
-fn build_deck() -> Vec<Card> {
+pub(crate) fn build_deck() -> Vec<Card> {
     let mut deck = Vec::with_capacity(52);
     for &v in &ALL_VALUES {
         for &s in &ALL_SUITS {
@@ -612,7 +612,7 @@ fn build_deck() -> Vec<Card> {
 /// The combos are stored as `(Card, Card)` with `c0 < c1` by deck index.
 /// The ordering is deterministic and matches the canonical combo index used
 /// throughout the bucket file.
-fn enumerate_combos(deck: &[Card]) -> Vec<[Card; 2]> {
+pub(crate) fn enumerate_combos(deck: &[Card]) -> Vec<[Card; 2]> {
     let mut combos = Vec::with_capacity(TOTAL_COMBOS as usize);
     for i in 0..deck.len() {
         for j in (i + 1)..deck.len() {
@@ -650,7 +650,7 @@ fn sample_n_card_boards(
 }
 
 /// Sample `n` random 5-card boards from the deck without replacement.
-fn sample_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 5]> {
+pub(crate) fn sample_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 5]> {
     sample_n_card_boards(deck, 5, n, seed)
         .into_iter()
         .map(|v| [v[0], v[1], v[2], v[3], v[4]])
@@ -660,7 +660,7 @@ fn sample_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 5]> {
 /// Compute equity for all 1326 combos on a given 5-card board.
 ///
 /// Returns `None` for combos that share a card with the board (blocked).
-fn compute_board_equities(board: [Card; 5], combos: &[[Card; 2]]) -> Vec<Option<f64>> {
+pub(crate) fn compute_board_equities(board: [Card; 5], combos: &[[Card; 2]]) -> Vec<Option<f64>> {
     combos
         .iter()
         .map(|&combo| {

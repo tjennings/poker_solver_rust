@@ -12,6 +12,8 @@ import {
   PostflopStreetResult,
 } from './types';
 import {
+  SUIT_COLORS,
+  SUIT_SYMBOLS,
   getActionColor,
   formatActionLabel,
 } from './matrix-utils';
@@ -59,11 +61,18 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   const pollRef = useRef<number | null>(null);
 
   // Navigation state
+  const [showFlopPicker, setShowFlopPicker] = useState(false);
+  const [showNextCardPicker, setShowNextCardPicker] = useState(false);
   const [awaitingCard, setAwaitingCard] = useState(false);
-  const [nextCardInput, setNextCardInput] = useState('');
   const [terminal, setTerminal] = useState(false);
   // Track actions per street for close_street call
   const [streetActions, setStreetActions] = useState<number[]>([]);
+
+  const boardCards = useMemo(() => {
+    const trimmed = boardInput.trim();
+    if (!trimmed) return [];
+    return trimmed.split(/\s+/);
+  }, [boardInput]);
 
   useEffect(() => {
     invoke<PostflopConfigSummary>('postflop_set_config', { config })
@@ -107,33 +116,6 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     pollRef.current = window.setInterval(poll, 2000);
   }, []);
 
-  const handleSolve = useCallback(async () => {
-    const cards = boardInput.trim().split(/\s+/);
-    if (cards.length < 3 || cards.length > 5) {
-      setError('Enter 3-5 cards (e.g. Ah Kd 7c)');
-      return;
-    }
-
-    setError(null);
-    setSolving(true);
-    setActionHistory([]);
-    setStreetActions([]);
-    setMatrix(null);
-    setProgress(null);
-    setTerminal(false);
-    setAwaitingCard(false);
-    setNextCardInput('');
-
-    try {
-      await invoke('postflop_solve_street', { board: cards });
-    } catch (e) {
-      setError(String(e));
-      setSolving(false);
-      return;
-    }
-
-    startPolling();
-  }, [boardInput, startPolling]);
 
   /** Navigate the solved tree by clicking an action button. */
   const handleAction = useCallback(async (actionIndex: number) => {
@@ -168,39 +150,6 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     }
   }, [solving, matrix]);
 
-  /** Deal the next street card (turn or river). */
-  const handleNextCard = useCallback(async () => {
-    const card = nextCardInput.trim();
-    if (!card) return;
-
-    setError(null);
-    setAwaitingCard(false);
-
-    try {
-      // Filter ranges through the completed street's action history.
-      await invoke<PostflopStreetResult>('postflop_close_street', {
-        action_history: streetActions,
-      });
-
-      // Build new board: current board + new card.
-      const currentCards = boardInput.trim().split(/\s+/);
-      const newBoard = [...currentCards, card];
-      setBoardInput(newBoard.join(' '));
-      setStreetActions([]);
-      setNextCardInput('');
-
-      // Solve the new street.
-      setSolving(true);
-      setMatrix(null);
-      setProgress(null);
-      await invoke('postflop_solve_street', { board: newBoard });
-
-      startPolling();
-    } catch (e) {
-      setError(String(e));
-      setSolving(false);
-    }
-  }, [nextCardInput, boardInput, streetActions, startPolling]);
 
   /** Reset everything for a new hand. */
   const handleReset = useCallback(() => {
@@ -213,7 +162,6 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     setAwaitingCard(false);
     setProgress(null);
     setError(null);
-    setNextCardInput('');
     setSolving(false);
   }, []);
 
@@ -222,11 +170,21 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       {error && <div className="error">{error}</div>}
 
       <div className="action-strip">
-        {/* Back button */}
-        <div className="action-block postflop-back-btn" onClick={onBack}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <polyline points="15 18 9 12 15 6" />
-          </svg>
+        {/* Split switcher: load dataset / postflop solver */}
+        <div className="dataset-switcher-split">
+          <div className="dataset-switcher-half" onClick={onBack} title="Load Dataset">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+              <line x1="12" y1="11" x2="12" y2="17" />
+              <line x1="9" y1="14" x2="15" y2="14" />
+            </svg>
+          </div>
+          <div className="dataset-switcher-half active" title="Postflop Solver">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="2" y="2" width="20" height="20" rx="2" />
+              <path d="M7 12h10M12 7v10" />
+            </svg>
+          </div>
         </div>
 
         {/* Config card */}
@@ -242,18 +200,29 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
           )}
         </div>
 
-        {/* Flop input */}
-        <div className="action-block postflop-board-input">
-          <div className="postflop-config-label">Flop</div>
-          <input
-            type="text"
-            placeholder="Ah Kd 7c"
-            value={boardInput}
-            onChange={(e) => setBoardInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') handleSolve(); }}
-            className="postflop-card-input"
-            disabled={solving}
-          />
+        {/* Flop street block */}
+        <div
+          className={`street-block ${boardCards.length === 3 ? '' : 'pending'}`}
+          onClick={() => { if (!solving) setShowFlopPicker(true); }}
+          style={{ cursor: solving ? 'default' : 'pointer' }}
+        >
+          <div className="street-block-header">
+            <span className="street-name">FLOP</span>
+          </div>
+          <div className="street-cards">
+            {[0, 1, 2].map((i) => {
+              const card = boardCards[i];
+              if (!card) return <div key={i} className="street-card empty"><span>?</span></div>;
+              const rank = card[0]?.toUpperCase();
+              const suit = card[1]?.toLowerCase();
+              return (
+                <div key={i} className="street-card" style={{ backgroundColor: SUIT_COLORS[suit] || '#333' }}>
+                  <span className="card-rank">{rank}</span>
+                  <span className="card-suit">{SUIT_SYMBOLS[suit] || '?'}</span>
+                </div>
+              );
+            })}
+          </div>
         </div>
 
         {/* Action history blocks */}
@@ -265,24 +234,77 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
           </div>
         ))}
 
-        {/* Next street card input */}
+        {/* Next street card (turn/river) */}
         {awaitingCard && (
-          <div className="action-block postflop-board-input">
-            <div className="postflop-config-label">
-              {boardInput.trim().split(/\s+/).length === 3 ? 'Turn' : 'River'}
+          <div className="street-block pending" style={{ cursor: 'pointer' }}
+            onClick={() => setShowNextCardPicker(true)}>
+            <div className="street-block-header">
+              <span className="street-name">{boardCards.length === 3 ? 'TURN' : 'RIVER'}</span>
             </div>
-            <input
-              type="text"
-              placeholder="5s"
-              value={nextCardInput}
-              onChange={(e) => setNextCardInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') handleNextCard(); }}
-              className="postflop-card-input"
-              autoFocus
-            />
+            <div className="street-cards">
+              <div className="street-card empty"><span>?</span></div>
+            </div>
           </div>
         )}
       </div>
+
+      {/* Flop card picker */}
+      {showFlopPicker && (
+        <div className="card-picker-container">
+          <p className="card-picker-prompt">Select 3 flop cards</p>
+          <FlopPicker
+            deadCards={[]}
+            onConfirm={(cards) => {
+              setBoardInput(cards.join(' '));
+              setShowFlopPicker(false);
+              // Auto-solve after selecting flop
+              setTimeout(() => {
+                setError(null);
+                setSolving(true);
+                setActionHistory([]);
+                setStreetActions([]);
+                setMatrix(null);
+                setProgress(null);
+                setTerminal(false);
+                setAwaitingCard(false);
+                            invoke('postflop_solve_street', { board: cards })
+                  .then(() => startPolling())
+                  .catch((e) => { setError(String(e)); setSolving(false); });
+              }, 0);
+            }}
+          />
+        </div>
+      )}
+
+      {/* Next card picker (turn/river) */}
+      {showNextCardPicker && awaitingCard && (
+        <div className="card-picker-container">
+          <p className="card-picker-prompt">Select {boardCards.length === 3 ? 'turn' : 'river'} card</p>
+          <NextCardPicker
+            deadCards={boardCards}
+            onConfirm={(card) => {
+              setShowNextCardPicker(false);
+              // Trigger the next card logic
+              setTimeout(() => {
+                setAwaitingCard(false);
+                setError(null);
+                invoke<PostflopStreetResult>('postflop_close_street', { action_history: streetActions })
+                  .then(() => {
+                    const newBoard = [...boardCards, card];
+                    setBoardInput(newBoard.join(' '));
+                    setStreetActions([]);
+                                    setSolving(true);
+                    setMatrix(null);
+                    setProgress(null);
+                    return invoke('postflop_solve_street', { board: newBoard });
+                  })
+                  .then(() => startPolling())
+                  .catch((e) => { setError(String(e)); setSolving(false); });
+              }, 0);
+            }}
+          />
+        </div>
+      )}
 
       {/* Progress bar */}
       {solving && progress && (
@@ -434,6 +456,86 @@ function ConfigModal({ config, error, onSubmit, onClose }: {
           <button className="modal-primary" onClick={() => onSubmit(draft)}>Apply</button>
         </div>
       </div>
+    </div>
+  );
+}
+
+const PICKER_RANKS = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+const PICKER_SUITS = ['s', 'h', 'd', 'c'];
+const PICKER_COLORS: Record<string, string> = { s: '#fff', h: '#dc2626', d: '#2563eb', c: '#16a34a' };
+
+function FlopPicker({ deadCards, onConfirm }: { deadCards: string[]; onConfirm: (cards: string[]) => void }) {
+  const [selected, setSelected] = useState<string[]>([]);
+  const deadSet = useMemo(() => new Set(deadCards.map((c) => c.toLowerCase())), [deadCards]);
+
+  const handleCardClick = (card: string) => {
+    if (deadSet.has(card.toLowerCase())) return;
+    setSelected((prev) => {
+      if (prev.includes(card)) return prev.filter((c) => c !== card);
+      if (prev.length >= 3) return prev;
+      return [...prev, card];
+    });
+  };
+
+  return (
+    <div className="card-picker">
+      {PICKER_SUITS.map((suit) => (
+        <div key={suit} className="card-picker-row">
+          {PICKER_RANKS.map((rank) => {
+            const card = `${rank}${suit}`;
+            const isDead = deadSet.has(card.toLowerCase());
+            const isSelected = selected.includes(card);
+            return (
+              <button
+                key={card}
+                className={`card-picker-card ${isDead ? 'dead' : ''} ${isSelected ? 'selected' : ''}`}
+                style={{ color: PICKER_COLORS[suit] || '#eee', borderColor: isSelected ? '#00d9ff' : 'transparent' }}
+                disabled={isDead}
+                onClick={() => handleCardClick(card)}
+              >
+                <span className="picker-rank">{rank}</span>
+                <span className="picker-suit">{SUIT_SYMBOLS[suit]}</span>
+              </button>
+            );
+          })}
+        </div>
+      ))}
+      <button
+        className="card-picker-confirm"
+        disabled={selected.length !== 3}
+        onClick={() => onConfirm(selected)}
+      >
+        Deal {selected.length}/3
+      </button>
+    </div>
+  );
+}
+
+function NextCardPicker({ deadCards, onConfirm }: { deadCards: string[]; onConfirm: (card: string) => void }) {
+  const deadSet = useMemo(() => new Set(deadCards.map((c) => c.toLowerCase())), [deadCards]);
+
+  return (
+    <div className="card-picker">
+      {PICKER_SUITS.map((suit) => (
+        <div key={suit} className="card-picker-row">
+          {PICKER_RANKS.map((rank) => {
+            const card = `${rank}${suit}`;
+            const isDead = deadSet.has(card.toLowerCase());
+            return (
+              <button
+                key={card}
+                className={`card-picker-card ${isDead ? 'dead' : ''}`}
+                style={{ color: PICKER_COLORS[suit] || '#eee' }}
+                disabled={isDead}
+                onClick={() => onConfirm(card)}
+              >
+                <span className="picker-rank">{rank}</span>
+                <span className="picker-suit">{SUIT_SYMBOLS[suit]}</span>
+              </button>
+            );
+          })}
+        </div>
+      ))}
     </div>
   );
 }

@@ -114,41 +114,6 @@ body {
   margin: 0;
 }
 
-/* Load dataset card */
-.load-dataset-card {
-  cursor: pointer;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  min-height: 80px;
-  border: 2px dashed rgba(255, 255, 255, 0.1);
-  transition: all 0.15s;
-}
-
-.load-dataset-card:hover {
-  border-color: #00d9ff;
-  background: rgba(0, 217, 255, 0.05);
-}
-
-.load-dataset-icon {
-  color: #555;
-}
-
-.load-dataset-card:hover .load-dataset-icon {
-  color: #00d9ff;
-}
-
-.load-dataset-label {
-  font-size: 0.85rem;
-  color: #888;
-}
-
-.load-dataset-card:hover .load-dataset-label {
-  color: #00d9ff;
-}
-
 /* Dataset picker */
 .dataset-picker {
   margin: 12px;
@@ -306,26 +271,41 @@ button:disabled {
   min-height: 0;
 }
 
-/* Dataset switcher card in action strip */
-.dataset-switcher {
+/* Dataset switcher split (two halves stacked vertically) */
+.dataset-switcher-split {
   min-width: 40px;
   max-width: 40px;
   display: flex;
-  align-items: center;
-  justify-content: center;
+  flex-direction: column;
   background: linear-gradient(135deg, #12122a 0%, #18183a 100%);
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 4px;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.dataset-switcher-half {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   color: #555;
   cursor: pointer;
   transition: all 0.15s;
-  flex-shrink: 0;
+  padding: 4px 0;
 }
 
-.dataset-switcher:hover {
+.dataset-switcher-half:first-child {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.dataset-switcher-half:hover {
   color: #00d9ff;
-  border-color: #00d9ff;
   background: rgba(0, 217, 255, 0.05);
+}
+
+.dataset-switcher-half.active {
+  color: #00d9ff;
 }
 
 /* Street block (FLOP, TURN, RIVER) */
@@ -1186,47 +1166,7 @@ button:disabled {
   z-index: 2;
 }
 
-/* Mode selection (vertical split) */
-.mode-selection {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 24px;
-  height: 100%;
-  justify-content: center;
-  align-items: center;
-}
-.mode-card {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 32px 48px;
-  border-radius: 12px;
-  background: rgba(255,255,255,0.04);
-  border: 1px solid rgba(255,255,255,0.08);
-  cursor: pointer;
-  transition: all 0.15s;
-  width: 280px;
-}
-.mode-card:hover {
-  background: rgba(255,255,255,0.08);
-  border-color: #00d9ff44;
-}
-.mode-icon { opacity: 0.6; }
-.mode-card:hover .mode-icon { opacity: 1; color: #00d9ff; }
-.mode-label { font-size: 1.1em; font-weight: 600; }
-.mode-desc { font-size: 0.8em; opacity: 0.5; }
-
 /* Postflop explorer */
-.postflop-back-btn {
-  cursor: pointer;
-  min-width: 40px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
 .postflop-config-card {
   cursor: pointer;
   min-width: 120px;
@@ -1244,19 +1184,6 @@ button:disabled {
 .postflop-config-combos {
   font-size: 0.75em;
   opacity: 0.5;
-}
-.postflop-board-input {
-  min-width: 100px;
-}
-.postflop-card-input {
-  background: transparent;
-  border: none;
-  color: inherit;
-  font-family: inherit;
-  font-size: 0.85em;
-  width: 100px;
-  outline: none;
-  padding: 2px 0;
 }
 
 /* Config modal */
