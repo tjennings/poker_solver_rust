@@ -1185,3 +1185,183 @@ button:disabled {
   background: #facc15;
   z-index: 2;
 }
+
+/* Mode selection (vertical split) */
+.mode-selection {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 24px;
+  height: 100%;
+  justify-content: center;
+  align-items: center;
+}
+.mode-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px 48px;
+  border-radius: 12px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  cursor: pointer;
+  transition: all 0.15s;
+  width: 280px;
+}
+.mode-card:hover {
+  background: rgba(255,255,255,0.08);
+  border-color: #00d9ff44;
+}
+.mode-icon { opacity: 0.6; }
+.mode-card:hover .mode-icon { opacity: 1; color: #00d9ff; }
+.mode-label { font-size: 1.1em; font-weight: 600; }
+.mode-desc { font-size: 0.8em; opacity: 0.5; }
+
+/* Postflop explorer */
+.postflop-back-btn {
+  cursor: pointer;
+  min-width: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.postflop-config-card {
+  cursor: pointer;
+  min-width: 120px;
+}
+.postflop-config-label {
+  font-size: 0.7em;
+  opacity: 0.5;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.postflop-config-summary {
+  font-size: 0.85em;
+  white-space: nowrap;
+}
+.postflop-config-combos {
+  font-size: 0.75em;
+  opacity: 0.5;
+}
+.postflop-board-input {
+  min-width: 100px;
+}
+.postflop-card-input {
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: 0.85em;
+  width: 100px;
+  outline: none;
+  padding: 2px 0;
+}
+
+/* Config modal */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal-content {
+  background: #1a1a2e;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 12px;
+  padding: 24px;
+  min-width: 400px;
+  max-width: 500px;
+}
+.modal-content h3 { margin: 0 0 16px; }
+.modal-content h4 { margin: 16px 0 8px; }
+.modal-content label {
+  display: block;
+  font-size: 0.8em;
+  opacity: 0.6;
+  margin: 8px 0 4px;
+}
+.modal-content input,
+.modal-content textarea {
+  width: 100%;
+  box-sizing: border-box;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: inherit;
+  font-family: inherit;
+  font-size: 0.9em;
+}
+.modal-row {
+  display: flex;
+  gap: 12px;
+}
+.modal-row > div { flex: 1; }
+.modal-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+.modal-buttons button {
+  padding: 6px 16px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.06);
+  color: inherit;
+  cursor: pointer;
+}
+.modal-primary {
+  background: #00d9ff22 !important;
+  border-color: #00d9ff44 !important;
+}
+
+/* Progress bar */
+.progress-bar-container {
+  position: relative;
+  height: 24px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 4px;
+  margin: 8px 0;
+  overflow: hidden;
+}
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #00d9ff33, #00d9ff66);
+  transition: width 0.3s;
+}
+.progress-text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75em;
+  opacity: 0.7;
+}
+
+/* Action buttons */
+.action-buttons {
+  display: flex;
+  gap: 6px;
+  padding: 8px 0;
+  flex-wrap: wrap;
+}
+.action-button {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 2px solid rgba(255,255,255,0.15);
+  background: rgba(255,255,255,0.04);
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.85em;
+  transition: all 0.15s;
+}
+.action-button:hover {
+  background: rgba(255,255,255,0.08);
+}
