@@ -263,6 +263,8 @@ Presets: `exhaustive_fast` (10 boards, 200 iterations) and `exhaustive_standard`
 
 When `tui.enabled: true` in the config, `train-blueprint` launches a full-screen terminal dashboard instead of text output.
 
+**Parallel Training:** Blueprint V2 automatically uses all available CPU cores. Each batch of `batch_size` deals (default: 200) is processed in parallel using Rayon's thread pool. LCFR discount and snapshots run between batches. Set `RAYON_NUM_THREADS=N` to limit core usage.
+
 **Left panel:** iteration progress, throughput sparkline, exploitability chart
 **Right panel:** tabbed 13x13 strategy grids for configured scenarios
 
