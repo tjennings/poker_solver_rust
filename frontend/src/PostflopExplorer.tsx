@@ -328,6 +328,23 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
         </div>
       )}
 
+      {/* Action buttons */}
+      {matrix && (
+        <div className="action-buttons">
+          {matrix.actions.map((action) => (
+            <button
+              key={action.index}
+              className="action-button"
+              style={{ borderColor: getActionColor(toActionInfo(action), toActionInfos(matrix.actions)) }}
+              onClick={() => handleAction(action.index)}
+              disabled={solving}
+            >
+              {formatActionLabel(toActionInfo(action))}
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* Strategy matrix */}
       {matrix && (
         <div className="matrix-container">
@@ -345,21 +362,6 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
                 </div>
               ))}
             </div>
-          </div>
-
-          {/* Action buttons */}
-          <div className="action-buttons">
-            {matrix.actions.map((action) => (
-              <button
-                key={action.index}
-                className="action-button"
-                style={{ borderColor: getActionColor(toActionInfo(action), toActionInfos(matrix.actions)) }}
-                onClick={() => handleAction(action.index)}
-                disabled={solving}
-              >
-                {formatActionLabel(toActionInfo(action))}
-              </button>
-            ))}
           </div>
         </div>
       )}

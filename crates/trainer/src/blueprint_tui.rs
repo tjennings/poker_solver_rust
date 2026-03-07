@@ -282,7 +282,7 @@ impl BlueprintTuiApp {
             .last()
             .map(|&v| v as f64)
             .unwrap_or(0.0);
-        let title = format!("Leaves moving (>20%): {latest:.1}%");
+        let title = format!("Leaves moving (>1%): {latest:.1}%");
         let sparkline = Sparkline::default()
             .block(Block::default().title(title).borders(Borders::NONE))
             .data(&self.leaf_movement_history)

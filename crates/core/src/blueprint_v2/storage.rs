@@ -254,7 +254,7 @@ impl BlueprintStorage {
                     max_diff = max_diff.max((p - c).abs());
                 }
                 total_delta += max_diff;
-                if max_diff > 0.20 {
+                if max_diff > 0.01 {
                     moving_count += 1;
                 }
                 num_groups += 1;
