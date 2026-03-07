@@ -403,11 +403,11 @@ function ConfigModal({ config, error, onSubmit, onClose }: {
       <div className="modal-content" onClick={(e) => e.stopPropagation()}>
         <h3>Game Configuration</h3>
 
-        <label>OOP Range (Hero)</label>
+        <label>SB Range</label>
         <textarea value={draft.oop_range}
           onChange={(e) => setDraft({ ...draft, oop_range: e.target.value })} rows={2} />
 
-        <label>IP Range (Villain)</label>
+        <label>BB Range</label>
         <textarea value={draft.ip_range}
           onChange={(e) => setDraft({ ...draft, ip_range: e.target.value })} rows={2} />
 
@@ -427,26 +427,14 @@ function ConfigModal({ config, error, onSubmit, onClose }: {
         <h4>Bet Sizes</h4>
         <div className="modal-row">
           <div>
-            <label>OOP Bet</label>
+            <label>SB Bet Sizes</label>
             <input value={draft.oop_bet_sizes}
               onChange={(e) => setDraft({ ...draft, oop_bet_sizes: e.target.value })} />
           </div>
           <div>
-            <label>OOP Raise</label>
-            <input value={draft.oop_raise_sizes}
-              onChange={(e) => setDraft({ ...draft, oop_raise_sizes: e.target.value })} />
-          </div>
-        </div>
-        <div className="modal-row">
-          <div>
-            <label>IP Bet</label>
+            <label>BB Bet Sizes</label>
             <input value={draft.ip_bet_sizes}
               onChange={(e) => setDraft({ ...draft, ip_bet_sizes: e.target.value })} />
-          </div>
-          <div>
-            <label>IP Raise</label>
-            <input value={draft.ip_raise_sizes}
-              onChange={(e) => setDraft({ ...draft, ip_raise_sizes: e.target.value })} />
           </div>
         </div>
 
@@ -454,7 +442,7 @@ function ConfigModal({ config, error, onSubmit, onClose }: {
 
         <div className="modal-buttons">
           <button onClick={onClose}>Cancel</button>
-          <button className="modal-primary" onClick={() => onSubmit(draft)}>Apply</button>
+          <button className="modal-primary" onClick={() => onSubmit({ ...draft, oop_raise_sizes: 'a', ip_raise_sizes: 'a' })}>Apply</button>
         </div>
       </div>
     </div>
