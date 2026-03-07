@@ -22,6 +22,10 @@ pub use exploration::{
     MatrixCell, StrategyMatrix,
 };
 
+pub use postflop::{
+    postflop_set_config, postflop_set_config_core, PostflopState,
+};
+
 pub use simulation::{
     get_simulation_result, list_strategy_sources, start_simulation, stop_simulation,
     SimulationState,

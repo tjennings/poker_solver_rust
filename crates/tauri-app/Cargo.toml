@@ -14,6 +14,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 parking_lot = "0.12"
 poker-solver-core = { path = "../core" }
+range-solver = { path = "../range-solver" }
 rs_poker = { workspace = true }
 
 [dev-dependencies]
