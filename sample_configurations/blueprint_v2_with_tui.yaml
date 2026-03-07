@@ -49,7 +49,6 @@ tui:
   enabled: true
   refresh_rate_ms: 500
   telemetry:
-    exploitability_interval_minutes: 5
     strategy_delta_interval_seconds: 30
     sparkline_window: 60
   scenarios:

@@ -84,7 +84,10 @@ pub fn extract_strategy_grid(
         for col in 0..13u16 {
             let bucket = if street_idx == 0 {
                 // Preflop: canonical hand index mod bucket count.
-                (row * 13 + col) % num_buckets
+                let hand = poker_solver_core::hands::CanonicalHand::from_matrix_position(
+                    row as usize, col as usize,
+                ).expect("valid 13x13 matrix position");
+                (hand.index() as u16) % num_buckets
             } else {
                 0
             };

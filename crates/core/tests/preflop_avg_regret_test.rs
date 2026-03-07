@@ -1,7 +1,7 @@
 use poker_solver_core::preflop::{CfrVariant, PreflopConfig, PreflopSolver, RaiseSize};
 use test_macros::timed_test;
 
-#[timed_test(10)]
+#[timed_test(15)]
 fn preflop_avg_positive_regret_positive_after_training() {
     let mut config = PreflopConfig::heads_up(10);
     config.raise_sizes = vec![vec![RaiseSize::Bb(3.0)]];

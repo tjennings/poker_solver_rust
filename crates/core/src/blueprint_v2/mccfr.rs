@@ -66,6 +66,11 @@ impl AllBuckets {
     /// used during clustering.
     #[must_use]
     pub fn get_bucket(&self, street: Street, hole_cards: [Card; 2], board: &[Card]) -> u16 {
+        if street == Street::Preflop {
+            let hand = crate::hands::CanonicalHand::from_cards(hole_cards[0], hole_cards[1]);
+            let idx = hand.index() as u16;
+            return idx.min(self.bucket_counts[0] - 1);
+        }
         // TODO: use self.bucket_files[street as usize] when a board→index
         // mapping is available from the clustering pipeline.
         let equity = crate::showdown_equity::compute_equity(hole_cards, board);
