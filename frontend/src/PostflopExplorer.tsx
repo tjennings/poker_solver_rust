@@ -341,12 +341,15 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       {/* Progress bar */}
       {solving && progress && (
         <div className="progress-bar-container">
-          <div className="progress-bar" style={{
-            width: `${(progress.iteration / Math.max(progress.max_iterations, 1)) * 100}%`,
-          }} />
-          <span className="progress-text">
-            {progress.iteration}/{progress.max_iterations} — exploit: {progress.exploitability.toExponential(2)}
-          </span>
+          <button className="progress-bar-cancel" title="Cancel solve" onClick={handleReset}>✕</button>
+          <div className="progress-bar-track">
+            <div className="progress-bar-fill" style={{
+              width: `${(progress.iteration / Math.max(progress.max_iterations, 1)) * 100}%`,
+            }} />
+            <span className="progress-text">
+              {progress.iteration}/{progress.max_iterations} — exploit: {progress.exploitability.toExponential(2)}
+            </span>
+          </div>
         </div>
       )}
 
