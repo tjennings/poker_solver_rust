@@ -705,38 +705,42 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
             eprintln!();
 
-            let pb = ProgressBar::new(1000);
-            pb.set_style(
-                ProgressStyle::with_template("  [{msg}] {bar:40.cyan/blue} {pos}/{len}")
-                    .unwrap()
-                    .progress_chars("##-"),
-            );
-            let current_street = std::sync::Mutex::new(String::new());
+            if poker_solver_core::blueprint_v2::trainer::bucket_files_exist(&output) {
+                eprintln!("Bucket files already exist in {}, skipping clustering", output.display());
+            } else {
+                let pb = ProgressBar::new(1000);
+                pb.set_style(
+                    ProgressStyle::with_template("  [{msg}] {bar:40.cyan/blue} {pos}/{len}")
+                        .unwrap()
+                        .progress_chars("##-"),
+                );
+                let current_street = std::sync::Mutex::new(String::new());
 
-            poker_solver_core::blueprint_v2::cluster_pipeline::run_clustering_pipeline(
-                &bp_config.clustering,
-                &output,
-                |street, p| {
-                    let mut cur = current_street.lock().unwrap();
-                    if *cur != street {
-                        if !cur.is_empty() {
-                            pb.finish_with_message(format!("{cur} done"));
-                            eprintln!();
+                poker_solver_core::blueprint_v2::cluster_pipeline::run_clustering_pipeline(
+                    &bp_config.clustering,
+                    &output,
+                    |street, p| {
+                        let mut cur = current_street.lock().unwrap();
+                        if *cur != street {
+                            if !cur.is_empty() {
+                                pb.finish_with_message(format!("{cur} done"));
+                                eprintln!();
+                            }
+                            *cur = street.to_string();
+                            pb.reset();
                         }
-                        *cur = street.to_string();
-                        pb.reset();
-                    }
-                    drop(cur);
+                        drop(cur);
 
-                    let phase = if p < 0.8 { "features" } else { "k-means" };
-                    pb.set_message(format!("{street} {phase}"));
-                    pb.set_position((p * 1000.0) as u64);
-                },
-            )?;
+                        let phase = if p < 0.8 { "features" } else { "k-means" };
+                        pb.set_message(format!("{street} {phase}"));
+                        pb.set_position((p * 1000.0) as u64);
+                    },
+                )?;
 
-            pb.finish_with_message("done");
-            eprintln!();
-            eprintln!("Clustering complete. Files saved to {}", output.display());
+                pb.finish_with_message("done");
+                eprintln!();
+                eprintln!("Clustering complete. Files saved to {}", output.display());
+            }
         }
         Commands::RangeSolve {
             oop_range,
