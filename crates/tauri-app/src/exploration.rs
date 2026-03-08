@@ -651,6 +651,36 @@ pub async fn list_blueprints(dir: String) -> Result<Vec<BlueprintListEntry>, Str
     list_blueprints_core(dir)
 }
 
+/// Convert blueprint action abstraction sizes to range-solver format strings.
+///
+/// Returns `(bet_sizes_str, raise_sizes_str)` for one street.
+/// Depth 0 maps to bet sizes, depth 1 maps to raise sizes. If only one depth
+/// is provided, the same sizes are used for both. An all-in option is always
+/// appended.
+pub fn blueprint_sizes_to_range_solver(depths: &[Vec<f64>]) -> (String, String) {
+    let format_depth = |sizes: &[f64]| -> String {
+        sizes
+            .iter()
+            .map(|&f| {
+                let pct = (f * 100.0).round() as u32;
+                format!("{pct}%")
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    let bet_str = depths.first().map(|d| format_depth(d)).unwrap_or_default();
+    let raise_str = depths
+        .get(1)
+        .map(|d| format_depth(d))
+        .unwrap_or_else(|| bet_str.clone());
+
+    let add_allin =
+        |s: String| if s.is_empty() { "a".to_string() } else { format!("{s},a") };
+
+    (add_allin(bet_str), add_allin(raise_str))
+}
+
 /// Get the strategy matrix for a given position (core logic, no Tauri dependency).
 ///
 /// `threshold` filters out hands whose prior action probabilities fell below
@@ -3238,4 +3268,26 @@ mod tests {
         assert!(idx < 169);
     }
 
+    #[timed_test]
+    fn blueprint_sizes_two_depths() {
+        let depths = vec![vec![0.33, 0.67, 1.0], vec![0.5, 1.0]];
+        let (bet, raise) = blueprint_sizes_to_range_solver(&depths);
+        assert_eq!(bet, "33%,67%,100%,a");
+        assert_eq!(raise, "50%,100%,a");
+    }
+
+    #[timed_test]
+    fn blueprint_sizes_single_depth() {
+        let depths = vec![vec![0.5]];
+        let (bet, raise) = blueprint_sizes_to_range_solver(&depths);
+        assert_eq!(bet, "50%,a");
+        assert_eq!(raise, "50%,a");
+    }
+
+    #[timed_test]
+    fn blueprint_sizes_empty() {
+        let (bet, raise) = blueprint_sizes_to_range_solver(&[]);
+        assert_eq!(bet, "a");
+        assert_eq!(raise, "a");
+    }
 }
