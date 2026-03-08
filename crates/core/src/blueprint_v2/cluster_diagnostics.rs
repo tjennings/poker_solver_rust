@@ -308,7 +308,7 @@ pub fn audit_cluster_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blueprint_v2::bucket_file::BucketFileHeader;
+    use crate::blueprint_v2::bucket_file::{BucketFileHeader, PackedBoard};
     use crate::blueprint_v2::Street;
 
     fn make_test_bucket_file(bucket_count: u16, buckets: Vec<u16>) -> BucketFile {
@@ -319,7 +319,9 @@ mod tests {
                 bucket_count,
                 board_count: 1,
                 combos_per_board: buckets.len() as u16,
+                version: 2,
             },
+            boards: vec![PackedBoard(0)],
             buckets,
         }
     }

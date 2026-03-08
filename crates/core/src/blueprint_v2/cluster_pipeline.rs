@@ -140,9 +140,10 @@ pub fn cluster_river_with_boards(
         bucket_count,
         board_count: num_boards as u32,
         combos_per_board: TOTAL_COMBOS,
+        version: 2,
     };
 
-    BucketFile { header, buckets }
+    BucketFile { header, boards: Vec::new(), buckets }
 }
 
 // ---------------------------------------------------------------------------
@@ -256,9 +257,10 @@ pub fn cluster_turn_with_boards(
         bucket_count,
         board_count: num_boards as u32,
         combos_per_board: TOTAL_COMBOS,
+        version: 2,
     };
 
-    BucketFile { header, buckets }
+    BucketFile { header, boards: Vec::new(), buckets }
 }
 
 /// Build a probability distribution over equity bins for the given combo
@@ -426,9 +428,10 @@ pub fn cluster_flop_with_boards(
         bucket_count,
         board_count: num_boards as u32,
         combos_per_board: TOTAL_COMBOS,
+        version: 2,
     };
 
-    BucketFile { header, buckets }
+    BucketFile { header, boards: Vec::new(), buckets }
 }
 
 
@@ -488,10 +491,12 @@ pub fn cluster_preflop_with_boards(
         bucket_count,
         board_count: 1,
         combos_per_board: TOTAL_COMBOS,
+        version: 2,
     };
 
     BucketFile {
         header,
+        boards: Vec::new(),
         buckets: cluster_labels,
     }
 }
