@@ -681,10 +681,14 @@ impl BlueprintTrainer {
         f64::from(max_raw) / 1000.0
     }
 
-    /// Average of all positive regret entries, divided by the x1000 scaling
-    /// factor. This tracks convergence — should decrease as O(1/sqrt(T)).
+    /// Average positive regret per iteration: mean of positive regret
+    /// entries divided by iteration count. This is the actual convergence
+    /// signal — should decrease as O(1/√T).
     #[must_use]
     pub fn avg_pos_regret(&self) -> f64 {
+        if self.iterations == 0 {
+            return 0.0;
+        }
         let (sum, count) = self
             .storage
             .regrets
@@ -698,7 +702,7 @@ impl BlueprintTrainer {
                 }
             });
         if count > 0 {
-            sum / count as f64 / 1000.0
+            sum / count as f64 / 1000.0 / self.iterations as f64
         } else {
             0.0
         }
