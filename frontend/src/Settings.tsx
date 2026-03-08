@@ -117,6 +117,22 @@ export default function Settings() {
           Default convergence target for postflop solves. Lower is more precise but slower.
         </p>
       </div>
+
+      {/* Stub Range Solver */}
+      <div style={{ marginBottom: '1.5rem' }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', color: '#eee', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={config.stub_range_solver ?? false}
+            onChange={e => setConfig({ stub_range_solver: e.target.checked })}
+            style={{ accentColor: '#d4a017' }}
+          />
+          Stub Range Solver
+        </label>
+        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
+          Replace the solver with a stub that returns random data instantly. For UI debugging only.
+        </p>
+      </div>
     </div>
   );
 }

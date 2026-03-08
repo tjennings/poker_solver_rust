@@ -232,6 +232,7 @@ export interface PostflopPlayResult {
 export interface GlobalConfig {
   blueprint_dir: string;
   target_exploitability: number;
+  stub_range_solver?: boolean;
 }
 
 export interface BlueprintListEntry {

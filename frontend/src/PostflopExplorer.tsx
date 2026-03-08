@@ -271,7 +271,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     setProgress(null);
     initialExplRef.current = Infinity;
     const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
-    const targetExpl = globalConfig.target_exploitability ?? 3.0;
+    const targetExpl = globalConfig.stub_range_solver ? 1e9 : (globalConfig.target_exploitability ?? 3.0);
     invoke('postflop_solve_street', { board: cards, target_exploitability: targetExpl })
       .then(() => startPolling())
       .catch((e) => { setError(String(e)); setSolving(false); });
@@ -460,23 +460,92 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
           </div>
         </div>
 
-        {/* Action history blocks — click to navigate back (current street only) */}
-        {actionHistory.map((item, i) => {
-          const canNavigate = true;
-          return (
-            <ActionBlock
-              key={i}
-              position={item.position}
-              stack={item.stack}
-              pot={item.pot}
-              actions={item.actions}
-              selectedAction={item.selectedId}
-              onSelect={canNavigate ? () => handleNavigateBack(i) : () => {}}
-              onHeaderClick={canNavigate ? () => handleNavigateBack(i) : undefined}
-              isCurrent={false}
-            />
-          );
-        })}
+        {/* Action history interleaved with street cards */}
+        {(() => {
+          const renderStreetCard = (idx: number, label: string) => {
+            const card = boardCards[idx];
+            if (!card) return null;
+            const rank = card[0]?.toUpperCase();
+            const suit = card[1]?.toLowerCase();
+            return (
+              <div key={`street-${label}`} className="street-block">
+                <div className="street-block-header">
+                  <span className="street-name">{label}</span>
+                </div>
+                <div className="street-cards">
+                  <div className="street-card" style={{ backgroundColor: SUIT_COLORS[suit] || '#333' }}>
+                    <span className="card-rank">{rank}</span>
+                    <span className="card-suit">{SUIT_SYMBOLS[suit] || '?'}</span>
+                  </div>
+                </div>
+              </div>
+            );
+          };
+
+          const elems: React.ReactNode[] = [];
+
+          // Flop (street 0) actions
+          actionHistory.forEach((item, i) => {
+            if (item.streetIndex !== 0) return;
+            elems.push(
+              <ActionBlock
+                key={`ah-${i}`}
+                position={item.position}
+                stack={item.stack}
+                pot={item.pot}
+                actions={item.actions}
+                selectedAction={item.selectedId}
+                onSelect={() => handleNavigateBack(i)}
+                onHeaderClick={() => handleNavigateBack(i)}
+                isCurrent={false}
+              />
+            );
+          });
+
+          // Turn card + turn actions
+          if (boardCards.length >= 4) {
+            elems.push(renderStreetCard(3, 'TURN'));
+            actionHistory.forEach((item, i) => {
+              if (item.streetIndex !== 1) return;
+              elems.push(
+                <ActionBlock
+                  key={`ah-${i}`}
+                  position={item.position}
+                  stack={item.stack}
+                  pot={item.pot}
+                  actions={item.actions}
+                  selectedAction={item.selectedId}
+                  onSelect={() => handleNavigateBack(i)}
+                  onHeaderClick={() => handleNavigateBack(i)}
+                  isCurrent={false}
+                />
+              );
+            });
+          }
+
+          // River card + river actions
+          if (boardCards.length >= 5) {
+            elems.push(renderStreetCard(4, 'RIVER'));
+            actionHistory.forEach((item, i) => {
+              if (item.streetIndex !== 2) return;
+              elems.push(
+                <ActionBlock
+                  key={`ah-${i}`}
+                  position={item.position}
+                  stack={item.stack}
+                  pot={item.pot}
+                  actions={item.actions}
+                  selectedAction={item.selectedId}
+                  onSelect={() => handleNavigateBack(i)}
+                  onHeaderClick={() => handleNavigateBack(i)}
+                  isCurrent={false}
+                />
+              );
+            });
+          }
+
+          return elems;
+        })()}
 
         {/* Available actions */}
         {matrix && !terminal && !awaitingCard && (
@@ -489,46 +558,6 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
             isCurrent={true}
           />
         )}
-
-        {/* Turn card */}
-        {boardCards.length >= 4 && (() => {
-          const card = boardCards[3];
-          const rank = card[0]?.toUpperCase();
-          const suit = card[1]?.toLowerCase();
-          return (
-            <div className="street-block">
-              <div className="street-block-header">
-                <span className="street-name">TURN</span>
-              </div>
-              <div className="street-cards">
-                <div className="street-card" style={{ backgroundColor: SUIT_COLORS[suit] || '#333' }}>
-                  <span className="card-rank">{rank}</span>
-                  <span className="card-suit">{SUIT_SYMBOLS[suit] || '?'}</span>
-                </div>
-              </div>
-            </div>
-          );
-        })()}
-
-        {/* River card */}
-        {boardCards.length >= 5 && (() => {
-          const card = boardCards[4];
-          const rank = card[0]?.toUpperCase();
-          const suit = card[1]?.toLowerCase();
-          return (
-            <div className="street-block">
-              <div className="street-block-header">
-                <span className="street-name">RIVER</span>
-              </div>
-              <div className="street-cards">
-                <div className="street-card" style={{ backgroundColor: SUIT_COLORS[suit] || '#333' }}>
-                  <span className="card-rank">{rank}</span>
-                  <span className="card-suit">{SUIT_SYMBOLS[suit] || '?'}</span>
-                </div>
-              </div>
-            </div>
-          );
-        })()}
 
         {/* Next street card picker */}
         {awaitingCard && (
