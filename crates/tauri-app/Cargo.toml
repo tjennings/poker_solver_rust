@@ -19,6 +19,7 @@ rs_poker = { workspace = true }
 
 [dev-dependencies]
 test-macros = { path = "../test-macros" }
+tempfile = "3"
 
 [lib]
 crate-type = ["staticlib", "cdylib", "rlib"]

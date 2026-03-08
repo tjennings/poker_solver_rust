@@ -23,9 +23,11 @@ pub use exploration::{
 };
 
 pub use postflop::{
-    postflop_close_street, postflop_close_street_core, postflop_get_progress,
-    postflop_get_progress_core, postflop_navigate_to, postflop_navigate_to_core,
-    postflop_play_action, postflop_play_action_core, postflop_set_config,
+    postflop_check_cache, postflop_check_cache_core, postflop_close_street,
+    postflop_close_street_core, postflop_get_progress, postflop_get_progress_core,
+    postflop_load_cached, postflop_load_cached_core, postflop_navigate_to,
+    postflop_navigate_to_core, postflop_play_action, postflop_play_action_core,
+    postflop_set_cache_dir, postflop_set_cache_dir_core, postflop_set_config,
     postflop_set_config_core, postflop_solve_street, postflop_solve_street_core,
     PostflopState,
 };
