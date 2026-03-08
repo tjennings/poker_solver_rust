@@ -425,7 +425,7 @@ impl BlueprintTuiApp {
         let gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::Magenta))
             .ratio(self.prune_fraction.clamp(0.0, 1.0))
-            .label(format!("Actions pruned: {pct:.1}%"));
+            .label(format!("Traversal pruned: {pct:.1}%"));
         frame.render_widget(gauge, area);
     }
 

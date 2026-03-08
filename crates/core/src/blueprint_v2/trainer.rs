@@ -26,7 +26,7 @@ use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
 use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
-use super::mccfr::{traverse_external, AllBuckets, Deal};
+use super::mccfr::{traverse_external, AllBuckets, Deal, PRUNE_HITS, PRUNE_TOTAL};
 use super::storage::BlueprintStorage;
 use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
 
@@ -568,7 +568,7 @@ impl BlueprintTrainer {
                 cb(self.max_regret());
             }
             if let Some(ref cb) = self.on_prune_fraction {
-                cb(self.prune_fraction());
+                cb(self.traversal_prune_rate());
             }
         }
         self.prev_strategy_sums = Some(self.storage.snapshot_strategy_sums());
@@ -643,6 +643,20 @@ impl BlueprintTrainer {
             .filter(|atom| atom.load(Ordering::Relaxed) < threshold)
             .count() as f64;
         below / total
+    }
+
+    /// Actual traversal prune rate: fraction of traverser-node actions
+    /// that were skipped due to pruning since the last call (0.0–1.0).
+    /// Resets the counters on each read.
+    #[must_use]
+    pub fn traversal_prune_rate(&self) -> f64 {
+        let hits = PRUNE_HITS.swap(0, Ordering::Relaxed);
+        let total = PRUNE_TOTAL.swap(0, Ordering::Relaxed);
+        if total > 0 {
+            hits as f64 / total as f64
+        } else {
+            0.0
+        }
     }
 
     /// Mean of all strictly-positive regret entries.

@@ -15,8 +15,14 @@
 )]
 
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use rand::Rng;
+
+/// Global diagnostic counters for prune-hit measurement.
+/// Reset and read by the trainer between batches.
+pub static PRUNE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static PRUNE_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 use super::bucket_file::BucketFile;
 use super::game_tree::{GameNode, GameTree, TerminalKind};
@@ -247,10 +253,12 @@ fn traverse_traverser(
     let mut node_value = 0.0f64;
 
     for (a, &child_idx) in children.iter().enumerate() {
-        if prune && storage.get_regret(node_idx, bucket, a) < prune_threshold {
-            // Pruned actions keep value 0.0 and do not contribute
-            // to the node value via their strategy weight.
-            continue;
+        if prune {
+            PRUNE_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            if storage.get_regret(node_idx, bucket, a) < prune_threshold {
+                PRUNE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+                continue;
+            }
         }
 
         action_values[a] = traverse_external(
