@@ -110,6 +110,13 @@ struct PostflopSetCacheDirParams {
     dir: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct PostflopCacheParams {
+    board: Vec<String>,
+    prior_actions: Vec<Vec<usize>>,
+}
+
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -365,6 +372,28 @@ async fn handle_postflop_set_cache_dir(
     to_json_value(())
 }
 
+async fn handle_postflop_check_cache(
+    Extension(state): Extension<Arc<PostflopState>>,
+    Json(params): Json<PostflopCacheParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::postflop_check_cache_core(
+        &state,
+        params.board,
+        params.prior_actions,
+    ))
+}
+
+async fn handle_postflop_load_cached(
+    Extension(state): Extension<Arc<PostflopState>>,
+    Json(params): Json<PostflopCacheParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::postflop_load_cached_core(
+        &state,
+        params.board,
+        params.prior_actions,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -438,6 +467,14 @@ async fn main() {
         .route(
             "/api/postflop_set_cache_dir",
             post(handle_postflop_set_cache_dir),
+        )
+        .route(
+            "/api/postflop_check_cache",
+            post(handle_postflop_check_cache),
+        )
+        .route(
+            "/api/postflop_load_cached",
+            post(handle_postflop_load_cached),
         )
         .layer(Extension(postflop_state))
         .layer(cors)

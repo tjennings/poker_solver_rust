@@ -40,6 +40,8 @@ fn main() {
             poker_solver_tauri::postflop_navigate_to,
             poker_solver_tauri::postflop_close_street,
             poker_solver_tauri::postflop_set_cache_dir,
+            poker_solver_tauri::postflop_check_cache,
+            poker_solver_tauri::postflop_load_cached,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

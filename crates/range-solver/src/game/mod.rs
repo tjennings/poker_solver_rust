@@ -167,21 +167,6 @@ pub struct PostFlopGame {
     pub(crate) cfvalues_cache: [Vec<f32>; 2],
 }
 
-impl PostFlopGame {
-    /// Returns references to the four storage buffers (strategy data).
-    ///
-    /// These buffers back the per-node strategy, regret, IP cfvalue, and
-    /// chance cfvalue data. Useful for serializing a solved game to disk.
-    pub fn storage_buffers(&self) -> (&[u8], &[u8], &[u8], &[u8]) {
-        (
-            &self.storage1,
-            &self.storage2,
-            &self.storage_ip,
-            &self.storage_chance,
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

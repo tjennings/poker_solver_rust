@@ -256,6 +256,48 @@ impl PostFlopGame {
         // a contiguous `Vec`. `MutexLike<T>` is `#[repr(transparent)]`.
         unsafe { node_ptr.offset_from(self.node_arena.as_ptr()) as usize }
     }
+
+    /// Returns references to the four internal storage buffers.
+    ///
+    /// The buffers hold strategy/regret data (`storage1`, `storage2`),
+    /// IP counterfactual values (`storage_ip`), and chance node values
+    /// (`storage_chance`).
+    pub fn storage_buffers(&self) -> (&[u8], &[u8], &[u8], &[u8]) {
+        (
+            &self.storage1,
+            &self.storage2,
+            &self.storage_ip,
+            &self.storage_chance,
+        )
+    }
+
+    /// Overwrites the internal storage buffers with cached data and
+    /// re-assigns the raw pointers in each `PostFlopNode`.
+    ///
+    /// # Panics
+    /// Panics if any buffer length does not match the allocated size.
+    pub fn set_storage_buffers(
+        &mut self,
+        s1: Vec<u8>,
+        s2: Vec<u8>,
+        s_ip: Vec<u8>,
+        s_chance: Vec<u8>,
+    ) {
+        assert_eq!(s1.len(), self.storage1.len(), "storage1 size mismatch");
+        assert_eq!(s2.len(), self.storage2.len(), "storage2 size mismatch");
+        assert_eq!(s_ip.len(), self.storage_ip.len(), "storage_ip size mismatch");
+        assert_eq!(
+            s_chance.len(),
+            self.storage_chance.len(),
+            "storage_chance size mismatch"
+        );
+        self.storage1 = s1;
+        self.storage2 = s2;
+        self.storage_ip = s_ip;
+        self.storage_chance = s_chance;
+        // Re-assign raw pointers in each node to the new buffer locations.
+        self.allocate_memory_nodes();
+    }
 }
 
 // ---------------------------------------------------------------------------
