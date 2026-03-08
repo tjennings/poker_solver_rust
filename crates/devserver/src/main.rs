@@ -69,6 +69,11 @@ struct HandEquityParams {
 }
 
 #[derive(Deserialize)]
+struct ListBlueprintsParams {
+    dir: String,
+}
+
+#[derive(Deserialize)]
 struct PostflopConfigParams {
     config: poker_solver_tauri::postflop::PostflopConfig,
 }
@@ -264,6 +269,12 @@ async fn handle_list_agents(
     result_to_response(poker_solver_tauri::list_agents())
 }
 
+async fn handle_list_blueprints(
+    Json(params): Json<ListBlueprintsParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::list_blueprints_core(params.dir))
+}
+
 // ---------------------------------------------------------------------------
 // Handlers — postflop
 // ---------------------------------------------------------------------------
@@ -364,6 +375,7 @@ async fn main() {
         )
         .route("/api/is_board_cached", post(handle_is_board_cached))
         .route("/api/list_agents", post(handle_list_agents))
+        .route("/api/list_blueprints", post(handle_list_blueprints))
         .route("/api/get_combo_classes", post(handle_get_combo_classes))
         .route("/api/get_hand_equity", post(handle_get_hand_equity))
         // Postflop explorer endpoints

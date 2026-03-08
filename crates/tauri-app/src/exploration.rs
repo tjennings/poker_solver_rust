@@ -45,6 +45,15 @@ pub struct SubgameProgressEvent {
     pub elapsed_ms: u64,
 }
 
+/// Summary of a blueprint bundle found by directory scan.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlueprintListEntry {
+    pub name: String,
+    pub path: String,
+    pub stack_depth: f64,
+    pub has_strategy: bool,
+}
+
 /// State for the exploration view.
 pub struct ExplorationState {
     /// Currently loaded strategy source (bundle or agent)
@@ -581,6 +590,65 @@ pub async fn load_blueprint_v2(
     path: String,
 ) -> Result<BundleInfo, String> {
     load_blueprint_v2_core(&state, path).await
+}
+
+/// Scan a directory for blueprint bundles (subdirectories containing `config.yaml`).
+///
+/// Returns a sorted list of discovered blueprints with metadata.
+pub fn list_blueprints_core(dir: String) -> Result<Vec<BlueprintListEntry>, String> {
+    let base = PathBuf::from(&dir);
+    let entries = std::fs::read_dir(&base)
+        .map_err(|e| format!("Failed to read directory {dir}: {e}"))?;
+
+    let mut blueprints = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {e}"))?;
+        let sub = entry.path();
+        if !sub.is_dir() || !sub.join("config.yaml").exists() {
+            continue;
+        }
+
+        let config = match v2_bundle::load_config(&sub) {
+            Ok(cfg) => cfg,
+            Err(_) => continue, // skip directories with unparseable configs
+        };
+
+        let name = sub
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let has_strategy = sub.join("final/strategy.bin").exists()
+            || sub.join("strategy.bin").exists()
+            || std::fs::read_dir(&sub)
+                .ok()
+                .map(|rd| {
+                    rd.filter_map(Result::ok).any(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.starts_with("snapshot_"))
+                    })
+                })
+                .unwrap_or(false);
+
+        let path_str = sub.to_string_lossy().to_string();
+        blueprints.push(BlueprintListEntry {
+            name,
+            path: path_str,
+            stack_depth: config.game.stack_depth,
+            has_strategy,
+        });
+    }
+
+    blueprints.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(blueprints)
+}
+
+/// List available blueprint bundles in a directory (Tauri wrapper).
+#[tauri::command]
+pub async fn list_blueprints(dir: String) -> Result<Vec<BlueprintListEntry>, String> {
+    list_blueprints_core(dir)
 }
 
 /// Get the strategy matrix for a given position (core logic, no Tauri dependency).
@@ -3169,4 +3237,5 @@ mod tests {
         // AA should be index 0 in the canonical ordering
         assert!(idx < 169);
     }
+
 }
