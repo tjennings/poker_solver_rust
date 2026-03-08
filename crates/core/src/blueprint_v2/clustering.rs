@@ -178,29 +178,45 @@ pub fn kmeans_1d(data: &[f64], k: usize, max_iterations: u32) -> Vec<u16> {
     let mut assignments = vec![0_u16; n];
 
     for _iter in 0..max_iterations {
-        // -- Assignment step -----------------------------------------------
-        let mut changed = false;
-        for (i, &val) in data.iter().enumerate() {
-            let nearest = nearest_centroid_1d(val, &centroids);
-            if assignments[i] != nearest {
-                assignments[i] = nearest;
-                changed = true;
-            }
-        }
+        // -- Assignment step (parallel) ------------------------------------
+        let new_assignments: Vec<u16> = data
+            .par_iter()
+            .map(|&val| nearest_centroid_1d(val, &centroids))
+            .collect();
+
+        let changed = assignments
+            .par_iter()
+            .zip(new_assignments.par_iter())
+            .any(|(old, new)| old != new);
+        assignments = new_assignments;
 
         if !changed {
             break;
         }
 
-        // -- Update step ---------------------------------------------------
-        let mut sums = vec![0.0_f64; k];
-        let mut counts = vec![0_usize; k];
-
-        for (i, &val) in data.iter().enumerate() {
-            let ci = assignments[i] as usize;
-            sums[ci] += val;
-            counts[ci] += 1;
-        }
+        // -- Update step (parallel fold/reduce) ----------------------------
+        let (sums, counts) = data
+            .par_iter()
+            .zip(assignments.par_iter())
+            .fold(
+                || (vec![0.0_f64; k], vec![0_usize; k]),
+                |(mut sums, mut counts), (&val, &ci)| {
+                    let ci = ci as usize;
+                    sums[ci] += val;
+                    counts[ci] += 1;
+                    (sums, counts)
+                },
+            )
+            .reduce(
+                || (vec![0.0_f64; k], vec![0_usize; k]),
+                |(mut s1, mut c1), (s2, c2)| {
+                    for i in 0..k {
+                        s1[i] += s2[i];
+                        c1[i] += c2[i];
+                    }
+                    (s1, c1)
+                },
+            );
 
         for ci in 0..k {
             if counts[ci] > 0 {
@@ -208,16 +224,13 @@ pub fn kmeans_1d(data: &[f64], k: usize, max_iterations: u32) -> Vec<u16> {
                 let count_f = counts[ci] as f64;
                 centroids[ci] = sums[ci] / count_f;
             }
-            // Empty cluster: keep old centroid (rare with percentile init).
         }
     }
 
-    // Final assignment pass.
-    for (i, &val) in data.iter().enumerate() {
-        assignments[i] = nearest_centroid_1d(val, &centroids);
-    }
-
-    assignments
+    // Final assignment pass (parallel).
+    data.par_iter()
+        .map(|&val| nearest_centroid_1d(val, &centroids))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -263,45 +276,58 @@ pub fn kmeans_1d_weighted(
     let mut assignments = vec![0_u16; n];
 
     for _iter in 0..max_iterations {
-        // -- Assignment step -----------------------------------------------
-        let mut changed = false;
-        for (i, &val) in data.iter().enumerate() {
-            let nearest = nearest_centroid_1d(val, &centroids);
-            if assignments[i] != nearest {
-                assignments[i] = nearest;
-                changed = true;
-            }
-        }
+        // -- Assignment step (parallel) ------------------------------------
+        let new_assignments: Vec<u16> = data
+            .par_iter()
+            .map(|&val| nearest_centroid_1d(val, &centroids))
+            .collect();
+
+        let changed = assignments
+            .par_iter()
+            .zip(new_assignments.par_iter())
+            .any(|(old, new)| old != new);
+        assignments = new_assignments;
 
         if !changed {
             break;
         }
 
-        // -- Weighted update step ------------------------------------------
-        let mut sums = vec![0.0_f64; k];
-        let mut weight_sums = vec![0.0_f64; k];
-
-        for (i, &val) in data.iter().enumerate() {
-            let ci = assignments[i] as usize;
-            let w = weights[i];
-            sums[ci] += val * w;
-            weight_sums[ci] += w;
-        }
+        // -- Weighted update step (parallel fold/reduce) -------------------
+        let (sums, weight_sums) = data
+            .par_iter()
+            .zip(weights.par_iter())
+            .zip(assignments.par_iter())
+            .fold(
+                || (vec![0.0_f64; k], vec![0.0_f64; k]),
+                |(mut sums, mut wsums), ((&val, &w), &ci)| {
+                    let ci = ci as usize;
+                    sums[ci] += val * w;
+                    wsums[ci] += w;
+                    (sums, wsums)
+                },
+            )
+            .reduce(
+                || (vec![0.0_f64; k], vec![0.0_f64; k]),
+                |(mut s1, mut w1), (s2, w2)| {
+                    for i in 0..k {
+                        s1[i] += s2[i];
+                        w1[i] += w2[i];
+                    }
+                    (s1, w1)
+                },
+            );
 
         for ci in 0..k {
             if weight_sums[ci] > 0.0 {
                 centroids[ci] = sums[ci] / weight_sums[ci];
             }
-            // Empty cluster: keep old centroid (rare with percentile init).
         }
     }
 
-    // Final assignment pass.
-    for (i, &val) in data.iter().enumerate() {
-        assignments[i] = nearest_centroid_1d(val, &centroids);
-    }
-
-    assignments
+    // Final assignment pass (parallel).
+    data.par_iter()
+        .map(|&val| nearest_centroid_1d(val, &centroids))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -472,18 +498,30 @@ fn nearest_centroid(point: &[f64], centroids: &[Vec<f64>]) -> u16 {
 }
 
 /// Index of the nearest centroid to a scalar `val`.
+///
+/// Uses binary search on sorted centroids (O(log k)) instead of linear scan.
+/// Centroids are always sorted after percentile initialisation and stay sorted
+/// because the weighted-average update preserves ordering in 1-D.
 #[allow(clippy::cast_possible_truncation)]
 fn nearest_centroid_1d(val: f64, centroids: &[f64]) -> u16 {
-    let mut best_idx = 0_u16;
-    let mut best_dist = f64::MAX;
-    for (ci, &c) in centroids.iter().enumerate() {
-        let d = (val - c).abs();
-        if d < best_dist {
-            best_dist = d;
-            best_idx = ci as u16;
-        }
+    let k = centroids.len();
+    debug_assert!(k > 0);
+    // Binary search for the insertion point.
+    let pos = centroids.partition_point(|&c| c < val);
+    if pos == 0 {
+        return 0;
     }
-    best_idx
+    if pos >= k {
+        return (k - 1) as u16;
+    }
+    // Compare the two neighbours.
+    let d_left = (val - centroids[pos - 1]).abs();
+    let d_right = (centroids[pos] - val).abs();
+    if d_left <= d_right {
+        (pos - 1) as u16
+    } else {
+        pos as u16
+    }
 }
 
 /// Find the point with the largest EMD distance to its currently assigned
