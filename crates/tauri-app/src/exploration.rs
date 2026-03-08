@@ -3080,6 +3080,281 @@ fn char_to_value(c: char) -> Value {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Preflop range extraction (169 → 1326 expansion)
+// ---------------------------------------------------------------------------
+
+/// Preflop ranges for both players at a given position in the game tree.
+#[derive(Debug, Clone, Serialize)]
+pub struct PreflopRanges {
+    /// 1326-element combo weights for OOP (player 0).
+    pub oop_weights: Vec<f32>,
+    /// 1326-element combo weights for IP (player 1).
+    pub ip_weights: Vec<f32>,
+    /// Pot size at the current position (in BB).
+    pub pot: f64,
+    /// Effective stack at the current position (in BB).
+    pub effective_stack: f64,
+    /// OOP bet sizes for flop in range-solver format (e.g. "33%,67%,100%,e").
+    pub oop_bet_sizes: String,
+    /// OOP raise sizes for flop in range-solver format.
+    pub oop_raise_sizes: String,
+    /// IP bet sizes for flop in range-solver format.
+    pub ip_bet_sizes: String,
+    /// IP raise sizes for flop in range-solver format.
+    pub ip_raise_sizes: String,
+}
+
+/// Convert an `rs_poker::core::Card` to a range-solver `u8` card.
+///
+/// Range-solver encoding: `card = 4 * rank + suit`
+/// where rank 0 = deuce .. 12 = ace, suit 0 = club, 1 = diamond, 2 = heart, 3 = spade.
+///
+/// `rs_poker` encoding: `Value::Two = 0 .. Ace = 12`,
+/// `Suit::Spade = 0, Club = 1, Heart = 2, Diamond = 3`.
+fn rs_card_to_range_solver(card: Card) -> u8 {
+    let rank = card.value as u8; // Two=0 .. Ace=12, matches range-solver
+    let suit = match card.suit {
+        Suit::Club => 0,
+        Suit::Diamond => 1,
+        Suit::Heart => 2,
+        Suit::Spade => 3,
+    };
+    4 * rank + suit
+}
+
+/// Build a lookup table mapping each canonical hand index (0..169) to its
+/// combo indices (0..1326) in range-solver encoding.
+fn build_canonical_to_combo_map() -> Vec<Vec<usize>> {
+    let mut map = Vec::with_capacity(169);
+    for i in 0..169 {
+        // INVARIANT: index is always 0..169, so `from_index` always returns Some
+        let hand = CanonicalHand::from_index(i).expect("valid canonical index");
+        let combos = hand.combos();
+        let indices: Vec<usize> = combos
+            .iter()
+            .map(|(c1, c2)| {
+                let r1 = rs_card_to_range_solver(*c1);
+                let r2 = rs_card_to_range_solver(*c2);
+                range_solver::card::card_pair_to_index(r1, r2)
+            })
+            .collect();
+        map.push(indices);
+    }
+    map
+}
+
+/// Expand 169 canonical hand weights to 1326 combo weights.
+///
+/// Each combo inherits the weight of its canonical hand.
+fn expand_169_to_1326(weights_169: &[f32; 169]) -> Vec<f32> {
+    let combo_map = build_canonical_to_combo_map();
+    let mut weights_1326 = vec![0.0f32; 1326];
+    for (hand_idx, combo_indices) in combo_map.iter().enumerate() {
+        let w = weights_169[hand_idx];
+        for &combo_idx in combo_indices {
+            weights_1326[combo_idx] = w;
+        }
+    }
+    weights_1326
+}
+
+/// Format pot-fraction bet sizes as a range-solver size string.
+///
+/// Each fraction is formatted as a percentage (e.g. 0.33 → "33%").
+/// Includes "e" (all-in) at the end since the blueprint tree always has all-in.
+fn format_bet_sizes(fractions: &[f64]) -> String {
+    if fractions.is_empty() {
+        return "e".to_string();
+    }
+    let mut parts: Vec<String> = fractions
+        .iter()
+        .map(|f| format!("{}%", (f * 100.0).round() as u32))
+        .collect();
+    parts.push("e".to_string());
+    parts.join(",")
+}
+
+/// Get the invested amounts at a V2 decision node by inspecting its fold child.
+///
+/// Every decision node that has a Fold action will have a fold terminal child
+/// whose `invested` field reflects the amounts put in by each player *before*
+/// that fold. For nodes without a fold (e.g. check-only), we look at the Call
+/// child's terminal instead and back out the opponent's investment.
+fn invested_at_v2_node(tree: &V2GameTree, node_idx: u32) -> [f64; 2] {
+    if let V2GameNode::Decision {
+        actions, children, ..
+    } = &tree.nodes[node_idx as usize]
+    {
+        // Try the fold terminal first — its invested is exactly what we want.
+        if let Some(fold_pos) = actions.iter().position(|a| matches!(a, TreeAction::Fold)) {
+            let child_idx = children[fold_pos] as usize;
+            if let V2GameNode::Terminal { invested, .. } = &tree.nodes[child_idx] {
+                return *invested;
+            }
+        }
+        // Fall back: use the check child or any terminal we can find.
+        for &child in children {
+            if let V2GameNode::Terminal { invested, .. } = &tree.nodes[child as usize] {
+                return *invested;
+            }
+        }
+    }
+    [0.0; 2]
+}
+
+/// Compute preflop ranges at a given history position (core logic).
+///
+/// Walks the V2 game tree, multiplying each canonical hand's range weight by
+/// the strategy probability of the chosen action, then expands the 169
+/// canonical weights into 1326 combo weights.
+#[allow(clippy::cast_possible_truncation)]
+pub fn get_preflop_ranges_core(
+    state: &ExplorationState,
+    history: Vec<String>,
+) -> Result<PreflopRanges, String> {
+    let source_guard = state.source.read();
+    let source = source_guard
+        .as_ref()
+        .ok_or_else(|| "No strategy source loaded".to_string())?;
+
+    let (config, strategy, tree, decision_map) = match source {
+        StrategySource::BlueprintV2 {
+            config,
+            strategy,
+            tree,
+            decision_map,
+        } => (config, strategy, tree, decision_map),
+        _ => return Err("get_preflop_ranges requires a BlueprintV2 source".to_string()),
+    };
+
+    // 169-element weight arrays for both players, initialized to 1.0.
+    let mut oop_weights = [1.0f32; 169];
+    let mut ip_weights = [1.0f32; 169];
+
+    // Walk the tree node by node, applying strategy weights.
+    let mut node_idx = tree.root;
+
+    for action_str in &history {
+        let node = &tree.nodes[node_idx as usize];
+        let (player, actions, children) = match node {
+            V2GameNode::Decision {
+                player,
+                actions,
+                children,
+                ..
+            } => (*player, actions, children),
+            V2GameNode::Chance { child, .. } => {
+                node_idx = *child;
+                match &tree.nodes[node_idx as usize] {
+                    V2GameNode::Decision {
+                        player,
+                        actions,
+                        children,
+                        ..
+                    } => (*player, actions, children),
+                    _ => {
+                        return Err(format!(
+                            "Expected decision after chance at node {node_idx}"
+                        ));
+                    }
+                }
+            }
+            V2GameNode::Terminal { .. } => {
+                return Err(format!(
+                    "Reached terminal before processing action '{action_str}'"
+                ));
+            }
+        };
+
+        let action_pos = find_v2_action_position(action_str, actions).ok_or_else(|| {
+            format!(
+                "Action '{action_str}' not available at node {node_idx}. Available: {actions:?}"
+            )
+        })?;
+
+        // Get the decision index for strategy lookup.
+        let decision_idx = decision_map
+            .get(node_idx as usize)
+            .copied()
+            .unwrap_or(u32::MAX);
+
+        if decision_idx != u32::MAX {
+            let num_buckets = strategy.bucket_counts
+                [strategy.node_street_indices[decision_idx as usize] as usize]
+                as usize;
+
+            // Select which player's weights to update.
+            let weights = if player == 0 {
+                &mut oop_weights
+            } else {
+                &mut ip_weights
+            };
+
+            for (hand_idx, w) in weights.iter_mut().enumerate() {
+                let bucket = if num_buckets == 169 {
+                    hand_idx as u16
+                } else {
+                    (hand_idx % num_buckets) as u16
+                };
+
+                let probs = strategy.get_action_probs(decision_idx as usize, bucket);
+                let prob = probs.get(action_pos).copied().unwrap_or(0.0);
+                *w *= prob;
+            }
+        }
+
+        node_idx = children[action_pos];
+
+        // Advance through chance nodes automatically.
+        if let V2GameNode::Chance { child, .. } = &tree.nodes[node_idx as usize] {
+            node_idx = *child;
+        }
+    }
+
+    // Compute pot and stacks at the current position.
+    let invested = invested_at_v2_node(tree.as_ref(), node_idx);
+    let stack_depth = config.game.stack_depth;
+    let pot = invested[0] + invested[1];
+    let remaining = [
+        stack_depth - invested[0],
+        stack_depth - invested[1],
+    ];
+    let effective_stack = remaining[0].min(remaining[1]);
+
+    // Build flop bet size strings from the config.
+    let flop_sizes = &config.action_abstraction.flop;
+    // OOP uses depth 0, IP uses depth 0 for bets; raise uses depth 1 if available.
+    let oop_bet_sizes = format_bet_sizes(flop_sizes.first().map_or(&[], Vec::as_slice));
+    let ip_bet_sizes = format_bet_sizes(flop_sizes.first().map_or(&[], Vec::as_slice));
+    let oop_raise_sizes = format_bet_sizes(flop_sizes.get(1).map_or(&[], Vec::as_slice));
+    let ip_raise_sizes = format_bet_sizes(flop_sizes.get(1).map_or(&[], Vec::as_slice));
+
+    // Expand 169 → 1326.
+    let oop_1326 = expand_169_to_1326(&oop_weights);
+    let ip_1326 = expand_169_to_1326(&ip_weights);
+
+    Ok(PreflopRanges {
+        oop_weights: oop_1326,
+        ip_weights: ip_1326,
+        pot,
+        effective_stack,
+        oop_bet_sizes,
+        oop_raise_sizes,
+        ip_bet_sizes,
+        ip_raise_sizes,
+    })
+}
+
+/// Get preflop ranges at a given history position (Tauri wrapper).
+#[tauri::command]
+pub fn get_preflop_ranges(
+    state: State<'_, ExplorationState>,
+    history: Vec<String>,
+) -> Result<PreflopRanges, String> {
+    get_preflop_ranges_core(&state, history)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3168,5 +3443,111 @@ mod tests {
         let idx = canonical_hand_index_from_ranks('A', 'A', false);
         // AA should be index 0 in the canonical ordering
         assert!(idx < 169);
+    }
+
+    // -------------------------------------------------------------------
+    // 169 → 1326 expansion tests
+    // -------------------------------------------------------------------
+
+    #[timed_test]
+    fn canonical_to_combo_map_total_combos() {
+        let map = build_canonical_to_combo_map();
+        assert_eq!(map.len(), 169);
+        let total: usize = map.iter().map(Vec::len).sum();
+        assert_eq!(total, 1326, "Total combos across all canonical hands");
+    }
+
+    #[timed_test]
+    fn canonical_to_combo_map_no_duplicates() {
+        let map = build_canonical_to_combo_map();
+        let mut seen = std::collections::HashSet::new();
+        for combos in &map {
+            for &idx in combos {
+                assert!(
+                    seen.insert(idx),
+                    "Duplicate combo index {idx} in canonical-to-combo map"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 1326);
+    }
+
+    #[timed_test]
+    fn canonical_to_combo_map_hand_sizes() {
+        let map = build_canonical_to_combo_map();
+        for i in 0..169 {
+            let hand = CanonicalHand::from_index(i).unwrap();
+            let expected = hand.num_combos() as usize;
+            assert_eq!(
+                map[i].len(),
+                expected,
+                "Hand index {i} ({hand}) expected {expected} combos, got {}",
+                map[i].len()
+            );
+        }
+    }
+
+    #[timed_test]
+    fn expand_169_to_1326_uniform_weights() {
+        let weights_169 = [1.0f32; 169];
+        let weights_1326 = expand_169_to_1326(&weights_169);
+        assert_eq!(weights_1326.len(), 1326);
+        for (i, &w) in weights_1326.iter().enumerate() {
+            assert!(
+                (w - 1.0).abs() < f32::EPSILON,
+                "Combo {i} should have weight 1.0, got {w}"
+            );
+        }
+    }
+
+    #[timed_test]
+    fn expand_169_to_1326_zero_one_hand() {
+        let mut weights_169 = [1.0f32; 169];
+        // Set AA (index 0) to zero.
+        weights_169[0] = 0.0;
+        let weights_1326 = expand_169_to_1326(&weights_169);
+
+        // AA has 6 combos — all should be zero.
+        let aa_combos = &build_canonical_to_combo_map()[0];
+        assert_eq!(aa_combos.len(), 6);
+        for &idx in aa_combos {
+            assert!(
+                weights_1326[idx].abs() < f32::EPSILON,
+                "AA combo {idx} should be zero"
+            );
+        }
+
+        // All other combos should be 1.0.
+        let non_zero_count = weights_1326.iter().filter(|&&w| w > 0.5).count();
+        assert_eq!(non_zero_count, 1326 - 6);
+    }
+
+    #[timed_test]
+    fn rs_card_to_range_solver_ace_of_spades() {
+        let card = Card::new(Value::Ace, Suit::Spade);
+        let rs_card = rs_card_to_range_solver(card);
+        // Ace = rank 12, Spade = suit 3 in range-solver
+        assert_eq!(rs_card, 4 * 12 + 3, "As should be card 51");
+    }
+
+    #[timed_test]
+    fn rs_card_to_range_solver_deuce_of_clubs() {
+        let card = Card::new(Value::Two, Suit::Club);
+        let rs_card = rs_card_to_range_solver(card);
+        // Two = rank 0, Club = suit 0 in range-solver
+        assert_eq!(rs_card, 0, "2c should be card 0");
+    }
+
+    #[timed_test]
+    fn format_bet_sizes_basic() {
+        let sizes = vec![0.33, 0.67, 1.0];
+        let result = format_bet_sizes(&sizes);
+        assert_eq!(result, "33%,67%,100%,e");
+    }
+
+    #[timed_test]
+    fn format_bet_sizes_empty() {
+        let result = format_bet_sizes(&[]);
+        assert_eq!(result, "e");
     }
 }
