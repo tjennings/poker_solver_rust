@@ -26,7 +26,7 @@ use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
 use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
-use super::mccfr::{traverse_external, AllBuckets, Deal, PRUNE_HITS, PRUNE_TOTAL};
+use super::mccfr::{traverse_external, AllBuckets, Deal, DealWithBuckets, PRUNE_HITS, PRUNE_TOTAL};
 use super::storage::BlueprintStorage;
 use crate::hands::CanonicalHand;
 use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
@@ -379,8 +379,14 @@ impl BlueprintTrainer {
                 break;
             }
 
-            // 1. Generate batch of deals (sequential, fast).
-            let deals: Vec<Deal> = (0..this_batch).map(|_| self.sample_deal()).collect();
+            // 1. Generate batch of deals with pre-computed buckets (sequential).
+            let deals: Vec<DealWithBuckets> = (0..this_batch)
+                .map(|_| {
+                    let deal = self.sample_deal();
+                    let buckets = self.buckets.precompute_buckets(&deal);
+                    DealWithBuckets { deal, buckets }
+                })
+                .collect();
 
             let prune = self.should_prune();
             let threshold = self.config.training.prune_threshold;
@@ -388,7 +394,6 @@ impl BlueprintTrainer {
             // 2. Parallel traversal.
             let tree = &self.tree;
             let storage = &self.storage;
-            let buckets = &self.buckets;
             let ev_sum = &self.ev_sum;
             let ev_count = &self.ev_count;
 
@@ -396,20 +401,20 @@ impl BlueprintTrainer {
                 let mut rng = SmallRng::from_os_rng();
 
                 let ev0 = traverse_external(
-                    tree, storage, buckets, deal, 0, tree.root, prune, threshold, &mut rng,
+                    tree, storage, deal, 0, tree.root, prune, threshold, &mut rng,
                 );
                 let ev1 = traverse_external(
-                    tree, storage, buckets, deal, 1, tree.root, prune, threshold, &mut rng,
+                    tree, storage, deal, 1, tree.root, prune, threshold, &mut rng,
                 );
 
                 // Accumulate EV per canonical preflop hand.
                 let idx0 = CanonicalHand::from_cards(
-                    deal.hole_cards[0][0],
-                    deal.hole_cards[0][1],
+                    deal.deal.hole_cards[0][0],
+                    deal.deal.hole_cards[0][1],
                 ).index();
                 let idx1 = CanonicalHand::from_cards(
-                    deal.hole_cards[1][0],
-                    deal.hole_cards[1][1],
+                    deal.deal.hole_cards[1][0],
+                    deal.deal.hole_cards[1][1],
                 ).index();
                 ev_sum[idx0].fetch_add((ev0 * 1000.0) as i64, Ordering::Relaxed);
                 ev_count[idx0].fetch_add(1, Ordering::Relaxed);
