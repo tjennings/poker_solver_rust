@@ -12,7 +12,7 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 
 use super::game_tree::{GameNode, GameTree};
 
@@ -27,9 +27,6 @@ pub struct BlueprintStorage {
     /// Per-node layout metadata. Non-decision nodes use the `Default`
     /// sentinel (`offset=0`, `num_actions=0`) and must never be queried.
     layout: Vec<NodeLayout>,
-    /// When `false`, `add_strategy_sum` is a no-op. Used to skip strategy
-    /// accumulation during LCFR warmup.
-    pub accumulate_strategy: AtomicBool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -74,7 +71,6 @@ impl BlueprintStorage {
             strategy_sums: (0..total).map(|_| AtomicI64::new(0)).collect(),
             bucket_counts,
             layout,
-            accumulate_strategy: AtomicBool::new(true),
         }
     }
 
@@ -105,13 +101,8 @@ impl BlueprintStorage {
     }
 
     /// Add a delta to a single strategy sum value atomically.
-    ///
-    /// No-op when `accumulate_strategy` is `false` (during LCFR warmup).
     #[inline]
     pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
-        if !self.accumulate_strategy.load(Ordering::Relaxed) {
-            return;
-        }
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
         self.strategy_sums[idx].fetch_add(delta, Ordering::Relaxed);

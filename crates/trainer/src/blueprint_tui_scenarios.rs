@@ -111,11 +111,7 @@ pub fn extract_strategy_grid(
                 }
             };
 
-            let probs = if storage.accumulate_strategy.load(std::sync::atomic::Ordering::Relaxed) {
-                storage.average_strategy(node_idx, bucket)
-            } else {
-                storage.current_strategy(node_idx, bucket)
-            };
+            let probs = storage.average_strategy(node_idx, bucket);
             let cell_actions: Vec<(String, f32)> = action_labels
                 .iter()
                 .zip(probs.iter())

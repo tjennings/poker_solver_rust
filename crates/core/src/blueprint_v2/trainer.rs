@@ -357,14 +357,6 @@ impl BlueprintTrainer {
         }
 
         let batch_size = self.config.training.batch_size;
-        let warmup = self.config.training.lcfr_warmup_iterations;
-
-        // Skip strategy-sum accumulation during LCFR warmup — early
-        // near-uniform strategies pollute the average strategy with
-        // passive bias.
-        self.storage
-            .accumulate_strategy
-            .store(self.iterations >= warmup, Ordering::Relaxed);
 
         while !self.should_stop() {
             // Honour pause requests from the TUI.
@@ -514,13 +506,6 @@ impl BlueprintTrainer {
     /// logging, and snapshot saving.
     fn check_timed_actions(&mut self) -> Result<(), Box<dyn Error>> {
         let elapsed_min = self.elapsed_minutes();
-
-        // Enable strategy accumulation once warmup is complete.
-        if self.iterations >= self.config.training.lcfr_warmup_iterations {
-            self.storage
-                .accumulate_strategy
-                .store(true, Ordering::Relaxed);
-        }
 
         // LCFR discount.
         let interval = self.config.training.lcfr_discount_interval.max(1);
