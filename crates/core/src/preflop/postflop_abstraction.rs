@@ -107,6 +107,7 @@ pub(crate) struct NodeEntry {
 
 impl PostflopLayout {
     /// Build the layout from a single postflop tree and bucket counts.
+    #[must_use]
     pub fn build(
         tree: &PostflopTree,
         node_streets: &[Street],
@@ -197,6 +198,7 @@ pub(crate) fn buckets_for_street(
 ///
 /// Walks the tree from root, tracking the current street.
 /// Chance nodes transition to their `next_street` for their children.
+#[must_use]
 pub fn annotate_streets(tree: &PostflopTree) -> Vec<Street> {
     let mut streets = vec![Street::Flop; tree.nodes.len()];
     annotate_recursive(&tree.nodes, 0, Street::Flop, &mut streets);

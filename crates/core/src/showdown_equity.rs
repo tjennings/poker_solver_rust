@@ -97,7 +97,7 @@ fn remaining_cards(hole: [Card; 2], board: &[Card]) -> arrayvec::ArrayVec<Card, 
 /// `a.cmp(&b) == rank_to_ordinal(a).cmp(&rank_to_ordinal(b))`.
 ///
 /// The maximum kicker value across all `rs_poker` hand categories is <2^26
-/// (verified empirically: TwoPair's `(pairs << 13) | low` maxes at ~50M).
+/// (verified empirically: `TwoPair`'s `(pairs << 13) | low` maxes at ~50M).
 #[must_use]
 pub fn rank_to_ordinal(rank: Rank) -> u32 {
     let (cat, kicker) = match rank {

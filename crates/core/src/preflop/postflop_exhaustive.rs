@@ -347,7 +347,7 @@ pub fn compute_equity_table(combo_map: &[Vec<(Card, Card)>], flop: [Card; 3]) ->
 /// Pre-compute card-removal weights for all 169x169 canonical hand pairs.
 ///
 /// For each `(hero_hand, opp_hand)` canonical pair, counts the number of
-/// concrete (combo_h, combo_o) pairs where all four hole cards are distinct.
+/// concrete (`combo_h`, `combo_o`) pairs where all four hole cards are distinct.
 /// This weight determines how much each matchup contributes to regret updates,
 /// correcting for card-removal effects (e.g. AA vs KK has 36 combos while
 /// AA vs AK has only 12).

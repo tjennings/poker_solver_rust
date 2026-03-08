@@ -289,7 +289,7 @@ fn build_canonical_ranges(combo_map: &[Vec<(Card, Card)>]) -> Vec<std::ops::Rang
 /// Accumulate equity for one board into the running totals.
 ///
 /// For each (hero, opponent) canonical hand pair, compares rank ordinals
-/// across all concrete combo matchups and adds to the (equity_sum, count) cell.
+/// across all concrete combo matchups and adds to the (`equity_sum`, count) cell.
 #[inline]
 fn accumulate_board_equity(
     accum: &mut [(f64, u64)],

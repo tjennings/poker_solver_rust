@@ -422,17 +422,17 @@ impl PreflopSolver {
                 (children.clone(), action_labels.clone())
             }
             PreflopNode::Terminal { .. } => {
-                eprintln!("Node {} is terminal", node_idx);
+                eprintln!("Node {node_idx} is terminal");
                 return;
             }
         };
 
         let eq = self.equity.equity(hero_hand as usize, opp_hand as usize);
-        println!("Terminal values from node {} (hero_pos={}, eq={:.4}):", node_idx, hero_pos, eq);
+        println!("Terminal values from node {node_idx} (hero_pos={hero_pos}, eq={eq:.4}):");
         println!("  stacks = {:?}", self.stacks);
 
         for (i, (&child_idx, action)) in children.iter().zip(action_labels.iter()).enumerate() {
-            println!("\n  Action {}: {:?} → child node {}", i, action, child_idx);
+            println!("\n  Action {i}: {action:?} → child node {child_idx}");
             self.walk_terminals(child_idx, hero_hand, opp_hand, hero_pos, eq, 2);
         }
     }
@@ -461,8 +461,7 @@ impl PreflopSolver {
                 match terminal_type {
                     TerminalType::Fold { folder } => {
                         let val = if *folder == hero_pos { -hero_inv } else { pot_f - hero_inv };
-                        println!("{}TERMINAL node {} (Fold by p{}): pot={}, inv={:?}, val={:.2}",
-                            indent, node_idx, folder, tree_pot, inv, val);
+                        println!("{indent}TERMINAL node {node_idx} (Fold by p{folder}): pot={tree_pot}, inv={inv:?}, val={val:.2}");
                     }
                     TerminalType::Showdown => {
                         // Compute SPR
@@ -477,12 +476,10 @@ impl PreflopSolver {
                             .and_then(|pf| pf.raise_counts.get(node_idx as usize).copied())
                             .unwrap_or(0);
 
-                        println!("{}SHOWDOWN node {} : pot={}, inv={:?}, hero_inv={:.0}, actual_spr={:.2}, raise_count={}",
-                            indent, node_idx, tree_pot, inv, hero_inv, actual_spr, raise_count);
+                        println!("{indent}SHOWDOWN node {node_idx} : pot={tree_pot}, inv={inv:?}, hero_inv={hero_inv:.0}, actual_spr={actual_spr:.2}, raise_count={raise_count}");
 
                         // Raw equity value
-                        println!("{}  eq_value = {:.4} * {:.0} - {:.0} = {:.2}",
-                            indent, eq, pot_f, hero_inv, eq_value);
+                        println!("{indent}  eq_value = {eq:.4} * {pot_f:.0} - {hero_inv:.0} = {eq_value:.2}");
 
                         // Postflop model value if available
                         if let Some(pf_state) = &self.postflop {
@@ -496,30 +493,26 @@ impl PreflopSolver {
                                 let model_value = pf_ev_frac * pot_f + (pot_f / 2.0 - hero_inv);
                                 let model_spr = selected.spr;
 
-                                println!("{}  model: spr={:.2}, pf_ev_frac={:.4}, model_value={:.2}",
-                                    indent, model_spr, pf_ev_frac, model_value);
+                                println!("{indent}  model: spr={model_spr:.2}, pf_ev_frac={pf_ev_frac:.4}, model_value={model_value:.2}");
 
                                 if model_spr > 0.0 && actual_spr < model_spr {
                                     let ratio = actual_spr / model_spr;
                                     let interp = eq_value + (model_value - eq_value) * ratio;
-                                    println!("{}  INTERPOLATED: ratio={:.4}, final={:.2} (eq={:.2}, model={:.2})",
-                                        indent, ratio, interp, eq_value, model_value);
+                                    println!("{indent}  INTERPOLATED: ratio={ratio:.4}, final={interp:.2} (eq={eq_value:.2}, model={model_value:.2})");
                                 } else {
-                                    println!("{}  final = model_value = {:.2} (no interpolation, actual_spr >= model_spr)",
-                                        indent, model_value);
+                                    println!("{indent}  final = model_value = {model_value:.2} (no interpolation, actual_spr >= model_spr)");
                                 }
                             } else {
-                                println!("{}  LIMPED POT: using eq_value = {:.2}", indent, eq_value);
+                                println!("{indent}  LIMPED POT: using eq_value = {eq_value:.2}");
                             }
                         }
                     }
                 }
             }
             PreflopNode::Decision { position, children, action_labels } => {
-                println!("{}DECISION node {} (p{} acts): inv={:?}, pot={}",
-                    indent, node_idx, position, inv, pot);
+                println!("{indent}DECISION node {node_idx} (p{position} acts): inv={inv:?}, pot={pot}");
                 for (&child_idx, action) in children.iter().zip(action_labels.iter()) {
-                    println!("{}  → {:?} (child {})", indent, action, child_idx);
+                    println!("{indent}  → {action:?} (child {child_idx})");
                     self.walk_terminals(child_idx, hero_hand, opp_hand, hero_pos, eq, depth + 1);
                 }
             }
