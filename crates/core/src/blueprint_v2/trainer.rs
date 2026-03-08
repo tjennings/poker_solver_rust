@@ -396,7 +396,8 @@ impl BlueprintTrainer {
                 .collect();
 
             let prune = self.should_prune();
-            let threshold = self.config.training.prune_threshold;
+            // Config is in BB units; stored regrets are ×1000.
+            let threshold = self.config.training.prune_threshold.saturating_mul(1000);
 
             // 2. Parallel traversal.
             let tree = &self.tree;
@@ -714,7 +715,8 @@ impl BlueprintTrainer {
     /// Fraction of regret entries below the prune threshold (0.0–1.0).
     #[must_use]
     pub fn prune_fraction(&self) -> f64 {
-        let threshold = self.config.training.prune_threshold;
+        // Config is in BB units; stored regrets are ×1000.
+        let threshold = self.config.training.prune_threshold.saturating_mul(1000);
         let total = self.storage.regrets.len() as f64;
         if total == 0.0 {
             return 0.0;

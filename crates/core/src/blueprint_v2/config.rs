@@ -86,7 +86,8 @@ pub struct TrainingConfig {
     /// Start pruning negative-regret actions after this many iterations.
     #[serde(default = "default_prune_after", alias = "prune_after_minutes")]
     pub prune_after_iterations: u64,
-    /// Regret threshold below which actions are pruned.
+    /// Regret threshold below which actions are pruned (in BB units;
+    /// internally scaled by ×1000 to match stored regret precision).
     #[serde(default = "default_prune_threshold")]
     pub prune_threshold: i32,
     /// Probability of exploring a pruned action anyway.
@@ -146,7 +147,7 @@ const fn default_prune_after() -> u64 {
 }
 
 const fn default_prune_threshold() -> i32 {
-    -250_000
+    -250
 }
 
 const fn default_prune_explore() -> f64 {
