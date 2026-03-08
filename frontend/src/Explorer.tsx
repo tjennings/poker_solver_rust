@@ -449,7 +449,7 @@ function extractStreetHistories(items: HistoryItem[]): string[][] {
 
   for (const item of items) {
     if (item.type === 'action') {
-      current.push(actionIdToHistoryEntry(item.selected));
+      current.push(item.selected);
     } else if (item.type === 'street') {
       if (current.length > 0) {
         histories.push(current);
@@ -459,15 +459,6 @@ function extractStreetHistories(items: HistoryItem[]): string[][] {
   }
   // Don't push `current` — those are current-street actions already in position.history
   return histories;
-}
-
-function actionIdToHistoryEntry(selected: string): string {
-  if (selected === 'call') return 'c';
-  if (selected === 'check') return 'x';
-  if (selected === 'fold') return 'f';
-  if (selected.startsWith('bet:')) return `b:${selected.split(':')[1]}`;
-  if (selected.startsWith('raise:')) return `r:${selected.split(':')[1]}`;
-  return selected;
 }
 
 export default function Explorer() {
@@ -623,23 +614,20 @@ export default function Explorer() {
   };
 
   // Check if current betting round is complete (needs street transition)
+  // Detect street transitions using action types from the V2 game tree.
+  // A street ends when: call after bet/raise, check-check, or limp-check.
   const checkStreetTransition = useCallback(
-    (history: string[], currentStreet: string, _preflopOnly?: boolean): { needsTransition: boolean; nextStreet: string } => {
-      if (history.length < 2) return { needsTransition: false, nextStreet: '' };
-
-      const lastTwo = history.slice(-2);
-
+    (currentStreet: string, prevActionType: string | null, actionType: string): { needsTransition: boolean; nextStreet: string } => {
       const isCallAfterBetOrRaise =
-        lastTwo[1] === 'c' && (lastTwo[0].startsWith('r:') || lastTwo[0].startsWith('b:'));
+        actionType === 'call' && (prevActionType === 'bet' || prevActionType === 'raise' || prevActionType === 'allin');
 
-      const isBothCheck = lastTwo[0] === 'x' && lastTwo[1] === 'x';
+      const isBothCheck = prevActionType === 'check' && actionType === 'check';
 
-      const isPreflopLimp = currentStreet === 'Preflop' && lastTwo[0] === 'c' && lastTwo[1] === 'x';
+      const isPreflopLimp =
+        currentStreet === 'Preflop' && prevActionType === 'call' && actionType === 'check';
 
       if (isCallAfterBetOrRaise || isBothCheck || isPreflopLimp) {
-        if (currentStreet === 'Preflop') {
-          return { needsTransition: true, nextStreet: 'FLOP' };
-        }
+        if (currentStreet === 'Preflop') return { needsTransition: true, nextStreet: 'FLOP' };
         if (currentStreet === 'Flop') return { needsTransition: true, nextStreet: 'TURN' };
         if (currentStreet === 'Turn') return { needsTransition: true, nextStreet: 'RIVER' };
         if (currentStreet === 'River') return { needsTransition: true, nextStreet: '' };
@@ -667,27 +655,16 @@ export default function Explorer() {
         let newHistory = [...position.history];
         let newToAct = position.to_act === 0 ? 1 : 0;
 
-        let historyEntry: string;
+        // V2 blueprint: action IDs are array indices ("0", "1", "2", ...)
+        // Pass directly to the backend.
+        newHistory.push(actionId);
 
-        if (actionId === 'call') {
-          historyEntry = 'c';
-        } else if (actionId === 'check') {
-          historyEntry = 'x';
-        } else if (actionId === 'fold') {
-          historyEntry = 'f';
-        } else if (actionId.startsWith('bet:') || actionId.startsWith('raise:')) {
-          // actionId is e.g. "bet:0", "raise:3", "bet:A" — store index in history
-          const idx = actionId.split(':')[1];
-          const prefix = actionId.startsWith('bet:') ? 'b' : 'r';
-          historyEntry = `${prefix}:${idx}`;
-        } else {
-          historyEntry = actionId;
-        }
-
-        newHistory.push(historyEntry);
+        // Look up the action type for transition/terminal detection.
+        const selectedAction = matrix.actions.find(a => a.id === actionId);
+        const actionType = selectedAction?.action_type ?? '';
 
         // Preflop-only fold: dead end — keep matrix visible, no action card added
-        if (actionId === 'fold' && bundleInfo?.preflop_only) {
+        if (actionType === 'fold' && bundleInfo?.preflop_only) {
           setPosition((prev) => ({
             ...prev,
             history: newHistory,
@@ -707,7 +684,7 @@ export default function Explorer() {
         setHistoryItems((prev) => [...prev, actionItem]);
 
         // Check for terminal states
-        if (actionId === 'fold') {
+        if (actionType === 'fold') {
           setPosition((prev) => ({
             ...prev,
             history: newHistory,
@@ -717,11 +694,17 @@ export default function Explorer() {
           return;
         }
 
-        // Check for street transition
+        // Check for street transition using action types.
+        // Get previous action type from the last action history item.
+        const prevItems = historyItems.filter(h => h.type === 'action');
+        const prevActionItem = prevItems[prevItems.length - 1];
+        const prevActionType = prevActionItem && prevActionItem.type === 'action'
+          ? prevActionItem.actions.find(a => a.id === prevActionItem.selected)?.action_type ?? null
+          : null;
         const { needsTransition, nextStreet } = checkStreetTransition(
-          newHistory,
           matrix.street,
-          bundleInfo?.preflop_only ?? false
+          prevActionType,
+          actionType,
         );
 
         if (needsTransition && nextStreet && bundleInfo?.preflop_only) {
@@ -758,10 +741,10 @@ export default function Explorer() {
           // Compute pot/stacks entering the new street.
           // A call adds to_call to pot and subtracts from the caller's stack.
           const transitionPot =
-            actionId === 'call' ? matrix.pot + matrix.to_call : matrix.pot;
+            actionType === 'call' ? matrix.pot + matrix.to_call : matrix.pot;
           let sp1 = matrix.stack_p1;
           let sp2 = matrix.stack_p2;
-          if (actionId === 'call') {
+          if (actionType === 'call') {
             if (position.to_act === 0) { sp1 -= matrix.to_call; }
             else { sp2 -= matrix.to_call; }
           }
@@ -774,7 +757,7 @@ export default function Explorer() {
           setMatrix(null);
         } else if (needsTransition && !nextStreet) {
           // Betting complete — showdown (or preflop-only terminal)
-          const finalPot = actionId === 'call'
+          const finalPot = actionType === 'call'
             ? matrix.pot + matrix.to_call
             : matrix.pot;
           setPosition((prev) => ({
@@ -907,16 +890,7 @@ export default function Explorer() {
 
       for (const item of items) {
         if (item.type === 'action') {
-          let entry: string;
-          if (item.selected === 'call') entry = 'c';
-          else if (item.selected === 'check') entry = 'x';
-          else if (item.selected === 'fold') entry = 'f';
-          else if (item.selected.startsWith('bet:'))
-            entry = `b:${item.selected.split(':')[1]}`;
-          else if (item.selected.startsWith('raise:'))
-            entry = `r:${item.selected.split(':')[1]}`;
-          else entry = item.selected;
-          history.push(entry);
+          history.push(item.selected);
           streetActionCount++;
         } else if (item.type === 'street') {
           board = [...board, ...item.cards];

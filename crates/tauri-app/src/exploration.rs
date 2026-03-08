@@ -1307,26 +1307,13 @@ fn v2_node_state(tree: &V2GameTree, node_idx: u32) -> (u8, f64, [f64; 2], f64) {
 
 /// Find the position of a history action string within V2 tree actions.
 fn find_v2_action_position(action_str: &str, actions: &[TreeAction]) -> Option<usize> {
-    match action_str {
-        "f" | "fold" => actions.iter().position(|a| matches!(a, TreeAction::Fold)),
-        "c" | "call" | "x" | "check" => actions
-            .iter()
-            .position(|a| matches!(a, TreeAction::Check | TreeAction::Call)),
-        _ => {
-            let suffix = action_str.split(':').nth(1).unwrap_or("");
-            if suffix == "A" {
-                return actions
-                    .iter()
-                    .position(|a| matches!(a, TreeAction::AllIn));
-            }
-            if let Ok(idx) = suffix.parse::<usize>() {
-                if idx < actions.len() {
-                    return Some(idx);
-                }
-            }
-            None
+    // Action IDs are array indices (e.g. "0", "1", "2").
+    if let Ok(idx) = action_str.parse::<usize>() {
+        if idx < actions.len() {
+            return Some(idx);
         }
     }
+    None
 }
 
 /// Build `ActionInfo` items for actions at a V2 tree node.
@@ -1344,39 +1331,40 @@ fn v2_actions_at_node(tree: &V2GameTree, node_idx: u32) -> Vec<ActionInfo> {
 /// Convert a V2 `TreeAction` to an `ActionInfo`.
 #[allow(clippy::cast_possible_truncation)]
 fn v2_action_info(action: &TreeAction, idx: usize) -> ActionInfo {
+    let id = idx.to_string();
     match action {
         TreeAction::Fold => ActionInfo {
-            id: "fold".to_string(),
+            id,
             label: "Fold".to_string(),
             action_type: "fold".to_string(),
             size_key: None,
         },
         TreeAction::Check => ActionInfo {
-            id: "check".to_string(),
+            id,
             label: "Check".to_string(),
             action_type: "check".to_string(),
             size_key: None,
         },
         TreeAction::Call => ActionInfo {
-            id: "call".to_string(),
+            id,
             label: "Call".to_string(),
             action_type: "call".to_string(),
             size_key: None,
         },
         TreeAction::Bet(amount) => ActionInfo {
-            id: format!("r:{idx}"),
+            id,
             label: format!("{:.1}bb", amount),
             action_type: "bet".to_string(),
             size_key: Some(format!("{amount:.2}")),
         },
         TreeAction::Raise(amount) => ActionInfo {
-            id: format!("r:{idx}"),
+            id,
             label: format!("{:.1}bb", amount),
             action_type: "raise".to_string(),
             size_key: Some(format!("{amount:.2}")),
         },
         TreeAction::AllIn => ActionInfo {
-            id: "r:A".to_string(),
+            id,
             label: "All-in".to_string(),
             action_type: "allin".to_string(),
             size_key: Some("allin".to_string()),
