@@ -46,7 +46,6 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     oop_raise_sizes: 'a',
     ip_bet_sizes: '25%,33%,75%,a',
     ip_raise_sizes: 'a',
-    target_exploitability: 3,
   });
   const [configSummary, setConfigSummary] = useState<PostflopConfigSummary | null>(null);
   const [showConfigModal, setShowConfigModal] = useState(false);
@@ -165,7 +164,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     setMatrix(null);
     setProgress(null);
     initialExplRef.current = Infinity;
-    invoke('postflop_solve_street', { board: cards, target_exploitability: config.target_exploitability })
+    invoke('postflop_solve_street', { board: cards, target_exploitability: 3.0 })
       .then(() => startPolling())
       .catch((e) => { setError(String(e)); setSolving(false); });
   }, [solving, boardInput, handleReset, startPolling]);
@@ -463,7 +462,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       {/* Progress bar */}
       {solving && progress && (() => {
         const expl = progress.exploitability;
-        const target = config.target_exploitability;
+        const target = 3.0;
         const valid = expl < 1e30;
         // Progress toward target: start from first reading, converge to target
         const startExpl = initialExplRef.current;
@@ -662,15 +661,6 @@ function ConfigModal({ config, error, onSubmit, onClose }: {
             <label>BB Bet Sizes</label>
             <input value={draft.ip_bet_sizes}
               onChange={(e) => setDraft({ ...draft, ip_bet_sizes: e.target.value })} />
-          </div>
-        </div>
-
-        <h4>Solver</h4>
-        <div className="modal-row">
-          <div>
-            <label>Target Exploitability (chips)</label>
-            <input type="number" step="0.1" value={draft.target_exploitability}
-              onChange={(e) => setDraft({ ...draft, target_exploitability: parseFloat(e.target.value) || 0 })} />
           </div>
         </div>
 
