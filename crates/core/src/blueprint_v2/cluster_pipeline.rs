@@ -576,11 +576,11 @@ pub fn cluster_turn_canonical(
     let mut feature_positions: Vec<(usize, usize)> = Vec::new();
 
     for (board_idx, (board_feats, wb)) in
-        board_features.iter().zip(boards.iter()).enumerate()
+        board_features.into_iter().zip(boards.iter()).enumerate()
     {
-        for (combo_idx, feat) in board_feats.iter().enumerate() {
+        for (combo_idx, feat) in board_feats.into_iter().enumerate() {
             if let Some(histogram) = feat {
-                all_features.push(histogram.clone());
+                all_features.push(histogram);
                 all_weights.push(f64::from(wb.weight));
                 feature_positions.push((board_idx, combo_idx));
             }
@@ -675,11 +675,11 @@ pub fn cluster_flop_canonical(
     let mut feature_positions: Vec<(usize, usize)> = Vec::new();
 
     for (board_idx, (board_feats, wb)) in
-        board_features.iter().zip(boards.iter()).enumerate()
+        board_features.into_iter().zip(boards.iter()).enumerate()
     {
-        for (combo_idx, feat) in board_feats.iter().enumerate() {
+        for (combo_idx, feat) in board_feats.into_iter().enumerate() {
             if let Some(histogram) = feat {
-                all_features.push(histogram.clone());
+                all_features.push(histogram);
                 all_weights.push(f64::from(wb.weight));
                 feature_positions.push((board_idx, combo_idx));
             }
