@@ -185,7 +185,7 @@ impl BlueprintTuiApp {
             for &v in hist.iter() {
                 push_bounded(
                     &mut self.avg_pos_regret_history,
-                    (v * 1000.0) as u64,
+                    (v * 1_000_000_000.0) as u64,
                     sparkline_max,
                 );
             }
@@ -462,9 +462,9 @@ impl BlueprintTuiApp {
         let latest = self
             .avg_pos_regret_history
             .last()
-            .map(|&v| v as f64 / 1000.0)
+            .map(|&v| v as f64 / 1_000_000_000.0)
             .unwrap_or(0.0);
-        let title = format!("Avg pos regret: {latest:.3}");
+        let title = format!("Avg pos regret: {latest:.2e}");
         let sparkline = Sparkline::default()
             .block(Block::default().title(title).borders(Borders::NONE))
             .data(&self.avg_pos_regret_history)
