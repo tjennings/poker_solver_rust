@@ -221,6 +221,185 @@ pub fn kmeans_1d(data: &[f64], k: usize, max_iterations: u32) -> Vec<u16> {
 }
 
 // ---------------------------------------------------------------------------
+// Weighted 1-D k-means
+// ---------------------------------------------------------------------------
+
+/// Weighted k-means for 1-D scalar values.
+///
+/// Identical to [`kmeans_1d`] except centroid updates use weighted averages,
+/// so points with higher weight pull centroids more strongly.
+///
+/// # Panics
+/// Panics if `data` is empty, `k` is zero, or `data.len() != weights.len()`.
+#[allow(clippy::cast_possible_truncation)]
+#[must_use]
+pub fn kmeans_1d_weighted(
+    data: &[f64],
+    weights: &[f64],
+    k: usize,
+    max_iterations: u32,
+) -> Vec<u16> {
+    assert_eq!(data.len(), weights.len());
+    assert!(!data.is_empty(), "data must not be empty");
+    assert!(k > 0, "k must be positive");
+
+    let n = data.len();
+    if k >= n {
+        return (0..n).map(|i| i as u16).collect();
+    }
+
+    // Sorted copy for percentile initialisation.
+    let mut sorted = data.to_vec();
+    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Initialise centroids at evenly-spaced percentiles.
+    let mut centroids: Vec<f64> = (0..k)
+        .map(|i| {
+            let idx = (i * (n - 1)) / (k.max(2) - 1).max(1);
+            sorted[idx.min(n - 1)]
+        })
+        .collect();
+
+    let mut assignments = vec![0_u16; n];
+
+    for _iter in 0..max_iterations {
+        // -- Assignment step -----------------------------------------------
+        let mut changed = false;
+        for (i, &val) in data.iter().enumerate() {
+            let nearest = nearest_centroid_1d(val, &centroids);
+            if assignments[i] != nearest {
+                assignments[i] = nearest;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+
+        // -- Weighted update step ------------------------------------------
+        let mut sums = vec![0.0_f64; k];
+        let mut weight_sums = vec![0.0_f64; k];
+
+        for (i, &val) in data.iter().enumerate() {
+            let ci = assignments[i] as usize;
+            let w = weights[i];
+            sums[ci] += val * w;
+            weight_sums[ci] += w;
+        }
+
+        for ci in 0..k {
+            if weight_sums[ci] > 0.0 {
+                centroids[ci] = sums[ci] / weight_sums[ci];
+            }
+            // Empty cluster: keep old centroid (rare with percentile init).
+        }
+    }
+
+    // Final assignment pass.
+    for (i, &val) in data.iter().enumerate() {
+        assignments[i] = nearest_centroid_1d(val, &centroids);
+    }
+
+    assignments
+}
+
+// ---------------------------------------------------------------------------
+// Weighted EMD k-means
+// ---------------------------------------------------------------------------
+
+/// Weighted k-means using EMD as the distance metric.
+///
+/// Identical to [`kmeans_emd_with_progress`] except centroid updates use
+/// weighted averages.
+///
+/// # Panics
+/// Panics if `data` is empty, `k` is zero, or `data.len() != weights.len()`.
+#[allow(clippy::cast_possible_truncation)]
+pub fn kmeans_emd_weighted(
+    data: &[Vec<f64>],
+    weights: &[f64],
+    k: usize,
+    max_iterations: u32,
+    seed: u64,
+    progress: impl Fn(u32, u32),
+) -> Vec<u16> {
+    assert_eq!(data.len(), weights.len());
+    assert!(!data.is_empty(), "data must not be empty");
+    assert!(k > 0, "k must be positive");
+
+    let n = data.len();
+    if k >= n {
+        return (0..n).map(|i| i as u16).collect();
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    // -- k-means++ initialisation ------------------------------------------
+    let mut centroids = kmeanspp_init(data, k, &mut rng);
+
+    let mut assignments = vec![0_u16; n];
+
+    for iter in 0..max_iterations {
+        progress(iter, max_iterations);
+
+        // -- Assignment step (parallel) ------------------------------------
+        let new_assignments: Vec<u16> = data
+            .par_iter()
+            .map(|point| nearest_centroid(point, &centroids))
+            .collect();
+
+        let changed = assignments
+            .iter()
+            .zip(new_assignments.iter())
+            .any(|(old, new)| old != new);
+        assignments = new_assignments;
+
+        if !changed {
+            break;
+        }
+
+        // -- Weighted update step ------------------------------------------
+        for c in &mut centroids {
+            c.fill(0.0);
+        }
+        let mut weight_sums = vec![0.0_f64; k];
+
+        for (i, point) in data.iter().enumerate() {
+            let ci = assignments[i] as usize;
+            let w = weights[i];
+            weight_sums[ci] += w;
+            for (j, &val) in point.iter().enumerate() {
+                centroids[ci][j] += val * w;
+            }
+        }
+
+        // Average and handle empty clusters.
+        for ci in 0..k {
+            if weight_sums[ci] <= 0.0 {
+                let farthest = farthest_point(data, &assignments, &centroids);
+                centroids[ci].clone_from(&data[farthest]);
+                assignments[farthest] = ci as u16;
+            } else {
+                let inv = 1.0 / weight_sums[ci];
+                for v in &mut centroids[ci] {
+                    *v *= inv;
+                }
+            }
+        }
+    }
+
+    // Final assignment pass (parallel).
+    data.par_iter()
+        .zip(assignments.par_iter_mut())
+        .for_each(|(point, assign)| {
+            *assign = nearest_centroid(point, &centroids);
+        });
+
+    assignments
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -433,5 +612,33 @@ mod tests {
         // All points are identical; they should end up in the same cluster.
         let first = assignments[0];
         assert!(assignments.iter().all(|&a| a == first));
+    }
+
+    #[test]
+    fn weighted_1d_kmeans_respects_weights() {
+        let data = vec![0.1, 0.2, 0.9, 1.0];
+        let weights = vec![10.0, 10.0, 1.0, 1.0];
+        let labels = kmeans_1d_weighted(&data, &weights, 2, 100);
+        assert_eq!(labels[0], labels[1]);
+        assert_eq!(labels[2], labels[3]);
+        assert_ne!(labels[0], labels[2]);
+    }
+
+    #[test]
+    fn weighted_emd_kmeans_separable() {
+        let mut data = Vec::new();
+        let mut weights = Vec::new();
+        for _ in 0..50 {
+            data.push(vec![0.9, 0.1, 0.0, 0.0]);
+            weights.push(5.0);
+        }
+        for _ in 0..50 {
+            data.push(vec![0.0, 0.0, 0.1, 0.9]);
+            weights.push(1.0);
+        }
+        let assignments = kmeans_emd_weighted(&data, &weights, 2, 100, 42, |_, _| {});
+        assert!(assignments[0..50].iter().all(|&a| a == assignments[0]));
+        assert!(assignments[50..100].iter().all(|&a| a == assignments[50]));
+        assert_ne!(assignments[0], assignments[50]);
     }
 }
