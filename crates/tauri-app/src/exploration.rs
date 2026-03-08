@@ -1427,7 +1427,7 @@ fn get_strategy_matrix_v2(
                             &mut reaching_p2
                         };
 
-                        for hand_idx in 0..169 {
+                        for (hand_idx, r) in reach.iter_mut().enumerate() {
                             let bucket = if num_buckets_preflop == 169 {
                                 hand_idx as u16
                             } else {
@@ -1436,7 +1436,7 @@ fn get_strategy_matrix_v2(
                             let probs =
                                 strategy.get_action_probs(dec_idx as usize, bucket);
                             let p = probs.get(action_pos).copied().unwrap_or(0.0);
-                            reach[hand_idx] *= p;
+                            *r *= p;
                         }
 
                         node_idx = children[action_pos];

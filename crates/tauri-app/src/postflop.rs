@@ -424,9 +424,9 @@ fn build_matrix_from_snapshot(snap: MatrixSnapshot) -> PostflopStrategyMatrix {
             ev_sums[row][col] += evs[hand_idx] as f64;
         }
         let mut probs = Vec::with_capacity(num_actions);
-        for action_idx in 0..num_actions {
+        for (action_idx, prob_sum) in prob_sums[row][col].iter_mut().enumerate() {
             let prob = snap.strategy[action_idx * snap.num_hands + hand_idx];
-            prob_sums[row][col][action_idx] += prob as f64;
+            *prob_sum += prob as f64;
             probs.push(prob);
         }
         let s1 = card_to_string(c1).unwrap_or_default();
@@ -788,7 +788,7 @@ fn postflop_solve_street_impl(
 
     // Clone the Arc for the background thread.
     let shared = Arc::clone(state);
-    let cache_dir = state.cache_dir.read().clone();
+    let _cache_dir = state.cache_dir.read().clone();
 
     std::thread::spawn(move || {
         let mut last_exp = f32::MAX;
