@@ -1358,9 +1358,41 @@ export default function Explorer() {
                 <div
                   key={bp.path}
                   className="dataset-picker-item"
-                  onClick={() => {
+                  onClick={async () => {
                     setShowBlueprintPicker(false);
-                    loadSource(bp.path);
+                    setLoading(true);
+                    setError(null);
+                    try {
+                      const info = await invoke<BundleInfo>('load_blueprint_v2', { path: bp.path });
+                      setBundleInfo(info);
+                      const sp1 = info.stack_depth * 2 - 1;
+                      const sp2 = info.stack_depth * 2 - 2;
+                      const initialPosition: ExplorationPosition = {
+                        board: [],
+                        history: [],
+                        pot: 3,
+                        stacks: [sp1, sp2],
+                        stack_p1: sp1,
+                        stack_p2: sp2,
+                        to_act: 0,
+                        num_players: 2,
+                        active_players: [true, true],
+                      };
+                      setPosition(initialPosition);
+                      setHistoryItems([]);
+                      setPendingStreet(null);
+                      setHandResult(null);
+                      setSelectedCell(null);
+                      const initialMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
+                        position: initialPosition,
+                      });
+                      setMatrix(initialMatrix);
+                      updateRangesFromMatrix(initialMatrix);
+                    } catch (e) {
+                      setError(String(e));
+                    } finally {
+                      setLoading(false);
+                    }
                   }}
                 >
                   <span className="dataset-kind-badge preflop">blueprint</span>
