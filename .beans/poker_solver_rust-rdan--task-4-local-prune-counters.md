@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-rdan
 title: 'Task 4: Local prune counters'
-status: todo
+status: completed
 type: task
 priority: high
 created_at: 2026-03-08T15:26:09Z
-updated_at: 2026-03-08T15:26:09Z
+updated_at: 2026-03-08T15:50:08Z
 parent: poker_solver_rust-jslp
 ---
 

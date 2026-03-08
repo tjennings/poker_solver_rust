@@ -186,6 +186,7 @@ export interface PostflopMatrixCell {
   combo_count: number;
   ev: number | null;
   combos: PostflopComboDetail[];
+  weight: number;
 }
 
 export interface PostflopStrategyMatrix {
@@ -203,6 +204,7 @@ export interface PostflopProgress {
   exploitability: number;
   is_complete: boolean;
   matrix: PostflopStrategyMatrix | null;
+  elapsed_secs: number;
 }
 
 export interface PostflopStreetResult {

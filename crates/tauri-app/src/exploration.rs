@@ -3516,6 +3516,15 @@ pub fn get_preflop_ranges_core(
     let oop_raise_sizes = format_bet_sizes(flop_sizes.get(1).map_or(&[], Vec::as_slice));
     let ip_raise_sizes = format_bet_sizes(flop_sizes.get(1).map_or(&[], Vec::as_slice));
 
+    // Zero out negligible weights (CFR never outputs exact 0, so threshold needed).
+    let threshold = 0.005;
+    for w in oop_weights.iter_mut() {
+        if *w < threshold { *w = 0.0; }
+    }
+    for w in ip_weights.iter_mut() {
+        if *w < threshold { *w = 0.0; }
+    }
+
     // Expand 169 → 1326.
     let oop_1326 = expand_169_to_1326(&oop_weights);
     let ip_1326 = expand_169_to_1326(&ip_weights);

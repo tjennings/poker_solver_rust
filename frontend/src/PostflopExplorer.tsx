@@ -116,15 +116,13 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         const summary = await invoke<PostflopConfigSummary>('postflop_set_config', { config });
         setConfigSummary(summary);
         if (blueprintConfig) {
-          // Set blueprint weights as filtered weights for the solve
-          await invoke('postflop_set_filtered_weights', {
+          // Set blueprint weights as filtered weights for the solve.
+          // Backend returns authoritative combo counts (sum of weights).
+          const result = await invoke<{ oop_combos: number; ip_combos: number }>('postflop_set_filtered_weights', {
             oopWeights: blueprintConfig.oop_weights,
             ipWeights: blueprintConfig.ip_weights,
           });
-          // Update combo counts to reflect filtered ranges
-          const oopCombos = blueprintConfig.oop_weights.filter(w => w > 0).length;
-          const ipCombos = blueprintConfig.ip_weights.filter(w => w > 0).length;
-          setConfigSummary(prev => prev ? { ...prev, oop_combos: oopCombos, ip_combos: ipCombos } : prev);
+          setConfigSummary(prev => prev ? { ...prev, oop_combos: result.oop_combos, ip_combos: result.ip_combos } : prev);
           // Set cache dir if the command exists
           await invoke('postflop_set_cache_dir', { dir: blueprintConfig.blueprint_dir }).catch(() => {
             // Command may not exist yet (Task 8)
@@ -305,18 +303,16 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     const entry = actionHistory[historyIndex];
     if (!entry) return;
 
-    // Only allow navigating within the current street
-    if (entry.streetIndex !== currentStreetIndex) return;
-
     setError(null);
     setSelectedCell(null);
     setTerminal(false);
     setAwaitingCard(false);
 
     // Collect the action indices up to (not including) the clicked entry
+    // Only replay actions from the current street's solve.
     const replayActions = actionHistory
       .slice(0, historyIndex)
-      .filter(e => e.streetIndex === currentStreetIndex)
+      .filter(e => e.streetIndex === entry.streetIndex)
       .map(e => e.actionIndex);
 
     try {
@@ -427,7 +423,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
 
         {/* Action history blocks — click to navigate back (current street only) */}
         {actionHistory.map((item, i) => {
-          const canNavigate = item.streetIndex === currentStreetIndex && !solving;
+          const canNavigate = !solving;
           return (
             <ActionBlock
               key={i}
@@ -436,7 +432,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
               pot={item.pot}
               actions={item.actions}
               selectedAction={item.selectedId}
-              onSelect={() => {}}
+              onSelect={canNavigate ? () => handleNavigateBack(i) : () => {}}
               onHeaderClick={canNavigate ? () => handleNavigateBack(i) : undefined}
               isCurrent={false}
             />
@@ -589,6 +585,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
               <span className="progress-text">
                 {progress.iteration}/{progress.max_iterations} iters
                 {valid && ` — ${(expl / Math.max(config.pot, 1) * 100).toFixed(1)}% pot expl`}
+                {progress.elapsed_secs > 0 && ` — ${progress.elapsed_secs.toFixed(1)}s`}
               </span>
             </div>
           </div>
@@ -627,7 +624,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
                         key={colIdx}
                         cell={toMatrixCell(cell, matrix.actions)}
                         actions={matrix.actions}
-                        reachWeight={cell.combo_count > 0 ? 1 : 0}
+                        reachWeight={cell.weight ?? (cell.combo_count > 0 ? 1 : 0)}
                         isSelected={selectedCell?.row === rowIdx && selectedCell?.col === colIdx}
                         onClick={() => setSelectedCell({ row: rowIdx, col: colIdx })}
                         overlayText={cell.ev != null && cell.combo_count > 0 ? cell.ev.toFixed(1) : undefined}
