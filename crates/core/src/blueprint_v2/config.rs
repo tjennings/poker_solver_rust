@@ -142,7 +142,7 @@ const fn default_prune_after() -> u64 {
 }
 
 const fn default_prune_threshold() -> i32 {
-    -310_000_000
+    0
 }
 
 const fn default_prune_explore() -> f64 {
@@ -283,7 +283,7 @@ snapshots:
                 lcfr_warmup_minutes: 400,
                 lcfr_discount_interval: 10,
                 prune_after_minutes: 200,
-                prune_threshold: -310_000_000,
+                prune_threshold: 0,
                 prune_explore_pct: 0.05,
                 print_every_minutes: 10,
                 batch_size: 200,
@@ -318,7 +318,7 @@ snapshots:
         assert_eq!(restored.training.cluster_path, "/data/clusters");
         assert_eq!(restored.training.iterations, None);
         assert_eq!(restored.training.time_limit_minutes, Some(720));
-        assert_eq!(restored.training.prune_threshold, -310_000_000);
+        assert_eq!(restored.training.prune_threshold, 0);
 
         // Snapshots
         assert_eq!(restored.snapshots.warmup_minutes, 120);

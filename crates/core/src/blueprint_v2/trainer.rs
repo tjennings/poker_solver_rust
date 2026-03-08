@@ -115,6 +115,8 @@ pub struct BlueprintTrainer {
     pub on_leaf_movement: Option<Box<dyn Fn(f64) + Send>>,
     /// Callback to push the minimum (most-negative) regret value to TUI metrics.
     pub on_min_regret: Option<Box<dyn Fn(f64) + Send>>,
+    /// Callback to push the maximum (most-positive) regret value to TUI metrics.
+    pub on_max_regret: Option<Box<dyn Fn(f64) + Send>>,
     /// Callback to push fraction of actions below prune threshold to TUI.
     pub on_prune_fraction: Option<Box<dyn Fn(f64) + Send>>,
     /// Last time (in seconds) a strategy refresh was performed.
@@ -202,6 +204,7 @@ impl BlueprintTrainer {
             on_strategy_delta: None,
             on_leaf_movement: None,
             on_min_regret: None,
+            on_max_regret: None,
             on_prune_fraction: None,
             last_strategy_refresh_secs: 0,
             prev_strategy_sums: None,
@@ -561,6 +564,9 @@ impl BlueprintTrainer {
             if let Some(ref cb) = self.on_min_regret {
                 cb(self.min_regret());
             }
+            if let Some(ref cb) = self.on_max_regret {
+                cb(self.max_regret());
+            }
             if let Some(ref cb) = self.on_prune_fraction {
                 cb(self.prune_fraction());
             }
@@ -606,6 +612,20 @@ impl BlueprintTrainer {
             .min()
             .unwrap_or(0);
         f64::from(min_raw) / 1000.0
+    }
+
+    /// The most-positive regret value across all info-set entries,
+    /// divided by the ×1000 scaling factor used in storage.
+    #[must_use]
+    pub fn max_regret(&self) -> f64 {
+        let max_raw = self
+            .storage
+            .regrets
+            .iter()
+            .map(|atom| atom.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0);
+        f64::from(max_raw) / 1000.0
     }
 
     /// Fraction of regret entries below the prune threshold (0.0–1.0).
@@ -735,7 +755,7 @@ mod tests {
                 lcfr_warmup_minutes: 0,
                 lcfr_discount_interval: 1,
                 prune_after_minutes: 9999,
-                prune_threshold: -310_000_000,
+                prune_threshold: 0,
                 prune_explore_pct: 0.05,
                 print_every_minutes: 9999,
                 batch_size: 200,

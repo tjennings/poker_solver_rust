@@ -48,6 +48,7 @@ pub struct BlueprintTuiMetrics {
     pub strategy_delta_history: Mutex<Vec<f64>>,
     pub leaf_movement_history: Mutex<Vec<f64>>,
     pub min_regret_history: Mutex<Vec<f64>>,
+    pub max_regret_history: Mutex<Vec<f64>>,
     pub prune_fraction: Mutex<f64>,
 }
 
@@ -82,6 +83,7 @@ impl BlueprintTuiMetrics {
             strategy_delta_history: Mutex::new(Vec::new()),
             leaf_movement_history: Mutex::new(Vec::new()),
             min_regret_history: Mutex::new(Vec::new()),
+            max_regret_history: Mutex::new(Vec::new()),
             prune_fraction: Mutex::new(0.0),
         }
     }
@@ -157,6 +159,12 @@ impl BlueprintTuiMetrics {
     /// Push a min-regret sample into the sparkline history.
     pub fn push_min_regret(&self, val: f64) {
         let mut hist = self.min_regret_history.lock().unwrap_or_else(|e| e.into_inner());
+        hist.push(val);
+    }
+
+    /// Push a max-regret sample into the sparkline history.
+    pub fn push_max_regret(&self, val: f64) {
+        let mut hist = self.max_regret_history.lock().unwrap_or_else(|e| e.into_inner());
         hist.push(val);
     }
 

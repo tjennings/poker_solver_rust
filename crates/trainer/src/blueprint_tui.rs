@@ -48,6 +48,8 @@ pub struct BlueprintTuiApp {
     delta_history: Vec<u64>,
     // Leaf movement sparkline data
     leaf_movement_history: Vec<u64>,
+    // Max positive regret sparkline data (stored as value × 1000 for sparkline)
+    max_regret_history: Vec<u64>,
     // Max negative regret sparkline data (stored as abs value × 1000 for sparkline)
     min_regret_history: Vec<u64>,
     // Current prune fraction (0.0–1.0)
@@ -74,6 +76,7 @@ impl BlueprintTuiApp {
             refresh_rate_hz,
             delta_history: Vec::with_capacity(SPARKLINE_HISTORY),
             leaf_movement_history: Vec::with_capacity(SPARKLINE_HISTORY),
+            max_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
             min_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
             prune_fraction: 0.0,
             has_random_tab: false,
@@ -126,6 +129,23 @@ impl BlueprintTuiApp {
                 push_bounded(
                     &mut self.leaf_movement_history,
                     (v * 100.0) as u64,
+                    sparkline_max,
+                );
+            }
+            hist.clear();
+        }
+
+        // Max regret sparkline: read all new values
+        {
+            let mut hist = self
+                .metrics
+                .max_regret_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for &v in hist.iter() {
+                push_bounded(
+                    &mut self.max_regret_history,
+                    (v * 1000.0) as u64,
                     sparkline_max,
                 );
             }
@@ -253,6 +273,7 @@ impl BlueprintTuiApp {
                 Constraint::Length(3), // Throughput sparkline
                 Constraint::Length(3), // Strategy delta sparkline
                 Constraint::Length(3), // Leaf movement sparkline
+                Constraint::Length(3), // Max positive regret sparkline
                 Constraint::Length(3), // Max negative regret sparkline
                 Constraint::Length(1), // Actions pruned bar
                 Constraint::Min(0),   // Spacer
@@ -266,9 +287,10 @@ impl BlueprintTuiApp {
         self.render_sparkline(frame, chunks[3]);
         self.render_strategy_delta(frame, chunks[4]);
         self.render_leaf_movement(frame, chunks[5]);
-        self.render_min_regret(frame, chunks[6]);
-        self.render_prune_bar(frame, chunks[7]);
-        self.render_hotkeys(frame, chunks[9]);
+        self.render_max_regret(frame, chunks[6]);
+        self.render_min_regret(frame, chunks[7]);
+        self.render_prune_bar(frame, chunks[8]);
+        self.render_hotkeys(frame, chunks[10]);
     }
 
     fn render_iterations(&self, frame: &mut Frame, area: Rect) {
@@ -364,6 +386,20 @@ impl BlueprintTuiApp {
         let sparkline = Sparkline::default()
             .block(Block::default().title(title).borders(Borders::NONE))
             .data(&self.leaf_movement_history)
+            .style(Style::default().fg(Color::Green));
+        frame.render_widget(sparkline, area);
+    }
+
+    fn render_max_regret(&self, frame: &mut Frame, area: Rect) {
+        let latest = self
+            .max_regret_history
+            .last()
+            .map(|&v| v as f64 / 1000.0)
+            .unwrap_or(0.0);
+        let title = format!("Max pos regret: {latest:.1}");
+        let sparkline = Sparkline::default()
+            .block(Block::default().title(title).borders(Borders::NONE))
+            .data(&self.max_regret_history)
             .style(Style::default().fg(Color::Green));
         frame.render_widget(sparkline, area);
     }

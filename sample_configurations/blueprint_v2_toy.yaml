@@ -36,7 +36,6 @@ training:
   lcfr_warmup_minutes: 2
   lcfr_discount_interval: 1
   prune_after_minutes: 2
-  prune_threshold: -310000000
   prune_explore_pct: 0.05
   print_every_minutes: 1
 

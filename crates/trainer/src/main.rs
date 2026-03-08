@@ -588,6 +588,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     metrics_for_regret.push_min_regret(val);
                 }));
 
+                let metrics_for_max_regret = Arc::clone(&metrics);
+                trainer.on_max_regret = Some(Box::new(move |val| {
+                    metrics_for_max_regret.push_max_regret(val);
+                }));
+
                 let metrics_for_prune = Arc::clone(&metrics);
                 trainer.on_prune_fraction = Some(Box::new(move |frac| {
                     metrics_for_prune.set_prune_fraction(frac);

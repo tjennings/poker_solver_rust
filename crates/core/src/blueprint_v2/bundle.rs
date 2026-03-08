@@ -342,7 +342,7 @@ mod tests {
                 lcfr_warmup_minutes: 0,
                 lcfr_discount_interval: 1,
                 prune_after_minutes: 200,
-                prune_threshold: -310_000_000,
+                prune_threshold: 0,
                 prune_explore_pct: 0.05,
                 print_every_minutes: 10,
                 batch_size: 200,
