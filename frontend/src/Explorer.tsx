@@ -625,11 +625,6 @@ export default function Explorer() {
   // Check if current betting round is complete (needs street transition)
   const checkStreetTransition = useCallback(
     (history: string[], currentStreet: string, _preflopOnly?: boolean): { needsTransition: boolean; nextStreet: string } => {
-      // V2 tree: SB limp immediately transitions to flop (BB has no option)
-      if (history.length === 1 && history[0] === 'c' && currentStreet === 'Preflop') {
-        return { needsTransition: true, nextStreet: 'FLOP' };
-      }
-
       if (history.length < 2) return { needsTransition: false, nextStreet: '' };
 
       const lastTwo = history.slice(-2);
