@@ -205,3 +205,29 @@ export interface PostflopPlayResult {
   pot: number;
   stacks: [number, number];
 }
+
+// Preflop → postflop transition types
+
+export interface PreflopRanges {
+  oop_weights: number[];      // [1326] combo weights
+  ip_weights: number[];       // [1326] combo weights
+  pot: number;
+  effective_stack: number;
+  oop_bet_sizes: string;
+  oop_raise_sizes: string;
+  ip_bet_sizes: string;
+  ip_raise_sizes: string;
+}
+
+export interface BlueprintConfig {
+  oop_range: string;
+  ip_range: string;
+  oop_weights: number[];      // [1326] combo weights
+  ip_weights: number[];       // [1326] combo weights
+  pot: number;
+  effective_stack: number;
+  oop_bet_sizes: string;
+  oop_raise_sizes: string;
+  ip_bet_sizes: string;
+  ip_raise_sizes: string;
+}

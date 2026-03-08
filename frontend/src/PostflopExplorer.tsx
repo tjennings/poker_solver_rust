@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { invoke } from './invoke';
 import {
   ActionInfo,
+  BlueprintConfig,
   MatrixCell,
   PostflopConfig,
   PostflopConfigSummary,
@@ -34,10 +35,24 @@ function toMatrixCell(cell: { hand: string; suited: boolean; pair: boolean; prob
 
 interface PostflopExplorerProps {
   onBack: () => void;
+  blueprintConfig?: BlueprintConfig;
 }
 
-export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
-  const [config, setConfig] = useState<PostflopConfig>({
+function buildInitialConfig(bp?: BlueprintConfig): PostflopConfig {
+  if (bp) {
+    return {
+      oop_range: bp.oop_range,
+      ip_range: bp.ip_range,
+      pot: bp.pot,
+      effective_stack: bp.effective_stack,
+      oop_bet_sizes: bp.oop_bet_sizes,
+      oop_raise_sizes: bp.oop_raise_sizes,
+      ip_bet_sizes: bp.ip_bet_sizes,
+      ip_raise_sizes: bp.ip_raise_sizes,
+      target_exploitability: 3,
+    };
+  }
+  return {
     oop_range: 'QQ+,AKs,AKo',
     ip_range: 'TT+,AQs+,AKo',
     pot: 30,
@@ -47,7 +62,11 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     ip_bet_sizes: '25%,33%,75%,a',
     ip_raise_sizes: 'a',
     target_exploitability: 3,
-  });
+  };
+}
+
+export default function PostflopExplorer({ onBack, blueprintConfig }: PostflopExplorerProps) {
+  const [config, setConfig] = useState<PostflopConfig>(() => buildInitialConfig(blueprintConfig));
   const [configSummary, setConfigSummary] = useState<PostflopConfigSummary | null>(null);
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
