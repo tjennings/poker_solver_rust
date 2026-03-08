@@ -249,35 +249,25 @@ impl BlueprintTuiApp {
         }
     }
 
-    /// Render the full dashboard.
+    /// Render the full dashboard — metrics on top, strategy grids below.
     pub fn render(&self, frame: &mut Frame) {
         let area = frame.area();
 
-        // Top-level horizontal split: left 45%, right 55%.
-        let h_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(area);
-
-        self.render_left_panel(frame, h_chunks[0]);
-        self.render_right_panel(frame, h_chunks[1]);
-    }
-
-    fn render_left_panel(&self, frame: &mut Frame, area: Rect) {
+        // Vertical split: metrics top, strategy grids bottom, hotkeys footer.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // Iterations counter
-                Constraint::Length(1), // Progress gauge
-                Constraint::Length(1), // Runtime + ETA
-                Constraint::Length(3), // Throughput sparkline
-                Constraint::Length(3), // Strategy delta sparkline
-                Constraint::Length(3), // Leaf movement sparkline
-                Constraint::Length(3), // Max positive regret sparkline
-                Constraint::Length(3), // Max negative regret sparkline
-                Constraint::Length(1), // Actions pruned bar
-                Constraint::Min(0),   // Spacer
-                Constraint::Length(1), // Hotkeys footer
+                Constraint::Length(1),  // Iterations counter
+                Constraint::Length(1),  // Progress gauge
+                Constraint::Length(1),  // Runtime + ETA
+                Constraint::Length(3),  // Throughput sparkline
+                Constraint::Length(3),  // Strategy delta sparkline
+                Constraint::Length(3),  // Leaf movement sparkline
+                Constraint::Length(3),  // Max positive regret sparkline
+                Constraint::Length(3),  // Max negative regret sparkline
+                Constraint::Length(1),  // Actions pruned bar
+                Constraint::Min(0),    // Strategy grids
+                Constraint::Length(1),  // Hotkeys footer
             ])
             .split(area);
 
@@ -290,6 +280,7 @@ impl BlueprintTuiApp {
         self.render_max_regret(frame, chunks[6]);
         self.render_min_regret(frame, chunks[7]);
         self.render_prune_bar(frame, chunks[8]);
+        self.render_right_panel(frame, chunks[9]);
         self.render_hotkeys(frame, chunks[10]);
     }
 
@@ -310,12 +301,15 @@ impl BlueprintTuiApp {
     }
 
     fn render_progress_gauge(&self, frame: &mut Frame, area: Rect) {
-        let current = self.metrics.iterations.load(Ordering::Relaxed);
-        let ratio = self
-            .metrics
-            .target_iterations
-            .map(|t| if t > 0 { current as f64 / t as f64 } else { 0.0 })
-            .unwrap_or(0.0);
+        let ratio = if let Some(t) = self.metrics.target_iterations {
+            let current = self.metrics.iterations.load(Ordering::Relaxed);
+            if t > 0 { current as f64 / t as f64 } else { 0.0 }
+        } else if let Some(minutes) = self.metrics.time_limit_minutes {
+            let elapsed = self.metrics.elapsed_secs();
+            if minutes > 0 { elapsed / (minutes as f64 * 60.0) } else { 0.0 }
+        } else {
+            0.0
+        };
         let gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::Cyan))
             .ratio(ratio.clamp(0.0, 1.0))
@@ -328,11 +322,18 @@ impl BlueprintTuiApp {
         let current = self.metrics.iterations.load(Ordering::Relaxed);
         let paused = self.metrics.is_paused();
 
-        let eta_str = self
-            .metrics
-            .target_iterations
-            .map(|t| format_eta(current, t, elapsed))
-            .unwrap_or_else(|| "--".to_string());
+        let eta_str = if let Some(t) = self.metrics.target_iterations {
+            format_eta(current, t, elapsed)
+        } else if let Some(minutes) = self.metrics.time_limit_minutes {
+            let remaining = (minutes as f64 * 60.0) - elapsed;
+            if remaining > 0.0 {
+                format_duration(remaining)
+            } else {
+                "done".to_string()
+            }
+        } else {
+            "--".to_string()
+        };
 
         let pause_marker = if paused { "  [PAUSED]" } else { "" };
         let text = format!(
@@ -430,7 +431,7 @@ impl BlueprintTuiApp {
     }
 
     fn render_hotkeys(&self, frame: &mut Frame, area: Rect) {
-        let text = "[p]ause [s]napshot [?]help [q]uit";
+        let text = "[p]ause [s]napshot [←/→]tab [q]uit";
         frame.render_widget(
             Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
             area,
@@ -600,7 +601,7 @@ mod tests {
     use test_macros::timed_test;
 
     fn make_metrics() -> Arc<BlueprintTuiMetrics> {
-        Arc::new(BlueprintTuiMetrics::new(Some(1_000_000)))
+        Arc::new(BlueprintTuiMetrics::new(Some(1_000_000), None))
     }
 
     fn make_scenario(name: &str) -> ResolvedScenario {

@@ -489,6 +489,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             if use_tui {
                 let metrics = Arc::new(blueprint_tui_metrics::BlueprintTuiMetrics::new(
                     trainer.config.training.iterations,
+                    trainer.config.training.time_limit_minutes,
                 ));
 
                 // Share atomics between trainer and TUI.

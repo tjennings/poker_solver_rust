@@ -28,6 +28,7 @@ pub struct BlueprintTuiMetrics {
     // --- lock-free atomics (hot path) ---
     pub iterations: Arc<AtomicU64>,
     pub target_iterations: Option<u64>,
+    pub time_limit_minutes: Option<u64>,
     pub start_time: Instant,
 
     // --- control flags (shared with training thread) ---
@@ -53,7 +54,7 @@ pub struct BlueprintTuiMetrics {
 }
 
 impl BlueprintTuiMetrics {
-    pub fn new(target_iterations: Option<u64>) -> Self {
+    pub fn new(target_iterations: Option<u64>, time_limit_minutes: Option<u64>) -> Self {
         let mut snapshots = Vec::with_capacity(MAX_SCENARIOS);
         let mut prev_snapshots = Vec::with_capacity(MAX_SCENARIOS);
         let mut deltas = Vec::with_capacity(MAX_SCENARIOS);
@@ -68,6 +69,7 @@ impl BlueprintTuiMetrics {
         Self {
             iterations: Arc::new(AtomicU64::new(0)),
             target_iterations,
+            time_limit_minutes,
             start_time: Instant::now(),
 
             paused: Arc::new(AtomicBool::new(false)),
@@ -210,7 +212,7 @@ mod tests {
 
     #[timed_test(10)]
     fn initial_state() {
-        let m = BlueprintTuiMetrics::new(Some(1000));
+        let m = BlueprintTuiMetrics::new(Some(1000), None);
         assert_eq!(m.iterations.load(Ordering::Relaxed), 0);
         assert!(!m.paused.load(Ordering::Relaxed));
         assert!(!m.quit_requested.load(Ordering::Relaxed));
@@ -220,7 +222,7 @@ mod tests {
 
     #[timed_test(10)]
     fn strategy_snapshot_lifecycle() {
-        let m = BlueprintTuiMetrics::new(None);
+        let m = BlueprintTuiMetrics::new(None, None);
 
         // First update -- no previous, delta should be 0.
         m.update_scenario_strategy(0, vec![0.5, 0.3, 0.2]);
@@ -246,7 +248,7 @@ mod tests {
 
     #[timed_test(10)]
     fn pause_resume() {
-        let m = BlueprintTuiMetrics::new(None);
+        let m = BlueprintTuiMetrics::new(None, None);
         assert!(!m.is_paused());
 
         m.toggle_pause();
@@ -258,7 +260,7 @@ mod tests {
 
     #[timed_test(10)]
     fn trigger_flags() {
-        let m = BlueprintTuiMetrics::new(None);
+        let m = BlueprintTuiMetrics::new(None, None);
 
         // Trigger not set initially.
         assert!(!m.take_snapshot_trigger());
@@ -273,7 +275,7 @@ mod tests {
 
     #[timed_test(10)]
     fn strategy_delta_history() {
-        let m = BlueprintTuiMetrics::new(None);
+        let m = BlueprintTuiMetrics::new(None, None);
         m.push_strategy_delta(0.1);
         m.push_strategy_delta(0.05);
         let hist = m.strategy_delta_history.lock().unwrap();
@@ -284,7 +286,7 @@ mod tests {
 
     #[timed_test(10)]
     fn leaf_movement_history() {
-        let m = BlueprintTuiMetrics::new(None);
+        let m = BlueprintTuiMetrics::new(None, None);
         m.push_leaf_movement(0.8);
         m.push_leaf_movement(0.3);
         let hist = m.leaf_movement_history.lock().unwrap();
@@ -294,7 +296,7 @@ mod tests {
 
     #[timed_test(10)]
     fn scenario_grid_update() {
-        let m = BlueprintTuiMetrics::new(None);
+        let m = BlueprintTuiMetrics::new(None, None);
         let grid: [[CellStrategy; 13]; 13] =
             std::array::from_fn(|_| std::array::from_fn(|_| CellStrategy::default()));
         m.update_scenario_grid(0, grid);
