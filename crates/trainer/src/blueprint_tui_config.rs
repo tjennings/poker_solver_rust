@@ -22,6 +22,7 @@ pub enum StreetLabel {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScenarioConfig {
     pub name: String,
+    #[allow(dead_code)]
     pub player: PlayerLabel,
     #[serde(default)]
     pub actions: Vec<String>,

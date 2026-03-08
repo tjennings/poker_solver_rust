@@ -186,7 +186,7 @@ fn trace_action_path(tree: &GameTree, target: u32) -> String {
     let mut path = Vec::new();
     if dfs_path(tree, tree.root, target, &mut path) {
         path.iter()
-            .map(|a| short_action_label(a))
+            .map(short_action_label)
             .collect::<Vec<_>>()
             .join("→")
     } else {
@@ -202,7 +202,7 @@ fn dfs_path(tree: &GameTree, current: u32, target: u32, path: &mut Vec<TreeActio
     match &tree.nodes[current as usize] {
         GameNode::Decision { actions, children, .. } => {
             for (action, &child) in actions.iter().zip(children.iter()) {
-                path.push(action.clone());
+                path.push(*action);
                 if dfs_path(tree, child, target, path) {
                     return true;
                 }
