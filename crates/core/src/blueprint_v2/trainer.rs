@@ -14,7 +14,7 @@
 
 use std::error::Error;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,6 +28,7 @@ use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
 use super::mccfr::{traverse_external, AllBuckets, Deal, PRUNE_HITS, PRUNE_TOTAL};
 use super::storage::BlueprintStorage;
+use crate::hands::CanonicalHand;
 use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
 
 /// Attempt to load `.buckets` files from the given directory.
@@ -84,6 +85,13 @@ pub struct BlueprintTrainer {
     /// Pre-allocated deck for [`sample_deal`](Self::sample_deal), avoiding
     /// a 52-element `Vec` allocation on every call.
     deck: [Card; 52],
+
+    // --- Per-hand chip EV tracking ---
+    /// Accumulated chip EV per canonical preflop hand (169 entries).
+    /// Stored as sum * 1000 for integer atomics.
+    ev_sum: [AtomicI64; 169],
+    /// Sample count per canonical preflop hand.
+    ev_count: [AtomicU64; 169],
 
     // --- TUI shared state ---
     /// Iteration counter visible to the TUI thread.
@@ -194,6 +202,8 @@ impl BlueprintTrainer {
             last_snapshot_time: 0,
             snapshot_count: 0,
             deck,
+            ev_sum: std::array::from_fn(|_| AtomicI64::new(0)),
+            ev_count: std::array::from_fn(|_| AtomicU64::new(0)),
             skip_bucket_validation: false,
             shared_iterations: Arc::new(AtomicU64::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
@@ -379,16 +389,32 @@ impl BlueprintTrainer {
             let tree = &self.tree;
             let storage = &self.storage;
             let buckets = &self.buckets;
+            let ev_sum = &self.ev_sum;
+            let ev_count = &self.ev_count;
 
             deals.par_iter().for_each(|deal| {
                 let mut rng = SmallRng::from_os_rng();
 
-                traverse_external(
+                let ev0 = traverse_external(
                     tree, storage, buckets, deal, 0, tree.root, prune, threshold, &mut rng,
                 );
-                traverse_external(
+                let ev1 = traverse_external(
                     tree, storage, buckets, deal, 1, tree.root, prune, threshold, &mut rng,
                 );
+
+                // Accumulate EV per canonical preflop hand.
+                let idx0 = CanonicalHand::from_cards(
+                    deal.hole_cards[0][0],
+                    deal.hole_cards[0][1],
+                ).index();
+                let idx1 = CanonicalHand::from_cards(
+                    deal.hole_cards[1][0],
+                    deal.hole_cards[1][1],
+                ).index();
+                ev_sum[idx0].fetch_add((ev0 * 1000.0) as i64, Ordering::Relaxed);
+                ev_count[idx0].fetch_add(1, Ordering::Relaxed);
+                ev_sum[idx1].fetch_add((ev1 * 1000.0) as i64, Ordering::Relaxed);
+                ev_count[idx1].fetch_add(1, Ordering::Relaxed);
             });
 
             // 3. Sequential: update counters and check timed actions.
@@ -716,6 +742,28 @@ impl BlueprintTrainer {
         }
     }
 
+    /// Compute average chip EV per canonical preflop hand.
+    ///
+    /// Returns a 169-element vector of `(hand_name, avg_ev)` pairs,
+    /// ordered by the canonical 169 hand index.
+    #[must_use]
+    pub fn hand_ev_averages(&self) -> Vec<(String, f64)> {
+        (0..169)
+            .map(|i| {
+                // INVARIANT: indices 0..169 are always valid for `from_index`.
+                let hand = CanonicalHand::from_index(i).expect("valid index 0..169");
+                let sum = self.ev_sum[i].load(Ordering::Relaxed) as f64 / 1000.0;
+                let count = self.ev_count[i].load(Ordering::Relaxed);
+                let avg = if count > 0 {
+                    sum / count as f64
+                } else {
+                    0.0
+                };
+                (hand.to_string(), avg)
+            })
+            .collect()
+    }
+
     /// Write a snapshot (regrets + metadata) to disk.
     ///
     /// # Errors
@@ -745,6 +793,19 @@ impl BlueprintTrainer {
         );
 
         bundle::save_snapshot(&snapshot_dir, &strategy, &self.storage, &metadata)?;
+
+        // Write per-hand chip EV averages.
+        let hand_evs = self.hand_ev_averages();
+        let mut ev_json = String::from("{\n");
+        for (i, (name, ev)) in hand_evs.iter().enumerate() {
+            ev_json.push_str(&format!("  \"{name}\": {ev:.4}"));
+            if i < hand_evs.len() - 1 {
+                ev_json.push(',');
+            }
+            ev_json.push('\n');
+        }
+        ev_json.push('}');
+        std::fs::write(snapshot_dir.join("hand_ev.json"), ev_json)?;
 
         self.snapshot_count += 1;
         self.last_snapshot_time = self.elapsed_minutes();
@@ -942,6 +1003,14 @@ mod tests {
         assert!(snapshot_dir.join("strategy.bin").exists());
         assert!(snapshot_dir.join("regrets.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
+        assert!(snapshot_dir.join("hand_ev.json").exists());
+
+        // Verify hand_ev.json is valid JSON with 169 entries.
+        let ev_json = std::fs::read_to_string(snapshot_dir.join("hand_ev.json"))
+            .expect("read hand_ev.json");
+        let ev_map: std::collections::BTreeMap<String, f64> =
+            serde_json::from_str(&ev_json).expect("parse hand_ev.json");
+        assert_eq!(ev_map.len(), 169, "should have 169 hand entries");
     }
 
     #[test]
