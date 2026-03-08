@@ -5,7 +5,6 @@ import {
   MatrixCell,
   PostflopConfig,
   PostflopConfigSummary,
-  PostflopActionInfo,
   PostflopStrategyMatrix,
   PostflopProgress,
   PostflopPlayResult,
@@ -14,25 +13,14 @@ import {
 import {
   SUIT_COLORS,
   SUIT_SYMBOLS,
+  getActionColor,
+  displayOrderIndices,
+  formatActionLabel,
 } from './matrix-utils';
 import { ActionBlock, HandCell, CellDetail } from './Explorer';
 
-/** Convert PostflopActionInfo → ActionInfo so shared color/label utils work. */
-function toActionInfo(a: PostflopActionInfo): ActionInfo {
-  return {
-    id: String(a.index),
-    label: a.label,
-    action_type: a.action_type,
-    size_key: a.amount != null ? String(a.amount) : null,
-  };
-}
-
-function toActionInfos(actions: PostflopActionInfo[]): ActionInfo[] {
-  return actions.map(toActionInfo);
-}
-
 /** Convert postflop cell to shared MatrixCell format. */
-function toMatrixCell(cell: { hand: string; suited: boolean; pair: boolean; probabilities: number[] }, actions: PostflopActionInfo[]): MatrixCell {
+function toMatrixCell(cell: { hand: string; suited: boolean; pair: boolean; probabilities: number[] }, actions: ActionInfo[]): MatrixCell {
   return {
     hand: cell.hand,
     suited: cell.suited,
@@ -72,12 +60,16 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   const [progress, setProgress] = useState<PostflopProgress | null>(null);
   const [actionHistory, setActionHistory] = useState<{
     selectedId: string;
+    actionIndex: number;
     position: string;
     stack: number;
     pot: number;
     actions: ActionInfo[];
+    streetIndex: number; // which street solve this action belongs to
   }[]>([]);
+  const [currentStreetIndex, setCurrentStreetIndex] = useState(0);
   const pollRef = useRef<number | null>(null);
+  const initialExplRef = useRef<number>(Infinity);
 
   // Navigation state
   const [showFlopPicker, setShowFlopPicker] = useState(false);
@@ -122,6 +114,9 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       try {
         const p = await invoke<PostflopProgress>('postflop_get_progress', {});
         setProgress(p);
+        if (p.exploitability < 1e30 && p.exploitability > initialExplRef.current) {
+          initialExplRef.current = p.exploitability;
+        }
         if (p.matrix) setMatrix(p.matrix);
         if (p.is_complete) {
           setSolving(false);
@@ -134,7 +129,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       }
     };
     poll();
-    pollRef.current = window.setInterval(poll, 2000);
+    pollRef.current = window.setInterval(poll, 500);
   }, []);
 
 
@@ -146,6 +141,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     setNeedsSolve(false);
     setActionHistory([]);
     setStreetActions([]);
+    setCurrentStreetIndex(0);
     setBoardInput('');
     setTerminal(false);
     setAwaitingCard(false);
@@ -168,6 +164,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     setNeedsSolve(false);
     setMatrix(null);
     setProgress(null);
+    initialExplRef.current = Infinity;
     invoke('postflop_solve_street', { board: cards, target_exploitability: config.target_exploitability })
       .then(() => startPolling())
       .catch((e) => { setError(String(e)); setSolving(false); });
@@ -184,10 +181,12 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       if (matrix) {
         setActionHistory(prev => [...prev, {
           selectedId: String(actionIndex),
+          actionIndex,
           position: matrix.player === 0 ? 'SB' : 'BB',
           stack: matrix.stacks[matrix.player],
           pot: matrix.pot,
-          actions: toActionInfos(matrix.actions),
+          actions: matrix.actions,
+          streetIndex: currentStreetIndex,
         }]);
       }
       setStreetActions(prev => [...prev, actionIndex]);
@@ -210,10 +209,55 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     } catch (e) {
       setError(String(e));
     }
-  }, [solving, matrix]);
+  }, [solving, matrix, currentStreetIndex]);
 
+  /** Navigate back to a previous point by clicking a history action card. */
+  const handleNavigateBack = useCallback(async (historyIndex: number) => {
+    if (solving) return;
+    const entry = actionHistory[historyIndex];
+    if (!entry) return;
 
-  /** Reset everything for a new hand. */
+    // Only allow navigating within the current street
+    if (entry.streetIndex !== currentStreetIndex) return;
+
+    setError(null);
+    setSelectedCell(null);
+    setTerminal(false);
+    setAwaitingCard(false);
+
+    // Collect the action indices up to (not including) the clicked entry
+    const replayActions = actionHistory
+      .slice(0, historyIndex)
+      .filter(e => e.streetIndex === currentStreetIndex)
+      .map(e => e.actionIndex);
+
+    try {
+      const result = await invoke<PostflopPlayResult>('postflop_navigate_to', { history: replayActions });
+
+      // Truncate action history and street actions to this point
+      setActionHistory(prev => prev.slice(0, historyIndex));
+      setStreetActions(replayActions);
+
+      if (result.is_terminal) {
+        setMatrix(null);
+        setTerminal(true);
+        return;
+      }
+
+      if (result.is_chance) {
+        setMatrix(null);
+        setAwaitingCard(true);
+        return;
+      }
+
+      if (result.matrix) {
+        setMatrix(result.matrix);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [solving, actionHistory, currentStreetIndex]);
+
   return (
     <div className="explorer-root">
       {error && <div className="error">{error}</div>}
@@ -274,26 +318,23 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
           </div>
         </div>
 
-        {/* Action history blocks */}
-        {actionHistory.map((item, i) => (
-          <ActionBlock
-            key={i}
-            position={item.position}
-            stack={item.stack}
-            pot={item.pot}
-            actions={item.actions}
-            selectedAction={item.selectedId}
-            onSelect={() => {}}
-            isCurrent={false}
-          />
-        ))}
-
-        {/* Solve button */}
-        {(needsSolve || solving) && (
-          <div className={`action-block solve-block ${solving ? 'solving' : ''}`} onClick={handleSolve}>
-            <span className="solve-label">{solving ? 'CANCEL' : 'SOLVE'}</span>
-          </div>
-        )}
+        {/* Action history blocks — click to navigate back (current street only) */}
+        {actionHistory.map((item, i) => {
+          const canNavigate = item.streetIndex === currentStreetIndex && !solving;
+          return (
+            <ActionBlock
+              key={i}
+              position={item.position}
+              stack={item.stack}
+              pot={item.pot}
+              actions={item.actions}
+              selectedAction={item.selectedId}
+              onSelect={() => {}}
+              onHeaderClick={canNavigate ? () => handleNavigateBack(i) : undefined}
+              isCurrent={false}
+            />
+          );
+        })}
 
         {/* Available actions */}
         {matrix && !solving && !terminal && !awaitingCard && (
@@ -301,7 +342,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
             position={matrix.player === 0 ? 'SB' : 'BB'}
             stack={matrix.stacks[matrix.player]}
             pot={matrix.pot}
-            actions={toActionInfos(matrix.actions)}
+            actions={matrix.actions}
             onSelect={(actionId) => !solving && handleAction(Number(actionId))}
             isCurrent={!solving}
           />
@@ -359,6 +400,13 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
             </div>
           </div>
         )}
+
+        {/* Solve button — always rightmost in strip */}
+        {(needsSolve || solving) && (
+          <div className={`action-block solve-block ${solving ? 'solving' : ''}`} onClick={handleSolve}>
+            <span className="solve-label">{solving ? 'CANCEL' : 'SOLVE'}</span>
+          </div>
+        )}
       </div>
 
       {/* Flop card picker modal */}
@@ -400,6 +448,7 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
                   const newBoard = [...boardCards, card];
                   setBoardInput(newBoard.join(' '));
                   setStreetActions([]);
+                  setCurrentStreetIndex(prev => prev + 1);
                   setMatrix(null);
                   setProgress(null);
                   setNeedsSolve(true);
@@ -412,30 +461,33 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       )}
 
       {/* Progress bar */}
-      {solving && progress && (
-        <div className="progress-bar-container">
-          <div className="progress-bar-track">
-            <div className="progress-bar-fill" style={{
-              width: `${(progress.iteration / Math.max(progress.max_iterations, 1)) * 100}%`,
-            }} />
-            <span className="progress-text">
-              {progress.iteration}/{progress.max_iterations} iters
-              {progress.exploitability < 1e30 && ` — ${(progress.exploitability / Math.max(config.pot, 1) * 100).toFixed(1)}% pot expl`}
-            </span>
+      {solving && progress && (() => {
+        const expl = progress.exploitability;
+        const target = config.target_exploitability;
+        const valid = expl < 1e30;
+        // Progress toward target: start from first reading, converge to target
+        const startExpl = initialExplRef.current;
+        let pct = 0;
+        if (valid && startExpl > target) {
+          pct = Math.min(1, Math.max(0, (startExpl - expl) / (startExpl - target)));
+        }
+        return (
+          <div className="progress-bar-container">
+            <div className="progress-bar-track">
+              <div className="progress-bar-fill" style={{ width: `${pct * 100}%` }} />
+              <span className="progress-text">
+                {progress.iteration}/{progress.max_iterations} iters
+                {valid && ` — ${(expl / Math.max(config.pot, 1) * 100).toFixed(1)}% pot expl`}
+              </span>
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
-      {/* Player indicator */}
-      {matrix && (
-        <div style={{ fontSize: '0.85em', opacity: 0.6, padding: '4px 12px' }}>
-          {matrix.player === 0 ? 'SB' : 'BB'} to act — Board: {matrix.board.join(' ')}
-        </div>
-      )}
+
 
       {/* Strategy matrix */}
       {matrix && (() => {
-        const actionInfos = toActionInfos(matrix.actions);
         return (
           <div className="matrix-container">
             <div className="matrix-with-detail">
@@ -446,22 +498,27 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
                       <HandCell
                         key={colIdx}
                         cell={toMatrixCell(cell, matrix.actions)}
-                        actions={actionInfos}
+                        actions={matrix.actions}
                         reachWeight={cell.combo_count > 0 ? 1 : 0}
                         isSelected={selectedCell?.row === rowIdx && selectedCell?.col === colIdx}
                         onClick={() => setSelectedCell({ row: rowIdx, col: colIdx })}
+                        overlayText={cell.ev != null && cell.combo_count > 0 ? cell.ev.toFixed(1) : undefined}
                       />
                     ))}
                   </div>
                 ))}
               </div>
               <div className="detail-column">
-                {selectedCell && matrix.cells[selectedCell.row]?.[selectedCell.col] && (
+                {selectedCell && matrix.cells[selectedCell.row]?.[selectedCell.col] && (<>
                   <CellDetail
                     cell={toMatrixCell(matrix.cells[selectedCell.row][selectedCell.col], matrix.actions)}
-                    actions={actionInfos}
+                    actions={matrix.actions}
                   />
-                )}
+                  <ComboBreakdown
+                    combos={matrix.cells[selectedCell.row][selectedCell.col].combos}
+                    actions={matrix.actions}
+                  />
+                </>)}
               </div>
             </div>
           </div>
@@ -492,6 +549,70 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
           onClose={() => setShowConfigModal(false)}
         />
       )}
+    </div>
+  );
+}
+
+const SUIT_ICON_COLORS: Record<string, string> = {
+  s: '#ccc', h: '#dc2626', d: '#2563eb', c: '#16a34a',
+};
+
+function ComboBreakdown({ combos, actions }: {
+  combos: { cards: string; probabilities: number[] }[];
+  actions: ActionInfo[];
+}) {
+  if (!combos || combos.length === 0) return null;
+
+  return (
+    <div className="combo-breakdown">
+      <div className="combo-breakdown-grid">
+        {combos.map((combo) => {
+          // Parse 4-char cards string e.g. "AsTh" → [A,s,T,h]
+          const r1 = combo.cards[0], s1 = combo.cards[1];
+          const r2 = combo.cards[2], s2 = combo.cards[3];
+          return (
+            <div key={combo.cards} className="combo-tile">
+              <div className="combo-tile-header">
+                <span className="combo-card" style={{ color: SUIT_ICON_COLORS[s1] || '#ccc' }}>
+                  {r1}<span className="combo-suit">{SUIT_SYMBOLS[s1]}</span>
+                </span>
+                <span className="combo-card" style={{ color: SUIT_ICON_COLORS[s2] || '#ccc' }}>
+                  {r2}<span className="combo-suit">{SUIT_SYMBOLS[s2]}</span>
+                </span>
+              </div>
+              <div className="combo-tile-bar">
+                {[...displayOrderIndices(actions)].reverse().map((idx) => {
+                  const prob = combo.probabilities[idx];
+                  if (!prob || prob <= 0) return null;
+                  return (
+                    <div
+                      key={idx}
+                      style={{
+                        width: `${prob * 100}%`,
+                        backgroundColor: getActionColor(actions[idx], actions),
+                        height: '100%',
+                      }}
+                    />
+                  );
+                })}
+              </div>
+              <div className="combo-tile-actions">
+                {displayOrderIndices(actions).map((idx) => {
+                  const prob = combo.probabilities[idx];
+                  const pct = (prob ?? 0) * 100;
+                  if (pct < 0.1) return null;
+                  return (
+                    <div key={idx} className="combo-tile-row">
+                      <span className="combo-tile-label">{formatActionLabel(actions[idx])}</span>
+                      <span className="combo-tile-pct">{pct.toFixed(0)}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

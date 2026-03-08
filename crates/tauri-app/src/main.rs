@@ -35,6 +35,7 @@ fn main() {
             poker_solver_tauri::postflop_solve_street,
             poker_solver_tauri::postflop_get_progress,
             poker_solver_tauri::postflop_play_action,
+            poker_solver_tauri::postflop_navigate_to,
             poker_solver_tauri::postflop_close_street,
         ])
         .run(tauri::generate_context!())

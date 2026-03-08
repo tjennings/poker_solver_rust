@@ -34,6 +34,7 @@ export function HandCell({
   isEditing,
   isEdited,
   onClick,
+  overlayText,
 }: {
   cell: MatrixCell;
   actions: ActionInfo[];
@@ -42,6 +43,7 @@ export function HandCell({
   isEditing?: boolean;
   isEdited?: boolean;
   onClick: () => void;
+  overlayText?: string;
 }) {
   const gradientStops = useMemo(() => {
     if (cell.probabilities.length === 0) {
@@ -86,6 +88,7 @@ export function HandCell({
         }}
       />
       <span className="cell-label">{cell.hand}</span>
+      {overlayText && <span className="hand-cell-ev">{overlayText}</span>}
     </div>
   );
 }

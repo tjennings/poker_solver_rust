@@ -654,6 +654,13 @@ button:disabled {
 /* Action button border-left colors are set inline via getActionColor() */
 
 /* Matrix */
+.explorer-root {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
 .matrix-container {
   background: linear-gradient(135deg, #14142a 0%, #1a1a3a 100%);
   border: 1px solid rgba(255, 255, 255, 0.06);
@@ -663,6 +670,7 @@ button:disabled {
   flex: 1;
   min-height: 0;
   display: flex;
+  overflow: hidden;
 }
 
 .hand-matrix {
@@ -674,8 +682,8 @@ button:disabled {
   border-radius: 4px;
   overflow: hidden;
   aspect-ratio: 1;
+  height: 100%;
   max-height: 100%;
-  flex: 1;
   min-width: 0;
 }
 
@@ -739,9 +747,10 @@ button:disabled {
 .matrix-with-detail {
   display: flex;
   gap: 1rem;
-  align-items: flex-start;
+  align-items: stretch;
   flex: 1;
   min-height: 0;
+  height: 100%;
 }
 
 .detail-column {
@@ -749,6 +758,8 @@ button:disabled {
   flex-direction: column;
   gap: 0.75rem;
   flex-shrink: 0;
+  overflow-y: auto;
+  max-height: 100%;
 }
 
 /* Cell detail panel */
@@ -830,6 +841,86 @@ button:disabled {
   flex-shrink: 0;
   min-width: 3em;
   text-align: right;
+}
+
+/* Hand cell EV overlay */
+.hand-cell-ev {
+  position: absolute;
+  bottom: 1px;
+  right: 2px;
+  font-size: 0.55rem;
+  color: rgba(255, 255, 255, 0.7);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  line-height: 1;
+}
+
+/* Combo Breakdown */
+.combo-breakdown {
+  margin-top: 0.75rem;
+}
+
+.combo-breakdown-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+  gap: 4px;
+}
+
+.combo-tile {
+  background: #1a1a2e;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 4px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.combo-tile-header {
+  display: flex;
+  gap: 2px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.combo-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+}
+
+.combo-suit {
+  font-size: 0.7rem;
+}
+
+.combo-tile-bar {
+  display: flex;
+  height: 5px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: #333;
+}
+
+.combo-tile-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.combo-tile-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.65rem;
+  color: #aaa;
+}
+
+.combo-tile-label {
+  text-transform: capitalize;
+}
+
+.combo-tile-pct {
+  font-variant-numeric: tabular-nums;
+  color: #888;
 }
 
 /* Loading */

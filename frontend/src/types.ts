@@ -158,11 +158,9 @@ export interface PostflopConfigSummary {
   ip_combos: number;
 }
 
-export interface PostflopActionInfo {
-  index: number;
-  label: string;
-  action_type: string;
-  amount: number | null;
+export interface PostflopComboDetail {
+  cards: string;
+  probabilities: number[];
 }
 
 export interface PostflopMatrixCell {
@@ -172,11 +170,12 @@ export interface PostflopMatrixCell {
   probabilities: number[];
   combo_count: number;
   ev: number | null;
+  combos: PostflopComboDetail[];
 }
 
 export interface PostflopStrategyMatrix {
   cells: PostflopMatrixCell[][];
-  actions: PostflopActionInfo[];
+  actions: ActionInfo[];
   player: number;
   pot: number;
   stacks: [number, number];

@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
+use crate::exploration::ActionInfo;
+
 // ---------------------------------------------------------------------------
 // Shared types
 // ---------------------------------------------------------------------------
@@ -49,12 +51,11 @@ pub struct PostflopConfigSummary {
     pub ip_combos: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PostflopActionInfo {
-    pub index: usize,
-    pub label: String,
-    pub action_type: String,
-    pub amount: Option<i32>,
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PostflopComboDetail {
+    pub cards: String,
+    pub probabilities: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,12 +66,13 @@ pub struct PostflopMatrixCell {
     pub probabilities: Vec<f32>,
     pub combo_count: usize,
     pub ev: Option<f32>,
+    pub combos: Vec<PostflopComboDetail>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PostflopStrategyMatrix {
     pub cells: Vec<Vec<PostflopMatrixCell>>,
-    pub actions: Vec<PostflopActionInfo>,
+    pub actions: Vec<ActionInfo>,
     pub player: usize,
     pub pot: i32,
     pub stacks: [i32; 2],
@@ -174,50 +176,50 @@ fn format_pot_pct(amt: i32, pot: i32) -> String {
     }
 }
 
-/// Converts a range-solver `Action` to a serializable `PostflopActionInfo`.
-fn action_to_info(action: &Action, index: usize, pot: i32) -> PostflopActionInfo {
+/// Converts a range-solver `Action` to a serializable `ActionInfo`.
+fn action_to_info(action: &Action, index: usize, pot: i32) -> ActionInfo {
     match action {
-        Action::Fold => PostflopActionInfo {
-            index,
+        Action::Fold => ActionInfo {
+            id: index.to_string(),
             label: "Fold".to_string(),
             action_type: "fold".to_string(),
-            amount: None,
+            size_key: None,
         },
-        Action::Check => PostflopActionInfo {
-            index,
+        Action::Check => ActionInfo {
+            id: index.to_string(),
             label: "Check".to_string(),
             action_type: "check".to_string(),
-            amount: None,
+            size_key: None,
         },
-        Action::Call => PostflopActionInfo {
-            index,
+        Action::Call => ActionInfo {
+            id: index.to_string(),
             label: "Call".to_string(),
             action_type: "call".to_string(),
-            amount: None,
+            size_key: None,
         },
-        Action::Bet(amt) => PostflopActionInfo {
-            index,
+        Action::Bet(amt) => ActionInfo {
+            id: index.to_string(),
             label: format!("Bet {}", format_pot_pct(*amt, pot)),
             action_type: "bet".to_string(),
-            amount: Some(*amt),
+            size_key: Some(amt.to_string()),
         },
-        Action::Raise(amt) => PostflopActionInfo {
-            index,
+        Action::Raise(amt) => ActionInfo {
+            id: index.to_string(),
             label: format!("Raise {}", format_pot_pct(*amt, pot)),
             action_type: "raise".to_string(),
-            amount: Some(*amt),
+            size_key: Some(amt.to_string()),
         },
-        Action::AllIn(amt) => PostflopActionInfo {
-            index,
+        Action::AllIn(amt) => ActionInfo {
+            id: index.to_string(),
             label: format!("All-in {amt}"),
             action_type: "allin".to_string(),
-            amount: Some(*amt),
+            size_key: Some(amt.to_string()),
         },
-        _ => PostflopActionInfo {
-            index,
+        _ => ActionInfo {
+            id: index.to_string(),
             label: format!("{action}"),
             action_type: "other".to_string(),
-            amount: None,
+            size_key: None,
         },
     }
 }
@@ -263,36 +265,62 @@ impl Default for PostflopState {
 /// Builds a 13x13 strategy matrix from the current game state.
 ///
 /// The game must be at a non-terminal, non-chance node with memory allocated.
-pub fn build_strategy_matrix(game: &PostFlopGame) -> PostflopStrategyMatrix {
+pub fn build_strategy_matrix(game: &mut PostFlopGame) -> PostflopStrategyMatrix {
     let player = game.current_player();
     let actions = game.available_actions();
     let strategy = game.strategy();
-    let private_cards = game.private_cards(player);
+    let private_cards = game.private_cards(player).to_vec();
     let num_hands = game.num_private_hands(player);
     let num_actions = actions.len();
 
-    // Compute pot first so action labels can show pot-relative percentages.
-    let tree_config = game.tree_config();
-    let bet_amounts = game.total_bet_amount();
-    let pot = tree_config.starting_pot + bet_amounts[0] + bet_amounts[1];
+    // Compute pot and stacks before mutable borrows.
+    let (pot, stacks) = {
+        let tc = game.tree_config();
+        let ba = game.total_bet_amount();
+        let pot = tc.starting_pot + ba[0] + ba[1];
+        let stacks = [tc.effective_stack - ba[0], tc.effective_stack - ba[1]];
+        (pot, stacks)
+    };
 
-    let action_infos: Vec<PostflopActionInfo> = actions
+    let action_infos: Vec<ActionInfo> = actions
         .iter()
         .enumerate()
         .map(|(i, a)| action_to_info(a, i, pot))
         .collect();
 
+    // Compute per-hand EV if game is solved.
+    let hand_evs: Option<Vec<f32>> = if game.is_solved() {
+        game.cache_normalized_weights();
+        Some(game.expected_values(player))
+    } else {
+        None
+    };
+
     // Initialize the 13x13 matrix with zeroed probability accumulators.
     let mut prob_sums = vec![vec![vec![0.0f64; num_actions]; 13]; 13];
     let mut combo_counts = vec![vec![0usize; 13]; 13];
+    let mut ev_sums = vec![vec![0.0f64; 13]; 13];
+    let mut combo_details: Vec<Vec<Vec<PostflopComboDetail>>> =
+        vec![vec![Vec::new(); 13]; 13];
 
     for (hand_idx, &(c1, c2)) in private_cards.iter().enumerate() {
         let (row, col, _) = card_pair_to_matrix(c1, c2);
         combo_counts[row][col] += 1;
+        if let Some(ref evs) = hand_evs {
+            ev_sums[row][col] += evs[hand_idx] as f64;
+        }
+        let mut probs = Vec::with_capacity(num_actions);
         for action_idx in 0..num_actions {
             let prob = strategy[action_idx * num_hands + hand_idx];
             prob_sums[row][col][action_idx] += prob as f64;
+            probs.push(prob);
         }
+        let s1 = card_to_string(c1).unwrap_or_default();
+        let s2 = card_to_string(c2).unwrap_or_default();
+        combo_details[row][col].push(PostflopComboDetail {
+            cards: format!("{s1}{s2}"),
+            probabilities: probs,
+        });
     }
 
     let cells: Vec<Vec<PostflopMatrixCell>> = (0..13)
@@ -309,13 +337,20 @@ pub fn build_strategy_matrix(game: &PostFlopGame) -> PostflopStrategyMatrix {
                     } else {
                         vec![0.0; num_actions]
                     };
+                    let ev = if count > 0 && hand_evs.is_some() {
+                        Some((ev_sums[row][col] / count as f64) as f32)
+                    } else {
+                        None
+                    };
+                    let combos = std::mem::take(&mut combo_details[row][col]);
                     PostflopMatrixCell {
                         hand: label,
                         suited,
                         pair,
                         probabilities,
                         combo_count: count,
-                        ev: None,
+                        ev,
+                        combos,
                     }
                 })
                 .collect()
@@ -335,12 +370,6 @@ pub fn build_strategy_matrix(game: &PostFlopGame) -> PostflopStrategyMatrix {
         .iter()
         .filter_map(|&c| card_to_string(c).ok())
         .collect();
-
-    // Stacks (pot and bet_amounts already computed above).
-    let stacks = [
-        tree_config.effective_stack - bet_amounts[0],
-        tree_config.effective_stack - bet_amounts[1],
-    ];
 
     PostflopStrategyMatrix {
         cells,
@@ -574,7 +603,7 @@ pub fn postflop_solve_street_core(
 
     // Take initial matrix snapshot.
     {
-        let matrix = build_strategy_matrix(&game);
+        let matrix = build_strategy_matrix(&mut game);
         *state.matrix_snapshot.write() = Some(matrix);
     }
 
@@ -596,9 +625,9 @@ pub fn postflop_solve_street_core(
                 .exploitability_bits
                 .store(exp.to_bits(), Ordering::Relaxed);
 
-            // Snapshot the matrix every 10 iterations (or on the first).
-            if (t + 1) % 10 == 0 || t == 0 {
-                let matrix = build_strategy_matrix(&game);
+            // Snapshot the matrix every iteration.
+            {
+                let matrix = build_strategy_matrix(&mut game);
                 *shared.matrix_snapshot.write() = Some(matrix);
             }
 
@@ -612,7 +641,7 @@ pub fn postflop_solve_street_core(
 
         // Final matrix snapshot.
         {
-            let matrix = build_strategy_matrix(&game);
+            let matrix = build_strategy_matrix(&mut game);
             *shared.matrix_snapshot.write() = Some(matrix);
         }
 
@@ -722,6 +751,69 @@ pub fn postflop_play_action(
     action: usize,
 ) -> Result<PostflopPlayResult, String> {
     postflop_play_action_core(&state, action)
+}
+
+// ---------------------------------------------------------------------------
+// postflop_navigate_to
+// ---------------------------------------------------------------------------
+
+/// Replay the game tree to a given action history and return the result.
+pub fn postflop_navigate_to_core(
+    state: &PostflopState,
+    history: Vec<usize>,
+) -> Result<PostflopPlayResult, String> {
+    let mut game_guard = state.game.lock();
+    let game = game_guard.as_mut().ok_or("No game loaded")?;
+
+    game.apply_history(&history);
+
+    let bet_amounts = game.total_bet_amount();
+    let tree_config = game.tree_config();
+    let pot = tree_config.starting_pot + bet_amounts[0] + bet_amounts[1];
+    let stacks = [
+        tree_config.effective_stack - bet_amounts[0],
+        tree_config.effective_stack - bet_amounts[1],
+    ];
+
+    if game.is_terminal_node() {
+        return Ok(PostflopPlayResult {
+            matrix: None,
+            is_terminal: true,
+            is_chance: false,
+            current_player: None,
+            pot,
+            stacks,
+        });
+    }
+
+    if game.is_chance_node() {
+        return Ok(PostflopPlayResult {
+            matrix: None,
+            is_terminal: false,
+            is_chance: true,
+            current_player: None,
+            pot,
+            stacks,
+        });
+    }
+
+    let matrix = build_strategy_matrix(game);
+    Ok(PostflopPlayResult {
+        matrix: Some(matrix),
+        is_terminal: false,
+        is_chance: false,
+        current_player: Some(game.current_player()),
+        pot,
+        stacks,
+    })
+}
+
+#[tauri::command]
+pub fn postflop_navigate_to(
+    state: tauri::State<'_, Arc<PostflopState>>,
+    history: Vec<usize>,
+) -> Result<PostflopPlayResult, String> {
+    postflop_navigate_to_core(&state, history)
 }
 
 // ---------------------------------------------------------------------------

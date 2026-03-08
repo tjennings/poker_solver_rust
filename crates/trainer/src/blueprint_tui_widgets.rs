@@ -179,6 +179,8 @@ impl Widget for &HandGridWidget<'_> {
                             );
                         }
                     }
+                } else {
+                    render_color_bar(buf, x, y, cell_w, &cell.actions);
                 }
             }
         }

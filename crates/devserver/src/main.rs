@@ -86,6 +86,11 @@ struct PostflopActionParams {
 }
 
 #[derive(Deserialize)]
+struct PostflopNavigateToParams {
+    history: Vec<usize>,
+}
+
+#[derive(Deserialize)]
 struct PostflopCloseStreetParams {
     action_history: Vec<usize>,
 }
@@ -301,6 +306,16 @@ async fn handle_postflop_play_action(
     ))
 }
 
+async fn handle_postflop_navigate_to(
+    Extension(state): Extension<Arc<PostflopState>>,
+    Json(params): Json<PostflopNavigateToParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::postflop_navigate_to_core(
+        &state,
+        params.history,
+    ))
+}
+
 async fn handle_postflop_close_street(
     Extension(state): Extension<Arc<PostflopState>>,
     Json(params): Json<PostflopCloseStreetParams>,
@@ -367,6 +382,10 @@ async fn main() {
         .route(
             "/api/postflop_play_action",
             post(handle_postflop_play_action),
+        )
+        .route(
+            "/api/postflop_navigate_to",
+            post(handle_postflop_navigate_to),
         )
         .route(
             "/api/postflop_close_street",
