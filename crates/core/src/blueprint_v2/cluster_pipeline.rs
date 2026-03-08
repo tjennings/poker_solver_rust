@@ -917,7 +917,7 @@ pub struct WeightedBoard<const N: usize> {
 /// board reached via different input orderings would produce different
 /// `PackedBoard` values. Sorting by `(value_rank desc, suit asc)` before
 /// packing ensures a unique key regardless of input order.
-fn canonical_key(cards: &[Card]) -> PackedBoard {
+pub(crate) fn canonical_key(cards: &[Card]) -> PackedBoard {
     let mut sorted: Vec<Card> = cards.to_vec();
     sorted.sort_by(|a, b| {
         use crate::card_utils::value_rank;

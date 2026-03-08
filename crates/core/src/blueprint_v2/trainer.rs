@@ -188,10 +188,7 @@ impl BlueprintTrainer {
 
         let storage = BlueprintStorage::new(&tree, bucket_counts);
         let bucket_files = load_bucket_files(Path::new(&config.training.cluster_path));
-        let buckets = AllBuckets {
-            bucket_counts,
-            bucket_files,
-        };
+        let buckets = AllBuckets::new(bucket_counts, bucket_files);
         let rng = StdRng::seed_from_u64(config.clustering.seed);
 
         let deck = *CANONICAL_DECK;
