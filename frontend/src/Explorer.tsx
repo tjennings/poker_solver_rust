@@ -13,6 +13,7 @@ import {
   ComboGroupInfo,
   PlayerRange,
   RangeSnapshot,
+  BlueprintListEntry,
 } from './types';
 import {
   SUIT_COLORS,
@@ -642,6 +643,8 @@ export default function Explorer() {
   const [datasets, setDatasets] = useState<DatasetInfo[] | null>(null);
   const [showDatasetPicker, setShowDatasetPicker] = useState(false);
   const [showPostflop, setShowPostflop] = useState(false);
+  const [showBlueprintPicker, setShowBlueprintPicker] = useState(false);
+  const [blueprints, setBlueprints] = useState<BlueprintListEntry[]>([]);
 
   const handleLoadDataset = useCallback(async () => {
     if ('__TAURI__' in window) {
@@ -663,6 +666,21 @@ export default function Explorer() {
       setError(String(e));
     }
   }, [loadSource]);
+
+  const handleLoadStrategy = async () => {
+    const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
+    if (!globalConfig.blueprint_dir) {
+      setError('Set Blueprint Directory in Settings first');
+      return;
+    }
+    try {
+      const list = await invoke<BlueprintListEntry[]>('list_blueprints', { dir: globalConfig.blueprint_dir });
+      setBlueprints(list.filter(b => b.has_strategy));
+      setShowBlueprintPicker(true);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   // Check if current betting round is complete (needs street transition)
   const checkStreetTransition = useCallback(
@@ -1280,23 +1298,42 @@ export default function Explorer() {
         </>
       )}
 
-      {!bundleInfo && !loading && !showDatasetPicker && !showPostflop && (
-        <div className="action-strip">
-          <div className="dataset-switcher-split">
-            <div className="dataset-switcher-half" onClick={handleLoadDataset} title="Load Dataset">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                <line x1="12" y1="11" x2="12" y2="17" />
-                <line x1="9" y1="14" x2="15" y2="14" />
-              </svg>
-            </div>
-            <div className="dataset-switcher-half" onClick={() => setShowPostflop(true)} title="Postflop Solver">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <rect x="2" y="2" width="20" height="20" rx="2" />
-                <path d="M7 12h10M12 7v10" />
-              </svg>
-            </div>
+      {!bundleInfo && !loading && !showDatasetPicker && !showPostflop && !showBlueprintPicker && (
+        <div className="explorer-landing">
+          <button className="landing-btn" onClick={handleLoadStrategy}>
+            Load Strategy
+          </button>
+          <button className="landing-btn" onClick={() => setShowPostflop(true)}>
+            Range Solve
+          </button>
+        </div>
+      )}
+
+      {showBlueprintPicker && (
+        <div className="dataset-picker">
+          <div className="dataset-picker-header">
+            <h3>Select Blueprint</h3>
+            <button className="dataset-picker-close" onClick={() => setShowBlueprintPicker(false)}>×</button>
           </div>
+          {blueprints.length === 0 ? (
+            <p className="dataset-picker-empty">No blueprints found with trained strategies</p>
+          ) : (
+            <div className="dataset-picker-list">
+              {blueprints.map((bp) => (
+                <div
+                  key={bp.path}
+                  className="dataset-picker-item"
+                  onClick={() => {
+                    setShowBlueprintPicker(false);
+                    loadSource(bp.path);
+                  }}
+                >
+                  <span className="dataset-kind-badge preflop">blueprint</span>
+                  <span className="dataset-name">{bp.name} ({bp.stack_depth}BB)</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 

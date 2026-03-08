@@ -209,3 +209,10 @@ export interface GlobalConfig {
   blueprint_dir: string;
   target_exploitability: number;
 }
+
+export interface BlueprintListEntry {
+  name: string;
+  path: string;
+  stack_depth: number;
+  has_strategy: boolean;
+}
