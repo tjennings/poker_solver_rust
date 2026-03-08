@@ -73,7 +73,14 @@ pub struct HandGridState {
 ///
 /// Fold = grey, Check = blue, Call = green,
 /// Bets/Raises = light red → dark red (scaled by bet size), All-in = darkest red.
+/// Map an action name to a colour. For bet/raise, `rank` is the position
+/// among bet/raise actions (0 = largest) and `total_bets` is how many
+/// bet/raise actions exist. This spreads the red gradient evenly.
 pub fn action_color(name: &str) -> Color {
+    action_color_ranked(name, 0, 1)
+}
+
+pub fn action_color_ranked(name: &str, rank: usize, total_bets: usize) -> Color {
     let lower = name.to_ascii_lowercase();
     if lower == "fold" {
         return Color::Rgb(140, 140, 140);
@@ -85,22 +92,21 @@ pub fn action_color(name: &str) -> Color {
         return Color::Rgb(60, 179, 113);
     }
     if lower.starts_with("bet") || lower.starts_with("raise") {
-        // Parse numeric value from e.g. "bet 0.3", "raise 1.0", "bet0", "raise2"
-        let size: f64 = lower
-            .trim_start_matches("bet")
-            .trim_start_matches("raise")
-            .trim()
-            .parse()
-            .unwrap_or(0.5);
-        // Map size 0.0→1.0 to light→dark red, clamped. Sizes >1.0 get darker.
-        let t = (size / 3.0).min(1.0); // normalise against max ~3x pot
-        let r = (255.0 - 115.0 * t) as u8; // 255 → 140
-        let g = (120.0 - 90.0 * t) as u8;  // 120 → 30
-        let b = (100.0 - 70.0 * t) as u8;  // 100 → 30
+        // Spread evenly across the red gradient based on rank among bets.
+        // rank 0 = largest bet (darkest), rank total-1 = smallest (lightest).
+        let t = if total_bets <= 1 {
+            0.5
+        } else {
+            rank as f64 / (total_bets - 1) as f64
+        };
+        // t=0 → darkest (largest bet), t=1 → lightest (smallest bet)
+        let r = (140.0 + 115.0 * t) as u8; // 140 → 255
+        let g = (30.0 + 90.0 * t) as u8;   // 30 → 120
+        let b = (30.0 + 70.0 * t) as u8;   // 30 → 100
         return Color::Rgb(r, g, b);
     }
     if lower.contains("all") || lower.contains("ai") {
-        return Color::Rgb(180, 30, 180); // purple for all-in — distinct from red gradient
+        return Color::Rgb(180, 30, 180); // purple for all-in
     }
     Color::DarkGray
 }
@@ -212,7 +218,7 @@ impl Widget for &HandGridWidget<'_> {
         // ── Legend row ──────────────────────────────────────────────
         let legend_y = footer_y + 1;
         if legend_y < area.y + area.height {
-            // Collect unique action names from the grid, preserving first-seen order.
+            // Collect unique action names from the grid, sorted to match cell order.
             let mut seen = Vec::new();
             for row in &self.state.cells {
                 for cell in row {
@@ -223,10 +229,19 @@ impl Widget for &HandGridWidget<'_> {
                     }
                 }
             }
+            seen.sort_by_key(|name| action_sort_key(name));
 
+            let total_bets = seen.iter().filter(|n| is_bet_or_raise(n)).count();
+            let mut bet_rank = 0;
             let mut x = area.x;
             for label in &seen {
-                let color = action_color(label);
+                let color = if is_bet_or_raise(label) {
+                    let c = action_color_ranked(label, bet_rank, total_bets);
+                    bet_rank += 1;
+                    c
+                } else {
+                    action_color(label)
+                };
                 let style = Style::default().bg(color).fg(Color::Black);
                 let display = label.to_ascii_uppercase();
                 buf.set_string(x, legend_y, format!(" {display} "), style);
@@ -236,11 +251,38 @@ impl Widget for &HandGridWidget<'_> {
     }
 }
 
+fn is_bet_or_raise(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("bet") || lower.starts_with("raise")
+}
+
+/// Sort key for display ordering: all-in, raises large→small, call/check, fold.
+fn action_sort_key(name: &str) -> (u8, i64) {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("all") || lower.contains("ai") {
+        (0, 0) // all-in first
+    } else if lower.starts_with("bet") || lower.starts_with("raise") {
+        let size: f64 = lower
+            .trim_start_matches("bet")
+            .trim_start_matches("raise")
+            .trim()
+            .parse()
+            .unwrap_or(0.0);
+        // Negate so larger sizes sort first
+        (1, (-size * 1000.0) as i64)
+    } else if lower == "call" || lower == "check" {
+        (2, 0)
+    } else if lower == "fold" {
+        (3, 0)
+    } else {
+        (4, 0)
+    }
+}
+
 /// Render a stacked color bar for a cell's action distribution.
 ///
 /// Each character position maps to a fraction of the cell width. Actions
-/// are drawn left-to-right in their natural order, each getting a number
-/// of characters proportional to its frequency.
+/// are drawn left-to-right: all-in, raises large→small, call/check, fold.
 fn render_color_bar(buf: &mut Buffer, x: u16, y: u16, w: u16, actions: &[(String, f32)]) {
     let total: f32 = actions.iter().map(|(_, f)| f).sum();
     if total <= 0.0 {
@@ -251,17 +293,38 @@ fn render_color_bar(buf: &mut Buffer, x: u16, y: u16, w: u16, actions: &[(String
         return;
     }
 
+    let mut sorted: Vec<_> = actions.to_vec();
+    sorted.sort_by_key(|(name, _)| action_sort_key(name));
+
+    // Count bet/raise actions and assign each a rank for the color gradient.
+    let bet_ranks: Vec<Option<(usize, usize)>> = {
+        let total_bets = sorted.iter().filter(|(n, _)| is_bet_or_raise(n)).count();
+        let mut rank = 0;
+        sorted.iter().map(|(n, _)| {
+            if is_bet_or_raise(n) {
+                let r = rank;
+                rank += 1;
+                Some((r, total_bets))
+            } else {
+                None
+            }
+        }).collect()
+    };
+
     let mut col = 0_u16;
     let mut cumulative = 0.0_f32;
-    for (i, (name, freq)) in actions.iter().enumerate() {
+    for (i, (name, freq)) in sorted.iter().enumerate() {
         cumulative += freq / total;
-        // Last action gets all remaining columns to avoid rounding gaps.
-        let end = if i == actions.len() - 1 {
+        let end = if i == sorted.len() - 1 {
             w
         } else {
             (cumulative * w as f32).round() as u16
         };
-        let color = action_color(name);
+        let color = if let Some((rank, total_bets)) = bet_ranks[i] {
+            action_color_ranked(name, rank, total_bets)
+        } else {
+            action_color(name)
+        };
         let style = Style::default().bg(color);
         while col < end && col < w {
             buf.set_string(x + col, y, " ", style);
