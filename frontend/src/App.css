@@ -1460,3 +1460,26 @@ button:disabled {
   background: rgba(51, 65, 85, 0.8);
   border-color: rgba(148, 163, 184, 0.5);
 }
+
+/* Cache info bar */
+.cache-info {
+  padding: 4px 8px;
+  font-size: 11px;
+  color: #94a3b8;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.re-solve-btn {
+  font-size: 10px;
+  padding: 2px 6px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 3px;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+}
+.re-solve-btn:hover {
+  border-color: rgba(148, 163, 184, 0.6);
+  color: #e2e8f0;
+}

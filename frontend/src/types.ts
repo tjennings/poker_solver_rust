@@ -242,3 +242,8 @@ export interface PreflopRanges {
   ip_bet_sizes: string;
   ip_raise_sizes: string;
 }
+
+export interface CacheInfo {
+  exploitability: number;
+  iterations: number;
+}
