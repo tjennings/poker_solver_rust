@@ -35,6 +35,7 @@ fn main() {
             poker_solver_tauri::get_simulation_result,
             // Postflop solver commands
             poker_solver_tauri::postflop_set_config,
+            poker_solver_tauri::postflop_set_filtered_weights,
             poker_solver_tauri::postflop_solve_street,
             poker_solver_tauri::postflop_cancel_solve,
             poker_solver_tauri::postflop_get_progress,

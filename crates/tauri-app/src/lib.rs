@@ -31,6 +31,7 @@ pub use postflop::{
     postflop_navigate_to_core, postflop_play_action, postflop_play_action_core,
     postflop_set_cache_dir, postflop_set_cache_dir_core, postflop_set_config,
     postflop_cancel_solve, postflop_cancel_solve_core, postflop_set_config_core,
+    postflop_set_filtered_weights, postflop_set_filtered_weights_core,
     postflop_solve_street, postflop_solve_street_core,
     PostflopState,
 };

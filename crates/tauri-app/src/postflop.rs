@@ -520,6 +520,44 @@ pub fn postflop_set_config(
 }
 
 // ---------------------------------------------------------------------------
+// postflop_set_filtered_weights
+// ---------------------------------------------------------------------------
+
+/// Set pre-computed range weights (1326-element arrays) from blueprint
+/// preflop strategy. These override the range strings when building the
+/// postflop game.
+pub fn postflop_set_filtered_weights_core(
+    state: &PostflopState,
+    oop_weights: Vec<f32>,
+    ip_weights: Vec<f32>,
+) -> Result<(), String> {
+    if oop_weights.len() != 1326 {
+        return Err(format!(
+            "OOP weights must have 1326 elements, got {}",
+            oop_weights.len()
+        ));
+    }
+    if ip_weights.len() != 1326 {
+        return Err(format!(
+            "IP weights must have 1326 elements, got {}",
+            ip_weights.len()
+        ));
+    }
+    *state.filtered_oop_weights.write() = Some(oop_weights);
+    *state.filtered_ip_weights.write() = Some(ip_weights);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn postflop_set_filtered_weights(
+    state: tauri::State<'_, Arc<PostflopState>>,
+    oop_weights: Vec<f32>,
+    ip_weights: Vec<f32>,
+) -> Result<(), String> {
+    postflop_set_filtered_weights_core(&state, oop_weights, ip_weights)
+}
+
+// ---------------------------------------------------------------------------
 // postflop_solve_street
 // ---------------------------------------------------------------------------
 

@@ -111,6 +111,12 @@ struct PostflopSetCacheDirParams {
 }
 
 #[derive(Deserialize)]
+struct PostflopSetFilteredWeightsParams {
+    oop_weights: Vec<f32>,
+    ip_weights: Vec<f32>,
+}
+
+#[derive(Deserialize)]
 struct PostflopCacheParams {
     board: Vec<String>,
     prior_actions: Vec<Vec<usize>>,
@@ -371,6 +377,17 @@ async fn handle_postflop_close_street(
     ))
 }
 
+async fn handle_postflop_set_filtered_weights(
+    Extension(state): Extension<Arc<PostflopState>>,
+    Json(params): Json<PostflopSetFilteredWeightsParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::postflop_set_filtered_weights_core(
+        &state,
+        params.oop_weights,
+        params.ip_weights,
+    ))
+}
+
 async fn handle_postflop_set_cache_dir(
     Extension(state): Extension<Arc<PostflopState>>,
     Json(params): Json<PostflopSetCacheDirParams>,
@@ -474,6 +491,10 @@ async fn main() {
         .route(
             "/api/postflop_close_street",
             post(handle_postflop_close_street),
+        )
+        .route(
+            "/api/postflop_set_filtered_weights",
+            post(handle_postflop_set_filtered_weights),
         )
         .route(
             "/api/postflop_set_cache_dir",
