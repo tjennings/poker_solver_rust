@@ -815,6 +815,43 @@ impl BlueprintTrainer {
         if !self.tui_active {
             eprintln!("  Snapshot saved to {}", snapshot_dir.display());
         }
+
+        // Prune old snapshots if retention limit is set.
+        if let Some(max) = self.config.snapshots.max_snapshots {
+            self.prune_old_snapshots(output_dir, max)?;
+        }
+
+        Ok(())
+    }
+
+    /// Delete the oldest `snapshot_NNNN` directories until at most `max`
+    /// remain. Directories are sorted by their numeric suffix; lower
+    /// numbers are deleted first. The `final/` directory is never pruned.
+    fn prune_old_snapshots(&self, output_dir: &Path, max: u32) -> Result<(), Box<dyn Error>> {
+        let mut numbered: Vec<(u32, std::path::PathBuf)> = Vec::new();
+        for entry in std::fs::read_dir(output_dir)?.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(num_str) = name_str.strip_prefix("snapshot_") {
+                if let Ok(num) = num_str.parse::<u32>() {
+                    numbered.push((num, entry.path()));
+                }
+            }
+        }
+
+        if numbered.len() as u32 <= max {
+            return Ok(());
+        }
+
+        numbered.sort_by_key(|(num, _)| *num);
+        let to_remove = numbered.len() - max as usize;
+        for (_, path) in &numbered[..to_remove] {
+            std::fs::remove_dir_all(path)?;
+            if !self.tui_active {
+                eprintln!("  Pruned old snapshot: {}", path.display());
+            }
+        }
+
         Ok(())
     }
 }
@@ -883,6 +920,7 @@ mod tests {
                 snapshot_every_minutes: 9999,
                 output_dir: "/tmp/test_blueprint_v2_snapshots".into(),
                 resume: false,
+                max_snapshots: None,
             },
         }
     }
@@ -1018,6 +1056,42 @@ mod tests {
             assert!(val.get("ev").and_then(|v| v.as_f64()).is_some());
             assert!(val.get("samples").and_then(|v| v.as_u64()).is_some());
         }
+    }
+
+    #[test]
+    fn snapshot_retention_prunes_oldest() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mut config = toy_config();
+        config.snapshots.output_dir = dir.path().to_string_lossy().to_string();
+        config.snapshots.max_snapshots = Some(2);
+        config.training.iterations = Some(10);
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("training should complete");
+
+        // Save 4 snapshots; retention limit is 2.
+        for _ in 0..4 {
+            trainer.save_snapshot().expect("snapshot should save");
+        }
+
+        // Only the 2 newest should remain.
+        let remaining: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("snapshot_")
+            })
+            .collect();
+        assert_eq!(remaining.len(), 2, "should keep exactly max_snapshots");
+
+        // The kept ones should be snapshot_0002 and snapshot_0003.
+        let mut names: Vec<String> = remaining
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["snapshot_0002", "snapshot_0003"]);
     }
 
     #[test]

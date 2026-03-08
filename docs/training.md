@@ -336,6 +336,8 @@ When `tui.enabled: true` in the config, `train-blueprint` launches a full-screen
 
 **Resume Training:** Set `resume: true` under `snapshots:` to continue from the latest snapshot in `output_dir`. The trainer loads regrets and iteration count from the highest-numbered `snapshot_NNNN/` directory (or `final/` if present).
 
+**Snapshot Retention:** Set `max_snapshots: N` under `snapshots:` to keep only the N most recent snapshots. After each save, older `snapshot_NNNN/` directories are deleted. The `final/` directory is never pruned. Omit or set to `null` for unlimited retention.
+
 **Left panel:** iteration progress, throughput sparkline, exploitability chart
 **Right panel:** tabbed 13x13 strategy grids for configured scenarios
 

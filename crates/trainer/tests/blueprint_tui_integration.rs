@@ -47,6 +47,7 @@ fn toy_config() -> BlueprintV2Config {
             snapshot_every_minutes: 9999,
             output_dir: "/tmp/test_tui_integration".into(),
             resume: false,
+            max_snapshots: None,
         },
     }
 }

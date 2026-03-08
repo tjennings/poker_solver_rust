@@ -117,6 +117,10 @@ pub struct SnapshotConfig {
     /// from its regrets. The snapshot with the highest number is used.
     #[serde(default)]
     pub resume: bool,
+    /// Maximum number of snapshot directories to keep. When exceeded, the
+    /// oldest snapshots are deleted after each new save. `None` = unlimited.
+    #[serde(default)]
+    pub max_snapshots: Option<u32>,
 }
 
 // ── Default value functions ──────────────────────────────────────────
@@ -294,6 +298,7 @@ snapshots:
                 snapshot_every_minutes: 60,
                 output_dir: "/data/snapshots".to_owned(),
                 resume: false,
+                max_snapshots: None,
             },
         };
 

@@ -54,6 +54,7 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
             snapshot_every_minutes: 9999,
             output_dir: run_dir.to_string_lossy().into_owned(),
             resume: false,
+            max_snapshots: None,
         },
     }
 }
