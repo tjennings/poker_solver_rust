@@ -142,7 +142,7 @@ const fn default_prune_after() -> u64 {
 }
 
 const fn default_prune_threshold() -> i32 {
-    0
+    -250_000
 }
 
 const fn default_prune_explore() -> f64 {
