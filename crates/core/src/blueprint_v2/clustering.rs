@@ -32,6 +32,48 @@ pub fn emd(p: &[f64], q: &[f64]) -> f64 {
     distance
 }
 
+/// EMD between two unnormalized u8 count histograms.
+///
+/// Normalizes each histogram on-the-fly by dividing by its sum. Both slices
+/// must have the same length. For zero-sum histograms the result is 0.
+///
+/// Numerically identical to [`emd`] on the corresponding normalized `f64`
+/// distributions, but avoids storing 8-byte floats per bin.
+#[must_use]
+pub fn emd_u8(a: &[u8], b: &[u8]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let total_a: f64 = a.iter().map(|&c| f64::from(c)).sum();
+    let total_b: f64 = b.iter().map(|&c| f64::from(c)).sum();
+    let inv_a = if total_a > 0.0 { 1.0 / total_a } else { 0.0 };
+    let inv_b = if total_b > 0.0 { 1.0 / total_b } else { 0.0 };
+    let mut cdf_diff = 0.0_f64;
+    let mut distance = 0.0_f64;
+    for (&ai, &bi) in a.iter().zip(b.iter()) {
+        cdf_diff += f64::from(ai) * inv_a - f64::from(bi) * inv_b;
+        distance += cdf_diff.abs();
+    }
+    distance
+}
+
+/// EMD between an unnormalized u8 count histogram and a normalized f64
+/// centroid.
+///
+/// Used in the assignment step of u8 k-means: data points are u8 counts,
+/// centroids are f64 probability vectors.
+#[must_use]
+pub fn emd_u8_vs_f64(counts: &[u8], centroid: &[f64]) -> f64 {
+    debug_assert_eq!(counts.len(), centroid.len());
+    let total: f64 = counts.iter().map(|&c| f64::from(c)).sum();
+    let inv = if total > 0.0 { 1.0 / total } else { 0.0 };
+    let mut cdf_diff = 0.0_f64;
+    let mut distance = 0.0_f64;
+    for (&ci, &qi) in counts.iter().zip(centroid.iter()) {
+        cdf_diff += f64::from(ci) * inv - qi;
+        distance += cdf_diff.abs();
+    }
+    distance
+}
+
 // ---------------------------------------------------------------------------
 // K-Means with EMD distance
 // ---------------------------------------------------------------------------
@@ -678,5 +720,42 @@ mod tests {
         assert!(assignments[0..50].iter().all(|&a| a == assignments[0]));
         assert!(assignments[50..100].iter().all(|&a| a == assignments[50]));
         assert_ne!(assignments[0], assignments[50]);
+    }
+
+    #[test]
+    fn test_emd_u8_identical() {
+        let a = vec![10, 10, 10, 10];
+        assert!(emd_u8(&a, &a).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_emd_u8_opposite_ends() {
+        let a = vec![40, 0, 0, 0];
+        let b = vec![0, 0, 0, 40];
+        assert!((emd_u8(&a, &b) - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_emd_u8_matches_f64() {
+        let counts_a: Vec<u8> = vec![20, 15, 10, 1];
+        let counts_b: Vec<u8> = vec![5, 20, 15, 6];
+        let total_a: f64 = counts_a.iter().map(|&c| f64::from(c)).sum();
+        let total_b: f64 = counts_b.iter().map(|&c| f64::from(c)).sum();
+        let prob_a: Vec<f64> = counts_a.iter().map(|&c| f64::from(c) / total_a).collect();
+        let prob_b: Vec<f64> = counts_b.iter().map(|&c| f64::from(c) / total_b).collect();
+        let d_u8 = emd_u8(&counts_a, &counts_b);
+        let d_f64 = emd(&prob_a, &prob_b);
+        assert!((d_u8 - d_f64).abs() < 1e-10, "u8={d_u8} f64={d_f64}");
+    }
+
+    #[test]
+    fn test_emd_u8_vs_f64_matches() {
+        let counts: Vec<u8> = vec![20, 15, 10, 1];
+        let centroid: Vec<f64> = vec![0.1, 0.4, 0.3, 0.2];
+        let total: f64 = counts.iter().map(|&c| f64::from(c)).sum();
+        let prob: Vec<f64> = counts.iter().map(|&c| f64::from(c) / total).collect();
+        let d_mixed = emd_u8_vs_f64(&counts, &centroid);
+        let d_f64 = emd(&prob, &centroid);
+        assert!((d_mixed - d_f64).abs() < 1e-10, "mixed={d_mixed} f64={d_f64}");
     }
 }
