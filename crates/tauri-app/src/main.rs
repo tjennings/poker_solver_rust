@@ -26,6 +26,7 @@ fn main() {
             poker_solver_tauri::list_blueprints,
             poker_solver_tauri::get_combo_classes,
             poker_solver_tauri::get_hand_equity,
+            poker_solver_tauri::get_preflop_ranges,
             // Simulation commands
             poker_solver_tauri::list_strategy_sources,
             poker_solver_tauri::start_simulation,

@@ -74,6 +74,11 @@ struct ListBlueprintsParams {
 }
 
 #[derive(Deserialize)]
+struct PreflopRangesParams {
+    history: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct PostflopConfigParams {
     config: poker_solver_tauri::postflop::PostflopConfig,
 }
@@ -237,6 +242,16 @@ async fn handle_get_hand_equity(
     ))
 }
 
+async fn handle_get_preflop_ranges(
+    AxumState(state): AxumState<AppState>,
+    Json(params): Json<PreflopRangesParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::get_preflop_ranges_core(
+        &state,
+        params.history,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Handlers — sync core functions (no params)
 // ---------------------------------------------------------------------------
@@ -378,6 +393,10 @@ async fn main() {
         .route("/api/list_blueprints", post(handle_list_blueprints))
         .route("/api/get_combo_classes", post(handle_get_combo_classes))
         .route("/api/get_hand_equity", post(handle_get_hand_equity))
+        .route(
+            "/api/get_preflop_ranges",
+            post(handle_get_preflop_ranges),
+        )
         // Postflop explorer endpoints
         .route(
             "/api/postflop_set_config",
