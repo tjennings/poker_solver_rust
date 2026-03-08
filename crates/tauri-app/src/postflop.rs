@@ -29,6 +29,8 @@ pub struct PostflopConfig {
     pub oop_raise_sizes: String,
     pub ip_bet_sizes: String,
     pub ip_raise_sizes: String,
+    pub rake_rate: f64,
+    pub rake_cap: f64,
 }
 
 impl Default for PostflopConfig {
@@ -42,6 +44,8 @@ impl Default for PostflopConfig {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "25%,33%,75%,a".to_string(),
             ip_raise_sizes: "a".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         }
     }
 }
@@ -69,6 +73,9 @@ pub struct PostflopMatrixCell {
     pub combo_count: usize,
     pub ev: Option<f32>,
     pub combos: Vec<PostflopComboDetail>,
+    /// Average initial range weight for this cell (0.0–1.0).
+    /// When derived from blueprint strategy, this reflects reaching probability.
+    pub weight: f32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +95,8 @@ pub struct PostflopProgress {
     pub exploitability: f32,
     pub is_complete: bool,
     pub matrix: Option<PostflopStrategyMatrix>,
+    /// Seconds elapsed since solve started.
+    pub elapsed_secs: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -297,6 +306,7 @@ pub struct PostflopState {
     pub filtered_oop_weights: RwLock<Option<Vec<f32>>>,
     pub filtered_ip_weights: RwLock<Option<Vec<f32>>>,
     pub cache_dir: RwLock<Option<PathBuf>>,
+    pub solve_start: RwLock<Option<std::time::Instant>>,
 }
 
 impl Default for PostflopState {
@@ -313,6 +323,7 @@ impl Default for PostflopState {
             filtered_oop_weights: RwLock::new(None),
             filtered_ip_weights: RwLock::new(None),
             cache_dir: RwLock::new(None),
+            solve_start: RwLock::new(None),
         }
     }
 }
@@ -321,18 +332,30 @@ impl Default for PostflopState {
 // build_strategy_matrix
 // ---------------------------------------------------------------------------
 
-/// Builds a 13x13 strategy matrix from the current game state.
-///
-/// The game must be at a non-terminal, non-chance node with memory allocated.
-pub fn build_strategy_matrix(game: &mut PostFlopGame) -> PostflopStrategyMatrix {
+/// All data needed to build a matrix, captured quickly from the game.
+struct MatrixSnapshot {
+    player: usize,
+    strategy: Vec<f32>,
+    private_cards: Vec<(u8, u8)>,
+    initial_weights: Vec<f32>,
+    num_hands: usize,
+    actions: Vec<Action>,
+    pot: i32,
+    stacks: [i32; 2],
+    hand_evs: Option<Vec<f32>>,
+    board: Vec<String>,
+}
+
+/// Capture all data needed for matrix construction from the game.
+/// This borrows the game briefly; the expensive matrix build runs on owned data.
+fn capture_matrix_snapshot(game: &mut PostFlopGame) -> MatrixSnapshot {
     let player = game.current_player();
     let actions = game.available_actions();
     let strategy = game.strategy();
     let private_cards = game.private_cards(player).to_vec();
+    let initial_weights = game.initial_weights(player).to_vec();
     let num_hands = game.num_private_hands(player);
-    let num_actions = actions.len();
 
-    // Compute pot and stacks before mutable borrows.
     let (pot, stacks) = {
         let tc = game.tree_config();
         let ba = game.total_bet_amount();
@@ -341,13 +364,6 @@ pub fn build_strategy_matrix(game: &mut PostFlopGame) -> PostflopStrategyMatrix 
         (pot, stacks)
     };
 
-    let action_infos: Vec<ActionInfo> = actions
-        .iter()
-        .enumerate()
-        .map(|(i, a)| action_to_info(a, i, pot))
-        .collect();
-
-    // Compute per-hand EV if game is solved.
     let hand_evs: Option<Vec<f32>> = if game.is_solved() {
         game.cache_normalized_weights();
         Some(game.expected_values(player))
@@ -355,22 +371,61 @@ pub fn build_strategy_matrix(game: &mut PostFlopGame) -> PostflopStrategyMatrix 
         None
     };
 
-    // Initialize the 13x13 matrix with zeroed probability accumulators.
+    let cc = game.card_config();
+    let mut board_cards: Vec<u8> = cc.flop.to_vec();
+    if cc.turn != NOT_DEALT {
+        board_cards.push(cc.turn);
+    }
+    if cc.river != NOT_DEALT {
+        board_cards.push(cc.river);
+    }
+    let board: Vec<String> = board_cards
+        .iter()
+        .filter_map(|&c| card_to_string(c).ok())
+        .collect();
+
+    MatrixSnapshot {
+        player,
+        strategy,
+        private_cards,
+        initial_weights,
+        num_hands,
+        actions,
+        pot,
+        stacks,
+        hand_evs,
+        board,
+    }
+}
+
+/// Build the matrix from a snapshot (no game borrow needed).
+fn build_matrix_from_snapshot(snap: MatrixSnapshot) -> PostflopStrategyMatrix {
+    let num_actions = snap.actions.len();
+
+    let action_infos: Vec<ActionInfo> = snap
+        .actions
+        .iter()
+        .enumerate()
+        .map(|(i, a)| action_to_info(a, i, snap.pot))
+        .collect();
+
     let mut prob_sums = vec![vec![vec![0.0f64; num_actions]; 13]; 13];
     let mut combo_counts = vec![vec![0usize; 13]; 13];
+    let mut weight_sums = vec![vec![0.0f64; 13]; 13];
     let mut ev_sums = vec![vec![0.0f64; 13]; 13];
     let mut combo_details: Vec<Vec<Vec<PostflopComboDetail>>> =
         vec![vec![Vec::new(); 13]; 13];
 
-    for (hand_idx, &(c1, c2)) in private_cards.iter().enumerate() {
+    for (hand_idx, &(c1, c2)) in snap.private_cards.iter().enumerate() {
         let (row, col, _) = card_pair_to_matrix(c1, c2);
         combo_counts[row][col] += 1;
-        if let Some(ref evs) = hand_evs {
+        weight_sums[row][col] += snap.initial_weights[hand_idx] as f64;
+        if let Some(ref evs) = snap.hand_evs {
             ev_sums[row][col] += evs[hand_idx] as f64;
         }
         let mut probs = Vec::with_capacity(num_actions);
         for action_idx in 0..num_actions {
-            let prob = strategy[action_idx * num_hands + hand_idx];
+            let prob = snap.strategy[action_idx * snap.num_hands + hand_idx];
             prob_sums[row][col][action_idx] += prob as f64;
             probs.push(prob);
         }
@@ -396,12 +451,17 @@ pub fn build_strategy_matrix(game: &mut PostFlopGame) -> PostflopStrategyMatrix 
                     } else {
                         vec![0.0; num_actions]
                     };
-                    let ev = if count > 0 && hand_evs.is_some() {
+                    let ev = if count > 0 && snap.hand_evs.is_some() {
                         Some((ev_sums[row][col] / count as f64) as f32)
                     } else {
                         None
                     };
                     let combos = std::mem::take(&mut combo_details[row][col]);
+                    let weight = if count > 0 {
+                        (weight_sums[row][col] / count as f64) as f32
+                    } else {
+                        0.0
+                    };
                     PostflopMatrixCell {
                         hand: label,
                         suited,
@@ -410,34 +470,29 @@ pub fn build_strategy_matrix(game: &mut PostFlopGame) -> PostflopStrategyMatrix 
                         combo_count: count,
                         ev,
                         combos,
+                        weight,
                     }
                 })
                 .collect()
         })
         .collect();
 
-    // Board cards — read from card_config to avoid relying on interpreter state.
-    let cc = game.card_config();
-    let mut board_cards: Vec<u8> = cc.flop.to_vec();
-    if cc.turn != NOT_DEALT {
-        board_cards.push(cc.turn);
-    }
-    if cc.river != NOT_DEALT {
-        board_cards.push(cc.river);
-    }
-    let board: Vec<String> = board_cards
-        .iter()
-        .filter_map(|&c| card_to_string(c).ok())
-        .collect();
-
     PostflopStrategyMatrix {
         cells,
         actions: action_infos,
-        player,
-        pot,
-        stacks,
-        board,
+        player: snap.player,
+        pot: snap.pot,
+        stacks: snap.stacks,
+        board: snap.board,
     }
+}
+
+/// Builds a 13x13 strategy matrix from the current game state.
+///
+/// The game must be at a non-terminal, non-chance node with memory allocated.
+pub fn build_strategy_matrix(game: &mut PostFlopGame) -> PostflopStrategyMatrix {
+    let snap = capture_matrix_snapshot(game);
+    build_matrix_from_snapshot(snap)
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +585,7 @@ pub fn postflop_set_filtered_weights_core(
     state: &PostflopState,
     oop_weights: Vec<f32>,
     ip_weights: Vec<f32>,
-) -> Result<(), String> {
+) -> Result<FilteredWeightsResult, String> {
     if oop_weights.len() != 1326 {
         return Err(format!(
             "OOP weights must have 1326 elements, got {}",
@@ -543,9 +598,17 @@ pub fn postflop_set_filtered_weights_core(
             ip_weights.len()
         ));
     }
+    let oop_combos = oop_weights.iter().sum::<f32>().round() as usize;
+    let ip_combos = ip_weights.iter().sum::<f32>().round() as usize;
     *state.filtered_oop_weights.write() = Some(oop_weights);
     *state.filtered_ip_weights.write() = Some(ip_weights);
-    Ok(())
+    Ok(FilteredWeightsResult { oop_combos, ip_combos })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FilteredWeightsResult {
+    pub oop_combos: usize,
+    pub ip_combos: usize,
 }
 
 #[tauri::command]
@@ -553,7 +616,7 @@ pub fn postflop_set_filtered_weights(
     state: tauri::State<'_, Arc<PostflopState>>,
     oop_weights: Vec<f32>,
     ip_weights: Vec<f32>,
-) -> Result<(), String> {
+) -> Result<FilteredWeightsResult, String> {
     postflop_set_filtered_weights_core(&state, oop_weights, ip_weights)
 }
 
@@ -607,6 +670,9 @@ fn build_game(
     // Parse ranges (or use filtered weights if available from multi-street).
     let oop_range = match filtered_oop {
         Some(weights) => {
+            let nonzero = weights.iter().filter(|&&w| w > 0.0).count();
+            let sum: f32 = weights.iter().sum();
+            eprintln!("[build_game] OOP filtered weights: {nonzero}/1326 nonzero, sum={sum:.1}");
             Range::from_raw_data(weights).map_err(|e| format!("Bad OOP weights: {e}"))?
         }
         None => config
@@ -616,6 +682,9 @@ fn build_game(
     };
     let ip_range = match filtered_ip {
         Some(weights) => {
+            let nonzero = weights.iter().filter(|&&w| w > 0.0).count();
+            let sum: f32 = weights.iter().sum();
+            eprintln!("[build_game] IP filtered weights: {nonzero}/1326 nonzero, sum={sum:.1}");
             Range::from_raw_data(weights).map_err(|e| format!("Bad IP weights: {e}"))?
         }
         None => config
@@ -647,8 +716,8 @@ fn build_game(
         initial_state,
         starting_pot: config.pot,
         effective_stack: config.effective_stack,
-        rake_rate: 0.0,
-        rake_cap: 0.0,
+        rake_rate: config.rake_rate,
+        rake_cap: config.rake_cap,
         flop_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
         turn_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
         river_bet_sizes: [oop_sizes, ip_sizes],
@@ -706,6 +775,7 @@ fn postflop_solve_street_impl(
         .exploitability_bits
         .store(f32::MAX.to_bits(), Ordering::Relaxed);
     state.solve_complete.store(false, Ordering::Relaxed);
+    *state.solve_start.write() = Some(std::time::Instant::now());
     state.solving.store(true, Ordering::Release);
 
     // Take initial matrix snapshot.
@@ -728,17 +798,23 @@ fn postflop_solve_street_impl(
             }
 
             solve_step(&game, t);
-
-            last_exp = compute_exploitability(&game);
             shared.current_iteration.store(t + 1, Ordering::Relaxed);
+
+            // Compute exploitability every iteration for progress display.
+            last_exp = compute_exploitability(&game);
             shared
                 .exploitability_bits
                 .store(last_exp.to_bits(), Ordering::Relaxed);
 
-            // Snapshot the matrix every iteration.
+            // Capture snapshot data quickly, build matrix on a background thread
+            // so the solver can continue immediately.
             {
-                let matrix = build_strategy_matrix(&mut game);
-                *shared.matrix_snapshot.write() = Some(matrix);
+                let snap = capture_matrix_snapshot(&mut game);
+                let shared2 = Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    let matrix = build_matrix_from_snapshot(snap);
+                    *shared2.matrix_snapshot.write() = Some(matrix);
+                });
             }
 
             if last_exp <= target_exp {
@@ -810,6 +886,11 @@ pub fn postflop_get_progress_core(state: &PostflopState) -> PostflopProgress {
     let exploitability = f32::from_bits(state.exploitability_bits.load(Ordering::Relaxed));
     let is_complete = state.solve_complete.load(Ordering::Relaxed);
     let matrix = state.matrix_snapshot.read().clone();
+    let elapsed_secs = state
+        .solve_start
+        .read()
+        .map(|t| t.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
 
     PostflopProgress {
         iteration,
@@ -817,6 +898,7 @@ pub fn postflop_get_progress_core(state: &PostflopState) -> PostflopProgress {
         exploitability,
         is_complete,
         matrix,
+        elapsed_secs,
     }
 }
 
@@ -1459,6 +1541,8 @@ mod tests {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "33%".to_string(),
             ip_raise_sizes: "a".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         };
         *state.config.write() = config;
 
@@ -1515,6 +1599,8 @@ mod tests {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "33%".to_string(),
             ip_raise_sizes: "a".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         };
         *state.config.write() = config;
 
@@ -1566,6 +1652,8 @@ mod tests {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "33%".to_string(),
             ip_raise_sizes: "a".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         };
         postflop_set_config_core(&state, config).unwrap();
 
@@ -1690,6 +1778,8 @@ mod tests {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "50%,a".to_string(),
             ip_raise_sizes: "a".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         };
         postflop_set_config_core(&state, config).unwrap();
 

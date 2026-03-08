@@ -1,5 +1,6 @@
 # Blueprint V2 Toy Config — 10BB, small buckets, trains in minutes
 game:
+  name: "HU 10BB Toy"
   players: 2
   stack_depth: 10.0
   small_blind: 0.5

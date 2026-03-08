@@ -163,6 +163,8 @@ impl AllBuckets {
 /// * `prune` - Whether negative-regret pruning is active
 /// * `prune_threshold` - Regret threshold below which actions are skipped
 /// * `rng` - Random number generator for opponent sampling
+/// * `rake_rate` - Fraction of pot taken as rake (0.0 = no rake)
+/// * `rake_cap` - Maximum rake in chip units (0.0 = no cap)
 #[allow(clippy::too_many_arguments)]
 pub fn traverse_external(
     tree: &GameTree,
@@ -173,16 +175,19 @@ pub fn traverse_external(
     prune: bool,
     prune_threshold: i32,
     rng: &mut impl Rng,
+    rake_rate: f64,
+    rake_cap: f64,
 ) -> (f64, PruneStats) {
     match &tree.nodes[node_idx as usize] {
         GameNode::Terminal { kind, invested, .. } => {
-            (terminal_value(*kind, invested, traverser, &deal.deal), PruneStats::default())
+            (terminal_value(*kind, invested, traverser, &deal.deal, rake_rate, rake_cap), PruneStats::default())
         }
 
         GameNode::Chance { child, .. } => {
             // Board cards are pre-dealt in the Deal; just recurse.
             traverse_external(
                 tree, storage, deal, traverser, *child, prune, prune_threshold, rng,
+                rake_rate, rake_cap,
             )
         }
 
@@ -211,6 +216,8 @@ pub fn traverse_external(
                     prune,
                     prune_threshold,
                     rng,
+                    rake_rate,
+                    rake_cap,
                 )
             } else {
                 traverse_opponent(
@@ -225,6 +232,8 @@ pub fn traverse_external(
                     prune,
                     prune_threshold,
                     rng,
+                    rake_rate,
+                    rake_cap,
                 )
             }
         }
@@ -232,18 +241,36 @@ pub fn traverse_external(
 }
 
 /// Compute payoff at a terminal node from the traverser's perspective.
+///
+/// When rake is enabled (`rake_rate > 0`), the winner pays
+/// `min(pot * rake_rate, rake_cap)` from their winnings. The loser
+/// always loses their full investment. On a tie the rake cost is split
+/// equally between both players. A `rake_cap` of `0.0` means no cap.
 fn terminal_value(
     kind: TerminalKind,
     invested: &[f64; 2],
     traverser: u8,
     deal: &Deal,
+    rake_rate: f64,
+    rake_cap: f64,
 ) -> f64 {
     let t = traverser as usize;
     let o = 1 - t;
+    let pot = invested[0] + invested[1];
+    let rake = if rake_rate > 0.0 {
+        let uncapped = pot * rake_rate;
+        if rake_cap > 0.0 {
+            uncapped.min(rake_cap)
+        } else {
+            uncapped
+        }
+    } else {
+        0.0
+    };
     match kind {
         TerminalKind::Fold { winner } => {
             if winner == traverser {
-                invested[o]
+                invested[o] - rake
             } else {
                 -invested[t]
             }
@@ -252,9 +279,9 @@ fn terminal_value(
             let rank_t = rank_hand(deal.hole_cards[t], &deal.board);
             let rank_o = rank_hand(deal.hole_cards[o], &deal.board);
             match rank_t.cmp(&rank_o) {
-                Ordering::Greater => invested[o],
+                Ordering::Greater => invested[o] - rake,
                 Ordering::Less => -invested[t],
-                Ordering::Equal => 0.0,
+                Ordering::Equal => -rake / 2.0,
             }
         }
     }
@@ -275,6 +302,8 @@ fn traverse_traverser(
     prune: bool,
     prune_threshold: i32,
     rng: &mut impl Rng,
+    rake_rate: f64,
+    rake_cap: f64,
 ) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
@@ -297,6 +326,7 @@ fn traverse_traverser(
 
         let (child_ev, child_stats) = traverse_external(
             tree, storage, deal, traverser, child_idx, prune, prune_threshold, rng,
+            rake_rate, rake_cap,
         );
         action_values[a] = child_ev;
         node_value += strategy[a] * child_ev;
@@ -333,6 +363,8 @@ fn traverse_opponent(
     prune: bool,
     prune_threshold: i32,
     rng: &mut impl Rng,
+    rake_rate: f64,
+    rake_cap: f64,
 ) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
@@ -352,6 +384,7 @@ fn traverse_opponent(
 
     traverse_external(
         tree, storage, deal, traverser, children[chosen], prune, prune_threshold, rng,
+        rake_rate, rake_cap,
     )
 }
 
@@ -428,6 +461,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
+            0.0, 0.0,
         );
         assert!(ev.is_finite(), "EV should be finite, got {ev}");
     }
@@ -445,9 +479,11 @@ mod tests {
 
         let (ev0, _) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
+            0.0, 0.0,
         );
         let (ev1, _) = traverse_external(
             &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
+            0.0, 0.0,
         );
 
         assert!(ev0.is_finite());
@@ -469,6 +505,7 @@ mod tests {
 
         let (_ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
+            0.0, 0.0,
         );
 
         assert!(
@@ -490,6 +527,7 @@ mod tests {
 
         let (_ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
+            0.0, 0.0,
         );
 
         assert!(
@@ -513,9 +551,11 @@ mod tests {
         for _ in 0..50 {
             let _ = traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
+                0.0, 0.0,
             );
             let _ = traverse_external(
                 &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
+                0.0, 0.0,
             );
         }
 
@@ -553,6 +593,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, true, -310_000_000, &mut rng,
+            0.0, 0.0,
         );
         assert!(ev.is_finite());
     }
@@ -563,11 +604,11 @@ mod tests {
         let deal = make_deal();
 
         // Winner is player 1 (BB), traverser is player 0 (SB).
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, 0, &deal);
+        let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, 0, &deal, 0.0, 0.0);
         assert!((v - (-0.5)).abs() < 1e-10, "SB loses 0.5 on fold, got {v}");
 
         // Winner is player 1, traverser is player 1.
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, 1, &deal);
+        let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, 1, &deal, 0.0, 0.0);
         assert!((v - 0.5).abs() < 1e-10, "BB wins 0.5 on SB fold, got {v}");
     }
 
@@ -579,10 +620,97 @@ mod tests {
         // Both have a straight on 2-3-4-5-6; AKs (6-high straight) vs
         // QJh (6-high straight). Both make the same board straight, so
         // this should be a tie (chop).
-        let v = terminal_value(TerminalKind::Showdown, &invested, 0, &deal);
+        let v = terminal_value(TerminalKind::Showdown, &invested, 0, &deal, 0.0, 0.0);
         assert!(
             v.abs() < 1e-10,
             "Equal hands should chop (EV=0), got {v}"
         );
+    }
+
+    // --- Rake tests ---
+
+    /// Deal where player 0 wins at showdown: AA vs KK on a low board.
+    fn make_deal_p0_wins() -> Deal {
+        Deal {
+            hole_cards: [
+                [
+                    Card::new(Value::Ace, Suit::Spade),
+                    Card::new(Value::Ace, Suit::Heart),
+                ],
+                [
+                    Card::new(Value::King, Suit::Spade),
+                    Card::new(Value::King, Suit::Heart),
+                ],
+            ],
+            board: [
+                Card::new(Value::Two, Suit::Club),
+                Card::new(Value::Three, Suit::Diamond),
+                Card::new(Value::Four, Suit::Club),
+                Card::new(Value::Seven, Suit::Diamond),
+                Card::new(Value::Eight, Suit::Club),
+            ],
+        }
+    }
+
+    #[test]
+    fn terminal_fold_with_rake() {
+        let invested = [5.0, 5.0]; // pot = 10
+        let deal = make_deal();
+        // 5% rake, cap 1.0 -> rake = min(10*0.05, 1.0) = 0.5
+        let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, 1, &deal, 0.05, 1.0);
+        assert!((v - 4.5).abs() < 1e-10, "Winner gets 5 - 0.5 rake = 4.5, got {v}");
+
+        let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, 0, &deal, 0.05, 1.0);
+        assert!((v - (-5.0)).abs() < 1e-10, "Loser loses 5.0, got {v}");
+    }
+
+    #[test]
+    fn terminal_showdown_with_rake_winner() {
+        let invested = [5.0, 5.0]; // pot = 10
+        let deal = make_deal_p0_wins();
+        // 5% rake, no cap -> rake = 0.5
+        // Player 0 wins: gets opponent's 5.0 minus 0.5 rake = 4.5
+        let v = terminal_value(TerminalKind::Showdown, &invested, 0, &deal, 0.05, 0.0);
+        assert!((v - 4.5).abs() < 1e-10, "Winner gets 5 - 0.5 rake = 4.5, got {v}");
+
+        // Player 1 loses: loses full 5.0
+        let v = terminal_value(TerminalKind::Showdown, &invested, 1, &deal, 0.05, 0.0);
+        assert!((v - (-5.0)).abs() < 1e-10, "Loser loses 5.0, got {v}");
+    }
+
+    #[test]
+    fn terminal_tie_with_rake() {
+        let invested = [5.0, 5.0]; // pot = 10
+        let deal = make_deal(); // equal hands (tie via board straight)
+        // 5% rake, no cap -> rake = 0.5
+        let v = terminal_value(TerminalKind::Showdown, &invested, 0, &deal, 0.05, 0.0);
+        assert!((v - (-0.25)).abs() < 1e-10, "Tie splits 0.5 rake: -0.25 each, got {v}");
+    }
+
+    #[test]
+    fn terminal_rake_cap_applied() {
+        let invested = [50.0, 50.0]; // pot = 100
+        let deal = make_deal(); // tie
+        // 5% rake, cap 3.0 -> rake = min(5.0, 3.0) = 3.0 (capped)
+        let v = terminal_value(TerminalKind::Showdown, &invested, 0, &deal, 0.05, 3.0);
+        assert!((v - (-1.5)).abs() < 1e-10, "Capped rake 3.0 split = -1.5 each, got {v}");
+    }
+
+    #[test]
+    fn terminal_rake_zero_rate_is_noop() {
+        let invested = [5.0, 5.0];
+        let deal = make_deal_p0_wins();
+        // rate=0 should produce identical results to no-rake
+        let v = terminal_value(TerminalKind::Showdown, &invested, 0, &deal, 0.0, 3.0);
+        assert!((v - 5.0).abs() < 1e-10, "Zero rate means no rake, got {v}");
+    }
+
+    #[test]
+    fn terminal_rake_uncapped() {
+        let invested = [50.0, 50.0]; // pot = 100
+        let deal = make_deal_p0_wins();
+        // 10% rake, no cap -> rake = 10.0
+        let v = terminal_value(TerminalKind::Showdown, &invested, 0, &deal, 0.10, 0.0);
+        assert!((v - 40.0).abs() < 1e-10, "Winner gets 50 - 10 rake = 40, got {v}");
     }
 }

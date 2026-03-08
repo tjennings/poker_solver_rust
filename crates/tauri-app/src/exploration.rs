@@ -132,6 +132,8 @@ pub struct BundleInfo {
     pub info_sets: usize,
     pub iterations: u64,
     pub preflop_only: bool,
+    pub rake_rate: f64,
+    pub rake_cap: f64,
 }
 
 /// Information about an available agent config.
@@ -267,6 +269,8 @@ pub async fn load_bundle_core(
             info_sets: bundle.blueprint.len(),
             iterations: bundle.blueprint.iterations_trained(),
             preflop_only: false,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         };
         let boundaries = bundle.boundaries;
         let source = StrategySource::Bundle {
@@ -313,6 +317,8 @@ pub async fn load_bundle_core(
             info_sets: preflop_bundle.strategy.len(),
             iterations: 0,
             preflop_only: true,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         };
         let source = StrategySource::PreflopSolve {
             config: preflop_bundle.config,
@@ -356,6 +362,8 @@ fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
         info_sets: 0,
         iterations: 0,
         preflop_only: false,
+        rake_rate: 0.0,
+        rake_cap: 0.0,
     };
 
     Ok((info, StrategySource::Agent(agent)))
@@ -395,6 +403,8 @@ pub async fn load_preflop_solve_core(
         info_sets: preflop_bundle.strategy.len(),
         iterations: 0,
         preflop_only: true,
+        rake_rate: 0.0,
+        rake_cap: 0.0,
     };
 
     *state.source.write() = Some(StrategySource::PreflopSolve {
@@ -442,6 +452,8 @@ pub async fn solve_preflop_live_core(
         info_sets: len,
         iterations,
         preflop_only: true,
+        rake_rate: 0.0,
+        rake_cap: 0.0,
     };
 
     *state.source.write() = Some(StrategySource::PreflopSolve {
@@ -483,6 +495,8 @@ pub async fn load_subgame_source_core(
         info_sets: bundle.blueprint.len(),
         iterations: bundle.blueprint.iterations_trained(),
         preflop_only: false,
+        rake_rate: 0.0,
+        rake_cap: 0.0,
     };
 
     *state.source.write() = Some(StrategySource::SubgameSolve {
@@ -567,12 +581,14 @@ pub async fn load_blueprint_v2_core(
 
     let (decision_nodes, _, _) = tree.node_counts();
     let info = BundleInfo {
-        name: Some("Blueprint V2".to_string()),
+        name: Some(config.game.name.clone()),
         stack_depth: config.game.stack_depth as u32,
         bet_sizes: vec![],
         info_sets: decision_nodes,
         iterations: strategy.iterations,
         preflop_only: true,
+        rake_rate: config.game.rake_rate,
+        rake_cap: config.game.rake_cap,
     };
 
     *state.source.write() = Some(StrategySource::BlueprintV2 {
@@ -636,19 +652,18 @@ fn try_make_blueprint_entry(dir: &Path) -> Option<BlueprintListEntry> {
         return None;
     }
 
-    let stack_depth = match v2_bundle::load_config(dir) {
-        Ok(config) => config.game.stack_depth,
+    let (name, stack_depth) = match v2_bundle::load_config(dir) {
+        Ok(config) => (config.game.name.clone(), config.game.stack_depth),
         Err(e) => {
             eprintln!("Warning: failed to parse config in {}: {e}", dir.display());
-            0.0
+            let fallback = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            (fallback, 0.0)
         }
     };
-
-    let name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
 
     let has_strategy = dir.join("final/strategy.bin").exists()
         || dir.join("strategy.bin").exists()
@@ -1621,6 +1636,8 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
             info_sets: blueprint.len(),
             iterations: blueprint.iterations_trained(),
             preflop_only: false,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         },
         StrategySource::Agent(agent) => BundleInfo {
             name: agent.game.name.clone(),
@@ -1629,6 +1646,8 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
             info_sets: 0,
             iterations: 0,
             preflop_only: false,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         },
         StrategySource::PreflopSolve { config, strategy, .. } => BundleInfo {
             name: Some("Preflop Solve".to_string()),
@@ -1637,6 +1656,8 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
             info_sets: strategy.len(),
             iterations: 0,
             preflop_only: true,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         },
         StrategySource::SubgameSolve {
             blueprint,
@@ -1649,6 +1670,8 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
             info_sets: blueprint.len(),
             iterations: blueprint.iterations_trained(),
             preflop_only: false,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         },
         StrategySource::BlueprintV2 {
             config,
@@ -1658,12 +1681,14 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
         } => {
             let (decision_nodes, _, _) = tree.node_counts();
             BundleInfo {
-                name: Some("Blueprint V2".to_string()),
+                name: Some(config.game.name.clone()),
                 stack_depth: config.game.stack_depth as u32,
                 bet_sizes: vec![],
                 info_sets: decision_nodes,
                 iterations: strategy.iterations,
                 preflop_only: false,
+                rake_rate: config.game.rake_rate,
+                rake_cap: config.game.rake_cap,
             }
         }
     })
@@ -3281,6 +3306,10 @@ pub struct PreflopRanges {
     pub ip_bet_sizes: String,
     /// IP raise sizes for flop in range-solver format.
     pub ip_raise_sizes: String,
+    /// Rake rate (0.0–1.0 fraction of pot).
+    pub rake_rate: f64,
+    /// Rake cap in chips.
+    pub rake_cap: f64,
 }
 
 /// Convert an `rs_poker::core::Card` to a range-solver `u8` card.
@@ -3516,6 +3545,15 @@ pub fn get_preflop_ranges_core(
     let oop_raise_sizes = format_bet_sizes(flop_sizes.get(1).map_or(&[], Vec::as_slice));
     let ip_raise_sizes = format_bet_sizes(flop_sizes.get(1).map_or(&[], Vec::as_slice));
 
+    // Zero out negligible weights (CFR never outputs exact 0, so threshold needed).
+    let threshold = 0.005;
+    for w in oop_weights.iter_mut() {
+        if *w < threshold { *w = 0.0; }
+    }
+    for w in ip_weights.iter_mut() {
+        if *w < threshold { *w = 0.0; }
+    }
+
     // Expand 169 → 1326.
     let oop_1326 = expand_169_to_1326(&oop_weights);
     let ip_1326 = expand_169_to_1326(&ip_weights);
@@ -3529,6 +3567,8 @@ pub fn get_preflop_ranges_core(
         oop_raise_sizes,
         ip_bet_sizes,
         ip_raise_sizes,
+        rake_rate: config.game.rake_rate,
+        rake_cap: config.game.rake_cap,
     })
 }
 

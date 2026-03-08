@@ -16,6 +16,8 @@ pub struct BlueprintV2Config {
 /// Core game parameters (stakes and stack depth).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameConfig {
+    /// Human-readable name for this blueprint (shown in UI).
+    pub name: String,
     pub players: u8,
     /// Stack depth in big blinds.
     pub stack_depth: f64,
@@ -23,6 +25,12 @@ pub struct GameConfig {
     pub small_blind: f64,
     /// Big blind size in big blinds (typically 1.0).
     pub big_blind: f64,
+    /// Rake as a fraction of the pot (0.0 = no rake, 0.05 = 5%).
+    #[serde(default)]
+    pub rake_rate: f64,
+    /// Maximum rake in chips (min bet units). 0.0 = no cap.
+    #[serde(default)]
+    pub rake_cap: f64,
 }
 
 /// Card abstraction clustering configuration.
@@ -170,6 +178,7 @@ mod tests {
     fn test_deserialize_toy_config() {
         let yaml = r#"
 game:
+  name: "Test Config"
   players: 6
   stack_depth: 100.0
   small_blind: 0.5
@@ -215,10 +224,14 @@ snapshots:
             serde_yaml::from_str(yaml).expect("failed to parse toy config");
 
         // Game
+        assert_eq!(cfg.game.name, "Test Config");
         assert_eq!(cfg.game.players, 6);
         assert!((cfg.game.stack_depth - 100.0).abs() < f64::EPSILON);
         assert!((cfg.game.small_blind - 0.5).abs() < f64::EPSILON);
         assert!((cfg.game.big_blind - 1.0).abs() < f64::EPSILON);
+        // rake defaults to 0.0 when omitted
+        assert!((cfg.game.rake_rate).abs() < f64::EPSILON);
+        assert!((cfg.game.rake_cap).abs() < f64::EPSILON);
 
         // Clustering
         assert!(matches!(
@@ -261,10 +274,13 @@ snapshots:
     fn test_serialize_round_trip() {
         let original = BlueprintV2Config {
             game: GameConfig {
+                name: "Round Trip Test".to_string(),
                 players: 2,
                 stack_depth: 50.0,
                 small_blind: 0.5,
                 big_blind: 1.0,
+                rake_rate: 0.045,
+                rake_cap: 3.0,
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
@@ -308,8 +324,11 @@ snapshots:
             serde_yaml::from_str(&yaml).expect("failed to deserialize round-tripped YAML");
 
         // Game
+        assert_eq!(restored.game.name, "Round Trip Test");
         assert_eq!(restored.game.players, original.game.players);
         assert!((restored.game.stack_depth - original.game.stack_depth).abs() < f64::EPSILON);
+        assert!((restored.game.rake_rate - 0.045).abs() < f64::EPSILON);
+        assert!((restored.game.rake_cap - 3.0).abs() < f64::EPSILON);
 
         // Clustering
         assert_eq!(restored.clustering.seed, 123);
@@ -329,5 +348,56 @@ snapshots:
         // Snapshots
         assert_eq!(restored.snapshots.warmup_minutes, 120);
         assert_eq!(restored.snapshots.output_dir, "/data/snapshots");
+    }
+
+    #[test]
+    fn test_deserialize_with_rake() {
+        let yaml = r#"
+game:
+  name: "Raked Game"
+  players: 2
+  stack_depth: 100.0
+  small_blind: 0.5
+  big_blind: 1.0
+  rake_rate: 0.05
+  rake_cap: 3.0
+
+clustering:
+  algorithm: potential_aware_emd
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+
+action_abstraction:
+  preflop:
+    - ["2.5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+
+training:
+  cluster_path: "/tmp/clusters"
+  iterations: 100
+
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse raked config");
+
+        assert_eq!(cfg.game.name, "Raked Game");
+        assert!((cfg.game.rake_rate - 0.05).abs() < f64::EPSILON);
+        assert!((cfg.game.rake_cap - 3.0).abs() < f64::EPSILON);
     }
 }

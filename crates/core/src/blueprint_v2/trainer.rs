@@ -408,16 +408,21 @@ impl BlueprintTrainer {
             // Pre-seed thread RNGs to avoid OS entropy syscalls in par_iter.
             let thread_seeds: Vec<u64> = (0..deals.len()).map(|_| self.rng.random()).collect();
 
+            let rake_rate = self.config.game.rake_rate;
+            let rake_cap = self.config.game.rake_cap;
+
             let batch_prune_stats: PruneStats = deals.par_iter().enumerate().map(|(i, deal)| {
                 let mut rng = SmallRng::seed_from_u64(thread_seeds[i]);
                 let mut stats = PruneStats::default();
 
                 let (ev0, s0) = traverse_external(
                     tree, storage, deal, 0, tree.root, prune, threshold, &mut rng,
+                    rake_rate, rake_cap,
                 );
                 stats.merge(s0);
                 let (ev1, s1) = traverse_external(
                     tree, storage, deal, 1, tree.root, prune, threshold, &mut rng,
+                    rake_rate, rake_cap,
                 );
                 stats.merge(s1);
 
@@ -906,10 +911,13 @@ mod tests {
     fn toy_config() -> BlueprintV2Config {
         BlueprintV2Config {
             game: GameConfig {
+                name: "Test".to_string(),
                 players: 2,
                 stack_depth: 10.0,
                 small_blind: 0.5,
                 big_blind: 1.0,
+                rake_rate: 0.0,
+                rake_cap: 0.0,
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
