@@ -19,7 +19,72 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use rs_poker::core::{Card, Suit, Value};
+
 use super::Street;
+
+// ---------------------------------------------------------------------------
+// PackedBoard — compact hashable board key
+// ---------------------------------------------------------------------------
+
+/// Compact canonical board representation for hashing and serialization.
+///
+/// Each card occupies 8 bits: `(value_rank << 2) | (suit as u8)`, packed
+/// left-to-right from the most-significant byte. Up to 5 cards fit in 40 of
+/// the 64 available bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PackedBoard(pub u64);
+
+impl PackedBoard {
+    /// Pack a slice of canonical cards into a `u64`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cards.len() > 5`.
+    #[must_use]
+    pub fn from_cards(cards: &[Card]) -> Self {
+        assert!(cards.len() <= 5, "PackedBoard supports at most 5 cards");
+        let mut packed: u64 = 0;
+        for (i, card) in cards.iter().enumerate() {
+            let byte = encode_card(*card);
+            packed |= u64::from(byte) << (56 - i * 8);
+        }
+        Self(packed)
+    }
+
+    /// Unpack back to a vector of cards.
+    #[must_use]
+    pub fn to_cards(self, num_cards: usize) -> Vec<Card> {
+        (0..num_cards)
+            .map(|i| {
+                #[allow(clippy::cast_possible_truncation)]
+                let byte = (self.0 >> (56 - i * 8)) as u8;
+                decode_card(byte)
+            })
+            .collect()
+    }
+}
+
+/// Encode a single card as an 8-bit value: `(value_rank << 2) | suit_index`.
+fn encode_card(card: Card) -> u8 {
+    let value_rank = crate::card_utils::value_rank(card.value);
+    let suit_idx = card.suit as u8;
+    (value_rank << 2) | suit_idx
+}
+
+/// Decode an 8-bit packed card back into `Card`.
+fn decode_card(byte: u8) -> Card {
+    let rank = byte >> 2;
+    let suit_idx = byte & 0x03;
+    // value_rank maps Two→2 … Ace→14, so discriminant = rank - 2.
+    let value = Value::from(rank - 2);
+    let suit = Suit::from(suit_idx);
+    Card::new(value, suit)
+}
+
+// ---------------------------------------------------------------------------
+// BucketFile — binary bucket storage
+// ---------------------------------------------------------------------------
 
 const MAGIC: [u8; 4] = *b"BKT2";
 const VERSION: u8 = 1;
@@ -168,6 +233,7 @@ impl BucketFile {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use rs_poker::core::{Card, Suit, Value};
 
     /// Helper: create a bucket file with deterministic data.
     fn make_test_file(boards: u32, combos: u16, buckets_k: u16) -> BucketFile {
@@ -248,5 +314,64 @@ mod tests {
             err.to_string().contains("bad magic"),
             "unexpected error message: {err}"
         );
+    }
+
+    // -- PackedBoard tests --------------------------------------------------
+
+    #[test]
+    fn packed_board_round_trip_flop() {
+        let cards = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::Queen, Suit::Heart),
+        ];
+        let packed = PackedBoard::from_cards(&cards);
+        let recovered = packed.to_cards(3);
+        assert_eq!(recovered, cards.to_vec());
+    }
+
+    #[test]
+    fn packed_board_round_trip_river() {
+        let cards = [
+            Card::new(Value::Two, Suit::Club),
+            Card::new(Value::Five, Suit::Diamond),
+            Card::new(Value::Ten, Suit::Heart),
+            Card::new(Value::Jack, Suit::Spade),
+            Card::new(Value::Ace, Suit::Spade),
+        ];
+        let packed = PackedBoard::from_cards(&cards);
+        let recovered = packed.to_cards(5);
+        assert_eq!(recovered, cards.to_vec());
+    }
+
+    #[test]
+    fn packed_board_hash_eq() {
+        use std::collections::HashMap;
+        let cards = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Diamond),
+        ];
+        let p1 = PackedBoard::from_cards(&cards);
+        let p2 = PackedBoard::from_cards(&cards);
+        assert_eq!(p1, p2);
+        let mut map = HashMap::new();
+        map.insert(p1, 42_u32);
+        assert_eq!(map[&p2], 42);
+    }
+
+    #[test]
+    fn packed_board_different_boards_different_keys() {
+        let a = PackedBoard::from_cards(&[
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::Queen, Suit::Spade),
+        ]);
+        let b = PackedBoard::from_cards(&[
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::Jack, Suit::Spade),
+        ]);
+        assert_ne!(a, b);
     }
 }
