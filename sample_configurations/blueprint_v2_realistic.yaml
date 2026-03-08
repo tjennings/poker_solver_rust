@@ -1,5 +1,6 @@
 # Blueprint V2 Realistic Config — 100BB, 200 buckets, multi-hour training
 game:
+  name: "HU 100BB Realistic"
   players: 2
   stack_depth: 100.0
   small_blind: 0.5

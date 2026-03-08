@@ -9,10 +9,13 @@ use poker_solver_core::blueprint_v2::trainer::BlueprintTrainer;
 fn toy_config() -> BlueprintV2Config {
     BlueprintV2Config {
         game: GameConfig {
+            name: "Test".to_string(),
             players: 2,
             stack_depth: 10.0,
             small_blind: 0.5,
             big_blind: 1.0,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         },
         clustering: ClusteringConfig {
             algorithm: ClusteringAlgorithm::PotentialAwareEmd,
