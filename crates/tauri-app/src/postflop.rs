@@ -977,17 +977,14 @@ mod tests {
         let info = action_to_info(&Action::Fold, 0, 100);
         assert_eq!(info.label, "Fold");
         assert_eq!(info.action_type, "fold");
-        assert!(info.amount.is_none());
 
         let info = action_to_info(&Action::Bet(50), 1, 100);
         assert_eq!(info.label, "Bet 50%");
         assert_eq!(info.action_type, "bet");
-        assert_eq!(info.amount, Some(50));
 
         let info = action_to_info(&Action::AllIn(200), 2, 100);
         assert_eq!(info.label, "All-in 200");
         assert_eq!(info.action_type, "allin");
-        assert_eq!(info.amount, Some(200));
     }
 
     #[test]
@@ -1260,8 +1257,9 @@ mod tests {
         let action_idx = matrix
             .actions
             .iter()
-            .find(|a| a.action_type != "fold")
-            .map(|a| a.index)
+            .enumerate()
+            .find(|(_, a)| a.action_type != "fold")
+            .map(|(i, _)| i)
             .expect("should have at least one non-fold action");
 
         let result = postflop_close_street_core(&state, vec![action_idx]).unwrap();
