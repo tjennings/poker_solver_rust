@@ -468,6 +468,107 @@ pub fn kmeans_emd_weighted(
 }
 
 // ---------------------------------------------------------------------------
+// Weighted EMD k-means for u8 count histograms
+// ---------------------------------------------------------------------------
+
+/// Weighted k-means using EMD on u8 count histograms.
+///
+/// Data points are unnormalized `u8` integer counts (e.g. how many
+/// next-street cards landed in each equity bucket). Centroids are `f64`
+/// probability vectors. This reduces per-histogram storage from 8 bytes
+/// (f64) to 1 byte (u8) per bin -- an 8x memory reduction.
+///
+/// Numerically equivalent to [`kmeans_emd_weighted`] on the corresponding
+/// normalized distributions.
+///
+/// # Panics
+/// Panics if `data` is empty, `k` is zero, or `data.len() != weights.len()`.
+#[allow(clippy::cast_possible_truncation)]
+pub fn kmeans_emd_weighted_u8(
+    data: &[Vec<u8>],
+    weights: &[f64],
+    k: usize,
+    max_iterations: u32,
+    seed: u64,
+    progress: impl Fn(u32, u32),
+) -> Vec<u16> {
+    assert_eq!(data.len(), weights.len());
+    assert!(!data.is_empty(), "data must not be empty");
+    assert!(k > 0, "k must be positive");
+
+    let n = data.len();
+    if k >= n {
+        return (0..n).map(|i| i as u16).collect();
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let mut centroids = kmeanspp_init_u8(data, k, &mut rng);
+
+    let mut assignments = vec![0_u16; n];
+
+    for iter in 0..max_iterations {
+        progress(iter, max_iterations);
+
+        // -- Assignment step (parallel) ----------------------------------------
+        let new_assignments: Vec<u16> = data
+            .par_iter()
+            .map(|point| nearest_centroid_u8(point, &centroids))
+            .collect();
+
+        let changed = assignments
+            .iter()
+            .zip(new_assignments.iter())
+            .any(|(old, new)| old != new);
+        assignments = new_assignments;
+
+        if !changed {
+            break;
+        }
+
+        // -- Weighted update step ----------------------------------------------
+        for c in &mut centroids {
+            c.fill(0.0);
+        }
+        let mut weight_sums = vec![0.0_f64; k];
+
+        for (i, point) in data.iter().enumerate() {
+            let ci = assignments[i] as usize;
+            let w = weights[i];
+            let total: f64 = point.iter().map(|&c| f64::from(c)).sum();
+            let inv = if total > 0.0 { 1.0 / total } else { 0.0 };
+            weight_sums[ci] += w;
+            for (j, &val) in point.iter().enumerate() {
+                centroids[ci][j] += f64::from(val) * inv * w;
+            }
+        }
+
+        // Average and handle empty clusters.
+        for ci in 0..k {
+            if weight_sums[ci] <= 0.0 {
+                let farthest = farthest_point_u8(data, &assignments, &centroids);
+                centroids[ci] = normalize_u8(&data[farthest]);
+                assignments[farthest] = ci as u16;
+            } else {
+                let inv = 1.0 / weight_sums[ci];
+                for v in &mut centroids[ci] {
+                    *v *= inv;
+                }
+            }
+        }
+    }
+
+    // Final assignment pass (parallel).
+    data.par_iter()
+        .zip(assignments.par_iter_mut())
+        .for_each(|(point, assign)| {
+            *assign = nearest_centroid_u8(point, &centroids);
+        });
+
+    assignments
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -580,6 +681,91 @@ fn farthest_point(data: &[Vec<f64>], assignments: &[u16], centroids: &[Vec<f64>]
         }
     }
     best_idx
+}
+
+/// Normalize a u8 count histogram to a f64 probability distribution.
+fn normalize_u8(counts: &[u8]) -> Vec<f64> {
+    let total: f64 = counts.iter().map(|&c| f64::from(c)).sum();
+    let inv = if total > 0.0 { 1.0 / total } else { 0.0 };
+    counts.iter().map(|&c| f64::from(c) * inv).collect()
+}
+
+/// Index of the nearest centroid to a u8 histogram `point` by EMD.
+#[allow(clippy::cast_possible_truncation)]
+fn nearest_centroid_u8(point: &[u8], centroids: &[Vec<f64>]) -> u16 {
+    let mut best_idx = 0_u16;
+    let mut best_dist = f64::MAX;
+    for (ci, centroid) in centroids.iter().enumerate() {
+        let d = emd_u8_vs_f64(point, centroid);
+        if d < best_dist {
+            best_dist = d;
+            best_idx = ci as u16;
+        }
+    }
+    best_idx
+}
+
+/// Find the u8 data point with the largest EMD distance to its assigned
+/// centroid. Used to re-seed empty clusters.
+fn farthest_point_u8(data: &[Vec<u8>], assignments: &[u16], centroids: &[Vec<f64>]) -> usize {
+    let mut best_idx = 0;
+    let mut best_dist = -1.0_f64;
+    for (i, point) in data.iter().enumerate() {
+        let ci = assignments[i] as usize;
+        let d = emd_u8_vs_f64(point, &centroids[ci]);
+        if d > best_dist {
+            best_dist = d;
+            best_idx = i;
+        }
+    }
+    best_idx
+}
+
+/// K-means++ seeding with EMD distance for u8 count histograms.
+///
+/// Returns f64 centroids (normalized probability distributions).
+#[allow(clippy::cast_possible_truncation)]
+fn kmeanspp_init_u8(data: &[Vec<u8>], k: usize, rng: &mut StdRng) -> Vec<Vec<f64>> {
+    let n = data.len();
+    let mut centroids: Vec<Vec<f64>> = Vec::with_capacity(k);
+
+    let first = rng.random_range(0..n);
+    centroids.push(normalize_u8(&data[first]));
+
+    let mut dists = vec![f64::MAX; n];
+
+    for _ in 1..k {
+        let newest = centroids.last().expect("centroids is non-empty");
+        let mut total = 0.0_f64;
+        for (i, point) in data.iter().enumerate() {
+            let d = emd_u8_vs_f64(point, newest);
+            let d2 = d * d;
+            if d2 < dists[i] {
+                dists[i] = d2;
+            }
+            total += dists[i];
+        }
+
+        if total <= 0.0 {
+            let idx = rng.random_range(0..n);
+            centroids.push(normalize_u8(&data[idx]));
+            continue;
+        }
+
+        let threshold = rng.random::<f64>() * total;
+        let mut cumulative = 0.0_f64;
+        let mut chosen = n - 1;
+        for (i, &d2) in dists.iter().enumerate() {
+            cumulative += d2;
+            if cumulative >= threshold {
+                chosen = i;
+                break;
+            }
+        }
+        centroids.push(normalize_u8(&data[chosen]));
+    }
+
+    centroids
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +906,52 @@ mod tests {
         assert!(assignments[0..50].iter().all(|&a| a == assignments[0]));
         assert!(assignments[50..100].iter().all(|&a| a == assignments[50]));
         assert_ne!(assignments[0], assignments[50]);
+    }
+
+    #[test]
+    fn weighted_emd_u8_separable() {
+        let mut data: Vec<Vec<u8>> = Vec::new();
+        let mut weights: Vec<f64> = Vec::new();
+        for _ in 0..50 {
+            data.push(vec![36, 4, 0, 0]);
+            weights.push(5.0);
+        }
+        for _ in 0..50 {
+            data.push(vec![0, 0, 4, 36]);
+            weights.push(1.0);
+        }
+        let assignments = kmeans_emd_weighted_u8(&data, &weights, 2, 100, 42, |_, _| {});
+        assert!(assignments[0..50].iter().all(|&a| a == assignments[0]));
+        assert!(assignments[50..100].iter().all(|&a| a == assignments[50]));
+        assert_ne!(assignments[0], assignments[50]);
+    }
+
+    #[test]
+    fn emd_u8_kmeans_three_clusters() {
+        let mut data: Vec<Vec<u8>> = Vec::new();
+        let mut weights: Vec<f64> = Vec::new();
+        for _ in 0..30 {
+            data.push(vec![36, 10, 0, 0, 0]);
+            weights.push(1.0);
+        }
+        for _ in 0..30 {
+            data.push(vec![0, 0, 36, 10, 0]);
+            weights.push(1.0);
+        }
+        for _ in 0..30 {
+            data.push(vec![0, 0, 0, 10, 36]);
+            weights.push(1.0);
+        }
+        let assignments = kmeans_emd_weighted_u8(&data, &weights, 3, 100, 42, |_, _| {});
+        let c0 = assignments[0];
+        let c1 = assignments[30];
+        let c2 = assignments[60];
+        assert_ne!(c0, c1);
+        assert_ne!(c1, c2);
+        assert_ne!(c0, c2);
+        assert!(assignments[0..30].iter().all(|&a| a == c0));
+        assert!(assignments[30..60].iter().all(|&a| a == c1));
+        assert!(assignments[60..90].iter().all(|&a| a == c2));
     }
 
     #[test]
