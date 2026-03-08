@@ -29,6 +29,8 @@ pub struct PostflopConfig {
     pub oop_raise_sizes: String,
     pub ip_bet_sizes: String,
     pub ip_raise_sizes: String,
+    pub rake_rate: f64,
+    pub rake_cap: f64,
 }
 
 impl Default for PostflopConfig {
@@ -42,6 +44,8 @@ impl Default for PostflopConfig {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "25%,33%,75%,a".to_string(),
             ip_raise_sizes: "a".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         }
     }
 }
@@ -712,8 +716,8 @@ fn build_game(
         initial_state,
         starting_pot: config.pot,
         effective_stack: config.effective_stack,
-        rake_rate: 0.0,
-        rake_cap: 0.0,
+        rake_rate: config.rake_rate,
+        rake_cap: config.rake_cap,
         flop_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
         turn_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
         river_bet_sizes: [oop_sizes, ip_sizes],
