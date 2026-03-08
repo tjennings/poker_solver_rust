@@ -205,3 +205,8 @@ export interface PostflopPlayResult {
   pot: number;
   stacks: [number, number];
 }
+
+export interface GlobalConfig {
+  blueprint_dir: string;
+  target_exploitability: number;
+}
