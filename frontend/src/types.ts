@@ -149,7 +149,6 @@ export interface PostflopConfig {
   oop_raise_sizes: string;
   ip_bet_sizes: string;
   ip_raise_sizes: string;
-  target_exploitability: number;
 }
 
 export interface PostflopConfigSummary {
