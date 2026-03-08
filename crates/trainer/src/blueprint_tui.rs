@@ -54,8 +54,8 @@ pub struct BlueprintTuiApp {
     min_regret_history: Vec<u64>,
     // Avg positive regret sparkline data (stored as value × 1000 for sparkline)
     avg_pos_regret_history: Vec<u64>,
-    // Current prune fraction (0.0–1.0)
-    prune_fraction: f64,
+    // Prune fraction sparkline data (stored as value × 1000 for sparkline)
+    prune_history: Vec<u64>,
     // Random scenario carousel tracking
     has_random_tab: bool,
 }
@@ -80,7 +80,7 @@ impl BlueprintTuiApp {
             max_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
             min_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
             avg_pos_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
-            prune_fraction: 0.0,
+            prune_history: Vec::with_capacity(SPARKLINE_HISTORY),
             has_random_tab: false,
         }
     }
@@ -192,10 +192,21 @@ impl BlueprintTuiApp {
             hist.clear();
         }
 
-        // Prune fraction
+        // Prune fraction sparkline: read all new values
         {
-            let pf = self.metrics.prune_fraction.lock().unwrap_or_else(|e| e.into_inner());
-            self.prune_fraction = *pf;
+            let mut hist = self
+                .metrics
+                .prune_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for &v in hist.iter() {
+                push_bounded(
+                    &mut self.prune_history,
+                    (v * 1000.0) as u64,
+                    sparkline_max,
+                );
+            }
+            hist.clear();
         }
 
         // Strategy grid refresh from trainer
@@ -288,7 +299,7 @@ impl BlueprintTuiApp {
                 Constraint::Length(3),  // Max positive regret sparkline
                 Constraint::Length(3),  // Max negative regret sparkline
                 Constraint::Length(3),  // Avg positive regret sparkline
-                Constraint::Length(1),  // Actions pruned bar
+                Constraint::Length(3),  // Traversals pruned sparkline
                 Constraint::Length(1),  // Spacer
                 Constraint::Min(0),    // Strategy grids
                 Constraint::Length(1),  // Hotkeys footer
@@ -304,7 +315,7 @@ impl BlueprintTuiApp {
         self.render_max_regret(frame, chunks[6]);
         self.render_min_regret(frame, chunks[7]);
         self.render_avg_pos_regret(frame, chunks[8]);
-        self.render_prune_bar(frame, chunks[9]);
+        self.render_prune_sparkline(frame, chunks[9]);
         // chunks[10] is an empty spacer
         self.render_right_panel(frame, chunks[11]);
         self.render_hotkeys(frame, chunks[12]);
@@ -461,13 +472,18 @@ impl BlueprintTuiApp {
         frame.render_widget(sparkline, area);
     }
 
-    fn render_prune_bar(&self, frame: &mut Frame, area: Rect) {
-        let pct = self.prune_fraction * 100.0;
-        let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(Color::Magenta))
-            .ratio(self.prune_fraction.clamp(0.0, 1.0))
-            .label(format!("Traversal pruned: {pct:.1}%"));
-        frame.render_widget(gauge, area);
+    fn render_prune_sparkline(&self, frame: &mut Frame, area: Rect) {
+        let latest = self
+            .prune_history
+            .last()
+            .map(|&v| v as f64 / 10.0)
+            .unwrap_or(0.0);
+        let title = format!("Traversals pruned: {latest:.1}%");
+        let sparkline = Sparkline::default()
+            .block(Block::default().title(title).borders(Borders::NONE))
+            .data(&self.prune_history)
+            .style(Style::default().fg(Color::Magenta));
+        frame.render_widget(sparkline, area);
     }
 
     fn render_hotkeys(&self, frame: &mut Frame, area: Rect) {

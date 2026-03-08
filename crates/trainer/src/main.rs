@@ -601,7 +601,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 let metrics_for_prune = Arc::clone(&metrics);
                 trainer.on_prune_fraction = Some(Box::new(move |frac| {
-                    metrics_for_prune.set_prune_fraction(frac);
+                    metrics_for_prune.push_prune_fraction(frac);
                 }));
 
                 // Random scenario carousel.

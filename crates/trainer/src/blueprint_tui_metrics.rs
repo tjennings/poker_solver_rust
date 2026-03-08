@@ -51,7 +51,7 @@ pub struct BlueprintTuiMetrics {
     pub min_regret_history: Mutex<Vec<f64>>,
     pub max_regret_history: Mutex<Vec<f64>>,
     pub avg_pos_regret_history: Mutex<Vec<f64>>,
-    pub prune_fraction: Mutex<f64>,
+    pub prune_history: Mutex<Vec<f64>>,
 }
 
 impl BlueprintTuiMetrics {
@@ -88,7 +88,7 @@ impl BlueprintTuiMetrics {
             min_regret_history: Mutex::new(Vec::new()),
             max_regret_history: Mutex::new(Vec::new()),
             avg_pos_regret_history: Mutex::new(Vec::new()),
-            prune_fraction: Mutex::new(0.0),
+            prune_history: Mutex::new(Vec::new()),
         }
     }
 
@@ -154,10 +154,10 @@ impl BlueprintTuiMetrics {
         hist.push(delta);
     }
 
-    /// Update the current prune fraction (0.0–1.0).
-    pub fn set_prune_fraction(&self, frac: f64) {
-        let mut pf = self.prune_fraction.lock().unwrap_or_else(|e| e.into_inner());
-        *pf = frac;
+    /// Push a prune fraction sample into the sparkline history.
+    pub fn push_prune_fraction(&self, frac: f64) {
+        let mut hist = self.prune_history.lock().unwrap_or_else(|e| e.into_inner());
+        hist.push(frac);
     }
 
     /// Push a min-regret sample into the sparkline history.
