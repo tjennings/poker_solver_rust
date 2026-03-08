@@ -174,37 +174,6 @@ pub(crate) fn max_fma_slices_uninit<'a>(
 }
 
 #[inline]
-pub(crate) fn inner_product(src1: &[f32], src2: &[f32]) -> f32 {
-    const CHUNK_SIZE: usize = 8;
-
-    let len = src1.len();
-    let len_chunk = len / CHUNK_SIZE * CHUNK_SIZE;
-    let mut acc = [0.0f64; CHUNK_SIZE];
-
-    for i in (0..len_chunk).step_by(CHUNK_SIZE) {
-        for j in 0..CHUNK_SIZE {
-            // SAFETY: `i + j < len_chunk <= len`, so the index is in bounds.
-            unsafe {
-                let x = *src1.get_unchecked(i + j);
-                let y = *src2.get_unchecked(i + j);
-                *acc.get_unchecked_mut(j) += (x * y) as f64;
-            }
-        }
-    }
-
-    for i in len_chunk..len {
-        // SAFETY: `i < len`, so the index is in bounds.
-        unsafe {
-            let x = *src1.get_unchecked(i);
-            let y = *src2.get_unchecked(i);
-            *acc.get_unchecked_mut(0) += (x * y) as f64;
-        }
-    }
-
-    acc.iter().sum::<f64>() as f32
-}
-
-#[inline]
 pub(crate) fn row<T>(slice: &[T], index: usize, row_size: usize) -> &[T] {
     &slice[index * row_size..(index + 1) * row_size]
 }
@@ -279,14 +248,6 @@ mod tests {
         let mut dst = vec![MaybeUninit::uninit(); 2];
         let result = fma_slices_uninit(&mut dst, &strategy, &cfv);
         assert_eq!(result, &[20.0, 30.0]);
-    }
-
-    #[test]
-    fn test_inner_product() {
-        let a = vec![1.0, 2.0, 3.0];
-        let b = vec![4.0, 5.0, 6.0];
-        let result = inner_product(&a, &b);
-        assert!((result - 32.0).abs() < 1e-6);
     }
 
     #[test]

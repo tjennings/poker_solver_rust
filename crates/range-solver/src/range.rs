@@ -1,7 +1,7 @@
 use crate::card::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use std::fmt::Write;
+use std::fmt::{self, Write};
 use std::str::FromStr;
 
 /// A struct representing a player's range.
@@ -422,27 +422,6 @@ impl Range {
         self.data.iter().all(|el| (0.0..=1.0).contains(el))
     }
 
-    /// Returns whether all suits are symmetric.
-    pub(crate) fn is_suit_symmetric(&self) -> bool {
-        for rank1 in 0..13 {
-            if !self.is_same_weight(&pair_indices(rank1)) {
-                return false;
-            }
-
-            for rank2 in rank1 + 1..13 {
-                if !self.is_same_weight(&suited_indices(rank1, rank2)) {
-                    return false;
-                }
-
-                if !self.is_same_weight(&offsuit_indices(rank1, rank2)) {
-                    return false;
-                }
-            }
-        }
-
-        true
-    }
-
     /// Returns whether the two suits are isomorphic.
     pub(crate) fn is_suit_isomorphic(&self, suit1: u8, suit2: u8) -> bool {
         let replace_suit = |suit| {
@@ -777,14 +756,14 @@ impl FromStr for Range {
     }
 }
 
-impl ToString for Range {
+impl fmt::Display for Range {
     #[inline]
-    fn to_string(&self) -> String {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut result = Vec::new();
         self.pairs_strings(&mut result);
         self.nonpairs_strings(&mut result);
         self.suit_specified_strings(&mut result);
-        result.join(",")
+        write!(f, "{}", result.join(","))
     }
 }
 

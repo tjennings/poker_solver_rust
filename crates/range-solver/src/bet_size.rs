@@ -7,7 +7,7 @@
 /// - x: Multiple of the previous bet. Valid for only raises. (e.g., "2.5x")
 /// - c: Constant value. Must be an integer. (e.g., "100c")
 /// - c + r: Constant value with raise cap (for FLHE). Both values must be integers.
-///          Valid only for raises. (e.g., "20c3r")
+///   Valid only for raises. (e.g., "20c3r")
 /// - e: Geometric size.
 ///   - e: Same as "3e" for the flop, "2e" for the turn, and "1e" (equivalent to "a") for the river.
 ///   - Xe: The geometric size with X streets remaining. X must be a positive integer. (e.g., "2e")
