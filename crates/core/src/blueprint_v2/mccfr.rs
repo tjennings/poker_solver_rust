@@ -15,14 +15,31 @@
 )]
 
 use std::cmp::Ordering;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::AtomicU64;
 
 use rand::Rng;
 
 /// Global diagnostic counters for prune-hit measurement.
-/// Reset and read by the trainer between batches.
+/// Updated once per batch (not per action) and read by the trainer for TUI.
 pub static PRUNE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static PRUNE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Prune statistics accumulated during a single traversal.
+///
+/// Collected locally to avoid global atomic contention, then merged
+/// into the global counters after the batch completes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PruneStats {
+    pub hits: u64,
+    pub total: u64,
+}
+
+impl PruneStats {
+    pub fn merge(&mut self, other: PruneStats) {
+        self.hits += other.hits;
+        self.total += other.total;
+    }
+}
 
 use super::bucket_file::BucketFile;
 use super::game_tree::{GameNode, GameTree, TerminalKind};
@@ -156,10 +173,10 @@ pub fn traverse_external(
     prune: bool,
     prune_threshold: i32,
     rng: &mut impl Rng,
-) -> f64 {
+) -> (f64, PruneStats) {
     match &tree.nodes[node_idx as usize] {
         GameNode::Terminal { kind, invested, .. } => {
-            terminal_value(*kind, invested, traverser, &deal.deal)
+            (terminal_value(*kind, invested, traverser, &deal.deal), PruneStats::default())
         }
 
         GameNode::Chance { child, .. } => {
@@ -258,7 +275,7 @@ fn traverse_traverser(
     prune: bool,
     prune_threshold: i32,
     rng: &mut impl Rng,
-) -> f64 {
+) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
     storage.current_strategy_into(node_idx, bucket, &mut strategy_buf[..num_actions]);
@@ -267,20 +284,23 @@ fn traverse_traverser(
     let mut action_values_buf = [0.0f64; MAX_ACTIONS];
     let action_values = &mut action_values_buf[..num_actions];
     let mut node_value = 0.0f64;
+    let mut stats = PruneStats::default();
 
     for (a, &child_idx) in children.iter().enumerate() {
         if prune {
-            PRUNE_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            stats.total += 1;
             if storage.get_regret(node_idx, bucket, a) < prune_threshold {
-                PRUNE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+                stats.hits += 1;
                 continue;
             }
         }
 
-        action_values[a] = traverse_external(
+        let (child_ev, child_stats) = traverse_external(
             tree, storage, deal, traverser, child_idx, prune, prune_threshold, rng,
         );
-        node_value += strategy[a] * action_values[a];
+        action_values[a] = child_ev;
+        node_value += strategy[a] * child_ev;
+        stats.merge(child_stats);
     }
 
     // Update regrets: delta = action_value - node_value, scaled to
@@ -295,7 +315,7 @@ fn traverse_traverser(
         storage.add_strategy_sum(node_idx, bucket, a, (strategy[a] * 1000.0) as i64);
     }
 
-    node_value
+    (node_value, stats)
 }
 
 /// Opponent's decision node: sample one action according to the
@@ -313,7 +333,7 @@ fn traverse_opponent(
     prune: bool,
     prune_threshold: i32,
     rng: &mut impl Rng,
-) -> f64 {
+) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
     storage.current_strategy_into(node_idx, bucket, &mut strategy_buf[..num_actions]);
@@ -406,7 +426,7 @@ mod tests {
         let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
-        let ev = traverse_external(
+        let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
         );
         assert!(ev.is_finite(), "EV should be finite, got {ev}");
@@ -423,10 +443,10 @@ mod tests {
         let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
-        let ev0 = traverse_external(
+        let (ev0, _) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
         );
-        let ev1 = traverse_external(
+        let (ev1, _) = traverse_external(
             &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
         );
 
@@ -447,7 +467,7 @@ mod tests {
 
         assert!(storage.regrets.iter().all(|r| r.load(Ordering::Relaxed) == 0));
 
-        traverse_external(
+        let (_ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
         );
 
@@ -468,7 +488,7 @@ mod tests {
         let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
-        traverse_external(
+        let (_ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
         );
 
@@ -491,10 +511,10 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         for _ in 0..50 {
-            traverse_external(
+            let _ = traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
             );
-            traverse_external(
+            let _ = traverse_external(
                 &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
             );
         }
@@ -531,7 +551,7 @@ mod tests {
             r.store(-400_000_000, Ordering::Relaxed);
         }
 
-        let ev = traverse_external(
+        let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, true, -310_000_000, &mut rng,
         );
         assert!(ev.is_finite());

@@ -26,7 +26,7 @@ use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
 use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
-use super::mccfr::{traverse_external, AllBuckets, Deal, DealWithBuckets, PRUNE_HITS, PRUNE_TOTAL};
+use super::mccfr::{traverse_external, AllBuckets, Deal, DealWithBuckets, PruneStats, PRUNE_HITS, PRUNE_TOTAL};
 use super::storage::BlueprintStorage;
 use crate::hands::CanonicalHand;
 use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
@@ -407,15 +407,18 @@ impl BlueprintTrainer {
             // Pre-seed thread RNGs to avoid OS entropy syscalls in par_iter.
             let thread_seeds: Vec<u64> = (0..deals.len()).map(|_| self.rng.random()).collect();
 
-            deals.par_iter().enumerate().for_each(|(i, deal)| {
+            let batch_prune_stats: PruneStats = deals.par_iter().enumerate().map(|(i, deal)| {
                 let mut rng = SmallRng::seed_from_u64(thread_seeds[i]);
+                let mut stats = PruneStats::default();
 
-                let ev0 = traverse_external(
+                let (ev0, s0) = traverse_external(
                     tree, storage, deal, 0, tree.root, prune, threshold, &mut rng,
                 );
-                let ev1 = traverse_external(
+                stats.merge(s0);
+                let (ev1, s1) = traverse_external(
                     tree, storage, deal, 1, tree.root, prune, threshold, &mut rng,
                 );
+                stats.merge(s1);
 
                 // Accumulate EV per canonical preflop hand.
                 let idx0 = CanonicalHand::from_cards(
@@ -430,7 +433,13 @@ impl BlueprintTrainer {
                 ev_count[idx0].fetch_add(1, Ordering::Relaxed);
                 ev_sum[idx1].fetch_add((ev1 * 1000.0) as i64, Ordering::Relaxed);
                 ev_count[idx1].fetch_add(1, Ordering::Relaxed);
-            });
+
+                stats
+            }).reduce(PruneStats::default, |mut a, b| { a.merge(b); a });
+
+            // Single atomic update for the whole batch.
+            PRUNE_HITS.fetch_add(batch_prune_stats.hits, Ordering::Relaxed);
+            PRUNE_TOTAL.fetch_add(batch_prune_stats.total, Ordering::Relaxed);
 
             // 3. Sequential: update counters and check timed actions.
             self.iterations += this_batch;
