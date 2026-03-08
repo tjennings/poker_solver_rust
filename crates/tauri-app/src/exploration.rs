@@ -628,12 +628,21 @@ pub fn list_blueprints_core(dir: String) -> Result<Vec<BlueprintListEntry>, Stri
 }
 
 /// Try to interpret `dir` as a blueprint directory.
-/// Returns `Some(BlueprintListEntry)` if `config.yaml` exists and parses successfully.
+/// Returns `Some(BlueprintListEntry)` if `config.yaml` exists.
+/// If config parsing fails, the entry is still created with defaults so
+/// the user can see it in the picker (with stack_depth = 0).
 fn try_make_blueprint_entry(dir: &Path) -> Option<BlueprintListEntry> {
     if !dir.join("config.yaml").exists() {
         return None;
     }
-    let config = v2_bundle::load_config(dir).ok()?;
+
+    let stack_depth = match v2_bundle::load_config(dir) {
+        Ok(config) => config.game.stack_depth,
+        Err(e) => {
+            eprintln!("Warning: failed to parse config in {}: {e}", dir.display());
+            0.0
+        }
+    };
 
     let name = dir
         .file_name()
@@ -657,7 +666,7 @@ fn try_make_blueprint_entry(dir: &Path) -> Option<BlueprintListEntry> {
     Some(BlueprintListEntry {
         name,
         path: dir.to_string_lossy().to_string(),
-        stack_depth: config.game.stack_depth,
+        stack_depth,
         has_strategy,
     })
 }
