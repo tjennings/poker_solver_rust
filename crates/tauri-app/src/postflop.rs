@@ -778,11 +778,13 @@ fn postflop_solve_street_impl(
     *state.solve_start.write() = Some(std::time::Instant::now());
     state.solving.store(true, Ordering::Release);
 
-    // Take initial matrix snapshot.
+    // Take initial matrix snapshot and store game in shared state so
+    // navigation commands can access it during solving.
     {
         let matrix = build_strategy_matrix(&mut game);
         *state.matrix_snapshot.write() = Some(matrix);
     }
+    *state.game.lock() = Some(game);
 
     // Clone the Arc for the background thread.
     let shared = Arc::clone(state);
@@ -792,24 +794,32 @@ fn postflop_solve_street_impl(
         let mut last_exp = f32::MAX;
 
         for t in 0..max_iters {
-            // Check if we've been asked to stop (e.g. config reset clears `solving`).
             if !shared.solving.load(Ordering::Relaxed) {
                 break;
             }
 
-            solve_step(&game, t);
-            shared.current_iteration.store(t + 1, Ordering::Relaxed);
+            // Lock game for solve_step + exploitability. solve_step traverses
+            // from root regardless of the game's current query position, so
+            // user navigation between iterations doesn't interfere.
+            {
+                let game_guard = shared.game.lock();
+                let game = game_guard.as_ref().unwrap();
+                solve_step(game, t);
+                last_exp = compute_exploitability(game);
+            }
+            // Lock released — navigation commands can run here.
 
-            // Compute exploitability every iteration for progress display.
-            last_exp = compute_exploitability(&game);
+            shared.current_iteration.store(t + 1, Ordering::Relaxed);
             shared
                 .exploitability_bits
                 .store(last_exp.to_bits(), Ordering::Relaxed);
 
-            // Capture snapshot data quickly, build matrix on a background thread
-            // so the solver can continue immediately.
+            // Capture snapshot at the game's current position (which the user
+            // may have changed via navigation). Build matrix on another thread.
             {
-                let snap = capture_matrix_snapshot(&mut game);
+                let mut game_guard = shared.game.lock();
+                let game = game_guard.as_mut().unwrap();
+                let snap = capture_matrix_snapshot(game);
                 let shared2 = Arc::clone(&shared);
                 std::thread::spawn(move || {
                     let matrix = build_matrix_from_snapshot(snap);
@@ -825,11 +835,11 @@ fn postflop_solve_street_impl(
         let final_iters = shared.current_iteration.load(Ordering::Relaxed);
 
         // Finalize: compute EV / normalize strategy.
-        finalize(&mut game);
-
-        // Final matrix snapshot.
         {
-            let matrix = build_strategy_matrix(&mut game);
+            let mut game_guard = shared.game.lock();
+            let game = game_guard.as_mut().unwrap();
+            finalize(game);
+            let matrix = build_strategy_matrix(game);
             *shared.matrix_snapshot.write() = Some(matrix);
         }
 
@@ -839,13 +849,13 @@ fn postflop_solve_street_impl(
             let _ = std::fs::create_dir_all(&spots_dir);
             let key = compute_cache_key(&config, &board, &prior_actions);
             let cache_path = spots_dir.join(format!("{key:016x}.bin"));
-            if let Err(e) = write_cache_file(&cache_path, &game, last_exp, final_iters) {
+            let game_guard = shared.game.lock();
+            let game = game_guard.as_ref().unwrap();
+            if let Err(e) = write_cache_file(&cache_path, game, last_exp, final_iters) {
                 eprintln!("Failed to write solve cache: {e}");
             }
         }
 
-        // Store the solved game so other commands can navigate it.
-        *shared.game.lock() = Some(game);
         shared.solve_complete.store(true, Ordering::Relaxed);
         shared.solving.store(false, Ordering::Release);
     });
@@ -964,11 +974,14 @@ pub fn postflop_play_action_core(
 }
 
 #[tauri::command]
-pub fn postflop_play_action(
+pub async fn postflop_play_action(
     state: tauri::State<'_, Arc<PostflopState>>,
     action: usize,
 ) -> Result<PostflopPlayResult, String> {
-    postflop_play_action_core(&state, action)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || postflop_play_action_core(&state, action))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,11 +1040,14 @@ pub fn postflop_navigate_to_core(
 }
 
 #[tauri::command]
-pub fn postflop_navigate_to(
+pub async fn postflop_navigate_to(
     state: tauri::State<'_, Arc<PostflopState>>,
     history: Vec<usize>,
 ) -> Result<PostflopPlayResult, String> {
-    postflop_navigate_to_core(&state, history)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || postflop_navigate_to_core(&state, history))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 // ---------------------------------------------------------------------------

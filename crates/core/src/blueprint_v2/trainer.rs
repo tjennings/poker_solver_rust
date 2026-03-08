@@ -45,6 +45,13 @@ static CANONICAL_DECK: LazyLock<[Card; 52]> = LazyLock::new(|| {
     deck
 });
 
+/// Check whether all 4 bucket files already exist in the given directory.
+pub fn bucket_files_exist(dir: &Path) -> bool {
+    ["river.buckets", "turn.buckets", "flop.buckets", "preflop.buckets"]
+        .iter()
+        .all(|name| dir.join(name).exists())
+}
+
 /// Attempt to load `.buckets` files from the given directory.
 ///
 /// Looks for `preflop.buckets`, `flop.buckets`, `turn.buckets`, and
@@ -188,10 +195,7 @@ impl BlueprintTrainer {
 
         let storage = BlueprintStorage::new(&tree, bucket_counts);
         let bucket_files = load_bucket_files(Path::new(&config.training.cluster_path));
-        let buckets = AllBuckets {
-            bucket_counts,
-            bucket_files,
-        };
+        let buckets = AllBuckets::new(bucket_counts, bucket_files);
         let rng = StdRng::seed_from_u64(config.clustering.seed);
 
         let deck = *CANONICAL_DECK;

@@ -20,17 +20,20 @@
 //! Each street produces a [`BucketFile`] mapping `(board, combo)` to a bucket
 //! index.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
 
-use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
+use crate::abstraction::isomorphism::CanonicalBoard;
+use crate::flops::all_flops;
+use crate::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
 use crate::showdown_equity::compute_equity;
 
-use super::bucket_file::{BucketFile, BucketFileHeader};
-use super::clustering::{kmeans_1d, kmeans_emd_with_progress};
+use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard};
+use super::clustering::{kmeans_1d, kmeans_1d_weighted, kmeans_emd_weighted, kmeans_emd_with_progress};
 use super::config::ClusteringConfig;
 use super::Street;
 
@@ -64,6 +67,7 @@ const TOTAL_COMBOS: u16 = 1326;
 ///
 /// The `progress` callback receives values in `[0.0, 1.0]` as boards are
 /// processed.
+#[allow(dead_code)]
 pub fn cluster_river(
     bucket_count: u16,
     kmeans_iterations: u32,
@@ -80,6 +84,7 @@ pub fn cluster_river(
 }
 
 /// Like [`cluster_river`] but with an explicit board sample count.
+#[allow(dead_code)]
 pub fn cluster_river_with_boards(
     bucket_count: u16,
     kmeans_iterations: u32,
@@ -137,9 +142,10 @@ pub fn cluster_river_with_boards(
         bucket_count,
         board_count: num_boards as u32,
         combos_per_board: TOTAL_COMBOS,
+        version: 2,
     };
 
-    BucketFile { header, buckets }
+    BucketFile { header, boards: Vec::new(), buckets }
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +166,7 @@ pub fn cluster_river_with_boards(
 ///
 /// Returns a `BucketFile` with `street = Turn` and the given `bucket_count`.
 /// Blocked combos (overlapping with the board) receive bucket 0 as a sentinel.
+#[allow(dead_code)]
 pub fn cluster_turn(
     river_buckets: &BucketFile,
     bucket_count: u16,
@@ -178,6 +185,7 @@ pub fn cluster_turn(
 }
 
 /// Like [`cluster_turn`] but with an explicit board sample count.
+#[allow(dead_code)]
 pub fn cluster_turn_with_boards(
     river_buckets: &BucketFile,
     bucket_count: u16,
@@ -253,9 +261,10 @@ pub fn cluster_turn_with_boards(
         bucket_count,
         board_count: num_boards as u32,
         combos_per_board: TOTAL_COMBOS,
+        version: 2,
     };
 
-    BucketFile { header, buckets }
+    BucketFile { header, boards: Vec::new(), buckets }
 }
 
 /// Build a probability distribution over equity bins for the given combo
@@ -330,6 +339,7 @@ fn equity_to_bucket(equity: f64, num_buckets: u16) -> u16 {
 ///
 /// Returns a `BucketFile` with `street = Flop` and the given `bucket_count`.
 /// Blocked combos (overlapping with the board) receive bucket 0 as a sentinel.
+#[allow(dead_code)]
 pub fn cluster_flop(
     turn_buckets: &BucketFile,
     bucket_count: u16,
@@ -348,6 +358,7 @@ pub fn cluster_flop(
 }
 
 /// Like [`cluster_flop`] but with an explicit board sample count.
+#[allow(dead_code)]
 pub fn cluster_flop_with_boards(
     turn_buckets: &BucketFile,
     bucket_count: u16,
@@ -423,13 +434,293 @@ pub fn cluster_flop_with_boards(
         bucket_count,
         board_count: num_boards as u32,
         combos_per_board: TOTAL_COMBOS,
+        version: 2,
     };
 
-    BucketFile { header, buckets }
+    BucketFile { header, boards: Vec::new(), buckets }
 }
 
+// ---------------------------------------------------------------------------
+// Canonical clustering (exhaustive enumeration + weighted k-means)
+// ---------------------------------------------------------------------------
 
+/// Cluster river information situations using exhaustive canonical board
+/// enumeration and weighted 1-D k-means.
+///
+/// Instead of sampling random boards, enumerates all canonical 5-card rivers
+/// (via suit isomorphism), computes showdown equity for every valid combo on
+/// each board, and clusters using [`kmeans_1d_weighted`] where each sample's
+/// weight reflects the number of raw boards that canonical board represents.
+///
+/// Returns a `BucketFile` with `street = River`, `board_count` equal to the
+/// number of canonical rivers, and a populated `boards` field.
+pub fn cluster_river_canonical(
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    _seed: u64,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let boards = enumerate_canonical_rivers();
+    let num_boards = boards.len();
 
+    // Compute equity for each (board, combo) pair in parallel.
+    let board_equities: Vec<Vec<Option<f64>>> = boards
+        .par_iter()
+        .enumerate()
+        .map(|(i, wb)| {
+            let eq = compute_board_equities(wb.cards, &combos);
+            #[allow(clippy::cast_precision_loss)]
+            progress((i + 1) as f64 / num_boards as f64 * 0.8);
+            eq
+        })
+        .collect();
+
+    // Collect valid equities with per-sample weights and positions.
+    let mut all_equities: Vec<f64> = Vec::new();
+    let mut all_weights: Vec<f64> = Vec::new();
+    let mut positions: Vec<(usize, usize)> = Vec::new();
+
+    for (board_idx, (eqs, wb)) in board_equities.iter().zip(boards.iter()).enumerate() {
+        for (combo_idx, eq) in eqs.iter().enumerate() {
+            if let Some(e) = eq {
+                all_equities.push(*e);
+                all_weights.push(f64::from(wb.weight));
+                positions.push((board_idx, combo_idx));
+            }
+        }
+    }
+
+    let cluster_labels = kmeans_1d_weighted(
+        &all_equities,
+        &all_weights,
+        bucket_count as usize,
+        kmeans_iterations,
+    );
+
+    let total = num_boards * TOTAL_COMBOS as usize;
+    let mut buckets = vec![0_u16; total];
+    for (flat_idx, &(board_idx, combo_idx)) in positions.iter().enumerate() {
+        buckets[board_idx * TOTAL_COMBOS as usize + combo_idx] = cluster_labels[flat_idx];
+    }
+
+    let packed_boards: Vec<PackedBoard> = boards
+        .iter()
+        .map(|wb| canonical_key(&wb.cards))
+        .collect();
+
+    #[allow(clippy::cast_possible_truncation)]
+    BucketFile {
+        header: BucketFileHeader {
+            street: Street::River,
+            bucket_count,
+            board_count: num_boards as u32,
+            combos_per_board: TOTAL_COMBOS,
+            version: 2,
+        },
+        boards: packed_boards,
+        buckets,
+    }
+}
+
+/// Cluster turn information situations using exhaustive canonical board
+/// enumeration and weighted EMD k-means.
+///
+/// Enumerates all canonical 4-card (flop+turn) boards, computes a histogram
+/// feature vector over river buckets for every valid combo, and clusters using
+/// [`kmeans_emd_weighted`] with weights reflecting combinatorial multiplicity.
+pub fn cluster_turn_canonical(
+    river_buckets: &BucketFile,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let boards = enumerate_canonical_turns();
+    let num_boards = boards.len();
+    let num_river_buckets = river_buckets.header.bucket_count;
+
+    // For each board, compute a histogram feature vector for every combo.
+    let board_features: Vec<Vec<Option<Vec<f64>>>> = boards
+        .par_iter()
+        .enumerate()
+        .map(|(board_idx, wb)| {
+            let features: Vec<Option<Vec<f64>>> = combos
+                .iter()
+                .map(|combo| {
+                    if cards_overlap(*combo, &wb.cards) {
+                        return None;
+                    }
+                    Some(build_next_street_histogram(
+                        *combo,
+                        &wb.cards,
+                        &deck,
+                        num_river_buckets,
+                    ))
+                })
+                .collect();
+
+            #[allow(clippy::cast_precision_loss)]
+            progress((board_idx + 1) as f64 / num_boards as f64 * 0.8);
+
+            features
+        })
+        .collect();
+
+    // Collect valid feature vectors with weights and positions.
+    let mut all_features: Vec<Vec<f64>> = Vec::new();
+    let mut all_weights: Vec<f64> = Vec::new();
+    let mut feature_positions: Vec<(usize, usize)> = Vec::new();
+
+    for (board_idx, (board_feats, wb)) in
+        board_features.iter().zip(boards.iter()).enumerate()
+    {
+        for (combo_idx, feat) in board_feats.iter().enumerate() {
+            if let Some(histogram) = feat {
+                all_features.push(histogram.clone());
+                all_weights.push(f64::from(wb.weight));
+                feature_positions.push((board_idx, combo_idx));
+            }
+        }
+    }
+
+    let cluster_labels = kmeans_emd_weighted(
+        &all_features,
+        &all_weights,
+        bucket_count as usize,
+        kmeans_iterations,
+        seed,
+        |iter, max_iter| {
+            progress(0.8 + 0.2 * f64::from(iter) / f64::from(max_iter));
+        },
+    );
+
+    let total = num_boards * TOTAL_COMBOS as usize;
+    let mut buckets = vec![0_u16; total];
+    for (flat_idx, &(board_idx, combo_idx)) in feature_positions.iter().enumerate() {
+        buckets[board_idx * TOTAL_COMBOS as usize + combo_idx] = cluster_labels[flat_idx];
+    }
+
+    let packed_boards: Vec<PackedBoard> = boards
+        .iter()
+        .map(|wb| canonical_key(&wb.cards))
+        .collect();
+
+    #[allow(clippy::cast_possible_truncation)]
+    BucketFile {
+        header: BucketFileHeader {
+            street: Street::Turn,
+            bucket_count,
+            board_count: num_boards as u32,
+            combos_per_board: TOTAL_COMBOS,
+            version: 2,
+        },
+        boards: packed_boards,
+        buckets,
+    }
+}
+
+/// Cluster flop information situations using exhaustive canonical board
+/// enumeration and weighted EMD k-means.
+///
+/// Enumerates all 1,755 canonical 3-card flops, computes a histogram feature
+/// vector over turn buckets for every valid combo, and clusters using
+/// [`kmeans_emd_weighted`] with weights reflecting combinatorial multiplicity.
+pub fn cluster_flop_canonical(
+    turn_buckets: &BucketFile,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let boards = enumerate_canonical_flops();
+    let num_boards = boards.len();
+    let num_turn_buckets = turn_buckets.header.bucket_count;
+
+    // For each board, compute a histogram feature vector for every combo.
+    let board_features: Vec<Vec<Option<Vec<f64>>>> = boards
+        .par_iter()
+        .enumerate()
+        .map(|(board_idx, wb)| {
+            let features: Vec<Option<Vec<f64>>> = combos
+                .iter()
+                .map(|combo| {
+                    if cards_overlap(*combo, &wb.cards) {
+                        return None;
+                    }
+                    Some(build_next_street_histogram(
+                        *combo,
+                        &wb.cards,
+                        &deck,
+                        num_turn_buckets,
+                    ))
+                })
+                .collect();
+
+            #[allow(clippy::cast_precision_loss)]
+            progress((board_idx + 1) as f64 / num_boards as f64 * 0.8);
+
+            features
+        })
+        .collect();
+
+    // Collect valid feature vectors with weights and positions.
+    let mut all_features: Vec<Vec<f64>> = Vec::new();
+    let mut all_weights: Vec<f64> = Vec::new();
+    let mut feature_positions: Vec<(usize, usize)> = Vec::new();
+
+    for (board_idx, (board_feats, wb)) in
+        board_features.iter().zip(boards.iter()).enumerate()
+    {
+        for (combo_idx, feat) in board_feats.iter().enumerate() {
+            if let Some(histogram) = feat {
+                all_features.push(histogram.clone());
+                all_weights.push(f64::from(wb.weight));
+                feature_positions.push((board_idx, combo_idx));
+            }
+        }
+    }
+
+    let cluster_labels = kmeans_emd_weighted(
+        &all_features,
+        &all_weights,
+        bucket_count as usize,
+        kmeans_iterations,
+        seed,
+        |iter, max_iter| {
+            progress(0.8 + 0.2 * f64::from(iter) / f64::from(max_iter));
+        },
+    );
+
+    let total = num_boards * TOTAL_COMBOS as usize;
+    let mut buckets = vec![0_u16; total];
+    for (flat_idx, &(board_idx, combo_idx)) in feature_positions.iter().enumerate() {
+        buckets[board_idx * TOTAL_COMBOS as usize + combo_idx] = cluster_labels[flat_idx];
+    }
+
+    let packed_boards: Vec<PackedBoard> = boards
+        .iter()
+        .map(|wb| canonical_key(&wb.cards))
+        .collect();
+
+    #[allow(clippy::cast_possible_truncation)]
+    BucketFile {
+        header: BucketFileHeader {
+            street: Street::Flop,
+            bucket_count,
+            board_count: num_boards as u32,
+            combos_per_board: TOTAL_COMBOS,
+            version: 2,
+        },
+        boards: packed_boards,
+        buckets,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Preflop clustering
@@ -485,10 +776,12 @@ pub fn cluster_preflop_with_boards(
         bucket_count,
         board_count: 1,
         combos_per_board: TOTAL_COMBOS,
+        version: 2,
     };
 
     BucketFile {
         header,
+        boards: Vec::new(),
         buckets: cluster_labels,
     }
 }
@@ -547,9 +840,9 @@ pub fn run_clustering_pipeline(
     output_dir: &Path,
     progress: impl Fn(&str, f64) + Sync,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. River
+    // 1. River (exhaustive canonical enumeration)
     progress("river", 0.0);
-    let river = cluster_river(
+    let river = cluster_river_canonical(
         config.river.buckets,
         config.kmeans_iterations,
         config.seed,
@@ -557,9 +850,9 @@ pub fn run_clustering_pipeline(
     );
     river.save(&output_dir.join("river.buckets"))?;
 
-    // 2. Turn (depends on river)
+    // 2. Turn (exhaustive canonical enumeration, depends on river)
     progress("turn", 0.0);
-    let turn = cluster_turn(
+    let turn = cluster_turn_canonical(
         &river,
         config.turn.buckets,
         config.kmeans_iterations,
@@ -568,9 +861,9 @@ pub fn run_clustering_pipeline(
     );
     turn.save(&output_dir.join("turn.buckets"))?;
 
-    // 3. Flop (depends on turn)
+    // 3. Flop (exhaustive canonical enumeration, depends on turn)
     progress("flop", 0.0);
-    let flop = cluster_flop(
+    let flop = cluster_flop_canonical(
         &turn,
         config.flop.buckets,
         config.kmeans_iterations,
@@ -607,6 +900,143 @@ pub(crate) fn build_deck() -> Vec<Card> {
     deck
 }
 
+// ---------------------------------------------------------------------------
+// Canonical board enumeration
+// ---------------------------------------------------------------------------
+
+/// A board with its combinatorial weight (number of raw boards it represents).
+#[derive(Debug, Clone)]
+pub struct WeightedBoard<const N: usize> {
+    pub cards: [Card; N],
+    pub weight: u32,
+}
+
+/// Pack canonical cards into a deterministic key by sorting first.
+///
+/// `CanonicalBoard::from_cards` preserves input order, so the same canonical
+/// board reached via different input orderings would produce different
+/// `PackedBoard` values. Sorting by `(value_rank desc, suit asc)` before
+/// packing ensures a unique key regardless of input order.
+pub(crate) fn canonical_key(cards: &[Card]) -> PackedBoard {
+    let mut sorted: Vec<Card> = cards.to_vec();
+    sorted.sort_by(|a, b| {
+        use crate::card_utils::value_rank;
+        value_rank(b.value)
+            .cmp(&value_rank(a.value))
+            .then(a.suit.cmp(&b.suit))
+    });
+    PackedBoard::from_cards(&sorted)
+}
+
+/// Enumerate all 1,755 canonical flops with combinatorial weights.
+///
+/// Wraps [`all_flops()`] into `WeightedBoard<3>` form. Total weight equals
+/// C(52,3) = 22,100.
+#[must_use]
+pub fn enumerate_canonical_flops() -> Vec<WeightedBoard<3>> {
+    let flops = all_flops();
+    let mut result: Vec<WeightedBoard<3>> = flops
+        .into_iter()
+        .map(|f| WeightedBoard {
+            cards: *f.cards(),
+            weight: u32::from(f.weight()),
+        })
+        .collect();
+    result.sort_by_key(|wb| canonical_key(&wb.cards).0);
+    result
+}
+
+/// Enumerate all canonical 4-card (flop + turn) boards with weights.
+///
+/// For each canonical flop, appends each of the 49 remaining cards as a turn,
+/// canonicalizes the resulting 4-card board, and deduplicates. Weight equals the
+/// sum of constituent flop weights. Total weight = C(52,3) x 49 = 1,082,900.
+#[must_use]
+pub fn enumerate_canonical_turns() -> Vec<WeightedBoard<4>> {
+    let flops = enumerate_canonical_flops();
+    let deck = build_deck();
+    let mut map: HashMap<PackedBoard, (u32, [Card; 4])> = HashMap::new();
+
+    for flop in &flops {
+        for &card in &deck {
+            if flop.cards.contains(&card) {
+                continue;
+            }
+            let board_vec = vec![
+                flop.cards[0],
+                flop.cards[1],
+                flop.cards[2],
+                card,
+            ];
+            // INVARIANT: 4-card boards are always valid for canonicalization
+            let canonical = CanonicalBoard::from_cards(&board_vec)
+                .expect("4-card board is always valid");
+            let key = canonical_key(&canonical.cards);
+            let sorted = key.to_cards(4);
+            map.entry(key)
+                .and_modify(|(w, _)| *w += flop.weight)
+                .or_insert_with(|| {
+                    let cards: [Card; 4] =
+                        [sorted[0], sorted[1], sorted[2], sorted[3]];
+                    (flop.weight, cards)
+                });
+        }
+    }
+
+    let mut result: Vec<WeightedBoard<4>> = map
+        .into_iter()
+        .map(|(_, (weight, cards))| WeightedBoard { cards, weight })
+        .collect();
+    result.sort_by_key(|wb| canonical_key(&wb.cards).0);
+    result
+}
+
+/// Enumerate all canonical 5-card river boards with weights.
+///
+/// For each canonical turn, appends each of the 48 remaining cards as a river,
+/// canonicalizes the resulting 5-card board, and deduplicates. Weight equals the
+/// sum of constituent turn weights. Total weight = C(52,3) x 49 x 48.
+#[must_use]
+pub fn enumerate_canonical_rivers() -> Vec<WeightedBoard<5>> {
+    let turns = enumerate_canonical_turns();
+    let deck = build_deck();
+    let mut map: HashMap<PackedBoard, (u32, [Card; 5])> = HashMap::new();
+
+    for turn in &turns {
+        for &card in &deck {
+            if turn.cards.contains(&card) {
+                continue;
+            }
+            let board_vec = vec![
+                turn.cards[0],
+                turn.cards[1],
+                turn.cards[2],
+                turn.cards[3],
+                card,
+            ];
+            // INVARIANT: 5-card boards are always valid for canonicalization
+            let canonical = CanonicalBoard::from_cards(&board_vec)
+                .expect("5-card board is always valid");
+            let key = canonical_key(&canonical.cards);
+            let sorted = key.to_cards(5);
+            map.entry(key)
+                .and_modify(|(w, _)| *w += turn.weight)
+                .or_insert_with(|| {
+                    let cards: [Card; 5] =
+                        [sorted[0], sorted[1], sorted[2], sorted[3], sorted[4]];
+                    (turn.weight, cards)
+                });
+        }
+    }
+
+    let mut result: Vec<WeightedBoard<5>> = map
+        .into_iter()
+        .map(|(_, (weight, cards))| WeightedBoard { cards, weight })
+        .collect();
+    result.sort_by_key(|wb| canonical_key(&wb.cards).0);
+    result
+}
+
 /// Enumerate all C(52,2) = 1326 two-card combos from the deck.
 ///
 /// The combos are stored as `(Card, Card)` with `c0 < c1` by deck index.
@@ -623,10 +1053,60 @@ pub(crate) fn enumerate_combos(deck: &[Card]) -> Vec<[Card; 2]> {
     combos
 }
 
+/// Map a card to its position in the canonical deck ordering.
+///
+/// The deck is ordered by value (Two..Ace) x suit (Spade, Heart, Diamond, Club),
+/// matching `build_deck()`.
+#[must_use]
+pub fn card_to_deck_index(card: Card) -> usize {
+    let value_idx = match card.value {
+        Value::Two => 0,
+        Value::Three => 1,
+        Value::Four => 2,
+        Value::Five => 3,
+        Value::Six => 4,
+        Value::Seven => 5,
+        Value::Eight => 6,
+        Value::Nine => 7,
+        Value::Ten => 8,
+        Value::Jack => 9,
+        Value::Queen => 10,
+        Value::King => 11,
+        Value::Ace => 12,
+    };
+    let suit_idx = match card.suit {
+        Suit::Spade => 0,
+        Suit::Heart => 1,
+        Suit::Diamond => 2,
+        Suit::Club => 3,
+    };
+    value_idx * 4 + suit_idx
+}
+
+/// Map a two-card hole-card combo to its index in the canonical
+/// `enumerate_combos()` ordering (0..1325).
+///
+/// The two cards can be in any order — they are sorted by deck index
+/// internally to match the enumeration `for i in 0..52 { for j in i+1..52 }`.
+#[must_use]
+pub fn combo_index(c0: Card, c1: Card) -> u16 {
+    let mut i = card_to_deck_index(c0);
+    let mut j = card_to_deck_index(c1);
+    if i > j {
+        std::mem::swap(&mut i, &mut j);
+    }
+    // Triangular number: combos before row i = i*(2*52 - i - 1)/2
+    // Offset within row = j - i - 1
+    #[allow(clippy::cast_possible_truncation)]
+    let idx = (i * (2 * 52 - i - 1) / 2 + (j - i - 1)) as u16;
+    idx
+}
+
 /// Sample `count` random boards of `card_count` cards from the deck.
 ///
 /// Each board is drawn via partial Fisher-Yates. Boards are sampled
 /// independently (duplicates possible but astronomically unlikely).
+#[allow(dead_code)]
 fn sample_n_card_boards(
     deck: &[Card],
     card_count: usize,
@@ -650,6 +1130,7 @@ fn sample_n_card_boards(
 }
 
 /// Sample `n` random 5-card boards from the deck without replacement.
+#[allow(dead_code)]
 pub(crate) fn sample_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 5]> {
     sample_n_card_boards(deck, 5, n, seed)
         .into_iter()
@@ -679,6 +1160,7 @@ fn cards_overlap(combo: [Card; 2], board: &[Card]) -> bool {
 }
 
 /// Sample `n` random 4-card boards from the deck without replacement.
+#[allow(dead_code)]
 fn sample_turn_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 4]> {
     sample_n_card_boards(deck, 4, n, seed)
         .into_iter()
@@ -687,6 +1169,7 @@ fn sample_turn_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 4]> {
 }
 
 /// Sample `n` random 3-card flop boards from the deck without replacement.
+#[allow(dead_code)]
 fn sample_flop_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 3]> {
     sample_n_card_boards(deck, 3, n, seed)
         .into_iter()
@@ -1167,5 +1650,68 @@ mod tests {
                 "average equity out of range: {eq}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // combo_index tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn combo_index_first_and_last() {
+        let deck = build_deck();
+        assert_eq!(combo_index(deck[0], deck[1]), 0);
+        assert_eq!(combo_index(deck[50], deck[51]), 1325);
+    }
+
+    #[test]
+    fn combo_index_order_independent() {
+        let c0 = Card::new(Value::Ace, Suit::Spade);
+        let c1 = Card::new(Value::King, Suit::Heart);
+        assert_eq!(combo_index(c0, c1), combo_index(c1, c0));
+    }
+
+    #[test]
+    fn combo_index_matches_enumeration() {
+        let deck = build_deck();
+        let combos = enumerate_combos(&deck);
+        for (expected_idx, combo) in combos.iter().enumerate() {
+            let actual = combo_index(combo[0], combo[1]);
+            assert_eq!(
+                actual, expected_idx as u16,
+                "Mismatch at combo {:?}: expected {expected_idx}, got {actual}",
+                combo
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Canonical board enumeration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn canonical_flops_count() {
+        let flops = enumerate_canonical_flops();
+        assert_eq!(flops.len(), 1755);
+        let total_weight: u32 = flops.iter().map(|f| f.weight).sum();
+        assert_eq!(total_weight, 22100); // C(52,3)
+    }
+
+    #[test]
+    fn canonical_turns_reasonable_count() {
+        let turns = enumerate_canonical_turns();
+        assert!(turns.len() > 10_000, "too few turns: {}", turns.len());
+        assert!(turns.len() < 25_000, "too many turns: {}", turns.len());
+        let total_weight: u32 = turns.iter().map(|t| t.weight).sum();
+        assert_eq!(total_weight, 22100 * 49);
+    }
+
+    #[test]
+    #[ignore]
+    fn canonical_rivers_reasonable_count() {
+        let rivers = enumerate_canonical_rivers();
+        assert!(rivers.len() > 500_000, "too few rivers: {}", rivers.len());
+        assert!(rivers.len() < 1_000_000, "too many rivers: {}", rivers.len());
+        let total_weight: u64 = rivers.iter().map(|r| u64::from(r.weight)).sum();
+        assert_eq!(total_weight, 22100 * 49 * 48);
     }
 }
