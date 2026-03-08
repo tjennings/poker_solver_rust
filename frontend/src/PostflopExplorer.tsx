@@ -52,6 +52,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         oop_raise_sizes: blueprintConfig.oop_raise_sizes,
         ip_bet_sizes: blueprintConfig.ip_bet_sizes,
         ip_raise_sizes: blueprintConfig.ip_raise_sizes,
+        rake_rate: blueprintConfig.rake_rate,
+        rake_cap: blueprintConfig.rake_cap,
       };
     }
     return {
@@ -63,6 +65,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       oop_raise_sizes: 'a',
       ip_bet_sizes: '25%,33%,75%,a',
       ip_raise_sizes: 'a',
+      rake_rate: 0,
+      rake_cap: 0,
     };
   });
   const [configSummary, setConfigSummary] = useState<PostflopConfigSummary | null>(null);
@@ -388,6 +392,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
           <div className="postflop-config-label">{blueprintConfig ? 'Blueprint' : 'Config'}</div>
           <div className="postflop-config-summary">
             {config.pot} pot / {config.effective_stack} eff
+            {config.rake_rate > 0 && ` / ${(config.rake_rate * 100).toFixed(1)}% rake`}
           </div>
           {configSummary && (
             <div className="postflop-config-combos">
@@ -773,6 +778,21 @@ function ConfigModal({ config, error, onSubmit, onClose }: {
             <label>Effective Stack</label>
             <input type="number" value={draft.effective_stack}
               onChange={(e) => setDraft({ ...draft, effective_stack: parseInt(e.target.value) || 0 })} />
+          </div>
+        </div>
+
+        <div className="modal-row">
+          <div>
+            <label>Rake Rate (%)</label>
+            <input type="number" min="0" max="100" step="0.5"
+              value={draft.rake_rate * 100}
+              onChange={(e) => setDraft({ ...draft, rake_rate: parseFloat(e.target.value) / 100 || 0 })} />
+          </div>
+          <div>
+            <label>Rake Cap</label>
+            <input type="number" min="0" step="0.5"
+              value={draft.rake_cap}
+              onChange={(e) => setDraft({ ...draft, rake_cap: parseFloat(e.target.value) || 0 })} />
           </div>
         </div>
 

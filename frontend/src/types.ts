@@ -5,6 +5,8 @@ export interface BundleInfo {
   info_sets: number;
   iterations: number;
   preflop_only: boolean;
+  rake_rate: number;
+  rake_cap: number;
 }
 
 export interface AgentInfo {
@@ -152,6 +154,8 @@ export interface BlueprintConfig {
   ip_raise_sizes: string;
   blueprint_dir: string;
   board?: string[];
+  rake_rate: number;
+  rake_cap: number;
 }
 
 // Postflop solver types
@@ -165,6 +169,8 @@ export interface PostflopConfig {
   oop_raise_sizes: string;
   ip_bet_sizes: string;
   ip_raise_sizes: string;
+  rake_rate: number;
+  rake_cap: number;
 }
 
 export interface PostflopConfigSummary {
@@ -244,6 +250,8 @@ export interface PreflopRanges {
   oop_raise_sizes: string;
   ip_bet_sizes: string;
   ip_raise_sizes: string;
+  rake_rate: number;
+  rake_cap: number;
 }
 
 export interface CacheInfo {

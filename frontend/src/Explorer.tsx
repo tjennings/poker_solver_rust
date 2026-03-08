@@ -727,6 +727,8 @@ export default function Explorer() {
               ip_bet_sizes: ranges.ip_bet_sizes,
               ip_raise_sizes: ranges.ip_raise_sizes,
               blueprint_dir: globalConfig.blueprint_dir || '',
+              rake_rate: ranges.rake_rate,
+              rake_cap: ranges.rake_cap,
             };
             setBlueprintPostflopConfig(bpConfig);
             blueprintPostflopConfigRef.current = bpConfig;
@@ -1043,6 +1045,15 @@ export default function Explorer() {
 
       {bundleInfo && (
         <>
+          {bundleInfo.name && (
+            <div className="action-block postflop-config-card" style={{ cursor: 'default' }}>
+              <div className="postflop-config-label">{bundleInfo.name}</div>
+              <div className="postflop-config-summary">
+                {bundleInfo.stack_depth}BB
+                {bundleInfo.rake_rate > 0 && ` / ${(bundleInfo.rake_rate * 100).toFixed(1)}% rake`}
+              </div>
+            </div>
+          )}
           {historyItems.map((item, idx) =>
             item.type === 'action' ? (
               <ActionBlock

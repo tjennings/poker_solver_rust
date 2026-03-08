@@ -3306,6 +3306,10 @@ pub struct PreflopRanges {
     pub ip_bet_sizes: String,
     /// IP raise sizes for flop in range-solver format.
     pub ip_raise_sizes: String,
+    /// Rake rate (0.0–1.0 fraction of pot).
+    pub rake_rate: f64,
+    /// Rake cap in chips.
+    pub rake_cap: f64,
 }
 
 /// Convert an `rs_poker::core::Card` to a range-solver `u8` card.
@@ -3563,6 +3567,8 @@ pub fn get_preflop_ranges_core(
         oop_raise_sizes,
         ip_bet_sizes,
         ip_raise_sizes,
+        rake_rate: config.game.rake_rate,
+        rake_cap: config.game.rake_cap,
     })
 }
 
