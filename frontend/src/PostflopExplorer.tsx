@@ -117,8 +117,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig }: PostflopEx
         if (blueprintConfig) {
           // Set blueprint weights as filtered weights for the solve
           await invoke('postflop_set_filtered_weights', {
-            oop_weights: blueprintConfig.oop_weights,
-            ip_weights: blueprintConfig.ip_weights,
+            oopWeights: blueprintConfig.oop_weights,
+            ipWeights: blueprintConfig.ip_weights,
           });
           // Set cache dir if the command exists
           await invoke('postflop_set_cache_dir', { dir: blueprintConfig.blueprint_dir }).catch(() => {
