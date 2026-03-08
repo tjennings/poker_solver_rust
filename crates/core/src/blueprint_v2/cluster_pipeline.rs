@@ -243,7 +243,7 @@ pub fn cluster_turn_with_boards(
         seed,
         |iter, max_iter| {
             #[allow(clippy::cast_precision_loss)]
-            progress(0.8 + 0.2 * iter as f64 / max_iter as f64);
+            progress(0.8 + 0.2 * f64::from(iter) / f64::from(max_iter));
         },
     );
 
@@ -452,7 +452,7 @@ pub fn cluster_flop_with_boards(
         seed,
         |iter, max_iter| {
             #[allow(clippy::cast_precision_loss)]
-            progress(0.8 + 0.2 * iter as f64 / max_iter as f64);
+            progress(0.8 + 0.2 * f64::from(iter) / f64::from(max_iter));
         },
     );
 
@@ -987,6 +987,9 @@ pub fn enumerate_canonical_flops() -> Vec<WeightedBoard<3>> {
 /// For each canonical flop, appends each of the 49 remaining cards as a turn,
 /// canonicalizes the resulting 4-card board, and deduplicates. Weight equals the
 /// sum of constituent flop weights. Total weight = C(52,3) x 49 = 1,082,900.
+///
+/// # Panics
+/// Panics if canonical flop enumeration produces invalid card data.
 #[must_use]
 pub fn enumerate_canonical_turns() -> Vec<WeightedBoard<4>> {
     let flops = enumerate_canonical_flops();
@@ -1045,6 +1048,9 @@ pub fn enumerate_canonical_turns() -> Vec<WeightedBoard<4>> {
 /// For each canonical turn, appends each of the 48 remaining cards as a river,
 /// canonicalizes the resulting 5-card board, and deduplicates. Weight equals the
 /// sum of constituent turn weights. Total weight = C(52,3) x 49 x 48.
+///
+/// # Panics
+/// Panics if canonical turn enumeration produces invalid card data.
 #[must_use]
 pub fn enumerate_canonical_rivers() -> Vec<WeightedBoard<5>> {
     let turns = enumerate_canonical_turns();

@@ -67,6 +67,7 @@ impl BlueprintV2Strategy {
     ///
     /// Actions with probability below the threshold are set to zero and the
     /// remaining probabilities renormalized. Use 0.0 to disable purification.
+    #[must_use]
     pub fn from_storage_with_threshold(
         storage: &BlueprintStorage,
         tree: &GameTree,

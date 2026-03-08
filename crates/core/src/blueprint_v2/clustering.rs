@@ -100,6 +100,9 @@ pub fn kmeans_emd(data: &[Vec<f64>], k: usize, max_iterations: u32, seed: u64) -
 }
 
 /// Like [`kmeans_emd`] but with a progress callback `(iteration, max_iterations)`.
+///
+/// # Panics
+/// Panics if `data` is empty or `k` is zero.
 #[allow(clippy::cast_possible_truncation)]
 pub fn kmeans_emd_with_progress(
     data: &[Vec<f64>],

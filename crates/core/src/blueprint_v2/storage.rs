@@ -153,10 +153,10 @@ impl BlueprintStorage {
         let start = Self::slot_offset(nl, bucket);
 
         let mut positive_sum = 0.0_f64;
-        for i in 0..num_actions {
+        for (i, slot) in out.iter_mut().enumerate() {
             let r = self.regrets[start + i].load(Ordering::Relaxed).max(0);
-            out[i] = f64::from(r);
-            positive_sum += out[i];
+            *slot = f64::from(r);
+            positive_sum += *slot;
         }
         if positive_sum > 0.0 {
             for o in out.iter_mut() {
@@ -205,14 +205,14 @@ impl BlueprintStorage {
         threshold: f64,
     ) -> Vec<f64> {
         let mut strat = self.average_strategy(node_idx, bucket);
-        for p in strat.iter_mut() {
+        for p in &mut strat {
             if *p < threshold {
                 *p = 0.0;
             }
         }
         let sum: f64 = strat.iter().sum();
         if sum > 0.0 {
-            for p in strat.iter_mut() {
+            for p in &mut strat {
                 *p /= sum;
             }
         } else {
@@ -246,6 +246,9 @@ impl BlueprintStorage {
     /// Returns `(mean_delta, pct_moving)` where `mean_delta` is the mean of
     /// per-group max deltas (near 0 = stabilised) and `pct_moving` is the
     /// fraction of groups whose max delta exceeds 0.20.
+    ///
+    /// # Panics
+    /// Panics if `prev_sums.len()` differs from `self.strategy_sums.len()`.
     #[must_use]
     pub fn strategy_delta(&self, prev_sums: &[i64]) -> (f64, f64) {
         assert_eq!(prev_sums.len(), self.strategy_sums.len());

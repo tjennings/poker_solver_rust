@@ -79,6 +79,7 @@ struct BuildState {
 }
 
 /// Configuration for the tree builder, extracted from the `build()` parameters.
+#[allow(clippy::struct_field_names)]
 struct TreeConfig {
     preflop_sizes: Vec<Vec<PreflopSize>>,
     flop_sizes: Vec<Vec<f64>>,

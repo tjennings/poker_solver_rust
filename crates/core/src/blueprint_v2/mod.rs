@@ -11,7 +11,7 @@ pub mod trainer;
 
 use serde::{Deserialize, Serialize};
 
-/// A poker street — shared across all blueprint_v2 modules.
+/// A poker street — shared across all `blueprint_v2` modules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Street {
@@ -23,6 +23,7 @@ pub enum Street {
 
 impl Street {
     /// Parse from a raw byte (used in binary deserialization).
+    #[must_use]
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Preflop),

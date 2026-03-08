@@ -46,6 +46,7 @@ static CANONICAL_DECK: LazyLock<[Card; 52]> = LazyLock::new(|| {
 });
 
 /// Check whether all 4 bucket files already exist in the given directory.
+#[must_use]
 pub fn bucket_files_exist(dir: &Path) -> bool {
     ["river.buckets", "turn.buckets", "flop.buckets", "preflop.buckets"]
         .iter()
@@ -85,6 +86,12 @@ fn load_bucket_files(dir: &Path) -> [Option<BucketFile>; 4] {
     }
     files
 }
+
+/// Callback type for pushing per-scenario strategy data to the TUI.
+type StrategyRefreshCallback = Box<dyn Fn(usize, u32, &BlueprintStorage, &GameTree) + Send>;
+
+/// Callback type for pushing a random scenario to the TUI.
+type RandomScenarioCallback = Box<dyn Fn(&BlueprintStorage, &GameTree) + Send>;
 
 /// Outer training driver for Blueprint V2.
 ///
@@ -136,8 +143,8 @@ pub struct BlueprintTrainer {
     /// Node indices for scenarios to refresh.
     pub scenario_node_indices: Vec<u32>,
     /// Callback to push strategy data to TUI metrics.
-    /// Args: (scenario_index, node_idx, &BlueprintStorage, &GameTree)
-    pub on_strategy_refresh: Option<Box<dyn Fn(usize, u32, &BlueprintStorage, &GameTree) + Send>>,
+    /// Args: (`scenario_index`, `node_idx`, `&BlueprintStorage`, `&GameTree`)
+    pub on_strategy_refresh: Option<StrategyRefreshCallback>,
     /// Callback to push strategy delta values to TUI metrics.
     pub on_strategy_delta: Option<Box<dyn Fn(f64) + Send>>,
     /// Callback to push leaf movement fraction to TUI metrics.
@@ -164,7 +171,7 @@ pub struct BlueprintTrainer {
     // --- Random scenario carousel ---
     /// Callback to push a random scenario to TUI.
     /// Receives a reference to storage and the game tree.
-    pub on_random_scenario: Option<Box<dyn Fn(&BlueprintStorage, &GameTree) + Send>>,
+    pub on_random_scenario: Option<RandomScenarioCallback>,
     /// Minutes between random scenario rotations.
     pub random_scenario_hold_minutes: u64,
     /// Last time (in minutes) a random scenario was pushed.
@@ -269,14 +276,12 @@ impl BlueprintTrainer {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if let Some(num_str) = name_str.strip_prefix("snapshot_") {
-                    if let Ok(num) = num_str.parse::<u32>() {
-                        if entry.path().join("regrets.bin").exists()
-                            && best.as_ref().map_or(true, |(n, _)| num > *n)
-                        {
-                            best = Some((num, entry.path()));
-                        }
-                    }
+                if let Some(num_str) = name_str.strip_prefix("snapshot_")
+                    && let Ok(num) = num_str.parse::<u32>()
+                    && entry.path().join("regrets.bin").exists()
+                    && best.as_ref().is_none_or(|(n, _)| num > *n)
+                {
+                    best = Some((num, entry.path()));
                 }
             }
         }
@@ -316,7 +321,8 @@ impl BlueprintTrainer {
             // ensures pruning warmup and other time-gated actions
             // activate correctly after resume.
             if let Some(prev_min) = extract_json_u64(&meta_str, "elapsed_minutes") {
-                self.start_time = Instant::now() - std::time::Duration::from_secs(prev_min * 60);
+                let backdate = std::time::Duration::from_secs(prev_min * 60);
+                self.start_time = Instant::now().checked_sub(backdate).unwrap_or(self.start_time);
             }
         }
 
@@ -383,8 +389,7 @@ impl BlueprintTrainer {
                 .config
                 .training
                 .iterations
-                .map(|max| max.saturating_sub(self.iterations))
-                .unwrap_or(batch_size);
+                .map_or(batch_size, |max| max.saturating_sub(self.iterations));
             let this_batch = batch_size.min(remaining);
             if this_batch == 0 {
                 break;
@@ -582,11 +587,11 @@ impl BlueprintTrainer {
         }
 
         // Random scenario carousel rotation.
-        if let Some(ref callback) = self.on_random_scenario {
-            if elapsed_min >= self.last_random_scenario_min + self.random_scenario_hold_minutes {
-                callback(&self.storage, &self.tree);
-                self.last_random_scenario_min = elapsed_min;
-            }
+        if let Some(ref callback) = self.on_random_scenario
+            && elapsed_min >= self.last_random_scenario_min + self.random_scenario_hold_minutes
+        {
+            callback(&self.storage, &self.tree);
+            self.last_random_scenario_min = elapsed_min;
         }
 
         Ok(())
@@ -779,6 +784,10 @@ impl BlueprintTrainer {
     ///
     /// Returns a 169-element vector of `(hand_name, avg_ev, sample_count)`,
     /// ordered by the canonical 169 hand index.
+    ///
+    /// # Panics
+    /// Panics if `CanonicalHand::from_index` returns `None` for indices 0..169
+    /// (this is an internal invariant that always holds).
     #[must_use]
     pub fn hand_ev_averages(&self) -> Vec<(String, f64, u64)> {
         (0..169)
@@ -833,11 +842,13 @@ impl BlueprintTrainer {
 
         // Write per-hand chip EV averages with sample counts.
         let hand_evs = self.hand_ev_averages();
+        use std::fmt::Write;
         let mut ev_json = String::from("{\n");
         for (i, (name, ev, count)) in hand_evs.iter().enumerate() {
-            ev_json.push_str(&format!(
+            let _ = write!(
+                ev_json,
                 "  \"{name}\": {{\"ev\": {ev:.4}, \"samples\": {count}}}"
-            ));
+            );
             if i < hand_evs.len() - 1 {
                 ev_json.push(',');
             }
@@ -869,10 +880,10 @@ impl BlueprintTrainer {
         for entry in std::fs::read_dir(output_dir)?.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if let Some(num_str) = name_str.strip_prefix("snapshot_") {
-                if let Ok(num) = num_str.parse::<u32>() {
-                    numbered.push((num, entry.path()));
-                }
+            if let Some(num_str) = name_str.strip_prefix("snapshot_")
+                && let Ok(num) = num_str.parse::<u32>()
+            {
+                numbered.push((num, entry.path()));
             }
         }
 
@@ -904,7 +915,7 @@ fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
     let after_colon = after_key[colon_idx + 1..].trim_start();
     let num_str: String = after_colon
         .chars()
-        .take_while(|c| c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
         .collect();
     num_str.parse().ok()
 }

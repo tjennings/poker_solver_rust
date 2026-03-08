@@ -169,10 +169,12 @@ impl EquityAuditReport {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         for b in &sorted {
-            s.push_str(&format!(
+            use std::fmt::Write;
+            let _ = write!(
+                s,
                 "\n    bucket {:>3}: n={:<6} eq={:.3}..{:.3}  mean={:.3}  std={:.4}",
                 b.bucket_id, b.count, b.min_equity, b.max_equity, b.mean_equity, b.std_dev,
-            ));
+            );
         }
         s
     }
@@ -209,6 +211,7 @@ pub fn audit_bucket_equity(bf: &BucketFile, num_sample_boards: usize, seed: u64)
                 .enumerate()
                 .filter_map(move |(combo_idx, eq_opt)| {
                     let eq = eq_opt?;
+                    #[allow(clippy::cast_possible_truncation)]
                     let bucket = bf.get_bucket(board_idx as u32, combo_idx as u16);
                     Some((eq, bucket))
                 })
@@ -229,6 +232,7 @@ pub fn audit_bucket_equity(bf: &BucketFile, num_sample_boards: usize, seed: u64)
         .enumerate()
         .map(|(id, eqs)| {
             if eqs.is_empty() {
+                #[allow(clippy::cast_possible_truncation)]
                 return BucketEquityStats {
                     bucket_id: id as u16,
                     count: 0,
@@ -245,6 +249,7 @@ pub fn audit_bucket_equity(bf: &BucketFile, num_sample_boards: usize, seed: u64)
             let variance = eqs.iter().map(|&e| (e - mean).powi(2)).sum::<f64>() / n;
             let min = eqs.iter().copied().fold(f64::INFINITY, f64::min);
             let max = eqs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            #[allow(clippy::cast_possible_truncation)]
             BucketEquityStats {
                 bucket_id: id as u16,
                 count: eqs.len(),
@@ -260,7 +265,8 @@ pub fn audit_bucket_equity(bf: &BucketFile, num_sample_boards: usize, seed: u64)
     let mean_std = if non_empty.is_empty() {
         0.0
     } else {
-        non_empty.iter().map(|b| b.std_dev).sum::<f64>() / non_empty.len() as f64
+        #[allow(clippy::cast_precision_loss)]
+        { non_empty.iter().map(|b| b.std_dev).sum::<f64>() / non_empty.len() as f64 }
     };
     let max_std = non_empty
         .iter()

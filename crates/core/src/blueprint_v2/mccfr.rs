@@ -94,6 +94,7 @@ pub struct AllBuckets {
 impl AllBuckets {
     /// Construct `AllBuckets`, building `board_maps` from any v2 bucket
     /// files that contain a board table.
+    #[must_use]
     pub fn new(bucket_counts: [u16; 4], bucket_files: [Option<BucketFile>; 4]) -> Self {
         let board_maps = std::array::from_fn(|street_idx| {
             bucket_files[street_idx].as_ref().and_then(|bf| {
@@ -124,6 +125,9 @@ impl AllBuckets {
     /// performs an O(1) lookup in the pre-built board map. Falls back
     /// to equity-based bucketing for v1 files or boards not present in
     /// the file.
+    ///
+    /// # Panics
+    /// Panics if `street` is preflop and `bucket_counts[0]` is zero.
     #[must_use]
     pub fn get_bucket(&self, street: Street, hole_cards: [Card; 2], board: &[Card]) -> u16 {
         if street == Street::Preflop {
@@ -384,14 +388,14 @@ fn traverse_traverser(
 
     // Update regrets: delta = action_value - node_value, scaled to
     // integer by ×1000 for precision.
-    for a in 0..num_actions {
-        let delta = action_values[a] - node_value;
+    for (a, &av) in action_values.iter().enumerate().take(num_actions) {
+        let delta = av - node_value;
         storage.add_regret(node_idx, bucket, a, (delta * 1000.0) as i32);
     }
 
     // Accumulate strategy sums (for computing the average strategy).
-    for a in 0..num_actions {
-        storage.add_strategy_sum(node_idx, bucket, a, (strategy[a] * 1000.0) as i64);
+    for (a, &s) in strategy.iter().enumerate().take(num_actions) {
+        storage.add_strategy_sum(node_idx, bucket, a, (s * 1000.0) as i64);
     }
 
     (node_value, stats)
