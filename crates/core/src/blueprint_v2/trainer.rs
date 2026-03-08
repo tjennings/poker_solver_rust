@@ -697,6 +697,11 @@ impl BlueprintTrainer {
         let output_dir = Path::new(&self.config.snapshots.output_dir);
         std::fs::create_dir_all(output_dir)?;
 
+        // Write config.yaml on the first snapshot so the explorer can discover this blueprint.
+        if !output_dir.join("config.yaml").exists() {
+            bundle::save_config(output_dir, &self.config)?;
+        }
+
         let snapshot_dir = output_dir.join(format!("snapshot_{:04}", self.snapshot_count));
 
         let mut strategy = BlueprintV2Strategy::from_storage(&self.storage, &self.tree);

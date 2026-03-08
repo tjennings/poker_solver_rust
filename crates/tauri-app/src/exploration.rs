@@ -601,48 +601,61 @@ pub fn list_blueprints_core(dir: String) -> Result<Vec<BlueprintListEntry>, Stri
         .map_err(|e| format!("Failed to read directory {dir}: {e}"))?;
 
     let mut blueprints = Vec::new();
+
+    // Check if the directory itself is a blueprint.
+    if let Some(entry) = try_make_blueprint_entry(&base) {
+        blueprints.push(entry);
+    }
+
+    // Check subdirectories.
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read entry: {e}"))?;
         let sub = entry.path();
-        if !sub.is_dir() || !sub.join("config.yaml").exists() {
+        if !sub.is_dir() {
             continue;
         }
-
-        let config = match v2_bundle::load_config(&sub) {
-            Ok(cfg) => cfg,
-            Err(_) => continue, // skip directories with unparseable configs
-        };
-
-        let name = sub
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let has_strategy = sub.join("final/strategy.bin").exists()
-            || sub.join("strategy.bin").exists()
-            || std::fs::read_dir(&sub)
-                .ok()
-                .map(|rd| {
-                    rd.filter_map(Result::ok).any(|e| {
-                        e.file_name()
-                            .to_str()
-                            .is_some_and(|n| n.starts_with("snapshot_"))
-                    })
-                })
-                .unwrap_or(false);
-
-        let path_str = sub.to_string_lossy().to_string();
-        blueprints.push(BlueprintListEntry {
-            name,
-            path: path_str,
-            stack_depth: config.game.stack_depth,
-            has_strategy,
-        });
+        if let Some(entry) = try_make_blueprint_entry(&sub) {
+            blueprints.push(entry);
+        }
     }
 
     blueprints.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(blueprints)
+}
+
+/// Try to interpret `dir` as a blueprint directory.
+/// Returns `Some(BlueprintListEntry)` if `config.yaml` exists and parses successfully.
+fn try_make_blueprint_entry(dir: &Path) -> Option<BlueprintListEntry> {
+    if !dir.join("config.yaml").exists() {
+        return None;
+    }
+    let config = v2_bundle::load_config(dir).ok()?;
+
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let has_strategy = dir.join("final/strategy.bin").exists()
+        || dir.join("strategy.bin").exists()
+        || std::fs::read_dir(dir)
+            .ok()
+            .map(|rd| {
+                rd.filter_map(Result::ok).any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("snapshot_"))
+                })
+            })
+            .unwrap_or(false);
+
+    Some(BlueprintListEntry {
+        name,
+        path: dir.to_string_lossy().to_string(),
+        stack_depth: config.game.stack_depth,
+        has_strategy,
+    })
 }
 
 /// List available blueprint bundles in a directory (Tauri wrapper).
