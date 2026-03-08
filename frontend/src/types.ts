@@ -205,3 +205,8 @@ export interface PostflopPlayResult {
   pot: number;
   stacks: [number, number];
 }
+
+export interface CacheInfo {
+  exploitability: number;
+  iterations: number;
+}

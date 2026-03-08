@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { invoke } from './invoke';
 import {
   ActionInfo,
+  CacheInfo,
   MatrixCell,
   PostflopConfig,
   PostflopConfigSummary,
@@ -80,6 +81,10 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   const [needsSolve, setNeedsSolve] = useState(false);
   // Track actions per street for close_street call
   const [streetActions, setStreetActions] = useState<number[]>([]);
+  // Cache integration
+  const [cacheInfo, setCacheInfo] = useState<CacheInfo | null>(null);
+  const [loadingCache, setLoadingCache] = useState(false);
+  const [priorStreetActions, setPriorStreetActions] = useState<number[][]>([]);
 
   const boardCards = useMemo(() => {
     const trimmed = boardInput.trim();
@@ -104,6 +109,42 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       setConfigError(String(e));
     }
   }, []);
+
+  // Check cache when board changes and config is set
+  useEffect(() => {
+    if (!configSummary || boardCards.length < 3 || solving || matrix) return;
+
+    let cancelled = false;
+    const checkCache = async () => {
+      setLoadingCache(true);
+      try {
+        const info = await invoke<CacheInfo | null>('postflop_check_cache', {
+          board: boardCards,
+          prior_actions: priorStreetActions,
+        });
+        if (cancelled) return;
+        setCacheInfo(info);
+        if (info) {
+          const cachedMatrix = await invoke<PostflopStrategyMatrix>('postflop_load_cached', {
+            board: boardCards,
+            prior_actions: priorStreetActions,
+          });
+          if (cancelled) return;
+          setMatrix(cachedMatrix);
+          setSolving(false);
+          setNeedsSolve(false);
+        } else {
+          setNeedsSolve(true);
+        }
+      } catch {
+        if (!cancelled) setNeedsSolve(true);
+      } finally {
+        if (!cancelled) setLoadingCache(false);
+      }
+    };
+    checkCache();
+    return () => { cancelled = true; };
+  }, [boardCards.length, configSummary, priorStreetActions]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Cleanup polling on unmount
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
@@ -148,6 +189,9 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     setProgress(null);
     setError(null);
     setSolving(false);
+    setCacheInfo(null);
+    setPriorStreetActions([]);
+    setLoadingCache(false);
   }, []);
 
   /** Start or cancel solve for the current board. */
@@ -421,11 +465,13 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
                 setShowFlopPicker(false);
                 setActionHistory([]);
                 setStreetActions([]);
+                setPriorStreetActions([]);
                 setMatrix(null);
                 setProgress(null);
                 setTerminal(false);
                 setAwaitingCard(false);
-                setNeedsSolve(true);
+                setCacheInfo(null);
+                // needsSolve will be set by cache check effect
               }}
             />
           </div>
@@ -447,11 +493,12 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
                 .then(() => {
                   const newBoard = [...boardCards, card];
                   setBoardInput(newBoard.join(' '));
+                  setPriorStreetActions(prev => [...prev, streetActions]);
                   setStreetActions([]);
                   setCurrentStreetIndex(prev => prev + 1);
                   setMatrix(null);
                   setProgress(null);
-                  setNeedsSolve(true);
+                  setCacheInfo(null);
                 })
                 .catch((e) => { setError(String(e)); });
             }}
@@ -485,6 +532,23 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       })()}
 
 
+
+      {/* Cache info */}
+      {cacheInfo && matrix && !solving && (
+        <div className="cache-info">
+          Cached ({cacheInfo.iterations} iterations, {cacheInfo.exploitability.toFixed(1)}% pot)
+          <button className="re-solve-btn" onClick={() => { setCacheInfo(null); setNeedsSolve(true); setMatrix(null); }}>
+            Re-solve
+          </button>
+        </div>
+      )}
+
+      {/* Loading cache indicator */}
+      {loadingCache && !matrix && !solving && (
+        <div style={{ padding: 8, textAlign: 'center', fontSize: '0.8em', color: '#94a3b8' }}>
+          Checking cache...
+        </div>
+      )}
 
       {/* Strategy matrix */}
       {matrix && (() => {
