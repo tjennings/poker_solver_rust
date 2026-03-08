@@ -192,6 +192,36 @@ impl BlueprintStorage {
         }
     }
 
+    /// Average strategy with low-frequency actions zeroed and renormalized.
+    ///
+    /// Any action with probability below `threshold` (e.g. 0.03 for 3%) is
+    /// set to zero. The remaining probabilities are renormalized to sum to 1.
+    /// If all actions fall below the threshold, returns uniform.
+    #[must_use]
+    pub fn purified_average_strategy(
+        &self,
+        node_idx: u32,
+        bucket: u16,
+        threshold: f64,
+    ) -> Vec<f64> {
+        let mut strat = self.average_strategy(node_idx, bucket);
+        for p in strat.iter_mut() {
+            if *p < threshold {
+                *p = 0.0;
+            }
+        }
+        let sum: f64 = strat.iter().sum();
+        if sum > 0.0 {
+            for p in strat.iter_mut() {
+                *p /= sum;
+            }
+        } else {
+            let uniform = 1.0 / strat.len() as f64;
+            strat.fill(uniform);
+        }
+        strat
+    }
+
     /// Number of actions at a decision node.
     #[inline]
     #[must_use]

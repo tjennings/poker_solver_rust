@@ -60,6 +60,18 @@ impl BlueprintV2Strategy {
     /// probabilities.
     #[must_use]
     pub fn from_storage(storage: &BlueprintStorage, tree: &GameTree) -> Self {
+        Self::from_storage_with_threshold(storage, tree, 0.0)
+    }
+
+    /// Build a strategy bundle from storage, zeroing actions below `purify_threshold`.
+    ///
+    /// Actions with probability below the threshold are set to zero and the
+    /// remaining probabilities renormalized. Use 0.0 to disable purification.
+    pub fn from_storage_with_threshold(
+        storage: &BlueprintStorage,
+        tree: &GameTree,
+        purify_threshold: f64,
+    ) -> Self {
         let mut action_probs = Vec::new();
         let mut node_action_counts = Vec::new();
         let mut node_street_indices = Vec::new();
@@ -77,7 +89,11 @@ impl BlueprintV2Strategy {
                 node_street_indices.push(street_idx);
 
                 for bucket in 0..buckets {
-                    let avg = storage.average_strategy(i as u32, bucket);
+                    let avg = if purify_threshold > 0.0 {
+                        storage.purified_average_strategy(i as u32, bucket, purify_threshold)
+                    } else {
+                        storage.average_strategy(i as u32, bucket)
+                    };
                     for &p in &avg {
                         action_probs.push(p as f32);
                     }
@@ -350,6 +366,7 @@ mod tests {
                 print_every_minutes: 10,
                 batch_size: 200,
                 target_strategy_delta: None,
+                purify_threshold: 0.0,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 60,

@@ -35,7 +35,7 @@ function toMatrixCell(cell: { hand: string; suited: boolean; pair: boolean; prob
 }
 
 interface PostflopExplorerProps {
-  onBack: () => void;
+  onBack: (preflopHistoryIndex?: number) => void;
   blueprintConfig?: BlueprintConfig;
   preflopHistory?: HistoryItem[];
 }
@@ -386,7 +386,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       <div className="action-strip">
         {/* Split switcher: load dataset / postflop solver */}
         <div className="dataset-switcher-split">
-          <div className="dataset-switcher-half" onClick={onBack} title="Load Strategy">
+          <div className="dataset-switcher-half" onClick={() => onBack()} title="Load Strategy">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
               <line x1="12" y1="11" x2="12" y2="17" />
@@ -411,7 +411,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
               pot={item.pot}
               actions={item.actions}
               selectedAction={item.selected}
-              onSelect={() => {}}
+              onSelect={() => onBack(i)}
+              onHeaderClick={() => onBack(i)}
               isCurrent={false}
             />
           ) : null

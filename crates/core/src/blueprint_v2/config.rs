@@ -111,6 +111,11 @@ pub struct TrainingConfig {
     /// Checked every `print_every_minutes`. `None` = never stop on delta.
     #[serde(default)]
     pub target_strategy_delta: Option<f64>,
+    /// Zero action probabilities below this threshold when exporting the
+    /// strategy to a bundle (e.g. 0.03 = drop actions under 3%).
+    /// Remaining probabilities are renormalized. Default 0.0 (disabled).
+    #[serde(default)]
+    pub purify_threshold: f64,
 }
 
 /// Snapshot (checkpoint) output settings.
@@ -309,6 +314,7 @@ snapshots:
                 print_every_minutes: 10,
                 batch_size: 200,
                 target_strategy_delta: None,
+                purify_threshold: 0.0,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 120,

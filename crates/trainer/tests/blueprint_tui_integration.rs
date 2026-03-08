@@ -44,6 +44,7 @@ fn toy_config() -> BlueprintV2Config {
             print_every_minutes: 9999,
             batch_size: 1,
             target_strategy_delta: None,
+            purify_threshold: 0.0,
         },
         snapshots: SnapshotConfig {
             warmup_minutes: 9999,

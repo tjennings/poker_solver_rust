@@ -814,7 +814,11 @@ impl BlueprintTrainer {
 
         let snapshot_dir = output_dir.join(format!("snapshot_{:04}", self.snapshot_count));
 
-        let mut strategy = BlueprintV2Strategy::from_storage(&self.storage, &self.tree);
+        let mut strategy = BlueprintV2Strategy::from_storage_with_threshold(
+            &self.storage,
+            &self.tree,
+            self.config.training.purify_threshold,
+        );
         strategy.iterations = self.iterations;
         strategy.elapsed_minutes = self.elapsed_minutes();
 
@@ -950,6 +954,7 @@ mod tests {
                 print_every_minutes: 9999,
                 batch_size: 200,
                 target_strategy_delta: None,
+                purify_threshold: 0.0,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 9999,

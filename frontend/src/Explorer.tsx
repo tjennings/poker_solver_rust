@@ -1345,7 +1345,13 @@ export default function Explorer() {
 
       {showPostflop && (
         <PostflopExplorer
-          onBack={() => { setShowPostflop(false); setBlueprintPostflopConfig(null); }}
+          onBack={(preflopIdx?: number) => {
+            setShowPostflop(false);
+            setBlueprintPostflopConfig(null);
+            if (preflopIdx !== undefined) {
+              handleHistoryRewind(preflopIdx);
+            }
+          }}
           blueprintConfig={blueprintPostflopConfig ?? undefined}
           preflopHistory={historyItems}
         />
