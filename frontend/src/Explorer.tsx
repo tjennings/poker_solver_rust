@@ -520,7 +520,7 @@ export default function Explorer() {
 
   const updateRangesFromMatrix = useCallback((m: StrategyMatrix) => {
     setP1Range(prev => {
-      const newHands = m.reaching_p1.length === 169 ? [...m.reaching_p1] : Array(169).fill(1.0);
+      const newHands = m.reaching_p1?.length === 169 ? [...m.reaching_p1] : Array(169).fill(1.0);
       for (const idx of prev.overrides) {
         newHands[idx] = prev.hands[idx];
       }
@@ -531,7 +531,7 @@ export default function Explorer() {
       };
     });
     setP2Range(prev => {
-      const newHands = m.reaching_p2.length === 169 ? [...m.reaching_p2] : Array(169).fill(1.0);
+      const newHands = m.reaching_p2?.length === 169 ? [...m.reaching_p2] : Array(169).fill(1.0);
       for (const idx of prev.overrides) {
         newHands[idx] = prev.hands[idx];
       }
@@ -1187,8 +1187,8 @@ export default function Explorer() {
                 <button
                   className="range-edit-btn reset"
                   onClick={() => {
-                    setP1Range({ hands: matrix.reaching_p1.length === 169 ? [...matrix.reaching_p1] : Array(169).fill(1.0), source: 'computed', overrides: [] });
-                    setP2Range({ hands: matrix.reaching_p2.length === 169 ? [...matrix.reaching_p2] : Array(169).fill(1.0), source: 'computed', overrides: [] });
+                    setP1Range({ hands: matrix.reaching_p1?.length === 169 ? [...matrix.reaching_p1] : Array(169).fill(1.0), source: 'computed', overrides: [] });
+                    setP2Range({ hands: matrix.reaching_p2?.length === 169 ? [...matrix.reaching_p2] : Array(169).fill(1.0), source: 'computed', overrides: [] });
                     setEditingPlayer(null);
                   }}
                 >
@@ -1212,8 +1212,8 @@ export default function Explorer() {
                             return range.hands[handIdx] ?? 1.0;
                           }
                           return position.to_act === 0
-                            ? (matrix.reaching_p1[handIdx] ?? 1.0)
-                            : (matrix.reaching_p2[handIdx] ?? 1.0);
+                            ? (matrix.reaching_p1?.[handIdx] ?? 1.0)
+                            : (matrix.reaching_p2?.[handIdx] ?? 1.0);
                         })();
                         const isEdited = editingPlayer !== null &&
                           (position.to_act === 0 ? p1Range : p2Range).overrides.includes(handIdx);
