@@ -8,7 +8,7 @@
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -43,7 +43,7 @@ pub struct BlueprintTuiApp {
     iter_per_sec_history: Vec<u64>,
     prev_iterations: u64,
     peak_iter_per_sec: u64,
-    refresh_rate_hz: f64,
+    last_tick: Instant,
     // Strategy delta sparkline data
     delta_history: Vec<u64>,
     // Leaf movement sparkline data
@@ -52,6 +52,8 @@ pub struct BlueprintTuiApp {
     max_regret_history: Vec<u64>,
     // Max negative regret sparkline data (stored as abs value × 1000 for sparkline)
     min_regret_history: Vec<u64>,
+    // Avg positive regret sparkline data (stored as value × 1000 for sparkline)
+    avg_pos_regret_history: Vec<u64>,
     // Current prune fraction (0.0–1.0)
     prune_fraction: f64,
     // Random scenario carousel tracking
@@ -63,7 +65,6 @@ impl BlueprintTuiApp {
         metrics: Arc<BlueprintTuiMetrics>,
         scenarios: Vec<ResolvedScenario>,
         telemetry_config: TelemetryConfig,
-        refresh_rate_hz: f64,
     ) -> Self {
         Self {
             metrics,
@@ -73,11 +74,12 @@ impl BlueprintTuiApp {
             iter_per_sec_history: Vec::with_capacity(SPARKLINE_HISTORY),
             prev_iterations: 0,
             peak_iter_per_sec: 0,
-            refresh_rate_hz,
+            last_tick: Instant::now(),
             delta_history: Vec::with_capacity(SPARKLINE_HISTORY),
             leaf_movement_history: Vec::with_capacity(SPARKLINE_HISTORY),
             max_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
             min_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
+            avg_pos_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
             prune_fraction: 0.0,
             has_random_tab: false,
         }
@@ -88,10 +90,13 @@ impl BlueprintTuiApp {
         let sparkline_max = self.telemetry_config.sparkline_window.min(SPARKLINE_HISTORY);
 
         // Throughput
+        let now = Instant::now();
+        let elapsed_secs = now.duration_since(self.last_tick).as_secs_f64();
+        self.last_tick = now;
         let current = self.metrics.iterations.load(Ordering::Relaxed);
         let delta = current.saturating_sub(self.prev_iterations);
-        let ips = if self.refresh_rate_hz > 0.0 {
-            (delta as f64 * self.refresh_rate_hz) as u64
+        let ips = if elapsed_secs > 0.0 {
+            (delta as f64 / elapsed_secs) as u64
         } else {
             delta
         };
@@ -164,6 +169,23 @@ impl BlueprintTuiApp {
                 push_bounded(
                     &mut self.min_regret_history,
                     (v.abs() * 1000.0) as u64,
+                    sparkline_max,
+                );
+            }
+            hist.clear();
+        }
+
+        // Avg positive regret sparkline: read all new values
+        {
+            let mut hist = self
+                .metrics
+                .avg_pos_regret_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for &v in hist.iter() {
+                push_bounded(
+                    &mut self.avg_pos_regret_history,
+                    (v * 1000.0) as u64,
                     sparkline_max,
                 );
             }
@@ -265,6 +287,7 @@ impl BlueprintTuiApp {
                 Constraint::Length(3),  // Leaf movement sparkline
                 Constraint::Length(3),  // Max positive regret sparkline
                 Constraint::Length(3),  // Max negative regret sparkline
+                Constraint::Length(3),  // Avg positive regret sparkline
                 Constraint::Length(1),  // Actions pruned bar
                 Constraint::Min(0),    // Strategy grids
                 Constraint::Length(1),  // Hotkeys footer
@@ -279,9 +302,10 @@ impl BlueprintTuiApp {
         self.render_leaf_movement(frame, chunks[5]);
         self.render_max_regret(frame, chunks[6]);
         self.render_min_regret(frame, chunks[7]);
-        self.render_prune_bar(frame, chunks[8]);
-        self.render_right_panel(frame, chunks[9]);
-        self.render_hotkeys(frame, chunks[10]);
+        self.render_avg_pos_regret(frame, chunks[8]);
+        self.render_prune_bar(frame, chunks[9]);
+        self.render_right_panel(frame, chunks[10]);
+        self.render_hotkeys(frame, chunks[11]);
     }
 
     fn render_iterations(&self, frame: &mut Frame, area: Rect) {
@@ -421,6 +445,20 @@ impl BlueprintTuiApp {
         frame.render_widget(sparkline, area);
     }
 
+    fn render_avg_pos_regret(&self, frame: &mut Frame, area: Rect) {
+        let latest = self
+            .avg_pos_regret_history
+            .last()
+            .map(|&v| v as f64 / 1000.0)
+            .unwrap_or(0.0);
+        let title = format!("Avg pos regret: {latest:.3}");
+        let sparkline = Sparkline::default()
+            .block(Block::default().title(title).borders(Borders::NONE))
+            .data(&self.avg_pos_regret_history)
+            .style(Style::default().fg(Color::Yellow));
+        frame.render_widget(sparkline, area);
+    }
+
     fn render_prune_bar(&self, frame: &mut Frame, area: Rect) {
         let pct = self.prune_fraction * 100.0;
         let gauge = Gauge::default()
@@ -476,7 +514,6 @@ pub fn run_blueprint_tui(
     scenarios: Vec<ResolvedScenario>,
     telemetry_config: TelemetryConfig,
     refresh_interval: Duration,
-    refresh_rate_hz: f64,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         if let Err(e) = run_tui_inner(
@@ -484,7 +521,6 @@ pub fn run_blueprint_tui(
             scenarios,
             telemetry_config,
             refresh_interval,
-            refresh_rate_hz,
         ) {
             eprintln!("Blueprint TUI error: {e}");
         }
@@ -496,7 +532,6 @@ fn run_tui_inner(
     scenarios: Vec<ResolvedScenario>,
     telemetry_config: TelemetryConfig,
     refresh_interval: Duration,
-    refresh_rate_hz: f64,
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stderr = io::stderr();
@@ -508,7 +543,6 @@ fn run_tui_inner(
         Arc::clone(&metrics),
         scenarios,
         telemetry_config,
-        refresh_rate_hz,
     );
 
     loop {
@@ -630,7 +664,6 @@ mod tests {
             metrics,
             vec![],
             TelemetryConfig::default(),
-            4.0,
         );
         let backend = ratatui::backend::TestBackend::new(160, 50);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -645,7 +678,6 @@ mod tests {
             metrics,
             scenarios,
             TelemetryConfig::default(),
-            4.0,
         );
 
         assert_eq!(app.active_tab, 0);

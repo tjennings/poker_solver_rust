@@ -117,6 +117,8 @@ pub struct BlueprintTrainer {
     pub on_min_regret: Option<Box<dyn Fn(f64) + Send>>,
     /// Callback to push the maximum (most-positive) regret value to TUI metrics.
     pub on_max_regret: Option<Box<dyn Fn(f64) + Send>>,
+    /// Callback to push the average positive regret value to TUI metrics.
+    pub on_avg_pos_regret: Option<Box<dyn Fn(f64) + Send>>,
     /// Callback to push fraction of actions below prune threshold to TUI.
     pub on_prune_fraction: Option<Box<dyn Fn(f64) + Send>>,
     /// Last time (in seconds) a strategy refresh was performed.
@@ -205,6 +207,7 @@ impl BlueprintTrainer {
             on_leaf_movement: None,
             on_min_regret: None,
             on_max_regret: None,
+            on_avg_pos_regret: None,
             on_prune_fraction: None,
             last_strategy_refresh_secs: 0,
             prev_strategy_sums: None,
@@ -573,6 +576,9 @@ impl BlueprintTrainer {
             if let Some(ref cb) = self.on_max_regret {
                 cb(self.max_regret());
             }
+            if let Some(ref cb) = self.on_avg_pos_regret {
+                cb(self.avg_pos_regret());
+            }
             if let Some(ref cb) = self.on_prune_fraction {
                 cb(self.traversal_prune_rate());
             }
@@ -632,6 +638,29 @@ impl BlueprintTrainer {
             .max()
             .unwrap_or(0);
         f64::from(max_raw) / 1000.0
+    }
+
+    /// Average of all positive regret entries, divided by the x1000 scaling
+    /// factor. This tracks convergence — should decrease as O(1/sqrt(T)).
+    #[must_use]
+    pub fn avg_pos_regret(&self) -> f64 {
+        let (sum, count) = self
+            .storage
+            .regrets
+            .iter()
+            .fold((0.0_f64, 0_u64), |(s, c), atom| {
+                let r = atom.load(Ordering::Relaxed);
+                if r > 0 {
+                    (s + f64::from(r), c + 1)
+                } else {
+                    (s, c)
+                }
+            });
+        if count > 0 {
+            sum / count as f64 / 1000.0
+        } else {
+            0.0
+        }
     }
 
     /// Fraction of regret entries below the prune threshold (0.0–1.0).

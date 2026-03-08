@@ -594,6 +594,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     metrics_for_max_regret.push_max_regret(val);
                 }));
 
+                let metrics_for_avg_regret = Arc::clone(&metrics);
+                trainer.on_avg_pos_regret = Some(Box::new(move |val| {
+                    metrics_for_avg_regret.push_avg_pos_regret(val);
+                }));
+
                 let metrics_for_prune = Arc::clone(&metrics);
                 trainer.on_prune_fraction = Some(Box::new(move |frac| {
                     metrics_for_prune.set_prune_fraction(frac);
@@ -664,15 +669,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 trainer.tui_active = true;
 
-                let refresh_ms = tui_config.refresh_rate_ms;
-                let refresh = Duration::from_millis(refresh_ms);
-                let refresh_hz = 1000.0 / refresh_ms as f64;
+                let refresh = Duration::from_millis(tui_config.refresh_rate_ms);
                 let tui_handle = blueprint_tui::run_blueprint_tui(
                     Arc::clone(&metrics),
                     scenarios,
                     tui_config.telemetry.clone(),
                     refresh,
-                    refresh_hz,
                 );
 
                 trainer.train()?;
