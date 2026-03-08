@@ -404,8 +404,11 @@ impl BlueprintTrainer {
             let ev_sum = &self.ev_sum;
             let ev_count = &self.ev_count;
 
-            deals.par_iter().for_each(|deal| {
-                let mut rng = SmallRng::from_os_rng();
+            // Pre-seed thread RNGs to avoid OS entropy syscalls in par_iter.
+            let thread_seeds: Vec<u64> = (0..deals.len()).map(|_| self.rng.random()).collect();
+
+            deals.par_iter().enumerate().for_each(|(i, deal)| {
+                let mut rng = SmallRng::seed_from_u64(thread_seeds[i]);
 
                 let ev0 = traverse_external(
                     tree, storage, deal, 0, tree.root, prune, threshold, &mut rng,
