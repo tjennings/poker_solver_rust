@@ -305,6 +305,19 @@ impl GameTree {
                 let mut new_invested = state.invested;
                 new_invested[actor] = call_to;
 
+                // Preflop limp: SB calls the BB blind. BB still gets to act
+                // (check or raise) because the blind is not a voluntary action.
+                if state.street == Street::Preflop && state.num_raises == 0 {
+                    let new_state = BuildState {
+                        invested: new_invested,
+                        to_act: opponent as u8,
+                        facing_bet: false,
+                        num_raises: 0,
+                        ..*state
+                    };
+                    return Self::build_node(config, &new_state, nodes);
+                }
+
                 // After a call, the betting round is over
                 let new_state = BuildState {
                     invested: new_invested,

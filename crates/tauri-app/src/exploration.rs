@@ -184,6 +184,10 @@ pub struct StrategyMatrix {
     pub stack_p2: u32,
     /// Per-player stacks (N-player generalized)
     pub stacks: Vec<u32>,
+    /// Per-hand reaching probability for player 1 (169 canonical hands)
+    pub reaching_p1: Vec<f32>,
+    /// Per-hand reaching probability for player 2 (169 canonical hands)
+    pub reaching_p2: Vec<f32>,
 }
 
 /// Information about an available action.
@@ -568,7 +572,7 @@ pub async fn load_blueprint_v2_core(
         bet_sizes: vec![],
         info_sets: decision_nodes,
         iterations: strategy.iterations,
-        preflop_only: false,
+        preflop_only: true,
     };
 
     *state.source.write() = Some(StrategySource::BlueprintV2 {
@@ -850,6 +854,8 @@ fn get_strategy_matrix_bundle(
         stack_p1: pos_state.stack_p1,
         stack_p2: pos_state.stack_p2,
         stacks: vec![pos_state.stack_p1, pos_state.stack_p2],
+        reaching_p1: vec![],
+        reaching_p2: vec![],
     })
 }
 
@@ -909,6 +915,8 @@ fn get_strategy_matrix_agent(
         stack_p1: pos_state.stack_p1,
         stack_p2: pos_state.stack_p2,
         stacks: vec![pos_state.stack_p1, pos_state.stack_p2],
+        reaching_p1: vec![],
+        reaching_p2: vec![],
     })
 }
 
@@ -985,6 +993,8 @@ fn get_strategy_matrix_preflop(
         stack_p1: walk.stacks.first().copied().unwrap_or(0),
         stack_p2: walk.stacks.get(1).copied().unwrap_or(0),
         stacks: walk.stacks,
+        reaching_p1: vec![],
+        reaching_p2: vec![],
     })
 }
 
@@ -1374,6 +1384,61 @@ fn get_strategy_matrix_v2(
     decision_map: &[u32],
     position: &ExplorationPosition,
 ) -> Result<StrategyMatrix, String> {
+    // Compute reaching probabilities by replaying the history step-by-step.
+    let mut reaching_p1 = vec![1.0_f32; 169];
+    let mut reaching_p2 = vec![1.0_f32; 169];
+    let num_buckets_preflop = strategy.bucket_counts[0] as usize;
+
+    {
+        let mut node_idx = tree.root;
+        for action_str in &position.history {
+            // Skip past chance nodes.
+            if let V2GameNode::Chance { child, .. } = &tree.nodes[node_idx as usize] {
+                node_idx = *child;
+            }
+
+            if let V2GameNode::Decision {
+                player, actions, children, ..
+            } = &tree.nodes[node_idx as usize]
+            {
+                let dec_idx = decision_map
+                    .get(node_idx as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+
+                if dec_idx != u32::MAX {
+                    let action_pos = find_v2_action_position(action_str, actions);
+                    if let Some(action_pos) = action_pos {
+                        let reach = if *player == 0 {
+                            &mut reaching_p1
+                        } else {
+                            &mut reaching_p2
+                        };
+
+                        for hand_idx in 0..169 {
+                            let bucket = if num_buckets_preflop == 169 {
+                                hand_idx as u16
+                            } else {
+                                (hand_idx % num_buckets_preflop) as u16
+                            };
+                            let probs =
+                                strategy.get_action_probs(dec_idx as usize, bucket);
+                            let p = probs.get(action_pos).copied().unwrap_or(0.0);
+                            reach[hand_idx] *= p;
+                        }
+
+                        node_idx = children[action_pos];
+                    }
+                }
+            }
+
+            // Skip past chance nodes after taking the action.
+            if let V2GameNode::Chance { child, .. } = &tree.nodes[node_idx as usize] {
+                node_idx = *child;
+            }
+        }
+    }
+
     let walk = walk_v2_tree(tree, &position.history)?;
     let actions = v2_actions_at_node(tree, walk.node_idx);
 
@@ -1460,11 +1525,14 @@ fn get_strategy_matrix_v2(
         cells.push(row_cells);
     }
 
-    // Compute pot/stacks from the ExplorationPosition (the canonical source).
-    let pot = position.pot;
-    let stack_p1 = position.stacks.first().copied().unwrap_or(0);
-    let stack_p2 = position.stacks.get(1).copied().unwrap_or(0);
-    let to_call = 0; // The frontend computes this from position data.
+    // Compute pot/stacks from the tree (invested amounts at current node).
+    let invested = invested_at_v2_node(tree, walk.node_idx);
+    let stack_depth = _config.game.stack_depth;
+    let pot = ((invested[0] + invested[1]) * 2.0) as u32; // convert BB to half-BB units
+    let stack_p1 = ((stack_depth - invested[0]) * 2.0) as u32;
+    let stack_p2 = ((stack_depth - invested[1]) * 2.0) as u32;
+    // to_call: difference in invested amounts
+    let to_call = ((invested[0] - invested[1]).abs() * 2.0) as u32;
 
     Ok(StrategyMatrix {
         cells,
@@ -1476,6 +1544,8 @@ fn get_strategy_matrix_v2(
         stack_p1,
         stack_p2,
         stacks: position.stacks.clone(),
+        reaching_p1,
+        reaching_p2,
     })
 }
 
@@ -3293,25 +3363,33 @@ fn format_bet_sizes(fractions: &[f64]) -> String {
 /// that fold. For nodes without a fold (e.g. check-only), we look at the Call
 /// child's terminal instead and back out the opponent's investment.
 fn invested_at_v2_node(tree: &V2GameTree, node_idx: u32) -> [f64; 2] {
-    if let V2GameNode::Decision {
-        actions, children, ..
-    } = &tree.nodes[node_idx as usize]
-    {
-        // Try the fold terminal first — its invested is exactly what we want.
-        if let Some(fold_pos) = actions.iter().position(|a| matches!(a, TreeAction::Fold)) {
-            let child_idx = children[fold_pos] as usize;
-            if let V2GameNode::Terminal { invested, .. } = &tree.nodes[child_idx] {
-                return *invested;
+    match &tree.nodes[node_idx as usize] {
+        V2GameNode::Terminal { invested, .. } => *invested,
+        V2GameNode::Chance { child, .. } => invested_at_v2_node(tree, *child),
+        V2GameNode::Decision {
+            actions, children, ..
+        } => {
+            // Try the fold terminal first — its invested is exactly what we want.
+            if let Some(fold_pos) = actions.iter().position(|a| matches!(a, TreeAction::Fold)) {
+                let child_idx = children[fold_pos] as usize;
+                if let V2GameNode::Terminal { invested, .. } = &tree.nodes[child_idx] {
+                    return *invested;
+                }
             }
-        }
-        // Fall back: use the check child or any terminal we can find.
-        for &child in children {
-            if let V2GameNode::Terminal { invested, .. } = &tree.nodes[child as usize] {
-                return *invested;
+            // Fall back: use any terminal child we can find.
+            for &child in children {
+                if let V2GameNode::Terminal { invested, .. } = &tree.nodes[child as usize] {
+                    return *invested;
+                }
             }
+            // No direct terminal children (e.g. first-to-act on a new street has no fold).
+            // Follow Check (same invested) or first child recursively.
+            if let Some(check_pos) = actions.iter().position(|a| matches!(a, TreeAction::Check)) {
+                return invested_at_v2_node(tree, children[check_pos]);
+            }
+            invested_at_v2_node(tree, children[0])
         }
     }
-    [0.0; 2]
 }
 
 /// Compute preflop ranges at a given history position (core logic).

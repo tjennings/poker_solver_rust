@@ -67,7 +67,9 @@ export default function PostflopExplorer({ onBack, blueprintConfig }: PostflopEx
   const [configSummary, setConfigSummary] = useState<PostflopConfigSummary | null>(null);
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
-  const [boardInput, setBoardInput] = useState('');
+  const [boardInput, setBoardInput] = useState(
+    blueprintConfig?.board ? blueprintConfig.board.join(' ') : ''
+  );
   const [error, setError] = useState<string | null>(null);
 
   // Solve state
@@ -231,8 +233,11 @@ export default function PostflopExplorer({ onBack, blueprintConfig }: PostflopEx
   /** Start or cancel solve for the current board. */
   const handleSolve = useCallback(() => {
     if (solving) {
-      // Cancel
-      handleReset();
+      // Cancel: tell backend to stop, then stop polling
+      invoke('postflop_cancel_solve').catch(() => {});
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      setSolving(false);
+      setNeedsSolve(true);
       return;
     }
     const cards = boardInput.trim().split(/\s+/);
@@ -248,7 +253,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig }: PostflopEx
     invoke('postflop_solve_street', { board: cards, target_exploitability: targetExpl })
       .then(() => startPolling())
       .catch((e) => { setError(String(e)); setSolving(false); });
-  }, [solving, boardInput, handleReset, startPolling]);
+  }, [solving, boardInput, startPolling]);
 
   /** Navigate the solved tree by clicking an action button. */
   const handleAction = useCallback(async (actionIndex: number) => {
@@ -345,7 +350,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig }: PostflopEx
       <div className="action-strip">
         {/* Split switcher: load dataset / postflop solver */}
         <div className="dataset-switcher-split">
-          <div className="dataset-switcher-half" onClick={onBack} title="Load Dataset">
+          <div className="dataset-switcher-half" onClick={onBack} title="Load Strategy">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
               <line x1="12" y1="11" x2="12" y2="17" />

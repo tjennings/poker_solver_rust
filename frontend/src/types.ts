@@ -151,6 +151,7 @@ export interface BlueprintConfig {
   ip_bet_sizes: string;
   ip_raise_sizes: string;
   blueprint_dir: string;
+  board?: string[];
 }
 
 // Postflop solver types

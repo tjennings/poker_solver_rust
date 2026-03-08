@@ -30,7 +30,8 @@ pub use postflop::{
     postflop_load_cached, postflop_load_cached_core, postflop_navigate_to,
     postflop_navigate_to_core, postflop_play_action, postflop_play_action_core,
     postflop_set_cache_dir, postflop_set_cache_dir_core, postflop_set_config,
-    postflop_set_config_core, postflop_solve_street, postflop_solve_street_core,
+    postflop_cancel_solve, postflop_cancel_solve_core, postflop_set_config_core,
+    postflop_solve_street, postflop_solve_street_core,
     PostflopState,
 };
 

@@ -328,6 +328,13 @@ async fn handle_postflop_solve_street(
     ))
 }
 
+async fn handle_postflop_cancel_solve(
+    Extension(state): Extension<Arc<PostflopState>>,
+) -> Json<serde_json::Value> {
+    poker_solver_tauri::postflop_cancel_solve_core(&state);
+    to_json_value("ok")
+}
+
 async fn handle_postflop_get_progress(
     Extension(state): Extension<Arc<PostflopState>>,
 ) -> Json<serde_json::Value> {
@@ -447,6 +454,10 @@ async fn main() {
         .route(
             "/api/postflop_solve_street",
             post(handle_postflop_solve_street),
+        )
+        .route(
+            "/api/postflop_cancel_solve",
+            post(handle_postflop_cancel_solve),
         )
         .route(
             "/api/postflop_get_progress",

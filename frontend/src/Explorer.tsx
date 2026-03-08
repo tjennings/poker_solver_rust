@@ -1,11 +1,10 @@
-import { useState, useCallback, useMemo, useEffect } from 'react';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { invoke } from './invoke';
 import PostflopExplorer from './PostflopExplorer';
 import {
   BlueprintConfig,
   BundleInfo,
   CanonicalizeResult,
-  DatasetInfo,
   HandEquity,
   PreflopRanges,
   StrategyMatrix,
@@ -602,73 +601,11 @@ export default function Explorer() {
       .catch(() => setHandEquity(null));
   }, [matrix, selectedCell, bundleInfo, villainHand]);
 
-  const loadSource = useCallback(
-    async (path: string) => {
-      setLoading(true);
-      setError(null);
-      try {
-        const info = await invoke<BundleInfo>('load_bundle', { path });
-        setBundleInfo(info);
-
-        const sp1 = info.stack_depth * 2 - 1;
-        const sp2 = info.stack_depth * 2 - 2;
-        const initialPosition: ExplorationPosition = {
-          board: [],
-          history: [],
-          pot: 3,
-          stacks: [sp1, sp2],
-          stack_p1: sp1,
-          stack_p2: sp2,
-          to_act: 0,
-          num_players: 2,
-          active_players: [true, true],
-        };
-        setPosition(initialPosition);
-        setHistoryItems([]);
-        setPendingStreet(null);
-        setHandResult(null);
-        setSelectedCell(null);
-        const initialMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
-          position: initialPosition,
-        });
-        setMatrix(initialMatrix);
-        updateRangesFromMatrix(initialMatrix);
-      } catch (e) {
-        setError(String(e));
-      } finally {
-        setLoading(false);
-      }
-    },
-    []
-  );
-
-  const [datasets, setDatasets] = useState<DatasetInfo[] | null>(null);
-  const [showDatasetPicker, setShowDatasetPicker] = useState(false);
   const [showPostflop, setShowPostflop] = useState(false);
   const [showBlueprintPicker, setShowBlueprintPicker] = useState(false);
   const [blueprints, setBlueprints] = useState<BlueprintListEntry[]>([]);
   const [blueprintPostflopConfig, setBlueprintPostflopConfig] = useState<BlueprintConfig | null>(null);
-
-  const handleLoadDataset = useCallback(async () => {
-    if ('__TAURI__' in window) {
-      try {
-        const { open } = await import('@tauri-apps/plugin-dialog');
-        const path = await open({ directory: true, title: 'Select Dataset Directory' });
-        if (path) loadSource(path);
-      } catch (e) {
-        setError(String(e));
-      }
-      return;
-    }
-    // Browser mode: fetch dataset list from backend
-    try {
-      const list = await invoke<DatasetInfo[]>('list_datasets', {});
-      setDatasets(list);
-      setShowDatasetPicker(true);
-    } catch (e) {
-      setError(String(e));
-    }
-  }, [loadSource]);
+  const blueprintPostflopConfigRef = useRef<BlueprintConfig | null>(null);
 
   const handleLoadStrategy = async () => {
     const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
@@ -688,6 +625,11 @@ export default function Explorer() {
   // Check if current betting round is complete (needs street transition)
   const checkStreetTransition = useCallback(
     (history: string[], currentStreet: string, _preflopOnly?: boolean): { needsTransition: boolean; nextStreet: string } => {
+      // V2 tree: SB limp immediately transitions to flop (BB has no option)
+      if (history.length === 1 && history[0] === 'c' && currentStreet === 'Preflop') {
+        return { needsTransition: true, nextStreet: 'FLOP' };
+      }
+
       if (history.length < 2) return { needsTransition: false, nextStreet: '' };
 
       const lastTwo = history.slice(-2);
@@ -788,14 +730,14 @@ export default function Explorer() {
         );
 
         if (needsTransition && nextStreet && bundleInfo?.preflop_only) {
-          // Blueprint preflop → postflop transition
+          // Blueprint preflop → postflop transition: compute ranges, show card picker
           try {
             const ranges = await invoke<PreflopRanges>('get_preflop_ranges', {
               history: newHistory,
             });
             const FULL_RANGE = 'AA,KK,QQ,JJ,TT,99,88,77,66,55,44,33,22,AKs,AQs,AJs,ATs,A9s,A8s,A7s,A6s,A5s,A4s,A3s,A2s,KQs,KJs,KTs,K9s,K8s,K7s,K6s,K5s,K4s,K3s,K2s,QJs,QTs,Q9s,Q8s,Q7s,Q6s,Q5s,Q4s,Q3s,Q2s,JTs,J9s,J8s,J7s,J6s,J5s,J4s,J3s,J2s,T9s,T8s,T7s,T6s,T5s,T4s,T3s,T2s,98s,97s,96s,95s,94s,93s,92s,87s,86s,85s,84s,83s,82s,76s,75s,74s,73s,72s,65s,64s,63s,62s,54s,53s,52s,43s,42s,32s,AKo,AQo,AJo,ATo,A9o,A8o,A7o,A6o,A5o,A4o,A3o,A2o,KQo,KJo,KTo,K9o,K8o,K7o,K6o,K5o,K4o,K3o,K2o,QJo,QTo,Q9o,Q8o,Q7o,Q6o,Q5o,Q4o,Q3o,Q2o,JTo,J9o,J8o,J7o,J6o,J5o,J4o,J3o,J2o,T9o,T8o,T7o,T6o,T5o,T4o,T3o,T2o,98o,97o,96o,95o,94o,93o,92o,87o,86o,85o,84o,83o,82o,76o,75o,74o,73o,72o,65o,64o,63o,62o,54o,53o,52o,43o,42o,32o';
             const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
-            setBlueprintPostflopConfig({
+            const bpConfig: BlueprintConfig = {
               oop_range: FULL_RANGE,
               ip_range: FULL_RANGE,
               oop_weights: ranges.oop_weights,
@@ -807,13 +749,17 @@ export default function Explorer() {
               ip_bet_sizes: ranges.ip_bet_sizes,
               ip_raise_sizes: ranges.ip_raise_sizes,
               blueprint_dir: globalConfig.blueprint_dir || '',
-            });
-            setShowPostflop(true);
+            };
+            setBlueprintPostflopConfig(bpConfig);
+            blueprintPostflopConfigRef.current = bpConfig;
           } catch (e) {
             setError(String(e));
+            return;
           }
-          return;
-        } else if (needsTransition && nextStreet) {
+          // Fall through to show the card picker (same as non-blueprint path)
+        }
+
+        if (needsTransition && nextStreet) {
           // Compute pot/stacks entering the new street.
           // A call adds to_call to pot and subtracts from the caller's stack.
           const transitionPot =
@@ -877,11 +823,19 @@ export default function Explorer() {
         const result = await invoke<CanonicalizeResult>('canonicalize_board', { cards });
         const canonicalCards = result.canonical_cards;
 
+        // Blueprint preflop → postflop: transition to PostflopExplorer with board pre-filled
+        if (blueprintPostflopConfigRef.current) {
+          const withBoard = { ...blueprintPostflopConfigRef.current, board: canonicalCards };
+          setBlueprintPostflopConfig(withBoard);
+          blueprintPostflopConfigRef.current = withBoard;
+          setPendingStreet(null);
+          setShowPostflop(true);
+          return;
+        }
+
         // Track remap info for the indicator.
-        // On flop: establish if remapped. On turn/river: always accumulate if a mapping exists.
         setRemapInfo((prev) => {
           if (result.remapped && result.suit_map) {
-            // This street introduced new suit substitutions
             return {
               original: [...(prev?.original ?? []), ...cards],
               canonical: [...(prev?.canonical ?? []), ...canonicalCards],
@@ -889,7 +843,6 @@ export default function Explorer() {
             };
           }
           if (prev) {
-            // Mapping exists from a prior street — accumulate even if this card didn't change
             return {
               ...prev,
               original: [...prev.original, ...cards],
@@ -911,7 +864,6 @@ export default function Explorer() {
         setHistoryItems((prev) => [...prev, streetItem]);
 
         // Update board, reset history for new street.
-        // Use pot/stacks from pendingStreet (computed at transition time).
         const newBoard = [...position.board, ...canonicalCards];
         const newPosition: ExplorationPosition = {
           board: newBoard,
@@ -920,7 +872,7 @@ export default function Explorer() {
           stacks: [pendingStreet.stack_p1, pendingStreet.stack_p2],
           stack_p1: pendingStreet.stack_p1,
           stack_p2: pendingStreet.stack_p2,
-          to_act: 0, // OOP acts first postflop
+          to_act: 0,
           num_players: 2,
           active_players: [true, true],
         };
@@ -929,8 +881,6 @@ export default function Explorer() {
 
         await invoke('start_bucket_computation', { board: newBoard });
 
-        // Compute street histories: existing completed streets + the just-completed street.
-        // position.history is already in short format (e.g. "r:0", "c").
         const sh = [...extractStreetHistories(historyItems), [...position.history]];
 
         const newMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
@@ -1104,72 +1054,77 @@ export default function Explorer() {
     <div className="explorer">
       {error && <div className="error">{error}</div>}
 
+      {!showPostflop && (
+      <div className="action-strip">
+        <div className="dataset-switcher-split">
+          <div className="dataset-switcher-half" onClick={handleLoadStrategy} title="Load Strategy">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+              <line x1="12" y1="11" x2="12" y2="17" />
+              <line x1="9" y1="14" x2="15" y2="14" />
+            </svg>
+          </div>
+          <div className="dataset-switcher-half" onClick={() => setShowPostflop(true)} title="Range Solve">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="2" y="2" width="20" height="20" rx="2" />
+              <path d="M7 12h10M12 7v10" />
+            </svg>
+          </div>
+        </div>
+
       {bundleInfo && (
         <>
-          <div className="action-strip">
-            <div className="dataset-switcher-split">
-              <div className="dataset-switcher-half" onClick={handleLoadDataset} title="Load Dataset">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                  <line x1="12" y1="11" x2="12" y2="17" />
-                  <line x1="9" y1="14" x2="15" y2="14" />
-                </svg>
-              </div>
-              <div className="dataset-switcher-half" onClick={() => setShowPostflop(true)} title="Postflop Solver">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="2" y="2" width="20" height="20" rx="2" />
-                  <path d="M7 12h10M12 7v10" />
-                </svg>
-              </div>
-            </div>
-            {historyItems.map((item, idx) =>
-              item.type === 'action' ? (
-                <ActionBlock
-                  key={idx}
-                  position={item.position}
-                  stack={item.stack}
-                  pot={item.pot}
-                  actions={item.actions}
-                  selectedAction={item.selected}
-                  onSelect={() => handleHistoryRewind(idx)}
-                  onHeaderClick={() => handleHistoryRewind(idx)}
-                  isCurrent={false}
-                />
-              ) : (
-                <StreetBlock
-                  key={idx}
-                  street={item.street}
-                  pot={item.pot}
-                  cards={item.cards}
-                  expectedCards={item.cards.length}
-                  onHeaderClick={() => handleStreetRewind(idx)}
-                  remapInfo={remapInfo}
-                />
-              )
-            )}
-
-            {pendingStreet && (
-              <StreetBlock
-                street={pendingStreet.street}
-                pot={pendingStreet.pot}
-                cards={[]}
-                expectedCards={pendingStreet.expectedCards}
-              />
-            )}
-
-            {matrix && !pendingStreet && (
+          {historyItems.map((item, idx) =>
+            item.type === 'action' ? (
               <ActionBlock
-                position={position.to_act === 0 ? 'SB' : 'BB'}
-                stack={matrix.stack}
-                pot={matrix.pot}
-                actions={matrix.actions}
-                onSelect={handleActionSelect}
-                isCurrent={true}
+                key={idx}
+                position={item.position}
+                stack={item.stack}
+                pot={item.pot}
+                actions={item.actions}
+                selectedAction={item.selected}
+                onSelect={() => handleHistoryRewind(idx)}
+                onHeaderClick={() => handleHistoryRewind(idx)}
+                isCurrent={false}
               />
-            )}
-          </div>
+            ) : (
+              <StreetBlock
+                key={idx}
+                street={item.street}
+                pot={item.pot}
+                cards={item.cards}
+                expectedCards={item.cards.length}
+                onHeaderClick={() => handleStreetRewind(idx)}
+                remapInfo={remapInfo}
+              />
+            )
+          )}
 
-          {matrix && (
+          {pendingStreet && (
+            <StreetBlock
+              street={pendingStreet.street}
+              pot={pendingStreet.pot}
+              cards={[]}
+              expectedCards={pendingStreet.expectedCards}
+            />
+          )}
+
+          {matrix && !pendingStreet && (
+            <ActionBlock
+              position={position.to_act === 0 ? 'SB' : 'BB'}
+              stack={matrix.stack}
+              pot={matrix.pot}
+              actions={matrix.actions}
+              onSelect={handleActionSelect}
+              isCurrent={true}
+            />
+          )}
+        </>
+      )}
+      </div>
+      )}
+
+      {!showPostflop && bundleInfo && matrix && (
             <div className="range-toolbar">
               <button
                 className={`range-edit-btn ${editingPlayer === 0 ? 'active' : ''}`}
@@ -1198,7 +1153,7 @@ export default function Explorer() {
             </div>
           )}
 
-          {matrix && (
+      {!showPostflop && bundleInfo && matrix && (
             <div className="matrix-container">
               <div className="matrix-with-detail">
                 <div className="hand-matrix">
@@ -1307,45 +1262,33 @@ export default function Explorer() {
             </div>
           )}
 
-          {!matrix && pendingStreet && (
-            <div className="card-picker-container">
-              <p className="card-picker-prompt">
-                Select {pendingStreet.street.toLowerCase()} card{pendingStreet.expectedCards > 1 ? 's' : ''}
-              </p>
-              <CardPicker
-                expectedCards={pendingStreet.expectedCards}
-                deadCards={position.board}
-                onConfirm={handleStreetCardsSet}
-              />
-            </div>
-          )}
-
-          {handResult && (
-            <div className="hand-complete">
-              <p className="hand-complete-result">
-                {handResult.type === 'fold' ? 'Player folded' : 'Showdown'} — Pot: {handResult.pot}
-              </p>
-              <button className="new-hand-btn" onClick={handleNewHand}>
-                New Hand
-              </button>
-            </div>
-          )}
-        </>
+      {!showPostflop && bundleInfo && !matrix && pendingStreet && (
+        <div className="card-picker-container">
+          <p className="card-picker-prompt">
+            Select {pendingStreet.street.toLowerCase()} card{pendingStreet.expectedCards > 1 ? 's' : ''}
+          </p>
+          <CardPicker
+            expectedCards={pendingStreet.expectedCards}
+            deadCards={position.board}
+            onConfirm={handleStreetCardsSet}
+          />
+        </div>
       )}
 
-      {!bundleInfo && !loading && !showDatasetPicker && !showPostflop && !showBlueprintPicker && (
-        <div className="explorer-landing">
-          <button className="landing-btn" onClick={handleLoadStrategy}>
-            Load Strategy
-          </button>
-          <button className="landing-btn" onClick={() => setShowPostflop(true)}>
-            Range Solve
+      {!showPostflop && bundleInfo && handResult && (
+        <div className="hand-complete">
+          <p className="hand-complete-result">
+            {handResult.type === 'fold' ? 'Player folded' : 'Showdown'} — Pot: {handResult.pot}
+          </p>
+          <button className="new-hand-btn" onClick={handleNewHand}>
+            New Hand
           </button>
         </div>
       )}
 
       {showBlueprintPicker && (
-        <div className="dataset-picker">
+        <div className="dataset-picker-overlay" onClick={() => setShowBlueprintPicker(false)}>
+        <div className="dataset-picker" onClick={e => e.stopPropagation()}>
           <div className="dataset-picker-header">
             <h3>Select Blueprint</h3>
             <button className="dataset-picker-close" onClick={() => setShowBlueprintPicker(false)}>×</button>
@@ -1402,6 +1345,7 @@ export default function Explorer() {
             </div>
           )}
         </div>
+        </div>
       )}
 
       {showPostflop && (
@@ -1409,34 +1353,6 @@ export default function Explorer() {
           onBack={() => { setShowPostflop(false); setBlueprintPostflopConfig(null); }}
           blueprintConfig={blueprintPostflopConfig ?? undefined}
         />
-      )}
-
-      {showDatasetPicker && datasets && (
-        <div className="dataset-picker">
-          <div className="dataset-picker-header">
-            <h3>Select Dataset</h3>
-            <button className="dataset-picker-close" onClick={() => setShowDatasetPicker(false)}>×</button>
-          </div>
-          {datasets.length === 0 ? (
-            <p className="dataset-picker-empty">No datasets found in local_data/ or agents/</p>
-          ) : (
-            <div className="dataset-picker-list">
-              {datasets.map((ds) => (
-                <div
-                  key={ds.path}
-                  className="dataset-picker-item"
-                  onClick={() => {
-                    setShowDatasetPicker(false);
-                    loadSource(ds.path);
-                  }}
-                >
-                  <span className={`dataset-kind-badge ${ds.kind}`}>{ds.kind}</span>
-                  <span className="dataset-name">{ds.name}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
       )}
 
       {loading && <div className="loading">Loading...</div>}

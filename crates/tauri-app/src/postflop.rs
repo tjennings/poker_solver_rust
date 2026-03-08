@@ -750,6 +750,19 @@ pub async fn postflop_solve_street(
 }
 
 // ---------------------------------------------------------------------------
+// postflop_cancel_solve
+// ---------------------------------------------------------------------------
+
+pub fn postflop_cancel_solve_core(state: &PostflopState) {
+    state.solving.store(false, Ordering::Release);
+}
+
+#[tauri::command]
+pub fn postflop_cancel_solve(state: tauri::State<'_, Arc<PostflopState>>) {
+    postflop_cancel_solve_core(&state);
+}
+
+// ---------------------------------------------------------------------------
 // postflop_get_progress
 // ---------------------------------------------------------------------------
 
