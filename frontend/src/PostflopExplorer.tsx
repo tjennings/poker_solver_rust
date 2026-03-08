@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { invoke } from './invoke';
 import {
   ActionInfo,
+  BlueprintConfig,
   MatrixCell,
   PostflopConfig,
   PostflopConfigSummary,
@@ -34,18 +35,33 @@ function toMatrixCell(cell: { hand: string; suited: boolean; pair: boolean; prob
 
 interface PostflopExplorerProps {
   onBack: () => void;
+  blueprintConfig?: BlueprintConfig;
 }
 
-export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
-  const [config, setConfig] = useState<PostflopConfig>({
-    oop_range: 'QQ+,AKs,AKo',
-    ip_range: 'TT+,AQs+,AKo',
-    pot: 30,
-    effective_stack: 170,
-    oop_bet_sizes: '25%,33%,75%,a',
-    oop_raise_sizes: 'a',
-    ip_bet_sizes: '25%,33%,75%,a',
-    ip_raise_sizes: 'a',
+export default function PostflopExplorer({ onBack, blueprintConfig }: PostflopExplorerProps) {
+  const [config, setConfig] = useState<PostflopConfig>(() => {
+    if (blueprintConfig) {
+      return {
+        oop_range: blueprintConfig.oop_range,
+        ip_range: blueprintConfig.ip_range,
+        pot: blueprintConfig.pot,
+        effective_stack: blueprintConfig.effective_stack,
+        oop_bet_sizes: blueprintConfig.oop_bet_sizes,
+        oop_raise_sizes: blueprintConfig.oop_raise_sizes,
+        ip_bet_sizes: blueprintConfig.ip_bet_sizes,
+        ip_raise_sizes: blueprintConfig.ip_raise_sizes,
+      };
+    }
+    return {
+      oop_range: 'QQ+,AKs,AKo',
+      ip_range: 'TT+,AQs+,AKo',
+      pot: 30,
+      effective_stack: 170,
+      oop_bet_sizes: '25%,33%,75%,a',
+      oop_raise_sizes: 'a',
+      ip_bet_sizes: '25%,33%,75%,a',
+      ip_raise_sizes: 'a',
+    };
   });
   const [configSummary, setConfigSummary] = useState<PostflopConfigSummary | null>(null);
   const [showConfigModal, setShowConfigModal] = useState(false);
@@ -87,10 +103,29 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
   }, [boardInput]);
 
   useEffect(() => {
-    invoke<PostflopConfigSummary>('postflop_set_config', { config })
-      .then(setConfigSummary)
-      .catch((e) => setError(String(e)));
-  }, []);
+    const autoApply = async () => {
+      try {
+        const summary = await invoke<PostflopConfigSummary>('postflop_set_config', { config });
+        setConfigSummary(summary);
+        if (blueprintConfig) {
+          // Set blueprint weights as filtered weights for the solve
+          await invoke('postflop_set_filtered_weights', {
+            oop_weights: blueprintConfig.oop_weights,
+            ip_weights: blueprintConfig.ip_weights,
+          }).catch(() => {
+            // Command may not exist yet; weights will come from range strings
+          });
+          // Set cache dir if the command exists
+          await invoke('postflop_set_cache_dir', { dir: blueprintConfig.blueprint_dir }).catch(() => {
+            // Command may not exist yet (Task 8)
+          });
+        }
+      } catch (e) {
+        setError(String(e));
+      }
+    };
+    autoApply();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleConfigSubmit = useCallback(async (newConfig: PostflopConfig) => {
     setConfigError(null);
@@ -164,7 +199,9 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
     setMatrix(null);
     setProgress(null);
     initialExplRef.current = Infinity;
-    invoke('postflop_solve_street', { board: cards, target_exploitability: 3.0 })
+    const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
+    const targetExpl = globalConfig.target_exploitability ?? 3.0;
+    invoke('postflop_solve_street', { board: cards, target_exploitability: targetExpl })
       .then(() => startPolling())
       .catch((e) => { setError(String(e)); setSolving(false); });
   }, [solving, boardInput, handleReset, startPolling]);
@@ -280,8 +317,11 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
         </div>
 
         {/* Config card */}
-        <div className="action-block postflop-config-card" onClick={() => setShowConfigModal(true)}>
-          <div className="postflop-config-label">Config</div>
+        <div className="action-block postflop-config-card"
+          onClick={blueprintConfig ? undefined : () => setShowConfigModal(true)}
+          style={blueprintConfig ? { cursor: 'default' } : undefined}
+        >
+          <div className="postflop-config-label">{blueprintConfig ? 'Blueprint' : 'Config'}</div>
           <div className="postflop-config-summary">
             {config.pot} pot / {config.effective_stack} eff
           </div>
@@ -462,7 +502,8 @@ export default function PostflopExplorer({ onBack }: PostflopExplorerProps) {
       {/* Progress bar */}
       {solving && progress && (() => {
         const expl = progress.exploitability;
-        const target = 3.0;
+        const globalCfg = JSON.parse(localStorage.getItem('global_config') || '{}');
+        const target = globalCfg.target_exploitability ?? 3.0;
         const valid = expl < 1e30;
         // Progress toward target: start from first reading, converge to target
         const startExpl = initialExplRef.current;

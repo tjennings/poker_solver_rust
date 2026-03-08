@@ -138,6 +138,21 @@ export interface SimulationResult {
   elapsed_ms: number;
 }
 
+// Blueprint-derived config for postflop exploration
+export interface BlueprintConfig {
+  oop_range: string;
+  ip_range: string;
+  oop_weights: number[];
+  ip_weights: number[];
+  pot: number;
+  effective_stack: number;
+  oop_bet_sizes: string;
+  oop_raise_sizes: string;
+  ip_bet_sizes: string;
+  ip_raise_sizes: string;
+  blueprint_dir: string;
+}
+
 // Postflop solver types
 
 export interface PostflopConfig {
