@@ -23,6 +23,7 @@ fn main() {
             poker_solver_tauri::get_computation_status,
             poker_solver_tauri::is_board_cached,
             poker_solver_tauri::list_agents,
+            poker_solver_tauri::list_blueprints,
             poker_solver_tauri::get_combo_classes,
             poker_solver_tauri::get_hand_equity,
             // Simulation commands
