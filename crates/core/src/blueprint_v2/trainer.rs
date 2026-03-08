@@ -744,10 +744,10 @@ impl BlueprintTrainer {
 
     /// Compute average chip EV per canonical preflop hand.
     ///
-    /// Returns a 169-element vector of `(hand_name, avg_ev)` pairs,
+    /// Returns a 169-element vector of `(hand_name, avg_ev, sample_count)`,
     /// ordered by the canonical 169 hand index.
     #[must_use]
-    pub fn hand_ev_averages(&self) -> Vec<(String, f64)> {
+    pub fn hand_ev_averages(&self) -> Vec<(String, f64, u64)> {
         (0..169)
             .map(|i| {
                 // INVARIANT: indices 0..169 are always valid for `from_index`.
@@ -759,7 +759,7 @@ impl BlueprintTrainer {
                 } else {
                     0.0
                 };
-                (hand.to_string(), avg)
+                (hand.to_string(), avg, count)
             })
             .collect()
     }
@@ -794,11 +794,13 @@ impl BlueprintTrainer {
 
         bundle::save_snapshot(&snapshot_dir, &strategy, &self.storage, &metadata)?;
 
-        // Write per-hand chip EV averages.
+        // Write per-hand chip EV averages with sample counts.
         let hand_evs = self.hand_ev_averages();
         let mut ev_json = String::from("{\n");
-        for (i, (name, ev)) in hand_evs.iter().enumerate() {
-            ev_json.push_str(&format!("  \"{name}\": {ev:.4}"));
+        for (i, (name, ev, count)) in hand_evs.iter().enumerate() {
+            ev_json.push_str(&format!(
+                "  \"{name}\": {{\"ev\": {ev:.4}, \"samples\": {count}}}"
+            ));
             if i < hand_evs.len() - 1 {
                 ev_json.push(',');
             }
@@ -1008,9 +1010,14 @@ mod tests {
         // Verify hand_ev.json is valid JSON with 169 entries.
         let ev_json = std::fs::read_to_string(snapshot_dir.join("hand_ev.json"))
             .expect("read hand_ev.json");
-        let ev_map: std::collections::BTreeMap<String, f64> =
+        let ev_map: std::collections::BTreeMap<String, serde_json::Value> =
             serde_json::from_str(&ev_json).expect("parse hand_ev.json");
         assert_eq!(ev_map.len(), 169, "should have 169 hand entries");
+        // Verify each entry has ev and samples fields.
+        for val in ev_map.values() {
+            assert!(val.get("ev").and_then(|v| v.as_f64()).is_some());
+            assert!(val.get("samples").and_then(|v| v.as_u64()).is_some());
+        }
     }
 
     #[test]
