@@ -15,7 +15,7 @@
 use std::error::Error;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use rand::prelude::*;
@@ -30,6 +30,20 @@ use super::mccfr::{traverse_external, AllBuckets, Deal, DealWithBuckets, PRUNE_H
 use super::storage::BlueprintStorage;
 use crate::hands::CanonicalHand;
 use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
+
+/// Pre-initialized canonical deck — copied into the trainer's deck buffer
+/// via memcpy instead of rebuilding from VALUE×SUIT loops each deal.
+static CANONICAL_DECK: LazyLock<[Card; 52]> = LazyLock::new(|| {
+    let mut deck = [Card::new(ALL_VALUES[0], ALL_SUITS[0]); 52];
+    let mut idx = 0;
+    for &v in &ALL_VALUES {
+        for &s in &ALL_SUITS {
+            deck[idx] = Card::new(v, s);
+            idx += 1;
+        }
+    }
+    deck
+});
 
 /// Attempt to load `.buckets` files from the given directory.
 ///
@@ -180,14 +194,7 @@ impl BlueprintTrainer {
         };
         let rng = StdRng::seed_from_u64(config.clustering.seed);
 
-        let mut deck = [Card::new(ALL_VALUES[0], ALL_SUITS[0]); 52];
-        let mut idx = 0;
-        for &v in &ALL_VALUES {
-            for &s in &ALL_SUITS {
-                deck[idx] = Card::new(v, s);
-                idx += 1;
-            }
-        }
+        let deck = *CANONICAL_DECK;
 
         Self {
             tree,
@@ -437,13 +444,7 @@ impl BlueprintTrainer {
     /// shuffles only the first 9 positions (2×2 hole + 5 board).
     pub fn sample_deal(&mut self) -> Deal {
         // Reset deck to canonical order (avoids tracking swap state).
-        let mut idx = 0;
-        for &v in &ALL_VALUES {
-            for &s in &ALL_SUITS {
-                self.deck[idx] = Card::new(v, s);
-                idx += 1;
-            }
-        }
+        self.deck = *CANONICAL_DECK;
 
         // Partial Fisher-Yates: shuffle only the first 9 positions.
         for i in 0..9 {
