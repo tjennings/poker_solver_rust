@@ -105,7 +105,7 @@ pub fn action_color_ranked(name: &str, rank: usize, total_bets: usize) -> Color 
         let b = (30.0 + 70.0 * t) as u8;   // 30 → 100
         return Color::Rgb(r, g, b);
     }
-    if lower.contains("all") || lower.contains("ai") {
+    if lower == "all-in" || lower == "allin" {
         return Color::Rgb(180, 30, 180); // purple for all-in
     }
     Color::DarkGray
@@ -259,7 +259,7 @@ fn is_bet_or_raise(name: &str) -> bool {
 /// Sort key for display ordering: all-in, raises large→small, call/check, fold.
 fn action_sort_key(name: &str) -> (u8, i64) {
     let lower = name.to_ascii_lowercase();
-    if lower.contains("all") || lower.contains("ai") {
+    if lower == "all-in" || lower == "allin" {
         (0, 0) // all-in first
     } else if lower.starts_with("bet") || lower.starts_with("raise") {
         let size: f64 = lower
