@@ -205,3 +205,10 @@ export interface PostflopPlayResult {
   pot: number;
   stacks: [number, number];
 }
+
+export interface BlueprintListEntry {
+  name: string;
+  path: string;
+  stack_depth: number;
+  has_strategy: boolean;
+}
