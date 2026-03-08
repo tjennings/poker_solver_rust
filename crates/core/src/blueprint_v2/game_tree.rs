@@ -84,7 +84,19 @@ struct TreeConfig {
     flop_sizes: Vec<Vec<f64>>,
     turn_sizes: Vec<Vec<f64>>,
     river_sizes: Vec<Vec<f64>>,
-    max_raises: u8,
+}
+
+impl TreeConfig {
+    /// Maximum raises for a street = number of declared size depths for that street.
+    fn max_raises_for_street(&self, street: Street) -> u8 {
+        let len = match street {
+            Street::Preflop => self.preflop_sizes.len(),
+            Street::Flop => self.flop_sizes.len(),
+            Street::Turn => self.turn_sizes.len(),
+            Street::River => self.river_sizes.len(),
+        };
+        len as u8
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,10 +130,9 @@ impl GameTree {
     /// * `preflop_sizes` - Per raise depth, list of size strings
     ///   (`"2.5bb"` = absolute, `"3.0x"` = multiplier of last raise)
     /// * `flop_sizes`, `turn_sizes`, `river_sizes` - Per raise depth,
-    ///   list of pot fractions
-    /// * `max_raises` - Global cap on raises per street
+    ///   list of pot fractions. The number of entries determines the
+    ///   maximum raises allowed on that street.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
         stack_depth: f64,
         small_blind: f64,
@@ -130,7 +141,6 @@ impl GameTree {
         flop_sizes: &[Vec<f64>],
         turn_sizes: &[Vec<f64>],
         river_sizes: &[Vec<f64>],
-        max_raises: u8,
     ) -> Self {
         let config = TreeConfig {
             preflop_sizes: preflop_sizes
@@ -140,7 +150,6 @@ impl GameTree {
             flop_sizes: flop_sizes.to_vec(),
             turn_sizes: turn_sizes.to_vec(),
             river_sizes: river_sizes.to_vec(),
-            max_raises,
         };
 
         let mut nodes = Vec::new();
@@ -196,8 +205,8 @@ impl GameTree {
             actions.push(TreeAction::Check);
         }
 
-        // Bet/Raise sizes (only if under max raises and actor has chips)
-        let can_raise = state.num_raises < config.max_raises
+        // Bet/Raise sizes (only if under the street's declared raise depths and actor has chips)
+        let can_raise = state.num_raises < config.max_raises_for_street(state.street)
             && remaining[actor] > SIZE_EPSILON;
         // Also need enough chips to make a legal raise (at least min-raise)
         if can_raise {
@@ -730,7 +739,6 @@ mod tests {
             &[vec![1.0]],
             &[vec![1.0]],
             &[vec![1.0]],
-            1,
         )
     }
 
@@ -775,7 +783,6 @@ mod tests {
             &[vec![0.5]],
             &[vec![0.5]],
             &[vec![0.5]],
-            1,
         );
         for node in &tree.nodes {
             if let GameNode::Decision { actions, .. } = node {
@@ -858,7 +865,8 @@ mod tests {
     }
 
     #[test]
-    fn test_max_raises_enforced() {
+    fn test_raise_depths_enforced() {
+        // 2 preflop depths, 2 flop depths, 1 turn, 1 river
         let tree = GameTree::build(
             100.0,
             0.5,
@@ -867,7 +875,6 @@ mod tests {
             &[vec![1.0], vec![1.0]],
             &[vec![1.0]],
             &[vec![1.0]],
-            2,
         );
         assert!(tree.nodes.len() > 10, "Tree should have substantial nodes");
     }
@@ -965,18 +972,17 @@ mod tests {
     }
 
     #[test]
-    fn test_no_raise_after_max_raises() {
-        // With max_raises=1, SB can open-raise (raise #1), but BB
-        // cannot re-raise (would be raise #2).
+    fn test_no_raise_after_declared_depths() {
+        // With 1 preflop depth, SB can open-raise (raise #1), but BB
+        // cannot re-raise (would exceed declared depths).
         let tree = GameTree::build(
             10.0,
             0.5,
             1.0,
-            &[vec!["2.5bb".into()], vec!["3.0x".into()]],
+            &[vec!["2.5bb".into()]],
             &[vec![1.0]],
             &[vec![1.0]],
             &[vec![1.0]],
-            1,
         );
         // Root: SB should be able to raise
         if let GameNode::Decision {
@@ -986,7 +992,7 @@ mod tests {
             let raise_idx = actions
                 .iter()
                 .position(|a| matches!(a, TreeAction::Raise(_)))
-                .expect("SB should have a raise with max_raises=1");
+                .expect("SB should have a raise with 1 preflop depth");
 
             // BB's response to SB's raise: should NOT have raise actions
             let bb_node = &tree.nodes[children[raise_idx] as usize];
@@ -996,7 +1002,7 @@ mod tests {
                 });
                 assert!(
                     !has_raise,
-                    "BB should not raise after max_raises=1 is hit. Actions: {actions:?}"
+                    "BB should not raise after 1 preflop depth is exhausted. Actions: {actions:?}"
                 );
             }
         }
@@ -1008,11 +1014,10 @@ mod tests {
             100.0,
             0.5,
             1.0,
-            &[vec!["2.5bb".into()], vec!["3.0x".into()]],
+            &[vec!["2.5bb".into()], vec!["3.0x".into()], vec!["3.0x".into()]],
             &[vec![1.0]],
             &[vec![1.0]],
             &[vec![1.0]],
-            3,
         );
         // SB raises to 2.5bb. BB can re-raise to 3.0x * 2.5 = 7.5bb
         // Find BB's response to SB's raise
@@ -1043,11 +1048,10 @@ mod tests {
             100.0,
             0.5,
             1.0,
-            &[vec!["2.5bb".into()], vec!["3.0x".into()]],
+            &[vec!["2.5bb".into()], vec!["3.0x".into()], vec!["3.0x".into()]],
             &[vec![0.5, 1.0], vec![0.5, 1.0]],
             &[vec![0.5, 1.0], vec![0.5, 1.0]],
             &[vec![0.5, 1.0], vec![0.5, 1.0]],
-            3,
         );
         let (decision, chance, terminal) = tree.node_counts();
         assert!(
@@ -1114,10 +1118,9 @@ mod tests {
             0.5,
             1.0,
             &[vec!["2.0bb".into()]],
-            &[vec![0.5]],
-            &[vec![0.5]],
-            &[vec![0.5]],
-            2,
+            &[vec![0.5], vec![0.5]],
+            &[vec![0.5], vec![0.5]],
+            &[vec![0.5], vec![0.5]],
         );
         // Find a flop decision where player opens with a bet
         for node in &tree.nodes {

@@ -28,7 +28,6 @@ fn toy_config() -> BlueprintV2Config {
             flop: vec![vec![1.0]],
             turn: vec![vec![1.0]],
             river: vec![vec![1.0]],
-            max_raises: 1,
         },
         training: TrainingConfig {
             cluster_path: "clusters/".into(),

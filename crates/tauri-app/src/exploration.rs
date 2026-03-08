@@ -549,7 +549,6 @@ pub async fn load_blueprint_v2_core(
         &aa.flop,
         &aa.turn,
         &aa.river,
-        aa.max_raises,
     );
     let decision_map = tree.decision_index_map();
 

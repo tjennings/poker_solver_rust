@@ -35,7 +35,6 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
             flop: vec![vec![1.0]],
             turn: vec![vec![1.0]],
             river: vec![vec![1.0]],
-            max_raises: 1,
         },
         training: TrainingConfig {
             cluster_path: cluster_dir.to_string_lossy().into_owned(),

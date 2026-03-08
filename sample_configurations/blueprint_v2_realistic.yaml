@@ -33,7 +33,6 @@ action_abstraction:
   river:
     - [0.5, 1.0]
     - [1.0]
-  max_raises: 3
 
 training:
   cluster_path: clusters/realistic/

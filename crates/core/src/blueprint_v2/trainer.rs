@@ -151,7 +151,6 @@ impl BlueprintTrainer {
             &config.action_abstraction.flop,
             &config.action_abstraction.turn,
             &config.action_abstraction.river,
-            config.action_abstraction.max_raises,
         );
 
         let bucket_counts = [
@@ -728,7 +727,6 @@ mod tests {
                 flop: vec![vec![1.0]],
                 turn: vec![vec![1.0]],
                 river: vec![vec![1.0]],
-                max_raises: 1,
             },
             training: TrainingConfig {
                 cluster_path: "clusters/".into(),

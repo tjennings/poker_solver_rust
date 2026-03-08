@@ -29,7 +29,6 @@ action_abstraction:
     - [0.5, 1.0]
   river:
     - [0.5, 1.0]
-  max_raises: 2
 
 training:
   cluster_path: clusters/toy/

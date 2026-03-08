@@ -64,8 +64,6 @@ pub struct ActionAbstractionConfig {
     pub turn: Vec<Vec<f64>>,
     /// River bet sizes as pot fractions, indexed by raise depth.
     pub river: Vec<Vec<f64>>,
-    /// Maximum number of raises allowed per street.
-    pub max_raises: u8,
 }
 
 /// MCCFR training schedule and parameters.
@@ -196,7 +194,6 @@ action_abstraction:
   river:
     - [0.5, 1.0]
     - [1.0]
-  max_raises: 3
 
 training:
   cluster_path: "/tmp/clusters"
@@ -235,7 +232,6 @@ snapshots:
         assert_eq!(cfg.action_abstraction.preflop.len(), 2);
         assert_eq!(cfg.action_abstraction.preflop[0], vec!["2.5bb"]);
         assert_eq!(cfg.action_abstraction.flop[0], vec![0.33, 0.67, 1.0]);
-        assert_eq!(cfg.action_abstraction.max_raises, 3);
 
         // Training
         assert_eq!(cfg.training.cluster_path, "/tmp/clusters");
@@ -279,7 +275,6 @@ snapshots:
                 flop: vec![vec![0.5, 1.0]],
                 turn: vec![vec![0.5, 1.0]],
                 river: vec![vec![1.0]],
-                max_raises: 4,
             },
             training: TrainingConfig {
                 cluster_path: "/data/clusters".to_owned(),
@@ -316,7 +311,6 @@ snapshots:
         assert_eq!(restored.clustering.flop.buckets, 500);
 
         // Action abstraction
-        assert_eq!(restored.action_abstraction.max_raises, 4);
         assert_eq!(restored.action_abstraction.preflop, original.action_abstraction.preflop);
         assert_eq!(restored.action_abstraction.river, original.action_abstraction.river);
 

@@ -468,7 +468,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 bp_config.clustering.turn.buckets,
                 bp_config.clustering.river.buckets,
             );
-            eprintln!("  Actions: max_raises={}", bp_config.action_abstraction.max_raises);
+            eprintln!("  Actions: preflop_depths={} flop_depths={} turn_depths={} river_depths={}",
+                bp_config.action_abstraction.preflop.len(),
+                bp_config.action_abstraction.flop.len(),
+                bp_config.action_abstraction.turn.len(),
+                bp_config.action_abstraction.river.len(),
+            );
             if let Some(iters) = bp_config.training.iterations {
                 eprintln!("  Iterations: {iters}");
             }
