@@ -93,6 +93,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
   const [currentStreetIndex, setCurrentStreetIndex] = useState(0);
   const pollRef = useRef<number | null>(null);
   const initialExplRef = useRef<number>(Infinity);
+  const pendingNavRef = useRef(false);
 
   // Navigation state
   const [showFlopPicker, setShowFlopPicker] = useState(false);
@@ -106,6 +107,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
   // Cache integration
   const [cacheInfo, setCacheInfo] = useState<CacheInfo | null>(null);
   const [loadingCache, setLoadingCache] = useState(false);
+  const blockedAtChanceRef = useRef(false);
   const [priorStreetActions, setPriorStreetActions] = useState<number[][]>([]);
 
   const boardCards = useMemo(() => {
@@ -190,6 +192,15 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
   // Cleanup polling on unmount
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
+  // When solve finishes while blocked at a chance node, transition to card picker
+  useEffect(() => {
+    if (!solving && blockedAtChanceRef.current) {
+      blockedAtChanceRef.current = false;
+      setTerminal(false);
+      setAwaitingCard(true);
+    }
+  }, [solving]);
+
   /** Start polling for solve progress (shared by initial solve and multi-street). */
   const startPolling = useCallback(() => {
     const poll = async () => {
@@ -199,7 +210,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         if (p.exploitability < 1e30 && p.exploitability > initialExplRef.current) {
           initialExplRef.current = p.exploitability;
         }
-        if (p.matrix) setMatrix(p.matrix);
+        if (p.matrix && !pendingNavRef.current) setMatrix(p.matrix);
         if (p.is_complete) {
           setSolving(false);
           if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
@@ -260,36 +271,44 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       .catch((e) => { setError(String(e)); setSolving(false); });
   }, [solving, boardInput, startPolling]);
 
-  /** Navigate the solved tree by clicking an action button. */
+  /** Navigate the tree by clicking an action button (works during solving). */
   const handleAction = useCallback(async (actionIndex: number) => {
-    if (solving) return;
     setError(null);
     setSelectedCell(null);
+
+    // Optimistically add the action card and clear the matrix immediately
+    if (matrix) {
+      setActionHistory(prev => [...prev, {
+        selectedId: String(actionIndex),
+        actionIndex,
+        position: matrix.player === 0 ? 'SB' : 'BB',
+        stack: matrix.stacks[matrix.player],
+        pot: matrix.pot,
+        actions: matrix.actions,
+        streetIndex: currentStreetIndex,
+      }]);
+    }
+    setStreetActions(prev => [...prev, actionIndex]);
+    setMatrix(null);
+    pendingNavRef.current = true;
+
     try {
       const result = await invoke<PostflopPlayResult>('postflop_play_action', { action: actionIndex });
-
-      if (matrix) {
-        setActionHistory(prev => [...prev, {
-          selectedId: String(actionIndex),
-          actionIndex,
-          position: matrix.player === 0 ? 'SB' : 'BB',
-          stack: matrix.stacks[matrix.player],
-          pot: matrix.pot,
-          actions: matrix.actions,
-          streetIndex: currentStreetIndex,
-        }]);
-      }
-      setStreetActions(prev => [...prev, actionIndex]);
+      pendingNavRef.current = false;
 
       if (result.is_terminal) {
-        setMatrix(null);
         setTerminal(true);
         return;
       }
 
       if (result.is_chance) {
-        setMatrix(null);
-        setAwaitingCard(true);
+        if (solving) {
+          blockedAtChanceRef.current = true;
+          setTerminal(true);
+          setAwaitingCard(false);
+        } else {
+          setAwaitingCard(true);
+        }
         return;
       }
 
@@ -297,13 +316,16 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         setMatrix(result.matrix);
       }
     } catch (e) {
+      // Rollback optimistic update on error
+      pendingNavRef.current = false;
+      setActionHistory(prev => prev.slice(0, -1));
+      setStreetActions(prev => prev.slice(0, -1));
       setError(String(e));
     }
   }, [solving, matrix, currentStreetIndex]);
 
   /** Navigate back to a previous point by clicking a history action card. */
   const handleNavigateBack = useCallback(async (historyIndex: number) => {
-    if (solving) return;
     const entry = actionHistory[historyIndex];
     if (!entry) return;
 
@@ -311,30 +333,34 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     setSelectedCell(null);
     setTerminal(false);
     setAwaitingCard(false);
+    blockedAtChanceRef.current = false;
 
-    // Collect the action indices up to (not including) the clicked entry
-    // Only replay actions from the current street's solve.
+    // Optimistically truncate history and clear matrix
     const replayActions = actionHistory
       .slice(0, historyIndex)
       .filter(e => e.streetIndex === entry.streetIndex)
       .map(e => e.actionIndex);
+    setActionHistory(prev => prev.slice(0, historyIndex));
+    setStreetActions(replayActions);
+    setMatrix(null);
+    pendingNavRef.current = true;
 
     try {
       const result = await invoke<PostflopPlayResult>('postflop_navigate_to', { history: replayActions });
-
-      // Truncate action history and street actions to this point
-      setActionHistory(prev => prev.slice(0, historyIndex));
-      setStreetActions(replayActions);
+      pendingNavRef.current = false;
 
       if (result.is_terminal) {
-        setMatrix(null);
         setTerminal(true);
         return;
       }
 
       if (result.is_chance) {
-        setMatrix(null);
-        setAwaitingCard(true);
+        if (solving) {
+          blockedAtChanceRef.current = true;
+          setTerminal(true);
+        } else {
+          setAwaitingCard(true);
+        }
         return;
       }
 
@@ -342,6 +368,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         setMatrix(result.matrix);
       }
     } catch (e) {
+      pendingNavRef.current = false;
       setError(String(e));
     }
   }, [solving, actionHistory, currentStreetIndex]);
@@ -428,7 +455,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
 
         {/* Action history blocks — click to navigate back (current street only) */}
         {actionHistory.map((item, i) => {
-          const canNavigate = !solving;
+          const canNavigate = true;
           return (
             <ActionBlock
               key={i}
@@ -445,14 +472,14 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         })}
 
         {/* Available actions */}
-        {matrix && !solving && !terminal && !awaitingCard && (
+        {matrix && !terminal && !awaitingCard && (
           <ActionBlock
             position={matrix.player === 0 ? 'SB' : 'BB'}
             stack={matrix.stacks[matrix.player]}
             pot={matrix.pot}
             actions={matrix.actions}
-            onSelect={(actionId) => !solving && handleAction(Number(actionId))}
-            isCurrent={!solving}
+            onSelect={(actionId) => handleAction(Number(actionId))}
+            isCurrent={true}
           />
         )}
 
