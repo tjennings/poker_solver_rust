@@ -30,7 +30,7 @@ use rayon::prelude::*;
 use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::flops::all_flops;
 use crate::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
-use crate::showdown_equity::compute_equity;
+use crate::showdown_equity::{compute_equity, rank_hand};
 
 use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard};
 use super::clustering::{kmeans_1d, kmeans_1d_weighted, kmeans_emd_weighted, kmeans_emd_with_progress};
@@ -955,33 +955,46 @@ pub fn enumerate_canonical_flops() -> Vec<WeightedBoard<3>> {
 pub fn enumerate_canonical_turns() -> Vec<WeightedBoard<4>> {
     let flops = enumerate_canonical_flops();
     let deck = build_deck();
-    let mut map: HashMap<PackedBoard, (u32, [Card; 4])> = HashMap::new();
 
-    for flop in &flops {
-        for &card in &deck {
-            if flop.cards.contains(&card) {
-                continue;
+    let map: HashMap<PackedBoard, (u32, [Card; 4])> = flops
+        .par_iter()
+        .fold(
+            HashMap::new,
+            |mut map: HashMap<PackedBoard, (u32, [Card; 4])>, flop| {
+                for &card in &deck {
+                    if flop.cards.contains(&card) {
+                        continue;
+                    }
+                    let board_vec = vec![
+                        flop.cards[0],
+                        flop.cards[1],
+                        flop.cards[2],
+                        card,
+                    ];
+                    // INVARIANT: 4-card boards are always valid for canonicalization
+                    let canonical = CanonicalBoard::from_cards(&board_vec)
+                        .expect("4-card board is always valid");
+                    let key = canonical_key(&canonical.cards);
+                    let sorted = key.to_cards(4);
+                    map.entry(key)
+                        .and_modify(|(w, _)| *w += flop.weight)
+                        .or_insert_with(|| {
+                            let cards: [Card; 4] =
+                                [sorted[0], sorted[1], sorted[2], sorted[3]];
+                            (flop.weight, cards)
+                        });
+                }
+                map
+            },
+        )
+        .reduce(HashMap::new, |mut a, b| {
+            for (key, (weight, cards)) in b {
+                a.entry(key)
+                    .and_modify(|(w, _)| *w += weight)
+                    .or_insert((weight, cards));
             }
-            let board_vec = vec![
-                flop.cards[0],
-                flop.cards[1],
-                flop.cards[2],
-                card,
-            ];
-            // INVARIANT: 4-card boards are always valid for canonicalization
-            let canonical = CanonicalBoard::from_cards(&board_vec)
-                .expect("4-card board is always valid");
-            let key = canonical_key(&canonical.cards);
-            let sorted = key.to_cards(4);
-            map.entry(key)
-                .and_modify(|(w, _)| *w += flop.weight)
-                .or_insert_with(|| {
-                    let cards: [Card; 4] =
-                        [sorted[0], sorted[1], sorted[2], sorted[3]];
-                    (flop.weight, cards)
-                });
-        }
-    }
+            a
+        });
 
     let mut result: Vec<WeightedBoard<4>> = map
         .into_iter()
@@ -1000,34 +1013,47 @@ pub fn enumerate_canonical_turns() -> Vec<WeightedBoard<4>> {
 pub fn enumerate_canonical_rivers() -> Vec<WeightedBoard<5>> {
     let turns = enumerate_canonical_turns();
     let deck = build_deck();
-    let mut map: HashMap<PackedBoard, (u32, [Card; 5])> = HashMap::new();
 
-    for turn in &turns {
-        for &card in &deck {
-            if turn.cards.contains(&card) {
-                continue;
+    let map: HashMap<PackedBoard, (u32, [Card; 5])> = turns
+        .par_iter()
+        .fold(
+            HashMap::new,
+            |mut map: HashMap<PackedBoard, (u32, [Card; 5])>, turn| {
+                for &card in &deck {
+                    if turn.cards.contains(&card) {
+                        continue;
+                    }
+                    let board_vec = vec![
+                        turn.cards[0],
+                        turn.cards[1],
+                        turn.cards[2],
+                        turn.cards[3],
+                        card,
+                    ];
+                    // INVARIANT: 5-card boards are always valid for canonicalization
+                    let canonical = CanonicalBoard::from_cards(&board_vec)
+                        .expect("5-card board is always valid");
+                    let key = canonical_key(&canonical.cards);
+                    let sorted = key.to_cards(5);
+                    map.entry(key)
+                        .and_modify(|(w, _)| *w += turn.weight)
+                        .or_insert_with(|| {
+                            let cards: [Card; 5] =
+                                [sorted[0], sorted[1], sorted[2], sorted[3], sorted[4]];
+                            (turn.weight, cards)
+                        });
+                }
+                map
+            },
+        )
+        .reduce(HashMap::new, |mut a, b| {
+            for (key, (weight, cards)) in b {
+                a.entry(key)
+                    .and_modify(|(w, _)| *w += weight)
+                    .or_insert((weight, cards));
             }
-            let board_vec = vec![
-                turn.cards[0],
-                turn.cards[1],
-                turn.cards[2],
-                turn.cards[3],
-                card,
-            ];
-            // INVARIANT: 5-card boards are always valid for canonicalization
-            let canonical = CanonicalBoard::from_cards(&board_vec)
-                .expect("5-card board is always valid");
-            let key = canonical_key(&canonical.cards);
-            let sorted = key.to_cards(5);
-            map.entry(key)
-                .and_modify(|(w, _)| *w += turn.weight)
-                .or_insert_with(|| {
-                    let cards: [Card; 5] =
-                        [sorted[0], sorted[1], sorted[2], sorted[3], sorted[4]];
-                    (turn.weight, cards)
-                });
-        }
-    }
+            a
+        });
 
     let mut result: Vec<WeightedBoard<5>> = map
         .into_iter()
@@ -1141,15 +1167,71 @@ pub(crate) fn sample_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 5]
 /// Compute equity for all 1326 combos on a given 5-card board.
 ///
 /// Returns `None` for combos that share a card with the board (blocked).
+///
+/// Uses a two-phase approach: first evaluates hand rank for every valid combo
+/// once, then sweeps pairwise comparisons using pre-computed ranks. This avoids
+/// redundantly re-evaluating opponent ranks for each hero combo (~1000x fewer
+/// `rank_hand` calls).
 pub(crate) fn compute_board_equities(board: [Card; 5], combos: &[[Card; 2]]) -> Vec<Option<f64>> {
+    use std::cmp::Ordering;
+
+    // Build a bitmask for the board cards for fast overlap checks.
+    let mut board_mask = 0u64;
+    for &c in &board {
+        board_mask |= 1u64 << card_to_deck_index(c);
+    }
+
+    // Phase 1: evaluate hand rank for every non-blocked combo (once each).
+    // Also store per-combo bitmask for fast hero-vs-opponent overlap detection.
+    let mut ranks: Vec<u32> = Vec::with_capacity(combos.len());
+    let mut combo_masks: Vec<u64> = Vec::with_capacity(combos.len());
+    let mut blocked: Vec<bool> = Vec::with_capacity(combos.len());
+
+    for &combo in combos {
+        let mask = (1u64 << card_to_deck_index(combo[0]))
+            | (1u64 << card_to_deck_index(combo[1]));
+        combo_masks.push(mask);
+        if mask & board_mask != 0 {
+            blocked.push(true);
+            ranks.push(0);
+        } else {
+            blocked.push(false);
+            ranks.push(crate::showdown_equity::rank_to_ordinal(rank_hand(combo, &board)));
+        }
+    }
+
+    // Phase 2: for each valid hero combo, sweep over all opponent combos using
+    // pre-computed ranks. Skip opponents that overlap with the board (blocked)
+    // or with the hero's cards (bitmask check).
     combos
         .iter()
-        .map(|&combo| {
-            if cards_overlap(combo, &board) {
-                None
-            } else {
-                Some(compute_equity(combo, &board))
+        .enumerate()
+        .map(|(i, _)| {
+            if blocked[i] {
+                return None;
             }
+            let our_rank = ranks[i];
+            let hero_mask = combo_masks[i];
+            let mut wins = 0u32;
+            let mut ties = 0u32;
+            let mut total = 0u32;
+
+            for j in 0..combos.len() {
+                if blocked[j] || combo_masks[j] & hero_mask != 0 {
+                    continue;
+                }
+                total += 1;
+                match our_rank.cmp(&ranks[j]) {
+                    Ordering::Greater => wins += 1,
+                    Ordering::Equal => ties += 1,
+                    Ordering::Less => {}
+                }
+            }
+
+            if total == 0 {
+                return Some(0.5);
+            }
+            Some((f64::from(wins) + f64::from(ties) * 0.5) / f64::from(total))
         })
         .collect()
 }
