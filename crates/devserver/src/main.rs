@@ -95,6 +95,11 @@ struct PostflopCloseStreetParams {
     action_history: Vec<usize>,
 }
 
+#[derive(Deserialize)]
+struct PostflopSetCacheDirParams {
+    dir: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -326,6 +331,14 @@ async fn handle_postflop_close_street(
     ))
 }
 
+async fn handle_postflop_set_cache_dir(
+    Extension(state): Extension<Arc<PostflopState>>,
+    Json(params): Json<PostflopSetCacheDirParams>,
+) -> Json<serde_json::Value> {
+    poker_solver_tauri::postflop_set_cache_dir_core(&state, params.dir);
+    to_json_value(())
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -390,6 +403,10 @@ async fn main() {
         .route(
             "/api/postflop_close_street",
             post(handle_postflop_close_street),
+        )
+        .route(
+            "/api/postflop_set_cache_dir",
+            post(handle_postflop_set_cache_dir),
         )
         .layer(Extension(postflop_state))
         .layer(cors)
