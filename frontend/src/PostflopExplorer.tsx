@@ -94,6 +94,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
   const pollRef = useRef<number | null>(null);
   const initialExplRef = useRef<number>(Infinity);
   const pendingNavRef = useRef(false);
+  const configAppliedRef = useRef(false);
 
   // Navigation state
   const [showFlopPicker, setShowFlopPicker] = useState(false);
@@ -117,6 +118,11 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
   }, [boardInput]);
 
   useEffect(() => {
+    // Guard against HMR re-mounts calling postflop_set_config again,
+    // which clears the solved game from the backend.
+    if (configAppliedRef.current) return;
+    configAppliedRef.current = true;
+
     const autoApply = async () => {
       try {
         const summary = await invoke<PostflopConfigSummary>('postflop_set_config', { config });
