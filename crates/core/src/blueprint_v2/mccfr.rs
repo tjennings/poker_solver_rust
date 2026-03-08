@@ -15,14 +15,31 @@
 )]
 
 use std::cmp::Ordering;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::AtomicU64;
 
 use rand::Rng;
 
 /// Global diagnostic counters for prune-hit measurement.
-/// Reset and read by the trainer between batches.
+/// Updated once per batch (not per action) and read by the trainer for TUI.
 pub static PRUNE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static PRUNE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Prune statistics accumulated during a single traversal.
+///
+/// Collected locally to avoid global atomic contention, then merged
+/// into the global counters after the batch completes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PruneStats {
+    pub hits: u64,
+    pub total: u64,
+}
+
+impl PruneStats {
+    pub fn merge(&mut self, other: PruneStats) {
+        self.hits += other.hits;
+        self.total += other.total;
+    }
+}
 
 use super::bucket_file::BucketFile;
 use super::game_tree::{GameNode, GameTree, TerminalKind};
@@ -42,6 +59,17 @@ const MAX_ACTIONS: usize = 16;
 pub struct Deal {
     pub hole_cards: [[Card; 2]; 2], // [player0, player1]
     pub board: [Card; 5],           // flop(3) + turn(1) + river(1)
+}
+
+/// A deal with pre-computed bucket assignments for all streets and players.
+///
+/// Eliminates repeated `get_bucket()` / `compute_equity()` calls during
+/// MCCFR traversal by computing all buckets once up-front.
+#[derive(Debug, Clone)]
+pub struct DealWithBuckets {
+    pub deal: Deal,
+    /// Pre-computed bucket indices: `buckets[player][street]`.
+    pub buckets: [[u16; 4]; 2],
 }
 
 /// Loaded bucket assignments for all 4 streets.
@@ -85,6 +113,25 @@ impl AllBuckets {
         bucket.min(k - 1)
     }
 
+    /// Pre-compute bucket assignments for all 4 streets x 2 players.
+    #[must_use]
+    pub fn precompute_buckets(&self, deal: &Deal) -> [[u16; 4]; 2] {
+        let mut result = [[0u16; 4]; 2];
+        for (player, row) in result.iter_mut().enumerate() {
+            for (street_idx, slot) in row.iter_mut().enumerate() {
+                let street = match street_idx {
+                    0 => Street::Preflop,
+                    1 => Street::Flop,
+                    2 => Street::Turn,
+                    _ => Street::River,
+                };
+                let board = Self::board_for_street(&deal.board, street);
+                *slot = self.get_bucket(street, deal.hole_cards[player], board);
+            }
+        }
+        result
+    }
+
     /// Return the visible board slice for a given street.
     #[must_use]
     pub fn board_for_street(board: &[Card; 5], street: Street) -> &[Card] {
@@ -110,8 +157,7 @@ impl AllBuckets {
 /// # Arguments
 /// * `tree` - The game tree
 /// * `storage` - Atomic regret/strategy storage (shared across threads)
-/// * `buckets` - Bucket lookup for all streets
-/// * `deal` - The sampled deal (hole cards + board)
+/// * `deal` - The sampled deal with pre-computed bucket assignments
 /// * `traverser` - Which player is traversing (0 or 1)
 /// * `node_idx` - Current node in the tree
 /// * `prune` - Whether negative-regret pruning is active
@@ -121,31 +167,22 @@ impl AllBuckets {
 pub fn traverse_external(
     tree: &GameTree,
     storage: &BlueprintStorage,
-    buckets: &AllBuckets,
-    deal: &Deal,
+    deal: &DealWithBuckets,
     traverser: u8,
     node_idx: u32,
     prune: bool,
     prune_threshold: i32,
     rng: &mut impl Rng,
-) -> f64 {
+) -> (f64, PruneStats) {
     match &tree.nodes[node_idx as usize] {
         GameNode::Terminal { kind, invested, .. } => {
-            terminal_value(*kind, invested, traverser, deal)
+            (terminal_value(*kind, invested, traverser, &deal.deal), PruneStats::default())
         }
 
         GameNode::Chance { child, .. } => {
             // Board cards are pre-dealt in the Deal; just recurse.
             traverse_external(
-                tree,
-                storage,
-                buckets,
-                deal,
-                traverser,
-                *child,
-                prune,
-                prune_threshold,
-                rng,
+                tree, storage, deal, traverser, *child, prune, prune_threshold, rng,
             )
         }
 
@@ -159,14 +196,12 @@ pub fn traverse_external(
             let street = *street;
             let num_actions = children.len();
 
-            let visible_board = AllBuckets::board_for_street(&deal.board, street);
-            let bucket = buckets.get_bucket(street, deal.hole_cards[player as usize], visible_board);
+            let bucket = deal.buckets[player as usize][street as usize];
 
             if player == traverser {
                 traverse_traverser(
                     tree,
                     storage,
-                    buckets,
                     deal,
                     traverser,
                     node_idx,
@@ -181,7 +216,6 @@ pub fn traverse_external(
                 traverse_opponent(
                     tree,
                     storage,
-                    buckets,
                     deal,
                     traverser,
                     node_idx,
@@ -232,8 +266,7 @@ fn terminal_value(
 fn traverse_traverser(
     tree: &GameTree,
     storage: &BlueprintStorage,
-    buckets: &AllBuckets,
-    deal: &Deal,
+    deal: &DealWithBuckets,
     traverser: u8,
     node_idx: u32,
     bucket: u16,
@@ -242,7 +275,7 @@ fn traverse_traverser(
     prune: bool,
     prune_threshold: i32,
     rng: &mut impl Rng,
-) -> f64 {
+) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
     storage.current_strategy_into(node_idx, bucket, &mut strategy_buf[..num_actions]);
@@ -251,28 +284,23 @@ fn traverse_traverser(
     let mut action_values_buf = [0.0f64; MAX_ACTIONS];
     let action_values = &mut action_values_buf[..num_actions];
     let mut node_value = 0.0f64;
+    let mut stats = PruneStats::default();
 
     for (a, &child_idx) in children.iter().enumerate() {
         if prune {
-            PRUNE_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            stats.total += 1;
             if storage.get_regret(node_idx, bucket, a) < prune_threshold {
-                PRUNE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+                stats.hits += 1;
                 continue;
             }
         }
 
-        action_values[a] = traverse_external(
-            tree,
-            storage,
-            buckets,
-            deal,
-            traverser,
-            child_idx,
-            prune,
-            prune_threshold,
-            rng,
+        let (child_ev, child_stats) = traverse_external(
+            tree, storage, deal, traverser, child_idx, prune, prune_threshold, rng,
         );
-        node_value += strategy[a] * action_values[a];
+        action_values[a] = child_ev;
+        node_value += strategy[a] * child_ev;
+        stats.merge(child_stats);
     }
 
     // Update regrets: delta = action_value - node_value, scaled to
@@ -287,7 +315,7 @@ fn traverse_traverser(
         storage.add_strategy_sum(node_idx, bucket, a, (strategy[a] * 1000.0) as i64);
     }
 
-    node_value
+    (node_value, stats)
 }
 
 /// Opponent's decision node: sample one action according to the
@@ -296,8 +324,7 @@ fn traverse_traverser(
 fn traverse_opponent(
     tree: &GameTree,
     storage: &BlueprintStorage,
-    buckets: &AllBuckets,
-    deal: &Deal,
+    deal: &DealWithBuckets,
     traverser: u8,
     node_idx: u32,
     bucket: u16,
@@ -306,7 +333,7 @@ fn traverse_opponent(
     prune: bool,
     prune_threshold: i32,
     rng: &mut impl Rng,
-) -> f64 {
+) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
     storage.current_strategy_into(node_idx, bucket, &mut strategy_buf[..num_actions]);
@@ -324,15 +351,7 @@ fn traverse_opponent(
     }
 
     traverse_external(
-        tree,
-        storage,
-        buckets,
-        deal,
-        traverser,
-        children[chosen],
-        prune,
-        prune_threshold,
-        rng,
+        tree, storage, deal, traverser, children[chosen], prune, prune_threshold, rng,
     )
 }
 
@@ -391,6 +410,11 @@ mod tests {
         )
     }
 
+    fn make_precomputed(buckets: &AllBuckets, deal: Deal) -> DealWithBuckets {
+        let b = buckets.precompute_buckets(&deal);
+        DealWithBuckets { deal, buckets: b }
+    }
+
     #[test]
     fn traverse_returns_finite() {
         let tree = toy_tree();
@@ -399,19 +423,11 @@ mod tests {
             bucket_counts: [10, 10, 10, 10],
             bucket_files: [None, None, None, None],
         };
-        let deal = make_deal();
+        let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
-        let ev = traverse_external(
-            &tree,
-            &storage,
-            &buckets,
-            &deal,
-            0,
-            tree.root,
-            false,
-            -310_000_000,
-            &mut rng,
+        let (ev, _stats) = traverse_external(
+            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
         );
         assert!(ev.is_finite(), "EV should be finite, got {ev}");
     }
@@ -424,30 +440,14 @@ mod tests {
             bucket_counts: [10, 10, 10, 10],
             bucket_files: [None, None, None, None],
         };
-        let deal = make_deal();
+        let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
-        let ev0 = traverse_external(
-            &tree,
-            &storage,
-            &buckets,
-            &deal,
-            0,
-            tree.root,
-            false,
-            -310_000_000,
-            &mut rng,
+        let (ev0, _) = traverse_external(
+            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
         );
-        let ev1 = traverse_external(
-            &tree,
-            &storage,
-            &buckets,
-            &deal,
-            1,
-            tree.root,
-            false,
-            -310_000_000,
-            &mut rng,
+        let (ev1, _) = traverse_external(
+            &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
         );
 
         assert!(ev0.is_finite());
@@ -462,21 +462,13 @@ mod tests {
             bucket_counts: [10, 10, 10, 10],
             bucket_files: [None, None, None, None],
         };
-        let deal = make_deal();
+        let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
         assert!(storage.regrets.iter().all(|r| r.load(Ordering::Relaxed) == 0));
 
-        traverse_external(
-            &tree,
-            &storage,
-            &buckets,
-            &deal,
-            0,
-            tree.root,
-            false,
-            -310_000_000,
-            &mut rng,
+        let (_ev, _stats) = traverse_external(
+            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
         );
 
         assert!(
@@ -493,19 +485,11 @@ mod tests {
             bucket_counts: [10, 10, 10, 10],
             bucket_files: [None, None, None, None],
         };
-        let deal = make_deal();
+        let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
-        traverse_external(
-            &tree,
-            &storage,
-            &buckets,
-            &deal,
-            0,
-            tree.root,
-            false,
-            -310_000_000,
-            &mut rng,
+        let (_ev, _stats) = traverse_external(
+            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
         );
 
         assert!(
@@ -523,30 +507,15 @@ mod tests {
             bucket_files: [None, None, None, None],
         };
         let deal = make_deal();
+        let precomputed = make_precomputed(&buckets, deal);
         let mut rng = StdRng::seed_from_u64(42);
 
         for _ in 0..50 {
-            traverse_external(
-                &tree,
-                &storage,
-                &buckets,
-                &deal,
-                0,
-                tree.root,
-                false,
-                -310_000_000,
-                &mut rng,
+            let _ = traverse_external(
+                &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
             );
-            traverse_external(
-                &tree,
-                &storage,
-                &buckets,
-                &deal,
-                1,
-                tree.root,
-                false,
-                -310_000_000,
-                &mut rng,
+            let _ = traverse_external(
+                &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
             );
         }
 
@@ -554,8 +523,8 @@ mod tests {
         // should have a non-uniform current strategy.
         for (i, node) in tree.nodes.iter().enumerate() {
             if let GameNode::Decision { player: 0, street, .. } = node {
-                let visible = AllBuckets::board_for_street(&deal.board, *street);
-                let bucket = buckets.get_bucket(*street, deal.hole_cards[0], visible);
+                let visible = AllBuckets::board_for_street(&precomputed.deal.board, *street);
+                let bucket = buckets.get_bucket(*street, precomputed.deal.hole_cards[0], visible);
                 let strategy = storage.current_strategy(i as u32, bucket);
                 let is_uniform = strategy.iter().all(|&p| (p - strategy[0]).abs() < 1e-10);
                 if strategy.len() > 1 && !is_uniform {
@@ -574,7 +543,7 @@ mod tests {
             bucket_counts: [10, 10, 10, 10],
             bucket_files: [None, None, None, None],
         };
-        let deal = make_deal();
+        let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
         // Force some very negative regrets.
@@ -582,16 +551,8 @@ mod tests {
             r.store(-400_000_000, Ordering::Relaxed);
         }
 
-        let ev = traverse_external(
-            &tree,
-            &storage,
-            &buckets,
-            &deal,
-            0,
-            tree.root,
-            true,
-            -310_000_000,
-            &mut rng,
+        let (ev, _stats) = traverse_external(
+            &tree, &storage, &precomputed, 0, tree.root, true, -310_000_000, &mut rng,
         );
         assert!(ev.is_finite());
     }

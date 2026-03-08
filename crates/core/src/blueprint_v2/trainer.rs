@@ -15,7 +15,7 @@
 use std::error::Error;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use rand::prelude::*;
@@ -26,10 +26,24 @@ use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
 use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
-use super::mccfr::{traverse_external, AllBuckets, Deal, PRUNE_HITS, PRUNE_TOTAL};
+use super::mccfr::{traverse_external, AllBuckets, Deal, DealWithBuckets, PruneStats, PRUNE_HITS, PRUNE_TOTAL};
 use super::storage::BlueprintStorage;
 use crate::hands::CanonicalHand;
 use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
+
+/// Pre-initialized canonical deck — copied into the trainer's deck buffer
+/// via memcpy instead of rebuilding from VALUE×SUIT loops each deal.
+static CANONICAL_DECK: LazyLock<[Card; 52]> = LazyLock::new(|| {
+    let mut deck = [Card::new(ALL_VALUES[0], ALL_SUITS[0]); 52];
+    let mut idx = 0;
+    for &v in &ALL_VALUES {
+        for &s in &ALL_SUITS {
+            deck[idx] = Card::new(v, s);
+            idx += 1;
+        }
+    }
+    deck
+});
 
 /// Attempt to load `.buckets` files from the given directory.
 ///
@@ -180,14 +194,7 @@ impl BlueprintTrainer {
         };
         let rng = StdRng::seed_from_u64(config.clustering.seed);
 
-        let mut deck = [Card::new(ALL_VALUES[0], ALL_SUITS[0]); 52];
-        let mut idx = 0;
-        for &v in &ALL_VALUES {
-            for &s in &ALL_SUITS {
-                deck[idx] = Card::new(v, s);
-                idx += 1;
-            }
-        }
+        let deck = *CANONICAL_DECK;
 
         Self {
             tree,
@@ -379,8 +386,14 @@ impl BlueprintTrainer {
                 break;
             }
 
-            // 1. Generate batch of deals (sequential, fast).
-            let deals: Vec<Deal> = (0..this_batch).map(|_| self.sample_deal()).collect();
+            // 1. Generate batch of deals with pre-computed buckets (sequential).
+            let deals: Vec<DealWithBuckets> = (0..this_batch)
+                .map(|_| {
+                    let deal = self.sample_deal();
+                    let buckets = self.buckets.precompute_buckets(&deal);
+                    DealWithBuckets { deal, buckets }
+                })
+                .collect();
 
             let prune = self.should_prune();
             let threshold = self.config.training.prune_threshold;
@@ -388,34 +401,45 @@ impl BlueprintTrainer {
             // 2. Parallel traversal.
             let tree = &self.tree;
             let storage = &self.storage;
-            let buckets = &self.buckets;
             let ev_sum = &self.ev_sum;
             let ev_count = &self.ev_count;
 
-            deals.par_iter().for_each(|deal| {
-                let mut rng = SmallRng::from_os_rng();
+            // Pre-seed thread RNGs to avoid OS entropy syscalls in par_iter.
+            let thread_seeds: Vec<u64> = (0..deals.len()).map(|_| self.rng.random()).collect();
 
-                let ev0 = traverse_external(
-                    tree, storage, buckets, deal, 0, tree.root, prune, threshold, &mut rng,
+            let batch_prune_stats: PruneStats = deals.par_iter().enumerate().map(|(i, deal)| {
+                let mut rng = SmallRng::seed_from_u64(thread_seeds[i]);
+                let mut stats = PruneStats::default();
+
+                let (ev0, s0) = traverse_external(
+                    tree, storage, deal, 0, tree.root, prune, threshold, &mut rng,
                 );
-                let ev1 = traverse_external(
-                    tree, storage, buckets, deal, 1, tree.root, prune, threshold, &mut rng,
+                stats.merge(s0);
+                let (ev1, s1) = traverse_external(
+                    tree, storage, deal, 1, tree.root, prune, threshold, &mut rng,
                 );
+                stats.merge(s1);
 
                 // Accumulate EV per canonical preflop hand.
                 let idx0 = CanonicalHand::from_cards(
-                    deal.hole_cards[0][0],
-                    deal.hole_cards[0][1],
+                    deal.deal.hole_cards[0][0],
+                    deal.deal.hole_cards[0][1],
                 ).index();
                 let idx1 = CanonicalHand::from_cards(
-                    deal.hole_cards[1][0],
-                    deal.hole_cards[1][1],
+                    deal.deal.hole_cards[1][0],
+                    deal.deal.hole_cards[1][1],
                 ).index();
                 ev_sum[idx0].fetch_add((ev0 * 1000.0) as i64, Ordering::Relaxed);
                 ev_count[idx0].fetch_add(1, Ordering::Relaxed);
                 ev_sum[idx1].fetch_add((ev1 * 1000.0) as i64, Ordering::Relaxed);
                 ev_count[idx1].fetch_add(1, Ordering::Relaxed);
-            });
+
+                stats
+            }).reduce(PruneStats::default, |mut a, b| { a.merge(b); a });
+
+            // Single atomic update for the whole batch.
+            PRUNE_HITS.fetch_add(batch_prune_stats.hits, Ordering::Relaxed);
+            PRUNE_TOTAL.fetch_add(batch_prune_stats.total, Ordering::Relaxed);
 
             // 3. Sequential: update counters and check timed actions.
             self.iterations += this_batch;
@@ -432,13 +456,7 @@ impl BlueprintTrainer {
     /// shuffles only the first 9 positions (2×2 hole + 5 board).
     pub fn sample_deal(&mut self) -> Deal {
         // Reset deck to canonical order (avoids tracking swap state).
-        let mut idx = 0;
-        for &v in &ALL_VALUES {
-            for &s in &ALL_SUITS {
-                self.deck[idx] = Card::new(v, s);
-                idx += 1;
-            }
-        }
+        self.deck = *CANONICAL_DECK;
 
         // Partial Fisher-Yates: shuffle only the first 9 positions.
         for i in 0..9 {
