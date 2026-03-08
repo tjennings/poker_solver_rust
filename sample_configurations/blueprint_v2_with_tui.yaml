@@ -33,8 +33,8 @@ action_abstraction:
 training:
   cluster_path: "clusters/"
   time_limit_minutes: 720
-  lcfr_warmup_minutes: 20
-  prune_after_minutes: 20
+  lcfr_warmup_iterations: 5000000
+  prune_after_iterations: 5000000
   batch_size: 600
 
 snapshots:

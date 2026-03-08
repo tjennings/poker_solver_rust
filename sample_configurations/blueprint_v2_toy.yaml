@@ -33,9 +33,9 @@ action_abstraction:
 training:
   cluster_path: clusters/toy/
   time_limit_minutes: 5
-  lcfr_warmup_minutes: 2
-  lcfr_discount_interval: 1
-  prune_after_minutes: 2
+  lcfr_warmup_iterations: 10000
+  lcfr_discount_interval: 5000
+  prune_after_iterations: 10000
   prune_explore_pct: 0.05
   print_every_minutes: 1
 

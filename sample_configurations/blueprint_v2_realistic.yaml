@@ -37,9 +37,9 @@ action_abstraction:
 training:
   cluster_path: clusters/realistic/
   time_limit_minutes: 480
-  lcfr_warmup_minutes: 400
-  lcfr_discount_interval: 10
-  prune_after_minutes: 200
+  lcfr_warmup_iterations: 5000000
+  lcfr_discount_interval: 500000
+  prune_after_iterations: 5000000
   prune_explore_pct: 0.05
   print_every_minutes: 10
 

@@ -77,15 +77,15 @@ pub struct TrainingConfig {
     /// Stop after this many minutes (if set).
     #[serde(default)]
     pub time_limit_minutes: Option<u64>,
-    /// Minutes of LCFR warmup before switching to linear averaging.
-    #[serde(default = "default_lcfr_warmup")]
-    pub lcfr_warmup_minutes: u64,
-    /// Minutes between LCFR discount applications.
+    /// Iterations of LCFR warmup before switching to linear averaging.
+    #[serde(default = "default_lcfr_warmup", alias = "lcfr_warmup_minutes")]
+    pub lcfr_warmup_iterations: u64,
+    /// Iterations between LCFR discount applications.
     #[serde(default = "default_discount_interval")]
     pub lcfr_discount_interval: u64,
-    /// Start pruning negative-regret actions after this many minutes.
-    #[serde(default = "default_prune_after")]
-    pub prune_after_minutes: u64,
+    /// Start pruning negative-regret actions after this many iterations.
+    #[serde(default = "default_prune_after", alias = "prune_after_minutes")]
+    pub prune_after_iterations: u64,
     /// Regret threshold below which actions are pruned.
     #[serde(default = "default_prune_threshold")]
     pub prune_threshold: i32,
@@ -130,15 +130,15 @@ const fn default_kmeans_iterations() -> u32 {
 }
 
 const fn default_lcfr_warmup() -> u64 {
-    400
+    5_000_000
 }
 
 const fn default_discount_interval() -> u64 {
-    10
+    500_000
 }
 
 const fn default_prune_after() -> u64 {
-    200
+    5_000_000
 }
 
 const fn default_prune_threshold() -> i32 {
@@ -198,7 +198,7 @@ action_abstraction:
 training:
   cluster_path: "/tmp/clusters"
   iterations: 10000
-  lcfr_warmup_minutes: 200
+  lcfr_warmup_iterations: 5000000
 
 snapshots:
   warmup_minutes: 60
@@ -237,10 +237,10 @@ snapshots:
         assert_eq!(cfg.training.cluster_path, "/tmp/clusters");
         assert_eq!(cfg.training.iterations, Some(10_000));
         assert_eq!(cfg.training.time_limit_minutes, None);
-        assert_eq!(cfg.training.lcfr_warmup_minutes, 200);
+        assert_eq!(cfg.training.lcfr_warmup_iterations, 5_000_000);
         // Defaults
         assert_eq!(cfg.training.lcfr_discount_interval, default_discount_interval());
-        assert_eq!(cfg.training.prune_after_minutes, default_prune_after());
+        assert_eq!(cfg.training.prune_after_iterations, default_prune_after());
         assert_eq!(cfg.training.prune_threshold, default_prune_threshold());
         assert!((cfg.training.prune_explore_pct - default_prune_explore()).abs() < f64::EPSILON);
         assert_eq!(cfg.training.print_every_minutes, default_print_every());
@@ -280,9 +280,9 @@ snapshots:
                 cluster_path: "/data/clusters".to_owned(),
                 iterations: None,
                 time_limit_minutes: Some(720),
-                lcfr_warmup_minutes: 400,
-                lcfr_discount_interval: 10,
-                prune_after_minutes: 200,
+                lcfr_warmup_iterations: 5_000_000,
+                lcfr_discount_interval: 500_000,
+                prune_after_iterations: 5_000_000,
                 prune_threshold: 0,
                 prune_explore_pct: 0.05,
                 print_every_minutes: 10,

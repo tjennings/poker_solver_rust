@@ -279,13 +279,20 @@ impl BlueprintTrainer {
         ];
         self.storage = BlueprintStorage::load_regrets(&regrets_path, &self.tree, bucket_counts)?;
 
-        // Load metadata for iteration count.
+        // Load metadata for iteration count and elapsed time.
         let meta_path = snapshot_dir.join("metadata.json");
         if meta_path.exists() {
             let meta_str = std::fs::read_to_string(&meta_path)?;
             if let Some(iter_val) = extract_json_u64(&meta_str, "iteration") {
                 self.iterations = iter_val;
                 self.shared_iterations.store(iter_val, Ordering::Relaxed);
+            }
+            // Backdate start_time so elapsed_minutes() reflects total
+            // training time, not just this process's wall time. This
+            // ensures pruning warmup and other time-gated actions
+            // activate correctly after resume.
+            if let Some(prev_min) = extract_json_u64(&meta_str, "elapsed_minutes") {
+                self.start_time = Instant::now() - std::time::Duration::from_secs(prev_min * 60);
             }
         }
 
@@ -296,9 +303,10 @@ impl BlueprintTrainer {
         self.prev_strategy_sums = Some(self.storage.snapshot_strategy_sums());
 
         eprintln!(
-            "Resumed from {}: {} iterations, mean_pos_regret={:.2}",
+            "Resumed from {}: {} iterations, {:.0}min elapsed, mean_pos_regret={:.2}",
             snapshot_dir.display(),
             self.iterations,
+            self.elapsed_minutes(),
             self.mean_positive_regret(),
         );
 
@@ -454,12 +462,11 @@ impl BlueprintTrainer {
 
     /// Determine whether the current iteration should use pruning.
     ///
-    /// Pruning activates after `prune_after_minutes` have elapsed and
+    /// Pruning activates after `prune_after_iterations` have elapsed and
     /// applies to `1 - prune_explore_pct` of iterations (the rest
     /// explore all actions to avoid permanently losing information).
     fn should_prune(&mut self) -> bool {
-        let elapsed_min = self.elapsed_minutes();
-        if elapsed_min < self.config.training.prune_after_minutes {
+        if self.iterations < self.config.training.prune_after_iterations {
             return false;
         }
         let explore: f64 = self.rng.random();
@@ -473,8 +480,8 @@ impl BlueprintTrainer {
 
         // LCFR discount.
         let interval = self.config.training.lcfr_discount_interval.max(1);
-        if elapsed_min >= self.config.training.lcfr_warmup_minutes
-            && elapsed_min >= self.last_discount_time + interval
+        if self.iterations >= self.config.training.lcfr_warmup_iterations
+            && self.iterations >= self.last_discount_time + interval
         {
             self.apply_lcfr_discount();
         }
@@ -532,9 +539,8 @@ impl BlueprintTrainer {
     /// strategy sums by `t / (t + 1)` where `t` is the number of
     /// discount intervals elapsed.
     fn apply_lcfr_discount(&mut self) {
-        let elapsed_min = self.elapsed_minutes();
         let interval = self.config.training.lcfr_discount_interval.max(1);
-        let t = elapsed_min / interval;
+        let t = self.iterations / interval;
         let d = t as f64 / (t as f64 + 1.0);
 
         for atom in &self.storage.regrets {
@@ -546,7 +552,7 @@ impl BlueprintTrainer {
             atom.store((v as f64 * d) as i64, Ordering::Relaxed);
         }
 
-        self.last_discount_time = elapsed_min;
+        self.last_discount_time = self.iterations;
     }
 
     /// Compute and store the strategy delta vs the previous snapshot.
@@ -766,9 +772,9 @@ mod tests {
                 cluster_path: "clusters/".into(),
                 iterations: Some(100),
                 time_limit_minutes: None,
-                lcfr_warmup_minutes: 0,
+                lcfr_warmup_iterations: 0,
                 lcfr_discount_interval: 1,
-                prune_after_minutes: 9999,
+                prune_after_iterations: 9999,
                 prune_threshold: 0,
                 prune_explore_pct: 0.05,
                 print_every_minutes: 9999,
