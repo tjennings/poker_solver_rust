@@ -289,6 +289,7 @@ impl BlueprintTuiApp {
                 Constraint::Length(3),  // Max negative regret sparkline
                 Constraint::Length(3),  // Avg positive regret sparkline
                 Constraint::Length(1),  // Actions pruned bar
+                Constraint::Length(1),  // Spacer
                 Constraint::Min(0),    // Strategy grids
                 Constraint::Length(1),  // Hotkeys footer
             ])
@@ -304,8 +305,9 @@ impl BlueprintTuiApp {
         self.render_min_regret(frame, chunks[7]);
         self.render_avg_pos_regret(frame, chunks[8]);
         self.render_prune_bar(frame, chunks[9]);
-        self.render_right_panel(frame, chunks[10]);
-        self.render_hotkeys(frame, chunks[11]);
+        // chunks[10] is an empty spacer
+        self.render_right_panel(frame, chunks[11]);
+        self.render_hotkeys(frame, chunks[12]);
     }
 
     fn render_iterations(&self, frame: &mut Frame, area: Rect) {
