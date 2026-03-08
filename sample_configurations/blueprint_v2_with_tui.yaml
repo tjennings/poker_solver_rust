@@ -10,39 +10,42 @@ clustering:
   preflop:
     buckets: 169
   flop:
-    buckets: 100
+    buckets: 600
   turn:
-    buckets: 100
+    buckets: 600
   river:
-    buckets: 100
+    buckets: 600
 
 action_abstraction:
   preflop:
     - ["2.5bb"]
-    - ["3.0x"]
+    - ["4bb", "2x"]
+    - ["2x", "3x"]
+    - ["2x"]
   flop:
-    - [0.33, 0.67, 1.0]
-    - [0.5, 1.0]
+    - [0.33, 0.67, 2.0]
+    - [2.0]
   turn:
-    - [0.5, 1.0]
-    - [0.67, 1.0]
+    - [0.33, 0.67, 2.0]
+    - [2.0]
   river:
-    - [0.5, 1.0]
-    - [1.0]
+    - [0.33, 0.67, 2.0]
+    - [2.0]
 
 training:
-  cluster_path: "clusters/"
-  time_limit_minutes: 720
+  cluster_path: "clusters_600bkt/"
+  time_limit_minutes: 7200
   lcfr_warmup_iterations: 5000000
   prune_after_iterations: 5000000
+  prune_threshold: -100000
+  lcfr_discount_interval: 100000
   batch_size: 600
 
 snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "snapshots/"
-  # resume: true  # resume from latest snapshot if output_dir has existing snapshots
+  output_dir: "snapshots_600bkt/"
 
 tui:
   enabled: true
