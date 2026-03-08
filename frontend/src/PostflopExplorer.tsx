@@ -125,8 +125,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
           // Set blueprint weights as filtered weights for the solve.
           // Backend returns authoritative combo counts (sum of weights).
           const result = await invoke<{ oop_combos: number; ip_combos: number }>('postflop_set_filtered_weights', {
-            oopWeights: blueprintConfig.oop_weights,
-            ipWeights: blueprintConfig.ip_weights,
+            oop_weights: blueprintConfig.oop_weights,
+            ip_weights: blueprintConfig.ip_weights,
           });
           setConfigSummary(prev => prev ? { ...prev, oop_combos: result.oop_combos, ip_combos: result.ip_combos } : prev);
           // Set cache dir if the command exists

@@ -466,7 +466,7 @@ pub async fn solve_preflop_live_core(
 }
 
 /// Solve a preflop game live (Tauri wrapper).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn solve_preflop_live(
     state: State<'_, ExplorationState>,
     stack_depth: u32,
@@ -510,7 +510,7 @@ pub async fn load_subgame_source_core(
 }
 
 /// Load a blueprint for subgame solving (Tauri wrapper).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn load_subgame_source(
     state: State<'_, ExplorationState>,
     blueprint_path: String,
@@ -771,7 +771,7 @@ pub fn get_strategy_matrix_core(
 }
 
 /// Get the strategy matrix for a given position (Tauri wrapper).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn get_strategy_matrix(
     state: State<'_, ExplorationState>,
     position: ExplorationPosition,
@@ -1787,7 +1787,7 @@ pub fn get_hand_equity_core(
 }
 
 /// Get postflop equity for a canonical hand (Tauri wrapper).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn get_hand_equity(
     state: State<'_, ExplorationState>,
     hand: String,

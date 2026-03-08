@@ -611,7 +611,7 @@ pub struct FilteredWeightsResult {
     pub ip_combos: usize,
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn postflop_set_filtered_weights(
     state: tauri::State<'_, Arc<PostflopState>>,
     oop_weights: Vec<f32>,
@@ -863,7 +863,7 @@ fn postflop_solve_street_impl(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn postflop_solve_street(
     state: tauri::State<'_, Arc<PostflopState>>,
     board: Vec<String>,
@@ -1131,7 +1131,7 @@ pub fn postflop_close_street_core(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn postflop_close_street(
     state: tauri::State<'_, Arc<PostflopState>>,
     action_history: Vec<usize>,
@@ -1318,7 +1318,7 @@ pub fn postflop_load_cached_core(
     Ok(matrix)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn postflop_check_cache(
     state: tauri::State<'_, Arc<PostflopState>>,
     board: Vec<String>,
@@ -1327,7 +1327,7 @@ pub fn postflop_check_cache(
     postflop_check_cache_core(&state, board, prior_actions)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn postflop_load_cached(
     state: tauri::State<'_, Arc<PostflopState>>,
     board: Vec<String>,
