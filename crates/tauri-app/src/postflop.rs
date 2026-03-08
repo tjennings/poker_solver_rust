@@ -1541,6 +1541,8 @@ mod tests {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "33%".to_string(),
             ip_raise_sizes: "a".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         };
         *state.config.write() = config;
 
@@ -1597,6 +1599,8 @@ mod tests {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "33%".to_string(),
             ip_raise_sizes: "a".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         };
         *state.config.write() = config;
 
@@ -1648,6 +1652,8 @@ mod tests {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "33%".to_string(),
             ip_raise_sizes: "a".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         };
         postflop_set_config_core(&state, config).unwrap();
 
@@ -1772,6 +1778,8 @@ mod tests {
             oop_raise_sizes: "a".to_string(),
             ip_bet_sizes: "50%,a".to_string(),
             ip_raise_sizes: "a".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
         };
         postflop_set_config_core(&state, config).unwrap();
 
