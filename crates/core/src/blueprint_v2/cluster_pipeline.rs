@@ -20,16 +20,19 @@
 //! Each street produces a [`BucketFile`] mapping `(board, combo)` to a bucket
 //! index.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
 
+use crate::abstraction::isomorphism::CanonicalBoard;
+use crate::flops::all_flops;
 use crate::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
 use crate::showdown_equity::compute_equity;
 
-use super::bucket_file::{BucketFile, BucketFileHeader};
+use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard};
 use super::clustering::{kmeans_1d, kmeans_emd_with_progress};
 use super::config::ClusteringConfig;
 use super::Street;
@@ -605,6 +608,143 @@ pub(crate) fn build_deck() -> Vec<Card> {
         }
     }
     deck
+}
+
+// ---------------------------------------------------------------------------
+// Canonical board enumeration
+// ---------------------------------------------------------------------------
+
+/// A board with its combinatorial weight (number of raw boards it represents).
+#[derive(Debug, Clone)]
+pub struct WeightedBoard<const N: usize> {
+    pub cards: [Card; N],
+    pub weight: u32,
+}
+
+/// Pack canonical cards into a deterministic key by sorting first.
+///
+/// `CanonicalBoard::from_cards` preserves input order, so the same canonical
+/// board reached via different input orderings would produce different
+/// `PackedBoard` values. Sorting by `(value_rank desc, suit asc)` before
+/// packing ensures a unique key regardless of input order.
+fn canonical_key(cards: &[Card]) -> PackedBoard {
+    let mut sorted: Vec<Card> = cards.to_vec();
+    sorted.sort_by(|a, b| {
+        use crate::card_utils::value_rank;
+        value_rank(b.value)
+            .cmp(&value_rank(a.value))
+            .then(a.suit.cmp(&b.suit))
+    });
+    PackedBoard::from_cards(&sorted)
+}
+
+/// Enumerate all 1,755 canonical flops with combinatorial weights.
+///
+/// Wraps [`all_flops()`] into `WeightedBoard<3>` form. Total weight equals
+/// C(52,3) = 22,100.
+#[must_use]
+pub fn enumerate_canonical_flops() -> Vec<WeightedBoard<3>> {
+    let flops = all_flops();
+    let mut result: Vec<WeightedBoard<3>> = flops
+        .into_iter()
+        .map(|f| WeightedBoard {
+            cards: *f.cards(),
+            weight: u32::from(f.weight()),
+        })
+        .collect();
+    result.sort_by_key(|wb| canonical_key(&wb.cards).0);
+    result
+}
+
+/// Enumerate all canonical 4-card (flop + turn) boards with weights.
+///
+/// For each canonical flop, appends each of the 49 remaining cards as a turn,
+/// canonicalizes the resulting 4-card board, and deduplicates. Weight equals the
+/// sum of constituent flop weights. Total weight = C(52,3) x 49 = 1,082,900.
+#[must_use]
+pub fn enumerate_canonical_turns() -> Vec<WeightedBoard<4>> {
+    let flops = enumerate_canonical_flops();
+    let deck = build_deck();
+    let mut map: HashMap<PackedBoard, (u32, [Card; 4])> = HashMap::new();
+
+    for flop in &flops {
+        for &card in &deck {
+            if flop.cards.contains(&card) {
+                continue;
+            }
+            let board_vec = vec![
+                flop.cards[0],
+                flop.cards[1],
+                flop.cards[2],
+                card,
+            ];
+            // INVARIANT: 4-card boards are always valid for canonicalization
+            let canonical = CanonicalBoard::from_cards(&board_vec)
+                .expect("4-card board is always valid");
+            let key = canonical_key(&canonical.cards);
+            let sorted = key.to_cards(4);
+            map.entry(key)
+                .and_modify(|(w, _)| *w += flop.weight)
+                .or_insert_with(|| {
+                    let cards: [Card; 4] =
+                        [sorted[0], sorted[1], sorted[2], sorted[3]];
+                    (flop.weight, cards)
+                });
+        }
+    }
+
+    let mut result: Vec<WeightedBoard<4>> = map
+        .into_iter()
+        .map(|(_, (weight, cards))| WeightedBoard { cards, weight })
+        .collect();
+    result.sort_by_key(|wb| canonical_key(&wb.cards).0);
+    result
+}
+
+/// Enumerate all canonical 5-card river boards with weights.
+///
+/// For each canonical turn, appends each of the 48 remaining cards as a river,
+/// canonicalizes the resulting 5-card board, and deduplicates. Weight equals the
+/// sum of constituent turn weights. Total weight = C(52,3) x 49 x 48.
+#[must_use]
+pub fn enumerate_canonical_rivers() -> Vec<WeightedBoard<5>> {
+    let turns = enumerate_canonical_turns();
+    let deck = build_deck();
+    let mut map: HashMap<PackedBoard, (u32, [Card; 5])> = HashMap::new();
+
+    for turn in &turns {
+        for &card in &deck {
+            if turn.cards.contains(&card) {
+                continue;
+            }
+            let board_vec = vec![
+                turn.cards[0],
+                turn.cards[1],
+                turn.cards[2],
+                turn.cards[3],
+                card,
+            ];
+            // INVARIANT: 5-card boards are always valid for canonicalization
+            let canonical = CanonicalBoard::from_cards(&board_vec)
+                .expect("5-card board is always valid");
+            let key = canonical_key(&canonical.cards);
+            let sorted = key.to_cards(5);
+            map.entry(key)
+                .and_modify(|(w, _)| *w += turn.weight)
+                .or_insert_with(|| {
+                    let cards: [Card; 5] =
+                        [sorted[0], sorted[1], sorted[2], sorted[3], sorted[4]];
+                    (turn.weight, cards)
+                });
+        }
+    }
+
+    let mut result: Vec<WeightedBoard<5>> = map
+        .into_iter()
+        .map(|(_, (weight, cards))| WeightedBoard { cards, weight })
+        .collect();
+    result.sort_by_key(|wb| canonical_key(&wb.cards).0);
+    result
 }
 
 /// Enumerate all C(52,2) = 1326 two-card combos from the deck.
@@ -1248,5 +1388,36 @@ mod tests {
                 combo
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Canonical board enumeration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn canonical_flops_count() {
+        let flops = enumerate_canonical_flops();
+        assert_eq!(flops.len(), 1755);
+        let total_weight: u32 = flops.iter().map(|f| f.weight).sum();
+        assert_eq!(total_weight, 22100); // C(52,3)
+    }
+
+    #[test]
+    fn canonical_turns_reasonable_count() {
+        let turns = enumerate_canonical_turns();
+        assert!(turns.len() > 10_000, "too few turns: {}", turns.len());
+        assert!(turns.len() < 25_000, "too many turns: {}", turns.len());
+        let total_weight: u32 = turns.iter().map(|t| t.weight).sum();
+        assert_eq!(total_weight, 22100 * 49);
+    }
+
+    #[test]
+    #[ignore]
+    fn canonical_rivers_reasonable_count() {
+        let rivers = enumerate_canonical_rivers();
+        assert!(rivers.len() > 500_000, "too few rivers: {}", rivers.len());
+        assert!(rivers.len() < 1_000_000, "too many rivers: {}", rivers.len());
+        let total_weight: u64 = rivers.iter().map(|r| u64::from(r.weight)).sum();
+        assert_eq!(total_weight, 22100 * 49 * 48);
     }
 }
