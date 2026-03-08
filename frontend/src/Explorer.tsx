@@ -438,7 +438,7 @@ function StreetBlock({
 }
 
 // History item type
-type HistoryItem =
+export type HistoryItem =
   | { type: 'action'; position: string; stack: number; pot: number; actions: ActionInfo[]; selected: string }
   | { type: 'street'; street: string; pot: number; stack_p1: number; stack_p2: number; cards: string[] };
 
@@ -1347,6 +1347,7 @@ export default function Explorer() {
         <PostflopExplorer
           onBack={() => { setShowPostflop(false); setBlueprintPostflopConfig(null); }}
           blueprintConfig={blueprintPostflopConfig ?? undefined}
+          preflopHistory={historyItems}
         />
       )}
 

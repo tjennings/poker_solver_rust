@@ -19,7 +19,7 @@ import {
   displayOrderIndices,
   formatActionLabel,
 } from './matrix-utils';
-import { ActionBlock, HandCell, CellDetail } from './Explorer';
+import { ActionBlock, HandCell, CellDetail, HistoryItem } from './Explorer';
 
 /** Convert postflop cell to shared MatrixCell format. */
 function toMatrixCell(cell: { hand: string; suited: boolean; pair: boolean; probabilities: number[] }, actions: ActionInfo[]): MatrixCell {
@@ -37,9 +37,10 @@ function toMatrixCell(cell: { hand: string; suited: boolean; pair: boolean; prob
 interface PostflopExplorerProps {
   onBack: () => void;
   blueprintConfig?: BlueprintConfig;
+  preflopHistory?: HistoryItem[];
 }
 
-export default function PostflopExplorer({ onBack, blueprintConfig }: PostflopExplorerProps) {
+export default function PostflopExplorer({ onBack, blueprintConfig, preflopHistory }: PostflopExplorerProps) {
   const [config, setConfig] = useState<PostflopConfig>(() => {
     if (blueprintConfig) {
       return {
@@ -120,6 +121,10 @@ export default function PostflopExplorer({ onBack, blueprintConfig }: PostflopEx
             oopWeights: blueprintConfig.oop_weights,
             ipWeights: blueprintConfig.ip_weights,
           });
+          // Update combo counts to reflect filtered ranges
+          const oopCombos = blueprintConfig.oop_weights.filter(w => w > 0).length;
+          const ipCombos = blueprintConfig.ip_weights.filter(w => w > 0).length;
+          setConfigSummary(prev => prev ? { ...prev, oop_combos: oopCombos, ip_combos: ipCombos } : prev);
           // Set cache dir if the command exists
           await invoke('postflop_set_cache_dir', { dir: blueprintConfig.blueprint_dir }).catch(() => {
             // Command may not exist yet (Task 8)
@@ -362,6 +367,22 @@ export default function PostflopExplorer({ onBack, blueprintConfig }: PostflopEx
             </svg>
           </div>
         </div>
+
+        {/* Preflop action history (from blueprint explorer) */}
+        {preflopHistory && preflopHistory.map((item, i) =>
+          item.type === 'action' ? (
+            <ActionBlock
+              key={`pf-${i}`}
+              position={item.position}
+              stack={item.stack}
+              pot={item.pot}
+              actions={item.actions}
+              selectedAction={item.selected}
+              onSelect={() => {}}
+              isCurrent={false}
+            />
+          ) : null
+        )}
 
         {/* Config card */}
         <div className="action-block postflop-config-card"
