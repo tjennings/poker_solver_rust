@@ -26,7 +26,7 @@ use rand::prelude::*;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
 
-use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
+use crate::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
 use crate::showdown_equity::compute_equity;
 
 use super::bucket_file::{BucketFile, BucketFileHeader};
@@ -623,6 +623,55 @@ pub(crate) fn enumerate_combos(deck: &[Card]) -> Vec<[Card; 2]> {
     combos
 }
 
+/// Map a card to its position in the canonical deck ordering.
+///
+/// The deck is ordered by value (Two..Ace) x suit (Spade, Heart, Diamond, Club),
+/// matching `build_deck()`.
+#[must_use]
+pub fn card_to_deck_index(card: Card) -> usize {
+    let value_idx = match card.value {
+        Value::Two => 0,
+        Value::Three => 1,
+        Value::Four => 2,
+        Value::Five => 3,
+        Value::Six => 4,
+        Value::Seven => 5,
+        Value::Eight => 6,
+        Value::Nine => 7,
+        Value::Ten => 8,
+        Value::Jack => 9,
+        Value::Queen => 10,
+        Value::King => 11,
+        Value::Ace => 12,
+    };
+    let suit_idx = match card.suit {
+        Suit::Spade => 0,
+        Suit::Heart => 1,
+        Suit::Diamond => 2,
+        Suit::Club => 3,
+    };
+    value_idx * 4 + suit_idx
+}
+
+/// Map a two-card hole-card combo to its index in the canonical
+/// `enumerate_combos()` ordering (0..1325).
+///
+/// The two cards can be in any order — they are sorted by deck index
+/// internally to match the enumeration `for i in 0..52 { for j in i+1..52 }`.
+#[must_use]
+pub fn combo_index(c0: Card, c1: Card) -> u16 {
+    let mut i = card_to_deck_index(c0);
+    let mut j = card_to_deck_index(c1);
+    if i > j {
+        std::mem::swap(&mut i, &mut j);
+    }
+    // Triangular number: combos before row i = i*(2*52 - i - 1)/2
+    // Offset within row = j - i - 1
+    #[allow(clippy::cast_possible_truncation)]
+    let idx = (i * (2 * 52 - i - 1) / 2 + (j - i - 1)) as u16;
+    idx
+}
+
 /// Sample `count` random boards of `card_count` cards from the deck.
 ///
 /// Each board is drawn via partial Fisher-Yates. Boards are sampled
@@ -1165,6 +1214,38 @@ mod tests {
             assert!(
                 (0.0..=1.0).contains(&eq),
                 "average equity out of range: {eq}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // combo_index tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn combo_index_first_and_last() {
+        let deck = build_deck();
+        assert_eq!(combo_index(deck[0], deck[1]), 0);
+        assert_eq!(combo_index(deck[50], deck[51]), 1325);
+    }
+
+    #[test]
+    fn combo_index_order_independent() {
+        let c0 = Card::new(Value::Ace, Suit::Spade);
+        let c1 = Card::new(Value::King, Suit::Heart);
+        assert_eq!(combo_index(c0, c1), combo_index(c1, c0));
+    }
+
+    #[test]
+    fn combo_index_matches_enumeration() {
+        let deck = build_deck();
+        let combos = enumerate_combos(&deck);
+        for (expected_idx, combo) in combos.iter().enumerate() {
+            let actual = combo_index(combo[0], combo[1]);
+            assert_eq!(
+                actual, expected_idx as u16,
+                "Mismatch at combo {:?}: expected {expected_idx}, got {actual}",
+                combo
             );
         }
     }
