@@ -39,17 +39,17 @@ use super::Street;
 
 /// Number of sample 5-card boards for river clustering when no explicit count
 /// is provided.
-const DEFAULT_NUM_BOARDS: usize = 1_000;
+const DEFAULT_NUM_BOARDS: usize = 10_000;
 
 /// Number of sample 4-card boards for turn clustering.
-const DEFAULT_TURN_BOARDS: usize = 500;
+const DEFAULT_TURN_BOARDS: usize = 5_000;
 
 /// Number of sample 3-card boards for flop clustering (fewer than turn because
 /// each board requires enumerating all ~47 turn cards per combo).
-const DEFAULT_FLOP_BOARDS: usize = 200;
+const DEFAULT_FLOP_BOARDS: usize = 2_000;
 
 /// Number of sample 5-card boards for preflop equity estimation.
-const DEFAULT_PREFLOP_BOARDS: usize = 200;
+const DEFAULT_PREFLOP_BOARDS: usize = 2_000;
 
 /// Total number of 2-card combos from a 52-card deck: C(52,2) = 1326.
 const TOTAL_COMBOS: u16 = 1326;
