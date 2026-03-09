@@ -6,10 +6,7 @@ use range_solver::interface::Game;
 use range_solver::range::Range;
 use range_solver::{compute_exploitability, finalize, solve_step, PostFlopGame};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -239,56 +236,8 @@ fn action_to_info(action: &Action, index: usize, pot: i32) -> ActionInfo {
 // Solve cache
 // ---------------------------------------------------------------------------
 
-const CACHE_MAGIC: u32 = 0x50534343; // "PSCC"
-const CACHE_VERSION: u32 = 1;
-
-fn compute_cache_key(
-    config: &PostflopConfig,
-    board: &[String],
-    prior_actions: &[Vec<usize>],
-) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    config.oop_range.hash(&mut hasher);
-    config.ip_range.hash(&mut hasher);
-    config.pot.hash(&mut hasher);
-    config.effective_stack.hash(&mut hasher);
-    config.oop_bet_sizes.hash(&mut hasher);
-    config.oop_raise_sizes.hash(&mut hasher);
-    config.ip_bet_sizes.hash(&mut hasher);
-    config.ip_raise_sizes.hash(&mut hasher);
-    for card in board {
-        card.hash(&mut hasher);
-    }
-    for street_actions in prior_actions {
-        for &a in street_actions {
-            a.hash(&mut hasher);
-        }
-    }
-    hasher.finish()
-}
-
-fn write_cache_file(
-    path: &Path,
-    game: &PostFlopGame,
-    exploitability: f32,
-    iterations: u32,
-) -> std::io::Result<()> {
-    let (s1, s2, s_ip, s_ch) = game.storage_buffers();
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(&CACHE_MAGIC.to_le_bytes())?;
-    f.write_all(&CACHE_VERSION.to_le_bytes())?;
-    f.write_all(&exploitability.to_le_bytes())?;
-    f.write_all(&iterations.to_le_bytes())?;
-    f.write_all(&(s1.len() as u64).to_le_bytes())?;
-    f.write_all(&(s2.len() as u64).to_le_bytes())?;
-    f.write_all(&(s_ip.len() as u64).to_le_bytes())?;
-    f.write_all(&(s_ch.len() as u64).to_le_bytes())?;
-    f.write_all(s1)?;
-    f.write_all(s2)?;
-    f.write_all(s_ip)?;
-    f.write_all(s_ch)?;
-    Ok(())
-}
+// Spot caching disabled — raw solver buffers were 80GB+ per spot.
+// TODO: re-enable with a compact format when real-time solving is optimized.
 
 // ---------------------------------------------------------------------------
 // PostflopState
@@ -750,7 +699,7 @@ fn postflop_solve_street_impl(
     board: Vec<String>,
     max_iterations: Option<u32>,
     target_exploitability: Option<f32>,
-    prior_actions: Vec<Vec<usize>>,
+    _prior_actions: Vec<Vec<usize>>,
 ) -> Result<(), String> {
     // Guard: reject if already solving.
     if state.solving.load(Ordering::Relaxed) {
@@ -791,6 +740,7 @@ fn postflop_solve_street_impl(
     let _cache_dir = state.cache_dir.read().clone();
 
     std::thread::spawn(move || {
+        #[allow(unused_assignments)]
         let mut last_exp = f32::MAX;
 
         for t in 0..max_iters {
@@ -832,8 +782,6 @@ fn postflop_solve_street_impl(
             }
         }
 
-        let final_iters = shared.current_iteration.load(Ordering::Relaxed);
-
         // Finalize: compute EV / normalize strategy.
         {
             let mut game_guard = shared.game.lock();
@@ -843,18 +791,8 @@ fn postflop_solve_street_impl(
             *shared.matrix_snapshot.write() = Some(matrix);
         }
 
-        // Write cache if cache_dir is configured.
-        if let Some(ref dir) = *shared.cache_dir.read() {
-            let spots_dir = dir.join("spots");
-            let _ = std::fs::create_dir_all(&spots_dir);
-            let key = compute_cache_key(&config, &board, &prior_actions);
-            let cache_path = spots_dir.join(format!("{key:016x}.bin"));
-            let game_guard = shared.game.lock();
-            let game = game_guard.as_ref().unwrap();
-            if let Err(e) = write_cache_file(&cache_path, game, last_exp, final_iters) {
-                eprintln!("Failed to write solve cache: {e}");
-            }
-        }
+        // Spot caching disabled — files were too large (80GB+).
+        // TODO: re-enable with a compact format (strategy-only or matrix-only).
 
         shared.solve_complete.store(true, Ordering::Relaxed);
         shared.solving.store(false, Ordering::Release);
@@ -1157,165 +1095,32 @@ pub fn postflop_set_cache_dir(
     postflop_set_cache_dir_core(&state, dir);
 }
 
-// -- Cache read types -------------------------------------------------------
+// -- Cache types ------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CacheInfo {
     pub exploitability: f32,
     pub iterations: u32,
 }
 
-struct CachedSolve {
-    exploitability: f32,
-    iterations: u32,
-    storage1: Vec<u8>,
-    storage2: Vec<u8>,
-    storage_ip: Vec<u8>,
-    storage_chance: Vec<u8>,
-}
-
-fn load_cache_file(path: &Path) -> Result<CachedSolve, String> {
-    use std::io::Read;
-
-    let mut f = std::fs::File::open(path).map_err(|e| format!("Cannot open cache: {e}"))?;
-    let mut buf4 = [0u8; 4];
-    let mut buf8 = [0u8; 8];
-
-    f.read_exact(&mut buf4)
-        .map_err(|e| format!("Read magic: {e}"))?;
-    let magic = u32::from_le_bytes(buf4);
-    if magic != CACHE_MAGIC {
-        return Err(format!("Bad cache magic: {magic:#x}"));
-    }
-
-    f.read_exact(&mut buf4)
-        .map_err(|e| format!("Read version: {e}"))?;
-    let version = u32::from_le_bytes(buf4);
-    if version != CACHE_VERSION {
-        return Err(format!("Unsupported cache version: {version}"));
-    }
-
-    f.read_exact(&mut buf4)
-        .map_err(|e| format!("Read exploitability: {e}"))?;
-    let exploitability = f32::from_le_bytes(buf4);
-
-    f.read_exact(&mut buf4)
-        .map_err(|e| format!("Read iterations: {e}"))?;
-    let iterations = u32::from_le_bytes(buf4);
-
-    f.read_exact(&mut buf8)
-        .map_err(|e| format!("Read s1 len: {e}"))?;
-    let s1_len = u64::from_le_bytes(buf8) as usize;
-    f.read_exact(&mut buf8)
-        .map_err(|e| format!("Read s2 len: {e}"))?;
-    let s2_len = u64::from_le_bytes(buf8) as usize;
-    f.read_exact(&mut buf8)
-        .map_err(|e| format!("Read s_ip len: {e}"))?;
-    let s_ip_len = u64::from_le_bytes(buf8) as usize;
-    f.read_exact(&mut buf8)
-        .map_err(|e| format!("Read s_ch len: {e}"))?;
-    let s_ch_len = u64::from_le_bytes(buf8) as usize;
-
-    let mut s1 = vec![0u8; s1_len];
-    f.read_exact(&mut s1)
-        .map_err(|e| format!("Read storage1: {e}"))?;
-    let mut s2 = vec![0u8; s2_len];
-    f.read_exact(&mut s2)
-        .map_err(|e| format!("Read storage2: {e}"))?;
-    let mut s_ip = vec![0u8; s_ip_len];
-    f.read_exact(&mut s_ip)
-        .map_err(|e| format!("Read storage_ip: {e}"))?;
-    let mut s_ch = vec![0u8; s_ch_len];
-    f.read_exact(&mut s_ch)
-        .map_err(|e| format!("Read storage_chance: {e}"))?;
-
-    Ok(CachedSolve {
-        exploitability,
-        iterations,
-        storage1: s1,
-        storage2: s2,
-        storage_ip: s_ip,
-        storage_chance: s_ch,
-    })
-}
-
 // -- Cache check & load -----------------------------------------------------
 
 pub fn postflop_check_cache_core(
-    state: &PostflopState,
-    board: Vec<String>,
-    prior_actions: Vec<Vec<usize>>,
+    _state: &PostflopState,
+    _board: Vec<String>,
+    _prior_actions: Vec<Vec<usize>>,
 ) -> Result<Option<CacheInfo>, String> {
-    let cache_dir = state.cache_dir.read().clone();
-    let cache_dir = match cache_dir {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-
-    let config = state.config.read().clone();
-    let key = compute_cache_key(&config, &board, &prior_actions);
-    let path = cache_dir.join("spots").join(format!("{key:016x}.bin"));
-
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    match load_cache_file(&path) {
-        Ok(cached) => Ok(Some(CacheInfo {
-            exploitability: cached.exploitability,
-            iterations: cached.iterations,
-        })),
-        Err(e) => {
-            eprintln!("Cache read error: {e}");
-            Ok(None)
-        }
-    }
+    // Spot caching disabled — files were too large (80GB+).
+    Ok(None)
 }
 
 pub fn postflop_load_cached_core(
-    state: &Arc<PostflopState>,
-    board: Vec<String>,
-    prior_actions: Vec<Vec<usize>>,
+    _state: &Arc<PostflopState>,
+    _board: Vec<String>,
+    _prior_actions: Vec<Vec<usize>>,
 ) -> Result<PostflopStrategyMatrix, String> {
-    let cache_dir = state
-        .cache_dir
-        .read()
-        .clone()
-        .ok_or("No cache directory configured")?;
-
-    let config = state.config.read().clone();
-    let filtered_oop = state.filtered_oop_weights.read().clone();
-    let filtered_ip = state.filtered_ip_weights.read().clone();
-
-    let key = compute_cache_key(&config, &board, &prior_actions);
-    let path = cache_dir.join("spots").join(format!("{key:016x}.bin"));
-
-    let cached = load_cache_file(&path)?;
-
-    let mut game = build_game(&config, &board, &filtered_oop, &filtered_ip)?;
-
-    game.set_storage_buffers(
-        cached.storage1,
-        cached.storage2,
-        cached.storage_ip,
-        cached.storage_chance,
-    );
-
-    finalize(&mut game);
-
-    let matrix = build_strategy_matrix(&mut game);
-
-    state
-        .current_iteration
-        .store(cached.iterations, Ordering::Relaxed);
-    state
-        .exploitability_bits
-        .store(cached.exploitability.to_bits(), Ordering::Relaxed);
-    state.solve_complete.store(true, Ordering::Relaxed);
-    *state.matrix_snapshot.write() = Some(matrix.clone());
-    *state.game.lock() = Some(game);
-
-    Ok(matrix)
+    // Spot caching disabled — files were too large (80GB+).
+    Err("Spot caching is disabled".to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1707,140 +1512,20 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_key_deterministic() {
-        let config = PostflopConfig::default();
-        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qs".to_string()];
-        let k1 = compute_cache_key(&config, &board, &[]);
-        let k2 = compute_cache_key(&config, &board, &[]);
-        assert_eq!(k1, k2);
-
-        // Different board produces a different key.
-        let board2 = vec!["Ah".to_string(), "Kd".to_string(), "Js".to_string()];
-        let k3 = compute_cache_key(&config, &board2, &[]);
-        assert_ne!(k1, k3);
-    }
-
-    #[test]
-    fn test_cache_key_varies_with_actions() {
-        let config = PostflopConfig::default();
-        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qs".to_string()];
-        let k1 = compute_cache_key(&config, &board, &[]);
-        let k2 = compute_cache_key(&config, &board, &[vec![0, 1]]);
-        assert_ne!(k1, k2);
-    }
-
-    #[test]
-    fn test_write_cache_file_header() {
-        let game = PostFlopGame::default();
-        let dir = std::env::temp_dir().join("postflop_cache_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("test_header.bin");
-
-        write_cache_file(&path, &game, 1.5_f32, 42).unwrap();
-
-        let data = std::fs::read(&path).unwrap();
-        // Header: magic(4) + version(4) + exploitability(4) + iterations(4) + 4×len(8) = 48 bytes
-        assert!(data.len() >= 48);
-
-        let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        assert_eq!(magic, CACHE_MAGIC);
-
-        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        assert_eq!(version, CACHE_VERSION);
-
-        let exp = f32::from_le_bytes(data[8..12].try_into().unwrap());
-        assert!((exp - 1.5).abs() < f32::EPSILON);
-
-        let iters = u32::from_le_bytes(data[12..16].try_into().unwrap());
-        assert_eq!(iters, 42);
-
-        // All storage lens should be 0 for a default game.
-        for i in 0..4 {
-            let offset = 16 + i * 8;
-            let len = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-            assert_eq!(len, 0);
-        }
-
-        // Total file size: 48-byte header + 0 body = 48 bytes.
-        assert_eq!(data.len(), 48);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_set_cache_dir() {
+    fn test_check_cache_returns_none() {
         let state = PostflopState::default();
-        assert!(state.cache_dir.read().is_none());
-
-        postflop_set_cache_dir_core(&state, Some("/tmp/test_cache".to_string()));
-        assert_eq!(
-            state.cache_dir.read().as_deref(),
-            Some(Path::new("/tmp/test_cache"))
-        );
-
-        postflop_set_cache_dir_core(&state, None);
-        assert!(state.cache_dir.read().is_none());
+        let result = postflop_check_cache_core(&state, vec![], vec![]);
+        assert_eq!(result.unwrap(), None);
     }
 
     #[test]
-    fn test_cache_round_trip() {
+    fn test_cache_disabled() {
+        // Spot caching is disabled — check/load should return None/Err.
         let state = Arc::new(PostflopState::default());
-        let config = PostflopConfig {
-            oop_range: "AA,KK".to_string(),
-            ip_range: "QQ,JJ".to_string(),
-            pot: 100,
-            effective_stack: 200,
-            oop_bet_sizes: "50%,a".to_string(),
-            oop_raise_sizes: "a".to_string(),
-            ip_bet_sizes: "50%,a".to_string(),
-            ip_raise_sizes: "a".to_string(),
-            rake_rate: 0.0,
-            rake_cap: 0.0,
-        };
-        postflop_set_config_core(&state, config).unwrap();
-
-        let tmp = tempfile::tempdir().unwrap();
-        postflop_set_cache_dir_core(
-            &state,
-            Some(tmp.path().to_string_lossy().to_string()),
+        assert_eq!(
+            postflop_check_cache_core(&state, vec![], vec![]).unwrap(),
+            None
         );
-
-        // River board for fast solve in debug mode.
-        let board = vec![
-            "Ah".to_string(),
-            "Kd".to_string(),
-            "Qc".to_string(),
-            "2s".to_string(),
-            "3c".to_string(),
-        ];
-
-        postflop_solve_street_core(&state, board.clone(), Some(5), Some(f32::MAX))
-            .unwrap();
-
-        // Wait for solve to complete.
-        for _ in 0..600 {
-            if state.solve_complete.load(Ordering::Relaxed) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(state.solve_complete.load(Ordering::Relaxed));
-
-        // Check cache exists.
-        let info =
-            postflop_check_cache_core(&state, board.clone(), vec![]).unwrap();
-        assert!(info.is_some(), "Cache should exist after solve");
-        let info = info.unwrap();
-        assert!(info.iterations > 0);
-
-        // Clear game state.
-        *state.game.lock() = None;
-        state.solve_complete.store(false, Ordering::Relaxed);
-
-        // Load from cache.
-        let matrix =
-            postflop_load_cached_core(&state, board, vec![]).unwrap();
-        assert!(!matrix.actions.is_empty());
-        assert!(state.solve_complete.load(Ordering::Relaxed));
+        assert!(postflop_load_cached_core(&state, vec![], vec![]).is_err());
     }
 }
