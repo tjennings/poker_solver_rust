@@ -42,6 +42,12 @@ impl<T> MutexLike<T> {
             data: UnsafeCell::new(val),
         }
     }
+
+    /// Consumes the `MutexLike` and returns the inner value.
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
 }
 
 impl<T: ?Sized> MutexLike<T> {

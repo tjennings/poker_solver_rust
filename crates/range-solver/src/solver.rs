@@ -2,8 +2,9 @@ use crate::interface::*;
 use crate::mutex_like::*;
 use crate::sliceop::*;
 use crate::utility::*;
+use std::cell::Cell;
 use std::io::{self, Write};
-use std::mem::MaybeUninit;
+use std::mem::{self, MaybeUninit};
 
 // Re-export utility functions that belong to the solver's public API.
 pub use crate::utility::{compute_exploitability, compute_average, finalize};
@@ -38,6 +39,59 @@ impl DiscountParams {
             gamma_t: pow_gamma as f32,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ScratchBuffers — reusable allocations for solve_recursive
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated buffers reused across recursive calls to avoid per-call
+/// heap allocations. Stored in thread-local storage so each rayon worker
+/// thread maintains its own set.
+///
+/// At each recursion level the buffers are *taken* from TLS, used, and
+/// *put back* before/after child recursion. In the parallel (`for_each_child`)
+/// case each rayon worker has its own thread-local set, so there is no
+/// contention.
+struct ScratchBuffers {
+    /// Backing store for the flat cfv_actions matrix.
+    cfv_buf: Vec<f32>,
+    /// Strategy vector (or opponent cfreach_actions).
+    strategy_buf: Vec<f32>,
+    /// Denominator accumulator for regret-matching normalisation.
+    denom_buf: Vec<f32>,
+    /// Chance-node cfreach update.
+    cfreach_buf: Vec<f32>,
+    /// Chance-node f64 accumulator for isomorphic-chance summation.
+    result_f64_buf: Vec<f64>,
+}
+
+impl ScratchBuffers {
+    const fn new() -> Self {
+        Self {
+            cfv_buf: Vec::new(),
+            strategy_buf: Vec::new(),
+            denom_buf: Vec::new(),
+            cfreach_buf: Vec::new(),
+            result_f64_buf: Vec::new(),
+        }
+    }
+}
+
+thread_local! {
+    static SCRATCH: Cell<ScratchBuffers> = const { Cell::new(ScratchBuffers::new()) };
+}
+
+/// Takes the thread-local scratch buffers, replacing with empty buffers.
+#[inline]
+fn take_scratch() -> ScratchBuffers {
+    SCRATCH.with(|cell| cell.replace(ScratchBuffers::new()))
+}
+
+/// Returns scratch buffers to thread-local storage for reuse.
+#[inline]
+fn put_scratch(scratch: ScratchBuffers) {
+    SCRATCH.with(|cell| cell.set(scratch));
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +203,11 @@ pub fn solve_step<T: Game>(game: &T, current_iteration: u32) {
 // ---------------------------------------------------------------------------
 
 /// Recursively solves the counterfactual values.
+///
+/// Uses thread-local [`ScratchBuffers`] to avoid per-call heap allocations.
+/// Buffers that must outlive `for_each_child` are extracted as locals before
+/// scratch is returned to TLS; children in sequential or parallel branches
+/// each acquire their own scratch from TLS.
 fn solve_recursive<T: Game>(
     result: &mut [MaybeUninit<f32>],
     game: &T,
@@ -173,13 +232,23 @@ fn solve_recursive<T: Game>(
         return;
     }
 
-    // Allocate memory for storing the counterfactual values.
-    let cfv_actions = MutexLike::new(Vec::with_capacity(num_actions * num_hands));
+    // Take scratch buffers from thread-local storage.
+    let mut scratch = take_scratch();
+
+    // Prepare cfv_actions: extract cfv_buf, clear, reserve, wrap in MutexLike.
+    let cfv_needed = num_actions * num_hands;
+    let mut cfv_buf = mem::take(&mut scratch.cfv_buf);
+    cfv_buf.clear();
+    cfv_buf.reserve(cfv_needed);
+    let cfv_mutex = MutexLike::new(cfv_buf);
 
     // -- Chance node --
     if node.is_chance() {
-        // Update the reach probabilities.
-        let mut cfreach_updated = Vec::with_capacity(cfreach.len());
+        // Prepare cfreach_updated, then extract as local so it can be
+        // borrowed inside the for_each_child closure.
+        let mut cfreach_updated = mem::take(&mut scratch.cfreach_buf);
+        cfreach_updated.clear();
+        cfreach_updated.reserve(cfreach.len());
         mul_slice_scalar_uninit(
             cfreach_updated.spare_capacity_mut(),
             cfreach,
@@ -188,10 +257,17 @@ fn solve_recursive<T: Game>(
         // SAFETY: mul_slice_scalar_uninit writes all cfreach.len() elements.
         unsafe { cfreach_updated.set_len(cfreach.len()) };
 
+        // Return remaining scratch to TLS so children can reuse it.
+        put_scratch(scratch);
+
         // Compute the counterfactual values of each action.
         for_each_child(node, |action| {
             solve_recursive(
-                row_mut(cfv_actions.lock().spare_capacity_mut(), action, num_hands),
+                row_mut(
+                    cfv_mutex.lock().spare_capacity_mut(),
+                    action,
+                    num_hands,
+                ),
                 game,
                 &mut node.play(action),
                 player,
@@ -200,44 +276,61 @@ fn solve_recursive<T: Game>(
             );
         });
 
-        // Use 64-bit floating point values.
-        let mut result_f64 = Vec::with_capacity(num_hands);
+        // Re-take scratch for post-recursion work.
+        let mut scratch = take_scratch();
+        scratch.result_f64_buf.clear();
+        scratch.result_f64_buf.reserve(num_hands);
 
-        // Sum up the counterfactual values.
-        let mut cfv_actions = cfv_actions.lock();
-        // SAFETY: All num_actions * num_hands elements initialized by recursion.
-        unsafe { cfv_actions.set_len(num_actions * num_hands) };
-        sum_slices_f64_uninit(result_f64.spare_capacity_mut(), &cfv_actions);
+        // Extract Vec from MutexLike.
+        let mut cfv_buf = cfv_mutex.into_inner();
+        // SAFETY: All cfv_needed elements initialized by child recursion.
+        unsafe { cfv_buf.set_len(cfv_needed) };
+
+        // Sum up the counterfactual values in f64.
+        sum_slices_f64_uninit(
+            &mut scratch.result_f64_buf.spare_capacity_mut()[..num_hands],
+            &cfv_buf,
+        );
         // SAFETY: sum_slices_f64_uninit writes all num_hands elements.
-        unsafe { result_f64.set_len(num_hands) };
-
-        // Get information about isomorphic chances.
-        let isomorphic_chances = game.isomorphic_chances(node);
+        unsafe { scratch.result_f64_buf.set_len(num_hands) };
 
         // Process isomorphic chances.
-        for (i, &isomorphic_index) in isomorphic_chances.iter().enumerate() {
+        let isomorphic_chances = game.isomorphic_chances(node);
+        for (i, &iso_idx) in isomorphic_chances.iter().enumerate() {
             let swap_list = &game.isomorphic_swap(node, i)[player];
-            let tmp = row_mut(&mut cfv_actions, isomorphic_index as usize, num_hands);
+            let tmp = row_mut(&mut cfv_buf, iso_idx as usize, num_hands);
 
             apply_swap(tmp, swap_list);
-
-            result_f64.iter_mut().zip(&*tmp).for_each(|(r, &v)| {
-                *r += v as f64;
-            });
-
+            scratch
+                .result_f64_buf
+                .iter_mut()
+                .zip(&*tmp)
+                .for_each(|(r, &v)| *r += v as f64);
             apply_swap(tmp, swap_list);
         }
 
-        result.iter_mut().zip(&result_f64).for_each(|(r, &v)| {
-            r.write(v as f32);
-        });
+        result
+            .iter_mut()
+            .zip(&scratch.result_f64_buf)
+            .for_each(|(r, &v)| { r.write(v as f32); });
+
+        // Return buffers to scratch and put back to TLS.
+        scratch.cfv_buf = cfv_buf;
+        scratch.cfreach_buf = cfreach_updated;
+        put_scratch(scratch);
     }
     // -- Current player's decision node --
     else if node.player() == player {
-        // Compute the counterfactual values of each action.
+        // Return scratch to TLS before child recursion.
+        put_scratch(scratch);
+
         for_each_child(node, |action| {
             solve_recursive(
-                row_mut(cfv_actions.lock().spare_capacity_mut(), action, num_hands),
+                row_mut(
+                    cfv_mutex.lock().spare_capacity_mut(),
+                    action,
+                    num_hands,
+                ),
                 game,
                 &mut node.play(action),
                 player,
@@ -246,117 +339,112 @@ fn solve_recursive<T: Game>(
             );
         });
 
-        // Compute the strategy by regret-matching algorithm.
-        let mut strategy = if game.is_compression_enabled() {
-            regret_matching_compressed(node.regrets_compressed(), num_actions)
+        // Re-take scratch for regret matching and updates.
+        let mut scratch = take_scratch();
+
+        // Compute strategy by regret-matching.
+        if game.is_compression_enabled() {
+            regret_matching_compressed_into(
+                node.regrets_compressed(),
+                num_actions,
+                &mut scratch.strategy_buf,
+                &mut scratch.denom_buf,
+            );
         } else {
-            regret_matching(node.regrets(), num_actions)
-        };
+            regret_matching_into(
+                node.regrets(),
+                num_actions,
+                &mut scratch.strategy_buf,
+                &mut scratch.denom_buf,
+            );
+        }
 
         // Node-locking.
         let locking = game.locking_strategy(node);
-        apply_locking_strategy(&mut strategy, locking);
+        apply_locking_strategy(&mut scratch.strategy_buf, locking);
 
-        // Sum up the counterfactual values.
-        let mut cfv_actions = cfv_actions.lock();
-        // SAFETY: All num_actions * num_hands elements initialized by recursion.
-        unsafe { cfv_actions.set_len(num_actions * num_hands) };
-        let result = fma_slices_uninit(result, &strategy, &cfv_actions);
+        // Extract Vec from MutexLike.
+        let mut cfv_buf = cfv_mutex.into_inner();
+        // SAFETY: All cfv_needed elements initialized by child recursion.
+        unsafe { cfv_buf.set_len(cfv_needed) };
+
+        let result =
+            fma_slices_uninit(result, &scratch.strategy_buf, &cfv_buf);
 
         if game.is_compression_enabled() {
-            // Update the cumulative strategy.
-            let scale = node.strategy_scale();
-            let decoder = params.gamma_t * scale / u16::MAX as f32;
-            let cum_strategy = node.strategy_compressed_mut();
-
-            strategy.iter_mut().zip(&*cum_strategy).for_each(|(x, y)| {
-                *x += (*y as f32) * decoder;
-            });
-
-            if !locking.is_empty() {
-                strategy.iter_mut().zip(locking).for_each(|(d, s)| {
-                    if s.is_sign_positive() {
-                        *d = 0.0;
-                    }
-                });
-            }
-
-            let new_scale = encode_unsigned_slice(cum_strategy, &strategy);
-            node.set_strategy_scale(new_scale);
-
-            // Update the cumulative regret.
-            let scale = node.regret_scale();
-            let alpha_decoder = params.alpha_t * scale / i16::MAX as f32;
-            let beta_decoder = params.beta_t * scale / i16::MAX as f32;
-            let cum_regret = node.regrets_compressed_mut();
-
-            cfv_actions
-                .iter_mut()
-                .zip(&*cum_regret)
-                .for_each(|(x, y)| {
-                    *x += *y as f32 * if *y >= 0 { alpha_decoder } else { beta_decoder };
-                });
-
-            cfv_actions.chunks_exact_mut(num_hands).for_each(|r| {
-                sub_slice(r, result);
-            });
-
-            if !locking.is_empty() {
-                cfv_actions.iter_mut().zip(locking).for_each(|(d, s)| {
-                    if s.is_sign_positive() {
-                        *d = 0.0;
-                    }
-                });
-            }
-
-            let new_scale = encode_signed_slice(cum_regret, &cfv_actions);
-            node.set_regret_scale(new_scale);
+            update_compressed_strategy(
+                node,
+                params,
+                &mut scratch.strategy_buf,
+                locking,
+            );
+            update_compressed_regret(
+                node,
+                params,
+                &mut cfv_buf,
+                result,
+                num_hands,
+                locking,
+            );
         } else {
-            // Update the cumulative strategy.
-            let gamma = params.gamma_t;
-            let cum_strategy = node.strategy_mut();
-            cum_strategy.iter_mut().zip(&strategy).for_each(|(x, y)| {
-                *x = *x * gamma + *y;
-            });
-
-            // Update the cumulative regret.
-            let (alpha, beta) = (params.alpha_t, params.beta_t);
-            let cum_regret = node.regrets_mut();
-            cum_regret
-                .iter_mut()
-                .zip(&*cfv_actions)
-                .for_each(|(x, y)| {
-                    let coef = if x.is_sign_positive() { alpha } else { beta };
-                    *x = *x * coef + *y;
-                });
-            cum_regret.chunks_exact_mut(num_hands).for_each(|r| {
-                sub_slice(r, result);
-            });
+            update_uncompressed_strategy(
+                node,
+                params,
+                &scratch.strategy_buf,
+            );
+            update_uncompressed_regret(
+                node,
+                params,
+                &cfv_buf,
+                result,
+                num_hands,
+            );
         }
+
+        scratch.cfv_buf = cfv_buf;
+        put_scratch(scratch);
     }
     // -- Opponent's decision node --
     else {
-        // Compute the strategy by regret-matching algorithm.
-        let mut cfreach_actions = if game.is_compression_enabled() {
-            regret_matching_compressed(node.regrets_compressed(), num_actions)
+        // Compute strategy into scratch.strategy_buf.
+        if game.is_compression_enabled() {
+            regret_matching_compressed_into(
+                node.regrets_compressed(),
+                num_actions,
+                &mut scratch.strategy_buf,
+                &mut scratch.denom_buf,
+            );
         } else {
-            regret_matching(node.regrets(), num_actions)
-        };
+            regret_matching_into(
+                node.regrets(),
+                num_actions,
+                &mut scratch.strategy_buf,
+                &mut scratch.denom_buf,
+            );
+        }
 
         // Node-locking.
         let locking = game.locking_strategy(node);
-        apply_locking_strategy(&mut cfreach_actions, locking);
+        apply_locking_strategy(&mut scratch.strategy_buf, locking);
 
-        // Update the reach probabilities.
+        // Multiply reach probabilities into strategy to get cfreach_actions.
         let row_size = cfreach.len();
-        cfreach_actions.chunks_exact_mut(row_size).for_each(|r| {
-            mul_slice(r, cfreach);
-        });
+        scratch
+            .strategy_buf
+            .chunks_exact_mut(row_size)
+            .for_each(|r| mul_slice(r, cfreach));
 
-        // Compute the counterfactual values of each action.
+        // Extract cfreach_actions as local for closure borrowing.
+        let cfreach_actions = mem::take(&mut scratch.strategy_buf);
+        put_scratch(scratch);
+
         for_each_child(node, |action| {
             solve_recursive(
-                row_mut(cfv_actions.lock().spare_capacity_mut(), action, num_hands),
+                row_mut(
+                    cfv_mutex.lock().spare_capacity_mut(),
+                    action,
+                    num_hands,
+                ),
                 game,
                 &mut node.play(action),
                 player,
@@ -365,23 +453,149 @@ fn solve_recursive<T: Game>(
             );
         });
 
-        // Sum up the counterfactual values.
-        let mut cfv_actions = cfv_actions.lock();
-        // SAFETY: All num_actions * num_hands elements initialized by recursion.
-        unsafe { cfv_actions.set_len(num_actions * num_hands) };
-        sum_slices_uninit(result, &cfv_actions);
+        // Extract Vec from MutexLike.
+        let mut cfv_buf = cfv_mutex.into_inner();
+        // SAFETY: All cfv_needed elements initialized by child recursion.
+        unsafe { cfv_buf.set_len(cfv_needed) };
+
+        sum_slices_uninit(result, &cfv_buf);
+
+        // Return buffers to scratch.
+        let mut scratch = take_scratch();
+        scratch.cfv_buf = cfv_buf;
+        scratch.strategy_buf = cfreach_actions;
+        put_scratch(scratch);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Regret matching
+// Strategy / regret update helpers (player branch)
 // ---------------------------------------------------------------------------
 
-/// Computes the strategy by regret-matching: max(regret, 0) then normalize.
 #[inline]
-fn regret_matching(regret: &[f32], num_actions: usize) -> Vec<f32> {
-    let mut strategy = Vec::with_capacity(regret.len());
-    let uninit = strategy.spare_capacity_mut();
+fn update_compressed_strategy<N: GameNode>(
+    node: &mut N,
+    params: &DiscountParams,
+    strategy: &mut [f32],
+    locking: &[f32],
+) {
+    let scale = node.strategy_scale();
+    let decoder = params.gamma_t * scale / u16::MAX as f32;
+    let cum_strategy = node.strategy_compressed_mut();
+
+    strategy
+        .iter_mut()
+        .zip(&*cum_strategy)
+        .for_each(|(x, y)| *x += (*y as f32) * decoder);
+
+    if !locking.is_empty() {
+        strategy.iter_mut().zip(locking).for_each(|(d, s)| {
+            if s.is_sign_positive() {
+                *d = 0.0;
+            }
+        });
+    }
+
+    let new_scale = encode_unsigned_slice(cum_strategy, strategy);
+    node.set_strategy_scale(new_scale);
+}
+
+#[inline]
+fn update_compressed_regret<N: GameNode>(
+    node: &mut N,
+    params: &DiscountParams,
+    cfv_buf: &mut [f32],
+    result: &[f32],
+    num_hands: usize,
+    locking: &[f32],
+) {
+    let scale = node.regret_scale();
+    let alpha_decoder = params.alpha_t * scale / i16::MAX as f32;
+    let beta_decoder = params.beta_t * scale / i16::MAX as f32;
+    let cum_regret = node.regrets_compressed_mut();
+
+    cfv_buf
+        .iter_mut()
+        .zip(&*cum_regret)
+        .for_each(|(x, y)| {
+            *x += *y as f32
+                * if *y >= 0 {
+                    alpha_decoder
+                } else {
+                    beta_decoder
+                };
+        });
+
+    cfv_buf
+        .chunks_exact_mut(num_hands)
+        .for_each(|r| sub_slice(r, result));
+
+    if !locking.is_empty() {
+        cfv_buf.iter_mut().zip(locking).for_each(|(d, s)| {
+            if s.is_sign_positive() {
+                *d = 0.0;
+            }
+        });
+    }
+
+    let new_scale = encode_signed_slice(cum_regret, cfv_buf);
+    node.set_regret_scale(new_scale);
+}
+
+#[inline]
+fn update_uncompressed_strategy<N: GameNode>(
+    node: &mut N,
+    params: &DiscountParams,
+    strategy: &[f32],
+) {
+    let gamma = params.gamma_t;
+    let cum_strategy = node.strategy_mut();
+    cum_strategy
+        .iter_mut()
+        .zip(strategy)
+        .for_each(|(x, y)| *x = *x * gamma + *y);
+}
+
+#[inline]
+fn update_uncompressed_regret<N: GameNode>(
+    node: &mut N,
+    params: &DiscountParams,
+    cfv_buf: &[f32],
+    result: &[f32],
+    num_hands: usize,
+) {
+    let (alpha, beta) = (params.alpha_t, params.beta_t);
+    let cum_regret = node.regrets_mut();
+    cum_regret
+        .iter_mut()
+        .zip(cfv_buf)
+        .for_each(|(x, y)| {
+            let coef = if x.is_sign_positive() { alpha } else { beta };
+            *x = *x * coef + *y;
+        });
+    cum_regret
+        .chunks_exact_mut(num_hands)
+        .for_each(|r| sub_slice(r, result));
+}
+
+// ---------------------------------------------------------------------------
+// Regret matching (buffer-reusing variants)
+// ---------------------------------------------------------------------------
+
+/// Computes the strategy by regret-matching into a pre-allocated buffer.
+///
+/// Writes `max(regret, 0)` normalized per-hand into `strategy`, reusing
+/// `denom` as the denominator accumulator.
+#[inline]
+fn regret_matching_into(
+    regret: &[f32],
+    num_actions: usize,
+    strategy: &mut Vec<f32>,
+    denom: &mut Vec<f32>,
+) {
+    strategy.clear();
+    strategy.reserve(regret.len());
+    let uninit = &mut strategy.spare_capacity_mut()[..regret.len()];
     uninit.iter_mut().zip(regret).for_each(|(s, r)| {
         s.write(max(*r, 0.0));
     });
@@ -389,36 +603,66 @@ fn regret_matching(regret: &[f32], num_actions: usize) -> Vec<f32> {
     unsafe { strategy.set_len(regret.len()) };
 
     let row_size = regret.len() / num_actions;
-    let mut denom = Vec::with_capacity(row_size);
-    sum_slices_uninit(denom.spare_capacity_mut(), &strategy);
+    denom.clear();
+    denom.reserve(row_size);
+    sum_slices_uninit(&mut denom.spare_capacity_mut()[..row_size], strategy);
     // SAFETY: sum_slices_uninit writes all row_size elements.
     unsafe { denom.set_len(row_size) };
 
     let default = 1.0 / num_actions as f32;
     strategy.chunks_exact_mut(row_size).for_each(|r| {
-        div_slice(r, &denom, default);
+        div_slice(r, denom, default);
     });
-
-    strategy
 }
 
-/// Computes the strategy by regret-matching from compressed (i16) regrets.
+/// Computes the strategy by regret-matching from compressed (i16) regrets
+/// into a pre-allocated buffer.
 #[inline]
-fn regret_matching_compressed(regret: &[i16], num_actions: usize) -> Vec<f32> {
-    let mut strategy = Vec::with_capacity(regret.len());
+fn regret_matching_compressed_into(
+    regret: &[i16],
+    num_actions: usize,
+    strategy: &mut Vec<f32>,
+    denom: &mut Vec<f32>,
+) {
+    strategy.clear();
+    strategy.reserve(regret.len());
     strategy.extend(regret.iter().map(|&r| r.max(0) as f32));
 
     let row_size = strategy.len() / num_actions;
-    let mut denom = Vec::with_capacity(row_size);
-    sum_slices_uninit(denom.spare_capacity_mut(), &strategy);
+    denom.clear();
+    denom.reserve(row_size);
+    sum_slices_uninit(&mut denom.spare_capacity_mut()[..row_size], strategy);
     // SAFETY: sum_slices_uninit writes all row_size elements.
     unsafe { denom.set_len(row_size) };
 
     let default = 1.0 / num_actions as f32;
     strategy.chunks_exact_mut(row_size).for_each(|r| {
-        div_slice(r, &denom, default);
+        div_slice(r, denom, default);
     });
+}
 
+/// Original regret-matching returning a new Vec (used by tests).
+#[cfg(test)]
+#[inline]
+fn regret_matching(regret: &[f32], num_actions: usize) -> Vec<f32> {
+    let mut strategy = Vec::new();
+    let mut denom = Vec::new();
+    regret_matching_into(regret, num_actions, &mut strategy, &mut denom);
+    strategy
+}
+
+/// Original compressed regret-matching returning a new Vec (used by tests).
+#[cfg(test)]
+#[inline]
+fn regret_matching_compressed(regret: &[i16], num_actions: usize) -> Vec<f32> {
+    let mut strategy = Vec::new();
+    let mut denom = Vec::new();
+    regret_matching_compressed_into(
+        regret,
+        num_actions,
+        &mut strategy,
+        &mut denom,
+    );
     strategy
 }
 
@@ -435,16 +679,13 @@ mod tests {
     fn test_discount_params_iteration_0() {
         let p = DiscountParams::new(0);
         assert_eq!(p.beta_t, 0.5);
-        // t_gamma=0, (0/1)^3=0
         assert_eq!(p.gamma_t, 0.0);
-        // t_alpha=(0-1).max(0)=0, pow_alpha=0, alpha_t=0/(0+1)=0
         assert_eq!(p.alpha_t, 0.0);
     }
 
     #[test]
     fn test_discount_params_iteration_1() {
         let p = DiscountParams::new(1);
-        // t_alpha=(1-1).max(0)=0, pow_alpha=0, alpha_t=0
         assert_eq!(p.alpha_t, 0.0);
         assert_eq!(p.beta_t, 0.5);
     }
@@ -452,28 +693,27 @@ mod tests {
     #[test]
     fn test_discount_params_large_iteration() {
         let p = DiscountParams::new(100);
-        assert!(p.alpha_t > 0.9, "alpha_t should be close to 1 at t=100: {}", p.alpha_t);
+        assert!(
+            p.alpha_t > 0.9,
+            "alpha_t should be close to 1 at t=100: {}",
+            p.alpha_t
+        );
         assert_eq!(p.beta_t, 0.5);
         assert!(p.gamma_t > 0.0, "gamma_t should be positive");
     }
 
     #[test]
     fn test_discount_params_power_of_4() {
-        // At iteration 4, nearest_lower_power_of_4 = 4
-        // t_gamma = 4 - 4 = 0, pow_gamma = (0/1)^3 = 0, gamma_t = 0
         let p = DiscountParams::new(4);
         assert_eq!(p.gamma_t, 0.0);
 
-        // At iteration 5, nearest_lower_power_of_4 = 4
-        // t_gamma = 5 - 4 = 1, pow_gamma = (1/2)^3 = 0.125
         let p = DiscountParams::new(5);
         assert!((p.gamma_t - 0.125).abs() < 1e-6);
     }
 
     #[test]
     fn test_regret_matching_all_negative() {
-        // All negative regrets -> uniform strategy
-        let regret = vec![-1.0, -2.0, -3.0, -1.0, -2.0, -3.0]; // 3 actions, 2 hands
+        let regret = vec![-1.0, -2.0, -3.0, -1.0, -2.0, -3.0];
         let strategy = regret_matching(&regret, 3);
         let expected = 1.0 / 3.0;
         for &s in &strategy {
@@ -483,9 +723,6 @@ mod tests {
 
     #[test]
     fn test_regret_matching_positive() {
-        // 2 actions, 2 hands: regret = [1, 0, 0, 3]
-        // hand 0: max(1,0)=1, max(0,0)=0, denom=1, probs=[1, 0]
-        // hand 1: max(0,0)=0, max(3,0)=3, denom=3, probs=[0, 1]
         let regret = vec![1.0, 0.0, 0.0, 3.0];
         let strategy = regret_matching(&regret, 2);
         assert!((strategy[0] - 1.0).abs() < 1e-6);
@@ -496,8 +733,6 @@ mod tests {
 
     #[test]
     fn test_regret_matching_mixed() {
-        // 2 actions, 1 hand: regret = [2, 1]
-        // max(2,0)=2, max(1,0)=1, denom=3, probs=[2/3, 1/3]
         let regret = vec![2.0, 1.0];
         let strategy = regret_matching(&regret, 2);
         assert!((strategy[0] - 2.0 / 3.0).abs() < 1e-6);
@@ -516,9 +751,6 @@ mod tests {
 
     #[test]
     fn test_regret_matching_compressed_positive() {
-        // 2 actions, 2 hands: [100, 0, 0, 200]
-        // hand 0: max(100,0)=100, max(0,0)=0, denom=100, probs=[1.0, 0.0]
-        // hand 1: max(0,0)=0, max(200,0)=200, denom=200, probs=[0.0, 1.0]
         let regret: Vec<i16> = vec![100, 0, 0, 200];
         let strategy = regret_matching_compressed(&regret, 2);
         assert!((strategy[0] - 1.0).abs() < 1e-6);
@@ -534,7 +766,8 @@ mod tests {
         use crate::card::*;
 
         let oop_range: crate::range::Range = "AA,KK,QQ,AKs".parse().unwrap();
-        let ip_range: crate::range::Range = "QQ-JJ,AQs,AJs".parse().unwrap();
+        let ip_range: crate::range::Range =
+            "QQ-JJ,AQs,AJs".parse().unwrap();
         let card_config = CardConfig {
             range: [oop_range, ip_range],
             flop: flop_from_str("Qs Jh 2c").unwrap(),
@@ -550,7 +783,8 @@ mod tests {
             ..Default::default()
         };
         let tree = ActionTree::new(tree_config).unwrap();
-        let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
+        let mut game =
+            PostFlopGame::with_config(card_config, tree).unwrap();
         game.allocate_memory(false);
 
         let expl = solve(&mut game, 100, 0.0, false);
@@ -567,7 +801,8 @@ mod tests {
         use crate::card::*;
 
         let oop_range: crate::range::Range = "AA,KK,QQ,AKs".parse().unwrap();
-        let ip_range: crate::range::Range = "QQ-JJ,AQs,AJs".parse().unwrap();
+        let ip_range: crate::range::Range =
+            "QQ-JJ,AQs,AJs".parse().unwrap();
         let card_config = CardConfig {
             range: [oop_range, ip_range],
             flop: flop_from_str("Qs Jh 2c").unwrap(),
@@ -583,12 +818,11 @@ mod tests {
             ..Default::default()
         };
         let tree = ActionTree::new(tree_config).unwrap();
-        let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
+        let mut game =
+            PostFlopGame::with_config(card_config, tree).unwrap();
         game.allocate_memory(false);
 
-        // Set a very high target so it terminates immediately
         let expl = solve(&mut game, 1000, 1e10, false);
-        // Should have stopped after computing initial exploitability
         assert!(expl >= 0.0);
     }
 
@@ -599,7 +833,8 @@ mod tests {
         use crate::card::*;
 
         let oop_range: crate::range::Range = "AA,KK,QQ,AKs".parse().unwrap();
-        let ip_range: crate::range::Range = "QQ-JJ,AQs,AJs".parse().unwrap();
+        let ip_range: crate::range::Range =
+            "QQ-JJ,AQs,AJs".parse().unwrap();
         let card_config = CardConfig {
             range: [oop_range, ip_range],
             flop: flop_from_str("Qs Jh 2c").unwrap(),
@@ -615,10 +850,10 @@ mod tests {
             ..Default::default()
         };
         let tree = ActionTree::new(tree_config).unwrap();
-        let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
+        let mut game =
+            PostFlopGame::with_config(card_config, tree).unwrap();
         game.allocate_memory(false);
 
-        // Run a few steps manually
         for i in 0..10 {
             solve_step(&game, i);
         }
