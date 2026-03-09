@@ -16,6 +16,18 @@ use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 
 use super::game_tree::{GameNode, GameTree};
 
+fn humanize_bytes(bytes: usize) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// Flat-buffer storage for regrets and strategy sums.
 pub struct BlueprintStorage {
     /// Cumulative regrets: one `AtomicI32` per (decision node, bucket, action).
@@ -65,6 +77,16 @@ impl BlueprintStorage {
                 total += buckets * num_actions;
             }
         }
+
+        let regret_bytes = total * 4;
+        let strategy_bytes = total * 8;
+        eprintln!(
+            "  Storage: {} slots ({} regret + {} strategy = {} total)",
+            total,
+            humanize_bytes(regret_bytes),
+            humanize_bytes(strategy_bytes),
+            humanize_bytes(regret_bytes + strategy_bytes),
+        );
 
         Self {
             regrets: (0..total).map(|_| AtomicI32::new(0)).collect(),
