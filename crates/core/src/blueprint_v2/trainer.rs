@@ -395,11 +395,17 @@ impl BlueprintTrainer {
                 break;
             }
 
-            // 1. Generate batch of deals with pre-computed buckets (sequential).
-            let deals: Vec<DealWithBuckets> = (0..this_batch)
-                .map(|_| {
-                    let deal = self.sample_deal();
-                    let buckets = self.buckets.precompute_buckets(&deal);
+            // 1a. Sample deals sequentially (fast — just RNG + partial shuffle).
+            let raw_deals: Vec<Deal> = (0..this_batch)
+                .map(|_| self.sample_deal())
+                .collect();
+
+            // 1b. Pre-compute buckets in parallel (expensive — 6 equity evals per deal).
+            let buckets_ref = &self.buckets;
+            let deals: Vec<DealWithBuckets> = raw_deals
+                .into_par_iter()
+                .map(|deal| {
+                    let buckets = buckets_ref.precompute_buckets(&deal);
                     DealWithBuckets { deal, buckets }
                 })
                 .collect();
