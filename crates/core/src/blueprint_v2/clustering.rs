@@ -594,17 +594,21 @@ fn kmeanspp_init(data: &[Vec<f64>], k: usize, rng: &mut StdRng) -> Vec<Vec<f64>>
 
     for _ in 1..k {
         // Update distances: min with distance to newest centroid.
-        // INVARIANT: centroids is non-empty after pushing above.
         let newest = centroids.last().expect("centroids is non-empty");
-        let mut total = 0.0_f64;
-        for (i, point) in data.iter().enumerate() {
-            let d = emd(point, newest);
-            let d2 = d * d;
-            if d2 < dists[i] {
-                dists[i] = d2;
-            }
-            total += dists[i];
-        }
+
+        // Parallel: compute EMD to newest centroid, update min-distances, sum.
+        let total: f64 = data
+            .par_iter()
+            .zip(dists.par_iter_mut())
+            .map(|(point, dist)| {
+                let d = emd(point, newest);
+                let d2 = d * d;
+                if d2 < *dist {
+                    *dist = d2;
+                }
+                *dist
+            })
+            .sum();
 
         if total <= 0.0 {
             // All remaining distances are zero; pick randomly.
@@ -613,7 +617,7 @@ fn kmeanspp_init(data: &[Vec<f64>], k: usize, rng: &mut StdRng) -> Vec<Vec<f64>>
             continue;
         }
 
-        // Weighted random selection proportional to D^2.
+        // Weighted random selection proportional to D^2 (sequential — cheap prefix-sum scan).
         let threshold = rng.random::<f64>() * total;
         let mut cumulative = 0.0_f64;
         let mut chosen = n - 1;
@@ -741,15 +745,20 @@ fn kmeanspp_init_u8(data: &[Vec<u8>], k: usize, rng: &mut StdRng) -> Vec<Vec<f64
 
     for _ in 1..k {
         let newest = centroids.last().expect("centroids is non-empty");
-        let mut total = 0.0_f64;
-        for (i, point) in data.iter().enumerate() {
-            let d = emd_u8_vs_f64(point, newest);
-            let d2 = d * d;
-            if d2 < dists[i] {
-                dists[i] = d2;
-            }
-            total += dists[i];
-        }
+
+        // Parallel: compute EMD to newest centroid, update min-distances, sum.
+        let total: f64 = data
+            .par_iter()
+            .zip(dists.par_iter_mut())
+            .map(|(point, dist)| {
+                let d = emd_u8_vs_f64(point, newest);
+                let d2 = d * d;
+                if d2 < *dist {
+                    *dist = d2;
+                }
+                *dist
+            })
+            .sum();
 
         if total <= 0.0 {
             let idx = rng.random_range(0..n);
@@ -757,6 +766,7 @@ fn kmeanspp_init_u8(data: &[Vec<u8>], k: usize, rng: &mut StdRng) -> Vec<Vec<f64
             continue;
         }
 
+        // Weighted random selection (sequential — cheap prefix-sum scan).
         let threshold = rng.random::<f64>() * total;
         let mut cumulative = 0.0_f64;
         let mut chosen = n - 1;
