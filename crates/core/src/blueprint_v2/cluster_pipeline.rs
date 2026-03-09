@@ -33,7 +33,7 @@ use crate::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
 use crate::showdown_equity::{compute_equity, rank_hand};
 
 use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard};
-use super::clustering::{kmeans_1d, kmeans_1d_weighted, kmeans_emd_weighted, kmeans_emd_with_progress};
+use super::clustering::{kmeans_1d, kmeans_1d_weighted, kmeans_emd_weighted_u8, kmeans_emd_with_progress};
 use super::config::ClusteringConfig;
 use super::Street;
 
@@ -318,7 +318,6 @@ fn build_next_street_histogram(
 /// Maximum per-bin count is 47 (flop with 3 board + 2 hole = 5 dead cards),
 /// which fits comfortably in u8. Normalization happens on-the-fly during
 /// EMD distance computation in [`kmeans_emd_weighted_u8`].
-#[allow(dead_code)]
 fn build_next_street_histogram_u8(
     combo: [Card; 2],
     board: &[Card],
@@ -564,7 +563,7 @@ pub fn cluster_river_canonical(
 ///
 /// Enumerates all canonical 4-card (flop+turn) boards, computes a histogram
 /// feature vector over river buckets for every valid combo, and clusters using
-/// [`kmeans_emd_weighted`] with weights reflecting combinatorial multiplicity.
+/// [`kmeans_emd_weighted_u8`] with weights reflecting combinatorial multiplicity.
 pub fn cluster_turn_canonical(
     river_buckets: &BucketFile,
     bucket_count: u16,
@@ -579,17 +578,17 @@ pub fn cluster_turn_canonical(
     let num_river_buckets = river_buckets.header.bucket_count;
 
     // For each board, compute a histogram feature vector for every combo.
-    let board_features: Vec<Vec<Option<Vec<f64>>>> = boards
+    let board_features: Vec<Vec<Option<Vec<u8>>>> = boards
         .par_iter()
         .enumerate()
         .map(|(board_idx, wb)| {
-            let features: Vec<Option<Vec<f64>>> = combos
+            let features: Vec<Option<Vec<u8>>> = combos
                 .iter()
                 .map(|combo| {
                     if cards_overlap(*combo, &wb.cards) {
                         return None;
                     }
-                    Some(build_next_street_histogram(
+                    Some(build_next_street_histogram_u8(
                         *combo,
                         &wb.cards,
                         &deck,
@@ -606,7 +605,7 @@ pub fn cluster_turn_canonical(
         .collect();
 
     // Collect valid feature vectors with weights and positions.
-    let mut all_features: Vec<Vec<f64>> = Vec::new();
+    let mut all_features: Vec<Vec<u8>> = Vec::new();
     let mut all_weights: Vec<f64> = Vec::new();
     let mut feature_positions: Vec<(usize, usize)> = Vec::new();
 
@@ -622,7 +621,7 @@ pub fn cluster_turn_canonical(
         }
     }
 
-    let cluster_labels = kmeans_emd_weighted(
+    let cluster_labels = kmeans_emd_weighted_u8(
         &all_features,
         &all_weights,
         bucket_count as usize,
@@ -663,7 +662,7 @@ pub fn cluster_turn_canonical(
 ///
 /// Enumerates all 1,755 canonical 3-card flops, computes a histogram feature
 /// vector over turn buckets for every valid combo, and clusters using
-/// [`kmeans_emd_weighted`] with weights reflecting combinatorial multiplicity.
+/// [`kmeans_emd_weighted_u8`] with weights reflecting combinatorial multiplicity.
 pub fn cluster_flop_canonical(
     turn_buckets: &BucketFile,
     bucket_count: u16,
@@ -678,17 +677,17 @@ pub fn cluster_flop_canonical(
     let num_turn_buckets = turn_buckets.header.bucket_count;
 
     // For each board, compute a histogram feature vector for every combo.
-    let board_features: Vec<Vec<Option<Vec<f64>>>> = boards
+    let board_features: Vec<Vec<Option<Vec<u8>>>> = boards
         .par_iter()
         .enumerate()
         .map(|(board_idx, wb)| {
-            let features: Vec<Option<Vec<f64>>> = combos
+            let features: Vec<Option<Vec<u8>>> = combos
                 .iter()
                 .map(|combo| {
                     if cards_overlap(*combo, &wb.cards) {
                         return None;
                     }
-                    Some(build_next_street_histogram(
+                    Some(build_next_street_histogram_u8(
                         *combo,
                         &wb.cards,
                         &deck,
@@ -705,7 +704,7 @@ pub fn cluster_flop_canonical(
         .collect();
 
     // Collect valid feature vectors with weights and positions.
-    let mut all_features: Vec<Vec<f64>> = Vec::new();
+    let mut all_features: Vec<Vec<u8>> = Vec::new();
     let mut all_weights: Vec<f64> = Vec::new();
     let mut feature_positions: Vec<(usize, usize)> = Vec::new();
 
@@ -721,7 +720,7 @@ pub fn cluster_flop_canonical(
         }
     }
 
-    let cluster_labels = kmeans_emd_weighted(
+    let cluster_labels = kmeans_emd_weighted_u8(
         &all_features,
         &all_weights,
         bucket_count as usize,
