@@ -41,14 +41,10 @@ impl PruneStats {
     }
 }
 
-use std::collections::HashMap;
-
-use super::bucket_file::{BucketFile, PackedBoard};
-use super::cluster_pipeline::{canonical_key, combo_index};
+use super::bucket_file::BucketFile;
 use super::game_tree::{GameNode, GameTree, TerminalKind};
 use super::storage::BlueprintStorage;
 use super::Street;
-use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::poker::{Card, Hand, Rankable};
 
 /// Maximum number of actions at any decision node.
@@ -79,52 +75,29 @@ pub struct DealWithBuckets {
 /// Loaded bucket assignments for all 4 streets.
 ///
 /// During MCCFR, we look up buckets by street using the deal's cards.
-/// When bucket files are loaded from the clustering pipeline, lookups
-/// use the file's canonical board index for O(1) lookup; otherwise
-/// falls back to raw equity-based bucketing.
+/// Uses equity-based bucketing: computes showdown equity and maps to
+/// a uniform bucket.
 pub struct AllBuckets {
     pub bucket_counts: [u16; 4],
     /// Per-street bucket files produced by the clustering pipeline.
-    /// `None` = fallback to raw-equity buckets for that street.
+    /// Currently unused for lookups (equity fallback is used instead),
+    /// but retained for potential future use.
     pub bucket_files: [Option<BucketFile>; 4],
-    /// Board-to-index lookup tables, built from bucket file board tables.
-    board_maps: [Option<HashMap<PackedBoard, u32>>; 4],
 }
 
 impl AllBuckets {
-    /// Construct `AllBuckets`, building `board_maps` from any v2 bucket
-    /// files that contain a board table.
     #[must_use]
     pub fn new(bucket_counts: [u16; 4], bucket_files: [Option<BucketFile>; 4]) -> Self {
-        let board_maps = std::array::from_fn(|street_idx| {
-            bucket_files[street_idx].as_ref().and_then(|bf| {
-                if bf.boards.is_empty() {
-                    None
-                } else {
-                    let map: HashMap<PackedBoard, u32> = bf
-                        .boards
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, &packed)| (packed, idx as u32))
-                        .collect();
-                    Some(map)
-                }
-            })
-        });
         Self {
             bucket_counts,
             bucket_files,
-            board_maps,
         }
     }
 
     /// Look up the bucket for a player's hole cards at a given street.
     ///
-    /// When a v2 `BucketFile` with a board table is loaded for the
-    /// given street, canonicalizes the board and hole cards, then
-    /// performs an O(1) lookup in the pre-built board map. Falls back
-    /// to equity-based bucketing for v1 files or boards not present in
-    /// the file.
+    /// Preflop uses canonical hand index. Post-flop streets compute
+    /// showdown equity and map to a uniform bucket.
     ///
     /// # Panics
     /// Panics if `street` is preflop and `bucket_counts[0]` is zero.
@@ -137,29 +110,6 @@ impl AllBuckets {
         }
 
         let street_idx = street as usize;
-
-        // Try bucket file lookup (O(1) when canonical boards are available).
-        if let (Some(bf), Some(board_map)) = (
-            &self.bucket_files[street_idx],
-            &self.board_maps[street_idx],
-        ) {
-            // INVARIANT: `board` has 3-5 cards for post-flop streets, which
-            // `CanonicalBoard::from_cards` accepts.
-            let canonical = CanonicalBoard::from_cards(board)
-                .expect("board should be valid for canonicalization");
-            let packed = canonical_key(&canonical.cards);
-            if let Some(&board_idx) = board_map.get(&packed) {
-                let (c0, c1) =
-                    canonical.canonicalize_holding(hole_cards[0], hole_cards[1]);
-                let cidx = combo_index(c0, c1) as usize;
-                let flat =
-                    board_idx as usize * bf.header.combos_per_board as usize + cidx;
-                return bf.buckets[flat];
-            }
-            // Board not in file — fall through to equity fallback.
-        }
-
-        // Fallback: equity-based bucketing (for v1 files or missing boards).
         let equity = crate::showdown_equity::compute_equity(hole_cards, board);
         let k = self.bucket_counts[street_idx];
         let bucket = (equity * f64::from(k)) as u16;
@@ -768,56 +718,29 @@ mod tests {
     }
 
     #[test]
-    fn get_bucket_uses_file_when_available() {
-        use crate::abstraction::isomorphism::CanonicalBoard;
-        use crate::blueprint_v2::bucket_file::BucketFileHeader;
-        use crate::blueprint_v2::cluster_pipeline::{canonical_key, combo_index};
+    fn get_bucket_equity_fallback() {
+        let all = AllBuckets::new(
+            [169, 10, 10, 10],
+            [None, None, None, None],
+        );
 
-        // Build a minimal bucket file with one canonical board.
-        let board_cards = vec![
+        let board = vec![
             Card::new(Value::Ace, Suit::Spade),
             Card::new(Value::King, Suit::Spade),
             Card::new(Value::Queen, Suit::Heart),
             Card::new(Value::Jack, Suit::Diamond),
             Card::new(Value::Ten, Suit::Club),
         ];
-        let canonical = CanonicalBoard::from_cards(&board_cards).unwrap();
-        let packed = canonical_key(&canonical.cards);
 
-        let mut buckets_data = vec![0_u16; 1326];
-        // Set a known combo to bucket 7.
-        let (c0, c1) = canonical.canonicalize_holding(
-            Card::new(Value::Two, Suit::Spade),
-            Card::new(Value::Three, Suit::Spade),
-        );
-        let cidx = combo_index(c0, c1) as usize;
-        buckets_data[cidx] = 7;
-
-        let bf = BucketFile {
-            header: BucketFileHeader {
-                street: Street::River,
-                bucket_count: 10,
-                board_count: 1,
-                combos_per_board: 1326,
-                version: 2,
-            },
-            boards: vec![packed],
-            buckets: buckets_data,
-        };
-
-        let all = AllBuckets::new(
-            [169, 10, 10, 10],
-            [None, None, None, Some(bf)],
-        );
-
-        let result = all.get_bucket(
+        let bucket = all.get_bucket(
             Street::River,
             [
-                Card::new(Value::Two, Suit::Spade),
-                Card::new(Value::Three, Suit::Spade),
+                Card::new(Value::Two, Suit::Heart),
+                Card::new(Value::Three, Suit::Heart),
             ],
-            &board_cards,
+            &board,
         );
-        assert_eq!(result, 7);
+        // Should return a valid bucket index in [0, 10).
+        assert!(bucket < 10, "bucket should be < 10, got {bucket}");
     }
 }

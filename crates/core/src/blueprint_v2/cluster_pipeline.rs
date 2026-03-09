@@ -876,9 +876,9 @@ pub fn run_clustering_pipeline(
     output_dir: &Path,
     progress: impl Fn(&str, f64) + Sync,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. River (exhaustive canonical enumeration)
+    // 1. River (sampling-based equity clustering)
     progress("river", 0.0);
-    let river = cluster_river_canonical(
+    let river = cluster_river(
         config.river.buckets,
         config.kmeans_iterations,
         config.seed,
@@ -886,9 +886,9 @@ pub fn run_clustering_pipeline(
     );
     river.save(&output_dir.join("river.buckets"))?;
 
-    // 2. Turn (exhaustive canonical enumeration, depends on river)
+    // 2. Turn (sampling-based, potential-aware EMD, depends on river)
     progress("turn", 0.0);
-    let turn = cluster_turn_canonical(
+    let turn = cluster_turn(
         &river,
         config.turn.buckets,
         config.kmeans_iterations,
@@ -897,9 +897,9 @@ pub fn run_clustering_pipeline(
     );
     turn.save(&output_dir.join("turn.buckets"))?;
 
-    // 3. Flop (exhaustive canonical enumeration, depends on turn)
+    // 3. Flop (sampling-based, potential-aware EMD, depends on turn)
     progress("flop", 0.0);
-    let flop = cluster_flop_canonical(
+    let flop = cluster_flop(
         &turn,
         config.flop.buckets,
         config.kmeans_iterations,
