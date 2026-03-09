@@ -45,6 +45,25 @@ static CANONICAL_DECK: LazyLock<[Card; 52]> = LazyLock::new(|| {
     deck
 });
 
+/// Sample a random deal using the provided RNG (thread-safe, no &mut self).
+///
+/// Copies the canonical deck onto the stack and applies a partial
+/// Fisher-Yates shuffle of the first 9 positions.
+fn sample_deal_with_rng(rng: &mut impl Rng) -> Deal {
+    let mut deck = *CANONICAL_DECK;
+    for i in 0..9 {
+        let j = rng.random_range(i..52);
+        deck.swap(i, j);
+    }
+    Deal {
+        hole_cards: [
+            [deck[0], deck[1]],
+            [deck[2], deck[3]],
+        ],
+        board: [deck[4], deck[5], deck[6], deck[7], deck[8]],
+    }
+}
+
 /// Check whether all 4 bucket files already exist in the given directory.
 #[must_use]
 pub fn bucket_files_exist(dir: &Path) -> bool {
@@ -404,9 +423,9 @@ impl BlueprintTrainer {
                 break;
             }
 
-            // 1. Sample deals sequentially (fast — just RNG + partial shuffle).
-            let raw_deals: Vec<Deal> = (0..this_batch)
-                .map(|_| self.sample_deal())
+            // Pre-seed per-deal RNGs from the main RNG (only sequential part).
+            let thread_seeds: Vec<u64> = (0..this_batch)
+                .map(|_| self.rng.random())
                 .collect();
 
             let prune = self.should_prune();
@@ -419,18 +438,16 @@ impl BlueprintTrainer {
             let ev_sum = &self.ev_sum;
             let ev_count = &self.ev_count;
 
-            // Pre-seed thread RNGs to avoid OS entropy syscalls in par_iter.
-            let thread_seeds: Vec<u64> = (0..raw_deals.len()).map(|_| self.rng.random()).collect();
-
             let rake_rate = self.config.game.rake_rate;
             let rake_cap = self.config.game.rake_cap;
 
-            // 2. Single parallel phase: precompute buckets + traverse per deal.
-            //    Eliminates sync barrier between separate precompute and traversal phases.
-            let batch_prune_stats: PruneStats = raw_deals.into_par_iter().enumerate().map(|(i, deal)| {
+            // Fully parallel: each thread samples its own deal, precomputes
+            // buckets, and traverses — no sequential deal generation.
+            let batch_prune_stats: PruneStats = thread_seeds.into_par_iter().map(|seed| {
+                let mut rng = SmallRng::seed_from_u64(seed);
+                let deal = sample_deal_with_rng(&mut rng);
                 let buckets = buckets_ref.precompute_buckets(&deal);
                 let deal = DealWithBuckets { deal, buckets };
-                let mut rng = SmallRng::seed_from_u64(thread_seeds[i]);
                 let mut stats = PruneStats::default();
 
                 let (ev0, s0) = traverse_external(
@@ -614,14 +631,14 @@ impl BlueprintTrainer {
         let t = self.iterations / interval;
         let d = t as f64 / (t as f64 + 1.0);
 
-        for atom in &self.storage.regrets {
+        self.storage.regrets.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
             atom.store((f64::from(v) * d) as i32, Ordering::Relaxed);
-        }
-        for atom in &self.storage.strategy_sums {
+        });
+        self.storage.strategy_sums.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
             atom.store((v as f64 * d) as i64, Ordering::Relaxed);
-        }
+        });
 
         self.last_discount_time = self.iterations;
     }
