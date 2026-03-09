@@ -19,10 +19,10 @@ fn toy_config() -> BlueprintV2Config {
         },
         clustering: ClusteringConfig {
             algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-            preflop: StreetClusterConfig { buckets: 10 },
-            flop: StreetClusterConfig { buckets: 10 },
-            turn: StreetClusterConfig { buckets: 10 },
-            river: StreetClusterConfig { buckets: 10 },
+            preflop: StreetClusterConfig { buckets: 10, delta_bins: None },
+            flop: StreetClusterConfig { buckets: 10, delta_bins: None },
+            turn: StreetClusterConfig { buckets: 10, delta_bins: None },
+            river: StreetClusterConfig { buckets: 10, delta_bins: None },
             seed: 42,
             kmeans_iterations: 50,
         },
@@ -33,7 +33,7 @@ fn toy_config() -> BlueprintV2Config {
             river: vec![vec![1.0]],
         },
         training: TrainingConfig {
-            cluster_path: "clusters/".into(),
+            cluster_path: None,
             iterations: Some(100),
             time_limit_minutes: None,
             lcfr_warmup_iterations: 9999,

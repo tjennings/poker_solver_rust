@@ -1,0 +1,79 @@
+# Blueprint V2 Config — Equity+Delta bucketing, no pre-computed clusters needed
+# 17 uniform equity bins × 7 asymmetric delta bins = 119 buckets per postflop street.
+# Delta captures draw vs made hand vs vulnerable; more resolution in positive draw range.
+game:
+  name: "HU Equity+Delta 100bb"
+  players: 2
+  stack_depth: 100.0
+  small_blind: 0.5
+  big_blind: 1.0
+
+clustering:
+  algorithm: potential_aware_emd
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 500
+    delta_bins: [-0.2, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.55, 0.75]
+  turn:
+    buckets: 100
+    delta_bins: [-0.2, -0.05, 0.05, 0.15, 0.25, 0.40]
+  river:
+    buckets: 1000
+
+action_abstraction:
+  preflop:
+    - ["2bb"]
+    - ["4bb", "7bb"]
+    - ["1x", "2x", "3x"]
+    - ["1x", "2x", "3x"]
+  flop:
+    - [0.33, 0.67, 1.0]
+    - [0.5, 1.0]
+  turn:
+    - [0.33, 0.67, 1.0, 1.5]
+    - [0.67, 1.5]
+  river:
+    - [0.33, 0.67, 1.0, 1.5, 2.0]
+    - [0.67, 1.5]
+
+training:
+  time_limit_minutes: 7200
+  lcfr_warmup_iterations: 5000000
+  prune_after_iterations: 99999999999
+  prune_threshold: -600
+  lcfr_discount_interval: 50000
+  batch_size: 2000
+
+snapshots:
+  resume: true
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  max_snapshots: 10
+  output_dir: "./local_data/snapshots_equity_delta"
+
+tui:
+  enabled: true
+  refresh_rate_ms: 2000
+  telemetry:
+    strategy_delta_interval_seconds: 120
+    sparkline_window: 60
+  scenarios:
+    - name: "SB Open"
+      player: SB
+      actions: []
+    - name: "BB vs Call"
+      player: BB
+      actions: ["call"]
+    - name: "BB vs 2.5x"
+      player: BB
+      actions: ["raise-0"]
+    - name: "SB Cbet K72"
+      player: SB
+      actions: ["raise-0", "call"]
+      board: ["Kh", "7s", "2d"]
+      street: flop
+  random_scenario:
+    enabled: true
+    hold_minutes: 3
+    pool: ["preflop", "flop", "turn", "river"]

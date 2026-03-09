@@ -58,6 +58,18 @@ pub enum ClusteringAlgorithm {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreetClusterConfig {
     pub buckets: u16,
+    /// Optional delta bin boundaries for equity-delta bucketing.
+    ///
+    /// When present, buckets are split into a 2D grid: equity × delta.
+    /// Boundaries define edges of delta bins over [-1.0, +1.0]; the number
+    /// of delta bins is `len(delta_bins) + 1`. Equity bins are derived as
+    /// `buckets / delta_bin_count`.
+    ///
+    /// Delta = next_street_equity - current_street_equity.
+    /// Use asymmetric boundaries for more resolution on positive deltas
+    /// (draws completing) and less on negative (made hands cracked).
+    #[serde(default)]
+    pub delta_bins: Option<Vec<f64>>,
 }
 
 /// Action abstraction: allowed bet sizes per street and raise cap.
@@ -78,7 +90,9 @@ pub struct ActionAbstractionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingConfig {
     /// Path to pre-computed clustering data.
-    pub cluster_path: String,
+    /// When omitted, training uses raw equity bucketing (no clustering needed).
+    #[serde(default)]
+    pub cluster_path: Option<String>,
     /// Stop after this many iterations (if set).
     #[serde(default)]
     pub iterations: Option<u64>,
@@ -257,7 +271,7 @@ snapshots:
         assert_eq!(cfg.action_abstraction.flop[0], vec![0.33, 0.67, 1.0]);
 
         // Training
-        assert_eq!(cfg.training.cluster_path, "/tmp/clusters");
+        assert_eq!(cfg.training.cluster_path, Some("/tmp/clusters".to_owned()));
         assert_eq!(cfg.training.iterations, Some(10_000));
         assert_eq!(cfg.training.time_limit_minutes, None);
         assert_eq!(cfg.training.lcfr_warmup_iterations, 5_000_000);
@@ -289,10 +303,10 @@ snapshots:
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-                preflop: StreetClusterConfig { buckets: 169 },
-                flop: StreetClusterConfig { buckets: 500 },
-                turn: StreetClusterConfig { buckets: 500 },
-                river: StreetClusterConfig { buckets: 500 },
+                preflop: StreetClusterConfig { buckets: 169, delta_bins: None },
+                flop: StreetClusterConfig { buckets: 500, delta_bins: None },
+                turn: StreetClusterConfig { buckets: 500, delta_bins: None },
+                river: StreetClusterConfig { buckets: 500, delta_bins: None },
                 seed: 123,
                 kmeans_iterations: 50,
             },
@@ -303,7 +317,7 @@ snapshots:
                 river: vec![vec![1.0]],
             },
             training: TrainingConfig {
-                cluster_path: "/data/clusters".to_owned(),
+                cluster_path: Some("/data/clusters".to_owned()),
                 iterations: None,
                 time_limit_minutes: Some(720),
                 lcfr_warmup_iterations: 5_000_000,
@@ -346,7 +360,7 @@ snapshots:
         assert_eq!(restored.action_abstraction.river, original.action_abstraction.river);
 
         // Training
-        assert_eq!(restored.training.cluster_path, "/data/clusters");
+        assert_eq!(restored.training.cluster_path, Some("/data/clusters".to_owned()));
         assert_eq!(restored.training.iterations, None);
         assert_eq!(restored.training.time_limit_minutes, Some(720));
         assert_eq!(restored.training.prune_threshold, 0);

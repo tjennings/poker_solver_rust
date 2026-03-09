@@ -26,10 +26,10 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
         },
         clustering: ClusteringConfig {
             algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-            preflop: StreetClusterConfig { buckets: 5 },
-            flop: StreetClusterConfig { buckets: 5 },
-            turn: StreetClusterConfig { buckets: 5 },
-            river: StreetClusterConfig { buckets: 5 },
+            preflop: StreetClusterConfig { buckets: 5, delta_bins: None },
+            flop: StreetClusterConfig { buckets: 5, delta_bins: None },
+            turn: StreetClusterConfig { buckets: 5, delta_bins: None },
+            river: StreetClusterConfig { buckets: 5, delta_bins: None },
             seed: 42,
             kmeans_iterations: 10,
         },
@@ -40,7 +40,7 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
             river: vec![vec![1.0]],
         },
         training: TrainingConfig {
-            cluster_path: cluster_dir.to_string_lossy().into_owned(),
+            cluster_path: Some(cluster_dir.to_string_lossy().into_owned()),
             iterations: Some(50),
             time_limit_minutes: None,
             lcfr_warmup_iterations: 9999,

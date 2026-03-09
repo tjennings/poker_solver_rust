@@ -201,8 +201,17 @@ impl BlueprintTrainer {
         ];
 
         let storage = BlueprintStorage::new(&tree, bucket_counts);
-        let bucket_files = load_bucket_files(Path::new(&config.training.cluster_path));
-        let buckets = AllBuckets::new(bucket_counts, bucket_files);
+        let bucket_files = match &config.training.cluster_path {
+            Some(path) => load_bucket_files(Path::new(path)),
+            None => [None, None, None, None],
+        };
+        let street_configs = [
+            &config.clustering.preflop,
+            &config.clustering.flop,
+            &config.clustering.turn,
+            &config.clustering.river,
+        ];
+        let buckets = AllBuckets::new(bucket_counts, bucket_files, street_configs);
         let rng = StdRng::seed_from_u64(config.clustering.seed);
 
         let deck = *CANONICAL_DECK;
@@ -351,9 +360,9 @@ impl BlueprintTrainer {
     /// fallback produces meaningless abstractions) or if a snapshot
     /// write fails.
     pub fn train(&mut self) -> Result<(), Box<dyn Error>> {
-        // Refuse to train without proper bucket files — equity-based
-        // fallback produces meaningless postflop abstractions.
-        if !self.skip_bucket_validation {
+        // Validate bucket files unless explicitly skipped or no cluster_path configured
+        // (no cluster_path means intentional equity-only mode).
+        if !self.skip_bucket_validation && self.config.training.cluster_path.is_some() {
         const STREET_NAMES: [&str; 3] = ["flop", "turn", "river"];
         let mut missing = Vec::new();
         for (i, name) in STREET_NAMES.iter().enumerate() {
@@ -946,10 +955,10 @@ mod tests {
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-                preflop: StreetClusterConfig { buckets: 10 },
-                flop: StreetClusterConfig { buckets: 10 },
-                turn: StreetClusterConfig { buckets: 10 },
-                river: StreetClusterConfig { buckets: 10 },
+                preflop: StreetClusterConfig { buckets: 10, delta_bins: None },
+                flop: StreetClusterConfig { buckets: 10, delta_bins: None },
+                turn: StreetClusterConfig { buckets: 10, delta_bins: None },
+                river: StreetClusterConfig { buckets: 10, delta_bins: None },
                 seed: 42,
                 kmeans_iterations: 50,
             },
@@ -960,7 +969,7 @@ mod tests {
                 river: vec![vec![1.0]],
             },
             training: TrainingConfig {
-                cluster_path: "clusters/".into(),
+                cluster_path: None,
                 iterations: Some(100),
                 time_limit_minutes: None,
                 lcfr_warmup_iterations: 0,

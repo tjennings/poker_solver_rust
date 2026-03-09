@@ -342,10 +342,10 @@ mod tests {
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-                preflop: StreetClusterConfig { buckets: 50 },
-                flop: StreetClusterConfig { buckets: 50 },
-                turn: StreetClusterConfig { buckets: 50 },
-                river: StreetClusterConfig { buckets: 50 },
+                preflop: StreetClusterConfig { buckets: 50, delta_bins: None },
+                flop: StreetClusterConfig { buckets: 50, delta_bins: None },
+                turn: StreetClusterConfig { buckets: 50, delta_bins: None },
+                river: StreetClusterConfig { buckets: 50, delta_bins: None },
                 seed: 42,
                 kmeans_iterations: 50,
             },
@@ -356,7 +356,7 @@ mod tests {
                 river: vec![vec![1.0]],
             },
             training: TrainingConfig {
-                cluster_path: "clusters/".into(),
+                cluster_path: None,
                 iterations: Some(100),
                 time_limit_minutes: None,
                 lcfr_warmup_iterations: 0,

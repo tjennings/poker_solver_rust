@@ -42,6 +42,7 @@ impl PruneStats {
 }
 
 use super::bucket_file::BucketFile;
+use super::config::StreetClusterConfig;
 use super::game_tree::{GameNode, GameTree, TerminalKind};
 use super::storage::BlueprintStorage;
 use super::Street;
@@ -75,32 +76,111 @@ pub struct DealWithBuckets {
 /// Loaded bucket assignments for all 4 streets.
 ///
 /// During MCCFR, we look up buckets by street using the deal's cards.
-/// Uses equity-based bucketing: computes showdown equity and maps to
-/// a uniform bucket.
+/// Supports two modes:
+/// - **Equity-only**: uniform equity bins (when no delta_bins configured).
+/// - **Equity+delta**: 2D grid of equity × signed delta to next street.
 pub struct AllBuckets {
     pub bucket_counts: [u16; 4],
     /// Per-street bucket files produced by the clustering pipeline.
     /// Currently unused for lookups (equity fallback is used instead),
     /// but retained for potential future use.
     pub bucket_files: [Option<BucketFile>; 4],
+    /// Per-street delta bin boundaries (flop, turn only; river has no future street).
+    /// When `Some`, bucketing uses 2D equity×delta grid.
+    delta_bins: [Option<Vec<f64>>; 4],
 }
 
 impl AllBuckets {
     #[must_use]
-    pub fn new(bucket_counts: [u16; 4], bucket_files: [Option<BucketFile>; 4]) -> Self {
+    pub fn new(
+        bucket_counts: [u16; 4],
+        bucket_files: [Option<BucketFile>; 4],
+        street_configs: [&StreetClusterConfig; 4],
+    ) -> Self {
+        let delta_bins = [
+            street_configs[0].delta_bins.clone(),
+            street_configs[1].delta_bins.clone(),
+            street_configs[2].delta_bins.clone(),
+            street_configs[3].delta_bins.clone(),
+        ];
         Self {
             bucket_counts,
             bucket_files,
+            delta_bins,
         }
     }
 
-    /// Look up the bucket for a player's hole cards at a given street.
+    /// Pre-compute bucket assignments for all 4 streets × 2 players.
     ///
-    /// Preflop uses canonical hand index. Post-flop streets compute
-    /// showdown equity and map to a uniform bucket.
+    /// Computes equity at all postflop streets first, then derives buckets
+    /// using equity+delta when delta_bins are configured.
+    #[must_use]
+    pub fn precompute_buckets(&self, deal: &Deal) -> [[u16; 4]; 2] {
+        let mut result = [[0u16; 4]; 2];
+        for (player, row) in result.iter_mut().enumerate() {
+            let hole = deal.hole_cards[player];
+
+            // Preflop: canonical hand index.
+            let hand = crate::hands::CanonicalHand::from_cards(hole[0], hole[1]);
+            let idx = hand.index() as u16;
+            row[0] = idx.min(self.bucket_counts[0] - 1);
+
+            // Compute postflop equities up-front (needed for delta computation).
+            let flop_eq = crate::showdown_equity::compute_equity(hole, &deal.board[..3]);
+            let turn_eq = crate::showdown_equity::compute_equity(hole, &deal.board[..4]);
+            let river_eq = crate::showdown_equity::compute_equity(hole, &deal.board[..5]);
+
+            // Flop bucket: equity + delta to turn.
+            row[1] = self.compute_bucket(1, flop_eq, Some(turn_eq));
+
+            // Turn bucket: equity + delta to river.
+            row[2] = self.compute_bucket(2, turn_eq, Some(river_eq));
+
+            // River bucket: equity only (no future street).
+            row[3] = self.compute_bucket(3, river_eq, None);
+        }
+        result
+    }
+
+    /// Compute a bucket index for a single street.
     ///
-    /// # Panics
-    /// Panics if `street` is preflop and `bucket_counts[0]` is zero.
+    /// When delta_bins are configured and `next_equity` is available, uses
+    /// a 2D equity×delta grid. Otherwise falls back to uniform equity bins.
+    fn compute_bucket(&self, street_idx: usize, equity: f64, next_equity: Option<f64>) -> u16 {
+        let k = self.bucket_counts[street_idx];
+
+        match (&self.delta_bins[street_idx], next_equity) {
+            (Some(boundaries), Some(next_eq)) => {
+                let delta = next_eq - equity;
+                let delta_bin_count = boundaries.len() as u16 + 1;
+                let equity_bin_count = k / delta_bin_count;
+                if equity_bin_count == 0 {
+                    // Not enough total buckets for the grid; fall back to equity-only.
+                    let bucket = (equity * f64::from(k)) as u16;
+                    return bucket.min(k - 1);
+                }
+
+                let eq_bin = (equity * f64::from(equity_bin_count)) as u16;
+                let eq_bin = eq_bin.min(equity_bin_count - 1);
+
+                let d_bin = delta_bin(delta, boundaries);
+
+                let bucket = eq_bin * delta_bin_count + d_bin;
+                bucket.min(k - 1)
+            }
+            _ => {
+                // Equity-only: uniform bins.
+                let bucket = (equity * f64::from(k)) as u16;
+                bucket.min(k - 1)
+            }
+        }
+    }
+
+    /// Look up the bucket for a single street using equity-only bucketing.
+    ///
+    /// Preflop uses canonical hand index. Postflop computes showdown equity
+    /// and maps to a uniform bucket. Does **not** use delta bins — use
+    /// `precompute_buckets` for full equity+delta bucketing.
     #[must_use]
     pub fn get_bucket(&self, street: Street, hole_cards: [Card; 2], board: &[Card]) -> u16 {
         if street == Street::Preflop {
@@ -108,31 +188,19 @@ impl AllBuckets {
             let idx = hand.index() as u16;
             return idx.min(self.bucket_counts[0] - 1);
         }
-
         let street_idx = street as usize;
         let equity = crate::showdown_equity::compute_equity(hole_cards, board);
-        let k = self.bucket_counts[street_idx];
-        let bucket = (equity * f64::from(k)) as u16;
-        bucket.min(k - 1)
+        self.compute_bucket(street_idx, equity, None)
     }
 
-    /// Pre-compute bucket assignments for all 4 streets x 2 players.
+    /// Create `AllBuckets` with equity-only bucketing (no delta bins).
     #[must_use]
-    pub fn precompute_buckets(&self, deal: &Deal) -> [[u16; 4]; 2] {
-        let mut result = [[0u16; 4]; 2];
-        for (player, row) in result.iter_mut().enumerate() {
-            for (street_idx, slot) in row.iter_mut().enumerate() {
-                let street = match street_idx {
-                    0 => Street::Preflop,
-                    1 => Street::Flop,
-                    2 => Street::Turn,
-                    _ => Street::River,
-                };
-                let board = Self::board_for_street(&deal.board, street);
-                *slot = self.get_bucket(street, deal.hole_cards[player], board);
-            }
+    pub fn equity_only(bucket_counts: [u16; 4], bucket_files: [Option<BucketFile>; 4]) -> Self {
+        Self {
+            bucket_counts,
+            bucket_files,
+            delta_bins: [None, None, None, None],
         }
-        result
     }
 
     /// Return the visible board slice for a given street.
@@ -145,6 +213,19 @@ impl AllBuckets {
             Street::River => &board[..5],
         }
     }
+}
+
+/// Map a delta value to a bin index given sorted boundary thresholds.
+///
+/// Boundaries partition [-1.0, +1.0] into `len + 1` bins.
+/// Returns an index in `0..=boundaries.len()`.
+fn delta_bin(delta: f64, boundaries: &[f64]) -> u16 {
+    for (i, &b) in boundaries.iter().enumerate() {
+        if delta < b {
+            return i as u16;
+        }
+    }
+    boundaries.len() as u16
 }
 
 /// Run one external-sampling MCCFR iteration for the given traverser.
@@ -315,6 +396,8 @@ fn traverse_traverser(
 
     let mut action_values_buf = [0.0f64; MAX_ACTIONS];
     let action_values = &mut action_values_buf[..num_actions];
+    let mut pruned_buf = [false; MAX_ACTIONS];
+    let pruned = &mut pruned_buf[..num_actions];
     let mut node_value = 0.0f64;
     let mut stats = PruneStats::default();
 
@@ -323,6 +406,7 @@ fn traverse_traverser(
             stats.total += 1;
             if storage.get_regret(node_idx, bucket, a) < prune_threshold {
                 stats.hits += 1;
+                pruned[a] = true;
                 continue;
             }
         }
@@ -337,8 +421,11 @@ fn traverse_traverser(
     }
 
     // Update regrets: delta = action_value - node_value, scaled to
-    // integer by ×1000 for precision.
+    // integer by ×1000 for precision. Skip pruned actions.
     for (a, &av) in action_values.iter().enumerate().take(num_actions) {
+        if pruned[a] {
+            continue;
+        }
         let delta = av - node_value;
         storage.add_regret(node_idx, bucket, a, (delta * 1000.0) as i32);
     }
@@ -455,7 +542,7 @@ mod tests {
     fn traverse_returns_finite() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::new(
+        let buckets = AllBuckets::equity_only(
             [10, 10, 10, 10],
             [None, None, None, None],
         );
@@ -473,7 +560,7 @@ mod tests {
     fn traverse_both_players() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::new(
+        let buckets = AllBuckets::equity_only(
             [10, 10, 10, 10],
             [None, None, None, None],
         );
@@ -497,7 +584,7 @@ mod tests {
     fn traverse_updates_regrets() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::new(
+        let buckets = AllBuckets::equity_only(
             [10, 10, 10, 10],
             [None, None, None, None],
         );
@@ -521,7 +608,7 @@ mod tests {
     fn traverse_updates_strategy_sums() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::new(
+        let buckets = AllBuckets::equity_only(
             [10, 10, 10, 10],
             [None, None, None, None],
         );
@@ -543,7 +630,7 @@ mod tests {
     fn multiple_iterations_change_strategy() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::new(
+        let buckets = AllBuckets::equity_only(
             [10, 10, 10, 10],
             [None, None, None, None],
         );
@@ -582,7 +669,7 @@ mod tests {
     fn traverse_with_pruning() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::new(
+        let buckets = AllBuckets::equity_only(
             [10, 10, 10, 10],
             [None, None, None, None],
         );
@@ -719,7 +806,7 @@ mod tests {
 
     #[test]
     fn get_bucket_equity_fallback() {
-        let all = AllBuckets::new(
+        let all = AllBuckets::equity_only(
             [169, 10, 10, 10],
             [None, None, None, None],
         );
