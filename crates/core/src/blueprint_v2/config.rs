@@ -121,6 +121,21 @@ pub struct TrainingConfig {
     /// Number of iterations per parallel batch.
     #[serde(default = "default_batch_size")]
     pub batch_size: u64,
+    /// DCFR exponent for positive regret discounting.
+    /// `d_pos = t^α / (t^α + 1)`. Default 1.5 (recommended DCFR).
+    /// Set to 1.0 for standard LCFR.
+    #[serde(default = "default_dcfr_alpha")]
+    pub dcfr_alpha: f64,
+    /// DCFR exponent for negative regret discounting.
+    /// `d_neg = t^β / (t^β + 1)`. Default 0.0 → d_neg = 0.5 (aggressive decay).
+    /// Set to 1.0 for standard LCFR.
+    #[serde(default = "default_dcfr_beta")]
+    pub dcfr_beta: f64,
+    /// DCFR exponent for strategy sum weighting.
+    /// `d_strat = (t/(t+1))^γ`. Default 2.0 (quadratic recent-weighting).
+    /// Set to 1.0 for standard LCFR.
+    #[serde(default = "default_dcfr_gamma")]
+    pub dcfr_gamma: f64,
     /// Stop when mean strategy delta falls below this threshold.
     /// Checked every `print_every_minutes`. `None` = never stop on delta.
     #[serde(default)]
@@ -187,6 +202,18 @@ const fn default_print_every() -> u64 {
 
 const fn default_batch_size() -> u64 {
     200
+}
+
+fn default_dcfr_alpha() -> f64 {
+    1.5
+}
+
+fn default_dcfr_beta() -> f64 {
+    0.0
+}
+
+fn default_dcfr_gamma() -> f64 {
+    2.0
 }
 
 #[cfg(test)]
@@ -282,6 +309,10 @@ snapshots:
         assert!((cfg.training.prune_explore_pct - default_prune_explore()).abs() < f64::EPSILON);
         assert_eq!(cfg.training.print_every_minutes, default_print_every());
         assert_eq!(cfg.training.batch_size, default_batch_size());
+        // DCFR defaults
+        assert!((cfg.training.dcfr_alpha - default_dcfr_alpha()).abs() < f64::EPSILON);
+        assert!((cfg.training.dcfr_beta - default_dcfr_beta()).abs() < f64::EPSILON);
+        assert!((cfg.training.dcfr_gamma - default_dcfr_gamma()).abs() < f64::EPSILON);
 
         // Snapshots
         assert_eq!(cfg.snapshots.warmup_minutes, 60);
@@ -329,6 +360,9 @@ snapshots:
                 batch_size: 200,
                 target_strategy_delta: None,
                 purify_threshold: 0.0,
+                dcfr_alpha: 1.5,
+                dcfr_beta: 0.0,
+                dcfr_gamma: 2.0,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 120,
@@ -364,6 +398,10 @@ snapshots:
         assert_eq!(restored.training.iterations, None);
         assert_eq!(restored.training.time_limit_minutes, Some(720));
         assert_eq!(restored.training.prune_threshold, 0);
+        // DCFR params
+        assert!((restored.training.dcfr_alpha - 1.5).abs() < f64::EPSILON);
+        assert!((restored.training.dcfr_beta - 0.0).abs() < f64::EPSILON);
+        assert!((restored.training.dcfr_gamma - 2.0).abs() < f64::EPSILON);
 
         // Snapshots
         assert_eq!(restored.snapshots.warmup_minutes, 120);

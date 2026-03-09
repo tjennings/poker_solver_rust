@@ -623,21 +623,37 @@ impl BlueprintTrainer {
         Ok(())
     }
 
-    /// Apply LCFR (Linear CFR) discounting: multiply all regrets and
-    /// strategy sums by `t / (t + 1)` where `t` is the number of
-    /// discount intervals elapsed.
+    /// Apply DCFR (Discounted CFR) discounting with separate exponents
+    /// for positive regrets (α), negative regrets (β), and strategy sums (γ).
+    ///
+    /// - `d_pos = t^α / (t^α + 1)` — higher α retains positive regrets longer
+    /// - `d_neg = t^β / (t^β + 1)` — lower β decays negative regrets faster
+    /// - `d_strat = (t / (t + 1))^γ` — higher γ weights recent strategies more
+    ///
+    /// Setting α = β = γ = 1.0 recovers standard LCFR.
     fn apply_lcfr_discount(&mut self) {
         let interval = self.config.training.lcfr_discount_interval.max(1);
         let t = self.iterations / interval;
-        let d = t as f64 / (t as f64 + 1.0);
+        let tf = t as f64;
+
+        let alpha = self.config.training.dcfr_alpha;
+        let beta = self.config.training.dcfr_beta;
+        let gamma = self.config.training.dcfr_gamma;
+
+        let t_alpha = tf.powf(alpha);
+        let t_beta = tf.powf(beta);
+        let d_pos = t_alpha / (t_alpha + 1.0);
+        let d_neg = t_beta / (t_beta + 1.0);
+        let d_strat = (tf / (tf + 1.0)).powf(gamma);
 
         self.storage.regrets.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
+            let d = if v >= 0 { d_pos } else { d_neg };
             atom.store((f64::from(v) * d) as i32, Ordering::Relaxed);
         });
         self.storage.strategy_sums.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
-            atom.store((v as f64 * d) as i64, Ordering::Relaxed);
+            atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
         });
 
         self.last_discount_time = self.iterations;
@@ -992,6 +1008,9 @@ mod tests {
                 batch_size: 200,
                 target_strategy_delta: None,
                 purify_threshold: 0.0,
+                dcfr_alpha: 1.0,
+                dcfr_beta: 1.0,
+                dcfr_gamma: 1.0,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 9999,

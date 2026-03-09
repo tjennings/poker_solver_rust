@@ -45,6 +45,9 @@ fn toy_config() -> BlueprintV2Config {
             batch_size: 1,
             target_strategy_delta: None,
             purify_threshold: 0.0,
+            dcfr_alpha: 1.0,
+            dcfr_beta: 1.0,
+            dcfr_gamma: 1.0,
         },
         snapshots: SnapshotConfig {
             warmup_minutes: 9999,
