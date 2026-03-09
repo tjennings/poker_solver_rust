@@ -813,6 +813,7 @@ impl BlueprintTrainer {
     /// Returns an error if the output directory cannot be created or
     /// the files cannot be written.
     pub fn save_snapshot(&mut self) -> Result<(), Box<dyn Error>> {
+        use std::fmt::Write;
         let output_dir = Path::new(&self.config.snapshots.output_dir);
         std::fs::create_dir_all(output_dir)?;
 
@@ -842,7 +843,6 @@ impl BlueprintTrainer {
 
         // Write per-hand chip EV averages with sample counts.
         let hand_evs = self.hand_ev_averages();
-        use std::fmt::Write;
         let mut ev_json = String::from("{\n");
         for (i, (name, ev, count)) in hand_evs.iter().enumerate() {
             let _ = write!(

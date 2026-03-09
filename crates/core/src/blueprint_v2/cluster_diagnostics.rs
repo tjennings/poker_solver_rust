@@ -152,6 +152,7 @@ impl EquityAuditReport {
     /// Format as a human-readable summary.
     #[must_use]
     pub fn summary(&self) -> String {
+        use std::fmt::Write;
         let mut s = format!(
             "{street}: {bc} buckets, {nb} sample boards\n  \
              Mean intra-bucket std: {mean:.4}, max: {max:.4}\n  \
@@ -169,7 +170,6 @@ impl EquityAuditReport {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         for b in &sorted {
-            use std::fmt::Write;
             let _ = write!(
                 s,
                 "\n    bucket {:>3}: n={:<6} eq={:.3}..{:.3}  mean={:.3}  std={:.4}",
