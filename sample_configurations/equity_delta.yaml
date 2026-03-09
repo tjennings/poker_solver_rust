@@ -13,7 +13,7 @@ clustering:
   preflop:
     buckets: 169
   flop:
-    buckets: 500
+    buckets: 400
     delta_bins: [-0.2, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.55, 0.75]
   turn:
     buckets: 100
@@ -39,11 +39,11 @@ action_abstraction:
 
 training:
   time_limit_minutes: 7200
-  lcfr_warmup_iterations: 5000000
-  prune_after_iterations: 99999999999
-  prune_threshold: -600
-  lcfr_discount_interval: 50000
-  batch_size: 2000
+  lcfr_warmup_iterations: 10000000
+  prune_after_iterations: 10000000000000000
+  prune_threshold: -6000
+  lcfr_discount_interval: 1000000
+  batch_size: 6000
 
 snapshots:
   resume: true
