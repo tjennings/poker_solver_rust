@@ -404,48 +404,42 @@ impl BlueprintTrainer {
                 break;
             }
 
-            // 1a. Sample deals sequentially (fast — just RNG + partial shuffle).
+            // 1. Sample deals sequentially (fast — just RNG + partial shuffle).
             let raw_deals: Vec<Deal> = (0..this_batch)
                 .map(|_| self.sample_deal())
-                .collect();
-
-            // 1b. Pre-compute buckets in parallel (expensive — 6 equity evals per deal).
-            let buckets_ref = &self.buckets;
-            let deals: Vec<DealWithBuckets> = raw_deals
-                .into_par_iter()
-                .map(|deal| {
-                    let buckets = buckets_ref.precompute_buckets(&deal);
-                    DealWithBuckets { deal, buckets }
-                })
                 .collect();
 
             let prune = self.should_prune();
             // Config is in BB units; stored regrets are ×1000.
             let threshold = self.config.training.prune_threshold.saturating_mul(1000);
 
-            // 2. Parallel traversal.
             let tree = &self.tree;
             let storage = &self.storage;
+            let buckets_ref = &self.buckets;
             let ev_sum = &self.ev_sum;
             let ev_count = &self.ev_count;
 
             // Pre-seed thread RNGs to avoid OS entropy syscalls in par_iter.
-            let thread_seeds: Vec<u64> = (0..deals.len()).map(|_| self.rng.random()).collect();
+            let thread_seeds: Vec<u64> = (0..raw_deals.len()).map(|_| self.rng.random()).collect();
 
             let rake_rate = self.config.game.rake_rate;
             let rake_cap = self.config.game.rake_cap;
 
-            let batch_prune_stats: PruneStats = deals.par_iter().enumerate().map(|(i, deal)| {
+            // 2. Single parallel phase: precompute buckets + traverse per deal.
+            //    Eliminates sync barrier between separate precompute and traversal phases.
+            let batch_prune_stats: PruneStats = raw_deals.into_par_iter().enumerate().map(|(i, deal)| {
+                let buckets = buckets_ref.precompute_buckets(&deal);
+                let deal = DealWithBuckets { deal, buckets };
                 let mut rng = SmallRng::seed_from_u64(thread_seeds[i]);
                 let mut stats = PruneStats::default();
 
                 let (ev0, s0) = traverse_external(
-                    tree, storage, deal, 0, tree.root, prune, threshold, &mut rng,
+                    tree, storage, &deal, 0, tree.root, prune, threshold, &mut rng,
                     rake_rate, rake_cap,
                 );
                 stats.merge(s0);
                 let (ev1, s1) = traverse_external(
-                    tree, storage, deal, 1, tree.root, prune, threshold, &mut rng,
+                    tree, storage, &deal, 1, tree.root, prune, threshold, &mut rng,
                     rake_rate, rake_cap,
                 );
                 stats.merge(s1);
