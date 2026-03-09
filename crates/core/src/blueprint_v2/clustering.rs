@@ -59,7 +59,9 @@ pub fn emd_u8(a: &[u8], b: &[u8]) -> f64 {
 /// centroid.
 ///
 /// Used in the assignment step of u8 k-means: data points are u8 counts,
-/// centroids are f64 probability vectors.
+/// centroids are f64 probability vectors. If all counts are zero the
+/// normalized point is a zero vector and the result equals the centroid's
+/// self-EMD (not meaningful — callers should ensure non-zero totals).
 #[must_use]
 pub fn emd_u8_vs_f64(counts: &[u8], centroid: &[f64]) -> f64 {
     debug_assert_eq!(counts.len(), centroid.len());

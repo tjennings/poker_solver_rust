@@ -340,7 +340,9 @@ fn build_next_street_histogram_u8(
         *extended.last_mut().expect("non-empty") = next_card;
         let eq = compute_equity(combo, &extended);
         let bucket = equity_to_bucket(eq, num_buckets);
-        histogram[bucket as usize] = histogram[bucket as usize].saturating_add(1);
+        // Max per-bin count is 47 (flop: 52 - 3 board - 2 hole), fits in u8.
+        debug_assert!(histogram[bucket as usize] < 255);
+        histogram[bucket as usize] += 1;
     }
 
     histogram
