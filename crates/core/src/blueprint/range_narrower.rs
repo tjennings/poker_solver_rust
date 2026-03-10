@@ -162,6 +162,80 @@ pub fn combo_index(c1: usize, c2: usize) -> usize {
     c1 * (103 - c1) / 2 + c2 - c1 - 1
 }
 
+/// Number of canonical starting hands in Hold'em: 13 pairs + 78 suited + 78 offsuit.
+pub const NUM_CANONICAL_HANDS: usize = 169;
+
+/// Construct a card index from rank (0=Two..12=Ace) and suit (0..3).
+///
+/// This is the inverse of extracting rank/suit from a card index.
+/// Layout matches [`card_index`]: `rank * 4 + suit`.
+#[must_use]
+pub fn card_index_from_rank_suit(rank: usize, suit: usize) -> usize {
+    debug_assert!(rank < 13, "rank must be 0..13");
+    debug_assert!(suit < 4, "suit must be 0..4");
+    rank * 4 + suit
+}
+
+/// Map a combo index (0..1326) to its canonical 169-hand index.
+///
+/// 169-hand layout:
+/// - `0..13`:  pocket pairs, ordered by rank (0=22, 1=33, ..., 12=AA)
+/// - `13..91`: suited hands, triangular index of `(hi_rank, lo_rank)` where `hi > lo`
+/// - `91..169`: offsuit hands, same triangular pattern
+///
+/// # Panics
+///
+/// Debug-panics if `combo_idx >= NUM_COMBOS`.
+#[must_use]
+pub fn combo_to_canonical_hand(combo_idx: usize) -> usize {
+    debug_assert!(combo_idx < NUM_COMBOS, "combo_idx out of range");
+
+    let (c1, c2) = combo_cards(combo_idx);
+    let rank1 = c1 / 4;
+    let suit1 = c1 % 4;
+    let rank2 = c2 / 4;
+    let suit2 = c2 % 4;
+
+    let hi = rank1.max(rank2);
+    let lo = rank1.min(rank2);
+
+    if rank1 == rank2 {
+        // Pocket pair — index is just the rank
+        hi
+    } else {
+        // Triangular number: hi*(hi-1)/2 + lo
+        let tri = hi * (hi - 1) / 2 + lo;
+        if suit1 == suit2 {
+            // Suited: offset by 13 (past pairs)
+            13 + tri
+        } else {
+            // Offsuit: offset by 91 (past pairs + suited)
+            91 + tri
+        }
+    }
+}
+
+/// Expand 169 canonical-hand bucket weights to 1326 combo weights.
+///
+/// Each combo receives the weight of its canonical hand. The input slice
+/// must have exactly [`NUM_CANONICAL_HANDS`] elements.
+///
+/// # Panics
+///
+/// Panics if `bucket_weights.len() != NUM_CANONICAL_HANDS`.
+#[must_use]
+pub fn expand_buckets_to_combos(bucket_weights: &[f64]) -> Vec<f64> {
+    assert_eq!(
+        bucket_weights.len(),
+        NUM_CANONICAL_HANDS,
+        "bucket_weights length must be {NUM_CANONICAL_HANDS}"
+    );
+
+    (0..NUM_COMBOS)
+        .map(|combo_idx| bucket_weights[combo_to_canonical_hand(combo_idx)])
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +385,182 @@ mod tests {
         assert_eq!(card_index(&Card::new(Value::Ace, Suit::Spade)), 48);
         // Ace of Club = index 51
         assert_eq!(card_index(&Card::new(Value::Ace, Suit::Club)), 51);
+    }
+
+    #[test]
+    fn test_card_index_from_rank_suit_roundtrip() {
+        for rank in 0..13 {
+            for suit in 0..4 {
+                let idx = card_index_from_rank_suit(rank, suit);
+                assert_eq!(idx / 4, rank);
+                assert_eq!(idx % 4, suit);
+            }
+        }
+    }
+
+    #[test]
+    fn test_combo_to_canonical_hand_pairs() {
+        // AA has rank 12. All 6 AA combos (AsAh, AsAd, AsAc, AhAd, AhAc, AdAc)
+        // should map to canonical index 12.
+        let ace_cards: Vec<usize> = (0..4).map(|s| card_index_from_rank_suit(12, s)).collect();
+        for i in 0..ace_cards.len() {
+            for j in (i + 1)..ace_cards.len() {
+                let c1 = ace_cards[i].min(ace_cards[j]);
+                let c2 = ace_cards[i].max(ace_cards[j]);
+                let ci = combo_index(c1, c2);
+                assert_eq!(
+                    combo_to_canonical_hand(ci),
+                    12,
+                    "AA combo ({c1},{c2}) should map to canonical 12"
+                );
+            }
+        }
+
+        // 22 has rank 0. All 6 combos should map to canonical index 0.
+        let two_cards: Vec<usize> = (0..4).map(|s| card_index_from_rank_suit(0, s)).collect();
+        for i in 0..two_cards.len() {
+            for j in (i + 1)..two_cards.len() {
+                let c1 = two_cards[i].min(two_cards[j]);
+                let c2 = two_cards[i].max(two_cards[j]);
+                let ci = combo_index(c1, c2);
+                assert_eq!(
+                    combo_to_canonical_hand(ci),
+                    0,
+                    "22 combo ({c1},{c2}) should map to canonical 0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_combo_to_canonical_hand_suited() {
+        // AKs: hi=12(A), lo=11(K), suited
+        // tri = 12*11/2 + 11 = 66 + 11 = 77
+        // canonical = 13 + 77 = 90
+        let as_idx = card_index_from_rank_suit(12, 0); // As
+        let ks_idx = card_index_from_rank_suit(11, 0); // Ks
+        let c1 = as_idx.min(ks_idx);
+        let c2 = as_idx.max(ks_idx);
+        let ci = combo_index(c1, c2);
+        assert_eq!(combo_to_canonical_hand(ci), 90);
+
+        // 32s: hi=1(3), lo=0(2), suited
+        // tri = 1*0/2 + 0 = 0
+        // canonical = 13 + 0 = 13
+        let three_s = card_index_from_rank_suit(1, 0);
+        let two_s = card_index_from_rank_suit(0, 0);
+        let c1 = three_s.min(two_s);
+        let c2 = three_s.max(two_s);
+        let ci = combo_index(c1, c2);
+        assert_eq!(combo_to_canonical_hand(ci), 13);
+    }
+
+    #[test]
+    fn test_combo_to_canonical_hand_offsuit() {
+        // AKo: hi=12(A), lo=11(K), offsuit
+        // tri = 12*11/2 + 11 = 77
+        // canonical = 91 + 77 = 168
+        let as_idx = card_index_from_rank_suit(12, 0); // As
+        let kh_idx = card_index_from_rank_suit(11, 1); // Kh
+        let c1 = as_idx.min(kh_idx);
+        let c2 = as_idx.max(kh_idx);
+        let ci = combo_index(c1, c2);
+        assert_eq!(combo_to_canonical_hand(ci), 168);
+
+        // 32o: hi=1(3), lo=0(2), offsuit
+        // tri = 1*0/2 + 0 = 0
+        // canonical = 91 + 0 = 91
+        let three_s = card_index_from_rank_suit(1, 0); // 3s
+        let two_h = card_index_from_rank_suit(0, 1); // 2h
+        let c1 = three_s.min(two_h);
+        let c2 = three_s.max(two_h);
+        let ci = combo_index(c1, c2);
+        assert_eq!(combo_to_canonical_hand(ci), 91);
+    }
+
+    #[test]
+    fn test_all_combos_map_to_valid_hands() {
+        for combo_idx in 0..NUM_COMBOS {
+            let hand = combo_to_canonical_hand(combo_idx);
+            assert!(
+                hand < NUM_CANONICAL_HANDS,
+                "combo {combo_idx} mapped to hand {hand} >= {NUM_CANONICAL_HANDS}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonical_hand_counts() {
+        let mut counts = [0u32; NUM_CANONICAL_HANDS];
+        for combo_idx in 0..NUM_COMBOS {
+            counts[combo_to_canonical_hand(combo_idx)] += 1;
+        }
+
+        // Pairs: 6 combos each (C(4,2)), indices 0..13
+        for i in 0..13 {
+            assert_eq!(counts[i], 6, "pair index {i} should have 6 combos");
+        }
+
+        // Suited: 4 combos each (one per suit), indices 13..91
+        for i in 13..91 {
+            assert_eq!(counts[i], 4, "suited index {i} should have 4 combos");
+        }
+
+        // Offsuit: 12 combos each (4*3 suit combos), indices 91..169
+        for i in 91..169 {
+            assert_eq!(counts[i], 12, "offsuit index {i} should have 12 combos");
+        }
+
+        // Total: 13*6 + 78*4 + 78*12 = 78 + 312 + 936 = 1326
+        let total: u32 = counts.iter().sum();
+        assert_eq!(total, NUM_COMBOS as u32);
+    }
+
+    #[test]
+    fn test_expand_buckets_to_combos() {
+        // Set weight for AA (index 12) to 0.5, everything else 0.0
+        let mut bucket_weights = vec![0.0; NUM_CANONICAL_HANDS];
+        bucket_weights[12] = 0.5;
+
+        let combo_weights = expand_buckets_to_combos(&bucket_weights);
+        assert_eq!(combo_weights.len(), NUM_COMBOS);
+
+        let mut aa_count = 0;
+        for (combo_idx, &w) in combo_weights.iter().enumerate() {
+            if combo_to_canonical_hand(combo_idx) == 12 {
+                assert!(
+                    (w - 0.5).abs() < f64::EPSILON,
+                    "AA combo {combo_idx} should have weight 0.5, got {w}"
+                );
+                aa_count += 1;
+            } else {
+                assert!(
+                    w.abs() < f64::EPSILON,
+                    "non-AA combo {combo_idx} should have weight 0.0, got {w}"
+                );
+            }
+        }
+        assert_eq!(aa_count, 6, "should be 6 AA combos");
+    }
+
+    #[test]
+    fn test_expand_roundtrip_preserves_weights() {
+        // Assign a distinct weight to each canonical hand
+        let bucket_weights: Vec<f64> = (0..NUM_CANONICAL_HANDS)
+            .map(|i| (i as f64) / (NUM_CANONICAL_HANDS as f64))
+            .collect();
+
+        let combo_weights = expand_buckets_to_combos(&bucket_weights);
+
+        // Every combo should carry the weight of its canonical hand
+        for combo_idx in 0..NUM_COMBOS {
+            let hand = combo_to_canonical_hand(combo_idx);
+            let expected = bucket_weights[hand];
+            let actual = combo_weights[combo_idx];
+            assert!(
+                (actual - expected).abs() < f64::EPSILON,
+                "combo {combo_idx} (hand {hand}): expected {expected}, got {actual}"
+            );
+        }
     }
 }
