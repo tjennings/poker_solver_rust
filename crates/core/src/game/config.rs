@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::abstraction::CardAbstraction;
 
@@ -33,6 +33,7 @@ pub enum AbstractionMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostflopConfig {
     /// Stack depth in big blinds
+    #[serde(deserialize_with = "deserialize_u32_from_float")]
     pub stack_depth: u32,
     /// Available bet sizes as fractions of pot (e.g., 0.5 = half pot)
     pub bet_sizes: Vec<f32>,
@@ -55,4 +56,13 @@ impl Default for PostflopConfig {
 
 fn default_max_raises() -> u8 {
     3
+}
+
+/// Accept both integer and float values for u32 fields in YAML configs.
+fn deserialize_u32_from_float<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: f64 = Deserialize::deserialize(deserializer)?;
+    Ok(value as u32)
 }
