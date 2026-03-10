@@ -18,6 +18,7 @@ mod bundle;
 mod cache;
 mod error;
 pub mod range_narrower;
+pub mod solver_dispatch;
 mod strategy;
 mod subgame;
 mod subgame_cfr;
