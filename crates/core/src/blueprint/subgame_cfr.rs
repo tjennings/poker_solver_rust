@@ -9,6 +9,7 @@ use crate::cfr::regret::regret_match;
 use crate::poker::{Card, Hand, Rank, Rankable};
 
 use super::SubgameConfig;
+use super::cbv::CbvTable;
 use super::subgame_tree::{SubgameHands, SubgameNode, SubgameTree, SubgameTreeBuilder};
 
 // ---------------------------------------------------------------------------
@@ -98,6 +99,28 @@ impl SubgameCfrSolver {
             opp_reach_totals,
             iteration: 0,
         }
+    }
+
+    /// Create a solver with leaf values populated from a [`CbvTable`].
+    ///
+    /// For each combo, `combo_to_bucket` maps its index to a bucket id, then
+    /// the CBV is looked up for the given `boundary_node_idx` in the table.
+    #[must_use]
+    pub fn with_cbv_table(
+        tree: SubgameTree,
+        hands: SubgameHands,
+        opponent_reach: Vec<f64>,
+        cbv_table: &CbvTable,
+        boundary_node_idx: usize,
+        combo_to_bucket: impl Fn(usize) -> usize,
+    ) -> Self {
+        let leaf_values: Vec<f64> = (0..hands.combos.len())
+            .map(|combo_idx| {
+                let bucket = combo_to_bucket(combo_idx);
+                f64::from(cbv_table.lookup(boundary_node_idx, bucket))
+            })
+            .collect();
+        Self::new(tree, hands, opponent_reach, leaf_values)
     }
 
     /// Run CFR+ for the given number of iterations.
@@ -581,6 +604,75 @@ mod tests {
         ];
         assert!(cards_overlap(a, b));
         assert!(!cards_overlap(a, c));
+    }
+
+    #[timed_test]
+    fn with_cbv_table_populates_leaf_values() {
+        use super::super::cbv::CbvTable;
+
+        // Build a depth-limited flop tree so it has DepthBoundary nodes.
+        let board = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Seven, Suit::Diamond),
+        ];
+        let tree = SubgameTreeBuilder::new()
+            .board(&board)
+            .bet_sizes(&[1.0])
+            .pot(100)
+            .stacks(&[200, 200])
+            .depth_limit(1) // flop-only: turn transitions become boundaries
+            .build();
+
+        let hands = small_hands(&board, 6);
+        let n = hands.combos.len();
+
+        // CBV table: 1 boundary node, 4 buckets with known values.
+        let cbv_table = CbvTable {
+            values: vec![10.0, 20.0, 30.0, 40.0],
+            node_offsets: vec![0],
+            buckets_per_node: vec![4],
+        };
+
+        // Map combo index to bucket via modulo.
+        let mut solver = SubgameCfrSolver::with_cbv_table(
+            tree,
+            hands,
+            vec![1.0; n],
+            &cbv_table,
+            0,
+            |combo_idx| combo_idx % 4,
+        );
+
+        // Verify leaf values were populated correctly.
+        for i in 0..n {
+            let expected = f64::from(cbv_table.lookup(0, i % 4));
+            assert!(
+                (solver.leaf_values[i] - expected).abs() < 1e-10,
+                "leaf_values[{i}] = {}, expected {expected}",
+                solver.leaf_values[i],
+            );
+        }
+
+        // Run a few iterations to confirm no panics and valid output.
+        solver.train(10);
+        assert_eq!(solver.iteration, 10);
+
+        let strategy = solver.strategy();
+        assert_eq!(strategy.num_combos(), n);
+
+        // Every combo that has a strategy entry should sum to ~1.0.
+        for combo_idx in 0..n {
+            let probs = strategy.root_probs(combo_idx);
+            if probs.is_empty() {
+                continue;
+            }
+            let sum: f64 = probs.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 0.01,
+                "combo {combo_idx}: strategy sum = {sum}, expected ~1.0"
+            );
+        }
     }
 
     #[timed_test]

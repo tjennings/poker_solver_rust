@@ -929,6 +929,15 @@ impl BlueprintTrainer {
 
         bundle::save_snapshot(&snapshot_dir, &strategy, &self.storage, &metadata)?;
 
+        // Compute and save counterfactual boundary values (CBVs) for
+        // real-time subgame solving. One table per player, indexed by
+        // (chance_node, bucket).
+        let bucket_counts = self.storage.bucket_counts;
+        let [p0_cbvs, p1_cbvs] =
+            crate::blueprint::cbv_compute::compute_cbvs(&strategy, &self.tree, bucket_counts);
+        p0_cbvs.save(&snapshot_dir.join("cbv_p0.bin"))?;
+        p1_cbvs.save(&snapshot_dir.join("cbv_p1.bin"))?;
+
         // Write per-hand chip EV averages with sample counts.
         let hand_evs = self.hand_ev_averages();
         let mut ev_json = String::from("{\n");

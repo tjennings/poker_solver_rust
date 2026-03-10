@@ -186,6 +186,23 @@ impl BlueprintV2Strategy {
     pub fn num_decision_nodes(&self) -> usize {
         self.node_action_counts.len()
     }
+
+    /// Create an empty strategy with no decision nodes.
+    ///
+    /// Useful for tests and fallback construction where no trained
+    /// blueprint is available.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            action_probs: Vec::new(),
+            node_action_counts: Vec::new(),
+            node_street_indices: Vec::new(),
+            bucket_counts: [0; 4],
+            iterations: 0,
+            elapsed_minutes: 0,
+            node_offsets: Vec::new(),
+        }
+    }
 }
 
 /// Build a prefix-sum offset table so `get_action_probs` is O(1).
