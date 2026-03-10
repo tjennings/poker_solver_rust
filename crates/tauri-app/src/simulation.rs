@@ -17,8 +17,7 @@ use poker_solver_core::blueprint::solver_dispatch::SolverConfig;
 use poker_solver_core::blueprint::StrategyBundle;
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::simulation::{
-    BlueprintAgentGenerator, RealTimeSolvingAgentGenerator, RuleBasedAgentGenerator, SimResult,
-    run_simulation,
+    RealTimeSolvingAgentGenerator, RuleBasedAgentGenerator, SimResult, run_simulation,
 };
 
 use rs_poker::arena::agent::{
@@ -350,10 +349,6 @@ fn build_agent_generator(path: &str) -> Result<(Box<dyn AgentGenerator>, Vec<f32
         };
     }
 
-    if let Some(bundle_path) = path.strip_prefix("solver:") {
-        return build_solver_agent_generator(bundle_path);
-    }
-
     let path_buf = PathBuf::from(path);
 
     if path.ends_with(".toml") {
@@ -361,16 +356,7 @@ fn build_agent_generator(path: &str) -> Result<(Box<dyn AgentGenerator>, Vec<f32
             .map_err(|e| format!("Failed to load agent config: {e}"))?;
         Ok((Box::new(RuleBasedAgentGenerator::new(Arc::new(config))), vec![]))
     } else {
-        let bundle = StrategyBundle::load(&path_buf)
-            .map_err(|e| format!("Failed to load bundle: {e}"))?;
-        let bet_sizes = bundle.config.game.bet_sizes.clone();
-        Ok((
-            Box::new(BlueprintAgentGenerator::new(
-                Arc::new(bundle.blueprint),
-                bundle.config,
-            )),
-            bet_sizes,
-        ))
+        build_solver_agent_generator(path)
     }
 }
 
