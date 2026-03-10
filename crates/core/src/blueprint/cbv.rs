@@ -1,6 +1,6 @@
 //! Precomputed continuation-value (CBV) lookup table.
 //!
-//! Stores one `f32` per (boundary_node, bucket) pair in a flat array with
+//! Stores one `f32` per `(boundary_node, bucket)` pair in a flat array with
 //! per-node offset indexing. Supports bincode serialization for fast
 //! save/load during real-time subgame solving.
 
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
 
-/// Flat lookup table mapping (boundary_node, bucket) pairs to precomputed
+/// Flat lookup table mapping `(boundary_node, bucket)` pairs to precomputed
 /// continuation values.
 ///
 /// The `values` array is partitioned into contiguous slices, one per boundary
@@ -33,6 +33,7 @@ impl CbvTable {
     /// Panics if `boundary_node >= self.num_boundary_nodes()` or
     /// `bucket >= self.buckets_per_node[boundary_node]`.
     #[inline]
+    #[must_use]
     pub fn lookup(&self, boundary_node: usize, bucket: usize) -> f32 {
         debug_assert!(
             boundary_node < self.node_offsets.len(),
@@ -49,6 +50,7 @@ impl CbvTable {
 
     /// Number of boundary nodes in this table.
     #[inline]
+    #[must_use]
     pub fn num_boundary_nodes(&self) -> usize {
         self.node_offsets.len()
     }
