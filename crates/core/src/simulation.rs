@@ -1644,6 +1644,68 @@ raise = 0.4
         }
     }
 
+    #[timed_test(10)]
+    fn real_time_agent_full_pipeline_vs_calling_station() {
+        // End-to-end integration test: RealTimeSolvingAgent (empty blueprint)
+        // vs a calling station for 50 hands. The empty blueprint + empty CBV
+        // cause every postflop decision to fall back to check/call, so this
+        // verifies the full pipeline doesn't panic under arena orchestration.
+        use rs_poker::arena::agent::CallingAgentGenerator;
+
+        let blueprint_v1 = Arc::new(BlueprintStrategy::new());
+        let blueprint_v2 = Arc::new(BlueprintV2Strategy::empty());
+        let cbv_table = Arc::new(CbvTable {
+            values: vec![],
+            node_offsets: vec![],
+            buckets_per_node: vec![],
+        });
+        let bundle_config = BundleConfig {
+            game: crate::game::PostflopConfig {
+                stack_depth: 100,
+                bet_sizes: vec![0.5, 1.0],
+                ..crate::game::PostflopConfig::default()
+            },
+            abstraction: None,
+            abstraction_mode: crate::blueprint::AbstractionModeConfig::HandClassV2,
+            ..BundleConfig::default()
+        };
+        let solver_config = SolverConfig {
+            full_solve_iterations: 10,
+            target_exploitability: 1.0,
+            ..SolverConfig::default()
+        };
+
+        let p1_gen: Box<dyn AgentGenerator> =
+            Box::new(RealTimeSolvingAgentGenerator::new(
+                blueprint_v2,
+                blueprint_v1,
+                bundle_config,
+                cbv_table,
+                solver_config,
+                vec![0.5, 1.0],
+                100,
+            ));
+        let p2_gen: Box<dyn AgentGenerator> = Box::new(CallingAgentGenerator);
+
+        let stop = AtomicBool::new(false);
+        let num_hands = 50;
+        let result =
+            run_simulation(p1_gen, p2_gen, num_hands, 100, &stop, &[0.5, 1.0], |_| {})
+                .expect("simulation should complete without error");
+
+        assert!(
+            result.mbbh.is_finite(),
+            "mbb/h should be finite, got {}",
+            result.mbbh
+        );
+        // Allow small deviation — the arena may skip hands on rare occasions.
+        assert!(
+            result.hands_played >= num_hands - 5 && result.hands_played <= num_hands,
+            "expected ~{num_hands} hands, got {}",
+            result.hands_played
+        );
+    }
+
     #[timed_test]
     fn rs_card_to_narrower_index_roundtrip() {
         // Verify that the mapping covers all 52 cards uniquely.
