@@ -11,6 +11,7 @@
 //! - `cache` - Two-tier caching for subgame solver results
 //! - `bundle` - Directory-based strategy bundle format
 
+pub mod cbv;
 mod bundle;
 mod cache;
 mod error;
