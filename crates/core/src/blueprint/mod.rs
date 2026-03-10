@@ -14,6 +14,7 @@
 mod bundle;
 mod cache;
 mod error;
+pub mod range_narrower;
 mod strategy;
 mod subgame;
 mod subgame_cfr;
