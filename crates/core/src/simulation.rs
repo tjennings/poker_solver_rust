@@ -283,10 +283,17 @@ pub struct RealTimeSolvingAgent {
     solver_config: SolverConfig,
     /// Tracks opponent range as a 1326-combo weight vector.
     range_narrower: RangeNarrower,
-    /// Hero's two hole cards.
-    hero_cards: [Card; 2],
+    /// Hero's two hole cards, lazily initialized on first `act()`.
+    ///
+    /// Initialized to `None` by the generator since we don't know which
+    /// player index we are until the arena calls `act()` with a `GameState`
+    /// that tells us `to_act_idx()`.
+    hero_cards: Option<[Card; 2]>,
     /// Number of `ACTION_LOG` entries we have already processed.
     last_action_count: usize,
+    /// Number of board cards already processed for card removal.
+    /// Used to apply removal incrementally as new cards are revealed.
+    last_board_len: usize,
     /// Bet sizes as pot fractions.
     bet_sizes: Vec<f64>,
     /// Stack depth in BB.
@@ -322,9 +329,10 @@ impl RealTimeSolvingAgent {
         let hero_is_oop = game_state.to_act_idx() == 0;
 
         // Build ranges using range-solver card IDs.
+        let hero = self.hero_cards?;
         let hero_rs = [
-            rs_poker_card_to_id(self.hero_cards[0]),
-            rs_poker_card_to_id(self.hero_cards[1]),
+            rs_poker_card_to_id(hero[0]),
+            rs_poker_card_to_id(hero[1]),
         ];
         let board_rs: Vec<u8> = board.iter().map(|c| rs_poker_card_to_id(*c)).collect();
 
@@ -428,9 +436,26 @@ fn rs_card_to_narrower_index(rs_id: u8) -> usize {
     rank as usize * 4 + narrower_suit
 }
 
+impl RealTimeSolvingAgent {
+    /// Lazily resolve hero's hole cards from the game state.
+    ///
+    /// On the first call, extracts cards using `game_state.to_act_idx()`
+    /// so we get the correct player's hand regardless of seat.
+    fn hero_cards(&mut self, game_state: &GameState) -> [Card; 2] {
+        *self.hero_cards.get_or_insert_with(|| {
+            let idx = game_state.to_act_idx();
+            let hand = game_state.hands[idx];
+            extract_hole_cards(hand, &game_state.board)
+        })
+    }
+}
+
 impl Agent for RealTimeSolvingAgent {
     fn act(&mut self, _id: u128, game_state: &GameState) -> AgentAction {
         let round = game_state.round;
+
+        // Ensure hero cards are resolved.
+        let hero_cards = self.hero_cards(game_state);
 
         // ----------------------------------------------------------------
         // Preflop: use V1 blueprint lookup (same as BlueprintAgent)
@@ -444,10 +469,14 @@ impl Agent for RealTimeSolvingAgent {
         // ----------------------------------------------------------------
         let board = &game_state.board;
 
-        // (a) Apply card removal for current board + hero cards.
-        //     V1: we skip per-action Bayesian updates and just use
-        //     uniform weights with card removal.
-        self.range_narrower.apply_card_removal(board, &self.hero_cards);
+        // (a) Apply card removal incrementally for newly revealed cards.
+        //     Only process board cards we haven't seen yet to avoid
+        //     cumulative zeroing across multiple act() calls.
+        if board.len() > self.last_board_len {
+            self.range_narrower
+                .apply_card_removal(board, &hero_cards);
+            self.last_board_len = board.len();
+        }
         let live_combos = self.range_narrower.live_combo_count();
 
         // Update last_action_count so we don't re-process actions.
@@ -478,13 +507,13 @@ impl Agent for RealTimeSolvingAgent {
                         self.rng.random(),
                     );
                 }
-                // Fallback: uniform random from available actions.
-                self.fallback_action(game_state)
+                // Fallback: check/call when solving fails.
+                self.fallback_check_or_call(game_state)
             }
             SolverChoice::DepthLimited => {
-                // TODO: wire SubgameCfrSolver with CBV table for
-                // depth-limited solving. For V1, fall back to blueprint.
-                self.act_preflop(game_state)
+                // TODO: wire SubgameCfrSolver depth-limited path
+                // Fallback: check if possible, otherwise call minimum
+                self.fallback_check_or_call(game_state)
             }
         }
     }
@@ -507,11 +536,15 @@ impl RealTimeSolvingAgent {
         let round = game_state.round;
         let mode = self.bundle_config.abstraction_mode;
 
+        // INVARIANT: hero_cards is always resolved by act() before this is called.
+        let hero = self.hero_cards
+            .expect("hero_cards must be resolved before build_info_set_key");
+
         let hand_bits: u32 = if board.is_empty() || !mode.is_hand_class() {
-            u32::from(canonical_hand_index(self.hero_cards))
+            u32::from(canonical_hand_index(hero))
         } else {
             compute_hand_bits_v2(
-                self.hero_cards,
+                hero,
                 board,
                 self.bundle_config.strength_bits,
                 self.bundle_config.equity_bits,
@@ -568,17 +601,20 @@ impl RealTimeSolvingAgent {
         vec![uniform; num_actions]
     }
 
-    /// Fallback: return a safe action when solving fails.
+    /// Fallback: check if possible, otherwise call the minimum.
+    ///
+    /// Used when depth-limited solving is not yet wired, or when a
+    /// full-depth solve fails. `rs_poker` treats `Call` as check when
+    /// the amount to call is zero.
     #[allow(clippy::unused_self)] // Will use self for blueprint fallback in V2
-    fn fallback_action(&self, game_state: &GameState) -> AgentAction {
+    fn fallback_check_or_call(&self, game_state: &GameState) -> AgentAction {
         let to_call = game_state.current_round_bet()
             - game_state.round_data.player_bet[game_state.to_act_idx()];
         if to_call > 0.0 {
-            // Facing a bet: call (safe default)
             AgentAction::Call
         } else {
-            // No bet to call: check
-            AgentAction::Call // rs_poker Call = Check when to_call is 0
+            // Check (rs_poker Call with 0 to call = check)
+            AgentAction::Call
         }
     }
 }
@@ -680,11 +716,7 @@ impl RealTimeSolvingAgentGenerator {
 }
 
 impl AgentGenerator for RealTimeSolvingAgentGenerator {
-    fn generate(&self, game_state: &GameState) -> Box<dyn Agent> {
-        let idx = 0; // Player index; arena calls generate per player
-        let hand = game_state.hands[idx];
-        let hero_cards = extract_hole_cards(hand, &game_state.board);
-
+    fn generate(&self, _game_state: &GameState) -> Box<dyn Agent> {
         Box::new(RealTimeSolvingAgent {
             blueprint_v2: self.blueprint_v2.clone(),
             blueprint_v1: self.blueprint_v1.clone(),
@@ -692,8 +724,9 @@ impl AgentGenerator for RealTimeSolvingAgentGenerator {
             cbv_table: self.cbv_table.clone(),
             solver_config: self.solver_config.clone(),
             range_narrower: RangeNarrower::new(),
-            hero_cards,
+            hero_cards: None,
             last_action_count: 0,
+            last_board_len: 0,
             bet_sizes: self.bet_sizes.clone(),
             stack_depth: self.stack_depth,
             rng: SmallRng::from_os_rng(),
@@ -1517,8 +1550,9 @@ raise = 0.4
             cbv_table,
             solver_config: SolverConfig::default(),
             range_narrower: RangeNarrower::new(),
-            hero_cards,
+            hero_cards: Some(hero_cards),
             last_action_count: 0,
+            last_board_len: 0,
             bet_sizes: vec![0.5, 1.0],
             stack_depth: 100,
             rng: SmallRng::seed_from_u64(42),
@@ -1577,8 +1611,9 @@ raise = 0.4
                 ..SolverConfig::default()
             },
             range_narrower: RangeNarrower::new(),
-            hero_cards,
+            hero_cards: Some(hero_cards),
             last_action_count: 0,
+            last_board_len: 0,
             bet_sizes: vec![1.0],
             stack_depth: 100,
             rng: SmallRng::seed_from_u64(42),
