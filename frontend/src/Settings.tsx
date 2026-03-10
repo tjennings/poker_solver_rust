@@ -1,14 +1,13 @@
 import { useState } from 'react';
+import { isTauri } from './invoke';
 import { useGlobalConfig } from './useGlobalConfig';
-
-const isTauri = '__TAURI__' in window;
 
 export default function Settings() {
   const { config, setConfig } = useGlobalConfig();
   const [browsing, setBrowsing] = useState(false);
 
   const handleBrowse = async () => {
-    if (!isTauri) return;
+    if (!isTauri()) return;
     setBrowsing(true);
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
@@ -32,7 +31,7 @@ export default function Settings() {
         <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
           Blueprint Directory
         </label>
-        {isTauri ? (
+        {isTauri() ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <div style={{
               flex: 1,

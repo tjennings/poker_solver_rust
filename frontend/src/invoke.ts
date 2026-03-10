@@ -1,7 +1,7 @@
 const DEV_SERVER_URL = 'http://localhost:3001';
 
-function isTauri(): boolean {
-  return '__TAURI__' in window;
+export function isTauri(): boolean {
+  return '__TAURI__' in window || '__TAURI_INTERNALS__' in window;
 }
 
 export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
