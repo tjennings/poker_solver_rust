@@ -15,7 +15,8 @@ function Simulator() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    invoke<StrategySourceInfo[]>('list_strategy_sources')
+    const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
+    invoke<StrategySourceInfo[]>('list_strategy_sources', { dir: globalConfig.blueprint_dir || null })
       .then(setSources)
       .catch(e => setError(String(e)));
   }, []);
