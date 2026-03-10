@@ -17,8 +17,7 @@ use poker_solver_core::blueprint::solver_dispatch::SolverConfig;
 use poker_solver_core::blueprint::StrategyBundle;
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::simulation::{
-    BlueprintAgentGenerator, RealTimeSolvingAgentGenerator, RuleBasedAgentGenerator, SimResult,
-    run_simulation,
+    RealTimeSolvingAgentGenerator, RuleBasedAgentGenerator, SimResult, run_simulation,
 };
 
 use rs_poker::arena::agent::{
@@ -310,11 +309,11 @@ fn build_solver_agent_generator(
         BlueprintV2Strategy::empty()
     };
 
-    // Load CBV tables (optional — missing is expected for older bundles)
-    let cbv_p0 = load_cbv_or_empty(&dir.join("cbv_p0.bin"));
+    // Load CBV tables (required)
+    let cbv_p0 = load_cbv(&dir.join("cbv_p0.bin"))?;
     // cbv_p1 loaded but not yet used; the generator currently uses a single
     // table for both players. Keep the load so it's ready when we split.
-    let _cbv_p1 = load_cbv_or_empty(&dir.join("cbv_p1.bin"));
+    let _cbv_p1 = load_cbv(&dir.join("cbv_p1.bin"))?;
 
     let generator = RealTimeSolvingAgentGenerator::new(
         Arc::new(blueprint_v2),
@@ -329,19 +328,10 @@ fn build_solver_agent_generator(
     Ok((Box::new(generator), bet_sizes_f32))
 }
 
-/// Load a [`CbvTable`] from disk, returning an empty table on any error.
-fn load_cbv_or_empty(path: &std::path::Path) -> CbvTable {
-    match CbvTable::load(path) {
-        Ok(table) => table,
-        Err(_) => {
-            eprintln!("Warning: No CBV table found at {}, using empty table", path.display());
-            CbvTable {
-                values: vec![],
-                node_offsets: vec![],
-                buckets_per_node: vec![],
-            }
-        }
-    }
+/// Load a [`CbvTable`] from disk, returning an error if the file is missing or corrupt.
+fn load_cbv(path: &std::path::Path) -> Result<CbvTable, String> {
+    CbvTable::load(path)
+        .map_err(|e| format!("Failed to load CBV table from {}: {e}", path.display()))
 }
 
 /// Build an agent generator and its associated bet sizes.
@@ -359,10 +349,6 @@ fn build_agent_generator(path: &str) -> Result<(Box<dyn AgentGenerator>, Vec<f32
         };
     }
 
-    if let Some(bundle_path) = path.strip_prefix("solver:") {
-        return build_solver_agent_generator(bundle_path);
-    }
-
     let path_buf = PathBuf::from(path);
 
     if path.ends_with(".toml") {
@@ -370,16 +356,7 @@ fn build_agent_generator(path: &str) -> Result<(Box<dyn AgentGenerator>, Vec<f32
             .map_err(|e| format!("Failed to load agent config: {e}"))?;
         Ok((Box::new(RuleBasedAgentGenerator::new(Arc::new(config))), vec![]))
     } else {
-        let bundle = StrategyBundle::load(&path_buf)
-            .map_err(|e| format!("Failed to load bundle: {e}"))?;
-        let bet_sizes = bundle.config.game.bet_sizes.clone();
-        Ok((
-            Box::new(BlueprintAgentGenerator::new(
-                Arc::new(bundle.blueprint),
-                bundle.config,
-            )),
-            bet_sizes,
-        ))
+        build_solver_agent_generator(path)
     }
 }
 
