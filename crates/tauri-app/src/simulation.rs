@@ -20,6 +20,8 @@ use poker_solver_core::simulation::{
     RealTimeSolvingAgentGenerator, RuleBasedAgentGenerator, SimResult, run_simulation,
 };
 
+use crate::exploration::list_blueprints_core;
+
 use rs_poker::arena::agent::{
     AgentGenerator, AllInAgentGenerator, CallingAgentGenerator, FoldingAgentGenerator,
     RandomAgentGenerator,
@@ -68,8 +70,11 @@ pub struct SimResultResponse {
 }
 
 /// List all available strategy sources (agents and trained bundles).
+///
+/// If `dir` is provided, scans that directory for blueprint bundles using the
+/// same logic as the Explorer tab. Otherwise, no bundles are returned.
 #[tauri::command]
-pub fn list_strategy_sources() -> Result<Vec<StrategySourceInfo>, String> {
+pub fn list_strategy_sources(dir: Option<String>) -> Result<Vec<StrategySourceInfo>, String> {
     let mut sources = Vec::new();
 
     // Built-in agents from rs_poker
@@ -113,23 +118,14 @@ pub fn list_strategy_sources() -> Result<Vec<StrategySourceInfo>, String> {
         }
     }
 
-    // Find bundle directories (look for config.yaml in subdirectories)
-    if let Some(root) = find_project_root() {
-        let entries = std::fs::read_dir(&root)
-            .map_err(|e| format!("Failed to read directory: {e}"))?;
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && path.join("config.yaml").exists() && path.join("blueprint.bin").exists() {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Unknown")
-                    .to_string();
+    // Scan blueprint_dir for trained bundles (same logic as Explorer tab)
+    if let Some(blueprint_dir) = dir {
+        if let Ok(blueprints) = list_blueprints_core(blueprint_dir) {
+            for bp in blueprints {
                 sources.push(StrategySourceInfo {
-                    name,
+                    name: bp.name,
                     source_type: "bundle".to_string(),
-                    path: path.to_string_lossy().to_string(),
+                    path: bp.path,
                 });
             }
         }
@@ -375,16 +371,3 @@ fn find_agents_dir() -> Option<PathBuf> {
     None
 }
 
-/// Walk up from CWD to find the project root (where agents/ or Cargo.toml is).
-fn find_project_root() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    for _ in 0..5 {
-        if dir.join("Cargo.toml").exists() && dir.join("crates").is_dir() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    None
-}
