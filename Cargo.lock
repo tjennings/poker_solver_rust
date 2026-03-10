@@ -3002,6 +3002,7 @@ dependencies = [
  "lru",
  "proptest",
  "rand 0.9.2",
+ "range-solver",
  "rayon",
  "rmp-serde",
  "rs_poker",

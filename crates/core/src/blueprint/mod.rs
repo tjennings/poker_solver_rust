@@ -12,6 +12,8 @@
 //! - `bundle` - Directory-based strategy bundle format
 
 pub mod cbv;
+pub mod cbv_compute;
+pub mod full_depth_solver;
 mod bundle;
 mod cache;
 mod error;
