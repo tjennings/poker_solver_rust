@@ -70,6 +70,14 @@ fn card_bit(card: Card) -> u32 {
 
 /// Collect all 52-card deck cards not in `hole` or `board`.
 ///
+/// Public variant for use by expected-delta computation.
+#[must_use]
+pub fn remaining_cards_from(hole: [Card; 2], board: &[Card]) -> arrayvec::ArrayVec<Card, 50> {
+    remaining_cards(hole, board)
+}
+
+/// Collect all 52-card deck cards not in `hole` or `board`.
+///
 /// Uses a u64 bitset for O(1) exclusion checks and returns a
 /// stack-allocated `ArrayVec` to avoid heap allocation.
 fn remaining_cards(hole: [Card; 2], board: &[Card]) -> arrayvec::ArrayVec<Card, 50> {

@@ -15,9 +15,11 @@ clustering:
   flop:
     buckets: 400
     delta_bins: [-0.2, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.55, 0.75]
+    expected_delta: true
   turn:
     buckets: 100
     delta_bins: [-0.2, -0.05, 0.05, 0.15, 0.25, 0.40]
+    expected_delta: true
   river:
     buckets: 1000
 
@@ -39,7 +41,7 @@ action_abstraction:
 
 training:
   time_limit_minutes: 7200
-  lcfr_warmup_iterations: 10000000
+  lcfr_warmup_iterations: 1000000
   prune_after_iterations: 10000000000000000
   prune_threshold: -6000
   lcfr_discount_interval: 100000
@@ -48,13 +50,16 @@ training:
   dcfr_alpha: 1.5
   dcfr_beta: 0.0
   dcfr_gamma: 2.0
+  # Pre-computed equity+delta cache for O(1) expected-delta lookups.
+  # Generated automatically if missing, or manually via: precompute-equity-delta
+  equity_cache_path: "./local_data/equity_delta.bin"
 
 snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
   max_snapshots: 10
-  output_dir: "./local_data/snapshots_equity_delta"
+  output_dir: "./local_data/snapshots_equity_delta_avg"
 
 tui:
   enabled: true

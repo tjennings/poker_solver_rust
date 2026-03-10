@@ -222,6 +222,14 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// Pre-compute the equity+delta lookup cache for fast expected-delta bucketing.
+    /// Generates turn table first (averaging over river cards), then flop table
+    /// (using turn table for two-street lookahead). Saves to a binary file.
+    PrecomputeEquityDelta {
+        /// Output file path for the cache
+        #[arg(short, long, default_value = "cache/equity_delta.bin")]
+        output: PathBuf,
+    },
     /// Solve a postflop spot with exact (no abstraction) DCFR
     RangeSolve {
         /// OOP player's range (PioSOLVER format, e.g. "QQ+,AKs,AKo")
@@ -741,6 +749,60 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!();
                 eprintln!("Clustering complete. Files saved to {}", output.display());
             }
+        }
+        Commands::PrecomputeEquityDelta { output } => {
+            use poker_solver_core::blueprint_v2::equity_cache::EquityDeltaCache;
+
+            if output.exists() {
+                eprintln!("Cache already exists at {}, nothing to do", output.display());
+                return Ok(());
+            }
+
+            eprintln!("Pre-computing equity+delta cache...");
+            eprintln!("  Output: {}", output.display());
+            eprintln!();
+
+            let pb = ProgressBar::new(10000);
+            pb.set_style(
+                ProgressStyle::with_template("  [{msg}] {bar:40.cyan/blue} {pos}/10000 ({eta})")
+                    .unwrap()
+                    .progress_chars("##-"),
+            );
+            pb.enable_steady_tick(Duration::from_millis(200));
+            let current_street = std::sync::Mutex::new(String::new());
+
+            let start = Instant::now();
+            let cache = EquityDeltaCache::generate(|street, frac| {
+                let mut cur = current_street.lock().unwrap();
+                if *cur != street {
+                    if !cur.is_empty() {
+                        pb.finish_with_message(format!("{cur} done"));
+                        eprintln!();
+                    }
+                    *cur = street.to_string();
+                    pb.reset();
+                }
+                drop(cur);
+                pb.set_message(street.to_string());
+                pb.set_position((frac * 10000.0) as u64);
+            });
+
+            pb.finish_with_message("done");
+            eprintln!();
+
+            let elapsed = start.elapsed();
+            eprintln!(
+                "Generated in {:.1}s: turn={} entries, flop={} entries",
+                elapsed.as_secs_f64(),
+                cache.turn_entries(),
+                cache.flop_entries(),
+            );
+
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            cache.save(&output)?;
+            eprintln!("Saved to {}", output.display());
         }
         Commands::RangeSolve {
             oop_range,

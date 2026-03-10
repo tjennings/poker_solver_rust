@@ -70,6 +70,12 @@ pub struct StreetClusterConfig {
     /// (draws completing) and less on negative (made hands cracked).
     #[serde(default)]
     pub delta_bins: Option<Vec<f64>>,
+    /// When true, delta is the **expected** delta averaged over all possible
+    /// next-street cards, rather than the delta from the actual runout.
+    /// This is deterministic (same hand+board always gets the same bucket)
+    /// but ~30× more expensive for the bucketing step.
+    #[serde(default)]
+    pub expected_delta: bool,
 }
 
 /// Action abstraction: allowed bet sizes per street and raise cap.
@@ -145,6 +151,12 @@ pub struct TrainingConfig {
     /// Remaining probabilities are renormalized. Default 0.0 (disabled).
     #[serde(default)]
     pub purify_threshold: f64,
+    /// Path to pre-computed equity+delta cache file.
+    /// When set and the file exists, loads it for O(1) expected-delta lookups.
+    /// When set but the file doesn't exist, generates it before training.
+    /// When omitted, expected delta is computed on-the-fly (slower).
+    #[serde(default)]
+    pub equity_cache_path: Option<String>,
 }
 
 /// Snapshot (checkpoint) output settings.
@@ -334,10 +346,10 @@ snapshots:
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-                preflop: StreetClusterConfig { buckets: 169, delta_bins: None },
-                flop: StreetClusterConfig { buckets: 500, delta_bins: None },
-                turn: StreetClusterConfig { buckets: 500, delta_bins: None },
-                river: StreetClusterConfig { buckets: 500, delta_bins: None },
+                preflop: StreetClusterConfig { buckets: 169, delta_bins: None, expected_delta: false },
+                flop: StreetClusterConfig { buckets: 500, delta_bins: None, expected_delta: false },
+                turn: StreetClusterConfig { buckets: 500, delta_bins: None, expected_delta: false },
+                river: StreetClusterConfig { buckets: 500, delta_bins: None, expected_delta: false },
                 seed: 123,
                 kmeans_iterations: 50,
             },
@@ -360,6 +372,7 @@ snapshots:
                 batch_size: 200,
                 target_strategy_delta: None,
                 purify_threshold: 0.0,
+                equity_cache_path: None,
                 dcfr_alpha: 1.5,
                 dcfr_beta: 0.0,
                 dcfr_gamma: 2.0,
