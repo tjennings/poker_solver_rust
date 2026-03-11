@@ -2248,4 +2248,140 @@ mod tests {
         );
         assert!(postflop_load_cached_core(&state, vec![], vec![]).is_err());
     }
+
+    /// Helper: build a 1326-element weight vector from a range string.
+    fn weights_from_range(range_str: &str) -> Vec<f32> {
+        let range: Range = range_str.parse().unwrap();
+        range.raw_data().to_vec()
+    }
+
+    #[test]
+    fn test_dispatch_subgame_for_wide_flop() {
+        let state = Arc::new(PostflopState::default());
+
+        let config = PostflopConfig {
+            oop_range: "22+,A2s+,K2s+,Q2s+,J2s+,T6s+,97s+,87s,A2o+,K5o+,Q8o+,J8o+,T8o+".to_string(),
+            ip_range: "22+,A2s+,K2s+,Q2s+,J2s+,T6s+,97s+,87s,A2o+,K5o+,Q8o+,J8o+,T8o+".to_string(),
+            pot: 100,
+            effective_stack: 200,
+            oop_bet_sizes: "50%".to_string(),
+            oop_raise_sizes: "".to_string(),
+            ip_bet_sizes: "50%".to_string(),
+            ip_raise_sizes: "".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        postflop_set_config_core(&state, config).unwrap();
+
+        // Pre-populate filtered weights so dispatch sees >200 live combos.
+        let wide = weights_from_range(
+            "22+,A2s+,K2s+,Q2s+,J2s+,T6s+,97s+,87s,A2o+,K5o+,Q8o+,J8o+,T8o+",
+        );
+        *state.filtered_oop_weights.write() = Some(wide.clone());
+        *state.filtered_ip_weights.write() = Some(wide);
+
+        // Solve flop — should dispatch to subgame due to wide ranges.
+        let board = vec!["Ks".to_string(), "Qh".to_string(), "Jd".to_string()];
+        let result = postflop_solve_street_core(&state, board, Some(5), Some(1e9));
+        assert!(result.is_ok(), "solve should succeed: {:?}", result);
+
+        let solver_name = state.solver_name.read().clone();
+        assert_eq!(solver_name, "subgame", "wide flop should dispatch to subgame");
+
+        // Wait for solve to complete.
+        for _ in 0..600 {
+            if state.solve_complete.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            state.solve_complete.load(Ordering::Relaxed),
+            "solve should complete",
+        );
+
+        // Matrix should be available.
+        let matrix = state.matrix_snapshot.read().clone();
+        assert!(matrix.is_some(), "matrix should be set after solve");
+    }
+
+    #[test]
+    fn test_dispatch_range_for_narrow_river() {
+        let state = Arc::new(PostflopState::default());
+
+        let config = PostflopConfig {
+            oop_range: "AA".to_string(),
+            ip_range: "KK".to_string(),
+            pot: 100,
+            effective_stack: 200,
+            oop_bet_sizes: "100%".to_string(),
+            oop_raise_sizes: "".to_string(),
+            ip_bet_sizes: "100%".to_string(),
+            ip_raise_sizes: "".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        postflop_set_config_core(&state, config).unwrap();
+
+        // Pre-populate narrow filtered weights (6 combos each).
+        let narrow = weights_from_range("AA");
+        *state.filtered_oop_weights.write() = Some(narrow.clone());
+        let narrow_ip = weights_from_range("KK");
+        *state.filtered_ip_weights.write() = Some(narrow_ip);
+
+        // River — always dispatches to range solver regardless of combo count.
+        let board = vec![
+            "Ks".to_string(),
+            "Qh".to_string(),
+            "Jd".to_string(),
+            "Tc".to_string(),
+            "2d".to_string(),
+        ];
+        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9));
+        assert!(result.is_ok(), "solve should succeed: {:?}", result);
+
+        let solver_name = state.solver_name.read().clone();
+        assert_eq!(solver_name, "range", "river should always dispatch to range");
+
+        // Wait for completion.
+        for _ in 0..600 {
+            if state.solve_complete.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(state.solve_complete.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_dispatch_range_for_narrow_flop() {
+        let state = Arc::new(PostflopState::default());
+
+        let config = PostflopConfig {
+            oop_range: "AA,KK".to_string(),
+            ip_range: "QQ,JJ".to_string(),
+            pot: 100,
+            effective_stack: 200,
+            oop_bet_sizes: "50%".to_string(),
+            oop_raise_sizes: "".to_string(),
+            ip_bet_sizes: "50%".to_string(),
+            ip_raise_sizes: "".to_string(),
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        postflop_set_config_core(&state, config).unwrap();
+
+        // Pre-populate narrow filtered weights well below the 200 threshold.
+        let narrow_oop = weights_from_range("AA,KK");
+        let narrow_ip = weights_from_range("QQ,JJ");
+        *state.filtered_oop_weights.write() = Some(narrow_oop);
+        *state.filtered_ip_weights.write() = Some(narrow_ip);
+
+        let board = vec!["Ks".to_string(), "Qh".to_string(), "Jd".to_string()];
+        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9));
+        assert!(result.is_ok(), "solve should succeed: {:?}", result);
+
+        let solver_name = state.solver_name.read().clone();
+        assert_eq!(solver_name, "range", "narrow flop should dispatch to range");
+    }
 }
