@@ -654,6 +654,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
                 {progress.iteration}/{progress.max_iterations} iters
                 {valid && ` — ${(expl / Math.max(config.pot, 1) * 100).toFixed(1)}% pot expl`}
                 {progress.elapsed_secs > 0 && ` — ${progress.elapsed_secs.toFixed(1)}s`}
+                {` — ${blueprintConfig ? 'subgame' : 'range'}`}
               </span>
             </div>
           </div>

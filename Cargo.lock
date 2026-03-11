@@ -5120,6 +5120,7 @@ dependencies = [
 name = "poker-solver-tauri"
 version = "0.1.0"
 dependencies = [
+ "lru",
  "parking_lot 0.12.5",
  "poker-solver-core",
  "range-solver",

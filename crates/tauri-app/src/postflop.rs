@@ -681,7 +681,17 @@ fn build_game(
         ActionTree::new(tree_config).map_err(|e| format!("Failed to build tree: {e}"))?;
     let mut game = PostFlopGame::with_config(card_config, action_tree)
         .map_err(|e| format!("Failed to build game: {e}"))?;
-    game.allocate_memory(true);
+
+    // Reject trees that would exceed the memory budget to prevent OOM.
+    const MEM_LIMIT: u64 = 2 * 1_024 * 1_024 * 1_024; // 2 GB
+    let (mem_estimate, _) = game.memory_usage();
+    if mem_estimate > MEM_LIMIT {
+        return Err(format!(
+            "Tree too large ({:.0} MB). Reduce bet sizes or solve from a later street.",
+            mem_estimate as f64 / 1_048_576.0
+        ));
+    }
+    game.allocate_memory(false);
     Ok(game)
 }
 
