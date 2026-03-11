@@ -211,6 +211,7 @@ export interface PostflopProgress {
   is_complete: boolean;
   matrix: PostflopStrategyMatrix | null;
   elapsed_secs: number;
+  solver_name: string;
 }
 
 export interface PostflopStreetResult {

@@ -94,6 +94,8 @@ pub struct PostflopProgress {
     pub matrix: Option<PostflopStrategyMatrix>,
     /// Seconds elapsed since solve started.
     pub elapsed_secs: f64,
+    /// Which solver is running (e.g. "range" or "subgame").
+    pub solver_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -256,6 +258,7 @@ pub struct PostflopState {
     pub filtered_ip_weights: RwLock<Option<Vec<f32>>>,
     pub cache_dir: RwLock<Option<PathBuf>>,
     pub solve_start: RwLock<Option<std::time::Instant>>,
+    pub solver_name: RwLock<String>,
 }
 
 impl Default for PostflopState {
@@ -273,6 +276,7 @@ impl Default for PostflopState {
             filtered_ip_weights: RwLock::new(None),
             cache_dir: RwLock::new(None),
             solve_start: RwLock::new(None),
+            solver_name: RwLock::new("range".to_string()),
         }
     }
 }
@@ -735,6 +739,7 @@ fn postflop_solve_street_impl(
         .store(f32::MAX.to_bits(), Ordering::Relaxed);
     state.solve_complete.store(false, Ordering::Relaxed);
     *state.solve_start.write() = Some(std::time::Instant::now());
+    *state.solver_name.write() = "range".to_string();
     state.solving.store(true, Ordering::Release);
 
     // Take initial matrix snapshot and store game in shared state so
@@ -850,6 +855,8 @@ pub fn postflop_get_progress_core(state: &PostflopState) -> PostflopProgress {
         .map(|t| t.elapsed().as_secs_f64())
         .unwrap_or(0.0);
 
+    let solver_name = state.solver_name.read().clone();
+
     PostflopProgress {
         iteration,
         max_iterations,
@@ -857,6 +864,7 @@ pub fn postflop_get_progress_core(state: &PostflopState) -> PostflopProgress {
         is_complete,
         matrix,
         elapsed_secs,
+        solver_name,
     }
 }
 
