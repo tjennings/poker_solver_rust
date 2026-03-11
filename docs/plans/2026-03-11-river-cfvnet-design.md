@@ -220,7 +220,7 @@ training:
   huber_delta: 1.0
   aux_loss_weight: 1.0
   validation_split: 0.05
-  checkpoint_every_n_batches: 1000
+  checkpoint_every_n_epochs: 1000
 
 evaluation:
   regression_spots: fixtures/river_spots.json

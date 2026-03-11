@@ -116,7 +116,7 @@ pub struct TrainingConfig {
     #[serde(default = "default_validation_split")]
     pub validation_split: f64,
     #[serde(default = "default_checkpoint_interval")]
-    pub checkpoint_every_n_batches: usize,
+    pub checkpoint_every_n_epochs: usize,
 }
 
 impl Default for TrainingConfig {
@@ -131,7 +131,7 @@ impl Default for TrainingConfig {
             huber_delta: 1.0,
             aux_loss_weight: 1.0,
             validation_split: 0.05,
-            checkpoint_every_n_batches: 1000,
+            checkpoint_every_n_epochs: 1000,
         }
     }
 }
@@ -230,7 +230,7 @@ training:
   huber_delta: 1.0
   aux_loss_weight: 1.0
   validation_split: 0.05
-  checkpoint_every_n_batches: 1000
+  checkpoint_every_n_epochs: 1000
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.datagen.pot_intervals.len(), 4);

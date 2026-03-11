@@ -21,7 +21,7 @@ pub struct TrainConfig {
     pub huber_delta: f64,
     pub aux_loss_weight: f64,
     pub validation_split: f64,
-    pub checkpoint_every_n_batches: usize,
+    pub checkpoint_every_n_epochs: usize,
 }
 
 /// Result returned after training completes.
@@ -201,7 +201,7 @@ mod tests {
             huber_delta: 1.0,
             aux_loss_weight: 0.0,
             validation_split: 0.0,
-            checkpoint_every_n_batches: 0,
+            checkpoint_every_n_epochs: 0,
         };
 
         let result = train::<B>(&device, &dataset, &config, None);

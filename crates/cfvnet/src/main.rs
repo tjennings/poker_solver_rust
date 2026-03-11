@@ -128,7 +128,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf) {
         huber_delta: cfg.training.huber_delta,
         aux_loss_weight: cfg.training.aux_loss_weight,
         validation_split: cfg.training.validation_split,
-        checkpoint_every_n_batches: cfg.training.checkpoint_every_n_batches,
+        checkpoint_every_n_epochs: cfg.training.checkpoint_every_n_epochs,
     };
 
     use burn::backend::{Autodiff, NdArray};
