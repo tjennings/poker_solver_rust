@@ -84,14 +84,11 @@ fn main() {
         } => cmd_train(config, data, output),
         Commands::Evaluate { model, data } => cmd_evaluate(model, data),
         Commands::Compare {
-            model: _,
-            num_spots: _,
-            threads: _,
-            config: _,
-        } => {
-            eprintln!("Compare not yet implemented (needs model loading)");
-            std::process::exit(1);
-        }
+            model,
+            num_spots,
+            threads,
+            config,
+        } => cmd_compare(model, num_spots, threads, config),
     }
 }
 
@@ -239,5 +236,79 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
     println!("  MAE:       {:.6}", total_mae / n);
     println!("  Max Error: {:.6}", total_max_error / n);
     println!("  mBB:       {:.2}", total_mbb / n);
+}
+
+fn cmd_compare(
+    model_dir: PathBuf,
+    num_spots: usize,
+    threads: Option<usize>,
+    config_path: Option<PathBuf>,
+) {
+    use burn::backend::NdArray;
+    use burn::module::Module;
+    use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
+    use burn::tensor::{Tensor, TensorData};
+    use cfvnet::config::GameConfig;
+    use cfvnet::eval::compare::run_comparison;
+    use cfvnet::model::dataset::encode_situation_for_inference;
+    use cfvnet::model::network::{CfvNet, INPUT_SIZE};
+
+    type B = NdArray;
+    let device = Default::default();
+    let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+    let model_path = model_dir.join("model");
+
+    let model = CfvNet::<B>::new(&device, 7, 500)
+        .load_file(&model_path, &recorder, &device)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to load model from {}: {e}", model_path.display());
+            std::process::exit(1);
+        });
+
+    let game_config = match config_path {
+        Some(path) => {
+            let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                eprintln!("failed to read config {}: {e}", path.display());
+                std::process::exit(1);
+            });
+            let cfg: cfvnet::config::CfvnetConfig =
+                serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
+                    eprintln!("failed to parse config: {e}");
+                    std::process::exit(1);
+                });
+            cfg.game
+        }
+        None => GameConfig::default(),
+    };
+
+    if let Some(t) = threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(t)
+            .build_global()
+            .ok(); // Ignore error if pool already initialized.
+    }
+
+    println!("Comparing {num_spots} spots against exact solver...");
+
+    let summary = run_comparison(&game_config, num_spots, 42, |sit, _solve_result| {
+        let input_data = encode_situation_for_inference(sit, 0);
+        let input = Tensor::<B, 2>::from_data(
+            TensorData::new(input_data, [1, INPUT_SIZE]),
+            &device,
+        );
+        let pred = model.forward(input);
+        pred.into_data().to_vec::<f32>().unwrap()
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("comparison failed: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Results ({} spots):", summary.num_spots);
+    println!("  Mean MAE:       {:.6}", summary.mean_mae);
+    println!("  Mean Max Error: {:.6}", summary.mean_max_error);
+    println!("  Mean mBB:       {:.2}", summary.mean_mbb);
+    println!("  Worst MAE:      {:.6}", summary.worst_mae);
+    println!("  Worst mBB:      {:.2}", summary.worst_mbb);
 }
 
