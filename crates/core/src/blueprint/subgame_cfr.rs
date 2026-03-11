@@ -13,9 +13,40 @@ use crate::poker::{Card, Hand, Rank, Rankable};
 
 use super::SubgameConfig;
 use super::cbv::CbvTable;
-use super::subgame_tree::SubgameHands;
 use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind};
 use crate::blueprint_v2::Street;
+
+// ---------------------------------------------------------------------------
+// SubgameHands -- valid hole card combos for a specific board
+// ---------------------------------------------------------------------------
+
+/// All valid hole card combos for a specific board.
+#[derive(Debug, Clone)]
+pub struct SubgameHands {
+    pub combos: Vec<[Card; 2]>,
+}
+
+impl SubgameHands {
+    /// Enumerate all valid 2-card combos from the 52-card deck excluding board cards.
+    #[must_use]
+    pub fn enumerate(board: &[Card]) -> Self {
+        let deck = remaining_deck(board);
+        let mut combos = Vec::with_capacity(deck.len() * (deck.len() - 1) / 2);
+        for i in 0..deck.len() {
+            for j in (i + 1)..deck.len() {
+                combos.push([deck[i], deck[j]]);
+            }
+        }
+        Self { combos }
+    }
+}
+
+fn remaining_deck(board: &[Card]) -> Vec<Card> {
+    crate::poker::full_deck()
+        .into_iter()
+        .filter(|c| !board.contains(c))
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // SubgameStrategy -- the output of a subgame solve

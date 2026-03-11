@@ -22,12 +22,10 @@ pub mod solver_dispatch;
 mod strategy;
 mod subgame;
 mod subgame_cfr;
-mod subgame_tree;
 
 pub use bundle::{AbstractionModeConfig, BundleConfig, StrategyBundle};
 pub use cache::{CacheConfig, SubgameCache, SubgameKey};
 pub use error::BlueprintError;
 pub use strategy::{BlueprintStrategy, ReachDecision, ReachQuery};
 pub use subgame::{SubgameConfig, SubgameSolver};
-pub use subgame_cfr::{SubgameCfrSolver, SubgameStrategy, compute_combo_equities, solve_subgame};
-pub use subgame_tree::{SubgameHands, SubgameNode, SubgameTree, SubgameTreeBuilder};
+pub use subgame_cfr::{SubgameCfrSolver, SubgameHands, SubgameStrategy, compute_combo_equities, solve_subgame};
