@@ -58,7 +58,7 @@ Every time I ask for a change to the system, you MUST dispatch this workflow:
 
 ## Architecture
 
-See [`docs/architecture.md`](docs/architecture.md) for the full solver architecture: preflop LCFR solver, postflop imperfect-recall abstraction pipeline, key control parameters, and caching.
+See [`docs/architecture.md`](docs/architecture.md) for the full solver architecture: blueprint_v2 MCCFR solver, hand abstraction, range solver, and cfvnet.
 
 **Keep it current:** When making changes to the solver pipeline, abstraction system, config parameters, or caching, update `docs/architecture.md` to reflect the new state.
 
@@ -94,8 +94,8 @@ cargo run -p poker-solver-trainer --release -- <subcommand>  # always --release 
 
 | Crate | Purpose |
 |-|-|
-| `core` | Preflop solver, postflop pipeline, CFR utilities, hand eval, abstractions |
-| `trainer` | CLI: preflop/postflop solving, range-solve, diagnostics |
+| `core` | Blueprint_v2 MCCFR solver, CFR utilities, hand abstraction, hand eval |
+| `trainer` | CLI: train-blueprint, range-solve, diagnostics |
 | `range-solver` | Exact (no-abstraction) postflop DCFR solver for single-spot analysis |
 | `range-solver-compare` | Identity test harness comparing range-solver against reference impl |
 | `tauri-app` | Desktop GUI exploration app |
