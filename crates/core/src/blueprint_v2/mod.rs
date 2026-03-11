@@ -7,10 +7,20 @@ pub mod cluster_pipeline;
 pub mod clustering;
 pub mod config;
 pub mod equity_cache;
+pub mod full_depth_solver;
 pub mod game_tree;
 pub mod mccfr;
+pub mod solver_dispatch;
 pub mod storage;
+pub mod subgame;
+pub mod subgame_cfr;
+pub mod subgame_tree;
 pub mod trainer;
+
+// Re-export subgame types at module level for convenience.
+pub use subgame::SubgameConfig;
+pub use subgame_cfr::{SubgameCfrSolver, SubgameStrategy, compute_combo_equities};
+pub use subgame_tree::{SubgameHands, SubgameNode, SubgameTree, SubgameTreeBuilder};
 
 use serde::{Deserialize, Serialize};
 
