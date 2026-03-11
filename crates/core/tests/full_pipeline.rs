@@ -7,8 +7,10 @@
 //! 4. Verify subgame strategy validity
 
 use poker_solver_core::blueprint::{
-    BlueprintStrategy, SubgameCfrSolver, SubgameHands, SubgameStrategy, SubgameTreeBuilder,
+    BlueprintStrategy, SubgameCfrSolver, SubgameHands, SubgameStrategy,
 };
+use poker_solver_core::blueprint_v2::game_tree::GameTree;
+use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::poker::{Card, Suit, Value};
 use poker_solver_core::preflop::{PreflopConfig, PreflopSolver, PreflopStrategy, RaiseSize};
 use test_macros::timed_test;
@@ -111,12 +113,14 @@ fn step1_preflop_solver_produces_valid_strategy() {
 fn step3_subgame_solver_produces_valid_strategy() {
     let board = river_board();
 
-    let tree = SubgameTreeBuilder::new()
-        .board(&board)
-        .bet_sizes(&[0.5, 1.0])
-        .pot(40)
-        .stacks(&[40, 40])
-        .build();
+    let tree = GameTree::build_subgame(
+        Street::River,
+        40.0,
+        [20.0, 20.0],
+        60.0,
+        &[vec![0.5, 1.0]],
+        None,
+    );
 
     let hands = small_hands(&board, SUBGAME_COMBO_COUNT);
     let n = hands.combos.len();
@@ -124,7 +128,7 @@ fn step3_subgame_solver_produces_valid_strategy() {
     let opponent_reach = vec![1.0; n];
     let leaf_values = vec![0.0; n];
 
-    let mut solver = SubgameCfrSolver::new(tree, hands, opponent_reach, leaf_values);
+    let mut solver = SubgameCfrSolver::new(tree, hands, &board, opponent_reach, leaf_values);
     solver.train(SUBGAME_ITERATIONS);
 
     assert_eq!(solver.iteration, SUBGAME_ITERATIONS);
@@ -221,12 +225,14 @@ fn full_pipeline_preflop_then_subgame() {
 
     // -- Subgame phase --
     let board = river_board();
-    let tree = SubgameTreeBuilder::new()
-        .board(&board)
-        .bet_sizes(&[0.5, 1.0])
-        .pot(40)
-        .stacks(&[40, 40])
-        .build();
+    let tree = GameTree::build_subgame(
+        Street::River,
+        40.0,
+        [20.0, 20.0],
+        60.0,
+        &[vec![0.5, 1.0]],
+        None,
+    );
 
     let hands = small_hands(&board, SUBGAME_COMBO_COUNT);
     let n = hands.combos.len();
@@ -236,7 +242,7 @@ fn full_pipeline_preflop_then_subgame() {
     let opponent_reach = vec![1.0; n];
     let leaf_values = vec![0.0; n];
 
-    let mut subgame_solver = SubgameCfrSolver::new(tree, hands, opponent_reach, leaf_values);
+    let mut subgame_solver = SubgameCfrSolver::new(tree, hands, &board, opponent_reach, leaf_values);
     subgame_solver.train(SUBGAME_ITERATIONS);
     let subgame_strategy = subgame_solver.strategy();
 

@@ -13,7 +13,9 @@ use crate::poker::{Card, Hand, Rank, Rankable};
 
 use super::SubgameConfig;
 use super::cbv::CbvTable;
-use super::subgame_tree::{SubgameHands, SubgameNode, SubgameTree, SubgameTreeBuilder};
+use super::subgame_tree::SubgameHands;
+use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind};
+use crate::blueprint_v2::Street;
 
 // ---------------------------------------------------------------------------
 // SubgameStrategy -- the output of a subgame solve
@@ -81,14 +83,14 @@ struct SubgameLayout {
 }
 
 impl SubgameLayout {
-    fn build(tree: &SubgameTree, num_combos: usize) -> Self {
+    fn build(tree: &GameTree, num_combos: usize) -> Self {
         let n = tree.nodes.len();
         let mut bases = vec![usize::MAX; n];
         let mut num_actions_vec = vec![0usize; n];
         let mut offset = 0;
 
         for (i, node) in tree.nodes.iter().enumerate() {
-            if let SubgameNode::Decision { actions, .. } = node {
+            if let GameNode::Decision { actions, .. } = node {
                 bases[i] = offset;
                 num_actions_vec[i] = actions.len();
                 offset += num_combos * actions.len();
@@ -119,7 +121,7 @@ impl SubgameLayout {
 
 /// Parallel DCFR solver for concrete subgame trees.
 pub struct SubgameCfrSolver {
-    tree: SubgameTree,
+    tree: GameTree,
     hands: SubgameHands,
     /// `equity[i][j]` = P(combo i beats combo j) at showdown.
     equity_matrix: Vec<Vec<f64>>,
@@ -146,12 +148,13 @@ impl SubgameCfrSolver {
     /// Create a solver for a specific board position.
     #[must_use]
     pub fn new(
-        tree: SubgameTree,
+        tree: GameTree,
         hands: SubgameHands,
+        board: &[Card],
         opponent_reach: Vec<f64>,
         leaf_values: Vec<f64>,
     ) -> Self {
-        let equity_matrix = compute_equity_matrix(&hands.combos, &tree.board);
+        let equity_matrix = compute_equity_matrix(&hands.combos, board);
         let opp_reach_totals = precompute_opp_reach(&hands.combos, &opponent_reach);
         let layout = SubgameLayout::build(&tree, hands.combos.len());
         let buf_size = layout.total_size;
@@ -181,8 +184,9 @@ impl SubgameCfrSolver {
     /// `DepthBoundary` traversal.
     #[must_use]
     pub fn with_cbv_table(
-        tree: SubgameTree,
+        tree: GameTree,
         hands: SubgameHands,
+        board: &[Card],
         opponent_reach: Vec<f64>,
         cbv_table: &CbvTable,
         boundary_node_idx: usize,
@@ -194,7 +198,7 @@ impl SubgameCfrSolver {
                 f64::from(cbv_table.lookup(boundary_node_idx, bucket))
             })
             .collect();
-        Self::new(tree, hands, opponent_reach, leaf_values)
+        Self::new(tree, hands, board, opponent_reach, leaf_values)
     }
 
     /// Run parallel DCFR for the given number of iterations.
@@ -248,7 +252,7 @@ impl SubgameCfrSolver {
 
         for (node_idx, node) in self.tree.nodes.iter().enumerate() {
             let num_actions = match node {
-                SubgameNode::Decision { actions, .. } => actions.len(),
+                GameNode::Decision { actions, .. } => actions.len(),
                 _ => continue,
             };
 
@@ -281,7 +285,7 @@ impl SubgameCfrSolver {
 
         for (node_idx, node) in self.tree.nodes.iter().enumerate() {
             let num_actions = match node {
-                SubgameNode::Decision { actions, .. } => actions.len(),
+                GameNode::Decision { actions, .. } => actions.len(),
                 _ => continue,
             };
 
@@ -304,7 +308,7 @@ impl SubgameCfrSolver {
 /// Frozen snapshot context for one traversal pass. Implements [`ParallelCfr`]
 /// so that combo traversals can run in parallel via rayon.
 struct SubgameCfrCtx<'a> {
-    tree: &'a SubgameTree,
+    tree: &'a GameTree,
     hands: &'a SubgameHands,
     equity_matrix: &'a [Vec<f64>],
     opponent_reach: &'a [f64],
@@ -332,7 +336,7 @@ impl ParallelCfr for SubgameCfrCtx<'_> {
         self.cfr_traverse(
             regret_delta,
             strategy_delta,
-            0,
+            self.tree.root as usize,
             hero_combo as usize,
             1.0,
             self.opp_reach_totals[hero_combo as usize],
@@ -353,20 +357,39 @@ impl SubgameCfrCtx<'_> {
         reach_opp: f64,
     ) -> f64 {
         match &self.tree.nodes[node_idx] {
-            SubgameNode::Terminal {
-                is_fold,
-                fold_player,
-                pot,
-                ..
-            } => self.terminal_value(hero_combo, *is_fold, *fold_player, *pot),
-
-            SubgameNode::DepthBoundary { pot, .. } => {
-                let equity = self.leaf_values.get(hero_combo).copied().unwrap_or(0.5);
-                (2.0 * equity - 1.0) * f64::from(*pot) / 2.0
+            GameNode::Terminal { kind, pot, .. } => {
+                let half_pot = *pot / 2.0;
+                match kind {
+                    TerminalKind::Fold { winner } => {
+                        if *winner == self.traverser {
+                            half_pot
+                        } else {
+                            -half_pot
+                        }
+                    }
+                    TerminalKind::Showdown => self.showdown_value(hero_combo, half_pot),
+                    TerminalKind::DepthBoundary => {
+                        let equity =
+                            self.leaf_values.get(hero_combo).copied().unwrap_or(0.5);
+                        (2.0 * equity - 1.0) * half_pot
+                    }
+                }
             }
 
-            SubgameNode::Decision {
-                position,
+            GameNode::Chance { child, .. } => {
+                // Concrete board is already known — pass through.
+                self.cfr_traverse(
+                    regret_delta,
+                    strategy_delta,
+                    *child as usize,
+                    hero_combo,
+                    reach_hero,
+                    reach_opp,
+                )
+            }
+
+            GameNode::Decision {
+                player,
                 actions,
                 children,
                 ..
@@ -375,7 +398,7 @@ impl SubgameCfrCtx<'_> {
                 let num_actions = actions.len();
                 let strategy = &self.snapshot[base..base + num_actions];
 
-                if *position == self.traverser {
+                if *player == self.traverser {
                     self.traverse_as_traverser(
                         regret_delta,
                         strategy_delta,
@@ -472,25 +495,6 @@ impl SubgameCfrCtx<'_> {
             node_value += strategy[a] * child_val;
         }
         node_value
-    }
-
-    /// Compute terminal value for the traversing player.
-    fn terminal_value(
-        &self,
-        hero_combo: usize,
-        is_fold: bool,
-        fold_player: u8,
-        pot: u32,
-    ) -> f64 {
-        let half_pot = f64::from(pot) / 2.0;
-        if is_fold {
-            return if fold_player == self.traverser {
-                -half_pot
-            } else {
-                half_pot
-            };
-        }
-        self.showdown_value(hero_combo, half_pot)
     }
 
     /// Compute showdown value: reach-weighted equity vs opponent range.
@@ -618,25 +622,44 @@ pub fn compute_combo_equities(
 // ---------------------------------------------------------------------------
 
 /// Solve a subgame and return the strategy.
+///
+/// # Panics
+///
+/// Panics if `board` does not have 3, 4, or 5 cards.
 #[must_use]
+#[allow(clippy::cast_possible_truncation)]
 pub fn solve_subgame(
     board: &[Card],
-    bet_sizes: &[f32],
-    pot: u32,
-    stacks: &[u32],
+    bet_sizes: &[f64],
+    pot: f64,
+    stacks: [f64; 2],
     opponent_reach: &[f64],
     leaf_values: &[f64],
     config: &SubgameConfig,
 ) -> SubgameStrategy {
-    let tree = SubgameTreeBuilder::new()
-        .board(board)
-        .bet_sizes(bet_sizes)
-        .pot(pot)
-        .stacks(stacks)
-        .build();
+    let street = match board.len() {
+        3 => Street::Flop,
+        4 => Street::Turn,
+        5 => Street::River,
+        _ => panic!("invalid board length: {}", board.len()),
+    };
+    let invested = [pot / 2.0; 2];
+    let starting_stack = stacks[0] + pot / 2.0;
+    let tree = GameTree::build_subgame(
+        street,
+        pot,
+        invested,
+        starting_stack,
+        &[bet_sizes.to_vec()],
+        if config.depth_limit > 0 {
+            Some(config.depth_limit as u8)
+        } else {
+            None
+        },
+    );
     let hands = SubgameHands::enumerate(board);
     let mut solver =
-        SubgameCfrSolver::new(tree, hands, opponent_reach.to_vec(), leaf_values.to_vec());
+        SubgameCfrSolver::new(tree, hands, board, opponent_reach.to_vec(), leaf_values.to_vec());
     solver.train(config.max_iterations);
     solver.strategy()
 }
@@ -669,20 +692,28 @@ mod tests {
         }
     }
 
+    /// Build a river subgame tree: pot=100, each player invested 50,
+    /// starting_stack = stacks_remaining + 50 = 250.
+    fn river_tree(bet_sizes: &[f64]) -> GameTree {
+        GameTree::build_subgame(
+            Street::River,
+            100.0,
+            [50.0, 50.0],
+            250.0,
+            &[bet_sizes.to_vec()],
+            None,
+        )
+    }
+
     #[timed_test]
     fn solver_creates_and_runs() {
         let board = river_board();
-        let tree = SubgameTreeBuilder::new()
-            .board(&board)
-            .bet_sizes(&[1.0])
-            .pot(100)
-            .stacks(&[200, 200])
-            .build();
+        let tree = river_tree(&[1.0]);
         let hands = small_hands(&board, 30);
         let n = hands.combos.len();
         let reach = vec![1.0; n];
         let leaf = vec![0.0; n];
-        let mut solver = SubgameCfrSolver::new(tree, hands, reach, leaf);
+        let mut solver = SubgameCfrSolver::new(tree, hands, &board, reach, leaf);
         solver.train(10);
         assert_eq!(solver.iteration, 10);
     }
@@ -690,17 +721,12 @@ mod tests {
     #[timed_test(3)]
     fn strategy_is_valid_distribution() {
         let board = river_board();
-        let tree = SubgameTreeBuilder::new()
-            .board(&board)
-            .bet_sizes(&[1.0])
-            .pot(100)
-            .stacks(&[200, 200])
-            .build();
+        let tree = river_tree(&[1.0]);
         let hands = small_hands(&board, 50);
         let n = hands.combos.len();
         let reach = vec![1.0; n];
         let leaf = vec![0.0; n];
-        let mut solver = SubgameCfrSolver::new(tree, hands, reach, leaf);
+        let mut solver = SubgameCfrSolver::new(tree, hands, &board, reach, leaf);
         solver.train(100);
         let strategy = solver.strategy();
 
@@ -729,13 +755,9 @@ mod tests {
         };
 
         // Build manually since solve_subgame uses full enumeration
-        let tree = SubgameTreeBuilder::new()
-            .board(&board)
-            .bet_sizes(&[1.0])
-            .pot(100)
-            .stacks(&[200, 200])
-            .build();
-        let mut solver = SubgameCfrSolver::new(tree, hands, vec![1.0; n], vec![0.0; n]);
+        let tree = river_tree(&[1.0]);
+        let mut solver =
+            SubgameCfrSolver::new(tree, hands, &board, vec![1.0; n], vec![0.0; n]);
         solver.train(config.max_iterations);
         let strategy = solver.strategy();
         assert!(strategy.num_combos() > 0);
@@ -786,13 +808,14 @@ mod tests {
             Card::new(Value::King, Suit::Heart),
             Card::new(Value::Seven, Suit::Diamond),
         ];
-        let tree = SubgameTreeBuilder::new()
-            .board(&board)
-            .bet_sizes(&[1.0])
-            .pot(100)
-            .stacks(&[200, 200])
-            .depth_limit(1) // flop-only: turn transitions become boundaries
-            .build();
+        let tree = GameTree::build_subgame(
+            Street::Flop,
+            100.0,
+            [50.0, 50.0],
+            250.0,
+            &[vec![1.0]],
+            Some(1), // flop-only: turn transitions become boundaries
+        );
 
         let hands = small_hands(&board, 6);
         let n = hands.combos.len();
@@ -808,6 +831,7 @@ mod tests {
         let mut solver = SubgameCfrSolver::with_cbv_table(
             tree,
             hands,
+            &board,
             vec![1.0; n],
             &cbv_table,
             0,
@@ -849,17 +873,12 @@ mod tests {
     #[ignore = "flaky: solver convergence doesn't guarantee hand ordering in debug mode"]
     fn strong_hands_bet_more_than_weak() {
         let board = river_board();
-        let tree = SubgameTreeBuilder::new()
-            .board(&board)
-            .bet_sizes(&[1.0])
-            .pot(100)
-            .stacks(&[200, 200])
-            .build();
+        let tree = river_tree(&[1.0]);
         let hands = small_hands(&board, 50);
         let n = hands.combos.len();
         let reach = vec![1.0; n];
         let leaf = vec![0.0; n];
-        let mut solver = SubgameCfrSolver::new(tree, hands.clone(), reach, leaf);
+        let mut solver = SubgameCfrSolver::new(tree, hands.clone(), &board, reach, leaf);
         solver.train(200);
         let strategy = solver.strategy();
 
@@ -904,15 +923,10 @@ mod tests {
         let n = hands.combos.len();
         let reach = vec![1.0; n];
         let leaf = vec![0.0; n];
-        let tree = SubgameTreeBuilder::new()
-            .board(&board)
-            .bet_sizes(&[1.0])
-            .pot(100)
-            .stacks(&[200, 200])
-            .build();
-        let solver = SubgameCfrSolver::new(tree, hands, reach, leaf);
+        let tree = river_tree(&[1.0]);
+        let solver = SubgameCfrSolver::new(tree, hands, &board, reach, leaf);
 
-        // Build a dummy context to test terminal values
+        // Find a Fold terminal in the tree and call cfr_traverse on it.
         let snapshot = solver.build_strategy_snapshot();
         let ctx = SubgameCfrCtx {
             tree: &solver.tree,
@@ -926,17 +940,48 @@ mod tests {
             traverser: 0,
         };
 
-        // Player 0 folds: traverser=0 gets -50
-        let v0 = ctx.terminal_value(0, true, 0, 100);
-        assert!((v0 - (-50.0)).abs() < 1e-10, "folder should lose half pot");
+        // Find a Fold terminal where player 0 (traverser) folds.
+        // In the tree, after OOP bets and IP folds, the winner is OOP (player 0).
+        // After OOP checks, IP bets, OOP folds, winner is IP (player 1).
+        // We need to find any fold terminal and verify the value.
+        let mut found_fold = false;
+        for (idx, node) in solver.tree.nodes.iter().enumerate() {
+            if let GameNode::Terminal {
+                kind: TerminalKind::Fold { winner },
+                pot,
+                ..
+            } = node
+            {
+                let half_pot = *pot / 2.0;
+                let mut dummy_regret = vec![0.0; solver.layout.total_size];
+                let mut dummy_strategy = vec![0.0; solver.layout.total_size];
 
-        // Player 0 folds: traverser=1 gets +50
-        let ctx1 = SubgameCfrCtx {
-            traverser: 1,
-            ..ctx
-        };
-        let v1 = ctx1.terminal_value(0, true, 0, 100);
-        assert!((v1 - 50.0).abs() < 1e-10, "non-folder wins half pot");
+                // traverser=0: if winner=0, traverser wins; if winner=1, traverser loses
+                let v0 = ctx.cfr_traverse(
+                    &mut dummy_regret,
+                    &mut dummy_strategy,
+                    idx,
+                    0,
+                    1.0,
+                    1.0,
+                );
+                if *winner == 0 {
+                    assert!(
+                        (v0 - half_pot).abs() < 1e-10,
+                        "traverser wins fold: expected {half_pot}, got {v0}"
+                    );
+                } else {
+                    assert!(
+                        (v0 - (-half_pot)).abs() < 1e-10,
+                        "traverser loses fold: expected {}, got {v0}",
+                        -half_pot
+                    );
+                }
+                found_fold = true;
+                break;
+            }
+        }
+        assert!(found_fold, "no fold terminal found in tree");
     }
 
     #[timed_test]
@@ -946,13 +991,8 @@ mod tests {
         let n = hands.combos.len();
         let reach = vec![1.0; n];
         let leaf = vec![0.0; n];
-        let tree = SubgameTreeBuilder::new()
-            .board(&board)
-            .bet_sizes(&[1.0])
-            .pot(100)
-            .stacks(&[200, 200])
-            .build();
-        let solver = SubgameCfrSolver::new(tree, hands, reach, leaf);
+        let tree = river_tree(&[1.0]);
+        let solver = SubgameCfrSolver::new(tree, hands, &board, reach, leaf);
 
         let snapshot = solver.build_strategy_snapshot();
         let ctx = SubgameCfrCtx {
@@ -980,12 +1020,14 @@ mod tests {
     #[timed_test]
     fn layout_total_size_matches_tree() {
         let board = river_board();
-        let tree = SubgameTreeBuilder::new()
-            .board(&board)
-            .bet_sizes(&[0.5, 1.0])
-            .pot(100)
-            .stacks(&[200, 200])
-            .build();
+        let tree = GameTree::build_subgame(
+            Street::River,
+            100.0,
+            [50.0, 50.0],
+            250.0,
+            &[vec![0.5, 1.0]],
+            None,
+        );
         let hands = small_hands(&board, 20);
         let n = hands.combos.len();
         let layout = SubgameLayout::build(&tree, n);
@@ -996,7 +1038,7 @@ mod tests {
             .nodes
             .iter()
             .map(|node| match node {
-                SubgameNode::Decision { actions, .. } => n * actions.len(),
+                GameNode::Decision { actions, .. } => n * actions.len(),
                 _ => 0,
             })
             .sum();
@@ -1005,13 +1047,7 @@ mod tests {
 
     #[timed_test]
     fn layout_slot_round_trips() {
-        let board = river_board();
-        let tree = SubgameTreeBuilder::new()
-            .board(&board)
-            .bet_sizes(&[1.0])
-            .pot(100)
-            .stacks(&[200, 200])
-            .build();
+        let tree = river_tree(&[1.0]);
         let n = 10;
         let layout = SubgameLayout::build(&tree, n);
 
@@ -1019,7 +1055,7 @@ mod tests {
         let mut used = vec![false; layout.total_size];
         for (node_idx, node) in tree.nodes.iter().enumerate() {
             let num_actions = match node {
-                SubgameNode::Decision { actions, .. } => actions.len(),
+                GameNode::Decision { actions, .. } => actions.len(),
                 _ => continue,
             };
             for combo in 0..n {
