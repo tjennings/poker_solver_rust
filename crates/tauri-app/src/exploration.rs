@@ -100,6 +100,11 @@ enum StrategySource {
         /// Cache of solved subgames
         #[allow(dead_code)]
         solve_cache: Arc<RwLock<LruCache<u64, poker_solver_core::blueprint::SubgameStrategy>>>,
+        /// Continuation-value tables for depth-limited subgame leaf values.
+        #[allow(dead_code)]
+        cbv_p0: Option<Arc<poker_solver_core::blueprint::cbv::CbvTable>>,
+        #[allow(dead_code)]
+        cbv_p1: Option<Arc<poker_solver_core::blueprint::cbv::CbvTable>>,
     },
     BlueprintV2 {
         config: Box<BlueprintV2Config>,
@@ -501,11 +506,29 @@ pub async fn load_subgame_source_core(
         rake_cap: 0.0,
     };
 
+    // Try to load CBV tables from the bundle directory (optional).
+    let bundle_dir = Path::new(&blueprint_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let cbv_p0 = poker_solver_core::blueprint::cbv::CbvTable::load(&bundle_dir.join("cbv_p0.bin"))
+        .ok()
+        .map(Arc::new);
+    let cbv_p1 = poker_solver_core::blueprint::cbv::CbvTable::load(&bundle_dir.join("cbv_p1.bin"))
+        .ok()
+        .map(Arc::new);
+    if cbv_p0.is_some() && cbv_p1.is_some() {
+        eprintln!("[subgame] Loaded CBV tables from {}", bundle_dir.display());
+    } else {
+        eprintln!("[subgame] No CBV tables found in {}; subgame solving will use uniform leaf values", bundle_dir.display());
+    }
+
     *state.source.write() = Some(StrategySource::SubgameSolve {
         blueprint: Arc::new(bundle.blueprint),
         blueprint_config: bundle.config,
         subgame_config: poker_solver_core::blueprint::SubgameConfig::default(),
         solve_cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(64).unwrap()))),
+        cbv_p0,
+        cbv_p1,
     });
 
     Ok(info)
