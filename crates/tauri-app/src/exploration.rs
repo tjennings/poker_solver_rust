@@ -1370,7 +1370,7 @@ fn v2_actions_at_node(tree: &V2GameTree, node_idx: u32) -> Vec<ActionInfo> {
 
 /// Convert a V2 `TreeAction` to an `ActionInfo`.
 #[allow(clippy::cast_possible_truncation)]
-fn v2_action_info(action: &TreeAction, idx: usize) -> ActionInfo {
+pub(crate) fn v2_action_info(action: &TreeAction, idx: usize) -> ActionInfo {
     let id = idx.to_string();
     match action {
         TreeAction::Fold => ActionInfo {

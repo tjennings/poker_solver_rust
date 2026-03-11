@@ -4,10 +4,11 @@ use poker_solver_core::blueprint::solver_dispatch::{
     self, SolverChoice, SolverConfig, Street,
 };
 use poker_solver_core::blueprint::{
-    SubgameCfrSolver, SubgameHands, SubgameNode, SubgameStrategy, SubgameTree, SubgameTreeBuilder,
+    SubgameCfrSolver, SubgameHands, SubgameStrategy,
     compute_combo_equities,
 };
-use poker_solver_core::game::{Action as GameAction, ALL_IN};
+use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
+use poker_solver_core::blueprint_v2::Street as V2Street;
 use poker_solver_core::poker::{Card as RsPokerCard, Suit as RsPokerSuit, Value as RsPokerValue};
 use range_solver::action_tree::{Action, ActionTree, BoardState, TreeConfig};
 use range_solver::bet_size::BetSizeOptions;
@@ -20,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
-use crate::exploration::ActionInfo;
+use crate::exploration::{ActionInfo, v2_action_info};
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -264,7 +265,10 @@ pub struct SubgameSolveResult {
     pub strategy: SubgameStrategy,
     pub hands: SubgameHands,
     pub action_infos: Vec<ActionInfo>,
-    pub tree: SubgameTree,
+    pub tree: GameTree,
+    pub board: Vec<RsPokerCard>,
+    pub initial_pot: f64,
+    pub starting_stack: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -306,83 +310,11 @@ fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
     Ok(RsPokerCard::new(value, suit))
 }
 
-/// Convert a subgame tree action to an `ActionInfo` for the UI.
-///
-/// `bet_sizes` and `pot` are used to resolve bet-size indices into chip
-/// amounts for display labels.
-fn subgame_action_to_info(
-    action: &GameAction,
-    index: usize,
-    pot: u32,
-    bet_sizes: &[f32],
-) -> ActionInfo {
-    match *action {
-        GameAction::Fold => ActionInfo {
-            id: index.to_string(),
-            label: "Fold".to_string(),
-            action_type: "fold".to_string(),
-            size_key: None,
-        },
-        GameAction::Check => ActionInfo {
-            id: index.to_string(),
-            label: "Check".to_string(),
-            action_type: "check".to_string(),
-            size_key: None,
-        },
-        GameAction::Call => ActionInfo {
-            id: index.to_string(),
-            label: "Call".to_string(),
-            action_type: "call".to_string(),
-            size_key: None,
-        },
-        GameAction::Bet(idx) => {
-            if idx == ALL_IN {
-                ActionInfo {
-                    id: index.to_string(),
-                    label: "All-in".to_string(),
-                    action_type: "allin".to_string(),
-                    size_key: None,
-                }
-            } else {
-                let frac = bet_sizes.get(idx as usize).copied().unwrap_or(1.0);
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let chip_amt = (f64::from(pot) * f64::from(frac)).round() as i32;
-                ActionInfo {
-                    id: index.to_string(),
-                    label: format!("Bet {}", format_pot_pct(chip_amt, pot as i32)),
-                    action_type: "bet".to_string(),
-                    size_key: Some(idx.to_string()),
-                }
-            }
-        }
-        GameAction::Raise(idx) => {
-            if idx == ALL_IN {
-                ActionInfo {
-                    id: index.to_string(),
-                    label: "All-in".to_string(),
-                    action_type: "allin".to_string(),
-                    size_key: None,
-                }
-            } else {
-                let frac = bet_sizes.get(idx as usize).copied().unwrap_or(1.0);
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let chip_amt = (f64::from(pot) * f64::from(frac)).round() as i32;
-                ActionInfo {
-                    id: index.to_string(),
-                    label: format!("Raise {}", format_pot_pct(chip_amt, pot as i32)),
-                    action_type: "raise".to_string(),
-                    size_key: Some(idx.to_string()),
-                }
-            }
-        }
-    }
-}
-
 /// Build a subgame tree and CFR solver, ready to iterate.
 ///
-/// Returns the solver, hands, action labels, and tree without running any
-/// iterations. The caller drives the iteration loop and can build matrix
-/// snapshots between iterations.
+/// Returns the solver, hands, action labels, tree, initial pot, and starting
+/// stack without running any iterations. The caller drives the iteration loop
+/// and can build matrix snapshots between iterations.
 ///
 /// Leaf values at `DepthBoundary` nodes use reach-weighted equity against
 /// the opponent range, converted to chip values by the solver.
@@ -395,14 +327,26 @@ pub fn build_subgame_solver(
     oop_weights: &[f32],
     ip_weights: &[f32],
     player: usize,
-) -> Result<(SubgameCfrSolver, SubgameHands, Vec<ActionInfo>, SubgameTree), String> {
-    let tree = SubgameTreeBuilder::new()
-        .board(board_cards)
-        .bet_sizes(bet_sizes)
-        .pot(pot)
-        .stacks(&[stacks[0], stacks[1]])
-        .depth_limit(1)
-        .build();
+) -> Result<(SubgameCfrSolver, SubgameHands, Vec<ActionInfo>, GameTree, f64, f64), String> {
+    let street = match board_cards.len() {
+        3 => V2Street::Flop,
+        4 => V2Street::Turn,
+        5 => V2Street::River,
+        n => return Err(format!("Invalid board length for subgame: {n}")),
+    };
+    let pot_f = f64::from(pot);
+    let inv = [pot_f / 2.0; 2];
+    let starting_stack = f64::from(stacks[0]) + inv[0];
+    let bet_sizes_f64: Vec<f64> = bet_sizes.iter().map(|&s| f64::from(s)).collect();
+
+    let tree = GameTree::build_subgame(
+        street,
+        pot_f,
+        inv,
+        starting_stack,
+        &[bet_sizes_f64],
+        Some(1),
+    );
 
     let hands = SubgameHands::enumerate(board_cards);
 
@@ -420,16 +364,14 @@ pub fn build_subgame_solver(
         .collect();
 
     // Equity-based leaf values for DepthBoundary nodes.
-    // Each combo gets its reach-weighted equity against the opponent range,
-    // which the solver converts to chip values via (2*eq - 1) * half_pot.
     let leaf_values = compute_combo_equities(&hands, board_cards, &opponent_reach);
 
     // Extract action labels from tree root.
-    let action_infos = match &tree.nodes[0] {
-        SubgameNode::Decision { actions, .. } => actions
+    let action_infos = match &tree.nodes[tree.root as usize] {
+        GameNode::Decision { actions, .. } => actions
             .iter()
             .enumerate()
-            .map(|(i, a)| subgame_action_to_info(a, i, pot, bet_sizes))
+            .map(|(i, a)| v2_action_info(a, i))
             .collect(),
         _ => return Err("Subgame tree root is not a decision node".to_string()),
     };
@@ -437,11 +379,12 @@ pub fn build_subgame_solver(
     let solver = SubgameCfrSolver::new(
         tree.clone(),
         hands.clone(),
+        board_cards,
         opponent_reach,
         leaf_values,
     );
 
-    Ok((solver, hands, action_infos, tree))
+    Ok((solver, hands, action_infos, tree, pot_f, starting_stack))
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,7 +1144,7 @@ fn solve_depth_limited(
             &ip_w,
             player,
         ) {
-            Ok((mut solver, hands, action_infos, tree)) => {
+            Ok((mut solver, hands, action_infos, tree, initial_pot, starting_stack)) => {
                 // Helper closure to build matrix from current strategy.
                 let make_matrix = |strat: &SubgameStrategy| {
                     let snap = snapshot_from_subgame(
@@ -1242,6 +1185,9 @@ fn solve_depth_limited(
                     hands,
                     action_infos,
                     tree,
+                    board: board_cards.clone(),
+                    initial_pot,
+                    starting_stack,
                 });
             }
             Err(e) => {
@@ -1329,7 +1275,7 @@ fn postflop_play_action_subgame(
     let current = state.subgame_node.load(Ordering::Relaxed);
 
     let children = match &result.tree.nodes[current as usize] {
-        SubgameNode::Decision { children, .. } => children,
+        GameNode::Decision { children, .. } => children,
         _ => return Err("Current subgame node is not a decision node".to_string()),
     };
 
@@ -1345,6 +1291,45 @@ fn postflop_play_action_subgame(
     subgame_node_to_result(state, result, child_idx)
 }
 
+/// Compute pot and remaining stacks for a `GameNode::Decision` by finding its
+/// fold child's terminal state. Falls back to `initial_pot` for nodes without
+/// a fold action (e.g., the opening check/bet node).
+#[allow(clippy::cast_possible_truncation)]
+fn decision_display_info(
+    tree: &GameTree,
+    node: &GameNode,
+    starting_stack: f64,
+    initial_pot: f64,
+) -> (i32, [i32; 2]) {
+    if let GameNode::Decision { actions, children, .. } = node {
+        for (a, &child_idx) in actions.iter().zip(children.iter()) {
+            if matches!(a, TreeAction::Fold) {
+                if let GameNode::Terminal { pot, invested, .. } =
+                    &tree.nodes[child_idx as usize]
+                {
+                    return (
+                        *pot as i32,
+                        [
+                            (starting_stack - invested[0]) as i32,
+                            (starting_stack - invested[1]) as i32,
+                        ],
+                    );
+                }
+            }
+        }
+        // No fold action — opening node. Use initial pot.
+        let inv = initial_pot / 2.0;
+        return (
+            initial_pot as i32,
+            [
+                (starting_stack - inv) as i32,
+                (starting_stack - inv) as i32,
+            ],
+        );
+    }
+    (0, [0, 0])
+}
+
 /// Convert a subgame tree node into a `PostflopPlayResult`, building the
 /// strategy matrix when the node is a decision point.
 fn subgame_node_to_result(
@@ -1353,34 +1338,41 @@ fn subgame_node_to_result(
     node_idx: u32,
 ) -> Result<PostflopPlayResult, String> {
     match &result.tree.nodes[node_idx as usize] {
-        SubgameNode::Terminal { pot, stacks, .. } => Ok(PostflopPlayResult {
-            matrix: None,
-            is_terminal: true,
-            is_chance: false,
-            current_player: None,
-            #[allow(clippy::cast_possible_wrap)]
-            pot: *pot as i32,
-            stacks: subgame_stacks(stacks),
-        }),
-        SubgameNode::DepthBoundary { pot, stacks } => Ok(PostflopPlayResult {
-            matrix: None,
-            is_terminal: false,
-            is_chance: true,
-            current_player: None,
-            #[allow(clippy::cast_possible_wrap)]
-            pot: *pot as i32,
-            stacks: subgame_stacks(stacks),
-        }),
-        SubgameNode::Decision {
-            position,
-            actions,
-            pot,
-            stacks,
-            ..
+        GameNode::Terminal {
+            kind, pot, invested,
         } => {
-            let player = *position as usize;
+            let remaining = [
+                (result.starting_stack - invested[0]) as i32,
+                (result.starting_stack - invested[1]) as i32,
+            ];
+            match kind {
+                TerminalKind::Fold { .. } | TerminalKind::Showdown => Ok(PostflopPlayResult {
+                    matrix: None,
+                    is_terminal: true,
+                    is_chance: false,
+                    current_player: None,
+                    pot: *pot as i32,
+                    stacks: remaining,
+                }),
+                TerminalKind::DepthBoundary => Ok(PostflopPlayResult {
+                    matrix: None,
+                    is_terminal: false,
+                    is_chance: true,
+                    current_player: None,
+                    pot: *pot as i32,
+                    stacks: remaining,
+                }),
+            }
+        }
+        GameNode::Chance { child, .. } => {
+            subgame_node_to_result(state, result, *child)
+        }
+        GameNode::Decision {
+            player, actions, ..
+        } => {
+            let player_usize = *player as usize;
 
-            let weights = if player == 0 {
+            let weights = if player_usize == 0 {
                 state.filtered_oop_weights.read().clone()
             } else {
                 state.filtered_ip_weights.read().clone()
@@ -1388,7 +1380,6 @@ fn subgame_node_to_result(
             let weights = weights.unwrap_or_else(|| vec![0.0f32; 1326]);
 
             let board_card_strings: Vec<String> = result
-                .tree
                 .board
                 .iter()
                 .map(|c| {
@@ -1400,12 +1391,15 @@ fn subgame_node_to_result(
             let action_infos: Vec<ActionInfo> = actions
                 .iter()
                 .enumerate()
-                .map(|(i, a)| subgame_action_to_info(a, i, *pot, &result.tree.bet_sizes))
+                .map(|(i, a)| v2_action_info(a, i))
                 .collect();
 
-            #[allow(clippy::cast_possible_wrap)]
-            let pot_i32 = *pot as i32;
-            let stacks_i32 = subgame_stacks(stacks);
+            let (pot_i32, stacks_i32) = decision_display_info(
+                &result.tree,
+                &result.tree.nodes[node_idx as usize],
+                result.starting_stack,
+                result.initial_pot,
+            );
 
             let snap = snapshot_from_subgame(
                 &result.hands,
@@ -1415,7 +1409,7 @@ fn subgame_node_to_result(
                 &board_card_strings,
                 pot_i32,
                 stacks_i32,
-                player,
+                player_usize,
                 node_idx,
             );
             let matrix = build_matrix_from_snapshot(snap);
@@ -1423,21 +1417,12 @@ fn subgame_node_to_result(
                 matrix: Some(matrix),
                 is_terminal: false,
                 is_chance: false,
-                current_player: Some(player),
+                current_player: Some(player_usize),
                 pot: pot_i32,
                 stacks: stacks_i32,
             })
         }
     }
-}
-
-/// Extract [i32; 2] stacks from a subgame node's stack vector.
-#[allow(clippy::cast_possible_wrap)]
-fn subgame_stacks(stacks: &[u32]) -> [i32; 2] {
-    [
-        stacks.first().copied().unwrap_or(0) as i32,
-        stacks.get(1).copied().unwrap_or(0) as i32,
-    ]
 }
 
 pub fn postflop_play_action_core(
@@ -1515,13 +1500,17 @@ fn postflop_navigate_to_subgame(
     state: &PostflopState,
     history: &[usize],
 ) -> Result<PostflopPlayResult, String> {
-    state.subgame_node.store(0, Ordering::Relaxed);
-
-    if history.is_empty() {
-        // Return the root node matrix.
+    let root = {
         let result_guard = state.subgame_result.read();
         let result = result_guard.as_ref().ok_or("No subgame result stored")?;
-        return subgame_node_to_result(state, result, 0);
+        result.tree.root
+    };
+    state.subgame_node.store(root, Ordering::Relaxed);
+
+    if history.is_empty() {
+        let result_guard = state.subgame_result.read();
+        let result = result_guard.as_ref().ok_or("No subgame result stored")?;
+        return subgame_node_to_result(state, result, root);
     }
 
     let mut last_result = None;
@@ -1721,14 +1710,14 @@ fn postflop_close_street_subgame(
         .unwrap_or_else(|| ip_range.raw_data().to_vec());
 
     // Walk each action through the subgame tree, narrowing the acting player's range.
-    let mut current_node = 0u32;
+    let mut current_node = result.tree.root;
     for &action_idx in &action_history {
         match &result.tree.nodes[current_node as usize] {
-            SubgameNode::Decision {
-                position, children, ..
+            GameNode::Decision {
+                player, children, ..
             } => {
-                let player = *position as usize;
-                let weights = if player == 0 {
+                let player_usize = *player as usize;
+                let weights = if player_usize == 0 {
                     &mut oop_weights
                 } else {
                     &mut ip_weights
@@ -1755,18 +1744,36 @@ fn postflop_close_street_subgame(
         }
     }
 
-    // Get pot/stacks from the final node.
-    #[allow(clippy::cast_possible_wrap)]
+    // Get pot/effective_stack from the final node.
+    #[allow(clippy::cast_possible_truncation)]
     let (pot, effective_stack) = match &result.tree.nodes[current_node as usize] {
-        SubgameNode::Decision { pot, stacks, .. }
-        | SubgameNode::Terminal { pot, stacks, .. }
-        | SubgameNode::DepthBoundary { pot, stacks } => {
-            let eff = stacks
-                .first()
-                .copied()
-                .unwrap_or(0)
-                .min(stacks.get(1).copied().unwrap_or(0));
-            (*pot as i32, eff as i32)
+        GameNode::Terminal { pot, invested, .. } => {
+            let s0 = (result.starting_stack - invested[0]) as i32;
+            let s1 = (result.starting_stack - invested[1]) as i32;
+            (*pot as i32, s0.min(s1))
+        }
+        GameNode::Decision { .. } => {
+            let (pot_i32, stacks) = decision_display_info(
+                &result.tree,
+                &result.tree.nodes[current_node as usize],
+                result.starting_stack,
+                result.initial_pot,
+            );
+            (pot_i32, stacks[0].min(stacks[1]))
+        }
+        GameNode::Chance { child, .. } => {
+            // Chance node: look through to child for pot info.
+            match &result.tree.nodes[*child as usize] {
+                GameNode::Terminal { pot, invested, .. } => {
+                    let s0 = (result.starting_stack - invested[0]) as i32;
+                    let s1 = (result.starting_stack - invested[1]) as i32;
+                    (*pot as i32, s0.min(s1))
+                }
+                _ => {
+                    let inv = result.initial_pot / 2.0;
+                    (result.initial_pot as i32, (result.starting_stack - inv) as i32)
+                }
+            }
         }
     };
 

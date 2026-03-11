@@ -54,6 +54,7 @@ pub enum TerminalKind {
     DepthBoundary,
 }
 
+#[derive(Debug, Clone)]
 pub struct GameTree {
     pub nodes: Vec<GameNode>,
     pub root: u32,
