@@ -1,5 +1,8 @@
 use parking_lot::{Mutex, RwLock};
 use poker_solver_core::blueprint::full_depth_solver::rs_poker_card_to_id;
+use poker_solver_core::blueprint::solver_dispatch::{
+    self, SolverChoice, SolverConfig, Street,
+};
 use poker_solver_core::blueprint::{
     SubgameCfrSolver, SubgameHands, SubgameNode, SubgameStrategy, SubgameTree, SubgameTreeBuilder,
 };
@@ -1004,27 +1007,71 @@ fn postflop_solve_street_impl(
         return Err("A solve is already in progress".to_string());
     }
 
-    let max_iters = max_iterations.unwrap_or(200);
-
     // Snapshot config and filtered weights under their locks.
     let config = state.config.read().clone();
     let target_exp = target_exploitability.unwrap_or(3.0);
     let filtered_oop = state.filtered_oop_weights.read().clone();
     let filtered_ip = state.filtered_ip_weights.read().clone();
 
-    // Build game (expensive but runs on the calling thread before spawn).
-    let mut game = build_game(&config, &board, &filtered_oop, &filtered_ip)?;
+    // Determine street from board length.
+    let street = match board.len() {
+        3 => Street::Flop,
+        4 => Street::Turn,
+        5 => Street::River,
+        n => return Err(format!("Invalid board length: {n}")),
+    };
+
+    // Count live combos for dispatch decision.
+    let live_combos = {
+        let oop_count = filtered_oop
+            .as_ref()
+            .map(|w| w.iter().filter(|&&v| v > 0.0).count())
+            .unwrap_or(0);
+        let ip_count = filtered_ip
+            .as_ref()
+            .map(|w| w.iter().filter(|&&v| v > 0.0).count())
+            .unwrap_or(0);
+        oop_count.max(ip_count)
+    };
+
+    let solver_config = SolverConfig::default();
+    let choice = solver_dispatch::dispatch_decision(&solver_config, street, live_combos);
 
     // Reset progress atomics.
     state.current_iteration.store(0, Ordering::Relaxed);
+    state.solve_complete.store(false, Ordering::Relaxed);
+    *state.solve_start.write() = Some(std::time::Instant::now());
+
+    match choice {
+        SolverChoice::FullDepth => {
+            solve_full_depth(state, &config, board, max_iterations, target_exp, &filtered_oop, &filtered_ip)
+        }
+        SolverChoice::DepthLimited => {
+            solve_depth_limited(state, &config, board, max_iterations, &solver_config, &filtered_oop, &filtered_ip)
+        }
+    }
+}
+
+/// Full-depth solve using the range-solver (existing path).
+fn solve_full_depth(
+    state: &Arc<PostflopState>,
+    config: &PostflopConfig,
+    board: Vec<String>,
+    max_iterations: Option<u32>,
+    target_exp: f32,
+    filtered_oop: &Option<Vec<f32>>,
+    filtered_ip: &Option<Vec<f32>>,
+) -> Result<(), String> {
+    let max_iters = max_iterations.unwrap_or(200);
     state.max_iterations.store(max_iters, Ordering::Relaxed);
     state
         .exploitability_bits
         .store(f32::MAX.to_bits(), Ordering::Relaxed);
-    state.solve_complete.store(false, Ordering::Relaxed);
-    *state.solve_start.write() = Some(std::time::Instant::now());
     *state.solver_name.write() = "range".to_string();
     state.solving.store(true, Ordering::Release);
+
+    // Build game (expensive but runs on the calling thread before spawn).
+    let mut game = build_game(config, &board, filtered_oop, filtered_ip)?;
 
     // Take initial matrix snapshot and store game in shared state so
     // navigation commands can access it during solving.
@@ -1034,10 +1081,7 @@ fn postflop_solve_street_impl(
     }
     *state.game.lock() = Some(game);
 
-    // Clone the Arc for the background thread.
     let shared = Arc::clone(state);
-    let _cache_dir = state.cache_dir.read().clone();
-
     std::thread::spawn(move || {
         #[allow(unused_assignments)]
         let mut last_exp = f32::MAX;
@@ -1090,9 +1134,98 @@ fn postflop_solve_street_impl(
             *shared.matrix_snapshot.write() = Some(matrix);
         }
 
-        // Spot caching disabled — files were too large (80GB+).
-        // TODO: re-enable with a compact format (strategy-only or matrix-only).
+        shared.solve_complete.store(true, Ordering::Relaxed);
+        shared.solving.store(false, Ordering::Release);
+    });
 
+    Ok(())
+}
+
+/// Depth-limited solve using `SubgameCfrSolver`.
+#[allow(clippy::too_many_arguments)]
+fn solve_depth_limited(
+    state: &Arc<PostflopState>,
+    config: &PostflopConfig,
+    board: Vec<String>,
+    max_iterations: Option<u32>,
+    solver_config: &SolverConfig,
+    filtered_oop: &Option<Vec<f32>>,
+    filtered_ip: &Option<Vec<f32>>,
+) -> Result<(), String> {
+    let max_iters = max_iterations.unwrap_or(solver_config.depth_limited_iterations);
+    state.max_iterations.store(max_iters, Ordering::Relaxed);
+    state
+        .exploitability_bits
+        .store(f32::MAX.to_bits(), Ordering::Relaxed);
+    *state.solver_name.write() = "subgame".to_string();
+    state.solving.store(true, Ordering::Release);
+
+    // Parse board to rs_poker Cards.
+    let board_cards: Vec<RsPokerCard> = board
+        .iter()
+        .map(|s| parse_rs_poker_card(s))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Extract bet sizes from config (parse comma-separated percentage strings).
+    let bet_sizes: Vec<f32> = config
+        .oop_bet_sizes
+        .split(',')
+        .filter_map(|s| {
+            let s = s.trim().trim_end_matches('%');
+            s.parse::<f32>().ok().map(|v| v / 100.0)
+        })
+        .collect();
+    let bet_sizes = if bet_sizes.is_empty() {
+        vec![1.0]
+    } else {
+        bet_sizes
+    };
+
+    let pot = config.pot;
+    let eff_stack = config.effective_stack;
+
+    let oop_w = filtered_oop.clone().unwrap_or_else(|| {
+        let range: Range = config.oop_range.parse().unwrap_or_default();
+        range.raw_data().to_vec()
+    });
+    let ip_w = filtered_ip.clone().unwrap_or_else(|| {
+        let range: Range = config.ip_range.parse().unwrap_or_default();
+        range.raw_data().to_vec()
+    });
+
+    let shared = Arc::clone(state);
+    let board_strings = board;
+    std::thread::spawn(move || {
+        let player = 0; // OOP acts first at root
+        match solve_subgame_street(
+            &board_cards,
+            &bet_sizes,
+            pot as u32,
+            [eff_stack as u32, eff_stack as u32],
+            &oop_w,
+            &ip_w,
+            max_iters,
+            player,
+            &shared,
+        ) {
+            Ok((strategy, hands, action_infos, _tree)) => {
+                let matrix = build_subgame_matrix(
+                    &hands,
+                    &strategy,
+                    action_infos,
+                    &oop_w,
+                    &board_strings,
+                    pot,
+                    [eff_stack, eff_stack],
+                    player,
+                    0,
+                );
+                *shared.matrix_snapshot.write() = Some(matrix);
+            }
+            Err(e) => {
+                eprintln!("Subgame solve failed: {e}");
+            }
+        }
         shared.solve_complete.store(true, Ordering::Relaxed);
         shared.solving.store(false, Ordering::Release);
     });
