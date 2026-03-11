@@ -8,11 +8,11 @@ game:
   force_allin_threshold: 0.15
 
 datagen:
-  num_samples: 1000000
+  num_samples: 100000
   pot_intervals: [[4,20], [20,80], [80,200], [200,400]]
   solver_iterations: 1000
   target_exploitability: 0.005
-  threads: 8
+  # threads: 8
   seed: 42
 
 training:
