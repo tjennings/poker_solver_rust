@@ -1,0 +1,77 @@
+# Small/fast Blueprint V2 — for quick iteration and UI testing
+# Stripped-down action abstraction and fewer buckets for fast convergence.
+game:
+  name: "HU Equity+Delta 100bb (small)"
+  players: 2
+  stack_depth: 100.0
+  small_blind: 0.5
+  big_blind: 1.0
+
+clustering:
+  algorithm: potential_aware_emd
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 50
+    delta_bins: [-0.2, 0.0, 0.15, 0.40]
+    expected_delta: true
+  turn:
+    buckets: 50
+    delta_bins: [-0.2, 0.0, 0.15, 0.40]
+    expected_delta: true
+  river:
+    buckets: 100
+
+action_abstraction:
+  preflop:
+    - ["2bb"]
+    - ["4bb", "7bb"]
+    - ["2x", "3x"]
+    - ["2x", "3x"]
+  flop:
+    - [0.5, 1.0]
+    - [1.0]
+  turn:
+    - [0.5, 1.0]
+    - [1.0]
+  river:
+    - [0.5, 1.0]
+    - [1.0]
+
+training:
+  time_limit_minutes: 30
+  lcfr_warmup_iterations: 100000
+  prune_after_iterations: 10000000000000000
+  prune_threshold: -6000
+  lcfr_discount_interval: 10000
+  batch_size: 6000
+  dcfr_alpha: 1.5
+  dcfr_beta: 0.0
+  dcfr_gamma: 2.0
+  equity_cache_path: "./local_data/equity_delta.bin"
+
+snapshots:
+  resume: true
+  warmup_minutes: 5
+  snapshot_every_minutes: 5
+  max_snapshots: 5
+  output_dir: "./local_data/snapshots_equity_delta_small"
+
+tui:
+  enabled: true
+  refresh_rate_ms: 2000
+  telemetry:
+    strategy_delta_interval_seconds: 60
+    sparkline_window: 30
+  scenarios:
+    - name: "SB Open"
+      player: SB
+      actions: []
+    - name: "BB vs 2x"
+      player: BB
+      actions: ["raise-0"]
+    - name: "SB Cbet K72"
+      player: SB
+      actions: ["raise-0", "call"]
+      board: ["Kh", "7s", "2d"]
+      street: flop

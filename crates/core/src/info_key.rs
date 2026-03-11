@@ -13,8 +13,22 @@
 //! Action encoding (4 bits): 0=empty, 1=fold, 2=check, 3=call,
 //! 4-8=bet idx 0-4, 9-13=raise idx 0-4, 14=bet all-in, 15=raise all-in.
 
-use crate::blueprint::{AbstractionModeConfig, BlueprintStrategy};
 use crate::game::{ALL_IN, Action};
+
+/// Which abstraction mode to use for key interpretation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AbstractionMode {
+    #[default]
+    Ehs2,
+    HandClassV2,
+}
+
+impl AbstractionMode {
+    #[must_use]
+    pub fn is_hand_class(self) -> bool {
+        matches!(self, Self::HandClassV2)
+    }
+}
 use crate::hand_class::{HandClass, classify, intra_class_strength};
 use crate::poker::{Card, Suit, Value};
 use crate::showdown_equity;
@@ -436,15 +450,15 @@ pub fn reverse_canonical_index(index: u16) -> &'static str {
 pub fn describe_key(
     input: &str,
     bet_sizes: &[f32],
-    abstraction_mode: AbstractionModeConfig,
-    blueprint: Option<&BlueprintStrategy>,
+    abstraction_mode: AbstractionMode,
+    _action_count: Option<usize>,
 ) -> Result<KeyDescription, String> {
     let trimmed = input.trim();
 
     if is_hex_input(trimmed) {
-        describe_from_hex(trimmed, bet_sizes, abstraction_mode, blueprint)
+        describe_from_hex(trimmed, bet_sizes, abstraction_mode)
     } else {
-        describe_from_compose(trimmed, bet_sizes, abstraction_mode, blueprint)
+        describe_from_compose(trimmed, bet_sizes, abstraction_mode)
     }
 }
 
@@ -459,8 +473,7 @@ fn is_hex_input(s: &str) -> bool {
 fn describe_from_hex(
     input: &str,
     bet_sizes: &[f32],
-    abstraction_mode: AbstractionModeConfig,
-    blueprint: Option<&BlueprintStrategy>,
+    abstraction_mode: AbstractionMode,
 ) -> Result<KeyDescription, String> {
     let hex_str = input
         .strip_prefix("0x")
@@ -482,7 +495,6 @@ fn describe_from_hex(
         .collect();
 
     let hand_label = hand_label_from_bits(hand_bits, street, abstraction_mode);
-    let strategy = blueprint.and_then(|bp| bp.lookup(raw).map(<[f32]>::to_vec));
 
     Ok(KeyDescription {
         raw,
@@ -493,15 +505,14 @@ fn describe_from_hex(
         spr_bucket: spr,
         action_codes,
         action_labels,
-        strategy,
+        strategy: None,
     })
 }
 
 fn describe_from_compose(
     input: &str,
     bet_sizes: &[f32],
-    abstraction_mode: AbstractionModeConfig,
-    blueprint: Option<&BlueprintStrategy>,
+    abstraction_mode: AbstractionMode,
 ) -> Result<KeyDescription, String> {
     let mut hand_str: Option<&str> = None;
     let mut street_str: Option<&str> = None;
@@ -541,7 +552,6 @@ fn describe_from_compose(
         .collect();
 
     let raw = InfoKey::new(hand_bits, street, spr, &action_codes).as_u64();
-    let strategy = blueprint.and_then(|bp| bp.lookup(raw).map(<[f32]>::to_vec));
 
     let hand_label = hand_raw.to_string();
 
@@ -554,7 +564,7 @@ fn describe_from_compose(
         spr_bucket: spr,
         action_codes,
         action_labels,
-        strategy,
+        strategy: None,
     })
 }
 
@@ -581,7 +591,7 @@ fn parse_street(s: &str) -> Result<u8, String> {
     }
 }
 
-fn parse_hand_bits(hand: &str, mode: AbstractionModeConfig) -> Result<u32, String> {
+fn parse_hand_bits(hand: &str, mode: AbstractionMode) -> Result<u32, String> {
     // Try raw numeric first (decimal or hex)
     if let Ok(v) = hand.parse::<u32>() {
         return Ok(v);
@@ -591,10 +601,10 @@ fn parse_hand_bits(hand: &str, mode: AbstractionModeConfig) -> Result<u32, Strin
     }
 
     match mode {
-        AbstractionModeConfig::Ehs2 => canonical_hand_index_from_str(hand)
+        AbstractionMode::Ehs2 => canonical_hand_index_from_str(hand)
             .map(u32::from)
             .ok_or_else(|| format!("invalid canonical hand: {hand}")),
-        AbstractionModeConfig::HandClassV2 => parse_hand_class_v2(hand),
+        AbstractionMode::HandClassV2 => parse_hand_class_v2(hand),
     }
 }
 
@@ -650,9 +660,9 @@ fn parse_action_codes(s: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Generate a human-readable hand label from the raw 28-bit hand field.
-pub fn hand_label_from_bits(hand_bits: u32, street: u8, mode: AbstractionModeConfig) -> String {
+pub fn hand_label_from_bits(hand_bits: u32, street: u8, mode: AbstractionMode) -> String {
     match mode {
-        AbstractionModeConfig::Ehs2 => {
+        AbstractionMode::Ehs2 => {
             if street == 0 && hand_bits < 169 {
                 #[allow(clippy::cast_possible_truncation)]
                 reverse_canonical_index(hand_bits as u16).to_string()
@@ -660,7 +670,7 @@ pub fn hand_label_from_bits(hand_bits: u32, street: u8, mode: AbstractionModeCon
                 format!("bucket:{hand_bits}")
             }
         }
-        AbstractionModeConfig::HandClassV2 => {
+        AbstractionMode::HandClassV2 => {
             let class_id = (hand_bits >> 23) & 0x1F;
             let strength = ((hand_bits >> 19) & 0xF) as u8;
             let equity = ((hand_bits >> 15) & 0xF) as u8;
@@ -1077,7 +1087,7 @@ mod tests {
         let key = InfoKey::new(42, 1, 10, &[2, 5]).as_u64();
         let hex = format!("0x{key:016X}");
 
-        let desc = describe_key(&hex, &sizes, AbstractionModeConfig::Ehs2, None).unwrap();
+        let desc = describe_key(&hex, &sizes, AbstractionMode::Ehs2, None).unwrap();
         assert_eq!(desc.raw, key);
         assert_eq!(desc.street, 1);
         assert_eq!(desc.spr_bucket, 10);
@@ -1089,7 +1099,7 @@ mod tests {
         let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
         let input = "hand=AKs street=preflop spr=31";
 
-        let desc = describe_key(input, &sizes, AbstractionModeConfig::Ehs2, None).unwrap();
+        let desc = describe_key(input, &sizes, AbstractionMode::Ehs2, None).unwrap();
         assert_eq!(desc.street, 0);
         assert_eq!(desc.spr_bucket, 31);
         assert_eq!(desc.hand_bits, 13); // AKs = index 13
@@ -1100,7 +1110,7 @@ mod tests {
         let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
         let input = "hand=QQ street=flop spr=5 actions=check,bet1";
 
-        let desc = describe_key(input, &sizes, AbstractionModeConfig::Ehs2, None).unwrap();
+        let desc = describe_key(input, &sizes, AbstractionMode::Ehs2, None).unwrap();
         assert_eq!(desc.action_codes, vec![2, 5]); // check=2, bet1=5
         assert_eq!(desc.action_labels, vec!["Check", "Bet 67%"]);
     }
@@ -1110,9 +1120,9 @@ mod tests {
         let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
         let input = "hand=AKs street=preflop spr=20 actions=call";
 
-        let desc1 = describe_key(input, &sizes, AbstractionModeConfig::Ehs2, None).unwrap();
+        let desc1 = describe_key(input, &sizes, AbstractionMode::Ehs2, None).unwrap();
         let hex = format!("0x{:016X}", desc1.raw);
-        let desc2 = describe_key(&hex, &sizes, AbstractionModeConfig::Ehs2, None).unwrap();
+        let desc2 = describe_key(&hex, &sizes, AbstractionMode::Ehs2, None).unwrap();
 
         assert_eq!(desc1.raw, desc2.raw);
         assert_eq!(desc1.street, desc2.street);
@@ -1125,7 +1135,7 @@ mod tests {
         let sizes = vec![0.33, 0.67, 1.0, 2.0, 3.0];
         let input = "hand=AKs street=flop spr=10 actions=check,bet1";
 
-        let desc = describe_key(input, &sizes, AbstractionModeConfig::Ehs2, None).unwrap();
+        let desc = describe_key(input, &sizes, AbstractionMode::Ehs2, None).unwrap();
         let compose = desc.compose_string();
         assert!(compose.contains("hand=AKs"), "compose: {compose}");
         assert!(compose.contains("street=flop"), "compose: {compose}");
@@ -1146,7 +1156,7 @@ mod tests {
         let sizes = vec![0.33, 0.67, 1.0];
         let input = "hand=Pair:1:0 street=flop spr=5";
 
-        let desc = describe_key(input, &sizes, AbstractionModeConfig::HandClassV2, None).unwrap();
+        let desc = describe_key(input, &sizes, AbstractionMode::HandClassV2, None).unwrap();
         // Pair = discriminant 9.
         // parse_hand_class_v2 passes raw strength=1, equity=0 to encode_hand_v2(bits=4,4).
         // encode_hand_v2 quantizes strength: (1-1).min(13) = 0, so encoded strength = 0.

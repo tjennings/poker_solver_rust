@@ -1,14 +1,24 @@
 pub mod bucket_file;
 pub mod bundle;
+pub mod cbv;
+pub mod cbv_compute;
 pub mod cluster_diagnostics;
 pub mod cluster_pipeline;
 pub mod clustering;
 pub mod config;
 pub mod equity_cache;
+pub mod full_depth_solver;
 pub mod game_tree;
 pub mod mccfr;
+pub mod solver_dispatch;
 pub mod storage;
+pub mod subgame;
+pub mod subgame_cfr;
 pub mod trainer;
+
+// Re-export subgame types at module level for convenience.
+pub use subgame::SubgameConfig;
+pub use subgame_cfr::{SubgameCfrSolver, SubgameHands, SubgameStrategy, compute_combo_equities};
 
 use serde::{Deserialize, Serialize};
 

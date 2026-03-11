@@ -12,12 +12,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use poker_solver_core::agent::AgentConfig;
-use poker_solver_core::blueprint::cbv::CbvTable;
-use poker_solver_core::blueprint::solver_dispatch::SolverConfig;
-use poker_solver_core::blueprint::StrategyBundle;
-use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::simulation::{
-    RealTimeSolvingAgentGenerator, RuleBasedAgentGenerator, SimResult, run_simulation,
+    RuleBasedAgentGenerator, SimResult, run_simulation,
 };
 
 use crate::exploration::list_blueprints_core;
@@ -277,59 +273,6 @@ pub fn get_simulation_result(
 // Helpers
 // ============================================================================
 
-/// Build a `RealTimeSolvingAgentGenerator` from a bundle directory.
-///
-/// Expects the directory to contain:
-/// - `config.yaml` + `blueprint.bin` (V1 bundle)
-/// - `strategy.bin` (V2 strategy)
-/// - `cbv_p0.bin` / `cbv_p1.bin` (optional — falls back to empty tables)
-fn build_solver_agent_generator(
-    bundle_path: &str,
-) -> Result<(Box<dyn AgentGenerator>, Vec<f32>), String> {
-    let dir = PathBuf::from(bundle_path);
-
-    // Load V1 bundle (config + blueprint)
-    let bundle = StrategyBundle::load(&dir)
-        .map_err(|e| format!("Failed to load V1 bundle from {bundle_path}: {e}"))?;
-    let bet_sizes_f32 = bundle.config.game.bet_sizes.clone();
-    let stack_depth = bundle.config.game.stack_depth;
-    let bet_sizes_f64: Vec<f64> = bet_sizes_f32.iter().map(|&b| f64::from(b)).collect();
-
-    // Load V2 strategy
-    let strategy_path = dir.join("strategy.bin");
-    let blueprint_v2 = if strategy_path.exists() {
-        BlueprintV2Strategy::load(&strategy_path)
-            .map_err(|e| format!("Failed to load V2 strategy from {bundle_path}: {e}"))?
-    } else {
-        eprintln!("Warning: No strategy.bin found at {bundle_path}, using empty V2 strategy");
-        BlueprintV2Strategy::empty()
-    };
-
-    // Load CBV tables (required)
-    let cbv_p0 = load_cbv(&dir.join("cbv_p0.bin"))?;
-    // cbv_p1 loaded but not yet used; the generator currently uses a single
-    // table for both players. Keep the load so it's ready when we split.
-    let _cbv_p1 = load_cbv(&dir.join("cbv_p1.bin"))?;
-
-    let generator = RealTimeSolvingAgentGenerator::new(
-        Arc::new(blueprint_v2),
-        Arc::new(bundle.blueprint),
-        bundle.config,
-        Arc::new(cbv_p0),
-        SolverConfig::default(),
-        bet_sizes_f64,
-        stack_depth,
-    );
-
-    Ok((Box::new(generator), bet_sizes_f32))
-}
-
-/// Load a [`CbvTable`] from disk, returning an error if the file is missing or corrupt.
-fn load_cbv(path: &std::path::Path) -> Result<CbvTable, String> {
-    CbvTable::load(path)
-        .map_err(|e| format!("Failed to load CBV table from {}: {e}", path.display()))
-}
-
 /// Build an agent generator and its associated bet sizes.
 ///
 /// Returns `(generator, bet_sizes)` where `bet_sizes` is non-empty for
@@ -352,7 +295,9 @@ fn build_agent_generator(path: &str) -> Result<(Box<dyn AgentGenerator>, Vec<f32
             .map_err(|e| format!("Failed to load agent config: {e}"))?;
         Ok((Box::new(RuleBasedAgentGenerator::new(Arc::new(config))), vec![]))
     } else {
-        build_solver_agent_generator(path)
+        Err(format!(
+            "Unsupported strategy source: {path}. Only .toml agent configs and built-in agents are supported."
+        ))
     }
 }
 

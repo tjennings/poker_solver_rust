@@ -13,7 +13,7 @@ cd crates/tauri-app && cargo tauri dev
 
 ### Browser via Dev Server
 
-No Tauri build required — useful for faster UI iteration:
+No Tauri build required -- useful for faster UI iteration:
 
 ```bash
 cargo run -p poker-solver-devserver &   # HTTP API on :3001
@@ -21,7 +21,7 @@ cd frontend && npm run dev              # Vite on :5173
 # Open http://localhost:5173
 ```
 
-The frontend auto-detects Tauri vs browser via `window.__TAURI__` and uses `fetch()` in browser mode. File picker falls back to `window.prompt()` — enter absolute paths.
+The frontend auto-detects Tauri vs browser via `window.__TAURI__` and uses `fetch()` in browser mode. File picker falls back to `window.prompt()` -- enter absolute paths.
 
 Test endpoints directly:
 ```bash
@@ -32,14 +32,11 @@ curl -X POST http://localhost:3001/api/is_bundle_loaded -H 'Content-Type: applic
 
 Open the hamburger menu to choose a strategy source:
 
-### Trained Bundle
-Select a strategy bundle directory (output from `train` command). Displays metadata: stack depth, bet sizes, info set count, training iterations.
+### Blueprint V2 Bundle
+Select a blueprint_v2 strategy bundle directory (output from `train-blueprint` command). Displays metadata: stack depth, bet sizes, info set count, training iterations.
 
 ### Rule-Based Agents
 Agent TOML configs from `agents/*.toml` are listed automatically. Each agent maps `HandClass` variants to action frequencies. Select one to explore its strategy.
-
-### Preflop Bundle
-Load a preflop solve output (from `solve-preflop` command). Displays the preflop strategy with 169 canonical hands.
 
 ## Explorer Tab
 
@@ -52,7 +49,7 @@ The 13x13 hand matrix shows action probabilities for every starting hand. Each c
 
 Click an action button to advance down the game tree.
 
-Click a cell to expand combo-level detail — shows the hand class breakdown (e.g. how many combos of AKs are Flush, Pair, etc.) at the current board state.
+Click a cell to expand combo-level detail -- shows the hand class breakdown (e.g. how many combos of AKs are Flush, Pair, etc.) at the current board state.
 
 ### Postflop
 
@@ -65,9 +62,9 @@ Continue through turn and river by entering additional cards. The suit mapping f
 
 ### Navigation
 
-- **Action buttons** — click to advance to a child node
-- **History strip** — shows the full action sequence at the top; click any point to rewind
-- **Available actions** — displayed for the current decision point with probabilities
+- **Action buttons** -- click to advance to a child node
+- **History strip** -- shows the full action sequence at the top; click any point to rewind
+- **Available actions** -- displayed for the current decision point with probabilities
 
 ## Simulator Tab
 
@@ -91,10 +88,8 @@ The explorer uses these backend commands (available as Tauri commands or HTTP `P
 
 | Command | Description |
 |-|-|
-| `load_bundle` | Load a trained strategy bundle |
-| `load_preflop_solve` | Load a preflop strategy bundle |
-| `solve_preflop_live` | Solve preflop in real-time |
-| `load_subgame_source` | Load a blueprint for subgame solving |
+| `load_bundle` | Load a trained strategy bundle (auto-detects blueprint_v2 format) |
+| `load_blueprint_v2` | Load a blueprint_v2 strategy bundle directly |
 | `get_strategy_matrix` | Get strategy for a position (returns 13x13 matrix) |
 | `get_available_actions` | Get actions at current position |
 | `get_bundle_info` | Get loaded bundle metadata |
@@ -105,4 +100,3 @@ The explorer uses these backend commands (available as Tauri commands or HTTP `P
 | `canonicalize_board` | Canonicalize board cards via suit isomorphism |
 | `list_agents` | List available agent TOML configs |
 | `get_combo_classes` | Get combo-level hand class breakdown for a cell |
-| `get_hand_equity` | Get avg postflop EV for a canonical hand (preflop bundles with postflop data) |

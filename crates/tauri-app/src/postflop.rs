@@ -1,9 +1,9 @@
 use parking_lot::{Mutex, RwLock};
-use poker_solver_core::blueprint::full_depth_solver::rs_poker_card_to_id;
-use poker_solver_core::blueprint::solver_dispatch::{
+use poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id;
+use poker_solver_core::blueprint_v2::solver_dispatch::{
     self, SolverChoice, SolverConfig, Street,
 };
-use poker_solver_core::blueprint::{
+use poker_solver_core::blueprint_v2::{
     SubgameCfrSolver, SubgameHands, SubgameStrategy,
     compute_combo_equities,
 };

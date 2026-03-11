@@ -4,27 +4,22 @@
 //! and explore the game tree, viewing strategies at each decision point.
 
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
-use poker_solver_core::abstraction::{CardAbstraction, Street};
 use poker_solver_core::abstraction::isomorphism::{CanonicalBoard, SuitMapping};
+use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
-use poker_solver_core::blueprint::{AbstractionModeConfig, BundleConfig, StrategyBundle};
 use poker_solver_core::blueprint_v2::bundle::{self as v2_bundle, BlueprintV2Strategy};
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode as V2GameNode, GameTree as V2GameTree, TreeAction};
-use poker_solver_core::hand_class::{classify, intra_class_strength, HandClass};
+use poker_solver_core::hand_class::classify;
 use poker_solver_core::hands::CanonicalHand;
-use poker_solver_core::info_key::{canonical_hand_index, canonical_hand_index_from_str, cards_from_rank_chars, encode_hand_v2, spr_bucket, InfoKey};
-use poker_solver_core::showdown_equity;
 use poker_solver_core::poker::{Card, Suit, Value};
 
 /// Callback for reporting bucket computation progress: `(completed, total, board_key)`.
@@ -71,8 +66,6 @@ pub struct ExplorationState {
     computing: Arc<AtomicBool>,
     /// Board key currently being computed
     computing_board_key: Arc<RwLock<Option<String>>>,
-    /// Abstraction for bucket computation (cloned for thread use)
-    abstraction_boundaries: Arc<RwLock<Option<poker_solver_core::abstraction::BucketBoundaries>>>,
     /// Suit mapping established by flop canonicalization, applied to turn/river cards
     suit_mapping: RwLock<Option<SuitMapping>>,
 }
@@ -80,32 +73,7 @@ pub struct ExplorationState {
 /// A loaded strategy source — either a trained bundle, rule-based agent,
 /// preflop solve, or subgame solve backed by a blueprint.
 enum StrategySource {
-    Bundle {
-        config: BundleConfig,
-        blueprint: poker_solver_core::blueprint::BlueprintStrategy,
-    },
     Agent(AgentConfig),
-    PreflopSolve {
-        config: poker_solver_core::preflop::PreflopConfig,
-        strategy: poker_solver_core::preflop::PreflopStrategy,
-        /// Hand-averaged postflop EV table from the companion PostflopBundle, if present.
-        /// Layout: `[pos0: 169×169, pos1: 169×169]`.
-        hand_avg_values: Option<Vec<f64>>,
-    },
-    SubgameSolve {
-        blueprint: Arc<poker_solver_core::blueprint::BlueprintStrategy>,
-        blueprint_config: BundleConfig,
-        #[allow(dead_code)]
-        subgame_config: poker_solver_core::blueprint::SubgameConfig,
-        /// Cache of solved subgames
-        #[allow(dead_code)]
-        solve_cache: Arc<RwLock<LruCache<u64, poker_solver_core::blueprint::SubgameStrategy>>>,
-        /// Continuation-value tables for depth-limited subgame leaf values.
-        #[allow(dead_code)]
-        cbv_p0: Option<Arc<poker_solver_core::blueprint::cbv::CbvTable>>,
-        #[allow(dead_code)]
-        cbv_p1: Option<Arc<poker_solver_core::blueprint::cbv::CbvTable>>,
-    },
     BlueprintV2 {
         config: Box<BlueprintV2Config>,
         strategy: Box<BlueprintV2Strategy>,
@@ -124,7 +92,6 @@ impl Default for ExplorationState {
             computation_total: Arc::new(AtomicUsize::new(0)),
             computing: Arc::new(AtomicBool::new(false)),
             computing_board_key: Arc::new(RwLock::new(None)),
-            abstraction_boundaries: Arc::new(RwLock::new(None)),
             suit_mapping: RwLock::new(None),
         }
     }
@@ -246,108 +213,29 @@ impl Default for ExplorationPosition {
     }
 }
 
-/// Load a strategy bundle from a directory, or an agent from a `.toml` file
+/// Load a strategy source from a directory or agent `.toml` file
 /// (core logic, no Tauri dependency).
 ///
-/// Bundle loading (which can deserialize ~1 GB of blueprint data) runs on a
-/// blocking thread so the async runtime stays responsive.
+/// Supports agent configs (`.toml`) and BlueprintV2 bundles (`config.yaml`).
 pub async fn load_bundle_core(
     state: &ExplorationState,
     path: String,
 ) -> Result<BundleInfo, String> {
     let bundle_path = PathBuf::from(&path);
 
-    let (info, source, boundaries) = if path.ends_with(".toml") {
+    if path.ends_with(".toml") {
         let (info, source) = load_agent(&bundle_path)?;
-        (info, source, None)
-    } else if bundle_path.join("blueprint.bin").exists() {
-        // Postflop strategy bundle
-        let bundle = tokio::task::spawn_blocking(move || {
-            StrategyBundle::load(&bundle_path)
-                .map_err(|e| format!("Failed to load bundle: {e}"))
-        })
-        .await
-        .map_err(|e| format!("Load task panicked: {e}"))??;
-
-        let info = BundleInfo {
-            name: Some("Trained Bundle".to_string()),
-            stack_depth: bundle.config.game.stack_depth,
-            bet_sizes: bundle.config.game.bet_sizes.clone(),
-            info_sets: bundle.blueprint.len(),
-            iterations: bundle.blueprint.iterations_trained(),
-            preflop_only: false,
-            rake_rate: 0.0,
-            rake_cap: 0.0,
-        };
-        let boundaries = bundle.boundaries;
-        let source = StrategySource::Bundle {
-            config: bundle.config,
-            blueprint: bundle.blueprint,
-        };
-        (info, source, boundaries)
-    } else if bundle_path.join("strategy.bin").exists() {
-        // Preflop strategy bundle
-        let bundle = tokio::task::spawn_blocking(move || {
-            let bp = bundle_path.clone();
-            let preflop = poker_solver_core::preflop::PreflopBundle::load(&bp)
-                .map_err(|e| format!("Failed to load preflop bundle: {e}"))?;
-
-            // Hand-averaged EV table: prefer PreflopBundle's embedded copy,
-            // fall back to postflop/ subdirectory, then co-located solve.bin.
-            let hand_avg_values = preflop.hand_avg_values.clone().or_else(|| {
-                let postflop_dir = bp.join("postflop");
-                // Try multi-SPR bundle (handles both new and legacy layouts)
-                if let Ok(abstractions) = poker_solver_core::preflop::PostflopBundle::load_multi(
-                    &poker_solver_core::preflop::PostflopModelConfig::default(),
-                    &postflop_dir,
-                ) {
-                    return abstractions.into_iter().next().map(|a| a.hand_avg_values);
-                }
-                // Legacy: co-located solve.bin at root
-                let solve_bin = bp.join("solve.bin");
-                if solve_bin.exists() {
-                    return poker_solver_core::preflop::PostflopBundle::load_hand_avg_values(&solve_bin).ok();
-                }
-                None
-            });
-
-            Ok::<_, String>((preflop, hand_avg_values))
-        })
-        .await
-        .map_err(|e| format!("Load task panicked: {e}"))??;
-
-        let (preflop_bundle, hand_avg_values) = bundle;
-        let info = BundleInfo {
-            name: Some("Preflop Solve".into()),
-            stack_depth: preflop_bundle.config.stacks.first().copied().unwrap_or(0) / 2,
-            bet_sizes: vec![],
-            info_sets: preflop_bundle.strategy.len(),
-            iterations: 0,
-            preflop_only: true,
-            rake_rate: 0.0,
-            rake_cap: 0.0,
-        };
-        let source = StrategySource::PreflopSolve {
-            config: preflop_bundle.config,
-            strategy: preflop_bundle.strategy,
-            hand_avg_values,
-        };
-        (info, source, None)
-    } else if bundle_path.join("config.yaml").exists() {
+        *state.source.write() = Some(source);
+        state.bucket_cache.write().clear();
+        *state.suit_mapping.write() = None;
+        return Ok(info);
+    }
+    if bundle_path.join("config.yaml").exists() {
         // Blueprint V2 bundle — delegate to the dedicated loader.
         return load_blueprint_v2_core(state, path).await;
-    } else {
-        return Err(
-            "Directory contains neither blueprint.bin, strategy.bin, nor config.yaml".to_string(),
-        );
-    };
+    }
 
-    *state.abstraction_boundaries.write() = boundaries;
-    *state.source.write() = Some(source);
-    state.bucket_cache.write().clear();
-    *state.suit_mapping.write() = None;
-
-    Ok(info)
+    Err("Directory does not contain config.yaml (BlueprintV2 bundle) or .toml (agent)".to_string())
 }
 
 /// Load a strategy bundle (Tauri wrapper).
@@ -374,173 +262,6 @@ fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
     };
 
     Ok((info, StrategySource::Agent(agent)))
-}
-
-/// Load a preflop strategy bundle from a directory (core logic, no Tauri dependency).
-pub async fn load_preflop_solve_core(
-    state: &ExplorationState,
-    path: String,
-) -> Result<BundleInfo, String> {
-    let bundle_path = PathBuf::from(&path);
-    let (preflop_bundle, hand_avg_values) = tokio::task::spawn_blocking(move || {
-        let preflop = poker_solver_core::preflop::PreflopBundle::load(&bundle_path)
-            .map_err(|e| format!("Failed to load preflop bundle: {e}"))?;
-
-        let hand_avg_values = {
-            let postflop_dir = bundle_path.join("postflop");
-            if let Ok(abstractions) = poker_solver_core::preflop::PostflopBundle::load_multi(
-                &poker_solver_core::preflop::PostflopModelConfig::default(),
-                &postflop_dir,
-            ) {
-                abstractions.into_iter().next().map(|a| a.hand_avg_values)
-            } else {
-                None
-            }
-        };
-
-        Ok::<_, String>((preflop, hand_avg_values))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))??;
-
-    let info = BundleInfo {
-        name: Some("Preflop Solve".into()),
-        stack_depth: preflop_bundle.config.stacks.first().copied().unwrap_or(0) / 2,
-        bet_sizes: vec![],
-        info_sets: preflop_bundle.strategy.len(),
-        iterations: 0,
-        preflop_only: true,
-        rake_rate: 0.0,
-        rake_cap: 0.0,
-    };
-
-    *state.source.write() = Some(StrategySource::PreflopSolve {
-        config: preflop_bundle.config,
-        strategy: preflop_bundle.strategy,
-        hand_avg_values,
-    });
-
-    Ok(info)
-}
-
-/// Load a preflop strategy bundle (Tauri wrapper).
-#[tauri::command]
-pub async fn load_preflop_solve(
-    state: State<'_, ExplorationState>,
-    path: String,
-) -> Result<BundleInfo, String> {
-    load_preflop_solve_core(&state, path).await
-}
-
-/// Solve a preflop game live with the given stack depth and iterations
-/// (core logic, no Tauri dependency).
-pub async fn solve_preflop_live_core(
-    state: &ExplorationState,
-    stack_depth: u32,
-    iterations: u64,
-) -> Result<BundleInfo, String> {
-    let config = poker_solver_core::preflop::PreflopConfig::heads_up(stack_depth);
-    let config_clone = config.clone();
-
-    let (strategy, len) = tokio::task::spawn_blocking(move || {
-        let mut solver = poker_solver_core::preflop::PreflopSolver::new(&config_clone);
-        solver.train(iterations);
-        let strat = solver.strategy();
-        let len = strat.len();
-        (strat, len)
-    })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?;
-
-    let info = BundleInfo {
-        name: Some(format!("Preflop {stack_depth}BB")),
-        stack_depth,
-        bet_sizes: vec![],
-        info_sets: len,
-        iterations,
-        preflop_only: true,
-        rake_rate: 0.0,
-        rake_cap: 0.0,
-    };
-
-    *state.source.write() = Some(StrategySource::PreflopSolve {
-        config,
-        strategy,
-        hand_avg_values: None,
-    });
-
-    Ok(info)
-}
-
-/// Solve a preflop game live (Tauri wrapper).
-#[tauri::command(rename_all = "snake_case")]
-pub async fn solve_preflop_live(
-    state: State<'_, ExplorationState>,
-    stack_depth: u32,
-    iterations: u64,
-) -> Result<BundleInfo, String> {
-    solve_preflop_live_core(&state, stack_depth, iterations).await
-}
-
-/// Load a blueprint for subgame solving (core logic, no Tauri dependency).
-pub async fn load_subgame_source_core(
-    state: &ExplorationState,
-    blueprint_path: String,
-) -> Result<BundleInfo, String> {
-    let bundle_path = PathBuf::from(&blueprint_path);
-    let bundle = tokio::task::spawn_blocking(move || {
-        poker_solver_core::blueprint::StrategyBundle::load(&bundle_path)
-            .map_err(|e| format!("Failed to load bundle: {e}"))
-    })
-    .await
-    .map_err(|e| format!("Load task panicked: {e}"))??;
-
-    let info = BundleInfo {
-        name: Some("Subgame Solve".to_string()),
-        stack_depth: bundle.config.game.stack_depth,
-        bet_sizes: bundle.config.game.bet_sizes.clone(),
-        info_sets: bundle.blueprint.len(),
-        iterations: bundle.blueprint.iterations_trained(),
-        preflop_only: false,
-        rake_rate: 0.0,
-        rake_cap: 0.0,
-    };
-
-    // Try to load CBV tables from the bundle directory (optional).
-    let bundle_dir = Path::new(&blueprint_path)
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let cbv_p0 = poker_solver_core::blueprint::cbv::CbvTable::load(&bundle_dir.join("cbv_p0.bin"))
-        .ok()
-        .map(Arc::new);
-    let cbv_p1 = poker_solver_core::blueprint::cbv::CbvTable::load(&bundle_dir.join("cbv_p1.bin"))
-        .ok()
-        .map(Arc::new);
-    if cbv_p0.is_some() && cbv_p1.is_some() {
-        eprintln!("[subgame] Loaded CBV tables from {}", bundle_dir.display());
-    } else {
-        eprintln!("[subgame] No CBV tables found in {}; subgame solving will use uniform leaf values", bundle_dir.display());
-    }
-
-    *state.source.write() = Some(StrategySource::SubgameSolve {
-        blueprint: Arc::new(bundle.blueprint),
-        blueprint_config: bundle.config,
-        subgame_config: poker_solver_core::blueprint::SubgameConfig::default(),
-        solve_cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(64).unwrap()))),
-        cbv_p0,
-        cbv_p1,
-    });
-
-    Ok(info)
-}
-
-/// Load a blueprint for subgame solving (Tauri wrapper).
-#[tauri::command(rename_all = "snake_case")]
-pub async fn load_subgame_source(
-    state: State<'_, ExplorationState>,
-    blueprint_path: String,
-) -> Result<BundleInfo, String> {
-    load_subgame_source_core(&state, blueprint_path).await
 }
 
 /// Load a Blueprint V2 bundle from a directory (core logic, no Tauri dependency).
@@ -755,37 +476,16 @@ pub fn blueprint_sizes_to_range_solver(depths: &[Vec<f64>]) -> (String, String) 
 pub fn get_strategy_matrix_core(
     state: &ExplorationState,
     position: ExplorationPosition,
-    threshold: Option<f32>,
-    street_histories: Option<Vec<Vec<String>>>,
+    _threshold: Option<f32>,
+    _street_histories: Option<Vec<Vec<String>>>,
 ) -> Result<StrategyMatrix, String> {
     let source_guard = state.source.read();
     let source = source_guard
         .as_ref()
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
-    let sh = street_histories.unwrap_or_default();
-    let thresh = threshold.unwrap_or(0.0);
-
     match source {
-        StrategySource::Bundle { config, blueprint } => {
-            get_strategy_matrix_bundle(config, blueprint, state, &position, thresh, &sh)
-        }
         StrategySource::Agent(agent) => get_strategy_matrix_agent(agent, &position),
-        StrategySource::PreflopSolve { config, strategy, .. } => {
-            get_strategy_matrix_preflop(config, strategy, &position)
-        }
-        StrategySource::SubgameSolve {
-            blueprint,
-            blueprint_config,
-            ..
-        } => get_strategy_matrix_bundle(
-            blueprint_config,
-            blueprint,
-            state,
-            &position,
-            thresh,
-            &sh,
-        ),
         StrategySource::BlueprintV2 {
             config,
             strategy,
@@ -804,108 +504,6 @@ pub fn get_strategy_matrix(
     street_histories: Option<Vec<Vec<String>>>,
 ) -> Result<StrategyMatrix, String> {
     get_strategy_matrix_core(&state, position, threshold, street_histories)
-}
-
-fn get_strategy_matrix_bundle(
-    config: &BundleConfig,
-    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
-    state: &ExplorationState,
-    position: &ExplorationPosition,
-    threshold: f32,
-    street_histories: &[Vec<String>],
-) -> Result<StrategyMatrix, String> {
-    let board = parse_board(&position.board)?;
-    let street = street_from_board_len(board.len())?;
-    let action_codes = build_action_codes(&position.history);
-    let mode = config.abstraction_mode;
-    let use_hand_class = mode.is_hand_class();
-
-    let ranks = RANKS;
-    let mut cells = Vec::with_capacity(13);
-
-    let pos_state = compute_position_state(&config.game.bet_sizes, position);
-    let actions =
-        get_actions_for_position(config.game.stack_depth, &config.game.bet_sizes, position);
-
-    // For EHS2 mode, use bucket cache; for hand_class mode, use classify() directly
-    let bucket_cache: Option<HashMap<(char, char, bool), u16>> =
-        if !use_hand_class && street != Street::Preflop && !board.is_empty() {
-            let board_key = position.board.join("");
-            let cache = state.bucket_cache.read();
-            cache.get(&board_key).cloned()
-        } else {
-            None
-        };
-
-    // Range filtering: only for hand_class bundles with a positive threshold
-    let apply_filter = use_hand_class && threshold > 0.0;
-
-    for (row, &rank1) in ranks.iter().enumerate() {
-        let mut row_cells = Vec::with_capacity(13);
-        for (col, &rank2) in ranks.iter().enumerate() {
-            let (hand_label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
-
-            let filtered = apply_filter
-                && !is_hand_in_range(
-                    config,
-                    blueprint,
-                    &board,
-                    street_histories,
-                    &position.history,
-                    position.to_act,
-                    threshold,
-                    rank1,
-                    rank2,
-                    suited,
-                );
-
-            let probabilities = if filtered {
-                vec![]
-            } else {
-                let hand_bits = if mode == AbstractionModeConfig::HandClassV2 {
-                    hand_bits_hand_class_v2(config, street, &board, rank1, rank2, suited)
-                } else {
-                    hand_bits_ehs2(street, rank1, rank2, suited, bucket_cache.as_ref())?
-                };
-                lookup_blueprint_strategy(
-                    blueprint,
-                    hand_bits,
-                    street,
-                    &action_codes,
-                    pos_state.pot,
-                    pos_state.eff_stack,
-                    &actions,
-                )?
-            };
-
-            row_cells.push(MatrixCell {
-                hand: hand_label,
-                suited,
-                pair,
-                probabilities,
-                filtered,
-            });
-        }
-        cells.push(row_cells);
-    }
-
-    Ok(StrategyMatrix {
-        cells,
-        actions,
-        street: format!("{street:?}"),
-        pot: pos_state.pot,
-        stack: if position.to_act == 0 {
-            pos_state.stack_p1
-        } else {
-            pos_state.stack_p2
-        },
-        to_call: pos_state.to_call,
-        stack_p1: pos_state.stack_p1,
-        stack_p2: pos_state.stack_p2,
-        stacks: vec![pos_state.stack_p1, pos_state.stack_p2],
-        reaching_p1: vec![],
-        reaching_p2: vec![],
-    })
 }
 
 fn get_strategy_matrix_agent(
@@ -967,279 +565,6 @@ fn get_strategy_matrix_agent(
         reaching_p1: vec![],
         reaching_p2: vec![],
     })
-}
-
-fn get_strategy_matrix_preflop(
-    config: &poker_solver_core::preflop::PreflopConfig,
-    strategy: &poker_solver_core::preflop::PreflopStrategy,
-    position: &ExplorationPosition,
-) -> Result<StrategyMatrix, String> {
-    use poker_solver_core::preflop::{PreflopNode, PreflopTree};
-
-    let tree = PreflopTree::build(config);
-
-    // Walk the tree following the action history, tracking pot/stacks
-    let walk = walk_preflop_tree_with_state(config, &tree, &position.history)?;
-
-    // Get available actions at this node
-    let (action_labels, _children) = match &tree.nodes[walk.node_idx as usize] {
-        PreflopNode::Decision {
-            action_labels,
-            children,
-            ..
-        } => (action_labels.clone(), children.clone()),
-        PreflopNode::Terminal { .. } => {
-            return Err("Position is at a terminal node".to_string());
-        }
-    };
-
-    // Build ActionInfo from preflop action labels (check vs call aware)
-    let actions: Vec<ActionInfo> = action_labels
-        .iter()
-        .enumerate()
-        .map(|(i, a)| preflop_action_info(a, i, walk.to_call))
-        .collect();
-
-    let ranks = RANKS;
-    let mut cells = Vec::with_capacity(13);
-
-    for (row, &rank1) in ranks.iter().enumerate() {
-        let mut row_cells = Vec::with_capacity(13);
-        for (col, &rank2) in ranks.iter().enumerate() {
-            let (hand_label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
-
-            let hand_idx = canonical_hand_index_from_ranks(rank1, rank2, suited);
-            let probs_f64 = strategy.get_probs(walk.node_idx, hand_idx);
-
-            #[allow(clippy::cast_possible_truncation)]
-            let probabilities: Vec<ActionProb> = actions
-                .iter()
-                .zip(probs_f64.iter())
-                .map(|(a, &p)| ActionProb {
-                    action: a.label.clone(),
-                    probability: p as f32,
-                })
-                .collect();
-
-            row_cells.push(MatrixCell {
-                hand: hand_label,
-                suited,
-                pair,
-                probabilities,
-                filtered: false,
-            });
-        }
-        cells.push(row_cells);
-    }
-
-    Ok(StrategyMatrix {
-        cells,
-        actions,
-        street: "Preflop".to_string(),
-        pot: walk.pot,
-        stack: walk.stacks.get(walk.to_act as usize).copied().unwrap_or(0),
-        to_call: walk.to_call,
-        stack_p1: walk.stacks.first().copied().unwrap_or(0),
-        stack_p2: walk.stacks.get(1).copied().unwrap_or(0),
-        stacks: walk.stacks,
-        reaching_p1: vec![],
-        reaching_p2: vec![],
-    })
-}
-
-/// Result of walking the preflop tree with full state tracking.
-struct PreflopWalkState {
-    node_idx: u32,
-    pot: u32,
-    stacks: Vec<u32>,
-    to_call: u32,
-    to_act: u8,
-}
-
-/// Walk the preflop tree following an action history, tracking pot/stacks/to_call.
-///
-/// Mirrors the `BuildState` transitions from tree construction so that
-/// pot, stacks, and to_call are accurate at each decision point.
-fn walk_preflop_tree_with_state(
-    config: &poker_solver_core::preflop::PreflopConfig,
-    tree: &poker_solver_core::preflop::PreflopTree,
-    history: &[String],
-) -> Result<PreflopWalkState, String> {
-    use poker_solver_core::preflop::{PreflopAction, PreflopNode};
-
-    let num_players = config.num_players() as usize;
-    let mut invested = vec![0u32; num_players];
-    let mut stacks = config.stacks.clone();
-
-    // Post blinds
-    for &(pos, amount) in &config.blinds {
-        let actual = amount.min(stacks[pos]);
-        invested[pos] = actual;
-        stacks[pos] -= actual;
-    }
-    // Post antes
-    for &(pos, amount) in &config.antes {
-        let actual = amount.min(stacks[pos]);
-        invested[pos] += actual;
-        stacks[pos] -= actual;
-    }
-
-    let mut current_bet = invested.iter().copied().max().unwrap_or(0);
-    let mut node_idx = 0u32;
-
-    for action_str in history {
-        let node = &tree.nodes[node_idx as usize];
-        let (action_labels, children, position) = match node {
-            PreflopNode::Decision {
-                action_labels,
-                children,
-                position,
-            } => (action_labels, children, *position),
-            PreflopNode::Terminal { .. } => {
-                return Err(format!(
-                    "Reached terminal before processing action '{action_str}'"
-                ));
-            }
-        };
-
-        let child_pos = find_action_position(action_str, action_labels)
-            .ok_or_else(|| {
-                format!(
-                    "Action '{action_str}' not available at node {node_idx}. \
-                     Available: {action_labels:?}"
-                )
-            })?;
-
-        let tree_action = &action_labels[child_pos];
-        let p = position as usize;
-        let to_call = current_bet.saturating_sub(invested[p]);
-
-        match tree_action {
-            PreflopAction::Fold => {}
-            PreflopAction::Call => {
-                let actual = to_call.min(stacks[p]);
-                invested[p] += actual;
-                stacks[p] -= actual;
-            }
-            PreflopAction::Raise(size) => {
-                let pot: u32 = invested.iter().sum();
-                let to_call = current_bet.saturating_sub(invested[p]);
-                let new_bet = size.resolve(current_bet, pot, to_call);
-                let total = new_bet.saturating_sub(invested[p]);
-                let actual = total.min(stacks[p]);
-                invested[p] += actual;
-                stacks[p] -= actual;
-                current_bet = invested[p];
-            }
-            PreflopAction::AllIn => {
-                let all_chips = stacks[p];
-                invested[p] += all_chips;
-                stacks[p] = 0;
-                if invested[p] > current_bet {
-                    current_bet = invested[p];
-                }
-            }
-        }
-
-        node_idx = children[child_pos];
-    }
-
-    // Determine to_act and to_call at the current node
-    let (to_act, to_call) = match &tree.nodes[node_idx as usize] {
-        PreflopNode::Decision { position, .. } => {
-            let tc = current_bet.saturating_sub(invested[*position as usize]);
-            (*position, tc)
-        }
-        PreflopNode::Terminal { .. } => (0, 0),
-    };
-
-    let pot: u32 = invested.iter().sum();
-
-    Ok(PreflopWalkState {
-        node_idx,
-        pot,
-        stacks,
-        to_call,
-        to_act,
-    })
-}
-
-/// Find the position of a history action string within the node's action labels.
-///
-/// For raise actions with `r:{idx}` format, uses the index directly to select
-/// the correct raise among multiple raise sizes at the same node.
-fn find_action_position(
-    action_str: &str,
-    action_labels: &[poker_solver_core::preflop::PreflopAction],
-) -> Option<usize> {
-    use poker_solver_core::preflop::PreflopAction;
-
-    if action_str == "f" || action_str == "fold" {
-        return action_labels.iter().position(|a| matches!(a, PreflopAction::Fold));
-    }
-    if action_str == "c" || action_str == "call" || action_str == "x" || action_str == "check" {
-        return action_labels.iter().position(|a| matches!(a, PreflopAction::Call));
-    }
-
-    // Extract the suffix after the first ':'
-    let suffix = action_str.split(':').nth(1).unwrap_or("");
-
-    if suffix == "A" {
-        // All-in
-        return action_labels.iter().position(|a| matches!(a, PreflopAction::AllIn));
-    }
-
-    // Raise with index — r:{idx} where idx is the position in the action_labels array
-    if let Ok(idx) = suffix.parse::<usize>() {
-        if idx < action_labels.len() && matches!(action_labels[idx], PreflopAction::Raise(_)) {
-            return Some(idx);
-        }
-    }
-
-    None
-}
-
-/// Build an `ActionInfo` from a preflop tree action.
-///
-/// `to_call` distinguishes check (0) from call (>0) for `PreflopAction::Call`.
-fn preflop_action_info(
-    action: &poker_solver_core::preflop::PreflopAction,
-    idx: usize,
-    to_call: u32,
-) -> ActionInfo {
-    use poker_solver_core::preflop::PreflopAction;
-    match action {
-        PreflopAction::Fold => ActionInfo {
-            id: "fold".to_string(),
-            label: "Fold".to_string(),
-            action_type: "fold".to_string(),
-            size_key: None,
-        },
-        PreflopAction::Call if to_call == 0 => ActionInfo {
-            id: "check".to_string(),
-            label: "Check".to_string(),
-            action_type: "check".to_string(),
-            size_key: None,
-        },
-        PreflopAction::Call => ActionInfo {
-            id: "call".to_string(),
-            label: format!("Call {to_call}"),
-            action_type: "call".to_string(),
-            size_key: None,
-        },
-        PreflopAction::Raise(size) => ActionInfo {
-            id: format!("r:{idx}"),
-            label: format!("Raise {size}"),
-            action_type: "raise".to_string(),
-            size_key: Some(format!("{size}")),
-        },
-        PreflopAction::AllIn => ActionInfo {
-            id: "r:A".to_string(),
-            label: "All-in".to_string(),
-            action_type: "allin".to_string(),
-            size_key: Some("allin".to_string()),
-        },
-    }
 }
 
 // ── Blueprint V2 helpers ─────────────────────────────────────────────
@@ -1498,10 +823,10 @@ fn get_strategy_matrix_v2(
     // Determine the street from the node.
     let street_name = match &tree.nodes[walk.node_idx as usize] {
         V2GameNode::Decision { street, .. } => match street {
-            poker_solver_core::blueprint_v2::Street::Preflop => "Preflop",
-            poker_solver_core::blueprint_v2::Street::Flop => "Flop",
-            poker_solver_core::blueprint_v2::Street::Turn => "Turn",
-            poker_solver_core::blueprint_v2::Street::River => "River",
+            Street::Preflop => "Preflop",
+            Street::Flop => "Flop",
+            Street::Turn => "Turn",
+            Street::River => "River",
         },
         _ => "Unknown",
     };
@@ -1604,26 +929,15 @@ pub fn get_available_actions_core(
         .as_ref()
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
-    // BlueprintV2 derives actions from the game tree rather than bet sizes.
-    if let StrategySource::BlueprintV2 { tree, .. } = source {
-        let walk = walk_v2_tree(tree, &position.history)?;
-        return Ok(v2_actions_at_node(tree, walk.node_idx));
+    match source {
+        StrategySource::BlueprintV2 { tree, .. } => {
+            let walk = walk_v2_tree(tree, &position.history)?;
+            Ok(v2_actions_at_node(tree, walk.node_idx))
+        }
+        StrategySource::Agent(agent) => {
+            Ok(get_actions_for_position(agent.game.stack_depth, &agent.game.bet_sizes, &position))
+        }
     }
-
-    let (stack_depth, bet_sizes) = match source {
-        StrategySource::Bundle { config, .. } | StrategySource::SubgameSolve { blueprint_config: config, .. } => {
-            (config.game.stack_depth, config.game.bet_sizes.as_slice())
-        }
-        StrategySource::Agent(agent) => (agent.game.stack_depth, agent.game.bet_sizes.as_slice()),
-        StrategySource::PreflopSolve { config, .. } => {
-            let depth = config.stacks.first().copied().unwrap_or(0) / 2;
-            // Preflop uses tree-based actions, return empty bet_sizes
-            (depth, [].as_slice())
-        }
-        StrategySource::BlueprintV2 { .. } => unreachable!(),
-    };
-
-    Ok(get_actions_for_position(stack_depth, bet_sizes, &position))
 }
 
 /// Get available actions at the current position (Tauri wrapper).
@@ -1654,46 +968,12 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
     Ok(match source {
-        StrategySource::Bundle { config, blueprint } => BundleInfo {
-            name: Some("Trained Bundle".to_string()),
-            stack_depth: config.game.stack_depth,
-            bet_sizes: config.game.bet_sizes.clone(),
-            info_sets: blueprint.len(),
-            iterations: blueprint.iterations_trained(),
-            preflop_only: false,
-            rake_rate: 0.0,
-            rake_cap: 0.0,
-        },
         StrategySource::Agent(agent) => BundleInfo {
             name: agent.game.name.clone(),
             stack_depth: agent.game.stack_depth,
             bet_sizes: agent.game.bet_sizes.clone(),
             info_sets: 0,
             iterations: 0,
-            preflop_only: false,
-            rake_rate: 0.0,
-            rake_cap: 0.0,
-        },
-        StrategySource::PreflopSolve { config, strategy, .. } => BundleInfo {
-            name: Some("Preflop Solve".to_string()),
-            stack_depth: config.stacks.first().copied().unwrap_or(0) / 2,
-            bet_sizes: vec![],
-            info_sets: strategy.len(),
-            iterations: 0,
-            preflop_only: true,
-            rake_rate: 0.0,
-            rake_cap: 0.0,
-        },
-        StrategySource::SubgameSolve {
-            blueprint,
-            blueprint_config,
-            ..
-        } => BundleInfo {
-            name: Some("Subgame Solve".to_string()),
-            stack_depth: blueprint_config.game.stack_depth,
-            bet_sizes: blueprint_config.game.bet_sizes.clone(),
-            info_sets: blueprint.len(),
-            iterations: blueprint.iterations_trained(),
             preflop_only: false,
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -1752,63 +1032,14 @@ pub struct HandEquity {
 /// Returns pot-fraction EV (where 1.0 = the initial postflop pot) averaged
 /// uniformly across all 169 opponent hands. Returns `None` if no
 /// postflop data is loaded or the hand string is unrecognised.
-#[allow(clippy::erasing_op, clippy::identity_op)]
 pub fn get_hand_equity_core(
-    state: &ExplorationState,
-    hand: &str,
-    villain_hand: Option<&str>,
+    _state: &ExplorationState,
+    _hand: &str,
+    _villain_hand: Option<&str>,
 ) -> Result<Option<HandEquity>, String> {
-    let hand_index = match canonical_hand_index_from_str(hand) {
-        Some(idx) => idx as usize,
-        None => return Ok(None),
-    };
-
-    let source_guard = state.source.read();
-    let source = source_guard
-        .as_ref()
-        .ok_or_else(|| "No bundle loaded".to_string())?;
-
-    let hand_avg = match source {
-        StrategySource::PreflopSolve { hand_avg_values: Some(v), .. } => v,
-        _ => return Ok(None),
-    };
-
-    // Table layout: [pos0: N×N, pos1: N×N]
-    let half = hand_avg.len() / 2;
-    if half == 0 {
-        return Ok(None);
-    }
-    let n = (half as f64).sqrt() as usize;
-    if n == 0 || n * n != half || hand_index >= n {
-        return Ok(None);
-    }
-
-    // Average EV (pot fractions) across all opponent hands for each position.
-    let avg_for_pos = |pos: usize| -> f64 {
-        let base = pos * n * n + hand_index * n;
-        let slice = &hand_avg[base..base + n];
-        let sum: f64 = slice.iter().sum();
-        sum / n as f64
-    };
-
-    let ev_pos0 = avg_for_pos(0);
-    let ev_pos1 = avg_for_pos(1);
-    let ev_avg = (ev_pos0 + ev_pos1) / 2.0;
-
-    let ev_vs_hand = villain_hand.and_then(|vh| {
-        let v_idx = canonical_hand_index_from_str(vh)? as usize;
-        if v_idx >= n { return None; }
-        let vp0 = hand_avg[0 * n * n + hand_index * n + v_idx];
-        let vp1 = hand_avg[1 * n * n + hand_index * n + v_idx];
-        Some(MatchupEquity {
-            villain_hand: vh.to_string(),
-            ev_pos0: vp0,
-            ev_pos1: vp1,
-            ev_avg: (vp0 + vp1) / 2.0,
-        })
-    });
-
-    Ok(Some(HandEquity { ev_pos0, ev_pos1, ev_avg, ev_vs_hand }))
+    // Hand equity data was only available from the old PreflopSolve source.
+    // Neither Agent nor BlueprintV2 sources carry per-hand EV tables.
+    Ok(None)
 }
 
 /// Get postflop equity for a canonical hand (Tauri wrapper).
@@ -1852,138 +1083,13 @@ pub fn get_computation_status(state: State<'_, ExplorationState>) -> Computation
 /// For bundles, computation happens in background.
 /// An optional `on_progress` callback receives `(completed, total, board_key)`.
 pub fn start_bucket_computation_core(
-    state: &ExplorationState,
+    _state: &ExplorationState,
     board: Vec<String>,
-    on_progress: Option<ProgressCallback>,
+    _on_progress: Option<ProgressCallback>,
 ) -> Result<String, String> {
-    let board_key = board.join("");
-
-    // Agents, hand_class bundles, preflop solves, and subgame solves don't need bucket computation
-    {
-        let source_guard = state.source.read();
-        match source_guard.as_ref() {
-            Some(
-                StrategySource::Agent(_)
-                | StrategySource::PreflopSolve { .. }
-                | StrategySource::BlueprintV2 { .. },
-            ) => {
-                return Ok(board_key);
-            }
-            Some(StrategySource::Bundle { config, .. })
-                if config.abstraction_mode.is_hand_class() =>
-            {
-                return Ok(board_key);
-            }
-            Some(StrategySource::SubgameSolve { blueprint_config, .. })
-                if blueprint_config.abstraction_mode.is_hand_class() =>
-            {
-                return Ok(board_key);
-            }
-            _ => {}
-        }
-    }
-
-    // Parse board
-    let board_cards = parse_board(&board)?;
-
-    // Check if already cached
-    {
-        let cache = state.bucket_cache.read();
-        if cache.contains_key(&board_key) {
-            return Ok(board_key);
-        }
-    }
-
-    // Check if already computing
-    if state.computing.load(Ordering::SeqCst) {
-        let current_key = state.computing_board_key.read();
-        if current_key.as_ref() == Some(&board_key) {
-            // Already computing this board
-            return Ok(board_key);
-        }
-        // Different board - stop current computation
-        state.computing.store(false, Ordering::SeqCst);
-    }
-
-    // Start computation
-    state.computing.store(true, Ordering::SeqCst);
-    state.computation_progress.store(0, Ordering::SeqCst);
-    state.computation_total.store(169, Ordering::SeqCst); // 169 hand combos
-    *state.computing_board_key.write() = Some(board_key.clone());
-
-    // Get abstraction boundaries for thread
-    let boundaries_guard = state.abstraction_boundaries.read();
-    let boundaries = boundaries_guard
-        .as_ref()
-        .ok_or_else(|| "No bundle loaded".to_string())?
-        .clone();
-    drop(boundaries_guard);
-
-    let abstraction = CardAbstraction::from_boundaries(boundaries);
-
-    // Clone Arc references for the thread
-    let computing = Arc::clone(&state.computing);
-    let progress = Arc::clone(&state.computation_progress);
-    let bucket_cache = Arc::clone(&state.bucket_cache);
-    let computing_board_key = Arc::clone(&state.computing_board_key);
-    let board_key_clone = board_key.clone();
-
-    // Spawn background thread
-    std::thread::spawn(move || {
-        let ranks = [
-            'A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2',
-        ];
-        let mut completed = 0;
-        let mut local_cache: HashMap<(char, char, bool), u16> = HashMap::new();
-
-        for &rank1 in &ranks {
-            for &rank2 in &ranks {
-                for suited in [true, false] {
-                    // Check if cancelled
-                    if !computing.load(Ordering::SeqCst) {
-                        return;
-                    }
-
-                    // Skip invalid combos (pairs can't be suited)
-                    if rank1 == rank2 && suited {
-                        continue;
-                    }
-
-                    // Compute bucket
-                    let (card1, card2) =
-                        make_representative_hand(rank1, rank2, suited, &board_cards);
-                    if let Ok(bucket) = abstraction.get_bucket(&board_cards, (card1, card2)) {
-                        local_cache.insert((rank1, rank2, suited), bucket);
-                    }
-
-                    completed += 1;
-                    progress.store(completed, Ordering::SeqCst);
-
-                    // Emit progress event every 10 hands
-                    if completed % 10 == 0 {
-                        if let Some(ref cb) = on_progress {
-                            cb(completed, 169, &board_key_clone);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Store in global cache
-        bucket_cache
-            .write()
-            .insert(board_key_clone.clone(), local_cache);
-
-        // Computation complete - emit final event
-        if let Some(ref cb) = on_progress {
-            cb(169, 169, &board_key_clone);
-        }
-
-        computing.store(false, Ordering::SeqCst);
-        *computing_board_key.write() = None;
-    });
-
-    Ok(board_key)
+    // Bucket computation was only needed for old EHS2 bundles.
+    // Agent and BlueprintV2 sources do not require it.
+    Ok(board.join(""))
 }
 
 /// Start async bucket computation for a board (Tauri wrapper).
@@ -2220,121 +1326,13 @@ pub struct ComboGroupInfo {
 ///
 /// Only meaningful for hand_class bundles on postflop streets.
 pub fn get_combo_classes_core(
-    state: &ExplorationState,
-    position: ExplorationPosition,
+    _state: &ExplorationState,
+    _position: ExplorationPosition,
     hand: String,
 ) -> Result<ComboGroupInfo, String> {
-    let source_guard = state.source.read();
-    let source = source_guard
-        .as_ref()
-        .ok_or_else(|| "No bundle loaded".to_string())?;
-
-    let (config, blueprint) = match source {
-        StrategySource::Bundle { config, blueprint } => (config, blueprint),
-        StrategySource::SubgameSolve {
-            blueprint_config,
-            blueprint,
-            ..
-        } => (blueprint_config, blueprint.as_ref()),
-        StrategySource::Agent(_)
-        | StrategySource::PreflopSolve { .. }
-        | StrategySource::BlueprintV2 { .. } => {
-            return Ok(empty_combo_info(&hand));
-        }
-    };
-
-    if !config.abstraction_mode.is_hand_class() {
-        return Ok(empty_combo_info(&hand));
-    }
-
-    let board = parse_board(&position.board)?;
-    let street = street_from_board_len(board.len())?;
-
-    if street == Street::Preflop {
-        return Ok(empty_combo_info(&hand));
-    }
-
-    let (rank1, rank2, suited) = parse_hand_label(&hand)?;
-    let max_combos = max_combo_count(rank1, rank2, suited);
-    let combos = enumerate_combos(rank1, rank2, suited, &board);
-    let blocked_combos = max_combos - combos.len();
-
-    let action_codes = build_action_codes(&position.history);
-    let pos_state = compute_position_state(&config.game.bet_sizes, &position);
-    let street_num = street_to_num(street);
-    let spr = spr_bucket(pos_state.pot, pos_state.eff_stack);
-
-    // Group combos by hand bits (v2 encoding: class_id + strength + equity + draw flags)
-    let mut groups_map: std::collections::BTreeMap<u32, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for combo in &combos {
-        let bits = match classify(*combo, &board) {
-            Ok(classification) => {
-                let made_id = classification.strongest_made_id();
-                let strength = if HandClass::is_made_hand_id(made_id) {
-                    intra_class_strength(
-                        *combo,
-                        &board,
-                        HandClass::ALL[made_id as usize],
-                    )
-                } else {
-                    1
-                };
-                let equity = showdown_equity::compute_equity(*combo, &board);
-                let eq_bin = showdown_equity::equity_bin(
-                    equity,
-                    1u8 << config.equity_bits,
-                );
-                encode_hand_v2(
-                    made_id,
-                    strength,
-                    eq_bin,
-                    classification.draw_flags(),
-                    config.strength_bits,
-                    config.equity_bits,
-                )
-            }
-            Err(_) => 0,
-        };
-        groups_map
-            .entry(bits)
-            .or_default()
-            .push(format_combo(*combo));
-    }
-
-    // Build ComboGroups with blueprint lookup
-    let groups: Vec<ComboGroup> = groups_map
-        .into_iter()
-        .map(|(bits, combo_strs)| {
-            let key = InfoKey::new(
-                bits,
-                street_num,
-                spr,
-                &action_codes,
-            )
-            .as_u64();
-            let strategy = blueprint
-                .lookup(key)
-                .map(|s| s.to_vec())
-                .unwrap_or_default();
-            let class_names = decode_v2_class_names(bits);
-            ComboGroup {
-                bits,
-                class_names,
-                combos: combo_strs,
-                strategy,
-            }
-        })
-        .collect();
-
-    Ok(ComboGroupInfo {
-        hand,
-        groups,
-        total_combos: combos.len(),
-        blocked_combos,
-        street: format!("{street:?}"),
-        spr_bucket: spr,
-    })
+    // Combo-level classification was only supported by old Bundle/SubgameSolve
+    // sources with BundleConfig. Agent and BlueprintV2 do not support it.
+    Ok(empty_combo_info(&hand))
 }
 
 /// Get combo-level classification breakdown (Tauri wrapper).
@@ -2358,129 +1356,6 @@ fn empty_combo_info(hand: &str) -> ComboGroupInfo {
     }
 }
 
-/// Parse a hand label like "AKs", "QQ", "T9o" into (rank1, rank2, suited).
-fn parse_hand_label(label: &str) -> Result<(char, char, bool), String> {
-    let chars: Vec<char> = label.chars().collect();
-    if chars.len() < 2 {
-        return Err(format!("Invalid hand label: {label}"));
-    }
-    let rank1 = chars[0];
-    let rank2 = chars[1];
-    let suited = chars.get(2) == Some(&'s');
-    Ok((rank1, rank2, suited))
-}
-
-/// Maximum number of combos for a canonical hand type.
-fn max_combo_count(rank1: char, rank2: char, suited: bool) -> usize {
-    if rank1 == rank2 {
-        6 // pairs: C(4,2)
-    } else if suited {
-        4 // suited: 4 suits
-    } else {
-        12 // offsuit: 4×3
-    }
-}
-
-/// Enumerate all specific combos of a canonical hand, excluding board-blocked cards.
-fn enumerate_combos(rank1: char, rank2: char, suited: bool, board: &[Card]) -> Vec<[Card; 2]> {
-    let v1 = char_to_value(rank1);
-    let v2 = char_to_value(rank2);
-    let suits = [Suit::Spade, Suit::Heart, Suit::Diamond, Suit::Club];
-    let board_set: std::collections::HashSet<Card> = board.iter().copied().collect();
-
-    let mut combos = Vec::new();
-
-    if rank1 == rank2 {
-        // Pairs: all suit pairs where s1 < s2
-        for (i, &s1) in suits.iter().enumerate() {
-            let c1 = Card::new(v1, s1);
-            if board_set.contains(&c1) {
-                continue;
-            }
-            for &s2 in &suits[i + 1..] {
-                let c2 = Card::new(v2, s2);
-                if !board_set.contains(&c2) {
-                    combos.push([c1, c2]);
-                }
-            }
-        }
-    } else if suited {
-        // Suited: same suit for both cards
-        for &s in &suits {
-            let c1 = Card::new(v1, s);
-            let c2 = Card::new(v2, s);
-            if !board_set.contains(&c1) && !board_set.contains(&c2) {
-                combos.push([c1, c2]);
-            }
-        }
-    } else {
-        // Offsuit: different suits
-        for &s1 in &suits {
-            let c1 = Card::new(v1, s1);
-            if board_set.contains(&c1) {
-                continue;
-            }
-            for &s2 in &suits {
-                if s1 == s2 {
-                    continue;
-                }
-                let c2 = Card::new(v2, s2);
-                if !board_set.contains(&c2) {
-                    combos.push([c1, c2]);
-                }
-            }
-        }
-    }
-
-    combos
-}
-
-/// Decode v2 packed bits into human-readable class names.
-///
-/// v2 layout: class_id(5) | strength(4) | equity(4) | draw_flags(NUM_DRAWS) | spare
-fn decode_v2_class_names(bits: u32) -> Vec<String> {
-    let class_id = (bits >> 23) & 0x1F;
-    let draw_mask = (1u32 << HandClass::NUM_DRAWS) - 1;
-    let draw_flags = (bits >> 8) & draw_mask;
-
-    let mut names = Vec::new();
-
-    // Made hand class
-    if HandClass::is_made_hand_id(class_id as u8) {
-        if let Some(class) = HandClass::from_discriminant(class_id as u8) {
-            names.push(class.to_string());
-        }
-    }
-
-    // Draw classes (mapped from draw_flags)
-    for i in 0u8..(HandClass::NUM_DRAWS as u8) {
-        if draw_flags & (1 << i) != 0 {
-            if let Some(class) = HandClass::from_discriminant(HandClass::DRAW_ONLY_ID + i) {
-                names.push(class.to_string());
-            }
-        }
-    }
-
-    names
-}
-
-/// Format a card as a unicode string (e.g. "A♠").
-fn format_card(card: Card) -> String {
-    let rank = value_to_char(card.value);
-    let suit = match card.suit {
-        Suit::Spade => '♠',
-        Suit::Heart => '♥',
-        Suit::Diamond => '♦',
-        Suit::Club => '♣',
-    };
-    format!("{rank}{suit}")
-}
-
-/// Format a two-card combo (e.g. "A♠K♠").
-fn format_combo(cards: [Card; 2]) -> String {
-    format!("{}{}", format_card(cards[0]), format_card(cards[1]))
-}
-
 /// Convert a Value back to its rank character.
 fn value_to_char(v: Value) -> char {
     match v {
@@ -2498,226 +1373,6 @@ fn value_to_char(v: Value) -> char {
         Value::Three => '3',
         Value::Two => '2',
     }
-}
-
-// ============================================================================
-// Range filtering
-// ============================================================================
-
-/// Check if a hand would be in the viewing player's range at the current position.
-///
-/// Replays the full game history (completed streets + current street) and
-/// checks that at each prior decision point of the viewing player, the action
-/// taken had at least `threshold` probability in the blueprint.
-#[allow(clippy::too_many_arguments)]
-fn is_hand_in_range(
-    config: &BundleConfig,
-    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
-    full_board: &[Card],
-    street_histories: &[Vec<String>],
-    current_history: &[String],
-    viewing_player: u8,
-    threshold: f32,
-    rank1: char,
-    rank2: char,
-    suited: bool,
-) -> bool {
-    let bet_sizes = &config.game.bet_sizes;
-    let mut stacks = [
-        config.game.stack_depth * 2 - 1,
-        config.game.stack_depth * 2 - 2,
-    ];
-    let mut pot = 3u32;
-
-    // Process completed streets, then the current street
-    let all_streets: Vec<&[String]> = street_histories
-        .iter()
-        .map(|v| v.as_slice())
-        .chain(std::iter::once(current_history))
-        .collect();
-
-    for (street_idx, street_actions) in all_streets.iter().enumerate() {
-        let board_for_street = board_at_street(full_board, street_idx);
-        let mut to_call = initial_to_call(street_idx, &stacks);
-        let mut action_codes: Vec<u8> = Vec::new();
-
-        for (i, action) in street_actions.iter().enumerate() {
-            let acting_player = (i % 2) as u8;
-
-            if acting_player == viewing_player
-                && !action_meets_threshold(
-                    blueprint,
-                    config,
-                    board_for_street,
-                    street_idx,
-                    &action_codes,
-                    pot,
-                    &stacks,
-                    to_call,
-                    action,
-                    threshold,
-                    rank1,
-                    rank2,
-                    suited,
-                )
-            {
-                return false;
-            }
-
-            action_codes.push(action_to_code(action));
-            apply_action(action, i % 2, &mut stacks, &mut pot, &mut to_call, bet_sizes);
-        }
-    }
-
-    true
-}
-
-/// Board cards visible during a given street.
-fn board_at_street(full_board: &[Card], street_idx: usize) -> &[Card] {
-    let n = match street_idx {
-        0 => 0,
-        1 => 3,
-        2 => 4,
-        3 => 5,
-        _ => 0,
-    };
-    &full_board[..n.min(full_board.len())]
-}
-
-/// Initial to-call amount at the start of a street.
-fn initial_to_call(street_idx: usize, stacks: &[u32; 2]) -> u32 {
-    if street_idx == 0 {
-        stacks[0].saturating_sub(stacks[1])
-    } else {
-        0
-    }
-}
-
-/// Check whether a single action's blueprint probability meets the threshold.
-#[allow(clippy::too_many_arguments)]
-fn action_meets_threshold(
-    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
-    config: &BundleConfig,
-    board: &[Card],
-    street_idx: usize,
-    action_codes: &[u8],
-    pot: u32,
-    stacks: &[u32; 2],
-    to_call: u32,
-    action: &str,
-    threshold: f32,
-    rank1: char,
-    rank2: char,
-    suited: bool,
-) -> bool {
-    let hand_bits = hand_bits_at_street(config, rank1, rank2, suited, board, street_idx);
-    let street_num = street_idx.min(3) as u8;
-    let eff_stack = stacks[0].min(stacks[1]);
-    let key = InfoKey::new(hand_bits, street_num, spr_bucket(pot, eff_stack), action_codes).as_u64();
-
-    let strategy = match blueprint.lookup(key) {
-        Some(s) => s,
-        None => return true, // no data → assume in range
-    };
-
-    let code = action_to_code(action);
-    let idx = action_code_to_strategy_index(code, to_call, config.game.bet_sizes.len());
-
-    match idx.and_then(|i| strategy.get(i)) {
-        Some(&prob) => prob >= threshold,
-        None => true,
-    }
-}
-
-/// Compute hand bits for a street (preflop uses canonical rank index,
-/// postflop uses hand-class or hand-class-v2 classification).
-fn hand_bits_at_street(
-    config: &BundleConfig,
-    rank1: char,
-    rank2: char,
-    suited: bool,
-    board: &[Card],
-    street_idx: usize,
-) -> u32 {
-    if street_idx == 0 {
-        return hand_bits_from_ranks(rank1, rank2, suited);
-    }
-    let (c1, c2) = make_representative_hand(rank1, rank2, suited, board);
-    let classification = match classify([c1, c2], board) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    if config.abstraction_mode == AbstractionModeConfig::HandClassV2 {
-        let made_id = classification.strongest_made_id();
-        let strength = if HandClass::is_made_hand_id(made_id) {
-            intra_class_strength([c1, c2], board, HandClass::ALL[made_id as usize])
-        } else {
-            1
-        };
-        let equity = showdown_equity::compute_equity([c1, c2], board);
-        let eq_bin = showdown_equity::equity_bin(equity, 1u8 << config.equity_bits);
-        encode_hand_v2(
-            made_id,
-            strength,
-            eq_bin,
-            classification.draw_flags(),
-            config.strength_bits,
-            config.equity_bits,
-        )
-    } else {
-        classification.bits()
-    }
-}
-
-/// Map an action code to its index in the strategy probability vector.
-fn action_code_to_strategy_index(code: u8, to_call: u32, num_bet_sizes: usize) -> Option<usize> {
-    match code {
-        1 => {
-            // fold — only valid when facing a bet
-            if to_call > 0 { Some(0) } else { None }
-        }
-        2 => Some(if to_call > 0 { 1 } else { 0 }), // check
-        3 => {
-            // call
-            if to_call > 0 { Some(1) } else { None }
-        }
-        4..=8 => Some(1 + (code - 4) as usize),                 // bet:idx (to_call == 0)
-        9..=13 => Some(2 + (code - 9) as usize),               // raise:idx (to_call > 0)
-        14 => Some(1 + num_bet_sizes),                          // bet all-in
-        15 => Some(2 + num_bet_sizes),                          // raise all-in
-        _ => None,
-    }
-}
-
-/// Update game state after one action (shared by replay and range filter).
-fn apply_action(
-    action: &str,
-    player: usize,
-    stacks: &mut [u32; 2],
-    pot: &mut u32,
-    to_call: &mut u32,
-    bet_sizes: &[f32],
-) {
-    if action == "c" || action == "call" {
-        let amt = (*to_call).min(stacks[player]);
-        stacks[player] -= amt;
-        *pot += amt;
-        *to_call = 0;
-    } else if let Some(idx_str) = action
-        .strip_prefix("bet:")
-        .or_else(|| action.strip_prefix("raise:"))
-        .or_else(|| action.strip_prefix("b:"))
-        .or_else(|| action.strip_prefix("r:"))
-    {
-        let effective = stacks[player].saturating_sub(*to_call);
-        let bet_portion = resolve_bet_index(idx_str, bet_sizes, *pot, effective);
-        let total = *to_call + bet_portion;
-        let actual = total.min(stacks[player]);
-        stacks[player] -= actual;
-        *pot += actual;
-        *to_call = actual.saturating_sub(*to_call);
-    }
-    // fold, check: no state change
 }
 
 // ============================================================================
@@ -2769,48 +1424,6 @@ fn street_from_board_len(len: usize) -> Result<Street, String> {
         4 => Ok(Street::Turn),
         5 => Ok(Street::River),
         n => Err(format!("Invalid board length: {n}")),
-    }
-}
-
-/// Convert history action strings to 4-bit action codes for `InfoKey`.
-fn build_action_codes(history: &[String]) -> Vec<u8> {
-    history.iter().map(|a| action_to_code(a)).collect()
-}
-
-/// Convert a history action string to a 4-bit action code.
-///
-/// Matches `encode_action` from `info_key`:
-/// 1=fold, 2=check, 3=call, 4-8=bet idx 0-4, 9-13=raise idx 0-4,
-/// 14=bet all-in, 15=raise all-in.
-fn action_to_code(action: &str) -> u8 {
-    if action == "f" || action == "fold" {
-        1
-    } else if action == "x" || action == "check" {
-        2
-    } else if action == "c" || action == "call" {
-        3
-    } else if let Some(idx_str) = action
-        .strip_prefix("bet:")
-        .or_else(|| action.strip_prefix("b:"))
-    {
-        if idx_str == "A" {
-            14 // bet all-in
-        } else {
-            let idx: u8 = idx_str.parse().unwrap_or(0);
-            4 + idx.min(4) // bet(idx)
-        }
-    } else if let Some(idx_str) = action
-        .strip_prefix("raise:")
-        .or_else(|| action.strip_prefix("r:"))
-    {
-        if idx_str == "A" {
-            15 // raise all-in
-        } else {
-            let idx: u8 = idx_str.parse().unwrap_or(0);
-            9 + idx.min(4) // raise(idx)
-        }
-    } else {
-        0 // unknown → empty
     }
 }
 
@@ -2899,7 +1512,6 @@ fn bet_size_key(fraction: f32) -> String {
 struct PositionState {
     to_call: u32,
     pot: u32,
-    eff_stack: u32,
     stack_p1: u32,
     stack_p2: u32,
 }
@@ -2951,7 +1563,6 @@ fn compute_position_state(bet_sizes: &[f32], position: &ExplorationPosition) -> 
     PositionState {
         to_call,
         pot,
-        eff_stack: stacks[0].min(stacks[1]),
         stack_p1: stacks[0],
         stack_p2: stacks[1],
     }
@@ -2974,127 +1585,6 @@ fn resolve_bet_index(idx_str: &str, bet_sizes: &[f32], pot: u32, effective_stack
     }
     // Fallback: try parsing as raw cent amount (backwards compat)
     idx_str.parse::<u32>().unwrap_or(0)
-}
-
-/// Look up blueprint strategy for a hand, given precomputed hand bits.
-///
-/// Shared implementation for all abstraction modes. Each mode computes
-/// `hand_bits` differently, but the InfoKey construction, blueprint lookup,
-/// and ActionProb mapping are identical.
-fn lookup_blueprint_strategy(
-    blueprint: &poker_solver_core::blueprint::BlueprintStrategy,
-    hand_bits: u32,
-    street: Street,
-    action_codes: &[u8],
-    pot: u32,
-    eff_stack: u32,
-    actions: &[ActionInfo],
-) -> Result<Vec<ActionProb>, String> {
-    let street_num = street_to_num(street);
-    let spr = spr_bucket(pot, eff_stack);
-
-    let info_set_key =
-        InfoKey::new(hand_bits, street_num, spr, action_codes).as_u64();
-
-    let probs = blueprint.lookup(info_set_key).ok_or_else(|| {
-        format!(
-            "Blueprint lookup failed for key {info_set_key:#018x} \
-             (blueprint has {} info sets)",
-            blueprint.len()
-        )
-    })?;
-
-    Ok(actions
-        .iter()
-        .enumerate()
-        .map(|(i, a)| ActionProb {
-            action: a.label.clone(),
-            probability: probs.get(i).copied().unwrap_or(0.0),
-        })
-        .collect())
-}
-
-/// Compute hand bits for EHS2 mode (requires precomputed bucket cache).
-fn hand_bits_ehs2(
-    street: Street,
-    rank1: char,
-    rank2: char,
-    suited: bool,
-    bucket_cache: Option<&std::collections::HashMap<(char, char, bool), u16>>,
-) -> Result<u32, String> {
-    if street == Street::Preflop {
-        return Ok(hand_bits_from_ranks(rank1, rank2, suited));
-    }
-    let cache = bucket_cache.ok_or_else(|| {
-        format!(
-            "Bucket cache not available for postflop street {street:?}. \
-             Start bucket computation before requesting postflop strategy."
-        )
-    })?;
-    let &bucket = cache.get(&(rank1, rank2, suited)).ok_or_else(|| {
-        format!("No bucket in cache for hand ({rank1}, {rank2}, suited={suited})")
-    })?;
-    Ok(u32::from(bucket))
-}
-
-/// Compute hand bits for hand_class_v2 mode (classify + strength + equity).
-fn hand_bits_hand_class_v2(
-    config: &BundleConfig,
-    street: Street,
-    board: &[Card],
-    rank1: char,
-    rank2: char,
-    suited: bool,
-) -> u32 {
-    if street == Street::Preflop {
-        return hand_bits_from_ranks(rank1, rank2, suited);
-    }
-    let (card1, card2) = make_representative_hand(rank1, rank2, suited, board);
-    match classify([card1, card2], board) {
-        Ok(classification) => {
-            let made_id = classification.strongest_made_id();
-            let strength = if HandClass::is_made_hand_id(made_id) {
-                intra_class_strength(
-                    [card1, card2],
-                    board,
-                    HandClass::ALL[made_id as usize],
-                )
-            } else {
-                1
-            };
-            let equity = showdown_equity::compute_equity([card1, card2], board);
-            let eq_bin =
-                showdown_equity::equity_bin(equity, 1u8 << config.equity_bits);
-            encode_hand_v2(
-                made_id,
-                strength,
-                eq_bin,
-                classification.draw_flags(),
-                config.strength_bits,
-                config.equity_bits,
-            )
-        }
-        Err(_) => 0,
-    }
-}
-
-/// Compute hand bits from rank characters and suited flag for `InfoKey`.
-fn hand_bits_from_ranks(rank1: char, rank2: char, suited: bool) -> u32 {
-    if let Some(cards) = cards_from_rank_chars(rank1, rank2, suited) {
-        u32::from(canonical_hand_index(cards))
-    } else {
-        0
-    }
-}
-
-/// Convert a `Street` to numeric encoding for `InfoKey`.
-fn street_to_num(street: Street) -> u8 {
-    match street {
-        Street::Preflop => 0,
-        Street::Flop => 1,
-        Street::Turn => 2,
-        Street::River => 3,
-    }
 }
 
 const RANKS: [char; 13] = [
@@ -3650,43 +2140,6 @@ mod tests {
         let json = serde_json::to_string(&event).expect("should serialize");
         assert!(json.contains("\"iteration\":10"));
         assert!(json.contains("\"max_iterations\":100"));
-    }
-
-    #[timed_test]
-    fn walk_preflop_tree_empty_history() {
-        let config = poker_solver_core::preflop::PreflopConfig::heads_up(100);
-        let tree = poker_solver_core::preflop::PreflopTree::build(&config);
-        let walk = walk_preflop_tree_with_state(&config, &tree, &[])
-            .expect("should walk empty history");
-        assert_eq!(walk.node_idx, 0);
-        // Initial pot = SB(1) + BB(2) = 3
-        assert_eq!(walk.pot, 3);
-        assert_eq!(walk.to_call, 1);
-    }
-
-    #[timed_test]
-    fn walk_preflop_tree_fold() {
-        let config = poker_solver_core::preflop::PreflopConfig::heads_up(100);
-        let tree = poker_solver_core::preflop::PreflopTree::build(&config);
-        let history = vec!["fold".to_string()];
-        let result = walk_preflop_tree_with_state(&config, &tree, &history);
-        // Fold leads to a terminal node, but the walk itself should succeed
-        assert!(result.is_ok());
-        let walk = result.unwrap();
-        assert_eq!(walk.pot, 3); // pot unchanged by fold
-    }
-
-    #[timed_test]
-    fn walk_preflop_tree_raise_tracks_state() {
-        let config = poker_solver_core::preflop::PreflopConfig::heads_up(50);
-        let tree = poker_solver_core::preflop::PreflopTree::build(&config);
-        // SB raises — Raise(2.5) is at index 3: [Fold, Call, AllIn, Raise(2.5)]
-        let history = vec!["r:3".to_string()];
-        let walk = walk_preflop_tree_with_state(&config, &tree, &history)
-            .expect("should walk raise history");
-        // After SB raise: pot should be > 3, SB stack should decrease
-        assert!(walk.pot > 3, "pot should increase after raise");
-        assert!(walk.stacks[0] < 99, "SB stack should decrease (was 99 after blind)");
     }
 
     #[timed_test]

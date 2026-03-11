@@ -24,17 +24,6 @@ struct PathParams {
 }
 
 #[derive(Deserialize)]
-struct SolvePreflopParams {
-    stack_depth: u32,
-    iterations: u64,
-}
-
-#[derive(Deserialize)]
-struct BlueprintPathParams {
-    blueprint_path: String,
-}
-
-#[derive(Deserialize)]
 struct StrategyMatrixParams {
     position: poker_solver_tauri::ExplorationPosition,
     threshold: Option<f32>,
@@ -151,32 +140,6 @@ async fn handle_load_bundle(
     Json(params): Json<PathParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     result_to_response(poker_solver_tauri::load_bundle_core(&state, params.path).await)
-}
-
-async fn handle_load_preflop_solve(
-    AxumState(state): AxumState<AppState>,
-    Json(params): Json<PathParams>,
-) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::load_preflop_solve_core(&state, params.path).await)
-}
-
-async fn handle_solve_preflop_live(
-    AxumState(state): AxumState<AppState>,
-    Json(params): Json<SolvePreflopParams>,
-) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(
-        poker_solver_tauri::solve_preflop_live_core(&state, params.stack_depth, params.iterations)
-            .await,
-    )
-}
-
-async fn handle_load_subgame_source(
-    AxumState(state): AxumState<AppState>,
-    Json(params): Json<BlueprintPathParams>,
-) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(
-        poker_solver_tauri::load_subgame_source_core(&state, params.blueprint_path).await,
-    )
 }
 
 async fn handle_load_blueprint_v2(
@@ -434,9 +397,6 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/load_bundle", post(handle_load_bundle))
-        .route("/api/load_preflop_solve", post(handle_load_preflop_solve))
-        .route("/api/solve_preflop_live", post(handle_solve_preflop_live))
-        .route("/api/load_subgame_source", post(handle_load_subgame_source))
         .route("/api/load_blueprint_v2", post(handle_load_blueprint_v2))
         .route("/api/get_strategy_matrix", post(handle_get_strategy_matrix))
         .route(
