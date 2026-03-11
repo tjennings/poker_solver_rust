@@ -1,7 +1,10 @@
+use burn::module::Module;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{Tensor, TensorData};
 
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -83,44 +86,144 @@ fn collate_batch<B: AutodiffBackend>(
     Batch { input, target, mask, range: range_t, game_value }
 }
 
+/// Compute average validation loss over the given indices without gradient tracking.
+fn compute_val_loss<B: AutodiffBackend>(
+    model: &CfvNet<B>,
+    dataset: &CfvDataset,
+    val_indices: &[usize],
+    config: &TrainConfig,
+    device: &B::Device,
+) -> f64 {
+    let mut total_loss = 0.0_f64;
+    let mut batch_count = 0_u64;
+
+    for batch_start in (0..val_indices.len()).step_by(config.batch_size) {
+        let batch_end = (batch_start + config.batch_size).min(val_indices.len());
+        let batch_idx = &val_indices[batch_start..batch_end];
+
+        let items: Vec<CfvItem> = batch_idx
+            .iter()
+            .filter_map(|&idx| dataset.get(idx))
+            .collect();
+
+        if items.is_empty() {
+            continue;
+        }
+
+        let batch = collate_batch::<B>(&items, device);
+        let pred = model.forward(batch.input);
+        let loss = cfvnet_loss(
+            pred,
+            batch.target,
+            batch.mask,
+            batch.range,
+            batch.game_value,
+            config.huber_delta,
+            config.aux_loss_weight,
+        );
+
+        // INVARIANT: loss is shape [1], so to_vec always has exactly one element.
+        let val: f32 = loss.into_data().to_vec::<f32>().unwrap()[0];
+        total_loss += val as f64;
+        batch_count += 1;
+    }
+
+    if batch_count == 0 {
+        0.0
+    } else {
+        total_loss / batch_count as f64
+    }
+}
+
+/// Save the model to `dir/name` using NamedMpkGz format.
+///
+/// Logs a warning on failure instead of panicking so training can continue.
+fn save_model<B: AutodiffBackend>(
+    model: &CfvNet<B>,
+    dir: &std::path::Path,
+    name: &str,
+) {
+    let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+    let path = dir.join(name);
+    if let Err(e) = model.clone().save_file(path, &recorder) {
+        eprintln!("Warning: failed to save model '{}': {}", name, e);
+    }
+}
+
 /// Train a `CfvNet` on the given dataset using a custom Adam training loop.
 ///
 /// Returns the final training loss. Shuffles indices each epoch, processes
-/// mini-batches, and updates the model via backpropagation.
+/// mini-batches, and updates the model via backpropagation. Optionally saves
+/// checkpoints and the final model to `output_dir`.
 pub fn train<B: AutodiffBackend>(
     device: &B::Device,
     dataset: &CfvDataset,
     config: &TrainConfig,
-    _output_dir: Option<&std::path::Path>,
+    output_dir: Option<&std::path::Path>,
 ) -> TrainResult {
     let mut model = CfvNet::<B>::new(device, config.hidden_layers, config.hidden_size);
 
+    // Resume from checkpoint if a saved model exists.
+    if let Some(dir) = output_dir {
+        let model_path = dir.join("model");
+        if model_path.with_extension("mpk.gz").exists() {
+            let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+            match model.clone().load_file(model_path, &recorder, device) {
+                Ok(loaded) => {
+                    eprintln!("Resuming from checkpoint");
+                    model = loaded;
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to load checkpoint, starting fresh: {e}");
+                }
+            }
+        }
+    }
+
     let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
 
+    // Split dataset into train/val using deterministic shuffle.
     let n = dataset.len();
-    let mut indices: Vec<usize> = (0..n).collect();
+    let mut all_indices: Vec<usize> = (0..n).collect();
     let mut rng = ChaCha8Rng::seed_from_u64(42);
+    all_indices.shuffle(&mut rng);
 
+    let val_count = (n as f64 * config.validation_split) as usize;
+    let val_indices = all_indices[..val_count].to_vec();
+    let mut train_indices = all_indices[val_count..].to_vec();
+
+    let num_train_batches = (train_indices.len() + config.batch_size - 1) / config.batch_size;
     let mut final_loss = f32::MAX;
 
-    for _epoch in 0..config.epochs {
-        indices.shuffle(&mut rng);
+    for epoch in 1..=config.epochs {
+        train_indices.shuffle(&mut rng);
 
-        for batch_start in (0..n).step_by(config.batch_size) {
-            let batch_end = (batch_start + config.batch_size).min(n);
-            let batch_indices = &indices[batch_start..batch_end];
+        let pb = ProgressBar::new(num_train_batches as u64);
+        // INVARIANT: template is valid — all placeholders are known indicatif fields.
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("  Epoch {msg} {wide_bar} {pos}/{len} [{elapsed}] ETA {eta}")
+                .unwrap(),
+        );
 
-            let items: Vec<CfvItem> = batch_indices
+        let mut epoch_loss = 0.0_f64;
+        let mut epoch_batches = 0_u64;
+
+        for batch_start in (0..train_indices.len()).step_by(config.batch_size) {
+            let batch_end = (batch_start + config.batch_size).min(train_indices.len());
+            let batch_idx = &train_indices[batch_start..batch_end];
+
+            let items: Vec<CfvItem> = batch_idx
                 .iter()
                 .filter_map(|&idx| dataset.get(idx))
                 .collect();
 
             if items.is_empty() {
+                pb.inc(1);
                 continue;
             }
 
             let batch = collate_batch::<B>(&items, device);
-
             let pred = model.forward(batch.input);
 
             let loss = cfvnet_loss(
@@ -133,14 +236,46 @@ pub fn train<B: AutodiffBackend>(
                 config.aux_loss_weight,
             );
 
-            // Read scalar loss before consuming the tensor for backward.
             // INVARIANT: loss is shape [1], so to_vec always has exactly one element.
             final_loss = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
+            epoch_loss += final_loss as f64;
+            epoch_batches += 1;
 
             let grads = loss.backward();
             let grads_params = GradientsParams::from_grads(grads, &model);
             model = optim.step(config.learning_rate, model, grads_params);
+            pb.inc(1);
         }
+
+        let avg_train = if epoch_batches > 0 {
+            epoch_loss / epoch_batches as f64
+        } else {
+            0.0
+        };
+
+        // Compute validation loss if we have a validation set.
+        let summary = if !val_indices.is_empty() {
+            let val_loss = compute_val_loss(&model, dataset, &val_indices, config, device);
+            format!("{epoch}/{} train={avg_train:.6} val={val_loss:.6}", config.epochs)
+        } else {
+            format!("{epoch}/{} train={avg_train:.6}", config.epochs)
+        };
+
+        pb.finish_with_message(summary);
+
+        // Checkpoint every N epochs if configured.
+        if config.checkpoint_every_n_epochs > 0
+            && epoch % config.checkpoint_every_n_epochs == 0
+        {
+            if let Some(dir) = output_dir {
+                save_model(&model, dir, &format!("checkpoint_epoch{epoch}"));
+            }
+        }
+    }
+
+    // Save final model.
+    if let Some(dir) = output_dir {
+        save_model(&model, dir, "model");
     }
 
     TrainResult {
@@ -210,5 +345,79 @@ mod tests {
             "should overfit small data, got loss {}",
             result.final_train_loss
         );
+    }
+
+    #[test]
+    fn train_saves_model_to_output_dir() {
+        let file = write_test_data(16);
+        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let device = Default::default();
+        let config = TrainConfig {
+            hidden_layers: 2,
+            hidden_size: 64,
+            batch_size: 16,
+            epochs: 2,
+            learning_rate: 0.001,
+            lr_min: 0.001,
+            huber_delta: 1.0,
+            aux_loss_weight: 0.0,
+            validation_split: 0.0,
+            checkpoint_every_n_epochs: 0,
+        };
+        let result = train::<B>(&device, &dataset, &config, Some(dir.path()));
+        assert!(result.final_train_loss < 1.0);
+        assert!(
+            dir.path().join("model.mpk.gz").exists(),
+            "model.mpk.gz should exist"
+        );
+    }
+
+    #[test]
+    fn train_saves_checkpoints() {
+        let file = write_test_data(16);
+        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let device = Default::default();
+        let config = TrainConfig {
+            hidden_layers: 2,
+            hidden_size: 64,
+            batch_size: 16,
+            epochs: 4,
+            learning_rate: 0.001,
+            lr_min: 0.001,
+            huber_delta: 1.0,
+            aux_loss_weight: 0.0,
+            validation_split: 0.0,
+            checkpoint_every_n_epochs: 2,
+        };
+        train::<B>(&device, &dataset, &config, Some(dir.path()));
+        assert!(dir.path().join("checkpoint_epoch2.mpk.gz").exists());
+        assert!(dir.path().join("checkpoint_epoch4.mpk.gz").exists());
+        assert!(dir.path().join("model.mpk.gz").exists());
+    }
+
+    #[test]
+    fn train_resumes_from_checkpoint() {
+        let file = write_test_data(16);
+        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let device = Default::default();
+        let config = TrainConfig {
+            hidden_layers: 2,
+            hidden_size: 64,
+            batch_size: 16,
+            epochs: 5,
+            learning_rate: 0.001,
+            lr_min: 0.001,
+            huber_delta: 1.0,
+            aux_loss_weight: 0.0,
+            validation_split: 0.0,
+            checkpoint_every_n_epochs: 0,
+        };
+        let r1 = train::<B>(&device, &dataset, &config, Some(dir.path()));
+        let r2 = train::<B>(&device, &dataset, &config, Some(dir.path()));
+        assert!(r1.final_train_loss < 10.0);
+        assert!(r2.final_train_loss < 10.0);
     }
 }
