@@ -244,6 +244,18 @@ fn action_to_info(action: &Action, index: usize, pot: i32) -> ActionInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Subgame solve result (stored for range propagation and navigation)
+// ---------------------------------------------------------------------------
+
+/// Stored result from a subgame solve, used for range propagation and navigation.
+pub struct SubgameSolveResult {
+    pub strategy: SubgameStrategy,
+    pub hands: SubgameHands,
+    pub action_infos: Vec<ActionInfo>,
+    pub tree: SubgameTree,
+}
+
+// ---------------------------------------------------------------------------
 // Subgame solver helpers
 // ---------------------------------------------------------------------------
 
@@ -546,6 +558,7 @@ pub struct PostflopState {
     pub cache_dir: RwLock<Option<PathBuf>>,
     pub solve_start: RwLock<Option<std::time::Instant>>,
     pub solver_name: RwLock<String>,
+    pub subgame_result: RwLock<Option<SubgameSolveResult>>,
 }
 
 impl Default for PostflopState {
@@ -564,6 +577,7 @@ impl Default for PostflopState {
             cache_dir: RwLock::new(None),
             solve_start: RwLock::new(None),
             solver_name: RwLock::new("range".to_string()),
+            subgame_result: RwLock::new(None),
         }
     }
 }
@@ -793,6 +807,7 @@ pub fn postflop_set_config_core(
     *state.matrix_snapshot.write() = None;
     *state.filtered_oop_weights.write() = None;
     *state.filtered_ip_weights.write() = None;
+    *state.subgame_result.write() = None;
     state.current_iteration.store(0, Ordering::Relaxed);
     state.max_iterations.store(0, Ordering::Relaxed);
     state.exploitability_bits.store(0, Ordering::Relaxed);
@@ -1068,6 +1083,7 @@ fn solve_full_depth(
         .exploitability_bits
         .store(f32::MAX.to_bits(), Ordering::Relaxed);
     *state.solver_name.write() = "range".to_string();
+    *state.subgame_result.write() = None;
     state.solving.store(true, Ordering::Release);
 
     // Build game (expensive but runs on the calling thread before spawn).
@@ -1208,7 +1224,10 @@ fn solve_depth_limited(
             player,
             &shared,
         ) {
-            Ok((strategy, hands, action_infos, _tree)) => {
+            Ok((strategy, hands, action_infos, tree)) => {
+                // Clone action_infos before moving into matrix builder.
+                let action_infos_for_result = action_infos.clone();
+
                 let matrix = build_subgame_matrix(
                     &hands,
                     &strategy,
@@ -1221,6 +1240,14 @@ fn solve_depth_limited(
                     0,
                 );
                 *shared.matrix_snapshot.write() = Some(matrix);
+
+                // Store subgame result for range propagation and navigation.
+                *shared.subgame_result.write() = Some(SubgameSolveResult {
+                    strategy,
+                    hands,
+                    action_infos: action_infos_for_result,
+                    tree,
+                });
             }
             Err(e) => {
                 eprintln!("Subgame solve failed: {e}");
@@ -1434,6 +1461,11 @@ pub fn postflop_close_street_core(
     state: &PostflopState,
     action_history: Vec<usize>,
 ) -> Result<PostflopStreetResult, String> {
+    let solver_name = state.solver_name.read().clone();
+    if solver_name == "subgame" {
+        return postflop_close_street_subgame(state, action_history);
+    }
+
     let mut game_guard = state.game.lock();
     let game = game_guard.as_mut().ok_or("No game loaded")?;
 
@@ -1493,6 +1525,102 @@ pub fn postflop_close_street_core(
     let effective_stack = tc.effective_stack - bet_amounts[0].max(bet_amounts[1]);
 
     // Store filtered weights for the next street.
+    *state.filtered_oop_weights.write() = Some(oop_weights.clone());
+    *state.filtered_ip_weights.write() = Some(ip_weights.clone());
+
+    Ok(PostflopStreetResult {
+        filtered_oop_range: oop_weights,
+        filtered_ip_range: ip_weights,
+        pot,
+        effective_stack,
+    })
+}
+
+/// Range propagation through a subgame tree for `postflop_close_street_core`.
+///
+/// Walks the stored `SubgameSolveResult`, multiplying each acting player's
+/// 1326-element weight vector by the subgame strategy probabilities at each
+/// decision node. Returns pot/stacks from the final node.
+fn postflop_close_street_subgame(
+    state: &PostflopState,
+    action_history: Vec<usize>,
+) -> Result<PostflopStreetResult, String> {
+    let result_guard = state.subgame_result.read();
+    let result = result_guard
+        .as_ref()
+        .ok_or("No subgame result stored")?;
+
+    let config = state.config.read().clone();
+    let oop_range: Range = config
+        .oop_range
+        .parse()
+        .map_err(|e: String| format!("Invalid OOP range: {e}"))?;
+    let ip_range: Range = config
+        .ip_range
+        .parse()
+        .map_err(|e: String| format!("Invalid IP range: {e}"))?;
+
+    let mut oop_weights: Vec<f32> = state
+        .filtered_oop_weights
+        .read()
+        .clone()
+        .unwrap_or_else(|| oop_range.raw_data().to_vec());
+    let mut ip_weights: Vec<f32> = state
+        .filtered_ip_weights
+        .read()
+        .clone()
+        .unwrap_or_else(|| ip_range.raw_data().to_vec());
+
+    // Walk each action through the subgame tree, narrowing the acting player's range.
+    let mut current_node = 0u32;
+    for &action_idx in &action_history {
+        match &result.tree.nodes[current_node as usize] {
+            SubgameNode::Decision {
+                position, children, ..
+            } => {
+                let player = *position as usize;
+                let weights = if player == 0 {
+                    &mut oop_weights
+                } else {
+                    &mut ip_weights
+                };
+
+                // Multiply each combo's weight by its strategy probability for this action.
+                for (combo_idx, combo) in result.hands.combos.iter().enumerate() {
+                    let rs_id0 = rs_poker_card_to_id(combo[0]);
+                    let rs_id1 = rs_poker_card_to_id(combo[1]);
+                    let ci = card_pair_to_index(rs_id0, rs_id1);
+                    let probs = result.strategy.get_probs(current_node, combo_idx);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let action_prob = probs.get(action_idx).copied().unwrap_or(0.0) as f32;
+                    weights[ci] *= action_prob;
+                }
+
+                if action_idx < children.len() {
+                    current_node = children[action_idx];
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    // Get pot/stacks from the final node.
+    #[allow(clippy::cast_possible_wrap)]
+    let (pot, effective_stack) = match &result.tree.nodes[current_node as usize] {
+        SubgameNode::Decision { pot, stacks, .. }
+        | SubgameNode::Terminal { pot, stacks, .. }
+        | SubgameNode::DepthBoundary { pot, stacks } => {
+            let eff = stacks
+                .first()
+                .copied()
+                .unwrap_or(0)
+                .min(stacks.get(1).copied().unwrap_or(0));
+            (*pot as i32, eff as i32)
+        }
+    };
+
     *state.filtered_oop_weights.write() = Some(oop_weights.clone());
     *state.filtered_ip_weights.write() = Some(ip_weights.clone());
 
