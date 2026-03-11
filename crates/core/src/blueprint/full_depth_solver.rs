@@ -253,7 +253,7 @@ pub fn solve_full_depth(
         range_solver::PostFlopGame::with_config(card_config, tree)
             .map_err(FullDepthError::ConfigError)?;
 
-    game.allocate_memory(false);
+    game.allocate_memory(true);
 
     let target = (config.target_exploitability * f64::from(config.pot)) as f32;
     range_solver::solve(&mut game, config.iterations, target, false);

@@ -681,7 +681,7 @@ fn build_game(
         ActionTree::new(tree_config).map_err(|e| format!("Failed to build tree: {e}"))?;
     let mut game = PostFlopGame::with_config(card_config, action_tree)
         .map_err(|e| format!("Failed to build game: {e}"))?;
-    game.allocate_memory(false);
+    game.allocate_memory(true);
     Ok(game)
 }
 

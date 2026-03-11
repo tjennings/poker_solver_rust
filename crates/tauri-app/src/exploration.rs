@@ -4,10 +4,12 @@
 //! and explore the game tree, viewing strategies at each decision point.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
@@ -97,7 +99,7 @@ enum StrategySource {
         subgame_config: poker_solver_core::blueprint::SubgameConfig,
         /// Cache of solved subgames
         #[allow(dead_code)]
-        solve_cache: Arc<RwLock<HashMap<u64, poker_solver_core::blueprint::SubgameStrategy>>>,
+        solve_cache: Arc<RwLock<LruCache<u64, poker_solver_core::blueprint::SubgameStrategy>>>,
     },
     BlueprintV2 {
         config: Box<BlueprintV2Config>,
@@ -503,7 +505,7 @@ pub async fn load_subgame_source_core(
         blueprint: Arc::new(bundle.blueprint),
         blueprint_config: bundle.config,
         subgame_config: poker_solver_core::blueprint::SubgameConfig::default(),
-        solve_cache: Arc::new(RwLock::new(HashMap::new())),
+        solve_cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(64).unwrap()))),
     });
 
     Ok(info)
