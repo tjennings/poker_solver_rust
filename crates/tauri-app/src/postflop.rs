@@ -38,7 +38,16 @@ pub struct PostflopConfig {
     pub ip_raise_sizes: String,
     pub rake_rate: f64,
     pub rake_cap: f64,
+    /// Max live combos on flop before switching to depth-limited solver.
+    #[serde(default = "default_flop_combo_threshold")]
+    pub flop_combo_threshold: usize,
+    /// Max live combos on turn before switching to depth-limited solver.
+    #[serde(default = "default_turn_combo_threshold")]
+    pub turn_combo_threshold: usize,
 }
+
+fn default_flop_combo_threshold() -> usize { 200 }
+fn default_turn_combo_threshold() -> usize { 300 }
 
 impl Default for PostflopConfig {
     fn default() -> Self {
@@ -53,6 +62,8 @@ impl Default for PostflopConfig {
             ip_raise_sizes: "a".to_string(),
             rake_rate: 0.0,
             rake_cap: 0.0,
+            flop_combo_threshold: default_flop_combo_threshold(),
+            turn_combo_threshold: default_turn_combo_threshold(),
         }
     }
 }
@@ -367,102 +378,6 @@ fn subgame_action_to_info(
     }
 }
 
-/// Build a 13x13 strategy matrix from `SubgameCfrSolver` output.
-///
-/// `node_idx` selects which decision node's strategy to display (0 = root).
-#[allow(clippy::too_many_arguments)]
-fn build_subgame_matrix(
-    hands: &SubgameHands,
-    strategy: &SubgameStrategy,
-    action_infos: Vec<ActionInfo>,
-    weights: &[f32],
-    board_card_strings: &[String],
-    pot: i32,
-    stacks: [i32; 2],
-    player: usize,
-    node_idx: u32,
-) -> PostflopStrategyMatrix {
-    let num_actions = action_infos.len();
-
-    let mut prob_sums = vec![vec![vec![0.0f64; num_actions]; 13]; 13];
-    let mut combo_counts = vec![vec![0usize; 13]; 13];
-    let mut weight_sums = vec![vec![0.0f64; 13]; 13];
-    let mut combo_details: Vec<Vec<Vec<PostflopComboDetail>>> = vec![vec![Vec::new(); 13]; 13];
-
-    for (combo_idx, combo) in hands.combos.iter().enumerate() {
-        let rs_id0 = rs_poker_card_to_id(combo[0]);
-        let rs_id1 = rs_poker_card_to_id(combo[1]);
-        let ci = card_pair_to_index(rs_id0, rs_id1);
-        let w = weights[ci] as f64;
-        if w <= 0.0 {
-            continue;
-        }
-
-        let (row, col, _) = card_pair_to_matrix(rs_id0, rs_id1);
-        combo_counts[row][col] += 1;
-        weight_sums[row][col] += w;
-
-        let probs = strategy.get_probs(node_idx, combo_idx);
-        let mut prob_f32 = Vec::with_capacity(num_actions);
-        for (a, prob_sum) in prob_sums[row][col].iter_mut().enumerate() {
-            let p = probs.get(a).copied().unwrap_or(0.0);
-            *prob_sum += p;
-            prob_f32.push(p as f32);
-        }
-
-        let s1 = card_to_string(rs_id0).unwrap_or_default();
-        let s2 = card_to_string(rs_id1).unwrap_or_default();
-        combo_details[row][col].push(PostflopComboDetail {
-            cards: format!("{s1}{s2}"),
-            probabilities: prob_f32,
-        });
-    }
-
-    let cells: Vec<Vec<PostflopMatrixCell>> = (0..13)
-        .map(|row| {
-            (0..13)
-                .map(|col| {
-                    let (label, suited, pair) = matrix_cell_label(row, col);
-                    let count = combo_counts[row][col];
-                    let probabilities = if count > 0 {
-                        prob_sums[row][col]
-                            .iter()
-                            .map(|&s| (s / count as f64) as f32)
-                            .collect()
-                    } else {
-                        vec![0.0; num_actions]
-                    };
-                    let combos = std::mem::take(&mut combo_details[row][col]);
-                    let weight = if count > 0 {
-                        (weight_sums[row][col] / count as f64) as f32
-                    } else {
-                        0.0
-                    };
-                    PostflopMatrixCell {
-                        hand: label,
-                        suited,
-                        pair,
-                        probabilities,
-                        combo_count: count,
-                        ev: None,
-                        combos,
-                        weight,
-                    }
-                })
-                .collect()
-        })
-        .collect();
-
-    PostflopStrategyMatrix {
-        cells,
-        actions: action_infos,
-        player,
-        pot,
-        stacks,
-        board: board_card_strings.to_vec(),
-    }
-}
-
 /// Build a subgame tree and CFR solver, ready to iterate.
 ///
 /// Returns the solver, hands, action labels, and tree without running any
@@ -592,7 +507,7 @@ struct MatrixSnapshot {
     private_cards: Vec<(u8, u8)>,
     initial_weights: Vec<f32>,
     num_hands: usize,
-    actions: Vec<Action>,
+    actions: Vec<ActionInfo>,
     pot: i32,
     stacks: [i32; 2],
     hand_evs: Option<Vec<f32>>,
@@ -603,7 +518,7 @@ struct MatrixSnapshot {
 /// This borrows the game briefly; the expensive matrix build runs on owned data.
 fn capture_matrix_snapshot(game: &mut PostFlopGame) -> MatrixSnapshot {
     let player = game.current_player();
-    let actions = game.available_actions();
+    let raw_actions = game.available_actions();
     let strategy = game.strategy();
     let private_cards = game.private_cards(player).to_vec();
     let initial_weights = game.initial_weights(player).to_vec();
@@ -637,6 +552,12 @@ fn capture_matrix_snapshot(game: &mut PostFlopGame) -> MatrixSnapshot {
         .filter_map(|&c| card_to_string(c).ok())
         .collect();
 
+    let actions: Vec<ActionInfo> = raw_actions
+        .iter()
+        .enumerate()
+        .map(|(i, a)| action_to_info(a, i, pot))
+        .collect();
+
     MatrixSnapshot {
         player,
         strategy,
@@ -654,13 +575,6 @@ fn capture_matrix_snapshot(game: &mut PostFlopGame) -> MatrixSnapshot {
 /// Build the matrix from a snapshot (no game borrow needed).
 fn build_matrix_from_snapshot(snap: MatrixSnapshot) -> PostflopStrategyMatrix {
     let num_actions = snap.actions.len();
-
-    let action_infos: Vec<ActionInfo> = snap
-        .actions
-        .iter()
-        .enumerate()
-        .map(|(i, a)| action_to_info(a, i, snap.pot))
-        .collect();
 
     let mut prob_sums = vec![vec![vec![0.0f64; num_actions]; 13]; 13];
     let mut combo_counts = vec![vec![0usize; 13]; 13];
@@ -732,7 +646,7 @@ fn build_matrix_from_snapshot(snap: MatrixSnapshot) -> PostflopStrategyMatrix {
 
     PostflopStrategyMatrix {
         cells,
-        actions: action_infos,
+        actions: snap.actions,
         player: snap.player,
         pot: snap.pot,
         stacks: snap.stacks,
@@ -746,6 +660,67 @@ fn build_matrix_from_snapshot(snap: MatrixSnapshot) -> PostflopStrategyMatrix {
 pub fn build_strategy_matrix(game: &mut PostFlopGame) -> PostflopStrategyMatrix {
     let snap = capture_matrix_snapshot(game);
     build_matrix_from_snapshot(snap)
+}
+
+/// Convert subgame solver output into a [`MatrixSnapshot`] so it can be rendered
+/// by the same [`build_matrix_from_snapshot`] used by the range-solver.
+#[allow(clippy::cast_possible_truncation)]
+fn snapshot_from_subgame(
+    hands: &SubgameHands,
+    strategy: &SubgameStrategy,
+    action_infos: Vec<ActionInfo>,
+    weights: &[f32],
+    board_strings: &[String],
+    pot: i32,
+    stacks: [i32; 2],
+    player: usize,
+    node_idx: u32,
+) -> MatrixSnapshot {
+    let num_actions = action_infos.len();
+
+    // Build private_cards and initial_weights in the same order as SubgameHands.
+    // Only include combos with non-zero weight.
+    let mut private_cards = Vec::with_capacity(hands.combos.len());
+    let mut initial_weights = Vec::with_capacity(hands.combos.len());
+    // strategy laid out as action_idx * num_included_hands + hand_idx
+    let mut hand_strategies: Vec<Vec<f32>> = vec![Vec::new(); num_actions];
+
+    for (combo_idx, combo) in hands.combos.iter().enumerate() {
+        let rs_id0 = rs_poker_card_to_id(combo[0]);
+        let rs_id1 = rs_poker_card_to_id(combo[1]);
+        let ci = card_pair_to_index(rs_id0, rs_id1);
+        let w = weights[ci];
+        if w <= 0.0 {
+            continue;
+        }
+        private_cards.push((rs_id0, rs_id1));
+        initial_weights.push(w);
+        let probs = strategy.get_probs(node_idx, combo_idx);
+        for a in 0..num_actions {
+            hand_strategies[a].push(probs.get(a).copied().unwrap_or(0.0) as f32);
+        }
+    }
+
+    let num_hands = private_cards.len();
+    // Flatten to the layout expected by build_matrix_from_snapshot:
+    // strategy[action_idx * num_hands + hand_idx]
+    let mut flat_strategy = Vec::with_capacity(num_actions * num_hands);
+    for a in 0..num_actions {
+        flat_strategy.extend_from_slice(&hand_strategies[a]);
+    }
+
+    MatrixSnapshot {
+        player,
+        strategy: flat_strategy,
+        private_cards,
+        initial_weights,
+        num_hands,
+        actions: action_infos,
+        pot,
+        stacks,
+        hand_evs: None,
+        board: board_strings.to_vec(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,7 +1023,11 @@ fn postflop_solve_street_impl(
         oop_count.max(ip_count)
     };
 
-    let solver_config = SolverConfig::default();
+    let solver_config = SolverConfig {
+        flop_combo_threshold: config.flop_combo_threshold,
+        turn_combo_threshold: config.turn_combo_threshold,
+        ..SolverConfig::default()
+    };
     let choice = solver_dispatch::dispatch_decision(&solver_config, street, live_combos);
 
     // Reset progress atomics.
@@ -1223,7 +1202,20 @@ fn solve_depth_limited(
             player,
         ) {
             Ok((mut solver, hands, action_infos, tree)) => {
-                // Snapshot interval: every 10 iterations, capped to at least once.
+                // Helper closure to build matrix from current strategy.
+                let make_matrix = |strat: &SubgameStrategy| {
+                    let snap = snapshot_from_subgame(
+                        &hands, strat, action_infos.clone(),
+                        &oop_w, &board_strings, pot,
+                        [eff_stack, eff_stack], player, 0,
+                    );
+                    build_matrix_from_snapshot(snap)
+                };
+
+                // Initial matrix: uniform strategy with range weights, shown before any iterations.
+                let initial_strategy = solver.strategy();
+                *shared.matrix_snapshot.write() = Some(make_matrix(&initial_strategy));
+
                 const SNAPSHOT_INTERVAL: u32 = 10;
 
                 for t in 0..max_iters {
@@ -1233,39 +1225,16 @@ fn solve_depth_limited(
                     solver.train(1);
                     shared.current_iteration.store(t + 1, Ordering::Relaxed);
 
-                    // Build intermediate matrix snapshot periodically.
                     let is_snapshot = (t + 1) % SNAPSHOT_INTERVAL == 0 || t + 1 == max_iters;
                     if is_snapshot {
                         let strategy = solver.strategy();
-                        let matrix = build_subgame_matrix(
-                            &hands,
-                            &strategy,
-                            action_infos.clone(),
-                            &oop_w,
-                            &board_strings,
-                            pot,
-                            [eff_stack, eff_stack],
-                            player,
-                            0,
-                        );
-                        *shared.matrix_snapshot.write() = Some(matrix);
+                        *shared.matrix_snapshot.write() = Some(make_matrix(&strategy));
                     }
                 }
 
                 // Final strategy snapshot.
                 let strategy = solver.strategy();
-                let matrix = build_subgame_matrix(
-                    &hands,
-                    &strategy,
-                    action_infos.clone(),
-                    &oop_w,
-                    &board_strings,
-                    pot,
-                    [eff_stack, eff_stack],
-                    player,
-                    0,
-                );
-                *shared.matrix_snapshot.write() = Some(matrix);
+                *shared.matrix_snapshot.write() = Some(make_matrix(&strategy));
 
                 // Store subgame result for range propagation and navigation.
                 *shared.subgame_result.write() = Some(SubgameSolveResult {
@@ -1438,7 +1407,7 @@ fn subgame_node_to_result(
             let pot_i32 = *pot as i32;
             let stacks_i32 = subgame_stacks(stacks);
 
-            let matrix = build_subgame_matrix(
+            let snap = snapshot_from_subgame(
                 &result.hands,
                 &result.strategy,
                 action_infos,
@@ -1449,6 +1418,7 @@ fn subgame_node_to_result(
                 player,
                 node_idx,
             );
+            let matrix = build_matrix_from_snapshot(snap);
             Ok(PostflopPlayResult {
                 matrix: Some(matrix),
                 is_terminal: false,
@@ -2106,6 +2076,7 @@ mod tests {
             ip_raise_sizes: "a".to_string(),
             rake_rate: 0.0,
             rake_cap: 0.0,
+            ..PostflopConfig::default()
         };
         *state.config.write() = config;
 
@@ -2164,6 +2135,7 @@ mod tests {
             ip_raise_sizes: "a".to_string(),
             rake_rate: 0.0,
             rake_cap: 0.0,
+            ..PostflopConfig::default()
         };
         *state.config.write() = config;
 
@@ -2217,6 +2189,7 @@ mod tests {
             ip_raise_sizes: "a".to_string(),
             rake_rate: 0.0,
             rake_cap: 0.0,
+            ..PostflopConfig::default()
         };
         postflop_set_config_core(&state, config).unwrap();
 
@@ -2292,6 +2265,7 @@ mod tests {
             ip_raise_sizes: "".to_string(),
             rake_rate: 0.0,
             rake_cap: 0.0,
+            ..PostflopConfig::default()
         };
         postflop_set_config_core(&state, config).unwrap();
 
@@ -2342,6 +2316,7 @@ mod tests {
             ip_raise_sizes: "".to_string(),
             rake_rate: 0.0,
             rake_cap: 0.0,
+            ..PostflopConfig::default()
         };
         postflop_set_config_core(&state, config).unwrap();
 
@@ -2390,6 +2365,7 @@ mod tests {
             ip_raise_sizes: "".to_string(),
             rake_rate: 0.0,
             rake_cap: 0.0,
+            ..PostflopConfig::default()
         };
         postflop_set_config_core(&state, config).unwrap();
 

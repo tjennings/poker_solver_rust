@@ -42,6 +42,9 @@ interface PostflopExplorerProps {
 
 export default function PostflopExplorer({ onBack, blueprintConfig, preflopHistory }: PostflopExplorerProps) {
   const [config, setConfig] = useState<PostflopConfig>(() => {
+    const gc = JSON.parse(localStorage.getItem('global_config') || '{}');
+    const flopThreshold = gc.flop_combo_threshold ?? 200;
+    const turnThreshold = gc.turn_combo_threshold ?? 300;
     if (blueprintConfig) {
       return {
         oop_range: blueprintConfig.oop_range,
@@ -54,6 +57,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         ip_raise_sizes: blueprintConfig.ip_raise_sizes,
         rake_rate: blueprintConfig.rake_rate,
         rake_cap: blueprintConfig.rake_cap,
+        flop_combo_threshold: flopThreshold,
+        turn_combo_threshold: turnThreshold,
       };
     }
     return {
@@ -67,6 +72,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       ip_raise_sizes: 'a',
       rake_rate: 0,
       rake_cap: 0,
+      flop_combo_threshold: flopThreshold,
+      turn_combo_threshold: turnThreshold,
     };
   });
   const [configSummary, setConfigSummary] = useState<PostflopConfigSummary | null>(null);
@@ -835,12 +842,12 @@ function ConfigModal({ config, error, onSubmit, onClose }: {
         <div className="modal-row">
           <div>
             <label>Pot</label>
-            <input type="number" value={draft.pot}
+            <input type="text" value={draft.pot}
               onChange={(e) => setDraft({ ...draft, pot: parseInt(e.target.value) || 0 })} />
           </div>
           <div>
             <label>Effective Stack</label>
-            <input type="number" value={draft.effective_stack}
+            <input type="text" value={draft.effective_stack}
               onChange={(e) => setDraft({ ...draft, effective_stack: parseInt(e.target.value) || 0 })} />
           </div>
         </div>
@@ -848,15 +855,31 @@ function ConfigModal({ config, error, onSubmit, onClose }: {
         <div className="modal-row">
           <div>
             <label>Rake Rate (%)</label>
-            <input type="number" min="0" max="100" step="0.5"
+            <input type="text"
               value={draft.rake_rate * 100}
               onChange={(e) => setDraft({ ...draft, rake_rate: parseFloat(e.target.value) / 100 || 0 })} />
           </div>
           <div>
             <label>Rake Cap</label>
-            <input type="number" min="0" step="0.5"
+            <input type="text"
               value={draft.rake_cap}
               onChange={(e) => setDraft({ ...draft, rake_cap: parseFloat(e.target.value) || 0 })} />
+          </div>
+        </div>
+
+        <h4>Solver Dispatch</h4>
+        <div className="modal-row">
+          <div>
+            <label>Flop Combo Threshold</label>
+            <input type="text"
+              value={draft.flop_combo_threshold}
+              onChange={(e) => setDraft({ ...draft, flop_combo_threshold: parseInt(e.target.value) || 0 })} />
+          </div>
+          <div>
+            <label>Turn Combo Threshold</label>
+            <input type="text"
+              value={draft.turn_combo_threshold}
+              onChange={(e) => setDraft({ ...draft, turn_combo_threshold: parseInt(e.target.value) || 0 })} />
           </div>
         </div>
 

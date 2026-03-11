@@ -90,7 +90,7 @@ export default function Settings() {
           Target Exploitability (% of pot)
         </label>
         <input
-          type="number"
+          type="text"
           value={config.target_exploitability}
           onChange={e => {
             const v = parseFloat(e.target.value);
@@ -98,9 +98,6 @@ export default function Settings() {
               setConfig({ target_exploitability: v });
             }
           }}
-          min={0.1}
-          max={100}
-          step={0.1}
           style={{
             width: 120,
             padding: '0.45rem 0.6rem',
@@ -114,6 +111,64 @@ export default function Settings() {
         />
         <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
           Default convergence target for postflop solves. Lower is more precise but slower.
+        </p>
+      </div>
+
+      {/* Solver Dispatch Thresholds */}
+      <div style={{ marginBottom: '1.5rem' }}>
+        <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
+          Solver Dispatch Thresholds
+        </label>
+        <div style={{ display: 'flex', gap: '1rem' }}>
+          <div>
+            <label style={{ display: 'block', fontSize: '0.7rem', color: '#666', marginBottom: '0.2rem' }}>
+              Flop
+            </label>
+            <input
+              type="text"
+              value={config.flop_combo_threshold ?? 200}
+              onChange={e => {
+                const v = parseInt(e.target.value);
+                if (!isNaN(v) && v >= 0) setConfig({ flop_combo_threshold: v });
+              }}
+              style={{
+                width: 80,
+                padding: '0.45rem 0.6rem',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 6,
+                color: '#eee',
+                fontSize: '0.85rem',
+                fontFamily: 'inherit',
+              }}
+            />
+          </div>
+          <div>
+            <label style={{ display: 'block', fontSize: '0.7rem', color: '#666', marginBottom: '0.2rem' }}>
+              Turn
+            </label>
+            <input
+              type="text"
+              value={config.turn_combo_threshold ?? 300}
+              onChange={e => {
+                const v = parseInt(e.target.value);
+                if (!isNaN(v) && v >= 0) setConfig({ turn_combo_threshold: v });
+              }}
+              style={{
+                width: 80,
+                padding: '0.45rem 0.6rem',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 6,
+                color: '#eee',
+                fontSize: '0.85rem',
+                fontFamily: 'inherit',
+              }}
+            />
+          </div>
+        </div>
+        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
+          Max live combos before switching to the depth-limited subgame solver. River always uses full-depth.
         </p>
       </div>
 

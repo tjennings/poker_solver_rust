@@ -171,6 +171,8 @@ export interface PostflopConfig {
   ip_raise_sizes: string;
   rake_rate: number;
   rake_cap: number;
+  flop_combo_threshold: number;
+  turn_combo_threshold: number;
 }
 
 export interface PostflopConfigSummary {
@@ -234,6 +236,8 @@ export interface GlobalConfig {
   blueprint_dir: string;
   target_exploitability: number;
   stub_range_solver?: boolean;
+  flop_combo_threshold: number;
+  turn_combo_threshold: number;
 }
 
 export interface BlueprintListEntry {
