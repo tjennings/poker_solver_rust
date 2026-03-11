@@ -86,6 +86,10 @@ struct TreeConfig {
     flop_sizes: Vec<Vec<f64>>,
     turn_sizes: Vec<Vec<f64>>,
     river_sizes: Vec<Vec<f64>>,
+    /// Maximum streets to solve from `starting_street`. `None` = full depth.
+    depth_limit: Option<u8>,
+    /// Street the subgame starts on (for depth counting).
+    starting_street: Option<Street>,
 }
 
 impl TreeConfig {
@@ -152,6 +156,8 @@ impl GameTree {
             flop_sizes: flop_sizes.to_vec(),
             turn_sizes: turn_sizes.to_vec(),
             river_sizes: river_sizes.to_vec(),
+            depth_limit: None,
+            starting_street: None,
         };
 
         let mut nodes = Vec::new();
@@ -466,6 +472,20 @@ impl GameTree {
 
         match state.street.next() {
             Some(next_street) if !both_all_in => {
+                // Check depth limit before transitioning streets
+                if let (Some(limit), Some(start)) = (config.depth_limit, config.starting_street) {
+                    let streets_played = next_street as usize - start as usize;
+                    if streets_played >= limit as usize {
+                        let idx = nodes.len() as u32;
+                        nodes.push(GameNode::Terminal {
+                            kind: TerminalKind::DepthBoundary,
+                            pot: state.invested[0] + state.invested[1],
+                            invested: state.invested,
+                        });
+                        return idx;
+                    }
+                }
+
                 // Transition to next street via Chance node
                 let chance_idx = nodes.len() as u32;
                 // Placeholder
@@ -704,6 +724,47 @@ impl GameTree {
         });
     }
 
+    /// Build a subgame tree rooted at a specific postflop street.
+    ///
+    /// Unlike [`build`], this starts mid-game with a known pot and stack
+    /// state, and optionally stops after `depth_limit` street transitions.
+    #[must_use]
+    pub fn build_subgame(
+        street: Street,
+        pot: f64,
+        invested: [f64; 2],
+        starting_stack: f64,
+        bet_sizes: &[Vec<f64>],
+        depth_limit: Option<u8>,
+    ) -> Self {
+        let config = TreeConfig {
+            preflop_sizes: vec![],
+            flop_sizes: bet_sizes.to_vec(),
+            turn_sizes: bet_sizes.to_vec(),
+            river_sizes: bet_sizes.to_vec(),
+            depth_limit,
+            starting_street: Some(street),
+        };
+
+        // Distribute pot evenly if invested doesn't sum to pot (caller
+        // may pass [pot/2, pot/2] or an asymmetric split).
+        let _ = pot; // pot is implicit in invested[0] + invested[1]
+
+        let initial_state = BuildState {
+            starting_stack,
+            invested,
+            street,
+            num_raises: 0,
+            to_act: 0,       // OOP acts first postflop
+            facing_bet: false,
+            last_raise_to: 0.0,
+        };
+
+        let mut nodes = Vec::new();
+        let root = Self::build_node(&config, &initial_state, &mut nodes);
+        Self { nodes, root }
+    }
+
     /// Count the number of nodes of each type in the tree.
     #[must_use]
     pub fn node_counts(&self) -> (usize, usize, usize) {
@@ -807,6 +868,10 @@ mod tests {
     /// Walk the tree verifying every decision node where the actor has chips
     /// includes AllIn. This catches the beyond-raise-cap case.
     fn check_all_in_everywhere(tree: &GameTree, starting_stack: f64) {
+        check_all_in_with_invested(tree, starting_stack, [0.5, 1.0]);
+    }
+
+    fn check_all_in_with_invested(tree: &GameTree, starting_stack: f64, initial: [f64; 2]) {
         fn walk(
             tree: &GameTree,
             node_idx: u32,
@@ -859,7 +924,6 @@ mod tests {
         }
 
         let mut violations = Vec::new();
-        let initial = [0.5, 1.0]; // SB=0.5, BB=1.0
         walk(tree, tree.root, initial, starting_stack, &mut violations);
         assert!(
             violations.is_empty(),
@@ -1211,6 +1275,56 @@ mod tests {
                 }
                 return;
             }
+        }
+    }
+
+    #[test]
+    fn test_build_subgame_basic() {
+        let tree = GameTree::build_subgame(
+            Street::Flop, 10.0, [5.0, 5.0], 50.0,
+            &[vec![0.5, 1.0]], None,
+        );
+        assert!(matches!(tree.nodes[tree.root as usize], GameNode::Decision { player: 0, .. }));
+        let has_chance = tree.nodes.iter().any(|n| matches!(n, GameNode::Chance { .. }));
+        assert!(has_chance, "Full-depth subgame should have Chance nodes");
+    }
+
+    #[test]
+    fn test_build_subgame_depth_limited() {
+        let tree = GameTree::build_subgame(
+            Street::Flop, 10.0, [5.0, 5.0], 50.0,
+            &[vec![0.5, 1.0]], Some(1),
+        );
+        let has_boundary = tree.nodes.iter().any(|n| matches!(
+            n, GameNode::Terminal { kind: TerminalKind::DepthBoundary, .. }
+        ));
+        assert!(has_boundary, "Depth-limited subgame should have DepthBoundary terminals");
+        let has_chance = tree.nodes.iter().any(|n| matches!(n, GameNode::Chance { .. }));
+        assert!(!has_chance, "Depth-limited flop subgame should not transition to turn");
+    }
+
+    #[test]
+    fn test_build_subgame_river_no_chance() {
+        let tree = GameTree::build_subgame(
+            Street::River, 20.0, [10.0, 10.0], 50.0,
+            &[vec![0.5, 1.0]], None,
+        );
+        let has_chance = tree.nodes.iter().any(|n| matches!(n, GameNode::Chance { .. }));
+        assert!(!has_chance, "River subgame has no next street");
+        let has_boundary = tree.nodes.iter().any(|n| matches!(
+            n, GameNode::Terminal { kind: TerminalKind::DepthBoundary, .. }
+        ));
+        assert!(!has_boundary, "River subgame has no DepthBoundary");
+    }
+
+    #[test]
+    fn test_build_subgame_allin_everywhere() {
+        for street in [Street::Flop, Street::Turn, Street::River] {
+            let tree = GameTree::build_subgame(
+                street, 10.0, [5.0, 5.0], 50.0,
+                &[vec![0.5]], Some(1),
+            );
+            check_all_in_with_invested(&tree, 50.0, [5.0, 5.0]);
         }
     }
 }
