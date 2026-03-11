@@ -209,28 +209,26 @@ impl GameTree {
         // Bet/Raise sizes (only if under the street's declared raise depths and actor has chips)
         let can_raise = state.num_raises < config.max_raises_for_street(state.street)
             && remaining[actor] > SIZE_EPSILON;
-        // Also need enough chips to make a legal raise (at least min-raise)
         if can_raise {
-            let mut sized_actions =
+            let sized_actions =
                 Self::compute_sized_actions(config, state, remaining[actor]);
-
-            // Add all-in if not already present as a sized action
-            let all_in_amount = state.invested[actor] + remaining[actor];
-            let has_all_in = sized_actions
-                .iter()
-                .any(|a| match a {
-                    TreeAction::Bet(v) | TreeAction::Raise(v) => {
-                        (*v - all_in_amount).abs() < SIZE_EPSILON
-                    }
-                    TreeAction::AllIn => true,
-                    _ => false,
-                });
-
-            if !has_all_in && remaining[actor] > SIZE_EPSILON {
-                sized_actions.push(TreeAction::AllIn);
-            }
-
             actions.extend(sized_actions);
+        }
+
+        // All-in is always available when the actor has chips, regardless of raise cap.
+        // This ensures players can shove even after all sized raise depths are exhausted.
+        if remaining[actor] > SIZE_EPSILON {
+            let all_in_amount = state.invested[actor] + remaining[actor];
+            let has_all_in = actions.iter().any(|a| match a {
+                TreeAction::Bet(v) | TreeAction::Raise(v) => {
+                    (*v - all_in_amount).abs() < SIZE_EPSILON
+                }
+                TreeAction::AllIn => true,
+                _ => false,
+            });
+            if !has_all_in {
+                actions.push(TreeAction::AllIn);
+            }
         }
 
         // If we only have Check (no bet/raise available), and the call case
@@ -789,31 +787,85 @@ mod tests {
 
     #[test]
     fn test_all_in_always_available() {
-        let tree = GameTree::build(
-            10.0,
-            0.5,
-            1.0,
-            &[vec!["2.5bb".into()]],
-            &[vec![0.5]],
-            &[vec![0.5]],
-            &[vec![0.5]],
-        );
-        for node in &tree.nodes {
-            if let GameNode::Decision { actions, .. } = node {
-                let has_bet_or_raise = actions.iter().any(|a| {
-                    matches!(
-                        a,
-                        TreeAction::Bet(_) | TreeAction::Raise(_) | TreeAction::AllIn
-                    )
-                });
-                if has_bet_or_raise {
-                    assert!(
-                        actions.iter().any(|a| matches!(a, TreeAction::AllIn)),
-                        "Decision node with bets should have AllIn. Actions: {actions:?}"
-                    );
+        // Test with deep stacks and multiple raise depths to ensure AllIn is present
+        // even AFTER all raise depths are exhausted.
+        for stack in [10.0, 50.0, 100.0] {
+            let tree = GameTree::build(
+                stack,
+                0.5,
+                1.0,
+                &[vec!["2.5bb".into()], vec!["3bb".into()]],
+                &[vec![0.5]],
+                &[vec![0.5]],
+                &[vec![0.5]],
+            );
+            check_all_in_everywhere(&tree, stack);
+        }
+    }
+
+    /// Walk the tree verifying every decision node where the actor has chips
+    /// includes AllIn. This catches the beyond-raise-cap case.
+    fn check_all_in_everywhere(tree: &GameTree, starting_stack: f64) {
+        fn walk(
+            tree: &GameTree,
+            node_idx: u32,
+            invested: [f64; 2],
+            starting_stack: f64,
+            violations: &mut Vec<String>,
+        ) {
+            match &tree.nodes[node_idx as usize] {
+                GameNode::Terminal { .. } => {}
+                GameNode::Chance { child, .. } => {
+                    walk(tree, *child, invested, starting_stack, violations);
+                }
+                GameNode::Decision {
+                    player,
+                    actions,
+                    children,
+                    ..
+                } => {
+                    let remaining = starting_stack - invested[*player as usize];
+                    if remaining > 0.01 {
+                        let has_all_in =
+                            actions.iter().any(|a| matches!(a, TreeAction::AllIn));
+                        if !has_all_in {
+                            violations.push(format!(
+                                "node {node_idx}: player {} remaining={remaining:.1} \
+                                 invested={invested:?} actions={actions:?}",
+                                player
+                            ));
+                        }
+                    }
+
+                    for (action, &child) in actions.iter().zip(children.iter()) {
+                        let mut new_inv = invested;
+                        match action {
+                            TreeAction::Fold | TreeAction::Check => {}
+                            TreeAction::Call => {
+                                new_inv[*player as usize] = new_inv[1 - *player as usize];
+                            }
+                            TreeAction::Bet(v) | TreeAction::Raise(v) => {
+                                new_inv[*player as usize] = *v;
+                            }
+                            TreeAction::AllIn => {
+                                new_inv[*player as usize] = starting_stack;
+                            }
+                        }
+                        walk(tree, child, new_inv, starting_stack, violations);
+                    }
                 }
             }
         }
+
+        let mut violations = Vec::new();
+        let initial = [0.5, 1.0]; // SB=0.5, BB=1.0
+        walk(tree, tree.root, initial, starting_stack, &mut violations);
+        assert!(
+            violations.is_empty(),
+            "AllIn missing at {} node(s):\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
     }
 
     #[test]
