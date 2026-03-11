@@ -4,12 +4,10 @@
 //! and explore the game tree, viewing strategies at each decision point.
 
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};

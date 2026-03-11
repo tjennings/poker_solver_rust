@@ -74,4 +74,34 @@ pub mod poker {
         }
         deck
     }
+
+    /// Parse a card from a two-character string like "Ah", "2c", "Td".
+    #[must_use]
+    pub fn parse_card(s: &str) -> Option<Card> {
+        let mut chars = s.chars();
+        let value = match chars.next()? {
+            '2' => Value::Two,
+            '3' => Value::Three,
+            '4' => Value::Four,
+            '5' => Value::Five,
+            '6' => Value::Six,
+            '7' => Value::Seven,
+            '8' => Value::Eight,
+            '9' => Value::Nine,
+            'T' | 't' => Value::Ten,
+            'J' | 'j' => Value::Jack,
+            'Q' | 'q' => Value::Queen,
+            'K' | 'k' => Value::King,
+            'A' | 'a' => Value::Ace,
+            _ => return None,
+        };
+        let suit = match chars.next()? {
+            'h' | 'H' => Suit::Heart,
+            'd' | 'D' => Suit::Diamond,
+            'c' | 'C' => Suit::Club,
+            's' | 'S' => Suit::Spade,
+            _ => return None,
+        };
+        Some(Card::new(value, suit))
+    }
 }

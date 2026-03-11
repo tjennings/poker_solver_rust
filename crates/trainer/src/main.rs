@@ -169,7 +169,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 strings
                                     .iter()
                                     .filter_map(|s| {
-                                        poker_solver_core::preflop::postflop_hands::parse_card(s)
+                                        poker_solver_core::poker::parse_card(s)
                                     })
                                     .collect()
                             })
