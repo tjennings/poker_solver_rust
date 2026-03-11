@@ -3,13 +3,7 @@ mod blueprint_tui_config;
 mod blueprint_tui_metrics;
 mod blueprint_tui_scenarios;
 mod blueprint_tui_widgets;
-mod bucket_diagnostics;
-mod hand_trace;
-mod lhe_viz;
 mod log_file;
-mod tree_dump;
-mod tui;
-mod tui_metrics;
 
 use std::error::Error;
 use std::io::{IsTerminal, Write};
