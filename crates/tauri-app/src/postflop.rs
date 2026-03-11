@@ -559,6 +559,8 @@ pub struct PostflopState {
     pub solve_start: RwLock<Option<std::time::Instant>>,
     pub solver_name: RwLock<String>,
     pub subgame_result: RwLock<Option<SubgameSolveResult>>,
+    /// Current node index in the subgame tree during navigation.
+    pub subgame_node: AtomicU32,
 }
 
 impl Default for PostflopState {
@@ -578,6 +580,7 @@ impl Default for PostflopState {
             solve_start: RwLock::new(None),
             solver_name: RwLock::new("range".to_string()),
             subgame_result: RwLock::new(None),
+            subgame_node: AtomicU32::new(0),
         }
     }
 }
@@ -1055,6 +1058,7 @@ fn postflop_solve_street_impl(
     // Reset progress atomics.
     state.current_iteration.store(0, Ordering::Relaxed);
     state.solve_complete.store(false, Ordering::Relaxed);
+    state.subgame_node.store(0, Ordering::Relaxed);
     *state.solve_start.write() = Some(std::time::Instant::now());
 
     match choice {
@@ -1323,10 +1327,136 @@ pub fn postflop_get_progress(
 // postflop_play_action
 // ---------------------------------------------------------------------------
 
+/// Navigate the subgame tree by one action and return the result at the child node.
+fn postflop_play_action_subgame(
+    state: &PostflopState,
+    action: usize,
+) -> Result<PostflopPlayResult, String> {
+    let result_guard = state.subgame_result.read();
+    let result = result_guard.as_ref().ok_or("No subgame result stored")?;
+
+    let current = state.subgame_node.load(Ordering::Relaxed);
+
+    let children = match &result.tree.nodes[current as usize] {
+        SubgameNode::Decision { children, .. } => children,
+        _ => return Err("Current subgame node is not a decision node".to_string()),
+    };
+
+    if action >= children.len() {
+        return Err(format!(
+            "Action {action} out of range (max {})",
+            children.len() - 1
+        ));
+    }
+    let child_idx = children[action];
+    state.subgame_node.store(child_idx, Ordering::Relaxed);
+
+    subgame_node_to_result(state, result, child_idx)
+}
+
+/// Convert a subgame tree node into a `PostflopPlayResult`, building the
+/// strategy matrix when the node is a decision point.
+fn subgame_node_to_result(
+    state: &PostflopState,
+    result: &SubgameSolveResult,
+    node_idx: u32,
+) -> Result<PostflopPlayResult, String> {
+    match &result.tree.nodes[node_idx as usize] {
+        SubgameNode::Terminal { pot, stacks, .. } => Ok(PostflopPlayResult {
+            matrix: None,
+            is_terminal: true,
+            is_chance: false,
+            current_player: None,
+            #[allow(clippy::cast_possible_wrap)]
+            pot: *pot as i32,
+            stacks: subgame_stacks(stacks),
+        }),
+        SubgameNode::DepthBoundary { pot, stacks } => Ok(PostflopPlayResult {
+            matrix: None,
+            is_terminal: false,
+            is_chance: true,
+            current_player: None,
+            #[allow(clippy::cast_possible_wrap)]
+            pot: *pot as i32,
+            stacks: subgame_stacks(stacks),
+        }),
+        SubgameNode::Decision {
+            position,
+            actions,
+            pot,
+            stacks,
+            ..
+        } => {
+            let player = *position as usize;
+
+            let weights = if player == 0 {
+                state.filtered_oop_weights.read().clone()
+            } else {
+                state.filtered_ip_weights.read().clone()
+            };
+            let weights = weights.unwrap_or_else(|| vec![0.0f32; 1326]);
+
+            let board_card_strings: Vec<String> = result
+                .tree
+                .board
+                .iter()
+                .map(|c| {
+                    let id = rs_poker_card_to_id(*c);
+                    card_to_string(id).unwrap_or_default()
+                })
+                .collect();
+
+            let action_infos: Vec<ActionInfo> = actions
+                .iter()
+                .enumerate()
+                .map(|(i, a)| subgame_action_to_info(a, i, *pot, &result.tree.bet_sizes))
+                .collect();
+
+            #[allow(clippy::cast_possible_wrap)]
+            let pot_i32 = *pot as i32;
+            let stacks_i32 = subgame_stacks(stacks);
+
+            let matrix = build_subgame_matrix(
+                &result.hands,
+                &result.strategy,
+                action_infos,
+                &weights,
+                &board_card_strings,
+                pot_i32,
+                stacks_i32,
+                player,
+                node_idx,
+            );
+            Ok(PostflopPlayResult {
+                matrix: Some(matrix),
+                is_terminal: false,
+                is_chance: false,
+                current_player: Some(player),
+                pot: pot_i32,
+                stacks: stacks_i32,
+            })
+        }
+    }
+}
+
+/// Extract [i32; 2] stacks from a subgame node's stack vector.
+#[allow(clippy::cast_possible_wrap)]
+fn subgame_stacks(stacks: &[u32]) -> [i32; 2] {
+    [
+        stacks.first().copied().unwrap_or(0) as i32,
+        stacks.get(1).copied().unwrap_or(0) as i32,
+    ]
+}
+
 pub fn postflop_play_action_core(
     state: &PostflopState,
     action: usize,
 ) -> Result<PostflopPlayResult, String> {
+    let solver_name = state.solver_name.read().clone();
+    if solver_name == "subgame" {
+        return postflop_play_action_subgame(state, action);
+    }
+
     let mut game_guard = state.game.lock();
     let game = game_guard.as_mut().ok_or("No game loaded")?;
 
@@ -1388,11 +1518,38 @@ pub async fn postflop_play_action(
 // postflop_navigate_to
 // ---------------------------------------------------------------------------
 
+/// Replay a subgame tree from the root along `history` and return the result.
+fn postflop_navigate_to_subgame(
+    state: &PostflopState,
+    history: &[usize],
+) -> Result<PostflopPlayResult, String> {
+    state.subgame_node.store(0, Ordering::Relaxed);
+
+    if history.is_empty() {
+        // Return the root node matrix.
+        let result_guard = state.subgame_result.read();
+        let result = result_guard.as_ref().ok_or("No subgame result stored")?;
+        return subgame_node_to_result(state, result, 0);
+    }
+
+    let mut last_result = None;
+    for &action in history {
+        last_result = Some(postflop_play_action_subgame(state, action)?);
+    }
+    // INVARIANT: history is non-empty so last_result is Some.
+    Ok(last_result.unwrap())
+}
+
 /// Replay the game tree to a given action history and return the result.
 pub fn postflop_navigate_to_core(
     state: &PostflopState,
     history: Vec<usize>,
 ) -> Result<PostflopPlayResult, String> {
+    let solver_name = state.solver_name.read().clone();
+    if solver_name == "subgame" {
+        return postflop_navigate_to_subgame(state, &history);
+    }
+
     let mut game_guard = state.game.lock();
     let game = game_guard.as_mut().ok_or("No game loaded")?;
 
