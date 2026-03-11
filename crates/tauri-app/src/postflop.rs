@@ -463,22 +463,24 @@ fn build_subgame_matrix(
     }
 }
 
-/// Build a subgame tree, run CFR+, and return everything needed for the matrix.
+/// Build a subgame tree and CFR solver, ready to iterate.
+///
+/// Returns the solver, hands, action labels, and tree without running any
+/// iterations. The caller drives the iteration loop and can build matrix
+/// snapshots between iterations.
 ///
 /// Leaf values at `DepthBoundary` nodes use reach-weighted equity against
 /// the opponent range, converted to chip values by the solver.
 #[allow(clippy::too_many_arguments)]
-pub fn solve_subgame_street(
+pub fn build_subgame_solver(
     board_cards: &[RsPokerCard],
     bet_sizes: &[f32],
     pot: u32,
     stacks: [u32; 2],
     oop_weights: &[f32],
     ip_weights: &[f32],
-    iterations: u32,
     player: usize,
-    progress_state: &Arc<PostflopState>,
-) -> Result<(SubgameStrategy, SubgameHands, Vec<ActionInfo>, SubgameTree), String> {
+) -> Result<(SubgameCfrSolver, SubgameHands, Vec<ActionInfo>, SubgameTree), String> {
     let tree = SubgameTreeBuilder::new()
         .board(board_cards)
         .bet_sizes(bet_sizes)
@@ -517,23 +519,14 @@ pub fn solve_subgame_street(
         _ => return Err("Subgame tree root is not a decision node".to_string()),
     };
 
-    let mut solver = SubgameCfrSolver::new(
+    let solver = SubgameCfrSolver::new(
         tree.clone(),
         hands.clone(),
         opponent_reach,
         leaf_values,
     );
 
-    for t in 0..iterations {
-        if !progress_state.solving.load(Ordering::Relaxed) {
-            break;
-        }
-        solver.train(1);
-        progress_state.current_iteration.store(t + 1, Ordering::Relaxed);
-    }
-
-    let strategy = solver.strategy();
-    Ok((strategy, hands, action_infos, tree))
+    Ok((solver, hands, action_infos, tree))
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,25 +1213,51 @@ fn solve_depth_limited(
     let board_strings = board;
     std::thread::spawn(move || {
         let player = 0; // OOP acts first at root
-        match solve_subgame_street(
+        match build_subgame_solver(
             &board_cards,
             &bet_sizes,
             pot as u32,
             [eff_stack as u32, eff_stack as u32],
             &oop_w,
             &ip_w,
-            max_iters,
             player,
-            &shared,
         ) {
-            Ok((strategy, hands, action_infos, tree)) => {
-                // Clone action_infos before moving into matrix builder.
-                let action_infos_for_result = action_infos.clone();
+            Ok((mut solver, hands, action_infos, tree)) => {
+                // Snapshot interval: every 10 iterations, capped to at least once.
+                const SNAPSHOT_INTERVAL: u32 = 10;
 
+                for t in 0..max_iters {
+                    if !shared.solving.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    solver.train(1);
+                    shared.current_iteration.store(t + 1, Ordering::Relaxed);
+
+                    // Build intermediate matrix snapshot periodically.
+                    let is_snapshot = (t + 1) % SNAPSHOT_INTERVAL == 0 || t + 1 == max_iters;
+                    if is_snapshot {
+                        let strategy = solver.strategy();
+                        let matrix = build_subgame_matrix(
+                            &hands,
+                            &strategy,
+                            action_infos.clone(),
+                            &oop_w,
+                            &board_strings,
+                            pot,
+                            [eff_stack, eff_stack],
+                            player,
+                            0,
+                        );
+                        *shared.matrix_snapshot.write() = Some(matrix);
+                    }
+                }
+
+                // Final strategy snapshot.
+                let strategy = solver.strategy();
                 let matrix = build_subgame_matrix(
                     &hands,
                     &strategy,
-                    action_infos,
+                    action_infos.clone(),
                     &oop_w,
                     &board_strings,
                     pot,
@@ -1252,7 +1271,7 @@ fn solve_depth_limited(
                 *shared.subgame_result.write() = Some(SubgameSolveResult {
                     strategy,
                     hands,
-                    action_infos: action_infos_for_result,
+                    action_infos,
                     tree,
                 });
             }
