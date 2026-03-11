@@ -51,6 +51,7 @@ pub enum TreeAction {
 pub enum TerminalKind {
     Fold { winner: u8 },
     Showdown,
+    DepthBoundary,
 }
 
 pub struct GameTree {

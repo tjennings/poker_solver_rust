@@ -197,6 +197,11 @@ fn terminal_bucket_value(
             let ev = equity * invested[o] - (1.0 - equity) * invested[p];
             ev as f32
         }
+        TerminalKind::DepthBoundary => {
+            // Depth-boundary nodes are not reachable during CBV computation;
+            // they only appear in subgame trees resolved by a separate solver.
+            unreachable!("DepthBoundary should not be reached during CBV computation")
+        }
     }
 }
 

@@ -447,6 +447,11 @@ fn terminal_value(
                 Ordering::Equal => -rake / 2.0,
             }
         }
+        TerminalKind::DepthBoundary => {
+            // Depth-boundary nodes are not reachable during blueprint MCCFR;
+            // they only appear in subgame trees resolved by a separate solver.
+            unreachable!("DepthBoundary should not be reached during MCCFR traversal")
+        }
     }
 }
 
