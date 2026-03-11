@@ -82,13 +82,7 @@ fn main() {
             output,
             backend: _,
         } => cmd_train(config, data, output),
-        Commands::Evaluate {
-            model: _,
-            data: _,
-        } => {
-            eprintln!("Evaluate not yet implemented (needs model loading)");
-            std::process::exit(1);
-        }
+        Commands::Evaluate { model, data } => cmd_evaluate(model, data),
         Commands::Compare {
             model: _,
             num_spots: _,
@@ -180,3 +174,70 @@ fn cmd_generate(
 
     println!("Done.");
 }
+
+fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
+    use burn::backend::NdArray;
+    use burn::module::Module;
+    use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
+    use burn::tensor::{Tensor, TensorData};
+    use cfvnet::eval::metrics::compute_prediction_metrics;
+    use cfvnet::model::dataset::CfvDataset;
+    use cfvnet::model::network::{CfvNet, INPUT_SIZE};
+
+    type B = NdArray;
+    let device = Default::default();
+    let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+    let model_path = model_dir.join("model");
+
+    let model = CfvNet::<B>::new(&device, 7, 500)
+        .load_file(&model_path, &recorder, &device)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to load model from {}: {e}", model_path.display());
+            std::process::exit(1);
+        });
+
+    let dataset = CfvDataset::from_file(&data_path).unwrap_or_else(|e| {
+        eprintln!("failed to load dataset: {e}", );
+        std::process::exit(1);
+    });
+
+    println!("Evaluating {} records...", dataset.len());
+
+    let mut total_mae = 0.0_f64;
+    let mut total_max_error = 0.0_f64;
+    let mut total_mbb = 0.0_f64;
+    let mut count = 0_u64;
+
+    for i in 0..dataset.len() {
+        // INVARIANT: index is in bounds because we iterate up to dataset.len().
+        let item = dataset.get(i).unwrap();
+
+        let input = Tensor::<B, 2>::from_data(
+            TensorData::new(item.input.clone(), [1, INPUT_SIZE]),
+            &device,
+        );
+        let pred = model.forward(input);
+        let pred_vec: Vec<f32> = pred.into_data().to_vec::<f32>().unwrap();
+
+        let mask: Vec<bool> = item.mask.iter().map(|&v| v > 0.5).collect();
+        let pot = item.input[2657] * 400.0;
+
+        let metrics = compute_prediction_metrics(&pred_vec, &item.target, &mask, pot);
+        total_mae += metrics.mae;
+        total_max_error += metrics.max_error;
+        total_mbb += metrics.mbb_error;
+        count += 1;
+    }
+
+    if count == 0 {
+        println!("No records to evaluate.");
+        return;
+    }
+
+    let n = count as f64;
+    println!("Results ({count} records):");
+    println!("  MAE:       {:.6}", total_mae / n);
+    println!("  Max Error: {:.6}", total_max_error / n);
+    println!("  mBB:       {:.2}", total_mbb / n);
+}
+
