@@ -100,6 +100,7 @@ cargo run -p poker-solver-trainer --release -- <subcommand>  # always --release 
 | `range-solver-compare` | Identity test harness comparing range-solver against reference impl |
 | `tauri-app` | Desktop GUI exploration app |
 | `devserver` | HTTP mirror of Tauri API for browser debugging |
+| `cfvnet` | Deep CFV network: river datagen, training (burn), evaluation |
 | `test-macros` | `#[timed_test]` proc macro |
 
 ## Key Config Files

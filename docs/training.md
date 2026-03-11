@@ -356,6 +356,60 @@ See `sample_configurations/blueprint_v2_with_tui.yaml` for a complete example.
 
 ---
 
+## CFVnet Training Pipeline
+
+The `cfvnet` crate provides tools for training Deep Counterfactual Value Networks.
+
+### Generate Training Data
+
+```bash
+cargo run -p cfvnet --release -- generate \
+  --config sample_configurations/river_cfvnet.yaml \
+  --output data/river_training.bin \
+  --num-samples 1000000 \
+  --threads 8
+```
+
+### Train the Network
+
+```bash
+cargo run -p cfvnet --release -- train \
+  --config sample_configurations/river_cfvnet.yaml \
+  --data data/river_training.bin \
+  --output models/river_v1
+```
+
+### Evaluate on Held-Out Data
+
+```bash
+cargo run -p cfvnet --release -- evaluate \
+  --model models/river_v1 \
+  --data data/river_validation.bin
+```
+
+### Compare Against Exact Solves
+
+```bash
+cargo run -p cfvnet --release -- compare \
+  --model models/river_v1 \
+  --num-spots 100
+```
+
+### Configuration
+
+See `sample_configurations/river_cfvnet.yaml` for all options. Key parameters:
+
+| Parameter | Default | Description |
+|-|-|-|
+| `datagen.num_samples` | 1,000,000 | Training situations to generate |
+| `datagen.solver_iterations` | 1000 | DCFR iterations per situation |
+| `training.hidden_layers` | 7 | MLP depth |
+| `training.hidden_size` | 500 | Hidden layer width |
+| `training.batch_size` | 2048 | Training batch size |
+| `training.epochs` | 2 | Training epochs |
+
+---
+
 ## Cloud Training (AWS)
 
 See [`docs/cloud.md`](cloud.md) for running training jobs on AWS EC2 instances via the `solver-cloud` CLI.

@@ -234,3 +234,50 @@ A self-contained postflop solver that computes Nash equilibrium strategies for s
 
 - **Preflop-only model limitation:** The preflop solver with postflop equity reference finds a limp-trap equilibrium (AA ~30% raise) rather than full-game GTO (AA 100% raise). This is inherent to the preflop-only model, not a bug.
 - **No real-time subgame solving yet:** The postflop model is a static blueprint. Pluribus-style real-time search is planned but not implemented.
+
+## CFVnet (Deep Counterfactual Value Network)
+
+A neural network pipeline for learning river-street counterfactual values, enabling depth-limited solving without computing full river subtrees at runtime.
+
+**Crate:** `crates/cfvnet`
+
+### Pipeline
+
+```
+generate → train → evaluate → compare
+```
+
+1. **Generate** (`datagen`): Sample random river situations (board, pot, stack, ranges via DeepStack R(S,p)), solve each with range-solver DCFR, extract pot-relative CFVs for both players. Output: binary file of training records.
+
+2. **Train** (`model`): Train a 7-layer MLP (2660→500→...→1326) using Huber loss + auxiliary game-value consistency loss. Framework: burn (wgpu/ndarray backends).
+
+3. **Evaluate** (`eval`): Compute MAE, max error, and mbb/hand metrics on held-out data.
+
+4. **Compare** (`eval`): Generate fresh river spots, solve exactly, compare network predictions against ground truth.
+
+### Network Architecture
+
+```
+Input(2660) → [Linear(500) → BatchNorm → PReLU] × 7 → Linear(1326)
+```
+
+- Input: OOP range (1326) + IP range (1326) + board (5) + pot (1) + stack (1) + player (1)
+- Output: 1326 pot-relative counterfactual values
+- Loss: Huber (masked for board-blocked combos) + λ × auxiliary game-value constraint
+- ~3.5M parameters
+
+### Integration Point
+
+The CFVnet replaces exact river solving at the leaves of turn subgames during depth-limited re-solving. Given a turn decision point, the solver builds a turn subtree and queries the CFVnet at each river leaf instead of running full DCFR.
+
+### Key Files
+
+- Config: `crates/cfvnet/src/config.rs`
+- Range generator: `crates/cfvnet/src/datagen/range_gen.rs`
+- Situation sampler: `crates/cfvnet/src/datagen/sampler.rs`
+- Solve wrapper: `crates/cfvnet/src/datagen/solver.rs`
+- Network model: `crates/cfvnet/src/model/network.rs`
+- Loss functions: `crates/cfvnet/src/model/loss.rs`
+- Training loop: `crates/cfvnet/src/model/training.rs`
+- CLI: `crates/cfvnet/src/main.rs`
+- Sample config: `sample_configurations/river_cfvnet.yaml`
