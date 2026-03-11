@@ -5,6 +5,7 @@ use poker_solver_core::blueprint::solver_dispatch::{
 };
 use poker_solver_core::blueprint::{
     SubgameCfrSolver, SubgameHands, SubgameNode, SubgameStrategy, SubgameTree, SubgameTreeBuilder,
+    compute_combo_equities,
 };
 use poker_solver_core::game::{Action as GameAction, ALL_IN};
 use poker_solver_core::poker::{Card as RsPokerCard, Suit as RsPokerSuit, Value as RsPokerValue};
@@ -464,8 +465,8 @@ fn build_subgame_matrix(
 
 /// Build a subgame tree, run CFR+, and return everything needed for the matrix.
 ///
-/// The `_cbv_p0` / `_cbv_p1` parameters are placeholders for future CBV
-/// integration; leaf values are currently zeroed.
+/// Leaf values at `DepthBoundary` nodes use reach-weighted equity against
+/// the opponent range, converted to chip values by the solver.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_subgame_street(
     board_cards: &[RsPokerCard],
@@ -501,8 +502,10 @@ pub fn solve_subgame_street(
         })
         .collect();
 
-    // Zero leaf values (CBV integration is a TODO).
-    let leaf_values = vec![0.0; hands.combos.len()];
+    // Equity-based leaf values for DepthBoundary nodes.
+    // Each combo gets its reach-weighted equity against the opponent range,
+    // which the solver converts to chip values via (2*eq - 1) * half_pot.
+    let leaf_values = compute_combo_equities(&hands, board_cards, &opponent_reach);
 
     // Extract action labels from tree root.
     let action_infos = match &tree.nodes[0] {

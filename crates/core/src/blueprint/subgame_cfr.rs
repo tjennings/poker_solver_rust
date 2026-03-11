@@ -65,7 +65,8 @@ pub struct SubgameCfrSolver {
     equity_matrix: Vec<Vec<f64>>,
     /// Opponent reaching probability per combo.
     opponent_reach: Vec<f64>,
-    /// Leaf continuation values per combo (for `DepthBoundary` nodes).
+    /// Per-combo leaf equity (0.0 to 1.0) for `DepthBoundary` nodes.
+    /// Converted to chip values via `(2 * equity - 1) * half_pot`.
     leaf_values: Vec<f64>,
     /// Cumulative regrets: `(node_idx, combo_idx)` -> regrets per action.
     regret_sum: FxHashMap<u64, Vec<f64>>,
@@ -105,6 +106,11 @@ impl SubgameCfrSolver {
     ///
     /// For each combo, `combo_to_bucket` maps its index to a bucket id, then
     /// the CBV is looked up for the given `boundary_node_idx` in the table.
+    ///
+    /// TODO: CBV values are chip-based, but `leaf_values` is now interpreted as
+    /// equity (0.0–1.0). This method needs normalization to convert CBV chip
+    /// values into the equity domain before it can be used with the updated
+    /// `DepthBoundary` traversal.
     #[must_use]
     pub fn with_cbv_table(
         tree: SubgameTree,
@@ -185,8 +191,9 @@ impl SubgameCfrSolver {
                 pot,
                 ..
             } => self.terminal_value(hero_combo, is_fold, fold_player, pot, traverser),
-            SubgameNode::DepthBoundary { .. } => {
-                self.leaf_values.get(hero_combo).copied().unwrap_or(0.0)
+            SubgameNode::DepthBoundary { pot, .. } => {
+                let equity = self.leaf_values.get(hero_combo).copied().unwrap_or(0.5);
+                (2.0 * equity - 1.0) * f64::from(pot) / 2.0
             }
             SubgameNode::Decision {
                 position,
@@ -441,6 +448,42 @@ fn rank_combo(combo: [Card; 2], board: &[Card]) -> Rank {
 /// Check if two 2-card combos share any card.
 fn cards_overlap(a: [Card; 2], b: [Card; 2]) -> bool {
     a[0] == b[0] || a[0] == b[1] || a[1] == b[0] || a[1] == b[1]
+}
+
+// ---------------------------------------------------------------------------
+// Public helpers
+// ---------------------------------------------------------------------------
+
+/// Compute per-combo equity against an opponent range.
+///
+/// Returns a vector of equities (0.0 to 1.0) for each combo in `hands`,
+/// where equity is the reach-weighted probability of beating the opponent.
+/// Combos facing zero opponent reach get equity 0.5 (neutral).
+#[must_use]
+pub fn compute_combo_equities(
+    hands: &SubgameHands,
+    board: &[Card],
+    opponent_reach: &[f64],
+) -> Vec<f64> {
+    let equity_matrix = compute_equity_matrix(&hands.combos, board);
+    let n = hands.combos.len();
+    let mut equities = vec![0.5; n];
+
+    for i in 0..n {
+        let mut eq_sum = 0.0;
+        let mut reach_sum = 0.0;
+        for (j, &opp_r) in opponent_reach.iter().enumerate() {
+            if opp_r <= 0.0 || cards_overlap(hands.combos[i], hands.combos[j]) {
+                continue;
+            }
+            eq_sum += opp_r * equity_matrix[i][j];
+            reach_sum += opp_r;
+        }
+        if reach_sum > 0.0 {
+            equities[i] = eq_sum / reach_sum;
+        }
+    }
+    equities
 }
 
 // ---------------------------------------------------------------------------
