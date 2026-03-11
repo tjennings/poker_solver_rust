@@ -40,7 +40,7 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
     let pb = ProgressBar::new(num_samples);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{wide_bar} {pos}/{len} [{elapsed_precise}] {msg}")
+            .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
             .expect("valid progress bar template"),
     );
 

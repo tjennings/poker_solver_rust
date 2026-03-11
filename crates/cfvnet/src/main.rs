@@ -66,6 +66,17 @@ enum Commands {
     },
 }
 
+fn ensure_parent_dir(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+                eprintln!("failed to create directory {}: {e}", parent.display());
+                std::process::exit(1);
+            });
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -75,13 +86,19 @@ fn main() {
             output,
             num_samples,
             threads,
-        } => cmd_generate(config, output, num_samples, threads),
+        } => {
+            ensure_parent_dir(&output);
+            cmd_generate(config, output, num_samples, threads);
+        }
         Commands::Train {
             config,
             data,
             output,
             backend: _,
-        } => cmd_train(config, data, output),
+        } => {
+            ensure_parent_dir(&output);
+            cmd_train(config, data, output);
+        }
         Commands::Evaluate {
             model: _,
             data: _,

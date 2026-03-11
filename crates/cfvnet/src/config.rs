@@ -89,7 +89,9 @@ fn default_target_exploitability() -> f32 {
     0.005
 }
 fn default_threads() -> usize {
-    8
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(8)
 }
 fn default_seed() -> u64 {
     42
