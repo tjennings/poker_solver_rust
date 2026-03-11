@@ -77,14 +77,11 @@ fn main() {
             threads,
         } => cmd_generate(config, output, num_samples, threads),
         Commands::Train {
-            config: _,
-            data: _,
-            output: _,
+            config,
+            data,
+            output,
             backend: _,
-        } => {
-            eprintln!("Train not yet implemented (pending model/training.rs)");
-            std::process::exit(1);
-        }
+        } => cmd_train(config, data, output),
         Commands::Evaluate {
             model: _,
             data: _,
@@ -102,6 +99,44 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf) {
+    let yaml = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        eprintln!("failed to read config {}: {e}", config_path.display());
+        std::process::exit(1);
+    });
+
+    let cfg: cfvnet::config::CfvnetConfig = serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
+        eprintln!("failed to parse config: {e}");
+        std::process::exit(1);
+    });
+
+    let dataset = cfvnet::model::dataset::CfvDataset::from_file(&data).unwrap_or_else(|e| {
+        eprintln!("failed to load dataset: {e}");
+        std::process::exit(1);
+    });
+    println!("Loaded {} training records", dataset.len());
+
+    let train_config = cfvnet::model::training::TrainConfig {
+        hidden_layers: cfg.training.hidden_layers,
+        hidden_size: cfg.training.hidden_size,
+        batch_size: cfg.training.batch_size,
+        epochs: cfg.training.epochs,
+        learning_rate: cfg.training.learning_rate,
+        lr_min: cfg.training.lr_min,
+        huber_delta: cfg.training.huber_delta,
+        aux_loss_weight: cfg.training.aux_loss_weight,
+        validation_split: cfg.training.validation_split,
+        checkpoint_every_n_batches: cfg.training.checkpoint_every_n_batches,
+    };
+
+    use burn::backend::{Autodiff, NdArray};
+    type B = Autodiff<NdArray>;
+    let device = Default::default();
+
+    let result = cfvnet::model::training::train::<B>(&device, &dataset, &train_config, Some(&output));
+    println!("Training complete. Final loss: {}", result.final_train_loss);
 }
 
 fn cmd_generate(
