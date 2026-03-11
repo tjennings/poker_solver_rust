@@ -934,7 +934,7 @@ impl BlueprintTrainer {
         // (chance_node, bucket).
         let bucket_counts = self.storage.bucket_counts;
         let [p0_cbvs, p1_cbvs] =
-            crate::blueprint::cbv_compute::compute_cbvs(&strategy, &self.tree, bucket_counts);
+            crate::blueprint_v2::cbv_compute::compute_cbvs(&strategy, &self.tree, bucket_counts);
         p0_cbvs.save(&snapshot_dir.join("cbv_p0.bin"))?;
         p1_cbvs.save(&snapshot_dir.join("cbv_p1.bin"))?;
 

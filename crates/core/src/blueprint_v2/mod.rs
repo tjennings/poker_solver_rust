@@ -1,5 +1,7 @@
 pub mod bucket_file;
 pub mod bundle;
+pub mod cbv;
+pub mod cbv_compute;
 pub mod cluster_diagnostics;
 pub mod cluster_pipeline;
 pub mod clustering;
