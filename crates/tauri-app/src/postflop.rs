@@ -1,4 +1,10 @@
 use parking_lot::{Mutex, RwLock};
+use poker_solver_core::blueprint::full_depth_solver::rs_poker_card_to_id;
+use poker_solver_core::blueprint::{
+    SubgameCfrSolver, SubgameHands, SubgameNode, SubgameStrategy, SubgameTree, SubgameTreeBuilder,
+};
+use poker_solver_core::game::{Action as GameAction, ALL_IN};
+use poker_solver_core::poker::{Card as RsPokerCard, Suit as RsPokerSuit, Value as RsPokerValue};
 use range_solver::action_tree::{Action, ActionTree, BoardState, TreeConfig};
 use range_solver::bet_size::BetSizeOptions;
 use range_solver::card::{card_from_str, card_pair_to_index, card_to_string, CardConfig, NOT_DEALT};
@@ -232,6 +238,284 @@ fn action_to_info(action: &Action, index: usize, pot: i32) -> ActionInfo {
             size_key: None,
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Subgame solver helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a 2-char card string (e.g. "Ks") into an `rs_poker` Card.
+fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
+    if s.len() != 2 {
+        return Err(format!("Invalid card string: {s}"));
+    }
+    let mut chars = s.chars();
+    let rank_ch = chars.next().unwrap();
+    let suit_ch = chars.next().unwrap();
+
+    let value = match rank_ch {
+        'A' | 'a' => RsPokerValue::Ace,
+        'K' | 'k' => RsPokerValue::King,
+        'Q' | 'q' => RsPokerValue::Queen,
+        'J' | 'j' => RsPokerValue::Jack,
+        'T' | 't' => RsPokerValue::Ten,
+        '9' => RsPokerValue::Nine,
+        '8' => RsPokerValue::Eight,
+        '7' => RsPokerValue::Seven,
+        '6' => RsPokerValue::Six,
+        '5' => RsPokerValue::Five,
+        '4' => RsPokerValue::Four,
+        '3' => RsPokerValue::Three,
+        '2' => RsPokerValue::Two,
+        c => return Err(format!("Unknown rank: {c}")),
+    };
+    let suit = match suit_ch {
+        's' | 'S' => RsPokerSuit::Spade,
+        'h' | 'H' => RsPokerSuit::Heart,
+        'd' | 'D' => RsPokerSuit::Diamond,
+        'c' | 'C' => RsPokerSuit::Club,
+        c => return Err(format!("Unknown suit: {c}")),
+    };
+    Ok(RsPokerCard::new(value, suit))
+}
+
+/// Convert a subgame tree action to an `ActionInfo` for the UI.
+///
+/// `bet_sizes` and `pot` are used to resolve bet-size indices into chip
+/// amounts for display labels.
+fn subgame_action_to_info(
+    action: &GameAction,
+    index: usize,
+    pot: u32,
+    bet_sizes: &[f32],
+) -> ActionInfo {
+    match *action {
+        GameAction::Fold => ActionInfo {
+            id: index.to_string(),
+            label: "Fold".to_string(),
+            action_type: "fold".to_string(),
+            size_key: None,
+        },
+        GameAction::Check => ActionInfo {
+            id: index.to_string(),
+            label: "Check".to_string(),
+            action_type: "check".to_string(),
+            size_key: None,
+        },
+        GameAction::Call => ActionInfo {
+            id: index.to_string(),
+            label: "Call".to_string(),
+            action_type: "call".to_string(),
+            size_key: None,
+        },
+        GameAction::Bet(idx) => {
+            if idx == ALL_IN {
+                ActionInfo {
+                    id: index.to_string(),
+                    label: "All-in".to_string(),
+                    action_type: "allin".to_string(),
+                    size_key: None,
+                }
+            } else {
+                let frac = bet_sizes.get(idx as usize).copied().unwrap_or(1.0);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let chip_amt = (f64::from(pot) * f64::from(frac)).round() as i32;
+                ActionInfo {
+                    id: index.to_string(),
+                    label: format!("Bet {}", format_pot_pct(chip_amt, pot as i32)),
+                    action_type: "bet".to_string(),
+                    size_key: Some(idx.to_string()),
+                }
+            }
+        }
+        GameAction::Raise(idx) => {
+            if idx == ALL_IN {
+                ActionInfo {
+                    id: index.to_string(),
+                    label: "All-in".to_string(),
+                    action_type: "allin".to_string(),
+                    size_key: None,
+                }
+            } else {
+                let frac = bet_sizes.get(idx as usize).copied().unwrap_or(1.0);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let chip_amt = (f64::from(pot) * f64::from(frac)).round() as i32;
+                ActionInfo {
+                    id: index.to_string(),
+                    label: format!("Raise {}", format_pot_pct(chip_amt, pot as i32)),
+                    action_type: "raise".to_string(),
+                    size_key: Some(idx.to_string()),
+                }
+            }
+        }
+    }
+}
+
+/// Build a 13x13 strategy matrix from `SubgameCfrSolver` output.
+///
+/// `node_idx` selects which decision node's strategy to display (0 = root).
+#[allow(clippy::too_many_arguments)]
+fn build_subgame_matrix(
+    hands: &SubgameHands,
+    strategy: &SubgameStrategy,
+    action_infos: Vec<ActionInfo>,
+    weights: &[f32],
+    board_card_strings: &[String],
+    pot: i32,
+    stacks: [i32; 2],
+    player: usize,
+    node_idx: u32,
+) -> PostflopStrategyMatrix {
+    let num_actions = action_infos.len();
+
+    let mut prob_sums = vec![vec![vec![0.0f64; num_actions]; 13]; 13];
+    let mut combo_counts = vec![vec![0usize; 13]; 13];
+    let mut weight_sums = vec![vec![0.0f64; 13]; 13];
+    let mut combo_details: Vec<Vec<Vec<PostflopComboDetail>>> = vec![vec![Vec::new(); 13]; 13];
+
+    for (combo_idx, combo) in hands.combos.iter().enumerate() {
+        let rs_id0 = rs_poker_card_to_id(combo[0]);
+        let rs_id1 = rs_poker_card_to_id(combo[1]);
+        let ci = card_pair_to_index(rs_id0, rs_id1);
+        let w = weights[ci] as f64;
+        if w <= 0.0 {
+            continue;
+        }
+
+        let (row, col, _) = card_pair_to_matrix(rs_id0, rs_id1);
+        combo_counts[row][col] += 1;
+        weight_sums[row][col] += w;
+
+        let probs = strategy.get_probs(node_idx, combo_idx);
+        let mut prob_f32 = Vec::with_capacity(num_actions);
+        for (a, prob_sum) in prob_sums[row][col].iter_mut().enumerate() {
+            let p = probs.get(a).copied().unwrap_or(0.0);
+            *prob_sum += p;
+            prob_f32.push(p as f32);
+        }
+
+        let s1 = card_to_string(rs_id0).unwrap_or_default();
+        let s2 = card_to_string(rs_id1).unwrap_or_default();
+        combo_details[row][col].push(PostflopComboDetail {
+            cards: format!("{s1}{s2}"),
+            probabilities: prob_f32,
+        });
+    }
+
+    let cells: Vec<Vec<PostflopMatrixCell>> = (0..13)
+        .map(|row| {
+            (0..13)
+                .map(|col| {
+                    let (label, suited, pair) = matrix_cell_label(row, col);
+                    let count = combo_counts[row][col];
+                    let probabilities = if count > 0 {
+                        prob_sums[row][col]
+                            .iter()
+                            .map(|&s| (s / count as f64) as f32)
+                            .collect()
+                    } else {
+                        vec![0.0; num_actions]
+                    };
+                    let combos = std::mem::take(&mut combo_details[row][col]);
+                    let weight = if count > 0 {
+                        (weight_sums[row][col] / count as f64) as f32
+                    } else {
+                        0.0
+                    };
+                    PostflopMatrixCell {
+                        hand: label,
+                        suited,
+                        pair,
+                        probabilities,
+                        combo_count: count,
+                        ev: None,
+                        combos,
+                        weight,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    PostflopStrategyMatrix {
+        cells,
+        actions: action_infos,
+        player,
+        pot,
+        stacks,
+        board: board_card_strings.to_vec(),
+    }
+}
+
+/// Build a subgame tree, run CFR+, and return everything needed for the matrix.
+///
+/// The `_cbv_p0` / `_cbv_p1` parameters are placeholders for future CBV
+/// integration; leaf values are currently zeroed.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_subgame_street(
+    board_cards: &[RsPokerCard],
+    bet_sizes: &[f32],
+    pot: u32,
+    stacks: [u32; 2],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    iterations: u32,
+    player: usize,
+    progress_state: &Arc<PostflopState>,
+) -> Result<(SubgameStrategy, SubgameHands, Vec<ActionInfo>, SubgameTree), String> {
+    let tree = SubgameTreeBuilder::new()
+        .board(board_cards)
+        .bet_sizes(bet_sizes)
+        .pot(pot)
+        .stacks(&[stacks[0], stacks[1]])
+        .depth_limit(1)
+        .build();
+
+    let hands = SubgameHands::enumerate(board_cards);
+
+    // Map opponent reach from the 1326-weight vector to SubgameHands ordering.
+    let opp_weights = if player == 0 { ip_weights } else { oop_weights };
+    let opponent_reach: Vec<f64> = hands
+        .combos
+        .iter()
+        .map(|combo| {
+            let rs_id0 = rs_poker_card_to_id(combo[0]);
+            let rs_id1 = rs_poker_card_to_id(combo[1]);
+            let ci = card_pair_to_index(rs_id0, rs_id1);
+            f64::from(opp_weights[ci])
+        })
+        .collect();
+
+    // Zero leaf values (CBV integration is a TODO).
+    let leaf_values = vec![0.0; hands.combos.len()];
+
+    // Extract action labels from tree root.
+    let action_infos = match &tree.nodes[0] {
+        SubgameNode::Decision { actions, .. } => actions
+            .iter()
+            .enumerate()
+            .map(|(i, a)| subgame_action_to_info(a, i, pot, bet_sizes))
+            .collect(),
+        _ => return Err("Subgame tree root is not a decision node".to_string()),
+    };
+
+    let mut solver = SubgameCfrSolver::new(
+        tree.clone(),
+        hands.clone(),
+        opponent_reach,
+        leaf_values,
+    );
+
+    for t in 0..iterations {
+        if !progress_state.solving.load(Ordering::Relaxed) {
+            break;
+        }
+        solver.train(1);
+        progress_state.current_iteration.store(t + 1, Ordering::Relaxed);
+    }
+
+    let strategy = solver.strategy();
+    Ok((strategy, hands, action_infos, tree))
 }
 
 // ---------------------------------------------------------------------------
