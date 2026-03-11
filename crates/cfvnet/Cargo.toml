@@ -1,0 +1,18 @@
+[package]
+name = "cfvnet"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+range-solver = { path = "../range-solver" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+rand = "0.8"
+rand_chacha = "0.3"
+rayon = { workspace = true }
+indicatif = "0.17"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
