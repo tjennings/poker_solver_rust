@@ -430,6 +430,156 @@ impl CfvSubgameSolver {
         }
     }
 
+    /// Build average strategy from cumulative strategy sums.
+    ///
+    /// Each decision node / combo pair gets its strategy sum normalized to a
+    /// probability distribution. Uniform fallback when no weight has
+    /// accumulated.
+    #[allow(clippy::cast_precision_loss)]
+    fn build_average_strategy(&self) -> Vec<f64> {
+        let mut avg = vec![0.0; self.layout.total_size];
+        let num_combos = self.hands.combos.len();
+
+        for (node_idx, node) in self.tree.nodes.iter().enumerate() {
+            let num_actions = match node {
+                GameNode::Decision { actions, .. } => actions.len(),
+                _ => continue,
+            };
+
+            for combo_idx in 0..num_combos {
+                let (base, _) = self.layout.slot(node_idx, combo_idx);
+                let sums = &self.strategy_sum[base..base + num_actions];
+                let total: f64 = sums.iter().sum();
+                if total > 0.0 {
+                    for a in 0..num_actions {
+                        avg[base + a] = sums[a] / total;
+                    }
+                } else {
+                    let uniform = 1.0 / num_actions as f64;
+                    for a in 0..num_actions {
+                        avg[base + a] = uniform;
+                    }
+                }
+            }
+        }
+
+        avg
+    }
+
+    /// Compute root counterfactual values for each combo.
+    ///
+    /// After training, call this to extract per-combo expected values from
+    /// `traverser`'s perspective using the average strategy. Returns one
+    /// value per combo in `self.hands.combos`.
+    ///
+    /// Internally evaluates leaf boundaries using the stored `leaf_cfvs`
+    /// from the last training iteration, which is acceptable because the
+    /// average strategy converges to Nash and the last boundary evaluations
+    /// reflect the final range propagation.
+    #[must_use]
+    pub fn root_cfvs(&self, traverser: u8) -> Vec<f64> {
+        let avg_strategy = self.build_average_strategy();
+        let num_combos = self.hands.combos.len();
+        let mut cfvs = Vec::with_capacity(num_combos);
+
+        for combo_idx in 0..num_combos {
+            let val = self.eval_combo_value(
+                &avg_strategy,
+                self.tree.root as usize,
+                combo_idx,
+                traverser,
+            );
+            cfvs.push(val);
+        }
+
+        cfvs
+    }
+
+    /// Recursive tree walk computing the expected value for a single combo
+    /// under the given strategy profile.
+    ///
+    /// At terminals, returns fold/showdown/boundary payoffs. At decision
+    /// nodes, weights child values by strategy probabilities.
+    fn eval_combo_value(
+        &self,
+        strategy: &[f64],
+        node_idx: usize,
+        combo_idx: usize,
+        traverser: u8,
+    ) -> f64 {
+        match &self.tree.nodes[node_idx] {
+            GameNode::Terminal { kind, pot, .. } => {
+                let half_pot = *pot / 2.0;
+                match kind {
+                    TerminalKind::Fold { winner } => {
+                        if *winner == traverser {
+                            half_pot
+                        } else {
+                            -half_pot
+                        }
+                    }
+                    TerminalKind::Showdown => {
+                        self.showdown_value_avg(combo_idx, half_pot, traverser)
+                    }
+                    TerminalKind::DepthBoundary => {
+                        let ordinal = self.node_to_boundary[node_idx];
+                        if ordinal == usize::MAX {
+                            0.0
+                        } else {
+                            self.leaf_cfvs[ordinal]
+                                .get(combo_idx)
+                                .copied()
+                                .unwrap_or(0.0)
+                                * half_pot
+                        }
+                    }
+                }
+            }
+
+            GameNode::Chance { child, .. } => {
+                self.eval_combo_value(strategy, *child as usize, combo_idx, traverser)
+            }
+
+            GameNode::Decision { children, actions, .. } => {
+                let (base, _) = self.layout.slot(node_idx, combo_idx);
+                let num_actions = actions.len();
+                let strat = &strategy[base..base + num_actions];
+
+                let mut value = 0.0;
+                for (a, &child_idx) in children.iter().enumerate() {
+                    let child_val = self.eval_combo_value(
+                        strategy,
+                        child_idx as usize,
+                        combo_idx,
+                        traverser,
+                    );
+                    value += strat[a] * child_val;
+                }
+                value
+            }
+        }
+    }
+
+    /// Showdown value for `root_cfvs` evaluation: equity vs uniform opponent.
+    fn showdown_value_avg(&self, hero_combo: usize, half_pot: f64, _traverser: u8) -> f64 {
+        let hero_cards = self.hands.combos[hero_combo];
+        let opp_reach_total = self.opp_reach_totals[hero_combo];
+        if opp_reach_total <= 0.0 {
+            return 0.0;
+        }
+
+        let mut equity_sum = 0.0;
+        for (j, eq_row) in self.equity_matrix[hero_combo].iter().enumerate() {
+            if cards_overlap(hero_cards, self.hands.combos[j]) {
+                continue;
+            }
+            equity_sum += eq_row;
+        }
+
+        let avg_equity = equity_sum / opp_reach_total;
+        (2.0 * avg_equity - 1.0) * half_pot
+    }
+
     /// Extract the average strategy from cumulative strategy sums.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
@@ -1180,5 +1330,73 @@ mod tests {
 
         let strategy = solver.strategy();
         assert!(strategy.num_combos() > 0);
+    }
+
+    #[timed_test(30)]
+    fn root_cfvs_returns_correct_length() {
+        let board = river_board();
+        let tree = river_tree(&[1.0]);
+        let hands = small_hands(&board, 30);
+        let n = hands.combos.len();
+        let evaluator = Box::new(ConstantEvaluator(0.5));
+        let mut solver =
+            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+
+        solver.train(100);
+
+        let oop_cfvs = solver.root_cfvs(0);
+        let ip_cfvs = solver.root_cfvs(1);
+        assert_eq!(oop_cfvs.len(), n);
+        assert_eq!(ip_cfvs.len(), n);
+    }
+
+    #[timed_test(30)]
+    fn root_cfvs_are_finite_and_bounded() {
+        let board = river_board();
+        let tree = river_tree(&[1.0]);
+        let hands = small_hands(&board, 30);
+        let evaluator = Box::new(ConstantEvaluator(0.5));
+        let mut solver =
+            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+
+        solver.train(200);
+
+        for traverser in 0..2u8 {
+            let cfvs = solver.root_cfvs(traverser);
+            for (i, &cfv) in cfvs.iter().enumerate() {
+                assert!(
+                    cfv.is_finite(),
+                    "traverser {traverser} combo {i}: CFV not finite: {cfv}"
+                );
+                // CFVs should be bounded by half_pot (50.0 in this setup).
+                assert!(
+                    cfv.abs() < 100.0,
+                    "traverser {traverser} combo {i}: CFV {cfv} seems too large"
+                );
+            }
+        }
+    }
+
+    #[timed_test(30)]
+    fn root_cfvs_with_depth_boundary() {
+        let board = turn_board();
+        let tree = turn_tree_depth_limited(&[1.0], 1);
+        let hands = small_hands(&board, 30);
+        let n = hands.combos.len();
+        let evaluator = Box::new(ConstantEvaluator(0.5));
+        let mut solver =
+            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+
+        solver.train(200);
+
+        let oop_cfvs = solver.root_cfvs(0);
+        let ip_cfvs = solver.root_cfvs(1);
+        assert_eq!(oop_cfvs.len(), n);
+        assert_eq!(ip_cfvs.len(), n);
+
+        for (i, (&oop, &ip)) in oop_cfvs.iter().zip(ip_cfvs.iter()).enumerate() {
+            assert!(oop.is_finite(), "OOP combo {i}: CFV not finite: {oop}");
+            assert!(ip.is_finite(), "IP combo {i}: CFV not finite: {ip}");
+        }
     }
 }
