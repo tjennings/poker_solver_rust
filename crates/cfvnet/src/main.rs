@@ -124,6 +124,22 @@ fn append_random_suffix(path: &std::path::Path) -> PathBuf {
     path.with_file_name(new_name)
 }
 
+/// Resolve a model path from user input.
+///
+/// Accepts either:
+/// - A directory: appends `/model` (burn adds `.mpk.gz`)
+/// - A `.mpk.gz` file: strips `.mpk.gz` (burn re-adds it)
+fn resolve_model_path(path: &std::path::Path) -> PathBuf {
+    if path.is_dir() {
+        path.join("model")
+    } else {
+        // Strip .mpk.gz extension(s) since burn's load_file adds them back.
+        let s = path.to_string_lossy();
+        let stripped = s.strip_suffix(".mpk.gz").unwrap_or(&s);
+        PathBuf::from(stripped.to_string())
+    }
+}
+
 fn ensure_parent_dir(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -205,6 +221,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         checkpoint_every_n_epochs: cfg.training.checkpoint_every_n_epochs,
         gpu_chunk_size: cfg.training.gpu_chunk_size,
         epochs_per_chunk: cfg.training.epochs_per_chunk,
+        prefetch_chunks: cfg.training.prefetch_chunks,
     };
 
     match backend {
@@ -344,7 +361,7 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
     type B = NdArray;
     let device = Default::default();
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
-    let model_path = model_dir.join("model");
+    let model_path = resolve_model_path(&model_dir);
 
     let model = CfvNet::<B>::new(&device, 7, 500, in_size)
         .load_file(&model_path, &recorder, &device)
@@ -420,7 +437,7 @@ fn cmd_compare(
     type B = NdArray;
     let device = Default::default();
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
-    let model_path = model_dir.join("model");
+    let model_path = resolve_model_path(&model_dir);
 
     let model = CfvNet::<B>::new(&device, 7, 500, in_size)
         .load_file(&model_path, &recorder, &device)
@@ -480,8 +497,8 @@ fn cmd_compare_net(
     use cfvnet::eval::compare_turn::run_turn_comparison_net;
 
     let cfg = load_config_or_default(config_path.as_deref());
-    let model_path = model_dir.join("model");
-    let river_path = river_model_dir.join("model");
+    let model_path = resolve_model_path(&model_dir);
+    let river_path = resolve_model_path(&river_model_dir);
 
     println!("Comparing {num_spots} turn spots against CfvSubgameSolver + RiverNetEvaluator...");
 
@@ -498,7 +515,7 @@ fn cmd_compare_exact(model_dir: PathBuf, num_spots: usize, config_path: Option<P
     use cfvnet::eval::compare_turn::run_turn_comparison_exact;
 
     let cfg = load_config_or_default(config_path.as_deref());
-    let model_path = model_dir.join("model");
+    let model_path = resolve_model_path(&model_dir);
 
     println!("Comparing {num_spots} turn spots against CfvSubgameSolver + ExactRiverEvaluator...");
 
