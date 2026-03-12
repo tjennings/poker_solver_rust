@@ -22,7 +22,7 @@ use range_solver::card::card_pair_to_index;
 use crate::config::CfvnetConfig;
 use crate::datagen::range_gen::NUM_COMBOS;
 use crate::datagen::sampler::{sample_situation, Situation};
-use crate::eval::compare::ComparisonSummary;
+use crate::eval::compare::{ComparisonSummary, SpotResult};
 use crate::eval::metrics::compute_prediction_metrics;
 use crate::eval::river_net_evaluator::RiverNetEvaluator;
 use crate::model::network::{CfvNet, input_size};
@@ -154,39 +154,49 @@ fn compare_single(
     bet_sizes: &[Vec<f64>],
     solver_iterations: u32,
     evaluator: Box<dyn LeafEvaluator>,
-) -> (f64, f64, f64) {
+) -> (f64, f64, f64, SpotResult) {
     let (actual, valid_mask) = solve_and_extract(sit, bet_sizes, solver_iterations, evaluator, 0);
     let predicted = predict_with_model(model, device, sit, 0);
 
     let mask_bool: Vec<bool> = valid_mask.to_vec();
     let metrics = compute_prediction_metrics(&predicted, &actual, &mask_bool, sit.pot as f32);
-    (metrics.mae, metrics.max_error, metrics.mbb_error)
+    (metrics.mae, metrics.max_error, metrics.mbb_error, SpotResult {
+        board: sit.board,
+        board_size: sit.board_size,
+        pot: sit.pot,
+        effective_stack: sit.effective_stack,
+        mae: metrics.mae,
+        mbb: metrics.mbb_error,
+    })
 }
 
 /// Aggregate per-spot metrics into a `ComparisonSummary`.
-fn aggregate(results: Vec<(f64, f64, f64)>) -> ComparisonSummary {
+fn aggregate(results: Vec<(f64, f64, f64, SpotResult)>) -> ComparisonSummary {
     let n = results.len() as f64;
     let mut sum_mae = 0.0;
     let mut sum_max = 0.0;
     let mut sum_mbb = 0.0;
     let mut worst_mae = 0.0_f64;
     let mut worst_mbb = 0.0_f64;
+    let mut spots = Vec::with_capacity(results.len());
 
-    for &(mae, max_err, mbb) in &results {
+    for (mae, max_err, mbb, spot) in results {
         sum_mae += mae;
         sum_max += max_err;
         sum_mbb += mbb;
         worst_mae = worst_mae.max(mae);
         worst_mbb = worst_mbb.max(mbb);
+        spots.push(spot);
     }
 
     ComparisonSummary {
-        num_spots: results.len(),
+        num_spots: spots.len(),
         mean_mae: sum_mae / n,
         mean_max_error: sum_max / n,
         mean_mbb: sum_mbb / n,
         worst_mae,
         worst_mbb,
+        spots,
     }
 }
 
@@ -258,9 +268,8 @@ pub fn run_turn_comparison_net(
             solver_iterations,
             evaluator,
         );
-        results.push(result);
-
         eprintln!("  spot {}/{num_spots}: MAE={:.6}, mBB={:.2}", i + 1, result.0, result.2);
+        results.push(result);
     }
 
     if results.is_empty() {
@@ -330,9 +339,8 @@ pub fn run_turn_comparison_exact(
             solver_iterations,
             evaluator,
         );
-        results.push(result);
-
         eprintln!("  spot {}/{num_spots}: MAE={:.6}, mBB={:.2}", i + 1, result.0, result.2);
+        results.push(result);
     }
 
     if results.is_empty() {
