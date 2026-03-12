@@ -64,6 +64,33 @@ enum Commands {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// Compare turn model against CfvSubgameSolver + RiverNetEvaluator
+    CompareNet {
+        /// Path to turn model directory
+        #[arg(short, long)]
+        model: PathBuf,
+        /// Path to river model directory
+        #[arg(long)]
+        river_model: PathBuf,
+        /// Number of spots to compare
+        #[arg(long, default_value = "100")]
+        num_spots: usize,
+        /// Optional YAML config for game and solver parameters
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// Compare turn model against CfvSubgameSolver + ExactRiverEvaluator
+    CompareExact {
+        /// Path to turn model directory
+        #[arg(short, long)]
+        model: PathBuf,
+        /// Number of spots to compare
+        #[arg(long, default_value = "20")]
+        num_spots: usize,
+        /// Optional YAML config for game and solver parameters
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
 }
 
 fn ensure_parent_dir(path: &std::path::Path) {
@@ -106,6 +133,17 @@ fn main() {
             threads,
             config,
         } => cmd_compare(model, num_spots, threads, config),
+        Commands::CompareNet {
+            model,
+            river_model,
+            num_spots,
+            config,
+        } => cmd_compare_net(model, river_model, num_spots, config),
+        Commands::CompareExact {
+            model,
+            num_spots,
+            config,
+        } => cmd_compare_exact(model, num_spots, config),
     }
 }
 
@@ -336,6 +374,75 @@ fn cmd_compare(
         std::process::exit(1);
     });
 
+    print_summary(&summary);
+}
+
+fn cmd_compare_net(
+    model_dir: PathBuf,
+    river_model_dir: PathBuf,
+    num_spots: usize,
+    config_path: Option<PathBuf>,
+) {
+    use cfvnet::eval::compare_turn::run_turn_comparison_net;
+
+    let cfg = load_config_or_default(config_path.as_deref());
+    let model_path = model_dir.join("model");
+    let river_path = river_model_dir.join("model");
+
+    println!("Comparing {num_spots} turn spots against CfvSubgameSolver + RiverNetEvaluator...");
+
+    let summary = run_turn_comparison_net(&cfg, &model_path, &river_path, num_spots, 42)
+        .unwrap_or_else(|e| {
+            eprintln!("comparison failed: {e}");
+            std::process::exit(1);
+        });
+
+    print_summary(&summary);
+}
+
+fn cmd_compare_exact(model_dir: PathBuf, num_spots: usize, config_path: Option<PathBuf>) {
+    use cfvnet::eval::compare_turn::run_turn_comparison_exact;
+
+    let cfg = load_config_or_default(config_path.as_deref());
+    let model_path = model_dir.join("model");
+
+    println!("Comparing {num_spots} turn spots against CfvSubgameSolver + ExactRiverEvaluator...");
+
+    let summary = run_turn_comparison_exact(&cfg, &model_path, num_spots, 42).unwrap_or_else(|e| {
+        eprintln!("comparison failed: {e}");
+        std::process::exit(1);
+    });
+
+    print_summary(&summary);
+}
+
+fn load_config_or_default(config_path: Option<&std::path::Path>) -> cfvnet::config::CfvnetConfig {
+    match config_path {
+        Some(path) => {
+            let yaml = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                eprintln!("failed to read config {}: {e}", path.display());
+                std::process::exit(1);
+            });
+            serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
+                eprintln!("failed to parse config: {e}");
+                std::process::exit(1);
+            })
+        }
+        None => {
+            use cfvnet::config::{
+                CfvnetConfig, DatagenConfig, EvaluationConfig, GameConfig, TrainingConfig,
+            };
+            CfvnetConfig {
+                game: GameConfig::default(),
+                datagen: DatagenConfig::default(),
+                training: TrainingConfig::default(),
+                evaluation: EvaluationConfig::default(),
+            }
+        }
+    }
+}
+
+fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
     println!("Results ({} spots):", summary.num_spots);
     println!("  Mean MAE:       {:.6}", summary.mean_mae);
     println!("  Mean Max Error: {:.6}", summary.mean_max_error);
