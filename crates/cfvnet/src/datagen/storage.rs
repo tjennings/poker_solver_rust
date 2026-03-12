@@ -34,9 +34,12 @@ pub struct TrainingRecord {
     pub valid_mask: [u8; NUM_COMBOS],
 }
 
-/// Write a single training record in little-endian format.
+/// Write a single training record in little-endian (native) format.
 ///
 /// Format: `[board_size: u8] [board: board_size × u8] [pot: f32] ...`
+///
+/// The f32 arrays are written as a single bulk `write_all` call via `bytemuck`,
+/// which is correct on little-endian platforms (all current targets).
 pub fn write_record<W: Write>(w: &mut W, rec: &TrainingRecord) -> io::Result<()> {
     let board_size = rec.board.len() as u8;
     w.write_all(&[board_size])?;
@@ -45,15 +48,9 @@ pub fn write_record<W: Write>(w: &mut W, rec: &TrainingRecord) -> io::Result<()>
     w.write_all(&rec.effective_stack.to_le_bytes())?;
     w.write_all(&[rec.player])?;
     w.write_all(&rec.game_value.to_le_bytes())?;
-    for &v in &rec.oop_range {
-        w.write_all(&v.to_le_bytes())?;
-    }
-    for &v in &rec.ip_range {
-        w.write_all(&v.to_le_bytes())?;
-    }
-    for &v in &rec.cfvs {
-        w.write_all(&v.to_le_bytes())?;
-    }
+    w.write_all(bytemuck::cast_slice(&rec.oop_range))?;
+    w.write_all(bytemuck::cast_slice(&rec.ip_range))?;
+    w.write_all(bytemuck::cast_slice(&rec.cfvs))?;
     w.write_all(&rec.valid_mask)?;
     Ok(())
 }
@@ -83,22 +80,13 @@ pub fn read_record<R: Read>(r: &mut R) -> io::Result<TrainingRecord> {
     let game_value = f32::from_le_bytes(buf4);
 
     let mut oop_range = [0.0f32; NUM_COMBOS];
-    for v in &mut oop_range {
-        r.read_exact(&mut buf4)?;
-        *v = f32::from_le_bytes(buf4);
-    }
+    r.read_exact(bytemuck::cast_slice_mut(&mut oop_range))?;
 
     let mut ip_range = [0.0f32; NUM_COMBOS];
-    for v in &mut ip_range {
-        r.read_exact(&mut buf4)?;
-        *v = f32::from_le_bytes(buf4);
-    }
+    r.read_exact(bytemuck::cast_slice_mut(&mut ip_range))?;
 
     let mut cfvs = [0.0f32; NUM_COMBOS];
-    for v in &mut cfvs {
-        r.read_exact(&mut buf4)?;
-        *v = f32::from_le_bytes(buf4);
-    }
+    r.read_exact(bytemuck::cast_slice_mut(&mut cfvs))?;
 
     let mut valid_mask = [0u8; NUM_COMBOS];
     r.read_exact(&mut valid_mask)?;

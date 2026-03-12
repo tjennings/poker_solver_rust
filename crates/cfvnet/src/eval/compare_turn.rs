@@ -83,7 +83,7 @@ fn solve_and_extract(
     evaluator: Box<dyn LeafEvaluator>,
     traverser: u8,
 ) -> ([f32; NUM_COMBOS], [bool; NUM_COMBOS]) {
-    let board_cards: Vec<Card> = sit.board.iter().map(|&c| u8_to_rs_card(c)).collect();
+    let board_cards: Vec<Card> = sit.board_cards().iter().map(|&c| u8_to_rs_card(c)).collect();
     let pot = f64::from(sit.pot);
     let effective_stack = f64::from(sit.effective_stack);
     let invested = [pot / 2.0; 2];
@@ -132,7 +132,7 @@ fn predict_with_model(
     let mut input = Vec::with_capacity(in_size);
     input.extend_from_slice(&sit.ranges[0]);
     input.extend_from_slice(&sit.ranges[1]);
-    for &card in &sit.board {
+    for &card in sit.board_cards() {
         input.push(f32::from(card) / 51.0);
     }
     input.push(sit.pot as f32 / 400.0);

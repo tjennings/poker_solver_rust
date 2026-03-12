@@ -68,7 +68,7 @@ impl CfvDataset {
 /// rather than a raw `TrainingRecord`, making it usable at inference time
 /// when no stored record exists.
 pub fn encode_situation_for_inference(sit: &Situation, player: u8) -> Vec<f32> {
-    let board_cards = sit.board.len();
+    let board_cards = sit.board_size;
     let in_size = input_size(board_cards);
     let mut input = Vec::with_capacity(in_size);
     // OOP range (1326 floats)
@@ -80,7 +80,7 @@ pub fn encode_situation_for_inference(sit: &Situation, player: u8) -> Vec<f32> {
         input.push(v);
     }
     // Board cards (normalized to [0, 1])
-    for &card in &sit.board {
+    for &card in sit.board_cards() {
         input.push(f32::from(card) / 51.0);
     }
     // Pot (normalized by max pot)

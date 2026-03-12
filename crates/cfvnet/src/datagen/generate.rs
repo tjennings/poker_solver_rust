@@ -140,8 +140,10 @@ fn write_chunk(
 
         let valid_mask = bool_mask_to_u8(&result.valid_mask);
 
+        let board_vec = sit.board_cards().to_vec();
+
         let oop_rec = TrainingRecord {
-            board: sit.board.clone(),
+            board: board_vec.clone(),
             pot: sit.pot as f32,
             effective_stack: sit.effective_stack as f32,
             player: 0,
@@ -154,7 +156,7 @@ fn write_chunk(
         write_record(writer, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
 
         let ip_rec = TrainingRecord {
-            board: sit.board.clone(),
+            board: board_vec,
             pot: sit.pot as f32,
             effective_stack: sit.effective_stack as f32,
             player: 1,
@@ -170,11 +172,13 @@ fn write_chunk(
 }
 
 /// Convert a `[bool; N]` mask to `[u8; N]` (1 for true, 0 for false).
+///
+/// Rust guarantees `bool` is represented as `0u8` or `1u8`, so this is a
+/// direct reinterpretation of the underlying bytes.
 fn bool_mask_to_u8(mask: &[bool; NUM_COMBOS]) -> [u8; NUM_COMBOS] {
     let mut out = [0u8; NUM_COMBOS];
-    for (i, &v) in mask.iter().enumerate() {
-        out[i] = u8::from(v);
-    }
+    let src: &[u8] = bytemuck::cast_slice(mask.as_slice());
+    out.copy_from_slice(src);
     out
 }
 

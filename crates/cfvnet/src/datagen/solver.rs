@@ -137,20 +137,21 @@ mod tests {
 
     fn known_river_situation() -> Situation {
         // Board: Qs Jh 2c 8d 3s
-        let board = vec![
+        let board = [
             4 * 10 + 3, // Qs = 43
             4 * 9 + 2,  // Jh = 38
             4 * 0 + 0,  // 2c = 0
             4 * 6 + 1,  // 8d = 25
             4 * 1 + 3,  // 3s = 7
         ];
+        let board_cards = &board[..5];
         // Uniform ranges over all valid combos
         let mut oop_range = [0.0f32; 1326];
         let mut ip_range = [0.0f32; 1326];
         let mut count = 0u32;
         for i in 0..1326 {
             let (c1, c2) = index_to_card_pair(i);
-            if !board.contains(&c1) && !board.contains(&c2) && c1 != c2 {
+            if !board_cards.contains(&c1) && !board_cards.contains(&c2) && c1 != c2 {
                 oop_range[i] = 1.0;
                 ip_range[i] = 1.0;
                 count += 1;
@@ -164,6 +165,7 @@ mod tests {
         }
         Situation {
             board,
+            board_size: 5,
             pot: 100,
             effective_stack: 100,
             ranges: [oop_range, ip_range],
@@ -194,7 +196,7 @@ mod tests {
     fn solve_board_blocked_evs_are_zero() {
         let sit = known_river_situation();
         let result = solve_situation(&sit, &test_solve_config()).unwrap();
-        for card in &sit.board {
+        for card in sit.board_cards() {
             for i in 0..1326 {
                 let (c1, c2) = index_to_card_pair(i);
                 if c1 == *card || c2 == *card {

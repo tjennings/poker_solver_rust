@@ -12,6 +12,7 @@ serde_yaml = "0.9"
 rand = "0.8"
 rand_chacha = "0.3"
 rayon = { workspace = true }
+bytemuck = { version = "1", features = ["derive"] }
 indicatif = "0.17"
 thiserror = { workspace = true }
 burn = { version = "0.16", features = ["train", "wgpu", "ndarray"] }

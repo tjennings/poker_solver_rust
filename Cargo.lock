@@ -1026,6 +1026,7 @@ name = "cfvnet"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "bytemuck",
  "clap",
  "indicatif",
  "poker-solver-core",

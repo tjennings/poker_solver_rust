@@ -225,7 +225,7 @@ pub fn generate_turn_training_data(
             Box::new(RiverNetEvaluator::new(eval_model, device));
 
         let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv) = solve_turn_situation(
-            &sit.board,
+            sit.board_cards(),
             f64::from(sit.pot),
             f64::from(sit.effective_stack),
             &sit.ranges,
@@ -234,8 +234,10 @@ pub fn generate_turn_training_data(
             evaluator,
         );
 
+        let board_vec = sit.board_cards().to_vec();
+
         let oop_rec = TrainingRecord {
-            board: sit.board.clone(),
+            board: board_vec.clone(),
             pot: sit.pot as f32,
             effective_stack: sit.effective_stack as f32,
             player: 0,
@@ -248,7 +250,7 @@ pub fn generate_turn_training_data(
         write_record(&mut writer, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
 
         let ip_rec = TrainingRecord {
-            board: sit.board.clone(),
+            board: board_vec,
             pot: sit.pot as f32,
             effective_stack: sit.effective_stack as f32,
             player: 1,
@@ -348,7 +350,7 @@ mod tests {
             ..Default::default()
         };
         let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
-        assert_eq!(sit.board.len(), 4);
+        assert_eq!(sit.board_size, 4);
 
         if sit.effective_stack <= 0 {
             return; // Skip degenerate situation.
@@ -356,7 +358,7 @@ mod tests {
 
         let bet_sizes_f64 = parse_bet_sizes(&["50%".into(), "a".into()]);
         let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv) = solve_turn_situation(
-            &sit.board,
+            sit.board_cards(),
             f64::from(sit.pot),
             f64::from(sit.effective_stack),
             &sit.ranges,
@@ -420,7 +422,7 @@ mod tests {
 
         let bet_sizes_f64 = parse_bet_sizes(&["50%".into()]);
         let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv) = solve_turn_situation(
-            &sit.board,
+            sit.board_cards(),
             f64::from(sit.pot),
             f64::from(sit.effective_stack),
             &sit.ranges,
@@ -435,8 +437,10 @@ mod tests {
             let file = std::fs::File::create(output.path()).unwrap();
             let mut writer = BufWriter::new(file);
 
+            let board_vec = sit.board_cards().to_vec();
+
             let oop_rec = TrainingRecord {
-                board: sit.board.clone(),
+                board: board_vec.clone(),
                 pot: sit.pot as f32,
                 effective_stack: sit.effective_stack as f32,
                 player: 0,
@@ -449,7 +453,7 @@ mod tests {
             write_record(&mut writer, &oop_rec).unwrap();
 
             let ip_rec = TrainingRecord {
-                board: sit.board.clone(),
+                board: board_vec,
                 pot: sit.pot as f32,
                 effective_stack: sit.effective_stack as f32,
                 player: 1,

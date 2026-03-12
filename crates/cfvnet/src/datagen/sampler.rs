@@ -6,10 +6,21 @@ use super::range_gen::{compute_hand_strengths, generate_rsp_range_with_strengths
 /// A single training situation before solving.
 #[derive(Debug, Clone)]
 pub struct Situation {
-    pub board: Vec<u8>,
+    /// Board cards as fixed-size array. Only the first `board_size` elements are valid.
+    pub board: [u8; 5],
+    /// Number of valid board cards (4 for turn, 5 for river).
+    pub board_size: usize,
     pub pot: i32,
     pub effective_stack: i32,
     pub ranges: [[f32; NUM_COMBOS]; 2], // [OOP, IP]
+}
+
+impl Situation {
+    /// Return a slice of the valid board cards.
+    #[inline]
+    pub fn board_cards(&self) -> &[u8] {
+        &self.board[..self.board_size]
+    }
 }
 
 /// Sample a random situation: board, pot, effective stack, and two R(S,p) ranges.
@@ -29,11 +40,12 @@ pub fn sample_situation<R: Rng>(
     } else {
         rng.gen_range(5..=max_stack)
     };
-    let strengths = compute_hand_strengths(&board);
+    let strengths = compute_hand_strengths(&board[..board_size]);
     let oop_range = generate_rsp_range_with_strengths(&strengths, rng);
     let ip_range = generate_rsp_range_with_strengths(&strengths, rng);
     Situation {
         board,
+        board_size,
         pot,
         effective_stack,
         ranges: [oop_range, ip_range],
@@ -42,19 +54,21 @@ pub fn sample_situation<R: Rng>(
 
 /// Sample `num_cards` unique cards from 0..52 for the board.
 ///
+/// Returns a `[u8; 5]` with the first `num_cards` slots filled and the rest zeroed.
+///
 /// # Panics
 ///
-/// Panics if `num_cards` is greater than 52.
-pub fn sample_board<R: Rng>(num_cards: usize, rng: &mut R) -> Vec<u8> {
-    assert!(num_cards <= 52, "cannot sample {num_cards} cards from a 52-card deck");
-    let mut board = Vec::with_capacity(num_cards);
+/// Panics if `num_cards` is greater than 5 or 52.
+pub fn sample_board<R: Rng>(num_cards: usize, rng: &mut R) -> [u8; 5] {
+    assert!(num_cards <= 5, "board cannot have more than 5 cards, got {num_cards}");
+    let mut board = [0u8; 5];
     let mut used = [false; 52];
-    for _ in 0..num_cards {
+    for slot in board.iter_mut().take(num_cards) {
         loop {
             let c: u8 = rng.gen_range(0..52);
             if !used[c as usize] {
                 used[c as usize] = true;
-                board.push(c);
+                *slot = c;
                 break;
             }
         }
@@ -96,7 +110,8 @@ mod tests {
         let config = test_config();
         for _ in 0..100 {
             let sit = sample_situation(&config, INITIAL_STACK, 5, &mut rng);
-            let board = &sit.board;
+            assert_eq!(sit.board_size, 5);
+            let board = sit.board_cards();
             assert_eq!(board.len(), 5);
             for i in 0..5 {
                 for j in (i + 1)..5 {
@@ -168,7 +183,7 @@ mod tests {
                 );
                 for i in 0..1326 {
                     let (c1, c2) = range_solver::card::index_to_card_pair(i);
-                    if sit.board.contains(&c1) || sit.board.contains(&c2) {
+                    if sit.board_cards().contains(&c1) || sit.board_cards().contains(&c2) {
                         assert_eq!(
                             range[i], 0.0,
                             "player {player} combo {i} conflicts with board"
@@ -198,7 +213,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         for _ in 0..100 {
             let board = sample_board(4, &mut rng);
-            assert_eq!(board.len(), 4);
+            // First 4 slots filled, 5th is padding (zero).
             for i in 0..4 {
                 assert!(board[i] < 52);
                 for j in (i + 1)..4 {
@@ -213,7 +228,6 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         for _ in 0..100 {
             let board = sample_board(5, &mut rng);
-            assert_eq!(board.len(), 5);
             for i in 0..5 {
                 assert!(board[i] < 52);
                 for j in (i + 1)..5 {
