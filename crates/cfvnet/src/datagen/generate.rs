@@ -6,14 +6,25 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 
+use range_solver::bet_size::BetSizeOptions;
+
 use super::range_gen::NUM_COMBOS;
 use super::sampler::sample_situation;
 use super::solver::{solve_situation, SolveConfig, SolveResult};
 use super::storage::{write_record, TrainingRecord};
 use crate::config::CfvnetConfig;
 
+/// Number of situations to generate, solve, and write per chunk.
+/// Keeps peak memory bounded regardless of total `num_samples`.
+const CHUNK_SIZE: u64 = 10_000;
+
 /// Generate training data by sampling river situations, solving each with DCFR,
 /// and writing two records (OOP + IP) per solved situation to `output_path`.
+///
+/// Processes situations in chunks of [`CHUNK_SIZE`] to bound peak memory.
+/// Within each chunk, situations are generated sequentially (preserving RNG
+/// determinism), solved (in parallel or sequentially), and written before the
+/// next chunk begins.
 ///
 /// Situations with `effective_stack == 0` are skipped since the solver requires
 /// a positive stack. The progress bar tracks solve completions (including skips).
@@ -22,8 +33,11 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
     let seed = config.datagen.seed;
     let threads = config.datagen.threads;
 
+    let bet_str = config.game.bet_sizes.join(",");
+    let bet_sizes = BetSizeOptions::try_from((bet_str.as_str(), ""))
+        .map_err(|e| format!("invalid bet sizes: {e}"))?;
     let solve_config = SolveConfig {
-        bet_sizes: config.game.bet_sizes.clone(),
+        bet_sizes,
         solver_iterations: config.datagen.solver_iterations,
         target_exploitability: config.datagen.target_exploitability,
         add_allin_threshold: config.game.add_allin_threshold,
@@ -32,13 +46,6 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
 
     let board_size = config.game.board_size;
 
-    // Generate all situations sequentially for determinism with a fixed seed.
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let situations: Vec<_> = (0..num_samples)
-        .map(|_| sample_situation(&config.datagen, config.game.initial_stack, board_size, &mut rng))
-        .collect();
-
-    // Solve in parallel (or sequentially for determinism in tests).
     let pb = ProgressBar::new(num_samples);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -46,65 +53,89 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
             .expect("valid progress bar template"),
     );
 
-    let results: Vec<Option<SolveResult>> = if threads <= 1 {
-        situations
-            .iter()
-            .map(|sit| {
-                let r = if sit.effective_stack <= 0 {
-                    None
-                } else {
-                    Some(solve_situation(sit, &solve_config))
-                };
-                pb.inc(1);
-                r
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|r| match r {
-                None => Ok(None),
-                Some(Ok(res)) => Ok(Some(res)),
-                Some(Err(e)) => Err(e),
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .map_err(|e| format!("thread pool: {e}"))?;
-        let raw: Vec<Option<Result<SolveResult, String>>> = pool.install(|| {
-            situations
-                .par_iter()
-                .map(|sit| {
-                    let r = if sit.effective_stack <= 0 {
-                        None
-                    } else {
-                        Some(solve_situation(sit, &solve_config))
-                    };
-                    pb.inc(1);
-                    r
-                })
-                .collect()
-        });
-        raw.into_iter()
-            .map(|r| match r {
-                None => Ok(None),
-                Some(Ok(res)) => Ok(Some(res)),
-                Some(Err(e)) => Err(e),
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    };
-
-    pb.finish_with_message("done");
-
-    // Write results: 2 records per solved situation (OOP + IP).
+    // Open output file once, write incrementally across chunks.
     let file =
         std::fs::File::create(output_path).map_err(|e| format!("create output: {e}"))?;
     let mut writer = BufWriter::new(file);
 
-    for (sit, result) in situations.iter().zip(results.into_iter()) {
+    // Build thread pool once if multi-threaded.
+    let pool = if threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| format!("thread pool: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut remaining = num_samples;
+
+    while remaining > 0 {
+        let chunk_len = remaining.min(CHUNK_SIZE);
+        remaining -= chunk_len;
+
+        // Generate situations sequentially for determinism.
+        let situations: Vec<_> = (0..chunk_len)
+            .map(|_| {
+                sample_situation(&config.datagen, config.game.initial_stack, board_size, &mut rng)
+            })
+            .collect();
+
+        // Solve chunk (parallel or sequential).
+        let results = solve_chunk(&situations, &solve_config, &pb, pool.as_ref())?;
+
+        // Write results immediately, then drop the chunk.
+        write_chunk(&situations, results, &mut writer)?;
+    }
+
+    pb.finish_with_message("done");
+    Ok(())
+}
+
+/// Solve a chunk of situations, returning results in the same order.
+fn solve_chunk(
+    situations: &[super::sampler::Situation],
+    solve_config: &SolveConfig,
+    pb: &ProgressBar,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<Vec<Option<SolveResult>>, String> {
+    let solve_one = |sit: &super::sampler::Situation| -> Option<Result<SolveResult, String>> {
+        let r = if sit.effective_stack <= 0 {
+            None
+        } else {
+            Some(solve_situation(sit, solve_config))
+        };
+        pb.inc(1);
+        r
+    };
+
+    let raw: Vec<Option<Result<SolveResult, String>>> = match pool {
+        Some(pool) => pool.install(|| situations.par_iter().map(solve_one).collect()),
+        None => situations.iter().map(solve_one).collect(),
+    };
+
+    raw.into_iter()
+        .map(|r| match r {
+            None => Ok(None),
+            Some(Ok(res)) => Ok(Some(res)),
+            Some(Err(e)) => Err(e),
+        })
+        .collect()
+}
+
+/// Write solved results for one chunk to the output writer.
+fn write_chunk(
+    situations: &[super::sampler::Situation],
+    results: Vec<Option<SolveResult>>,
+    writer: &mut BufWriter<std::fs::File>,
+) -> Result<(), String> {
+    for (sit, result) in situations.iter().zip(results) {
         let result = match result {
             Some(r) => r,
-            None => continue, // skipped (effective_stack == 0)
+            None => continue,
         };
 
         let valid_mask = bool_mask_to_u8(&result.valid_mask);
@@ -120,7 +151,7 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
             cfvs: result.oop_evs,
             valid_mask,
         };
-        write_record(&mut writer, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
+        write_record(writer, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
 
         let ip_rec = TrainingRecord {
             board: sit.board.clone(),
@@ -133,9 +164,8 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
             cfvs: result.ip_evs,
             valid_mask,
         };
-        write_record(&mut writer, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
+        write_record(writer, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
     }
-
     Ok(())
 }
 
