@@ -155,6 +155,8 @@ pub struct TrainingConfig {
     pub gpu_chunk_size: usize,
     #[serde(default = "default_epochs_per_chunk")]
     pub epochs_per_chunk: usize,
+    #[serde(default = "default_prefetch_chunks")]
+    pub prefetch_chunks: usize,
 }
 
 impl Default for TrainingConfig {
@@ -172,6 +174,7 @@ impl Default for TrainingConfig {
             checkpoint_every_n_epochs: 1000,
             gpu_chunk_size: 100_000,
             epochs_per_chunk: 1,
+            prefetch_chunks: 3,
         }
     }
 }
@@ -211,6 +214,9 @@ fn default_gpu_chunk_size() -> usize {
 }
 fn default_epochs_per_chunk() -> usize {
     1
+}
+fn default_prefetch_chunks() -> usize {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

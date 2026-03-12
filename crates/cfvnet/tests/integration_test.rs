@@ -55,6 +55,7 @@ fn full_pipeline_smoke_test() {
         checkpoint_every_n_epochs: 0,
         gpu_chunk_size: 100,
         epochs_per_chunk: 1,
+        prefetch_chunks: 1,
     };
 
     let result = cfvnet::model::training::train::<B>(

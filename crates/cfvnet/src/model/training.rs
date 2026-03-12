@@ -33,6 +33,7 @@ pub struct TrainConfig {
     pub checkpoint_every_n_epochs: usize,
     pub gpu_chunk_size: usize,
     pub epochs_per_chunk: usize,
+    pub prefetch_chunks: usize,
 }
 
 /// Result returned after training completes.
@@ -469,14 +470,14 @@ pub fn train<B: AutodiffBackend>(
     let mut total_epochs_done: usize = 0;
 
     // Prefetch pipeline: background thread reads + encodes chunks, sends
-    // through a bounded channel so 2-3 chunks are always ready.
-    const PREFETCH_SLOTS: usize = 3;
+    // through a bounded channel so N chunks are always ready.
+    let prefetch_slots = config.prefetch_chunks.max(1);
 
     let num_epochs = config.epochs;
     let producer_files = files.clone();
     let producer_seed = rng.clone();
 
-    let (tx, rx) = mpsc::sync_channel::<ChunkMsg>(PREFETCH_SLOTS);
+    let (tx, rx) = mpsc::sync_channel::<ChunkMsg>(prefetch_slots);
 
     let producer = std::thread::spawn(move || {
         let mut rng = producer_seed;
@@ -708,6 +709,7 @@ mod tests {
             checkpoint_every_n_epochs: 0,
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
+            prefetch_chunks: 1,
         };
 
         let result = train::<B>(&device, file.path(), 5, &config, None);
@@ -736,6 +738,7 @@ mod tests {
             checkpoint_every_n_epochs: 0,
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
+            prefetch_chunks: 1,
         };
         let result = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(result.final_train_loss < 1.0);
@@ -763,6 +766,7 @@ mod tests {
             checkpoint_every_n_epochs: 2,
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
+            prefetch_chunks: 1,
         };
         train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(dir.path().join("checkpoint_epoch2.mpk.gz").exists());
@@ -789,6 +793,7 @@ mod tests {
             checkpoint_every_n_epochs: 0,
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
+            prefetch_chunks: 1,
         };
 
         let result = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
@@ -814,6 +819,7 @@ mod tests {
             checkpoint_every_n_epochs: 0,
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
+            prefetch_chunks: 1,
         };
         let r1 = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         let r2 = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
@@ -854,6 +860,7 @@ mod tests {
             checkpoint_every_n_epochs: 0,
             gpu_chunk_size: 8,
             epochs_per_chunk: 2,
+            prefetch_chunks: 1,
         };
         let result = train::<B>(&device, file.path(), 5, &config, None);
         assert!(result.final_train_loss < 10.0);
@@ -903,6 +910,7 @@ mod tests {
             checkpoint_every_n_epochs: 0,
             gpu_chunk_size: 10, // smaller than a file, forces cross-file chunking
             epochs_per_chunk: 1,
+            prefetch_chunks: 1,
         };
 
         let result = train::<B>(&device, dir.path(), 5, &config, None);
