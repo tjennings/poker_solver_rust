@@ -11,8 +11,13 @@ pub(crate) fn max(x: f32, y: f32) -> f32 {
 }
 
 /// Returns `true` if `x` is positive zero (bit-exact).
+///
+/// Not used in the hot path — `== 0.0` is preferred there for LLVM
+/// auto-vectorization. Retained for its distinct semantics (distinguishes
+/// +0.0 from -0.0).
+#[cfg(test)]
 #[inline]
-pub(crate) fn is_zero(x: f32) -> bool {
+fn is_zero(x: f32) -> bool {
     x.to_bits() == 0
 }
 
@@ -30,7 +35,7 @@ pub(crate) fn mul_slice(lhs: &mut [f32], rhs: &[f32]) {
 pub(crate) fn div_slice(lhs: &mut [f32], rhs: &[f32], default: f32) {
     lhs.iter_mut()
         .zip(rhs)
-        .for_each(|(l, r)| *l = if is_zero(*r) { default } else { *l / *r });
+        .for_each(|(l, r)| *l = if *r == 0.0 { default } else { *l / *r });
 }
 
 #[inline]
@@ -43,7 +48,7 @@ pub(crate) fn div_slice_uninit(
     dst.iter_mut()
         .zip(lhs.iter().zip(rhs))
         .for_each(|(d, (l, r))| {
-            d.write(if is_zero(*r) { default } else { *l / *r });
+            d.write(if *r == 0.0 { default } else { *l / *r });
         });
 }
 
