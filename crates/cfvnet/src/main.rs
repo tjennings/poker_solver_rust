@@ -566,21 +566,19 @@ fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
     }
 
     let mut sorted: Vec<_> = summary.spots.iter().collect();
-    sorted.sort_by(|a, b| a.mbb.partial_cmp(&b.mbb).unwrap());
+    sorted.sort_by(|a, b| a.mbb.total_cmp(&b.mbb));
 
-    let n = sorted.len();
-    let best_n = n.min(3);
-    let worst_n = n.min(3);
+    let top_n = sorted.len().min(3);
 
-    println!("\nBest {} spots (by mBB):", best_n);
-    for (i, spot) in sorted.iter().take(best_n).enumerate() {
+    println!("\nBest {} spots (by mBB):", top_n);
+    for (i, spot) in sorted.iter().take(top_n).enumerate() {
         println!("  {}. {}  Pot: {:<5} Stack: {:<5} MAE: {:.6}  mBB: {:.2}",
             i + 1, format_board(&spot.board, spot.board_size),
             spot.pot, spot.effective_stack, spot.mae, spot.mbb);
     }
 
-    println!("\nWorst {} spots (by mBB):", worst_n);
-    for (i, spot) in sorted.iter().rev().take(worst_n).enumerate() {
+    println!("\nWorst {} spots (by mBB):", top_n);
+    for (i, spot) in sorted.iter().rev().take(top_n).enumerate() {
         println!("  {}. {}  Pot: {:<5} Stack: {:<5} MAE: {:.6}  mBB: {:.2}",
             i + 1, format_board(&spot.board, spot.board_size),
             spot.pot, spot.effective_stack, spot.mae, spot.mbb);
