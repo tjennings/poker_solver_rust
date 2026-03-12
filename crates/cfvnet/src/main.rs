@@ -191,11 +191,6 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
     });
 
     let board_cards = cfvnet::config::board_cards_for_street(&cfg.datagen.street);
-    let dataset = cfvnet::model::dataset::CfvDataset::from_path(&data, board_cards).unwrap_or_else(|e| {
-        eprintln!("failed to load dataset: {e}");
-        std::process::exit(1);
-    });
-    println!("Loaded {} training records from {}", dataset.len(), data.display());
 
     let train_config = cfvnet::model::training::TrainConfig {
         hidden_layers: cfg.training.hidden_layers,
@@ -218,7 +213,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
             type B = Autodiff<Wgpu>;
             let device = WgpuDevice::DefaultDevice;
             println!("Using wgpu backend (Metal GPU on macOS)");
-            let result = cfvnet::model::training::train::<B>(&device, &dataset, &train_config, Some(&output));
+            let result = cfvnet::model::training::train::<B>(&device, &data, board_cards, &train_config, Some(&output));
             println!("Training complete. Final loss: {}", result.final_train_loss);
         }
         "ndarray" => {
@@ -226,7 +221,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
             type B = Autodiff<NdArray>;
             let device = Default::default();
             println!("Using ndarray backend (CPU)");
-            let result = cfvnet::model::training::train::<B>(&device, &dataset, &train_config, Some(&output));
+            let result = cfvnet::model::training::train::<B>(&device, &data, board_cards, &train_config, Some(&output));
             println!("Training complete. Final loss: {}", result.final_train_loss);
         }
         #[cfg(feature = "cuda")]
@@ -235,7 +230,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
             type B = Autodiff<CudaJit<f32>>;
             let device = CudaDevice::default();
             println!("Using CUDA backend (NVIDIA GPU)");
-            let result = cfvnet::model::training::train::<B>(&device, &dataset, &train_config, Some(&output));
+            let result = cfvnet::model::training::train::<B>(&device, &data, board_cards, &train_config, Some(&output));
             println!("Training complete. Final loss: {}", result.final_train_loss);
         }
         #[cfg(not(feature = "cuda"))]

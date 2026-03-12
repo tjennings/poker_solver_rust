@@ -9,9 +9,13 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
-use crate::model::dataset::{encode_record, CfvDataset};
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
+
+use crate::datagen::storage::{read_record, TrainingRecord};
+use crate::model::dataset::encode_record;
 use crate::model::loss::cfvnet_loss;
-use crate::model::network::{CfvNet, OUTPUT_SIZE};
+use crate::model::network::{CfvNet, OUTPUT_SIZE, input_size};
 
 /// Configuration for the CFVnet training loop.
 pub struct TrainConfig {
@@ -34,7 +38,7 @@ pub struct TrainResult {
     pub final_train_loss: f32,
 }
 
-/// Pre-encoded dataset stored as contiguous flat buffers for fast tensor creation.
+/// Pre-encoded chunk stored as contiguous flat buffers for fast tensor creation.
 struct PreEncoded {
     input: Vec<f32>,
     target: Vec<f32>,
@@ -46,11 +50,10 @@ struct PreEncoded {
 }
 
 impl PreEncoded {
-    /// Encode all records from the dataset into contiguous flat arrays.
-    fn from_dataset(dataset: &CfvDataset) -> Self {
-        let n = dataset.len();
-        let in_size = dataset.input_size();
-        let board_cards = dataset.board_cards();
+    /// Encode a slice of records into contiguous flat arrays.
+    fn from_records(records: &[TrainingRecord], board_cards: usize) -> Self {
+        let n = records.len();
+        let in_size = input_size(board_cards);
 
         let mut input = Vec::with_capacity(n * in_size);
         let mut target = Vec::with_capacity(n * OUTPUT_SIZE);
@@ -58,7 +61,7 @@ impl PreEncoded {
         let mut range = Vec::with_capacity(n * OUTPUT_SIZE);
         let mut game_value = Vec::with_capacity(n);
 
-        for rec in dataset.records() {
+        for rec in records {
             let item = encode_record(rec, board_cards);
             input.extend_from_slice(&item.input);
             target.extend_from_slice(&item.target);
@@ -70,7 +73,21 @@ impl PreEncoded {
         Self { input, target, mask, range, game_value, in_size, len: n }
     }
 
-    /// Extract a contiguous slice of records into 5 tensors on `device`.
+    /// Create tensors for the full pre-encoded chunk on `device`.
+    fn to_tensors<B: Backend>(&self, device: &B::Device) -> ChunkTensors<B> {
+        let n = self.len;
+        let in_size = self.in_size;
+        ChunkTensors {
+            input: Tensor::from_data(TensorData::new(self.input.clone(), [n, in_size]), device),
+            target: Tensor::from_data(TensorData::new(self.target.clone(), [n, OUTPUT_SIZE]), device),
+            mask: Tensor::from_data(TensorData::new(self.mask.clone(), [n, OUTPUT_SIZE]), device),
+            range: Tensor::from_data(TensorData::new(self.range.clone(), [n, OUTPUT_SIZE]), device),
+            game_value: Tensor::from_data(TensorData::new(self.game_value.clone(), [n]), device),
+            len: n,
+        }
+    }
+
+    /// Extract a subset by indices into tensors on `device`.
     fn chunk_tensors<B: Backend>(
         &self,
         indices: &[usize],
@@ -163,16 +180,15 @@ fn cosine_lr(lr_max: f64, lr_min: f64, step: usize, total_steps: usize) -> f64 {
     lr_min + 0.5 * (lr_max - lr_min) * (1.0 + (std::f64::consts::PI * t / total).cos())
 }
 
-/// Compute average validation loss using the inner (no-grad) backend.
+/// Compute average validation loss from a small set of records.
 fn compute_val_loss<B: AutodiffBackend>(
     model: &CfvNet<B>,
     encoded: &PreEncoded,
-    val_indices: &[usize],
     config: &TrainConfig,
     device: &B::Device,
 ) -> f64 {
     let valid_model = model.valid();
-    let chunk = encoded.chunk_tensors::<B::InnerBackend>(val_indices, device);
+    let chunk = encoded.to_tensors::<B::InnerBackend>(device);
 
     let mut total_loss = 0.0_f64;
     let mut batch_count = 0_u64;
@@ -221,17 +237,142 @@ fn save_model<B: AutodiffBackend>(
 /// the GPU->CPU sync to avoid pipeline stalls.
 const LOSS_READ_INTERVAL: usize = 50;
 
-/// Train a `CfvNet` on the given dataset using a custom Adam training loop.
+/// Streaming record reader that reads from a sequence of files, filling
+/// buffers up to a requested chunk size. Handles file boundaries transparently.
+struct StreamingReader {
+    files: Vec<PathBuf>,
+    current_file_idx: usize,
+    reader: Option<BufReader<std::fs::File>>,
+    exhausted: bool,
+}
+
+impl StreamingReader {
+    fn new(files: Vec<PathBuf>) -> Self {
+        Self {
+            files,
+            current_file_idx: 0,
+            reader: None,
+            exhausted: false,
+        }
+    }
+
+    /// Reset to the beginning of the file list for a new epoch pass.
+    fn reset(&mut self) {
+        self.current_file_idx = 0;
+        self.reader = None;
+        self.exhausted = false;
+    }
+
+    /// Read up to `max_records` records, spanning file boundaries as needed.
+    /// Returns fewer than `max_records` only when all files are exhausted.
+    fn read_chunk(&mut self, max_records: usize) -> Vec<TrainingRecord> {
+        let mut records = Vec::with_capacity(max_records);
+
+        while records.len() < max_records && !self.exhausted {
+            // Open next file if no reader active.
+            if self.reader.is_none() {
+                if self.current_file_idx >= self.files.len() {
+                    self.exhausted = true;
+                    break;
+                }
+                let path = &self.files[self.current_file_idx];
+                match std::fs::File::open(path) {
+                    Ok(f) => {
+                        self.reader = Some(BufReader::new(f));
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: skipping {}: {e}", path.display());
+                        self.current_file_idx += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Read records from current file.
+            let reader = self.reader.as_mut().unwrap();
+            match read_record(reader) {
+                Ok(rec) => {
+                    records.push(rec);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // Current file exhausted, move to next.
+                    self.reader = None;
+                    self.current_file_idx += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: read error in {}: {e}",
+                        self.files[self.current_file_idx].display()
+                    );
+                    self.reader = None;
+                    self.current_file_idx += 1;
+                }
+            }
+        }
+
+        records
+    }
+}
+
+/// Collect sorted file paths from a path (file or directory).
+fn collect_data_files(path: &Path) -> Result<Vec<PathBuf>, String> {
+    if path.is_dir() {
+        let mut paths: Vec<_> = std::fs::read_dir(path)
+            .map_err(|e| format!("read directory {}: {e}", path.display()))?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if entry.file_type().ok()?.is_file() {
+                    Some(entry.path())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if paths.is_empty() {
+            return Err(format!("no files found in {}", path.display()));
+        }
+        paths.sort();
+        Ok(paths)
+    } else {
+        Ok(vec![path.to_path_buf()])
+    }
+}
+
+/// Count total records across all files without keeping them in memory.
+fn count_total_records(files: &[PathBuf]) -> u64 {
+    let mut total = 0u64;
+    for path in files {
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mut reader = BufReader::new(file);
+        loop {
+            match read_record(&mut reader) {
+                Ok(_) => total += 1,
+                Err(_) => break,
+            }
+        }
+    }
+    total
+}
+
+/// Train a `CfvNet` on data files using streaming GPU-chunked training.
 ///
-/// Returns the final training loss. Uses chunked GPU-resident tensors,
-/// cosine LR annealing, reduced GPU->CPU loss sync, and no-grad validation.
+/// Loads records on demand in chunks of `gpu_chunk_size`, never holding the
+/// full dataset in memory. Files are read sequentially; chunk boundaries
+/// can span files. Each pass through all files counts as one epoch.
+///
+/// A small validation set is loaded once at startup (first `validation_split`
+/// fraction of the first pass's records).
 pub fn train<B: AutodiffBackend>(
     device: &B::Device,
-    dataset: &CfvDataset,
+    data_path: &Path,
+    board_cards: usize,
     config: &TrainConfig,
     output_dir: Option<&std::path::Path>,
 ) -> TrainResult {
-    let in_size = dataset.input_size();
+    let in_size = input_size(board_cards);
     let mut model = CfvNet::<B>::new(device, config.hidden_layers, config.hidden_size, in_size);
 
     // Resume from checkpoint if a saved model exists.
@@ -252,44 +393,70 @@ pub fn train<B: AutodiffBackend>(
     }
 
     let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
-
-    // Pre-encode all records into flat CPU buffers (done once).
-    let encoded = PreEncoded::from_dataset(dataset);
-
-    // Split dataset into train/val using deterministic shuffle.
-    let n = encoded.len;
-    let mut all_indices: Vec<usize> = (0..n).collect();
     let mut rng = ChaCha8Rng::seed_from_u64(42);
-    all_indices.shuffle(&mut rng);
 
-    let val_count = (n as f64 * config.validation_split) as usize;
-    let val_indices = all_indices[..val_count].to_vec();
-    let train_indices = all_indices[val_count..].to_vec();
+    let files = collect_data_files(data_path).unwrap_or_else(|e| {
+        eprintln!("failed to collect data files: {e}");
+        std::process::exit(1);
+    });
 
-    let num_train = train_indices.len();
+    eprintln!("Counting records across {} file(s)...", files.len());
+    let total_records = count_total_records(&files) as usize;
+    eprintln!("Total records: {total_records}");
+
+    if total_records == 0 {
+        eprintln!("No training records found.");
+        return TrainResult { final_train_loss: f32::MAX };
+    }
+
+    // Load validation set: read first pass, take validation_split fraction.
+    let val_count = (total_records as f64 * config.validation_split) as usize;
+    let val_encoded = if val_count > 0 {
+        eprintln!("Loading {val_count} validation records...");
+        let mut val_reader = StreamingReader::new(files.clone());
+        let val_records = val_reader.read_chunk(val_count);
+        let actual_val = val_records.len();
+        eprintln!("Loaded {actual_val} validation records");
+        Some(PreEncoded::from_records(&val_records, board_cards))
+    } else {
+        None
+    };
+
+    let num_train = total_records;
     let batch_size = config.batch_size;
-    let batches_per_epoch = num_train.div_ceil(batch_size);
-    let total_steps = batches_per_epoch * config.epochs;
-
-    // Determine chunk parameters.
-    let chunk_size = config.gpu_chunk_size.max(batch_size).min(num_train);
+    let chunk_size = config.gpu_chunk_size.max(batch_size);
     let epochs_per_chunk = config.epochs_per_chunk.max(1);
 
-    // Split train indices into chunks.
-    let chunks: Vec<Vec<usize>> = train_indices
-        .chunks(chunk_size)
-        .map(|c| c.to_vec())
-        .collect();
+    // Estimate total steps for LR schedule.
+    let batches_per_epoch = num_train.div_ceil(batch_size);
+    let total_steps = batches_per_epoch * config.epochs;
 
     let mut final_loss = f32::MAX;
     let mut global_step: usize = 0;
     let mut total_epochs_done: usize = 0;
 
-    'outer: loop {
-        for chunk_indices in &chunks {
-            // Upload this chunk's tensors to the device once.
-            let chunk_tensors = encoded.chunk_tensors::<B>(chunk_indices, device);
-            let chunk_len = chunk_tensors.len;
+    let mut shuffled_files = files.clone();
+
+    'outer: for _epoch in 0..config.epochs {
+        // Shuffle file order each epoch for data diversity across chunks.
+        shuffled_files.shuffle(&mut rng);
+        let mut reader = StreamingReader::new(shuffled_files.clone());
+
+        let mut chunks_in_epoch = 0u64;
+
+        loop {
+            // Load next chunk from files.
+            let records = reader.read_chunk(chunk_size);
+            if records.is_empty() {
+                break; // All files exhausted for this epoch.
+            }
+
+            let chunk_len = records.len();
+            let encoded = PreEncoded::from_records(&records, board_cards);
+            drop(records); // Free raw records before uploading to GPU.
+
+            let chunk_tensors = encoded.to_tensors::<B>(device);
+            drop(encoded); // Free CPU buffers after GPU upload.
             let chunk_batches = chunk_len.div_ceil(batch_size);
 
             for _ in 0..epochs_per_chunk {
@@ -355,7 +522,7 @@ pub fn train<B: AutodiffBackend>(
                     pb.inc(1);
                 }
 
-                total_epochs_done += 1;
+                chunks_in_epoch += 1;
 
                 let avg_train = if epoch_batches > 0 {
                     epoch_loss / epoch_batches as f64
@@ -370,40 +537,36 @@ pub fn train<B: AutodiffBackend>(
                     total_steps,
                 );
 
-                // Compute validation loss if we have a validation set.
-                let summary = if !val_indices.is_empty() {
-                    let val_loss =
-                        compute_val_loss(&model, &encoded, &val_indices, config, device);
+                let summary = if let Some(ref val_enc) = val_encoded {
+                    let val_loss = compute_val_loss(&model, val_enc, config, device);
                     format!(
-                        "{}/{} lr={lr_now:.2e} train={avg_train:.6} val={val_loss:.6}",
-                        total_epochs_done, config.epochs
+                        "{}/{} chunk={} lr={lr_now:.2e} train={avg_train:.6} val={val_loss:.6}",
+                        total_epochs_done + 1, config.epochs, chunks_in_epoch
                     )
                 } else {
                     format!(
-                        "{}/{} lr={lr_now:.2e} train={avg_train:.6}",
-                        total_epochs_done, config.epochs
+                        "{}/{} chunk={} lr={lr_now:.2e} train={avg_train:.6}",
+                        total_epochs_done + 1, config.epochs, chunks_in_epoch
                     )
                 };
 
                 pb.finish_with_message(summary);
-
-                // Checkpoint every N epochs if configured.
-                if config.checkpoint_every_n_epochs > 0
-                    && total_epochs_done.is_multiple_of(config.checkpoint_every_n_epochs)
-                    && let Some(dir) = output_dir
-                {
-                    save_model(
-                        &model,
-                        dir,
-                        &format!("checkpoint_epoch{total_epochs_done}"),
-                    );
-                }
-
-                if total_epochs_done >= config.epochs {
-                    break 'outer;
-                }
             }
             // chunk_tensors dropped here — GPU memory freed.
+        }
+
+        total_epochs_done += 1;
+
+        // Checkpoint every N epochs if configured.
+        if config.checkpoint_every_n_epochs > 0
+            && total_epochs_done.is_multiple_of(config.checkpoint_every_n_epochs)
+            && let Some(dir) = output_dir
+        {
+            save_model(
+                &model,
+                dir,
+                &format!("checkpoint_epoch{total_epochs_done}"),
+            );
         }
     }
 
@@ -424,7 +587,7 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    use crate::datagen::storage::{write_record, TrainingRecord};
+    use crate::datagen::storage::write_record;
 
     type B = Autodiff<NdArray>;
 
@@ -457,7 +620,6 @@ mod tests {
     #[test]
     fn overfit_single_batch() {
         let file = write_test_data(16);
-        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
 
         let device = Default::default();
         let config = TrainConfig {
@@ -475,7 +637,7 @@ mod tests {
             epochs_per_chunk: 1,
         };
 
-        let result = train::<B>(&device, &dataset, &config, None);
+        let result = train::<B>(&device, file.path(), 5, &config, None);
         assert!(
             result.final_train_loss < 0.01,
             "should overfit small data, got loss {}",
@@ -486,7 +648,6 @@ mod tests {
     #[test]
     fn train_saves_model_to_output_dir() {
         let file = write_test_data(16);
-        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let device = Default::default();
         let config = TrainConfig {
@@ -503,7 +664,7 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
         };
-        let result = train::<B>(&device, &dataset, &config, Some(dir.path()));
+        let result = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(result.final_train_loss < 1.0);
         assert!(
             dir.path().join("model.mpk.gz").exists(),
@@ -514,7 +675,6 @@ mod tests {
     #[test]
     fn train_saves_checkpoints() {
         let file = write_test_data(16);
-        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let device = Default::default();
         let config = TrainConfig {
@@ -531,7 +691,7 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
         };
-        train::<B>(&device, &dataset, &config, Some(dir.path()));
+        train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(dir.path().join("checkpoint_epoch2.mpk.gz").exists());
         assert!(dir.path().join("checkpoint_epoch4.mpk.gz").exists());
         assert!(dir.path().join("model.mpk.gz").exists());
@@ -540,7 +700,6 @@ mod tests {
     #[test]
     fn train_with_validation_reports_val_loss() {
         let file = write_test_data(20);
-        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         let dir = tempfile::tempdir().unwrap();
 
         let device = Default::default();
@@ -559,7 +718,7 @@ mod tests {
             epochs_per_chunk: 1,
         };
 
-        let result = train::<B>(&device, &dataset, &config, Some(dir.path()));
+        let result = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(result.final_train_loss < 10.0);
         assert!(dir.path().join("model.mpk.gz").exists());
     }
@@ -567,7 +726,6 @@ mod tests {
     #[test]
     fn train_resumes_from_checkpoint() {
         let file = write_test_data(16);
-        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let device = Default::default();
         let config = TrainConfig {
@@ -584,8 +742,8 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
         };
-        let r1 = train::<B>(&device, &dataset, &config, Some(dir.path()));
-        let r2 = train::<B>(&device, &dataset, &config, Some(dir.path()));
+        let r1 = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
+        let r2 = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(r1.final_train_loss < 10.0);
         assert!(r2.final_train_loss < 10.0);
     }
@@ -609,7 +767,6 @@ mod tests {
     #[test]
     fn multi_epoch_per_chunk() {
         let file = write_test_data(16);
-        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         let device = Default::default();
         let config = TrainConfig {
             hidden_layers: 2,
@@ -625,7 +782,102 @@ mod tests {
             gpu_chunk_size: 8,
             epochs_per_chunk: 2,
         };
-        let result = train::<B>(&device, &dataset, &config, None);
+        let result = train::<B>(&device, file.path(), 5, &config, None);
         assert!(result.final_train_loss < 10.0);
+    }
+
+    #[test]
+    fn train_from_directory() {
+        // Write data across two files in a temp directory.
+        let dir = tempfile::tempdir().unwrap();
+        let path1 = dir.path().join("data_01.bin");
+        let path2 = dir.path().join("data_02.bin");
+
+        for path in [&path1, &path2] {
+            let mut file = std::fs::File::create(path).unwrap();
+            for i in 0..8 {
+                let mut rec = TrainingRecord {
+                    board: vec![0, 4, 8, 12, 16],
+                    pot: 100.0,
+                    effective_stack: 50.0,
+                    player: (i % 2) as u8,
+                    game_value: 0.1 * i as f32,
+                    oop_range: [0.0; 1326],
+                    ip_range: [0.0; 1326],
+                    cfvs: [0.0; 1326],
+                    valid_mask: [1; 1326],
+                };
+                for j in 0..10 {
+                    rec.cfvs[j] = (i as f32 + j as f32) * 0.01;
+                    rec.oop_range[j] = 0.1;
+                    rec.ip_range[j] = 0.1;
+                }
+                write_record(&mut file, &rec).unwrap();
+            }
+        }
+
+        let device = Default::default();
+        let config = TrainConfig {
+            hidden_layers: 2,
+            hidden_size: 64,
+            batch_size: 8,
+            epochs: 2,
+            learning_rate: 0.001,
+            lr_min: 0.001,
+            huber_delta: 1.0,
+            aux_loss_weight: 0.0,
+            validation_split: 0.0,
+            checkpoint_every_n_epochs: 0,
+            gpu_chunk_size: 10, // smaller than a file, forces cross-file chunking
+            epochs_per_chunk: 1,
+        };
+
+        let result = train::<B>(&device, dir.path(), 5, &config, None);
+        assert!(result.final_train_loss < 10.0);
+    }
+
+    #[test]
+    fn streaming_reader_spans_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path1 = dir.path().join("a.bin");
+        let path2 = dir.path().join("b.bin");
+
+        // Write 3 records to first file, 2 to second.
+        for (path, count) in [(&path1, 3), (&path2, 2)] {
+            let mut file = std::fs::File::create(path).unwrap();
+            for i in 0..count {
+                let rec = TrainingRecord {
+                    board: vec![0, 4, 8, 12, 16],
+                    pot: 100.0,
+                    effective_stack: 50.0,
+                    player: (i % 2) as u8,
+                    game_value: i as f32,
+                    oop_range: [0.0; 1326],
+                    ip_range: [0.0; 1326],
+                    cfvs: [0.0; 1326],
+                    valid_mask: [1; 1326],
+                };
+                write_record(&mut file, &rec).unwrap();
+            }
+        }
+
+        let mut reader = StreamingReader::new(vec![path1, path2]);
+
+        // Read 4 records (spans both files: 3 from first + 1 from second).
+        let chunk1 = reader.read_chunk(4);
+        assert_eq!(chunk1.len(), 4);
+
+        // Read remaining 1.
+        let chunk2 = reader.read_chunk(4);
+        assert_eq!(chunk2.len(), 1);
+
+        // Exhausted.
+        let chunk3 = reader.read_chunk(4);
+        assert_eq!(chunk3.len(), 0);
+
+        // Reset and read again.
+        reader.reset();
+        let all = reader.read_chunk(100);
+        assert_eq!(all.len(), 5);
     }
 }

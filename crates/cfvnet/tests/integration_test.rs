@@ -42,9 +42,6 @@ fn full_pipeline_smoke_test() {
     type B = Autodiff<NdArray>;
     let device = Default::default();
 
-    let dataset = cfvnet::model::dataset::CfvDataset::from_file(&data_path, 5)
-        .expect("failed to load dataset");
-
     let train_config = cfvnet::model::training::TrainConfig {
         hidden_layers: 2,
         hidden_size: 32,
@@ -62,9 +59,10 @@ fn full_pipeline_smoke_test() {
 
     let result = cfvnet::model::training::train::<B>(
         &device,
-        &dataset,
+        &data_path,
+        5,
         &train_config,
-        Some(&model_path),
+        Some(model_path.as_path()),
     );
     assert!(
         result.final_train_loss.is_finite(),
