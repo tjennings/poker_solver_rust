@@ -8,6 +8,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use rayon::prelude::*;
 
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -52,18 +53,26 @@ struct PreEncoded {
 
 impl PreEncoded {
     /// Encode a slice of records into contiguous flat arrays.
+    ///
+    /// Encoding is parallelized across CPU cores with rayon.
     fn from_records(records: &[TrainingRecord], board_cards: usize) -> Self {
         let n = records.len();
         let in_size = input_size(board_cards);
 
+        // Encode all records in parallel.
+        let items: Vec<_> = records
+            .par_iter()
+            .map(|rec| encode_record(rec, board_cards))
+            .collect();
+
+        // Flatten into contiguous arrays.
         let mut input = Vec::with_capacity(n * in_size);
         let mut target = Vec::with_capacity(n * OUTPUT_SIZE);
         let mut mask = Vec::with_capacity(n * OUTPUT_SIZE);
         let mut range = Vec::with_capacity(n * OUTPUT_SIZE);
         let mut game_value = Vec::with_capacity(n);
 
-        for rec in records {
-            let item = encode_record(rec, board_cards);
+        for item in &items {
             input.extend_from_slice(&item.input);
             target.extend_from_slice(&item.target);
             mask.extend_from_slice(&item.mask);
@@ -74,7 +83,21 @@ impl PreEncoded {
         Self { input, target, mask, range, game_value, in_size, len: n }
     }
 
-    /// Create tensors for the full pre-encoded chunk on `device`.
+    /// Consume self and create tensors on `device`, avoiding copies.
+    fn into_tensors<B: Backend>(self, device: &B::Device) -> ChunkTensors<B> {
+        let n = self.len;
+        let in_size = self.in_size;
+        ChunkTensors {
+            input: Tensor::from_data(TensorData::new(self.input, [n, in_size]), device),
+            target: Tensor::from_data(TensorData::new(self.target, [n, OUTPUT_SIZE]), device),
+            mask: Tensor::from_data(TensorData::new(self.mask, [n, OUTPUT_SIZE]), device),
+            range: Tensor::from_data(TensorData::new(self.range, [n, OUTPUT_SIZE]), device),
+            game_value: Tensor::from_data(TensorData::new(self.game_value, [n]), device),
+            len: n,
+        }
+    }
+
+    /// Create tensors on `device` by cloning (for reusable data like validation set).
     fn to_tensors<B: Backend>(&self, device: &B::Device) -> ChunkTensors<B> {
         let n = self.len;
         let in_size = self.in_size;
@@ -494,6 +517,15 @@ pub fn train<B: AutodiffBackend>(
             ChunkMsg::EndOfEpoch => {
                 total_epochs_done += 1;
 
+                // Compute validation loss at epoch boundary (not per-chunk).
+                if let Some(ref val_enc) = val_encoded {
+                    let val_loss = compute_val_loss(&model, val_enc, config, device);
+                    eprintln!(
+                        "  Epoch {}/{} complete — val={val_loss:.6}",
+                        total_epochs_done, config.epochs
+                    );
+                }
+
                 // Checkpoint every N epochs if configured.
                 if config.checkpoint_every_n_epochs > 0
                     && total_epochs_done.is_multiple_of(config.checkpoint_every_n_epochs)
@@ -514,8 +546,7 @@ pub fn train<B: AutodiffBackend>(
             }
             ChunkMsg::Data(encoded) => {
                 let chunk_len = encoded.len;
-                let chunk_tensors = encoded.to_tensors::<B>(device);
-                // encoded dropped here — CPU buffers freed after GPU upload.
+                let chunk_tensors = encoded.into_tensors::<B>(device);
 
                 let chunk_batches = chunk_len.div_ceil(batch_size);
 
@@ -597,18 +628,10 @@ pub fn train<B: AutodiffBackend>(
                         total_steps,
                     );
 
-                    let summary = if let Some(ref val_enc) = val_encoded {
-                        let val_loss = compute_val_loss(&model, val_enc, config, device);
-                        format!(
-                            "{}/{} chunk={} lr={lr_now:.2e} train={avg_train:.6} val={val_loss:.6}",
-                            total_epochs_done + 1, config.epochs, chunks_in_epoch
-                        )
-                    } else {
-                        format!(
-                            "{}/{} chunk={} lr={lr_now:.2e} train={avg_train:.6}",
-                            total_epochs_done + 1, config.epochs, chunks_in_epoch
-                        )
-                    };
+                    let summary = format!(
+                        "{}/{} chunk={} lr={lr_now:.2e} train={avg_train:.6}",
+                        total_epochs_done + 1, config.epochs, chunks_in_epoch
+                    );
 
                     pb.finish_with_message(summary);
                 }
