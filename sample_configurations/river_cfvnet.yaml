@@ -1,5 +1,16 @@
 # River CFVnet training configuration
 # Based on Supremus (Zarick et al. 2020)
+#
+# Datagen:
+#   cargo run -p cfvnet --release -- generate \
+#     -c sample_configurations/river_cfvnet.yaml \
+#     -o data/river/river.bin \
+#     --per-file 1000000
+#
+# Training (CUDA):
+#   cargo run -p cfvnet --release --features cuda -- train \
+#     -c sample_configurations/river_cfvnet.yaml \
+#     -d data/river/ -o models/river_v1 --backend cuda
 
 game:
   initial_stack: 200 # 100bb in SB units
@@ -8,7 +19,7 @@ game:
   force_allin_threshold: 0.15
 
 datagen:
-  num_samples: 1000000
+  num_samples: 10000000
   pot_intervals: [[4, 20], [20, 80], [80, 200], [200, 400]]
   solver_iterations: 1000
   target_exploitability: 0.005
@@ -19,7 +30,7 @@ training:
   hidden_layers: 7
   hidden_size: 500
   batch_size: 8192
-  epochs: 10
+  epochs: 1000
   learning_rate: 0.002
   lr_min: 0.00002
   huber_delta: 1.0
@@ -27,4 +38,4 @@ training:
   validation_split: 0.05
   checkpoint_every_n_epochs: 1000
   gpu_chunk_size: 100000
-  epochs_per_chunk: 1
+  epochs_per_chunk: 5
