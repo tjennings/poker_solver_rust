@@ -858,4 +858,98 @@ mod tests {
             }
         }
     }
+
+    #[timed_test(30)]
+    fn solver_with_depth_boundary_converges() {
+        let board = turn_board();
+        let tree = turn_tree_depth_limited(&[1.0], 1);
+        let hands = small_hands(&board, 30);
+
+        // Verify the tree actually has DepthBoundary nodes.
+        let has_boundary = tree.nodes.iter().any(|n| {
+            matches!(
+                n,
+                GameNode::Terminal {
+                    kind: TerminalKind::DepthBoundary,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_boundary,
+            "turn tree with depth_limit=1 should have DepthBoundary nodes"
+        );
+
+        let evaluator = Box::new(ConstantEvaluator(0.5));
+        let mut solver =
+            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+
+        assert!(
+            !solver.boundary_info.boundaries.is_empty(),
+            "solver should detect boundaries"
+        );
+
+        solver.train(200);
+        assert_eq!(solver.iteration, 200);
+
+        let strategy = solver.strategy();
+        let n = strategy.num_combos();
+        assert!(n > 0);
+
+        // Verify all strategy distributions are valid.
+        for combo_idx in 0..n {
+            let probs = strategy.root_probs(combo_idx);
+            if probs.is_empty() {
+                continue;
+            }
+            let sum: f64 = probs.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 0.01,
+                "combo {combo_idx}: strategy sum = {sum}, expected ~1.0"
+            );
+            for (a, &p) in probs.iter().enumerate() {
+                assert!(
+                    p >= -1e-10,
+                    "combo {combo_idx} action {a}: negative prob {p}"
+                );
+            }
+        }
+    }
+
+    #[timed_test(30)]
+    fn solver_trains_no_boundaries() {
+        let board = river_board();
+        let tree = river_tree(&[1.0]);
+        let hands = small_hands(&board, 30);
+
+        // Verify no boundaries exist in a river tree.
+        let has_boundary = tree.nodes.iter().any(|n| {
+            matches!(
+                n,
+                GameNode::Terminal {
+                    kind: TerminalKind::DepthBoundary,
+                    ..
+                }
+            )
+        });
+        assert!(
+            !has_boundary,
+            "river tree should have no DepthBoundary nodes"
+        );
+
+        let evaluator = Box::new(ConstantEvaluator(0.5));
+        let mut solver =
+            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+
+        assert!(
+            solver.boundary_info.boundaries.is_empty(),
+            "solver should have no boundaries for river tree"
+        );
+
+        solver.train(100);
+        assert_eq!(solver.iteration, 100);
+
+        let strategy = solver.strategy();
+        assert!(strategy.num_combos() > 0);
+    }
 }
