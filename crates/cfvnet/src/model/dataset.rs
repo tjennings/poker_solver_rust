@@ -28,7 +28,7 @@ impl CfvDataset {
     /// so this reads until EOF.
     pub fn from_file(path: &Path, board_cards: usize) -> Result<Self, String> {
         let file = std::fs::File::open(path)
-            .map_err(|e| format!("open dataset: {e}"))?;
+            .map_err(|e| format!("open dataset {}: {e}", path.display()))?;
         let mut reader = BufReader::new(file);
 
         let mut records = Vec::new();
@@ -36,11 +36,57 @@ impl CfvDataset {
             match read_record(&mut reader) {
                 Ok(rec) => records.push(rec),
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(format!("read: {e}")),
+                Err(e) => return Err(format!("read {}: {e}", path.display())),
             }
         }
 
         Ok(Self { records, board_cards })
+    }
+
+    /// Load records from all files in a directory.
+    ///
+    /// Reads every file in the directory (non-recursive, skipping subdirectories),
+    /// sorted by name for deterministic ordering. Returns an error if the directory
+    /// is empty or cannot be read.
+    pub fn from_dir(dir: &Path, board_cards: usize) -> Result<Self, String> {
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .map_err(|e| format!("read directory {}: {e}", dir.display()))?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if entry.file_type().ok()?.is_file() {
+                    Some(entry.path())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if paths.is_empty() {
+            return Err(format!("no files found in {}", dir.display()));
+        }
+
+        paths.sort();
+
+        let mut records = Vec::new();
+        for path in &paths {
+            let ds = Self::from_file(path, board_cards)?;
+            eprintln!("  {} — {} records", path.display(), ds.len());
+            records.extend(ds.records);
+        }
+
+        Ok(Self { records, board_cards })
+    }
+
+    /// Load from a path that may be a file or directory.
+    ///
+    /// If `path` is a directory, loads all files within it. If it's a file,
+    /// loads that single file.
+    pub fn from_path(path: &Path, board_cards: usize) -> Result<Self, String> {
+        if path.is_dir() {
+            Self::from_dir(path, board_cards)
+        } else {
+            Self::from_file(path, board_cards)
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -262,5 +308,67 @@ mod tests {
             (item1.range[0] - 0.3).abs() < 1e-6,
             "player 1 should use IP range"
         );
+    }
+
+    fn write_test_data_to(path: &Path, n: usize) {
+        let mut file = std::fs::File::create(path).unwrap();
+        for i in 0..n {
+            let mut rec = TrainingRecord {
+                board: vec![0, 4, 8, 12, 16],
+                pot: 100.0,
+                effective_stack: 50.0,
+                player: (i % 2) as u8,
+                game_value: 0.1 * i as f32,
+                oop_range: [0.0; 1326],
+                ip_range: [0.0; 1326],
+                cfvs: [0.0; 1326],
+                valid_mask: [1; 1326],
+            };
+            rec.cfvs[0] = i as f32 * 0.01;
+            rec.oop_range[0] = 0.5;
+            rec.ip_range[0] = 0.3;
+            write_record(&mut file, &rec).unwrap();
+        }
+    }
+
+    #[test]
+    fn from_dir_loads_all_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_data_to(&dir.path().join("a.bin"), 5);
+        write_test_data_to(&dir.path().join("b.bin"), 3);
+        let dataset = CfvDataset::from_dir(dir.path(), 5).unwrap();
+        assert_eq!(dataset.len(), 8);
+    }
+
+    #[test]
+    fn from_dir_sorts_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_data_to(&dir.path().join("b.bin"), 2);
+        write_test_data_to(&dir.path().join("a.bin"), 3);
+        let dataset = CfvDataset::from_dir(dir.path(), 5).unwrap();
+        // a.bin (3 records) loaded first, then b.bin (2 records) = 5 total
+        assert_eq!(dataset.len(), 5);
+    }
+
+    #[test]
+    fn from_dir_empty_directory_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = CfvDataset::from_dir(dir.path(), 5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_path_detects_file() {
+        let file = write_test_data(4);
+        let dataset = CfvDataset::from_path(file.path(), 5).unwrap();
+        assert_eq!(dataset.len(), 4);
+    }
+
+    #[test]
+    fn from_path_detects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_data_to(&dir.path().join("data.bin"), 7);
+        let dataset = CfvDataset::from_path(dir.path(), 5).unwrap();
+        assert_eq!(dataset.len(), 7);
     }
 }

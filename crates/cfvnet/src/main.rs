@@ -30,7 +30,7 @@ enum Commands {
         /// Path to YAML config file
         #[arg(short, long)]
         config: PathBuf,
-        /// Path to binary training data
+        /// Path to training data (file or directory of files)
         #[arg(short, long)]
         data: PathBuf,
         /// Output directory for checkpoints
@@ -159,11 +159,11 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
     });
 
     let board_cards = cfvnet::config::board_cards_for_street(&cfg.datagen.street);
-    let dataset = cfvnet::model::dataset::CfvDataset::from_file(&data, board_cards).unwrap_or_else(|e| {
+    let dataset = cfvnet::model::dataset::CfvDataset::from_path(&data, board_cards).unwrap_or_else(|e| {
         eprintln!("failed to load dataset: {e}");
         std::process::exit(1);
     });
-    println!("Loaded {} training records", dataset.len());
+    println!("Loaded {} training records from {}", dataset.len(), data.display());
 
     let train_config = cfvnet::model::training::TrainConfig {
         hidden_layers: cfg.training.hidden_layers,
