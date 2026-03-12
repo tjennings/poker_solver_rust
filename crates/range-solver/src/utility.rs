@@ -335,9 +335,10 @@ pub fn finalize<T: Game>(game: &mut T) {
 
     // Compute the expected values and save them.
     for player in 0..2 {
-        let mut cfvalues = Vec::with_capacity(game.num_private_hands(player));
+        let nh = game.num_private_hands(player);
+        let mut cfvalues = Vec::with_capacity(nh);
         compute_cfvalue_recursive(
-            cfvalues.spare_capacity_mut(),
+            &mut cfvalues.spare_capacity_mut()[..nh],
             game,
             &mut game.root(),
             player,
@@ -387,9 +388,11 @@ pub fn compute_current_ev<T: Game>(game: &T) -> [f32; 2] {
     scratch.cfvalues_1.reserve(game.num_private_hands(1));
 
     let reach = [game.initial_weights(0), game.initial_weights(1)];
+    let nh0 = game.num_private_hands(0);
+    let nh1 = game.num_private_hands(1);
 
     compute_cfvalue_recursive(
-        scratch.cfvalues_0.spare_capacity_mut(),
+        &mut scratch.cfvalues_0.spare_capacity_mut()[..nh0],
         game,
         &mut game.root(),
         0,
@@ -397,10 +400,10 @@ pub fn compute_current_ev<T: Game>(game: &T) -> [f32; 2] {
         false,
     );
     // SAFETY: compute_cfvalue_recursive writes all num_private_hands elements.
-    unsafe { scratch.cfvalues_0.set_len(game.num_private_hands(0)) };
+    unsafe { scratch.cfvalues_0.set_len(nh0) };
 
     compute_cfvalue_recursive(
-        scratch.cfvalues_1.spare_capacity_mut(),
+        &mut scratch.cfvalues_1.spare_capacity_mut()[..nh1],
         game,
         &mut game.root(),
         1,
@@ -408,7 +411,7 @@ pub fn compute_current_ev<T: Game>(game: &T) -> [f32; 2] {
         false,
     );
     // SAFETY: compute_cfvalue_recursive writes all num_private_hands elements.
-    unsafe { scratch.cfvalues_1.set_len(game.num_private_hands(1)) };
+    unsafe { scratch.cfvalues_1.set_len(nh1) };
 
     let ev0 = weighted_sum(&scratch.cfvalues_0, reach[0]);
     let ev1 = weighted_sum(&scratch.cfvalues_1, reach[1]);
@@ -436,26 +439,28 @@ pub fn compute_mes_ev<T: Game>(game: &T) -> [f32; 2] {
     scratch.cfvalues_1.reserve(game.num_private_hands(1));
 
     let reach = [game.initial_weights(0), game.initial_weights(1)];
+    let nh0 = game.num_private_hands(0);
+    let nh1 = game.num_private_hands(1);
 
     compute_best_cfv_recursive(
-        scratch.cfvalues_0.spare_capacity_mut(),
+        &mut scratch.cfvalues_0.spare_capacity_mut()[..nh0],
         game,
         &game.root(),
         0,
         reach[1],
     );
     // SAFETY: compute_best_cfv_recursive writes all num_private_hands elements.
-    unsafe { scratch.cfvalues_0.set_len(game.num_private_hands(0)) };
+    unsafe { scratch.cfvalues_0.set_len(nh0) };
 
     compute_best_cfv_recursive(
-        scratch.cfvalues_1.spare_capacity_mut(),
+        &mut scratch.cfvalues_1.spare_capacity_mut()[..nh1],
         game,
         &game.root(),
         1,
         reach[0],
     );
     // SAFETY: compute_best_cfv_recursive writes all num_private_hands elements.
-    unsafe { scratch.cfvalues_1.set_len(game.num_private_hands(1)) };
+    unsafe { scratch.cfvalues_1.set_len(nh1) };
 
     let ev0 = weighted_sum(&scratch.cfvalues_0, reach[0]);
     let ev1 = weighted_sum(&scratch.cfvalues_1, reach[1]);
