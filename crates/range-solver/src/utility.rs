@@ -2,7 +2,7 @@ use crate::interface::*;
 use crate::mutex_like::*;
 use crate::sliceop::*;
 use std::cell::Cell;
-use std::mem::MaybeUninit;
+use std::mem::{self, MaybeUninit};
 use std::ptr;
 
 use rayon::prelude::*;
@@ -39,6 +39,48 @@ fn take_utility_scratch() -> UtilityScratch {
 #[inline]
 fn put_utility_scratch(scratch: UtilityScratch) {
     UTILITY_SCRATCH.with(|cell| cell.set(scratch));
+}
+
+// ---------------------------------------------------------------------------
+// CfvScratch — reusable allocations for cfvalue/best-cfv recursion
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated buffers reused across `compute_cfvalue_recursive` and
+/// `compute_best_cfv_recursive` to avoid per-node heap allocations.
+struct CfvScratch {
+    /// Backing store for the flat cfv_actions matrix.
+    cfv_buf: Vec<f32>,
+    /// Chance-node cfreach update.
+    cfreach_buf: Vec<f32>,
+    /// Chance-node f64 accumulator for isomorphic-chance summation.
+    result_f64_buf: Vec<f64>,
+    /// Strategy vector (or opponent cfreach_actions).
+    strategy_buf: Vec<f32>,
+}
+
+impl CfvScratch {
+    const fn new() -> Self {
+        Self {
+            cfv_buf: Vec::new(),
+            cfreach_buf: Vec::new(),
+            result_f64_buf: Vec::new(),
+            strategy_buf: Vec::new(),
+        }
+    }
+}
+
+thread_local! {
+    static CFV_SCRATCH: Cell<CfvScratch> = const { Cell::new(CfvScratch::new()) };
+}
+
+#[inline]
+fn take_cfv_scratch() -> CfvScratch {
+    CFV_SCRATCH.with(|cell| cell.replace(CfvScratch::new()))
+}
+
+#[inline]
+fn put_cfv_scratch(scratch: CfvScratch) {
+    CFV_SCRATCH.with(|cell| cell.set(scratch));
 }
 
 /// Executes `op` for each child, potentially in parallel via rayon.
@@ -215,6 +257,54 @@ pub(crate) fn normalized_strategy_compressed(
     normalized
 }
 
+/// Normalizes a cumulative strategy into `buf`, reusing its allocation.
+#[inline]
+fn normalized_strategy_into(buf: &mut Vec<f32>, strategy: &[f32], num_actions: usize) {
+    buf.clear();
+    buf.reserve(strategy.len());
+    let uninit = &mut buf.spare_capacity_mut()[..strategy.len()];
+
+    let row_size = strategy.len() / num_actions;
+    let mut denom = Vec::with_capacity(row_size);
+    sum_slices_uninit(denom.spare_capacity_mut(), strategy);
+    // SAFETY: sum_slices_uninit initializes all `row_size` elements.
+    unsafe { denom.set_len(row_size) };
+
+    let default = 1.0 / num_actions as f32;
+    uninit
+        .chunks_exact_mut(row_size)
+        .zip(strategy.chunks_exact(row_size))
+        .for_each(|(n, s)| {
+            div_slice_uninit(n, s, &denom, default);
+        });
+
+    // SAFETY: All `strategy.len()` elements initialized by div_slice_uninit.
+    unsafe { buf.set_len(strategy.len()) };
+}
+
+/// Normalizes a compressed (u16) cumulative strategy into `buf`, reusing its allocation.
+#[inline]
+fn normalized_strategy_compressed_into(
+    buf: &mut Vec<f32>,
+    strategy: &[u16],
+    num_actions: usize,
+) {
+    buf.clear();
+    buf.reserve(strategy.len());
+    buf.extend(strategy.iter().map(|&s| s as f32));
+
+    let row_size = strategy.len() / num_actions;
+    let mut denom = Vec::with_capacity(row_size);
+    sum_slices_uninit(denom.spare_capacity_mut(), buf);
+    // SAFETY: sum_slices_uninit initializes all `row_size` elements.
+    unsafe { denom.set_len(row_size) };
+
+    let default = 1.0 / num_actions as f32;
+    buf.chunks_exact_mut(row_size).for_each(|r| {
+        div_slice(r, &denom, default);
+    });
+}
+
 /// Applies a locking strategy: where `locking[i]` is non-negative, override
 /// the corresponding strategy entry.
 #[inline]
@@ -380,6 +470,8 @@ pub fn compute_mes_ev<T: Game>(game: &T) -> [f32; 2] {
 // ---------------------------------------------------------------------------
 
 /// Recursively computes the counterfactual values of the current strategy.
+///
+/// Uses thread-local [`CfvScratch`] to avoid per-node heap allocations.
 fn compute_cfvalue_recursive<T: Game>(
     result: &mut [MaybeUninit<f32>],
     game: &T,
@@ -397,11 +489,34 @@ fn compute_cfvalue_recursive<T: Game>(
     let num_actions = node.num_actions();
     let num_hands = result.len();
 
-    let cfv_actions = MutexLike::new(Vec::with_capacity(num_actions * num_hands));
+    // Opponent node with single action: no scratch needed.
+    if !node.is_chance() && node.player() != player && num_actions == 1 {
+        compute_cfvalue_recursive(
+            result,
+            game,
+            &mut node.play(0),
+            player,
+            cfreach,
+            save_cfvalues,
+        );
+        return;
+    }
 
-    // Chance node
+    // Take scratch buffers from TLS.
+    let mut scratch = take_cfv_scratch();
+
+    // Prepare cfv_actions from scratch.
+    let cfv_needed = num_actions * num_hands;
+    let mut cfv_buf = mem::take(&mut scratch.cfv_buf);
+    cfv_buf.clear();
+    cfv_buf.reserve(cfv_needed);
+    let cfv_mutex = MutexLike::new(cfv_buf);
+
+    // -- Chance node --
     if node.is_chance() {
-        let mut cfreach_updated = Vec::with_capacity(cfreach.len());
+        let mut cfreach_updated = mem::take(&mut scratch.cfreach_buf);
+        cfreach_updated.clear();
+        cfreach_updated.reserve(cfreach.len());
         mul_slice_scalar_uninit(
             cfreach_updated.spare_capacity_mut(),
             cfreach,
@@ -410,9 +525,12 @@ fn compute_cfvalue_recursive<T: Game>(
         // SAFETY: mul_slice_scalar_uninit writes all cfreach.len() elements.
         unsafe { cfreach_updated.set_len(cfreach.len()) };
 
+        // Return remaining scratch to TLS so children can reuse it.
+        put_cfv_scratch(scratch);
+
         for_each_child(node, |action| {
             compute_cfvalue_recursive(
-                row_mut(cfv_actions.lock().spare_capacity_mut(), action, num_hands),
+                row_mut(cfv_mutex.lock().spare_capacity_mut(), action, num_hands),
                 game,
                 &mut node.play(action),
                 player,
@@ -421,33 +539,45 @@ fn compute_cfvalue_recursive<T: Game>(
             );
         });
 
-        let mut result_f64 = Vec::with_capacity(num_hands);
+        // Re-take scratch for post-recursion work.
+        let mut scratch = take_cfv_scratch();
+        scratch.result_f64_buf.clear();
+        scratch.result_f64_buf.reserve(num_hands);
 
-        let mut cfv_actions = cfv_actions.lock();
-        // SAFETY: All num_actions * num_hands elements initialized by recursion.
-        unsafe { cfv_actions.set_len(num_actions * num_hands) };
-        sum_slices_f64_uninit(result_f64.spare_capacity_mut(), &cfv_actions);
+        let mut cfv_buf = cfv_mutex.into_inner();
+        // SAFETY: All cfv_needed elements initialized by child recursion.
+        unsafe { cfv_buf.set_len(cfv_needed) };
+
+        sum_slices_f64_uninit(
+            &mut scratch.result_f64_buf.spare_capacity_mut()[..num_hands],
+            &cfv_buf,
+        );
         // SAFETY: sum_slices_f64_uninit writes all num_hands elements.
-        unsafe { result_f64.set_len(num_hands) };
+        unsafe { scratch.result_f64_buf.set_len(num_hands) };
 
         let isomorphic_chances = game.isomorphic_chances(node);
 
         for (i, &isomorphic_index) in isomorphic_chances.iter().enumerate() {
             let swap_list = &game.isomorphic_swap(node, i)[player];
-            let tmp = row_mut(&mut cfv_actions, isomorphic_index as usize, num_hands);
+            let tmp = row_mut(&mut cfv_buf, isomorphic_index as usize, num_hands);
 
             apply_swap(tmp, swap_list);
 
-            result_f64.iter_mut().zip(&*tmp).for_each(|(r, &v)| {
-                *r += v as f64;
-            });
+            scratch
+                .result_f64_buf
+                .iter_mut()
+                .zip(&*tmp)
+                .for_each(|(r, &v)| *r += v as f64);
 
             apply_swap(tmp, swap_list);
         }
 
-        result.iter_mut().zip(&result_f64).for_each(|(r, &v)| {
-            r.write(v as f32);
-        });
+        result
+            .iter_mut()
+            .zip(&scratch.result_f64_buf)
+            .for_each(|(r, &v)| {
+                r.write(v as f32);
+            });
 
         // Save the counterfactual values.
         if save_cfvalues && node.cfvalue_storage_player() == Some(player) {
@@ -461,12 +591,20 @@ fn compute_cfvalue_recursive<T: Game>(
                 node.cfvalues_chance_mut().copy_from_slice(result);
             }
         }
+
+        // Return buffers to scratch.
+        scratch.cfv_buf = cfv_buf;
+        scratch.cfreach_buf = cfreach_updated;
+        put_cfv_scratch(scratch);
     }
     // Player node
     else if node.player() == player {
+        // Return scratch to TLS before child recursion.
+        put_cfv_scratch(scratch);
+
         for_each_child(node, |action| {
             compute_cfvalue_recursive(
-                row_mut(cfv_actions.lock().spare_capacity_mut(), action, num_hands),
+                row_mut(cfv_mutex.lock().spare_capacity_mut(), action, num_hands),
                 game,
                 &mut node.play(action),
                 player,
@@ -475,60 +613,76 @@ fn compute_cfvalue_recursive<T: Game>(
             );
         });
 
-        let mut strategy = if game.is_compression_enabled() {
-            normalized_strategy_compressed(node.strategy_compressed(), num_actions)
+        // Re-take scratch for strategy normalization.
+        let mut scratch = take_cfv_scratch();
+
+        if game.is_compression_enabled() {
+            normalized_strategy_compressed_into(
+                &mut scratch.strategy_buf,
+                node.strategy_compressed(),
+                num_actions,
+            );
         } else {
-            normalized_strategy(node.strategy(), num_actions)
-        };
+            normalized_strategy_into(
+                &mut scratch.strategy_buf,
+                node.strategy(),
+                num_actions,
+            );
+        }
 
         let locking = game.locking_strategy(node);
-        apply_locking_strategy(&mut strategy, locking);
+        apply_locking_strategy(&mut scratch.strategy_buf, locking);
 
-        let mut cfv_actions = cfv_actions.lock();
-        // SAFETY: All num_actions * num_hands elements initialized by recursion.
-        unsafe { cfv_actions.set_len(num_actions * num_hands) };
-        fma_slices_uninit(result, &strategy, &cfv_actions);
+        let mut cfv_buf = cfv_mutex.into_inner();
+        // SAFETY: All cfv_needed elements initialized by child recursion.
+        unsafe { cfv_buf.set_len(cfv_needed) };
+        fma_slices_uninit(result, &scratch.strategy_buf, &cfv_buf);
 
         if save_cfvalues {
             if game.is_compression_enabled() {
                 let cfv_scale =
-                    encode_signed_slice(node.cfvalues_compressed_mut(), &cfv_actions);
+                    encode_signed_slice(node.cfvalues_compressed_mut(), &cfv_buf);
                 node.set_cfvalue_scale(cfv_scale);
             } else {
-                node.cfvalues_mut().copy_from_slice(&cfv_actions);
+                node.cfvalues_mut().copy_from_slice(&cfv_buf);
             }
         }
+
+        scratch.cfv_buf = cfv_buf;
+        put_cfv_scratch(scratch);
     }
-    // Opponent node with single action
-    else if num_actions == 1 {
-        compute_cfvalue_recursive(
-            result,
-            game,
-            &mut node.play(0),
-            player,
-            cfreach,
-            save_cfvalues,
-        );
-    }
-    // Opponent node
+    // Opponent node (num_actions >= 2, handled single-action above)
     else {
-        let mut cfreach_actions = if game.is_compression_enabled() {
-            normalized_strategy_compressed(node.strategy_compressed(), num_actions)
+        if game.is_compression_enabled() {
+            normalized_strategy_compressed_into(
+                &mut scratch.strategy_buf,
+                node.strategy_compressed(),
+                num_actions,
+            );
         } else {
-            normalized_strategy(node.strategy(), num_actions)
-        };
+            normalized_strategy_into(
+                &mut scratch.strategy_buf,
+                node.strategy(),
+                num_actions,
+            );
+        }
 
         let locking = game.locking_strategy(node);
-        apply_locking_strategy(&mut cfreach_actions, locking);
+        apply_locking_strategy(&mut scratch.strategy_buf, locking);
 
         let row_size = cfreach.len();
-        cfreach_actions.chunks_exact_mut(row_size).for_each(|r| {
-            mul_slice(r, cfreach);
-        });
+        scratch
+            .strategy_buf
+            .chunks_exact_mut(row_size)
+            .for_each(|r| mul_slice(r, cfreach));
+
+        // Extract cfreach_actions as local for closure borrowing.
+        let cfreach_actions = mem::take(&mut scratch.strategy_buf);
+        put_cfv_scratch(scratch);
 
         for_each_child(node, |action| {
             compute_cfvalue_recursive(
-                row_mut(cfv_actions.lock().spare_capacity_mut(), action, num_hands),
+                row_mut(cfv_mutex.lock().spare_capacity_mut(), action, num_hands),
                 game,
                 &mut node.play(action),
                 player,
@@ -537,13 +691,20 @@ fn compute_cfvalue_recursive<T: Game>(
             );
         });
 
-        let mut cfv_actions = cfv_actions.lock();
-        // SAFETY: All num_actions * num_hands elements initialized by recursion.
-        unsafe { cfv_actions.set_len(num_actions * num_hands) };
-        sum_slices_uninit(result, &cfv_actions);
+        let mut cfv_buf = cfv_mutex.into_inner();
+        // SAFETY: All cfv_needed elements initialized by child recursion.
+        unsafe { cfv_buf.set_len(cfv_needed) };
+        sum_slices_uninit(result, &cfv_buf);
+
+        // Return buffers to scratch.
+        let mut scratch = take_cfv_scratch();
+        scratch.cfv_buf = cfv_buf;
+        scratch.strategy_buf = cfreach_actions;
+        put_cfv_scratch(scratch);
     }
 
     // Save the counterfactual values for IP.
+    // Note: scratch has been put back to TLS already in all branches above.
     if save_cfvalues && node.has_cfvalues_ip() && player == 1 {
         // SAFETY: All elements of result have been written by the branches above.
         let result = unsafe { &*(result as *const _ as *const [f32]) };
@@ -561,6 +722,8 @@ fn compute_cfvalue_recursive<T: Game>(
 // ---------------------------------------------------------------------------
 
 /// Recursively computes the counterfactual values of the best response.
+///
+/// Uses thread-local [`CfvScratch`] to avoid per-node heap allocations.
 fn compute_best_cfv_recursive<T: Game>(
     result: &mut [MaybeUninit<f32>],
     game: &T,
@@ -577,18 +740,27 @@ fn compute_best_cfv_recursive<T: Game>(
     let num_actions = node.num_actions();
     let num_hands = game.num_private_hands(player);
 
-    // Single action (non-chance): just recurse
+    // Single action (non-chance): just recurse, no scratch needed.
     if num_actions == 1 && !node.is_chance() {
         let child = &node.play(0);
         compute_best_cfv_recursive(result, game, child, player, cfreach);
         return;
     }
 
-    let cfv_actions = MutexLike::new(Vec::with_capacity(num_actions * num_hands));
+    // Take scratch buffers from TLS.
+    let mut scratch = take_cfv_scratch();
 
-    // Chance node
+    let cfv_needed = num_actions * num_hands;
+    let mut cfv_buf = mem::take(&mut scratch.cfv_buf);
+    cfv_buf.clear();
+    cfv_buf.reserve(cfv_needed);
+    let cfv_mutex = MutexLike::new(cfv_buf);
+
+    // -- Chance node --
     if node.is_chance() {
-        let mut cfreach_updated = Vec::with_capacity(cfreach.len());
+        let mut cfreach_updated = mem::take(&mut scratch.cfreach_buf);
+        cfreach_updated.clear();
+        cfreach_updated.reserve(cfreach.len());
         mul_slice_scalar_uninit(
             cfreach_updated.spare_capacity_mut(),
             cfreach,
@@ -597,9 +769,12 @@ fn compute_best_cfv_recursive<T: Game>(
         // SAFETY: mul_slice_scalar_uninit writes all cfreach.len() elements.
         unsafe { cfreach_updated.set_len(cfreach.len()) };
 
+        // Return remaining scratch to TLS so children can reuse it.
+        put_cfv_scratch(scratch);
+
         for_each_child(node, |action| {
             compute_best_cfv_recursive(
-                row_mut(cfv_actions.lock().spare_capacity_mut(), action, num_hands),
+                row_mut(cfv_mutex.lock().spare_capacity_mut(), action, num_hands),
                 game,
                 &node.play(action),
                 player,
@@ -607,39 +782,59 @@ fn compute_best_cfv_recursive<T: Game>(
             );
         });
 
-        let mut result_f64 = Vec::with_capacity(num_hands);
+        // Re-take scratch for post-recursion work.
+        let mut scratch = take_cfv_scratch();
+        scratch.result_f64_buf.clear();
+        scratch.result_f64_buf.reserve(num_hands);
 
-        let mut cfv_actions = cfv_actions.lock();
-        // SAFETY: All num_actions * num_hands elements initialized by recursion.
-        unsafe { cfv_actions.set_len(num_actions * num_hands) };
-        sum_slices_f64_uninit(result_f64.spare_capacity_mut(), &cfv_actions);
+        let mut cfv_buf = cfv_mutex.into_inner();
+        // SAFETY: All cfv_needed elements initialized by child recursion.
+        unsafe { cfv_buf.set_len(cfv_needed) };
+
+        sum_slices_f64_uninit(
+            &mut scratch.result_f64_buf.spare_capacity_mut()[..num_hands],
+            &cfv_buf,
+        );
         // SAFETY: sum_slices_f64_uninit writes all num_hands elements.
-        unsafe { result_f64.set_len(num_hands) };
+        unsafe { scratch.result_f64_buf.set_len(num_hands) };
 
         let isomorphic_chances = game.isomorphic_chances(node);
 
         for (i, &isomorphic_index) in isomorphic_chances.iter().enumerate() {
             let swap_list = &game.isomorphic_swap(node, i)[player];
-            let tmp = row_mut(&mut cfv_actions, isomorphic_index as usize, num_hands);
+            let tmp = row_mut(&mut cfv_buf, isomorphic_index as usize, num_hands);
 
             apply_swap(tmp, swap_list);
 
-            result_f64.iter_mut().zip(&*tmp).for_each(|(r, &v)| {
-                *r += v as f64;
-            });
+            scratch
+                .result_f64_buf
+                .iter_mut()
+                .zip(&*tmp)
+                .for_each(|(r, &v)| *r += v as f64);
 
             apply_swap(tmp, swap_list);
         }
 
-        result.iter_mut().zip(&result_f64).for_each(|(r, &v)| {
-            r.write(v as f32);
-        });
+        result
+            .iter_mut()
+            .zip(&scratch.result_f64_buf)
+            .for_each(|(r, &v)| {
+                r.write(v as f32);
+            });
+
+        // Return buffers to scratch.
+        scratch.cfv_buf = cfv_buf;
+        scratch.cfreach_buf = cfreach_updated;
+        put_cfv_scratch(scratch);
     }
     // Player node: take the best response (max over actions)
     else if node.player() == player {
+        // Return scratch to TLS before child recursion.
+        put_cfv_scratch(scratch);
+
         for_each_child(node, |action| {
             compute_best_cfv_recursive(
-                row_mut(cfv_actions.lock().spare_capacity_mut(), action, num_hands),
+                row_mut(cfv_mutex.lock().spare_capacity_mut(), action, num_hands),
                 game,
                 &node.play(action),
                 player,
@@ -648,35 +843,53 @@ fn compute_best_cfv_recursive<T: Game>(
         });
 
         let locking = game.locking_strategy(node);
-        let mut cfv_actions = cfv_actions.lock();
-        // SAFETY: All num_actions * num_hands elements initialized by recursion.
-        unsafe { cfv_actions.set_len(num_actions * num_hands) };
+        let mut cfv_buf = cfv_mutex.into_inner();
+        // SAFETY: All cfv_needed elements initialized by child recursion.
+        unsafe { cfv_buf.set_len(cfv_needed) };
 
         if locking.is_empty() {
-            max_slices_uninit(result, &cfv_actions);
+            max_slices_uninit(result, &cfv_buf);
         } else {
-            max_fma_slices_uninit(result, &cfv_actions, locking);
+            max_fma_slices_uninit(result, &cfv_buf, locking);
         }
+
+        // Return buffer to scratch.
+        let mut scratch = take_cfv_scratch();
+        scratch.cfv_buf = cfv_buf;
+        put_cfv_scratch(scratch);
     }
-    // Opponent node
+    // Opponent node (num_actions >= 2, single-action handled above)
     else {
-        let mut cfreach_actions = if game.is_compression_enabled() {
-            normalized_strategy_compressed(node.strategy_compressed(), num_actions)
+        if game.is_compression_enabled() {
+            normalized_strategy_compressed_into(
+                &mut scratch.strategy_buf,
+                node.strategy_compressed(),
+                num_actions,
+            );
         } else {
-            normalized_strategy(node.strategy(), num_actions)
-        };
+            normalized_strategy_into(
+                &mut scratch.strategy_buf,
+                node.strategy(),
+                num_actions,
+            );
+        }
 
         let locking = game.locking_strategy(node);
-        apply_locking_strategy(&mut cfreach_actions, locking);
+        apply_locking_strategy(&mut scratch.strategy_buf, locking);
 
         let row_size = cfreach.len();
-        cfreach_actions.chunks_exact_mut(row_size).for_each(|r| {
-            mul_slice(r, cfreach);
-        });
+        scratch
+            .strategy_buf
+            .chunks_exact_mut(row_size)
+            .for_each(|r| mul_slice(r, cfreach));
+
+        // Extract cfreach_actions as local for closure borrowing.
+        let cfreach_actions = mem::take(&mut scratch.strategy_buf);
+        put_cfv_scratch(scratch);
 
         for_each_child(node, |action| {
             compute_best_cfv_recursive(
-                row_mut(cfv_actions.lock().spare_capacity_mut(), action, num_hands),
+                row_mut(cfv_mutex.lock().spare_capacity_mut(), action, num_hands),
                 game,
                 &node.play(action),
                 player,
@@ -684,10 +897,16 @@ fn compute_best_cfv_recursive<T: Game>(
             );
         });
 
-        let mut cfv_actions = cfv_actions.lock();
-        // SAFETY: All num_actions * num_hands elements initialized by recursion.
-        unsafe { cfv_actions.set_len(num_actions * num_hands) };
-        sum_slices_uninit(result, &cfv_actions);
+        let mut cfv_buf = cfv_mutex.into_inner();
+        // SAFETY: All cfv_needed elements initialized by child recursion.
+        unsafe { cfv_buf.set_len(cfv_needed) };
+        sum_slices_uninit(result, &cfv_buf);
+
+        // Return buffers to scratch.
+        let mut scratch = take_cfv_scratch();
+        scratch.cfv_buf = cfv_buf;
+        scratch.strategy_buf = cfreach_actions;
+        put_cfv_scratch(scratch);
     }
 }
 
