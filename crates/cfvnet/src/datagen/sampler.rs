@@ -1,7 +1,7 @@
 use rand::Rng;
 
 use crate::config::DatagenConfig;
-use super::range_gen::{generate_rsp_range, NUM_COMBOS};
+use super::range_gen::{compute_hand_strengths, generate_rsp_range_with_strengths, NUM_COMBOS};
 
 /// A single training situation before solving.
 #[derive(Debug, Clone)]
@@ -29,8 +29,9 @@ pub fn sample_situation<R: Rng>(
     } else {
         rng.gen_range(5..=max_stack)
     };
-    let oop_range = generate_rsp_range(&board, rng);
-    let ip_range = generate_rsp_range(&board, rng);
+    let strengths = compute_hand_strengths(&board);
+    let oop_range = generate_rsp_range_with_strengths(&strengths, rng);
+    let ip_range = generate_rsp_range_with_strengths(&strengths, rng);
     Situation {
         board,
         pot,

@@ -114,7 +114,17 @@ fn raw_to_ordinal(raw: &[i32; NUM_COMBOS]) -> [u16; NUM_COMBOS] {
 /// Board-conflicting combos have zero reach.
 pub fn generate_rsp_range<R: Rng>(board: &[u8], rng: &mut R) -> [f32; NUM_COMBOS] {
     let strengths = compute_hand_strengths(board);
+    generate_rsp_range_with_strengths(&strengths, rng)
+}
 
+/// Like [`generate_rsp_range`], but accepts pre-computed hand strengths.
+///
+/// Use this when generating multiple ranges for the same board to avoid
+/// recomputing `compute_hand_strengths` for each call.
+pub fn generate_rsp_range_with_strengths<R: Rng>(
+    strengths: &[u16; NUM_COMBOS],
+    rng: &mut R,
+) -> [f32; NUM_COMBOS] {
     // Collect valid (non-blocked) combo indices, sorted by ascending strength.
     let mut valid: Vec<usize> = (0..NUM_COMBOS)
         .filter(|&i| strengths[i] > 0)
