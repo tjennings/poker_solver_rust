@@ -398,6 +398,31 @@ mod tests {
     }
 
     #[test]
+    fn train_with_validation_reports_val_loss() {
+        let file = write_test_data(20);
+        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        let device = Default::default();
+        let config = TrainConfig {
+            hidden_layers: 2,
+            hidden_size: 64,
+            batch_size: 8,
+            epochs: 3,
+            learning_rate: 0.001,
+            lr_min: 0.001,
+            huber_delta: 1.0,
+            aux_loss_weight: 0.0,
+            validation_split: 0.2, // 4 val samples out of 20
+            checkpoint_every_n_epochs: 0,
+        };
+
+        let result = train::<B>(&device, &dataset, &config, Some(dir.path()));
+        assert!(result.final_train_loss < 10.0);
+        assert!(dir.path().join("model.mpk.gz").exists());
+    }
+
+    #[test]
     fn train_resumes_from_checkpoint() {
         let file = write_test_data(16);
         let dataset = CfvDataset::from_file(file.path()).unwrap();
