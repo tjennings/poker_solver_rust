@@ -557,7 +557,7 @@ impl SubgameCfrCtx<'_> {
 // ---------------------------------------------------------------------------
 
 /// Precompute total opponent reach for each combo (excluding blocked combos).
-fn precompute_opp_reach(combos: &[[Card; 2]], opponent_reach: &[f64]) -> Vec<f64> {
+pub fn precompute_opp_reach(combos: &[[Card; 2]], opponent_reach: &[f64]) -> Vec<f64> {
     combos
         .iter()
         .map(|&hero| {
@@ -572,7 +572,7 @@ fn precompute_opp_reach(combos: &[[Card; 2]], opponent_reach: &[f64]) -> Vec<f64
 }
 
 /// Build an N x N equity matrix for all combo pairs on the given board.
-fn compute_equity_matrix(combos: &[[Card; 2]], board: &[Card]) -> Vec<Vec<f64>> {
+pub fn compute_equity_matrix(combos: &[[Card; 2]], board: &[Card]) -> Vec<Vec<f64>> {
     let n = combos.len();
     let ranks: Vec<Rank> = combos.iter().map(|c| rank_combo(*c, board)).collect();
     let mut matrix = vec![vec![0.5; n]; n];
@@ -610,7 +610,7 @@ fn rank_combo(combo: [Card; 2], board: &[Card]) -> Rank {
 }
 
 /// Check if two 2-card combos share any card.
-fn cards_overlap(a: [Card; 2], b: [Card; 2]) -> bool {
+pub fn cards_overlap(a: [Card; 2], b: [Card; 2]) -> bool {
     a[0] == b[0] || a[0] == b[1] || a[1] == b[0] || a[1] == b[1]
 }
 

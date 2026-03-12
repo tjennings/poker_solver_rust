@@ -9,7 +9,7 @@
 //!    opponent range, producing per-combo CFVs.
 //! 3. Uses those CFVs during CFR traversal.
 
-use crate::blueprint::{
+use crate::blueprint_v2::subgame_cfr::{
     cards_overlap, compute_combo_equities, compute_equity_matrix, precompute_opp_reach,
     SubgameCfrSolver, SubgameHands, SubgameStrategy,
 };
