@@ -1,6 +1,7 @@
 use std::io::BufReader;
 use std::path::Path;
 
+use crate::datagen::sampler::Situation;
 use crate::datagen::storage::{read_record, count_records, TrainingRecord};
 use crate::model::network::INPUT_SIZE;
 
@@ -51,6 +52,35 @@ impl CfvDataset {
     pub fn get(&self, idx: usize) -> Option<CfvItem> {
         self.records.get(idx).map(encode_record)
     }
+}
+
+/// Encode a [`Situation`] into a model input vector for inference.
+///
+/// Mirrors the encoding in [`encode_record`] but works from a `Situation`
+/// rather than a raw `TrainingRecord`, making it usable at inference time
+/// when no stored record exists.
+pub fn encode_situation_for_inference(sit: &Situation, player: u8) -> Vec<f32> {
+    let mut input = Vec::with_capacity(INPUT_SIZE);
+    // OOP range (1326 floats)
+    for &v in &sit.ranges[0] {
+        input.push(v);
+    }
+    // IP range (1326 floats)
+    for &v in &sit.ranges[1] {
+        input.push(v);
+    }
+    // Board cards (5 floats, normalized to [0, 1])
+    for &card in &sit.board {
+        input.push(f32::from(card) / 51.0);
+    }
+    // Pot (normalized by max pot)
+    input.push(sit.pot as f32 / 400.0);
+    // Effective stack (normalized by max stack)
+    input.push(sit.effective_stack as f32 / 400.0);
+    // Player indicator (0.0 = OOP, 1.0 = IP)
+    input.push(f32::from(player));
+    debug_assert_eq!(input.len(), INPUT_SIZE);
+    input
 }
 
 fn encode_record(rec: &TrainingRecord) -> CfvItem {

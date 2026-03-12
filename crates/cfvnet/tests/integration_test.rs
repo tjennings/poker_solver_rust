@@ -55,7 +55,7 @@ fn full_pipeline_smoke_test() {
         huber_delta: 1.0,
         aux_loss_weight: 0.0,
         validation_split: 0.0,
-        checkpoint_every_n_batches: 0,
+        checkpoint_every_n_epochs: 0,
     };
 
     let result = cfvnet::model::training::train::<B>(
