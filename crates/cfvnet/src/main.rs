@@ -560,5 +560,37 @@ fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
     println!("  Mean mBB:       {:.2}", summary.mean_mbb);
     println!("  Worst MAE:      {:.6}", summary.worst_mae);
     println!("  Worst mBB:      {:.2}", summary.worst_mbb);
+
+    if summary.spots.is_empty() {
+        return;
+    }
+
+    let mut sorted: Vec<_> = summary.spots.iter().collect();
+    sorted.sort_by(|a, b| a.mbb.total_cmp(&b.mbb));
+
+    let top_n = sorted.len().min(3);
+
+    println!("\nBest {} spots (by mBB):", top_n);
+    for (i, spot) in sorted.iter().take(top_n).enumerate() {
+        println!("  {}. {}  Pot: {:<5} Stack: {:<5} MAE: {:.6}  mBB: {:.2}",
+            i + 1, format_board(&spot.board, spot.board_size),
+            spot.pot, spot.effective_stack, spot.mae, spot.mbb);
+    }
+
+    println!("\nWorst {} spots (by mBB):", top_n);
+    for (i, spot) in sorted.iter().rev().take(top_n).enumerate() {
+        println!("  {}. {}  Pot: {:<5} Stack: {:<5} MAE: {:.6}  mBB: {:.2}",
+            i + 1, format_board(&spot.board, spot.board_size),
+            spot.pot, spot.effective_stack, spot.mae, spot.mbb);
+    }
+}
+
+fn format_board(board: &[u8; 5], board_size: usize) -> String {
+    use range_solver::card::card_to_string;
+    let cards: Vec<String> = board[..board_size]
+        .iter()
+        .map(|&c| card_to_string(c).unwrap_or_else(|_| "??".into()))
+        .collect();
+    format!("Board: {}", cards.join(" "))
 }
 

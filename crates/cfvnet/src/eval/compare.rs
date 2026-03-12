@@ -38,6 +38,16 @@ pub fn compare_single_spot(
     compute_prediction_metrics(predicted, actual, valid_mask, pot)
 }
 
+/// Per-spot comparison result with board context for reporting.
+pub struct SpotResult {
+    pub board: [u8; 5],
+    pub board_size: usize,
+    pub pot: i32,
+    pub effective_stack: i32,
+    pub mae: f64,
+    pub mbb: f64,
+}
+
 /// Summary of comparison across multiple spots.
 pub struct ComparisonSummary {
     pub num_spots: usize,
@@ -46,6 +56,7 @@ pub struct ComparisonSummary {
     pub mean_mbb: f64,
     pub worst_mae: f64,
     pub worst_mbb: f64,
+    pub spots: Vec<SpotResult>,
 }
 
 /// Run comparison on N random spots.
@@ -66,6 +77,7 @@ where
     let mut maes = Vec::with_capacity(num_spots);
     let mut max_errors = Vec::with_capacity(num_spots);
     let mut mbbs = Vec::with_capacity(num_spots);
+    let mut spots = Vec::with_capacity(num_spots);
 
     for i in 0..num_spots {
         let spot = generate_comparison_spot(base_seed + i as u64, game_config.initial_stack);
@@ -76,6 +88,14 @@ where
         maes.push(metrics.mae);
         max_errors.push(metrics.max_error);
         mbbs.push(metrics.mbb_error);
+        spots.push(SpotResult {
+            board: spot.board,
+            board_size: spot.board_size,
+            pot: spot.pot,
+            effective_stack: spot.effective_stack,
+            mae: metrics.mae,
+            mbb: metrics.mbb_error,
+        });
     }
 
     let n = num_spots as f64;
@@ -86,6 +106,7 @@ where
         mean_mbb: mbbs.iter().sum::<f64>() / n,
         worst_mae: maes.iter().copied().fold(0.0_f64, f64::max),
         worst_mbb: mbbs.iter().copied().fold(0.0_f64, f64::max),
+        spots,
     })
 }
 
@@ -117,5 +138,26 @@ mod tests {
             summary.worst_mae
         );
         assert_eq!(summary.num_spots, 2);
+    }
+
+    #[test]
+    fn summary_contains_per_spot_results() {
+        let game = GameConfig {
+            initial_stack: 200,
+            bet_sizes: vec!["50%".into(), "a".into()],
+            ..Default::default()
+        };
+
+        let summary = run_comparison(&game, 3, 42, |_sit, result| result.oop_evs.to_vec())
+            .unwrap();
+
+        assert_eq!(summary.spots.len(), 3);
+        for spot in &summary.spots {
+            assert!(spot.board_size == 4 || spot.board_size == 5);
+            assert!(spot.pot > 0);
+            assert!(spot.effective_stack > 0);
+            assert!(spot.mae.is_finite());
+            assert!(spot.mbb.is_finite());
+        }
     }
 }
