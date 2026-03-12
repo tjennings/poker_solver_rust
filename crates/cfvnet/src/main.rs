@@ -1,6 +1,14 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+fn default_backend() -> String {
+    if cfg!(feature = "cuda") {
+        "cuda".into()
+    } else {
+        "wgpu".into()
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "cfvnet", about = "Deep Counterfactual Value Network toolkit")]
 struct Cli {
@@ -39,8 +47,9 @@ enum Commands {
         /// Output directory for checkpoints
         #[arg(short, long)]
         output: PathBuf,
-        /// Backend: wgpu (default, Metal/Vulkan), ndarray (CPU), or cuda (NVIDIA, requires --features cuda)
-        #[arg(long, default_value = "wgpu")]
+        /// Backend: wgpu (Metal/Vulkan), ndarray (CPU), or cuda (NVIDIA, requires --features cuda).
+        /// Defaults to cuda when built with --features cuda, otherwise wgpu.
+        #[arg(long, default_value_t = default_backend())]
         backend: String,
     },
     /// Evaluate model on held-out validation data
@@ -222,8 +231,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         }
         #[cfg(feature = "cuda")]
         "cuda" => {
-            use burn::backend::{Autodiff, cuda_jit::{CudaDevice, CudaRuntime}};
-            use burn::backend::CudaJit;
+            use burn::backend::{Autodiff, CudaJit, cuda_jit::CudaDevice};
             type B = Autodiff<CudaJit<f32>>;
             let device = CudaDevice::default();
             println!("Using CUDA backend (NVIDIA GPU)");
