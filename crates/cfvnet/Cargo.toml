@@ -16,6 +16,11 @@ bytemuck = { version = "1", features = ["derive"] }
 indicatif = "0.17"
 thiserror = { workspace = true }
 burn = { version = "0.16", features = ["train", "wgpu", "ndarray"] }
+burn-cuda = { version = "0.16", optional = true }
+
+[features]
+default = []
+cuda = ["burn/cuda-jit"]
 
 [dev-dependencies]
 tempfile = "3"

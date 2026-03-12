@@ -1026,6 +1026,7 @@ name = "cfvnet"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-cuda",
  "bytemuck",
  "clap",
  "indicatif",

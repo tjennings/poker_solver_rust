@@ -36,7 +36,7 @@ enum Commands {
         /// Output directory for checkpoints
         #[arg(short, long)]
         output: PathBuf,
-        /// Backend: wgpu (default, uses Metal GPU on macOS) or ndarray (CPU)
+        /// Backend: wgpu (default, Metal/Vulkan), ndarray (CPU), or cuda (NVIDIA, requires --features cuda)
         #[arg(long, default_value = "wgpu")]
         backend: String,
     },
@@ -195,8 +195,23 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
             let result = cfvnet::model::training::train::<B>(&device, &dataset, &train_config, Some(&output));
             println!("Training complete. Final loss: {}", result.final_train_loss);
         }
+        #[cfg(feature = "cuda")]
+        "cuda" => {
+            use burn::backend::{Autodiff, cuda_jit::{CudaDevice, CudaRuntime}};
+            use burn::backend::CudaJit;
+            type B = Autodiff<CudaJit<f32>>;
+            let device = CudaDevice::default();
+            println!("Using CUDA backend (NVIDIA GPU)");
+            let result = cfvnet::model::training::train::<B>(&device, &dataset, &train_config, Some(&output));
+            println!("Training complete. Final loss: {}", result.final_train_loss);
+        }
+        #[cfg(not(feature = "cuda"))]
+        "cuda" => {
+            eprintln!("CUDA backend not enabled. Rebuild with: cargo build -p cfvnet --features cuda --release");
+            std::process::exit(1);
+        }
         other => {
-            eprintln!("unknown backend '{other}', expected 'ndarray' or 'wgpu'");
+            eprintln!("unknown backend '{other}', expected 'ndarray', 'wgpu', or 'cuda'");
             std::process::exit(1);
         }
     }
