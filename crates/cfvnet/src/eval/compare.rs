@@ -8,10 +8,9 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 /// Generate a random comparison spot from a seed.
-pub fn generate_comparison_spot(seed: u64, initial_stack: i32) -> Situation {
+pub fn generate_comparison_spot(seed: u64, initial_stack: i32, datagen: &DatagenConfig) -> Situation {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let config = DatagenConfig::default();
-    sample_situation(&config, initial_stack, 5, &mut rng)
+    sample_situation(datagen, initial_stack, 5, &mut rng)
 }
 
 /// Default solve config for comparison spots.
@@ -66,6 +65,7 @@ pub struct ComparisonSummary {
 /// as a self-test.
 pub fn run_comparison<F>(
     game_config: &GameConfig,
+    datagen: &DatagenConfig,
     num_spots: usize,
     base_seed: u64,
     predict_fn: F,
@@ -80,7 +80,7 @@ where
     let mut spots = Vec::with_capacity(num_spots);
 
     for i in 0..num_spots {
-        let spot = generate_comparison_spot(base_seed + i as u64, game_config.initial_stack);
+        let spot = generate_comparison_spot(base_seed + i as u64, game_config.initial_stack, datagen);
         let result = solve_situation(&spot, &solve_config)?;
         let predicted = predict_fn(&spot, &result);
         let mask: Vec<bool> = result.valid_mask.to_vec();
@@ -122,9 +122,10 @@ mod tests {
             bet_sizes: vec!["50%".into(), "a".into()],
             ..Default::default()
         };
+        let datagen = DatagenConfig::default();
 
         // Use exact OOP EVs as "predictions" — error should be zero
-        let summary = run_comparison(&game, 2, 42, |_sit, result| result.oop_evs.to_vec())
+        let summary = run_comparison(&game, &datagen, 2, 42, |_sit, result| result.oop_evs.to_vec())
             .unwrap();
 
         assert!(
@@ -147,8 +148,9 @@ mod tests {
             bet_sizes: vec!["50%".into(), "a".into()],
             ..Default::default()
         };
+        let datagen = DatagenConfig::default();
 
-        let summary = run_comparison(&game, 3, 42, |_sit, result| result.oop_evs.to_vec())
+        let summary = run_comparison(&game, &datagen, 3, 42, |_sit, result| result.oop_evs.to_vec())
             .unwrap();
 
         assert_eq!(summary.spots.len(), 3);

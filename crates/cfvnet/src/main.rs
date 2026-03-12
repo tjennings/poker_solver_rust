@@ -425,7 +425,7 @@ fn cmd_compare(
     use burn::module::Module;
     use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
     use burn::tensor::{Tensor, TensorData};
-    use cfvnet::config::GameConfig;
+    use cfvnet::config::{DatagenConfig, GameConfig};
     use cfvnet::eval::compare::run_comparison;
     use cfvnet::model::dataset::encode_situation_for_inference;
     use cfvnet::model::network::{CfvNet, input_size};
@@ -446,7 +446,7 @@ fn cmd_compare(
             std::process::exit(1);
         });
 
-    let game_config = match config_path {
+    let (game_config, datagen_config) = match config_path {
         Some(path) => {
             let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| {
                 eprintln!("failed to read config {}: {e}", path.display());
@@ -457,9 +457,9 @@ fn cmd_compare(
                     eprintln!("failed to parse config: {e}");
                     std::process::exit(1);
                 });
-            cfg.game
+            (cfg.game, cfg.datagen)
         }
-        None => GameConfig::default(),
+        None => (GameConfig::default(), DatagenConfig::default()),
     };
 
     if let Some(t) = threads {
@@ -471,7 +471,7 @@ fn cmd_compare(
 
     println!("Comparing {num_spots} spots against exact solver...");
 
-    let summary = run_comparison(&game_config, num_spots, 42, |sit, _solve_result| {
+    let summary = run_comparison(&game_config, &datagen_config, num_spots, 42, |sit, _solve_result| {
         let input_data = encode_situation_for_inference(sit, 0);
         let input = Tensor::<B, 2>::from_data(
             TensorData::new(input_data, [1, in_size]),
