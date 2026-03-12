@@ -28,7 +28,7 @@ use crate::poker::Card;
 ///
 /// Implementations may solve sub-trees exactly (e.g. all river runouts)
 /// or use a neural network approximation.
-pub trait LeafEvaluator: Send + Sync {
+pub trait LeafEvaluator {
     /// Evaluate counterfactual values for a set of combos at a boundary.
     ///
     /// Returns a `Vec<f64>` of length `combos.len()`, where each entry is
