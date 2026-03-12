@@ -1,10 +1,45 @@
 use crate::interface::*;
 use crate::mutex_like::*;
 use crate::sliceop::*;
+use std::cell::Cell;
 use std::mem::MaybeUninit;
 use std::ptr;
 
 use rayon::prelude::*;
+
+// ---------------------------------------------------------------------------
+// UtilityScratch — reusable allocations for exploitability checks
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated buffers reused across `compute_mes_ev` / `compute_current_ev`
+/// calls to avoid per-call heap allocations. Stored in thread-local storage.
+struct UtilityScratch {
+    cfvalues_0: Vec<f32>,
+    cfvalues_1: Vec<f32>,
+}
+
+impl UtilityScratch {
+    const fn new() -> Self {
+        Self {
+            cfvalues_0: Vec::new(),
+            cfvalues_1: Vec::new(),
+        }
+    }
+}
+
+thread_local! {
+    static UTILITY_SCRATCH: Cell<UtilityScratch> = const { Cell::new(UtilityScratch::new()) };
+}
+
+#[inline]
+fn take_utility_scratch() -> UtilityScratch {
+    UTILITY_SCRATCH.with(|cell| cell.replace(UtilityScratch::new()))
+}
+
+#[inline]
+fn put_utility_scratch(scratch: UtilityScratch) {
+    UTILITY_SCRATCH.with(|cell| cell.set(scratch));
+}
 
 /// Executes `op` for each child, potentially in parallel via rayon.
 #[inline]
@@ -254,28 +289,43 @@ pub fn compute_current_ev<T: Game>(game: &T) -> [f32; 2] {
         panic!("Game is not ready");
     }
 
-    let mut cfvalues = [
-        Vec::with_capacity(game.num_private_hands(0)),
-        Vec::with_capacity(game.num_private_hands(1)),
-    ];
+    let mut scratch = take_utility_scratch();
+
+    scratch.cfvalues_0.clear();
+    scratch.cfvalues_0.reserve(game.num_private_hands(0));
+    scratch.cfvalues_1.clear();
+    scratch.cfvalues_1.reserve(game.num_private_hands(1));
 
     let reach = [game.initial_weights(0), game.initial_weights(1)];
 
-    for player in 0..2 {
-        compute_cfvalue_recursive(
-            cfvalues[player].spare_capacity_mut(),
-            game,
-            &mut game.root(),
-            player,
-            reach[player ^ 1],
-            false,
-        );
-        // SAFETY: compute_cfvalue_recursive writes all num_private_hands elements.
-        unsafe { cfvalues[player].set_len(game.num_private_hands(player)) };
-    }
+    compute_cfvalue_recursive(
+        scratch.cfvalues_0.spare_capacity_mut(),
+        game,
+        &mut game.root(),
+        0,
+        reach[1],
+        false,
+    );
+    // SAFETY: compute_cfvalue_recursive writes all num_private_hands elements.
+    unsafe { scratch.cfvalues_0.set_len(game.num_private_hands(0)) };
 
-    let get_sum = |player: usize| weighted_sum(&cfvalues[player], reach[player]);
-    [get_sum(0), get_sum(1)]
+    compute_cfvalue_recursive(
+        scratch.cfvalues_1.spare_capacity_mut(),
+        game,
+        &mut game.root(),
+        1,
+        reach[0],
+        false,
+    );
+    // SAFETY: compute_cfvalue_recursive writes all num_private_hands elements.
+    unsafe { scratch.cfvalues_1.set_len(game.num_private_hands(1)) };
+
+    let ev0 = weighted_sum(&scratch.cfvalues_0, reach[0]);
+    let ev1 = weighted_sum(&scratch.cfvalues_1, reach[1]);
+
+    put_utility_scratch(scratch);
+
+    [ev0, ev1]
 }
 
 /// Computes the expected values of the maximally exploitative strategy (MES).
@@ -288,27 +338,41 @@ pub fn compute_mes_ev<T: Game>(game: &T) -> [f32; 2] {
         panic!("Game is not ready");
     }
 
-    let mut cfvalues = [
-        Vec::with_capacity(game.num_private_hands(0)),
-        Vec::with_capacity(game.num_private_hands(1)),
-    ];
+    let mut scratch = take_utility_scratch();
+
+    scratch.cfvalues_0.clear();
+    scratch.cfvalues_0.reserve(game.num_private_hands(0));
+    scratch.cfvalues_1.clear();
+    scratch.cfvalues_1.reserve(game.num_private_hands(1));
 
     let reach = [game.initial_weights(0), game.initial_weights(1)];
 
-    for player in 0..2 {
-        compute_best_cfv_recursive(
-            cfvalues[player].spare_capacity_mut(),
-            game,
-            &game.root(),
-            player,
-            reach[player ^ 1],
-        );
-        // SAFETY: compute_best_cfv_recursive writes all num_private_hands elements.
-        unsafe { cfvalues[player].set_len(game.num_private_hands(player)) };
-    }
+    compute_best_cfv_recursive(
+        scratch.cfvalues_0.spare_capacity_mut(),
+        game,
+        &game.root(),
+        0,
+        reach[1],
+    );
+    // SAFETY: compute_best_cfv_recursive writes all num_private_hands elements.
+    unsafe { scratch.cfvalues_0.set_len(game.num_private_hands(0)) };
 
-    let get_sum = |player: usize| weighted_sum(&cfvalues[player], reach[player]);
-    [get_sum(0), get_sum(1)]
+    compute_best_cfv_recursive(
+        scratch.cfvalues_1.spare_capacity_mut(),
+        game,
+        &game.root(),
+        1,
+        reach[0],
+    );
+    // SAFETY: compute_best_cfv_recursive writes all num_private_hands elements.
+    unsafe { scratch.cfvalues_1.set_len(game.num_private_hands(1)) };
+
+    let ev0 = weighted_sum(&scratch.cfvalues_0, reach[0]);
+    let ev1 = weighted_sum(&scratch.cfvalues_1, reach[1]);
+
+    put_utility_scratch(scratch);
+
+    [ev0, ev1]
 }
 
 // ---------------------------------------------------------------------------
