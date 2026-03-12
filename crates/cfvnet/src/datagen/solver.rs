@@ -140,7 +140,7 @@ mod tests {
 
     fn known_river_situation() -> Situation {
         // Board: Qs Jh 2c 8d 3s
-        let board = [
+        let board = vec![
             4 * 10 + 3, // Qs = 43
             4 * 9 + 2,  // Jh = 38
             4 * 0 + 0,  // 2c = 0

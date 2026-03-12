@@ -2,8 +2,14 @@ use std::io::BufReader;
 use std::path::Path;
 
 use crate::datagen::sampler::Situation;
-use crate::datagen::storage::{read_record, count_records, TrainingRecord};
+use crate::datagen::storage::{read_record, TrainingRecord};
 use crate::model::network::INPUT_SIZE;
+
+/// Maximum number of board cards in the input encoding.
+const MAX_BOARD_CARDS: usize = 5;
+
+/// Sentinel value for missing board card positions (normalized).
+const MISSING_CARD: f32 = -1.0;
 
 /// A single training item with encoded input, target CFVs, mask, range, and game value.
 #[derive(Debug, Clone)]
@@ -22,19 +28,21 @@ pub struct CfvDataset {
 
 impl CfvDataset {
     /// Load all records from a binary training file into memory.
+    ///
+    /// Records are self-describing (each starts with a board_size byte),
+    /// so this reads until EOF.
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let file = std::fs::File::open(path)
             .map_err(|e| format!("open dataset: {e}"))?;
         let mut reader = BufReader::new(file);
 
-        let num_records = count_records(&mut reader)
-            .map_err(|e| format!("count: {e}"))?;
-
-        let mut records = Vec::with_capacity(num_records as usize);
-        for _ in 0..num_records {
-            let rec = read_record(&mut reader)
-                .map_err(|e| format!("read: {e}"))?;
-            records.push(rec);
+        let mut records = Vec::new();
+        loop {
+            match read_record(&mut reader) {
+                Ok(rec) => records.push(rec),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(format!("read: {e}")),
+            }
         }
 
         Ok(Self { records })
@@ -90,9 +98,14 @@ fn encode_record(rec: &TrainingRecord) -> CfvItem {
     input.extend_from_slice(&rec.oop_range);
     // IP range (1326 floats)
     input.extend_from_slice(&rec.ip_range);
-    // Board cards (5 floats, normalized to [0, 1])
-    for &card in &rec.board {
-        input.push(f32::from(card) / 51.0);
+    // Board cards (up to MAX_BOARD_CARDS floats, normalized to [0, 1]).
+    // Missing positions are filled with MISSING_CARD sentinel.
+    for i in 0..MAX_BOARD_CARDS {
+        if i < rec.board.len() {
+            input.push(f32::from(rec.board[i]) / 51.0);
+        } else {
+            input.push(MISSING_CARD);
+        }
     }
     // Pot (normalized by max pot)
     input.push(rec.pot / 400.0);
@@ -137,7 +150,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         for i in 0..n {
             let mut rec = TrainingRecord {
-                board: [0, 4, 8, 12, 16],
+                board: vec![0, 4, 8, 12, 16],
                 pot: 100.0,
                 effective_stack: 50.0,
                 player: (i % 2) as u8,

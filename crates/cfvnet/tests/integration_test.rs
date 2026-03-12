@@ -33,7 +33,7 @@ fn full_pipeline_smoke_test() {
 
     // Verify record count
     let mut file = std::fs::File::open(&data_path).unwrap();
-    let count = cfvnet::datagen::storage::count_records(&mut file).unwrap();
+    let count = cfvnet::datagen::storage::count_records(&mut file, 5).unwrap();
     // Some situations with effective_stack=0 may be skipped, so count may be < 8
     assert!(count >= 2, "should have at least 2 records, got {count}");
 

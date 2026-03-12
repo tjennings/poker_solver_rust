@@ -9,7 +9,7 @@ use rand_chacha::ChaCha8Rng;
 pub fn generate_comparison_spot(seed: u64, initial_stack: i32) -> Situation {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let config = DatagenConfig::default();
-    sample_situation(&config, initial_stack, &mut rng)
+    sample_situation(&config, initial_stack, 5, &mut rng)
 }
 
 /// Default solve config for comparison spots.

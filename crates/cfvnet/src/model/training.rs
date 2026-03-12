@@ -298,7 +298,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         for i in 0..n {
             let mut rec = TrainingRecord {
-                board: [0, 4, 8, 12, 16],
+                board: vec![0, 4, 8, 12, 16],
                 pot: 100.0,
                 effective_stack: 50.0,
                 player: (i % 2) as u8,

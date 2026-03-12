@@ -30,10 +30,12 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
         force_allin_threshold: config.game.force_allin_threshold,
     };
 
+    let board_size = config.game.board_size;
+
     // Generate all situations sequentially for determinism with a fixed seed.
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let situations: Vec<_> = (0..num_samples)
-        .map(|_| sample_situation(&config.datagen, config.game.initial_stack, &mut rng))
+        .map(|_| sample_situation(&config.datagen, config.game.initial_stack, board_size, &mut rng))
         .collect();
 
     // Solve in parallel (or sequentially for determinism in tests).
@@ -108,7 +110,7 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
         let valid_mask = bool_mask_to_u8(&result.valid_mask);
 
         let oop_rec = TrainingRecord {
-            board: sit.board,
+            board: sit.board.clone(),
             pot: sit.pot as f32,
             effective_stack: sit.effective_stack as f32,
             player: 0,
@@ -121,7 +123,7 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
         write_record(&mut writer, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
 
         let ip_rec = TrainingRecord {
-            board: sit.board,
+            board: sit.board.clone(),
             pot: sit.pot as f32,
             effective_stack: sit.effective_stack as f32,
             player: 1,
@@ -182,7 +184,7 @@ mod tests {
         generate_training_data(&config, &path).unwrap();
 
         let mut file = std::fs::File::open(&path).unwrap();
-        let count = storage::count_records(&mut file).unwrap();
+        let count = storage::count_records(&mut file, 5).unwrap();
 
         // Some situations may have effective_stack == 0 and be skipped,
         // so we get at most 8 records (4 situations * 2 players).

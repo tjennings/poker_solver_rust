@@ -4,14 +4,36 @@ use range_solver::card::index_to_card_pair;
 /// Number of possible hole card combos in HUNL.
 pub const NUM_COMBOS: usize = 1326;
 
-/// Compute hand strength for each of the 1326 combos on a 5-card board.
+/// Compute hand strength for each of the 1326 combos on a board of 4 or 5 cards.
+///
+/// For a 5-card board, returns ordinal ranks directly from the 7-card evaluator.
+/// For a 4-card board, averages raw strength over all 48 possible river cards,
+/// then converts to ordinal ranks.
 ///
 /// Returns an array where `strengths[i]` is the hand rank (higher = stronger)
 /// for the combo at index `i`. Board-conflicting combos get strength 0.
-pub fn compute_hand_strengths(board: &[u8; 5]) -> [u16; NUM_COMBOS] {
-    let board_mask = board_to_mask(board);
+///
+/// # Panics
+///
+/// Panics if `board.len()` is not 4 or 5.
+pub fn compute_hand_strengths(board: &[u8]) -> [u16; NUM_COMBOS] {
+    assert!(
+        board.len() == 4 || board.len() == 5,
+        "board must have 4 or 5 cards, got {}",
+        board.len()
+    );
 
-    // First pass: compute raw i32 strength for each valid combo.
+    let board_mask = slice_to_mask(board);
+
+    if board.len() == 5 {
+        compute_strengths_5(board, board_mask)
+    } else {
+        compute_strengths_4(board, board_mask)
+    }
+}
+
+/// Fast path for 5-card boards: one evaluation per combo.
+fn compute_strengths_5(board: &[u8], board_mask: u64) -> [u16; NUM_COMBOS] {
     let mut raw = [0i32; NUM_COMBOS];
     for (i, strength) in raw.iter_mut().enumerate() {
         let (c1, c2) = index_to_card_pair(i);
@@ -19,11 +41,56 @@ pub fn compute_hand_strengths(board: &[u8; 5]) -> [u16; NUM_COMBOS] {
         if hand_mask & board_mask != 0 {
             continue;
         }
-        *strength = evaluate_7(c1, c2, board);
+        *strength = evaluate_7_slice(c1, c2, board);
+    }
+    raw_to_ordinal(&raw)
+}
+
+/// 4-card board: average raw strength across all 48 possible river cards.
+fn compute_strengths_4(board: &[u8], board_mask: u64) -> [u16; NUM_COMBOS] {
+    let mut avg = [0.0f64; NUM_COMBOS];
+    for (i, avg_val) in avg.iter_mut().enumerate() {
+        let (c1, c2) = index_to_card_pair(i);
+        let hand_mask: u64 = (1 << c1) | (1 << c2);
+        if hand_mask & board_mask != 0 {
+            continue;
+        }
+        let used = board_mask | hand_mask;
+        let mut sum = 0i64;
+        let mut count = 0u32;
+        for river in 0u8..52 {
+            if used & (1 << river) != 0 {
+                continue;
+            }
+            let full_board = [board[0], board[1], board[2], board[3], river];
+            sum += i64::from(evaluate_7_slice(c1, c2, &full_board));
+            count += 1;
+        }
+        if count > 0 {
+            *avg_val = sum as f64 / f64::from(count);
+        }
     }
 
-    // Second pass: convert raw strengths to ordinal ranks via sorting.
-    // Collect (raw_strength, combo_index) for valid combos, sort, assign ranks.
+    // Convert averaged strengths to ordinal ranks via sorting.
+    let mut pairs: Vec<(u64, usize)> = (0..NUM_COMBOS)
+        .filter(|&i| avg[i] > 0.0)
+        .map(|i| (avg[i].to_bits(), i))
+        .collect();
+    pairs.sort_unstable();
+
+    let mut strengths = [0u16; NUM_COMBOS];
+    let mut rank = 1u16;
+    for window_idx in 0..pairs.len() {
+        if window_idx > 0 && pairs[window_idx].0 != pairs[window_idx - 1].0 {
+            rank = window_idx as u16 + 1;
+        }
+        strengths[pairs[window_idx].1] = rank;
+    }
+    strengths
+}
+
+/// Convert raw i32 strengths to ordinal u16 ranks.
+fn raw_to_ordinal(raw: &[i32; NUM_COMBOS]) -> [u16; NUM_COMBOS] {
     let mut pairs: Vec<(i32, usize)> = (0..NUM_COMBOS)
         .filter(|&i| raw[i] != 0)
         .map(|i| (raw[i], i))
@@ -45,7 +112,7 @@ pub fn compute_hand_strengths(board: &[u8; 5]) -> [u16; NUM_COMBOS] {
 ///
 /// Returns a 1326-element array of reach probabilities summing to 1.0.
 /// Board-conflicting combos have zero reach.
-pub fn generate_rsp_range<R: Rng>(board: &[u8; 5], rng: &mut R) -> [f32; NUM_COMBOS] {
+pub fn generate_rsp_range<R: Rng>(board: &[u8], rng: &mut R) -> [f32; NUM_COMBOS] {
     let strengths = compute_hand_strengths(board);
 
     // Collect valid (non-blocked) combo indices, sorted by ascending strength.
@@ -104,7 +171,7 @@ fn rsp_recursive<R: Rng>(hands: &[usize], p: f64, range: &mut [f32; NUM_COMBOS],
 
 /// Evaluate a 7-card hand (2 hole cards + 5 board cards).
 /// Returns an i32 where higher = stronger. Zero is never returned for valid input.
-fn evaluate_7(c1: u8, c2: u8, board: &[u8; 5]) -> i32 {
+fn evaluate_7_slice(c1: u8, c2: u8, board: &[u8]) -> i32 {
     let cards = [
         c1 as usize,
         c2 as usize,
@@ -203,9 +270,9 @@ fn find_straight(rankset: i32) -> i32 {
     }
 }
 
-/// Convert a 5-card board array into a 64-bit mask for fast conflict checks.
+/// Convert a board slice into a 64-bit mask for fast conflict checks.
 #[inline]
-fn board_to_mask(board: &[u8; 5]) -> u64 {
+fn slice_to_mask(board: &[u8]) -> u64 {
     board.iter().fold(0u64, |mask, &card| mask | (1 << card))
 }
 
@@ -307,5 +374,51 @@ mod tests {
         let range1 = generate_rsp_range(&board, &mut rng1);
         let range2 = generate_rsp_range(&board, &mut rng2);
         assert_eq!(range1, range2);
+    }
+
+    #[test]
+    fn hand_strengths_4_card_board() {
+        // 4-card board: Qs Jh 2c 8d
+        let board = [
+            4 * 10 + 3, // Qs
+            4 * 9 + 2,  // Jh
+            4 * 0 + 0,  // 2c
+            4 * 6 + 1,  // 8d
+        ];
+        let strengths = compute_hand_strengths(&board);
+
+        // Board-blocked combos should have strength 0.
+        for i in 0..NUM_COMBOS {
+            let (c1, c2) = range_solver::card::index_to_card_pair(i);
+            if board.contains(&c1) || board.contains(&c2) {
+                assert_eq!(strengths[i], 0, "blocked combo {i} should have strength 0");
+            }
+        }
+
+        // Non-blocked combos should have positive strength.
+        let non_blocked: Vec<usize> = (0..NUM_COMBOS)
+            .filter(|&i| {
+                let (c1, c2) = range_solver::card::index_to_card_pair(i);
+                !board.contains(&c1) && !board.contains(&c2)
+            })
+            .collect();
+        assert!(!non_blocked.is_empty());
+        for &i in &non_blocked {
+            assert!(strengths[i] > 0, "valid combo {i} should have positive strength");
+        }
+    }
+
+    #[test]
+    fn range_4_card_board_sums_to_one() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let board: [u8; 4] = [
+            4 * 10 + 3, // Qs
+            4 * 9 + 2,  // Jh
+            4 * 0 + 0,  // 2c
+            4 * 6 + 1,  // 8d
+        ];
+        let range = generate_rsp_range(&board, &mut rng);
+        let sum: f32 = range.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "4-card range sum = {sum}");
     }
 }

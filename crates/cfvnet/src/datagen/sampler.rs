@@ -6,19 +6,22 @@ use super::range_gen::{generate_rsp_range, NUM_COMBOS};
 /// A single training situation before solving.
 #[derive(Debug, Clone)]
 pub struct Situation {
-    pub board: [u8; 5],
+    pub board: Vec<u8>,
     pub pot: i32,
     pub effective_stack: i32,
     pub ranges: [[f32; NUM_COMBOS]; 2], // [OOP, IP]
 }
 
-/// Sample a random river situation: board, pot, effective stack, and two R(S,p) ranges.
+/// Sample a random situation: board, pot, effective stack, and two R(S,p) ranges.
+///
+/// `board_size` must be 4 (turn) or 5 (river).
 pub fn sample_situation<R: Rng>(
     config: &DatagenConfig,
     initial_stack: i32,
+    board_size: usize,
     rng: &mut R,
 ) -> Situation {
-    let board = sample_board(rng);
+    let board = sample_board(board_size, rng);
     let pot = sample_pot(&config.pot_intervals, rng);
     let max_stack = initial_stack - pot / 2;
     let effective_stack = if max_stack <= 0 {
@@ -36,16 +39,21 @@ pub fn sample_situation<R: Rng>(
     }
 }
 
-/// Sample 5 unique cards from 0..52 for the board.
-fn sample_board<R: Rng>(rng: &mut R) -> [u8; 5] {
-    let mut board = [0u8; 5];
+/// Sample `num_cards` unique cards from 0..52 for the board.
+///
+/// # Panics
+///
+/// Panics if `num_cards` is greater than 52.
+pub fn sample_board<R: Rng>(num_cards: usize, rng: &mut R) -> Vec<u8> {
+    assert!(num_cards <= 52, "cannot sample {num_cards} cards from a 52-card deck");
+    let mut board = Vec::with_capacity(num_cards);
     let mut used = [false; 52];
-    for card in &mut board {
+    for _ in 0..num_cards {
         loop {
             let c: u8 = rng.gen_range(0..52);
             if !used[c as usize] {
                 used[c as usize] = true;
-                *card = c;
+                board.push(c);
                 break;
             }
         }
@@ -85,8 +93,8 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let config = test_config();
         for _ in 0..100 {
-            let sit = sample_situation(&config, INITIAL_STACK, &mut rng);
-            let board = sit.board;
+            let sit = sample_situation(&config, INITIAL_STACK, 5, &mut rng);
+            let board = &sit.board;
             assert_eq!(board.len(), 5);
             for i in 0..5 {
                 for j in (i + 1)..5 {
@@ -106,7 +114,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let config = test_config();
         for _ in 0..200 {
-            let sit = sample_situation(&config, INITIAL_STACK, &mut rng);
+            let sit = sample_situation(&config, INITIAL_STACK, 5, &mut rng);
             let in_some_interval = config
                 .pot_intervals
                 .iter()
@@ -124,7 +132,7 @@ mod tests {
         let config = test_config();
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         for _ in 0..200 {
-            let sit = sample_situation(&config, INITIAL_STACK, &mut rng);
+            let sit = sample_situation(&config, INITIAL_STACK, 5, &mut rng);
             let max_stack = INITIAL_STACK - sit.pot / 2;
             assert!(
                 sit.effective_stack >= 0,
@@ -146,7 +154,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let config = test_config();
         for _ in 0..50 {
-            let sit = sample_situation(&config, INITIAL_STACK, &mut rng);
+            let sit = sample_situation(&config, INITIAL_STACK, 5, &mut rng);
             for player in 0..2 {
                 let range = &sit.ranges[player];
                 let sum: f32 = range.iter().sum();
@@ -172,12 +180,42 @@ mod tests {
         let config = test_config();
         let mut rng1 = ChaCha8Rng::seed_from_u64(99);
         let mut rng2 = ChaCha8Rng::seed_from_u64(99);
-        let s1 = sample_situation(&config, INITIAL_STACK, &mut rng1);
-        let s2 = sample_situation(&config, INITIAL_STACK, &mut rng2);
+        let s1 = sample_situation(&config, INITIAL_STACK, 5, &mut rng1);
+        let s2 = sample_situation(&config, INITIAL_STACK, 5, &mut rng2);
         assert_eq!(s1.board, s2.board);
         assert_eq!(s1.pot, s2.pot);
         assert_eq!(s1.effective_stack, s2.effective_stack);
         assert_eq!(s1.ranges[0], s2.ranges[0]);
         assert_eq!(s1.ranges[1], s2.ranges[1]);
+    }
+
+    #[test]
+    fn sample_board_4_cards() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        for _ in 0..100 {
+            let board = sample_board(4, &mut rng);
+            assert_eq!(board.len(), 4);
+            for i in 0..4 {
+                assert!(board[i] < 52);
+                for j in (i + 1)..4 {
+                    assert_ne!(board[i], board[j], "duplicate cards in 4-card board");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sample_board_5_cards() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        for _ in 0..100 {
+            let board = sample_board(5, &mut rng);
+            assert_eq!(board.len(), 5);
+            for i in 0..5 {
+                assert!(board[i] < 52);
+                for j in (i + 1)..5 {
+                    assert_ne!(board[i], board[j], "duplicate cards in 5-card board");
+                }
+            }
+        }
     }
 }

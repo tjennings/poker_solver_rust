@@ -15,6 +15,8 @@ pub struct CfvnetConfig {
 pub struct GameConfig {
     pub initial_stack: i32,
     pub bet_sizes: Vec<String>,
+    #[serde(default = "default_board_size")]
+    pub board_size: usize,
     #[serde(default = "default_allin_threshold")]
     pub add_allin_threshold: f64,
     #[serde(default = "default_force_allin_threshold")]
@@ -26,6 +28,7 @@ impl Default for GameConfig {
         Self {
             initial_stack: 200,
             bet_sizes: vec!["25%".into(), "50%".into(), "100%".into(), "a".into()],
+            board_size: 5,
             add_allin_threshold: 1.5,
             force_allin_threshold: 0.15,
         }
@@ -40,10 +43,16 @@ impl GameConfig {
         if self.bet_sizes.is_empty() {
             return Err("bet_sizes must not be empty".into());
         }
+        if self.board_size != 4 && self.board_size != 5 {
+            return Err(format!("board_size must be 4 or 5, got {}", self.board_size));
+        }
         Ok(())
     }
 }
 
+fn default_board_size() -> usize {
+    5
+}
 fn default_allin_threshold() -> f64 {
     1.5
 }
