@@ -176,13 +176,19 @@ fn cmd_generate(
         cfg.datagen.threads = t;
     }
 
+    let street = cfg.datagen.street.as_str();
     println!(
-        "Generating {} training samples to {}...",
+        "Generating {} {street} training samples to {}...",
         cfg.datagen.num_samples,
         output.display()
     );
 
-    if let Err(e) = cfvnet::datagen::generate::generate_training_data(&cfg, &output) {
+    let result = match street {
+        "turn" => cfvnet::datagen::turn_generate::generate_turn_training_data(&cfg, &output),
+        _ => cfvnet::datagen::generate::generate_training_data(&cfg, &output),
+    };
+
+    if let Err(e) = result {
         eprintln!("data generation failed: {e}");
         std::process::exit(1);
     }
