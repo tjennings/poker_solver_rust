@@ -42,7 +42,7 @@ fn full_pipeline_smoke_test() {
     type B = Autodiff<NdArray>;
     let device = Default::default();
 
-    let dataset = cfvnet::model::dataset::CfvDataset::from_file(&data_path)
+    let dataset = cfvnet::model::dataset::CfvDataset::from_file(&data_path, 5)
         .expect("failed to load dataset");
 
     let train_config = cfvnet::model::training::TrainConfig {

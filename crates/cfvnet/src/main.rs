@@ -120,7 +120,8 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf) {
         std::process::exit(1);
     });
 
-    let dataset = cfvnet::model::dataset::CfvDataset::from_file(&data).unwrap_or_else(|e| {
+    let board_cards = cfvnet::config::board_cards_for_street(&cfg.datagen.street);
+    let dataset = cfvnet::model::dataset::CfvDataset::from_file(&data, board_cards).unwrap_or_else(|e| {
         eprintln!("failed to load dataset: {e}");
         std::process::exit(1);
     });
@@ -196,22 +197,26 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
     use burn::tensor::{Tensor, TensorData};
     use cfvnet::eval::metrics::compute_prediction_metrics;
     use cfvnet::model::dataset::CfvDataset;
-    use cfvnet::model::network::{CfvNet, INPUT_SIZE};
+    use cfvnet::model::network::{CfvNet, input_size};
+
+    // TODO: support turn/flop models via --street flag
+    let board_cards = 5;
+    let in_size = input_size(board_cards);
 
     type B = NdArray;
     let device = Default::default();
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model_path = model_dir.join("model");
 
-    let model = CfvNet::<B>::new(&device, 7, 500)
+    let model = CfvNet::<B>::new(&device, 7, 500, in_size)
         .load_file(&model_path, &recorder, &device)
         .unwrap_or_else(|e| {
             eprintln!("failed to load model from {}: {e}", model_path.display());
             std::process::exit(1);
         });
 
-    let dataset = CfvDataset::from_file(&data_path).unwrap_or_else(|e| {
-        eprintln!("failed to load dataset: {e}", );
+    let dataset = CfvDataset::from_file(&data_path, board_cards).unwrap_or_else(|e| {
+        eprintln!("failed to load dataset: {e}");
         std::process::exit(1);
     });
 
@@ -227,7 +232,7 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
         let item = dataset.get(i).unwrap();
 
         let input = Tensor::<B, 2>::from_data(
-            TensorData::new(item.input.clone(), [1, INPUT_SIZE]),
+            TensorData::new(item.input.clone(), [1, in_size]),
             &device,
         );
         let pred = model.forward(input);
@@ -268,14 +273,18 @@ fn cmd_compare(
     use cfvnet::config::GameConfig;
     use cfvnet::eval::compare::run_comparison;
     use cfvnet::model::dataset::encode_situation_for_inference;
-    use cfvnet::model::network::{CfvNet, INPUT_SIZE};
+    use cfvnet::model::network::{CfvNet, input_size};
+
+    // TODO: support turn/flop models via --street flag
+    let board_cards = 5;
+    let in_size = input_size(board_cards);
 
     type B = NdArray;
     let device = Default::default();
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model_path = model_dir.join("model");
 
-    let model = CfvNet::<B>::new(&device, 7, 500)
+    let model = CfvNet::<B>::new(&device, 7, 500, in_size)
         .load_file(&model_path, &recorder, &device)
         .unwrap_or_else(|e| {
             eprintln!("failed to load model from {}: {e}", model_path.display());
@@ -310,7 +319,7 @@ fn cmd_compare(
     let summary = run_comparison(&game_config, num_spots, 42, |sit, _solve_result| {
         let input_data = encode_situation_for_inference(sit, 0);
         let input = Tensor::<B, 2>::from_data(
-            TensorData::new(input_data, [1, INPUT_SIZE]),
+            TensorData::new(input_data, [1, in_size]),
             &device,
         );
         let pred = model.forward(input);

@@ -3,18 +3,12 @@ use std::path::Path;
 
 use crate::datagen::sampler::Situation;
 use crate::datagen::storage::{read_record, TrainingRecord};
-use crate::model::network::INPUT_SIZE;
-
-/// Maximum number of board cards in the input encoding.
-const MAX_BOARD_CARDS: usize = 5;
-
-/// Sentinel value for missing board card positions (normalized).
-const MISSING_CARD: f32 = -1.0;
+use crate::model::network::input_size;
 
 /// A single training item with encoded input, target CFVs, mask, range, and game value.
 #[derive(Debug, Clone)]
 pub struct CfvItem {
-    pub input: Vec<f32>,      // length INPUT_SIZE (2660)
+    pub input: Vec<f32>,      // length input_size(board_cards)
     pub target: Vec<f32>,     // length OUTPUT_SIZE (1326) — target CFVs
     pub mask: Vec<f32>,       // length OUTPUT_SIZE — 1.0 valid, 0.0 masked
     pub range: Vec<f32>,      // length OUTPUT_SIZE — player's range for aux loss
@@ -24,6 +18,7 @@ pub struct CfvItem {
 /// Dataset that loads binary training records from disk.
 pub struct CfvDataset {
     records: Vec<TrainingRecord>,
+    board_cards: usize,
 }
 
 impl CfvDataset {
@@ -31,7 +26,7 @@ impl CfvDataset {
     ///
     /// Records are self-describing (each starts with a board_size byte),
     /// so this reads until EOF.
-    pub fn from_file(path: &Path) -> Result<Self, String> {
+    pub fn from_file(path: &Path, board_cards: usize) -> Result<Self, String> {
         let file = std::fs::File::open(path)
             .map_err(|e| format!("open dataset: {e}"))?;
         let mut reader = BufReader::new(file);
@@ -45,7 +40,7 @@ impl CfvDataset {
             }
         }
 
-        Ok(Self { records })
+        Ok(Self { records, board_cards })
     }
 
     pub fn len(&self) -> usize {
@@ -56,9 +51,14 @@ impl CfvDataset {
         self.records.is_empty()
     }
 
+    /// The input feature size for this dataset's board card count.
+    pub fn input_size(&self) -> usize {
+        input_size(self.board_cards)
+    }
+
     /// Encode and return the training item at `idx`, or `None` if out of bounds.
     pub fn get(&self, idx: usize) -> Option<CfvItem> {
-        self.records.get(idx).map(encode_record)
+        self.records.get(idx).map(|rec| encode_record(rec, self.board_cards))
     }
 }
 
@@ -68,7 +68,9 @@ impl CfvDataset {
 /// rather than a raw `TrainingRecord`, making it usable at inference time
 /// when no stored record exists.
 pub fn encode_situation_for_inference(sit: &Situation, player: u8) -> Vec<f32> {
-    let mut input = Vec::with_capacity(INPUT_SIZE);
+    let board_cards = sit.board.len();
+    let in_size = input_size(board_cards);
+    let mut input = Vec::with_capacity(in_size);
     // OOP range (1326 floats)
     for &v in &sit.ranges[0] {
         input.push(v);
@@ -77,7 +79,7 @@ pub fn encode_situation_for_inference(sit: &Situation, player: u8) -> Vec<f32> {
     for &v in &sit.ranges[1] {
         input.push(v);
     }
-    // Board cards (5 floats, normalized to [0, 1])
+    // Board cards (normalized to [0, 1])
     for &card in &sit.board {
         input.push(f32::from(card) / 51.0);
     }
@@ -87,25 +89,21 @@ pub fn encode_situation_for_inference(sit: &Situation, player: u8) -> Vec<f32> {
     input.push(sit.effective_stack as f32 / 400.0);
     // Player indicator (0.0 = OOP, 1.0 = IP)
     input.push(f32::from(player));
-    debug_assert_eq!(input.len(), INPUT_SIZE);
+    debug_assert_eq!(input.len(), in_size);
     input
 }
 
-fn encode_record(rec: &TrainingRecord) -> CfvItem {
-    let mut input = Vec::with_capacity(INPUT_SIZE);
+fn encode_record(rec: &TrainingRecord, board_cards: usize) -> CfvItem {
+    let in_size = input_size(board_cards);
+    let mut input = Vec::with_capacity(in_size);
 
     // OOP range (1326 floats)
     input.extend_from_slice(&rec.oop_range);
     // IP range (1326 floats)
     input.extend_from_slice(&rec.ip_range);
-    // Board cards (up to MAX_BOARD_CARDS floats, normalized to [0, 1]).
-    // Missing positions are filled with MISSING_CARD sentinel.
-    for i in 0..MAX_BOARD_CARDS {
-        if i < rec.board.len() {
-            input.push(f32::from(rec.board[i]) / 51.0);
-        } else {
-            input.push(MISSING_CARD);
-        }
+    // Board cards (normalized to [0, 1])
+    for &card in &rec.board[..board_cards] {
+        input.push(f32::from(card) / 51.0);
     }
     // Pot (normalized by max pot)
     input.push(rec.pot / 400.0);
@@ -114,7 +112,7 @@ fn encode_record(rec: &TrainingRecord) -> CfvItem {
     // Player indicator (0.0 = OOP, 1.0 = IP)
     input.push(f32::from(rec.player));
 
-    debug_assert_eq!(input.len(), INPUT_SIZE);
+    debug_assert_eq!(input.len(), in_size);
 
     let target = rec.cfvs.to_vec();
 
@@ -172,25 +170,35 @@ mod tests {
     #[test]
     fn dataset_length_correct() {
         let file = write_test_data(10);
-        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         assert_eq!(dataset.len(), 10);
     }
 
     #[test]
     fn dataset_get_returns_valid_item() {
         let file = write_test_data(5);
-        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         let item = dataset.get(0).unwrap();
-        assert_eq!(item.input.len(), INPUT_SIZE);
+        assert_eq!(item.input.len(), input_size(5));
         assert_eq!(item.target.len(), OUTPUT_SIZE);
         assert_eq!(item.mask.len(), OUTPUT_SIZE);
         assert_eq!(item.range.len(), OUTPUT_SIZE);
     }
 
     #[test]
+    fn dataset_input_size_method() {
+        let file = write_test_data(1);
+        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
+        assert_eq!(dataset.input_size(), 2660);
+
+        let dataset4 = CfvDataset::from_file(file.path(), 4).unwrap();
+        assert_eq!(dataset4.input_size(), 2659);
+    }
+
+    #[test]
     fn dataset_input_encoding_correct() {
         let file = write_test_data(1);
-        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         let item = dataset.get(0).unwrap();
 
         // First element of OOP range should be 0.5
@@ -213,9 +221,25 @@ mod tests {
     }
 
     #[test]
+    fn dataset_turn_encoding_uses_4_board_cards() {
+        let file = write_test_data(1);
+        let dataset = CfvDataset::from_file(file.path(), 4).unwrap();
+        let item = dataset.get(0).unwrap();
+
+        assert_eq!(item.input.len(), 1326 + 1326 + 4 + 1 + 1 + 1);
+        // Board cards: only first 4 encoded
+        assert!((item.input[2652]).abs() < 1e-6);       // card 0
+        assert!((item.input[2653] - 4.0 / 51.0).abs() < 1e-6); // card 4
+        assert!((item.input[2654] - 8.0 / 51.0).abs() < 1e-6); // card 8
+        assert!((item.input[2655] - 12.0 / 51.0).abs() < 1e-6); // card 12
+        // Pot at index 2656 (not 2657)
+        assert!((item.input[2656] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
     fn dataset_player_range_selection() {
         let file = write_test_data(2);
-        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         // Record 0: player=0, should use OOP range
         let item0 = dataset.get(0).unwrap();
         assert!(

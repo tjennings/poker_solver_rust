@@ -6,10 +6,17 @@ use burn::{
     tensor::{backend::Backend, Tensor},
 };
 
-/// 1326 combo probabilities per player + 5 board + 1 pot + 1 stack + 1 player indicator.
-pub const INPUT_SIZE: usize = 2660;
+/// Number of hole-card combinations (52 choose 2).
+pub const NUM_COMBOS: usize = 1326;
 /// One counterfactual value per combo.
-pub const OUTPUT_SIZE: usize = 1326;
+pub const OUTPUT_SIZE: usize = NUM_COMBOS;
+
+/// Compute input feature size for a given number of board cards.
+///
+/// Layout: OOP range (1326) + IP range (1326) + board cards + pot + stack + player indicator.
+pub fn input_size(board_cards: usize) -> usize {
+    NUM_COMBOS + NUM_COMBOS + board_cards + 1 + 1 + 1
+}
 
 /// A single hidden block: Linear -> BatchNorm -> PReLU.
 #[derive(Module, Debug)]
@@ -43,7 +50,7 @@ impl<B: Backend> HiddenBlock<B> {
 
 /// Deep Counterfactual Value Network.
 ///
-/// Architecture: `Input(2660) -> [Linear -> BatchNorm -> PReLU] x N -> Linear(1326)`
+/// Architecture: `Input(in_size) -> [Linear -> BatchNorm -> PReLU] x N -> Linear(1326)`
 #[derive(Module, Debug)]
 pub struct CfvNet<B: Backend> {
     hidden: Vec<HiddenBlock<B>>,
@@ -52,11 +59,13 @@ pub struct CfvNet<B: Backend> {
 
 impl<B: Backend> CfvNet<B> {
     /// Build a new network with `num_layers` hidden blocks of width `hidden_size`.
-    pub fn new(device: &B::Device, num_layers: usize, hidden_size: usize) -> Self {
+    ///
+    /// `in_size` is the input feature dimension, typically from [`input_size`].
+    pub fn new(device: &B::Device, num_layers: usize, hidden_size: usize, in_size: usize) -> Self {
         assert!(num_layers > 0, "need at least one hidden layer");
 
         let mut hidden = Vec::with_capacity(num_layers);
-        hidden.push(HiddenBlock::new(device, INPUT_SIZE, hidden_size));
+        hidden.push(HiddenBlock::new(device, in_size, hidden_size));
         for _ in 1..num_layers {
             hidden.push(HiddenBlock::new(device, hidden_size, hidden_size));
         }
@@ -82,11 +91,28 @@ mod tests {
 
     type TestBackend = NdArray;
 
+    const RIVER_INPUT: usize = 2660; // input_size(5)
+
+    #[test]
+    fn input_size_correct_for_river() {
+        assert_eq!(input_size(5), 2660);
+    }
+
+    #[test]
+    fn input_size_correct_for_turn() {
+        assert_eq!(input_size(4), 2659);
+    }
+
+    #[test]
+    fn input_size_correct_for_flop() {
+        assert_eq!(input_size(3), 2658);
+    }
+
     #[test]
     fn model_output_shape() {
         let device = Default::default();
-        let model = CfvNet::<TestBackend>::new(&device, 7, 500);
-        let input = Tensor::<TestBackend, 2>::zeros([1, INPUT_SIZE], &device);
+        let model = CfvNet::<TestBackend>::new(&device, 7, 500, RIVER_INPUT);
+        let input = Tensor::<TestBackend, 2>::zeros([1, RIVER_INPUT], &device);
         let output = model.forward(input);
         assert_eq!(output.dims(), [1, OUTPUT_SIZE]);
     }
@@ -94,10 +120,10 @@ mod tests {
     #[test]
     fn model_batch_forward() {
         let device = Default::default();
-        let model = CfvNet::<TestBackend>::new(&device, 7, 500);
+        let model = CfvNet::<TestBackend>::new(&device, 7, 500, RIVER_INPUT);
         let batch_size = 4;
         let input =
-            Tensor::<TestBackend, 2>::zeros([batch_size, INPUT_SIZE], &device);
+            Tensor::<TestBackend, 2>::zeros([batch_size, RIVER_INPUT], &device);
         let output = model.forward(input);
         assert_eq!(output.dims(), [batch_size, OUTPUT_SIZE]);
     }
@@ -105,9 +131,9 @@ mod tests {
     #[test]
     fn model_output_changes_with_input() {
         let device = Default::default();
-        let model = CfvNet::<TestBackend>::new(&device, 7, 500);
-        let input1 = Tensor::<TestBackend, 2>::zeros([1, INPUT_SIZE], &device);
-        let input2 = Tensor::<TestBackend, 2>::ones([1, INPUT_SIZE], &device);
+        let model = CfvNet::<TestBackend>::new(&device, 7, 500, RIVER_INPUT);
+        let input1 = Tensor::<TestBackend, 2>::zeros([1, RIVER_INPUT], &device);
+        let input2 = Tensor::<TestBackend, 2>::ones([1, RIVER_INPUT], &device);
         let out1 = model.forward(input1);
         let out2 = model.forward(input2);
         let diff: f32 = (out1 - out2).abs().sum().into_scalar();
@@ -115,5 +141,15 @@ mod tests {
             diff > 1e-6,
             "outputs should differ for different inputs, diff={diff}"
         );
+    }
+
+    #[test]
+    fn model_with_turn_input_size() {
+        let device = Default::default();
+        let in_size = input_size(4);
+        let model = CfvNet::<TestBackend>::new(&device, 2, 64, in_size);
+        let input = Tensor::<TestBackend, 2>::zeros([1, in_size], &device);
+        let output = model.forward(input);
+        assert_eq!(output.dims(), [1, OUTPUT_SIZE]);
     }
 }

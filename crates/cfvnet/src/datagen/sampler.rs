@@ -78,6 +78,7 @@ mod tests {
     fn test_config() -> DatagenConfig {
         DatagenConfig {
             num_samples: 100,
+            street: "river".into(),
             pot_intervals: vec![[4, 20], [20, 80], [80, 200], [200, 400]],
             solver_iterations: 100,
             target_exploitability: 0.01,

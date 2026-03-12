@@ -21,6 +21,9 @@ pub struct GameConfig {
     pub add_allin_threshold: f64,
     #[serde(default = "default_force_allin_threshold")]
     pub force_allin_threshold: f64,
+    /// Path to a trained river CFV model, used as a leaf evaluator for turn solving.
+    #[serde(default)]
+    pub river_model_path: Option<String>,
 }
 
 impl Default for GameConfig {
@@ -31,6 +34,7 @@ impl Default for GameConfig {
             board_size: 5,
             add_allin_threshold: 1.5,
             force_allin_threshold: 0.15,
+            river_model_path: None,
         }
     }
 }
@@ -60,9 +64,24 @@ fn default_force_allin_threshold() -> f64 {
     0.15
 }
 
+/// Return the number of board cards for a given street name.
+///
+/// Panics if `street` is not one of `"river"`, `"turn"`, or `"flop"`.
+pub fn board_cards_for_street(street: &str) -> usize {
+    match street {
+        "river" => 5,
+        "turn" => 4,
+        "flop" => 3,
+        other => panic!("unknown street: {other:?} (expected river, turn, or flop)"),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatagenConfig {
     pub num_samples: u64,
+    /// Which street to generate data for: "river" (default), "turn", or "flop".
+    #[serde(default = "default_street")]
+    pub street: String,
     #[serde(default = "default_pot_intervals")]
     pub pot_intervals: Vec<[i32; 2]>,
     #[serde(default = "default_solver_iterations")]
@@ -79,6 +98,7 @@ impl Default for DatagenConfig {
     fn default() -> Self {
         Self {
             num_samples: 1000,
+            street: default_street(),
             pot_intervals: default_pot_intervals(),
             solver_iterations: 1000,
             target_exploitability: 0.005,
@@ -88,6 +108,9 @@ impl Default for DatagenConfig {
     }
 }
 
+fn default_street() -> String {
+    "river".into()
+}
 fn default_pot_intervals() -> Vec<[i32; 2]> {
     vec![[4, 20], [20, 80], [80, 200], [200, 400]]
 }
@@ -267,5 +290,52 @@ training:
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn board_cards_for_known_streets() {
+        assert_eq!(board_cards_for_street("river"), 5);
+        assert_eq!(board_cards_for_street("turn"), 4);
+        assert_eq!(board_cards_for_street("flop"), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown street")]
+    fn board_cards_for_unknown_street_panics() {
+        board_cards_for_street("preflop");
+    }
+
+    #[test]
+    fn datagen_street_defaults_to_river() {
+        let config = DatagenConfig::default();
+        assert_eq!(config.street, "river");
+    }
+
+    #[test]
+    fn parse_config_with_street() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  street: "turn"
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.datagen.street, "turn");
+    }
+
+    #[test]
+    fn parse_config_with_river_model_path() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+  river_model_path: "/path/to/river_model"
+datagen:
+  num_samples: 100
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.game.river_model_path.as_deref(), Some("/path/to/river_model"));
     }
 }

@@ -11,7 +11,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::model::dataset::{CfvDataset, CfvItem};
 use crate::model::loss::cfvnet_loss;
-use crate::model::network::{CfvNet, INPUT_SIZE, OUTPUT_SIZE};
+use crate::model::network::{CfvNet, OUTPUT_SIZE};
 
 /// Configuration for the CFVnet training loop.
 pub struct TrainConfig {
@@ -45,10 +45,11 @@ struct Batch<B: AutodiffBackend> {
 fn collate_batch<B: AutodiffBackend>(
     items: &[CfvItem],
     device: &B::Device,
+    in_size: usize,
 ) -> Batch<B> {
     let bs = items.len();
 
-    let mut input_data = Vec::with_capacity(bs * INPUT_SIZE);
+    let mut input_data = Vec::with_capacity(bs * in_size);
     let mut target_data = Vec::with_capacity(bs * OUTPUT_SIZE);
     let mut mask_data = Vec::with_capacity(bs * OUTPUT_SIZE);
     let mut range_data = Vec::with_capacity(bs * OUTPUT_SIZE);
@@ -63,7 +64,7 @@ fn collate_batch<B: AutodiffBackend>(
     }
 
     let input = Tensor::from_data(
-        TensorData::new(input_data, [bs, INPUT_SIZE]),
+        TensorData::new(input_data, [bs, in_size]),
         device,
     );
     let target = Tensor::from_data(
@@ -110,7 +111,7 @@ fn compute_val_loss<B: AutodiffBackend>(
             continue;
         }
 
-        let batch = collate_batch::<B>(&items, device);
+        let batch = collate_batch::<B>(&items, device, dataset.input_size());
         let pred = model.forward(batch.input);
         let loss = cfvnet_loss(
             pred,
@@ -161,7 +162,8 @@ pub fn train<B: AutodiffBackend>(
     config: &TrainConfig,
     output_dir: Option<&std::path::Path>,
 ) -> TrainResult {
-    let mut model = CfvNet::<B>::new(device, config.hidden_layers, config.hidden_size);
+    let in_size = dataset.input_size();
+    let mut model = CfvNet::<B>::new(device, config.hidden_layers, config.hidden_size, in_size);
 
     // Resume from checkpoint if a saved model exists.
     if let Some(dir) = output_dir {
@@ -223,7 +225,7 @@ pub fn train<B: AutodiffBackend>(
                 continue;
             }
 
-            let batch = collate_batch::<B>(&items, device);
+            let batch = collate_batch::<B>(&items, device, in_size);
             let pred = model.forward(batch.input);
 
             let loss = cfvnet_loss(
@@ -323,7 +325,7 @@ mod tests {
     #[test]
     fn overfit_single_batch() {
         let file = write_test_data(16);
-        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
 
         let device = Default::default();
         let config = TrainConfig {
@@ -350,7 +352,7 @@ mod tests {
     #[test]
     fn train_saves_model_to_output_dir() {
         let file = write_test_data(16);
-        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let device = Default::default();
         let config = TrainConfig {
@@ -376,7 +378,7 @@ mod tests {
     #[test]
     fn train_saves_checkpoints() {
         let file = write_test_data(16);
-        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let device = Default::default();
         let config = TrainConfig {
@@ -400,7 +402,7 @@ mod tests {
     #[test]
     fn train_with_validation_reports_val_loss() {
         let file = write_test_data(20);
-        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         let dir = tempfile::tempdir().unwrap();
 
         let device = Default::default();
@@ -425,7 +427,7 @@ mod tests {
     #[test]
     fn train_resumes_from_checkpoint() {
         let file = write_test_data(16);
-        let dataset = CfvDataset::from_file(file.path()).unwrap();
+        let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let device = Default::default();
         let config = TrainConfig {
