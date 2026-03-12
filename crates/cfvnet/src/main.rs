@@ -36,8 +36,8 @@ enum Commands {
         /// Output directory for checkpoints
         #[arg(short, long)]
         output: PathBuf,
-        /// Backend: ndarray (default) or wgpu
-        #[arg(long, default_value = "ndarray")]
+        /// Backend: wgpu (default, uses Metal GPU on macOS) or ndarray (CPU)
+        #[arg(long, default_value = "wgpu")]
         backend: String,
     },
     /// Evaluate model on held-out validation data
@@ -121,10 +121,10 @@ fn main() {
             config,
             data,
             output,
-            backend: _,
+            backend,
         } => {
             ensure_parent_dir(&output);
-            cmd_train(config, data, output);
+            cmd_train(config, data, output, &backend);
         }
         Commands::Evaluate { model, data } => cmd_evaluate(model, data),
         Commands::Compare {
@@ -147,7 +147,7 @@ fn main() {
     }
 }
 
-fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf) {
+fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str) {
     let yaml = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
         eprintln!("failed to read config {}: {e}", config_path.display());
         std::process::exit(1);
@@ -178,12 +178,28 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf) {
         checkpoint_every_n_epochs: cfg.training.checkpoint_every_n_epochs,
     };
 
-    use burn::backend::{Autodiff, NdArray};
-    type B = Autodiff<NdArray>;
-    let device = Default::default();
-
-    let result = cfvnet::model::training::train::<B>(&device, &dataset, &train_config, Some(&output));
-    println!("Training complete. Final loss: {}", result.final_train_loss);
+    match backend {
+        "wgpu" => {
+            use burn::backend::{Autodiff, wgpu::{Wgpu, WgpuDevice}};
+            type B = Autodiff<Wgpu>;
+            let device = WgpuDevice::DefaultDevice;
+            println!("Using wgpu backend (Metal GPU on macOS)");
+            let result = cfvnet::model::training::train::<B>(&device, &dataset, &train_config, Some(&output));
+            println!("Training complete. Final loss: {}", result.final_train_loss);
+        }
+        "ndarray" => {
+            use burn::backend::{Autodiff, NdArray};
+            type B = Autodiff<NdArray>;
+            let device = Default::default();
+            println!("Using ndarray backend (CPU)");
+            let result = cfvnet::model::training::train::<B>(&device, &dataset, &train_config, Some(&output));
+            println!("Training complete. Final loss: {}", result.final_train_loss);
+        }
+        other => {
+            eprintln!("unknown backend '{other}', expected 'ndarray' or 'wgpu'");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn cmd_generate(
