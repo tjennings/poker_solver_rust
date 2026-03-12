@@ -10,9 +10,11 @@
 //! 3. Uses those CFVs during CFR traversal.
 
 use crate::blueprint::{
-    cards_overlap, compute_equity_matrix, precompute_opp_reach, SubgameHands, SubgameStrategy,
+    cards_overlap, compute_combo_equities, compute_equity_matrix, precompute_opp_reach,
+    SubgameCfrSolver, SubgameHands, SubgameStrategy,
 };
 use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind};
+use crate::blueprint_v2::Street;
 use crate::cfr::dcfr::DcfrParams;
 use crate::cfr::parallel::{add_into, parallel_traverse, ParallelCfr};
 use crate::cfr::regret::regret_match;
@@ -692,6 +694,140 @@ impl CfvCfrCtx<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// remaining_deck helper
+// ---------------------------------------------------------------------------
+
+/// Returns all cards not on the board.
+#[must_use]
+pub fn remaining_deck(board: &[Card]) -> Vec<Card> {
+    crate::poker::full_deck()
+        .into_iter()
+        .filter(|c| !board.contains(c))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// ExactRiverEvaluator
+// ---------------------------------------------------------------------------
+
+/// Evaluates depth boundary nodes by solving all possible river runouts
+/// exactly using [`SubgameCfrSolver`].
+///
+/// For each remaining deck card, builds a river tree, filters combos to
+/// those surviving that card, solves the subgame, extracts equities, and
+/// averages across all river cards.
+pub struct ExactRiverEvaluator {
+    /// Bet sizes for the river subgame trees.
+    pub bet_sizes: Vec<f64>,
+    /// Number of CFR iterations per river solve.
+    pub iterations: u32,
+}
+
+impl LeafEvaluator for ExactRiverEvaluator {
+    #[allow(clippy::cast_precision_loss)]
+    fn evaluate(
+        &self,
+        combos: &[[Card; 2]],
+        board: &[Card],
+        pot: f64,
+        effective_stack: f64,
+        oop_range: &[f64],
+        ip_range: &[f64],
+        traverser: u8,
+    ) -> Vec<f64> {
+        let n = combos.len();
+        let mut cfv_sums = vec![0.0_f64; n];
+        let mut cfv_counts = vec![0u32; n];
+
+        let remaining = remaining_deck(board);
+
+        for &river_card in &remaining {
+            let mut river_board = board.to_vec();
+            river_board.push(river_card);
+
+            // Filter combos: only keep those that don't conflict with the
+            // river card. Track the mapping from filtered index to parent.
+            let mut filtered_combos = Vec::new();
+            let mut parent_indices = Vec::new();
+            for (i, &combo) in combos.iter().enumerate() {
+                if combo[0] != river_card && combo[1] != river_card {
+                    filtered_combos.push(combo);
+                    parent_indices.push(i);
+                }
+            }
+
+            if filtered_combos.is_empty() {
+                continue;
+            }
+
+            let river_hands = SubgameHands {
+                combos: filtered_combos,
+            };
+            let fn_count = river_hands.combos.len();
+
+            // Build opponent reach for the filtered combo set.
+            let opp_reach: Vec<f64> = parent_indices
+                .iter()
+                .map(|&pi| {
+                    if traverser == 0 {
+                        ip_range[pi]
+                    } else {
+                        oop_range[pi]
+                    }
+                })
+                .collect();
+
+            // Build the river tree.
+            let invested = [pot / 2.0; 2];
+            let starting_stack = effective_stack + pot / 2.0;
+            let tree = GameTree::build_subgame(
+                Street::River,
+                pot,
+                invested,
+                starting_stack,
+                &[self.bet_sizes.clone()],
+                None,
+            );
+
+            let leaf_values = vec![0.0; fn_count];
+            let mut solver = SubgameCfrSolver::new(
+                tree,
+                river_hands.clone(),
+                &river_board,
+                opp_reach.clone(),
+                leaf_values,
+            );
+            solver.train(self.iterations);
+
+            // Extract equities against the (now-narrowed) opponent range.
+            let equities = compute_combo_equities(
+                &river_hands,
+                &river_board,
+                &opp_reach,
+            );
+
+            // Map equities back to parent combo indices as CFVs.
+            // CFV = (2 * equity - 1) in pot-fraction units.
+            for (fi, &pi) in parent_indices.iter().enumerate() {
+                cfv_sums[pi] += 2.0 * equities[fi] - 1.0;
+                cfv_counts[pi] += 1;
+            }
+        }
+
+        // Average across river cards.
+        (0..n)
+            .map(|i| {
+                if cfv_counts[i] > 0 {
+                    cfv_sums[i] / f64::from(cfv_counts[i])
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,6 +1084,99 @@ mod tests {
 
         solver.train(100);
         assert_eq!(solver.iteration, 100);
+
+        let strategy = solver.strategy();
+        assert!(strategy.num_combos() > 0);
+    }
+
+    #[timed_test(30)]
+    fn remaining_deck_excludes_board() {
+        let board = river_board();
+        let deck = remaining_deck(&board);
+        assert_eq!(deck.len(), 52 - board.len());
+        for card in &board {
+            assert!(!deck.contains(card), "board card {card:?} found in deck");
+        }
+
+        let turn = turn_board();
+        let deck2 = remaining_deck(&turn);
+        assert_eq!(deck2.len(), 52 - turn.len());
+    }
+
+    #[timed_test(30)]
+    fn leaf_evaluator_returns_correct_length() {
+        let board = turn_board();
+        let hands = small_hands(&board, 20);
+        let n = hands.combos.len();
+        let evaluator = ExactRiverEvaluator {
+            bet_sizes: vec![1.0],
+            iterations: 2,
+        };
+        let oop_range = vec![1.0; n];
+        let ip_range = vec![1.0; n];
+        let result = evaluator.evaluate(
+            &hands.combos,
+            &board,
+            100.0,
+            200.0,
+            &oop_range,
+            &ip_range,
+            0,
+        );
+        assert_eq!(
+            result.len(),
+            n,
+            "evaluator should return one CFV per combo"
+        );
+    }
+
+    #[timed_test(30)]
+    fn exact_river_evaluator_produces_bounded_cfvs() {
+        let board = turn_board();
+        let hands = small_hands(&board, 25);
+        let n = hands.combos.len();
+        let evaluator = ExactRiverEvaluator {
+            bet_sizes: vec![1.0],
+            iterations: 3,
+        };
+        let oop_range = vec![1.0; n];
+        let ip_range = vec![1.0; n];
+        let cfvs = evaluator.evaluate(
+            &hands.combos,
+            &board,
+            100.0,
+            200.0,
+            &oop_range,
+            &ip_range,
+            0,
+        );
+
+        for (i, &cfv) in cfvs.iter().enumerate() {
+            assert!(
+                cfv.is_finite(),
+                "combo {i}: CFV is not finite: {cfv}"
+            );
+            assert!(
+                (-1.5..=1.5).contains(&cfv),
+                "combo {i}: CFV {cfv} out of [-1.5, 1.5]"
+            );
+        }
+    }
+
+    #[timed_test(30)]
+    fn cfv_solver_with_exact_evaluator_on_turn() {
+        let board = turn_board();
+        let tree = turn_tree_depth_limited(&[1.0], 1);
+        let hands = small_hands(&board, 20);
+        let evaluator = Box::new(ExactRiverEvaluator {
+            bet_sizes: vec![1.0],
+            iterations: 5,
+        });
+        let mut solver =
+            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+
+        solver.train(10);
+        assert_eq!(solver.iteration, 10);
 
         let strategy = solver.strategy();
         assert!(strategy.num_combos() > 0);
