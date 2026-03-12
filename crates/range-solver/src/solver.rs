@@ -125,6 +125,11 @@ pub fn solve<T: Game>(
         io::stdout().flush().unwrap();
     }
 
+    let mut result_bufs: [Vec<f32>; 2] = [
+        Vec::with_capacity(game.num_private_hands(0)),
+        Vec::with_capacity(game.num_private_hands(1)),
+    ];
+
     for t in 0..max_num_iterations {
         if exploitability <= target_exploitability {
             break;
@@ -134,9 +139,10 @@ pub fn solve<T: Game>(
 
         // Alternating updates
         for player in 0..2 {
-            let mut result = Vec::with_capacity(game.num_private_hands(player));
+            result_bufs[player].clear();
+            result_bufs[player].reserve(game.num_private_hands(player));
             solve_recursive(
-                result.spare_capacity_mut(),
+                result_bufs[player].spare_capacity_mut(),
                 game,
                 &mut root,
                 player,
@@ -187,6 +193,7 @@ pub fn solve_step<T: Game>(game: &T, current_iteration: u32) {
     // Alternating updates
     for player in 0..2 {
         let mut result = Vec::with_capacity(game.num_private_hands(player));
+        result.reserve(game.num_private_hands(player));
         solve_recursive(
             result.spare_capacity_mut(),
             game,
