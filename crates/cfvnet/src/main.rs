@@ -93,6 +93,25 @@ enum Commands {
     },
 }
 
+fn append_random_suffix(path: &std::path::Path) -> PathBuf {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let suffix: String = (0..5)
+        .map(|_| {
+            let idx = rng.gen_range(0..52);
+            if idx < 26 {
+                (b'a' + idx) as char
+            } else {
+                (b'A' + idx - 26) as char
+            }
+        })
+        .collect();
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let new_name = format!("{stem}_{suffix}{ext}");
+    path.with_file_name(new_name)
+}
+
 fn ensure_parent_dir(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -114,6 +133,7 @@ fn main() {
             num_samples,
             threads,
         } => {
+            let output = append_random_suffix(&output);
             ensure_parent_dir(&output);
             cmd_generate(config, output, num_samples, threads);
         }
