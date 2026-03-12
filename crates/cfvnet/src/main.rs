@@ -24,6 +24,9 @@ enum Commands {
         /// Override thread count from config
         #[arg(long)]
         threads: Option<usize>,
+        /// Max samples per output file; splits into multiple files if total exceeds this
+        #[arg(long)]
+        per_file: Option<u64>,
     },
     /// Train the CFVnet model
     Train {
@@ -132,10 +135,10 @@ fn main() {
             output,
             num_samples,
             threads,
+            per_file,
         } => {
-            let output = append_random_suffix(&output);
             ensure_parent_dir(&output);
-            cmd_generate(config, output, num_samples, threads);
+            cmd_generate(config, output, num_samples, threads, per_file);
         }
         Commands::Train {
             config,
@@ -244,6 +247,7 @@ fn cmd_generate(
     output: PathBuf,
     num_samples: Option<u64>,
     threads: Option<usize>,
+    per_file: Option<u64>,
 ) {
     let yaml = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
         eprintln!("failed to read config {}: {e}", config_path.display());
@@ -267,21 +271,55 @@ fn cmd_generate(
         cfg.datagen.threads = t;
     }
 
+    let total = cfg.datagen.num_samples;
+    let chunk_size = per_file.unwrap_or(total);
+    let num_files = (total + chunk_size - 1) / chunk_size;
+
     let street = cfg.datagen.street.as_str();
-    println!(
-        "Generating {} {street} training samples to {}...",
-        cfg.datagen.num_samples,
-        output.display()
-    );
+    if num_files > 1 {
+        println!(
+            "Generating {total} {street} training samples across {num_files} files ({chunk_size} per file)..."
+        );
+    } else {
+        println!(
+            "Generating {total} {street} training samples...",
+        );
+    }
 
-    let result = match street {
-        "turn" => cfvnet::datagen::turn_generate::generate_turn_training_data(&cfg, &output),
-        _ => cfvnet::datagen::generate::generate_training_data(&cfg, &output),
-    };
+    let base_seed = cfg.datagen.seed;
+    let mut remaining = total;
+    let mut file_idx = 0u64;
+    while remaining > 0 {
+        let this_chunk = remaining.min(chunk_size);
+        remaining -= this_chunk;
 
-    if let Err(e) = result {
-        eprintln!("data generation failed: {e}");
-        std::process::exit(1);
+        cfg.datagen.num_samples = this_chunk;
+        // Advance seed per file so each file gets different situations.
+        cfg.datagen.seed = base_seed.wrapping_add(file_idx * 1_000_000);
+
+        let file_output = append_random_suffix(&output);
+
+        if num_files > 1 {
+            println!(
+                "  File {}/{num_files}: {this_chunk} samples → {}",
+                file_idx + 1,
+                file_output.display()
+            );
+        } else {
+            println!("  → {}", file_output.display());
+        }
+
+        let result = match street {
+            "turn" => cfvnet::datagen::turn_generate::generate_turn_training_data(&cfg, &file_output),
+            _ => cfvnet::datagen::generate::generate_training_data(&cfg, &file_output),
+        };
+
+        if let Err(e) = result {
+            eprintln!("data generation failed: {e}");
+            std::process::exit(1);
+        }
+
+        file_idx += 1;
     }
 
     println!("Done.");
