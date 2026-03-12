@@ -1,3 +1,5 @@
+use range_solver::bet_size::BetSizeOptions;
+
 use crate::config::{DatagenConfig, GameConfig};
 use crate::datagen::sampler::{sample_situation, Situation};
 use crate::datagen::solver::{solve_situation, SolveConfig, SolveResult};
@@ -13,14 +15,17 @@ pub fn generate_comparison_spot(seed: u64, initial_stack: i32) -> Situation {
 }
 
 /// Default solve config for comparison spots.
-pub fn default_solve_config(game: &GameConfig) -> SolveConfig {
-    SolveConfig {
-        bet_sizes: game.bet_sizes.clone(),
+pub fn default_solve_config(game: &GameConfig) -> Result<SolveConfig, String> {
+    let bet_str = game.bet_sizes.join(",");
+    let bet_sizes = BetSizeOptions::try_from((bet_str.as_str(), ""))
+        .map_err(|e| format!("invalid bet sizes: {e}"))?;
+    Ok(SolveConfig {
+        bet_sizes,
         solver_iterations: 500,
         target_exploitability: 0.005,
         add_allin_threshold: game.add_allin_threshold,
         force_allin_threshold: game.force_allin_threshold,
-    }
+    })
 }
 
 /// Compare a single predicted CFV vector against ground-truth solve.
@@ -57,7 +62,7 @@ pub fn run_comparison<F>(
 where
     F: Fn(&Situation, &SolveResult) -> Vec<f32>,
 {
-    let solve_config = default_solve_config(game_config);
+    let solve_config = default_solve_config(game_config)?;
     let mut maes = Vec::with_capacity(num_spots);
     let mut max_errors = Vec::with_capacity(num_spots);
     let mut mbbs = Vec::with_capacity(num_spots);

@@ -10,8 +10,8 @@ use range_solver::{
 
 /// Configuration for the range-solver wrapper.
 pub struct SolveConfig {
-    /// Bet sizes as strings, e.g. `["50%", "a"]`.
-    pub bet_sizes: Vec<String>,
+    /// Pre-parsed bet size options (avoids re-parsing per solve call).
+    pub bet_sizes: BetSizeOptions,
     /// Maximum number of solver iterations.
     pub solver_iterations: u32,
     /// Target exploitability (pot-relative); solver stops early if reached.
@@ -61,14 +61,11 @@ pub fn solve_situation(situation: &Situation, config: &SolveConfig) -> Result<So
         river: situation.board[4],
     };
 
-    let bet_str = config.bet_sizes.join(",");
-    let bet_sizes = BetSizeOptions::try_from((bet_str.as_str(), ""))?;
-
     let tree_config = TreeConfig {
         initial_state: BoardState::River,
         starting_pot: situation.pot,
         effective_stack: situation.effective_stack,
-        river_bet_sizes: [bet_sizes.clone(), bet_sizes],
+        river_bet_sizes: [config.bet_sizes.clone(), config.bet_sizes.clone()],
         add_allin_threshold: config.add_allin_threshold,
         force_allin_threshold: config.force_allin_threshold,
         ..Default::default()
@@ -174,8 +171,10 @@ mod tests {
     }
 
     fn test_solve_config() -> SolveConfig {
+        let bet_sizes = BetSizeOptions::try_from(("50%,a", ""))
+            .expect("valid test bet sizes");
         SolveConfig {
-            bet_sizes: vec!["50%".into(), "a".into()],
+            bet_sizes,
             solver_iterations: 200,
             target_exploitability: 0.01,
             add_allin_threshold: 1.5,
