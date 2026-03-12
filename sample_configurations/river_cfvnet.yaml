@@ -26,3 +26,5 @@ training:
   aux_loss_weight: 1.0
   validation_split: 0.05
   checkpoint_every_n_epochs: 1000
+  gpu_chunk_size: 100000
+  epochs_per_chunk: 1

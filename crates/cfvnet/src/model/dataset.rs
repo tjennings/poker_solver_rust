@@ -51,6 +51,16 @@ impl CfvDataset {
         self.records.is_empty()
     }
 
+    /// The number of board cards used for encoding.
+    pub(crate) fn board_cards(&self) -> usize {
+        self.board_cards
+    }
+
+    /// Access the underlying records for bulk pre-encoding.
+    pub(crate) fn records(&self) -> &[TrainingRecord] {
+        &self.records
+    }
+
     /// The input feature size for this dataset's board card count.
     pub fn input_size(&self) -> usize {
         input_size(self.board_cards)
@@ -93,7 +103,7 @@ pub fn encode_situation_for_inference(sit: &Situation, player: u8) -> Vec<f32> {
     input
 }
 
-fn encode_record(rec: &TrainingRecord, board_cards: usize) -> CfvItem {
+pub(crate) fn encode_record(rec: &TrainingRecord, board_cards: usize) -> CfvItem {
     let in_size = input_size(board_cards);
     let mut input = Vec::with_capacity(in_size);
 

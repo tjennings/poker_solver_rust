@@ -151,6 +151,10 @@ pub struct TrainingConfig {
     pub validation_split: f64,
     #[serde(default = "default_checkpoint_interval")]
     pub checkpoint_every_n_epochs: usize,
+    #[serde(default = "default_gpu_chunk_size")]
+    pub gpu_chunk_size: usize,
+    #[serde(default = "default_epochs_per_chunk")]
+    pub epochs_per_chunk: usize,
 }
 
 impl Default for TrainingConfig {
@@ -166,6 +170,8 @@ impl Default for TrainingConfig {
             aux_loss_weight: 1.0,
             validation_split: 0.05,
             checkpoint_every_n_epochs: 1000,
+            gpu_chunk_size: 100_000,
+            epochs_per_chunk: 1,
         }
     }
 }
@@ -199,6 +205,12 @@ fn default_validation_split() -> f64 {
 }
 fn default_checkpoint_interval() -> usize {
     1000
+}
+fn default_gpu_chunk_size() -> usize {
+    100_000
+}
+fn default_epochs_per_chunk() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

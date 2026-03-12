@@ -176,6 +176,8 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         aux_loss_weight: cfg.training.aux_loss_weight,
         validation_split: cfg.training.validation_split,
         checkpoint_every_n_epochs: cfg.training.checkpoint_every_n_epochs,
+        gpu_chunk_size: cfg.training.gpu_chunk_size,
+        epochs_per_chunk: cfg.training.epochs_per_chunk,
     };
 
     match backend {
