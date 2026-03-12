@@ -125,3 +125,32 @@ cd frontend && npm run dev              # Vite on :5173
 - Dev server: `crates/devserver/src/main.rs`
 - Invoke wrapper: `frontend/src/invoke.ts`
 - Core functions: `crates/tauri-app/src/exploration.rs` (`_core` suffix variants)
+
+## Design Context
+
+### Users
+Serious poker professionals seeking a competitive edge. They use this tool during study sessions to analyze GTO strategies, explore decision trees, and refine their game. The interface should evoke precision, analytical power, and confidence — like wielding a high-end instrument built for experts.
+
+### Brand Personality
+**Dark, focused, elite.** This is a premium tool for serious players, not a casual poker app. Every pixel should feel intentional and information-dense without being cluttered.
+
+### Aesthetic Direction
+- **Visual tone**: Dark, high-contrast, data-rich — inspired by trading terminals (Bloomberg, TradingView) and poker solvers (PioSOLVER, GTO Wizard)
+- **Theme**: Dark mode only. Deep navy/purple backgrounds (#0f0f1e, #1a1a2e) with bright cyan (#00d9ff) as the primary accent
+- **References**: Trading terminals for information density and professional feel; GTO Wizard/PioSOLVER for poker-domain conventions and familiar action color coding
+- **Anti-references**: Casual gaming aesthetics, bright/playful color schemes, consumer-oriented "friendly" UIs
+
+### Color System
+- **Backgrounds**: Dark navy gradients (#0f0f1e → #1a1a2e), panels (#14142a → #1a1a3a)
+- **Primary accent**: Cyan (#00d9ff) for interactive elements, selections, and focus states
+- **Poker actions**: Blue (fold), green (check/call), rose-to-red gradient (bet/raise) — these are domain conventions, preserve them
+- **Status**: Amber (#f59e0b) for warnings, red (#ff6b6b) for errors, green (#4caf50) for success
+- **Text**: #eee primary, #ccc/#bbb secondary, #888/#666 muted
+- **Typography**: System font stack (-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto); tabular-nums for numeric data
+
+### Design Principles
+1. **Information density over decoration** — Every element earns its space. Favor showing more data over whitespace or ornament.
+2. **Domain-native conventions** — Use poker and solver UI conventions (action colors, matrix layouts, tree structures) that pros already know. Don't reinvent established patterns.
+3. **Precision and clarity** — Numbers, probabilities, and strategies must be instantly readable. Use contrast, alignment, and tabular formatting to make data scannable.
+4. **Progressive disclosure** — Show the essential view by default; reveal deeper analysis on interaction. Power is available but not overwhelming.
+5. **Zero friction** — The interface should never slow down the analysis workflow. Fast interactions, minimal clicks, keyboard-friendly where possible.
