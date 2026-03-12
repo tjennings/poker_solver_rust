@@ -120,9 +120,11 @@ See `sample_configurations/blueprint_v2_with_tui.yaml` for a complete example.
 
 ## CFVnet Training Pipeline
 
-The `cfvnet` crate provides tools for training Deep Counterfactual Value Networks.
+The `cfvnet` crate trains Deep Counterfactual Value Networks following the Supremus/DeepStack approach: solve random subgames, extract per-combo counterfactual values, and train a neural network to predict them. Networks are trained bottom-up: river first, then turn (using the river network as leaf evaluator).
 
-### Generate Training Data
+### River Network
+
+#### Generate River Training Data
 
 ```bash
 cargo run -p cfvnet --release -- generate \
@@ -132,7 +134,7 @@ cargo run -p cfvnet --release -- generate \
   --threads 8
 ```
 
-### Train the Network
+#### Train the River Network
 
 ```bash
 cargo run -p cfvnet --release -- train \
@@ -141,7 +143,7 @@ cargo run -p cfvnet --release -- train \
   --output models/river_v1
 ```
 
-### Evaluate on Held-Out Data
+#### Evaluate on Held-Out Data
 
 ```bash
 cargo run -p cfvnet --release -- evaluate \
@@ -149,12 +151,70 @@ cargo run -p cfvnet --release -- evaluate \
   --data data/river_validation.bin
 ```
 
-### Compare Against Exact Solves
+#### Compare Against Exact Solves
 
 ```bash
 cargo run -p cfvnet --release -- compare \
   --model models/river_v1 \
   --num-spots 100
+```
+
+### Turn Network
+
+Turn training requires a trained river network. The turn datagen solves random 4-card board situations using DCFR with the river CFV network as leaf evaluator (instead of solving all 46 river runouts exactly).
+
+#### Generate Turn Training Data
+
+Set `datagen.street: "turn"` and `game.river_model_path` in the config:
+
+```yaml
+game:
+  initial_stack: 200
+  bet_sizes: ["25%", "50%", "100%", "a"]
+  river_model_path: "models/river_v1/model"
+datagen:
+  street: "turn"
+  num_samples: 1000000
+  solver_iterations: 1000
+```
+
+```bash
+cargo run -p cfvnet --release -- generate \
+  --config sample_configurations/turn_cfvnet.yaml \
+  --output data/turn_training.bin \
+  --num-samples 1000000
+```
+
+#### Train the Turn Network
+
+```bash
+cargo run -p cfvnet --release -- train \
+  --config sample_configurations/turn_cfvnet.yaml \
+  --data data/turn_training.bin \
+  --output models/turn_v1
+```
+
+#### Compare Turn Model Against River Net Evaluator
+
+Validates the turn model by comparing its predictions against fresh CfvSubgameSolver solves using the river network as leaf evaluator:
+
+```bash
+cargo run -p cfvnet --release -- compare-net \
+  --model models/turn_v1 \
+  --river-model models/river_v1 \
+  --num-spots 100 \
+  --config sample_configurations/turn_cfvnet.yaml
+```
+
+#### Compare Turn Model Against Exact River Solves
+
+Validates the turn model against CfvSubgameSolver with exact river evaluation (solves all 46 runouts). Slow but provides ground-truth comparison:
+
+```bash
+cargo run -p cfvnet --release -- compare-exact \
+  --model models/turn_v1 \
+  --num-spots 20 \
+  --config sample_configurations/turn_cfvnet.yaml
 ```
 
 ### Configuration
@@ -163,8 +223,10 @@ See `sample_configurations/river_cfvnet.yaml` for all options. Key parameters:
 
 | Parameter | Default | Description |
 |-|-|-|
+| `datagen.street` | `"river"` | Street to generate data for (`"river"` or `"turn"`) |
 | `datagen.num_samples` | 1,000,000 | Training situations to generate |
 | `datagen.solver_iterations` | 1000 | DCFR iterations per situation |
+| `game.river_model_path` | none | Path to trained river model (required for turn) |
 | `training.hidden_layers` | 7 | MLP depth |
 | `training.hidden_size` | 500 | Hidden layer width |
 | `training.batch_size` | 2048 | Training batch size |

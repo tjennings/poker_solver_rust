@@ -24,10 +24,10 @@ pub fn sample_situation<R: Rng>(
     let board = sample_board(board_size, rng);
     let pot = sample_pot(&config.pot_intervals, rng);
     let max_stack = initial_stack - pot / 2;
-    let effective_stack = if max_stack <= 0 {
-        0
+    let effective_stack = if max_stack < 5 {
+        5
     } else {
-        rng.gen_range(0..=max_stack)
+        rng.gen_range(5..=max_stack)
     };
     let oop_range = generate_rsp_range(&board, rng);
     let ip_range = generate_rsp_range(&board, rng);
@@ -136,17 +136,19 @@ mod tests {
             let sit = sample_situation(&config, INITIAL_STACK, 5, &mut rng);
             let max_stack = INITIAL_STACK - sit.pot / 2;
             assert!(
-                sit.effective_stack >= 0,
-                "negative stack: {}",
+                sit.effective_stack >= 5,
+                "stack must be >= 5, got: {}",
                 sit.effective_stack
             );
-            assert!(
-                sit.effective_stack <= max_stack,
-                "stack {} exceeds max {} for pot {}",
-                sit.effective_stack,
-                max_stack,
-                sit.pot
-            );
+            if max_stack >= 5 {
+                assert!(
+                    sit.effective_stack <= max_stack,
+                    "stack {} exceeds max {} for pot {}",
+                    sit.effective_stack,
+                    max_stack,
+                    sit.pot
+                );
+            }
         }
     }
 
