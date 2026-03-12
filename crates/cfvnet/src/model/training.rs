@@ -11,6 +11,7 @@ use rand_chacha::ChaCha8Rng;
 
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use crate::datagen::storage::{read_record, TrainingRecord};
 use crate::model::dataset::encode_record;
@@ -237,6 +238,15 @@ fn save_model<B: AutodiffBackend>(
 /// the GPU->CPU sync to avoid pipeline stalls.
 const LOSS_READ_INTERVAL: usize = 50;
 
+/// Messages sent from the prefetch producer thread to the training consumer.
+enum ChunkMsg {
+    /// A pre-encoded chunk ready for GPU upload.
+    Data(PreEncoded),
+    /// All files for this epoch have been read.
+    EndOfEpoch,
+}
+
+
 /// Streaming record reader that reads from a sequence of files, filling
 /// buffers up to a requested chunk size. Handles file boundaries transparently.
 struct StreamingReader {
@@ -435,140 +445,180 @@ pub fn train<B: AutodiffBackend>(
     let mut global_step: usize = 0;
     let mut total_epochs_done: usize = 0;
 
-    let mut shuffled_files = files.clone();
+    // Prefetch pipeline: background thread reads + encodes chunks, sends
+    // through a bounded channel so 2-3 chunks are always ready.
+    const PREFETCH_SLOTS: usize = 3;
 
-    'outer: for _epoch in 0..config.epochs {
-        // Shuffle file order each epoch for data diversity across chunks.
-        shuffled_files.shuffle(&mut rng);
-        let mut reader = StreamingReader::new(shuffled_files.clone());
+    let num_epochs = config.epochs;
+    let producer_files = files.clone();
+    let producer_seed = rng.clone();
 
-        let mut chunks_in_epoch = 0u64;
+    let (tx, rx) = mpsc::sync_channel::<ChunkMsg>(PREFETCH_SLOTS);
 
-        loop {
-            // Load next chunk from files.
-            let records = reader.read_chunk(chunk_size);
-            if records.is_empty() {
-                break; // All files exhausted for this epoch.
+    let producer = std::thread::spawn(move || {
+        let mut rng = producer_seed;
+        let mut shuffled = producer_files;
+
+        for _epoch in 0..num_epochs {
+            shuffled.shuffle(&mut rng);
+            let mut reader = StreamingReader::new(shuffled.clone());
+
+            loop {
+                let records = reader.read_chunk(chunk_size);
+                if records.is_empty() {
+                    break;
+                }
+                let encoded = PreEncoded::from_records(&records, board_cards);
+                if tx.send(ChunkMsg::Data(encoded)).is_err() {
+                    return; // Consumer dropped — training ended early.
+                }
             }
 
-            let chunk_len = records.len();
-            let encoded = PreEncoded::from_records(&records, board_cards);
-            drop(records); // Free raw records before uploading to GPU.
+            if tx.send(ChunkMsg::EndOfEpoch).is_err() {
+                return;
+            }
+        }
+        // Channel drops when producer exits, signaling completion.
+    });
 
-            let chunk_tensors = encoded.to_tensors::<B>(device);
-            drop(encoded); // Free CPU buffers after GPU upload.
-            let chunk_batches = chunk_len.div_ceil(batch_size);
+    // Advance the main rng past the producer's usage so they don't share state.
+    // The producer got a clone; we skip ahead to keep them independent.
+    for _ in 0..config.epochs {
+        rng.set_word_pos(rng.get_word_pos() + 1);
+    }
 
-            for _ in 0..epochs_per_chunk {
-                if total_epochs_done >= config.epochs {
-                    break 'outer;
+    let mut chunks_in_epoch = 0u64;
+
+    for msg in rx {
+        match msg {
+            ChunkMsg::EndOfEpoch => {
+                total_epochs_done += 1;
+
+                // Checkpoint every N epochs if configured.
+                if config.checkpoint_every_n_epochs > 0
+                    && total_epochs_done.is_multiple_of(config.checkpoint_every_n_epochs)
+                    && let Some(dir) = output_dir
+                {
+                    save_model(
+                        &model,
+                        dir,
+                        &format!("checkpoint_epoch{total_epochs_done}"),
+                    );
                 }
 
-                let pb = ProgressBar::new(chunk_batches as u64);
-                // INVARIANT: template is valid — all placeholders are known indicatif fields.
-                pb.set_style(
-                    ProgressStyle::default_bar()
-                        .template(
-                            "  Epoch {msg} {wide_bar} {pos}/{len} [{elapsed}] ETA {eta}",
-                        )
-                        .unwrap(),
-                );
+                chunks_in_epoch = 0;
 
-                // Shuffle within the chunk: create a random permutation.
-                let mut perm: Vec<usize> = (0..chunk_len).collect();
-                perm.shuffle(&mut rng);
-                let perm_data: Vec<i64> = perm.iter().map(|&i| i as i64).collect();
-                let perm_tensor: Tensor<B, 1, Int> = Tensor::from_data(
-                    TensorData::new(perm_data, [chunk_len]),
-                    device,
-                );
-                let shuffled = chunk_tensors.index_select(perm_tensor);
+                if total_epochs_done >= config.epochs {
+                    break;
+                }
+            }
+            ChunkMsg::Data(encoded) => {
+                let chunk_len = encoded.len;
+                let chunk_tensors = encoded.to_tensors::<B>(device);
+                // encoded dropped here — CPU buffers freed after GPU upload.
 
-                let mut epoch_loss = 0.0_f64;
-                let mut epoch_batches = 0_u64;
+                let chunk_batches = chunk_len.div_ceil(batch_size);
 
-                for batch_idx in 0..chunk_batches {
-                    let start = batch_idx * batch_size;
-                    let end = (start + batch_size).min(chunk_len);
-                    let batch = shuffled.slice_batch(start, end);
-
-                    let pred = model.forward(batch.input);
-                    let loss = cfvnet_loss(
-                        pred,
-                        batch.target,
-                        batch.mask,
-                        batch.range,
-                        batch.game_value,
-                        config.huber_delta,
-                        config.aux_loss_weight,
-                    );
-
-                    // Only read loss from GPU every LOSS_READ_INTERVAL batches
-                    // or on the last batch of the epoch to reduce sync overhead.
-                    let is_last_batch = batch_idx + 1 == chunk_batches;
-                    if batch_idx.is_multiple_of(LOSS_READ_INTERVAL) || is_last_batch {
-                        // INVARIANT: loss is shape [1], so to_vec always has one element.
-                        final_loss = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
-                        epoch_loss += final_loss as f64;
-                        epoch_batches += 1;
+                for _ in 0..epochs_per_chunk {
+                    if total_epochs_done >= config.epochs {
+                        break;
                     }
 
-                    let lr = cosine_lr(config.learning_rate, config.lr_min, global_step, total_steps);
-                    let grads = loss.backward();
-                    let grads_params = GradientsParams::from_grads(grads, &model);
-                    model = optim.step(lr, model, grads_params);
+                    let pb = ProgressBar::new(chunk_batches as u64);
+                    // INVARIANT: template is valid — all placeholders are known indicatif fields.
+                    pb.set_style(
+                        ProgressStyle::default_bar()
+                            .template(
+                                "  Epoch {msg} {wide_bar} {pos}/{len} [{elapsed}] ETA {eta}",
+                            )
+                            .unwrap(),
+                    );
 
-                    global_step += 1;
-                    pb.inc(1);
+                    // Shuffle within the chunk: create a random permutation.
+                    let mut perm: Vec<usize> = (0..chunk_len).collect();
+                    perm.shuffle(&mut rng);
+                    let perm_data: Vec<i64> = perm.iter().map(|&i| i as i64).collect();
+                    let perm_tensor: Tensor<B, 1, Int> = Tensor::from_data(
+                        TensorData::new(perm_data, [chunk_len]),
+                        device,
+                    );
+                    let shuffled = chunk_tensors.index_select(perm_tensor);
+
+                    let mut epoch_loss = 0.0_f64;
+                    let mut epoch_batches = 0_u64;
+
+                    for batch_idx in 0..chunk_batches {
+                        let start = batch_idx * batch_size;
+                        let end = (start + batch_size).min(chunk_len);
+                        let batch = shuffled.slice_batch(start, end);
+
+                        let pred = model.forward(batch.input);
+                        let loss = cfvnet_loss(
+                            pred,
+                            batch.target,
+                            batch.mask,
+                            batch.range,
+                            batch.game_value,
+                            config.huber_delta,
+                            config.aux_loss_weight,
+                        );
+
+                        // Only read loss from GPU every LOSS_READ_INTERVAL batches
+                        // or on the last batch to reduce sync overhead.
+                        let is_last_batch = batch_idx + 1 == chunk_batches;
+                        if batch_idx.is_multiple_of(LOSS_READ_INTERVAL) || is_last_batch {
+                            // INVARIANT: loss is shape [1], so to_vec always has one element.
+                            final_loss = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
+                            epoch_loss += final_loss as f64;
+                            epoch_batches += 1;
+                        }
+
+                        let lr = cosine_lr(config.learning_rate, config.lr_min, global_step, total_steps);
+                        let grads = loss.backward();
+                        let grads_params = GradientsParams::from_grads(grads, &model);
+                        model = optim.step(lr, model, grads_params);
+
+                        global_step += 1;
+                        pb.inc(1);
+                    }
+
+                    chunks_in_epoch += 1;
+
+                    let avg_train = if epoch_batches > 0 {
+                        epoch_loss / epoch_batches as f64
+                    } else {
+                        0.0
+                    };
+
+                    let lr_now = cosine_lr(
+                        config.learning_rate,
+                        config.lr_min,
+                        global_step.saturating_sub(1),
+                        total_steps,
+                    );
+
+                    let summary = if let Some(ref val_enc) = val_encoded {
+                        let val_loss = compute_val_loss(&model, val_enc, config, device);
+                        format!(
+                            "{}/{} chunk={} lr={lr_now:.2e} train={avg_train:.6} val={val_loss:.6}",
+                            total_epochs_done + 1, config.epochs, chunks_in_epoch
+                        )
+                    } else {
+                        format!(
+                            "{}/{} chunk={} lr={lr_now:.2e} train={avg_train:.6}",
+                            total_epochs_done + 1, config.epochs, chunks_in_epoch
+                        )
+                    };
+
+                    pb.finish_with_message(summary);
                 }
-
-                chunks_in_epoch += 1;
-
-                let avg_train = if epoch_batches > 0 {
-                    epoch_loss / epoch_batches as f64
-                } else {
-                    0.0
-                };
-
-                let lr_now = cosine_lr(
-                    config.learning_rate,
-                    config.lr_min,
-                    global_step.saturating_sub(1),
-                    total_steps,
-                );
-
-                let summary = if let Some(ref val_enc) = val_encoded {
-                    let val_loss = compute_val_loss(&model, val_enc, config, device);
-                    format!(
-                        "{}/{} chunk={} lr={lr_now:.2e} train={avg_train:.6} val={val_loss:.6}",
-                        total_epochs_done + 1, config.epochs, chunks_in_epoch
-                    )
-                } else {
-                    format!(
-                        "{}/{} chunk={} lr={lr_now:.2e} train={avg_train:.6}",
-                        total_epochs_done + 1, config.epochs, chunks_in_epoch
-                    )
-                };
-
-                pb.finish_with_message(summary);
+                // chunk_tensors dropped here — GPU memory freed.
             }
-            // chunk_tensors dropped here — GPU memory freed.
-        }
-
-        total_epochs_done += 1;
-
-        // Checkpoint every N epochs if configured.
-        if config.checkpoint_every_n_epochs > 0
-            && total_epochs_done.is_multiple_of(config.checkpoint_every_n_epochs)
-            && let Some(dir) = output_dir
-        {
-            save_model(
-                &model,
-                dir,
-                &format!("checkpoint_epoch{total_epochs_done}"),
-            );
         }
     }
+
+    // Wait for producer thread to finish.
+    let _ = producer.join();
 
     // Save final model.
     if let Some(dir) = output_dir {
