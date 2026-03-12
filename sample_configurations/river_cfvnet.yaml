@@ -20,7 +20,7 @@ game:
 
 datagen:
   num_samples: 10000000
-  pot_intervals: [[4, 20], [20, 80], [80, 200], [200, 400]]
+  pot_intervals: [[4, 20], [20, 80], [80, 200]]
   solver_iterations: 1000
   target_exploitability: 0.005
   threads: 8
@@ -30,12 +30,12 @@ training:
   hidden_layers: 7
   hidden_size: 500
   batch_size: 8192
-  epochs: 1000
+  epochs: 50
   learning_rate: 0.002
   lr_min: 0.00002
   huber_delta: 1.0
   aux_loss_weight: 1.0
   validation_split: 0.05
-  checkpoint_every_n_epochs: 1000
-  gpu_chunk_size: 100000
-  epochs_per_chunk: 5
+  checkpoint_every_n_epochs: 1
+  gpu_chunk_size: 200000
+  epochs_per_chunk: 15
