@@ -329,6 +329,367 @@ impl CfvSubgameSolver {
             }
         }
     }
+
+    /// Run parallel DCFR for the given number of iterations.
+    ///
+    /// Each iteration:
+    /// 1. Builds a strategy snapshot from current regret sums.
+    /// 2. Propagates ranges to depth boundaries.
+    /// 3. Evaluates leaf CFVs at each boundary using the [`LeafEvaluator`].
+    /// 4. Runs CFR traversal for both traverser positions.
+    /// 5. Applies DCFR discounting.
+    pub fn train(&mut self, iterations: u32) {
+        let combos: Vec<(u16, u16)> = (0..self.hands.combos.len())
+            .filter(|&c| self.opp_reach_totals[c] > 0.0)
+            .map(|c| {
+                // INVARIANT: combo count fits in u16 (max 1326 combos)
+                #[allow(clippy::cast_possible_truncation)]
+                (c as u16, 0u16)
+            })
+            .collect();
+
+        for _ in 0..iterations {
+            self.iteration += 1;
+
+            let snapshot = self.build_strategy_snapshot();
+
+            // Propagate ranges to boundaries and evaluate leaf CFVs.
+            if !self.boundary_info.boundaries.is_empty() {
+                let (oop_ranges, ip_ranges) = self.propagate_ranges(&snapshot);
+
+                for (b_idx, &(_, pot, invested)) in
+                    self.boundary_info.boundaries.iter().enumerate()
+                {
+                    let eff_stack =
+                        self.starting_stack - invested[0].max(invested[1]);
+
+                    // Evaluate for each traverser and store the results.
+                    // We'll use traverser=0 for the iteration (OOP perspective).
+                    // The actual per-traverser leaf CFVs are handled below.
+                    self.leaf_cfvs[b_idx] = self.evaluator.evaluate(
+                        &self.hands.combos,
+                        &self.board,
+                        pot,
+                        eff_stack,
+                        &oop_ranges[b_idx],
+                        &ip_ranges[b_idx],
+                        0, // evaluated from OOP perspective initially
+                    );
+                }
+            }
+
+            for traverser in 0..2u8 {
+                // Re-evaluate boundaries from current traverser's perspective
+                // if there are boundaries.
+                if !self.boundary_info.boundaries.is_empty() && traverser == 1 {
+                    let (oop_ranges, ip_ranges) =
+                        self.propagate_ranges(&snapshot);
+                    for (b_idx, &(_, pot, invested)) in
+                        self.boundary_info.boundaries.iter().enumerate()
+                    {
+                        let eff_stack = self.starting_stack
+                            - invested[0].max(invested[1]);
+                        self.leaf_cfvs[b_idx] = self.evaluator.evaluate(
+                            &self.hands.combos,
+                            &self.board,
+                            pot,
+                            eff_stack,
+                            &oop_ranges[b_idx],
+                            &ip_ranges[b_idx],
+                            traverser,
+                        );
+                    }
+                }
+
+                let ctx = CfvCfrCtx {
+                    tree: &self.tree,
+                    hands: &self.hands,
+                    equity_matrix: &self.equity_matrix,
+                    opp_reach_totals: &self.opp_reach_totals,
+                    layout: &self.layout,
+                    snapshot: &snapshot,
+                    leaf_cfvs: &self.leaf_cfvs,
+                    node_to_boundary: &self.node_to_boundary,
+                    traverser,
+                };
+
+                let (regret_delta, strategy_delta) =
+                    parallel_traverse(&ctx, &combos);
+                add_into(&mut self.regret_sum, &regret_delta);
+                add_into(&mut self.strategy_sum, &strategy_delta);
+            }
+
+            let iter_u64 = u64::from(self.iteration);
+            if self.dcfr.should_discount(iter_u64) {
+                self.dcfr.discount_regrets(&mut self.regret_sum, iter_u64);
+                self.dcfr
+                    .discount_strategy_sums(&mut self.strategy_sum, iter_u64);
+            }
+        }
+    }
+
+    /// Extract the average strategy from cumulative strategy sums.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn strategy(&self) -> SubgameStrategy {
+        let mut strategies =
+            rustc_hash::FxHashMap::default();
+        let num_combos = self.hands.combos.len();
+
+        for (node_idx, node) in self.tree.nodes.iter().enumerate() {
+            let num_actions = match node {
+                GameNode::Decision { actions, .. } => actions.len(),
+                _ => continue,
+            };
+
+            for combo_idx in 0..num_combos {
+                let (base, _) = self.layout.slot(node_idx, combo_idx);
+                let sums = &self.strategy_sum[base..base + num_actions];
+                let total: f64 = sums.iter().sum();
+                if total > 0.0 {
+                    let probs: Vec<f64> =
+                        sums.iter().map(|&s| s / total).collect();
+                    let key = SubgameStrategy::key(
+                        node_idx as u32,
+                        combo_idx as u32,
+                    );
+                    strategies.insert(key, probs);
+                }
+            }
+        }
+
+        SubgameStrategy {
+            strategies,
+            num_combos,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CfvCfrCtx — parallel CFR context with per-boundary leaf CFVs
+// ---------------------------------------------------------------------------
+
+/// Frozen snapshot context for one CFR traversal pass. Like `SubgameCfrCtx`
+/// but uses per-boundary leaf CFV vectors instead of a single leaf_values
+/// vector.
+struct CfvCfrCtx<'a> {
+    tree: &'a GameTree,
+    hands: &'a SubgameHands,
+    equity_matrix: &'a [Vec<f64>],
+    opp_reach_totals: &'a [f64],
+    layout: &'a CfvLayout,
+    snapshot: &'a [f64],
+    /// Per-boundary leaf CFVs: `[boundary_ordinal][combo_idx]`.
+    leaf_cfvs: &'a [Vec<f64>],
+    /// Maps node index to boundary ordinal.
+    node_to_boundary: &'a [usize],
+    traverser: u8,
+}
+
+impl ParallelCfr for CfvCfrCtx<'_> {
+    fn buffer_size(&self) -> usize {
+        self.layout.total_size
+    }
+
+    fn traverse_pair(
+        &self,
+        regret_delta: &mut [f64],
+        strategy_delta: &mut [f64],
+        hero_combo: u16,
+        _opponent: u16,
+    ) {
+        self.cfr_traverse(
+            regret_delta,
+            strategy_delta,
+            self.tree.root as usize,
+            hero_combo as usize,
+            1.0,
+            self.opp_reach_totals[hero_combo as usize],
+        );
+    }
+}
+
+impl CfvCfrCtx<'_> {
+    /// Recursive CFR traversal for one combo. Returns expected value for
+    /// the traverser.
+    fn cfr_traverse(
+        &self,
+        regret_delta: &mut [f64],
+        strategy_delta: &mut [f64],
+        node_idx: usize,
+        hero_combo: usize,
+        reach_hero: f64,
+        reach_opp: f64,
+    ) -> f64 {
+        match &self.tree.nodes[node_idx] {
+            GameNode::Terminal { kind, pot, .. } => {
+                let half_pot = *pot / 2.0;
+                match kind {
+                    TerminalKind::Fold { winner } => {
+                        if *winner == self.traverser {
+                            half_pot
+                        } else {
+                            -half_pot
+                        }
+                    }
+                    TerminalKind::Showdown => {
+                        self.showdown_value(hero_combo, half_pot)
+                    }
+                    TerminalKind::DepthBoundary => {
+                        let ordinal = self.node_to_boundary[node_idx];
+                        if ordinal != usize::MAX {
+                            // leaf_cfvs are in pot-fraction units; scale by
+                            // half_pot to get chip values.
+                            self.leaf_cfvs[ordinal]
+                                .get(hero_combo)
+                                .copied()
+                                .unwrap_or(0.0)
+                                * half_pot
+                        } else {
+                            0.0
+                        }
+                    }
+                }
+            }
+
+            GameNode::Chance { child, .. } => self.cfr_traverse(
+                regret_delta,
+                strategy_delta,
+                *child as usize,
+                hero_combo,
+                reach_hero,
+                reach_opp,
+            ),
+
+            GameNode::Decision {
+                player,
+                actions,
+                children,
+                ..
+            } => {
+                let (base, _) = self.layout.slot(node_idx, hero_combo);
+                let num_actions = actions.len();
+                let strategy = &self.snapshot[base..base + num_actions];
+
+                if *player == self.traverser {
+                    self.traverse_as_traverser(
+                        regret_delta,
+                        strategy_delta,
+                        node_idx,
+                        hero_combo,
+                        reach_hero,
+                        reach_opp,
+                        strategy,
+                        children,
+                    )
+                } else {
+                    self.traverse_as_opponent(
+                        regret_delta,
+                        strategy_delta,
+                        hero_combo,
+                        reach_hero,
+                        reach_opp,
+                        strategy,
+                        children,
+                    )
+                }
+            }
+        }
+    }
+
+    /// Traverser's decision: compute counterfactual values, write regret
+    /// and strategy deltas.
+    #[allow(clippy::too_many_arguments)]
+    fn traverse_as_traverser(
+        &self,
+        regret_delta: &mut [f64],
+        strategy_delta: &mut [f64],
+        node_idx: usize,
+        hero_combo: usize,
+        reach_hero: f64,
+        reach_opp: f64,
+        strategy: &[f64],
+        children: &[u32],
+    ) -> f64 {
+        let num_actions = children.len();
+        let mut action_values = [0.0f64; 16];
+        let mut node_value = 0.0;
+
+        for (a, &child_idx) in children.iter().enumerate() {
+            let new_reach = reach_hero * strategy[a];
+            action_values[a] = self.cfr_traverse(
+                regret_delta,
+                strategy_delta,
+                child_idx as usize,
+                hero_combo,
+                new_reach,
+                reach_opp,
+            );
+            node_value += strategy[a] * action_values[a];
+        }
+
+        let (base, _) = self.layout.slot(node_idx, hero_combo);
+        for a in 0..num_actions {
+            regret_delta[base + a] +=
+                reach_opp * (action_values[a] - node_value);
+        }
+        for a in 0..num_actions {
+            strategy_delta[base + a] += reach_hero * strategy[a];
+        }
+
+        node_value
+    }
+
+    /// Opponent's decision: weight by opponent strategy and recurse.
+    #[allow(clippy::too_many_arguments)]
+    fn traverse_as_opponent(
+        &self,
+        regret_delta: &mut [f64],
+        strategy_delta: &mut [f64],
+        hero_combo: usize,
+        reach_hero: f64,
+        reach_opp: f64,
+        strategy: &[f64],
+        children: &[u32],
+    ) -> f64 {
+        let mut node_value = 0.0;
+        for (a, &child_idx) in children.iter().enumerate() {
+            let new_opp_reach = reach_opp * strategy[a];
+            let child_val = self.cfr_traverse(
+                regret_delta,
+                strategy_delta,
+                child_idx as usize,
+                hero_combo,
+                reach_hero,
+                new_opp_reach,
+            );
+            node_value += strategy[a] * child_val;
+        }
+        node_value
+    }
+
+    /// Compute showdown value: reach-weighted equity vs opponent range.
+    fn showdown_value(&self, hero_combo: usize, half_pot: f64) -> f64 {
+        let hero_cards = self.hands.combos[hero_combo];
+        let opp_reach_total = self.opp_reach_totals[hero_combo];
+        if opp_reach_total <= 0.0 {
+            return 0.0;
+        }
+
+        let mut equity_sum = 0.0;
+        // Use uniform opponent reach (1.0 per combo) since opp_reach_totals
+        // was computed from uniform reach. The reach weighting is already
+        // baked into the CFR traversal structure.
+        for (j, eq_row) in self.equity_matrix[hero_combo].iter().enumerate() {
+            if cards_overlap(hero_cards, self.hands.combos[j]) {
+                continue;
+            }
+            equity_sum += eq_row;
+        }
+
+        let avg_equity = equity_sum / opp_reach_total;
+        (2.0 * avg_equity - 1.0) * half_pot
+    }
 }
 
 #[cfg(test)]
@@ -459,6 +820,42 @@ mod tests {
                 ip_total <= 1.0 + 1e-10,
                 "combo {combo_idx}: IP total reach {ip_total} > 1.0"
             );
+        }
+    }
+
+    #[timed_test(30)]
+    fn solver_trains_and_produces_strategy() {
+        let board = river_board();
+        let tree = river_tree(&[1.0]);
+        let hands = small_hands(&board, 30);
+        let evaluator = Box::new(ConstantEvaluator(0.5));
+        let mut solver =
+            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+
+        solver.train(100);
+        assert_eq!(solver.iteration, 100);
+
+        let strategy = solver.strategy();
+        let n = strategy.num_combos();
+        assert!(n > 0);
+
+        // Verify valid probability distributions at the root.
+        for combo_idx in 0..n {
+            let probs = strategy.root_probs(combo_idx);
+            if probs.is_empty() {
+                continue;
+            }
+            let sum: f64 = probs.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 0.01,
+                "combo {combo_idx}: strategy sum = {sum}, expected ~1.0"
+            );
+            for (a, &p) in probs.iter().enumerate() {
+                assert!(
+                    p >= -1e-10,
+                    "combo {combo_idx} action {a}: negative prob {p}"
+                );
+            }
         }
     }
 }

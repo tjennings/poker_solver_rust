@@ -56,13 +56,15 @@ fn remaining_deck(board: &[Card]) -> Vec<Card> {
 #[derive(Debug, Clone)]
 pub struct SubgameStrategy {
     /// `(node_idx, combo_idx)` -> action probabilities.
-    strategies: FxHashMap<u64, Vec<f64>>,
+    pub strategies: FxHashMap<u64, Vec<f64>>,
     /// Total number of combos in this subgame.
     pub num_combos: usize,
 }
 
 impl SubgameStrategy {
-    fn key(node_idx: u32, combo_idx: u32) -> u64 {
+    /// Compute the flat key for `(node_idx, combo_idx)`.
+    #[must_use]
+    pub fn key(node_idx: u32, combo_idx: u32) -> u64 {
         (u64::from(node_idx) << 32) | u64::from(combo_idx)
     }
 
