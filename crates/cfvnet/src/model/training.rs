@@ -2,10 +2,9 @@ use burn::module::{AutodiffModule, Module};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::{Int, Tensor, TensorData};
+use burn::tensor::{Tensor, TensorData};
 
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -31,8 +30,8 @@ pub struct TrainConfig {
     pub aux_loss_weight: f64,
     pub validation_split: f64,
     pub checkpoint_every_n_epochs: usize,
-    pub reservoir_size: usize,
-    pub reservoir_turnover: f64,
+    pub shuffle_buffer_size: usize,
+    pub prefetch_depth: usize,
 }
 
 /// Result returned after training completes.
@@ -117,120 +116,6 @@ impl PreEncoded {
             len: self.len,
         };
         cloned.into_device_tensors(device)
-    }
-}
-
-/// GPU-resident reservoir of training data.
-///
-/// Holds pre-encoded training records as large tensors in GPU memory.
-/// The training loop samples random batches via `select` (pure GPU).
-/// A background thread continuously refreshes records via `scatter_refresh`.
-struct GpuReservoir<B: Backend> {
-    input: Tensor<B, 2>,
-    target: Tensor<B, 2>,
-    mask: Tensor<B, 2>,
-    range: Tensor<B, 2>,
-    game_value: Tensor<B, 1>,
-    capacity: usize,
-}
-
-/// A single mini-batch of tensors sampled from the reservoir.
-struct SampledBatch<B: Backend> {
-    input: Tensor<B, 2>,
-    target: Tensor<B, 2>,
-    mask: Tensor<B, 2>,
-    range: Tensor<B, 2>,
-    game_value: Tensor<B, 1>,
-}
-
-impl<B: Backend> GpuReservoir<B> {
-    /// Create an empty reservoir with `capacity` slots on `device`.
-    fn new(device: &B::Device, capacity: usize, board_cards: usize) -> Self {
-        let in_size = input_size(board_cards);
-        Self {
-            input: Tensor::zeros([capacity, in_size], device),
-            target: Tensor::zeros([capacity, OUTPUT_SIZE], device),
-            mask: Tensor::zeros([capacity, OUTPUT_SIZE], device),
-            range: Tensor::zeros([capacity, OUTPUT_SIZE], device),
-            game_value: Tensor::zeros([capacity], device),
-            capacity,
-        }
-    }
-
-    /// Fill the reservoir from disk. Returns number of records loaded.
-    fn fill(&mut self, reader: &mut StreamingReader, board_cards: usize) -> usize {
-        let records = reader.read_chunk(self.capacity);
-        let n = records.len();
-        if n == 0 {
-            return 0;
-        }
-        let encoded = PreEncoded::from_records(&records, board_cards);
-        let device = self.input.device();
-        let n_actual = n.min(self.capacity);
-        let tensors = encoded.into_device_tensors::<B>(&device);
-
-        self.input = tensors.input;
-        self.target = tensors.target;
-        self.mask = tensors.mask;
-        self.range = tensors.range;
-        self.game_value = tensors.game_value;
-        self.capacity = n_actual;
-        n_actual
-    }
-
-    /// Sample a random mini-batch from the reservoir.
-    ///
-    /// Uses `rand::seq::index::sample` for O(batch_size) index generation
-    /// instead of shuffling the full reservoir. Indices are unique to avoid
-    /// gradient accumulation issues in some backends.
-    fn sample_batch(&self, batch_size: usize, rng: &mut ChaCha8Rng, device: &B::Device) -> SampledBatch<B> {
-        use rand::seq::index;
-        let actual_batch = batch_size.min(self.capacity);
-        let sampled = index::sample(rng, self.capacity, actual_batch);
-        let indices_vec: Vec<i64> = sampled.iter().map(|i| i as i64).collect();
-
-        let indices: Tensor<B, 1, Int> = Tensor::from_data(
-            TensorData::new(indices_vec, [actual_batch]),
-            device,
-        );
-        SampledBatch {
-            input: self.input.clone().select(0, indices.clone()),
-            target: self.target.clone().select(0, indices.clone()),
-            mask: self.mask.clone().select(0, indices.clone()),
-            range: self.range.clone().select(0, indices.clone()),
-            game_value: self.game_value.clone().select(0, indices),
-        }
-    }
-
-    /// Scatter a batch of new pre-encoded records into random reservoir positions.
-    fn scatter_refresh(
-        &mut self,
-        encoded: PreEncoded,
-        rng: &mut ChaCha8Rng,
-        device: &B::Device,
-    ) {
-        let n = encoded.len;
-        if n == 0 {
-            return;
-        }
-
-        // Pick n random target positions in the reservoir.
-        let positions: Vec<i64> = (0..n)
-            .map(|_| rng.gen_range(0..self.capacity) as i64)
-            .collect();
-
-        let tensors = encoded.into_device_tensors::<B>(device);
-
-        // Use select_assign to scatter new values into the reservoir.
-        let idx: Tensor<B, 1, Int> = Tensor::from_data(
-            TensorData::new(positions, [n]),
-            device,
-        );
-        self.input = self.input.clone().select_assign(0, idx.clone(), tensors.input);
-        self.target = self.target.clone().select_assign(0, idx.clone(), tensors.target);
-        self.mask = self.mask.clone().select_assign(0, idx.clone(), tensors.mask);
-        self.range = self.range.clone().select_assign(0, idx.clone(), tensors.range);
-        self.game_value = self.game_value.clone().select_assign(0, idx, tensors.game_value);
     }
 }
 
@@ -465,62 +350,67 @@ fn load_validation_set(
     Some(PreEncoded::from_records(&val_records, board_cards))
 }
 
-/// Spawn the background refresh thread that reads records from disk and sends
-/// pre-encoded batches over the channel.
+/// Spawn the background dataloader thread that reads records from disk, shuffles
+/// them, splits into batches, encodes, and sends through a bounded channel.
 ///
-/// Returns `(receiver, Option<JoinHandle>)`. If `refresh_per_step` is 0, no
-/// thread is spawned and the sender is dropped immediately.
-fn spawn_refresh_thread(
+/// Returns `(receiver, JoinHandle)`. The thread loops forever (resetting the
+/// reader on EOF) until the receiver is dropped.
+fn spawn_dataloader_thread(
     files: &[PathBuf],
-    refresh_per_step: usize,
+    config: &TrainConfig,
     val_count: usize,
     board_cards: usize,
-) -> (mpsc::Receiver<PreEncoded>, Option<std::thread::JoinHandle<()>>) {
-    let (refresh_tx, refresh_rx) = mpsc::sync_channel::<PreEncoded>(4);
-    let thread = if refresh_per_step > 0 {
-        let refresh_files = files.to_vec();
-        Some(std::thread::spawn(move || {
-            let mut reader = StreamingReader::new(refresh_files);
-            // Skip past validation records so they don't leak into training.
-            if val_count > 0 {
-                let _ = reader.read_chunk(val_count);
-            }
-            let mut consecutive_empty = 0u32;
-            loop {
-                let records = reader.read_chunk(refresh_per_step);
-                if records.is_empty() {
-                    consecutive_empty += 1;
-                    if consecutive_empty > 3 {
-                        eprintln!("Warning: refresh thread exhausted all files after 3 retries, stopping");
-                        return;
-                    }
-                    reader.reset();
-                    // Skip validation records again after reset.
-                    if val_count > 0 {
-                        let _ = reader.read_chunk(val_count);
-                    }
-                    continue;
+) -> (mpsc::Receiver<PreEncoded>, std::thread::JoinHandle<()>) {
+    let batch_size = config.batch_size;
+    let shuffle_buffer_size = config.shuffle_buffer_size;
+    let prefetch_depth = config.prefetch_depth;
+    let (tx, rx) = mpsc::sync_channel::<PreEncoded>(prefetch_depth);
+    let loader_files = files.to_vec();
+    let thread = std::thread::spawn(move || {
+        use rand::seq::SliceRandom;
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut reader = StreamingReader::new(loader_files);
+        // Skip past validation records so they don't leak into training.
+        if val_count > 0 {
+            let _ = reader.read_chunk(val_count);
+        }
+        let mut consecutive_empty = 0u32;
+        loop {
+            // Read a shuffle buffer worth of records.
+            let mut records = reader.read_chunk(shuffle_buffer_size);
+            if records.is_empty() {
+                consecutive_empty += 1;
+                if consecutive_empty > 3 {
+                    eprintln!("Warning: dataloader exhausted all files after 3 retries, stopping");
+                    return;
                 }
-                consecutive_empty = 0;
-                let encoded = PreEncoded::from_records(&records, board_cards);
-                if refresh_tx.send(encoded).is_err() {
-                    return; // Training done, channel closed.
+                // EOF: reset reader, skip validation records, continue.
+                reader.reset();
+                if val_count > 0 {
+                    let _ = reader.read_chunk(val_count);
+                }
+                continue;
+            }
+            consecutive_empty = 0;
+            // Shuffle the buffer.
+            records.shuffle(&mut rng);
+            // Split into batch_size chunks, encode, and send.
+            for chunk in records.chunks(batch_size) {
+                let encoded = PreEncoded::from_records(chunk, board_cards);
+                if tx.send(encoded).is_err() {
+                    return; // Channel closed, training done.
                 }
             }
-        }))
-    } else {
-        drop(refresh_tx);
-        None
-    };
-    (refresh_rx, thread)
+        }
+    });
+    (rx, thread)
 }
 
-/// Train a `CfvNet` using a GPU-resident reservoir.
+/// Train a `CfvNet` using a streaming dataloader.
 ///
-/// The reservoir holds `reservoir_size` records in GPU memory. Training samples
-/// random batches directly from GPU tensors (zero PCIe transfer). A background
-/// thread continuously refreshes records from disk. One epoch = `total_records /
-/// batch_size` training steps.
+/// A background thread reads records from disk, shuffles them in a buffer,
+/// splits into batches, and sends pre-encoded data over a channel. One epoch =
+/// `train_records / batch_size` training steps.
 pub fn train<B: AutodiffBackend>(
     device: &B::Device,
     data_path: &Path,
@@ -533,7 +423,6 @@ pub fn train<B: AutodiffBackend>(
     let mut model = load_or_create_model(model, output_dir, device);
 
     let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
-    let mut rng = ChaCha8Rng::seed_from_u64(42);
 
     let files = collect_data_files(data_path).unwrap_or_else(|e| {
         eprintln!("failed to collect data files: {e}");
@@ -549,37 +438,27 @@ pub fn train<B: AutodiffBackend>(
         return TrainResult { final_train_loss: f32::MAX };
     }
 
-    let val_count = (total_records as f64 * config.validation_split) as usize;
+    let val_count = ((total_records as f64 * config.validation_split) as usize)
+        .min(total_records);
     let val_encoded = load_validation_set(&files, val_count, board_cards);
 
-    // Fill reservoir from disk.
-    let reservoir_cap = config.reservoir_size.min(total_records);
-    eprintln!("Filling reservoir ({reservoir_cap} records)...");
-    let mut reservoir = GpuReservoir::<B::InnerBackend>::new(device, reservoir_cap, board_cards);
-    {
-        let mut fill_reader = StreamingReader::new(files.clone());
-        // Skip past validation records so they don't leak into the reservoir.
-        if val_count > 0 {
-            let _ = fill_reader.read_chunk(val_count);
-        }
-        let filled = reservoir.fill(&mut fill_reader, board_cards);
-        eprintln!("Reservoir filled: {filled} records");
-    }
-
     // Compute training schedule.
+    let train_records = total_records - val_count;
     let batch_size = config.batch_size;
-    let steps_per_epoch = total_records.div_ceil(batch_size);
+    let steps_per_epoch = train_records.div_ceil(batch_size);
     let total_steps = steps_per_epoch * config.epochs;
-    let refresh_per_step = ((reservoir_cap as f64 * config.reservoir_turnover)
-        / steps_per_epoch as f64)
-        .ceil() as usize;
 
     eprintln!(
-        "Training: {} epochs x {} steps/epoch = {} total steps, refresh {}/step",
-        config.epochs, steps_per_epoch, total_steps, refresh_per_step
+        "Training: {} epochs x {} steps/epoch = {} total steps",
+        config.epochs, steps_per_epoch, total_steps
     );
 
-    let (refresh_rx, refresh_thread) = spawn_refresh_thread(&files, refresh_per_step, val_count, board_cards);
+    let (data_rx, loader_thread) = spawn_dataloader_thread(
+        &files,
+        config,
+        val_count,
+        board_cards,
+    );
 
     let mut final_loss = f32::MAX;
     let mut global_step: usize = 0;
@@ -596,14 +475,14 @@ pub fn train<B: AutodiffBackend>(
         let mut epoch_loss_count = 0_u64;
 
         for step_in_epoch in 0..steps_per_epoch {
-            // Apply any pending refresh batch (non-blocking).
-            if let Ok(encoded) = refresh_rx.try_recv() {
-                reservoir.scatter_refresh(encoded, &mut rng, device);
-            }
+            // Receive next pre-encoded batch from the dataloader (blocking).
+            let encoded = match data_rx.recv() {
+                Ok(e) => e,
+                Err(_) => break, // Channel closed unexpectedly.
+            };
 
-            // Sample batch from reservoir (inner backend, no autodiff graph)
-            // and convert to autodiff tensors for the training step.
-            let batch = reservoir.sample_batch(batch_size, &mut rng, device);
+            // Create tensors on the inner (non-autodiff) backend, then lift.
+            let batch = encoded.into_device_tensors::<B::InnerBackend>(device);
             let input = Tensor::<B, 2>::from_inner(batch.input);
             let target = Tensor::<B, 2>::from_inner(batch.target);
             let mask = Tensor::<B, 2>::from_inner(batch.mask);
@@ -671,10 +550,10 @@ pub fn train<B: AutodiffBackend>(
         }
     }
 
-    // Drop refresh channel to signal thread to exit, then join.
-    drop(refresh_rx);
-    if let Some(thread) = refresh_thread {
-        let _ = thread.join();
+    // Drop data channel to signal thread to exit, then join.
+    drop(data_rx);
+    if let Err(e) = loader_thread.join() {
+        eprintln!("ERROR: dataloader thread panicked: {e:?}");
     }
 
     // Save final model.
@@ -708,8 +587,8 @@ mod tests {
             aux_loss_weight: 0.0,
             validation_split: 0.0,
             checkpoint_every_n_epochs: 0,
-            reservoir_size: 100,
-            reservoir_turnover: 1.0,
+            shuffle_buffer_size: 100,
+            prefetch_depth: 2,
         }
     }
 
@@ -746,7 +625,6 @@ mod tests {
         let device = Default::default();
         let config = TrainConfig {
             epochs: 200,
-            reservoir_turnover: 0.0,
             ..default_test_config()
         };
 
@@ -838,39 +716,37 @@ mod tests {
     }
 
     #[test]
-    fn reservoir_training_reduces_loss() {
+    fn training_reduces_loss() {
         let file = write_test_data(16);
         let device = Default::default();
         let config = TrainConfig {
             epochs: 200,
-            reservoir_size: 16,
-            reservoir_turnover: 0.0,
             ..default_test_config()
         };
         let result = train::<B>(&device, file.path(), 5, &config, None);
         assert!(
             result.final_train_loss < 0.05,
-            "reservoir training should reduce loss, got {}",
+            "training should reduce loss, got {}",
             result.final_train_loss
         );
     }
 
     #[test]
-    fn training_with_refresh() {
-        // Use more data than reservoir_size to exercise the refresh path.
+    fn training_with_streaming() {
+        // Use more data than shuffle_buffer_size to exercise the streaming path.
         let file = write_test_data(64);
         let device = Default::default();
         let config = TrainConfig {
             batch_size: 8,
             epochs: 5,
-            reservoir_size: 16, // smaller than data -> refresh thread runs
-            reservoir_turnover: 2.0,
+            shuffle_buffer_size: 16,
+            prefetch_depth: 2,
             ..default_test_config()
         };
         let result = train::<B>(&device, file.path(), 5, &config, None);
         assert!(
             result.final_train_loss < 10.0,
-            "training with refresh should produce reasonable loss, got {}",
+            "training with streaming should produce reasonable loss, got {}",
             result.final_train_loss
         );
     }
@@ -961,73 +837,33 @@ mod tests {
     }
 
     #[test]
-    fn reservoir_fill_and_sample() {
-        let file = write_test_data(20);
-        let device = Default::default();
-        let files = collect_data_files(file.path()).unwrap();
+    fn dataloader_stops_on_empty_files() {
+        // Create a directory with an empty file (no valid records).
+        let dir = tempfile::tempdir().unwrap();
+        let empty_path = dir.path().join("empty.bin");
+        std::fs::File::create(&empty_path).unwrap();
 
-        // Reservoir uses inner (non-autodiff) backend to avoid graph accumulation.
-        let mut reservoir = GpuReservoir::<NdArray>::new(&device, 20, 5);
-        let mut reader = StreamingReader::new(files);
-        let filled = reservoir.fill(&mut reader, 5);
-        assert_eq!(filled, 20);
+        let config = TrainConfig {
+            batch_size: 8,
+            shuffle_buffer_size: 100,
+            prefetch_depth: 2,
+            ..default_test_config()
+        };
 
-        // Sample a batch -- should not panic, should return correct shapes.
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let batch = reservoir.sample_batch(4, &mut rng, &device);
-        assert_eq!(batch.input.dims(), [4, input_size(5)]);
-        assert_eq!(batch.target.dims(), [4, OUTPUT_SIZE]);
+        let (rx, handle) = spawn_dataloader_thread(
+            &[empty_path],
+            &config,
+            0,
+            5,
+        );
+
+        // The thread should stop after 3 consecutive empty reads,
+        // causing recv() to return Err.
+        let result = rx.recv();
+        assert!(result.is_err(), "expected channel to close after consecutive empty reads");
+
+        // Thread should have exited cleanly (no panic).
+        assert!(handle.join().is_ok(), "dataloader thread should not panic");
     }
 
-    #[test]
-    fn reservoir_scatter_refresh() {
-        let file = write_test_data(20);
-        let device = Default::default();
-        let files = collect_data_files(file.path()).unwrap();
-
-        // Reservoir uses inner (non-autodiff) backend to avoid graph accumulation.
-        let mut reservoir = GpuReservoir::<NdArray>::new(&device, 10, 5);
-        let mut reader = StreamingReader::new(files);
-        reservoir.fill(&mut reader, 5);
-
-        // Read some more records and scatter them in.
-        let mut reader2 = StreamingReader::new(vec![file.path().to_path_buf()]);
-        let records = reader2.read_chunk(3);
-        let encoded = PreEncoded::from_records(&records, 5);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
-        reservoir.scatter_refresh(encoded, &mut rng, &device);
-        // No panic = success. Reservoir still works.
-        let batch = reservoir.sample_batch(4, &mut rng, &device);
-        assert_eq!(batch.input.dims(), [4, input_size(5)]);
-    }
-
-    #[test]
-    fn reservoir_sample_converts_to_autodiff() {
-        // Verify that inner-backend reservoir batches can be lifted to autodiff
-        // tensors via from_inner, which is the pattern used in the training loop
-        // to avoid graph accumulation in the reservoir.
-        let file = write_test_data(20);
-        let device = Default::default();
-        let files = collect_data_files(file.path()).unwrap();
-
-        let mut reservoir = GpuReservoir::<NdArray>::new(&device, 20, 5);
-        let mut reader = StreamingReader::new(files);
-        reservoir.fill(&mut reader, 5);
-
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let batch = reservoir.sample_batch(4, &mut rng, &device);
-
-        // Convert each tensor to autodiff -- this is what train() does.
-        let input = Tensor::<B, 2>::from_inner(batch.input);
-        let target = Tensor::<B, 2>::from_inner(batch.target);
-        let mask = Tensor::<B, 2>::from_inner(batch.mask);
-        let range = Tensor::<B, 2>::from_inner(batch.range);
-        let game_value = Tensor::<B, 1>::from_inner(batch.game_value);
-
-        assert_eq!(input.dims(), [4, input_size(5)]);
-        assert_eq!(target.dims(), [4, OUTPUT_SIZE]);
-        assert_eq!(mask.dims(), [4, OUTPUT_SIZE]);
-        assert_eq!(range.dims(), [4, OUTPUT_SIZE]);
-        assert_eq!(game_value.dims(), [4]);
-    }
 }

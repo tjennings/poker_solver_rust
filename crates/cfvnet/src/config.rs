@@ -154,10 +154,10 @@ pub struct TrainingConfig {
     pub validation_split: f64,
     #[serde(default = "default_checkpoint_interval")]
     pub checkpoint_every_n_epochs: usize,
-    #[serde(default = "default_reservoir_size")]
-    pub reservoir_size: usize,
-    #[serde(default = "default_reservoir_turnover")]
-    pub reservoir_turnover: f64,
+    #[serde(default = "default_shuffle_buffer_size")]
+    pub shuffle_buffer_size: usize,
+    #[serde(default = "default_prefetch_depth")]
+    pub prefetch_depth: usize,
 }
 
 impl Default for TrainingConfig {
@@ -173,8 +173,8 @@ impl Default for TrainingConfig {
             aux_loss_weight: 1.0,
             validation_split: 0.05,
             checkpoint_every_n_epochs: 1000,
-            reservoir_size: 1_500_000,
-            reservoir_turnover: 1.0,
+            shuffle_buffer_size: 262_144,
+            prefetch_depth: 4,
         }
     }
 }
@@ -209,11 +209,11 @@ fn default_validation_split() -> f64 {
 fn default_checkpoint_interval() -> usize {
     1000
 }
-fn default_reservoir_size() -> usize {
-    1_500_000
+fn default_shuffle_buffer_size() -> usize {
+    262_144
 }
-fn default_reservoir_turnover() -> f64 {
-    1.0
+fn default_prefetch_depth() -> usize {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,7 +385,7 @@ datagen:
     }
 
     #[test]
-    fn parse_config_with_reservoir_params() {
+    fn parse_config_with_streaming_params() {
         let yaml = r#"
 game:
   initial_stack: 200
@@ -393,16 +393,16 @@ game:
 datagen:
   num_samples: 100
 training:
-  reservoir_size: 1500000
-  reservoir_turnover: 1.0
+  shuffle_buffer_size: 131072
+  prefetch_depth: 8
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.training.reservoir_size, 1_500_000);
-        assert!((config.training.reservoir_turnover - 1.0).abs() < 1e-9);
+        assert_eq!(config.training.shuffle_buffer_size, 131_072);
+        assert_eq!(config.training.prefetch_depth, 8);
     }
 
     #[test]
-    fn config_defaults_for_reservoir() {
+    fn config_defaults_for_streaming() {
         let yaml = r#"
 game:
   initial_stack: 200
@@ -411,7 +411,7 @@ datagen:
   num_samples: 100
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.training.reservoir_size, 1_500_000);
-        assert!((config.training.reservoir_turnover - 1.0).abs() < 1e-9);
+        assert_eq!(config.training.shuffle_buffer_size, 262_144);
+        assert_eq!(config.training.prefetch_depth, 4);
     }
 }
