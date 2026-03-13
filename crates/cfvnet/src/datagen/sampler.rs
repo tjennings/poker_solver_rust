@@ -89,11 +89,12 @@ fn sample_pot<R: Rng>(intervals: &[[i32; 2]], rng: &mut R) -> i32 {
     rng.gen_range(lo..hi)
 }
 
-/// Sample a (pot, stack) pair via SPR-stratified sampling.
+/// Sample a (pot, stack) pair via 2D-stratified rejection sampling.
 ///
-/// Picks an SPR bucket uniformly, computes the feasible pot range for that SPR,
-/// then samples pot from the intersection of configured pot intervals and the
-/// feasible range. Stack is derived directly from pot and target SPR.
+/// Picks both an SPR bucket and a pot bucket uniformly, then intersects
+/// the chosen pot bucket with the feasible pot range for the target SPR.
+/// Infeasible (SPR, pot) cells are rejected and retried, producing a
+/// distribution that is uniform across both dimensions.
 fn sample_pot_stack_by_spr<R: Rng>(
     pot_intervals: &[[i32; 2]],
     spr_intervals: &[[f64; 2]],
@@ -102,57 +103,34 @@ fn sample_pot_stack_by_spr<R: Rng>(
 ) -> (i32, i32) {
     let stack_f = initial_stack as f64;
     loop {
-        // 1. Pick SPR bucket uniformly
+        // 1. Pick BOTH buckets uniformly
         let spr_idx = rng.gen_range(0..spr_intervals.len());
         let [spr_lo, spr_hi] = spr_intervals[spr_idx];
         let target_spr = rng.gen_range(spr_lo..spr_hi);
 
-        // 2. Compute feasible pot range for this SPR:
-        //    stack = spr * pot, and 5 <= stack <= initial_stack - pot/2
-        //    => pot >= 5/spr  (so stack >= 5)
-        //    => pot <= initial_stack / (spr + 0.5)  (so stack <= initial_stack - pot/2)
+        let pot_idx = rng.gen_range(0..pot_intervals.len());
+        let [pot_lo, pot_hi] = pot_intervals[pot_idx];
+
+        // 2. Compute feasible pot range for this SPR
         let pot_min_f = if target_spr > 0.0 {
             (5.0 / target_spr).ceil()
         } else {
-            // SPR near 0 means stack near 0; pot must be large enough that max_stack >= 5
             (2.0 * (stack_f - 5.0)).ceil()
         };
         let pot_max_f = stack_f / (target_spr + 0.5);
 
         let feasible_lo = pot_min_f.max(1.0) as i32;
         let feasible_hi = pot_max_f as i32;
-        if feasible_lo > feasible_hi {
+
+        // 3. Intersect chosen pot bucket with feasible range
+        let lo = pot_lo.max(feasible_lo);
+        let hi = pot_hi.min(feasible_hi + 1); // pot_intervals use exclusive upper bound
+        if lo >= hi {
             continue;
         }
 
-        // 3. Collect pot intervals that overlap the feasible range, clipped
-        let mut segments: Vec<[i32; 2]> = Vec::new();
-        let mut total_width: i32 = 0;
-        for &[ilo, ihi] in pot_intervals {
-            let lo = ilo.max(feasible_lo);
-            let hi = ihi.min(feasible_hi + 1); // pot_intervals use exclusive upper bound
-            if lo < hi {
-                segments.push([lo, hi]);
-                total_width += hi - lo;
-            }
-        }
-        if total_width == 0 {
-            continue;
-        }
-
-        // 4. Sample uniformly across the clipped segments
-        let mut pick = rng.gen_range(0..total_width);
-        let mut pot = segments[0][0]; // fallback
-        for [lo, hi] in &segments {
-            let w = hi - lo;
-            if pick < w {
-                pot = lo + pick;
-                break;
-            }
-            pick -= w;
-        }
-
-        // 5. Derive stack from SPR
+        // 4. Sample pot, derive stack
+        let pot = rng.gen_range(lo..hi);
         let max_stack = initial_stack - pot / 2;
         if max_stack < 5 {
             continue;
@@ -160,6 +138,7 @@ fn sample_pot_stack_by_spr<R: Rng>(
         let target_stack = (target_spr * pot as f64).round() as i32;
         let stack = target_stack.clamp(5, max_stack);
 
+        // 5. Verify actual SPR lands in chosen bucket
         let actual_spr = stack as f64 / pot as f64;
         if actual_spr >= spr_lo && actual_spr < spr_hi {
             return (pot, stack);
@@ -447,6 +426,61 @@ mod tests {
                     assert_ne!(board[i], board[j], "duplicate cards in 5-card board");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn spr_and_pot_buckets_both_covered() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let pot_intervals = test_pot_intervals();
+        let spr_intervals = test_spr_intervals();
+        let num_spr = spr_intervals.len();
+        let num_pot = pot_intervals.len();
+        // 2D grid: cell[spr_idx][pot_idx]
+        let mut cell_hits = vec![vec![0u32; num_pot]; num_spr];
+
+        for _ in 0..5000 {
+            let (pot, stack) = sample_pot_stack_by_spr(
+                &pot_intervals, &spr_intervals, INITIAL_STACK, &mut rng,
+            );
+            let actual_spr = stack as f64 / pot as f64;
+            let spr_idx = spr_intervals.iter().position(|[lo, hi]| actual_spr >= *lo && actual_spr < *hi);
+            let pot_idx = pot_intervals.iter().position(|[lo, hi]| pot >= *lo && pot < *hi);
+            if let (Some(si), Some(pi)) = (spr_idx, pot_idx) {
+                cell_hits[si][pi] += 1;
+            }
+        }
+
+        // Check pot bucket marginals are roughly uniform (no bucket < 25% of max)
+        let mut pot_marginals = vec![0u32; num_pot];
+        for si in 0..num_spr {
+            for pi in 0..num_pot {
+                pot_marginals[pi] += cell_hits[si][pi];
+            }
+        }
+        let max_pot = *pot_marginals.iter().max().unwrap();
+        for (pi, &count) in pot_marginals.iter().enumerate() {
+            assert!(
+                count * 4 >= max_pot,
+                "pot bucket {} ({:?}) underrepresented: {} vs max {}",
+                pi, pot_intervals[pi], count, max_pot
+            );
+        }
+
+        // Check SPR bucket marginals are roughly uniform
+        let mut spr_marginals = vec![0u32; num_spr];
+        for si in 0..num_spr {
+            for pi in 0..num_pot {
+                spr_marginals[si] += cell_hits[si][pi];
+            }
+        }
+        let max_spr = *spr_marginals.iter().max().unwrap();
+        for (si, &count) in spr_marginals.iter().enumerate() {
+            assert!(
+                count * 4 >= max_spr,
+                "SPR bucket {} ({:?}) underrepresented: {} vs max {}",
+                si, spr_intervals[si], count, max_spr
+            );
         }
     }
 }
