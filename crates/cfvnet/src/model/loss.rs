@@ -56,14 +56,13 @@ pub fn cfvnet_loss<B: Backend>(
     target: Tensor<B, 2>,
     mask: Tensor<B, 2>,
     huber_delta: f64,
-    pot_weight: Option<Tensor<B, 1>>,
 ) -> Tensor<B, 1> {
     let pred_oop = pred.clone().narrow(1, 0, 1326);
     let pred_ip = pred.narrow(1, 1326, 1326);
     let tgt_oop = target.clone().narrow(1, 0, 1326);
     let tgt_ip = target.narrow(1, 1326, 1326);
-    let loss_oop = masked_huber_loss(pred_oop, tgt_oop, mask.clone(), huber_delta, pot_weight.clone());
-    let loss_ip = masked_huber_loss(pred_ip, tgt_ip, mask, huber_delta, pot_weight);
+    let loss_oop = masked_huber_loss(pred_oop, tgt_oop, mask.clone(), huber_delta, None);
+    let loss_ip = masked_huber_loss(pred_ip, tgt_ip, mask, huber_delta, None);
     loss_oop + loss_ip
 }
 
@@ -151,7 +150,7 @@ mod tests {
         let target = Tensor::<B, 2>::from_data(TensorData::new(target_data, [1, 2 * n]), &device);
         let mask = Tensor::<B, 2>::from_data(TensorData::new(mask_data.clone(), [1, n]), &device);
 
-        let loss = cfvnet_loss(pred, target, mask.clone(), 1.0, None);
+        let loss = cfvnet_loss(pred, target, mask.clone(), 1.0);
         let val: f32 = loss.into_scalar();
         assert!(val > 0.0, "dual player loss should be positive, got {val}");
 

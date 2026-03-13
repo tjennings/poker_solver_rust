@@ -38,4 +38,3 @@ training:
   checkpoint_every_n_epochs: 1
   gpu_chunk_size: 200000
   epochs_per_chunk: 15
-  pot_weighted_loss: true
