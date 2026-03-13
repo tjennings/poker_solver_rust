@@ -509,8 +509,13 @@ fn cmd_compare_exact(model_dir: PathBuf, num_spots: usize) {
     print_summary(&summary);
 }
 
-fn load_model_config(model_dir: &std::path::Path) -> cfvnet::config::CfvnetConfig {
-    let config_path = model_dir.join("config.yaml");
+fn load_model_config(model_path: &std::path::Path) -> cfvnet::config::CfvnetConfig {
+    let dir = if model_path.is_dir() {
+        model_path.to_path_buf()
+    } else {
+        model_path.parent().unwrap_or(model_path).to_path_buf()
+    };
+    let config_path = dir.join("config.yaml");
     let yaml = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
         eprintln!(
             "failed to read model config {}: {e}\n\
