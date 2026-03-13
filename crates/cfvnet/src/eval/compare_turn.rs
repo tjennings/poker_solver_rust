@@ -159,8 +159,10 @@ fn predict_with_model(
     let output = model.forward(input_tensor, range_oop, range_ip);
     let full_vec: Vec<f32> = output.into_data().to_vec::<f32>().expect("output tensor conversion");
     // Dual output: first 1326 = OOP CFVs, last 1326 = IP CFVs.
+    // Network outputs pot-relative CFVs; multiply by pot to get absolute values.
+    let pot_f32 = sit.pot as f32;
     let offset = if traverser == 0 { 0 } else { NET_NUM_COMBOS };
-    full_vec[offset..offset + NET_NUM_COMBOS].to_vec()
+    full_vec[offset..offset + NET_NUM_COMBOS].iter().map(|&v| v * pot_f32).collect()
 }
 
 /// Compare a single spot: model prediction vs ground truth.

@@ -186,10 +186,12 @@ where
             let out_vec: Vec<f32> = out_data.to_vec().expect("output tensor conversion");
             let cfv_offset = if traverser == 0 { 0 } else { NUM_COMBOS };
 
+            // Network outputs pot-relative CFVs; multiply by pot to get absolute values.
+            let pot_f32 = pot as f32;
             // Map 1326-indexed outputs back to solver combo order.
             for (i, &idx) in combo_indices.iter().enumerate() {
                 if valid_combo_mask[i] {
-                    cfv_sum[i] += f64::from(out_vec[cfv_offset + idx]);
+                    cfv_sum[i] += f64::from(out_vec[cfv_offset + idx] * pot_f32);
                     cfv_count[i] += 1;
                 }
             }
