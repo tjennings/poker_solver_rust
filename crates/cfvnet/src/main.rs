@@ -406,15 +406,18 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
         let mask: Vec<bool> = item.mask.iter().map(|&v| v > 0.5).collect();
         let pot = item.pot;
 
-        // Concatenate OOP + IP targets for full dual-output comparison.
-        let mut target: Vec<f32> = Vec::with_capacity(2652);
-        target.extend_from_slice(&item.oop_target);
-        target.extend_from_slice(&item.ip_target);
+        // Split dual output (2652) into OOP (first 1326) and IP (last 1326)
+        // to match the 1326-element mask.
+        let pred_oop = &pred_vec[..1326];
+        let pred_ip = &pred_vec[1326..];
 
-        let metrics = compute_prediction_metrics(&pred_vec, &target, &mask, pot);
-        total_mae += metrics.mae;
-        total_max_error += metrics.max_error;
-        total_mbb += metrics.mbb_error;
+        let metrics_oop = compute_prediction_metrics(pred_oop, &item.oop_target, &mask, pot);
+        let metrics_ip = compute_prediction_metrics(pred_ip, &item.ip_target, &mask, pot);
+
+        // Average OOP and IP metrics for overall evaluation.
+        total_mae += (metrics_oop.mae + metrics_ip.mae) / 2.0;
+        total_max_error += f64::max(metrics_oop.max_error, metrics_ip.max_error);
+        total_mbb += (metrics_oop.mbb_error + metrics_ip.mbb_error) / 2.0;
         count += 1;
     }
 
@@ -484,7 +487,9 @@ fn cmd_compare(
             &device,
         );
         let pred = model.forward(input, range_oop, range_ip);
-        pred.into_data().to_vec::<f32>().unwrap()
+        let all_cfvs = pred.into_data().to_vec::<f32>().unwrap();
+        // Return only OOP CFVs (first 1326) for comparison against solver OOP EVs.
+        all_cfvs[..1326].to_vec()
     })
     .unwrap_or_else(|e| {
         eprintln!("comparison failed: {e}");
