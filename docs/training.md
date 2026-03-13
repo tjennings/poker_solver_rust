@@ -159,10 +159,10 @@ The `training` section of the YAML config controls the network architecture and 
 | `aux_loss_weight` | 1.0 | Weight for auxiliary game-value loss |
 | `validation_split` | 0.05 | Fraction of data reserved for validation |
 | `checkpoint_every_n_epochs` | 1000 | Save checkpoint every N epochs (0 = disabled) |
-| `reservoir_size` | 1500000 | Number of training records held in the GPU-resident reservoir |
-| `reservoir_turnover` | 1.0 | Fraction of reservoir replaced per epoch by background refresh (0 = no refresh) |
+| `shuffle_buffer_size` | 262144 | Number of records loaded into the shuffle buffer by the background dataloader |
+| `prefetch_depth` | 4 | Number of pre-encoded batches buffered in the channel ahead of the training loop |
 
-The training loop uses a **GPU-resident reservoir**: `reservoir_size` records are loaded into GPU memory as tensors, and mini-batches are sampled directly on-device (zero PCIe transfer). A background thread continuously reads fresh records from disk and scatters them into random reservoir positions. Set `reservoir_turnover` to 0 to disable refresh (useful for small datasets that fit entirely in the reservoir). Values above 1.0 mean the full reservoir is replaced more than once per epoch.
+The training loop uses a **streaming dataloader**: a background thread reads `shuffle_buffer_size` records from disk, shuffles them, splits into `batch_size` chunks, encodes each chunk, and sends them through a bounded channel with `prefetch_depth` slots. The training loop consumes batches by blocking on the channel. On EOF the reader resets and loops, so training always has data available. Increase `shuffle_buffer_size` for better randomization; increase `prefetch_depth` to keep the GPU fed when I/O is slow.
 
 #### Evaluate on Held-Out Data
 
