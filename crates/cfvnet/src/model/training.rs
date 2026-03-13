@@ -186,7 +186,7 @@ impl<B: Backend> GpuReservoir<B> {
     /// Scatter a batch of new pre-encoded records into random reservoir positions.
     fn scatter_refresh(
         &mut self,
-        encoded: &PreEncoded,
+        encoded: PreEncoded,
         rng: &mut ChaCha8Rng,
         device: &B::Device,
     ) {
@@ -202,23 +202,23 @@ impl<B: Backend> GpuReservoir<B> {
 
         // Create new-value tensors from the encoded data.
         let new_input: Tensor<B, 2> = Tensor::from_data(
-            TensorData::new(encoded.input.clone(), [n, self.in_size]),
+            TensorData::new(encoded.input, [n, self.in_size]),
             device,
         );
         let new_target: Tensor<B, 2> = Tensor::from_data(
-            TensorData::new(encoded.target.clone(), [n, OUTPUT_SIZE]),
+            TensorData::new(encoded.target, [n, OUTPUT_SIZE]),
             device,
         );
         let new_mask: Tensor<B, 2> = Tensor::from_data(
-            TensorData::new(encoded.mask.clone(), [n, OUTPUT_SIZE]),
+            TensorData::new(encoded.mask, [n, OUTPUT_SIZE]),
             device,
         );
         let new_range: Tensor<B, 2> = Tensor::from_data(
-            TensorData::new(encoded.range.clone(), [n, OUTPUT_SIZE]),
+            TensorData::new(encoded.range, [n, OUTPUT_SIZE]),
             device,
         );
         let new_gv: Tensor<B, 1> = Tensor::from_data(
-            TensorData::new(encoded.game_value.clone(), [n]),
+            TensorData::new(encoded.game_value, [n]),
             device,
         );
 
@@ -573,7 +573,7 @@ pub fn train<B: AutodiffBackend>(
         for step_in_epoch in 0..steps_per_epoch {
             // Apply any pending refresh batch (non-blocking).
             if let Ok(encoded) = refresh_rx.try_recv() {
-                reservoir.scatter_refresh(&encoded, &mut rng, device);
+                reservoir.scatter_refresh(encoded, &mut rng, device);
             }
 
             // Sample batch from reservoir and train.
@@ -1019,7 +1019,7 @@ mod tests {
         let records = reader2.read_chunk(3);
         let encoded = PreEncoded::from_records(&records, 5);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        reservoir.scatter_refresh(&encoded, &mut rng, &device);
+        reservoir.scatter_refresh(encoded, &mut rng, &device);
         // No panic = success. Reservoir still works.
         let batch = reservoir.sample_batch(4, &mut rng, &device);
         assert_eq!(batch.input.dims(), [4, input_size(5)]);
