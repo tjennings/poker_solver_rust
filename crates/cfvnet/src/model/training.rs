@@ -309,28 +309,63 @@ fn count_total_records(files: &[PathBuf]) -> u64 {
     total
 }
 
-/// Load a model from checkpoint if it exists, otherwise return the model as-is.
+/// Load the latest checkpoint from `output_dir` if one exists.
+///
+/// Scans for `checkpoint_epochN.mpk.gz` files and picks the highest N.
+/// Falls back to `model.mpk.gz` if no numbered checkpoints exist.
+/// Returns `(model, start_epoch)` where `start_epoch` is the epoch to
+/// resume from (0 if starting fresh).
 fn load_or_create_model<B: AutodiffBackend>(
     model: CfvNet<B>,
     output_dir: Option<&Path>,
     device: &B::Device,
-) -> CfvNet<B> {
-    let Some(dir) = output_dir else { return model };
-    let model_path = dir.join("model");
-    if !model_path.with_extension("mpk.gz").exists() {
-        return model;
-    }
+) -> (CfvNet<B>, usize) {
+    let Some(dir) = output_dir else { return (model, 0) };
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
-    match model.clone().load_file(model_path, &recorder, device) {
-        Ok(loaded) => {
-            eprintln!("Resuming from checkpoint");
-            loaded
+
+    // Scan for checkpoint_epochN.mpk.gz and find the highest N.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut best_epoch = 0usize;
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(rest) = name.strip_prefix("checkpoint_epoch") {
+                if let Some(n_str) = rest.strip_suffix(".mpk.gz") {
+                    if let Ok(n) = n_str.parse::<usize>() {
+                        best_epoch = best_epoch.max(n);
+                    }
+                }
+            }
         }
-        Err(e) => {
-            eprintln!("Warning: failed to load checkpoint, starting fresh: {e}");
-            model
+        if best_epoch > 0 {
+            let ckpt_path = dir.join(format!("checkpoint_epoch{best_epoch}"));
+            match model.clone().load_file(ckpt_path, &recorder, device) {
+                Ok(loaded) => {
+                    eprintln!("Resuming from checkpoint epoch {best_epoch}");
+                    return (loaded, best_epoch);
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to load checkpoint epoch {best_epoch}: {e}");
+                }
+            }
         }
     }
+
+    // Fall back to model.mpk.gz.
+    let model_path = dir.join("model");
+    if model_path.with_extension("mpk.gz").exists() {
+        match model.clone().load_file(model_path, &recorder, device) {
+            Ok(loaded) => {
+                eprintln!("Resuming from saved model");
+                return (loaded, 0);
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to load model, starting fresh: {e}");
+            }
+        }
+    }
+
+    (model, 0)
 }
 
 /// Load validation records and return them pre-encoded.
@@ -432,7 +467,7 @@ pub fn train<B: AutodiffBackend>(
 ) -> TrainResult {
     let in_size = input_size(board_cards);
     let model = CfvNet::<B>::new(device, config.hidden_layers, config.hidden_size, in_size);
-    let mut model = load_or_create_model(model, output_dir, device);
+    let (mut model, start_epoch) = load_or_create_model(model, output_dir, device);
 
     let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
 
@@ -460,9 +495,15 @@ pub fn train<B: AutodiffBackend>(
     let steps_per_epoch = train_records.div_ceil(batch_size);
     let total_steps = steps_per_epoch * config.epochs;
 
+    if start_epoch >= config.epochs {
+        eprintln!("Already completed {start_epoch}/{} epochs, nothing to do.", config.epochs);
+        return TrainResult { final_train_loss: f32::MAX };
+    }
+
+    let remaining_epochs = config.epochs - start_epoch;
     eprintln!(
-        "Training: {} epochs x {} steps/epoch = {} total steps",
-        config.epochs, steps_per_epoch, total_steps
+        "Training: epochs {}-{} ({remaining_epochs} remaining) x {} steps/epoch = {} total steps",
+        start_epoch + 1, config.epochs, steps_per_epoch, total_steps
     );
 
     let (data_rx, loader_threads) = spawn_dataloader_thread(
@@ -473,9 +514,9 @@ pub fn train<B: AutodiffBackend>(
     );
 
     let mut final_loss = f32::MAX;
-    let mut global_step: usize = 0;
+    let mut global_step: usize = start_epoch * steps_per_epoch;
 
-    for epoch in 0..config.epochs {
+    for epoch in start_epoch..config.epochs {
         let pb = ProgressBar::new(steps_per_epoch as u64);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -711,6 +752,51 @@ mod tests {
         let r2 = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(r1.final_train_loss < 10.0);
         assert!(r2.final_train_loss < 10.0);
+    }
+
+    #[test]
+    fn train_resumes_from_numbered_checkpoint() {
+        let file = write_test_data(16);
+        let dir = tempfile::tempdir().unwrap();
+        let device = Default::default();
+
+        // Train 4 epochs with checkpoints every 2.
+        let config = TrainConfig {
+            epochs: 4,
+            checkpoint_every_n_epochs: 2,
+            ..default_test_config()
+        };
+        train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
+        assert!(dir.path().join("checkpoint_epoch4.mpk.gz").exists());
+
+        // Resume with 6 total epochs — should pick up from epoch 4.
+        let config2 = TrainConfig {
+            epochs: 6,
+            checkpoint_every_n_epochs: 2,
+            ..default_test_config()
+        };
+        let r2 = train::<B>(&device, file.path(), 5, &config2, Some(dir.path()));
+        assert!(r2.final_train_loss < 10.0);
+        assert!(dir.path().join("checkpoint_epoch6.mpk.gz").exists());
+    }
+
+    #[test]
+    fn train_skips_when_already_complete() {
+        let file = write_test_data(16);
+        let dir = tempfile::tempdir().unwrap();
+        let device = Default::default();
+
+        // Train 4 epochs with checkpoints every 2.
+        let config = TrainConfig {
+            epochs: 4,
+            checkpoint_every_n_epochs: 2,
+            ..default_test_config()
+        };
+        train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
+
+        // Run again with same epoch count — should detect completion.
+        let r2 = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
+        assert_eq!(r2.final_train_loss, f32::MAX);
     }
 
     #[test]
