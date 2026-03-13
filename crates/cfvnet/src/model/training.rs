@@ -617,7 +617,6 @@ mod tests {
         let device = Default::default();
         let config = TrainConfig {
             epochs: 200,
-            reservoir_turnover: 0.0,
             ..default_test_config()
         };
 
@@ -709,39 +708,37 @@ mod tests {
     }
 
     #[test]
-    fn reservoir_training_reduces_loss() {
+    fn training_reduces_loss() {
         let file = write_test_data(16);
         let device = Default::default();
         let config = TrainConfig {
             epochs: 200,
-            reservoir_size: 16,
-            reservoir_turnover: 0.0,
             ..default_test_config()
         };
         let result = train::<B>(&device, file.path(), 5, &config, None);
         assert!(
             result.final_train_loss < 0.05,
-            "reservoir training should reduce loss, got {}",
+            "training should reduce loss, got {}",
             result.final_train_loss
         );
     }
 
     #[test]
-    fn training_with_refresh() {
-        // Use more data than reservoir_size to exercise the refresh path.
+    fn training_with_streaming() {
+        // Use more data than shuffle_buffer_size to exercise the streaming path.
         let file = write_test_data(64);
         let device = Default::default();
         let config = TrainConfig {
             batch_size: 8,
             epochs: 5,
-            reservoir_size: 16, // smaller than data -> refresh thread runs
-            reservoir_turnover: 2.0,
+            shuffle_buffer_size: 16,
+            prefetch_depth: 2,
             ..default_test_config()
         };
         let result = train::<B>(&device, file.path(), 5, &config, None);
         assert!(
             result.final_train_loss < 10.0,
-            "training with refresh should produce reasonable loss, got {}",
+            "training with streaming should produce reasonable loss, got {}",
             result.final_train_loss
         );
     }
@@ -831,74 +828,4 @@ mod tests {
         assert_eq!(all.len(), 5);
     }
 
-    #[test]
-    fn reservoir_fill_and_sample() {
-        let file = write_test_data(20);
-        let device = Default::default();
-        let files = collect_data_files(file.path()).unwrap();
-
-        // Reservoir uses inner (non-autodiff) backend to avoid graph accumulation.
-        let mut reservoir = GpuReservoir::<NdArray>::new(&device, 20, 5);
-        let mut reader = StreamingReader::new(files);
-        let filled = reservoir.fill(&mut reader, 5);
-        assert_eq!(filled, 20);
-
-        // Sample a batch -- should not panic, should return correct shapes.
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let batch = reservoir.sample_batch(4, &mut rng, &device);
-        assert_eq!(batch.input.dims(), [4, input_size(5)]);
-        assert_eq!(batch.target.dims(), [4, OUTPUT_SIZE]);
-    }
-
-    #[test]
-    fn reservoir_scatter_refresh() {
-        let file = write_test_data(20);
-        let device = Default::default();
-        let files = collect_data_files(file.path()).unwrap();
-
-        // Reservoir uses inner (non-autodiff) backend to avoid graph accumulation.
-        let mut reservoir = GpuReservoir::<NdArray>::new(&device, 10, 5);
-        let mut reader = StreamingReader::new(files);
-        reservoir.fill(&mut reader, 5);
-
-        // Read some more records and scatter them in.
-        let mut reader2 = StreamingReader::new(vec![file.path().to_path_buf()]);
-        let records = reader2.read_chunk(3);
-        let encoded = PreEncoded::from_records(&records, 5);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
-        reservoir.scatter_refresh(encoded, &mut rng, &device);
-        // No panic = success. Reservoir still works.
-        let batch = reservoir.sample_batch(4, &mut rng, &device);
-        assert_eq!(batch.input.dims(), [4, input_size(5)]);
-    }
-
-    #[test]
-    fn reservoir_sample_converts_to_autodiff() {
-        // Verify that inner-backend reservoir batches can be lifted to autodiff
-        // tensors via from_inner, which is the pattern used in the training loop
-        // to avoid graph accumulation in the reservoir.
-        let file = write_test_data(20);
-        let device = Default::default();
-        let files = collect_data_files(file.path()).unwrap();
-
-        let mut reservoir = GpuReservoir::<NdArray>::new(&device, 20, 5);
-        let mut reader = StreamingReader::new(files);
-        reservoir.fill(&mut reader, 5);
-
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let batch = reservoir.sample_batch(4, &mut rng, &device);
-
-        // Convert each tensor to autodiff -- this is what train() does.
-        let input = Tensor::<B, 2>::from_inner(batch.input);
-        let target = Tensor::<B, 2>::from_inner(batch.target);
-        let mask = Tensor::<B, 2>::from_inner(batch.mask);
-        let range = Tensor::<B, 2>::from_inner(batch.range);
-        let game_value = Tensor::<B, 1>::from_inner(batch.game_value);
-
-        assert_eq!(input.dims(), [4, input_size(5)]);
-        assert_eq!(target.dims(), [4, OUTPUT_SIZE]);
-        assert_eq!(mask.dims(), [4, OUTPUT_SIZE]);
-        assert_eq!(range.dims(), [4, OUTPUT_SIZE]);
-        assert_eq!(game_value.dims(), [4]);
-    }
 }
