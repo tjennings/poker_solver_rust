@@ -38,7 +38,6 @@ pub struct TrainConfig {
     pub gpu_chunk_size: usize,
     pub epochs_per_chunk: usize,
     pub prefetch_chunks: usize,
-    pub pot_weighted_loss: bool,
 }
 
 /// Result returned after training completes.
@@ -53,7 +52,6 @@ struct PreEncoded {
     mask: Vec<f32>,
     oop_range: Vec<f32>,
     ip_range: Vec<f32>,
-    pot: Vec<f32>,
     in_size: usize,
     len: usize,
 }
@@ -78,7 +76,6 @@ impl PreEncoded {
         let mut mask = Vec::with_capacity(n * MASK_SIZE);
         let mut oop_range = Vec::with_capacity(n * NUM_COMBOS);
         let mut ip_range = Vec::with_capacity(n * NUM_COMBOS);
-        let mut pot = Vec::with_capacity(n);
 
         for item in &items {
             input.extend_from_slice(&item.input);
@@ -88,10 +85,9 @@ impl PreEncoded {
             mask.extend_from_slice(&item.mask);
             oop_range.extend_from_slice(&item.oop_range);
             ip_range.extend_from_slice(&item.ip_range);
-            pot.push(item.pot);
         }
 
-        Self { input, target, mask, oop_range, ip_range, pot, in_size, len: n }
+        Self { input, target, mask, oop_range, ip_range, in_size, len: n }
     }
 
     /// Consume self and create tensors on `device`, avoiding copies.
@@ -104,7 +100,6 @@ impl PreEncoded {
             mask: Tensor::from_data(TensorData::new(self.mask, [n, MASK_SIZE]), device),
             oop_range: Tensor::from_data(TensorData::new(self.oop_range, [n, NUM_COMBOS]), device),
             ip_range: Tensor::from_data(TensorData::new(self.ip_range, [n, NUM_COMBOS]), device),
-            pot: Tensor::from_data(TensorData::new(self.pot, [n]), device),
             len: n,
         }
     }
@@ -119,7 +114,6 @@ impl PreEncoded {
             mask: Tensor::from_data(TensorData::new(self.mask.clone(), [n, MASK_SIZE]), device),
             oop_range: Tensor::from_data(TensorData::new(self.oop_range.clone(), [n, NUM_COMBOS]), device),
             ip_range: Tensor::from_data(TensorData::new(self.ip_range.clone(), [n, NUM_COMBOS]), device),
-            pot: Tensor::from_data(TensorData::new(self.pot.clone(), [n]), device),
             len: n,
         }
     }
@@ -138,7 +132,6 @@ impl PreEncoded {
         let mut mask = Vec::with_capacity(n * MASK_SIZE);
         let mut oop_range = Vec::with_capacity(n * NUM_COMBOS);
         let mut ip_range = Vec::with_capacity(n * NUM_COMBOS);
-        let mut pot = Vec::with_capacity(n);
 
         for &idx in indices {
             let i_start = idx * in_size;
@@ -150,7 +143,6 @@ impl PreEncoded {
             let r_start = idx * NUM_COMBOS;
             oop_range.extend_from_slice(&self.oop_range[r_start..r_start + NUM_COMBOS]);
             ip_range.extend_from_slice(&self.ip_range[r_start..r_start + NUM_COMBOS]);
-            pot.push(self.pot[idx]);
         }
 
         ChunkTensors {
@@ -159,7 +151,6 @@ impl PreEncoded {
             mask: Tensor::from_data(TensorData::new(mask, [n, MASK_SIZE]), device),
             oop_range: Tensor::from_data(TensorData::new(oop_range, [n, NUM_COMBOS]), device),
             ip_range: Tensor::from_data(TensorData::new(ip_range, [n, NUM_COMBOS]), device),
-            pot: Tensor::from_data(TensorData::new(pot, [n]), device),
             len: n,
         }
     }
@@ -172,7 +163,6 @@ struct ChunkTensors<B: Backend> {
     mask: Tensor<B, 2>,
     oop_range: Tensor<B, 2>,
     ip_range: Tensor<B, 2>,
-    pot: Tensor<B, 1>,
     len: usize,
 }
 
@@ -184,8 +174,7 @@ impl<B: Backend> ChunkTensors<B> {
             target: self.target.clone().select(0, perm.clone()),
             mask: self.mask.clone().select(0, perm.clone()),
             oop_range: self.oop_range.clone().select(0, perm.clone()),
-            ip_range: self.ip_range.clone().select(0, perm.clone()),
-            pot: self.pot.clone().select(0, perm),
+            ip_range: self.ip_range.clone().select(0, perm),
             len: self.len,
         }
     }
@@ -199,7 +188,6 @@ impl<B: Backend> ChunkTensors<B> {
             mask: self.mask.clone().narrow(0, start, len),
             oop_range: self.oop_range.clone().narrow(0, start, len),
             ip_range: self.ip_range.clone().narrow(0, start, len),
-            pot: self.pot.clone().narrow(0, start, len),
         }
     }
 }
@@ -211,7 +199,6 @@ struct MiniBatch<B: Backend> {
     mask: Tensor<B, 2>,
     oop_range: Tensor<B, 2>,
     ip_range: Tensor<B, 2>,
-    pot: Tensor<B, 1>,
 }
 
 /// Cosine annealing learning rate schedule.
@@ -245,17 +232,11 @@ fn compute_val_loss<B: AutodiffBackend>(
         let batch = chunk.slice_batch(batch_start, batch_end);
 
         let pred = valid_model.forward(batch.input, batch.oop_range, batch.ip_range);
-        let pot_w = if config.pot_weighted_loss {
-            Some(batch.pot)
-        } else {
-            None
-        };
         let loss = cfvnet_loss(
             pred,
             batch.target,
             batch.mask,
             config.huber_delta,
-            pot_w,
         );
 
         // INVARIANT: loss is shape [1], so to_vec always has exactly one element.
@@ -609,17 +590,11 @@ pub fn train<B: AutodiffBackend>(
                         let batch = shuffled.slice_batch(start, end);
 
                         let pred = model.forward(batch.input, batch.oop_range, batch.ip_range);
-                        let pot_w = if config.pot_weighted_loss {
-                            Some(batch.pot)
-                        } else {
-                            None
-                        };
                         let loss = cfvnet_loss(
                             pred,
                             batch.target,
                             batch.mask,
                             config.huber_delta,
-                            pot_w,
                         );
 
                         // Only read loss from GPU every LOSS_READ_INTERVAL batches
@@ -737,7 +712,7 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
             prefetch_chunks: 1,
-            pot_weighted_loss: false,
+
         };
 
         let result = train::<B>(&device, file.path(), 5, &config, None);
@@ -767,7 +742,7 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
             prefetch_chunks: 1,
-            pot_weighted_loss: false,
+
         };
         let result = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(result.final_train_loss < 1.0);
@@ -796,7 +771,7 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
             prefetch_chunks: 1,
-            pot_weighted_loss: false,
+
         };
         train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(dir.path().join("checkpoint_epoch2.mpk.gz").exists());
@@ -824,7 +799,7 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
             prefetch_chunks: 1,
-            pot_weighted_loss: false,
+
         };
 
         let result = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
@@ -851,7 +826,7 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
             prefetch_chunks: 1,
-            pot_weighted_loss: false,
+
         };
         let r1 = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         let r2 = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
@@ -893,7 +868,7 @@ mod tests {
             gpu_chunk_size: 8,
             epochs_per_chunk: 2,
             prefetch_chunks: 1,
-            pot_weighted_loss: false,
+
         };
         let result = train::<B>(&device, file.path(), 5, &config, None);
         assert!(result.final_train_loss < 10.0);
@@ -944,7 +919,7 @@ mod tests {
             gpu_chunk_size: 10, // smaller than a file, forces cross-file chunking
             epochs_per_chunk: 1,
             prefetch_chunks: 1,
-            pot_weighted_loss: false,
+
         };
 
         let result = train::<B>(&device, dir.path(), 5, &config, None);

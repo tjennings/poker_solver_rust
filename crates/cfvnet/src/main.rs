@@ -210,7 +210,6 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         gpu_chunk_size: cfg.training.gpu_chunk_size,
         epochs_per_chunk: cfg.training.epochs_per_chunk,
         prefetch_chunks: cfg.training.prefetch_chunks,
-        pot_weighted_loss: cfg.training.pot_weighted_loss,
     };
 
     // Ensure output directory exists before writing config.
@@ -410,15 +409,17 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
         let pred_vec: Vec<f32> = pred.into_data().to_vec::<f32>().unwrap();
 
         let mask: Vec<bool> = item.mask.iter().map(|&v| v > 0.5).collect();
-        let pot = item.pot;
+        let pot_f32 = item.pot;
 
-        // Split dual output (2652) into OOP (first 1326) and IP (last 1326)
-        // to match the 1326-element mask.
-        let pred_oop = &pred_vec[..1326];
-        let pred_ip = &pred_vec[1326..];
+        // Network outputs pot-relative CFVs; multiply by pot to get absolute values.
+        // Targets are also pot-relative; convert back to absolute for metric comparison.
+        let pred_oop: Vec<f32> = pred_vec[..1326].iter().map(|&v| v * pot_f32).collect();
+        let pred_ip: Vec<f32> = pred_vec[1326..].iter().map(|&v| v * pot_f32).collect();
+        let tgt_oop: Vec<f32> = item.oop_target.iter().map(|&v| v * pot_f32).collect();
+        let tgt_ip: Vec<f32> = item.ip_target.iter().map(|&v| v * pot_f32).collect();
 
-        let metrics_oop = compute_prediction_metrics(pred_oop, &item.oop_target, &mask, pot);
-        let metrics_ip = compute_prediction_metrics(pred_ip, &item.ip_target, &mask, pot);
+        let metrics_oop = compute_prediction_metrics(&pred_oop, &tgt_oop, &mask, pot_f32);
+        let metrics_ip = compute_prediction_metrics(&pred_ip, &tgt_ip, &mask, pot_f32);
 
         // Average OOP and IP metrics for overall evaluation.
         total_mae += (metrics_oop.mae + metrics_ip.mae) / 2.0;
@@ -494,8 +495,10 @@ fn cmd_compare(
         );
         let pred = model.forward(input, range_oop, range_ip);
         let all_cfvs = pred.into_data().to_vec::<f32>().unwrap();
+        // Network outputs pot-relative CFVs; multiply by pot to get absolute values.
+        let pot = sit.pot as f32;
         // Return only OOP CFVs (first 1326) for comparison against solver OOP EVs.
-        all_cfvs[..1326].to_vec()
+        all_cfvs[..1326].iter().map(|&v| v * pot).collect()
     })
     .unwrap_or_else(|e| {
         eprintln!("comparison failed: {e}");

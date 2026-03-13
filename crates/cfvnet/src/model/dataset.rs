@@ -8,7 +8,7 @@ use crate::model::network::{input_size, INPUT_SIZE};
 /// A single training item with encoded input and dual-player targets.
 #[derive(Debug, Clone)]
 pub struct CfvItem {
-    pub input: Vec<f32>,       // length INPUT_SIZE (2706)
+    pub input: Vec<f32>,       // length INPUT_SIZE (2705)
     pub oop_target: Vec<f32>,  // length NUM_COMBOS (1326) — OOP target CFVs
     pub ip_target: Vec<f32>,   // length NUM_COMBOS (1326) — IP target CFVs
     pub mask: Vec<f32>,        // length NUM_COMBOS — 1.0 valid, 0.0 masked
@@ -126,7 +126,7 @@ impl CfvDataset {
 /// rather than a raw `TrainingRecord`, making it usable at inference time
 /// when no stored record exists.
 ///
-/// Layout: `[OOP_range(1326), IP_range(1326), board_one_hot(52), pot(1), stack(1)]`
+/// Layout: `[OOP_range(1326), IP_range(1326), board_one_hot(52), SPR(1)]`
 pub fn encode_situation_for_inference(sit: &Situation) -> Vec<f32> {
     let in_size = INPUT_SIZE;
     let mut input = Vec::with_capacity(in_size);
@@ -140,10 +140,11 @@ pub fn encode_situation_for_inference(sit: &Situation) -> Vec<f32> {
         board_one_hot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_one_hot);
-    // Pot (normalized by max pot)
-    input.push(sit.pot as f32 / 400.0);
-    // Effective stack (normalized by max stack)
-    input.push(sit.effective_stack as f32 / 400.0);
+    // pot / effective_stack (matches Supremus pot/starting_chips convention)
+    let pot = sit.pot as f32;
+    let stack = sit.effective_stack as f32;
+    let spr = if stack > 0.0 { pot / stack } else { 0.0 };
+    input.push(spr);
     debug_assert_eq!(input.len(), in_size);
     input
 }
@@ -162,16 +163,16 @@ pub(crate) fn encode_record(rec: &TrainingRecord, board_cards: usize) -> CfvItem
         board_one_hot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_one_hot);
-    // Pot (normalized by max pot)
-    input.push(rec.pot / 400.0);
-    // Effective stack (normalized by max stack)
-    input.push(rec.effective_stack / 400.0);
+    // pot / effective_stack (matches Supremus pot/starting_chips convention)
+    let spr = if rec.effective_stack > 0.0 { rec.pot / rec.effective_stack } else { 0.0 };
+    input.push(spr);
 
     debug_assert_eq!(input.len(), in_size);
 
-    // Both players' CFVs directly from the record.
-    let oop_target = rec.oop_cfvs.to_vec();
-    let ip_target = rec.ip_cfvs.to_vec();
+    // Both players' CFVs normalized to pot-relative units.
+    let pot_inv = if rec.pot > 0.0 { 1.0 / rec.pot } else { 0.0 };
+    let oop_target: Vec<f32> = rec.oop_cfvs.iter().map(|&v| v * pot_inv).collect();
+    let ip_target: Vec<f32> = rec.ip_cfvs.iter().map(|&v| v * pot_inv).collect();
 
     let mask: Vec<f32> = rec.valid_mask.iter()
         .map(|&v| if v != 0 { 1.0 } else { 0.0 })
@@ -276,13 +277,11 @@ mod tests {
         assert!((item.input[board_start + 1]).abs() < 1e-6);
         assert!((item.input[board_start + 51]).abs() < 1e-6);
 
-        // Pot = 100 / 400 = 0.25, at index 2652 + 52 = 2704
-        assert!((item.input[2704] - 0.25).abs() < 1e-6);
-        // Stack = 50 / 400 = 0.125, at index 2705
-        assert!((item.input[2705] - 0.125).abs() < 1e-6);
+        // pot/stack = 100 / 50 = 2.0, at index 2652 + 52 = 2704
+        assert!((item.input[2704] - 2.0).abs() < 1e-6);
 
         assert_eq!(item.input.len(), INPUT_SIZE);
-        assert_eq!(item.input.len(), 2706);
+        assert_eq!(item.input.len(), 2705);
     }
 
     #[test]
@@ -301,7 +300,8 @@ mod tests {
         // Card 16 NOT encoded (only 4 board cards)
         assert!((item.input[board_start + 16]).abs() < 1e-6);
 
-        assert!((item.input[2704] - 0.25).abs() < 1e-6);
+        // pot/stack = 100 / 50 = 2.0, at index 2704
+        assert!((item.input[2704] - 2.0).abs() < 1e-6);
     }
 
     #[test]
@@ -309,13 +309,16 @@ mod tests {
         let file = write_test_data(3);
         let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
 
+        // Targets are pot-relative: raw_cfv / pot.
+        // Record i=1: oop_cfvs[0]=0.01, pot=100 → 0.01/100=0.0001
         let item1 = dataset.get(1).unwrap();
-        assert!((item1.oop_target[0] - 0.01).abs() < 1e-6);
-        assert!((item1.ip_target[0] - (-0.01)).abs() < 1e-6);
+        assert!((item1.oop_target[0] - 0.0001).abs() < 1e-8);
+        assert!((item1.ip_target[0] - (-0.0001)).abs() < 1e-8);
 
+        // Record i=2: oop_cfvs[0]=0.02, pot=100 → 0.02/100=0.0002
         let item2 = dataset.get(2).unwrap();
-        assert!((item2.oop_target[0] - 0.02).abs() < 1e-6);
-        assert!((item2.ip_target[0] - (-0.02)).abs() < 1e-6);
+        assert!((item2.oop_target[0] - 0.0002).abs() < 1e-8);
+        assert!((item2.ip_target[0] - (-0.0002)).abs() < 1e-8);
     }
 
     #[test]
@@ -339,7 +342,7 @@ mod tests {
         let item = dataset.get(0).unwrap();
 
         assert_eq!(item.input.len(), INPUT_SIZE);
-        assert_eq!(INPUT_SIZE, 2706);
+        assert_eq!(INPUT_SIZE, 2705);
     }
 
     fn write_test_data_to(path: &Path, n: usize) {

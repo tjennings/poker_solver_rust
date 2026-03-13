@@ -139,8 +139,11 @@ fn predict_with_model(
         board_one_hot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_one_hot);
-    input.push(sit.pot as f32 / 400.0);
-    input.push(sit.effective_stack as f32 / 400.0);
+    // pot / effective_stack (matches Supremus convention)
+    let pot_f32 = sit.pot as f32;
+    let stack_f32 = sit.effective_stack as f32;
+    let spr = if stack_f32 > 0.0 { pot_f32 / stack_f32 } else { 0.0 };
+    input.push(spr);
     debug_assert_eq!(input.len(), in_size);
 
     let data = TensorData::new(input, [1, in_size]);
@@ -156,8 +159,10 @@ fn predict_with_model(
     let output = model.forward(input_tensor, range_oop, range_ip);
     let full_vec: Vec<f32> = output.into_data().to_vec::<f32>().expect("output tensor conversion");
     // Dual output: first 1326 = OOP CFVs, last 1326 = IP CFVs.
+    // Network outputs pot-relative CFVs; multiply by pot to get absolute values.
+    let pot_f32 = sit.pot as f32;
     let offset = if traverser == 0 { 0 } else { NET_NUM_COMBOS };
-    full_vec[offset..offset + NET_NUM_COMBOS].to_vec()
+    full_vec[offset..offset + NET_NUM_COMBOS].iter().map(|&v| v * pot_f32).collect()
 }
 
 /// Compare a single spot: model prediction vs ground truth.

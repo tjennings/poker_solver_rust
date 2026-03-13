@@ -66,12 +66,11 @@ impl<B: Backend> RiverNetEvaluator<B> {
 
 /// Build the input vector for a single river board evaluation.
 ///
-/// Layout (2706 floats):
+/// Layout (2705 floats):
 ///   [0..1326)     — OOP range (1326 combo probabilities)
 ///   [1326..2652)  — IP range (1326 combo probabilities)
 ///   [2652..2704)  — board 52-dim one-hot
-///   [2704]        — pot / 400.0
-///   [2705]        — effective_stack / 400.0
+///   [2704]        — pot / effective_stack
 fn build_input(
     oop_1326: &[f32; OUTPUT_SIZE],
     ip_1326: &[f32; OUTPUT_SIZE],
@@ -88,8 +87,8 @@ fn build_input(
         board_one_hot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_one_hot);
-    input.push(pot as f32 / 400.0);
-    input.push(effective_stack as f32 / 400.0);
+    let spr = if effective_stack > 0.0 { pot as f32 / effective_stack as f32 } else { 0.0 };
+    input.push(spr);
     debug_assert_eq!(input.len(), in_size);
     input
 }
@@ -187,10 +186,12 @@ where
             let out_vec: Vec<f32> = out_data.to_vec().expect("output tensor conversion");
             let cfv_offset = if traverser == 0 { 0 } else { NUM_COMBOS };
 
+            // Network outputs pot-relative CFVs; multiply by pot to get absolute values.
+            let pot_f32 = pot as f32;
             // Map 1326-indexed outputs back to solver combo order.
             for (i, &idx) in combo_indices.iter().enumerate() {
                 if valid_combo_mask[i] {
-                    cfv_sum[i] += f64::from(out_vec[cfv_offset + idx]);
+                    cfv_sum[i] += f64::from(out_vec[cfv_offset + idx] * pot_f32);
                     cfv_count[i] += 1;
                 }
             }
