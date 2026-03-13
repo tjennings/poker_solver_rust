@@ -169,9 +169,10 @@ pub(crate) fn encode_record(rec: &TrainingRecord, board_cards: usize) -> CfvItem
 
     debug_assert_eq!(input.len(), in_size);
 
-    // Both players' CFVs directly from the record.
-    let oop_target = rec.oop_cfvs.to_vec();
-    let ip_target = rec.ip_cfvs.to_vec();
+    // Both players' CFVs normalized to pot-relative units.
+    let pot_inv = if rec.pot > 0.0 { 1.0 / rec.pot } else { 0.0 };
+    let oop_target: Vec<f32> = rec.oop_cfvs.iter().map(|&v| v * pot_inv).collect();
+    let ip_target: Vec<f32> = rec.ip_cfvs.iter().map(|&v| v * pot_inv).collect();
 
     let mask: Vec<f32> = rec.valid_mask.iter()
         .map(|&v| if v != 0 { 1.0 } else { 0.0 })
@@ -308,13 +309,16 @@ mod tests {
         let file = write_test_data(3);
         let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
 
+        // Targets are pot-relative: raw_cfv / pot.
+        // Record i=1: oop_cfvs[0]=0.01, pot=100 → 0.01/100=0.0001
         let item1 = dataset.get(1).unwrap();
-        assert!((item1.oop_target[0] - 0.01).abs() < 1e-6);
-        assert!((item1.ip_target[0] - (-0.01)).abs() < 1e-6);
+        assert!((item1.oop_target[0] - 0.0001).abs() < 1e-8);
+        assert!((item1.ip_target[0] - (-0.0001)).abs() < 1e-8);
 
+        // Record i=2: oop_cfvs[0]=0.02, pot=100 → 0.02/100=0.0002
         let item2 = dataset.get(2).unwrap();
-        assert!((item2.oop_target[0] - 0.02).abs() < 1e-6);
-        assert!((item2.ip_target[0] - (-0.02)).abs() < 1e-6);
+        assert!((item2.oop_target[0] - 0.0002).abs() < 1e-8);
+        assert!((item2.ip_target[0] - (-0.0002)).abs() < 1e-8);
     }
 
     #[test]
