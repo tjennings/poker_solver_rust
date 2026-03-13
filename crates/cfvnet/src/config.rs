@@ -157,6 +157,8 @@ pub struct TrainingConfig {
     pub epochs_per_chunk: usize,
     #[serde(default = "default_prefetch_chunks")]
     pub prefetch_chunks: usize,
+    #[serde(default = "default_pot_weighted_loss")]
+    pub pot_weighted_loss: bool,
 }
 
 impl Default for TrainingConfig {
@@ -175,6 +177,7 @@ impl Default for TrainingConfig {
             gpu_chunk_size: 100_000,
             epochs_per_chunk: 1,
             prefetch_chunks: 3,
+            pot_weighted_loss: true,
         }
     }
 }
@@ -217,6 +220,9 @@ fn default_epochs_per_chunk() -> usize {
 }
 fn default_prefetch_chunks() -> usize {
     3
+}
+fn default_pot_weighted_loss() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

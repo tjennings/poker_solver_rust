@@ -34,6 +34,7 @@ pub struct TrainConfig {
     pub gpu_chunk_size: usize,
     pub epochs_per_chunk: usize,
     pub prefetch_chunks: usize,
+    pub pot_weighted_loss: bool,
 }
 
 /// Result returned after training completes.
@@ -236,6 +237,11 @@ fn compute_val_loss<B: AutodiffBackend>(
         let batch = chunk.slice_batch(batch_start, batch_end);
 
         let pred = valid_model.forward(batch.input);
+        let pot_w = if config.pot_weighted_loss {
+            Some(batch.pot)
+        } else {
+            None
+        };
         let loss = cfvnet_loss(
             pred,
             batch.target,
@@ -244,6 +250,7 @@ fn compute_val_loss<B: AutodiffBackend>(
             batch.game_value,
             config.huber_delta,
             config.aux_loss_weight,
+            pot_w,
         );
 
         // INVARIANT: loss is shape [1], so to_vec always has exactly one element.
@@ -597,6 +604,11 @@ pub fn train<B: AutodiffBackend>(
                         let batch = shuffled.slice_batch(start, end);
 
                         let pred = model.forward(batch.input);
+                        let pot_w = if config.pot_weighted_loss {
+                            Some(batch.pot)
+                        } else {
+                            None
+                        };
                         let loss = cfvnet_loss(
                             pred,
                             batch.target,
@@ -605,6 +617,7 @@ pub fn train<B: AutodiffBackend>(
                             batch.game_value,
                             config.huber_delta,
                             config.aux_loss_weight,
+                            pot_w,
                         );
 
                         // Only read loss from GPU every LOSS_READ_INTERVAL batches
@@ -722,6 +735,7 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
             prefetch_chunks: 1,
+            pot_weighted_loss: false,
         };
 
         let result = train::<B>(&device, file.path(), 5, &config, None);
@@ -751,6 +765,7 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
             prefetch_chunks: 1,
+            pot_weighted_loss: false,
         };
         let result = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(result.final_train_loss < 1.0);
@@ -779,6 +794,7 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
             prefetch_chunks: 1,
+            pot_weighted_loss: false,
         };
         train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(dir.path().join("checkpoint_epoch2.mpk.gz").exists());
@@ -806,6 +822,7 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
             prefetch_chunks: 1,
+            pot_weighted_loss: false,
         };
 
         let result = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
@@ -832,6 +849,7 @@ mod tests {
             gpu_chunk_size: 100,
             epochs_per_chunk: 1,
             prefetch_chunks: 1,
+            pot_weighted_loss: false,
         };
         let r1 = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         let r2 = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
@@ -873,6 +891,7 @@ mod tests {
             gpu_chunk_size: 8,
             epochs_per_chunk: 2,
             prefetch_chunks: 1,
+            pot_weighted_loss: false,
         };
         let result = train::<B>(&device, file.path(), 5, &config, None);
         assert!(result.final_train_loss < 10.0);
@@ -923,6 +942,7 @@ mod tests {
             gpu_chunk_size: 10, // smaller than a file, forces cross-file chunking
             epochs_per_chunk: 1,
             prefetch_chunks: 1,
+            pot_weighted_loss: false,
         };
 
         let result = train::<B>(&device, dir.path(), 5, &config, None);

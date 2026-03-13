@@ -210,6 +210,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         gpu_chunk_size: cfg.training.gpu_chunk_size,
         epochs_per_chunk: cfg.training.epochs_per_chunk,
         prefetch_chunks: cfg.training.prefetch_chunks,
+        pot_weighted_loss: cfg.training.pot_weighted_loss,
     };
 
     match backend {
