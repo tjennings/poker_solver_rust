@@ -183,9 +183,6 @@ fn save_model<B: AutodiffBackend>(
     }
 }
 
-/// How often (in batches) to read loss from GPU. Between reads, we skip
-/// the GPU->CPU sync to avoid pipeline stalls.
-const LOSS_READ_INTERVAL: usize = 50;
 
 /// Streaming record reader that reads from a sequence of files, filling
 /// buffers up to a requested chunk size. Handles file boundaries transparently.
@@ -610,7 +607,6 @@ pub fn train<B: AutodiffBackend>(
         );
 
         let mut epoch_loss = 0.0_f64;
-        let mut epoch_loss_count = 0_u64;
 
         for step_in_epoch in 0..steps_per_epoch {
             // Receive next pre-encoded batch from the dataloader (blocking).
@@ -637,12 +633,10 @@ pub fn train<B: AutodiffBackend>(
                 config.aux_loss_weight,
             );
 
-            // Read loss periodically to avoid GPU sync stalls.
-            let is_last = step_in_epoch + 1 == steps_per_epoch;
-            if step_in_epoch % LOSS_READ_INTERVAL == 0 || is_last {
+            // Read loss only at epoch end to avoid GPU sync stalls.
+            if step_in_epoch + 1 == steps_per_epoch {
                 final_loss = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
-                epoch_loss += final_loss as f64;
-                epoch_loss_count += 1;
+                epoch_loss = final_loss as f64;
             }
 
             let lr = cosine_lr(config.learning_rate, config.lr_min, global_step, total_steps);
@@ -654,11 +648,6 @@ pub fn train<B: AutodiffBackend>(
             pb.inc(1);
         }
 
-        let avg_loss = if epoch_loss_count > 0 {
-            epoch_loss / epoch_loss_count as f64
-        } else {
-            0.0
-        };
         let lr_now = cosine_lr(
             config.learning_rate,
             config.lr_min,
@@ -667,7 +656,7 @@ pub fn train<B: AutodiffBackend>(
         );
 
         let mut summary = format!(
-            "{}/{} lr={lr_now:.2e} train={avg_loss:.6}",
+            "{}/{} lr={lr_now:.2e} train={epoch_loss:.6}",
             epoch + 1, config.epochs,
         );
 
