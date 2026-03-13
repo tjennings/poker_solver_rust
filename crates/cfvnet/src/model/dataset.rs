@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::datagen::sampler::Situation;
 use crate::datagen::storage::{read_record, TrainingRecord};
-use crate::model::network::{input_size, INPUT_SIZE, NUM_COMBOS};
+use crate::model::network::{input_size, INPUT_SIZE};
 
 /// A single training item with encoded input and dual-player targets.
 #[derive(Debug, Clone)]

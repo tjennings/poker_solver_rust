@@ -204,7 +204,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         learning_rate: cfg.training.learning_rate,
         lr_min: cfg.training.lr_min,
         huber_delta: cfg.training.huber_delta,
-        aux_loss_weight: cfg.training.aux_loss_weight,
+
         validation_split: cfg.training.validation_split,
         checkpoint_every_n_epochs: cfg.training.checkpoint_every_n_epochs,
         gpu_chunk_size: cfg.training.gpu_chunk_size,
@@ -392,14 +392,26 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
             TensorData::new(item.input.clone(), [1, in_size]),
             &device,
         );
-        let pred = model.forward(input);
+        let range_oop = Tensor::<B, 2>::from_data(
+            TensorData::new(item.oop_range.clone(), [1, 1326]),
+            &device,
+        );
+        let range_ip = Tensor::<B, 2>::from_data(
+            TensorData::new(item.ip_range.clone(), [1, 1326]),
+            &device,
+        );
+        let pred = model.forward(input, range_oop, range_ip);
         let pred_vec: Vec<f32> = pred.into_data().to_vec::<f32>().unwrap();
 
         let mask: Vec<bool> = item.mask.iter().map(|&v| v > 0.5).collect();
-        // Pot is at index 2*1326 + board_cards, normalized by 400.0 during encoding
-        let pot = item.input[2 * 1326 + board_cards] * 400.0;
+        let pot = item.pot;
 
-        let metrics = compute_prediction_metrics(&pred_vec, &item.target, &mask, pot);
+        // Concatenate OOP + IP targets for full dual-output comparison.
+        let mut target: Vec<f32> = Vec::with_capacity(2652);
+        target.extend_from_slice(&item.oop_target);
+        target.extend_from_slice(&item.ip_target);
+
+        let metrics = compute_prediction_metrics(&pred_vec, &target, &mask, pot);
         total_mae += metrics.mae;
         total_max_error += metrics.max_error;
         total_mbb += metrics.mbb_error;
@@ -430,7 +442,7 @@ fn cmd_compare(
     use cfvnet::config::board_cards_for_street;
     use cfvnet::eval::compare::run_comparison;
     use cfvnet::model::dataset::encode_situation_for_inference;
-    use cfvnet::model::network::{CfvNet, input_size};
+    use cfvnet::model::network::{CfvNet, NUM_COMBOS, input_size};
 
     let cfg = load_model_config(&model_dir);
     let board_cards = board_cards_for_street(&cfg.datagen.street);
@@ -458,12 +470,20 @@ fn cmd_compare(
     println!("Comparing {num_spots} spots against exact solver...");
 
     let summary = run_comparison(&cfg.game, &cfg.datagen, num_spots, cfg.datagen.seed, |sit, _solve_result| {
-        let input_data = encode_situation_for_inference(sit, 0);
+        let input_data = encode_situation_for_inference(sit);
         let input = Tensor::<B, 2>::from_data(
             TensorData::new(input_data, [1, in_size]),
             &device,
         );
-        let pred = model.forward(input);
+        let range_oop = Tensor::<B, 2>::from_data(
+            TensorData::new(sit.ranges[0].to_vec(), [1, NUM_COMBOS]),
+            &device,
+        );
+        let range_ip = Tensor::<B, 2>::from_data(
+            TensorData::new(sit.ranges[1].to_vec(), [1, NUM_COMBOS]),
+            &device,
+        );
+        let pred = model.forward(input, range_oop, range_ip);
         pred.into_data().to_vec::<f32>().unwrap()
     })
     .unwrap_or_else(|e| {

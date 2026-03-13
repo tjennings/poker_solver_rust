@@ -25,7 +25,7 @@ use crate::datagen::sampler::{sample_situation, Situation};
 use crate::eval::compare::{ComparisonSummary, SpotResult};
 use crate::eval::metrics::compute_prediction_metrics;
 use crate::eval::river_net_evaluator::RiverNetEvaluator;
-use crate::model::network::{CfvNet, input_size};
+use crate::model::network::{CfvNet, NUM_COMBOS as NET_NUM_COMBOS, input_size};
 
 use std::path::Path;
 
@@ -121,7 +121,8 @@ fn solve_and_extract(
     (cfvs_1326, valid_mask)
 }
 
-/// Run the turn model forward pass and return 1326-indexed predicted CFVs.
+/// Run the turn model forward pass and return 1326-indexed predicted CFVs
+/// for the given traverser (0 = OOP, 1 = IP).
 fn predict_with_model(
     model: &CfvNet<B>,
     device: &<B as burn::tensor::backend::Backend>::Device,
@@ -132,18 +133,31 @@ fn predict_with_model(
     let mut input = Vec::with_capacity(in_size);
     input.extend_from_slice(&sit.ranges[0]);
     input.extend_from_slice(&sit.ranges[1]);
+    // 52-dim one-hot board encoding
+    let mut board_one_hot = [0.0f32; 52];
     for &card in sit.board_cards() {
-        input.push(f32::from(card) / 51.0);
+        board_one_hot[card as usize] = 1.0;
     }
+    input.extend_from_slice(&board_one_hot);
     input.push(sit.pot as f32 / 400.0);
     input.push(sit.effective_stack as f32 / 400.0);
-    input.push(f32::from(traverser));
     debug_assert_eq!(input.len(), in_size);
 
     let data = TensorData::new(input, [1, in_size]);
     let input_tensor = Tensor::<B, 2>::from_data(data, device);
-    let output = model.forward(input_tensor);
-    output.into_data().to_vec::<f32>().expect("output tensor conversion")
+    let range_oop = Tensor::<B, 2>::from_data(
+        TensorData::new(sit.ranges[0].to_vec(), [1, NET_NUM_COMBOS]),
+        device,
+    );
+    let range_ip = Tensor::<B, 2>::from_data(
+        TensorData::new(sit.ranges[1].to_vec(), [1, NET_NUM_COMBOS]),
+        device,
+    );
+    let output = model.forward(input_tensor, range_oop, range_ip);
+    let full_vec: Vec<f32> = output.into_data().to_vec::<f32>().expect("output tensor conversion");
+    // Dual output: first 1326 = OOP CFVs, last 1326 = IP CFVs.
+    let offset = if traverser == 0 { 0 } else { NET_NUM_COMBOS };
+    full_vec[offset..offset + NET_NUM_COMBOS].to_vec()
 }
 
 /// Compare a single spot: model prediction vs ground truth.

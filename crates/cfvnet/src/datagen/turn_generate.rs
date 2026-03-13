@@ -224,7 +224,7 @@ pub fn generate_turn_training_data(
         let evaluator: Box<dyn LeafEvaluator> =
             Box::new(RiverNetEvaluator::new(eval_model, device));
 
-        let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv) = solve_turn_situation(
+        let (oop_cfvs, ip_cfvs, valid_mask, _oop_gv, _ip_gv) = solve_turn_situation(
             sit.board_cards(),
             f64::from(sit.pot),
             f64::from(sit.effective_stack),
@@ -236,31 +236,17 @@ pub fn generate_turn_training_data(
 
         let board_vec = sit.board_cards().to_vec();
 
-        let oop_rec = TrainingRecord {
-            board: board_vec.clone(),
-            pot: sit.pot as f32,
-            effective_stack: sit.effective_stack as f32,
-            player: 0,
-            game_value: oop_gv,
-            oop_range: sit.ranges[0],
-            ip_range: sit.ranges[1],
-            cfvs: oop_cfvs,
-            valid_mask,
-        };
-        write_record(&mut writer, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
-
-        let ip_rec = TrainingRecord {
+        let rec = TrainingRecord {
             board: board_vec,
             pot: sit.pot as f32,
             effective_stack: sit.effective_stack as f32,
-            player: 1,
-            game_value: ip_gv,
             oop_range: sit.ranges[0],
             ip_range: sit.ranges[1],
-            cfvs: ip_cfvs,
+            oop_cfvs,
+            ip_cfvs,
             valid_mask,
         };
-        write_record(&mut writer, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
+        write_record(&mut writer, &rec).map_err(|e| format!("write: {e}"))?;
 
         pb.inc(1);
     }
@@ -357,7 +343,7 @@ mod tests {
         }
 
         let bet_sizes_f64 = parse_bet_sizes(&["50%".into(), "a".into()]);
-        let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv) = solve_turn_situation(
+        let (oop_cfvs, ip_cfvs, valid_mask, _oop_gv, _ip_gv) = solve_turn_situation(
             sit.board_cards(),
             f64::from(sit.pot),
             f64::from(sit.effective_stack),
@@ -383,8 +369,6 @@ mod tests {
         for (i, &cfv) in ip_cfvs.iter().enumerate() {
             assert!(cfv.is_finite(), "IP combo {i}: non-finite CFV {cfv}");
         }
-        assert!(oop_gv.is_finite(), "OOP game value not finite");
-        assert!(ip_gv.is_finite(), "IP game value not finite");
     }
 
     #[test]
@@ -421,7 +405,7 @@ mod tests {
         }
 
         let bet_sizes_f64 = parse_bet_sizes(&["50%".into()]);
-        let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv) = solve_turn_situation(
+        let (oop_cfvs, ip_cfvs, valid_mask, _oop_gv, _ip_gv) = solve_turn_situation(
             sit.board_cards(),
             f64::from(sit.pot),
             f64::from(sit.effective_stack),
@@ -431,7 +415,7 @@ mod tests {
             evaluator,
         );
 
-        // Write records and verify they round-trip correctly.
+        // Write a single record with both players' CFVs and verify round-trip.
         let output = NamedTempFile::new().unwrap();
         {
             let file = std::fs::File::create(output.path()).unwrap();
@@ -439,42 +423,24 @@ mod tests {
 
             let board_vec = sit.board_cards().to_vec();
 
-            let oop_rec = TrainingRecord {
-                board: board_vec.clone(),
-                pot: sit.pot as f32,
-                effective_stack: sit.effective_stack as f32,
-                player: 0,
-                game_value: oop_gv,
-                oop_range: sit.ranges[0],
-                ip_range: sit.ranges[1],
-                cfvs: oop_cfvs,
-                valid_mask,
-            };
-            write_record(&mut writer, &oop_rec).unwrap();
-
-            let ip_rec = TrainingRecord {
+            let rec = TrainingRecord {
                 board: board_vec,
                 pot: sit.pot as f32,
                 effective_stack: sit.effective_stack as f32,
-                player: 1,
-                game_value: ip_gv,
                 oop_range: sit.ranges[0],
                 ip_range: sit.ranges[1],
-                cfvs: ip_cfvs,
+                oop_cfvs,
+                ip_cfvs,
                 valid_mask,
             };
-            write_record(&mut writer, &ip_rec).unwrap();
+            write_record(&mut writer, &rec).unwrap();
         }
 
         // Read back and verify.
         let mut file = std::fs::File::open(output.path()).unwrap();
         let rec0 = storage::read_record(&mut file).unwrap();
-        let rec1 = storage::read_record(&mut file).unwrap();
 
-        assert_eq!(rec0.board.len(), 4, "OOP record should have 4-card board");
-        assert_eq!(rec1.board.len(), 4, "IP record should have 4-card board");
-        assert_eq!(rec0.player, 0);
-        assert_eq!(rec1.player, 1);
+        assert_eq!(rec0.board.len(), 4, "record should have 4-card board");
         assert!(rec0.pot > 0.0);
         assert!(rec0.effective_stack > 0.0);
     }
