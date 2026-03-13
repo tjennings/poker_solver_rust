@@ -546,7 +546,7 @@ pub fn train<B: AutodiffBackend>(
     // Fill reservoir from disk.
     let reservoir_cap = config.reservoir_size.min(total_records);
     eprintln!("Filling reservoir ({reservoir_cap} records)...");
-    let mut reservoir = GpuReservoir::<B>::new(device, reservoir_cap, board_cards);
+    let mut reservoir = GpuReservoir::<B::InnerBackend>::new(device, reservoir_cap, board_cards);
     {
         let mut fill_reader = StreamingReader::new(files.clone());
         // Skip past validation records so they don't leak into the reservoir.
@@ -592,15 +592,21 @@ pub fn train<B: AutodiffBackend>(
                 reservoir.scatter_refresh(encoded, &mut rng, device);
             }
 
-            // Sample batch from reservoir and train.
+            // Sample batch from reservoir (inner backend, no autodiff graph)
+            // and convert to autodiff tensors for the training step.
             let batch = reservoir.sample_batch(batch_size, &mut rng, device);
-            let pred = model.forward(batch.input);
+            let input = Tensor::<B, 2>::from_inner(batch.input);
+            let target = Tensor::<B, 2>::from_inner(batch.target);
+            let mask = Tensor::<B, 2>::from_inner(batch.mask);
+            let range = Tensor::<B, 2>::from_inner(batch.range);
+            let game_value = Tensor::<B, 1>::from_inner(batch.game_value);
+            let pred = model.forward(input);
             let loss = cfvnet_loss(
                 pred,
-                batch.target,
-                batch.mask,
-                batch.range,
-                batch.game_value,
+                target,
+                mask,
+                range,
+                game_value,
                 config.huber_delta,
                 config.aux_loss_weight,
             );
@@ -951,7 +957,8 @@ mod tests {
         let device = Default::default();
         let files = collect_data_files(file.path()).unwrap();
 
-        let mut reservoir = GpuReservoir::<B>::new(&device, 20, 5);
+        // Reservoir uses inner (non-autodiff) backend to avoid graph accumulation.
+        let mut reservoir = GpuReservoir::<NdArray>::new(&device, 20, 5);
         let mut reader = StreamingReader::new(files);
         let filled = reservoir.fill(&mut reader, 5);
         assert_eq!(filled, 20);
@@ -969,7 +976,8 @@ mod tests {
         let device = Default::default();
         let files = collect_data_files(file.path()).unwrap();
 
-        let mut reservoir = GpuReservoir::<B>::new(&device, 10, 5);
+        // Reservoir uses inner (non-autodiff) backend to avoid graph accumulation.
+        let mut reservoir = GpuReservoir::<NdArray>::new(&device, 10, 5);
         let mut reader = StreamingReader::new(files);
         reservoir.fill(&mut reader, 5);
 
@@ -982,5 +990,35 @@ mod tests {
         // No panic = success. Reservoir still works.
         let batch = reservoir.sample_batch(4, &mut rng, &device);
         assert_eq!(batch.input.dims(), [4, input_size(5)]);
+    }
+
+    #[test]
+    fn reservoir_sample_converts_to_autodiff() {
+        // Verify that inner-backend reservoir batches can be lifted to autodiff
+        // tensors via from_inner, which is the pattern used in the training loop
+        // to avoid graph accumulation in the reservoir.
+        let file = write_test_data(20);
+        let device = Default::default();
+        let files = collect_data_files(file.path()).unwrap();
+
+        let mut reservoir = GpuReservoir::<NdArray>::new(&device, 20, 5);
+        let mut reader = StreamingReader::new(files);
+        reservoir.fill(&mut reader, 5);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let batch = reservoir.sample_batch(4, &mut rng, &device);
+
+        // Convert each tensor to autodiff -- this is what train() does.
+        let input = Tensor::<B, 2>::from_inner(batch.input);
+        let target = Tensor::<B, 2>::from_inner(batch.target);
+        let mask = Tensor::<B, 2>::from_inner(batch.mask);
+        let range = Tensor::<B, 2>::from_inner(batch.range);
+        let game_value = Tensor::<B, 1>::from_inner(batch.game_value);
+
+        assert_eq!(input.dims(), [4, input_size(5)]);
+        assert_eq!(target.dims(), [4, OUTPUT_SIZE]);
+        assert_eq!(mask.dims(), [4, OUTPUT_SIZE]);
+        assert_eq!(range.dims(), [4, OUTPUT_SIZE]);
+        assert_eq!(game_value.dims(), [4]);
     }
 }
