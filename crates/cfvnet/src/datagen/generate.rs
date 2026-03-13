@@ -19,7 +19,8 @@ use crate::config::CfvnetConfig;
 const CHUNK_SIZE: u64 = 10_000;
 
 /// Generate training data by sampling river situations, solving each with DCFR,
-/// and writing two records (OOP + IP) per solved situation to `output_path`.
+/// and writing one record per solved situation (with both OOP and IP CFVs) to
+/// `output_path`.
 ///
 /// Processes situations in chunks of [`CHUNK_SIZE`] to bound peak memory.
 /// Within each chunk, situations are generated sequentially (preserving RNG
@@ -127,6 +128,8 @@ fn solve_chunk(
 }
 
 /// Write solved results for one chunk to the output writer.
+///
+/// Each solved situation produces one record containing both OOP and IP CFVs.
 fn write_chunk(
     situations: &[super::sampler::Situation],
     results: Vec<Option<SolveResult>>,
@@ -140,33 +143,17 @@ fn write_chunk(
 
         let valid_mask = bool_mask_to_u8(&result.valid_mask);
 
-        let board_vec = sit.board_cards().to_vec();
-
-        let oop_rec = TrainingRecord {
-            board: board_vec.clone(),
+        let rec = TrainingRecord {
+            board: sit.board_cards().to_vec(),
             pot: sit.pot as f32,
             effective_stack: sit.effective_stack as f32,
-            player: 0,
-            game_value: result.oop_game_value,
             oop_range: sit.ranges[0],
             ip_range: sit.ranges[1],
-            cfvs: result.oop_evs,
+            oop_cfvs: result.oop_evs,
+            ip_cfvs: result.ip_evs,
             valid_mask,
         };
-        write_record(writer, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
-
-        let ip_rec = TrainingRecord {
-            board: board_vec,
-            pot: sit.pot as f32,
-            effective_stack: sit.effective_stack as f32,
-            player: 1,
-            game_value: result.ip_game_value,
-            oop_range: sit.ranges[0],
-            ip_range: sit.ranges[1],
-            cfvs: result.ip_evs,
-            valid_mask,
-        };
-        write_record(writer, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
+        write_record(writer, &rec).map_err(|e| format!("write record: {e}"))?;
     }
     Ok(())
 }
@@ -221,13 +208,12 @@ mod tests {
         let count = storage::count_records(&mut file, 5).unwrap();
 
         // Some situations may have effective_stack == 0 and be skipped,
-        // so we get at most 8 records (4 situations * 2 players).
+        // so we get at most 4 records (one per situation).
         assert!(count > 0, "expected at least one record");
         assert!(
-            count <= 8,
-            "expected at most 8 records (4 sits * 2), got {count}"
+            count <= 4,
+            "expected at most 4 records (one per situation), got {count}"
         );
-        assert_eq!(count % 2, 0, "records must come in OOP/IP pairs");
 
         // All records readable with valid data.
         use std::io::Seek;
@@ -236,7 +222,6 @@ mod tests {
             let rec = storage::read_record(&mut file).unwrap();
             assert!(rec.pot > 0.0, "record {i} has non-positive pot");
             assert!(rec.effective_stack > 0.0, "record {i} has non-positive stack");
-            assert!(rec.player <= 1, "record {i} invalid player {}", rec.player);
         }
     }
 
