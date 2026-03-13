@@ -473,6 +473,7 @@ fn load_validation_set(
 fn spawn_refresh_thread(
     files: &[PathBuf],
     refresh_per_step: usize,
+    val_count: usize,
     board_cards: usize,
 ) -> (mpsc::Receiver<PreEncoded>, Option<std::thread::JoinHandle<()>>) {
     let (refresh_tx, refresh_rx) = mpsc::sync_channel::<PreEncoded>(4);
@@ -480,6 +481,10 @@ fn spawn_refresh_thread(
         let refresh_files = files.to_vec();
         Some(std::thread::spawn(move || {
             let mut reader = StreamingReader::new(refresh_files);
+            // Skip past validation records so they don't leak into training.
+            if val_count > 0 {
+                let _ = reader.read_chunk(val_count);
+            }
             let mut consecutive_empty = 0u32;
             loop {
                 let records = reader.read_chunk(refresh_per_step);
@@ -490,6 +495,10 @@ fn spawn_refresh_thread(
                         return;
                     }
                     reader.reset();
+                    // Skip validation records again after reset.
+                    if val_count > 0 {
+                        let _ = reader.read_chunk(val_count);
+                    }
                     continue;
                 }
                 consecutive_empty = 0;
@@ -570,7 +579,7 @@ pub fn train<B: AutodiffBackend>(
         config.epochs, steps_per_epoch, total_steps, refresh_per_step
     );
 
-    let (refresh_rx, refresh_thread) = spawn_refresh_thread(&files, refresh_per_step, board_cards);
+    let (refresh_rx, refresh_thread) = spawn_refresh_thread(&files, refresh_per_step, val_count, board_cards);
 
     let mut final_loss = f32::MAX;
     let mut global_step: usize = 0;
