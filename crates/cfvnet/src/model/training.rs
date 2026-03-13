@@ -120,120 +120,6 @@ impl PreEncoded {
     }
 }
 
-/// GPU-resident reservoir of training data.
-///
-/// Holds pre-encoded training records as large tensors in GPU memory.
-/// The training loop samples random batches via `select` (pure GPU).
-/// A background thread continuously refreshes records via `scatter_refresh`.
-struct GpuReservoir<B: Backend> {
-    input: Tensor<B, 2>,
-    target: Tensor<B, 2>,
-    mask: Tensor<B, 2>,
-    range: Tensor<B, 2>,
-    game_value: Tensor<B, 1>,
-    capacity: usize,
-}
-
-/// A single mini-batch of tensors sampled from the reservoir.
-struct SampledBatch<B: Backend> {
-    input: Tensor<B, 2>,
-    target: Tensor<B, 2>,
-    mask: Tensor<B, 2>,
-    range: Tensor<B, 2>,
-    game_value: Tensor<B, 1>,
-}
-
-impl<B: Backend> GpuReservoir<B> {
-    /// Create an empty reservoir with `capacity` slots on `device`.
-    fn new(device: &B::Device, capacity: usize, board_cards: usize) -> Self {
-        let in_size = input_size(board_cards);
-        Self {
-            input: Tensor::zeros([capacity, in_size], device),
-            target: Tensor::zeros([capacity, OUTPUT_SIZE], device),
-            mask: Tensor::zeros([capacity, OUTPUT_SIZE], device),
-            range: Tensor::zeros([capacity, OUTPUT_SIZE], device),
-            game_value: Tensor::zeros([capacity], device),
-            capacity,
-        }
-    }
-
-    /// Fill the reservoir from disk. Returns number of records loaded.
-    fn fill(&mut self, reader: &mut StreamingReader, board_cards: usize) -> usize {
-        let records = reader.read_chunk(self.capacity);
-        let n = records.len();
-        if n == 0 {
-            return 0;
-        }
-        let encoded = PreEncoded::from_records(&records, board_cards);
-        let device = self.input.device();
-        let n_actual = n.min(self.capacity);
-        let tensors = encoded.into_device_tensors::<B>(&device);
-
-        self.input = tensors.input;
-        self.target = tensors.target;
-        self.mask = tensors.mask;
-        self.range = tensors.range;
-        self.game_value = tensors.game_value;
-        self.capacity = n_actual;
-        n_actual
-    }
-
-    /// Sample a random mini-batch from the reservoir.
-    ///
-    /// Uses `rand::seq::index::sample` for O(batch_size) index generation
-    /// instead of shuffling the full reservoir. Indices are unique to avoid
-    /// gradient accumulation issues in some backends.
-    fn sample_batch(&self, batch_size: usize, rng: &mut ChaCha8Rng, device: &B::Device) -> SampledBatch<B> {
-        use rand::seq::index;
-        let actual_batch = batch_size.min(self.capacity);
-        let sampled = index::sample(rng, self.capacity, actual_batch);
-        let indices_vec: Vec<i64> = sampled.iter().map(|i| i as i64).collect();
-
-        let indices: Tensor<B, 1, Int> = Tensor::from_data(
-            TensorData::new(indices_vec, [actual_batch]),
-            device,
-        );
-        SampledBatch {
-            input: self.input.clone().select(0, indices.clone()),
-            target: self.target.clone().select(0, indices.clone()),
-            mask: self.mask.clone().select(0, indices.clone()),
-            range: self.range.clone().select(0, indices.clone()),
-            game_value: self.game_value.clone().select(0, indices),
-        }
-    }
-
-    /// Scatter a batch of new pre-encoded records into random reservoir positions.
-    fn scatter_refresh(
-        &mut self,
-        encoded: PreEncoded,
-        rng: &mut ChaCha8Rng,
-        device: &B::Device,
-    ) {
-        let n = encoded.len;
-        if n == 0 {
-            return;
-        }
-
-        // Pick n random target positions in the reservoir.
-        let positions: Vec<i64> = (0..n)
-            .map(|_| rng.gen_range(0..self.capacity) as i64)
-            .collect();
-
-        let tensors = encoded.into_device_tensors::<B>(device);
-
-        // Use select_assign to scatter new values into the reservoir.
-        let idx: Tensor<B, 1, Int> = Tensor::from_data(
-            TensorData::new(positions, [n]),
-            device,
-        );
-        self.input = self.input.clone().select_assign(0, idx.clone(), tensors.input);
-        self.target = self.target.clone().select_assign(0, idx.clone(), tensors.target);
-        self.mask = self.mask.clone().select_assign(0, idx.clone(), tensors.mask);
-        self.range = self.range.clone().select_assign(0, idx.clone(), tensors.range);
-        self.game_value = self.game_value.clone().select_assign(0, idx, tensors.game_value);
-    }
-}
-
 /// Cosine annealing learning rate schedule.
 ///
 /// Returns `lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(pi * t / total_steps))`.
@@ -465,54 +351,52 @@ fn load_validation_set(
     Some(PreEncoded::from_records(&val_records, board_cards))
 }
 
-/// Spawn the background refresh thread that reads records from disk and sends
-/// pre-encoded batches over the channel.
+/// Spawn the background dataloader thread that reads records from disk, shuffles
+/// them, splits into batches, encodes, and sends through a bounded channel.
 ///
-/// Returns `(receiver, Option<JoinHandle>)`. If `refresh_per_step` is 0, no
-/// thread is spawned and the sender is dropped immediately.
-fn spawn_refresh_thread(
+/// Returns `(receiver, JoinHandle)`. The thread loops forever (resetting the
+/// reader on EOF) until the receiver is dropped.
+fn spawn_dataloader_thread(
     files: &[PathBuf],
-    refresh_per_step: usize,
+    batch_size: usize,
+    shuffle_buffer_size: usize,
+    prefetch_depth: usize,
     val_count: usize,
     board_cards: usize,
-) -> (mpsc::Receiver<PreEncoded>, Option<std::thread::JoinHandle<()>>) {
-    let (refresh_tx, refresh_rx) = mpsc::sync_channel::<PreEncoded>(4);
-    let thread = if refresh_per_step > 0 {
-        let refresh_files = files.to_vec();
-        Some(std::thread::spawn(move || {
-            let mut reader = StreamingReader::new(refresh_files);
-            // Skip past validation records so they don't leak into training.
-            if val_count > 0 {
-                let _ = reader.read_chunk(val_count);
-            }
-            let mut consecutive_empty = 0u32;
-            loop {
-                let records = reader.read_chunk(refresh_per_step);
-                if records.is_empty() {
-                    consecutive_empty += 1;
-                    if consecutive_empty > 3 {
-                        eprintln!("Warning: refresh thread exhausted all files after 3 retries, stopping");
-                        return;
-                    }
-                    reader.reset();
-                    // Skip validation records again after reset.
-                    if val_count > 0 {
-                        let _ = reader.read_chunk(val_count);
-                    }
-                    continue;
+) -> (mpsc::Receiver<PreEncoded>, std::thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::sync_channel::<PreEncoded>(prefetch_depth);
+    let loader_files = files.to_vec();
+    let thread = std::thread::spawn(move || {
+        use rand::seq::SliceRandom;
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut reader = StreamingReader::new(loader_files);
+        // Skip past validation records so they don't leak into training.
+        if val_count > 0 {
+            let _ = reader.read_chunk(val_count);
+        }
+        loop {
+            // Read a shuffle buffer worth of records.
+            let mut records = reader.read_chunk(shuffle_buffer_size);
+            if records.is_empty() {
+                // EOF: reset reader, skip validation records, continue.
+                reader.reset();
+                if val_count > 0 {
+                    let _ = reader.read_chunk(val_count);
                 }
-                consecutive_empty = 0;
-                let encoded = PreEncoded::from_records(&records, board_cards);
-                if refresh_tx.send(encoded).is_err() {
-                    return; // Training done, channel closed.
+                continue;
+            }
+            // Shuffle the buffer.
+            records.shuffle(&mut rng);
+            // Split into batch_size chunks, encode, and send.
+            for chunk in records.chunks(batch_size) {
+                let encoded = PreEncoded::from_records(chunk, board_cards);
+                if tx.send(encoded).is_err() {
+                    return; // Channel closed, training done.
                 }
             }
-        }))
-    } else {
-        drop(refresh_tx);
-        None
-    };
-    (refresh_rx, thread)
+        }
+    });
+    (rx, thread)
 }
 
 /// Train a `CfvNet` using a GPU-resident reservoir.
