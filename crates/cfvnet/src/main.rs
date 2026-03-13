@@ -84,9 +84,6 @@ enum Commands {
         /// Number of spots to compare
         #[arg(long, default_value = "100")]
         num_spots: usize,
-        /// Optional YAML config for game and solver parameters
-        #[arg(short, long)]
-        config: Option<PathBuf>,
     },
     /// Compare turn model against CfvSubgameSolver + ExactRiverEvaluator
     CompareExact {
@@ -96,9 +93,6 @@ enum Commands {
         /// Number of spots to compare
         #[arg(long, default_value = "20")]
         num_spots: usize,
-        /// Optional YAML config for game and solver parameters
-        #[arg(short, long)]
-        config: Option<PathBuf>,
     },
 }
 
@@ -181,13 +175,11 @@ fn main() {
             model,
             river_model,
             num_spots,
-            config,
-        } => cmd_compare_net(model, river_model, num_spots, config),
+        } => cmd_compare_net(model, river_model, num_spots),
         Commands::CompareExact {
             model,
             num_spots,
-            config,
-        } => cmd_compare_exact(model, num_spots, config),
+        } => cmd_compare_exact(model, num_spots),
     }
 }
 
@@ -482,17 +474,16 @@ fn cmd_compare_net(
     model_dir: PathBuf,
     river_model_dir: PathBuf,
     num_spots: usize,
-    config_path: Option<PathBuf>,
 ) {
     use cfvnet::eval::compare_turn::run_turn_comparison_net;
 
-    let cfg = load_config_or_default(config_path.as_deref());
+    let cfg = load_model_config(&model_dir);
     let model_path = resolve_model_path(&model_dir);
     let river_path = resolve_model_path(&river_model_dir);
 
     println!("Comparing {num_spots} turn spots against CfvSubgameSolver + RiverNetEvaluator...");
 
-    let summary = run_turn_comparison_net(&cfg, &model_path, &river_path, num_spots, 42)
+    let summary = run_turn_comparison_net(&cfg, &model_path, &river_path, num_spots, cfg.datagen.seed)
         .unwrap_or_else(|e| {
             eprintln!("comparison failed: {e}");
             std::process::exit(1);
@@ -501,15 +492,15 @@ fn cmd_compare_net(
     print_summary(&summary);
 }
 
-fn cmd_compare_exact(model_dir: PathBuf, num_spots: usize, config_path: Option<PathBuf>) {
+fn cmd_compare_exact(model_dir: PathBuf, num_spots: usize) {
     use cfvnet::eval::compare_turn::run_turn_comparison_exact;
 
-    let cfg = load_config_or_default(config_path.as_deref());
+    let cfg = load_model_config(&model_dir);
     let model_path = resolve_model_path(&model_dir);
 
     println!("Comparing {num_spots} turn spots against CfvSubgameSolver + ExactRiverEvaluator...");
 
-    let summary = run_turn_comparison_exact(&cfg, &model_path, num_spots, 42).unwrap_or_else(|e| {
+    let summary = run_turn_comparison_exact(&cfg, &model_path, num_spots, cfg.datagen.seed).unwrap_or_else(|e| {
         eprintln!("comparison failed: {e}");
         std::process::exit(1);
     });
