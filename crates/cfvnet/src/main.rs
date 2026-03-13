@@ -349,12 +349,13 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
     use burn::module::Module;
     use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
     use burn::tensor::{Tensor, TensorData};
+    use cfvnet::config::board_cards_for_street;
     use cfvnet::eval::metrics::compute_prediction_metrics;
     use cfvnet::model::dataset::CfvDataset;
     use cfvnet::model::network::{CfvNet, input_size};
 
-    // TODO: support turn/flop models via --street flag
-    let board_cards = 5;
+    let cfg = load_model_config(&model_dir);
+    let board_cards = board_cards_for_street(&cfg.datagen.street);
     let in_size = input_size(board_cards);
 
     type B = NdArray;
@@ -362,7 +363,7 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model_path = resolve_model_path(&model_dir);
 
-    let model = CfvNet::<B>::new(&device, 7, 500, in_size)
+    let model = CfvNet::<B>::new(&device, cfg.training.hidden_layers, cfg.training.hidden_size, in_size)
         .load_file(&model_path, &recorder, &device)
         .unwrap_or_else(|e| {
             eprintln!("failed to load model from {}: {e}", model_path.display());
@@ -382,7 +383,6 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
     let mut count = 0_u64;
 
     for i in 0..dataset.len() {
-        // INVARIANT: index is in bounds because we iterate up to dataset.len().
         let item = dataset.get(i).unwrap();
 
         let input = Tensor::<B, 2>::from_data(
@@ -393,7 +393,8 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
         let pred_vec: Vec<f32> = pred.into_data().to_vec::<f32>().unwrap();
 
         let mask: Vec<bool> = item.mask.iter().map(|&v| v > 0.5).collect();
-        let pot = item.input[2657] * 400.0;
+        // Pot is at index 2*1326 + board_cards, normalized by 400.0 during encoding
+        let pot = item.input[2 * 1326 + board_cards] * 400.0;
 
         let metrics = compute_prediction_metrics(&pred_vec, &item.target, &mask, pot);
         total_mae += metrics.mae;
