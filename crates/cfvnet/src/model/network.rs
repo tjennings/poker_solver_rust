@@ -10,14 +10,14 @@ use burn::{
 pub const NUM_COMBOS: usize = 1326;
 /// One counterfactual value per combo.
 pub const OUTPUT_SIZE: usize = NUM_COMBOS;
-/// Fixed input feature size: OOP range (1326) + IP range (1326) + board one-hot (52) + pot (1) + stack (1).
-pub const INPUT_SIZE: usize = NUM_COMBOS + NUM_COMBOS + 52 + 1 + 1; // = 2706
+/// Fixed input feature size: OOP range (1326) + IP range (1326) + board one-hot (52) + SPR (1).
+pub const INPUT_SIZE: usize = NUM_COMBOS + NUM_COMBOS + 52 + 1; // = 2705
 /// Dual output: OOP CFVs (1326) + IP CFVs (1326).
 pub const DUAL_OUTPUT_SIZE: usize = 2 * NUM_COMBOS; // = 2652
 
 /// Compute input feature size for a given number of board cards.
 ///
-/// Now returns the fixed [`INPUT_SIZE`] (2706) regardless of `board_cards`,
+/// Now returns the fixed [`INPUT_SIZE`] (2705) regardless of `board_cards`,
 /// since board encoding uses a 52-dim one-hot vector. The parameter is
 /// retained for API compatibility.
 pub fn input_size(_board_cards: usize) -> usize {
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn input_size_correct_for_river() {
         assert_eq!(input_size(5), INPUT_SIZE);
-        assert_eq!(INPUT_SIZE, 2706);
+        assert_eq!(INPUT_SIZE, 2705);
     }
 
     #[test]

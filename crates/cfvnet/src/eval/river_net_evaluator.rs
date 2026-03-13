@@ -66,12 +66,11 @@ impl<B: Backend> RiverNetEvaluator<B> {
 
 /// Build the input vector for a single river board evaluation.
 ///
-/// Layout (2706 floats):
+/// Layout (2705 floats):
 ///   [0..1326)     — OOP range (1326 combo probabilities)
 ///   [1326..2652)  — IP range (1326 combo probabilities)
 ///   [2652..2704)  — board 52-dim one-hot
-///   [2704]        — pot / 400.0
-///   [2705]        — effective_stack / 400.0
+///   [2704]        — SPR (effective_stack / pot)
 fn build_input(
     oop_1326: &[f32; OUTPUT_SIZE],
     ip_1326: &[f32; OUTPUT_SIZE],
@@ -88,8 +87,8 @@ fn build_input(
         board_one_hot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_one_hot);
-    input.push(pot as f32 / 400.0);
-    input.push(effective_stack as f32 / 400.0);
+    let spr = if pot > 0.0 { effective_stack as f32 / pot as f32 } else { 0.0 };
+    input.push(spr);
     debug_assert_eq!(input.len(), in_size);
     input
 }

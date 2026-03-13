@@ -139,8 +139,11 @@ fn predict_with_model(
         board_one_hot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_one_hot);
-    input.push(sit.pot as f32 / 400.0);
-    input.push(sit.effective_stack as f32 / 400.0);
+    // SPR = effective_stack / pot (guard against div-by-zero)
+    let pot_f32 = sit.pot as f32;
+    let stack_f32 = sit.effective_stack as f32;
+    let spr = if pot_f32 > 0.0 { stack_f32 / pot_f32 } else { 0.0 };
+    input.push(spr);
     debug_assert_eq!(input.len(), in_size);
 
     let data = TensorData::new(input, [1, in_size]);
