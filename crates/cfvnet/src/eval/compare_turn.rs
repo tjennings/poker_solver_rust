@@ -139,10 +139,10 @@ fn predict_with_model(
         board_one_hot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_one_hot);
-    // SPR = effective_stack / pot (guard against div-by-zero)
+    // pot / effective_stack (matches Supremus convention)
     let pot_f32 = sit.pot as f32;
     let stack_f32 = sit.effective_stack as f32;
-    let spr = if pot_f32 > 0.0 { stack_f32 / pot_f32 } else { 0.0 };
+    let spr = if stack_f32 > 0.0 { pot_f32 / stack_f32 } else { 0.0 };
     input.push(spr);
     debug_assert_eq!(input.len(), in_size);
 

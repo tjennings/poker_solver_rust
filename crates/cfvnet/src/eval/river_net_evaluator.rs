@@ -70,7 +70,7 @@ impl<B: Backend> RiverNetEvaluator<B> {
 ///   [0..1326)     — OOP range (1326 combo probabilities)
 ///   [1326..2652)  — IP range (1326 combo probabilities)
 ///   [2652..2704)  — board 52-dim one-hot
-///   [2704]        — SPR (effective_stack / pot)
+///   [2704]        — pot / effective_stack
 fn build_input(
     oop_1326: &[f32; OUTPUT_SIZE],
     ip_1326: &[f32; OUTPUT_SIZE],
@@ -87,7 +87,7 @@ fn build_input(
         board_one_hot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_one_hot);
-    let spr = if pot > 0.0 { effective_stack as f32 / pot as f32 } else { 0.0 };
+    let spr = if effective_stack > 0.0 { pot as f32 / effective_stack as f32 } else { 0.0 };
     input.push(spr);
     debug_assert_eq!(input.len(), in_size);
     input

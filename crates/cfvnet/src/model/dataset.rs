@@ -140,10 +140,10 @@ pub fn encode_situation_for_inference(sit: &Situation) -> Vec<f32> {
         board_one_hot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_one_hot);
-    // SPR = effective_stack / pot (guard against div-by-zero)
+    // pot / effective_stack (matches Supremus pot/starting_chips convention)
     let pot = sit.pot as f32;
     let stack = sit.effective_stack as f32;
-    let spr = if pot > 0.0 { stack / pot } else { 0.0 };
+    let spr = if stack > 0.0 { pot / stack } else { 0.0 };
     input.push(spr);
     debug_assert_eq!(input.len(), in_size);
     input
@@ -163,8 +163,8 @@ pub(crate) fn encode_record(rec: &TrainingRecord, board_cards: usize) -> CfvItem
         board_one_hot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_one_hot);
-    // SPR = effective_stack / pot (guard against div-by-zero)
-    let spr = if rec.pot > 0.0 { rec.effective_stack / rec.pot } else { 0.0 };
+    // pot / effective_stack (matches Supremus pot/starting_chips convention)
+    let spr = if rec.effective_stack > 0.0 { rec.pot / rec.effective_stack } else { 0.0 };
     input.push(spr);
 
     debug_assert_eq!(input.len(), in_size);
@@ -277,8 +277,8 @@ mod tests {
         assert!((item.input[board_start + 1]).abs() < 1e-6);
         assert!((item.input[board_start + 51]).abs() < 1e-6);
 
-        // SPR = 50 / 100 = 0.5, at index 2652 + 52 = 2704
-        assert!((item.input[2704] - 0.5).abs() < 1e-6);
+        // pot/stack = 100 / 50 = 2.0, at index 2652 + 52 = 2704
+        assert!((item.input[2704] - 2.0).abs() < 1e-6);
 
         assert_eq!(item.input.len(), INPUT_SIZE);
         assert_eq!(item.input.len(), 2705);
@@ -300,8 +300,8 @@ mod tests {
         // Card 16 NOT encoded (only 4 board cards)
         assert!((item.input[board_start + 16]).abs() < 1e-6);
 
-        // SPR = 50 / 100 = 0.5, at index 2704
-        assert!((item.input[2704] - 0.5).abs() < 1e-6);
+        // pot/stack = 100 / 50 = 2.0, at index 2704
+        assert!((item.input[2704] - 2.0).abs() < 1e-6);
     }
 
     #[test]
