@@ -14,14 +14,14 @@
 
 game:
   initial_stack: 200 # 100bb in SB units
-  bet_sizes: ["25%", "50%", "100%", "a"]
+  bet_sizes: ["33%", "50%", "100%", "150%"]
   add_allin_threshold: 1.5
   force_allin_threshold: 0.15
 
 datagen:
   num_samples: 10000000
   pot_range: [4, 200]
-  solver_iterations: 1000
+  solver_iterations: 10000
   target_exploitability: 0.005
   threads: 8
   seed: 42
