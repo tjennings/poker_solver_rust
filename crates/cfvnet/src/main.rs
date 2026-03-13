@@ -213,6 +213,12 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         pot_weighted_loss: cfg.training.pot_weighted_loss,
     };
 
+    // Ensure output directory exists before writing config.
+    std::fs::create_dir_all(&output).unwrap_or_else(|e| {
+        eprintln!("failed to create output directory {}: {e}", output.display());
+        std::process::exit(1);
+    });
+
     // Write config early so it's available alongside checkpoints.
     let config_out = output.join("config.yaml");
     let config_yaml = serde_yaml::to_string(&cfg).unwrap_or_else(|e| {
