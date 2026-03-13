@@ -333,20 +333,17 @@ fn collect_data_files(path: &Path) -> Result<Vec<PathBuf>, String> {
     }
 }
 
-/// Count total records across all files without keeping them in memory.
-fn count_total_records(files: &[PathBuf]) -> u64 {
+/// Count total records across all files using file size arithmetic.
+///
+/// All records must have the same `board_size`. Files whose size is not
+/// an exact multiple of `record_size` are still counted (truncated).
+fn count_total_records(files: &[PathBuf], board_size: usize) -> u64 {
+    let rec_size = crate::datagen::storage::record_size(board_size) as u64;
     let mut total = 0u64;
     for path in files {
-        let file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let mut reader = BufReader::new(file);
-        loop {
-            match read_record(&mut reader) {
-                Ok(_) => total += 1,
-                Err(_) => break,
-            }
+        match std::fs::metadata(path) {
+            Ok(meta) => total += meta.len() / rec_size,
+            Err(e) => eprintln!("Warning: cannot stat {}: {e}", path.display()),
         }
     }
     total
@@ -520,7 +517,7 @@ pub fn train<B: AutodiffBackend>(
     });
 
     eprintln!("Counting records across {} file(s)...", files.len());
-    let total_records = count_total_records(&files) as usize;
+    let total_records = count_total_records(&files, board_cards) as usize;
     eprintln!("Total records: {total_records}");
 
     if total_records == 0 {
@@ -1046,6 +1043,31 @@ mod tests {
 
         reader.reset();
         assert!(reader.read_one().is_some());
+    }
+
+    #[test]
+    fn count_total_records_uses_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            for i in 0..5 {
+                let rec = TrainingRecord {
+                    board: vec![0, 4, 8, 12, 16],
+                    pot: i as f32,
+                    effective_stack: 50.0,
+                    player: 0,
+                    game_value: 0.0,
+                    oop_range: [0.0; 1326],
+                    ip_range: [0.0; 1326],
+                    cfvs: [0.0; 1326],
+                    valid_mask: [1; 1326],
+                };
+                write_record(&mut file, &rec).unwrap();
+            }
+        }
+        let count = count_total_records(&[path], 5);
+        assert_eq!(count, 5);
     }
 
 }
