@@ -685,6 +685,23 @@ mod tests {
 
     type B = Autodiff<NdArray>;
 
+    fn default_test_config() -> TrainConfig {
+        TrainConfig {
+            hidden_layers: 2,
+            hidden_size: 64,
+            batch_size: 16,
+            epochs: 2,
+            learning_rate: 0.001,
+            lr_min: 0.001,
+            huber_delta: 1.0,
+            aux_loss_weight: 0.0,
+            validation_split: 0.0,
+            checkpoint_every_n_epochs: 0,
+            reservoir_size: 100,
+            reservoir_turnover: 1.0,
+        }
+    }
+
     fn write_test_data(n: usize) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
         for i in 0..n {
@@ -717,18 +734,9 @@ mod tests {
 
         let device = Default::default();
         let config = TrainConfig {
-            hidden_layers: 2,
-            hidden_size: 64,
-            batch_size: 16,
             epochs: 200,
-            learning_rate: 0.001,
-            lr_min: 0.001,
-            huber_delta: 1.0,
-            aux_loss_weight: 0.0,
-            validation_split: 0.0,
-            checkpoint_every_n_epochs: 0,
-            reservoir_size: 100,
             reservoir_turnover: 0.0,
+            ..default_test_config()
         };
 
         let result = train::<B>(&device, file.path(), 5, &config, None);
@@ -744,20 +752,7 @@ mod tests {
         let file = write_test_data(16);
         let dir = tempfile::tempdir().unwrap();
         let device = Default::default();
-        let config = TrainConfig {
-            hidden_layers: 2,
-            hidden_size: 64,
-            batch_size: 16,
-            epochs: 2,
-            learning_rate: 0.001,
-            lr_min: 0.001,
-            huber_delta: 1.0,
-            aux_loss_weight: 0.0,
-            validation_split: 0.0,
-            checkpoint_every_n_epochs: 0,
-            reservoir_size: 100,
-            reservoir_turnover: 1.0,
-        };
+        let config = default_test_config();
         let result = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(result.final_train_loss < 1.0);
         assert!(
@@ -772,18 +767,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let device = Default::default();
         let config = TrainConfig {
-            hidden_layers: 2,
-            hidden_size: 64,
-            batch_size: 16,
             epochs: 4,
-            learning_rate: 0.001,
-            lr_min: 0.001,
-            huber_delta: 1.0,
-            aux_loss_weight: 0.0,
-            validation_split: 0.0,
             checkpoint_every_n_epochs: 2,
-            reservoir_size: 100,
-            reservoir_turnover: 1.0,
+            ..default_test_config()
         };
         train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         assert!(dir.path().join("checkpoint_epoch2.mpk.gz").exists());
@@ -798,18 +784,10 @@ mod tests {
 
         let device = Default::default();
         let config = TrainConfig {
-            hidden_layers: 2,
-            hidden_size: 64,
             batch_size: 8,
             epochs: 3,
-            learning_rate: 0.001,
-            lr_min: 0.001,
-            huber_delta: 1.0,
-            aux_loss_weight: 0.0,
             validation_split: 0.2, // 4 val samples out of 20
-            checkpoint_every_n_epochs: 0,
-            reservoir_size: 100,
-            reservoir_turnover: 1.0,
+            ..default_test_config()
         };
 
         let result = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
@@ -823,18 +801,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let device = Default::default();
         let config = TrainConfig {
-            hidden_layers: 2,
-            hidden_size: 64,
-            batch_size: 16,
             epochs: 5,
-            learning_rate: 0.001,
-            lr_min: 0.001,
-            huber_delta: 1.0,
-            aux_loss_weight: 0.0,
-            validation_split: 0.0,
-            checkpoint_every_n_epochs: 0,
-            reservoir_size: 100,
-            reservoir_turnover: 1.0,
+            ..default_test_config()
         };
         let r1 = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
         let r2 = train::<B>(&device, file.path(), 5, &config, Some(dir.path()));
@@ -863,18 +831,10 @@ mod tests {
         let file = write_test_data(16);
         let device = Default::default();
         let config = TrainConfig {
-            hidden_layers: 2,
-            hidden_size: 64,
-            batch_size: 16,
             epochs: 200,
-            learning_rate: 0.001,
-            lr_min: 0.001,
-            huber_delta: 1.0,
-            aux_loss_weight: 0.0,
-            validation_split: 0.0,
-            checkpoint_every_n_epochs: 0,
             reservoir_size: 16,
             reservoir_turnover: 0.0,
+            ..default_test_config()
         };
         let result = train::<B>(&device, file.path(), 5, &config, None);
         assert!(
@@ -890,18 +850,11 @@ mod tests {
         let file = write_test_data(64);
         let device = Default::default();
         let config = TrainConfig {
-            hidden_layers: 2,
-            hidden_size: 64,
             batch_size: 8,
             epochs: 5,
-            learning_rate: 0.001,
-            lr_min: 0.001,
-            huber_delta: 1.0,
-            aux_loss_weight: 0.0,
-            validation_split: 0.0,
-            checkpoint_every_n_epochs: 0,
             reservoir_size: 16, // smaller than data -> refresh thread runs
             reservoir_turnover: 2.0,
+            ..default_test_config()
         };
         let result = train::<B>(&device, file.path(), 5, &config, None);
         assert!(
@@ -943,18 +896,8 @@ mod tests {
 
         let device = Default::default();
         let config = TrainConfig {
-            hidden_layers: 2,
-            hidden_size: 64,
             batch_size: 8,
-            epochs: 2,
-            learning_rate: 0.001,
-            lr_min: 0.001,
-            huber_delta: 1.0,
-            aux_loss_weight: 0.0,
-            validation_split: 0.0,
-            checkpoint_every_n_epochs: 0,
-            reservoir_size: 100,
-            reservoir_turnover: 1.0,
+            ..default_test_config()
         };
 
         let result = train::<B>(&device, dir.path(), 5, &config, None);
