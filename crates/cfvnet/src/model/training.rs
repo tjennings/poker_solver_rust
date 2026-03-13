@@ -510,17 +510,34 @@ fn spawn_dataloader_thread(
         }
     });
 
-    // Stage 2: Encoder thread — receives record batches, encodes via rayon, sends.
-    let encoder_thread = std::thread::spawn(move || {
-        while let Ok(records) = record_rx.recv() {
-            let encoded = PreEncoded::from_records(&records, board_cards);
-            if batch_tx.send(encoded).is_err() {
-                return;
+    // Stage 2: Encoder threads — multiple threads pull from the shared record
+    // channel, encode via rayon, and push to the batch channel. This keeps CPU
+    // cores busy continuously instead of idling between sequential encode calls.
+    let record_rx = std::sync::Arc::new(std::sync::Mutex::new(record_rx));
+    let num_encoders = 3;
+    let mut handles = vec![reader_thread];
+    for _ in 0..num_encoders {
+        let rx = record_rx.clone();
+        let tx = batch_tx.clone();
+        handles.push(std::thread::spawn(move || {
+            loop {
+                let records = {
+                    let lock = rx.lock().unwrap();
+                    match lock.recv() {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    }
+                };
+                let encoded = PreEncoded::from_records(&records, board_cards);
+                if tx.send(encoded).is_err() {
+                    return;
+                }
             }
-        }
-    });
+        }));
+    }
+    drop(batch_tx); // Drop the original sender so channel closes when all encoders exit.
 
-    (batch_rx, vec![reader_thread, encoder_thread])
+    (batch_rx, handles)
 }
 
 /// Train a `CfvNet` using a streaming dataloader.
