@@ -82,8 +82,8 @@ pub struct DatagenConfig {
     /// Which street to generate data for: "river" (default), "turn", or "flop".
     #[serde(default = "default_street")]
     pub street: String,
-    #[serde(default = "default_pot_intervals")]
-    pub pot_intervals: Vec<[i32; 2]>,
+    #[serde(default = "default_pot_range")]
+    pub pot_range: [i32; 2],
     #[serde(default = "default_solver_iterations")]
     pub solver_iterations: u32,
     #[serde(default = "default_target_exploitability")]
@@ -99,7 +99,7 @@ impl Default for DatagenConfig {
         Self {
             num_samples: 1000,
             street: default_street(),
-            pot_intervals: default_pot_intervals(),
+            pot_range: default_pot_range(),
             solver_iterations: 1000,
             target_exploitability: 0.005,
             threads: 8,
@@ -111,8 +111,8 @@ impl Default for DatagenConfig {
 fn default_street() -> String {
     "river".into()
 }
-fn default_pot_intervals() -> Vec<[i32; 2]> {
-    vec![[4, 20], [20, 80], [80, 200], [200, 400]]
+fn default_pot_range() -> [i32; 2] {
+    [4, 400]
 }
 fn default_solver_iterations() -> u32 {
     1000
@@ -267,7 +267,7 @@ game:
   force_allin_threshold: 0.15
 datagen:
   num_samples: 1000000
-  pot_intervals: [[4,20], [20,80], [80,200], [200,400]]
+  pot_range: [4, 400]
   solver_iterations: 1000
   target_exploitability: 0.005
   threads: 8
@@ -285,7 +285,7 @@ training:
   checkpoint_every_n_epochs: 1000
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.datagen.pot_intervals.len(), 4);
+        assert_eq!(config.datagen.pot_range, [4, 400]);
         assert_eq!(config.datagen.threads, 8);
         assert!((config.training.learning_rate - 0.001).abs() < 1e-9);
     }

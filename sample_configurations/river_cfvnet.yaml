@@ -20,7 +20,7 @@ game:
 
 datagen:
   num_samples: 10000000
-  pot_intervals: [[4, 20], [20, 80], [80, 200]]
+  pot_range: [4, 200]
   solver_iterations: 1000
   target_exploitability: 0.005
   threads: 8
