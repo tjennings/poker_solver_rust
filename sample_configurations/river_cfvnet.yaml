@@ -38,5 +38,5 @@ training:
   aux_loss_weight: 1.0
   validation_split: 0.05
   checkpoint_every_n_epochs: 1
-  reservoir_size: 1500000
-  reservoir_turnover: 1.0
+  reservoir_size: 400000
+  reservoir_turnover: 0.05
