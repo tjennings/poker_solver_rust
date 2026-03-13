@@ -31,12 +31,12 @@ training:
   hidden_layers: 7
   hidden_size: 500
   batch_size: 8192
-  epochs: 50
-  learning_rate: 0.002
+  epochs: 500
+  learning_rate: 0.02
   lr_min: 0.00002
   huber_delta: 1.0
   aux_loss_weight: 1.0
   validation_split: 0.05
-  checkpoint_every_n_epochs: 1
-  reservoir_size: 400000
+  checkpoint_every_n_epochs: 3
+  reservoir_size: 500000
   reservoir_turnover: 0.05

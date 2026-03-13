@@ -549,7 +549,8 @@ pub fn train<B: AutodiffBackend>(
         return TrainResult { final_train_loss: f32::MAX };
     }
 
-    let val_count = (total_records as f64 * config.validation_split) as usize;
+    let val_count = ((config.reservoir_size as f64 * config.validation_split) as usize)
+        .min(total_records);
     let val_encoded = load_validation_set(&files, val_count, board_cards);
 
     // Fill reservoir from disk.
