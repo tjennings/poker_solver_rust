@@ -58,7 +58,6 @@ struct DeviceTensors<B: Backend> {
     mask: Tensor<B, 2>,
     range: Tensor<B, 2>,
     game_value: Tensor<B, 1>,
-    len: usize,
 }
 
 impl PreEncoded {
@@ -103,7 +102,6 @@ impl PreEncoded {
             mask: Tensor::from_data(TensorData::new(self.mask, [n, OUTPUT_SIZE]), device),
             range: Tensor::from_data(TensorData::new(self.range, [n, OUTPUT_SIZE]), device),
             game_value: Tensor::from_data(TensorData::new(self.game_value, [n]), device),
-            len: n,
         }
     }
 
@@ -134,7 +132,6 @@ struct GpuReservoir<B: Backend> {
     range: Tensor<B, 2>,
     game_value: Tensor<B, 1>,
     capacity: usize,
-    in_size: usize,
 }
 
 /// A single mini-batch of tensors sampled from the reservoir.
@@ -157,7 +154,6 @@ impl<B: Backend> GpuReservoir<B> {
             range: Tensor::zeros([capacity, OUTPUT_SIZE], device),
             game_value: Tensor::zeros([capacity], device),
             capacity,
-            in_size,
         }
     }
 
