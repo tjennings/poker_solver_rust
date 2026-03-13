@@ -44,35 +44,27 @@ pub fn masked_huber_loss<B: Backend>(
     }
 }
 
-/// Auxiliary game-value consistency loss.
+/// Combined CFVnet loss for dual-player output.
 ///
-/// Enforces that the range-weighted sum of predicted CFVs equals the known
-/// game value: `L = mean((sum_i(range[i] * cfv[i]) - game_value)^2)`.
-pub fn aux_game_value_loss<B: Backend>(
-    cfv_pred: Tensor<B, 2>,
-    range: Tensor<B, 2>,
-    game_value: Tensor<B, 1>,
-) -> Tensor<B, 1> {
-    // weighted_sum: [batch, 1326] -> sum over dim 1 -> [batch, 1] -> squeeze -> [batch]
-    let weighted_sum: Tensor<B, 1> = (cfv_pred * range).sum_dim(1).squeeze(1);
-    let residual = weighted_sum - game_value;
-    residual.powf_scalar(2.0).mean()
-}
-
-/// Combined CFVnet loss: `L = L_huber + lambda * L_aux`.
+/// The prediction and target tensors have shape `[batch, 2652]`, where the first
+/// 1326 columns are OOP CFVs and the last 1326 are IP CFVs. The mask has shape
+/// `[batch, 1326]` and applies identically to both players.
+///
+/// Returns the sum of masked Huber losses for both players.
 pub fn cfvnet_loss<B: Backend>(
     pred: Tensor<B, 2>,
     target: Tensor<B, 2>,
     mask: Tensor<B, 2>,
-    range: Tensor<B, 2>,
-    game_value: Tensor<B, 1>,
     huber_delta: f64,
-    aux_weight: f64,
     pot_weight: Option<Tensor<B, 1>>,
 ) -> Tensor<B, 1> {
-    let huber = masked_huber_loss(pred.clone(), target, mask, huber_delta, pot_weight);
-    let aux = aux_game_value_loss(pred, range, game_value);
-    huber + aux.mul_scalar(aux_weight)
+    let pred_oop = pred.clone().narrow(1, 0, 1326);
+    let pred_ip = pred.narrow(1, 1326, 1326);
+    let tgt_oop = target.clone().narrow(1, 0, 1326);
+    let tgt_ip = target.narrow(1, 1326, 1326);
+    let loss_oop = masked_huber_loss(pred_oop, tgt_oop, mask.clone(), huber_delta, pot_weight.clone());
+    let loss_ip = masked_huber_loss(pred_ip, tgt_ip, mask, huber_delta, pot_weight);
+    loss_oop + loss_ip
 }
 
 #[cfg(test)]
@@ -121,39 +113,71 @@ mod tests {
     }
 
     #[test]
-    fn aux_loss_zero_when_constraint_met() {
-        let device = Default::default();
-        let cfv_pred = Tensor::<B, 2>::from_floats([[0.2, 0.4]], &device);
-        let range = Tensor::<B, 2>::from_floats([[0.5, 0.5]], &device);
-        // weighted sum = 0.5*0.2 + 0.5*0.4 = 0.3
-        let game_value = Tensor::<B, 1>::from_floats([0.3], &device);
-        let loss = aux_game_value_loss(cfv_pred, range, game_value);
-        let val: f32 = loss.into_scalar();
-        assert!(val.abs() < 1e-5, "aux loss should be ~0, got {val}");
-    }
-
-    #[test]
-    fn aux_loss_positive_when_constraint_violated() {
-        let device = Default::default();
-        let cfv_pred = Tensor::<B, 2>::from_floats([[1.0, 1.0]], &device);
-        let range = Tensor::<B, 2>::from_floats([[0.5, 0.5]], &device);
-        let game_value = Tensor::<B, 1>::from_floats([0.0], &device);
-        let loss = aux_game_value_loss(cfv_pred, range, game_value);
-        let val: f32 = loss.into_scalar();
-        assert!(val > 0.5, "aux loss should be large, got {val}");
-    }
-
-    #[test]
     fn combined_loss_includes_both_terms() {
         let device = Default::default();
-        let pred = Tensor::<B, 2>::from_floats([[0.5, 0.5]], &device);
-        let target = Tensor::<B, 2>::from_floats([[0.0, 0.0]], &device);
+        // Test that the loss from both players sums correctly.
+        // Use the underlying masked_huber_loss since cfvnet_loss requires 1326-wide tensors.
         let mask = Tensor::<B, 2>::from_floats([[1.0, 1.0]], &device);
-        let range = Tensor::<B, 2>::from_floats([[0.5, 0.5]], &device);
-        let game_value = Tensor::<B, 1>::from_floats([0.0], &device);
-        let loss = cfvnet_loss(pred, target, mask, range, game_value, 1.0, 1.0, None);
+        let loss_oop = masked_huber_loss(
+            Tensor::<B, 2>::from_floats([[0.5, 0.5]], &device),
+            Tensor::<B, 2>::from_floats([[0.0, 0.0]], &device),
+            mask.clone(),
+            1.0,
+            None,
+        );
+        let loss_ip = masked_huber_loss(
+            Tensor::<B, 2>::from_floats([[0.3, 0.3]], &device),
+            Tensor::<B, 2>::from_floats([[0.0, 0.0]], &device),
+            mask,
+            1.0,
+            None,
+        );
+        let total: f32 = (loss_oop + loss_ip).into_scalar();
+        assert!(total > 0.0, "combined loss should be positive, got {total}");
+    }
+
+    #[test]
+    fn dual_player_loss_sums_both() {
+        use burn::tensor::TensorData;
+
+        let device = Default::default();
+        // Build tensors of width 2652 (1326 + 1326)
+        let n = 1326;
+        let pred_data: Vec<f32> = (0..2 * n).map(|i| if i < n { 0.5 } else { 0.3 }).collect();
+        let target_data: Vec<f32> = vec![0.0; 2 * n];
+        let mask_data: Vec<f32> = vec![1.0; n];
+
+        let pred = Tensor::<B, 2>::from_data(TensorData::new(pred_data, [1, 2 * n]), &device);
+        let target = Tensor::<B, 2>::from_data(TensorData::new(target_data, [1, 2 * n]), &device);
+        let mask = Tensor::<B, 2>::from_data(TensorData::new(mask_data.clone(), [1, n]), &device);
+
+        let loss = cfvnet_loss(pred, target, mask.clone(), 1.0, None);
         let val: f32 = loss.into_scalar();
-        assert!(val > 0.0, "combined loss should be positive, got {val}");
+        assert!(val > 0.0, "dual player loss should be positive, got {val}");
+
+        // Verify it equals the sum of individual player losses
+        let pred_oop_data: Vec<f32> = vec![0.5; n];
+        let pred_ip_data: Vec<f32> = vec![0.3; n];
+        let zero_data: Vec<f32> = vec![0.0; n];
+        let loss_oop = masked_huber_loss(
+            Tensor::<B, 2>::from_data(TensorData::new(pred_oop_data, [1, n]), &device),
+            Tensor::<B, 2>::from_data(TensorData::new(zero_data.clone(), [1, n]), &device),
+            mask.clone(),
+            1.0,
+            None,
+        );
+        let loss_ip = masked_huber_loss(
+            Tensor::<B, 2>::from_data(TensorData::new(pred_ip_data, [1, n]), &device),
+            Tensor::<B, 2>::from_data(TensorData::new(zero_data, [1, n]), &device),
+            mask,
+            1.0,
+            None,
+        );
+        let expected: f32 = (loss_oop + loss_ip).into_scalar();
+        assert!(
+            (val - expected).abs() < 1e-5,
+            "cfvnet_loss ({val}) should equal sum of per-player losses ({expected})"
+        );
     }
 
     #[test]

@@ -145,8 +145,6 @@ pub struct TrainingConfig {
     pub lr_min: f64,
     #[serde(default = "default_huber_delta")]
     pub huber_delta: f64,
-    #[serde(default = "default_aux_loss_weight")]
-    pub aux_loss_weight: f64,
     #[serde(default = "default_validation_split")]
     pub validation_split: f64,
     #[serde(default = "default_checkpoint_interval")]
@@ -171,7 +169,6 @@ impl Default for TrainingConfig {
             learning_rate: 0.001,
             lr_min: 0.00001,
             huber_delta: 1.0,
-            aux_loss_weight: 1.0,
             validation_split: 0.05,
             checkpoint_every_n_epochs: 1000,
             gpu_chunk_size: 100_000,
@@ -201,9 +198,6 @@ fn default_lr_min() -> f64 {
     0.00001
 }
 fn default_huber_delta() -> f64 {
-    1.0
-}
-fn default_aux_loss_weight() -> f64 {
     1.0
 }
 fn default_validation_split() -> f64 {
@@ -286,7 +280,6 @@ training:
   learning_rate: 0.001
   lr_min: 0.00001
   huber_delta: 1.0
-  aux_loss_weight: 1.0
   validation_split: 0.05
   checkpoint_every_n_epochs: 1000
 "#;

@@ -50,7 +50,7 @@ fn full_pipeline_smoke_test() {
         learning_rate: 0.001,
         lr_min: 0.001,
         huber_delta: 1.0,
-        aux_loss_weight: 0.0,
+
         validation_split: 0.0,
         checkpoint_every_n_epochs: 0,
         gpu_chunk_size: 100,

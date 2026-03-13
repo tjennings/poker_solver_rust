@@ -122,6 +122,12 @@ See `sample_configurations/blueprint_v2_with_tui.yaml` for a complete example.
 
 The `cfvnet` crate trains Deep Counterfactual Value Networks following the Supremus/DeepStack approach: solve random subgames, extract per-combo counterfactual values, and train a neural network to predict them. Networks are trained bottom-up: river first, then turn (using the river network as leaf evaluator).
 
+> **Architecture change (breaking):** The CFVnet data format and network architecture have been updated. Existing training data must be regenerated.
+>
+> - **Removed:** player indicator input, `aux_loss_weight` config parameter, `game_value` from training records
+> - **Added:** 52-dim one-hot board card encoding replaces 5-card integer input; dual-player output head with hard zero-sum constraint (OOP CFVs predicted directly, IP CFVs derived as negative OOP)
+> - **Result:** A single forward pass now produces both players' counterfactual values. Old `.bin` data files are incompatible and must be regenerated.
+
 ### River Network
 
 #### Generate River Training Data
