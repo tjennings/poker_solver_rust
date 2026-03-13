@@ -51,6 +51,16 @@ struct PreEncoded {
     len: usize,
 }
 
+/// Tensors created on a device from pre-encoded data.
+struct DeviceTensors<B: Backend> {
+    input: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    mask: Tensor<B, 2>,
+    range: Tensor<B, 2>,
+    game_value: Tensor<B, 1>,
+    len: usize,
+}
+
 impl PreEncoded {
     /// Encode a slice of records into contiguous flat arrays.
     ///
@@ -83,6 +93,33 @@ impl PreEncoded {
         Self { input, target, mask, range, game_value, in_size, len: n }
     }
 
+    /// Create tensors on `device`, consuming the pre-encoded data.
+    fn into_device_tensors<B: Backend>(self, device: &B::Device) -> DeviceTensors<B> {
+        let n = self.len;
+        let in_size = self.in_size;
+        DeviceTensors {
+            input: Tensor::from_data(TensorData::new(self.input, [n, in_size]), device),
+            target: Tensor::from_data(TensorData::new(self.target, [n, OUTPUT_SIZE]), device),
+            mask: Tensor::from_data(TensorData::new(self.mask, [n, OUTPUT_SIZE]), device),
+            range: Tensor::from_data(TensorData::new(self.range, [n, OUTPUT_SIZE]), device),
+            game_value: Tensor::from_data(TensorData::new(self.game_value, [n]), device),
+            len: n,
+        }
+    }
+
+    /// Create tensors on `device` by cloning (for reusable data like validation).
+    fn to_device_tensors<B: Backend>(&self, device: &B::Device) -> DeviceTensors<B> {
+        let cloned = PreEncoded {
+            input: self.input.clone(),
+            target: self.target.clone(),
+            mask: self.mask.clone(),
+            range: self.range.clone(),
+            game_value: self.game_value.clone(),
+            in_size: self.in_size,
+            len: self.len,
+        };
+        cloned.into_device_tensors(device)
+    }
 }
 
 /// GPU-resident reservoir of training data.
@@ -134,27 +171,13 @@ impl<B: Backend> GpuReservoir<B> {
         let encoded = PreEncoded::from_records(&records, board_cards);
         let device = self.input.device();
         let n_actual = n.min(self.capacity);
+        let tensors = encoded.into_device_tensors::<B>(&device);
 
-        self.input = Tensor::from_data(
-            TensorData::new(encoded.input, [n_actual, self.in_size]),
-            &device,
-        );
-        self.target = Tensor::from_data(
-            TensorData::new(encoded.target, [n_actual, OUTPUT_SIZE]),
-            &device,
-        );
-        self.mask = Tensor::from_data(
-            TensorData::new(encoded.mask, [n_actual, OUTPUT_SIZE]),
-            &device,
-        );
-        self.range = Tensor::from_data(
-            TensorData::new(encoded.range, [n_actual, OUTPUT_SIZE]),
-            &device,
-        );
-        self.game_value = Tensor::from_data(
-            TensorData::new(encoded.game_value, [n_actual]),
-            &device,
-        );
+        self.input = tensors.input;
+        self.target = tensors.target;
+        self.mask = tensors.mask;
+        self.range = tensors.range;
+        self.game_value = tensors.game_value;
         self.capacity = n_actual;
         n_actual
     }
@@ -200,38 +223,18 @@ impl<B: Backend> GpuReservoir<B> {
             .map(|_| rng.gen_range(0..self.capacity) as i64)
             .collect();
 
-        // Create new-value tensors from the encoded data.
-        let new_input: Tensor<B, 2> = Tensor::from_data(
-            TensorData::new(encoded.input, [n, self.in_size]),
-            device,
-        );
-        let new_target: Tensor<B, 2> = Tensor::from_data(
-            TensorData::new(encoded.target, [n, OUTPUT_SIZE]),
-            device,
-        );
-        let new_mask: Tensor<B, 2> = Tensor::from_data(
-            TensorData::new(encoded.mask, [n, OUTPUT_SIZE]),
-            device,
-        );
-        let new_range: Tensor<B, 2> = Tensor::from_data(
-            TensorData::new(encoded.range, [n, OUTPUT_SIZE]),
-            device,
-        );
-        let new_gv: Tensor<B, 1> = Tensor::from_data(
-            TensorData::new(encoded.game_value, [n]),
-            device,
-        );
+        let tensors = encoded.into_device_tensors::<B>(device);
 
         // Use select_assign to scatter new values into the reservoir.
         let idx: Tensor<B, 1, Int> = Tensor::from_data(
             TensorData::new(positions, [n]),
             device,
         );
-        self.input = self.input.clone().select_assign(0, idx.clone(), new_input);
-        self.target = self.target.clone().select_assign(0, idx.clone(), new_target);
-        self.mask = self.mask.clone().select_assign(0, idx.clone(), new_mask);
-        self.range = self.range.clone().select_assign(0, idx.clone(), new_range);
-        self.game_value = self.game_value.clone().select_assign(0, idx, new_gv);
+        self.input = self.input.clone().select_assign(0, idx.clone(), tensors.input);
+        self.target = self.target.clone().select_assign(0, idx.clone(), tensors.target);
+        self.mask = self.mask.clone().select_assign(0, idx.clone(), tensors.mask);
+        self.range = self.range.clone().select_assign(0, idx.clone(), tensors.range);
+        self.game_value = self.game_value.clone().select_assign(0, idx, tensors.game_value);
     }
 }
 
@@ -256,20 +259,10 @@ fn compute_val_loss<B: AutodiffBackend>(
 ) -> f64 {
     let valid_model = model.valid();
     let n = encoded.len;
-    let in_size = encoded.in_size;
     let batch_size = config.batch_size;
 
     // Create full validation tensors on the inner (non-autodiff) backend.
-    let input: Tensor<B::InnerBackend, 2> = Tensor::from_data(
-        TensorData::new(encoded.input.clone(), [n, in_size]), device);
-    let target: Tensor<B::InnerBackend, 2> = Tensor::from_data(
-        TensorData::new(encoded.target.clone(), [n, OUTPUT_SIZE]), device);
-    let mask: Tensor<B::InnerBackend, 2> = Tensor::from_data(
-        TensorData::new(encoded.mask.clone(), [n, OUTPUT_SIZE]), device);
-    let range: Tensor<B::InnerBackend, 2> = Tensor::from_data(
-        TensorData::new(encoded.range.clone(), [n, OUTPUT_SIZE]), device);
-    let game_value: Tensor<B::InnerBackend, 1> = Tensor::from_data(
-        TensorData::new(encoded.game_value.clone(), [n]), device);
+    let tensors = encoded.to_device_tensors::<B::InnerBackend>(device);
 
     let mut total_loss = 0.0_f64;
     let mut batch_count = 0_u64;
@@ -278,11 +271,11 @@ fn compute_val_loss<B: AutodiffBackend>(
         let batch_end = (batch_start + batch_size).min(n);
         let len = batch_end - batch_start;
 
-        let b_input = input.clone().narrow(0, batch_start, len);
-        let b_target = target.clone().narrow(0, batch_start, len);
-        let b_mask = mask.clone().narrow(0, batch_start, len);
-        let b_range = range.clone().narrow(0, batch_start, len);
-        let b_gv = game_value.clone().narrow(0, batch_start, len);
+        let b_input = tensors.input.clone().narrow(0, batch_start, len);
+        let b_target = tensors.target.clone().narrow(0, batch_start, len);
+        let b_mask = tensors.mask.clone().narrow(0, batch_start, len);
+        let b_range = tensors.range.clone().narrow(0, batch_start, len);
+        let b_gv = tensors.game_value.clone().narrow(0, batch_start, len);
 
         let pred = valid_model.forward(b_input);
         let loss = cfvnet_loss(pred, b_target, b_mask, b_range, b_gv, config.huber_delta, config.aux_loss_weight);
