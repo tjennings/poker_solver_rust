@@ -203,6 +203,23 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
 
     let board_cards = cfvnet::config::board_cards_for_street(&cfg.datagen.street);
 
+    // Create output directory and write config before training starts,
+    // so the config is preserved even if training is interrupted.
+    std::fs::create_dir_all(&output).unwrap_or_else(|e| {
+        eprintln!("failed to create output directory {}: {e}", output.display());
+        std::process::exit(1);
+    });
+    let config_out = output.join("config.yaml");
+    let config_yaml = serde_yaml::to_string(&cfg).unwrap_or_else(|e| {
+        eprintln!("failed to serialize config: {e}");
+        std::process::exit(1);
+    });
+    std::fs::write(&config_out, &config_yaml).unwrap_or_else(|e| {
+        eprintln!("failed to write config to {}: {e}", config_out.display());
+        std::process::exit(1);
+    });
+    println!("Config saved to {}", config_out.display());
+
     let train_config = cfvnet::model::training::TrainConfig {
         hidden_layers: cfg.training.hidden_layers,
         hidden_size: cfg.training.hidden_size,
@@ -255,17 +272,6 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
             std::process::exit(1);
         }
     }
-
-    let config_out = output.join("config.yaml");
-    let yaml = serde_yaml::to_string(&cfg).unwrap_or_else(|e| {
-        eprintln!("failed to serialize config: {e}");
-        std::process::exit(1);
-    });
-    std::fs::write(&config_out, &yaml).unwrap_or_else(|e| {
-        eprintln!("failed to write config to {}: {e}", config_out.display());
-        std::process::exit(1);
-    });
-    println!("Config saved to {}", config_out.display());
 }
 
 fn cmd_generate(
