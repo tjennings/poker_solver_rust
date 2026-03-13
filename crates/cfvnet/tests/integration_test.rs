@@ -53,9 +53,8 @@ fn full_pipeline_smoke_test() {
         aux_loss_weight: 0.0,
         validation_split: 0.0,
         checkpoint_every_n_epochs: 0,
-        gpu_chunk_size: 100,
-        epochs_per_chunk: 1,
-        prefetch_chunks: 1,
+        reservoir_size: 100,
+        reservoir_turnover: 1.0,
     };
 
     let result = cfvnet::model::training::train::<B>(
