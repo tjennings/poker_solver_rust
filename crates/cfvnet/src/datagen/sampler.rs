@@ -102,7 +102,7 @@ fn sample_pot_stack_by_spr<R: Rng>(
     rng: &mut R,
 ) -> (i32, i32) {
     let stack_f = initial_stack as f64;
-    loop {
+    for _ in 0..10_000 {
         // 1. Pick BOTH buckets uniformly
         let spr_idx = rng.gen_range(0..spr_intervals.len());
         let [spr_lo, spr_hi] = spr_intervals[spr_idx];
@@ -144,6 +144,10 @@ fn sample_pot_stack_by_spr<R: Rng>(
             return (pot, stack);
         }
     }
+    panic!(
+        "sample_pot_stack_by_spr: exceeded 10000 attempts; \
+         check that pot_intervals and spr_intervals are feasible for initial_stack={initial_stack}"
+    );
 }
 
 #[cfg(test)]
