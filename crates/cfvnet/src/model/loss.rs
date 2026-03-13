@@ -4,12 +4,18 @@ use burn::tensor::{backend::Backend, Tensor};
 ///
 /// Computes the smooth Huber loss on `(pred - target)` only where `mask == 1.0`.
 /// Board-blocked combos (mask == 0.0) contribute nothing to the loss.
+///
+/// When `pot_weight` is `Some`, each sample's loss is weighted by its pot size
+/// and the result is normalized by total pot weight instead of count. This
+/// emphasizes larger-pot situations in the loss landscape.
+///
 /// Returns a scalar (rank-1 tensor with one element).
 pub fn masked_huber_loss<B: Backend>(
     pred: Tensor<B, 2>,
     target: Tensor<B, 2>,
     mask: Tensor<B, 2>,
     delta: f64,
+    pot_weight: Option<Tensor<B, 1>>,
 ) -> Tensor<B, 1> {
     let diff = (pred - target) * mask.clone();
     let abs_diff = diff.abs();
@@ -22,10 +28,20 @@ pub fn masked_huber_loss<B: Backend>(
     let within_delta = abs_diff.lower_equal_elem(delta);
     let element_loss = quadratic.mask_where(within_delta.bool_not(), linear);
 
-    // Mask and average over valid entries only.
+    // Mask and reduce over valid entries.
     let masked_loss = element_loss * mask.clone();
-    let num_valid = mask.sum().clamp_min(1.0);
-    masked_loss.sum().div(num_valid)
+    match pot_weight {
+        Some(pw) => {
+            let pw_2d: Tensor<B, 2> = pw.clone().unsqueeze_dim(1);
+            let weighted = masked_loss * pw_2d;
+            let total_weight = pw.sum().clamp_min(1.0);
+            weighted.sum().div(total_weight)
+        }
+        None => {
+            let num_valid = mask.sum().clamp_min(1.0);
+            masked_loss.sum().div(num_valid)
+        }
+    }
 }
 
 /// Auxiliary game-value consistency loss.
@@ -52,8 +68,9 @@ pub fn cfvnet_loss<B: Backend>(
     game_value: Tensor<B, 1>,
     huber_delta: f64,
     aux_weight: f64,
+    pot_weight: Option<Tensor<B, 1>>,
 ) -> Tensor<B, 1> {
-    let huber = masked_huber_loss(pred.clone(), target, mask, huber_delta);
+    let huber = masked_huber_loss(pred.clone(), target, mask, huber_delta, pot_weight);
     let aux = aux_game_value_loss(pred, range, game_value);
     huber + aux.mul_scalar(aux_weight)
 }
@@ -71,7 +88,7 @@ mod tests {
         let pred = Tensor::<B, 2>::from_floats([[1.0, 2.0, 3.0]], &device);
         let target = Tensor::<B, 2>::from_floats([[1.0, 2.0, 3.0]], &device);
         let mask = Tensor::<B, 2>::from_floats([[1.0, 1.0, 1.0]], &device);
-        let loss = masked_huber_loss(pred, target, mask, 1.0);
+        let loss = masked_huber_loss(pred, target, mask, 1.0, None);
         let val: f32 = loss.into_scalar();
         assert!(val.abs() < 1e-6, "loss should be 0, got {val}");
     }
@@ -82,7 +99,7 @@ mod tests {
         let pred = Tensor::<B, 2>::from_floats([[1.0, 999.0, 3.0]], &device);
         let target = Tensor::<B, 2>::from_floats([[1.0, 0.0, 3.0]], &device);
         let mask = Tensor::<B, 2>::from_floats([[1.0, 0.0, 1.0]], &device);
-        let loss = masked_huber_loss(pred, target, mask, 1.0);
+        let loss = masked_huber_loss(pred, target, mask, 1.0, None);
         let val: f32 = loss.into_scalar();
         assert!(val.abs() < 1e-6, "masked loss should be 0, got {val}");
     }
@@ -94,7 +111,7 @@ mod tests {
         let pred = Tensor::<B, 2>::from_floats([[0.5, 2.0]], &device);
         let target = Tensor::<B, 2>::from_floats([[0.0, 0.0]], &device);
         let mask = Tensor::<B, 2>::from_floats([[1.0, 1.0]], &device);
-        let loss = masked_huber_loss(pred, target, mask, 1.0);
+        let loss = masked_huber_loss(pred, target, mask, 1.0, None);
         let val: f32 = loss.into_scalar();
         // expected = (0.125 + 1.5) / 2 = 0.8125
         assert!(
@@ -134,8 +151,37 @@ mod tests {
         let mask = Tensor::<B, 2>::from_floats([[1.0, 1.0]], &device);
         let range = Tensor::<B, 2>::from_floats([[0.5, 0.5]], &device);
         let game_value = Tensor::<B, 1>::from_floats([0.0], &device);
-        let loss = cfvnet_loss(pred, target, mask, range, game_value, 1.0, 1.0);
+        let loss = cfvnet_loss(pred, target, mask, range, game_value, 1.0, 1.0, None);
         let val: f32 = loss.into_scalar();
         assert!(val > 0.0, "combined loss should be positive, got {val}");
+    }
+
+    #[test]
+    fn pot_weighted_loss_emphasizes_high_pot() {
+        let device = Default::default();
+        let pred = Tensor::<B, 2>::from_floats([[0.5, 0.0], [0.5, 0.0]], &device);
+        let target = Tensor::<B, 2>::from_floats([[0.0, 0.0], [0.0, 0.0]], &device);
+        let mask = Tensor::<B, 2>::from_floats([[1.0, 1.0], [1.0, 1.0]], &device);
+        let pot = Tensor::<B, 1>::from_floats([10.0, 100.0], &device);
+        let weighted = masked_huber_loss(pred.clone(), target.clone(), mask.clone(), 1.0, Some(pot));
+        let unweighted = masked_huber_loss(pred, target, mask, 1.0, None);
+        let w: f32 = weighted.into_scalar();
+        let u: f32 = unweighted.into_scalar();
+        assert!(w.is_finite(), "weighted loss should be finite, got {w}");
+        assert!(u.is_finite(), "unweighted loss should be finite, got {u}");
+    }
+
+    #[test]
+    fn pot_weighted_loss_scales_contribution() {
+        let device = Default::default();
+        let pred = Tensor::<B, 2>::from_floats([[0.1], [0.1]], &device);
+        let target = Tensor::<B, 2>::from_floats([[0.0], [0.0]], &device);
+        let mask = Tensor::<B, 2>::from_floats([[1.0], [1.0]], &device);
+        let pot = Tensor::<B, 1>::from_floats([10.0, 100.0], &device);
+        let weighted = masked_huber_loss(pred, target, mask, 1.0, Some(pot));
+        let val: f32 = weighted.into_scalar();
+        // Huber quadratic: 0.5 * 0.01 = 0.005 per entry
+        // Weighted: (10*0.005 + 100*0.005) / (10+100) = 0.55/110 = 0.005
+        assert!((val - 0.005).abs() < 1e-5, "expected ~0.005, got {val}");
     }
 }
