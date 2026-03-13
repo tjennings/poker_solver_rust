@@ -143,6 +143,27 @@ cargo run -p cfvnet --release -- train \
   --output models/river_v1
 ```
 
+#### Training Configuration
+
+The `training` section of the YAML config controls the network architecture and training loop. Key parameters:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `hidden_layers` | 7 | Number of hidden layers |
+| `hidden_size` | 500 | Width of each hidden layer |
+| `batch_size` | 2048 | Mini-batch size |
+| `epochs` | 2 | Number of training epochs |
+| `learning_rate` | 0.001 | Initial learning rate (cosine annealed) |
+| `lr_min` | 0.00001 | Minimum learning rate at end of schedule |
+| `huber_delta` | 1.0 | Huber loss delta threshold |
+| `aux_loss_weight` | 1.0 | Weight for auxiliary game-value loss |
+| `validation_split` | 0.05 | Fraction of data reserved for validation |
+| `checkpoint_every_n_epochs` | 1000 | Save checkpoint every N epochs (0 = disabled) |
+| `reservoir_size` | 1500000 | Number of training records held in the GPU-resident reservoir |
+| `reservoir_turnover` | 1.0 | Fraction of reservoir replaced per epoch by background refresh (0 = no refresh) |
+
+The training loop uses a **GPU-resident reservoir**: `reservoir_size` records are loaded into GPU memory as tensors, and mini-batches are sampled directly on-device (zero PCIe transfer). A background thread continuously reads fresh records from disk and scatters them into random reservoir positions. Set `reservoir_turnover` to 0 to disable refresh (useful for small datasets that fit entirely in the reservoir). Values above 1.0 mean the full reservoir is replaced more than once per epoch.
+
 #### Evaluate on Held-Out Data
 
 ```bash
