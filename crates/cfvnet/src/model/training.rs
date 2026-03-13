@@ -48,6 +48,7 @@ struct PreEncoded {
     mask: Vec<f32>,
     range: Vec<f32>,
     game_value: Vec<f32>,
+    pot: Vec<f32>,
     in_size: usize,
     len: usize,
 }
@@ -72,6 +73,7 @@ impl PreEncoded {
         let mut mask = Vec::with_capacity(n * OUTPUT_SIZE);
         let mut range = Vec::with_capacity(n * OUTPUT_SIZE);
         let mut game_value = Vec::with_capacity(n);
+        let mut pot = Vec::with_capacity(n);
 
         for item in &items {
             input.extend_from_slice(&item.input);
@@ -79,9 +81,10 @@ impl PreEncoded {
             mask.extend_from_slice(&item.mask);
             range.extend_from_slice(&item.range);
             game_value.push(item.game_value);
+            pot.push(item.pot);
         }
 
-        Self { input, target, mask, range, game_value, in_size, len: n }
+        Self { input, target, mask, range, game_value, pot, in_size, len: n }
     }
 
     /// Consume self and create tensors on `device`, avoiding copies.
@@ -94,6 +97,7 @@ impl PreEncoded {
             mask: Tensor::from_data(TensorData::new(self.mask, [n, OUTPUT_SIZE]), device),
             range: Tensor::from_data(TensorData::new(self.range, [n, OUTPUT_SIZE]), device),
             game_value: Tensor::from_data(TensorData::new(self.game_value, [n]), device),
+            pot: Tensor::from_data(TensorData::new(self.pot, [n]), device),
             len: n,
         }
     }
@@ -108,6 +112,7 @@ impl PreEncoded {
             mask: Tensor::from_data(TensorData::new(self.mask.clone(), [n, OUTPUT_SIZE]), device),
             range: Tensor::from_data(TensorData::new(self.range.clone(), [n, OUTPUT_SIZE]), device),
             game_value: Tensor::from_data(TensorData::new(self.game_value.clone(), [n]), device),
+            pot: Tensor::from_data(TensorData::new(self.pot.clone(), [n]), device),
             len: n,
         }
     }
@@ -126,6 +131,7 @@ impl PreEncoded {
         let mut mask = Vec::with_capacity(n * OUTPUT_SIZE);
         let mut range = Vec::with_capacity(n * OUTPUT_SIZE);
         let mut gv = Vec::with_capacity(n);
+        let mut pot = Vec::with_capacity(n);
 
         for &idx in indices {
             let i_start = idx * in_size;
@@ -135,6 +141,7 @@ impl PreEncoded {
             mask.extend_from_slice(&self.mask[o_start..o_start + OUTPUT_SIZE]);
             range.extend_from_slice(&self.range[o_start..o_start + OUTPUT_SIZE]);
             gv.push(self.game_value[idx]);
+            pot.push(self.pot[idx]);
         }
 
         ChunkTensors {
@@ -143,6 +150,7 @@ impl PreEncoded {
             mask: Tensor::from_data(TensorData::new(mask, [n, OUTPUT_SIZE]), device),
             range: Tensor::from_data(TensorData::new(range, [n, OUTPUT_SIZE]), device),
             game_value: Tensor::from_data(TensorData::new(gv, [n]), device),
+            pot: Tensor::from_data(TensorData::new(pot, [n]), device),
             len: n,
         }
     }
@@ -155,6 +163,7 @@ struct ChunkTensors<B: Backend> {
     mask: Tensor<B, 2>,
     range: Tensor<B, 2>,
     game_value: Tensor<B, 1>,
+    pot: Tensor<B, 1>,
     len: usize,
 }
 
@@ -166,6 +175,7 @@ impl<B: Backend> ChunkTensors<B> {
             target: self.target.clone().select(0, perm.clone()),
             mask: self.mask.clone().select(0, perm.clone()),
             range: self.range.clone().select(0, perm.clone()),
+            pot: self.pot.clone().select(0, perm.clone()),
             game_value: self.game_value.clone().select(0, perm),
             len: self.len,
         }
@@ -180,6 +190,7 @@ impl<B: Backend> ChunkTensors<B> {
             mask: self.mask.clone().narrow(0, start, len),
             range: self.range.clone().narrow(0, start, len),
             game_value: self.game_value.clone().narrow(0, start, len),
+            pot: self.pot.clone().narrow(0, start, len),
         }
     }
 }
@@ -191,6 +202,7 @@ struct MiniBatch<B: Backend> {
     mask: Tensor<B, 2>,
     range: Tensor<B, 2>,
     game_value: Tensor<B, 1>,
+    pot: Tensor<B, 1>,
 }
 
 /// Cosine annealing learning rate schedule.
