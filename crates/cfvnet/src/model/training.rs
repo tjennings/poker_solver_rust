@@ -357,12 +357,13 @@ fn load_validation_set(
 /// reader on EOF) until the receiver is dropped.
 fn spawn_dataloader_thread(
     files: &[PathBuf],
-    batch_size: usize,
-    shuffle_buffer_size: usize,
-    prefetch_depth: usize,
+    config: &TrainConfig,
     val_count: usize,
     board_cards: usize,
 ) -> (mpsc::Receiver<PreEncoded>, std::thread::JoinHandle<()>) {
+    let batch_size = config.batch_size;
+    let shuffle_buffer_size = config.shuffle_buffer_size;
+    let prefetch_depth = config.prefetch_depth;
     let (tx, rx) = mpsc::sync_channel::<PreEncoded>(prefetch_depth);
     let loader_files = files.to_vec();
     let thread = std::thread::spawn(move || {
@@ -373,10 +374,16 @@ fn spawn_dataloader_thread(
         if val_count > 0 {
             let _ = reader.read_chunk(val_count);
         }
+        let mut consecutive_empty = 0u32;
         loop {
             // Read a shuffle buffer worth of records.
             let mut records = reader.read_chunk(shuffle_buffer_size);
             if records.is_empty() {
+                consecutive_empty += 1;
+                if consecutive_empty > 3 {
+                    eprintln!("Warning: dataloader exhausted all files after 3 retries, stopping");
+                    return;
+                }
                 // EOF: reset reader, skip validation records, continue.
                 reader.reset();
                 if val_count > 0 {
@@ -384,6 +391,7 @@ fn spawn_dataloader_thread(
                 }
                 continue;
             }
+            consecutive_empty = 0;
             // Shuffle the buffer.
             records.shuffle(&mut rng);
             // Split into batch_size chunks, encode, and send.
@@ -447,9 +455,7 @@ pub fn train<B: AutodiffBackend>(
 
     let (data_rx, loader_thread) = spawn_dataloader_thread(
         &files,
-        batch_size,
-        config.shuffle_buffer_size,
-        config.prefetch_depth,
+        config,
         val_count,
         board_cards,
     );
@@ -546,7 +552,9 @@ pub fn train<B: AutodiffBackend>(
 
     // Drop data channel to signal thread to exit, then join.
     drop(data_rx);
-    let _ = loader_thread.join();
+    if let Err(e) = loader_thread.join() {
+        eprintln!("ERROR: dataloader thread panicked: {e:?}");
+    }
 
     // Save final model.
     if let Some(dir) = output_dir {
@@ -826,6 +834,36 @@ mod tests {
         reader.reset();
         let all = reader.read_chunk(100);
         assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn dataloader_stops_on_empty_files() {
+        // Create a directory with an empty file (no valid records).
+        let dir = tempfile::tempdir().unwrap();
+        let empty_path = dir.path().join("empty.bin");
+        std::fs::File::create(&empty_path).unwrap();
+
+        let config = TrainConfig {
+            batch_size: 8,
+            shuffle_buffer_size: 100,
+            prefetch_depth: 2,
+            ..default_test_config()
+        };
+
+        let (rx, handle) = spawn_dataloader_thread(
+            &[empty_path],
+            &config,
+            0,
+            5,
+        );
+
+        // The thread should stop after 3 consecutive empty reads,
+        // causing recv() to return Err.
+        let result = rx.recv();
+        assert!(result.is_err(), "expected channel to close after consecutive empty reads");
+
+        // Thread should have exited cleanly (no panic).
+        assert!(handle.join().is_ok(), "dataloader thread should not panic");
     }
 
 }
