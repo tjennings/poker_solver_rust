@@ -2,10 +2,9 @@ use burn::module::{AutodiffModule, Module};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::{Int, Tensor, TensorData};
+use burn::tensor::{Tensor, TensorData};
 
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -399,12 +398,11 @@ fn spawn_dataloader_thread(
     (rx, thread)
 }
 
-/// Train a `CfvNet` using a GPU-resident reservoir.
+/// Train a `CfvNet` using a streaming dataloader.
 ///
-/// The reservoir holds `reservoir_size` records in GPU memory. Training samples
-/// random batches directly from GPU tensors (zero PCIe transfer). A background
-/// thread continuously refreshes records from disk. One epoch = `total_records /
-/// batch_size` training steps.
+/// A background thread reads records from disk, shuffles them in a buffer,
+/// splits into batches, and sends pre-encoded data over a channel. One epoch =
+/// `train_records / batch_size` training steps.
 pub fn train<B: AutodiffBackend>(
     device: &B::Device,
     data_path: &Path,
@@ -417,7 +415,6 @@ pub fn train<B: AutodiffBackend>(
     let mut model = load_or_create_model(model, output_dir, device);
 
     let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
-    let mut rng = ChaCha8Rng::seed_from_u64(42);
 
     let files = collect_data_files(data_path).unwrap_or_else(|e| {
         eprintln!("failed to collect data files: {e}");
@@ -433,38 +430,29 @@ pub fn train<B: AutodiffBackend>(
         return TrainResult { final_train_loss: f32::MAX };
     }
 
-    let val_count = ((config.reservoir_size as f64 * config.validation_split) as usize)
+    let val_count = ((total_records as f64 * config.validation_split) as usize)
         .min(total_records);
     let val_encoded = load_validation_set(&files, val_count, board_cards);
 
-    // Fill reservoir from disk.
-    let reservoir_cap = config.reservoir_size.min(total_records);
-    eprintln!("Filling reservoir ({reservoir_cap} records)...");
-    let mut reservoir = GpuReservoir::<B::InnerBackend>::new(device, reservoir_cap, board_cards);
-    {
-        let mut fill_reader = StreamingReader::new(files.clone());
-        // Skip past validation records so they don't leak into the reservoir.
-        if val_count > 0 {
-            let _ = fill_reader.read_chunk(val_count);
-        }
-        let filled = reservoir.fill(&mut fill_reader, board_cards);
-        eprintln!("Reservoir filled: {filled} records");
-    }
-
     // Compute training schedule.
+    let train_records = total_records - val_count;
     let batch_size = config.batch_size;
-    let steps_per_epoch = total_records.div_ceil(batch_size);
+    let steps_per_epoch = train_records.div_ceil(batch_size);
     let total_steps = steps_per_epoch * config.epochs;
-    let refresh_per_step = ((reservoir_cap as f64 * config.reservoir_turnover)
-        / steps_per_epoch as f64)
-        .ceil() as usize;
 
     eprintln!(
-        "Training: {} epochs x {} steps/epoch = {} total steps, refresh {}/step",
-        config.epochs, steps_per_epoch, total_steps, refresh_per_step
+        "Training: {} epochs x {} steps/epoch = {} total steps",
+        config.epochs, steps_per_epoch, total_steps
     );
 
-    let (refresh_rx, refresh_thread) = spawn_refresh_thread(&files, refresh_per_step, val_count, board_cards);
+    let (data_rx, loader_thread) = spawn_dataloader_thread(
+        &files,
+        batch_size,
+        config.shuffle_buffer_size,
+        config.prefetch_depth,
+        val_count,
+        board_cards,
+    );
 
     let mut final_loss = f32::MAX;
     let mut global_step: usize = 0;
@@ -481,14 +469,14 @@ pub fn train<B: AutodiffBackend>(
         let mut epoch_loss_count = 0_u64;
 
         for step_in_epoch in 0..steps_per_epoch {
-            // Apply any pending refresh batch (non-blocking).
-            if let Ok(encoded) = refresh_rx.try_recv() {
-                reservoir.scatter_refresh(encoded, &mut rng, device);
-            }
+            // Receive next pre-encoded batch from the dataloader (blocking).
+            let encoded = match data_rx.recv() {
+                Ok(e) => e,
+                Err(_) => break, // Channel closed unexpectedly.
+            };
 
-            // Sample batch from reservoir (inner backend, no autodiff graph)
-            // and convert to autodiff tensors for the training step.
-            let batch = reservoir.sample_batch(batch_size, &mut rng, device);
+            // Create tensors on the inner (non-autodiff) backend, then lift.
+            let batch = encoded.into_device_tensors::<B::InnerBackend>(device);
             let input = Tensor::<B, 2>::from_inner(batch.input);
             let target = Tensor::<B, 2>::from_inner(batch.target);
             let mask = Tensor::<B, 2>::from_inner(batch.mask);
@@ -556,11 +544,9 @@ pub fn train<B: AutodiffBackend>(
         }
     }
 
-    // Drop refresh channel to signal thread to exit, then join.
-    drop(refresh_rx);
-    if let Some(thread) = refresh_thread {
-        let _ = thread.join();
-    }
+    // Drop data channel to signal thread to exit, then join.
+    drop(data_rx);
+    let _ = loader_thread.join();
 
     // Save final model.
     if let Some(dir) = output_dir {
