@@ -350,33 +350,38 @@ fn load_validation_set(
     Some(PreEncoded::from_records(&val_records, board_cards))
 }
 
-/// Spawn the background dataloader thread that reads records from disk, shuffles
-/// them, splits into batches, encodes, and sends through a bounded channel.
+/// Spawn a two-stage dataloader pipeline: a reader thread that reads and
+/// shuffles records, and an encoder thread that encodes batches in parallel
+/// via rayon. This overlaps disk I/O with CPU encoding.
 ///
-/// Returns `(receiver, JoinHandle)`. The thread loops forever (resetting the
-/// reader on EOF) until the receiver is dropped.
+/// Returns `(batch_receiver, thread_handles)`. The threads exit cleanly when
+/// the receiver is dropped (cascading channel close).
 fn spawn_dataloader_thread(
     files: &[PathBuf],
     config: &TrainConfig,
     val_count: usize,
     board_cards: usize,
-) -> (mpsc::Receiver<PreEncoded>, std::thread::JoinHandle<()>) {
+) -> (mpsc::Receiver<PreEncoded>, Vec<std::thread::JoinHandle<()>>) {
     let batch_size = config.batch_size;
     let shuffle_buffer_size = config.shuffle_buffer_size;
     let prefetch_depth = config.prefetch_depth;
-    let (tx, rx) = mpsc::sync_channel::<PreEncoded>(prefetch_depth);
-    let loader_files = files.to_vec();
-    let thread = std::thread::spawn(move || {
+
+    // Stage 1 → Stage 2: un-encoded record batches.
+    let (record_tx, record_rx) = mpsc::sync_channel::<Vec<TrainingRecord>>(prefetch_depth * 2);
+    // Stage 2 → Training loop: encoded batches.
+    let (batch_tx, batch_rx) = mpsc::sync_channel::<PreEncoded>(prefetch_depth);
+
+    // Stage 1: Reader thread — reads chunks, shuffles, splits into batch slices.
+    let reader_files = files.to_vec();
+    let reader_thread = std::thread::spawn(move || {
         use rand::seq::SliceRandom;
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let mut reader = StreamingReader::new(loader_files);
-        // Skip past validation records so they don't leak into training.
+        let mut reader = StreamingReader::new(reader_files);
         if val_count > 0 {
             let _ = reader.read_chunk(val_count);
         }
         let mut consecutive_empty = 0u32;
         loop {
-            // Read a shuffle buffer worth of records.
             let mut records = reader.read_chunk(shuffle_buffer_size);
             if records.is_empty() {
                 consecutive_empty += 1;
@@ -384,7 +389,6 @@ fn spawn_dataloader_thread(
                     eprintln!("Warning: dataloader exhausted all files after 3 retries, stopping");
                     return;
                 }
-                // EOF: reset reader, skip validation records, continue.
                 reader.reset();
                 if val_count > 0 {
                     let _ = reader.read_chunk(val_count);
@@ -392,18 +396,26 @@ fn spawn_dataloader_thread(
                 continue;
             }
             consecutive_empty = 0;
-            // Shuffle the buffer.
             records.shuffle(&mut rng);
-            // Split into batch_size chunks, encode, and send.
             for chunk in records.chunks(batch_size) {
-                let encoded = PreEncoded::from_records(chunk, board_cards);
-                if tx.send(encoded).is_err() {
-                    return; // Channel closed, training done.
+                if record_tx.send(chunk.to_vec()).is_err() {
+                    return;
                 }
             }
         }
     });
-    (rx, thread)
+
+    // Stage 2: Encoder thread — receives record batches, encodes via rayon, sends.
+    let encoder_thread = std::thread::spawn(move || {
+        while let Ok(records) = record_rx.recv() {
+            let encoded = PreEncoded::from_records(&records, board_cards);
+            if batch_tx.send(encoded).is_err() {
+                return;
+            }
+        }
+    });
+
+    (batch_rx, vec![reader_thread, encoder_thread])
 }
 
 /// Train a `CfvNet` using a streaming dataloader.
@@ -453,7 +465,7 @@ pub fn train<B: AutodiffBackend>(
         config.epochs, steps_per_epoch, total_steps
     );
 
-    let (data_rx, loader_thread) = spawn_dataloader_thread(
+    let (data_rx, loader_threads) = spawn_dataloader_thread(
         &files,
         config,
         val_count,
@@ -550,10 +562,12 @@ pub fn train<B: AutodiffBackend>(
         }
     }
 
-    // Drop data channel to signal thread to exit, then join.
+    // Drop data channel to signal threads to exit (cascading close), then join.
     drop(data_rx);
-    if let Err(e) = loader_thread.join() {
-        eprintln!("ERROR: dataloader thread panicked: {e:?}");
+    for handle in loader_threads {
+        if let Err(e) = handle.join() {
+            eprintln!("ERROR: dataloader thread panicked: {e:?}");
+        }
     }
 
     // Save final model.
@@ -850,20 +864,22 @@ mod tests {
             ..default_test_config()
         };
 
-        let (rx, handle) = spawn_dataloader_thread(
+        let (rx, handles) = spawn_dataloader_thread(
             &[empty_path],
             &config,
             0,
             5,
         );
 
-        // The thread should stop after 3 consecutive empty reads,
-        // causing recv() to return Err.
+        // The reader thread should stop after 3 consecutive empty reads,
+        // cascading close through the encoder, causing recv() to return Err.
         let result = rx.recv();
         assert!(result.is_err(), "expected channel to close after consecutive empty reads");
 
-        // Thread should have exited cleanly (no panic).
-        assert!(handle.join().is_ok(), "dataloader thread should not panic");
+        // Both threads should have exited cleanly (no panic).
+        for handle in handles {
+            assert!(handle.join().is_ok(), "dataloader thread should not panic");
+        }
     }
 
 }
