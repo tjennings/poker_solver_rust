@@ -428,6 +428,88 @@ fn count_total_records(files: &[PathBuf]) -> u64 {
     total
 }
 
+/// Load a model from checkpoint if it exists, otherwise return the model as-is.
+fn load_or_create_model<B: AutodiffBackend>(
+    model: CfvNet<B>,
+    output_dir: Option<&Path>,
+    device: &B::Device,
+) -> CfvNet<B> {
+    let Some(dir) = output_dir else { return model };
+    let model_path = dir.join("model");
+    if !model_path.with_extension("mpk.gz").exists() {
+        return model;
+    }
+    let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+    match model.clone().load_file(model_path, &recorder, device) {
+        Ok(loaded) => {
+            eprintln!("Resuming from checkpoint");
+            loaded
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to load checkpoint, starting fresh: {e}");
+            model
+        }
+    }
+}
+
+/// Load validation records and return them pre-encoded.
+fn load_validation_set(
+    files: &[PathBuf],
+    val_count: usize,
+    board_cards: usize,
+) -> Option<PreEncoded> {
+    if val_count == 0 {
+        return None;
+    }
+    eprintln!("Loading {val_count} validation records...");
+    let mut val_reader = StreamingReader::new(files.to_vec());
+    let val_records = val_reader.read_chunk(val_count);
+    let actual_val = val_records.len();
+    eprintln!("Loaded {actual_val} validation records");
+    Some(PreEncoded::from_records(&val_records, board_cards))
+}
+
+/// Spawn the background refresh thread that reads records from disk and sends
+/// pre-encoded batches over the channel.
+///
+/// Returns `(receiver, Option<JoinHandle>)`. If `refresh_per_step` is 0, no
+/// thread is spawned and the sender is dropped immediately.
+fn spawn_refresh_thread(
+    files: &[PathBuf],
+    refresh_per_step: usize,
+    board_cards: usize,
+) -> (mpsc::Receiver<PreEncoded>, Option<std::thread::JoinHandle<()>>) {
+    let (refresh_tx, refresh_rx) = mpsc::sync_channel::<PreEncoded>(4);
+    let thread = if refresh_per_step > 0 {
+        let refresh_files = files.to_vec();
+        Some(std::thread::spawn(move || {
+            let mut reader = StreamingReader::new(refresh_files);
+            let mut consecutive_empty = 0u32;
+            loop {
+                let records = reader.read_chunk(refresh_per_step);
+                if records.is_empty() {
+                    consecutive_empty += 1;
+                    if consecutive_empty > 3 {
+                        eprintln!("Warning: refresh thread exhausted all files after 3 retries, stopping");
+                        return;
+                    }
+                    reader.reset();
+                    continue;
+                }
+                consecutive_empty = 0;
+                let encoded = PreEncoded::from_records(&records, board_cards);
+                if refresh_tx.send(encoded).is_err() {
+                    return; // Training done, channel closed.
+                }
+            }
+        }))
+    } else {
+        drop(refresh_tx);
+        None
+    };
+    (refresh_rx, thread)
+}
+
 /// Train a `CfvNet` using a GPU-resident reservoir.
 ///
 /// The reservoir holds `reservoir_size` records in GPU memory. Training samples
@@ -442,24 +524,8 @@ pub fn train<B: AutodiffBackend>(
     output_dir: Option<&std::path::Path>,
 ) -> TrainResult {
     let in_size = input_size(board_cards);
-    let mut model = CfvNet::<B>::new(device, config.hidden_layers, config.hidden_size, in_size);
-
-    // Resume from checkpoint if a saved model exists.
-    if let Some(dir) = output_dir {
-        let model_path = dir.join("model");
-        if model_path.with_extension("mpk.gz").exists() {
-            let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
-            match model.clone().load_file(model_path, &recorder, device) {
-                Ok(loaded) => {
-                    eprintln!("Resuming from checkpoint");
-                    model = loaded;
-                }
-                Err(e) => {
-                    eprintln!("Warning: failed to load checkpoint, starting fresh: {e}");
-                }
-            }
-        }
-    }
+    let model = CfvNet::<B>::new(device, config.hidden_layers, config.hidden_size, in_size);
+    let mut model = load_or_create_model(model, output_dir, device);
 
     let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
     let mut rng = ChaCha8Rng::seed_from_u64(42);
@@ -478,18 +544,8 @@ pub fn train<B: AutodiffBackend>(
         return TrainResult { final_train_loss: f32::MAX };
     }
 
-    // Load validation set.
     let val_count = (total_records as f64 * config.validation_split) as usize;
-    let val_encoded = if val_count > 0 {
-        eprintln!("Loading {val_count} validation records...");
-        let mut val_reader = StreamingReader::new(files.clone());
-        let val_records = val_reader.read_chunk(val_count);
-        let actual_val = val_records.len();
-        eprintln!("Loaded {actual_val} validation records");
-        Some(PreEncoded::from_records(&val_records, board_cards))
-    } else {
-        None
-    };
+    let val_encoded = load_validation_set(&files, val_count, board_cards);
 
     // Fill reservoir from disk.
     let reservoir_cap = config.reservoir_size.min(total_records);
@@ -518,36 +574,7 @@ pub fn train<B: AutodiffBackend>(
         config.epochs, steps_per_epoch, total_steps, refresh_per_step
     );
 
-    // Spawn refresh thread: reads from disk, encodes, sends PreEncoded batches.
-    // Only spawn if turnover > 0, otherwise no refresh needed.
-    let (refresh_tx, refresh_rx) = mpsc::sync_channel::<PreEncoded>(4);
-    let refresh_thread = if refresh_per_step > 0 {
-        let refresh_files = files.clone();
-        Some(std::thread::spawn(move || {
-            let mut reader = StreamingReader::new(refresh_files);
-            let mut consecutive_empty = 0u32;
-            loop {
-                let records = reader.read_chunk(refresh_per_step);
-                if records.is_empty() {
-                    consecutive_empty += 1;
-                    if consecutive_empty > 3 {
-                        eprintln!("Warning: refresh thread exhausted all files after 3 retries, stopping");
-                        return;
-                    }
-                    reader.reset();
-                    continue;
-                }
-                consecutive_empty = 0;
-                let encoded = PreEncoded::from_records(&records, board_cards);
-                if refresh_tx.send(encoded).is_err() {
-                    return; // Training done, channel closed.
-                }
-            }
-        }))
-    } else {
-        drop(refresh_tx);
-        None
-    };
+    let (refresh_rx, refresh_thread) = spawn_refresh_thread(&files, refresh_per_step, board_cards);
 
     let mut final_loss = f32::MAX;
     let mut global_step: usize = 0;
