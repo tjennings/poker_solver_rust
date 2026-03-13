@@ -576,6 +576,12 @@ fn cmd_datagen_eval(data: PathBuf) {
 
     print_raw_frequency_histogram("Frequency by Stack Size", &stacks);
     print_raw_frequency_histogram("Frequency by Pot Size", &pots);
+
+    let sprs: Vec<f64> = pots.iter().zip(&stacks)
+        .filter(|(p, _)| **p > 0.0)
+        .map(|(p, s)| *s / *p)
+        .collect();
+    print_spr_frequency_histogram("Frequency by SPR", &sprs);
 }
 
 fn print_raw_frequency_histogram(title: &str, values: &[f64]) {
@@ -609,6 +615,88 @@ fn print_raw_frequency_histogram(title: &str, values: &[f64]) {
         let bar_len = ((count as f64 / max_count as f64) * BAR_WIDTH as f64).round() as usize;
         let bar: String = "█".repeat(bar_len);
         println!("  {:>6.0}-{:<6.0} |{:<width$}| {}", lo, hi, bar, count, width = BAR_WIDTH);
+    }
+}
+
+const SPR_BOUNDARIES: &[f64] = &[0.0, 0.5, 1.5, 4.0, 8.0, 50.0];
+const SPR_LABELS: &[&str] = &[
+    "0.0-0.5  jam/fold   ",
+    "0.5-1.5  ~1 PSB     ",
+    "1.5-4.0  bread&butter",
+    "4.0-8.0  single st  ",
+    "8.0-50.0 deep/limped",
+];
+
+fn spr_bucket(spr: f64) -> Option<usize> {
+    for i in 0..SPR_LABELS.len() {
+        if spr >= SPR_BOUNDARIES[i] && spr < SPR_BOUNDARIES[i + 1] {
+            return Some(i);
+        }
+    }
+    // Include the upper boundary in the last bucket
+    if (spr - SPR_BOUNDARIES[SPR_LABELS.len()]).abs() < 1e-9 {
+        return Some(SPR_LABELS.len() - 1);
+    }
+    None
+}
+
+fn print_spr_frequency_histogram(title: &str, sprs: &[f64]) {
+    const BAR_WIDTH: usize = 40;
+
+    let mut counts = vec![0_u32; SPR_LABELS.len()];
+    for &spr in sprs {
+        if let Some(idx) = spr_bucket(spr) {
+            counts[idx] += 1;
+        }
+    }
+
+    let max_count = *counts.iter().max().unwrap_or(&1);
+    if max_count == 0 {
+        return;
+    }
+
+    println!("\n{title}:");
+    for (i, label) in SPR_LABELS.iter().enumerate() {
+        let count = counts[i];
+        let bar_len = ((count as f64 / max_count as f64) * BAR_WIDTH as f64).round() as usize;
+        let bar: String = "█".repeat(bar_len);
+        println!("  {label} |{:<width$}| {}", bar, count, width = BAR_WIDTH);
+    }
+}
+
+fn print_spr_mbb_histogram(title: &str, spr_mbb: &[(f64, f64)]) {
+    const BAR_WIDTH: usize = 40;
+
+    let mut sums = vec![0.0_f64; SPR_LABELS.len()];
+    let mut counts = vec![0_u32; SPR_LABELS.len()];
+
+    for &(spr, mbb) in spr_mbb {
+        if let Some(idx) = spr_bucket(spr) {
+            sums[idx] += mbb;
+            counts[idx] += 1;
+        }
+    }
+
+    let means: Vec<f64> = sums.iter().zip(&counts)
+        .map(|(&s, &c)| if c > 0 { s / c as f64 } else { 0.0 })
+        .collect();
+
+    let max_val = means.iter().copied().fold(0.0_f64, f64::max);
+    if max_val <= 0.0 {
+        return;
+    }
+
+    println!("\n{title}:");
+    for (i, label) in SPR_LABELS.iter().enumerate() {
+        let mean = means[i];
+        let count = counts[i];
+        let bar_len = ((mean / max_val) * BAR_WIDTH as f64).round() as usize;
+        let bar: String = "█".repeat(bar_len);
+        if count > 0 {
+            println!("  {label} |{:<width$}| {:.2} mBB  (n={})", bar, mean, count, width = BAR_WIDTH);
+        } else {
+            println!("  {label} |{:<width$}|              (n=0)", "", width = BAR_WIDTH);
+        }
     }
 }
 
@@ -669,6 +757,18 @@ fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
     print_histogram("mBB Error by Pot Size", &summary.spots, |s| s.pot as f64, |s| s.mbb);
     print_frequency_histogram("Frequency by Stack Size", &summary.spots, |s| s.effective_stack as f64);
     print_frequency_histogram("Frequency by Pot Size", &summary.spots, |s| s.pot as f64);
+
+    let sprs: Vec<f64> = summary.spots.iter()
+        .filter(|s| s.pot > 0)
+        .map(|s| s.effective_stack as f64 / s.pot as f64)
+        .collect();
+    print_spr_frequency_histogram("Frequency by SPR", &sprs);
+
+    let spr_mbb: Vec<(f64, f64)> = summary.spots.iter()
+        .filter(|s| s.pot > 0)
+        .map(|s| (s.effective_stack as f64 / s.pot as f64, s.mbb))
+        .collect();
+    print_spr_mbb_histogram("mBB Error by SPR", &spr_mbb);
 }
 
 fn print_histogram<F, G>(title: &str, spots: &[cfvnet::eval::compare::SpotResult], key_fn: F, val_fn: G)
