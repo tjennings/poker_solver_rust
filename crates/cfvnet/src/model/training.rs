@@ -5,7 +5,7 @@ use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Tensor, TensorData};
 
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 
@@ -215,6 +215,49 @@ impl StreamingReader {
         self.exhausted = false;
     }
 
+    /// Read a single record, advancing through files as needed.
+    /// Returns `None` when all files are exhausted.
+    fn read_one(&mut self) -> Option<TrainingRecord> {
+        while !self.exhausted {
+            // Open next file if no reader active.
+            if self.reader.is_none() {
+                if self.current_file_idx >= self.files.len() {
+                    self.exhausted = true;
+                    return None;
+                }
+                let path = &self.files[self.current_file_idx];
+                match std::fs::File::open(path) {
+                    Ok(f) => {
+                        self.reader = Some(BufReader::new(f));
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: skipping {}: {e}", path.display());
+                        self.current_file_idx += 1;
+                        continue;
+                    }
+                }
+            }
+
+            let reader = self.reader.as_mut().unwrap();
+            match read_record(reader) {
+                Ok(rec) => return Some(rec),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    self.reader = None;
+                    self.current_file_idx += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: read error in {}: {e}",
+                        self.files[self.current_file_idx].display()
+                    );
+                    self.reader = None;
+                    self.current_file_idx += 1;
+                }
+            }
+        }
+        None
+    }
+
     /// Read up to `max_records` records, spanning file boundaries as needed.
     /// Returns fewer than `max_records` only when all files are exhausted.
     fn read_chunk(&mut self, max_records: usize) -> Vec<TrainingRecord> {
@@ -265,48 +308,6 @@ impl StreamingReader {
         records
     }
 
-    /// Read a single record, advancing across file boundaries.
-    /// Returns `None` when all files are exhausted.
-    fn read_one(&mut self) -> Option<TrainingRecord> {
-        while !self.exhausted {
-            // Open next file if no reader active.
-            if self.reader.is_none() {
-                if self.current_file_idx >= self.files.len() {
-                    self.exhausted = true;
-                    return None;
-                }
-                let path = &self.files[self.current_file_idx];
-                match std::fs::File::open(path) {
-                    Ok(f) => {
-                        self.reader = Some(BufReader::new(f));
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: skipping {}: {e}", path.display());
-                        self.current_file_idx += 1;
-                        continue;
-                    }
-                }
-            }
-
-            let reader = self.reader.as_mut().unwrap();
-            match read_record(reader) {
-                Ok(rec) => return Some(rec),
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    self.reader = None;
-                    self.current_file_idx += 1;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: read error in {}: {e}",
-                        self.files[self.current_file_idx].display()
-                    );
-                    self.reader = None;
-                    self.current_file_idx += 1;
-                }
-            }
-        }
-        None
-    }
 }
 
 /// Collect sorted file paths from a path (file or directory).
@@ -425,9 +426,10 @@ fn load_validation_set(
     Some(PreEncoded::from_records(&val_records, board_cards))
 }
 
-/// Spawn a two-stage dataloader pipeline: a reader thread that reads and
-/// shuffles records, and an encoder thread that encodes batches in parallel
-/// via rayon. This overlaps disk I/O with CPU encoding.
+/// Spawn a two-stage dataloader pipeline: a reader thread with a streaming
+/// shuffle buffer, and an encoder thread that encodes batches in parallel
+/// via rayon. The reader continuously reads records one at a time, evicting
+/// shuffled records into batches, eliminating pipeline stalls between chunks.
 ///
 /// Returns `(batch_receiver, thread_handles)`. The threads exit cleanly when
 /// the receiver is dropped (cascading channel close).
@@ -446,37 +448,65 @@ fn spawn_dataloader_thread(
     // Stage 2 → Training loop: encoded batches.
     let (batch_tx, batch_rx) = mpsc::sync_channel::<PreEncoded>(prefetch_depth);
 
-    // Stage 1: Reader thread — reads chunks, shuffles, splits into batch slices.
+    // Stage 1: Reader thread — streaming shuffle buffer with eviction.
     let reader_files = files.to_vec();
     let reader_thread = std::thread::spawn(move || {
         use rand::seq::SliceRandom;
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let mut reader = StreamingReader::new(reader_files);
-        if val_count > 0 {
-            let _ = reader.read_chunk(val_count);
-        }
-        let mut consecutive_empty = 0u32;
+        let mut files = reader_files;
+        let mut epoch = 0u64;
+
         loop {
-            let mut records = reader.read_chunk(shuffle_buffer_size);
-            if records.is_empty() {
-                consecutive_empty += 1;
-                if consecutive_empty > 3 {
-                    eprintln!("Warning: dataloader exhausted all files after 3 retries, stopping");
+            let mut reader = StreamingReader::new(files.clone());
+            if val_count > 0 {
+                let _ = reader.read_chunk(val_count);
+            }
+
+            // Phase 1: Fill buffer.
+            let mut buffer = reader.read_chunk(shuffle_buffer_size);
+            if buffer.is_empty() {
+                eprintln!("Warning: no training records found, stopping dataloader");
+                return;
+            }
+            buffer.shuffle(&mut rng);
+
+            // Phase 2: Stream with eviction — read one record, evict one from buffer.
+            let mut batch_buf = Vec::with_capacity(batch_size);
+            while let Some(record) = reader.read_one() {
+                let idx = rng.gen_range(0..buffer.len());
+                let evicted = std::mem::replace(&mut buffer[idx], record);
+                batch_buf.push(evicted);
+
+                if batch_buf.len() == batch_size {
+                    if record_tx.send(batch_buf).is_err() {
+                        return;
+                    }
+                    batch_buf = Vec::with_capacity(batch_size);
+                }
+            }
+
+            // Phase 3: Drain remaining buffer + partial batch_buf.
+            buffer.shuffle(&mut rng);
+            for record in buffer.drain(..) {
+                batch_buf.push(record);
+                if batch_buf.len() == batch_size {
+                    if record_tx.send(batch_buf).is_err() {
+                        return;
+                    }
+                    batch_buf = Vec::with_capacity(batch_size);
+                }
+            }
+            // Send any partial final batch.
+            if !batch_buf.is_empty() {
+                if record_tx.send(batch_buf).is_err() {
                     return;
                 }
-                reader.reset();
-                if val_count > 0 {
-                    let _ = reader.read_chunk(val_count);
-                }
-                continue;
             }
-            consecutive_empty = 0;
-            records.shuffle(&mut rng);
-            for chunk in records.chunks(batch_size) {
-                if record_tx.send(chunk.to_vec()).is_err() {
-                    return;
-                }
-            }
+
+            // Phase 4: Prepare next epoch.
+            epoch += 1;
+            rng = ChaCha8Rng::seed_from_u64(42 + epoch);
+            files.shuffle(&mut rng);
         }
     });
 
@@ -997,10 +1027,10 @@ mod tests {
             5,
         );
 
-        // The reader thread should stop after 3 consecutive empty reads,
+        // The reader thread should stop after seeing empty buffer,
         // cascading close through the encoder, causing recv() to return Err.
         let result = rx.recv();
-        assert!(result.is_err(), "expected channel to close after consecutive empty reads");
+        assert!(result.is_err(), "expected channel to close after empty reads");
 
         // Both threads should have exited cleanly (no panic).
         for handle in handles {
@@ -1068,6 +1098,48 @@ mod tests {
         }
         let count = count_total_records(&[path], 5);
         assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn streaming_shuffle_buffer_coverage() {
+        // 64 records, shuffle buffer of 16, batch size 8.
+        // With streaming eviction, all 64 records should be delivered.
+        let file = write_test_data(64);
+        let config = TrainConfig {
+            batch_size: 8,
+            shuffle_buffer_size: 16,
+            prefetch_depth: 2,
+            epochs: 2,
+            ..default_test_config()
+        };
+
+        let (rx, handles) = spawn_dataloader_thread(
+            &[file.path().to_path_buf()],
+            &config,
+            0,
+            5,
+        );
+
+        // One epoch = ceil(64 / 8) = 8 batches.
+        // Receive two epochs worth (16 batches).
+        let mut total_records = 0;
+        let mut total_batches = 0;
+        for _ in 0..16 {
+            match rx.recv() {
+                Ok(batch) => {
+                    total_records += batch.len;
+                    total_batches += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(total_batches, 16, "should receive 16 batches for 2 epochs");
+        assert_eq!(total_records, 128, "should receive 64 records per epoch x 2");
+
+        drop(rx);
+        for handle in handles {
+            handle.join().expect("thread should not panic");
+        }
     }
 
 }
