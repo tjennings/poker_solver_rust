@@ -5,6 +5,7 @@ use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor, TensorData};
 
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::Rng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -144,6 +145,151 @@ impl PreEncoded {
             game_value: Tensor::from_data(TensorData::new(gv, [n]), device),
             len: n,
         }
+    }
+}
+
+/// GPU-resident reservoir of training data.
+///
+/// Holds pre-encoded training records as large tensors in GPU memory.
+/// The training loop samples random batches via `select` (pure GPU).
+/// A background thread continuously refreshes records via `scatter_refresh`.
+struct GpuReservoir<B: Backend> {
+    input: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    mask: Tensor<B, 2>,
+    range: Tensor<B, 2>,
+    game_value: Tensor<B, 1>,
+    capacity: usize,
+    in_size: usize,
+}
+
+/// A single mini-batch of tensors sampled from the reservoir.
+struct SampledBatch<B: Backend> {
+    input: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    mask: Tensor<B, 2>,
+    range: Tensor<B, 2>,
+    game_value: Tensor<B, 1>,
+}
+
+impl<B: Backend> GpuReservoir<B> {
+    /// Create an empty reservoir with `capacity` slots on `device`.
+    fn new(device: &B::Device, capacity: usize, board_cards: usize) -> Self {
+        let in_size = input_size(board_cards);
+        Self {
+            input: Tensor::zeros([capacity, in_size], device),
+            target: Tensor::zeros([capacity, OUTPUT_SIZE], device),
+            mask: Tensor::zeros([capacity, OUTPUT_SIZE], device),
+            range: Tensor::zeros([capacity, OUTPUT_SIZE], device),
+            game_value: Tensor::zeros([capacity], device),
+            capacity,
+            in_size,
+        }
+    }
+
+    /// Fill the reservoir from disk. Returns number of records loaded.
+    fn fill(&mut self, reader: &mut StreamingReader, board_cards: usize) -> usize {
+        let records = reader.read_chunk(self.capacity);
+        let n = records.len();
+        if n == 0 {
+            return 0;
+        }
+        let encoded = PreEncoded::from_records(&records, board_cards);
+        let device = self.input.device();
+        let n_actual = n.min(self.capacity);
+
+        self.input = Tensor::from_data(
+            TensorData::new(encoded.input, [n_actual, self.in_size]),
+            &device,
+        );
+        self.target = Tensor::from_data(
+            TensorData::new(encoded.target, [n_actual, OUTPUT_SIZE]),
+            &device,
+        );
+        self.mask = Tensor::from_data(
+            TensorData::new(encoded.mask, [n_actual, OUTPUT_SIZE]),
+            &device,
+        );
+        self.range = Tensor::from_data(
+            TensorData::new(encoded.range, [n_actual, OUTPUT_SIZE]),
+            &device,
+        );
+        self.game_value = Tensor::from_data(
+            TensorData::new(encoded.game_value, [n_actual]),
+            &device,
+        );
+        self.capacity = n_actual;
+        n_actual
+    }
+
+    /// Sample a random mini-batch from the reservoir. Pure GPU operation.
+    fn sample_batch(&self, batch_size: usize, device: &B::Device) -> SampledBatch<B> {
+        let mut rng = ChaCha8Rng::from_rng(rand::thread_rng()).unwrap();
+        let indices_vec: Vec<i64> = (0..batch_size)
+            .map(|_| rng.gen_range(0..self.capacity) as i64)
+            .collect();
+        let indices: Tensor<B, 1, Int> = Tensor::from_data(
+            TensorData::new(indices_vec, [batch_size]),
+            device,
+        );
+        SampledBatch {
+            input: self.input.clone().select(0, indices.clone()),
+            target: self.target.clone().select(0, indices.clone()),
+            mask: self.mask.clone().select(0, indices.clone()),
+            range: self.range.clone().select(0, indices.clone()),
+            game_value: self.game_value.clone().select(0, indices),
+        }
+    }
+
+    /// Scatter a batch of new pre-encoded records into random reservoir positions.
+    fn scatter_refresh(
+        &mut self,
+        encoded: &PreEncoded,
+        rng: &mut ChaCha8Rng,
+        device: &B::Device,
+    ) {
+        let n = encoded.len;
+        if n == 0 {
+            return;
+        }
+
+        // Pick n random target positions in the reservoir.
+        let positions: Vec<i64> = (0..n)
+            .map(|_| rng.gen_range(0..self.capacity) as i64)
+            .collect();
+
+        // Create new-value tensors from the encoded data.
+        let new_input: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(encoded.input.clone(), [n, self.in_size]),
+            device,
+        );
+        let new_target: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(encoded.target.clone(), [n, OUTPUT_SIZE]),
+            device,
+        );
+        let new_mask: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(encoded.mask.clone(), [n, OUTPUT_SIZE]),
+            device,
+        );
+        let new_range: Tensor<B, 2> = Tensor::from_data(
+            TensorData::new(encoded.range.clone(), [n, OUTPUT_SIZE]),
+            device,
+        );
+        let new_gv: Tensor<B, 1> = Tensor::from_data(
+            TensorData::new(encoded.game_value.clone(), [n]),
+            device,
+        );
+
+        // Use select_assign to scatter new values into the reservoir.
+        let idx: Tensor<B, 1, Int> = Tensor::from_data(
+            TensorData::new(positions, [n]),
+            device,
+        );
+        self.input = self.input.clone().select_assign(0, idx.clone(), new_input);
+        self.target = self.target.clone().select_assign(0, idx.clone(), new_target);
+        self.mask = self.mask.clone().select_assign(0, idx.clone(), new_mask);
+        self.range = self.range.clone().select_assign(0, idx.clone(), new_range);
+        self.game_value = self.game_value.clone().select_assign(0, idx, new_gv);
     }
 }
 
@@ -952,5 +1098,43 @@ mod tests {
         reader.reset();
         let all = reader.read_chunk(100);
         assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn reservoir_fill_and_sample() {
+        let file = write_test_data(20);
+        let device = Default::default();
+        let files = collect_data_files(file.path()).unwrap();
+
+        let mut reservoir = GpuReservoir::<B>::new(&device, 20, 5);
+        let mut reader = StreamingReader::new(files);
+        let filled = reservoir.fill(&mut reader, 5);
+        assert_eq!(filled, 20);
+
+        // Sample a batch -- should not panic, should return correct shapes.
+        let batch = reservoir.sample_batch(4, &device);
+        assert_eq!(batch.input.dims(), [4, input_size(5)]);
+        assert_eq!(batch.target.dims(), [4, OUTPUT_SIZE]);
+    }
+
+    #[test]
+    fn reservoir_scatter_refresh() {
+        let file = write_test_data(20);
+        let device = Default::default();
+        let files = collect_data_files(file.path()).unwrap();
+
+        let mut reservoir = GpuReservoir::<B>::new(&device, 10, 5);
+        let mut reader = StreamingReader::new(files);
+        reservoir.fill(&mut reader, 5);
+
+        // Read some more records and scatter them in.
+        let mut reader2 = StreamingReader::new(vec![file.path().to_path_buf()]);
+        let records = reader2.read_chunk(3);
+        let encoded = PreEncoded::from_records(&records, 5);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        reservoir.scatter_refresh(&encoded, &mut rng, &device);
+        // No panic = success. Reservoir still works.
+        let batch = reservoir.sample_batch(4, &device);
+        assert_eq!(batch.input.dims(), [4, input_size(5)]);
     }
 }
