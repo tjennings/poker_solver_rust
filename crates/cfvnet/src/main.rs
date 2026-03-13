@@ -94,6 +94,12 @@ enum Commands {
         #[arg(long, default_value = "20")]
         num_spots: usize,
     },
+    /// Print distribution histograms for generated training data
+    DatagenEval {
+        /// Path to binary training data (file or directory)
+        #[arg(short, long)]
+        data: PathBuf,
+    },
 }
 
 fn append_random_suffix(path: &std::path::Path) -> PathBuf {
@@ -180,6 +186,7 @@ fn main() {
             model,
             num_spots,
         } => cmd_compare_exact(model, num_spots),
+        Commands::DatagenEval { data } => cmd_datagen_eval(data),
     }
 }
 
@@ -509,6 +516,102 @@ fn cmd_compare_exact(model_dir: PathBuf, num_spots: usize) {
     print_summary(&summary);
 }
 
+fn cmd_datagen_eval(data: PathBuf) {
+    use cfvnet::datagen::storage::read_record;
+    use std::io::BufReader;
+
+    let paths: Vec<PathBuf> = if data.is_dir() {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&data)
+            .unwrap_or_else(|e| {
+                eprintln!("failed to read directory {}: {e}", data.display());
+                std::process::exit(1);
+            })
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if entry.file_type().ok()?.is_file() { Some(entry.path()) } else { None }
+            })
+            .collect();
+        entries.sort();
+        entries
+    } else {
+        vec![data.clone()]
+    };
+
+    if paths.is_empty() {
+        eprintln!("no files found in {}", data.display());
+        std::process::exit(1);
+    }
+
+    let mut pots = Vec::new();
+    let mut stacks = Vec::new();
+
+    for path in &paths {
+        let file = std::fs::File::open(path).unwrap_or_else(|e| {
+            eprintln!("failed to open {}: {e}", path.display());
+            std::process::exit(1);
+        });
+        let mut reader = BufReader::new(file);
+        loop {
+            match read_record(&mut reader) {
+                Ok(rec) => {
+                    pots.push(rec.pot as f64);
+                    stacks.push(rec.effective_stack as f64);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => {
+                    eprintln!("read error in {}: {e}", path.display());
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    let num_records = pots.len();
+    println!("Loaded {num_records} records from {} file(s).", paths.len());
+
+    if num_records < 2 {
+        println!("Not enough records for histograms.");
+        return;
+    }
+
+    print_raw_frequency_histogram("Frequency by Stack Size", &stacks);
+    print_raw_frequency_histogram("Frequency by Pot Size", &pots);
+}
+
+fn print_raw_frequency_histogram(title: &str, values: &[f64]) {
+    const NUM_BUCKETS: usize = 20;
+    const BAR_WIDTH: usize = 40;
+
+    let min_val = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_val = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    if (max_val - min_val).abs() < 1e-9 {
+        println!("\n{title}: all values = {:.0}", min_val);
+        return;
+    }
+
+    let bucket_width = (max_val - min_val) / NUM_BUCKETS as f64;
+    let mut bucket_counts = vec![0_u32; NUM_BUCKETS];
+
+    for &v in values {
+        let idx = ((v - min_val) / bucket_width) as usize;
+        let idx = idx.min(NUM_BUCKETS - 1);
+        bucket_counts[idx] += 1;
+    }
+
+    let max_count = *bucket_counts.iter().max().unwrap_or(&1);
+
+    println!("\n{title}:");
+    for i in 0..NUM_BUCKETS {
+        let lo = min_val + i as f64 * bucket_width;
+        let hi = lo + bucket_width;
+        let count = bucket_counts[i];
+        let bar_len = ((count as f64 / max_count as f64) * BAR_WIDTH as f64).round() as usize;
+        let bar: String = "█".repeat(bar_len);
+        println!("  {:>6.0}-{:<6.0} |{:<width$}| {}", lo, hi, bar, count, width = BAR_WIDTH);
+    }
+}
+
 fn load_model_config(model_path: &std::path::Path) -> cfvnet::config::CfvnetConfig {
     let dir = if model_path.is_dir() {
         model_path.to_path_buf()
@@ -560,6 +663,113 @@ fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
         println!("  {}. {}  Pot: {:<5} Stack: {:<5} MAE: {:.6}  mBB: {:.2}",
             i + 1, format_board(&spot.board, spot.board_size),
             spot.pot, spot.effective_stack, spot.mae, spot.mbb);
+    }
+
+    print_histogram("mBB Error by Stack Size", &summary.spots, |s| s.effective_stack as f64, |s| s.mbb);
+    print_histogram("mBB Error by Pot Size", &summary.spots, |s| s.pot as f64, |s| s.mbb);
+    print_frequency_histogram("Frequency by Stack Size", &summary.spots, |s| s.effective_stack as f64);
+    print_frequency_histogram("Frequency by Pot Size", &summary.spots, |s| s.pot as f64);
+}
+
+fn print_histogram<F, G>(title: &str, spots: &[cfvnet::eval::compare::SpotResult], key_fn: F, val_fn: G)
+where
+    F: Fn(&cfvnet::eval::compare::SpotResult) -> f64,
+    G: Fn(&cfvnet::eval::compare::SpotResult) -> f64,
+{
+    const NUM_BUCKETS: usize = 20;
+    const BAR_WIDTH: usize = 40;
+
+    if spots.len() < 2 {
+        return;
+    }
+
+    let min_key = spots.iter().map(|s| key_fn(s)).fold(f64::INFINITY, f64::min);
+    let max_key = spots.iter().map(|s| key_fn(s)).fold(f64::NEG_INFINITY, f64::max);
+
+    if (max_key - min_key).abs() < 1e-9 {
+        return;
+    }
+
+    let bucket_width = (max_key - min_key) / NUM_BUCKETS as f64;
+    let mut bucket_sums = vec![0.0_f64; NUM_BUCKETS];
+    let mut bucket_counts = vec![0_u32; NUM_BUCKETS];
+
+    for spot in spots {
+        let k = key_fn(spot);
+        let idx = ((k - min_key) / bucket_width) as usize;
+        let idx = idx.min(NUM_BUCKETS - 1);
+        bucket_sums[idx] += val_fn(spot);
+        bucket_counts[idx] += 1;
+    }
+
+    let bucket_means: Vec<f64> = bucket_sums
+        .iter()
+        .zip(&bucket_counts)
+        .map(|(&sum, &count)| if count > 0 { sum / count as f64 } else { 0.0 })
+        .collect();
+
+    let max_val = bucket_means.iter().copied().fold(0.0_f64, f64::max);
+    if max_val <= 0.0 {
+        return;
+    }
+
+    println!("\n{title}:");
+    for i in 0..NUM_BUCKETS {
+        let lo = min_key + i as f64 * bucket_width;
+        let hi = lo + bucket_width;
+        let mean = bucket_means[i];
+        let bar_len = ((mean / max_val) * BAR_WIDTH as f64).round() as usize;
+        let bar: String = "█".repeat(bar_len);
+        let count = bucket_counts[i];
+        if count > 0 {
+            println!("  {:>6.0}-{:<6.0} |{:<width$}| {:.2} mBB  (n={})", lo, hi, bar, mean, count, width = BAR_WIDTH);
+        } else {
+            println!("  {:>6.0}-{:<6.0} |{:<width$}|              (n=0)", lo, hi, "", width = BAR_WIDTH);
+        }
+    }
+}
+
+fn print_frequency_histogram<F>(title: &str, spots: &[cfvnet::eval::compare::SpotResult], key_fn: F)
+where
+    F: Fn(&cfvnet::eval::compare::SpotResult) -> f64,
+{
+    const NUM_BUCKETS: usize = 20;
+    const BAR_WIDTH: usize = 40;
+
+    if spots.len() < 2 {
+        return;
+    }
+
+    let min_key = spots.iter().map(|s| key_fn(s)).fold(f64::INFINITY, f64::min);
+    let max_key = spots.iter().map(|s| key_fn(s)).fold(f64::NEG_INFINITY, f64::max);
+
+    if (max_key - min_key).abs() < 1e-9 {
+        return;
+    }
+
+    let bucket_width = (max_key - min_key) / NUM_BUCKETS as f64;
+    let mut bucket_counts = vec![0_u32; NUM_BUCKETS];
+
+    for spot in spots {
+        let k = key_fn(spot);
+        let idx = ((k - min_key) / bucket_width) as usize;
+        let idx = idx.min(NUM_BUCKETS - 1);
+        bucket_counts[idx] += 1;
+    }
+
+    let max_count = *bucket_counts.iter().max().unwrap_or(&1);
+    if max_count == 0 {
+        return;
+    }
+
+    println!("\n{title}:");
+    for i in 0..NUM_BUCKETS {
+        let lo = min_key + i as f64 * bucket_width;
+        let hi = lo + bucket_width;
+        let count = bucket_counts[i];
+        let bar_len = ((count as f64 / max_count as f64) * BAR_WIDTH as f64).round() as usize;
+        let bar: String = "█".repeat(bar_len);
+        println!("  {:>6.0}-{:<6.0} |{:<width$}| {}", lo, hi, bar, count, width = BAR_WIDTH);
     }
 }
 

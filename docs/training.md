@@ -215,6 +215,27 @@ cargo run -p cfvnet --release -- compare-exact \
   --num-spots 20
 ```
 
+### Inspect Training Data Distribution
+
+Print frequency histograms (stack size and pot size, 20 equal-width buckets) for generated training data:
+
+```bash
+cargo run -p cfvnet --release -- datagen-eval \
+  --data data/river_training.bin
+
+# Also works with a directory of split files
+cargo run -p cfvnet --release -- datagen-eval \
+  --data data/river_chunks/
+```
+
+### Compare Output
+
+All compare commands (`compare`, `compare-net`, `compare-exact`) print:
+- Summary statistics (mean/worst MAE and mBB)
+- Best and worst spots by mBB
+- mBB error histograms by stack size and pot size (20 equal-width buckets)
+- Frequency histograms by stack size and pot size
+
 ### Configuration
 
 See `sample_configurations/river_cfvnet.yaml` for all options. Key parameters:
