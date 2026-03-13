@@ -84,6 +84,8 @@ pub struct DatagenConfig {
     pub street: String,
     #[serde(default = "default_pot_intervals")]
     pub pot_intervals: Vec<[i32; 2]>,
+    #[serde(default)]
+    pub spr_intervals: Option<Vec<[f64; 2]>>,
     #[serde(default = "default_solver_iterations")]
     pub solver_iterations: u32,
     #[serde(default = "default_target_exploitability")]
@@ -100,6 +102,7 @@ impl Default for DatagenConfig {
             num_samples: 1000,
             street: default_street(),
             pot_intervals: default_pot_intervals(),
+            spr_intervals: None,
             solver_iterations: 1000,
             target_exploitability: 0.005,
             threads: 8,
@@ -341,6 +344,36 @@ datagen:
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.datagen.street, "turn");
+    }
+
+    #[test]
+    fn parse_config_with_spr_intervals() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0]]
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        let spr = config.datagen.spr_intervals.unwrap();
+        assert_eq!(spr.len(), 3);
+        assert!((spr[0][0] - 0.0).abs() < 1e-9);
+        assert!((spr[0][1] - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_config_without_spr_intervals_is_none() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.datagen.spr_intervals.is_none());
     }
 
     #[test]
