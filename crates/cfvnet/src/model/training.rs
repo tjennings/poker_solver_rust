@@ -859,25 +859,30 @@ mod tests {
     }
 
     #[test]
-    fn multi_epoch_per_chunk() {
-        let file = write_test_data(16);
+    fn training_with_refresh() {
+        // Use more data than reservoir_size to exercise the refresh path.
+        let file = write_test_data(64);
         let device = Default::default();
         let config = TrainConfig {
             hidden_layers: 2,
             hidden_size: 64,
-            batch_size: 16,
-            epochs: 4,
+            batch_size: 8,
+            epochs: 5,
             learning_rate: 0.001,
             lr_min: 0.001,
             huber_delta: 1.0,
             aux_loss_weight: 0.0,
             validation_split: 0.0,
             checkpoint_every_n_epochs: 0,
-            reservoir_size: 100,
-            reservoir_turnover: 1.0,
+            reservoir_size: 16, // smaller than data -> refresh thread runs
+            reservoir_turnover: 2.0,
         };
         let result = train::<B>(&device, file.path(), 5, &config, None);
-        assert!(result.final_train_loss < 10.0);
+        assert!(
+            result.final_train_loss < 10.0,
+            "training with refresh should produce reasonable loss, got {}",
+            result.final_train_loss
+        );
     }
 
     #[test]
