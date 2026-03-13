@@ -14,16 +14,6 @@ The default session acts as a **coordinator**, not an implementer. It must:
 3. **Always follow the pipeline**: research → brainstorm → plan → dispatch → review → integrate
 4. **Use beans** to track every work item before dispatching
 
-### Dispatch Rules
-
-- Algorithm/design questions, game theory, poker AI → `ml-researcher` agent (read-only advisor)
-- Implementation tasks → `rust-developer` agent (use worktree isolation)
-- Architecture review → `software-architect` agent
-- Code quality review → `idiomatic-rust-enforcer` agent
-- Performance review → `rust-perf-reviewer` agent
-- Independent tasks → dispatch in parallel via `dispatching-parallel-agents`
-- Multi-step plans → use `subagent-driven-development`
-
 ### What the manager does directly
 
 - Clarifies requirements with the user
@@ -51,7 +41,8 @@ Every time I ask for a change to the system, you MUST dispatch this workflow:
 
 ## Git Workflow
 
-- Always use worktrees for implementing plans
+- Always create a feature branch for the change
+- Always use worktrees for each agent for implementing plans
 - Write clear commit messages describing **what** and **why**
 - Keep commits atomic: one logical change per commit
 - Use feature branches for non-trivial changes
@@ -139,14 +130,6 @@ Serious poker professionals seeking a competitive edge. They use this tool durin
 - **Theme**: Dark mode only. Deep navy/purple backgrounds (#0f0f1e, #1a1a2e) with bright cyan (#00d9ff) as the primary accent
 - **References**: Trading terminals for information density and professional feel; GTO Wizard/PioSOLVER for poker-domain conventions and familiar action color coding
 - **Anti-references**: Casual gaming aesthetics, bright/playful color schemes, consumer-oriented "friendly" UIs
-
-### Color System
-- **Backgrounds**: Dark navy gradients (#0f0f1e → #1a1a2e), panels (#14142a → #1a1a3a)
-- **Primary accent**: Cyan (#00d9ff) for interactive elements, selections, and focus states
-- **Poker actions**: Blue (fold), green (check/call), rose-to-red gradient (bet/raise) — these are domain conventions, preserve them
-- **Status**: Amber (#f59e0b) for warnings, red (#ff6b6b) for errors, green (#4caf50) for success
-- **Text**: #eee primary, #ccc/#bbb secondary, #888/#666 muted
-- **Typography**: System font stack (-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto); tabular-nums for numeric data
 
 ### Design Principles
 1. **Information density over decoration** — Every element earns its space. Favor showing more data over whitespace or ornament.

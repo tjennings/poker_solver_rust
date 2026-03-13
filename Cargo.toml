@@ -27,5 +27,5 @@ rayon = "1.10"
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
+codegen-units = 8
 opt-level = 3
