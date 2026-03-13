@@ -154,12 +154,10 @@ pub struct TrainingConfig {
     pub validation_split: f64,
     #[serde(default = "default_checkpoint_interval")]
     pub checkpoint_every_n_epochs: usize,
-    #[serde(default = "default_gpu_chunk_size")]
-    pub gpu_chunk_size: usize,
-    #[serde(default = "default_epochs_per_chunk")]
-    pub epochs_per_chunk: usize,
-    #[serde(default = "default_prefetch_chunks")]
-    pub prefetch_chunks: usize,
+    #[serde(default = "default_reservoir_size")]
+    pub reservoir_size: usize,
+    #[serde(default = "default_reservoir_turnover")]
+    pub reservoir_turnover: f64,
 }
 
 impl Default for TrainingConfig {
@@ -175,9 +173,8 @@ impl Default for TrainingConfig {
             aux_loss_weight: 1.0,
             validation_split: 0.05,
             checkpoint_every_n_epochs: 1000,
-            gpu_chunk_size: 100_000,
-            epochs_per_chunk: 1,
-            prefetch_chunks: 3,
+            reservoir_size: 1_500_000,
+            reservoir_turnover: 1.0,
         }
     }
 }
@@ -212,14 +209,11 @@ fn default_validation_split() -> f64 {
 fn default_checkpoint_interval() -> usize {
     1000
 }
-fn default_gpu_chunk_size() -> usize {
-    100_000
+fn default_reservoir_size() -> usize {
+    1_500_000
 }
-fn default_epochs_per_chunk() -> usize {
-    1
-}
-fn default_prefetch_chunks() -> usize {
-    3
+fn default_reservoir_turnover() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,5 +382,36 @@ datagen:
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.game.river_model_path.as_deref(), Some("/path/to/river_model"));
+    }
+
+    #[test]
+    fn parse_config_with_reservoir_params() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+training:
+  reservoir_size: 1500000
+  reservoir_turnover: 1.0
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.training.reservoir_size, 1_500_000);
+        assert!((config.training.reservoir_turnover - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn config_defaults_for_reservoir() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.training.reservoir_size, 1_500_000);
+        assert!((config.training.reservoir_turnover - 1.0).abs() < 1e-9);
     }
 }
