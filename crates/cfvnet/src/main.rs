@@ -231,8 +231,8 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         aux_loss_weight: cfg.training.aux_loss_weight,
         validation_split: cfg.training.validation_split,
         checkpoint_every_n_epochs: cfg.training.checkpoint_every_n_epochs,
-        reservoir_size: cfg.training.reservoir_size,
-        reservoir_turnover: cfg.training.reservoir_turnover,
+        shuffle_buffer_size: cfg.training.shuffle_buffer_size,
+        prefetch_depth: cfg.training.prefetch_depth,
     };
 
     match backend {

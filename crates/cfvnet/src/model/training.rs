@@ -31,8 +31,8 @@ pub struct TrainConfig {
     pub aux_loss_weight: f64,
     pub validation_split: f64,
     pub checkpoint_every_n_epochs: usize,
-    pub reservoir_size: usize,
-    pub reservoir_turnover: f64,
+    pub shuffle_buffer_size: usize,
+    pub prefetch_depth: usize,
 }
 
 /// Result returned after training completes.
@@ -709,8 +709,8 @@ mod tests {
             aux_loss_weight: 0.0,
             validation_split: 0.0,
             checkpoint_every_n_epochs: 0,
-            reservoir_size: 100,
-            reservoir_turnover: 1.0,
+            shuffle_buffer_size: 100,
+            prefetch_depth: 2,
         }
     }
 
