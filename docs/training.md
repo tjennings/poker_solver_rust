@@ -159,10 +159,10 @@ The `training` section of the YAML config controls the network architecture and 
 | `aux_loss_weight` | 1.0 | Weight for auxiliary game-value loss |
 | `validation_split` | 0.05 | Fraction of data reserved for validation |
 | `checkpoint_every_n_epochs` | 1000 | Save checkpoint every N epochs (0 = disabled) |
-| `shuffle_buffer_size` | 262144 | Number of records loaded into the shuffle buffer by the background dataloader |
+| `shuffle_buffer_size` | 262144 | Streaming shuffle buffer capacity (records). Larger = better shuffle quality, more RAM |
 | `prefetch_depth` | 4 | Number of pre-encoded batches buffered in the channel ahead of the training loop |
 
-The training loop uses a **streaming dataloader**: a background thread reads `shuffle_buffer_size` records from disk, shuffles them, splits into `batch_size` chunks, encodes each chunk, and sends them through a bounded channel with `prefetch_depth` slots. The training loop consumes batches by blocking on the channel. On EOF the reader resets and loops, so training always has data available. Increase `shuffle_buffer_size` for better randomization; increase `prefetch_depth` to keep the GPU fed when I/O is slow.
+The training loop uses a **streaming dataloader** with an eviction-based shuffle buffer. A background reader fills a buffer of `shuffle_buffer_size` records, then continuously reads one record at a time — each new record randomly replaces a buffer slot and the evicted record flows into the next batch. This keeps disk reads continuous and eliminates pipeline stalls. A second encoder thread encodes batches in parallel via rayon and sends them through a bounded channel with `prefetch_depth` slots. Every record is seen exactly once per epoch. Increase `shuffle_buffer_size` for better randomization; increase `prefetch_depth` to keep the GPU fed when encoding is slow.
 
 #### Evaluate on Held-Out Data
 
