@@ -89,12 +89,12 @@ fn sample_pot<R: Rng>(intervals: &[[i32; 2]], rng: &mut R) -> i32 {
     rng.gen_range(lo..hi)
 }
 
-/// Sample a (pot, stack) pair via 2D-stratified rejection sampling.
+/// Sample a (pot, stack) pair via hybrid stratified rejection sampling.
 ///
-/// Picks both an SPR bucket and a pot bucket uniformly, then intersects
-/// the chosen pot bucket with the feasible pot range for the target SPR.
-/// Infeasible (SPR, pot) cells are rejected and retried, producing a
-/// distribution that is uniform across both dimensions.
+/// Picks an SPR bucket uniformly (guaranteeing uniform SPR marginals), then
+/// picks a pot bucket uniformly from those feasible for the target SPR.
+/// This produces distributions that are uniform on SPR and approximately
+/// uniform on pot size.
 fn sample_pot_stack_by_spr<R: Rng>(
     pot_intervals: &[[i32; 2]],
     spr_intervals: &[[f64; 2]],
@@ -103,13 +103,10 @@ fn sample_pot_stack_by_spr<R: Rng>(
 ) -> (i32, i32) {
     let stack_f = initial_stack as f64;
     for _ in 0..10_000 {
-        // 1. Pick BOTH buckets uniformly
+        // 1. Pick SPR bucket uniformly
         let spr_idx = rng.gen_range(0..spr_intervals.len());
         let [spr_lo, spr_hi] = spr_intervals[spr_idx];
         let target_spr = rng.gen_range(spr_lo..spr_hi);
-
-        let pot_idx = rng.gen_range(0..pot_intervals.len());
-        let [pot_lo, pot_hi] = pot_intervals[pot_idx];
 
         // 2. Compute feasible pot range for this SPR
         let pot_min_f = if target_spr > 0.0 {
@@ -121,16 +118,28 @@ fn sample_pot_stack_by_spr<R: Rng>(
 
         let feasible_lo = pot_min_f.max(1.0) as i32;
         let feasible_hi = pot_max_f as i32;
-
-        // 3. Intersect chosen pot bucket with feasible range
-        let lo = pot_lo.max(feasible_lo);
-        let hi = pot_hi.min(feasible_hi + 1); // pot_intervals use exclusive upper bound
-        if lo >= hi {
+        if feasible_lo > feasible_hi {
             continue;
         }
 
-        // 4. Sample pot, derive stack
-        let pot = rng.gen_range(lo..hi);
+        // 3. Collect feasible pot buckets (those with non-empty intersection)
+        let mut feasible_buckets: Vec<[i32; 2]> = Vec::new();
+        for &[ilo, ihi] in pot_intervals {
+            let lo = ilo.max(feasible_lo);
+            let hi = ihi.min(feasible_hi + 1);
+            if lo < hi {
+                feasible_buckets.push([lo, hi]);
+            }
+        }
+        if feasible_buckets.is_empty() {
+            continue;
+        }
+
+        // 4. Pick a feasible pot bucket uniformly, then sample within it
+        let bucket = feasible_buckets[rng.gen_range(0..feasible_buckets.len())];
+        let pot = rng.gen_range(bucket[0]..bucket[1]);
+
+        // 5. Derive stack from SPR
         let max_stack = initial_stack - pot / 2;
         if max_stack < 5 {
             continue;
@@ -138,7 +147,7 @@ fn sample_pot_stack_by_spr<R: Rng>(
         let target_stack = (target_spr * pot as f64).round() as i32;
         let stack = target_stack.clamp(5, max_stack);
 
-        // 5. Verify actual SPR lands in chosen bucket
+        // 6. Verify actual SPR lands in chosen bucket
         let actual_spr = stack as f64 / pot as f64;
         if actual_spr >= spr_lo && actual_spr < spr_hi {
             return (pot, stack);
