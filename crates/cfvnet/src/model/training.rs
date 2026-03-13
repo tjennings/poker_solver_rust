@@ -161,21 +161,17 @@ impl<B: Backend> GpuReservoir<B> {
 
     /// Sample a random mini-batch from the reservoir.
     ///
-    /// Generates a random permutation on CPU and selects `batch_size` rows
-    /// using `select`. The permutation avoids duplicate indices which can
-    /// cause gradient accumulation issues in some backends.
-    fn sample_batch(&self, batch_size: usize, device: &B::Device) -> SampledBatch<B> {
-        use rand::seq::SliceRandom;
+    /// Uses `rand::seq::index::sample` for O(batch_size) index generation
+    /// instead of shuffling the full reservoir. Indices are unique to avoid
+    /// gradient accumulation issues in some backends.
+    fn sample_batch(&self, batch_size: usize, rng: &mut ChaCha8Rng, device: &B::Device) -> SampledBatch<B> {
+        use rand::seq::index;
         let actual_batch = batch_size.min(self.capacity);
-        let mut rng = ChaCha8Rng::from_rng(rand::thread_rng()).unwrap();
-
-        // Random permutation of unique indices (no duplicates).
-        let mut perm: Vec<i64> = (0..self.capacity as i64).collect();
-        perm.shuffle(&mut rng);
-        perm.truncate(actual_batch);
+        let sampled = index::sample(rng, self.capacity, actual_batch);
+        let indices_vec: Vec<i64> = sampled.iter().map(|i| i as i64).collect();
 
         let indices: Tensor<B, 1, Int> = Tensor::from_data(
-            TensorData::new(perm, [actual_batch]),
+            TensorData::new(indices_vec, [actual_batch]),
             device,
         );
         SampledBatch {
@@ -581,7 +577,7 @@ pub fn train<B: AutodiffBackend>(
             }
 
             // Sample batch from reservoir and train.
-            let batch = reservoir.sample_batch(batch_size, device);
+            let batch = reservoir.sample_batch(batch_size, &mut rng, device);
             let pred = model.forward(batch.input);
             let loss = cfvnet_loss(
                 pred,
@@ -1002,7 +998,8 @@ mod tests {
         assert_eq!(filled, 20);
 
         // Sample a batch -- should not panic, should return correct shapes.
-        let batch = reservoir.sample_batch(4, &device);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let batch = reservoir.sample_batch(4, &mut rng, &device);
         assert_eq!(batch.input.dims(), [4, input_size(5)]);
         assert_eq!(batch.target.dims(), [4, OUTPUT_SIZE]);
     }
@@ -1024,7 +1021,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         reservoir.scatter_refresh(&encoded, &mut rng, &device);
         // No panic = success. Reservoir still works.
-        let batch = reservoir.sample_batch(4, &device);
+        let batch = reservoir.sample_batch(4, &mut rng, &device);
         assert_eq!(batch.input.dims(), [4, input_size(5)]);
     }
 }
