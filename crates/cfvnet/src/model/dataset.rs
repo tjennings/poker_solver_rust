@@ -13,6 +13,7 @@ pub struct CfvItem {
     pub mask: Vec<f32>,       // length OUTPUT_SIZE — 1.0 valid, 0.0 masked
     pub range: Vec<f32>,      // length OUTPUT_SIZE — player's range for aux loss
     pub game_value: f32,      // scalar game value for aux loss
+    pub pot: f32,             // raw pot size for pot-weighted loss
 }
 
 /// Dataset that loads binary training records from disk.
@@ -189,6 +190,7 @@ pub(crate) fn encode_record(rec: &TrainingRecord, board_cards: usize) -> CfvItem
         mask,
         range,
         game_value: rec.game_value,
+        pot: rec.pot,
     }
 }
 
