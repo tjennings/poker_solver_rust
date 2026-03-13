@@ -264,6 +264,49 @@ impl StreamingReader {
 
         records
     }
+
+    /// Read a single record, advancing across file boundaries.
+    /// Returns `None` when all files are exhausted.
+    fn read_one(&mut self) -> Option<TrainingRecord> {
+        while !self.exhausted {
+            // Open next file if no reader active.
+            if self.reader.is_none() {
+                if self.current_file_idx >= self.files.len() {
+                    self.exhausted = true;
+                    return None;
+                }
+                let path = &self.files[self.current_file_idx];
+                match std::fs::File::open(path) {
+                    Ok(f) => {
+                        self.reader = Some(BufReader::new(f));
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: skipping {}: {e}", path.display());
+                        self.current_file_idx += 1;
+                        continue;
+                    }
+                }
+            }
+
+            let reader = self.reader.as_mut().unwrap();
+            match read_record(reader) {
+                Ok(rec) => return Some(rec),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    self.reader = None;
+                    self.current_file_idx += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: read error in {}: {e}",
+                        self.files[self.current_file_idx].display()
+                    );
+                    self.reader = None;
+                    self.current_file_idx += 1;
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Collect sorted file paths from a path (file or directory).
@@ -966,6 +1009,43 @@ mod tests {
         for handle in handles {
             assert!(handle.join().is_ok(), "dataloader thread should not panic");
         }
+    }
+
+    #[test]
+    fn streaming_reader_read_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            for i in 0..3 {
+                let rec = TrainingRecord {
+                    board: vec![0, 4, 8, 12, 16],
+                    pot: (i as f32) * 10.0,
+                    effective_stack: 50.0,
+                    player: 0,
+                    game_value: 0.0,
+                    oop_range: [0.0; 1326],
+                    ip_range: [0.0; 1326],
+                    cfvs: [0.0; 1326],
+                    valid_mask: [1; 1326],
+                };
+                write_record(&mut file, &rec).unwrap();
+            }
+        }
+
+        let mut reader = StreamingReader::new(vec![path]);
+
+        let r0 = reader.read_one().unwrap();
+        assert!((r0.pot - 0.0).abs() < 1e-6);
+        let r1 = reader.read_one().unwrap();
+        assert!((r1.pot - 10.0).abs() < 1e-6);
+        let r2 = reader.read_one().unwrap();
+        assert!((r2.pot - 20.0).abs() < 1e-6);
+
+        assert!(reader.read_one().is_none());
+
+        reader.reset();
+        assert!(reader.read_one().is_some());
     }
 
 }
