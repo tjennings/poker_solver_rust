@@ -202,8 +202,7 @@ Validates the turn model by comparing its predictions against fresh CfvSubgameSo
 cargo run -p cfvnet --release -- compare-net \
   --model models/turn_v1 \
   --river-model models/river_v1 \
-  --num-spots 100 \
-  --config sample_configurations/turn_cfvnet.yaml
+  --num-spots 100
 ```
 
 #### Compare Turn Model Against Exact River Solves
@@ -213,8 +212,7 @@ Validates the turn model against CfvSubgameSolver with exact river evaluation (s
 ```bash
 cargo run -p cfvnet --release -- compare-exact \
   --model models/turn_v1 \
-  --num-spots 20 \
-  --config sample_configurations/turn_cfvnet.yaml
+  --num-spots 20
 ```
 
 ### Configuration

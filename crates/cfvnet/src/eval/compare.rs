@@ -10,18 +10,19 @@ use rand_chacha::ChaCha8Rng;
 /// Generate a random comparison spot from a seed.
 pub fn generate_comparison_spot(seed: u64, initial_stack: i32, datagen: &DatagenConfig) -> Situation {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    sample_situation(datagen, initial_stack, 5, &mut rng)
+    let board_size = crate::config::board_cards_for_street(&datagen.street);
+    sample_situation(datagen, initial_stack, board_size, &mut rng)
 }
 
 /// Default solve config for comparison spots.
-pub fn default_solve_config(game: &GameConfig) -> Result<SolveConfig, String> {
+pub fn default_solve_config(game: &GameConfig, datagen: &DatagenConfig) -> Result<SolveConfig, String> {
     let bet_str = game.bet_sizes.join(",");
     let bet_sizes = BetSizeOptions::try_from((bet_str.as_str(), ""))
         .map_err(|e| format!("invalid bet sizes: {e}"))?;
     Ok(SolveConfig {
         bet_sizes,
-        solver_iterations: 500,
-        target_exploitability: 0.005,
+        solver_iterations: datagen.solver_iterations,
+        target_exploitability: datagen.target_exploitability,
         add_allin_threshold: game.add_allin_threshold,
         force_allin_threshold: game.force_allin_threshold,
     })
@@ -73,7 +74,7 @@ pub fn run_comparison<F>(
 where
     F: Fn(&Situation, &SolveResult) -> Vec<f32>,
 {
-    let solve_config = default_solve_config(game_config)?;
+    let solve_config = default_solve_config(game_config, datagen)?;
     let mut maes = Vec::with_capacity(num_spots);
     let mut max_errors = Vec::with_capacity(num_spots);
     let mut mbbs = Vec::with_capacity(num_spots);
