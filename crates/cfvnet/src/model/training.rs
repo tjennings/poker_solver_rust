@@ -508,6 +508,10 @@ pub fn train<B: AutodiffBackend>(
     let mut reservoir = GpuReservoir::<B>::new(device, reservoir_cap, board_cards);
     {
         let mut fill_reader = StreamingReader::new(files.clone());
+        // Skip past validation records so they don't leak into the reservoir.
+        if val_count > 0 {
+            let _ = fill_reader.read_chunk(val_count);
+        }
         let filled = reservoir.fill(&mut fill_reader, board_cards);
         eprintln!("Reservoir filled: {filled} records");
     }
@@ -532,13 +536,19 @@ pub fn train<B: AutodiffBackend>(
         let refresh_files = files.clone();
         Some(std::thread::spawn(move || {
             let mut reader = StreamingReader::new(refresh_files);
+            let mut consecutive_empty = 0u32;
             loop {
                 let records = reader.read_chunk(refresh_per_step);
                 if records.is_empty() {
-                    // Exhausted all files -- loop back to start.
+                    consecutive_empty += 1;
+                    if consecutive_empty > 3 {
+                        eprintln!("Warning: refresh thread exhausted all files after 3 retries, stopping");
+                        return;
+                    }
                     reader.reset();
                     continue;
                 }
+                consecutive_empty = 0;
                 let encoded = PreEncoded::from_records(&records, board_cards);
                 if refresh_tx.send(encoded).is_err() {
                     return; // Training done, channel closed.
