@@ -72,9 +72,6 @@ enum Commands {
         /// Thread count for parallel solves
         #[arg(long)]
         threads: Option<usize>,
-        /// Optional YAML config for game parameters
-        #[arg(short, long)]
-        config: Option<PathBuf>,
     },
     /// Compare turn model against CfvSubgameSolver + RiverNetEvaluator
     CompareNet {
@@ -179,8 +176,7 @@ fn main() {
             model,
             num_spots,
             threads,
-            config,
-        } => cmd_compare(model, num_spots, threads, config),
+        } => cmd_compare(model, num_spots, threads),
         Commands::CompareNet {
             model,
             river_model,
@@ -430,19 +426,18 @@ fn cmd_compare(
     model_dir: PathBuf,
     num_spots: usize,
     threads: Option<usize>,
-    config_path: Option<PathBuf>,
 ) {
     use burn::backend::NdArray;
     use burn::module::Module;
     use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
     use burn::tensor::{Tensor, TensorData};
-    use cfvnet::config::{DatagenConfig, GameConfig};
+    use cfvnet::config::board_cards_for_street;
     use cfvnet::eval::compare::run_comparison;
     use cfvnet::model::dataset::encode_situation_for_inference;
     use cfvnet::model::network::{CfvNet, input_size};
 
-    // TODO: support turn/flop models via --street flag
-    let board_cards = 5;
+    let cfg = load_model_config(&model_dir);
+    let board_cards = board_cards_for_street(&cfg.datagen.street);
     let in_size = input_size(board_cards);
 
     type B = NdArray;
@@ -450,39 +445,23 @@ fn cmd_compare(
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model_path = resolve_model_path(&model_dir);
 
-    let model = CfvNet::<B>::new(&device, 7, 500, in_size)
+    let model = CfvNet::<B>::new(&device, cfg.training.hidden_layers, cfg.training.hidden_size, in_size)
         .load_file(&model_path, &recorder, &device)
         .unwrap_or_else(|e| {
             eprintln!("failed to load model from {}: {e}", model_path.display());
             std::process::exit(1);
         });
 
-    let (game_config, datagen_config) = match config_path {
-        Some(path) => {
-            let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                eprintln!("failed to read config {}: {e}", path.display());
-                std::process::exit(1);
-            });
-            let cfg: cfvnet::config::CfvnetConfig =
-                serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
-                    eprintln!("failed to parse config: {e}");
-                    std::process::exit(1);
-                });
-            (cfg.game, cfg.datagen)
-        }
-        None => (GameConfig::default(), DatagenConfig::default()),
-    };
-
     if let Some(t) = threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(t)
             .build_global()
-            .ok(); // Ignore error if pool already initialized.
+            .ok();
     }
 
     println!("Comparing {num_spots} spots against exact solver...");
 
-    let summary = run_comparison(&game_config, &datagen_config, num_spots, 42, |sit, _solve_result| {
+    let summary = run_comparison(&cfg.game, &cfg.datagen, num_spots, cfg.datagen.seed, |sit, _solve_result| {
         let input_data = encode_situation_for_inference(sit, 0);
         let input = Tensor::<B, 2>::from_data(
             TensorData::new(input_data, [1, in_size]),
