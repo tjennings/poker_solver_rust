@@ -32,6 +32,7 @@ pub struct TrainConfig {
     pub checkpoint_every_n_epochs: usize,
     pub shuffle_buffer_size: usize,
     pub prefetch_depth: usize,
+    pub encoder_threads: usize,
 }
 
 /// Result returned after training completes.
@@ -61,15 +62,12 @@ struct DeviceTensors<B: Backend> {
 
 impl PreEncoded {
     /// Encode a slice of records into contiguous flat arrays.
-    ///
-    /// Encoding is parallelized across CPU cores with rayon.
     fn from_records(records: &[TrainingRecord], board_cards: usize) -> Self {
         let n = records.len();
         let in_size = input_size(board_cards);
 
-        // Encode all records in parallel.
         let items: Vec<_> = records
-            .par_iter()
+            .iter()
             .map(|rec| encode_record(rec, board_cards))
             .collect();
 
@@ -514,7 +512,7 @@ fn spawn_dataloader_thread(
     // channel, encode via rayon, and push to the batch channel. This keeps CPU
     // cores busy continuously instead of idling between sequential encode calls.
     let record_rx = std::sync::Arc::new(std::sync::Mutex::new(record_rx));
-    let num_encoders = 3;
+    let num_encoders = config.encoder_threads;
     let mut handles = vec![reader_thread];
     for _ in 0..num_encoders {
         let rx = record_rx.clone();
@@ -731,6 +729,7 @@ mod tests {
             checkpoint_every_n_epochs: 0,
             shuffle_buffer_size: 100,
             prefetch_depth: 2,
+            encoder_threads: 2,
         }
     }
 

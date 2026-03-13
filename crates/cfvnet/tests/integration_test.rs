@@ -55,6 +55,7 @@ fn full_pipeline_smoke_test() {
         checkpoint_every_n_epochs: 0,
         shuffle_buffer_size: 100,
         prefetch_depth: 2,
+        encoder_threads: 2,
     };
 
     let result = cfvnet::model::training::train::<B>(

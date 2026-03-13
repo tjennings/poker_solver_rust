@@ -233,6 +233,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         checkpoint_every_n_epochs: cfg.training.checkpoint_every_n_epochs,
         shuffle_buffer_size: cfg.training.shuffle_buffer_size,
         prefetch_depth: cfg.training.prefetch_depth,
+        encoder_threads: cfg.training.encoder_threads,
     };
 
     match backend {

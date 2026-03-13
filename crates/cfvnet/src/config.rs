@@ -158,6 +158,8 @@ pub struct TrainingConfig {
     pub shuffle_buffer_size: usize,
     #[serde(default = "default_prefetch_depth")]
     pub prefetch_depth: usize,
+    #[serde(default = "default_encoder_threads")]
+    pub encoder_threads: usize,
 }
 
 impl Default for TrainingConfig {
@@ -175,6 +177,7 @@ impl Default for TrainingConfig {
             checkpoint_every_n_epochs: 1000,
             shuffle_buffer_size: 262_144,
             prefetch_depth: 4,
+            encoder_threads: default_encoder_threads(),
         }
     }
 }
@@ -214,6 +217,13 @@ fn default_shuffle_buffer_size() -> usize {
 }
 fn default_prefetch_depth() -> usize {
     4
+}
+fn default_encoder_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .saturating_sub(2) // reserve 1 for reader, 1 for training loop
+        .max(1)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
