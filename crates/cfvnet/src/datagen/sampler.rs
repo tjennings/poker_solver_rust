@@ -33,7 +33,7 @@ pub fn sample_situation<R: Rng>(
     rng: &mut R,
 ) -> Situation {
     let board = sample_board(board_size, rng);
-    let pot = sample_pot(&config.pot_intervals, rng);
+    let pot = sample_pot(config.pot_range, rng);
     let max_stack = initial_stack - pot / 2;
     let effective_stack = if max_stack < 5 {
         5
@@ -76,12 +76,16 @@ pub fn sample_board<R: Rng>(num_cards: usize, rng: &mut R) -> [u8; 5] {
     board
 }
 
-/// Sample a pot from stratified intervals: pick a uniform random interval, then
-/// a uniform random value within that interval.
-fn sample_pot<R: Rng>(intervals: &[[i32; 2]], rng: &mut R) -> i32 {
-    let idx = rng.gen_range(0..intervals.len());
-    let [lo, hi] = intervals[idx];
-    rng.gen_range(lo..hi)
+/// Sample a pot using log-uniform distribution over the given range.
+///
+/// This gives equal probability density per multiplicative factor, so small
+/// pots (e.g. 4-20) get similar representation as large pots (e.g. 100-400).
+fn sample_pot<R: Rng>(pot_range: [i32; 2], rng: &mut R) -> i32 {
+    let [lo, hi] = pot_range;
+    let log_lo = (lo as f64).ln();
+    let log_hi = (hi as f64).ln();
+    let log_pot = rng.gen_range(log_lo..log_hi);
+    log_pot.exp().round() as i32
 }
 
 #[cfg(test)]
@@ -94,7 +98,7 @@ mod tests {
         DatagenConfig {
             num_samples: 100,
             street: "river".into(),
-            pot_intervals: vec![[4, 20], [20, 80], [80, 200], [200, 400]],
+            pot_range: [4, 400],
             solver_iterations: 100,
             target_exploitability: 0.01,
             threads: 1,
@@ -127,19 +131,16 @@ mod tests {
     }
 
     #[test]
-    fn pot_within_configured_intervals() {
+    fn pot_within_configured_range() {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let config = test_config();
+        let [lo, hi] = config.pot_range;
         for _ in 0..200 {
             let sit = sample_situation(&config, INITIAL_STACK, 5, &mut rng);
-            let in_some_interval = config
-                .pot_intervals
-                .iter()
-                .any(|[lo, hi]| sit.pot >= *lo && sit.pot < *hi);
             assert!(
-                in_some_interval,
-                "pot {} not in any interval {:?}",
-                sit.pot, config.pot_intervals
+                sit.pot >= lo && sit.pot <= hi,
+                "pot {} not in range [{}, {}]",
+                sit.pot, lo, hi
             );
         }
     }
