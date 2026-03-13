@@ -213,6 +213,18 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         pot_weighted_loss: cfg.training.pot_weighted_loss,
     };
 
+    // Write config early so it's available alongside checkpoints.
+    let config_out = output.join("config.yaml");
+    let config_yaml = serde_yaml::to_string(&cfg).unwrap_or_else(|e| {
+        eprintln!("failed to serialize config: {e}");
+        std::process::exit(1);
+    });
+    std::fs::write(&config_out, &config_yaml).unwrap_or_else(|e| {
+        eprintln!("failed to write config to {}: {e}", config_out.display());
+        std::process::exit(1);
+    });
+    println!("Config saved to {}", config_out.display());
+
     match backend {
         "wgpu" => {
             use burn::backend::{Autodiff, wgpu::{Wgpu, WgpuDevice}};
@@ -250,16 +262,6 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         }
     }
 
-    let config_out = output.join("config.yaml");
-    let yaml = serde_yaml::to_string(&cfg).unwrap_or_else(|e| {
-        eprintln!("failed to serialize config: {e}");
-        std::process::exit(1);
-    });
-    std::fs::write(&config_out, &yaml).unwrap_or_else(|e| {
-        eprintln!("failed to write config to {}: {e}", config_out.display());
-        std::process::exit(1);
-    });
-    println!("Config saved to {}", config_out.display());
 }
 
 fn cmd_generate(
