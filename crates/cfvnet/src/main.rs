@@ -260,6 +260,17 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
             std::process::exit(1);
         }
     }
+
+    let config_out = output.join("config.yaml");
+    let yaml = serde_yaml::to_string(&cfg).unwrap_or_else(|e| {
+        eprintln!("failed to serialize config: {e}");
+        std::process::exit(1);
+    });
+    std::fs::write(&config_out, &yaml).unwrap_or_else(|e| {
+        eprintln!("failed to write config to {}: {e}", config_out.display());
+        std::process::exit(1);
+    });
+    println!("Config saved to {}", config_out.display());
 }
 
 fn cmd_generate(
@@ -527,30 +538,21 @@ fn cmd_compare_exact(model_dir: PathBuf, num_spots: usize, config_path: Option<P
     print_summary(&summary);
 }
 
-fn load_config_or_default(config_path: Option<&std::path::Path>) -> cfvnet::config::CfvnetConfig {
-    match config_path {
-        Some(path) => {
-            let yaml = std::fs::read_to_string(path).unwrap_or_else(|e| {
-                eprintln!("failed to read config {}: {e}", path.display());
-                std::process::exit(1);
-            });
-            serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
-                eprintln!("failed to parse config: {e}");
-                std::process::exit(1);
-            })
-        }
-        None => {
-            use cfvnet::config::{
-                CfvnetConfig, DatagenConfig, EvaluationConfig, GameConfig, TrainingConfig,
-            };
-            CfvnetConfig {
-                game: GameConfig::default(),
-                datagen: DatagenConfig::default(),
-                training: TrainingConfig::default(),
-                evaluation: EvaluationConfig::default(),
-            }
-        }
-    }
+fn load_model_config(model_dir: &std::path::Path) -> cfvnet::config::CfvnetConfig {
+    let config_path = model_dir.join("config.yaml");
+    let yaml = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        eprintln!(
+            "failed to read model config {}: {e}\n\
+             hint: this model was saved before config embedding was added — \
+             re-train or manually place a config.yaml in the model directory",
+            config_path.display()
+        );
+        std::process::exit(1);
+    });
+    serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
+        eprintln!("failed to parse model config {}: {e}", config_path.display());
+        std::process::exit(1);
+    })
 }
 
 fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
