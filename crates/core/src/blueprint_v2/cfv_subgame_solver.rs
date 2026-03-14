@@ -238,6 +238,11 @@ impl CfvSubgameSolver {
     ///
     /// Returns `(oop_ranges, ip_ranges)` where each is a `Vec<Vec<f64>>`
     /// indexed by `[boundary_ordinal][combo_idx]`.
+    ///
+    /// Traverses the tree **once**, carrying reach-probability vectors of
+    /// length `n` (number of combos) for both players, instead of walking
+    /// the tree once per combo. This is O(tree_nodes × combos) work in a
+    /// single pass rather than O(combos × tree_nodes) across 1326 passes.
     fn propagate_ranges(
         &self,
         snapshot: &[f64],
@@ -248,53 +253,57 @@ impl CfvSubgameSolver {
         let mut oop_ranges = vec![vec![0.0; n]; num_boundaries];
         let mut ip_ranges = vec![vec![0.0; n]; num_boundaries];
 
-        for combo_idx in 0..n {
-            self.propagate_combo(
-                snapshot,
-                self.tree.root as usize,
-                combo_idx,
-                1.0, // OOP starts with reach 1.0
-                1.0, // IP starts with reach 1.0
-                &mut oop_ranges,
-                &mut ip_ranges,
-            );
-        }
+        let oop_reach = vec![1.0; n];
+        let ip_reach = vec![1.0; n];
+
+        self.propagate_ranges_recursive(
+            snapshot,
+            self.tree.root as usize,
+            &oop_reach,
+            &ip_reach,
+            &mut oop_ranges,
+            &mut ip_ranges,
+        );
 
         (oop_ranges, ip_ranges)
     }
 
-    /// Recursive range propagation for a single combo.
+    /// Vectorized recursive range propagation.
     ///
-    /// Walks the tree, multiplying reaches by strategy probabilities at
-    /// decision nodes, and recording reaches at depth boundary nodes.
+    /// Walks the tree once, carrying reach-probability vectors for all
+    /// combos simultaneously. At decision nodes, the acting player's
+    /// reach vector is multiplied element-wise by strategy probabilities
+    /// for each action before recursing into children.
     #[allow(clippy::too_many_arguments)]
-    fn propagate_combo(
+    fn propagate_ranges_recursive(
         &self,
         snapshot: &[f64],
         node_idx: usize,
-        combo_idx: usize,
-        oop_reach: f64,
-        ip_reach: f64,
+        oop_reach: &[f64],
+        ip_reach: &[f64],
         oop_ranges: &mut [Vec<f64>],
         ip_ranges: &mut [Vec<f64>],
     ) {
+        let n = oop_reach.len();
+
         match &self.tree.nodes[node_idx] {
             GameNode::Terminal { kind, .. } => {
                 if *kind == TerminalKind::DepthBoundary {
                     let ordinal = self.node_to_boundary[node_idx];
                     if ordinal != usize::MAX {
-                        oop_ranges[ordinal][combo_idx] += oop_reach;
-                        ip_ranges[ordinal][combo_idx] += ip_reach;
+                        for i in 0..n {
+                            oop_ranges[ordinal][i] += oop_reach[i];
+                            ip_ranges[ordinal][i] += ip_reach[i];
+                        }
                     }
                 }
                 // Fold / Showdown: no propagation needed.
             }
 
             GameNode::Chance { child, .. } => {
-                self.propagate_combo(
+                self.propagate_ranges_recursive(
                     snapshot,
                     *child as usize,
-                    combo_idx,
                     oop_reach,
                     ip_reach,
                     oop_ranges,
@@ -308,22 +317,36 @@ impl CfvSubgameSolver {
                 children,
                 ..
             } => {
-                let (base, _) = self.layout.slot(node_idx, combo_idx);
                 let num_actions = actions.len();
-                let strategy = &snapshot[base..base + num_actions];
+                let node_base = self.layout.bases[node_idx];
 
                 for (a, &child_idx) in children.iter().enumerate() {
-                    let (new_oop, new_ip) = if *player == 0 {
-                        (oop_reach * strategy[a], ip_reach)
+                    // Build child reach vectors by multiplying the acting
+                    // player's reach by strategy probability for this action.
+                    let mut child_oop = Vec::with_capacity(n);
+                    let mut child_ip = Vec::with_capacity(n);
+
+                    if *player == 0 {
+                        for combo_idx in 0..n {
+                            let strat_prob =
+                                snapshot[node_base + combo_idx * num_actions + a];
+                            child_oop.push(oop_reach[combo_idx] * strat_prob);
+                            child_ip.push(ip_reach[combo_idx]);
+                        }
                     } else {
-                        (oop_reach, ip_reach * strategy[a])
-                    };
-                    self.propagate_combo(
+                        for combo_idx in 0..n {
+                            let strat_prob =
+                                snapshot[node_base + combo_idx * num_actions + a];
+                            child_oop.push(oop_reach[combo_idx]);
+                            child_ip.push(ip_reach[combo_idx] * strat_prob);
+                        }
+                    }
+
+                    self.propagate_ranges_recursive(
                         snapshot,
                         child_idx as usize,
-                        combo_idx,
-                        new_oop,
-                        new_ip,
+                        &child_oop,
+                        &child_ip,
                         oop_ranges,
                         ip_ranges,
                     );
@@ -374,16 +397,21 @@ impl CfvSubgameSolver {
                     || iter_idx == iterations - 1
             };
 
-            // Propagate ranges to boundaries and evaluate leaf CFVs.
-            if should_eval && !self.boundary_info.boundaries.is_empty() {
-                let (oop_ranges, ip_ranges) = self.propagate_ranges(&snapshot);
+            // Propagate ranges once (shared between both traversers).
+            let boundary_ranges =
+                if should_eval && !self.boundary_info.boundaries.is_empty() {
+                    Some(self.propagate_ranges(&snapshot))
+                } else {
+                    None
+                };
 
+            // Evaluate leaf CFVs for traverser 0 (OOP).
+            if let Some((ref oop_ranges, ref ip_ranges)) = boundary_ranges {
                 for (b_idx, &(_, pot, invested)) in
                     self.boundary_info.boundaries.iter().enumerate()
                 {
                     let eff_stack =
                         self.starting_stack - invested[0].max(invested[1]);
-
                     self.leaf_cfvs[b_idx] = self.evaluator.evaluate(
                         &self.hands.combos,
                         &self.board,
@@ -397,25 +425,25 @@ impl CfvSubgameSolver {
             }
 
             for traverser in 0..2u8 {
-                // Re-evaluate boundaries from current traverser's perspective
-                // if there are boundaries.
-                if should_eval && !self.boundary_info.boundaries.is_empty() && traverser == 1 {
-                    let (oop_ranges, ip_ranges) =
-                        self.propagate_ranges(&snapshot);
-                    for (b_idx, &(_, pot, invested)) in
-                        self.boundary_info.boundaries.iter().enumerate()
-                    {
-                        let eff_stack = self.starting_stack
-                            - invested[0].max(invested[1]);
-                        self.leaf_cfvs[b_idx] = self.evaluator.evaluate(
-                            &self.hands.combos,
-                            &self.board,
-                            pot,
-                            eff_stack,
-                            &oop_ranges[b_idx],
-                            &ip_ranges[b_idx],
-                            traverser,
-                        );
+                // Re-evaluate boundaries for traverser 1 using the same
+                // propagated ranges (no duplicate tree walk).
+                if let Some((ref oop_ranges, ref ip_ranges)) = boundary_ranges {
+                    if traverser == 1 {
+                        for (b_idx, &(_, pot, invested)) in
+                            self.boundary_info.boundaries.iter().enumerate()
+                        {
+                            let eff_stack = self.starting_stack
+                                - invested[0].max(invested[1]);
+                            self.leaf_cfvs[b_idx] = self.evaluator.evaluate(
+                                &self.hands.combos,
+                                &self.board,
+                                pot,
+                                eff_stack,
+                                &oop_ranges[b_idx],
+                                &ip_ranges[b_idx],
+                                traverser,
+                            );
+                        }
                     }
                 }
 
