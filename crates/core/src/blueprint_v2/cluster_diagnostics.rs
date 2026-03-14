@@ -502,6 +502,132 @@ pub fn centroid_emd_report(
     }
 }
 
+/// Audit river bucket assignments against cfvnet training data.
+///
+/// Streams cfvnet bin files, computes equity from CFVs, looks up the assigned
+/// bucket, and reports per-bucket equity statistics. Samples every `sample_rate`-th
+/// record for speed.
+///
+/// # Errors
+///
+/// Returns an error if bin files cannot be read or the bucket file has no matching boards.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+pub fn audit_cfvnet_buckets(
+    cfvnet_dir: &Path,
+    bf: &BucketFile,
+    sample_rate: usize,
+    progress: impl Fn(f64),
+) -> Result<EquityAuditReport, Box<dyn std::error::Error>> {
+    use super::cluster_pipeline::{
+        build_cfvnet_to_core_combo_map, cfvnet_card_to_core, canonical_key,
+        collect_bin_files, read_cfv_as_equity, record_size_for_board,
+        CFVNET_RIVER_RECORD_SIZE, CFV_FIELD_OFFSET,
+    };
+
+    let combo_map = build_cfvnet_to_core_combo_map();
+    let bin_files = collect_bin_files(cfvnet_dir)?;
+    let board_map = bf.board_index_map();
+    let bucket_count = bf.header.bucket_count as usize;
+    let combos_per_board = bf.header.combos_per_board as usize;
+
+    // Accumulators per bucket
+    let mut sum = vec![0.0f64; bucket_count];
+    let mut sq_sum = vec![0.0f64; bucket_count];
+    let mut min_eq = vec![f64::INFINITY; bucket_count];
+    let mut max_eq = vec![f64::NEG_INFINITY; bucket_count];
+    let mut count = vec![0u64; bucket_count];
+
+    let mut records_seen = 0u64;
+
+    for (fi, path) in bin_files.iter().enumerate() {
+        let data = std::fs::read(path)?;
+        let mut offset = 0;
+        while offset + CFVNET_RIVER_RECORD_SIZE <= data.len() {
+            if data[offset] != 5 {
+                offset += record_size_for_board(data[offset]);
+                continue;
+            }
+
+            records_seen += 1;
+            if records_seen % sample_rate as u64 != 0 {
+                offset += CFVNET_RIVER_RECORD_SIZE;
+                continue;
+            }
+
+            let board_cards: Vec<Card> = (0..5)
+                .map(|i| cfvnet_card_to_core(data[offset + 1 + i]))
+                .collect();
+            let packed = canonical_key(&board_cards);
+
+            if let Some(&board_idx) = board_map.get(&packed) {
+                let cfv_offset = offset + CFV_FIELD_OFFSET;
+                let mask_offset = cfv_offset + 1326 * 4;
+
+                for i in 0..1326 {
+                    if data[mask_offset + i] != 0 {
+                        let equity = read_cfv_as_equity(&data, cfv_offset, i);
+                        let core_combo = combo_map[i] as usize;
+                        let bucket = bf.buckets[board_idx as usize * combos_per_board + core_combo] as usize;
+                        if bucket < bucket_count {
+                            sum[bucket] += equity;
+                            sq_sum[bucket] += equity * equity;
+                            if equity < min_eq[bucket] { min_eq[bucket] = equity; }
+                            if equity > max_eq[bucket] { max_eq[bucket] = equity; }
+                            count[bucket] += 1;
+                        }
+                    }
+                }
+            }
+
+            offset += CFVNET_RIVER_RECORD_SIZE;
+        }
+        progress((fi + 1) as f64 / bin_files.len() as f64);
+    }
+
+    let bucket_stats: Vec<BucketEquityStats> = (0..bucket_count)
+        .map(|b| {
+            let n = count[b];
+            if n == 0 {
+                return BucketEquityStats {
+                    bucket_id: b as u16,
+                    count: 0,
+                    mean_equity: 0.0,
+                    std_dev: 0.0,
+                    min_equity: 0.0,
+                    max_equity: 0.0,
+                };
+            }
+            let mean = sum[b] / n as f64;
+            let variance = (sq_sum[b] / n as f64 - mean * mean).max(0.0);
+            BucketEquityStats {
+                bucket_id: b as u16,
+                count: n as usize,
+                mean_equity: mean,
+                std_dev: variance.sqrt(),
+                min_equity: min_eq[b],
+                max_equity: max_eq[b],
+            }
+        })
+        .collect();
+
+    let non_empty: Vec<_> = bucket_stats.iter().filter(|b| b.count > 0).collect();
+    let mean_std = if non_empty.is_empty() {
+        0.0
+    } else {
+        non_empty.iter().map(|b| b.std_dev).sum::<f64>() / non_empty.len() as f64
+    };
+    let max_std = non_empty.iter().map(|b| b.std_dev).fold(0.0_f64, f64::max);
+
+    Ok(EquityAuditReport {
+        street: "River (cfvnet)".to_string(),
+        bucket_count: bucket_count as u16,
+        sample_boards: records_seen as usize / sample_rate.max(1),
+        buckets: bucket_stats,
+        mean_intra_bucket_std: mean_std,
+        max_intra_bucket_std: max_std,
+    })
+}
+
 /// A sample hand from a specific bucket.
 #[derive(Debug, Clone)]
 pub struct BucketHandSample {

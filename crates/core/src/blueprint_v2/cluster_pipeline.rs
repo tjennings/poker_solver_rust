@@ -914,7 +914,7 @@ const HISTOGRAM_BINS: usize = 10_000;
 /// `board_size`(1) + board(5) + pot(4) + stack(4) + player(1) +
 /// `game_value`(4) + `oop_range`(5304) + `ip_range`(5304) + cfvs(5304) +
 /// `valid_mask`(1326).
-const CFVNET_RIVER_RECORD_SIZE: usize = 1 + 5 + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4 + 1326 * 4 + 1326;
+pub(crate) const CFVNET_RIVER_RECORD_SIZE: usize = 1 + 5 + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4 + 1326 * 4 + 1326;
 
 /// Cluster river situations using pre-solved cfvnet training records.
 ///
@@ -1009,10 +1009,10 @@ pub fn cluster_river_from_cfvnet(
 }
 
 /// Byte offset from record start to the cfvs field (river records only).
-const CFV_FIELD_OFFSET: usize = 1 + 5 + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4;
+pub(crate) const CFV_FIELD_OFFSET: usize = 1 + 5 + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4;
 
 /// Collect all `*.bin` files from a directory.
-fn collect_bin_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
+pub(crate) fn collect_bin_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
     let files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
         .filter_map(std::result::Result::ok)
         .map(|e| e.path())
@@ -1025,7 +1025,7 @@ fn collect_bin_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, Box<dyn std:
 }
 
 /// Read a single CFV float from binary data and convert to equity.
-fn read_cfv_as_equity(data: &[u8], cfv_offset: usize, combo_idx: usize) -> f64 {
+pub(crate) fn read_cfv_as_equity(data: &[u8], cfv_offset: usize, combo_idx: usize) -> f64 {
     let start = cfv_offset + combo_idx * 4;
     let cfv = f32::from_le_bytes([data[start], data[start + 1], data[start + 2], data[start + 3]]);
     cfv_to_equity(cfv)
@@ -1122,7 +1122,7 @@ fn cfvnet_pass2_centroids(histogram: &[u64], bucket_count: u16, kmeans_iteration
 }
 
 /// Compute the byte size of a cfvnet record given the board size.
-fn record_size_for_board(board_size: u8) -> usize {
+pub(crate) fn record_size_for_board(board_size: u8) -> usize {
     1 + board_size as usize + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4 + 1326 * 4 + 1326
 }
 
@@ -1616,13 +1616,13 @@ fn cards_overlap(combo: [Card; 2], board: &[Card]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Convert a pot-relative CFV to an equity value in [0, 1].
-fn cfv_to_equity(cfv: f32) -> f64 {
+pub(crate) fn cfv_to_equity(cfv: f32) -> f64 {
     f64::midpoint(f64::from(cfv), 1.0).clamp(0.0, 1.0)
 }
 
 /// Map a cfvnet `card_id` (`4*rank + suit` where C=0,D=1,H=2,S=3)
 /// to a core Card.
-fn cfvnet_card_to_core(card_id: u8) -> Card {
+pub(crate) fn cfvnet_card_to_core(card_id: u8) -> Card {
     let rank = card_id / 4;
     let cfvnet_suit = card_id % 4;
     let value = match rank {
@@ -1653,7 +1653,7 @@ fn cfvnet_card_to_core(card_id: u8) -> Card {
 
 /// Build a lookup table mapping cfvnet combo index (range-solver ordering)
 /// to core combo index (`cluster_pipeline` ordering).
-fn build_cfvnet_to_core_combo_map() -> [u16; 1326] {
+pub(crate) fn build_cfvnet_to_core_combo_map() -> [u16; 1326] {
     let mut map = [0u16; 1326];
     let mut cfvnet_idx = 0usize;
     for c0 in 0u8..52 {

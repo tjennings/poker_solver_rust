@@ -63,6 +63,9 @@ enum Commands {
         /// Show sample hands from a specific bucket (STREET BUCKET_ID)
         #[arg(long, num_args = 2, value_names = ["STREET", "BUCKET"])]
         sample_bucket: Option<Vec<String>>,
+        /// Audit river bucket equity using cfvnet training data (path to cfvnet dir)
+        #[arg(long)]
+        cfvnet_audit: Option<PathBuf>,
     },
     /// Pre-compute the equity+delta lookup cache for fast expected-delta bucketing.
     /// Generates turn table first (averaging over river cards), then flop table
@@ -418,6 +421,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             transitions,
             centroid_emd,
             sample_bucket,
+            cfvnet_audit,
         } => {
             use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
             use poker_solver_core::blueprint_v2::cluster_diagnostics::{
@@ -441,6 +445,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                 )?;
                 for report in &audit_reports {
                     eprintln!("\n{}", report.summary());
+                }
+            }
+            if let Some(ref cfvnet_dir) = cfvnet_audit {
+                eprintln!("\nCFVnet river equity audit (sampling every 10th record)...");
+                let river_path = cluster_dir.join("river.buckets");
+                if !river_path.exists() {
+                    eprintln!("No river.buckets found in {}", cluster_dir.display());
+                } else {
+                    let bf = BucketFile::load(&river_path)?;
+                    let report = poker_solver_core::blueprint_v2::cluster_diagnostics::audit_cfvnet_buckets(
+                        cfvnet_dir,
+                        &bf,
+                        10,
+                        |p| eprint!("\r  progress: {:.0}%", p * 100.0),
+                    )?;
+                    eprintln!("\r                    ");
+                    eprintln!("{}", report.summary());
                 }
             }
             if transitions {
