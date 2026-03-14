@@ -1,6 +1,10 @@
 //! Turn depth-boundary evaluator that averages the river CFV network
 //! over all possible river cards.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
@@ -61,6 +65,34 @@ pub struct RiverNetEvaluator<B: Backend> {
 impl<B: Backend> RiverNetEvaluator<B> {
     pub fn new(model: CfvNet<B>, device: B::Device) -> Self {
         Self { model, device }
+    }
+}
+
+/// GPU-accelerated evaluator that shares a single model behind a mutex.
+///
+/// Batches all valid river card inputs into a single `[N, INPUT_SIZE]` tensor
+/// for one forward pass per `evaluate()` call. Tracks cumulative mutex wait time.
+pub struct SharedRiverNetEvaluator<B: Backend> {
+    model: Arc<Mutex<CfvNet<B>>>,
+    device: B::Device,
+    /// Cumulative nanoseconds spent waiting for the mutex across all threads.
+    pub wait_nanos: Arc<AtomicU64>,
+}
+
+impl<B: Backend> SharedRiverNetEvaluator<B>
+where
+    B::Device: Clone,
+{
+    pub fn new(
+        model: Arc<Mutex<CfvNet<B>>>,
+        device: B::Device,
+        wait_nanos: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            model,
+            device,
+            wait_nanos,
+        }
     }
 }
 
@@ -211,12 +243,133 @@ where
     }
 }
 
+impl<B: Backend> LeafEvaluator for SharedRiverNetEvaluator<B>
+where
+    B::Device: Clone,
+{
+    fn evaluate(
+        &self,
+        combos: &[[Card; 2]],
+        board: &[Card],
+        pot: f64,
+        effective_stack: f64,
+        oop_range: &[f64],
+        ip_range: &[f64],
+        traverser: u8,
+    ) -> Vec<f64> {
+        assert_eq!(
+            board.len(),
+            4,
+            "SharedRiverNetEvaluator requires a 4-card turn board"
+        );
+        assert_eq!(combos.len(), oop_range.len());
+        assert_eq!(combos.len(), ip_range.len());
+
+        let num_combos = combos.len();
+
+        let combos_u8: Vec<[u8; 2]> = combos
+            .iter()
+            .map(|c| [rs_card_to_u8(c[0]), rs_card_to_u8(c[1])])
+            .collect();
+        let combo_indices: Vec<usize> = combos_u8
+            .iter()
+            .map(|c| card_pair_to_index(c[0], c[1]))
+            .collect();
+
+        let board_u8: Vec<u8> = board.iter().map(|c| rs_card_to_u8(*c)).collect();
+
+        // Build all river card inputs CPU-side.
+        let mut inputs: Vec<f32> = Vec::new();
+        let mut valid_combo_masks: Vec<Vec<bool>> = Vec::new();
+
+        for river_u8 in 0u8..52 {
+            if board_u8.contains(&river_u8) {
+                continue;
+            }
+
+            let river_board_u8: [u8; 5] = [
+                board_u8[0], board_u8[1], board_u8[2], board_u8[3], river_u8,
+            ];
+
+            let mut oop_1326 = [0.0_f32; OUTPUT_SIZE];
+            let mut ip_1326 = [0.0_f32; OUTPUT_SIZE];
+            let mut valid_combo_mask = vec![false; num_combos];
+
+            for (i, &idx) in combo_indices.iter().enumerate() {
+                if combos_u8[i][0] == river_u8 || combos_u8[i][1] == river_u8 {
+                    continue;
+                }
+                valid_combo_mask[i] = true;
+                oop_1326[idx] = oop_range[i] as f32;
+                ip_1326[idx] = ip_range[i] as f32;
+            }
+
+            let input_vec = build_input(
+                &oop_1326,
+                &ip_1326,
+                &river_board_u8,
+                pot,
+                effective_stack,
+                traverser,
+            );
+            inputs.extend_from_slice(&input_vec);
+            valid_combo_masks.push(valid_combo_mask);
+        }
+
+        let batch_size = valid_combo_masks.len();
+
+        // Acquire mutex, run batched forward pass.
+        let t0 = Instant::now();
+        let model = self.model.lock().unwrap();
+        let wait = t0.elapsed();
+        self.wait_nanos
+            .fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
+
+        let data = TensorData::new(inputs, [batch_size, INPUT_SIZE]);
+        let input_tensor = Tensor::<B, 2>::from_data(data, &self.device);
+        let output = model.forward(input_tensor);
+
+        drop(model); // release mutex before post-processing
+
+        let out_data = output.into_data();
+        let out_vec: Vec<f32> = out_data.to_vec().expect("output tensor conversion");
+
+        // Post-process: average over river cards per combo.
+        let mut cfv_sum = vec![0.0_f64; num_combos];
+        let mut cfv_count = vec![0_u32; num_combos];
+
+        for (river_idx, mask) in valid_combo_masks.iter().enumerate() {
+            let row_start = river_idx * OUTPUT_SIZE;
+            for (i, &idx) in combo_indices.iter().enumerate() {
+                if mask[i] {
+                    cfv_sum[i] += f64::from(out_vec[row_start + idx]);
+                    cfv_count[i] += 1;
+                }
+            }
+        }
+
+        cfv_sum
+            .iter()
+            .zip(cfv_count.iter())
+            .map(|(&sum, &count)| {
+                if count > 0 {
+                    sum / f64::from(count)
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
     use poker_solver_core::blueprint_v2::subgame_cfr::SubgameHands;
     use poker_solver_core::poker::Value;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
 
     type TestBackend = NdArray;
 
@@ -318,6 +471,41 @@ mod tests {
                 let back = rs_card_to_u8(card);
                 assert_eq!(id, back, "roundtrip failed for card {id}");
             }
+        }
+    }
+
+    #[test]
+    fn shared_evaluator_matches_sequential() {
+        let device = Default::default();
+        let model = CfvNet::<TestBackend>::new(&device, 1, 8, INPUT_SIZE);
+        let wait_nanos = Arc::new(AtomicU64::new(0));
+
+        let shared = SharedRiverNetEvaluator::new(
+            Arc::new(Mutex::new(model.clone())),
+            device,
+            wait_nanos.clone(),
+        );
+        let sequential = RiverNetEvaluator::new(model, Default::default());
+
+        let board = test_board();
+        let hands = SubgameHands::enumerate(&board);
+        let n = hands.combos.len().min(20);
+        let combos = &hands.combos[..n];
+        let oop_range = vec![1.0 / n as f64; n];
+        let ip_range = vec![1.0 / n as f64; n];
+
+        let shared_result =
+            shared.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 0);
+        let seq_result =
+            sequential.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 0);
+
+        assert_eq!(shared_result.len(), seq_result.len());
+        for (i, (s, q)) in shared_result.iter().zip(seq_result.iter()).enumerate() {
+            assert!(
+                (s - q).abs() < 1e-4,
+                "combo {i}: shared={s} vs sequential={q}, diff={}",
+                (s - q).abs()
+            );
         }
     }
 }

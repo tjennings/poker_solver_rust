@@ -35,6 +35,9 @@ enum Commands {
         /// Max samples per output file; splits into multiple files if total exceeds this
         #[arg(long)]
         per_file: Option<u64>,
+        /// Backend for inference: ndarray (CPU, default) or cuda (GPU, requires --features cuda).
+        #[arg(long, default_value = "ndarray")]
+        backend: String,
     },
     /// Train the CFVnet model
     Train {
@@ -168,9 +171,10 @@ fn main() {
             num_samples,
             threads,
             per_file,
+            backend,
         } => {
             ensure_parent_dir(&output);
-            cmd_generate(config, output, num_samples, threads, per_file);
+            cmd_generate(config, output, num_samples, threads, per_file, &backend);
         }
         Commands::Train {
             config,
@@ -293,6 +297,7 @@ fn cmd_generate(
     num_samples: Option<u64>,
     threads: Option<usize>,
     per_file: Option<u64>,
+    backend: &str,
 ) {
     let yaml = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
         eprintln!("failed to read config {}: {e}", config_path.display());
@@ -356,7 +361,7 @@ fn cmd_generate(
         }
 
         let result = match street {
-            "turn" => cfvnet::datagen::turn_generate::generate_turn_training_data(&cfg, &file_output),
+            "turn" => cfvnet::datagen::turn_generate::generate_turn_training_data(&cfg, &file_output, backend),
             _ => cfvnet::datagen::generate::generate_training_data(&cfg, &file_output),
         };
 

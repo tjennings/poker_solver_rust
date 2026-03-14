@@ -6,6 +6,10 @@
 
 use std::io::BufWriter;
 use std::path::Path;
+#[cfg(feature = "cuda")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "cuda")]
+use std::sync::{Arc, Mutex};
 
 use burn::backend::NdArray;
 use burn::module::Module;
@@ -26,6 +30,8 @@ use super::sampler::sample_situation;
 use super::storage::{write_record, TrainingRecord};
 use crate::config::CfvnetConfig;
 use crate::eval::river_net_evaluator::RiverNetEvaluator;
+#[cfg(feature = "cuda")]
+use crate::eval::river_net_evaluator::SharedRiverNetEvaluator;
 use crate::model::network::{CfvNet, INPUT_SIZE};
 
 type B = NdArray;
@@ -179,6 +185,179 @@ fn weighted_sum(range: &[f32; NUM_COMBOS], cfvs: &[f32; NUM_COMBOS]) -> f32 {
     range.iter().zip(cfvs.iter()).map(|(&r, &c)| r * c).sum()
 }
 
+/// GPU-accelerated turn datagen using a shared CUDA model behind a mutex.
+///
+/// Each parallel solve creates a [`SharedRiverNetEvaluator`] that acquires the
+/// GPU mutex for batched inference. Contention stats are printed at the end.
+#[cfg(feature = "cuda")]
+fn generate_turn_training_data_cuda(
+    config: &CfvnetConfig,
+    output_path: &Path,
+) -> Result<(), String> {
+    use burn::backend::cuda_jit::CudaDevice;
+    use burn::backend::CudaJit;
+
+    type CudaB = CudaJit<f32>;
+
+    let river_model_path = config
+        .game
+        .river_model_path
+        .as_deref()
+        .ok_or("river_model_path is required for turn datagen")?;
+
+    let num_samples = config.datagen.num_samples;
+    let seed = crate::config::resolve_seed(config.datagen.seed);
+    let threads = config.datagen.threads;
+    let solver_iterations = config.datagen.solver_iterations;
+    let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
+    if bet_sizes_f64.is_empty() {
+        return Err("no valid percentage bet sizes found in config".into());
+    }
+    let bet_sizes_vec = vec![bet_sizes_f64];
+
+    // Load river model on CUDA.
+    let device = CudaDevice::default();
+    let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+    let model = CfvNet::<CudaB>::new(
+        &device,
+        config.training.hidden_layers,
+        config.training.hidden_size,
+        INPUT_SIZE,
+    )
+    .load_file(river_model_path, &recorder, &device)
+    .map_err(|e| format!("failed to load river model: {e}"))?;
+
+    println!("River model loaded on CUDA");
+
+    // Wrap in Arc<Mutex<>> for shared GPU access.
+    let model = Arc::new(Mutex::new(model));
+    let wait_nanos = Arc::new(AtomicU64::new(0));
+
+    let wall_start = std::time::Instant::now();
+
+    let pb = ProgressBar::new(num_samples);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
+            .expect("valid progress bar template"),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_secs(1));
+
+    // Open output file once, write incrementally across chunks.
+    let file =
+        std::fs::File::create(output_path).map_err(|e| format!("create output: {e}"))?;
+    let mut writer = BufWriter::new(file);
+
+    // Build thread pool once if multi-threaded.
+    let pool = if threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| format!("thread pool: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut remaining = num_samples;
+
+    while remaining > 0 {
+        let chunk_len = remaining.min(CHUNK_SIZE);
+        remaining -= chunk_len;
+
+        // Sample situations sequentially for determinism.
+        let situations: Vec<_> = (0..chunk_len)
+            .map(|_| sample_situation(&config.datagen, config.game.initial_stack, 4, &mut rng))
+            .collect();
+
+        // Solve chunk in parallel (or sequentially if threads == 1).
+        let solve_one =
+            |sit: &super::sampler::Situation|
+             -> Option<([f32; NUM_COMBOS], [f32; NUM_COMBOS], [u8; NUM_COMBOS], f32, f32)> {
+                if sit.effective_stack <= 0 {
+                    pb.inc(1);
+                    return None;
+                }
+
+                let evaluator: Box<dyn LeafEvaluator> =
+                    Box::new(SharedRiverNetEvaluator::new(
+                        Arc::clone(&model),
+                        device.clone(),
+                        Arc::clone(&wait_nanos),
+                    ));
+
+                let result = solve_turn_situation(
+                    sit.board_cards(),
+                    f64::from(sit.pot),
+                    f64::from(sit.effective_stack),
+                    &sit.ranges,
+                    &bet_sizes_vec,
+                    solver_iterations,
+                    evaluator,
+                );
+
+                pb.inc(1);
+                Some(result)
+            };
+
+        let results: Vec<_> = match &pool {
+            Some(pool) => pool.install(|| situations.par_iter().map(solve_one).collect()),
+            None => situations.iter().map(solve_one).collect(),
+        };
+
+        // Write results sequentially.
+        for (sit, result) in situations.iter().zip(results) {
+            if let Some((oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)) = result {
+                let board_vec = sit.board_cards().to_vec();
+
+                let oop_rec = TrainingRecord {
+                    board: board_vec.clone(),
+                    pot: sit.pot as f32,
+                    effective_stack: sit.effective_stack as f32,
+                    player: 0,
+                    game_value: oop_gv,
+                    oop_range: sit.ranges[0],
+                    ip_range: sit.ranges[1],
+                    cfvs: oop_cfvs,
+                    valid_mask,
+                };
+                write_record(&mut writer, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
+
+                let ip_rec = TrainingRecord {
+                    board: board_vec,
+                    pot: sit.pot as f32,
+                    effective_stack: sit.effective_stack as f32,
+                    player: 1,
+                    game_value: ip_gv,
+                    oop_range: sit.ranges[0],
+                    ip_range: sit.ranges[1],
+                    cfvs: ip_cfvs,
+                    valid_mask,
+                };
+                write_record(&mut writer, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
+            }
+        }
+    }
+
+    pb.finish_with_message("done");
+
+    // Print contention stats.
+    let wall_secs = wall_start.elapsed().as_secs_f64();
+    let wait_secs = wait_nanos.load(Ordering::Relaxed) as f64 / 1e9;
+    let pct = if wall_secs > 0.0 {
+        wait_secs / wall_secs * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "GPU mutex wait: {wait_secs:.1}s total ({pct:.1}% of {wall_secs:.1}s wall time)"
+    );
+
+    Ok(())
+}
+
 /// Generate turn training data by sampling situations, solving with
 /// `CfvSubgameSolver` + `RiverNetEvaluator`, and writing paired records.
 ///
@@ -191,7 +370,15 @@ fn weighted_sum(range: &[f32; NUM_COMBOS], cfvs: &[f32; NUM_COMBOS]) -> f32 {
 pub fn generate_turn_training_data(
     config: &CfvnetConfig,
     output_path: &Path,
+    backend: &str,
 ) -> Result<(), String> {
+    match backend {
+        #[cfg(feature = "cuda")]
+        "cuda" => return generate_turn_training_data_cuda(config, output_path),
+        #[cfg(not(feature = "cuda"))]
+        "cuda" => return Err("CUDA backend not enabled. Rebuild with: cargo build -p cfvnet --features cuda --release".into()),
+        _ => {} // fall through to NdArray path
+    }
     let river_model_path = config
         .game
         .river_model_path
@@ -229,6 +416,7 @@ pub fn generate_turn_training_data(
             .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
             .expect("valid progress bar template"),
     );
+    pb.enable_steady_tick(std::time::Duration::from_secs(1));
 
     // Open output file once, write incrementally across chunks.
     let file =
@@ -450,7 +638,7 @@ mod tests {
     fn generate_turn_requires_river_model_path() {
         let config = turn_test_config(1);
         let output = NamedTempFile::new().unwrap();
-        let result = generate_turn_training_data(&config, output.path());
+        let result = generate_turn_training_data(&config, output.path(), "ndarray");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("river_model_path"));
     }
