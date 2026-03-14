@@ -77,6 +77,8 @@ pub struct SharedRiverNetEvaluator<B: Backend> {
     device: B::Device,
     /// Cumulative nanoseconds spent waiting for the mutex across all threads.
     pub wait_nanos: Arc<AtomicU64>,
+    /// Number of mutex acquisitions across all threads.
+    pub lock_count: Arc<AtomicU64>,
 }
 
 impl<B: Backend> SharedRiverNetEvaluator<B>
@@ -87,11 +89,13 @@ where
         model: Arc<Mutex<CfvNet<B>>>,
         device: B::Device,
         wait_nanos: Arc<AtomicU64>,
+        lock_count: Arc<AtomicU64>,
     ) -> Self {
         Self {
             model,
             device,
             wait_nanos,
+            lock_count,
         }
     }
 }
@@ -324,6 +328,7 @@ where
         let wait = t0.elapsed();
         self.wait_nanos
             .fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
+        self.lock_count.fetch_add(1, Ordering::Relaxed);
 
         let data = TensorData::new(inputs, [batch_size, INPUT_SIZE]);
         let input_tensor = Tensor::<B, 2>::from_data(data, &self.device);
@@ -479,11 +484,13 @@ mod tests {
         let device = Default::default();
         let model = CfvNet::<TestBackend>::new(&device, 1, 8, INPUT_SIZE);
         let wait_nanos = Arc::new(AtomicU64::new(0));
+        let lock_count = Arc::new(AtomicU64::new(0));
 
         let shared = SharedRiverNetEvaluator::new(
             Arc::new(Mutex::new(model.clone())),
             device,
             wait_nanos.clone(),
+            lock_count,
         );
         let sequential = RiverNetEvaluator::new(model, Default::default());
 

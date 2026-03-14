@@ -232,8 +232,13 @@ fn generate_turn_training_data_cuda(
     // Wrap in Arc<Mutex<>> for shared GPU access.
     let model = Arc::new(Mutex::new(model));
     let wait_nanos = Arc::new(AtomicU64::new(0));
+    let lock_count = Arc::new(AtomicU64::new(0));
 
     let wall_start = std::time::Instant::now();
+
+    // Clone Arcs for the progress bar tick callback.
+    let wait_nanos_pb = Arc::clone(&wait_nanos);
+    let lock_count_pb = Arc::clone(&lock_count);
 
     let pb = ProgressBar::new(num_samples);
     pb.set_style(
@@ -241,7 +246,25 @@ fn generate_turn_training_data_cuda(
             .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
             .expect("valid progress bar template"),
     );
-    pb.enable_steady_tick(std::time::Duration::from_secs(1));
+    pb.enable_steady_tick(std::time::Duration::from_secs(2));
+
+    // Periodically update progress bar message with mutex stats.
+    let pb_clone = pb.clone();
+    let stats_thread = std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let nanos = wait_nanos_pb.load(Ordering::Relaxed);
+            let count = lock_count_pb.load(Ordering::Relaxed);
+            if count == 0 {
+                continue;
+            }
+            let avg_ms = (nanos as f64 / count as f64) / 1_000_000.0;
+            pb_clone.set_message(format!("mutex: {avg_ms:.1}ms avg ({count} locks)"));
+            if pb_clone.is_finished() {
+                break;
+            }
+        }
+    });
 
     // Open output file once, write incrementally across chunks.
     let file =
@@ -286,6 +309,7 @@ fn generate_turn_training_data_cuda(
                         Arc::clone(&model),
                         device.clone(),
                         Arc::clone(&wait_nanos),
+                        Arc::clone(&lock_count),
                     ));
 
                 let result = solve_turn_situation(
@@ -342,17 +366,17 @@ fn generate_turn_training_data_cuda(
     }
 
     pb.finish_with_message("done");
+    let _ = stats_thread.join();
 
     // Print contention stats.
     let wall_secs = wall_start.elapsed().as_secs_f64();
-    let wait_secs = wait_nanos.load(Ordering::Relaxed) as f64 / 1e9;
-    let pct = if wall_secs > 0.0 {
-        wait_secs / wall_secs * 100.0
-    } else {
-        0.0
-    };
+    let total_nanos = wait_nanos.load(Ordering::Relaxed);
+    let total_locks = lock_count.load(Ordering::Relaxed);
+    let wait_secs = total_nanos as f64 / 1e9;
+    let avg_ms = if total_locks > 0 { (total_nanos as f64 / total_locks as f64) / 1_000_000.0 } else { 0.0 };
+    let pct = if wall_secs > 0.0 { wait_secs / wall_secs * 100.0 } else { 0.0 };
     println!(
-        "GPU mutex wait: {wait_secs:.1}s total ({pct:.1}% of {wall_secs:.1}s wall time)"
+        "GPU mutex: {avg_ms:.1}ms avg wait, {total_locks} locks, {wait_secs:.1}s total ({pct:.1}% of {wall_secs:.1}s wall)"
     );
 
     Ok(())
