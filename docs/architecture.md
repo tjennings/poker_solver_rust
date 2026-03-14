@@ -85,7 +85,7 @@ poker_solver_rust/
 
 **Abstractions:**
 - `HandClassV2` -- 19-class hand classification with intra-class strength and equity binning (28-bit hand field)
-- `EHS2` -- Expected Hand Strength Squared bucketing via k-means on equity histograms
+- `PotentialAwareEmd` -- True Pluribus-style potential-aware bucket abstraction (see below)
 - Info set keys encode: hand (28 bits) | street (2) | SPR (5) | reserved (5) | actions (24)
 
 **Key files:**
@@ -94,6 +94,43 @@ poker_solver_rust/
 - MCCFR: `crates/core/src/blueprint_v2/mccfr.rs`
 - Storage: `crates/core/src/blueprint_v2/storage.rs`
 - Trainer: `crates/core/src/blueprint_v2/trainer.rs`
+
+### Potential-Aware Clustering Pipeline
+
+The clustering pipeline computes card abstractions by running bottom-up from river to preflop. At each street, the feature vector for a (board, combo) pair is a distribution over the *next* street's bucket IDs — true potential-aware abstraction as described by Brown & Sandholm (Pluribus).
+
+**Pipeline flow (all in memory, files written at the end):**
+
+```
+1. cluster_river()     → equity-based 1-D k-means           → river BucketFile
+2. cluster_turn()      → histogram over river bucket IDs     → turn BucketFile
+3. cluster_flop()      → histogram over turn bucket IDs      → flop BucketFile
+4. cluster_preflop()   → histogram over flop bucket IDs      → preflop BucketFile
+5. Write all 4 BucketFiles to disk
+```
+
+**Histogram construction (`build_bucket_histogram_u8`):** For each possible next-street card, extends the board, canonicalizes it via `canonical_key()`, looks up the board index in the previous street's `BucketFile` via `board_index_map()`, and increments the count for that combo's bucket ID. Returns raw u8 counts.
+
+**Clustering:** Turn, flop, and preflop use weighted EMD (Earth Mover's Distance) k-means over these bucket-ID histograms (`kmeans_emd_weighted_u8`). River uses equity-based 1-D k-means.
+
+**Variants:** Each street has three clustering variants:
+- **Canonical** (`cluster_*_canonical`): exhaustive enumeration of isomorphic boards with combinatorial weights
+- **Sampling** (`cluster_*`): samples from canonical boards with weights
+- **With-boards** (`cluster_*_with_boards`): raw random board sampling for testing
+
+All variants store canonical `PackedBoard` entries in the `BucketFile.boards` field (version 2 format) for downstream lookup.
+
+**Diagnostics** (`cluster_diagnostics.rs`):
+- `cross_street_transition_matrix` -- counts (board, combo) transitions between adjacent streets
+- `centroid_emd_report` -- pairwise EMD between reconstructed bucket centroids
+- `sample_hands_for_bucket` -- sample hands from a specific bucket for inspection
+
+**Key files:**
+- Pipeline: `crates/core/src/blueprint_v2/cluster_pipeline.rs`
+- BucketFile: `crates/core/src/blueprint_v2/bucket_file.rs`
+- K-means: `crates/core/src/blueprint_v2/clustering.rs`
+- Diagnostics: `crates/core/src/blueprint_v2/cluster_diagnostics.rs`
+- Config: `crates/core/src/blueprint_v2/config.rs` (`ClusteringConfig`)
 
 ## Range Solver (Exact Postflop Solver)
 

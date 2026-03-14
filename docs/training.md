@@ -88,6 +88,66 @@ Options:
 
 ---
 
+### cluster
+
+Run the potential-aware clustering pipeline to build bucket assignments for all four streets. Uses Pluribus-style bottom-up abstraction: river (equity k-means) → turn (EMD over river buckets) → flop (EMD over turn buckets) → preflop (EMD over flop buckets).
+
+```bash
+cargo run -p poker-solver-trainer --release -- cluster \
+  -c sample_configurations/blueprint_v2_with_tui.yaml \
+  -o output/buckets
+```
+
+Options:
+- `-c <CONFIG>` -- YAML config file (uses the `clustering` section)
+- `-o <DIR>` -- Output directory for `.buckets` files
+
+Produces four files: `river.buckets`, `turn.buckets`, `flop.buckets`, `preflop.buckets`. If bucket files already exist in the output directory, clustering is skipped.
+
+Clustering config parameters (in the `clustering` section of the YAML):
+
+| Parameter | Default | Description |
+|-|-|-|
+| `algorithm` | `potential_aware_emd` | Clustering algorithm |
+| `river.buckets` | -- | Number of river buckets |
+| `turn.buckets` | -- | Number of turn buckets |
+| `flop.buckets` | -- | Number of flop buckets |
+| `preflop.buckets` | -- | Number of preflop buckets |
+| `kmeans_iterations` | 100 | K-means iterations per street |
+| `seed` | 42 | Random seed for board sampling |
+
+### diag-clusters
+
+Diagnostics for pre-computed cluster bucket files.
+
+```bash
+# Basic bucket distribution report
+cargo run -p poker-solver-trainer --release -- diag-clusters \
+  -d output/buckets
+
+# Equity audit (sample boards and check intra-bucket equity consistency)
+cargo run -p poker-solver-trainer --release -- diag-clusters \
+  -d output/buckets --audit --audit-boards 100
+
+# Cross-street transition matrices (verify potential-aware linkage)
+cargo run -p poker-solver-trainer --release -- diag-clusters \
+  -d output/buckets --transitions
+
+# Sample hands from a specific bucket
+cargo run -p poker-solver-trainer --release -- diag-clusters \
+  -d output/buckets --sample-bucket river 5
+```
+
+Options:
+- `-d <DIR>` -- Directory containing `.buckets` files (required)
+- `--audit` -- Run equity audit by sampling boards
+- `--audit-boards <N>` -- Number of boards to sample for audit (default: 50)
+- `--transitions` -- Print cross-street transition matrices for adjacent street pairs (preflop→flop, flop→turn, turn→river)
+- `--sample-bucket <STREET> <BUCKET_ID>` -- Show 10 sample hands from the given bucket
+- `--centroid-emd <STREET>` -- Placeholder; centroid EMD requires feature vectors not stored in bucket files
+
+---
+
 ## Training TUI Dashboard
 
 When `tui.enabled: true` in the config, `train-blueprint` launches a full-screen terminal dashboard instead of text output.
