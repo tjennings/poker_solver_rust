@@ -242,6 +242,19 @@ impl BucketFile {
         Self::read_from(&mut reader)
     }
 
+    /// Build a lookup map from `PackedBoard` to board index.
+    ///
+    /// Used by the clustering pipeline to find a board's index for bucket
+    /// lookups when building potential-aware histograms.
+    #[must_use]
+    pub fn board_index_map(&self) -> std::collections::HashMap<PackedBoard, u32> {
+        self.boards
+            .iter()
+            .enumerate()
+            .map(|(i, &board)| (board, i as u32))
+            .collect()
+    }
+
     /// Look up the bucket assignment for a specific board and combo index.
     #[must_use]
     pub fn get_bucket(&self, board_idx: u32, combo_idx: u16) -> u16 {
@@ -446,6 +459,37 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(p1, 42_u32);
         assert_eq!(map[&p2], 42);
+    }
+
+    #[test]
+    fn board_index_map_round_trip() {
+        let boards = vec![
+            PackedBoard::from_cards(&[
+                Card::new(Value::Ace, Suit::Spade),
+                Card::new(Value::King, Suit::Spade),
+                Card::new(Value::Queen, Suit::Heart),
+            ]),
+            PackedBoard::from_cards(&[
+                Card::new(Value::Two, Suit::Spade),
+                Card::new(Value::Three, Suit::Heart),
+                Card::new(Value::Four, Suit::Diamond),
+            ]),
+        ];
+        let bf = BucketFile {
+            header: BucketFileHeader {
+                street: Street::Flop,
+                bucket_count: 10,
+                board_count: 2,
+                combos_per_board: 1326,
+                version: VERSION,
+            },
+            boards: boards.clone(),
+            buckets: vec![0; 2 * 1326],
+        };
+        let map = bf.board_index_map();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&boards[0]], 0);
+        assert_eq!(map[&boards[1]], 1);
     }
 
     #[test]
