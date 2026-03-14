@@ -48,10 +48,6 @@ const DEFAULT_NUM_BOARDS: usize = 10_000;
 /// Number of sample 4-card boards for turn clustering.
 const DEFAULT_TURN_BOARDS: usize = 5_000;
 
-/// Number of sample 3-card boards for flop clustering (fewer than turn because
-/// each board requires enumerating all ~47 turn cards per combo).
-const DEFAULT_FLOP_BOARDS: usize = 2_000;
-
 /// Total number of 2-card combos from a 52-card deck: C(52,2) = 1326.
 const TOTAL_COMBOS: u16 = 1326;
 
@@ -415,8 +411,7 @@ fn build_bucket_histogram_u8(
 /// running weighted EMD k-means where each data point carries the board's
 /// combinatorial multiplicity as its weight.
 ///
-/// With 1,755 canonical flops and `DEFAULT_FLOP_BOARDS` = 2,000, all
-/// canonical flops are used (full coverage of the flop space).
+/// Uses all 1,755 canonical flops (exhaustive — no sampling).
 #[allow(dead_code)]
 pub fn cluster_flop(
     turn_buckets: &BucketFile,
@@ -430,7 +425,8 @@ pub fn cluster_flop(
     let board_map = turn_buckets.board_index_map();
 
     let all_canonical = enumerate_canonical_flops();
-    let (boards, board_weights) = sample_canonical(&all_canonical, DEFAULT_FLOP_BOARDS, seed);
+    let boards: Vec<[Card; 3]> = all_canonical.iter().map(|wb| wb.cards).collect();
+    let board_weights: Vec<f64> = all_canonical.iter().map(|wb| f64::from(wb.weight)).collect();
     let num_boards = boards.len();
 
     // For each board, build a histogram over turn bucket IDs for every combo.

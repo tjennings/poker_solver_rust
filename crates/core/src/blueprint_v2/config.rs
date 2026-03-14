@@ -84,7 +84,7 @@ pub struct StreetClusterConfig {
     #[serde(default)]
     pub expected_delta: bool,
     /// Number of boards to sample for clustering. When omitted, uses the
-    /// default for each street (river: 10000, turn: 5000, flop: all canonical).
+    /// default for each street (river: 10000, turn: 5000, flop: all 1755 canonical).
     #[serde(default)]
     pub sample_boards: Option<usize>,
 }
