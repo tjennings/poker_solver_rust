@@ -261,6 +261,7 @@ impl BucketFile {
         let idx = board_idx as usize * self.header.combos_per_board as usize + combo_idx as usize;
         self.buckets[idx]
     }
+
 }
 
 #[cfg(test)]

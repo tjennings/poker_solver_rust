@@ -361,64 +361,55 @@ pub fn cluster_turn_with_boards(
     }
 }
 
-/// Build a probability distribution over equity bins for the given combo
-/// on a partial board.
-///
-/// Enumerates every card not in the board or combo as a potential next-street
-/// card, computes equity on the extended board, maps equity to a bin, and
-/// normalises the histogram.
+
+// DEPRECATED: These stubs exist only to keep callers compiling until Tasks 3-6
+// replace them with `build_bucket_histogram_u8`. They will be removed entirely
+// once the callers are migrated.
+#[allow(dead_code, unused_variables)]
 fn build_next_street_histogram(
     combo: [Card; 2],
     board: &[Card],
     deck: &[Card],
     num_buckets: u16,
 ) -> Vec<f64> {
-    let mut histogram = vec![0.0_f64; num_buckets as usize];
-    let mut count = 0_u32;
-    let mut extended = Vec::with_capacity(board.len() + 1);
-    extended.extend_from_slice(board);
-    extended.push(Card::new(crate::poker::Value::Two, crate::poker::Suit::Club)); // placeholder
-
-    for &next_card in deck {
-        if board.contains(&next_card)
-            || next_card == combo[0]
-            || next_card == combo[1]
-        {
-            continue;
-        }
-
-        *extended.last_mut().expect("non-empty") = next_card;
-        let eq = compute_equity(combo, &extended);
-        let bucket = equity_to_bucket(eq, num_buckets);
-        histogram[bucket as usize] += 1.0;
-        count += 1;
-    }
-
-    // Normalise to a probability distribution.
-    if count > 0 {
-        #[allow(clippy::cast_precision_loss)]
-        let inv = 1.0 / f64::from(count);
-        for h in &mut histogram {
-            *h *= inv;
-        }
-    }
-
-    histogram
+    todo!("replaced by build_bucket_histogram_u8 — migrate callers in Tasks 3-6")
 }
 
-/// Like [`build_next_street_histogram`] but returns raw u8 counts instead of
-/// normalized f64 probabilities.
-///
-/// Maximum per-bin count is 47 (flop with 3 board + 2 hole = 5 dead cards),
-/// which fits comfortably in u8. Normalization happens on-the-fly during
-/// EMD distance computation in [`kmeans_emd_weighted_u8`].
+#[allow(dead_code, unused_variables)]
 fn build_next_street_histogram_u8(
     combo: [Card; 2],
     board: &[Card],
     deck: &[Card],
     num_buckets: u16,
 ) -> Vec<u8> {
+    todo!("replaced by build_bucket_histogram_u8 — migrate callers in Tasks 3-6")
+}
+
+#[allow(dead_code, unused_variables)]
+fn equity_to_bucket(equity: f64, num_buckets: u16) -> u16 {
+    todo!("replaced by build_bucket_histogram_u8 — migrate callers in Tasks 3-6")
+}
+
+/// Build a histogram of bucket IDs from the previous street's clustering.
+///
+/// For each possible next-street card, extends the board, looks up the
+/// resulting board in `prev_buckets` via `board_map`, and increments the
+/// histogram bin for that combo's bucket ID.
+///
+/// This is the core of true potential-aware abstraction: feature vectors
+/// at street S are distributions over bucket assignments at street S+1.
+#[allow(dead_code)] // callers will be migrated in Tasks 3-6
+fn build_bucket_histogram_u8(
+    combo: [Card; 2],
+    board: &[Card],
+    deck: &[Card],
+    prev_buckets: &BucketFile,
+    board_map: &std::collections::HashMap<PackedBoard, u32>,
+) -> Vec<u8> {
+    let num_buckets = prev_buckets.header.bucket_count;
     let mut histogram = vec![0_u8; num_buckets as usize];
+    let ci = combo_index(combo[0], combo[1]);
+
     let mut extended = Vec::with_capacity(board.len() + 1);
     extended.extend_from_slice(board);
     extended.push(Card::new(crate::poker::Value::Two, crate::poker::Suit::Club));
@@ -432,23 +423,17 @@ fn build_next_street_histogram_u8(
         }
 
         *extended.last_mut().expect("non-empty") = next_card;
-        let eq = compute_equity(combo, &extended);
-        let bucket = equity_to_bucket(eq, num_buckets);
-        // Max per-bin count is 47 (flop: 52 - 3 board - 2 hole), fits in u8.
-        debug_assert!(histogram[bucket as usize] < 255);
-        histogram[bucket as usize] += 1;
+        let packed = PackedBoard::from_cards(&extended);
+
+        if let Some(&board_idx) = board_map.get(&packed) {
+            let bucket = prev_buckets.get_bucket(board_idx, ci);
+            debug_assert!((bucket as usize) < histogram.len());
+            debug_assert!(histogram[bucket as usize] < 255);
+            histogram[bucket as usize] += 1;
+        }
     }
 
     histogram
-}
-
-/// Map an equity value in [0, 1] to a bucket index via uniform binning.
-///
-/// `equity_to_bucket(0.0, K) = 0` and `equity_to_bucket(1.0, K) = K - 1`.
-fn equity_to_bucket(equity: f64, num_buckets: u16) -> u16 {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let bucket = (equity * f64::from(num_buckets)) as u16;
-    bucket.min(num_buckets - 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,66 +1644,6 @@ mod tests {
         assert!(!cards_overlap(combo, &board));
     }
 
-    #[test]
-    fn test_equity_to_bucket_bounds() {
-        // equity=0.0 should map to bucket 0
-        assert_eq!(equity_to_bucket(0.0, 10), 0);
-        // equity=1.0 should map to the last bucket (9 for K=10)
-        assert_eq!(equity_to_bucket(1.0, 10), 9);
-        // equity=0.5 with 10 buckets → bucket 5
-        assert_eq!(equity_to_bucket(0.5, 10), 5);
-        // equity just below 1.0
-        assert_eq!(equity_to_bucket(0.99, 10), 9);
-    }
-
-    #[test]
-    fn test_equity_to_bucket_single_bucket() {
-        // With 1 bucket, everything maps to 0.
-        assert_eq!(equity_to_bucket(0.0, 1), 0);
-        assert_eq!(equity_to_bucket(0.5, 1), 0);
-        assert_eq!(equity_to_bucket(1.0, 1), 0);
-    }
-
-    #[test]
-    fn test_build_next_street_histogram_river_sums_to_one() {
-        let deck = build_deck();
-        // combo: first two cards, board: next four cards (no overlap)
-        let combo = [deck[0], deck[1]];
-        let board = [deck[2], deck[3], deck[4], deck[5]];
-        let histogram = build_next_street_histogram(combo, &board, &deck, 10);
-
-        assert_eq!(histogram.len(), 10);
-
-        let sum: f64 = histogram.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-10,
-            "histogram should sum to 1.0, got {sum}"
-        );
-
-        // Every entry should be non-negative.
-        for &h in &histogram {
-            assert!(h >= 0.0);
-        }
-    }
-
-    #[test]
-    fn test_build_next_street_histogram_river_card_count() {
-        // With 4 board cards + 2 hole cards = 6 used, there are 46 river cards.
-        let deck = build_deck();
-        let combo = [deck[0], deck[1]];
-        let board = [deck[2], deck[3], deck[4], deck[5]];
-        let histogram = build_next_street_histogram(combo, &board, &deck, 5);
-
-        // The histogram entries times 46 should give integer counts.
-        let total_rivers = 46.0;
-        for &h in &histogram {
-            let count = h * total_rivers;
-            assert!(
-                (count - count.round()).abs() < 1e-8,
-                "expected integer count, got {count}"
-            );
-        }
-    }
 
     #[test]
     #[ignore] // slow: equity enumeration in debug mode
@@ -1812,43 +1737,6 @@ mod tests {
         assert!(!cards_overlap(combo, &board));
     }
 
-    #[test]
-    fn test_build_next_street_histogram_turn_sums_to_one() {
-        let deck = build_deck();
-        let combo = [deck[0], deck[1]];
-        let board = [deck[10], deck[20], deck[30]];
-        let hist = build_next_street_histogram(combo, &board, &deck, 5);
-
-        assert_eq!(hist.len(), 5);
-
-        let sum: f64 = hist.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-10,
-            "histogram should sum to 1.0, got {sum}"
-        );
-
-        for &h in &hist {
-            assert!(h >= 0.0);
-        }
-    }
-
-    #[test]
-    fn test_build_next_street_histogram_turn_card_count() {
-        // With 3 board cards + 2 hole cards = 5 used, there are 47 turn cards.
-        let deck = build_deck();
-        let combo = [deck[0], deck[1]];
-        let board = [deck[10], deck[20], deck[30]];
-        let histogram = build_next_street_histogram(combo, &board, &deck, 5);
-
-        let total_turns = 47.0;
-        for &h in &histogram {
-            let count = h * total_turns;
-            assert!(
-                (count - count.round()).abs() < 1e-8,
-                "expected integer count, got {count}"
-            );
-        }
-    }
 
     #[test]
     #[ignore] // slow: equity enumeration in debug mode
@@ -2014,34 +1902,62 @@ mod tests {
     }
 
     #[test]
-    fn test_build_next_street_histogram_u8_river_counts() {
+    fn test_build_bucket_histogram_uses_actual_buckets() {
+        use super::super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard};
+
         let deck = build_deck();
         let combo = [deck[0], deck[1]];
-        let board = [deck[2], deck[3], deck[4], deck[5]];
-        let hist = build_next_street_histogram_u8(combo, &board, &deck, 10);
+        let board: [Card; 4] = [deck[10], deck[20], deck[30], deck[40]];
 
-        assert_eq!(hist.len(), 10);
-        let total: u32 = hist.iter().map(|&c| u32::from(c)).sum();
-        assert_eq!(total, 46, "4 board + 2 hole = 6 used, 46 river cards");
-    }
+        let num_river_buckets: u16 = 3;
+        let mut river_boards = Vec::new();
+        let mut river_buckets = Vec::new();
 
-    #[test]
-    fn test_build_next_street_histogram_u8_matches_f64() {
-        let deck = build_deck();
-        let combo = [deck[0], deck[1]];
-        let board = [deck[2], deck[3], deck[4], deck[5]];
-        let hist_u8 = build_next_street_histogram_u8(combo, &board, &deck, 10);
-        let hist_f64 = build_next_street_histogram(combo, &board, &deck, 10);
-
-        // u8 counts / total should equal f64 values
-        let total: f64 = hist_u8.iter().map(|&c| f64::from(c)).sum();
-        for (i, (&cu, &cf)) in hist_u8.iter().zip(hist_f64.iter()).enumerate() {
-            let normalized = f64::from(cu) / total;
-            assert!(
-                (normalized - cf).abs() < 1e-10,
-                "bin {i}: u8 normalized={normalized}, f64={cf}"
-            );
+        for &river_card in &deck {
+            if board.contains(&river_card)
+                || river_card == combo[0]
+                || river_card == combo[1]
+            {
+                continue;
+            }
+            let mut river_board = board.to_vec();
+            river_board.push(river_card);
+            let packed = PackedBoard::from_cards(&river_board);
+            river_boards.push(packed);
+            let mut board_buckets = Vec::with_capacity(1326);
+            for ci in 0..1326_u16 {
+                board_buckets.push(ci % num_river_buckets);
+            }
+            river_buckets.extend(board_buckets);
         }
+
+        let river_bf = BucketFile {
+            header: BucketFileHeader {
+                street: Street::River,
+                bucket_count: num_river_buckets,
+                board_count: river_boards.len() as u32,
+                combos_per_board: 1326,
+                version: 2,
+            },
+            boards: river_boards,
+            buckets: river_buckets,
+        };
+        let board_map = river_bf.board_index_map();
+
+        let histogram = build_bucket_histogram_u8(
+            combo,
+            &board,
+            &deck,
+            &river_bf,
+            &board_map,
+        );
+
+        assert_eq!(histogram.len(), num_river_buckets as usize);
+        let total: u8 = histogram.iter().sum();
+        assert_eq!(total, 46); // 52 - 4 board - 2 hole = 46 river cards
+        assert_eq!(histogram[0], 46); // all in bucket 0 (combo_index(deck[0], deck[1]) == 0, 0 % 3 == 0)
+        assert_eq!(histogram[1], 0);
+        assert_eq!(histogram[2], 0);
     }
 
     // -----------------------------------------------------------------------
@@ -2145,15 +2061,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_build_next_street_histogram_u8_turn_counts() {
-        let deck = build_deck();
-        let combo = [deck[0], deck[1]];
-        let board = [deck[10], deck[20], deck[30]];
-        let hist = build_next_street_histogram_u8(combo, &board, &deck, 5);
-
-        assert_eq!(hist.len(), 5);
-        let total: u32 = hist.iter().map(|&c| u32::from(c)).sum();
-        assert_eq!(total, 47, "3 board + 2 hole = 5 used, 47 turn cards");
-    }
 }
