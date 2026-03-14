@@ -124,9 +124,9 @@ pub fn cluster_river(
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
-            version: 1,
+            version: 2,
         },
-        boards: Vec::new(),
+        boards: boards.iter().map(|b| PackedBoard::from_cards(b)).collect(),
         buckets,
     }
 }
@@ -182,9 +182,9 @@ pub fn cluster_river_with_boards(
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
-            version: 1,
+            version: 2,
         },
-        boards: Vec::new(),
+        boards: boards.iter().map(|b| PackedBoard::from_cards(b)).collect(),
         buckets,
     }
 }
@@ -277,9 +277,9 @@ pub fn cluster_turn(
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
-            version: 1,
+            version: 2,
         },
-        boards: Vec::new(),
+        boards: boards.iter().map(|b| PackedBoard::from_cards(b)).collect(),
         buckets,
     }
 }
@@ -354,9 +354,9 @@ pub fn cluster_turn_with_boards(
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
-            version: 1,
+            version: 2,
         },
-        boards: Vec::new(),
+        boards: boards.iter().map(|b| PackedBoard::from_cards(b)).collect(),
         buckets,
     }
 }
@@ -542,9 +542,9 @@ pub fn cluster_flop(
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
-            version: 1,
+            version: 2,
         },
-        boards: Vec::new(),
+        boards: boards.iter().map(|b| PackedBoard::from_cards(b)).collect(),
         buckets,
     }
 }
@@ -619,9 +619,9 @@ pub fn cluster_flop_with_boards(
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
-            version: 1,
+            version: 2,
         },
-        boards: Vec::new(),
+        boards: boards.iter().map(|b| PackedBoard::from_cards(b)).collect(),
         buckets,
     }
 }
@@ -2041,6 +2041,107 @@ mod tests {
                 (normalized - cf).abs() < 1e-10,
                 "bin {i}: u8 normalized={normalized}, f64={cf}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sampling-based BucketFile boards population tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_river_with_boards_populates_boards() {
+        let result = cluster_river_with_boards(5, 30, 42, 10, |_| {});
+        assert_eq!(result.header.version, 2, "version should be 2");
+        assert_eq!(
+            result.boards.len(),
+            10,
+            "boards should have one entry per sampled board"
+        );
+        // Each PackedBoard should be non-zero (valid cards).
+        for (i, pb) in result.boards.iter().enumerate() {
+            assert_ne!(pb.0, 0, "board {i} should be non-zero PackedBoard");
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_river_populates_boards() {
+        let result = cluster_river(5, 30, 42, |_| {});
+        assert_eq!(result.header.version, 2, "version should be 2");
+        assert_eq!(
+            result.boards.len(),
+            result.header.board_count as usize,
+            "boards should have one entry per sampled board"
+        );
+        for (i, pb) in result.boards.iter().enumerate() {
+            assert_ne!(pb.0, 0, "board {i} should be non-zero PackedBoard");
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_turn_with_boards_populates_boards() {
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
+        let turn = cluster_turn_with_boards(&river, 3, 20, 42, 8, |_| {});
+        assert_eq!(turn.header.version, 2, "version should be 2");
+        assert_eq!(
+            turn.boards.len(),
+            8,
+            "boards should have one entry per sampled board"
+        );
+        for (i, pb) in turn.boards.iter().enumerate() {
+            assert_ne!(pb.0, 0, "board {i} should be non-zero PackedBoard");
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_turn_populates_boards() {
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
+        let turn = cluster_turn(&river, 3, 20, 42, |_| {});
+        assert_eq!(turn.header.version, 2, "version should be 2");
+        assert_eq!(
+            turn.boards.len(),
+            turn.header.board_count as usize,
+            "boards should have one entry per sampled board"
+        );
+        for (i, pb) in turn.boards.iter().enumerate() {
+            assert_ne!(pb.0, 0, "board {i} should be non-zero PackedBoard");
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_flop_with_boards_populates_boards() {
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
+        let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_| {});
+        let flop = cluster_flop_with_boards(&turn, 3, 20, 42, 5, |_| {});
+        assert_eq!(flop.header.version, 2, "version should be 2");
+        assert_eq!(
+            flop.boards.len(),
+            5,
+            "boards should have one entry per sampled board"
+        );
+        for (i, pb) in flop.boards.iter().enumerate() {
+            assert_ne!(pb.0, 0, "board {i} should be non-zero PackedBoard");
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration in debug mode
+    fn test_cluster_flop_populates_boards() {
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
+        let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_| {});
+        let flop = cluster_flop(&turn, 3, 20, 42, |_| {});
+        assert_eq!(flop.header.version, 2, "version should be 2");
+        assert_eq!(
+            flop.boards.len(),
+            flop.header.board_count as usize,
+            "boards should have one entry per sampled board"
+        );
+        for (i, pb) in flop.boards.iter().enumerate() {
+            assert_ne!(pb.0, 0, "board {i} should be non-zero PackedBoard");
         }
     }
 
