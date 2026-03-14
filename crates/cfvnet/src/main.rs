@@ -693,7 +693,7 @@ fn print_raw_frequency_histogram(title: &str, values: &[f64]) {
     }
 
     let bucket_width = (max_val - min_val) / NUM_BUCKETS as f64;
-    let mut bucket_counts = vec![0_u32; NUM_BUCKETS];
+    let mut bucket_counts = [0_u32; NUM_BUCKETS];
 
     for &v in values {
         let idx = ((v - min_val) / bucket_width) as usize;
@@ -999,16 +999,16 @@ where
         return;
     }
 
-    let min_key = spots.iter().map(|s| key_fn(s)).fold(f64::INFINITY, f64::min);
-    let max_key = spots.iter().map(|s| key_fn(s)).fold(f64::NEG_INFINITY, f64::max);
+    let min_key = spots.iter().map(&key_fn).fold(f64::INFINITY, f64::min);
+    let max_key = spots.iter().map(&key_fn).fold(f64::NEG_INFINITY, f64::max);
 
     if (max_key - min_key).abs() < 1e-9 {
         return;
     }
 
     let bucket_width = (max_key - min_key) / NUM_BUCKETS as f64;
-    let mut bucket_sums = vec![0.0_f64; NUM_BUCKETS];
-    let mut bucket_counts = vec![0_u32; NUM_BUCKETS];
+    let mut bucket_sums = [0.0_f64; NUM_BUCKETS];
+    let mut bucket_counts = [0_u32; NUM_BUCKETS];
 
     for spot in spots {
         let k = key_fn(spot);
@@ -1056,15 +1056,15 @@ where
         return;
     }
 
-    let min_key = spots.iter().map(|s| key_fn(s)).fold(f64::INFINITY, f64::min);
-    let max_key = spots.iter().map(|s| key_fn(s)).fold(f64::NEG_INFINITY, f64::max);
+    let min_key = spots.iter().map(&key_fn).fold(f64::INFINITY, f64::min);
+    let max_key = spots.iter().map(&key_fn).fold(f64::NEG_INFINITY, f64::max);
 
     if (max_key - min_key).abs() < 1e-9 {
         return;
     }
 
     let bucket_width = (max_key - min_key) / NUM_BUCKETS as f64;
-    let mut bucket_counts = vec![0_u32; NUM_BUCKETS];
+    let mut bucket_counts = [0_u32; NUM_BUCKETS];
 
     for spot in spots {
         let k = key_fn(spot);
