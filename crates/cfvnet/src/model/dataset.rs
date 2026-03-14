@@ -3,12 +3,12 @@ use std::path::Path;
 
 use crate::datagen::sampler::Situation;
 use crate::datagen::storage::{read_record, TrainingRecord};
-use crate::model::network::input_size;
+use crate::model::network::{DECK_SIZE, INPUT_SIZE};
 
 /// A single training item with encoded input, target CFVs, mask, range, and game value.
 #[derive(Debug, Clone)]
 pub struct CfvItem {
-    pub input: Vec<f32>,      // length input_size(board_cards)
+    pub input: Vec<f32>,      // length INPUT_SIZE (2707)
     pub target: Vec<f32>,     // length OUTPUT_SIZE (1326) — target CFVs
     pub mask: Vec<f32>,       // length OUTPUT_SIZE — 1.0 valid, 0.0 masked
     pub range: Vec<f32>,      // length OUTPUT_SIZE — player's range for aux loss
@@ -107,14 +107,14 @@ impl CfvDataset {
         &self.records
     }
 
-    /// The input feature size for this dataset's board card count.
+    /// The input feature size (constant for all streets with one-hot board encoding).
     pub fn input_size(&self) -> usize {
-        input_size(self.board_cards)
+        INPUT_SIZE
     }
 
     /// Encode and return the training item at `idx`, or `None` if out of bounds.
     pub fn get(&self, idx: usize) -> Option<CfvItem> {
-        self.records.get(idx).map(|rec| encode_record(rec, self.board_cards))
+        self.records.get(idx).map(encode_record)
     }
 }
 
@@ -124,9 +124,7 @@ impl CfvDataset {
 /// rather than a raw `TrainingRecord`, making it usable at inference time
 /// when no stored record exists.
 pub fn encode_situation_for_inference(sit: &Situation, player: u8) -> Vec<f32> {
-    let board_cards = sit.board_size;
-    let in_size = input_size(board_cards);
-    let mut input = Vec::with_capacity(in_size);
+    let mut input = Vec::with_capacity(INPUT_SIZE);
     // OOP range (1326 floats)
     for &v in &sit.ranges[0] {
         input.push(v);
@@ -135,32 +133,35 @@ pub fn encode_situation_for_inference(sit: &Situation, player: u8) -> Vec<f32> {
     for &v in &sit.ranges[1] {
         input.push(v);
     }
-    // Board cards (normalized to [0, 1])
+    // Board cards (52-element one-hot)
+    let mut board_onehot = [0.0_f32; DECK_SIZE];
     for &card in sit.board_cards() {
-        input.push(f32::from(card) / 51.0);
+        board_onehot[card as usize] = 1.0;
     }
+    input.extend_from_slice(&board_onehot);
     // Pot (normalized by max pot)
     input.push(sit.pot as f32 / 400.0);
     // Effective stack (normalized by max stack)
     input.push(sit.effective_stack as f32 / 400.0);
     // Player indicator (0.0 = OOP, 1.0 = IP)
     input.push(f32::from(player));
-    debug_assert_eq!(input.len(), in_size);
+    debug_assert_eq!(input.len(), INPUT_SIZE);
     input
 }
 
-pub(crate) fn encode_record(rec: &TrainingRecord, board_cards: usize) -> CfvItem {
-    let in_size = input_size(board_cards);
-    let mut input = Vec::with_capacity(in_size);
+pub(crate) fn encode_record(rec: &TrainingRecord) -> CfvItem {
+    let mut input = Vec::with_capacity(INPUT_SIZE);
 
     // OOP range (1326 floats)
     input.extend_from_slice(&rec.oop_range);
     // IP range (1326 floats)
     input.extend_from_slice(&rec.ip_range);
-    // Board cards (normalized to [0, 1])
-    for &card in &rec.board[..board_cards] {
-        input.push(f32::from(card) / 51.0);
+    // Board cards (52-element one-hot)
+    let mut board_onehot = [0.0_f32; DECK_SIZE];
+    for &card in &rec.board {
+        board_onehot[card as usize] = 1.0;
     }
+    input.extend_from_slice(&board_onehot);
     // Pot (normalized by max pot)
     input.push(rec.pot / 400.0);
     // Effective stack (normalized by max stack)
@@ -168,7 +169,7 @@ pub(crate) fn encode_record(rec: &TrainingRecord, board_cards: usize) -> CfvItem
     // Player indicator (0.0 = OOP, 1.0 = IP)
     input.push(f32::from(rec.player));
 
-    debug_assert_eq!(input.len(), in_size);
+    debug_assert_eq!(input.len(), INPUT_SIZE);
 
     let target = rec.cfvs.to_vec();
 
@@ -196,7 +197,7 @@ pub(crate) fn encode_record(rec: &TrainingRecord, board_cards: usize) -> CfvItem
 mod tests {
     use super::*;
     use crate::datagen::storage::write_record;
-    use crate::model::network::OUTPUT_SIZE;
+    use crate::model::network::{OUTPUT_SIZE, POT_INDEX};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -235,7 +236,7 @@ mod tests {
         let file = write_test_data(5);
         let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
         let item = dataset.get(0).unwrap();
-        assert_eq!(item.input.len(), input_size(5));
+        assert_eq!(item.input.len(), INPUT_SIZE);
         assert_eq!(item.target.len(), OUTPUT_SIZE);
         assert_eq!(item.mask.len(), OUTPUT_SIZE);
         assert_eq!(item.range.len(), OUTPUT_SIZE);
@@ -245,10 +246,11 @@ mod tests {
     fn dataset_input_size_method() {
         let file = write_test_data(1);
         let dataset = CfvDataset::from_file(file.path(), 5).unwrap();
-        assert_eq!(dataset.input_size(), 2660);
+        assert_eq!(dataset.input_size(), INPUT_SIZE);
 
+        // Turn dataset also returns the same INPUT_SIZE now.
         let dataset4 = CfvDataset::from_file(file.path(), 4).unwrap();
-        assert_eq!(dataset4.input_size(), 2659);
+        assert_eq!(dataset4.input_size(), INPUT_SIZE);
     }
 
     #[test]
@@ -261,35 +263,47 @@ mod tests {
         assert!((item.input[0] - 0.5).abs() < 1e-6);
         // First element of IP range should be 0.3 (at index 1326)
         assert!((item.input[1326] - 0.3).abs() < 1e-6);
-        // Board cards normalized: card 0 / 51 = 0.0
-        assert!((item.input[2652]).abs() < 1e-6);
-        // Board card 4 / 51.0
-        assert!((item.input[2653] - 4.0 / 51.0).abs() < 1e-6);
-        // Pot = 100 / 400 = 0.25
-        assert!((item.input[2657] - 0.25).abs() < 1e-6);
-        // Stack = 50 / 400 = 0.125
-        assert!((item.input[2658] - 0.125).abs() < 1e-6);
-        // Player = 0 (first record)
-        assert!((item.input[2659]).abs() < 1e-6);
+        // Board one-hot: card 0 should be 1.0 at index 2652+0
+        assert!((item.input[2652] - 1.0).abs() < 1e-6, "card 0 one-hot");
+        // Card 4 should be 1.0 at index 2652+4
+        assert!((item.input[2652 + 4] - 1.0).abs() < 1e-6, "card 4 one-hot");
+        // Card 8 should be 1.0 at index 2652+8
+        assert!((item.input[2652 + 8] - 1.0).abs() < 1e-6, "card 8 one-hot");
+        // Card 12 should be 1.0 at index 2652+12
+        assert!((item.input[2652 + 12] - 1.0).abs() < 1e-6, "card 12 one-hot");
+        // Card 16 should be 1.0 at index 2652+16
+        assert!((item.input[2652 + 16] - 1.0).abs() < 1e-6, "card 16 one-hot");
+        // A non-board card should be 0.0
+        assert!((item.input[2652 + 1]).abs() < 1e-6, "non-board card should be 0");
+        // Pot at POT_INDEX = 2704: 100 / 400 = 0.25
+        assert!((item.input[POT_INDEX] - 0.25).abs() < 1e-6);
+        // Stack at POT_INDEX + 1: 50 / 400 = 0.125
+        assert!((item.input[POT_INDEX + 1] - 0.125).abs() < 1e-6);
+        // Player at POT_INDEX + 2: 0 (first record)
+        assert!((item.input[POT_INDEX + 2]).abs() < 1e-6);
 
         // Total length
-        assert_eq!(item.input.len(), 1326 + 1326 + 5 + 1 + 1 + 1);
+        assert_eq!(item.input.len(), INPUT_SIZE);
     }
 
     #[test]
-    fn dataset_turn_encoding_uses_4_board_cards() {
+    fn dataset_turn_encoding_uses_onehot() {
         let file = write_test_data(1);
+        // Turn dataset: board has 5 cards but record stores all of them.
+        // The one-hot encodes all board cards regardless of board_cards param.
         let dataset = CfvDataset::from_file(file.path(), 4).unwrap();
         let item = dataset.get(0).unwrap();
 
-        assert_eq!(item.input.len(), 1326 + 1326 + 4 + 1 + 1 + 1);
-        // Board cards: only first 4 encoded
-        assert!((item.input[2652]).abs() < 1e-6);       // card 0
-        assert!((item.input[2653] - 4.0 / 51.0).abs() < 1e-6); // card 4
-        assert!((item.input[2654] - 8.0 / 51.0).abs() < 1e-6); // card 8
-        assert!((item.input[2655] - 12.0 / 51.0).abs() < 1e-6); // card 12
-        // Pot at index 2656 (not 2657)
-        assert!((item.input[2656] - 0.25).abs() < 1e-6);
+        // Input size is always INPUT_SIZE (2707)
+        assert_eq!(item.input.len(), INPUT_SIZE);
+        // Board one-hot: all 5 board cards are encoded (entire rec.board).
+        assert!((item.input[2652] - 1.0).abs() < 1e-6, "card 0 one-hot");
+        assert!((item.input[2652 + 4] - 1.0).abs() < 1e-6, "card 4 one-hot");
+        assert!((item.input[2652 + 8] - 1.0).abs() < 1e-6, "card 8 one-hot");
+        assert!((item.input[2652 + 12] - 1.0).abs() < 1e-6, "card 12 one-hot");
+        assert!((item.input[2652 + 16] - 1.0).abs() < 1e-6, "card 16 one-hot");
+        // Pot at POT_INDEX = 2704
+        assert!((item.input[POT_INDEX] - 0.25).abs() < 1e-6);
     }
 
     #[test]
