@@ -704,10 +704,9 @@ fn print_raw_frequency_histogram(title: &str, values: &[f64]) {
     let max_count = *bucket_counts.iter().max().unwrap_or(&1);
 
     println!("\n{title}:");
-    for i in 0..NUM_BUCKETS {
+    for (i, &count) in bucket_counts.iter().enumerate() {
         let lo = min_val + i as f64 * bucket_width;
         let hi = lo + bucket_width;
-        let count = bucket_counts[i];
         let bar_len = ((count as f64 / max_count as f64) * BAR_WIDTH as f64).round() as usize;
         let bar: String = "█".repeat(bar_len);
         println!("  {:>6.0}-{:<6.0} |{:<width$}| {}", lo, hi, bar, count, width = BAR_WIDTH);
@@ -837,8 +836,8 @@ fn board_texture_tags(board: &[u8; 5], board_size: usize) -> Vec<&'static str> {
         // Check ace-low: if ace present, count consecutive from rank 0.
         if rank_counts[12] > 0 {
             let mut wheel_run = 1u8; // ace counts as low
-            for r in 0..12 {
-                if rank_counts[r] > 0 { wheel_run += 1; } else { break; }
+            for &c in &rank_counts[..12] {
+                if c > 0 { wheel_run += 1; } else { break; }
             }
             best = best.max(wheel_run);
         }
@@ -1080,10 +1079,9 @@ where
     }
 
     println!("\n{title}:");
-    for i in 0..NUM_BUCKETS {
+    for (i, &count) in bucket_counts.iter().enumerate() {
         let lo = min_key + i as f64 * bucket_width;
         let hi = lo + bucket_width;
-        let count = bucket_counts[i];
         let bar_len = ((count as f64 / max_count as f64) * BAR_WIDTH as f64).round() as usize;
         let bar: String = "█".repeat(bar_len);
         println!("  {:>6.0}-{:<6.0} |{:<width$}| {}", lo, hi, bar, count, width = BAR_WIDTH);
