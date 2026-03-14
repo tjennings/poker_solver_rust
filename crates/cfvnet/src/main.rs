@@ -872,41 +872,47 @@ fn board_texture_tags(board: &[u8; 5], board_size: usize) -> Vec<&'static str> {
     tags
 }
 
-fn print_texture_mbb_histogram(title: &str, spots: &[cfvnet::eval::compare::SpotResult]) {
+fn print_texture_histogram(spots: &[cfvnet::eval::compare::SpotResult]) {
     const BAR_WIDTH: usize = 40;
 
-    let mut sums = [0.0_f64; TEXTURE_LABELS.len()];
+    let mut mae_sums = [0.0_f64; TEXTURE_LABELS.len()];
+    let mut mbb_sums = [0.0_f64; TEXTURE_LABELS.len()];
     let mut counts = [0_u32; TEXTURE_LABELS.len()];
 
     for spot in spots {
         let tags = board_texture_tags(&spot.board, spot.board_size);
         for tag in tags {
             if let Some(idx) = TEXTURE_LABELS.iter().position(|&l| l == tag) {
-                sums[idx] += spot.mbb;
+                mae_sums[idx] += spot.mae;
+                mbb_sums[idx] += spot.mbb;
                 counts[idx] += 1;
             }
         }
     }
 
-    let means: Vec<f64> = sums.iter().zip(&counts)
+    let mae_means: Vec<f64> = mae_sums.iter().zip(&counts)
+        .map(|(&s, &c)| if c > 0 { s / c as f64 } else { 0.0 })
+        .collect();
+    let mbb_means: Vec<f64> = mbb_sums.iter().zip(&counts)
         .map(|(&s, &c)| if c > 0 { s / c as f64 } else { 0.0 })
         .collect();
 
-    let max_val = means.iter().copied().fold(0.0_f64, f64::max);
-    if max_val <= 0.0 {
+    let max_mae = mae_means.iter().copied().fold(0.0_f64, f64::max);
+    if max_mae <= 0.0 {
         return;
     }
 
-    println!("\n{title}:");
+    println!("\nMAE / mBB Error by Board Texture:");
     for (i, label) in TEXTURE_LABELS.iter().enumerate() {
-        let mean = means[i];
+        let mae = mae_means[i];
+        let mbb = mbb_means[i];
         let count = counts[i];
-        let bar_len = ((mean / max_val) * BAR_WIDTH as f64).round() as usize;
+        let bar_len = ((mae / max_mae) * BAR_WIDTH as f64).round() as usize;
         let bar: String = "█".repeat(bar_len);
         if count > 0 {
-            println!("  {label} |{:<width$}| {:.2} mBB  (n={})", bar, mean, count, width = BAR_WIDTH);
+            println!("  {label} |{:<width$}| MAE {:.4}  {:.0} mBB  (n={})", bar, mae, mbb, count, width = BAR_WIDTH);
         } else {
-            println!("  {label} |{:<width$}|              (n=0)", "", width = BAR_WIDTH);
+            println!("  {label} |{:<width$}|                          (n=0)", "", width = BAR_WIDTH);
         }
     }
 }
@@ -981,7 +987,7 @@ fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
         .collect();
     print_spr_mbb_histogram("mBB Error by SPR", &spr_mbb);
 
-    print_texture_mbb_histogram("mBB Error by Board Texture", &summary.spots);
+    print_texture_histogram(&summary.spots);
 }
 
 fn print_histogram<F, G>(title: &str, spots: &[cfvnet::eval::compare::SpotResult], key_fn: F, val_fn: G)
