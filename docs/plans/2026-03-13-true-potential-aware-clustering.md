@@ -661,3 +661,534 @@ Expected: No new warnings
 ```
 git commit -m "test(clustering): verify full potential-aware pipeline"
 ```
+
+---
+
+### Task 10: Cross-street transition matrix diagnostic
+
+**Files:**
+- Modify: `crates/core/src/blueprint_v2/cluster_diagnostics.rs`
+- Modify: `crates/trainer/src/main.rs` (add CLI flag)
+
+**Context:** For each adjacent pair of streets (river→turn, turn→flop, flop→preflop), build a matrix where entry `[i][j]` counts how many (board, combo) situations have bucket `i` on street S and bucket `j` on street S+1. This is the primary tool for verifying the potential-aware linkage is working — a well-linked pipeline should show block-diagonal structure (strong turn buckets concentrate into strong river buckets).
+
+**Step 1: Write the failing test**
+
+Add to `cluster_diagnostics.rs` tests:
+
+```rust
+#[test]
+fn transition_matrix_basic() {
+    // Two streets: "river" with 3 buckets, "turn" with 2 buckets.
+    // 1 board, 4 combos.
+    let river = BucketFile {
+        header: BucketFileHeader {
+            street: Street::River,
+            bucket_count: 3,
+            board_count: 1,
+            combos_per_board: 4,
+            version: 2,
+        },
+        boards: vec![PackedBoard(0)],
+        buckets: vec![0, 1, 2, 0], // combo 0→b0, 1→b1, 2→b2, 3→b0
+    };
+    let turn = BucketFile {
+        header: BucketFileHeader {
+            street: Street::Turn,
+            bucket_count: 2,
+            board_count: 1,
+            combos_per_board: 4,
+            version: 2,
+        },
+        boards: vec![PackedBoard(0)],
+        buckets: vec![0, 0, 1, 1], // combo 0→b0, 1→b0, 2→b1, 3→b1
+    };
+
+    let matrix = cross_street_transition_matrix(&turn, &river);
+    // turn bucket 0 (combos 0,1) → river buckets: combo0=0, combo1=1
+    // turn bucket 1 (combos 2,3) → river buckets: combo2=2, combo3=0
+    assert_eq!(matrix.from_street, "Turn");
+    assert_eq!(matrix.to_street, "River");
+    assert_eq!(matrix.matrix.len(), 2);    // 2 turn buckets
+    assert_eq!(matrix.matrix[0].len(), 3); // 3 river buckets
+    // Turn bucket 0 contains combos 0,1 → river buckets 0,1
+    assert_eq!(matrix.matrix[0][0], 1); // combo 0: turn=0, river=0
+    assert_eq!(matrix.matrix[0][1], 1); // combo 1: turn=0, river=1
+    assert_eq!(matrix.matrix[0][2], 0);
+    // Turn bucket 1 contains combos 2,3 → river buckets 2,0
+    assert_eq!(matrix.matrix[1][0], 1); // combo 3: turn=1, river=0
+    assert_eq!(matrix.matrix[1][1], 0);
+    assert_eq!(matrix.matrix[1][2], 1); // combo 2: turn=1, river=2
+}
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `cargo test -p poker-solver-core transition_matrix_basic`
+Expected: FAIL — `cross_street_transition_matrix` not found
+
+**Step 3: Write implementation**
+
+```rust
+/// Transition matrix between two adjacent streets.
+#[derive(Debug)]
+pub struct TransitionMatrix {
+    pub from_street: String,
+    pub to_street: String,
+    /// `matrix[from_bucket][to_bucket]` = count of (board, combo) pairs
+    /// with that bucket assignment on each street.
+    pub matrix: Vec<Vec<u64>>,
+}
+
+impl TransitionMatrix {
+    /// Format as a human-readable table.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        use std::fmt::Write;
+        let mut s = format!(
+            "Transition: {} → {} ({} × {} buckets)\n",
+            self.from_street,
+            self.to_street,
+            self.matrix.len(),
+            self.matrix.first().map_or(0, |r| r.len()),
+        );
+        // Header row
+        let _ = write!(s, "  {:>6}", "");
+        for j in 0..self.matrix.first().map_or(0, |r| r.len()) {
+            let _ = write!(s, " {:>6}", j);
+        }
+        s.push('\n');
+        // Data rows
+        for (i, row) in self.matrix.iter().enumerate() {
+            let _ = write!(s, "  {:>6}", i);
+            let row_total: u64 = row.iter().sum();
+            for &count in row {
+                if row_total > 0 {
+                    let pct = count as f64 / row_total as f64 * 100.0;
+                    let _ = write!(s, " {:>5.1}%", pct);
+                } else {
+                    let _ = write!(s, " {:>6}", 0);
+                }
+            }
+            s.push('\n');
+        }
+        s
+    }
+}
+
+/// Build a transition matrix between two streets that share the same boards.
+///
+/// `from_street` is the earlier street (e.g., turn), `to_street` is the later
+/// street (e.g., river). Both must have the same `board_count` and
+/// `combos_per_board`. For each (board, combo), looks up the bucket in both
+/// files and increments `matrix[from_bucket][to_bucket]`.
+///
+/// For the preflop→flop transition where preflop has `board_count=1`, the
+/// preflop bucket is looked up for each combo across all flop boards.
+#[must_use]
+pub fn cross_street_transition_matrix(
+    from_bf: &BucketFile,
+    to_bf: &BucketFile,
+) -> TransitionMatrix {
+    let from_k = from_bf.header.bucket_count as usize;
+    let to_k = to_bf.header.bucket_count as usize;
+    let mut matrix = vec![vec![0_u64; to_k]; from_k];
+
+    let from_boards = from_bf.header.board_count as usize;
+    let to_boards = to_bf.header.board_count as usize;
+    let combos = from_bf.header.combos_per_board as usize;
+
+    // Handle preflop (1 board) → flop (many boards) specially.
+    if from_boards == 1 && to_boards > 1 {
+        for combo_idx in 0..combos {
+            let from_bucket = from_bf.get_bucket(0, combo_idx as u16) as usize;
+            for board_idx in 0..to_boards {
+                let to_bucket = to_bf.get_bucket(board_idx as u32, combo_idx as u16) as usize;
+                if from_bucket < from_k && to_bucket < to_k {
+                    matrix[from_bucket][to_bucket] += 1;
+                }
+            }
+        }
+    } else {
+        let boards = from_boards.min(to_boards);
+        for board_idx in 0..boards {
+            for combo_idx in 0..combos {
+                let from_bucket = from_bf.get_bucket(board_idx as u32, combo_idx as u16) as usize;
+                let to_bucket = to_bf.get_bucket(board_idx as u32, combo_idx as u16) as usize;
+                if from_bucket < from_k && to_bucket < to_k {
+                    matrix[from_bucket][to_bucket] += 1;
+                }
+            }
+        }
+    }
+
+    TransitionMatrix {
+        from_street: format!("{:?}", from_bf.header.street),
+        to_street: format!("{:?}", to_bf.header.street),
+        matrix,
+    }
+}
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `cargo test -p poker-solver-core transition_matrix_basic`
+Expected: PASS
+
+**Step 5: Add CLI integration**
+
+In `crates/trainer/src/main.rs`, add a `--transitions` flag to `DiagClusters` that loads adjacent street pairs and prints the transition matrix.
+
+**Step 6: Commit**
+
+```
+git add crates/core/src/blueprint_v2/cluster_diagnostics.rs crates/trainer/src/main.rs
+git commit -m "feat(diag): add cross-street transition matrix diagnostic"
+```
+
+---
+
+### Task 11: EMD between bucket centroids diagnostic
+
+**Files:**
+- Modify: `crates/core/src/blueprint_v2/cluster_diagnostics.rs`
+
+**Context:** After k-means, compute pairwise EMD between final centroids. Well-separated clusters have high inter-centroid EMD. Nearly identical centroids indicate the bucket count is too high. This requires access to the centroids, which are not currently stored in `BucketFile`.
+
+**Approach:** Rather than storing centroids, recompute them from the bucket assignments. For each bucket on a given street, collect all the feature vectors (histograms over next-street buckets) assigned to it and average them to reconstruct the centroid. Then compute pairwise EMD.
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn centroid_emd_matrix_basic() {
+    use crate::blueprint_v2::clustering::emd;
+
+    // 3 buckets, 6 data points with known distributions.
+    let features = vec![
+        vec![0.9, 0.1, 0.0],  // bucket 0
+        vec![0.8, 0.2, 0.0],  // bucket 0
+        vec![0.0, 0.9, 0.1],  // bucket 1
+        vec![0.0, 0.8, 0.2],  // bucket 1
+        vec![0.0, 0.1, 0.9],  // bucket 2
+        vec![0.0, 0.0, 1.0],  // bucket 2
+    ];
+    let assignments: Vec<u16> = vec![0, 0, 1, 1, 2, 2];
+
+    let report = centroid_emd_report(&features, &assignments, 3);
+    assert_eq!(report.num_buckets, 3);
+    assert_eq!(report.pairwise_emd.len(), 3); // 3 pairs: (0,1), (0,2), (1,2)
+
+    // Centroids: b0=[0.85, 0.15, 0.0], b1=[0.0, 0.85, 0.15], b2=[0.0, 0.05, 0.95]
+    // EMD(b0, b1) should be ~0.85
+    // EMD(b0, b2) should be ~1.75
+    // EMD(b1, b2) should be ~0.80
+    for pair in &report.pairwise_emd {
+        assert!(pair.emd > 0.0, "EMD should be positive: {:?}", pair);
+    }
+    assert!(report.min_emd > 0.0);
+    assert!(report.max_emd > report.min_emd);
+}
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `cargo test -p poker-solver-core centroid_emd_matrix_basic`
+Expected: FAIL — `centroid_emd_report` not found
+
+**Step 3: Write implementation**
+
+```rust
+/// A pair of buckets and their inter-centroid EMD.
+#[derive(Debug, Clone)]
+pub struct CentroidPairEmd {
+    pub bucket_a: u16,
+    pub bucket_b: u16,
+    pub emd: f64,
+}
+
+/// Report on inter-centroid EMD distances.
+#[derive(Debug)]
+pub struct CentroidEmdReport {
+    pub num_buckets: usize,
+    pub pairwise_emd: Vec<CentroidPairEmd>,
+    pub min_emd: f64,
+    pub max_emd: f64,
+    pub mean_emd: f64,
+}
+
+impl CentroidEmdReport {
+    /// Format as a human-readable summary.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        use std::fmt::Write;
+        let mut s = format!(
+            "Centroid EMD: {} buckets, {} pairs\n  \
+             min={:.4}, max={:.4}, mean={:.4}\n  \
+             Closest pairs:",
+            self.num_buckets,
+            self.pairwise_emd.len(),
+            self.min_emd,
+            self.max_emd,
+            self.mean_emd,
+        );
+        // Show the 5 closest pairs (potential merging candidates).
+        let mut sorted: Vec<_> = self.pairwise_emd.iter().collect();
+        sorted.sort_by(|a, b| a.emd.partial_cmp(&b.emd).unwrap_or(std::cmp::Ordering::Equal));
+        for pair in sorted.iter().take(5) {
+            let _ = write!(
+                s,
+                "\n    bucket {} ↔ {}: EMD={:.4}",
+                pair.bucket_a, pair.bucket_b, pair.emd,
+            );
+        }
+        s
+    }
+}
+
+/// Compute pairwise EMD between reconstructed centroids.
+///
+/// Reconstructs centroids by averaging feature vectors within each bucket,
+/// then computes EMD between all pairs.
+///
+/// # Arguments
+/// * `features` — feature vectors (probability distributions), one per data point
+/// * `assignments` — bucket assignment for each data point
+/// * `k` — number of buckets
+#[must_use]
+pub fn centroid_emd_report(
+    features: &[Vec<f64>],
+    assignments: &[u16],
+    k: usize,
+) -> CentroidEmdReport {
+    use super::clustering::emd;
+
+    let dim = features.first().map_or(0, |f| f.len());
+    let mut centroids = vec![vec![0.0_f64; dim]; k];
+    let mut counts = vec![0_usize; k];
+
+    for (i, feat) in features.iter().enumerate() {
+        let ci = assignments[i] as usize;
+        if ci < k {
+            counts[ci] += 1;
+            for (j, &val) in feat.iter().enumerate() {
+                centroids[ci][j] += val;
+            }
+        }
+    }
+
+    for ci in 0..k {
+        if counts[ci] > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let inv = 1.0 / counts[ci] as f64;
+            for v in &mut centroids[ci] {
+                *v *= inv;
+            }
+        }
+    }
+
+    let mut pairwise = Vec::new();
+    for i in 0..k {
+        for j in (i + 1)..k {
+            let d = emd(&centroids[i], &centroids[j]);
+            #[allow(clippy::cast_possible_truncation)]
+            pairwise.push(CentroidPairEmd {
+                bucket_a: i as u16,
+                bucket_b: j as u16,
+                emd: d,
+            });
+        }
+    }
+
+    let min = pairwise.iter().map(|p| p.emd).fold(f64::INFINITY, f64::min);
+    let max = pairwise.iter().map(|p| p.emd).fold(0.0_f64, f64::max);
+    #[allow(clippy::cast_precision_loss)]
+    let mean = if pairwise.is_empty() {
+        0.0
+    } else {
+        pairwise.iter().map(|p| p.emd).sum::<f64>() / pairwise.len() as f64
+    };
+
+    CentroidEmdReport {
+        num_buckets: k,
+        pairwise_emd: pairwise,
+        min_emd: if min.is_infinite() { 0.0 } else { min },
+        max_emd: max,
+        mean_emd: mean,
+    }
+}
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `cargo test -p poker-solver-core centroid_emd_matrix_basic`
+Expected: PASS
+
+**Step 5: Commit**
+
+```
+git add crates/core/src/blueprint_v2/cluster_diagnostics.rs
+git commit -m "feat(diag): add inter-centroid EMD distance report"
+```
+
+---
+
+### Task 12: Sample hands per bucket diagnostic
+
+**Files:**
+- Modify: `crates/core/src/blueprint_v2/cluster_diagnostics.rs`
+- Modify: `crates/trainer/src/main.rs` (add CLI flag)
+
+**Context:** For a given street and bucket ID, show example hands with their boards so a human can sanity-check "do these hands belong together?" This is the most intuitive debugging tool — you look at bucket 7 on the turn and see if the hands make sense.
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn sample_hands_for_bucket_basic() {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+
+    // Make a tiny river BucketFile: 1 board, assign combo 0..9 to bucket 0, rest to bucket 1.
+    let mut buckets = vec![1_u16; 1326];
+    for i in 0..10 {
+        buckets[i] = 0;
+    }
+    let board_cards = [deck[10], deck[20], deck[30], deck[40], deck[50]];
+    let bf = BucketFile {
+        header: BucketFileHeader {
+            street: Street::River,
+            bucket_count: 2,
+            board_count: 1,
+            combos_per_board: 1326,
+            version: 2,
+        },
+        boards: vec![PackedBoard::from_cards(&board_cards)],
+        buckets,
+    };
+
+    let samples = sample_hands_for_bucket(&bf, 0, 5, 42);
+    assert_eq!(samples.len(), 5);
+    // All returned combos should be in bucket 0 (combo indices 0..9).
+    for sample in &samples {
+        assert_eq!(sample.bucket, 0);
+    }
+}
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `cargo test -p poker-solver-core sample_hands_for_bucket_basic`
+Expected: FAIL — `sample_hands_for_bucket` not found
+
+**Step 3: Write implementation**
+
+```rust
+/// A sample hand from a specific bucket.
+#[derive(Debug, Clone)]
+pub struct BucketHandSample {
+    pub bucket: u16,
+    pub board_idx: u32,
+    pub combo_idx: u16,
+    pub board_cards: Vec<Card>,
+    pub hole_cards: [Card; 2],
+}
+
+impl BucketHandSample {
+    /// Format as a human-readable string.
+    #[must_use]
+    pub fn display(&self) -> String {
+        let board_str: Vec<String> = self.board_cards.iter().map(|c| format!("{c}")).collect();
+        format!(
+            "  [{} {}] on [{}]",
+            self.hole_cards[0],
+            self.hole_cards[1],
+            board_str.join(" "),
+        )
+    }
+}
+
+/// Sample up to `max_samples` hands from a specific bucket.
+///
+/// Scans the bucket file for entries matching `target_bucket`, collects
+/// them, and returns a random subset (seeded for reproducibility).
+/// Each sample includes the board cards and hole cards.
+#[must_use]
+pub fn sample_hands_for_bucket(
+    bf: &BucketFile,
+    target_bucket: u16,
+    max_samples: usize,
+    seed: u64,
+) -> Vec<BucketHandSample> {
+    use rand::prelude::*;
+    use rand::rngs::StdRng;
+
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let board_count = bf.header.board_count;
+    let combos_per_board = bf.header.combos_per_board as usize;
+
+    // Collect all (board_idx, combo_idx) in the target bucket.
+    let mut candidates: Vec<(u32, u16)> = Vec::new();
+    for board_idx in 0..board_count {
+        for combo_idx in 0..combos_per_board {
+            let bucket = bf.get_bucket(board_idx, combo_idx as u16);
+            if bucket == target_bucket {
+                candidates.push((board_idx, combo_idx as u16));
+            }
+        }
+    }
+
+    // Subsample.
+    let mut rng = StdRng::seed_from_u64(seed);
+    candidates.shuffle(&mut rng);
+    candidates.truncate(max_samples);
+
+    candidates
+        .into_iter()
+        .map(|(board_idx, combo_idx)| {
+            let board_cards = if (board_idx as usize) < bf.boards.len() {
+                let num_cards = match bf.header.street {
+                    Street::Preflop => 0,
+                    Street::Flop => 3,
+                    Street::Turn => 4,
+                    Street::River => 5,
+                };
+                bf.boards[board_idx as usize].to_cards(num_cards)
+            } else {
+                Vec::new()
+            };
+
+            let hole_cards = if (combo_idx as usize) < combos.len() {
+                combos[combo_idx as usize]
+            } else {
+                [deck[0], deck[1]] // fallback
+            };
+
+            BucketHandSample {
+                bucket: target_bucket,
+                board_idx,
+                combo_idx,
+                board_cards,
+                hole_cards,
+            }
+        })
+        .collect()
+}
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `cargo test -p poker-solver-core sample_hands_for_bucket_basic`
+Expected: PASS
+
+**Step 5: Add CLI integration**
+
+In `crates/trainer/src/main.rs`, add `--sample-bucket <STREET> <BUCKET_ID>` option to `DiagClusters` that loads the bucket file and prints 10 sample hands.
+
+**Step 6: Commit**
+
+```
+git add crates/core/src/blueprint_v2/cluster_diagnostics.rs crates/trainer/src/main.rs
+git commit -m "feat(diag): add sample hands per bucket diagnostic"
+```
