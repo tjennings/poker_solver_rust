@@ -7,7 +7,7 @@ use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
 use poker_solver_core::poker::{Card, Suit};
 use range_solver::card::card_pair_to_index;
 
-use crate::model::network::{CfvNet, OUTPUT_SIZE, input_size};
+use crate::model::network::{CfvNet, DECK_SIZE, INPUT_SIZE, OUTPUT_SIZE};
 
 /// Convert an `rs_poker::core::Card` to a range-solver `u8` card.
 ///
@@ -66,13 +66,13 @@ impl<B: Backend> RiverNetEvaluator<B> {
 
 /// Build the input vector for a single river board evaluation.
 ///
-/// Layout (2660 floats for 5 board cards):
-///   [0..1326)     — OOP range (1326 combo probabilities)
-///   [1326..2652)  — IP range (1326 combo probabilities)
-///   [2652..2657)  — board cards normalized by /51.0
-///   [2657]        — pot / 400.0
-///   [2658]        — effective_stack / 400.0
-///   [2659]        — player indicator (0.0=OOP, 1.0=IP)
+/// Layout (2707 floats):
+///   [0..1326)      — OOP range (1326 combo probabilities)
+///   [1326..2652)   — IP range (1326 combo probabilities)
+///   [2652..2704)   — board one-hot (52 elements)
+///   [2704]         — pot / 400.0
+///   [2705]         — effective_stack / 400.0
+///   [2706]         — player indicator (0.0=OOP, 1.0=IP)
 fn build_input(
     oop_1326: &[f32; OUTPUT_SIZE],
     ip_1326: &[f32; OUTPUT_SIZE],
@@ -81,17 +81,18 @@ fn build_input(
     effective_stack: f64,
     traverser: u8,
 ) -> Vec<f32> {
-    let in_size = input_size(5);
-    let mut input = Vec::with_capacity(in_size);
+    let mut input = Vec::with_capacity(INPUT_SIZE);
     input.extend_from_slice(oop_1326);
     input.extend_from_slice(ip_1326);
+    let mut board_onehot = [0.0_f32; DECK_SIZE];
     for &card in board_u8 {
-        input.push(f32::from(card) / 51.0);
+        board_onehot[card as usize] = 1.0;
     }
+    input.extend_from_slice(&board_onehot);
     input.push(pot as f32 / 400.0);
     input.push(effective_stack as f32 / 400.0);
     input.push(if traverser == 0 { 0.0 } else { 1.0 });
-    debug_assert_eq!(input.len(), in_size);
+    debug_assert_eq!(input.len(), INPUT_SIZE);
     input
 }
 
@@ -114,7 +115,6 @@ where
         assert_eq!(combos.len(), ip_range.len());
 
         let num_combos = combos.len();
-        let in_size = input_size(5);
 
         // Pre-convert combos to u8 pairs and their 1326 indices.
         let combos_u8: Vec<[u8; 2]> = combos
@@ -171,7 +171,7 @@ where
                 traverser,
             );
 
-            let data = TensorData::new(input_vec, [1, in_size]);
+            let data = TensorData::new(input_vec, [1, INPUT_SIZE]);
             let input_tensor = Tensor::<B, 2>::from_data(data, &self.device);
             let output = self.model.forward(input_tensor);
 
@@ -224,8 +224,7 @@ mod tests {
     #[test]
     fn output_length_matches_combos() {
         let device = Default::default();
-        let in_size = input_size(5);
-        let model = CfvNet::<TestBackend>::new(&device, 1, 8, in_size);
+        let model = CfvNet::<TestBackend>::new(&device, 1, 8, INPUT_SIZE);
         let evaluator = RiverNetEvaluator::new(model, device);
 
         let board = test_board();
@@ -244,8 +243,7 @@ mod tests {
     #[test]
     fn all_values_finite() {
         let device = Default::default();
-        let in_size = input_size(5);
-        let model = CfvNet::<TestBackend>::new(&device, 1, 8, in_size);
+        let model = CfvNet::<TestBackend>::new(&device, 1, 8, INPUT_SIZE);
         let evaluator = RiverNetEvaluator::new(model, device);
 
         let board = test_board();
@@ -266,8 +264,7 @@ mod tests {
     #[test]
     fn can_box_as_dyn_leaf_evaluator() {
         let device = Default::default();
-        let in_size = input_size(5);
-        let model = CfvNet::<TestBackend>::new(&device, 1, 8, in_size);
+        let model = CfvNet::<TestBackend>::new(&device, 1, 8, INPUT_SIZE);
         let evaluator = RiverNetEvaluator::new(model, device);
 
         let _boxed: Box<dyn LeafEvaluator> = Box::new(evaluator);
@@ -276,8 +273,7 @@ mod tests {
     #[test]
     fn both_traverser_positions() {
         let device = Default::default();
-        let in_size = input_size(5);
-        let model = CfvNet::<TestBackend>::new(&device, 1, 8, in_size);
+        let model = CfvNet::<TestBackend>::new(&device, 1, 8, INPUT_SIZE);
         let evaluator = RiverNetEvaluator::new(model, device);
 
         let board = test_board();
