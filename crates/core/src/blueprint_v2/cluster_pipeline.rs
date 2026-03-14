@@ -32,12 +32,11 @@ use rayon::prelude::*;
 
 use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::flops::all_flops;
-use crate::hands::CanonicalHand;
 use crate::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
 use crate::showdown_equity::rank_hand;
 
 use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard};
-use super::clustering::{kmeans_1d, kmeans_1d_weighted, kmeans_emd_weighted_u8};
+use super::clustering::{kmeans_1d, kmeans_1d_weighted, kmeans_emd_weighted_u8, nearest_centroid_1d};
 use super::config::ClusteringConfig;
 use super::Street;
 
@@ -53,6 +52,7 @@ const DEFAULT_TURN_BOARDS: usize = 5_000;
 const DEFAULT_FLOP_BOARDS: usize = 2_000;
 
 /// Number of sample 5-card boards for preflop equity estimation.
+const DEFAULT_PREFLOP_BOARDS: usize = 2_000;
 
 /// Total number of 2-card combos from a 52-card deck: C(52,2) = 1326.
 const TOTAL_COMBOS: u16 = 1326;
@@ -873,40 +873,321 @@ pub fn cluster_flop_canonical(
 // Preflop clustering
 // ---------------------------------------------------------------------------
 
-/// Map preflop hole-card combos to canonical hand buckets (1:1).
+/// Cluster preflop hole-card combos by EMD over flop bucket distributions.
 ///
-/// Each of the 1326 two-card combos is assigned to its canonical hand index
-/// (0–168), giving exactly 169 buckets: 13 pairs (6 combos each), 78 suited
-/// (4 combos each), and 78 offsuit (12 combos each).
+/// Samples random 3-card flop boards, builds a histogram of flop bucket IDs
+/// for each of the 1326 two-card combos, and clusters using EMD k-means.
 ///
-/// This is deterministic and matches the lookup used by the MCCFR solver at
-/// runtime (`CanonicalHand::from_cards().index()`).
+/// Returns a `BucketFile` with `board_count = 1` and `combos_per_board = 1326`.
+/// Every combo receives a valid bucket (no sentinels needed since there is no
+/// board to conflict with preflop).
 ///
 /// The `progress` callback receives values in `[0.0, 1.0]`.
-pub fn cluster_preflop(progress: impl Fn(f64) + Sync) -> BucketFile {
+pub fn cluster_preflop(
+    flop_buckets: &BucketFile,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    cluster_preflop_with_boards(
+        flop_buckets,
+        bucket_count,
+        kmeans_iterations,
+        seed,
+        DEFAULT_PREFLOP_BOARDS,
+        progress,
+    )
+}
+
+/// Like [`cluster_preflop`] but with an explicit flop board sample count.
+pub fn cluster_preflop_with_boards(
+    flop_buckets: &BucketFile,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    num_boards: usize,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
-    let buckets: Vec<u16> = combos
-        .iter()
+    let board_map = flop_buckets.board_index_map();
+
+    // Sample 3-card flop boards.
+    let boards = sample_flop_boards(&deck, num_boards, seed);
+
+    // For each combo, build histogram over flop bucket IDs.
+    let features: Vec<Vec<u8>> = combos
+        .par_iter()
         .enumerate()
-        .map(|(i, &combo)| {
+        .map(|(combo_idx, &combo)| {
+            let mut histogram = vec![0_u16; flop_buckets.header.bucket_count as usize];
+            let ci = combo_index(combo[0], combo[1]);
+
+            for board in &boards {
+                if cards_overlap(combo, board) {
+                    continue;
+                }
+                let packed = canonical_key(board);
+                if let Some(&board_idx) = board_map.get(&packed) {
+                    let bucket = flop_buckets.get_bucket(board_idx, ci);
+                    histogram[bucket as usize] += 1;
+                }
+            }
+
             #[allow(clippy::cast_precision_loss)]
-            progress((i + 1) as f64 / combos.len() as f64);
-            CanonicalHand::from_cards(combo[0], combo[1]).index() as u16
+            progress((combo_idx + 1) as f64 / combos.len() as f64 * 0.8);
+            histogram.iter().map(|&c| c.min(255) as u8).collect()
         })
         .collect();
+
+    let weights: Vec<f64> = vec![1.0; features.len()];
+    let cluster_labels = kmeans_emd_weighted_u8(
+        &features,
+        &weights,
+        bucket_count as usize,
+        kmeans_iterations,
+        seed,
+        |iter, max| {
+            #[allow(clippy::cast_precision_loss)]
+            progress(0.8 + 0.2 * iter as f64 / max as f64);
+        },
+    );
 
     BucketFile {
         header: BucketFileHeader {
             street: Street::Preflop,
-            bucket_count: 169,
+            bucket_count,
             board_count: 1,
             combos_per_board: TOTAL_COMBOS,
             version: 1,
         },
         boards: Vec::new(),
-        buckets,
+        buckets: cluster_labels,
     }
+}
+
+// ---------------------------------------------------------------------------
+// cfvnet-based river clustering
+// ---------------------------------------------------------------------------
+
+/// Number of histogram bins for the streaming equity histogram.
+const HISTOGRAM_BINS: usize = 10_000;
+
+/// Size of a single cfvnet river training record in bytes:
+/// `board_size`(1) + board(5) + pot(4) + stack(4) + player(1) +
+/// `game_value`(4) + `oop_range`(5304) + `ip_range`(5304) + cfvs(5304) +
+/// `valid_mask`(1326).
+const CFVNET_RIVER_RECORD_SIZE: usize = 1 + 5 + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4 + 1326 * 4 + 1326;
+
+/// Cluster river situations using pre-solved cfvnet training records.
+///
+/// Streams `*.bin` files from `data_dir`, converts pot-relative CFVs to equity,
+/// and clusters using a streaming histogram k-means approach in 3 passes:
+///
+/// 1. Build a 10,000-bin equity histogram and collect unique canonical boards.
+/// 2. Run weighted 1-D k-means on histogram bin midpoints to find centroids.
+/// 3. Re-stream files and assign each (board, combo) its nearest centroid bucket.
+///
+/// # Errors
+///
+/// Returns an error if no valid river records are found or if I/O fails.
+#[allow(clippy::cast_precision_loss)]
+pub fn cluster_river_from_cfvnet(
+    data_dir: &Path,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    progress: impl Fn(f64) + Sync,
+) -> Result<BucketFile, Box<dyn std::error::Error>> {
+    let combo_map = build_cfvnet_to_core_combo_map();
+    let bin_files = collect_bin_files(data_dir)?;
+
+    // ---- Pass 1: build histogram + collect unique boards --------------------
+    let (histogram, board_set) = cfvnet_pass1_histogram(&bin_files, &progress)?;
+
+    // ---- Pass 2: k-means on histogram bins ---------------------------------
+    let centroids = cfvnet_pass2_centroids(&histogram, bucket_count, kmeans_iterations);
+    progress(0.5);
+
+    // ---- Pass 3: assign buckets ---------------------------------------------
+    let mut sorted_boards: Vec<(PackedBoard, Vec<Card>)> = board_set.into_iter().collect();
+    sorted_boards.sort_by_key(|(packed, _)| packed.0);
+    let num_boards = sorted_boards.len();
+
+    let board_index: HashMap<PackedBoard, usize> = sorted_boards
+        .iter()
+        .enumerate()
+        .map(|(i, (packed, _))| (*packed, i))
+        .collect();
+
+    let total = num_boards * TOTAL_COMBOS as usize;
+    let mut buckets = vec![0u16; total];
+
+    for (file_idx, path) in bin_files.iter().enumerate() {
+        let data = std::fs::read(path)?;
+        let mut offset = 0;
+        while offset + CFVNET_RIVER_RECORD_SIZE <= data.len() {
+            if data[offset] != 5 {
+                offset += record_size_for_board(data[offset]);
+                continue;
+            }
+
+            let board_cards: Vec<Card> = (0..5)
+                .map(|i| cfvnet_card_to_core(data[offset + 1 + i]))
+                .collect();
+            let packed = canonical_key(&board_cards);
+
+            if let Some(&board_idx) = board_index.get(&packed) {
+                let cfv_offset = offset + CFV_FIELD_OFFSET;
+                let mask_offset = cfv_offset + 1326 * 4;
+
+                for i in 0..1326 {
+                    if data[mask_offset + i] != 0 {
+                        let equity = read_cfv_as_equity(&data, cfv_offset, i);
+                        let core_combo = combo_map[i] as usize;
+                        let bucket = nearest_centroid_1d(equity, &centroids);
+                        buckets[board_idx * TOTAL_COMBOS as usize + core_combo] = bucket;
+                    }
+                }
+            }
+
+            offset += CFVNET_RIVER_RECORD_SIZE;
+        }
+        progress(0.5 + (file_idx + 1) as f64 / bin_files.len() as f64 * 0.5);
+    }
+
+    let packed_boards: Vec<PackedBoard> = sorted_boards.iter().map(|(p, _)| *p).collect();
+
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(BucketFile {
+        header: BucketFileHeader {
+            street: Street::River,
+            bucket_count,
+            board_count: num_boards as u32,
+            combos_per_board: TOTAL_COMBOS,
+            version: 2,
+        },
+        boards: packed_boards,
+        buckets,
+    })
+}
+
+/// Byte offset from record start to the cfvs field (river records only).
+const CFV_FIELD_OFFSET: usize = 1 + 5 + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4;
+
+/// Collect all `*.bin` files from a directory.
+fn collect_bin_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "bin"))
+        .collect();
+    if files.is_empty() {
+        return Err("no .bin files found in data_dir".into());
+    }
+    Ok(files)
+}
+
+/// Read a single CFV float from binary data and convert to equity.
+fn read_cfv_as_equity(data: &[u8], cfv_offset: usize, combo_idx: usize) -> f64 {
+    let start = cfv_offset + combo_idx * 4;
+    let cfv = f32::from_le_bytes([data[start], data[start + 1], data[start + 2], data[start + 3]]);
+    cfv_to_equity(cfv)
+}
+
+/// Pass 1: stream all river records, build a histogram of equity values,
+/// and collect unique canonical boards.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::type_complexity)]
+fn cfvnet_pass1_histogram(
+    bin_files: &[std::path::PathBuf],
+    progress: &impl Fn(f64),
+) -> Result<(Vec<u64>, HashMap<PackedBoard, Vec<Card>>), Box<dyn std::error::Error>> {
+    let mut histogram = vec![0u64; HISTOGRAM_BINS];
+    let mut board_set: HashMap<PackedBoard, Vec<Card>> = HashMap::new();
+
+    for (file_idx, path) in bin_files.iter().enumerate() {
+        let data = std::fs::read(path)?;
+        let mut offset = 0;
+        while offset + CFVNET_RIVER_RECORD_SIZE <= data.len() {
+            if data[offset] != 5 {
+                offset += record_size_for_board(data[offset]);
+                continue;
+            }
+
+            let board_cards: Vec<Card> = (0..5)
+                .map(|i| cfvnet_card_to_core(data[offset + 1 + i]))
+                .collect();
+            let packed = canonical_key(&board_cards);
+            board_set.entry(packed).or_insert_with(|| board_cards.clone());
+
+            let cfv_offset = offset + CFV_FIELD_OFFSET;
+            let mask_offset = cfv_offset + 1326 * 4;
+
+            for i in 0..1326 {
+                if data[mask_offset + i] != 0 {
+                    let equity = read_cfv_as_equity(&data, cfv_offset, i);
+                    let bin = (equity * HISTOGRAM_BINS as f64) as usize;
+                    histogram[bin.min(HISTOGRAM_BINS - 1)] += 1;
+                }
+            }
+
+            offset += CFVNET_RIVER_RECORD_SIZE;
+        }
+        progress((file_idx + 1) as f64 / bin_files.len() as f64 * 0.3);
+    }
+
+    if board_set.is_empty() {
+        return Err("no valid river records found".into());
+    }
+    Ok((histogram, board_set))
+}
+
+/// Pass 2: run weighted 1-D k-means on histogram bin midpoints and extract
+/// sorted centroids.
+#[allow(clippy::cast_precision_loss)]
+fn cfvnet_pass2_centroids(histogram: &[u64], bucket_count: u16, kmeans_iterations: u32) -> Vec<f64> {
+    let mut bin_midpoints: Vec<f64> = Vec::new();
+    let mut bin_weights: Vec<f64> = Vec::new();
+    for (i, &count) in histogram.iter().enumerate() {
+        if count > 0 {
+            let midpoint = (i as f64 + 0.5) / HISTOGRAM_BINS as f64;
+            bin_midpoints.push(midpoint);
+            bin_weights.push(count as f64);
+        }
+    }
+
+    let labels = kmeans_1d_weighted(
+        &bin_midpoints,
+        &bin_weights,
+        bucket_count as usize,
+        kmeans_iterations,
+    );
+
+    // Extract centroids from labels by computing weighted average per cluster.
+    let k = bucket_count as usize;
+    let mut centroid_sums = vec![0.0_f64; k];
+    let mut centroid_weights = vec![0.0_f64; k];
+    for (idx, &label) in labels.iter().enumerate() {
+        let ci = label as usize;
+        centroid_sums[ci] += bin_midpoints[idx] * bin_weights[idx];
+        centroid_weights[ci] += bin_weights[idx];
+    }
+    let mut centroids: Vec<f64> = (0..k)
+        .map(|ci| {
+            if centroid_weights[ci] > 0.0 {
+                centroid_sums[ci] / centroid_weights[ci]
+            } else {
+                ci as f64 / (k.max(2) - 1) as f64
+            }
+        })
+        .collect();
+    centroids.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    centroids
+}
+
+/// Compute the byte size of a cfvnet record given the board size.
+fn record_size_for_board(board_size: u8) -> usize {
+    1 + board_size as usize + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4 + 1326 * 4 + 1326
 }
 
 // ---------------------------------------------------------------------------
@@ -958,9 +1239,15 @@ pub fn run_clustering_pipeline(
         |p| progress("flop", p),
     );
 
-    // 4. Preflop (deterministic canonical hand mapping, 169 buckets)
+    // 4. Preflop (EMD over flop bucket distributions, depends on flop)
     progress("preflop", 0.0);
-    let preflop = cluster_preflop(|p| progress("preflop", p));
+    let preflop = cluster_preflop(
+        &flop,
+        config.preflop.buckets,
+        config.kmeans_iterations,
+        config.seed,
+        |p| progress("preflop", p),
+    );
 
     // Write all files at the end.
     river.save(&output_dir.join("river.buckets"))?;
@@ -1357,6 +1644,62 @@ fn cards_overlap(combo: [Card; 2], board: &[Card]) -> bool {
     board.iter().any(|b| *b == combo[0] || *b == combo[1])
 }
 
+// ---------------------------------------------------------------------------
+// cfvnet helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a pot-relative CFV to an equity value in [0, 1].
+fn cfv_to_equity(cfv: f32) -> f64 {
+    f64::midpoint(f64::from(cfv), 1.0).clamp(0.0, 1.0)
+}
+
+/// Map a cfvnet `card_id` (`4*rank + suit` where C=0,D=1,H=2,S=3)
+/// to a core Card.
+fn cfvnet_card_to_core(card_id: u8) -> Card {
+    let rank = card_id / 4;
+    let cfvnet_suit = card_id % 4;
+    let value = match rank {
+        0 => Value::Two,
+        1 => Value::Three,
+        2 => Value::Four,
+        3 => Value::Five,
+        4 => Value::Six,
+        5 => Value::Seven,
+        6 => Value::Eight,
+        7 => Value::Nine,
+        8 => Value::Ten,
+        9 => Value::Jack,
+        10 => Value::Queen,
+        11 => Value::King,
+        12 => Value::Ace,
+        _ => panic!("invalid rank {rank}"),
+    };
+    let suit = match cfvnet_suit {
+        0 => Suit::Club,
+        1 => Suit::Diamond,
+        2 => Suit::Heart,
+        3 => Suit::Spade,
+        _ => unreachable!(),
+    };
+    Card::new(value, suit)
+}
+
+/// Build a lookup table mapping cfvnet combo index (range-solver ordering)
+/// to core combo index (`cluster_pipeline` ordering).
+fn build_cfvnet_to_core_combo_map() -> [u16; 1326] {
+    let mut map = [0u16; 1326];
+    let mut cfvnet_idx = 0usize;
+    for c0 in 0u8..52 {
+        for c1 in (c0 + 1)..52 {
+            let card0 = cfvnet_card_to_core(c0);
+            let card1 = cfvnet_card_to_core(c1);
+            map[cfvnet_idx] = combo_index(card0, card1);
+            cfvnet_idx += 1;
+        }
+    }
+    map
+}
+
 /// Sample `n` random 4-card boards from the deck without replacement.
 #[allow(dead_code)]
 fn sample_turn_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 4]> {
@@ -1730,43 +2073,37 @@ mod tests {
 
     #[test]
     fn test_preflop_cluster_basic() {
-        let preflop = cluster_preflop(|_| {});
+        let flop = make_dummy_flop_buckets(50, 5, 42);
+        let preflop = cluster_preflop_with_boards(&flop, 10, 20, 42, 50, |_| {});
         assert_eq!(preflop.header.street, Street::Preflop);
-        assert_eq!(preflop.header.bucket_count, 169);
+        assert_eq!(preflop.header.bucket_count, 10);
         assert_eq!(preflop.header.board_count, 1);
         assert_eq!(preflop.header.combos_per_board, 1326);
         assert_eq!(preflop.buckets.len(), 1326);
         for &b in &preflop.buckets {
-            assert!(b < 169, "bucket {b} out of range");
+            assert!(b < 10, "bucket {b} out of range");
         }
     }
 
     #[test]
     fn test_preflop_cluster_deterministic() {
-        let a = cluster_preflop(|_| {});
-        let b = cluster_preflop(|_| {});
+        let flop = make_dummy_flop_buckets(50, 5, 42);
+        let a = cluster_preflop_with_boards(&flop, 10, 20, 42, 50, |_| {});
+        let b = cluster_preflop_with_boards(&flop, 10, 20, 42, 50, |_| {});
         assert_eq!(a.buckets, b.buckets);
     }
 
     #[test]
     fn test_preflop_cluster_bucket_distribution() {
-        let preflop = cluster_preflop(|_| {});
+        let flop = make_dummy_flop_buckets(80, 10, 42);
+        let preflop = cluster_preflop_with_boards(&flop, 169, 50, 42, 80, |_| {});
         let unique: std::collections::HashSet<u16> =
             preflop.buckets.iter().copied().collect();
-        // All 169 canonical hands should be represented
-        assert_eq!(unique.len(), 169);
-        // Verify expected combo counts per canonical hand type
-        let mut counts = vec![0u32; 169];
-        for &b in &preflop.buckets {
-            counts[b as usize] += 1;
-        }
-        for &c in &counts {
-            // Each canonical hand has 4 (suited), 6 (pair), or 12 (offsuit) combos
-            assert!(
-                c == 4 || c == 6 || c == 12,
-                "unexpected combo count {c} for a canonical hand bucket"
-            );
-        }
+        assert!(
+            unique.len() > 10,
+            "expected many unique buckets, got {}",
+            unique.len()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1875,6 +2212,80 @@ mod tests {
         // Only deck[2] forms a board in the map, so total should be at most 1.
         let total: u32 = hist.iter().map(|&c| u32::from(c)).sum();
         assert!(total <= 46, "total counts should not exceed river card count");
+    }
+
+    // -----------------------------------------------------------------------
+    // cfvnet helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cfv_to_equity() {
+        assert!((cfv_to_equity(-1.0) - 0.0).abs() < 1e-9);
+        assert!((cfv_to_equity(0.0) - 0.5).abs() < 1e-9);
+        assert!((cfv_to_equity(1.0) - 1.0).abs() < 1e-9);
+        assert!((cfv_to_equity(-1.5) - 0.0).abs() < 1e-9);
+        assert!((cfv_to_equity(1.5) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cfvnet_card_to_core() {
+        let c = cfvnet_card_to_core(0);
+        assert_eq!(c.value, Value::Two);
+        assert_eq!(c.suit, Suit::Club);
+        let c = cfvnet_card_to_core(51);
+        assert_eq!(c.value, Value::Ace);
+        assert_eq!(c.suit, Suit::Spade);
+        let c = cfvnet_card_to_core(48);
+        assert_eq!(c.value, Value::Ace);
+        assert_eq!(c.suit, Suit::Club);
+    }
+
+    #[test]
+    fn test_cfvnet_to_core_combo_map_is_permutation() {
+        let map = build_cfvnet_to_core_combo_map();
+        let mut sorted: Vec<u16> = map.to_vec();
+        sorted.sort_unstable();
+        let expected: Vec<u16> = (0..1326).collect();
+        assert_eq!(sorted, expected, "combo map must be a permutation of 0..1326");
+    }
+
+    #[test]
+    fn test_cluster_river_from_cfvnet_with_synthetic_data() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("river_test.bin");
+        let mut f = std::fs::File::create(&path).unwrap();
+
+        for player in 0u8..2 {
+            f.write_all(&[5u8]).unwrap();                    // board_size
+            f.write_all(&[0, 4, 8, 12, 16]).unwrap();        // board: 2c 3c 4c 5c 6c
+            f.write_all(&100.0_f32.to_le_bytes()).unwrap();   // pot
+            f.write_all(&200.0_f32.to_le_bytes()).unwrap();   // stack
+            f.write_all(&[player]).unwrap();                   // player
+            f.write_all(&0.0_f32.to_le_bytes()).unwrap();     // game_value
+            f.write_all(&[0u8; 1326 * 4]).unwrap();           // oop_range
+            f.write_all(&[0u8; 1326 * 4]).unwrap();           // ip_range
+            for i in 0..1326 {
+                let cfv = -1.0 + 2.0 * (i as f32 / 1325.0);
+                f.write_all(&cfv.to_le_bytes()).unwrap();
+            }
+            f.write_all(&[1u8; 1326]).unwrap();               // valid_mask: all valid
+        }
+        drop(f);
+
+        let result = cluster_river_from_cfvnet(dir.path(), 10, 50, |_| {});
+        let bf = result.expect("clustering should succeed");
+        assert_eq!(bf.header.street, Street::River);
+        assert_eq!(bf.header.bucket_count, 10);
+        assert_eq!(bf.header.board_count, 1);
+        assert_eq!(bf.buckets.len(), 1326);
+        for &b in &bf.buckets {
+            assert!(b < 10, "bucket {b} out of range");
+        }
+        let used: std::collections::HashSet<u16> = bf.buckets.iter().copied().collect();
+        assert!(used.len() > 1, "expected multiple buckets used");
     }
 
     #[test]
