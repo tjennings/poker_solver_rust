@@ -202,6 +202,7 @@ impl StreamingReader {
     }
 
     /// Reset to the beginning of the file list for a new epoch pass.
+    #[allow(dead_code)]
     fn reset(&mut self) {
         self.current_file_idx = 0;
         self.reader = None;

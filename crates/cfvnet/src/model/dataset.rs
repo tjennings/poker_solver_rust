@@ -96,11 +96,6 @@ impl CfvDataset {
         self.records.is_empty()
     }
 
-    /// Access the underlying records for bulk pre-encoding.
-    pub(crate) fn records(&self) -> &[TrainingRecord] {
-        &self.records
-    }
-
     /// The input feature size (constant for all streets with one-hot board encoding).
     pub fn input_size(&self) -> usize {
         INPUT_SIZE
