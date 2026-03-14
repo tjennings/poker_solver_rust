@@ -798,6 +798,63 @@ fn print_spr_mbb_histogram(title: &str, spr_mbb: &[(f64, f64)]) {
     }
 }
 
+fn board_texture_label(board: &[u8; 5], board_size: usize) -> &'static str {
+    let mut suit_counts = [0u8; 4];
+    for &card in &board[..board_size] {
+        let suit = (card % 4) as usize;
+        suit_counts[suit] += 1;
+    }
+    let max_suit = suit_counts.iter().copied().max().unwrap_or(0);
+    match max_suit {
+        4.. => "Monotone     ",
+        3 => "Three-flush  ",
+        2 => "Two-tone     ",
+        _ => "Rainbow      ",
+    }
+}
+
+fn print_texture_mbb_histogram(title: &str, texture_mbb: &[(&str, f64)]) {
+    const BAR_WIDTH: usize = 40;
+    const LABELS: &[&str] = &[
+        "Monotone     ",
+        "Three-flush  ",
+        "Two-tone     ",
+        "Rainbow      ",
+    ];
+
+    let mut sums = [0.0_f64; 4];
+    let mut counts = [0_u32; 4];
+
+    for &(label, mbb) in texture_mbb {
+        if let Some(idx) = LABELS.iter().position(|&l| l == label) {
+            sums[idx] += mbb;
+            counts[idx] += 1;
+        }
+    }
+
+    let means: Vec<f64> = sums.iter().zip(&counts)
+        .map(|(&s, &c)| if c > 0 { s / c as f64 } else { 0.0 })
+        .collect();
+
+    let max_val = means.iter().copied().fold(0.0_f64, f64::max);
+    if max_val <= 0.0 {
+        return;
+    }
+
+    println!("\n{title}:");
+    for (i, label) in LABELS.iter().enumerate() {
+        let mean = means[i];
+        let count = counts[i];
+        let bar_len = ((mean / max_val) * BAR_WIDTH as f64).round() as usize;
+        let bar: String = "█".repeat(bar_len);
+        if count > 0 {
+            println!("  {label} |{:<width$}| {:.2} mBB  (n={})", bar, mean, count, width = BAR_WIDTH);
+        } else {
+            println!("  {label} |{:<width$}|              (n=0)", "", width = BAR_WIDTH);
+        }
+    }
+}
+
 fn load_model_config(model_path: &std::path::Path) -> cfvnet::config::CfvnetConfig {
     let dir = if model_path.is_dir() {
         model_path.to_path_buf()
@@ -835,7 +892,7 @@ fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
     let mut sorted: Vec<_> = summary.spots.iter().collect();
     sorted.sort_by(|a, b| a.mbb.total_cmp(&b.mbb));
 
-    let top_n = sorted.len().min(3);
+    let top_n = sorted.len().min(10);
 
     println!("\nBest {} spots (by mBB):", top_n);
     for (i, spot) in sorted.iter().take(top_n).enumerate() {
@@ -867,6 +924,11 @@ fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
         .map(|s| (s.effective_stack as f64 / s.pot as f64, s.mbb))
         .collect();
     print_spr_mbb_histogram("mBB Error by SPR", &spr_mbb);
+
+    let texture_mbb: Vec<(&str, f64)> = summary.spots.iter()
+        .map(|s| (board_texture_label(&s.board, s.board_size), s.mbb))
+        .collect();
+    print_texture_mbb_histogram("mBB Error by Board Texture", &texture_mbb);
 }
 
 fn print_histogram<F, G>(title: &str, spots: &[cfvnet::eval::compare::SpotResult], key_fn: F, val_fn: G)
