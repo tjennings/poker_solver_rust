@@ -100,6 +100,18 @@ enum Commands {
         #[arg(short, long)]
         data: PathBuf,
     },
+    /// Benchmark sample + solve throughput (no output).
+    BenchSolve {
+        /// Path to the YAML configuration file.
+        #[arg(long)]
+        config: PathBuf,
+        /// Number of situations to solve (default: 1000).
+        #[arg(long, default_value = "1000")]
+        num_samples: u64,
+        /// Number of threads (default: 1 for profiling).
+        #[arg(long, default_value = "1")]
+        threads: usize,
+    },
 }
 
 fn append_random_suffix(path: &std::path::Path) -> PathBuf {
@@ -187,6 +199,9 @@ fn main() {
             num_spots,
         } => cmd_compare_exact(model, num_spots),
         Commands::DatagenEval { data } => cmd_datagen_eval(data),
+        Commands::BenchSolve { config, num_samples, threads } => {
+            cmd_bench_solve(config, num_samples, threads);
+        }
     }
 }
 
@@ -355,6 +370,87 @@ fn cmd_generate(
     }
 
     println!("Done.");
+}
+
+fn cmd_bench_solve(config_path: PathBuf, num_samples: u64, threads: usize) {
+    let yaml = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        eprintln!("failed to read config {}: {e}", config_path.display());
+        std::process::exit(1);
+    });
+    let cfg: cfvnet::config::CfvnetConfig = serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
+        eprintln!("failed to parse config: {e}");
+        std::process::exit(1);
+    });
+    if let Err(e) = cfg.game.validate() {
+        eprintln!("invalid game config: {e}");
+        std::process::exit(1);
+    }
+
+    let bet_str = cfg.game.bet_sizes.join(",");
+    let bet_sizes = range_solver::bet_size::BetSizeOptions::try_from((bet_str.as_str(), ""))
+        .unwrap_or_else(|e| {
+            eprintln!("invalid bet sizes: {e}");
+            std::process::exit(1);
+        });
+    let solve_config = cfvnet::datagen::solver::SolveConfig {
+        bet_sizes,
+        solver_iterations: cfg.datagen.solver_iterations,
+        target_exploitability: cfg.datagen.target_exploitability,
+        add_allin_threshold: cfg.game.add_allin_threshold,
+        force_allin_threshold: cfg.game.force_allin_threshold,
+    };
+
+    let board_size = cfg.game.board_size;
+    let seed = cfg.datagen.seed;
+
+    eprintln!("Benchmarking sample+solve: {num_samples} situations, {threads} thread(s)");
+
+    let start = std::time::Instant::now();
+
+    if threads > 1 {
+        use rayon::prelude::*;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            (0..num_samples).into_par_iter().for_each(|i| {
+                use rand::SeedableRng;
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed.wrapping_add(i));
+                let situation = cfvnet::datagen::sampler::sample_situation(
+                    &cfg.datagen,
+                    cfg.game.initial_stack,
+                    board_size,
+                    &mut rng,
+                );
+                if situation.effective_stack > 0 {
+                    let _ = cfvnet::datagen::solver::solve_situation(&situation, &solve_config);
+                }
+            });
+        });
+    } else {
+        use rand::SeedableRng;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+        for _ in 0..num_samples {
+            let situation = cfvnet::datagen::sampler::sample_situation(
+                &cfg.datagen,
+                cfg.game.initial_stack,
+                board_size,
+                &mut rng,
+            );
+            if situation.effective_stack > 0 {
+                let _ = cfvnet::datagen::solver::solve_situation(&situation, &solve_config);
+            }
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let per_solve = elapsed / num_samples as u32;
+    let solves_per_sec = num_samples as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "Solved {} situations in {:.2?} ({:.1} solves/sec, {:.2?}/solve)",
+        num_samples, elapsed, solves_per_sec, per_solve,
+    );
 }
 
 fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
