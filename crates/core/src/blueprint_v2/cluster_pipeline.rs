@@ -32,6 +32,7 @@ use rayon::prelude::*;
 
 use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::flops::all_flops;
+use crate::hands::CanonicalHand;
 use crate::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
 use crate::showdown_equity::rank_hand;
 
@@ -52,7 +53,6 @@ const DEFAULT_TURN_BOARDS: usize = 5_000;
 const DEFAULT_FLOP_BOARDS: usize = 2_000;
 
 /// Number of sample 5-card boards for preflop equity estimation.
-const DEFAULT_PREFLOP_BOARDS: usize = 2_000;
 
 /// Total number of 2-card combos from a 52-card deck: C(52,2) = 1326.
 const TOTAL_COMBOS: u16 = 1326;
@@ -873,97 +873,39 @@ pub fn cluster_flop_canonical(
 // Preflop clustering
 // ---------------------------------------------------------------------------
 
-/// Cluster preflop hole-card combos by EMD over flop bucket distributions.
+/// Map preflop hole-card combos to canonical hand buckets (1:1).
 ///
-/// Samples random 3-card flop boards, builds a histogram of flop bucket IDs
-/// for each of the 1326 two-card combos, and clusters using EMD k-means.
+/// Each of the 1326 two-card combos is assigned to its canonical hand index
+/// (0–168), giving exactly 169 buckets: 13 pairs (6 combos each), 78 suited
+/// (4 combos each), and 78 offsuit (12 combos each).
 ///
-/// Returns a `BucketFile` with `board_count = 1` and `combos_per_board = 1326`.
-/// Every combo receives a valid bucket (no sentinels needed since there is no
-/// board to conflict with preflop).
+/// This is deterministic and matches the lookup used by the MCCFR solver at
+/// runtime (`CanonicalHand::from_cards().index()`).
 ///
 /// The `progress` callback receives values in `[0.0, 1.0]`.
-pub fn cluster_preflop(
-    flop_buckets: &BucketFile,
-    bucket_count: u16,
-    kmeans_iterations: u32,
-    seed: u64,
-    progress: impl Fn(f64) + Sync,
-) -> BucketFile {
-    cluster_preflop_with_boards(
-        flop_buckets,
-        bucket_count,
-        kmeans_iterations,
-        seed,
-        DEFAULT_PREFLOP_BOARDS,
-        progress,
-    )
-}
-
-/// Like [`cluster_preflop`] but with an explicit flop board sample count.
-pub fn cluster_preflop_with_boards(
-    flop_buckets: &BucketFile,
-    bucket_count: u16,
-    kmeans_iterations: u32,
-    seed: u64,
-    num_boards: usize,
-    progress: impl Fn(f64) + Sync,
-) -> BucketFile {
+pub fn cluster_preflop(progress: impl Fn(f64) + Sync) -> BucketFile {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
-    let board_map = flop_buckets.board_index_map();
-
-    // Sample 3-card flop boards.
-    let boards = sample_flop_boards(&deck, num_boards, seed);
-
-    // For each combo, build histogram over flop bucket IDs.
-    let features: Vec<Vec<u8>> = combos
-        .par_iter()
+    let buckets: Vec<u16> = combos
+        .iter()
         .enumerate()
-        .map(|(combo_idx, &combo)| {
-            let mut histogram = vec![0_u16; flop_buckets.header.bucket_count as usize];
-            let ci = combo_index(combo[0], combo[1]);
-
-            for board in &boards {
-                if cards_overlap(combo, board) {
-                    continue;
-                }
-                let packed = canonical_key(board);
-                if let Some(&board_idx) = board_map.get(&packed) {
-                    let bucket = flop_buckets.get_bucket(board_idx, ci);
-                    histogram[bucket as usize] += 1;
-                }
-            }
-
+        .map(|(i, &combo)| {
             #[allow(clippy::cast_precision_loss)]
-            progress((combo_idx + 1) as f64 / combos.len() as f64 * 0.8);
-            histogram.iter().map(|&c| c.min(255) as u8).collect()
+            progress((i + 1) as f64 / combos.len() as f64);
+            CanonicalHand::from_cards(combo[0], combo[1]).index() as u16
         })
         .collect();
-
-    let weights: Vec<f64> = vec![1.0; features.len()];
-    let cluster_labels = kmeans_emd_weighted_u8(
-        &features,
-        &weights,
-        bucket_count as usize,
-        kmeans_iterations,
-        seed,
-        |iter, max| {
-            #[allow(clippy::cast_precision_loss)]
-            progress(0.8 + 0.2 * iter as f64 / max as f64);
-        },
-    );
 
     BucketFile {
         header: BucketFileHeader {
             street: Street::Preflop,
-            bucket_count,
+            bucket_count: 169,
             board_count: 1,
             combos_per_board: TOTAL_COMBOS,
             version: 1,
         },
         boards: Vec::new(),
-        buckets: cluster_labels,
+        buckets,
     }
 }
 
@@ -1016,15 +958,9 @@ pub fn run_clustering_pipeline(
         |p| progress("flop", p),
     );
 
-    // 4. Preflop (EMD over flop bucket distributions, depends on flop)
+    // 4. Preflop (deterministic canonical hand mapping, 169 buckets)
     progress("preflop", 0.0);
-    let preflop = cluster_preflop(
-        &flop,
-        config.preflop.buckets,
-        config.kmeans_iterations,
-        config.seed,
-        |p| progress("preflop", p),
-    );
+    let preflop = cluster_preflop(|p| progress("preflop", p));
 
     // Write all files at the end.
     river.save(&output_dir.join("river.buckets"))?;
@@ -1794,37 +1730,43 @@ mod tests {
 
     #[test]
     fn test_preflop_cluster_basic() {
-        let flop = make_dummy_flop_buckets(50, 5, 42);
-        let preflop = cluster_preflop_with_boards(&flop, 10, 20, 42, 50, |_| {});
+        let preflop = cluster_preflop(|_| {});
         assert_eq!(preflop.header.street, Street::Preflop);
-        assert_eq!(preflop.header.bucket_count, 10);
+        assert_eq!(preflop.header.bucket_count, 169);
         assert_eq!(preflop.header.board_count, 1);
         assert_eq!(preflop.header.combos_per_board, 1326);
         assert_eq!(preflop.buckets.len(), 1326);
         for &b in &preflop.buckets {
-            assert!(b < 10, "bucket {b} out of range");
+            assert!(b < 169, "bucket {b} out of range");
         }
     }
 
     #[test]
     fn test_preflop_cluster_deterministic() {
-        let flop = make_dummy_flop_buckets(50, 5, 42);
-        let a = cluster_preflop_with_boards(&flop, 10, 20, 42, 50, |_| {});
-        let b = cluster_preflop_with_boards(&flop, 10, 20, 42, 50, |_| {});
+        let a = cluster_preflop(|_| {});
+        let b = cluster_preflop(|_| {});
         assert_eq!(a.buckets, b.buckets);
     }
 
     #[test]
     fn test_preflop_cluster_bucket_distribution() {
-        let flop = make_dummy_flop_buckets(80, 10, 42);
-        let preflop = cluster_preflop_with_boards(&flop, 169, 50, 42, 80, |_| {});
+        let preflop = cluster_preflop(|_| {});
         let unique: std::collections::HashSet<u16> =
             preflop.buckets.iter().copied().collect();
-        assert!(
-            unique.len() > 10,
-            "expected many unique buckets, got {}",
-            unique.len()
-        );
+        // All 169 canonical hands should be represented
+        assert_eq!(unique.len(), 169);
+        // Verify expected combo counts per canonical hand type
+        let mut counts = vec![0u32; 169];
+        for &b in &preflop.buckets {
+            counts[b as usize] += 1;
+        }
+        for &c in &counts {
+            // Each canonical hand has 4 (suited), 6 (pair), or 12 (offsuit) combos
+            assert!(
+                c == 4 || c == 6 || c == 12,
+                "unexpected combo count {c} for a canonical hand bucket"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

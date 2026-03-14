@@ -121,14 +121,7 @@ fn blueprint_v2_e2e_pipeline() {
     flop.save(&cluster_dir.join("flop.buckets"))
         .expect("save flop");
 
-    let preflop = cluster_pipeline::cluster_preflop_with_boards(
-        &flop,
-        config.clustering.preflop.buckets,
-        k,
-        seed,
-        preflop_boards,
-        |_| {},
-    );
+    let preflop = cluster_pipeline::cluster_preflop(|_| {});
     preflop
         .save(&cluster_dir.join("preflop.buckets"))
         .expect("save preflop");
