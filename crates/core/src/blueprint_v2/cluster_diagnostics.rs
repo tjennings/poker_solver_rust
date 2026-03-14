@@ -311,6 +311,92 @@ pub fn audit_cluster_dir(
     Ok(reports)
 }
 
+/// Transition matrix between two adjacent streets.
+#[derive(Debug)]
+pub struct TransitionMatrix {
+    pub from_street: String,
+    pub to_street: String,
+    /// `matrix[from_bucket][to_bucket]` = count of (board, combo) pairs
+    pub matrix: Vec<Vec<u64>>,
+}
+
+impl TransitionMatrix {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        use std::fmt::Write;
+        let num_to = self.matrix.first().map_or(0, Vec::len);
+        let num_from = self.matrix.len();
+        let mut s = format!(
+            "Transition: {} → {} ({num_from} × {num_to} buckets)\n",
+            self.from_street, self.to_street,
+        );
+        let _ = write!(s, "  {:>6}", "");
+        for j in 0..num_to {
+            let _ = write!(s, " {j:>6}");
+        }
+        s.push('\n');
+        for (i, row) in self.matrix.iter().enumerate() {
+            let _ = write!(s, "  {i:>6}");
+            let row_total: u64 = row.iter().sum();
+            for &count in row {
+                if row_total > 0 {
+                    #[allow(clippy::cast_precision_loss)]
+                    let pct = count as f64 / row_total as f64 * 100.0;
+                    let _ = write!(s, " {pct:>5.1}%");
+                } else {
+                    let _ = write!(s, " {:>6}", 0);
+                }
+            }
+            s.push('\n');
+        }
+        s
+    }
+}
+
+#[must_use]
+pub fn cross_street_transition_matrix(
+    from_bf: &BucketFile,
+    to_bf: &BucketFile,
+) -> TransitionMatrix {
+    let from_k = from_bf.header.bucket_count as usize;
+    let to_k = to_bf.header.bucket_count as usize;
+    let mut matrix = vec![vec![0_u64; to_k]; from_k];
+    let from_boards = from_bf.header.board_count as usize;
+    let to_boards = to_bf.header.board_count as usize;
+    let combos = from_bf.header.combos_per_board as usize;
+
+    #[allow(clippy::cast_possible_truncation)]
+    if from_boards == 1 && to_boards > 1 {
+        for combo_idx in 0..combos {
+            let from_bucket = from_bf.get_bucket(0, combo_idx as u16) as usize;
+            for board_idx in 0..to_boards {
+                let to_bucket = to_bf.get_bucket(board_idx as u32, combo_idx as u16) as usize;
+                if from_bucket < from_k && to_bucket < to_k {
+                    matrix[from_bucket][to_bucket] += 1;
+                }
+            }
+        }
+    } else {
+        let boards = from_boards.min(to_boards);
+        #[allow(clippy::cast_possible_truncation)]
+        for board_idx in 0..boards {
+            for combo_idx in 0..combos {
+                let from_bucket = from_bf.get_bucket(board_idx as u32, combo_idx as u16) as usize;
+                let to_bucket = to_bf.get_bucket(board_idx as u32, combo_idx as u16) as usize;
+                if from_bucket < from_k && to_bucket < to_k {
+                    matrix[from_bucket][to_bucket] += 1;
+                }
+            }
+        }
+    }
+
+    TransitionMatrix {
+        from_street: format!("{:?}", from_bf.header.street),
+        to_street: format!("{:?}", to_bf.header.street),
+        matrix,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +455,113 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let reports = diagnose_cluster_dir(dir.path()).unwrap();
         assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn transition_matrix_basic() {
+        let river = BucketFile {
+            header: BucketFileHeader {
+                street: Street::River, bucket_count: 3, board_count: 1, combos_per_board: 4, version: 2,
+            },
+            boards: vec![PackedBoard(0)],
+            buckets: vec![0, 1, 2, 0],
+        };
+        let turn = BucketFile {
+            header: BucketFileHeader {
+                street: Street::Turn, bucket_count: 2, board_count: 1, combos_per_board: 4, version: 2,
+            },
+            boards: vec![PackedBoard(0)],
+            buckets: vec![0, 0, 1, 1],
+        };
+        let matrix = cross_street_transition_matrix(&turn, &river);
+        assert_eq!(matrix.from_street, "Turn");
+        assert_eq!(matrix.to_street, "River");
+        assert_eq!(matrix.matrix.len(), 2);
+        assert_eq!(matrix.matrix[0].len(), 3);
+        assert_eq!(matrix.matrix[0][0], 1);
+        assert_eq!(matrix.matrix[0][1], 1);
+        assert_eq!(matrix.matrix[0][2], 0);
+        assert_eq!(matrix.matrix[1][0], 1);
+        assert_eq!(matrix.matrix[1][1], 0);
+        assert_eq!(matrix.matrix[1][2], 1);
+    }
+
+    #[test]
+    fn transition_matrix_summary_format() {
+        let a = BucketFile {
+            header: BucketFileHeader {
+                street: Street::Turn, bucket_count: 2, board_count: 1, combos_per_board: 2, version: 2,
+            },
+            boards: vec![PackedBoard(0)],
+            buckets: vec![0, 1],
+        };
+        let b = BucketFile {
+            header: BucketFileHeader {
+                street: Street::River, bucket_count: 2, board_count: 1, combos_per_board: 2, version: 2,
+            },
+            boards: vec![PackedBoard(0)],
+            buckets: vec![0, 1],
+        };
+        let matrix = cross_street_transition_matrix(&a, &b);
+        let s = matrix.summary();
+        assert!(s.contains("Turn"), "summary missing from_street: {s}");
+        assert!(s.contains("River"), "summary missing to_street: {s}");
+        assert!(s.contains("2 × 2"), "summary missing dimensions: {s}");
+        assert!(s.contains("100.0%"), "summary missing percentage: {s}");
+    }
+
+    #[test]
+    fn transition_matrix_preflop_to_multi_board() {
+        // Preflop has 1 board, flop has 2 boards: tests the fan-out branch.
+        let preflop = BucketFile {
+            header: BucketFileHeader {
+                street: Street::Preflop, bucket_count: 2, board_count: 1, combos_per_board: 3, version: 2,
+            },
+            boards: vec![PackedBoard(0)],
+            buckets: vec![0, 0, 1],
+        };
+        let flop = BucketFile {
+            header: BucketFileHeader {
+                street: Street::Flop, bucket_count: 2, board_count: 2, combos_per_board: 3, version: 2,
+            },
+            boards: vec![PackedBoard(0), PackedBoard(1)],
+            // board0: combos -> [0, 1, 0], board1: combos -> [1, 0, 1]
+            buckets: vec![0, 1, 0, 1, 0, 1],
+        };
+        let matrix = cross_street_transition_matrix(&preflop, &flop);
+        assert_eq!(matrix.matrix.len(), 2);
+        // preflop bucket 0 (combos 0, 1): flop board0 -> [0,1], flop board1 -> [1,0]
+        // so bucket0 -> flop_bucket0: 2, flop_bucket1: 2
+        assert_eq!(matrix.matrix[0][0], 2);
+        assert_eq!(matrix.matrix[0][1], 2);
+        // preflop bucket 1 (combo 2): flop board0 -> [0], flop board1 -> [1]
+        assert_eq!(matrix.matrix[1][0], 1);
+        assert_eq!(matrix.matrix[1][1], 1);
+    }
+
+    #[test]
+    fn transition_matrix_empty_row_shows_zero() {
+        // One bucket has no entries, should show 0 not percentage.
+        let from = BucketFile {
+            header: BucketFileHeader {
+                street: Street::Turn, bucket_count: 2, board_count: 1, combos_per_board: 2, version: 2,
+            },
+            boards: vec![PackedBoard(0)],
+            buckets: vec![0, 0], // bucket 1 is empty
+        };
+        let to = BucketFile {
+            header: BucketFileHeader {
+                street: Street::River, bucket_count: 2, board_count: 1, combos_per_board: 2, version: 2,
+            },
+            boards: vec![PackedBoard(0)],
+            buckets: vec![0, 1],
+        };
+        let matrix = cross_street_transition_matrix(&from, &to);
+        assert_eq!(matrix.matrix[1][0], 0);
+        assert_eq!(matrix.matrix[1][1], 0);
+        let s = matrix.summary();
+        // Row 1 should show 0s, not percentages
+        assert!(s.contains("     0"), "empty row should show 0: {s}");
     }
 
     #[test]
