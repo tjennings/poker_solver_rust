@@ -461,18 +461,17 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
     use cfvnet::config::board_cards_for_street;
     use cfvnet::eval::metrics::compute_prediction_metrics;
     use cfvnet::model::dataset::CfvDataset;
-    use cfvnet::model::network::{CfvNet, input_size};
+    use cfvnet::model::network::{CfvNet, INPUT_SIZE, POT_INDEX};
 
     let cfg = load_model_config(&model_dir);
     let board_cards = board_cards_for_street(&cfg.datagen.street);
-    let in_size = input_size(board_cards);
 
     type B = NdArray;
     let device = Default::default();
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model_path = resolve_model_path(&model_dir);
 
-    let model = CfvNet::<B>::new(&device, cfg.training.hidden_layers, cfg.training.hidden_size, in_size)
+    let model = CfvNet::<B>::new(&device, cfg.training.hidden_layers, cfg.training.hidden_size, INPUT_SIZE)
         .load_file(&model_path, &recorder, &device)
         .unwrap_or_else(|e| {
             eprintln!("failed to load model from {}: {e}", model_path.display());
@@ -495,15 +494,15 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
         let item = dataset.get(i).unwrap();
 
         let input = Tensor::<B, 2>::from_data(
-            TensorData::new(item.input.clone(), [1, in_size]),
+            TensorData::new(item.input.clone(), [1, INPUT_SIZE]),
             &device,
         );
         let pred = model.forward(input);
         let pred_vec: Vec<f32> = pred.into_data().to_vec::<f32>().unwrap();
 
         let mask: Vec<bool> = item.mask.iter().map(|&v| v > 0.5).collect();
-        // Pot is at index 2*1326 + board_cards, normalized by 400.0 during encoding
-        let pot = item.input[2 * 1326 + board_cards] * 400.0;
+        // Pot is at POT_INDEX, normalized by 400.0 during encoding
+        let pot = item.input[POT_INDEX] * 400.0;
 
         let metrics = compute_prediction_metrics(&pred_vec, &item.target, &mask, pot);
         total_mae += metrics.mae;
@@ -533,21 +532,18 @@ fn cmd_compare(
     use burn::module::Module;
     use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
     use burn::tensor::{Tensor, TensorData};
-    use cfvnet::config::board_cards_for_street;
     use cfvnet::eval::compare::run_comparison;
     use cfvnet::model::dataset::encode_situation_for_inference;
-    use cfvnet::model::network::{CfvNet, input_size};
+    use cfvnet::model::network::{CfvNet, INPUT_SIZE};
 
     let cfg = load_model_config(&model_dir);
-    let board_cards = board_cards_for_street(&cfg.datagen.street);
-    let in_size = input_size(board_cards);
 
     type B = NdArray;
     let device = Default::default();
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model_path = resolve_model_path(&model_dir);
 
-    let model = CfvNet::<B>::new(&device, cfg.training.hidden_layers, cfg.training.hidden_size, in_size)
+    let model = CfvNet::<B>::new(&device, cfg.training.hidden_layers, cfg.training.hidden_size, INPUT_SIZE)
         .load_file(&model_path, &recorder, &device)
         .unwrap_or_else(|e| {
             eprintln!("failed to load model from {}: {e}", model_path.display());
@@ -566,7 +562,7 @@ fn cmd_compare(
     let summary = run_comparison(&cfg.game, &cfg.datagen, num_spots, cfg.datagen.seed, |sit, _solve_result| {
         let input_data = encode_situation_for_inference(sit, 0);
         let input = Tensor::<B, 2>::from_data(
-            TensorData::new(input_data, [1, in_size]),
+            TensorData::new(input_data, [1, INPUT_SIZE]),
             &device,
         );
         let pred = model.forward(input);

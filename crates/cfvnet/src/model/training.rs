@@ -66,7 +66,7 @@ impl PreEncoded {
 
         let items: Vec<_> = records
             .iter()
-            .map(|rec| encode_record(rec))
+            .map(encode_record)
             .collect();
 
         // Flatten into contiguous arrays.
