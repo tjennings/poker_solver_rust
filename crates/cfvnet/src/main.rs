@@ -318,7 +318,7 @@ fn cmd_generate(
 
     let total = cfg.datagen.num_samples;
     let chunk_size = per_file.unwrap_or(total);
-    let num_files = (total + chunk_size - 1) / chunk_size;
+    let num_files = total.div_ceil(chunk_size);
 
     let street = cfg.datagen.street.as_str();
     if num_files > 1 {
