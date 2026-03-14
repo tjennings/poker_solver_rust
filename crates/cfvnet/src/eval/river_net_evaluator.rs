@@ -86,6 +86,7 @@ fn build_input(
     input.extend_from_slice(ip_1326);
     let mut board_onehot = [0.0_f32; DECK_SIZE];
     for &card in board_u8 {
+        debug_assert!((card as usize) < DECK_SIZE, "card id {card} out of range");
         board_onehot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_onehot);

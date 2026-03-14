@@ -18,7 +18,6 @@ pub struct CfvItem {
 /// Dataset that loads binary training records from disk.
 pub struct CfvDataset {
     records: Vec<TrainingRecord>,
-    board_cards: usize,
 }
 
 impl CfvDataset {
@@ -26,7 +25,7 @@ impl CfvDataset {
     ///
     /// Records are self-describing (each starts with a board_size byte),
     /// so this reads until EOF.
-    pub fn from_file(path: &Path, board_cards: usize) -> Result<Self, String> {
+    pub fn from_file(path: &Path, _board_cards: usize) -> Result<Self, String> {
         let file = std::fs::File::open(path)
             .map_err(|e| format!("open dataset {}: {e}", path.display()))?;
         let mut reader = BufReader::new(file);
@@ -40,7 +39,7 @@ impl CfvDataset {
             }
         }
 
-        Ok(Self { records, board_cards })
+        Ok(Self { records })
     }
 
     /// Load records from all files in a directory.
@@ -74,7 +73,7 @@ impl CfvDataset {
             records.extend(ds.records);
         }
 
-        Ok(Self { records, board_cards })
+        Ok(Self { records })
     }
 
     /// Load from a path that may be a file or directory.
@@ -95,11 +94,6 @@ impl CfvDataset {
 
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
-    }
-
-    /// The number of board cards used for encoding.
-    pub(crate) fn board_cards(&self) -> usize {
-        self.board_cards
     }
 
     /// Access the underlying records for bulk pre-encoding.
@@ -136,6 +130,7 @@ pub fn encode_situation_for_inference(sit: &Situation, player: u8) -> Vec<f32> {
     // Board cards (52-element one-hot)
     let mut board_onehot = [0.0_f32; DECK_SIZE];
     for &card in sit.board_cards() {
+        debug_assert!((card as usize) < DECK_SIZE, "card id {card} out of range");
         board_onehot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_onehot);
@@ -159,6 +154,7 @@ pub(crate) fn encode_record(rec: &TrainingRecord) -> CfvItem {
     // Board cards (52-element one-hot)
     let mut board_onehot = [0.0_f32; DECK_SIZE];
     for &card in &rec.board {
+        debug_assert!((card as usize) < DECK_SIZE, "card id {card} out of range");
         board_onehot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_onehot);

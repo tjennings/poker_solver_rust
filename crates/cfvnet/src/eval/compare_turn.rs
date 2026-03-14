@@ -133,6 +133,7 @@ fn predict_with_model(
     input.extend_from_slice(&sit.ranges[1]);
     let mut board_onehot = [0.0_f32; DECK_SIZE];
     for &card in sit.board_cards() {
+        debug_assert!((card as usize) < DECK_SIZE, "card id {card} out of range");
         board_onehot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_onehot);
