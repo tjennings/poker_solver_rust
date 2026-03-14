@@ -364,12 +364,12 @@ fn load_or_create_model<B: AutodiffBackend>(
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(rest) = name.strip_prefix("checkpoint_epoch") {
-                if let Some(n_str) = rest.strip_suffix(".mpk.gz") {
-                    if let Ok(n) = n_str.parse::<usize>() {
-                        best_epoch = best_epoch.max(n);
-                    }
-                }
+            if let Some(n) = name
+                .strip_prefix("checkpoint_epoch")
+                .and_then(|rest| rest.strip_suffix(".mpk.gz"))
+                .and_then(|n_str| n_str.parse::<usize>().ok())
+            {
+                best_epoch = best_epoch.max(n);
             }
         }
         if best_epoch > 0 {
@@ -489,10 +489,8 @@ fn spawn_dataloader_thread(
                 }
             }
             // Send any partial final batch.
-            if !batch_buf.is_empty() {
-                if record_tx.send(batch_buf).is_err() {
-                    return;
-                }
+            if !batch_buf.is_empty() && record_tx.send(batch_buf).is_err() {
+                return;
             }
 
             // Phase 4: Prepare next epoch.
