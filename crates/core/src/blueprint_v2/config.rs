@@ -83,6 +83,10 @@ pub struct StreetClusterConfig {
     /// but ~30× more expensive for the bucketing step.
     #[serde(default)]
     pub expected_delta: bool,
+    /// Number of boards to sample for clustering. When omitted, uses the
+    /// default for each street (river: 10000, turn: 5000, flop: all canonical).
+    #[serde(default)]
+    pub sample_boards: Option<usize>,
 }
 
 /// Action abstraction: allowed bet sizes per street and raise cap.
@@ -353,12 +357,13 @@ snapshots:
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-                preflop: StreetClusterConfig { buckets: 169, delta_bins: None, expected_delta: false },
-                flop: StreetClusterConfig { buckets: 500, delta_bins: None, expected_delta: false },
-                turn: StreetClusterConfig { buckets: 500, delta_bins: None, expected_delta: false },
-                river: StreetClusterConfig { buckets: 500, delta_bins: None, expected_delta: false },
+                preflop: StreetClusterConfig { buckets: 169, delta_bins: None, expected_delta: false, sample_boards: None },
+                flop: StreetClusterConfig { buckets: 500, delta_bins: None, expected_delta: false, sample_boards: None },
+                turn: StreetClusterConfig { buckets: 500, delta_bins: None, expected_delta: false, sample_boards: None },
+                river: StreetClusterConfig { buckets: 500, delta_bins: None, expected_delta: false, sample_boards: None },
                 seed: 123,
                 kmeans_iterations: 50,
+                cfvnet_river_data: None,
             },
             action_abstraction: ActionAbstractionConfig {
                 preflop: vec![vec!["2.5bb".to_owned()], vec!["3.0x".to_owned()]],

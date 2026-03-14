@@ -8,15 +8,18 @@ game:
 
 clustering:
   algorithm: potential_aware_emd
-  # cfvnet_river_data: ./local_data/cfvnet/river/v1  # uncomment to use CFV-based river clustering
+  cfvnet_river_data: ./local_data/cfvnet/river/v1
   preflop:
     buckets: 169
   flop:
     buckets: 500
+    # sample_boards: 2000  # default
   turn:
     buckets: 500
+    sample_boards: 3000
   river:
     buckets: 500
+    # cfvnet uses all ~3.1M records (no sampling)
 
 action_abstraction:
   preflop:

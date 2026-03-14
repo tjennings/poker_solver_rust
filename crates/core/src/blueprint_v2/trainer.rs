@@ -1037,12 +1037,13 @@ mod tests {
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-                preflop: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false },
-                flop: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false },
-                turn: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false },
-                river: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false },
+                preflop: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
+                flop: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
+                turn: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
+                river: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
                 seed: 42,
                 kmeans_iterations: 50,
+                cfvnet_river_data: None,
             },
             action_abstraction: ActionAbstractionConfig {
                 preflop: vec![vec!["2.5bb".into()]],

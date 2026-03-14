@@ -900,14 +900,16 @@ mod tests {
                 -0.2, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.55, 0.75,
             ]),
             expected_delta: false,
+            sample_boards: None,
         };
         let turn_cfg = StreetClusterConfig {
             buckets: 100,
             delta_bins: Some(vec![-0.2, -0.05, 0.05, 0.15, 0.25, 0.40]),
             expected_delta: false,
+            sample_boards: None,
         };
-        let preflop_cfg = StreetClusterConfig { buckets: 169, delta_bins: None, expected_delta: false };
-        let river_cfg = StreetClusterConfig { buckets: 1000, delta_bins: None, expected_delta: false };
+        let preflop_cfg = StreetClusterConfig { buckets: 169, delta_bins: None, expected_delta: false, sample_boards: None };
+        let river_cfg = StreetClusterConfig { buckets: 1000, delta_bins: None, expected_delta: false, sample_boards: None };
 
         AllBuckets::new(
             [169, 400, 100, 1000],
@@ -1261,14 +1263,16 @@ mod tests {
                 -0.2, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.55, 0.75,
             ]),
             expected_delta: true,
+            sample_boards: None,
         };
         let turn_cfg = StreetClusterConfig {
             buckets: 100,
             delta_bins: Some(vec![-0.2, -0.05, 0.05, 0.15, 0.25, 0.40]),
             expected_delta: true,
+            sample_boards: None,
         };
-        let preflop_cfg = StreetClusterConfig { buckets: 169, delta_bins: None, expected_delta: false };
-        let river_cfg = StreetClusterConfig { buckets: 1000, delta_bins: None, expected_delta: false };
+        let preflop_cfg = StreetClusterConfig { buckets: 169, delta_bins: None, expected_delta: false, sample_boards: None };
+        let river_cfg = StreetClusterConfig { buckets: 1000, delta_bins: None, expected_delta: false, sample_boards: None };
 
         AllBuckets::new(
             [169, 400, 100, 1000],
