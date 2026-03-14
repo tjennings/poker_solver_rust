@@ -19,6 +19,7 @@ use poker_solver_core::poker::{Card, Suit, Value};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use range_solver::card::card_pair_to_index;
+use rayon::prelude::*;
 
 use super::range_gen::NUM_COMBOS;
 use super::sampler::sample_situation;
@@ -28,6 +29,31 @@ use crate::eval::river_net_evaluator::RiverNetEvaluator;
 use crate::model::network::{CfvNet, INPUT_SIZE};
 
 type B = NdArray;
+
+/// Number of situations to generate, solve, and write per chunk.
+/// Keeps peak memory bounded regardless of total `num_samples`.
+const CHUNK_SIZE: u64 = 10_000;
+
+/// Thin wrapper that marks `CfvNet<NdArray>` as `Sync` so it can be shared
+/// across rayon threads for cloning.
+///
+/// # Safety
+///
+/// `CfvNet<NdArray>` is backed by CPU `ndarray` tensors whose storage is
+/// reference-counted (`Arc`). The only operation performed through the shared
+/// reference is `Clone::clone`, which atomically increments the refcount and
+/// is inherently thread-safe. The `OnceCell` inside burn's `Param` that
+/// prevents the auto-`Sync` impl is never written to after model loading.
+struct SyncModel(CfvNet<B>);
+
+// SAFETY: see doc comment above — only `.clone()` is called through `&self`.
+unsafe impl Sync for SyncModel {}
+
+impl SyncModel {
+    fn clone_inner(&self) -> CfvNet<B> {
+        self.0.clone()
+    }
+}
 
 /// Convert a range-solver `u8` card to an `rs_poker::core::Card`.
 fn u8_to_rs_card(id: u8) -> Card {
@@ -173,7 +199,8 @@ pub fn generate_turn_training_data(
         .ok_or("river_model_path is required for turn datagen")?;
 
     let num_samples = config.datagen.num_samples;
-    let seed = config.datagen.seed;
+    let seed = crate::config::resolve_seed(config.datagen.seed);
+    let threads = config.datagen.threads;
     let solver_iterations = config.datagen.solver_iterations;
     let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
     if bet_sizes_f64.is_empty() {
@@ -193,75 +220,109 @@ pub fn generate_turn_training_data(
     .load_file(river_model_path, &recorder, &device)
     .map_err(|e| format!("failed to load river model: {e}"))?;
 
-    // Sample all situations deterministically.
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let situations: Vec<_> = (0..num_samples)
-        .map(|_| sample_situation(&config.datagen, config.game.initial_stack, 4, &mut rng))
-        .collect();
+    // Wrap in SyncModel so rayon closures can share &model across threads.
+    let model = SyncModel(model);
 
     let pb = ProgressBar::new(num_samples);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{wide_bar} {pos}/{len} [{elapsed_precise}] {msg}")
+            .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
             .expect("valid progress bar template"),
     );
 
-    // Open output file.
+    // Open output file once, write incrementally across chunks.
     let file =
         std::fs::File::create(output_path).map_err(|e| format!("create output: {e}"))?;
     let mut writer = BufWriter::new(file);
 
-    // Process situations sequentially (each solve is already parallel internally).
-    for sit in &situations {
-        if sit.effective_stack <= 0 {
-            pb.inc(1);
-            continue;
+    // Build thread pool once if multi-threaded.
+    let pool = if threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| format!("thread pool: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut remaining = num_samples;
+
+    while remaining > 0 {
+        let chunk_len = remaining.min(CHUNK_SIZE);
+        remaining -= chunk_len;
+
+        // Sample situations sequentially for determinism.
+        let situations: Vec<_> = (0..chunk_len)
+            .map(|_| sample_situation(&config.datagen, config.game.initial_stack, 4, &mut rng))
+            .collect();
+
+        // Solve chunk in parallel (or sequentially if threads == 1).
+        let solve_one =
+            |sit: &super::sampler::Situation|
+             -> Option<([f32; NUM_COMBOS], [f32; NUM_COMBOS], [u8; NUM_COMBOS], f32, f32)> {
+                if sit.effective_stack <= 0 {
+                    pb.inc(1);
+                    return None;
+                }
+
+                let eval_model = model.clone_inner();
+                let evaluator: Box<dyn LeafEvaluator> =
+                    Box::new(RiverNetEvaluator::new(eval_model, device));
+
+                let result = solve_turn_situation(
+                    sit.board_cards(),
+                    f64::from(sit.pot),
+                    f64::from(sit.effective_stack),
+                    &sit.ranges,
+                    &bet_sizes_vec,
+                    solver_iterations,
+                    evaluator,
+                );
+
+                pb.inc(1);
+                Some(result)
+            };
+
+        let results: Vec<_> = match &pool {
+            Some(pool) => pool.install(|| situations.par_iter().map(solve_one).collect()),
+            None => situations.iter().map(solve_one).collect(),
+        };
+
+        // Write results sequentially.
+        for (sit, result) in situations.iter().zip(results) {
+            if let Some((oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)) = result {
+                let board_vec = sit.board_cards().to_vec();
+
+                let oop_rec = TrainingRecord {
+                    board: board_vec.clone(),
+                    pot: sit.pot as f32,
+                    effective_stack: sit.effective_stack as f32,
+                    player: 0,
+                    game_value: oop_gv,
+                    oop_range: sit.ranges[0],
+                    ip_range: sit.ranges[1],
+                    cfvs: oop_cfvs,
+                    valid_mask,
+                };
+                write_record(&mut writer, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
+
+                let ip_rec = TrainingRecord {
+                    board: board_vec,
+                    pot: sit.pot as f32,
+                    effective_stack: sit.effective_stack as f32,
+                    player: 1,
+                    game_value: ip_gv,
+                    oop_range: sit.ranges[0],
+                    ip_range: sit.ranges[1],
+                    cfvs: ip_cfvs,
+                    valid_mask,
+                };
+                write_record(&mut writer, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
+            }
         }
-
-        // Clone model for a fresh evaluator each solve.
-        let eval_model = model.clone();
-        let evaluator: Box<dyn LeafEvaluator> =
-            Box::new(RiverNetEvaluator::new(eval_model, device));
-
-        let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv) = solve_turn_situation(
-            sit.board_cards(),
-            f64::from(sit.pot),
-            f64::from(sit.effective_stack),
-            &sit.ranges,
-            &bet_sizes_vec,
-            solver_iterations,
-            evaluator,
-        );
-
-        let board_vec = sit.board_cards().to_vec();
-
-        let oop_rec = TrainingRecord {
-            board: board_vec.clone(),
-            pot: sit.pot as f32,
-            effective_stack: sit.effective_stack as f32,
-            player: 0,
-            game_value: oop_gv,
-            oop_range: sit.ranges[0],
-            ip_range: sit.ranges[1],
-            cfvs: oop_cfvs,
-            valid_mask,
-        };
-        write_record(&mut writer, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
-
-        let ip_rec = TrainingRecord {
-            board: board_vec,
-            pot: sit.pot as f32,
-            effective_stack: sit.effective_stack as f32,
-            player: 1,
-            game_value: ip_gv,
-            oop_range: sit.ranges[0],
-            ip_range: sit.ranges[1],
-            cfvs: ip_cfvs,
-            valid_mask,
-        };
-        write_record(&mut writer, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
-
-        pb.inc(1);
     }
 
     pb.finish_with_message("done");
@@ -292,7 +353,7 @@ mod tests {
                 solver_iterations: 50,
                 target_exploitability: 0.05,
                 threads: 1,
-                seed: 42,
+                seed: Some(42),
                 ..Default::default()
             },
             training: TrainingConfig {
@@ -344,7 +405,7 @@ mod tests {
             solver_iterations: 20,
             target_exploitability: 0.05,
             threads: 1,
-            seed: 42,
+            seed: Some(42),
             ..Default::default()
         };
         let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
@@ -409,7 +470,7 @@ mod tests {
             solver_iterations: 10,
             target_exploitability: 0.05,
             threads: 1,
-            seed: 123,
+            seed: Some(123),
             ..Default::default()
         };
         let sit = sample_situation(&datagen_config, 200, 4, &mut rng);

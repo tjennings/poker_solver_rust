@@ -331,7 +331,8 @@ fn cmd_generate(
         );
     }
 
-    let base_seed = cfg.datagen.seed;
+    let base_seed = cfvnet::config::resolve_seed(cfg.datagen.seed);
+    println!("Using seed: {base_seed}");
     let mut remaining = total;
     let mut file_idx = 0u64;
     while remaining > 0 {
@@ -340,7 +341,7 @@ fn cmd_generate(
 
         cfg.datagen.num_samples = this_chunk;
         // Advance seed per file so each file gets different situations.
-        cfg.datagen.seed = base_seed.wrapping_add(file_idx * 1_000_000);
+        cfg.datagen.seed = Some(base_seed.wrapping_add(file_idx * 1_000_000));
 
         let file_output = append_random_suffix(&output);
 
@@ -399,7 +400,7 @@ fn cmd_bench_solve(config_path: PathBuf, num_samples: u64, threads: usize) {
     };
 
     let board_size = cfg.game.board_size;
-    let seed = cfg.datagen.seed;
+    let seed = cfvnet::config::resolve_seed(cfg.datagen.seed);
 
     eprintln!("Benchmarking sample+solve: {num_samples} situations, {threads} thread(s)");
 
@@ -557,7 +558,7 @@ fn cmd_compare(
 
     println!("Comparing {num_spots} spots against exact solver...");
 
-    let summary = run_comparison(&cfg.game, &cfg.datagen, num_spots, cfg.datagen.seed, |sit, _solve_result| {
+    let summary = run_comparison(&cfg.game, &cfg.datagen, num_spots, cfvnet::config::resolve_seed(cfg.datagen.seed), |sit, _solve_result| {
         let input_data = encode_situation_for_inference(sit, 0);
         let input = Tensor::<B, 2>::from_data(
             TensorData::new(input_data, [1, INPUT_SIZE]),
@@ -587,7 +588,7 @@ fn cmd_compare_net(
 
     println!("Comparing {num_spots} turn spots against CfvSubgameSolver + RiverNetEvaluator...");
 
-    let summary = run_turn_comparison_net(&cfg, &model_path, &river_path, num_spots, cfg.datagen.seed)
+    let summary = run_turn_comparison_net(&cfg, &model_path, &river_path, num_spots, cfvnet::config::resolve_seed(cfg.datagen.seed))
         .unwrap_or_else(|e| {
             eprintln!("comparison failed: {e}");
             std::process::exit(1);
@@ -604,7 +605,7 @@ fn cmd_compare_exact(model_dir: PathBuf, num_spots: usize) {
 
     println!("Comparing {num_spots} turn spots against CfvSubgameSolver + ExactRiverEvaluator...");
 
-    let summary = run_turn_comparison_exact(&cfg, &model_path, num_spots, cfg.datagen.seed).unwrap_or_else(|e| {
+    let summary = run_turn_comparison_exact(&cfg, &model_path, num_spots, cfvnet::config::resolve_seed(cfg.datagen.seed)).unwrap_or_else(|e| {
         eprintln!("comparison failed: {e}");
         std::process::exit(1);
     });
@@ -949,18 +950,18 @@ fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
     }
 
     let mut sorted: Vec<_> = summary.spots.iter().collect();
-    sorted.sort_by(|a, b| a.mbb.total_cmp(&b.mbb));
+    sorted.sort_by(|a, b| a.mae.total_cmp(&b.mae));
 
     let top_n = sorted.len().min(10);
 
-    println!("\nBest {} spots (by mBB):", top_n);
+    println!("\nBest {} spots (by MAE):", top_n);
     for (i, spot) in sorted.iter().take(top_n).enumerate() {
         println!("  {}. {}  Pot: {:<5} Stack: {:<5} MAE: {:.6}  mBB: {:.2}",
             i + 1, format_board(&spot.board, spot.board_size),
             spot.pot, spot.effective_stack, spot.mae, spot.mbb);
     }
 
-    println!("\nWorst {} spots (by mBB):", top_n);
+    println!("\nWorst {} spots (by MAE):", top_n);
     for (i, spot) in sorted.iter().rev().take(top_n).enumerate() {
         println!("  {}. {}  Pot: {:<5} Stack: {:<5} MAE: {:.6}  mBB: {:.2}",
             i + 1, format_board(&spot.board, spot.board_size),

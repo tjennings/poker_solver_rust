@@ -92,8 +92,8 @@ pub struct DatagenConfig {
     pub target_exploitability: f32,
     #[serde(default = "default_threads")]
     pub threads: usize,
-    #[serde(default = "default_seed")]
-    pub seed: u64,
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 impl Default for DatagenConfig {
@@ -106,7 +106,7 @@ impl Default for DatagenConfig {
             solver_iterations: 1000,
             target_exploitability: 0.005,
             threads: 8,
-            seed: 42,
+            seed: Some(42),
         }
     }
 }
@@ -128,8 +128,9 @@ fn default_threads() -> usize {
         .map(usize::from)
         .unwrap_or(8)
 }
-fn default_seed() -> u64 {
-    42
+/// Resolve seed: use provided value or generate a random one.
+pub fn resolve_seed(seed: Option<u64>) -> u64 {
+    seed.unwrap_or_else(|| rand::random())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,7 +252,7 @@ datagen:
         assert_eq!(config.game.bet_sizes.len(), 4);
         assert_eq!(config.datagen.num_samples, 1000);
         // Check defaults filled in
-        assert_eq!(config.datagen.seed, 42);
+        assert_eq!(config.datagen.seed, None);
         assert_eq!(config.training.hidden_layers, 7);
         assert_eq!(config.training.batch_size, 2048);
     }

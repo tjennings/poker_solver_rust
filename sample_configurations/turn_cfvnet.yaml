@@ -1,31 +1,33 @@
-# River CFVnet training configuration
-# Based on Supremus (Zarick et al. 2020)
+# Turn CFVnet training configuration
+# Uses trained river model as leaf evaluator
 #
 # Datagen:
 #   cargo run -p cfvnet --release -- generate \
-#     -c sample_configurations/river_cfvnet.yaml \
-#     -o data/river/river.bin \
+#     -c sample_configurations/turn_cfvnet.yaml \
+#     -o data/turn/turn.bin \
 #     --per-file 1000000
 #
 # Training (CUDA):
 #   cargo run -p cfvnet --release --features cuda -- train \
-#     -c sample_configurations/river_cfvnet.yaml \
-#     -d data/river/ -o models/river_v1 --backend cuda
+#     -c sample_configurations/turn_cfvnet.yaml \
+#     -d data/turn/ -o models/turn_v1 --backend cuda
 
 game:
   initial_stack: 200 # 100bb in SB units
   bet_sizes: ["25%", "50%", "100%", "a"]
+  board_size: 4
   add_allin_threshold: 1.5
   force_allin_threshold: 0.15
+  river_model_path: "local_data/models/river_v7/checkpoint_epoch340"
 
 datagen:
-  num_samples: 10000000
+  street: "turn"
+  num_samples: 5000000
   pot_intervals: [[4, 50], [50, 100], [100, 150], [150, 200]]
   spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0], [4.0, 8.0], [8.0, 50.0]]
   solver_iterations: 5000
   target_exploitability: 0.005
   threads: 8
-  seed: 42
 
 training:
   hidden_layers: 7

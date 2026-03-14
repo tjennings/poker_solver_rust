@@ -20,7 +20,7 @@ fn full_pipeline_smoke_test() {
             solver_iterations: 100,
             target_exploitability: 0.05,
             threads: 1,
-            seed: 42,
+            seed: Some(42),
             ..Default::default()
         },
         training: Default::default(),

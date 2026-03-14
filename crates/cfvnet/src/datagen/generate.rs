@@ -30,7 +30,7 @@ const CHUNK_SIZE: u64 = 10_000;
 /// a positive stack. The progress bar tracks solve completions (including skips).
 pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Result<(), String> {
     let num_samples = config.datagen.num_samples;
-    let seed = config.datagen.seed;
+    let seed = crate::config::resolve_seed(config.datagen.seed);
     let threads = config.datagen.threads;
 
     let bet_str = config.game.bet_sizes.join(",");
@@ -201,7 +201,7 @@ mod tests {
                 solver_iterations: 100,
                 target_exploitability: 0.05,
                 threads: 1,
-                seed,
+                seed: Some(seed),
                 ..Default::default()
             },
             training: TrainingConfig::default(),

@@ -174,7 +174,7 @@ mod tests {
             solver_iterations: 100,
             target_exploitability: 0.01,
             threads: 1,
-            seed: 42,
+            seed: Some(42),
         }
     }
 

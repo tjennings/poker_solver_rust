@@ -476,7 +476,7 @@ mod tests {
                 solver_iterations: 20,
                 target_exploitability: 0.05,
                 threads: 1,
-                seed: 42,
+                seed: Some(42),
                 ..Default::default()
             },
             training: TrainingConfig {
