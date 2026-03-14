@@ -1,0 +1,20 @@
+[package]
+name = "poker-solver-gpu"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+cuda = ["cudarc"]
+
+[dependencies]
+cudarc = { version = "0.16", features = ["std", "driver", "nvrtc"], optional = true }
+poker-solver-core = { path = "../core" }
+range-solver = { path = "../range-solver" }
+rs_poker = { workspace = true }
+thiserror = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+approx = "0.5"
+tempfile = "3"
