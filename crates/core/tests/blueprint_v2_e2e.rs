@@ -122,6 +122,7 @@ fn blueprint_v2_e2e_pipeline() {
         .expect("save flop");
 
     let preflop = cluster_pipeline::cluster_preflop_with_boards(
+        &flop,
         config.clustering.preflop.buckets,
         k,
         seed,
