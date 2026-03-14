@@ -11,8 +11,11 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
+use crate::poker::Card;
+
 use super::bucket_file::BucketFile;
 use super::cluster_pipeline::{build_deck, compute_board_equities, enumerate_combos, sample_boards};
+use super::Street;
 
 /// Size distribution statistics for bucket assignments.
 #[derive(Debug)]
@@ -397,6 +400,196 @@ pub fn cross_street_transition_matrix(
     }
 }
 
+/// A pair of buckets and their inter-centroid EMD.
+#[derive(Debug, Clone)]
+pub struct CentroidPairEmd {
+    pub bucket_a: u16,
+    pub bucket_b: u16,
+    pub emd: f64,
+}
+
+/// Report on inter-centroid EMD distances.
+#[derive(Debug)]
+pub struct CentroidEmdReport {
+    pub num_buckets: usize,
+    pub pairwise_emd: Vec<CentroidPairEmd>,
+    pub min_emd: f64,
+    pub max_emd: f64,
+    pub mean_emd: f64,
+}
+
+impl CentroidEmdReport {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        use std::fmt::Write;
+        let mut s = format!(
+            "Centroid EMD: {} buckets, {} pairs\n  min={:.4}, max={:.4}, mean={:.4}\n  Closest pairs:",
+            self.num_buckets, self.pairwise_emd.len(), self.min_emd, self.max_emd, self.mean_emd,
+        );
+        let mut sorted: Vec<_> = self.pairwise_emd.iter().collect();
+        sorted.sort_by(|a, b| a.emd.partial_cmp(&b.emd).unwrap_or(std::cmp::Ordering::Equal));
+        for pair in sorted.iter().take(5) {
+            let _ = write!(s, "\n    bucket {} <-> {}: EMD={:.4}", pair.bucket_a, pair.bucket_b, pair.emd);
+        }
+        s
+    }
+}
+
+/// Compute pairwise EMD between reconstructed centroids.
+///
+/// Reconstructs centroids by averaging feature vectors within each bucket,
+/// then computes EMD between all pairs.
+#[must_use]
+pub fn centroid_emd_report(
+    features: &[Vec<f64>],
+    assignments: &[u16],
+    k: usize,
+) -> CentroidEmdReport {
+    use super::clustering::emd;
+
+    let dim = features.first().map_or(0, Vec::len);
+    let mut centroids = vec![vec![0.0_f64; dim]; k];
+    let mut counts = vec![0_usize; k];
+
+    for (i, feat) in features.iter().enumerate() {
+        let ci = assignments[i] as usize;
+        if ci < k {
+            counts[ci] += 1;
+            for (j, &val) in feat.iter().enumerate() {
+                centroids[ci][j] += val;
+            }
+        }
+    }
+
+    for ci in 0..k {
+        if counts[ci] > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let inv = 1.0 / counts[ci] as f64;
+            for v in &mut centroids[ci] {
+                *v *= inv;
+            }
+        }
+    }
+
+    let mut pairwise = Vec::new();
+    for i in 0..k {
+        for j in (i + 1)..k {
+            let d = emd(&centroids[i], &centroids[j]);
+            #[allow(clippy::cast_possible_truncation)]
+            pairwise.push(CentroidPairEmd {
+                bucket_a: i as u16,
+                bucket_b: j as u16,
+                emd: d,
+            });
+        }
+    }
+
+    let min = pairwise.iter().map(|p| p.emd).fold(f64::INFINITY, f64::min);
+    let max = pairwise.iter().map(|p| p.emd).fold(0.0_f64, f64::max);
+    #[allow(clippy::cast_precision_loss)]
+    let mean = if pairwise.is_empty() {
+        0.0
+    } else {
+        pairwise.iter().map(|p| p.emd).sum::<f64>() / pairwise.len() as f64
+    };
+
+    CentroidEmdReport {
+        num_buckets: k,
+        pairwise_emd: pairwise,
+        min_emd: if min.is_infinite() { 0.0 } else { min },
+        max_emd: max,
+        mean_emd: mean,
+    }
+}
+
+/// A sample hand from a specific bucket.
+#[derive(Debug, Clone)]
+pub struct BucketHandSample {
+    pub bucket: u16,
+    pub board_idx: u32,
+    pub combo_idx: u16,
+    pub board_cards: Vec<Card>,
+    pub hole_cards: [Card; 2],
+}
+
+impl BucketHandSample {
+    #[must_use]
+    pub fn display(&self) -> String {
+        let board_str: Vec<String> = self.board_cards.iter().map(|c| format!("{c}")).collect();
+        format!(
+            "  [{} {}] on [{}]",
+            self.hole_cards[0], self.hole_cards[1], board_str.join(" "),
+        )
+    }
+}
+
+/// Sample up to `max_samples` hands from a specific bucket.
+///
+/// Scans the bucket file for entries matching `target_bucket`, collects
+/// them, and returns a random subset (seeded for reproducibility).
+#[must_use]
+pub fn sample_hands_for_bucket(
+    bf: &BucketFile,
+    target_bucket: u16,
+    max_samples: usize,
+    seed: u64,
+) -> Vec<BucketHandSample> {
+    use rand::prelude::*;
+    use rand::rngs::StdRng;
+
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let board_count = bf.header.board_count;
+    let combos_per_board = bf.header.combos_per_board as usize;
+
+    let mut candidates: Vec<(u32, u16)> = Vec::new();
+    for board_idx in 0..board_count {
+        for combo_idx in 0..combos_per_board {
+            #[allow(clippy::cast_possible_truncation)]
+            let bucket = bf.get_bucket(board_idx, combo_idx as u16);
+            if bucket == target_bucket {
+                #[allow(clippy::cast_possible_truncation)]
+                candidates.push((board_idx, combo_idx as u16));
+            }
+        }
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    candidates.shuffle(&mut rng);
+    candidates.truncate(max_samples);
+
+    candidates
+        .into_iter()
+        .map(|(board_idx, combo_idx)| {
+            let board_cards = if (board_idx as usize) < bf.boards.len() {
+                let num_cards = match bf.header.street {
+                    Street::Preflop => 0,
+                    Street::Flop => 3,
+                    Street::Turn => 4,
+                    Street::River => 5,
+                };
+                bf.boards[board_idx as usize].to_cards(num_cards)
+            } else {
+                Vec::new()
+            };
+
+            let hole_cards = if (combo_idx as usize) < combos.len() {
+                combos[combo_idx as usize]
+            } else {
+                [deck[0], deck[1]]
+            };
+
+            BucketHandSample {
+                bucket: target_bucket,
+                board_idx,
+                combo_idx,
+                board_cards,
+                hole_cards,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +765,91 @@ mod tests {
         let reports = diagnose_cluster_dir(dir.path()).unwrap();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].bucket_count, 3);
+    }
+
+    #[test]
+    fn centroid_emd_matrix_basic() {
+        let features = vec![
+            vec![0.9, 0.1, 0.0],
+            vec![0.8, 0.2, 0.0],
+            vec![0.0, 0.9, 0.1],
+            vec![0.0, 0.8, 0.2],
+            vec![0.0, 0.1, 0.9],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let assignments: Vec<u16> = vec![0, 0, 1, 1, 2, 2];
+        let report = centroid_emd_report(&features, &assignments, 3);
+        assert_eq!(report.num_buckets, 3);
+        assert_eq!(report.pairwise_emd.len(), 3);
+        for pair in &report.pairwise_emd {
+            assert!(pair.emd > 0.0, "EMD should be positive: {:?}", pair);
+        }
+        assert!(report.min_emd > 0.0);
+        assert!(report.max_emd > report.min_emd);
+    }
+
+    #[test]
+    fn centroid_emd_single_bucket() {
+        let features = vec![vec![0.5, 0.5], vec![0.6, 0.4]];
+        let assignments: Vec<u16> = vec![0, 0];
+        let report = centroid_emd_report(&features, &assignments, 1);
+        assert_eq!(report.num_buckets, 1);
+        assert!(report.pairwise_emd.is_empty());
+        assert_eq!(report.min_emd, 0.0);
+        assert_eq!(report.max_emd, 0.0);
+        assert_eq!(report.mean_emd, 0.0);
+    }
+
+    #[test]
+    fn centroid_emd_empty_features() {
+        let features: Vec<Vec<f64>> = vec![];
+        let assignments: Vec<u16> = vec![];
+        let report = centroid_emd_report(&features, &assignments, 2);
+        assert_eq!(report.num_buckets, 2);
+        // Still produces pairs but EMD between zero-vectors is 0
+        assert_eq!(report.pairwise_emd.len(), 1);
+    }
+
+    #[test]
+    fn centroid_emd_summary_format() {
+        let features = vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+        ];
+        let assignments: Vec<u16> = vec![0, 1];
+        let report = centroid_emd_report(&features, &assignments, 2);
+        let s = report.summary();
+        assert!(s.contains("2 buckets"), "summary missing bucket count: {s}");
+        assert!(s.contains("1 pairs"), "summary missing pair count: {s}");
+        assert!(s.contains("Closest pairs:"), "summary missing header: {s}");
+        assert!(s.contains("bucket 0 <-> 1"), "summary missing pair: {s}");
+    }
+
+    #[test]
+    fn sample_hands_for_bucket_basic() {
+        let deck = build_deck();
+
+        let mut buckets = vec![1_u16; 1326];
+        for i in 0..10 {
+            buckets[i] = 0;
+        }
+        let board_cards = [deck[10], deck[20], deck[30], deck[40], deck[50]];
+        let bf = BucketFile {
+            header: BucketFileHeader {
+                street: Street::River,
+                bucket_count: 2,
+                board_count: 1,
+                combos_per_board: 1326,
+                version: 2,
+            },
+            boards: vec![PackedBoard::from_cards(&board_cards)],
+            buckets,
+        };
+
+        let samples = sample_hands_for_bucket(&bf, 0, 5, 42);
+        assert_eq!(samples.len(), 5);
+        for sample in &samples {
+            assert_eq!(sample.bucket, 0);
+        }
     }
 }
