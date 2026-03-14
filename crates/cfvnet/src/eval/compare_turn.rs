@@ -25,7 +25,7 @@ use crate::datagen::sampler::{sample_situation, Situation};
 use crate::eval::compare::{ComparisonSummary, SpotResult};
 use crate::eval::metrics::compute_prediction_metrics;
 use crate::eval::river_net_evaluator::RiverNetEvaluator;
-use crate::model::network::{CfvNet, DECK_SIZE, INPUT_SIZE};
+use crate::model::network::{CfvNet, DECK_SIZE, INPUT_SIZE, NUM_RANKS};
 
 use std::path::Path;
 
@@ -137,6 +137,12 @@ fn predict_with_model(
         board_onehot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_onehot);
+    let mut rank_presence = [0.0_f32; NUM_RANKS];
+    for &card in sit.board_cards() {
+        debug_assert!((card as usize) < DECK_SIZE, "card id {card} out of range");
+        rank_presence[(card / 4) as usize] = 1.0;
+    }
+    input.extend_from_slice(&rank_presence);
     input.push(sit.pot as f32 / 400.0);
     input.push(sit.effective_stack as f32 / 400.0);
     input.push(f32::from(traverser));

@@ -7,7 +7,7 @@ use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
 use poker_solver_core::poker::{Card, Suit};
 use range_solver::card::card_pair_to_index;
 
-use crate::model::network::{CfvNet, DECK_SIZE, INPUT_SIZE, OUTPUT_SIZE};
+use crate::model::network::{CfvNet, DECK_SIZE, INPUT_SIZE, NUM_RANKS, OUTPUT_SIZE};
 
 /// Convert an `rs_poker::core::Card` to a range-solver `u8` card.
 ///
@@ -66,13 +66,14 @@ impl<B: Backend> RiverNetEvaluator<B> {
 
 /// Build the input vector for a single river board evaluation.
 ///
-/// Layout (2707 floats):
+/// Layout (2720 floats):
 ///   [0..1326)      — OOP range (1326 combo probabilities)
 ///   [1326..2652)   — IP range (1326 combo probabilities)
 ///   [2652..2704)   — board one-hot (52 elements)
-///   [2704]         — pot / 400.0
-///   [2705]         — effective_stack / 400.0
-///   [2706]         — player indicator (0.0=OOP, 1.0=IP)
+///   [2704..2717)   — rank presence (13 elements)
+///   [2717]         — pot / 400.0
+///   [2718]         — effective_stack / 400.0
+///   [2719]         — player indicator (0.0=OOP, 1.0=IP)
 fn build_input(
     oop_1326: &[f32; OUTPUT_SIZE],
     ip_1326: &[f32; OUTPUT_SIZE],
@@ -90,6 +91,12 @@ fn build_input(
         board_onehot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_onehot);
+    let mut rank_presence = [0.0_f32; NUM_RANKS];
+    for &card in board_u8 {
+        debug_assert!((card as usize) < DECK_SIZE, "card id {card} out of range");
+        rank_presence[(card / 4) as usize] = 1.0;
+    }
+    input.extend_from_slice(&rank_presence);
     input.push(pot as f32 / 400.0);
     input.push(effective_stack as f32 / 400.0);
     input.push(if traverser == 0 { 0.0 } else { 1.0 });

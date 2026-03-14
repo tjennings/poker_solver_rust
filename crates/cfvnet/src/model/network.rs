@@ -12,14 +12,16 @@ pub const NUM_COMBOS: usize = 1326;
 pub const OUTPUT_SIZE: usize = NUM_COMBOS;
 /// Number of cards in a standard deck.
 pub const DECK_SIZE: usize = 52;
+/// Number of distinct ranks (2..A).
+pub const NUM_RANKS: usize = 13;
 
 /// Fixed input feature size for all streets.
 ///
-/// Layout: OOP range (1326) + IP range (1326) + board one-hot (52) + pot + stack + player indicator.
-pub const INPUT_SIZE: usize = NUM_COMBOS + NUM_COMBOS + DECK_SIZE + 1 + 1 + 1; // 2707
+/// Layout: OOP range (1326) + IP range (1326) + board one-hot (52) + rank presence (13) + pot + stack + player indicator.
+pub const INPUT_SIZE: usize = NUM_COMBOS + NUM_COMBOS + DECK_SIZE + NUM_RANKS + 1 + 1 + 1; // 2720
 
 /// Index of the pot feature in the input vector.
-pub const POT_INDEX: usize = NUM_COMBOS + NUM_COMBOS + DECK_SIZE; // 2704
+pub const POT_INDEX: usize = NUM_COMBOS + NUM_COMBOS + DECK_SIZE + NUM_RANKS; // 2717
 
 /// A single hidden block: Linear -> BatchNorm -> PReLU.
 #[derive(Module, Debug)]
@@ -95,13 +97,13 @@ mod tests {
     type TestBackend = NdArray;
 
     #[test]
-    fn input_size_is_2707() {
-        assert_eq!(INPUT_SIZE, 2707);
+    fn input_size_is_2720() {
+        assert_eq!(INPUT_SIZE, 2720);
     }
 
     #[test]
-    fn pot_index_is_2704() {
-        assert_eq!(POT_INDEX, 2704);
+    fn pot_index_is_2717() {
+        assert_eq!(POT_INDEX, 2717);
     }
 
     #[test]

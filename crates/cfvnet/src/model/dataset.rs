@@ -3,12 +3,12 @@ use std::path::Path;
 
 use crate::datagen::sampler::Situation;
 use crate::datagen::storage::{read_record, TrainingRecord};
-use crate::model::network::{DECK_SIZE, INPUT_SIZE};
+use crate::model::network::{DECK_SIZE, INPUT_SIZE, NUM_RANKS};
 
 /// A single training item with encoded input, target CFVs, mask, range, and game value.
 #[derive(Debug, Clone)]
 pub struct CfvItem {
-    pub input: Vec<f32>,      // length INPUT_SIZE (2707)
+    pub input: Vec<f32>,      // length INPUT_SIZE (2720)
     pub target: Vec<f32>,     // length OUTPUT_SIZE (1326) — target CFVs
     pub mask: Vec<f32>,       // length OUTPUT_SIZE — 1.0 valid, 0.0 masked
     pub range: Vec<f32>,      // length OUTPUT_SIZE — player's range for aux loss
@@ -134,6 +134,13 @@ pub fn encode_situation_for_inference(sit: &Situation, player: u8) -> Vec<f32> {
         board_onehot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_onehot);
+    // Rank presence (13-element binary vector)
+    let mut rank_presence = [0.0_f32; NUM_RANKS];
+    for &card in sit.board_cards() {
+        debug_assert!((card as usize) < DECK_SIZE, "card id {card} out of range");
+        rank_presence[(card / 4) as usize] = 1.0;
+    }
+    input.extend_from_slice(&rank_presence);
     // Pot (normalized by max pot)
     input.push(sit.pot as f32 / 400.0);
     // Effective stack (normalized by max stack)
@@ -158,6 +165,13 @@ pub(crate) fn encode_record(rec: &TrainingRecord) -> CfvItem {
         board_onehot[card as usize] = 1.0;
     }
     input.extend_from_slice(&board_onehot);
+    // Rank presence (13-element binary vector)
+    let mut rank_presence = [0.0_f32; NUM_RANKS];
+    for &card in &rec.board {
+        debug_assert!((card as usize) < DECK_SIZE, "card id {card} out of range");
+        rank_presence[(card / 4) as usize] = 1.0;
+    }
+    input.extend_from_slice(&rank_presence);
     // Pot (normalized by max pot)
     input.push(rec.pot / 400.0);
     // Effective stack (normalized by max stack)
@@ -271,7 +285,17 @@ mod tests {
         assert!((item.input[2652 + 16] - 1.0).abs() < 1e-6, "card 16 one-hot");
         // A non-board card should be 0.0
         assert!((item.input[2652 + 1]).abs() < 1e-6, "non-board card should be 0");
-        // Pot at POT_INDEX = 2704: 100 / 400 = 0.25
+        // Rank presence vector starts at 2652 + 52 = 2704
+        // Board cards are 0, 4, 8, 12, 16 → ranks 0/4=0, 4/4=1, 8/4=2, 12/4=3, 16/4=4
+        let rp_start = 2652 + 52; // 2704
+        assert!((item.input[rp_start] - 1.0).abs() < 1e-6, "rank 0 present");
+        assert!((item.input[rp_start + 1] - 1.0).abs() < 1e-6, "rank 1 present");
+        assert!((item.input[rp_start + 2] - 1.0).abs() < 1e-6, "rank 2 present");
+        assert!((item.input[rp_start + 3] - 1.0).abs() < 1e-6, "rank 3 present");
+        assert!((item.input[rp_start + 4] - 1.0).abs() < 1e-6, "rank 4 present");
+        assert!((item.input[rp_start + 5]).abs() < 1e-6, "rank 5 absent");
+        assert!((item.input[rp_start + 12]).abs() < 1e-6, "rank 12 absent");
+        // Pot at POT_INDEX = 2717: 100 / 400 = 0.25
         assert!((item.input[POT_INDEX] - 0.25).abs() < 1e-6);
         // Stack at POT_INDEX + 1: 50 / 400 = 0.125
         assert!((item.input[POT_INDEX + 1] - 0.125).abs() < 1e-6);
@@ -290,7 +314,7 @@ mod tests {
         let dataset = CfvDataset::from_file(file.path(), 4).unwrap();
         let item = dataset.get(0).unwrap();
 
-        // Input size is always INPUT_SIZE (2707)
+        // Input size is always INPUT_SIZE (2720)
         assert_eq!(item.input.len(), INPUT_SIZE);
         // Board one-hot: all 5 board cards are encoded (entire rec.board).
         assert!((item.input[2652] - 1.0).abs() < 1e-6, "card 0 one-hot");
@@ -298,7 +322,7 @@ mod tests {
         assert!((item.input[2652 + 8] - 1.0).abs() < 1e-6, "card 8 one-hot");
         assert!((item.input[2652 + 12] - 1.0).abs() < 1e-6, "card 12 one-hot");
         assert!((item.input[2652 + 16] - 1.0).abs() < 1e-6, "card 16 one-hot");
-        // Pot at POT_INDEX = 2704
+        // Pot at POT_INDEX = 2717
         assert!((item.input[POT_INDEX] - 0.25).abs() < 1e-6);
     }
 
