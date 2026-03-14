@@ -25,7 +25,7 @@ use super::sampler::sample_situation;
 use super::storage::{write_record, TrainingRecord};
 use crate::config::CfvnetConfig;
 use crate::eval::river_net_evaluator::RiverNetEvaluator;
-use crate::model::network::{CfvNet, input_size};
+use crate::model::network::{CfvNet, INPUT_SIZE};
 
 type B = NdArray;
 
@@ -183,13 +183,12 @@ pub fn generate_turn_training_data(
 
     // Load river model.
     let device = <B as burn::tensor::backend::Backend>::Device::default();
-    let in_size = input_size(5); // River model takes 5-card boards.
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model = CfvNet::<B>::new(
         &device,
         config.training.hidden_layers,
         config.training.hidden_size,
-        in_size,
+        INPUT_SIZE,
     )
     .load_file(river_model_path, &recorder, &device)
     .map_err(|e| format!("failed to load river model: {e}"))?;
@@ -334,8 +333,7 @@ mod tests {
     fn solve_single_turn_situation() {
         // Use a tiny untrained model as the river evaluator.
         let device = <B as burn::tensor::backend::Backend>::Device::default();
-        let in_size = input_size(5);
-        let model = CfvNet::<B>::new(&device, 1, 8, in_size);
+        let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
         let evaluator: Box<dyn LeafEvaluator> =
             Box::new(RiverNetEvaluator::new(model, device));
 
@@ -400,8 +398,7 @@ mod tests {
     fn solve_writes_4_card_board_records() {
         // Directly test the record writing path without needing a model file.
         let device = <B as burn::tensor::backend::Backend>::Device::default();
-        let in_size = input_size(5);
-        let model = CfvNet::<B>::new(&device, 1, 8, in_size);
+        let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
         let evaluator: Box<dyn LeafEvaluator> =
             Box::new(RiverNetEvaluator::new(model, device));
 

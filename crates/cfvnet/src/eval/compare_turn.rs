@@ -25,7 +25,7 @@ use crate::datagen::sampler::{sample_situation, Situation};
 use crate::eval::compare::{ComparisonSummary, SpotResult};
 use crate::eval::metrics::compute_prediction_metrics;
 use crate::eval::river_net_evaluator::RiverNetEvaluator;
-use crate::model::network::{CfvNet, input_size};
+use crate::model::network::{CfvNet, DECK_SIZE, INPUT_SIZE};
 
 use std::path::Path;
 
@@ -128,19 +128,20 @@ fn predict_with_model(
     sit: &Situation,
     traverser: u8,
 ) -> Vec<f32> {
-    let in_size = input_size(4);
-    let mut input = Vec::with_capacity(in_size);
+    let mut input = Vec::with_capacity(INPUT_SIZE);
     input.extend_from_slice(&sit.ranges[0]);
     input.extend_from_slice(&sit.ranges[1]);
+    let mut board_onehot = [0.0_f32; DECK_SIZE];
     for &card in sit.board_cards() {
-        input.push(f32::from(card) / 51.0);
+        board_onehot[card as usize] = 1.0;
     }
+    input.extend_from_slice(&board_onehot);
     input.push(sit.pot as f32 / 400.0);
     input.push(sit.effective_stack as f32 / 400.0);
     input.push(f32::from(traverser));
-    debug_assert_eq!(input.len(), in_size);
+    debug_assert_eq!(input.len(), INPUT_SIZE);
 
-    let data = TensorData::new(input, [1, in_size]);
+    let data = TensorData::new(input, [1, INPUT_SIZE]);
     let input_tensor = Tensor::<B, 2>::from_data(data, device);
     let output = model.forward(input_tensor);
     output.into_data().to_vec::<f32>().expect("output tensor conversion")
@@ -220,22 +221,20 @@ pub fn run_turn_comparison_net(
     let device = <B as burn::tensor::backend::Backend>::Device::default();
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
 
-    let turn_in_size = input_size(4);
     let turn_model = CfvNet::<B>::new(
         &device,
         config.training.hidden_layers,
         config.training.hidden_size,
-        turn_in_size,
+        INPUT_SIZE,
     )
     .load_file(turn_model_path, &recorder, &device)
     .map_err(|e| format!("failed to load turn model: {e}"))?;
 
-    let river_in_size = input_size(5);
     let river_model = CfvNet::<B>::new(
         &device,
         config.training.hidden_layers,
         config.training.hidden_size,
-        river_in_size,
+        INPUT_SIZE,
     )
     .load_file(river_model_path, &recorder, &device)
     .map_err(|e| format!("failed to load river model: {e}"))?;
@@ -300,12 +299,11 @@ pub fn run_turn_comparison_exact(
     let device = <B as burn::tensor::backend::Backend>::Device::default();
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
 
-    let turn_in_size = input_size(4);
     let turn_model = CfvNet::<B>::new(
         &device,
         config.training.hidden_layers,
         config.training.hidden_size,
-        turn_in_size,
+        INPUT_SIZE,
     )
     .load_file(turn_model_path, &recorder, &device)
     .map_err(|e| format!("failed to load turn model: {e}"))?;
@@ -488,11 +486,9 @@ mod tests {
         let config = test_config();
         let device = <B as burn::tensor::backend::Backend>::Device::default();
 
-        let turn_in_size = input_size(4);
-        let turn_model = CfvNet::<B>::new(&device, 1, 8, turn_in_size);
+        let turn_model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
 
-        let river_in_size = input_size(5);
-        let river_model = CfvNet::<B>::new(&device, 1, 8, river_in_size);
+        let river_model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
 
         let summary =
             run_turn_comparison_net_with_models(&config, &turn_model, &river_model, 1, 42)
@@ -516,8 +512,7 @@ mod tests {
         config.datagen.solver_iterations = 5;
         let device = <B as burn::tensor::backend::Backend>::Device::default();
 
-        let turn_in_size = input_size(4);
-        let turn_model = CfvNet::<B>::new(&device, 1, 8, turn_in_size);
+        let turn_model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
 
         let summary =
             run_turn_comparison_exact_with_model(&config, &turn_model, 1, 42, 2).unwrap();
@@ -534,11 +529,9 @@ mod tests {
         let device = <B as burn::tensor::backend::Backend>::Device::default();
         let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
 
-        let turn_in_size = input_size(4);
-        let turn_model = CfvNet::<B>::new(&device, 1, 8, turn_in_size);
+        let turn_model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
 
-        let river_in_size = input_size(5);
-        let river_model = CfvNet::<B>::new(&device, 1, 8, river_in_size);
+        let river_model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
 
         // Save to temp dirs and reload via the file-based API.
         let turn_dir = tempfile::tempdir().unwrap();
@@ -572,14 +565,13 @@ mod tests {
         let device = <B as burn::tensor::backend::Backend>::Device::default();
         let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
 
-        let turn_in_size = input_size(4);
-        let turn_model = CfvNet::<B>::new(&device, 1, 8, turn_in_size);
+        let turn_model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
 
         let turn_dir = tempfile::tempdir().unwrap();
         let turn_path = turn_dir.path().join("model");
         turn_model.save_file(&turn_path, &recorder).unwrap();
 
-        let loaded = CfvNet::<B>::new(&device, 1, 8, turn_in_size)
+        let loaded = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE)
             .load_file(&turn_path, &recorder, &device)
             .unwrap();
 
