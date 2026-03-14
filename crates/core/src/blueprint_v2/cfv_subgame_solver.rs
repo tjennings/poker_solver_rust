@@ -245,6 +245,8 @@ impl CfvSubgameSolver {
     fn propagate_ranges(
         &self,
         snapshot: &[f64],
+        reach_init: &[f64],
+        reach_pool: &mut [f64],
     ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
         let n = self.hands.combos.len();
         let num_boundaries = self.boundary_info.boundaries.len();
@@ -252,16 +254,14 @@ impl CfvSubgameSolver {
         let mut oop_ranges = vec![vec![0.0; n]; num_boundaries];
         let mut ip_ranges = vec![vec![0.0; n]; num_boundaries];
 
-        let oop_reach = vec![1.0; n];
-        let ip_reach = vec![1.0; n];
-
         self.propagate_ranges_recursive(
             snapshot,
             self.tree.root as usize,
-            &oop_reach,
-            &ip_reach,
+            reach_init,
+            reach_init,
             &mut oop_ranges,
             &mut ip_ranges,
+            reach_pool,
         );
 
         (oop_ranges, ip_ranges)
@@ -273,6 +273,10 @@ impl CfvSubgameSolver {
     /// combos simultaneously. At decision nodes, the acting player's
     /// reach vector is multiplied element-wise by strategy probabilities
     /// for each action before recursing into children.
+    ///
+    /// Uses a pre-allocated flat `reach_pool` buffer. The current depth
+    /// level occupies `reach_pool[0..n]`; deeper levels use the remainder
+    /// via `split_at_mut`, avoiding all heap allocations in the hot loop.
     #[allow(clippy::too_many_arguments)]
     fn propagate_ranges_recursive(
         &self,
@@ -282,73 +286,101 @@ impl CfvSubgameSolver {
         ip_reach: &[f64],
         oop_ranges: &mut [Vec<f64>],
         ip_ranges: &mut [Vec<f64>],
+        reach_pool: &mut [f64],
     ) {
         let n = oop_reach.len();
 
-        match &self.tree.nodes[node_idx] {
+        // Extract node info into locals to avoid holding borrow on self.tree.
+        enum PropNodeInfo {
+            Terminal { is_boundary: bool, ordinal: usize },
+            Chance { child: u32 },
+            Decision { player: u8, num_actions: usize, children_buf: [u32; 16] },
+        }
+
+        let info = match &self.tree.nodes[node_idx] {
             GameNode::Terminal { kind, .. } => {
-                if *kind == TerminalKind::DepthBoundary {
-                    let ordinal = self.node_to_boundary[node_idx];
-                    if ordinal != usize::MAX {
-                        for i in 0..n {
-                            oop_ranges[ordinal][i] += oop_reach[i];
-                            ip_ranges[ordinal][i] += ip_reach[i];
-                        }
+                let is_boundary = *kind == TerminalKind::DepthBoundary;
+                let ordinal = if is_boundary {
+                    self.node_to_boundary[node_idx]
+                } else {
+                    usize::MAX
+                };
+                PropNodeInfo::Terminal { is_boundary, ordinal }
+            }
+            GameNode::Chance { child, .. } => PropNodeInfo::Chance { child: *child },
+            GameNode::Decision { player, actions, children, .. } => {
+                let num_actions = actions.len();
+                let mut children_buf = [0u32; 16];
+                debug_assert!(num_actions <= 16);
+                children_buf[..num_actions].copy_from_slice(&children[..num_actions]);
+                PropNodeInfo::Decision { player: *player, num_actions, children_buf }
+            }
+        };
+
+        match info {
+            PropNodeInfo::Terminal { is_boundary, ordinal } => {
+                if is_boundary && ordinal != usize::MAX {
+                    for i in 0..n {
+                        oop_ranges[ordinal][i] += oop_reach[i];
+                        ip_ranges[ordinal][i] += ip_reach[i];
                     }
                 }
                 // Fold / Showdown: no propagation needed.
             }
 
-            GameNode::Chance { child, .. } => {
+            PropNodeInfo::Chance { child } => {
                 self.propagate_ranges_recursive(
                     snapshot,
-                    *child as usize,
+                    child as usize,
                     oop_reach,
                     ip_reach,
                     oop_ranges,
                     ip_ranges,
+                    reach_pool,
                 );
             }
 
-            GameNode::Decision {
-                player,
-                actions,
-                children,
-                ..
-            } => {
-                let num_actions = actions.len();
+            PropNodeInfo::Decision { player, num_actions, children_buf } => {
                 let node_base = self.layout.bases[node_idx];
 
-                for (a, &child_idx) in children.iter().enumerate() {
-                    // Build child reach vectors by multiplying the acting
-                    // player's reach by strategy probability for this action.
-                    let mut child_oop = Vec::with_capacity(n);
-                    let mut child_ip = Vec::with_capacity(n);
+                // Split reach_pool: this level uses [0..n], children use [n..].
+                let (this_level, rest) = reach_pool.split_at_mut(n);
 
-                    if *player == 0 {
+                for a in 0..num_actions {
+                    let child_idx = children_buf[a];
+
+                    // Build child reach into this_level, reusing the buffer.
+                    if player == 0 {
                         for combo_idx in 0..n {
                             let strat_prob =
                                 snapshot[node_base + combo_idx * num_actions + a];
-                            child_oop.push(oop_reach[combo_idx] * strat_prob);
-                            child_ip.push(ip_reach[combo_idx]);
+                            this_level[combo_idx] = oop_reach[combo_idx] * strat_prob;
                         }
+                        self.propagate_ranges_recursive(
+                            snapshot,
+                            child_idx as usize,
+                            this_level,
+                            ip_reach,
+                            oop_ranges,
+                            ip_ranges,
+                            rest,
+                        );
                     } else {
                         for combo_idx in 0..n {
                             let strat_prob =
                                 snapshot[node_base + combo_idx * num_actions + a];
-                            child_oop.push(oop_reach[combo_idx]);
-                            child_ip.push(ip_reach[combo_idx] * strat_prob);
+                            this_level[combo_idx] = ip_reach[combo_idx] * strat_prob;
                         }
+                        self.propagate_ranges_recursive(
+                            snapshot,
+                            child_idx as usize,
+                            oop_reach,
+                            this_level,
+                            oop_ranges,
+                            ip_ranges,
+                            rest,
+                        );
                     }
-
-                    self.propagate_ranges_recursive(
-                        snapshot,
-                        child_idx as usize,
-                        &child_oop,
-                        &child_ip,
-                        oop_ranges,
-                        ip_ranges,
-                    );
                 }
             }
         }
@@ -357,8 +389,8 @@ impl CfvSubgameSolver {
     /// Vectorized CFR traversal: walks the tree ONCE, processing ALL combos
     /// simultaneously at each node.
     ///
-    /// Updates `regret_sum` and `strategy_sum` inline. Returns per-combo
-    /// counterfactual values at the root.
+    /// Updates `regret_sum` and `strategy_sum` inline. Writes per-combo
+    /// counterfactual values into `cfv_buf[node_idx * n..(node_idx + 1) * n]`.
     ///
     /// # Arguments
     ///
@@ -367,6 +399,11 @@ impl CfvSubgameSolver {
     /// * `reach_traverser` - per-combo reach probabilities for the traverser
     /// * `reach_opponent` - per-combo reach probabilities for the opponent
     /// * `snapshot` - frozen strategy snapshot (from `build_strategy_snapshot`)
+    /// * `cfv_buf` - pre-allocated flat buffer of size `num_nodes * num_combos`;
+    ///   each node writes its output to `[node_idx * n..(node_idx+1) * n]`
+    /// * `reach_pool` - pre-allocated flat reach scratch buffer. The current
+    ///   depth level uses `[0..n]`; deeper levels use `[n..]` via `split_at_mut`,
+    ///   eliminating all per-call heap allocations.
     #[allow(clippy::too_many_arguments)]
     fn cfr_traverse_vectorized(
         &mut self,
@@ -375,24 +412,31 @@ impl CfvSubgameSolver {
         reach_traverser: &[f64],
         reach_opponent: &[f64],
         snapshot: &[f64],
-    ) -> Vec<f64> {
+        cfv_buf: &mut [f64],
+        reach_pool: &mut [f64],
+    ) {
         let n = self.hands.combos.len();
+        let out_start = node_idx * n;
 
-        // Extract node info to avoid borrow conflicts with &mut self.
+        // Extract node info into small Copy types to free borrow on self.tree.
         enum NodeInfo {
             Terminal { kind: TerminalKind, pot: f64 },
             Chance { child: u32 },
-            Decision { player: u8, children: Vec<u32>, num_actions: usize },
+            Decision { player: u8, num_actions: usize, children_buf: [u32; 16] },
         }
 
         let info = match &self.tree.nodes[node_idx] {
             GameNode::Terminal { kind, pot, .. } => NodeInfo::Terminal { kind: *kind, pot: *pot },
             GameNode::Chance { child, .. } => NodeInfo::Chance { child: *child },
             GameNode::Decision { player, children, actions, .. } => {
+                let num_actions = actions.len();
+                let mut children_buf = [0u32; 16];
+                debug_assert!(num_actions <= 16);
+                children_buf[..num_actions].copy_from_slice(&children[..num_actions]);
                 NodeInfo::Decision {
                     player: *player,
-                    children: children.clone(),
-                    num_actions: actions.len(),
+                    num_actions,
+                    children_buf,
                 }
             }
         };
@@ -400,17 +444,16 @@ impl CfvSubgameSolver {
         match info {
             NodeInfo::Terminal { kind, pot } => {
                 let half_pot = pot / 2.0;
-                let mut cfvs = vec![0.0; n];
                 match kind {
                     TerminalKind::Fold { winner } => {
                         let sign = if winner == traverser { 1.0 } else { -1.0 };
                         for i in 0..n {
-                            cfvs[i] = sign * half_pot;
+                            cfv_buf[out_start + i] = sign * half_pot;
                         }
                     }
                     TerminalKind::Showdown => {
                         for i in 0..n {
-                            cfvs[i] = showdown_value_single(
+                            cfv_buf[out_start + i] = showdown_value_single(
                                 i, &self.hands, &self.equity_matrix,
                                 &self.opp_reach_totals, half_pot,
                             );
@@ -420,79 +463,94 @@ impl CfvSubgameSolver {
                         let ordinal = self.node_to_boundary[node_idx];
                         if ordinal != usize::MAX {
                             for i in 0..n {
-                                cfvs[i] = self.leaf_cfvs[ordinal]
+                                cfv_buf[out_start + i] = self.leaf_cfvs[ordinal]
                                     .get(i).copied().unwrap_or(0.0) * half_pot;
+                            }
+                        } else {
+                            for i in 0..n {
+                                cfv_buf[out_start + i] = 0.0;
                             }
                         }
                     }
                 }
-                cfvs
             }
 
             NodeInfo::Chance { child } => {
                 self.cfr_traverse_vectorized(
                     child as usize, traverser,
                     reach_traverser, reach_opponent, snapshot,
-                )
+                    cfv_buf, reach_pool,
+                );
+                // Copy child's output to this node's slot.
+                let child_start = child as usize * n;
+                cfv_buf.copy_within(child_start..child_start + n, out_start);
             }
 
-            NodeInfo::Decision { player, children, num_actions } => {
+            NodeInfo::Decision { player, num_actions, children_buf } => {
                 let node_base = self.layout.bases[node_idx];
                 let is_traverser = player == traverser;
 
+                // Split reach_pool: this level uses [0..n], children use [n..].
+                let (this_level, rest) = reach_pool.split_at_mut(n);
+
                 // Recurse into each child with updated reach vectors.
-                let mut action_cfvs: Vec<Vec<f64>> = Vec::with_capacity(num_actions);
-                for (a, &child_idx) in children.iter().enumerate() {
+                // Reuse this_level for child reach — only one child is
+                // processed at a time. The recursive call gets `rest`
+                // (disjoint from this_level) so there are no borrow conflicts.
+                for a in 0..num_actions {
+                    let child_idx = children_buf[a] as usize;
+
+                    // Build child reach into this_level.
                     if is_traverser {
-                        // Traverser's node: multiply traverser reach by strategy
-                        let mut child_reach = vec![0.0; n];
                         for i in 0..n {
-                            child_reach[i] = reach_traverser[i]
+                            this_level[i] = reach_traverser[i]
                                 * snapshot[node_base + i * num_actions + a];
                         }
-                        let child_cfv = self.cfr_traverse_vectorized(
-                            child_idx as usize, traverser,
-                            &child_reach, reach_opponent, snapshot,
+                        self.cfr_traverse_vectorized(
+                            child_idx, traverser,
+                            this_level, reach_opponent, snapshot,
+                            cfv_buf, rest,
                         );
-                        action_cfvs.push(child_cfv);
                     } else {
-                        // Opponent's node: multiply opponent reach by strategy
-                        let mut child_opp_reach = vec![0.0; n];
                         for i in 0..n {
-                            child_opp_reach[i] = reach_opponent[i]
+                            this_level[i] = reach_opponent[i]
                                 * snapshot[node_base + i * num_actions + a];
                         }
-                        let child_cfv = self.cfr_traverse_vectorized(
-                            child_idx as usize, traverser,
-                            reach_traverser, &child_opp_reach, snapshot,
+                        self.cfr_traverse_vectorized(
+                            child_idx, traverser,
+                            reach_traverser, this_level, snapshot,
+                            cfv_buf, rest,
                         );
-                        action_cfvs.push(child_cfv);
                     }
                 }
 
-                // Compute node CFVs: strategy-weighted sum of action CFVs.
-                let mut node_cfvs = vec![0.0; n];
+                // Compute node CFVs from children's results (stored in cfv_buf
+                // at each child's own node_idx slot — no separate action_cfvs needed).
                 for i in 0..n {
+                    let mut val = 0.0;
                     for a in 0..num_actions {
+                        let child_idx = children_buf[a] as usize;
                         let strat = snapshot[node_base + i * num_actions + a];
-                        node_cfvs[i] += strat * action_cfvs[a][i];
+                        val += strat * cfv_buf[child_idx * n + i];
                     }
+                    cfv_buf[out_start + i] = val;
                 }
 
                 // Update regrets and strategy sums at traverser's nodes.
                 if is_traverser {
                     for i in 0..n {
                         let base = node_base + i * num_actions;
+                        let node_val = cfv_buf[out_start + i];
                         for a in 0..num_actions {
+                            let child_idx = children_buf[a] as usize;
+                            let child_val = cfv_buf[child_idx * n + i];
                             self.regret_sum[base + a] +=
-                                reach_opponent[i] * (action_cfvs[a][i] - node_cfvs[i]);
+                                reach_opponent[i] * (child_val - node_val);
                             self.strategy_sum[base + a] +=
                                 reach_traverser[i] * snapshot[base + a];
                         }
                     }
                 }
-
-                node_cfvs
             }
         }
     }
@@ -517,7 +575,18 @@ impl CfvSubgameSolver {
     /// - `N > 0` = evaluate at iteration 1, every N iterations, and the final iteration
     pub fn train_with_leaf_interval(&mut self, iterations: u32, leaf_eval_interval: u32) {
         let n = self.hands.combos.len();
+        let num_nodes = self.tree.nodes.len();
+
+        // Pre-allocate all scratch buffers once, reused across all iterations.
+        // This eliminates ~110GB of allocation churn over a typical training run.
         let reach_init = vec![1.0; n];
+        let mut cfv_buf = vec![0.0; num_nodes * n];
+        // Flat reach scratch pool: max_depth levels × n combos per level.
+        // 64 levels is more than enough for any practical game tree.
+        let max_depth: usize = 64;
+        let mut reach_pool = vec![0.0; max_depth * n];
+        // Separate flat reach pool for range propagation.
+        let mut prop_reach_pool = vec![0.0; max_depth * n];
 
         for iter_idx in 0..iterations {
             self.iteration += 1;
@@ -536,7 +605,9 @@ impl CfvSubgameSolver {
             // Propagate ranges once (shared between both traversers).
             let boundary_ranges =
                 if should_eval && !self.boundary_info.boundaries.is_empty() {
-                    Some(self.propagate_ranges(&snapshot))
+                    Some(self.propagate_ranges(
+                        &snapshot, &reach_init, &mut prop_reach_pool,
+                    ))
                 } else {
                     None
                 };
@@ -563,12 +634,14 @@ impl CfvSubgameSolver {
                     }
                 }
 
-                let _cfvs = self.cfr_traverse_vectorized(
+                self.cfr_traverse_vectorized(
                     self.tree.root as usize,
                     traverser,
                     &reach_init,
                     &reach_init,
                     &snapshot,
+                    &mut cfv_buf,
+                    &mut reach_pool,
                 );
             }
 
@@ -1024,7 +1097,12 @@ mod tests {
         // With no training, strategy is uniform. Propagation should still
         // produce non-negative ranges that sum to at most 1.0 per combo.
         let snapshot = solver.build_strategy_snapshot();
-        let (oop_ranges, ip_ranges) = solver.propagate_ranges(&snapshot);
+        let reach_init = vec![1.0; n];
+        let max_depth: usize = 64;
+        let mut prop_reach_pool = vec![0.0; max_depth * n];
+        let (oop_ranges, ip_ranges) = solver.propagate_ranges(
+            &snapshot, &reach_init, &mut prop_reach_pool,
+        );
 
         assert!(
             !oop_ranges.is_empty(),
