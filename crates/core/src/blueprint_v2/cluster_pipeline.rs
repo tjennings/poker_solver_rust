@@ -127,9 +127,9 @@ pub fn cluster_river(
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
-            version: 1,
+            version: 2,
         },
-        boards: Vec::new(),
+        boards: boards.iter().map(|b| canonical_key(b)).collect(),
         buckets,
     }
 }
@@ -185,9 +185,9 @@ pub fn cluster_river_with_boards(
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
-            version: 1,
+            version: 2,
         },
-        boards: Vec::new(),
+        boards: boards.iter().map(|b| canonical_key(b)).collect(),
         buckets,
     }
 }
@@ -279,9 +279,9 @@ pub fn cluster_turn(
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
-            version: 1,
+            version: 2,
         },
-        boards: Vec::new(),
+        boards: boards.iter().map(|b| canonical_key(b)).collect(),
         buckets,
     }
 }
@@ -359,9 +359,9 @@ pub fn cluster_turn_with_boards(
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
-            version: 1,
+            version: 2,
         },
-        boards: Vec::new(),
+        boards: boards.iter().map(|b| canonical_key(b)).collect(),
         buckets,
     }
 }
@@ -498,9 +498,9 @@ pub fn cluster_flop(
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
-            version: 1,
+            version: 2,
         },
-        boards: Vec::new(),
+        boards: boards.iter().map(|b| canonical_key(b)).collect(),
         buckets,
     }
 }
@@ -578,9 +578,9 @@ pub fn cluster_flop_with_boards(
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
-            version: 1,
+            version: 2,
         },
-        boards: Vec::new(),
+        boards: boards.iter().map(|b| canonical_key(b)).collect(),
         buckets,
     }
 }
