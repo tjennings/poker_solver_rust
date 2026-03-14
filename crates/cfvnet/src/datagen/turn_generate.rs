@@ -117,6 +117,7 @@ fn solve_turn_situation(
     ranges: &[[f32; NUM_COMBOS]; 2],
     bet_sizes: &[Vec<f64>],
     solver_iterations: u32,
+    leaf_eval_interval: u32,
     evaluator: Box<dyn LeafEvaluator>,
 ) -> (
     [f32; NUM_COMBOS],
@@ -149,7 +150,7 @@ fn solve_turn_situation(
         starting_stack,
     );
 
-    solver.train(solver_iterations);
+    solver.train_with_leaf_interval(solver_iterations, leaf_eval_interval);
 
     // Extract root CFVs for both players.
     let oop_cfvs_combo = solver.root_cfvs(0);
@@ -209,6 +210,7 @@ fn generate_turn_training_data_cuda(
     let seed = crate::config::resolve_seed(config.datagen.seed);
     let threads = config.datagen.threads;
     let solver_iterations = config.datagen.solver_iterations;
+    let leaf_eval_interval = config.datagen.leaf_eval_interval;
     let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
@@ -319,6 +321,7 @@ fn generate_turn_training_data_cuda(
                     &sit.ranges,
                     &bet_sizes_vec,
                     solver_iterations,
+                    leaf_eval_interval,
                     evaluator,
                 );
 
@@ -413,6 +416,7 @@ pub fn generate_turn_training_data(
     let seed = crate::config::resolve_seed(config.datagen.seed);
     let threads = config.datagen.threads;
     let solver_iterations = config.datagen.solver_iterations;
+    let leaf_eval_interval = config.datagen.leaf_eval_interval;
     let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
@@ -491,6 +495,7 @@ pub fn generate_turn_training_data(
                     &sit.ranges,
                     &bet_sizes_vec,
                     solver_iterations,
+                    leaf_eval_interval,
                     evaluator,
                 );
 
@@ -635,6 +640,7 @@ mod tests {
             &sit.ranges,
             &[bet_sizes_f64],
             20,
+            0,
             evaluator,
         );
 
@@ -698,6 +704,7 @@ mod tests {
             &sit.ranges,
             &[bet_sizes_f64],
             10,
+            0,
             evaluator,
         );
 

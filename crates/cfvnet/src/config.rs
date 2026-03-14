@@ -94,6 +94,10 @@ pub struct DatagenConfig {
     pub threads: usize,
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Re-evaluate leaf boundaries every N iterations. 0 = every iteration (default).
+    /// E.g. 1000 means evaluate at iteration 1, 1000, 2000, ... and the final iteration.
+    #[serde(default)]
+    pub leaf_eval_interval: u32,
 }
 
 impl Default for DatagenConfig {
@@ -107,6 +111,7 @@ impl Default for DatagenConfig {
             target_exploitability: 0.005,
             threads: 8,
             seed: Some(42),
+            leaf_eval_interval: 0,
         }
     }
 }

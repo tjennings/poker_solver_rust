@@ -341,6 +341,16 @@ impl CfvSubgameSolver {
     /// 4. Runs CFR traversal for both traverser positions.
     /// 5. Applies DCFR discounting.
     pub fn train(&mut self, iterations: u32) {
+        self.train_with_leaf_interval(iterations, 0);
+    }
+
+    /// Train with configurable leaf evaluation interval.
+    ///
+    /// `leaf_eval_interval` controls how often depth-boundary leaves are
+    /// re-evaluated:
+    /// - `0` = every iteration (original behavior)
+    /// - `N > 0` = evaluate at iteration 1, every N iterations, and the final iteration
+    pub fn train_with_leaf_interval(&mut self, iterations: u32, leaf_eval_interval: u32) {
         let combos: Vec<(u16, u16)> = (0..self.hands.combos.len())
             .filter(|&c| self.opp_reach_totals[c] > 0.0)
             .map(|c| {
@@ -350,13 +360,22 @@ impl CfvSubgameSolver {
             })
             .collect();
 
-        for _ in 0..iterations {
+        for iter_idx in 0..iterations {
             self.iteration += 1;
 
             let snapshot = self.build_strategy_snapshot();
 
+            // Determine whether to re-evaluate leaf boundaries this iteration.
+            let should_eval = if leaf_eval_interval == 0 {
+                true
+            } else {
+                self.iteration == 1
+                    || self.iteration % leaf_eval_interval == 0
+                    || iter_idx == iterations - 1
+            };
+
             // Propagate ranges to boundaries and evaluate leaf CFVs.
-            if !self.boundary_info.boundaries.is_empty() {
+            if should_eval && !self.boundary_info.boundaries.is_empty() {
                 let (oop_ranges, ip_ranges) = self.propagate_ranges(&snapshot);
 
                 for (b_idx, &(_, pot, invested)) in
@@ -365,9 +384,6 @@ impl CfvSubgameSolver {
                     let eff_stack =
                         self.starting_stack - invested[0].max(invested[1]);
 
-                    // Evaluate for each traverser and store the results.
-                    // We'll use traverser=0 for the iteration (OOP perspective).
-                    // The actual per-traverser leaf CFVs are handled below.
                     self.leaf_cfvs[b_idx] = self.evaluator.evaluate(
                         &self.hands.combos,
                         &self.board,
@@ -375,7 +391,7 @@ impl CfvSubgameSolver {
                         eff_stack,
                         &oop_ranges[b_idx],
                         &ip_ranges[b_idx],
-                        0, // evaluated from OOP perspective initially
+                        0,
                     );
                 }
             }
@@ -383,7 +399,7 @@ impl CfvSubgameSolver {
             for traverser in 0..2u8 {
                 // Re-evaluate boundaries from current traverser's perspective
                 // if there are boundaries.
-                if !self.boundary_info.boundaries.is_empty() && traverser == 1 {
+                if should_eval && !self.boundary_info.boundaries.is_empty() && traverser == 1 {
                     let (oop_ranges, ip_ranges) =
                         self.propagate_ranges(&snapshot);
                     for (b_idx, &(_, pot, invested)) in
