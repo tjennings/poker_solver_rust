@@ -308,17 +308,36 @@ pub fn kmeans_1d_weighted(
         return (0..n).map(|i| i as u16).collect();
     }
 
-    // Sorted copy for percentile initialisation.
-    let mut sorted = data.to_vec();
-    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Build (value, weight) pairs sorted by value for weighted percentile init.
+    let mut indexed: Vec<(f64, f64)> = data.iter().copied().zip(weights.iter().copied()).collect();
+    indexed.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Initialise centroids at evenly-spaced percentiles.
-    let mut centroids: Vec<f64> = (0..k)
-        .map(|i| {
-            let idx = (i * (n - 1)) / (k.max(2) - 1).max(1);
-            sorted[idx.min(n - 1)]
-        })
-        .collect();
+    // Weighted percentile initialisation: place centroids at evenly-spaced
+    // quantiles of the weighted CDF.
+    let total_weight: f64 = indexed.iter().map(|(_, w)| w).sum();
+    let mut centroids: Vec<f64> = Vec::with_capacity(k);
+    let mut cumulative = 0.0_f64;
+    let mut idx = 0;
+    for ci in 0..k {
+        #[allow(clippy::cast_precision_loss)]
+        let target = (ci as f64 + 0.5) / k as f64 * total_weight;
+        while idx < indexed.len() - 1 && cumulative + indexed[idx].1 < target {
+            cumulative += indexed[idx].1;
+            idx += 1;
+        }
+        centroids.push(indexed[idx].0);
+    }
+    // Deduplicate centroids that landed on the same value by nudging.
+    centroids.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
+    while centroids.len() < k {
+        let min = indexed.first().unwrap().0;
+        let max = indexed.last().unwrap().0;
+        #[allow(clippy::cast_precision_loss)]
+        let val = min + (max - min) * (centroids.len() as f64 / k as f64);
+        centroids.push(val);
+    }
+    // Sort centroids so nearest_centroid_1d binary search works correctly.
+    centroids.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut assignments = vec![0_u16; n];
 
@@ -367,8 +386,26 @@ pub fn kmeans_1d_weighted(
         for ci in 0..k {
             if weight_sums[ci] > 0.0 {
                 centroids[ci] = sums[ci] / weight_sums[ci];
+            } else {
+                // Re-seed empty cluster: find the data point farthest from
+                // its assigned centroid.
+                let farthest = data
+                    .iter()
+                    .zip(assignments.iter())
+                    .enumerate()
+                    .map(|(i, (&val, &a))| {
+                        let dist = (val - centroids[a as usize]).abs();
+                        (i, dist)
+                    })
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+                    .unwrap();
+                centroids[ci] = data[farthest];
+                assignments[farthest] = ci as u16;
             }
         }
+        // Re-sort centroids after updates/re-seeding so binary search works.
+        centroids.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     }
 
     // Final assignment pass (parallel).
@@ -655,7 +692,7 @@ fn nearest_centroid(point: &[f64], centroids: &[Vec<f64>]) -> u16 {
 /// Centroids are always sorted after percentile initialisation and stay sorted
 /// because the weighted-average update preserves ordering in 1-D.
 #[allow(clippy::cast_possible_truncation)]
-fn nearest_centroid_1d(val: f64, centroids: &[f64]) -> u16 {
+pub(crate) fn nearest_centroid_1d(val: f64, centroids: &[f64]) -> u16 {
     let k = centroids.len();
     debug_assert!(k > 0);
     // Binary search for the insertion point.
@@ -967,6 +1004,59 @@ mod tests {
         assert!(assignments[0..30].iter().all(|&a| a == c0));
         assert!(assignments[30..60].iter().all(|&a| a == c1));
         assert!(assignments[60..90].iter().all(|&a| a == c2));
+    }
+
+    #[test]
+    fn kmeans_1d_weighted_no_empty_clusters() {
+        // Data heavily concentrated at 0.0 and 1.0 with a few points at 0.5.
+        // With bad initialization, middle centroids starve and become empty.
+        let mut data = Vec::new();
+        let mut weights = Vec::new();
+        for _ in 0..1000 {
+            data.push(0.0);
+            weights.push(1.0);
+        }
+        for _ in 0..10 {
+            data.push(0.5);
+            weights.push(1.0);
+        }
+        for _ in 0..1000 {
+            data.push(1.0);
+            weights.push(1.0);
+        }
+        // With only 3 distinct values, we can have at most 3 occupied clusters.
+        // Use k=3 to test that all clusters stay occupied (no empty buckets)
+        // despite the highly skewed distribution.
+        let labels = kmeans_1d_weighted(&data, &weights, 3, 100);
+        let used: std::collections::HashSet<u16> = labels.iter().copied().collect();
+        assert_eq!(
+            used.len(),
+            3,
+            "expected 3 occupied clusters, got {}",
+            used.len()
+        );
+
+        // Also test with many distinct values and high k: use 200 distinct
+        // points spread across [0,1] with heavily skewed weights, and k=20.
+        // Without re-seeding, clusters in the low-weight region starve.
+        let mut data2 = Vec::new();
+        let mut weights2 = Vec::new();
+        for i in 0..200 {
+            #[allow(clippy::cast_precision_loss)]
+            let v = i as f64 / 199.0;
+            data2.push(v);
+            // Heavy weight at ends, tiny weight in the middle.
+            let w = if v < 0.1 || v > 0.9 { 100.0 } else { 0.01 };
+            weights2.push(w);
+        }
+        let labels2 = kmeans_1d_weighted(&data2, &weights2, 20, 100);
+        let used2: std::collections::HashSet<u16> = labels2.iter().copied().collect();
+        assert_eq!(
+            used2.len(),
+            20,
+            "expected 20 occupied clusters, got {}",
+            used2.len()
+        );
     }
 
     #[test]
