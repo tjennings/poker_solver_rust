@@ -1212,12 +1212,21 @@ pub fn run_clustering_pipeline(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. River (equity clustering — independent)
     progress("river", 0.0);
-    let river = cluster_river(
-        config.river.buckets,
-        config.kmeans_iterations,
-        config.seed,
-        |p| progress("river", p),
-    );
+    let river = if let Some(ref cfvnet_dir) = config.cfvnet_river_data {
+        cluster_river_from_cfvnet(
+            cfvnet_dir,
+            config.river.buckets,
+            config.kmeans_iterations,
+            |p| progress("river", p),
+        )?
+    } else {
+        cluster_river(
+            config.river.buckets,
+            config.kmeans_iterations,
+            config.seed,
+            |p| progress("river", p),
+        )
+    };
 
     // 2. Turn (potential-aware EMD, depends on river)
     progress("turn", 0.0);

@@ -1,0 +1,75 @@
+# Blueprint V2 Config — 100BB HU, 500 buckets per street
+game:
+  name: "500bkt"
+  players: 2
+  stack_depth: 100.0
+  small_blind: 0.5
+  big_blind: 1.0
+
+clustering:
+  algorithm: potential_aware_emd
+  # cfvnet_river_data: ./local_data/cfvnet/river/v1  # uncomment to use CFV-based river clustering
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 500
+  turn:
+    buckets: 500
+  river:
+    buckets: 500
+
+action_abstraction:
+  preflop:
+    - ["2.5bb"]
+    - ["4bb", "6bb"]
+    - ["18bb"]
+  flop:
+    - [0.33, 0.67, 1.0]
+    - [0.33, 0.67, 2.0]
+    - [2.0]
+  turn:
+    - [0.33, 0.67, 1.0]
+    - [0.33, 0.67, 2.0]
+    - [2.0]
+  river:
+    - [0.33, 0.67, 1.0]
+    - [0.33, 0.67, 2.0]
+    - [2.0]
+
+training:
+  cluster_path: "./local_data/clusters_500bkt"
+  time_limit_minutes: 7200
+  lcfr_warmup_iterations: 5000000
+  prune_after_iterations: 5000000
+  prune_threshold: -200000
+  lcfr_discount_interval: 1000000
+  batch_size: 2000
+
+snapshots:
+  resume: true
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "./local_data/blueprints/500bkt/snapsot"
+
+tui:
+  enabled: true
+  refresh_rate_ms: 2000
+  telemetry:
+    strategy_delta_interval_seconds: 120
+    sparkline_window: 60
+  scenarios:
+    - name: "SB Open"
+      player: SB
+      actions: []
+    - name: "BB vs 2.5x"
+      player: BB
+      actions: ["raise-0"]
+    - name: "SB Cbet K72"
+      player: SB
+      actions: ["raise-0", "call"]
+      board: ["Kh", "7s", "2d"]
+      street: flop
+  random_scenario:
+    enabled: true
+    hold_minutes: 3
+    pool: ["preflop", "flop", "turn", "river"]

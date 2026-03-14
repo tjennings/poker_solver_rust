@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// Top-level config for the full Blueprint V2 pipeline.
@@ -45,6 +47,11 @@ pub struct ClusteringConfig {
     pub seed: u64,
     #[serde(default = "default_kmeans_iterations")]
     pub kmeans_iterations: u32,
+    /// Optional path to cfvnet river training data directory.
+    /// When set, river clustering uses pre-solved CFV equity instead of
+    /// random-hand showdown equity.
+    #[serde(default)]
+    pub cfvnet_river_data: Option<PathBuf>,
 }
 
 /// Supported clustering algorithms for card abstraction.
