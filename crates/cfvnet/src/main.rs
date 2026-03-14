@@ -798,37 +798,93 @@ fn print_spr_mbb_histogram(title: &str, spr_mbb: &[(f64, f64)]) {
     }
 }
 
-fn board_texture_label(board: &[u8; 5], board_size: usize) -> &'static str {
+/// Board texture labels (non-exclusive — a board can match multiple).
+const TEXTURE_LABELS: &[&str] = &[
+    "Monotone     ",
+    "4-flush      ",
+    "Three-flush  ",
+    "Two-tone     ",
+    "Rainbow      ",
+    "4-straight   ",
+    "3-straight   ",
+    "Paired       ",
+    "Dry          ",
+];
+
+/// Return all texture tags that apply to this board.
+fn board_texture_tags(board: &[u8; 5], board_size: usize) -> Vec<&'static str> {
+    let cards = &board[..board_size];
+
+    // Suit counts.
     let mut suit_counts = [0u8; 4];
-    for &card in &board[..board_size] {
-        let suit = (card % 4) as usize;
-        suit_counts[suit] += 1;
+    for &card in cards {
+        suit_counts[(card % 4) as usize] += 1;
     }
     let max_suit = suit_counts.iter().copied().max().unwrap_or(0);
-    match max_suit {
-        4.. => "Monotone     ",
-        3 => "Three-flush  ",
-        2 => "Two-tone     ",
-        _ => "Rainbow      ",
+
+    // Rank presence + pair detection.
+    let mut rank_counts = [0u8; 13];
+    for &card in cards {
+        rank_counts[(card / 4) as usize] += 1;
     }
+    let paired = rank_counts.iter().any(|&c| c >= 2);
+
+    // Max consecutive ranks (including ace-low wrap for wheels).
+    let max_consec = {
+        let mut best = 0u8;
+        let mut run = 0u8;
+        for &c in &rank_counts {
+            if c > 0 { run += 1; best = best.max(run); } else { run = 0; }
+        }
+        // Check ace-low: if ace present, count consecutive from rank 0.
+        if rank_counts[12] > 0 {
+            let mut wheel_run = 1u8; // ace counts as low
+            for r in 0..12 {
+                if rank_counts[r] > 0 { wheel_run += 1; } else { break; }
+            }
+            best = best.max(wheel_run);
+        }
+        best
+    };
+
+    let mut tags = Vec::new();
+
+    // Suit textures (mutually exclusive).
+    match max_suit {
+        5.. => tags.push("Monotone     "),
+        4 => tags.push("4-flush      "),
+        3 => tags.push("Three-flush  "),
+        2 => tags.push("Two-tone     "),
+        _ => tags.push("Rainbow      "),
+    }
+
+    // Straight textures (non-exclusive with suit textures).
+    if max_consec >= 4 { tags.push("4-straight   "); }
+    else if max_consec >= 3 { tags.push("3-straight   "); }
+
+    if paired { tags.push("Paired       "); }
+
+    // Dry: no flush draw (max suit < 3), no straight draw (max consec < 3), not paired.
+    if max_suit < 3 && max_consec < 3 && !paired {
+        tags.push("Dry          ");
+    }
+
+    tags
 }
 
-fn print_texture_mbb_histogram(title: &str, texture_mbb: &[(&str, f64)]) {
+fn print_texture_mbb_histogram(title: &str, spots: &[cfvnet::eval::compare::SpotResult]) {
     const BAR_WIDTH: usize = 40;
-    const LABELS: &[&str] = &[
-        "Monotone     ",
-        "Three-flush  ",
-        "Two-tone     ",
-        "Rainbow      ",
-    ];
 
-    let mut sums = [0.0_f64; 4];
-    let mut counts = [0_u32; 4];
+    let mut sums = [0.0_f64; TEXTURE_LABELS.len()];
+    let mut counts = [0_u32; TEXTURE_LABELS.len()];
 
-    for &(label, mbb) in texture_mbb {
-        if let Some(idx) = LABELS.iter().position(|&l| l == label) {
-            sums[idx] += mbb;
-            counts[idx] += 1;
+    for spot in spots {
+        let tags = board_texture_tags(&spot.board, spot.board_size);
+        for tag in tags {
+            if let Some(idx) = TEXTURE_LABELS.iter().position(|&l| l == tag) {
+                sums[idx] += spot.mbb;
+                counts[idx] += 1;
+            }
         }
     }
 
@@ -842,7 +898,7 @@ fn print_texture_mbb_histogram(title: &str, texture_mbb: &[(&str, f64)]) {
     }
 
     println!("\n{title}:");
-    for (i, label) in LABELS.iter().enumerate() {
+    for (i, label) in TEXTURE_LABELS.iter().enumerate() {
         let mean = means[i];
         let count = counts[i];
         let bar_len = ((mean / max_val) * BAR_WIDTH as f64).round() as usize;
@@ -925,10 +981,7 @@ fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
         .collect();
     print_spr_mbb_histogram("mBB Error by SPR", &spr_mbb);
 
-    let texture_mbb: Vec<(&str, f64)> = summary.spots.iter()
-        .map(|s| (board_texture_label(&s.board, s.board_size), s.mbb))
-        .collect();
-    print_texture_mbb_histogram("mBB Error by Board Texture", &texture_mbb);
+    print_texture_mbb_histogram("mBB Error by Board Texture", &summary.spots);
 }
 
 fn print_histogram<F, G>(title: &str, spots: &[cfvnet::eval::compare::SpotResult], key_fn: F, val_fn: G)
