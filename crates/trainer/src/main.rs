@@ -54,6 +54,15 @@ enum Commands {
         /// Number of boards to sample for audit (default 50)
         #[arg(long, default_value = "50")]
         audit_boards: usize,
+        /// Print cross-street transition matrices for adjacent street pairs
+        #[arg(long)]
+        transitions: bool,
+        /// Reconstruct centroids and print pairwise EMD report for a street
+        #[arg(long)]
+        centroid_emd: Option<String>,
+        /// Show sample hands from a specific bucket (STREET BUCKET_ID)
+        #[arg(long, num_args = 2, value_names = ["STREET", "BUCKET"])]
+        sample_bucket: Option<Vec<String>>,
     },
     /// Pre-compute the equity+delta lookup cache for fast expected-delta bucketing.
     /// Generates turn table first (averaging over river cards), then flop table
@@ -402,7 +411,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("Clustering complete. Files saved to {}", output.display());
             }
         }
-        Commands::DiagClusters { cluster_dir, audit, audit_boards } => {
+        Commands::DiagClusters {
+            cluster_dir,
+            audit,
+            audit_boards,
+            transitions,
+            centroid_emd,
+            sample_bucket,
+        } => {
+            use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
+            use poker_solver_core::blueprint_v2::cluster_diagnostics::{
+                cross_street_transition_matrix, sample_hands_for_bucket,
+            };
+
             let reports = poker_solver_core::blueprint_v2::cluster_diagnostics::diagnose_cluster_dir(&cluster_dir)?;
             if reports.is_empty() {
                 eprintln!("No .buckets files found in {}", cluster_dir.display());
@@ -420,6 +441,49 @@ fn main() -> Result<(), Box<dyn Error>> {
                 )?;
                 for report in &audit_reports {
                     eprintln!("\n{}", report.summary());
+                }
+            }
+            if transitions {
+                let pairs = [("preflop", "flop"), ("flop", "turn"), ("turn", "river")];
+                for (from_name, to_name) in &pairs {
+                    let from_path = cluster_dir.join(format!("{from_name}.buckets"));
+                    let to_path = cluster_dir.join(format!("{to_name}.buckets"));
+                    if from_path.exists() && to_path.exists() {
+                        let from_bf = BucketFile::load(&from_path)?;
+                        let to_bf = BucketFile::load(&to_path)?;
+                        let matrix = cross_street_transition_matrix(&from_bf, &to_bf);
+                        eprintln!("\n{}", matrix.summary());
+                    }
+                }
+            }
+            if let Some(_street) = centroid_emd {
+                eprintln!(
+                    "\nCentroid EMD requires feature vectors which are not stored \
+                     in bucket files — run during clustering to capture this diagnostic."
+                );
+            }
+            if let Some(ref args) = sample_bucket {
+                let street_str = &args[0];
+                let bucket_id: u16 = args[1].parse().map_err(|e| {
+                    format!("invalid bucket id '{}': {e}", args[1])
+                })?;
+                let path = cluster_dir.join(format!("{street_str}.buckets"));
+                if !path.exists() {
+                    eprintln!("Bucket file not found: {}", path.display());
+                } else {
+                    let bf = BucketFile::load(&path)?;
+                    let samples = sample_hands_for_bucket(&bf, bucket_id, 10, 42);
+                    if samples.is_empty() {
+                        eprintln!("No entries found for bucket {bucket_id} in {street_str}");
+                    } else {
+                        eprintln!(
+                            "{} sample(s) from {street_str} bucket {bucket_id}:",
+                            samples.len()
+                        );
+                        for sample in &samples {
+                            eprintln!("  {}", sample.display());
+                        }
+                    }
                 }
             }
         }
