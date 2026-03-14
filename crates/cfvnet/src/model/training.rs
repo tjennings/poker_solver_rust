@@ -7,8 +7,6 @@ use burn::tensor::{Tensor, TensorData};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use rayon::prelude::*;
-
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -16,7 +14,7 @@ use std::sync::mpsc;
 use crate::datagen::storage::{read_record, TrainingRecord};
 use crate::model::dataset::encode_record;
 use crate::model::loss::cfvnet_loss;
-use crate::model::network::{CfvNet, OUTPUT_SIZE, input_size};
+use crate::model::network::{CfvNet, INPUT_SIZE, OUTPUT_SIZE};
 
 /// Configuration for the CFVnet training loop.
 pub struct TrainConfig {
@@ -62,13 +60,13 @@ struct DeviceTensors<B: Backend> {
 
 impl PreEncoded {
     /// Encode a slice of records into contiguous flat arrays.
-    fn from_records(records: &[TrainingRecord], board_cards: usize) -> Self {
+    fn from_records(records: &[TrainingRecord]) -> Self {
         let n = records.len();
-        let in_size = input_size(board_cards);
+        let in_size = INPUT_SIZE;
 
         let items: Vec<_> = records
             .iter()
-            .map(|rec| encode_record(rec, board_cards))
+            .map(|rec| encode_record(rec))
             .collect();
 
         // Flatten into contiguous arrays.
@@ -408,7 +406,6 @@ fn load_or_create_model<B: AutodiffBackend>(
 fn load_validation_set(
     files: &[PathBuf],
     val_count: usize,
-    board_cards: usize,
 ) -> Option<PreEncoded> {
     if val_count == 0 {
         return None;
@@ -418,7 +415,7 @@ fn load_validation_set(
     let val_records = val_reader.read_chunk(val_count);
     let actual_val = val_records.len();
     eprintln!("Loaded {actual_val} validation records");
-    Some(PreEncoded::from_records(&val_records, board_cards))
+    Some(PreEncoded::from_records(&val_records))
 }
 
 /// Spawn a two-stage dataloader pipeline: a reader thread with a streaming
@@ -432,7 +429,6 @@ fn spawn_dataloader_thread(
     files: &[PathBuf],
     config: &TrainConfig,
     val_count: usize,
-    board_cards: usize,
 ) -> (mpsc::Receiver<PreEncoded>, Vec<std::thread::JoinHandle<()>>) {
     let batch_size = config.batch_size;
     let shuffle_buffer_size = config.shuffle_buffer_size;
@@ -523,7 +519,7 @@ fn spawn_dataloader_thread(
                         Err(_) => return,
                     }
                 };
-                let encoded = PreEncoded::from_records(&records, board_cards);
+                let encoded = PreEncoded::from_records(&records);
                 if tx.send(encoded).is_err() {
                     return;
                 }
@@ -547,8 +543,7 @@ pub fn train<B: AutodiffBackend>(
     config: &TrainConfig,
     output_dir: Option<&std::path::Path>,
 ) -> TrainResult {
-    let in_size = input_size(board_cards);
-    let model = CfvNet::<B>::new(device, config.hidden_layers, config.hidden_size, in_size);
+    let model = CfvNet::<B>::new(device, config.hidden_layers, config.hidden_size, INPUT_SIZE);
     let (mut model, start_epoch) = load_or_create_model(model, output_dir, device);
 
     let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
@@ -569,7 +564,7 @@ pub fn train<B: AutodiffBackend>(
 
     let val_count = ((total_records as f64 * config.validation_split) as usize)
         .min(total_records);
-    let val_encoded = load_validation_set(&files, val_count, board_cards);
+    let val_encoded = load_validation_set(&files, val_count);
 
     // Compute training schedule.
     let train_records = total_records - val_count;
@@ -592,7 +587,6 @@ pub fn train<B: AutodiffBackend>(
         &files,
         config,
         val_count,
-        board_cards,
     );
 
     let mut final_loss = f32::MAX;
@@ -1029,7 +1023,6 @@ mod tests {
             &[empty_path],
             &config,
             0,
-            5,
         );
 
         // The reader thread should stop after seeing empty buffer,
@@ -1122,7 +1115,6 @@ mod tests {
             &[file.path().to_path_buf()],
             &config,
             0,
-            5,
         );
 
         // One epoch = ceil(64 / 8) = 8 batches.
