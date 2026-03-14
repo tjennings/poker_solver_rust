@@ -150,13 +150,11 @@ fn resolve_model_path(path: &std::path::Path) -> PathBuf {
 }
 
 fn ensure_parent_dir(path: &std::path::Path) {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-                eprintln!("failed to create directory {}: {e}", parent.display());
-                std::process::exit(1);
-            });
-        }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+            eprintln!("failed to create directory {}: {e}", parent.display());
+            std::process::exit(1);
+        });
     }
 }
 
@@ -320,7 +318,7 @@ fn cmd_generate(
 
     let total = cfg.datagen.num_samples;
     let chunk_size = per_file.unwrap_or(total);
-    let num_files = (total + chunk_size - 1) / chunk_size;
+    let num_files = total.div_ceil(chunk_size);
 
     let street = cfg.datagen.street.as_str();
     if num_files > 1 {
@@ -695,7 +693,7 @@ fn print_raw_frequency_histogram(title: &str, values: &[f64]) {
     }
 
     let bucket_width = (max_val - min_val) / NUM_BUCKETS as f64;
-    let mut bucket_counts = vec![0_u32; NUM_BUCKETS];
+    let mut bucket_counts = [0_u32; NUM_BUCKETS];
 
     for &v in values {
         let idx = ((v - min_val) / bucket_width) as usize;
@@ -706,10 +704,9 @@ fn print_raw_frequency_histogram(title: &str, values: &[f64]) {
     let max_count = *bucket_counts.iter().max().unwrap_or(&1);
 
     println!("\n{title}:");
-    for i in 0..NUM_BUCKETS {
+    for (i, &count) in bucket_counts.iter().enumerate() {
         let lo = min_val + i as f64 * bucket_width;
         let hi = lo + bucket_width;
-        let count = bucket_counts[i];
         let bar_len = ((count as f64 / max_count as f64) * BAR_WIDTH as f64).round() as usize;
         let bar: String = "█".repeat(bar_len);
         println!("  {:>6.0}-{:<6.0} |{:<width$}| {}", lo, hi, bar, count, width = BAR_WIDTH);
@@ -839,8 +836,8 @@ fn board_texture_tags(board: &[u8; 5], board_size: usize) -> Vec<&'static str> {
         // Check ace-low: if ace present, count consecutive from rank 0.
         if rank_counts[12] > 0 {
             let mut wheel_run = 1u8; // ace counts as low
-            for r in 0..12 {
-                if rank_counts[r] > 0 { wheel_run += 1; } else { break; }
+            for &c in &rank_counts[..12] {
+                if c > 0 { wheel_run += 1; } else { break; }
             }
             best = best.max(wheel_run);
         }
@@ -1002,16 +999,16 @@ where
         return;
     }
 
-    let min_key = spots.iter().map(|s| key_fn(s)).fold(f64::INFINITY, f64::min);
-    let max_key = spots.iter().map(|s| key_fn(s)).fold(f64::NEG_INFINITY, f64::max);
+    let min_key = spots.iter().map(&key_fn).fold(f64::INFINITY, f64::min);
+    let max_key = spots.iter().map(&key_fn).fold(f64::NEG_INFINITY, f64::max);
 
     if (max_key - min_key).abs() < 1e-9 {
         return;
     }
 
     let bucket_width = (max_key - min_key) / NUM_BUCKETS as f64;
-    let mut bucket_sums = vec![0.0_f64; NUM_BUCKETS];
-    let mut bucket_counts = vec![0_u32; NUM_BUCKETS];
+    let mut bucket_sums = [0.0_f64; NUM_BUCKETS];
+    let mut bucket_counts = [0_u32; NUM_BUCKETS];
 
     for spot in spots {
         let k = key_fn(spot);
@@ -1059,15 +1056,15 @@ where
         return;
     }
 
-    let min_key = spots.iter().map(|s| key_fn(s)).fold(f64::INFINITY, f64::min);
-    let max_key = spots.iter().map(|s| key_fn(s)).fold(f64::NEG_INFINITY, f64::max);
+    let min_key = spots.iter().map(&key_fn).fold(f64::INFINITY, f64::min);
+    let max_key = spots.iter().map(&key_fn).fold(f64::NEG_INFINITY, f64::max);
 
     if (max_key - min_key).abs() < 1e-9 {
         return;
     }
 
     let bucket_width = (max_key - min_key) / NUM_BUCKETS as f64;
-    let mut bucket_counts = vec![0_u32; NUM_BUCKETS];
+    let mut bucket_counts = [0_u32; NUM_BUCKETS];
 
     for spot in spots {
         let k = key_fn(spot);
@@ -1082,10 +1079,9 @@ where
     }
 
     println!("\n{title}:");
-    for i in 0..NUM_BUCKETS {
+    for (i, &count) in bucket_counts.iter().enumerate() {
         let lo = min_key + i as f64 * bucket_width;
         let hi = lo + bucket_width;
-        let count = bucket_counts[i];
         let bar_len = ((count as f64 / max_count as f64) * BAR_WIDTH as f64).round() as usize;
         let bar: String = "█".repeat(bar_len);
         println!("  {:>6.0}-{:<6.0} |{:<width$}| {}", lo, hi, bar, count, width = BAR_WIDTH);

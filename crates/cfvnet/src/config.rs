@@ -226,18 +226,10 @@ fn default_encoder_threads() -> usize {
         .max(1)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EvaluationConfig {
     #[serde(default)]
     pub regression_spots: Option<String>,
-}
-
-impl Default for EvaluationConfig {
-    fn default() -> Self {
-        Self {
-            regression_spots: None,
-        }
-    }
 }
 
 #[cfg(test)]
