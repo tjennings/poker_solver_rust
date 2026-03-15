@@ -597,16 +597,6 @@ impl CfvSubgameSolver {
         let n = self.hands.combos.len();
         let num_nodes = self.tree.nodes.len();
 
-        // Print diagnostics.
-        let decision_count = self.tree.nodes.iter().filter(|n| matches!(n, GameNode::Decision { .. })).count();
-        let chance_count = self.tree.nodes.iter().filter(|n| matches!(n, GameNode::Chance { .. })).count();
-        let fold_count = self.tree.nodes.iter().filter(|n| matches!(n, GameNode::Terminal { kind: TerminalKind::Fold { .. }, .. })).count();
-        let showdown_count = self.tree.nodes.iter().filter(|n| matches!(n, GameNode::Terminal { kind: TerminalKind::Showdown, .. })).count();
-        let boundary_count = self.tree.nodes.iter().filter(|n| matches!(n, GameNode::Terminal { kind: TerminalKind::DepthBoundary, .. })).count();
-        eprintln!("[cfv-solver] tree: {} nodes ({} decision, {} chance, {} fold, {} showdown, {} boundary), {} combos, {} boundaries, layout_size={}, cfv_buf={}",
-            num_nodes, decision_count, chance_count, fold_count, showdown_count, boundary_count,
-            n, self.boundary_info.boundaries.len(), self.layout.total_size, num_nodes * n);
-
         // Pre-allocate all scratch buffers once, reused across all iterations.
         let reach_init = vec![1.0; n];
         let mut cfv_buf = vec![0.0; num_nodes * n];
@@ -616,12 +606,8 @@ impl CfvSubgameSolver {
 
         for iter_idx in 0..iterations {
             self.iteration += 1;
-            let diag = iter_idx == 0;
-            let iter_start = std::time::Instant::now();
 
-            let t0 = std::time::Instant::now();
             let snapshot = self.build_strategy_snapshot();
-            if diag { eprintln!("[cfv-solver]   snapshot: {:?}", t0.elapsed()); }
 
             // Determine whether to re-evaluate leaf boundaries this iteration.
             let should_eval = if leaf_eval_interval == 0 {
@@ -633,7 +619,6 @@ impl CfvSubgameSolver {
             };
 
             // Propagate ranges once (shared between both traversers).
-            let t0 = std::time::Instant::now();
             let boundary_ranges =
                 if should_eval && !self.boundary_info.boundaries.is_empty() {
                     Some(self.propagate_ranges(
@@ -642,11 +627,9 @@ impl CfvSubgameSolver {
                 } else {
                     None
                 };
-            if diag { eprintln!("[cfv-solver]   propagate: {:?} (eval={})", t0.elapsed(), should_eval); }
 
             // Evaluate leaf CFVs and traverse for each traverser.
             for traverser in 0..2u8 {
-                let t0 = std::time::Instant::now();
                 if let Some((ref oop_ranges, ref ip_ranges)) = boundary_ranges {
                     for (b_idx, &(_, pot, invested)) in
                         self.boundary_info.boundaries.iter().enumerate()
@@ -664,9 +647,7 @@ impl CfvSubgameSolver {
                         );
                     }
                 }
-                if diag { eprintln!("[cfv-solver]   eval t={}: {:?}", traverser, t0.elapsed()); }
 
-                let t0 = std::time::Instant::now();
                 self.cfr_traverse_vectorized(
                     self.tree.root as usize,
                     traverser,
@@ -676,7 +657,6 @@ impl CfvSubgameSolver {
                     &mut cfv_buf,
                     &mut reach_pool,
                 );
-                if diag { eprintln!("[cfv-solver]   traverse t={}: {:?}", traverser, t0.elapsed()); }
             }
 
             let iter_u64 = u64::from(self.iteration);
@@ -685,7 +665,6 @@ impl CfvSubgameSolver {
                 self.dcfr
                     .discount_strategy_sums(&mut self.strategy_sum, iter_u64);
             }
-            if diag { eprintln!("[cfv-solver]   total iter 1: {:?}", iter_start.elapsed()); }
         }
     }
 
