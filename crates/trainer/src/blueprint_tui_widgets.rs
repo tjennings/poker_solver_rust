@@ -117,15 +117,11 @@ impl Widget for &HandGridWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         use poker_solver_core::hands::CanonicalHand;
 
-        // Always 2-row cells: top = stacked color bar, bottom = hand label.
-        // Clips gracefully if terminal is too short.
-        let cell_h: u16 = 2;
-        // Need at least 1 title row + 1 complete cell (2 rows) = 3 rows.
-        if area.height < 3 || area.width < 13 {
+        // 3-row cells: row 0-1 = stacked color bar, row 2 = hand label.
+        let cell_h: u16 = 3;
+        if area.height < 4 || area.width < 13 {
             return;
         }
-
-        let border = Color::Rgb(0, 0, 0); // black cell border
 
         // ── Title row ────────────────────────────────────────────────
         let title = format!(
@@ -135,16 +131,16 @@ impl Widget for &HandGridWidget<'_> {
         buf.set_string(area.x, area.y, &title, Style::default().bold());
 
         // ── Grid rows ───────────────────────────────────────────────
-        // Each cell is cell_w wide with the last column reserved for a
-        // black vertical border, giving (cell_w - 1) usable content chars.
+        // Last column of each cell is a vertical border (black or blue).
         let cell_w = cell_width(area.width);
-        let content_w = cell_w.saturating_sub(1).max(2); // at least 2 content chars
+        let content_w = cell_w.saturating_sub(1).max(2);
         let grid_x0 = area.x;
         let grid_y0 = area.y + 1;
         for r in 0..13u16 {
-            let y_top = grid_y0 + r * cell_h; // color bar row
-            let y_bot = y_top + 1;             // hand label row
-            if y_bot >= area.y + area.height {
+            let y0 = grid_y0 + r * cell_h;       // color bar row 1
+            let y1 = y0 + 1;                      // color bar row 2
+            let y2 = y0 + 2;                      // hand label row
+            if y0 >= area.y + area.height {
                 break;
             }
 
@@ -155,51 +151,61 @@ impl Widget for &HandGridWidget<'_> {
                     continue;
                 }
 
-                let hand_label = CanonicalHand::from_matrix_position(r as usize, c as usize)
-                    .map_or_else(|| "   ".to_string(), |h| format!("{h}"));
-
-                // Top row: stacked color bar (content_w chars) + border
-                if cell.actions.is_empty() {
-                    let style = Style::default().bg(Color::Rgb(40, 40, 40));
-                    for dx in 0..content_w {
-                        buf.set_string(x + dx, y_top, " ", style);
+                // Determine border color: blue if strategy changed, black otherwise.
+                let border_color = if let Some(ref prev) = self.state.prev_cells {
+                    if !cell.is_converged(&prev[r as usize][c as usize], 0.01) {
+                        Color::Rgb(60, 120, 255)
+                    } else {
+                        Color::Rgb(0, 0, 0)
                     }
                 } else {
-                    render_color_bar(buf, x, y_top, content_w, &cell.actions);
-                }
-                // Vertical border on top row
-                buf.set_string(x + content_w, y_top, " ", Style::default().bg(border));
-
-                // Bottom row: hand label on dominant action color background
-                let bg_color = if cell.actions.is_empty() {
-                    Color::Rgb(40, 40, 40)
-                } else {
-                    let (dom_name, _) = cell.dominant_action();
-                    dominant_action_color(dom_name, &cell.actions)
+                    Color::Rgb(0, 0, 0)
                 };
-                let label_style = Style::default().bg(bg_color).fg(Color::White);
-                let label_len = hand_label.len().min(content_w as usize);
-                buf.set_string(x, y_bot, &hand_label[..label_len], label_style);
-                let pad_style = Style::default().bg(bg_color);
-                for dx in label_len as u16..content_w {
-                    buf.set_string(x + dx, y_bot, " ", pad_style);
-                }
-                // Vertical border on bottom row
-                buf.set_string(x + content_w, y_bot, " ", Style::default().bg(border));
+                let border_style = Style::default().bg(border_color);
 
-                // Blue underline for cells that changed since last snapshot.
-                if let Some(ref prev) = self.state.prev_cells {
-                    if !cell.is_converged(&prev[r as usize][c as usize], 0.01) {
+                // Rows 0-1: stacked color bar (doubled height)
+                for &y in &[y0, y1] {
+                    if y >= area.y + area.height {
+                        break;
+                    }
+                    if cell.actions.is_empty() {
+                        let style = Style::default().bg(Color::Rgb(40, 40, 40));
                         for dx in 0..content_w {
-                            let buf_cell = &mut buf[(x + dx, y_top)];
-                            buf_cell.set_style(
-                                buf_cell
-                                    .style()
-                                    .underlined()
-                                    .underline_color(Color::Rgb(60, 120, 255)),
+                            buf.set_string(x + dx, y, " ", style);
+                        }
+                    } else {
+                        render_color_bar(buf, x, y, content_w, &cell.actions);
+                    }
+                    buf.set_string(x + content_w, y, " ", border_style);
+                }
+
+                // Row 2: hand label (black bg) + remainder = color bar
+                if y2 < area.y + area.height {
+                    let hand_label =
+                        CanonicalHand::from_matrix_position(r as usize, c as usize)
+                            .map_or_else(|| "   ".to_string(), |h| format!("{h}"));
+                    let label_len = hand_label.len().min(content_w as usize);
+                    let label_style =
+                        Style::default().bg(Color::Rgb(0, 0, 0)).fg(Color::White);
+                    buf.set_string(x, y2, &hand_label[..label_len], label_style);
+
+                    // Fill remainder with the color bar pattern
+                    let remainder_start = label_len as u16;
+                    if remainder_start < content_w {
+                        if cell.actions.is_empty() {
+                            let style = Style::default().bg(Color::Rgb(40, 40, 40));
+                            for dx in remainder_start..content_w {
+                                buf.set_string(x + dx, y2, " ", style);
+                            }
+                        } else {
+                            // Render full color bar then we already wrote the label
+                            // over the first chars — just render the tail portion.
+                            render_color_bar_offset(
+                                buf, x, y2, content_w, &cell.actions, remainder_start,
                             );
                         }
                     }
+                    buf.set_string(x + content_w, y2, " ", border_style);
                 }
             }
         }
@@ -345,6 +351,69 @@ fn render_color_bar(buf: &mut Buffer, x: u16, y: u16, w: u16, actions: &[(String
     }
 }
 
+/// Like `render_color_bar` but only writes characters from column `skip` onward.
+/// Used for the label row where the first few chars are the hand name on black.
+fn render_color_bar_offset(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    w: u16,
+    actions: &[(String, f32)],
+    skip: u16,
+) {
+    let total: f32 = actions.iter().map(|(_, f)| f).sum();
+    if total <= 0.0 {
+        let style = Style::default().bg(Color::Rgb(40, 40, 40));
+        for dx in skip..w {
+            buf.set_string(x + dx, y, " ", style);
+        }
+        return;
+    }
+
+    let mut sorted: Vec<_> = actions.to_vec();
+    sorted.sort_by_key(|(name, _)| action_sort_key(name));
+
+    let bet_ranks: Vec<Option<(usize, usize)>> = {
+        let total_bets = sorted.iter().filter(|(n, _)| is_bet_or_raise(n)).count();
+        let mut rank = 0;
+        sorted
+            .iter()
+            .map(|(n, _)| {
+                if is_bet_or_raise(n) {
+                    let r = rank;
+                    rank += 1;
+                    Some((r, total_bets))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    let mut col = 0_u16;
+    let mut cumulative = 0.0_f32;
+    for (i, (name, freq)) in sorted.iter().enumerate() {
+        cumulative += freq / total;
+        let end = if i == sorted.len() - 1 {
+            w
+        } else {
+            (cumulative * w as f32).round() as u16
+        };
+        let color = if let Some((rank, total_bets)) = bet_ranks[i] {
+            action_color_ranked(name, rank, total_bets)
+        } else {
+            action_color(name)
+        };
+        let style = Style::default().bg(color);
+        while col < end && col < w {
+            if col >= skip {
+                buf.set_string(x + col, y, " ", style);
+            }
+            col += 1;
+        }
+    }
+}
+
 /// Get the color for the dominant action, respecting bet/raise rank gradient.
 fn dominant_action_color(dom_name: &str, actions: &[(String, f32)]) -> Color {
     if is_bet_or_raise(dom_name) {
@@ -479,7 +548,7 @@ mod tests {
     fn widget_renders_without_panic() {
         let state = mock_grid_state();
         let widget = HandGridWidget { state: &state };
-        let backend = TestBackend::new(80, 30);
+        let backend = TestBackend::new(80, 45);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
@@ -491,7 +560,7 @@ mod tests {
     #[timed_test(10)]
     fn widget_renders_convergence_border() {
         // Create grid with prev_cells that are very similar -> converged
-        // cells should render the bright green left border.
+        // cells should render blue border on changed cells.
         let mut state = mock_grid_state();
         let mut prev = state.cells.clone();
         // Slightly perturb prev to make them converged (delta < 0.01)
@@ -500,8 +569,7 @@ mod tests {
         }
         state.prev_cells = Some(prev);
 
-        // Use a wide terminal so cell_w >= 4, enabling the indicator.
-        let backend = TestBackend::new(160, 30);
+        let backend = TestBackend::new(160, 45);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
