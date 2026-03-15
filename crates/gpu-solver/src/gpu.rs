@@ -1482,13 +1482,17 @@ impl GpuContext {
     /// feature vectors for the river CFV network. One thread per
     /// (boundary, river_card, spot) triple.
     ///
+    /// Supports per-spot boards: each spot may have a different 4-card
+    /// turn board, so `boards` is `[num_spots * 4]` and `river_cards`
+    /// is `[num_spots * num_rivers]`.
+    ///
     /// # Layout
     /// - `output`: `[num_boundaries * num_rivers * num_spots * 2720]`
     /// - `reach_oop`: `[num_nodes * total_hands]`
     /// - `reach_ip`: `[num_nodes * total_hands]`
     /// - `boundary_nodes`: `[num_boundaries]` node IDs
-    /// - `turn_board`: `[4]` turn board cards
-    /// - `river_cards`: `[num_rivers]` possible river cards
+    /// - `boards`: `[num_spots * 4]` per-spot turn board cards
+    /// - `river_cards`: `[num_spots * num_rivers]` per-spot possible river cards
     /// - `boundary_pots`: `[num_boundaries]` pot at each boundary
     /// - `boundary_stacks`: `[num_boundaries]` stack at each boundary
     /// - `combo_cards`: `[1326 * 2]` card pairs per combo
@@ -1499,7 +1503,7 @@ impl GpuContext {
         reach_oop: &CudaSlice<f32>,
         reach_ip: &CudaSlice<f32>,
         boundary_nodes: &CudaSlice<u32>,
-        turn_board: &CudaSlice<u32>,
+        boards: &CudaSlice<u32>,
         river_cards: &CudaSlice<u32>,
         boundary_pots: &CudaSlice<f32>,
         boundary_stacks: &CudaSlice<f32>,
@@ -1524,7 +1528,7 @@ impl GpuContext {
                 .arg(reach_oop)
                 .arg(reach_ip)
                 .arg(boundary_nodes)
-                .arg(turn_board)
+                .arg(boards)
                 .arg(river_cards)
                 .arg(boundary_pots)
                 .arg(boundary_stacks)
@@ -2346,22 +2350,42 @@ mod tests {
         let result = gpu.download(&gpu_output).unwrap();
         assert_eq!(result.len(), 2720);
 
-        // Check OOP range: combos containing card 4 should be zeroed
-        // Combo 0 is cards (0,1) which don't conflict with river=4, so should be 0.5
+        // Check OOP range: combos conflicting with board or river should be zeroed.
+        // Board = cards [0,1,2,3], river = card 4.
+        // Combo 0 is cards (0,1) which conflicts with board, so should be 0.
         assert!(
-            (result[0] - 0.5).abs() < 1e-6,
-            "combo 0 oop should be 0.5, got {}",
+            result[0].abs() < 1e-6,
+            "combo 0 conflicts with board, should be 0, got {}",
             result[0]
         );
 
-        // Find a combo that contains card 4 (3c) — should be zeroed
-        // Combo index for (0, 4) — card_pair_to_index(0, 4) = some index
-        // combo_cards[idx*2] == 0, combo_cards[idx*2+1] == 4
+        // Find a combo that doesn't conflict with board or river -- should be 0.5
+        let board_and_river = [0u32, 1, 2, 3, 4];
+        let mut clean_idx = None;
+        for c in 0..1326 {
+            let c1 = combo_cards_flat[c * 2];
+            let c2 = combo_cards_flat[c * 2 + 1];
+            if !board_and_river.contains(&c1) && !board_and_river.contains(&c2) {
+                clean_idx = Some(c);
+                break;
+            }
+        }
+        if let Some(idx) = clean_idx {
+            assert!(
+                (result[idx] - 0.5).abs() < 1e-6,
+                "combo {} has no conflicts, should be 0.5, got {}",
+                idx,
+                result[idx]
+            );
+        }
+
+        // Find a combo that contains card 4 (river) -- should be zeroed
         let mut conflict_idx = None;
         for c in 0..1326 {
             let c1 = combo_cards_flat[c * 2];
             let c2 = combo_cards_flat[c * 2 + 1];
-            if c1 == 4 || c2 == 4 {
+            if (c1 == 4 || c2 == 4) && !board_and_river[..4].contains(&c1) && !board_and_river[..4].contains(&c2) {
+                // Only conflicts with river, not board
                 conflict_idx = Some(c);
                 break;
             }
