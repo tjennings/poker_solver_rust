@@ -398,47 +398,50 @@ impl<'a> BatchGpuSolver<'a> {
         // --- Build terminal data with per-hand payoffs ---
         // Terminal nodes and fold_player are shared (same topology).
         // Payoffs differ per spot, so we broadcast per-spot payoffs to per-hand arrays.
+        //
+        // Two-pass approach: first identify terminals, then fill payoff arrays in parallel.
 
+        use rayon::prelude::*;
+
+        // Pass 1: classify terminals and collect per-terminal per-spot scalar payoffs
         let mut fold_nodes = Vec::new();
-        let mut fold_win_per_hand = Vec::new();
-        let mut fold_lose_per_hand = Vec::new();
         let mut fold_pl = Vec::new();
+        // Per fold terminal: [num_spots] scalar payoffs
+        let mut fold_win_scalars: Vec<Vec<f32>> = Vec::new();
+        let mut fold_lose_scalars: Vec<Vec<f32>> = Vec::new();
 
         let mut showdown_nodes = Vec::new();
-        let mut showdown_win_per_hand = Vec::new();
-        let mut showdown_lose_per_hand = Vec::new();
+        let mut showdown_win_scalars: Vec<Vec<f32>> = Vec::new();
+        let mut showdown_lose_scalars: Vec<Vec<f32>> = Vec::new();
 
         for (term_idx, &node_id) in ref_tree.terminal_indices.iter().enumerate() {
             match ref_tree.node_types[node_id as usize] {
                 NodeType::TerminalFold => {
                     fold_nodes.push(node_id);
-                    // Per-hand payoffs: each hand gets its spot's payoff
-                    for (spot_idx, si) in spot_infos.iter().enumerate() {
+                    let payoff_ref = &spot_infos[0].flat_tree.fold_payoffs[term_idx];
+                    fold_pl.push(payoff_ref[2] as u32);
+                    let mut wins = Vec::with_capacity(num_spots);
+                    let mut loses = Vec::with_capacity(num_spots);
+                    for si in spot_infos.iter() {
                         let payoff = &si.flat_tree.fold_payoffs[term_idx];
-                        let win = payoff[0];
-                        let lose = payoff[1];
-                        for _h in 0..hands_per_spot {
-                            fold_win_per_hand.push(win);
-                            fold_lose_per_hand.push(lose);
-                        }
-                        // fold_player is the same for all spots (same topology)
-                        if spot_idx == 0 {
-                            fold_pl.push(payoff[2] as u32);
-                        }
+                        wins.push(payoff[0]);
+                        loses.push(payoff[1]);
                     }
+                    fold_win_scalars.push(wins);
+                    fold_lose_scalars.push(loses);
                 }
                 NodeType::TerminalShowdown => {
                     showdown_nodes.push(node_id);
+                    let mut wins = Vec::with_capacity(num_spots);
+                    let mut loses = Vec::with_capacity(num_spots);
                     for si in spot_infos.iter() {
                         let eq_id = si.flat_tree.showdown_equity_ids[term_idx] as usize;
                         let eq = &si.flat_tree.equity_tables[eq_id];
-                        let win = eq[0];
-                        let lose = eq[1];
-                        for _h in 0..hands_per_spot {
-                            showdown_win_per_hand.push(win);
-                            showdown_lose_per_hand.push(lose);
-                        }
+                        wins.push(eq[0]);
+                        loses.push(eq[1]);
                     }
+                    showdown_win_scalars.push(wins);
+                    showdown_lose_scalars.push(loses);
                 }
                 _ => {}
             }
@@ -446,6 +449,45 @@ impl<'a> BatchGpuSolver<'a> {
 
         let num_fold_terminals = fold_nodes.len() as u32;
         let num_showdown_terminals = showdown_nodes.len() as u32;
+
+        // Pass 2: broadcast scalar payoffs to per-hand arrays in parallel
+        let fold_term_count = fold_nodes.len();
+        let mut fold_win_per_hand = vec![0.0f32; fold_term_count * total_hands];
+        let mut fold_lose_per_hand = vec![0.0f32; fold_term_count * total_hands];
+
+        fold_win_per_hand
+            .par_chunks_exact_mut(total_hands)
+            .zip(fold_lose_per_hand.par_chunks_exact_mut(total_hands))
+            .enumerate()
+            .for_each(|(term_idx, (win_chunk, lose_chunk))| {
+                for (spot_idx, (spot_win, spot_lose)) in win_chunk
+                    .chunks_exact_mut(hands_per_spot)
+                    .zip(lose_chunk.chunks_exact_mut(hands_per_spot))
+                    .enumerate()
+                {
+                    spot_win.fill(fold_win_scalars[term_idx][spot_idx]);
+                    spot_lose.fill(fold_lose_scalars[term_idx][spot_idx]);
+                }
+            });
+
+        let sd_term_count = showdown_nodes.len();
+        let mut showdown_win_per_hand = vec![0.0f32; sd_term_count * total_hands];
+        let mut showdown_lose_per_hand = vec![0.0f32; sd_term_count * total_hands];
+
+        showdown_win_per_hand
+            .par_chunks_exact_mut(total_hands)
+            .zip(showdown_lose_per_hand.par_chunks_exact_mut(total_hands))
+            .enumerate()
+            .for_each(|(term_idx, (win_chunk, lose_chunk))| {
+                for (spot_idx, (spot_win, spot_lose)) in win_chunk
+                    .chunks_exact_mut(hands_per_spot)
+                    .zip(lose_chunk.chunks_exact_mut(hands_per_spot))
+                    .enumerate()
+                {
+                    spot_win.fill(showdown_win_scalars[term_idx][spot_idx]);
+                    spot_lose.fill(showdown_lose_scalars[term_idx][spot_idx]);
+                }
+            });
 
         // Ensure non-empty buffers for GPU
         if fold_nodes.is_empty() {
@@ -676,15 +718,19 @@ impl<'a> BatchGpuSolver<'a> {
         num_spots: usize,
         hands_per_spot: usize,
     ) -> Vec<u32> {
+        use rayon::prelude::*;
+
         let mut sorted = vec![0u32; num_spots * hands_per_spot];
-        for spot in 0..num_spots {
-            let base = spot * hands_per_spot;
-            let spot_slice = &mut sorted[base..base + hands_per_spot];
-            for (i, val) in spot_slice.iter_mut().enumerate() {
-                *val = i as u32;
-            }
-            spot_slice.sort_by_key(|&i| strengths[base + i as usize]);
-        }
+        sorted
+            .par_chunks_exact_mut(hands_per_spot)
+            .enumerate()
+            .for_each(|(spot, spot_slice)| {
+                let base = spot * hands_per_spot;
+                for (i, val) in spot_slice.iter_mut().enumerate() {
+                    *val = i as u32;
+                }
+                spot_slice.sort_by_key(|&i| strengths[base + i as usize]);
+            });
         sorted
     }
 
@@ -704,26 +750,30 @@ impl<'a> BatchGpuSolver<'a> {
         num_spots: usize,
         hands_per_spot: usize,
     ) -> Vec<u32> {
+        use rayon::prelude::*;
+
         let mut rank = vec![0u32; num_spots * hands_per_spot];
-        for spot in 0..num_spots {
-            let base = spot * hands_per_spot;
+        rank.par_chunks_exact_mut(hands_per_spot)
+            .enumerate()
+            .for_each(|(spot, spot_slice)| {
+                let base = spot * hands_per_spot;
 
-            // Build sorted opponent strengths for binary search
-            let opp_sorted_strengths: Vec<u32> = (0..hands_per_spot)
-                .map(|r| {
-                    let opp_local = opp_sorted_indices[base + r] as usize;
-                    opp_strengths[base + opp_local]
-                })
-                .collect();
+                // Build sorted opponent strengths for binary search
+                let opp_sorted_strengths: Vec<u32> = (0..hands_per_spot)
+                    .map(|r| {
+                        let opp_local = opp_sorted_indices[base + r] as usize;
+                        opp_strengths[base + opp_local]
+                    })
+                    .collect();
 
-            for h in 0..hands_per_spot {
-                let trav_str = trav_strengths[base + h];
-                // Find first position where opponent strength >= trav_str
-                // That position = # of opponent hands strictly weaker
-                let pos = opp_sorted_strengths.partition_point(|&s| s < trav_str);
-                rank[base + h] = pos as u32;
-            }
-        }
+                for (h, rank_val) in spot_slice.iter_mut().enumerate() {
+                    let trav_str = trav_strengths[base + h];
+                    // Find first position where opponent strength >= trav_str
+                    // That position = # of opponent hands strictly weaker
+                    let pos = opp_sorted_strengths.partition_point(|&s| s < trav_str);
+                    *rank_val = pos as u32;
+                }
+            });
         rank
     }
 
@@ -739,25 +789,30 @@ impl<'a> BatchGpuSolver<'a> {
         num_spots: usize,
         hands_per_spot: usize,
     ) -> Vec<u32> {
+        use rayon::prelude::*;
+
         let mut rank_next = vec![0u32; num_spots * hands_per_spot];
-        for spot in 0..num_spots {
-            let base = spot * hands_per_spot;
+        rank_next
+            .par_chunks_exact_mut(hands_per_spot)
+            .enumerate()
+            .for_each(|(spot, spot_slice)| {
+                let base = spot * hands_per_spot;
 
-            let opp_sorted_strengths: Vec<u32> = (0..hands_per_spot)
-                .map(|r| {
-                    let opp_local = opp_sorted_indices[base + r] as usize;
-                    opp_strengths[base + opp_local]
-                })
-                .collect();
+                let opp_sorted_strengths: Vec<u32> = (0..hands_per_spot)
+                    .map(|r| {
+                        let opp_local = opp_sorted_indices[base + r] as usize;
+                        opp_strengths[base + opp_local]
+                    })
+                    .collect();
 
-            for h in 0..hands_per_spot {
-                let trav_str = trav_strengths[base + h];
-                // Find first position where opponent strength > trav_str
-                // That position = # of opponent hands with strength <= trav_str
-                let pos = opp_sorted_strengths.partition_point(|&s| s <= trav_str);
-                rank_next[base + h] = pos as u32;
-            }
-        }
+                for (h, rank_val) in spot_slice.iter_mut().enumerate() {
+                    let trav_str = trav_strengths[base + h];
+                    // Find first position where opponent strength > trav_str
+                    // That position = # of opponent hands with strength <= trav_str
+                    let pos = opp_sorted_strengths.partition_point(|&s| s <= trav_str);
+                    *rank_val = pos as u32;
+                }
+            });
         rank_next
     }
 

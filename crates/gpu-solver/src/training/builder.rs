@@ -263,24 +263,30 @@ impl GpuBatchBuilder {
         let num_fold_terminals = fold_nodes.len();
         let num_showdown_terminals = showdown_nodes.len();
 
-        // Build per-hand payoffs by broadcasting reference payoffs
-        let mut fold_win_per_hand = Vec::with_capacity(num_fold_terminals * total_hands);
-        let mut fold_lose_per_hand = Vec::with_capacity(num_fold_terminals * total_hands);
-        for term_idx in 0..num_fold_terminals {
-            for _h in 0..total_hands {
-                fold_win_per_hand.push(fold_payoff_win_ref[term_idx]);
-                fold_lose_per_hand.push(fold_payoff_lose_ref[term_idx]);
-            }
-        }
+        // Build per-hand payoffs by broadcasting reference payoffs (parallel)
+        use rayon::prelude::*;
 
-        let mut showdown_win_per_hand = Vec::with_capacity(num_showdown_terminals * total_hands);
-        let mut showdown_lose_per_hand = Vec::with_capacity(num_showdown_terminals * total_hands);
-        for term_idx in 0..num_showdown_terminals {
-            for _h in 0..total_hands {
-                showdown_win_per_hand.push(showdown_payoff_win_ref[term_idx]);
-                showdown_lose_per_hand.push(showdown_payoff_lose_ref[term_idx]);
-            }
-        }
+        let mut fold_win_per_hand = vec![0.0f32; num_fold_terminals * total_hands];
+        let mut fold_lose_per_hand = vec![0.0f32; num_fold_terminals * total_hands];
+        fold_win_per_hand
+            .par_chunks_exact_mut(total_hands)
+            .zip(fold_lose_per_hand.par_chunks_exact_mut(total_hands))
+            .enumerate()
+            .for_each(|(term_idx, (win_chunk, lose_chunk))| {
+                win_chunk.fill(fold_payoff_win_ref[term_idx]);
+                lose_chunk.fill(fold_payoff_lose_ref[term_idx]);
+            });
+
+        let mut showdown_win_per_hand = vec![0.0f32; num_showdown_terminals * total_hands];
+        let mut showdown_lose_per_hand = vec![0.0f32; num_showdown_terminals * total_hands];
+        showdown_win_per_hand
+            .par_chunks_exact_mut(total_hands)
+            .zip(showdown_lose_per_hand.par_chunks_exact_mut(total_hands))
+            .enumerate()
+            .for_each(|(term_idx, (win_chunk, lose_chunk))| {
+                win_chunk.fill(showdown_payoff_win_ref[term_idx]);
+                lose_chunk.fill(showdown_payoff_lose_ref[term_idx]);
+            });
 
         // Ensure non-empty buffers
         if fold_nodes.is_empty() {
@@ -327,15 +333,17 @@ impl GpuBatchBuilder {
         gpu: &GpuContext,
         total_hands: usize,
     ) -> Result<CudaSlice<u32>, GpuError> {
+        use rayon::prelude::*;
+
         // Build on CPU and upload — this is a one-time static lookup.
         // combo_cards_flat is [1326 * 2].
         let combo_cards_flat = super::hand_eval::build_combo_cards_flat();
-        let mut hand_cards = Vec::with_capacity(total_hands * 2);
-        for h in 0..total_hands {
+        let mut hand_cards = vec![0u32; total_hands * 2];
+        hand_cards.par_chunks_exact_mut(2).enumerate().for_each(|(h, pair)| {
             let combo = h % 1326;
-            hand_cards.push(combo_cards_flat[combo * 2]);
-            hand_cards.push(combo_cards_flat[combo * 2 + 1]);
-        }
+            pair[0] = combo_cards_flat[combo * 2];
+            pair[1] = combo_cards_flat[combo * 2 + 1];
+        });
         gpu.upload(&hand_cards)
     }
 
