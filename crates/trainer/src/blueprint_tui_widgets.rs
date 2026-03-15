@@ -120,8 +120,10 @@ pub struct HandGridWidget<'a> {
 
 impl Widget for &HandGridWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // Layout: 2 header rows, 13 grid rows, 2 footer rows = 17 minimum.
-        if area.height < 17 || area.width < 15 {
+        use poker_solver_core::hands::CanonicalHand;
+
+        // Layout: 1 header row, 26 grid rows (13×2), 2 footer rows = 29 minimum.
+        if area.height < 29 || area.width < 13 {
             return; // too small to render
         }
 
@@ -132,27 +134,16 @@ impl Widget for &HandGridWidget<'_> {
         );
         buf.set_string(area.x, area.y, &title, Style::default().bold());
 
-        // ── Column labels ────────────────────────────────────────────
-        let col_y = area.y + 1;
+        // ── Grid rows (no axis labels) ───────────────────────────────
         let cell_w = cell_width(area.width);
-        let grid_x0 = area.x + 3; // space for row label + " "
-        for (c, label) in RANK_LABELS.iter().enumerate() {
-            let x = grid_x0 + (c as u16) * cell_w;
-            if x < area.x + area.width {
-                buf.set_string(x, col_y, label, Style::default().dim());
-            }
-        }
-
-        // ── Grid rows ───────────────────────────────────────────────
-        let grid_y0 = area.y + 2;
+        let grid_x0 = area.x;
+        let grid_y0 = area.y + 1;
         for r in 0..13u16 {
-            let y = grid_y0 + r;
-            if y >= area.y + area.height {
+            let y_top = grid_y0 + r * 2;     // color bar row
+            let y_bot = grid_y0 + r * 2 + 1; // hand label row
+            if y_bot >= area.y + area.height {
                 break;
             }
-
-            // Row label
-            buf.set_string(area.x, y, RANK_LABELS[r as usize], Style::default().dim());
 
             for c in 0..13u16 {
                 let cell = &self.state.cells[r as usize][c as usize];
@@ -161,22 +152,39 @@ impl Widget for &HandGridWidget<'_> {
                     continue;
                 }
 
-                // Stacked color bar: each character gets the color of the
-                // action whose cumulative frequency covers that position.
+                // Top row: stacked color bar
                 if cell.actions.is_empty() {
                     let style = Style::default().bg(Color::Rgb(40, 40, 40));
                     for dx in 0..cell_w {
-                        buf.set_string(x + dx, y, " ", style);
+                        buf.set_string(x + dx, y_top, " ", style);
                     }
                 } else {
-                    render_color_bar(buf, x, y, cell_w, &cell.actions);
+                    render_color_bar(buf, x, y_top, cell_w, &cell.actions);
                 }
 
-                // Blue underline on cells that changed since last snapshot.
+                // Bottom row: hand label on dominant action color background
+                let hand_label = CanonicalHand::from_matrix_position(r as usize, c as usize)
+                    .map_or_else(|| "   ".to_string(), |h| format!("{h}"));
+                let bg_color = if cell.actions.is_empty() {
+                    Color::Rgb(40, 40, 40)
+                } else {
+                    let (dom_name, _) = cell.dominant_action();
+                    dominant_action_color(dom_name, &cell.actions)
+                };
+                let label_style = Style::default().bg(bg_color).fg(Color::White);
+                // Write label left-aligned, pad rest with bg color
+                let label_len = hand_label.len().min(cell_w as usize);
+                buf.set_string(x, y_bot, &hand_label[..label_len], label_style);
+                let pad_style = Style::default().bg(bg_color);
+                for dx in label_len as u16..cell_w {
+                    buf.set_string(x + dx, y_bot, " ", pad_style);
+                }
+
+                // Blue underline on top row for cells that changed since last snapshot.
                 if let Some(ref prev) = self.state.prev_cells {
                     if !cell.is_converged(&prev[r as usize][c as usize], 0.01) {
                         for dx in 0..cell_w {
-                            let buf_cell = &mut buf[(x + dx, y)];
+                            let buf_cell = &mut buf[(x + dx, y_top)];
                             buf_cell.set_style(
                                 buf_cell
                                     .style()
@@ -185,14 +193,12 @@ impl Widget for &HandGridWidget<'_> {
                             );
                         }
                     }
-                } else {
-                    render_color_bar(buf, x, y, cell_w, &cell.actions);
                 }
             }
         }
 
         // ── Footer ──────────────────────────────────────────────────
-        let footer_y = grid_y0 + 13;
+        let footer_y = grid_y0 + 26;
         if footer_y < area.y + area.height {
             let board = self
                 .state
@@ -218,7 +224,6 @@ impl Widget for &HandGridWidget<'_> {
         // ── Legend row ──────────────────────────────────────────────
         let legend_y = footer_y + 1;
         if legend_y < area.y + area.height {
-            // Collect unique action names from the grid, sorted to match cell order.
             let mut seen = Vec::new();
             for row in &self.state.cells {
                 for cell in row {
@@ -333,11 +338,27 @@ fn render_color_bar(buf: &mut Buffer, x: u16, y: u16, w: u16, actions: &[(String
     }
 }
 
+/// Get the color for the dominant action, respecting bet/raise rank gradient.
+fn dominant_action_color(dom_name: &str, actions: &[(String, f32)]) -> Color {
+    if is_bet_or_raise(dom_name) {
+        let mut sorted_names: Vec<_> = actions
+            .iter()
+            .filter(|(n, _)| is_bet_or_raise(n))
+            .map(|(n, _)| n.clone())
+            .collect();
+        sorted_names.sort_by_key(|n| action_sort_key(n));
+        let total_bets = sorted_names.len();
+        let rank = sorted_names.iter().position(|n| n == dom_name).unwrap_or(0);
+        action_color_ranked(dom_name, rank, total_bets)
+    } else {
+        action_color(dom_name)
+    }
+}
+
 /// Calculate per-cell character width from the available area width.
 fn cell_width(area_w: u16) -> u16 {
-    // 3 chars reserved for row label, remainder divided among 13 columns.
-    let usable = area_w.saturating_sub(3);
-    (usable / 13).max(3)
+    // No axis labels — full width divided among 13 columns.
+    (area_w / 13).max(3)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
