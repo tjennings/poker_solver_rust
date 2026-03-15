@@ -868,4 +868,47 @@ mod tests {
         let expl = compute_exploitability(&game);
         assert!(expl >= 0.0, "exploitability should be non-negative");
     }
+
+    #[test]
+    fn test_solver_convergence_depth_limited_turn() {
+        use crate::action_tree::*;
+        use crate::bet_size::*;
+        use crate::card::*;
+
+        let oop_range: crate::range::Range = "AA,KK,QQ,AKs".parse().unwrap();
+        let ip_range: crate::range::Range =
+            "QQ-JJ,AQs,AJs".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: NOT_DEALT,
+        };
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 100,
+            turn_bet_sizes: [sizes.clone(), sizes],
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let mut game =
+            PostFlopGame::with_config(card_config, tree).unwrap();
+        game.allocate_memory(false);
+
+        // Set uniform boundary CFVs (value = 0.0 for all hands)
+        let n_boundary = game.num_boundary_nodes();
+        for ordinal in 0..n_boundary {
+            game.set_boundary_cfvs(ordinal, 0, vec![0.0; game.num_private_hands(0)]);
+            game.set_boundary_cfvs(ordinal, 1, vec![0.0; game.num_private_hands(1)]);
+        }
+
+        let expl = solve(&mut game, 100, 0.0, false);
+        assert!(
+            expl < 10.0,
+            "Exploitability should decrease below 10.0 after 100 iters: {expl}"
+        );
+    }
 }

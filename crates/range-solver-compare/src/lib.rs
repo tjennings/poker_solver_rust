@@ -218,6 +218,7 @@ pub fn run_ours(config: &TestConfig, iterations: u32) -> SolveResult {
         add_allin_threshold: 1.5,
         force_allin_threshold: 0.15,
         merging_threshold: 0.1,
+        depth_limit: None,
     };
 
     let action_tree = ActionTree::new(tree_config).unwrap();
@@ -282,6 +283,7 @@ pub fn run_original(config: &TestConfig, iterations: u32) -> SolveResult {
         add_allin_threshold: 1.5,
         force_allin_threshold: 0.15,
         merging_threshold: 0.1,
+        depth_limit: None,
     };
 
     let action_tree = ActionTree::new(tree_config).unwrap();

@@ -15,6 +15,7 @@ pub(crate) const PLAYER_MASK: u8 = 3;
 pub(crate) const PLAYER_CHANCE_FLAG: u8 = 4; // chance_player = PLAYER_CHANCE_FLAG | prev_player
 pub(crate) const PLAYER_TERMINAL_FLAG: u8 = 8;
 pub(crate) const PLAYER_FOLD_FLAG: u8 = 24; // TERMINAL_FLAG(8) | 16
+pub const PLAYER_DEPTH_BOUNDARY_FLAG: u8 = 40; // TERMINAL_FLAG(8) | 32
 
 // ---------------------------------------------------------------------------
 // Action
@@ -122,6 +123,7 @@ impl fmt::Display for BoardState {
 ///     add_allin_threshold: 1.5,
 ///     force_allin_threshold: 0.15,
 ///     merging_threshold: 0.1,
+///     depth_limit: None,
 /// };
 /// ```
 #[derive(Debug, Clone, Default)]
@@ -176,6 +178,17 @@ pub struct TreeConfig {
     ///
     /// Personal recommendation: around `0.1`
     pub merging_threshold: f64,
+
+    /// Optional depth limit: maximum number of street transitions allowed.
+    ///
+    /// Street transitions are counted each time the tree would deal a new card
+    /// (flop->turn = 1, turn->river = 2). When the limit is reached, a depth
+    /// boundary terminal is emitted instead of a chance node. The boundary
+    /// node's counterfactual values must be supplied externally before solving
+    /// (e.g., from a neural network).
+    ///
+    /// `None` means no limit (default).
+    pub depth_limit: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +230,8 @@ struct BuildTreeInfo {
     oop_call_flag: bool,
     stack: [i32; 2],
     prev_amount: i32,
+    /// Number of street transitions that have occurred so far.
+    street_transitions: u8,
 }
 
 impl BuildTreeInfo {
@@ -229,6 +244,7 @@ impl BuildTreeInfo {
             oop_call_flag: false,
             stack: [stack, stack],
             prev_amount: 0,
+            street_transitions: 0,
         }
     }
 
@@ -239,6 +255,7 @@ impl BuildTreeInfo {
         let mut oop_call_flag = self.oop_call_flag;
         let mut stack = self.stack;
         let mut prev_amount = self.prev_amount;
+        let mut street_transitions = self.street_transitions;
 
         match action {
             Action::Check => {
@@ -257,6 +274,9 @@ impl BuildTreeInfo {
                 stack[player as usize] -= amount - prev_amount + to_call;
                 prev_amount = amount;
             }
+            Action::Chance(_) => {
+                street_transitions += 1;
+            }
             _ => {}
         }
 
@@ -267,6 +287,7 @@ impl BuildTreeInfo {
             oop_call_flag,
             stack,
             prev_amount,
+            street_transitions,
         }
     }
 }
@@ -618,14 +639,41 @@ impl ActionTree {
         if node.is_terminal() {
             // do nothing
         } else if node.is_chance() {
+            // Check if this street transition would exceed the depth limit.
+            // info.street_transitions counts transitions that have already happened.
+            // This chance node represents a new transition, so block it if
+            // street_transitions >= depth_limit.
+            let depth_limit_hit = self.config.depth_limit.is_some_and(|limit| {
+                info.street_transitions >= limit
+            });
+
+            if depth_limit_hit {
+                // Convert this chance node to a depth boundary terminal.
+                node.player = PLAYER_DEPTH_BOUNDARY_FLAG;
+                node.actions.clear();
+                node.children.clear();
+                return;
+            }
+
             let next_state = match node.board_state {
                 BoardState::Flop => BoardState::Turn,
                 BoardState::Turn => BoardState::River,
                 BoardState::River => unreachable!(),
             };
 
+            // For the all-in + flop case, the child is another chance node. Check
+            // whether the *next* transition (turn->river) would also exceed the depth
+            // limit. After processing this chance, street_transitions will be
+            // info.street_transitions + 1.
+            let second_transition_blocked = self.config.depth_limit.is_some_and(|limit| {
+                info.street_transitions + 1 >= limit
+            });
+
             let next_player = match (info.allin_flag, node.board_state) {
                 (false, _) => PLAYER_OOP,
+                (true, BoardState::Flop) if second_transition_blocked => {
+                    PLAYER_DEPTH_BOUNDARY_FLAG
+                }
                 (true, BoardState::Flop) => PLAYER_CHANCE_FLAG | PLAYER_CHANCE,
                 (true, _) => PLAYER_TERMINAL_FLAG,
             };
@@ -831,8 +879,13 @@ impl ActionTree {
         // merge bet actions with close amounts
         actions = merge_bet_actions(actions, pot, prev_amount, self.config.merging_threshold);
 
+        let depth_limit_reached = self.config.depth_limit.is_some_and(|limit| {
+            info.street_transitions >= limit
+        });
+
         let player_after_call = match node.board_state {
             BoardState::River => PLAYER_TERMINAL_FLAG,
+            _ if depth_limit_reached => PLAYER_DEPTH_BOUNDARY_FLAG,
             _ => PLAYER_CHANCE_FLAG | player,
         };
 
@@ -995,8 +1048,13 @@ impl ActionTree {
             };
         }
 
+        let depth_limit_reached = self.config.depth_limit.is_some_and(|limit| {
+            info.street_transitions >= limit
+        });
+
         let player_after_call = match node.board_state {
             BoardState::River => PLAYER_TERMINAL_FLAG,
+            _ if depth_limit_reached => PLAYER_DEPTH_BOUNDARY_FLAG,
             _ => PLAYER_CHANCE_FLAG | player,
         };
 
@@ -1113,14 +1171,16 @@ impl ActionTree {
 // ---------------------------------------------------------------------------
 
 /// Returns the number of action nodes for [flop, turn, river].
-pub(crate) fn count_num_action_nodes(node: &ActionTreeNode) -> [u64; 3] {
+///
+/// `initial_state` determines the starting street offset so that nodes are
+/// placed in the correct slot even when depth-limiting removes later streets.
+pub(crate) fn count_num_action_nodes(
+    node: &ActionTreeNode,
+    initial_state: BoardState,
+) -> [u64; 3] {
+    let street_offset = initial_state as usize;
     let mut ret = [0, 0, 0];
-    count_num_action_nodes_recursive(node, 0, &mut ret);
-    if ret[1] == 0 {
-        ret = [0, 0, ret[0]];
-    } else if ret[2] == 0 {
-        ret = [0, ret[0], ret[1]];
-    }
+    count_num_action_nodes_recursive(node, street_offset, &mut ret);
     ret
 }
 
@@ -1319,6 +1379,7 @@ mod tests {
             add_allin_threshold: 1.5,
             force_allin_threshold: 0.15,
             merging_threshold: 0.1,
+            depth_limit: None,
         };
 
         assert_eq!(config.initial_state, BoardState::Turn);
@@ -1973,7 +2034,7 @@ mod tests {
     fn test_count_action_nodes_river() {
         let config = river_config("50%", "60%", 100, 200);
         let tree = ActionTree::new(config).unwrap();
-        let counts = count_num_action_nodes(&tree.root.lock());
+        let counts = count_num_action_nodes(&tree.root.lock(), tree.config.initial_state);
         // River-only tree: counts[2] should be non-zero
         assert!(counts[2] > 0);
         assert_eq!(counts[0], 0);
@@ -2004,7 +2065,7 @@ mod tests {
             ..Default::default()
         };
         let tree = ActionTree::new(config).unwrap();
-        let counts = count_num_action_nodes(&tree.root.lock());
+        let counts = count_num_action_nodes(&tree.root.lock(), tree.config.initial_state);
         // Flop tree should have nodes on all three streets
         assert!(counts[0] > 0);
         assert!(counts[1] > 0);
@@ -2141,5 +2202,162 @@ mod tests {
         assert!(next.allin_flag);
         assert_eq!(next.num_bets, 1);
         assert_eq!(next.stack[0], 0);
+    }
+
+    #[test]
+    fn test_build_tree_info_street_transitions() {
+        let info = BuildTreeInfo::new(500);
+        assert_eq!(info.street_transitions, 0);
+
+        // Chance action increments street_transitions
+        let after_chance = info.create_next(0, Action::Chance(0));
+        assert_eq!(after_chance.street_transitions, 1);
+
+        // Non-chance actions don't increment
+        let after_check = info.create_next(PLAYER_OOP, Action::Check);
+        assert_eq!(after_check.street_transitions, 0);
+    }
+
+    // -- Depth limit --
+
+    #[test]
+    fn depth_limit_none_does_not_affect_tree() {
+        // A turn tree with no depth_limit should have chance nodes.
+        let config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 200,
+            turn_bet_sizes: [
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+            ],
+            river_bet_sizes: [
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+            ],
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.15,
+            merging_threshold: 0.12,
+            depth_limit: None,
+            ..Default::default()
+        };
+        let mut tree = ActionTree::new(config).unwrap();
+
+        // Check-check leads to chance (river deal)
+        tree.play(Action::Check).unwrap();
+        tree.play(Action::Check).unwrap();
+        assert!(tree.is_chance_node());
+    }
+
+    #[test]
+    fn depth_limit_zero_blocks_all_transitions() {
+        // A turn tree with depth_limit=0 should have no chance nodes.
+        // Check-check should lead to a terminal (depth boundary).
+        let config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 200,
+            turn_bet_sizes: [
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+            ],
+            river_bet_sizes: [
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+            ],
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.15,
+            merging_threshold: 0.12,
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let mut tree = ActionTree::new(config).unwrap();
+
+        // Root: OOP to act on the turn
+        assert!(!tree.is_terminal_node());
+        assert!(!tree.is_chance_node());
+
+        // Check-check should be terminal (depth boundary)
+        tree.play(Action::Check).unwrap();
+        tree.play(Action::Check).unwrap();
+        assert!(tree.is_terminal_node());
+        assert!(!tree.is_chance_node());
+    }
+
+    #[test]
+    fn depth_limit_zero_bet_call_is_terminal() {
+        let config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 200,
+            turn_bet_sizes: [
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+            ],
+            river_bet_sizes: [
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+            ],
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.15,
+            merging_threshold: 0.12,
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let mut tree = ActionTree::new(config).unwrap();
+
+        // OOP bets, IP calls => should be terminal (depth boundary)
+        tree.play(Action::Bet(50)).unwrap();
+        tree.play(Action::Call).unwrap();
+        assert!(tree.is_terminal_node());
+    }
+
+    #[test]
+    fn depth_limit_one_allows_one_transition() {
+        // Flop tree with depth_limit=1: flop->turn allowed, turn->river blocked.
+        let config = TreeConfig {
+            initial_state: BoardState::Flop,
+            starting_pot: 100,
+            effective_stack: 1000,
+            flop_bet_sizes: [
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+            ],
+            turn_bet_sizes: [
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+            ],
+            river_bet_sizes: [
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+            ],
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.15,
+            merging_threshold: 0.12,
+            depth_limit: Some(1),
+            ..Default::default()
+        };
+        let mut tree = ActionTree::new(config).unwrap();
+
+        // Flop: check-check => chance (turn) — first transition allowed
+        tree.play(Action::Check).unwrap();
+        tree.play(Action::Check).unwrap();
+        assert!(tree.is_chance_node());
+
+        // Turn: check-check => should be terminal (depth boundary), not chance
+        tree.play(Action::Check).unwrap();
+        tree.play(Action::Check).unwrap();
+        assert!(tree.is_terminal_node());
+        assert!(!tree.is_chance_node());
+    }
+
+    #[test]
+    fn depth_boundary_flag_constant() {
+        // PLAYER_DEPTH_BOUNDARY_FLAG includes PLAYER_TERMINAL_FLAG
+        assert_ne!(PLAYER_DEPTH_BOUNDARY_FLAG & PLAYER_TERMINAL_FLAG, 0);
+        // But not PLAYER_FOLD_FLAG or PLAYER_CHANCE_FLAG
+        assert_eq!(PLAYER_DEPTH_BOUNDARY_FLAG & PLAYER_CHANCE_FLAG, 0);
+        // Different from PLAYER_FOLD_FLAG
+        assert_ne!(PLAYER_DEPTH_BOUNDARY_FLAG, PLAYER_FOLD_FLAG);
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::action_tree::PLAYER_DEPTH_BOUNDARY_FLAG;
 use crate::card::*;
 use std::mem::MaybeUninit;
 
@@ -53,6 +54,73 @@ impl PostFlopGame {
         // SAFETY: We just initialized every element to 0.0 via `MaybeUninit::write`.
         // Reinterpreting as `&mut [f32]` is sound because all elements are now initialized.
         let result = unsafe { &mut *(result as *mut [MaybeUninit<f32>] as *mut [f32]) };
+
+        // -----------------------------------------------------------------
+        // Case 0: Depth boundary
+        // -----------------------------------------------------------------
+        if node.player & PLAYER_DEPTH_BOUNDARY_FLAG == PLAYER_DEPTH_BOUNDARY_FLAG {
+            let node_index = self.node_index(node);
+            let ordinal = self.node_to_boundary[node_index] as usize;
+            let bcfv_index = ordinal * 2 + player;
+            let bcfvs = &self.boundary_cfvs[bcfv_index];
+
+            if bcfvs.is_empty() {
+                // No boundary CFVs set — treat as zero.
+                return;
+            }
+
+            let payoff_scale = half_pot / self.num_combinations;
+
+            let valid_indices = if node.river != NOT_DEALT {
+                &self.valid_indices_river[card_pair_to_index(node.turn, node.river)]
+            } else if node.turn != NOT_DEALT {
+                &self.valid_indices_turn[node.turn as usize]
+            } else {
+                &self.valid_indices_flop
+            };
+
+            let opponent_indices = &valid_indices[player ^ 1];
+            for &i in opponent_indices {
+                // SAFETY: same invariants as the fold case.
+                unsafe {
+                    let cfreach_i = *cfreach.get_unchecked(i as usize);
+                    if cfreach_i != 0.0 {
+                        let (c1, c2) = *opponent_cards.get_unchecked(i as usize);
+                        let cfreach_i_f64 = cfreach_i as f64;
+                        cfreach_sum += cfreach_i_f64;
+                        *cfreach_minus.get_unchecked_mut(c1 as usize) += cfreach_i_f64;
+                        *cfreach_minus.get_unchecked_mut(c2 as usize) += cfreach_i_f64;
+                    }
+                }
+            }
+
+            if cfreach_sum == 0.0 {
+                return;
+            }
+
+            let player_indices = &valid_indices[player];
+            let same_hand_index = &self.same_hand_index[player];
+            for &i in player_indices {
+                // SAFETY: same invariants as the fold case.
+                unsafe {
+                    let (c1, c2) = *player_cards.get_unchecked(i as usize);
+                    let same_i = *same_hand_index.get_unchecked(i as usize);
+                    let cfreach_same = if same_i == u16::MAX {
+                        0.0
+                    } else {
+                        *cfreach.get_unchecked(same_i as usize) as f64
+                    };
+                    let cfreach = cfreach_sum + cfreach_same
+                        - *cfreach_minus.get_unchecked(c1 as usize)
+                        - *cfreach_minus.get_unchecked(c2 as usize);
+                    let bcfv = *bcfvs.get_unchecked(i as usize) as f64;
+                    *result.get_unchecked_mut(i as usize) =
+                        (bcfv * payoff_scale * cfreach) as f32;
+                }
+            }
+
+            return;
+        }
 
         // -----------------------------------------------------------------
         // Case 1: Fold
@@ -552,6 +620,135 @@ mod tests {
                 raked <= no_rake + 1e-6,
                 "hand {i}: raked {raked} > no_rake {no_rake}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Depth boundary evaluation
+    // -----------------------------------------------------------------
+
+    /// Helper: build a turn game with depth_limit=0 (no river).
+    fn make_turn_game_depth_limited() -> PostFlopGame {
+        let oop_range: crate::range::Range = "AA,KK,QQ,AKs".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ-JJ,AQs,AJs".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: NOT_DEALT,
+        };
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 100,
+            turn_bet_sizes: [sizes.clone(), sizes],
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
+        game.allocate_memory(false);
+        game
+    }
+
+    fn find_boundary_node(game: &PostFlopGame) -> Option<usize> {
+        for (idx, node_mutex) in game.node_arena.iter().enumerate() {
+            if node_mutex.lock().is_depth_boundary() {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_depth_boundary_zero_cfvs_gives_zero_result() {
+        let mut game = make_turn_game_depth_limited();
+        let n_boundary = game.num_boundary_nodes();
+        assert!(n_boundary > 0, "should have boundary nodes");
+
+        // Set zero boundary CFVs for all boundary nodes
+        for ordinal in 0..n_boundary {
+            let oop_cfvs = vec![0.0f32; game.num_private_hands(0)];
+            let ip_cfvs = vec![0.0f32; game.num_private_hands(1)];
+            game.set_boundary_cfvs(ordinal, 0, oop_cfvs);
+            game.set_boundary_cfvs(ordinal, 1, ip_cfvs);
+        }
+
+        let bd_idx = find_boundary_node(&game).expect("should have a boundary node");
+        let node = game.node_arena[bd_idx].lock();
+
+        let num_oop = game.num_private_hands(0);
+        let cfreach_ip: Vec<f32> = vec![1.0; game.num_private_hands(1)];
+        let mut result: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); num_oop];
+        game.evaluate_internal(&mut result, &node, 0, &cfreach_ip);
+
+        let values: Vec<f32> = result.iter().map(|v| unsafe { v.assume_init() }).collect();
+
+        // Zero boundary CFVs should produce zero result
+        for &v in &values {
+            assert_eq!(v, 0.0, "zero boundary CFVs should produce zero result");
+        }
+    }
+
+    #[test]
+    fn test_depth_boundary_positive_cfvs() {
+        let mut game = make_turn_game_depth_limited();
+        let n_boundary = game.num_boundary_nodes();
+
+        // Set positive boundary CFVs (all hands have value +1.0)
+        for ordinal in 0..n_boundary {
+            let oop_cfvs = vec![1.0f32; game.num_private_hands(0)];
+            let ip_cfvs = vec![1.0f32; game.num_private_hands(1)];
+            game.set_boundary_cfvs(ordinal, 0, oop_cfvs);
+            game.set_boundary_cfvs(ordinal, 1, ip_cfvs);
+        }
+
+        let bd_idx = find_boundary_node(&game).expect("should have a boundary node");
+        let node = game.node_arena[bd_idx].lock();
+
+        let num_oop = game.num_private_hands(0);
+        let cfreach_ip: Vec<f32> = vec![1.0; game.num_private_hands(1)];
+        let mut result: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); num_oop];
+        game.evaluate_internal(&mut result, &node, 0, &cfreach_ip);
+
+        let values: Vec<f32> = result.iter().map(|v| unsafe { v.assume_init() }).collect();
+
+        // Positive boundary CFVs with positive reach should produce positive values
+        let nonzero_count = values.iter().filter(|&&v| v != 0.0).count();
+        assert!(nonzero_count > 0, "some hands should have nonzero value");
+
+        for &v in &values {
+            assert!(v >= 0.0, "positive boundary CFVs should produce non-negative values, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_depth_boundary_zero_reach_gives_zero_result() {
+        let mut game = make_turn_game_depth_limited();
+        let n_boundary = game.num_boundary_nodes();
+
+        for ordinal in 0..n_boundary {
+            let oop_cfvs = vec![1.0f32; game.num_private_hands(0)];
+            let ip_cfvs = vec![1.0f32; game.num_private_hands(1)];
+            game.set_boundary_cfvs(ordinal, 0, oop_cfvs);
+            game.set_boundary_cfvs(ordinal, 1, ip_cfvs);
+        }
+
+        let bd_idx = find_boundary_node(&game).expect("should have a boundary node");
+        let node = game.node_arena[bd_idx].lock();
+
+        let num_oop = game.num_private_hands(0);
+        // Zero opponent reach
+        let cfreach_ip: Vec<f32> = vec![0.0; game.num_private_hands(1)];
+        let mut result: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); num_oop];
+        game.evaluate_internal(&mut result, &node, 0, &cfreach_ip);
+
+        let values: Vec<f32> = result.iter().map(|v| unsafe { v.assume_init() }).collect();
+
+        // Zero reach should produce zero result
+        for &v in &values {
+            assert_eq!(v, 0.0, "zero reach should produce zero result");
         }
     }
 }
