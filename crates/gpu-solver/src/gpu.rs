@@ -1425,6 +1425,57 @@ impl GpuContext {
         ptr as u64
     }
 
+    /// Launch the leaf CFV averaging and scatter kernel.
+    ///
+    /// After the river model returns CFVs for all (boundary × river × spot)
+    /// inputs, this kernel averages across river cards per combo (handling
+    /// card conflicts) and writes the result to `cfvalues` at each depth-
+    /// boundary node's position.
+    ///
+    /// # Layout
+    /// - `cfvalues`: `[num_nodes * total_hands]` — output (scattered writes)
+    /// - `raw_cfvs`: `[num_boundaries * num_rivers * num_spots * 1326]`
+    /// - `boundary_nodes`: `[num_boundaries]` node IDs
+    /// - `river_cards`: `[num_rivers]` possible river cards
+    /// - `combo_cards`: `[1326 * 2]` card pairs per combo
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_average_leaf_cfvs(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        raw_cfvs: &CudaSlice<f32>,
+        boundary_nodes: &CudaSlice<u32>,
+        river_cards: &CudaSlice<u32>,
+        combo_cards: &CudaSlice<u32>,
+        num_boundaries: u32,
+        num_rivers: u32,
+        num_spots: u32,
+        total_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/average_leaf_cfvs.cu"),
+            "average_leaf_cfvs",
+        )?;
+        let total_threads = num_boundaries * num_spots * hands_per_spot;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(raw_cfvs)
+                .arg(boundary_nodes)
+                .arg(river_cards)
+                .arg(combo_cards)
+                .arg(&num_boundaries)
+                .arg(&num_rivers)
+                .arg(&num_spots)
+                .arg(&total_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
     /// Launch the leaf input encoding kernel.
     ///
     /// Encodes reach probabilities at depth-boundary nodes into 2720-dim
@@ -2371,6 +2422,100 @@ mod tests {
             result[2719].abs() < 1e-6,
             "traverser should be 0.0 for OOP, got {}",
             result[2719]
+        );
+    }
+
+    #[test]
+    fn test_average_leaf_cfvs_kernel() {
+        let gpu = GpuContext::new(0).expect("CUDA device required");
+
+        // Setup: 1 boundary at node 0, 2 river cards, 1 spot, 4 hands per spot
+        let num_boundaries: u32 = 1;
+        let num_rivers: u32 = 2;
+        let num_spots: u32 = 1;
+        let hands_per_spot: u32 = 4;
+        let num_nodes: u32 = 1;
+        let total_hands = num_nodes * num_spots * hands_per_spot;
+
+        let boundary_nodes = vec![0u32];
+        // River cards: cards 10, 11
+        let river_cards = vec![10u32, 11];
+
+        // Fake combo_cards for 4 hands:
+        // hand 0: (0, 1), hand 1: (2, 3), hand 2: (10, 5), hand 3: (6, 7)
+        // Hand 2 has card 10 which conflicts with river_card=10
+        let mut combo_cards_flat = vec![0u32; 1326 * 2];
+        combo_cards_flat[0] = 0; combo_cards_flat[1] = 1;   // hand 0: (0, 1)
+        combo_cards_flat[2] = 2; combo_cards_flat[3] = 3;   // hand 1: (2, 3)
+        combo_cards_flat[4] = 10; combo_cards_flat[5] = 5;  // hand 2: (10, 5)
+        combo_cards_flat[6] = 6; combo_cards_flat[7] = 7;   // hand 3: (6, 7)
+
+        // raw_cfvs: [num_boundaries * num_rivers * num_spots * 1326]
+        // = [1 * 2 * 1 * 1326] = [2 * 1326]
+        let mut raw_cfvs = vec![0.0f32; 2 * 1326];
+        // River card 0 (card 10): hand0=2.0, hand1=4.0, hand2=6.0, hand3=8.0
+        raw_cfvs[0] = 2.0;   // input_idx=0, hand=0
+        raw_cfvs[1] = 4.0;   // input_idx=0, hand=1
+        raw_cfvs[2] = 6.0;   // input_idx=0, hand=2 (but conflicts with river=10)
+        raw_cfvs[3] = 8.0;   // input_idx=0, hand=3
+        // River card 1 (card 11): hand0=10.0, hand1=12.0, hand2=14.0, hand3=16.0
+        raw_cfvs[1326] = 10.0;  // input_idx=1, hand=0
+        raw_cfvs[1327] = 12.0;  // input_idx=1, hand=1
+        raw_cfvs[1328] = 14.0;  // input_idx=1, hand=2
+        raw_cfvs[1329] = 16.0;  // input_idx=1, hand=3
+
+        let gpu_cfvalues = gpu.alloc_zeros::<f32>(total_hands as usize).unwrap();
+        let gpu_raw_cfvs = gpu.upload(&raw_cfvs).unwrap();
+        let gpu_boundary_nodes = gpu.upload(&boundary_nodes).unwrap();
+        let gpu_river_cards = gpu.upload(&river_cards).unwrap();
+        let gpu_combo_cards = gpu.upload(&combo_cards_flat).unwrap();
+
+        let mut gpu_cfvalues = gpu_cfvalues;
+
+        gpu.launch_average_leaf_cfvs(
+            &mut gpu_cfvalues,
+            &gpu_raw_cfvs,
+            &gpu_boundary_nodes,
+            &gpu_river_cards,
+            &gpu_combo_cards,
+            num_boundaries,
+            num_rivers,
+            num_spots,
+            total_hands,
+            hands_per_spot,
+        ).unwrap();
+
+        let result = gpu.download(&gpu_cfvalues).unwrap();
+
+        let eps = 1e-5;
+
+        // Hand 0: (0,1) no conflicts. avg = (2.0 + 10.0) / 2 = 6.0
+        assert!(
+            (result[0] - 6.0).abs() < eps,
+            "hand 0 avg should be 6.0, got {}",
+            result[0]
+        );
+
+        // Hand 1: (2,3) no conflicts. avg = (4.0 + 12.0) / 2 = 8.0
+        assert!(
+            (result[1] - 8.0).abs() < eps,
+            "hand 1 avg should be 8.0, got {}",
+            result[1]
+        );
+
+        // Hand 2: (10,5) conflicts with river=10. Only river=11 is valid.
+        // avg = 14.0 / 1 = 14.0
+        assert!(
+            (result[2] - 14.0).abs() < eps,
+            "hand 2 avg should be 14.0 (river=10 conflict), got {}",
+            result[2]
+        );
+
+        // Hand 3: (6,7) no conflicts. avg = (8.0 + 16.0) / 2 = 12.0
+        assert!(
+            (result[3] - 12.0).abs() < eps,
+            "hand 3 avg should be 12.0, got {}",
+            result[3]
         );
     }
 }
