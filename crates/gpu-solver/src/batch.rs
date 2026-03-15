@@ -2098,6 +2098,320 @@ impl<'a> BatchGpuSolver<'a> {
         })
     }
 
+    // ---------------------------------------------------------------
+    // Accessors for TurnBatchSolver and other downstream consumers
+    // ---------------------------------------------------------------
+
+    /// Reference to the GPU context.
+    pub fn gpu(&self) -> &'a GpuContext {
+        self.gpu
+    }
+
+    /// Mutable reference to reach_oop buffer.
+    pub fn reach_oop_mut(&mut self) -> &mut CudaSlice<f32> {
+        &mut self.reach_oop
+    }
+
+    /// Mutable reference to reach_ip buffer.
+    pub fn reach_ip_mut(&mut self) -> &mut CudaSlice<f32> {
+        &mut self.reach_ip
+    }
+
+    /// Reference to reach_oop buffer.
+    pub fn reach_oop(&self) -> &CudaSlice<f32> {
+        &self.reach_oop
+    }
+
+    /// Reference to reach_ip buffer.
+    pub fn reach_ip(&self) -> &CudaSlice<f32> {
+        &self.reach_ip
+    }
+
+    /// Mutable reference to cfvalues buffer.
+    pub fn cfvalues_mut(&mut self) -> &mut CudaSlice<f32> {
+        &mut self.cfvalues
+    }
+
+    /// Reference to cfvalues buffer.
+    pub fn cfvalues(&self) -> &CudaSlice<f32> {
+        &self.cfvalues
+    }
+
+    /// Total number of hands (num_spots * hands_per_spot).
+    pub fn total_hands(&self) -> u32 {
+        self.num_hands
+    }
+
+    /// Hands per spot.
+    pub fn hands_per_spot_val(&self) -> usize {
+        self.hands_per_spot
+    }
+
+    /// Number of spots.
+    pub fn num_spots_val(&self) -> usize {
+        self.num_spots
+    }
+
+    /// Number of nodes.
+    pub fn num_nodes_val(&self) -> u32 {
+        self.num_nodes
+    }
+
+    /// Number of infosets.
+    pub fn num_infosets_val(&self) -> u32 {
+        self.num_infosets
+    }
+
+    /// Max actions.
+    pub fn max_actions_val(&self) -> u32 {
+        self.max_actions
+    }
+
+    /// Number of levels.
+    pub fn num_levels_val(&self) -> usize {
+        self.num_levels
+    }
+
+    /// Reference to regrets buffer.
+    pub fn regrets(&self) -> &CudaSlice<f32> {
+        &self.regrets
+    }
+
+    /// Reference to the num_actions GPU buffer.
+    pub fn gpu_num_actions(&self) -> &CudaSlice<u32> {
+        &self.gpu_num_actions
+    }
+
+    /// Mutable reference to current strategy buffer.
+    pub fn current_strategy_mut(&mut self) -> &mut CudaSlice<f32> {
+        &mut self.current_strategy
+    }
+
+    /// Public wrapper around init_reach.
+    pub fn init_reach_pub(&mut self) -> Result<(), GpuError> {
+        self.init_reach()
+    }
+
+    /// Run regret matching to compute the current strategy from regrets.
+    pub fn regret_match(&mut self) -> Result<(), GpuError> {
+        self.gpu.launch_regret_match(
+            &self.regrets,
+            &self.gpu_num_actions,
+            &mut self.current_strategy,
+            self.num_infosets,
+            self.max_actions,
+            self.num_hands,
+        )
+    }
+
+    /// Zero the cfvalues buffer.
+    pub fn zero_cfvalues(&mut self) -> Result<(), GpuError> {
+        let cfv_size = self.num_nodes * self.num_hands;
+        self.gpu.launch_zero_buffer(&mut self.cfvalues, cfv_size)
+    }
+
+    /// Run the forward pass (top-down reach propagation).
+    pub fn forward_pass(&mut self) -> Result<(), GpuError> {
+        for level in 1..self.num_levels {
+            let ld = &self.level_data[level];
+            if ld.num_nodes == 0 {
+                continue;
+            }
+            self.gpu.launch_forward_pass(
+                &mut self.reach_oop,
+                &mut self.reach_ip,
+                &self.current_strategy,
+                &ld.nodes,
+                &ld.parent_nodes,
+                &ld.parent_actions,
+                &ld.parent_infosets,
+                &ld.parent_players,
+                ld.num_nodes,
+                self.num_hands,
+                self.max_actions,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Run fold terminal evaluation for the given traverser.
+    pub fn fold_eval(&mut self, traverser: u32) -> Result<(), GpuError> {
+        if self.num_fold_terminals == 0 {
+            return Ok(());
+        }
+        let opp_reach = if traverser == 0 {
+            &self.reach_ip
+        } else {
+            &self.reach_oop
+        };
+        let opp_hand_cards = if traverser == 0 {
+            &self.gpu_hand_cards_ip
+        } else {
+            &self.gpu_hand_cards_oop
+        };
+        let trav_hand_cards = if traverser == 0 {
+            &self.gpu_hand_cards_oop
+        } else {
+            &self.gpu_hand_cards_ip
+        };
+        let same_hand_index = if traverser == 0 {
+            &self.gpu_same_hand_index_oop
+        } else {
+            &self.gpu_same_hand_index_ip
+        };
+
+        self.gpu.launch_precompute_fold_aggregates_batch(
+            opp_reach,
+            &self.fold_terminal_nodes,
+            opp_hand_cards,
+            &mut self.gpu_fold_total_opp_reach,
+            &mut self.gpu_fold_per_card_reach,
+            self.num_fold_terminals,
+            self.num_hands,
+            self.hands_per_spot as u32,
+        )?;
+
+        self.gpu.launch_fold_eval_from_aggregates_batch(
+            &mut self.cfvalues,
+            opp_reach,
+            &self.fold_terminal_nodes,
+            &self.fold_amount_win,
+            &self.fold_amount_lose,
+            &self.fold_player,
+            &self.gpu_fold_total_opp_reach,
+            &self.gpu_fold_per_card_reach,
+            trav_hand_cards,
+            same_hand_index,
+            traverser,
+            self.num_fold_terminals,
+            self.num_hands,
+            self.hands_per_spot as u32,
+        )?;
+
+        Ok(())
+    }
+
+    /// Run showdown terminal evaluation for the given traverser.
+    pub fn showdown_eval(&mut self, traverser: u32) -> Result<(), GpuError> {
+        if self.num_showdown_terminals == 0 {
+            return Ok(());
+        }
+        let opp_reach = if traverser == 0 {
+            &self.reach_ip
+        } else {
+            &self.reach_oop
+        };
+        let opp_sorted = if traverser == 0 {
+            &self.gpu_sorted_ip
+        } else {
+            &self.gpu_sorted_oop
+        };
+        let (trav_rank_win, trav_rank_next) = if traverser == 0 {
+            (&self.gpu_rank_win_oop, &self.gpu_rank_next_oop)
+        } else {
+            (&self.gpu_rank_win_ip, &self.gpu_rank_next_ip)
+        };
+
+        // Kernel 1: scatter
+        self.gpu.launch_scatter_opp_reach_sorted(
+            &mut self.gpu_sd_sorted_reach,
+            opp_reach,
+            &self.showdown_terminal_nodes,
+            opp_sorted,
+            self.num_showdown_terminals,
+            self.num_hands,
+            self.hands_per_spot as u32,
+        )?;
+
+        // Kernel 2: prefix sum
+        let num_spots = self.num_spots as u32;
+        let num_segments = self.num_showdown_terminals * num_spots;
+        self.gpu.launch_segmented_prefix_sum(
+            &self.gpu_sd_sorted_reach,
+            &mut self.gpu_sd_prefix_excl,
+            &mut self.gpu_sd_totals,
+            num_segments,
+            self.hands_per_spot as u32,
+        )?;
+
+        // Kernel 3: lookup
+        self.gpu.launch_showdown_lookup_cfv(
+            &mut self.cfvalues,
+            &self.gpu_sd_prefix_excl,
+            &self.gpu_sd_totals,
+            &self.showdown_amount_win,
+            &self.showdown_amount_lose,
+            &self.showdown_terminal_nodes,
+            trav_rank_win,
+            trav_rank_next,
+            self.num_showdown_terminals,
+            self.num_hands,
+            self.hands_per_spot as u32,
+        )?;
+
+        Ok(())
+    }
+
+    /// Run backward CFV propagation for the given traverser.
+    pub fn backward_cfv(&mut self, traverser: u32) -> Result<(), GpuError> {
+        for level in (0..self.num_levels).rev() {
+            let bld = &self.backward_level_data[level];
+            if bld.num_decision_nodes == 0 {
+                continue;
+            }
+            self.gpu.launch_backward_cfv(
+                &mut self.cfvalues,
+                &self.current_strategy,
+                &bld.decision_nodes,
+                &self.gpu_child_offsets,
+                &self.gpu_children,
+                &self.gpu_infoset_ids,
+                &bld.decision_players,
+                traverser,
+                bld.num_decision_nodes,
+                self.num_hands,
+                self.max_actions,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Update regrets and strategy sum for the given traverser.
+    pub fn update_regrets(
+        &mut self,
+        traverser: u32,
+        pos_discount: f32,
+        neg_discount: f32,
+        strat_discount: f32,
+    ) -> Result<(), GpuError> {
+        let (decision_nodes, num_decision) = if traverser == 0 {
+            (&self.decision_nodes_oop, self.num_oop_decisions)
+        } else {
+            (&self.decision_nodes_ip, self.num_ip_decisions)
+        };
+
+        if num_decision > 0 {
+            self.gpu.launch_update_regrets(
+                &mut self.regrets,
+                &mut self.strategy_sum,
+                &self.current_strategy,
+                &self.cfvalues,
+                decision_nodes,
+                &self.gpu_child_offsets,
+                &self.gpu_children,
+                &self.gpu_infoset_ids,
+                &self.gpu_num_actions,
+                num_decision,
+                self.num_hands,
+                self.max_actions,
+                pos_discount,
+                neg_discount,
+                strat_discount,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Initialize reach probabilities at the root node for all spots.
     /// Fully GPU-resident: zero buffers then set root reach from pre-uploaded values.
     fn init_reach(&mut self) -> Result<(), GpuError> {
