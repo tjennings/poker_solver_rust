@@ -2,35 +2,398 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use hex:executing-plans to implement this plan task-by-task.
 
-**Goal:** Replace runtime `compute_equity()` calls in MCCFR with O(1) precomputed bucket file lookups (Pluribus-style), and fix the clustering pipeline to produce exhaustive canonical bucket files.
+**Goal:** Replace runtime `compute_equity()` calls in MCCFR with O(1) precomputed bucket file lookups (Pluribus-style), and fix the clustering pipeline to produce exhaustive canonical bucket files via two-phase clustering: sample-based k-means to find centroids, then exhaustive nearest-centroid assignment for all canonical boards.
 
-**Architecture:** Two changes: (A) modify `run_clustering_pipeline` to always use exhaustive canonical board enumeration for all streets, and (B) rewrite `AllBuckets::precompute_buckets()` to look up buckets from loaded `BucketFile`s via board canonicalization + combo indexing, eliminating all runtime equity computation.
+**Architecture:** (A) Modify k-means functions to return centroids alongside assignments. (B) Add exhaustive assignment passes to each street's clustering function: enumerate all canonical boards, compute features, assign to nearest centroid. (C) Rewrite `AllBuckets::precompute_buckets()` to use O(1) bucket file lookups via board canonicalization + combo indexing.
 
 **Tech Stack:** Rust, `rs_poker::core::Card`, existing `CanonicalBoard` from `abstraction/isomorphism.rs`, existing `BucketFile` v2 format, existing `combo_index()` and `canonical_key()` from `cluster_pipeline.rs`
 
 ---
 
-### Task 1: Make `run_clustering_pipeline` use exhaustive canonical enumeration
+### Task 1: Return centroids from k-means functions
+
+**Files:**
+- Modify: `crates/core/src/blueprint_v2/clustering.rs`
+
+The k-means functions currently return only `Vec<u16>` (assignments). They need to also return the final centroids so the clustering pipeline can use them for exhaustive assignment.
+
+**Step 1: Change `kmeans_1d_weighted` return type**
+
+Change signature from:
+```rust
+pub fn kmeans_1d_weighted(...) -> Vec<u16>
+```
+to:
+```rust
+pub fn kmeans_1d_weighted(...) -> (Vec<u16>, Vec<f64>)
+```
+
+Return `(assignments, centroids)` at the end (line ~414):
+```rust
+    // Final assignment pass (parallel).
+    let assignments = data.par_iter()
+        .map(|&val| nearest_centroid_1d(val, &centroids))
+        .collect();
+    (assignments, centroids)
+```
+
+**Step 2: Change `kmeans_emd_weighted_u8` return type**
+
+Change signature from:
+```rust
+pub fn kmeans_emd_weighted_u8(...) -> Vec<u16>
+```
+to:
+```rust
+pub fn kmeans_emd_weighted_u8(...) -> (Vec<u16>, Vec<Vec<f64>>)
+```
+
+Return `(assignments, centroids)` at the end (line ~611):
+```rust
+    // Final assignment pass (parallel).
+    data.par_iter()
+        .zip(assignments.par_iter_mut())
+        .for_each(|(point, assign)| {
+            *assign = nearest_centroid_u8(point, &centroids);
+        });
+    (assignments, centroids)
+```
+
+**Step 3: Make `nearest_centroid_u8` pub(crate)**
+
+Change `fn nearest_centroid_u8` (line 741) to `pub(crate) fn nearest_centroid_u8`. It will be called from `cluster_pipeline.rs` during the exhaustive assignment pass.
+
+`nearest_centroid_1d` is already `pub(crate)` (line 695).
+
+**Step 4: Fix all call sites**
+
+Grep for `kmeans_1d_weighted` and `kmeans_emd_weighted_u8` across the codebase. Each call currently expects `Vec<u16>` — update to destructure:
+
+```rust
+// Before:
+let cluster_labels = kmeans_1d_weighted(&all_equities, &all_weights, k, iters);
+// After:
+let (cluster_labels, _centroids) = kmeans_1d_weighted(&all_equities, &all_weights, k, iters);
+```
+
+For the clustering pipeline functions that will use centroids (Task 2), keep the centroids. For all other callers (tests, cfvnet), discard with `_`.
+
+**Step 5: Run tests**
+
+```bash
+cargo test -p poker-solver-core -- clustering
+```
+
+**Step 6: Commit**
+
+```bash
+git add crates/core/src/blueprint_v2/clustering.rs
+git commit -m "feat: return centroids from k-means functions for exhaustive assignment"
+```
+
+---
+
+### Task 2: Add exhaustive assignment to river clustering
+
+**Files:**
+- Modify: `crates/core/src/blueprint_v2/cluster_pipeline.rs`
+
+Two-phase river clustering: (1) k-means on sampled boards to find centroids, (2) exhaustive assignment for all canonical rivers.
+
+**Step 1: Create `cluster_river_exhaustive` function**
+
+```rust
+/// Two-phase river clustering: k-means on sampled boards, then exhaustive
+/// nearest-centroid assignment for all canonical rivers.
+///
+/// Phase 1: Sample `sample_boards` canonical rivers, compute equity for each
+/// (board, combo) pair, run weighted 1-D k-means to find centroids.
+///
+/// Phase 2: Enumerate ALL canonical rivers, compute equity for each
+/// (board, combo) pair, assign to nearest centroid. Streams boards in
+/// parallel batches to avoid holding all ~700K boards in memory at once.
+pub fn cluster_river_exhaustive(
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    sample_boards: usize,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    let combos = enumerate_combos(&build_deck());
+
+    // Phase 1: K-means on sampled boards to find centroids.
+    let all_canonical = enumerate_canonical_rivers();
+    let (sampled_boards, board_weights) = sample_canonical(&all_canonical, sample_boards, seed);
+    let num_sampled = sampled_boards.len();
+
+    let board_equities: Vec<Vec<Option<f64>>> = sampled_boards
+        .par_iter()
+        .enumerate()
+        .map(|(i, board)| {
+            let eq = compute_board_equities(*board, &combos);
+            #[allow(clippy::cast_precision_loss)]
+            progress((i + 1) as f64 / num_sampled as f64 * 0.4);
+            eq
+        })
+        .collect();
+
+    let mut all_equities: Vec<f64> = Vec::new();
+    let mut all_weights: Vec<f64> = Vec::new();
+    for (board_idx, eqs) in board_equities.iter().enumerate() {
+        let w = board_weights[board_idx];
+        for eq in eqs.iter().flatten() {
+            all_equities.push(*eq);
+            all_weights.push(w);
+        }
+    }
+
+    let (_sample_labels, centroids) = kmeans_1d_weighted(
+        &all_equities, &all_weights, bucket_count as usize, kmeans_iterations,
+    );
+    drop(board_equities); // free memory before phase 2
+
+    // Phase 2: Exhaustive assignment over all canonical rivers.
+    let num_all = all_canonical.len();
+    let all_buckets: Vec<Vec<u16>> = all_canonical
+        .par_iter()
+        .enumerate()
+        .map(|(i, wb)| {
+            let equities = compute_board_equities(wb.cards, &combos);
+            let board_buckets: Vec<u16> = equities
+                .iter()
+                .map(|eq| {
+                    match eq {
+                        Some(e) => nearest_centroid_1d(*e, &centroids),
+                        None => 0, // overlapping cards — bucket 0 as placeholder
+                    }
+                })
+                .collect();
+            #[allow(clippy::cast_precision_loss)]
+            progress(0.4 + (i + 1) as f64 / num_all as f64 * 0.6);
+            board_buckets
+        })
+        .collect();
+
+    // Flatten into BucketFile.
+    let mut buckets = Vec::with_capacity(num_all * TOTAL_COMBOS as usize);
+    for board_buckets in &all_buckets {
+        buckets.extend_from_slice(board_buckets);
+    }
+
+    let packed_boards: Vec<PackedBoard> = all_canonical
+        .iter()
+        .map(|wb| canonical_key(&wb.cards))
+        .collect();
+
+    #[allow(clippy::cast_possible_truncation)]
+    BucketFile {
+        header: BucketFileHeader {
+            street: Street::River,
+            bucket_count,
+            board_count: num_all as u32,
+            combos_per_board: TOTAL_COMBOS,
+            version: 2,
+        },
+        boards: packed_boards,
+        buckets,
+    }
+}
+```
+
+**Important:** `nearest_centroid_1d` is in `clustering.rs` — import it:
+```rust
+use super::clustering::nearest_centroid_1d;
+```
+
+**Step 2: Add import for `nearest_centroid_1d`**
+
+At the top of `cluster_pipeline.rs`, add to the existing clustering imports:
+```rust
+use super::clustering::nearest_centroid_1d;
+```
+
+**Step 3: Run tests**
+
+```bash
+cargo test -p poker-solver-core -- cluster_pipeline
+```
+
+**Step 4: Commit**
+
+```bash
+git add crates/core/src/blueprint_v2/cluster_pipeline.rs
+git commit -m "feat: two-phase river clustering with exhaustive centroid assignment"
+```
+
+---
+
+### Task 3: Add exhaustive assignment to turn and flop clustering
+
+**Files:**
+- Modify: `crates/core/src/blueprint_v2/cluster_pipeline.rs`
+
+Same two-phase pattern for turn and flop, using EMD centroids.
+
+**Step 1: Create `cluster_turn_exhaustive` function**
+
+```rust
+/// Two-phase turn clustering: EMD k-means on sampled boards, then exhaustive
+/// nearest-centroid assignment for all canonical turns.
+pub fn cluster_turn_exhaustive(
+    river_buckets: &BucketFile,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    sample_boards: usize,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let board_map = river_buckets.board_index_map();
+    let all_canonical = enumerate_canonical_turns();
+
+    // Phase 1: K-means on sampled boards.
+    let (sampled_boards, board_weights) = sample_canonical(&all_canonical, sample_boards, seed);
+    let num_sampled = sampled_boards.len();
+
+    let board_features: Vec<Vec<Option<Vec<u8>>>> = sampled_boards
+        .par_iter()
+        .enumerate()
+        .map(|(board_idx, board)| {
+            let features: Vec<Option<Vec<u8>>> = combos
+                .iter()
+                .map(|combo| {
+                    if cards_overlap(*combo, board) {
+                        return None;
+                    }
+                    Some(build_bucket_histogram_u8(
+                        *combo, board, &deck, river_buckets, &board_map,
+                    ))
+                })
+                .collect();
+            #[allow(clippy::cast_precision_loss)]
+            progress((board_idx + 1) as f64 / num_sampled as f64 * 0.4);
+            features
+        })
+        .collect();
+
+    let mut all_features: Vec<Vec<u8>> = Vec::new();
+    let mut all_weights: Vec<f64> = Vec::new();
+    for (board_feats, wb_weight) in board_features.into_iter().zip(board_weights.iter()) {
+        for feat in board_feats.into_iter().flatten() {
+            all_features.push(feat);
+            all_weights.push(*wb_weight);
+        }
+    }
+
+    let (_sample_labels, centroids) = kmeans_emd_weighted_u8(
+        &all_features, &all_weights, bucket_count as usize, kmeans_iterations, seed,
+        |iter, max_iter| {
+            #[allow(clippy::cast_precision_loss)]
+            progress(0.4 + 0.2 * f64::from(iter) / f64::from(max_iter));
+        },
+    );
+    drop(all_features); // free memory before phase 2
+
+    // Phase 2: Exhaustive assignment over all canonical turns.
+    let num_all = all_canonical.len();
+    let all_buckets: Vec<Vec<u16>> = all_canonical
+        .par_iter()
+        .enumerate()
+        .map(|(board_idx, wb)| {
+            let board_buckets: Vec<u16> = combos
+                .iter()
+                .map(|combo| {
+                    if cards_overlap(*combo, &wb.cards) {
+                        return 0;
+                    }
+                    let hist = build_bucket_histogram_u8(
+                        *combo, &wb.cards, &deck, river_buckets, &board_map,
+                    );
+                    nearest_centroid_u8(&hist, &centroids)
+                })
+                .collect();
+            #[allow(clippy::cast_precision_loss)]
+            progress(0.6 + (board_idx + 1) as f64 / num_all as f64 * 0.4);
+            board_buckets
+        })
+        .collect();
+
+    let mut buckets = Vec::with_capacity(num_all * TOTAL_COMBOS as usize);
+    for board_buckets in &all_buckets {
+        buckets.extend_from_slice(board_buckets);
+    }
+
+    let packed_boards: Vec<PackedBoard> = all_canonical
+        .iter()
+        .map(|wb| canonical_key(&wb.cards))
+        .collect();
+
+    #[allow(clippy::cast_possible_truncation)]
+    BucketFile {
+        header: BucketFileHeader {
+            street: Street::Turn,
+            bucket_count,
+            board_count: num_all as u32,
+            combos_per_board: TOTAL_COMBOS,
+            version: 2,
+        },
+        boards: packed_boards,
+        buckets,
+    }
+}
+```
+
+**Step 2: Create `cluster_flop_exhaustive` function**
+
+Same pattern as turn but with `enumerate_canonical_flops()` and turn_buckets. Flop is already small (~1,755 boards) so the exhaustive pass is trivial, but the two-phase approach is consistent.
+
+```rust
+pub fn cluster_flop_exhaustive(
+    turn_buckets: &BucketFile,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    sample_boards: usize,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    // Same structure as cluster_turn_exhaustive but:
+    // - Uses enumerate_canonical_flops() (1,755 boards)
+    // - Builds histograms over turn_buckets
+    // - Since flop is small, sample_boards >= 1755 means phase 1 = phase 2
+    // ... (same pattern)
+}
+```
+
+Since flop only has 1,755 canonical boards, `sample_boards >= 1755` means k-means runs on all boards and the exhaustive assignment produces identical results. The function is still useful for consistency.
+
+**Step 3: Add import for `nearest_centroid_u8`**
+
+```rust
+use super::clustering::nearest_centroid_u8;
+```
+
+**Step 4: Run tests**
+
+```bash
+cargo test -p poker-solver-core -- cluster_pipeline
+```
+
+**Step 5: Commit**
+
+```bash
+git add crates/core/src/blueprint_v2/cluster_pipeline.rs
+git commit -m "feat: two-phase turn/flop clustering with exhaustive centroid assignment"
+```
+
+---
+
+### Task 4: Wire exhaustive functions into `run_clustering_pipeline`
 
 **Files:**
 - Modify: `crates/core/src/blueprint_v2/cluster_pipeline.rs` (lines 1144-1226)
 
-Currently, `run_clustering_pipeline` dispatches to sampled variants when `sample_boards` is set. The canonical variants (`cluster_turn_canonical`, `cluster_flop_canonical`) already exist but aren't wired in. The default `cluster_river` samples 10K boards via `DEFAULT_NUM_BOARDS`.
-
-**Step 1: Change river default to exhaustive**
-
-In `cluster_river()` (line 74), `sample_canonical` is called with `DEFAULT_NUM_BOARDS` (10,000). Change to `usize::MAX` so all canonical rivers are used:
-
-```rust
-// line 74: change DEFAULT_NUM_BOARDS to usize::MAX
-let (boards, board_weights) = sample_canonical(&all_canonical, usize::MAX, seed);
-```
-
-Alternatively, keep `DEFAULT_NUM_BOARDS` for the default function but update `run_clustering_pipeline` to always pass a large number. The simplest fix: change the pipeline dispatch.
-
-**Step 2: Rewrite `run_clustering_pipeline` to always use canonical variants**
-
-Replace the branching logic. The `sample_boards` config field is still respected — if `sample_boards` is set AND less than the total canonical count, it subsamples. Otherwise, exhaustive.
+**Step 1: Update `run_clustering_pipeline` to use exhaustive variants**
 
 ```rust
 pub fn run_clustering_pipeline(
@@ -38,7 +401,7 @@ pub fn run_clustering_pipeline(
     output_dir: &Path,
     progress: impl Fn(&str, f64) + Sync,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. River (1-D equity clustering)
+    // 1. River
     progress("river", 0.0);
     let river = if let Some(ref cfvnet_dir) = config.cfvnet_river_data {
         cluster_river_from_cfvnet(
@@ -48,40 +411,39 @@ pub fn run_clustering_pipeline(
             |p| progress("river", p),
         )?
     } else {
-        // Use canonical enumeration; sample_boards caps the count if set.
-        let max_boards = config.river.sample_boards.unwrap_or(usize::MAX);
-        cluster_river_sampled(
+        let sample = config.river.sample_boards.unwrap_or(DEFAULT_NUM_BOARDS);
+        cluster_river_exhaustive(
             config.river.buckets,
             config.kmeans_iterations,
             config.seed,
-            max_boards,
+            sample,
             |p| progress("river", p),
         )
     };
     river.save(&output_dir.join("river.buckets"))?;
 
-    // 2. Turn (potential-aware EMD, canonical enumeration)
+    // 2. Turn
     progress("turn", 0.0);
-    let max_turn = config.turn.sample_boards.unwrap_or(usize::MAX);
-    let turn = cluster_turn_sampled(
+    let sample_turn = config.turn.sample_boards.unwrap_or(DEFAULT_TURN_BOARDS);
+    let turn = cluster_turn_exhaustive(
         &river,
         config.turn.buckets,
         config.kmeans_iterations,
         config.seed,
-        max_turn,
+        sample_turn,
         |p| progress("turn", p),
     );
     turn.save(&output_dir.join("turn.buckets"))?;
 
-    // 3. Flop (potential-aware EMD, canonical enumeration)
+    // 3. Flop
     progress("flop", 0.0);
-    let max_flop = config.flop.sample_boards.unwrap_or(usize::MAX);
-    let flop = cluster_flop_sampled(
+    let sample_flop = config.flop.sample_boards.unwrap_or(usize::MAX);
+    let flop = cluster_flop_exhaustive(
         &turn,
         config.flop.buckets,
         config.kmeans_iterations,
         config.seed,
-        max_flop,
+        sample_flop,
         |p| progress("flop", p),
     );
     flop.save(&output_dir.join("flop.buckets"))?;
@@ -95,89 +457,47 @@ pub fn run_clustering_pipeline(
 }
 ```
 
-Here `cluster_river_sampled`, `cluster_turn_sampled`, `cluster_flop_sampled` are unified versions that take a `max_boards` parameter. They use `enumerate_canonical_*()` + `sample_canonical(all, max_boards, seed)`. When `max_boards >= all.len()`, all boards are used (exhaustive). This unifies the existing `cluster_*` and `cluster_*_canonical` variants.
+**Step 2: Mark old clustering functions as `#[allow(dead_code)]`**
 
-**Step 3: Create unified `cluster_river_sampled` function**
+Grep for which old functions are still used in tests. Mark unused ones. Don't delete yet — they may be useful for fast iteration during development.
 
-Merge `cluster_river` and `cluster_river_with_boards` into a single function that takes `max_boards`. The existing `cluster_river` body is almost right — just parameterize the sample count:
-
-```rust
-pub fn cluster_river_sampled(
-    bucket_count: u16,
-    kmeans_iterations: u32,
-    seed: u64,
-    max_boards: usize,
-    progress: impl Fn(f64) + Sync,
-) -> BucketFile {
-    let combos = enumerate_combos(&build_deck());
-    let all_canonical = enumerate_canonical_rivers();
-    let (boards, board_weights) = sample_canonical(&all_canonical, max_boards, seed);
-    // ... rest identical to cluster_river body (lines 76-128)
-}
-```
-
-**Step 4: Create unified `cluster_turn_sampled` function**
-
-Same pattern — merge `cluster_turn` and `cluster_turn_canonical`. Take `max_boards`, enumerate all canonical turns, then `sample_canonical`:
-
-```rust
-pub fn cluster_turn_sampled(
-    river_buckets: &BucketFile,
-    bucket_count: u16,
-    kmeans_iterations: u32,
-    seed: u64,
-    max_boards: usize,
-    progress: impl Fn(f64) + Sync,
-) -> BucketFile {
-    let deck = build_deck();
-    let combos = enumerate_combos(&deck);
-    let all_canonical = enumerate_canonical_turns();
-    let (boards_raw, board_weights) = sample_canonical(&all_canonical, max_boards, seed);
-    let boards: Vec<[Card; 4]> = boards_raw;
-    let num_boards = boards.len();
-    let board_map = river_buckets.board_index_map();
-
-    // Build histograms (same as cluster_turn body lines 214-267)
-    // Use board_weights for k-means weighting
-    // ...
-}
-```
-
-Note: the existing `cluster_turn` (lines 198-293) uses `sample_canonical` with `DEFAULT_TURN_BOARDS`. The existing `cluster_turn_canonical` (lines 672-763) enumerates all and doesn't use `sample_canonical`. The unified version should use `sample_canonical` with configurable `max_boards`, defaulting to `usize::MAX` for exhaustive.
-
-**Step 5: Create unified `cluster_flop_sampled` function**
-
-Same pattern for flop. The existing `cluster_flop` is already exhaustive (uses all 1,755 canonical flops), but wrap it to accept `max_boards` for consistency.
-
-**Step 6: Mark old functions as `#[allow(dead_code)]` or remove them**
-
-The old `cluster_river`, `cluster_turn`, `cluster_river_with_boards`, `cluster_turn_with_boards`, `cluster_flop_with_boards`, `cluster_turn_canonical`, `cluster_flop_canonical` can be removed or marked dead_code. Prefer removal if no tests reference them — grep first.
-
-**Step 7: Run tests**
+**Step 3: Run tests**
 
 ```bash
 cargo test -p poker-solver-core -- cluster_pipeline
 ```
 
-**Step 8: Commit**
+**Step 4: Commit**
 
 ```bash
 git add crates/core/src/blueprint_v2/cluster_pipeline.rs
-git commit -m "feat: unify clustering pipeline with exhaustive canonical enumeration"
+git commit -m "feat: wire exhaustive clustering into run_clustering_pipeline"
 ```
 
 ---
 
-### Task 2: Add board index maps to `AllBuckets`
+### Task 5: Add board index maps to `AllBuckets`
 
 **Files:**
 - Modify: `crates/core/src/blueprint_v2/mccfr.rs` (lines 85-129)
+- Modify: `crates/core/src/blueprint_v2/bucket_file.rs`
 
-Add `HashMap<PackedBoard, u32>` lookup maps so `precompute_buckets` can find a board's index in O(1).
+**Step 1: Add `board_index_map_fx()` to `BucketFile`**
 
-**Step 1: Add imports**
+In `bucket_file.rs`, add:
+```rust
+/// Build an FxHashMap from PackedBoard to board index for O(1) lookups.
+#[must_use]
+pub fn board_index_map_fx(&self) -> rustc_hash::FxHashMap<PackedBoard, u32> {
+    self.boards
+        .iter()
+        .enumerate()
+        .map(|(i, &board)| (board, i as u32))
+        .collect()
+}
+```
 
-At the top of `mccfr.rs`, add:
+**Step 2: Add imports to `mccfr.rs`**
 
 ```rust
 use rustc_hash::FxHashMap;
@@ -186,25 +506,24 @@ use super::cluster_pipeline::{canonical_key, combo_index};
 use crate::abstraction::isomorphism::CanonicalBoard;
 ```
 
-Note: `canonical_key` is currently `pub(crate)` — it needs to be `pub` since it's used from `mccfr.rs` in the same crate. Same for `combo_index` (already `pub`). Check visibility and adjust if needed.
+Note: `canonical_key` is `pub(crate)` — it's in the same crate, so this works.
 
-**Step 2: Add `board_maps` field to `AllBuckets`**
+**Step 3: Rewrite `AllBuckets` struct**
 
 ```rust
 pub struct AllBuckets {
     pub bucket_counts: [u16; 4],
     pub bucket_files: [Option<BucketFile>; 4],
     /// Board index lookup tables for O(1) bucket file lookups.
-    /// Built from bucket file board tables at construction time.
     board_maps: [Option<FxHashMap<PackedBoard, u32>>; 4],
 }
 ```
 
-Remove the `delta_bins`, `expected_delta`, and `equity_cache` fields — they're no longer needed.
+Remove `delta_bins`, `expected_delta`, `equity_cache` fields.
 
-**Step 3: Rewrite `AllBuckets::new()`**
+**Step 4: Rewrite `AllBuckets::new()`**
 
-Remove the `street_configs` parameter. Build board maps from bucket files:
+Remove the `street_configs` parameter:
 
 ```rust
 impl AllBuckets {
@@ -222,18 +541,12 @@ impl AllBuckets {
                 }
             })
         });
-        Self {
-            bucket_counts,
-            bucket_files,
-            board_maps,
-        }
+        Self { bucket_counts, bucket_files, board_maps }
     }
 }
 ```
 
-This needs `board_index_map_fx()` on `BucketFile` — add it in Task 2b.
-
-**Step 4: Update `equity_only()` constructor**
+**Step 5: Update `equity_only()` constructor**
 
 ```rust
 pub fn equity_only(bucket_counts: [u16; 4], bucket_files: [Option<BucketFile>; 4]) -> Self {
@@ -241,94 +554,47 @@ pub fn equity_only(bucket_counts: [u16; 4], bucket_files: [Option<BucketFile>; 4
 }
 ```
 
-**Step 5: Remove `set_equity_cache()`, `compute_bucket()`, and `expected_next_equity()` function**
+**Step 6: Remove `set_equity_cache()`**
 
-These are no longer needed. Remove them. Also remove the `delta_bin()` helper if it exists and is unused.
+Delete the method entirely.
 
-Remove the unused imports: `EquityDeltaCache`, `Arc`, `StreetClusterConfig`.
-
-**Step 6: Add `board_index_map_fx()` to `BucketFile`**
-
-In `crates/core/src/blueprint_v2/bucket_file.rs`, add:
-
-```rust
-/// Build an FxHashMap from PackedBoard to board index for O(1) lookups.
-#[must_use]
-pub fn board_index_map_fx(&self) -> rustc_hash::FxHashMap<PackedBoard, u32> {
-    self.boards
-        .iter()
-        .enumerate()
-        .map(|(i, &board)| (board, i as u32))
-        .collect()
-}
-```
-
-**Step 7: Run tests (expect some failures from removed API)**
+**Step 7: Run tests (expect compilation errors — fix in Task 6)**
 
 ```bash
 cargo test -p poker-solver-core 2>&1 | head -50
 ```
 
-Fix any compilation errors from removed fields/methods. Tests in `mccfr.rs` that use `equity_only()` should still work since it delegates to `new()`.
-
 **Step 8: Commit**
 
 ```bash
 git add crates/core/src/blueprint_v2/mccfr.rs crates/core/src/blueprint_v2/bucket_file.rs
-git commit -m "feat: add board index maps to AllBuckets for O(1) lookups"
+git commit -m "feat: add board index maps to AllBuckets, remove delta/cache fields"
 ```
 
 ---
 
-### Task 3: Rewrite `precompute_buckets()` to use bucket file lookups
+### Task 6: Rewrite `precompute_buckets()` and `get_bucket()` to use bucket file lookups
 
 **Files:**
-- Modify: `crates/core/src/blueprint_v2/mccfr.rs` (lines 143-222)
+- Modify: `crates/core/src/blueprint_v2/mccfr.rs`
 
-This is the core change. Replace all `compute_equity` calls with bucket file lookups.
-
-**Step 1: Write the new `precompute_buckets` implementation**
+**Step 1: Write the `lookup_bucket` helper**
 
 ```rust
-#[must_use]
-pub fn precompute_buckets(&self, deal: &Deal) -> [[u16; 4]; 2] {
-    let mut result = [[0u16; 4]; 2];
-    for (player, row) in result.iter_mut().enumerate() {
-        let hole = deal.hole_cards[player];
-
-        // Preflop: canonical hand index (unchanged).
-        let hand = crate::hands::CanonicalHand::from_cards(hole[0], hole[1]);
-        let idx = hand.index() as u16;
-        row[0] = idx.min(self.bucket_counts[0] - 1);
-
-        // Postflop: bucket file lookup with equity fallback.
-        let streets: [(usize, &[Card]); 3] = [
-            (1, &deal.board[..3]), // flop
-            (2, &deal.board[..4]), // turn
-            (3, &deal.board[..5]), // river
-        ];
-
-        for (street_idx, board) in streets {
-            row[street_idx] = self.lookup_bucket(street_idx, hole, board);
-        }
-    }
-    result
-}
-
-/// Look up a bucket for a postflop street.
+/// Look up a bucket for a postflop street via bucket file.
 ///
-/// Tries the bucket file first (O(1) canonicalize + hash lookup + array index).
-/// Falls back to equity binning if no bucket file or board not found.
+/// Canonicalizes the board, looks up the board index in the hash map,
+/// applies the same suit permutation to hole cards, and reads the bucket
+/// from the flat array. Falls back to equity binning if no bucket file
+/// or board not found.
 fn lookup_bucket(&self, street_idx: usize, hole: [Card; 2], board: &[Card]) -> u16 {
     if let (Some(bf), Some(board_map)) = (
         &self.bucket_files[street_idx],
         &self.board_maps[street_idx],
     ) {
-        // Canonicalize the board (suit isomorphism).
         if let Ok(canonical) = CanonicalBoard::from_cards(board) {
             let packed = canonical_key(&canonical.cards);
             if let Some(&board_idx) = board_map.get(&packed) {
-                // Apply the same suit permutation to hole cards.
                 let (c0, c1) = canonical.canonicalize_holding(hole[0], hole[1]);
                 let ci = combo_index(c0, c1);
                 return bf.get_bucket(board_idx, ci);
@@ -339,14 +605,36 @@ fn lookup_bucket(&self, street_idx: usize, hole: [Card; 2], board: &[Card]) -> u
     // Fallback: equity-based bucketing.
     let equity = crate::showdown_equity::compute_equity(hole, board);
     let k = self.bucket_counts[street_idx];
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let bucket = (equity * f64::from(k)) as u16;
     bucket.min(k - 1)
 }
 ```
 
-**Step 2: Update `get_bucket()` to also use bucket file lookups**
+**Step 2: Rewrite `precompute_buckets()`**
 
-The `get_bucket` method (line 230) is used by the TUI scenario display (line 741). Update it to use the same lookup path:
+```rust
+#[must_use]
+pub fn precompute_buckets(&self, deal: &Deal) -> [[u16; 4]; 2] {
+    let mut result = [[0u16; 4]; 2];
+    for (player, row) in result.iter_mut().enumerate() {
+        let hole = deal.hole_cards[player];
+
+        // Preflop: canonical hand index.
+        let hand = crate::hands::CanonicalHand::from_cards(hole[0], hole[1]);
+        let idx = hand.index() as u16;
+        row[0] = idx.min(self.bucket_counts[0] - 1);
+
+        // Postflop: bucket file lookup with equity fallback.
+        row[1] = self.lookup_bucket(1, hole, &deal.board[..3]); // flop
+        row[2] = self.lookup_bucket(2, hole, &deal.board[..4]); // turn
+        row[3] = self.lookup_bucket(3, hole, &deal.board[..5]); // river
+    }
+    result
+}
+```
+
+**Step 3: Rewrite `get_bucket()`**
 
 ```rust
 #[must_use]
@@ -360,21 +648,23 @@ pub fn get_bucket(&self, street: Street, hole_cards: [Card; 2], board: &[Card]) 
 }
 ```
 
-**Step 3: Remove dead code**
+**Step 4: Remove dead code**
 
 Remove:
 - `compute_bucket()` method
 - `expected_next_equity()` free function
-- `delta_bin()` free function (grep for it first)
-- Any unused imports (`showdown_equity::compute_equity` may still be needed for fallback — keep it)
+- `delta_bin()` free function (if it exists)
+- Unused imports (`EquityDeltaCache`, `Arc`, `StreetClusterConfig` from mccfr.rs)
 
-**Step 4: Run tests**
+Keep `board_for_street()` — still used.
+
+**Step 5: Run tests**
 
 ```bash
 cargo test -p poker-solver-core -- mccfr
 ```
 
-**Step 5: Commit**
+**Step 6: Commit**
 
 ```bash
 git add crates/core/src/blueprint_v2/mccfr.rs
@@ -383,46 +673,26 @@ git commit -m "feat: precompute_buckets uses bucket file lookups instead of comp
 
 ---
 
-### Task 4: Update trainer to match new `AllBuckets` API
+### Task 7: Update trainer to match new `AllBuckets` API
 
 **Files:**
 - Modify: `crates/core/src/blueprint_v2/trainer.rs`
 
-**Step 1: Update `AllBuckets::new()` call site**
-
-In `BlueprintTrainer::new()` (line 234), remove `street_configs` parameter:
+**Step 1: Update `AllBuckets::new()` call in `BlueprintTrainer::new()`**
 
 ```rust
-// Before:
-let street_configs = [
-    &config.clustering.preflop,
-    &config.clustering.flop,
-    &config.clustering.turn,
-    &config.clustering.river,
-];
-let buckets = AllBuckets::new(bucket_counts, bucket_files, street_configs);
-
-// After:
+// Remove street_configs construction (lines 228-233)
+// Replace line 234:
 let buckets = AllBuckets::new(bucket_counts, bucket_files);
 ```
 
-**Step 2: Remove equity cache loading in `train()`**
+**Step 2: Remove equity cache loading block in `train()`**
 
-Delete the entire `needs_cache` block in `train()` (lines 405-448):
-
-```rust
-// DELETE this entire block:
-let needs_cache = (self.config.clustering.flop.expected_delta ...
-if needs_cache {
-    if let Some(cache_path) = ...
-    ...
-    self.buckets.set_equity_cache(Arc::new(cache));
-}
-```
+Delete the entire `needs_cache` block (lines 405-448).
 
 **Step 3: Remove unused imports**
 
-Remove `EquityDeltaCache` import (line 29) and any unused `Arc` imports.
+Remove `EquityDeltaCache` import and any unused `Arc` imports.
 
 **Step 4: Run tests**
 
@@ -435,19 +705,17 @@ cargo test -p poker-solver-trainer
 
 ```bash
 git add crates/core/src/blueprint_v2/trainer.rs
-git commit -m "feat: remove equity cache, use simplified AllBuckets API"
+git commit -m "feat: simplify trainer init, remove equity cache loading"
 ```
 
 ---
 
-### Task 5: Add tests for bucket file lookup path
+### Task 8: Add tests for bucket file lookup path
 
 **Files:**
 - Modify: `crates/core/src/blueprint_v2/mccfr.rs` (tests module)
 
-**Step 1: Test that bucket file lookup produces correct bucket**
-
-Build a minimal `BucketFile` with one known board, set a specific combo to a known bucket, and verify `precompute_buckets` returns it:
+**Step 1: Test bucket file lookup produces correct bucket**
 
 ```rust
 #[test]
@@ -456,7 +724,6 @@ fn precompute_buckets_uses_bucket_file() {
     use crate::abstraction::isomorphism::CanonicalBoard;
     use crate::blueprint_v2::cluster_pipeline::{canonical_key, combo_index};
 
-    // Create a known board and canonicalize it.
     let board = [
         Card::new(Value::Ace, Suit::Spade),
         Card::new(Value::King, Suit::Spade),
@@ -467,7 +734,6 @@ fn precompute_buckets_uses_bucket_file() {
     let canonical = CanonicalBoard::from_cards(&board).unwrap();
     let packed = canonical_key(&canonical.cards);
 
-    // Pick a hole-card combo and find its canonical combo index.
     let hole = [
         Card::new(Value::Two, Suit::Spade),
         Card::new(Value::Three, Suit::Heart),
@@ -475,9 +741,8 @@ fn precompute_buckets_uses_bucket_file() {
     let (c0, c1) = canonical.canonicalize_holding(hole[0], hole[1]);
     let ci = combo_index(c0, c1) as usize;
 
-    // Build a bucket file with this one board.
     let mut buckets_data = vec![0_u16; 1326];
-    buckets_data[ci] = 42; // known bucket value
+    buckets_data[ci] = 42;
 
     let bf = BucketFile {
         header: BucketFileHeader {
@@ -491,10 +756,7 @@ fn precompute_buckets_uses_bucket_file() {
         buckets: buckets_data,
     };
 
-    let all = AllBuckets::new(
-        [169, 500, 500, 500],
-        [None, None, None, Some(bf)],
-    );
+    let all = AllBuckets::new([169, 500, 500, 500], [None, None, None, Some(bf)]);
 
     let deal = Deal {
         hole_cards: [hole, [Card::new(Value::Four, Suit::Club), Card::new(Value::Five, Suit::Club)]],
@@ -505,16 +767,12 @@ fn precompute_buckets_uses_bucket_file() {
 }
 ```
 
-**Step 2: Test fallback to equity when no bucket file**
+**Step 2: Test equity fallback when no bucket file**
 
 ```rust
 #[test]
 fn precompute_buckets_equity_fallback() {
-    let all = AllBuckets::new(
-        [169, 10, 10, 10],
-        [None, None, None, None],
-    );
-
+    let all = AllBuckets::new([169, 10, 10, 10], [None, None, None, None]);
     let deal = Deal {
         hole_cards: [
             [Card::new(Value::Ace, Suit::Spade), Card::new(Value::Ace, Suit::Heart)],
@@ -529,7 +787,6 @@ fn precompute_buckets_equity_fallback() {
         ],
     };
     let result = all.precompute_buckets(&deal);
-    // AA should have high equity → high bucket
     assert!(result[0][3] >= 7, "AA should get a high river bucket, got {}", result[0][3]);
 }
 ```
@@ -549,7 +806,7 @@ git commit -m "test: bucket file lookup and equity fallback in precompute_bucket
 
 ---
 
-### Task 6: Full test suite + clippy
+### Task 9: Full test suite + clippy + cleanup
 
 **Step 1: Run full test suite**
 
@@ -557,68 +814,27 @@ git commit -m "test: bucket file lookup and equity fallback in precompute_bucket
 cargo test
 ```
 
-Fix any compilation errors or test failures.
-
 **Step 2: Run clippy**
 
 ```bash
 cargo clippy
 ```
 
-Fix any warnings.
-
-**Step 3: Verify test suite completes in under 1 minute**
+**Step 3: Verify tests complete in under 1 minute**
 
 ```bash
 time cargo test 2>&1 | tail -5
 ```
 
-**Step 4: Commit any fixes**
+**Step 4: Remove dead code**
 
-```bash
-git add -u
-git commit -m "chore: fix clippy and test issues from bucket file refactor"
-```
+Grep for unused functions: `expected_next_equity`, `delta_bin`, `compute_bucket`, old clustering variants. Remove or mark `#[allow(dead_code)]`.
 
----
-
-### Task 7: Clean up dead code
-
-**Files:**
-- Modify: `crates/core/src/blueprint_v2/mccfr.rs`
-- Modify: `crates/core/src/blueprint_v2/equity_cache.rs`
-- Modify: `crates/core/src/blueprint_v2/config.rs`
-
-**Step 1: Check if `EquityDeltaCache` is still used anywhere**
-
-```bash
-cargo grep EquityDeltaCache
-```
-
-If only used in tests or the `generate-equity-cache` CLI command, keep it. If completely unused, consider marking with `#[allow(dead_code)]`. Do NOT delete it — it may be useful for other tools.
-
-**Step 2: Check if `delta_bins` and `expected_delta` config fields are still used**
-
-```bash
-cargo grep delta_bins
-cargo grep expected_delta
-```
-
-Keep config fields for backward compatibility (serde deserialization of existing configs). Just stop using them in `AllBuckets`.
-
-**Step 3: Remove unused functions in `mccfr.rs`**
-
-Grep for `expected_next_equity`, `delta_bin`, `compute_bucket` — if truly unused after the refactor, remove them.
-
-**Step 4: Run tests + clippy**
-
-```bash
-cargo test && cargo clippy
-```
+Keep `EquityDeltaCache` if it's used by CLI commands or other tools. Keep config fields (`delta_bins`, `expected_delta`) for serde backward compat.
 
 **Step 5: Commit**
 
 ```bash
 git add -u
-git commit -m "chore: remove dead equity computation code from MCCFR hot path"
+git commit -m "chore: cleanup dead code from bucket file refactor"
 ```
