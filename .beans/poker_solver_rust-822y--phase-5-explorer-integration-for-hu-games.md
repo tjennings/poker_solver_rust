@@ -1,14 +1,14 @@
 ---
 # poker_solver_rust-822y
 title: 'Phase 5: Explorer Integration for HU Games'
-status: todo
+status: completed
 type: feature
 priority: low
 tags:
     - gpu
     - explorer
 created_at: 2026-03-15T04:14:47Z
-updated_at: 2026-03-15T04:14:47Z
+updated_at: 2026-03-15T23:48:38Z
 parent: poker_solver_rust-twez
 ---
 
