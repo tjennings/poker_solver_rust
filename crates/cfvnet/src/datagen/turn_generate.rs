@@ -15,14 +15,16 @@ use burn::backend::NdArray;
 use burn::module::Module;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 use indicatif::{ProgressBar, ProgressStyle};
-use poker_solver_core::blueprint_v2::cfv_subgame_solver::{CfvSubgameSolver, LeafEvaluator};
-use poker_solver_core::blueprint_v2::game_tree::GameTree;
-use poker_solver_core::blueprint_v2::subgame_cfr::SubgameHands;
-use poker_solver_core::blueprint_v2::Street;
+use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
 use poker_solver_core::poker::{Card, Suit, Value};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use range_solver::card::card_pair_to_index;
+use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
+use range_solver::bet_size::{BetSize, BetSizeOptions};
+use range_solver::card::{card_pair_to_index, CardConfig, NOT_DEALT};
+use range_solver::game::PostFlopGame;
+use range_solver::range::Range as RsRange;
+use range_solver::solve;
 use rayon::prelude::*;
 
 use super::range_gen::NUM_COMBOS;
@@ -77,6 +79,7 @@ fn u8_to_rs_card(id: u8) -> Card {
 }
 
 /// Convert an `rs_poker::core::Card` to a range-solver `u8` card.
+#[cfg(test)]
 fn rs_card_to_u8(card: Card) -> u8 {
     let rank = card.value as u8;
     let suit = match card.suit {
@@ -108,6 +111,10 @@ fn parse_bet_sizes(sizes: &[String]) -> Vec<f64> {
 
 /// Solve a single turn situation and return per-player root CFVs mapped to 1326 indices.
 ///
+/// Uses the range-solver with `depth_limit: Some(1)` so that river transitions
+/// become depth boundary terminals. The leaf evaluator (river net) is called once
+/// per boundary to fill in the boundary CFVs before solving.
+///
 /// Returns `(oop_cfvs_1326, ip_cfvs_1326, valid_mask, game_value_oop, game_value_ip)`.
 #[allow(clippy::type_complexity)]
 fn solve_turn_situation(
@@ -117,7 +124,7 @@ fn solve_turn_situation(
     ranges: &[[f32; NUM_COMBOS]; 2],
     bet_sizes: &[Vec<f64>],
     solver_iterations: u32,
-    leaf_eval_interval: u32,
+    _leaf_eval_interval: u32,
     evaluator: Box<dyn LeafEvaluator>,
 ) -> (
     [f32; NUM_COMBOS],
@@ -126,52 +133,130 @@ fn solve_turn_situation(
     f32,
     f32,
 ) {
-    // Convert board from u8 to Card.
+    // Build range-solver Range objects from 1326-indexed f32 arrays.
+    let oop_range = RsRange::from_raw_data(&ranges[0]).expect("valid OOP range");
+    let ip_range = RsRange::from_raw_data(&ranges[1]).expect("valid IP range");
+
+    // Build bet size options from pot fractions.
+    let sizes: Vec<BetSize> = bet_sizes
+        .iter()
+        .flat_map(|v| v.iter().map(|&f| BetSize::PotRelative(f)))
+        .collect();
+    let bet_size_opts = BetSizeOptions {
+        bet: sizes.clone(),
+        raise: Vec::new(),
+    };
+
+    let card_config = CardConfig {
+        range: [oop_range, ip_range],
+        flop: [board_u8[0], board_u8[1], board_u8[2]],
+        turn: board_u8[3],
+        river: NOT_DEALT,
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Turn,
+        starting_pot: pot as i32,
+        effective_stack: effective_stack as i32,
+        turn_bet_sizes: [bet_size_opts.clone(), bet_size_opts],
+        river_bet_sizes: [BetSizeOptions::default(), BetSizeOptions::default()],
+        depth_limit: Some(1),
+        add_allin_threshold: 1.5,
+        force_allin_threshold: 0.15,
+        merging_threshold: 0.1,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).expect("valid action tree");
+    let mut game = PostFlopGame::with_config(card_config, action_tree).expect("valid game");
+    game.allocate_memory(false);
+
+    // Convert board from u8 to poker_solver_core::Card for the evaluator.
     let board_cards: Vec<Card> = board_u8.iter().map(|&c| u8_to_rs_card(c)).collect();
 
-    // Build tree and enumerate combos.
-    let invested = [pot / 2.0; 2];
-    let starting_stack = effective_stack + pot / 2.0;
-    let tree = GameTree::build_subgame(
-        Street::Turn,
-        pot,
-        invested,
-        starting_stack,
-        bet_sizes,
-        Some(1), // depth_limit=1: river boundaries become DepthBoundary
-    );
+    // Evaluate boundary nodes using the river net evaluator.
+    let num_boundaries = game.num_boundary_nodes();
+    for ordinal in 0..num_boundaries {
+        let bpot = game.boundary_pot(ordinal) as f64;
+        // Effective stack at boundary = original eff_stack - amount invested
+        // beyond the starting pot by each player.
+        // boundary_pot = starting_pot + 2 * node.amount
+        // => node.amount = (bpot - pot) / 2
+        // => eff_stack_at_boundary = effective_stack - node.amount
+        let eff_stack_at_boundary = effective_stack - (bpot - pot) / 2.0;
 
-    let hands = SubgameHands::enumerate(&board_cards);
-    let mut solver = CfvSubgameSolver::new(
-        tree,
-        hands.clone(),
-        &board_cards,
-        evaluator,
-        starting_stack,
-    );
+        // Get private hands for each player in the range-solver's internal ordering.
+        // private_cards returns &[(u8, u8)] — card ID pairs.
+        for player in 0..2u8 {
+            let hands = game.private_cards(player as usize);
+            let num_hands = hands.len();
 
-    solver.train_with_leaf_interval(solver_iterations, leaf_eval_interval);
+            // Convert to [[Card; 2]] for the evaluator.
+            let combos: Vec<[Card; 2]> = hands
+                .iter()
+                .map(|&(c0, c1)| [u8_to_rs_card(c0), u8_to_rs_card(c1)])
+                .collect();
 
-    // Extract root CFVs for both players.
-    let oop_cfvs_combo = solver.root_cfvs(0);
-    let ip_cfvs_combo = solver.root_cfvs(1);
+            // Build per-combo range arrays from the 1326-indexed input ranges.
+            let oop_reach: Vec<f64> = hands
+                .iter()
+                .map(|&(c0, c1)| f64::from(ranges[0][card_pair_to_index(c0, c1)]))
+                .collect();
+            let ip_reach: Vec<f64> = hands
+                .iter()
+                .map(|&(c0, c1)| f64::from(ranges[1][card_pair_to_index(c0, c1)]))
+                .collect();
 
-    // Map combo-indexed CFVs to 1326-indexed arrays.
+            // Call the evaluator for this traverser.
+            let cfvs_f64 = evaluator.evaluate(
+                &combos,
+                &board_cards,
+                bpot,
+                eff_stack_at_boundary,
+                &oop_reach,
+                &ip_reach,
+                player,
+            );
+
+            // Convert to f32 for set_boundary_cfvs.
+            let cfvs_f32: Vec<f32> = cfvs_f64.iter().map(|&v| v as f32).collect();
+            debug_assert_eq!(cfvs_f32.len(), num_hands);
+
+            game.set_boundary_cfvs(ordinal, player as usize, cfvs_f32);
+        }
+    }
+
+    // Solve the depth-limited turn game.
+    solve(&mut game, solver_iterations, 0.0, false);
+
+    // Extract root EVs.
+    game.back_to_root();
+    game.cache_normalized_weights();
+    let raw_oop = game.expected_values(0);
+    let raw_ip = game.expected_values(1);
+
+    let oop_hands = game.private_cards(0);
+    let ip_hands = game.private_cards(1);
+
+    // Map solver EVs (absolute chips) to 1326-indexed pot-relative arrays.
+    // expected_values() returns total payoff (includes player's contribution).
+    // Net gain = ev - pot/2. Normalize to half-pot-relative: (ev - pot/2) / (pot/2).
+    let half_pot = pot / 2.0;
+    let norm = if half_pot > 0.0 { half_pot } else { 1.0 };
+
     let mut oop_cfvs = [0.0_f32; NUM_COMBOS];
     let mut ip_cfvs = [0.0_f32; NUM_COMBOS];
     let mut valid_mask = [0_u8; NUM_COMBOS];
 
-    for (combo_idx, combo) in hands.combos.iter().enumerate() {
-        let c0 = rs_card_to_u8(combo[0]);
-        let c1 = rs_card_to_u8(combo[1]);
-        let idx_1326 = card_pair_to_index(c0, c1);
-
-        // CFVs from the solver are in chip units; normalize to pot-relative.
-        let half_pot = pot / 2.0;
-        let norm = if half_pot > 0.0 { half_pot } else { 1.0 };
-        oop_cfvs[idx_1326] = (oop_cfvs_combo[combo_idx] / norm) as f32;
-        ip_cfvs[idx_1326] = (ip_cfvs_combo[combo_idx] / norm) as f32;
-        valid_mask[idx_1326] = 1;
+    for (i, &(c0, c1)) in oop_hands.iter().enumerate() {
+        let idx = card_pair_to_index(c0, c1);
+        oop_cfvs[idx] = ((f64::from(raw_oop[i]) - half_pot) / norm) as f32;
+        valid_mask[idx] = 1;
+    }
+    for (i, &(c0, c1)) in ip_hands.iter().enumerate() {
+        let idx = card_pair_to_index(c0, c1);
+        ip_cfvs[idx] = ((f64::from(raw_ip[i]) - half_pot) / norm) as f32;
+        valid_mask[idx] = 1;
     }
 
     // Compute weighted game values.
