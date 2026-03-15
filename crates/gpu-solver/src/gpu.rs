@@ -3,6 +3,8 @@ use cudarc::driver::{
     ValidAsZeroBits,
 };
 use cudarc::nvrtc::compile_ptx;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Wrapper around a CUDA device context and stream.
@@ -11,9 +13,13 @@ use std::sync::Arc;
 /// compiling CUDA kernels at runtime, and launching solver-specific kernels
 /// (regret matching, forward reach propagation, terminal evaluation,
 /// backward CFV propagation, and DCFR+ regret updates).
+///
+/// Kernels are cached after first compilation so repeated launches are fast.
 pub struct GpuContext {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
+    /// Cache of compiled kernel functions keyed by function name.
+    kernel_cache: RefCell<HashMap<String, CudaFunction>>,
 }
 
 impl GpuContext {
@@ -21,7 +27,11 @@ impl GpuContext {
     pub fn new(device_ordinal: usize) -> Result<Self, GpuError> {
         let ctx = CudaContext::new(device_ordinal)?;
         let stream = ctx.default_stream();
-        Ok(Self { ctx, stream })
+        Ok(Self {
+            ctx,
+            stream,
+            kernel_cache: RefCell::new(HashMap::new()),
+        })
     }
 
     /// Copy host data to a new GPU buffer.
@@ -49,15 +59,26 @@ impl GpuContext {
     }
 
     /// Compile a CUDA source string to PTX, load it as a module, and return
-    /// the named function.
+    /// the named function. Results are cached so repeated calls with the same
+    /// function name return the previously compiled kernel.
     pub fn compile_and_load(
         &self,
         source: &str,
         function_name: &str,
     ) -> Result<CudaFunction, GpuError> {
+        let cache = self.kernel_cache.borrow();
+        if let Some(func) = cache.get(function_name) {
+            return Ok(func.clone());
+        }
+        drop(cache);
+
         let ptx = compile_ptx(source)?;
         let module = self.ctx.load_module(ptx)?;
-        Ok(module.load_function(function_name)?)
+        let func = module.load_function(function_name)?;
+        self.kernel_cache
+            .borrow_mut()
+            .insert(function_name.to_string(), func.clone());
+        Ok(func)
     }
 
     /// Launch the regret-matching kernel with per-hand layout.
@@ -291,6 +312,96 @@ impl GpuContext {
                 .arg(&num_nodes_this_level)
                 .arg(&num_hands)
                 .arg(&max_actions)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Launch the combined forward-pass kernel that propagates both players'
+    /// reach probabilities in a single pass.
+    ///
+    /// For each node in the current BFS level:
+    /// - The acting player's reach is multiplied by the action probability
+    /// - The non-acting player's reach is copied from parent
+    ///
+    /// # Layout
+    /// - `reach_oop`, `reach_ip`: `[num_total_nodes * num_hands]`
+    /// - `strategy`: `[num_infosets * max_actions * num_hands]`
+    /// - `parent_players`: `[num_nodes_this_level]` — 0=OOP, 1=IP
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_forward_pass(
+        &self,
+        reach_oop: &mut CudaSlice<f32>,
+        reach_ip: &mut CudaSlice<f32>,
+        strategy: &CudaSlice<f32>,
+        level_nodes: &CudaSlice<u32>,
+        parent_nodes: &CudaSlice<u32>,
+        parent_actions: &CudaSlice<u32>,
+        parent_infosets: &CudaSlice<u32>,
+        parent_players: &CudaSlice<u32>,
+        num_nodes_this_level: u32,
+        num_hands: u32,
+        max_actions: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/forward_pass.cu"),
+            "forward_pass",
+        )?;
+        let total_threads = num_nodes_this_level * num_hands;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(reach_oop)
+                .arg(reach_ip)
+                .arg(strategy)
+                .arg(level_nodes)
+                .arg(parent_nodes)
+                .arg(parent_actions)
+                .arg(parent_infosets)
+                .arg(parent_players)
+                .arg(&num_nodes_this_level)
+                .arg(&num_hands)
+                .arg(&max_actions)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Launch the extract-strategy kernel.
+    ///
+    /// Normalizes cumulative strategy sums into final action probabilities
+    /// for each (infoset, hand) pair. Falls back to uniform when all
+    /// strategy sums are zero.
+    ///
+    /// # Layout
+    /// - `strategy_sum`: `[num_infosets * max_actions * num_hands]` — input
+    /// - `num_actions`: `[num_infosets]` — valid action count per infoset
+    /// - `output_strategy`: `[num_infosets * max_actions * num_hands]` — output
+    pub fn launch_extract_strategy(
+        &self,
+        strategy_sum: &CudaSlice<f32>,
+        num_actions: &CudaSlice<u32>,
+        output_strategy: &mut CudaSlice<f32>,
+        num_infosets: u32,
+        max_actions: u32,
+        num_hands: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/extract_strategy.cu"),
+            "extract_strategy",
+        )?;
+        let total_threads = num_infosets * num_hands;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(strategy_sum)
+                .arg(num_actions)
+                .arg(output_strategy)
+                .arg(&num_infosets)
+                .arg(&max_actions)
+                .arg(&num_hands)
                 .launch(cfg)?;
         }
         Ok(())
@@ -883,6 +994,108 @@ mod tests {
             (result_strat_sum[3] - 0.6).abs() < eps,
             "strat_sum hand1 action1: got {}",
             result_strat_sum[3]
+        );
+    }
+
+    #[test]
+    fn test_extract_strategy_kernel() {
+        let gpu = GpuContext::new(0).unwrap();
+        let num_infosets: u32 = 2;
+        let max_actions: u32 = 3;
+        let num_hands: u32 = 2;
+
+        // Per-hand layout: (infoset * max_actions + action) * num_hands + hand
+        // Infoset 0, hand 0: strategy_sum [10, 20, 30] -> [1/6, 2/6, 3/6]
+        // Infoset 0, hand 1: strategy_sum [0, 0, 0] -> uniform [1/3, 1/3, 1/3]
+        // Infoset 1, hand 0: strategy_sum [5, 0, 15] -> [1/4, 0, 3/4]
+        // Infoset 1, hand 1: strategy_sum [3, 3, 3] -> [1/3, 1/3, 1/3]
+        let strategy_sum: Vec<f32> = vec![
+            10.0, 0.0, // iset0, act0: hand0=10, hand1=0
+            20.0, 0.0, // iset0, act1: hand0=20, hand1=0
+            30.0, 0.0, // iset0, act2: hand0=30, hand1=0
+            5.0, 3.0,  // iset1, act0
+            0.0, 3.0,  // iset1, act1
+            15.0, 3.0, // iset1, act2
+        ];
+        let num_actions: Vec<u32> = vec![3, 3];
+
+        let gpu_strategy_sum = gpu.upload(&strategy_sum).unwrap();
+        let gpu_num_actions = gpu.upload(&num_actions).unwrap();
+        let mut gpu_output = gpu
+            .alloc_zeros::<f32>((num_infosets * max_actions * num_hands) as usize)
+            .unwrap();
+
+        gpu.launch_extract_strategy(
+            &gpu_strategy_sum,
+            &gpu_num_actions,
+            &mut gpu_output,
+            num_infosets,
+            max_actions,
+            num_hands,
+        )
+        .unwrap();
+
+        let result = gpu.download(&gpu_output).unwrap();
+        let eps = 1e-5;
+
+        // Infoset 0, hand 0: [10/60, 20/60, 30/60] = [1/6, 1/3, 1/2]
+        assert!(
+            (result[0] - 1.0 / 6.0).abs() < eps,
+            "i0h0a0: {}",
+            result[0]
+        );
+        assert!(
+            (result[2] - 1.0 / 3.0).abs() < eps,
+            "i0h0a1: {}",
+            result[2]
+        );
+        assert!((result[4] - 0.5).abs() < eps, "i0h0a2: {}", result[4]);
+
+        // Infoset 0, hand 1: all zeros -> uniform [1/3, 1/3, 1/3]
+        assert!(
+            (result[1] - 1.0 / 3.0).abs() < eps,
+            "i0h1a0: {}",
+            result[1]
+        );
+        assert!(
+            (result[3] - 1.0 / 3.0).abs() < eps,
+            "i0h1a1: {}",
+            result[3]
+        );
+        assert!(
+            (result[5] - 1.0 / 3.0).abs() < eps,
+            "i0h1a2: {}",
+            result[5]
+        );
+
+        // Infoset 1, hand 0: [5/20, 0/20, 15/20] = [1/4, 0, 3/4]
+        assert!(
+            (result[6] - 0.25).abs() < eps,
+            "i1h0a0: {}",
+            result[6]
+        );
+        assert!((result[8] - 0.0).abs() < eps, "i1h0a1: {}", result[8]);
+        assert!(
+            (result[10] - 0.75).abs() < eps,
+            "i1h0a2: {}",
+            result[10]
+        );
+
+        // Infoset 1, hand 1: [3/9, 3/9, 3/9] = [1/3, 1/3, 1/3]
+        assert!(
+            (result[7] - 1.0 / 3.0).abs() < eps,
+            "i1h1a0: {}",
+            result[7]
+        );
+        assert!(
+            (result[9] - 1.0 / 3.0).abs() < eps,
+            "i1h1a1: {}",
+            result[9]
+        );
+        assert!(
+            (result[11] - 1.0 / 3.0).abs() < eps,
+            "i1h1a2: {}",
+            result[11]
         );
     }
 
