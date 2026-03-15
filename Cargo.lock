@@ -151,6 +151,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
+name = "approx"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab112f0a86d568ea0e627cc1d6be74a1e9cd55214684db5561995f6dad897c6"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1568,7 +1577,7 @@ dependencies = [
  "cubecl-core",
  "cubecl-cpp",
  "cubecl-runtime",
- "cudarc",
+ "cudarc 0.12.1",
  "derive-new 0.6.0",
  "half",
  "log",
@@ -1688,6 +1697,15 @@ name = "cudarc"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38cd60a9a42ec83a2ed7effb0b1f073270264ea99da7acfc44f7e8d74dee0384"
+dependencies = [
+ "libloading 0.8.9",
+]
+
+[[package]]
+name = "cudarc"
+version = "0.16.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17200eb07e7d85a243aa1bf4569a7aa998385ba98d14833973a817a63cc86e92"
 dependencies = [
  "libloading 0.8.9",
 ]
@@ -5070,6 +5088,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower-http",
+]
+
+[[package]]
+name = "poker-solver-gpu"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "cudarc 0.16.6",
+ "poker-solver-core",
+ "range-solver",
+ "rayon",
+ "rs_poker",
+ "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
