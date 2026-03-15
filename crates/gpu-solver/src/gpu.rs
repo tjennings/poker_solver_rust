@@ -1,11 +1,101 @@
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
-    ValidAsZeroBits,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr,
+    LaunchConfig, PushKernelArg, ValidAsZeroBits,
 };
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{compile_ptx, compile_ptx_with_opts, CompileOptions};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// GPU-resident solver context struct, matching the CUDA `SolverContext` layout.
+///
+/// All pointer fields are raw device pointers (u64) and scalar fields are u32.
+/// This struct is uploaded to GPU memory and a single pointer to it is passed
+/// as the kernel argument, keeping us well under CUDA's 4KB argument limit.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GpuSolverContext {
+    // Solver state (read/write) -- 6 pointers
+    pub regrets: u64,
+    pub strategy_sum: u64,
+    pub strategy: u64,
+    pub reach_oop: u64,
+    pub reach_ip: u64,
+    pub cfvalues: u64,
+
+    // Tree topology (read-only) -- 5 pointers
+    pub child_offsets: u64,
+    pub children: u64,
+    pub infoset_ids: u64,
+    pub num_actions_arr: u64,
+    pub node_types: u64,
+
+    // Level data -- 4 pointers
+    pub level_offsets: u64,
+    pub parent_nodes: u64,
+    pub parent_actions: u64,
+    pub parent_infosets: u64,
+    pub parent_players: u64,
+
+    // Terminal fold data -- 4 pointers
+    pub fold_terminal_nodes: u64,
+    pub fold_amount_win: u64,
+    pub fold_amount_lose: u64,
+    pub fold_player: u64,
+
+    // Fold aggregates -- 6 pointers
+    pub hand_cards_oop: u64,
+    pub hand_cards_ip: u64,
+    pub same_hand_index_oop: u64,
+    pub same_hand_index_ip: u64,
+    pub fold_total_opp_reach: u64,
+    pub fold_per_card_reach: u64,
+
+    // Showdown data -- 3 pointers
+    pub showdown_terminal_nodes: u64,
+    pub showdown_amount_win: u64,
+    pub showdown_amount_lose: u64,
+
+    // 3-kernel showdown data -- 9 pointers
+    pub sorted_opp_oop: u64,
+    pub sorted_opp_ip: u64,
+    pub rank_win_oop: u64,
+    pub rank_next_oop: u64,
+    pub rank_win_ip: u64,
+    pub rank_next_ip: u64,
+    pub sd_sorted_reach: u64,
+    pub sd_prefix_excl: u64,
+    pub sd_totals: u64,
+
+    // Decision node lists -- 2 pointers
+    pub decision_nodes_oop: u64,
+    pub decision_nodes_ip: u64,
+
+    // Initial reach -- 2 pointers
+    pub initial_reach_oop: u64,
+    pub initial_reach_ip: u64,
+
+    // Dimensions -- 12 scalars
+    pub num_hands: u32,
+    pub max_actions: u32,
+    pub num_infosets: u32,
+    pub num_nodes: u32,
+    pub num_levels: u32,
+    pub hands_per_spot: u32,
+    pub num_spots: u32,
+    pub num_fold_terminals: u32,
+    pub num_showdown_terminals: u32,
+    pub num_oop_decisions: u32,
+    pub num_ip_decisions: u32,
+    pub max_iterations: u32,
+
+    // Grid sync state -- 2 pointers
+    pub barrier_counter: u64,
+    pub barrier_sense: u64,
+}
+
+unsafe impl DeviceRepr for GpuSolverContext {}
+unsafe impl ValidAsZeroBits for GpuSolverContext {}
 
 /// Wrapper around a CUDA device context and stream.
 ///
@@ -1256,6 +1346,83 @@ impl GpuContext {
                 .launch(cfg)?;
         }
         Ok(())
+    }
+
+    /// Launch the persistent DCFR+ mega-kernel.
+    ///
+    /// Runs the entire DCFR+ solve loop in a single kernel launch using
+    /// cooperative groups (grid-wide atomic barrier). The kernel performs
+    /// all iterations on-GPU without returning to the host.
+    ///
+    /// # Arguments
+    /// - `ctx_gpu`: GPU-resident `GpuSolverContext` struct containing all pointers
+    /// - `num_blocks`: Number of thread blocks (must fit on GPU simultaneously)
+    /// - `block_size`: Threads per block (typically 256)
+    pub fn launch_dcfr_persistent(
+        &self,
+        ctx_gpu: &CudaSlice<GpuSolverContext>,
+        num_blocks: u32,
+        block_size: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_persistent_kernel()?;
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(ctx_gpu)
+                .launch_cooperative(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Compile the persistent DCFR+ mega-kernel with cooperative launch support.
+    ///
+    /// Uses `compile_ptx_with_opts` to enable cooperative launch semantics.
+    /// The kernel is cached after first compilation.
+    fn compile_persistent_kernel(&self) -> Result<CudaFunction, GpuError> {
+        let function_name = "dcfr_persistent";
+        let cache = self.kernel_cache.borrow();
+        if let Some(func) = cache.get(function_name) {
+            return Ok(func.clone());
+        }
+        drop(cache);
+
+        let source = include_str!("../kernels/dcfr_persistent.cu");
+        let ptx = compile_ptx_with_opts(
+            source,
+            CompileOptions {
+                // Extra options can include architecture targeting
+                options: vec![
+                    "--extra-device-vectorization".to_string(),
+                ],
+                ..Default::default()
+            },
+        )?;
+        let module = self.ctx.load_module(ptx)?;
+        let func = module.load_function(function_name)?;
+        self.kernel_cache
+            .borrow_mut()
+            .insert(function_name.to_string(), func.clone());
+        Ok(func)
+    }
+
+    /// Get the raw device pointer as u64 for a CudaSlice.
+    /// Used to populate the GpuSolverContext struct.
+    ///
+    /// The returned u64 is only valid for use on the same stream.
+    pub fn get_device_ptr<T>(&self, slice: &CudaSlice<T>) -> u64 {
+        let (ptr, _guard) = slice.device_ptr(&self.stream);
+        ptr as u64
+    }
+
+    /// Get the raw device pointer as u64 for a mutable CudaSlice.
+    pub fn get_device_ptr_mut<T>(&self, slice: &mut CudaSlice<T>) -> u64 {
+        let (ptr, _guard) = slice.device_ptr_mut(&self.stream);
+        ptr as u64
     }
 }
 

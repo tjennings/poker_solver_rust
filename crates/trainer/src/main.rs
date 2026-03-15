@@ -178,6 +178,9 @@ enum Commands {
         /// Reference effective stack
         #[arg(long, default_value_t = 100)]
         ref_stack: i32,
+        /// Use persistent mega-kernel (single launch, eliminates kernel launch overhead)
+        #[arg(long, default_value_t = false)]
+        persistent_kernel: bool,
     },
     /// Solve a postflop spot with exact (no abstraction) DCFR
     RangeSolve {
@@ -687,6 +690,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             seed,
             ref_pot,
             ref_stack,
+            persistent_kernel,
         } => {
             run_gpu_train_river(
                 num_samples,
@@ -708,6 +712,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 seed,
                 ref_pot,
                 ref_stack,
+                persistent_kernel,
             )?;
         }
         #[cfg(feature = "cuda")]
@@ -806,6 +811,7 @@ fn run_gpu_train_river(
     seed: u64,
     ref_pot: i32,
     ref_stack: i32,
+    persistent_kernel: bool,
 ) -> Result<(), Box<dyn Error>> {
     use burn::backend::{Autodiff, NdArray};
     use poker_solver_gpu::training::pipeline::{train_river_cfvnet, RiverTrainingConfig};
@@ -834,6 +840,7 @@ fn run_gpu_train_river(
         seed,
         ref_pot,
         ref_stack,
+        use_persistent_kernel: persistent_kernel,
     };
 
     let device = Default::default();

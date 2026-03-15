@@ -644,6 +644,219 @@ impl<'a> GpuSolver<'a> {
         })
     }
 
+    /// Run the DCFR+ solver using the persistent mega-kernel (single launch).
+    ///
+    /// Eliminates all kernel launch overhead by running the entire solve loop
+    /// in a single CUDA kernel using grid-wide atomic barriers.
+    pub fn solve_persistent(
+        &mut self,
+        tree: &FlatTree,
+        max_iterations: u32,
+        _target_exploitability: Option<f32>,
+    ) -> Result<SolveResult, GpuError> {
+        use crate::gpu::GpuSolverContext;
+
+        // Build per-node arrays indexed by global node_id
+        let num_nodes = self.num_nodes as usize;
+
+        let mut parent_infosets_full = vec![0u32; num_nodes];
+        let mut parent_players_full = vec![0u32; num_nodes];
+        for node_id in 0..num_nodes {
+            let parent = tree.parent_nodes[node_id];
+            if parent != u32::MAX {
+                parent_infosets_full[node_id] = tree.infoset_ids[parent as usize];
+                parent_players_full[node_id] = tree.player(parent as usize) as u32;
+            }
+        }
+
+        // Build node_types: 0=OOP, 1=IP, 2=terminal
+        let mut node_types_arr = vec![0u32; num_nodes];
+        for i in 0..num_nodes {
+            if tree.infoset_ids[i] == u32::MAX {
+                node_types_arr[i] = 2; // terminal
+            } else {
+                node_types_arr[i] = tree.player(i) as u32;
+            }
+        }
+
+        // Upload persistent kernel data
+        let gpu_level_offsets = self.gpu.upload(&tree.level_starts)?;
+        let gpu_parent_nodes_full = self.gpu.upload(&tree.parent_nodes)?;
+        let gpu_parent_actions_full = self.gpu.upload(&tree.parent_actions)?;
+        let gpu_parent_infosets_full = self.gpu.upload(&parent_infosets_full)?;
+        let gpu_parent_players_full = self.gpu.upload(&parent_players_full)?;
+        let gpu_node_types = self.gpu.upload(&node_types_arr)?;
+
+        // Showdown sorted indices and rank arrays for single-spot
+        // For single spot, we need to build the sorted/rank arrays
+        let hands_per_spot = self.num_hands as usize;
+        let num_spots = 1usize;
+
+        let hs_oop: Vec<u32> = self.gpu.download(&self.gpu_hand_strengths_oop)?;
+        let hs_ip: Vec<u32> = self.gpu.download(&self.gpu_hand_strengths_ip)?;
+
+        let sorted_ip = crate::batch::BatchGpuSolver::sort_hands_by_strength(
+            &hs_ip, num_spots, hands_per_spot,
+        );
+        let sorted_oop = crate::batch::BatchGpuSolver::sort_hands_by_strength(
+            &hs_oop, num_spots, hands_per_spot,
+        );
+        let rank_win_oop = crate::batch::BatchGpuSolver::compute_cross_rank(
+            &hs_oop, &sorted_ip, &hs_ip, num_spots, hands_per_spot,
+        );
+        let rank_next_oop = crate::batch::BatchGpuSolver::compute_cross_rank_next(
+            &hs_oop, &sorted_ip, &hs_ip, num_spots, hands_per_spot,
+        );
+        let rank_win_ip = crate::batch::BatchGpuSolver::compute_cross_rank(
+            &hs_ip, &sorted_oop, &hs_oop, num_spots, hands_per_spot,
+        );
+        let rank_next_ip = crate::batch::BatchGpuSolver::compute_cross_rank_next(
+            &hs_ip, &sorted_oop, &hs_oop, num_spots, hands_per_spot,
+        );
+
+        let gpu_sorted_ip = self.gpu.upload(&sorted_ip)?;
+        let gpu_sorted_oop = self.gpu.upload(&sorted_oop)?;
+        let gpu_rank_win_oop = self.gpu.upload(&rank_win_oop)?;
+        let gpu_rank_next_oop = self.gpu.upload(&rank_next_oop)?;
+        let gpu_rank_win_ip = self.gpu.upload(&rank_win_ip)?;
+        let gpu_rank_next_ip = self.gpu.upload(&rank_next_ip)?;
+
+        // Showdown working buffers
+        let sd_buf_size = (self.num_showdown_terminals as usize * self.num_hands as usize).max(1);
+        let sd_total_size = (self.num_showdown_terminals as usize).max(1);
+        let mut gpu_sd_sorted_reach = self.gpu.alloc_zeros::<f32>(sd_buf_size)?;
+        let mut gpu_sd_prefix_excl = self.gpu.alloc_zeros::<f32>(sd_buf_size)?;
+        let mut gpu_sd_totals = self.gpu.alloc_zeros::<f32>(sd_total_size)?;
+
+        // Build per-hand showdown payoffs (single spot: broadcast scalar)
+        let num_sd = self.num_showdown_terminals as usize;
+        let nh = self.num_hands as usize;
+
+        let sd_win_host: Vec<f32> = self.gpu.download(&self.showdown_amount_win)?;
+        let sd_lose_host: Vec<f32> = self.gpu.download(&self.showdown_amount_lose)?;
+
+        // For single spot, amount_win/lose are scalar per terminal.
+        // Persistent kernel expects [num_sd_terminals * num_hands] layout.
+        let mut sd_win_per_hand = vec![0.0f32; num_sd * nh];
+        let mut sd_lose_per_hand = vec![0.0f32; num_sd * nh];
+        for t in 0..num_sd {
+            for h in 0..nh {
+                sd_win_per_hand[t * nh + h] = sd_win_host[t];
+                sd_lose_per_hand[t * nh + h] = sd_lose_host[t];
+            }
+        }
+        let gpu_sd_amount_win = self.gpu.upload(&sd_win_per_hand)?;
+        let gpu_sd_amount_lose = self.gpu.upload(&sd_lose_per_hand)?;
+
+        // Build per-hand fold payoffs (single spot: broadcast scalar)
+        let num_fold = self.num_fold_terminals as usize;
+        let fold_win_host: Vec<f32> = self.gpu.download(&self.fold_amount_win)?;
+        let fold_lose_host: Vec<f32> = self.gpu.download(&self.fold_amount_lose)?;
+
+        let mut fold_win_per_hand = vec![0.0f32; num_fold * nh];
+        let mut fold_lose_per_hand = vec![0.0f32; num_fold * nh];
+        for t in 0..num_fold {
+            for h in 0..nh {
+                fold_win_per_hand[t * nh + h] = fold_win_host[t];
+                fold_lose_per_hand[t * nh + h] = fold_lose_host[t];
+            }
+        }
+        let gpu_fold_amount_win = self.gpu.upload(&fold_win_per_hand)?;
+        let gpu_fold_amount_lose = self.gpu.upload(&fold_lose_per_hand)?;
+
+        // Barrier state
+        let mut gpu_barrier_counter = self.gpu.alloc_zeros::<i32>(1)?;
+        let mut gpu_barrier_sense = self.gpu.alloc_zeros::<i32>(1)?;
+
+        // Build context
+        let ctx = GpuSolverContext {
+            regrets: self.gpu.get_device_ptr_mut(&mut self.regrets),
+            strategy_sum: self.gpu.get_device_ptr_mut(&mut self.strategy_sum),
+            strategy: self.gpu.get_device_ptr_mut(&mut self.current_strategy),
+            reach_oop: self.gpu.get_device_ptr_mut(&mut self.reach_oop),
+            reach_ip: self.gpu.get_device_ptr_mut(&mut self.reach_ip),
+            cfvalues: self.gpu.get_device_ptr_mut(&mut self.cfvalues),
+
+            child_offsets: self.gpu.get_device_ptr(&self.gpu_child_offsets),
+            children: self.gpu.get_device_ptr(&self.gpu_children),
+            infoset_ids: self.gpu.get_device_ptr(&self.gpu_infoset_ids),
+            num_actions_arr: self.gpu.get_device_ptr(&self.gpu_num_actions),
+            node_types: self.gpu.get_device_ptr(&gpu_node_types),
+
+            level_offsets: self.gpu.get_device_ptr(&gpu_level_offsets),
+            parent_nodes: self.gpu.get_device_ptr(&gpu_parent_nodes_full),
+            parent_actions: self.gpu.get_device_ptr(&gpu_parent_actions_full),
+            parent_infosets: self.gpu.get_device_ptr(&gpu_parent_infosets_full),
+            parent_players: self.gpu.get_device_ptr(&gpu_parent_players_full),
+
+            fold_terminal_nodes: self.gpu.get_device_ptr(&self.fold_terminal_nodes),
+            fold_amount_win: self.gpu.get_device_ptr(&gpu_fold_amount_win),
+            fold_amount_lose: self.gpu.get_device_ptr(&gpu_fold_amount_lose),
+            fold_player: self.gpu.get_device_ptr(&self.fold_player),
+
+            hand_cards_oop: self.gpu.get_device_ptr(&self.gpu_hand_cards_oop),
+            hand_cards_ip: self.gpu.get_device_ptr(&self.gpu_hand_cards_ip),
+            same_hand_index_oop: self.gpu.get_device_ptr(&self.gpu_same_hand_index_oop),
+            same_hand_index_ip: self.gpu.get_device_ptr(&self.gpu_same_hand_index_ip),
+            fold_total_opp_reach: self.gpu.get_device_ptr_mut(&mut self.gpu_fold_total_opp_reach),
+            fold_per_card_reach: self.gpu.get_device_ptr_mut(&mut self.gpu_fold_per_card_reach),
+
+            showdown_terminal_nodes: self.gpu.get_device_ptr(&self.showdown_terminal_nodes),
+            showdown_amount_win: self.gpu.get_device_ptr(&gpu_sd_amount_win),
+            showdown_amount_lose: self.gpu.get_device_ptr(&gpu_sd_amount_lose),
+
+            sorted_opp_oop: self.gpu.get_device_ptr(&gpu_sorted_ip),
+            sorted_opp_ip: self.gpu.get_device_ptr(&gpu_sorted_oop),
+            rank_win_oop: self.gpu.get_device_ptr(&gpu_rank_win_oop),
+            rank_next_oop: self.gpu.get_device_ptr(&gpu_rank_next_oop),
+            rank_win_ip: self.gpu.get_device_ptr(&gpu_rank_win_ip),
+            rank_next_ip: self.gpu.get_device_ptr(&gpu_rank_next_ip),
+            sd_sorted_reach: self.gpu.get_device_ptr_mut(&mut gpu_sd_sorted_reach),
+            sd_prefix_excl: self.gpu.get_device_ptr_mut(&mut gpu_sd_prefix_excl),
+            sd_totals: self.gpu.get_device_ptr_mut(&mut gpu_sd_totals),
+
+            decision_nodes_oop: self.gpu.get_device_ptr(&self.decision_nodes_oop),
+            decision_nodes_ip: self.gpu.get_device_ptr(&self.decision_nodes_ip),
+
+            initial_reach_oop: self.gpu.get_device_ptr(&self.gpu_initial_reach_oop),
+            initial_reach_ip: self.gpu.get_device_ptr(&self.gpu_initial_reach_ip),
+
+            num_hands: self.num_hands,
+            max_actions: self.max_actions,
+            num_infosets: self.num_infosets,
+            num_nodes: self.num_nodes,
+            num_levels: self.num_levels as u32,
+            hands_per_spot: self.num_hands, // single spot: hps = num_hands
+            num_spots: 1,
+            num_fold_terminals: self.num_fold_terminals,
+            num_showdown_terminals: self.num_showdown_terminals,
+            num_oop_decisions: self.num_oop_decisions,
+            num_ip_decisions: self.num_ip_decisions,
+            max_iterations,
+
+            barrier_counter: self.gpu.get_device_ptr_mut(&mut gpu_barrier_counter),
+            barrier_sense: self.gpu.get_device_ptr_mut(&mut gpu_barrier_sense),
+        };
+
+        let gpu_ctx = self.gpu.upload(&[ctx])?;
+
+        let block_size = 256u32;
+        let num_blocks = 256u32;
+
+        self.gpu.launch_dcfr_persistent(&gpu_ctx, num_blocks, block_size)?;
+
+        // Synchronize
+        self.gpu.stream.synchronize().map_err(GpuError::Driver)?;
+
+        // Download strategy
+        let strategy = self.gpu.download(&self.current_strategy)?;
+
+        Ok(SolveResult {
+            strategy,
+            iterations: max_iterations,
+        })
+    }
+
     /// Run a single DCFR+ iteration and return all intermediate state
     /// for debugging. Used to compare GPU results against CPU step-by-step.
     pub fn debug_iteration(&mut self) -> Result<DebugIteration, GpuError> {
@@ -961,5 +1174,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_persistent_solver_runs() {
+        let mut game = make_river_game();
+        let flat_tree = FlatTree::from_postflop_game(&mut game);
+        let gpu = GpuContext::new(0).unwrap();
+
+        let result = GpuSolver::new(&gpu, &flat_tree)
+            .unwrap()
+            .solve_persistent(&flat_tree, 100, None)
+            .unwrap();
+
+        assert_eq!(result.iterations, 100);
+        assert!(!result.strategy.is_empty());
+        assert_eq!(
+            result.strategy.len(),
+            flat_tree.num_infosets * flat_tree.max_actions() * flat_tree.num_hands
+        );
+    }
+
+    #[test]
+    fn test_persistent_solver_strategy_valid() {
+        let mut game = make_river_game();
+        let flat_tree = FlatTree::from_postflop_game(&mut game);
+        let gpu = GpuContext::new(0).unwrap();
+
+        let result = GpuSolver::new(&gpu, &flat_tree)
+            .unwrap()
+            .solve_persistent(&flat_tree, 200, None)
+            .unwrap();
+
+        let num_hands = flat_tree.num_hands;
+        let max_actions = flat_tree.max_actions();
+
+        // For each infoset, verify strategy sums to ~1.0 for each hand
+        for iset in 0..flat_tree.num_infosets {
+            let n_actions = flat_tree.infoset_num_actions[iset] as usize;
+            for h in 0..num_hands {
+                let mut total = 0.0f32;
+                for a in 0..n_actions {
+                    let idx = (iset * max_actions + a) * num_hands + h;
+                    let prob = result.strategy[idx];
+                    assert!(
+                        prob >= -1e-5,
+                        "negative probability {prob} at iset={iset} action={a} hand={h}"
+                    );
+                    total += prob;
+                }
+                assert!(
+                    (total - 1.0).abs() < 1e-4,
+                    "strategy doesn't sum to 1.0 for iset={iset} hand={h}: sum={total}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_persistent_solver_convergence() {
+        // Test that the persistent solver produces reasonable strategies
+        // at different iteration counts (convergence behavior).
+        let mut game = make_river_game();
+        let flat_tree = FlatTree::from_postflop_game(&mut game);
+        let gpu = GpuContext::new(0).unwrap();
+
+        // Run at low iterations
+        let result_low = GpuSolver::new(&gpu, &flat_tree)
+            .unwrap()
+            .solve_persistent(&flat_tree, 50, None)
+            .unwrap();
+
+        // Run at higher iterations
+        let result_high = GpuSolver::new(&gpu, &flat_tree)
+            .unwrap()
+            .solve_persistent(&flat_tree, 500, None)
+            .unwrap();
+
+        // Strategies should be valid at both
+        let num_hands = flat_tree.num_hands;
+        let max_actions = flat_tree.max_actions();
+
+        for result in &[&result_low, &result_high] {
+            for iset in 0..flat_tree.num_infosets {
+                let n_actions = flat_tree.infoset_num_actions[iset] as usize;
+                for h in 0..num_hands {
+                    let mut total = 0.0f32;
+                    for a in 0..n_actions {
+                        let idx = (iset * max_actions + a) * num_hands + h;
+                        total += result.strategy[idx];
+                    }
+                    assert!(
+                        (total - 1.0).abs() < 1e-4,
+                        "strategy doesn't sum to 1.0 for iset={iset} hand={h}: sum={total}"
+                    );
+                }
+            }
+        }
+
+        // Higher iteration strategies should be at least somewhat different
+        // from lower iteration (solver is actually running and updating)
+        let max_diff = result_low.strategy.iter()
+            .zip(result_high.strategy.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        eprintln!("50 vs 500 iteration strategy max diff = {max_diff}");
+        // The strategies should have evolved (max_diff > 0 proves the solver iterates)
+        assert!(
+            max_diff > 0.001,
+            "Strategies at 50 and 500 iterations are identical (solver may not be iterating)"
+        );
     }
 }

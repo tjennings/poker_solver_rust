@@ -74,6 +74,9 @@ pub struct RiverTrainingConfig {
     pub ref_pot: i32,
     /// Reference effective stack for shared tree topology.
     pub ref_stack: i32,
+    /// Use persistent mega-kernel (single launch) instead of multi-kernel solve.
+    /// Eliminates kernel launch overhead but requires cooperative launch support.
+    pub use_persistent_kernel: bool,
 }
 
 #[cfg(feature = "training")]
@@ -99,6 +102,7 @@ impl Default for RiverTrainingConfig {
             seed: 42,
             ref_pot: 100,
             ref_stack: 100,
+            use_persistent_kernel: false,
         }
     }
 }
@@ -256,10 +260,17 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
         let t2 = Instant::now();
 
         // === SOLVE PHASE (GPU) ===
-        let solve_result = batch_solver.solve_with_cfvs(
-            config.solve_iterations,
-            None,
-        )?;
+        let solve_result = if config.use_persistent_kernel {
+            batch_solver.solve_persistent_with_cfvs(
+                config.solve_iterations,
+                None,
+            )?
+        } else {
+            batch_solver.solve_with_cfvs(
+                config.solve_iterations,
+                None,
+            )?
+        };
         let t3 = Instant::now();
 
         // === INSERT PHASE (GPU) ===
