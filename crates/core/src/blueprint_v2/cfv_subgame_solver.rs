@@ -139,6 +139,9 @@ pub struct CfvSubgameSolver {
     starting_stack: f64,
     /// Precomputed: for each combo, the total opponent reach of non-blocked combos.
     opp_reach_totals: Vec<f64>,
+    /// Precomputed showdown values per combo (normalized equity: -1 to +1).
+    /// Multiply by half_pot at showdown nodes. Fixed across iterations.
+    showdown_equity: Vec<f64>,
 }
 
 impl CfvSubgameSolver {
@@ -188,6 +191,25 @@ impl CfvSubgameSolver {
         let num_boundaries = boundaries.len();
         let leaf_cfvs = vec![vec![0.0; n]; num_boundaries];
 
+        // Precompute showdown equity for all combos (O(n²) but done once).
+        let showdown_equity: Vec<f64> = (0..n)
+            .map(|i| {
+                let opp_total = opp_reach_totals[i];
+                if opp_total <= 0.0 {
+                    return 0.0;
+                }
+                let mut eq_sum = 0.0;
+                for (j, eq) in equity_matrix[i].iter().enumerate() {
+                    if cards_overlap(hands.combos[i], hands.combos[j]) {
+                        continue;
+                    }
+                    eq_sum += eq;
+                }
+                let avg_eq = eq_sum / opp_total;
+                2.0 * avg_eq - 1.0
+            })
+            .collect();
+
         Self {
             tree,
             hands,
@@ -204,6 +226,7 @@ impl CfvSubgameSolver {
             iteration: 0,
             starting_stack,
             opp_reach_totals,
+            showdown_equity,
         }
     }
 
@@ -453,10 +476,7 @@ impl CfvSubgameSolver {
                     }
                     TerminalKind::Showdown => {
                         for i in 0..n {
-                            cfv_buf[out_start + i] = showdown_value_single(
-                                i, &self.hands, &self.equity_matrix,
-                                &self.opp_reach_totals, half_pot,
-                            );
+                            cfv_buf[out_start + i] = self.showdown_equity[i] * half_pot;
                         }
                     }
                     TerminalKind::DepthBoundary => {
