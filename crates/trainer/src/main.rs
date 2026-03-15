@@ -205,6 +205,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             &trainer.storage,
                             node_idx,
                             &scenario_boards[i],
+                            None,
                         );
                         blueprint_tui::ResolvedScenario {
                             name: sc.name.clone(),
@@ -238,10 +239,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let metrics_for_refresh = Arc::clone(&metrics);
                 let boards_for_refresh = scenario_boards;
                 trainer.on_strategy_refresh =
-                    Some(Box::new(move |scenario_idx, node_idx, storage, tree| {
+                    Some(Box::new(move |scenario_idx, node_idx, storage, tree, hand_evs| {
                         let board = &boards_for_refresh[scenario_idx];
                         let grid = blueprint_tui_scenarios::extract_strategy_grid(
-                            tree, storage, node_idx, board,
+                            tree, storage, node_idx, board, Some(hand_evs),
                         );
                         metrics_for_refresh.update_scenario_grid(scenario_idx, grid);
                     }));
@@ -283,7 +284,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let metrics_for_random = Arc::clone(&metrics);
                     let pool = tui_config.random_scenario.pool.clone();
                     trainer.on_random_scenario =
-                        Some(Box::new(move |storage, tree| {
+                        Some(Box::new(move |storage, tree, hand_evs| {
                             use rand::seq::IndexedRandom;
                             let mut rng = rand::rng();
 
@@ -324,7 +325,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             };
 
                             let grid = blueprint_tui_scenarios::extract_strategy_grid(
-                                tree, storage, node_idx, &board,
+                                tree, storage, node_idx, &board, Some(hand_evs),
                             );
 
                             let name = blueprint_tui_scenarios::random_scenario_name(

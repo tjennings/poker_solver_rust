@@ -13,6 +13,8 @@ use ratatui::widgets::Widget;
 pub struct CellStrategy {
     /// `(action_name, frequency)` pairs.
     pub actions: Vec<(String, f32)>,
+    /// Mean chip EV for this hand group (big blinds).
+    pub ev: Option<f32>,
 }
 
 impl CellStrategy {
@@ -179,11 +181,17 @@ impl Widget for &HandGridWidget<'_> {
                     buf.set_string(x + content_w, y, " ", border_style);
                 }
 
-                // Row 2: hand label (black bg) + remainder = color bar
+                // Row 2: hand label + EV (black bg) + remainder = color bar
                 if y2 < area.y + area.height {
-                    let hand_label =
+                    let hand_name =
                         CanonicalHand::from_matrix_position(r as usize, c as usize)
                             .map_or_else(|| "   ".to_string(), |h| format!("{h}"));
+                    let hand_label = if let Some(ev) = cell.ev {
+                        let sign = if ev >= 0.0 { "+" } else { "" };
+                        format!("{hand_name}{sign}{ev:.1}")
+                    } else {
+                        hand_name
+                    };
                     let label_len = hand_label.len().min(content_w as usize);
                     let label_style =
                         Style::default().bg(Color::Rgb(0, 0, 0)).fg(Color::White);
@@ -470,6 +478,7 @@ mod tests {
                 ("fold".to_string(), 0.10),
                 ("call".to_string(), 0.10),
             ],
+            ev: Some(5.1),
         };
 
         // 72o: row 6 (7), col 12 (2) — below diagonal = offsuit
@@ -479,6 +488,7 @@ mod tests {
                 ("call".to_string(), 0.05),
                 ("raise 1.0".to_string(), 0.05),
             ],
+            ev: Some(-2.3),
         };
 
         state
@@ -504,6 +514,7 @@ mod tests {
                 ("call".to_string(), 0.7),
                 ("raise 1.0".to_string(), 0.1),
             ],
+            ev: None,
         };
         let (name, freq) = cell.dominant_action();
         assert_eq!(name, "call");
@@ -517,12 +528,14 @@ mod tests {
                 ("fold".to_string(), 0.50),
                 ("call".to_string(), 0.50),
             ],
+            ev: None,
         };
         let previous = CellStrategy {
             actions: vec![
                 ("fold".to_string(), 0.51),
                 ("call".to_string(), 0.49),
             ],
+            ev: None,
         };
         assert!(current.is_converged(&previous, 0.05));
     }
@@ -534,12 +547,14 @@ mod tests {
                 ("fold".to_string(), 0.70),
                 ("call".to_string(), 0.30),
             ],
+            ev: None,
         };
         let previous = CellStrategy {
             actions: vec![
                 ("fold".to_string(), 0.40),
                 ("call".to_string(), 0.60),
             ],
+            ev: None,
         };
         assert!(!current.is_converged(&previous, 0.05));
     }

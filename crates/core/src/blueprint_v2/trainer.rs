@@ -107,10 +107,11 @@ fn load_bucket_files(dir: &Path) -> [Option<BucketFile>; 4] {
 }
 
 /// Callback type for pushing per-scenario strategy data to the TUI.
-type StrategyRefreshCallback = Box<dyn Fn(usize, u32, &BlueprintStorage, &GameTree) + Send>;
+type StrategyRefreshCallback =
+    Box<dyn Fn(usize, u32, &BlueprintStorage, &GameTree, &[f64; 169]) + Send>;
 
 /// Callback type for pushing a random scenario to the TUI.
-type RandomScenarioCallback = Box<dyn Fn(&BlueprintStorage, &GameTree) + Send>;
+type RandomScenarioCallback = Box<dyn Fn(&BlueprintStorage, &GameTree, &[f64; 169]) + Send>;
 
 /// Outer training driver for Blueprint V2.
 ///
@@ -599,8 +600,9 @@ impl BlueprintTrainer {
         // Strategy refresh for TUI.
         if refresh_due {
             if let Some(ref callback) = self.on_strategy_refresh {
+                let hand_evs = self.hand_ev_array();
                 for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
-                    callback(i, node_idx, &self.storage, &self.tree);
+                    callback(i, node_idx, &self.storage, &self.tree, &hand_evs);
                 }
             }
             self.last_strategy_refresh_secs = elapsed_secs;
@@ -610,7 +612,8 @@ impl BlueprintTrainer {
         if let Some(ref callback) = self.on_random_scenario
             && elapsed_min >= self.last_random_scenario_min + self.random_scenario_hold_minutes
         {
-            callback(&self.storage, &self.tree);
+            let hand_evs = self.hand_ev_array();
+            callback(&self.storage, &self.tree, &hand_evs);
             self.last_random_scenario_min = elapsed_min;
         }
 
@@ -824,6 +827,16 @@ impl BlueprintTrainer {
     /// # Panics
     /// Panics if `CanonicalHand::from_index` returns `None` for indices 0..169
     /// (this is an internal invariant that always holds).
+    /// Mean chip EV per canonical hand as a fixed-size array (indexed by hand index 0..169).
+    #[must_use]
+    pub fn hand_ev_array(&self) -> [f64; 169] {
+        std::array::from_fn(|i| {
+            let sum = self.ev_sum[i].load(Ordering::Relaxed) as f64 / 1000.0;
+            let count = self.ev_count[i].load(Ordering::Relaxed);
+            if count > 0 { sum / count as f64 } else { 0.0 }
+        })
+    }
+
     #[must_use]
     pub fn hand_ev_averages(&self) -> Vec<(String, f64, u64)> {
         (0..169)

@@ -64,6 +64,7 @@ pub fn extract_strategy_grid(
     storage: &BlueprintStorage,
     node_idx: u32,
     board: &[Card],
+    hand_evs: Option<&[f64; 169]>,
 ) -> [[CellStrategy; 13]; 13] {
     let mut grid: [[CellStrategy; 13]; 13] =
         std::array::from_fn(|_| std::array::from_fn(|_| CellStrategy::default()));
@@ -118,8 +119,16 @@ pub fn extract_strategy_grid(
                 .map(|(name, &p)| (name.clone(), p as f32))
                 .collect();
 
+            let ev = hand_evs.map(|evs| {
+                let hand = poker_solver_core::hands::CanonicalHand::from_matrix_position(
+                    row as usize, col as usize,
+                ).expect("valid 13x13 matrix position");
+                evs[hand.index()] as f32
+            });
+
             grid[row as usize][col as usize] = CellStrategy {
                 actions: cell_actions,
+                ev,
             };
         }
     }
@@ -352,7 +361,7 @@ mod tests {
     fn extract_grid_returns_169_cells() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
-        let grid = extract_strategy_grid(&tree, &storage, tree.root, &[]);
+        let grid = extract_strategy_grid(&tree, &storage, tree.root, &[], None);
         for row in &grid {
             for cell in row {
                 assert!(
