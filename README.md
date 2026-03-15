@@ -1,6 +1,6 @@
-# Poker Solver
+# WarpGTO
 
-A Rust-based poker solver using Counterfactual Regret Minimization (CFR) for Heads-Up No-Limit Texas Hold'em, with a Tauri desktop UI for strategy exploration.
+A massively parallel, GPU-accelerated poker solver using Counterfactual Regret Minimization (CFR) for Heads-Up No-Limit Texas Hold'em, with a Tauri desktop UI for strategy exploration.
 
 ## Features
 

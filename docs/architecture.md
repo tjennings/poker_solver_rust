@@ -1,4 +1,4 @@
-# Solver Architecture
+# WarpGTO — Solver Architecture
 
 ## Overview
 
