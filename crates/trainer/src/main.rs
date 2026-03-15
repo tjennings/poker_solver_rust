@@ -286,6 +286,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     trainer.on_random_scenario =
                         Some(Box::new(move |storage, tree, hand_evs| {
                             use rand::seq::IndexedRandom;
+                            use poker_solver_core::blueprint_v2::game_tree::GameNode;
                             let mut rng = rand::rng();
 
                             let Some(street_label) = pool.choose(&mut rng) else {
@@ -312,6 +313,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 return;
                             };
 
+                            // Select the correct position's EVs based on the node's player.
+                            let player = match &tree.nodes[node_idx as usize] {
+                                GameNode::Decision { player, .. } => *player as usize,
+                                _ => 0,
+                            };
+                            let node_hand_evs = &hand_evs[player];
+
                             let board =
                                 blueprint_tui_scenarios::random_board(street, &mut rng);
                             let board_display = if board.is_empty() {
@@ -325,7 +333,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             };
 
                             let grid = blueprint_tui_scenarios::extract_strategy_grid(
-                                tree, storage, node_idx, &board, Some(hand_evs),
+                                tree, storage, node_idx, &board, Some(node_hand_evs),
                             );
 
                             let name = blueprint_tui_scenarios::random_scenario_name(

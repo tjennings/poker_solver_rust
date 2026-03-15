@@ -111,7 +111,10 @@ type StrategyRefreshCallback =
     Box<dyn Fn(usize, u32, &BlueprintStorage, &GameTree, &[f64; 169]) + Send>;
 
 /// Callback type for pushing a random scenario to the TUI.
-type RandomScenarioCallback = Box<dyn Fn(&BlueprintStorage, &GameTree, &[f64; 169]) + Send>;
+/// Receives per-position EV arrays `[position][hand_index]` so the callback
+/// can select the correct position based on the chosen node's player.
+type RandomScenarioCallback =
+    Box<dyn Fn(&BlueprintStorage, &GameTree, &[[f64; 169]; 2]) + Send>;
 
 /// Outer training driver for Blueprint V2.
 ///
@@ -135,11 +138,12 @@ pub struct BlueprintTrainer {
     deck: [Card; 52],
 
     // --- Per-hand chip EV tracking ---
-    /// Accumulated chip EV per canonical preflop hand (169 entries).
-    /// Stored as sum * 1000 for integer atomics.
-    ev_sum: [AtomicI64; 169],
-    /// Sample count per canonical preflop hand.
-    ev_count: [AtomicU64; 169],
+    /// Accumulated chip EV per canonical preflop hand, per position.
+    /// `ev_sum[player][hand_index]`, stored as sum * 1000 for integer atomics.
+    ev_sum: [[AtomicI64; 169]; 2],
+    /// Sample count per canonical preflop hand, per position.
+    /// `ev_count[player][hand_index]`.
+    ev_count: [[AtomicU64; 169]; 2],
 
     // --- TUI shared state ---
     /// Iteration counter visible to the TUI thread.
@@ -243,8 +247,14 @@ impl BlueprintTrainer {
             last_snapshot_time: 0,
             snapshot_count: 0,
             deck,
-            ev_sum: std::array::from_fn(|_| AtomicI64::new(0)),
-            ev_count: std::array::from_fn(|_| AtomicU64::new(0)),
+            ev_sum: [
+                std::array::from_fn(|_| AtomicI64::new(0)),
+                std::array::from_fn(|_| AtomicI64::new(0)),
+            ],
+            ev_count: [
+                std::array::from_fn(|_| AtomicU64::new(0)),
+                std::array::from_fn(|_| AtomicU64::new(0)),
+            ],
             skip_bucket_validation: false,
             shared_iterations: Arc::new(AtomicU64::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
@@ -465,10 +475,10 @@ impl BlueprintTrainer {
                     deal.deal.hole_cards[1][0],
                     deal.deal.hole_cards[1][1],
                 ).index();
-                ev_sum[idx0].fetch_add((ev0 * 1000.0) as i64, Ordering::Relaxed);
-                ev_count[idx0].fetch_add(1, Ordering::Relaxed);
-                ev_sum[idx1].fetch_add((ev1 * 1000.0) as i64, Ordering::Relaxed);
-                ev_count[idx1].fetch_add(1, Ordering::Relaxed);
+                ev_sum[0][idx0].fetch_add((ev0 * 1000.0) as i64, Ordering::Relaxed);
+                ev_count[0][idx0].fetch_add(1, Ordering::Relaxed);
+                ev_sum[1][idx1].fetch_add((ev1 * 1000.0) as i64, Ordering::Relaxed);
+                ev_count[1][idx1].fetch_add(1, Ordering::Relaxed);
 
                 stats
             }).reduce(PruneStats::default, |mut a, b| { a.merge(b); a });
@@ -600,8 +610,12 @@ impl BlueprintTrainer {
         // Strategy refresh for TUI.
         if refresh_due {
             if let Some(ref callback) = self.on_strategy_refresh {
-                let hand_evs = self.hand_ev_array();
                 for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
+                    let player = match &self.tree.nodes[node_idx as usize] {
+                        super::game_tree::GameNode::Decision { player, .. } => *player as usize,
+                        _ => 0,
+                    };
+                    let hand_evs = self.hand_ev_array(player);
                     callback(i, node_idx, &self.storage, &self.tree, &hand_evs);
                 }
             }
@@ -612,7 +626,7 @@ impl BlueprintTrainer {
         if let Some(ref callback) = self.on_random_scenario
             && elapsed_min >= self.last_random_scenario_min + self.random_scenario_hold_minutes
         {
-            let hand_evs = self.hand_ev_array();
+            let hand_evs = [self.hand_ev_array(0), self.hand_ev_array(1)];
             callback(&self.storage, &self.tree, &hand_evs);
             self.last_random_scenario_min = elapsed_min;
         }
@@ -827,30 +841,53 @@ impl BlueprintTrainer {
     /// # Panics
     /// Panics if `CanonicalHand::from_index` returns `None` for indices 0..169
     /// (this is an internal invariant that always holds).
-    /// Mean chip EV per canonical hand as a fixed-size array (indexed by hand index 0..169).
+    /// Mean chip EV per canonical hand for a given position (0 or 1),
+    /// as a fixed-size array (indexed by hand index 0..169).
     #[must_use]
-    pub fn hand_ev_array(&self) -> [f64; 169] {
+    pub fn hand_ev_array(&self, player: usize) -> [f64; 169] {
         std::array::from_fn(|i| {
-            let sum = self.ev_sum[i].load(Ordering::Relaxed) as f64 / 1000.0;
-            let count = self.ev_count[i].load(Ordering::Relaxed);
+            let sum = self.ev_sum[player][i].load(Ordering::Relaxed) as f64 / 1000.0;
+            let count = self.ev_count[player][i].load(Ordering::Relaxed);
             if count > 0 { sum / count as f64 } else { 0.0 }
         })
     }
 
     #[must_use]
-    pub fn hand_ev_averages(&self) -> Vec<(String, f64, u64)> {
+    pub fn hand_ev_averages(&self, player: usize) -> Vec<(String, f64, u64)> {
         (0..169)
             .map(|i| {
                 // INVARIANT: indices 0..169 are always valid for `from_index`.
                 let hand = CanonicalHand::from_index(i).expect("valid index 0..169");
-                let sum = self.ev_sum[i].load(Ordering::Relaxed) as f64 / 1000.0;
-                let count = self.ev_count[i].load(Ordering::Relaxed);
+                let sum = self.ev_sum[player][i].load(Ordering::Relaxed) as f64 / 1000.0;
+                let count = self.ev_count[player][i].load(Ordering::Relaxed);
                 let avg = if count > 0 {
                     sum / count as f64
                 } else {
                     0.0
                 };
                 (hand.to_string(), avg, count)
+            })
+            .collect()
+    }
+
+    /// Combined (cross-position average) EV per canonical hand for JSON export.
+    /// Averages both positions' EVs for backward compatibility.
+    #[must_use]
+    fn hand_ev_averages_combined(&self) -> Vec<(String, f64, u64)> {
+        (0..169)
+            .map(|i| {
+                let hand = CanonicalHand::from_index(i).expect("valid index 0..169");
+                let sum0 = self.ev_sum[0][i].load(Ordering::Relaxed) as f64 / 1000.0;
+                let count0 = self.ev_count[0][i].load(Ordering::Relaxed);
+                let sum1 = self.ev_sum[1][i].load(Ordering::Relaxed) as f64 / 1000.0;
+                let count1 = self.ev_count[1][i].load(Ordering::Relaxed);
+                let total_count = count0 + count1;
+                let avg = if total_count > 0 {
+                    (sum0 + sum1) / total_count as f64
+                } else {
+                    0.0
+                };
+                (hand.to_string(), avg, total_count)
             })
             .collect()
     }
@@ -899,8 +936,9 @@ impl BlueprintTrainer {
         p0_cbvs.save(&snapshot_dir.join("cbv_p0.bin"))?;
         p1_cbvs.save(&snapshot_dir.join("cbv_p1.bin"))?;
 
-        // Write per-hand chip EV averages with sample counts.
-        let hand_evs = self.hand_ev_averages();
+        // Write per-hand chip EV averages with sample counts (averaged across both positions
+        // for backward compatibility with existing JSON consumers).
+        let hand_evs = self.hand_ev_averages_combined();
         let mut ev_json = String::from("{\n");
         for (i, (name, ev, count)) in hand_evs.iter().enumerate() {
             let _ = write!(
@@ -1311,5 +1349,73 @@ mod tests {
 
         trainer2.train().expect("resumed training");
         assert_eq!(trainer2.iterations, 40, "should reach 40 total");
+    }
+
+    #[test]
+    fn hand_ev_array_per_position_initially_zero() {
+        let config = toy_config();
+        let trainer = BlueprintTrainer::new(config);
+        let evs_p0 = trainer.hand_ev_array(0);
+        let evs_p1 = trainer.hand_ev_array(1);
+        assert!(evs_p0.iter().all(|&v| v == 0.0), "position 0 EVs should start at zero");
+        assert!(evs_p1.iter().all(|&v| v == 0.0), "position 1 EVs should start at zero");
+    }
+
+    #[test]
+    fn hand_ev_array_per_position_independent() {
+        let config = toy_config();
+        let trainer = BlueprintTrainer::new(config);
+
+        // Manually set EV data for position 0, hand index 5.
+        trainer.ev_sum[0][5].store(3000, Ordering::Relaxed); // 3.0 * 1000
+        trainer.ev_count[0][5].store(2, Ordering::Relaxed);
+
+        // Manually set EV data for position 1, hand index 5.
+        trainer.ev_sum[1][5].store(-1000, Ordering::Relaxed); // -1.0 * 1000
+        trainer.ev_count[1][5].store(1, Ordering::Relaxed);
+
+        let evs_p0 = trainer.hand_ev_array(0);
+        let evs_p1 = trainer.hand_ev_array(1);
+
+        assert!((evs_p0[5] - 1.5).abs() < 1e-6, "position 0 hand 5 EV should be 1.5, got {}", evs_p0[5]);
+        assert!((evs_p1[5] - (-1.0)).abs() < 1e-6, "position 1 hand 5 EV should be -1.0, got {}", evs_p1[5]);
+        // Other hands should still be zero.
+        assert!(evs_p0[0] == 0.0);
+        assert!(evs_p1[0] == 0.0);
+    }
+
+    #[test]
+    fn hand_ev_averages_per_position() {
+        let config = toy_config();
+        let trainer = BlueprintTrainer::new(config);
+
+        trainer.ev_sum[0][0].store(5000, Ordering::Relaxed);
+        trainer.ev_count[0][0].store(1, Ordering::Relaxed);
+        trainer.ev_sum[1][0].store(10000, Ordering::Relaxed);
+        trainer.ev_count[1][0].store(2, Ordering::Relaxed);
+
+        let avg_p0 = trainer.hand_ev_averages(0);
+        let avg_p1 = trainer.hand_ev_averages(1);
+
+        assert!((avg_p0[0].1 - 5.0).abs() < 1e-6, "p0 avg should be 5.0");
+        assert_eq!(avg_p0[0].2, 1);
+        assert!((avg_p1[0].1 - 5.0).abs() < 1e-6, "p1 avg should be 5.0");
+        assert_eq!(avg_p1[0].2, 2);
+    }
+
+    #[test]
+    fn train_accumulates_ev_per_position() {
+        let mut config = toy_config();
+        config.training.iterations = Some(200);
+        config.training.batch_size = 50;
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("training should complete");
+
+        let evs_p0 = trainer.hand_ev_array(0);
+        let evs_p1 = trainer.hand_ev_array(1);
+
+        // After training, at least some hands should have non-zero EV for each position.
+        assert!(evs_p0.iter().any(|&v| v != 0.0), "position 0 should have some non-zero EVs");
+        assert!(evs_p1.iter().any(|&v| v != 0.0), "position 1 should have some non-zero EVs");
     }
 }
