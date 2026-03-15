@@ -1,14 +1,14 @@
 ---
 # poker_solver_rust-qpms
 title: 'Phase 4: Flop + Auxiliary Preflop Models'
-status: todo
+status: completed
 type: feature
 priority: normal
 tags:
     - gpu
     - cfvnet
 created_at: 2026-03-15T04:14:40Z
-updated_at: 2026-03-15T04:14:40Z
+updated_at: 2026-03-15T21:50:16Z
 parent: poker_solver_rust-twez
 ---
 
