@@ -60,6 +60,12 @@ pub struct FlatTree {
     /// Hand strength for each IP combo (higher = stronger).
     /// Length = `num_hands_ip`. Combos blocked by the board have strength 0.
     pub hand_strengths_ip: Vec<u32>,
+    /// Initial reach probabilities for OOP (range weights after card removal).
+    /// Length = `num_hands` (padded with zeros if `num_hands_oop < num_hands`).
+    pub initial_reach_oop: Vec<f32>,
+    /// Initial reach probabilities for IP (range weights after card removal).
+    /// Length = `num_hands` (padded with zeros if `num_hands_ip < num_hands`).
+    pub initial_reach_ip: Vec<f32>,
 }
 
 impl FlatTree {
@@ -71,6 +77,15 @@ impl FlatTree {
     /// Number of BFS levels.
     pub fn num_levels(&self) -> usize {
         self.level_starts.len().saturating_sub(1)
+    }
+
+    /// Maximum number of actions across all infosets.
+    pub fn max_actions(&self) -> usize {
+        self.infoset_num_actions
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0) as usize
     }
 
     /// Number of children for a given node.
@@ -327,6 +342,22 @@ impl FlatTree {
             })
             .collect();
 
+        // Extract initial reach weights (range weights after card removal).
+        let weights_oop = game.initial_weights(0);
+        let weights_ip = game.initial_weights(1);
+        let mut initial_reach_oop = vec![0.0f32; num_hands];
+        let mut initial_reach_ip = vec![0.0f32; num_hands];
+        for (i, &w) in weights_oop.iter().enumerate() {
+            if i < num_hands {
+                initial_reach_oop[i] = w;
+            }
+        }
+        for (i, &w) in weights_ip.iter().enumerate() {
+            if i < num_hands {
+                initial_reach_ip[i] = w;
+            }
+        }
+
         // Reset game to root
         game.back_to_root();
 
@@ -350,6 +381,8 @@ impl FlatTree {
             num_hands_ip,
             hand_strengths_oop,
             hand_strengths_ip,
+            initial_reach_oop,
+            initial_reach_ip,
         }
     }
 
@@ -409,6 +442,8 @@ impl FlatTree {
             // Hand 0 is stronger than hand 1 for test purposes.
             hand_strengths_oop: vec![100, 50],
             hand_strengths_ip: vec![100, 50],
+            initial_reach_oop: vec![1.0, 1.0],
+            initial_reach_ip: vec![1.0, 1.0],
         }
     }
 }
