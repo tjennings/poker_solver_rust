@@ -9,5 +9,7 @@ pub mod batch;
 
 pub mod training;
 
+pub mod resolve;
+
 #[cfg(test)]
 mod tests;

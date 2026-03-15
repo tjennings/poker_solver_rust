@@ -1084,6 +1084,210 @@ impl<'a> GpuSolver<'a> {
         self.gpu.launch_set_root_reach(&mut self.reach_ip, &self.gpu_initial_reach_ip, self.num_hands)?;
         Ok(())
     }
+
+    /// Run additional DCFR+ iterations without resetting regrets or strategy_sum.
+    ///
+    /// `additional_iters`: number of new iterations to run.
+    /// `already_done`: number of iterations already completed (used for discount
+    ///   parameter computation so the discount schedule is continuous).
+    ///
+    /// This is the inner loop of `solve()` extracted for progressive resolving.
+    pub fn solve_iterations(
+        &mut self,
+        additional_iters: u32,
+        already_done: u32,
+    ) -> Result<(), GpuError> {
+        for t_offset in 1..=additional_iters {
+            let t = already_done + t_offset; // 1-indexed global iteration
+            let current_iteration = t - 1;   // 0-indexed
+
+            let t_alpha = (current_iteration as i32 - 1).max(0) as f64;
+            let pow_alpha = t_alpha * t_alpha.sqrt();
+            let pos_discount = (pow_alpha / (pow_alpha + 1.0)) as f32;
+            let neg_discount = 0.5f32;
+
+            let nearest_lower_power_of_4 = match current_iteration {
+                0 => 0u32,
+                x => 1u32 << ((x.leading_zeros() ^ 31) & !1),
+            };
+            let t_gamma = (current_iteration - nearest_lower_power_of_4) as f64;
+            let strat_discount = ((t_gamma / (t_gamma + 1.0)).powi(3)) as f32;
+
+            for traverser in 0..2u32 {
+                self.gpu.launch_regret_match(
+                    &self.regrets,
+                    &self.gpu_num_actions,
+                    &mut self.current_strategy,
+                    self.num_infosets,
+                    self.max_actions,
+                    self.num_hands,
+                )?;
+
+                self.init_reach()?;
+
+                for level in 1..self.num_levels {
+                    let ld = &self.level_data[level];
+                    if ld.num_nodes == 0 {
+                        continue;
+                    }
+                    self.gpu.launch_forward_pass(
+                        &mut self.reach_oop,
+                        &mut self.reach_ip,
+                        &self.current_strategy,
+                        &ld.nodes,
+                        &ld.parent_nodes,
+                        &ld.parent_actions,
+                        &ld.parent_infosets,
+                        &ld.parent_players,
+                        ld.num_nodes,
+                        self.num_hands,
+                        self.max_actions,
+                    )?;
+                }
+
+                let cfv_size = (self.num_nodes * self.num_hands) as u32;
+                self.gpu.launch_zero_buffer(&mut self.cfvalues, cfv_size)?;
+
+                if self.num_fold_terminals > 0 {
+                    let opp_reach = if traverser == 0 {
+                        &self.reach_ip
+                    } else {
+                        &self.reach_oop
+                    };
+                    let opp_hand_cards = if traverser == 0 {
+                        &self.gpu_hand_cards_ip
+                    } else {
+                        &self.gpu_hand_cards_oop
+                    };
+                    let trav_hand_cards = if traverser == 0 {
+                        &self.gpu_hand_cards_oop
+                    } else {
+                        &self.gpu_hand_cards_ip
+                    };
+                    let same_hand_index = if traverser == 0 {
+                        &self.gpu_same_hand_index_oop
+                    } else {
+                        &self.gpu_same_hand_index_ip
+                    };
+
+                    self.gpu.launch_precompute_fold_aggregates(
+                        opp_reach,
+                        &self.fold_terminal_nodes,
+                        opp_hand_cards,
+                        &mut self.gpu_fold_total_opp_reach,
+                        &mut self.gpu_fold_per_card_reach,
+                        self.num_fold_terminals,
+                        self.num_hands,
+                    )?;
+
+                    self.gpu.launch_fold_eval_from_aggregates(
+                        &mut self.cfvalues,
+                        opp_reach,
+                        &self.fold_terminal_nodes,
+                        &self.fold_amount_win,
+                        &self.fold_amount_lose,
+                        &self.fold_player,
+                        &self.gpu_fold_total_opp_reach,
+                        &self.gpu_fold_per_card_reach,
+                        trav_hand_cards,
+                        same_hand_index,
+                        traverser,
+                        self.num_fold_terminals,
+                        self.num_hands,
+                    )?;
+                }
+
+                if self.num_showdown_terminals > 0 {
+                    let opp_reach = if traverser == 0 {
+                        &self.reach_ip
+                    } else {
+                        &self.reach_oop
+                    };
+                    let (traverser_strengths, opponent_strengths) = if traverser == 0 {
+                        (&self.gpu_hand_strengths_oop, &self.gpu_hand_strengths_ip)
+                    } else {
+                        (&self.gpu_hand_strengths_ip, &self.gpu_hand_strengths_oop)
+                    };
+                    self.gpu.launch_showdown_eval_fast(
+                        &mut self.cfvalues,
+                        opp_reach,
+                        &self.showdown_terminal_nodes,
+                        &self.showdown_amount_win,
+                        &self.showdown_amount_lose,
+                        traverser_strengths,
+                        opponent_strengths,
+                        self.num_showdown_terminals,
+                        self.num_hands,
+                        self.num_hands,
+                    )?;
+                }
+
+                for level in (0..self.num_levels).rev() {
+                    let bld = &self.backward_level_data[level];
+                    if bld.num_decision_nodes == 0 {
+                        continue;
+                    }
+                    self.gpu.launch_backward_cfv(
+                        &mut self.cfvalues,
+                        &self.current_strategy,
+                        &bld.decision_nodes,
+                        &self.gpu_child_offsets,
+                        &self.gpu_children,
+                        &self.gpu_infoset_ids,
+                        &bld.decision_players,
+                        traverser,
+                        bld.num_decision_nodes,
+                        self.num_hands,
+                        self.max_actions,
+                    )?;
+                }
+
+                let (decision_nodes, num_decision) = if traverser == 0 {
+                    (&self.decision_nodes_oop, self.num_oop_decisions)
+                } else {
+                    (&self.decision_nodes_ip, self.num_ip_decisions)
+                };
+
+                if num_decision > 0 {
+                    self.gpu.launch_update_regrets(
+                        &mut self.regrets,
+                        &mut self.strategy_sum,
+                        &self.current_strategy,
+                        &self.cfvalues,
+                        decision_nodes,
+                        &self.gpu_child_offsets,
+                        &self.gpu_children,
+                        &self.gpu_infoset_ids,
+                        &self.gpu_num_actions,
+                        num_decision,
+                        self.num_hands,
+                        self.max_actions,
+                        pos_discount,
+                        neg_discount,
+                        strat_discount,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract the current averaged strategy from strategy_sum.
+    ///
+    /// Runs the extract_strategy kernel and downloads the result to host.
+    /// Does not modify regrets or strategy_sum.
+    pub fn extract_current_strategy(&mut self) -> Result<Vec<f32>, GpuError> {
+        self.gpu.launch_extract_strategy(
+            &self.strategy_sum,
+            &self.gpu_num_actions,
+            &mut self.current_strategy,
+            self.num_infosets,
+            self.max_actions,
+            self.num_hands,
+        )?;
+        self.gpu.download(&self.current_strategy)
+    }
 }
 
 #[cfg(test)]

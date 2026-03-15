@@ -284,6 +284,68 @@ impl<'a> FlopBatchSolverCuda<'a> {
             cfvs_ip,
         })
     }
+
+    /// Run additional DCFR+ iterations with leaf evaluation, without resetting
+    /// regrets or strategy_sum.
+    ///
+    /// `additional_iters`: number of new iterations to run.
+    /// `already_done`: iterations already completed (for discount schedule).
+    pub fn solve_iterations(
+        &mut self,
+        additional_iters: u32,
+        already_done: u32,
+    ) -> Result<(), String> {
+        let gpu_err = |e: GpuError| format!("GPU error: {e}");
+
+        if self.num_boundaries == 0 {
+            return self
+                .solver
+                .solve_iterations(additional_iters, already_done)
+                .map_err(gpu_err);
+        }
+
+        for t_offset in 1..=additional_iters {
+            let t = already_done + t_offset;
+            let current_iteration = t - 1;
+
+            let t_alpha = (current_iteration as i32 - 1).max(0) as f64;
+            let pow_alpha = t_alpha * t_alpha.sqrt();
+            let pos_discount = (pow_alpha / (pow_alpha + 1.0)) as f32;
+            let neg_discount = 0.5f32;
+
+            let nearest_lower_power_of_4 = match current_iteration {
+                0 => 0u32,
+                x => 1u32 << ((x.leading_zeros() ^ 31) & !1),
+            };
+            let t_gamma = (current_iteration - nearest_lower_power_of_4) as f64;
+            let strat_discount = ((t_gamma / (t_gamma + 1.0)).powi(3)) as f32;
+
+            for traverser in 0..2u32 {
+                self.solver.regret_match().map_err(gpu_err)?;
+                self.solver.init_reach_pub().map_err(gpu_err)?;
+                self.solver.forward_pass().map_err(gpu_err)?;
+                self.solver.zero_cfvalues().map_err(gpu_err)?;
+                self.solver.fold_eval(traverser).map_err(gpu_err)?;
+                self.solver.showdown_eval(traverser).map_err(gpu_err)?;
+                self.leaf_evaluation_cuda(traverser)?;
+                self.solver.backward_cfv(traverser).map_err(gpu_err)?;
+                self.solver
+                    .update_regrets(traverser, pos_discount, neg_discount, strat_discount)
+                    .map_err(gpu_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Extract the current averaged strategy from the inner solver.
+    pub fn extract_strategy(
+        &mut self,
+        _gpu: &GpuContext,
+    ) -> Result<Vec<f32>, String> {
+        self.solver
+            .extract_strategy_to_host()
+            .map_err(|e| format!("extract strategy: {e}"))
+    }
 }
 
 #[cfg(all(test, feature = "training"))]

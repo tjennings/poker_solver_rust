@@ -458,6 +458,24 @@ impl GpuLeafEvaluatorCuda {
         Ok(Self { net })
     }
 
+    /// Wrap an existing `CudaNetInference` as a leaf evaluator.
+    ///
+    /// Used by the resolver to share models between streets without
+    /// reloading from disk.
+    pub fn wrap(net: CudaNetInference) -> Self {
+        Self { net }
+    }
+
+    /// Unwrap, returning the owned `CudaNetInference`.
+    pub fn into_inner(self) -> CudaNetInference {
+        self.net
+    }
+
+    /// Get a mutable reference to the inner `CudaNetInference`.
+    pub fn net_mut(&mut self) -> &mut CudaNetInference {
+        &mut self.net
+    }
+
     /// Run batched inference on GPU-resident encoded inputs.
     ///
     /// Input: `[batch_size * INPUT_SIZE]` on GPU.

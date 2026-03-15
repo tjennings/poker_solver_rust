@@ -2423,6 +2423,118 @@ impl<'a> BatchGpuSolver<'a> {
         Ok(())
     }
 
+    /// Reference to strategy_sum buffer.
+    pub fn strategy_sum(&self) -> &CudaSlice<f32> {
+        &self.strategy_sum
+    }
+
+    /// Reference to current_strategy buffer.
+    pub fn current_strategy(&self) -> &CudaSlice<f32> {
+        &self.current_strategy
+    }
+
+    /// Extract the current averaged strategy from strategy_sum.
+    ///
+    /// Runs the extract_strategy kernel and downloads the result to host.
+    pub fn extract_strategy_to_host(&mut self) -> Result<Vec<f32>, GpuError> {
+        self.gpu.launch_extract_strategy(
+            &self.strategy_sum,
+            &self.gpu_num_actions,
+            &mut self.current_strategy,
+            self.num_infosets,
+            self.max_actions,
+            self.num_hands,
+        )?;
+        self.gpu.download(&self.current_strategy)
+    }
+
+    /// Run additional DCFR+ iterations without resetting regrets or strategy_sum.
+    ///
+    /// `additional_iters`: number of new iterations to run.
+    /// `already_done`: number of iterations already completed (for discount schedule).
+    pub fn solve_iterations(
+        &mut self,
+        additional_iters: u32,
+        already_done: u32,
+    ) -> Result<(), GpuError> {
+        for t_offset in 1..=additional_iters {
+            let t = already_done + t_offset;
+            let current_iteration = t - 1;
+
+            let t_alpha = (current_iteration as i32 - 1).max(0) as f64;
+            let pow_alpha = t_alpha * t_alpha.sqrt();
+            let pos_discount = (pow_alpha / (pow_alpha + 1.0)) as f32;
+            let neg_discount = 0.5f32;
+
+            let nearest_lower_power_of_4 = match current_iteration {
+                0 => 0u32,
+                x => 1u32 << ((x.leading_zeros() ^ 31) & !1),
+            };
+            let t_gamma = (current_iteration - nearest_lower_power_of_4) as f64;
+            let strat_discount = ((t_gamma / (t_gamma + 1.0)).powi(3)) as f32;
+
+            for traverser in 0..2u32 {
+                self.regret_match()?;
+                self.init_reach()?;
+
+                for level in 1..self.num_levels {
+                    let ld = &self.level_data[level];
+                    if ld.num_nodes == 0 {
+                        continue;
+                    }
+                    self.gpu.launch_forward_pass(
+                        &mut self.reach_oop,
+                        &mut self.reach_ip,
+                        &self.current_strategy,
+                        &ld.nodes,
+                        &ld.parent_nodes,
+                        &ld.parent_actions,
+                        &ld.parent_infosets,
+                        &ld.parent_players,
+                        ld.num_nodes,
+                        self.num_hands,
+                        self.max_actions,
+                    )?;
+                }
+
+                let cfv_size = self.num_nodes * self.num_hands;
+                self.gpu.launch_zero_buffer(&mut self.cfvalues, cfv_size)?;
+
+                self.fold_eval(traverser)?;
+                self.showdown_eval(traverser)?;
+
+                for level in (0..self.num_levels).rev() {
+                    let bld = &self.backward_level_data[level];
+                    if bld.num_decision_nodes == 0 {
+                        continue;
+                    }
+                    self.gpu.launch_backward_cfv(
+                        &mut self.cfvalues,
+                        &self.current_strategy,
+                        &bld.decision_nodes,
+                        &self.gpu_child_offsets,
+                        &self.gpu_children,
+                        &self.gpu_infoset_ids,
+                        &bld.decision_players,
+                        traverser,
+                        bld.num_decision_nodes,
+                        self.num_hands,
+                        self.max_actions,
+                    )?;
+                }
+
+                self.update_regrets(
+                    traverser,
+                    pos_discount,
+                    neg_discount,
+                    strat_discount,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Extract per-spot strategies from the full batched strategy array.
     ///
     /// The full strategy is `[num_infosets * max_actions * total_hands]`.
