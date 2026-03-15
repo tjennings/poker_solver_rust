@@ -64,7 +64,7 @@ pub fn cluster_river_with_boards(
     kmeans_iterations: u32,
     seed: u64,
     num_boards: usize,
-    progress: impl Fn(f64) + Sync,
+    progress: impl Fn(&str, f64) + Sync,
 ) -> BucketFile {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
@@ -76,7 +76,7 @@ pub fn cluster_river_with_boards(
         .map(|(i, board)| {
             let eq = compute_board_equities(*board, &combos);
             #[allow(clippy::cast_precision_loss)]
-            progress((i + 1) as f64 / num_boards as f64);
+            progress("sampling", (i + 1) as f64 / num_boards as f64);
             eq
         })
         .collect();
@@ -127,7 +127,7 @@ pub fn cluster_turn_with_boards(
     kmeans_iterations: u32,
     seed: u64,
     num_boards: usize,
-    progress: impl Fn(f64) + Sync,
+    progress: impl Fn(&str, f64) + Sync,
 ) -> BucketFile {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
@@ -148,7 +148,7 @@ pub fn cluster_turn_with_boards(
                 })
                 .collect();
             #[allow(clippy::cast_precision_loss)]
-            progress((board_idx + 1) as f64 / num_boards as f64 * 0.8);
+            progress("sampling", (board_idx + 1) as f64 / num_boards as f64);
             features
         })
         .collect();
@@ -174,7 +174,7 @@ pub fn cluster_turn_with_boards(
         seed,
         |iter, max_iter| {
             #[allow(clippy::cast_precision_loss)]
-            progress(0.8 + 0.2 * f64::from(iter) / f64::from(max_iter));
+            progress("k-means", f64::from(iter) / f64::from(max_iter));
         },
     );
 
@@ -253,7 +253,7 @@ pub fn cluster_flop_with_boards(
     kmeans_iterations: u32,
     seed: u64,
     num_boards: usize,
-    progress: impl Fn(f64) + Sync,
+    progress: impl Fn(&str, f64) + Sync,
 ) -> BucketFile {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
@@ -274,7 +274,7 @@ pub fn cluster_flop_with_boards(
                 })
                 .collect();
             #[allow(clippy::cast_precision_loss)]
-            progress((board_idx + 1) as f64 / num_boards as f64 * 0.8);
+            progress("sampling", (board_idx + 1) as f64 / num_boards as f64);
             features
         })
         .collect();
@@ -300,7 +300,7 @@ pub fn cluster_flop_with_boards(
         seed,
         |iter, max_iter| {
             #[allow(clippy::cast_precision_loss)]
-            progress(0.8 + 0.2 * f64::from(iter) / f64::from(max_iter));
+            progress("k-means", f64::from(iter) / f64::from(max_iter));
         },
     );
 
@@ -342,7 +342,7 @@ pub fn cluster_river_exhaustive(
     kmeans_iterations: u32,
     seed: u64,
     sample_boards: usize,
-    progress: impl Fn(f64) + Sync,
+    progress: impl Fn(&str, f64) + Sync,
 ) -> BucketFile {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
@@ -359,7 +359,7 @@ pub fn cluster_river_exhaustive(
         .map(|(i, board)| {
             let eq = compute_board_equities(*board, &combos);
             #[allow(clippy::cast_precision_loss)]
-            progress((i + 1) as f64 / num_sample as f64 * 0.3);
+            progress("sampling", (i + 1) as f64 / num_sample as f64);
             eq
         })
         .collect();
@@ -380,7 +380,7 @@ pub fn cluster_river_exhaustive(
         bucket_count as usize,
         kmeans_iterations,
     );
-    progress(0.4);
+    progress("k-means", 1.0);
 
     // Phase 2: Enumerate ALL canonical rivers and assign each combo to nearest centroid.
     let num_boards = all_canonical.len();
@@ -400,7 +400,7 @@ pub fn cluster_river_exhaustive(
                 })
                 .collect();
             #[allow(clippy::cast_precision_loss)]
-            progress(0.4 + (i + 1) as f64 / num_boards as f64 * 0.6);
+            progress("assigning", (i + 1) as f64 / num_boards as f64);
             assigns
         })
         .collect();
@@ -445,7 +445,7 @@ fn cluster_histogram_exhaustive<const N: usize>(
     kmeans_iterations: u32,
     seed: u64,
     sample_boards: usize,
-    progress: impl Fn(f64) + Sync,
+    progress: impl Fn(&str, f64) + Sync,
 ) -> BucketFile {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
@@ -472,7 +472,7 @@ fn cluster_histogram_exhaustive<const N: usize>(
                 })
                 .collect();
             #[allow(clippy::cast_precision_loss)]
-            progress((board_idx + 1) as f64 / num_sample as f64 * 0.2);
+            progress("sampling", (board_idx + 1) as f64 / num_sample as f64);
             features
         })
         .collect();
@@ -495,10 +495,10 @@ fn cluster_histogram_exhaustive<const N: usize>(
         seed,
         |iter, max_iter| {
             #[allow(clippy::cast_precision_loss)]
-            progress(0.2 + 0.1 * f64::from(iter) / f64::from(max_iter));
+            progress("k-means", f64::from(iter) / f64::from(max_iter));
         },
     );
-    progress(0.3);
+    progress("k-means", 1.0);
 
     // Phase 2: Enumerate ALL canonical boards and assign each combo to nearest centroid.
     let num_boards = all_canonical.len();
@@ -522,7 +522,7 @@ fn cluster_histogram_exhaustive<const N: usize>(
                 })
                 .collect();
             #[allow(clippy::cast_precision_loss)]
-            progress(0.3 + (i + 1) as f64 / num_boards as f64 * 0.7);
+            progress("assigning", (i + 1) as f64 / num_boards as f64);
             assigns
         })
         .collect();
@@ -562,7 +562,7 @@ pub fn cluster_turn_exhaustive(
     kmeans_iterations: u32,
     seed: u64,
     sample_boards: usize,
-    progress: impl Fn(f64) + Sync,
+    progress: impl Fn(&str, f64) + Sync,
 ) -> BucketFile {
     let all_canonical = enumerate_canonical_turns();
     cluster_histogram_exhaustive(
@@ -588,7 +588,7 @@ pub fn cluster_flop_exhaustive(
     kmeans_iterations: u32,
     seed: u64,
     sample_boards: usize,
-    progress: impl Fn(f64) + Sync,
+    progress: impl Fn(&str, f64) + Sync,
 ) -> BucketFile {
     let all_canonical = enumerate_canonical_flops();
     cluster_histogram_exhaustive(
@@ -617,7 +617,7 @@ pub fn cluster_flop_exhaustive(
 /// runtime (`CanonicalHand::from_cards().index()`).
 ///
 /// The `progress` callback receives values in `[0.0, 1.0]`.
-pub fn cluster_preflop(progress: impl Fn(f64) + Sync) -> BucketFile {
+pub fn cluster_preflop(progress: impl Fn(&str, f64) + Sync) -> BucketFile {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
     let buckets: Vec<u16> = combos
@@ -625,7 +625,7 @@ pub fn cluster_preflop(progress: impl Fn(f64) + Sync) -> BucketFile {
         .enumerate()
         .map(|(i, &combo)| {
             #[allow(clippy::cast_precision_loss)]
-            progress((i + 1) as f64 / combos.len() as f64);
+            progress("mapping", (i + 1) as f64 / combos.len() as f64);
             CanonicalHand::from_cards(combo[0], combo[1]).index() as u16
         })
         .collect();
@@ -673,17 +673,17 @@ pub fn cluster_river_from_cfvnet(
     data_dir: &Path,
     bucket_count: u16,
     kmeans_iterations: u32,
-    progress: impl Fn(f64) + Sync,
+    progress: impl Fn(&str, f64) + Sync,
 ) -> Result<BucketFile, Box<dyn std::error::Error>> {
     let combo_map = build_cfvnet_to_core_combo_map();
     let bin_files = collect_bin_files(data_dir)?;
 
     // ---- Pass 1: build histogram + collect unique boards --------------------
-    let (histogram, board_set) = cfvnet_pass1_histogram(&bin_files, &progress)?;
+    let (histogram, board_set) = cfvnet_pass1_histogram(&bin_files, &|p| progress("histograms", p))?;
 
     // ---- Pass 2: k-means on histogram bins ---------------------------------
     let centroids = cfvnet_pass2_centroids(&histogram, bucket_count, kmeans_iterations);
-    progress(0.5);
+    progress("k-means", 1.0);
 
     // ---- Pass 3: assign buckets ---------------------------------------------
     let mut sorted_boards: Vec<(PackedBoard, Vec<Card>)> = board_set.into_iter().collect();
@@ -729,7 +729,7 @@ pub fn cluster_river_from_cfvnet(
 
             offset += CFVNET_RIVER_RECORD_SIZE;
         }
-        progress(0.5 + (file_idx + 1) as f64 / bin_files.len() as f64 * 0.5);
+        progress("assigning", (file_idx + 1) as f64 / bin_files.len() as f64);
     }
 
     let packed_boards: Vec<PackedBoard> = sorted_boards.iter().map(|(p, _)| *p).collect();
@@ -809,7 +809,7 @@ fn cfvnet_pass1_histogram(
 
             offset += CFVNET_RIVER_RECORD_SIZE;
         }
-        progress((file_idx + 1) as f64 / bin_files.len() as f64 * 0.3);
+        progress((file_idx + 1) as f64 / bin_files.len() as f64);
     }
 
     if board_set.is_empty() {
@@ -866,19 +866,19 @@ pub(crate) fn record_size_for_board(board_size: u8) -> usize {
 pub fn run_clustering_pipeline(
     config: &ClusteringConfig,
     output_dir: &Path,
-    progress: impl Fn(&str, f64) + Sync,
+    progress: impl Fn(&str, &str, f64) + Sync,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. River (equity clustering — independent)
     // cfvnet path already produces exhaustive bucket files; otherwise use
     // two-phase exhaustive clustering. sample_boards controls the sampling
     // phase of centroid finding; the exhaustive phase always covers all boards.
-    progress("river", 0.0);
+    progress("river", "sampling", 0.0);
     let river = if let Some(ref cfvnet_dir) = config.cfvnet_river_data {
         cluster_river_from_cfvnet(
             cfvnet_dir,
             config.river.buckets,
             config.kmeans_iterations,
-            |p| progress("river", p),
+            |phase, p| progress("river", phase, p),
         )?
     } else {
         let sample = config.river.sample_boards.unwrap_or(DEFAULT_NUM_BOARDS);
@@ -887,14 +887,14 @@ pub fn run_clustering_pipeline(
             config.kmeans_iterations,
             config.seed,
             sample,
-            |p| progress("river", p),
+            |phase, p| progress("river", phase, p),
         )
     };
     river.save(&output_dir.join("river.buckets"))?;
 
     // 2. Turn (potential-aware EMD, depends on river)
     // Two-phase exhaustive: sample for centroids, assign all canonical turns.
-    progress("turn", 0.0);
+    progress("turn", "sampling", 0.0);
     let sample_turn = config.turn.sample_boards.unwrap_or(DEFAULT_TURN_BOARDS);
     let turn = cluster_turn_exhaustive(
         &river,
@@ -902,14 +902,14 @@ pub fn run_clustering_pipeline(
         config.kmeans_iterations,
         config.seed,
         sample_turn,
-        |p| progress("turn", p),
+        |phase, p| progress("turn", phase, p),
     );
     turn.save(&output_dir.join("turn.buckets"))?;
 
     // 3. Flop (potential-aware EMD, depends on turn)
     // Two-phase exhaustive: sample for centroids, assign all canonical flops.
     // All 1,755 canonical flops are always enumerated in the exhaustive phase.
-    progress("flop", 0.0);
+    progress("flop", "sampling", 0.0);
     let sample_flop = config.flop.sample_boards.unwrap_or(1755);
     let flop = cluster_flop_exhaustive(
         &turn,
@@ -917,13 +917,13 @@ pub fn run_clustering_pipeline(
         config.kmeans_iterations,
         config.seed,
         sample_flop,
-        |p| progress("flop", p),
+        |phase, p| progress("flop", phase, p),
     );
     flop.save(&output_dir.join("flop.buckets"))?;
 
     // 4. Preflop (deterministic canonical hand mapping, 169 buckets)
-    progress("preflop", 0.0);
-    let preflop = cluster_preflop(|p| progress("preflop", p));
+    progress("preflop", "mapping", 0.0);
+    let preflop = cluster_preflop(|phase, p| progress("preflop", phase, p));
     preflop.save(&output_dir.join("preflop.buckets"))?;
 
     Ok(())
@@ -1488,7 +1488,7 @@ mod tests {
     #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_river_basic() {
         // Use few boards for speed in tests.
-        let result = cluster_river_with_boards(10, 50, 42, 20, |_| {});
+        let result = cluster_river_with_boards(10, 50, 42, 20, |_, _| {});
         assert_eq!(result.header.street, Street::River);
         assert_eq!(result.header.bucket_count, 10);
         assert_eq!(result.header.board_count, 20);
@@ -1503,8 +1503,8 @@ mod tests {
     #[test]
     #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_river_deterministic() {
-        let r1 = cluster_river_with_boards(5, 30, 123, 10, |_| {});
-        let r2 = cluster_river_with_boards(5, 30, 123, 10, |_| {});
+        let r1 = cluster_river_with_boards(5, 30, 123, 10, |_, _| {});
+        let r2 = cluster_river_with_boards(5, 30, 123, 10, |_, _| {});
         assert_eq!(r1.buckets, r2.buckets);
     }
 
@@ -1512,7 +1512,7 @@ mod tests {
     #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_river_bucket_distribution() {
         // Verify that buckets are not all the same value (equity varies).
-        let result = cluster_river_with_boards(5, 50, 42, 30, |_| {});
+        let result = cluster_river_with_boards(5, 50, 42, 30, |_, _| {});
         let mut seen = std::collections::HashSet::new();
         for &b in &result.buckets {
             seen.insert(b);
@@ -1578,9 +1578,9 @@ mod tests {
     #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_turn_basic() {
         // First cluster river with small params.
-        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_, _| {});
         // Then cluster turn using river buckets.
-        let turn = cluster_turn_with_boards(&river, 5, 30, 42, 10, |_| {});
+        let turn = cluster_turn_with_boards(&river, 5, 30, 42, 10, |_, _| {});
 
         assert_eq!(turn.header.street, Street::Turn);
         assert_eq!(turn.header.bucket_count, 5);
@@ -1596,17 +1596,17 @@ mod tests {
     #[test]
     #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_turn_deterministic() {
-        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
-        let t1 = cluster_turn_with_boards(&river, 3, 20, 123, 8, |_| {});
-        let t2 = cluster_turn_with_boards(&river, 3, 20, 123, 8, |_| {});
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_, _| {});
+        let t1 = cluster_turn_with_boards(&river, 3, 20, 123, 8, |_, _| {});
+        let t2 = cluster_turn_with_boards(&river, 3, 20, 123, 8, |_, _| {});
         assert_eq!(t1.buckets, t2.buckets);
     }
 
     #[test]
     #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_turn_bucket_distribution() {
-        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
-        let turn = cluster_turn_with_boards(&river, 4, 30, 42, 15, |_| {});
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_, _| {});
+        let turn = cluster_turn_with_boards(&river, 4, 30, 42, 15, |_, _| {});
         let mut seen = std::collections::HashSet::new();
         for &b in &turn.buckets {
             seen.insert(b);
@@ -1670,9 +1670,9 @@ mod tests {
     #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_flop_basic() {
         // Build dependencies: river -> turn -> flop.
-        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
-        let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_| {});
-        let flop = cluster_flop_with_boards(&turn, 3, 20, 42, 5, |_| {});
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_, _| {});
+        let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_, _| {});
+        let flop = cluster_flop_with_boards(&turn, 3, 20, 42, 5, |_, _| {});
 
         assert_eq!(flop.header.street, Street::Flop);
         assert_eq!(flop.header.bucket_count, 3);
@@ -1688,19 +1688,19 @@ mod tests {
     #[test]
     #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_flop_deterministic() {
-        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
-        let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_| {});
-        let f1 = cluster_flop_with_boards(&turn, 3, 20, 123, 5, |_| {});
-        let f2 = cluster_flop_with_boards(&turn, 3, 20, 123, 5, |_| {});
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_, _| {});
+        let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_, _| {});
+        let f1 = cluster_flop_with_boards(&turn, 3, 20, 123, 5, |_, _| {});
+        let f2 = cluster_flop_with_boards(&turn, 3, 20, 123, 5, |_, _| {});
         assert_eq!(f1.buckets, f2.buckets);
     }
 
     #[test]
     #[ignore] // slow: equity enumeration in debug mode
     fn test_cluster_flop_bucket_distribution() {
-        let river = cluster_river_with_boards(5, 30, 42, 10, |_| {});
-        let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_| {});
-        let flop = cluster_flop_with_boards(&turn, 4, 20, 42, 10, |_| {});
+        let river = cluster_river_with_boards(5, 30, 42, 10, |_, _| {});
+        let turn = cluster_turn_with_boards(&river, 5, 20, 42, 10, |_, _| {});
+        let flop = cluster_flop_with_boards(&turn, 4, 20, 42, 10, |_, _| {});
         let mut seen = std::collections::HashSet::new();
         for &b in &flop.buckets {
             seen.insert(b);
@@ -1744,7 +1744,7 @@ mod tests {
 
     #[test]
     fn test_preflop_cluster_canonical_mapping() {
-        let preflop = cluster_preflop(|_| {});
+        let preflop = cluster_preflop(|_, _| {});
         assert_eq!(preflop.header.street, Street::Preflop);
         assert_eq!(preflop.header.bucket_count, 169);
         assert_eq!(preflop.header.board_count, 1);
@@ -1761,9 +1761,78 @@ mod tests {
 
     #[test]
     fn test_preflop_cluster_deterministic() {
-        let a = cluster_preflop(|_| {});
-        let b = cluster_preflop(|_| {});
+        let a = cluster_preflop(|_, _| {});
+        let b = cluster_preflop(|_, _| {});
         assert_eq!(a.buckets, b.buckets);
+    }
+
+    #[test]
+    fn test_preflop_progress_reports_mapping_phase() {
+        let phases = std::sync::Mutex::new(Vec::new());
+        cluster_preflop(|phase, p| {
+            phases.lock().unwrap().push((phase.to_string(), p));
+        });
+        let phases = phases.into_inner().unwrap();
+        assert!(!phases.is_empty(), "should report progress");
+        for (phase, p) in &phases {
+            assert_eq!(phase, "mapping", "preflop should use 'mapping' phase");
+            assert!(*p >= 0.0 && *p <= 1.0, "progress {p} should be in [0, 1]");
+        }
+        // Last progress should be 1.0
+        assert!(
+            (phases.last().unwrap().1 - 1.0).abs() < 1e-9,
+            "final progress should be 1.0"
+        );
+    }
+
+    #[test]
+    fn test_cfvnet_progress_reports_phases() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("river_test.bin");
+        let mut f = std::fs::File::create(&path).unwrap();
+
+        for player in 0u8..2 {
+            f.write_all(&[5u8]).unwrap();
+            f.write_all(&[0, 4, 8, 12, 16]).unwrap();
+            f.write_all(&100.0_f32.to_le_bytes()).unwrap();
+            f.write_all(&200.0_f32.to_le_bytes()).unwrap();
+            f.write_all(&[player]).unwrap();
+            f.write_all(&0.0_f32.to_le_bytes()).unwrap();
+            f.write_all(&[0u8; 1326 * 4]).unwrap();
+            f.write_all(&[0u8; 1326 * 4]).unwrap();
+            for i in 0..1326 {
+                let cfv = -1.0 + 2.0 * (i as f32 / 1325.0);
+                f.write_all(&cfv.to_le_bytes()).unwrap();
+            }
+            f.write_all(&[1u8; 1326]).unwrap();
+        }
+        drop(f);
+
+        let phases = std::sync::Mutex::new(Vec::new());
+        let _ = cluster_river_from_cfvnet(dir.path(), 10, 50, |phase, p| {
+            phases.lock().unwrap().push((phase.to_string(), p));
+        });
+        let phases = phases.into_inner().unwrap();
+        let unique_phases: std::collections::HashSet<String> =
+            phases.iter().map(|(ph, _)| ph.clone()).collect();
+        assert!(
+            unique_phases.contains("histograms"),
+            "should have histograms phase, got {unique_phases:?}"
+        );
+        assert!(
+            unique_phases.contains("k-means"),
+            "should have k-means phase, got {unique_phases:?}"
+        );
+        assert!(
+            unique_phases.contains("assigning"),
+            "should have assigning phase, got {unique_phases:?}"
+        );
+        for (_, p) in &phases {
+            assert!(*p >= 0.0 && *p <= 1.0, "progress {p} should be in [0, 1]");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1935,7 +2004,7 @@ mod tests {
         }
         drop(f);
 
-        let result = cluster_river_from_cfvnet(dir.path(), 10, 50, |_| {});
+        let result = cluster_river_from_cfvnet(dir.path(), 10, 50, |_, _| {});
         let bf = result.expect("clustering should succeed");
         assert_eq!(bf.header.street, Street::River);
         assert_eq!(bf.header.bucket_count, 10);

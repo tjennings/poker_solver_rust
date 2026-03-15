@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::trainer::BlueprintTrainer;
 
@@ -390,37 +390,51 @@ fn main() -> Result<(), Box<dyn Error>> {
             if poker_solver_core::blueprint_v2::trainer::bucket_files_exist(&output) {
                 eprintln!("Bucket files already exist in {}, skipping clustering", output.display());
             } else {
-                let pb = ProgressBar::new(1000);
-                pb.set_style(
-                    ProgressStyle::with_template("  [{msg}] {bar:40.cyan/blue} {pos}/{len}")
+                let mp = MultiProgress::new();
+                let street_bar = mp.add(ProgressBar::new(4));
+                street_bar.set_style(
+                    ProgressStyle::with_template("  {msg:>12} {bar:40.cyan/blue} {pos}/{len}")
                         .unwrap()
                         .progress_chars("##-"),
                 );
+                street_bar.set_message("clustering");
+
+                let phase_bar = mp.add(ProgressBar::new(1000));
+                phase_bar.set_style(
+                    ProgressStyle::with_template("  {msg:>12} {bar:40.white/black} {pos}/{len}")
+                        .unwrap()
+                        .progress_chars("##-"),
+                );
+
                 let current_street = std::sync::Mutex::new(String::new());
+                let street_count = std::sync::atomic::AtomicU32::new(0);
 
                 poker_solver_core::blueprint_v2::cluster_pipeline::run_clustering_pipeline(
                     &bp_config.clustering,
                     &output,
-                    |street, p| {
+                    |street, phase, p| {
                         let mut cur = current_street.lock().unwrap();
                         if *cur != street {
                             if !cur.is_empty() {
-                                pb.finish_with_message(format!("{cur} done"));
-                                eprintln!();
+                                phase_bar.finish_and_clear();
                             }
                             *cur = street.to_string();
-                            pb.reset();
+                            street_bar.set_message(street.to_string());
+                            street_bar.set_position(
+                                street_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    as u64,
+                            );
+                            phase_bar.reset();
                         }
                         drop(cur);
 
-                        let phase = if p < 0.8 { "features" } else { "k-means" };
-                        pb.set_message(format!("{street} {phase}"));
-                        pb.set_position((p * 1000.0) as u64);
+                        phase_bar.set_message(phase.to_string());
+                        phase_bar.set_position((p * 1000.0) as u64);
                     },
                 )?;
 
-                pb.finish_with_message("done");
-                eprintln!();
+                street_bar.finish_with_message("done");
+                phase_bar.finish_and_clear();
                 eprintln!("Clustering complete. Files saved to {}", output.display());
             }
         }

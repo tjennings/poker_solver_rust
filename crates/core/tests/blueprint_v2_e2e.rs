@@ -94,7 +94,7 @@ fn blueprint_v2_e2e_pipeline() {
         k,
         seed,
         few_boards,
-        |_| {},
+        |_, _| {},
     );
     river
         .save(&cluster_dir.join("river.buckets"))
@@ -106,7 +106,7 @@ fn blueprint_v2_e2e_pipeline() {
         k,
         seed,
         few_boards,
-        |_| {},
+        |_, _| {},
     );
     turn.save(&cluster_dir.join("turn.buckets"))
         .expect("save turn");
@@ -117,12 +117,12 @@ fn blueprint_v2_e2e_pipeline() {
         k,
         seed,
         few_boards,
-        |_| {},
+        |_, _| {},
     );
     flop.save(&cluster_dir.join("flop.buckets"))
         .expect("save flop");
 
-    let preflop = cluster_pipeline::cluster_preflop(|_| {});
+    let preflop = cluster_pipeline::cluster_preflop(|_, _| {});
     preflop
         .save(&cluster_dir.join("preflop.buckets"))
         .expect("save preflop");
