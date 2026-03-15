@@ -226,6 +226,34 @@ impl CardConfig {
     }
 }
 
+/// Evaluates a 7-card poker hand and returns a strength value.
+///
+/// Cards use the encoding `card_id = 4 * rank + suit` where rank 0 = 2, ..., 12 = A
+/// and suit 0 = clubs, 1 = diamonds, 2 = hearts, 3 = spades.
+///
+/// Board must have exactly 5 cards. Hole cards are 2 cards.
+/// Higher return values indicate stronger hands. Returns 0 if any card conflicts.
+///
+/// The returned `u16` is an index into the internal hand table and is comparable:
+/// equal values mean equal-strength hands.
+pub fn evaluate_hand_strength(board: &[Card; 5], hole: (Card, Card)) -> u16 {
+    let mut hand = Hand::new();
+    for &c in board {
+        if hand.contains(c as usize) {
+            return 0;
+        }
+        hand = hand.add_card(c as usize);
+    }
+    if hand.contains(hole.0 as usize) || hand.contains(hole.1 as usize) {
+        return 0;
+    }
+    if hole.0 == hole.1 {
+        return 0;
+    }
+    let hand = hand.add_card(hole.0 as usize).add_card(hole.1 as usize);
+    hand.evaluate()
+}
+
 /// Attempts to convert a rank character to a rank index.
 ///
 /// `'A'` => `12`, `'K'` => `11`, ..., `'2'` => `0`.

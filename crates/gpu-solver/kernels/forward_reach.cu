@@ -1,3 +1,14 @@
+// Forward reach propagation kernel.
+//
+// For each node at the current BFS level, computes:
+//   reach[node][hand] = reach[parent][hand] * strategy[parent_infoset][action][hand]
+//
+// Parallelized over (node_in_level, hand) pairs.
+//
+// Layout:
+//   reach_probs[node * num_hands + hand]
+//   strategy[(infoset * max_actions + action) * num_hands + hand]
+
 extern "C" __global__ void forward_reach(
     float* reach_probs,
     const float* strategy,
@@ -21,7 +32,7 @@ extern "C" __global__ void forward_reach(
     unsigned int infoset = parent_infosets[node_local];
 
     float parent_reach = reach_probs[parent * num_hands + hand];
-    float action_prob = strategy[infoset * max_actions + action];
+    float action_prob = strategy[(infoset * max_actions + action) * num_hands + hand];
 
     reach_probs[node * num_hands + hand] = parent_reach * action_prob;
 }

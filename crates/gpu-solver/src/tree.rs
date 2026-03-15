@@ -54,6 +54,12 @@ pub struct FlatTree {
     pub num_hands_oop: usize,
     /// Number of IP hands.
     pub num_hands_ip: usize,
+    /// Hand strength for each OOP combo (higher = stronger).
+    /// Length = `num_hands_oop`. Combos blocked by the board have strength 0.
+    pub hand_strengths_oop: Vec<u32>,
+    /// Hand strength for each IP combo (higher = stronger).
+    /// Length = `num_hands_ip`. Combos blocked by the board have strength 0.
+    pub hand_strengths_ip: Vec<u32>,
 }
 
 impl FlatTree {
@@ -295,6 +301,32 @@ impl FlatTree {
         }
         child_offsets.push(offset);
 
+        // Compute per-combo hand strengths for showdown evaluation.
+        let card_cfg = game.card_config();
+        let board = [
+            card_cfg.flop[0],
+            card_cfg.flop[1],
+            card_cfg.flop[2],
+            card_cfg.turn,
+            card_cfg.river,
+        ];
+
+        let hand_strengths_oop: Vec<u32> = game
+            .private_cards(0)
+            .iter()
+            .map(|&hole| {
+                range_solver::card::evaluate_hand_strength(&board, hole) as u32
+            })
+            .collect();
+
+        let hand_strengths_ip: Vec<u32> = game
+            .private_cards(1)
+            .iter()
+            .map(|&hole| {
+                range_solver::card::evaluate_hand_strength(&board, hole) as u32
+            })
+            .collect();
+
         // Reset game to root
         game.back_to_root();
 
@@ -316,6 +348,8 @@ impl FlatTree {
             num_hands,
             num_hands_oop,
             num_hands_ip,
+            hand_strengths_oop,
+            hand_strengths_ip,
         }
     }
 
@@ -372,6 +406,9 @@ impl FlatTree {
             num_hands: 2,
             num_hands_oop: 2,
             num_hands_ip: 2,
+            // Hand 0 is stronger than hand 1 for test purposes.
+            hand_strengths_oop: vec![100, 50],
+            hand_strengths_ip: vec![100, 50],
         }
     }
 }

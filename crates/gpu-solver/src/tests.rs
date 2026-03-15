@@ -220,3 +220,43 @@ fn test_flat_tree_showdown_payoffs() {
         assert!(eq[1] < 0.0, "showdown amount_lose should be negative");
     }
 }
+
+#[test]
+fn test_flat_tree_hand_strengths() {
+    let mut game = make_river_game();
+    let flat = FlatTree::from_postflop_game(&mut game);
+
+    // Hand strength arrays should match player hand counts
+    assert_eq!(
+        flat.hand_strengths_oop.len(),
+        flat.num_hands_oop,
+        "OOP hand strengths length mismatch"
+    );
+    assert_eq!(
+        flat.hand_strengths_ip.len(),
+        flat.num_hands_ip,
+        "IP hand strengths length mismatch"
+    );
+
+    // On a river board, all valid combos should have nonzero strength
+    // (blocked combos would have been filtered out by the range)
+    let nonzero_oop = flat.hand_strengths_oop.iter().filter(|&&s| s > 0).count();
+    assert!(
+        nonzero_oop > 0,
+        "should have at least some OOP hands with strength"
+    );
+
+    let nonzero_ip = flat.hand_strengths_ip.iter().filter(|&&s| s > 0).count();
+    assert!(
+        nonzero_ip > 0,
+        "should have at least some IP hands with strength"
+    );
+
+    // Different hands should have different strengths (not all the same)
+    let distinct_oop: std::collections::HashSet<u32> =
+        flat.hand_strengths_oop.iter().copied().collect();
+    assert!(
+        distinct_oop.len() > 1,
+        "OOP should have multiple distinct strength values"
+    );
+}
