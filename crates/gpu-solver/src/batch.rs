@@ -843,7 +843,21 @@ impl<'a> BatchGpuSolver<'a> {
         max_iterations: u32,
         _target_exploitability: Option<f32>,
     ) -> Result<BatchSolveResult, String> {
+        use std::time::Instant;
+
         let gpu_err = |e: GpuError| format!("GPU error: {e}");
+
+        // Accumulators for profiling (summed over both traversers at profile iteration)
+        let profile_iter = 100u32;
+        let mut prof_regret_match = 0.0f64;
+        let mut prof_init_reach = 0.0f64;
+        let mut prof_forward_pass = 0.0f64;
+        let mut prof_zero_cfv = 0.0f64;
+        let mut prof_fold_precompute = 0.0f64;
+        let mut prof_fold_eval = 0.0f64;
+        let mut prof_showdown = 0.0f64;
+        let mut prof_backward_cfv = 0.0f64;
+        let mut prof_update_regrets = 0.0f64;
 
         for t in 1..=max_iterations {
             let current_iteration = t - 1;
@@ -860,8 +874,16 @@ impl<'a> BatchGpuSolver<'a> {
             let t_gamma = (current_iteration - nearest_lower_power_of_4) as f64;
             let strat_discount = ((t_gamma / (t_gamma + 1.0)).powi(3)) as f32;
 
+            let profiling = current_iteration == profile_iter;
+
+            // Synchronize before profiled iteration to get clean baseline
+            if profiling {
+                self.gpu.stream.synchronize().map_err(|e| format!("sync: {e}"))?;
+            }
+
             for traverser in 0..2u32 {
                 // 1. Regret match -> current strategy
+                let t0 = if profiling { Some(Instant::now()) } else { None };
                 self.gpu
                     .launch_regret_match(
                         &self.regrets,
@@ -872,11 +894,21 @@ impl<'a> BatchGpuSolver<'a> {
                         self.num_hands,
                     )
                     .map_err(gpu_err)?;
+                if profiling {
+                    self.gpu.stream.synchronize().map_err(|e| format!("sync: {e}"))?;
+                    prof_regret_match += t0.unwrap().elapsed().as_secs_f64() * 1000.0;
+                }
 
                 // 2. Initialize reach at root
+                let t0 = if profiling { Some(Instant::now()) } else { None };
                 self.init_reach().map_err(gpu_err)?;
+                if profiling {
+                    self.gpu.stream.synchronize().map_err(|e| format!("sync: {e}"))?;
+                    prof_init_reach += t0.unwrap().elapsed().as_secs_f64() * 1000.0;
+                }
 
                 // 3. Forward pass (top-down, level by level)
+                let t0 = if profiling { Some(Instant::now()) } else { None };
                 for level in 1..self.num_levels {
                     let ld = &self.level_data[level];
                     if ld.num_nodes == 0 {
@@ -898,12 +930,21 @@ impl<'a> BatchGpuSolver<'a> {
                         )
                         .map_err(gpu_err)?;
                 }
+                if profiling {
+                    self.gpu.stream.synchronize().map_err(|e| format!("sync: {e}"))?;
+                    prof_forward_pass += t0.unwrap().elapsed().as_secs_f64() * 1000.0;
+                }
 
                 // 4a. Zero out cfvalues (GPU-only, no allocation)
+                let t0 = if profiling { Some(Instant::now()) } else { None };
                 let cfv_size = (self.num_nodes * self.num_hands) as u32;
                 self.gpu
                     .launch_zero_buffer(&mut self.cfvalues, cfv_size)
                     .map_err(gpu_err)?;
+                if profiling {
+                    self.gpu.stream.synchronize().map_err(|e| format!("sync: {e}"))?;
+                    prof_zero_cfv += t0.unwrap().elapsed().as_secs_f64() * 1000.0;
+                }
 
                 // 4b. Terminal fold eval — O(n) via inclusion-exclusion (batch)
                 if self.num_fold_terminals > 0 {
@@ -931,6 +972,7 @@ impl<'a> BatchGpuSolver<'a> {
                     };
 
                     // Phase A: precompute per-card reach aggregates (per terminal per spot)
+                    let t0 = if profiling { Some(Instant::now()) } else { None };
                     self.gpu
                         .launch_precompute_fold_aggregates_batch(
                             opp_reach,
@@ -943,8 +985,13 @@ impl<'a> BatchGpuSolver<'a> {
                             self.hands_per_spot as u32,
                         )
                         .map_err(gpu_err)?;
+                    if profiling {
+                        self.gpu.stream.synchronize().map_err(|e| format!("sync: {e}"))?;
+                        prof_fold_precompute += t0.unwrap().elapsed().as_secs_f64() * 1000.0;
+                    }
 
                     // Phase B: O(1) per-hand CFV using aggregates
+                    let t0 = if profiling { Some(Instant::now()) } else { None };
                     self.gpu
                         .launch_fold_eval_from_aggregates_batch(
                             &mut self.cfvalues,
@@ -963,6 +1010,10 @@ impl<'a> BatchGpuSolver<'a> {
                             self.hands_per_spot as u32,
                         )
                         .map_err(gpu_err)?;
+                    if profiling {
+                        self.gpu.stream.synchronize().map_err(|e| format!("sync: {e}"))?;
+                        prof_fold_eval += t0.unwrap().elapsed().as_secs_f64() * 1000.0;
+                    }
                 }
 
                 // 4c. Terminal showdown eval — shared memory (batch)
@@ -987,6 +1038,7 @@ impl<'a> BatchGpuSolver<'a> {
                     } else {
                         &self.gpu_hand_cards_oop
                     };
+                    let t0 = if profiling { Some(Instant::now()) } else { None };
                     self.gpu
                         .launch_terminal_showdown_eval_shm_batch(
                             &mut self.cfvalues,
@@ -1003,9 +1055,14 @@ impl<'a> BatchGpuSolver<'a> {
                             self.hands_per_spot as u32,
                         )
                         .map_err(gpu_err)?;
+                    if profiling {
+                        self.gpu.stream.synchronize().map_err(|e| format!("sync: {e}"))?;
+                        prof_showdown += t0.unwrap().elapsed().as_secs_f64() * 1000.0;
+                    }
                 }
 
                 // 4d. Backward CFV (bottom-up)
+                let t0 = if profiling { Some(Instant::now()) } else { None };
                 for level in (0..self.num_levels).rev() {
                     let bld = &self.backward_level_data[level];
                     if bld.num_decision_nodes == 0 {
@@ -1027,6 +1084,10 @@ impl<'a> BatchGpuSolver<'a> {
                         )
                         .map_err(gpu_err)?;
                 }
+                if profiling {
+                    self.gpu.stream.synchronize().map_err(|e| format!("sync: {e}"))?;
+                    prof_backward_cfv += t0.unwrap().elapsed().as_secs_f64() * 1000.0;
+                }
 
                 // 4e. Update regrets
                 let (decision_nodes, num_decision) = if traverser == 0 {
@@ -1036,6 +1097,7 @@ impl<'a> BatchGpuSolver<'a> {
                 };
 
                 if num_decision > 0 {
+                    let t0 = if profiling { Some(Instant::now()) } else { None };
                     self.gpu
                         .launch_update_regrets(
                             &mut self.regrets,
@@ -1055,7 +1117,33 @@ impl<'a> BatchGpuSolver<'a> {
                             strat_discount,
                         )
                         .map_err(gpu_err)?;
+                    if profiling {
+                        self.gpu.stream.synchronize().map_err(|e| format!("sync: {e}"))?;
+                        prof_update_regrets += t0.unwrap().elapsed().as_secs_f64() * 1000.0;
+                    }
                 }
+            }
+
+            // Print profiling results after both traversers complete
+            if profiling {
+                let total = prof_regret_match + prof_init_reach + prof_forward_pass
+                    + prof_zero_cfv + prof_fold_precompute + prof_fold_eval
+                    + prof_showdown + prof_backward_cfv + prof_update_regrets;
+                eprintln!("  KERNEL PROFILE (iter {profile_iter}, both traversers):");
+                eprintln!("    regret_match:    {:>8.3}ms ({:>5.1}%)", prof_regret_match, prof_regret_match / total * 100.0);
+                eprintln!("    init_reach:      {:>8.3}ms ({:>5.1}%)", prof_init_reach, prof_init_reach / total * 100.0);
+                eprintln!("    forward_pass:    {:>8.3}ms ({:>5.1}%)", prof_forward_pass, prof_forward_pass / total * 100.0);
+                eprintln!("    zero_cfv:        {:>8.3}ms ({:>5.1}%)", prof_zero_cfv, prof_zero_cfv / total * 100.0);
+                eprintln!("    fold_precompute: {:>8.3}ms ({:>5.1}%)", prof_fold_precompute, prof_fold_precompute / total * 100.0);
+                eprintln!("    fold_eval:       {:>8.3}ms ({:>5.1}%)", prof_fold_eval, prof_fold_eval / total * 100.0);
+                eprintln!("    showdown:        {:>8.3}ms ({:>5.1}%)", prof_showdown, prof_showdown / total * 100.0);
+                eprintln!("    backward_cfv:    {:>8.3}ms ({:>5.1}%)", prof_backward_cfv, prof_backward_cfv / total * 100.0);
+                eprintln!("    update_regrets:  {:>8.3}ms ({:>5.1}%)", prof_update_regrets, prof_update_regrets / total * 100.0);
+                eprintln!("    TOTAL:           {:>8.3}ms", total);
+                eprintln!("    estimated full solve ({max_iterations} iters): {:.1}s", total * max_iterations as f64 / 1000.0);
+                eprintln!("    tree: {} nodes, {} infosets, {} hands/spot, {} spots, {} total_hands",
+                    self.num_nodes, self.num_infosets, self.hands_per_spot, self.num_spots, self.num_hands);
+                eprintln!("    terminals: {} fold, {} showdown", self.num_fold_terminals, self.num_showdown_terminals);
             }
         }
 
