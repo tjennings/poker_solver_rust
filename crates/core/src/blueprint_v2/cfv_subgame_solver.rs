@@ -52,6 +52,32 @@ pub trait LeafEvaluator {
         ip_range: &[f64],
         traverser: u8,
     ) -> Vec<f64>;
+
+    /// Batch-evaluate multiple boundary requests in one call.
+    ///
+    /// Each request specifies `(pot, effective_stack, traverser)` for a
+    /// different boundary node. All requests share the same combos, board,
+    /// and ranges.
+    ///
+    /// Returns one `Vec<f64>` per request (same length as `combos`).
+    ///
+    /// Default implementation calls [`evaluate`] sequentially. GPU-backed
+    /// implementations should override to batch into a single forward pass.
+    fn evaluate_boundaries(
+        &self,
+        combos: &[[Card; 2]],
+        board: &[Card],
+        oop_range: &[f64],
+        ip_range: &[f64],
+        requests: &[(f64, f64, u8)], // (pot, effective_stack, traverser)
+    ) -> Vec<Vec<f64>> {
+        requests
+            .iter()
+            .map(|&(pot, eff_stack, traverser)| {
+                self.evaluate(combos, board, pot, eff_stack, oop_range, ip_range, traverser)
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
