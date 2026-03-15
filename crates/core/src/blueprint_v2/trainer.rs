@@ -589,7 +589,17 @@ impl BlueprintTrainer {
                         super::game_tree::GameNode::Decision { player, .. } => *player as usize,
                         _ => 0,
                     };
-                    let hand_evs = self.scenario_ev_tracker.hand_ev_array(i, player);
+                    let mut hand_evs = self.scenario_ev_tracker.hand_ev_array(i, player);
+                    // Normalize to decision-point frame: fold = 0.
+                    // The traversal measures from hand start, so node_value
+                    // includes the sunk cost of reaching this node. Subtract
+                    // the fold terminal value (= -vol_self) so fold shows 0.
+                    let fold_offset = Self::fold_value_at_node(&self.tree, node_idx, player);
+                    for ev in &mut hand_evs {
+                        if *ev != 0.0 {
+                            *ev -= fold_offset;
+                        }
+                    }
                     callback(i, node_idx, &self.storage, &self.tree, &hand_evs);
                 }
             }
@@ -813,6 +823,28 @@ impl BlueprintTrainer {
         } else {
             0.0
         }
+    }
+
+    /// Compute the fold terminal value at a decision node for a given player.
+    ///
+    /// Returns the dead-money fold payoff (e.g. -2.0 if the player has
+    /// voluntarily invested 2.0). At the root preflop node this is 0.0.
+    /// Returns 0.0 if the node has no Fold action.
+    fn fold_value_at_node(tree: &GameTree, node_idx: u32, player: usize) -> f64 {
+        use super::game_tree::{GameNode, TreeAction, TerminalKind};
+        if let GameNode::Decision { actions, children, .. } = &tree.nodes[node_idx as usize] {
+            for (a, &child_idx) in children.iter().enumerate() {
+                if actions[a] == TreeAction::Fold {
+                    if let GameNode::Terminal { kind: TerminalKind::Fold { .. }, invested, .. } =
+                        &tree.nodes[child_idx as usize]
+                    {
+                        let vol_self = invested[player] - tree.blinds[player];
+                        return -vol_self;
+                    }
+                }
+            }
+        }
+        0.0
     }
 
     /// Mean chip EV per canonical hand for a given position (0 or 1),
