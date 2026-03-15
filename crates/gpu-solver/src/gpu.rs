@@ -488,6 +488,106 @@ impl GpuContext {
         }
         Ok(())
     }
+
+    /// Launch the batch fold terminal evaluation kernel.
+    ///
+    /// Like `launch_terminal_fold_eval` but with:
+    /// - Per-hand payoffs: `fold_amount_win[term_idx * num_hands + hand]`
+    /// - Spot-scoped card blocking via `hands_per_spot`
+    ///
+    /// # Layout
+    /// - `fold_amount_win`: `[num_fold_terminals * num_hands]` — per-hand payoff
+    /// - `fold_amount_lose`: `[num_fold_terminals * num_hands]` — per-hand payoff
+    /// - `valid_matchups`: `[num_spots * hps * hps]` — per-spot blocking matrices
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_terminal_fold_eval_batch(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        fold_amount_win: &CudaSlice<f32>,
+        fold_amount_lose: &CudaSlice<f32>,
+        fold_player: &CudaSlice<u32>,
+        valid_matchups: &CudaSlice<f32>,
+        traverser: u32,
+        num_fold_terminals: u32,
+        num_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/terminal_fold_eval_batch.cu"),
+            "terminal_fold_eval_batch",
+        )?;
+        let total_threads = num_fold_terminals * num_hands;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(fold_amount_win)
+                .arg(fold_amount_lose)
+                .arg(fold_player)
+                .arg(valid_matchups)
+                .arg(&traverser)
+                .arg(&num_fold_terminals)
+                .arg(&num_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Launch the batch showdown terminal evaluation kernel.
+    ///
+    /// Like `launch_terminal_showdown_eval` but with:
+    /// - Per-hand payoffs: `amount_win[term_idx * num_hands + hand]`
+    /// - Spot-scoped card blocking via `hands_per_spot`
+    ///
+    /// # Layout
+    /// - `amount_win`: `[num_showdown_terminals * num_hands]` — per-hand payoff
+    /// - `amount_lose`: `[num_showdown_terminals * num_hands]` — per-hand payoff
+    /// - `valid_matchups`: `[num_spots * hps * hps]` — per-spot blocking matrices
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_terminal_showdown_eval_batch(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        amount_win: &CudaSlice<f32>,
+        amount_lose: &CudaSlice<f32>,
+        traverser_strengths: &CudaSlice<u32>,
+        opponent_strengths: &CudaSlice<u32>,
+        valid_matchups: &CudaSlice<f32>,
+        num_showdown_terminals: u32,
+        num_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/terminal_showdown_eval_batch.cu"),
+            "terminal_showdown_eval_batch",
+        )?;
+        let total_threads = num_showdown_terminals * num_hands;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(amount_win)
+                .arg(amount_lose)
+                .arg(traverser_strengths)
+                .arg(opponent_strengths)
+                .arg(valid_matchups)
+                .arg(&num_showdown_terminals)
+                .arg(&num_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
