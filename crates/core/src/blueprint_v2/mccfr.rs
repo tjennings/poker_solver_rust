@@ -776,16 +776,6 @@ mod tests {
 
     // ── Bucket file lookup tests ─────────────────────────────────────
 
-    // (delta bucketing tests removed — AllBuckets now uses bucket file lookups)
-
-    #[test]
-    fn placeholder_delta_tests_removed() {
-        // Delta bucketing was removed from AllBuckets in favour of
-        // precomputed bucket file lookups. The clustering pipeline
-        // now handles delta-aware bucketing during offline cluster
-        // generation rather than at MCCFR runtime.
-    }
-
     #[test]
     fn equity_fallback_aa_high_bucket() {
         let all = AllBuckets::equity_only(
