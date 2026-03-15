@@ -206,6 +206,21 @@ pub struct BatchGpuSolver<'a> {
     gpu_sorted_oop: CudaSlice<u32>,
     gpu_sorted_ip: CudaSlice<u32>,
 
+    // Cross-player rank arrays for 3-kernel showdown.
+    // When OOP is traverser, these give OOP hand's position in IP's sorted strength order.
+    // rank_win: # of opponent hands strictly weaker. rank_next: # of opponent hands <= (weaker or tied).
+    gpu_rank_win_oop: CudaSlice<u32>,    // OOP trav: rank in IP's order (for win reach)
+    gpu_rank_next_oop: CudaSlice<u32>,   // OOP trav: next rank in IP's order (for lose reach)
+    gpu_rank_win_ip: CudaSlice<u32>,     // IP trav: rank in OOP's order
+    gpu_rank_next_ip: CudaSlice<u32>,    // IP trav: next rank in OOP's order
+
+    // Working buffers for 3-kernel showdown eval (reused each iteration).
+    // Sized for num_showdown_terminals * total_hands.
+    gpu_sd_sorted_reach: CudaSlice<f32>,
+    gpu_sd_prefix_excl: CudaSlice<f32>,
+    // Sized for num_showdown_terminals * num_spots.
+    gpu_sd_totals: CudaSlice<f32>,
+
     // Decision node lists per player
     decision_nodes_oop: CudaSlice<u32>,
     decision_nodes_ip: CudaSlice<u32>,
@@ -371,6 +386,14 @@ impl<'a> BatchGpuSolver<'a> {
         // --- Pre-sort hand indices by strength for O(n) showdown eval ---
         let sorted_oop = Self::sort_hands_by_strength(&hand_strengths_oop, num_spots, hands_per_spot);
         let sorted_ip = Self::sort_hands_by_strength(&hand_strengths_ip, num_spots, hands_per_spot);
+
+        // Compute cross-player rank arrays for 3-kernel showdown
+        // When OOP is traverser, opponent is IP: find OOP's position in IP's sorted order
+        let rank_win_oop = Self::compute_cross_rank(&hand_strengths_oop, &sorted_ip, &hand_strengths_ip, num_spots, hands_per_spot);
+        let rank_next_oop = Self::compute_cross_rank_next(&hand_strengths_oop, &sorted_ip, &hand_strengths_ip, num_spots, hands_per_spot);
+        // When IP is traverser, opponent is OOP: find IP's position in OOP's sorted order
+        let rank_win_ip = Self::compute_cross_rank(&hand_strengths_ip, &sorted_oop, &hand_strengths_oop, num_spots, hands_per_spot);
+        let rank_next_ip = Self::compute_cross_rank_next(&hand_strengths_ip, &sorted_oop, &hand_strengths_oop, num_spots, hands_per_spot);
 
         // --- Build terminal data with per-hand payoffs ---
         // Terminal nodes and fold_player are shared (same topology).
@@ -538,6 +561,19 @@ impl<'a> BatchGpuSolver<'a> {
         let gpu_sorted_oop = gpu.upload(&sorted_oop).map_err(gpu_err)?;
         let gpu_sorted_ip = gpu.upload(&sorted_ip).map_err(gpu_err)?;
 
+        // Upload cross-player rank arrays for 3-kernel showdown
+        let gpu_rank_win_oop = gpu.upload(&rank_win_oop).map_err(gpu_err)?;
+        let gpu_rank_next_oop = gpu.upload(&rank_next_oop).map_err(gpu_err)?;
+        let gpu_rank_win_ip = gpu.upload(&rank_win_ip).map_err(gpu_err)?;
+        let gpu_rank_next_ip = gpu.upload(&rank_next_ip).map_err(gpu_err)?;
+
+        // Allocate working buffers for 3-kernel showdown eval
+        let sd_buf_size = (num_showdown_terminals as usize * total_hands).max(1);
+        let sd_total_size = (num_showdown_terminals as usize * num_spots).max(1);
+        let gpu_sd_sorted_reach = gpu.alloc_zeros::<f32>(sd_buf_size).map_err(gpu_err)?;
+        let gpu_sd_prefix_excl = gpu.alloc_zeros::<f32>(sd_buf_size).map_err(gpu_err)?;
+        let gpu_sd_totals = gpu.alloc_zeros::<f32>(sd_total_size).map_err(gpu_err)?;
+
         // Upload hand card arrays
         let gpu_hand_cards_oop = gpu.upload(&hand_cards_oop_flat).map_err(gpu_err)?;
         let gpu_hand_cards_ip = gpu.upload(&hand_cards_ip_flat).map_err(gpu_err)?;
@@ -608,6 +644,13 @@ impl<'a> BatchGpuSolver<'a> {
             gpu_fold_per_card_reach,
             gpu_sorted_oop,
             gpu_sorted_ip,
+            gpu_rank_win_oop,
+            gpu_rank_next_oop,
+            gpu_rank_win_ip,
+            gpu_rank_next_ip,
+            gpu_sd_sorted_reach,
+            gpu_sd_prefix_excl,
+            gpu_sd_totals,
             decision_nodes_oop,
             decision_nodes_ip,
             num_oop_decisions,
@@ -643,6 +686,79 @@ impl<'a> BatchGpuSolver<'a> {
             spot_slice.sort_by_key(|&i| strengths[base + i as usize]);
         }
         sorted
+    }
+
+    /// Compute the rank of each traverser hand in the opponent's sorted strength order.
+    ///
+    /// For each traverser hand at local index `h`, finds the number of opponent
+    /// hands with strength strictly less than `trav_strengths[h]`. This is the
+    /// position in the opponent's sorted order where the prefix sum gives
+    /// "reach of all strictly weaker opponents".
+    ///
+    /// Returns `[num_spots * hands_per_spot]` where
+    /// `result[spot*hps + h] = # of opponent hands in that spot with strength < trav_strengths[spot*hps + h]`.
+    fn compute_cross_rank(
+        trav_strengths: &[u32],
+        opp_sorted_indices: &[u32],
+        opp_strengths: &[u32],
+        num_spots: usize,
+        hands_per_spot: usize,
+    ) -> Vec<u32> {
+        let mut rank = vec![0u32; num_spots * hands_per_spot];
+        for spot in 0..num_spots {
+            let base = spot * hands_per_spot;
+
+            // Build sorted opponent strengths for binary search
+            let opp_sorted_strengths: Vec<u32> = (0..hands_per_spot)
+                .map(|r| {
+                    let opp_local = opp_sorted_indices[base + r] as usize;
+                    opp_strengths[base + opp_local]
+                })
+                .collect();
+
+            for h in 0..hands_per_spot {
+                let trav_str = trav_strengths[base + h];
+                // Find first position where opponent strength >= trav_str
+                // That position = # of opponent hands strictly weaker
+                let pos = opp_sorted_strengths.partition_point(|&s| s < trav_str);
+                rank[base + h] = pos as u32;
+            }
+        }
+        rank
+    }
+
+    /// Compute the "next rank" for each traverser hand: the number of opponent
+    /// hands with strength <= trav_strengths[h] (i.e., strictly weaker or tied).
+    ///
+    /// This is used to compute lose_reach: total - prefix_excl[next_rank] gives
+    /// the reach of all strictly stronger opponents.
+    fn compute_cross_rank_next(
+        trav_strengths: &[u32],
+        opp_sorted_indices: &[u32],
+        opp_strengths: &[u32],
+        num_spots: usize,
+        hands_per_spot: usize,
+    ) -> Vec<u32> {
+        let mut rank_next = vec![0u32; num_spots * hands_per_spot];
+        for spot in 0..num_spots {
+            let base = spot * hands_per_spot;
+
+            let opp_sorted_strengths: Vec<u32> = (0..hands_per_spot)
+                .map(|r| {
+                    let opp_local = opp_sorted_indices[base + r] as usize;
+                    opp_strengths[base + opp_local]
+                })
+                .collect();
+
+            for h in 0..hands_per_spot {
+                let trav_str = trav_strengths[base + h];
+                // Find first position where opponent strength > trav_str
+                // That position = # of opponent hands with strength <= trav_str
+                let pos = opp_sorted_strengths.partition_point(|&s| s <= trav_str);
+                rank_next[base + h] = pos as u32;
+            }
+        }
+        rank_next
     }
 
     /// Create a batch GPU solver from pre-built GPU buffers and a reference
@@ -804,6 +920,23 @@ impl<'a> BatchGpuSolver<'a> {
         let gpu_sorted_oop = gpu.upload(&sorted_oop).map_err(gpu_err)?;
         let gpu_sorted_ip = gpu.upload(&sorted_ip).map_err(gpu_err)?;
 
+        // Compute and upload cross-player rank arrays for 3-kernel showdown
+        let rank_win_oop = Self::compute_cross_rank(&strengths_oop_host, &sorted_ip, &strengths_ip_host, num_spots, hands_per_spot);
+        let rank_next_oop = Self::compute_cross_rank_next(&strengths_oop_host, &sorted_ip, &strengths_ip_host, num_spots, hands_per_spot);
+        let rank_win_ip = Self::compute_cross_rank(&strengths_ip_host, &sorted_oop, &strengths_oop_host, num_spots, hands_per_spot);
+        let rank_next_ip = Self::compute_cross_rank_next(&strengths_ip_host, &sorted_oop, &strengths_oop_host, num_spots, hands_per_spot);
+        let gpu_rank_win_oop = gpu.upload(&rank_win_oop).map_err(gpu_err)?;
+        let gpu_rank_next_oop = gpu.upload(&rank_next_oop).map_err(gpu_err)?;
+        let gpu_rank_win_ip = gpu.upload(&rank_win_ip).map_err(gpu_err)?;
+        let gpu_rank_next_ip = gpu.upload(&rank_next_ip).map_err(gpu_err)?;
+
+        // Allocate working buffers for 3-kernel showdown eval
+        let sd_buf_size = (num_showdown_terminals as usize * total_hands).max(1);
+        let sd_total_size = (num_showdown_terminals as usize * num_spots).max(1);
+        let gpu_sd_sorted_reach = gpu.alloc_zeros::<f32>(sd_buf_size).map_err(gpu_err)?;
+        let gpu_sd_prefix_excl = gpu.alloc_zeros::<f32>(sd_buf_size).map_err(gpu_err)?;
+        let gpu_sd_totals = gpu.alloc_zeros::<f32>(sd_total_size).map_err(gpu_err)?;
+
         // Build decision node lists per player
         let mut oop_decisions = Vec::new();
         let mut ip_decisions = Vec::new();
@@ -861,6 +994,13 @@ impl<'a> BatchGpuSolver<'a> {
             gpu_fold_per_card_reach,
             gpu_sorted_oop,
             gpu_sorted_ip,
+            gpu_rank_win_oop,
+            gpu_rank_next_oop,
+            gpu_rank_win_ip,
+            gpu_rank_next_ip,
+            gpu_sd_sorted_reach,
+            gpu_sd_prefix_excl,
+            gpu_sd_totals,
             decision_nodes_oop,
             decision_nodes_ip,
             num_oop_decisions,
@@ -1062,48 +1202,72 @@ impl<'a> BatchGpuSolver<'a> {
                     }
                 }
 
-                // 4c. Terminal showdown eval — O(n) sorted prefix-sum (batch)
+                // 4c. Terminal showdown eval — 3-kernel O(n) pipeline
+                //     1. Scatter opponent reach to sorted order
+                //     2. Segmented prefix sum
+                //     3. Lookup + compute CFV
                 if self.num_showdown_terminals > 0 {
                     let opp_reach = if traverser == 0 {
                         &self.reach_ip
                     } else {
                         &self.reach_oop
                     };
-                    let (trav_sorted, opp_sorted) = if traverser == 0 {
-                        (&self.gpu_sorted_oop, &self.gpu_sorted_ip)
+                    let opp_sorted = if traverser == 0 {
+                        &self.gpu_sorted_ip
                     } else {
-                        (&self.gpu_sorted_ip, &self.gpu_sorted_oop)
+                        &self.gpu_sorted_oop
                     };
-                    let (trav_strengths, opp_strengths) = if traverser == 0 {
-                        (&self.gpu_hand_strengths_oop, &self.gpu_hand_strengths_ip)
+                    let (trav_rank_win, trav_rank_next) = if traverser == 0 {
+                        (&self.gpu_rank_win_oop, &self.gpu_rank_next_oop)
                     } else {
-                        (&self.gpu_hand_strengths_ip, &self.gpu_hand_strengths_oop)
+                        (&self.gpu_rank_win_ip, &self.gpu_rank_next_ip)
                     };
-                    let trav_hand_cards = if traverser == 0 {
-                        &self.gpu_hand_cards_oop
-                    } else {
-                        &self.gpu_hand_cards_ip
-                    };
-                    let opp_hand_cards = if traverser == 0 {
-                        &self.gpu_hand_cards_ip
-                    } else {
-                        &self.gpu_hand_cards_oop
-                    };
+
                     let t0 = if profiling { Some(Instant::now()) } else { None };
+
+                    // Kernel 1: scatter opponent reach to sorted order
                     self.gpu
-                        .launch_showdown_eval_fast(
-                            &mut self.cfvalues,
+                        .launch_scatter_opp_reach_sorted(
+                            &mut self.gpu_sd_sorted_reach,
                             opp_reach,
                             &self.showdown_terminal_nodes,
-                            &self.showdown_amount_win,
-                            &self.showdown_amount_lose,
-                            trav_strengths,
-                            opp_strengths,
+                            opp_sorted,
                             self.num_showdown_terminals,
                             self.num_hands,
                             self.hands_per_spot as u32,
                         )
                         .map_err(gpu_err)?;
+
+                    // Kernel 2: segmented prefix sum
+                    let num_spots = self.num_spots as u32;
+                    let num_segments = self.num_showdown_terminals * num_spots;
+                    self.gpu
+                        .launch_segmented_prefix_sum(
+                            &self.gpu_sd_sorted_reach,
+                            &mut self.gpu_sd_prefix_excl,
+                            &mut self.gpu_sd_totals,
+                            num_segments,
+                            self.hands_per_spot as u32,
+                        )
+                        .map_err(gpu_err)?;
+
+                    // Kernel 3: lookup prefix sums and compute CFV
+                    self.gpu
+                        .launch_showdown_lookup_cfv(
+                            &mut self.cfvalues,
+                            &self.gpu_sd_prefix_excl,
+                            &self.gpu_sd_totals,
+                            &self.showdown_amount_win,
+                            &self.showdown_amount_lose,
+                            &self.showdown_terminal_nodes,
+                            trav_rank_win,
+                            trav_rank_next,
+                            self.num_showdown_terminals,
+                            self.num_hands,
+                            self.hands_per_spot as u32,
+                        )
+                        .map_err(gpu_err)?;
+
                     if profiling {
                         self.gpu.stream.synchronize().map_err(|e| format!("sync: {e}"))?;
                         prof_showdown += t0.unwrap().elapsed().as_secs_f64() * 1000.0;
@@ -1339,43 +1503,61 @@ impl<'a> BatchGpuSolver<'a> {
                     .map_err(gpu_err)?;
             }
 
-            // Terminal showdown eval — O(n) sorted prefix-sum
+            // Terminal showdown eval — 3-kernel O(n) pipeline
             if self.num_showdown_terminals > 0 {
                 let opp_reach = if traverser == 0 {
                     &self.reach_ip
                 } else {
                     &self.reach_oop
                 };
-                let (trav_sorted, opp_sorted) = if traverser == 0 {
-                    (&self.gpu_sorted_oop, &self.gpu_sorted_ip)
+                let opp_sorted = if traverser == 0 {
+                    &self.gpu_sorted_ip
                 } else {
-                    (&self.gpu_sorted_ip, &self.gpu_sorted_oop)
+                    &self.gpu_sorted_oop
                 };
-                let (trav_strengths, opp_strengths) = if traverser == 0 {
-                    (&self.gpu_hand_strengths_oop, &self.gpu_hand_strengths_ip)
+                let (trav_rank_win, trav_rank_next) = if traverser == 0 {
+                    (&self.gpu_rank_win_oop, &self.gpu_rank_next_oop)
                 } else {
-                    (&self.gpu_hand_strengths_ip, &self.gpu_hand_strengths_oop)
-                };
-                let trav_hand_cards = if traverser == 0 {
-                    &self.gpu_hand_cards_oop
-                } else {
-                    &self.gpu_hand_cards_ip
-                };
-                let opp_hand_cards = if traverser == 0 {
-                    &self.gpu_hand_cards_ip
-                } else {
-                    &self.gpu_hand_cards_oop
+                    (&self.gpu_rank_win_ip, &self.gpu_rank_next_ip)
                 };
 
+                // Kernel 1: scatter
                 self.gpu
-                    .launch_showdown_eval_fast(
-                        &mut self.cfvalues,
+                    .launch_scatter_opp_reach_sorted(
+                        &mut self.gpu_sd_sorted_reach,
                         opp_reach,
                         &self.showdown_terminal_nodes,
+                        opp_sorted,
+                        self.num_showdown_terminals,
+                        self.num_hands,
+                        self.hands_per_spot as u32,
+                    )
+                    .map_err(gpu_err)?;
+
+                // Kernel 2: prefix sum
+                let num_spots = self.num_spots as u32;
+                let num_segments = self.num_showdown_terminals * num_spots;
+                self.gpu
+                    .launch_segmented_prefix_sum(
+                        &self.gpu_sd_sorted_reach,
+                        &mut self.gpu_sd_prefix_excl,
+                        &mut self.gpu_sd_totals,
+                        num_segments,
+                        self.hands_per_spot as u32,
+                    )
+                    .map_err(gpu_err)?;
+
+                // Kernel 3: lookup
+                self.gpu
+                    .launch_showdown_lookup_cfv(
+                        &mut self.cfvalues,
+                        &self.gpu_sd_prefix_excl,
+                        &self.gpu_sd_totals,
                         &self.showdown_amount_win,
                         &self.showdown_amount_lose,
-                        trav_strengths,
-                        opp_strengths,
+                        &self.showdown_terminal_nodes,
+                        trav_rank_win,
+                        trav_rank_next,
                         self.num_showdown_terminals,
                         self.num_hands,
                         self.hands_per_spot as u32,
@@ -1979,6 +2161,205 @@ mod tests {
                         "Spot {spot_idx}: sum={total} at iset={iset} h={h}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Test 3-kernel showdown pipeline against the O(n^2) fast kernel
+    /// with synthetic reach at node 0.
+    #[test]
+    fn test_3kernel_showdown_gpu_vs_fast() {
+        let spot = make_spot(
+            "AA,KK,QQ,AKs",
+            "QQ-JJ,AQs,AJs",
+            "Qs Jh 2c",
+            "8d",
+            "3s",
+            100,
+            100,
+        );
+        let config = BatchConfig::default();
+        let gpu = GpuContext::new(0).unwrap();
+        let solver = BatchGpuSolver::new(&gpu, &[spot], &config).unwrap();
+
+        let num_hands = solver.num_hands;
+        let num_nodes = solver.num_nodes;
+        let hps = solver.hands_per_spot as u32;
+
+        // Use initial reach as the opponent reach at root (node 0)
+        // Set up reach buffer: all zeros except node 0 = initial reach
+        let reach_size = (num_nodes * num_hands) as usize;
+        let mut reach_host = vec![0.0f32; reach_size];
+        let initial_ip: Vec<f32> = gpu.download(&solver.gpu_initial_reach_ip).unwrap();
+        for h in 0..num_hands as usize {
+            reach_host[h] = initial_ip[h]; // node 0, hand h
+        }
+        let gpu_reach = gpu.upload(&reach_host).unwrap();
+
+        // Run the O(n^2) fast kernel
+        let mut cfv_fast = gpu.alloc_zeros::<f32>(reach_size).unwrap();
+        gpu.launch_showdown_eval_fast(
+            &mut cfv_fast,
+            &gpu_reach,
+            &solver.showdown_terminal_nodes,
+            &solver.showdown_amount_win,
+            &solver.showdown_amount_lose,
+            &solver.gpu_hand_strengths_oop,  // traverser = OOP
+            &solver.gpu_hand_strengths_ip,   // opponent = IP
+            solver.num_showdown_terminals,
+            num_hands,
+            hps,
+        ).unwrap();
+
+        // Run the 3-kernel pipeline
+        let mut cfv_3k = gpu.alloc_zeros::<f32>(reach_size).unwrap();
+        let mut sorted_reach = gpu.alloc_zeros::<f32>((solver.num_showdown_terminals * num_hands) as usize).unwrap();
+        let mut prefix_excl = gpu.alloc_zeros::<f32>((solver.num_showdown_terminals * num_hands) as usize).unwrap();
+        let mut totals = gpu.alloc_zeros::<f32>((solver.num_showdown_terminals * solver.num_spots as u32) as usize).unwrap();
+
+        // Kernel 1: scatter
+        gpu.launch_scatter_opp_reach_sorted(
+            &mut sorted_reach,
+            &gpu_reach,
+            &solver.showdown_terminal_nodes,
+            &solver.gpu_sorted_ip,  // opponent sorted indices
+            solver.num_showdown_terminals,
+            num_hands,
+            hps,
+        ).unwrap();
+
+        // Kernel 2: prefix sum
+        let num_segments = solver.num_showdown_terminals * solver.num_spots as u32;
+        gpu.launch_segmented_prefix_sum(
+            &sorted_reach,
+            &mut prefix_excl,
+            &mut totals,
+            num_segments,
+            hps,
+        ).unwrap();
+
+        // Kernel 3: lookup
+        gpu.launch_showdown_lookup_cfv(
+            &mut cfv_3k,
+            &prefix_excl,
+            &totals,
+            &solver.showdown_amount_win,
+            &solver.showdown_amount_lose,
+            &solver.showdown_terminal_nodes,
+            &solver.gpu_rank_win_oop,   // traverser=OOP, rank_win in IP order
+            &solver.gpu_rank_next_oop,  // traverser=OOP, rank_next in IP order
+            solver.num_showdown_terminals,
+            num_hands,
+            hps,
+        ).unwrap();
+
+        // Download and compare
+        let cfv_fast_host: Vec<f32> = gpu.download(&cfv_fast).unwrap();
+        let cfv_3k_host: Vec<f32> = gpu.download(&cfv_3k).unwrap();
+        let sd_nodes: Vec<u32> = gpu.download(&solver.showdown_terminal_nodes).unwrap();
+
+        let mut max_diff = 0.0f32;
+        for term_idx in 0..solver.num_showdown_terminals as usize {
+            let node = sd_nodes[term_idx] as usize;
+            for h in 0..num_hands as usize {
+                let fast_val = cfv_fast_host[node * num_hands as usize + h];
+                let k3_val = cfv_3k_host[node * num_hands as usize + h];
+                let diff = (fast_val - k3_val).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                }
+            }
+        }
+        assert!(max_diff < 1e-4, "Max diff {max_diff} exceeds tolerance");
+    }
+
+    /// Debug test: compare 3-kernel showdown rank arrays against O(n^2) brute force.
+    #[test]
+    fn test_3kernel_showdown_rank_correctness() {
+        let spot = make_spot(
+            "AA,KK,QQ,AKs",
+            "QQ-JJ,AQs,AJs",
+            "Qs Jh 2c",
+            "8d",
+            "3s",
+            100,
+            100,
+        );
+        let config = BatchConfig::default();
+        let gpu = GpuContext::new(0).unwrap();
+        let solver = BatchGpuSolver::new(&gpu, &[spot], &config).unwrap();
+
+        let strengths_oop: Vec<u32> = gpu.download(&solver.gpu_hand_strengths_oop).unwrap();
+        let strengths_ip: Vec<u32> = gpu.download(&solver.gpu_hand_strengths_ip).unwrap();
+        let sorted_ip: Vec<u32> = gpu.download(&solver.gpu_sorted_ip).unwrap();
+        let rank_win_oop: Vec<u32> = gpu.download(&solver.gpu_rank_win_oop).unwrap();
+        let rank_next_oop: Vec<u32> = gpu.download(&solver.gpu_rank_next_oop).unwrap();
+
+        let hps = solver.hands_per_spot;
+
+        // Check rank arrays against brute-force computation
+        let mut mismatch_count = 0;
+        for h in 0..hps {
+            let trav_str = strengths_oop[h];
+            let expected_win = (0..hps).filter(|&j| strengths_ip[j] < trav_str).count() as u32;
+            let expected_next = (0..hps).filter(|&j| strengths_ip[j] <= trav_str).count() as u32;
+            if rank_win_oop[h] != expected_win || rank_next_oop[h] != expected_next {
+                mismatch_count += 1;
+            }
+        }
+        assert_eq!(mismatch_count, 0, "{mismatch_count} rank mismatches found");
+
+        // Now test actual CFV computation with synthetic reach
+        // Set all IP reach to their initial range weights
+        let initial_reach_ip: Vec<f32> = gpu.download(&solver.gpu_initial_reach_ip).unwrap();
+        let sd_win: Vec<f32> = gpu.download(&solver.showdown_amount_win).unwrap();
+        let sd_lose: Vec<f32> = gpu.download(&solver.showdown_amount_lose).unwrap();
+
+        for term_idx in 0..solver.num_showdown_terminals as usize {
+            for h in 0..hps {
+                let trav_str = strengths_oop[h];
+                let win = sd_win[term_idx * solver.num_hands as usize + h];
+                let lose = sd_lose[term_idx * solver.num_hands as usize + h];
+
+                // O(n^2) expected CFV
+                let mut cfv_n2 = 0.0f32;
+                for j in 0..hps {
+                    let opp_r = initial_reach_ip[j];
+                    let opp_str = strengths_ip[j];
+                    if trav_str > opp_str {
+                        cfv_n2 += win * opp_r;
+                    } else if trav_str < opp_str {
+                        cfv_n2 += lose * opp_r;
+                    }
+                }
+
+                // 3-kernel expected CFV
+                let rw = rank_win_oop[h] as usize;
+                let rn = rank_next_oop[h] as usize;
+
+                let mut sorted_reach = vec![0.0f32; hps];
+                for r in 0..hps {
+                    let opp_local = sorted_ip[r] as usize;
+                    sorted_reach[r] = initial_reach_ip[opp_local];
+                }
+                let mut prefix = vec![0.0f32; hps];
+                let mut running = 0.0f32;
+                for i in 0..hps {
+                    prefix[i] = running;
+                    running += sorted_reach[i];
+                }
+                let total = running;
+
+                let win_reach = if rw < hps { prefix[rw] } else { total };
+                let prefix_next = if rn < hps { prefix[rn] } else { total };
+                let lose_reach = total - prefix_next;
+                let cfv_3k = win * win_reach + lose * lose_reach;
+
+                let diff = (cfv_n2 - cfv_3k).abs();
+                assert!(
+                    diff < 1e-5,
+                    "CFV mismatch at term={term_idx}, hand={h}: n2={cfv_n2}, 3k={cfv_3k}, diff={diff}"
+                );
             }
         }
     }

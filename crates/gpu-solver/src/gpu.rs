@@ -1122,6 +1122,141 @@ impl GpuContext {
         }
         Ok(())
     }
+
+    // ===== 3-kernel O(n) showdown evaluation =====
+
+    /// Kernel 1: Scatter opponent reach from natural order to strength-sorted order.
+    ///
+    /// One thread per (terminal, hand). Reads `opp_reach[node][global_hand]` and
+    /// writes it to `sorted_reach[term_idx][sorted_pos]` using the pre-sorted
+    /// index mapping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_scatter_opp_reach_sorted(
+        &self,
+        sorted_reach: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        sorted_indices: &CudaSlice<u32>,
+        num_sd_terminals: u32,
+        num_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/scatter_opp_reach_sorted.cu"),
+            "scatter_opp_reach_sorted",
+        )?;
+        let total = num_sd_terminals * num_hands;
+        let block_size = 256u32;
+        let grid_size = (total + block_size - 1) / block_size;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(sorted_reach)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(sorted_indices)
+                .arg(&num_sd_terminals)
+                .arg(&num_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Kernel 2: Segmented exclusive prefix sum on sorted reach values.
+    ///
+    /// One block (32 threads = 1 warp) per segment. Thread 0 performs a serial
+    /// exclusive prefix sum on shared memory. All threads cooperate on
+    /// global memory loads/stores.
+    pub fn launch_segmented_prefix_sum(
+        &self,
+        sorted_reach: &CudaSlice<f32>,
+        prefix_excl: &mut CudaSlice<f32>,
+        segment_totals: &mut CudaSlice<f32>,
+        num_segments: u32,
+        segment_len: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/segmented_prefix_sum.cu"),
+            "segmented_prefix_sum",
+        )?;
+        let block_size = 32u32; // one warp for high occupancy
+        let shared_mem = segment_len * std::mem::size_of::<f32>() as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (num_segments, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: shared_mem,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(sorted_reach)
+                .arg(prefix_excl)
+                .arg(segment_totals)
+                .arg(&num_segments)
+                .arg(&segment_len)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Kernel 3: Look up prefix sums by rank and compute showdown CFV.
+    ///
+    /// One thread per (terminal, hand). Uses precomputed exclusive prefix sums
+    /// and segment totals to compute win/lose reach in O(1) per hand.
+    ///
+    /// `rank_win[h]`: # of opponent hands with strength < traverser's strength at h.
+    /// `rank_next[h]`: # of opponent hands with strength <= traverser's strength at h.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_showdown_lookup_cfv(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        prefix_excl: &CudaSlice<f32>,
+        segment_totals: &CudaSlice<f32>,
+        amount_win: &CudaSlice<f32>,
+        amount_lose: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        rank_win: &CudaSlice<u32>,
+        rank_next: &CudaSlice<u32>,
+        num_sd_terminals: u32,
+        num_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/showdown_lookup_cfv.cu"),
+            "showdown_lookup_cfv",
+        )?;
+        let total = num_sd_terminals * num_hands;
+        let block_size = 256u32;
+        let grid_size = (total + block_size - 1) / block_size;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(prefix_excl)
+                .arg(segment_totals)
+                .arg(amount_win)
+                .arg(amount_lose)
+                .arg(terminal_nodes)
+                .arg(rank_win)
+                .arg(rank_next)
+                .arg(&num_sd_terminals)
+                .arg(&num_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
