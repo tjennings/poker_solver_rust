@@ -15,7 +15,7 @@
 )]
 
 use std::cmp::Ordering;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
 
 use rand::Rng;
 
@@ -182,6 +182,85 @@ impl AllBuckets {
     }
 }
 
+/// Per-scenario-node EV accumulator for TUI display.
+///
+/// Each scenario node gets a `[player][169]` pair of sum/count arrays.
+/// Updated during MCCFR traversal when visiting tracked nodes.
+pub struct ScenarioEvTracker {
+    /// Node indices being tracked.
+    pub node_indices: Vec<u32>,
+    /// `ev_sum[scenario_idx][player][hand_index]` -- sum * 1000.
+    pub ev_sum: Vec<[[AtomicI64; 169]; 2]>,
+    /// `ev_count[scenario_idx][player][hand_index]`.
+    pub ev_count: Vec<[[AtomicU64; 169]; 2]>,
+}
+
+impl ScenarioEvTracker {
+    /// Create a new tracker for the given node indices.
+    #[must_use]
+    pub fn new(node_indices: Vec<u32>) -> Self {
+        let len = node_indices.len();
+        let ev_sum = (0..len)
+            .map(|_| [std::array::from_fn(|_| AtomicI64::new(0)), std::array::from_fn(|_| AtomicI64::new(0))])
+            .collect();
+        let ev_count = (0..len)
+            .map(|_| [std::array::from_fn(|_| AtomicU64::new(0)), std::array::from_fn(|_| AtomicU64::new(0))])
+            .collect();
+        Self {
+            node_indices,
+            ev_sum,
+            ev_count,
+        }
+    }
+
+    /// Reinitialize the tracker with new node indices.
+    pub fn set_nodes(&mut self, node_indices: Vec<u32>) {
+        *self = Self::new(node_indices);
+    }
+
+    /// Find the scenario index for a given node index (linear scan).
+    #[must_use]
+    pub fn find_scenario(&self, node_idx: u32) -> Option<usize> {
+        self.node_indices.iter().position(|&n| n == node_idx)
+    }
+
+    /// Accumulate an EV sample for a scenario node.
+    pub fn accumulate(&self, scenario_idx: usize, player: usize, hand_index: usize, ev: f64) {
+        self.ev_sum[scenario_idx][player][hand_index]
+            .fetch_add((ev * 1000.0) as i64, AtomicOrdering::Relaxed);
+        self.ev_count[scenario_idx][player][hand_index]
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Compute average EV per hand for a scenario and player.
+    #[must_use]
+    pub fn hand_ev_array(&self, scenario_idx: usize, player: usize) -> [f64; 169] {
+        std::array::from_fn(|i| {
+            let sum = self.ev_sum[scenario_idx][player][i].load(AtomicOrdering::Relaxed) as f64 / 1000.0;
+            let count = self.ev_count[scenario_idx][player][i].load(AtomicOrdering::Relaxed);
+            if count > 0 { sum / count as f64 } else { 0.0 }
+        })
+    }
+
+    /// Zero all accumulators.
+    pub fn reset(&self) {
+        for scenario in &self.ev_sum {
+            for player in scenario {
+                for v in player {
+                    v.store(0, AtomicOrdering::Relaxed);
+                }
+            }
+        }
+        for scenario in &self.ev_count {
+            for player in scenario {
+                for v in player {
+                    v.store(0, AtomicOrdering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
 /// Run one external-sampling MCCFR iteration for the given traverser.
 ///
 /// Returns the expected value for the traverser at the root (in BB
@@ -203,6 +282,7 @@ impl AllBuckets {
 /// * `rng` - Random number generator for opponent sampling
 /// * `rake_rate` - Fraction of pot taken as rake (0.0 = no rake)
 /// * `rake_cap` - Maximum rake in chip units (0.0 = no cap)
+/// * `ev_tracker` - Optional per-scenario EV tracker for TUI display
 #[allow(clippy::too_many_arguments)]
 pub fn traverse_external(
     tree: &GameTree,
@@ -215,6 +295,7 @@ pub fn traverse_external(
     rng: &mut impl Rng,
     rake_rate: f64,
     rake_cap: f64,
+    ev_tracker: Option<&ScenarioEvTracker>,
 ) -> (f64, PruneStats) {
     match &tree.nodes[node_idx as usize] {
         GameNode::Terminal { kind, invested, .. } => {
@@ -225,7 +306,7 @@ pub fn traverse_external(
             // Board cards are pre-dealt in the Deal; just recurse.
             traverse_external(
                 tree, storage, deal, traverser, *child, prune, prune_threshold, rng,
-                rake_rate, rake_cap,
+                rake_rate, rake_cap, ev_tracker,
             )
         }
 
@@ -256,6 +337,7 @@ pub fn traverse_external(
                     rng,
                     rake_rate,
                     rake_cap,
+                    ev_tracker,
                 )
             } else {
                 traverse_opponent(
@@ -272,6 +354,7 @@ pub fn traverse_external(
                     rng,
                     rake_rate,
                     rake_cap,
+                    ev_tracker,
                 )
             }
         }
@@ -355,6 +438,7 @@ fn traverse_traverser(
     rng: &mut impl Rng,
     rake_rate: f64,
     rake_cap: f64,
+    ev_tracker: Option<&ScenarioEvTracker>,
 ) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
@@ -380,7 +464,7 @@ fn traverse_traverser(
 
         let (child_ev, child_stats) = traverse_external(
             tree, storage, deal, traverser, child_idx, prune, prune_threshold, rng,
-            rake_rate, rake_cap,
+            rake_rate, rake_cap, ev_tracker,
         );
         action_values[a] = child_ev;
         node_value += strategy[a] * child_ev;
@@ -400,6 +484,17 @@ fn traverse_traverser(
     // Accumulate strategy sums (for computing the average strategy).
     for (a, &s) in strategy.iter().enumerate().take(num_actions) {
         storage.add_strategy_sum(node_idx, bucket, a, (s * 1000.0) as i64);
+    }
+
+    // Accumulate EV at tracked scenario nodes.
+    if let Some(tracker) = ev_tracker {
+        if let Some(scenario_idx) = tracker.find_scenario(node_idx) {
+            let hand_index = crate::hands::CanonicalHand::from_cards(
+                deal.deal.hole_cards[traverser as usize][0],
+                deal.deal.hole_cards[traverser as usize][1],
+            ).index();
+            tracker.accumulate(scenario_idx, traverser as usize, hand_index, node_value);
+        }
     }
 
     (node_value, stats)
@@ -422,6 +517,7 @@ fn traverse_opponent(
     rng: &mut impl Rng,
     rake_rate: f64,
     rake_cap: f64,
+    ev_tracker: Option<&ScenarioEvTracker>,
 ) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
@@ -441,7 +537,7 @@ fn traverse_opponent(
 
     traverse_external(
         tree, storage, deal, traverser, children[chosen], prune, prune_threshold, rng,
-        rake_rate, rake_cap,
+        rake_rate, rake_cap, ev_tracker,
     )
 }
 
@@ -461,6 +557,133 @@ mod tests {
     use super::*;
     use crate::blueprint_v2::game_tree::GameTree;
     use crate::blueprint_v2::storage::BlueprintStorage;
+
+    // --- ScenarioEvTracker tests ---
+
+    #[test]
+    fn scenario_tracker_new_empty() {
+        let tracker = ScenarioEvTracker::new(vec![]);
+        assert!(tracker.node_indices.is_empty());
+        assert!(tracker.ev_sum.is_empty());
+        assert!(tracker.ev_count.is_empty());
+    }
+
+    #[test]
+    fn scenario_tracker_new_with_nodes() {
+        let tracker = ScenarioEvTracker::new(vec![3, 7]);
+        assert_eq!(tracker.node_indices.len(), 2);
+        assert_eq!(tracker.ev_sum.len(), 2);
+        assert_eq!(tracker.ev_count.len(), 2);
+    }
+
+    #[test]
+    fn scenario_tracker_find_scenario() {
+        let tracker = ScenarioEvTracker::new(vec![3, 7, 12]);
+        assert_eq!(tracker.find_scenario(3), Some(0));
+        assert_eq!(tracker.find_scenario(7), Some(1));
+        assert_eq!(tracker.find_scenario(12), Some(2));
+        assert_eq!(tracker.find_scenario(99), None);
+    }
+
+    #[test]
+    fn scenario_tracker_accumulate_and_read() {
+        let tracker = ScenarioEvTracker::new(vec![5]);
+        tracker.accumulate(0, 0, 42, 2.5);
+        tracker.accumulate(0, 0, 42, 3.5);
+        let evs = tracker.hand_ev_array(0, 0);
+        assert!((evs[42] - 3.0).abs() < 1e-3, "expected avg 3.0, got {}", evs[42]);
+        // Unaccumulated hands should be 0.
+        assert!((evs[0] - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scenario_tracker_accumulate_both_players() {
+        let tracker = ScenarioEvTracker::new(vec![5]);
+        tracker.accumulate(0, 0, 10, 1.0);
+        tracker.accumulate(0, 1, 10, -1.0);
+        let evs_p0 = tracker.hand_ev_array(0, 0);
+        let evs_p1 = tracker.hand_ev_array(0, 1);
+        assert!((evs_p0[10] - 1.0).abs() < 1e-3);
+        assert!((evs_p1[10] - (-1.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn scenario_tracker_reset_zeroes_all() {
+        let tracker = ScenarioEvTracker::new(vec![5, 10]);
+        tracker.accumulate(0, 0, 0, 5.0);
+        tracker.accumulate(1, 1, 100, -3.0);
+        tracker.reset();
+        let evs0 = tracker.hand_ev_array(0, 0);
+        let evs1 = tracker.hand_ev_array(1, 1);
+        assert!((evs0[0] - 0.0).abs() < 1e-10);
+        assert!((evs1[100] - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scenario_tracker_set_nodes_reinitializes() {
+        let mut tracker = ScenarioEvTracker::new(vec![5]);
+        tracker.accumulate(0, 0, 42, 2.5);
+        tracker.set_nodes(vec![10, 20]);
+        assert_eq!(tracker.node_indices.len(), 2);
+        assert_eq!(tracker.ev_sum.len(), 2);
+        // Old data should be gone.
+        let evs = tracker.hand_ev_array(0, 0);
+        assert!((evs[42] - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scenario_tracker_hand_ev_array_no_samples() {
+        let tracker = ScenarioEvTracker::new(vec![5]);
+        let evs = tracker.hand_ev_array(0, 0);
+        for &v in &evs {
+            assert!((v - 0.0).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn traverse_with_tracker_accumulates_ev() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
+        let precomputed = make_precomputed(&buckets, make_deal());
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Track the root node.
+        let tracker = ScenarioEvTracker::new(vec![tree.root]);
+
+        for _ in 0..20 {
+            traverse_external(
+                &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
+                &mut rng, 0.0, 0.0, Some(&tracker),
+            );
+        }
+
+        // The root node is a decision node for player 0 (SB),
+        // so scenario EVs for player 0 should have samples.
+        let hand_idx = crate::hands::CanonicalHand::from_cards(
+            precomputed.deal.hole_cards[0][0],
+            precomputed.deal.hole_cards[0][1],
+        ).index();
+        let evs = tracker.hand_ev_array(0, 0);
+        let count = tracker.ev_count[0][0][hand_idx].load(Ordering::Relaxed);
+        assert!(count > 0, "should have accumulated samples for traverser hand");
+        assert!(evs[hand_idx].is_finite(), "EV should be finite");
+    }
+
+    #[test]
+    fn traverse_without_tracker_still_works() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
+        let precomputed = make_precomputed(&buckets, make_deal());
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let (ev, _stats) = traverse_external(
+            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
+            &mut rng, 0.0, 0.0, None,
+        );
+        assert!(ev.is_finite(), "EV should be finite without tracker");
+    }
     use crate::poker::{Card, Suit, Value};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
@@ -518,7 +741,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0,
+            0.0, 0.0, None,
         );
         assert!(ev.is_finite(), "EV should be finite, got {ev}");
     }
@@ -536,11 +759,11 @@ mod tests {
 
         let (ev0, _) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0,
+            0.0, 0.0, None,
         );
         let (ev1, _) = traverse_external(
             &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0,
+            0.0, 0.0, None,
         );
 
         assert!(ev0.is_finite());
@@ -562,7 +785,7 @@ mod tests {
 
         let (_ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0,
+            0.0, 0.0, None,
         );
 
         assert!(
@@ -584,7 +807,7 @@ mod tests {
 
         let (_ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0,
+            0.0, 0.0, None,
         );
 
         assert!(
@@ -608,11 +831,11 @@ mod tests {
         for _ in 0..50 {
             let _ = traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-                0.0, 0.0,
+                0.0, 0.0, None,
             );
             let _ = traverse_external(
                 &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
-                0.0, 0.0,
+                0.0, 0.0, None,
             );
         }
 
@@ -650,7 +873,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, true, -310_000_000, &mut rng,
-            0.0, 0.0,
+            0.0, 0.0, None,
         );
         assert!(ev.is_finite());
     }

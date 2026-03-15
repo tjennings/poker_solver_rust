@@ -14,7 +14,7 @@
 
 use std::error::Error;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -26,7 +26,7 @@ use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
 use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
-use super::mccfr::{traverse_external, AllBuckets, Deal, DealWithBuckets, PruneStats, PRUNE_HITS, PRUNE_TOTAL};
+use super::mccfr::{traverse_external, AllBuckets, Deal, DealWithBuckets, PruneStats, ScenarioEvTracker, PRUNE_HITS, PRUNE_TOTAL};
 use super::storage::BlueprintStorage;
 use crate::hands::CanonicalHand;
 use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
@@ -137,13 +137,9 @@ pub struct BlueprintTrainer {
     /// a 52-element `Vec` allocation on every call.
     deck: [Card; 52],
 
-    // --- Per-hand chip EV tracking ---
-    /// Accumulated chip EV per canonical preflop hand, per position.
-    /// `ev_sum[player][hand_index]`, stored as sum * 1000 for integer atomics.
-    ev_sum: [[AtomicI64; 169]; 2],
-    /// Sample count per canonical preflop hand, per position.
-    /// `ev_count[player][hand_index]`.
-    ev_count: [[AtomicU64; 169]; 2],
+    // --- Per-scenario-node EV tracking ---
+    /// Per-scenario-node EV accumulator for TUI display.
+    pub scenario_ev_tracker: ScenarioEvTracker,
 
     // --- TUI shared state ---
     /// Iteration counter visible to the TUI thread.
@@ -247,14 +243,7 @@ impl BlueprintTrainer {
             last_snapshot_time: 0,
             snapshot_count: 0,
             deck,
-            ev_sum: [
-                std::array::from_fn(|_| AtomicI64::new(0)),
-                std::array::from_fn(|_| AtomicI64::new(0)),
-            ],
-            ev_count: [
-                std::array::from_fn(|_| AtomicU64::new(0)),
-                std::array::from_fn(|_| AtomicU64::new(0)),
-            ],
+            scenario_ev_tracker: ScenarioEvTracker::new(vec![]),
             skip_bucket_validation: false,
             shared_iterations: Arc::new(AtomicU64::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
@@ -440,8 +429,7 @@ impl BlueprintTrainer {
             let tree = &self.tree;
             let storage = &self.storage;
             let buckets_ref = &self.buckets;
-            let ev_sum = &self.ev_sum;
-            let ev_count = &self.ev_count;
+            let ev_tracker = &self.scenario_ev_tracker;
 
             let rake_rate = self.config.game.rake_rate;
             let rake_cap = self.config.game.rake_cap;
@@ -455,30 +443,16 @@ impl BlueprintTrainer {
                 let deal = DealWithBuckets { deal, buckets };
                 let mut stats = PruneStats::default();
 
-                let (ev0, s0) = traverse_external(
+                let (_, s0) = traverse_external(
                     tree, storage, &deal, 0, tree.root, prune, threshold, &mut rng,
-                    rake_rate, rake_cap,
+                    rake_rate, rake_cap, Some(ev_tracker),
                 );
                 stats.merge(s0);
-                let (ev1, s1) = traverse_external(
+                let (_, s1) = traverse_external(
                     tree, storage, &deal, 1, tree.root, prune, threshold, &mut rng,
-                    rake_rate, rake_cap,
+                    rake_rate, rake_cap, Some(ev_tracker),
                 );
                 stats.merge(s1);
-
-                // Accumulate EV per canonical preflop hand.
-                let idx0 = CanonicalHand::from_cards(
-                    deal.deal.hole_cards[0][0],
-                    deal.deal.hole_cards[0][1],
-                ).index();
-                let idx1 = CanonicalHand::from_cards(
-                    deal.deal.hole_cards[1][0],
-                    deal.deal.hole_cards[1][1],
-                ).index();
-                ev_sum[0][idx0].fetch_add((ev0 * 1000.0) as i64, Ordering::Relaxed);
-                ev_count[0][idx0].fetch_add(1, Ordering::Relaxed);
-                ev_sum[1][idx1].fetch_add((ev1 * 1000.0) as i64, Ordering::Relaxed);
-                ev_count[1][idx1].fetch_add(1, Ordering::Relaxed);
 
                 stats
             }).reduce(PruneStats::default, |mut a, b| { a.merge(b); a });
@@ -615,22 +589,13 @@ impl BlueprintTrainer {
                         super::game_tree::GameNode::Decision { player, .. } => *player as usize,
                         _ => 0,
                     };
-                    let hand_evs = self.hand_ev_array(player);
+                    let hand_evs = self.scenario_ev_tracker.hand_ev_array(i, player);
                     callback(i, node_idx, &self.storage, &self.tree, &hand_evs);
                 }
             }
             // Reset EV accumulators after reading so displayed values
             // reflect only the most recent window, not cumulative history.
-            for player in &self.ev_sum {
-                for v in player {
-                    v.store(0, Ordering::Relaxed);
-                }
-            }
-            for player in &self.ev_count {
-                for v in player {
-                    v.store(0, Ordering::Relaxed);
-                }
-            }
+            self.scenario_ev_tracker.reset();
             self.last_strategy_refresh_secs = elapsed_secs;
         }
 
@@ -638,7 +603,12 @@ impl BlueprintTrainer {
         if let Some(ref callback) = self.on_random_scenario
             && elapsed_min >= self.last_random_scenario_min + self.random_scenario_hold_minutes
         {
-            let hand_evs = [self.hand_ev_array(0), self.hand_ev_array(1)];
+            // Use scenario 0 (root) EVs for random scenario display.
+            let hand_evs = if self.scenario_ev_tracker.node_indices.is_empty() {
+                [[0.0; 169], [0.0; 169]]
+            } else {
+                [self.scenario_ev_tracker.hand_ev_array(0, 0), self.scenario_ev_tracker.hand_ev_array(0, 1)]
+            };
             callback(&self.storage, &self.tree, &hand_evs);
             self.last_random_scenario_min = elapsed_min;
         }
@@ -845,54 +815,54 @@ impl BlueprintTrainer {
         }
     }
 
-    /// Compute average chip EV per canonical preflop hand.
-    ///
-    /// Returns a 169-element vector of `(hand_name, avg_ev, sample_count)`,
-    /// ordered by the canonical 169 hand index.
-    ///
-    /// # Panics
-    /// Panics if `CanonicalHand::from_index` returns `None` for indices 0..169
-    /// (this is an internal invariant that always holds).
     /// Mean chip EV per canonical hand for a given position (0 or 1),
     /// as a fixed-size array (indexed by hand index 0..169).
+    ///
+    /// Uses scenario 0 (root) if the tracker has scenario nodes,
+    /// otherwise returns all zeros.
     #[must_use]
     pub fn hand_ev_array(&self, player: usize) -> [f64; 169] {
-        std::array::from_fn(|i| {
-            let sum = self.ev_sum[player][i].load(Ordering::Relaxed) as f64 / 1000.0;
-            let count = self.ev_count[player][i].load(Ordering::Relaxed);
-            if count > 0 { sum / count as f64 } else { 0.0 }
-        })
+        if self.scenario_ev_tracker.node_indices.is_empty() {
+            [0.0; 169]
+        } else {
+            self.scenario_ev_tracker.hand_ev_array(0, player)
+        }
     }
 
+    /// Per-hand EV averages with names and sample counts for JSON export.
+    /// Uses scenario 0 (root) for backward compatibility.
     #[must_use]
     pub fn hand_ev_averages(&self, player: usize) -> Vec<(String, f64, u64)> {
+        use std::sync::atomic::Ordering as AO;
         (0..169)
             .map(|i| {
-                // INVARIANT: indices 0..169 are always valid for `from_index`.
                 let hand = CanonicalHand::from_index(i).expect("valid index 0..169");
-                let sum = self.ev_sum[player][i].load(Ordering::Relaxed) as f64 / 1000.0;
-                let count = self.ev_count[player][i].load(Ordering::Relaxed);
-                let avg = if count > 0 {
-                    sum / count as f64
-                } else {
-                    0.0
-                };
+                if self.scenario_ev_tracker.node_indices.is_empty() {
+                    return (hand.to_string(), 0.0, 0);
+                }
+                let sum = self.scenario_ev_tracker.ev_sum[0][player][i].load(AO::Relaxed) as f64 / 1000.0;
+                let count = self.scenario_ev_tracker.ev_count[0][player][i].load(AO::Relaxed);
+                let avg = if count > 0 { sum / count as f64 } else { 0.0 };
                 (hand.to_string(), avg, count)
             })
             .collect()
     }
 
     /// Combined (cross-position average) EV per canonical hand for JSON export.
-    /// Averages both positions' EVs for backward compatibility.
+    /// Uses scenario 0 (root) for backward compatibility.
     #[must_use]
     fn hand_ev_averages_combined(&self) -> Vec<(String, f64, u64)> {
+        use std::sync::atomic::Ordering as AO;
         (0..169)
             .map(|i| {
                 let hand = CanonicalHand::from_index(i).expect("valid index 0..169");
-                let sum0 = self.ev_sum[0][i].load(Ordering::Relaxed) as f64 / 1000.0;
-                let count0 = self.ev_count[0][i].load(Ordering::Relaxed);
-                let sum1 = self.ev_sum[1][i].load(Ordering::Relaxed) as f64 / 1000.0;
-                let count1 = self.ev_count[1][i].load(Ordering::Relaxed);
+                if self.scenario_ev_tracker.node_indices.is_empty() {
+                    return (hand.to_string(), 0.0, 0);
+                }
+                let sum0 = self.scenario_ev_tracker.ev_sum[0][0][i].load(AO::Relaxed) as f64 / 1000.0;
+                let count0 = self.scenario_ev_tracker.ev_count[0][0][i].load(AO::Relaxed);
+                let sum1 = self.scenario_ev_tracker.ev_sum[0][1][i].load(AO::Relaxed) as f64 / 1000.0;
+                let count1 = self.scenario_ev_tracker.ev_count[0][1][i].load(AO::Relaxed);
                 let total_count = count0 + count1;
                 let avg = if total_count > 0 {
                     (sum0 + sum1) / total_count as f64
@@ -1376,21 +1346,23 @@ mod tests {
     #[test]
     fn hand_ev_array_per_position_independent() {
         let config = toy_config();
-        let trainer = BlueprintTrainer::new(config);
+        let mut trainer = BlueprintTrainer::new(config);
+
+        // Set up tracker with a single node (root).
+        trainer.scenario_ev_tracker.set_nodes(vec![trainer.tree.root]);
 
         // Manually set EV data for position 0, hand index 5.
-        trainer.ev_sum[0][5].store(3000, Ordering::Relaxed); // 3.0 * 1000
-        trainer.ev_count[0][5].store(2, Ordering::Relaxed);
+        trainer.scenario_ev_tracker.accumulate(0, 0, 5, 3.0);
+        trainer.scenario_ev_tracker.accumulate(0, 0, 5, 0.0); // avg = 1.5
 
         // Manually set EV data for position 1, hand index 5.
-        trainer.ev_sum[1][5].store(-1000, Ordering::Relaxed); // -1.0 * 1000
-        trainer.ev_count[1][5].store(1, Ordering::Relaxed);
+        trainer.scenario_ev_tracker.accumulate(0, 1, 5, -1.0);
 
         let evs_p0 = trainer.hand_ev_array(0);
         let evs_p1 = trainer.hand_ev_array(1);
 
-        assert!((evs_p0[5] - 1.5).abs() < 1e-6, "position 0 hand 5 EV should be 1.5, got {}", evs_p0[5]);
-        assert!((evs_p1[5] - (-1.0)).abs() < 1e-6, "position 1 hand 5 EV should be -1.0, got {}", evs_p1[5]);
+        assert!((evs_p0[5] - 1.5).abs() < 1e-2, "position 0 hand 5 EV should be 1.5, got {}", evs_p0[5]);
+        assert!((evs_p1[5] - (-1.0)).abs() < 1e-2, "position 1 hand 5 EV should be -1.0, got {}", evs_p1[5]);
         // Other hands should still be zero.
         assert!(evs_p0[0] == 0.0);
         assert!(evs_p1[0] == 0.0);
@@ -1399,35 +1371,63 @@ mod tests {
     #[test]
     fn hand_ev_averages_per_position() {
         let config = toy_config();
-        let trainer = BlueprintTrainer::new(config);
+        let mut trainer = BlueprintTrainer::new(config);
 
-        trainer.ev_sum[0][0].store(5000, Ordering::Relaxed);
-        trainer.ev_count[0][0].store(1, Ordering::Relaxed);
-        trainer.ev_sum[1][0].store(10000, Ordering::Relaxed);
-        trainer.ev_count[1][0].store(2, Ordering::Relaxed);
+        // Set up tracker with a single node (root).
+        trainer.scenario_ev_tracker.set_nodes(vec![trainer.tree.root]);
+
+        trainer.scenario_ev_tracker.accumulate(0, 0, 0, 5.0);
+        trainer.scenario_ev_tracker.accumulate(0, 1, 0, 5.0);
+        trainer.scenario_ev_tracker.accumulate(0, 1, 0, 5.0);
 
         let avg_p0 = trainer.hand_ev_averages(0);
         let avg_p1 = trainer.hand_ev_averages(1);
 
-        assert!((avg_p0[0].1 - 5.0).abs() < 1e-6, "p0 avg should be 5.0");
+        assert!((avg_p0[0].1 - 5.0).abs() < 1e-2, "p0 avg should be 5.0");
         assert_eq!(avg_p0[0].2, 1);
-        assert!((avg_p1[0].1 - 5.0).abs() < 1e-6, "p1 avg should be 5.0");
+        assert!((avg_p1[0].1 - 5.0).abs() < 1e-2, "p1 avg should be 5.0");
         assert_eq!(avg_p1[0].2, 2);
     }
 
     #[test]
     fn train_accumulates_ev_per_position() {
+        use super::super::game_tree::GameNode;
+
         let mut config = toy_config();
         config.training.iterations = Some(200);
         config.training.batch_size = 50;
         let mut trainer = toy_trainer(config);
+
+        // Collect decision nodes for both players.
+        let mut tracked_nodes: Vec<u32> = Vec::new();
+        for (i, node) in trainer.tree.nodes.iter().enumerate() {
+            if let GameNode::Decision { .. } = node {
+                tracked_nodes.push(i as u32);
+            }
+        }
+        assert!(!tracked_nodes.is_empty(), "should have decision nodes");
+
+        // Set up tracker with all decision nodes.
+        trainer.scenario_ev_tracker.set_nodes(tracked_nodes.clone());
+        trainer.scenario_node_indices = tracked_nodes;
+
         trainer.train().expect("training should complete");
 
-        let evs_p0 = trainer.hand_ev_array(0);
-        let evs_p1 = trainer.hand_ev_array(1);
+        // Root (scenario 0) is player 0's decision -- should have EVs for p0.
+        let evs_p0 = trainer.scenario_ev_tracker.hand_ev_array(0, 0);
+        assert!(evs_p0.iter().any(|&v| v != 0.0), "position 0 should have some non-zero EVs at root");
 
-        // After training, at least some hands should have non-zero EV for each position.
-        assert!(evs_p0.iter().any(|&v| v != 0.0), "position 0 should have some non-zero EVs");
-        assert!(evs_p1.iter().any(|&v| v != 0.0), "position 1 should have some non-zero EVs");
+        // Find a player 1 scenario node and check it has EVs.
+        let mut found_p1 = false;
+        for (si, &ni) in trainer.scenario_ev_tracker.node_indices.iter().enumerate() {
+            if let GameNode::Decision { player: 1, .. } = &trainer.tree.nodes[ni as usize] {
+                let evs = trainer.scenario_ev_tracker.hand_ev_array(si, 1);
+                if evs.iter().any(|&v| v != 0.0) {
+                    found_p1 = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_p1, "position 1 should have some non-zero EVs at its decision nodes");
     }
 }

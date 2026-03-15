@@ -232,6 +232,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // Wire strategy refresh callback from trainer to TUI metrics.
                 let scenarios_node_indices: Vec<u32> =
                     scenarios.iter().map(|s| s.node_idx).collect();
+                trainer.scenario_ev_tracker.set_nodes(scenarios_node_indices.clone());
                 trainer.scenario_node_indices = scenarios_node_indices;
                 trainer.strategy_refresh_interval_secs =
                     tui_config.telemetry.strategy_delta_interval_seconds;
