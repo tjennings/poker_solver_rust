@@ -7,6 +7,7 @@
 pub mod builder;
 pub mod hand_eval;
 pub mod reservoir;
+pub mod sampler;
 
 #[cfg(feature = "training")]
 pub mod trainer;

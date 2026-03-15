@@ -2,7 +2,7 @@
 //!
 //! Orchestrates the full sample -> solve -> insert -> train loop:
 //!
-//! 1. **Sample**: Generate random river situations on GPU (or CPU fallback)
+//! 1. **Sample**: Generate random river situations on GPU via `GpuSampler`
 //! 2. **Solve**: Batch-solve all situations on GPU using DCFR+
 //! 3. **Insert**: Encode and insert solved CFVs into GPU reservoir
 //! 4. **Train**: Sample mini-batches from reservoir and train the CFVNet
@@ -25,6 +25,8 @@ use crate::gpu::GpuContext;
 use crate::training::builder::GpuBatchBuilder;
 #[cfg(feature = "training")]
 use crate::training::reservoir::GpuReservoir;
+#[cfg(feature = "training")]
+use crate::training::sampler::GpuSampler;
 #[cfg(feature = "training")]
 use crate::training::trainer::GpuTrainer;
 #[cfg(feature = "training")]
@@ -106,7 +108,9 @@ impl Default for RiverTrainingConfig {
 /// Produces `batch_size` random river boards with uniform ranges.
 /// Board cards are sampled uniformly without replacement from 0..52.
 /// Ranges are set to 1.0 for unblocked combos, 0.0 for blocked.
-#[cfg(feature = "training")]
+///
+/// **Deprecated**: Use `GpuSampler` instead for zero-copy GPU-native sampling.
+#[cfg(all(test, feature = "training"))]
 fn sample_situations_cpu(
     batch_size: usize,
     rng: &mut impl rand::Rng,
@@ -147,18 +151,29 @@ fn sample_situations_cpu(
     (boards, ranges_oop, ranges_ip)
 }
 
+/// Per-batch timing accumulator for performance reporting.
+#[cfg(feature = "training")]
+struct PhaseTiming {
+    sample_ms: f64,
+    build_ms: f64,
+    solve_ms: f64,
+    insert_ms: f64,
+    train_ms: f64,
+}
+
 /// Run the full GPU river CFVNet training pipeline.
 ///
 /// This is the main entry point for Supremus-style training:
 /// sample -> batch-solve -> reservoir insert -> train -> validate -> checkpoint.
+///
+/// All hot-loop phases (sample, build, solve, insert, train) operate on
+/// GPU-resident data with no CPU-GPU transfers. Per-phase timing is printed
+/// at each validation interval.
 #[cfg(feature = "training")]
 pub fn train_river_cfvnet<B: AutodiffBackend>(
     config: &RiverTrainingConfig,
     device: &B::Device,
 ) -> Result<(), String> {
-    use rand::SeedableRng;
-    use rand_chacha::ChaCha8Rng;
-
     let gpu = GpuContext::new(0).map_err(|e| format!("CUDA init: {e}"))?;
 
     // Initialize components
@@ -175,6 +190,15 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
         config.aux_loss_weight,
     );
 
+    // Initialize GPU sampler (replaces CPU sampling + upload)
+    let mut sampler = GpuSampler::new(&gpu, config.batch_size, config.seed + 3_000_000)?;
+
+    // Pre-allocate pot/stack GPU buffers (constant across all batches)
+    let pots = vec![config.ref_pot as f32; config.batch_size];
+    let stacks = vec![config.ref_stack as f32; config.batch_size];
+    let gpu_pots = gpu.upload(&pots).map_err(|e| format!("upload pots: {e}"))?;
+    let gpu_stacks = gpu.upload(&stacks).map_err(|e| format!("upload stacks: {e}"))?;
+
     // Pre-compute ground-truth validation set
     eprintln!("Pre-computing ground-truth validation set ({} positions x {} iters)...",
         config.gt_validation_positions, config.gt_solve_iterations);
@@ -184,11 +208,20 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
         config.seed + 1_000_000,
     );
 
-    let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
     let mut total_samples = 0u64;
     let mut last_loss = f32::MAX;
     let mut sample_seed = config.seed + 2_000_000;
     let start = Instant::now();
+
+    // Accumulate per-phase timing for the current validation interval
+    let mut timing_accum = PhaseTiming {
+        sample_ms: 0.0,
+        build_ms: 0.0,
+        solve_ms: 0.0,
+        insert_ms: 0.0,
+        train_ms: 0.0,
+    };
+    let mut batches_since_report = 0u64;
 
     // Create output directory
     std::fs::create_dir_all(&config.output_dir)
@@ -201,53 +234,47 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
     eprintln!("  Model: {} layers x {} hidden", config.hidden_layers, config.hidden_size);
     eprintln!("  Train batch: {} x {} steps/batch", config.train_batch_size, config.train_steps_per_batch);
     eprintln!("  Learning rate: {}", config.learning_rate);
+    eprintln!("  Sampling: GPU-native (GpuSampler)");
+    eprintln!("  Pot/stack buffers: pre-allocated (ref_pot={}, ref_stack={})", config.ref_pot, config.ref_stack);
     eprintln!("  Output: {}", config.output_dir.display());
     eprintln!();
 
     while total_samples < config.num_samples {
-        // === SAMPLE PHASE (CPU for now, GPU sampler can replace later) ===
-        let (boards, ranges_oop, ranges_ip) = sample_situations_cpu(
-            config.batch_size,
-            &mut rng,
-        );
+        // === SAMPLE PHASE (GPU) ===
+        let t0 = Instant::now();
+        sampler.sample(&gpu)?;
+        let t1 = Instant::now();
 
-        // Upload to GPU
-        let gpu_boards = gpu.upload(&boards).map_err(|e| format!("upload boards: {e}"))?;
-        let gpu_ranges_oop = gpu.upload(&ranges_oop).map_err(|e| format!("upload oop: {e}"))?;
-        let gpu_ranges_ip = gpu.upload(&ranges_ip).map_err(|e| format!("upload ip: {e}"))?;
-
-        // === SOLVE PHASE (GPU) ===
+        // === BUILD SOLVER PHASE (GPU) ===
         let mut batch_solver = builder.build_from_gpu_data(
             &gpu,
-            &gpu_boards,
-            &gpu_ranges_oop,
-            &gpu_ranges_ip,
+            sampler.boards(),
+            sampler.ranges_oop(),
+            sampler.ranges_ip(),
             config.batch_size,
         )?;
+        let t2 = Instant::now();
 
+        // === SOLVE PHASE (GPU) ===
         let solve_result = batch_solver.solve_with_cfvs(
             config.solve_iterations,
             None,
         )?;
+        let t3 = Instant::now();
 
         // === INSERT PHASE (GPU) ===
-        // Build pots/stacks buffers (uniform for all spots)
-        let pots = vec![config.ref_pot as f32; config.batch_size];
-        let stacks = vec![config.ref_stack as f32; config.batch_size];
-        let gpu_pots = gpu.upload(&pots).map_err(|e| format!("upload pots: {e}"))?;
-        let gpu_stacks = gpu.upload(&stacks).map_err(|e| format!("upload stacks: {e}"))?;
-
         reservoir.insert_batch_gpu(
             &gpu,
-            &gpu_ranges_oop,
-            &gpu_ranges_ip,
-            &gpu_boards,
+            sampler.ranges_oop(),
+            sampler.ranges_ip(),
+            sampler.boards(),
             &gpu_pots,
             &gpu_stacks,
             &solve_result.cfvs_oop,
             &solve_result.cfvs_ip,
             config.batch_size,
         ).map_err(|e| format!("reservoir insert: {e}"))?;
+        let t4 = Instant::now();
 
         total_samples += (config.batch_size as u64) * 2; // 2 records per spot
 
@@ -264,6 +291,15 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
                 last_loss = trainer.train_step(&gpu, &batch)?;
             }
         }
+        let t5 = Instant::now();
+
+        // Accumulate timing
+        timing_accum.sample_ms += (t1 - t0).as_secs_f64() * 1000.0;
+        timing_accum.build_ms += (t2 - t1).as_secs_f64() * 1000.0;
+        timing_accum.solve_ms += (t3 - t2).as_secs_f64() * 1000.0;
+        timing_accum.insert_ms += (t4 - t3).as_secs_f64() * 1000.0;
+        timing_accum.train_ms += (t5 - t4).as_secs_f64() * 1000.0;
+        batches_since_report += 1;
 
         // === VALIDATION (periodic) ===
         if total_samples % config.validation_interval < (config.batch_size as u64 * 2) {
@@ -290,6 +326,30 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
                 "[{:>12} samples] loss={:.6} val={:.6} gt_rmse={:.6} rate={:.0} samples/s  reservoir={}",
                 total_samples, last_loss, val_loss, gt_rmse, rate, reservoir.size()
             );
+
+            // Print per-phase timing breakdown (averaged over batches since last report)
+            if batches_since_report > 0 {
+                let n = batches_since_report as f64;
+                eprintln!(
+                    "  timing: sample={:.1}ms build={:.1}ms solve={:.1}ms insert={:.1}ms train={:.1}ms  ({} batches avg)",
+                    timing_accum.sample_ms / n,
+                    timing_accum.build_ms / n,
+                    timing_accum.solve_ms / n,
+                    timing_accum.insert_ms / n,
+                    timing_accum.train_ms / n,
+                    batches_since_report,
+                );
+            }
+
+            // Reset accumulator
+            timing_accum = PhaseTiming {
+                sample_ms: 0.0,
+                build_ms: 0.0,
+                solve_ms: 0.0,
+                insert_ms: 0.0,
+                train_ms: 0.0,
+            };
+            batches_since_report = 0;
         }
 
         // === CHECKPOINT (periodic) ===
