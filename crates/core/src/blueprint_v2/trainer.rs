@@ -26,7 +26,6 @@ use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
 use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
-use super::equity_cache::EquityDeltaCache;
 use super::mccfr::{traverse_external, AllBuckets, Deal, DealWithBuckets, PruneStats, PRUNE_HITS, PRUNE_TOTAL};
 use super::storage::BlueprintStorage;
 use crate::hands::CanonicalHand;
@@ -225,13 +224,7 @@ impl BlueprintTrainer {
             Some(path) => load_bucket_files(Path::new(path)),
             None => [None, None, None, None],
         };
-        let street_configs = [
-            &config.clustering.preflop,
-            &config.clustering.flop,
-            &config.clustering.turn,
-            &config.clustering.river,
-        ];
-        let buckets = AllBuckets::new(bucket_counts, bucket_files, street_configs);
+        let buckets = AllBuckets::new(bucket_counts, bucket_files);
         let rng = StdRng::seed_from_u64(config.clustering.seed);
 
         let deck = *CANONICAL_DECK;
@@ -400,51 +393,6 @@ impl BlueprintTrainer {
             )
             .into());
         }
-        }
-
-        // Load or generate equity+delta cache when expected_delta is enabled.
-        let needs_cache = (self.config.clustering.flop.expected_delta
-            && self.config.clustering.flop.delta_bins.is_some())
-            || (self.config.clustering.turn.expected_delta
-                && self.config.clustering.turn.delta_bins.is_some());
-
-        if needs_cache {
-            if let Some(cache_path) = &self.config.training.equity_cache_path {
-                let path = Path::new(cache_path);
-                let cache = if path.exists() {
-                    if !self.tui_active {
-                        eprintln!("Loading equity+delta cache from {}", path.display());
-                    }
-                    EquityDeltaCache::load(path)?
-                } else {
-                    if !self.tui_active {
-                        eprintln!("Generating equity+delta cache (this may take several minutes)...");
-                    }
-                    let cache = EquityDeltaCache::generate(|street, frac| {
-                        if !self.tui_active {
-                            eprint!("\r  {street}: {:.1}%", frac * 100.0);
-                        }
-                    });
-                    if !self.tui_active {
-                        eprintln!();
-                    }
-                    // Ensure parent directory exists and save.
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    cache.save(path)?;
-                    if !self.tui_active {
-                        eprintln!(
-                            "Saved equity+delta cache to {} (turn: {} entries, flop: {} entries)",
-                            path.display(),
-                            cache.turn_entries(),
-                            cache.flop_entries(),
-                        );
-                    }
-                    cache
-                };
-                self.buckets.set_equity_cache(Arc::new(cache));
-            }
         }
 
         let batch_size = self.config.training.batch_size;
