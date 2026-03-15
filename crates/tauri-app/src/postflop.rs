@@ -898,6 +898,7 @@ fn build_game(
         add_allin_threshold: 1.5,
         force_allin_threshold: 0.15,
         merging_threshold: 0.1,
+        depth_limit: None,
     };
 
     let action_tree =

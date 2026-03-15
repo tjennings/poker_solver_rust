@@ -8,18 +8,18 @@ game:
 
 clustering:
   algorithm: potential_aware_emd
-  cfvnet_river_data: ./local_data/cfvnet/river/v1
+  # cfvnet_river_data: ./local_data/cfvnet/river/v1
   preflop:
     buckets: 169
   flop:
     buckets: 500
-    # sample_boards: 2000  # default
+    #sample_boards: 2000  # default
   turn:
     buckets: 500
     sample_boards: 3000
   river:
     buckets: 500
-    # cfvnet uses all ~3.1M records (no sampling)
+    sample_boards: 500000  # default
 
 action_abstraction:
   preflop:
@@ -40,11 +40,11 @@ action_abstraction:
     - [2.0]
 
 training:
-  cluster_path: "./local_data/clusters_500bkt"
+  cluster_path: "./local_data/clusters_500bkt_samples"
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 5000000
   prune_after_iterations: 5000000
-  prune_threshold: -200000
+  prune_threshold: 0
   lcfr_discount_interval: 1000000
   batch_size: 2000
 
@@ -52,7 +52,7 @@ snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/500bkt/snapsot"
+  output_dir: "./local_data/blueprints/500bkt_samples/snap"
 
 tui:
   enabled: true
@@ -67,6 +67,9 @@ tui:
     - name: "BB vs 2.5x"
       player: BB
       actions: ["raise-0"]
+    - name: "SB vs 3-bet"
+      player: BB
+      actions: ["raise-0", "raise-1"]
     - name: "SB Cbet K72"
       player: SB
       actions: ["raise-0", "call"]

@@ -301,6 +301,61 @@ impl PostFlopGame {
 }
 
 // ---------------------------------------------------------------------------
+// Depth boundary API
+// ---------------------------------------------------------------------------
+
+impl PostFlopGame {
+    /// Returns the number of depth boundary terminals in the tree.
+    ///
+    /// Each boundary terminal needs CFVs set via [`set_boundary_cfvs`]
+    /// before solving.
+    #[inline]
+    pub fn num_boundary_nodes(&self) -> usize {
+        // boundary_cfvs has 2 entries per boundary node (one per player)
+        self.boundary_cfvs.len() / 2
+    }
+
+    /// Returns the node arena indices of all depth boundary terminals,
+    /// ordered by their boundary ordinal.
+    pub fn boundary_node_indices(&self) -> Vec<usize> {
+        let n = self.num_boundary_nodes();
+        let mut result = vec![0usize; n];
+        for (idx, &ordinal) in self.node_to_boundary.iter().enumerate() {
+            if ordinal != u32::MAX {
+                result[ordinal as usize] = idx;
+            }
+        }
+        result
+    }
+
+    /// Sets the counterfactual values for a depth boundary terminal.
+    ///
+    /// `ordinal` identifies the boundary node (0-based, in tree traversal
+    /// order). `player` is the player whose CFVs are being set (0 = OOP,
+    /// 1 = IP). `cfvs` must have one entry per private hand for `player`.
+    ///
+    /// CFVs should be in pot-normalised units: a value of 1.0 means the
+    /// player wins 1× the half-pot from that point forward.
+    pub fn set_boundary_cfvs(&mut self, ordinal: usize, player: usize, cfvs: Vec<f32>) {
+        let idx = ordinal * 2 + player;
+        if idx >= self.boundary_cfvs.len() {
+            self.boundary_cfvs.resize(idx + 1, Vec::new());
+        }
+        self.boundary_cfvs[idx] = cfvs;
+    }
+
+    /// Returns the pot size at a given depth boundary node.
+    ///
+    /// Useful for callers that need to convert pot-normalised CFVs back to
+    /// chip values.
+    pub fn boundary_pot(&self, ordinal: usize) -> i32 {
+        let indices = self.boundary_node_indices();
+        let node = self.node_arena[indices[ordinal]].lock();
+        self.tree_config.starting_pot + 2 * node.amount
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Card config validation
 // ---------------------------------------------------------------------------
 
@@ -498,7 +553,10 @@ impl PostFlopGame {
             _ => (0, 1),
         };
 
-        let num_action_nodes = count_num_action_nodes(&self.action_root.lock());
+        let num_action_nodes = count_num_action_nodes(
+            &self.action_root.lock(),
+            self.tree_config.initial_state,
+        );
 
         [
             num_action_nodes[0],
@@ -547,6 +605,21 @@ impl PostFlopGame {
         self.num_storage = info.num_storage;
         self.num_storage_ip = info.num_storage_ip;
         self.num_storage_chance = info.num_storage_chance;
+
+        // Build the boundary ordinal map by scanning the arena for depth
+        // boundary terminals. Ordinals are assigned in arena order, which
+        // matches the DFS traversal order used during tree construction.
+        self.node_to_boundary = vec![u32::MAX; total_num_nodes as usize];
+        let mut boundary_count = 0u32;
+        for (idx, node_mutex) in self.node_arena.iter().enumerate() {
+            if node_mutex.lock().is_depth_boundary() {
+                self.node_to_boundary[idx] = boundary_count;
+                boundary_count += 1;
+            }
+        }
+        // 2 slots per boundary node: one for each player.
+        self.boundary_cfvs = vec![Vec::new(); boundary_count as usize * 2];
+
         self.misc_memory_usage = self.memory_usage_internal();
 
         Ok(())
@@ -1122,5 +1195,139 @@ mod tests {
 
         let root = game.root();
         assert_eq!(game.node_index(&root), 0);
+    }
+
+    #[test]
+    fn test_build_turn_game_with_depth_limit() {
+        let oop_range: crate::range::Range = "AA,KK,QQ".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ,JJ,TT".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: NOT_DEALT,
+        };
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 200,
+            turn_bet_sizes: simple_bet_sizes(),
+            river_bet_sizes: simple_bet_sizes(),
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
+
+        // Should have boundary nodes
+        assert!(game.num_boundary_nodes() > 0, "depth-limited tree should have boundary nodes");
+
+        // Should be able to allocate memory
+        game.allocate_memory(false);
+        assert_eq!(game.state, State::MemoryAllocated);
+
+        // Private hands should be populated
+        assert!(game.num_private_hands(0) > 0);
+        assert!(game.num_private_hands(1) > 0);
+    }
+
+    #[test]
+    fn test_boundary_node_indices() {
+        let oop_range: crate::range::Range = "AA,KK,QQ".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ,JJ,TT".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: NOT_DEALT,
+        };
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 200,
+            turn_bet_sizes: simple_bet_sizes(),
+            river_bet_sizes: simple_bet_sizes(),
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let game = PostFlopGame::with_config(card_config, tree).unwrap();
+
+        let indices = game.boundary_node_indices();
+        assert_eq!(indices.len(), game.num_boundary_nodes());
+
+        // Each boundary index should point to a depth boundary node
+        for &idx in &indices {
+            let node = game.node_arena[idx].lock();
+            assert!(node.is_depth_boundary());
+            assert!(node.is_terminal());
+        }
+    }
+
+    #[test]
+    fn test_set_boundary_cfvs() {
+        let oop_range: crate::range::Range = "AA,KK,QQ".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ,JJ,TT".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: NOT_DEALT,
+        };
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 200,
+            turn_bet_sizes: simple_bet_sizes(),
+            river_bet_sizes: simple_bet_sizes(),
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
+        game.allocate_memory(false);
+
+        let n_boundary = game.num_boundary_nodes();
+        assert!(n_boundary > 0);
+
+        // Set CFVs for all boundary nodes (both players)
+        for ordinal in 0..n_boundary {
+            let oop_cfvs = vec![0.0f32; game.num_private_hands(0)];
+            let ip_cfvs = vec![0.0f32; game.num_private_hands(1)];
+            game.set_boundary_cfvs(ordinal, 0, oop_cfvs);
+            game.set_boundary_cfvs(ordinal, 1, ip_cfvs);
+        }
+
+        // Verify boundary_cfvs has the right number of entries
+        assert_eq!(game.boundary_cfvs.len(), n_boundary * 2);
+    }
+
+    #[test]
+    fn test_boundary_pot() {
+        let oop_range: crate::range::Range = "AA,KK,QQ".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ,JJ,TT".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: NOT_DEALT,
+        };
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 200,
+            turn_bet_sizes: simple_bet_sizes(),
+            river_bet_sizes: simple_bet_sizes(),
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let game = PostFlopGame::with_config(card_config, tree).unwrap();
+
+        // All boundary pots should be >= starting pot
+        for ordinal in 0..game.num_boundary_nodes() {
+            let pot = game.boundary_pot(ordinal);
+            assert!(pot >= 100, "boundary pot should be >= starting pot, got {pot}");
+        }
     }
 }

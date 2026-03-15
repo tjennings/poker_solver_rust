@@ -293,13 +293,13 @@ impl BlueprintTuiApp {
                 Constraint::Length(1),  // Iterations counter
                 Constraint::Length(1),  // Progress gauge
                 Constraint::Length(1),  // Runtime + ETA
-                Constraint::Length(3),  // Throughput sparkline
-                Constraint::Length(3),  // Strategy delta sparkline
-                Constraint::Length(3),  // Leaf movement sparkline
-                Constraint::Length(3),  // Max positive regret sparkline
-                Constraint::Length(3),  // Max negative regret sparkline
-                Constraint::Length(3),  // Avg positive regret sparkline
-                Constraint::Length(3),  // Traversals pruned sparkline
+                Constraint::Length(2),  // Throughput sparkline
+                Constraint::Length(2),  // Strategy delta sparkline
+                Constraint::Length(2),  // Leaf movement sparkline
+                Constraint::Length(2),  // Max positive regret sparkline
+                Constraint::Length(2),  // Max negative regret sparkline
+                Constraint::Length(2),  // Avg positive regret sparkline
+                Constraint::Length(2),  // Traversals pruned sparkline
                 Constraint::Length(1),  // Spacer
                 Constraint::Min(0),    // Strategy grids
                 Constraint::Length(1),  // Hotkeys footer

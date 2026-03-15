@@ -152,6 +152,15 @@ pub struct PostFlopGame {
     pub(crate) storage_chance: Vec<u8>,
     pub(crate) locking_strategy: BTreeMap<usize, Vec<f32>>,
 
+    // -- depth boundary data --
+    /// Per-boundary leaf CFVs, indexed by boundary ordinal.
+    /// Each inner `Vec<f32>` has one f32 per private hand for the evaluation
+    /// player. Set externally before solving via [`set_boundary_cfvs`].
+    pub(crate) boundary_cfvs: Vec<Vec<f32>>,
+    /// Maps node arena index to boundary ordinal. `u32::MAX` means not a
+    /// boundary. Built during tree construction.
+    pub(crate) node_to_boundary: Vec<u32>,
+
     // -- result interpreter state --
     pub(crate) action_history: Vec<usize>,
     pub(crate) node_history: Vec<usize>,

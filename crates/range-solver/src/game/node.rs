@@ -32,6 +32,16 @@ impl Default for PostFlopNode {
 }
 
 impl PostFlopNode {
+    /// Returns whether this node is a depth boundary terminal.
+    ///
+    /// Depth boundary terminals are created when the action tree reaches its
+    /// depth limit. Their counterfactual values are supplied externally
+    /// (e.g., from a neural network) rather than computed from the game tree.
+    #[inline]
+    pub fn is_depth_boundary(&self) -> bool {
+        self.player & PLAYER_DEPTH_BOUNDARY_FLAG == PLAYER_DEPTH_BOUNDARY_FLAG
+    }
+
     /// Returns the child nodes as a slice.
     ///
     /// # Safety
@@ -412,5 +422,18 @@ mod tests {
         let size = std::mem::size_of::<PostFlopNode>();
         // Just verify it's a reasonable size (not zero, not absurdly large).
         assert!(size > 0 && size <= 128, "unexpected size: {size}");
+    }
+
+    #[test]
+    fn node_depth_boundary_flag() {
+        let mut node = PostFlopNode::default();
+        assert!(!node.is_depth_boundary());
+
+        node.player = PLAYER_DEPTH_BOUNDARY_FLAG;
+        assert!(node.is_depth_boundary());
+        // Depth boundary includes terminal flag
+        assert!(node.is_terminal());
+        // But not chance flag
+        assert!(!node.is_chance());
     }
 }

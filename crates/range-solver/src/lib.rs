@@ -18,4 +18,4 @@ pub(crate) mod hand;
 pub use game::PostFlopGame;
 pub use solver::{solve, solve_step, compute_exploitability, compute_average, finalize};
 pub use card::CardConfig;
-pub use action_tree::{Action, ActionTree, TreeConfig, BoardState};
+pub use action_tree::{Action, ActionTree, TreeConfig, BoardState, PLAYER_DEPTH_BOUNDARY_FLAG};
