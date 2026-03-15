@@ -609,6 +609,19 @@ impl BlueprintTrainer {
 
         // Strategy refresh for TUI.
         if refresh_due {
+            // Reset EV accumulators so displayed values reflect only the
+            // most recent window, not stale early-iteration history.
+            for player in &self.ev_sum {
+                for v in player {
+                    v.store(0, Ordering::Relaxed);
+                }
+            }
+            for player in &self.ev_count {
+                for v in player {
+                    v.store(0, Ordering::Relaxed);
+                }
+            }
+
             if let Some(ref callback) = self.on_strategy_refresh {
                 for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
                     let player = match &self.tree.nodes[node_idx as usize] {
