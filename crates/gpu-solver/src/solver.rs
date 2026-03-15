@@ -118,9 +118,9 @@ pub struct GpuSolver<'a> {
     num_oop_decisions: u32,
     num_ip_decisions: u32,
 
-    // Initial reach (host, uploaded each iteration)
-    initial_reach_oop: Vec<f32>,
-    initial_reach_ip: Vec<f32>,
+    // Initial reach (on GPU, uploaded once)
+    gpu_initial_reach_oop: CudaSlice<f32>,
+    gpu_initial_reach_ip: CudaSlice<f32>,
 
     // Dimensions
     num_hands: u32,
@@ -353,8 +353,8 @@ impl<'a> GpuSolver<'a> {
             decision_nodes_ip,
             num_oop_decisions,
             num_ip_decisions,
-            initial_reach_oop: tree.initial_reach_oop.clone(),
-            initial_reach_ip: tree.initial_reach_ip.clone(),
+            gpu_initial_reach_oop: gpu.upload(&tree.initial_reach_oop)?,
+            gpu_initial_reach_ip: gpu.upload(&tree.initial_reach_ip)?,
             num_hands,
             max_actions,
             num_infosets,
@@ -435,10 +435,9 @@ impl<'a> GpuSolver<'a> {
                     )?;
                 }
 
-                // 4a. Zero out cfvalues
-                self.cfvalues = self
-                    .gpu
-                    .alloc_zeros::<f32>((self.num_nodes * self.num_hands) as usize)?;
+                // 4a. Zero out cfvalues (GPU-only, no allocation)
+                let cfv_size = (self.num_nodes * self.num_hands) as u32;
+                self.gpu.launch_zero_buffer(&mut self.cfvalues, cfv_size)?;
 
                 // 4b. Terminal fold eval
                 if self.num_fold_terminals > 0 {
@@ -620,9 +619,8 @@ impl<'a> GpuSolver<'a> {
             }
 
             // 4a. Zero cfvalues
-            self.cfvalues = self
-                .gpu
-                .alloc_zeros::<f32>((self.num_nodes * self.num_hands) as usize)?;
+            let cfv_size = (self.num_nodes * self.num_hands) as u32;
+            self.gpu.launch_zero_buffer(&mut self.cfvalues, cfv_size)?;
 
             // 4b. Terminal fold eval
             if self.num_fold_terminals > 0 {
@@ -755,21 +753,13 @@ impl<'a> GpuSolver<'a> {
     }
 
     /// Initialize reach probabilities at the root node.
+    /// Fully GPU-resident: zero buffers then set root reach from pre-uploaded values.
     fn init_reach(&mut self) -> Result<(), GpuError> {
-        // Build full reach arrays: only root (node 0) gets initial values
-        let reach_size = (self.num_nodes * self.num_hands) as usize;
-        let mut reach_oop_host = vec![0.0f32; reach_size];
-        let mut reach_ip_host = vec![0.0f32; reach_size];
-
-        // Root is node 0
-        for h in 0..self.num_hands as usize {
-            reach_oop_host[h] = self.initial_reach_oop[h];
-            reach_ip_host[h] = self.initial_reach_ip[h];
-        }
-
-        self.reach_oop = self.gpu.upload(&reach_oop_host)?;
-        self.reach_ip = self.gpu.upload(&reach_ip_host)?;
-
+        let reach_size = (self.num_nodes * self.num_hands) as u32;
+        self.gpu.launch_zero_buffer(&mut self.reach_oop, reach_size)?;
+        self.gpu.launch_zero_buffer(&mut self.reach_ip, reach_size)?;
+        self.gpu.launch_set_root_reach(&mut self.reach_oop, &self.gpu_initial_reach_oop, self.num_hands)?;
+        self.gpu.launch_set_root_reach(&mut self.reach_ip, &self.gpu_initial_reach_ip, self.num_hands)?;
         Ok(())
     }
 }

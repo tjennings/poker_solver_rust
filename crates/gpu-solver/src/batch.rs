@@ -178,9 +178,9 @@ pub struct BatchGpuSolver<'a> {
     num_oop_decisions: u32,
     num_ip_decisions: u32,
 
-    // Initial reach (host, uploaded each iteration)
-    initial_reach_oop: Vec<f32>,
-    initial_reach_ip: Vec<f32>,
+    // Initial reach (on GPU, uploaded once in new())
+    gpu_initial_reach_oop: CudaSlice<f32>,
+    gpu_initial_reach_ip: CudaSlice<f32>,
 
     // Dimensions
     num_hands: u32,       // total_hands = num_spots * hands_per_spot
@@ -537,8 +537,8 @@ impl<'a> BatchGpuSolver<'a> {
             decision_nodes_ip,
             num_oop_decisions,
             num_ip_decisions,
-            initial_reach_oop,
-            initial_reach_ip,
+            gpu_initial_reach_oop: gpu.upload(&initial_reach_oop).map_err(gpu_err)?,
+            gpu_initial_reach_ip: gpu.upload(&initial_reach_ip).map_err(gpu_err)?,
             num_hands: total_hands as u32,
             max_actions: max_actions as u32,
             num_infosets: num_infosets as u32,
@@ -616,10 +616,10 @@ impl<'a> BatchGpuSolver<'a> {
                         .map_err(gpu_err)?;
                 }
 
-                // 4a. Zero out cfvalues
-                self.cfvalues = self
-                    .gpu
-                    .alloc_zeros::<f32>((self.num_nodes * self.num_hands) as usize)
+                // 4a. Zero out cfvalues (GPU-only, no allocation)
+                let cfv_size = (self.num_nodes * self.num_hands) as u32;
+                self.gpu
+                    .launch_zero_buffer(&mut self.cfvalues, cfv_size)
                     .map_err(gpu_err)?;
 
                 // 4b. Terminal fold eval (batch-aware with per-hand payoffs)
@@ -763,20 +763,13 @@ impl<'a> BatchGpuSolver<'a> {
     }
 
     /// Initialize reach probabilities at the root node for all spots.
+    /// Fully GPU-resident: zero buffers then set root reach from pre-uploaded values.
     fn init_reach(&mut self) -> Result<(), GpuError> {
-        let reach_size = (self.num_nodes * self.num_hands) as usize;
-        let mut reach_oop_host = vec![0.0f32; reach_size];
-        let mut reach_ip_host = vec![0.0f32; reach_size];
-
-        // Root is node 0; hands are concatenated across spots
-        for h in 0..self.num_hands as usize {
-            reach_oop_host[h] = self.initial_reach_oop[h];
-            reach_ip_host[h] = self.initial_reach_ip[h];
-        }
-
-        self.reach_oop = self.gpu.upload(&reach_oop_host)?;
-        self.reach_ip = self.gpu.upload(&reach_ip_host)?;
-
+        let reach_size = (self.num_nodes * self.num_hands) as u32;
+        self.gpu.launch_zero_buffer(&mut self.reach_oop, reach_size)?;
+        self.gpu.launch_zero_buffer(&mut self.reach_ip, reach_size)?;
+        self.gpu.launch_set_root_reach(&mut self.reach_oop, &self.gpu_initial_reach_oop, self.num_hands)?;
+        self.gpu.launch_set_root_reach(&mut self.reach_ip, &self.gpu_initial_reach_ip, self.num_hands)?;
         Ok(())
     }
 

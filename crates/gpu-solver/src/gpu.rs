@@ -539,6 +539,50 @@ impl GpuContext {
         Ok(())
     }
 
+    /// Zero a GPU float buffer in-place (no host allocation).
+    pub fn launch_zero_buffer(
+        &self,
+        buf: &mut CudaSlice<f32>,
+        len: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/zero_buffer.cu"),
+            "zero_buffer",
+        )?;
+        let cfg = LaunchConfig::for_num_elems(len);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(buf)
+                .arg(&len)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Copy initial reach values into the root node (node 0) of a reach array.
+    pub fn launch_set_root_reach(
+        &self,
+        reach: &mut CudaSlice<f32>,
+        initial: &CudaSlice<f32>,
+        num_hands: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/set_root_reach.cu"),
+            "set_root_reach",
+        )?;
+        let cfg = LaunchConfig::for_num_elems(num_hands);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(reach)
+                .arg(initial)
+                .arg(&num_hands)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
     /// Launch the batch showdown terminal evaluation kernel.
     ///
     /// Like `launch_terminal_showdown_eval` but with:
