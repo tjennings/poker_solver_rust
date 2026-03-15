@@ -1,4 +1,4 @@
-//! GPU-resident training pipelines for river and turn CFVNet.
+//! GPU-resident training pipelines for river, turn, flop, and preflop CFVNet.
 //!
 //! Modules for sampling situations, evaluating hand strengths, building
 //! batch solvers, storing training examples in a reservoir buffer,
@@ -23,3 +23,9 @@ pub mod cuda_net;
 pub mod turn_solver;
 #[cfg(feature = "training")]
 pub mod turn_pipeline;
+#[cfg(feature = "training")]
+pub mod flop_solver;
+#[cfg(feature = "training")]
+pub mod flop_pipeline;
+#[cfg(feature = "training")]
+pub mod preflop_pipeline;

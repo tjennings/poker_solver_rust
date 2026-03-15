@@ -1543,6 +1543,154 @@ impl GpuContext {
         }
         Ok(())
     }
+
+    /// Launch the leaf input encoding kernel for flop training.
+    ///
+    /// Encodes reach probabilities at depth-boundary nodes into 2720-dim
+    /// feature vectors for the turn CFV network. One thread per
+    /// (boundary, turn_card, spot) triple.
+    ///
+    /// Supports per-spot 3-card flop boards: `boards` is `[num_spots * 3]`
+    /// and `next_street_cards` is `[num_spots * num_next_cards]`.
+    ///
+    /// # Layout
+    /// - `output`: `[num_boundaries * num_next_cards * num_spots * 2720]`
+    /// - `reach_oop`: `[num_nodes * total_hands]`
+    /// - `reach_ip`: `[num_nodes * total_hands]`
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_encode_leaf_inputs_flop(
+        &self,
+        output: &mut CudaSlice<f32>,
+        reach_oop: &CudaSlice<f32>,
+        reach_ip: &CudaSlice<f32>,
+        boundary_nodes: &CudaSlice<u32>,
+        boards: &CudaSlice<u32>,
+        next_street_cards: &CudaSlice<u32>,
+        boundary_pots: &CudaSlice<f32>,
+        boundary_stacks: &CudaSlice<f32>,
+        combo_cards: &CudaSlice<u32>,
+        traverser: u32,
+        num_boundaries: u32,
+        num_next_cards: u32,
+        num_spots: u32,
+        total_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/encode_leaf_inputs_flop.cu"),
+            "encode_leaf_inputs_flop",
+        )?;
+        let total_threads = num_boundaries * num_next_cards * num_spots;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(output)
+                .arg(reach_oop)
+                .arg(reach_ip)
+                .arg(boundary_nodes)
+                .arg(boards)
+                .arg(next_street_cards)
+                .arg(boundary_pots)
+                .arg(boundary_stacks)
+                .arg(combo_cards)
+                .arg(&traverser)
+                .arg(&num_boundaries)
+                .arg(&num_next_cards)
+                .arg(&num_spots)
+                .arg(&total_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Launch the preflop input encoding kernel.
+    ///
+    /// Encodes range weights at each of 22,100 possible flops into 2720-dim
+    /// feature vectors for the flop CFV network. One thread per
+    /// (flop_idx, spot_idx) pair.
+    ///
+    /// # Layout
+    /// - `output`: `[num_flops * num_spots * 2720]`
+    /// - `ranges_oop`: `[num_spots * 1326]`
+    /// - `ranges_ip`: `[num_spots * 1326]`
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_encode_preflop_inputs(
+        &self,
+        output: &mut CudaSlice<f32>,
+        ranges_oop: &CudaSlice<f32>,
+        ranges_ip: &CudaSlice<f32>,
+        all_flops: &CudaSlice<u32>,
+        combo_cards: &CudaSlice<u32>,
+        pots: &CudaSlice<f32>,
+        stacks: &CudaSlice<f32>,
+        traverser: u32,
+        num_flops: u32,
+        num_spots: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/encode_preflop_inputs.cu"),
+            "encode_preflop_inputs",
+        )?;
+        let total_threads = num_flops * num_spots;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(output)
+                .arg(ranges_oop)
+                .arg(ranges_ip)
+                .arg(all_flops)
+                .arg(combo_cards)
+                .arg(pots)
+                .arg(stacks)
+                .arg(&traverser)
+                .arg(&num_flops)
+                .arg(&num_spots)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Launch the preflop CFV averaging kernel.
+    ///
+    /// Averages flop model CFV predictions across all flops per combo,
+    /// skipping flops that conflict with the combo's cards.
+    /// One thread per (spot_idx, hand) pair.
+    ///
+    /// # Layout
+    /// - `output`: `[num_spots * 1326]`
+    /// - `raw_cfvs`: `[num_flops * num_spots * 1326]`
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_average_preflop_cfvs(
+        &self,
+        output: &mut CudaSlice<f32>,
+        raw_cfvs: &CudaSlice<f32>,
+        all_flops: &CudaSlice<u32>,
+        combo_cards: &CudaSlice<u32>,
+        num_flops: u32,
+        num_spots: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/average_preflop_cfvs.cu"),
+            "average_preflop_cfvs",
+        )?;
+        let total_threads = num_spots * 1326;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(output)
+                .arg(raw_cfvs)
+                .arg(all_flops)
+                .arg(combo_cards)
+                .arg(&num_flops)
+                .arg(&num_spots)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
