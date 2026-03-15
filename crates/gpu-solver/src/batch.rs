@@ -4,6 +4,11 @@
 // board cards, ranges, and pot/stack sizes. The batch solver concatenates
 // per-hand data from all spots and runs the existing CUDA kernels with
 // `num_hands = num_spots * hands_per_spot`.
+//
+// Terminal evaluation uses the same optimized kernels as the single-spot solver:
+// - O(n) fold eval via inclusion-exclusion (precompute_fold_aggregates_batch + fold_eval_from_aggregates_batch)
+// - Shared-memory showdown eval (terminal_showdown_eval_shm_batch)
+// Both are scoped per (terminal, spot) to keep cross-spot isolation.
 
 #[cfg(feature = "cuda")]
 use crate::gpu::{GpuContext, GpuError};
@@ -167,10 +172,20 @@ pub struct BatchGpuSolver<'a> {
     gpu_hand_strengths_oop: CudaSlice<u32>,
     gpu_hand_strengths_ip: CudaSlice<u32>,
 
-    // Card blocking matrices — [num_spots * hands_per_spot * hands_per_spot]
-    // indexed as: spot * hps * hps + local_hand * hps + local_opp
-    gpu_valid_matchups_oop: CudaSlice<f32>,
-    gpu_valid_matchups_ip: CudaSlice<f32>,
+    // Hand card arrays for O(n) fold eval and shared-memory showdown eval
+    // Each is [total_hands * 2] containing (c1, c2) per hand as u32
+    gpu_hand_cards_oop: CudaSlice<u32>,
+    gpu_hand_cards_ip: CudaSlice<u32>,
+
+    // Same-hand index for inclusion-exclusion correction
+    // For each player's hand, the opponent's hand index holding same cards (or u32::MAX)
+    gpu_same_hand_index_oop: CudaSlice<u32>,
+    gpu_same_hand_index_ip: CudaSlice<u32>,
+
+    // Working buffers for O(n) fold aggregates (reused each iteration)
+    // Sized for num_fold_terminals * num_spots (one aggregate per terminal per spot)
+    gpu_fold_total_opp_reach: CudaSlice<f32>,
+    gpu_fold_per_card_reach: CudaSlice<f32>,
 
     // Decision node lists per player
     decision_nodes_oop: CudaSlice<u32>,
@@ -278,10 +293,13 @@ impl<'a> BatchGpuSolver<'a> {
         let mut hand_strengths_oop = vec![0u32; total_hands];
         let mut hand_strengths_ip = vec![0u32; total_hands];
 
-        // Valid matchups: [num_spots * hps * hps] per traverser
-        let matchup_size = num_spots * hands_per_spot * hands_per_spot;
-        let mut valid_matchups_oop = vec![0.0f32; matchup_size];
-        let mut valid_matchups_ip = vec![0.0f32; matchup_size];
+        // Hand card arrays: [total_hands * 2] per player (c1, c2 pairs as u32)
+        let mut hand_cards_oop_flat = vec![255u32; total_hands * 2];
+        let mut hand_cards_ip_flat = vec![255u32; total_hands * 2];
+
+        // Same-hand index arrays: [total_hands] per player
+        let mut same_hand_index_oop = vec![u32::MAX; total_hands];
+        let mut same_hand_index_ip = vec![u32::MAX; total_hands];
 
         for (spot_idx, si) in spot_infos.iter().enumerate() {
             let t = &si.flat_tree;
@@ -302,16 +320,31 @@ impl<'a> BatchGpuSolver<'a> {
                 hand_strengths_ip[base + h] = t.hand_strengths_ip[h];
             }
 
-            // Copy valid matchups for this spot
-            // Source: t.valid_matchups_oop is [num_hands * num_hands] where num_hands = t.num_hands
-            // Dest: valid_matchups_oop[spot * hps * hps + local_hand * hps + local_opp]
-            let spot_matchup_base = spot_idx * hands_per_spot * hands_per_spot;
-            for trav_h in 0..ah {
-                for opp_h in 0..ah {
-                    valid_matchups_oop[spot_matchup_base + trav_h * hands_per_spot + opp_h] =
-                        t.valid_matchups_oop[trav_h * t.num_hands + opp_h];
-                    valid_matchups_ip[spot_matchup_base + trav_h * hands_per_spot + opp_h] =
-                        t.valid_matchups_ip[trav_h * t.num_hands + opp_h];
+            // Copy hand card pairs for OOP
+            for (i, &(c1, c2)) in t.cards_oop.iter().enumerate() {
+                if i < ah {
+                    hand_cards_oop_flat[(base + i) * 2] = c1 as u32;
+                    hand_cards_oop_flat[(base + i) * 2 + 1] = c2 as u32;
+                }
+            }
+            // Copy hand card pairs for IP
+            for (i, &(c1, c2)) in t.cards_ip.iter().enumerate() {
+                if i < ah {
+                    hand_cards_ip_flat[(base + i) * 2] = c1 as u32;
+                    hand_cards_ip_flat[(base + i) * 2 + 1] = c2 as u32;
+                }
+            }
+
+            // Copy same-hand indices, offsetting by spot base
+            // same_hand_index_oop[global_oop_hand] -> global_ip_hand (or u32::MAX)
+            for h in 0..ah {
+                let local_idx = t.same_hand_index_oop[h];
+                if local_idx != u32::MAX {
+                    same_hand_index_oop[base + h] = base as u32 + local_idx;
+                }
+                let local_idx = t.same_hand_index_ip[h];
+                if local_idx != u32::MAX {
+                    same_hand_index_ip[base + h] = base as u32 + local_idx;
                 }
             }
         }
@@ -478,9 +511,18 @@ impl<'a> BatchGpuSolver<'a> {
         let gpu_hand_strengths_oop = gpu.upload(&hand_strengths_oop).map_err(gpu_err)?;
         let gpu_hand_strengths_ip = gpu.upload(&hand_strengths_ip).map_err(gpu_err)?;
 
-        // Upload valid matchups
-        let gpu_valid_matchups_oop = gpu.upload(&valid_matchups_oop).map_err(gpu_err)?;
-        let gpu_valid_matchups_ip = gpu.upload(&valid_matchups_ip).map_err(gpu_err)?;
+        // Upload hand card arrays
+        let gpu_hand_cards_oop = gpu.upload(&hand_cards_oop_flat).map_err(gpu_err)?;
+        let gpu_hand_cards_ip = gpu.upload(&hand_cards_ip_flat).map_err(gpu_err)?;
+
+        // Upload same-hand index arrays
+        let gpu_same_hand_index_oop = gpu.upload(&same_hand_index_oop).map_err(gpu_err)?;
+        let gpu_same_hand_index_ip = gpu.upload(&same_hand_index_ip).map_err(gpu_err)?;
+
+        // Allocate working buffers for fold aggregates (per terminal per spot)
+        let fold_agg_count = (num_fold_terminals as usize * num_spots).max(1);
+        let gpu_fold_total_opp_reach = gpu.alloc_zeros::<f32>(fold_agg_count).map_err(gpu_err)?;
+        let gpu_fold_per_card_reach = gpu.alloc_zeros::<f32>(fold_agg_count * 52).map_err(gpu_err)?;
 
         // Build decision node lists per player
         let mut oop_decisions = Vec::new();
@@ -531,8 +573,12 @@ impl<'a> BatchGpuSolver<'a> {
             num_showdown_terminals,
             gpu_hand_strengths_oop,
             gpu_hand_strengths_ip,
-            gpu_valid_matchups_oop,
-            gpu_valid_matchups_ip,
+            gpu_hand_cards_oop,
+            gpu_hand_cards_ip,
+            gpu_same_hand_index_oop,
+            gpu_same_hand_index_ip,
+            gpu_fold_total_opp_reach,
+            gpu_fold_per_card_reach,
             decision_nodes_oop,
             decision_nodes_ip,
             num_oop_decisions,
@@ -553,8 +599,9 @@ impl<'a> BatchGpuSolver<'a> {
     /// Run the DCFR+ solver for the batch.
     ///
     /// The solve loop is structurally identical to `GpuSolver::solve()` but uses
-    /// batch-aware terminal kernels that support per-hand payoffs and spot-scoped
-    /// card blocking.
+    /// batch-aware optimized terminal kernels:
+    /// - O(n) fold eval via inclusion-exclusion (precompute_fold_aggregates_batch + fold_eval_from_aggregates_batch)
+    /// - Shared-memory showdown eval scoped per (terminal, spot)
     pub fn solve(
         &mut self,
         max_iterations: u32,
@@ -622,27 +669,58 @@ impl<'a> BatchGpuSolver<'a> {
                     .launch_zero_buffer(&mut self.cfvalues, cfv_size)
                     .map_err(gpu_err)?;
 
-                // 4b. Terminal fold eval (batch-aware with per-hand payoffs)
+                // 4b. Terminal fold eval — O(n) via inclusion-exclusion (batch)
                 if self.num_fold_terminals > 0 {
                     let opp_reach = if traverser == 0 {
                         &self.reach_ip
                     } else {
                         &self.reach_oop
                     };
-                    let valid_matchups = if traverser == 0 {
-                        &self.gpu_valid_matchups_oop
+                    // Opponent's hand cards (for aggregate computation)
+                    let opp_hand_cards = if traverser == 0 {
+                        &self.gpu_hand_cards_ip
                     } else {
-                        &self.gpu_valid_matchups_ip
+                        &self.gpu_hand_cards_oop
                     };
+                    // Traverser's hand cards (for blocking lookup)
+                    let trav_hand_cards = if traverser == 0 {
+                        &self.gpu_hand_cards_oop
+                    } else {
+                        &self.gpu_hand_cards_ip
+                    };
+                    let same_hand_index = if traverser == 0 {
+                        &self.gpu_same_hand_index_oop
+                    } else {
+                        &self.gpu_same_hand_index_ip
+                    };
+
+                    // Phase A: precompute per-card reach aggregates (per terminal per spot)
                     self.gpu
-                        .launch_terminal_fold_eval_batch(
+                        .launch_precompute_fold_aggregates_batch(
+                            opp_reach,
+                            &self.fold_terminal_nodes,
+                            opp_hand_cards,
+                            &mut self.gpu_fold_total_opp_reach,
+                            &mut self.gpu_fold_per_card_reach,
+                            self.num_fold_terminals,
+                            self.num_hands,
+                            self.hands_per_spot as u32,
+                        )
+                        .map_err(gpu_err)?;
+
+                    // Phase B: O(1) per-hand CFV using aggregates
+                    self.gpu
+                        .launch_fold_eval_from_aggregates_batch(
                             &mut self.cfvalues,
                             opp_reach,
                             &self.fold_terminal_nodes,
                             &self.fold_amount_win,
                             &self.fold_amount_lose,
                             &self.fold_player,
-                            valid_matchups,
+                            &self.gpu_fold_total_opp_reach,
+                            &self.gpu_fold_per_card_reach,
+                            trav_hand_cards,
+                            same_hand_index,
                             traverser,
                             self.num_fold_terminals,
                             self.num_hands,
@@ -651,7 +729,7 @@ impl<'a> BatchGpuSolver<'a> {
                         .map_err(gpu_err)?;
                 }
 
-                // 4c. Terminal showdown eval (batch-aware)
+                // 4c. Terminal showdown eval — shared memory (batch)
                 if self.num_showdown_terminals > 0 {
                     let opp_reach = if traverser == 0 {
                         &self.reach_ip
@@ -663,13 +741,18 @@ impl<'a> BatchGpuSolver<'a> {
                     } else {
                         (&self.gpu_hand_strengths_ip, &self.gpu_hand_strengths_oop)
                     };
-                    let valid_matchups = if traverser == 0 {
-                        &self.gpu_valid_matchups_oop
+                    let trav_hand_cards = if traverser == 0 {
+                        &self.gpu_hand_cards_oop
                     } else {
-                        &self.gpu_valid_matchups_ip
+                        &self.gpu_hand_cards_ip
+                    };
+                    let opp_hand_cards = if traverser == 0 {
+                        &self.gpu_hand_cards_ip
+                    } else {
+                        &self.gpu_hand_cards_oop
                     };
                     self.gpu
-                        .launch_terminal_showdown_eval_batch(
+                        .launch_terminal_showdown_eval_shm_batch(
                             &mut self.cfvalues,
                             opp_reach,
                             &self.showdown_terminal_nodes,
@@ -677,7 +760,8 @@ impl<'a> BatchGpuSolver<'a> {
                             &self.showdown_amount_lose,
                             traverser_strengths,
                             opponent_strengths,
-                            valid_matchups,
+                            trav_hand_cards,
+                            opp_hand_cards,
                             self.num_showdown_terminals,
                             self.num_hands,
                             self.hands_per_spot as u32,

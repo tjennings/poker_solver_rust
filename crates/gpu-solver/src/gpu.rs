@@ -786,6 +786,163 @@ impl GpuContext {
         }
         Ok(())
     }
+
+    /// Launch the batch fold aggregates precomputation kernel.
+    ///
+    /// One block per (fold_terminal, spot) pair. Each block only iterates over
+    /// its spot's hands, keeping shared memory atomics contention low.
+    ///
+    /// Outputs:
+    ///   `total_opp_reach[term_idx * num_spots + spot]`
+    ///   `per_card_reach[(term_idx * num_spots + spot) * 52 + card]`
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_precompute_fold_aggregates_batch(
+        &self,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        opp_hand_cards: &CudaSlice<u32>,
+        total_opp_reach: &mut CudaSlice<f32>,
+        per_card_reach: &mut CudaSlice<f32>,
+        num_fold_terminals: u32,
+        num_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/precompute_fold_aggregates_batch.cu"),
+            "precompute_fold_aggregates_batch",
+        )?;
+        let num_spots = num_hands / hands_per_spot;
+        let num_blocks = num_fold_terminals * num_spots;
+        let block_dim = 256u32.min(hands_per_spot);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0, // shared memory is statically allocated in the kernel
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(opp_hand_cards)
+                .arg(total_opp_reach)
+                .arg(per_card_reach)
+                .arg(&num_fold_terminals)
+                .arg(&num_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Launch the batch O(1) fold evaluation kernel using precomputed aggregates.
+    ///
+    /// Like `launch_fold_eval_from_aggregates` but with per-hand payoffs and
+    /// aggregates indexed by `(terminal, spot)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fold_eval_from_aggregates_batch(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        fold_amount_win: &CudaSlice<f32>,
+        fold_amount_lose: &CudaSlice<f32>,
+        fold_player: &CudaSlice<u32>,
+        total_opp_reach: &CudaSlice<f32>,
+        per_card_reach: &CudaSlice<f32>,
+        trav_hand_cards: &CudaSlice<u32>,
+        same_hand_index: &CudaSlice<u32>,
+        traverser: u32,
+        num_fold_terminals: u32,
+        num_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/fold_eval_from_aggregates_batch.cu"),
+            "fold_eval_from_aggregates_batch",
+        )?;
+        let total_threads = num_fold_terminals * num_hands;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(fold_amount_win)
+                .arg(fold_amount_lose)
+                .arg(fold_player)
+                .arg(total_opp_reach)
+                .arg(per_card_reach)
+                .arg(trav_hand_cards)
+                .arg(same_hand_index)
+                .arg(&traverser)
+                .arg(&num_fold_terminals)
+                .arg(&num_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Launch the batch shared-memory showdown evaluation kernel.
+    ///
+    /// One block per (showdown_terminal, spot) pair. Each block loads one
+    /// spot's opponent reach into shared memory, then each thread computes
+    /// its traverser hand's CFV by iterating over opponent hands within
+    /// the same spot only.
+    ///
+    /// Uses per-hand payoffs and explicit card comparison for blocking.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_terminal_showdown_eval_shm_batch(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        amount_win: &CudaSlice<f32>,
+        amount_lose: &CudaSlice<f32>,
+        traverser_strengths: &CudaSlice<u32>,
+        opponent_strengths: &CudaSlice<u32>,
+        trav_hand_cards: &CudaSlice<u32>,
+        opp_hand_cards: &CudaSlice<u32>,
+        num_showdown_terminals: u32,
+        num_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/terminal_showdown_eval_shm_batch.cu"),
+            "terminal_showdown_eval_shm_batch",
+        )?;
+        let num_spots = num_hands / hands_per_spot;
+        let num_blocks = num_showdown_terminals * num_spots;
+        // Block size: min(hands_per_spot, 1024), rounded up to warp size
+        let block_size = ((hands_per_spot + 31) / 32) * 32;
+        let block_size = block_size.min(1024);
+        let shared_mem = hands_per_spot * 4; // sizeof(float) = 4
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: shared_mem,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(amount_win)
+                .arg(amount_lose)
+                .arg(traverser_strengths)
+                .arg(opponent_strengths)
+                .arg(trav_hand_cards)
+                .arg(opp_hand_cards)
+                .arg(&num_showdown_terminals)
+                .arg(&num_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
