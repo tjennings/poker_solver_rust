@@ -596,6 +596,228 @@ impl<'a> BatchGpuSolver<'a> {
         })
     }
 
+    /// Create a batch GPU solver from pre-built GPU buffers and a reference
+    /// `FlatTree` topology. No CPU round-trip for per-hand data assembly.
+    ///
+    /// The topology (node_types, child_offsets, etc.) is extracted from
+    /// `ref_tree`. Per-hand data (strengths, reach, cards, payoffs) are
+    /// provided as references to already-computed data (on host or GPU).
+    ///
+    /// This constructor uploads topology + per-hand data to GPU in one shot,
+    /// avoiding the need to build `RiverSpot` structs and `PostFlopGame`
+    /// instances per spot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_gpu_data(
+        gpu: &'a GpuContext,
+        ref_tree: &FlatTree,
+        hand_strengths_oop: &CudaSlice<u32>,
+        hand_strengths_ip: &CudaSlice<u32>,
+        initial_reach_oop: &CudaSlice<f32>,
+        initial_reach_ip: &CudaSlice<f32>,
+        hand_cards_oop: &CudaSlice<u32>,
+        hand_cards_ip: &CudaSlice<u32>,
+        same_hand_index_oop: &CudaSlice<u32>,
+        same_hand_index_ip: &CudaSlice<u32>,
+        fold_nodes: &[u32],
+        fold_win_per_hand: &[f32],
+        fold_lose_per_hand: &[f32],
+        fold_pl: &[u32],
+        num_fold_terminals: u32,
+        showdown_nodes: &[u32],
+        showdown_win_per_hand: &[f32],
+        showdown_lose_per_hand: &[f32],
+        num_showdown_terminals: u32,
+        num_spots: usize,
+        hands_per_spot: usize,
+    ) -> Result<Self, String> {
+        let gpu_err = |e: GpuError| format!("GPU error: {e}");
+
+        let total_hands = num_spots * hands_per_spot;
+        let num_nodes = ref_tree.num_nodes();
+        let num_infosets = ref_tree.num_infosets;
+        let max_actions = ref_tree.max_actions();
+        let num_levels = ref_tree.num_levels();
+
+        let actual_hands_per_spot = vec![hands_per_spot; num_spots];
+
+        // Allocate solver state
+        let strat_size = num_infosets * max_actions * total_hands;
+        let reach_size = num_nodes * total_hands;
+
+        let regrets = gpu.alloc_zeros::<f32>(strat_size).map_err(gpu_err)?;
+        let strategy_sum = gpu.alloc_zeros::<f32>(strat_size).map_err(gpu_err)?;
+        let current_strategy = gpu.alloc_zeros::<f32>(strat_size).map_err(gpu_err)?;
+        let reach_oop = gpu.alloc_zeros::<f32>(reach_size).map_err(gpu_err)?;
+        let reach_ip = gpu.alloc_zeros::<f32>(reach_size).map_err(gpu_err)?;
+        let cfvalues = gpu.alloc_zeros::<f32>(reach_size).map_err(gpu_err)?;
+
+        // Upload shared topology
+        let gpu_child_offsets = gpu.upload(&ref_tree.child_offsets).map_err(gpu_err)?;
+        let gpu_children = gpu.upload(&ref_tree.children).map_err(gpu_err)?;
+        let gpu_infoset_ids = gpu.upload(&ref_tree.infoset_ids).map_err(gpu_err)?;
+        let gpu_num_actions = gpu.upload(&ref_tree.infoset_num_actions).map_err(gpu_err)?;
+
+        // Build per-level data for forward pass
+        let mut level_data = Vec::with_capacity(num_levels);
+        for level in 0..num_levels {
+            let start = ref_tree.level_starts[level] as usize;
+            let end = ref_tree.level_starts[level + 1] as usize;
+
+            let mut nodes_vec = Vec::with_capacity(end - start);
+            let mut parent_nodes_vec = Vec::with_capacity(end - start);
+            let mut parent_actions_vec = Vec::with_capacity(end - start);
+            let mut parent_infosets_vec = Vec::with_capacity(end - start);
+            let mut parent_players_vec = Vec::with_capacity(end - start);
+
+            for node_id in start..end {
+                nodes_vec.push(node_id as u32);
+                let parent = ref_tree.parent_nodes[node_id];
+                parent_nodes_vec.push(parent);
+                parent_actions_vec.push(ref_tree.parent_actions[node_id]);
+                if parent != u32::MAX {
+                    parent_infosets_vec.push(ref_tree.infoset_ids[parent as usize]);
+                    parent_players_vec.push(ref_tree.player(parent as usize) as u32);
+                } else {
+                    parent_infosets_vec.push(0);
+                    parent_players_vec.push(0);
+                }
+            }
+
+            let num_nodes_level = nodes_vec.len() as u32;
+            level_data.push(LevelData {
+                nodes: gpu.upload(&nodes_vec).map_err(gpu_err)?,
+                parent_nodes: gpu.upload(&parent_nodes_vec).map_err(gpu_err)?,
+                parent_actions: gpu.upload(&parent_actions_vec).map_err(gpu_err)?,
+                parent_infosets: gpu.upload(&parent_infosets_vec).map_err(gpu_err)?,
+                parent_players: gpu.upload(&parent_players_vec).map_err(gpu_err)?,
+                num_nodes: num_nodes_level,
+            });
+        }
+
+        // Build per-level decision node lists for backward CFV
+        let mut backward_level_data = Vec::with_capacity(num_levels);
+        for level in 0..num_levels {
+            let start = ref_tree.level_starts[level] as usize;
+            let end = ref_tree.level_starts[level + 1] as usize;
+
+            let mut decision_nodes_vec = Vec::new();
+            let mut decision_players_vec = Vec::new();
+            for node_id in start..end {
+                if !ref_tree.is_terminal(node_id) {
+                    decision_nodes_vec.push(node_id as u32);
+                    decision_players_vec.push(ref_tree.player(node_id) as u32);
+                }
+            }
+
+            let num_decision = decision_nodes_vec.len() as u32;
+            if decision_nodes_vec.is_empty() {
+                decision_nodes_vec.push(0);
+                decision_players_vec.push(0);
+            }
+            backward_level_data.push(BackwardLevelData {
+                decision_nodes: gpu.upload(&decision_nodes_vec).map_err(gpu_err)?,
+                decision_players: gpu.upload(&decision_players_vec).map_err(gpu_err)?,
+                num_decision_nodes: num_decision,
+            });
+        }
+
+        // Upload terminal data
+        let fold_terminal_nodes = gpu.upload(fold_nodes).map_err(gpu_err)?;
+        let fold_amount_win = gpu.upload(fold_win_per_hand).map_err(gpu_err)?;
+        let fold_amount_lose = gpu.upload(fold_lose_per_hand).map_err(gpu_err)?;
+        let fold_player = gpu.upload(fold_pl).map_err(gpu_err)?;
+
+        let showdown_terminal_nodes = gpu.upload(showdown_nodes).map_err(gpu_err)?;
+        let showdown_amount_win = gpu.upload(showdown_win_per_hand).map_err(gpu_err)?;
+        let showdown_amount_lose = gpu.upload(showdown_lose_per_hand).map_err(gpu_err)?;
+
+        // Clone GPU buffers for per-hand data (solver takes ownership)
+        let gpu_hand_strengths_oop = gpu.clone_slice(hand_strengths_oop).map_err(gpu_err)?;
+        let gpu_hand_strengths_ip = gpu.clone_slice(hand_strengths_ip).map_err(gpu_err)?;
+        let gpu_hand_cards_oop = gpu.clone_slice(hand_cards_oop).map_err(gpu_err)?;
+        let gpu_hand_cards_ip = gpu.clone_slice(hand_cards_ip).map_err(gpu_err)?;
+        let gpu_same_hand_index_oop = gpu.clone_slice(same_hand_index_oop).map_err(gpu_err)?;
+        let gpu_same_hand_index_ip = gpu.clone_slice(same_hand_index_ip).map_err(gpu_err)?;
+        let gpu_initial_reach_oop = gpu.clone_slice(initial_reach_oop).map_err(gpu_err)?;
+        let gpu_initial_reach_ip = gpu.clone_slice(initial_reach_ip).map_err(gpu_err)?;
+
+        // Allocate working buffers for fold aggregates
+        let fold_agg_count = (num_fold_terminals as usize * num_spots).max(1);
+        let gpu_fold_total_opp_reach = gpu.alloc_zeros::<f32>(fold_agg_count).map_err(gpu_err)?;
+        let gpu_fold_per_card_reach = gpu.alloc_zeros::<f32>(fold_agg_count * 52).map_err(gpu_err)?;
+
+        // Build decision node lists per player
+        let mut oop_decisions = Vec::new();
+        let mut ip_decisions = Vec::new();
+        for (i, nt) in ref_tree.node_types.iter().enumerate() {
+            match nt {
+                NodeType::DecisionOop => oop_decisions.push(i as u32),
+                NodeType::DecisionIp => ip_decisions.push(i as u32),
+                _ => {}
+            }
+        }
+
+        let num_oop_decisions = oop_decisions.len() as u32;
+        let num_ip_decisions = ip_decisions.len() as u32;
+
+        if oop_decisions.is_empty() {
+            oop_decisions.push(0);
+        }
+        if ip_decisions.is_empty() {
+            ip_decisions.push(0);
+        }
+
+        let decision_nodes_oop = gpu.upload(&oop_decisions).map_err(gpu_err)?;
+        let decision_nodes_ip = gpu.upload(&ip_decisions).map_err(gpu_err)?;
+
+        Ok(Self {
+            gpu,
+            regrets,
+            strategy_sum,
+            current_strategy,
+            reach_oop,
+            reach_ip,
+            cfvalues,
+            gpu_child_offsets,
+            gpu_children,
+            gpu_infoset_ids,
+            gpu_num_actions,
+            level_data,
+            backward_level_data,
+            fold_terminal_nodes,
+            fold_amount_win,
+            fold_amount_lose,
+            fold_player,
+            num_fold_terminals,
+            showdown_terminal_nodes,
+            showdown_amount_win,
+            showdown_amount_lose,
+            num_showdown_terminals,
+            gpu_hand_strengths_oop,
+            gpu_hand_strengths_ip,
+            gpu_hand_cards_oop,
+            gpu_hand_cards_ip,
+            gpu_same_hand_index_oop,
+            gpu_same_hand_index_ip,
+            gpu_fold_total_opp_reach,
+            gpu_fold_per_card_reach,
+            decision_nodes_oop,
+            decision_nodes_ip,
+            num_oop_decisions,
+            num_ip_decisions,
+            gpu_initial_reach_oop,
+            gpu_initial_reach_ip,
+            num_hands: total_hands as u32,
+            max_actions: max_actions as u32,
+            num_infosets: num_infosets as u32,
+            num_nodes: num_nodes as u32,
+            num_levels,
+            hands_per_spot,
+            num_spots,
+            actual_hands_per_spot,
+        })
+    }
+
     /// Run the DCFR+ solver for the batch.
     ///
     /// The solve loop is structurally identical to `GpuSolver::solve()` but uses

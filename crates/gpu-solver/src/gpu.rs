@@ -58,6 +58,14 @@ impl GpuContext {
         Ok(self.stream.alloc_zeros(len)?)
     }
 
+    /// Clone a GPU buffer (device-to-device copy).
+    pub fn clone_slice<T: cudarc::driver::DeviceRepr + Copy>(
+        &self,
+        src: &CudaSlice<T>,
+    ) -> Result<CudaSlice<T>, GpuError> {
+        Ok(self.stream.clone_dtod(src)?)
+    }
+
     /// Compile a CUDA source string to PTX, load it as a module, and return
     /// the named function. Results are cached so repeated calls with the same
     /// function name return the previously compiled kernel.
