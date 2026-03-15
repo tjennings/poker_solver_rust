@@ -1091,7 +1091,7 @@ impl<'a> BatchGpuSolver<'a> {
                     };
                     let t0 = if profiling { Some(Instant::now()) } else { None };
                     self.gpu
-                        .launch_showdown_eval_sorted_batch(
+                        .launch_showdown_eval_block_scan(
                             &mut self.cfvalues,
                             opp_reach,
                             &self.showdown_terminal_nodes,
@@ -1372,7 +1372,7 @@ impl<'a> BatchGpuSolver<'a> {
                 };
 
                 self.gpu
-                    .launch_showdown_eval_sorted_batch(
+                    .launch_showdown_eval_block_scan(
                         &mut self.cfvalues,
                         opp_reach,
                         &self.showdown_terminal_nodes,
@@ -1628,7 +1628,7 @@ mod tests {
                     let trav_hand_cards = if traverser == 0 { &solver.gpu_hand_cards_oop } else { &solver.gpu_hand_cards_ip };
                     let opp_hand_cards = if traverser == 0 { &solver.gpu_hand_cards_ip } else { &solver.gpu_hand_cards_oop };
 
-                    solver.gpu.launch_showdown_eval_sorted_batch(
+                    solver.gpu.launch_showdown_eval_block_scan(
                         &mut solver.cfvalues, opp_reach,
                         &solver.showdown_terminal_nodes,
                         &solver.showdown_amount_win, &solver.showdown_amount_lose,

@@ -1008,6 +1008,71 @@ impl GpuContext {
         }
         Ok(())
     }
+
+    /// Launch the block-scan showdown evaluation kernel (batch).
+    ///
+    /// One CUDA block per (terminal, spot) pair. Thread 0 performs a serial
+    /// two-pointer scan in shared memory (ascending + descending with per-card
+    /// inclusion-exclusion blocking). All threads then read their win/lose reach
+    /// from shared memory and compute CFV in parallel.
+    ///
+    /// This achieves the same O(n) algorithmic complexity as the sorted kernel
+    /// but with dramatically higher GPU occupancy: ~5000 blocks × 1024 threads
+    /// vs ~5000 individual threads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_showdown_eval_block_scan(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        amount_win: &CudaSlice<f32>,
+        amount_lose: &CudaSlice<f32>,
+        trav_sorted: &CudaSlice<u32>,
+        opp_sorted: &CudaSlice<u32>,
+        trav_strengths: &CudaSlice<u32>,
+        opp_strengths: &CudaSlice<u32>,
+        trav_hand_cards: &CudaSlice<u32>,
+        opp_hand_cards: &CudaSlice<u32>,
+        num_showdown_terminals: u32,
+        num_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/showdown_eval_block_scan.cu"),
+            "showdown_eval_block_scan",
+        )?;
+        let num_spots = num_hands / hands_per_spot;
+        let total_blocks = num_showdown_terminals * num_spots;
+        // Use up to 1024 threads per block, capped at hands_per_spot
+        let block_size = hands_per_spot.min(1024);
+        // Shared memory: 3 arrays of hps floats (sorted_reach, win_reach, lose_reach)
+        let shared_mem = 3 * hands_per_spot * std::mem::size_of::<f32>() as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (total_blocks, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: shared_mem,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(amount_win)
+                .arg(amount_lose)
+                .arg(trav_sorted)
+                .arg(opp_sorted)
+                .arg(trav_strengths)
+                .arg(opp_strengths)
+                .arg(trav_hand_cards)
+                .arg(opp_hand_cards)
+                .arg(&num_showdown_terminals)
+                .arg(&num_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
