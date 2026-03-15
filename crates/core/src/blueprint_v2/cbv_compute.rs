@@ -106,7 +106,7 @@ fn compute_node_value(
 ) -> f32 {
     match &ctx.tree.nodes[node_idx as usize] {
         GameNode::Terminal { kind, invested, .. } => {
-            terminal_bucket_value(*kind, invested, ctx.player, bucket, ctx.bucket_counts)
+            terminal_bucket_value(*kind, invested, &ctx.tree.blinds, ctx.player, bucket, ctx.bucket_counts)
         }
 
         GameNode::Chance { next_street, child } => {
@@ -173,19 +173,23 @@ fn compute_node_value(
 fn terminal_bucket_value(
     kind: TerminalKind,
     invested: &[f64; 2],
+    blinds: &[f64; 2],
     player: u8,
     bucket: u16,
     bucket_counts: [u16; 4],
 ) -> f32 {
     let p = player as usize;
     let o = 1 - p;
+    let initial_pot = blinds[0] + blinds[1];
+    let vol_p = invested[p] - blinds[p];
+    let vol_o = invested[o] - blinds[o];
 
     match kind {
         TerminalKind::Fold { winner } => {
             if winner == player {
-                invested[o] as f32
+                (initial_pot + vol_o) as f32
             } else {
-                -(invested[p] as f32)
+                -(vol_p as f32)
             }
         }
         TerminalKind::Showdown => {
@@ -193,8 +197,8 @@ fn terminal_bucket_value(
             let clamped_bucket = bucket.min(river_buckets - 1);
             let equity = (f64::from(clamped_bucket) + 0.5) / f64::from(river_buckets);
 
-            // EV = equity * opponent_invested - (1 - equity) * own_invested
-            let ev = equity * invested[o] - (1.0 - equity) * invested[p];
+            // EV = equity * (initial_pot + vol_opponent) - (1 - equity) * vol_self
+            let ev = equity * (initial_pot + vol_o) - (1.0 - equity) * vol_p;
             ev as f32
         }
         TerminalKind::DepthBoundary => {
@@ -318,7 +322,7 @@ mod tests {
             },
         ];
 
-        GameTree { nodes, root: 0 }
+        GameTree { nodes, root: 0, blinds: [0.0, 0.0] }
     }
 
     /// With uniform strategy (fresh storage), verify that the CBV
@@ -415,6 +419,7 @@ mod tests {
         let v = terminal_bucket_value(
             TerminalKind::Fold { winner: 0 },
             &[1.0, 1.0],
+            &[0.0, 0.0],
             0,
             0,
             bucket_counts,
@@ -425,6 +430,7 @@ mod tests {
         let v2 = terminal_bucket_value(
             TerminalKind::Fold { winner: 0 },
             &[1.0, 1.0],
+            &[0.0, 0.0],
             0,
             3,
             bucket_counts,
@@ -435,6 +441,7 @@ mod tests {
         let v3 = terminal_bucket_value(
             TerminalKind::Fold { winner: 1 },
             &[1.0, 1.0],
+            &[0.0, 0.0],
             0,
             2,
             bucket_counts,
@@ -452,6 +459,7 @@ mod tests {
         let v0 = terminal_bucket_value(
             TerminalKind::Showdown,
             &[1.0, 1.0],
+            &[0.0, 0.0],
             0,
             0,
             bucket_counts,
@@ -465,6 +473,7 @@ mod tests {
         let v3 = terminal_bucket_value(
             TerminalKind::Showdown,
             &[1.0, 1.0],
+            &[0.0, 0.0],
             0,
             3,
             bucket_counts,

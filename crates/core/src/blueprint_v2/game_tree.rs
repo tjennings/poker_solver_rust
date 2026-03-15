@@ -58,6 +58,9 @@ pub enum TerminalKind {
 pub struct GameTree {
     pub nodes: Vec<GameNode>,
     pub root: u32,
+    /// Forced blind postings (dead money). `blinds[0]` = SB, `blinds[1]` = BB.
+    /// Used by `terminal_value` to separate voluntary investment from dead money.
+    pub blinds: [f64; 2],
 }
 
 /// Internal state tracked during recursive tree construction.
@@ -175,7 +178,7 @@ impl GameTree {
 
         let root = Self::build_node(&config, &initial_state, &mut nodes);
 
-        Self { nodes, root }
+        Self { nodes, root, blinds: [small_blind, big_blind] }
     }
 
     /// Recursively build a node and return its arena index.
@@ -763,7 +766,9 @@ impl GameTree {
 
         let mut nodes = Vec::new();
         let root = Self::build_node(&config, &initial_state, &mut nodes);
-        Self { nodes, root }
+        // Subgames: blinds are already accounted for in the invested amounts.
+        // The initial_pot (dead money) for a subgame is pot - invested[0] - invested[1].
+        Self { nodes, root, blinds: invested }
     }
 
     /// Count the number of nodes of each type in the tree.

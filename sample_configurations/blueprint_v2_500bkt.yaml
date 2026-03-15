@@ -40,11 +40,11 @@ action_abstraction:
     - [2.0]
 
 training:
-  cluster_path: "./local_data/clusters_500bkt_samples"
+  cluster_path: "./local_data/clusters_500bkt_v3"
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 5000000
   prune_after_iterations: 5000000
-  prune_threshold: -1000000
+  prune_threshold: 0
   lcfr_discount_interval: 1000000
   batch_size: 2000
 
@@ -52,7 +52,7 @@ snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/500bkt_samples/snap"
+  output_dir: "./local_data/blueprints/500bkt_pot_aware/snap"
 
 tui:
   enabled: true
