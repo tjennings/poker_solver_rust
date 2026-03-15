@@ -6,9 +6,14 @@ license.workspace = true
 authors.workspace = true
 description = "CLI tool for training poker blueprint strategies"
 
+[features]
+default = []
+cuda = ["poker-solver-gpu"]
+
 [dependencies]
 poker-solver-core = { path = "../core" }
 range-solver = { path = "../range-solver" }
+poker-solver-gpu = { path = "../gpu-solver", features = ["cuda"], optional = true }
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 ratatui = "0.29"
