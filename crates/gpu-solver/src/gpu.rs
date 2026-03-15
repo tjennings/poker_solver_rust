@@ -1424,6 +1424,70 @@ impl GpuContext {
         let (ptr, _guard) = slice.device_ptr_mut(&self.stream);
         ptr as u64
     }
+
+    /// Launch the leaf input encoding kernel.
+    ///
+    /// Encodes reach probabilities at depth-boundary nodes into 2720-dim
+    /// feature vectors for the river CFV network. One thread per
+    /// (boundary, river_card, spot) triple.
+    ///
+    /// # Layout
+    /// - `output`: `[num_boundaries * num_rivers * num_spots * 2720]`
+    /// - `reach_oop`: `[num_nodes * total_hands]`
+    /// - `reach_ip`: `[num_nodes * total_hands]`
+    /// - `boundary_nodes`: `[num_boundaries]` node IDs
+    /// - `turn_board`: `[4]` turn board cards
+    /// - `river_cards`: `[num_rivers]` possible river cards
+    /// - `boundary_pots`: `[num_boundaries]` pot at each boundary
+    /// - `boundary_stacks`: `[num_boundaries]` stack at each boundary
+    /// - `combo_cards`: `[1326 * 2]` card pairs per combo
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_encode_leaf_inputs(
+        &self,
+        output: &mut CudaSlice<f32>,
+        reach_oop: &CudaSlice<f32>,
+        reach_ip: &CudaSlice<f32>,
+        boundary_nodes: &CudaSlice<u32>,
+        turn_board: &CudaSlice<u32>,
+        river_cards: &CudaSlice<u32>,
+        boundary_pots: &CudaSlice<f32>,
+        boundary_stacks: &CudaSlice<f32>,
+        combo_cards: &CudaSlice<u32>,
+        traverser: u32,
+        num_boundaries: u32,
+        num_rivers: u32,
+        num_spots: u32,
+        total_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/encode_leaf_inputs.cu"),
+            "encode_leaf_inputs",
+        )?;
+        let total_threads = num_boundaries * num_rivers * num_spots;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(output)
+                .arg(reach_oop)
+                .arg(reach_ip)
+                .arg(boundary_nodes)
+                .arg(turn_board)
+                .arg(river_cards)
+                .arg(boundary_pots)
+                .arg(boundary_stacks)
+                .arg(combo_cards)
+                .arg(&traverser)
+                .arg(&num_boundaries)
+                .arg(&num_rivers)
+                .arg(&num_spots)
+                .arg(&total_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2167,6 +2231,146 @@ mod tests {
             (result_strat_sum[1] - 0.0).abs() < eps,
             "strat_sum action1: got {}",
             result_strat_sum[1]
+        );
+    }
+
+    #[test]
+    fn test_encode_leaf_inputs_kernel() {
+        let gpu = GpuContext::new(0).expect("CUDA device required");
+
+        // Setup: 1 boundary, 1 river card, 1 spot, 2 hands per spot
+        let num_boundaries: u32 = 1;
+        let num_rivers: u32 = 1;
+        let num_spots: u32 = 1;
+        let hands_per_spot: u32 = 1326;
+        let num_nodes: u32 = 1;
+        let total_hands = num_nodes * num_spots * hands_per_spot;
+
+        // Reach: uniform 0.5 for all combos at node 0
+        let reach = vec![0.5f32; total_hands as usize];
+
+        // Boundary at node 0
+        let boundary_nodes = vec![0u32];
+        let boundary_pots = vec![200.0f32];
+        let boundary_stacks = vec![100.0f32];
+
+        // Turn board: cards 0,1,2,3 (2c,2d,2h,2s)
+        let turn_board = vec![0u32, 1, 2, 3];
+        // River card: card 4 (3c)
+        let river_cards = vec![4u32];
+
+        // Build combo_cards lookup
+        let combo_cards_flat = crate::training::hand_eval::build_combo_cards_flat();
+        let combo_cards = gpu.upload(&combo_cards_flat).unwrap();
+
+        let gpu_reach_oop = gpu.upload(&reach).unwrap();
+        let gpu_reach_ip = gpu.upload(&reach).unwrap();
+        let gpu_boundary_nodes = gpu.upload(&boundary_nodes).unwrap();
+        let gpu_boundary_pots = gpu.upload(&boundary_pots).unwrap();
+        let gpu_boundary_stacks = gpu.upload(&boundary_stacks).unwrap();
+        let gpu_turn_board = gpu.upload(&turn_board).unwrap();
+        let gpu_river_cards = gpu.upload(&river_cards).unwrap();
+
+        let output_size = (num_boundaries * num_rivers * num_spots * 2720) as usize;
+        let mut gpu_output = gpu.alloc_zeros::<f32>(output_size).unwrap();
+
+        gpu.launch_encode_leaf_inputs(
+            &mut gpu_output,
+            &gpu_reach_oop,
+            &gpu_reach_ip,
+            &gpu_boundary_nodes,
+            &gpu_turn_board,
+            &gpu_river_cards,
+            &gpu_boundary_pots,
+            &gpu_boundary_stacks,
+            &combo_cards,
+            0, // traverser = OOP
+            num_boundaries,
+            num_rivers,
+            num_spots,
+            total_hands,
+            hands_per_spot,
+        ).unwrap();
+
+        let result = gpu.download(&gpu_output).unwrap();
+        assert_eq!(result.len(), 2720);
+
+        // Check OOP range: combos containing card 4 should be zeroed
+        // Combo 0 is cards (0,1) which don't conflict with river=4, so should be 0.5
+        assert!(
+            (result[0] - 0.5).abs() < 1e-6,
+            "combo 0 oop should be 0.5, got {}",
+            result[0]
+        );
+
+        // Find a combo that contains card 4 (3c) — should be zeroed
+        // Combo index for (0, 4) — card_pair_to_index(0, 4) = some index
+        // combo_cards[idx*2] == 0, combo_cards[idx*2+1] == 4
+        let mut conflict_idx = None;
+        for c in 0..1326 {
+            let c1 = combo_cards_flat[c * 2];
+            let c2 = combo_cards_flat[c * 2 + 1];
+            if c1 == 4 || c2 == 4 {
+                conflict_idx = Some(c);
+                break;
+            }
+        }
+        if let Some(idx) = conflict_idx {
+            assert!(
+                result[idx].abs() < 1e-6,
+                "combo {} conflicts with river card 4, should be 0, got {}",
+                idx,
+                result[idx]
+            );
+        }
+
+        // Check board one-hot: cards 0,1,2,3,4 should be set
+        for card in [0u32, 1, 2, 3, 4] {
+            assert!(
+                (result[2652 + card as usize] - 1.0).abs() < 1e-6,
+                "board card {} should be 1.0, got {}",
+                card,
+                result[2652 + card as usize]
+            );
+        }
+        // Card 5 should NOT be set
+        assert!(
+            result[2657].abs() < 1e-6,
+            "card 5 should be 0.0, got {}",
+            result[2657]
+        );
+
+        // Rank presence: cards 0-3 are rank 0 (2s), card 4 is rank 1 (3c)
+        assert!(
+            (result[2704] - 1.0).abs() < 1e-6,
+            "rank 0 should be 1.0, got {}",
+            result[2704]
+        );
+        assert!(
+            (result[2705] - 1.0).abs() < 1e-6,
+            "rank 1 should be 1.0, got {}",
+            result[2705]
+        );
+
+        // Pot: 200 / 400 = 0.5
+        assert!(
+            (result[2717] - 0.5).abs() < 1e-6,
+            "pot should be 0.5, got {}",
+            result[2717]
+        );
+
+        // Stack: 100 / 400 = 0.25
+        assert!(
+            (result[2718] - 0.25).abs() < 1e-6,
+            "stack should be 0.25, got {}",
+            result[2718]
+        );
+
+        // Traverser = OOP = 0.0
+        assert!(
+            result[2719].abs() < 1e-6,
+            "traverser should be 0.0 for OOP, got {}",
+            result[2719]
         );
     }
 }
