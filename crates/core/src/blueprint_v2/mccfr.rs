@@ -100,7 +100,7 @@ impl AllBuckets {
                 if bf.boards.is_empty() {
                     None
                 } else {
-                    Some(bf.board_index_map_fx())
+                    Some(bf.board_index_map())
                 }
             })
         });
@@ -168,12 +168,6 @@ impl AllBuckets {
             return idx.min(self.bucket_counts[0] - 1);
         }
         self.lookup_bucket(street as usize, hole_cards, board)
-    }
-
-    /// Create `AllBuckets` with equity-only bucketing (no bucket files).
-    #[must_use]
-    pub fn equity_only(bucket_counts: [u16; 4], bucket_files: [Option<BucketFile>; 4]) -> Self {
-        Self::new(bucket_counts, bucket_files)
     }
 
     /// Return the visible board slice for a given street.
@@ -507,7 +501,7 @@ mod tests {
     fn traverse_returns_finite() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::equity_only(
+        let buckets = AllBuckets::new(
             [10, 10, 10, 10],
             [None, None, None, None],
         );
@@ -525,7 +519,7 @@ mod tests {
     fn traverse_both_players() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::equity_only(
+        let buckets = AllBuckets::new(
             [10, 10, 10, 10],
             [None, None, None, None],
         );
@@ -549,7 +543,7 @@ mod tests {
     fn traverse_updates_regrets() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::equity_only(
+        let buckets = AllBuckets::new(
             [10, 10, 10, 10],
             [None, None, None, None],
         );
@@ -573,7 +567,7 @@ mod tests {
     fn traverse_updates_strategy_sums() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::equity_only(
+        let buckets = AllBuckets::new(
             [10, 10, 10, 10],
             [None, None, None, None],
         );
@@ -595,7 +589,7 @@ mod tests {
     fn multiple_iterations_change_strategy() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::equity_only(
+        let buckets = AllBuckets::new(
             [10, 10, 10, 10],
             [None, None, None, None],
         );
@@ -634,7 +628,7 @@ mod tests {
     fn traverse_with_pruning() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::equity_only(
+        let buckets = AllBuckets::new(
             [10, 10, 10, 10],
             [None, None, None, None],
         );
@@ -778,7 +772,7 @@ mod tests {
 
     #[test]
     fn equity_fallback_aa_high_bucket() {
-        let all = AllBuckets::equity_only(
+        let all = AllBuckets::new(
             [169, 400, 100, 1000],
             [None, None, None, None],
         );
@@ -805,19 +799,9 @@ mod tests {
         assert!(turn_bucket_aa < 100, "turn bucket in range");
     }
 
-    // The remaining delta-specific tests (delta_aa_wet_board_negative,
-    // delta_flush_draw_positive, delta_combo_draw_very_positive,
-    // delta_same_equity_different_buckets, equity_only_cannot_differentiate_deltas,
-    // expected_delta_deterministic_across_runouts, actual_delta_varies_with_runout,
-    // expected_delta_flush_draw_positive_bucket) have been removed because
-    // AllBuckets no longer manages delta bins at runtime — the clustering
-    // pipeline now handles all delta-aware bucketing during offline generation.
-
-    // (Delta bucketing tests removed — see comment above)
-
     #[test]
     fn get_bucket_equity_fallback() {
-        let all = AllBuckets::equity_only(
+        let all = AllBuckets::new(
             [169, 10, 10, 10],
             [None, None, None, None],
         );
