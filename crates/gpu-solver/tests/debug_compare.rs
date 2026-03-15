@@ -15,7 +15,7 @@ use range_solver::interface::Game;
 use range_solver::range::Range;
 use range_solver::{solve, solve_step, CardConfig, PostFlopGame};
 
-/// Build a river game with configurable pot and stack.
+/// Build a river game with configurable pot, stack, and bet sizes.
 fn build_game(
     oop_range_str: &str,
     ip_range_str: &str,
@@ -24,6 +24,8 @@ fn build_game(
     river: &str,
     starting_pot: i32,
     effective_stack: i32,
+    oop_bet: &str,
+    ip_bet: &str,
 ) -> PostFlopGame {
     let oop_range: Range = oop_range_str.parse().unwrap();
     let ip_range: Range = ip_range_str.parse().unwrap();
@@ -33,12 +35,13 @@ fn build_game(
         turn: card_from_str(turn).unwrap(),
         river: card_from_str(river).unwrap(),
     };
-    let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+    let oop_sizes = BetSizeOptions::try_from((oop_bet, "")).unwrap();
+    let ip_sizes = BetSizeOptions::try_from((ip_bet, "")).unwrap();
     let tree_config = TreeConfig {
         initial_state: BoardState::River,
         starting_pot,
         effective_stack,
-        river_bet_sizes: [sizes.clone(), sizes],
+        river_bet_sizes: [oop_sizes, ip_sizes],
         ..Default::default()
     };
     let tree = ActionTree::new(tree_config).unwrap();
@@ -47,68 +50,396 @@ fn build_game(
     game
 }
 
+/// Parse a board string like "7c 2d 5s Kh 9c" into (flop, turn, river).
+fn parse_board(board: &str) -> (&str, &str, &str) {
+    let parts: Vec<&str> = board.split_whitespace().collect();
+    assert_eq!(parts.len(), 5, "Board must have exactly 5 cards");
+    let flop_end = board
+        .match_indices(' ')
+        .nth(2)
+        .map(|(i, _)| i)
+        .unwrap();
+    let flop = &board[..flop_end];
+    let turn = parts[3];
+    let river = parts[4];
+    (flop, turn, river)
+}
+
 struct Position {
     name: &'static str,
     oop_range: &'static str,
     ip_range: &'static str,
-    flop: &'static str,
-    turn: &'static str,
-    river: &'static str,
+    board: &'static str, // "Fc Fd Fh Tc Rc" — 5 cards: flop[3] turn river
     pot: i32,
     stack: i32,
+    oop_bet: &'static str,
+    ip_bet: &'static str,
 }
 
 #[test]
 fn debug_compare_gpu_vs_cpu() {
     let positions = [
+        // --- Original 3 positions ---
         Position {
-            name: "Position 1: QQ+,AKs vs QQ-JJ,AQs,AJs on Qs Jh 2c 8d 3s",
+            name: "Pos 1: QQ+,AKs vs QQ-JJ,AQs,AJs — Qs Jh 2c 8d 3s",
             oop_range: "QQ+,AKs",
             ip_range: "QQ-JJ,AQs,AJs",
-            flop: "Qs Jh 2c",
-            turn: "8d",
-            river: "3s",
+            board: "Qs Jh 2c 8d 3s",
             pot: 100,
             stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
         },
         Position {
-            name: "Position 2: AA,KK vs 22+,AK on Kd 7h 3c 9s 2d",
+            name: "Pos 2: AA,KK vs 22+,AK — Kd 7h 3c 9s 2d",
             oop_range: "AA,KK",
             ip_range: "22+,AK",
-            flop: "Kd 7h 3c",
-            turn: "9s",
-            river: "2d",
+            board: "Kd 7h 3c 9s 2d",
             pot: 200,
             stack: 150,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
         },
         Position {
-            name: "Position 3: TT+,AQ+ vs 77+,AJ+ on Tc 8s 4h Jd 2c",
+            name: "Pos 3: TT+,AQ+ vs 77+,AJ+ — Tc 8s 4h Jd 2c",
             oop_range: "TT+,AQ+",
             ip_range: "77+,AJ+",
-            flop: "Tc 8s 4h",
-            turn: "Jd",
-            river: "2c",
+            board: "Tc 8s 4h Jd 2c",
             pot: 80,
             stack: 200,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // --- 27 new positions ---
+        // 4. BTN vs BB SRP, dry board
+        Position {
+            name: "Pos 4: dry board — 7c 2d 5s Kh 9d",
+            oop_range: "22+,A2s+",
+            ip_range: "QQ+,AK",
+            board: "7c 2d 5s Kh 9d",
+            pot: 60,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 5. 3bet pot, paired board
+        Position {
+            name: "Pos 5: 3bet paired — Jd Jc 3h 8s Tc",
+            oop_range: "QQ+,AKs",
+            ip_range: "TT+,AQs+",
+            board: "Jd Jc 3h 8s Tc",
+            pot: 180,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 6. Monotone flop (4 hearts on board)
+        Position {
+            name: "Pos 6: monotone — 9h 6h 2h Th 4c",
+            oop_range: "AA,KK,AKs",
+            ip_range: "TT+,AJs+",
+            board: "9h 6h 2h Th 4c",
+            pot: 100,
+            stack: 150,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 7. Broadway heavy
+        Position {
+            name: "Pos 7: broadway — Kc Qd Ts 3h 7d",
+            oop_range: "TT+,AJ+",
+            ip_range: "99+,AT+",
+            board: "Kc Qd Ts 3h 7d",
+            pot: 100,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 8. Low board
+        Position {
+            name: "Pos 8: low board — 4d 3c 2s 8h 6c",
+            oop_range: "AA-TT",
+            ip_range: "77+,A9s+",
+            board: "4d 3c 2s 8h 6c",
+            pot: 80,
+            stack: 120,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 9. Shallow stack
+        Position {
+            name: "Pos 9: shallow — As Kd 7c 4h 2d",
+            oop_range: "JJ+,AK",
+            ip_range: "TT+,AQ+",
+            board: "As Kd 7c 4h 2d",
+            pot: 100,
+            stack: 50,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 10. Deep stack
+        Position {
+            name: "Pos 10: deep — 8c 5d 3h Jc 9s",
+            oop_range: "QQ+,AKs",
+            ip_range: "JJ-99,AQs",
+            board: "8c 5d 3h Jc 9s",
+            pot: 60,
+            stack: 300,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 11. Paired board 2
+        Position {
+            name: "Pos 11: paired 2 — 6c 6d Ks Ah 3s",
+            oop_range: "AA,KK",
+            ip_range: "QQ,JJ,TT",
+            board: "6c 6d Ks Ah 3s",
+            pot: 100,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 12. Connected board
+        Position {
+            name: "Pos 12: connected — 9c 8d 7s Td 2h",
+            oop_range: "TT+,AQ+",
+            ip_range: "88+,AJ+",
+            board: "9c 8d 7s Td 2h",
+            pot: 120,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 13. Ace-high
+        Position {
+            name: "Pos 13: ace-high — Ad 9c 5h 3s 7c",
+            oop_range: "KK,QQ",
+            ip_range: "AA,AKs",
+            board: "Ad 9c 5h 3s 7c",
+            pot: 100,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 14. Two-pair board
+        Position {
+            name: "Pos 14: two-pair board — 5c 5d 9s 9h Kd",
+            oop_range: "JJ+,AK",
+            ip_range: "TT+,AQ",
+            board: "5c 5d 9s 9h Kd",
+            pot: 100,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 15. Flush possible (3 spades)
+        Position {
+            name: "Pos 15: flush possible — 7s 4s 2c Js 8d",
+            oop_range: "AA,KK,AKs",
+            ip_range: "QQ-TT,AQs",
+            board: "7s 4s 2c Js 8d",
+            pot: 80,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 16. Wide vs narrow (OOP wide, IP narrow)
+        Position {
+            name: "Pos 16: wide vs narrow — 6c 3d 8h Ts 2s",
+            oop_range: "22+,A2s+,K9s+",
+            ip_range: "AA",
+            board: "6c 3d 8h Ts 2s",
+            pot: 100,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 17. Narrow vs wide (OOP narrow, IP wide)
+        Position {
+            name: "Pos 17: narrow vs wide — Qc 7d 4s 9h 3d",
+            oop_range: "AA",
+            ip_range: "22+,A5s+,KTs+",
+            board: "Qc 7d 4s 9h 3d",
+            pot: 100,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 18. High card board
+        Position {
+            name: "Pos 18: high card board — Ac Kd Qh 5s 3c",
+            oop_range: "TT+,AJ+",
+            ip_range: "99+,AT+",
+            board: "Ac Kd Qh 5s 3c",
+            pot: 150,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 19. Gutshot board
+        Position {
+            name: "Pos 19: gutshot — 9c 7d 3s Th 6h",
+            oop_range: "JJ+,AK",
+            ip_range: "TT+,AQ",
+            board: "9c 7d 3s Th 6h",
+            pot: 100,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 20. Overcard river
+        Position {
+            name: "Pos 20: overcard river — 8c 5d 2h 4s Ad",
+            oop_range: "QQ,JJ,TT",
+            ip_range: "99-77,ATs+",
+            board: "8c 5d 2h 4s Ad",
+            pot: 100,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 21. Blank river
+        Position {
+            name: "Pos 21: blank river — Td 7c 3s 5h 2c",
+            oop_range: "AA,KK,QQ",
+            ip_range: "JJ,TT,99",
+            board: "Td 7c 3s 5h 2c",
+            pot: 100,
+            stack: 150,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 22. Trips board
+        Position {
+            name: "Pos 22: trips board — 4c 4d 4h 9s Kd",
+            oop_range: "KK,QQ,AK",
+            ip_range: "JJ,TT,AQ",
+            board: "4c 4d 4h 9s Kd",
+            pot: 100,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 23. Small pot, deep effective
+        Position {
+            name: "Pos 23: small pot — Jc 8d 2s 5h Kc",
+            oop_range: "TT+,AQ+",
+            ip_range: "99+,AJ+",
+            board: "Jc 8d 2s 5h Kc",
+            pot: 40,
+            stack: 200,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 24. Large pot
+        Position {
+            name: "Pos 24: large pot — 7c 3d 9h 2s Td",
+            oop_range: "QQ+,AKs",
+            ip_range: "JJ+,AQs",
+            board: "7c 3d 9h 2s Td",
+            pot: 300,
+            stack: 150,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 25. SB vs BB
+        Position {
+            name: "Pos 25: SB vs BB — 6d 4c 9h Ks 2h",
+            oop_range: "33+,A2s+,K8s+",
+            ip_range: "55+,A7s+,KTs+",
+            board: "6d 4c 9h Ks 2h",
+            pot: 50,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 26. Squeeze pot (big pot, shallow SPR)
+        Position {
+            name: "Pos 26: squeeze pot — 8c 7d 3h As 5d",
+            oop_range: "KK+,AKs",
+            ip_range: "QQ-TT,AQs",
+            board: "8c 7d 3h As 5d",
+            pot: 250,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 27. Limped pot (tiny pot, deep)
+        Position {
+            name: "Pos 27: limped pot — Ts 6c 3d 8h Kd",
+            oop_range: "22+,A2s+",
+            ip_range: "22+,A2s+",
+            board: "Ts 6c 3d 8h Kd",
+            pot: 20,
+            stack: 200,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 28. 4bet pot (huge pot, shallow SPR)
+        Position {
+            name: "Pos 28: 4bet pot — 7c 4d 2s Jh 9d",
+            oop_range: "KK+,AKs",
+            ip_range: "QQ+,AKs",
+            board: "7c 4d 2s Jh 9d",
+            pot: 400,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 29. Medium-wide ranges
+        Position {
+            name: "Pos 29: medium ranges — 5c 3d 2h 9s Qd",
+            oop_range: "TT+,AJs+",
+            ip_range: "88+,ATs+",
+            board: "5c 3d 2h 9s Qd",
+            pot: 100,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
+        },
+        // 30. Very dry, pocket pair matchup
+        Position {
+            name: "Pos 30: very dry — 2c 3d 7s Kh 4s",
+            oop_range: "AA-JJ",
+            ip_range: "TT-77",
+            board: "2c 3d 7s Kh 4s",
+            pot: 100,
+            stack: 100,
+            oop_bet: "50%, a",
+            ip_bet: "50%, a",
         },
     ];
 
     let iterations = 1000u32;
 
-    for pos in &positions {
+    // Track per-position results for the summary.
+    struct PositionResult {
+        name: String,
+        max_diff: f32,
+        dominant_agree: u32,
+        dominant_total: u32,
+        passed: bool,
+    }
+    let mut results: Vec<PositionResult> = Vec::new();
+
+    for (pos_idx, pos) in positions.iter().enumerate() {
         eprintln!("\n{}", "=".repeat(80));
-        eprintln!("{}", pos.name);
+        eprintln!("[{}/{}] {}", pos_idx + 1, positions.len(), pos.name);
         eprintln!("{}", "=".repeat(80));
+
+        let (flop, turn, river) = parse_board(pos.board);
 
         // --- CPU solve ---
         let mut cpu_game = build_game(
             pos.oop_range,
             pos.ip_range,
-            pos.flop,
-            pos.turn,
-            pos.river,
+            flop,
+            turn,
+            river,
             pos.pot,
             pos.stack,
+            pos.oop_bet,
+            pos.ip_bet,
         );
         let cpu_exploit = solve(&mut cpu_game, iterations, 0.0, false);
         eprintln!("CPU exploitability: {:.6}", cpu_exploit);
@@ -127,11 +458,13 @@ fn debug_compare_gpu_vs_cpu() {
         let mut gpu_game = build_game(
             pos.oop_range,
             pos.ip_range,
-            pos.flop,
-            pos.turn,
-            pos.river,
+            flop,
+            turn,
+            river,
             pos.pot,
             pos.stack,
+            pos.oop_bet,
+            pos.ip_bet,
         );
         let flat_tree = FlatTree::from_postflop_game(&mut gpu_game);
         let gpu_ctx = GpuContext::new(0).unwrap();
@@ -151,8 +484,11 @@ fn debug_compare_gpu_vs_cpu() {
         );
         eprintln!("Actions: {:?}", cpu_actions);
 
-        // --- Print per-hand strategy comparison ---
-        eprintln!("\n{:<20} | {:>30} | {:>30}", "Hand", "CPU strategy", "GPU strategy");
+        // --- Print per-hand strategy comparison (first 15 hands to keep output manageable) ---
+        eprintln!(
+            "\n{:<20} | {:>30} | {:>30}",
+            "Hand", "CPU strategy", "GPU strategy"
+        );
         eprintln!("{:-<85}", "");
 
         let num_compare = cpu_num_hands.min(gpu_num_hands);
@@ -178,16 +514,20 @@ fn debug_compare_gpu_vs_cpu() {
                 gpu_probs.push(gpu_strategy[idx]);
             }
 
-            // Format probabilities
-            let cpu_str: Vec<String> = cpu_probs.iter().map(|p| format!("{:.3}", p)).collect();
-            let gpu_str: Vec<String> = gpu_probs.iter().map(|p| format!("{:.3}", p)).collect();
+            // Print first 15 hands for readability
+            if h < 15 {
+                let cpu_str: Vec<String> =
+                    cpu_probs.iter().map(|p| format!("{:.3}", p)).collect();
+                let gpu_str: Vec<String> =
+                    gpu_probs.iter().map(|p| format!("{:.3}", p)).collect();
 
-            eprintln!(
-                "{:<20} | {:>30} | {:>30}",
-                hand_name,
-                cpu_str.join(" "),
-                gpu_str.join(" ")
-            );
+                eprintln!(
+                    "{:<20} | {:>30} | {:>30}",
+                    hand_name,
+                    cpu_str.join(" "),
+                    gpu_str.join(" ")
+                );
+            }
 
             // Track max absolute difference
             let min_actions = cpu_probs.len().min(gpu_probs.len());
@@ -219,16 +559,98 @@ fn debug_compare_gpu_vs_cpu() {
             }
         }
 
+        if num_compare > 15 {
+            eprintln!("... ({} more hands omitted)", num_compare - 15);
+        }
+
+        let dominant_pct = if dominant_total > 0 {
+            dominant_agree as f64 / dominant_total as f64 * 100.0
+        } else {
+            0.0
+        };
+
         eprintln!("\nMax absolute difference: {:.6}", max_abs_diff);
         eprintln!(
             "Dominant action agreement: {}/{} ({:.1}%)",
+            dominant_agree, dominant_total, dominant_pct
+        );
+
+        let passed = max_abs_diff < 0.01 && dominant_pct >= 95.0;
+        eprintln!(
+            "Result: {}",
+            if passed { "PASS" } else { "FAIL" }
+        );
+
+        results.push(PositionResult {
+            name: pos.name.to_string(),
+            max_diff: max_abs_diff,
             dominant_agree,
             dominant_total,
-            if dominant_total > 0 {
-                dominant_agree as f64 / dominant_total as f64 * 100.0
-            } else {
-                0.0
-            }
+            passed,
+        });
+    }
+
+    // === Summary ===
+    eprintln!("\n{}", "=".repeat(80));
+    eprintln!(
+        "SUMMARY: GPU vs CPU comparison across {} positions",
+        results.len()
+    );
+    eprintln!("{}", "=".repeat(80));
+    eprintln!(
+        "{:<55} {:>10} {:>12} {:>6}",
+        "Position", "Max Diff", "Dom Agree %", "Result"
+    );
+    eprintln!("{:-<87}", "");
+
+    let mut worst_diff = 0.0f32;
+    let mut num_passed = 0u32;
+
+    for r in &results {
+        let pct = if r.dominant_total > 0 {
+            r.dominant_agree as f64 / r.dominant_total as f64 * 100.0
+        } else {
+            0.0
+        };
+        let status = if r.passed { "PASS" } else { "FAIL" };
+        eprintln!(
+            "{:<55} {:>10.6} {:>11.1}% {:>6}",
+            r.name, r.max_diff, pct, status
+        );
+        if r.max_diff > worst_diff {
+            worst_diff = r.max_diff;
+        }
+        if r.passed {
+            num_passed += 1;
+        }
+    }
+
+    eprintln!("{:-<87}", "");
+    eprintln!(
+        "Positions passed: {}/{} | Worst max diff: {:.6}",
+        num_passed,
+        results.len(),
+        worst_diff
+    );
+
+    // Assert all positions pass
+    for r in &results {
+        assert!(
+            r.max_diff < 0.01,
+            "Position '{}' exceeded max diff threshold: {:.6} >= 0.01",
+            r.name,
+            r.max_diff
+        );
+        let pct = if r.dominant_total > 0 {
+            r.dominant_agree as f64 / r.dominant_total as f64 * 100.0
+        } else {
+            100.0 // no hands = vacuously true
+        };
+        assert!(
+            pct >= 95.0,
+            "Position '{}' dominant action agreement too low: {:.1}% < 95%",
+            r.name,
+            pct
         );
     }
 }
@@ -237,7 +659,9 @@ fn debug_compare_gpu_vs_cpu() {
 #[test]
 fn debug_terminal_values() {
     // Use position 2: simple case, OOP has 9 hands
-    let mut game = build_game("AA,KK", "22+,AK", "Kd 7h 3c", "9s", "2d", 200, 150);
+    let mut game = build_game(
+        "AA,KK", "22+,AK", "Kd 7h 3c", "9s", "2d", 200, 150, "50%, a", "50%, a",
+    );
     let flat = FlatTree::from_postflop_game(&mut game);
 
     eprintln!("num_hands_oop={}, num_hands_ip={}, num_hands={}",
@@ -359,6 +783,8 @@ fn debug_minimal_iteration_trace() {
         "7h",
         100,
         100,
+        "50%, a",
+        "50%, a",
     );
 
     let num_hands_oop = cpu_game.num_private_hands(0);
@@ -393,7 +819,9 @@ fn debug_minimal_iteration_trace() {
     print_cpu_tree_strategies(&mut cpu_game, &[], 0);
 
     // Build FlatTree and run GPU
-    let mut gpu_game = build_game("KK", "AA", "2c 3d 4h", "5s", "7h", 100, 100);
+    let mut gpu_game = build_game(
+        "KK", "AA", "2c 3d 4h", "5s", "7h", 100, 100, "50%, a", "50%, a",
+    );
     let flat = FlatTree::from_postflop_game(&mut gpu_game);
 
     eprintln!("\n--- FlatTree structure ---");
@@ -513,7 +941,9 @@ fn debug_minimal_iteration_trace() {
 
     // Also run the full solve for a few hundred iterations and compare
     eprintln!("\n--- Full solve comparison (200 iterations) ---");
-    let mut cpu_game2 = build_game("KK", "AA", "2c 3d 4h", "5s", "7h", 100, 100);
+    let mut cpu_game2 = build_game(
+        "KK", "AA", "2c 3d 4h", "5s", "7h", 100, 100, "50%, a", "50%, a",
+    );
     let cpu_exploit = solve(&mut cpu_game2, 200, 0.0, false);
     eprintln!("CPU exploitability: {:.6}", cpu_exploit);
 
@@ -523,7 +953,9 @@ fn debug_minimal_iteration_trace() {
     let cpu_nh = cpu_game2.num_private_hands(cpu_pl);
     let cpu_na = cpu_game2.available_actions().len();
 
-    let mut gpu_game2 = build_game("KK", "AA", "2c 3d 4h", "5s", "7h", 100, 100);
+    let mut gpu_game2 = build_game(
+        "KK", "AA", "2c 3d 4h", "5s", "7h", 100, 100, "50%, a", "50%, a",
+    );
     let flat2 = FlatTree::from_postflop_game(&mut gpu_game2);
     let gpu_ctx2 = GpuContext::new(0).unwrap();
     let gpu_result2 = GpuSolver::new(&gpu_ctx2, &flat2)
