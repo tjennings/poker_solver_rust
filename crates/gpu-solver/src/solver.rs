@@ -34,6 +34,8 @@ struct LevelData {
 struct BackwardLevelData {
     /// Decision node IDs at this level.
     decision_nodes: CudaSlice<u32>,
+    /// Player who acts at each decision node (0=OOP, 1=IP).
+    decision_players: CudaSlice<u32>,
     /// Number of decision nodes at this level.
     num_decision_nodes: u32,
 }
@@ -86,6 +88,10 @@ pub struct GpuSolver<'a> {
 
     gpu_hand_strengths_oop: CudaSlice<u32>,
     gpu_hand_strengths_ip: CudaSlice<u32>,
+
+    // Card blocking matrices
+    gpu_valid_matchups_oop: CudaSlice<f32>,
+    gpu_valid_matchups_ip: CudaSlice<f32>,
 
     // Decision node lists per player
     decision_nodes_oop: CudaSlice<u32>,
@@ -176,9 +182,11 @@ impl<'a> GpuSolver<'a> {
             let end = tree.level_starts[level + 1] as usize;
 
             let mut decision_nodes_vec = Vec::new();
+            let mut decision_players_vec = Vec::new();
             for node_id in start..end {
                 if !tree.is_terminal(node_id) {
                     decision_nodes_vec.push(node_id as u32);
+                    decision_players_vec.push(tree.player(node_id) as u32);
                 }
             }
 
@@ -186,9 +194,11 @@ impl<'a> GpuSolver<'a> {
             // Ensure we have at least one element for GPU buffer
             if decision_nodes_vec.is_empty() {
                 decision_nodes_vec.push(0);
+                decision_players_vec.push(0);
             }
             backward_level_data.push(BackwardLevelData {
                 decision_nodes: gpu.upload(&decision_nodes_vec)?,
+                decision_players: gpu.upload(&decision_players_vec)?,
                 num_decision_nodes: num_decision,
             });
         }
@@ -264,6 +274,10 @@ impl<'a> GpuSolver<'a> {
         let gpu_hand_strengths_oop = gpu.upload(&hs_oop)?;
         let gpu_hand_strengths_ip = gpu.upload(&hs_ip)?;
 
+        // Upload card blocking matrices
+        let gpu_valid_matchups_oop = gpu.upload(&tree.valid_matchups_oop)?;
+        let gpu_valid_matchups_ip = gpu.upload(&tree.valid_matchups_ip)?;
+
         // Build decision node lists per player
         let mut oop_decisions = Vec::new();
         let mut ip_decisions = Vec::new();
@@ -314,6 +328,8 @@ impl<'a> GpuSolver<'a> {
             num_showdown_terminals,
             gpu_hand_strengths_oop,
             gpu_hand_strengths_ip,
+            gpu_valid_matchups_oop,
+            gpu_valid_matchups_ip,
             decision_nodes_oop,
             decision_nodes_ip,
             num_oop_decisions,
@@ -386,6 +402,11 @@ impl<'a> GpuSolver<'a> {
                     } else {
                         &self.reach_oop
                     };
+                    let valid_matchups = if traverser == 0 {
+                        &self.gpu_valid_matchups_oop
+                    } else {
+                        &self.gpu_valid_matchups_ip
+                    };
                     self.gpu.launch_terminal_fold_eval(
                         &mut self.cfvalues,
                         opp_reach,
@@ -393,6 +414,7 @@ impl<'a> GpuSolver<'a> {
                         &self.fold_amount_win,
                         &self.fold_amount_lose,
                         &self.fold_player,
+                        valid_matchups,
                         traverser,
                         self.num_fold_terminals,
                         self.num_hands,
@@ -406,10 +428,15 @@ impl<'a> GpuSolver<'a> {
                     } else {
                         &self.reach_oop
                     };
-                    let hand_strengths = if traverser == 0 {
-                        &self.gpu_hand_strengths_oop
+                    let (traverser_strengths, opponent_strengths) = if traverser == 0 {
+                        (&self.gpu_hand_strengths_oop, &self.gpu_hand_strengths_ip)
                     } else {
-                        &self.gpu_hand_strengths_ip
+                        (&self.gpu_hand_strengths_ip, &self.gpu_hand_strengths_oop)
+                    };
+                    let valid_matchups = if traverser == 0 {
+                        &self.gpu_valid_matchups_oop
+                    } else {
+                        &self.gpu_valid_matchups_ip
                     };
                     self.gpu.launch_terminal_showdown_eval(
                         &mut self.cfvalues,
@@ -417,7 +444,9 @@ impl<'a> GpuSolver<'a> {
                         &self.showdown_terminal_nodes,
                         &self.showdown_amount_win,
                         &self.showdown_amount_lose,
-                        hand_strengths,
+                        traverser_strengths,
+                        opponent_strengths,
+                        valid_matchups,
                         self.num_showdown_terminals,
                         self.num_hands,
                     )?;
@@ -436,6 +465,8 @@ impl<'a> GpuSolver<'a> {
                         &self.gpu_child_offsets,
                         &self.gpu_children,
                         &self.gpu_infoset_ids,
+                        &bld.decision_players,
+                        traverser,
                         bld.num_decision_nodes,
                         self.num_hands,
                         self.max_actions,
@@ -450,13 +481,28 @@ impl<'a> GpuSolver<'a> {
                 };
 
                 if num_decision > 0 {
-                    // DCFR+ discount factors
-                    let alpha = 1.5f32;
-                    let t_f = t as f32;
-                    let t_alpha = t_f.powf(alpha);
-                    let pos_discount = t_alpha / (t_alpha + 1.0);
-                    let neg_discount = 0.5;
-                    let strat_weight = (t_f - 100.0).max(0.0);
+                    // DCFR discount factors — match range-solver's DiscountParams
+                    // CPU solver uses 0-indexed iteration `t`:
+                    //   alpha_t = (t-1)^1.5 / ((t-1)^1.5 + 1)
+                    //   beta_t  = 0.5
+                    //   gamma_t = ((t - nearest_lower_power_of_4) / (t - nlp4 + 1))^3
+                    // Here `t` is 1-indexed, so `current_iteration = t - 1` (0-indexed)
+                    let current_iteration = t - 1; // 0-indexed to match CPU
+
+                    let t_alpha = (current_iteration as i32 - 1).max(0) as f64;
+                    let pow_alpha = t_alpha * t_alpha.sqrt();
+                    let pos_discount = (pow_alpha / (pow_alpha + 1.0)) as f32;
+                    let neg_discount = 0.5f32;
+
+                    // gamma_t: power-of-4 based strategy weight
+                    let nearest_lower_power_of_4 = match current_iteration {
+                        0 => 0u32,
+                        x => 1u32 << ((x.leading_zeros() ^ 31) & !1),
+                    };
+                    let t_gamma =
+                        (current_iteration - nearest_lower_power_of_4) as f64;
+                    let strat_discount =
+                        ((t_gamma / (t_gamma + 1.0)).powi(3)) as f32;
 
                     self.gpu.launch_update_regrets(
                         &mut self.regrets,
@@ -473,7 +519,7 @@ impl<'a> GpuSolver<'a> {
                         self.max_actions,
                         pos_discount,
                         neg_discount,
-                        strat_weight,
+                        strat_discount,
                     )?;
                 }
             }

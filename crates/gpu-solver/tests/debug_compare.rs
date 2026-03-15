@@ -233,6 +233,110 @@ fn debug_compare_gpu_vs_cpu() {
     }
 }
 
+/// Diagnostic: Run 1 iteration and check terminal fold values match.
+#[test]
+fn debug_terminal_values() {
+    // Use position 2: simple case, OOP has 9 hands
+    let mut game = build_game("AA,KK", "22+,AK", "Kd 7h 3c", "9s", "2d", 200, 150);
+    let flat = FlatTree::from_postflop_game(&mut game);
+
+    eprintln!("num_hands_oop={}, num_hands_ip={}, num_hands={}",
+        flat.num_hands_oop, flat.num_hands_ip, flat.num_hands);
+    eprintln!("num_fold_terminals: {}",
+        flat.terminal_indices.iter()
+            .filter(|&&i| flat.node_types[i as usize] == poker_solver_gpu::tree::NodeType::TerminalFold)
+            .count());
+    eprintln!("num_showdown_terminals: {}",
+        flat.terminal_indices.iter()
+            .filter(|&&i| flat.node_types[i as usize] == poker_solver_gpu::tree::NodeType::TerminalShowdown)
+            .count());
+
+    // Print tree structure
+    for (i, nt) in flat.node_types.iter().enumerate() {
+        let parent = flat.parent_nodes[i];
+        let parent_action = flat.parent_actions[i];
+        eprintln!("Node {}: {:?}, pot={:.0}, parent={}, action={}",
+            i, nt, flat.pots[i],
+            if parent == u32::MAX { "root".to_string() } else { parent.to_string() },
+            if parent_action == u32::MAX { "N/A".to_string() } else { parent_action.to_string() });
+    }
+
+    // Print fold payoffs
+    eprintln!("\nFold payoffs:");
+    for (term_i, &node_id) in flat.terminal_indices.iter().enumerate() {
+        if flat.node_types[node_id as usize] == poker_solver_gpu::tree::NodeType::TerminalFold {
+            let payoff = &flat.fold_payoffs[term_i];
+            eprintln!("  node={}: amount_win={:.6}, amount_lose={:.6}, fold_player={}",
+                node_id, payoff[0], payoff[1], payoff[2] as u32);
+        }
+    }
+
+    // Print showdown info
+    eprintln!("\nShowdown payoffs:");
+    for (term_i, &node_id) in flat.terminal_indices.iter().enumerate() {
+        if flat.node_types[node_id as usize] == poker_solver_gpu::tree::NodeType::TerminalShowdown {
+            let eq_id = flat.showdown_equity_ids[term_i] as usize;
+            let eq = &flat.equity_tables[eq_id];
+            eprintln!("  node={}: amount_win={:.6}, amount_lose={:.6}",
+                node_id, eq[0], eq[1]);
+        }
+    }
+
+    // Print some hand strengths
+    eprintln!("\nOOP hand strengths (first 9):");
+    for (i, &s) in flat.hand_strengths_oop.iter().take(9).enumerate() {
+        let cards = game.private_cards(0);
+        let (c1, c2) = cards[i];
+        eprintln!("  hand {}: {} {} -> strength {}", i, card_name(c1), card_name(c2), s);
+    }
+    eprintln!("IP hand strengths (first 10):");
+    for (i, &s) in flat.hand_strengths_ip.iter().take(10).enumerate() {
+        let cards = game.private_cards(1);
+        let (c1, c2) = cards[i];
+        eprintln!("  hand {}: {} {} -> strength {}", i, card_name(c1), card_name(c2), s);
+    }
+
+    // Print valid_matchups for OOP hand 0 vs first 10 IP hands
+    eprintln!("\nValid matchups (OOP hand 0 vs IP hands 0..10):");
+    for ip_h in 0..10.min(flat.num_hands_ip) {
+        let cards_ip = game.private_cards(1);
+        let (c1, c2) = cards_ip[ip_h];
+        let valid = flat.valid_matchups_oop[0 * flat.num_hands + ip_h];
+        eprintln!("  OOP[0] vs IP[{}] ({} {}): valid={}", ip_h, card_name(c1), card_name(c2), valid);
+    }
+
+    // Print initial reaches
+    eprintln!("\nInitial reach OOP (first 9):");
+    for i in 0..9 {
+        eprintln!("  hand {}: {}", i, flat.initial_reach_oop[i]);
+    }
+    eprintln!("Initial reach IP (first 10):");
+    for i in 0..10 {
+        eprintln!("  hand {}: {}", i, flat.initial_reach_ip[i]);
+    }
+
+    // Run GPU solver for 1 iteration and check cfvalues at root
+    let gpu_ctx = GpuContext::new(0).unwrap();
+    let gpu_result = GpuSolver::new(&gpu_ctx, &flat)
+        .unwrap()
+        .solve(1, None)
+        .unwrap();
+
+    eprintln!("\nGPU strategy after 1 iteration (root, OOP hands 0..9):");
+    let _max_actions = flat.max_actions();
+    let root_n_actions = flat.infoset_num_actions[0] as usize;
+    for h in 0..9 {
+        let mut probs = Vec::new();
+        for a in 0..root_n_actions {
+            let idx = a * flat.num_hands + h;
+            probs.push(gpu_result.strategy[idx]);
+        }
+        let cards = game.private_cards(0);
+        let (c1, c2) = cards[h];
+        eprintln!("  {} {}: {:?}", card_name(c1), card_name(c2), probs);
+    }
+}
+
 /// Convert a card byte to a human-readable name like "As", "Kh", etc.
 fn card_name(card: u8) -> String {
     let rank = card / 4;

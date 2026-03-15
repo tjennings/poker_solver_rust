@@ -175,8 +175,11 @@ impl GpuContext {
     ///
     /// Computes counterfactual values at fold terminal nodes. For each
     /// (fold_terminal, hand) pair:
-    ///   - If the traverser folded: `cfv[hand] = amount_lose * sum(opp_reach)`
-    ///   - If the opponent folded: `cfv[hand] = amount_win * sum(opp_reach)`
+    ///   - If the traverser folded: `cfv[hand] = amount_lose * sum(valid_opp_reach)`
+    ///   - If the opponent folded: `cfv[hand] = amount_win * sum(valid_opp_reach)`
+    ///
+    /// Card blocking: only sums opponent reach for hands that don't share cards
+    /// with the traverser's hand.
     ///
     /// # Layout
     /// - `cfvalues`: `[num_nodes * num_hands]` — output (only fold terminals written)
@@ -185,6 +188,8 @@ impl GpuContext {
     /// - `fold_amount_win`: `[num_fold_terminals]` — positive payoff
     /// - `fold_amount_lose`: `[num_fold_terminals]` — negative payoff
     /// - `fold_player`: `[num_fold_terminals]` — which player folded (0 or 1)
+    /// - `valid_matchups`: `[num_hands * num_hands]` — 1.0 if hands don't share cards
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_terminal_fold_eval(
         &self,
         cfvalues: &mut CudaSlice<f32>,
@@ -193,6 +198,7 @@ impl GpuContext {
         fold_amount_win: &CudaSlice<f32>,
         fold_amount_lose: &CudaSlice<f32>,
         fold_player: &CudaSlice<u32>,
+        valid_matchups: &CudaSlice<f32>,
         traverser: u32,
         num_fold_terminals: u32,
         num_hands: u32,
@@ -212,6 +218,7 @@ impl GpuContext {
                 .arg(fold_amount_win)
                 .arg(fold_amount_lose)
                 .arg(fold_player)
+                .arg(valid_matchups)
                 .arg(&traverser)
                 .arg(&num_fold_terminals)
                 .arg(&num_hands)
@@ -224,8 +231,8 @@ impl GpuContext {
     ///
     /// Computes counterfactual values at showdown terminal nodes. For each
     /// (showdown_terminal, hand) pair, sums over opponent hands:
-    ///   - `cfv[h] += amount_win * opp_reach[h']` if hand h beats h'
-    ///   - `cfv[h] += amount_lose * opp_reach[h']` if hand h loses to h'
+    ///   - `cfv[h] += amount_win * opp_reach[h']` if hand h beats h' and not blocked
+    ///   - `cfv[h] += amount_lose * opp_reach[h']` if hand h loses to h' and not blocked
     ///   - ties contribute nothing
     ///
     /// # Layout
@@ -234,7 +241,10 @@ impl GpuContext {
     /// - `terminal_nodes`: `[num_showdown_terminals]` — node indices
     /// - `amount_win`: `[num_showdown_terminals]` — positive payoff per combo
     /// - `amount_lose`: `[num_showdown_terminals]` — negative payoff per combo
-    /// - `hand_strengths`: `[num_hands]` — strength ranking for each hand combo
+    /// - `traverser_strengths`: `[num_hands]` — strength ranking for traverser's hands
+    /// - `opponent_strengths`: `[num_hands]` — strength ranking for opponent's hands
+    /// - `valid_matchups`: `[num_hands * num_hands]` — 1.0 if hands don't share cards
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_terminal_showdown_eval(
         &self,
         cfvalues: &mut CudaSlice<f32>,
@@ -242,7 +252,9 @@ impl GpuContext {
         terminal_nodes: &CudaSlice<u32>,
         amount_win: &CudaSlice<f32>,
         amount_lose: &CudaSlice<f32>,
-        hand_strengths: &CudaSlice<u32>,
+        traverser_strengths: &CudaSlice<u32>,
+        opponent_strengths: &CudaSlice<u32>,
+        valid_matchups: &CudaSlice<f32>,
         num_showdown_terminals: u32,
         num_hands: u32,
     ) -> Result<(), GpuError> {
@@ -260,7 +272,9 @@ impl GpuContext {
                 .arg(terminal_nodes)
                 .arg(amount_win)
                 .arg(amount_lose)
-                .arg(hand_strengths)
+                .arg(traverser_strengths)
+                .arg(opponent_strengths)
+                .arg(valid_matchups)
                 .arg(&num_showdown_terminals)
                 .arg(&num_hands)
                 .launch(cfg)?;
@@ -271,7 +285,8 @@ impl GpuContext {
     /// Launch the backward CFV propagation kernel.
     ///
     /// For each decision node at the given level, computes:
-    ///   `cfv[node][hand] = sum_a(strategy[infoset][a][hand] * cfv[child_a][hand])`
+    ///   - Traverser's nodes: `cfv[node][hand] = sum_a(strategy[a][hand] * cfv[child_a][hand])`
+    ///   - Opponent's nodes: `cfv[node][hand] = sum_a(cfv[child_a][hand])`
     ///
     /// Must be called level-by-level from leaves to root (bottom-up).
     ///
@@ -282,6 +297,8 @@ impl GpuContext {
     /// - `child_offsets`: `[num_total_nodes + 1]` — CSR child offsets
     /// - `children_arr`: CSR child node IDs
     /// - `infoset_ids`: `[num_total_nodes]` — infoset id per node (u32::MAX for terminals)
+    /// - `node_players`: `[num_nodes_this_level]` — player who acts at each node (0=OOP, 1=IP)
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_backward_cfv(
         &self,
         cfvalues: &mut CudaSlice<f32>,
@@ -290,6 +307,8 @@ impl GpuContext {
         child_offsets: &CudaSlice<u32>,
         children_arr: &CudaSlice<u32>,
         infoset_ids: &CudaSlice<u32>,
+        node_players: &CudaSlice<u32>,
+        traverser: u32,
         num_nodes_this_level: u32,
         num_hands: u32,
         max_actions: u32,
@@ -309,6 +328,8 @@ impl GpuContext {
                 .arg(child_offsets)
                 .arg(children_arr)
                 .arg(infoset_ids)
+                .arg(node_players)
+                .arg(&traverser)
                 .arg(&num_nodes_this_level)
                 .arg(&num_hands)
                 .arg(&max_actions)
@@ -412,7 +433,7 @@ impl GpuContext {
     /// For each (decision_node, action, hand):
     ///   1. Computes instantaneous regret: `cfv[child_a][hand] - cfv[node][hand]`
     ///   2. Updates cumulative regret with DCFR discounting
-    ///   3. Accumulates strategy sum
+    ///   3. Updates strategy sum: `sum = sum * strat_discount + strategy`
     ///
     /// # Layout
     /// - `regrets`: `[num_infosets * max_actions * num_hands]` — in/out
@@ -437,7 +458,7 @@ impl GpuContext {
         max_actions: u32,
         pos_discount: f32,
         neg_discount: f32,
-        strat_weight: f32,
+        strat_discount: f32,
     ) -> Result<(), GpuError> {
         let kernel = self.compile_and_load(
             include_str!("../kernels/update_regrets.cu"),
@@ -462,7 +483,7 @@ impl GpuContext {
                 .arg(&max_actions)
                 .arg(&pos_discount)
                 .arg(&neg_discount)
-                .arg(&strat_weight)
+                .arg(&strat_discount)
                 .launch(cfg)?;
         }
         Ok(())
@@ -653,6 +674,8 @@ mod tests {
         let fold_amount_win = vec![5.0f32]; // win 5 per combo
         let fold_amount_lose = vec![-5.0f32]; // lose 5 per combo
         let fold_player = vec![1u32]; // IP (opponent) folded
+        // All matchups valid (no card conflicts in this test)
+        let valid_matchups = vec![1.0f32; (num_hands * num_hands) as usize];
 
         let mut gpu_cfvalues = gpu.alloc_zeros::<f32>((num_nodes * num_hands) as usize).unwrap();
         let gpu_opp_reach = gpu.upload(&opp_reach).unwrap();
@@ -660,6 +683,7 @@ mod tests {
         let gpu_win = gpu.upload(&fold_amount_win).unwrap();
         let gpu_lose = gpu.upload(&fold_amount_lose).unwrap();
         let gpu_fold_player = gpu.upload(&fold_player).unwrap();
+        let gpu_valid = gpu.upload(&valid_matchups).unwrap();
 
         // Traverser is 0 (OOP). Opponent (IP) folded.
         gpu.launch_terminal_fold_eval(
@@ -669,6 +693,7 @@ mod tests {
             &gpu_win,
             &gpu_lose,
             &gpu_fold_player,
+            &gpu_valid,
             0, // traverser
             num_fold_terminals,
             num_hands,
@@ -707,6 +732,8 @@ mod tests {
         let fold_amount_win = vec![5.0f32];
         let fold_amount_lose = vec![-5.0f32];
         let fold_player = vec![0u32]; // OOP (traverser) folded
+        // All matchups valid (no card conflicts in this test)
+        let valid_matchups = vec![1.0f32; (num_hands * num_hands) as usize];
 
         let mut gpu_cfvalues = gpu.alloc_zeros::<f32>((num_nodes * num_hands) as usize).unwrap();
         let gpu_opp_reach = gpu.upload(&opp_reach).unwrap();
@@ -714,6 +741,7 @@ mod tests {
         let gpu_win = gpu.upload(&fold_amount_win).unwrap();
         let gpu_lose = gpu.upload(&fold_amount_lose).unwrap();
         let gpu_fold_player = gpu.upload(&fold_player).unwrap();
+        let gpu_valid = gpu.upload(&valid_matchups).unwrap();
 
         gpu.launch_terminal_fold_eval(
             &mut gpu_cfvalues,
@@ -722,6 +750,7 @@ mod tests {
             &gpu_win,
             &gpu_lose,
             &gpu_fold_player,
+            &gpu_valid,
             0, // traverser = OOP, who folded
             1,
             num_hands,
@@ -750,7 +779,9 @@ mod tests {
         let gpu = GpuContext::new(0).unwrap();
 
         // 2 nodes: root(0), showdown_terminal(1)
-        // 3 hands with strengths: [100, 50, 100] (hand 0 and 2 tie, hand 1 loses)
+        // 3 hands with strengths:
+        //   traverser: [100, 50, 100] (hand 0 and 2 tie, hand 1 loses)
+        //   opponent:  [100, 50, 100] (same for this test)
         let num_hands: u32 = 3;
         let num_nodes: u32 = 2;
 
@@ -762,14 +793,19 @@ mod tests {
         let terminal_nodes = vec![1u32];
         let amount_win = vec![10.0f32];
         let amount_lose = vec![-10.0f32];
-        let hand_strengths = vec![100u32, 50, 100];
+        let traverser_strengths = vec![100u32, 50, 100];
+        let opponent_strengths = vec![100u32, 50, 100];
+        // All matchups valid (no card conflicts in this test)
+        let valid_matchups = vec![1.0f32; (num_hands * num_hands) as usize];
 
         let mut gpu_cfvalues = gpu.alloc_zeros::<f32>((num_nodes * num_hands) as usize).unwrap();
         let gpu_opp_reach = gpu.upload(&opp_reach).unwrap();
         let gpu_terminals = gpu.upload(&terminal_nodes).unwrap();
         let gpu_win = gpu.upload(&amount_win).unwrap();
         let gpu_lose = gpu.upload(&amount_lose).unwrap();
-        let gpu_strengths = gpu.upload(&hand_strengths).unwrap();
+        let gpu_trav_strengths = gpu.upload(&traverser_strengths).unwrap();
+        let gpu_opp_strengths = gpu.upload(&opponent_strengths).unwrap();
+        let gpu_valid = gpu.upload(&valid_matchups).unwrap();
 
         gpu.launch_terminal_showdown_eval(
             &mut gpu_cfvalues,
@@ -777,7 +813,9 @@ mod tests {
             &gpu_terminals,
             &gpu_win,
             &gpu_lose,
-            &gpu_strengths,
+            &gpu_trav_strengths,
+            &gpu_opp_strengths,
+            &gpu_valid,
             1,
             num_hands,
         )
@@ -814,7 +852,7 @@ mod tests {
         let gpu = GpuContext::new(0).unwrap();
 
         // Tree: Root(0) -> [Child(1), Child(2)]
-        // Root is infoset 0 with 2 actions
+        // Root is infoset 0 with 2 actions, player=0 (OOP)
         // 2 hands, per-hand strategy
         let num_hands: u32 = 2;
         let num_nodes: u32 = 3;
@@ -841,6 +879,8 @@ mod tests {
         let child_offsets = vec![0u32, 2, 2, 2]; // root has 2 children
         let children_arr = vec![1u32, 2];
         let infoset_ids = vec![0u32, u32::MAX, u32::MAX];
+        // Root is player 0 (OOP), traverser=0 -> strategy-weighted
+        let node_players = vec![0u32];
 
         let mut gpu_cfvalues = gpu.upload(&cfvalues).unwrap();
         let gpu_strategy = gpu.upload(&strategy).unwrap();
@@ -848,6 +888,7 @@ mod tests {
         let gpu_child_offsets = gpu.upload(&child_offsets).unwrap();
         let gpu_children = gpu.upload(&children_arr).unwrap();
         let gpu_infoset_ids = gpu.upload(&infoset_ids).unwrap();
+        let gpu_node_players = gpu.upload(&node_players).unwrap();
 
         gpu.launch_backward_cfv(
             &mut gpu_cfvalues,
@@ -856,6 +897,8 @@ mod tests {
             &gpu_child_offsets,
             &gpu_children,
             &gpu_infoset_ids,
+            &gpu_node_players,
+            0, // traverser = OOP
             1, // 1 node at this level
             num_hands,
             max_actions,
@@ -921,7 +964,7 @@ mod tests {
         let gpu_infoset_ids = gpu.upload(&infoset_ids).unwrap();
         let gpu_num_actions = gpu.upload(&num_actions_arr).unwrap();
 
-        // No discounting: pos_discount=1, neg_discount=1, strat_weight=1
+        // No discounting: pos_discount=1, neg_discount=1, strat_discount=1
         gpu.launch_update_regrets(
             &mut gpu_regrets,
             &mut gpu_strategy_sum,
@@ -937,7 +980,7 @@ mod tests {
             max_actions,
             1.0, // pos_discount
             1.0, // neg_discount
-            1.0, // strat_weight
+            1.0, // strat_discount
         )
         .unwrap();
 
@@ -974,7 +1017,7 @@ mod tests {
             result_regrets[3]
         );
 
-        // Strategy sum: strat_weight * strategy = 1.0 * strategy
+        // Strategy sum: old * strat_discount + strategy = 0 * 1.0 + strategy = strategy
         assert!(
             (result_strat_sum[0] - 0.7).abs() < eps,
             "strat_sum hand0 action0: got {}",
@@ -1133,7 +1176,7 @@ mod tests {
         let gpu_infoset_ids = gpu.upload(&infoset_ids).unwrap();
         let gpu_num_actions = gpu.upload(&num_actions_arr).unwrap();
 
-        // DCFR discounting: pos_discount=0.8, neg_discount=0.5, strat_weight=2.0
+        // DCFR discounting: pos_discount=0.8, neg_discount=0.5, strat_discount=0.7
         gpu.launch_update_regrets(
             &mut gpu_regrets,
             &mut gpu_strategy_sum,
@@ -1149,7 +1192,7 @@ mod tests {
             max_actions,
             0.8, // pos_discount
             0.5, // neg_discount
-            2.0, // strat_weight
+            0.7, // strat_discount
         )
         .unwrap();
 
@@ -1176,14 +1219,14 @@ mod tests {
             result_regrets[1]
         );
 
-        // Strategy sum: old + strat_weight * strategy
-        // action0: 2.0 + 2.0 * 1.0 = 4.0
+        // Strategy sum: old * strat_discount + strategy
+        // action0: 2.0 * 0.7 + 1.0 = 2.4
         assert!(
-            (result_strat_sum[0] - 4.0).abs() < eps,
+            (result_strat_sum[0] - 2.4).abs() < eps,
             "strat_sum action0: got {}",
             result_strat_sum[0]
         );
-        // action1: 0.0 + 2.0 * 0.0 = 0.0
+        // action1: 0.0 * 0.7 + 0.0 = 0.0
         assert!(
             (result_strat_sum[1] - 0.0).abs() < eps,
             "strat_sum action1: got {}",

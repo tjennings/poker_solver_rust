@@ -6,7 +6,8 @@
 // If the traverser folded, they receive amount_lose * total_opp_reach.
 // If the opponent folded, the traverser receives amount_win * total_opp_reach.
 //
-// Card blocking is handled externally: blocked combos already have 0 reach.
+// Card blocking: only sum opponent reach for hands that don't share cards
+// with the traverser's hand (valid_matchups).
 
 extern "C" __global__ void terminal_fold_eval(
     float* cfvalues,
@@ -15,6 +16,7 @@ extern "C" __global__ void terminal_fold_eval(
     const float* fold_amount_win,
     const float* fold_amount_lose,
     const unsigned int* fold_player,
+    const float* valid_matchups,
     unsigned int traverser,
     unsigned int num_fold_terminals,
     unsigned int num_hands
@@ -26,9 +28,11 @@ extern "C" __global__ void terminal_fold_eval(
 
     unsigned int node = terminal_nodes[term_idx];
 
-    // Sum opponent reach at this node
+    // Sum opponent reach at this node, excluding blocked hands
     float opp_reach_sum = 0.0f;
     for (unsigned int h = 0; h < num_hands; h++) {
+        float valid = valid_matchups[hand * num_hands + h];
+        if (valid < 0.5f) continue;
         opp_reach_sum += opp_reach[node * num_hands + h];
     }
 

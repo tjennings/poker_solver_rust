@@ -5,9 +5,11 @@
 // One thread per (showdown_terminal, hand) pair.
 //
 // cfv[h] = sum over opponent hands h':
-//   if strength[h] > strength[h']: amount_win * opp_reach[h']
-//   if strength[h] < strength[h']: amount_lose * opp_reach[h']
+//   if traverser_strength[h] > opponent_strength[h']: amount_win * opp_reach[h'] * valid
+//   if traverser_strength[h] < opponent_strength[h']: amount_lose * opp_reach[h'] * valid
 //   if tied: 0 (no contribution)
+//
+// valid_matchups[h * num_hands + h'] = 1.0 if hands don't share cards, 0.0 if blocked
 
 extern "C" __global__ void terminal_showdown_eval(
     float* cfvalues,
@@ -15,7 +17,9 @@ extern "C" __global__ void terminal_showdown_eval(
     const unsigned int* terminal_nodes,
     const float* amount_win,
     const float* amount_lose,
-    const unsigned int* hand_strengths,
+    const unsigned int* traverser_strengths,
+    const unsigned int* opponent_strengths,
+    const float* valid_matchups,
     unsigned int num_showdown_terminals,
     unsigned int num_hands
 ) {
@@ -25,15 +29,18 @@ extern "C" __global__ void terminal_showdown_eval(
     if (term_idx >= num_showdown_terminals) return;
 
     unsigned int node = terminal_nodes[term_idx];
-    unsigned int my_strength = hand_strengths[hand];
+    unsigned int my_strength = traverser_strengths[hand];
 
     float cfv = 0.0f;
     float win = amount_win[term_idx];
     float lose = amount_lose[term_idx];
 
     for (unsigned int opp = 0; opp < num_hands; opp++) {
+        float valid = valid_matchups[hand * num_hands + opp];
+        if (valid < 0.5f) continue;
+
         float opp_r = opp_reach[node * num_hands + opp];
-        unsigned int opp_strength = hand_strengths[opp];
+        unsigned int opp_strength = opponent_strengths[opp];
 
         if (my_strength > opp_strength) {
             cfv += win * opp_r;

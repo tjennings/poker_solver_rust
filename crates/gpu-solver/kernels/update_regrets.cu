@@ -5,7 +5,7 @@
 //   2. Updates cumulative regret with DCFR discounting:
 //        new_regret = old_regret * discount + instant_regret
 //      where discount = pos_discount if old_regret >= 0, else neg_discount
-//   3. Accumulates strategy sum: strategy_sum += strat_weight * strategy
+//   3. Updates strategy sum: strategy_sum = strategy_sum * strat_discount + strategy
 //
 // One thread per (decision_node, action, hand) linearized triple.
 
@@ -24,7 +24,7 @@ extern "C" __global__ void update_regrets(
     unsigned int max_actions,
     float pos_discount,
     float neg_discount,
-    float strat_weight
+    float strat_discount
 ) {
     unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -61,8 +61,6 @@ extern "C" __global__ void update_regrets(
     float new_regret = old_regret * discount + inst_regret;
     regrets[reg_idx] = new_regret;
 
-    // Strategy sum update
-    if (strat_weight > 0.0f) {
-        strategy_sum[reg_idx] += strat_weight * strategy[reg_idx];
-    }
+    // Strategy sum update: discount old sum, add current strategy
+    strategy_sum[reg_idx] = strategy_sum[reg_idx] * strat_discount + strategy[reg_idx];
 }

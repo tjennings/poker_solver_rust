@@ -66,6 +66,18 @@ pub struct FlatTree {
     /// Initial reach probabilities for IP (range weights after card removal).
     /// Length = `num_hands` (padded with zeros if `num_hands_ip < num_hands`).
     pub initial_reach_ip: Vec<f32>,
+    /// Card pairs for OOP hands: (card1, card2) for each hand index.
+    pub cards_oop: Vec<(u8, u8)>,
+    /// Card pairs for IP hands: (card1, card2) for each hand index.
+    pub cards_ip: Vec<(u8, u8)>,
+    /// Valid matchup matrix when OOP is the traverser.
+    /// `valid_matchups_oop[oop_hand * num_hands + ip_hand] = 1.0` if no card conflict, `0.0` if blocked.
+    /// Size: `num_hands * num_hands`.
+    pub valid_matchups_oop: Vec<f32>,
+    /// Valid matchup matrix when IP is the traverser.
+    /// `valid_matchups_ip[ip_hand * num_hands + oop_hand] = 1.0` if no card conflict, `0.0` if blocked.
+    /// Size: `num_hands * num_hands`.
+    pub valid_matchups_ip: Vec<f32>,
 }
 
 impl FlatTree {
@@ -358,6 +370,51 @@ impl FlatTree {
             }
         }
 
+        // Extract card pairs for each player's hands.
+        let cards_oop: Vec<(u8, u8)> = game
+            .private_cards(0)
+            .iter()
+            .map(|&(c1, c2)| (c1, c2))
+            .collect();
+        let cards_ip: Vec<(u8, u8)> = game
+            .private_cards(1)
+            .iter()
+            .map(|&(c1, c2)| (c1, c2))
+            .collect();
+
+        // Precompute valid matchup matrices for card blocking.
+        // When OOP is traverser, opponents are IP hands.
+        let mut valid_matchups_oop = vec![0.0f32; num_hands * num_hands];
+        for oop_h in 0..num_hands_oop {
+            let (oop_c1, oop_c2) = cards_oop[oop_h];
+            for ip_h in 0..num_hands_ip {
+                let (ip_c1, ip_c2) = cards_ip[ip_h];
+                let conflicts = oop_c1 == ip_c1
+                    || oop_c1 == ip_c2
+                    || oop_c2 == ip_c1
+                    || oop_c2 == ip_c2;
+                if !conflicts {
+                    valid_matchups_oop[oop_h * num_hands + ip_h] = 1.0;
+                }
+            }
+        }
+
+        // When IP is traverser, opponents are OOP hands.
+        let mut valid_matchups_ip = vec![0.0f32; num_hands * num_hands];
+        for ip_h in 0..num_hands_ip {
+            let (ip_c1, ip_c2) = cards_ip[ip_h];
+            for oop_h in 0..num_hands_oop {
+                let (oop_c1, oop_c2) = cards_oop[oop_h];
+                let conflicts = ip_c1 == oop_c1
+                    || ip_c1 == oop_c2
+                    || ip_c2 == oop_c1
+                    || ip_c2 == oop_c2;
+                if !conflicts {
+                    valid_matchups_ip[ip_h * num_hands + oop_h] = 1.0;
+                }
+            }
+        }
+
         // Reset game to root
         game.back_to_root();
 
@@ -383,6 +440,10 @@ impl FlatTree {
             hand_strengths_ip,
             initial_reach_oop,
             initial_reach_ip,
+            cards_oop,
+            cards_ip,
+            valid_matchups_oop,
+            valid_matchups_ip,
         }
     }
 
@@ -444,6 +505,12 @@ impl FlatTree {
             hand_strengths_ip: vec![100, 50],
             initial_reach_oop: vec![1.0, 1.0],
             initial_reach_ip: vec![1.0, 1.0],
+            // Test cards: no conflicts between any hands
+            cards_oop: vec![(0, 1), (2, 3)],
+            cards_ip: vec![(4, 5), (6, 7)],
+            // All matchups valid (no card conflicts in test tree)
+            valid_matchups_oop: vec![1.0, 1.0, 1.0, 1.0],
+            valid_matchups_ip: vec![1.0, 1.0, 1.0, 1.0],
         }
     }
 }
