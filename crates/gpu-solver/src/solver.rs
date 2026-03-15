@@ -49,6 +49,25 @@ pub struct SolveResult {
     pub iterations: u32,
 }
 
+/// Debug snapshot of a single iteration's intermediate state.
+#[cfg(feature = "cuda")]
+pub struct DebugIteration {
+    /// Reach probabilities for OOP at every node: `[num_nodes * num_hands]`.
+    pub reach_oop: Vec<f32>,
+    /// Reach probabilities for IP at every node: `[num_nodes * num_hands]`.
+    pub reach_ip: Vec<f32>,
+    /// CFVs when OOP is traverser (after terminal eval + backward): `[num_nodes * num_hands]`.
+    pub cfvalues_oop_traverser: Vec<f32>,
+    /// CFVs when IP is traverser (after terminal eval + backward): `[num_nodes * num_hands]`.
+    pub cfvalues_ip_traverser: Vec<f32>,
+    /// Cumulative regrets after update: `[num_infosets * max_actions * num_hands]`.
+    pub regrets: Vec<f32>,
+    /// Current strategy (from regret matching): `[num_infosets * max_actions * num_hands]`.
+    pub strategy: Vec<f32>,
+    /// Cumulative strategy sum after update: `[num_infosets * max_actions * num_hands]`.
+    pub strategy_sum: Vec<f32>,
+}
+
 /// GPU DCFR+ solver that holds all GPU buffers and tree metadata.
 #[cfg(feature = "cuda")]
 pub struct GpuSolver<'a> {
@@ -354,42 +373,68 @@ impl<'a> GpuSolver<'a> {
         _target_exploitability: Option<f32>,
     ) -> Result<SolveResult, GpuError> {
         for t in 1..=max_iterations {
-            // 1. Regret match -> current strategy
-            self.gpu.launch_regret_match(
-                &self.regrets,
-                &self.gpu_num_actions,
-                &mut self.current_strategy,
-                self.num_infosets,
-                self.max_actions,
-                self.num_hands,
-            )?;
+            // DCFR discount factors — match range-solver's DiscountParams
+            // CPU solver uses 0-indexed iteration `t`:
+            //   alpha_t = (t-1)^1.5 / ((t-1)^1.5 + 1)
+            //   beta_t  = 0.5
+            //   gamma_t = ((t - nearest_lower_power_of_4) / (t - nlp4 + 1))^3
+            // Here `t` is 1-indexed, so `current_iteration = t - 1` (0-indexed)
+            let current_iteration = t - 1; // 0-indexed to match CPU
 
-            // 2. Initialize reach at root
-            self.init_reach()?;
+            let t_alpha = (current_iteration as i32 - 1).max(0) as f64;
+            let pow_alpha = t_alpha * t_alpha.sqrt();
+            let pos_discount = (pow_alpha / (pow_alpha + 1.0)) as f32;
+            let neg_discount = 0.5f32;
 
-            // 3. Forward pass (top-down, level by level, skip level 0 = root)
-            for level in 1..self.num_levels {
-                let ld = &self.level_data[level];
-                if ld.num_nodes == 0 {
-                    continue;
-                }
-                self.gpu.launch_forward_pass(
-                    &mut self.reach_oop,
-                    &mut self.reach_ip,
-                    &self.current_strategy,
-                    &ld.nodes,
-                    &ld.parent_nodes,
-                    &ld.parent_actions,
-                    &ld.parent_infosets,
-                    &ld.parent_players,
-                    ld.num_nodes,
-                    self.num_hands,
-                    self.max_actions,
-                )?;
-            }
+            // gamma_t: power-of-4 based strategy weight
+            let nearest_lower_power_of_4 = match current_iteration {
+                0 => 0u32,
+                x => 1u32 << ((x.leading_zeros() ^ 31) & !1),
+            };
+            let t_gamma =
+                (current_iteration - nearest_lower_power_of_4) as f64;
+            let strat_discount =
+                ((t_gamma / (t_gamma + 1.0)).powi(3)) as f32;
 
-            // 4. For each traverser, compute CFV and update regrets
+            // Alternating traverser updates — CPU solver recomputes strategy
+            // from regrets between traversers (traverser 1 sees traverser 0's
+            // regret updates). We must do the same: regret-match + forward pass
+            // inside the traverser loop.
             for traverser in 0..2u32 {
+                // 1. Regret match -> current strategy (uses latest regrets)
+                self.gpu.launch_regret_match(
+                    &self.regrets,
+                    &self.gpu_num_actions,
+                    &mut self.current_strategy,
+                    self.num_infosets,
+                    self.max_actions,
+                    self.num_hands,
+                )?;
+
+                // 2. Initialize reach at root
+                self.init_reach()?;
+
+                // 3. Forward pass (top-down, level by level)
+                for level in 1..self.num_levels {
+                    let ld = &self.level_data[level];
+                    if ld.num_nodes == 0 {
+                        continue;
+                    }
+                    self.gpu.launch_forward_pass(
+                        &mut self.reach_oop,
+                        &mut self.reach_ip,
+                        &self.current_strategy,
+                        &ld.nodes,
+                        &ld.parent_nodes,
+                        &ld.parent_actions,
+                        &ld.parent_infosets,
+                        &ld.parent_players,
+                        ld.num_nodes,
+                        self.num_hands,
+                        self.max_actions,
+                    )?;
+                }
+
                 // 4a. Zero out cfvalues
                 self.cfvalues = self
                     .gpu
@@ -481,29 +526,6 @@ impl<'a> GpuSolver<'a> {
                 };
 
                 if num_decision > 0 {
-                    // DCFR discount factors — match range-solver's DiscountParams
-                    // CPU solver uses 0-indexed iteration `t`:
-                    //   alpha_t = (t-1)^1.5 / ((t-1)^1.5 + 1)
-                    //   beta_t  = 0.5
-                    //   gamma_t = ((t - nearest_lower_power_of_4) / (t - nlp4 + 1))^3
-                    // Here `t` is 1-indexed, so `current_iteration = t - 1` (0-indexed)
-                    let current_iteration = t - 1; // 0-indexed to match CPU
-
-                    let t_alpha = (current_iteration as i32 - 1).max(0) as f64;
-                    let pow_alpha = t_alpha * t_alpha.sqrt();
-                    let pos_discount = (pow_alpha / (pow_alpha + 1.0)) as f32;
-                    let neg_discount = 0.5f32;
-
-                    // gamma_t: power-of-4 based strategy weight
-                    let nearest_lower_power_of_4 = match current_iteration {
-                        0 => 0u32,
-                        x => 1u32 << ((x.leading_zeros() ^ 31) & !1),
-                    };
-                    let t_gamma =
-                        (current_iteration - nearest_lower_power_of_4) as f64;
-                    let strat_discount =
-                        ((t_gamma / (t_gamma + 1.0)).powi(3)) as f32;
-
                     self.gpu.launch_update_regrets(
                         &mut self.regrets,
                         &mut self.strategy_sum,
@@ -540,6 +562,195 @@ impl<'a> GpuSolver<'a> {
         Ok(SolveResult {
             strategy,
             iterations: max_iterations,
+        })
+    }
+
+    /// Run a single DCFR+ iteration and return all intermediate state
+    /// for debugging. Used to compare GPU results against CPU step-by-step.
+    pub fn debug_iteration(&mut self) -> Result<DebugIteration, GpuError> {
+        let pos_discount = 0.0f32; // iteration 0: alpha_t = 0
+        let neg_discount = 0.5f32;
+        let strat_discount = 0.0f32; // iteration 0: gamma_t = 0
+
+        // We'll capture the state after OOP traversal's reach setup for the snapshot.
+        let mut cfvalues_oop = Vec::new();
+        let mut cfvalues_ip = Vec::new();
+        let mut saved_reach_oop = Vec::new();
+        let mut saved_reach_ip = Vec::new();
+
+        for traverser in 0..2u32 {
+            // 1. Regret match
+            self.gpu.launch_regret_match(
+                &self.regrets,
+                &self.gpu_num_actions,
+                &mut self.current_strategy,
+                self.num_infosets,
+                self.max_actions,
+                self.num_hands,
+            )?;
+
+            // 2. Init reach
+            self.init_reach()?;
+
+            // 3. Forward pass
+            for level in 1..self.num_levels {
+                let ld = &self.level_data[level];
+                if ld.num_nodes == 0 {
+                    continue;
+                }
+                self.gpu.launch_forward_pass(
+                    &mut self.reach_oop,
+                    &mut self.reach_ip,
+                    &self.current_strategy,
+                    &ld.nodes,
+                    &ld.parent_nodes,
+                    &ld.parent_actions,
+                    &ld.parent_infosets,
+                    &ld.parent_players,
+                    ld.num_nodes,
+                    self.num_hands,
+                    self.max_actions,
+                )?;
+            }
+
+            // Save reach after first traverser's forward pass
+            if traverser == 0 {
+                saved_reach_oop = self.gpu.download(&self.reach_oop)?;
+                saved_reach_ip = self.gpu.download(&self.reach_ip)?;
+            }
+
+            // 4a. Zero cfvalues
+            self.cfvalues = self
+                .gpu
+                .alloc_zeros::<f32>((self.num_nodes * self.num_hands) as usize)?;
+
+            // 4b. Terminal fold eval
+            if self.num_fold_terminals > 0 {
+                let opp_reach = if traverser == 0 {
+                    &self.reach_ip
+                } else {
+                    &self.reach_oop
+                };
+                let valid_matchups = if traverser == 0 {
+                    &self.gpu_valid_matchups_oop
+                } else {
+                    &self.gpu_valid_matchups_ip
+                };
+                self.gpu.launch_terminal_fold_eval(
+                    &mut self.cfvalues,
+                    opp_reach,
+                    &self.fold_terminal_nodes,
+                    &self.fold_amount_win,
+                    &self.fold_amount_lose,
+                    &self.fold_player,
+                    valid_matchups,
+                    traverser,
+                    self.num_fold_terminals,
+                    self.num_hands,
+                )?;
+            }
+
+            // 4c. Terminal showdown eval
+            if self.num_showdown_terminals > 0 {
+                let opp_reach = if traverser == 0 {
+                    &self.reach_ip
+                } else {
+                    &self.reach_oop
+                };
+                let (traverser_strengths, opponent_strengths) = if traverser == 0 {
+                    (&self.gpu_hand_strengths_oop, &self.gpu_hand_strengths_ip)
+                } else {
+                    (&self.gpu_hand_strengths_ip, &self.gpu_hand_strengths_oop)
+                };
+                let valid_matchups = if traverser == 0 {
+                    &self.gpu_valid_matchups_oop
+                } else {
+                    &self.gpu_valid_matchups_ip
+                };
+                self.gpu.launch_terminal_showdown_eval(
+                    &mut self.cfvalues,
+                    opp_reach,
+                    &self.showdown_terminal_nodes,
+                    &self.showdown_amount_win,
+                    &self.showdown_amount_lose,
+                    traverser_strengths,
+                    opponent_strengths,
+                    valid_matchups,
+                    self.num_showdown_terminals,
+                    self.num_hands,
+                )?;
+            }
+
+            // 4d. Backward CFV
+            for level in (0..self.num_levels).rev() {
+                let bld = &self.backward_level_data[level];
+                if bld.num_decision_nodes == 0 {
+                    continue;
+                }
+                self.gpu.launch_backward_cfv(
+                    &mut self.cfvalues,
+                    &self.current_strategy,
+                    &bld.decision_nodes,
+                    &self.gpu_child_offsets,
+                    &self.gpu_children,
+                    &self.gpu_infoset_ids,
+                    &bld.decision_players,
+                    traverser,
+                    bld.num_decision_nodes,
+                    self.num_hands,
+                    self.max_actions,
+                )?;
+            }
+
+            // Save cfvalues
+            let cfv_snapshot = self.gpu.download(&self.cfvalues)?;
+            if traverser == 0 {
+                cfvalues_oop = cfv_snapshot;
+            } else {
+                cfvalues_ip = cfv_snapshot;
+            }
+
+            // 4e. Update regrets
+            let (decision_nodes, num_decision) = if traverser == 0 {
+                (&self.decision_nodes_oop, self.num_oop_decisions)
+            } else {
+                (&self.decision_nodes_ip, self.num_ip_decisions)
+            };
+
+            if num_decision > 0 {
+                self.gpu.launch_update_regrets(
+                    &mut self.regrets,
+                    &mut self.strategy_sum,
+                    &self.current_strategy,
+                    &self.cfvalues,
+                    decision_nodes,
+                    &self.gpu_child_offsets,
+                    &self.gpu_children,
+                    &self.gpu_infoset_ids,
+                    &self.gpu_num_actions,
+                    num_decision,
+                    self.num_hands,
+                    self.max_actions,
+                    pos_discount,
+                    neg_discount,
+                    strat_discount,
+                )?;
+            }
+        }
+
+        // Download final state
+        let strategy = self.gpu.download(&self.current_strategy)?;
+        let regrets = self.gpu.download(&self.regrets)?;
+        let strategy_sum = self.gpu.download(&self.strategy_sum)?;
+
+        Ok(DebugIteration {
+            reach_oop: saved_reach_oop,
+            reach_ip: saved_reach_ip,
+            cfvalues_oop_traverser: cfvalues_oop,
+            cfvalues_ip_traverser: cfvalues_ip,
+            regrets,
+            strategy,
+            strategy_sum,
         })
     }
 

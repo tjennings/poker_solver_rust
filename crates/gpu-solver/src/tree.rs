@@ -217,9 +217,15 @@ impl FlatTree {
                     );
                 }
 
-                // Compute pot
+                // Compute pot using matched amounts only.
+                // The CPU evaluator uses `pot = starting_pot + 2 * node.amount`
+                // where `node.amount` is the per-player matched bet. This equals
+                // `starting_pot + 2 * min(bet[0], bet[1])`, because unmatched
+                // bets (e.g., a bet followed by a fold) are excluded from the pot
+                // calculation used for payoff evaluation.
                 let bet_amounts = game.total_bet_amount();
-                let pot = (starting_pot + bet_amounts[0] + bet_amounts[1]) as f32;
+                let matched = bet_amounts[0].min(bet_amounts[1]);
+                let pot = (starting_pot + 2 * matched) as f32;
 
                 parent_nodes.push(parent_id);
                 parent_actions.push(action_idx);

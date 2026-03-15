@@ -13,7 +13,7 @@ use range_solver::bet_size::BetSizeOptions;
 use range_solver::card::{card_from_str, flop_from_str};
 use range_solver::interface::Game;
 use range_solver::range::Range;
-use range_solver::{solve, CardConfig, PostFlopGame};
+use range_solver::{solve, solve_step, CardConfig, PostFlopGame};
 
 /// Build a river game with configurable pot and stack.
 fn build_game(
@@ -334,6 +334,282 @@ fn debug_terminal_values() {
         let cards = game.private_cards(0);
         let (c1, c2) = cards[h];
         eprintln!("  {} {}: {:?}", card_name(c1), card_name(c2), probs);
+    }
+}
+
+/// Minimal iteration trace: runs 1 iteration on both GPU and CPU,
+/// dumps all intermediate values, and identifies the first divergence.
+#[test]
+fn debug_minimal_iteration_trace() {
+    eprintln!("\n{}", "=".repeat(80));
+    eprintln!("MINIMAL ITERATION TRACE: 1 iteration, narrow ranges");
+    eprintln!("{}", "=".repeat(80));
+
+    // Use a very simple setup: narrow ranges on a board where both have few combos.
+    // OOP: KK (6 combos minus board blockers)
+    // IP: AA (6 combos minus board blockers)
+    // Board: 2c 3d 4h 5s 6c — no blockers for either range
+    // Wait, 2c and 6c share suit — let's use a board that doesn't block KK or AA.
+    // Board: 2c 3d 4h 5s 7h — KK has 6 combos, AA has 6 combos
+    let mut cpu_game = build_game(
+        "KK",
+        "AA",
+        "2c 3d 4h",
+        "5s",
+        "7h",
+        100,
+        100,
+    );
+
+    let num_hands_oop = cpu_game.num_private_hands(0);
+    let num_hands_ip = cpu_game.num_private_hands(1);
+    eprintln!("OOP hands: {}, IP hands: {}", num_hands_oop, num_hands_ip);
+
+    // Print the hand cards
+    let oop_cards = cpu_game.private_cards(0);
+    let ip_cards = cpu_game.private_cards(1);
+    eprintln!("OOP hands:");
+    for (i, &(c1, c2)) in oop_cards.iter().enumerate() {
+        eprintln!("  {}: {} {}", i, card_name(c1), card_name(c2));
+    }
+    eprintln!("IP hands:");
+    for (i, &(c1, c2)) in ip_cards.iter().enumerate() {
+        eprintln!("  {}: {} {}", i, card_name(c1), card_name(c2));
+    }
+
+    // Run 1 iteration on CPU
+    solve_step(&cpu_game, 0);
+
+    // Read CPU strategy at root after 1 iteration
+    cpu_game.back_to_root();
+    let cpu_root_player = cpu_game.current_player();
+    let cpu_root_actions = cpu_game.available_actions();
+    eprintln!("\nCPU root player: {} ({})", cpu_root_player,
+        if cpu_root_player == 0 { "OOP" } else { "IP" });
+    eprintln!("CPU root actions: {:?}", cpu_root_actions);
+
+    // Walk the CPU tree and print strategy at each decision node
+    eprintln!("\n--- CPU strategy at each node after 1 iteration ---");
+    print_cpu_tree_strategies(&mut cpu_game, &[], 0);
+
+    // Build FlatTree and run GPU
+    let mut gpu_game = build_game("KK", "AA", "2c 3d 4h", "5s", "7h", 100, 100);
+    let flat = FlatTree::from_postflop_game(&mut gpu_game);
+
+    eprintln!("\n--- FlatTree structure ---");
+    eprintln!("num_nodes={}, num_infosets={}, num_hands={}, max_actions={}",
+        flat.num_nodes(), flat.num_infosets, flat.num_hands, flat.max_actions());
+    for (i, nt) in flat.node_types.iter().enumerate() {
+        let parent = flat.parent_nodes[i];
+        let iset = flat.infoset_ids[i];
+        eprintln!("  Node {}: {:?}, pot={:.0}, parent={}, iset={}, n_actions={}",
+            i, nt, flat.pots[i],
+            if parent == u32::MAX { "root".to_string() } else { parent.to_string() },
+            if iset == u32::MAX { "N/A".to_string() } else { iset.to_string() },
+            if iset != u32::MAX { flat.infoset_num_actions[iset as usize] } else { 0 }
+        );
+    }
+
+    // Run GPU debug iteration
+    let gpu_ctx = GpuContext::new(0).unwrap();
+    let mut gpu_solver = GpuSolver::new(&gpu_ctx, &flat).unwrap();
+    let debug = gpu_solver.debug_iteration().unwrap();
+
+    let nh = flat.num_hands;
+    let ma = flat.max_actions();
+
+    // Print GPU intermediate state
+    eprintln!("\n--- GPU reach after forward pass (traverser=0) ---");
+    for node_id in 0..flat.num_nodes() {
+        let oop_reach: Vec<f32> = (0..nh).map(|h| debug.reach_oop[node_id * nh + h]).collect();
+        let ip_reach: Vec<f32> = (0..nh).map(|h| debug.reach_ip[node_id * nh + h]).collect();
+        // Only print if any non-zero
+        let has_data = oop_reach.iter().any(|&v| v != 0.0) || ip_reach.iter().any(|&v| v != 0.0);
+        if has_data {
+            eprintln!("  Node {}: OOP_reach={:?}, IP_reach={:?}", node_id,
+                &oop_reach[..num_hands_oop.min(nh)],
+                &ip_reach[..num_hands_ip.min(nh)]);
+        }
+    }
+
+    eprintln!("\n--- GPU CFVs (OOP as traverser) ---");
+    for node_id in 0..flat.num_nodes() {
+        let cfvs: Vec<f32> = (0..nh).map(|h| debug.cfvalues_oop_traverser[node_id * nh + h]).collect();
+        let has_data = cfvs.iter().any(|&v| v != 0.0);
+        if has_data {
+            eprintln!("  Node {} ({:?}): {:?}", node_id, flat.node_types[node_id],
+                &cfvs[..num_hands_oop.min(nh)]);
+        }
+    }
+
+    eprintln!("\n--- GPU CFVs (IP as traverser) ---");
+    for node_id in 0..flat.num_nodes() {
+        let cfvs: Vec<f32> = (0..nh).map(|h| debug.cfvalues_ip_traverser[node_id * nh + h]).collect();
+        let has_data = cfvs.iter().any(|&v| v != 0.0);
+        if has_data {
+            eprintln!("  Node {} ({:?}): {:?}", node_id, flat.node_types[node_id],
+                &cfvs[..num_hands_ip.min(nh)]);
+        }
+    }
+
+    // Print GPU regrets
+    eprintln!("\n--- GPU regrets after 1 iteration ---");
+    for iset in 0..flat.num_infosets {
+        let n_actions = flat.infoset_num_actions[iset] as usize;
+        let _player = flat.player(
+            flat.node_types.iter().enumerate()
+                .find(|(_, nt)| **nt == poker_solver_gpu::tree::NodeType::DecisionOop ||
+                    **nt == poker_solver_gpu::tree::NodeType::DecisionIp)
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        );
+        // Find which node this infoset belongs to
+        let node_id = flat.infoset_ids.iter().position(|&id| id == iset as u32).unwrap();
+        let acting_player = flat.player(node_id);
+        let acting_num_hands = if acting_player == 0 { num_hands_oop } else { num_hands_ip };
+
+        eprintln!("  Infoset {} (node {}, player={}):", iset, node_id,
+            if acting_player == 0 { "OOP" } else { "IP" });
+        for a in 0..n_actions {
+            let regrets: Vec<f32> = (0..acting_num_hands.min(nh))
+                .map(|h| debug.regrets[(iset * ma + a) * nh + h])
+                .collect();
+            eprintln!("    action {}: regrets={:?}", a, regrets);
+        }
+    }
+
+    // Print GPU strategy (current, from regret matching)
+    eprintln!("\n--- GPU strategy after 1 iteration ---");
+    for iset in 0..flat.num_infosets {
+        let n_actions = flat.infoset_num_actions[iset] as usize;
+        let node_id = flat.infoset_ids.iter().position(|&id| id == iset as u32).unwrap();
+        let acting_player = flat.player(node_id);
+        let acting_num_hands = if acting_player == 0 { num_hands_oop } else { num_hands_ip };
+
+        eprintln!("  Infoset {} (node {}, player={}):", iset, node_id,
+            if acting_player == 0 { "OOP" } else { "IP" });
+        for a in 0..n_actions {
+            let strat: Vec<f32> = (0..acting_num_hands.min(nh))
+                .map(|h| debug.strategy[(iset * ma + a) * nh + h])
+                .collect();
+            eprintln!("    action {}: strategy={:?}", a, strat);
+        }
+    }
+
+    // Compare GPU and CPU strategies after 1 iteration at root
+    eprintln!("\n--- COMPARISON: Root strategy after 1 iteration ---");
+    cpu_game.back_to_root();
+    // Note: CPU strategy() returns the *normalized* strategy from strategy_sum,
+    // but after only 1 iteration, strategy_sum = current_strategy (gamma=0),
+    // so normalized strategy_sum = regret-matched strategy = uniform.
+    // What we really want to compare is the raw regrets.
+    // After 1 iter, we can look at the strategy that would be used in iteration 2.
+    // For that, we'd need to do regret matching on the new regrets.
+    // The GPU debug_iteration returns the strategy AFTER the last regret_match
+    // (which was for traverser=1's pass). But it also returns regrets.
+    //
+    // Better: run 2 iterations on both and compare the final strategies.
+    eprintln!("(See full solve comparison in debug_compare_gpu_vs_cpu test)");
+
+    // Also run the full solve for a few hundred iterations and compare
+    eprintln!("\n--- Full solve comparison (200 iterations) ---");
+    let mut cpu_game2 = build_game("KK", "AA", "2c 3d 4h", "5s", "7h", 100, 100);
+    let cpu_exploit = solve(&mut cpu_game2, 200, 0.0, false);
+    eprintln!("CPU exploitability: {:.6}", cpu_exploit);
+
+    cpu_game2.back_to_root();
+    let cpu_strat = cpu_game2.strategy();
+    let cpu_pl = cpu_game2.current_player();
+    let cpu_nh = cpu_game2.num_private_hands(cpu_pl);
+    let cpu_na = cpu_game2.available_actions().len();
+
+    let mut gpu_game2 = build_game("KK", "AA", "2c 3d 4h", "5s", "7h", 100, 100);
+    let flat2 = FlatTree::from_postflop_game(&mut gpu_game2);
+    let gpu_ctx2 = GpuContext::new(0).unwrap();
+    let gpu_result2 = GpuSolver::new(&gpu_ctx2, &flat2)
+        .unwrap()
+        .solve(200, None)
+        .unwrap();
+    let gpu_strat = &gpu_result2.strategy;
+    let gpu_nh = flat2.num_hands;
+    let gpu_ma = flat2.max_actions();
+    let gpu_na = flat2.infoset_num_actions[0] as usize;
+
+    let oop_cards2 = cpu_game2.private_cards(cpu_pl);
+    eprintln!("{:<20} | {:>30} | {:>30}", "Hand", "CPU", "GPU");
+    eprintln!("{:-<85}", "");
+    let mut max_diff = 0.0f32;
+    for h in 0..cpu_nh.min(gpu_nh) {
+        let (c1, c2) = oop_cards2[h];
+        let hand_name = format!("{}{}", card_name(c1), card_name(c2));
+
+        let mut cpu_probs = Vec::new();
+        for a in 0..cpu_na {
+            cpu_probs.push(cpu_strat[a * cpu_nh + h]);
+        }
+        let mut gpu_probs = Vec::new();
+        for a in 0..gpu_na {
+            let idx = (0 * gpu_ma + a) * gpu_nh + h;
+            gpu_probs.push(gpu_strat[idx]);
+        }
+
+        let cpu_str: Vec<String> = cpu_probs.iter().map(|p| format!("{:.3}", p)).collect();
+        let gpu_str: Vec<String> = gpu_probs.iter().map(|p| format!("{:.3}", p)).collect();
+        eprintln!("{:<20} | {:>30} | {:>30}", hand_name, cpu_str.join(" "), gpu_str.join(" "));
+
+        for a in 0..cpu_na.min(gpu_na) {
+            let diff = (cpu_probs[a] - gpu_probs[a]).abs();
+            if diff > max_diff { max_diff = diff; }
+        }
+    }
+    eprintln!("Max difference: {:.6}", max_diff);
+
+    // Assert the strategies are reasonably close
+    assert!(
+        max_diff < 0.05,
+        "GPU and CPU strategies diverge too much at root: max_diff={:.6}",
+        max_diff
+    );
+}
+
+/// Recursively print CPU strategies at each decision node.
+fn print_cpu_tree_strategies(game: &mut PostFlopGame, history: &[usize], depth: usize) {
+    game.apply_history(history);
+    if game.is_terminal_node() {
+        return;
+    }
+
+    let player = game.current_player();
+    let actions = game.available_actions();
+    let n_actions = actions.len();
+    let _num_hands = game.num_private_hands(player);
+
+    let indent = "  ".repeat(depth);
+    eprintln!("{}Node (history={:?}, player={}, actions={:?}):",
+        indent, history,
+        if player == 0 { "OOP" } else { "IP" },
+        actions);
+
+    // Print strategy — but note: after 0 iterations with solve_step(0),
+    // the strategy is computed from regrets. Since all regrets are initially zero,
+    // the strategy should be uniform. After 1 call to solve_step, regrets are updated.
+    // The strategy() method normalizes strategy_sum, which after 1 iteration = current strategy.
+    // This won't be meaningful to compare directly — we need the raw regrets.
+    // Let's just print what we can.
+
+    // Strategy is from strategy_sum normalization. After 1 iteration with gamma=0,
+    // strategy_sum = just the current strategy from that iteration.
+    // For the root (OOP), the strategy used was uniform (regrets were zero).
+    // After the update, regrets changed. strategy_sum = uniform.
+    // So game.strategy() would give us the normalized strategy_sum = uniform for all nodes.
+    // This is not very useful for per-iteration comparison.
+
+    // Instead, let's compare after many iterations.
+
+    for ai in 0..n_actions {
+        let mut child_history = history.to_vec();
+        child_history.push(ai);
+        print_cpu_tree_strategies(game, &child_history, depth + 1);
     }
 }
 
