@@ -5097,6 +5097,7 @@ dependencies = [
  "approx",
  "cudarc 0.16.6",
  "poker-solver-core",
+ "rand 0.8.5",
  "range-solver",
  "rayon",
  "rs_poker",
