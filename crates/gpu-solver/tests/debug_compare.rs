@@ -14,6 +14,7 @@ use range_solver::card::{card_from_str, flop_from_str};
 use range_solver::interface::Game;
 use range_solver::range::Range;
 use range_solver::{solve, solve_step, CardConfig, PostFlopGame};
+use std::time::Instant;
 
 /// Build a river game with configurable pot, stack, and bet sizes.
 fn build_game(
@@ -410,11 +411,14 @@ fn debug_compare_gpu_vs_cpu() {
         },
     ];
 
-    let iterations = 1000u32;
-
     // Track per-position results for the summary.
     struct PositionResult {
         name: String,
+        num_hands: usize,
+        tree_nodes: usize,
+        iterations: u32,
+        gpu_time_ms: f64,
+        cpu_time_ms: f64,
         max_diff: f32,
         dominant_agree: u32,
         dominant_total: u32,
@@ -429,7 +433,7 @@ fn debug_compare_gpu_vs_cpu() {
 
         let (flop, turn, river) = parse_board(pos.board);
 
-        // --- CPU solve ---
+        // --- Build games for both solvers (not timed) ---
         let mut cpu_game = build_game(
             pos.oop_range,
             pos.ip_range,
@@ -441,20 +445,6 @@ fn debug_compare_gpu_vs_cpu() {
             pos.oop_bet,
             pos.ip_bet,
         );
-        let cpu_exploit = solve(&mut cpu_game, iterations, 0.0, false);
-        eprintln!("CPU exploitability: {:.6}", cpu_exploit);
-
-        cpu_game.back_to_root();
-        let cpu_strategy = cpu_game.strategy();
-        let cpu_player = cpu_game.current_player();
-        let cpu_num_hands = cpu_game.num_private_hands(cpu_player);
-        let cpu_actions = cpu_game.available_actions();
-        let cpu_num_actions = cpu_actions.len();
-
-        // Get private card names for the acting player
-        let cpu_cards = cpu_game.private_cards(cpu_player);
-
-        // --- GPU solve ---
         let mut gpu_game = build_game(
             pos.oop_range,
             pos.ip_range,
@@ -466,12 +456,46 @@ fn debug_compare_gpu_vs_cpu() {
             pos.oop_bet,
             pos.ip_bet,
         );
+
+        // Determine hand counts for iteration heuristic
+        let oop_hands = cpu_game.num_private_hands(0);
+        let ip_hands = cpu_game.num_private_hands(1);
+        let max_hands = oop_hands.max(ip_hands);
+
+        // Bump iterations for wide ranges: >80 hands => 2000, else 1000
+        let iterations: u32 = if max_hands > 80 { 2000 } else { 1000 };
+
+        // --- CPU solve (timed) ---
+        let cpu_start = Instant::now();
+        let cpu_exploit = solve(&mut cpu_game, iterations, 0.0, false);
+        let cpu_time = cpu_start.elapsed();
+        let cpu_time_ms = cpu_time.as_secs_f64() * 1000.0;
+        eprintln!("CPU exploitability: {:.6} ({:.1} ms, {} iters)", cpu_exploit, cpu_time_ms, iterations);
+
+        cpu_game.back_to_root();
+        let cpu_strategy = cpu_game.strategy();
+        let cpu_player = cpu_game.current_player();
+        let cpu_num_hands = cpu_game.num_private_hands(cpu_player);
+        let cpu_actions = cpu_game.available_actions();
+        let cpu_num_actions = cpu_actions.len();
+
+        // Get private card names for the acting player
+        let cpu_cards = cpu_game.private_cards(cpu_player);
+
+        // --- GPU solve (setup not timed, only solve step) ---
         let flat_tree = FlatTree::from_postflop_game(&mut gpu_game);
+        let tree_nodes = flat_tree.num_nodes();
         let gpu_ctx = GpuContext::new(0).unwrap();
-        let gpu_result = GpuSolver::new(&gpu_ctx, &flat_tree)
-            .unwrap()
-            .solve(iterations, None)
-            .unwrap();
+        let mut gpu_solver = GpuSolver::new(&gpu_ctx, &flat_tree).unwrap();
+
+        let gpu_start = Instant::now();
+        let gpu_result = gpu_solver.solve(iterations, None).unwrap();
+        let gpu_time = gpu_start.elapsed();
+        let gpu_time_ms = gpu_time.as_secs_f64() * 1000.0;
+
+        let speedup = cpu_time_ms / gpu_time_ms;
+        eprintln!("GPU solve: {:.1} ms | CPU solve: {:.1} ms | Speedup: {:.2}x", gpu_time_ms, cpu_time_ms, speedup);
+
         let gpu_strategy = &gpu_result.strategy;
 
         let gpu_num_hands = flat_tree.num_hands;
@@ -479,8 +503,8 @@ fn debug_compare_gpu_vs_cpu() {
         let root_n_actions = flat_tree.infoset_num_actions[0] as usize;
 
         eprintln!(
-            "CPU: {} actions, {} hands | GPU: {} actions, {} hands (max={})",
-            cpu_num_actions, cpu_num_hands, root_n_actions, gpu_num_hands, max_actions
+            "CPU: {} actions, {} hands | GPU: {} actions, {} hands (max={}) | Tree nodes: {}",
+            cpu_num_actions, cpu_num_hands, root_n_actions, gpu_num_hands, max_actions, tree_nodes
         );
         eprintln!("Actions: {:?}", cpu_actions);
 
@@ -583,6 +607,11 @@ fn debug_compare_gpu_vs_cpu() {
 
         results.push(PositionResult {
             name: pos.name.to_string(),
+            num_hands: max_hands,
+            tree_nodes,
+            iterations,
+            gpu_time_ms,
+            cpu_time_ms,
             max_diff: max_abs_diff,
             dominant_agree,
             dominant_total,
@@ -590,32 +619,32 @@ fn debug_compare_gpu_vs_cpu() {
         });
     }
 
-    // === Summary ===
-    eprintln!("\n{}", "=".repeat(80));
+    // === Performance Summary Table ===
+    eprintln!("\n{}", "=".repeat(140));
     eprintln!(
-        "SUMMARY: GPU vs CPU comparison across {} positions",
+        "PERFORMANCE SUMMARY: GPU vs CPU comparison across {} positions",
         results.len()
     );
-    eprintln!("{}", "=".repeat(80));
+    eprintln!("{}", "=".repeat(140));
     eprintln!(
-        "{:<55} {:>10} {:>12} {:>6}",
-        "Position", "Max Diff", "Dom Agree %", "Result"
+        "{:<45} {:>6} {:>7} {:>6} {:>10} {:>10} {:>9} {:>10} {:>6}",
+        "Position", "Hands", "Nodes", "Iters", "GPU (ms)", "CPU (ms)", "Speedup", "Max Diff", "Result"
     );
-    eprintln!("{:-<87}", "");
+    eprintln!("{:-<115}", "");
 
     let mut worst_diff = 0.0f32;
     let mut num_passed = 0u32;
+    let mut total_gpu_ms = 0.0f64;
+    let mut total_cpu_ms = 0.0f64;
+    let mut speedups: Vec<(f64, String)> = Vec::new();
 
     for r in &results {
-        let pct = if r.dominant_total > 0 {
-            r.dominant_agree as f64 / r.dominant_total as f64 * 100.0
-        } else {
-            0.0
-        };
         let status = if r.passed { "PASS" } else { "FAIL" };
+        let speedup = r.cpu_time_ms / r.gpu_time_ms;
         eprintln!(
-            "{:<55} {:>10.6} {:>11.1}% {:>6}",
-            r.name, r.max_diff, pct, status
+            "{:<45} {:>6} {:>7} {:>6} {:>10.1} {:>10.1} {:>8.2}x {:>10.6} {:>6}",
+            r.name, r.num_hands, r.tree_nodes, r.iterations,
+            r.gpu_time_ms, r.cpu_time_ms, speedup, r.max_diff, status
         );
         if r.max_diff > worst_diff {
             worst_diff = r.max_diff;
@@ -623,15 +652,40 @@ fn debug_compare_gpu_vs_cpu() {
         if r.passed {
             num_passed += 1;
         }
+        total_gpu_ms += r.gpu_time_ms;
+        total_cpu_ms += r.cpu_time_ms;
+        speedups.push((speedup, r.name.clone()));
     }
 
-    eprintln!("{:-<87}", "");
+    eprintln!("{:-<115}", "");
     eprintln!(
         "Positions passed: {}/{} | Worst max diff: {:.6}",
         num_passed,
         results.len(),
         worst_diff
     );
+
+    // === Aggregate Performance Stats ===
+    eprintln!("\n{}", "=".repeat(80));
+    eprintln!("AGGREGATE PERFORMANCE STATS");
+    eprintln!("{}", "=".repeat(80));
+
+    let avg_speedup = if !speedups.is_empty() {
+        speedups.iter().map(|(s, _)| s).sum::<f64>() / speedups.len() as f64
+    } else {
+        0.0
+    };
+    let overall_speedup = total_cpu_ms / total_gpu_ms;
+
+    eprintln!("Average GPU speedup:   {:.2}x", avg_speedup);
+    eprintln!("Overall GPU speedup:   {:.2}x (total GPU: {:.1} ms, total CPU: {:.1} ms)", overall_speedup, total_gpu_ms, total_cpu_ms);
+
+    if let Some((fastest_speed, fastest_name)) = speedups.iter().max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()) {
+        eprintln!("Fastest GPU speedup:   {:.2}x — {}", fastest_speed, fastest_name);
+    }
+    if let Some((slowest_speed, slowest_name)) = speedups.iter().min_by(|a, b| a.0.partial_cmp(&b.0).unwrap()) {
+        eprintln!("Slowest GPU speedup:   {:.2}x — {}", slowest_speed, slowest_name);
+    }
 
     // Assert all positions pass
     for r in &results {
