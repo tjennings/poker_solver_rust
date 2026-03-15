@@ -1,15 +1,16 @@
 //! GPU-resident reservoir buffer for CFVNet training examples.
 //!
-//! A fixed-capacity circular buffer storing training records in GPU memory.
-//! Each record consists of:
-//!   - `input`:  `[INPUT_SIZE]` f32 — encoded situation features
-//!   - `target`: `[OUTPUT_SIZE]` f32 — CFVs (training targets)
-//!   - `mask`:   `[OUTPUT_SIZE]` f32 — valid combo mask (1.0 or 0.0)
-//!   - `range`:  `[OUTPUT_SIZE]` f32 — acting player's range (for auxiliary loss)
-//!   - `game_value`: f32 — scalar game value
+//! A fixed-capacity circular buffer storing training records entirely in GPU
+//! memory. Records are inserted after each solve batch via a CUDA kernel that
+//! encodes situation data into the CFVNet input format. Mini-batches are
+//! sampled via GPU gather kernels without touching host memory.
 //!
-//! Records are inserted after each solve batch and randomly sampled to form
-//! mini-batches for neural network training.
+//! Each record consists of:
+//!   - `input`:  `[INPUT_SIZE]` f32 -- encoded situation features
+//!   - `target`: `[OUTPUT_SIZE]` f32 -- CFVs (training targets)
+//!   - `mask`:   `[OUTPUT_SIZE]` f32 -- valid combo mask (1.0 or 0.0)
+//!   - `range`:  `[OUTPUT_SIZE]` f32 -- acting player's range (for auxiliary loss)
+//!   - `game_value`: f32 -- scalar game value
 
 /// Input feature size for the CFVNet encoder.
 ///
@@ -23,7 +24,7 @@
 ///   - `[2719]`:        Player indicator (0.0 = OOP, 1.0 = IP)
 pub const INPUT_SIZE: usize = 2720;
 
-/// Output (target) size — one CFV per combo.
+/// Output (target) size -- one CFV per combo.
 pub const OUTPUT_SIZE: usize = 1326;
 
 /// A CPU-side training record ready for reservoir insertion.
@@ -38,18 +39,10 @@ pub struct TrainingRecord {
 
 /// CPU-side reservoir buffer for training examples.
 ///
-/// This is a fixed-capacity circular buffer. When full, new records
-/// overwrite the oldest entries. The buffer supports random mini-batch
-/// sampling for training.
+/// A fixed-capacity circular buffer. When full, new records overwrite the
+/// oldest entries. Supports random mini-batch sampling for training.
 ///
-/// While the plan calls for a GPU-resident reservoir, we implement a
-/// CPU-side version first because:
-///   1. It avoids the complexity of custom CUDA gather/insert kernels.
-///   2. The mini-batch transfer to burn-cuda tensors would require a
-///      GPU→GPU copy anyway (cudarc ↔ burn share different allocators).
-///   3. The reservoir bottleneck is solve time, not data transfer.
-///
-/// A future optimisation can move storage to GPU memory.
+/// For GPU-resident operation, use [`GpuReservoir`] instead.
 pub struct Reservoir {
     inputs: Vec<f32>,
     targets: Vec<f32>,
@@ -61,7 +54,7 @@ pub struct Reservoir {
     size: usize,
 }
 
-/// A sampled mini-batch of training data.
+/// A sampled mini-batch of training data (CPU-side).
 pub struct MiniBatch {
     /// `[batch_size * INPUT_SIZE]` input features.
     pub inputs: Vec<f32>,
@@ -110,9 +103,6 @@ impl Reservoir {
     }
 
     /// Insert a single training record into the reservoir.
-    ///
-    /// The record is written at `write_idx` (circular). If the reservoir is
-    /// full, the oldest record is overwritten.
     pub fn insert(&mut self, record: &TrainingRecord) {
         assert_eq!(record.input.len(), INPUT_SIZE);
         assert_eq!(record.target.len(), OUTPUT_SIZE);
@@ -121,28 +111,22 @@ impl Reservoir {
 
         let idx = self.write_idx;
 
-        // Copy input features
         let in_start = idx * INPUT_SIZE;
         self.inputs[in_start..in_start + INPUT_SIZE]
             .copy_from_slice(&record.input);
 
-        // Copy target CFVs
         let out_start = idx * OUTPUT_SIZE;
         self.targets[out_start..out_start + OUTPUT_SIZE]
             .copy_from_slice(&record.target);
 
-        // Copy mask
         self.masks[out_start..out_start + OUTPUT_SIZE]
             .copy_from_slice(&record.mask);
 
-        // Copy range
         self.ranges[out_start..out_start + OUTPUT_SIZE]
             .copy_from_slice(&record.range);
 
-        // Copy game value
         self.game_values[idx] = record.game_value;
 
-        // Advance write pointer
         self.write_idx = (self.write_idx + 1) % self.capacity;
         if self.size < self.capacity {
             self.size += 1;
@@ -153,17 +137,6 @@ impl Reservoir {
     ///
     /// Each situation produces two records: one from OOP's perspective and
     /// one from IP's perspective.
-    ///
-    /// # Arguments
-    ///
-    /// * `boards` — `[num_situations * 5]` board card indices.
-    /// * `ranges_oop` — `[num_situations * 1326]` OOP range weights.
-    /// * `ranges_ip` — `[num_situations * 1326]` IP range weights.
-    /// * `pots` — `[num_situations]` pot sizes.
-    /// * `stacks` — `[num_situations]` effective stacks.
-    /// * `cfvs_oop` — `[num_situations * 1326]` OOP CFV targets.
-    /// * `cfvs_ip` — `[num_situations * 1326]` IP CFV targets.
-    /// * `num_situations` — Number of situations.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_batch(
         &mut self,
@@ -220,9 +193,6 @@ impl Reservoir {
     }
 
     /// Sample a random mini-batch of `batch_size` records from the reservoir.
-    ///
-    /// Uses the provided `rng` for index selection. Returns `Err` if the
-    /// reservoir has fewer records than `batch_size`.
     pub fn sample_minibatch(
         &self,
         batch_size: usize,
@@ -244,27 +214,22 @@ impl Reservoir {
         for (b, gv) in batch_game_values.iter_mut().enumerate() {
             let idx = rng(self.size);
 
-            // Gather input
             let in_src = idx * INPUT_SIZE;
             let in_dst = b * INPUT_SIZE;
             batch_inputs[in_dst..in_dst + INPUT_SIZE]
                 .copy_from_slice(&self.inputs[in_src..in_src + INPUT_SIZE]);
 
-            // Gather target
             let out_src = idx * OUTPUT_SIZE;
             let out_dst = b * OUTPUT_SIZE;
             batch_targets[out_dst..out_dst + OUTPUT_SIZE]
                 .copy_from_slice(&self.targets[out_src..out_src + OUTPUT_SIZE]);
 
-            // Gather mask
             batch_masks[out_dst..out_dst + OUTPUT_SIZE]
                 .copy_from_slice(&self.masks[out_src..out_src + OUTPUT_SIZE]);
 
-            // Gather range
             batch_ranges[out_dst..out_dst + OUTPUT_SIZE]
                 .copy_from_slice(&self.ranges[out_src..out_src + OUTPUT_SIZE]);
 
-            // Gather game value
             *gv = self.game_values[idx];
         }
 
@@ -281,10 +246,7 @@ impl Reservoir {
 
 /// Encode a situation into the 2720-dimensional input feature vector.
 ///
-/// Returns `(input, mask, game_value)` where:
-///   - `input` is `[INPUT_SIZE]` f32
-///   - `mask` is `[OUTPUT_SIZE]` f32 (1.0 for valid combos, 0.0 for blocked)
-///   - `game_value` is a scalar (mean CFV over valid combos, computed later)
+/// Returns `(input, mask, game_value)`.
 fn encode_input(
     range_oop: &[f32],
     range_ip: &[f32],
@@ -326,7 +288,7 @@ fn encode_input(
     // [2719]: Player indicator
     input[2719] = f32::from(player);
 
-    // Build combo mask: valid if neither card is on the board
+    // Build combo mask
     let board_set: Vec<u8> = board.iter().map(|&c| c as u8).collect();
     let mut mask = vec![0.0f32; OUTPUT_SIZE];
     for (i, m) in mask.iter_mut().enumerate() {
@@ -336,8 +298,268 @@ fn encode_input(
         }
     }
 
-    // Game value: will be computed by the caller from CFVs; placeholder 0.0
     (input, mask, 0.0)
+}
+
+// ---------------------------------------------------------------------------
+// GPU-resident reservoir
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+use crate::gpu::{GpuContext, GpuError};
+#[cfg(feature = "cuda")]
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+
+/// GPU-resident reservoir buffer.
+///
+/// All storage is on the GPU. Insert and sample operations are performed
+/// via CUDA kernels, with no data downloaded to the CPU.
+#[cfg(feature = "cuda")]
+pub struct GpuReservoir {
+    inputs: CudaSlice<f32>,       // [capacity * INPUT_SIZE]
+    targets: CudaSlice<f32>,      // [capacity * OUTPUT_SIZE]
+    masks: CudaSlice<f32>,        // [capacity * OUTPUT_SIZE]
+    ranges: CudaSlice<f32>,       // [capacity * OUTPUT_SIZE]
+    game_values: CudaSlice<f32>,  // [capacity]
+    /// Precomputed combo cards `[1326 * 2]` on GPU, used by encode kernel.
+    combo_cards: CudaSlice<u32>,
+    capacity: usize,
+    write_idx: usize,
+    size: usize,
+}
+
+/// A sampled mini-batch of training data in GPU memory.
+#[cfg(feature = "cuda")]
+pub struct GpuMiniBatch {
+    /// `[batch_size * INPUT_SIZE]` input features on GPU.
+    pub inputs: CudaSlice<f32>,
+    /// `[batch_size * OUTPUT_SIZE]` target CFVs on GPU.
+    pub targets: CudaSlice<f32>,
+    /// `[batch_size * OUTPUT_SIZE]` valid-combo masks on GPU.
+    pub masks: CudaSlice<f32>,
+    /// `[batch_size * OUTPUT_SIZE]` acting player's range on GPU.
+    pub ranges: CudaSlice<f32>,
+    /// `[batch_size]` scalar game values on GPU.
+    pub game_values: CudaSlice<f32>,
+    /// Number of records in this batch.
+    pub batch_size: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuReservoir {
+    /// Create a new GPU-resident reservoir with the given capacity.
+    pub fn new(gpu: &GpuContext, capacity: usize) -> Result<Self, GpuError> {
+        assert!(capacity > 0, "Reservoir capacity must be > 0");
+
+        let inputs = gpu.alloc_zeros::<f32>(capacity * INPUT_SIZE)?;
+        let targets = gpu.alloc_zeros::<f32>(capacity * OUTPUT_SIZE)?;
+        let masks = gpu.alloc_zeros::<f32>(capacity * OUTPUT_SIZE)?;
+        let ranges = gpu.alloc_zeros::<f32>(capacity * OUTPUT_SIZE)?;
+        let game_values = gpu.alloc_zeros::<f32>(capacity)?;
+
+        // Upload combo_cards lookup table
+        let combo_cards_flat = super::hand_eval::build_combo_cards_flat();
+        let combo_cards = gpu.upload(&combo_cards_flat)?;
+
+        Ok(Self {
+            inputs,
+            targets,
+            masks,
+            ranges,
+            game_values,
+            combo_cards,
+            capacity,
+            write_idx: 0,
+            size: 0,
+        })
+    }
+
+    /// Number of records currently stored.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Maximum capacity of the reservoir.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Whether the reservoir is full.
+    pub fn is_full(&self) -> bool {
+        self.size == self.capacity
+    }
+
+    /// Insert a batch of solved situations into the reservoir.
+    ///
+    /// Each situation produces two records (OOP + IP perspective).
+    /// All data is GPU-resident; encoding happens via CUDA kernel.
+    ///
+    /// # Arguments
+    /// * `gpu` - CUDA context.
+    /// * `ranges_oop` - GPU buffer `[num_spots * 1326]` OOP ranges.
+    /// * `ranges_ip` - GPU buffer `[num_spots * 1326]` IP ranges.
+    /// * `boards` - GPU buffer `[num_spots * 5]` board card indices.
+    /// * `pots` - GPU buffer `[num_spots]` pot sizes.
+    /// * `stacks` - GPU buffer `[num_spots]` effective stacks.
+    /// * `cfvs_oop` - GPU buffer `[num_spots * 1326]` OOP root CFVs.
+    /// * `cfvs_ip` - GPU buffer `[num_spots * 1326]` IP root CFVs.
+    /// * `num_spots` - Number of situations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_batch_gpu(
+        &mut self,
+        gpu: &GpuContext,
+        ranges_oop: &CudaSlice<f32>,
+        ranges_ip: &CudaSlice<f32>,
+        boards: &CudaSlice<u32>,
+        pots: &CudaSlice<f32>,
+        stacks: &CudaSlice<f32>,
+        cfvs_oop: &CudaSlice<f32>,
+        cfvs_ip: &CudaSlice<f32>,
+        num_spots: usize,
+    ) -> Result<(), GpuError> {
+        if num_spots == 0 {
+            return Ok(());
+        }
+
+        let num_records = num_spots * 2;
+
+        let kernel = gpu.compile_and_load(
+            include_str!("../../kernels/reservoir_encode_insert.cu"),
+            "reservoir_encode_insert",
+        )?;
+
+        let cfg = LaunchConfig::for_num_elems(num_records as u32);
+        let write_start = self.write_idx as u32;
+        let capacity = self.capacity as u32;
+        let num_spots_u32 = num_spots as u32;
+
+        unsafe {
+            gpu.stream
+                .launch_builder(&kernel)
+                .arg(&mut self.inputs)
+                .arg(&mut self.targets)
+                .arg(&mut self.masks)
+                .arg(&mut self.ranges)
+                .arg(&mut self.game_values)
+                .arg(ranges_oop)
+                .arg(ranges_ip)
+                .arg(boards)
+                .arg(pots)
+                .arg(stacks)
+                .arg(cfvs_oop)
+                .arg(cfvs_ip)
+                .arg(&self.combo_cards)
+                .arg(&write_start)
+                .arg(&capacity)
+                .arg(&num_spots_u32)
+                .launch(cfg)?;
+        }
+
+        // Update write pointer and size
+        self.write_idx = (self.write_idx + num_records) % self.capacity;
+        self.size = (self.size + num_records).min(self.capacity);
+
+        Ok(())
+    }
+
+    /// Sample a random mini-batch from the reservoir.
+    ///
+    /// Uses GPU-side random index generation and gather kernels.
+    /// No data touches the CPU.
+    ///
+    /// # Arguments
+    /// * `gpu` - CUDA context.
+    /// * `batch_size` - Number of records to sample.
+    /// * `seed` - Random seed for index generation.
+    pub fn sample_minibatch_gpu(
+        &self,
+        gpu: &GpuContext,
+        batch_size: usize,
+        seed: u32,
+    ) -> Result<GpuMiniBatch, String> {
+        let gpu_err = |e: GpuError| format!("GPU error: {e}");
+        let drv_err = |e: cudarc::driver::DriverError| format!("GPU error: {e}");
+
+        if self.size < batch_size {
+            return Err(format!(
+                "Reservoir has {} records but batch_size is {}",
+                self.size, batch_size
+            ));
+        }
+
+        // 1. Generate random indices on GPU
+        let mut indices = gpu.alloc_zeros::<u32>(batch_size).map_err(gpu_err)?;
+        {
+            let kernel = gpu.compile_and_load(
+                include_str!("../../kernels/generate_random_indices.cu"),
+                "generate_random_indices",
+            ).map_err(gpu_err)?;
+            let cfg = LaunchConfig::for_num_elems(batch_size as u32);
+            let batch_size_u32 = batch_size as u32;
+            let max_index = self.size as u32;
+            unsafe {
+                gpu.stream
+                    .launch_builder(&kernel)
+                    .arg(&mut indices)
+                    .arg(&batch_size_u32)
+                    .arg(&max_index)
+                    .arg(&seed)
+                    .launch(cfg)
+                    .map_err(drv_err)?;
+            }
+        }
+
+        // 2. Gather each field using the reservoir_gather kernel
+        let batch_inputs = self.gather_field(gpu, &indices, &self.inputs, batch_size, INPUT_SIZE).map_err(gpu_err)?;
+        let batch_targets = self.gather_field(gpu, &indices, &self.targets, batch_size, OUTPUT_SIZE).map_err(gpu_err)?;
+        let batch_masks = self.gather_field(gpu, &indices, &self.masks, batch_size, OUTPUT_SIZE).map_err(gpu_err)?;
+        let batch_ranges = self.gather_field(gpu, &indices, &self.ranges, batch_size, OUTPUT_SIZE).map_err(gpu_err)?;
+        let batch_game_values = self.gather_field(gpu, &indices, &self.game_values, batch_size, 1).map_err(gpu_err)?;
+
+        Ok(GpuMiniBatch {
+            inputs: batch_inputs,
+            targets: batch_targets,
+            masks: batch_masks,
+            ranges: batch_ranges,
+            game_values: batch_game_values,
+            batch_size,
+        })
+    }
+
+    /// Gather a field from the reservoir into a contiguous batch buffer.
+    fn gather_field(
+        &self,
+        gpu: &GpuContext,
+        indices: &CudaSlice<u32>,
+        reservoir: &CudaSlice<f32>,
+        batch_size: usize,
+        feature_size: usize,
+    ) -> Result<CudaSlice<f32>, GpuError> {
+        let total = batch_size * feature_size;
+        let mut output = gpu.alloc_zeros::<f32>(total)?;
+
+        let kernel = gpu.compile_and_load(
+            include_str!("../../kernels/reservoir_gather.cu"),
+            "reservoir_gather",
+        )?;
+
+        let cfg = LaunchConfig::for_num_elems(total as u32);
+        let batch_size_u32 = batch_size as u32;
+        let feature_size_u32 = feature_size as u32;
+
+        unsafe {
+            gpu.stream
+                .launch_builder(&kernel)
+                .arg(&mut output)
+                .arg(reservoir)
+                .arg(indices)
+                .arg(&batch_size_u32)
+                .arg(&feature_size_u32)
+                .launch(cfg)?;
+        }
+
+        Ok(output)
+    }
 }
 
 #[cfg(test)]
@@ -406,7 +628,7 @@ mod tests {
 
         // Inserting beyond capacity wraps around
         res.insert(&record);
-        assert_eq!(res.size(), 100); // still at capacity
+        assert_eq!(res.size(), 100);
     }
 
     #[test]
@@ -414,7 +636,6 @@ mod tests {
         let mut res = Reservoir::new(5);
         let board = test_board();
 
-        // Insert 5 records with different game values
         for i in 0..5 {
             let range = dummy_range(&board);
             let (input, mask, _) =
@@ -443,8 +664,8 @@ mod tests {
             game_value: 99.0,
         });
         assert_eq!(res.size(), 5);
-        assert_eq!(res.game_values[0], 99.0); // overwritten
-        assert_eq!(res.game_values[1], 1.0); // still original
+        assert_eq!(res.game_values[0], 99.0);
+        assert_eq!(res.game_values[1], 1.0);
     }
 
     #[test]
@@ -452,7 +673,6 @@ mod tests {
         let mut res = Reservoir::new(100);
         let board = test_board();
 
-        // Insert 50 records
         for i in 0..50 {
             let range = dummy_range(&board);
             let (input, mask, _) =
@@ -466,12 +686,10 @@ mod tests {
             });
         }
 
-        // Sample a mini-batch of 10
         let mut counter = 0usize;
         let batch = res
             .sample_minibatch(10, &mut |bound| {
                 counter += 1;
-                // Deterministic: cycle through indices
                 (counter * 7) % bound
             })
             .unwrap();
@@ -502,30 +720,18 @@ mod tests {
         assert_eq!(input.len(), INPUT_SIZE);
         assert_eq!(mask.len(), OUTPUT_SIZE);
 
-        // Check OOP range copied correctly
         assert_eq!(&input[..OUTPUT_SIZE], &range[..]);
-
-        // Check IP range copied correctly
         assert_eq!(&input[OUTPUT_SIZE..2 * OUTPUT_SIZE], &range[..]);
 
-        // Check board one-hot
         let ac_card = card("Ac") as usize;
         assert_eq!(input[2652 + ac_card], 1.0);
 
-        // Check pot normalisation
-        assert!((input[2717] - 0.5).abs() < 1e-6); // 200/400 = 0.5
-
-        // Check stack normalisation
-        assert!((input[2718] - 1.0).abs() < 1e-6); // 400/400 = 1.0
-
-        // Check player indicator
+        assert!((input[2717] - 0.5).abs() < 1e-6);
+        assert!((input[2718] - 1.0).abs() < 1e-6);
         assert_eq!(input[2719], 0.0);
 
-        // Check mask: blocked combos should be 0.0
         let board_set: Vec<u8> = board.iter().map(|&c| c as u8).collect();
         let valid_count = mask.iter().filter(|&&m| m == 1.0).count();
-        // 5 board cards block C(5,2)=10 two-card combos plus 5*47=235 one-card combos
-        // Valid = 1326 - 245 = 1081
         assert_eq!(valid_count, 1081);
 
         for (i, &m) in mask.iter().enumerate() {
@@ -589,7 +795,107 @@ mod tests {
             num_situations,
         );
 
-        // Each situation produces 2 records (OOP + IP)
         assert_eq!(res.size(), num_situations * 2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_gpu_reservoir_insert_and_sample() {
+        use crate::gpu::GpuContext;
+
+        let gpu = GpuContext::new(0).expect("CUDA device required");
+        let mut reservoir = GpuReservoir::new(&gpu, 100).unwrap();
+
+        assert_eq!(reservoir.size(), 0);
+        assert_eq!(reservoir.capacity(), 100);
+        assert!(!reservoir.is_full());
+
+        let board = test_board();
+        let range = dummy_range(&board);
+
+        let num_spots = 5;
+        let mut boards = Vec::new();
+        let mut ranges_oop = Vec::new();
+        let mut ranges_ip = Vec::new();
+        let mut pots = Vec::new();
+        let mut stacks = Vec::new();
+        let cfvs = vec![0.01f32; OUTPUT_SIZE];
+        let mut cfvs_oop = Vec::new();
+        let mut cfvs_ip = Vec::new();
+
+        for _ in 0..num_spots {
+            boards.extend_from_slice(&board);
+            ranges_oop.extend_from_slice(&range);
+            ranges_ip.extend_from_slice(&range);
+            pots.push(200.0f32);
+            stacks.push(400.0f32);
+            cfvs_oop.extend_from_slice(&cfvs);
+            cfvs_ip.extend_from_slice(&cfvs);
+        }
+
+        // Upload to GPU
+        let gpu_boards = gpu.upload(&boards).unwrap();
+        let gpu_ranges_oop = gpu.upload(&ranges_oop).unwrap();
+        let gpu_ranges_ip = gpu.upload(&ranges_ip).unwrap();
+        let gpu_pots = gpu.upload(&pots).unwrap();
+        let gpu_stacks = gpu.upload(&stacks).unwrap();
+        let gpu_cfvs_oop = gpu.upload(&cfvs_oop).unwrap();
+        let gpu_cfvs_ip = gpu.upload(&cfvs_ip).unwrap();
+
+        // Insert batch
+        reservoir.insert_batch_gpu(
+            &gpu,
+            &gpu_ranges_oop,
+            &gpu_ranges_ip,
+            &gpu_boards,
+            &gpu_pots,
+            &gpu_stacks,
+            &gpu_cfvs_oop,
+            &gpu_cfvs_ip,
+            num_spots,
+        ).unwrap();
+
+        // Each spot produces 2 records
+        assert_eq!(reservoir.size(), num_spots * 2);
+
+        // Sample a mini-batch
+        let batch = reservoir.sample_minibatch_gpu(&gpu, 4, 42).unwrap();
+        assert_eq!(batch.batch_size, 4);
+
+        // Download and verify shapes
+        let inputs: Vec<f32> = gpu.download(&batch.inputs).unwrap();
+        let targets: Vec<f32> = gpu.download(&batch.targets).unwrap();
+        let masks: Vec<f32> = gpu.download(&batch.masks).unwrap();
+        let ranges: Vec<f32> = gpu.download(&batch.ranges).unwrap();
+        let game_values: Vec<f32> = gpu.download(&batch.game_values).unwrap();
+
+        assert_eq!(inputs.len(), 4 * INPUT_SIZE);
+        assert_eq!(targets.len(), 4 * OUTPUT_SIZE);
+        assert_eq!(masks.len(), 4 * OUTPUT_SIZE);
+        assert_eq!(ranges.len(), 4 * OUTPUT_SIZE);
+        assert_eq!(game_values.len(), 4);
+
+        // Verify non-trivial content: inputs should have non-zero values
+        let non_zero_inputs = inputs.iter().filter(|&&v| v != 0.0).count();
+        assert!(non_zero_inputs > 0, "Inputs should have non-zero values");
+
+        // Verify mask has correct structure: each sample should have 1081 valid combos
+        for b in 0..4 {
+            let mask_slice = &masks[b * OUTPUT_SIZE..(b + 1) * OUTPUT_SIZE];
+            let valid = mask_slice.iter().filter(|&&m| m == 1.0).count();
+            assert_eq!(valid, 1081, "Sample {b} should have 1081 valid combos");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_gpu_reservoir_sample_too_large() {
+        use crate::gpu::GpuContext;
+
+        let gpu = GpuContext::new(0).expect("CUDA device required");
+        let reservoir = GpuReservoir::new(&gpu, 100).unwrap();
+
+        let result = reservoir.sample_minibatch_gpu(&gpu, 10, 42);
+        assert!(result.is_err());
     }
 }
