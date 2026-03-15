@@ -1,14 +1,14 @@
 ---
 # poker_solver_rust-9v41
 title: 'Phase 2: River CFVNet Training on GPU'
-status: todo
+status: in-progress
 type: feature
 priority: high
 tags:
     - gpu
     - cfvnet
 created_at: 2026-03-15T04:14:26Z
-updated_at: 2026-03-15T04:14:26Z
+updated_at: 2026-03-15T04:33:09Z
 parent: poker_solver_rust-twez
 ---
 
