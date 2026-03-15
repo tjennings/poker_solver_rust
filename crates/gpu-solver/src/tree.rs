@@ -1,5 +1,5 @@
 use range_solver::interface::Game;
-use range_solver::{Action, PostFlopGame};
+use range_solver::{Action, BoardState, PostFlopGame};
 
 /// Node type discriminant for GPU.
 #[repr(u8)]
@@ -9,6 +9,7 @@ pub enum NodeType {
     DecisionIp = 1,
     TerminalFold = 2,
     TerminalShowdown = 3,
+    DepthBoundary = 4,
 }
 
 /// Flat level-order game tree for GPU upload.
@@ -87,6 +88,12 @@ pub struct FlatTree {
     /// or `u32::MAX` if no such hand exists.
     /// Length = `num_hands` (padded with `u32::MAX`).
     pub same_hand_index_ip: Vec<u32>,
+    /// Node IDs of depth-boundary nodes (terminals that need neural leaf evaluation).
+    pub boundary_indices: Vec<u32>,
+    /// Pot size at each depth-boundary node.
+    pub boundary_pots: Vec<f32>,
+    /// Effective stack remaining at each depth-boundary node.
+    pub boundary_stacks: Vec<f32>,
 }
 
 impl FlatTree {
@@ -129,11 +136,11 @@ impl FlatTree {
         }
     }
 
-    /// Whether the node is a terminal (fold or showdown).
+    /// Whether the node is a terminal (fold, showdown, or depth boundary).
     pub fn is_terminal(&self, node: usize) -> bool {
         matches!(
             self.node_types[node],
-            NodeType::TerminalFold | NodeType::TerminalShowdown
+            NodeType::TerminalFold | NodeType::TerminalShowdown | NodeType::DepthBoundary
         )
     }
 
@@ -155,9 +162,12 @@ impl FlatTree {
         let num_hands_ip = game.num_private_hands(1);
         let num_hands = num_hands_oop.max(num_hands_ip);
         let starting_pot = game.tree_config().starting_pot;
+        let effective_stack = game.tree_config().effective_stack;
         let num_combinations = game.num_combinations();
         let rake_rate = game.tree_config().rake_rate;
         let rake_cap = game.tree_config().rake_cap;
+        let has_depth_limit = game.tree_config().depth_limit.is_some();
+        let initial_state = game.tree_config().initial_state.clone();
 
         // BFS entry: history path from root + metadata.
         struct BfsEntry {
@@ -188,6 +198,11 @@ impl FlatTree {
         let mut showdown_equity_ids_vec: Vec<u32> = Vec::new();
         let mut equity_tables_vec: Vec<Vec<f32>> = Vec::new();
         let mut fold_payoffs_vec: Vec<Vec<f32>> = Vec::new();
+
+        // Depth boundary tracking
+        let mut boundary_indices: Vec<u32> = Vec::new();
+        let mut boundary_pots: Vec<f32> = Vec::new();
+        let mut boundary_stacks: Vec<f32> = Vec::new();
 
         // Seed BFS with root
         queue.push(BfsEntry {
@@ -222,7 +237,8 @@ impl FlatTree {
                 if is_chance {
                     panic!(
                         "Chance nodes not supported in Phase 1 (river games only). \
-                         Got chance node at history {history:?}",
+                         Got chance node at history {history:?}, \
+                         is_terminal={is_terminal}",
                     );
                 }
 
@@ -262,6 +278,25 @@ impl FlatTree {
                             folded_player as f32,
                         ]);
                         showdown_equity_ids_vec.push(u32::MAX);
+                    } else if has_depth_limit && initial_state != BoardState::River {
+                        // Non-fold terminal in a depth-limited game (not starting
+                        // at the river) is a depth boundary — the tree stops before
+                        // the next street and leaf values come from a neural net.
+                        node_types.push(NodeType::DepthBoundary);
+
+                        // Compute effective stack remaining at this boundary.
+                        let bet_amounts_boundary = game.total_bet_amount();
+                        let max_bet = bet_amounts_boundary[0].max(bet_amounts_boundary[1]);
+                        let stack_remaining = (effective_stack - max_bet) as f32;
+
+                        boundary_indices.push(flat_id);
+                        boundary_pots.push(pot);
+                        boundary_stacks.push(stack_remaining);
+
+                        // Fill placeholder payoff entries so terminal_indices
+                        // stays aligned with fold_payoffs / showdown_equity_ids.
+                        showdown_equity_ids_vec.push(u32::MAX);
+                        fold_payoffs_vec.push(Vec::new());
                     } else {
                         node_types.push(NodeType::TerminalShowdown);
 
@@ -344,30 +379,39 @@ impl FlatTree {
         child_offsets.push(offset);
 
         // Compute per-combo hand strengths for showdown evaluation.
+        // Only needed when there are showdown terminals (not for depth-limited turn games).
         let card_cfg = game.card_config();
-        let board = [
-            card_cfg.flop[0],
-            card_cfg.flop[1],
-            card_cfg.flop[2],
-            card_cfg.turn,
-            card_cfg.river,
-        ];
+        let has_showdowns = node_types.iter().any(|t| *t == NodeType::TerminalShowdown);
+        let (hand_strengths_oop, hand_strengths_ip) = if has_showdowns {
+            let board = [
+                card_cfg.flop[0],
+                card_cfg.flop[1],
+                card_cfg.flop[2],
+                card_cfg.turn,
+                card_cfg.river,
+            ];
 
-        let hand_strengths_oop: Vec<u32> = game
-            .private_cards(0)
-            .iter()
-            .map(|&hole| {
-                range_solver::card::evaluate_hand_strength(&board, hole) as u32
-            })
-            .collect();
+            let strengths_oop: Vec<u32> = game
+                .private_cards(0)
+                .iter()
+                .map(|&hole| {
+                    range_solver::card::evaluate_hand_strength(&board, hole) as u32
+                })
+                .collect();
 
-        let hand_strengths_ip: Vec<u32> = game
-            .private_cards(1)
-            .iter()
-            .map(|&hole| {
-                range_solver::card::evaluate_hand_strength(&board, hole) as u32
-            })
-            .collect();
+            let strengths_ip: Vec<u32> = game
+                .private_cards(1)
+                .iter()
+                .map(|&hole| {
+                    range_solver::card::evaluate_hand_strength(&board, hole) as u32
+                })
+                .collect();
+
+            (strengths_oop, strengths_ip)
+        } else {
+            // No showdowns: hand strengths not needed, use empty vecs
+            (vec![0u32; num_hands_oop], vec![0u32; num_hands_ip])
+        };
 
         // Extract initial reach weights (range weights after card removal).
         let weights_oop = game.initial_weights(0);
@@ -482,6 +526,9 @@ impl FlatTree {
             valid_matchups_ip,
             same_hand_index_oop,
             same_hand_index_ip,
+            boundary_indices,
+            boundary_pots,
+            boundary_stacks,
         }
     }
 
@@ -552,8 +599,52 @@ impl FlatTree {
             // No same-hand overlaps in test tree
             same_hand_index_oop: vec![u32::MAX, u32::MAX],
             same_hand_index_ip: vec![u32::MAX, u32::MAX],
+            // No depth boundaries in test tree
+            boundary_indices: vec![],
+            boundary_pots: vec![],
+            boundary_stacks: vec![],
         }
     }
+}
+
+/// Build a turn `PostFlopGame` with `depth_limit: Some(0)` so that the tree
+/// has fold terminals and depth-boundary leaves (no chance nodes, no showdown).
+///
+/// `depth_limit: Some(0)` blocks ALL street transitions, so check-check or
+/// bet-call on the turn produces a depth boundary instead of dealing a river.
+///
+/// Uses uniform ranges (all 1326 combos at weight 1.0) and the provided
+/// bet-size configuration for both players.
+pub fn build_turn_game(
+    flop: [u8; 3],
+    turn: u8,
+    pot: i32,
+    stack: i32,
+    bet_sizes: &range_solver::bet_size::BetSizeOptions,
+) -> PostFlopGame {
+    use range_solver::{ActionTree, CardConfig, TreeConfig};
+
+    let card_config = CardConfig {
+        range: [range_solver::range::Range::ones(), range_solver::range::Range::ones()],
+        flop,
+        turn,
+        river: range_solver::card::NOT_DEALT,
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Turn,
+        starting_pot: pot,
+        effective_stack: stack,
+        turn_bet_sizes: [bet_sizes.clone(), bet_sizes.clone()],
+        depth_limit: Some(0),
+        ..Default::default()
+    };
+
+    let tree = ActionTree::new(tree_config).expect("Failed to build turn action tree");
+    let mut game = PostFlopGame::with_config(card_config, tree)
+        .expect("Failed to build turn PostFlopGame");
+    game.allocate_memory(false);
+    game
 }
 
 #[cfg(test)]
@@ -608,5 +699,80 @@ mod tests {
         assert_eq!(tree.infoset_ids[0], 0);
         assert_eq!(tree.infoset_ids[1], u32::MAX);
         assert_eq!(tree.infoset_ids[2], 1);
+    }
+
+    #[test]
+    fn test_turn_tree_with_depth_boundaries() {
+        use range_solver::bet_size::BetSizeOptions;
+
+        // Build a turn game with depth_limit=1.
+        // Board: Qs Jh 2c 8d => flop=[46,37,8], turn=29
+        let flop = range_solver::card::flop_from_str("Qs Jh 2c").unwrap();
+        let turn = range_solver::card::card_from_str("8d").unwrap();
+        let bet_sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+
+        let mut game = build_turn_game(flop, turn, 100, 100, &bet_sizes);
+        let flat = FlatTree::from_postflop_game(&mut game);
+
+        // Basic sanity
+        assert!(flat.num_nodes() > 0, "tree should have nodes");
+        assert!(flat.num_levels() > 0, "tree should have levels");
+        assert!(flat.num_infosets > 0, "tree should have infosets");
+
+        // Count terminal types
+        let num_fold = flat.node_types.iter().filter(|t| **t == NodeType::TerminalFold).count();
+        let num_showdown = flat.node_types.iter().filter(|t| **t == NodeType::TerminalShowdown).count();
+        let num_boundary = flat.node_types.iter().filter(|t| **t == NodeType::DepthBoundary).count();
+
+        // With depth_limit=1 on a turn game:
+        // - NO showdown terminals (can't reach river)
+        // - NO chance nodes (depth boundary replaces them)
+        // - SOME fold terminals
+        // - SOME depth boundaries
+        assert!(num_fold > 0, "should have fold terminals, got 0");
+        assert_eq!(num_showdown, 0, "should have no showdown terminals, got {num_showdown}");
+        assert!(num_boundary > 0, "should have depth boundaries, got 0");
+
+        // boundary_indices should be populated and match count
+        assert_eq!(flat.boundary_indices.len(), num_boundary);
+        assert_eq!(flat.boundary_pots.len(), num_boundary);
+        assert_eq!(flat.boundary_stacks.len(), num_boundary);
+
+        // Verify all boundary indices point to DepthBoundary nodes
+        for &idx in &flat.boundary_indices {
+            assert_eq!(
+                flat.node_types[idx as usize],
+                NodeType::DepthBoundary,
+                "boundary_indices[{idx}] should be DepthBoundary"
+            );
+        }
+
+        // Boundary pots should be >= starting pot
+        for &pot in &flat.boundary_pots {
+            assert!(pot >= 100.0, "boundary pot {pot} should be >= starting pot 100");
+        }
+
+        // Boundary stacks should be > 0 and <= effective stack
+        for &stack in &flat.boundary_stacks {
+            assert!(stack >= 0.0, "boundary stack {stack} should be >= 0");
+            assert!(stack <= 100.0, "boundary stack {stack} should be <= effective stack 100");
+        }
+
+        // DepthBoundary should be recognized as terminal
+        for &idx in &flat.boundary_indices {
+            assert!(flat.is_terminal(idx as usize), "depth boundary should be terminal");
+        }
+
+        // Root should be a decision node
+        assert!(
+            flat.node_types[0] == NodeType::DecisionOop || flat.node_types[0] == NodeType::DecisionIp,
+            "root should be a decision node"
+        );
+
+        // Both players should have hands (some blocked by board cards)
+        assert!(flat.num_hands > 0, "should have some hands");
+        assert!(flat.num_hands <= 1326, "at most 1326 hands");
+        // With a 4-card board, expect C(48,2) = 1128 valid combos
+        assert_eq!(flat.num_hands, 1128);
     }
 }
