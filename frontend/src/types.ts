@@ -264,3 +264,6 @@ export interface CacheInfo {
   exploitability: number;
   iterations: number;
 }
+
+// GPU resolve types (re-exported from invoke.ts for convenience)
+export type { ModelStackConfig, GpuGameState, GpuResolveResult } from './invoke';

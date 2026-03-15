@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
-import { invoke } from './invoke';
+import { invoke, isTauri, isGpuModelLoaded, loadGpuModelSet, ModelStackConfig } from './invoke';
 import PostflopExplorer from './PostflopExplorer';
 import {
   BlueprintConfig,
@@ -598,6 +598,51 @@ export default function Explorer() {
   const [blueprintPostflopConfig, setBlueprintPostflopConfig] = useState<BlueprintConfig | null>(null);
   const blueprintPostflopConfigRef = useRef<BlueprintConfig | null>(null);
 
+  // GPU model state
+  const [gpuLoaded, setGpuLoaded] = useState(false);
+  const [gpuLoading, setGpuLoading] = useState(false);
+  const [gpuError, setGpuError] = useState<string | null>(null);
+
+  // Check GPU status on mount
+  useEffect(() => {
+    isGpuModelLoaded()
+      .then(setGpuLoaded)
+      .catch(() => { /* GPU feature not available */ });
+  }, []);
+
+  const handleLoadGpuModel = async () => {
+    let modelPath: string | null = null;
+    if (isTauri()) {
+      try {
+        const { open } = await import('@tauri-apps/plugin-dialog');
+        const selected = await open({ directory: true, title: 'Select GPU Model Directory' });
+        if (typeof selected === 'string') modelPath = selected;
+      } catch {
+        modelPath = window.prompt('Enter GPU model directory path:');
+      }
+    } else {
+      modelPath = window.prompt('Enter GPU model directory path:');
+    }
+    if (!modelPath) return;
+
+    setGpuLoading(true);
+    setGpuError(null);
+    try {
+      const config: ModelStackConfig = {
+        river_layers: 7, river_hidden: 500,
+        turn_layers: 7, turn_hidden: 500,
+        flop_layers: 7, flop_hidden: 500,
+        preflop_layers: 7, preflop_hidden: 500,
+      };
+      await loadGpuModelSet(modelPath, config);
+      setGpuLoaded(true);
+    } catch (e) {
+      setGpuError(String(e));
+    } finally {
+      setGpuLoading(false);
+    }
+  };
+
   const handleLoadStrategy = async () => {
     const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
     if (!globalConfig.blueprint_dir) {
@@ -1056,6 +1101,33 @@ export default function Explorer() {
               <path d="M7 12h10M12 7v10" />
             </svg>
           </div>
+        </div>
+
+        {/* GPU model indicator */}
+        <div
+          className="action-block postflop-config-card"
+          style={{ cursor: 'pointer', opacity: gpuLoading ? 0.6 : 1 }}
+          onClick={handleLoadGpuModel}
+          title={gpuLoaded ? 'GPU model loaded — click to reload' : 'Load GPU model set'}
+        >
+          <div className="postflop-config-label" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <span style={{
+              display: 'inline-block',
+              width: 8,
+              height: 8,
+              borderRadius: '50%',
+              background: gpuLoaded ? '#00d9ff' : '#444',
+            }} />
+            GPU
+          </div>
+          <div className="postflop-config-summary">
+            {gpuLoading ? 'Loading...' : gpuLoaded ? 'Ready' : 'Not loaded'}
+          </div>
+          {gpuError && (
+            <div className="postflop-config-summary" style={{ color: '#ef4444', fontSize: '10px' }}>
+              {gpuError.slice(0, 60)}
+            </div>
+          )}
         </div>
 
       {bundleInfo && (
