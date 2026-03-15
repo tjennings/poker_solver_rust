@@ -117,13 +117,15 @@ impl Widget for &HandGridWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         use poker_solver_core::hands::CanonicalHand;
 
-        // Adaptive cell height: 2 rows (color bar + label) if space allows,
-        // otherwise 1 row (color bar with overlaid label).
-        let cell_h: u16 = if area.height >= 28 { 2 } else { 1 }; // 1 title + 13*cell_h
-        let min_h = 1 + 13 * cell_h; // title + grid
-        if area.height < min_h || area.width < 13 {
+        // Always 2-row cells: top = stacked color bar, bottom = hand label.
+        // Clips gracefully if terminal is too short.
+        let cell_h: u16 = 2;
+        // Need at least 1 title row + 1 complete cell (2 rows) = 3 rows.
+        if area.height < 3 || area.width < 13 {
             return;
         }
+
+        let border = Color::Rgb(0, 0, 0); // black cell border
 
         // ── Title row ────────────────────────────────────────────────
         let title = format!(
@@ -132,13 +134,17 @@ impl Widget for &HandGridWidget<'_> {
         );
         buf.set_string(area.x, area.y, &title, Style::default().bold());
 
-        // ── Grid rows (no axis labels) ───────────────────────────────
+        // ── Grid rows ───────────────────────────────────────────────
+        // Each cell is cell_w wide with the last column reserved for a
+        // black vertical border, giving (cell_w - 1) usable content chars.
         let cell_w = cell_width(area.width);
+        let content_w = cell_w.saturating_sub(1).max(2); // at least 2 content chars
         let grid_x0 = area.x;
         let grid_y0 = area.y + 1;
         for r in 0..13u16 {
-            let y_top = grid_y0 + r * cell_h;
-            if y_top >= area.y + area.height {
+            let y_top = grid_y0 + r * cell_h; // color bar row
+            let y_bot = y_top + 1;             // hand label row
+            if y_bot >= area.y + area.height {
                 break;
             }
 
@@ -152,60 +158,39 @@ impl Widget for &HandGridWidget<'_> {
                 let hand_label = CanonicalHand::from_matrix_position(r as usize, c as usize)
                     .map_or_else(|| "   ".to_string(), |h| format!("{h}"));
 
-                if cell_h == 2 {
-                    // ── 2-row mode: top = color bar, bottom = hand label ──
-                    let y_bot = y_top + 1;
-                    if y_bot >= area.y + area.height {
-                        break;
-                    }
-
-                    if cell.actions.is_empty() {
-                        let style = Style::default().bg(Color::Rgb(40, 40, 40));
-                        for dx in 0..cell_w {
-                            buf.set_string(x + dx, y_top, " ", style);
-                        }
-                    } else {
-                        render_color_bar(buf, x, y_top, cell_w, &cell.actions);
-                    }
-
-                    let bg_color = if cell.actions.is_empty() {
-                        Color::Rgb(40, 40, 40)
-                    } else {
-                        let (dom_name, _) = cell.dominant_action();
-                        dominant_action_color(dom_name, &cell.actions)
-                    };
-                    let label_style = Style::default().bg(bg_color).fg(Color::White);
-                    let label_len = hand_label.len().min(cell_w as usize);
-                    buf.set_string(x, y_bot, &hand_label[..label_len], label_style);
-                    let pad_style = Style::default().bg(bg_color);
-                    for dx in label_len as u16..cell_w {
-                        buf.set_string(x + dx, y_bot, " ", pad_style);
+                // Top row: stacked color bar (content_w chars) + border
+                if cell.actions.is_empty() {
+                    let style = Style::default().bg(Color::Rgb(40, 40, 40));
+                    for dx in 0..content_w {
+                        buf.set_string(x + dx, y_top, " ", style);
                     }
                 } else {
-                    // ── 1-row mode: color bar with hand label overlaid ──
-                    if cell.actions.is_empty() {
-                        let style = Style::default().bg(Color::Rgb(40, 40, 40)).fg(Color::White);
-                        let label_len = hand_label.len().min(cell_w as usize);
-                        buf.set_string(x, y_top, &hand_label[..label_len], style);
-                        let pad_style = Style::default().bg(Color::Rgb(40, 40, 40));
-                        for dx in label_len as u16..cell_w {
-                            buf.set_string(x + dx, y_top, " ", pad_style);
-                        }
-                    } else {
-                        render_color_bar(buf, x, y_top, cell_w, &cell.actions);
-                        // Overlay hand label on the color bar
-                        let (dom_name, _) = cell.dominant_action();
-                        let bg = dominant_action_color(dom_name, &cell.actions);
-                        let style = Style::default().bg(bg).fg(Color::White);
-                        let label_len = hand_label.len().min(cell_w as usize);
-                        buf.set_string(x, y_top, &hand_label[..label_len], style);
-                    }
+                    render_color_bar(buf, x, y_top, content_w, &cell.actions);
                 }
+                // Vertical border on top row
+                buf.set_string(x + content_w, y_top, " ", Style::default().bg(border));
+
+                // Bottom row: hand label on dominant action color background
+                let bg_color = if cell.actions.is_empty() {
+                    Color::Rgb(40, 40, 40)
+                } else {
+                    let (dom_name, _) = cell.dominant_action();
+                    dominant_action_color(dom_name, &cell.actions)
+                };
+                let label_style = Style::default().bg(bg_color).fg(Color::White);
+                let label_len = hand_label.len().min(content_w as usize);
+                buf.set_string(x, y_bot, &hand_label[..label_len], label_style);
+                let pad_style = Style::default().bg(bg_color);
+                for dx in label_len as u16..content_w {
+                    buf.set_string(x + dx, y_bot, " ", pad_style);
+                }
+                // Vertical border on bottom row
+                buf.set_string(x + content_w, y_bot, " ", Style::default().bg(border));
 
                 // Blue underline for cells that changed since last snapshot.
                 if let Some(ref prev) = self.state.prev_cells {
                     if !cell.is_converged(&prev[r as usize][c as usize], 0.01) {
-                        for dx in 0..cell_w {
+                        for dx in 0..content_w {
                             let buf_cell = &mut buf[(x + dx, y_top)];
                             buf_cell.set_style(
                                 buf_cell
