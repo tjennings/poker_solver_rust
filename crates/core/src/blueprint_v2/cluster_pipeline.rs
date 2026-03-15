@@ -596,6 +596,7 @@ pub fn cluster_flop_with_boards(
 ///
 /// Returns a `BucketFile` with `street = River`, `board_count` equal to the
 /// number of canonical rivers, and a populated `boards` field.
+#[allow(dead_code)]
 pub fn cluster_river_canonical(
     bucket_count: u16,
     kmeans_iterations: u32,
@@ -672,6 +673,7 @@ pub fn cluster_river_canonical(
 /// Enumerates all canonical 4-card (flop+turn) boards, computes a histogram
 /// feature vector over river buckets for every valid combo, and clusters using
 /// [`kmeans_emd_weighted_u8`] with weights reflecting combinatorial multiplicity.
+#[allow(dead_code)]
 pub fn cluster_turn_canonical(
     river_buckets: &BucketFile,
     bucket_count: u16,
@@ -772,6 +774,7 @@ pub fn cluster_turn_canonical(
 /// Enumerates all 1,755 canonical 3-card flops, computes a histogram feature
 /// vector over turn buckets for every valid combo, and clusters using
 /// [`kmeans_emd_weighted_u8`] with weights reflecting combinatorial multiplicity.
+#[allow(dead_code)]
 pub fn cluster_flop_canonical(
     turn_buckets: &BucketFile,
     bucket_count: u16,
@@ -1491,6 +1494,9 @@ pub fn run_clustering_pipeline(
     progress: impl Fn(&str, f64) + Sync,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. River (equity clustering — independent)
+    // cfvnet path already produces exhaustive bucket files; otherwise use
+    // two-phase exhaustive clustering. sample_boards controls the sampling
+    // phase of centroid finding; the exhaustive phase always covers all boards.
     progress("river", 0.0);
     let river = if let Some(ref cfvnet_dir) = config.cfvnet_river_data {
         cluster_river_from_cfvnet(
@@ -1499,66 +1505,45 @@ pub fn run_clustering_pipeline(
             config.kmeans_iterations,
             |p| progress("river", p),
         )?
-    } else if let Some(n) = config.river.sample_boards {
-        cluster_river_with_boards(
-            config.river.buckets,
-            config.kmeans_iterations,
-            config.seed,
-            n,
-            |p| progress("river", p),
-        )
     } else {
-        cluster_river(
+        let sample = config.river.sample_boards.unwrap_or(DEFAULT_NUM_BOARDS);
+        cluster_river_exhaustive(
             config.river.buckets,
             config.kmeans_iterations,
             config.seed,
+            sample,
             |p| progress("river", p),
         )
     };
     river.save(&output_dir.join("river.buckets"))?;
 
     // 2. Turn (potential-aware EMD, depends on river)
+    // Two-phase exhaustive: sample for centroids, assign all canonical turns.
     progress("turn", 0.0);
-    let turn = if let Some(n) = config.turn.sample_boards {
-        cluster_turn_with_boards(
-            &river,
-            config.turn.buckets,
-            config.kmeans_iterations,
-            config.seed,
-            n,
-            |p| progress("turn", p),
-        )
-    } else {
-        cluster_turn(
-            &river,
-            config.turn.buckets,
-            config.kmeans_iterations,
-            config.seed,
-            |p| progress("turn", p),
-        )
-    };
+    let sample_turn = config.turn.sample_boards.unwrap_or(DEFAULT_TURN_BOARDS);
+    let turn = cluster_turn_exhaustive(
+        &river,
+        config.turn.buckets,
+        config.kmeans_iterations,
+        config.seed,
+        sample_turn,
+        |p| progress("turn", p),
+    );
     turn.save(&output_dir.join("turn.buckets"))?;
 
     // 3. Flop (potential-aware EMD, depends on turn)
+    // Two-phase exhaustive: sample for centroids, assign all canonical flops.
+    // All 1,755 canonical flops are always enumerated in the exhaustive phase.
     progress("flop", 0.0);
-    let flop = if let Some(n) = config.flop.sample_boards {
-        cluster_flop_with_boards(
-            &turn,
-            config.flop.buckets,
-            config.kmeans_iterations,
-            config.seed,
-            n,
-            |p| progress("flop", p),
-        )
-    } else {
-        cluster_flop(
-            &turn,
-            config.flop.buckets,
-            config.kmeans_iterations,
-            config.seed,
-            |p| progress("flop", p),
-        )
-    };
+    let sample_flop = config.flop.sample_boards.unwrap_or(1755);
+    let flop = cluster_flop_exhaustive(
+        &turn,
+        config.flop.buckets,
+        config.kmeans_iterations,
+        config.seed,
+        sample_flop,
+        |p| progress("flop", p),
+    );
     flop.save(&output_dir.join("flop.buckets"))?;
 
     // 4. Preflop (deterministic canonical hand mapping, 169 buckets)
