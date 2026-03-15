@@ -647,6 +647,45 @@ pub fn build_turn_game(
     game
 }
 
+/// Build a flop `PostFlopGame` with `depth_limit: Some(0)` so that the tree
+/// has fold terminals and depth-boundary leaves (no chance nodes, no showdown).
+///
+/// `depth_limit: Some(0)` blocks ALL street transitions, so check-check or
+/// bet-call on the flop produces a depth boundary instead of dealing a turn.
+///
+/// Uses uniform ranges (all 1326 combos at weight 1.0) and the provided
+/// bet-size configuration for both players.
+pub fn build_flop_game(
+    flop: [u8; 3],
+    pot: i32,
+    stack: i32,
+    bet_sizes: &range_solver::bet_size::BetSizeOptions,
+) -> PostFlopGame {
+    use range_solver::{ActionTree, CardConfig, TreeConfig};
+
+    let card_config = CardConfig {
+        range: [range_solver::range::Range::ones(), range_solver::range::Range::ones()],
+        flop,
+        turn: range_solver::card::NOT_DEALT,
+        river: range_solver::card::NOT_DEALT,
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Flop,
+        starting_pot: pot,
+        effective_stack: stack,
+        flop_bet_sizes: [bet_sizes.clone(), bet_sizes.clone()],
+        depth_limit: Some(0),
+        ..Default::default()
+    };
+
+    let tree = ActionTree::new(tree_config).expect("Failed to build flop action tree");
+    let mut game = PostFlopGame::with_config(card_config, tree)
+        .expect("Failed to build flop PostFlopGame");
+    game.allocate_memory(false);
+    game
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,5 +813,72 @@ mod tests {
         assert!(flat.num_hands <= 1326, "at most 1326 hands");
         // With a 4-card board, expect C(48,2) = 1128 valid combos
         assert_eq!(flat.num_hands, 1128);
+    }
+
+    #[test]
+    fn test_flop_tree_with_depth_boundaries() {
+        use range_solver::bet_size::BetSizeOptions;
+
+        // Build a flop game with depth_limit=0.
+        // Board: Qs Jh 2c
+        let flop = range_solver::card::flop_from_str("Qs Jh 2c").unwrap();
+        let bet_sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+
+        let mut game = build_flop_game(flop, 100, 100, &bet_sizes);
+        let flat = FlatTree::from_postflop_game(&mut game);
+
+        // Basic sanity
+        assert!(flat.num_nodes() > 0, "tree should have nodes");
+        assert!(flat.num_levels() > 0, "tree should have levels");
+        assert!(flat.num_infosets > 0, "tree should have infosets");
+
+        // Count terminal types
+        let num_fold = flat.node_types.iter().filter(|t| **t == NodeType::TerminalFold).count();
+        let num_showdown = flat.node_types.iter().filter(|t| **t == NodeType::TerminalShowdown).count();
+        let num_boundary = flat.node_types.iter().filter(|t| **t == NodeType::DepthBoundary).count();
+
+        // With depth_limit=0 on a flop game:
+        // - NO showdown terminals (can't reach turn/river)
+        // - SOME fold terminals
+        // - SOME depth boundaries
+        assert!(num_fold > 0, "should have fold terminals, got 0");
+        assert_eq!(num_showdown, 0, "should have no showdown terminals, got {num_showdown}");
+        assert!(num_boundary > 0, "should have depth boundaries, got 0");
+
+        // boundary_indices should be populated and match count
+        assert_eq!(flat.boundary_indices.len(), num_boundary);
+        assert_eq!(flat.boundary_pots.len(), num_boundary);
+        assert_eq!(flat.boundary_stacks.len(), num_boundary);
+
+        // Verify all boundary indices point to DepthBoundary nodes
+        for &idx in &flat.boundary_indices {
+            assert_eq!(
+                flat.node_types[idx as usize],
+                NodeType::DepthBoundary,
+                "boundary_indices[{idx}] should be DepthBoundary"
+            );
+        }
+
+        // Boundary pots should be >= starting pot
+        for &pot in &flat.boundary_pots {
+            assert!(pot >= 100.0, "boundary pot {pot} should be >= starting pot 100");
+        }
+
+        // Boundary stacks should be > 0 and <= effective stack
+        for &stack in &flat.boundary_stacks {
+            assert!(stack >= 0.0, "boundary stack {stack} should be >= 0");
+            assert!(stack <= 100.0, "boundary stack {stack} should be <= effective stack 100");
+        }
+
+        // Root should be a decision node
+        assert!(
+            flat.node_types[0] == NodeType::DecisionOop || flat.node_types[0] == NodeType::DecisionIp,
+            "root should be a decision node"
+        );
+
+        // With a 3-card board, expect C(49,2) = 1176 valid combos
+        assert!(flat.num_hands > 0, "should have some hands");
+        assert!(flat.num_hands <= 1326, "at most 1326 hands");
+        assert_eq!(flat.num_hands, 1176);
     }
 }

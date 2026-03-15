@@ -205,6 +205,47 @@ impl GpuBatchBuilder {
         })
     }
 
+    /// Create a new GPU batch builder using a **flop** reference tree
+    /// with `depth_limit: Some(0)`.
+    ///
+    /// The flop tree has fold terminals and depth-boundary leaves
+    /// (no showdowns, no chance nodes). The topology depends on bet sizes
+    /// and pot/stack via allin thresholds.
+    pub fn new_flop(
+        gpu: &GpuContext,
+        config: &BatchConfig,
+        ref_pot: i32,
+        ref_stack: i32,
+    ) -> Result<Self, String> {
+        use range_solver::bet_size::BetSizeOptions;
+
+        // Build a reference flop game with depth_limit=0
+        let bet_sizes = BetSizeOptions::try_from(("50%,a", "")).unwrap();
+        let mut game = crate::tree::build_flop_game(
+            [0, 1, 2], // dummy flop
+            ref_pot,
+            ref_stack,
+            &bet_sizes,
+        );
+        let ref_tree = FlatTree::from_postflop_game(&mut game);
+
+        let hand_evaluator = GpuHandEvaluator::new(gpu)
+            .map_err(|e| format!("Failed to create GPU hand evaluator: {e}"))?;
+
+        let shared_topology = SharedTopology {
+            ref_tree,
+            config: config.clone(),
+            ref_pot,
+            ref_stack,
+        };
+
+        Ok(Self {
+            shared_topology,
+            hand_evaluator,
+            hands_per_spot: 1326,
+        })
+    }
+
     /// Reference to the shared topology.
     pub fn topology(&self) -> &SharedTopology {
         &self.shared_topology
@@ -364,6 +405,120 @@ impl GpuBatchBuilder {
             &showdown_win_per_hand,
             &showdown_lose_per_hand,
             num_showdown_terminals as u32,
+            num_spots,
+            hps,
+        )
+    }
+
+    /// Build a `BatchGpuSolver` for depth-limited trees (no showdowns).
+    ///
+    /// Unlike `build_from_gpu_data`, this method does NOT evaluate hand
+    /// strengths (which requires 5-card boards). Instead it uses zero
+    /// strengths, which is correct because depth-limited trees have no
+    /// showdown terminals.
+    ///
+    /// This is the correct method to use for turn and flop training
+    /// where boards have fewer than 5 cards.
+    ///
+    /// # Arguments
+    /// * `gpu` - CUDA context.
+    /// * `ranges_oop` - GPU buffer `[num_spots * 1326]` OOP range weights.
+    /// * `ranges_ip` - GPU buffer `[num_spots * 1326]` IP range weights.
+    /// * `num_spots` - Number of spots in the batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_depth_limited<'a>(
+        &self,
+        gpu: &'a GpuContext,
+        ranges_oop: &CudaSlice<f32>,
+        ranges_ip: &CudaSlice<f32>,
+        num_spots: usize,
+    ) -> Result<BatchGpuSolver<'a>, String> {
+        if num_spots == 0 {
+            return Err("No spots provided".to_string());
+        }
+
+        let gpu_err = |e: GpuError| format!("GPU error: {e}");
+        let hps = self.hands_per_spot;
+        let total_hands = num_spots * hps;
+
+        // No hand strength evaluation -- depth-limited trees have no showdowns.
+        // Use zero strengths (they won't be read since there are no showdown terminals).
+        let gpu_strengths = gpu.alloc_zeros::<u32>(total_hands).map_err(gpu_err)?;
+
+        let hand_cards = self.build_hand_cards_gpu(gpu, total_hands).map_err(gpu_err)?;
+        let same_hand_index = self.build_same_hand_index_gpu(gpu, total_hands).map_err(gpu_err)?;
+
+        let ref_tree = &self.shared_topology.ref_tree;
+
+        let mut fold_nodes = Vec::new();
+        let mut fold_payoff_win_ref = Vec::new();
+        let mut fold_payoff_lose_ref = Vec::new();
+        let mut fold_pl = Vec::new();
+
+        // No showdown terminals expected in depth-limited trees
+        let showdown_nodes_dummy = vec![0u32];
+        let showdown_win_dummy = vec![0.0f32];
+        let showdown_lose_dummy = vec![0.0f32];
+
+        for (term_idx, &node_id) in ref_tree.terminal_indices.iter().enumerate() {
+            match ref_tree.node_types[node_id as usize] {
+                NodeType::TerminalFold => {
+                    fold_nodes.push(node_id);
+                    let payoff = &ref_tree.fold_payoffs[term_idx];
+                    fold_payoff_win_ref.push(payoff[0]);
+                    fold_payoff_lose_ref.push(payoff[1]);
+                    fold_pl.push(payoff[2] as u32);
+                }
+                NodeType::TerminalShowdown => {
+                    // Should not occur in depth-limited trees
+                    panic!("Unexpected showdown terminal in depth-limited tree");
+                }
+                _ => {}
+            }
+        }
+
+        let num_fold_terminals = fold_nodes.len();
+
+        use rayon::prelude::*;
+
+        let mut fold_win_per_hand = vec![0.0f32; num_fold_terminals * total_hands];
+        let mut fold_lose_per_hand = vec![0.0f32; num_fold_terminals * total_hands];
+        fold_win_per_hand
+            .par_chunks_exact_mut(total_hands)
+            .zip(fold_lose_per_hand.par_chunks_exact_mut(total_hands))
+            .enumerate()
+            .for_each(|(term_idx, (win_chunk, lose_chunk))| {
+                win_chunk.fill(fold_payoff_win_ref[term_idx]);
+                lose_chunk.fill(fold_payoff_lose_ref[term_idx]);
+            });
+
+        if fold_nodes.is_empty() {
+            fold_nodes.push(0);
+            fold_win_per_hand.push(0.0);
+            fold_lose_per_hand.push(0.0);
+            fold_pl.push(0);
+        }
+
+        BatchGpuSolver::from_gpu_data(
+            gpu,
+            ref_tree,
+            &gpu_strengths,
+            &gpu_strengths,
+            ranges_oop,
+            ranges_ip,
+            &hand_cards,
+            &hand_cards,
+            &same_hand_index,
+            &same_hand_index,
+            &fold_nodes,
+            &fold_win_per_hand,
+            &fold_lose_per_hand,
+            &fold_pl,
+            num_fold_terminals as u32,
+            &showdown_nodes_dummy,
+            &showdown_win_dummy,
+            &showdown_lose_dummy,
+            0, // num_showdown_terminals = 0
             num_spots,
             hps,
         )

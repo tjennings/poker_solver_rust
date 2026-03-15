@@ -290,9 +290,8 @@ pub fn train_turn_cfvnet<B: AutodiffBackend>(
             .download(sampler.boards())
             .map_err(|e| format!("download boards: {e}"))?;
 
-        let batch_solver = builder.build_from_gpu_data(
+        let batch_solver = builder.build_depth_limited(
             &gpu,
-            sampler.boards(),
             sampler.ranges_oop(),
             sampler.ranges_ip(),
             config.batch_size,
@@ -574,9 +573,8 @@ pub fn train_turn_cfvnet_cuda<B: AutodiffBackend>(
             .download(sampler.boards())
             .map_err(|e| format!("download boards: {e}"))?;
 
-        let batch_solver = builder.build_from_gpu_data(
+        let batch_solver = builder.build_depth_limited(
             &gpu,
-            sampler.boards(),
             sampler.ranges_oop(),
             sampler.ranges_ip(),
             config.batch_size,
