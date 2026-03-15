@@ -41,7 +41,7 @@ use range_solver::{CardConfig, PostFlopGame};
 // ---------------------------------------------------------------------------
 
 /// Configuration for the neural network architecture of each street model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelStackConfig {
     pub river_layers: usize,
     pub river_hidden: usize,
@@ -69,7 +69,7 @@ impl Default for ModelStackConfig {
 }
 
 /// Description of a game state to resolve.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GameState {
     /// Board cards: 0 cards (preflop), 3 (flop), 4 (turn), or 5 (river).
     pub board: Vec<u8>,
@@ -92,7 +92,7 @@ pub struct GameState {
 }
 
 /// Result of resolving a single position.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResolveResult {
     /// Strategy for the acting player: `[num_actions * num_hands]`.
     /// Layout: action-major, i.e. `strategy[a * num_hands + h]` is the

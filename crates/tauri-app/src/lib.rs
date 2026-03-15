@@ -40,3 +40,14 @@ pub use simulation::{
     get_simulation_result, list_strategy_sources, start_simulation, stop_simulation,
     SimulationState,
 };
+
+#[cfg(feature = "gpu")]
+pub use exploration::{
+    // GPU Tauri commands
+    gpu_resolve, gpu_resolve_progressive, is_gpu_model_loaded, load_gpu_model_set,
+    // GPU core functions (no Tauri dependency)
+    gpu_resolve_core, gpu_resolve_progressive_core, is_gpu_model_loaded_core,
+    load_gpu_model_set_core,
+    // GPU state
+    GpuState,
+};

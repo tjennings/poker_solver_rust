@@ -2096,6 +2096,121 @@ pub fn get_preflop_ranges(
     get_preflop_ranges_core(&state, history)
 }
 
+// ---------------------------------------------------------------------------
+// GPU resolving commands (behind `gpu` feature)
+// ---------------------------------------------------------------------------
+
+/// State holding an optional loaded GPU model stack.
+#[cfg(feature = "gpu")]
+pub struct GpuState {
+    model_stack: std::sync::Mutex<Option<poker_solver_gpu::resolve::GpuModelStack>>,
+}
+
+#[cfg(feature = "gpu")]
+impl Default for GpuState {
+    fn default() -> Self {
+        Self {
+            model_stack: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+/// Load a set of GPU CFV models from a directory.
+#[cfg(feature = "gpu")]
+#[tauri::command]
+pub async fn load_gpu_model_set(
+    path: String,
+    config: poker_solver_gpu::resolve::ModelStackConfig,
+    state: State<'_, GpuState>,
+) -> Result<(), String> {
+    let stack = poker_solver_gpu::resolve::GpuModelStack::load(
+        std::path::Path::new(&path),
+        &config,
+    )?;
+    *state.model_stack.lock().unwrap() = Some(stack);
+    Ok(())
+}
+
+/// Core implementation for load_gpu_model_set (no Tauri dependency).
+#[cfg(feature = "gpu")]
+pub fn load_gpu_model_set_core(
+    state: &GpuState,
+    path: String,
+    config: poker_solver_gpu::resolve::ModelStackConfig,
+) -> Result<(), String> {
+    let stack = poker_solver_gpu::resolve::GpuModelStack::load(
+        std::path::Path::new(&path),
+        &config,
+    )?;
+    *state.model_stack.lock().unwrap() = Some(stack);
+    Ok(())
+}
+
+/// Resolve a single position on the GPU.
+#[cfg(feature = "gpu")]
+#[tauri::command]
+pub async fn gpu_resolve(
+    game_state: poker_solver_gpu::resolve::GameState,
+    max_iterations: u32,
+    state: State<'_, GpuState>,
+) -> Result<poker_solver_gpu::resolve::ResolveResult, String> {
+    let mut lock = state.model_stack.lock().unwrap();
+    let stack = lock.as_mut().ok_or("No GPU model set loaded")?;
+    stack.resolve(&game_state, max_iterations)
+}
+
+/// Core implementation for gpu_resolve (no Tauri dependency).
+#[cfg(feature = "gpu")]
+pub fn gpu_resolve_core(
+    state: &GpuState,
+    game_state: poker_solver_gpu::resolve::GameState,
+    max_iterations: u32,
+) -> Result<poker_solver_gpu::resolve::ResolveResult, String> {
+    let mut lock = state.model_stack.lock().unwrap();
+    let stack = lock.as_mut().ok_or("No GPU model set loaded")?;
+    stack.resolve(&game_state, max_iterations)
+}
+
+/// Resolve with progressive iteration checkpoints.
+#[cfg(feature = "gpu")]
+#[tauri::command]
+pub async fn gpu_resolve_progressive(
+    game_state: poker_solver_gpu::resolve::GameState,
+    checkpoints: Vec<u32>,
+    state: State<'_, GpuState>,
+) -> Result<Vec<poker_solver_gpu::resolve::ResolveResult>, String> {
+    let mut lock = state.model_stack.lock().unwrap();
+    let stack = lock.as_mut().ok_or("No GPU model set loaded")?;
+    stack.resolve_progressive(&game_state, &checkpoints)
+}
+
+/// Core implementation for gpu_resolve_progressive (no Tauri dependency).
+#[cfg(feature = "gpu")]
+pub fn gpu_resolve_progressive_core(
+    state: &GpuState,
+    game_state: poker_solver_gpu::resolve::GameState,
+    checkpoints: Vec<u32>,
+) -> Result<Vec<poker_solver_gpu::resolve::ResolveResult>, String> {
+    let mut lock = state.model_stack.lock().unwrap();
+    let stack = lock.as_mut().ok_or("No GPU model set loaded")?;
+    stack.resolve_progressive(&game_state, &checkpoints)
+}
+
+/// Check whether a GPU model set is currently loaded.
+#[cfg(feature = "gpu")]
+#[tauri::command]
+pub async fn is_gpu_model_loaded(
+    state: State<'_, GpuState>,
+) -> Result<bool, String> {
+    Ok(state.model_stack.lock().unwrap().is_some())
+}
+
+/// Core implementation for is_gpu_model_loaded (no Tauri dependency).
+#[cfg(feature = "gpu")]
+pub fn is_gpu_model_loaded_core(state: &GpuState) -> bool {
+    state.model_stack.lock().unwrap().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

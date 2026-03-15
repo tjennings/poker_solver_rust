@@ -16,7 +16,11 @@ parking_lot = "0.12"
 lru = "0.12"
 poker-solver-core = { path = "../core" }
 range-solver = { path = "../range-solver" }
+poker-solver-gpu = { path = "../gpu-solver", features = ["training"], optional = true }
 rs_poker = { workspace = true }
+
+[features]
+gpu = ["poker-solver-gpu"]
 
 [dev-dependencies]
 test-macros = { path = "../test-macros" }
