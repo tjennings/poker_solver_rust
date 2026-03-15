@@ -298,14 +298,16 @@ pub fn kmeans_1d_weighted(
     weights: &[f64],
     k: usize,
     max_iterations: u32,
-) -> Vec<u16> {
+) -> (Vec<u16>, Vec<f64>) {
     assert_eq!(data.len(), weights.len());
     assert!(!data.is_empty(), "data must not be empty");
     assert!(k > 0, "k must be positive");
 
     let n = data.len();
     if k >= n {
-        return (0..n).map(|i| i as u16).collect();
+        let assignments: Vec<u16> = (0..n).map(|i| i as u16).collect();
+        let centroids: Vec<f64> = data.to_vec();
+        return (assignments, centroids);
     }
 
     // Build (value, weight) pairs sorted by value for weighted percentile init.
@@ -409,9 +411,10 @@ pub fn kmeans_1d_weighted(
     }
 
     // Final assignment pass (parallel).
-    data.par_iter()
+    let assignments = data.par_iter()
         .map(|&val| nearest_centroid_1d(val, &centroids))
-        .collect()
+        .collect();
+    (assignments, centroids)
 }
 
 // ---------------------------------------------------------------------------
@@ -533,14 +536,16 @@ pub fn kmeans_emd_weighted_u8(
     max_iterations: u32,
     seed: u64,
     progress: impl Fn(u32, u32),
-) -> Vec<u16> {
+) -> (Vec<u16>, Vec<Vec<f64>>) {
     assert_eq!(data.len(), weights.len());
     assert!(!data.is_empty(), "data must not be empty");
     assert!(k > 0, "k must be positive");
 
     let n = data.len();
     if k >= n {
-        return (0..n).map(|i| i as u16).collect();
+        let assignments: Vec<u16> = (0..n).map(|i| i as u16).collect();
+        let centroids: Vec<Vec<f64>> = data.iter().map(|d| normalize_u8(d)).collect();
+        return (assignments, centroids);
     }
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -607,7 +612,7 @@ pub fn kmeans_emd_weighted_u8(
             *assign = nearest_centroid_u8(point, &centroids);
         });
 
-    assignments
+    (assignments, centroids)
 }
 
 // ---------------------------------------------------------------------------
@@ -738,7 +743,7 @@ fn normalize_u8(counts: &[u8]) -> Vec<f64> {
 
 /// Index of the nearest centroid to a u8 histogram `point` by EMD.
 #[allow(clippy::cast_possible_truncation)]
-fn nearest_centroid_u8(point: &[u8], centroids: &[Vec<f64>]) -> u16 {
+pub(crate) fn nearest_centroid_u8(point: &[u8], centroids: &[Vec<f64>]) -> u16 {
     let mut best_idx = 0_u16;
     let mut best_dist = f64::MAX;
     for (ci, centroid) in centroids.iter().enumerate() {
@@ -827,6 +832,55 @@ fn kmeanspp_init_u8(data: &[Vec<u8>], k: usize, rng: &mut StdRng) -> Vec<Vec<f64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kmeans_1d_weighted_returns_centroids() {
+        let data = vec![0.1, 0.2, 0.9, 1.0];
+        let weights = vec![1.0, 1.0, 1.0, 1.0];
+        let (labels, centroids) = kmeans_1d_weighted(&data, &weights, 2, 100);
+        assert_eq!(labels.len(), 4);
+        assert_eq!(centroids.len(), 2);
+        // Centroids should be sorted (1-D k-means maintains sorted centroids).
+        assert!(centroids[0] < centroids[1]);
+        // Low cluster centroid should be near 0.15, high near 0.95.
+        assert!(centroids[0] < 0.5);
+        assert!(centroids[1] > 0.5);
+    }
+
+    #[test]
+    fn kmeans_emd_weighted_u8_returns_centroids() {
+        let mut data: Vec<Vec<u8>> = Vec::new();
+        let mut weights: Vec<f64> = Vec::new();
+        for _ in 0..50 {
+            data.push(vec![36, 4, 0, 0]);
+            weights.push(1.0);
+        }
+        for _ in 0..50 {
+            data.push(vec![0, 0, 4, 36]);
+            weights.push(1.0);
+        }
+        let (labels, centroids) = kmeans_emd_weighted_u8(&data, &weights, 2, 100, 42, |_, _| {});
+        assert_eq!(labels.len(), 100);
+        assert_eq!(centroids.len(), 2);
+        // Each centroid should be a probability distribution (4 bins).
+        for c in &centroids {
+            assert_eq!(c.len(), 4);
+            let sum: f64 = c.iter().sum();
+            assert!((sum - 1.0).abs() < 0.01, "centroid should sum to ~1.0, got {sum}");
+        }
+    }
+
+    #[test]
+    fn nearest_centroid_u8_is_accessible() {
+        // Verify nearest_centroid_u8 is pub(crate) by calling it directly.
+        let point = vec![36, 4, 0, 0];
+        let centroids = vec![
+            vec![0.9, 0.1, 0.0, 0.0],
+            vec![0.0, 0.0, 0.1, 0.9],
+        ];
+        let idx = nearest_centroid_u8(&point, &centroids);
+        assert_eq!(idx, 0); // point is close to first centroid
+    }
 
     #[test]
     fn test_emd_identical() {
@@ -936,7 +990,7 @@ mod tests {
     fn weighted_1d_kmeans_respects_weights() {
         let data = vec![0.1, 0.2, 0.9, 1.0];
         let weights = vec![10.0, 10.0, 1.0, 1.0];
-        let labels = kmeans_1d_weighted(&data, &weights, 2, 100);
+        let (labels, _centroids) = kmeans_1d_weighted(&data, &weights, 2, 100);
         assert_eq!(labels[0], labels[1]);
         assert_eq!(labels[2], labels[3]);
         assert_ne!(labels[0], labels[2]);
@@ -972,7 +1026,7 @@ mod tests {
             data.push(vec![0, 0, 4, 36]);
             weights.push(1.0);
         }
-        let assignments = kmeans_emd_weighted_u8(&data, &weights, 2, 100, 42, |_, _| {});
+        let (assignments, _centroids) = kmeans_emd_weighted_u8(&data, &weights, 2, 100, 42, |_, _| {});
         assert!(assignments[0..50].iter().all(|&a| a == assignments[0]));
         assert!(assignments[50..100].iter().all(|&a| a == assignments[50]));
         assert_ne!(assignments[0], assignments[50]);
@@ -994,7 +1048,7 @@ mod tests {
             data.push(vec![0, 0, 0, 10, 36]);
             weights.push(1.0);
         }
-        let assignments = kmeans_emd_weighted_u8(&data, &weights, 3, 100, 42, |_, _| {});
+        let (assignments, _centroids) = kmeans_emd_weighted_u8(&data, &weights, 3, 100, 42, |_, _| {});
         let c0 = assignments[0];
         let c1 = assignments[30];
         let c2 = assignments[60];
@@ -1027,7 +1081,7 @@ mod tests {
         // With only 3 distinct values, we can have at most 3 occupied clusters.
         // Use k=3 to test that all clusters stay occupied (no empty buckets)
         // despite the highly skewed distribution.
-        let labels = kmeans_1d_weighted(&data, &weights, 3, 100);
+        let (labels, _centroids) = kmeans_1d_weighted(&data, &weights, 3, 100);
         let used: std::collections::HashSet<u16> = labels.iter().copied().collect();
         assert_eq!(
             used.len(),
@@ -1049,7 +1103,7 @@ mod tests {
             let w = if v < 0.1 || v > 0.9 { 100.0 } else { 0.01 };
             weights2.push(w);
         }
-        let labels2 = kmeans_1d_weighted(&data2, &weights2, 20, 100);
+        let (labels2, _centroids2) = kmeans_1d_weighted(&data2, &weights2, 20, 100);
         let used2: std::collections::HashSet<u16> = labels2.iter().copied().collect();
         assert_eq!(
             used2.len(),
