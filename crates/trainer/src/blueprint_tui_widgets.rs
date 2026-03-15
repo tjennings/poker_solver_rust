@@ -188,7 +188,7 @@ impl Widget for &HandGridWidget<'_> {
                             .map_or_else(|| "   ".to_string(), |h| format!("{h}"));
                     let hand_label = if let Some(ev) = cell.ev {
                         let sign = if ev >= 0.0 { "+" } else { "" };
-                        format!("{hand_name}{sign}{ev:.1}")
+                        format!("{hand_name} {sign}{ev:.1}")
                     } else {
                         hand_name
                     };
