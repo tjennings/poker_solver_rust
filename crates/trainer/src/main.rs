@@ -118,6 +118,67 @@ enum Commands {
         #[arg(long, default_value = "60%,100%")]
         ip_raise_sizes: String,
     },
+    /// Train a river CFVNet on GPU using Supremus-style pipeline
+    #[cfg(feature = "gpu-training")]
+    GpuTrainRiver {
+        /// Total training samples to generate
+        #[arg(long, default_value_t = 50_000_000)]
+        num_samples: u64,
+        /// DCFR+ iterations per solve batch
+        #[arg(long, default_value_t = 4000)]
+        solve_iterations: u32,
+        /// River spots per solve batch
+        #[arg(long, default_value_t = 1000)]
+        batch_size: usize,
+        /// GPU reservoir capacity (max training records)
+        #[arg(long, default_value_t = 100_000)]
+        reservoir_capacity: usize,
+        /// Number of hidden layers
+        #[arg(long, default_value_t = 7)]
+        hidden_layers: usize,
+        /// Hidden layer width
+        #[arg(long, default_value_t = 500)]
+        hidden_size: usize,
+        /// Mini-batch size for training
+        #[arg(long, default_value_t = 1024)]
+        train_batch_size: usize,
+        /// Training steps per solve batch
+        #[arg(long, default_value_t = 10)]
+        train_steps_per_batch: usize,
+        /// Learning rate
+        #[arg(long, default_value_t = 0.001)]
+        learning_rate: f64,
+        /// Huber loss delta
+        #[arg(long, default_value_t = 1.0)]
+        huber_delta: f64,
+        /// Auxiliary game-value loss weight
+        #[arg(long, default_value_t = 1.0)]
+        aux_loss_weight: f64,
+        /// Validation reporting interval (samples)
+        #[arg(long, default_value_t = 10_000)]
+        validation_interval: u64,
+        /// Checkpoint save interval (samples)
+        #[arg(long, default_value_t = 1_000_000)]
+        checkpoint_interval: u64,
+        /// Number of ground-truth validation positions
+        #[arg(long, default_value_t = 100)]
+        gt_positions: usize,
+        /// Iterations for ground-truth solves
+        #[arg(long, default_value_t = 10_000)]
+        gt_iterations: u32,
+        /// Output directory for model and checkpoints
+        #[arg(long)]
+        output: PathBuf,
+        /// Random seed
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Reference pot size
+        #[arg(long, default_value_t = 100)]
+        ref_pot: i32,
+        /// Reference effective stack
+        #[arg(long, default_value_t = 100)]
+        ref_stack: i32,
+    },
     /// Solve a postflop spot with exact (no abstraction) DCFR
     RangeSolve {
         /// OOP player's range (PioSOLVER format, e.g. "QQ+,AKs,AKo")
@@ -605,6 +666,50 @@ fn main() -> Result<(), Box<dyn Error>> {
             cache.save(&output)?;
             eprintln!("Saved to {}", output.display());
         }
+        #[cfg(feature = "gpu-training")]
+        Commands::GpuTrainRiver {
+            num_samples,
+            solve_iterations,
+            batch_size,
+            reservoir_capacity,
+            hidden_layers,
+            hidden_size,
+            train_batch_size,
+            train_steps_per_batch,
+            learning_rate,
+            huber_delta,
+            aux_loss_weight,
+            validation_interval,
+            checkpoint_interval,
+            gt_positions,
+            gt_iterations,
+            output,
+            seed,
+            ref_pot,
+            ref_stack,
+        } => {
+            run_gpu_train_river(
+                num_samples,
+                solve_iterations,
+                batch_size,
+                reservoir_capacity,
+                hidden_layers,
+                hidden_size,
+                train_batch_size,
+                train_steps_per_batch,
+                learning_rate,
+                huber_delta,
+                aux_loss_weight,
+                validation_interval,
+                checkpoint_interval,
+                gt_positions,
+                gt_iterations,
+                output,
+                seed,
+                ref_pot,
+                ref_stack,
+            )?;
+        }
         #[cfg(feature = "cuda")]
         Commands::GpuSolve {
             oop_range,
@@ -672,6 +777,67 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GPU river CFVNet training
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gpu-training")]
+#[allow(clippy::too_many_arguments)]
+fn run_gpu_train_river(
+    num_samples: u64,
+    solve_iterations: u32,
+    batch_size: usize,
+    reservoir_capacity: usize,
+    hidden_layers: usize,
+    hidden_size: usize,
+    train_batch_size: usize,
+    train_steps_per_batch: usize,
+    learning_rate: f64,
+    huber_delta: f64,
+    aux_loss_weight: f64,
+    validation_interval: u64,
+    checkpoint_interval: u64,
+    gt_positions: usize,
+    gt_iterations: u32,
+    output: PathBuf,
+    seed: u64,
+    ref_pot: i32,
+    ref_stack: i32,
+) -> Result<(), Box<dyn Error>> {
+    use burn::backend::{Autodiff, NdArray};
+    use poker_solver_gpu::training::pipeline::{train_river_cfvnet, RiverTrainingConfig};
+
+    // Use NdArray backend by default. When burn-cuda is available,
+    // this can be switched to Autodiff<CudaJit<f32>>.
+    type B = Autodiff<NdArray>;
+
+    let config = RiverTrainingConfig {
+        num_samples,
+        solve_iterations,
+        batch_size,
+        reservoir_capacity,
+        hidden_layers,
+        hidden_size,
+        train_batch_size,
+        train_steps_per_batch,
+        learning_rate,
+        huber_delta,
+        aux_loss_weight,
+        validation_interval,
+        checkpoint_interval,
+        gt_validation_positions: gt_positions,
+        gt_solve_iterations: gt_iterations,
+        output_dir: output,
+        seed,
+        ref_pot,
+        ref_stack,
+    };
+
+    let device = Default::default();
+    train_river_cfvnet::<B>(&config, &device)?;
     Ok(())
 }
 

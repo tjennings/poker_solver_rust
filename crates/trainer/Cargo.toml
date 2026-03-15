@@ -9,11 +9,13 @@ description = "CLI tool for training poker blueprint strategies"
 [features]
 default = []
 cuda = ["poker-solver-gpu"]
+gpu-training = ["cuda", "poker-solver-gpu/training", "burn"]
 
 [dependencies]
 poker-solver-core = { path = "../core" }
 range-solver = { path = "../range-solver" }
 poker-solver-gpu = { path = "../gpu-solver", features = ["cuda"], optional = true }
+burn = { version = "0.16", features = ["train", "ndarray"], optional = true }
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 ratatui = "0.29"
