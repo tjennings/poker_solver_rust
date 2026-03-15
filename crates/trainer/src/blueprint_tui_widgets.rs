@@ -6,11 +6,6 @@
 use ratatui::prelude::*;
 use ratatui::widgets::Widget;
 
-/// Rank labels for rows/columns: A down to 2.
-const RANK_LABELS: [&str; 13] = [
-    "A", "K", "Q", "J", "T", "9", "8", "7", "6", "5", "4", "3", "2",
-];
-
 // ─── CellStrategy ────────────────────────────────────────────────────────────
 
 /// Per-cell strategy data: a distribution over named actions.
@@ -122,9 +117,12 @@ impl Widget for &HandGridWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         use poker_solver_core::hands::CanonicalHand;
 
-        // Layout: 1 header row, 26 grid rows (13×2), 2 footer rows = 29 minimum.
-        if area.height < 29 || area.width < 13 {
-            return; // too small to render
+        // Adaptive cell height: 2 rows (color bar + label) if space allows,
+        // otherwise 1 row (color bar with overlaid label).
+        let cell_h: u16 = if area.height >= 28 { 2 } else { 1 }; // 1 title + 13*cell_h
+        let min_h = 1 + 13 * cell_h; // title + grid
+        if area.height < min_h || area.width < 13 {
+            return;
         }
 
         // ── Title row ────────────────────────────────────────────────
@@ -139,9 +137,8 @@ impl Widget for &HandGridWidget<'_> {
         let grid_x0 = area.x;
         let grid_y0 = area.y + 1;
         for r in 0..13u16 {
-            let y_top = grid_y0 + r * 2;     // color bar row
-            let y_bot = grid_y0 + r * 2 + 1; // hand label row
-            if y_bot >= area.y + area.height {
+            let y_top = grid_y0 + r * cell_h;
+            if y_top >= area.y + area.height {
                 break;
             }
 
@@ -152,35 +149,60 @@ impl Widget for &HandGridWidget<'_> {
                     continue;
                 }
 
-                // Top row: stacked color bar
-                if cell.actions.is_empty() {
-                    let style = Style::default().bg(Color::Rgb(40, 40, 40));
-                    for dx in 0..cell_w {
-                        buf.set_string(x + dx, y_top, " ", style);
-                    }
-                } else {
-                    render_color_bar(buf, x, y_top, cell_w, &cell.actions);
-                }
-
-                // Bottom row: hand label on dominant action color background
                 let hand_label = CanonicalHand::from_matrix_position(r as usize, c as usize)
                     .map_or_else(|| "   ".to_string(), |h| format!("{h}"));
-                let bg_color = if cell.actions.is_empty() {
-                    Color::Rgb(40, 40, 40)
+
+                if cell_h == 2 {
+                    // ── 2-row mode: top = color bar, bottom = hand label ──
+                    let y_bot = y_top + 1;
+                    if y_bot >= area.y + area.height {
+                        break;
+                    }
+
+                    if cell.actions.is_empty() {
+                        let style = Style::default().bg(Color::Rgb(40, 40, 40));
+                        for dx in 0..cell_w {
+                            buf.set_string(x + dx, y_top, " ", style);
+                        }
+                    } else {
+                        render_color_bar(buf, x, y_top, cell_w, &cell.actions);
+                    }
+
+                    let bg_color = if cell.actions.is_empty() {
+                        Color::Rgb(40, 40, 40)
+                    } else {
+                        let (dom_name, _) = cell.dominant_action();
+                        dominant_action_color(dom_name, &cell.actions)
+                    };
+                    let label_style = Style::default().bg(bg_color).fg(Color::White);
+                    let label_len = hand_label.len().min(cell_w as usize);
+                    buf.set_string(x, y_bot, &hand_label[..label_len], label_style);
+                    let pad_style = Style::default().bg(bg_color);
+                    for dx in label_len as u16..cell_w {
+                        buf.set_string(x + dx, y_bot, " ", pad_style);
+                    }
                 } else {
-                    let (dom_name, _) = cell.dominant_action();
-                    dominant_action_color(dom_name, &cell.actions)
-                };
-                let label_style = Style::default().bg(bg_color).fg(Color::White);
-                // Write label left-aligned, pad rest with bg color
-                let label_len = hand_label.len().min(cell_w as usize);
-                buf.set_string(x, y_bot, &hand_label[..label_len], label_style);
-                let pad_style = Style::default().bg(bg_color);
-                for dx in label_len as u16..cell_w {
-                    buf.set_string(x + dx, y_bot, " ", pad_style);
+                    // ── 1-row mode: color bar with hand label overlaid ──
+                    if cell.actions.is_empty() {
+                        let style = Style::default().bg(Color::Rgb(40, 40, 40)).fg(Color::White);
+                        let label_len = hand_label.len().min(cell_w as usize);
+                        buf.set_string(x, y_top, &hand_label[..label_len], style);
+                        let pad_style = Style::default().bg(Color::Rgb(40, 40, 40));
+                        for dx in label_len as u16..cell_w {
+                            buf.set_string(x + dx, y_top, " ", pad_style);
+                        }
+                    } else {
+                        render_color_bar(buf, x, y_top, cell_w, &cell.actions);
+                        // Overlay hand label on the color bar
+                        let (dom_name, _) = cell.dominant_action();
+                        let bg = dominant_action_color(dom_name, &cell.actions);
+                        let style = Style::default().bg(bg).fg(Color::White);
+                        let label_len = hand_label.len().min(cell_w as usize);
+                        buf.set_string(x, y_top, &hand_label[..label_len], style);
+                    }
                 }
 
-                // Blue underline on top row for cells that changed since last snapshot.
+                // Blue underline for cells that changed since last snapshot.
                 if let Some(ref prev) = self.state.prev_cells {
                     if !cell.is_converged(&prev[r as usize][c as usize], 0.01) {
                         for dx in 0..cell_w {
@@ -198,7 +220,7 @@ impl Widget for &HandGridWidget<'_> {
         }
 
         // ── Footer ──────────────────────────────────────────────────
-        let footer_y = grid_y0 + 26;
+        let footer_y = grid_y0 + 13 * cell_h;
         if footer_y < area.y + area.height {
             let board = self
                 .state
