@@ -8,7 +8,7 @@ tags:
     - gpu
     - cfvnet
 created_at: 2026-03-15T04:14:26Z
-updated_at: 2026-03-15T13:39:41Z
+updated_at: 2026-03-15T18:22:16Z
 parent: poker_solver_rust-twez
 ---
 
