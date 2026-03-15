@@ -114,10 +114,16 @@ struct SpotInfo {
 
 /// Batch GPU solver that solves N independent river spots simultaneously.
 ///
-/// All spots share the same tree topology (same bet sizes produce the same
-/// action tree structure) but have different board cards, ranges, and
-/// pot/stack sizes. Per-hand data is concatenated across spots with uniform
-/// padding so `total_hands = num_spots * hands_per_spot`.
+/// All spots **must** share the same tree topology. This means they must use
+/// the same bet sizes **and** the same pot and effective stack values. Even
+/// with identical bet size percentages, different pot/stack ratios can cause
+/// the tree builder's allin thresholds (`add_allin_threshold`,
+/// `force_allin_threshold`) to merge or eliminate bet sizes near all-in,
+/// producing trees with different node counts.
+///
+/// Spots may differ in board cards and ranges, which affect per-hand data
+/// but not tree shape. Per-hand data is concatenated across spots with
+/// uniform padding so `total_hands = num_spots * hands_per_spot`.
 ///
 /// Terminal kernels use per-hand payoffs to account for different pot sizes
 /// across spots. Card blocking is spot-scoped via the `hands_per_spot`

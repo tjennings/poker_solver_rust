@@ -1,8 +1,9 @@
 //! Batch GPU solver benchmark: 300 random river spots, GPU vs CPU.
 //!
-//! Generates random river spots with random boards, ranges, and pot/stack,
-//! solves them both in a single batched GPU call and sequentially on CPU,
-//! then compares strategies for correctness and prints performance results.
+//! Generates random river spots with random boards and ranges (but uniform
+//! pot/stack to ensure identical tree topology), solves them both in a single
+//! batched GPU call and sequentially on CPU, then compares strategies for
+//! correctness and prints performance results.
 //!
 //! Run:
 //!   cargo test -p poker-solver-gpu --features cuda --release --test bench_batch test_batch_correctness -- --nocapture
@@ -59,9 +60,22 @@ fn sample_unique_cards(rng: &mut StdRng, n: usize) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Generate `n` random river spots with a seeded RNG for reproducibility.
+///
+/// All spots use the same pot and stack (100/100) to ensure identical tree
+/// topology. The BatchGpuSolver requires all spots to share the same action
+/// tree structure, and varying pot/stack ratios can cause the tree builder's
+/// allin thresholds (add_allin_threshold, force_allin_threshold) to merge or
+/// eliminate bet sizes near all-in, producing trees with different node counts.
+///
+/// Only boards and ranges vary across spots — these affect per-hand data but
+/// not tree shape.
 fn generate_random_spots(n: usize, seed: u64) -> Vec<RiverSpot> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut spots = Vec::with_capacity(n);
+
+    // Fixed pot/stack for all spots to guarantee identical tree topology.
+    let pot = 100;
+    let effective_stack = 100;
 
     for _ in 0..n {
         // Sample 5 unique board cards
@@ -87,10 +101,6 @@ fn generate_random_spots(n: usize, seed: u64) -> Vec<RiverSpot> {
             oop_range[i] = rng.gen_range(0.0f32..1.0f32);
             ip_range[i] = rng.gen_range(0.0f32..1.0f32);
         }
-
-        // Random pot and stack
-        let pot: i32 = rng.gen_range(40..=400);
-        let effective_stack: i32 = rng.gen_range(50..=300);
 
         spots.push(RiverSpot {
             flop,
@@ -236,6 +246,16 @@ fn bench_batch_300_spots() {
     let cpu_time = cpu_start.elapsed();
     println!("CPU solve time: {:.1}ms", cpu_time.as_secs_f64() * 1000.0);
 
+    // --- Compute hand-per-spot statistics ---
+    let hands_per_spot: Vec<usize> = cpu_num_hands.clone();
+    let min_hands = hands_per_spot.iter().copied().min().unwrap_or(0);
+    let max_hands = hands_per_spot.iter().copied().max().unwrap_or(0);
+    let avg_hands = if hands_per_spot.is_empty() {
+        0.0
+    } else {
+        hands_per_spot.iter().sum::<usize>() as f64 / hands_per_spot.len() as f64
+    };
+
     // --- Compare strategies ---
     let mut max_diff_overall = 0.0f32;
     let mut dominant_agree = 0usize;
@@ -334,6 +354,9 @@ fn bench_batch_300_spots() {
     println!(
         "GPU total (build+solve): {:>5.1}ms",
         (build_time + gpu_time).as_secs_f64() * 1000.0
+    );
+    println!(
+        "Hands per spot:     min={min_hands}, max={max_hands}, avg={avg_hands:.1}"
     );
     println!("{}", "-".repeat(70));
     println!("Max strategy diff:           {max_diff_overall:.6}");
