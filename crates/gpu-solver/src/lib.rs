@@ -7,5 +7,7 @@ pub mod solver;
 
 pub mod batch;
 
+pub mod training;
+
 #[cfg(test)]
 mod tests;
