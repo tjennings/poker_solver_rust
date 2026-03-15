@@ -382,6 +382,97 @@ async fn handle_postflop_load_cached(
 }
 
 // ---------------------------------------------------------------------------
+// Handlers — GPU resolve (behind `gpu` feature)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gpu")]
+#[derive(Deserialize)]
+struct GpuLoadParams {
+    path: String,
+    config: poker_solver_tauri::gpu_types::ModelStackConfig,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Deserialize)]
+struct GpuResolveParams {
+    game_state: poker_solver_tauri::gpu_types::GameState,
+    max_iterations: u32,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Deserialize)]
+struct GpuResolveProgressiveParams {
+    game_state: poker_solver_tauri::gpu_types::GameState,
+    checkpoints: Vec<u32>,
+}
+
+#[cfg(feature = "gpu")]
+async fn handle_load_gpu_model_set(
+    Extension(state): Extension<Arc<poker_solver_tauri::GpuState>>,
+    Json(params): Json<GpuLoadParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::load_gpu_model_set_core(
+        &state,
+        params.path,
+        params.config,
+    ))
+}
+
+#[cfg(feature = "gpu")]
+async fn handle_gpu_resolve(
+    Extension(state): Extension<Arc<poker_solver_tauri::GpuState>>,
+    Json(params): Json<GpuResolveParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::gpu_resolve_core(
+        &state,
+        params.game_state,
+        params.max_iterations,
+    ))
+}
+
+#[cfg(feature = "gpu")]
+async fn handle_gpu_resolve_progressive(
+    Extension(state): Extension<Arc<poker_solver_tauri::GpuState>>,
+    Json(params): Json<GpuResolveProgressiveParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::gpu_resolve_progressive_core(
+        &state,
+        params.game_state,
+        params.checkpoints,
+    ))
+}
+
+#[cfg(feature = "gpu")]
+async fn handle_is_gpu_model_loaded(
+    Extension(state): Extension<Arc<poker_solver_tauri::GpuState>>,
+) -> Json<serde_json::Value> {
+    to_json_value(poker_solver_tauri::is_gpu_model_loaded_core(&state))
+}
+
+/// Add GPU routes to the router (only when `gpu` feature is enabled).
+#[cfg(feature = "gpu")]
+fn add_gpu_routes(router: Router<AppState>) -> Router<AppState> {
+    let gpu_state: Arc<poker_solver_tauri::GpuState> =
+        Arc::new(poker_solver_tauri::GpuState::default());
+
+    router
+        .route(
+            "/api/load_gpu_model_set",
+            post(handle_load_gpu_model_set),
+        )
+        .route("/api/gpu_resolve", post(handle_gpu_resolve))
+        .route(
+            "/api/gpu_resolve_progressive",
+            post(handle_gpu_resolve_progressive),
+        )
+        .route(
+            "/api/is_gpu_model_loaded",
+            post(handle_is_gpu_model_loaded),
+        )
+        .layer(Extension(gpu_state))
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -395,7 +486,8 @@ async fn main() {
         .allow_methods([Method::POST])
         .allow_headers(tower_http::cors::Any);
 
-    let app = Router::new()
+    #[allow(unused_mut)]
+    let mut app = Router::new()
         .route("/api/load_bundle", post(handle_load_bundle))
         .route("/api/load_blueprint_v2", post(handle_load_blueprint_v2))
         .route("/api/get_strategy_matrix", post(handle_get_strategy_matrix))
@@ -468,9 +560,14 @@ async fn main() {
             "/api/postflop_load_cached",
             post(handle_postflop_load_cached),
         )
-        .layer(Extension(postflop_state))
-        .layer(cors)
-        .with_state(state);
+        .layer(Extension(postflop_state));
+
+    #[cfg(feature = "gpu")]
+    {
+        app = add_gpu_routes(app);
+    }
+
+    let app = app.layer(cors).with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3001")
         .await

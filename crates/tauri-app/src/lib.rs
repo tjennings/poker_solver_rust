@@ -51,3 +51,9 @@ pub use exploration::{
     // GPU state
     GpuState,
 };
+
+/// Re-export GPU resolve types for consumers (e.g. devserver).
+#[cfg(feature = "gpu")]
+pub mod gpu_types {
+    pub use poker_solver_gpu::resolve::{GameState, ModelStackConfig, ResolveResult};
+}
