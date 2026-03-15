@@ -8,17 +8,13 @@
 // One thread per (boundary_idx, spot_idx, hand) triple.
 // Each thread loops over all river cards, accumulates non-conflicting CFVs,
 // and writes the average to cfvalues.
-//
-// Supports per-spot river cards: `river_cards` is [num_spots * num_rivers]
-// containing the possible river cards for each spot (different boards yield
-// different sets of 48 river cards).
 
 extern "C" __global__ void average_leaf_cfvs(
     float* cfvalues,                    // [num_nodes * total_hands] output (scattered writes)
     const float* raw_cfvs,              // [num_boundaries * num_rivers * num_spots * 1326]
-    const unsigned int* boundary_nodes, // [num_boundaries] -- node IDs
-    const unsigned int* river_cards,    // [num_spots * num_rivers] -- per-spot river cards
-    const unsigned int* combo_cards,    // [1326 * 2] -- card pairs per combo
+    const unsigned int* boundary_nodes, // [num_boundaries] — node IDs
+    const unsigned int* river_cards,    // [num_rivers] — possible river cards
+    const unsigned int* combo_cards,    // [1326 * 2] — card pairs per combo
     unsigned int num_boundaries,
     unsigned int num_rivers,
     unsigned int num_spots,
@@ -46,7 +42,7 @@ extern "C" __global__ void average_leaf_cfvs(
     unsigned int count = 0;
 
     for (unsigned int r = 0; r < num_rivers; r++) {
-        unsigned int river_card = river_cards[spot_idx * num_rivers + r];
+        unsigned int river_card = river_cards[r];
 
         // Skip river cards that conflict with this hand
         if (river_card == c1 || river_card == c2) {

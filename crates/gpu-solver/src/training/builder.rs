@@ -163,48 +163,6 @@ impl GpuBatchBuilder {
         })
     }
 
-    /// Create a new GPU batch builder using a **turn** reference tree
-    /// with `depth_limit: Some(0)`.
-    ///
-    /// The turn tree has fold terminals and depth-boundary leaves
-    /// (no showdowns, no chance nodes). The topology depends on bet sizes
-    /// and pot/stack via allin thresholds.
-    pub fn new_turn(
-        gpu: &GpuContext,
-        config: &BatchConfig,
-        ref_pot: i32,
-        ref_stack: i32,
-    ) -> Result<Self, String> {
-        use range_solver::bet_size::BetSizeOptions;
-
-        // Build a reference turn game with depth_limit=0
-        let bet_sizes = BetSizeOptions::try_from(("50%,a", "")).unwrap();
-        let mut game = crate::tree::build_turn_game(
-            [0, 1, 2], // dummy flop
-            3,          // dummy turn
-            ref_pot,
-            ref_stack,
-            &bet_sizes,
-        );
-        let ref_tree = FlatTree::from_postflop_game(&mut game);
-
-        let hand_evaluator = GpuHandEvaluator::new(gpu)
-            .map_err(|e| format!("Failed to create GPU hand evaluator: {e}"))?;
-
-        let shared_topology = SharedTopology {
-            ref_tree,
-            config: config.clone(),
-            ref_pot,
-            ref_stack,
-        };
-
-        Ok(Self {
-            shared_topology,
-            hand_evaluator,
-            hands_per_spot: 1326,
-        })
-    }
-
     /// Reference to the shared topology.
     pub fn topology(&self) -> &SharedTopology {
         &self.shared_topology

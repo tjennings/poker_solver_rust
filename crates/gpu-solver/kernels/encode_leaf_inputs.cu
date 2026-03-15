@@ -5,26 +5,21 @@
 // Each thread writes one INPUT_SIZE=2720 element feature vector.
 //
 // Input layout (2720 floats):
-//   [0..1326)      -- OOP reach at this boundary (zeroed for river conflicts)
-//   [1326..2652)   -- IP reach at this boundary (zeroed for river conflicts)
-//   [2652..2704)   -- board one-hot (52 elements: 4 turn + 1 river card)
-//   [2704..2717)   -- rank presence (13 elements)
-//   [2717]         -- pot / 400.0
-//   [2718]         -- effective_stack / 400.0
-//   [2719]         -- traverser indicator (0.0=OOP, 1.0=IP)
-//
-// Supports per-spot boards: each spot may have a different 4-card turn board.
-// `boards` is [num_spots * 4] containing the board cards for each spot.
-// `river_cards` is [num_spots * num_rivers] containing possible river cards
-// per spot (since different boards yield different river card sets).
+//   [0..1326)      — OOP reach at this boundary (zeroed for river conflicts)
+//   [1326..2652)   — IP reach at this boundary (zeroed for river conflicts)
+//   [2652..2704)   — board one-hot (52 elements: 4 turn + 1 river card)
+//   [2704..2717)   — rank presence (13 elements)
+//   [2717]         — pot / 400.0
+//   [2718]         — effective_stack / 400.0
+//   [2719]         — traverser indicator (0.0=OOP, 1.0=IP)
 
 extern "C" __global__ void encode_leaf_inputs(
     float* output,                      // [total_inputs * 2720]
     const float* reach_oop,             // [num_nodes * total_hands]
     const float* reach_ip,              // [num_nodes * total_hands]
-    const unsigned int* boundary_nodes, // [num_boundaries] -- node IDs
-    const unsigned int* boards,         // [num_spots * 4] -- per-spot turn boards
-    const unsigned int* river_cards,    // [num_spots * num_rivers] -- per-spot river cards
+    const unsigned int* boundary_nodes, // [num_boundaries] — node IDs
+    const unsigned int* turn_board,     // [4] — the 4 turn board cards
+    const unsigned int* river_cards,    // [num_rivers] — possible river cards
     const float* boundary_pots,         // [num_boundaries]
     const float* boundary_stacks,       // [num_boundaries]
     const unsigned int* combo_cards,    // [1326 * 2]
@@ -46,10 +41,7 @@ extern "C" __global__ void encode_leaf_inputs(
     unsigned int boundary_idx = tmp / num_rivers;
 
     unsigned int node_id = boundary_nodes[boundary_idx];
-    unsigned int river_card = river_cards[spot_idx * num_rivers + river_idx];
-
-    // Per-spot board cards
-    const unsigned int* spot_board = &boards[spot_idx * 4u];
+    unsigned int river_card = river_cards[river_idx];
 
     // Output pointer for this thread's 2720-dim vector
     float* out = &output[tid * 2720u];
@@ -57,22 +49,11 @@ extern "C" __global__ void encode_leaf_inputs(
     // Reach base offset for this boundary node + this spot
     unsigned int reach_base = node_id * total_hands + spot_idx * hands_per_spot;
 
-    // Also check board card conflicts for this spot's board
-    unsigned int board0 = spot_board[0];
-    unsigned int board1 = spot_board[1];
-    unsigned int board2 = spot_board[2];
-    unsigned int board3 = spot_board[3];
-
-    // Write OOP range [0..1326), zeroing combos that conflict with river card or board
+    // Write OOP range [0..1326), zeroing combos that conflict with river card
     for (unsigned int c = 0; c < 1326u; c++) {
         unsigned int c1 = combo_cards[c * 2];
         unsigned int c2 = combo_cards[c * 2 + 1];
-        int conflict = (c1 == river_card || c2 == river_card ||
-                        c1 == board0 || c2 == board0 ||
-                        c1 == board1 || c2 == board1 ||
-                        c1 == board2 || c2 == board2 ||
-                        c1 == board3 || c2 == board3);
-        if (conflict) {
+        if (c1 == river_card || c2 == river_card) {
             out[c] = 0.0f;
         } else if (c < hands_per_spot) {
             out[c] = reach_oop[reach_base + c];
@@ -81,16 +62,11 @@ extern "C" __global__ void encode_leaf_inputs(
         }
     }
 
-    // Write IP range [1326..2652), zeroing combos that conflict with river card or board
+    // Write IP range [1326..2652), zeroing combos that conflict with river card
     for (unsigned int c = 0; c < 1326u; c++) {
         unsigned int c1 = combo_cards[c * 2];
         unsigned int c2 = combo_cards[c * 2 + 1];
-        int conflict = (c1 == river_card || c2 == river_card ||
-                        c1 == board0 || c2 == board0 ||
-                        c1 == board1 || c2 == board1 ||
-                        c1 == board2 || c2 == board2 ||
-                        c1 == board3 || c2 == board3);
-        if (conflict) {
+        if (c1 == river_card || c2 == river_card) {
             out[1326u + c] = 0.0f;
         } else if (c < hands_per_spot) {
             out[1326u + c] = reach_ip[reach_base + c];
@@ -103,20 +79,18 @@ extern "C" __global__ void encode_leaf_inputs(
     for (unsigned int i = 0; i < 52u; i++) {
         out[2652u + i] = 0.0f;
     }
-    out[2652u + board0] = 1.0f;
-    out[2652u + board1] = 1.0f;
-    out[2652u + board2] = 1.0f;
-    out[2652u + board3] = 1.0f;
+    for (unsigned int i = 0; i < 4u; i++) {
+        out[2652u + turn_board[i]] = 1.0f;
+    }
     out[2652u + river_card] = 1.0f;
 
     // Rank presence [2704..2717): 13 elements
     for (unsigned int i = 0; i < 13u; i++) {
         out[2704u + i] = 0.0f;
     }
-    out[2704u + board0 / 4u] = 1.0f;
-    out[2704u + board1 / 4u] = 1.0f;
-    out[2704u + board2 / 4u] = 1.0f;
-    out[2704u + board3 / 4u] = 1.0f;
+    for (unsigned int i = 0; i < 4u; i++) {
+        out[2704u + turn_board[i] / 4u] = 1.0f;
+    }
     out[2704u + river_card / 4u] = 1.0f;
 
     // Pot, stack, traverser
