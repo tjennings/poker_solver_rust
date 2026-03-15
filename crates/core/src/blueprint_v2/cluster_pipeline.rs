@@ -99,7 +99,7 @@ pub fn cluster_river(
     }
 
     // Weighted 1-D k-means (board frequency observed via weights).
-    let cluster_labels =
+    let (cluster_labels, _centroids) =
         kmeans_1d_weighted(&all_equities, &all_weights, bucket_count as usize, kmeans_iterations);
 
     let total = num_boards * TOTAL_COMBOS as usize;
@@ -248,7 +248,7 @@ pub fn cluster_turn(
     }
 
     // Weighted EMD k-means (board frequency observed via weights).
-    let cluster_labels = kmeans_emd_weighted_u8(
+    let (cluster_labels, _centroids) = kmeans_emd_weighted_u8(
         &all_features,
         &all_weights,
         bucket_count as usize,
@@ -328,7 +328,7 @@ pub fn cluster_turn_with_boards(
         }
     }
 
-    let cluster_labels = kmeans_emd_weighted_u8(
+    let (cluster_labels, _centroids) = kmeans_emd_weighted_u8(
         &all_features,
         &all_weights,
         bucket_count as usize,
@@ -467,7 +467,7 @@ pub fn cluster_flop(
     }
 
     // Weighted EMD k-means (board frequency observed via weights).
-    let cluster_labels = kmeans_emd_weighted_u8(
+    let (cluster_labels, _centroids) = kmeans_emd_weighted_u8(
         &all_features,
         &all_weights,
         bucket_count as usize,
@@ -547,7 +547,7 @@ pub fn cluster_flop_with_boards(
         }
     }
 
-    let cluster_labels = kmeans_emd_weighted_u8(
+    let (cluster_labels, _centroids) = kmeans_emd_weighted_u8(
         &all_features,
         &all_weights,
         bucket_count as usize,
@@ -631,7 +631,7 @@ pub fn cluster_river_canonical(
         }
     }
 
-    let cluster_labels = kmeans_1d_weighted(
+    let (cluster_labels, _centroids) = kmeans_1d_weighted(
         &all_equities,
         &all_weights,
         bucket_count as usize,
@@ -727,7 +727,7 @@ pub fn cluster_turn_canonical(
         }
     }
 
-    let cluster_labels = kmeans_emd_weighted_u8(
+    let (cluster_labels, _centroids) = kmeans_emd_weighted_u8(
         &all_features,
         &all_weights,
         bucket_count as usize,
@@ -827,7 +827,7 @@ pub fn cluster_flop_canonical(
         }
     }
 
-    let cluster_labels = kmeans_emd_weighted_u8(
+    let (cluster_labels, _centroids) = kmeans_emd_weighted_u8(
         &all_features,
         &all_weights,
         bucket_count as usize,
@@ -1092,7 +1092,7 @@ fn cfvnet_pass2_centroids(histogram: &[u64], bucket_count: u16, kmeans_iteration
         }
     }
 
-    let labels = kmeans_1d_weighted(
+    let (labels, _centroids) = kmeans_1d_weighted(
         &bin_midpoints,
         &bin_weights,
         bucket_count as usize,
