@@ -5095,9 +5095,12 @@ name = "poker-solver-gpu"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "burn",
+ "cfvnet",
  "cudarc 0.16.6",
  "poker-solver-core",
  "rand 0.8.5",
+ "rand_chacha 0.3.1",
  "range-solver",
  "rayon",
  "rs_poker",
@@ -5128,6 +5131,7 @@ dependencies = [
 name = "poker-solver-trainer"
 version = "0.1.0"
 dependencies = [
+ "burn",
  "clap",
  "crossterm",
  "indicatif",

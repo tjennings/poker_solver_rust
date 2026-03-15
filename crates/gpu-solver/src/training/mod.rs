@@ -1,8 +1,16 @@
 //! GPU-resident training pipeline for river CFVNet.
 //!
 //! Modules for sampling situations, evaluating hand strengths, building
-//! batch solvers, and storing training examples in a reservoir buffer.
+//! batch solvers, storing training examples in a reservoir buffer,
+//! training the CFVNet model, and running the full pipeline.
 
 pub mod builder;
 pub mod hand_eval;
 pub mod reservoir;
+
+#[cfg(feature = "training")]
+pub mod trainer;
+#[cfg(feature = "training")]
+pub mod validation;
+#[cfg(feature = "training")]
+pub mod pipeline;

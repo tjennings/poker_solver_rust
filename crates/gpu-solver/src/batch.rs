@@ -89,6 +89,20 @@ pub struct BatchSolveResult {
     pub iterations: u32,
 }
 
+/// Result of a batch solve with root CFVs extracted on GPU.
+///
+/// Contains GPU-resident root CFVs for both traversers, suitable for direct
+/// insertion into the GPU reservoir without host round-trip.
+#[cfg(feature = "cuda")]
+pub struct BatchSolveResultGpu {
+    /// Number of iterations completed.
+    pub iterations: u32,
+    /// Root CFVs for OOP (traverser 0): `[num_spots * 1326]` on GPU.
+    pub cfvs_oop: CudaSlice<f32>,
+    /// Root CFVs for IP (traverser 1): `[num_spots * 1326]` on GPU.
+    pub cfvs_ip: CudaSlice<f32>,
+}
+
 /// Precomputed per-level data for GPU kernels (same as in solver.rs).
 #[cfg(feature = "cuda")]
 struct LevelData {
@@ -1065,6 +1079,208 @@ impl<'a> BatchGpuSolver<'a> {
         Ok(BatchSolveResult {
             strategies,
             iterations: max_iterations,
+        })
+    }
+
+    /// Solve and extract root CFVs for both traversers on GPU.
+    ///
+    /// Runs the normal solve loop, then performs a final forward+backward
+    /// pass for each traverser to extract root-node CFVs. Returns
+    /// GPU-resident CFV buffers `[num_spots * hands_per_spot]` per traverser.
+    pub fn solve_with_cfvs(
+        &mut self,
+        max_iterations: u32,
+        target_exploitability: Option<f32>,
+    ) -> Result<BatchSolveResultGpu, String> {
+        let gpu_err = |e: GpuError| format!("GPU error: {e}");
+
+        // Run the normal solve loop (discarding strategy download)
+        let _result = self.solve(max_iterations, target_exploitability)?;
+
+        // Now extract root CFVs via a final forward+backward pass per traverser.
+        let total_hands = self.num_hands as usize;
+
+        // Get converged strategy
+        self.gpu
+            .launch_regret_match(
+                &self.regrets,
+                &self.gpu_num_actions,
+                &mut self.current_strategy,
+                self.num_infosets,
+                self.max_actions,
+                self.num_hands,
+            )
+            .map_err(gpu_err)?;
+
+        // Single forward pass
+        self.init_reach().map_err(gpu_err)?;
+        for level in 1..self.num_levels {
+            let ld = &self.level_data[level];
+            if ld.num_nodes == 0 {
+                continue;
+            }
+            self.gpu
+                .launch_forward_pass(
+                    &mut self.reach_oop,
+                    &mut self.reach_ip,
+                    &self.current_strategy,
+                    &ld.nodes,
+                    &ld.parent_nodes,
+                    &ld.parent_actions,
+                    &ld.parent_infosets,
+                    &ld.parent_players,
+                    ld.num_nodes,
+                    self.num_hands,
+                    self.max_actions,
+                )
+                .map_err(gpu_err)?;
+        }
+
+        let mut cfvs_oop = self.gpu.alloc_zeros::<f32>(total_hands).map_err(gpu_err)?;
+        let mut cfvs_ip = self.gpu.alloc_zeros::<f32>(total_hands).map_err(gpu_err)?;
+
+        for traverser in 0..2u32 {
+            // Zero cfvalues
+            let cfv_size = (self.num_nodes * self.num_hands) as u32;
+            self.gpu
+                .launch_zero_buffer(&mut self.cfvalues, cfv_size)
+                .map_err(gpu_err)?;
+
+            // Terminal fold eval (same pattern as solve())
+            if self.num_fold_terminals > 0 {
+                let opp_reach = if traverser == 0 {
+                    &self.reach_ip
+                } else {
+                    &self.reach_oop
+                };
+                let opp_hand_cards = if traverser == 0 {
+                    &self.gpu_hand_cards_ip
+                } else {
+                    &self.gpu_hand_cards_oop
+                };
+                let trav_hand_cards = if traverser == 0 {
+                    &self.gpu_hand_cards_oop
+                } else {
+                    &self.gpu_hand_cards_ip
+                };
+                let same_hand_index = if traverser == 0 {
+                    &self.gpu_same_hand_index_oop
+                } else {
+                    &self.gpu_same_hand_index_ip
+                };
+
+                self.gpu
+                    .launch_precompute_fold_aggregates_batch(
+                        opp_reach,
+                        &self.fold_terminal_nodes,
+                        opp_hand_cards,
+                        &mut self.gpu_fold_total_opp_reach,
+                        &mut self.gpu_fold_per_card_reach,
+                        self.num_fold_terminals,
+                        self.num_hands,
+                        self.hands_per_spot as u32,
+                    )
+                    .map_err(gpu_err)?;
+
+                self.gpu
+                    .launch_fold_eval_from_aggregates_batch(
+                        &mut self.cfvalues,
+                        opp_reach,
+                        &self.fold_terminal_nodes,
+                        &self.fold_amount_win,
+                        &self.fold_amount_lose,
+                        &self.fold_player,
+                        &self.gpu_fold_total_opp_reach,
+                        &self.gpu_fold_per_card_reach,
+                        trav_hand_cards,
+                        same_hand_index,
+                        traverser,
+                        self.num_fold_terminals,
+                        self.num_hands,
+                        self.hands_per_spot as u32,
+                    )
+                    .map_err(gpu_err)?;
+            }
+
+            // Terminal showdown eval
+            if self.num_showdown_terminals > 0 {
+                let opp_reach = if traverser == 0 {
+                    &self.reach_ip
+                } else {
+                    &self.reach_oop
+                };
+                let (traverser_strengths, opponent_strengths) = if traverser == 0 {
+                    (&self.gpu_hand_strengths_oop, &self.gpu_hand_strengths_ip)
+                } else {
+                    (&self.gpu_hand_strengths_ip, &self.gpu_hand_strengths_oop)
+                };
+                let trav_hand_cards = if traverser == 0 {
+                    &self.gpu_hand_cards_oop
+                } else {
+                    &self.gpu_hand_cards_ip
+                };
+                let opp_hand_cards = if traverser == 0 {
+                    &self.gpu_hand_cards_ip
+                } else {
+                    &self.gpu_hand_cards_oop
+                };
+
+                self.gpu
+                    .launch_terminal_showdown_eval_shm_batch(
+                        &mut self.cfvalues,
+                        opp_reach,
+                        &self.showdown_terminal_nodes,
+                        &self.showdown_amount_win,
+                        &self.showdown_amount_lose,
+                        traverser_strengths,
+                        opponent_strengths,
+                        trav_hand_cards,
+                        opp_hand_cards,
+                        self.num_showdown_terminals,
+                        self.num_hands,
+                        self.hands_per_spot as u32,
+                    )
+                    .map_err(gpu_err)?;
+            }
+
+            // Backward CFV
+            for level in (0..self.num_levels).rev() {
+                let bld = &self.backward_level_data[level];
+                if bld.num_decision_nodes == 0 {
+                    continue;
+                }
+                self.gpu
+                    .launch_backward_cfv(
+                        &mut self.cfvalues,
+                        &self.current_strategy,
+                        &bld.decision_nodes,
+                        &self.gpu_child_offsets,
+                        &self.gpu_children,
+                        &self.gpu_infoset_ids,
+                        &bld.decision_players,
+                        traverser,
+                        bld.num_decision_nodes,
+                        self.num_hands,
+                        self.max_actions,
+                    )
+                    .map_err(gpu_err)?;
+            }
+
+            // Download root CFVs (node 0, first total_hands elements)
+            let full_cfvs: Vec<f32> = self.gpu.download(&self.cfvalues).map_err(gpu_err)?;
+            let root_cfvs = &full_cfvs[..total_hands];
+            let dst = if traverser == 0 {
+                &mut cfvs_oop
+            } else {
+                &mut cfvs_ip
+            };
+            *dst = self.gpu.upload(root_cfvs).map_err(gpu_err)?;
+        }
+
+        Ok(BatchSolveResultGpu {
+            iterations: max_iterations,
+            cfvs_oop,
+            cfvs_ip,
         })
     }
 

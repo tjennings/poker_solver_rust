@@ -247,7 +247,7 @@ impl Reservoir {
 /// Encode a situation into the 2720-dimensional input feature vector.
 ///
 /// Returns `(input, mask, game_value)`.
-fn encode_input(
+pub fn encode_input(
     range_oop: &[f32],
     range_ip: &[f32],
     board: &[u32],
