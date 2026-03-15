@@ -139,8 +139,8 @@ pub struct CfvSubgameSolver {
     starting_stack: f64,
     /// Precomputed: for each combo, the total opponent reach of non-blocked combos.
     opp_reach_totals: Vec<f64>,
-    /// Precomputed showdown values per combo (equity-based, fixed across iterations).
-    /// `showdown_equity[combo]` = the equity-based value assuming uniform opponent reach.
+    /// Precomputed showdown values per combo (normalized equity: -1 to +1).
+    /// Multiply by half_pot at showdown nodes. Fixed across iterations.
     showdown_equity: Vec<f64>,
 }
 
@@ -206,7 +206,7 @@ impl CfvSubgameSolver {
                     eq_sum += eq;
                 }
                 let avg_eq = eq_sum / opp_total;
-                2.0 * avg_eq - 1.0 // normalized equity: -1 to +1
+                2.0 * avg_eq - 1.0
             })
             .collect();
 
