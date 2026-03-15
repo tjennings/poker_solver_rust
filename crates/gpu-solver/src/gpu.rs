@@ -94,6 +94,55 @@ impl GpuContext {
         }
         Ok(())
     }
+
+    /// Launch the forward-reach propagation kernel.
+    ///
+    /// For each node in the current BFS level, computes:
+    ///   `reach[node][hand] = reach[parent][hand] * strategy[parent_infoset][action]`
+    ///
+    /// This is parallelized over `num_nodes_this_level * num_hands` threads.
+    ///
+    /// # Layout
+    /// - `reach_probs`: `[num_total_nodes * num_hands]` flat array
+    /// - `strategy`: `[num_infosets * max_actions]` flat array
+    /// - `level_nodes`: `[num_nodes_this_level]` global node ids for this level
+    /// - `parent_nodes`: `[num_nodes_this_level]` parent global node id
+    /// - `parent_actions`: `[num_nodes_this_level]` action index from parent
+    /// - `parent_infosets`: `[num_nodes_this_level]` infoset id of parent
+    pub fn launch_forward_reach(
+        &self,
+        reach_probs: &mut CudaSlice<f32>,
+        strategy: &CudaSlice<f32>,
+        level_nodes: &CudaSlice<u32>,
+        parent_nodes: &CudaSlice<u32>,
+        parent_actions: &CudaSlice<u32>,
+        parent_infosets: &CudaSlice<u32>,
+        num_nodes_this_level: u32,
+        num_hands: u32,
+        max_actions: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/forward_reach.cu"),
+            "forward_reach",
+        )?;
+        let total_threads = num_nodes_this_level * num_hands;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(reach_probs)
+                .arg(strategy)
+                .arg(level_nodes)
+                .arg(parent_nodes)
+                .arg(parent_actions)
+                .arg(parent_infosets)
+                .arg(&num_nodes_this_level)
+                .arg(&num_hands)
+                .arg(&max_actions)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -151,5 +200,77 @@ mod tests {
         assert!((strategy[3] - 1.0 / 3.0).abs() < eps);
         assert!((strategy[4] - 1.0 / 3.0).abs() < eps);
         assert!((strategy[5] - 1.0 / 3.0).abs() < eps);
+    }
+
+    #[test]
+    fn test_forward_reach_kernel() {
+        let gpu = GpuContext::new(0).unwrap();
+
+        // Tree: Root(0) -> [Child(1), Child(2)]
+        // Root is infoset 0 with strategy [0.6, 0.4]
+        // 2 hands
+        // Initial reach for hand 0: 1.0, hand 1: 0.5
+        let num_hands: u32 = 2;
+        let num_nodes_this_level: u32 = 2;
+
+        // reach_probs layout: [num_total_nodes * num_hands]
+        // We need at least 3 nodes (root + 2 children)
+        let reach = vec![
+            1.0f32, 0.5, // node 0 (root): hand 0 = 1.0, hand 1 = 0.5
+            0.0, 0.0, // node 1 (child): to be filled
+            0.0, 0.0, // node 2 (child): to be filled
+        ];
+        let strategy = vec![0.6f32, 0.4]; // infoset 0: [action0=0.6, action1=0.4]
+
+        let level_nodes = vec![1u32, 2]; // nodes at this level
+        let parent_nodes = vec![0u32, 0]; // both children's parent is node 0
+        let parent_actions = vec![0u32, 1]; // child 1 via action 0, child 2 via action 1
+        let parent_infosets = vec![0u32, 0]; // parent's infoset for both
+
+        let mut gpu_reach = gpu.upload(&reach).unwrap();
+        let gpu_strategy = gpu.upload(&strategy).unwrap();
+        let gpu_level_nodes = gpu.upload(&level_nodes).unwrap();
+        let gpu_parent_nodes = gpu.upload(&parent_nodes).unwrap();
+        let gpu_parent_actions = gpu.upload(&parent_actions).unwrap();
+        let gpu_parent_infosets = gpu.upload(&parent_infosets).unwrap();
+
+        gpu.launch_forward_reach(
+            &mut gpu_reach,
+            &gpu_strategy,
+            &gpu_level_nodes,
+            &gpu_parent_nodes,
+            &gpu_parent_actions,
+            &gpu_parent_infosets,
+            num_nodes_this_level,
+            num_hands,
+            2, // max_actions
+        )
+        .unwrap();
+
+        let result = gpu.download(&gpu_reach).unwrap();
+
+        let eps = 1e-5;
+        // Child 1 (action 0): reach = parent_reach * 0.6 = [0.6, 0.3]
+        assert!(
+            (result[2] - 0.6).abs() < eps,
+            "child1 hand0: got {}",
+            result[2]
+        );
+        assert!(
+            (result[3] - 0.3).abs() < eps,
+            "child1 hand1: got {}",
+            result[3]
+        );
+        // Child 2 (action 1): reach = parent_reach * 0.4 = [0.4, 0.2]
+        assert!(
+            (result[4] - 0.4).abs() < eps,
+            "child2 hand0: got {}",
+            result[4]
+        );
+        assert!(
+            (result[5] - 0.2).abs() < eps,
+            "child2 hand1: got {}",
+            result[5]
+        );
     }
 }
