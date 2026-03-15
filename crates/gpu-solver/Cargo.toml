@@ -8,7 +8,7 @@ default = []
 cuda = ["cudarc"]
 
 [dependencies]
-cudarc = { version = "0.16", features = ["std", "driver", "nvrtc"], optional = true }
+cudarc = { version = "0.16", features = ["std", "driver", "nvrtc", "cuda-12010"], optional = true }
 poker-solver-core = { path = "../core" }
 range-solver = { path = "../range-solver" }
 rs_poker = { workspace = true }
