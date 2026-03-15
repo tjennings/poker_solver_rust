@@ -37,7 +37,10 @@ use crate::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
 use crate::showdown_equity::rank_hand;
 
 use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard};
-use super::clustering::{kmeans_1d, kmeans_1d_weighted, kmeans_emd_weighted_u8, nearest_centroid_1d};
+use super::clustering::{
+    kmeans_1d, kmeans_1d_weighted, kmeans_emd_weighted_u8, nearest_centroid_1d,
+    nearest_centroid_u8,
+};
 use super::config::ClusteringConfig;
 use super::Street;
 
@@ -958,6 +961,242 @@ pub fn cluster_river_exhaustive(
     BucketFile {
         header: BucketFileHeader {
             street: Street::River,
+            bucket_count,
+            board_count: num_boards as u32,
+            combos_per_board: TOTAL_COMBOS,
+            version: 2,
+        },
+        boards: packed_boards,
+        buckets,
+    }
+}
+
+/// Cluster turn situations using two-phase clustering:
+/// - Phase 1: Sample canonical turns, build histograms over `river_buckets`,
+///   run `kmeans_emd_weighted_u8` to find centroids.
+/// - Phase 2: Enumerate ALL canonical turns, build histograms, assign to
+///   nearest centroid via `nearest_centroid_u8`.
+pub fn cluster_turn_exhaustive(
+    river_buckets: &BucketFile,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    sample_boards: usize,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let board_map = river_buckets.board_index_map();
+
+    // Phase 1: Sample canonical turns and run k-means to find centroids.
+    let all_canonical = enumerate_canonical_turns();
+    let (sample_boards_cards, sample_weights) =
+        sample_canonical(&all_canonical, sample_boards, seed);
+    let num_sample = sample_boards_cards.len();
+
+    let sample_features: Vec<Vec<Option<Vec<u8>>>> = sample_boards_cards
+        .par_iter()
+        .enumerate()
+        .map(|(board_idx, board)| {
+            let features: Vec<Option<Vec<u8>>> = combos
+                .iter()
+                .map(|combo| {
+                    if cards_overlap(*combo, board) {
+                        return None;
+                    }
+                    Some(build_bucket_histogram_u8(
+                        *combo, board, &deck, river_buckets, &board_map,
+                    ))
+                })
+                .collect();
+            #[allow(clippy::cast_precision_loss)]
+            progress((board_idx + 1) as f64 / num_sample as f64 * 0.2);
+            features
+        })
+        .collect();
+
+    let mut all_features: Vec<Vec<u8>> = Vec::new();
+    let mut all_weights: Vec<f64> = Vec::new();
+    for (board_idx, board_feats) in sample_features.into_iter().enumerate() {
+        let w = sample_weights[board_idx];
+        for feat in board_feats.into_iter().flatten() {
+            all_features.push(feat);
+            all_weights.push(w);
+        }
+    }
+
+    let (_labels, centroids) = kmeans_emd_weighted_u8(
+        &all_features,
+        &all_weights,
+        bucket_count as usize,
+        kmeans_iterations,
+        seed,
+        |iter, max_iter| {
+            #[allow(clippy::cast_precision_loss)]
+            progress(0.2 + 0.1 * f64::from(iter) / f64::from(max_iter));
+        },
+    );
+    progress(0.3);
+
+    // Phase 2: Enumerate ALL canonical turns and assign each combo to nearest centroid.
+    let num_boards = all_canonical.len();
+    let total = num_boards * TOTAL_COMBOS as usize;
+    let mut buckets = vec![0_u16; total];
+
+    let board_assignments: Vec<Vec<u16>> = all_canonical
+        .par_iter()
+        .enumerate()
+        .map(|(i, wb)| {
+            let assigns: Vec<u16> = combos
+                .iter()
+                .map(|combo| {
+                    if cards_overlap(*combo, &wb.cards) {
+                        return 0; // placeholder for overlapping cards
+                    }
+                    let hist = build_bucket_histogram_u8(
+                        *combo, &wb.cards, &deck, river_buckets, &board_map,
+                    );
+                    nearest_centroid_u8(&hist, &centroids)
+                })
+                .collect();
+            #[allow(clippy::cast_precision_loss)]
+            progress(0.3 + (i + 1) as f64 / num_boards as f64 * 0.7);
+            assigns
+        })
+        .collect();
+
+    for (board_idx, assigns) in board_assignments.iter().enumerate() {
+        let offset = board_idx * TOTAL_COMBOS as usize;
+        buckets[offset..offset + TOTAL_COMBOS as usize].copy_from_slice(assigns);
+    }
+
+    let packed_boards: Vec<PackedBoard> = all_canonical
+        .iter()
+        .map(|wb| canonical_key(&wb.cards))
+        .collect();
+
+    #[allow(clippy::cast_possible_truncation)]
+    BucketFile {
+        header: BucketFileHeader {
+            street: Street::Turn,
+            bucket_count,
+            board_count: num_boards as u32,
+            combos_per_board: TOTAL_COMBOS,
+            version: 2,
+        },
+        boards: packed_boards,
+        buckets,
+    }
+}
+
+/// Cluster flop situations using two-phase clustering:
+/// - Phase 1: Sample canonical flops, build histograms over `turn_buckets`,
+///   run `kmeans_emd_weighted_u8` to find centroids.
+/// - Phase 2: Enumerate ALL canonical flops, build histograms, assign to
+///   nearest centroid via `nearest_centroid_u8`.
+pub fn cluster_flop_exhaustive(
+    turn_buckets: &BucketFile,
+    bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    sample_boards: usize,
+    progress: impl Fn(f64) + Sync,
+) -> BucketFile {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let board_map = turn_buckets.board_index_map();
+
+    // Phase 1: Sample canonical flops and run k-means to find centroids.
+    let all_canonical = enumerate_canonical_flops();
+    let (sample_boards_cards, sample_weights) =
+        sample_canonical(&all_canonical, sample_boards, seed);
+    let num_sample = sample_boards_cards.len();
+
+    let sample_features: Vec<Vec<Option<Vec<u8>>>> = sample_boards_cards
+        .par_iter()
+        .enumerate()
+        .map(|(board_idx, board)| {
+            let features: Vec<Option<Vec<u8>>> = combos
+                .iter()
+                .map(|combo| {
+                    if cards_overlap(*combo, board) {
+                        return None;
+                    }
+                    Some(build_bucket_histogram_u8(
+                        *combo, board, &deck, turn_buckets, &board_map,
+                    ))
+                })
+                .collect();
+            #[allow(clippy::cast_precision_loss)]
+            progress((board_idx + 1) as f64 / num_sample as f64 * 0.2);
+            features
+        })
+        .collect();
+
+    let mut all_features: Vec<Vec<u8>> = Vec::new();
+    let mut all_weights: Vec<f64> = Vec::new();
+    for (board_idx, board_feats) in sample_features.into_iter().enumerate() {
+        let w = sample_weights[board_idx];
+        for feat in board_feats.into_iter().flatten() {
+            all_features.push(feat);
+            all_weights.push(w);
+        }
+    }
+
+    let (_labels, centroids) = kmeans_emd_weighted_u8(
+        &all_features,
+        &all_weights,
+        bucket_count as usize,
+        kmeans_iterations,
+        seed,
+        |iter, max_iter| {
+            #[allow(clippy::cast_precision_loss)]
+            progress(0.2 + 0.1 * f64::from(iter) / f64::from(max_iter));
+        },
+    );
+    progress(0.3);
+
+    // Phase 2: Enumerate ALL canonical flops and assign each combo to nearest centroid.
+    let num_boards = all_canonical.len();
+    let total = num_boards * TOTAL_COMBOS as usize;
+    let mut buckets = vec![0_u16; total];
+
+    let board_assignments: Vec<Vec<u16>> = all_canonical
+        .par_iter()
+        .enumerate()
+        .map(|(i, wb)| {
+            let assigns: Vec<u16> = combos
+                .iter()
+                .map(|combo| {
+                    if cards_overlap(*combo, &wb.cards) {
+                        return 0; // placeholder for overlapping cards
+                    }
+                    let hist = build_bucket_histogram_u8(
+                        *combo, &wb.cards, &deck, turn_buckets, &board_map,
+                    );
+                    nearest_centroid_u8(&hist, &centroids)
+                })
+                .collect();
+            #[allow(clippy::cast_precision_loss)]
+            progress(0.3 + (i + 1) as f64 / num_boards as f64 * 0.7);
+            assigns
+        })
+        .collect();
+
+    for (board_idx, assigns) in board_assignments.iter().enumerate() {
+        let offset = board_idx * TOTAL_COMBOS as usize;
+        buckets[offset..offset + TOTAL_COMBOS as usize].copy_from_slice(assigns);
+    }
+
+    let packed_boards: Vec<PackedBoard> = all_canonical
+        .iter()
+        .map(|wb| canonical_key(&wb.cards))
+        .collect();
+
+    #[allow(clippy::cast_possible_truncation)]
+    BucketFile {
+        header: BucketFileHeader {
+            street: Street::Flop,
             bucket_count,
             board_count: num_boards as u32,
             combos_per_board: TOTAL_COMBOS,
@@ -2380,9 +2619,21 @@ mod tests {
     #[test]
     fn cluster_river_exhaustive_exists_and_compiles() {
         // Verify the function exists with the expected signature.
-        // Use a trivially small sample to just test the two-phase logic.
-        // The full exhaustive enumeration is too slow for debug mode.
         let _: fn(u16, u32, u64, usize, fn(f64)) -> BucketFile = cluster_river_exhaustive;
+    }
+
+    #[test]
+    fn cluster_turn_exhaustive_exists_and_compiles() {
+        // Verify the function exists with the expected signature.
+        let _: fn(&BucketFile, u16, u32, u64, usize, fn(f64)) -> BucketFile =
+            cluster_turn_exhaustive;
+    }
+
+    #[test]
+    fn cluster_flop_exhaustive_exists_and_compiles() {
+        // Verify the function exists with the expected signature.
+        let _: fn(&BucketFile, u16, u32, u64, usize, fn(f64)) -> BucketFile =
+            cluster_flop_exhaustive;
     }
 
 }
