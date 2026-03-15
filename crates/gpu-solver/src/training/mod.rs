@@ -15,3 +15,5 @@ pub mod trainer;
 pub mod validation;
 #[cfg(feature = "training")]
 pub mod pipeline;
+#[cfg(feature = "training")]
+pub mod leaf_eval;
