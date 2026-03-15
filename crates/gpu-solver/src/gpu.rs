@@ -227,6 +227,160 @@ impl GpuContext {
         Ok(())
     }
 
+    /// Launch the fold aggregates precomputation kernel.
+    ///
+    /// For each fold terminal, computes:
+    ///   - `total_opp_reach[term]` — sum of all opponent reach
+    ///   - `per_card_reach[term * 52 + c]` — sum of opponent reach for hands containing card c
+    ///
+    /// These aggregates enable O(1) per-hand fold CFV via inclusion-exclusion.
+    ///
+    /// # Launch config
+    /// One block per fold terminal. Threads within the block cooperate via
+    /// shared memory atomics to accumulate across all opponent hands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_precompute_fold_aggregates(
+        &self,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        opp_hand_cards: &CudaSlice<u32>,
+        total_opp_reach: &mut CudaSlice<f32>,
+        per_card_reach: &mut CudaSlice<f32>,
+        num_fold_terminals: u32,
+        num_hands: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/precompute_fold_aggregates.cu"),
+            "precompute_fold_aggregates",
+        )?;
+        // One block per terminal, 256 threads per block
+        let block_dim = 256u32.min(num_hands);
+        let cfg = LaunchConfig {
+            grid_dim: (num_fold_terminals, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0, // shared memory is statically allocated in the kernel
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(opp_hand_cards)
+                .arg(total_opp_reach)
+                .arg(per_card_reach)
+                .arg(&num_fold_terminals)
+                .arg(&num_hands)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Launch the O(1) fold evaluation kernel using precomputed aggregates.
+    ///
+    /// For each (fold_terminal, hand) pair, computes:
+    ///   `cfv[h] = payoff * (total_opp_reach - per_card[c1] - per_card[c2] + same_hand_reach)`
+    ///
+    /// Requires `launch_precompute_fold_aggregates` to have been called first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fold_eval_from_aggregates(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        fold_amount_win: &CudaSlice<f32>,
+        fold_amount_lose: &CudaSlice<f32>,
+        fold_player: &CudaSlice<u32>,
+        total_opp_reach: &CudaSlice<f32>,
+        per_card_reach: &CudaSlice<f32>,
+        trav_hand_cards: &CudaSlice<u32>,
+        same_hand_index: &CudaSlice<u32>,
+        traverser: u32,
+        num_fold_terminals: u32,
+        num_hands: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/fold_eval_from_aggregates.cu"),
+            "fold_eval_from_aggregates",
+        )?;
+        let total_threads = num_fold_terminals * num_hands;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(fold_amount_win)
+                .arg(fold_amount_lose)
+                .arg(fold_player)
+                .arg(total_opp_reach)
+                .arg(per_card_reach)
+                .arg(trav_hand_cards)
+                .arg(same_hand_index)
+                .arg(&traverser)
+                .arg(&num_fold_terminals)
+                .arg(&num_hands)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Launch the shared-memory showdown evaluation kernel.
+    ///
+    /// One block per showdown terminal. Opponent reach is loaded into shared
+    /// memory once, then each thread computes its traverser hand's CFV by
+    /// iterating over opponent hands in fast shared memory.
+    ///
+    /// Card blocking uses explicit card comparison (no valid_matchups matrix).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_terminal_showdown_eval_shm(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        amount_win: &CudaSlice<f32>,
+        amount_lose: &CudaSlice<f32>,
+        traverser_strengths: &CudaSlice<u32>,
+        opponent_strengths: &CudaSlice<u32>,
+        trav_hand_cards: &CudaSlice<u32>,
+        opp_hand_cards: &CudaSlice<u32>,
+        num_showdown_terminals: u32,
+        num_hands: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/terminal_showdown_eval_shm.cu"),
+            "terminal_showdown_eval_shm",
+        )?;
+        // Block size must be >= num_hands; round up to next multiple of 32 (warp size)
+        let block_size = ((num_hands + 31) / 32) * 32;
+        // Cap at 1024 (max block size). For very large hand counts this would
+        // need a different approach, but typical poker hands are <= 1081.
+        let block_size = block_size.min(1024);
+        let shared_mem = num_hands * 4; // sizeof(float) = 4
+        let cfg = LaunchConfig {
+            grid_dim: (num_showdown_terminals, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: shared_mem,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(amount_win)
+                .arg(amount_lose)
+                .arg(traverser_strengths)
+                .arg(opponent_strengths)
+                .arg(trav_hand_cards)
+                .arg(opp_hand_cards)
+                .arg(&num_showdown_terminals)
+                .arg(&num_hands)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
     /// Launch the showdown terminal evaluation kernel.
     ///
     /// Computes counterfactual values at showdown terminal nodes. For each

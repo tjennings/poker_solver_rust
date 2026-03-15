@@ -78,6 +78,15 @@ pub struct FlatTree {
     /// `valid_matchups_ip[ip_hand * num_hands + oop_hand] = 1.0` if no card conflict, `0.0` if blocked.
     /// Size: `num_hands * num_hands`.
     pub valid_matchups_ip: Vec<f32>,
+    /// For each OOP hand index, the IP hand index holding the same two cards,
+    /// or `u32::MAX` if no such hand exists. Used for inclusion-exclusion
+    /// correction in the O(n) fold evaluation kernel.
+    /// Length = `num_hands` (padded with `u32::MAX`).
+    pub same_hand_index_oop: Vec<u32>,
+    /// For each IP hand index, the OOP hand index holding the same two cards,
+    /// or `u32::MAX` if no such hand exists.
+    /// Length = `num_hands` (padded with `u32::MAX`).
+    pub same_hand_index_ip: Vec<u32>,
 }
 
 impl FlatTree {
@@ -421,6 +430,27 @@ impl FlatTree {
             }
         }
 
+        // Compute same_hand_index: for each hand of one player, find the
+        // opponent hand holding the same two cards (if any).
+        let mut same_hand_index_oop = vec![u32::MAX; num_hands];
+        for (oop_h, &(oop_c1, oop_c2)) in cards_oop.iter().enumerate() {
+            for (ip_h, &(ip_c1, ip_c2)) in cards_ip.iter().enumerate() {
+                if oop_c1 == ip_c1 && oop_c2 == ip_c2 {
+                    same_hand_index_oop[oop_h] = ip_h as u32;
+                    break;
+                }
+            }
+        }
+        let mut same_hand_index_ip = vec![u32::MAX; num_hands];
+        for (ip_h, &(ip_c1, ip_c2)) in cards_ip.iter().enumerate() {
+            for (oop_h, &(oop_c1, oop_c2)) in cards_oop.iter().enumerate() {
+                if ip_c1 == oop_c1 && ip_c2 == oop_c2 {
+                    same_hand_index_ip[ip_h] = oop_h as u32;
+                    break;
+                }
+            }
+        }
+
         // Reset game to root
         game.back_to_root();
 
@@ -450,6 +480,8 @@ impl FlatTree {
             cards_ip,
             valid_matchups_oop,
             valid_matchups_ip,
+            same_hand_index_oop,
+            same_hand_index_ip,
         }
     }
 
@@ -517,6 +549,9 @@ impl FlatTree {
             // All matchups valid (no card conflicts in test tree)
             valid_matchups_oop: vec![1.0, 1.0, 1.0, 1.0],
             valid_matchups_ip: vec![1.0, 1.0, 1.0, 1.0],
+            // No same-hand overlaps in test tree
+            same_hand_index_oop: vec![u32::MAX, u32::MAX],
+            same_hand_index_ip: vec![u32::MAX, u32::MAX],
         }
     }
 }

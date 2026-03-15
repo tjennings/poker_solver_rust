@@ -260,3 +260,53 @@ fn test_flat_tree_hand_strengths() {
         "OOP should have multiple distinct strength values"
     );
 }
+
+#[test]
+fn test_same_hand_index() {
+    let mut game = make_river_game();
+    let flat = FlatTree::from_postflop_game(&mut game);
+
+    // same_hand_index arrays should be padded to num_hands
+    assert_eq!(flat.same_hand_index_oop.len(), flat.num_hands);
+    assert_eq!(flat.same_hand_index_ip.len(), flat.num_hands);
+
+    // Verify bidirectional consistency: if OOP hand i maps to IP hand j,
+    // then IP hand j must map back to OOP hand i.
+    for (oop_h, &ip_h) in flat.same_hand_index_oop.iter().enumerate() {
+        if ip_h != u32::MAX {
+            assert!(
+                (ip_h as usize) < flat.num_hands_ip,
+                "same_hand_index_oop[{oop_h}] = {ip_h} out of range"
+            );
+            assert_eq!(
+                flat.same_hand_index_ip[ip_h as usize], oop_h as u32,
+                "bidirectional mismatch: oop[{oop_h}]->{ip_h}, but ip[{ip_h}]->{}",
+                flat.same_hand_index_ip[ip_h as usize]
+            );
+        }
+    }
+
+    // Verify that mapped hands actually have the same cards
+    for (oop_h, &ip_h) in flat.same_hand_index_oop.iter().enumerate() {
+        if ip_h != u32::MAX && oop_h < flat.num_hands_oop {
+            let (oc1, oc2) = flat.cards_oop[oop_h];
+            let (ic1, ic2) = flat.cards_ip[ip_h as usize];
+            assert_eq!(
+                (oc1, oc2), (ic1, ic2),
+                "same_hand_index cards mismatch at oop={oop_h}, ip={ip_h}"
+            );
+        }
+    }
+
+    // Count how many OOP hands also exist in the IP range.
+    // With "AA,KK,QQ,AKs" vs "QQ-JJ,AQs,AJs", QQ combos should overlap.
+    let overlapping = flat
+        .same_hand_index_oop
+        .iter()
+        .filter(|&&v| v != u32::MAX)
+        .count();
+    assert!(
+        overlapping > 0,
+        "AA/KK/QQ/AKs vs QQ-JJ/AQs/AJs should have overlapping QQ combos"
+    );
+}
