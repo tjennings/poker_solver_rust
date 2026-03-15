@@ -255,6 +255,16 @@ impl BucketFile {
             .collect()
     }
 
+    /// Build an `FxHashMap` from `PackedBoard` to board index for O(1) lookups.
+    #[must_use]
+    pub fn board_index_map_fx(&self) -> rustc_hash::FxHashMap<PackedBoard, u32> {
+        self.boards
+            .iter()
+            .enumerate()
+            .map(|(i, &board)| (board, i as u32))
+            .collect()
+    }
+
     /// Look up the bucket assignment for a specific board and combo index.
     #[must_use]
     pub fn get_bucket(&self, board_idx: u32, combo_idx: u16) -> u16 {
@@ -491,6 +501,54 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map[&boards[0]], 0);
         assert_eq!(map[&boards[1]], 1);
+    }
+
+    #[test]
+    fn board_index_map_fx_round_trip() {
+        let boards = vec![
+            PackedBoard::from_cards(&[
+                Card::new(Value::Ace, Suit::Spade),
+                Card::new(Value::King, Suit::Spade),
+                Card::new(Value::Queen, Suit::Heart),
+            ]),
+            PackedBoard::from_cards(&[
+                Card::new(Value::Two, Suit::Spade),
+                Card::new(Value::Three, Suit::Heart),
+                Card::new(Value::Four, Suit::Diamond),
+            ]),
+        ];
+        let bf = BucketFile {
+            header: BucketFileHeader {
+                street: Street::Flop,
+                bucket_count: 10,
+                board_count: 2,
+                combos_per_board: 1326,
+                version: VERSION,
+            },
+            boards: boards.clone(),
+            buckets: vec![0; 2 * 1326],
+        };
+        let map = bf.board_index_map_fx();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&boards[0]], 0);
+        assert_eq!(map[&boards[1]], 1);
+    }
+
+    #[test]
+    fn board_index_map_fx_empty_boards() {
+        let bf = BucketFile {
+            header: BucketFileHeader {
+                street: Street::Flop,
+                bucket_count: 10,
+                board_count: 0,
+                combos_per_board: 1326,
+                version: VERSION,
+            },
+            boards: vec![],
+            buckets: vec![],
+        };
+        let map = bf.board_index_map_fx();
+        assert!(map.is_empty());
     }
 
     #[test]

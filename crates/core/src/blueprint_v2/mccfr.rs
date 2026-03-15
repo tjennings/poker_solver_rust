@@ -41,14 +41,14 @@ impl PruneStats {
     }
 }
 
-use std::sync::Arc;
+use rustc_hash::FxHashMap;
 
-use super::bucket_file::BucketFile;
-use super::config::StreetClusterConfig;
-pub use super::equity_cache::EquityDeltaCache;
+use super::bucket_file::{BucketFile, PackedBoard};
+use super::cluster_pipeline::{canonical_key, combo_index};
 use super::game_tree::{GameNode, GameTree, TerminalKind};
 use super::storage::BlueprintStorage;
 use super::Street;
+use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::poker::{Card, Hand, Rankable};
 
 /// Maximum number of actions at any decision node.
@@ -79,25 +79,14 @@ pub struct DealWithBuckets {
 /// Loaded bucket assignments for all 4 streets.
 ///
 /// During MCCFR, we look up buckets by street using the deal's cards.
-/// Supports two modes:
-/// - **Equity-only**: uniform equity bins (when no delta_bins configured).
-/// - **Equity+delta**: 2D grid of equity × signed delta to next street.
+/// Uses precomputed bucket files for O(1) lookups when available,
+/// with equity-based fallback when no bucket file is present.
 pub struct AllBuckets {
     pub bucket_counts: [u16; 4],
     /// Per-street bucket files produced by the clustering pipeline.
-    /// Currently unused for lookups (equity fallback is used instead),
-    /// but retained for potential future use.
     pub bucket_files: [Option<BucketFile>; 4],
-    /// Per-street delta bin boundaries (flop, turn only; river has no future street).
-    /// When `Some`, bucketing uses 2D equity×delta grid.
-    delta_bins: [Option<Vec<f64>>; 4],
-    /// Per-street flag: when true, delta is averaged over all possible
-    /// next-street cards rather than using the actual runout.
-    expected_delta: [bool; 4],
-    /// Optional pre-computed equity+delta cache for O(1) lookups.
-    /// When present, `precompute_buckets` uses table lookups instead of
-    /// expensive expected-equity computation.
-    equity_cache: Option<Arc<EquityDeltaCache>>,
+    /// Board index lookup tables for O(1) bucket file lookups.
+    board_maps: [Option<FxHashMap<PackedBoard, u32>>; 4],
 }
 
 impl AllBuckets {
@@ -105,127 +94,72 @@ impl AllBuckets {
     pub fn new(
         bucket_counts: [u16; 4],
         bucket_files: [Option<BucketFile>; 4],
-        street_configs: [&StreetClusterConfig; 4],
     ) -> Self {
-        let delta_bins = [
-            street_configs[0].delta_bins.clone(),
-            street_configs[1].delta_bins.clone(),
-            street_configs[2].delta_bins.clone(),
-            street_configs[3].delta_bins.clone(),
-        ];
-        let expected_delta = [
-            street_configs[0].expected_delta,
-            street_configs[1].expected_delta,
-            street_configs[2].expected_delta,
-            street_configs[3].expected_delta,
-        ];
+        let board_maps = std::array::from_fn(|i| {
+            bucket_files[i].as_ref().and_then(|bf| {
+                if bf.boards.is_empty() {
+                    None
+                } else {
+                    Some(bf.board_index_map_fx())
+                }
+            })
+        });
         Self {
             bucket_counts,
             bucket_files,
-            delta_bins,
-            expected_delta,
-            equity_cache: None,
+            board_maps,
         }
     }
 
-    /// Attach a pre-computed equity+delta cache for O(1) lookups.
-    pub fn set_equity_cache(&mut self, cache: Arc<EquityDeltaCache>) {
-        self.equity_cache = Some(cache);
+    /// Look up a bucket for a postflop street via bucket file.
+    ///
+    /// Canonicalizes the board, looks up the board index in the hash map,
+    /// applies the same suit permutation to hole cards, and reads the bucket
+    /// from the flat array. Falls back to equity binning if no bucket file
+    /// or board not found.
+    fn lookup_bucket(&self, street_idx: usize, hole: [Card; 2], board: &[Card]) -> u16 {
+        if let (Some(bf), Some(board_map)) = (
+            &self.bucket_files[street_idx],
+            &self.board_maps[street_idx],
+        ) {
+            if let Ok(canonical) = CanonicalBoard::from_cards(board) {
+                let packed = canonical_key(&canonical.cards);
+                if let Some(&board_idx) = board_map.get(&packed) {
+                    let (c0, c1) = canonical.canonicalize_holding(hole[0], hole[1]);
+                    let ci = combo_index(c0, c1);
+                    return bf.get_bucket(board_idx, ci);
+                }
+            }
+        }
+        // Fallback: equity-based bucketing.
+        let equity = crate::showdown_equity::compute_equity(hole, board);
+        let k = self.bucket_counts[street_idx];
+        let bucket = (equity * f64::from(k)) as u16;
+        bucket.min(k - 1)
     }
 
-    /// Pre-compute bucket assignments for all 4 streets × 2 players.
-    ///
-    /// Computes equity at all postflop streets first, then derives buckets
-    /// using equity+delta when delta_bins are configured. When `expected_delta`
-    /// is set for a street, the delta is averaged over all possible next-street
-    /// cards rather than using the actual runout.
+    /// Pre-compute bucket assignments for all 4 streets x 2 players.
     #[must_use]
     pub fn precompute_buckets(&self, deal: &Deal) -> [[u16; 4]; 2] {
         let mut result = [[0u16; 4]; 2];
         for (player, row) in result.iter_mut().enumerate() {
             let hole = deal.hole_cards[player];
-
             // Preflop: canonical hand index.
             let hand = crate::hands::CanonicalHand::from_cards(hole[0], hole[1]);
             let idx = hand.index() as u16;
             row[0] = idx.min(self.bucket_counts[0] - 1);
-
-            // Compute postflop equities up-front (needed for delta computation).
-            let flop_eq = crate::showdown_equity::compute_equity(hole, &deal.board[..3]);
-            let turn_eq = crate::showdown_equity::compute_equity(hole, &deal.board[..4]);
-            let river_eq = crate::showdown_equity::compute_equity(hole, &deal.board[..5]);
-
-            // Flop bucket: equity + delta to turn.
-            let flop_next_eq = if self.expected_delta[1] && self.delta_bins[1].is_some() {
-                if let Some(cache) = &self.equity_cache {
-                    cache.flop_lookup(hole, &deal.board[..3])
-                        .map(|e| f64::from(e.expected_next_equity))
-                } else {
-                    Some(expected_next_equity(hole, &deal.board[..3]))
-                }
-            } else {
-                Some(turn_eq)
-            };
-            row[1] = self.compute_bucket(1, flop_eq, flop_next_eq);
-
-            // Turn bucket: equity + delta to river.
-            let turn_next_eq = if self.expected_delta[2] && self.delta_bins[2].is_some() {
-                if let Some(cache) = &self.equity_cache {
-                    cache.turn_lookup(hole, &deal.board[..4])
-                        .map(|e| f64::from(e.expected_next_equity))
-                } else {
-                    Some(expected_next_equity(hole, &deal.board[..4]))
-                }
-            } else {
-                Some(river_eq)
-            };
-            row[2] = self.compute_bucket(2, turn_eq, turn_next_eq);
-
-            // River bucket: equity only (no future street).
-            row[3] = self.compute_bucket(3, river_eq, None);
+            // Postflop: bucket file lookup with equity fallback.
+            row[1] = self.lookup_bucket(1, hole, &deal.board[..3]); // flop
+            row[2] = self.lookup_bucket(2, hole, &deal.board[..4]); // turn
+            row[3] = self.lookup_bucket(3, hole, &deal.board[..5]); // river
         }
         result
     }
 
-    /// Compute a bucket index for a single street.
+    /// Look up the bucket for a single street.
     ///
-    /// When delta_bins are configured and `next_equity` is available, uses
-    /// a 2D equity×delta grid. Otherwise falls back to uniform equity bins.
-    fn compute_bucket(&self, street_idx: usize, equity: f64, next_equity: Option<f64>) -> u16 {
-        let k = self.bucket_counts[street_idx];
-
-        match (&self.delta_bins[street_idx], next_equity) {
-            (Some(boundaries), Some(next_eq)) => {
-                let delta = next_eq - equity;
-                let delta_bin_count = boundaries.len() as u16 + 1;
-                let equity_bin_count = k / delta_bin_count;
-                if equity_bin_count == 0 {
-                    // Not enough total buckets for the grid; fall back to equity-only.
-                    let bucket = (equity * f64::from(k)) as u16;
-                    return bucket.min(k - 1);
-                }
-
-                let eq_bin = (equity * f64::from(equity_bin_count)) as u16;
-                let eq_bin = eq_bin.min(equity_bin_count - 1);
-
-                let d_bin = delta_bin(delta, boundaries);
-
-                let bucket = eq_bin * delta_bin_count + d_bin;
-                bucket.min(k - 1)
-            }
-            _ => {
-                // Equity-only: uniform bins.
-                let bucket = (equity * f64::from(k)) as u16;
-                bucket.min(k - 1)
-            }
-        }
-    }
-
-    /// Look up the bucket for a single street using equity-only bucketing.
-    ///
-    /// Preflop uses canonical hand index. Postflop computes showdown equity
-    /// and maps to a uniform bucket. Does **not** use delta bins — use
-    /// `precompute_buckets` for full equity+delta bucketing.
+    /// Preflop uses canonical hand index. Postflop uses bucket file
+    /// lookup with equity-based fallback.
     #[must_use]
     pub fn get_bucket(&self, street: Street, hole_cards: [Card; 2], board: &[Card]) -> u16 {
         if street == Street::Preflop {
@@ -233,21 +167,13 @@ impl AllBuckets {
             let idx = hand.index() as u16;
             return idx.min(self.bucket_counts[0] - 1);
         }
-        let street_idx = street as usize;
-        let equity = crate::showdown_equity::compute_equity(hole_cards, board);
-        self.compute_bucket(street_idx, equity, None)
+        self.lookup_bucket(street as usize, hole_cards, board)
     }
 
-    /// Create `AllBuckets` with equity-only bucketing (no delta bins).
+    /// Create `AllBuckets` with equity-only bucketing (no bucket files).
     #[must_use]
     pub fn equity_only(bucket_counts: [u16; 4], bucket_files: [Option<BucketFile>; 4]) -> Self {
-        Self {
-            bucket_counts,
-            bucket_files,
-            delta_bins: [None, None, None, None],
-            expected_delta: [false; 4],
-            equity_cache: None,
-        }
+        Self::new(bucket_counts, bucket_files)
     }
 
     /// Return the visible board slice for a given street.
@@ -260,51 +186,6 @@ impl AllBuckets {
             Street::River => &board[..5],
         }
     }
-}
-
-/// Compute the expected equity on the next street by averaging over all
-/// possible next cards.
-///
-/// For a flop board (3 cards), enumerates all ~47 possible turn cards.
-/// For a turn board (4 cards), enumerates all ~46 possible river cards.
-/// Returns the mean equity across all possible next-street boards.
-fn expected_next_equity(hole: [Card; 2], board: &[Card]) -> f64 {
-    use crate::showdown_equity::remaining_cards_from;
-
-    let remaining = remaining_cards_from(hole, board);
-    let mut total_eq = 0.0;
-    let mut count = 0u32;
-
-    // Stack-allocate a board buffer one card longer than the current board.
-    let mut next_board = arrayvec::ArrayVec::<Card, 5>::new();
-    for &c in board {
-        next_board.push(c);
-    }
-    next_board.push(Card::new(crate::poker::Value::Two, crate::poker::Suit::Spade)); // placeholder
-
-    for &card in &remaining {
-        *next_board.last_mut().unwrap() = card;
-        total_eq += crate::showdown_equity::compute_equity(hole, &next_board);
-        count += 1;
-    }
-
-    if count == 0 {
-        return 0.5;
-    }
-    total_eq / f64::from(count)
-}
-
-/// Map a delta value to a bin index given sorted boundary thresholds.
-///
-/// Boundaries partition [-1.0, +1.0] into `len + 1` bins.
-/// Returns an index in `0..=boundaries.len()`.
-fn delta_bin(delta: f64, boundaries: &[f64]) -> u16 {
-    for (i, &b) in boundaries.iter().enumerate() {
-        if delta < b {
-            return i as u16;
-        }
-    }
-    boundaries.len() as u16
 }
 
 /// Run one external-sampling MCCFR iteration for the given traverser.
@@ -888,52 +769,24 @@ mod tests {
         assert!((v - 40.0).abs() < 1e-10, "Winner gets 50 - 10 rake = 40, got {v}");
     }
 
-    // ── Equity+Delta bucketing integration tests ─────────────────────
-
-    /// Helper: build AllBuckets with the equity_delta config's flop delta bins.
-    fn equity_delta_buckets() -> AllBuckets {
-        use crate::blueprint_v2::config::StreetClusterConfig;
-
-        let flop_cfg = StreetClusterConfig {
-            buckets: 400,
-            delta_bins: Some(vec![
-                -0.2, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.55, 0.75,
-            ]),
-            expected_delta: false,
-            sample_boards: None,
-        };
-        let turn_cfg = StreetClusterConfig {
-            buckets: 100,
-            delta_bins: Some(vec![-0.2, -0.05, 0.05, 0.15, 0.25, 0.40]),
-            expected_delta: false,
-            sample_boards: None,
-        };
-        let preflop_cfg = StreetClusterConfig { buckets: 169, delta_bins: None, expected_delta: false, sample_boards: None };
-        let river_cfg = StreetClusterConfig { buckets: 1000, delta_bins: None, expected_delta: false, sample_boards: None };
-
-        AllBuckets::new(
-            [169, 400, 100, 1000],
-            [None, None, None, None],
-            [&preflop_cfg, &flop_cfg, &turn_cfg, &river_cfg],
-        )
-    }
-
     /// Helper: shorthand card constructor.
     fn c(v: Value, s: Suit) -> Card {
         Card::new(v, s)
     }
 
-    /// AA on a dry rainbow board — equity stays high across streets.
-    /// Delta should be near zero (neutral).
+    // ── Bucket file lookup tests ─────────────────────────────────────
+
     #[test]
-    fn delta_aa_dry_board_neutral() {
-        let buckets = equity_delta_buckets();
+    fn equity_fallback_aa_high_bucket() {
+        let all = AllBuckets::equity_only(
+            [169, 400, 100, 1000],
+            [None, None, None, None],
+        );
         let deal = Deal {
             hole_cards: [
                 [c(Value::Ace, Suit::Spade), c(Value::Ace, Suit::Heart)],
                 [c(Value::Seven, Suit::Club), c(Value::Two, Suit::Diamond)],
             ],
-            // K72 rainbow, turn 3, river 8 — no draws complete
             board: [
                 c(Value::King, Suit::Diamond),
                 c(Value::Seven, Suit::Spade),
@@ -943,478 +796,24 @@ mod tests {
             ],
         };
 
-        let b = buckets.precompute_buckets(&deal);
-        let flop_bucket_aa = b[0][1]; // player 0 = AA
+        let b = all.precompute_buckets(&deal);
+        let flop_bucket_aa = b[0][1];
         let turn_bucket_aa = b[0][2];
-
-        // Compute raw equities/deltas for verification
-        let hole = deal.hole_cards[0];
-        let flop_eq = crate::showdown_equity::compute_equity(hole, &deal.board[..3]);
-        let turn_eq = crate::showdown_equity::compute_equity(hole, &deal.board[..4]);
-        let river_eq = crate::showdown_equity::compute_equity(hole, &deal.board[..5]);
-
-        // AA on dry board should have very high equity throughout
-        assert!(flop_eq > 0.85, "AA flop equity should be >0.85, got {flop_eq}");
-        assert!(turn_eq > 0.85, "AA turn equity should be >0.85, got {turn_eq}");
-        assert!(river_eq > 0.85, "AA river equity should be >0.85, got {river_eq}");
-
-        // Delta should be small (near zero) — hand doesn't change much
-        let flop_delta = turn_eq - flop_eq;
-        let turn_delta = river_eq - turn_eq;
-        assert!(
-            flop_delta.abs() < 0.10,
-            "AA dry board flop→turn delta should be near zero, got {flop_delta}"
-        );
-        assert!(
-            turn_delta.abs() < 0.10,
-            "AA dry board turn→river delta should be near zero, got {turn_delta}"
-        );
 
         // Buckets should be valid
         assert!(flop_bucket_aa < 400, "flop bucket in range");
         assert!(turn_bucket_aa < 100, "turn bucket in range");
     }
 
-    /// AA on a wet connected board — vulnerable to straights/flushes.
-    /// Turn/river complete draws → equity drops → negative delta.
-    #[test]
-    fn delta_aa_wet_board_negative() {
-        let buckets = equity_delta_buckets();
-        let deal = Deal {
-            hole_cards: [
-                [c(Value::Ace, Suit::Spade), c(Value::Ace, Suit::Heart)],
-                [c(Value::Nine, Suit::Spade), c(Value::Eight, Suit::Spade)],
-            ],
-            // JTs board with two spades — straight and flush draws present
-            board: [
-                c(Value::Jack, Suit::Spade),
-                c(Value::Ten, Suit::Diamond),
-                c(Value::Nine, Suit::Heart),
-                c(Value::Seven, Suit::Spade), // turn completes straight for 98
-                c(Value::Two, Suit::Club),
-            ],
-        };
+    // The remaining delta-specific tests (delta_aa_wet_board_negative,
+    // delta_flush_draw_positive, delta_combo_draw_very_positive,
+    // delta_same_equity_different_buckets, equity_only_cannot_differentiate_deltas,
+    // expected_delta_deterministic_across_runouts, actual_delta_varies_with_runout,
+    // expected_delta_flush_draw_positive_bucket) have been removed because
+    // AllBuckets no longer manages delta bins at runtime — the clustering
+    // pipeline now handles all delta-aware bucketing during offline generation.
 
-        let b = buckets.precompute_buckets(&deal);
-
-        let hole_aa = deal.hole_cards[0];
-        let flop_eq = crate::showdown_equity::compute_equity(hole_aa, &deal.board[..3]);
-        let turn_eq = crate::showdown_equity::compute_equity(hole_aa, &deal.board[..4]);
-
-        let flop_delta = turn_eq - flop_eq;
-
-        // AA had high flop equity but the 7s completes opponent's straight
-        assert!(flop_eq > 0.60, "AA wet flop equity should be decent, got {flop_eq}");
-        assert!(
-            flop_delta < -0.05,
-            "AA should have negative delta when draws complete, got {flop_delta}"
-        );
-
-        // Verify AA and 98 get different flop buckets (different delta profiles)
-        let flop_bucket_aa = b[0][1];
-        let flop_bucket_98 = b[1][1];
-        assert_ne!(
-            flop_bucket_aa, flop_bucket_98,
-            "AA and 98s should bucket differently on this board"
-        );
-    }
-
-    /// Flush draw on flop that completes on turn → large positive delta.
-    #[test]
-    fn delta_flush_draw_positive() {
-        let buckets = equity_delta_buckets();
-        let deal = Deal {
-            hole_cards: [
-                // Player 0: flush draw (two hearts)
-                [c(Value::King, Suit::Heart), c(Value::Queen, Suit::Heart)],
-                // Player 1: made hand (top pair)
-                [c(Value::Ace, Suit::Spade), c(Value::Ten, Suit::Club)],
-            ],
-            // Two hearts on flop, heart on turn completes the flush
-            board: [
-                c(Value::Ten, Suit::Heart),
-                c(Value::Five, Suit::Heart),
-                c(Value::Two, Suit::Spade),
-                c(Value::Three, Suit::Heart), // turn: flush completes!
-                c(Value::Eight, Suit::Diamond),
-            ],
-        };
-
-        let b = buckets.precompute_buckets(&deal);
-
-        let hole_fd = deal.hole_cards[0]; // flush draw
-        let flop_eq = crate::showdown_equity::compute_equity(hole_fd, &deal.board[..3]);
-        let turn_eq = crate::showdown_equity::compute_equity(hole_fd, &deal.board[..4]);
-
-        let flop_delta = turn_eq - flop_eq;
-
-        // On flop, KQhh has modest equity (just a draw vs made pair)
-        assert!(flop_eq < 0.50, "Flush draw flop equity should be < 0.50, got {flop_eq}");
-        // On turn, flush is made → equity jumps
-        assert!(turn_eq > 0.85, "Made flush turn equity should be > 0.85, got {turn_eq}");
-        // Delta should be strongly positive
-        assert!(
-            flop_delta > 0.30,
-            "Flush completing should give delta > 0.30, got {flop_delta}"
-        );
-
-        // Flush draw should be in a different bucket than the made hand
-        let flop_bucket_fd = b[0][1];
-        let flop_bucket_tp = b[1][1];
-        assert_ne!(
-            flop_bucket_fd, flop_bucket_tp,
-            "Flush draw and top pair should bucket differently"
-        );
-    }
-
-    /// Combo draw (flush + straight draw) that completes → very large positive delta.
-    #[test]
-    fn delta_combo_draw_very_positive() {
-        let buckets = equity_delta_buckets();
-        let deal = Deal {
-            hole_cards: [
-                // Player 0: combo draw — flush draw + open-ended straight draw
-                [c(Value::Jack, Suit::Heart), c(Value::Ten, Suit::Heart)],
-                // Player 1: top pair
-                [c(Value::Ace, Suit::Spade), c(Value::Nine, Suit::Club)],
-            ],
-            board: [
-                c(Value::Nine, Suit::Heart),
-                c(Value::Eight, Suit::Heart),
-                c(Value::Three, Suit::Spade),
-                c(Value::Seven, Suit::Heart), // turn: flush AND straight complete!
-                c(Value::Two, Suit::Diamond),
-            ],
-        };
-
-        let b = buckets.precompute_buckets(&deal);
-
-        let hole_cd = deal.hole_cards[0]; // combo draw
-        let flop_eq = crate::showdown_equity::compute_equity(hole_cd, &deal.board[..3]);
-        let turn_eq = crate::showdown_equity::compute_equity(hole_cd, &deal.board[..4]);
-
-        let flop_delta = turn_eq - flop_eq;
-
-        // Combo draw on flop: some equity from pair outs + draw equity
-        // but static equity is low (hasn't made the hand)
-        assert!(flop_eq < 0.55, "Combo draw flop equity should be modest, got {flop_eq}");
-        // Turn completes both draws → near-nut hand
-        assert!(turn_eq > 0.90, "Made straight flush turn equity should be > 0.90, got {turn_eq}");
-        // Delta should be very large
-        assert!(
-            flop_delta > 0.40,
-            "Combo draw completing should give delta > 0.40, got {flop_delta}"
-        );
-
-        // Combo draw and top pair should land in different buckets
-        assert_ne!(
-            b[0][1], b[1][1],
-            "Combo draw and top pair should bucket differently on flop"
-        );
-    }
-
-    /// Compare bucket differentiation: same equity, different deltas
-    /// should land in different buckets.
-    #[test]
-    fn delta_same_equity_different_buckets() {
-        let buckets = equity_delta_buckets();
-
-        // Deal 1: made hand that stays strong (neutral delta)
-        let deal_stable = Deal {
-            hole_cards: [
-                [c(Value::King, Suit::Spade), c(Value::King, Suit::Heart)],
-                [c(Value::Two, Suit::Club), c(Value::Three, Suit::Diamond)],
-            ],
-            board: [
-                c(Value::Queen, Suit::Diamond),
-                c(Value::Seven, Suit::Club),
-                c(Value::Four, Suit::Heart),
-                c(Value::Nine, Suit::Spade), // safe turn
-                c(Value::Two, Suit::Heart),
-            ],
-        };
-
-        // Deal 2: made hand that gets cracked (negative delta)
-        let deal_cracked = Deal {
-            hole_cards: [
-                [c(Value::King, Suit::Spade), c(Value::King, Suit::Heart)],
-                [c(Value::Two, Suit::Club), c(Value::Three, Suit::Diamond)],
-            ],
-            board: [
-                c(Value::Queen, Suit::Diamond),
-                c(Value::Seven, Suit::Club),
-                c(Value::Four, Suit::Heart),
-                c(Value::Ace, Suit::Spade), // scary turn (Ace)
-                c(Value::Two, Suit::Heart),
-            ],
-        };
-
-        let b_stable = buckets.precompute_buckets(&deal_stable);
-        let b_cracked = buckets.precompute_buckets(&deal_cracked);
-
-        // Both KK on Q74 flop — same flop equity
-        let eq_stable = crate::showdown_equity::compute_equity(
-            deal_stable.hole_cards[0],
-            &deal_stable.board[..3],
-        );
-        let eq_cracked = crate::showdown_equity::compute_equity(
-            deal_cracked.hole_cards[0],
-            &deal_cracked.board[..3],
-        );
-        assert!(
-            (eq_stable - eq_cracked).abs() < 0.01,
-            "Same hand on same flop should have same equity: {eq_stable} vs {eq_cracked}"
-        );
-
-        // But different turns → different deltas → different flop buckets
-        let turn_eq_stable = crate::showdown_equity::compute_equity(
-            deal_stable.hole_cards[0],
-            &deal_stable.board[..4],
-        );
-        let turn_eq_cracked = crate::showdown_equity::compute_equity(
-            deal_cracked.hole_cards[0],
-            &deal_cracked.board[..4],
-        );
-        let delta_stable = turn_eq_stable - eq_stable;
-        let delta_cracked = turn_eq_cracked - eq_cracked;
-
-        // 9 is safe for KK, Ace reduces KK's equity significantly
-        assert!(
-            delta_stable > delta_cracked,
-            "Safe turn should have better delta than Ace: {delta_stable} vs {delta_cracked}"
-        );
-        assert_ne!(
-            b_stable[0][1], b_cracked[0][1],
-            "Same flop equity but different deltas should produce different buckets \
-             (stable delta={delta_stable:.3}, cracked delta={delta_cracked:.3})"
-        );
-    }
-
-    /// Verify that without delta bins, hands with different trajectories
-    /// but similar equity get the SAME bucket (equity-only can't distinguish).
-    #[test]
-    fn equity_only_cannot_differentiate_deltas() {
-        let eq_only = AllBuckets::equity_only(
-            [169, 400, 100, 1000],
-            [None, None, None, None],
-        );
-
-        // Flush draw on flop that completes
-        let deal_draw = Deal {
-            hole_cards: [
-                [c(Value::King, Suit::Heart), c(Value::Queen, Suit::Heart)],
-                [c(Value::Two, Suit::Club), c(Value::Three, Suit::Diamond)],
-            ],
-            board: [
-                c(Value::Ten, Suit::Heart),
-                c(Value::Five, Suit::Heart),
-                c(Value::Two, Suit::Spade),
-                c(Value::Three, Suit::Heart),
-                c(Value::Eight, Suit::Diamond),
-            ],
-        };
-
-        // Made hand with similar flop equity
-        let deal_made = Deal {
-            hole_cards: [
-                [c(Value::Ten, Suit::Spade), c(Value::Five, Suit::Club)],
-                [c(Value::Two, Suit::Club), c(Value::Three, Suit::Diamond)],
-            ],
-            board: [
-                c(Value::Ten, Suit::Heart),
-                c(Value::Five, Suit::Heart),
-                c(Value::Two, Suit::Spade),
-                c(Value::Three, Suit::Club),
-                c(Value::Eight, Suit::Diamond),
-            ],
-        };
-
-        let eq_draw = crate::showdown_equity::compute_equity(
-            deal_draw.hole_cards[0],
-            &deal_draw.board[..3],
-        );
-        let eq_made = crate::showdown_equity::compute_equity(
-            deal_made.hole_cards[0],
-            &deal_made.board[..3],
-        );
-
-        // If they happen to have similar flop equity, equity-only gives same bucket
-        // (this test documents the limitation)
-        if (eq_draw - eq_made).abs() < 0.03 {
-            let b_draw = eq_only.precompute_buckets(&deal_draw);
-            let b_made = eq_only.precompute_buckets(&deal_made);
-            assert_eq!(
-                b_draw[0][1], b_made[0][1],
-                "Equity-only should give same bucket for similar equity \
-                 regardless of delta (eq_draw={eq_draw:.3}, eq_made={eq_made:.3})"
-            );
-        }
-    }
-
-    // ── Expected delta tests ─────────────────────────────────────────
-
-    /// Helper: build AllBuckets with expected_delta enabled.
-    fn expected_delta_buckets() -> AllBuckets {
-        use crate::blueprint_v2::config::StreetClusterConfig;
-
-        let flop_cfg = StreetClusterConfig {
-            buckets: 400,
-            delta_bins: Some(vec![
-                -0.2, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.55, 0.75,
-            ]),
-            expected_delta: true,
-            sample_boards: None,
-        };
-        let turn_cfg = StreetClusterConfig {
-            buckets: 100,
-            delta_bins: Some(vec![-0.2, -0.05, 0.05, 0.15, 0.25, 0.40]),
-            expected_delta: true,
-            sample_boards: None,
-        };
-        let preflop_cfg = StreetClusterConfig { buckets: 169, delta_bins: None, expected_delta: false, sample_boards: None };
-        let river_cfg = StreetClusterConfig { buckets: 1000, delta_bins: None, expected_delta: false, sample_boards: None };
-
-        AllBuckets::new(
-            [169, 400, 100, 1000],
-            [None, None, None, None],
-            [&preflop_cfg, &flop_cfg, &turn_cfg, &river_cfg],
-        )
-    }
-
-    /// With expected_delta, the same hand+flop always gets the same flop bucket
-    /// regardless of what turn card actually falls.
-    #[test]
-    fn expected_delta_deterministic_across_runouts() {
-        let buckets = expected_delta_buckets();
-        let hole = [c(Value::King, Suit::Heart), c(Value::Queen, Suit::Heart)];
-        let flop = [
-            c(Value::Ten, Suit::Heart),
-            c(Value::Five, Suit::Heart),
-            c(Value::Two, Suit::Spade),
-        ];
-
-        // Two different runouts for the same hand+flop
-        let deal_flush = Deal {
-            hole_cards: [hole, [c(Value::Three, Suit::Club), c(Value::Four, Suit::Diamond)]],
-            board: [flop[0], flop[1], flop[2], c(Value::Three, Suit::Heart), c(Value::Eight, Suit::Diamond)],
-        };
-        let deal_brick = Deal {
-            hole_cards: [hole, [c(Value::Three, Suit::Club), c(Value::Four, Suit::Diamond)]],
-            board: [flop[0], flop[1], flop[2], c(Value::King, Suit::Club), c(Value::Eight, Suit::Diamond)],
-        };
-
-        let b_flush = buckets.precompute_buckets(&deal_flush);
-        let b_brick = buckets.precompute_buckets(&deal_brick);
-
-        // Flop bucket should be identical — expected delta doesn't depend on the actual turn
-        assert_eq!(
-            b_flush[0][1], b_brick[0][1],
-            "Expected delta: same hand+flop should give same flop bucket \
-             regardless of turn card"
-        );
-    }
-
-    /// With actual-runout delta (expected_delta=false), different turn cards
-    /// give different flop buckets for the same hand+flop.
-    #[test]
-    fn actual_delta_varies_with_runout() {
-        let buckets = equity_delta_buckets(); // expected_delta: false
-        // Flush draw: Ah9h on a flop with TWO hearts (so turn heart = flush)
-        let hole = [c(Value::Ace, Suit::Heart), c(Value::Nine, Suit::Heart)];
-        let flop = [
-            c(Value::King, Suit::Heart),
-            c(Value::Seven, Suit::Heart),
-            c(Value::Two, Suit::Diamond),
-        ];
-
-        // Flush completes on turn (5th heart)
-        let deal_flush = Deal {
-            hole_cards: [hole, [c(Value::Three, Suit::Club), c(Value::Four, Suit::Club)]],
-            board: [flop[0], flop[1], flop[2], c(Value::Six, Suit::Heart), c(Value::Eight, Suit::Spade)],
-        };
-        // Complete brick — off-suit, no help
-        let deal_brick = Deal {
-            hole_cards: [hole, [c(Value::Three, Suit::Club), c(Value::Four, Suit::Club)]],
-            board: [flop[0], flop[1], flop[2], c(Value::Five, Suit::Spade), c(Value::Eight, Suit::Spade)],
-        };
-
-        let hole_fd = deal_flush.hole_cards[0];
-        let flop_eq = crate::showdown_equity::compute_equity(hole_fd, &flop);
-        let turn_eq_flush = crate::showdown_equity::compute_equity(hole_fd, &deal_flush.board[..4]);
-        let turn_eq_brick = crate::showdown_equity::compute_equity(hole_fd, &deal_brick.board[..4]);
-        let delta_flush = turn_eq_flush - flop_eq;
-        let delta_brick = turn_eq_brick - flop_eq;
-
-        // Sanity: flush completing should give much larger delta than a brick
-        assert!(
-            delta_flush > delta_brick + 0.20,
-            "Flush delta ({delta_flush:.3}) should be much larger than brick delta ({delta_brick:.3})"
-        );
-
-        let b_flush = buckets.precompute_buckets(&deal_flush);
-        let b_brick = buckets.precompute_buckets(&deal_brick);
-
-        // With actual-runout delta, these should differ (flush completing vs brick)
-        assert_ne!(
-            b_flush[0][1], b_brick[0][1],
-            "Actual-runout delta should give different flop buckets for \
-             flush-completing (delta={delta_flush:.3}) vs brick (delta={delta_brick:.3})"
-        );
-    }
-
-    /// Expected delta: flush draw should still get a positive delta bucket
-    /// (averaged across all possible turns, flush draws improve more than they decline).
-    #[test]
-    fn expected_delta_flush_draw_positive_bucket() {
-        let buckets = expected_delta_buckets();
-        let deal = Deal {
-            hole_cards: [
-                [c(Value::King, Suit::Heart), c(Value::Queen, Suit::Heart)],
-                [c(Value::Ace, Suit::Spade), c(Value::Ten, Suit::Club)],
-            ],
-            board: [
-                c(Value::Ten, Suit::Heart),
-                c(Value::Five, Suit::Heart),
-                c(Value::Two, Suit::Spade),
-                c(Value::Three, Suit::Heart),
-                c(Value::Eight, Suit::Diamond),
-            ],
-        };
-
-        let hole_fd = deal.hole_cards[0];
-        let flop_eq = crate::showdown_equity::compute_equity(hole_fd, &deal.board[..3]);
-        let exp_next = expected_next_equity(hole_fd, &deal.board[..3]);
-        let exp_delta = exp_next - flop_eq;
-
-        // Flush draw has ~9 outs of ~47 cards that improve equity significantly
-        // Expected delta should be positive
-        assert!(
-            exp_delta > 0.0,
-            "Flush draw expected delta should be positive, got {exp_delta:.4}"
-        );
-
-        // Verify bucket reflects this — should differ from a stable made hand
-        let b = buckets.precompute_buckets(&deal);
-        let deal_stable = Deal {
-            hole_cards: [
-                [c(Value::Ace, Suit::Spade), c(Value::Ace, Suit::Heart)],
-                [c(Value::Seven, Suit::Club), c(Value::Three, Suit::Diamond)],
-            ],
-            board: [
-                c(Value::King, Suit::Diamond),
-                c(Value::Eight, Suit::Club),
-                c(Value::Two, Suit::Diamond),
-                c(Value::Nine, Suit::Spade),
-                c(Value::Four, Suit::Heart),
-            ],
-        };
-        let b_stable = buckets.precompute_buckets(&deal_stable);
-        // Different delta profiles → different buckets
-        assert_ne!(
-            b[0][1], b_stable[0][1],
-            "Flush draw and stable AA should get different flop buckets"
-        );
-    }
+    // (Delta bucketing tests removed — see comment above)
 
     #[test]
     fn get_bucket_equity_fallback() {
@@ -1441,5 +840,217 @@ mod tests {
         );
         // Should return a valid bucket index in [0, 10).
         assert!(bucket < 10, "bucket should be < 10, got {bucket}");
+    }
+
+    // ── Bucket file lookup tests ─────────────────────────────────────
+
+    /// Build a minimal BucketFile with known boards and bucket assignments
+    /// for testing lookup_bucket.
+    fn make_test_bucket_file(
+        street: Street,
+        board_cards: &[Vec<Card>],
+        bucket_count: u16,
+    ) -> BucketFile {
+        use crate::blueprint_v2::bucket_file::{BucketFileHeader, PackedBoard};
+        use crate::blueprint_v2::cluster_pipeline::canonical_key;
+
+        let boards: Vec<PackedBoard> = board_cards
+            .iter()
+            .map(|b| {
+                use crate::abstraction::isomorphism::CanonicalBoard;
+                let canonical = CanonicalBoard::from_cards(b).unwrap();
+                canonical_key(&canonical.cards)
+            })
+            .collect();
+
+        let combos_per_board = 1326_u16;
+        let total = boards.len() * combos_per_board as usize;
+        // Assign deterministic buckets: bucket = (board_idx * 100 + combo_idx) % bucket_count
+        let mut buckets = Vec::with_capacity(total);
+        for board_idx in 0..boards.len() {
+            for combo_idx in 0..combos_per_board as usize {
+                buckets.push(((board_idx * 100 + combo_idx) % bucket_count as usize) as u16);
+            }
+        }
+
+        BucketFile {
+            header: BucketFileHeader {
+                street,
+                bucket_count,
+                board_count: boards.len() as u32,
+                combos_per_board,
+                version: 2,
+            },
+            boards,
+            buckets,
+        }
+    }
+
+    #[test]
+    fn lookup_bucket_returns_bucket_from_file() {
+        use crate::blueprint_v2::cluster_pipeline::{canonical_key, combo_index};
+        use crate::abstraction::isomorphism::CanonicalBoard;
+
+        let flop_cards = vec![
+            c(Value::Ace, Suit::Spade),
+            c(Value::King, Suit::Heart),
+            c(Value::Two, Suit::Diamond),
+        ];
+        let bf = make_test_bucket_file(Street::Flop, &[flop_cards.clone()], 50);
+
+        let all = AllBuckets::new(
+            [169, 50, 10, 10],
+            [None, Some(bf), None, None],
+        );
+
+        let hole = [c(Value::Queen, Suit::Spade), c(Value::Jack, Suit::Club)];
+        let bucket = all.lookup_bucket(1, hole, &flop_cards);
+
+        // Verify the bucket matches what the file would return:
+        let canonical = CanonicalBoard::from_cards(&flop_cards).unwrap();
+        let packed = canonical_key(&canonical.cards);
+        let board_map = all.board_maps[1].as_ref().unwrap();
+        let board_idx = board_map[&packed];
+        let (c0, c1) = canonical.canonicalize_holding(hole[0], hole[1]);
+        let ci = combo_index(c0, c1);
+        let expected = all.bucket_files[1].as_ref().unwrap().get_bucket(board_idx, ci);
+
+        assert_eq!(bucket, expected, "lookup_bucket should return the bucket file value");
+    }
+
+    #[test]
+    fn lookup_bucket_falls_back_to_equity_without_file() {
+        let all = AllBuckets::new(
+            [169, 10, 10, 10],
+            [None, None, None, None],
+        );
+
+        let flop = [
+            c(Value::Ace, Suit::Spade),
+            c(Value::King, Suit::Heart),
+            c(Value::Two, Suit::Diamond),
+        ];
+        let hole = [c(Value::Queen, Suit::Spade), c(Value::Jack, Suit::Club)];
+
+        let bucket = all.lookup_bucket(1, hole, &flop);
+        // Should fall back to equity-based bucketing: valid in [0, 10)
+        assert!(bucket < 10, "equity fallback bucket should be < 10, got {bucket}");
+
+        // Cross-check with manual equity computation
+        let equity = crate::showdown_equity::compute_equity(hole, &flop);
+        let expected = ((equity * 10.0) as u16).min(9);
+        assert_eq!(bucket, expected, "should match equity-based bucketing");
+    }
+
+    #[test]
+    fn precompute_buckets_uses_bucket_file() {
+        let flop_cards = vec![
+            c(Value::Two, Suit::Club),
+            c(Value::Three, Suit::Diamond),
+            c(Value::Four, Suit::Club),
+        ];
+        let turn_cards = vec![
+            c(Value::Two, Suit::Club),
+            c(Value::Three, Suit::Diamond),
+            c(Value::Four, Suit::Club),
+            c(Value::Five, Suit::Diamond),
+        ];
+        let river_cards = vec![
+            c(Value::Two, Suit::Club),
+            c(Value::Three, Suit::Diamond),
+            c(Value::Four, Suit::Club),
+            c(Value::Five, Suit::Diamond),
+            c(Value::Six, Suit::Heart),
+        ];
+
+        let flop_bf = make_test_bucket_file(Street::Flop, &[flop_cards], 50);
+        let turn_bf = make_test_bucket_file(Street::Turn, &[turn_cards], 30);
+        let river_bf = make_test_bucket_file(Street::River, &[river_cards], 20);
+
+        let all = AllBuckets::new(
+            [169, 50, 30, 20],
+            [None, Some(flop_bf), Some(turn_bf), Some(river_bf)],
+        );
+
+        let deal = make_deal();
+        let result = all.precompute_buckets(&deal);
+
+        // Preflop should be canonical hand index
+        for player in 0..2 {
+            let hand = crate::hands::CanonicalHand::from_cards(
+                deal.hole_cards[player][0],
+                deal.hole_cards[player][1],
+            );
+            let expected_preflop = (hand.index() as u16).min(168);
+            assert_eq!(result[player][0], expected_preflop, "preflop bucket for player {player}");
+        }
+
+        // Postflop buckets should be valid
+        for player in 0..2 {
+            assert!(result[player][1] < 50, "flop bucket valid for player {player}");
+            assert!(result[player][2] < 30, "turn bucket valid for player {player}");
+            assert!(result[player][3] < 20, "river bucket valid for player {player}");
+        }
+    }
+
+    #[test]
+    fn get_bucket_uses_bucket_file_for_postflop() {
+        let flop_cards = vec![
+            c(Value::Ace, Suit::Spade),
+            c(Value::King, Suit::Heart),
+            c(Value::Two, Suit::Diamond),
+        ];
+        let bf = make_test_bucket_file(Street::Flop, &[flop_cards.clone()], 50);
+
+        let all = AllBuckets::new(
+            [169, 50, 10, 10],
+            [None, Some(bf), None, None],
+        );
+
+        let hole = [c(Value::Queen, Suit::Spade), c(Value::Jack, Suit::Club)];
+        let bucket_via_get = all.get_bucket(Street::Flop, hole, &flop_cards);
+        let bucket_via_lookup = all.lookup_bucket(1, hole, &flop_cards);
+
+        assert_eq!(bucket_via_get, bucket_via_lookup,
+            "get_bucket and lookup_bucket should agree for flop");
+    }
+
+    #[test]
+    fn get_bucket_preflop_returns_canonical_hand_index() {
+        let all = AllBuckets::new(
+            [169, 10, 10, 10],
+            [None, None, None, None],
+        );
+
+        let hole = [c(Value::Ace, Suit::Spade), c(Value::King, Suit::Spade)];
+        let bucket = all.get_bucket(Street::Preflop, hole, &[]);
+
+        let hand = crate::hands::CanonicalHand::from_cards(hole[0], hole[1]);
+        let expected = (hand.index() as u16).min(168);
+        assert_eq!(bucket, expected);
+    }
+
+    #[test]
+    fn new_allbuckets_builds_board_maps() {
+        let flop_cards = vec![
+            c(Value::Ace, Suit::Spade),
+            c(Value::King, Suit::Heart),
+            c(Value::Two, Suit::Diamond),
+        ];
+        let bf = make_test_bucket_file(Street::Flop, &[flop_cards], 50);
+
+        let all = AllBuckets::new(
+            [169, 50, 10, 10],
+            [None, Some(bf), None, None],
+        );
+
+        // Preflop has no bucket file -> no board map
+        assert!(all.board_maps[0].is_none());
+        // Flop has a bucket file with boards -> has board map
+        assert!(all.board_maps[1].is_some());
+        assert_eq!(all.board_maps[1].as_ref().unwrap().len(), 1);
+        // Turn/River have no bucket files -> no board maps
+        assert!(all.board_maps[2].is_none());
+        assert!(all.board_maps[3].is_none());
     }
 }
