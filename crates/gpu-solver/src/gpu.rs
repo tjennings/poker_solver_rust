@@ -1551,6 +1551,8 @@ pub enum GpuError {
     Driver(#[from] cudarc::driver::DriverError),
     #[error("NVRTC compilation error: {0}")]
     Compile(#[from] cudarc::nvrtc::CompileError),
+    #[error("cuBLAS error: {0}")]
+    CuBlas(#[from] cudarc::cublas::result::CublasError),
 }
 
 #[cfg(test)]

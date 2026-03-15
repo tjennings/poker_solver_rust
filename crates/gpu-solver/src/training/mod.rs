@@ -18,6 +18,8 @@ pub mod pipeline;
 #[cfg(feature = "training")]
 pub mod leaf_eval;
 #[cfg(feature = "training")]
+pub mod cuda_net;
+#[cfg(feature = "training")]
 pub mod turn_solver;
 #[cfg(feature = "training")]
 pub mod turn_pipeline;

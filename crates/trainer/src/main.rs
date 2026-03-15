@@ -987,7 +987,7 @@ fn run_gpu_train_turn(
     ref_stack: i32,
 ) -> Result<(), Box<dyn Error>> {
     use burn::backend::{Autodiff, NdArray};
-    use poker_solver_gpu::training::turn_pipeline::{train_turn_cfvnet, TurnTrainingConfig};
+    use poker_solver_gpu::training::turn_pipeline::{train_turn_cfvnet_cuda, TurnTrainingConfig};
 
     type B = Autodiff<NdArray>;
 
@@ -1017,7 +1017,7 @@ fn run_gpu_train_turn(
     };
 
     let device = Default::default();
-    train_turn_cfvnet::<B>(&config, &device)?;
+    train_turn_cfvnet_cuda::<B>(&config, &device)?;
     Ok(())
 }
 
