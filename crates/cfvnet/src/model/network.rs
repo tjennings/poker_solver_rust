@@ -25,14 +25,14 @@ pub const POT_INDEX: usize = NUM_COMBOS + NUM_COMBOS + DECK_SIZE + NUM_RANKS; //
 
 /// A single hidden block: Linear -> BatchNorm -> PReLU.
 #[derive(Module, Debug)]
-struct HiddenBlock<B: Backend> {
-    linear: Linear<B>,
-    norm: BatchNorm<B, 1>,
-    activation: PRelu<B>,
+pub struct HiddenBlock<B: Backend> {
+    pub linear: Linear<B>,
+    pub norm: BatchNorm<B, 1>,
+    pub activation: PRelu<B>,
 }
 
 impl<B: Backend> HiddenBlock<B> {
-    fn new(device: &B::Device, in_features: usize, out_features: usize) -> Self {
+    pub fn new(device: &B::Device, in_features: usize, out_features: usize) -> Self {
         Self {
             linear: LinearConfig::new(in_features, out_features).init(device),
             norm: BatchNormConfig::new(out_features).init(device),
@@ -42,7 +42,7 @@ impl<B: Backend> HiddenBlock<B> {
         }
     }
 
-    fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
         let x = self.linear.forward(x);
         // BatchNorm<B, 1> expects [batch, channels, length]; reshape 2D -> 3D -> 2D.
         let [batch, features] = x.dims();
@@ -58,8 +58,8 @@ impl<B: Backend> HiddenBlock<B> {
 /// Architecture: `Input(in_size) -> [Linear -> BatchNorm -> PReLU] x N -> Linear(1326)`
 #[derive(Module, Debug)]
 pub struct CfvNet<B: Backend> {
-    hidden: Vec<HiddenBlock<B>>,
-    output: Linear<B>,
+    pub hidden: Vec<HiddenBlock<B>>,
+    pub output: Linear<B>,
 }
 
 impl<B: Backend> CfvNet<B> {

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/tauri-app", "crates/trainer", "crates/test-macros", "crates/devserver", "crates/range-solver", "crates/cfvnet"]
+members = ["crates/core", "crates/tauri-app", "crates/trainer", "crates/test-macros", "crates/devserver", "crates/range-solver", "crates/cfvnet", "crates/gpu-solver"]
 exclude = ["crates/range-solver-compare"]
 
 [workspace.package]
