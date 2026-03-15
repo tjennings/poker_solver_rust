@@ -108,9 +108,26 @@ pub struct GpuSolver<'a> {
     gpu_hand_strengths_oop: CudaSlice<u32>,
     gpu_hand_strengths_ip: CudaSlice<u32>,
 
-    // Card blocking matrices
+    // Card blocking matrices — no longer used in the solve loop (replaced by
+    // hand_cards-based blocking), but kept for backward-compatible kernel tests.
+    #[allow(dead_code)]
     gpu_valid_matchups_oop: CudaSlice<f32>,
+    #[allow(dead_code)]
     gpu_valid_matchups_ip: CudaSlice<f32>,
+
+    // Hand card arrays for O(n) fold eval and shared-memory showdown eval
+    // Each is [num_hands * 2] containing (c1, c2) per hand as u32
+    gpu_hand_cards_oop: CudaSlice<u32>,
+    gpu_hand_cards_ip: CudaSlice<u32>,
+
+    // Same-hand index for inclusion-exclusion correction
+    // For each player's hand, the opponent's hand index holding same cards (or u32::MAX)
+    gpu_same_hand_index_oop: CudaSlice<u32>,
+    gpu_same_hand_index_ip: CudaSlice<u32>,
+
+    // Working buffers for O(n) fold aggregates (reused each iteration)
+    gpu_fold_total_opp_reach: CudaSlice<f32>,
+    gpu_fold_per_card_reach: CudaSlice<f32>,
 
     // Decision node lists per player
     decision_nodes_oop: CudaSlice<u32>,
@@ -297,6 +314,30 @@ impl<'a> GpuSolver<'a> {
         let gpu_valid_matchups_oop = gpu.upload(&tree.valid_matchups_oop)?;
         let gpu_valid_matchups_ip = gpu.upload(&tree.valid_matchups_ip)?;
 
+        // Upload hand card arrays for O(n) fold eval and shared-memory showdown.
+        // Layout: [num_hands * 2] as flat u32 array of (c1, c2) pairs.
+        let mut hand_cards_oop_flat = vec![255u32; num_hands as usize * 2];
+        for (i, &(c1, c2)) in tree.cards_oop.iter().enumerate() {
+            hand_cards_oop_flat[i * 2] = c1 as u32;
+            hand_cards_oop_flat[i * 2 + 1] = c2 as u32;
+        }
+        let mut hand_cards_ip_flat = vec![255u32; num_hands as usize * 2];
+        for (i, &(c1, c2)) in tree.cards_ip.iter().enumerate() {
+            hand_cards_ip_flat[i * 2] = c1 as u32;
+            hand_cards_ip_flat[i * 2 + 1] = c2 as u32;
+        }
+        let gpu_hand_cards_oop = gpu.upload(&hand_cards_oop_flat)?;
+        let gpu_hand_cards_ip = gpu.upload(&hand_cards_ip_flat)?;
+
+        // Upload same-hand index arrays
+        let gpu_same_hand_index_oop = gpu.upload(&tree.same_hand_index_oop)?;
+        let gpu_same_hand_index_ip = gpu.upload(&tree.same_hand_index_ip)?;
+
+        // Allocate working buffers for fold aggregates
+        let fold_agg_size = fold_ordinal.max(1);
+        let gpu_fold_total_opp_reach = gpu.alloc_zeros::<f32>(fold_agg_size)?;
+        let gpu_fold_per_card_reach = gpu.alloc_zeros::<f32>(fold_agg_size * 52)?;
+
         // Build decision node lists per player
         let mut oop_decisions = Vec::new();
         let mut ip_decisions = Vec::new();
@@ -349,6 +390,12 @@ impl<'a> GpuSolver<'a> {
             gpu_hand_strengths_ip,
             gpu_valid_matchups_oop,
             gpu_valid_matchups_ip,
+            gpu_hand_cards_oop,
+            gpu_hand_cards_ip,
+            gpu_same_hand_index_oop,
+            gpu_same_hand_index_ip,
+            gpu_fold_total_opp_reach,
+            gpu_fold_per_card_reach,
             decision_nodes_oop,
             decision_nodes_ip,
             num_oop_decisions,
@@ -439,33 +486,61 @@ impl<'a> GpuSolver<'a> {
                 let cfv_size = (self.num_nodes * self.num_hands) as u32;
                 self.gpu.launch_zero_buffer(&mut self.cfvalues, cfv_size)?;
 
-                // 4b. Terminal fold eval
+                // 4b. Terminal fold eval — O(n) via inclusion-exclusion
                 if self.num_fold_terminals > 0 {
                     let opp_reach = if traverser == 0 {
                         &self.reach_ip
                     } else {
                         &self.reach_oop
                     };
-                    let valid_matchups = if traverser == 0 {
-                        &self.gpu_valid_matchups_oop
+                    // Opponent's hand cards (for aggregate computation)
+                    let opp_hand_cards = if traverser == 0 {
+                        &self.gpu_hand_cards_ip
                     } else {
-                        &self.gpu_valid_matchups_ip
+                        &self.gpu_hand_cards_oop
                     };
-                    self.gpu.launch_terminal_fold_eval(
+                    // Traverser's hand cards (for blocking lookup)
+                    let trav_hand_cards = if traverser == 0 {
+                        &self.gpu_hand_cards_oop
+                    } else {
+                        &self.gpu_hand_cards_ip
+                    };
+                    let same_hand_index = if traverser == 0 {
+                        &self.gpu_same_hand_index_oop
+                    } else {
+                        &self.gpu_same_hand_index_ip
+                    };
+
+                    // Phase A: precompute per-card reach aggregates
+                    self.gpu.launch_precompute_fold_aggregates(
+                        opp_reach,
+                        &self.fold_terminal_nodes,
+                        opp_hand_cards,
+                        &mut self.gpu_fold_total_opp_reach,
+                        &mut self.gpu_fold_per_card_reach,
+                        self.num_fold_terminals,
+                        self.num_hands,
+                    )?;
+
+                    // Phase B: O(1) per-hand CFV using aggregates
+                    self.gpu.launch_fold_eval_from_aggregates(
                         &mut self.cfvalues,
                         opp_reach,
                         &self.fold_terminal_nodes,
                         &self.fold_amount_win,
                         &self.fold_amount_lose,
                         &self.fold_player,
-                        valid_matchups,
+                        &self.gpu_fold_total_opp_reach,
+                        &self.gpu_fold_per_card_reach,
+                        trav_hand_cards,
+                        same_hand_index,
                         traverser,
                         self.num_fold_terminals,
                         self.num_hands,
                     )?;
                 }
 
-                // 4c. Terminal showdown eval
+                // 4c. Terminal showdown eval — shared memory optimization
                 if self.num_showdown_terminals > 0 {
                     let opp_reach = if traverser == 0 {
                         &self.reach_ip
@@ -477,12 +552,17 @@ impl<'a> GpuSolver<'a> {
                     } else {
                         (&self.gpu_hand_strengths_ip, &self.gpu_hand_strengths_oop)
                     };
-                    let valid_matchups = if traverser == 0 {
-                        &self.gpu_valid_matchups_oop
+                    let trav_hand_cards = if traverser == 0 {
+                        &self.gpu_hand_cards_oop
                     } else {
-                        &self.gpu_valid_matchups_ip
+                        &self.gpu_hand_cards_ip
                     };
-                    self.gpu.launch_terminal_showdown_eval(
+                    let opp_hand_cards = if traverser == 0 {
+                        &self.gpu_hand_cards_ip
+                    } else {
+                        &self.gpu_hand_cards_oop
+                    };
+                    self.gpu.launch_terminal_showdown_eval_shm(
                         &mut self.cfvalues,
                         opp_reach,
                         &self.showdown_terminal_nodes,
@@ -490,7 +570,8 @@ impl<'a> GpuSolver<'a> {
                         &self.showdown_amount_lose,
                         traverser_strengths,
                         opponent_strengths,
-                        valid_matchups,
+                        trav_hand_cards,
+                        opp_hand_cards,
                         self.num_showdown_terminals,
                         self.num_hands,
                     )?;
@@ -622,33 +703,57 @@ impl<'a> GpuSolver<'a> {
             let cfv_size = (self.num_nodes * self.num_hands) as u32;
             self.gpu.launch_zero_buffer(&mut self.cfvalues, cfv_size)?;
 
-            // 4b. Terminal fold eval
+            // 4b. Terminal fold eval — O(n) via inclusion-exclusion
             if self.num_fold_terminals > 0 {
                 let opp_reach = if traverser == 0 {
                     &self.reach_ip
                 } else {
                     &self.reach_oop
                 };
-                let valid_matchups = if traverser == 0 {
-                    &self.gpu_valid_matchups_oop
+                let opp_hand_cards = if traverser == 0 {
+                    &self.gpu_hand_cards_ip
                 } else {
-                    &self.gpu_valid_matchups_ip
+                    &self.gpu_hand_cards_oop
                 };
-                self.gpu.launch_terminal_fold_eval(
+                let trav_hand_cards = if traverser == 0 {
+                    &self.gpu_hand_cards_oop
+                } else {
+                    &self.gpu_hand_cards_ip
+                };
+                let same_hand_index = if traverser == 0 {
+                    &self.gpu_same_hand_index_oop
+                } else {
+                    &self.gpu_same_hand_index_ip
+                };
+
+                self.gpu.launch_precompute_fold_aggregates(
+                    opp_reach,
+                    &self.fold_terminal_nodes,
+                    opp_hand_cards,
+                    &mut self.gpu_fold_total_opp_reach,
+                    &mut self.gpu_fold_per_card_reach,
+                    self.num_fold_terminals,
+                    self.num_hands,
+                )?;
+
+                self.gpu.launch_fold_eval_from_aggregates(
                     &mut self.cfvalues,
                     opp_reach,
                     &self.fold_terminal_nodes,
                     &self.fold_amount_win,
                     &self.fold_amount_lose,
                     &self.fold_player,
-                    valid_matchups,
+                    &self.gpu_fold_total_opp_reach,
+                    &self.gpu_fold_per_card_reach,
+                    trav_hand_cards,
+                    same_hand_index,
                     traverser,
                     self.num_fold_terminals,
                     self.num_hands,
                 )?;
             }
 
-            // 4c. Terminal showdown eval
+            // 4c. Terminal showdown eval — shared memory optimization
             if self.num_showdown_terminals > 0 {
                 let opp_reach = if traverser == 0 {
                     &self.reach_ip
@@ -660,12 +765,17 @@ impl<'a> GpuSolver<'a> {
                 } else {
                     (&self.gpu_hand_strengths_ip, &self.gpu_hand_strengths_oop)
                 };
-                let valid_matchups = if traverser == 0 {
-                    &self.gpu_valid_matchups_oop
+                let trav_hand_cards = if traverser == 0 {
+                    &self.gpu_hand_cards_oop
                 } else {
-                    &self.gpu_valid_matchups_ip
+                    &self.gpu_hand_cards_ip
                 };
-                self.gpu.launch_terminal_showdown_eval(
+                let opp_hand_cards = if traverser == 0 {
+                    &self.gpu_hand_cards_ip
+                } else {
+                    &self.gpu_hand_cards_oop
+                };
+                self.gpu.launch_terminal_showdown_eval_shm(
                     &mut self.cfvalues,
                     opp_reach,
                     &self.showdown_terminal_nodes,
@@ -673,7 +783,8 @@ impl<'a> GpuSolver<'a> {
                     &self.showdown_amount_lose,
                     traverser_strengths,
                     opponent_strengths,
-                    valid_matchups,
+                    trav_hand_cards,
+                    opp_hand_cards,
                     self.num_showdown_terminals,
                     self.num_hands,
                 )?;
