@@ -562,7 +562,7 @@ impl<'a> GpuSolver<'a> {
                     } else {
                         &self.gpu_hand_cards_oop
                     };
-                    self.gpu.launch_terminal_showdown_eval_shm(
+                    self.gpu.launch_showdown_eval_fast(
                         &mut self.cfvalues,
                         opp_reach,
                         &self.showdown_terminal_nodes,
@@ -570,10 +570,9 @@ impl<'a> GpuSolver<'a> {
                         &self.showdown_amount_lose,
                         traverser_strengths,
                         opponent_strengths,
-                        trav_hand_cards,
-                        opp_hand_cards,
                         self.num_showdown_terminals,
                         self.num_hands,
+                        self.num_hands,  // hands_per_spot = num_hands for single-spot
                     )?;
                 }
 
@@ -775,7 +774,7 @@ impl<'a> GpuSolver<'a> {
                 } else {
                     &self.gpu_hand_cards_oop
                 };
-                self.gpu.launch_terminal_showdown_eval_shm(
+                self.gpu.launch_showdown_eval_fast(
                     &mut self.cfvalues,
                     opp_reach,
                     &self.showdown_terminal_nodes,
@@ -783,10 +782,9 @@ impl<'a> GpuSolver<'a> {
                     &self.showdown_amount_lose,
                     traverser_strengths,
                     opponent_strengths,
-                    trav_hand_cards,
-                    opp_hand_cards,
                     self.num_showdown_terminals,
                     self.num_hands,
+                    self.num_hands,  // hands_per_spot = num_hands for single-spot
                 )?;
             }
 
