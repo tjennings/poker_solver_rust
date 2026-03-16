@@ -256,6 +256,14 @@ impl CfvSubgameSolver {
         }
     }
 
+    /// Override the DCFR parameters used by this solver.
+    ///
+    /// Call before `train()` to switch to a different CFR variant
+    /// (e.g., `DcfrParams::dcfr_plus(100)` for Supremus-style solving).
+    pub fn set_dcfr_params(&mut self, params: DcfrParams) {
+        self.dcfr = params;
+    }
+
     /// Build a frozen strategy snapshot from current regret sums.
     ///
     /// Each `(decision_node, combo)` pair gets regret-matched into a
@@ -584,6 +592,7 @@ impl CfvSubgameSolver {
 
                 // Update regrets and strategy sums at traverser's nodes.
                 if is_traverser {
+                    let sw = self.dcfr.strategy_weight(u64::from(self.iteration));
                     for i in 0..n {
                         let base = node_base + i * num_actions;
                         let node_val = cfv_buf[out_start + i];
@@ -593,7 +602,7 @@ impl CfvSubgameSolver {
                             self.regret_sum[base + a] +=
                                 reach_opponent[i] * (child_val - node_val);
                             self.strategy_sum[base + a] +=
-                                reach_traverser[i] * snapshot[base + a];
+                                sw * reach_traverser[i] * snapshot[base + a];
                         }
                     }
                 }

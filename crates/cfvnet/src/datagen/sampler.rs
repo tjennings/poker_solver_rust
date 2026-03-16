@@ -176,6 +176,8 @@ mod tests {
             threads: 1,
             seed: Some(42),
             leaf_eval_interval: 0,
+            cfr_variant: None,
+            cfr_delay: 100,
         }
     }
 

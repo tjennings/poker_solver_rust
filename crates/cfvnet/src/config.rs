@@ -1,3 +1,4 @@
+use poker_solver_core::cfr::dcfr::{CfrVariant, DcfrParams};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +99,12 @@ pub struct DatagenConfig {
     /// E.g. 1000 means evaluate at iteration 1, 1000, 2000, ... and the final iteration.
     #[serde(default)]
     pub leaf_eval_interval: u32,
+    /// CFR variant for the subgame solver: "dcfr" (default), "dcfrplus", "vanilla", etc.
+    #[serde(default)]
+    pub cfr_variant: Option<CfrVariant>,
+    /// Strategy averaging delay for DcfrPlus variant. Default: 100.
+    #[serde(default = "default_cfr_delay")]
+    pub cfr_delay: u64,
 }
 
 impl Default for DatagenConfig {
@@ -112,8 +119,37 @@ impl Default for DatagenConfig {
             threads: 8,
             seed: Some(42),
             leaf_eval_interval: 0,
+            cfr_variant: None,
+            cfr_delay: default_cfr_delay(),
         }
     }
+}
+
+impl DatagenConfig {
+    /// Build the `DcfrParams` specified by this config.
+    ///
+    /// Returns `DcfrParams::default()` (standard DCFR) unless `cfr_variant` is
+    /// set. For `DcfrPlus`, uses the configured `cfr_delay`.
+    #[must_use]
+    pub fn dcfr_params(&self) -> DcfrParams {
+        match self.cfr_variant {
+            Some(CfrVariant::DcfrPlus) => DcfrParams::dcfr_plus(self.cfr_delay),
+            Some(CfrVariant::Vanilla) => DcfrParams::vanilla(),
+            Some(CfrVariant::Linear) => DcfrParams::linear(),
+            Some(CfrVariant::CfrPlus) => DcfrParams::from_config(
+                CfrVariant::CfrPlus,
+                0.0,
+                0.0,
+                0.0,
+                0,
+            ),
+            Some(CfrVariant::Dcfr) | None => DcfrParams::default(),
+        }
+    }
+}
+
+fn default_cfr_delay() -> u64 {
+    100
 }
 
 fn default_street() -> String {
@@ -421,5 +457,51 @@ datagen:
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.training.shuffle_buffer_size, 262_144);
         assert_eq!(config.training.prefetch_depth, 4);
+    }
+
+    #[test]
+    fn parse_config_with_cfr_variant_dcfrplus() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  cfr_variant: dcfrplus
+  cfr_delay: 200
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.datagen.cfr_variant, Some(CfrVariant::DcfrPlus));
+        assert_eq!(config.datagen.cfr_delay, 200);
+        let dcfr = config.datagen.dcfr_params();
+        assert_eq!(dcfr.variant, CfrVariant::DcfrPlus);
+        assert_eq!(dcfr.delay, 200);
+        assert!((dcfr.alpha - 1.5).abs() < f64::EPSILON);
+        assert!((dcfr.beta - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cfr_variant_defaults_to_dcfr() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.datagen.cfr_variant.is_none());
+        let dcfr = config.datagen.dcfr_params();
+        assert_eq!(dcfr.variant, CfrVariant::Dcfr);
+    }
+
+    #[test]
+    fn dcfr_params_vanilla_from_config() {
+        let config = DatagenConfig {
+            cfr_variant: Some(CfrVariant::Vanilla),
+            ..Default::default()
+        };
+        let dcfr = config.dcfr_params();
+        assert_eq!(dcfr.variant, CfrVariant::Vanilla);
     }
 }

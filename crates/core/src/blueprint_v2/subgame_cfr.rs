@@ -206,6 +206,14 @@ impl SubgameCfrSolver {
         }
     }
 
+    /// Override the DCFR parameters used by this solver.
+    ///
+    /// Call before `train()` to switch to a different CFR variant
+    /// (e.g., `DcfrParams::dcfr_plus(100)` for Supremus-style solving).
+    pub fn set_dcfr_params(&mut self, params: DcfrParams) {
+        self.dcfr = params;
+    }
+
     /// Create a solver with leaf values populated from a [`CbvTable`].
     ///
     /// For each combo, `combo_to_bucket` maps its index to a bucket id, then
@@ -262,8 +270,14 @@ impl SubgameCfrSolver {
                     traverser,
                 };
 
-                let (regret_delta, strategy_delta) = parallel_traverse(&ctx, &combos);
+                let (regret_delta, mut strategy_delta) = parallel_traverse(&ctx, &combos);
                 add_into(&mut self.regret_sum, &regret_delta);
+                let sw = self.dcfr.strategy_weight(u64::from(self.iteration));
+                if (sw - 1.0).abs() > f64::EPSILON {
+                    for v in strategy_delta.iter_mut() {
+                        *v *= sw;
+                    }
+                }
                 add_into(&mut self.strategy_sum, &strategy_delta);
             }
 
