@@ -362,7 +362,159 @@ git commit -am "feat(gpu-solver): add BucketedGpuSolver for river"
 
 ---
 
-### Task A6: River Batch Solver + Training Pipeline
+### Task A6: Sample Generation — Reuse cfvnet Sampler
+
+**Files:**
+- Create: `crates/gpu-solver/src/bucketed/sampler.rs`
+
+Reuse the cfvnet sampler for high-quality situation generation. The cfvnet sampler has extensive work ensuring:
+- **Stratified pot sampling** via configurable `pot_intervals` — uniform coverage across pot sizes
+- **SPR stratification** via `spr_intervals` with rejection sampling — covers all stack-to-pot ratio regimes
+- **R(S,p) ranges** — hand-strength-correlated range generation (DeepStack algorithm), NOT uniform random weights
+- **2D pot×SPR uniformity** — verified by integration tests
+
+This runs on CPU (cheap — <1ms per situation). The sample is then converted to bucket space and uploaded to GPU.
+
+**Step 1: Wrap cfvnet sampler**
+
+```rust
+use cfvnet::datagen::sampler::{sample_situation, Situation};
+use cfvnet::config::DatagenConfig;
+
+pub fn sample_and_bucketize(
+    datagen_config: &DatagenConfig,
+    bucket_file: &BucketFile,
+    num_buckets: usize,
+    initial_stack: i32,
+    board_size: usize,
+    rng: &mut impl Rng,
+) -> BucketedSituation {
+    // 1. Sample situation using cfvnet sampler (board, pot, stack, R(S,p) ranges)
+    let sit = sample_situation(datagen_config, initial_stack, board_size, rng);
+
+    // 2. Find board index in bucket file
+    let board_idx = find_board_index(bucket_file, &sit.board[..board_size]);
+
+    // 3. Map 1326-dim ranges to num_buckets-dim reach
+    let mut oop_reach = vec![0.0f32; num_buckets];
+    let mut ip_reach = vec![0.0f32; num_buckets];
+    for combo in 0..1326 {
+        let bucket = bucket_file.get_bucket(board_idx, combo as u16) as usize;
+        if bucket < num_buckets {
+            oop_reach[bucket] += sit.ranges[0][combo];
+            ip_reach[bucket] += sit.ranges[1][combo];
+        }
+    }
+
+    BucketedSituation {
+        board: sit.board,
+        board_size: sit.board_size,
+        board_idx,
+        pot: sit.pot,
+        effective_stack: sit.effective_stack,
+        oop_reach,
+        ip_reach,
+    }
+}
+```
+
+**Step 2: Configuration**
+
+The YAML config includes cfvnet-style sampling params:
+
+```yaml
+sampling:
+  pot_intervals: [[4, 50], [50, 100], [100, 150], [150, 200]]
+  spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0], [4.0, 8.0], [8.0, 50.0]]
+  initial_stack: 200
+```
+
+**Step 3: Test** — sample 1000 situations, verify pot/SPR distributions are uniform across intervals.
+
+**Step 4: Commit**
+
+```bash
+git commit -am "feat(gpu-solver): bucketed sampler with cfvnet-quality distributions"
+```
+
+---
+
+### Task A7: Combo-to-Bucket Mapping Utilities
+
+**Files:**
+- Create: `crates/gpu-solver/src/bucketed/mapping.rs`
+
+Utilities for converting between 1326-combo space and bucket space.
+
+**Step 1: Range → bucket reach**
+
+```rust
+/// Convert 1326-dim range weights to num_buckets-dim bucket reach.
+pub fn range_to_bucket_reach(
+    range: &[f32; 1326],
+    bucket_file: &BucketFile,
+    board_idx: u32,
+    num_buckets: usize,
+) -> Vec<f32> {
+    let mut reach = vec![0.0f32; num_buckets];
+    for combo in 0..1326u16 {
+        let bucket = bucket_file.get_bucket(board_idx, combo) as usize;
+        if bucket < num_buckets {
+            reach[bucket] += range[combo as usize];
+        }
+    }
+    reach
+}
+```
+
+**Step 2: Bucket strategy → combo strategy (for display)**
+
+```rust
+/// Expand bucket-space strategy to 1326-combo strategy for display.
+/// Each combo gets its bucket's strategy.
+pub fn bucket_strategy_to_combos(
+    bucket_strategy: &[f32],  // [num_actions * num_buckets]
+    bucket_file: &BucketFile,
+    board_idx: u32,
+    num_buckets: usize,
+    num_actions: usize,
+) -> Vec<f32> {  // [num_actions * 1326]
+    let mut combo_strat = vec![0.0f32; num_actions * 1326];
+    for combo in 0..1326u16 {
+        let bucket = bucket_file.get_bucket(board_idx, combo) as usize;
+        for a in 0..num_actions {
+            combo_strat[a * 1326 + combo as usize] = bucket_strategy[a * num_buckets + bucket];
+        }
+    }
+    combo_strat
+}
+```
+
+**Step 3: Board → board_idx lookup**
+
+```rust
+/// Find the board index in the bucket file for a given set of cards.
+/// Canonicalizes the board first, then looks up in the board index map.
+pub fn find_board_index(
+    bucket_file: &BucketFile,
+    board_cards: &[u8],
+) -> u32 {
+    // Convert u8 cards to Card, canonicalize, pack, look up
+    // Uses BucketFile::board_index_map() or binary search on sorted boards
+}
+```
+
+**Step 4: Test** — round-trip: range → buckets → expand back. Verify expanded strategy is valid.
+
+**Step 5: Commit**
+
+```bash
+git commit -am "feat(gpu-solver): combo-to-bucket mapping utilities"
+```
+
+---
+
+### Task A8: River Batch Solver + Training Pipeline
 
 **Files:**
 - Create: `crates/gpu-solver/src/bucketed/batch.rs`
@@ -372,19 +524,31 @@ Batch-solve N river spots in bucket space and train a river CFV net.
 
 **Step 1: BatchBucketedSolver**
 
-Same pattern as BatchGpuSolver but with `num_buckets` dimensions. All spots share the same tree topology. Per-spot data: initial_reach (bucket-space), equity tables (per-spot since different boards have different equity).
+Same pattern as BatchGpuSolver but with `num_buckets` dimensions. All spots share the same tree topology. Per-spot data:
+- `initial_reach_oop/ip`: `[num_spots × num_buckets]` — from range_to_bucket_reach()
+- `equity_tables`: `[num_showdown_terminals × num_spots × num_buckets × num_buckets]` — per-spot because different boards have different equity. Note: this is large for many spots. With 500 buckets, each table is 500×500×4=1MB. For 1000 spots × 5 showdown terminals = 5GB. May need to share equity tables across spots with the same board, or compute on-the-fly.
 
-**Step 2: River training pipeline**
+**Optimization for equity tables**: Since equity tables are per-board and the sampler generates random boards, each spot has a unique table. For batch_size=1000, this is 5GB — too much. Solutions:
+- **Reduce batch_size** for the solver (e.g., 100 spots)
+- **Compute equity matrix-vector product on CPU** and upload CFV results (defeats GPU purpose)
+- **Use a single shared equity table** based on average equity across boards (lossy)
+- **Compute equity on-the-fly in the kernel** — each thread evaluates the few hands in its bucket pair. Viable for 500 buckets but complex.
+
+Best approach for Phase A: **use moderate batch_size (100-500)** where equity tables fit in VRAM. At 500 buckets, 100 spots × 5 terminals × 500 × 500 × 4 = 500MB. Manageable.
+
+**Step 2: Training loop**
 
 ```
-GPU-Resident Loop:
-  Sample random river boards (GPU or CPU)
-  Map ranges to bucket-space reach (CPU, upload)
-  Precompute bucket equity tables (CPU, upload)
-  Batch solve → extract root bucket CFVs
-  Insert into reservoir (bucket-space: input=2×500+1=1001, output=500)
-  Train bucket-space CFV net
+Per batch (CPU + GPU):
+  1. CPU: sample N situations using cfvnet sampler (stratified pot/SPR + R(S,p))
+  2. CPU: map ranges to bucket reach, compute equity tables per board
+  3. CPU → GPU: upload bucket reach + equity tables
+  4. GPU: batch solve (DCFR+ with bucketed kernels) → extract root CFVs
+  5. GPU: insert CFVs into reservoir (bucket-space)
+  6. GPU: train step (burn-cuda)
 ```
+
+Steps 1-3 are CPU (sampling + bucket mapping + equity precomputation). These run once per batch — the solve (step 4) at 4000 iterations dominates.
 
 **Step 3: CFV net architecture**
 
@@ -394,17 +558,20 @@ Hidden: 7 × 500 (same as Supremus)
 
 The network is much smaller than the concrete version (1001 input vs 2720).
 
-**Step 4: Performance benchmark**
+**Step 4: Reservoir encoding**
 
+Bucket-space reservoir records:
 ```
-gpu-train-bucketed-stack -c config.yaml -o models/bucketed_v1
+input:  [2 × num_buckets + 1] = 1001 floats
+target: [num_buckets]          = 500 floats
+mask:   [num_buckets]          = 500 floats (all 1.0 for valid buckets)
 ```
 
-Target: 50M samples in 1 hour. With 500 buckets (2.65x smaller arrays), the solver should be proportionally faster.
+No board one-hot needed — bucket assignments already encode board context.
 
-**Step 5: Diagnostic: gpu-eval-bucketed-model**
+**Step 5: Performance benchmark**
 
-Eval command for bucketed models. Compares bucket-space predictions against bucket-space ground truth.
+Target: 50M samples in 1 hour. With 500 buckets (2.65x less compute per kernel), expect proportionally faster throughput.
 
 **Step 6: Commit**
 
@@ -414,14 +581,86 @@ git commit -am "feat(gpu-solver): bucketed river batch solver and training pipel
 
 ---
 
+### Task A9: Evaluation — gpu-eval-bucketed (cfvnet compare style)
+
+**Files:**
+- Create: `crates/gpu-solver/src/bucketed/eval.rs`
+
+A diagnostic command matching `cfvnet compare` output but for bucketed models.
+
+**Step 1: Per-spot evaluation**
+
+For each of N test spots:
+1. Sample a situation using cfvnet sampler (quality distribution)
+2. Map to bucket space
+3. Solve exactly in bucket space (high iterations, 10,000+) → ground-truth bucket CFVs
+4. Encode as network input `[2 × num_buckets + 1]`
+5. Run model forward pass → predicted bucket CFVs
+6. Compare: MAE, max error, per-bucket error histogram
+
+**Step 2: Metrics (matching cfvnet compare)**
+
+```
+Per spot:
+  MAE (pot-relative): mean absolute error across valid buckets
+  Max error: worst single-bucket error
+  mBB error: MAE × 1000 (assuming 1 pot unit)
+
+Summary:
+  Overall MAE (pot-relative)
+  Overall mBB/hand
+  Max error across all spots
+  Per-bucket error distribution (histogram: how many buckets have error < 0.01, < 0.02, etc.)
+  Spots where dominant action disagrees with exact solve
+```
+
+**Step 3: Output format**
+
+```
+Evaluating river model: models/bucketed_v1/river (7x500, 500 buckets)
+Solving 100 spots at 10000 iterations...
+
+  Spot   1/100: MAE=0.0142  mBB= 7.1  max=0.089  (OOP check 62%, solver check 64%)
+  Spot   2/100: MAE=0.0098  mBB= 4.9  max=0.045  (OOP bet 78%, solver bet 80%)
+  ...
+
+Summary:
+  Mean Absolute Error:     0.0134 pot-relative (13.4 mBB/hand)
+  Max Error:               0.112
+  Dominant action agree:   94/100 (94%)
+  Bucket error histogram:
+    <0.005: 312 buckets (62.4%)
+    <0.01:  108 buckets (21.6%)
+    <0.02:   62 buckets (12.4%)
+    <0.05:   14 buckets (2.8%)
+    >0.05:    4 buckets (0.8%)
+```
+
+**Step 4: CLI command**
+
+```bash
+gpu-eval-bucketed --model models/river --hidden-layers 7 --hidden-size 500 \
+  --buckets local_data/clusters_500bkt_v3/river.buckets --num-buckets 500 \
+  --street river --num-spots 100 --solve-iters 10000
+```
+
+**Step 5: Commit**
+
+```bash
+git commit -am "feat(gpu-solver): add gpu-eval-bucketed diagnostic command"
+```
+
+---
+
 ### Phase A Validation Checkpoint
 
 Before proceeding to Phase B:
-1. ✅ Bucketed river solver produces valid strategies
-2. ✅ Bucketed solver matches CPU range-solver on dominant actions (>90% agreement)
-3. ✅ River CFV net validation loss decreasing
-4. ✅ Performance: river training >1000 samples/s (bucket-space is smaller)
-5. ✅ `gpu-eval-bucketed-model --street river` reports MAE < 0.05 (pot-relative)
+1. ✅ Bucketed river solver produces valid strategies (bucket probs sum to 1.0)
+2. ✅ Bucketed solver matches CPU range-solver on dominant actions (>90% agreement after expanding buckets to combos)
+3. ✅ River CFV net validation loss decreasing over training
+4. ✅ `gpu-eval-bucketed --street river` reports MAE < 0.05 pot-relative (<50 mBB/hand) with sufficient training data
+5. ✅ Performance: river training >1000 samples/s (bucket-space is smaller)
+6. ✅ Pot/SPR distribution of training samples matches cfvnet quality (verified by histogram)
 
 ---
 
