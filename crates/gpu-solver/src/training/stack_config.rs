@@ -113,8 +113,12 @@ pub fn train_full_stack<B: AutodiffBackend>(
     let flop_dir = output_dir.join("flop");
     let preflop_dir = output_dir.join("preflop");
 
+    let separator = "=".repeat(60);
+
     // 1. Train river
-    eprintln!("=== PHASE 1/4: RIVER ===");
+    eprintln!("\n{separator}");
+    eprintln!("PHASE 1/4: RIVER");
+    eprintln!("{separator}\n");
     let river_config = build_river_config(config, &river_dir);
     train_river_cfvnet::<B>(&river_config, device)?;
 
@@ -122,7 +126,9 @@ pub fn train_full_stack<B: AutodiffBackend>(
     let river_model_path = river_dir.join("model");
 
     // 2. Train turn (uses river model)
-    eprintln!("=== PHASE 2/4: TURN ===");
+    eprintln!("\n{separator}");
+    eprintln!("PHASE 2/4: TURN");
+    eprintln!("{separator}\n");
     let turn_config = build_turn_config(config, &river_model_path, &turn_dir);
     train_turn_cfvnet_cuda::<B>(&turn_config, device)?;
 
@@ -130,7 +136,9 @@ pub fn train_full_stack<B: AutodiffBackend>(
     let turn_model_path = turn_dir.join("model");
 
     // 3. Train flop (uses turn model)
-    eprintln!("=== PHASE 3/4: FLOP ===");
+    eprintln!("\n{separator}");
+    eprintln!("PHASE 3/4: FLOP");
+    eprintln!("{separator}\n");
     let flop_config = build_flop_config(config, &turn_model_path, &flop_dir);
     train_flop_cfvnet_cuda::<B>(&flop_config, device)?;
 
@@ -138,11 +146,15 @@ pub fn train_full_stack<B: AutodiffBackend>(
     let flop_model_path = flop_dir.join("model");
 
     // 4. Train preflop (uses flop model)
-    eprintln!("=== PHASE 4/4: PREFLOP ===");
+    eprintln!("\n{separator}");
+    eprintln!("PHASE 4/4: PREFLOP");
+    eprintln!("{separator}\n");
     let preflop_config = build_preflop_config(config, &flop_model_path, &preflop_dir);
     train_preflop_cfvnet_cuda::<B>(&preflop_config, device)?;
 
-    eprintln!("=== ALL 4 MODELS TRAINED ===");
+    eprintln!("\n{separator}");
+    eprintln!("ALL 4 MODELS TRAINED");
+    eprintln!("{separator}");
     eprintln!("Output: {}", output_dir.display());
     Ok(())
 }

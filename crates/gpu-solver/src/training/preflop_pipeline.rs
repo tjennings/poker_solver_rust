@@ -23,6 +23,8 @@ use std::time::Instant;
 
 #[cfg(feature = "training")]
 use burn::tensor::backend::AutodiffBackend;
+#[cfg(feature = "training")]
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[cfg(feature = "training")]
 use crate::gpu::GpuContext;
@@ -265,6 +267,15 @@ pub fn train_preflop_cfvnet_cuda<B: AutodiffBackend>(
     eprintln!("  Output: {}", config.output_dir.display());
     eprintln!();
 
+    let pb = ProgressBar::new(config.num_samples);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{prefix} [{bar:30}] {pos}/{len} ({per_sec}, ETA {eta}) {msg}")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+    pb.set_prefix("PREFLOP");
+
     while total_samples < config.num_samples {
         let t0 = Instant::now();
 
@@ -381,6 +392,12 @@ pub fn train_preflop_cfvnet_cuda<B: AutodiffBackend>(
         timing_accum.train_ms += (t_train_end - t_train_start).as_secs_f64() * 1000.0;
         batches_since_report += 1;
 
+        // Update progress bar
+        pb.set_position(total_samples);
+        if last_loss < f32::MAX {
+            pb.set_message(format!("loss={:.4}", last_loss));
+        }
+
         // === VALIDATION ===
         if total_samples % config.validation_interval < (config.batch_size as u64 * 2) {
             let elapsed = start.elapsed().as_secs_f64();
@@ -400,14 +417,14 @@ pub fn train_preflop_cfvnet_cuda<B: AutodiffBackend>(
                 f32::NAN
             };
 
-            eprintln!(
+            pb.println(format!(
                 "[{:>12} samples] loss={:.6} val={:.6} rate={:.0} samples/s  reservoir={}",
                 total_samples, last_loss, val_loss, rate, reservoir.size()
-            );
+            ));
 
             if batches_since_report > 0 {
                 let n = batches_since_report as f64;
-                eprintln!(
+                pb.println(format!(
                     "  timing: encode={:.1}ms infer={:.1}ms avg={:.1}ms insert={:.1}ms train={:.1}ms  ({} batches avg)",
                     timing_accum.encode_ms / n,
                     timing_accum.infer_ms / n,
@@ -415,7 +432,7 @@ pub fn train_preflop_cfvnet_cuda<B: AutodiffBackend>(
                     timing_accum.insert_ms / n,
                     timing_accum.train_ms / n,
                     batches_since_report,
-                );
+                ));
             }
 
             timing_accum = PhaseTiming {
@@ -435,9 +452,11 @@ pub fn train_preflop_cfvnet_cuda<B: AutodiffBackend>(
         {
             let label = format!("checkpoint_{}", total_samples);
             trainer.save_checkpoint(&config.output_dir, &label);
-            eprintln!("  Saved checkpoint: {}", label);
+            pb.println(format!("  Saved checkpoint: {}", label));
         }
     }
+
+    pb.finish_with_message("done");
 
     trainer.save_final(&config.output_dir)?;
     let elapsed = start.elapsed().as_secs_f64();

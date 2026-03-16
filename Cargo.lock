@@ -5099,6 +5099,7 @@ dependencies = [
  "burn",
  "cfvnet",
  "cudarc 0.16.6",
+ "indicatif",
  "poker-solver-core",
  "rand 0.8.5",
  "rand_chacha 0.3.1",

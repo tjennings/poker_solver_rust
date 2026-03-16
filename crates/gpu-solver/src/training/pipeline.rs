@@ -16,6 +16,8 @@ use std::time::Instant;
 
 #[cfg(feature = "training")]
 use burn::tensor::backend::AutodiffBackend;
+#[cfg(feature = "training")]
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[cfg(feature = "training")]
 use crate::batch::BatchConfig;
@@ -243,6 +245,15 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
     eprintln!("  Output: {}", config.output_dir.display());
     eprintln!();
 
+    let pb = ProgressBar::new(config.num_samples);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{prefix} [{bar:30}] {pos}/{len} ({per_sec}, ETA {eta}) {msg}")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+    pb.set_prefix("RIVER");
+
     while total_samples < config.num_samples {
         // === SAMPLE PHASE (GPU) ===
         let t0 = Instant::now();
@@ -304,6 +315,12 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
         }
         let t5 = Instant::now();
 
+        // Update progress bar
+        pb.set_position(total_samples);
+        if last_loss < f32::MAX {
+            pb.set_message(format!("loss={:.4}", last_loss));
+        }
+
         // Accumulate timing
         timing_accum.sample_ms += (t1 - t0).as_secs_f64() * 1000.0;
         timing_accum.build_ms += (t2 - t1).as_secs_f64() * 1000.0;
@@ -333,15 +350,15 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
             // Ground-truth RMSE
             let gt_rmse = gt_validator.evaluate(trainer.model(), device);
 
-            eprintln!(
+            pb.println(format!(
                 "[{:>12} samples] loss={:.6} val={:.6} gt_rmse={:.6} rate={:.0} samples/s  reservoir={}",
                 total_samples, last_loss, val_loss, gt_rmse, rate, reservoir.size()
-            );
+            ));
 
             // Print per-phase timing breakdown (averaged over batches since last report)
             if batches_since_report > 0 {
                 let n = batches_since_report as f64;
-                eprintln!(
+                pb.println(format!(
                     "  timing: sample={:.1}ms build={:.1}ms solve={:.1}ms insert={:.1}ms train={:.1}ms  ({} batches avg)",
                     timing_accum.sample_ms / n,
                     timing_accum.build_ms / n,
@@ -349,7 +366,7 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
                     timing_accum.insert_ms / n,
                     timing_accum.train_ms / n,
                     batches_since_report,
-                );
+                ));
             }
 
             // Reset accumulator
@@ -370,9 +387,11 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
         {
             let label = format!("checkpoint_{}", total_samples);
             trainer.save_checkpoint(&config.output_dir, &label);
-            eprintln!("  Saved checkpoint: {}", label);
+            pb.println(format!("  Saved checkpoint: {}", label));
         }
     }
+
+    pb.finish_with_message("done");
 
     // Save final model
     trainer.save_final(&config.output_dir)?;
