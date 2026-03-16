@@ -1,3 +1,4 @@
+pub mod bucket_mapping;
 pub mod generate;
 pub mod range_gen;
 pub mod sampler;
