@@ -118,7 +118,7 @@ impl PreEncoded {
 /// Cosine annealing learning rate schedule.
 ///
 /// Returns `lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(pi * t / total_steps))`.
-fn cosine_lr(lr_max: f64, lr_min: f64, step: usize, total_steps: usize) -> f64 {
+pub(crate) fn cosine_lr(lr_max: f64, lr_min: f64, step: usize, total_steps: usize) -> f64 {
     if total_steps == 0 {
         return lr_max;
     }
@@ -305,7 +305,7 @@ impl StreamingReader {
 }
 
 /// Collect sorted file paths from a path (file or directory).
-fn collect_data_files(path: &Path) -> Result<Vec<PathBuf>, String> {
+pub fn collect_data_files(path: &Path) -> Result<Vec<PathBuf>, String> {
     if path.is_dir() {
         let mut paths: Vec<_> = std::fs::read_dir(path)
             .map_err(|e| format!("read directory {}: {e}", path.display()))?

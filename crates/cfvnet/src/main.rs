@@ -136,6 +136,48 @@ enum Commands {
         #[arg(long, default_value = "1")]
         threads: usize,
     },
+    /// Train a bucketed CFV network (Supremus-exact architecture)
+    TrainBucketed {
+        /// Path to training data (file or directory of bucketed .bin files)
+        #[arg(short, long)]
+        data: PathBuf,
+        /// Output directory for model checkpoints
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Number of hidden layers
+        #[arg(long, default_value = "7")]
+        hidden_layers: usize,
+        /// Hidden layer width
+        #[arg(long, default_value = "500")]
+        hidden_size: usize,
+        /// Training batch size
+        #[arg(long, default_value = "2048")]
+        batch_size: usize,
+        /// Number of training epochs
+        #[arg(long, default_value = "200")]
+        epochs: usize,
+        /// Peak learning rate
+        #[arg(long, default_value = "0.001")]
+        learning_rate: f64,
+        /// Minimum learning rate for cosine decay
+        #[arg(long, default_value = "0.00001")]
+        lr_min: f64,
+        /// Huber loss delta
+        #[arg(long, default_value = "1.0")]
+        huber_delta: f64,
+        /// Fraction of data for validation
+        #[arg(long, default_value = "0.05")]
+        validation_split: f64,
+        /// Checkpoint every N epochs
+        #[arg(long, default_value = "10")]
+        checkpoint_every_n_epochs: usize,
+        /// Shuffle buffer size
+        #[arg(long, default_value = "262144")]
+        shuffle_buffer_size: usize,
+        /// Backend: wgpu, ndarray, or cuda
+        #[arg(long, default_value_t = default_backend())]
+        backend: String,
+    },
 }
 
 fn append_random_suffix(path: &std::path::Path) -> PathBuf {
@@ -228,6 +270,18 @@ fn main() {
         }
         Commands::BenchSolve { config, num_samples, threads } => {
             cmd_bench_solve(config, num_samples, threads);
+        }
+        Commands::TrainBucketed {
+            data, output, hidden_layers, hidden_size, batch_size, epochs,
+            learning_rate, lr_min, huber_delta, validation_split,
+            checkpoint_every_n_epochs, shuffle_buffer_size, backend,
+        } => {
+            ensure_parent_dir(&output);
+            cmd_train_bucketed(
+                data, output, hidden_layers, hidden_size, batch_size, epochs,
+                learning_rate, lr_min, huber_delta, validation_split,
+                checkpoint_every_n_epochs, shuffle_buffer_size, backend,
+            );
         }
     }
 }
@@ -1229,5 +1283,109 @@ fn format_board(board: &[u8; 5], board_size: usize) -> String {
         .map(|&c| card_to_string(c).unwrap_or_else(|_| "??".into()))
         .collect();
     format!("Board: {}", cards.join(" "))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_train_bucketed(
+    data: PathBuf,
+    output: PathBuf,
+    hidden_layers: usize,
+    hidden_size: usize,
+    batch_size: usize,
+    epochs: usize,
+    learning_rate: f64,
+    lr_min: f64,
+    huber_delta: f64,
+    validation_split: f64,
+    checkpoint_every_n_epochs: usize,
+    shuffle_buffer_size: usize,
+    backend: String,
+) {
+    // Peek at the first data file to get num_buckets from the header.
+    let files = cfvnet::model::training::collect_data_files(&data).unwrap_or_else(|e| {
+        eprintln!("failed to collect data files: {e}");
+        std::process::exit(1);
+    });
+    let num_buckets = {
+        let mut f = std::fs::File::open(&files[0]).unwrap_or_else(|e| {
+            eprintln!("failed to open {}: {e}", files[0].display());
+            std::process::exit(1);
+        });
+        cfvnet::datagen::bucketed_storage::read_bucketed_header(&mut f).unwrap_or_else(|e| {
+            eprintln!("failed to read header: {e}");
+            std::process::exit(1);
+        }) as usize
+    };
+
+    let encoder_threads = std::thread::available_parallelism()
+        .map(|p| p.get().saturating_sub(2).max(1))
+        .unwrap_or(1);
+
+    let config = cfvnet::model::bucketed_training::BucketedTrainConfig {
+        num_buckets,
+        hidden_layers,
+        hidden_size,
+        batch_size,
+        epochs,
+        learning_rate,
+        lr_min,
+        huber_delta,
+        validation_split,
+        checkpoint_every_n_epochs,
+        shuffle_buffer_size,
+        prefetch_depth: 4,
+        encoder_threads,
+    };
+
+    std::fs::create_dir_all(&output).unwrap_or_else(|e| {
+        eprintln!("failed to create output dir: {e}");
+        std::process::exit(1);
+    });
+
+    let input_size = 2 * num_buckets + 1;
+    let output_size = 2 * num_buckets;
+    eprintln!("Training bucketed CFV network:");
+    eprintln!("  Buckets:      {num_buckets}");
+    eprintln!("  Architecture: {input_size} -> {hidden_layers}x{hidden_size} -> {output_size}");
+    eprintln!("  Epochs:       {epochs}");
+    eprintln!("  Batch size:   {batch_size}");
+    eprintln!("  LR:           {learning_rate} -> {lr_min} (cosine)");
+    eprintln!("  Huber delta:  {huber_delta}");
+    eprintln!("  Backend:      {backend}");
+
+    match backend.as_str() {
+        "wgpu" => {
+            use burn::backend::{Autodiff, Wgpu};
+            type B = Autodiff<Wgpu>;
+            let device = burn::backend::wgpu::WgpuDevice::default();
+            let result = cfvnet::model::bucketed_training::train_bucketed::<B>(
+                &device, &data, &config, Some(&output),
+            );
+            eprintln!("Final train loss: {:.6}", result.final_train_loss);
+        }
+        "ndarray" => {
+            use burn::backend::{Autodiff, NdArray};
+            type B = Autodiff<NdArray>;
+            let device = Default::default();
+            let result = cfvnet::model::bucketed_training::train_bucketed::<B>(
+                &device, &data, &config, Some(&output),
+            );
+            eprintln!("Final train loss: {:.6}", result.final_train_loss);
+        }
+        #[cfg(feature = "cuda")]
+        "cuda" => {
+            use burn::backend::{Autodiff, CudaJit};
+            type B = Autodiff<CudaJit>;
+            let device = burn::backend::cuda_jit::CudaDevice::default();
+            let result = cfvnet::model::bucketed_training::train_bucketed::<B>(
+                &device, &data, &config, Some(&output),
+            );
+            eprintln!("Final train loss: {:.6}", result.final_train_loss);
+        }
+        other => {
+            eprintln!("Unknown backend '{other}'. Use wgpu, ndarray, or cuda.");
+            std::process::exit(1);
+        }
+    }
 }
 
