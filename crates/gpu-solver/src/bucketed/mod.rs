@@ -5,5 +5,8 @@
 //! This dramatically reduces the dimensionality of the solver state.
 
 pub mod equity;
+pub mod mapping;
+#[cfg(feature = "training")]
+pub mod sampler;
 pub mod solver;
 pub mod tree;
