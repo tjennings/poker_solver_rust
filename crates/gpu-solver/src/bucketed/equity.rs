@@ -18,7 +18,7 @@ use rs_poker::core::{Card, Suit, Value};
 /// Range-solver encoding: `card_id = 4 * rank + suit`
 ///   - rank: 2 -> 0, 3 -> 1, ..., A -> 12
 ///   - suit: club -> 0, diamond -> 1, heart -> 2, spade -> 3
-fn u8_to_rs_card(card_id: u8) -> Card {
+pub fn u8_to_rs_card(card_id: u8) -> Card {
     let rank = card_id / 4;
     let suit_idx = card_id % 4;
     let value = Value::from(rank);
