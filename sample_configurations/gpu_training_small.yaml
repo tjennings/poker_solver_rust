@@ -28,7 +28,7 @@ river:
   solve_iterations: 2000
   batch_size: 500
   reservoir_capacity: 50000
-  validation_interval: 50000
+  validation_interval: 10000
   checkpoint_interval: 500000
 
 turn:
@@ -36,7 +36,7 @@ turn:
   solve_iterations: 2000
   batch_size: 500
   reservoir_capacity: 50000
-  validation_interval: 50000
+  validation_interval: 10000
   checkpoint_interval: 500000
 
 flop:
@@ -44,12 +44,12 @@ flop:
   solve_iterations: 2000
   batch_size: 200
   reservoir_capacity: 50000
-  validation_interval: 50000
+  validation_interval: 10000
   checkpoint_interval: 500000
 
 preflop:
   num_samples: 200000
   batch_size: 1
   reservoir_capacity: 50000
-  validation_interval: 50000
+  validation_interval: 10000
   checkpoint_interval: 200000
