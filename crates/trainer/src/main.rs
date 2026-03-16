@@ -371,6 +371,16 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         ref_stack: i32,
     },
+    /// Train the full CFVNet model stack (river → turn → flop → preflop) from one YAML config
+    #[cfg(feature = "gpu-training")]
+    GpuTrainStack {
+        /// YAML config file (GpuTrainingStackConfig)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Output directory (creates river/, turn/, flop/, preflop/ subdirs)
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// Solve a postflop spot with exact (no abstraction) DCFR
     RangeSolve {
         /// OOP player's range (PioSOLVER format, e.g. "QQ+,AKs,AKo")
@@ -997,6 +1007,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             )?;
         }
         #[cfg(feature = "gpu-training")]
+        Commands::GpuTrainStack { config, output } => {
+            run_gpu_train_stack(config, output)?;
+        }
+        #[cfg(feature = "gpu-training")]
         Commands::GpuTrainPreflop {
             flop_model,
             flop_hidden_layers,
@@ -1345,6 +1359,45 @@ fn run_gpu_train_preflop(
 
     let device = Default::default();
     train_preflop_cfvnet_cuda::<B>(&config, &device)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GPU stack training (all 4 streets from YAML config)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gpu-training")]
+fn run_gpu_train_stack(
+    config_path: PathBuf,
+    output: PathBuf,
+) -> Result<(), Box<dyn Error>> {
+    use burn::backend::{Autodiff, NdArray};
+    use poker_solver_gpu::training::stack_config::{train_full_stack, GpuTrainingStackConfig};
+
+    type B = Autodiff<NdArray>;
+
+    let yaml = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read config {}: {e}", config_path.display()))?;
+    let stack_config: GpuTrainingStackConfig = serde_yaml::from_str(&yaml)
+        .map_err(|e| format!("Failed to parse config: {e}"))?;
+
+    eprintln!("GPU Train Stack");
+    eprintln!("  Config: {}", config_path.display());
+    eprintln!("  Output: {}", output.display());
+    eprintln!("  Model:  {} layers x {} hidden", stack_config.model.hidden_layers, stack_config.model.hidden_size);
+    eprintln!("  River:  {} samples", stack_config.river.num_samples);
+    eprintln!("  Turn:   {} samples", stack_config.turn.num_samples);
+    eprintln!("  Flop:   {} samples", stack_config.flop.num_samples);
+    eprintln!("  Preflop:{} samples", stack_config.preflop.num_samples);
+    eprintln!();
+
+    std::fs::create_dir_all(&output)
+        .map_err(|e| format!("Failed to create output dir: {e}"))?;
+
+    let device = Default::default();
+    train_full_stack::<B>(&stack_config, &output, &device)
+        .map_err(|e| format!("Stack training failed: {e}"))?;
+
     Ok(())
 }
 

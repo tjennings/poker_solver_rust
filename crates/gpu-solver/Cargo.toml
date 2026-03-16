@@ -15,6 +15,7 @@ range-solver = { path = "../range-solver" }
 cfvnet = { path = "../cfvnet", optional = true }
 burn = { version = "0.16", features = ["train", "ndarray"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
+serde_yaml = { workspace = true }
 rs_poker = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }

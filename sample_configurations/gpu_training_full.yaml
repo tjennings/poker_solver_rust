@@ -1,0 +1,55 @@
+# Full GPU training stack config for production model training.
+# Trains all 4 CFVNet models (river → turn → flop → preflop) in sequence.
+#
+# Usage:
+#   cargo run -p poker-solver-trainer --release --features cuda,gpu-training -- \
+#     gpu-train-stack -c sample_configurations/gpu_training_full.yaml -o models/stack_v1
+
+game:
+  initial_stack: 200
+  bet_sizes: ["25%", "50%", "100%", "a"]
+  ref_pot: 100
+  ref_stack: 100
+
+model:
+  hidden_layers: 7
+  hidden_size: 500
+
+training:
+  train_batch_size: 1024
+  train_steps_per_batch: 10
+  learning_rate: 0.001
+  huber_delta: 1.0
+  aux_loss_weight: 1.0
+  seed: 42
+
+river:
+  num_samples: 50_000_000
+  solve_iterations: 4000
+  batch_size: 1000
+  reservoir_capacity: 100_000
+  validation_interval: 100_000
+  checkpoint_interval: 5_000_000
+
+turn:
+  num_samples: 20_000_000
+  solve_iterations: 4000
+  batch_size: 1000
+  reservoir_capacity: 100_000
+  validation_interval: 100_000
+  checkpoint_interval: 5_000_000
+
+flop:
+  num_samples: 20_000_000
+  solve_iterations: 4000
+  batch_size: 1000
+  reservoir_capacity: 100_000
+  validation_interval: 100_000
+  checkpoint_interval: 5_000_000
+
+preflop:
+  num_samples: 10_000_000
+  batch_size: 1
+  reservoir_capacity: 100_000
+  validation_interval: 100_000
+  checkpoint_interval: 1_000_000

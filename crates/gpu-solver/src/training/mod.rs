@@ -29,3 +29,4 @@ pub mod flop_solver;
 pub mod flop_pipeline;
 #[cfg(feature = "training")]
 pub mod preflop_pipeline;
+pub mod stack_config;

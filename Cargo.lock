@@ -5105,6 +5105,8 @@ dependencies = [
  "range-solver",
  "rayon",
  "rs_poker",
+ "serde",
+ "serde_yaml",
  "tempfile",
  "thiserror 1.0.69",
 ]
@@ -5116,6 +5118,7 @@ dependencies = [
  "lru",
  "parking_lot",
  "poker-solver-core",
+ "poker-solver-gpu",
  "range-solver",
  "rs_poker",
  "serde",
