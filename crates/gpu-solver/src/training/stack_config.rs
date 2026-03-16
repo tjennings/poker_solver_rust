@@ -1,8 +1,8 @@
 //! YAML-driven config for training the full CFVNet model stack.
 //!
 //! Parses a single YAML file into [`GpuTrainingStackConfig`] and provides
-//! [`train_full_stack`] which orchestrates river → turn → flop → preflop
-//! training in sequence.
+//! [`train_full_stack`] which orchestrates turn → flop → preflop training
+//! in sequence, using a pre-trained river model as the leaf evaluator.
 
 use serde::Deserialize;
 
@@ -12,8 +12,6 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "training")]
 use burn::tensor::backend::AutodiffBackend;
 
-#[cfg(feature = "training")]
-use crate::training::pipeline::{train_river_cfvnet, RiverTrainingConfig};
 #[cfg(feature = "training")]
 use crate::training::turn_pipeline::{train_turn_cfvnet_cuda, TurnTrainingConfig};
 #[cfg(feature = "training")]
@@ -25,12 +23,20 @@ use crate::training::preflop_pipeline::{train_preflop_cfvnet_cuda, PreflopTraini
 #[derive(Debug, Deserialize)]
 pub struct GpuTrainingStackConfig {
     pub game: GameConfig,
+    pub river_model: RiverModelConfig,
     pub model: ModelConfig,
     pub training: TrainingConfig,
-    pub river: StreetConfig,
     pub turn: StreetConfig,
     pub flop: StreetConfig,
     pub preflop: StreetConfig,
+}
+
+/// Pre-trained river model reference (skip river training, use this model).
+#[derive(Debug, Deserialize)]
+pub struct RiverModelConfig {
+    pub path: String,
+    pub hidden_layers: usize,
+    pub hidden_size: usize,
 }
 
 /// Shared game parameters.
@@ -98,8 +104,9 @@ pub struct StreetConfig {
 // Stack training pipeline
 // ---------------------------------------------------------------------------
 
-/// Train the full CFVNet model stack: river → turn → flop → preflop.
+/// Train the full CFVNet model stack: turn → flop → preflop.
 ///
+/// Uses a pre-trained river model as the leaf evaluator for turn training.
 /// Each phase writes its model into a subdirectory of `output_dir`, and
 /// subsequent phases load the previous model as their leaf evaluator.
 #[cfg(feature = "training")]
@@ -108,36 +115,31 @@ pub fn train_full_stack<B: AutodiffBackend>(
     output_dir: &Path,
     device: &B::Device,
 ) -> Result<(), String> {
-    let river_dir = output_dir.join("river");
     let turn_dir = output_dir.join("turn");
     let flop_dir = output_dir.join("flop");
     let preflop_dir = output_dir.join("preflop");
 
     let separator = "=".repeat(60);
 
-    // 1. Train river
-    eprintln!("\n{separator}");
-    eprintln!("PHASE 1/4: RIVER");
-    eprintln!("{separator}\n");
-    let river_config = build_river_config(config, &river_dir);
-    train_river_cfvnet::<B>(&river_config, device)?;
+    eprintln!("Using pre-trained river model: {}", config.river_model.path);
+    eprintln!(
+        "  Architecture: {}x{}",
+        config.river_model.hidden_layers, config.river_model.hidden_size
+    );
 
-    // River model path is output_dir/river/model
-    let river_model_path = river_dir.join("model");
-
-    // 2. Train turn (uses river model)
+    // Phase 1/3: Turn (uses pre-trained river model)
     eprintln!("\n{separator}");
-    eprintln!("PHASE 2/4: TURN");
+    eprintln!("PHASE 1/3: TURN");
     eprintln!("{separator}\n");
-    let turn_config = build_turn_config(config, &river_model_path, &turn_dir);
+    let turn_config = build_turn_config(config, &turn_dir);
     train_turn_cfvnet_cuda::<B>(&turn_config, device)?;
 
     // Turn model path is output_dir/turn/model
     let turn_model_path = turn_dir.join("model");
 
-    // 3. Train flop (uses turn model)
+    // Phase 2/3: Flop (uses turn model just trained)
     eprintln!("\n{separator}");
-    eprintln!("PHASE 3/4: FLOP");
+    eprintln!("PHASE 2/3: FLOP");
     eprintln!("{separator}\n");
     let flop_config = build_flop_config(config, &turn_model_path, &flop_dir);
     train_flop_cfvnet_cuda::<B>(&flop_config, device)?;
@@ -145,17 +147,19 @@ pub fn train_full_stack<B: AutodiffBackend>(
     // Flop model path is output_dir/flop/model
     let flop_model_path = flop_dir.join("model");
 
-    // 4. Train preflop (uses flop model)
+    // Phase 3/3: Preflop (uses flop model just trained)
     eprintln!("\n{separator}");
-    eprintln!("PHASE 4/4: PREFLOP");
+    eprintln!("PHASE 3/3: PREFLOP");
     eprintln!("{separator}\n");
     let preflop_config = build_preflop_config(config, &flop_model_path, &preflop_dir);
     train_preflop_cfvnet_cuda::<B>(&preflop_config, device)?;
 
     eprintln!("\n{separator}");
-    eprintln!("ALL 4 MODELS TRAINED");
+    eprintln!("ALL 3 MODELS TRAINED");
+    eprintln!("  Turn:     {turn_dir:?}");
+    eprintln!("  Flop:     {flop_dir:?}");
+    eprintln!("  Preflop:  {preflop_dir:?}");
     eprintln!("{separator}");
-    eprintln!("Output: {}", output_dir.display());
     Ok(())
 }
 
@@ -164,49 +168,15 @@ pub fn train_full_stack<B: AutodiffBackend>(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "training")]
-fn build_river_config(config: &GpuTrainingStackConfig, output_dir: &Path) -> RiverTrainingConfig {
-    let street = &config.river;
-    RiverTrainingConfig {
-        num_samples: street.num_samples,
-        solve_iterations: street.solve_iterations,
-        batch_size: street.batch_size,
-        reservoir_capacity: street.reservoir_capacity,
-        hidden_layers: config.model.hidden_layers,
-        hidden_size: config.model.hidden_size,
-        train_batch_size: street
-            .train_batch_size
-            .unwrap_or(config.training.train_batch_size),
-        train_steps_per_batch: street
-            .train_steps_per_batch
-            .unwrap_or(config.training.train_steps_per_batch),
-        learning_rate: street
-            .learning_rate
-            .unwrap_or(config.training.learning_rate),
-        huber_delta: config.training.huber_delta,
-        aux_loss_weight: config.training.aux_loss_weight,
-        validation_interval: street.validation_interval,
-        checkpoint_interval: street.checkpoint_interval,
-        gt_validation_positions: 0,
-        gt_solve_iterations: 0,
-        output_dir: output_dir.to_path_buf(),
-        seed: config.training.seed,
-        ref_pot: config.game.ref_pot,
-        ref_stack: config.game.ref_stack,
-        use_persistent_kernel: false,
-    }
-}
-
-#[cfg(feature = "training")]
 fn build_turn_config(
     config: &GpuTrainingStackConfig,
-    river_model_path: &Path,
     output_dir: &Path,
 ) -> TurnTrainingConfig {
     let street = &config.turn;
     TurnTrainingConfig {
-        river_model_path: river_model_path.to_path_buf(),
-        river_hidden_layers: config.model.hidden_layers,
-        river_hidden_size: config.model.hidden_size,
+        river_model_path: PathBuf::from(&config.river_model.path),
+        river_hidden_layers: config.river_model.hidden_layers,
+        river_hidden_size: config.river_model.hidden_size,
         num_samples: street.num_samples,
         solve_iterations: street.solve_iterations,
         batch_size: street.batch_size,
@@ -321,6 +291,11 @@ game:
   ref_pot: 100
   ref_stack: 100
 
+river_model:
+  path: "local_data/models/river_v7/checkpoint_epoch340"
+  hidden_layers: 4
+  hidden_size: 256
+
 model:
   hidden_layers: 4
   hidden_size: 256
@@ -332,12 +307,6 @@ training:
   huber_delta: 1.0
   aux_loss_weight: 1.0
   seed: 42
-
-river:
-  num_samples: 1000000
-  solve_iterations: 2000
-  batch_size: 500
-  reservoir_capacity: 50000
 
 turn:
   num_samples: 500000
@@ -358,11 +327,12 @@ preflop:
 "#;
         let config: GpuTrainingStackConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.game.ref_pot, 100);
+        assert_eq!(config.river_model.path, "local_data/models/river_v7/checkpoint_epoch340");
+        assert_eq!(config.river_model.hidden_layers, 4);
+        assert_eq!(config.river_model.hidden_size, 256);
         assert_eq!(config.model.hidden_layers, 4);
         assert_eq!(config.model.hidden_size, 256);
         assert_eq!(config.training.seed, 42);
-        assert_eq!(config.river.num_samples, 1_000_000);
-        assert_eq!(config.river.solve_iterations, 2000);
         assert_eq!(config.turn.batch_size, 500);
         assert_eq!(config.flop.reservoir_capacity, 50000);
         assert_eq!(config.preflop.num_samples, 200_000);
@@ -381,6 +351,11 @@ game:
   ref_pot: 100
   ref_stack: 100
 
+river_model:
+  path: "models/river_v7/best"
+  hidden_layers: 7
+  hidden_size: 768
+
 model:
   hidden_layers: 7
   hidden_size: 500
@@ -393,15 +368,11 @@ training:
   aux_loss_weight: 1.0
   seed: 42
 
-river:
+turn:
   num_samples: 100
   reservoir_capacity: 100
   train_batch_size: 2048
   learning_rate: 0.0005
-
-turn:
-  num_samples: 100
-  reservoir_capacity: 100
 
 flop:
   num_samples: 100
@@ -412,11 +383,15 @@ preflop:
   reservoir_capacity: 100
 "#;
         let config: GpuTrainingStackConfig = serde_yaml::from_str(yaml).unwrap();
-        // River overrides
-        assert_eq!(config.river.train_batch_size, Some(2048));
-        assert_eq!(config.river.learning_rate, Some(0.0005));
-        // Turn uses shared defaults
-        assert_eq!(config.turn.train_batch_size, None);
-        assert_eq!(config.turn.learning_rate, None);
+        // River model config
+        assert_eq!(config.river_model.path, "models/river_v7/best");
+        assert_eq!(config.river_model.hidden_layers, 7);
+        assert_eq!(config.river_model.hidden_size, 768);
+        // Turn overrides
+        assert_eq!(config.turn.train_batch_size, Some(2048));
+        assert_eq!(config.turn.learning_rate, Some(0.0005));
+        // Flop uses shared defaults
+        assert_eq!(config.flop.train_batch_size, None);
+        assert_eq!(config.flop.learning_rate, None);
     }
 }

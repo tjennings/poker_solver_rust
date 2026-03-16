@@ -1385,7 +1385,7 @@ fn run_gpu_train_stack(
     eprintln!("  Config: {}", config_path.display());
     eprintln!("  Output: {}", output.display());
     eprintln!("  Model:  {} layers x {} hidden", stack_config.model.hidden_layers, stack_config.model.hidden_size);
-    eprintln!("  River:  {} samples", stack_config.river.num_samples);
+    eprintln!("  River model: {} ({}x{})", stack_config.river_model.path, stack_config.river_model.hidden_layers, stack_config.river_model.hidden_size);
     eprintln!("  Turn:   {} samples", stack_config.turn.num_samples);
     eprintln!("  Flop:   {} samples", stack_config.flop.num_samples);
     eprintln!("  Preflop:{} samples", stack_config.preflop.num_samples);
