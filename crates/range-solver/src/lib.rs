@@ -25,6 +25,6 @@ pub fn hand_table_data() -> &'static [i32] {
 
 // Convenience re-exports
 pub use game::PostFlopGame;
-pub use solver::{solve, solve_step, compute_exploitability, compute_average, finalize};
+pub use solver::{solve, solve_with_scheme, solve_step, compute_exploitability, compute_average, finalize, DiscountScheme};
 pub use card::CardConfig;
 pub use action_tree::{Action, ActionTree, TreeConfig, BoardState, PLAYER_DEPTH_BOUNDARY_FLAG};

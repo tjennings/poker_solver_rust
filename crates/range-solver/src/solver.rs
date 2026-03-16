@@ -13,10 +13,24 @@ pub use crate::utility::{compute_exploitability, compute_average, finalize};
 // Discount parameters
 // ---------------------------------------------------------------------------
 
+/// Which discount scheme the solver should use.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DiscountScheme {
+    /// Original range-solver scheme (power-of-4 gamma, alpha on t-1).
+    Default,
+    /// Supremus DCFR+: alpha=1.5 on t, beta=0.5 constant,
+    /// additive linear strategy weighting with delay d.
+    DcfrPlus { delay: u32 },
+}
+
 struct DiscountParams {
     alpha_t: f32,
     beta_t: f32,
     gamma_t: f32,
+    /// For DcfrPlus: additive strategy weight = max(0, t - delay).
+    strategy_weight: f32,
+    /// Whether to use additive (DcfrPlus) or multiplicative (Default) strategy update.
+    additive_strategy: bool,
 }
 
 impl DiscountParams {
@@ -37,6 +51,36 @@ impl DiscountParams {
             alpha_t: (pow_alpha / (pow_alpha + 1.0)) as f32,
             beta_t: 0.5,
             gamma_t: pow_gamma as f32,
+            strategy_weight: 1.0,
+            additive_strategy: false,
+        }
+    }
+
+    /// Supremus DCFR+: t^1.5 alpha, 0.5 beta, additive linear strategy weight.
+    pub fn dcfr_plus(current_iteration: u32, delay: u32) -> Self {
+        let t = current_iteration as f64;
+        let pow_alpha = t * t.sqrt(); // t^1.5
+
+        let strat_w = if current_iteration > delay {
+            (current_iteration - delay) as f32
+        } else {
+            0.0
+        };
+
+        Self {
+            alpha_t: (pow_alpha / (pow_alpha + 1.0)) as f32,
+            beta_t: 0.5,
+            gamma_t: 0.0,
+            strategy_weight: strat_w,
+            additive_strategy: true,
+        }
+    }
+
+    /// Construct params for a given iteration and scheme.
+    pub fn for_scheme(current_iteration: u32, scheme: DiscountScheme) -> Self {
+        match scheme {
+            DiscountScheme::Default => Self::new(current_iteration),
+            DiscountScheme::DcfrPlus { delay } => Self::dcfr_plus(current_iteration, delay),
         }
     }
 }
@@ -108,6 +152,17 @@ pub fn solve<T: Game>(
     target_exploitability: f32,
     print_progress: bool,
 ) -> f32 {
+    solve_with_scheme(game, max_num_iterations, target_exploitability, print_progress, DiscountScheme::Default)
+}
+
+/// Like [`solve`] but with a configurable discount scheme.
+pub fn solve_with_scheme<T: Game>(
+    game: &mut T,
+    max_num_iterations: u32,
+    target_exploitability: f32,
+    print_progress: bool,
+    scheme: DiscountScheme,
+) -> f32 {
     if game.is_solved() {
         panic!("Game is already solved");
     }
@@ -135,7 +190,7 @@ pub fn solve<T: Game>(
             break;
         }
 
-        let params = DiscountParams::new(t);
+        let params = DiscountParams::for_scheme(t, scheme);
 
         // Alternating updates
         for player in 0..2 {
@@ -487,13 +542,19 @@ fn update_compressed_strategy<N: GameNode>(
     locking: &[f32],
 ) {
     let scale = node.strategy_scale();
-    let decoder = params.gamma_t * scale / u16::MAX as f32;
     let cum_strategy = node.strategy_compressed_mut();
 
-    strategy
-        .iter_mut()
-        .zip(&*cum_strategy)
-        .for_each(|(x, y)| *x += (*y as f32) * decoder);
+    if params.additive_strategy {
+        // DcfrPlus with compressed storage is not supported.
+        // Use uncompressed memory (allocate_memory(false)) for DcfrPlus.
+        panic!("DcfrPlus discount scheme requires uncompressed memory (allocate_memory(false))");
+    } else {
+        let decoder = params.gamma_t * scale / u16::MAX as f32;
+        strategy
+            .iter_mut()
+            .zip(&*cum_strategy)
+            .for_each(|(x, y)| *x += (*y as f32) * decoder);
+    }
 
     if !locking.is_empty() {
         strategy.iter_mut().zip(locking).for_each(|(d, s)| {
@@ -555,12 +616,22 @@ fn update_uncompressed_strategy<N: GameNode>(
     params: &DiscountParams,
     strategy: &[f32],
 ) {
-    let gamma = params.gamma_t;
     let cum_strategy = node.strategy_mut();
-    cum_strategy
-        .iter_mut()
-        .zip(strategy)
-        .for_each(|(x, y)| *x = *x * gamma + *y);
+    if params.additive_strategy {
+        let w = params.strategy_weight;
+        if w > 0.0 {
+            cum_strategy
+                .iter_mut()
+                .zip(strategy)
+                .for_each(|(x, y)| *x += w * *y);
+        }
+    } else {
+        let gamma = params.gamma_t;
+        cum_strategy
+            .iter_mut()
+            .zip(strategy)
+            .for_each(|(x, y)| *x = *x * gamma + *y);
+    }
 }
 
 #[inline]
