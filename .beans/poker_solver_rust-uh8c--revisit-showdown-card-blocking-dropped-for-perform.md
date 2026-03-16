@@ -1,14 +1,14 @@
 ---
 # poker_solver_rust-uh8c
 title: Revisit showdown card blocking (dropped for performance)
-status: todo
+status: completed
 type: task
 priority: normal
 tags:
     - gpu
     - perf
 created_at: 2026-03-15T19:30:56Z
-updated_at: 2026-03-15T19:30:56Z
+updated_at: 2026-03-16T00:15:36Z
 parent: poker_solver_rust-twez
 ---
 
