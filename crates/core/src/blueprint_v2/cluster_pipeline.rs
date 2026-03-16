@@ -591,44 +591,6 @@ pub fn cluster_flop_exhaustive(
     progress: impl Fn(&str, f64) + Sync,
 ) -> BucketFile {
     let all_canonical = enumerate_canonical_flops();
-
-    // Canonical mode: when bucket_count == number of canonical flops,
-    // skip clustering — each canonical flop gets its own unique bucket.
-    if bucket_count as usize == all_canonical.len() {
-        let num_boards = all_canonical.len();
-        let total = num_boards * TOTAL_COMBOS as usize;
-        let mut buckets = vec![0_u16; total];
-
-        for (board_idx, _) in all_canonical.iter().enumerate() {
-            let bucket = board_idx as u16;
-            let offset = board_idx * TOTAL_COMBOS as usize;
-            for combo_idx in 0..TOTAL_COMBOS as usize {
-                buckets[offset + combo_idx] = bucket;
-            }
-        }
-
-        let packed_boards: Vec<PackedBoard> = all_canonical
-            .iter()
-            .map(|wb| canonical_key(&wb.cards))
-            .collect();
-
-        progress("canonical", 1.0);
-
-        #[allow(clippy::cast_possible_truncation)]
-        return BucketFile {
-            header: BucketFileHeader {
-                street: Street::Flop,
-                bucket_count,
-                board_count: num_boards as u32,
-                combos_per_board: TOTAL_COMBOS,
-                version: VERSION,
-            },
-            boards: packed_boards,
-            buckets,
-        };
-    }
-
-    // Normal path: two-phase histogram-based clustering
     cluster_histogram_exhaustive(
         Street::Flop,
         turn_buckets,
@@ -2079,64 +2041,5 @@ mod tests {
         assert_eq!(total, 0, "no boards match, histogram should be all zeros");
     }
 
-    // -----------------------------------------------------------------------
-    // cluster_flop_exhaustive canonical mode tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn cluster_flop_exhaustive_canonical_mode() {
-        let canonical_count = enumerate_canonical_flops().len();
-
-        // Dummy turn BucketFile — canonical mode should not use it at all.
-        let dummy_turn = BucketFile {
-            header: BucketFileHeader {
-                street: Street::Turn,
-                bucket_count: 1,
-                board_count: 0,
-                combos_per_board: TOTAL_COMBOS,
-                version: VERSION,
-            },
-            boards: Vec::new(),
-            buckets: Vec::new(),
-        };
-
-        #[allow(clippy::cast_possible_truncation)]
-        let bucket_count = canonical_count as u16;
-
-        let result = cluster_flop_exhaustive(
-            &dummy_turn,
-            bucket_count,
-            10,
-            42,
-            100,
-            |_phase, _p| {},
-        );
-
-        // Header checks
-        assert_eq!(result.header.street, Street::Flop);
-        assert_eq!(result.header.bucket_count, bucket_count);
-        assert_eq!(result.header.board_count, canonical_count as u32);
-        assert_eq!(result.header.combos_per_board, TOTAL_COMBOS);
-
-        // Board count matches canonical flops (1755)
-        assert_eq!(result.boards.len(), canonical_count);
-        assert_eq!(canonical_count, 1755);
-
-        // Each board gets a unique bucket and all combos on the same board share it.
-        for board_idx in 0..canonical_count {
-            let expected_bucket = board_idx as u16;
-            let offset = board_idx * TOTAL_COMBOS as usize;
-            for combo_idx in 0..TOTAL_COMBOS as usize {
-                assert_eq!(
-                    result.buckets[offset + combo_idx],
-                    expected_bucket,
-                    "board {board_idx}, combo {combo_idx}: expected bucket {expected_bucket}"
-                );
-            }
-        }
-
-        // Total bucket vector length
-        assert_eq!(result.buckets.len(), canonical_count * TOTAL_COMBOS as usize);
-    }
 
 }
