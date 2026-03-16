@@ -189,6 +189,149 @@ fn bool_mask_to_u8(mask: &[bool; NUM_COMBOS]) -> [u8; NUM_COMBOS] {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Bucketed datagen — solve exact, map to bucket space
+// ---------------------------------------------------------------------------
+
+use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
+use super::bucket_mapping::encode_bucketed_record;
+
+/// Configuration for bucketed datagen output.
+pub struct BucketedDatagenConfig {
+    pub bucket_file: BucketFile,
+    pub board_cache: std::collections::HashMap<poker_solver_core::blueprint_v2::bucket_file::PackedBoard, u32>,
+    pub num_buckets: usize,
+    pub initial_stack: i32,
+}
+
+/// A single bucketed training record.
+pub struct BucketedRecord {
+    pub input: Vec<f32>,   // [2 * num_buckets + 1]
+    pub target: Vec<f32>,  // [2 * num_buckets]
+}
+
+/// Generate bucketed training data: solve exact with range-solver, map to bucket space.
+///
+/// Returns records rather than writing to disk, so the caller can handle storage.
+pub fn generate_bucketed_training_data(
+    config: &CfvnetConfig,
+    bucket_config: &BucketedDatagenConfig,
+    output_path: &Path,
+    seed: u64,
+) -> Result<u64, String> {
+    let num_samples = config.datagen.num_samples;
+    let board_size = config.game.board_size;
+    let threads = config.datagen.threads;
+
+    let bet_str = config.game.bet_sizes.join(",");
+    let bet_sizes = BetSizeOptions::try_from((bet_str.as_str(), ""))
+        .map_err(|e| format!("invalid bet sizes: {e}"))?;
+
+    let discount_scheme = match config.datagen.cfr_variant {
+        Some(poker_solver_core::cfr::dcfr::CfrVariant::DcfrPlus) => {
+            range_solver::DiscountScheme::DcfrPlus { delay: config.datagen.cfr_delay as u32 }
+        }
+        _ => range_solver::DiscountScheme::Default,
+    };
+    let solve_config = SolveConfig {
+        bet_sizes,
+        solver_iterations: config.datagen.solver_iterations,
+        target_exploitability: config.datagen.target_exploitability,
+        add_allin_threshold: config.game.add_allin_threshold,
+        force_allin_threshold: config.game.force_allin_threshold,
+        discount_scheme,
+    };
+
+    let pb = ProgressBar::new(num_samples);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
+            .expect("valid template"),
+    );
+
+    // Open output file — simple binary: [u32 num_buckets] header then flat records
+    let file = std::fs::File::create(output_path)
+        .map_err(|e| format!("create output: {e}"))?;
+    let mut writer = std::io::BufWriter::new(file);
+
+    // Write header
+    use std::io::Write;
+    let nb = bucket_config.num_buckets as u32;
+    writer.write_all(&nb.to_le_bytes()).map_err(|e| format!("write header: {e}"))?;
+
+    let pool = if threads > 1 {
+        Some(rayon::ThreadPoolBuilder::new().num_threads(threads).build()
+            .map_err(|e| format!("thread pool: {e}"))?)
+    } else {
+        None
+    };
+
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut remaining = num_samples;
+    let mut records_written = 0u64;
+
+    while remaining > 0 {
+        let chunk_len = remaining.min(CHUNK_SIZE);
+        remaining -= chunk_len;
+
+        let situations: Vec<_> = (0..chunk_len)
+            .map(|_| sample_situation(&config.datagen, config.game.initial_stack, board_size, &mut rng))
+            .collect();
+
+        let results = solve_chunk(&situations, &solve_config, &pb, pool.as_ref())?;
+
+        // Map to bucket space and write
+        for (sit, result) in situations.iter().zip(results) {
+            let result = match result {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Find board index
+            let board_cards: Vec<rs_poker::core::Card> = sit.board_cards().iter()
+                .map(|&c| {
+                    let rank = c / 4;
+                    let suit = c % 4;
+                    rs_poker::core::Card::new(
+                        rs_poker::core::Value::from(rank),
+                        match suit { 0 => rs_poker::core::Suit::Club, 1 => rs_poker::core::Suit::Diamond, 2 => rs_poker::core::Suit::Heart, _ => rs_poker::core::Suit::Spade },
+                    )
+                })
+                .collect();
+
+            let packed = poker_solver_core::blueprint_v2::cluster_pipeline::canonical_key(&board_cards);
+            let board_idx = match bucket_config.board_cache.get(&packed) {
+                Some(&idx) => idx,
+                None => continue, // board not in bucket file
+            };
+
+            let (input, target) = encode_bucketed_record(
+                &sit.ranges[0],
+                &sit.ranges[1],
+                &result.oop_evs,
+                &result.ip_evs,
+                &bucket_config.bucket_file,
+                board_idx,
+                bucket_config.num_buckets,
+                sit.pot as f32,
+                bucket_config.initial_stack as f32,
+            );
+
+            // Write record: [input floats][target floats]
+            for &v in &input {
+                writer.write_all(&v.to_le_bytes()).map_err(|e| format!("write: {e}"))?;
+            }
+            for &v in &target {
+                writer.write_all(&v.to_le_bytes()).map_err(|e| format!("write: {e}"))?;
+            }
+            records_written += 1;
+        }
+    }
+
+    pb.finish_with_message(format!("done — {records_written} bucketed records"));
+    Ok(records_written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
