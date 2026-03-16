@@ -114,6 +114,12 @@ enum Commands {
         /// Path to bucket file (e.g., local_data/clusters_500bkt_v3/river.buckets)
         #[arg(long)]
         buckets: PathBuf,
+        /// Override num_samples from config
+        #[arg(long)]
+        num_samples: Option<u64>,
+        /// Max samples per output file; splits into multiple files if total exceeds this
+        #[arg(long)]
+        per_file: Option<u64>,
     },
     /// Benchmark sample + solve throughput (no output).
     BenchSolve {
@@ -213,8 +219,9 @@ fn main() {
             num_spots,
         } => cmd_compare_exact(model, num_spots),
         Commands::DatagenEval { data } => cmd_datagen_eval(data),
-        Commands::GenerateBucketed { config, output, buckets } => {
-            cmd_generate_bucketed(config, output, buckets);
+        Commands::GenerateBucketed { config, output, buckets, num_samples, per_file } => {
+            ensure_parent_dir(&output);
+            cmd_generate_bucketed(config, output, buckets, num_samples, per_file);
         }
         Commands::BenchSolve { config, num_samples, threads } => {
             cmd_bench_solve(config, num_samples, threads);
@@ -222,17 +229,27 @@ fn main() {
     }
 }
 
-fn cmd_generate_bucketed(config_path: PathBuf, output: PathBuf, buckets_path: PathBuf) {
+fn cmd_generate_bucketed(
+    config_path: PathBuf,
+    output: PathBuf,
+    buckets_path: PathBuf,
+    num_samples_override: Option<u64>,
+    per_file: Option<u64>,
+) {
     use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
 
     let yaml = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
         eprintln!("failed to read config {}: {e}", config_path.display());
         std::process::exit(1);
     });
-    let cfg: cfvnet::config::CfvnetConfig = serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
+    let mut cfg: cfvnet::config::CfvnetConfig = serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
         eprintln!("failed to parse config: {e}");
         std::process::exit(1);
     });
+
+    if let Some(n) = num_samples_override {
+        cfg.datagen.num_samples = n;
+    }
 
     let bf = BucketFile::load(&buckets_path).unwrap_or_else(|e| {
         eprintln!("failed to load bucket file {}: {e}", buckets_path.display());
@@ -241,31 +258,63 @@ fn cmd_generate_bucketed(config_path: PathBuf, output: PathBuf, buckets_path: Pa
     let num_buckets = bf.header.bucket_count as usize;
     let board_cache = bf.board_index_map();
 
+    let total = cfg.datagen.num_samples;
+    let chunk_size = per_file.unwrap_or(total);
+    let num_files = total.div_ceil(chunk_size);
+
     eprintln!("Generating bucketed training data");
     eprintln!("  Config: {}", config_path.display());
     eprintln!("  Buckets: {} ({} buckets, {} boards)", buckets_path.display(), num_buckets, bf.header.board_count);
+    eprintln!("  Samples: {total}");
+    if num_files > 1 {
+        eprintln!("  Files: {num_files} ({chunk_size} per file)");
+    }
     eprintln!("  Output: {}", output.display());
-    eprintln!("  Samples: {}", cfg.datagen.num_samples);
     eprintln!("  CFR variant: {:?}", cfg.datagen.cfr_variant);
 
-    ensure_parent_dir(&output);
+    let base_seed = cfvnet::config::resolve_seed(cfg.datagen.seed);
+    let mut remaining = total;
+    let mut file_idx = 0u64;
+    let mut total_records = 0u64;
 
-    let seed = cfvnet::config::resolve_seed(cfg.datagen.seed);
+    while remaining > 0 {
+        let this_chunk = remaining.min(chunk_size);
+        remaining -= this_chunk;
 
-    let bucket_config = cfvnet::datagen::generate::BucketedDatagenConfig {
-        bucket_file: bf,
-        board_cache,
-        num_buckets,
-        initial_stack: cfg.game.initial_stack,
-    };
+        cfg.datagen.num_samples = this_chunk;
+        cfg.datagen.seed = Some(base_seed.wrapping_add(file_idx * 1_000_000));
 
-    match cfvnet::datagen::generate::generate_bucketed_training_data(&cfg, &bucket_config, &output, seed) {
-        Ok(n) => eprintln!("Wrote {n} bucketed records to {}", output.display()),
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
+        let file_output = if num_files > 1 {
+            append_random_suffix(&output)
+        } else {
+            output.clone()
+        };
+
+        if num_files > 1 {
+            eprintln!("  File {}/{num_files}: {} ({this_chunk} samples)", file_idx + 1, file_output.display());
         }
+
+        let bucket_config = cfvnet::datagen::generate::BucketedDatagenConfig {
+            bucket_file: BucketFile::load(&buckets_path).unwrap(),
+            board_cache: board_cache.clone(),
+            num_buckets,
+            initial_stack: cfg.game.initial_stack,
+        };
+
+        match cfvnet::datagen::generate::generate_bucketed_training_data(
+            &cfg, &bucket_config, &file_output, cfg.datagen.seed.unwrap(),
+        ) {
+            Ok(n) => total_records += n,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+
+        file_idx += 1;
     }
+
+    eprintln!("Done — {total_records} bucketed records across {file_idx} file(s)");
 }
 
 fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str) {
