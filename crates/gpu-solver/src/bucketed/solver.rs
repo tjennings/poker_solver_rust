@@ -115,6 +115,9 @@ pub struct BucketedGpuSolver<'a> {
     num_infosets: u32,
     num_nodes: u32,
     num_levels: usize,
+    /// Total initial reach (sum of initial_reach_oop). Used to normalize
+    /// fold/showdown payoffs (analogous to num_combinations in concrete solver).
+    reach_normalizer: f32,
 }
 
 #[cfg(feature = "cuda")]
@@ -349,6 +352,11 @@ impl<'a> BucketedGpuSolver<'a> {
             num_infosets,
             num_nodes,
             num_levels,
+            reach_normalizer: {
+                let rn = initial_reach_oop.iter().sum::<f32>();
+                eprintln!("    DEBUG solver: reach_normalizer = {:.1}", rn);
+                rn
+            },
         })
     }
 
@@ -420,8 +428,9 @@ impl<'a> BucketedGpuSolver<'a> {
                         &self.fold_player,
                         traverser,
                         self.num_fold_terminals,
-                        self.num_buckets, // total_hands = num_buckets for single-spot
                         self.num_buckets,
+                        self.num_buckets,
+                        self.reach_normalizer,
                     )?;
                 }
 
@@ -439,8 +448,9 @@ impl<'a> BucketedGpuSolver<'a> {
                         &self.showdown_equity_tables,
                         &self.showdown_half_pots,
                         self.num_showdown_terminals,
-                        self.num_buckets, // total_hands = num_buckets for single-spot
                         self.num_buckets,
+                        self.num_buckets,
+                        self.reach_normalizer,
                     )?;
                 }
 
@@ -779,6 +789,7 @@ mod tests {
             2, // num_fold_terminals
             total_hands,
             num_buckets,
+            1.0, // reach_normalizer = 1.0 for test (don't normalize)
         )
         .unwrap();
 
@@ -846,6 +857,7 @@ mod tests {
             1, // num_sd_terminals
             total_hands,
             num_buckets,
+            1.0, // reach_normalizer = 1.0 for test
         )
         .unwrap();
 

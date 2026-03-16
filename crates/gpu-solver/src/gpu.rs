@@ -1870,6 +1870,7 @@ impl GpuContext {
         num_sd_terminals: u32,
         total_hands: u32,
         num_buckets: u32,
+        reach_normalizer: f32,
     ) -> Result<(), GpuError> {
         let kernel = self.compile_and_load(
             include_str!("../kernels/bucketed_showdown.cu"),
@@ -1888,6 +1889,7 @@ impl GpuContext {
                 .arg(&num_sd_terminals)
                 .arg(&total_hands)
                 .arg(&num_buckets)
+                .arg(&reach_normalizer)
                 .launch(cfg)?;
         }
         Ok(())
@@ -1919,6 +1921,7 @@ impl GpuContext {
         num_fold_terminals: u32,
         total_hands: u32,
         num_buckets: u32,
+        reach_normalizer: f32,
     ) -> Result<(), GpuError> {
         let kernel = self.compile_and_load(
             include_str!("../kernels/bucketed_fold.cu"),
@@ -1938,6 +1941,7 @@ impl GpuContext {
                 .arg(&num_fold_terminals)
                 .arg(&total_hands)
                 .arg(&num_buckets)
+                .arg(&reach_normalizer)
                 .launch(cfg)?;
         }
         Ok(())

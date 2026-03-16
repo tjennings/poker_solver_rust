@@ -468,7 +468,33 @@ pub fn eval_bucketed_vs_concrete(config: &BucketedEvalConfig) -> Result<(), Stri
 
         // ---- Bucketed GPU solver ----
         let tree = BucketedTree::from_postflop_game(&mut game, &bf, &cache, num_buckets);
-        let initial_reach = vec![1.0f32; num_buckets];
+
+        // Map uniform ranges to bucket-space reach (proportional to bucket sizes)
+        let uniform_range: Vec<f32> = (0..1326)
+            .map(|combo| {
+                let (c1, c2) = range_solver::card::index_to_card_pair(combo);
+                if board_u8.contains(&c1) || board_u8.contains(&c2) { 0.0 } else { 1.0 }
+            })
+            .collect();
+        let initial_reach = super::mapping::range_to_bucket_reach(&uniform_range, &bf, board_idx, num_buckets);
+
+        // Debug: print tree terminal info
+        if spot_idx == 0 {
+            let reach_sum: f32 = initial_reach.iter().sum();
+            eprintln!("    DEBUG: initial_reach sum={:.1}, num_buckets={}", reach_sum, num_buckets);
+            eprintln!("    DEBUG: fold_half_pots={:?}", &tree.fold_half_pots);
+            eprintln!("    DEBUG: showdown_half_pots={:?}", &tree.showdown_half_pots);
+            eprintln!("    DEBUG: fold_players={:?}", &tree.fold_players);
+            eprintln!("    DEBUG: num_fold={}, num_showdown={}", tree.fold_half_pots.len(), tree.showdown_half_pots.len());
+            // Equity table stats
+            if let Some(eq) = tree.showdown_equity_tables.first() {
+                let eq_min = eq.iter().cloned().fold(f32::MAX, f32::min);
+                let eq_max = eq.iter().cloned().fold(f32::MIN, f32::max);
+                let eq_abs_mean: f32 = eq.iter().map(|v| v.abs()).sum::<f32>() / eq.len() as f32;
+                eprintln!("    DEBUG: equity_table[0] min={:.4} max={:.4} abs_mean={:.4} size={}",
+                    eq_min, eq_max, eq_abs_mean, eq.len());
+            }
+        }
 
         let mut solver = BucketedGpuSolver::new(&gpu, &tree, &initial_reach, &initial_reach)
             .map_err(|e| format!("Failed to create solver: {e}"))?;
