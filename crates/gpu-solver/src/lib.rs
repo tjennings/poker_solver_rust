@@ -11,5 +11,7 @@ pub mod training;
 
 pub mod resolve;
 
+pub mod bucketed;
+
 #[cfg(test)]
 mod tests;
