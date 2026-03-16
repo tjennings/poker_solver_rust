@@ -29,4 +29,6 @@ pub mod flop_solver;
 pub mod flop_pipeline;
 #[cfg(feature = "training")]
 pub mod preflop_pipeline;
+#[cfg(feature = "training")]
+pub mod eval_model;
 pub mod stack_config;

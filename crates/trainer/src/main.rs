@@ -381,6 +381,49 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// Evaluate a trained CFVNet model against GPU-exact solves
+    #[cfg(feature = "gpu-training")]
+    GpuEvalModel {
+        /// Path to model checkpoint (without .mpk.gz extension)
+        #[arg(long)]
+        model: PathBuf,
+        /// Number of hidden layers in the model
+        #[arg(long, default_value_t = 4)]
+        hidden_layers: usize,
+        /// Hidden layer width
+        #[arg(long, default_value_t = 256)]
+        hidden_size: usize,
+        /// Street to evaluate: "river" or "turn"
+        #[arg(long, default_value = "turn")]
+        street: String,
+        /// Number of random spots to evaluate
+        #[arg(long, default_value_t = 20)]
+        num_spots: usize,
+        /// DCFR+ iterations for ground-truth solves
+        #[arg(long, default_value_t = 4000)]
+        solve_iterations: u32,
+        /// Random seed
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Reference pot size
+        #[arg(long, default_value_t = 100)]
+        ref_pot: i32,
+        /// Reference effective stack
+        #[arg(long, default_value_t = 100)]
+        ref_stack: i32,
+        /// Path to leaf model (required for turn eval)
+        #[arg(long)]
+        leaf_model: Option<PathBuf>,
+        /// Number of hidden layers in the leaf model
+        #[arg(long, default_value_t = 7)]
+        leaf_hidden_layers: usize,
+        /// Hidden layer width of the leaf model
+        #[arg(long, default_value_t = 768)]
+        leaf_hidden_size: usize,
+        /// Bet sizes (e.g. "50%,a")
+        #[arg(long, default_value = "50%,a")]
+        bet_sizes: String,
+    },
     /// Solve a postflop spot with exact (no abstraction) DCFR
     RangeSolve {
         /// OOP player's range (PioSOLVER format, e.g. "QQ+,AKs,AKo")
@@ -1054,6 +1097,38 @@ fn main() -> Result<(), Box<dyn Error>> {
                 ref_stack,
             )?;
         }
+        #[cfg(feature = "gpu-training")]
+        Commands::GpuEvalModel {
+            model,
+            hidden_layers,
+            hidden_size,
+            street,
+            num_spots,
+            solve_iterations,
+            seed,
+            ref_pot,
+            ref_stack,
+            leaf_model,
+            leaf_hidden_layers,
+            leaf_hidden_size,
+            bet_sizes,
+        } => {
+            run_gpu_eval_model(
+                model,
+                hidden_layers,
+                hidden_size,
+                street,
+                num_spots,
+                solve_iterations,
+                seed,
+                ref_pot,
+                ref_stack,
+                leaf_model,
+                leaf_hidden_layers,
+                leaf_hidden_size,
+                bet_sizes,
+            )?;
+        }
         #[cfg(feature = "cuda")]
         Commands::GpuSolve {
             oop_range,
@@ -1398,6 +1473,49 @@ fn run_gpu_train_stack(
     train_full_stack::<B>(&stack_config, &output, &device)
         .map_err(|e| format!("Stack training failed: {e}"))?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GPU model evaluation
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gpu-training")]
+#[allow(clippy::too_many_arguments)]
+fn run_gpu_eval_model(
+    model: PathBuf,
+    hidden_layers: usize,
+    hidden_size: usize,
+    street: String,
+    num_spots: usize,
+    solve_iterations: u32,
+    seed: u64,
+    ref_pot: i32,
+    ref_stack: i32,
+    leaf_model: Option<PathBuf>,
+    leaf_hidden_layers: usize,
+    leaf_hidden_size: usize,
+    bet_sizes: String,
+) -> Result<(), Box<dyn Error>> {
+    use poker_solver_gpu::training::eval_model::{run_eval_model, EvalModelConfig};
+
+    let config = EvalModelConfig {
+        model_path: model,
+        hidden_layers,
+        hidden_size,
+        street,
+        num_spots,
+        solve_iterations,
+        seed,
+        ref_pot,
+        ref_stack,
+        leaf_model,
+        leaf_hidden_layers,
+        leaf_hidden_size,
+        bet_sizes,
+    };
+
+    run_eval_model(&config)?;
     Ok(())
 }
 
