@@ -1131,7 +1131,7 @@ impl<'a> BatchGpuSolver<'a> {
         let gpu_err = |e: GpuError| format!("GPU error: {e}");
 
         // Accumulators for profiling (summed over both traversers at profile iteration)
-        let profile_iter = 100u32;
+        let profile_iter = if std::env::var("GPU_PROFILE").is_ok() { 100u32 } else { u32::MAX };
         let mut prof_regret_match = 0.0f64;
         let mut prof_init_reach = 0.0f64;
         let mut prof_forward_pass = 0.0f64;
