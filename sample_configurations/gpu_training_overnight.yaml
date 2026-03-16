@@ -1,0 +1,51 @@
+# Overnight training run — moderate scale for evaluation.
+# Expected ~8-10 hours total on RTX 6000 Ada.
+
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "100%", "a"]
+  ref_pot: 100
+  ref_stack: 100
+
+river_model:
+  path: "local_data/models/river_v7/checkpoint_epoch340"
+  hidden_layers: 7
+  hidden_size: 768
+
+model:
+  hidden_layers: 7
+  hidden_size: 500
+
+training:
+  train_batch_size: 512
+  train_steps_per_batch: 10
+  learning_rate: 0.001
+  huber_delta: 1.0
+  aux_loss_weight: 1.0
+  seed: 42
+
+# Turn: ~4-5 hours (43 samples/s)
+turn:
+  num_samples: 500000
+  solve_iterations: 500
+  batch_size: 50
+  reservoir_capacity: 100000
+  validation_interval: 50000
+  checkpoint_interval: 100000
+
+# Flop: ~2-3 hours (45 samples/s)
+flop:
+  num_samples: 200000
+  solve_iterations: 500
+  batch_size: 20
+  reservoir_capacity: 50000
+  validation_interval: 20000
+  checkpoint_interval: 50000
+
+# Preflop: ~30 min (inference-only)
+preflop:
+  num_samples: 100000
+  batch_size: 5
+  reservoir_capacity: 50000
+  validation_interval: 10000
+  checkpoint_interval: 25000
