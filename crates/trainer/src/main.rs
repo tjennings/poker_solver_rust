@@ -496,6 +496,9 @@ enum Commands {
         /// Use batch solver with CFV extraction
         #[arg(long, default_value_t = false)]
         with_cfvs: bool,
+        /// Compare bucketed solver against concrete CPU range-solver
+        #[arg(long, default_value_t = false)]
+        compare: bool,
     },
     /// Run bucketed batch datagen on random river spots and report timing/CFV stats
     #[cfg(feature = "gpu-training")]
@@ -1260,6 +1263,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             bet_sizes,
             initial_stack,
             with_cfvs,
+            compare,
         } => {
             run_gpu_eval_bucketed(
                 buckets,
@@ -1270,6 +1274,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &bet_sizes,
                 initial_stack,
                 with_cfvs,
+                compare,
             )?;
         }
         #[cfg(feature = "gpu-training")]
@@ -1995,8 +2000,11 @@ fn run_gpu_eval_bucketed(
     bet_sizes_str: &str,
     initial_stack: i32,
     _with_cfvs: bool,
+    compare: bool,
 ) -> Result<(), Box<dyn Error>> {
-    use poker_solver_gpu::bucketed::eval::{eval_bucketed_solver, BucketedEvalConfig};
+    use poker_solver_gpu::bucketed::eval::{
+        eval_bucketed_solver, eval_bucketed_vs_concrete, BucketedEvalConfig,
+    };
     use range_solver::bet_size::BetSizeOptions;
 
     let bet_sizes = BetSizeOptions::try_from((bet_sizes_str, ""))
@@ -2012,8 +2020,11 @@ fn run_gpu_eval_bucketed(
         initial_stack,
     };
 
-    // Always use the simple eval for now (with_cfvs requires training feature)
-    eval_bucketed_solver(&config)?;
+    if compare {
+        eval_bucketed_vs_concrete(&config)?;
+    } else {
+        eval_bucketed_solver(&config)?;
+    }
 
     Ok(())
 }
