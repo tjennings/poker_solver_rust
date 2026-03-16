@@ -322,6 +322,7 @@ impl GpuModelStack {
             &flat_tree.boundary_stacks,
             &boards_flat,
             1, // single spot
+            flat_tree.num_combinations,
         )?;
 
         turn_solver.solve_with_cfvs(max_iterations)?;
@@ -355,6 +356,7 @@ impl GpuModelStack {
             &flat_tree.boundary_stacks,
             &boards_flat,
             1,
+            flat_tree.num_combinations,
         )?;
 
         let mut results = Vec::with_capacity(checkpoints.len());
@@ -406,6 +408,7 @@ impl GpuModelStack {
             &flat_tree.boundary_stacks,
             &boards_flat,
             1,
+            flat_tree.num_combinations,
         )?;
 
         flop_solver.solve_with_cfvs(max_iterations)?;
@@ -439,6 +442,7 @@ impl GpuModelStack {
             &flat_tree.boundary_stacks,
             &boards_flat,
             1,
+            flat_tree.num_combinations,
         )?;
 
         let mut results = Vec::with_capacity(checkpoints.len());

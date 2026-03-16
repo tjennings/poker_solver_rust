@@ -62,6 +62,8 @@ pub struct TurnBatchSolver<'a, B: Backend> {
     num_spots: u32,
     /// Hands per spot (1326).
     hands_per_spot: u32,
+    /// Number of valid hand-pair combinations (for pot-relative conversion).
+    num_combinations: f32,
 }
 
 #[cfg(feature = "training")]
@@ -77,6 +79,7 @@ impl<'a, B: Backend> TurnBatchSolver<'a, B> {
     /// * `boundary_stacks` -- Effective stack at each boundary.
     /// * `boards_flat` -- Per-spot turn board cards `[num_spots * 4]` on CPU.
     /// * `num_spots` -- Number of spots in the batch.
+    /// * `num_combinations` -- Number of valid hand-pair combinations (from FlatTree).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         gpu: &'a GpuContext,
@@ -87,6 +90,7 @@ impl<'a, B: Backend> TurnBatchSolver<'a, B> {
         boundary_stacks: &[f32],
         boards_flat: &[u32],
         num_spots: usize,
+        num_combinations: f64,
     ) -> Result<Self, String> {
         let gpu_err = |e: GpuError| format!("GPU error: {e}");
 
@@ -151,6 +155,7 @@ impl<'a, B: Backend> TurnBatchSolver<'a, B> {
             raw_cfvs,
             num_spots: num_spots as u32,
             hands_per_spot,
+            num_combinations: num_combinations as f32,
         })
     }
 
@@ -283,17 +288,20 @@ impl<'a, B: Backend> TurnBatchSolver<'a, B> {
         )?;
 
         // 3. Average: average 48 river outputs per combo, scatter to cfvalues
+        // Converts pot-relative model output to raw DCFR+ cfvalue units.
         gpu.launch_average_leaf_cfvs(
             self.solver.cfvalues_mut(),
             &self.raw_cfvs,
             &self.gpu_boundary_nodes,
             &self.gpu_river_cards,
             &self.gpu_combo_cards,
+            &self.gpu_boundary_pots,
             self.num_boundaries,
             NUM_RIVERS,
             self.num_spots,
             total_hands,
             self.hands_per_spot,
+            self.num_combinations,
         ).map_err(gpu_err)?;
 
         Ok(())
@@ -392,6 +400,8 @@ pub struct TurnBatchSolverCuda<'a> {
     num_spots: u32,
     /// Hands per spot (1326).
     hands_per_spot: u32,
+    /// Number of valid hand-pair combinations (for pot-relative conversion).
+    num_combinations: f32,
 }
 
 #[cfg(feature = "training")]
@@ -407,6 +417,7 @@ impl<'a> TurnBatchSolverCuda<'a> {
         boundary_stacks: &[f32],
         boards_flat: &[u32],
         num_spots: usize,
+        num_combinations: f64,
     ) -> Result<Self, String> {
         let gpu_err = |e: GpuError| format!("GPU error: {e}");
 
@@ -465,6 +476,7 @@ impl<'a> TurnBatchSolverCuda<'a> {
             raw_cfvs,
             num_spots: num_spots as u32,
             hands_per_spot,
+            num_combinations: num_combinations as f32,
         })
     }
 
@@ -563,17 +575,20 @@ impl<'a> TurnBatchSolverCuda<'a> {
         ).map_err(gpu_err)?;
 
         // 3. Average across rivers and scatter to cfvalues
+        // Converts pot-relative model output to raw DCFR+ cfvalue units.
         gpu.launch_average_leaf_cfvs(
             self.solver.cfvalues_mut(),
             &self.raw_cfvs,
             &self.gpu_boundary_nodes,
             &self.gpu_river_cards,
             &self.gpu_combo_cards,
+            &self.gpu_boundary_pots,
             self.num_boundaries,
             NUM_RIVERS,
             self.num_spots,
             total_hands,
             self.hands_per_spot,
+            self.num_combinations,
         ).map_err(gpu_err)?;
 
         Ok(())

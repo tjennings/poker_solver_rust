@@ -187,6 +187,7 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
     // Initialize components
     let batch_config = BatchConfig::default();
     let builder = GpuBatchBuilder::new(&gpu, &batch_config, config.ref_pot, config.ref_stack)?;
+    let num_combinations = builder.topology().ref_tree.num_combinations;
     let mut reservoir = GpuReservoir::new(&gpu, config.reservoir_capacity)
         .map_err(|e| format!("reservoir: {e}"))?;
     let mut trainer = GpuTrainer::<B>::new(
@@ -292,6 +293,18 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
         let t3 = Instant::now();
 
         // === INSERT PHASE (GPU) ===
+        // Convert raw DCFR+ cfvalues to pot-relative before reservoir insert.
+        let num_combs_f32 = num_combinations as f32;
+        let total_hands = (config.batch_size * 1326) as u32;
+        let mut cfvs_oop = solve_result.cfvs_oop;
+        let mut cfvs_ip = solve_result.cfvs_ip;
+        gpu.launch_scale_cfvs_to_pot_relative(
+            &mut cfvs_oop, &gpu_pots, num_combs_f32, total_hands, 1326,
+        ).map_err(|e| format!("scale cfvs oop: {e}"))?;
+        gpu.launch_scale_cfvs_to_pot_relative(
+            &mut cfvs_ip, &gpu_pots, num_combs_f32, total_hands, 1326,
+        ).map_err(|e| format!("scale cfvs ip: {e}"))?;
+
         reservoir.insert_batch_gpu(
             &gpu,
             sampler.ranges_oop(),
@@ -299,8 +312,8 @@ pub fn train_river_cfvnet<B: AutodiffBackend>(
             sampler.boards(),
             &gpu_pots,
             &gpu_stacks,
-            &solve_result.cfvs_oop,
-            &solve_result.cfvs_ip,
+            &cfvs_oop,
+            &cfvs_ip,
             config.batch_size,
         ).map_err(|e| format!("reservoir insert: {e}"))?;
         let t4 = Instant::now();

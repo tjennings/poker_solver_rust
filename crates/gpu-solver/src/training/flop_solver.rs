@@ -57,6 +57,8 @@ pub struct FlopBatchSolverCuda<'a> {
     num_spots: u32,
     /// Hands per spot (1326).
     hands_per_spot: u32,
+    /// Number of valid hand-pair combinations (for pot-relative conversion).
+    num_combinations: f32,
 }
 
 #[cfg(feature = "training")]
@@ -72,6 +74,7 @@ impl<'a> FlopBatchSolverCuda<'a> {
         boundary_stacks: &[f32],
         boards_flat: &[u32],
         num_spots: usize,
+        num_combinations: f64,
     ) -> Result<Self, String> {
         let gpu_err = |e: GpuError| format!("GPU error: {e}");
 
@@ -130,6 +133,7 @@ impl<'a> FlopBatchSolverCuda<'a> {
             raw_cfvs,
             num_spots: num_spots as u32,
             hands_per_spot,
+            num_combinations: num_combinations as f32,
         })
     }
 
@@ -229,17 +233,20 @@ impl<'a> FlopBatchSolverCuda<'a> {
 
         // 3. Average across turn cards and scatter to cfvalues.
         // Reuses the same average_leaf_cfvs kernel (parameterized by num_rivers/num_next_cards).
+        // Converts pot-relative model output to raw DCFR+ cfvalue units.
         gpu.launch_average_leaf_cfvs(
             self.solver.cfvalues_mut(),
             &self.raw_cfvs,
             &self.gpu_boundary_nodes,
             &self.gpu_turn_cards,
             &self.gpu_combo_cards,
+            &self.gpu_boundary_pots,
             self.num_boundaries,
             NUM_TURN_CARDS,
             self.num_spots,
             total_hands,
             self.hands_per_spot,
+            self.num_combinations,
         ).map_err(gpu_err)?;
 
         Ok(())

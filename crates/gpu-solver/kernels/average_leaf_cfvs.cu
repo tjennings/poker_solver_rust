@@ -19,11 +19,13 @@ extern "C" __global__ void average_leaf_cfvs(
     const unsigned int* boundary_nodes, // [num_boundaries] -- node IDs
     const unsigned int* river_cards,    // [num_spots * num_rivers] -- per-spot river cards
     const unsigned int* combo_cards,    // [1326 * 2] -- card pairs per combo
+    const float* boundary_pots,         // [num_boundaries] -- pot at each boundary
     unsigned int num_boundaries,
     unsigned int num_rivers,
     unsigned int num_spots,
     unsigned int total_hands,           // num_nodes * num_spots * hands_per_spot stride
-    unsigned int hands_per_spot         // typically 1326
+    unsigned int hands_per_spot,        // typically 1326
+    float num_combinations              // from FlatTree, for pot-relative -> raw conversion
 ) {
     unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total_threads = num_boundaries * num_spots * hands_per_spot;
@@ -63,7 +65,12 @@ extern "C" __global__ void average_leaf_cfvs(
         count++;
     }
 
-    // Write averaged CFV to cfvalues at the boundary node position
+    // Write averaged CFV to cfvalues at the boundary node position.
+    // The model outputs pot-relative values (0.5 = breakeven).
+    // Convert to raw DCFR+ cfvalue units:
+    //   cfvalue = (pot_relative - 0.5) * pot / num_combinations
     float avg = (count > 0) ? (sum / (float)count) : 0.0f;
-    cfvalues[node_id * total_hands + spot_idx * hands_per_spot + hand] = avg;
+    float pot = boundary_pots[boundary_idx];
+    float raw = (avg - 0.5f) * pot / num_combinations;
+    cfvalues[node_id * total_hands + spot_idx * hands_per_spot + hand] = raw;
 }

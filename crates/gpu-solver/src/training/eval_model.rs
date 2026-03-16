@@ -118,6 +118,7 @@ fn run_eval_river(config: &EvalModelConfig) -> Result<(), String> {
         ip_bet_sizes: bet_sizes,
     };
     let builder = GpuBatchBuilder::new(&gpu, &batch_config, config.ref_pot, config.ref_stack)?;
+    let num_combinations = builder.topology().ref_tree.num_combinations;
 
     // Sampler for random river boards
     let mut sampler = GpuSampler::new(&gpu, 1, config.seed)?;
@@ -170,6 +171,7 @@ fn run_eval_river(config: &EvalModelConfig) -> Result<(), String> {
             &gt_cfvs_ip,
             config.ref_pot as f32,
             config.ref_stack as f32,
+            num_combinations,
         )?;
 
         eprintln!(
@@ -249,6 +251,7 @@ fn run_eval_turn(config: &EvalModelConfig) -> Result<(), String> {
     let builder = GpuBatchBuilder::new_turn(&gpu, &batch_config, config.ref_pot, config.ref_stack)?;
     let ref_tree = &builder.topology().ref_tree;
     let num_boundaries = ref_tree.boundary_indices.len();
+    let num_combinations = ref_tree.num_combinations;
     eprintln!(
         "Turn tree: {} nodes, {} boundaries",
         ref_tree.num_nodes(),
@@ -297,6 +300,7 @@ fn run_eval_turn(config: &EvalModelConfig) -> Result<(), String> {
             &topo.boundary_stacks,
             &boards_host,
             1, // num_spots=1
+            num_combinations,
         )?;
 
         // 4. Solve
@@ -332,6 +336,7 @@ fn run_eval_turn(config: &EvalModelConfig) -> Result<(), String> {
             &gt_cfvs_ip,
             config.ref_pot as f32,
             config.ref_stack as f32,
+            num_combinations,
         )?;
 
         eprintln!(
@@ -358,6 +363,10 @@ fn run_eval_turn(config: &EvalModelConfig) -> Result<(), String> {
 ///
 /// Encodes the situation from both OOP and IP perspectives, runs the model
 /// forward pass, and computes MAE and max error across all valid combos.
+///
+/// Ground-truth CFVs are in raw DCFR+ units. Model predictions are in
+/// pot-relative units. We convert ground truth to pot-relative for comparison:
+///   pot_relative = raw * num_combinations / pot + 0.5
 #[cfg(feature = "training")]
 fn evaluate_both_perspectives(
     gpu: &GpuContext,
@@ -369,10 +378,20 @@ fn evaluate_both_perspectives(
     gt_cfvs_ip: &[f32],
     pot: f32,
     stack: f32,
+    num_combinations: f64,
 ) -> Result<SpotResult, String> {
     let mut total_abs_error = 0.0f64;
     let mut max_error = 0.0f32;
     let mut total_valid = 0usize;
+
+    // Convert ground-truth CFVs from raw DCFR+ units to pot-relative
+    let num_combs_f32 = num_combinations as f32;
+    let gt_oop_pr: Vec<f32> = gt_cfvs_oop.iter()
+        .map(|&v| v * num_combs_f32 / pot + 0.5)
+        .collect();
+    let gt_ip_pr: Vec<f32> = gt_cfvs_ip.iter()
+        .map(|&v| v * num_combs_f32 / pot + 0.5)
+        .collect();
 
     for player in 0..2u8 {
         let (input, mask, _game_value) = encode_input(
@@ -383,7 +402,7 @@ fn evaluate_both_perspectives(
             stack,
             player,
         );
-        let gt_cfvs = if player == 0 { gt_cfvs_oop } else { gt_cfvs_ip };
+        let gt_cfvs = if player == 0 { &gt_oop_pr } else { &gt_ip_pr };
 
         // Upload encoded input to GPU and run forward pass
         let gpu_input = gpu
@@ -458,20 +477,14 @@ fn print_summary(results: &[SpotResult], elapsed: std::time::Duration) {
         .map(|r| r.max_error)
         .fold(0.0f32, f32::max);
 
-    // Pot-relative: divide raw MAE by pot to get fraction-of-pot error
-    // mBB: pot-relative * 1000 (assuming pot ≈ pot in bb units / 2)
-    // With ref_pot=100 and initial_stack=200 (100bb), pot=100 means 50bb pot
-    // So 1 unit of pot = 2bb, and mBB = mae / pot * 2 * 1000 = mae * 20
-    // Simpler: just report raw MAE and MAE/pot
-    let pot = 100.0f32; // TODO: make configurable
-    let pot_relative_mae = global_mae / pot;
-    let mbb = pot_relative_mae * 1000.0; // assuming pot = 1 pot unit
+    // MAE is now in pot-relative units (model and ground truth both pot-relative).
+    // mBB = pot-relative MAE * 1000
+    let mbb = global_mae * 1000.0;
 
     eprintln!();
     eprintln!("Summary:");
-    eprintln!("  Raw MAE:                    {global_mae:.4}");
-    eprintln!("  Pot-relative MAE:           {pot_relative_mae:.6} ({mbb:.1} mBB/hand)");
-    eprintln!("  Max Error:                  {global_max:.3}");
+    eprintln!("  Pot-relative MAE:           {global_mae:.6} ({mbb:.1} mBB/hand)");
+    eprintln!("  Max Error (pot-relative):   {global_max:.6}");
     eprintln!("  Spots evaluated:            {}", results.len());
     eprintln!("  Total combos evaluated:     {total_combos}");
     eprintln!("  Elapsed:                    {:.1}s", elapsed.as_secs_f64());

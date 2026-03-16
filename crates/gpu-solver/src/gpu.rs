@@ -1509,11 +1509,13 @@ impl GpuContext {
         boundary_nodes: &CudaSlice<u32>,
         river_cards: &CudaSlice<u32>,
         combo_cards: &CudaSlice<u32>,
+        boundary_pots: &CudaSlice<f32>,
         num_boundaries: u32,
         num_rivers: u32,
         num_spots: u32,
         total_hands: u32,
         hands_per_spot: u32,
+        num_combinations: f32,
     ) -> Result<(), GpuError> {
         let kernel = self.compile_and_load(
             include_str!("../kernels/average_leaf_cfvs.cu"),
@@ -1529,11 +1531,13 @@ impl GpuContext {
                 .arg(boundary_nodes)
                 .arg(river_cards)
                 .arg(combo_cards)
+                .arg(boundary_pots)
                 .arg(&num_boundaries)
                 .arg(&num_rivers)
                 .arg(&num_spots)
                 .arg(&total_hands)
                 .arg(&hands_per_spot)
+                .arg(&num_combinations)
                 .launch(cfg)?;
         }
         Ok(())
@@ -2732,11 +2736,16 @@ mod tests {
         raw_cfvs[1328] = 14.0;  // input_idx=1, hand=2
         raw_cfvs[1329] = 16.0;  // input_idx=1, hand=3
 
+        // Boundary pot for the single boundary (used for pot-relative -> raw conversion)
+        let boundary_pots_data = vec![100.0f32]; // pot = 100
+        let num_combinations: f32 = 1.0; // trivial for test
+
         let gpu_cfvalues = gpu.alloc_zeros::<f32>(total_hands as usize).unwrap();
         let gpu_raw_cfvs = gpu.upload(&raw_cfvs).unwrap();
         let gpu_boundary_nodes = gpu.upload(&boundary_nodes).unwrap();
         let gpu_river_cards = gpu.upload(&river_cards).unwrap();
         let gpu_combo_cards = gpu.upload(&combo_cards_flat).unwrap();
+        let gpu_boundary_pots = gpu.upload(&boundary_pots_data).unwrap();
 
         let mut gpu_cfvalues = gpu_cfvalues;
 
@@ -2746,43 +2755,54 @@ mod tests {
             &gpu_boundary_nodes,
             &gpu_river_cards,
             &gpu_combo_cards,
+            &gpu_boundary_pots,
             num_boundaries,
             num_rivers,
             num_spots,
             total_hands,
             hands_per_spot,
+            num_combinations,
         ).unwrap();
 
         let result = gpu.download(&gpu_cfvalues).unwrap();
 
-        let eps = 1e-5;
+        let eps = 1e-3;
+
+        // The kernel now converts pot-relative to raw DCFR+ units:
+        //   raw = (avg - 0.5) * pot / num_combinations
+        // With pot=100.0 and num_combinations=1.0:
+        //   raw = (avg - 0.5) * 100.0
 
         // Hand 0: (0,1) no conflicts. avg = (2.0 + 10.0) / 2 = 6.0
+        // raw = (6.0 - 0.5) * 100 = 550.0
         assert!(
-            (result[0] - 6.0).abs() < eps,
-            "hand 0 avg should be 6.0, got {}",
+            (result[0] - 550.0).abs() < eps,
+            "hand 0 raw should be 550.0, got {}",
             result[0]
         );
 
         // Hand 1: (2,3) no conflicts. avg = (4.0 + 12.0) / 2 = 8.0
+        // raw = (8.0 - 0.5) * 100 = 750.0
         assert!(
-            (result[1] - 8.0).abs() < eps,
-            "hand 1 avg should be 8.0, got {}",
+            (result[1] - 750.0).abs() < eps,
+            "hand 1 raw should be 750.0, got {}",
             result[1]
         );
 
         // Hand 2: (10,5) conflicts with river=10. Only river=11 is valid.
         // avg = 14.0 / 1 = 14.0
+        // raw = (14.0 - 0.5) * 100 = 1350.0
         assert!(
-            (result[2] - 14.0).abs() < eps,
-            "hand 2 avg should be 14.0 (river=10 conflict), got {}",
+            (result[2] - 1350.0).abs() < eps,
+            "hand 2 raw should be 1350.0 (river=10 conflict), got {}",
             result[2]
         );
 
         // Hand 3: (6,7) no conflicts. avg = (8.0 + 16.0) / 2 = 12.0
+        // raw = (12.0 - 0.5) * 100 = 1150.0
         assert!(
-            (result[3] - 12.0).abs() < eps,
-            "hand 3 avg should be 12.0, got {}",
+            (result[3] - 1150.0).abs() < eps,
+            "hand 3 raw should be 1150.0, got {}",
             result[3]
         );
     }

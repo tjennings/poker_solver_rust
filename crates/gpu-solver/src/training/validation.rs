@@ -148,41 +148,41 @@ impl GroundTruthValidator {
             game.allocate_memory(false);
             let _exploitability = range_solver::solve(&mut game, solve_iterations, 0.0, false);
 
-            // Extract root CFVs as raw counterfactual values.
+            // Extract root CFVs as pot-relative values.
             //
-            // The GPU solver's training targets are raw cfvalues from the DCFR+
-            // backward pass, where terminal payoffs are pre-divided by
-            // num_combinations. We must produce ground-truth targets in the same
-            // scale.
-            //
+            // The model outputs pot-relative values (0.5 = breakeven).
             // `expected_values(player)` returns chip EVs (after normalisation):
             //   chip_ev[h] = cfv_raw[h] * num_combinations + starting_pot / 2
             //
-            // So we reverse:
-            //   cfv_raw[h] = (chip_ev[h] - starting_pot / 2) / num_combinations
+            // Converting to pot-relative:
+            //   pot_relative = (chip_ev - starting_pot/2) / pot + 0.5
             //
-            // Additionally, `expected_values` is indexed by private_cards order
+            // `expected_values` is indexed by private_cards order
             // (only non-blocked combos), NOT the canonical 1326-combo layout the
             // GPU solver uses. We remap via `card_pair_to_index`.
             game.back_to_root();
             game.cache_normalized_weights();
-            let num_combinations = game.num_combinations() as f32;
             let half_pot = 100.0_f32 * 0.5; // starting_pot / 2
 
-            // Convert chip EVs → raw cfvalues in canonical 1326 order
-            let map_to_raw_cfvs = |player: usize| -> Vec<f32> {
+            // Convert chip EVs → pot-relative cfvalues in canonical 1326 order.
+            // The model outputs pot-relative values (0.5 = breakeven):
+            //   raw = (chip_ev - starting_pot/2) / num_combinations
+            //   pot_relative = raw * num_combinations / pot + 0.5
+            // Substituting: pot_relative = (chip_ev - starting_pot/2) / pot + 0.5
+            let pot = 100.0_f32; // ref_pot (same as starting_pot for the reference tree)
+            let map_to_pot_relative_cfvs = |player: usize| -> Vec<f32> {
                 let chip_evs = game.expected_values(player);
                 let hands = game.private_cards(player);
-                let mut raw_cfvs = vec![0.0f32; OUTPUT_SIZE];
+                let mut cfvs = vec![0.0f32; OUTPUT_SIZE];
                 for (i, &(c1, c2)) in hands.iter().enumerate() {
                     let idx = range_solver::card::card_pair_to_index(c1, c2);
-                    raw_cfvs[idx] = (chip_evs[i] - half_pot) / num_combinations;
+                    cfvs[idx] = (chip_evs[i] - half_pot) / pot + 0.5;
                 }
-                raw_cfvs
+                cfvs
             };
 
-            let cfvs_oop = map_to_raw_cfvs(0);
-            let cfvs_ip = map_to_raw_cfvs(1);
+            let cfvs_oop = map_to_pot_relative_cfvs(0);
+            let cfvs_ip = map_to_pot_relative_cfvs(1);
 
             // Encode both perspectives
             for player in 0..2u8 {

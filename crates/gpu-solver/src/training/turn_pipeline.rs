@@ -316,6 +316,7 @@ pub fn train_turn_cfvnet<B: AutodiffBackend>(
         )?;
 
         let topo = &builder.topology().ref_tree;
+        let num_combs = topo.num_combinations;
         let mut turn_solver = TurnBatchSolver::new(
             &gpu,
             batch_solver,
@@ -325,6 +326,7 @@ pub fn train_turn_cfvnet<B: AutodiffBackend>(
             &topo.boundary_stacks,
             &boards_host,
             config.batch_size,
+            num_combs,
         )?;
         let t2 = Instant::now();
 
@@ -333,6 +335,19 @@ pub fn train_turn_cfvnet<B: AutodiffBackend>(
         let t3 = Instant::now();
 
         // === INSERT PHASE (GPU) ===
+        // Convert raw DCFR+ cfvalues to pot-relative before reservoir insert.
+        // The trained model will output pot-relative values.
+        let num_combs_f32 = num_combs as f32;
+        let total_hands = (config.batch_size * 1326) as u32;
+        let mut cfvs_oop = solve_result.cfvs_oop;
+        let mut cfvs_ip = solve_result.cfvs_ip;
+        gpu.launch_scale_cfvs_to_pot_relative(
+            &mut cfvs_oop, &gpu_pots, num_combs_f32, total_hands, 1326,
+        ).map_err(|e| format!("scale cfvs oop: {e}"))?;
+        gpu.launch_scale_cfvs_to_pot_relative(
+            &mut cfvs_ip, &gpu_pots, num_combs_f32, total_hands, 1326,
+        ).map_err(|e| format!("scale cfvs ip: {e}"))?;
+
         // Pad 4-card boards to 5-card for the reservoir encoder kernel.
         // The 5th card is set to 255 (>= 52), which the kernel ignores
         // in one-hot encoding (`if (b[i] < 52)`) and masking.
@@ -348,8 +363,8 @@ pub fn train_turn_cfvnet<B: AutodiffBackend>(
                 &gpu_padded_boards,
                 &gpu_pots,
                 &gpu_stacks,
-                &solve_result.cfvs_oop,
-                &solve_result.cfvs_ip,
+                &cfvs_oop,
+                &cfvs_ip,
                 config.batch_size,
             )
             .map_err(|e| format!("reservoir insert: {e}"))?;
@@ -627,6 +642,7 @@ pub fn train_turn_cfvnet_cuda<B: AutodiffBackend>(
         )?;
 
         let topo = &builder.topology().ref_tree;
+        let num_combs = topo.num_combinations;
         let mut turn_solver = TurnBatchSolverCuda::new(
             &gpu,
             batch_solver,
@@ -636,6 +652,7 @@ pub fn train_turn_cfvnet_cuda<B: AutodiffBackend>(
             &topo.boundary_stacks,
             &boards_host,
             config.batch_size,
+            num_combs,
         )?;
         let t2 = Instant::now();
 
@@ -644,6 +661,16 @@ pub fn train_turn_cfvnet_cuda<B: AutodiffBackend>(
         let t3 = Instant::now();
 
         // === INSERT PHASE ===
+        // Convert raw DCFR+ cfvalues to pot-relative before reservoir insert.
+        let num_combs_f32 = num_combs as f32;
+        let total_hands = (config.batch_size * 1326) as u32;
+        gpu.launch_scale_cfvs_to_pot_relative(
+            &mut solve_result.cfvs_oop, &gpu_pots, num_combs_f32, total_hands, 1326,
+        ).map_err(|e| format!("scale cfvs oop: {e}"))?;
+        gpu.launch_scale_cfvs_to_pot_relative(
+            &mut solve_result.cfvs_ip, &gpu_pots, num_combs_f32, total_hands, 1326,
+        ).map_err(|e| format!("scale cfvs ip: {e}"))?;
+
         let padded_boards = pad_boards_to_5(&boards_host);
         let gpu_padded_boards = gpu
             .upload(&padded_boards)
