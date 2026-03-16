@@ -8,7 +8,7 @@ tags:
     - gpu
     - bucket
 created_at: 2026-03-16T17:47:25Z
-updated_at: 2026-03-16T17:47:25Z
+updated_at: 2026-03-16T23:10:10Z
 parent: poker_solver_rust-618h
 ---
 
@@ -25,10 +25,10 @@ Completed:
 - [x] A7: Combo-to-bucket mapping utilities
 - [x] A8: BatchBucketedSolver + datagen pipeline
 - [x] A9: eval command + CLI
+- [x] River CFV net training (Supremus-exact: dual-player output, zero-sum)
 
 In progress:
 - [ ] Fix bucketed solver correctness (0% check, heavy all-in — payoff/equity scale mismatch)
-- [ ] River CFV net training (Supremus-exact: dual-player output, zero-sum)
 - [ ] Validation: MAE < 0.05, >90% dominant action agreement vs CPU
 
 Performance target: 50M samples in 1 hour
