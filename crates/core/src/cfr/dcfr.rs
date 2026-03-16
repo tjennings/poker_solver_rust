@@ -1,13 +1,15 @@
 //! Shared DCFR (Discounted Counterfactual Regret) module.
 //!
 //! Encapsulates the discounting and iteration-weighting logic used by both
-//! the preflop LCFR solver and the postflop exhaustive solver. Supports four
+//! the preflop LCFR solver and the postflop exhaustive solver. Supports five
 //! variants via [`CfrVariant`]:
 //!
 //! - **Vanilla**: no discounting, uniform iteration weighting.
 //! - **DCFR**: α/β/γ discounting with linear (LCFR) iteration weighting.
 //! - **CFR+**: regrets floored to zero, linear strategy weighting.
 //! - **Linear**: DCFR with all exponents = 1.0 (Pluribus-style).
+//! - **DcfrPlus**: Supremus DCFR+ — standard DCFR regret discounting (α=1.5, β=0)
+//!   with additive linear strategy weighting and delayed averaging.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,13 +26,16 @@ pub enum CfrVariant {
     CfrPlus,
     /// DCFR with all exponents = 1.0 (Pluribus linear weighting).
     Linear,
+    /// Supremus DCFR+: standard DCFR regret discounting (α=1.5, β=0)
+    /// with additive linear strategy weighting and delayed averaging.
+    DcfrPlus,
 }
 
 /// Parameters for Discounted CFR variants.
 ///
 /// Encapsulates the DCFR discounting logic shared between preflop and postflop
 /// solvers. Supports Vanilla (no-op), DCFR (α/β/γ), CFR+ (floor + linear
-/// strategy), and Linear (LCFR).
+/// strategy), Linear (LCFR), and DcfrPlus (Supremus delayed averaging).
 #[derive(Debug, Clone, Copy)]
 pub struct DcfrParams {
     pub variant: CfrVariant,
@@ -42,6 +47,9 @@ pub struct DcfrParams {
     pub gamma: f64,
     /// Number of initial iterations without DCFR discounting (warm-up phase).
     pub warmup: u64,
+    /// Strategy averaging delay for DcfrPlus variant.
+    /// First `delay` iterations get zero strategy weight.
+    pub delay: u64,
 }
 
 impl Default for DcfrParams {
@@ -52,6 +60,7 @@ impl Default for DcfrParams {
             beta: 0.5,
             gamma: 2.0,
             warmup: 0,
+            delay: 100,
         }
     }
 }
@@ -66,6 +75,7 @@ impl DcfrParams {
             beta: 1.0,
             gamma: 1.0,
             warmup: 0,
+            delay: 0,
         }
     }
 
@@ -78,6 +88,7 @@ impl DcfrParams {
             beta: 0.0,
             gamma: 0.0,
             warmup: 0,
+            delay: 0,
         }
     }
 
@@ -96,6 +107,24 @@ impl DcfrParams {
             beta,
             gamma,
             warmup,
+            delay: 0,
+        }
+    }
+
+    /// Supremus DCFR+: α=1.5, β=0 regret discounting,
+    /// additive linear strategy weighting with delay `d`.
+    ///
+    /// With β=0: negative regret factor = t^0/(t^0+1) = 0.5 (constant halving).
+    /// Strategy weight at iteration t = max(0, t - d), giving delayed linear averaging.
+    #[must_use]
+    pub fn dcfr_plus(delay: u64) -> Self {
+        Self {
+            variant: CfrVariant::DcfrPlus,
+            alpha: 1.5,
+            beta: 0.0,
+            gamma: 0.0, // unused for DcfrPlus (uses additive, not multiplicative)
+            warmup: 0,
+            delay,
         }
     }
 
@@ -104,6 +133,8 @@ impl DcfrParams {
     /// - Vanilla: `(1.0, 1.0)` — uniform weighting.
     /// - DCFR / Linear: `(t, t)` — linear (LCFR) weighting.
     /// - CFR+: `(1.0, t)` — uniform regret, linear strategy.
+    /// - DcfrPlus: `(1.0, max(0, t - delay))` — regret handled by discount_regrets,
+    ///   strategy weight is delayed linear.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn iteration_weights(&self, iteration: u64) -> (f64, f64) {
@@ -114,6 +145,34 @@ impl DcfrParams {
                 (w, w)
             }
             CfrVariant::CfrPlus => (1.0, iteration as f64),
+            CfrVariant::DcfrPlus => {
+                let strat_w = if iteration > self.delay {
+                    (iteration - self.delay) as f64
+                } else {
+                    0.0
+                };
+                (1.0, strat_w)
+            }
+        }
+    }
+
+    /// Returns the additive strategy weight for the current iteration.
+    ///
+    /// For most variants this is 1.0 (multiplicative discount handles weighting
+    /// via `discount_strategy_sums`). For DcfrPlus, returns `max(0, t - delay)`
+    /// to implement delayed linear averaging.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn strategy_weight(&self, iteration: u64) -> f64 {
+        match self.variant {
+            CfrVariant::DcfrPlus => {
+                if iteration > self.delay {
+                    (iteration - self.delay) as f64
+                } else {
+                    0.0
+                }
+            }
+            _ => 1.0,
         }
     }
 
@@ -127,12 +186,14 @@ impl DcfrParams {
 
     /// Whether DCFR discounting should be applied at this iteration.
     ///
-    /// Returns `true` if the variant is DCFR or Linear **and** the iteration
-    /// is past the warmup phase.
+    /// Returns `true` if the variant is DCFR, Linear, or DcfrPlus **and** the
+    /// iteration is past the warmup phase.
     #[must_use]
     pub fn should_discount(&self, iteration: u64) -> bool {
-        matches!(self.variant, CfrVariant::Dcfr | CfrVariant::Linear)
-            && iteration > self.warmup
+        matches!(
+            self.variant,
+            CfrVariant::Dcfr | CfrVariant::Linear | CfrVariant::DcfrPlus
+        ) && iteration > self.warmup
     }
 
     /// Apply DCFR cumulative regret discounting to a raw slice.
@@ -157,8 +218,14 @@ impl DcfrParams {
     }
 
     /// Multiply all strategy sum values by `strategy_discount(iteration)`.
+    ///
+    /// DcfrPlus uses additive weighting (not multiplicative discount), so this
+    /// is a no-op for that variant.
     #[allow(clippy::cast_precision_loss)]
     pub fn discount_strategy_sums(&self, buf: &mut [f64], iteration: u64) {
+        if self.variant == CfrVariant::DcfrPlus {
+            return; // DcfrPlus uses additive weighting, not multiplicative discount
+        }
         let sd = self.strategy_discount(iteration);
         for s in buf.iter_mut() {
             *s *= sd;
@@ -284,6 +351,7 @@ mod tests {
         assert!(!DcfrParams::default().should_floor_regrets());
         assert!(!DcfrParams::vanilla().should_floor_regrets());
         assert!(!DcfrParams::linear().should_floor_regrets());
+        assert!(!DcfrParams::dcfr_plus(100).should_floor_regrets());
     }
 
     #[timed_test]
@@ -304,6 +372,7 @@ mod tests {
         assert!((p.beta - 0.5).abs() < f64::EPSILON);
         assert!((p.gamma - 2.0).abs() < f64::EPSILON);
         assert_eq!(p.warmup, 0);
+        assert_eq!(p.delay, 100);
     }
 
     #[timed_test]
@@ -324,6 +393,7 @@ mod tests {
             CfrVariant::Dcfr,
             CfrVariant::CfrPlus,
             CfrVariant::Linear,
+            CfrVariant::DcfrPlus,
         ] {
             let yaml = serde_yaml::to_string(&variant).unwrap();
             let parsed: CfrVariant = serde_yaml::from_str(yaml.trim()).unwrap();
@@ -341,5 +411,76 @@ mod tests {
         check(CfrVariant::Dcfr, "dcfr");
         check(CfrVariant::CfrPlus, "cfrplus");
         check(CfrVariant::Linear, "linear");
+        check(CfrVariant::DcfrPlus, "dcfrplus");
+    }
+
+    // -------------------------------------------------------------------
+    // DcfrPlus-specific tests
+    // -------------------------------------------------------------------
+
+    #[timed_test]
+    fn dcfr_plus_constructor() {
+        let p = DcfrParams::dcfr_plus(100);
+        assert_eq!(p.variant, CfrVariant::DcfrPlus);
+        assert!((p.alpha - 1.5).abs() < f64::EPSILON);
+        assert!((p.beta - 0.0).abs() < f64::EPSILON);
+        assert_eq!(p.delay, 100);
+        assert_eq!(p.warmup, 0);
+    }
+
+    #[timed_test]
+    fn dcfr_plus_iteration_weights() {
+        let p = DcfrParams::dcfr_plus(100);
+        assert_eq!(p.iteration_weights(50), (1.0, 0.0)); // before delay
+        assert_eq!(p.iteration_weights(100), (1.0, 0.0)); // at delay boundary
+        assert_eq!(p.iteration_weights(101), (1.0, 1.0)); // one past delay
+        assert_eq!(p.iteration_weights(200), (1.0, 100.0)); // linear weight
+    }
+
+    #[timed_test]
+    fn dcfr_plus_strategy_weight() {
+        let p = DcfrParams::dcfr_plus(100);
+        assert!((p.strategy_weight(50) - 0.0).abs() < f64::EPSILON);
+        assert!((p.strategy_weight(100) - 0.0).abs() < f64::EPSILON);
+        assert!((p.strategy_weight(101) - 1.0).abs() < f64::EPSILON);
+        assert!((p.strategy_weight(200) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[timed_test]
+    fn dcfr_plus_strategy_weight_non_dcfrplus_is_one() {
+        let p = DcfrParams::default();
+        assert!((p.strategy_weight(0) - 1.0).abs() < f64::EPSILON);
+        assert!((p.strategy_weight(500) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[timed_test]
+    fn dcfr_plus_no_strategy_discount() {
+        let p = DcfrParams::dcfr_plus(100);
+        let mut buf = vec![10.0, 20.0, 5.0];
+        p.discount_strategy_sums(&mut buf, 500);
+        // Should be unchanged (no multiplicative discount)
+        assert_eq!(buf, vec![10.0, 20.0, 5.0]);
+    }
+
+    #[timed_test]
+    fn dcfr_plus_discounts_regrets() {
+        let p = DcfrParams::dcfr_plus(100);
+        assert!(p.should_discount(1));
+        let mut buf = vec![10.0, -5.0];
+        p.discount_regrets(&mut buf, 9); // iteration 9 => t=10
+        // alpha=1.5: pos *= 10^1.5 / (10^1.5 + 1)
+        // beta=0.0: neg *= 10^0 / (10^0 + 1) = 0.5
+        let t = 10.0_f64;
+        let pos = t.powf(1.5) / (t.powf(1.5) + 1.0);
+        assert!((buf[0] - 10.0 * pos).abs() < 1e-10);
+        assert!((buf[1] - (-5.0 * 0.5)).abs() < 1e-10);
+    }
+
+    #[timed_test]
+    fn dcfr_plus_should_discount_always() {
+        let p = DcfrParams::dcfr_plus(100);
+        assert!(p.should_discount(1));
+        assert!(p.should_discount(100));
+        assert!(p.should_discount(1000));
     }
 }
