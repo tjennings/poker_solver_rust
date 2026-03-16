@@ -469,6 +469,62 @@ enum Commands {
         #[arg(long)]
         compressed: bool,
     },
+    /// Evaluate bucketed GPU solver on random river spots
+    #[cfg(feature = "cuda")]
+    GpuEvalBucketed {
+        /// Path to bucket file (e.g. local_data/clusters_500bkt_v3/river.buckets)
+        #[arg(long)]
+        buckets: PathBuf,
+        /// Number of random spots to evaluate
+        #[arg(long, default_value_t = 20)]
+        num_spots: usize,
+        /// DCFR+ iterations per solve
+        #[arg(long, default_value_t = 4000)]
+        solve_iterations: u32,
+        /// Delay for strategy accumulation
+        #[arg(long, default_value_t = 100)]
+        delay: u32,
+        /// Random seed
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Bet sizes (e.g. "50%,a")
+        #[arg(long, default_value = "50%,a")]
+        bet_sizes: String,
+        /// Effective stack
+        #[arg(long, default_value_t = 200)]
+        initial_stack: i32,
+        /// Use batch solver with CFV extraction
+        #[arg(long, default_value_t = false)]
+        with_cfvs: bool,
+    },
+    /// Run bucketed batch datagen on random river spots and report timing/CFV stats
+    #[cfg(feature = "gpu-training")]
+    GpuBucketedDatagen {
+        /// Path to bucket file
+        #[arg(long)]
+        buckets: PathBuf,
+        /// Number of samples (situations) to generate and solve
+        #[arg(long, default_value_t = 100)]
+        num_samples: usize,
+        /// DCFR+ iterations per batch solve
+        #[arg(long, default_value_t = 4000)]
+        solve_iterations: u32,
+        /// Strategy accumulation delay
+        #[arg(long, default_value_t = 100)]
+        delay: u32,
+        /// Batch size (number of spots solved simultaneously)
+        #[arg(long, default_value_t = 50)]
+        batch_size: usize,
+        /// Random seed
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Bet sizes (e.g. "50%,a")
+        #[arg(long, default_value = "50%,a")]
+        bet_sizes: String,
+        /// Effective stack
+        #[arg(long, default_value_t = 200)]
+        initial_stack: i32,
+    },
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -1194,6 +1250,50 @@ fn main() -> Result<(), Box<dyn Error>> {
                 compressed,
             )?;
         }
+        #[cfg(feature = "cuda")]
+        Commands::GpuEvalBucketed {
+            buckets,
+            num_spots,
+            solve_iterations,
+            delay,
+            seed,
+            bet_sizes,
+            initial_stack,
+            with_cfvs,
+        } => {
+            run_gpu_eval_bucketed(
+                buckets,
+                num_spots,
+                solve_iterations,
+                delay,
+                seed,
+                &bet_sizes,
+                initial_stack,
+                with_cfvs,
+            )?;
+        }
+        #[cfg(feature = "gpu-training")]
+        Commands::GpuBucketedDatagen {
+            buckets,
+            num_samples,
+            solve_iterations,
+            delay,
+            batch_size,
+            seed,
+            bet_sizes,
+            initial_stack,
+        } => {
+            run_gpu_bucketed_datagen(
+                buckets,
+                num_samples,
+                solve_iterations,
+                delay,
+                batch_size,
+                seed,
+                &bet_sizes,
+                initial_stack,
+            )?;
+        }
     }
 
     Ok(())
@@ -1876,6 +1976,82 @@ fn run_gpu_solve(
     if hands.len() > display_count {
         println!("... and {} more hands", hands.len() - display_count);
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GPU bucketed solver evaluation
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn run_gpu_eval_bucketed(
+    buckets: PathBuf,
+    num_spots: usize,
+    solve_iterations: u32,
+    delay: u32,
+    seed: u64,
+    bet_sizes_str: &str,
+    initial_stack: i32,
+    _with_cfvs: bool,
+) -> Result<(), Box<dyn Error>> {
+    use poker_solver_gpu::bucketed::eval::{eval_bucketed_solver, BucketedEvalConfig};
+    use range_solver::bet_size::BetSizeOptions;
+
+    let bet_sizes = BetSizeOptions::try_from((bet_sizes_str, ""))
+        .map_err(|e| format!("Invalid bet sizes: {e}"))?;
+
+    let config = BucketedEvalConfig {
+        bucket_path: buckets,
+        num_spots,
+        solve_iterations,
+        delay,
+        seed,
+        bet_sizes,
+        initial_stack,
+    };
+
+    // Always use the simple eval for now (with_cfvs requires training feature)
+    eval_bucketed_solver(&config)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GPU bucketed batch datagen
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gpu-training")]
+#[allow(clippy::too_many_arguments)]
+fn run_gpu_bucketed_datagen(
+    buckets: PathBuf,
+    num_samples: usize,
+    solve_iterations: u32,
+    delay: u32,
+    batch_size: usize,
+    seed: u64,
+    bet_sizes_str: &str,
+    initial_stack: i32,
+) -> Result<(), Box<dyn Error>> {
+    use poker_solver_gpu::bucketed::datagen::{run_bucketed_datagen, BucketedDatagenConfig};
+    use range_solver::bet_size::BetSizeOptions;
+
+    let bet_sizes = BetSizeOptions::try_from((bet_sizes_str, ""))
+        .map_err(|e| format!("Invalid bet sizes: {e}"))?;
+
+    let config = BucketedDatagenConfig {
+        bucket_path: buckets,
+        num_samples,
+        solve_iterations,
+        delay,
+        batch_size,
+        seed,
+        bet_sizes,
+        initial_stack,
+    };
+
+    run_bucketed_datagen(&config)?;
 
     Ok(())
 }

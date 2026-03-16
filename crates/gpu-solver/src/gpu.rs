@@ -1942,6 +1942,93 @@ impl GpuContext {
         }
         Ok(())
     }
+
+    /// Launch the batch bucketed showdown evaluation kernel.
+    ///
+    /// Like `launch_bucketed_showdown_eval` but with per-spot equity tables and half-pots.
+    /// Each of `num_spots` spots has its own equity table and pot size.
+    ///
+    /// Data layout:
+    ///   equity_tables: `[num_sd_terminals * num_spots * num_buckets * num_buckets]`
+    ///   half_pots: `[num_sd_terminals * num_spots]`
+    pub fn launch_bucketed_showdown_eval_batch(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        equity_tables: &CudaSlice<f32>,
+        half_pots: &CudaSlice<f32>,
+        num_sd_terminals: u32,
+        total_hands: u32,
+        num_buckets: u32,
+        num_spots: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/bucketed_showdown_batch.cu"),
+            "bucketed_showdown_eval_batch",
+        )?;
+        let total_threads = num_sd_terminals * total_hands;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(equity_tables)
+                .arg(half_pots)
+                .arg(&num_sd_terminals)
+                .arg(&total_hands)
+                .arg(&num_buckets)
+                .arg(&num_spots)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Launch the batch bucketed fold evaluation kernel.
+    ///
+    /// Like `launch_bucketed_fold_eval` but with per-spot half-pots.
+    ///
+    /// Data layout:
+    ///   half_pots: `[num_fold_terminals * num_spots]`
+    ///   fold_player: `[num_fold_terminals]` (same for all spots)
+    pub fn launch_bucketed_fold_eval_batch(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        half_pots: &CudaSlice<f32>,
+        fold_player: &CudaSlice<u32>,
+        traverser: u32,
+        num_fold_terminals: u32,
+        total_hands: u32,
+        num_buckets: u32,
+        num_spots: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/bucketed_fold_batch.cu"),
+            "bucketed_fold_eval_batch",
+        )?;
+        let total_threads = num_fold_terminals * total_hands;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(half_pots)
+                .arg(fold_player)
+                .arg(&traverser)
+                .arg(&num_fold_terminals)
+                .arg(&total_hands)
+                .arg(&num_buckets)
+                .arg(&num_spots)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
