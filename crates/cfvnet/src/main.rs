@@ -396,12 +396,19 @@ fn cmd_bench_solve(config_path: PathBuf, num_samples: u64, threads: usize) {
             eprintln!("invalid bet sizes: {e}");
             std::process::exit(1);
         });
+    let discount_scheme = match cfg.datagen.cfr_variant {
+        Some(poker_solver_core::cfr::dcfr::CfrVariant::DcfrPlus) => {
+            range_solver::DiscountScheme::DcfrPlus { delay: cfg.datagen.cfr_delay as u32 }
+        }
+        _ => range_solver::DiscountScheme::Default,
+    };
     let solve_config = cfvnet::datagen::solver::SolveConfig {
         bet_sizes,
         solver_iterations: cfg.datagen.solver_iterations,
         target_exploitability: cfg.datagen.target_exploitability,
         add_allin_threshold: cfg.game.add_allin_threshold,
         force_allin_threshold: cfg.game.force_allin_threshold,
+        discount_scheme,
     };
 
     let board_size = cfg.game.board_size;

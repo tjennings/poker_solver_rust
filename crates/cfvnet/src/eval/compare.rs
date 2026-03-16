@@ -19,12 +19,19 @@ pub fn default_solve_config(game: &GameConfig, datagen: &DatagenConfig) -> Resul
     let bet_str = game.bet_sizes.join(",");
     let bet_sizes = BetSizeOptions::try_from((bet_str.as_str(), ""))
         .map_err(|e| format!("invalid bet sizes: {e}"))?;
+    let discount_scheme = match datagen.cfr_variant {
+        Some(poker_solver_core::cfr::dcfr::CfrVariant::DcfrPlus) => {
+            range_solver::DiscountScheme::DcfrPlus { delay: datagen.cfr_delay as u32 }
+        }
+        _ => range_solver::DiscountScheme::Default,
+    };
     Ok(SolveConfig {
         bet_sizes,
         solver_iterations: datagen.solver_iterations,
         target_exploitability: datagen.target_exploitability,
         add_allin_threshold: game.add_allin_threshold,
         force_allin_threshold: game.force_allin_threshold,
+        discount_scheme,
     })
 }
 

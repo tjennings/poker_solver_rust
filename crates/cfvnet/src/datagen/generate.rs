@@ -36,12 +36,19 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
     let bet_str = config.game.bet_sizes.join(",");
     let bet_sizes = BetSizeOptions::try_from((bet_str.as_str(), ""))
         .map_err(|e| format!("invalid bet sizes: {e}"))?;
+    let discount_scheme = match config.datagen.cfr_variant {
+        Some(poker_solver_core::cfr::dcfr::CfrVariant::DcfrPlus) => {
+            range_solver::DiscountScheme::DcfrPlus { delay: config.datagen.cfr_delay as u32 }
+        }
+        _ => range_solver::DiscountScheme::Default,
+    };
     let solve_config = SolveConfig {
         bet_sizes,
         solver_iterations: config.datagen.solver_iterations,
         target_exploitability: config.datagen.target_exploitability,
         add_allin_threshold: config.game.add_allin_threshold,
         force_allin_threshold: config.game.force_allin_threshold,
+        discount_scheme,
     };
 
     let board_size = config.game.board_size;

@@ -5,7 +5,7 @@ use range_solver::{
     bet_size::BetSizeOptions,
     card::{card_pair_to_index, Card},
     range::Range,
-    solve, CardConfig, PostFlopGame,
+    solve, solve_with_scheme, CardConfig, DiscountScheme, PostFlopGame,
 };
 
 /// Configuration for the range-solver wrapper.
@@ -20,6 +20,9 @@ pub struct SolveConfig {
     pub add_allin_threshold: f64,
     /// Force all-in if SPR after call <= this threshold.
     pub force_allin_threshold: f64,
+    /// Discount scheme. Default = original range-solver scheme.
+    /// DcfrPlus = Supremus DCFR+ with delayed linear strategy weighting.
+    pub discount_scheme: DiscountScheme,
 }
 
 /// Result of solving a single river situation.
@@ -75,7 +78,13 @@ pub fn solve_situation(situation: &Situation, config: &SolveConfig) -> Result<So
     let mut game = PostFlopGame::with_config(card_config, action_tree)?;
     game.allocate_memory(false);
 
-    let exploitability = solve(&mut game, config.solver_iterations, config.target_exploitability, false);
+    let exploitability = solve_with_scheme(
+        &mut game,
+        config.solver_iterations,
+        config.target_exploitability,
+        false,
+        config.discount_scheme,
+    );
 
     game.cache_normalized_weights();
 
@@ -181,6 +190,7 @@ mod tests {
             target_exploitability: 0.01,
             add_allin_threshold: 1.5,
             force_allin_threshold: 0.15,
+            discount_scheme: DiscountScheme::Default,
         }
     }
 
