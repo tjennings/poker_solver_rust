@@ -12,6 +12,47 @@ use crate::tree::{FlatTree, NodeType};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
 
+/// Build a CSR (compressed sparse row) mapping from card (0..51) to hand indices
+/// containing that card, scoped per spot.
+///
+/// # Arguments
+/// - `hand_cards_flat`: `[total_hands * 2]` — flat (c1, c2) pairs as u32 per hand
+/// - `hands_per_spot`: number of hands per spot
+/// - `num_spots`: number of spots
+///
+/// # Returns
+/// - `offsets`: `[num_spots * 53]` — CSR offsets. For spot `s`, card `c`,
+///   the hand indices are `hands[offsets[s*53+c]..offsets[s*53+c+1]]`.
+/// - `hands`: flat array of LOCAL hand indices (0..hands_per_spot) per (spot, card).
+#[cfg(feature = "cuda")]
+pub fn build_card_hand_csr(
+    hand_cards_flat: &[u32],
+    hands_per_spot: usize,
+    num_spots: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut offsets = vec![0u32; num_spots * 53];
+    let mut hands = Vec::new();
+
+    for spot in 0..num_spots {
+        let base = spot * hands_per_spot;
+        for card in 0..52u32 {
+            offsets[spot * 53 + card as usize] = hands.len() as u32;
+            for local_hand in 0..hands_per_spot {
+                let global_hand = base + local_hand;
+                let c1 = hand_cards_flat[global_hand * 2];
+                let c2 = hand_cards_flat[global_hand * 2 + 1];
+                if c1 == card || c2 == card {
+                    hands.push(local_hand as u32);
+                }
+            }
+        }
+        // Sentinel for last card
+        offsets[spot * 53 + 52] = hands.len() as u32;
+    }
+
+    (offsets, hands)
+}
+
 /// Precomputed per-level data for GPU kernels.
 #[cfg(feature = "cuda")]
 struct LevelData {
@@ -128,6 +169,15 @@ pub struct GpuSolver<'a> {
     // Working buffers for O(n) fold aggregates (reused each iteration)
     gpu_fold_total_opp_reach: CudaSlice<f32>,
     gpu_fold_per_card_reach: CudaSlice<f32>,
+
+    // CSR lookup for showdown card-blocking correction.
+    // Maps (card) -> list of opponent hand indices containing that card.
+    // When OOP is traverser, opponent is IP: use card_hand_offsets_ip / card_hands_ip
+    // When IP is traverser, opponent is OOP: use card_hand_offsets_oop / card_hands_oop
+    gpu_card_hand_offsets_oop: CudaSlice<u32>,  // [53] — CSR offsets for OOP hands by card
+    gpu_card_hands_oop: CudaSlice<u32>,          // flat list of OOP hand indices per card
+    gpu_card_hand_offsets_ip: CudaSlice<u32>,   // [53] — CSR offsets for IP hands by card
+    gpu_card_hands_ip: CudaSlice<u32>,           // flat list of IP hand indices per card
 
     // Decision node lists per player
     decision_nodes_oop: CudaSlice<u32>,
@@ -298,8 +348,21 @@ impl<'a> GpuSolver<'a> {
         let fold_player = gpu.upload(&fold_pl)?;
 
         let showdown_terminal_nodes = gpu.upload(&showdown_nodes)?;
-        let showdown_amount_win = gpu.upload(&showdown_win)?;
-        let showdown_amount_lose = gpu.upload(&showdown_lose)?;
+
+        // Broadcast scalar showdown amounts to per-hand arrays.
+        // The fast showdown kernel indexes amount_win[term_idx * num_hands + hand],
+        // so we need num_showdown_terminals * num_hands entries.
+        let sd_count = showdown_ordinal.max(1);
+        let mut showdown_win_per_hand = vec![0.0f32; sd_count * num_hands as usize];
+        let mut showdown_lose_per_hand = vec![0.0f32; sd_count * num_hands as usize];
+        for t in 0..showdown_ordinal {
+            for h in 0..num_hands as usize {
+                showdown_win_per_hand[t * num_hands as usize + h] = showdown_win[t];
+                showdown_lose_per_hand[t * num_hands as usize + h] = showdown_lose[t];
+            }
+        }
+        let showdown_amount_win = gpu.upload(&showdown_win_per_hand)?;
+        let showdown_amount_lose = gpu.upload(&showdown_lose_per_hand)?;
 
         // Pad hand strengths to num_hands
         let mut hs_oop = tree.hand_strengths_oop.clone();
@@ -332,6 +395,18 @@ impl<'a> GpuSolver<'a> {
         // Upload same-hand index arrays
         let gpu_same_hand_index_oop = gpu.upload(&tree.same_hand_index_oop)?;
         let gpu_same_hand_index_ip = gpu.upload(&tree.same_hand_index_ip)?;
+
+        // Build card-to-hand CSR lookup for showdown blocking correction.
+        // Single spot: num_spots = 1, so offsets are [53].
+        let (card_hand_offsets_oop, card_hands_oop) =
+            build_card_hand_csr(&hand_cards_oop_flat, num_hands as usize, 1);
+        let (card_hand_offsets_ip, card_hands_ip) =
+            build_card_hand_csr(&hand_cards_ip_flat, num_hands as usize, 1);
+
+        let gpu_card_hand_offsets_oop = gpu.upload(&card_hand_offsets_oop)?;
+        let gpu_card_hands_oop = gpu.upload(if card_hands_oop.is_empty() { &[0u32] } else { &card_hands_oop })?;
+        let gpu_card_hand_offsets_ip = gpu.upload(&card_hand_offsets_ip)?;
+        let gpu_card_hands_ip = gpu.upload(if card_hands_ip.is_empty() { &[0u32] } else { &card_hands_ip })?;
 
         // Allocate working buffers for fold aggregates
         let fold_agg_size = fold_ordinal.max(1);
@@ -396,6 +471,10 @@ impl<'a> GpuSolver<'a> {
             gpu_same_hand_index_ip,
             gpu_fold_total_opp_reach,
             gpu_fold_per_card_reach,
+            gpu_card_hand_offsets_oop,
+            gpu_card_hands_oop,
+            gpu_card_hand_offsets_ip,
+            gpu_card_hands_ip,
             decision_nodes_oop,
             decision_nodes_ip,
             num_oop_decisions,
@@ -573,6 +652,28 @@ impl<'a> GpuSolver<'a> {
                         self.num_showdown_terminals,
                         self.num_hands,
                         self.num_hands,  // hands_per_spot = num_hands for single-spot
+                    )?;
+                    // Correction pass: subtract blocked opponent contributions
+                    let (opp_card_offsets, opp_card_hands) = if traverser == 0 {
+                        (&self.gpu_card_hand_offsets_ip, &self.gpu_card_hands_ip)
+                    } else {
+                        (&self.gpu_card_hand_offsets_oop, &self.gpu_card_hands_oop)
+                    };
+                    self.gpu.launch_showdown_block_correction(
+                        &mut self.cfvalues,
+                        opp_reach,
+                        &self.showdown_terminal_nodes,
+                        &self.showdown_amount_win,
+                        &self.showdown_amount_lose,
+                        traverser_strengths,
+                        opponent_strengths,
+                        trav_hand_cards,
+                        opp_hand_cards,
+                        opp_card_offsets,
+                        opp_card_hands,
+                        self.num_showdown_terminals,
+                        self.num_hands,
+                        self.num_hands,
                     )?;
                 }
 
@@ -999,6 +1100,28 @@ impl<'a> GpuSolver<'a> {
                     self.num_hands,
                     self.num_hands,  // hands_per_spot = num_hands for single-spot
                 )?;
+                // Correction pass: subtract blocked opponent contributions
+                let (opp_card_offsets, opp_card_hands) = if traverser == 0 {
+                    (&self.gpu_card_hand_offsets_ip, &self.gpu_card_hands_ip)
+                } else {
+                    (&self.gpu_card_hand_offsets_oop, &self.gpu_card_hands_oop)
+                };
+                self.gpu.launch_showdown_block_correction(
+                    &mut self.cfvalues,
+                    opp_reach,
+                    &self.showdown_terminal_nodes,
+                    &self.showdown_amount_win,
+                    &self.showdown_amount_lose,
+                    traverser_strengths,
+                    opponent_strengths,
+                    trav_hand_cards,
+                    opp_hand_cards,
+                    opp_card_offsets,
+                    opp_card_hands,
+                    self.num_showdown_terminals,
+                    self.num_hands,
+                    self.num_hands,
+                )?;
             }
 
             // 4d. Backward CFV
@@ -1208,6 +1331,16 @@ impl<'a> GpuSolver<'a> {
                     } else {
                         (&self.gpu_hand_strengths_ip, &self.gpu_hand_strengths_oop)
                     };
+                    let trav_hand_cards = if traverser == 0 {
+                        &self.gpu_hand_cards_oop
+                    } else {
+                        &self.gpu_hand_cards_ip
+                    };
+                    let opp_hand_cards = if traverser == 0 {
+                        &self.gpu_hand_cards_ip
+                    } else {
+                        &self.gpu_hand_cards_oop
+                    };
                     self.gpu.launch_showdown_eval_fast(
                         &mut self.cfvalues,
                         opp_reach,
@@ -1216,6 +1349,28 @@ impl<'a> GpuSolver<'a> {
                         &self.showdown_amount_lose,
                         traverser_strengths,
                         opponent_strengths,
+                        self.num_showdown_terminals,
+                        self.num_hands,
+                        self.num_hands,
+                    )?;
+                    // Correction pass: subtract blocked opponent contributions
+                    let (opp_card_offsets, opp_card_hands) = if traverser == 0 {
+                        (&self.gpu_card_hand_offsets_ip, &self.gpu_card_hands_ip)
+                    } else {
+                        (&self.gpu_card_hand_offsets_oop, &self.gpu_card_hands_oop)
+                    };
+                    self.gpu.launch_showdown_block_correction(
+                        &mut self.cfvalues,
+                        opp_reach,
+                        &self.showdown_terminal_nodes,
+                        &self.showdown_amount_win,
+                        &self.showdown_amount_lose,
+                        traverser_strengths,
+                        opponent_strengths,
+                        trav_hand_cards,
+                        opp_hand_cards,
+                        opp_card_offsets,
+                        opp_card_hands,
                         self.num_showdown_terminals,
                         self.num_hands,
                         self.num_hands,

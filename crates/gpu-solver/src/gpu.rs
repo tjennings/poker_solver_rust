@@ -1213,6 +1213,69 @@ impl GpuContext {
         Ok(())
     }
 
+    /// Launch the showdown card-blocking correction kernel.
+    ///
+    /// After the fast showdown kernel (or 3-kernel pipeline) computes CFVs without
+    /// card blocking, this kernel subtracts the incorrectly included contributions
+    /// from opponent hands that share cards with the traverser.
+    ///
+    /// Uses a precomputed CSR (compressed sparse row) lookup mapping each card
+    /// to the opponent hand indices that contain it, scoped per spot.
+    ///
+    /// - `card_hand_offsets`: `[num_spots * 53]` CSR offsets
+    /// - `card_hands`: flat array of local opponent hand indices per (spot, card)
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_showdown_block_correction(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        amount_win: &CudaSlice<f32>,
+        amount_lose: &CudaSlice<f32>,
+        traverser_strengths: &CudaSlice<u32>,
+        opponent_strengths: &CudaSlice<u32>,
+        trav_hand_cards: &CudaSlice<u32>,
+        opp_hand_cards: &CudaSlice<u32>,
+        card_hand_offsets: &CudaSlice<u32>,
+        card_hands: &CudaSlice<u32>,
+        num_sd_terminals: u32,
+        num_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/showdown_block_correction.cu"),
+            "showdown_block_correction",
+        )?;
+        let total = num_sd_terminals * num_hands;
+        let block_size = 256u32;
+        let grid_size = (total + block_size - 1) / block_size;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(amount_win)
+                .arg(amount_lose)
+                .arg(traverser_strengths)
+                .arg(opponent_strengths)
+                .arg(trav_hand_cards)
+                .arg(opp_hand_cards)
+                .arg(card_hand_offsets)
+                .arg(card_hands)
+                .arg(&num_sd_terminals)
+                .arg(&num_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
     // ===== 3-kernel O(n) showdown evaluation =====
 
     /// Kernel 1: Scatter opponent reach from natural order to strength-sorted order.
