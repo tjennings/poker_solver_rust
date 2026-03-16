@@ -1,0 +1,142 @@
+nohup: ignoring input and appending output to 'nohup.out'
+warning: function `build_turn_game` is never used
+   --> crates/cfvnet/src/datagen/turn_generate.rs:272:4
+    |
+272 | fn build_turn_game(
+    |    ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `solve_and_extract` is never used
+   --> crates/cfvnet/src/datagen/turn_generate.rs:319:4
+    |
+319 | fn solve_and_extract(
+    |    ^^^^^^^^^^^^^^^^^
+
+warning: `cfvnet` (lib) generated 2 warnings
+   Compiling poker-solver-gpu v0.1.0 (/home/coreco/code/poker_solver_rust/crates/gpu-solver)
+warning: unused import: `crate::training::validation::GroundTruthValidator`
+  --> crates/gpu-solver/src/training/turn_pipeline.rs:45:5
+   |
+45 | use crate::training::validation::GroundTruthValidator;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::tree::FlatTree`
+  --> crates/gpu-solver/src/training/turn_pipeline.rs:47:5
+   |
+47 | use crate::tree::FlatTree;
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::tree::FlatTree`
+  --> crates/gpu-solver/src/training/flop_pipeline.rs:41:5
+   |
+41 | use crate::tree::FlatTree;
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/gpu-solver/src/training/turn_pipeline.rs:643:13
+    |
+643 |         let mut solve_result = turn_solver.solve_with_cfvs(config.solve_iterations)?;
+    |             ----^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/gpu-solver/src/training/flop_pipeline.rs:322:13
+    |
+322 |         let mut solve_result = flop_solver.solve_with_cfvs(config.solve_iterations)?;
+    |             ----^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: `poker-solver-gpu` (lib) generated 5 warnings (run `cargo fix --lib -p poker-solver-gpu` to apply 5 suggestions)
+   Compiling poker-solver-trainer v0.1.0 (/home/coreco/code/poker_solver_rust/crates/trainer)
+warning: function `dominant_action_color` is never used
+   --> crates/trainer/src/blueprint_tui_widgets.rs:418:4
+    |
+418 | fn dominant_action_color(dom_name: &str, actions: &[(String, f32)]) -> Color {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: static `TUI_ACTIVE` is never used
+  --> crates/trainer/src/log_file.rs:17:12
+   |
+17 | pub static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+   |            ^^^^^^^^^^
+
+warning: static `LOG_FILE` is never used
+  --> crates/trainer/src/log_file.rs:20:8
+   |
+20 | static LOG_FILE: OnceLock<Mutex<BufWriter<File>>> = OnceLock::new();
+   |        ^^^^^^^^
+
+warning: function `init_log_file` is never used
+  --> crates/trainer/src/log_file.rs:26:8
+   |
+26 | pub fn init_log_file() {
+   |        ^^^^^^^^^^^^^
+
+warning: function `write_to_log` is never used
+  --> crates/trainer/src/log_file.rs:43:8
+   |
+43 | pub fn write_to_log(line: &str) {
+   |        ^^^^^^^^^^^^
+
+warning: function `format_timestamp` is never used
+  --> crates/trainer/src/log_file.rs:54:4
+   |
+54 | fn format_timestamp(time: SystemTime) -> String {
+   |    ^^^^^^^^^^^^^^^^
+
+warning: function `days_to_ymd` is never used
+  --> crates/trainer/src/log_file.rs:76:4
+   |
+76 | fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+   |    ^^^^^^^^^^^
+
+warning: function `install_panic_hook` is never used
+   --> crates/trainer/src/log_file.rs:128:8
+    |
+128 | pub fn install_panic_hook() {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: `poker-solver-trainer` (bin "poker-solver-trainer") generated 8 warnings
+    Finished `release` profile [optimized] target(s) in 15.57s
+     Running `target/release/poker-solver-trainer gpu-train-stack -c sample_configurations/gpu_training_overnight.yaml -o models/overnight_v1`
+GPU Train Stack
+  Config: sample_configurations/gpu_training_overnight.yaml
+  Output: models/overnight_v1
+  Model:  7 layers x 500 hidden
+  River model: local_data/models/river_v7/checkpoint_epoch340 (7x768)
+  Turn:   500000 samples
+  Flop:   200000 samples
+  Preflop:100000 samples
+
+Using pre-trained river model: local_data/models/river_v7/checkpoint_epoch340
+  Architecture: 7x768
+
+============================================================
+PHASE 1/3: TURN
+============================================================
+
+Loading river model from "local_data/models/river_v7/checkpoint_epoch340" (7x768) with CUDA-native inference...
+Turn tree: 15 nodes, 6 infosets, 5 boundaries, 4 fold terminals
+Note: Ground-truth validation for turn uses river-model leaf eval
+  Skipping pre-compute (hold-out validation only for now)
+Starting GPU turn training pipeline (CUDA-native leaf eval)
+  Batch size: 50 spots
+  Solve iterations: 500
+  Reservoir capacity: 100000
+  Turn model: 7 layers x 500 hidden
+  River model: 7 layers x 768 hidden
+  Depth boundaries: 5
+  Leaf eval: CUDA-native (cuBLAS + custom kernels)
+  Train batch: 512 x 10 steps/batch
+  Learning rate: 0.001
+  Output: models/overnight_v1/turn
+

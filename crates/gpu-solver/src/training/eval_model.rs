@@ -397,6 +397,10 @@ fn evaluate_both_perspectives(
             .map_err(|e| format!("download output: {e}"))?;
 
         // Compare only valid (unblocked) combos
+        let mut player_gt_min = f32::MAX;
+        let mut player_gt_max = f32::MIN;
+        let mut player_pred_min = f32::MAX;
+        let mut player_pred_max = f32::MIN;
         for i in 0..OUTPUT_SIZE {
             if mask[i] > 0.5 {
                 let err = (predicted[i] - gt_cfvs[i]).abs();
@@ -405,7 +409,15 @@ fn evaluate_both_perspectives(
                     max_error = err;
                 }
                 total_valid += 1;
+                player_gt_min = player_gt_min.min(gt_cfvs[i]);
+                player_gt_max = player_gt_max.max(gt_cfvs[i]);
+                player_pred_min = player_pred_min.min(predicted[i]);
+                player_pred_max = player_pred_max.max(predicted[i]);
             }
+        }
+        if player == 0 {
+            eprintln!("    OOP gt=[{:.4}..{:.4}] pred=[{:.4}..{:.4}]",
+                player_gt_min, player_gt_max, player_pred_min, player_pred_max);
         }
     }
 
@@ -446,9 +458,19 @@ fn print_summary(results: &[SpotResult], elapsed: std::time::Duration) {
         .map(|r| r.max_error)
         .fold(0.0f32, f32::max);
 
+    // Pot-relative: divide raw MAE by pot to get fraction-of-pot error
+    // mBB: pot-relative * 1000 (assuming pot ≈ pot in bb units / 2)
+    // With ref_pot=100 and initial_stack=200 (100bb), pot=100 means 50bb pot
+    // So 1 unit of pot = 2bb, and mBB = mae / pot * 2 * 1000 = mae * 20
+    // Simpler: just report raw MAE and MAE/pot
+    let pot = 100.0f32; // TODO: make configurable
+    let pot_relative_mae = global_mae / pot;
+    let mbb = pot_relative_mae * 1000.0; // assuming pot = 1 pot unit
+
     eprintln!();
     eprintln!("Summary:");
-    eprintln!("  Mean Absolute Error (MAE):  {global_mae:.4}");
+    eprintln!("  Raw MAE:                    {global_mae:.4}");
+    eprintln!("  Pot-relative MAE:           {pot_relative_mae:.6} ({mbb:.1} mBB/hand)");
     eprintln!("  Max Error:                  {global_max:.3}");
     eprintln!("  Spots evaluated:            {}", results.len());
     eprintln!("  Total combos evaluated:     {total_combos}");
