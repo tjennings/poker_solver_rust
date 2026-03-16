@@ -12,6 +12,79 @@
 
 ---
 
+## DCFR+ Algorithm (Supremus-Specific)
+
+The bucketed solver MUST use the Supremus DCFR+ variant, not standard DCFR or the range-solver's power-of-4 scheme. Key differences from our current implementation:
+
+### Regret Discounting (same as standard DCFR)
+
+```
+pos_discount = t^1.5 / (t^1.5 + 1)    // alpha=1.5
+neg_discount = 0.5                      // beta=0 → t^0/(t^0+1) = 0.5
+new_regret = old_regret * discount + instantaneous_regret
+```
+
+This part is unchanged from our current GPU solver (matches standard DCFR with alpha=1.5, beta=0).
+
+### Strategy Weighting (DIFFERENT — linear, not multiplicative)
+
+**Current (wrong):** Multiplicative discount with power-of-4 periodic resets:
+```
+strategy_sum = strategy_sum * strat_discount + strategy
+where strat_discount = ((t - nlp4) / (t - nlp4 + 1))^3
+```
+
+**Supremus DCFR+ (correct):** Additive linear weighting with delay d=100:
+```
+weight = max(0, t - d)      // d=100, t is iteration number
+strategy_sum += weight * strategy
+```
+
+The first 100 iterations get zero weight (strategy exploration only). After that, each iteration's strategy is weighted linearly by `t - 100`. No multiplicative decay, no periodic resets.
+
+**Implementation in update_regrets kernel:**
+```cuda
+// OLD (wrong):
+strategy_sum[idx] = strategy_sum[idx] * strat_discount + strategy[idx];
+
+// NEW (Supremus DCFR+):
+float weight = (float)iteration - 100.0f;
+if (weight > 0.0f) {
+    strategy_sum[idx] += weight * strategy[idx];
+}
+```
+
+The kernel parameter changes from `strat_discount: f32` to `iteration: u32` (or `strat_weight: f32` precomputed as `max(0, t - 100)`).
+
+### Simultaneous Updates (DIFFERENT for CFVnet leaf eval)
+
+**Current:** Both traversers share a strategy snapshot but traverser 1 sees traverser 0's regret updates.
+
+**Supremus:** True simultaneous — both traversers compute against the exact same strategy and reach probabilities. Regrets from both traversers are accumulated independently using the same pre-iteration state. Neither sees the other's within-iteration updates.
+
+**Implementation:**
+1. Compute strategy from regrets ONCE at start of iteration
+2. Propagate reach ONCE
+3. For each traverser: compute CFVs and accumulate regret deltas into SEPARATE buffers
+4. After both traversers: merge regret deltas into the main regret buffer
+5. Update strategy sum ONCE
+
+This requires two temporary regret delta buffers (one per traverser) instead of updating regrets in-place.
+
+Alternative (simpler, close enough): keep current structure where regret_match + forward_pass run once, then each traverser does terminal eval + backward CFV + regret update sequentially. The regret updates from traverser 0 ARE visible to traverser 1's regret_match on the NEXT iteration, but NOT within the same iteration (since regret_match runs before the traverser loop). This is already nearly simultaneous — the only leak is that update_regrets for traverser 0 modifies the regret buffer before traverser 1's update_regrets runs, but both use the SAME strategy (computed before the loop). This is acceptable for Phase A; true simultaneous can be added later if needed.
+
+### Summary of Changes for the Bucketed Solver
+
+| Parameter | Current GPU | Supremus DCFR+ | Change needed? |
+|-----------|-------------|----------------|---------------|
+| pos_discount | `(t-1)^1.5/((t-1)^1.5+1)` | `t^1.5/(t^1.5+1)` | Minor: use `t` not `t-1` |
+| neg_discount | 0.5 | 0.5 | No change |
+| Strategy weight | Multiplicative power-of-4 | Additive `max(0, t-100)` | **YES — fundamental change** |
+| Update order | Near-simultaneous | Simultaneous | Minor (current is close enough) |
+| Delay d | Implicit via power-of-4 | d=100 explicit | **YES** |
+
+---
+
 ## Phase A: Bucketed River Solver + Training
 
 **Goal:** Solve river subgames in bucket space, train a river CFV net, validate against CPU range-solver. This is the foundation — everything else builds on it.
