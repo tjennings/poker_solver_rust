@@ -1,20 +1,24 @@
-// GPU kernel for averaging flop model CFV predictions across all flops
-// to produce preflop CFV training targets.
+// GPU kernel for weighted averaging of flop model CFV predictions across
+// canonical flops to produce preflop CFV training targets.
 //
-// After the flop model returns CFVs for all (flop x spot) inputs,
-// this kernel averages across the 22,100 flops per combo, skipping
-// flops where the combo conflicts with board cards.
+// After the flop model returns CFVs for all (canonical_flop x spot) inputs,
+// this kernel computes a weighted average across the 1,755 canonical flops
+// per combo, skipping flops where the combo conflicts with board cards.
+//
+// Weights are pre-normalized to sum to 1.0, so the weighted average for
+// non-conflicting flops is: sum(cfv * weight) / sum(weight) over valid flops.
 //
 // One thread per (spot_idx, hand) pair.
-// Each thread loops over all flops, accumulates non-conflicting CFVs,
-// and writes the average.
+// Each thread loops over all canonical flops, accumulates weighted CFVs,
+// and writes the weighted average.
 
 extern "C" __global__ void average_preflop_cfvs(
     float* output,                    // [num_spots * 1326] averaged CFVs
     const float* raw_cfvs,            // [num_flops * num_spots * 1326]
-    const unsigned int* all_flops,    // [num_flops * 3] -- all C(52,3) flop cards
+    const unsigned int* all_flops,    // [num_flops * 3] -- canonical flop cards
     const unsigned int* combo_cards,  // [1326 * 2] -- card pairs per combo
-    unsigned int num_flops,           // 22100
+    const float* weights,             // [num_flops] -- pre-normalized weights
+    unsigned int num_flops,           // 1755 canonical flops
     unsigned int num_spots
 ) {
     unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -28,9 +32,9 @@ extern "C" __global__ void average_preflop_cfvs(
     unsigned int c1 = combo_cards[hand * 2];
     unsigned int c2 = combo_cards[hand * 2 + 1];
 
-    // Accumulate CFVs across all flops, skipping conflicts
-    float sum = 0.0f;
-    unsigned int count = 0;
+    // Accumulate weighted CFVs across all canonical flops, skipping conflicts
+    float weighted_sum = 0.0f;
+    float weight_sum = 0.0f;
 
     for (unsigned int f = 0; f < num_flops; f++) {
         unsigned int f0 = all_flops[f * 3];
@@ -43,15 +47,17 @@ extern "C" __global__ void average_preflop_cfvs(
             continue;
         }
 
+        float w = weights[f];
+
         // Input index: flop_idx * num_spots + spot_idx
         unsigned int input_idx = f * num_spots + spot_idx;
 
         // The model output for this input is raw_cfvs[input_idx * 1326 + hand]
-        sum += raw_cfvs[input_idx * 1326u + hand];
-        count++;
+        weighted_sum += raw_cfvs[input_idx * 1326u + hand] * w;
+        weight_sum += w;
     }
 
-    // Write averaged CFV
-    float avg = (count > 0) ? (sum / (float)count) : 0.0f;
+    // Write weighted-averaged CFV (re-normalize to account for skipped conflicts)
+    float avg = (weight_sum > 0.0f) ? (weighted_sum / weight_sum) : 0.0f;
     output[spot_idx * 1326u + hand] = avg;
 }

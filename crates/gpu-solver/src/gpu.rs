@@ -1716,15 +1716,16 @@ impl GpuContext {
         Ok(())
     }
 
-    /// Launch the preflop CFV averaging kernel.
+    /// Launch the preflop CFV weighted-averaging kernel.
     ///
-    /// Averages flop model CFV predictions across all flops per combo,
-    /// skipping flops that conflict with the combo's cards.
+    /// Computes weighted average of flop model CFV predictions across canonical
+    /// flops per combo, skipping flops that conflict with the combo's cards.
     /// One thread per (spot_idx, hand) pair.
     ///
     /// # Layout
     /// - `output`: `[num_spots * 1326]`
     /// - `raw_cfvs`: `[num_flops * num_spots * 1326]`
+    /// - `weights`: `[num_flops]` pre-normalized weights for canonical flops
     #[allow(clippy::too_many_arguments)]
     pub fn launch_average_preflop_cfvs(
         &self,
@@ -1732,6 +1733,7 @@ impl GpuContext {
         raw_cfvs: &CudaSlice<f32>,
         all_flops: &CudaSlice<u32>,
         combo_cards: &CudaSlice<u32>,
+        weights: &CudaSlice<f32>,
         num_flops: u32,
         num_spots: u32,
     ) -> Result<(), GpuError> {
@@ -1748,6 +1750,7 @@ impl GpuContext {
                 .arg(raw_cfvs)
                 .arg(all_flops)
                 .arg(combo_cards)
+                .arg(weights)
                 .arg(&num_flops)
                 .arg(&num_spots)
                 .launch(cfg)?;
