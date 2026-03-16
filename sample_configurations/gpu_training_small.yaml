@@ -24,32 +24,32 @@ training:
   seed: 42
 
 river:
-  num_samples: 1_000_000
+  num_samples: 1000000
   solve_iterations: 2000
   batch_size: 500
-  reservoir_capacity: 50_000
-  validation_interval: 50_000
-  checkpoint_interval: 500_000
+  reservoir_capacity: 50000
+  validation_interval: 50000
+  checkpoint_interval: 500000
 
 turn:
-  num_samples: 500_000
+  num_samples: 500000
   solve_iterations: 2000
   batch_size: 500
-  reservoir_capacity: 50_000
-  validation_interval: 50_000
-  checkpoint_interval: 500_000
+  reservoir_capacity: 50000
+  validation_interval: 50000
+  checkpoint_interval: 500000
 
 flop:
-  num_samples: 500_000
+  num_samples: 500000
   solve_iterations: 2000
   batch_size: 200
-  reservoir_capacity: 50_000
-  validation_interval: 50_000
-  checkpoint_interval: 500_000
+  reservoir_capacity: 50000
+  validation_interval: 50000
+  checkpoint_interval: 500000
 
 preflop:
-  num_samples: 200_000
+  num_samples: 200000
   batch_size: 1
-  reservoir_capacity: 50_000
-  validation_interval: 50_000
-  checkpoint_interval: 200_000
+  reservoir_capacity: 50000
+  validation_interval: 50000
+  checkpoint_interval: 200000
