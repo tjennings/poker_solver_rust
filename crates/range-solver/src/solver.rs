@@ -982,4 +982,74 @@ mod tests {
             "Exploitability should decrease below 10.0 after 100 iters: {expl}"
         );
     }
+
+    #[test]
+    fn test_dcfr_plus_vs_default() {
+        use crate::action_tree::{ActionTree, BoardState, TreeConfig};
+        use crate::bet_size::BetSizeOptions;
+        use crate::card::{card_from_str, flop_from_str, CardConfig};
+        use crate::interface::Game;
+        use crate::range::Range;
+
+        let oop_range: Range = "AA,KK,QQ,AKs".parse().unwrap();
+        let ip_range: Range = "QQ-JJ,AQs,AJs".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: card_from_str("3s").unwrap(),
+        };
+        let sizes = BetSizeOptions::try_from(("50%,a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::River,
+            starting_pot: 100,
+            effective_stack: 100,
+            river_bet_sizes: [sizes.clone(), sizes],
+            ..Default::default()
+        };
+
+        // Solve with Default
+        let at1 = ActionTree::new(tree_config.clone()).unwrap();
+        let mut game1 = crate::PostFlopGame::with_config(card_config.clone(), at1).unwrap();
+        game1.allocate_memory(false);
+        let expl1 = solve(&mut game1, 1000, 0.0, false);
+
+        // Solve with DcfrPlus
+        let at2 = ActionTree::new(tree_config).unwrap();
+        let mut game2 = crate::PostFlopGame::with_config(card_config, at2).unwrap();
+        game2.allocate_memory(false);
+        let expl2 = solve_with_scheme(&mut game2, 1000, 0.0, false, DiscountScheme::DcfrPlus { delay: 100 });
+
+        eprintln!("Default exploitability: {expl1:.4}");
+        eprintln!("DcfrPlus exploitability: {expl2:.4}");
+
+        // Both should converge to reasonable exploitability
+        assert!(expl1 < 5.0, "Default expl too high: {expl1}");
+        assert!(expl2 < 5.0, "DcfrPlus expl too high: {expl2}");
+
+        // Compare strategies
+        game1.back_to_root();
+        game2.back_to_root();
+        let s1 = game1.strategy();
+        let s2 = game2.strategy();
+        let num_hands = game1.private_cards(game1.current_player()).len();
+        let num_actions = game1.available_actions().len();
+
+        let mut agree = 0;
+        for h in 0..num_hands {
+            let mut best1 = 0;
+            let mut best2 = 0;
+            let mut max1 = f32::MIN;
+            let mut max2 = f32::MIN;
+            for a in 0..num_actions {
+                if s1[a * num_hands + h] > max1 { max1 = s1[a * num_hands + h]; best1 = a; }
+                if s2[a * num_hands + h] > max2 { max2 = s2[a * num_hands + h]; best2 = a; }
+            }
+            if best1 == best2 { agree += 1; }
+        }
+
+        let pct = agree as f64 / num_hands as f64 * 100.0;
+        eprintln!("Dominant action agreement: {agree}/{num_hands} ({pct:.1}%)");
+        assert!(pct > 70.0, "Agreement too low: {pct:.1}%");
+    }
 }
