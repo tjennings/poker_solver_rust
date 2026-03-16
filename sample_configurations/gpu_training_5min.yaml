@@ -26,25 +26,24 @@ training:
 
 # Turn: ~3 min at 49 samples/s
 turn:
-  num_samples: 10000
-  solve_iterations: 500
-  batch_size: 50
-  reservoir_capacity: 10000
-  validation_interval: 2000
-  checkpoint_interval: 5000
-
-# Flop: ~1.5 min at 64 samples/s (2x64 leaf model is small)
-flop:
   num_samples: 5000
-  solve_iterations: 500
-  batch_size: 20
+  solve_iterations: 100
+  batch_size: 50
   reservoir_capacity: 5000
   validation_interval: 1000
   checkpoint_interval: 2500
+
+flop:
+  num_samples: 2000
+  solve_iterations: 100
+  batch_size: 20
+  reservoir_capacity: 2000
+  validation_interval: 500
+  checkpoint_interval: 1000
 
 # Preflop: ~seconds (inference-only)
 preflop:
-  num_samples: 5000
-  reservoir_capacity: 5000
-  validation_interval: 1000
-  checkpoint_interval: 2500
+  num_samples: 2000
+  reservoir_capacity: 2000
+  validation_interval: 500
+  checkpoint_interval: 1000
