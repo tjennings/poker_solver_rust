@@ -640,7 +640,7 @@ pub fn train_turn_cfvnet_cuda<B: AutodiffBackend>(
         let t2 = Instant::now();
 
         // === SOLVE PHASE ===
-        let solve_result = turn_solver.solve_with_cfvs(config.solve_iterations)?;
+        let mut solve_result = turn_solver.solve_with_cfvs(config.solve_iterations)?;
         let t3 = Instant::now();
 
         // === INSERT PHASE ===

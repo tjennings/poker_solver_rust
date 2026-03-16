@@ -49,6 +49,8 @@ pub struct FlatTree {
     /// Precomputed fold payoff constants for fold terminal nodes.
     /// Each inner vec contains `[amount_win, amount_lose, folded_player]`.
     pub fold_payoffs: Vec<Vec<f32>>,
+    /// Number of valid hand-pair combinations (for payoff normalization).
+    pub num_combinations: f64,
     /// Number of canonical hand combos (max of OOP and IP).
     pub num_hands: usize,
     /// Number of OOP hands.
@@ -513,6 +515,7 @@ impl FlatTree {
             showdown_equity_ids: showdown_equity_ids_vec,
             equity_tables: equity_tables_vec,
             fold_payoffs: fold_payoffs_vec,
+            num_combinations,
             num_hands,
             num_hands_oop,
             num_hands_ip,
@@ -582,6 +585,7 @@ impl FlatTree {
             showdown_equity_ids: vec![],
             equity_tables: vec![],
             fold_payoffs: vec![],
+            num_combinations: 4.0,
             num_hands: 2,
             num_hands_oop: 2,
             num_hands_ip: 2,

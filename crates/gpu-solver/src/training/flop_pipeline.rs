@@ -319,7 +319,7 @@ pub fn train_flop_cfvnet_cuda<B: AutodiffBackend>(
         let t2 = Instant::now();
 
         // === SOLVE PHASE ===
-        let solve_result = flop_solver.solve_with_cfvs(config.solve_iterations)?;
+        let mut solve_result = flop_solver.solve_with_cfvs(config.solve_iterations)?;
         let t3 = Instant::now();
 
         // === INSERT PHASE ===

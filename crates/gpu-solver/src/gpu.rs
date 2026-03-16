@@ -1757,6 +1757,34 @@ impl GpuContext {
         }
         Ok(())
     }
+    /// Scale raw DCFR+ cfvalues to pot-relative EVs in-place.
+    ///
+    /// Formula: `cfv[h] = cfv[h] * num_combinations / pot[spot] + 0.5`
+    pub fn launch_scale_cfvs_to_pot_relative(
+        &self,
+        cfvs: &mut CudaSlice<f32>,
+        pots: &CudaSlice<f32>,
+        num_combinations: f32,
+        total_hands: u32,
+        hands_per_spot: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/scale_cfvs.cu"),
+            "scale_cfvs_to_pot_relative",
+        )?;
+        let cfg = LaunchConfig::for_num_elems(total_hands);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvs)
+                .arg(pots)
+                .arg(&num_combinations)
+                .arg(&total_hands)
+                .arg(&hands_per_spot)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
