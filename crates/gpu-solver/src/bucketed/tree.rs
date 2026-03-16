@@ -113,6 +113,23 @@ impl BucketedTree {
         (self.child_offsets[node + 1] - self.child_offsets[node]) as usize
     }
 
+    /// Which player acts at this node (0=OOP, 1=IP, u8::MAX for terminals).
+    pub fn player(&self, node: usize) -> u8 {
+        match self.node_types[node] {
+            NodeType::DecisionOop => 0,
+            NodeType::DecisionIp => 1,
+            _ => u8::MAX,
+        }
+    }
+
+    /// Whether the node is a terminal (fold, showdown, or depth boundary).
+    pub fn is_terminal(&self, node: usize) -> bool {
+        matches!(
+            self.node_types[node],
+            NodeType::TerminalFold | NodeType::TerminalShowdown | NodeType::DepthBoundary
+        )
+    }
+
     /// Build a `BucketedTree` from an allocated `PostFlopGame` and a bucket file.
     ///
     /// The BFS walk is identical to `FlatTree::from_postflop_game()` for

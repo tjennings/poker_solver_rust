@@ -5,4 +5,5 @@
 //! This dramatically reduces the dimensionality of the solver state.
 
 pub mod equity;
+pub mod solver;
 pub mod tree;

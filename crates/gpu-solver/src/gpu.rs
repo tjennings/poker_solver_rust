@@ -1845,6 +1845,103 @@ impl GpuContext {
         }
         Ok(())
     }
+
+    /// Launch the bucketed showdown evaluation kernel.
+    ///
+    /// For each showdown terminal and traverser bucket i, computes:
+    ///   `cfv[i] = half_pot * sum_j(equity[i][j] * opp_reach[j])`
+    ///
+    /// No card blocking -- blocking is baked into the equity table.
+    ///
+    /// # Layout
+    /// - `cfvalues`: `[num_nodes * total_hands]` -- output
+    /// - `opp_reach`: `[num_nodes * total_hands]` -- opponent reach
+    /// - `terminal_nodes`: `[num_sd_terminals]` -- node indices
+    /// - `equity_tables`: `[num_sd_terminals * num_buckets * num_buckets]`
+    /// - `half_pots`: `[num_sd_terminals]`
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_bucketed_showdown_eval(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        equity_tables: &CudaSlice<f32>,
+        half_pots: &CudaSlice<f32>,
+        num_sd_terminals: u32,
+        total_hands: u32,
+        num_buckets: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/bucketed_showdown.cu"),
+            "bucketed_showdown_eval",
+        )?;
+        let total_threads = num_sd_terminals * total_hands;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(equity_tables)
+                .arg(half_pots)
+                .arg(&num_sd_terminals)
+                .arg(&total_hands)
+                .arg(&num_buckets)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Launch the bucketed fold evaluation kernel.
+    ///
+    /// For each fold terminal and traverser bucket i, computes:
+    ///   `cfv[i] = payoff * sum_j(opp_reach[j])`
+    ///
+    /// No card blocking in bucket space -- every bucket sees the full
+    /// opponent reach sum.
+    ///
+    /// # Layout
+    /// - `cfvalues`: `[num_nodes * total_hands]` -- output
+    /// - `opp_reach`: `[num_nodes * total_hands]` -- opponent reach
+    /// - `terminal_nodes`: `[num_fold_terminals]` -- node indices
+    /// - `half_pots`: `[num_fold_terminals]`
+    /// - `fold_player`: `[num_fold_terminals]` -- which player folded (0=OOP, 1=IP)
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_bucketed_fold_eval(
+        &self,
+        cfvalues: &mut CudaSlice<f32>,
+        opp_reach: &CudaSlice<f32>,
+        terminal_nodes: &CudaSlice<u32>,
+        half_pots: &CudaSlice<f32>,
+        fold_player: &CudaSlice<u32>,
+        traverser: u32,
+        num_fold_terminals: u32,
+        total_hands: u32,
+        num_buckets: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/bucketed_fold.cu"),
+            "bucketed_fold_eval",
+        )?;
+        let total_threads = num_fold_terminals * total_hands;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(cfvalues)
+                .arg(opp_reach)
+                .arg(terminal_nodes)
+                .arg(half_pots)
+                .arg(fold_player)
+                .arg(&traverser)
+                .arg(&num_fold_terminals)
+                .arg(&total_hands)
+                .arg(&num_buckets)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
