@@ -120,6 +120,9 @@ enum Commands {
         /// Max samples per output file; splits into multiple files if total exceeds this
         #[arg(long)]
         per_file: Option<u64>,
+        /// Number of solver threads (default: all available cores)
+        #[arg(long)]
+        threads: Option<usize>,
     },
     /// Benchmark sample + solve throughput (no output).
     BenchSolve {
@@ -219,9 +222,9 @@ fn main() {
             num_spots,
         } => cmd_compare_exact(model, num_spots),
         Commands::DatagenEval { data } => cmd_datagen_eval(data),
-        Commands::GenerateBucketed { config, output, buckets, num_samples, per_file } => {
+        Commands::GenerateBucketed { config, output, buckets, num_samples, per_file, threads } => {
             ensure_parent_dir(&output);
-            cmd_generate_bucketed(config, output, buckets, num_samples, per_file);
+            cmd_generate_bucketed(config, output, buckets, num_samples, per_file, threads);
         }
         Commands::BenchSolve { config, num_samples, threads } => {
             cmd_bench_solve(config, num_samples, threads);
@@ -235,6 +238,7 @@ fn cmd_generate_bucketed(
     buckets_path: PathBuf,
     num_samples_override: Option<u64>,
     per_file: Option<u64>,
+    threads_override: Option<usize>,
 ) {
     use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
 
@@ -250,6 +254,12 @@ fn cmd_generate_bucketed(
     if let Some(n) = num_samples_override {
         cfg.datagen.num_samples = n;
     }
+    if let Some(t) = threads_override {
+        cfg.datagen.threads = t;
+    }
+    // For bucketed datagen, use random seed by default (each run produces unique data).
+    // The config's fixed seed is for reproducibility in tests.
+    cfg.datagen.seed = None;
 
     let bf = BucketFile::load(&buckets_path).unwrap_or_else(|e| {
         eprintln!("failed to load bucket file {}: {e}", buckets_path.display());
@@ -270,6 +280,7 @@ fn cmd_generate_bucketed(
         eprintln!("  Files: {num_files} ({chunk_size} per file)");
     }
     eprintln!("  Output: {}", output.display());
+    eprintln!("  Threads: {}", cfg.datagen.threads);
     eprintln!("  CFR variant: {:?}", cfg.datagen.cfr_variant);
 
     let base_seed = cfvnet::config::resolve_seed(cfg.datagen.seed);
