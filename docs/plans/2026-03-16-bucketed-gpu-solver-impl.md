@@ -4,11 +4,80 @@
 
 **Goal:** Rebuild the GPU DCFR+ solver to operate on configurable buckets (500/1000) instead of 1326 concrete combos, matching the Supremus architecture. Phased approach: river → turn → flop, each with correctness validation and performance benchmarks.
 
-**Architecture:** Reuse existing GPU solver kernels (already parameterized by `num_hands` — just pass `num_buckets`). Replace terminal showdown evaluation with bucket-vs-bucket equity matrix multiply. Replace CFV net I/O with bucket-space encoding (2×num_buckets+1 input, num_buckets output). Load bucket assignments from existing `.buckets` files.
+**Architecture:** Reuse existing GPU solver kernels (already parameterized by `num_hands` — just pass `num_buckets`). Replace terminal showdown evaluation with bucket-vs-bucket equity matrix multiply. CFV net matches Supremus exactly: input = `2 × num_buckets + 1` (both players' bucket distributions + pot/initial_stack), output = `2 × num_buckets` (both players' CFVs in one call), with hard zero-sum correction. Load bucket assignments from existing `.buckets` files.
 
 **Tech Stack:** Rust, cudarc (existing CUDA kernels), BucketFile (core crate), CudaNetInference (cuBLAS)
 
 **Performance target:** 50M samples in 1 hour (13,889 samples/s)
+
+---
+
+## Network Architecture (Supremus-Exact)
+
+All street-specific networks (river, turn, flop) share this architecture:
+
+### Input: `2 × num_buckets + 1`
+
+| Offset | Size | Content |
+|--------|------|---------|
+| 0 | num_buckets | OOP range as distribution over buckets |
+| num_buckets | num_buckets | IP range as distribution over buckets |
+| 2 × num_buckets | 1 | Pot size as fraction of starting stack: `pot / initial_stack` |
+
+For 500 buckets: input = 1001. For 1000 buckets: input = 2001.
+
+**No board encoding** — board context is implicit in bucket assignments.
+**No stack input** — effective stack is derivable from pot in standard HUNL.
+**No player indicator** — one call returns both players' CFVs.
+
+### Output: `2 × num_buckets`
+
+| Offset | Size | Content |
+|--------|------|---------|
+| 0 | num_buckets | OOP counterfactual values per bucket (pot-relative) |
+| num_buckets | num_buckets | IP counterfactual values per bucket (pot-relative) |
+
+For 500 buckets: output = 1000. For 1000 buckets: output = 2000.
+
+### Zero-Sum Enforcement (Outer Network)
+
+After the inner network (7 × 500, PReLU) produces raw outputs:
+1. Compute range-weighted game values: `gv_oop = sum(oop_range[i] * cfv_oop[i])`, `gv_ip = sum(ip_range[i] * cfv_ip[i])`
+2. Correction: `correction = (gv_oop + gv_ip) / 2`
+3. Adjust: `cfv_oop[i] -= correction`, `cfv_ip[i] -= correction`
+
+This ensures the game values sum to zero (zero-sum property of poker). The correction is applied as a differentiable operation — gradients flow through it during training.
+
+### Inner Network
+
+7 fully-connected hidden layers, 500 nodes each, PReLU activation. Same as current cfvnet architecture.
+
+### Pot Normalization
+
+`pot / initial_stack` (NOT `pot / 400`). For a 200-chip game (100bb): range is [0, 2] (max pot = 400 = 2 × initial_stack). The normalization constant comes from the YAML config, not hardcoded.
+
+### Preflop Auxiliary Network (Different Architecture)
+
+The preflop network does NOT use buckets. Instead it uses 169 strategically distinct hand classes:
+
+| Offset | Size | Content |
+|--------|------|---------|
+| 0 | 169 | OOP range over 169 preflop hand classes |
+| 169 | 169 | IP range over 169 preflop hand classes |
+| 338 | 1 | Pot / initial_stack |
+
+Input: 339. Output: 338 (2 × 169). Same zero-sum enforcement.
+
+The 169 classes are the standard preflop hand groupings (AA, AKs, AKo, ..., 22). Each class maps to multiple combos (e.g., AA = 6 combos, AKs = 4 combos).
+
+### Summary: Networks in the Full Stack
+
+| Network | Input | Output | Bucket source | Training data |
+|---------|-------|--------|--------------|---------------|
+| River | 2×500+1=1001 | 2×500=1000 | river.buckets | 50M subgame solves |
+| Turn | 2×500+1=1001 | 2×500=1000 | turn.buckets | 20M (river model at leaves) |
+| Flop | 2×500+1=1001 | 2×500=1000 | flop.buckets | 5M (turn model at leaves) |
+| Preflop | 2×169+1=339 | 2×169=338 | 169 hand classes | 10M (inference-only, average over 1755 flops) |
 
 ---
 
@@ -550,24 +619,29 @@ Per batch (CPU + GPU):
 
 Steps 1-3 are CPU (sampling + bucket mapping + equity precomputation). These run once per batch — the solve (step 4) at 4000 iterations dominates.
 
-**Step 3: CFV net architecture**
+**Step 3: CFV net architecture (Supremus-exact)**
 
 Input: `2 × num_buckets + 1 = 1001` (for 500 buckets)
-Output: `num_buckets = 500`
-Hidden: 7 × 500 (same as Supremus)
+Output: `2 × num_buckets = 1000` (BOTH players' CFVs in one call)
+Hidden: 7 × 500, PReLU
+Zero-sum enforcement: hard correction on output (subtract `(gv_oop + gv_ip) / 2`)
 
-The network is much smaller than the concrete version (1001 input vs 2720).
+One forward pass returns CFVs for both players. This halves inference cost vs the concrete implementation (which calls the network twice, once per player).
+
+The training target for each situation is a 1000-dim vector: OOP bucket CFVs concatenated with IP bucket CFVs. The loss function includes:
+- Huber loss on predicted vs ground-truth CFVs (masked for valid buckets)
+- Zero-sum constraint is enforced architecturally (not via loss penalty)
 
 **Step 4: Reservoir encoding**
 
-Bucket-space reservoir records:
+Bucket-space reservoir records (one record per situation, NOT per player):
 ```
-input:  [2 × num_buckets + 1] = 1001 floats
-target: [num_buckets]          = 500 floats
-mask:   [num_buckets]          = 500 floats (all 1.0 for valid buckets)
+input:  [2 × num_buckets + 1] = 1001 floats (OOP reach + IP reach + pot/initial_stack)
+target: [2 × num_buckets]     = 1000 floats (OOP CFVs + IP CFVs)
+mask:   [2 × num_buckets]     = 1000 floats (1.0 for buckets with non-zero reach)
 ```
 
-No board one-hot needed — bucket assignments already encode board context.
+Each solved situation produces ONE training record (not two). The network returns both players' CFVs in a single call. No board one-hot, no player indicator — bucket assignments encode board context.
 
 **Step 5: Performance benchmark**
 
@@ -677,20 +751,24 @@ Before proceeding to Phase B:
 - Create: `crates/gpu-solver/kernels/bucketed_encode_leaf.cu`
 - Create: `crates/gpu-solver/kernels/bucketed_average_leaf.cu`
 
-At depth boundaries, encode bucket-space reach into network input (2×num_buckets+1), run forward pass, convert output back to DCFR+ cfvalues.
+At depth boundaries, encode bucket-space reach into network input, run one forward pass (returns BOTH players' CFVs), apply zero-sum correction, convert output back to DCFR+ cfvalues.
 
-**Key difference from concrete version**: No 2720-dim encoding. Just:
+**Key difference from concrete version**: No 2720-dim encoding, no player indicator, one call per boundary (not two):
 - `input[0..500]` = OOP bucket reach at boundary
 - `input[500..1000]` = IP bucket reach at boundary
-- `input[1000]` = pot / normalization_constant
+- `input[1000]` = pot_at_boundary / initial_stack
+
+Output: `[0..500]` = OOP bucket CFVs, `[500..1000]` = IP bucket CFVs (pot-relative).
 
 The encoding kernel is trivial — just gather reach values and append pot.
 
-No num_combinations issue — the bucket equity tables are pre-normalized. The CFV net output IS the cfvalue (no conversion needed).
+No num_combinations issue — the bucket equity tables are pre-normalized. The CFV net output is pot-relative; convert to DCFR+ cfvalue units: `cfvalue[b] = (net_output[b] - 0.5) * pot_at_boundary`. Wait — in bucket space with pre-normalized equity, the conversion is simpler. The fold payoffs are `±half_pot` and the network outputs pot-relative values. The conversion is: `cfvalue[b] = net_output[b] * pot_at_boundary` (if net outputs are already in "fraction of pot" form). The exact conversion depends on the training target normalization — verify during Phase A validation.
 
-**Step 1: Encode kernel** — gather reach at boundary + pot into `[num_inputs × (2*num_buckets+1)]`
+**One call per boundary** (not two per player): the model returns both players' CFVs. The solver uses the traverser's CFVs for the backward pass. For simultaneous updates, both players' CFVs are available from the same call.
 
-**Step 2: Average kernel** — average model outputs across possible next cards (48 for turn→river, 49 for flop→turn)
+**Step 1: Encode kernel** — gather reach at boundary + pot into `[num_inputs × (2*num_buckets+1)]`. One input per (boundary × next_card × spot), NOT per player.
+
+**Step 2: Average kernel** — average model outputs across possible next cards (48 for turn→river, 49 for flop→turn). Output is `[2 × num_buckets]` per (boundary, spot). Extract the traverser's half for the backward pass.
 
 **Step 3: Test**
 
@@ -774,7 +852,15 @@ Same as turn but:
 
 ### Task C2: Preflop Auxiliary Training
 
-Same as concrete: inference-only, 1755 canonical flops, weighted averaging. But in bucket space — much smaller tensors (500-dim instead of 1326-dim).
+**Different architecture from other streets.** The preflop network uses 169 hand classes (NOT buckets):
+
+Input: `2 × 169 + 1 = 339` (OOP range + IP range + pot/initial_stack over 169 hand classes)
+Output: `2 × 169 = 338` (both players' CFVs)
+Same zero-sum enforcement.
+
+The 169 classes are the standard preflop groupings (AA, AKs, AKo, ..., 22). DeepStack uses this because "there are only 169 strategically distinct hands pre-flop, making it feasible to input the distribution over distinct hands directly."
+
+Training is inference-only (same as concrete): for each random preflop situation, enumerate 1755 canonical flops, forward pass the flop model for each, weighted-average the outputs, use as training target. Each flop model call requires mapping from 169 preflop classes to flop-bucket-space — a sparse matrix multiply precomputed from the bucket file.
 
 ### Task C3: Full Stack CLI
 
