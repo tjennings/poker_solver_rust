@@ -741,6 +741,62 @@ impl GpuContext {
         Ok(())
     }
 
+    /// Launch the Supremus DCFR+ regret update kernel.
+    ///
+    /// Differences from `launch_update_regrets`:
+    /// - Regret discounting uses `t` directly: `pos_discount = t^1.5 / (t^1.5 + 1)`
+    /// - Strategy sum uses additive linear weighting with delay:
+    ///   `strategy_sum += max(0, t - delay) * strategy`
+    ///
+    /// # Arguments
+    /// - `iteration`: current iteration number (1-indexed)
+    /// - `delay`: number of early iterations to skip for strategy accumulation (typically 100)
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_update_regrets_supremus(
+        &self,
+        regrets: &mut CudaSlice<f32>,
+        strategy_sum: &mut CudaSlice<f32>,
+        strategy: &CudaSlice<f32>,
+        cfvalues: &CudaSlice<f32>,
+        decision_nodes: &CudaSlice<u32>,
+        child_offsets: &CudaSlice<u32>,
+        children_arr: &CudaSlice<u32>,
+        infoset_ids: &CudaSlice<u32>,
+        num_actions_arr: &CudaSlice<u32>,
+        num_decision_nodes: u32,
+        num_hands: u32,
+        max_actions: u32,
+        iteration: u32,
+        delay: u32,
+    ) -> Result<(), GpuError> {
+        let kernel = self.compile_and_load(
+            include_str!("../kernels/update_regrets_supremus.cu"),
+            "update_regrets_supremus",
+        )?;
+        let total_threads = num_decision_nodes * max_actions * num_hands;
+        let cfg = LaunchConfig::for_num_elems(total_threads);
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(regrets)
+                .arg(strategy_sum)
+                .arg(strategy)
+                .arg(cfvalues)
+                .arg(decision_nodes)
+                .arg(child_offsets)
+                .arg(children_arr)
+                .arg(infoset_ids)
+                .arg(num_actions_arr)
+                .arg(&num_decision_nodes)
+                .arg(&num_hands)
+                .arg(&max_actions)
+                .arg(&iteration)
+                .arg(&delay)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
     /// Launch the batch fold terminal evaluation kernel.
     ///
     /// Like `launch_terminal_fold_eval` but with:
@@ -2804,6 +2860,176 @@ mod tests {
             (result[3] - 1150.0).abs() < eps,
             "hand 3 raw should be 1150.0, got {}",
             result[3]
+        );
+    }
+
+    /// Test the Supremus DCFR+ `update_regrets_supremus` kernel.
+    ///
+    /// Setup: 2 infosets, 2 actions, 3 buckets (hands).
+    /// Verifies:
+    /// - Regret discounting uses t directly (not t-1)
+    /// - At iteration 50 (before delay=100): strategy_sum unchanged
+    /// - At iteration 150 (after delay=100): strategy_sum += 50 * strategy
+    #[test]
+    fn test_update_regrets_supremus() {
+        let gpu = GpuContext::new(0).unwrap();
+
+        let num_decision_nodes: u32 = 2;
+        let num_hands: u32 = 3; // = num_buckets for bucketed solver
+        let max_actions: u32 = 2;
+        let num_infosets: u32 = 2;
+
+        // Tree:  node0 (iset 0) -> children [1, 2]
+        //        node3 (iset 1) -> children [4, 5]
+        // We only use nodes 0..6 in cfvalues.
+        let decision_nodes: Vec<u32> = vec![0, 3];
+        let child_offsets: Vec<u32> = vec![0, 2, 2, 2, 2, 4, 4];
+        let children: Vec<u32> = vec![1, 2, 4, 5];
+        let infoset_ids: Vec<u32> = vec![0, u32::MAX, u32::MAX, 1, u32::MAX, u32::MAX];
+        let num_actions_arr: Vec<u32> = vec![2, 2];
+
+        // CFValues: 6 nodes * 3 hands = 18 floats
+        // node0: [1.0, 2.0, 3.0]  (node cfv)
+        // node1: [2.0, 4.0, 6.0]  (child 0 of iset0)
+        // node2: [0.5, 1.0, 1.5]  (child 1 of iset0)
+        // node3: [5.0, 5.0, 5.0]  (node cfv)
+        // node4: [7.0, 8.0, 9.0]  (child 0 of iset1)
+        // node5: [3.0, 2.0, 1.0]  (child 1 of iset1)
+        let cfvalues: Vec<f32> = vec![
+            1.0, 2.0, 3.0, // node 0
+            2.0, 4.0, 6.0, // node 1
+            0.5, 1.0, 1.5, // node 2
+            5.0, 5.0, 5.0, // node 3
+            7.0, 8.0, 9.0, // node 4
+            3.0, 2.0, 1.0, // node 5
+        ];
+
+        // Instantaneous regrets:
+        // iset0, act0: child1 - node0 = [1, 2, 3]
+        // iset0, act1: child2 - node0 = [-0.5, -1, -1.5]
+        // iset1, act0: child4 - node3 = [2, 3, 4]
+        // iset1, act1: child5 - node3 = [-2, -3, -4]
+
+        // Initial regrets: all 1.0 (positive)
+        let initial_regrets = vec![1.0f32; (num_infosets * max_actions * num_hands) as usize];
+        // Strategy: uniform 0.5 for 2 actions
+        let strategy = vec![0.5f32; (num_infosets * max_actions * num_hands) as usize];
+        // Strategy sum: start at zero
+        let initial_strategy_sum = vec![0.0f32; (num_infosets * max_actions * num_hands) as usize];
+
+        // Upload
+        let gpu_decision_nodes = gpu.upload(&decision_nodes).unwrap();
+        let gpu_child_offsets = gpu.upload(&child_offsets).unwrap();
+        let gpu_children = gpu.upload(&children).unwrap();
+        let gpu_infoset_ids = gpu.upload(&infoset_ids).unwrap();
+        let gpu_num_actions = gpu.upload(&num_actions_arr).unwrap();
+        let gpu_cfvalues = gpu.upload(&cfvalues).unwrap();
+        let gpu_strategy = gpu.upload(&strategy).unwrap();
+
+        // --- Test at iteration 50 (before delay=100): strategy_sum should NOT change ---
+        let mut gpu_regrets = gpu.upload(&initial_regrets).unwrap();
+        let mut gpu_strategy_sum = gpu.upload(&initial_strategy_sum).unwrap();
+
+        gpu.launch_update_regrets_supremus(
+            &mut gpu_regrets,
+            &mut gpu_strategy_sum,
+            &gpu_strategy,
+            &gpu_cfvalues,
+            &gpu_decision_nodes,
+            &gpu_child_offsets,
+            &gpu_children,
+            &gpu_infoset_ids,
+            &gpu_num_actions,
+            num_decision_nodes,
+            num_hands,
+            max_actions,
+            50, // iteration
+            100, // delay
+        )
+        .unwrap();
+
+        let strat_sum_50 = gpu.download(&gpu_strategy_sum).unwrap();
+        let regrets_50 = gpu.download(&gpu_regrets).unwrap();
+
+        // Strategy sum should be all zeros (iteration 50 < delay 100)
+        for (i, &v) in strat_sum_50.iter().enumerate() {
+            assert!(
+                v.abs() < 1e-6,
+                "strategy_sum[{i}] should be 0.0 at iter 50, got {v}"
+            );
+        }
+
+        // Verify regret discounting at t=50:
+        // pos_discount = 50^1.5 / (50^1.5 + 1)
+        let t: f32 = 50.0;
+        let t_alpha = t * t.sqrt(); // 50^1.5 = 353.55...
+        let pos_discount = t_alpha / (t_alpha + 1.0);
+        let eps = 1e-4;
+
+        // iset0, act0, hand0: old_regret=1.0 (positive), inst_regret=1.0
+        // new = 1.0 * pos_discount + 1.0
+        let expected = 1.0 * pos_discount + 1.0;
+        assert!(
+            (regrets_50[0] - expected).abs() < eps,
+            "regret[0] expected {expected}, got {}",
+            regrets_50[0]
+        );
+
+        // iset0, act1, hand0: old_regret=1.0 (positive), inst_regret=-0.5
+        // new = 1.0 * pos_discount + (-0.5)
+        let expected = 1.0 * pos_discount + (-0.5);
+        assert!(
+            (regrets_50[3] - expected).abs() < eps,
+            "regret[3] expected {expected}, got {}",
+            regrets_50[3]
+        );
+
+        // --- Test at iteration 150 (after delay=100): strategy_sum += 50 * strategy ---
+        let mut gpu_regrets2 = gpu.upload(&initial_regrets).unwrap();
+        let mut gpu_strategy_sum2 = gpu.upload(&initial_strategy_sum).unwrap();
+
+        gpu.launch_update_regrets_supremus(
+            &mut gpu_regrets2,
+            &mut gpu_strategy_sum2,
+            &gpu_strategy,
+            &gpu_cfvalues,
+            &gpu_decision_nodes,
+            &gpu_child_offsets,
+            &gpu_children,
+            &gpu_infoset_ids,
+            &gpu_num_actions,
+            num_decision_nodes,
+            num_hands,
+            max_actions,
+            150, // iteration
+            100, // delay
+        )
+        .unwrap();
+
+        let strat_sum_150 = gpu.download(&gpu_strategy_sum2).unwrap();
+        let regrets_150 = gpu.download(&gpu_regrets2).unwrap();
+
+        // Strategy sum should be 50 * 0.5 = 25.0 for all entries
+        // weight = max(0, 150 - 100) = 50
+        let expected_strat_sum = 50.0 * 0.5;
+        for (i, &v) in strat_sum_150.iter().enumerate() {
+            assert!(
+                (v - expected_strat_sum).abs() < 1e-4,
+                "strategy_sum[{i}] should be {expected_strat_sum} at iter 150, got {v}"
+            );
+        }
+
+        // Verify regret discounting at t=150:
+        let t: f32 = 150.0;
+        let t_alpha = t * t.sqrt(); // 150^1.5
+        let pos_discount = t_alpha / (t_alpha + 1.0);
+
+        // iset0, act0, hand0: old=1.0 (pos), inst=1.0
+        let expected = 1.0 * pos_discount + 1.0;
+        assert!(
+            (regrets_150[0] - expected).abs() < eps,
+            "regret[0] at iter 150 expected {expected}, got {}",
+            regrets_150[0]
         );
     }
 }
