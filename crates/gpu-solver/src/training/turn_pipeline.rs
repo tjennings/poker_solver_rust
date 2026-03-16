@@ -10,6 +10,8 @@
 //!           -> insert root CFVs into reservoir -> train -> validate
 
 #[cfg(feature = "training")]
+use std::io::IsTerminal;
+#[cfg(feature = "training")]
 use std::path::PathBuf;
 #[cfg(feature = "training")]
 use std::time::Instant;
@@ -280,14 +282,19 @@ pub fn train_turn_cfvnet<B: AutodiffBackend>(
     eprintln!("  Output: {}", config.output_dir.display());
     eprintln!();
 
-    let pb = ProgressBar::new(config.num_samples);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{prefix} [{bar:30}] {pos}/{len} ({per_sec}, ETA {eta}) {msg}")
-            .unwrap()
-            .progress_chars("##-"),
-    );
-    pb.set_prefix("TURN");
+    let pb = if std::io::stderr().is_terminal() {
+        let pb = ProgressBar::new(config.num_samples);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{prefix} [{bar:30}] {pos}/{len} ({per_sec}, ETA {eta}) {msg}")
+                .unwrap()
+                .progress_chars("##-"),
+        );
+        pb.set_prefix("TURN");
+        pb
+    } else {
+        ProgressBar::hidden()
+    };
 
     while total_samples < config.num_samples {
         // === SAMPLE PHASE (GPU) ===
@@ -401,15 +408,17 @@ pub fn train_turn_cfvnet<B: AutodiffBackend>(
                 f32::NAN
             };
 
-            pb.println(format!(
+            let msg = format!(
                 "[{:>12} samples] loss={:.6} val={:.6} rate={:.0} samples/s  reservoir={}",
                 total_samples, last_loss, val_loss, rate, reservoir.size()
-            ));
+            );
+            pb.println(&msg);
+            eprintln!("{}", msg);
 
             // Print per-phase timing breakdown
             if batches_since_report > 0 {
                 let n = batches_since_report as f64;
-                pb.println(format!(
+                let msg = format!(
                     "  timing: sample={:.1}ms build={:.1}ms solve={:.1}ms insert={:.1}ms train={:.1}ms  ({} batches avg)",
                     timing_accum.sample_ms / n,
                     timing_accum.build_ms / n,
@@ -417,7 +426,9 @@ pub fn train_turn_cfvnet<B: AutodiffBackend>(
                     timing_accum.insert_ms / n,
                     timing_accum.train_ms / n,
                     batches_since_report,
-                ));
+                );
+                pb.println(&msg);
+                eprintln!("{}", msg);
             }
 
             // Reset accumulator
@@ -438,7 +449,9 @@ pub fn train_turn_cfvnet<B: AutodiffBackend>(
         {
             let label = format!("checkpoint_{}", total_samples);
             trainer.save_checkpoint(&config.output_dir, &label);
-            pb.println(format!("  Saved checkpoint: {}", label));
+            let msg = format!("  Saved checkpoint: {}", label);
+            pb.println(&msg);
+            eprintln!("{}", msg);
         }
     }
 
@@ -581,14 +594,19 @@ pub fn train_turn_cfvnet_cuda<B: AutodiffBackend>(
     eprintln!("  Output: {}", config.output_dir.display());
     eprintln!();
 
-    let pb = ProgressBar::new(config.num_samples);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{prefix} [{bar:30}] {pos}/{len} ({per_sec}, ETA {eta}) {msg}")
-            .unwrap()
-            .progress_chars("##-"),
-    );
-    pb.set_prefix("TURN");
+    let pb = if std::io::stderr().is_terminal() {
+        let pb = ProgressBar::new(config.num_samples);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{prefix} [{bar:30}] {pos}/{len} ({per_sec}, ETA {eta}) {msg}")
+                .unwrap()
+                .progress_chars("##-"),
+        );
+        pb.set_prefix("TURN");
+        pb
+    } else {
+        ProgressBar::hidden()
+    };
 
     while total_samples < config.num_samples {
         // === SAMPLE PHASE ===
@@ -696,14 +714,16 @@ pub fn train_turn_cfvnet_cuda<B: AutodiffBackend>(
                 f32::NAN
             };
 
-            pb.println(format!(
+            let msg = format!(
                 "[{:>12} samples] loss={:.6} val={:.6} rate={:.0} samples/s  reservoir={}",
                 total_samples, last_loss, val_loss, rate, reservoir.size()
-            ));
+            );
+            pb.println(&msg);
+            eprintln!("{}", msg);
 
             if batches_since_report > 0 {
                 let n = batches_since_report as f64;
-                pb.println(format!(
+                let msg = format!(
                     "  timing: sample={:.1}ms build={:.1}ms solve={:.1}ms insert={:.1}ms train={:.1}ms  ({} batches avg)",
                     timing_accum.sample_ms / n,
                     timing_accum.build_ms / n,
@@ -711,7 +731,9 @@ pub fn train_turn_cfvnet_cuda<B: AutodiffBackend>(
                     timing_accum.insert_ms / n,
                     timing_accum.train_ms / n,
                     batches_since_report,
-                ));
+                );
+                pb.println(&msg);
+                eprintln!("{}", msg);
             }
 
             timing_accum = PhaseTiming {
@@ -731,7 +753,9 @@ pub fn train_turn_cfvnet_cuda<B: AutodiffBackend>(
         {
             let label = format!("checkpoint_{}", total_samples);
             trainer.save_checkpoint(&config.output_dir, &label);
-            pb.println(format!("  Saved checkpoint: {}", label));
+            let msg = format!("  Saved checkpoint: {}", label);
+            pb.println(&msg);
+            eprintln!("{}", msg);
         }
     }
 
