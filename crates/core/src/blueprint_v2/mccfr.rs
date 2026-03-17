@@ -15,7 +15,9 @@
 )]
 
 use std::cmp::Ordering;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, RwLock};
 
 use rand::Rng;
 
@@ -46,6 +48,7 @@ use rustc_hash::FxHashMap;
 use super::bucket_file::{BucketFile, PackedBoard};
 use super::cluster_pipeline::{canonical_key, combo_index};
 use super::game_tree::{GameNode, GameTree, TerminalKind};
+use super::per_flop_bucket_file::PerFlopBucketFile;
 use super::storage::BlueprintStorage;
 use super::Street;
 use crate::abstraction::isomorphism::CanonicalBoard;
@@ -87,6 +90,16 @@ pub struct AllBuckets {
     pub bucket_files: [Option<BucketFile>; 4],
     /// Board index lookup tables for O(1) bucket file lookups.
     board_maps: [Option<FxHashMap<PackedBoard, u32>>; 4],
+    /// Directory containing per-flop bucket files (`flop_NNNN.buckets`).
+    /// When set, turn/river lookups use per-flop files instead of global
+    /// bucket files.
+    per_flop_dir: Option<PathBuf>,
+    /// Cache of loaded per-flop bucket files, keyed by canonical flop
+    /// `PackedBoard`.
+    per_flop_cache: RwLock<FxHashMap<PackedBoard, Arc<PerFlopBucketFile>>>,
+    /// Map from canonical flop `PackedBoard` to flop file index (the NNNN
+    /// in `flop_NNNN.buckets`).
+    flop_index_map: Option<FxHashMap<PackedBoard, u16>>,
 }
 
 impl AllBuckets {
@@ -108,7 +121,61 @@ impl AllBuckets {
             bucket_counts,
             bucket_files,
             board_maps,
+            per_flop_dir: None,
+            per_flop_cache: RwLock::new(FxHashMap::default()),
+            flop_index_map: None,
         }
+    }
+
+    /// Enable per-flop bucket lookups for turn and river streets.
+    ///
+    /// Scans `dir` for `flop_NNNN.buckets` files, loads each header to
+    /// extract the canonical flop, and builds an index mapping each flop
+    /// `PackedBoard` to its file index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal per-flop cache lock is poisoned.
+    #[must_use]
+    pub fn with_per_flop_dir(mut self, dir: PathBuf) -> Self {
+        let mut index_map = FxHashMap::default();
+
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                // Match flop_NNNN.buckets pattern
+                if !name.starts_with("flop_") || !name.ends_with(".buckets") {
+                    continue;
+                }
+                let idx_str = &name[5..name.len() - 8]; // strip "flop_" and ".buckets"
+                let file_index: u16 = match idx_str.parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                // Load the file to get the flop cards
+                if let Ok(pf) = PerFlopBucketFile::load(&path) {
+                    let Ok(canonical) = CanonicalBoard::from_cards(&pf.flop_cards[..]) else {
+                        continue;
+                    };
+                    let packed = canonical_key(&canonical.cards);
+                    index_map.insert(packed, file_index);
+                    // Also cache the loaded file
+                    self.per_flop_cache
+                        .write()
+                        .expect("per_flop_cache lock")
+                        .insert(packed, Arc::new(pf));
+                }
+            }
+        }
+
+        self.per_flop_dir = Some(dir);
+        self.flop_index_map = Some(index_map);
+        self
     }
 
     /// Look up a bucket for a postflop street via bucket file.
@@ -117,8 +184,17 @@ impl AllBuckets {
     /// applies the same suit permutation to hole cards, and reads the bucket
     /// from the flat array. Falls back to equity binning if no bucket file
     /// or board not found.
+    ///
+    /// For turn (`street_idx`=2) and river (`street_idx`=3), when `per_flop_dir`
+    /// is set, uses per-flop bucket files instead of global bucket files.
     fn lookup_bucket(&self, street_idx: usize, hole: [Card; 2], board: &[Card]) -> u16 {
-        if let (Some(bf), Some(board_map)) = (
+        // Per-flop lookup for turn and river when available
+        if (street_idx == 2 || street_idx == 3) && self.per_flop_dir.is_some() {
+            if let Some(bucket) = self.lookup_per_flop(street_idx, hole, board) {
+                return bucket;
+            }
+            // Fall through to equity fallback
+        } else if let (Some(bf), Some(board_map)) = (
             &self.bucket_files[street_idx],
             &self.board_maps[street_idx],
         ) {
@@ -136,6 +212,77 @@ impl AllBuckets {
         let k = self.bucket_counts[street_idx];
         let bucket = (equity * f64::from(k)) as u16;
         bucket.min(k - 1)
+    }
+
+    /// Per-flop bucket lookup for turn (`street_idx`=2) or river (`street_idx`=3).
+    ///
+    /// Canonicalizes the flop portion of the board, looks up the per-flop
+    /// file (loading from cache or disk), then finds the turn/river card
+    /// indices and returns the bucket. Returns `None` if the flop or
+    /// card is not found in the per-flop file.
+    fn lookup_per_flop(
+        &self,
+        street_idx: usize,
+        hole: [Card; 2],
+        board: &[Card],
+    ) -> Option<u16> {
+        let index_map = self.flop_index_map.as_ref()?;
+
+        // Canonicalize the flop (first 3 board cards)
+        let canonical_flop = CanonicalBoard::from_cards(&board[..3]).ok()?;
+        let flop_key = canonical_key(&canonical_flop.cards);
+
+        // Check if we have a per-flop file for this flop
+        let _file_idx = index_map.get(&flop_key)?;
+
+        // Get or load the per-flop file from cache
+        let pf = self.get_per_flop_file(flop_key)?;
+
+        // Apply the flop's suit mapping to the hole cards for combo index
+        let (h0, h1) = canonical_flop.canonicalize_holding(hole[0], hole[1]);
+        let ci = combo_index(h0, h1) as usize;
+
+        // Map the turn card through the flop's suit canonicalization
+        let canon_turn = canonical_flop.mapping.map_card(board[3]);
+
+        // Find turn card index in the per-flop file
+        let turn_idx = pf.turn_cards.iter().position(|&tc| tc == canon_turn)?;
+
+        if street_idx == 2 {
+            // Turn bucket
+            Some(pf.get_turn_bucket(turn_idx, ci))
+        } else {
+            // River: also need to find the river card
+            let canon_river = canonical_flop.mapping.map_card(board[4]);
+            let river_idx = pf.river_cards_per_turn[turn_idx]
+                .iter()
+                .position(|&rc| rc == canon_river)?;
+            Some(pf.get_river_bucket(turn_idx, river_idx, ci))
+        }
+    }
+
+    /// Get a per-flop file from the cache, loading from disk if needed.
+    fn get_per_flop_file(&self, flop_key: PackedBoard) -> Option<Arc<PerFlopBucketFile>> {
+        // Fast path: read lock
+        {
+            let cache = self.per_flop_cache.read().expect("per_flop_cache read lock");
+            if let Some(pf) = cache.get(&flop_key) {
+                return Some(Arc::clone(pf));
+            }
+        }
+
+        // Slow path: load from disk, write lock
+        let dir = self.per_flop_dir.as_ref()?;
+        let index_map = self.flop_index_map.as_ref()?;
+        let &file_idx = index_map.get(&flop_key)?;
+
+        let path = dir.join(format!("flop_{file_idx:04}.buckets"));
+        let pf = PerFlopBucketFile::load(&path).ok()?;
+        let arc = Arc::new(pf);
+
+        let mut cache = self.per_flop_cache.write().expect("per_flop_cache write lock");
+        cache.insert(flop_key, Arc::clone(&arc));
+        Some(arc)
     }
 
     /// Pre-compute bucket assignments for all 4 streets x 2 players.
@@ -1294,5 +1441,280 @@ mod tests {
         // Turn/River have no bucket files -> no board maps
         assert!(all.board_maps[2].is_none());
         assert!(all.board_maps[3].is_none());
+    }
+
+    // ── Per-flop bucket lookup tests ─────────────────────────────────
+
+    /// Helper: build a PerFlopBucketFile for a given canonical flop with
+    /// deterministic bucket assignments, save it to the given directory,
+    /// and return the flop cards used.
+    fn save_test_per_flop_file(
+        dir: &std::path::Path,
+        flop: [Card; 3],
+        turn_cards: Vec<Card>,
+        river_cards_per_turn: Vec<Vec<Card>>,
+        turn_bucket_count: u16,
+        river_bucket_count: u16,
+        file_index: usize,
+    ) -> crate::blueprint_v2::per_flop_bucket_file::PerFlopBucketFile {
+        use crate::blueprint_v2::per_flop_bucket_file::PerFlopBucketFile;
+
+        let num_turns = turn_cards.len();
+        // Deterministic turn buckets: bucket = (turn_idx * 100 + combo_idx) % turn_bucket_count
+        let mut turn_buckets = vec![0u16; num_turns * 1326];
+        for t in 0..num_turns {
+            for ci in 0..1326 {
+                turn_buckets[t * 1326 + ci] = ((t * 100 + ci) % turn_bucket_count as usize) as u16;
+            }
+        }
+
+        // Deterministic river buckets
+        let mut river_buckets_per_turn = Vec::new();
+        for (t, rivers) in river_cards_per_turn.iter().enumerate() {
+            let num_rivers = rivers.len();
+            let mut rb = vec![0u16; num_rivers * 1326];
+            for r in 0..num_rivers {
+                for ci in 0..1326 {
+                    rb[r * 1326 + ci] = ((t * 50 + r * 10 + ci) % river_bucket_count as usize) as u16;
+                }
+            }
+            river_buckets_per_turn.push(rb);
+        }
+
+        let pf = PerFlopBucketFile {
+            flop_cards: flop,
+            turn_bucket_count,
+            river_bucket_count,
+            turn_cards,
+            turn_buckets,
+            river_cards_per_turn,
+            river_buckets_per_turn,
+        };
+
+        let path = dir.join(format!("flop_{file_index:04}.buckets"));
+        pf.save(&path).expect("save per-flop file");
+        pf
+    }
+
+    #[test]
+    fn with_per_flop_dir_scans_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let flop = [
+            c(Value::Queen, Suit::Spade),
+            c(Value::Jack, Suit::Heart),
+            c(Value::Two, Suit::Diamond),
+        ];
+        let turn_card = c(Value::Ace, Suit::Club);
+        let river_card = c(Value::Ten, Suit::Club);
+
+        save_test_per_flop_file(
+            dir.path(), flop,
+            vec![turn_card],
+            vec![vec![river_card]],
+            10, 10, 0,
+        );
+
+        let all = AllBuckets::new(
+            [169, 50, 10, 10],
+            [None, None, None, None],
+        ).with_per_flop_dir(dir.path().to_path_buf());
+
+        assert!(all.per_flop_dir.is_some());
+        assert!(all.flop_index_map.is_some());
+        let index = all.flop_index_map.as_ref().unwrap();
+        assert_eq!(index.len(), 1, "should have 1 flop indexed");
+    }
+
+    #[test]
+    fn per_flop_turn_bucket_lookup() {
+        use crate::abstraction::isomorphism::CanonicalBoard;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Use canonical flop cards (already in canonical form for simplicity)
+        let flop = [
+            c(Value::Queen, Suit::Spade),
+            c(Value::Jack, Suit::Heart),
+            c(Value::Two, Suit::Diamond),
+        ];
+        let turn_card = c(Value::Ace, Suit::Club);
+        let river_card = c(Value::Ten, Suit::Club);
+
+        let pf = save_test_per_flop_file(
+            dir.path(), flop,
+            vec![turn_card],
+            vec![vec![river_card]],
+            10, 10, 0,
+        );
+
+        let all = AllBuckets::new(
+            [169, 50, 10, 10],
+            [None, None, None, None],
+        ).with_per_flop_dir(dir.path().to_path_buf());
+
+        // Build a turn board: flop + turn_card
+        let turn_board = [flop[0], flop[1], flop[2], turn_card];
+
+        // Use hole cards that won't conflict with board
+        let hole = [c(Value::King, Suit::Club), c(Value::Nine, Suit::Diamond)];
+
+        let bucket = all.get_bucket(Street::Turn, hole, &turn_board);
+
+        // Compute expected: canonicalize the flop, find turn card, get combo_index
+        let canonical_flop = CanonicalBoard::from_cards(&flop[..]).unwrap();
+        let (h0, h1) = canonical_flop.canonicalize_holding(hole[0], hole[1]);
+        let ci = combo_index(h0, h1) as usize;
+
+        // turn_idx=0, expected = (0 * 100 + ci) % 10
+        let expected = (ci % 10) as u16;
+        assert_eq!(bucket, expected, "turn bucket from per-flop file");
+    }
+
+    #[test]
+    fn per_flop_river_bucket_lookup() {
+        use crate::abstraction::isomorphism::CanonicalBoard;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let flop = [
+            c(Value::Queen, Suit::Spade),
+            c(Value::Jack, Suit::Heart),
+            c(Value::Two, Suit::Diamond),
+        ];
+        let turn_card = c(Value::Ace, Suit::Club);
+        let river_card = c(Value::Ten, Suit::Club);
+
+        let _pf = save_test_per_flop_file(
+            dir.path(), flop,
+            vec![turn_card],
+            vec![vec![river_card]],
+            10, 10, 0,
+        );
+
+        let all = AllBuckets::new(
+            [169, 50, 10, 10],
+            [None, None, None, None],
+        ).with_per_flop_dir(dir.path().to_path_buf());
+
+        // Build a river board: flop + turn + river
+        let river_board = [flop[0], flop[1], flop[2], turn_card, river_card];
+
+        let hole = [c(Value::King, Suit::Club), c(Value::Nine, Suit::Diamond)];
+
+        let bucket = all.get_bucket(Street::River, hole, &river_board);
+
+        // Compute expected
+        let canonical_flop = CanonicalBoard::from_cards(&flop[..]).unwrap();
+        let (h0, h1) = canonical_flop.canonicalize_holding(hole[0], hole[1]);
+        let ci = combo_index(h0, h1) as usize;
+
+        // turn_idx=0, river_idx=0, expected = (0 * 50 + 0 * 10 + ci) % 10
+        let expected = (ci % 10) as u16;
+        assert_eq!(bucket, expected, "river bucket from per-flop file");
+    }
+
+    #[test]
+    fn per_flop_precompute_buckets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Use the same board cards as make_deal()
+        let deal = make_deal();
+        let flop = [deal.board[0], deal.board[1], deal.board[2]];
+        let turn_card = deal.board[3];
+        let river_card = deal.board[4];
+
+        save_test_per_flop_file(
+            dir.path(), flop,
+            vec![turn_card],
+            vec![vec![river_card]],
+            10, 10, 0,
+        );
+
+        let all = AllBuckets::new(
+            [169, 50, 10, 10],
+            [None, None, None, None],
+        ).with_per_flop_dir(dir.path().to_path_buf());
+
+        let result = all.precompute_buckets(&deal);
+
+        // Turn and river buckets should be valid (in [0, 10))
+        for player in 0..2 {
+            assert!(result[player][2] < 10, "turn bucket valid for player {player}: {}", result[player][2]);
+            assert!(result[player][3] < 10, "river bucket valid for player {player}: {}", result[player][3]);
+        }
+    }
+
+    #[test]
+    fn per_flop_flop_still_uses_global_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let flop = [
+            c(Value::Queen, Suit::Spade),
+            c(Value::Jack, Suit::Heart),
+            c(Value::Two, Suit::Diamond),
+        ];
+
+        // Save a per-flop file
+        save_test_per_flop_file(
+            dir.path(), flop,
+            vec![c(Value::Ace, Suit::Club)],
+            vec![vec![c(Value::Ten, Suit::Club)]],
+            10, 10, 0,
+        );
+
+        // Also provide a global flop bucket file
+        let flop_bf = make_test_bucket_file(
+            Street::Flop,
+            &[vec![flop[0], flop[1], flop[2]]],
+            50,
+        );
+
+        let all = AllBuckets::new(
+            [169, 50, 10, 10],
+            [None, Some(flop_bf), None, None],
+        ).with_per_flop_dir(dir.path().to_path_buf());
+
+        let hole = [c(Value::King, Suit::Club), c(Value::Nine, Suit::Diamond)];
+
+        // Flop lookup should use global bucket file, not per-flop
+        let bucket = all.get_bucket(Street::Flop, hole, &[flop[0], flop[1], flop[2]]);
+        assert!(bucket < 50, "flop bucket should use global file (< 50), got {bucket}");
+    }
+
+    #[test]
+    fn per_flop_fallback_when_flop_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Save a per-flop file for one flop
+        let flop = [
+            c(Value::Queen, Suit::Spade),
+            c(Value::Jack, Suit::Heart),
+            c(Value::Two, Suit::Diamond),
+        ];
+        save_test_per_flop_file(
+            dir.path(), flop,
+            vec![c(Value::Ace, Suit::Club)],
+            vec![vec![c(Value::Ten, Suit::Club)]],
+            10, 10, 0,
+        );
+
+        let all = AllBuckets::new(
+            [169, 50, 10, 10],
+            [None, None, None, None],
+        ).with_per_flop_dir(dir.path().to_path_buf());
+
+        // Try a different flop that has no per-flop file
+        let other_flop = [
+            c(Value::Ace, Suit::Spade),
+            c(Value::King, Suit::Heart),
+            c(Value::Three, Suit::Diamond),
+        ];
+        let turn_board = [other_flop[0], other_flop[1], other_flop[2], c(Value::Four, Suit::Club)];
+
+        let hole = [c(Value::Seven, Suit::Club), c(Value::Eight, Suit::Diamond)];
+
+        // Should fall back to equity-based bucketing (returns valid bucket in [0,10))
+        let bucket = all.get_bucket(Street::Turn, hole, &turn_board);
+        assert!(bucket < 10, "should fall back to equity bucketing, got {bucket}");
     }
 }
