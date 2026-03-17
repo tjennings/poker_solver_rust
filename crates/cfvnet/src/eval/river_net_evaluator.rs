@@ -110,7 +110,7 @@ where
 ///   [2717]         — pot / 400.0
 ///   [2718]         — effective_stack / 400.0
 ///   [2719]         — player indicator (0.0=OOP, 1.0=IP)
-fn build_input(
+pub fn build_input(
     oop_1326: &[f32; OUTPUT_SIZE],
     ip_1326: &[f32; OUTPUT_SIZE],
     board_u8: &[u8; 5],
@@ -364,6 +364,133 @@ where
                 }
             })
             .collect()
+    }
+
+    fn evaluate_boundaries(
+        &self,
+        combos: &[[Card; 2]],
+        board: &[Card],
+        oop_range: &[f64],
+        ip_range: &[f64],
+        requests: &[(f64, f64, u8)],
+    ) -> Vec<Vec<f64>> {
+        assert_eq!(board.len(), 4);
+        assert_eq!(combos.len(), oop_range.len());
+        assert_eq!(combos.len(), ip_range.len());
+        if requests.is_empty() {
+            return Vec::new();
+        }
+
+        let num_combos = combos.len();
+        let combos_u8: Vec<[u8; 2]> = combos
+            .iter()
+            .map(|c| [rs_card_to_u8(c[0]), rs_card_to_u8(c[1])])
+            .collect();
+        let combo_indices: Vec<usize> = combos_u8
+            .iter()
+            .map(|c| card_pair_to_index(c[0], c[1]))
+            .collect();
+        let board_u8: Vec<u8> = board.iter().map(|c| rs_card_to_u8(*c)).collect();
+
+        // Valid river cards (shared across all requests).
+        let valid_rivers: Vec<u8> = (0u8..52)
+            .filter(|r| !board_u8.contains(r))
+            .collect();
+        let rivers_per_request = valid_rivers.len();
+
+        // Per-river combo validity masks (shared across requests).
+        let river_valid_masks: Vec<Vec<bool>> = valid_rivers
+            .iter()
+            .map(|&river_u8| {
+                combos_u8
+                    .iter()
+                    .map(|c| c[0] != river_u8 && c[1] != river_u8)
+                    .collect()
+            })
+            .collect();
+
+        // Build ALL inputs: requests × rivers → one big batch.
+        let total_rows = requests.len() * rivers_per_request;
+        let mut inputs: Vec<f32> = Vec::with_capacity(total_rows * INPUT_SIZE);
+
+        for &(pot, effective_stack, traverser) in requests {
+            for (ri, &river_u8) in valid_rivers.iter().enumerate() {
+                let river_board_u8: [u8; 5] = [
+                    board_u8[0], board_u8[1], board_u8[2], board_u8[3], river_u8,
+                ];
+
+                let mut oop_1326 = [0.0_f32; OUTPUT_SIZE];
+                let mut ip_1326 = [0.0_f32; OUTPUT_SIZE];
+
+                for (i, &idx) in combo_indices.iter().enumerate() {
+                    if river_valid_masks[ri][i] {
+                        oop_1326[idx] = oop_range[i] as f32;
+                        ip_1326[idx] = ip_range[i] as f32;
+                    }
+                }
+
+                let input_vec = build_input(
+                    &oop_1326,
+                    &ip_1326,
+                    &river_board_u8,
+                    pot,
+                    effective_stack,
+                    traverser,
+                );
+                inputs.extend_from_slice(&input_vec);
+            }
+        }
+
+        // ONE mutex lock, ONE forward pass for all requests.
+        let t0 = Instant::now();
+        let model = self.model.lock().unwrap();
+        let wait = t0.elapsed();
+        self.wait_nanos
+            .fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
+        self.lock_count.fetch_add(1, Ordering::Relaxed);
+
+        let data = TensorData::new(inputs, [total_rows, INPUT_SIZE]);
+        let input_tensor = Tensor::<B, 2>::from_data(data, &self.device);
+        let output = model.forward(input_tensor);
+
+        drop(model);
+
+        let out_data = output.into_data();
+        let out_vec: Vec<f32> = out_data.to_vec().expect("output tensor conversion");
+
+        // Scatter results: for each request, average over rivers.
+        let mut results = Vec::with_capacity(requests.len());
+        for req_idx in 0..requests.len() {
+            let mut cfv_sum = vec![0.0_f64; num_combos];
+            let mut cfv_count = vec![0_u32; num_combos];
+
+            for (ri, mask) in river_valid_masks.iter().enumerate() {
+                let row = req_idx * rivers_per_request + ri;
+                let row_start = row * OUTPUT_SIZE;
+                for (i, &idx) in combo_indices.iter().enumerate() {
+                    if mask[i] {
+                        cfv_sum[i] += f64::from(out_vec[row_start + idx]);
+                        cfv_count[i] += 1;
+                    }
+                }
+            }
+
+            results.push(
+                cfv_sum
+                    .iter()
+                    .zip(cfv_count.iter())
+                    .map(|(&sum, &count)| {
+                        if count > 0 {
+                            sum / f64::from(count)
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect(),
+            );
+        }
+
+        results
     }
 }
 
