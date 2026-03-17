@@ -23,6 +23,27 @@ use rs_poker::arena::agent::{
     RandomAgentGenerator,
 };
 
+/// Abstraction over event emission so simulation logic works with both
+/// Tauri's `AppHandle` and alternative backends (e.g. broadcast channels).
+pub trait SimEventSink: Send + 'static {
+    fn emit_progress(&self, event: SimProgressEvent);
+    fn emit_complete(&self, event: SimResultResponse);
+    fn emit_error(&self, msg: String);
+}
+
+/// `SimEventSink` implementation for Tauri's `AppHandle`.
+impl SimEventSink for AppHandle {
+    fn emit_progress(&self, event: SimProgressEvent) {
+        let _ = self.emit("simulation-progress", event);
+    }
+    fn emit_complete(&self, event: SimResultResponse) {
+        let _ = self.emit("simulation-complete", event);
+    }
+    fn emit_error(&self, msg: String) {
+        let _ = self.emit("simulation-error", msg);
+    }
+}
+
 /// Managed state for the simulation view.
 pub struct SimulationState {
     running: Arc<AtomicBool>,
@@ -69,8 +90,9 @@ pub struct SimResultResponse {
 ///
 /// If `dir` is provided, scans that directory for blueprint bundles using the
 /// same logic as the Explorer tab. Otherwise, no bundles are returned.
-#[tauri::command]
-pub fn list_strategy_sources(dir: Option<String>) -> Result<Vec<StrategySourceInfo>, String> {
+///
+/// Core variant: no Tauri dependency, usable from any runtime.
+pub fn list_strategy_sources_core(dir: Option<String>) -> Result<Vec<StrategySourceInfo>, String> {
     let mut sources = Vec::new();
 
     // Built-in agents from rs_poker
@@ -131,13 +153,19 @@ pub fn list_strategy_sources(dir: Option<String>) -> Result<Vec<StrategySourceIn
     Ok(sources)
 }
 
+/// Tauri command wrapper for `list_strategy_sources_core`.
+#[tauri::command]
+pub fn list_strategy_sources(dir: Option<String>) -> Result<Vec<StrategySourceInfo>, String> {
+    list_strategy_sources_core(dir)
+}
+
 /// Start a simulation between two strategy sources.
 ///
-/// Runs in a background thread and emits `"simulation-progress"` events.
-#[tauri::command]
-pub async fn start_simulation(
-    app: AppHandle,
-    state: State<'_, SimulationState>,
+/// Core variant: accepts any `SimEventSink` instead of requiring `AppHandle`.
+/// Runs in a background thread and emits progress/complete/error events via the sink.
+pub fn start_simulation_core(
+    sink: impl SimEventSink,
+    state: &SimulationState,
     p1_path: String,
     p2_path: String,
     num_hands: u64,
@@ -158,7 +186,7 @@ pub async fn start_simulation(
         let (p1_gen, p1_bs) = match build_agent_generator(&p1_path) {
             Ok(g) => g,
             Err(e) => {
-                let _ = app.emit("simulation-error", e);
+                sink.emit_error(e);
                 running.store(false, Ordering::SeqCst);
                 return;
             }
@@ -166,7 +194,7 @@ pub async fn start_simulation(
         let (p2_gen, p2_bs) = match build_agent_generator(&p2_path) {
             Ok(g) => g,
             Err(e) => {
-                let _ = app.emit("simulation-error", e);
+                sink.emit_error(e);
                 running.store(false, Ordering::SeqCst);
                 return;
             }
@@ -207,15 +235,12 @@ pub async fn start_simulation(
                 }
                 last_emit = now;
 
-                let _ = app.emit(
-                    "simulation-progress",
-                    SimProgressEvent {
-                        hands_played: progress.hands_played,
-                        total_hands: progress.total_hands,
-                        p1_profit_bb: progress.p1_profit_bb,
-                        current_mbbh: progress.current_mbbh,
-                    },
-                );
+                sink.emit_progress(SimProgressEvent {
+                    hands_played: progress.hands_played,
+                    total_hands: progress.total_hands,
+                    p1_profit_bb: progress.p1_profit_bb,
+                    current_mbbh: progress.current_mbbh,
+                });
 
                 // Yield so the main thread can deliver stop commands
                 std::thread::yield_now();
@@ -224,20 +249,17 @@ pub async fn start_simulation(
 
         match sim_result {
             Ok(result) => {
-                let _ = app.emit(
-                    "simulation-complete",
-                    SimResultResponse {
-                        hands_played: result.hands_played,
-                        p1_profit_bb: result.p1_profit_bb,
-                        mbbh: result.mbbh,
-                        equity_curve: result.equity_curve.clone(),
-                        elapsed_ms: result.elapsed_ms,
-                    },
-                );
+                sink.emit_complete(SimResultResponse {
+                    hands_played: result.hands_played,
+                    p1_profit_bb: result.p1_profit_bb,
+                    mbbh: result.mbbh,
+                    equity_curve: result.equity_curve.clone(),
+                    elapsed_ms: result.elapsed_ms,
+                });
                 *result_store.write() = Some(result);
             }
             Err(e) => {
-                let _ = app.emit("simulation-error", e);
+                sink.emit_error(e);
             }
         }
 
@@ -247,17 +269,38 @@ pub async fn start_simulation(
     Ok(())
 }
 
+/// Tauri command wrapper for `start_simulation_core`.
+#[tauri::command]
+pub async fn start_simulation(
+    app: AppHandle,
+    state: State<'_, SimulationState>,
+    p1_path: String,
+    p2_path: String,
+    num_hands: u64,
+    stack_depth: u32,
+) -> Result<(), String> {
+    start_simulation_core(app, &state, p1_path, p2_path, num_hands, stack_depth)
+}
+
 /// Stop the currently running simulation.
+///
+/// Core variant: no Tauri dependency.
+pub fn stop_simulation_core(state: &SimulationState) {
+    state.running.store(false, Ordering::SeqCst);
+}
+
+/// Tauri command wrapper for `stop_simulation_core`.
 #[tauri::command]
 pub async fn stop_simulation(state: State<'_, SimulationState>) -> Result<(), String> {
-    state.running.store(false, Ordering::SeqCst);
+    stop_simulation_core(&state);
     Ok(())
 }
 
 /// Get the result of the last completed simulation.
-#[tauri::command]
-pub fn get_simulation_result(
-    state: State<'_, SimulationState>,
+///
+/// Core variant: no Tauri dependency.
+pub fn get_simulation_result_core(
+    state: &SimulationState,
 ) -> Result<Option<SimResultResponse>, String> {
     let guard = state.result.read();
     Ok(guard.as_ref().map(|r| SimResultResponse {
@@ -267,6 +310,14 @@ pub fn get_simulation_result(
         equity_curve: r.equity_curve.clone(),
         elapsed_ms: r.elapsed_ms,
     }))
+}
+
+/// Tauri command wrapper for `get_simulation_result_core`.
+#[tauri::command]
+pub fn get_simulation_result(
+    state: State<'_, SimulationState>,
+) -> Result<Option<SimResultResponse>, String> {
+    get_simulation_result_core(&state)
 }
 
 // ============================================================================
@@ -314,5 +365,117 @@ fn find_agents_dir() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_macros::timed_test;
+
+    #[timed_test]
+    fn list_strategy_sources_core_returns_builtins() {
+        let sources = list_strategy_sources_core(None).unwrap();
+        let builtins: Vec<_> = sources
+            .iter()
+            .filter(|s| s.source_type == "builtin")
+            .collect();
+        assert_eq!(builtins.len(), 4);
+        assert!(builtins.iter().any(|s| s.path == "builtin:calling"));
+        assert!(builtins.iter().any(|s| s.path == "builtin:folding"));
+        assert!(builtins.iter().any(|s| s.path == "builtin:allin"));
+        assert!(builtins.iter().any(|s| s.path == "builtin:random"));
+    }
+
+    #[timed_test]
+    fn list_strategy_sources_core_sorted_by_name() {
+        let sources = list_strategy_sources_core(None).unwrap();
+        for i in 1..sources.len() {
+            assert!(sources[i - 1].name <= sources[i].name);
+        }
+    }
+
+    #[timed_test]
+    fn stop_simulation_core_sets_running_false() {
+        let state = SimulationState::default();
+        state.running.store(true, Ordering::SeqCst);
+        stop_simulation_core(&state);
+        assert!(!state.running.load(Ordering::SeqCst));
+    }
+
+    #[timed_test]
+    fn get_simulation_result_core_returns_none_initially() {
+        let state = SimulationState::default();
+        let result = get_simulation_result_core(&state).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[timed_test]
+    fn get_simulation_result_core_returns_stored_result() {
+        let state = SimulationState::default();
+        *state.result.write() = Some(SimResult {
+            hands_played: 100,
+            p1_profit_bb: 5.0,
+            mbbh: 50.0,
+            equity_curve: vec![1.0, 2.0, 3.0],
+            elapsed_ms: 42,
+        });
+        let result = get_simulation_result_core(&state).unwrap().unwrap();
+        assert_eq!(result.hands_played, 100);
+        assert_eq!(result.mbbh, 50.0);
+        assert_eq!(result.equity_curve, vec![1.0, 2.0, 3.0]);
+        assert_eq!(result.elapsed_ms, 42);
+    }
+
+    #[timed_test]
+    fn sim_event_sink_trait_exists_and_is_object_safe() {
+        // Verify trait can be used as a trait object (Send + 'static)
+        struct TestSink;
+        impl SimEventSink for TestSink {
+            fn emit_progress(&self, _event: SimProgressEvent) {}
+            fn emit_complete(&self, _event: SimResultResponse) {}
+            fn emit_error(&self, _msg: String) {}
+        }
+        let sink: Box<dyn SimEventSink> = Box::new(TestSink);
+        sink.emit_progress(SimProgressEvent {
+            hands_played: 0,
+            total_hands: 10,
+            p1_profit_bb: 0.0,
+            current_mbbh: 0.0,
+        });
+        sink.emit_complete(SimResultResponse {
+            hands_played: 10,
+            p1_profit_bb: 1.0,
+            mbbh: 100.0,
+            equity_curve: vec![],
+            elapsed_ms: 5,
+        });
+        sink.emit_error("test error".to_string());
+    }
+
+    #[timed_test]
+    fn sim_progress_event_serializes() {
+        let event = SimProgressEvent {
+            hands_played: 50,
+            total_hands: 100,
+            p1_profit_bb: 2.5,
+            current_mbbh: 25.0,
+        };
+        let json = serde_json::to_string(&event).expect("should serialize");
+        assert!(json.contains("\"hands_played\":50"));
+        assert!(json.contains("\"total_hands\":100"));
+    }
+
+    #[timed_test]
+    fn sim_result_response_serializes() {
+        let resp = SimResultResponse {
+            hands_played: 100,
+            p1_profit_bb: 5.0,
+            mbbh: 50.0,
+            equity_curve: vec![1.0],
+            elapsed_ms: 42,
+        };
+        let json = serde_json::to_string(&resp).expect("should serialize");
+        assert!(json.contains("\"mbbh\":50"));
+    }
 }
 

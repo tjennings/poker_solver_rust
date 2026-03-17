@@ -37,6 +37,11 @@ pub use postflop::{
 };
 
 pub use simulation::{
+    // Tauri command wrappers
     get_simulation_result, list_strategy_sources, start_simulation, stop_simulation,
-    SimulationState,
+    // Core functions (no Tauri dependency, usable from Axum or other runtimes)
+    get_simulation_result_core, list_strategy_sources_core, start_simulation_core,
+    stop_simulation_core,
+    // Trait and types
+    SimEventSink, SimProgressEvent, SimResultResponse, SimulationState, StrategySourceInfo,
 };
