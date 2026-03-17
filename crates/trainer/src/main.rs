@@ -4,6 +4,7 @@ mod blueprint_tui_metrics;
 mod blueprint_tui_scenarios;
 mod blueprint_tui_widgets;
 mod log_file;
+mod validation_spots;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -125,6 +126,18 @@ enum Commands {
         /// Use 16-bit compressed storage
         #[arg(long)]
         compressed: bool,
+    },
+    /// Validate a blueprint strategy against exact range-solver solutions
+    ValidateBlueprint {
+        /// Path to blueprint bundle directory
+        #[arg(short, long)]
+        blueprint: PathBuf,
+        /// Path to validation spots YAML file
+        #[arg(short, long)]
+        spots: PathBuf,
+        /// Optional cluster directory (for per-flop bucket lookup)
+        #[arg(long)]
+        cluster_dir: Option<PathBuf>,
     },
 }
 
@@ -643,6 +656,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &ip_raise_sizes,
                 compressed,
             )?;
+        }
+        Commands::ValidateBlueprint {
+            blueprint,
+            spots,
+            cluster_dir,
+        } => {
+            let spots_file = validation_spots::ValidationSpotsFile::load(&spots)?;
+
+            eprintln!("Blueprint Validation");
+            eprintln!("  Blueprint: {}", blueprint.display());
+            eprintln!("  Spots file: {} ({} spots)", spots.display(), spots_file.spots.len());
+            if let Some(ref dir) = cluster_dir {
+                eprintln!("  Cluster dir: {}", dir.display());
+            }
+            eprintln!();
+
+            for spot in &spots_file.spots {
+                eprintln!("  [{}]", spot.name);
+                eprintln!("    Board: {}", spot.board.join(" "));
+                eprintln!("    OOP range: {}", spot.oop_range);
+                eprintln!("    IP range: {}", spot.ip_range);
+                eprintln!("    Pot: {:.0} BB, Stack: {:.0} BB", spot.pot, spot.effective_stack);
+                eprintln!("    TODO: solve with range-solver and compare");
+                eprintln!();
+            }
         }
     }
 

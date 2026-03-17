@@ -1,0 +1,120 @@
+# Canonical validation spots for blueprint strategy comparison.
+#
+# Each spot defines a postflop scenario with board, ranges, pot, and stack.
+# The validate-blueprint command solves each spot with the exact range solver
+# and compares against the blueprint's abstracted strategy.
+#
+# Ranges are SB open (2.5x) vs BB call for 100BB 6-max.
+
+spots:
+  # -- Dry flops --
+  - name: "Dry rainbow K-high"
+    board: ["Ks", "7d", "2c"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  - name: "Dry rainbow A-high"
+    board: ["As", "8d", "3c"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  - name: "Dry rainbow low"
+    board: ["7s", "4d", "2c"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  # -- Wet / connected flops --
+  - name: "Wet connected JT9"
+    board: ["Jh", "Ts", "9d"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  - name: "Wet connected 876"
+    board: ["8h", "7s", "6d"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  - name: "Wet two-tone KQJ"
+    board: ["Kh", "Qh", "Jd"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  # -- Paired flops --
+  - name: "Paired mid"
+    board: ["8s", "8h", "3d"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  - name: "Paired high"
+    board: ["Qs", "Qh", "7d"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  # -- Monotone flops --
+  - name: "Monotone Q-high"
+    board: ["Qh", "Jh", "5h"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  - name: "Monotone low"
+    board: ["9c", "6c", "3c"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  # -- Broadway flops --
+  - name: "Broadway AKQ"
+    board: ["As", "Kd", "Qc"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  - name: "Broadway AJT"
+    board: ["Ad", "Jh", "Tc"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  # -- Low connected --
+  - name: "Low straight-draw 543"
+    board: ["5s", "4h", "3d"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 6.0
+    effective_stack: 97.0
+
+  # -- Turn spots --
+  - name: "Dry flop + brick turn"
+    board: ["Ks", "7d", "2c", "9h"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 10.0
+    effective_stack: 95.0
+
+  - name: "Wet flop + completing turn"
+    board: ["Jh", "Ts", "9d", "8c"]
+    oop_range: "22+,A2s+,K2s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A2o+,K9o+,QTo+,JTo"
+    ip_range: "22-TT,A2s-ATs,K2s+,Q2s+,J6s+,T6s+,96s+,86s+,76s,65s,54s,A2o-ATo,K5o+,Q8o+,J8o+,T8o+"
+    pot: 10.0
+    effective_stack: 95.0
