@@ -1,0 +1,71 @@
+game:
+  name: "per_flop_200bkt"
+  players: 2
+  stack_depth: 100.0
+  small_blind: 0.5
+  big_blind: 1.0
+
+clustering:
+  flop:
+    buckets: 200
+  per_flop:
+    turn_buckets: 200
+    river_buckets: 200
+  preflop:
+    buckets: 169
+  # These are still needed for backwards compat with config parsing
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+
+action_abstraction:
+  preflop:
+    - ["2.5bb"]
+    - ["4bb", "6bb"]
+    - ["18bb"]
+  flop:
+    - [0.33, 0.67, 1.0]
+    - [0.33, 0.67, 2.0]
+    - [2.0]
+  turn:
+    - [0.33, 0.67, 1.0]
+    - [0.33, 0.67, 2.0]
+    - [2.0]
+  river:
+    - [0.33, 0.67, 1.0]
+    - [0.33, 0.67, 2.0]
+    - [2.0]
+
+training:
+  cluster_path: "./local_data/clusters_per_flop_200"
+  time_limit_minutes: 7200
+  lcfr_warmup_iterations: 5000000
+  prune_after_iterations: 5000000
+  prune_threshold: 0
+  lcfr_discount_interval: 1000000
+  batch_size: 2000
+
+snapshots:
+  resume: true
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "./local_data/blueprints/per_flop_200bkt/snap"
+
+tui:
+  enabled: true
+  refresh_rate_ms: 2000
+  telemetry:
+    strategy_delta_interval_seconds: 30
+    sparkline_window: 60
+  scenarios:
+    - name: "SB Open"
+      player: SB
+      actions: []
+    - name: "BB vs 2.5x"
+      player: BB
+      actions: ["raise-0"]
+  random_scenario:
+    enabled: true
+    hold_minutes: 3
+    pool: ["preflop", "flop", "turn", "river"]

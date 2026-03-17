@@ -395,28 +395,34 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             std::fs::create_dir_all(&output)?;
 
-            eprintln!("Blueprint V2 Clustering Pipeline");
-            eprintln!("  Output: {}", output.display());
-            eprintln!(
-                "  Buckets: preflop={}, flop={}, turn={}, river={}",
-                bp_config.clustering.preflop.buckets,
-                bp_config.clustering.flop.buckets,
-                bp_config.clustering.turn.buckets,
-                bp_config.clustering.river.buckets,
-            );
-            eprintln!();
+            if bp_config.clustering.per_flop.is_some() {
+                let pf_cfg = bp_config.clustering.per_flop.as_ref().unwrap();
+                eprintln!("Per-Flop Clustering Pipeline");
+                eprintln!("  Output: {}", output.display());
+                eprintln!(
+                    "  Buckets: flop={}, turn={}/flop, river={}/flop",
+                    bp_config.clustering.flop.buckets,
+                    pf_cfg.turn_buckets,
+                    pf_cfg.river_buckets,
+                );
+                eprintln!();
 
-            if poker_solver_core::blueprint_v2::trainer::bucket_files_exist(&output) {
-                eprintln!("Bucket files already exist in {}, skipping clustering", output.display());
-            } else {
+                let per_flop_config = poker_solver_core::blueprint_v2::cluster_pipeline::PerFlopClusteringConfig {
+                    flop_buckets: bp_config.clustering.flop.buckets,
+                    turn_buckets: pf_cfg.turn_buckets,
+                    river_buckets: pf_cfg.river_buckets,
+                    kmeans_iterations: bp_config.clustering.kmeans_iterations,
+                    seed: bp_config.clustering.seed,
+                };
+
                 let mp = MultiProgress::new();
-                let street_bar = mp.add(ProgressBar::new(4));
+                let street_bar = mp.add(ProgressBar::new(1000));
                 street_bar.set_style(
                     ProgressStyle::with_template("  {msg:>12} {bar:40.cyan/blue} {pos}/{len}")
                         .unwrap()
                         .progress_chars("##-"),
                 );
-                street_bar.set_message("clustering");
+                street_bar.set_message("per-flop");
 
                 let phase_bar = mp.add(ProgressBar::new(1000));
                 phase_bar.set_style(
@@ -426,11 +432,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 );
 
                 let current_street = std::sync::Mutex::new(String::new());
-                let street_count = std::sync::atomic::AtomicU32::new(0);
 
-                poker_solver_core::blueprint_v2::cluster_pipeline::run_clustering_pipeline(
-                    &bp_config.clustering,
+                poker_solver_core::blueprint_v2::cluster_pipeline::run_per_flop_pipeline(
+                    &per_flop_config,
                     &output,
+                    None,
                     |street, phase, p| {
                         let mut cur = current_street.lock().unwrap();
                         if *cur != street {
@@ -439,10 +445,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }
                             *cur = street.to_string();
                             street_bar.set_message(street.to_string());
-                            street_bar.set_position(
-                                street_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                    as u64,
-                            );
                             phase_bar.reset();
                         }
                         drop(cur);
@@ -454,7 +456,69 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 street_bar.finish_with_message("done");
                 phase_bar.finish_and_clear();
-                eprintln!("Clustering complete. Files saved to {}", output.display());
+                eprintln!("Per-flop clustering complete. Files saved to {}", output.display());
+            } else {
+                eprintln!("Blueprint V2 Clustering Pipeline");
+                eprintln!("  Output: {}", output.display());
+                eprintln!(
+                    "  Buckets: preflop={}, flop={}, turn={}, river={}",
+                    bp_config.clustering.preflop.buckets,
+                    bp_config.clustering.flop.buckets,
+                    bp_config.clustering.turn.buckets,
+                    bp_config.clustering.river.buckets,
+                );
+                eprintln!();
+
+                if poker_solver_core::blueprint_v2::trainer::bucket_files_exist(&output) {
+                    eprintln!("Bucket files already exist in {}, skipping clustering", output.display());
+                } else {
+                    let mp = MultiProgress::new();
+                    let street_bar = mp.add(ProgressBar::new(4));
+                    street_bar.set_style(
+                        ProgressStyle::with_template("  {msg:>12} {bar:40.cyan/blue} {pos}/{len}")
+                            .unwrap()
+                            .progress_chars("##-"),
+                    );
+                    street_bar.set_message("clustering");
+
+                    let phase_bar = mp.add(ProgressBar::new(1000));
+                    phase_bar.set_style(
+                        ProgressStyle::with_template("  {msg:>12} {bar:40.white/black} {pos}/{len}")
+                            .unwrap()
+                            .progress_chars("##-"),
+                    );
+
+                    let current_street = std::sync::Mutex::new(String::new());
+                    let street_count = std::sync::atomic::AtomicU32::new(0);
+
+                    poker_solver_core::blueprint_v2::cluster_pipeline::run_clustering_pipeline(
+                        &bp_config.clustering,
+                        &output,
+                        |street, phase, p| {
+                            let mut cur = current_street.lock().unwrap();
+                            if *cur != street {
+                                if !cur.is_empty() {
+                                    phase_bar.finish_and_clear();
+                                }
+                                *cur = street.to_string();
+                                street_bar.set_message(street.to_string());
+                                street_bar.set_position(
+                                    street_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        as u64,
+                                );
+                                phase_bar.reset();
+                            }
+                            drop(cur);
+
+                            phase_bar.set_message(phase.to_string());
+                            phase_bar.set_position((p * 1000.0) as u64);
+                        },
+                    )?;
+
+                    street_bar.finish_with_message("done");
+                    phase_bar.finish_and_clear();
+                    eprintln!("Clustering complete. Files saved to {}", output.display());
+                }
             }
         }
         Commands::DiagClusters {
@@ -865,4 +929,68 @@ fn format_board_suffix(turn: Option<&str>, river: Option<&str>) -> String {
         s.push_str(r);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
+    use poker_solver_core::blueprint_v2::cluster_pipeline::PerFlopClusteringConfig;
+
+    /// The sample per_flop_200bkt.yaml must parse and have per_flop set.
+    #[test]
+    fn per_flop_sample_yaml_parses() {
+        let yaml = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../sample_configurations/per_flop_200bkt.yaml"),
+        )
+        .expect("sample per_flop_200bkt.yaml must exist");
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(&yaml).expect("YAML must parse as BlueprintV2Config");
+        assert!(
+            cfg.clustering.per_flop.is_some(),
+            "per_flop section must be present"
+        );
+        let pf = cfg.clustering.per_flop.as_ref().unwrap();
+        assert_eq!(pf.turn_buckets, 200);
+        assert_eq!(pf.river_buckets, 200);
+    }
+
+    /// PerFlopClusteringConfig can be constructed from a parsed config with per_flop.
+    #[test]
+    fn per_flop_config_construction_from_yaml() {
+        let yaml = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../sample_configurations/per_flop_200bkt.yaml"),
+        )
+        .expect("sample per_flop_200bkt.yaml must exist");
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(&yaml).expect("YAML must parse");
+
+        let pf = cfg.clustering.per_flop.as_ref().unwrap();
+        let per_flop_config = PerFlopClusteringConfig {
+            flop_buckets: cfg.clustering.flop.buckets,
+            turn_buckets: pf.turn_buckets,
+            river_buckets: pf.river_buckets,
+            kmeans_iterations: cfg.clustering.kmeans_iterations,
+            seed: cfg.clustering.seed,
+        };
+
+        assert_eq!(per_flop_config.flop_buckets, 200);
+        assert_eq!(per_flop_config.turn_buckets, 200);
+        assert_eq!(per_flop_config.river_buckets, 200);
+        assert_eq!(per_flop_config.seed, 42);
+    }
+
+    /// A config without per_flop should have per_flop as None.
+    #[test]
+    fn standard_config_has_no_per_flop() {
+        let yaml = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../sample_configurations/blueprint_v2_500bkt.yaml"),
+        )
+        .expect("blueprint_v2_500bkt.yaml must exist");
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(&yaml).expect("YAML must parse");
+        assert!(
+            cfg.clustering.per_flop.is_none(),
+            "standard config should not have per_flop"
+        );
+    }
 }
