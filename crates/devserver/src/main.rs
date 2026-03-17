@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     extract::State as AxumState,
     http::{HeaderValue, Method},
-    routing::post,
+    routing::{get, post},
     Extension, Json, Router,
 };
 use serde::Deserialize;
@@ -11,6 +11,7 @@ use tower_http::cors::CorsLayer;
 
 use poker_solver_tauri::ExplorationState;
 use poker_solver_tauri::PostflopState;
+use poker_solver_tauri::SimulationState;
 
 type AppState = Arc<ExplorationState>;
 
@@ -272,6 +273,38 @@ async fn handle_list_blueprints(
 }
 
 // ---------------------------------------------------------------------------
+// Handlers — simulation
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ListStrategySourcesParams {
+    dir: Option<String>,
+}
+
+async fn handle_health() -> Json<serde_json::Value> {
+    to_json_value(serde_json::json!({"ok": true}))
+}
+
+async fn handle_list_strategy_sources(
+    Json(params): Json<ListStrategySourcesParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::list_strategy_sources_core(params.dir))
+}
+
+async fn handle_stop_simulation(
+    Extension(state): Extension<Arc<SimulationState>>,
+) -> Json<serde_json::Value> {
+    poker_solver_tauri::stop_simulation_core(&state);
+    to_json_value(())
+}
+
+async fn handle_get_simulation_result(
+    Extension(state): Extension<Arc<SimulationState>>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::get_simulation_result_core(&state))
+}
+
+// ---------------------------------------------------------------------------
 // Handlers — postflop
 // ---------------------------------------------------------------------------
 
@@ -389,13 +422,15 @@ async fn handle_postflop_load_cached(
 async fn main() {
     let state: AppState = Arc::new(ExplorationState::default());
     let postflop_state: Arc<PostflopState> = Arc::new(PostflopState::default());
+    let simulation_state: Arc<SimulationState> = Arc::new(SimulationState::default());
 
     let cors = CorsLayer::new()
         .allow_origin("*".parse::<HeaderValue>().expect("valid header value"))
-        .allow_methods([Method::POST])
+        .allow_methods([Method::GET, Method::POST])
         .allow_headers(tower_http::cors::Any);
 
     let app = Router::new()
+        .route("/health", get(handle_health))
         .route("/api/load_bundle", post(handle_load_bundle))
         .route("/api/load_blueprint_v2", post(handle_load_blueprint_v2))
         .route("/api/get_strategy_matrix", post(handle_get_strategy_matrix))
@@ -422,6 +457,16 @@ async fn main() {
         .route(
             "/api/get_preflop_ranges",
             post(handle_get_preflop_ranges),
+        )
+        // Simulation endpoints
+        .route(
+            "/api/list_strategy_sources",
+            post(handle_list_strategy_sources),
+        )
+        .route("/api/stop_simulation", post(handle_stop_simulation))
+        .route(
+            "/api/get_simulation_result",
+            post(handle_get_simulation_result),
         )
         // Postflop explorer endpoints
         .route(
@@ -468,6 +513,7 @@ async fn main() {
             "/api/postflop_load_cached",
             post(handle_postflop_load_cached),
         )
+        .layer(Extension(simulation_state))
         .layer(Extension(postflop_state))
         .layer(cors)
         .with_state(state);
