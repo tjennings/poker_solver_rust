@@ -1,10 +1,24 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { isTauri } from './invoke';
 import { useGlobalConfig } from './useGlobalConfig';
 
 export default function Settings() {
   const { config, setConfig } = useGlobalConfig();
   const [browsing, setBrowsing] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<'idle' | 'checking' | 'connected' | 'error'>('idle');
+
+  useEffect(() => {
+    if (!config.backend_url) {
+      setConnectionStatus('idle');
+      return;
+    }
+    setConnectionStatus('checking');
+    fetch(`${config.backend_url}/health`)
+      .then(res => {
+        setConnectionStatus(res.ok ? 'connected' : 'error');
+      })
+      .catch(() => setConnectionStatus('error'));
+  }, [config.backend_url]);
 
   const handleBrowse = async () => {
     if (!isTauri()) return;
@@ -25,6 +39,46 @@ export default function Settings() {
       <h2 style={{ color: '#eee', marginTop: 0, marginBottom: '1.5rem', fontSize: '1.2rem' }}>
         Settings
       </h2>
+
+      {/* Remote Backend */}
+      <div style={{ marginBottom: '1.5rem' }}>
+        <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
+          Remote Backend URL
+        </label>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          <input
+            type="text"
+            value={config.backend_url}
+            onChange={e => setConfig({ backend_url: e.target.value })}
+            placeholder="http://192.168.1.50:3001"
+            style={{
+              flex: 1,
+              padding: '0.45rem 0.6rem',
+              background: 'rgba(255,255,255,0.06)',
+              border: '1px solid rgba(255,255,255,0.12)',
+              borderRadius: 6,
+              color: '#eee',
+              fontSize: '0.85rem',
+              fontFamily: 'inherit',
+            }}
+          />
+          {config.backend_url && (
+            <div style={{
+              width: 10,
+              height: 10,
+              borderRadius: '50%',
+              flexShrink: 0,
+              background: connectionStatus === 'connected' ? '#22c55e'
+                : connectionStatus === 'error' ? '#ef4444'
+                : connectionStatus === 'checking' ? '#eab308'
+                : '#555',
+            }} title={connectionStatus} />
+          )}
+        </div>
+        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
+          Connect to a remote solver backend. Leave empty for local mode.
+        </p>
+      </div>
 
       {/* Blueprint Directory */}
       <div style={{ marginBottom: '1.5rem' }}>
