@@ -44,6 +44,7 @@ use super::clustering::{
     nearest_centroid_u8,
 };
 use super::config::ClusteringConfig;
+use super::per_flop_bucket_file::PerFlopBucketFile;
 use super::Street;
 
 /// Number of sample 5-card boards for river clustering when no explicit count
@@ -927,6 +928,189 @@ pub fn run_clustering_pipeline(
     preflop.save(&output_dir.join("preflop.buckets"))?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Per-flop clustering
+// ---------------------------------------------------------------------------
+
+/// Per-turn intermediate data: river bucket assignments and combo histograms.
+struct TurnRiverData {
+    river_cards: Vec<Card>,
+    river_buckets: Vec<u16>,   // flat: [river_idx * 1326 + combo_idx]
+    combo_hists: Vec<Vec<u8>>, // per-combo histogram over river buckets
+    combo_valid: Vec<bool>,    // whether combo is valid (not blocked by board)
+}
+
+/// Cluster a single canonical flop into turn and river buckets.
+///
+/// For each possible turn card (cards not on the flop):
+///   1. For each possible river card, compute equity for all 1326 combos on
+///      the 5-card board and cluster into `river_bucket_count` river buckets.
+///   2. Build a histogram per combo over river buckets across all rivers for
+///      this turn.
+///   3. Cluster the combo histograms into `turn_bucket_count` turn buckets.
+///
+/// Returns a [`PerFlopBucketFile`] with all assignments.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::too_many_lines)]
+pub fn cluster_single_flop(
+    flop: [Card; 3],
+    turn_bucket_count: u16,
+    river_bucket_count: u16,
+    kmeans_iterations: u32,
+    seed: u64,
+    progress: impl Fn(&str, f64) + Sync,
+) -> PerFlopBucketFile {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let num_combos = combos.len(); // 1326
+
+    // Enumerate turn cards: all cards not on the flop.
+    let turn_cards: Vec<Card> = deck
+        .iter()
+        .copied()
+        .filter(|c| !flop.contains(c))
+        .collect();
+    let num_turns = turn_cards.len();
+
+    // ---- Phase 1: River clustering per turn ----
+    let turn_river_data: Vec<TurnRiverData> = turn_cards
+        .par_iter()
+        .enumerate()
+        .map(|(ti, &turn_card)| {
+            let board4 = [flop[0], flop[1], flop[2], turn_card];
+
+            let river_cards: Vec<Card> = deck
+                .iter()
+                .copied()
+                .filter(|c| !board4.contains(c))
+                .collect();
+            let num_rivers = river_cards.len();
+
+            // Collect equities across all (river, combo) pairs.
+            let mut all_equities: Vec<f64> = Vec::new();
+            let mut all_weights: Vec<f64> = Vec::new();
+            let mut positions: Vec<(usize, usize)> = Vec::new();
+
+            for (ri, &river_card) in river_cards.iter().enumerate() {
+                let board5 = [flop[0], flop[1], flop[2], turn_card, river_card];
+                let eqs = compute_board_equities(board5, &combos);
+                for (ci, eq_opt) in eqs.into_iter().enumerate() {
+                    if let Some(eq) = eq_opt {
+                        all_equities.push(eq);
+                        all_weights.push(1.0);
+                        positions.push((ri, ci));
+                    }
+                }
+            }
+
+            // 1D k-means on equities.
+            let river_k = (river_bucket_count as usize).min(all_equities.len());
+            let (labels, _) = if all_equities.is_empty() {
+                (vec![], vec![])
+            } else {
+                kmeans_1d_weighted(&all_equities, &all_weights, river_k, kmeans_iterations)
+            };
+
+            // Scatter into flat array.
+            let mut river_buckets = vec![0u16; num_rivers * num_combos];
+            for (flat_i, &(ri, ci)) in positions.iter().enumerate() {
+                river_buckets[ri * num_combos + ci] = labels[flat_i];
+            }
+
+            // Build per-combo histograms over river buckets.
+            let mut combo_hists = Vec::with_capacity(num_combos);
+            let mut combo_valid = Vec::with_capacity(num_combos);
+
+            for ci in 0..num_combos {
+                if cards_overlap(combos[ci], &board4) {
+                    combo_hists.push(vec![0u8; river_k]);
+                    combo_valid.push(false);
+                } else {
+                    let mut hist = vec![0u16; river_k];
+                    for ri in 0..num_rivers {
+                        if river_cards[ri] == combos[ci][0]
+                            || river_cards[ri] == combos[ci][1]
+                        {
+                            continue;
+                        }
+                        let bucket = river_buckets[ri * num_combos + ci];
+                        hist[bucket as usize] += 1;
+                    }
+                    combo_hists.push(hist.iter().map(|&c| c.min(255) as u8).collect());
+                    combo_valid.push(true);
+                }
+            }
+
+            progress("river", (ti + 1) as f64 / num_turns as f64);
+
+            TurnRiverData {
+                river_cards,
+                river_buckets,
+                combo_hists,
+                combo_valid,
+            }
+        })
+        .collect();
+
+    // ---- Phase 2: Turn clustering ----
+    // Collect all valid (combo, turn) histograms and cluster with EMD k-means.
+    let hist_dim = river_bucket_count as usize;
+    let mut all_features: Vec<Vec<u8>> = Vec::new();
+    let mut all_weights: Vec<f64> = Vec::new();
+    let mut feature_positions: Vec<(usize, usize)> = Vec::new(); // (turn_idx, combo_idx)
+
+    for (ti, trd) in turn_river_data.iter().enumerate() {
+        for (ci, hist) in trd.combo_hists.iter().enumerate() {
+            if trd.combo_valid[ci] {
+                // Ensure histogram dimension matches (pad if river_k was smaller).
+                let mut padded = hist.clone();
+                padded.resize(hist_dim, 0);
+                all_features.push(padded);
+                all_weights.push(1.0);
+                feature_positions.push((ti, ci));
+            }
+        }
+    }
+
+    let turn_k = (turn_bucket_count as usize).min(all_features.len());
+    let (turn_labels, _) = if all_features.is_empty() {
+        (vec![], vec![])
+    } else {
+        kmeans_emd_weighted_u8(
+            &all_features,
+            &all_weights,
+            turn_k,
+            kmeans_iterations,
+            seed,
+            |iter, max_iter| {
+                progress("turn-kmeans", f64::from(iter) / f64::from(max_iter));
+            },
+        )
+    };
+
+    // Scatter turn labels.
+    let mut turn_buckets = vec![0u16; num_turns * num_combos];
+    for (flat_i, &(ti, ci)) in feature_positions.iter().enumerate() {
+        turn_buckets[ti * num_combos + ci] = turn_labels[flat_i];
+    }
+
+    // ---- Assemble PerFlopBucketFile ----
+    let (river_cards_per_turn, river_buckets_per_turn): (Vec<Vec<Card>>, Vec<Vec<u16>>) =
+        turn_river_data
+            .into_iter()
+            .map(|trd| (trd.river_cards, trd.river_buckets))
+            .unzip();
+
+    PerFlopBucketFile {
+        flop_cards: flop,
+        turn_bucket_count,
+        river_bucket_count,
+        turn_cards,
+        turn_buckets,
+        river_cards_per_turn,
+        river_buckets_per_turn,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1941,6 +2125,54 @@ mod tests {
         // Only deck[2] forms a board in the map, so total should be at most 1.
         let total: u32 = hist.iter().map(|&c| u32::from(c)).sum();
         assert!(total <= 46, "total counts should not exceed river card count");
+    }
+
+    // -----------------------------------------------------------------------
+    // cluster_single_flop tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore] // slow: equity enumeration
+    fn test_cluster_single_flop() {
+        let flop = [
+            Card::new(Value::Queen, Suit::Spade),
+            Card::new(Value::Jack, Suit::Heart),
+            Card::new(Value::Two, Suit::Diamond),
+        ];
+        let pf = cluster_single_flop(flop, 10, 10, 50, 42, |_, _| {});
+        assert_eq!(pf.flop_cards, flop);
+        assert_eq!(pf.turn_bucket_count, 10);
+        assert_eq!(pf.river_bucket_count, 10);
+        // Should have ~49 turn cards (52 - 3 flop cards)
+        assert!(
+            pf.turn_cards.len() >= 40 && pf.turn_cards.len() <= 49,
+            "unexpected turn count: {}",
+            pf.turn_cards.len()
+        );
+        // Each turn should have river cards
+        for (i, river_cards) in pf.river_cards_per_turn.iter().enumerate() {
+            assert!(river_cards.len() >= 40, "turn {} has too few rivers: {}", i, river_cards.len());
+        }
+        // Verify bucket range
+        for &b in &pf.turn_buckets {
+            assert!(b < 10, "turn bucket {} out of range", b);
+        }
+        // Verify river bucket range
+        for (ti, river_buckets) in pf.river_buckets_per_turn.iter().enumerate() {
+            for &b in river_buckets {
+                assert!(b < 10, "river bucket {} out of range on turn {}", b, ti);
+            }
+        }
+        // Verify sizes match
+        assert_eq!(pf.turn_buckets.len(), pf.turn_cards.len() * TOTAL_COMBOS as usize);
+        for (ti, river_cards) in pf.river_cards_per_turn.iter().enumerate() {
+            assert_eq!(
+                pf.river_buckets_per_turn[ti].len(),
+                river_cards.len() * TOTAL_COMBOS as usize,
+                "river buckets size mismatch for turn {}",
+                ti
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
