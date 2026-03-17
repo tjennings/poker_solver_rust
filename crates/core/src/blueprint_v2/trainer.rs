@@ -390,19 +390,31 @@ impl BlueprintTrainer {
         // Validate bucket files unless explicitly skipped or no cluster_path configured
         // (no cluster_path means intentional equity-only mode).
         if !self.skip_bucket_validation && self.config.training.cluster_path.is_some() {
-        const STREET_NAMES: [&str; 3] = ["flop", "turn", "river"];
-        let mut missing = Vec::new();
-        for (i, name) in STREET_NAMES.iter().enumerate() {
-            if self.buckets.bucket_files[i + 1].is_none() {
-                missing.push(*name);
+        // Per-flop bucketing: turn/river are in per-flop files, not global.
+        let has_per_flop = self.buckets.has_per_flop_dir();
+        if !has_per_flop {
+            const STREET_NAMES: [&str; 3] = ["flop", "turn", "river"];
+            let mut missing = Vec::new();
+            for (i, name) in STREET_NAMES.iter().enumerate() {
+                if self.buckets.bucket_files[i + 1].is_none() {
+                    missing.push(*name);
+                }
             }
-        }
-        if !missing.is_empty() {
+            if !missing.is_empty() {
+                return Err(format!(
+                    "No bucket files found for: {}. \
+                     Run the clustering pipeline first (cluster_path: {:?}). \
+                     Training without proper buckets produces meaningless strategies.",
+                    missing.join(", "),
+                    self.config.training.cluster_path,
+                )
+                .into());
+            }
+        } else if self.buckets.bucket_files[1].is_none() {
+            // Per-flop mode still needs global flop.buckets
             return Err(format!(
-                "No bucket files found for: {}. \
-                 Run the clustering pipeline first (cluster_path: {:?}). \
-                 Training without proper buckets produces meaningless strategies.",
-                missing.join(", "),
+                "Per-flop bucket files found but flop.buckets is missing. \
+                 Run the clustering pipeline first (cluster_path: {:?}).",
                 self.config.training.cluster_path,
             )
             .into());
