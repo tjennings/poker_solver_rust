@@ -603,6 +603,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
+            // Per-flop bucket file diagnostics
+            let per_flop_marker = cluster_dir.join("flop_0000.buckets");
+            if per_flop_marker.exists() {
+                eprintln!("\nPer-flop bucket files detected.");
+                let pf_report = poker_solver_core::blueprint_v2::cluster_diagnostics::diagnose_per_flop_dir(&cluster_dir, 10)?;
+                eprintln!("  Files: {}, sampled: {}", pf_report.total_flop_files, pf_report.sampled_files);
+                eprintln!("  Turn buckets: {}, River buckets: {}", pf_report.turn_bucket_count, pf_report.river_bucket_count);
+                eprintln!("  Avg turn cards: {:.1}, Avg rivers/turn: {:.1}", pf_report.avg_turn_cards, pf_report.avg_river_cards_per_turn);
+
+                if audit {
+                    let pf_flop_samples = audit_boards.min(20);
+                    eprintln!("\nPer-flop equity audit ({} flop samples, 5 rivers/turn)...", pf_flop_samples);
+                    let pf_audit = poker_solver_core::blueprint_v2::cluster_diagnostics::audit_per_flop_equity(
+                        &cluster_dir, pf_flop_samples, 5, 42,
+                    )?;
+                    eprintln!("{}", pf_audit.summary());
+                }
+            }
             if let Some(_street) = centroid_emd {
                 eprintln!(
                     "\nCentroid EMD requires feature vectors which are not stored \

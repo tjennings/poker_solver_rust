@@ -947,6 +947,244 @@ pub fn audit_cfvnet_buckets(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Per-flop diagnostics
+// ---------------------------------------------------------------------------
+
+/// Report on per-flop bucket files found in a directory.
+#[derive(Debug)]
+pub struct PerFlopReport {
+    pub total_flop_files: usize,
+    pub sampled_files: usize,
+    pub turn_bucket_count: u16,
+    pub river_bucket_count: u16,
+    pub avg_turn_cards: f64,
+    pub avg_river_cards_per_turn: f64,
+}
+
+/// Scan a directory for `flop_NNNN.buckets` files and report summary statistics.
+///
+/// Loads up to `sample_count` files and aggregates turn/river bucket info.
+///
+/// # Errors
+///
+/// Returns an error if any sampled file cannot be loaded.
+pub fn diagnose_per_flop_dir(
+    dir: &Path,
+    sample_count: usize,
+) -> Result<PerFlopReport, Box<dyn std::error::Error>> {
+    use rand::prelude::*;
+    use rand::rngs::StdRng;
+    use super::per_flop_bucket_file::PerFlopBucketFile;
+
+    let mut flop_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("flop_") && n.ends_with(".buckets"))
+        })
+        .collect();
+
+    let total_flop_files = flop_files.len();
+    if total_flop_files == 0 {
+        return Ok(PerFlopReport {
+            total_flop_files: 0,
+            sampled_files: 0,
+            turn_bucket_count: 0,
+            river_bucket_count: 0,
+            avg_turn_cards: 0.0,
+            avg_river_cards_per_turn: 0.0,
+        });
+    }
+
+    flop_files.sort();
+    if flop_files.len() > sample_count {
+        let mut rng = StdRng::seed_from_u64(42);
+        flop_files.shuffle(&mut rng);
+        flop_files.truncate(sample_count);
+    }
+
+    let sampled = flop_files.len();
+    let mut turn_bucket_count = 0u16;
+    let mut river_bucket_count = 0u16;
+    let mut total_turn_cards = 0usize;
+    let mut total_river_cards = 0usize;
+    let mut total_turns_counted = 0usize;
+
+    for path in &flop_files {
+        let pf = PerFlopBucketFile::load(path)?;
+        turn_bucket_count = pf.turn_bucket_count;
+        river_bucket_count = pf.river_bucket_count;
+        total_turn_cards += pf.turn_cards.len();
+        for rivers in &pf.river_cards_per_turn {
+            total_river_cards += rivers.len();
+            total_turns_counted += 1;
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let avg_turn_cards = total_turn_cards as f64 / sampled as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let avg_river_cards_per_turn = if total_turns_counted > 0 {
+        total_river_cards as f64 / total_turns_counted as f64
+    } else {
+        0.0
+    };
+
+    Ok(PerFlopReport {
+        total_flop_files,
+        sampled_files: sampled,
+        turn_bucket_count,
+        river_bucket_count,
+        avg_turn_cards,
+        avg_river_cards_per_turn,
+    })
+}
+
+/// Audit per-flop river bucket equity by sampling flop files, turns, and rivers.
+///
+/// For each sampled per-flop file, iterates over turn cards, picks random river
+/// cards, builds 5-card boards, computes equity, and groups by river bucket.
+///
+/// # Errors
+///
+/// Returns an error if any per-flop file cannot be loaded.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+pub fn audit_per_flop_equity(
+    dir: &Path,
+    num_flop_samples: usize,
+    num_river_samples_per_turn: usize,
+    seed: u64,
+) -> Result<EquityAuditReport, Box<dyn std::error::Error>> {
+    use rand::prelude::*;
+    use rand::rngs::StdRng;
+    use super::per_flop_bucket_file::PerFlopBucketFile;
+
+    let mut flop_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("flop_") && n.ends_with(".buckets"))
+        })
+        .collect();
+
+    flop_files.sort();
+    let mut rng = StdRng::seed_from_u64(seed);
+    if flop_files.len() > num_flop_samples {
+        flop_files.shuffle(&mut rng);
+        flop_files.truncate(num_flop_samples);
+    }
+
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+
+    // We'll discover river_bucket_count from the first file loaded.
+    let mut river_bucket_count = 0u16;
+    let mut equity_bucket_pairs: Vec<(f64, u16)> = Vec::new();
+
+    for path in &flop_files {
+        let pf = PerFlopBucketFile::load(path)?;
+        river_bucket_count = pf.river_bucket_count;
+
+        for (turn_idx, &turn_card) in pf.turn_cards.iter().enumerate() {
+            let river_cards = &pf.river_cards_per_turn[turn_idx];
+            // Sample river cards
+            let mut sampled_rivers: Vec<(usize, Card)> = river_cards
+                .iter()
+                .enumerate()
+                .map(|(ri, &c)| (ri, c))
+                .collect();
+            if sampled_rivers.len() > num_river_samples_per_turn {
+                sampled_rivers.shuffle(&mut rng);
+                sampled_rivers.truncate(num_river_samples_per_turn);
+            }
+
+            for (river_idx, river_card) in &sampled_rivers {
+                let board: [Card; 5] = [
+                    pf.flop_cards[0],
+                    pf.flop_cards[1],
+                    pf.flop_cards[2],
+                    turn_card,
+                    *river_card,
+                ];
+                let equities = compute_board_equities(board, &combos);
+                for (combo_idx, eq_opt) in equities.into_iter().enumerate() {
+                    if let Some(eq) = eq_opt {
+                        let bucket = pf.get_river_bucket(turn_idx, *river_idx, combo_idx);
+                        equity_bucket_pairs.push((eq, bucket));
+                    }
+                }
+            }
+        }
+    }
+
+    // Build per-bucket stats reusing the same pattern as audit_bucket_equity
+    let bucket_count = river_bucket_count as usize;
+    let mut bucket_equities: Vec<Vec<f64>> = vec![Vec::new(); bucket_count.max(1)];
+    for &(eq, bucket) in &equity_bucket_pairs {
+        if (bucket as usize) < bucket_equities.len() {
+            bucket_equities[bucket as usize].push(eq);
+        }
+    }
+
+    let bucket_stats: Vec<BucketEquityStats> = bucket_equities
+        .iter()
+        .enumerate()
+        .map(|(id, eqs)| {
+            if eqs.is_empty() {
+                return BucketEquityStats {
+                    bucket_id: id as u16,
+                    count: 0,
+                    mean_equity: 0.0,
+                    std_dev: 0.0,
+                    min_equity: 0.0,
+                    max_equity: 0.0,
+                };
+            }
+            let n = eqs.len() as f64;
+            let sum: f64 = eqs.iter().sum();
+            let mean = sum / n;
+            let variance = eqs.iter().map(|&e| (e - mean).powi(2)).sum::<f64>() / n;
+            let min = eqs.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = eqs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            BucketEquityStats {
+                bucket_id: id as u16,
+                count: eqs.len(),
+                mean_equity: mean,
+                std_dev: variance.sqrt(),
+                min_equity: min,
+                max_equity: max,
+            }
+        })
+        .collect();
+
+    let non_empty: Vec<_> = bucket_stats.iter().filter(|b| b.count > 0).collect();
+    let mean_std = if non_empty.is_empty() {
+        0.0
+    } else {
+        non_empty.iter().map(|b| b.std_dev).sum::<f64>() / non_empty.len() as f64
+    };
+    let max_std = non_empty
+        .iter()
+        .map(|b| b.std_dev)
+        .fold(0.0_f64, f64::max);
+
+    let sample_boards = equity_bucket_pairs.len();
+
+    Ok(EquityAuditReport {
+        street: "River (per-flop)".to_string(),
+        bucket_count: river_bucket_count,
+        sample_boards,
+        buckets: bucket_stats,
+        mean_intra_bucket_std: mean_std,
+        max_intra_bucket_std: max_std,
+    })
+}
+
 /// A sample hand from a specific bucket.
 #[derive(Debug, Clone)]
 pub struct BucketHandSample {
@@ -1296,5 +1534,118 @@ mod tests {
         for sample in &samples {
             assert_eq!(sample.bucket, 0);
         }
+    }
+
+    #[test]
+    fn diagnose_per_flop_dir_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = diagnose_per_flop_dir(dir.path(), 10).unwrap();
+        assert_eq!(report.total_flop_files, 0);
+        assert_eq!(report.sampled_files, 0);
+    }
+
+    #[test]
+    fn diagnose_per_flop_dir_counts_files() {
+        use crate::blueprint_v2::per_flop_bucket_file::PerFlopBucketFile;
+        use rs_poker::core::{Suit, Value};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Create 3 per-flop files
+        for i in 0..3u16 {
+            let flop = [
+                Card::new(Value::Queen, Suit::Spade),
+                Card::new(Value::Jack, Suit::Heart),
+                Card::new(Value::Two, Suit::Diamond),
+            ];
+            let turn_cards = vec![Card::new(Value::Ace, Suit::Club)];
+            let river_cards = vec![Card::new(Value::Ten, Suit::Club)];
+            let pf = PerFlopBucketFile {
+                flop_cards: flop,
+                turn_bucket_count: 5,
+                river_bucket_count: 8,
+                turn_cards: turn_cards.clone(),
+                turn_buckets: vec![i; 1326],
+                river_cards_per_turn: vec![river_cards],
+                river_buckets_per_turn: vec![vec![i; 1326]],
+            };
+            pf.save(&dir.path().join(format!("flop_{i:04}.buckets"))).unwrap();
+        }
+        let report = diagnose_per_flop_dir(dir.path(), 10).unwrap();
+        assert_eq!(report.total_flop_files, 3);
+        assert_eq!(report.sampled_files, 3); // sample_count=10 > 3 files
+        assert_eq!(report.turn_bucket_count, 5);
+        assert_eq!(report.river_bucket_count, 8);
+        assert!((report.avg_turn_cards - 1.0).abs() < 1e-10);
+        assert!((report.avg_river_cards_per_turn - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn diagnose_per_flop_dir_samples_subset() {
+        use crate::blueprint_v2::per_flop_bucket_file::PerFlopBucketFile;
+        use rs_poker::core::{Suit, Value};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Create 20 per-flop files
+        for i in 0..20u16 {
+            let flop = [
+                Card::new(Value::Queen, Suit::Spade),
+                Card::new(Value::Jack, Suit::Heart),
+                Card::new(Value::Two, Suit::Diamond),
+            ];
+            let pf = PerFlopBucketFile {
+                flop_cards: flop,
+                turn_bucket_count: 5,
+                river_bucket_count: 8,
+                turn_cards: vec![Card::new(Value::Ace, Suit::Club)],
+                turn_buckets: vec![0; 1326],
+                river_cards_per_turn: vec![vec![Card::new(Value::Ten, Suit::Club)]],
+                river_buckets_per_turn: vec![vec![0; 1326]],
+            };
+            pf.save(&dir.path().join(format!("flop_{i:04}.buckets"))).unwrap();
+        }
+        let report = diagnose_per_flop_dir(dir.path(), 5).unwrap();
+        assert_eq!(report.total_flop_files, 20);
+        assert_eq!(report.sampled_files, 5);
+    }
+
+    #[test]
+    fn audit_per_flop_equity_basic() {
+        use crate::blueprint_v2::per_flop_bucket_file::PerFlopBucketFile;
+        use rs_poker::core::{Suit, Value};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a per-flop file with 2 river buckets.
+        // Bucket 0 = combos 0..663, bucket 1 = combos 663..1326.
+        let flop = [
+            Card::new(Value::Queen, Suit::Spade),
+            Card::new(Value::Jack, Suit::Heart),
+            Card::new(Value::Two, Suit::Diamond),
+        ];
+        let turn_card = Card::new(Value::Ace, Suit::Club);
+        let river_card = Card::new(Value::Ten, Suit::Club);
+
+        let mut river_buckets = vec![0u16; 1326];
+        for i in 663..1326 {
+            river_buckets[i] = 1;
+        }
+
+        let pf = PerFlopBucketFile {
+            flop_cards: flop,
+            turn_bucket_count: 2,
+            river_bucket_count: 2,
+            turn_cards: vec![turn_card],
+            turn_buckets: vec![0; 1326],
+            river_cards_per_turn: vec![vec![river_card]],
+            river_buckets_per_turn: vec![river_buckets],
+        };
+        pf.save(&dir.path().join("flop_0000.buckets")).unwrap();
+
+        let report = audit_per_flop_equity(dir.path(), 1, 1, 42).unwrap();
+        assert_eq!(report.street, "River (per-flop)");
+        assert_eq!(report.bucket_count, 2);
+        // Should have some observations in at least one bucket
+        let total: usize = report.buckets.iter().map(|b| b.count).sum();
+        assert!(total > 0, "expected some equity observations");
     }
 }
