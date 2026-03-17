@@ -14,8 +14,12 @@ use rayon::prelude::*;
 use crate::poker::Card;
 
 use super::bucket_file::BucketFile;
-use super::cluster_pipeline::{build_deck, compute_board_equities, enumerate_combos, sample_boards};
+use super::cluster_pipeline::{
+    build_deck, canonical_key, compute_board_equities, enumerate_combos, sample_boards,
+};
 use super::Street;
+
+use crate::abstraction::isomorphism::CanonicalBoard;
 
 /// Size distribution statistics for bucket assignments.
 #[derive(Debug)]
@@ -198,26 +202,36 @@ pub fn audit_bucket_equity(bf: &BucketFile, num_sample_boards: usize, seed: u64)
     let combos = enumerate_combos(&deck);
     let boards = sample_boards(&deck, num_sample_boards, seed);
     let bucket_count = bf.header.bucket_count;
-    let board_count = bf.header.board_count as usize;
+    let board_map = bf.board_index_map();
 
     // Collect (equity, bucket_id) pairs across all sampled boards.
+    // Canonicalize each sampled board and look up its index in the bucket file.
     let equity_bucket_pairs: Vec<(f64, u16)> = boards
         .par_iter()
-        .enumerate()
-        .flat_map_iter(|(sample_idx, &board)| {
-            let equities = compute_board_equities(board, &combos);
-            // Map sample board index to the bucket file's board dimension.
-            // If the bucket file has fewer boards than our sample, wrap around.
-            let board_idx = sample_idx % board_count;
+        .flat_map_iter(|&board| {
+            // Canonicalize the board to match the bucket file's board keys.
+            let board_idx = CanonicalBoard::from_cards(&board.to_vec())
+                .ok()
+                .map(|cb| canonical_key(&cb.cards))
+                .and_then(|key| board_map.get(&key).copied());
+
+            let equities = if board_idx.is_some() {
+                compute_board_equities(board, &combos)
+            } else {
+                return Vec::new();
+            };
+
+            let idx = board_idx.unwrap();
             equities
                 .into_iter()
                 .enumerate()
                 .filter_map(move |(combo_idx, eq_opt)| {
                     let eq = eq_opt?;
                     #[allow(clippy::cast_possible_truncation)]
-                    let bucket = bf.get_bucket(board_idx as u32, combo_idx as u16);
+                    let bucket = bf.get_bucket(idx, combo_idx as u16);
                     Some((eq, bucket))
                 })
+                .collect::<Vec<_>>()
         })
         .collect();
 
