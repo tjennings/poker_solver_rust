@@ -415,46 +415,67 @@ fn main() -> Result<(), Box<dyn Error>> {
                     seed: bp_config.clustering.seed,
                 };
 
+                let num_flops = 1755_usize; // canonical flop count
+
                 let mp = MultiProgress::new();
-                let street_bar = mp.add(ProgressBar::new(1000));
-                street_bar.set_style(
-                    ProgressStyle::with_template("  {msg:>12} {bar:40.cyan/blue} {pos}/{len}")
+
+                // Bar 1: Overall flop progress (0 / 1755)
+                let flop_bar = mp.add(ProgressBar::new(num_flops as u64));
+                flop_bar.set_style(
+                    ProgressStyle::with_template("  {msg:>16} {bar:40.cyan/blue} {pos}/{len}")
                         .unwrap()
                         .progress_chars("##-"),
                 );
-                street_bar.set_message("per-flop");
+                flop_bar.set_message("Flops");
 
+                // Bar 2: Current flop being processed
+                let flop_name_bar = mp.add(ProgressBar::new(100));
+                flop_name_bar.set_style(
+                    ProgressStyle::with_template("  {msg:>16} {bar:40.green/black} {pos}%")
+                        .unwrap()
+                        .progress_chars("##-"),
+                );
+
+                // Bar 3: Phase progress within the current flop
                 let phase_bar = mp.add(ProgressBar::new(1000));
                 phase_bar.set_style(
-                    ProgressStyle::with_template("  {msg:>12} {bar:40.white/black} {pos}/{len}")
+                    ProgressStyle::with_template("  {msg:>16} {bar:40.white/black} {pos}/{len}")
                         .unwrap()
                         .progress_chars("##-"),
                 );
 
-                let current_street = std::sync::Mutex::new(String::new());
+                let num_flops_u64 = num_flops as u64;
 
                 poker_solver_core::blueprint_v2::cluster_pipeline::run_per_flop_pipeline(
                     &per_flop_config,
                     &output,
                     None,
-                    |street, phase, p| {
-                        let mut cur = current_street.lock().unwrap();
-                        if *cur != street {
-                            if !cur.is_empty() {
-                                phase_bar.finish_and_clear();
+                    |stage, flop_label, phase, p| {
+                        match stage {
+                            "per-flop" => {
+                                flop_name_bar.set_message(flop_label.to_string());
+                                flop_name_bar.set_position((p * 100.0) as u64);
+                                phase_bar.set_message(phase.to_string());
+                                phase_bar.set_position((p * 1000.0) as u64);
                             }
-                            *cur = street.to_string();
-                            street_bar.set_message(street.to_string());
-                            phase_bar.reset();
+                            "per-flop-done" => {
+                                let done = (p * num_flops_u64 as f64) as u64;
+                                flop_bar.set_position(done);
+                            }
+                            "flop-clustering" | "preflop" => {
+                                flop_bar.set_position(num_flops_u64);
+                                flop_name_bar.set_message(stage.to_string());
+                                flop_name_bar.set_position(100);
+                                phase_bar.set_message(phase.to_string());
+                                phase_bar.set_position((p * 1000.0) as u64);
+                            }
+                            _ => {}
                         }
-                        drop(cur);
-
-                        phase_bar.set_message(phase.to_string());
-                        phase_bar.set_position((p * 1000.0) as u64);
                     },
                 )?;
 
-                street_bar.finish_with_message("done");
+                flop_bar.finish_with_message("done");
+                flop_name_bar.finish_and_clear();
                 phase_bar.finish_and_clear();
                 eprintln!("Per-flop clustering complete. Files saved to {}", output.display());
             } else {
