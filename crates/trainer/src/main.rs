@@ -432,11 +432,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let thread_count = rayon::current_num_threads();
                 let thread_bars: Vec<ProgressBar> = (0..thread_count)
                     .map(|_| {
-                        let bar = mp.add(ProgressBar::new(1000));
+                        let bar = mp.add(ProgressBar::new(100));
                         bar.set_style(
-                            ProgressStyle::with_template("  {msg:>20} {bar:40.white/black} {pos}/{len}")
-                                .unwrap()
-                                .progress_chars("##-"),
+                            ProgressStyle::with_template("  {msg}")
+                                .unwrap(),
                         );
                         bar.set_message("");
                         bar
@@ -452,6 +451,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                             "done" => {
                                 let done = (p * num_flops as f64).round() as u64;
                                 flop_bar.set_position(done);
+                                // Clear the thread bar that finished
+                                let tid = rayon::current_thread_index().unwrap_or(0);
+                                if let Some(bar) = thread_bars.get(tid) {
+                                    bar.set_message("");
+                                }
                             }
                             "resume" => {
                                 let done = (p * num_flops as f64).round() as u64;
@@ -463,11 +467,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 flop_bar.set_message(format!("{stage}: {msg}"));
                             }
                             _ => {
-                                // stage = "NNNN [cards]", msg = phase
+                                // stage = "NNNN [cards]", msg = "river 5/48" etc
                                 let tid = rayon::current_thread_index().unwrap_or(0);
                                 if let Some(bar) = thread_bars.get(tid) {
-                                    bar.set_message(format!("{stage} {msg}"));
-                                    bar.set_position((p * 1000.0) as u64);
+                                    bar.set_message(format!("  {stage} {msg}"));
                                 }
                             }
                         }

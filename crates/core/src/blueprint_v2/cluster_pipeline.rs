@@ -959,7 +959,7 @@ pub fn cluster_single_flop(
     river_bucket_count: u16,
     kmeans_iterations: u32,
     seed: u64,
-    progress: impl Fn(&str, f64) + Sync,
+    progress: impl Fn(&str, u32, u32) + Sync,
 ) -> PerFlopBucketFile {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
@@ -1042,7 +1042,8 @@ pub fn cluster_single_flop(
                 }
             }
 
-            progress("river", (ti + 1) as f64 / num_turns as f64);
+            #[allow(clippy::cast_possible_truncation)]
+            progress("river", (ti + 1) as u32, num_turns as u32);
 
             TurnRiverData {
                 river_cards,
@@ -1084,7 +1085,7 @@ pub fn cluster_single_flop(
             kmeans_iterations,
             seed,
             |iter, max_iter| {
-                progress("turn-kmeans", f64::from(iter) / f64::from(max_iter));
+                progress("turn-kmeans", iter, max_iter);
             },
         )
     };
@@ -1191,8 +1192,8 @@ pub fn run_per_flop_pipeline(
                 config.river_buckets,
                 config.kmeans_iterations,
                 config.seed.wrapping_add(i as u64),
-                |phase, p| {
-                    progress(&flop_label, phase, p);
+                |phase, pos, total| {
+                    progress(&flop_label, &format!("{phase} {pos}/{total}"), pos as f64 / total as f64);
                 },
             );
             pf.save(&per_flop_paths[i]).expect("failed to save per-flop bucket file");
@@ -2317,7 +2318,7 @@ mod tests {
             Card::new(Value::Jack, Suit::Heart),
             Card::new(Value::Two, Suit::Diamond),
         ];
-        let pf = cluster_single_flop(flop, 10, 10, 50, 42, |_, _| {});
+        let pf = cluster_single_flop(flop, 10, 10, 50, 42, |_, _, _| {});
         assert_eq!(pf.flop_cards, flop);
         assert_eq!(pf.turn_bucket_count, 10);
         assert_eq!(pf.river_bucket_count, 10);
