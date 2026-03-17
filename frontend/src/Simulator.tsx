@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { invoke, isTauri } from './invoke';
+import { invoke } from './invoke';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
 import type { StrategySourceInfo, SimulationProgress, SimulationResult } from './types';
 
@@ -22,24 +22,22 @@ function Simulator() {
   }, []);
 
   useEffect(() => {
-    if (!isTauri()) return;
-
     let cancelled = false;
     const unlisteners: (() => void)[] = [];
 
     (async () => {
-      const { listen } = await import('@tauri-apps/api/event');
+      const { listen } = await import('./events');
       if (cancelled) return;
 
-      const u1 = await listen<SimulationProgress>('simulation-progress', (event) => {
-        setProgress(event.payload);
+      const u1 = await listen<SimulationProgress>('simulation-progress', (payload) => {
+        setProgress(payload);
       });
-      const u2 = await listen<SimulationResult>('simulation-complete', (event) => {
-        setResult(event.payload);
+      const u2 = await listen<SimulationResult>('simulation-complete', (payload) => {
+        setResult(payload);
         setRunning(false);
       });
-      const u3 = await listen<string>('simulation-error', (event) => {
-        setError(event.payload);
+      const u3 = await listen<string>('simulation-error', (payload) => {
+        setError(payload);
         setRunning(false);
         setProgress(null);
       });
