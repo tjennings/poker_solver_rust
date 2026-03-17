@@ -9,6 +9,9 @@ use rand::prelude::*;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
 
+use fastkmeans_rs::FastKMeans;
+use ndarray::Array2;
+
 // ---------------------------------------------------------------------------
 // Earth Mover's Distance
 // ---------------------------------------------------------------------------
@@ -823,6 +826,126 @@ fn kmeanspp_init_u8(data: &[Vec<u8>], k: usize, rng: &mut StdRng) -> Vec<Vec<f64
     }
 
     centroids
+}
+
+// ---------------------------------------------------------------------------
+// fastkmeans-rs wrappers
+// ---------------------------------------------------------------------------
+
+/// Run BLAS-accelerated L2 k-means via `fastkmeans-rs`.
+///
+/// Takes feature vectors as `&[Vec<f32>]` (n_samples × n_features),
+/// returns `(labels, centroids)` in our internal format.
+///
+/// This replaces `kmeans_1d_weighted` and `kmeans_emd_weighted_u8` with
+/// a single L2-distance implementation backed by Apple Accelerate BLAS.
+#[allow(clippy::cast_possible_truncation)]
+#[must_use]
+pub fn fast_kmeans(
+    features: &[Vec<f32>],
+    k: usize,
+    max_iters: u32,
+    seed: u64,
+) -> (Vec<u16>, Vec<Vec<f32>>) {
+    let n = features.len();
+    if n == 0 || k == 0 {
+        return (vec![], vec![]);
+    }
+    let k = k.min(n);
+    let dim = features[0].len();
+
+    // Build Array2<f32> from flat data.
+    let mut flat = Vec::with_capacity(n * dim);
+    for f in features {
+        flat.extend_from_slice(f);
+    }
+    let data = Array2::from_shape_vec((n, dim), flat)
+        .expect("shape mismatch building Array2 for k-means");
+
+    // Configure and run.
+    let config = fastkmeans_rs::KMeansConfig::new(k)
+        .with_max_iters(max_iters as usize)
+        .with_seed(seed)
+        .with_max_points_per_centroid(None); // no subsampling
+
+    let mut km = FastKMeans::with_config(config);
+    let labels = km
+        .fit_predict(&data.view())
+        .expect("fastkmeans fit_predict failed");
+
+    // Extract labels as Vec<u16>.
+    let label_vec: Vec<u16> = labels.iter().map(|&l| l as u16).collect();
+
+    // Extract centroids.
+    let centroids_arr = km.centroids().expect("centroids not set after fit");
+    let centroid_vecs: Vec<Vec<f32>> = (0..k)
+        .map(|i| centroids_arr.row(i).to_vec())
+        .collect();
+
+    (label_vec, centroid_vecs)
+}
+
+/// Convenience wrapper for 1D equity clustering.
+///
+/// Converts `f64` equities to single-feature `f32` vectors, runs fast_kmeans,
+/// and returns labels + centroids as `f64`.
+#[allow(clippy::cast_possible_truncation)]
+#[must_use]
+pub fn fast_kmeans_1d(
+    data: &[f64],
+    k: usize,
+    max_iters: u32,
+    seed: u64,
+) -> (Vec<u16>, Vec<f64>) {
+    let features: Vec<Vec<f32>> = data.iter().map(|&v| vec![v as f32]).collect();
+    let (labels, centroids) = fast_kmeans(&features, k, max_iters, seed);
+    let centroid_vals: Vec<f64> = centroids.iter().map(|c| f64::from(c[0])).collect();
+    (labels, centroid_vals)
+}
+
+/// Convenience wrapper for histogram clustering.
+///
+/// Converts `u8` histograms to `f32` feature vectors and runs fast_kmeans.
+/// Returns labels + centroids as `Vec<Vec<f32>>`.
+#[allow(clippy::cast_possible_truncation)]
+#[must_use]
+pub fn fast_kmeans_histogram(
+    histograms: &[Vec<u8>],
+    k: usize,
+    max_iters: u32,
+    seed: u64,
+) -> (Vec<u16>, Vec<Vec<f32>>) {
+    let features: Vec<Vec<f32>> = histograms
+        .iter()
+        .map(|h| h.iter().map(|&v| f32::from(v)).collect())
+        .collect();
+    fast_kmeans(&features, k, max_iters, seed)
+}
+
+/// Assign a single u8 histogram point to the nearest centroid by L2 distance.
+///
+/// Used in the exhaustive assignment phase after `fast_kmeans_histogram`
+/// finds centroids.
+#[allow(clippy::cast_possible_truncation)]
+#[must_use]
+pub fn nearest_centroid_l2(point: &[u8], centroids: &[Vec<f32>]) -> u16 {
+    let mut best_idx = 0_u16;
+    let mut best_dist = f32::MAX;
+    for (ci, centroid) in centroids.iter().enumerate() {
+        let d: f32 = point
+            .iter()
+            .zip(centroid.iter())
+            .map(|(&p, &c)| {
+                let diff = f32::from(p) - c;
+                diff * diff
+            })
+            .sum();
+        if d < best_dist {
+            best_dist = d;
+            best_idx = ci as u16;
+        }
+    }
+    best_idx
 }
 
 // ---------------------------------------------------------------------------

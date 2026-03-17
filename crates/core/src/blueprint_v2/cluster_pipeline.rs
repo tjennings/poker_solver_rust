@@ -40,7 +40,8 @@ use crate::showdown_equity::rank_hand;
 
 use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard, VERSION};
 use super::clustering::{
-    kmeans_1d, kmeans_1d_weighted, kmeans_emd_weighted_u8, nearest_centroid_1d,
+    fast_kmeans_1d, fast_kmeans_histogram, kmeans_1d, kmeans_1d_weighted,
+    kmeans_emd_weighted_u8, nearest_centroid_1d, nearest_centroid_l2,
     nearest_centroid_u8,
 };
 use super::config::ClusteringConfig;
@@ -167,17 +168,13 @@ pub fn cluster_turn_with_boards(
         }
     }
 
-    let (cluster_labels, _centroids) = kmeans_emd_weighted_u8(
+    let (cluster_labels, _centroids) = fast_kmeans_histogram(
         &all_features,
-        &all_weights,
         bucket_count as usize,
         kmeans_iterations,
         seed,
-        |iter, max_iter| {
-            #[allow(clippy::cast_precision_loss)]
-            progress("k-means", f64::from(iter) / f64::from(max_iter));
-        },
     );
+    progress("k-means", 1.0);
 
     let total = num_boards * TOTAL_COMBOS as usize;
     let mut buckets = vec![0_u16; total];
@@ -293,17 +290,13 @@ pub fn cluster_flop_with_boards(
         }
     }
 
-    let (cluster_labels, _centroids) = kmeans_emd_weighted_u8(
+    let (cluster_labels, _centroids) = fast_kmeans_histogram(
         &all_features,
-        &all_weights,
         bucket_count as usize,
         kmeans_iterations,
         seed,
-        |iter, max_iter| {
-            #[allow(clippy::cast_precision_loss)]
-            progress("k-means", f64::from(iter) / f64::from(max_iter));
-        },
     );
+    progress("k-means", 1.0);
 
     let total = num_boards * TOTAL_COMBOS as usize;
     let mut buckets = vec![0_u16; total];
@@ -375,11 +368,11 @@ pub fn cluster_river_exhaustive(
         }
     }
 
-    let (_labels, centroids) = kmeans_1d_weighted(
+    let (_labels, centroids) = fast_kmeans_1d(
         &sample_vals,
-        &sample_wts,
         bucket_count as usize,
         kmeans_iterations,
+        seed,
     );
     progress("k-means", 1.0);
 
@@ -488,16 +481,11 @@ fn cluster_histogram_exhaustive<const N: usize>(
         }
     }
 
-    let (_labels, centroids) = kmeans_emd_weighted_u8(
+    let (_labels, centroids) = fast_kmeans_histogram(
         &all_features,
-        &all_weights,
         bucket_count as usize,
         kmeans_iterations,
         seed,
-        |iter, max_iter| {
-            #[allow(clippy::cast_precision_loss)]
-            progress("k-means", f64::from(iter) / f64::from(max_iter));
-        },
     );
     progress("k-means", 1.0);
 
@@ -519,7 +507,7 @@ fn cluster_histogram_exhaustive<const N: usize>(
                     let hist = build_bucket_histogram_u8(
                         *combo, &wb.cards, &deck, prior_buckets, &board_map,
                     );
-                    nearest_centroid_u8(&hist, &centroids)
+                    nearest_centroid_l2(&hist, &centroids)
                 })
                 .collect();
             #[allow(clippy::cast_precision_loss)]
@@ -833,11 +821,11 @@ fn cfvnet_pass2_centroids(histogram: &[u64], bucket_count: u16, kmeans_iteration
         }
     }
 
-    let (_labels, mut centroids) = kmeans_1d_weighted(
+    let (_labels, mut centroids) = fast_kmeans_1d(
         &bin_midpoints,
-        &bin_weights,
         bucket_count as usize,
         kmeans_iterations,
+        42, // seed
     );
 
     centroids.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1004,12 +992,12 @@ pub fn cluster_single_flop(
                 }
             }
 
-            // 1D k-means on equities.
+            // 1D k-means on equities (BLAS-accelerated).
             let river_k = (river_bucket_count as usize).min(all_equities.len());
             let (labels, _) = if all_equities.is_empty() {
                 (vec![], vec![])
             } else {
-                kmeans_1d_weighted(&all_equities, &all_weights, river_k, kmeans_iterations)
+                fast_kmeans_1d(&all_equities, river_k, kmeans_iterations, seed)
             };
 
             // Scatter into flat array.
@@ -1075,20 +1063,13 @@ pub fn cluster_single_flop(
     }
 
     let turn_k = (turn_bucket_count as usize).min(all_features.len());
+    progress("turn-kmeans", 0, 1);
     let (turn_labels, _) = if all_features.is_empty() {
         (vec![], vec![])
     } else {
-        kmeans_emd_weighted_u8(
-            &all_features,
-            &all_weights,
-            turn_k,
-            kmeans_iterations,
-            seed,
-            |iter, max_iter| {
-                progress("turn-kmeans", iter, max_iter);
-            },
-        )
+        fast_kmeans_histogram(&all_features, turn_k, kmeans_iterations, seed)
     };
+    progress("turn-kmeans", 1, 1);
 
     // Scatter turn labels.
     let mut turn_buckets = vec![0u16; num_turns * num_combos];
@@ -1243,26 +1224,15 @@ pub fn run_per_flop_pipeline(
         );
     }
 
-    // Run EMD k-means on flop histograms.
+    // Run L2 k-means on flop histograms (BLAS-accelerated).
+    progress("flop-clustering", "k-means", 0.0);
     let flop_k = (config.flop_buckets as usize).min(all_features.len());
     let (flop_labels, _) = if all_features.is_empty() {
         (vec![], vec![])
     } else {
-        kmeans_emd_weighted_u8(
-            &all_features,
-            &all_weights,
-            flop_k,
-            config.kmeans_iterations,
-            config.seed,
-            |iter, max_iter| {
-                progress(
-                    "flop-clustering",
-                    "k-means",
-                    f64::from(iter) / f64::from(max_iter),
-                );
-            },
-        )
+        fast_kmeans_histogram(&all_features, flop_k, config.kmeans_iterations, config.seed)
     };
+    progress("flop-clustering", "k-means", 1.0);
 
     // Build flop BucketFile.
     let total = num_flops * TOTAL_COMBOS as usize;
