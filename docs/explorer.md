@@ -70,6 +70,31 @@ Continue through turn and river by entering additional cards. The suit mapping f
 
 Hand simulation interface for testing strategies against each other.
 
+## Remote Backend
+
+WarpGTO can connect to a remote backend for GPU-accelerated solving. This is useful when the solver machine has a powerful GPU but you want to use the desktop UI on another machine.
+
+### Setup
+
+1. On the remote machine, start the devserver:
+   ```bash
+   cargo run -p poker-solver-devserver --release
+   ```
+   The server listens on `http://0.0.0.0:3001`.
+
+2. On your local machine, open WarpGTO and go to **Settings**.
+
+3. Enter the remote machine's URL (e.g., `http://192.168.1.50:3001`) in the **Remote Backend URL** field.
+
+4. A green dot indicates a successful connection. Leave the field empty to return to local mode.
+
+### Notes
+
+- File paths (bundle loading, cache directory) refer to the **remote machine's** filesystem. Type paths manually when in remote mode.
+- All solver commands (exploration, postflop, simulation) are routed to the remote backend. Window management stays local.
+- Simulation events (progress, completion) stream over WebSocket (`/ws/events`) in remote mode.
+- No authentication is required — the server is intended for trusted LAN use.
+
 ## Key Files
 
 | File | Purpose |
@@ -78,7 +103,8 @@ Hand simulation interface for testing strategies against each other.
 | `crates/devserver/src/main.rs` | HTTP mirror of Tauri API for browser debugging |
 | `frontend/src/Explorer.tsx` | Explorer UI component |
 | `frontend/src/Simulator.tsx` | Simulator UI component |
-| `frontend/src/invoke.ts` | Invoke wrapper (auto-detects Tauri vs fetch) |
+| `frontend/src/invoke.ts` | Invoke wrapper (routes to Tauri IPC, remote HTTP, or local devserver) |
+| `frontend/src/events.ts` | Event listener abstraction (Tauri events or WebSocket) |
 | `frontend/src/types.ts` | TypeScript type definitions |
 | `agents/*.toml` | Rule-based agent configs |
 
