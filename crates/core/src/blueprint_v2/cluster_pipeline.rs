@@ -1207,7 +1207,7 @@ pub fn combo_index(c0: Card, c1: Card) -> u16 {
 /// Each board is drawn via partial Fisher-Yates. Boards are sampled
 /// independently (duplicates possible but astronomically unlikely).
 #[allow(dead_code)]
-fn sample_n_card_boards(
+pub(crate) fn sample_n_card_boards(
     deck: &[Card],
     card_count: usize,
     count: usize,

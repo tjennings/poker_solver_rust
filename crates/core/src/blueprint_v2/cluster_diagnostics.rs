@@ -16,10 +16,12 @@ use crate::poker::Card;
 use super::bucket_file::BucketFile;
 use super::cluster_pipeline::{
     build_deck, canonical_key, compute_board_equities, enumerate_combos, sample_boards,
+    sample_n_card_boards,
 };
 use super::Street;
 
 use crate::abstraction::isomorphism::CanonicalBoard;
+use crate::showdown_equity;
 
 /// Size distribution statistics for bucket assignments.
 #[derive(Debug)]
@@ -187,53 +189,84 @@ impl EquityAuditReport {
     }
 }
 
-/// Audit a river bucket file by sampling boards and computing showdown equity.
+/// Audit a bucket file by sampling boards and computing showdown equity.
 ///
-/// For each sampled 5-card board, computes equity for all 1326 combos and
+/// For each sampled board, computes equity for all 1326 combos and
 /// groups by bucket assignment. Reports per-bucket equity distribution.
 ///
+/// Handles all streets: river (5 cards), turn (4 cards), flop (3 cards),
+/// and preflop (0 cards — samples 5-card runouts for equity).
+///
 /// # Arguments
-/// * `bf` — The bucket file to audit (should be river street).
+/// * `bf` — The bucket file to audit.
 /// * `num_sample_boards` — How many boards to sample for equity computation.
 /// * `seed` — RNG seed for board sampling.
 #[must_use]
 pub fn audit_bucket_equity(bf: &BucketFile, num_sample_boards: usize, seed: u64) -> EquityAuditReport {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
-    let boards = sample_boards(&deck, num_sample_boards, seed);
     let bucket_count = bf.header.bucket_count;
     let board_map = bf.board_index_map();
 
+    let card_count = match bf.header.street {
+        Street::River => 5,
+        Street::Turn => 4,
+        Street::Flop => 3,
+        Street::Preflop => 5, // sample full runouts for equity
+    };
+
     // Collect (equity, bucket_id) pairs across all sampled boards.
     // Canonicalize each sampled board and look up its index in the bucket file.
-    let equity_bucket_pairs: Vec<(f64, u16)> = boards
-        .par_iter()
-        .flat_map_iter(|&board| {
-            // Canonicalize the board to match the bucket file's board keys.
-            let board_idx = CanonicalBoard::from_cards(&board.to_vec())
-                .ok()
-                .map(|cb| canonical_key(&cb.cards))
-                .and_then(|key| board_map.get(&key).copied());
-
-            let equities = if board_idx.is_some() {
+    let equity_bucket_pairs: Vec<(f64, u16)> = if card_count == 5 {
+        // River (or preflop with full runout): use optimized batch equity
+        let boards = sample_boards(&deck, num_sample_boards, seed);
+        boards
+            .par_iter()
+            .flat_map_iter(|&board| {
+                let board_idx = canonicalize_and_lookup(&board, &board_map);
+                let Some(idx) = board_idx else {
+                    return Vec::new();
+                };
                 compute_board_equities(board, &combos)
-            } else {
-                return Vec::new();
-            };
-
-            let idx = board_idx.unwrap();
-            equities
-                .into_iter()
-                .enumerate()
-                .filter_map(move |(combo_idx, eq_opt)| {
-                    let eq = eq_opt?;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let bucket = bf.get_bucket(idx, combo_idx as u16);
-                    Some((eq, bucket))
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(move |(combo_idx, eq_opt)| {
+                        let eq = eq_opt?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let bucket = bf.get_bucket(idx, combo_idx as u16);
+                        Some((eq, bucket))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    } else {
+        // Turn/Flop: sample N-card boards, compute equity per combo
+        let boards = sample_n_card_boards(&deck, card_count, num_sample_boards, seed);
+        boards
+            .par_iter()
+            .flat_map_iter(|board| {
+                let board_arr: Vec<Card> = board.clone();
+                let board_idx = canonicalize_and_lookup_slice(&board_arr, &board_map);
+                let Some(idx) = board_idx else {
+                    return Vec::new();
+                };
+                combos
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(combo_idx, &combo)| {
+                        // Skip combos that share cards with the board
+                        if board_arr.iter().any(|&bc| bc == combo[0] || bc == combo[1]) {
+                            return None;
+                        }
+                        let eq = showdown_equity::compute_equity(combo, &board_arr);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let bucket = bf.get_bucket(idx, combo_idx as u16);
+                        Some((eq, bucket))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
 
     // Group equities by bucket.
     let mut bucket_equities: Vec<Vec<f64>> = vec![Vec::new(); bucket_count as usize];
@@ -300,6 +333,28 @@ pub fn audit_bucket_equity(bf: &BucketFile, num_sample_boards: usize, seed: u64)
         mean_intra_bucket_std: mean_std,
         max_intra_bucket_std: max_std,
     }
+}
+
+/// Canonicalize a 5-card board and look up its index in the board map.
+fn canonicalize_and_lookup(
+    board: &[Card; 5],
+    board_map: &rustc_hash::FxHashMap<super::bucket_file::PackedBoard, u32>,
+) -> Option<u32> {
+    CanonicalBoard::from_cards(&board.to_vec())
+        .ok()
+        .map(|cb| canonical_key(&cb.cards))
+        .and_then(|key| board_map.get(&key).copied())
+}
+
+/// Canonicalize a board of any size and look up its index in the board map.
+fn canonicalize_and_lookup_slice(
+    board: &[Card],
+    board_map: &rustc_hash::FxHashMap<super::bucket_file::PackedBoard, u32>,
+) -> Option<u32> {
+    CanonicalBoard::from_cards(board)
+        .ok()
+        .map(|cb| canonical_key(&cb.cards))
+        .and_then(|key| board_map.get(&key).copied())
 }
 
 /// Audit all bucket files in a directory.
