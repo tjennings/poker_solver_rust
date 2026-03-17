@@ -102,7 +102,6 @@ pub fn count_bucketed_records_in_files(files: &[PathBuf]) -> io::Result<(u32, u6
         let mut file = std::fs::File::open(path)?;
         let file_size = file.metadata()?.len();
         if file_size < HEADER_SIZE {
-            eprintln!("Warning: skipping empty file {}", path.display());
             continue;
         }
         let nb = read_bucketed_header(&mut file)?;
