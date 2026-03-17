@@ -422,7 +422,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // Bar 1: Overall flop completion (0 / 1755)
                 let flop_bar = mp.add(ProgressBar::new(num_flops));
                 flop_bar.set_style(
-                    ProgressStyle::with_template("  {msg:>20} {bar:40.cyan/blue} {pos}/{len}")
+                    ProgressStyle::with_template("  {msg:>20} {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] ETA {eta_precise}")
                         .unwrap()
                         .progress_chars("##-"),
                 );
