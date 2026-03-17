@@ -415,68 +415,69 @@ fn main() -> Result<(), Box<dyn Error>> {
                     seed: bp_config.clustering.seed,
                 };
 
-                let num_flops = 1755_usize; // canonical flop count
+                let num_flops = 1755_u64; // canonical flop count
 
                 let mp = MultiProgress::new();
 
-                // Bar 1: Overall flop progress (0 / 1755)
-                let flop_bar = mp.add(ProgressBar::new(num_flops as u64));
+                // Bar 1: Overall flop completion (0 / 1755)
+                let flop_bar = mp.add(ProgressBar::new(num_flops));
                 flop_bar.set_style(
-                    ProgressStyle::with_template("  {msg:>16} {bar:40.cyan/blue} {pos}/{len}")
+                    ProgressStyle::with_template("  {msg:>20} {bar:40.cyan/blue} {pos}/{len}")
                         .unwrap()
                         .progress_chars("##-"),
                 );
-                flop_bar.set_message("Flops");
+                flop_bar.set_message("Flops completed");
 
-                // Bar 2: Current flop being processed
-                let flop_name_bar = mp.add(ProgressBar::new(100));
-                flop_name_bar.set_style(
-                    ProgressStyle::with_template("  {msg:>16} {bar:40.green/black} {pos}%")
-                        .unwrap()
-                        .progress_chars("##-"),
-                );
-
-                // Bar 3: Phase progress within the current flop
-                let phase_bar = mp.add(ProgressBar::new(1000));
-                phase_bar.set_style(
-                    ProgressStyle::with_template("  {msg:>16} {bar:40.white/black} {pos}/{len}")
-                        .unwrap()
-                        .progress_chars("##-"),
-                );
-
-                let num_flops_u64 = num_flops as u64;
+                // Bars 2..N: one per active thread, showing current flop + phase
+                let thread_count = rayon::current_num_threads();
+                let thread_bars: Vec<ProgressBar> = (0..thread_count)
+                    .map(|_| {
+                        let bar = mp.add(ProgressBar::new(1000));
+                        bar.set_style(
+                            ProgressStyle::with_template("  {msg:>20} {bar:40.white/black} {pos}/{len}")
+                                .unwrap()
+                                .progress_chars("##-"),
+                        );
+                        bar.set_message("");
+                        bar
+                    })
+                    .collect();
 
                 poker_solver_core::blueprint_v2::cluster_pipeline::run_per_flop_pipeline(
                     &per_flop_config,
                     &output,
                     None,
-                    |stage, flop_label, phase, p| {
+                    |stage, msg, p| {
                         match stage {
-                            "per-flop" => {
-                                flop_name_bar.set_message(flop_label.to_string());
-                                flop_name_bar.set_position((p * 100.0) as u64);
-                                phase_bar.set_message(phase.to_string());
-                                phase_bar.set_position((p * 1000.0) as u64);
-                            }
-                            "per-flop-done" => {
-                                let done = (p * num_flops_u64 as f64) as u64;
+                            "done" => {
+                                let done = (p * num_flops as f64).round() as u64;
                                 flop_bar.set_position(done);
                             }
-                            "flop-clustering" | "preflop" => {
-                                flop_bar.set_position(num_flops_u64);
-                                flop_name_bar.set_message(stage.to_string());
-                                flop_name_bar.set_position(100);
-                                phase_bar.set_message(phase.to_string());
-                                phase_bar.set_position((p * 1000.0) as u64);
+                            "resume" => {
+                                let done = (p * num_flops as f64).round() as u64;
+                                flop_bar.set_position(done);
+                                flop_bar.set_message(format!("Resumed ({done} cached)"));
                             }
-                            _ => {}
+                            "flop-clustering" | "preflop" => {
+                                flop_bar.set_position(num_flops);
+                                flop_bar.set_message(format!("{stage}: {msg}"));
+                            }
+                            _ => {
+                                // stage = "NNNN [cards]", msg = phase
+                                let tid = rayon::current_thread_index().unwrap_or(0);
+                                if let Some(bar) = thread_bars.get(tid) {
+                                    bar.set_message(format!("{stage} {msg}"));
+                                    bar.set_position((p * 1000.0) as u64);
+                                }
+                            }
                         }
                     },
                 )?;
 
                 flop_bar.finish_with_message("done");
-                flop_name_bar.finish_and_clear();
-                phase_bar.finish_and_clear();
+                for bar in &thread_bars {
+                    bar.finish_and_clear();
+                }
                 eprintln!("Per-flop clustering complete. Files saved to {}", output.display());
             } else {
                 eprintln!("Blueprint V2 Clustering Pipeline");

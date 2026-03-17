@@ -1148,7 +1148,7 @@ pub fn run_per_flop_pipeline(
     config: &PerFlopClusteringConfig,
     output_dir: &Path,
     flop_limit: Option<usize>,
-    progress: impl Fn(&str, &str, &str, f64) + Sync,
+    progress: impl Fn(&str, &str, f64) + Sync,
 ) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(output_dir)?;
 
@@ -1160,21 +1160,31 @@ pub fn run_per_flop_pipeline(
     };
     let num_flops = flops.len();
 
-    // 2. Process each flop in parallel and save per-flop files.
+    // 2. Process each flop in parallel, skipping already-completed ones (resume).
     let per_flop_paths: Vec<PathBuf> = (0..num_flops)
         .map(|i| output_dir.join(format!("flop_{i:04}.buckets")))
         .collect();
 
-    let completed = std::sync::atomic::AtomicUsize::new(0);
+    // Count how many are already done for resume progress.
+    let already_done: usize = per_flop_paths.iter().filter(|p| p.exists()).count();
+    let completed = std::sync::atomic::AtomicUsize::new(already_done);
+    if already_done > 0 {
+        progress("resume", &format!("skipping {already_done} completed flops"), already_done as f64 / num_flops as f64);
+    }
+
     flops
         .par_iter()
         .enumerate()
         .for_each(|(i, wb)| {
+            // Skip if already computed (resume support).
+            if per_flop_paths[i].exists() {
+                return;
+            }
+
             let flop_label = format!(
-                "flop_{i:04} [{}]",
+                "{i:04} [{}]",
                 wb.cards.iter().map(|c| format!("{c}")).collect::<Vec<_>>().join("")
             );
-            progress("per-flop", &flop_label, "starting", 0.0);
             let pf = cluster_single_flop(
                 wb.cards,
                 config.turn_buckets,
@@ -1182,17 +1192,17 @@ pub fn run_per_flop_pipeline(
                 config.kmeans_iterations,
                 config.seed.wrapping_add(i as u64),
                 |phase, p| {
-                    progress("per-flop", &flop_label, phase, p);
+                    progress(&flop_label, phase, p);
                 },
             );
             pf.save(&per_flop_paths[i]).expect("failed to save per-flop bucket file");
             let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             #[allow(clippy::cast_precision_loss)]
-            progress("per-flop-done", &flop_label, "complete", done as f64 / num_flops as f64);
+            progress("done", &flop_label, done as f64 / num_flops as f64);
         });
 
     // 3. Global flop clustering: build histograms over per-flop turn buckets.
-    progress("flop-clustering", "", "building-histograms", 0.0);
+    progress("flop-clustering", "building-histograms", 0.0);
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
     let num_combos = combos.len();
@@ -1227,7 +1237,6 @@ pub fn run_per_flop_pipeline(
 
         progress(
             "flop-clustering",
-            "",
             "building-histograms",
             (flop_idx + 1) as f64 / num_flops as f64,
         );
@@ -1247,7 +1256,6 @@ pub fn run_per_flop_pipeline(
             |iter, max_iter| {
                 progress(
                     "flop-clustering",
-                    "",
                     "k-means",
                     f64::from(iter) / f64::from(max_iter),
                 );
@@ -1276,8 +1284,8 @@ pub fn run_per_flop_pipeline(
     flop_bf.save(&output_dir.join("flop.buckets"))?;
 
     // 4. Preflop: 169 lossless.
-    progress("preflop", "", "mapping", 0.0);
-    let preflop = cluster_preflop(|phase, p| progress("preflop", "", phase, p));
+    progress("preflop", "mapping", 0.0);
+    let preflop = cluster_preflop(|phase, p| progress("preflop", phase, p));
     preflop.save(&output_dir.join("preflop.buckets"))?;
 
     Ok(())
@@ -2462,7 +2470,7 @@ mod tests {
             &config,
             output_dir.path(),
             Some(3), // limit to 3 flops for speed
-            |_, _, _, _| {},
+            |_, _, _| {},
         )
         .unwrap();
         assert!(output_dir.path().join("flop_0000.buckets").exists());
@@ -2483,7 +2491,7 @@ mod tests {
             kmeans_iterations: 20,
             seed: 42,
         };
-        run_per_flop_pipeline(&config, output_dir.path(), Some(3), |_, _, _, _| {}).unwrap();
+        run_per_flop_pipeline(&config, output_dir.path(), Some(3), |_, _, _| {}).unwrap();
 
         // Load the global flop bucket file and verify it
         let flop_bf = BucketFile::load(&output_dir.path().join("flop.buckets")).unwrap();
@@ -2508,7 +2516,7 @@ mod tests {
             kmeans_iterations: 20,
             seed: 42,
         };
-        run_per_flop_pipeline(&config, output_dir.path(), Some(2), |_, _, _, _| {}).unwrap();
+        run_per_flop_pipeline(&config, output_dir.path(), Some(2), |_, _, _| {}).unwrap();
 
         let preflop = BucketFile::load(&output_dir.path().join("preflop.buckets")).unwrap();
         assert_eq!(preflop.header.street, Street::Preflop);
@@ -2532,7 +2540,7 @@ mod tests {
             seed: 42,
         };
         let stages = std::sync::Mutex::new(Vec::new());
-        run_per_flop_pipeline(&config, output_dir.path(), Some(2), |stage, _flop, phase, _p| {
+        run_per_flop_pipeline(&config, output_dir.path(), Some(2), |stage, phase, _p| {
             stages.lock().unwrap().push((stage.to_string(), phase.to_string()));
         })
         .unwrap();
@@ -2559,7 +2567,7 @@ mod tests {
             kmeans_iterations: 20,
             seed: 42,
         };
-        run_per_flop_pipeline(&config, output_dir.path(), Some(2), |_, _, _, _| {}).unwrap();
+        run_per_flop_pipeline(&config, output_dir.path(), Some(2), |_, _, _| {}).unwrap();
         // Should not have flop_0002.buckets
         assert!(!output_dir.path().join("flop_0002.buckets").exists());
     }
