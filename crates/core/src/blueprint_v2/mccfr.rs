@@ -127,6 +127,12 @@ impl AllBuckets {
         }
     }
 
+    /// Returns `true` if per-flop bucket lookups are enabled.
+    #[must_use]
+    pub fn has_per_flop_dir(&self) -> bool {
+        self.per_flop_dir.is_some()
+    }
+
     /// Enable per-flop bucket lookups for turn and river streets.
     ///
     /// Scans `dir` for `flop_NNNN.buckets` files, loads each header to

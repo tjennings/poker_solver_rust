@@ -226,6 +226,20 @@ impl BlueprintTrainer {
             None => [None, None, None, None],
         };
         let buckets = AllBuckets::new(bucket_counts, bucket_files);
+
+        // Auto-detect per-flop bucket files
+        let buckets = if let Some(ref cluster_path) = config.training.cluster_path {
+            let per_flop_marker = Path::new(cluster_path).join("flop_0000.buckets");
+            if per_flop_marker.exists() {
+                eprintln!("  Detected per-flop bucket files in {cluster_path}");
+                buckets.with_per_flop_dir(Path::new(cluster_path).to_path_buf())
+            } else {
+                buckets
+            }
+        } else {
+            buckets
+        };
+
         let rng = StdRng::seed_from_u64(config.clustering.seed);
 
         let deck = *CANONICAL_DECK;
@@ -1462,5 +1476,56 @@ mod tests {
             }
         }
         assert!(found_p1, "position 1 should have some non-zero EVs at its decision nodes");
+    }
+
+    #[test]
+    fn trainer_auto_detects_per_flop_buckets() {
+        use crate::blueprint_v2::per_flop_bucket_file::PerFlopBucketFile;
+        use crate::poker::{Card, Suit, Value};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Create a minimal per-flop bucket file (flop_0000.buckets)
+        let flop = [
+            Card::new(Value::Queen, Suit::Spade),
+            Card::new(Value::Jack, Suit::Heart),
+            Card::new(Value::Two, Suit::Diamond),
+        ];
+        let turn_card = Card::new(Value::Ace, Suit::Club);
+        let river_card = Card::new(Value::Ten, Suit::Club);
+
+        // 1 turn card x 1326 combos
+        let turn_buckets = vec![0u16; 1326];
+        // 1 turn x 1 river x 1326 combos
+        let river_buckets_per_turn = vec![vec![0u16; 1326]];
+
+        let pf = PerFlopBucketFile {
+            flop_cards: flop,
+            turn_bucket_count: 10,
+            river_bucket_count: 10,
+            turn_cards: vec![turn_card],
+            turn_buckets,
+            river_cards_per_turn: vec![vec![river_card]],
+            river_buckets_per_turn,
+        };
+        pf.save(&dir.path().join("flop_0000.buckets")).expect("save per-flop file");
+
+        let mut config = toy_config();
+        config.training.cluster_path = Some(dir.path().to_string_lossy().into_owned());
+
+        let trainer = toy_trainer(config);
+        assert!(trainer.buckets.has_per_flop_dir(), "trainer should auto-detect per-flop bucket files");
+    }
+
+    #[test]
+    fn trainer_no_per_flop_without_marker_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Empty directory — no flop_0000.buckets
+        let mut config = toy_config();
+        config.training.cluster_path = Some(dir.path().to_string_lossy().into_owned());
+
+        let trainer = toy_trainer(config);
+        assert!(!trainer.buckets.has_per_flop_dir(), "trainer should not enable per-flop without marker file");
     }
 }
