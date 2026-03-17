@@ -1,17 +1,21 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State as AxumState,
+    extract::{State as AxumState, WebSocketUpgrade, ws::Message},
     http::{HeaderValue, Method},
+    response::IntoResponse,
     routing::{get, post},
     Extension, Json, Router,
 };
-use serde::Deserialize;
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 
-use poker_solver_tauri::ExplorationState;
-use poker_solver_tauri::PostflopState;
-use poker_solver_tauri::SimulationState;
+use poker_solver_tauri::{
+    ExplorationState, PostflopState, SimEventSink, SimProgressEvent, SimResultResponse,
+    SimulationState,
+};
 
 type AppState = Arc<ExplorationState>;
 
@@ -305,6 +309,89 @@ async fn handle_get_simulation_result(
 }
 
 // ---------------------------------------------------------------------------
+// WebSocket event streaming
+// ---------------------------------------------------------------------------
+
+/// JSON-serializable event sent over the WebSocket.
+#[derive(Clone, Serialize)]
+struct WsEvent {
+    event: String,
+    payload: serde_json::Value,
+}
+
+/// `SimEventSink` backed by a `tokio::sync::broadcast` channel.
+///
+/// Allows `start_simulation_core` to emit events that are forwarded
+/// to all connected WebSocket clients.
+struct BroadcastEventSink {
+    tx: broadcast::Sender<WsEvent>,
+}
+
+impl SimEventSink for BroadcastEventSink {
+    fn emit_progress(&self, event: SimProgressEvent) {
+        let _ = self.tx.send(WsEvent {
+            event: "simulation-progress".to_string(),
+            payload: serde_json::to_value(event).expect("SimProgressEvent serializes"),
+        });
+    }
+
+    fn emit_complete(&self, event: SimResultResponse) {
+        let _ = self.tx.send(WsEvent {
+            event: "simulation-complete".to_string(),
+            payload: serde_json::to_value(event).expect("SimResultResponse serializes"),
+        });
+    }
+
+    fn emit_error(&self, msg: String) {
+        let _ = self.tx.send(WsEvent {
+            event: "simulation-error".to_string(),
+            payload: serde_json::to_value(msg).expect("String serializes"),
+        });
+    }
+}
+
+#[derive(Deserialize)]
+struct StartSimulationParams {
+    p1_path: String,
+    p2_path: String,
+    num_hands: u64,
+    stack_depth: u32,
+}
+
+async fn handle_start_simulation(
+    Extension(state): Extension<Arc<SimulationState>>,
+    Extension(tx): Extension<broadcast::Sender<WsEvent>>,
+    Json(params): Json<StartSimulationParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let sink = BroadcastEventSink { tx };
+    result_to_response(poker_solver_tauri::start_simulation_core(
+        sink,
+        &state,
+        params.p1_path,
+        params.p2_path,
+        params.num_hands,
+        params.stack_depth,
+    ))
+}
+
+async fn handle_ws_events(
+    Extension(tx): Extension<broadcast::Sender<WsEvent>>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        let mut rx = tx.subscribe();
+        let (mut sender, _receiver) = socket.split();
+
+        while let Ok(event) = rx.recv().await {
+            let json = serde_json::to_string(&event).expect("WsEvent serializes");
+            if sender.send(Message::Text(json.into())).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Handlers — postflop
 // ---------------------------------------------------------------------------
 
@@ -423,6 +510,7 @@ async fn main() {
     let state: AppState = Arc::new(ExplorationState::default());
     let postflop_state: Arc<PostflopState> = Arc::new(PostflopState::default());
     let simulation_state: Arc<SimulationState> = Arc::new(SimulationState::default());
+    let (ws_tx, _) = broadcast::channel::<WsEvent>(64);
 
     let cors = CorsLayer::new()
         .allow_origin("*".parse::<HeaderValue>().expect("valid header value"))
@@ -463,11 +551,13 @@ async fn main() {
             "/api/list_strategy_sources",
             post(handle_list_strategy_sources),
         )
+        .route("/api/start_simulation", post(handle_start_simulation))
         .route("/api/stop_simulation", post(handle_stop_simulation))
         .route(
             "/api/get_simulation_result",
             post(handle_get_simulation_result),
         )
+        .route("/ws/events", get(handle_ws_events))
         // Postflop explorer endpoints
         .route(
             "/api/postflop_set_config",
@@ -513,6 +603,7 @@ async fn main() {
             "/api/postflop_load_cached",
             post(handle_postflop_load_cached),
         )
+        .layer(Extension(ws_tx))
         .layer(Extension(simulation_state))
         .layer(Extension(postflop_state))
         .layer(cors)
