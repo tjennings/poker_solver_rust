@@ -8,7 +8,7 @@ tags:
     - gpu
     - bucket
 created_at: 2026-03-16T17:47:25Z
-updated_at: 2026-03-17T02:20:04Z
+updated_at: 2026-03-17T02:43:21Z
 parent: poker_solver_rust-618h
 ---
 
@@ -26,9 +26,9 @@ Completed:
 - [x] A8: BatchBucketedSolver + datagen pipeline
 - [x] A9: eval command + CLI
 - [x] River CFV net training (Supremus-exact: dual-player output, zero-sum)
+- [x] compare-bucketed: evaluate trained model vs exact solver (MAE, dominant action agreement)
 
 In progress:
-- [ ] compare-bucketed: evaluate trained model vs exact solver (MAE, dominant action agreement)
 - [ ] Fix bucketed solver correctness (0% check, heavy all-in — payoff/equity scale mismatch)
 - [ ] Validation: MAE < 0.05, >90% dominant action agreement vs CPU
 
