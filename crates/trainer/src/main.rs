@@ -430,18 +430,21 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 // Bars 2..N: one per active thread, showing current flop + phase
                 let thread_count = rayon::current_num_threads();
+                let bar_style = ProgressStyle::with_template("  {msg:>30} {bar:30.white/black} {pos}/{len} ETA {eta}")
+                    .unwrap()
+                    .progress_chars("##-");
+                let spinner_style = ProgressStyle::with_template("  {msg:>30} {spinner:.cyan} {elapsed_precise}")
+                    .unwrap();
                 let thread_bars: Vec<ProgressBar> = (0..thread_count)
                     .map(|_| {
                         let bar = mp.add(ProgressBar::new(100));
-                        bar.set_style(
-                            ProgressStyle::with_template("  {msg:>30} {bar:30.white/black} {pos}/{len} ETA {eta}")
-                                .unwrap()
-                                .progress_chars("##-"),
-                        );
+                        bar.set_style(bar_style.clone());
                         bar.set_message("");
                         bar
                     })
                     .collect();
+                let bar_style_clone = bar_style.clone();
+                let spinner_style_clone = spinner_style.clone();
 
                 poker_solver_core::blueprint_v2::cluster_pipeline::run_per_flop_pipeline(
                     &per_flop_config,
@@ -468,7 +471,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 flop_bar.set_message(format!("{stage}: {msg}"));
                             }
                             _ => {
-                                // stage = "NNNN [cards]", msg = "river 5/48" etc
+                                // stage = "NNNN [cards]", msg = "river 5/48" or "turn-kmeans 0/1" etc
                                 let tid = rayon::current_thread_index().unwrap_or(0);
                                 if let Some(bar) = thread_bars.get(tid) {
                                     // Parse "phase pos/total" from msg
@@ -476,12 +479,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         if let Some((pos_s, total_s)) = counts.split_once('/') {
                                             if let (Ok(pos), Ok(total)) = (pos_s.parse::<u64>(), total_s.parse::<u64>()) {
                                                 let new_msg = format!("{stage} {phase}");
-                                                if bar.message() != new_msg {
-                                                    bar.reset_eta();
+                                                if total <= 1 {
+                                                    // No meaningful progress — show spinner
+                                                    bar.set_style(spinner_style_clone.clone());
                                                     bar.set_message(new_msg);
-                                                    bar.set_length(total);
+                                                    bar.enable_steady_tick(std::time::Duration::from_millis(100));
+                                                } else {
+                                                    // Real progress bar
+                                                    if bar.message() != new_msg {
+                                                        bar.disable_steady_tick();
+                                                        bar.set_style(bar_style_clone.clone());
+                                                        bar.reset_eta();
+                                                        bar.set_message(new_msg);
+                                                        bar.set_length(total);
+                                                    }
+                                                    bar.set_position(pos);
                                                 }
-                                                bar.set_position(pos);
                                                 return;
                                             }
                                         }
