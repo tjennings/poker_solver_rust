@@ -67,14 +67,14 @@ impl PackedBoard {
 }
 
 /// Encode a single card as an 8-bit value: `(value_rank << 2) | suit_index`.
-fn encode_card(card: Card) -> u8 {
+pub(crate) fn encode_card(card: Card) -> u8 {
     let value_rank = crate::card_utils::value_rank(card.value);
     let suit_idx = card.suit as u8;
     (value_rank << 2) | suit_idx
 }
 
 /// Decode an 8-bit packed card back into `Card`.
-fn decode_card(byte: u8) -> Card {
+pub(crate) fn decode_card(byte: u8) -> Card {
     let rank = byte >> 2;
     let suit_idx = byte & 0x03;
     // value_rank maps Two→2 … Ace→14, so discriminant = rank - 2.
