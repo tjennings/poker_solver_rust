@@ -24,7 +24,7 @@
 //! index.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHashMap;
 
@@ -1111,6 +1111,168 @@ pub fn cluster_single_flop(
         river_cards_per_turn,
         river_buckets_per_turn,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-flop pipeline orchestrator
+// ---------------------------------------------------------------------------
+
+/// Configuration for the per-flop clustering pipeline.
+pub struct PerFlopClusteringConfig {
+    /// Number of global flop buckets (across all canonical flops).
+    pub flop_buckets: u16,
+    /// Number of turn buckets per flop.
+    pub turn_buckets: u16,
+    /// Number of river buckets per flop.
+    pub river_buckets: u16,
+    /// Number of k-means iterations.
+    pub kmeans_iterations: u32,
+    /// Random seed for reproducibility.
+    pub seed: u64,
+}
+
+/// Run the full per-flop clustering pipeline.
+///
+/// 1. Enumerate all 1,755 canonical flops (or a subset via `flop_limit`).
+/// 2. Process each flop in parallel via `cluster_single_flop`.
+/// 3. Save per-flop bucket files as `flop_NNNN.buckets`.
+/// 4. Build global flop buckets by clustering combo histograms over per-flop
+///    turn buckets with EMD k-means.
+/// 5. Save preflop (169 lossless) bucket file.
+///
+/// # Errors
+///
+/// Returns an error if any file I/O fails.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+pub fn run_per_flop_pipeline(
+    config: &PerFlopClusteringConfig,
+    output_dir: &Path,
+    flop_limit: Option<usize>,
+    progress: impl Fn(&str, &str, f64) + Sync,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(output_dir)?;
+
+    // 1. Enumerate canonical flops.
+    let all_flops = enumerate_canonical_flops();
+    let flops: Vec<_> = match flop_limit {
+        Some(limit) => all_flops.into_iter().take(limit).collect(),
+        None => all_flops,
+    };
+    let num_flops = flops.len();
+
+    // 2. Process each flop in parallel and save per-flop files.
+    let per_flop_paths: Vec<PathBuf> = (0..num_flops)
+        .map(|i| output_dir.join(format!("flop_{i:04}.buckets")))
+        .collect();
+
+    let completed = std::sync::atomic::AtomicUsize::new(0);
+    flops
+        .par_iter()
+        .enumerate()
+        .for_each(|(i, wb)| {
+            let pf = cluster_single_flop(
+                wb.cards,
+                config.turn_buckets,
+                config.river_buckets,
+                config.kmeans_iterations,
+                config.seed.wrapping_add(i as u64),
+                |phase, p| {
+                    progress("per-flop", phase, p);
+                },
+            );
+            pf.save(&per_flop_paths[i]).expect("failed to save per-flop bucket file");
+            let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            progress("per-flop", "complete", done as f64 / num_flops as f64);
+        });
+
+    // 3. Global flop clustering: build histograms over per-flop turn buckets.
+    progress("flop-clustering", "building-histograms", 0.0);
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let num_combos = combos.len();
+    let hist_dim = config.turn_buckets as usize;
+
+    let mut all_features: Vec<Vec<u8>> = Vec::new();
+    let mut all_weights: Vec<f64> = Vec::new();
+    let mut feature_positions: Vec<(usize, usize)> = Vec::new(); // (flop_idx, combo_idx)
+
+    for (flop_idx, wb) in flops.iter().enumerate() {
+        let pf = PerFlopBucketFile::load(&per_flop_paths[flop_idx])?;
+        let num_turns = pf.turn_cards.len();
+        let weight = f64::from(wb.weight);
+
+        for ci in 0..num_combos {
+            if cards_overlap(combos[ci], &wb.cards) {
+                continue;
+            }
+            // Build histogram: for each turn card, get this combo's turn bucket.
+            let mut hist = vec![0u16; hist_dim];
+            for ti in 0..num_turns {
+                let bucket = pf.get_turn_bucket(ti, ci) as usize;
+                if bucket < hist_dim {
+                    hist[bucket] += 1;
+                }
+            }
+            let hist_u8: Vec<u8> = hist.iter().map(|&c| c.min(255) as u8).collect();
+            all_features.push(hist_u8);
+            all_weights.push(weight);
+            feature_positions.push((flop_idx, ci));
+        }
+
+        progress(
+            "flop-clustering",
+            "building-histograms",
+            (flop_idx + 1) as f64 / num_flops as f64,
+        );
+    }
+
+    // Run EMD k-means on flop histograms.
+    let flop_k = (config.flop_buckets as usize).min(all_features.len());
+    let (flop_labels, _) = if all_features.is_empty() {
+        (vec![], vec![])
+    } else {
+        kmeans_emd_weighted_u8(
+            &all_features,
+            &all_weights,
+            flop_k,
+            config.kmeans_iterations,
+            config.seed,
+            |iter, max_iter| {
+                progress(
+                    "flop-clustering",
+                    "k-means",
+                    f64::from(iter) / f64::from(max_iter),
+                );
+            },
+        )
+    };
+
+    // Build flop BucketFile.
+    let total = num_flops * TOTAL_COMBOS as usize;
+    let mut flop_buckets = vec![0u16; total];
+    for (flat_i, &(flop_idx, combo_idx)) in feature_positions.iter().enumerate() {
+        flop_buckets[flop_idx * TOTAL_COMBOS as usize + combo_idx] = flop_labels[flat_i];
+    }
+
+    let flop_bf = BucketFile {
+        header: BucketFileHeader {
+            street: Street::Flop,
+            bucket_count: config.flop_buckets,
+            board_count: num_flops as u32,
+            combos_per_board: TOTAL_COMBOS,
+            version: VERSION,
+        },
+        boards: flops.iter().map(|wb| canonical_key(&wb.cards)).collect(),
+        buckets: flop_buckets,
+    };
+    flop_bf.save(&output_dir.join("flop.buckets"))?;
+
+    // 4. Preflop: 169 lossless.
+    progress("preflop", "mapping", 0.0);
+    let preflop = cluster_preflop(|phase, p| progress("preflop", phase, p));
+    preflop.save(&output_dir.join("preflop.buckets"))?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2271,6 +2433,127 @@ mod tests {
         assert_eq!(hist.len(), 5);
         let total: u32 = hist.iter().map(|&c| u32::from(c)).sum();
         assert_eq!(total, 0, "no boards match, histogram should be all zeros");
+    }
+
+    // -----------------------------------------------------------------------
+    // run_per_flop_pipeline tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore] // slow: processes multiple flops
+    fn test_per_flop_pipeline_small() {
+        let output_dir = tempfile::TempDir::new().unwrap();
+        let config = PerFlopClusteringConfig {
+            flop_buckets: 3,
+            turn_buckets: 5,
+            river_buckets: 5,
+            kmeans_iterations: 20,
+            seed: 42,
+        };
+        run_per_flop_pipeline(
+            &config,
+            output_dir.path(),
+            Some(3), // limit to 3 flops for speed
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert!(output_dir.path().join("flop_0000.buckets").exists());
+        assert!(output_dir.path().join("flop_0001.buckets").exists());
+        assert!(output_dir.path().join("flop_0002.buckets").exists());
+        assert!(output_dir.path().join("flop.buckets").exists());
+        assert!(output_dir.path().join("preflop.buckets").exists());
+    }
+
+    #[test]
+    #[ignore]
+    fn test_per_flop_pipeline_flop_buckets_valid() {
+        let output_dir = tempfile::TempDir::new().unwrap();
+        let config = PerFlopClusteringConfig {
+            flop_buckets: 3,
+            turn_buckets: 5,
+            river_buckets: 5,
+            kmeans_iterations: 20,
+            seed: 42,
+        };
+        run_per_flop_pipeline(&config, output_dir.path(), Some(3), |_, _, _| {}).unwrap();
+
+        // Load the global flop bucket file and verify it
+        let flop_bf = BucketFile::load(&output_dir.path().join("flop.buckets")).unwrap();
+        assert_eq!(flop_bf.header.street, Street::Flop);
+        assert_eq!(flop_bf.header.bucket_count, 3);
+        assert_eq!(flop_bf.header.board_count, 3);
+        assert_eq!(flop_bf.header.combos_per_board, TOTAL_COMBOS);
+        // All bucket values should be in range
+        for &b in &flop_bf.buckets {
+            assert!(b < 3, "flop bucket {} out of range", b);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_per_flop_pipeline_preflop_is_169_lossless() {
+        let output_dir = tempfile::TempDir::new().unwrap();
+        let config = PerFlopClusteringConfig {
+            flop_buckets: 3,
+            turn_buckets: 5,
+            river_buckets: 5,
+            kmeans_iterations: 20,
+            seed: 42,
+        };
+        run_per_flop_pipeline(&config, output_dir.path(), Some(2), |_, _, _| {}).unwrap();
+
+        let preflop = BucketFile::load(&output_dir.path().join("preflop.buckets")).unwrap();
+        assert_eq!(preflop.header.street, Street::Preflop);
+        assert_eq!(preflop.header.bucket_count, 169);
+        assert_eq!(preflop.header.board_count, 1);
+        assert_eq!(preflop.buckets.len(), TOTAL_COMBOS as usize);
+        for &b in &preflop.buckets {
+            assert!(b < 169, "preflop bucket {} out of range", b);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_per_flop_pipeline_progress_reports() {
+        let output_dir = tempfile::TempDir::new().unwrap();
+        let config = PerFlopClusteringConfig {
+            flop_buckets: 3,
+            turn_buckets: 5,
+            river_buckets: 5,
+            kmeans_iterations: 20,
+            seed: 42,
+        };
+        let stages = std::sync::Mutex::new(Vec::new());
+        run_per_flop_pipeline(&config, output_dir.path(), Some(2), |stage, phase, _p| {
+            stages.lock().unwrap().push((stage.to_string(), phase.to_string()));
+        })
+        .unwrap();
+        let stages = stages.into_inner().unwrap();
+        // Should have reported per-flop and flop-clustering stages
+        assert!(
+            stages.iter().any(|(s, _)| s == "per-flop"),
+            "expected per-flop progress"
+        );
+        assert!(
+            stages.iter().any(|(s, _)| s == "flop-clustering"),
+            "expected flop-clustering progress"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_per_flop_pipeline_no_extra_flop_files() {
+        let output_dir = tempfile::TempDir::new().unwrap();
+        let config = PerFlopClusteringConfig {
+            flop_buckets: 3,
+            turn_buckets: 5,
+            river_buckets: 5,
+            kmeans_iterations: 20,
+            seed: 42,
+        };
+        run_per_flop_pipeline(&config, output_dir.path(), Some(2), |_, _, _| {}).unwrap();
+        // Should not have flop_0002.buckets
+        assert!(!output_dir.path().join("flop_0002.buckets").exists());
     }
 
 
