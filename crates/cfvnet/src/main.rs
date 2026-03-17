@@ -103,6 +103,30 @@ enum Commands {
         #[arg(short, long)]
         data: PathBuf,
     },
+    /// Compare bucketed model predictions against exact solver
+    CompareBucketed {
+        /// Path to saved bucketed model directory
+        #[arg(short, long)]
+        model: PathBuf,
+        /// Path to bucket file (e.g., local_data/clusters_500bkt_v3/river.buckets)
+        #[arg(long)]
+        buckets: PathBuf,
+        /// Number of hidden layers (must match trained model)
+        #[arg(long, default_value = "7")]
+        hidden_layers: usize,
+        /// Hidden layer width (must match trained model)
+        #[arg(long, default_value = "500")]
+        hidden_size: usize,
+        /// Number of random spots to compare
+        #[arg(long, default_value = "100")]
+        num_spots: usize,
+        /// Thread count for parallel solves
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Path to YAML config file (for game/datagen settings)
+        #[arg(short, long)]
+        config: PathBuf,
+    },
     /// Generate bucketed training data (solve exact, map to bucket space)
     GenerateBucketed {
         /// Path to the YAML configuration file.
@@ -264,6 +288,9 @@ fn main() {
             num_spots,
         } => cmd_compare_exact(model, num_spots),
         Commands::DatagenEval { data } => cmd_datagen_eval(data),
+        Commands::CompareBucketed {
+            model, buckets, hidden_layers, hidden_size, num_spots, threads, config,
+        } => cmd_compare_bucketed(model, buckets, hidden_layers, hidden_size, num_spots, threads, config),
         Commands::GenerateBucketed { config, output, buckets, num_samples, per_file, threads } => {
             ensure_parent_dir(&output);
             cmd_generate_bucketed(config, output, buckets, num_samples, per_file, threads);
@@ -1387,5 +1414,81 @@ fn cmd_train_bucketed(
             std::process::exit(1);
         }
     }
+}
+
+fn cmd_compare_bucketed(
+    model_dir: PathBuf,
+    buckets_path: PathBuf,
+    hidden_layers: usize,
+    hidden_size: usize,
+    num_spots: usize,
+    threads: Option<usize>,
+    config_path: PathBuf,
+) {
+    use burn::backend::NdArray;
+    use burn::module::Module;
+    use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
+    use burn::tensor::{Tensor, TensorData};
+    use cfvnet::eval::compare_bucketed::run_bucketed_comparison;
+    use cfvnet::model::bucketed_network::BucketedCfvNet;
+    use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
+
+    let yaml = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        eprintln!("failed to read config: {e}");
+        std::process::exit(1);
+    });
+    let cfg: cfvnet::config::CfvnetConfig = serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
+        eprintln!("failed to parse config: {e}");
+        std::process::exit(1);
+    });
+
+    let bucket_file = BucketFile::load(&buckets_path).unwrap_or_else(|e| {
+        eprintln!("failed to load bucket file: {e}");
+        std::process::exit(1);
+    });
+    let num_buckets = bucket_file.header.bucket_count as usize;
+
+    type B = NdArray;
+    let device = Default::default();
+    let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+    let model_path = resolve_model_path(&model_dir);
+
+    let model = BucketedCfvNet::<B>::new(&device, hidden_layers, hidden_size, num_buckets)
+        .load_file(&model_path, &recorder, &device)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to load model from {}: {e}", model_path.display());
+            std::process::exit(1);
+        });
+
+    if let Some(t) = threads {
+        rayon::ThreadPoolBuilder::new().num_threads(t).build_global().ok();
+    }
+
+    let input_size = 2 * num_buckets + 1;
+    println!("Comparing {num_spots} spots against exact solver...");
+    println!("  Model: {} ({}x{}, {} buckets)", model_dir.display(), hidden_layers, hidden_size, num_buckets);
+
+    let summary = run_bucketed_comparison(
+        &cfg.game,
+        &cfg.datagen,
+        num_spots,
+        cfvnet::config::resolve_seed(cfg.datagen.seed),
+        &bucket_file,
+        num_buckets,
+        |bucketed_input| {
+            let input = Tensor::<B, 2>::from_data(
+                TensorData::new(bucketed_input.to_vec(), [1, input_size]),
+                &device,
+            );
+            let pred = model.forward(input);
+            pred.into_data().to_vec::<f32>().unwrap()
+        },
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("comparison failed: {e}");
+        std::process::exit(1);
+    });
+
+    print_summary(&summary);
 }
 
