@@ -4,6 +4,7 @@ mod blueprint_tui_metrics;
 mod blueprint_tui_scenarios;
 mod blueprint_tui_widgets;
 mod log_file;
+mod validate_blueprint;
 mod validation_spots;
 
 use std::error::Error;
@@ -808,14 +809,52 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             eprintln!();
 
+            let mut results = Vec::new();
+
             for spot in &spots_file.spots {
-                eprintln!("  [{}]", spot.name);
-                eprintln!("    Board: {}", spot.board.join(" "));
-                eprintln!("    OOP range: {}", spot.oop_range);
-                eprintln!("    IP range: {}", spot.ip_range);
-                eprintln!("    Pot: {:.0} BB, Stack: {:.0} BB", spot.pot, spot.effective_stack);
-                eprintln!("    TODO: solve with range-solver and compare");
+                eprintln!("  Solving [{}]...", spot.name);
+                let vspot = validate_blueprint::ValidationSpot {
+                    name: spot.name.clone(),
+                    board: spot.board.clone(),
+                    oop_range: spot.oop_range.clone(),
+                    ip_range: spot.ip_range.clone(),
+                    pot: spot.pot,
+                    effective_stack: spot.effective_stack,
+                };
+
+                match validate_blueprint::solve_spot(&vspot) {
+                    Ok(result) => {
+                        eprintln!(
+                            "    {} hands, {} actions, exploitability={:.4}",
+                            result.num_hands, result.num_actions, result.exploitability,
+                        );
+                        // Print average action frequencies
+                        for (ai, action_name) in result.actions_display.iter().enumerate() {
+                            let avg_freq: f32 = (0..result.num_hands)
+                                .map(|h| result.strategy[ai * result.num_hands + h])
+                                .sum::<f32>() / result.num_hands as f32;
+                            eprintln!("      {action_name}: {:.1}%", avg_freq * 100.0);
+                        }
+                        results.push((spot.name.clone(), result));
+                    }
+                    Err(e) => {
+                        eprintln!("    ERROR: {e}");
+                    }
+                }
                 eprintln!();
+            }
+
+            // Summary table
+            if !results.is_empty() {
+                println!();
+                println!("{:<40} {:>6} {:>6} {:>12}", "Spot", "Hands", "Acts", "Exploit");
+                println!("{}", "-".repeat(66));
+                for (name, r) in &results {
+                    println!(
+                        "{:<40} {:>6} {:>6} {:>12.4}",
+                        name, r.num_hands, r.num_actions, r.exploitability,
+                    );
+                }
             }
         }
     }
