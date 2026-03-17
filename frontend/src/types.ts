@@ -238,6 +238,7 @@ export interface GlobalConfig {
   stub_range_solver?: boolean;
   flop_combo_threshold: number;
   turn_combo_threshold: number;
+  backend_url: string;
 }
 
 export interface BlueprintListEntry {

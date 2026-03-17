@@ -2,7 +2,7 @@ import { useState, useCallback } from 'react';
 import type { GlobalConfig } from './types';
 
 const STORAGE_KEY = 'global_config';
-const DEFAULT_CONFIG: GlobalConfig = { blueprint_dir: '', target_exploitability: 3.0, flop_combo_threshold: 200, turn_combo_threshold: 300 };
+const DEFAULT_CONFIG: GlobalConfig = { blueprint_dir: '', target_exploitability: 3.0, flop_combo_threshold: 200, turn_combo_threshold: 300, backend_url: '' };
 
 function loadConfig(): GlobalConfig {
   try {
