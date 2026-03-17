@@ -434,7 +434,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .map(|_| {
                         let bar = mp.add(ProgressBar::new(100));
                         bar.set_style(
-                            ProgressStyle::with_template("  {msg:>30} {bar:30.white/black} {pos}/{len}")
+                            ProgressStyle::with_template("  {msg:>30} {bar:30.white/black} {pos}/{len} ETA {eta}")
                                 .unwrap()
                                 .progress_chars("##-"),
                         );
@@ -475,8 +475,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     if let Some((phase, counts)) = msg.rsplit_once(' ') {
                                         if let Some((pos_s, total_s)) = counts.split_once('/') {
                                             if let (Ok(pos), Ok(total)) = (pos_s.parse::<u64>(), total_s.parse::<u64>()) {
-                                                bar.set_message(format!("{stage} {phase}"));
-                                                bar.set_length(total);
+                                                let new_msg = format!("{stage} {phase}");
+                                                if bar.message() != new_msg {
+                                                    bar.reset_eta();
+                                                    bar.set_message(new_msg);
+                                                    bar.set_length(total);
+                                                }
                                                 bar.set_position(pos);
                                                 return;
                                             }
