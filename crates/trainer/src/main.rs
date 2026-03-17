@@ -66,6 +66,12 @@ enum Commands {
         /// Audit river bucket equity using cfvnet training data (path to cfvnet dir)
         #[arg(long)]
         cfvnet_audit: Option<PathBuf>,
+        /// Audit transition consistency (do combos in same bucket go to similar next-street buckets?)
+        #[arg(long)]
+        transition_audit: bool,
+        /// Number of boards to sample for transition audit (default 20)
+        #[arg(long, default_value = "20")]
+        transition_audit_boards: usize,
     },
     /// Pre-compute the equity+delta lookup cache for fast expected-delta bucketing.
     /// Generates turn table first (averaging over river cards), then flop table
@@ -446,6 +452,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             centroid_emd,
             sample_bucket,
             cfvnet_audit,
+            transition_audit,
+            transition_audit_boards,
         } => {
             use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
             use poker_solver_core::blueprint_v2::cluster_diagnostics::{
@@ -498,6 +506,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let to_bf = BucketFile::load(&to_path)?;
                         let matrix = cross_street_transition_matrix(&from_bf, &to_bf);
                         eprintln!("\n{}", matrix.summary());
+                    }
+                }
+            }
+            if transition_audit {
+                use poker_solver_core::blueprint_v2::cluster_diagnostics::audit_transition_consistency;
+                let pairs = [("flop", "turn"), ("turn", "river")];
+                for (from_name, to_name) in &pairs {
+                    let from_path = cluster_dir.join(format!("{from_name}.buckets"));
+                    let to_path = cluster_dir.join(format!("{to_name}.buckets"));
+                    if from_path.exists() && to_path.exists() {
+                        eprintln!("\nTransition consistency audit: {from_name} → {to_name} ({transition_audit_boards} sample boards)...");
+                        let from_bf = BucketFile::load(&from_path)?;
+                        let to_bf = BucketFile::load(&to_path)?;
+                        let report = audit_transition_consistency(
+                            &from_bf, &to_bf, transition_audit_boards, 42,
+                        );
+                        eprintln!("{}", report.summary());
                     }
                 }
             }

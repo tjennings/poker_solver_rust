@@ -357,9 +357,259 @@ fn canonicalize_and_lookup_slice(
         .and_then(|key| board_map.get(&key).copied())
 }
 
+/// Per-bucket transition consistency statistics.
+#[derive(Debug)]
+pub struct BucketTransitionStats {
+    pub bucket_id: u16,
+    /// Number of combos observed in this bucket.
+    pub count: usize,
+    /// Mean EMD from each combo's turn-bucket histogram to the bucket centroid.
+    pub mean_emd_to_centroid: f64,
+    /// Max EMD from any combo to the centroid.
+    pub max_emd_to_centroid: f64,
+    /// Number of distinct turn buckets that combos in this bucket transition to.
+    pub distinct_turn_buckets: usize,
+    /// Entropy of the aggregated turn-bucket distribution (bits).
+    pub transition_entropy: f64,
+}
+
+/// Report on transition consistency for a street's clustering.
+#[derive(Debug)]
+pub struct TransitionConsistencyReport {
+    pub from_street: String,
+    pub to_street: String,
+    pub bucket_count: u16,
+    pub sample_boards: usize,
+    pub buckets: Vec<BucketTransitionStats>,
+    pub mean_emd: f64,
+    pub max_emd: f64,
+}
+
+impl TransitionConsistencyReport {
+    /// Format the report as a human-readable string.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        use std::fmt::Write;
+        let non_empty: Vec<_> = self.buckets.iter().filter(|b| b.count > 0).collect();
+        let mut s = format!(
+            "{} → {}: {} buckets, {} sample boards\n  Mean EMD to centroid: {:.4}, max: {:.4}\n  Per-bucket (sorted by mean EMD):",
+            self.from_street, self.to_street, non_empty.len(), self.sample_boards,
+            self.mean_emd, self.max_emd,
+        );
+        let mut sorted: Vec<_> = non_empty.iter().collect();
+        sorted.sort_by(|a, b| {
+            a.mean_emd_to_centroid
+                .partial_cmp(&b.mean_emd_to_centroid)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for b in &sorted {
+            let _ = write!(
+                s,
+                "\n    bucket {:>3}: n={:<6} emd={:.4}  max_emd={:.4}  distinct={:<4} entropy={:.2}",
+                b.bucket_id, b.count, b.mean_emd_to_centroid, b.max_emd_to_centroid,
+                b.distinct_turn_buckets, b.transition_entropy,
+            );
+        }
+        s
+    }
+}
+
+/// Audit transition consistency: do combos in the same bucket produce similar
+/// next-street bucket distributions?
+///
+/// For each sampled board, deals all possible next-street cards, looks up the
+/// next-street bucket for each combo, and builds a per-combo histogram. Then
+/// measures how similar the histograms are within each bucket using EMD to
+/// the bucket's centroid histogram.
+///
+/// Works for flop→turn and turn→river transitions.
+#[must_use]
+pub fn audit_transition_consistency(
+    current_bf: &BucketFile,
+    next_bf: &BucketFile,
+    num_sample_boards: usize,
+    seed: u64,
+) -> TransitionConsistencyReport {
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let current_map = current_bf.board_index_map();
+    let next_map = next_bf.board_index_map();
+    let current_k = current_bf.header.bucket_count as usize;
+    let next_k = next_bf.header.bucket_count as usize;
+
+    let card_count = match current_bf.header.street {
+        Street::Flop => 3,
+        Street::Turn => 4,
+        _ => panic!("transition consistency audit requires flop or turn"),
+    };
+
+    let boards = sample_n_card_boards(&deck, card_count, num_sample_boards, seed);
+
+    // For each bucket, collect per-combo histograms (normalized).
+    // Each histogram is a Vec<f64> of length next_k.
+    let mut bucket_histograms: Vec<Vec<Vec<f64>>> = vec![Vec::new(); current_k];
+
+    for board in &boards {
+        // Look up this board in the current bucket file
+        let Some(current_board_idx) = canonicalize_and_lookup_slice(board, &current_map) else {
+            continue;
+        };
+
+        // Find remaining cards (not on the board)
+        let remaining: Vec<Card> = deck
+            .iter()
+            .filter(|c| !board.contains(c))
+            .copied()
+            .collect();
+
+        // For each combo, build histogram over next-street buckets
+        for (combo_idx, combo) in combos.iter().enumerate() {
+            // Skip combos blocked by the board
+            if board.iter().any(|&bc| bc == combo[0] || bc == combo[1]) {
+                continue;
+            }
+
+            #[allow(clippy::cast_possible_truncation)]
+            let current_bucket = current_bf.get_bucket(current_board_idx, combo_idx as u16) as usize;
+            if current_bucket >= current_k {
+                continue;
+            }
+
+            // Deal each possible next card and look up the next-street bucket
+            let mut histogram = vec![0_u32; next_k];
+            let mut total = 0_u32;
+
+            for &next_card in &remaining {
+                // Skip if next card overlaps with combo
+                if next_card == combo[0] || next_card == combo[1] {
+                    continue;
+                }
+
+                let mut next_board: Vec<Card> = board.clone();
+                next_board.push(next_card);
+
+                if let Some(next_board_idx) = canonicalize_and_lookup_slice(&next_board, &next_map) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let next_bucket = next_bf.get_bucket(next_board_idx, combo_idx as u16) as usize;
+                    if next_bucket < next_k {
+                        histogram[next_bucket] += 1;
+                        total += 1;
+                    }
+                }
+            }
+
+            if total == 0 {
+                continue;
+            }
+
+            // Normalize to probability distribution
+            #[allow(clippy::cast_precision_loss)]
+            let norm_hist: Vec<f64> = histogram.iter().map(|&c| c as f64 / total as f64).collect();
+            bucket_histograms[current_bucket].push(norm_hist);
+        }
+    }
+
+    // Compute per-bucket statistics
+    let bucket_stats: Vec<BucketTransitionStats> = bucket_histograms
+        .iter()
+        .enumerate()
+        .map(|(id, hists)| {
+            if hists.is_empty() {
+                #[allow(clippy::cast_possible_truncation)]
+                return BucketTransitionStats {
+                    bucket_id: id as u16,
+                    count: 0,
+                    mean_emd_to_centroid: 0.0,
+                    max_emd_to_centroid: 0.0,
+                    distinct_turn_buckets: 0,
+                    transition_entropy: 0.0,
+                };
+            }
+
+            // Compute centroid (mean histogram)
+            let dim = next_k;
+            let mut centroid = vec![0.0_f64; dim];
+            for h in hists {
+                for (j, &v) in h.iter().enumerate() {
+                    centroid[j] += v;
+                }
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let inv = 1.0 / hists.len() as f64;
+            for v in &mut centroid {
+                *v *= inv;
+            }
+
+            // EMD from each histogram to centroid
+            let emds: Vec<f64> = hists
+                .iter()
+                .map(|h| emd_1d(h, &centroid))
+                .collect();
+            let mean_emd = emds.iter().sum::<f64>() / emds.len() as f64;
+            let max_emd = emds.iter().fold(0.0_f64, |a, &b| a.max(b));
+
+            // Distinct turn buckets and entropy from aggregated centroid
+            let distinct = centroid.iter().filter(|&&v| v > 0.0).count();
+            let entropy: f64 = centroid
+                .iter()
+                .filter(|&&p| p > 0.0)
+                .map(|&p| -p * p.log2())
+                .sum();
+
+            #[allow(clippy::cast_possible_truncation)]
+            BucketTransitionStats {
+                bucket_id: id as u16,
+                count: hists.len(),
+                mean_emd_to_centroid: mean_emd,
+                max_emd_to_centroid: max_emd,
+                distinct_turn_buckets: distinct,
+                transition_entropy: entropy,
+            }
+        })
+        .collect();
+
+    let non_empty: Vec<_> = bucket_stats.iter().filter(|b| b.count > 0).collect();
+    let mean_emd = if non_empty.is_empty() {
+        0.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        { non_empty.iter().map(|b| b.mean_emd_to_centroid).sum::<f64>() / non_empty.len() as f64 }
+    };
+    let max_emd = non_empty
+        .iter()
+        .map(|b| b.mean_emd_to_centroid)
+        .fold(0.0_f64, f64::max);
+
+    let from_street = format!("{:?}", current_bf.header.street);
+    let to_street = format!("{:?}", next_bf.header.street);
+
+    TransitionConsistencyReport {
+        from_street,
+        to_street,
+        bucket_count: current_bf.header.bucket_count,
+        sample_boards: num_sample_boards,
+        buckets: bucket_stats,
+        mean_emd: mean_emd,
+        max_emd: max_emd,
+    }
+}
+
+/// 1-D Earth Mover's Distance between two probability distributions.
+///
+/// For 1-D histograms, EMD equals the L1 norm of the cumulative difference.
+fn emd_1d(a: &[f64], b: &[f64]) -> f64 {
+    let mut cum = 0.0_f64;
+    let mut total = 0.0_f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        cum += x - y;
+        total += cum.abs();
+    }
+    total
+}
+
 /// Audit all bucket files in a directory.
 ///
-/// Samples `num_boards` random 5-card boards, computes equity, and reports
+/// Samples `num_boards` random boards, computes equity, and reports
 /// per-bucket equity stats for each street.
 ///
 /// # Errors
