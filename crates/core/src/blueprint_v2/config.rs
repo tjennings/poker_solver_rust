@@ -35,9 +35,33 @@ pub struct GameConfig {
     pub rake_cap: f64,
 }
 
+/// Per-flop clustering configuration.
+///
+/// When present in `ClusteringConfig`, enables per-flop turn/river clustering
+/// where each flop texture gets its own set of turn and river buckets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerFlopConfig {
+    /// Number of turn buckets per flop. Defaults to 200.
+    #[serde(default = "default_per_flop_buckets")]
+    pub turn_buckets: u16,
+    /// Number of river buckets per flop. Defaults to 200.
+    #[serde(default = "default_per_flop_buckets")]
+    pub river_buckets: u16,
+}
+
+impl Default for PerFlopConfig {
+    fn default() -> Self {
+        Self {
+            turn_buckets: default_per_flop_buckets(),
+            river_buckets: default_per_flop_buckets(),
+        }
+    }
+}
+
 /// Card abstraction clustering configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusteringConfig {
+    #[serde(default)]
     pub algorithm: ClusteringAlgorithm,
     pub preflop: StreetClusterConfig,
     pub flop: StreetClusterConfig,
@@ -52,12 +76,17 @@ pub struct ClusteringConfig {
     /// random-hand showdown equity.
     #[serde(default)]
     pub cfvnet_river_data: Option<PathBuf>,
+    /// Optional per-flop clustering configuration.
+    /// When present, turn and river clustering is done independently per flop texture.
+    #[serde(default)]
+    pub per_flop: Option<PerFlopConfig>,
 }
 
 /// Supported clustering algorithms for card abstraction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClusteringAlgorithm {
+    #[default]
     PotentialAwareEmd,
 }
 
@@ -190,6 +219,10 @@ pub struct SnapshotConfig {
 }
 
 // ── Default value functions ──────────────────────────────────────────
+
+const fn default_per_flop_buckets() -> u16 {
+    200
+}
 
 const fn default_seed() -> u64 {
     42
@@ -364,6 +397,7 @@ snapshots:
                 seed: 123,
                 kmeans_iterations: 50,
                 cfvnet_river_data: None,
+                per_flop: None,
             },
             action_abstraction: ActionAbstractionConfig {
                 preflop: vec![vec!["2.5bb".to_owned()], vec!["3.0x".to_owned()]],
@@ -431,6 +465,140 @@ snapshots:
         // Snapshots
         assert_eq!(restored.snapshots.warmup_minutes, 120);
         assert_eq!(restored.snapshots.output_dir, "/data/snapshots");
+    }
+
+    #[test]
+    fn test_deserialize_per_flop_config() {
+        let yaml = r#"
+game:
+  name: "Per-Flop Test"
+  players: 2
+  stack_depth: 100.0
+  small_blind: 0.5
+  big_blind: 1.0
+
+clustering:
+  flop:
+    buckets: 200
+  per_flop:
+    turn_buckets: 200
+    river_buckets: 200
+  preflop:
+    buckets: 169
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+
+action_abstraction:
+  preflop:
+    - ["2.5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+
+training:
+  cluster_path: "/tmp/clusters"
+  iterations: 100
+
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse per-flop config");
+
+        // algorithm should default to PotentialAwareEmd when omitted
+        assert!(matches!(
+            cfg.clustering.algorithm,
+            ClusteringAlgorithm::PotentialAwareEmd
+        ));
+
+        // per_flop section parsed
+        let pf = cfg.clustering.per_flop.as_ref().expect("per_flop should be Some");
+        assert_eq!(pf.turn_buckets, 200);
+        assert_eq!(pf.river_buckets, 200);
+
+        // street configs still work
+        assert_eq!(cfg.clustering.flop.buckets, 200);
+        assert_eq!(cfg.clustering.preflop.buckets, 169);
+    }
+
+    #[test]
+    fn test_per_flop_config_defaults() {
+        // PerFlopConfig defaults: turn_buckets=200, river_buckets=200
+        let pf = PerFlopConfig::default();
+        assert_eq!(pf.turn_buckets, 200);
+        assert_eq!(pf.river_buckets, 200);
+    }
+
+    #[test]
+    fn test_per_flop_config_partial_yaml() {
+        // Only specifying turn_buckets should default river_buckets
+        let yaml = r#"
+turn_buckets: 150
+"#;
+        let pf: PerFlopConfig =
+            serde_yaml::from_str(yaml).expect("failed to parse partial per-flop");
+        assert_eq!(pf.turn_buckets, 150);
+        assert_eq!(pf.river_buckets, 200);
+    }
+
+    #[test]
+    fn test_old_config_without_per_flop_still_works() {
+        // Old-style config with algorithm and no per_flop must still parse
+        let yaml = r#"
+game:
+  name: "Legacy Config"
+  players: 6
+  stack_depth: 100.0
+  small_blind: 0.5
+  big_blind: 1.0
+
+clustering:
+  algorithm: potential_aware_emd
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+
+action_abstraction:
+  preflop:
+    - ["2.5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+
+training:
+  cluster_path: "/tmp/clusters"
+  iterations: 100
+
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse legacy config");
+
+        assert!(matches!(
+            cfg.clustering.algorithm,
+            ClusteringAlgorithm::PotentialAwareEmd
+        ));
+        assert!(cfg.clustering.per_flop.is_none());
     }
 
     #[test]

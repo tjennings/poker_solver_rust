@@ -1057,6 +1057,7 @@ mod tests {
                 seed: 42,
                 kmeans_iterations: 50,
                 cfvnet_river_data: None,
+                per_flop: None,
             },
             action_abstraction: ActionAbstractionConfig {
                 preflop: vec![vec!["2.5bb".into()]],

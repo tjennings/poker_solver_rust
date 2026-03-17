@@ -33,6 +33,7 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
             seed: 42,
             kmeans_iterations: 10,
             cfvnet_river_data: None,
+            per_flop: None,
         },
         action_abstraction: ActionAbstractionConfig {
             preflop: vec![vec!["2.5bb".into()]],
