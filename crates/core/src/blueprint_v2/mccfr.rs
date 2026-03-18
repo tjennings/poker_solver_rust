@@ -52,7 +52,7 @@ use super::per_flop_bucket_file::PerFlopBucketFile;
 use super::storage::BlueprintStorage;
 use super::Street;
 use crate::abstraction::isomorphism::CanonicalBoard;
-use crate::poker::{Card, Hand, Rankable};
+use crate::poker::{Card, Hand, Rankable, ALL_SUITS, ALL_VALUES};
 
 /// Maximum number of actions at any decision node.
 ///
@@ -66,6 +66,44 @@ const MAX_ACTIONS: usize = 16;
 pub struct Deal {
     pub hole_cards: [[Card; 2]; 2], // [player0, player1]
     pub board: [Card; 5],           // flop(3) + turn(1) + river(1)
+}
+
+/// Sample a random deal with a specific flop board.
+///
+/// The flop cards are fixed; turn, river, and both players' hole cards
+/// are sampled randomly from the remaining 49-card deck.
+pub fn sample_deal_for_flop(flop: [Card; 3], rng: &mut impl Rng) -> Deal {
+    // Build remaining deck: all 52 cards minus the 3 flop cards
+    let mut remaining: Vec<Card> = Vec::with_capacity(49);
+    for &v in &ALL_VALUES {
+        for &s in &ALL_SUITS {
+            let c = Card::new(v, s);
+            if !(c.value == flop[0].value && c.suit == flop[0].suit)
+                && !(c.value == flop[1].value && c.suit == flop[1].suit)
+                && !(c.value == flop[2].value && c.suit == flop[2].suit)
+            {
+                remaining.push(c);
+            }
+        }
+    }
+    assert_eq!(remaining.len(), 49);
+
+    // Partial Fisher-Yates: shuffle first 6 positions
+    // [0,1] = player 0 hole cards
+    // [2,3] = player 1 hole cards
+    // [4] = turn, [5] = river
+    for i in 0..6 {
+        let j = rng.random_range(i..remaining.len());
+        remaining.swap(i, j);
+    }
+
+    Deal {
+        hole_cards: [
+            [remaining[0], remaining[1]],
+            [remaining[2], remaining[3]],
+        ],
+        board: [flop[0], flop[1], flop[2], remaining[4], remaining[5]],
+    }
 }
 
 /// A deal with pre-computed bucket assignments for all streets and players.
@@ -1722,5 +1760,80 @@ mod tests {
         // Should fall back to equity-based bucketing (returns valid bucket in [0,10))
         let bucket = all.get_bucket(Street::Turn, hole, &turn_board);
         assert!(bucket < 10, "should fall back to equity bucketing, got {bucket}");
+    }
+
+    // ── sample_deal_for_flop tests ──────────────────────────────────
+
+    #[test]
+    fn sample_deal_for_flop_board_starts_with_flop() {
+        let flop = [
+            c(Value::Ace, Suit::Spade),
+            c(Value::King, Suit::Heart),
+            c(Value::Two, Suit::Diamond),
+        ];
+        let mut rng = StdRng::seed_from_u64(99);
+        let deal = sample_deal_for_flop(flop, &mut rng);
+
+        assert_eq!(deal.board[0].value, flop[0].value);
+        assert_eq!(deal.board[0].suit, flop[0].suit);
+        assert_eq!(deal.board[1].value, flop[1].value);
+        assert_eq!(deal.board[1].suit, flop[1].suit);
+        assert_eq!(deal.board[2].value, flop[2].value);
+        assert_eq!(deal.board[2].suit, flop[2].suit);
+    }
+
+    #[test]
+    fn sample_deal_for_flop_all_cards_unique() {
+        let flop = [
+            c(Value::Ten, Suit::Club),
+            c(Value::Seven, Suit::Diamond),
+            c(Value::Three, Suit::Heart),
+        ];
+        // Run multiple trials to increase confidence
+        for seed in 0..20 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let deal = sample_deal_for_flop(flop, &mut rng);
+
+            let mut all_cards = Vec::with_capacity(9);
+            all_cards.extend_from_slice(&deal.hole_cards[0]);
+            all_cards.extend_from_slice(&deal.hole_cards[1]);
+            all_cards.extend_from_slice(&deal.board);
+
+            // Check all 9 cards are distinct (compare value+suit)
+            for i in 0..all_cards.len() {
+                for j in (i + 1)..all_cards.len() {
+                    assert!(
+                        all_cards[i].value != all_cards[j].value
+                            || all_cards[i].suit != all_cards[j].suit,
+                        "Duplicate card found at positions {i} and {j} (seed {seed})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sample_deal_for_flop_no_flop_cards_in_holes() {
+        let flop = [
+            c(Value::Queen, Suit::Spade),
+            c(Value::Jack, Suit::Heart),
+            c(Value::Nine, Suit::Club),
+        ];
+
+        for seed in 0..20 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let deal = sample_deal_for_flop(flop, &mut rng);
+
+            for &hole_card in deal.hole_cards[0].iter().chain(deal.hole_cards[1].iter()) {
+                for &flop_card in &flop {
+                    assert!(
+                        hole_card.value != flop_card.value || hole_card.suit != flop_card.suit,
+                        "Hole card {:?}{:?} matches flop card (seed {seed})",
+                        hole_card.value,
+                        hole_card.suit,
+                    );
+                }
+            }
+        }
     }
 }
