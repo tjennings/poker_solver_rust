@@ -29,13 +29,12 @@ struct NodeLayout {
     street_idx: u8,
 }
 
-/// Compact flat-buffer storage using `AtomicI32` regrets and `AtomicI32`
-/// strategy sums. 8 bytes/slot instead of 12 (no AtomicI64 strategy sums).
+/// Compact flat-buffer storage using `AtomicI32` regrets only.
+/// 4 bytes/slot — strategy sums are skipped during training
+/// (only regrets needed for regret-matching current strategy).
 pub struct CompactStorage {
     /// Cumulative regrets: one `AtomicI32` per (decision node, bucket, action).
     pub regrets: Vec<AtomicI32>,
-    /// Strategy sums: one `AtomicI32` per (decision node, bucket, action).
-    pub strategy_sums: Vec<AtomicI32>,
     /// Number of buckets per street `[preflop, flop, turn, river]`.
     pub bucket_counts: [u16; 4],
     /// Per-node layout metadata. Non-decision nodes use the `Default`
@@ -74,7 +73,6 @@ impl CompactStorage {
 
         Self {
             regrets: (0..total).map(|_| AtomicI32::new(0)).collect(),
-            strategy_sums: (0..total).map(|_| AtomicI32::new(0)).collect(),
             bucket_counts,
             layout,
         }
@@ -136,19 +134,13 @@ impl CompactStorage {
     /// Read a single strategy sum value atomically, widened to i64.
     #[inline]
     #[must_use]
-    pub fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64 {
-        let nl = &self.layout[node_idx as usize];
-        let idx = Self::slot_offset(nl, bucket) + action;
-        i64::from(self.strategy_sums[idx].load(Ordering::Relaxed))
+    pub fn get_strategy_sum(&self, _node_idx: u32, _bucket: u16, _action: usize) -> i64 {
+        0 // Strategy sums not tracked — only regrets needed during training.
     }
 
-    /// Add a delta to a single strategy sum value atomically.
+    /// No-op — strategy sums not tracked in CompactStorage.
     #[inline]
-    pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
-        let clamped = delta.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
-        let nl = &self.layout[node_idx as usize];
-        let idx = Self::slot_offset(nl, bucket) + action;
-        self.strategy_sums[idx].fetch_add(clamped, Ordering::Relaxed);
+    pub fn add_strategy_sum(&self, _node_idx: u32, _bucket: u16, _action: usize, _delta: i64) {
     }
 
     /// Number of actions at a decision node.
@@ -176,11 +168,7 @@ impl CompactStorage {
             let new_val = (f64::from(v) * d) as i32;
             atom.store(new_val, Ordering::Relaxed);
         }
-        for atom in &self.strategy_sums {
-            let v = atom.load(Ordering::Relaxed);
-            let new_val = (f64::from(v) * d_strat) as i32;
-            atom.store(new_val, Ordering::Relaxed);
-        }
+        // Strategy sums not tracked — skip d_strat.
     }
 
     /// Serialize regrets and strategy sums to a binary file.
@@ -199,14 +187,9 @@ impl CompactStorage {
             .iter()
             .map(|a| a.load(Ordering::Relaxed))
             .collect();
-        let sums_plain: Vec<i32> = self
-            .strategy_sums
-            .iter()
-            .map(|a| a.load(Ordering::Relaxed))
-            .collect();
 
-        // Magic + bucket_counts + regrets + strategy_sums
-        let payload = (b"CMP2", &self.bucket_counts, &regrets_plain, &sums_plain);
+        // Magic + bucket_counts + regrets (no strategy sums)
+        let payload = (b"CMP3", &self.bucket_counts, &regrets_plain);
         bincode::serialize_into(&mut writer, &payload)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -227,18 +210,17 @@ impl CompactStorage {
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
 
-        let (magic, stored_counts, regrets_plain, sums_plain): (
+        let (magic, stored_counts, regrets_plain): (
             [u8; 4],
             [u16; 4],
-            Vec<i32>,
             Vec<i32>,
         ) = bincode::deserialize_from(reader)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        if &magic != b"CMP2" {
+        if &magic != b"CMP3" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("invalid magic: expected CMP2, got {magic:?}"),
+                format!("invalid magic: expected CMP3, got {magic:?}"),
             ));
         }
 
@@ -264,21 +246,7 @@ impl CompactStorage {
                 ),
             ));
         }
-        if sums_plain.len() != storage.strategy_sums.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "strategy_sums buffer length mismatch: file has {}, expected {}",
-                    sums_plain.len(),
-                    storage.strategy_sums.len()
-                ),
-            ));
-        }
-
         for (atom, &val) in storage.regrets.iter().zip(regrets_plain.iter()) {
-            atom.store(val, Ordering::Relaxed);
-        }
-        for (atom, &val) in storage.strategy_sums.iter().zip(sums_plain.iter()) {
             atom.store(val, Ordering::Relaxed);
         }
 
