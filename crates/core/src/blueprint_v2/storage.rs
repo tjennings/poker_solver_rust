@@ -36,6 +36,9 @@ pub trait RegretStorage: Sync {
     fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64;
     fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64);
     fn num_actions(&self, node_idx: u32) -> usize;
+    /// Scaling factor for regret/strategy deltas. i32 storage uses 1000.0,
+    /// i16 storage uses 10.0 to avoid overflow.
+    fn delta_scale(&self) -> f64 { 1000.0 }
 }
 
 /// Flat-buffer storage for regrets and strategy sums.

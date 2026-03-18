@@ -712,17 +712,18 @@ fn traverse_traverser(
 
     // Update regrets: delta = action_value - node_value, scaled to
     // integer by ×1000 for precision. Skip pruned actions.
+    let scale = storage.delta_scale();
     for (a, &av) in action_values.iter().enumerate().take(num_actions) {
         if pruned[a] {
             continue;
         }
         let delta = av - node_value;
-        storage.add_regret(node_idx, bucket, a, (delta * 1000.0) as i32);
+        storage.add_regret(node_idx, bucket, a, (delta * scale) as i32);
     }
 
     // Accumulate strategy sums (for computing the average strategy).
     for (a, &s) in strategy.iter().enumerate().take(num_actions) {
-        storage.add_strategy_sum(node_idx, bucket, a, (s * 1000.0) as i64);
+        storage.add_strategy_sum(node_idx, bucket, a, (s * scale) as i64);
     }
 
     // Accumulate EV at tracked scenario nodes.

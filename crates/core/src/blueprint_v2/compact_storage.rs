@@ -339,6 +339,11 @@ impl RegretStorage for CompactStorage {
     fn num_actions(&self, node_idx: u32) -> usize {
         self.num_actions(node_idx)
     }
+
+    #[inline]
+    fn delta_scale(&self) -> f64 {
+        10.0
+    }
 }
 
 #[cfg(test)]
