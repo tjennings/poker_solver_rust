@@ -578,10 +578,6 @@ impl BlueprintTrainer {
         let mut epoch = 0u64;
         let rake_rate = self.config.game.rake_rate;
         let rake_cap = self.config.game.rake_cap;
-        let preflop_ref = &self.storage;
-        let bucket_lookup_ref = &bucket_lookup;
-        let tree_ref = &self.tree;
-        let storages_ref = &flop_storages;
 
         let time_limit = std::time::Duration::from_secs(
             self.config.training.time_limit_minutes.unwrap_or(u64::MAX) * 60
@@ -595,10 +591,16 @@ impl BlueprintTrainer {
 
             let work_idx = std::sync::atomic::AtomicUsize::new(0);
             let epoch_deals = std::sync::atomic::AtomicU64::new(0);
+
+            {
             let epoch_deals_ref = &epoch_deals;
             let work_idx_ref = &work_idx;
             let schedule_ref = &schedule;
             let indices_ref = &schedule_indices;
+            let preflop_ref = &self.storage;
+            let bucket_lookup_ref = &bucket_lookup;
+            let tree_ref = &self.tree;
+            let storages_ref = &flop_storages;
 
             rayon::scope(|s| {
                 for _ in 0..rayon::current_num_threads() {
@@ -634,11 +636,15 @@ impl BlueprintTrainer {
                     });
                 }
             });
+            } // drop preflop_ref borrow
 
             epoch += 1;
             let deals = epoch_deals.load(Ordering::Relaxed);
             self.iterations += deals;
             self.shared_iterations.store(self.iterations, Ordering::Relaxed);
+
+            // Update TUI metrics from preflop storage.
+            self.update_strategy_delta();
 
             if !self.tui_active {
                 eprintln!(
