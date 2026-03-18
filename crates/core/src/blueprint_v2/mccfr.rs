@@ -196,7 +196,7 @@ impl AllBuckets {
             }
         }
 
-        eprintln!("  Per-flop index: {} flops available (lazy loading)", index_map.len());
+        // index_map.len() flops indexed for lazy loading
         self.per_flop_dir = Some(dir);
         self.flop_index_map = Some(index_map);
         self

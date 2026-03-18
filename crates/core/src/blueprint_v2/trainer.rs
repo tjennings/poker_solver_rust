@@ -571,19 +571,9 @@ impl BlueprintTrainer {
         // No disk I/O during training — only save on snapshots.
         let schedule = EpochSchedule::new();
         let num_flops = schedule.len();
-        eprintln!("  Allocating {} per-flop regret tables...", num_flops);
         let flop_storages: Vec<CompactStorage> = (0..num_flops)
-            .map(|i| {
-                if i % 200 == 0 {
-                    eprintln!("    {}/{}", i, num_flops);
-                }
-                CompactStorage::new(&self.tree, per_flop_bucket_counts)
-            })
+            .map(|_| CompactStorage::new(&self.tree, per_flop_bucket_counts))
             .collect();
-        let slots_per = if flop_storages.is_empty() { 0 } else { flop_storages[0].num_slots() };
-        let total_mem = num_flops * slots_per * 6; // 6 bytes per slot (i16 + i32)
-        eprintln!("  Done: {} slots/flop, {:.1} GB total",
-            slots_per, total_mem as f64 / 1e9);
 
         let mut epoch = 0u64;
         let rake_rate = self.config.game.rake_rate;
@@ -596,14 +586,6 @@ impl BlueprintTrainer {
         let time_limit = std::time::Duration::from_secs(
             self.config.training.time_limit_minutes.unwrap_or(u64::MAX) * 60
         );
-
-        eprintln!("Per-flop MCCFR training");
-        eprintln!("  Flops: {num_flops}");
-        eprintln!(
-            "  Buckets: flop={}, turn={}, river={}",
-            per_flop_cfg.flop_buckets, per_flop_cfg.turn_buckets, per_flop_cfg.river_buckets
-        );
-        eprintln!();
 
         // Shuffled schedule indices for each epoch
         let mut schedule_indices: Vec<usize> = (0..num_flops).collect();

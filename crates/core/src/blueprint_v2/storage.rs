@@ -88,15 +88,6 @@ impl BlueprintStorage {
             }
         }
 
-        let regret_bytes = total * 4;
-        let strategy_bytes = total * 8;
-        eprintln!(
-            "  Storage: {} slots ({} regret + {} strategy = {} total)",
-            total,
-            humanize_bytes(regret_bytes),
-            humanize_bytes(strategy_bytes),
-            humanize_bytes(regret_bytes + strategy_bytes),
-        );
 
         Self {
             regrets: (0..total).map(|_| AtomicI32::new(0)).collect(),
