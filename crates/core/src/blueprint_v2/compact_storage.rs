@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI16, AtomicI32, Ordering};
 
 use super::game_tree::{GameNode, GameTree};
+use super::storage::RegretStorage;
 
 /// Per-node layout metadata for index computation.
 #[derive(Clone, Copy, Default)]
@@ -277,6 +278,38 @@ impl CompactStorage {
     }
 }
 
+impl RegretStorage for CompactStorage {
+    #[inline]
+    fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
+        self.get_regret(node_idx, bucket, action)
+    }
+
+    #[inline]
+    fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
+        self.add_regret(node_idx, bucket, action, delta);
+    }
+
+    #[inline]
+    fn current_strategy_into(&self, node_idx: u32, bucket: u16, out: &mut [f64]) {
+        self.current_strategy_into(node_idx, bucket, out);
+    }
+
+    #[inline]
+    fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64 {
+        self.get_strategy_sum(node_idx, bucket, action)
+    }
+
+    #[inline]
+    fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
+        self.add_strategy_sum(node_idx, bucket, action, delta);
+    }
+
+    #[inline]
+    fn num_actions(&self, node_idx: u32) -> usize {
+        self.num_actions(node_idx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +488,48 @@ mod tests {
         let compact_bytes = compact.num_slots() * 6;
         let blueprint_bytes = blueprint.regrets.len() * 12;
         assert_eq!(compact_bytes * 2, blueprint_bytes);
+    }
+
+    #[test]
+    fn compact_storage_implements_regret_storage_trait() {
+        use crate::blueprint_v2::storage::RegretStorage;
+
+        let tree = toy_tree();
+        let storage = CompactStorage::new(&tree, [50, 50, 50, 50]);
+
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, crate::blueprint_v2::game_tree::GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+
+        // Use through a trait object reference
+        let dyn_storage: &dyn RegretStorage = &storage;
+
+        // num_actions via trait
+        let num_actions = dyn_storage.num_actions(node_idx);
+        assert!(num_actions > 0);
+
+        // Initial regrets should be zero
+        assert_eq!(dyn_storage.get_regret(node_idx, 0, 0), 0);
+
+        // add_regret + get_regret via trait
+        dyn_storage.add_regret(node_idx, 0, 0, 500);
+        assert_eq!(dyn_storage.get_regret(node_idx, 0, 0), 500);
+
+        // add_strategy_sum + get_strategy_sum via trait
+        assert_eq!(dyn_storage.get_strategy_sum(node_idx, 0, 0), 0);
+        dyn_storage.add_strategy_sum(node_idx, 0, 0, 1000);
+        assert_eq!(dyn_storage.get_strategy_sum(node_idx, 0, 0), 1000);
+
+        // current_strategy_into via trait: action 0 has positive regret,
+        // so it should get probability 1.0
+        let mut buf = vec![0.0f64; num_actions];
+        dyn_storage.current_strategy_into(node_idx, 0, &mut buf);
+        assert!(
+            (buf[0] - 1.0).abs() < 1e-10,
+            "action 0 should have prob 1.0, got {}",
+            buf[0]
+        );
     }
 }

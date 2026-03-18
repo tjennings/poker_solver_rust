@@ -387,6 +387,10 @@ impl BlueprintTrainer {
     /// fallback produces meaningless abstractions) or if a snapshot
     /// write fails.
     pub fn train(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.config.training.per_flop_regrets {
+            return self.train_per_flop();
+        }
+
         // Validate bucket files unless explicitly skipped or no cluster_path configured
         // (no cluster_path means intentional equity-only mode).
         if !self.skip_bucket_validation && self.config.training.cluster_path.is_some() {
@@ -493,6 +497,196 @@ impl BlueprintTrainer {
                 .store(self.iterations, Ordering::Relaxed);
             self.check_timed_actions()?;
         }
+        Ok(())
+    }
+
+    /// Run per-flop epoch-based MCCFR training.
+    ///
+    /// Uses separate preflop (global `BlueprintStorage`) and per-flop
+    /// postflop (`CompactStorage`) regret tables. Each epoch iterates
+    /// over all 1,755 canonical flops with a preload buffer for
+    /// concurrent disk I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `per_flop` config is missing or `cluster_path`
+    /// is not set.
+    fn train_per_flop(&mut self) -> Result<(), Box<dyn Error>> {
+        use super::compact_storage::CompactStorage;
+        use super::epoch_schedule::EpochSchedule;
+        use super::mccfr::sample_deal_for_flop;
+        use super::per_flop_regret_store::PerFlopRegretStore;
+
+        let per_flop_cfg = self
+            .config
+            .clustering
+            .per_flop
+            .as_ref()
+            .ok_or("per_flop_regrets requires clustering.per_flop config")?;
+
+        let cluster_path = self
+            .config
+            .training
+            .cluster_path
+            .as_ref()
+            .ok_or("per_flop_regrets requires cluster_path")?;
+
+        // Per-flop bucket counts: preflop=1 (unused in per-flop storage),
+        // rest from per_flop config.
+        let per_flop_bucket_counts: [u16; 4] = [
+            1,
+            per_flop_cfg.flop_buckets,
+            per_flop_cfg.turn_buckets,
+            per_flop_cfg.river_buckets,
+        ];
+
+        // Global preflop storage (BlueprintStorage, always in memory).
+        let preflop_storage = BlueprintStorage::new(&self.tree, [169, 1, 1, 1]);
+
+        // Per-flop regret store (CompactStorage backed by disk).
+        let regret_dir = std::path::PathBuf::from(cluster_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("per_flop_regrets");
+        let tree = Arc::new(self.tree.clone());
+        let store = PerFlopRegretStore::new(
+            regret_dir,
+            Arc::clone(&tree),
+            per_flop_bucket_counts,
+        );
+
+        // Bucket lookup using per-flop bucket counts with equity fallback.
+        let bucket_lookup = AllBuckets::new(per_flop_bucket_counts, [None, None, None, None]);
+        let bucket_lookup = if let Some(ref cp) = self.config.training.cluster_path {
+            let per_flop_marker = std::path::Path::new(cp).join("flop_0000.buckets");
+            if per_flop_marker.exists() {
+                bucket_lookup.with_per_flop_dir(std::path::PathBuf::from(cp))
+            } else {
+                bucket_lookup
+            }
+        } else {
+            bucket_lookup
+        };
+
+        let mut schedule = EpochSchedule::new();
+        let mut epoch = 0u64;
+        let rake_rate = self.config.game.rake_rate;
+        let rake_cap = self.config.game.rake_cap;
+        let buffer_size = self.config.training.preload_buffer_size;
+        let preflop_ref = &preflop_storage;
+        let bucket_lookup_ref = &bucket_lookup;
+        let tree_ref = &self.tree;
+
+        if !self.tui_active {
+            eprintln!("Per-flop MCCFR training");
+            eprintln!("  Regret dir: {}", store.dir().display());
+            eprintln!(
+                "  Buckets: flop={}, turn={}, river={}",
+                per_flop_cfg.flop_buckets,
+                per_flop_cfg.turn_buckets,
+                per_flop_cfg.river_buckets
+            );
+            eprintln!("  Preload buffer: {buffer_size}");
+            eprintln!();
+        }
+
+        loop {
+            schedule.shuffle(&mut self.rng);
+            let (ready_rx, dirty_tx, handles) = store.start_epoch(&schedule, buffer_size);
+
+            let epoch_deals = std::sync::atomic::AtomicU64::new(0);
+            let epoch_deals_ref = &epoch_deals;
+
+            rayon::scope(|s| {
+                for _ in 0..rayon::current_num_threads() {
+                    let rx = ready_rx.clone();
+                    let tx = dirty_tx.clone();
+                    s.spawn(move |_| {
+                        let mut rng = SmallRng::from_os_rng();
+                        while let Ok(work) = rx.recv() {
+                            for _ in 0..work.weight {
+                                let deal =
+                                    sample_deal_for_flop(work.flop_cards, &mut rng);
+                                let buckets =
+                                    bucket_lookup_ref.precompute_buckets(&deal);
+                                let deal = DealWithBuckets { deal, buckets };
+
+                                traverse_external(
+                                    tree_ref,
+                                    preflop_ref,
+                                    &work.storage,
+                                    &deal,
+                                    0,
+                                    tree_ref.root,
+                                    false,
+                                    0,
+                                    &mut rng,
+                                    rake_rate,
+                                    rake_cap,
+                                    None,
+                                );
+                                traverse_external(
+                                    tree_ref,
+                                    preflop_ref,
+                                    &work.storage,
+                                    &deal,
+                                    1,
+                                    tree_ref.root,
+                                    false,
+                                    0,
+                                    &mut rng,
+                                    rake_rate,
+                                    rake_cap,
+                                    None,
+                                );
+                            }
+                            epoch_deals_ref.fetch_add(
+                                u64::from(work.weight),
+                                Ordering::Relaxed,
+                            );
+                            tx.send((work.flop_index, work.storage)).ok();
+                        }
+                    });
+                }
+            });
+
+            // Drop extra clones so writer thread finishes
+            drop(ready_rx);
+            drop(dirty_tx);
+            for h in handles {
+                h.join().ok();
+            }
+
+            epoch += 1;
+            let deals = epoch_deals.load(Ordering::Relaxed);
+            self.iterations += deals;
+            self.shared_iterations
+                .store(self.iterations, Ordering::Relaxed);
+
+            if !self.tui_active {
+                eprintln!(
+                    "  Epoch {epoch}: {deals} deals, total: {}, elapsed: {:.0}s",
+                    self.iterations,
+                    self.start_time.elapsed().as_secs_f64()
+                );
+            }
+
+            // Check stopping conditions
+            if let Some(max_min) = self.config.training.time_limit_minutes {
+                if self.elapsed_minutes() >= max_min {
+                    break;
+                }
+            }
+            if let Some(max) = self.config.training.iterations {
+                if self.iterations >= max {
+                    break;
+                }
+            }
+            if self.quit_requested.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
         Ok(())
     }
 
@@ -1541,5 +1735,152 @@ mod tests {
 
         let trainer = toy_trainer(config);
         assert!(!trainer.buckets.has_per_flop_dir(), "trainer should not enable per-flop without marker file");
+    }
+
+    #[test]
+    fn train_per_flop_runs_one_epoch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = toy_config();
+        config.training.per_flop_regrets = true;
+        config.training.iterations = Some(22100); // exactly 1 epoch
+        config.training.cluster_path = Some(dir.path().to_string_lossy().into_owned());
+        config.clustering.per_flop = Some(PerFlopConfig {
+            flop_buckets: 5,
+            turn_buckets: 5,
+            river_buckets: 5,
+        });
+
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("train_per_flop should not fail");
+
+        // Should have processed at least some iterations
+        assert!(trainer.iterations > 0, "should have completed some iterations");
+    }
+
+    #[test]
+    fn train_per_flop_writes_regret_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // cluster_path is a subdirectory so regret_dir (sibling) stays in temp
+        let cluster_dir = dir.path().join("clusters");
+        std::fs::create_dir_all(&cluster_dir).expect("create cluster dir");
+
+        let mut config = toy_config();
+        config.training.per_flop_regrets = true;
+        config.training.iterations = Some(22100);
+        config.training.cluster_path = Some(cluster_dir.to_string_lossy().into_owned());
+        config.clustering.per_flop = Some(PerFlopConfig {
+            flop_buckets: 5,
+            turn_buckets: 5,
+            river_buckets: 5,
+        });
+
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("train should not fail");
+
+        // Per-flop regret files should be written as sibling of cluster_path
+        let regret_dir = dir.path().join("per_flop_regrets");
+        assert!(regret_dir.exists(), "per_flop_regrets dir should exist");
+        let file_count = std::fs::read_dir(&regret_dir)
+            .expect("read regret dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "regrets"))
+            .count();
+        assert!(file_count > 0, "should have written at least one .regrets file");
+    }
+
+    #[test]
+    fn train_per_flop_errors_without_per_flop_config() {
+        let mut config = toy_config();
+        config.training.per_flop_regrets = true;
+        config.training.cluster_path = Some("/tmp/test_no_per_flop".into());
+        // No per_flop config set (None)
+        config.clustering.per_flop = None;
+
+        let mut trainer = toy_trainer(config);
+        let result = trainer.train();
+        assert!(result.is_err(), "should error without per_flop config");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("per_flop"),
+            "error should mention per_flop config, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn train_per_flop_errors_without_cluster_path() {
+        let mut config = toy_config();
+        config.training.per_flop_regrets = true;
+        config.training.cluster_path = None;
+        config.clustering.per_flop = Some(PerFlopConfig {
+            flop_buckets: 5,
+            turn_buckets: 5,
+            river_buckets: 5,
+        });
+
+        let mut trainer = toy_trainer(config);
+        let result = trainer.train();
+        assert!(result.is_err(), "should error without cluster_path");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("cluster_path"),
+            "error should mention cluster_path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn train_per_flop_respects_iteration_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cluster_dir = dir.path().join("clusters");
+        std::fs::create_dir_all(&cluster_dir).expect("create cluster dir");
+
+        let mut config = toy_config();
+        config.training.per_flop_regrets = true;
+        // Set a limit less than one full epoch (22100 deals per epoch)
+        config.training.iterations = Some(100);
+        config.training.cluster_path = Some(cluster_dir.to_string_lossy().into_owned());
+        config.clustering.per_flop = Some(PerFlopConfig {
+            flop_buckets: 5,
+            turn_buckets: 5,
+            river_buckets: 5,
+        });
+
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("train should not fail");
+
+        // Should have completed at least one epoch (minimum is 22100 deals)
+        // since each epoch processes all flops
+        assert!(
+            trainer.iterations >= 22100,
+            "per-flop training does full epochs; got {}",
+            trainer.iterations
+        );
+    }
+
+    #[test]
+    fn train_per_flop_updates_shared_iterations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cluster_dir = dir.path().join("clusters");
+        std::fs::create_dir_all(&cluster_dir).expect("create cluster dir");
+
+        let mut config = toy_config();
+        config.training.per_flop_regrets = true;
+        config.training.iterations = Some(22100);
+        config.training.cluster_path = Some(cluster_dir.to_string_lossy().into_owned());
+        config.clustering.per_flop = Some(PerFlopConfig {
+            flop_buckets: 5,
+            turn_buckets: 5,
+            river_buckets: 5,
+        });
+
+        let mut trainer = toy_trainer(config);
+        let shared = Arc::clone(&trainer.shared_iterations);
+        trainer.train().expect("train should not fail");
+
+        assert_eq!(
+            shared.load(Ordering::Relaxed),
+            trainer.iterations,
+            "shared_iterations should match trainer.iterations"
+        );
+        assert!(trainer.iterations > 0);
     }
 }

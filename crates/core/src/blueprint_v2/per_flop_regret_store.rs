@@ -101,6 +101,11 @@ impl PerFlopRegretStore {
 
         (ready_rx, dirty_tx, vec![reader, writer])
     }
+
+    /// The directory where per-flop regret files are stored.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
 }
 
 /// Load a flop's storage from disk, or create a fresh zeroed one.
