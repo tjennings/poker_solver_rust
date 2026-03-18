@@ -603,6 +603,8 @@ impl BlueprintTrainer {
             let tree_ref = &self.tree;
             let storages_ref = &flop_storages;
             let ev_tracker = &self.scenario_ev_tracker;
+            let prune = self.iterations >= self.config.training.prune_after_iterations;
+            let prune_threshold = self.config.training.prune_threshold * 1000;
 
             rayon::scope(|s| {
                 for _ in 0..rayon::current_num_threads() {
@@ -623,12 +625,12 @@ impl BlueprintTrainer {
 
                                 traverse_external(
                                     tree_ref, preflop_ref, flop_storage,
-                                    &deal, 0, tree_ref.root, false, 0, &mut rng,
+                                    &deal, 0, tree_ref.root, prune, prune_threshold, &mut rng,
                                     rake_rate, rake_cap, Some(ev_tracker),
                                 );
                                 traverse_external(
                                     tree_ref, preflop_ref, flop_storage,
-                                    &deal, 1, tree_ref.root, false, 0, &mut rng,
+                                    &deal, 1, tree_ref.root, prune, prune_threshold, &mut rng,
                                     rake_rate, rake_cap, Some(ev_tracker),
                                 );
                             }
