@@ -745,16 +745,31 @@ impl BlueprintTrainer {
                 );
             }
 
-            // Dump preflop regret tree to log file every 500 epochs.
+            // Dump diagnostics to log file every 500 epochs.
             if epoch % 500 == 0 {
                 let log_path = regret_dir.join("regret_diag.log");
-                // Sample hands: AA=0, AKs≈1, KQo≈30, 72o≈168 (approximate canonical indices)
+                let labels = &["AA", "AKs", "JTs", "72o"];
+                let preflop_bkts = &[0u16, 1, 50, 168];
+                // Postflop buckets: use middle-range values for the 50-bucket space
+                let postflop_bkts = &[0u16, 10, 25, 49];
+
+                // 1. Preflop regret tree
                 super::regret_diag::dump_preflop_regrets(
-                    &log_path,
-                    &self.tree,
-                    &self.storage,
-                    &["AA", "AKs", "JTs", "72o"],
-                    &[0, 1, 50, 168],
+                    &log_path, &self.tree, &self.storage, labels, preflop_bkts,
+                );
+
+                // 2. Full spot dump for flop 0 (preflop + postflop, depth=4)
+                if !flop_storages.is_empty() {
+                    super::regret_diag::dump_full_spot(
+                        &log_path, &self.tree,
+                        &self.storage, &flop_storages[0],
+                        "flop_0000", labels, preflop_bkts, postflop_bkts, 4,
+                    );
+                }
+
+                // 3. Per-flop regret stats (saturation check)
+                super::regret_diag::dump_regret_stats(
+                    &log_path, &flop_storages, &format!("epoch {epoch}"),
                 );
             }
 
