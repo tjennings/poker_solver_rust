@@ -722,11 +722,10 @@ impl BlueprintTrainer {
                 self.last_discount_time = self.iterations;
             }
 
-            // Update TUI metrics from preflop storage.
+            // Update TUI metrics + refresh grids every 500 epochs (~10 seconds at 3.5M/s).
+            if epoch % 500 == 0 {
             self.update_strategy_delta();
 
-            // Refresh strategy grids + EVs for TUI scenarios.
-            // EVs are a running average — never reset, just keep accumulating.
             if let Some(ref callback) = self.on_strategy_refresh {
                 for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
                     let player = match &self.tree.nodes[node_idx as usize] {
@@ -737,6 +736,7 @@ impl BlueprintTrainer {
                     callback(i, node_idx, &self.storage, &self.tree, &hand_evs);
                 }
             }
+            } // end TUI refresh throttle
 
             if !self.tui_active {
                 eprintln!(
