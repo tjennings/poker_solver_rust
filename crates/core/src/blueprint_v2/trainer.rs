@@ -223,7 +223,7 @@ impl BlueprintTrainer {
         // Per-flop training skips global storage and bucket file loading —
         // it creates its own storage in train_per_flop().
         let storage = if config.training.per_flop_regrets {
-            BlueprintStorage::new(&tree, [1, 1, 1, 1]) // placeholder, unused
+            BlueprintStorage::new(&tree, [169, 1, 1, 1]) // preflop regrets for TUI
         } else {
             BlueprintStorage::new(&tree, bucket_counts)
         };
@@ -551,8 +551,8 @@ impl BlueprintTrainer {
             per_flop_cfg.river_buckets,
         ];
 
-        // Global preflop storage (BlueprintStorage, always in memory).
-        let preflop_storage = BlueprintStorage::new(&self.tree, [169, 1, 1, 1]);
+        // Use self.storage as preflop storage so TUI can see preflop regrets.
+        // (self.storage was created with [169, 1, 1, 1] for per-flop mode)
 
         // Bucket lookup for per-flop bucket files.
         let bucket_lookup = AllBuckets::new(per_flop_bucket_counts, [None, None, None, None]);
@@ -578,7 +578,7 @@ impl BlueprintTrainer {
         let mut epoch = 0u64;
         let rake_rate = self.config.game.rake_rate;
         let rake_cap = self.config.game.rake_cap;
-        let preflop_ref = &preflop_storage;
+        let preflop_ref = &self.storage;
         let bucket_lookup_ref = &bucket_lookup;
         let tree_ref = &self.tree;
         let storages_ref = &flop_storages;
