@@ -92,16 +92,29 @@ impl CompactStorage {
 
     /// Add a delta to a single regret value atomically.
     ///
-    /// Saturating add — clamps at ±32,767 instead of wrapping.
+    /// Asymptotic add — delta is damped as the value approaches ±32,767.
+    ///
+    /// `effective_delta = delta × (1 - |current| / 32767)`
+    ///
+    /// Near zero, full delta is applied. Near the limits, almost nothing.
+    /// The value approaches ±32,767 asymptotically but never reaches it,
+    /// preserving gradient between actions with different true regrets.
     #[inline]
     pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
         let atom = &self.regrets[idx];
-        // CAS loop for saturating add.
         let mut current = atom.load(Ordering::Relaxed);
         loop {
-            let new_val = (i32::from(current) + delta).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            let cur_i32 = i32::from(current);
+            let remaining = 32767 - cur_i32.abs();
+            // Damped delta: proportional to headroom remaining.
+            // +1 avoids division giving 0 when remaining is small.
+            let effective = delta * remaining / 32768;
+            let new_val = (cur_i32 + effective).clamp(-32767, 32767) as i16;
+            if new_val == current {
+                break; // No change — avoid spinning
+            }
             match atom.compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => break,
                 Err(actual) => current = actual,
@@ -152,15 +165,22 @@ impl CompactStorage {
         i64::from(self.strategy_sums[idx].load(Ordering::Relaxed))
     }
 
-    /// Saturating add for strategy sums — clamps at i32 range.
+    /// Asymptotic add for strategy sums — damped as value approaches i32 limits.
     #[inline]
     pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
         let atom = &self.strategy_sums[idx];
+        let max_val = i32::MAX as i64;
         let mut current = atom.load(Ordering::Relaxed);
         loop {
-            let new_val = (i64::from(current) + delta).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            let cur_i64 = i64::from(current);
+            let remaining = max_val - cur_i64.abs();
+            let effective = delta * remaining / (max_val + 1);
+            let new_val = (cur_i64 + effective).clamp(-max_val, max_val) as i32;
+            if new_val == current {
+                break;
+            }
             match atom.compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => break,
                 Err(actual) => current = actual,
@@ -340,10 +360,7 @@ impl RegretStorage for CompactStorage {
         self.num_actions(node_idx)
     }
 
-    #[inline]
-    fn delta_scale(&self) -> f64 {
-        100.0
-    }
+    // Use default delta_scale (1000.0) — asymptotic add handles overflow.
 }
 
 #[cfg(test)]
