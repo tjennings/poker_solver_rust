@@ -602,6 +602,7 @@ impl BlueprintTrainer {
             let bucket_lookup_ref = &bucket_lookup;
             let tree_ref = &self.tree;
             let storages_ref = &flop_storages;
+            let ev_tracker = &self.scenario_ev_tracker;
 
             rayon::scope(|s| {
                 for _ in 0..rayon::current_num_threads() {
@@ -623,12 +624,12 @@ impl BlueprintTrainer {
                                 traverse_external(
                                     tree_ref, preflop_ref, flop_storage,
                                     &deal, 0, tree_ref.root, false, 0, &mut rng,
-                                    rake_rate, rake_cap, None,
+                                    rake_rate, rake_cap, Some(ev_tracker),
                                 );
                                 traverse_external(
                                     tree_ref, preflop_ref, flop_storage,
                                     &deal, 1, tree_ref.root, false, 0, &mut rng,
-                                    rake_rate, rake_cap, None,
+                                    rake_rate, rake_cap, Some(ev_tracker),
                                 );
                             }
 
@@ -647,7 +648,7 @@ impl BlueprintTrainer {
             // Update TUI metrics from preflop storage.
             self.update_strategy_delta();
 
-            // Refresh strategy grids for TUI scenarios.
+            // Refresh strategy grids + EVs for TUI scenarios.
             if let Some(ref callback) = self.on_strategy_refresh {
                 for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
                     let player = match &self.tree.nodes[node_idx as usize] {
@@ -657,6 +658,7 @@ impl BlueprintTrainer {
                     let hand_evs = self.scenario_ev_tracker.hand_ev_array(i, player);
                     callback(i, node_idx, &self.storage, &self.tree, &hand_evs);
                 }
+                self.scenario_ev_tracker.reset();
             }
 
             if !self.tui_active {
