@@ -16,7 +16,7 @@ use crate::datagen::bucketed_storage::{
 };
 use crate::model::bucketed_network::BucketedCfvNet;
 use crate::model::loss::masked_huber_loss;
-use crate::model::training::{collect_data_files, cosine_lr};
+use crate::model::training::{collect_data_files, cosine_lr_with_warmup};
 
 /// Configuration for bucketed training.
 pub struct BucketedTrainConfig {
@@ -33,6 +33,9 @@ pub struct BucketedTrainConfig {
     pub shuffle_buffer_size: usize,
     pub prefetch_depth: usize,
     pub encoder_threads: usize,
+    /// Number of linear warmup steps at the start of training.
+    /// During warmup, LR ramps linearly from `lr_min` to `learning_rate`.
+    pub warmup_steps: usize,
 }
 
 /// Result returned after bucketed training completes.
@@ -597,7 +600,9 @@ pub fn train_bucketed<B: AutodiffBackend>(
                 epoch_loss = final_loss as f64;
             }
 
-            let lr = cosine_lr(config.learning_rate, config.lr_min, global_step, total_steps);
+            let lr = cosine_lr_with_warmup(
+                config.learning_rate, config.lr_min, global_step, total_steps, config.warmup_steps,
+            );
             let grads = loss.backward();
             let grads_params = GradientsParams::from_grads(grads, &model);
             model = optim.step(lr, model, grads_params);
@@ -606,11 +611,12 @@ pub fn train_bucketed<B: AutodiffBackend>(
             pb.inc(1);
         }
 
-        let lr_now = cosine_lr(
+        let lr_now = cosine_lr_with_warmup(
             config.learning_rate,
             config.lr_min,
             global_step.saturating_sub(1),
             total_steps,
+            config.warmup_steps,
         );
 
         let mut summary = format!(
@@ -662,6 +668,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use crate::datagen::bucketed_storage::{write_bucketed_header, write_bucketed_record};
+    use crate::model::training::cosine_lr;
 
     type B = Autodiff<NdArray>;
 
@@ -680,6 +687,7 @@ mod tests {
             shuffle_buffer_size: 100,
             prefetch_depth: 2,
             encoder_threads: 2,
+            warmup_steps: 0, // no warmup in tests for simplicity
         }
     }
 

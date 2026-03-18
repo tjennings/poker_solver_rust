@@ -198,6 +198,9 @@ enum Commands {
         /// Shuffle buffer size
         #[arg(long, default_value = "262144")]
         shuffle_buffer_size: usize,
+        /// Linear LR warmup steps (default: 1000)
+        #[arg(long, default_value = "1000")]
+        warmup_steps: usize,
         /// Backend: wgpu, ndarray, or cuda
         #[arg(long, default_value_t = default_backend())]
         backend: String,
@@ -301,13 +304,13 @@ fn main() {
         Commands::TrainBucketed {
             data, output, hidden_layers, hidden_size, batch_size, epochs,
             learning_rate, lr_min, huber_delta, validation_split,
-            checkpoint_every_n_epochs, shuffle_buffer_size, backend,
+            checkpoint_every_n_epochs, shuffle_buffer_size, warmup_steps, backend,
         } => {
             ensure_parent_dir(&output);
             cmd_train_bucketed(
                 data, output, hidden_layers, hidden_size, batch_size, epochs,
                 learning_rate, lr_min, huber_delta, validation_split,
-                checkpoint_every_n_epochs, shuffle_buffer_size, backend,
+                checkpoint_every_n_epochs, shuffle_buffer_size, warmup_steps, backend,
             );
         }
     }
@@ -1326,6 +1329,7 @@ fn cmd_train_bucketed(
     validation_split: f64,
     checkpoint_every_n_epochs: usize,
     shuffle_buffer_size: usize,
+    warmup_steps: usize,
     backend: String,
 ) {
     // Peek at the first data file to get num_buckets from the header.
@@ -1362,6 +1366,7 @@ fn cmd_train_bucketed(
         shuffle_buffer_size,
         prefetch_depth: 4,
         encoder_threads,
+        warmup_steps,
     };
 
     std::fs::create_dir_all(&output).unwrap_or_else(|e| {
@@ -1376,7 +1381,7 @@ fn cmd_train_bucketed(
     eprintln!("  Architecture: {input_size} -> {hidden_layers}x{hidden_size} -> {output_size}");
     eprintln!("  Epochs:       {epochs}");
     eprintln!("  Batch size:   {batch_size}");
-    eprintln!("  LR:           {learning_rate} -> {lr_min} (cosine)");
+    eprintln!("  LR:           {learning_rate} -> {lr_min} (cosine, warmup={warmup_steps})");
     eprintln!("  Huber delta:  {huber_delta}");
     eprintln!("  Backend:      {backend}");
 

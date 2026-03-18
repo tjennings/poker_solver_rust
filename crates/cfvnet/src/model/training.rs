@@ -115,15 +115,43 @@ impl PreEncoded {
     }
 }
 
-/// Cosine annealing learning rate schedule.
+/// Cosine annealing learning rate schedule (no warmup).
 ///
 /// Returns `lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(pi * t / total_steps))`.
+///
+/// This is a convenience wrapper around [`cosine_lr_with_warmup`] with
+/// `warmup_steps = 0`, used by the combo-space training loop.
 pub(crate) fn cosine_lr(lr_max: f64, lr_min: f64, step: usize, total_steps: usize) -> f64 {
+    cosine_lr_with_warmup(lr_max, lr_min, step, total_steps, 0)
+}
+
+/// Cosine annealing learning rate schedule with optional linear warmup.
+///
+/// During warmup (`step < warmup_steps`): linearly ramp from `lr_min` to `lr_max`.
+/// After warmup: cosine decay from `lr_max` to `lr_min` over the remaining steps.
+pub(crate) fn cosine_lr_with_warmup(
+    lr_max: f64,
+    lr_min: f64,
+    step: usize,
+    total_steps: usize,
+    warmup_steps: usize,
+) -> f64 {
     if total_steps == 0 {
         return lr_max;
     }
-    let t = step.min(total_steps) as f64;
-    let total = total_steps as f64;
+    if step < warmup_steps {
+        // Linear warmup from lr_min to lr_max.
+        let progress = step as f64 / warmup_steps as f64;
+        return lr_min + progress * (lr_max - lr_min);
+    }
+    // Cosine decay over remaining steps.
+    let adjusted_step = (step - warmup_steps).min(total_steps.saturating_sub(warmup_steps));
+    let adjusted_total = total_steps.saturating_sub(warmup_steps);
+    if adjusted_total == 0 {
+        return lr_min;
+    }
+    let t = adjusted_step as f64;
+    let total = adjusted_total as f64;
     lr_min + 0.5 * (lr_max - lr_min) * (1.0 + (std::f64::consts::PI * t / total).cos())
 }
 
@@ -881,6 +909,62 @@ mod tests {
         // Midpoint of cosine = (lr_max + lr_min) / 2
         let expected_mid = (0.01 + 0.001) / 2.0;
         assert!((lr_mid - expected_mid).abs() < 1e-9, "mid lr should be {expected_mid}, got {lr_mid}");
+    }
+
+    #[test]
+    fn cosine_lr_warmup() {
+        use super::cosine_lr_with_warmup;
+
+        let lr_max = 0.01;
+        let lr_min = 0.001;
+        let total = 200;
+        let warmup = 20;
+
+        // At step 0: should be lr_min (start of warmup).
+        let lr0 = cosine_lr_with_warmup(lr_max, lr_min, 0, total, warmup);
+        assert!((lr0 - lr_min).abs() < 1e-9, "warmup step 0 should be lr_min, got {lr0}");
+
+        // During warmup: linearly increasing.
+        let lr10 = cosine_lr_with_warmup(lr_max, lr_min, 10, total, warmup);
+        assert!(lr10 > lr_min && lr10 < lr_max, "warmup mid should be between min/max, got {lr10}");
+        let expected_warmup_mid = lr_min + 0.5 * (lr_max - lr_min);
+        assert!(
+            (lr10 - expected_warmup_mid).abs() < 1e-9,
+            "warmup midpoint should be {expected_warmup_mid}, got {lr10}"
+        );
+
+        // At end of warmup: should be lr_max.
+        let lr_at_warmup_end = cosine_lr_with_warmup(lr_max, lr_min, warmup, total, warmup);
+        assert!(
+            (lr_at_warmup_end - lr_max).abs() < 1e-9,
+            "at warmup end should be lr_max, got {lr_at_warmup_end}"
+        );
+
+        // After warmup: cosine decay from lr_max to lr_min.
+        let lr_final = cosine_lr_with_warmup(lr_max, lr_min, total, total, warmup);
+        assert!(
+            (lr_final - lr_min).abs() < 1e-9,
+            "at final step should be lr_min, got {lr_final}"
+        );
+
+        // Cosine midpoint after warmup.
+        let cosine_mid_step = warmup + (total - warmup) / 2;
+        let lr_cosine_mid = cosine_lr_with_warmup(lr_max, lr_min, cosine_mid_step, total, warmup);
+        let expected_cosine_mid = (lr_max + lr_min) / 2.0;
+        assert!(
+            (lr_cosine_mid - expected_cosine_mid).abs() < 1e-9,
+            "cosine midpoint should be {expected_cosine_mid}, got {lr_cosine_mid}"
+        );
+
+        // Zero warmup should match plain cosine_lr.
+        for step in [0, 25, 50, 75, 100] {
+            let plain = cosine_lr(lr_max, lr_min, step, 100);
+            let with_warmup = cosine_lr_with_warmup(lr_max, lr_min, step, 100, 0);
+            assert!(
+                (plain - with_warmup).abs() < 1e-12,
+                "warmup=0 should match plain cosine_lr at step {step}: {plain} vs {with_warmup}"
+            );
+        }
     }
 
     #[test]

@@ -4,32 +4,47 @@ use burn::{
     tensor::{backend::Backend, Tensor},
 };
 
-/// A single hidden block: Linear -> PReLU (no batch norm).
+/// A single hidden block: Linear -> PReLU with optional residual connection.
 ///
 /// Unlike the standard `HiddenBlock` used in [`CfvNet`](super::network::CfvNet),
 /// this block omits `BatchNorm` — the Supremus bucketed architecture does not
 /// need it, and `BatchNorm` introduces inference-time issues.
+///
+/// When `residual` is true (i.e., input and output dimensions match), a skip
+/// connection is added: `output = PReLU(Linear(x)) + x`. This improves gradient
+/// flow in deep networks (7+ layers).
 #[derive(Module, Debug)]
 pub struct BucketedHiddenBlock<B: Backend> {
     pub linear: Linear<B>,
     pub activation: PRelu<B>,
+    /// Whether to add a skip connection (only when in_features == out_features).
+    pub residual: bool,
 }
 
 impl<B: Backend> BucketedHiddenBlock<B> {
     /// Create a new hidden block with the given input/output dimensions.
+    ///
+    /// A residual (skip) connection is automatically enabled when
+    /// `in_features == out_features`.
     pub fn new(device: &B::Device, in_features: usize, out_features: usize) -> Self {
         Self {
             linear: LinearConfig::new(in_features, out_features).init(device),
             activation: PReluConfig::new()
                 .with_num_parameters(out_features)
                 .init(device),
+            residual: in_features == out_features,
         }
     }
 
-    /// Forward pass through linear layer then PReLU activation.
+    /// Forward pass through linear layer then PReLU activation, with optional
+    /// residual connection.
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let x = self.linear.forward(x);
-        self.activation.forward(x)
+        let out = self.activation.forward(self.linear.forward(x.clone()));
+        if self.residual {
+            out + x
+        } else {
+            out
+        }
     }
 }
 
@@ -122,15 +137,32 @@ impl<B: Backend> BucketedCfvNet<B> {
     ///
     /// Returns `[batch, 2*num_buckets]` counterfactual values where the
     /// range-weighted game values of OOP and IP sum to zero.
+    ///
+    /// # Input Scaling
+    ///
+    /// Reach values are ~1/num_buckets per bucket (range sums to ~1.0 over
+    /// num_buckets entries), while pot/stack is ~0.5. To fix the ~250:1 scale
+    /// mismatch, the reach portion is scaled by `num_buckets` before feeding
+    /// to the network, so both feature groups are ~O(1).
+    ///
+    /// The zero-sum correction uses the **original** unscaled reach values,
+    /// since game value = `sum(reach * cfv)` must use the true reach probabilities.
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        let raw = self.forward_raw(input.clone());
         let nb = self.num_buckets;
+
+        // Scale reach inputs for the network (reach values are ~1/num_buckets, scale to ~1.0).
+        let reach = input.clone().slice([None, Some((0, (2 * nb) as i64))]);
+        let pot = input.clone().slice([None, Some(((2 * nb) as i64, (2 * nb + 1) as i64))]);
+        let scaled_input = Tensor::cat(vec![reach.mul_scalar(nb as f64), pot], 1);
+
+        // Run through network with scaled input.
+        let raw = self.forward_raw(scaled_input);
 
         // Extract per-player raw CFVs: [batch, num_buckets] each.
         let oop_cfv = raw.clone().slice([None, Some((0, nb as i64))]);
         let ip_cfv = raw.slice([None, Some((nb as i64, (2 * nb) as i64))]);
 
-        // Extract per-player range distributions from input.
+        // Zero-sum correction using ORIGINAL (unscaled) reach for correct game values.
         let oop_range = input.clone().slice([None, Some((0, nb as i64))]);
         let ip_range = input.slice([None, Some((nb as i64, (2 * nb) as i64))]);
 
