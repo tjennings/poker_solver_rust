@@ -117,6 +117,50 @@ pub struct DealWithBuckets {
     pub buckets: [[u16; 4]; 2],
 }
 
+/// Compute flop-street buckets from a per-flop file's turn bucket assignments.
+///
+/// For each combo, computes the average turn bucket across all turn cards
+/// (a proxy for overall hand strength/potential on this flop), then
+/// rank-assigns combos into `flop_k` ordered buckets. Bucket 0 = weakest,
+/// bucket `flop_k - 1` = strongest.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn compute_flop_buckets_from_turn(pf: &PerFlopBucketFile, flop_k: usize) -> Vec<u16> {
+    const COMBOS: usize = 1326;
+    let num_turns = pf.turn_cards.len();
+
+    if num_turns == 0 || flop_k == 0 {
+        return vec![0; COMBOS];
+    }
+
+    // Compute average turn bucket for each combo.
+    let mut avg_positions: Vec<(usize, f64)> = (0..COMBOS)
+        .map(|ci| {
+            let mut sum = 0u64;
+            let mut count = 0u32;
+            for t in 0..num_turns {
+                let bucket = pf.turn_buckets[t * COMBOS + ci];
+                // Skip blocked combos (bucket 0 with all-zero pattern).
+                sum += u64::from(bucket);
+                count += 1;
+            }
+            let avg = if count > 0 { sum as f64 / count as f64 } else { 0.0 };
+            (ci, avg)
+        })
+        .collect();
+
+    // Sort by average position (ascending = weakest first).
+    avg_positions.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Rank-assign into flop_k buckets.
+    let mut flop_buckets = vec![0u16; COMBOS];
+    for (rank, &(ci, _)) in avg_positions.iter().enumerate() {
+        let bucket = (rank * flop_k / COMBOS).min(flop_k - 1);
+        flop_buckets[ci] = bucket as u16;
+    }
+
+    flop_buckets
+}
+
 /// Loaded bucket assignments for all 4 streets.
 ///
 /// During MCCFR, we look up buckets by street using the deal's cards.
@@ -135,6 +179,9 @@ pub struct AllBuckets {
     /// Per-flop bucket files, keyed by canonical flop `PackedBoard`.
     /// Fully populated at startup by `with_per_flop_dir` — read-only during training.
     per_flop_cache: FxHashMap<PackedBoard, Arc<PerFlopBucketFile>>,
+    /// Computed flop-street buckets per canonical flop (derived from turn-bucket histograms).
+    /// `per_flop_flop_buckets[flop_key][combo_idx]` = flop bucket for this combo.
+    per_flop_flop_buckets: FxHashMap<PackedBoard, Vec<u16>>,
     /// Map from canonical flop `PackedBoard` to flop file index (the NNNN
     /// in `flop_NNNN.buckets`).
     flop_index_map: Option<FxHashMap<PackedBoard, u16>>,
@@ -161,6 +208,7 @@ impl AllBuckets {
             board_maps,
             per_flop_dir: None,
             per_flop_cache: FxHashMap::default(),
+            per_flop_flop_buckets: FxHashMap::default(),
             flop_index_map: None,
         }
     }
@@ -195,6 +243,12 @@ impl AllBuckets {
                     let packed = canonical_key(&wb.cards);
                     #[allow(clippy::cast_possible_truncation)]
                     index_map.insert(packed, i as u16);
+
+                    // Compute flop buckets from turn-bucket histograms.
+                    let flop_k = self.bucket_counts[1] as usize;
+                    let flop_buckets = compute_flop_buckets_from_turn(&pf, flop_k);
+                    self.per_flop_flop_buckets.insert(packed, flop_buckets);
+
                     cache.insert(packed, Arc::new(pf));
                 }
             }
@@ -277,10 +331,11 @@ impl AllBuckets {
         let ci = combo_index(h0, h1) as usize;
 
         if street_idx == 1 {
-            // Flop: use combo index as bucket. With per-flop regrets each
-            // flop has its own regret table, so combo-based bucketing is
-            // deterministic and fast. ~1176 valid combos / 500 buckets ≈ 2.4
-            // combos per bucket — near-lossless.
+            // Flop: use pre-computed flop buckets derived from turn-bucket histograms.
+            if let Some(fb) = self.per_flop_flop_buckets.get(&flop_key) {
+                return Some(fb[ci]);
+            }
+            // Fallback if no flop buckets computed (shouldn't happen with eager loading).
             let k = self.bucket_counts[1] as usize;
             return Some((ci % k) as u16);
         }
