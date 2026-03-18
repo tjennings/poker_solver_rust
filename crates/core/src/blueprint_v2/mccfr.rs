@@ -183,20 +183,24 @@ impl AllBuckets {
 
         let mut index_map = FxHashMap::default();
         let canonical_flops = enumerate_canonical_flops();
+        let mut cache = self.per_flop_cache.write().expect("per_flop_cache lock");
 
-        // Build index from canonical flop enumeration (no file I/O).
-        // Flop index N corresponds to enumerate_canonical_flops()[N].
-        // Only include indices that have a corresponding file on disk.
+        // Eagerly load all per-flop bucket files into memory.
+        // ~6MB each × 1,755 flops = ~10GB. Eliminates RwLock contention
+        // and disk I/O during training.
         for (i, wb) in canonical_flops.iter().enumerate() {
             let path = dir.join(format!("flop_{i:04}.buckets"));
             if path.exists() {
-                let packed = canonical_key(&wb.cards);
-                #[allow(clippy::cast_possible_truncation)]
-                index_map.insert(packed, i as u16);
+                if let Ok(pf) = PerFlopBucketFile::load(&path) {
+                    let packed = canonical_key(&wb.cards);
+                    #[allow(clippy::cast_possible_truncation)]
+                    index_map.insert(packed, i as u16);
+                    cache.insert(packed, Arc::new(pf));
+                }
             }
         }
+        drop(cache);
 
-        // index_map.len() flops indexed for lazy loading
         self.per_flop_dir = Some(dir);
         self.flop_index_map = Some(index_map);
         self
