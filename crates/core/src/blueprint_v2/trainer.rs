@@ -537,7 +537,7 @@ impl BlueprintTrainer {
             .as_ref()
             .ok_or("per_flop_regrets requires clustering.per_flop config")?;
 
-        let _cluster_path = self
+        let cluster_path = self
             .config
             .training
             .cluster_path
@@ -568,13 +568,52 @@ impl BlueprintTrainer {
             bucket_lookup
         };
 
-        // Allocate ALL 1,755 per-flop regret tables in memory.
-        // No disk I/O during training — only save on snapshots.
+        // Per-flop regret directory.
+        let regret_dir = std::path::PathBuf::from(cluster_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("per_flop_regrets");
+        std::fs::create_dir_all(&regret_dir)?;
+
+        // Load or create all 1,755 per-flop regret tables.
         let schedule = EpochSchedule::new();
         let num_flops = schedule.len();
+        let preflop_regret_path = regret_dir.join("preflop.regrets");
+
+        // Resume preflop regrets if available.
+        if preflop_regret_path.exists() {
+            if let Ok(loaded) = BlueprintStorage::load_regrets(
+                &preflop_regret_path, &self.tree, [169, 1, 1, 1],
+            ) {
+                // Copy loaded regrets into self.storage.
+                for (i, atom) in loaded.regrets.iter().enumerate() {
+                    self.storage.regrets[i].store(atom.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+                for (i, atom) in loaded.strategy_sums.iter().enumerate() {
+                    self.storage.strategy_sums[i].store(atom.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+                eprintln!("  Resumed preflop regrets from {}", preflop_regret_path.display());
+            }
+        }
+
+        // Load or create per-flop regret tables.
         let flop_storages: Vec<CompactStorage> = (0..num_flops)
-            .map(|_| CompactStorage::new(&self.tree, per_flop_bucket_counts))
+            .map(|i| {
+                let path = regret_dir.join(format!("flop_{i:04}.regrets"));
+                if path.exists() {
+                    if let Ok(cs) = CompactStorage::load_regrets(&path, &self.tree, per_flop_bucket_counts) {
+                        return cs;
+                    }
+                }
+                CompactStorage::new(&self.tree, per_flop_bucket_counts)
+            })
             .collect();
+        let resumed_count = (0..num_flops)
+            .filter(|i| regret_dir.join(format!("flop_{i:04}.regrets")).exists())
+            .count();
+        if resumed_count > 0 {
+            eprintln!("  Resumed {resumed_count}/{num_flops} per-flop regret tables");
+        }
 
         let mut epoch = 0u64;
         let rake_rate = self.config.game.rake_rate;
@@ -733,10 +772,32 @@ impl BlueprintTrainer {
                     break;
                 }
             }
+            // Periodic save.
+            let save_interval = self.config.snapshots.snapshot_every_minutes;
+            if self.elapsed_minutes() >= self.last_snapshot_time + save_interval {
+                eprintln!("  Saving per-flop regrets...");
+                self.storage.save_regrets(&preflop_regret_path)?;
+                flop_storages.par_iter().enumerate().for_each(|(i, cs)| {
+                    let path = regret_dir.join(format!("flop_{i:04}.regrets"));
+                    cs.save_regrets(&path).ok();
+                });
+                self.last_snapshot_time = self.elapsed_minutes();
+                eprintln!("  Saved.");
+            }
+
             if self.quit_requested.load(Ordering::Relaxed) {
                 break;
             }
         }
+
+        // Final save on exit.
+        eprintln!("  Final save...");
+        self.storage.save_regrets(&preflop_regret_path)?;
+        flop_storages.par_iter().enumerate().for_each(|(i, cs)| {
+            let path = regret_dir.join(format!("flop_{i:04}.regrets"));
+            cs.save_regrets(&path).ok();
+        });
+        eprintln!("  Done.");
 
         Ok(())
     }
