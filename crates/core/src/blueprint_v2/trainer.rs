@@ -470,12 +470,12 @@ impl BlueprintTrainer {
                 let mut stats = PruneStats::default();
 
                 let (_, s0) = traverse_external(
-                    tree, storage, &deal, 0, tree.root, prune, threshold, &mut rng,
+                    tree, storage, storage, &deal, 0, tree.root, prune, threshold, &mut rng,
                     rake_rate, rake_cap, Some(ev_tracker),
                 );
                 stats.merge(s0);
                 let (_, s1) = traverse_external(
-                    tree, storage, &deal, 1, tree.root, prune, threshold, &mut rng,
+                    tree, storage, storage, &deal, 1, tree.root, prune, threshold, &mut rng,
                     rake_rate, rake_cap, Some(ev_tracker),
                 );
                 stats.merge(s1);

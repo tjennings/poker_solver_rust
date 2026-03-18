@@ -49,7 +49,7 @@ use super::bucket_file::{BucketFile, PackedBoard};
 use super::cluster_pipeline::{canonical_key, combo_index};
 use super::game_tree::{GameNode, GameTree, TerminalKind};
 use super::per_flop_bucket_file::PerFlopBucketFile;
-use super::storage::BlueprintStorage;
+use super::storage::{BlueprintStorage, RegretStorage};
 use super::Street;
 use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::poker::{Card, Hand, Rankable, ALL_SUITS, ALL_VALUES};
@@ -477,7 +477,8 @@ impl ScenarioEvTracker {
 #[allow(clippy::too_many_arguments)]
 pub fn traverse_external(
     tree: &GameTree,
-    storage: &BlueprintStorage,
+    preflop_storage: &dyn RegretStorage,
+    postflop_storage: &dyn RegretStorage,
     deal: &DealWithBuckets,
     traverser: u8,
     node_idx: u32,
@@ -496,8 +497,8 @@ pub fn traverse_external(
         GameNode::Chance { child, .. } => {
             // Board cards are pre-dealt in the Deal; just recurse.
             traverse_external(
-                tree, storage, deal, traverser, *child, prune, prune_threshold, rng,
-                rake_rate, rake_cap, ev_tracker,
+                tree, preflop_storage, postflop_storage, deal, traverser, *child,
+                prune, prune_threshold, rng, rake_rate, rake_cap, ev_tracker,
             )
         }
 
@@ -512,10 +513,17 @@ pub fn traverse_external(
             let num_actions = children.len();
 
             let bucket = deal.buckets[player as usize][street as usize];
+            let storage: &dyn RegretStorage = if street == Street::Preflop {
+                preflop_storage
+            } else {
+                postflop_storage
+            };
 
             if player == traverser {
                 traverse_traverser(
                     tree,
+                    preflop_storage,
+                    postflop_storage,
                     storage,
                     deal,
                     traverser,
@@ -533,6 +541,8 @@ pub fn traverse_external(
             } else {
                 traverse_opponent(
                     tree,
+                    preflop_storage,
+                    postflop_storage,
                     storage,
                     deal,
                     traverser,
@@ -617,7 +627,9 @@ fn terminal_value(
 #[allow(clippy::too_many_arguments)]
 fn traverse_traverser(
     tree: &GameTree,
-    storage: &BlueprintStorage,
+    preflop_storage: &dyn RegretStorage,
+    postflop_storage: &dyn RegretStorage,
+    storage: &dyn RegretStorage,
     deal: &DealWithBuckets,
     traverser: u8,
     node_idx: u32,
@@ -654,8 +666,8 @@ fn traverse_traverser(
         }
 
         let (child_ev, child_stats) = traverse_external(
-            tree, storage, deal, traverser, child_idx, prune, prune_threshold, rng,
-            rake_rate, rake_cap, ev_tracker,
+            tree, preflop_storage, postflop_storage, deal, traverser, child_idx,
+            prune, prune_threshold, rng, rake_rate, rake_cap, ev_tracker,
         );
         action_values[a] = child_ev;
         node_value += strategy[a] * child_ev;
@@ -696,7 +708,9 @@ fn traverse_traverser(
 #[allow(clippy::too_many_arguments)]
 fn traverse_opponent(
     tree: &GameTree,
-    storage: &BlueprintStorage,
+    preflop_storage: &dyn RegretStorage,
+    postflop_storage: &dyn RegretStorage,
+    storage: &dyn RegretStorage,
     deal: &DealWithBuckets,
     traverser: u8,
     node_idx: u32,
@@ -727,8 +741,8 @@ fn traverse_opponent(
     }
 
     traverse_external(
-        tree, storage, deal, traverser, children[chosen], prune, prune_threshold, rng,
-        rake_rate, rake_cap, ev_tracker,
+        tree, preflop_storage, postflop_storage, deal, traverser, children[chosen],
+        prune, prune_threshold, rng, rake_rate, rake_cap, ev_tracker,
     )
 }
 
@@ -844,7 +858,7 @@ mod tests {
 
         for _ in 0..20 {
             traverse_external(
-                &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
+                &tree, &storage, &storage, &precomputed, 0, tree.root, false, -310_000_000,
                 &mut rng, 0.0, 0.0, Some(&tracker),
             );
         }
@@ -870,7 +884,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         let (ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
+            &tree, &storage, &storage, &precomputed, 0, tree.root, false, -310_000_000,
             &mut rng, 0.0, 0.0, None,
         );
         assert!(ev.is_finite(), "EV should be finite without tracker");
@@ -931,7 +945,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         let (ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
+            &tree, &storage, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
             0.0, 0.0, None,
         );
         assert!(ev.is_finite(), "EV should be finite, got {ev}");
@@ -949,11 +963,11 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         let (ev0, _) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
+            &tree, &storage, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
             0.0, 0.0, None,
         );
         let (ev1, _) = traverse_external(
-            &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
+            &tree, &storage, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
             0.0, 0.0, None,
         );
 
@@ -975,7 +989,7 @@ mod tests {
         assert!(storage.regrets.iter().all(|r| r.load(Ordering::Relaxed) == 0));
 
         let (_ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
+            &tree, &storage, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
             0.0, 0.0, None,
         );
 
@@ -997,7 +1011,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         let (_ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
+            &tree, &storage, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
             0.0, 0.0, None,
         );
 
@@ -1021,11 +1035,11 @@ mod tests {
 
         for _ in 0..50 {
             let _ = traverse_external(
-                &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
+                &tree, &storage, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
                 0.0, 0.0, None,
             );
             let _ = traverse_external(
-                &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
+                &tree, &storage, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
                 0.0, 0.0, None,
             );
         }
@@ -1063,7 +1077,7 @@ mod tests {
         }
 
         let (ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, true, -310_000_000, &mut rng,
+            &tree, &storage, &storage, &precomputed, 0, tree.root, true, -310_000_000, &mut rng,
             0.0, 0.0, None,
         );
         assert!(ev.is_finite());
@@ -1487,6 +1501,7 @@ mod tests {
         assert!(all.board_maps[3].is_none());
     }
 
+<<<<<<< HEAD
     // ── Per-flop bucket lookup tests ─────────────────────────────────
 
     /// Helper: build a PerFlopBucketFile for a given canonical flop with
@@ -1835,5 +1850,60 @@ mod tests {
                 }
             }
         }
+=======
+    #[test]
+    fn split_storage_routes_regrets_by_street() {
+        let tree = toy_tree();
+        let preflop_storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let postflop_storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
+        let precomputed = make_precomputed(&buckets, make_deal());
+        let mut rng = StdRng::seed_from_u64(42);
+
+        for _ in 0..50 {
+            let _ = traverse_external(
+                &tree, &preflop_storage, &postflop_storage, &precomputed,
+                0, tree.root, false, -310_000_000, &mut rng,
+                0.0, 0.0, None,
+            );
+            let _ = traverse_external(
+                &tree, &preflop_storage, &postflop_storage, &precomputed,
+                1, tree.root, false, -310_000_000, &mut rng,
+                0.0, 0.0, None,
+            );
+        }
+
+        // Verify routing: for each decision node that was visited,
+        // regrets must appear ONLY in the correct storage (preflop or postflop).
+        // Not every node is necessarily visited (external sampling), so we
+        // check the exclusion property and also that at least some preflop
+        // and some postflop nodes were updated.
+        let mut preflop_updated = false;
+        let mut postflop_updated = false;
+        for (i, node) in tree.nodes.iter().enumerate() {
+            if let GameNode::Decision { street, .. } = node {
+                let na = preflop_storage.num_actions(i as u32) as usize;
+                let in_pre = (0..10u16).any(|b| {
+                    (0..na).any(|a| preflop_storage.get_regret(i as u32, b, a) != 0)
+                });
+                let in_post = (0..10u16).any(|b| {
+                    (0..na).any(|a| postflop_storage.get_regret(i as u32, b, a) != 0)
+                });
+                if *street == Street::Preflop {
+                    // Preflop node: must NOT appear in postflop_storage.
+                    assert!(!in_post,
+                        "preflop node {i} should NOT have regrets in postflop_storage");
+                    if in_pre { preflop_updated = true; }
+                } else {
+                    // Postflop node: must NOT appear in preflop_storage.
+                    assert!(!in_pre,
+                        "postflop node {i} should NOT have regrets in preflop_storage");
+                    if in_post { postflop_updated = true; }
+                }
+            }
+        }
+        assert!(preflop_updated, "at least one preflop node should have regrets");
+        assert!(postflop_updated, "at least one postflop node should have regrets");
+>>>>>>> 7305d90 (feat(blueprint_v2): add RegretStorage trait and split MCCFR traversal by street)
     }
 }

@@ -28,6 +28,16 @@ fn humanize_bytes(bytes: usize) -> String {
     }
 }
 
+/// Trait for regret/strategy storage used by MCCFR traversal.
+pub trait RegretStorage: Sync {
+    fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32;
+    fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32);
+    fn current_strategy_into(&self, node_idx: u32, bucket: u16, out: &mut [f64]);
+    fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64;
+    fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64);
+    fn num_actions(&self, node_idx: u32) -> usize;
+}
+
 /// Flat-buffer storage for regrets and strategy sums.
 pub struct BlueprintStorage {
     /// Cumulative regrets: one `AtomicI32` per (decision node, bucket, action).
@@ -430,6 +440,38 @@ impl BlueprintStorage {
     }
 }
 
+impl RegretStorage for BlueprintStorage {
+    #[inline]
+    fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
+        self.get_regret(node_idx, bucket, action)
+    }
+
+    #[inline]
+    fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
+        self.add_regret(node_idx, bucket, action, delta);
+    }
+
+    #[inline]
+    fn current_strategy_into(&self, node_idx: u32, bucket: u16, out: &mut [f64]) {
+        self.current_strategy_into(node_idx, bucket, out);
+    }
+
+    #[inline]
+    fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64 {
+        self.get_strategy_sum(node_idx, bucket, action)
+    }
+
+    #[inline]
+    fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
+        self.add_strategy_sum(node_idx, bucket, action, delta);
+    }
+
+    #[inline]
+    fn num_actions(&self, node_idx: u32) -> usize {
+        self.num_actions(node_idx) as usize
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +672,48 @@ mod tests {
 
         let (delta, _pct) = storage.strategy_delta(&snap);
         assert!(delta > 0.0, "changed strategy should have delta > 0, got {delta}");
+    }
+
+    #[test]
+    fn blueprint_storage_implements_regret_storage_trait() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
+
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+
+        // Use the trait through a dynamic reference.
+        let dyn_storage: &dyn RegretStorage = &storage;
+
+        // num_actions should match
+        let num_actions = dyn_storage.num_actions(node_idx);
+        assert!(num_actions > 0, "should have at least one action");
+
+        // Initial regrets should be zero.
+        assert_eq!(dyn_storage.get_regret(node_idx, 0, 0), 0);
+
+        // Add regret via trait, read back.
+        dyn_storage.add_regret(node_idx, 0, 0, 500);
+        assert_eq!(dyn_storage.get_regret(node_idx, 0, 0), 500);
+
+        // Initial strategy sums should be zero.
+        assert_eq!(dyn_storage.get_strategy_sum(node_idx, 0, 0), 0);
+
+        // Add strategy sum via trait, read back.
+        dyn_storage.add_strategy_sum(node_idx, 0, 0, 1000);
+        assert_eq!(dyn_storage.get_strategy_sum(node_idx, 0, 0), 1000);
+
+        // current_strategy_into via trait.
+        let mut buf = vec![0.0f64; num_actions];
+        dyn_storage.current_strategy_into(node_idx, 0, &mut buf);
+        // After adding 500 regret to action 0, action 0 should have probability 1.0.
+        assert!(
+            (buf[0] - 1.0).abs() < 1e-10,
+            "action 0 should have prob 1.0, got {}",
+            buf[0]
+        );
     }
 }
