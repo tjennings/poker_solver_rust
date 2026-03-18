@@ -554,8 +554,9 @@ impl BlueprintTrainer {
         // Use self.storage as preflop storage so TUI can see preflop regrets.
         // (self.storage was created with [169, 1, 1, 1] for per-flop mode)
 
-        // Bucket lookup for per-flop bucket files.
-        let bucket_lookup = AllBuckets::new(per_flop_bucket_counts, [None, None, None, None]);
+        // Bucket lookup: preflop=169 lossless, postflop from per-flop config.
+        let lookup_bucket_counts = [169, per_flop_cfg.flop_buckets, per_flop_cfg.turn_buckets, per_flop_cfg.river_buckets];
+        let bucket_lookup = AllBuckets::new(lookup_bucket_counts, [None, None, None, None]);
         let bucket_lookup = if let Some(ref cp) = self.config.training.cluster_path {
             let per_flop_marker = std::path::Path::new(cp).join("flop_0000.buckets");
             if per_flop_marker.exists() {
