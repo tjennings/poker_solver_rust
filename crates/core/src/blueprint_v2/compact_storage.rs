@@ -92,13 +92,21 @@ impl CompactStorage {
 
     /// Add a delta to a single regret value atomically.
     ///
-    /// The delta is clamped to `i16` range before addition.
+    /// Saturating add — clamps at ±32,767 instead of wrapping.
     #[inline]
     pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
-        let clamped = delta.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
-        self.regrets[idx].fetch_add(clamped, Ordering::Relaxed);
+        let atom = &self.regrets[idx];
+        // CAS loop for saturating add.
+        let mut current = atom.load(Ordering::Relaxed);
+        loop {
+            let new_val = (i32::from(current) + delta).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            match atom.compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Write the current regret-matched strategy into a caller-supplied buffer.
@@ -144,15 +152,20 @@ impl CompactStorage {
         i64::from(self.strategy_sums[idx].load(Ordering::Relaxed))
     }
 
-    /// Add a delta to a single strategy sum value atomically.
-    ///
-    /// The delta is clamped to `i32` range before addition.
+    /// Saturating add for strategy sums — clamps at i32 range.
     #[inline]
     pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
-        let clamped = delta.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
-        self.strategy_sums[idx].fetch_add(clamped, Ordering::Relaxed);
+        let atom = &self.strategy_sums[idx];
+        let mut current = atom.load(Ordering::Relaxed);
+        loop {
+            let new_val = (i64::from(current) + delta).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            match atom.compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Number of actions at a decision node.
