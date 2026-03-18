@@ -173,50 +173,30 @@ impl AllBuckets {
 
     /// Enable per-flop bucket lookups for turn and river streets.
     ///
-    /// Scans `dir` for `flop_NNNN.buckets` files, loads each header to
-    /// extract the canonical flop, and builds an index mapping each flop
-    /// `PackedBoard` to its file index.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal per-flop cache lock is poisoned.
+    /// Builds an index mapping each canonical flop `PackedBoard` to its
+    /// file index using the deterministic canonical flop enumeration.
+    /// No files are loaded — per-flop bucket files are loaded lazily
+    /// on first access via `get_per_flop_file`.
     #[must_use]
     pub fn with_per_flop_dir(mut self, dir: PathBuf) -> Self {
+        use super::cluster_pipeline::enumerate_canonical_flops;
+
         let mut index_map = FxHashMap::default();
+        let canonical_flops = enumerate_canonical_flops();
 
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = match path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n.to_string(),
-                    None => continue,
-                };
-                // Match flop_NNNN.buckets pattern
-                if !name.starts_with("flop_") || !name.ends_with(".buckets") {
-                    continue;
-                }
-                let idx_str = &name[5..name.len() - 8]; // strip "flop_" and ".buckets"
-                let file_index: u16 = match idx_str.parse() {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                // Load the file to get the flop cards
-                if let Ok(pf) = PerFlopBucketFile::load(&path) {
-                    let Ok(canonical) = CanonicalBoard::from_cards(&pf.flop_cards[..]) else {
-                        continue;
-                    };
-                    let packed = canonical_key(&canonical.cards);
-                    index_map.insert(packed, file_index);
-                    // Also cache the loaded file
-                    self.per_flop_cache
-                        .write()
-                        .expect("per_flop_cache lock")
-                        .insert(packed, Arc::new(pf));
-                }
+        // Build index from canonical flop enumeration (no file I/O).
+        // Flop index N corresponds to enumerate_canonical_flops()[N].
+        // Only include indices that have a corresponding file on disk.
+        for (i, wb) in canonical_flops.iter().enumerate() {
+            let path = dir.join(format!("flop_{i:04}.buckets"));
+            if path.exists() {
+                let packed = canonical_key(&wb.cards);
+                #[allow(clippy::cast_possible_truncation)]
+                index_map.insert(packed, i as u16);
             }
         }
 
+        eprintln!("  Per-flop index: {} flops available (lazy loading)", index_map.len());
         self.per_flop_dir = Some(dir);
         self.flop_index_map = Some(index_map);
         self
@@ -251,11 +231,19 @@ impl AllBuckets {
                 }
             }
         }
-        // Fallback: equity-based bucketing.
-        let equity = crate::showdown_equity::compute_equity(hole, board);
-        let k = self.bucket_counts[street_idx];
-        let bucket = (equity * f64::from(k)) as u16;
-        bucket.min(k - 1)
+        // Equity fallback — only available in tests. Production must have bucket files.
+        #[cfg(test)]
+        {
+            let equity = crate::showdown_equity::compute_equity(hole, board);
+            let k = self.bucket_counts[street_idx];
+            let bucket = (equity * f64::from(k)) as u16;
+            return bucket.min(k - 1);
+        }
+        #[cfg(not(test))]
+        panic!(
+            "Bucket lookup failed: street={street_idx} board={board:?} hole={hole:?}. \
+             No bucket file or per-flop file found. Equity fallback is disabled in production."
+        )
     }
 
     /// Per-flop bucket lookup for turn (`street_idx`=2) or river (`street_idx`=3).
@@ -1503,9 +1491,24 @@ mod tests {
 
     // ── Per-flop bucket lookup tests ─────────────────────────────────
 
+    /// Find the canonical flop index for a given set of flop cards.
+    fn canonical_flop_index(flop: [Card; 3]) -> usize {
+        use crate::blueprint_v2::cluster_pipeline::enumerate_canonical_flops;
+        let canonical = CanonicalBoard::from_cards(&flop[..]).unwrap();
+        let packed = canonical_key(&canonical.cards);
+        let all = enumerate_canonical_flops();
+        for (i, wb) in all.iter().enumerate() {
+            let wb_packed = canonical_key(&wb.cards);
+            if wb_packed == packed {
+                return i;
+            }
+        }
+        panic!("flop not found in canonical enumeration: {flop:?}");
+    }
+
     /// Helper: build a PerFlopBucketFile for a given canonical flop with
-    /// deterministic bucket assignments, save it to the given directory,
-    /// and return the flop cards used.
+    /// deterministic bucket assignments, save it to the given directory
+    /// at the correct canonical index, and return the flop cards used.
     fn save_test_per_flop_file(
         dir: &std::path::Path,
         flop: [Card; 3],
@@ -1513,7 +1516,6 @@ mod tests {
         river_cards_per_turn: Vec<Vec<Card>>,
         turn_bucket_count: u16,
         river_bucket_count: u16,
-        file_index: usize,
     ) -> crate::blueprint_v2::per_flop_bucket_file::PerFlopBucketFile {
         use crate::blueprint_v2::per_flop_bucket_file::PerFlopBucketFile;
 
@@ -1549,6 +1551,7 @@ mod tests {
             river_buckets_per_turn,
         };
 
+        let file_index = canonical_flop_index(flop);
         let path = dir.join(format!("flop_{file_index:04}.buckets"));
         pf.save(&path).expect("save per-flop file");
         pf
@@ -1569,7 +1572,7 @@ mod tests {
             dir.path(), flop,
             vec![turn_card],
             vec![vec![river_card]],
-            10, 10, 0,
+            10, 10,
         );
 
         let all = AllBuckets::new(
@@ -1602,7 +1605,7 @@ mod tests {
             dir.path(), flop,
             vec![turn_card],
             vec![vec![river_card]],
-            10, 10, 0,
+            10, 10,
         );
 
         let all = AllBuckets::new(
@@ -1646,7 +1649,7 @@ mod tests {
             dir.path(), flop,
             vec![turn_card],
             vec![vec![river_card]],
-            10, 10, 0,
+            10, 10,
         );
 
         let all = AllBuckets::new(
@@ -1685,7 +1688,7 @@ mod tests {
             dir.path(), flop,
             vec![turn_card],
             vec![vec![river_card]],
-            10, 10, 0,
+            10, 10,
         );
 
         let all = AllBuckets::new(
@@ -1717,7 +1720,7 @@ mod tests {
             dir.path(), flop,
             vec![c(Value::Ace, Suit::Club)],
             vec![vec![c(Value::Ten, Suit::Club)]],
-            10, 10, 0,
+            10, 10,
         );
 
         // Also provide a global flop bucket file
@@ -1753,7 +1756,7 @@ mod tests {
             dir.path(), flop,
             vec![c(Value::Ace, Suit::Club)],
             vec![vec![c(Value::Ten, Suit::Club)]],
-            10, 10, 0,
+            10, 10,
         );
 
         let all = AllBuckets::new(
