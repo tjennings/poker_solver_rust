@@ -8,6 +8,7 @@ pub mod cluster_diagnostics;
 pub mod cluster_pipeline;
 pub mod clustering;
 pub mod config;
+pub mod epoch_schedule;
 pub mod equity_cache;
 pub mod full_depth_solver;
 pub mod game_tree;
