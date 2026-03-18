@@ -342,7 +342,7 @@ impl RegretStorage for CompactStorage {
 
     #[inline]
     fn delta_scale(&self) -> f64 {
-        10.0
+        100.0
     }
 }
 
