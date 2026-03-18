@@ -212,8 +212,8 @@ impl AllBuckets {
     /// For turn (`street_idx`=2) and river (`street_idx`=3), when `per_flop_dir`
     /// is set, uses per-flop bucket files instead of global bucket files.
     fn lookup_bucket(&self, street_idx: usize, hole: [Card; 2], board: &[Card]) -> u16 {
-        // Per-flop lookup for turn and river when available
-        if (street_idx == 2 || street_idx == 3) && self.per_flop_dir.is_some() {
+        // Per-flop lookup for flop, turn, and river when per-flop dir is set
+        if street_idx >= 1 && self.per_flop_dir.is_some() {
             if let Some(bucket) = self.lookup_per_flop(street_idx, hole, board) {
                 return bucket;
             }
@@ -273,6 +273,16 @@ impl AllBuckets {
         // Apply the flop's suit mapping to the hole cards for combo index
         let (h0, h1) = canonical_flop.canonicalize_holding(hole[0], hole[1]);
         let ci = combo_index(h0, h1) as usize;
+
+        if street_idx == 1 {
+            // Flop: use equity-based bucketing within this flop's bucket space.
+            // Per-flop regrets give each flop its own regret table, so equity
+            // ordering within a single board is an appropriate bucketing.
+            let equity = crate::showdown_equity::compute_equity([h0, h1], board);
+            let k = self.bucket_counts[1];
+            let bucket = (equity * f64::from(k)) as u16;
+            return Some(bucket.min(k - 1));
+        }
 
         // Map the turn card through the flop's suit canonicalization
         let canon_turn = canonical_flop.mapping.map_card(board[3]);
