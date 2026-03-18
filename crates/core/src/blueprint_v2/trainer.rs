@@ -623,6 +623,10 @@ impl BlueprintTrainer {
             self.config.training.time_limit_minutes.unwrap_or(u64::MAX) * 60
         );
 
+        // Create diagnostic log file on startup.
+        let log_path = regret_dir.join("regret_diag.log");
+        { let _ = std::fs::File::create(&log_path); }
+
         // Shuffled schedule indices for each epoch
         let mut schedule_indices: Vec<usize> = (0..num_flops).collect();
 
