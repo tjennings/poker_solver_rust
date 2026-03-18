@@ -1108,6 +1108,8 @@ mod tests {
                 dcfr_alpha: 1.0,
                 dcfr_beta: 1.0,
                 dcfr_gamma: 1.0,
+                per_flop_regrets: false,
+                preload_buffer_size: 32,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 9999,

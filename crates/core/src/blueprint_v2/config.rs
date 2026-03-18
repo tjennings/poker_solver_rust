@@ -37,10 +37,13 @@ pub struct GameConfig {
 
 /// Per-flop clustering configuration.
 ///
-/// When present in `ClusteringConfig`, enables per-flop turn/river clustering
-/// where each flop texture gets its own set of turn and river buckets.
+/// When present in `ClusteringConfig`, enables per-flop clustering
+/// where each flop texture gets its own set of flop, turn, and river buckets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerFlopConfig {
+    /// Number of flop buckets per flop. Defaults to 200.
+    #[serde(default = "default_per_flop_buckets")]
+    pub flop_buckets: u16,
     /// Number of turn buckets per flop. Defaults to 200.
     #[serde(default = "default_per_flop_buckets")]
     pub turn_buckets: u16,
@@ -52,6 +55,7 @@ pub struct PerFlopConfig {
 impl Default for PerFlopConfig {
     fn default() -> Self {
         Self {
+            flop_buckets: default_per_flop_buckets(),
             turn_buckets: default_per_flop_buckets(),
             river_buckets: default_per_flop_buckets(),
         }
@@ -197,6 +201,12 @@ pub struct TrainingConfig {
     /// When omitted, expected delta is computed on-the-fly (slower).
     #[serde(default)]
     pub equity_cache_path: Option<String>,
+    /// Enable per-flop regret tables.
+    #[serde(default)]
+    pub per_flop_regrets: bool,
+    /// Number of flops to preload ahead of workers.
+    #[serde(default = "default_preload_buffer_size")]
+    pub preload_buffer_size: usize,
 }
 
 /// Snapshot (checkpoint) output settings.
@@ -222,6 +232,10 @@ pub struct SnapshotConfig {
 
 const fn default_per_flop_buckets() -> u16 {
     200
+}
+
+const fn default_preload_buffer_size() -> usize {
+    32
 }
 
 const fn default_seed() -> u64 {
@@ -422,6 +436,8 @@ snapshots:
                 dcfr_alpha: 1.5,
                 dcfr_beta: 0.0,
                 dcfr_gamma: 2.0,
+                per_flop_regrets: false,
+                preload_buffer_size: 32,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 120,
@@ -650,5 +666,178 @@ snapshots:
         assert_eq!(cfg.game.name, "Raked Game");
         assert!((cfg.game.rake_rate - 0.05).abs() < f64::EPSILON);
         assert!((cfg.game.rake_cap - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_per_flop_regrets_config() {
+        let yaml = r#"
+game:
+  name: "Per-Flop Regrets"
+  players: 2
+  stack_depth: 100.0
+  small_blind: 0.5
+  big_blind: 1.0
+
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+
+action_abstraction:
+  preflop:
+    - ["2.5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+
+training:
+  cluster_path: "/tmp/clusters"
+  iterations: 100
+  per_flop_regrets: true
+  preload_buffer_size: 16
+
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse per-flop regrets config");
+
+        assert!(cfg.training.per_flop_regrets);
+        assert_eq!(cfg.training.preload_buffer_size, 16);
+    }
+
+    #[test]
+    fn test_per_flop_regrets_defaults() {
+        // When per_flop_regrets and preload_buffer_size are omitted,
+        // they should default to false and 32 respectively.
+        let yaml = r#"
+game:
+  name: "Defaults"
+  players: 2
+  stack_depth: 100.0
+  small_blind: 0.5
+  big_blind: 1.0
+
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+
+action_abstraction:
+  preflop:
+    - ["2.5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+
+training:
+  cluster_path: "/tmp/clusters"
+  iterations: 100
+
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse defaults config");
+
+        assert!(!cfg.training.per_flop_regrets);
+        assert_eq!(cfg.training.preload_buffer_size, 32);
+    }
+
+    #[test]
+    fn test_old_config_backwards_compat_with_new_training_fields() {
+        // Old configs that predate per_flop_regrets and preload_buffer_size
+        // must still parse without error.
+        let yaml = r#"
+game:
+  name: "Legacy"
+  players: 6
+  stack_depth: 100.0
+  small_blind: 0.5
+  big_blind: 1.0
+
+clustering:
+  algorithm: potential_aware_emd
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+
+action_abstraction:
+  preflop:
+    - ["2.5bb"]
+  flop:
+    - [0.33, 0.67, 1.0]
+  turn:
+    - [0.5, 1.0]
+  river:
+    - [0.5, 1.0]
+
+training:
+  cluster_path: "/tmp/clusters"
+  iterations: 10000
+  lcfr_warmup_iterations: 5000000
+
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse legacy config");
+
+        // New fields get defaults
+        assert!(!cfg.training.per_flop_regrets);
+        assert_eq!(cfg.training.preload_buffer_size, 32);
+        // Existing fields still work
+        assert_eq!(cfg.training.lcfr_warmup_iterations, 5_000_000);
+    }
+
+    #[test]
+    fn test_per_flop_config_with_flop_buckets() {
+        let yaml = r#"
+turn_buckets: 300
+river_buckets: 400
+flop_buckets: 150
+"#;
+        let pf: PerFlopConfig =
+            serde_yaml::from_str(yaml).expect("failed to parse PerFlopConfig with flop_buckets");
+        assert_eq!(pf.turn_buckets, 300);
+        assert_eq!(pf.river_buckets, 400);
+        assert_eq!(pf.flop_buckets, 150);
+    }
+
+    #[test]
+    fn test_per_flop_config_flop_buckets_default() {
+        // When flop_buckets is omitted, it should default to 200.
+        let pf = PerFlopConfig::default();
+        assert_eq!(pf.flop_buckets, 200);
     }
 }
