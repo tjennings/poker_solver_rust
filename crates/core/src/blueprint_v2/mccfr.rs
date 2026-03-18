@@ -275,13 +275,12 @@ impl AllBuckets {
         let ci = combo_index(h0, h1) as usize;
 
         if street_idx == 1 {
-            // Flop: use equity-based bucketing within this flop's bucket space.
-            // Per-flop regrets give each flop its own regret table, so equity
-            // ordering within a single board is an appropriate bucketing.
-            let equity = crate::showdown_equity::compute_equity([h0, h1], board);
-            let k = self.bucket_counts[1];
-            let bucket = (equity * f64::from(k)) as u16;
-            return Some(bucket.min(k - 1));
+            // Flop: use combo index as bucket. With per-flop regrets each
+            // flop has its own regret table, so combo-based bucketing is
+            // deterministic and fast. ~1176 valid combos / 500 buckets ≈ 2.4
+            // combos per bucket — near-lossless.
+            let k = self.bucket_counts[1] as usize;
+            return Some((ci % k) as u16);
         }
 
         // Map the turn card through the flop's suit canonicalization

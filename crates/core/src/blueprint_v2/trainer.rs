@@ -220,19 +220,33 @@ impl BlueprintTrainer {
             config.clustering.river.buckets,
         ];
 
-        let storage = BlueprintStorage::new(&tree, bucket_counts);
-        let bucket_files = match &config.training.cluster_path {
-            Some(path) => load_bucket_files(Path::new(path)),
-            None => [None, None, None, None],
+        // Per-flop training skips global storage and bucket file loading —
+        // it creates its own storage in train_per_flop().
+        let storage = if config.training.per_flop_regrets {
+            BlueprintStorage::new(&tree, [1, 1, 1, 1]) // placeholder, unused
+        } else {
+            BlueprintStorage::new(&tree, bucket_counts)
+        };
+        let bucket_files = if config.training.per_flop_regrets {
+            [None, None, None, None] // skip loading
+        } else {
+            match &config.training.cluster_path {
+                Some(path) => load_bucket_files(Path::new(path)),
+                None => [None, None, None, None],
+            }
         };
         let buckets = AllBuckets::new(bucket_counts, bucket_files);
 
-        // Auto-detect per-flop bucket files
-        let buckets = if let Some(ref cluster_path) = config.training.cluster_path {
-            let per_flop_marker = Path::new(cluster_path).join("flop_0000.buckets");
-            if per_flop_marker.exists() {
-                eprintln!("  Detected per-flop bucket files in {cluster_path}");
-                buckets.with_per_flop_dir(Path::new(cluster_path).to_path_buf())
+        // Auto-detect per-flop bucket files (only for non-per-flop training)
+        let buckets = if !config.training.per_flop_regrets {
+            if let Some(ref cluster_path) = config.training.cluster_path {
+                let per_flop_marker = Path::new(cluster_path).join("flop_0000.buckets");
+                if per_flop_marker.exists() {
+                    eprintln!("  Detected per-flop bucket files in {cluster_path}");
+                    buckets.with_per_flop_dir(Path::new(cluster_path).to_path_buf())
+                } else {
+                    buckets
+                }
             } else {
                 buckets
             }
@@ -541,7 +555,9 @@ impl BlueprintTrainer {
         ];
 
         // Global preflop storage (BlueprintStorage, always in memory).
+        eprintln!("[init] creating preflop storage...");
         let preflop_storage = BlueprintStorage::new(&self.tree, [169, 1, 1, 1]);
+        eprintln!("[init] preflop storage done");
 
         // Per-flop regret store (CompactStorage backed by disk).
         let regret_dir = std::path::PathBuf::from(cluster_path)
@@ -556,11 +572,15 @@ impl BlueprintTrainer {
         );
 
         // Bucket lookup using per-flop bucket counts with equity fallback.
+        eprintln!("[init] creating bucket lookup...");
         let bucket_lookup = AllBuckets::new(per_flop_bucket_counts, [None, None, None, None]);
         let bucket_lookup = if let Some(ref cp) = self.config.training.cluster_path {
             let per_flop_marker = std::path::Path::new(cp).join("flop_0000.buckets");
             if per_flop_marker.exists() {
-                bucket_lookup.with_per_flop_dir(std::path::PathBuf::from(cp))
+                eprintln!("[init] building per-flop index (lazy)...");
+                let bl = bucket_lookup.with_per_flop_dir(std::path::PathBuf::from(cp));
+                eprintln!("[init] per-flop index done");
+                bl
             } else {
                 bucket_lookup
             }
@@ -568,7 +588,9 @@ impl BlueprintTrainer {
             bucket_lookup
         };
 
+        eprintln!("[init] creating epoch schedule...");
         let mut schedule = EpochSchedule::new();
+        eprintln!("[init] schedule done ({} entries)", schedule.len());
         let mut epoch = 0u64;
         let rake_rate = self.config.game.rake_rate;
         let rake_cap = self.config.game.rake_cap;
@@ -590,9 +612,13 @@ impl BlueprintTrainer {
             eprintln!();
         }
 
+        eprintln!("[init] entering epoch loop");
         loop {
+            eprintln!("[epoch] shuffling schedule...");
             schedule.shuffle(&mut self.rng);
+            eprintln!("[epoch] starting epoch (preloader + writer)...");
             let (ready_rx, dirty_tx, handles) = store.start_epoch(&schedule, buffer_size);
+            eprintln!("[epoch] epoch started, entering rayon scope...");
 
             let epoch_deals = std::sync::atomic::AtomicU64::new(0);
             let epoch_deals_ref = &epoch_deals;
