@@ -745,20 +745,17 @@ impl BlueprintTrainer {
                 );
             }
 
-            // Every 100 epochs, print preflop strategy sample (--no-tui only)
-            if !self.tui_active && epoch % 100 == 0 {
-                for (i, node) in self.tree.nodes.iter().enumerate() {
-                    if let super::game_tree::GameNode::Decision { street, .. } = node {
-                        if *street == super::Street::Preflop {
-                            for bucket in [0u16, 50, 100, 168] {
-                                let strat = self.storage.current_strategy(i as u32, bucket);
-                                eprintln!("    Preflop node={i} bucket={bucket}: {:?}",
-                                    strat.iter().map(|s| format!("{:.2}", s)).collect::<Vec<_>>());
-                            }
-                            break;
-                        }
-                    }
-                }
+            // Dump preflop regret tree to log file every 500 epochs.
+            if epoch % 500 == 0 {
+                let log_path = regret_dir.join("regret_diag.log");
+                // Sample hands: AA=0, AKs≈1, KQo≈30, 72o≈168 (approximate canonical indices)
+                super::regret_diag::dump_preflop_regrets(
+                    &log_path,
+                    &self.tree,
+                    &self.storage,
+                    &["AA", "AKs", "JTs", "72o"],
+                    &[0, 1, 50, 168],
+                );
             }
 
             // Check stopping conditions

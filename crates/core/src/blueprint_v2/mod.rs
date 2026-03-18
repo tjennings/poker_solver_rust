@@ -1,6 +1,7 @@
 pub mod bucket_file;
 pub mod compact_storage;
 pub mod per_flop_bucket_file;
+pub mod regret_diag;
 pub mod bundle;
 pub mod cbv;
 pub mod cbv_compute;
