@@ -14,7 +14,26 @@ Per-flop regret tables solve this: each flop's regret table is independent, so b
 ### Two-Level Storage
 
 - **Preflop:** Global regret table (i16), always in memory. 169 lossless buckets.
-- **Per-flop (flop + turn + river):** 1,755 independent regret tables (i16), one per canonical flop. Each table uses 500 per-flop buckets for flop, turn, and river decisions. Managed by a FIFO disk-backed cache.
+- **Per-flop (flop + turn + river):** 1,755 independent regret tables (i16), one per canonical flop. Each table uses 500 per-flop buckets for flop, turn, and river decisions. Loaded/saved to disk, with a preload buffer keeping the next N flops ready in memory.
+
+### i16 Quantized Storage
+
+A new `CompactStorage` struct replaces `BlueprintStorage` for per-flop use:
+
+- **Regrets:** `Vec<AtomicI16>` — 2 bytes per slot (clamped to ±32,767)
+- **Strategy sums:** `Vec<AtomicI32>` — 4 bytes per slot (sufficient for per-flop accumulation)
+- **Total:** 6 bytes per slot vs 12 bytes in `BlueprintStorage`
+
+With `[1, 500, 500, 500]` bucket counts and the current action tree (~87M postflop slots):
+- `BlueprintStorage`: 87M × 12 = **1.04 GB per flop**
+- `CompactStorage`: 87M × 6 = **522 MB per flop**
+
+With postflop-only allocation (preflop=0, skip preflop nodes entirely):
+- `CompactStorage`: ~86M × 6 = **516 MB per flop**
+
+16 active threads × 516 MB = **8.3 GB active memory**. Feasible.
+
+`CompactStorage` implements the same interface as `BlueprintStorage` (`get_regret`, `add_regret`, `current_strategy`, etc.) so the MCCFR traversal code doesn't change — it just uses a trait or generic.
 
 ### Training Loop
 
@@ -22,64 +41,56 @@ Each "epoch" processes all 1,755 canonical flops exactly once, with each flop vi
 
 ```
 Epoch:
-  1. Build schedule: all 1755 flops, each repeated `weight` times, shuffled
-     Total deals per epoch = C(52,3) = 22,100
-  2. AtomicUsize counter = 0
-  3. 16 threads, each loops:
-     a. idx = counter.fetch_add(1)
-     b. if idx >= schedule.len(): epoch done
-     c. Load flop's regret table from FIFO cache (or disk)
-     d. Sample random hole cards for both players
-     e. MCCFR traversal:
-        - Preflop: use global regret table
-        - Flop/Turn/River: use this flop's regret table
-     f. Mark flop's regret table dirty in cache
-     g. Go to (a)
-  4. Flush all dirty tables to disk
-  5. Reshuffle schedule, reset counter, start next epoch
+  1. Build schedule: 1755 entries, each with (flop_index, flop_cards, weight)
+     Shuffle order each epoch
+  2. Preload buffer: background thread loads next N flops from disk
+  3. AtomicUsize work_idx = 0
+  4. 16 worker threads, each loops:
+     a. Pop next ready flop from preload buffer (flop_index, weight, storage)
+     b. Run `weight` MCCFR deals on this flop:
+        - Sample hole cards + turn + river
+        - Preflop decisions: use global preflop storage
+        - Postflop decisions: use this flop's CompactStorage
+     c. Hand dirty storage back for async disk write
+     d. Go to (a)
+  5. When schedule exhausted, flush remaining writes
+  6. Start next epoch
 ```
 
-### FIFO Cache
+### Preload Buffer
 
-- Circular buffer of `flop_cache_capacity` entries (default 1000)
-- Each entry: flop index + `Vec<i16>` regret array + dirty flag
-- When full, flush the oldest entry to disk before loading a new one
-- No random access needed — flops are processed in schedule order and not revisited until next epoch
-- On epoch end, flush all remaining dirty entries
+- Background **reader thread** walks the schedule ahead of workers, loading `CompactStorage` from disk (or creating empty) into a concurrent buffer
+- Buffer capacity: N entries (e.g., 32). When full, reader blocks until workers consume
+- Background **writer thread** receives dirty `CompactStorage` from workers and saves to disk asynchronously
+- Workers never do disk I/O — they only grab from the ready buffer and hand back dirty storage
+- Use `crossbeam::channel::bounded` for multi-consumer support (unlike `mpsc` which is single-consumer)
 
 ### Storage Layout
 
 ```
 regrets/
-  preflop.bin          — i16, always in memory
-  flop_0000.bin        — i16, FIFO cached
-  flop_0001.bin        — i16, FIFO cached
+  preflop.bin              — global, always in memory
+  flop_0000.regrets        — i16/i32 CompactStorage, loaded on demand
+  flop_0001.regrets
   ...
-  flop_1754.bin        — i16, FIFO cached
+  flop_1754.regrets
 ```
 
 ### MCCFR Traversal Changes
 
-The traversal function currently takes a single `BlueprintStorage`. It changes to take:
+The traversal function takes two storage references via a trait or generic:
 
-- `PreflopStorage` — global i16 regret/strategy arrays for preflop decisions
-- `PerFlopStorage` — i16 regret/strategy arrays for this flop's postflop decisions
+- `preflop_storage` — global storage for preflop decisions
+- `postflop_storage` — per-flop storage for flop/turn/river decisions
 
-At the flop chance node, the traversal switches from preflop storage to per-flop storage. The rest of the traversal (flop, turn, river decision nodes) uses the per-flop storage exclusively.
-
-### Per-Flop Regret Table Sizing
-
-Each per-flop table covers all postflop decision nodes in the action tree:
-
-- Flop decisions: 500 buckets × actions at each flop decision node
-- Turn decisions: 500 buckets × actions at each turn decision node
-- River decisions: 500 buckets × actions at each river decision node
-
-The action tree structure is the same for every flop. Only the bucket assignments differ.
-
-### Quantization
-
-All regrets use i16 (−32,768 to +32,767). This provides sufficient dynamic range for MCCFR regret accumulation. Regrets that would exceed the range are clamped.
+At each Decision node, select storage based on street:
+```rust
+let storage = if street == Street::Preflop {
+    preflop_storage
+} else {
+    postflop_storage
+};
+```
 
 ### Config
 
@@ -92,19 +103,19 @@ clustering:
 
 training:
   per_flop_regrets: true
-  regret_quantization: i16
-  flop_cache_capacity: 1000
+  preload_buffer_size: 32
 ```
 
 ## What Changes
 
 | Component | Change |
 |-----------|--------|
-| `BlueprintStorage` | Split into `PreflopStorage` (global, i16) + `PerFlopStorage` (per-flop, i16) |
-| `mccfr.rs` traversal | Takes both storages; switches at flop chance node |
-| `trainer.rs` | Epoch-based loop with atomic counter, FIFO cache |
-| Snapshot save/load | Save preflop.bin + 1,755 flop_NNNN.bin files |
-| Config | New `per_flop_regrets`, `flop_cache_capacity` |
+| New `CompactStorage` | i16 regrets + i32 strategy sums, same API as BlueprintStorage |
+| `mccfr.rs` traversal | Takes preflop + postflop storage; selects by street |
+| `trainer.rs` | Epoch-based loop with preload buffer and atomic work-stealing |
+| New `PerFlopRegretStore` | Preload buffer with reader/writer threads using crossbeam channels |
+| Snapshot save/load | Save preflop.bin + flush all per-flop .regrets files |
+| Config | New `per_flop_regrets`, `preload_buffer_size` |
 
 ## What Does NOT Change
 

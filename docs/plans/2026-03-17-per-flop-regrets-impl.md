@@ -2,432 +2,322 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use hex:executing-plans to implement this plan task-by-task.
 
-**Goal:** Split MCCFR regret storage into global preflop + per-flop postflop tables with disk-backed FIFO cache, enabling per-flop bucketing to produce coherent strategies.
+**Goal:** Split MCCFR regret storage into global preflop + per-flop postflop tables with i16-quantized compact storage and a preload buffer for concurrent disk I/O.
 
-**Architecture:** The existing `BlueprintStorage` is reused as-is for both preflop (global) and per-flop (local) contexts — same API, different instances. A new `PerFlopRegretStore` manages the FIFO cache of per-flop `BlueprintStorage` instances. The training loop changes from random deal sampling to epoch-based weighted round-robin with atomic work-stealing.
+**Architecture:** A new `CompactStorage` (i16 regrets, i32 strategy sums) replaces `BlueprintStorage` for per-flop use, cutting per-flop memory from 1GB to 500MB. A `PerFlopRegretStore` manages a preload buffer using crossbeam channels for true multi-consumer support. Workers grab ready flops from the buffer, process them, and hand back dirty storage for async write.
 
-**Tech Stack:** Rust, rayon, existing BlueprintStorage, bincode for serialization
+**Tech Stack:** Rust, rayon, crossbeam-channel, existing BlueprintStorage API
 
 **Design doc:** `docs/plans/2026-03-17-per-flop-regrets-design.md`
 
 ---
 
-### Task 1: PerFlopRegretStore — FIFO Cache
+### Task 1: CompactStorage — i16 Regrets, i32 Strategy Sums
 
-Create the disk-backed FIFO cache that manages per-flop `BlueprintStorage` instances.
-
-**Files:**
-- Create: `crates/core/src/blueprint_v2/per_flop_regret_store.rs`
-- Modify: `crates/core/src/blueprint_v2/mod.rs` (add module)
-
-**The struct:**
-
-```rust
-pub struct PerFlopRegretStore {
-    /// Directory where per-flop regret files are stored
-    dir: PathBuf,
-    /// The game tree (shared across all flops — same action structure)
-    tree: Arc<GameTree>,
-    /// Bucket counts for postflop streets [flop_k, turn_k, river_k]
-    postflop_bucket_counts: [u16; 3],
-    /// FIFO cache: VecDeque of (flop_index, storage, dirty)
-    cache: Mutex<VecDeque<CacheEntry>>,
-    /// Max entries in cache
-    capacity: usize,
-}
-
-struct CacheEntry {
-    flop_index: u16,
-    storage: BlueprintStorage,
-    dirty: bool,
-}
-```
-
-**Key methods:**
-
-```rust
-impl PerFlopRegretStore {
-    /// Create a new store. Creates the directory if needed.
-    pub fn new(dir: PathBuf, tree: Arc<GameTree>, postflop_bucket_counts: [u16; 3], capacity: usize) -> Self;
-
-    /// Get or load a flop's storage. If cache is full, flush oldest.
-    /// Returns a reference that borrows the cache lock.
-    ///
-    /// Since threads work on different flops (atomic work-stealing),
-    /// we can take the entry OUT of the cache, give it to the thread,
-    /// and have the thread put it back when done.
-    pub fn checkout(&self, flop_index: u16) -> BlueprintStorage;
-
-    /// Return a storage to the cache after use. Marks as dirty.
-    pub fn checkin(&self, flop_index: u16, storage: BlueprintStorage);
-
-    /// Flush all dirty entries to disk.
-    pub fn flush_all(&self) -> std::io::Result<()>;
-
-    /// Save a single storage to disk.
-    fn save_flop(&self, flop_index: u16, storage: &BlueprintStorage) -> std::io::Result<()>;
-
-    /// Load a storage from disk (or create empty if file doesn't exist).
-    fn load_flop(&self, flop_index: u16) -> BlueprintStorage;
-}
-```
-
-The `checkout`/`checkin` pattern avoids holding the Mutex during traversal. The thread takes ownership of the `BlueprintStorage`, runs traversal with it, then returns it.
-
-**Serialization:** Use the existing `BlueprintStorage::save_regrets` / `load_regrets` methods but adapted for i16. Or simpler: just write the raw `Vec<AtomicI32>` values to disk (they'll be i32 on disk even if we clamp to i16 range — i16 quantization can come later as an optimization).
-
-**Storage sizing for one flop:**
-The `BlueprintStorage::new` takes a `GameTree` and `bucket_counts`. For per-flop, the tree is the same but we only use postflop nodes. The `bucket_counts` would be `[0, flop_k, turn_k, river_k]` where preflop=0 (no preflop nodes in per-flop storage). Actually, simpler: use the full tree but set preflop buckets to 0 — preflop decision nodes will have 0 slots allocated.
-
-Actually, even simpler: use `bucket_counts = [1, flop_k, turn_k, river_k]` with preflop=1. The preflop slots (169 × 1 = tiny) will exist but never be used. This avoids any tree modifications.
-
-Wait — the layout computes `buckets * num_actions` per decision node. If preflop buckets = 1 instead of 169, the preflop slots shrink from 169 × actions to 1 × actions. That's fine — a few wasted bytes.
-
-**Tests:**
-- Create store, checkout a flop, checkin, verify it's cached
-- Checkout beyond capacity, verify oldest is flushed to disk
-- Flush all, reload, verify regrets are preserved
-- Concurrent checkout of different flops (no conflicts)
-
-**Step 1:** Write tests
-**Step 2:** Implement `PerFlopRegretStore`
-**Step 3:** Verify: `cargo test -p poker-solver-core per_flop_regret`
-**Step 4:** Commit
-
----
-
-### Task 2: Epoch Schedule Builder
-
-Create the weighted round-robin schedule for training epochs.
+Create a compact storage struct that uses `AtomicI16` for regrets and `AtomicI32` for strategy sums. Same API surface as `BlueprintStorage` so the MCCFR traversal can use either.
 
 **Files:**
-- Create: `crates/core/src/blueprint_v2/epoch_schedule.rs`
+- Create: `crates/core/src/blueprint_v2/compact_storage.rs`
 - Modify: `crates/core/src/blueprint_v2/mod.rs`
 
 **The struct:**
-
 ```rust
-pub struct EpochSchedule {
-    /// Entries: (flop_index, canonical_flop_cards)
-    /// Each flop appears `weight` times.
-    entries: Vec<ScheduleEntry>,
-}
-
-pub struct ScheduleEntry {
-    pub flop_index: u16,
-    pub flop_cards: [Card; 3],
-    pub weight: u32,  // combinatorial weight of this canonical flop
-}
-
-impl EpochSchedule {
-    /// Build a schedule from all canonical flops.
-    /// Total entries = sum of weights = C(52,3) = 22,100.
-    pub fn new() -> Self;
-
-    /// Shuffle the schedule order (for a new epoch).
-    pub fn shuffle(&mut self, rng: &mut impl Rng);
-
-    /// Number of entries (total deals in epoch).
-    pub fn len(&self) -> usize;
-
-    /// Get entry by index.
-    pub fn get(&self, idx: usize) -> &ScheduleEntry;
+pub struct CompactStorage {
+    pub regrets: Vec<AtomicI16>,
+    pub strategy_sums: Vec<AtomicI32>,
+    pub bucket_counts: [u16; 4],
+    layout: Vec<NodeLayout>,  // same NodeLayout as BlueprintStorage
 }
 ```
 
-Uses `enumerate_canonical_flops()` from `cluster_pipeline.rs` to build the schedule. Each canonical flop with weight W appears W times in the schedule (or appears once with `weight` field indicating how many deals to run).
+**Same API as BlueprintStorage:**
+- `new(tree, bucket_counts) -> Self`
+- `get_regret(node_idx, bucket, action) -> i32` (widens i16 to i32 on read)
+- `add_regret(node_idx, bucket, action, delta: i32)` (clamps to i16 range)
+- `current_strategy(node_idx, bucket) -> Vec<f64>`
+- `current_strategy_into(node_idx, bucket, out: &mut [f64])`
+- `get_strategy_sum(node_idx, bucket, action) -> i64` (widens i32 to i64)
+- `add_strategy_sum(node_idx, bucket, action, delta: i64)` (clamps to i32)
+- `save_regrets(path)` / `load_regrets(path, tree, bucket_counts)`
+- `num_slots() -> usize`
 
-Actually, simpler: each entry appears ONCE but carries its `weight`. The training thread runs `weight` deals on that flop before moving to the next entry. This way the schedule has 1,755 entries (not 22,100), and each flop is visited exactly once per epoch.
+**Key: clamping.** `add_regret` adds delta but clamps result to `[-32768, 32767]`. Use `fetch_update` or load-compute-store with CAS loop for atomic clamped add. Or simpler: just let it wrap (the MCCFR algorithm is tolerant of regret magnitude, only signs matter for strategy).
 
-```rust
-pub struct EpochSchedule {
-    entries: Vec<ScheduleEntry>,
-}
+Actually simplest: use `AtomicI16::fetch_add` and let it saturate. Rust's `AtomicI16` wraps on overflow, but we can use `.fetch_add(delta as i16)` which truncates. For MCCFR this is fine — large regrets mean "strongly prefer this action" and clamping to ±32K preserves that signal.
 
-impl EpochSchedule {
-    pub fn new() -> Self {
-        let flops = enumerate_canonical_flops();
-        let entries = flops.iter().enumerate().map(|(i, wb)| {
-            ScheduleEntry {
-                flop_index: i as u16,
-                flop_cards: wb.cards,
-                weight: wb.weight,
-            }
-        }).collect();
-        Self { entries }
-    }
-}
-```
+**Serialization:** Binary format: magic `CMP1`, bucket_counts, then raw i16 regrets, then raw i32 strategy sums. Much smaller files than BlueprintStorage (~500MB vs ~1GB per flop).
 
 **Tests:**
-- Schedule has 1,755 entries
-- Sum of weights = 22,100
-- Shuffle produces different order
+- `new` creates zeroed storage
+- `add_regret` + `get_regret` round-trip
+- `current_strategy` produces valid distribution
+- `save/load` round-trip preserves regrets and strategy sums
+- Size is ~half of equivalent BlueprintStorage
 
-**Step 1:** Write tests
-**Step 2:** Implement
-**Step 3:** Verify: `cargo test -p poker-solver-core epoch_schedule`
-**Step 4:** Commit
+---
+
+### Task 2: Storage Trait for MCCFR
+
+Extract a trait that both `BlueprintStorage` and `CompactStorage` implement, so the traversal code works with either.
+
+**Files:**
+- Create or modify: `crates/core/src/blueprint_v2/storage.rs`
+- Modify: `crates/core/src/blueprint_v2/mccfr.rs`
+
+**The trait:**
+```rust
+pub trait RegretStorage: Sync {
+    fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32;
+    fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32);
+    fn current_strategy_into(&self, node_idx: u32, bucket: u16, out: &mut [f64]);
+    fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64;
+    fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64);
+    fn num_actions(&self, node_idx: u32) -> usize;
+}
+```
+
+Implement for both `BlueprintStorage` and `CompactStorage`.
+
+Change `traverse_external` and related functions to be generic over `S: RegretStorage` instead of taking `&BlueprintStorage` directly.
+
+**Backwards compatible:** Existing code using `&BlueprintStorage` continues to work since it implements the trait.
+
+**Tests:**
+- Existing traversal tests pass unchanged
+- New test: traversal works with `CompactStorage`
 
 ---
 
 ### Task 3: Split MCCFR Traversal for Two-Level Storage
 
-Modify the MCCFR traversal functions to accept both a preflop storage and a postflop storage, selecting the right one based on the current street.
+Modify traversal to accept separate preflop and postflop storage, selecting by street.
 
 **Files:**
 - Modify: `crates/core/src/blueprint_v2/mccfr.rs`
 
-**Current traversal signature:**
+**New signature (using the trait from Task 2):**
 ```rust
-fn traverse_mccfr(
+fn traverse_external<P: RegretStorage, F: RegretStorage>(
     tree: &GameTree,
-    storage: &BlueprintStorage,
-    node_idx: u32,
+    preflop_storage: &P,
+    postflop_storage: &F,
     deal: &DealWithBuckets,
     traverser: usize,
     ...
-) -> f64
+) -> (f64, PruneStats)
 ```
 
-**New traversal signature:**
+At Decision nodes:
 ```rust
-fn traverse_mccfr(
-    tree: &GameTree,
-    preflop_storage: &BlueprintStorage,
-    postflop_storage: &BlueprintStorage,
-    node_idx: u32,
-    deal: &DealWithBuckets,
-    traverser: usize,
-    ...
-) -> f64
-```
-
-At each Decision node, select the storage based on the node's street:
-```rust
-let storage = if street == Street::Preflop {
+let storage: &dyn RegretStorage = if street == Street::Preflop {
     preflop_storage
 } else {
     postflop_storage
 };
 ```
 
-The rest of the traversal logic stays identical — `storage.get_regret(...)`, `storage.add_regret(...)`, etc.
+Or use an enum dispatch to avoid dynamic dispatch overhead on the hot path.
 
-**Also update:**
-- `traverse_mccfr_prune` (the pruning variant)
-- `update_strategy` (strategy sum accumulation)
-- Any other functions that take `&BlueprintStorage`
-
-**Important:** The `DealWithBuckets` precomputes bucket IDs for all 4 streets. The preflop bucket comes from the global bucket lookup. The postflop buckets come from the per-flop bucket lookup (already implemented in `AllBuckets`). No changes needed to bucket lookup — it already uses per-flop files.
+**Backwards compat:** Callers can pass the same storage for both args.
 
 **Tests:**
-- Existing traversal tests should pass with `preflop_storage == postflop_storage` (same object for both)
-- New test: preflop and postflop use different storage objects, regrets accumulate to the correct one
-
-**Step 1:** Update traverse signatures
-**Step 2:** Add street-based storage selection
-**Step 3:** Update all callers
-**Step 4:** Verify existing tests pass
-**Step 5:** Add new test for split storage
-**Step 6:** Commit
+- All existing tests pass (same storage for both)
+- New test: preflop regrets go to preflop storage, postflop to postflop
 
 ---
 
-### Task 4: Epoch-Based Training Loop
+### Task 4: PerFlopRegretStore — Preload Buffer
 
-Replace the current batch-based training loop in `trainer.rs` with the epoch-based weighted round-robin loop.
+The store that manages loading/saving per-flop `CompactStorage` with a background preloader.
 
 **Files:**
-- Modify: `crates/core/src/blueprint_v2/trainer.rs`
+- Create: `crates/core/src/blueprint_v2/per_flop_regret_store.rs`
+- Modify: `crates/core/src/blueprint_v2/mod.rs`
+- Add dependency: `crossbeam-channel` to `crates/core/Cargo.toml`
 
-**Current loop (simplified):**
+**Architecture:**
+```
+Schedule:    [flop_823, flop_12, flop_1504, ...]
+                          ^cursor
+
+Reader thread:  walks schedule from cursor+1, loads CompactStorage from disk
+                sends (flop_index, flop_cards, weight, storage) through bounded channel
+
+Workers:        recv from channel (multi-consumer, no mutex needed)
+                process deals, send dirty storage through write channel
+
+Writer thread:  recv dirty (flop_index, storage), save to disk
+```
+
+Uses `crossbeam::channel::bounded` which supports **multiple consumers** (unlike `std::mpsc`). No Mutex needed for the ready channel.
+
 ```rust
-loop {
-    // Sample random deals in parallel
-    let batch_results: Vec<_> = thread_seeds.into_par_iter().map(|seed| {
-        let deal = sample_deal();
-        let buckets = all_buckets.precompute_buckets(&deal);
-        traverse_mccfr(&tree, &storage, ...);
-    }).collect();
+pub struct PerFlopRegretStore {
+    dir: PathBuf,
+    tree: Arc<GameTree>,
+    bucket_counts: [u16; 4],
+}
 
-    // Apply DCFR discounting periodically
-    iterations += batch_size;
+impl PerFlopRegretStore {
+    pub fn new(dir, tree, bucket_counts) -> Self;
+
+    /// Start an epoch. Spawns reader + writer threads.
+    /// Returns (ready_rx, dirty_tx, join_handles).
+    ///
+    /// Workers call ready_rx.recv() to get next flop (blocks until ready).
+    /// Workers call dirty_tx.send() to return dirty storage.
+    /// Multiple workers can recv concurrently (crossbeam is MPMC).
+    pub fn start_epoch(&self, schedule: &EpochSchedule, buffer_size: usize)
+        -> (Receiver<FlopWork>, Sender<(u16, CompactStorage)>, Vec<JoinHandle<()>>);
+}
+
+pub struct FlopWork {
+    pub flop_index: u16,
+    pub flop_cards: [Card; 3],
+    pub weight: u32,
+    pub storage: CompactStorage,
 }
 ```
 
-**New loop:**
+The key difference from the failed attempt: `start_epoch` returns the channels directly to the caller. Workers call `ready_rx.recv()` themselves — no Mutex wrapper. crossbeam's `Receiver` is `Clone` and supports concurrent recv.
+
+**Tests:**
+- Load/save round-trip preserves regrets
+- Multiple consumers can recv concurrently
+- Writer persists dirty storage to disk
+
+---
+
+### Task 5: sample_deal_for_flop
+
+Add a function to sample random deals conditioned on a specific flop.
+
+**Files:**
+- Modify: `crates/core/src/blueprint_v2/mccfr.rs`
+
 ```rust
-let preflop_storage = BlueprintStorage::new(&tree, [169, 1, 1, 1]);  // preflop only
-let per_flop_store = PerFlopRegretStore::new(regret_dir, tree.clone(), [500, 500, 500], cache_capacity);
-let mut schedule = EpochSchedule::new();
-let epoch_counter = AtomicUsize::new(0);
-
-loop {
-    schedule.shuffle(&mut rng);
-    let work_idx = AtomicUsize::new(0);
-
-    // Process epoch in parallel
-    rayon::scope(|s| {
-        for _ in 0..num_threads {
-            s.spawn(|_| {
-                let mut rng = thread_rng();
-                loop {
-                    let idx = work_idx.fetch_add(1, Ordering::Relaxed);
-                    if idx >= schedule.len() { break; }
-
-                    let entry = schedule.get(idx);
-                    let mut postflop_storage = per_flop_store.checkout(entry.flop_index);
-
-                    // Run `weight` deals on this flop
-                    for _ in 0..entry.weight {
-                        let deal = sample_deal_for_flop(entry.flop_cards, &mut rng);
-                        let buckets = all_buckets.precompute_buckets(&deal);
-                        let deal = DealWithBuckets { deal, buckets };
-
-                        traverse_mccfr(&tree, &preflop_storage, &postflop_storage, ...);
-                        traverse_mccfr(&tree, &preflop_storage, &postflop_storage, ...); // both traversers
-                    }
-
-                    per_flop_store.checkin(entry.flop_index, postflop_storage);
-                }
-            });
-        }
-    });
-
-    per_flop_store.flush_all()?;
-    epochs += 1;
-
-    // DCFR discounting, snapshots, etc.
-}
-```
-
-**Key new function: `sample_deal_for_flop`**
-
-Given a specific canonical flop, sample random hole cards for both players:
-```rust
-fn sample_deal_for_flop(flop: [Card; 3], rng: &mut impl Rng) -> Deal {
-    // Remove flop cards from deck
-    // Sample 4 cards: 2 for each player
-    // Sample 2 more: turn + river
-    // Return Deal { hole_cards, board: [flop + turn + river] }
+pub fn sample_deal_for_flop(flop: [Card; 3], rng: &mut impl Rng) -> Deal {
+    // Build remaining deck (49 cards), shuffle first 6,
+    // assign to hole cards (4) + turn + river
 }
 ```
 
 **Tests:**
-- Epoch processes all 1,755 flops
-- Each flop gets `weight` deals
-- Preflop regrets accumulate globally
-- Per-flop regrets are independent per flop
-- Snapshots save/load correctly
-
-**Step 1:** Add `sample_deal_for_flop`
-**Step 2:** Add epoch loop (can coexist with old loop behind `per_flop_regrets` config flag)
-**Step 3:** Wire up preflop + per-flop storage
-**Step 4:** Verify with a short training run
-**Step 5:** Commit
+- Board starts with the given flop cards
+- All 7 dealt cards are unique
+- Hole cards don't overlap with flop
 
 ---
 
-### Task 5: Config Changes
+### Task 6: Epoch Schedule
 
-Add the new training config fields.
+Create the weighted round-robin schedule.
+
+**Files:**
+- Create: `crates/core/src/blueprint_v2/epoch_schedule.rs`
+- Modify: `crates/core/src/blueprint_v2/mod.rs`
+
+```rust
+pub struct ScheduleEntry {
+    pub flop_index: u16,
+    pub flop_cards: [Card; 3],
+    pub weight: u32,
+}
+
+pub struct EpochSchedule { pub entries: Vec<ScheduleEntry> }
+
+impl EpochSchedule {
+    pub fn new() -> Self;  // 1755 entries from enumerate_canonical_flops()
+    pub fn shuffle(&mut self, rng: &mut impl Rng);
+}
+```
+
+**Tests:**
+- 1755 entries
+- Sum of weights = 22100
+- Shuffle changes order
+
+---
+
+### Task 7: Config Changes
 
 **Files:**
 - Modify: `crates/core/src/blueprint_v2/config.rs`
 
 Add to `TrainingConfig`:
 ```rust
-/// Enable per-flop regret tables (requires per-flop bucket files).
-#[serde(default)]
-pub per_flop_regrets: bool,
-
-/// Number of per-flop regret tables to keep in memory.
-#[serde(default = "default_flop_cache_capacity")]
-pub flop_cache_capacity: usize,
+pub per_flop_regrets: bool,        // default false
+pub preload_buffer_size: usize,    // default 32
 ```
 
-Add to `PerFlopConfig`:
-```rust
-/// Per-flop flop buckets (in addition to turn/river).
-#[serde(default = "default_per_flop_buckets")]
-pub flop_buckets: u16,
-```
-
-**Tests:**
-- Parse YAML with `per_flop_regrets: true`
-- Default `flop_cache_capacity` = 1000
-- Backwards compatible (old configs without these fields still parse)
-
-**Step 1:** Add fields with defaults
-**Step 2:** Update tests
-**Step 3:** Commit
+Add `flop_buckets: u16` to `PerFlopConfig`.
 
 ---
 
-### Task 6: Snapshot Save/Load for Per-Flop Regrets
+### Task 8: Epoch-Based Training Loop
 
-Update snapshot saving to write preflop.bin + per-flop regret files, and loading to restore them.
+Wire everything together in `trainer.rs`.
 
 **Files:**
 - Modify: `crates/core/src/blueprint_v2/trainer.rs`
-- Modify: `crates/core/src/blueprint_v2/bundle.rs` (if strategy export needs changes)
 
-**Save:**
 ```rust
-// Save preflop regrets
-preflop_storage.save_regrets(&snapshot_dir.join("preflop_regrets.bin"))?;
+fn train_per_flop(&mut self) -> Result<(), Box<dyn Error>> {
+    let preflop_storage = BlueprintStorage::new(&self.tree, [169, 1, 1, 1]);
+    let store = PerFlopRegretStore::new(regret_dir, tree, [1, 500, 500, 500]);
+    let mut schedule = EpochSchedule::new();
 
-// Per-flop regrets are already on disk in regret_dir/flop_NNNN.bin
-// Just flush the cache to ensure all are written
-per_flop_store.flush_all()?;
+    loop {
+        schedule.shuffle(&mut self.rng);
+        let (ready_rx, dirty_tx, handles) = store.start_epoch(
+            &schedule, self.config.training.preload_buffer_size);
 
-// Copy or symlink the regret dir into the snapshot
+        rayon::scope(|s| {
+            for _ in 0..rayon::current_num_threads() {
+                let rx = ready_rx.clone();  // crossbeam Receiver is Clone
+                let tx = dirty_tx.clone();
+                s.spawn(move |_| {
+                    let mut rng = SmallRng::from_entropy();
+                    while let Ok(work) = rx.recv() {
+                        for _ in 0..work.weight {
+                            let deal = sample_deal_for_flop(work.flop_cards, &mut rng);
+                            let buckets = bucket_lookup.precompute_buckets(&deal);
+                            let deal = DealWithBuckets { deal, buckets };
+                            traverse_external(
+                                &tree, &preflop_storage, &work.storage,
+                                &deal, 0, ...);
+                            traverse_external(
+                                &tree, &preflop_storage, &work.storage,
+                                &deal, 1, ...);
+                        }
+                        tx.send((work.flop_index, work.storage)).ok();
+                    }
+                });
+            }
+        });
+        drop(dirty_tx);  // signal writer to finish
+        for h in handles { h.join().ok(); }
+
+        epoch += 1;
+        // time/iteration checks, progress reporting
+    }
+}
 ```
 
-**Load (resume):**
-```rust
-// Load preflop regrets
-preflop_storage = BlueprintStorage::load_regrets(&snapshot_dir.join("preflop_regrets.bin"), ...)?;
-
-// Per-flop regrets load lazily from the regret dir (already on disk)
-```
-
-**Tests:**
-- Save snapshot, load snapshot, verify regrets match
-- Resume training from snapshot produces continued convergence
-
-**Step 1:** Update save logic
-**Step 2:** Update resume logic
-**Step 3:** Verify round-trip
-**Step 4:** Commit
+Wire into `train()`: `if self.config.training.per_flop_regrets { return self.train_per_flop(); }`
 
 ---
 
-### Task 7: Integration Test — End to End
+### Task 9: Snapshot Save/Load
 
-Run a short training session with per-flop regrets and verify SB develops a raising strategy.
-
-**Files:** None (manual testing)
-
-**Step 1:** Create config with `per_flop_regrets: true`
-**Step 2:** Run training for ~5 minutes
-**Step 3:** Check TUI: SB Open scenario should show raising for strong hands
-**Step 4:** If passive, debug bucket lookups with the panic check
-**Step 5:** Commit any fixes
+- Preflop: save/load `preflop.bin` using existing `BlueprintStorage::save_regrets`
+- Per-flop: already on disk (writer thread saves after each flop)
+- Resume: just load preflop.bin, per-flop files load lazily through the preload buffer
 
 ---
 
-### Task 8: Remove Debug Code
+### Task 10: Integration Test + Cleanup
 
-Remove the temporary debug prints and panics added during the per-flop debugging session.
-
-**Files:**
-- Modify: `crates/core/src/blueprint_v2/mccfr.rs`
-
-**Step 1:** Remove the `[DEBUG]` print in `precompute_buckets`
-**Step 2:** Remove the `PRINTED` atomic
-**Step 3:** Remove the `Per-flop index: ...` print in `with_per_flop_dir`
-**Step 4:** Keep the panic in `lookup_bucket` (it's a valid safety check)
-**Step 5:** Verify: `cargo test`
-**Step 6:** Commit
+- Run training, verify SB develops raising strategy
+- Remove any debug prints/panics from prior attempts
+- Update docs
