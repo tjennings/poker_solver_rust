@@ -665,13 +665,11 @@ impl BlueprintTrainer {
                 );
             }
 
-            // Every 100 epochs, print preflop strategy sample
-            if epoch % 100 == 0 {
-                // Find the first preflop decision node (SB open)
+            // Every 100 epochs, print preflop strategy sample (--no-tui only)
+            if !self.tui_active && epoch % 100 == 0 {
                 for (i, node) in self.tree.nodes.iter().enumerate() {
                     if let super::game_tree::GameNode::Decision { street, .. } = node {
                         if *street == super::Street::Preflop {
-                            // Show strategy for a few hand buckets
                             for bucket in [0u16, 50, 100, 168] {
                                 let strat = self.storage.current_strategy(i as u32, bucket);
                                 eprintln!("    Preflop node={i} bucket={bucket}: {:?}",
