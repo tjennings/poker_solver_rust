@@ -17,7 +17,7 @@
 use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use rand::Rng;
 
@@ -132,9 +132,9 @@ pub struct AllBuckets {
     /// When set, turn/river lookups use per-flop files instead of global
     /// bucket files.
     per_flop_dir: Option<PathBuf>,
-    /// Cache of loaded per-flop bucket files, keyed by canonical flop
-    /// `PackedBoard`.
-    per_flop_cache: RwLock<FxHashMap<PackedBoard, Arc<PerFlopBucketFile>>>,
+    /// Per-flop bucket files, keyed by canonical flop `PackedBoard`.
+    /// Fully populated at startup by `with_per_flop_dir` — read-only during training.
+    per_flop_cache: FxHashMap<PackedBoard, Arc<PerFlopBucketFile>>,
     /// Map from canonical flop `PackedBoard` to flop file index (the NNNN
     /// in `flop_NNNN.buckets`).
     flop_index_map: Option<FxHashMap<PackedBoard, u16>>,
@@ -160,7 +160,7 @@ impl AllBuckets {
             bucket_files,
             board_maps,
             per_flop_dir: None,
-            per_flop_cache: RwLock::new(FxHashMap::default()),
+            per_flop_cache: FxHashMap::default(),
             flop_index_map: None,
         }
     }
@@ -183,7 +183,7 @@ impl AllBuckets {
 
         let mut index_map = FxHashMap::default();
         let canonical_flops = enumerate_canonical_flops();
-        let mut cache = self.per_flop_cache.write().expect("per_flop_cache lock");
+        let cache = &mut self.per_flop_cache;
 
         // Eagerly load all per-flop bucket files into memory.
         // ~6MB each × 1,755 flops = ~10GB. Eliminates RwLock contention
@@ -199,8 +199,6 @@ impl AllBuckets {
                 }
             }
         }
-        drop(cache);
-
         self.per_flop_dir = Some(dir);
         self.flop_index_map = Some(index_map);
         self
@@ -306,28 +304,10 @@ impl AllBuckets {
         }
     }
 
-    /// Get a per-flop file from the cache, loading from disk if needed.
+    /// Get a per-flop file from the cache.
+    /// All files are loaded eagerly by `with_per_flop_dir` — this is a plain lookup.
     fn get_per_flop_file(&self, flop_key: PackedBoard) -> Option<Arc<PerFlopBucketFile>> {
-        // Fast path: read lock
-        {
-            let cache = self.per_flop_cache.read().expect("per_flop_cache read lock");
-            if let Some(pf) = cache.get(&flop_key) {
-                return Some(Arc::clone(pf));
-            }
-        }
-
-        // Slow path: load from disk, write lock
-        let dir = self.per_flop_dir.as_ref()?;
-        let index_map = self.flop_index_map.as_ref()?;
-        let &file_idx = index_map.get(&flop_key)?;
-
-        let path = dir.join(format!("flop_{file_idx:04}.buckets"));
-        let pf = PerFlopBucketFile::load(&path).ok()?;
-        let arc = Arc::new(pf);
-
-        let mut cache = self.per_flop_cache.write().expect("per_flop_cache write lock");
-        cache.insert(flop_key, Arc::clone(&arc));
-        Some(arc)
+        self.per_flop_cache.get(&flop_key).map(Arc::clone)
     }
 
     /// Pre-compute bucket assignments for all 4 streets x 2 players.
