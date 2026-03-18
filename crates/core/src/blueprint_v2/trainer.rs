@@ -646,11 +646,41 @@ impl BlueprintTrainer {
             // Update TUI metrics from preflop storage.
             self.update_strategy_delta();
 
+            // Refresh strategy grids for TUI scenarios.
+            if let Some(ref callback) = self.on_strategy_refresh {
+                for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
+                    let player = match &self.tree.nodes[node_idx as usize] {
+                        super::game_tree::GameNode::Decision { player, .. } => *player as usize,
+                        _ => 0,
+                    };
+                    let hand_evs = self.scenario_ev_tracker.hand_ev_array(i, player);
+                    callback(i, node_idx, &self.storage, &self.tree, &hand_evs);
+                }
+            }
+
             if !self.tui_active {
                 eprintln!(
                     "  Epoch {epoch}: {deals} deals, total: {}, elapsed: {:.0}s",
                     self.iterations, self.start_time.elapsed().as_secs_f64()
                 );
+            }
+
+            // Every 100 epochs, print preflop strategy sample
+            if epoch % 100 == 0 {
+                // Find the first preflop decision node (SB open)
+                for (i, node) in self.tree.nodes.iter().enumerate() {
+                    if let super::game_tree::GameNode::Decision { street, .. } = node {
+                        if *street == super::Street::Preflop {
+                            // Show strategy for a few hand buckets
+                            for bucket in [0u16, 50, 100, 168] {
+                                let strat = self.storage.current_strategy(i as u32, bucket);
+                                eprintln!("    Preflop node={i} bucket={bucket}: {:?}",
+                                    strat.iter().map(|s| format!("{:.2}", s)).collect::<Vec<_>>());
+                            }
+                            break;
+                        }
+                    }
+                }
             }
 
             // Check stopping conditions
