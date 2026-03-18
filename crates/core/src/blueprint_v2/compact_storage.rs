@@ -12,7 +12,7 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicI16, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use super::game_tree::{GameNode, GameTree};
 use super::storage::RegretStorage;
@@ -29,12 +29,11 @@ struct NodeLayout {
     street_idx: u8,
 }
 
-/// Compact flat-buffer storage using `AtomicI16` regrets and `AtomicI32`
-/// strategy sums. Same API surface as `BlueprintStorage` but 6 bytes/slot
-/// instead of 12.
+/// Compact flat-buffer storage using `AtomicI32` regrets and `AtomicI32`
+/// strategy sums. 8 bytes/slot instead of 12 (no AtomicI64 strategy sums).
 pub struct CompactStorage {
-    /// Cumulative regrets: one `AtomicI16` per (decision node, bucket, action).
-    pub regrets: Vec<AtomicI16>,
+    /// Cumulative regrets: one `AtomicI32` per (decision node, bucket, action).
+    pub regrets: Vec<AtomicI32>,
     /// Strategy sums: one `AtomicI32` per (decision node, bucket, action).
     pub strategy_sums: Vec<AtomicI32>,
     /// Number of buckets per street `[preflop, flop, turn, river]`.
@@ -74,7 +73,7 @@ impl CompactStorage {
         }
 
         Self {
-            regrets: (0..total).map(|_| AtomicI16::new(0)).collect(),
+            regrets: (0..total).map(|_| AtomicI32::new(0)).collect(),
             strategy_sums: (0..total).map(|_| AtomicI32::new(0)).collect(),
             bucket_counts,
             layout,
@@ -87,39 +86,17 @@ impl CompactStorage {
     pub fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
-        i32::from(self.regrets[idx].load(Ordering::Relaxed))
+        self.regrets[idx].load(Ordering::Relaxed)
     }
 
     /// Add a delta to a single regret value atomically.
     ///
-    /// Asymptotic add — delta is damped as the value approaches ±32,767.
-    ///
-    /// `effective_delta = delta × (1 - |current| / 32767)`
-    ///
-    /// Near zero, full delta is applied. Near the limits, almost nothing.
-    /// The value approaches ±32,767 asymptotically but never reaches it,
-    /// preserving gradient between actions with different true regrets.
+    /// Add a delta to a single regret value atomically.
     #[inline]
     pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
-        let atom = &self.regrets[idx];
-        let mut current = atom.load(Ordering::Relaxed);
-        loop {
-            let cur_i32 = i32::from(current);
-            let remaining = 32767 - cur_i32.abs();
-            // Damped delta: proportional to headroom remaining.
-            // +1 avoids division giving 0 when remaining is small.
-            let effective = delta * remaining / 32768;
-            let new_val = (cur_i32 + effective).clamp(-32767, 32767) as i16;
-            if new_val == current {
-                break; // No change — avoid spinning
-            }
-            match atom.compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
+        self.regrets[idx].fetch_add(delta, Ordering::Relaxed);
     }
 
     /// Write the current regret-matched strategy into a caller-supplied buffer.
@@ -165,27 +142,13 @@ impl CompactStorage {
         i64::from(self.strategy_sums[idx].load(Ordering::Relaxed))
     }
 
-    /// Asymptotic add for strategy sums — damped as value approaches i32 limits.
+    /// Add a delta to a single strategy sum value atomically.
     #[inline]
     pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
+        let clamped = delta.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
-        let atom = &self.strategy_sums[idx];
-        let max_val = i32::MAX as i64;
-        let mut current = atom.load(Ordering::Relaxed);
-        loop {
-            let cur_i64 = i64::from(current);
-            let remaining = max_val - cur_i64.abs();
-            let effective = delta * remaining / (max_val + 1);
-            let new_val = (cur_i64 + effective).clamp(-max_val, max_val) as i32;
-            if new_val == current {
-                break;
-            }
-            match atom.compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
+        self.strategy_sums[idx].fetch_add(clamped, Ordering::Relaxed);
     }
 
     /// Number of actions at a decision node.
@@ -210,7 +173,7 @@ impl CompactStorage {
         for atom in &self.regrets {
             let v = atom.load(Ordering::Relaxed);
             let d = if v >= 0 { d_pos } else { d_neg };
-            let new_val = (f64::from(v) * d) as i16;
+            let new_val = (f64::from(v) * d) as i32;
             atom.store(new_val, Ordering::Relaxed);
         }
         for atom in &self.strategy_sums {
@@ -222,7 +185,7 @@ impl CompactStorage {
 
     /// Serialize regrets and strategy sums to a binary file.
     ///
-    /// Format: magic `CMP1`, `bucket_counts`, raw i16 regrets, raw i32 strategy sums.
+    /// Format: magic `CMP2`, `bucket_counts`, raw i32 regrets, raw i32 strategy sums.
     ///
     /// # Errors
     ///
@@ -231,7 +194,7 @@ impl CompactStorage {
         let file = std::fs::File::create(path)?;
         let mut writer = std::io::BufWriter::new(file);
 
-        let regrets_plain: Vec<i16> = self
+        let regrets_plain: Vec<i32> = self
             .regrets
             .iter()
             .map(|a| a.load(Ordering::Relaxed))
@@ -243,7 +206,7 @@ impl CompactStorage {
             .collect();
 
         // Magic + bucket_counts + regrets + strategy_sums
-        let payload = (b"CMP1", &self.bucket_counts, &regrets_plain, &sums_plain);
+        let payload = (b"CMP2", &self.bucket_counts, &regrets_plain, &sums_plain);
         bincode::serialize_into(&mut writer, &payload)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -267,15 +230,15 @@ impl CompactStorage {
         let (magic, stored_counts, regrets_plain, sums_plain): (
             [u8; 4],
             [u16; 4],
-            Vec<i16>,
+            Vec<i32>,
             Vec<i32>,
         ) = bincode::deserialize_from(reader)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        if &magic != b"CMP1" {
+        if &magic != b"CMP2" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("invalid magic: expected CMP1, got {magic:?}"),
+                format!("invalid magic: expected CMP2, got {magic:?}"),
             ));
         }
 
@@ -360,7 +323,7 @@ impl RegretStorage for CompactStorage {
         self.num_actions(node_idx)
     }
 
-    // Use default delta_scale (1000.0) — asymptotic add handles overflow.
+    // Uses default delta_scale (1000.0) — i32 regrets have sufficient range.
 }
 
 #[cfg(test)]
@@ -414,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn add_regret_clamps_to_i16() {
+    fn add_regret_accumulates_i32() {
         let tree = toy_tree();
         let storage = CompactStorage::new(&tree, [50, 50, 50, 50]);
 
@@ -424,14 +387,12 @@ mod tests {
             .position(|n| matches!(n, crate::blueprint_v2::game_tree::GameNode::Decision { .. }))
             .expect("need a decision node") as u32;
 
-        // Adding 50000 should clamp to i16::MAX (32767)
+        // i32 — no clamping, direct accumulation
         storage.add_regret(node_idx, 0, 0, 50_000);
-        assert_eq!(storage.get_regret(node_idx, 0, 0), 32_767);
+        assert_eq!(storage.get_regret(node_idx, 0, 0), 50_000);
 
-        // Reset by creating fresh storage and testing negative clamping
-        let storage2 = CompactStorage::new(&tree, [50, 50, 50, 50]);
-        storage2.add_regret(node_idx, 0, 0, -50_000);
-        assert_eq!(storage2.get_regret(node_idx, 0, 0), -32_768);
+        storage.add_regret(node_idx, 0, 0, 50_000);
+        assert_eq!(storage.get_regret(node_idx, 0, 0), 100_000);
     }
 
     #[test]

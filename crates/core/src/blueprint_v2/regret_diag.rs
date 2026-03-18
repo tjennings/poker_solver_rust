@@ -81,8 +81,8 @@ pub fn dump_regret_stats(
     let timestamp = epoch_secs();
     let _ = writeln!(file, "\n=== Per-Flop Regret Stats: {label} @ t={timestamp} ===");
 
-    let mut global_min = i16::MAX;
-    let mut global_max = i16::MIN;
+    let mut global_min = i32::MAX;
+    let mut global_max = i32::MIN;
     let mut global_sum = 0i64;
     let mut global_count = 0u64;
     let mut saturated_pos = 0u64;
@@ -90,8 +90,8 @@ pub fn dump_regret_stats(
     let mut zero_count = 0u64;
 
     for (i, cs) in flop_storages.iter().enumerate() {
-        let mut flop_min = i16::MAX;
-        let mut flop_max = i16::MIN;
+        let mut flop_min = i32::MAX;
+        let mut flop_max = i32::MIN;
 
         for atom in &cs.regrets {
             let v = atom.load(std::sync::atomic::Ordering::Relaxed);
@@ -99,8 +99,8 @@ pub fn dump_regret_stats(
             flop_max = flop_max.max(v);
             global_sum += i64::from(v);
             global_count += 1;
-            if v == i16::MAX { saturated_pos += 1; }
-            if v == i16::MIN { saturated_neg += 1; }
+            if v == i32::MAX { saturated_pos += 1; }
+            if v == i32::MIN { saturated_neg += 1; }
             if v == 0 { zero_count += 1; }
         }
 
@@ -118,7 +118,7 @@ pub fn dump_regret_stats(
     let _ = writeln!(file, "  Global: min={global_min} max={global_max} mean={mean:.1}");
     let _ = writeln!(file, "  Slots: {global_count} total, {zero_count} zero ({:.1}%)",
         zero_count as f64 / global_count as f64 * 100.0);
-    let _ = writeln!(file, "  Saturated: +32767={saturated_pos} -32768={saturated_neg}");
+    let _ = writeln!(file, "  Saturated: +MAX={saturated_pos} -MIN={saturated_neg}");
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────
