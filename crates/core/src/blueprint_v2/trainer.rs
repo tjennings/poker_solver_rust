@@ -745,20 +745,18 @@ impl BlueprintTrainer {
                 );
             }
 
-            // Dump diagnostics to log file every 500 epochs.
-            if epoch % 500 == 0 {
+            // Dump diagnostics to log file every 5 minutes.
+            if self.elapsed_minutes() >= self.last_print_time + 5 {
+                self.last_print_time = self.elapsed_minutes();
                 let log_path = regret_dir.join("regret_diag.log");
                 let labels = &["AA", "AKs", "JTs", "72o"];
                 let preflop_bkts = &[0u16, 1, 50, 168];
-                // Postflop buckets: use middle-range values for the 50-bucket space
                 let postflop_bkts = &[0u16, 10, 25, 49];
 
-                // 1. Preflop regret tree
                 super::regret_diag::dump_preflop_regrets(
                     &log_path, &self.tree, &self.storage, labels, preflop_bkts,
                 );
 
-                // 2. Full spot dump for flop 0 (preflop + postflop, depth=4)
                 if !flop_storages.is_empty() {
                     super::regret_diag::dump_full_spot(
                         &log_path, &self.tree,
@@ -767,7 +765,6 @@ impl BlueprintTrainer {
                     );
                 }
 
-                // 3. Per-flop regret stats (saturation check)
                 super::regret_diag::dump_regret_stats(
                     &log_path, &flop_storages, &format!("epoch {epoch}"),
                 );

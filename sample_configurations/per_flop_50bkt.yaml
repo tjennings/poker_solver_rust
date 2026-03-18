@@ -44,8 +44,8 @@ training:
   preload_buffer_size: 32
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 5000000
-  prune_after_iterations: 5000000
-  prune_threshold: 0
+  prune_after_iterations: 5000000000
+  prune_threshold: -1000000000
   lcfr_discount_interval: 100000000
   batch_size: 2000
 
