@@ -673,10 +673,10 @@ impl BlueprintTrainer {
                     atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
                 });
 
-                // Discount all per-flop regrets.
-                for cs in &flop_storages {
+                // Discount all per-flop regrets (parallel across flops).
+                flop_storages.par_iter().for_each(|cs| {
                     cs.apply_discount(d_pos, d_neg, d_strat);
-                }
+                });
 
                 self.last_discount_time = self.iterations;
             }
