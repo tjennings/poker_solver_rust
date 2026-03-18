@@ -169,6 +169,24 @@ impl CompactStorage {
         self.regrets.len()
     }
 
+    /// Apply DCFR discounting to regrets and strategy sums.
+    ///
+    /// `d_pos` multiplies positive regrets, `d_neg` multiplies negative regrets,
+    /// `d_strat` multiplies strategy sums.
+    pub fn apply_discount(&self, d_pos: f64, d_neg: f64, d_strat: f64) {
+        for atom in &self.regrets {
+            let v = atom.load(Ordering::Relaxed);
+            let d = if v >= 0 { d_pos } else { d_neg };
+            let new_val = (f64::from(v) * d) as i16;
+            atom.store(new_val, Ordering::Relaxed);
+        }
+        for atom in &self.strategy_sums {
+            let v = atom.load(Ordering::Relaxed);
+            let new_val = (f64::from(v) * d_strat) as i32;
+            atom.store(new_val, Ordering::Relaxed);
+        }
+    }
+
     /// Serialize regrets and strategy sums to a binary file.
     ///
     /// Format: magic `CMP1`, `bucket_counts`, raw i16 regrets, raw i32 strategy sums.

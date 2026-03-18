@@ -645,6 +645,42 @@ impl BlueprintTrainer {
             self.iterations += deals;
             self.shared_iterations.store(self.iterations, Ordering::Relaxed);
 
+            // DCFR discounting — same methodology as the normal training loop.
+            let interval = self.config.training.lcfr_discount_interval.max(1);
+            if self.iterations >= self.config.training.lcfr_warmup_iterations
+                && self.iterations >= self.last_discount_time + interval
+            {
+                let t = self.iterations / interval;
+                let tf = t as f64;
+                let alpha = self.config.training.dcfr_alpha;
+                let beta = self.config.training.dcfr_beta;
+                let gamma = self.config.training.dcfr_gamma;
+
+                let t_alpha = tf.powf(alpha);
+                let t_beta = tf.powf(beta);
+                let d_pos = t_alpha / (t_alpha + 1.0);
+                let d_neg = t_beta / (t_beta + 1.0);
+                let d_strat = (tf / (tf + 1.0)).powf(gamma);
+
+                // Discount preflop regrets (self.storage).
+                self.storage.regrets.par_iter().for_each(|atom| {
+                    let v = atom.load(Ordering::Relaxed);
+                    let d = if v >= 0 { d_pos } else { d_neg };
+                    atom.store((f64::from(v) * d) as i32, Ordering::Relaxed);
+                });
+                self.storage.strategy_sums.par_iter().for_each(|atom| {
+                    let v = atom.load(Ordering::Relaxed);
+                    atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
+                });
+
+                // Discount all per-flop regrets.
+                for cs in &flop_storages {
+                    cs.apply_discount(d_pos, d_neg, d_strat);
+                }
+
+                self.last_discount_time = self.iterations;
+            }
+
             // Update TUI metrics from preflop storage.
             self.update_strategy_delta();
 
