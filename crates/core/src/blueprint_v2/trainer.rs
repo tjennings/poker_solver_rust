@@ -658,10 +658,12 @@ impl BlueprintTrainer {
             self.iterations += deals;
             self.shared_iterations.store(self.iterations, Ordering::Relaxed);
 
-            eprintln!(
-                "  Epoch {epoch}: {deals} deals, total: {}, elapsed: {:.0}s",
-                self.iterations, self.start_time.elapsed().as_secs_f64()
-            );
+            if !self.tui_active {
+                eprintln!(
+                    "  Epoch {epoch}: {deals} deals, total: {}, elapsed: {:.0}s",
+                    self.iterations, self.start_time.elapsed().as_secs_f64()
+                );
+            }
 
             // Check stopping conditions
             if let Some(max_min) = self.config.training.time_limit_minutes {

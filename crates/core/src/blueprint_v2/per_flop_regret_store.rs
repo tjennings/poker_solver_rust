@@ -76,14 +76,8 @@ impl PerFlopRegretStore {
         let tree = Arc::clone(&self.tree);
         let bucket_counts = self.bucket_counts;
         let reader = std::thread::spawn(move || {
-            for (i, entry) in entries.iter().enumerate() {
-                if i < 3 || i % 100 == 0 {
-                    eprintln!("[reader] loading flop {}/{} (index {})", i + 1, entries.len(), entry.flop_index);
-                }
+            for entry in &entries {
                 let storage = load_or_create(&dir, entry.flop_index, &tree, bucket_counts);
-                if i < 3 {
-                    eprintln!("[reader] loaded, sending...");
-                }
                 let work = FlopWork {
                     flop_index: entry.flop_index,
                     flop_cards: entry.flop_cards,
@@ -91,13 +85,9 @@ impl PerFlopRegretStore {
                     storage,
                 };
                 if ready_tx.send(work).is_err() {
-                    break; // workers dropped their receivers
-                }
-                if i < 3 {
-                    eprintln!("[reader] sent flop {}", entry.flop_index);
+                    break;
                 }
             }
-            eprintln!("[reader] done, all flops sent");
         });
 
         // Writer thread: receives dirty storages, saves to disk
