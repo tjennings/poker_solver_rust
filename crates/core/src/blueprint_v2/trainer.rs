@@ -685,6 +685,7 @@ impl BlueprintTrainer {
             self.update_strategy_delta();
 
             // Refresh strategy grids + EVs for TUI scenarios.
+            // EVs are a running average — never reset, just keep accumulating.
             if let Some(ref callback) = self.on_strategy_refresh {
                 for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
                     let player = match &self.tree.nodes[node_idx as usize] {
@@ -694,7 +695,6 @@ impl BlueprintTrainer {
                     let hand_evs = self.scenario_ev_tracker.hand_ev_array(i, player);
                     callback(i, node_idx, &self.storage, &self.tree, &hand_evs);
                 }
-                self.scenario_ev_tracker.reset();
             }
 
             if !self.tui_active {
