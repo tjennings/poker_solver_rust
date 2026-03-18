@@ -7,7 +7,6 @@ pub mod cbv_compute;
 pub mod cluster_diagnostics;
 pub mod cluster_pipeline;
 pub mod clustering;
-pub mod compact_storage;
 pub mod config;
 pub mod epoch_schedule;
 pub mod equity_cache;

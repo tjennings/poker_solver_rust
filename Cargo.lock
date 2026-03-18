@@ -5098,6 +5098,7 @@ dependencies = [
  "arrayvec",
  "bincode 1.3.3",
  "criterion",
+ "crossbeam-channel",
  "fastkmeans-rs",
  "indicatif",
  "ndarray 0.16.1",

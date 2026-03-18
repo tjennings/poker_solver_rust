@@ -3,6 +3,7 @@ use rs_poker::core::Card;
 
 /// A single entry in the epoch schedule: one canonical flop with its
 /// combinatorial weight (the number of raw deals it represents).
+#[derive(Clone)]
 pub struct ScheduleEntry {
     pub flop_index: u16,
     pub flop_cards: [Card; 3],

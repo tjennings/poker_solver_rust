@@ -1501,7 +1501,6 @@ mod tests {
         assert!(all.board_maps[3].is_none());
     }
 
-<<<<<<< HEAD
     // ── Per-flop bucket lookup tests ─────────────────────────────────
 
     /// Helper: build a PerFlopBucketFile for a given canonical flop with
@@ -1850,7 +1849,8 @@ mod tests {
                 }
             }
         }
-=======
+    }
+
     #[test]
     fn split_storage_routes_regrets_by_street() {
         let tree = toy_tree();
@@ -1904,6 +1904,5 @@ mod tests {
         }
         assert!(preflop_updated, "at least one preflop node should have regrets");
         assert!(postflop_updated, "at least one postflop node should have regrets");
->>>>>>> 7305d90 (feat(blueprint_v2): add RegretStorage trait and split MCCFR traversal by street)
     }
 }
