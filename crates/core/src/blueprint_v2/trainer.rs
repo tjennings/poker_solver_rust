@@ -529,7 +529,6 @@ impl BlueprintTrainer {
         use super::compact_storage::CompactStorage;
         use super::epoch_schedule::EpochSchedule;
         use super::mccfr::sample_deal_for_flop;
-        use super::per_flop_regret_store::PerFlopRegretStore;
 
         let per_flop_cfg = self
             .config
@@ -538,15 +537,13 @@ impl BlueprintTrainer {
             .as_ref()
             .ok_or("per_flop_regrets requires clustering.per_flop config")?;
 
-        let cluster_path = self
+        let _cluster_path = self
             .config
             .training
             .cluster_path
             .as_ref()
             .ok_or("per_flop_regrets requires cluster_path")?;
 
-        // Per-flop bucket counts: preflop=1 (unused in per-flop storage),
-        // rest from per_flop config.
         let per_flop_bucket_counts: [u16; 4] = [
             1,
             per_flop_cfg.flop_buckets,
@@ -555,32 +552,14 @@ impl BlueprintTrainer {
         ];
 
         // Global preflop storage (BlueprintStorage, always in memory).
-        eprintln!("[init] creating preflop storage...");
         let preflop_storage = BlueprintStorage::new(&self.tree, [169, 1, 1, 1]);
-        eprintln!("[init] preflop storage done");
 
-        // Per-flop regret store (CompactStorage backed by disk).
-        let regret_dir = std::path::PathBuf::from(cluster_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("per_flop_regrets");
-        let tree = Arc::new(self.tree.clone());
-        let store = PerFlopRegretStore::new(
-            regret_dir,
-            Arc::clone(&tree),
-            per_flop_bucket_counts,
-        );
-
-        // Bucket lookup using per-flop bucket counts with equity fallback.
-        eprintln!("[init] creating bucket lookup...");
+        // Bucket lookup for per-flop bucket files.
         let bucket_lookup = AllBuckets::new(per_flop_bucket_counts, [None, None, None, None]);
         let bucket_lookup = if let Some(ref cp) = self.config.training.cluster_path {
             let per_flop_marker = std::path::Path::new(cp).join("flop_0000.buckets");
             if per_flop_marker.exists() {
-                eprintln!("[init] building per-flop index (lazy)...");
-                let bl = bucket_lookup.with_per_flop_dir(std::path::PathBuf::from(cp));
-                eprintln!("[init] per-flop index done");
-                bl
+                bucket_lookup.with_per_flop_dir(std::path::PathBuf::from(cp))
             } else {
                 bucket_lookup
             }
@@ -588,114 +567,101 @@ impl BlueprintTrainer {
             bucket_lookup
         };
 
-        eprintln!("[init] creating epoch schedule...");
-        let mut schedule = EpochSchedule::new();
-        eprintln!("[init] schedule done ({} entries)", schedule.len());
+        // Allocate ALL 1,755 per-flop regret tables in memory.
+        // No disk I/O during training — only save on snapshots.
+        let schedule = EpochSchedule::new();
+        let num_flops = schedule.len();
+        eprintln!("  Allocating {} per-flop regret tables...", num_flops);
+        let flop_storages: Vec<CompactStorage> = (0..num_flops)
+            .map(|i| {
+                if i % 200 == 0 {
+                    eprintln!("    {}/{}", i, num_flops);
+                }
+                CompactStorage::new(&self.tree, per_flop_bucket_counts)
+            })
+            .collect();
+        let slots_per = if flop_storages.is_empty() { 0 } else { flop_storages[0].num_slots() };
+        let total_mem = num_flops * slots_per * 6; // 6 bytes per slot (i16 + i32)
+        eprintln!("  Done: {} slots/flop, {:.1} GB total",
+            slots_per, total_mem as f64 / 1e9);
+
         let mut epoch = 0u64;
         let rake_rate = self.config.game.rake_rate;
         let rake_cap = self.config.game.rake_cap;
-        let buffer_size = self.config.training.preload_buffer_size;
         let preflop_ref = &preflop_storage;
         let bucket_lookup_ref = &bucket_lookup;
         let tree_ref = &self.tree;
+        let storages_ref = &flop_storages;
 
-        if !self.tui_active {
-            eprintln!("Per-flop MCCFR training");
-            eprintln!("  Regret dir: {}", store.dir().display());
-            eprintln!(
-                "  Buckets: flop={}, turn={}, river={}",
-                per_flop_cfg.flop_buckets,
-                per_flop_cfg.turn_buckets,
-                per_flop_cfg.river_buckets
-            );
-            eprintln!("  Preload buffer: {buffer_size}");
-            eprintln!();
-        }
+        let time_limit = std::time::Duration::from_secs(
+            self.config.training.time_limit_minutes.unwrap_or(u64::MAX) * 60
+        );
 
-        eprintln!("[init] entering epoch loop");
+        eprintln!("Per-flop MCCFR training");
+        eprintln!("  Flops: {num_flops}");
+        eprintln!(
+            "  Buckets: flop={}, turn={}, river={}",
+            per_flop_cfg.flop_buckets, per_flop_cfg.turn_buckets, per_flop_cfg.river_buckets
+        );
+        eprintln!();
+
+        // Shuffled schedule indices for each epoch
+        let mut schedule_indices: Vec<usize> = (0..num_flops).collect();
+
         loop {
-            eprintln!("[epoch] shuffling schedule...");
-            schedule.shuffle(&mut self.rng);
-            eprintln!("[epoch] starting epoch (preloader + writer)...");
-            let (ready_rx, dirty_tx, handles) = store.start_epoch(&schedule, buffer_size);
-            eprintln!("[epoch] epoch started, entering rayon scope...");
+            schedule_indices.shuffle(&mut self.rng);
 
+            let work_idx = std::sync::atomic::AtomicUsize::new(0);
             let epoch_deals = std::sync::atomic::AtomicU64::new(0);
             let epoch_deals_ref = &epoch_deals;
+            let work_idx_ref = &work_idx;
+            let schedule_ref = &schedule;
+            let indices_ref = &schedule_indices;
 
             rayon::scope(|s| {
                 for _ in 0..rayon::current_num_threads() {
-                    let rx = ready_rx.clone();
-                    let tx = dirty_tx.clone();
-                    s.spawn(move |_| {
+                    s.spawn(|_| {
                         let mut rng = SmallRng::from_os_rng();
-                        while let Ok(work) = rx.recv() {
-                            for _ in 0..work.weight {
-                                let deal =
-                                    sample_deal_for_flop(work.flop_cards, &mut rng);
-                                let buckets =
-                                    bucket_lookup_ref.precompute_buckets(&deal);
+                        loop {
+                            let idx = work_idx_ref.fetch_add(1, Ordering::Relaxed);
+                            if idx >= num_flops { break; }
+
+                            let schedule_idx = indices_ref[idx];
+                            let entry = &schedule_ref.entries[schedule_idx];
+                            let flop_storage = &storages_ref[schedule_idx];
+
+                            for _ in 0..entry.weight {
+                                let deal = sample_deal_for_flop(entry.flop_cards, &mut rng);
+                                let buckets = bucket_lookup_ref.precompute_buckets(&deal);
                                 let deal = DealWithBuckets { deal, buckets };
 
                                 traverse_external(
-                                    tree_ref,
-                                    preflop_ref,
-                                    &work.storage,
-                                    &deal,
-                                    0,
-                                    tree_ref.root,
-                                    false,
-                                    0,
-                                    &mut rng,
-                                    rake_rate,
-                                    rake_cap,
-                                    None,
+                                    tree_ref, preflop_ref, flop_storage,
+                                    &deal, 0, tree_ref.root, false, 0, &mut rng,
+                                    rake_rate, rake_cap, None,
                                 );
                                 traverse_external(
-                                    tree_ref,
-                                    preflop_ref,
-                                    &work.storage,
-                                    &deal,
-                                    1,
-                                    tree_ref.root,
-                                    false,
-                                    0,
-                                    &mut rng,
-                                    rake_rate,
-                                    rake_cap,
-                                    None,
+                                    tree_ref, preflop_ref, flop_storage,
+                                    &deal, 1, tree_ref.root, false, 0, &mut rng,
+                                    rake_rate, rake_cap, None,
                                 );
                             }
-                            epoch_deals_ref.fetch_add(
-                                u64::from(work.weight),
-                                Ordering::Relaxed,
-                            );
-                            tx.send((work.flop_index, work.storage)).ok();
+
+                            epoch_deals_ref.fetch_add(u64::from(entry.weight), Ordering::Relaxed);
                         }
                     });
                 }
             });
 
-            // Drop extra clones so writer thread finishes
-            drop(ready_rx);
-            drop(dirty_tx);
-            for h in handles {
-                h.join().ok();
-            }
-
             epoch += 1;
             let deals = epoch_deals.load(Ordering::Relaxed);
             self.iterations += deals;
-            self.shared_iterations
-                .store(self.iterations, Ordering::Relaxed);
+            self.shared_iterations.store(self.iterations, Ordering::Relaxed);
 
-            if !self.tui_active {
-                eprintln!(
-                    "  Epoch {epoch}: {deals} deals, total: {}, elapsed: {:.0}s",
-                    self.iterations,
-                    self.start_time.elapsed().as_secs_f64()
-                );
-            }
+            eprintln!(
+                "  Epoch {epoch}: {deals} deals, total: {}, elapsed: {:.0}s",
+                self.iterations, self.start_time.elapsed().as_secs_f64()
+            );
 
             // Check stopping conditions
             if let Some(max_min) = self.config.training.time_limit_minutes {

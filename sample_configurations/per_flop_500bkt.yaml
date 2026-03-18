@@ -16,9 +16,9 @@ clustering:
   river:
     buckets: 500
   per_flop:
-    flop_buckets: 500
-    turn_buckets: 500
-    river_buckets: 500
+    flop_buckets: 50
+    turn_buckets: 50
+    river_buckets: 50
 
 action_abstraction:
   preflop:
