@@ -70,7 +70,7 @@ pub struct Deal {
 
 /// A deal with pre-computed bucket assignments for all streets and players.
 ///
-/// Eliminates repeated `get_bucket()` / `compute_equity()` calls during
+/// Eliminates repeated `get_bucket()` calls during
 /// MCCFR traversal by computing all buckets once up-front.
 #[derive(Debug, Clone)]
 pub struct DealWithBuckets {
@@ -82,8 +82,9 @@ pub struct DealWithBuckets {
 /// Loaded bucket assignments for all 4 streets.
 ///
 /// During MCCFR, we look up buckets by street using the deal's cards.
-/// Uses precomputed bucket files for O(1) lookups when available,
-/// with equity-based fallback when no bucket file is present.
+/// Uses precomputed bucket files for O(1) lookups.
+/// In production, panics if no bucket file is available for a postflop street.
+/// In `#[cfg(test)]`, falls back to equity-based bucketing.
 pub struct AllBuckets {
     pub bucket_counts: [u16; 4],
     /// Per-street bucket files produced by the clustering pipeline.
@@ -188,8 +189,8 @@ impl AllBuckets {
     ///
     /// Canonicalizes the board, looks up the board index in the hash map,
     /// applies the same suit permutation to hole cards, and reads the bucket
-    /// from the flat array. Falls back to equity binning if no bucket file
-    /// or board not found.
+    /// from the flat array. In production, panics if no bucket file is
+    /// available. In `#[cfg(test)]`, falls back to equity-based bucketing.
     ///
     /// For turn (`street_idx`=2) and river (`street_idx`=3), when `per_flop_dir`
     /// is set, uses per-flop bucket files instead of global bucket files.
@@ -199,7 +200,15 @@ impl AllBuckets {
             if let Some(bucket) = self.lookup_per_flop(street_idx, hole, board) {
                 return bucket;
             }
-            // Fall through to equity fallback
+            // In tests, fall back to equity-based bucketing
+            #[cfg(not(test))]
+            {
+                let street_name = if street_idx == 2 { "turn" } else { "river" };
+                panic!(
+                    "No per-flop bucket file found for {street_name} board {board:?} \
+                     with hole cards {hole:?}. Bucket files must be generated before training.",
+                );
+            }
         } else if let (Some(bf), Some(board_map)) = (
             &self.bucket_files[street_idx],
             &self.board_maps[street_idx],
@@ -213,11 +222,29 @@ impl AllBuckets {
                 }
             }
         }
-        // Fallback: equity-based bucketing.
-        let equity = crate::showdown_equity::compute_equity(hole, board);
-        let k = self.bucket_counts[street_idx];
-        let bucket = (equity * f64::from(k)) as u16;
-        bucket.min(k - 1)
+
+        // In tests, fall back to equity-based bucketing.
+        // In production, missing bucket files are a fatal configuration error.
+        #[cfg(test)]
+        {
+            let equity = crate::showdown_equity::compute_equity(hole, board);
+            let k = self.bucket_counts[street_idx];
+            let bucket = (equity * f64::from(k)) as u16;
+            return bucket.min(k - 1);
+        }
+        #[cfg(not(test))]
+        {
+            let street_name = match street_idx {
+                1 => "flop",
+                2 => "turn",
+                3 => "river",
+                _ => "unknown",
+            };
+            panic!(
+                "No bucket file found for {street_name} (street_idx={street_idx}), \
+                 board {board:?}, hole {hole:?}. Bucket files must be generated before training.",
+            );
+        }
     }
 
     /// Per-flop bucket lookup for turn (`street_idx`=2) or river (`street_idx`=3).
@@ -301,7 +328,7 @@ impl AllBuckets {
             let hand = crate::hands::CanonicalHand::from_cards(hole[0], hole[1]);
             let idx = hand.index() as u16;
             row[0] = idx.min(self.bucket_counts[0] - 1);
-            // Postflop: bucket file lookup with equity fallback.
+            // Postflop: bucket file lookup (panics if missing).
             row[1] = self.lookup_bucket(1, hole, &deal.board[..3]); // flop
             row[2] = self.lookup_bucket(2, hole, &deal.board[..4]); // turn
             row[3] = self.lookup_bucket(3, hole, &deal.board[..5]); // river
@@ -312,7 +339,8 @@ impl AllBuckets {
     /// Look up the bucket for a single street.
     ///
     /// Preflop uses canonical hand index. Postflop uses bucket file
-    /// lookup with equity-based fallback.
+    /// lookup (panics in production if no bucket file is available;
+    /// falls back to equity in tests).
     #[must_use]
     pub fn get_bucket(&self, street: Street, hole_cards: [Card; 2], board: &[Card]) -> u16 {
         if street == Street::Preflop {
