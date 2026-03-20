@@ -1,8 +1,8 @@
-# Cluster Diagnostics Baseline: 500bkt (pre-EMD fix)
+# Cluster Diagnostics Baseline: 500bkt
 
 **Date:** 2026-03-20
 **Directory:** local_data/buckets/500bkt
-**Pipeline:** L2 k-means (fastkmeans-rs) + L2 exhaustive assignment (pre-improvement)
+**Pipeline:** L2 k-means (fastkmeans-rs) + sorted EMD exhaustive assignment + weighted ground distances
 
 ## Bucket Sizes
 
@@ -35,5 +35,5 @@ Only 415/500 turn buckets observed in 30 sample boards. High max EMD (>100) indi
 
 ## Notes
 
-- This is the baseline before clustering quality improvements (sorted bucket IDs, EMD assignment, weighted ground distances)
-- Re-cluster with the same config using the improved pipeline and compare
+- Pipeline uses sorted EMD assignment + weighted ground distances (post-improvement)
+- Use this as the baseline for future clustering quality experiments
