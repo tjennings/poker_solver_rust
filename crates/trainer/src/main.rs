@@ -643,6 +643,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             if transition_audit {
                 use poker_solver_core::blueprint_v2::cluster_diagnostics::audit_transition_consistency;
+                use poker_solver_core::blueprint_v2::centroid_file::CentroidFile;
                 let pairs = [("flop", "turn"), ("turn", "river")];
                 for (from_name, to_name) in &pairs {
                     let from_path = cluster_dir.join(format!("{from_name}.buckets"));
@@ -651,8 +652,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                         eprintln!("\nTransition consistency audit: {from_name} → {to_name} ({transition_audit_boards} sample boards)...");
                         let from_bf = BucketFile::load(&from_path)?;
                         let to_bf = BucketFile::load(&to_path)?;
+                        // Load centroid file for the current (from) street if available.
+                        let centroid_path = cluster_dir.join(format!("{from_name}.centroids"));
+                        let centroids = if centroid_path.exists() {
+                            CentroidFile::load(&centroid_path).ok()
+                        } else {
+                            None
+                        };
                         let report = audit_transition_consistency(
                             &from_bf, &to_bf, transition_audit_boards, 42,
+                            centroids.as_ref(),
                         );
                         eprintln!("{}", report.summary());
                     }

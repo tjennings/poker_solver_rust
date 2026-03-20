@@ -14,6 +14,7 @@ use rayon::prelude::*;
 use crate::poker::Card;
 
 use super::bucket_file::BucketFile;
+use super::centroid_file::CentroidFile;
 use super::cluster_pipeline::{
     build_deck, canonical_key, compute_board_equities, enumerate_combos, sample_boards,
     sample_n_card_boards,
@@ -379,10 +380,18 @@ pub struct TransitionConsistencyReport {
     pub from_street: String,
     pub to_street: String,
     pub bucket_count: u16,
+    /// Number of child-street buckets (K for normalization context).
+    pub child_bucket_count: u16,
     pub sample_boards: usize,
     pub buckets: Vec<BucketTransitionStats>,
+    /// Mean within-bucket EMD (normalized to [0,1]).
     pub mean_emd: f64,
+    /// Max within-bucket EMD (normalized to [0,1]).
     pub max_emd: f64,
+    /// Mean centroid-to-centroid EMD (normalized), if centroids available.
+    pub mean_between_emd: Option<f64>,
+    /// Separation ratio: between-centroid EMD / within-bucket EMD.
+    pub separation_ratio: Option<f64>,
 }
 
 impl TransitionConsistencyReport {
@@ -392,10 +401,17 @@ impl TransitionConsistencyReport {
         use std::fmt::Write;
         let non_empty: Vec<_> = self.buckets.iter().filter(|b| b.count > 0).collect();
         let mut s = format!(
-            "{} → {}: {} buckets, {} sample boards\n  Mean EMD to centroid: {:.4}, max: {:.4}\n  Per-bucket (sorted by mean EMD):",
+            "{} → {}: {} buckets, {} sample boards\n  Within-bucket EMD: mean={:.4}, max={:.4} (normalized)",
             self.from_street, self.to_street, non_empty.len(), self.sample_boards,
             self.mean_emd, self.max_emd,
         );
+        if let Some(between) = self.mean_between_emd {
+            let _ = write!(s, "\n  Between-centroid EMD: mean={between:.4}");
+        }
+        if let Some(ratio) = self.separation_ratio {
+            let _ = write!(s, "\n  Separation ratio: {ratio:.2} (higher = better)");
+        }
+        s.push_str("\n  Per-bucket (sorted by mean EMD):");
         let mut sorted: Vec<_> = non_empty.iter().collect();
         sorted.sort_by(|a, b| {
             a.mean_emd_to_centroid
@@ -429,6 +445,7 @@ pub fn audit_transition_consistency(
     next_bf: &BucketFile,
     num_sample_boards: usize,
     seed: u64,
+    centroid_file: Option<&CentroidFile>,
 ) -> TransitionConsistencyReport {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
@@ -526,25 +543,25 @@ pub fn audit_transition_consistency(
                 };
             }
 
-            // Compute centroid (mean histogram)
-            let dim = next_k;
-            let mut centroid = vec![0.0_f64; dim];
-            for h in hists {
-                for (j, &v) in h.iter().enumerate() {
-                    centroid[j] += v;
+            // Use persisted centroid if available, otherwise reconstruct from samples.
+            let centroid = if let Some(cf) = centroid_file {
+                if id < cf.centroids().len() {
+                    cf.centroids()[id].clone()
+                } else {
+                    reconstruct_centroid(hists, next_k)
                 }
-            }
-            #[allow(clippy::cast_precision_loss)]
-            let inv = 1.0 / hists.len() as f64;
-            for v in &mut centroid {
-                *v *= inv;
-            }
+            } else {
+                reconstruct_centroid(hists, next_k)
+            };
 
-            // EMD from each histogram to centroid
+            // EMD from each histogram to centroid, normalized by (K-1)
+            #[allow(clippy::cast_precision_loss)]
+            let norm = if next_k > 1 { 1.0 / (next_k as f64 - 1.0) } else { 1.0 };
             let emds: Vec<f64> = hists
                 .iter()
-                .map(|h| emd_1d(h, &centroid))
+                .map(|h| emd_1d(h, &centroid) * norm)
                 .collect();
+            #[allow(clippy::cast_precision_loss)]
             let mean_emd = emds.iter().sum::<f64>() / emds.len() as f64;
             let max_emd = emds.iter().fold(0.0_f64, |a, &b| a.max(b));
 
@@ -583,15 +600,72 @@ pub fn audit_transition_consistency(
     let from_street = format!("{:?}", current_bf.header.street);
     let to_street = format!("{:?}", next_bf.header.street);
 
+    let (mean_between_emd, separation_ratio) = if let Some(cf) = centroid_file {
+        if cf.centroids().len() >= 2 {
+            let between = mean_pairwise_centroid_emd(cf.centroids());
+            let ratio = if mean_emd > 0.0 { between / mean_emd } else { f64::INFINITY };
+            (Some(between), Some(ratio))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
     TransitionConsistencyReport {
         from_street,
         to_street,
         bucket_count: current_bf.header.bucket_count,
+        child_bucket_count: next_bf.header.bucket_count,
         sample_boards: num_sample_boards,
         buckets: bucket_stats,
-        mean_emd: mean_emd,
-        max_emd: max_emd,
+        mean_emd,
+        max_emd,
+        mean_between_emd,
+        separation_ratio,
     }
+}
+
+/// Reconstruct a centroid by averaging histograms.
+fn reconstruct_centroid(hists: &[Vec<f64>], dim: usize) -> Vec<f64> {
+    let mut centroid = vec![0.0_f64; dim];
+    for h in hists {
+        for (j, &v) in h.iter().enumerate() {
+            centroid[j] += v;
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let inv = 1.0 / hists.len() as f64;
+    for v in &mut centroid {
+        *v *= inv;
+    }
+    centroid
+}
+
+/// Mean pairwise EMD between all centroid pairs, normalized by (K-1).
+///
+/// Computes K*(K-1)/2 pairwise EMD values between centroids and returns
+/// the mean. Normalized by (dim-1) where dim is the centroid dimension
+/// (= number of child-street buckets).
+#[must_use]
+pub fn mean_pairwise_centroid_emd(centroids: &[Vec<f64>]) -> f64 {
+    let k = centroids.len();
+    if k < 2 {
+        return 0.0;
+    }
+    let dim = centroids[0].len();
+    #[allow(clippy::cast_precision_loss)]
+    let norm = if dim > 1 { 1.0 / (dim as f64 - 1.0) } else { 1.0 };
+    let mut total = 0.0_f64;
+    let mut count = 0_usize;
+    for i in 0..k {
+        for j in (i + 1)..k {
+            total += emd_1d(&centroids[i], &centroids[j]) * norm;
+            count += 1;
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    if count > 0 { total / count as f64 } else { 0.0 }
 }
 
 /// 1-D Earth Mover's Distance between two probability distributions.
@@ -1647,5 +1721,90 @@ mod tests {
         // Should have some observations in at least one bucket
         let total: usize = report.buckets.iter().map(|b| b.count).sum();
         assert!(total > 0, "expected some equity observations");
+    }
+
+    #[test]
+    fn normalize_emd_divides_by_k_minus_1() {
+        // With 500 child buckets, raw EMD of 24.95 should normalize to 24.95 / 499
+        let raw = 24.95;
+        let k = 500;
+        let normalized = raw / (k as f64 - 1.0);
+        assert!((normalized - 0.05).abs() < 0.001);
+    }
+
+    #[test]
+    fn centroid_separation_ratio() {
+        // Two centroids far apart should give high separation.
+        // Centroid 0: mass at bucket 0. Centroid 1: mass at bucket 2.
+        let centroids = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let between = mean_pairwise_centroid_emd(&centroids);
+        // EMD between [1,0,0] and [0,0,1] on 3 buckets: CDF diffs = [1.0, 1.0], sum = 2.0
+        // Normalized by (3-1) = 2: 2.0 / 2.0 = 1.0
+        assert!((between - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn centroid_separation_close() {
+        // Two adjacent centroids should give low separation.
+        let centroids = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+        ];
+        let between = mean_pairwise_centroid_emd(&centroids);
+        // EMD = 1.0, normalized by 2 = 0.5
+        assert!((between - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn transition_report_summary_shows_normalized_and_separation() {
+        // Verify the summary output format includes normalized EMD and separation ratio.
+        let report = TransitionConsistencyReport {
+            from_street: "Flop".to_string(),
+            to_street: "Turn".to_string(),
+            bucket_count: 2,
+            child_bucket_count: 100,
+            sample_boards: 10,
+            buckets: vec![
+                BucketTransitionStats {
+                    bucket_id: 0,
+                    count: 5,
+                    mean_emd_to_centroid: 0.048,
+                    max_emd_to_centroid: 0.22,
+                    distinct_turn_buckets: 10,
+                    transition_entropy: 3.0,
+                },
+            ],
+            mean_emd: 0.048,
+            max_emd: 0.22,
+            mean_between_emd: Some(0.185),
+            separation_ratio: Some(3.85),
+        };
+        let s = report.summary();
+        assert!(s.contains("(normalized)"), "summary missing '(normalized)': {s}");
+        assert!(s.contains("Between-centroid EMD"), "summary missing between-centroid: {s}");
+        assert!(s.contains("Separation ratio"), "summary missing separation ratio: {s}");
+        assert!(s.contains("3.85"), "summary missing ratio value: {s}");
+    }
+
+    #[test]
+    fn transition_report_summary_omits_separation_when_none() {
+        let report = TransitionConsistencyReport {
+            from_street: "Flop".to_string(),
+            to_street: "Turn".to_string(),
+            bucket_count: 2,
+            child_bucket_count: 100,
+            sample_boards: 10,
+            buckets: vec![],
+            mean_emd: 0.0,
+            max_emd: 0.0,
+            mean_between_emd: None,
+            separation_ratio: None,
+        };
+        let s = report.summary();
+        assert!(!s.contains("Between-centroid"), "should not show between-centroid when None: {s}");
+        assert!(!s.contains("Separation ratio"), "should not show separation ratio when None: {s}");
     }
 }
