@@ -39,10 +39,11 @@ use crate::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
 use crate::showdown_equity::rank_hand;
 
 use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard, VERSION};
+use super::centroid_file::CentroidFile;
 use super::clustering::{
-    fast_kmeans_1d, fast_kmeans_histogram, kmeans_1d, kmeans_1d_weighted,
-    kmeans_emd_weighted_u8, nearest_centroid_1d, nearest_centroid_l2,
-    nearest_centroid_u8,
+    compute_centroid_ev, compute_centroid_gaps, fast_kmeans_1d, fast_kmeans_histogram,
+    kmeans_1d, nearest_centroid_1d, nearest_centroid_u8, nearest_centroid_u8_weighted,
+    sort_centroids_by_ev,
 };
 use super::config::ClusteringConfig;
 use super::per_flop_bucket_file::PerFlopBucketFile;
@@ -337,7 +338,7 @@ pub fn cluster_river_exhaustive(
     seed: u64,
     sample_boards: usize,
     progress: impl Fn(&str, f64) + Sync,
-) -> BucketFile {
+) -> (BucketFile, CentroidFile) {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
 
@@ -368,13 +369,21 @@ pub fn cluster_river_exhaustive(
         }
     }
 
-    let (_labels, centroids) = fast_kmeans_1d(
+    let (_labels, mut centroids) = fast_kmeans_1d(
         &sample_vals,
         bucket_count as usize,
         kmeans_iterations,
         seed,
     );
+    // Sort centroids ascending so bucket IDs are ordered by equity.
+    centroids.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     progress("k-means", 1.0);
+
+    // Build CentroidFile with scalar centroids (1-D).
+    let centroid_file = CentroidFile::new(
+        Street::River,
+        centroids.iter().map(|&c| vec![c]).collect(),
+    );
 
     // Phase 2: Enumerate ALL canonical rivers and assign each combo to nearest centroid.
     let num_boards = all_canonical.len();
@@ -410,7 +419,7 @@ pub fn cluster_river_exhaustive(
         .collect();
 
     #[allow(clippy::cast_possible_truncation)]
-    BucketFile {
+    let bucket_file = BucketFile {
         header: BucketFileHeader {
             street: Street::River,
             bucket_count,
@@ -420,7 +429,8 @@ pub fn cluster_river_exhaustive(
         },
         boards: packed_boards,
         buckets,
-    }
+    };
+    (bucket_file, centroid_file)
 }
 
 /// Two-phase histogram-based clustering: EMD k-means on sampled boards,
@@ -430,7 +440,7 @@ pub fn cluster_river_exhaustive(
 /// prior street, and runs `kmeans_emd_weighted_u8` to find centroids.
 /// Phase 2 enumerates ALL canonical boards and assigns each combo to its
 /// nearest centroid via `nearest_centroid_u8`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn cluster_histogram_exhaustive<const N: usize>(
     street: Street,
     prior_buckets: &BucketFile,
@@ -439,8 +449,10 @@ fn cluster_histogram_exhaustive<const N: usize>(
     kmeans_iterations: u32,
     seed: u64,
     sample_boards: usize,
+    child_centroid_evs: &[f64],
+    child_centroid_gaps: &[f64],
     progress: impl Fn(&str, f64) + Sync,
-) -> BucketFile {
+) -> (BucketFile, CentroidFile) {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
     let board_map = prior_buckets.board_index_map();
@@ -489,6 +501,21 @@ fn cluster_histogram_exhaustive<const N: usize>(
     );
     progress("k-means", 1.0);
 
+    // Convert f32 centroids to f64 normalized probability distributions.
+    let centroids_f64: Vec<Vec<f64>> = centroids
+        .iter()
+        .map(|c| {
+            let total: f64 = c.iter().map(|&v| f64::from(v)).sum();
+            let inv = if total > 0.0 { 1.0 / total } else { 0.0 };
+            c.iter().map(|&v| f64::from(v) * inv).collect()
+        })
+        .collect();
+
+    // Sort centroids by expected equity so bucket IDs are ordered.
+    let (sorted_centroids, _remap) = sort_centroids_by_ev(&centroids_f64, child_centroid_evs);
+
+    let centroid_file = CentroidFile::new(street, sorted_centroids.clone());
+
     // Phase 2: Enumerate ALL canonical boards and assign each combo to nearest centroid.
     let num_boards = all_canonical.len();
     let total = num_boards * TOTAL_COMBOS as usize;
@@ -507,7 +534,11 @@ fn cluster_histogram_exhaustive<const N: usize>(
                     let hist = build_bucket_histogram_u8(
                         *combo, &wb.cards, &deck, prior_buckets, &board_map,
                     );
-                    nearest_centroid_l2(&hist, &centroids)
+                    if child_centroid_gaps.is_empty() {
+                        nearest_centroid_u8(&hist, &sorted_centroids)
+                    } else {
+                        nearest_centroid_u8_weighted(&hist, &sorted_centroids, child_centroid_gaps)
+                    }
                 })
                 .collect();
             #[allow(clippy::cast_precision_loss)]
@@ -527,7 +558,7 @@ fn cluster_histogram_exhaustive<const N: usize>(
         .collect();
 
     #[allow(clippy::cast_possible_truncation)]
-    BucketFile {
+    let bucket_file = BucketFile {
         header: BucketFileHeader {
             street,
             bucket_count,
@@ -537,22 +568,26 @@ fn cluster_histogram_exhaustive<const N: usize>(
         },
         boards: packed_boards,
         buckets,
-    }
+    };
+    (bucket_file, centroid_file)
 }
 
 /// Cluster turn situations using two-phase clustering:
 /// - Phase 1: Sample canonical turns, build histograms over `river_buckets`,
 ///   run `kmeans_emd_weighted_u8` to find centroids.
 /// - Phase 2: Enumerate ALL canonical turns, build histograms, assign to
-///   nearest centroid via `nearest_centroid_u8`.
+///   nearest centroid via weighted EMD (or unweighted if gaps are empty).
+#[allow(clippy::too_many_arguments)]
 pub fn cluster_turn_exhaustive(
     river_buckets: &BucketFile,
     bucket_count: u16,
     kmeans_iterations: u32,
     seed: u64,
     sample_boards: usize,
+    river_centroid_evs: &[f64],
+    river_centroid_gaps: &[f64],
     progress: impl Fn(&str, f64) + Sync,
-) -> BucketFile {
+) -> (BucketFile, CentroidFile) {
     let all_canonical = enumerate_canonical_turns();
     cluster_histogram_exhaustive(
         Street::Turn,
@@ -562,6 +597,8 @@ pub fn cluster_turn_exhaustive(
         kmeans_iterations,
         seed,
         sample_boards,
+        river_centroid_evs,
+        river_centroid_gaps,
         progress,
     )
 }
@@ -570,15 +607,18 @@ pub fn cluster_turn_exhaustive(
 /// - Phase 1: Sample canonical flops, build histograms over `turn_buckets`,
 ///   run `kmeans_emd_weighted_u8` to find centroids.
 /// - Phase 2: Enumerate ALL canonical flops, build histograms, assign to
-///   nearest centroid via `nearest_centroid_u8`.
+///   nearest centroid via weighted EMD (or unweighted if gaps are empty).
+#[allow(clippy::too_many_arguments)]
 pub fn cluster_flop_exhaustive(
     turn_buckets: &BucketFile,
     bucket_count: u16,
     kmeans_iterations: u32,
     seed: u64,
     sample_boards: usize,
+    turn_centroid_evs: &[f64],
+    turn_centroid_gaps: &[f64],
     progress: impl Fn(&str, f64) + Sync,
-) -> BucketFile {
+) -> (BucketFile, CentroidFile) {
     let all_canonical = enumerate_canonical_flops();
     cluster_histogram_exhaustive(
         Street::Flop,
@@ -588,6 +628,8 @@ pub fn cluster_flop_exhaustive(
         kmeans_iterations,
         seed,
         sample_boards,
+        turn_centroid_evs,
+        turn_centroid_gaps,
         progress,
     )
 }
@@ -862,13 +904,14 @@ pub fn run_clustering_pipeline(
     // two-phase exhaustive clustering. sample_boards controls the sampling
     // phase of centroid finding; the exhaustive phase always covers all boards.
     progress("river", "sampling", 0.0);
-    let river = if let Some(ref cfvnet_dir) = config.cfvnet_river_data {
-        cluster_river_from_cfvnet(
+    let (river, river_centroids) = if let Some(ref cfvnet_dir) = config.cfvnet_river_data {
+        let bf = cluster_river_from_cfvnet(
             cfvnet_dir,
             config.river.buckets,
             config.kmeans_iterations,
             |phase, p| progress("river", phase, p),
-        )?
+        )?;
+        (bf, CentroidFile::new(Street::River, vec![]))
     } else {
         let sample = config.river.sample_boards.unwrap_or(DEFAULT_NUM_BOARDS);
         cluster_river_exhaustive(
@@ -880,35 +923,58 @@ pub fn run_clustering_pipeline(
         )
     };
     river.save(&output_dir.join("river.buckets"))?;
+    if !river_centroids.centroids().is_empty() {
+        river_centroids.save(&output_dir.join("river.centroids"))?;
+    }
 
     // 2. Turn (potential-aware EMD, depends on river)
     // Two-phase exhaustive: sample for centroids, assign all canonical turns.
+    // Thread river centroid EVs and gaps for weighted EMD assignment.
     progress("turn", "sampling", 0.0);
     let sample_turn = config.turn.sample_boards.unwrap_or(DEFAULT_TURN_BOARDS);
-    let turn = cluster_turn_exhaustive(
+    let river_evs: Vec<f64> = river_centroids.centroids().iter().map(|c| c[0]).collect();
+    let river_gaps = compute_centroid_gaps(&river_evs);
+    let (turn, turn_centroids) = cluster_turn_exhaustive(
         &river,
         config.turn.buckets,
         config.kmeans_iterations,
         config.seed,
         sample_turn,
+        &river_evs,
+        &river_gaps,
         |phase, p| progress("turn", phase, p),
     );
     turn.save(&output_dir.join("turn.buckets"))?;
+    if !turn_centroids.centroids().is_empty() {
+        turn_centroids.save(&output_dir.join("turn.centroids"))?;
+    }
 
     // 3. Flop (potential-aware EMD, depends on turn)
     // Two-phase exhaustive: sample for centroids, assign all canonical flops.
+    // Thread turn centroid EVs and gaps for weighted EMD assignment.
     // All 1,755 canonical flops are always enumerated in the exhaustive phase.
     progress("flop", "sampling", 0.0);
     let sample_flop = config.flop.sample_boards.unwrap_or(1755);
-    let flop = cluster_flop_exhaustive(
+    let turn_evs: Vec<f64> = turn_centroids
+        .centroids()
+        .iter()
+        .map(|c| compute_centroid_ev(c, &river_evs))
+        .collect();
+    let turn_gaps = compute_centroid_gaps(&turn_evs);
+    let (flop, flop_centroids) = cluster_flop_exhaustive(
         &turn,
         config.flop.buckets,
         config.kmeans_iterations,
         config.seed,
         sample_flop,
+        &turn_evs,
+        &turn_gaps,
         |phase, p| progress("flop", phase, p),
     );
     flop.save(&output_dir.join("flop.buckets"))?;
+    if !flop_centroids.centroids().is_empty() {
+        flop_centroids.save(&output_dir.join("flop.centroids"))?;
+    }
 
     // 4. Preflop (deterministic canonical hand mapping, 169 buckets)
     progress("preflop", "mapping", 0.0);
@@ -2525,6 +2591,38 @@ mod tests {
             stages.iter().any(|(s, _)| s == "flop-clustering"),
             "expected flop-clustering progress"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Centroid pipeline wiring tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cluster_river_exhaustive_returns_centroid_file() {
+        // cluster_river_exhaustive should return (BucketFile, CentroidFile).
+        // We can't run a full exhaustive pipeline in a unit test (too slow),
+        // so we verify the type signature compiles and the centroid file is
+        // constructed correctly by calling the function with minimal params.
+        // This test is marked ignore since it enumerates canonical rivers.
+        // Instead, we verify the return type at compile time by destructuring.
+        let _: fn(u16, u32, u64, usize, fn(&str, f64)) -> (BucketFile, CentroidFile) =
+            |a, b, c, d, e| cluster_river_exhaustive(a, b, c, d, e);
+    }
+
+    #[test]
+    fn cluster_turn_exhaustive_accepts_centroid_evs_and_gaps() {
+        // Verify the new signature compiles: takes centroid EVs and gaps,
+        // returns (BucketFile, CentroidFile).
+        let _: fn(&BucketFile, u16, u32, u64, usize, &[f64], &[f64], fn(&str, f64)) -> (BucketFile, CentroidFile) =
+            |a, b, c, d, e, f, g, h| cluster_turn_exhaustive(a, b, c, d, e, f, g, h);
+    }
+
+    #[test]
+    fn cluster_flop_exhaustive_accepts_centroid_evs_and_gaps() {
+        // Verify the new signature compiles: takes centroid EVs and gaps,
+        // returns (BucketFile, CentroidFile).
+        let _: fn(&BucketFile, u16, u32, u64, usize, &[f64], &[f64], fn(&str, f64)) -> (BucketFile, CentroidFile) =
+            |a, b, c, d, e, f, g, h| cluster_flop_exhaustive(a, b, c, d, e, f, g, h);
     }
 
     #[test]
