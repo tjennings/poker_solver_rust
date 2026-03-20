@@ -949,6 +949,53 @@ pub fn nearest_centroid_l2(point: &[u8], centroids: &[Vec<f32>]) -> u16 {
 }
 
 // ---------------------------------------------------------------------------
+// Centroid EV computation, sorting, and label remapping
+// ---------------------------------------------------------------------------
+
+/// Compute the expected equity of a centroid histogram given child-street EVs.
+/// Returns `centroid[i] * child_evs[i]`.
+#[must_use]
+pub fn compute_centroid_ev(centroid: &[f64], child_evs: &[f64]) -> f64 {
+    debug_assert_eq!(centroid.len(), child_evs.len());
+    centroid.iter().zip(child_evs).map(|(w, ev)| w * ev).sum()
+}
+
+/// Sort centroids by expected equity (ascending). Returns `(sorted_centroids, remap)`
+/// where `remap[old_id] = new_id`.
+#[must_use]
+pub fn sort_centroids_by_ev(
+    centroids: &[Vec<f64>],
+    child_evs: &[f64],
+) -> (Vec<Vec<f64>>, Vec<u16>) {
+    let mut indexed_evs: Vec<(usize, f64)> = centroids
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, compute_centroid_ev(c, child_evs)))
+        .collect();
+    indexed_evs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut remap = vec![0_u16; centroids.len()];
+    let mut sorted = Vec::with_capacity(centroids.len());
+    #[allow(clippy::cast_possible_truncation)]
+    for (new_id, (old_id, _ev)) in indexed_evs.iter().enumerate() {
+        remap[*old_id] = new_id as u16;
+        sorted.push(centroids[*old_id].clone());
+    }
+    (sorted, remap)
+}
+
+/// Compute equity gaps between adjacent sorted centroids. Returns vec of length K-1.
+#[must_use]
+pub fn compute_centroid_gaps(sorted_evs: &[f64]) -> Vec<f64> {
+    sorted_evs.windows(2).map(|w| w[1] - w[0]).collect()
+}
+
+/// Apply a remap permutation to bucket labels. `remap[old_id] = new_id`.
+#[must_use]
+pub fn remap_labels(labels: &[u16], remap: &[u16]) -> Vec<u16> {
+    labels.iter().map(|&old| remap[old as usize]).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1271,5 +1318,54 @@ mod tests {
         let d_mixed = emd_u8_vs_f64(&counts, &centroid);
         let d_f64 = emd(&prob, &centroid);
         assert!((d_mixed - d_f64).abs() < 1e-10, "mixed={d_mixed} f64={d_f64}");
+    }
+
+    #[test]
+    fn test_compute_centroid_ev() {
+        let child_evs = [0.1, 0.5, 0.9];
+        let centroid = [0.5, 0.0, 0.5];
+        let ev = compute_centroid_ev(&centroid, &child_evs);
+        assert!((ev - 0.5).abs() < 1e-10, "expected 0.5, got {ev}");
+    }
+
+    #[test]
+    fn test_sort_centroids_by_ev() {
+        // Centroid 0: high EV, centroid 1: low EV, centroid 2: mid EV
+        let centroids = vec![
+            vec![0.0, 0.0, 1.0], // EV = 0.9
+            vec![1.0, 0.0, 0.0], // EV = 0.1
+            vec![0.0, 1.0, 0.0], // EV = 0.5
+        ];
+        let child_evs = [0.1, 0.5, 0.9];
+        let (sorted, remap) = sort_centroids_by_ev(&centroids, &child_evs);
+
+        // Sorted by ascending EV: old[1]=0.1, old[2]=0.5, old[0]=0.9
+        assert_eq!(remap[0], 2); // old 0 -> new 2 (highest)
+        assert_eq!(remap[1], 0); // old 1 -> new 0 (lowest)
+        assert_eq!(remap[2], 1); // old 2 -> new 1 (middle)
+
+        // Verify sorted centroids are in ascending EV order
+        let ev0 = compute_centroid_ev(&sorted[0], &child_evs);
+        let ev1 = compute_centroid_ev(&sorted[1], &child_evs);
+        let ev2 = compute_centroid_ev(&sorted[2], &child_evs);
+        assert!(ev0 < ev1);
+        assert!(ev1 < ev2);
+    }
+
+    #[test]
+    fn test_compute_centroid_gaps() {
+        let sorted_evs = [0.1, 0.3, 0.9];
+        let gaps = compute_centroid_gaps(&sorted_evs);
+        assert_eq!(gaps.len(), 2);
+        assert!((gaps[0] - 0.2).abs() < 1e-10, "expected 0.2, got {}", gaps[0]);
+        assert!((gaps[1] - 0.6).abs() < 1e-10, "expected 0.6, got {}", gaps[1]);
+    }
+
+    #[test]
+    fn test_remap_labels() {
+        let labels: Vec<u16> = vec![0, 1, 2, 0, 2, 1];
+        let remap: Vec<u16> = vec![2, 0, 1];
+        let result = remap_labels(&labels, &remap);
+        assert_eq!(result, vec![2, 0, 1, 2, 1, 0]);
     }
 }
