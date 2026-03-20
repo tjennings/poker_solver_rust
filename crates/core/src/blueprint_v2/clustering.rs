@@ -79,6 +79,42 @@ pub fn emd_u8_vs_f64(counts: &[u8], centroid: &[f64]) -> f64 {
     distance
 }
 
+/// Weighted EMD between a u8 count histogram and an f64 centroid.
+///
+/// Like [`emd_u8_vs_f64`] but each CDF step is weighted by `gaps[i]`.
+/// `gaps` has length K-1 where K = `counts.len()`.
+/// With uniform gaps of 1.0 this equals the unweighted variant.
+#[must_use]
+pub fn emd_u8_vs_f64_weighted(counts: &[u8], centroid: &[f64], gaps: &[f64]) -> f64 {
+    debug_assert_eq!(counts.len(), centroid.len());
+    debug_assert_eq!(gaps.len(), counts.len() - 1);
+    let total: f64 = counts.iter().map(|&c| f64::from(c)).sum();
+    let inv = if total > 0.0 { 1.0 / total } else { 0.0 };
+    let mut cdf_diff = 0.0_f64;
+    let mut distance = 0.0_f64;
+    for i in 0..counts.len() - 1 {
+        cdf_diff += f64::from(counts[i]) * inv - centroid[i];
+        distance += cdf_diff.abs() * gaps[i];
+    }
+    distance
+}
+
+/// Assign a u8 histogram to the nearest centroid using weighted EMD.
+#[allow(clippy::cast_possible_truncation)]
+#[must_use]
+pub fn nearest_centroid_u8_weighted(point: &[u8], centroids: &[Vec<f64>], gaps: &[f64]) -> u16 {
+    let mut best_idx = 0_u16;
+    let mut best_dist = f64::MAX;
+    for (ci, centroid) in centroids.iter().enumerate() {
+        let d = emd_u8_vs_f64_weighted(point, centroid, gaps);
+        if d < best_dist {
+            best_dist = d;
+            best_idx = ci as u16;
+        }
+    }
+    best_idx
+}
+
 // ---------------------------------------------------------------------------
 // K-Means with EMD distance
 // ---------------------------------------------------------------------------
@@ -1367,5 +1403,53 @@ mod tests {
         let remap: Vec<u16> = vec![2, 0, 1];
         let result = remap_labels(&labels, &remap);
         assert_eq!(result, vec![2, 0, 1, 2, 1, 0]);
+    }
+
+    #[test]
+    fn test_emd_u8_vs_f64_weighted_uniform_gaps() {
+        // With uniform gaps of 1.0, weighted EMD must equal unweighted EMD.
+        let counts: Vec<u8> = vec![20, 15, 10, 1];
+        let centroid: Vec<f64> = vec![0.1, 0.4, 0.3, 0.2];
+        let gaps = vec![1.0, 1.0, 1.0]; // K-1 = 3 gaps
+        let d_weighted = emd_u8_vs_f64_weighted(&counts, &centroid, &gaps);
+        let d_unweighted = emd_u8_vs_f64(&counts, &centroid);
+        assert!(
+            (d_weighted - d_unweighted).abs() < 1e-10,
+            "weighted={d_weighted} unweighted={d_unweighted}"
+        );
+    }
+
+    #[test]
+    fn test_emd_u8_vs_f64_weighted_nonuniform_gaps() {
+        // All mass at bucket 0. Compare distance to centroids at bucket 1 vs bucket 3.
+        // With gaps [0.1, 0.3, 0.5], bucket 3 is farther than bucket 1.
+        let counts: Vec<u8> = vec![40, 0, 0, 0];
+        let gaps = vec![0.1, 0.3, 0.5];
+
+        // Centroid concentrated at bucket 1
+        let near_centroid = vec![0.0, 1.0, 0.0, 0.0];
+        // Centroid concentrated at bucket 3
+        let far_centroid = vec![0.0, 0.0, 0.0, 1.0];
+
+        let d_near = emd_u8_vs_f64_weighted(&counts, &near_centroid, &gaps);
+        let d_far = emd_u8_vs_f64_weighted(&counts, &far_centroid, &gaps);
+
+        assert!(
+            d_far > d_near,
+            "far={d_far} should be > near={d_near}"
+        );
+    }
+
+    #[test]
+    fn test_nearest_centroid_u8_weighted() {
+        // Point with mass concentrated at bucket 0.
+        let point: Vec<u8> = vec![36, 4, 0, 0];
+        let centroids = vec![
+            vec![0.9, 0.1, 0.0, 0.0], // close to point
+            vec![0.0, 0.0, 0.1, 0.9], // far from point
+        ];
+        let gaps = vec![1.0, 1.0, 1.0];
+        let idx = nearest_centroid_u8_weighted(&point, &centroids, &gaps);
+        assert_eq!(idx, 0, "should pick centroid 0 (closer)");
     }
 }
