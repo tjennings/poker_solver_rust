@@ -1,5 +1,6 @@
 pub mod config;
 pub mod leaf_evaluator;
+pub mod orchestration;
 pub mod pbs;
 pub mod belief_update;
 pub mod blueprint_sampler;
