@@ -807,7 +807,7 @@ fn v2_actions_at_node(tree: &V2GameTree, node_idx: u32) -> Vec<ActionInfo> {
         V2GameNode::Decision { actions, .. } => actions
             .iter()
             .enumerate()
-            .map(|(i, a)| v2_action_info(a, i, 1.0))
+            .map(|(i, a)| v2_action_info(a, i, 1.0, 0.0))
             .collect(),
         _ => vec![],
     }
@@ -818,8 +818,19 @@ fn v2_actions_at_node(tree: &V2GameTree, node_idx: u32) -> Vec<ActionInfo> {
 /// `bb_scale` converts internal tree units to BB for display labels.
 /// Use `1.0` when the tree uses BB units (blueprint preflop tree).
 /// Use `0.5` when the tree uses chip units (subgame solver, 1BB = 2 chips).
+///
+/// `invested_offset` is subtracted from Bet/Raise amounts before display.
+/// For postflop subgame trees this is the per-player investment entering
+/// the street (pot / 2), so labels show the bet/raise amount on THIS
+/// street rather than total invested across all streets.
+/// Use `0.0` for preflop where invested starts at the blind.
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn v2_action_info(action: &TreeAction, idx: usize, bb_scale: f64) -> ActionInfo {
+pub(crate) fn v2_action_info(
+    action: &TreeAction,
+    idx: usize,
+    bb_scale: f64,
+    invested_offset: f64,
+) -> ActionInfo {
     let id = idx.to_string();
     match action {
         TreeAction::Fold => ActionInfo {
@@ -840,18 +851,24 @@ pub(crate) fn v2_action_info(action: &TreeAction, idx: usize, bb_scale: f64) -> 
             action_type: "call".to_string(),
             size_key: None,
         },
-        TreeAction::Bet(amount) => ActionInfo {
-            id,
-            label: format!("{:.1}bb", amount * bb_scale),
-            action_type: "bet".to_string(),
-            size_key: Some(format!("{amount:.2}")),
-        },
-        TreeAction::Raise(amount) => ActionInfo {
-            id,
-            label: format!("{:.1}bb", amount * bb_scale),
-            action_type: "raise".to_string(),
-            size_key: Some(format!("{amount:.2}")),
-        },
+        TreeAction::Bet(amount) => {
+            let display = (amount - invested_offset) * bb_scale;
+            ActionInfo {
+                id,
+                label: format!("{display:.1}bb"),
+                action_type: "bet".to_string(),
+                size_key: Some(format!("{amount:.2}")),
+            }
+        }
+        TreeAction::Raise(amount) => {
+            let display = (amount - invested_offset) * bb_scale;
+            ActionInfo {
+                id,
+                label: format!("{display:.1}bb"),
+                action_type: "raise".to_string(),
+                size_key: Some(format!("{amount:.2}")),
+            }
+        }
         TreeAction::AllIn => ActionInfo {
             id,
             label: "All-in".to_string(),
