@@ -196,6 +196,21 @@ enum Commands {
         #[arg(long, default_value_t = 100000)]
         num_hands: usize,
     },
+    /// Generate a held-out validation set for ReBeL
+    #[command(name = "rebel-validate")]
+    RebelValidate {
+        /// Path to ReBeL YAML configuration file
+        #[arg(short, long)]
+        config: PathBuf,
+
+        /// Number of validation examples to generate
+        #[arg(long, default_value_t = 100)]
+        num_examples: usize,
+
+        /// Output path for validation set binary file
+        #[arg(short, long)]
+        output: String,
+    },
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -982,6 +997,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         } => {
             run_rebel_eval(&config, &model, &mode, num_hands)?;
         }
+        Commands::RebelValidate {
+            config,
+            num_examples,
+            output,
+        } => {
+            run_rebel_validate(&config, num_examples, &output)?;
+        }
     }
 
     Ok(())
@@ -1298,23 +1320,92 @@ fn run_rebel_eval(
 
     match mode {
         "mse" => {
-            eprintln!("MSE evaluation not yet implemented.");
-            eprintln!("This will compare value net predictions against exact subgame solutions.");
+            // Generate a small held-out validation set (river only for now)
+            eprintln!("Generating held-out validation set...");
+            let solve_config = rebel::generate::build_solve_config(&rebel_config.seed);
+            let val_records = rebel::validation::generate_validation_set(
+                100,  // 100 validation examples
+                &solve_config,
+                rebel_config.seed.seed + 999999,  // different seed from training
+            );
+            eprintln!("Generated {} validation records", val_records.len());
+
+            eprintln!("  River records: {}", val_records.iter().filter(|r| r.board_card_count == 5).count());
+
+            // Model MSE evaluation requires loading CfvNet — not yet wired.
+            eprintln!();
             eprintln!(
-                "  Network: {} hidden layers x {} units",
+                "Model MSE evaluation requires loading CfvNet ({} layers x {} units) — not yet wired.",
                 rebel_config.training.hidden_layers, rebel_config.training.hidden_size
             );
+            eprintln!("Validation set generated with {} records.", val_records.len());
         }
         "h2h" => {
-            eprintln!("Head-to-head evaluation not yet implemented.");
-            eprintln!(
-                "This will play {num_hands} hands of ReBeL vs blueprint and report exploitability."
-            );
+            eprintln!("Head-to-head evaluation: {} hands", num_hands);
+            eprintln!("This requires both a ReBeL agent (subgame solving at each decision)");
+            eprintln!("and a blueprint agent (table lookup). Not yet implemented.");
         }
         other => {
             return Err(format!("Unknown evaluation mode: '{other}'. Use 'mse' or 'h2h'.").into());
         }
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ReBeL validation set generation
+// ---------------------------------------------------------------------------
+
+fn run_rebel_validate(
+    config_path: &std::path::Path,
+    num_examples: usize,
+    output: &str,
+) -> Result<(), Box<dyn Error>> {
+    let yaml = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("Failed to read config: {e}"))?;
+    let rebel_config: rebel::config::RebelConfig = serde_yaml::from_str(&yaml)
+        .map_err(|e| format!("Failed to parse config: {e}"))?;
+
+    eprintln!("ReBeL Validation Set Generator");
+    eprintln!("  Config: {}", config_path.display());
+    eprintln!("  Examples: {num_examples}");
+    eprintln!("  Output: {output}");
+    eprintln!();
+
+    // Build solve config from rebel seed settings
+    let solve_config = rebel::generate::build_solve_config(&rebel_config.seed);
+
+    // Use a different seed from training to ensure held-out data
+    let val_seed = rebel_config.seed.seed + 999999;
+
+    eprintln!("Generating validation set (seed={val_seed})...");
+    let start = std::time::Instant::now();
+    let val_records = rebel::validation::generate_validation_set(
+        num_examples,
+        &solve_config,
+        val_seed,
+    );
+    let elapsed = start.elapsed();
+
+    let river_count = val_records.iter().filter(|r| r.board_card_count == 5).count();
+    eprintln!("Generated {} records ({} river) in {:.1}s", val_records.len(), river_count, elapsed.as_secs_f64());
+
+    // Save to output file using DiskBuffer
+    let output_path = std::path::Path::new(output);
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create output directory: {e}"))?;
+        }
+    }
+
+    let mut buf = rebel::data_buffer::DiskBuffer::create(output_path, val_records.len())
+        .map_err(|e| format!("Failed to create output file: {e}"))?;
+    for rec in &val_records {
+        buf.append(rec).map_err(|e| format!("Failed to write record: {e}"))?;
+    }
+    eprintln!("Saved {} validation records to {output}", buf.len());
 
     Ok(())
 }
