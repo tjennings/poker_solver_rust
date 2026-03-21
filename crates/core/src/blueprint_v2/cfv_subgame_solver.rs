@@ -892,6 +892,31 @@ impl CfvSubgameSolver {
             num_combos,
         }
     }
+
+    /// Get the cumulative regret sums at the root node for a specific combo.
+    /// Returns a slice of regrets, one per action. For debugging.
+    #[must_use]
+    pub fn root_regrets(&self, combo_idx: usize) -> Vec<f64> {
+        let root = self.tree.root as usize;
+        let num_actions = match &self.tree.nodes[root] {
+            GameNode::Decision { actions, .. } => actions.len(),
+            _ => return vec![],
+        };
+        let (base, _) = self.layout.slot(root, combo_idx);
+        self.regret_sum[base..base + num_actions].to_vec()
+    }
+
+    /// Get the cumulative strategy sums at the root node for a specific combo.
+    #[must_use]
+    pub fn root_strategy_sums(&self, combo_idx: usize) -> Vec<f64> {
+        let root = self.tree.root as usize;
+        let num_actions = match &self.tree.nodes[root] {
+            GameNode::Decision { actions, .. } => actions.len(),
+            _ => return vec![],
+        };
+        let (base, _) = self.layout.slot(root, combo_idx);
+        self.strategy_sum[base..base + num_actions].to_vec()
+    }
 }
 
 // ---------------------------------------------------------------------------

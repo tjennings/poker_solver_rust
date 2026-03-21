@@ -455,6 +455,12 @@ impl BlueprintCbvEvaluator {
                 eprintln!("  bucket {bucket:>4}: {: >3} combos  cbv={raw_cbv:>7.3}  [{}{suffix}]",
                     combos.len(), preview.join(", "));
             }
+
+            // Search for specific hands of interest
+            eprintln!("[cbv audit] ALL COMBOS (sorted by CBV desc):");
+            for (name, bucket, raw, norm) in &samples {
+                eprintln!("  {name:<12} bucket={bucket:>4}  cbv_bb={raw:>8.3}  pot_frac={norm:>8.4}");
+            }
         }
 
         Self {
@@ -1409,6 +1415,49 @@ fn solve_depth_limited(
                 // Final strategy snapshot.
                 let strategy = solver.strategy();
                 *shared.matrix_snapshot.write() = Some(make_matrix(&strategy));
+
+                // Post-training diagnostic: dump regrets and strategy for
+                // a few sample combos at the root node.
+                {
+                    let n = hands.combos.len();
+                    let num_actions = action_infos.len();
+                    let labels: Vec<&str> = action_infos.iter().map(|a| a.label.as_str()).collect();
+                    eprintln!("[solver audit] {} iterations complete, {} combos, {} actions: {:?}",
+                        max_iters, n, num_actions, labels);
+
+                    // Show strategy + regrets for first 10 combos with nonzero reach
+                    let mut shown = 0;
+                    for combo_idx in 0..n {
+                        if shown >= 10 { break; }
+                        let probs = strategy.root_probs(combo_idx);
+                        if probs.is_empty() { continue; }
+                        let reach = if player == 0 { &oop_w } else { &ip_w };
+                        let card_id0 = rs_poker_card_to_id(hands.combos[combo_idx][0]);
+                        let card_id1 = rs_poker_card_to_id(hands.combos[combo_idx][1]);
+                        let ci = card_pair_to_index(card_id0, card_id1);
+                        if reach[ci] <= 0.0 { continue; }
+                        let probs_str: Vec<String> = probs.iter()
+                            .zip(labels.iter())
+                            .map(|(p, l)| format!("{l}={:.1}%", p * 100.0))
+                            .collect();
+                        let regrets = solver.root_regrets(combo_idx);
+                        let strat_sums = solver.root_strategy_sums(combo_idx);
+                        let regret_str: Vec<String> = regrets.iter()
+                            .zip(labels.iter())
+                            .map(|(r, l)| format!("{l}={r:.1}"))
+                            .collect();
+                        let ssum_str: Vec<String> = strat_sums.iter()
+                            .zip(labels.iter())
+                            .map(|(s, l)| format!("{l}={s:.1}"))
+                            .collect();
+                        eprintln!("  combo {combo_idx} {}{}:",
+                            hands.combos[combo_idx][0], hands.combos[combo_idx][1]);
+                        eprintln!("    strategy: {}", probs_str.join(" "));
+                        eprintln!("    regrets:  {}", regret_str.join(" "));
+                        eprintln!("    str_sums: {}", ssum_str.join(" "));
+                        shown += 1;
+                    }
+                }
 
                 // Store subgame result for range propagation and navigation.
                 *shared.subgame_result.write() = Some(SubgameSolveResult {

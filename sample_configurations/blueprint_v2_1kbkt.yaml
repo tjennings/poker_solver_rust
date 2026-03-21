@@ -52,7 +52,7 @@ snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/1k_50bb_dead_moneyactual/snap"
+  output_dir: "./local_data/blueprints/1k_50bb_v3/snap"
 
 tui:
   enabled: true

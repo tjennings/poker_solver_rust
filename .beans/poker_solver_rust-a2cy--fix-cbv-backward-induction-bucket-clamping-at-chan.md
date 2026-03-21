@@ -3,8 +3,9 @@
 title: Fix CBV backward induction bucket clamping at Chance nodes
 status: todo
 type: bug
+priority: normal
 created_at: 2026-03-21T13:15:56Z
-updated_at: 2026-03-21T13:15:56Z
+updated_at: 2026-03-21T18:41:15Z
 ---
 
-cbv_compute.rs clamps bucket index at Chance nodes (child_bucket = bucket.min(next_buckets-1)) instead of properly mapping flop buckets to turn buckets. Flop bucket 500 has no relation to turn bucket 500. All precomputed CBVs are wrong. Fix: at each Chance node, enumerate concrete hands per bucket, deal next-street cards, look up correct next-street bucket, average the child CBVs. Requires retrain after fix.
+Phase 1 of the two-phase CBV backward induction STILL clamps at nested Chance nodes (turn->river). The transition matrix fix only applies in phase 2 to the outermost Chance node. Deeper Chance nodes use the old buggy clamping. Needs full recursive transition support at every Chance level, or a multi-pass approach that processes each street boundary independently.
