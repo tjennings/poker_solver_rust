@@ -296,10 +296,12 @@ fn terminal_bucket_value(
 
     match kind {
         TerminalKind::Fold { winner } => {
+            // Zero-sum payoffs: winner gains opponent's total contribution
+            // (blind + voluntary), loser loses own total contribution.
             if winner == player {
-                (initial_pot + vol_o) as f32
+                (blinds[o] + vol_o) as f32
             } else {
-                -(vol_p as f32)
+                -((blinds[p] + vol_p) as f32)
             }
         }
         TerminalKind::Showdown => {
@@ -307,8 +309,10 @@ fn terminal_bucket_value(
             let clamped_bucket = bucket.min(river_buckets - 1);
             let equity = (f64::from(clamped_bucket) + 0.5) / f64::from(river_buckets);
 
-            // EV = equity * (initial_pot + vol_opponent) - (1 - equity) * vol_self
-            let ev = equity * (initial_pot + vol_o) - (1.0 - equity) * vol_p;
+            // Zero-sum: payoff = equity * total_pot - own_contribution
+            let total_pot = initial_pot + vol_p + vol_o;
+            let own_contribution = blinds[p] + vol_p;
+            let ev = equity * total_pot - own_contribution;
             ev as f32
         }
         TerminalKind::DepthBoundary => {
@@ -709,12 +713,13 @@ mod tests {
             0,
             bucket_counts,
         );
+        // Zero-sum: winner gains opponent's blind + voluntary = 1.0 + 2.0 = 3.0
         assert!(
-            (v - 3.5).abs() < 1e-5,
-            "Fold win: expected 3.5 (initial_pot 1.5 + vol_opp 2.0), got {v}"
+            (v - 3.0).abs() < 1e-5,
+            "Fold win: expected 3.0 (blinds[opp] 1.0 + vol_opp 2.0), got {v}"
         );
 
-        // Player 0 loses fold: loses own voluntary
+        // Player 0 loses fold: loses own blind + voluntary = 0.5 + 2.0 = 2.5
         let v2 = terminal_bucket_value(
             TerminalKind::Fold { winner: 1 },
             &[2.0, 2.0],
@@ -724,8 +729,8 @@ mod tests {
             bucket_counts,
         );
         assert!(
-            (v2 - (-2.0)).abs() < 1e-5,
-            "Fold loss: expected -2.0, got {v2}"
+            (v2 - (-2.5)).abs() < 1e-5,
+            "Fold loss: expected -2.5 (blinds[self] 0.5 + vol_self 2.0), got {v2}"
         );
     }
 

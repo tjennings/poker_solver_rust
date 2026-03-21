@@ -582,19 +582,22 @@ fn terminal_value(
     };
     match kind {
         TerminalKind::Fold { winner } => {
+            // Zero-sum: winner gains opponent's total (blind + voluntary),
+            // loser loses own total (blind + voluntary).
             if winner == traverser {
-                initial_pot + vol_o - rake
+                blinds[o] + vol_o - rake
             } else {
-                -vol_t
+                -(blinds[t] + vol_t)
             }
         }
         TerminalKind::Showdown => {
             let rank_t = rank_hand(deal.hole_cards[t], &deal.board);
             let rank_o = rank_hand(deal.hole_cards[o], &deal.board);
+            let own_contribution = blinds[t] + vol_t;
             match rank_t.cmp(&rank_o) {
-                Ordering::Greater => initial_pot + vol_o - rake,
-                Ordering::Less => -vol_t,
-                Ordering::Equal => initial_pot / 2.0 - rake / 2.0,
+                Ordering::Greater => pot - own_contribution - rake,
+                Ordering::Less => -own_contribution,
+                Ordering::Equal => pot / 2.0 - own_contribution - rake / 2.0,
             }
         }
         TerminalKind::DepthBoundary => {
@@ -1183,25 +1186,25 @@ mod tests {
         // invested is now voluntary-only: SB fold with no voluntary action
         let invested = [0.0, 0.0];
 
-        // SB folds: vol = 0, so SB loses 0 (blind was sunk cost)
+        // SB folds (traverser=0): loses own blind = -0.5
         let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, &blinds, 0, &deal, 0.0, 0.0);
-        assert!((v - 0.0).abs() < 1e-10, "SB fold should be 0 EV (dead money), got {v}");
+        assert!((v - (-0.5)).abs() < 1e-10, "SB fold should lose blind (-0.5), got {v}");
 
-        // BB wins SB fold: initial_pot + vol_opponent = 1.5 + 0 = 1.5
+        // BB wins SB fold (traverser=1): gains opponent's blind = 0.5
         let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, &blinds, 1, &deal, 0.0, 0.0);
-        assert!((v - 1.5).abs() < 1e-10, "BB wins 1.5 (dead money pot), got {v}");
+        assert!((v - 0.5).abs() < 1e-10, "BB wins opponent blind (0.5), got {v}");
 
         // After raise: voluntary invested=[2.5, 2.0], blinds=[0.5, 1.0]
-        // initial_pot = 1.5
+        // pot = 1.5 + 2.5 + 2.0 = 6.0
         let invested2 = [2.5, 2.0];
-        // Player 0 wins showdown: initial_pot + vol_1 = 1.5 + 2.0 = 3.5
         let deal_p0_wins = make_deal_p0_wins();
+        // Player 0 wins showdown: pot - own_contribution = 6.0 - (0.5 + 2.5) = 3.0
         let v = terminal_value(TerminalKind::Showdown, &invested2, &blinds, 0, &deal_p0_wins, 0.0, 0.0);
-        assert!((v - 3.5).abs() < 1e-10, "Winner gets initial_pot + vol_opp = 3.5, got {v}");
+        assert!((v - 3.0).abs() < 1e-10, "Winner net = pot - own_total = 3.0, got {v}");
 
-        // Player 1 loses: -vol_1 = -2.0
+        // Player 1 loses: -(blind + vol) = -(1.0 + 2.0) = -3.0
         let v = terminal_value(TerminalKind::Showdown, &invested2, &blinds, 1, &deal_p0_wins, 0.0, 0.0);
-        assert!((v - (-2.0)).abs() < 1e-10, "Loser loses vol_self = -2.0, got {v}");
+        assert!((v - (-3.0)).abs() < 1e-10, "Loser loses own_total = -3.0, got {v}");
     }
 
     /// Helper: shorthand card constructor.
