@@ -973,7 +973,6 @@ impl LeafEvaluator for ExactRiverEvaluator {
             let river_hands = SubgameHands {
                 combos: filtered_combos,
             };
-            let fn_count = river_hands.combos.len();
 
             // Build opponent reach for the filtered combo set.
             let opp_reach: Vec<f64> = parent_indices

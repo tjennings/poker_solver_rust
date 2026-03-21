@@ -1553,6 +1553,6 @@ mod tests {
             &[vec![0.5]],
             None,
         );
-        build_boundary_mapping(&tree_a, &tree_b);
+        let _ = build_boundary_mapping(&tree_a, &tree_b);
     }
 }
