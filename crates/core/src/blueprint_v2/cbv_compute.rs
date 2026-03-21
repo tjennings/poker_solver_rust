@@ -181,8 +181,9 @@ fn terminal_bucket_value(
     let p = player as usize;
     let o = 1 - p;
     let initial_pot = blinds[0] + blinds[1];
-    let vol_p = invested[p] - blinds[p];
-    let vol_o = invested[o] - blinds[o];
+    // invested is now voluntary-only (blinds already excluded).
+    let vol_p = invested[p];
+    let vol_o = invested[o];
 
     match kind {
         TerminalKind::Fold { winner } => {
@@ -482,6 +483,45 @@ mod tests {
         assert!(
             (v3 - expected_3).abs() < 1e-5,
             "bucket 3: expected {expected_3}, got {v3}"
+        );
+    }
+
+    /// With non-zero blinds and voluntary invested, verify terminal values.
+    ///
+    /// Scenario: blinds = [0.5, 1.0], invested (voluntary) = [2.0, 2.0].
+    /// initial_pot = 1.5, vol_p0 = 2.0, vol_p1 = 2.0.
+    /// Fold winner=0: p0 gains initial_pot + vol_opp = 1.5 + 2.0 = 3.5
+    /// Fold winner=1: p0 loses vol_self = -2.0
+    #[test]
+    fn terminal_value_with_nonzero_blinds() {
+        let bucket_counts: [u16; 4] = [4, 4, 4, 4];
+
+        // Player 0 wins fold: gains dead money + opponent voluntary
+        let v = terminal_bucket_value(
+            TerminalKind::Fold { winner: 0 },
+            &[2.0, 2.0],
+            &[0.5, 1.0],
+            0,
+            0,
+            bucket_counts,
+        );
+        assert!(
+            (v - 3.5).abs() < 1e-5,
+            "Fold win: expected 3.5 (initial_pot 1.5 + vol_opp 2.0), got {v}"
+        );
+
+        // Player 0 loses fold: loses own voluntary
+        let v2 = terminal_bucket_value(
+            TerminalKind::Fold { winner: 1 },
+            &[2.0, 2.0],
+            &[0.5, 1.0],
+            0,
+            0,
+            bucket_counts,
+        );
+        assert!(
+            (v2 - (-2.0)).abs() < 1e-5,
+            "Fold loss: expected -2.0, got {v2}"
         );
     }
 

@@ -566,8 +566,9 @@ fn terminal_value(
     let t = traverser as usize;
     let o = 1 - t;
     let initial_pot = blinds[0] + blinds[1];
-    let vol_t = invested[t] - blinds[t];
-    let vol_o = invested[o] - blinds[o];
+    // invested is now voluntary-only (blinds already excluded).
+    let vol_t = invested[t];
+    let vol_o = invested[o];
     let pot = initial_pot + vol_t + vol_o;
     let rake = if rake_rate > 0.0 {
         let uncapped = pot * rake_rate;
@@ -1179,9 +1180,10 @@ mod tests {
     fn terminal_dead_money_model() {
         let deal = make_deal();
         let blinds = [0.5, 1.0]; // SB=0.5, BB=1.0
-        let invested = [0.5, 1.0]; // Preflop fold (no voluntary action)
+        // invested is now voluntary-only: SB fold with no voluntary action
+        let invested = [0.0, 0.0];
 
-        // SB folds: vol = 0.5 - 0.5 = 0, so SB loses 0 (blind was sunk cost)
+        // SB folds: vol = 0, so SB loses 0 (blind was sunk cost)
         let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, &blinds, 0, &deal, 0.0, 0.0);
         assert!((v - 0.0).abs() < 1e-10, "SB fold should be 0 EV (dead money), got {v}");
 
@@ -1189,9 +1191,9 @@ mod tests {
         let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, &blinds, 1, &deal, 0.0, 0.0);
         assert!((v - 1.5).abs() < 1e-10, "BB wins 1.5 (dead money pot), got {v}");
 
-        // After raise: invested=[3.0, 3.0], blinds=[0.5, 1.0]
-        // vol_0 = 2.5, vol_1 = 2.0, initial_pot = 1.5
-        let invested2 = [3.0, 3.0];
+        // After raise: voluntary invested=[2.5, 2.0], blinds=[0.5, 1.0]
+        // initial_pot = 1.5
+        let invested2 = [2.5, 2.0];
         // Player 0 wins showdown: initial_pot + vol_1 = 1.5 + 2.0 = 3.5
         let deal_p0_wins = make_deal_p0_wins();
         let v = terminal_value(TerminalKind::Showdown, &invested2, &blinds, 0, &deal_p0_wins, 0.0, 0.0);

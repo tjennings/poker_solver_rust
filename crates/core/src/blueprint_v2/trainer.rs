@@ -852,7 +852,8 @@ impl BlueprintTrainer {
                     if let GameNode::Terminal { kind: TerminalKind::Fold { .. }, invested, .. } =
                         &tree.nodes[child_idx as usize]
                     {
-                        let vol_self = invested[player] - tree.blinds[player];
+                        // invested is voluntary-only (blinds already excluded).
+                        let vol_self = invested[player];
                         return -vol_self;
                     }
                 }

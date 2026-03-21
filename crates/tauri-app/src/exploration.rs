@@ -1008,11 +1008,12 @@ fn get_strategy_matrix_v2(
     }
 
     // Compute pot/stacks from the tree (invested amounts at current node).
+    // invested is voluntary-only; pot includes blinds as dead money.
     let invested = invested_at_v2_node(tree, walk.node_idx);
     let stack_depth = _config.game.stack_depth;
-    let pot = ((invested[0] + invested[1]) * 2.0) as u32; // convert BB to half-BB units
-    let stack_p1 = ((stack_depth - invested[0]) * 2.0) as u32;
-    let stack_p2 = ((stack_depth - invested[1]) * 2.0) as u32;
+    let pot = ((tree.blinds[0] + tree.blinds[1] + invested[0] + invested[1]) * 2.0) as u32; // convert BB to half-BB units
+    let stack_p1 = ((stack_depth - tree.blinds[0] - invested[0]) * 2.0) as u32;
+    let stack_p2 = ((stack_depth - tree.blinds[1] - invested[1]) * 2.0) as u32;
     // to_call: difference in invested amounts
     let to_call = ((invested[0] - invested[1]).abs() * 2.0) as u32;
 
@@ -2164,12 +2165,13 @@ pub fn get_preflop_ranges_core(
     }
 
     // Compute pot and stacks at the current position.
+    // invested is voluntary-only; pot includes blinds as dead money.
     let invested = invested_at_v2_node(tree.as_ref(), node_idx);
     let stack_depth = config.game.stack_depth;
-    let pot = invested[0] + invested[1];
+    let pot = tree.blinds[0] + tree.blinds[1] + invested[0] + invested[1];
     let remaining = [
-        stack_depth - invested[0],
-        stack_depth - invested[1],
+        stack_depth - tree.blinds[0] - invested[0],
+        stack_depth - tree.blinds[1] - invested[1],
     ];
     let effective_stack = remaining[0].min(remaining[1]);
 
