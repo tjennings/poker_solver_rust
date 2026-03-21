@@ -906,21 +906,21 @@ fn walk_trees_lockstep(
                 ..
             },
         ) => {
-            for (sub_a_idx, sub_action) in sub_actions.iter().enumerate() {
-                let abs_a_idx = abs_actions
-                    .iter()
-                    .position(|a| actions_match(a, sub_action))
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "no matching action for {sub_action:?} in abstract tree at node {abs_idx}"
-                        )
-                    });
+            // Match by position (same action abstraction = same ordering).
+            // Don't compare bet values — trees may use different units
+            // (chips vs BB) but the same pot-fraction action abstraction.
+            assert_eq!(
+                sub_actions.len(), abs_actions.len(),
+                "action count mismatch at sub={sub_idx} abs={abs_idx}: \
+                 sub={sub_actions:?} abs={abs_actions:?}"
+            );
+            for a_idx in 0..sub_actions.len() {
                 walk_trees_lockstep(
                     sub,
                     abs,
                     chance_ordinals,
-                    sub_children[sub_a_idx] as usize,
-                    abs_children[abs_a_idx] as usize,
+                    sub_children[a_idx] as usize,
+                    abs_children[a_idx] as usize,
                     mapping,
                 );
             }
@@ -1534,7 +1534,7 @@ mod tests {
     }
 
     #[timed_test]
-    #[should_panic(expected = "no matching action")]
+    #[should_panic(expected = "action count mismatch")]
     fn build_boundary_mapping_panics_on_mismatch() {
         let tree_a = GameTree::build_subgame(
             Street::Flop,
@@ -1544,13 +1544,13 @@ mod tests {
             &[vec![1.0]],
             Some(1),
         );
-        // Different bet sizes -> different actions -> panic.
+        // Different number of bet sizes -> different action count -> panic.
         let tree_b = GameTree::build_subgame(
             Street::Flop,
             100.0,
             [50.0, 50.0],
             250.0,
-            &[vec![0.5]],
+            &[vec![0.5, 1.0]],
             None,
         );
         let _ = build_boundary_mapping(&tree_a, &tree_b);
