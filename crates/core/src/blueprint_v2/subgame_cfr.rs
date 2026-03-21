@@ -160,9 +160,12 @@ pub struct SubgameCfrSolver {
     equity_matrix: Vec<Vec<f64>>,
     /// Opponent reaching probability per combo.
     opponent_reach: Vec<f64>,
-    /// Per-combo leaf equity (0.0 to 1.0) for `DepthBoundary` nodes.
+    /// Per-boundary, per-combo leaf equity (0.0 to 1.0) for `DepthBoundary` nodes.
+    /// Outer index = boundary ordinal, inner index = combo index.
     /// Converted to chip values via `(2 * equity - 1) * half_pot`.
-    leaf_values: Vec<f64>,
+    leaf_values: Vec<Vec<f64>>,
+    /// Maps tree node index to boundary ordinal (`usize::MAX` if not a boundary).
+    node_to_boundary: Vec<usize>,
     /// Flat buffer: cumulative regret sums.
     regret_sum: Vec<f64>,
     /// Flat buffer: cumulative strategy sums.
@@ -179,24 +182,55 @@ pub struct SubgameCfrSolver {
 
 impl SubgameCfrSolver {
     /// Create a solver for a specific board position.
+    ///
+    /// `leaf_values` is indexed by `[boundary_ordinal][combo_index]`.
+    /// Its length must match the number of `DepthBoundary` nodes in `tree`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `leaf_values.len()` does not equal the boundary count.
     #[must_use]
     pub fn new(
         tree: GameTree,
         hands: SubgameHands,
         board: &[Card],
         opponent_reach: Vec<f64>,
-        leaf_values: Vec<f64>,
+        leaf_values: Vec<Vec<f64>>,
     ) -> Self {
         let equity_matrix = compute_equity_matrix(&hands.combos, board);
         let opp_reach_totals = precompute_opp_reach(&hands.combos, &opponent_reach);
         let layout = SubgameLayout::build(&tree, hands.combos.len());
         let buf_size = layout.total_size;
+
+        // Build node_to_boundary mapping.
+        let mut node_to_boundary = vec![usize::MAX; tree.nodes.len()];
+        let mut boundary_ord = 0;
+        for (idx, node) in tree.nodes.iter().enumerate() {
+            if matches!(
+                node,
+                GameNode::Terminal {
+                    kind: TerminalKind::DepthBoundary,
+                    ..
+                }
+            ) {
+                node_to_boundary[idx] = boundary_ord;
+                boundary_ord += 1;
+            }
+        }
+        assert_eq!(
+            boundary_ord,
+            leaf_values.len(),
+            "leaf_values length ({}) must match DepthBoundary count ({boundary_ord})",
+            leaf_values.len(),
+        );
+
         Self {
             tree,
             hands,
             equity_matrix,
             opponent_reach,
             leaf_values,
+            node_to_boundary,
             regret_sum: vec![0.0; buf_size],
             strategy_sum: vec![0.0; buf_size],
             layout,
@@ -211,10 +245,9 @@ impl SubgameCfrSolver {
     /// For each combo, `combo_to_bucket` maps its index to a bucket id, then
     /// the CBV is looked up for the given `boundary_node_idx` in the table.
     ///
-    /// TODO: CBV values are chip-based, but `leaf_values` is now interpreted as
-    /// equity (0.0-1.0). This method needs normalization to convert CBV chip
-    /// values into the equity domain before it can be used with the updated
-    /// `DepthBoundary` traversal.
+    /// **Deprecated:** Use `with_cbv_tables()` for per-boundary normalization.
+    /// This method replicates a single boundary's values across all boundaries
+    /// without proper normalization.
     #[must_use]
     pub fn with_cbv_table(
         tree: GameTree,
@@ -225,12 +258,27 @@ impl SubgameCfrSolver {
         boundary_node_idx: usize,
         combo_to_bucket: impl Fn(usize) -> usize,
     ) -> Self {
-        let leaf_values: Vec<f64> = (0..hands.combos.len())
+        let single_boundary: Vec<f64> = (0..hands.combos.len())
             .map(|combo_idx| {
                 let bucket = combo_to_bucket(combo_idx);
                 f64::from(cbv_table.lookup(boundary_node_idx, bucket))
             })
             .collect();
+        // Count boundaries and replicate the flat vec for each.
+        let boundary_count = tree
+            .nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n,
+                    GameNode::Terminal {
+                        kind: TerminalKind::DepthBoundary,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let leaf_values = vec![single_boundary; boundary_count];
         Self::new(tree, hands, board, opponent_reach, leaf_values)
     }
 
@@ -256,6 +304,7 @@ impl SubgameCfrSolver {
                     equity_matrix: &self.equity_matrix,
                     opponent_reach: &self.opponent_reach,
                     leaf_values: &self.leaf_values,
+                    node_to_boundary: &self.node_to_boundary,
                     opp_reach_totals: &self.opp_reach_totals,
                     layout: &self.layout,
                     snapshot: &snapshot,
@@ -345,7 +394,8 @@ struct SubgameCfrCtx<'a> {
     hands: &'a SubgameHands,
     equity_matrix: &'a [Vec<f64>],
     opponent_reach: &'a [f64],
-    leaf_values: &'a [f64],
+    leaf_values: &'a [Vec<f64>],
+    node_to_boundary: &'a [usize],
     opp_reach_totals: &'a [f64],
     layout: &'a SubgameLayout,
     /// Frozen strategy (from regret matching). Same flat layout as `regret_sum`.
@@ -402,8 +452,13 @@ impl SubgameCfrCtx<'_> {
                     }
                     TerminalKind::Showdown => self.showdown_value(hero_combo, half_pot),
                     TerminalKind::DepthBoundary => {
-                        let equity =
-                            self.leaf_values.get(hero_combo).copied().unwrap_or(0.5);
+                        let boundary_ord = self.node_to_boundary[node_idx];
+                        assert_ne!(
+                            boundary_ord,
+                            usize::MAX,
+                            "DepthBoundary node {node_idx} has no boundary ordinal"
+                        );
+                        let equity = self.leaf_values[boundary_ord][hero_combo];
                         (2.0 * equity - 1.0) * half_pot
                     }
                 }
@@ -691,8 +746,27 @@ pub fn solve_subgame(
         },
     );
     let hands = SubgameHands::enumerate(board);
+    // Count boundaries and replicate flat leaf values for each.
+    let boundary_count = tree
+        .nodes
+        .iter()
+        .filter(|n| {
+            matches!(
+                n,
+                GameNode::Terminal {
+                    kind: TerminalKind::DepthBoundary,
+                    ..
+                }
+            )
+        })
+        .count();
+    let per_boundary = if boundary_count == 0 {
+        vec![]
+    } else {
+        vec![leaf_values.to_vec(); boundary_count]
+    };
     let mut solver =
-        SubgameCfrSolver::new(tree, hands, board, opponent_reach.to_vec(), leaf_values.to_vec());
+        SubgameCfrSolver::new(tree, hands, board, opponent_reach.to_vec(), per_boundary);
     solver.train(config.max_iterations);
     solver.strategy()
 }
@@ -706,6 +780,31 @@ mod tests {
     use super::*;
     use crate::poker::{Card, Suit, Value};
     use test_macros::timed_test;
+
+    /// Wrap flat leaf values for all boundaries in a tree (test helper).
+    ///
+    /// For river trees (no boundaries), returns `vec![]`.
+    /// For depth-limited trees, replicates the flat vec for each boundary.
+    fn flat_leaf_values(tree: &GameTree, values: Vec<f64>) -> Vec<Vec<f64>> {
+        let count = tree
+            .nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n,
+                    GameNode::Terminal {
+                        kind: TerminalKind::DepthBoundary,
+                        ..
+                    }
+                )
+            })
+            .count();
+        if count == 0 {
+            vec![]
+        } else {
+            vec![values; count]
+        }
+    }
 
     fn river_board() -> Vec<Card> {
         vec![
@@ -745,7 +844,7 @@ mod tests {
         let hands = small_hands(&board, 30);
         let n = hands.combos.len();
         let reach = vec![1.0; n];
-        let leaf = vec![0.0; n];
+        let leaf = flat_leaf_values(&tree, vec![0.0; n]);
         let mut solver = SubgameCfrSolver::new(tree, hands, &board, reach, leaf);
         solver.train(10);
         assert_eq!(solver.iteration, 10);
@@ -758,7 +857,7 @@ mod tests {
         let hands = small_hands(&board, 50);
         let n = hands.combos.len();
         let reach = vec![1.0; n];
-        let leaf = vec![0.0; n];
+        let leaf = flat_leaf_values(&tree, vec![0.0; n]);
         let mut solver = SubgameCfrSolver::new(tree, hands, &board, reach, leaf);
         solver.train(100);
         let strategy = solver.strategy();
@@ -789,8 +888,9 @@ mod tests {
 
         // Build manually since solve_subgame uses full enumeration
         let tree = river_tree(&[1.0]);
+        let leaf = flat_leaf_values(&tree, vec![0.0; n]);
         let mut solver =
-            SubgameCfrSolver::new(tree, hands, &board, vec![1.0; n], vec![0.0; n]);
+            SubgameCfrSolver::new(tree, hands, &board, vec![1.0; n], leaf);
         solver.train(config.max_iterations);
         let strategy = solver.strategy();
         assert!(strategy.num_combos() > 0);
@@ -871,14 +971,16 @@ mod tests {
             |combo_idx| combo_idx % 4,
         );
 
-        // Verify leaf values were populated correctly.
-        for i in 0..n {
-            let expected = f64::from(cbv_table.lookup(0, i % 4));
-            assert!(
-                (solver.leaf_values[i] - expected).abs() < 1e-10,
-                "leaf_values[{i}] = {}, expected {expected}",
-                solver.leaf_values[i],
-            );
+        // Verify leaf values were populated correctly (replicated across all boundaries).
+        for boundary in &solver.leaf_values {
+            for i in 0..n {
+                let expected = f64::from(cbv_table.lookup(0, i % 4));
+                assert!(
+                    (boundary[i] - expected).abs() < 1e-10,
+                    "leaf_values[{i}] = {}, expected {expected}",
+                    boundary[i],
+                );
+            }
         }
 
         // Run a few iterations to confirm no panics and valid output.
@@ -910,7 +1012,7 @@ mod tests {
         let hands = small_hands(&board, 50);
         let n = hands.combos.len();
         let reach = vec![1.0; n];
-        let leaf = vec![0.0; n];
+        let leaf = flat_leaf_values(&tree, vec![0.0; n]);
         let mut solver = SubgameCfrSolver::new(tree, hands.clone(), &board, reach, leaf);
         solver.train(200);
         let strategy = solver.strategy();
@@ -955,8 +1057,8 @@ mod tests {
         let hands = small_hands(&board, 5);
         let n = hands.combos.len();
         let reach = vec![1.0; n];
-        let leaf = vec![0.0; n];
         let tree = river_tree(&[1.0]);
+        let leaf = flat_leaf_values(&tree, vec![0.0; n]);
         let solver = SubgameCfrSolver::new(tree, hands, &board, reach, leaf);
 
         // Find a Fold terminal in the tree and call cfr_traverse on it.
@@ -967,6 +1069,7 @@ mod tests {
             equity_matrix: &solver.equity_matrix,
             opponent_reach: &solver.opponent_reach,
             leaf_values: &solver.leaf_values,
+            node_to_boundary: &solver.node_to_boundary,
             opp_reach_totals: &solver.opp_reach_totals,
             layout: &solver.layout,
             snapshot: &snapshot,
@@ -1023,8 +1126,8 @@ mod tests {
         let hands = small_hands(&board, 10);
         let n = hands.combos.len();
         let reach = vec![1.0; n];
-        let leaf = vec![0.0; n];
         let tree = river_tree(&[1.0]);
+        let leaf = flat_leaf_values(&tree, vec![0.0; n]);
         let solver = SubgameCfrSolver::new(tree, hands, &board, reach, leaf);
 
         let snapshot = solver.build_strategy_snapshot();
@@ -1034,6 +1137,7 @@ mod tests {
             equity_matrix: &solver.equity_matrix,
             opponent_reach: &solver.opponent_reach,
             leaf_values: &solver.leaf_values,
+            node_to_boundary: &solver.node_to_boundary,
             opp_reach_totals: &solver.opp_reach_totals,
             layout: &solver.layout,
             snapshot: &snapshot,
@@ -1076,6 +1180,77 @@ mod tests {
             })
             .sum();
         assert_eq!(layout.total_size, expected);
+    }
+
+    #[timed_test]
+    fn per_boundary_leaf_values_differ_by_pot() {
+        // Build a depth-limited flop tree with bet sizes that create
+        // multiple DepthBoundary nodes at different pot sizes.
+        let board = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Seven, Suit::Diamond),
+        ];
+        let tree = GameTree::build_subgame(
+            Street::Flop,
+            100.0,
+            [50.0, 50.0],
+            250.0,
+            &[vec![1.0]], // pot-size bet
+            Some(1),
+        );
+
+        // Count DepthBoundary nodes -- should be > 1 (check-check and bet-call paths).
+        let boundary_count = tree
+            .nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n,
+                    GameNode::Terminal {
+                        kind: TerminalKind::DepthBoundary,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            boundary_count >= 2,
+            "need multiple boundaries, got {boundary_count}"
+        );
+
+        // Collect boundary pots.
+        let boundary_pots: Vec<f64> = tree
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                GameNode::Terminal {
+                    kind: TerminalKind::DepthBoundary,
+                    pot,
+                    ..
+                } => Some(*pot),
+                _ => None,
+            })
+            .collect();
+
+        // Verify boundaries have different pots.
+        assert!(
+            boundary_pots.windows(2).any(|w| (w[0] - w[1]).abs() > 1.0),
+            "boundaries should have different pots: {boundary_pots:?}"
+        );
+
+        let hands = small_hands(&board, 10);
+        let n = hands.combos.len();
+
+        // Create per-boundary leaf values: all combos get equity 0.7 at every boundary.
+        let leaf_values: Vec<Vec<f64>> = vec![vec![0.7; n]; boundary_count];
+
+        let mut solver =
+            SubgameCfrSolver::new(tree, hands, &board, vec![1.0; n], leaf_values);
+
+        // Train briefly and verify it doesn't panic.
+        solver.train(5);
+        assert_eq!(solver.iteration, 5);
     }
 
     #[timed_test]

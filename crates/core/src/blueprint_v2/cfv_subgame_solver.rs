@@ -999,13 +999,13 @@ impl LeafEvaluator for ExactRiverEvaluator {
                 None,
             );
 
-            let leaf_values = vec![0.0; fn_count];
+            // River tree has no DepthBoundary nodes, so leaf_values is empty.
             let mut solver = SubgameCfrSolver::new(
                 tree,
                 river_hands.clone(),
                 &river_board,
                 opp_reach.clone(),
-                leaf_values,
+                vec![],
             );
             solver.train(self.iterations);
 

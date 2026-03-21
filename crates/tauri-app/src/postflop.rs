@@ -363,8 +363,22 @@ pub fn build_subgame_solver(
         })
         .collect();
 
-    // Equity-based leaf values for DepthBoundary nodes.
-    let leaf_values = compute_combo_equities(&hands, board_cards, &opponent_reach);
+    // Equity-based leaf values for DepthBoundary nodes (per-boundary).
+    let equities = compute_combo_equities(&hands, board_cards, &opponent_reach);
+    let boundary_count = tree
+        .nodes
+        .iter()
+        .filter(|n| {
+            matches!(
+                n,
+                GameNode::Terminal {
+                    kind: TerminalKind::DepthBoundary,
+                    ..
+                }
+            )
+        })
+        .count();
+    let leaf_values: Vec<Vec<f64>> = vec![equities; boundary_count];
 
     // Extract action labels from tree root.
     let action_infos = match &tree.nodes[tree.root as usize] {
