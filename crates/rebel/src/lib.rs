@@ -10,3 +10,4 @@ pub mod solver;
 pub mod self_play;
 pub mod subgame_solve;
 pub mod training;
+pub mod validation;
