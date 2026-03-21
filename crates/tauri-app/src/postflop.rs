@@ -403,9 +403,11 @@ impl BlueprintCbvEvaluator {
                 hands.combos.iter().map(|&hole| {
                     let bucket = ctx.all_buckets.get_bucket(street, hole, board) as usize;
                     let cbv = f64::from(ctx.cbv_table.lookup(chance_ord, bucket));
-                    // Normalize chip value to pot-fraction: cbv / half_pot
-                    // The solver multiplies by half_pot at the boundary, recovering cbv.
-                    cbv / half_pot
+                    // CBV is in BB (abstract tree units). Subgame uses chips (1BB = 2 chips).
+                    // Convert to pot-fraction in chip units: (cbv * 2) / half_pot_chips.
+                    // The solver multiplies by half_pot_chips at the boundary, recovering
+                    // cbv in chips.
+                    (cbv * 2.0) / half_pot
                 }).collect()
             })
             .collect();
