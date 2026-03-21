@@ -224,7 +224,13 @@ impl DiskBuffer {
         if self.count == 0 {
             return Ok(Vec::new());
         }
-        // Safety: mmap requires the file to have nonzero length, which we checked above.
+        // SAFETY:
+        // 1. The file has nonzero length (checked by the `self.count == 0` guard above).
+        // 2. The mapped region must not be concurrently modified while the `Mmap`
+        //    is in scope.  `DiskBuffer` enforces this by taking `&self` (shared
+        //    reference), which prevents any `&mut self` writer from running
+        //    concurrently in safe Rust.  External processes must not write to
+        //    the file while this mmap is live.
         let mmap = unsafe { Mmap::map(&self.file)? };
         let mut records = Vec::with_capacity(n);
         for _ in 0..n {

@@ -14,7 +14,7 @@ use rand::Rng;
 use range_solver::card::index_to_card_pair;
 
 use crate::belief_update::{sample_action, update_reach};
-use crate::pbs::{Pbs, NUM_COMBOS};
+use crate::pbs::{combo_index, Pbs, NUM_COMBOS};
 
 /// A dealt hand: hole cards for two players plus the full 5-card board.
 ///
@@ -66,15 +66,23 @@ fn rs_id_to_card(id: u8) -> Card {
     Card::new(value, suit)
 }
 
+/// Sentinel bucket value for board-blocked combos.
+///
+/// Using `u16::MAX` ensures a blocked combo's bucket can never collide with a
+/// real bucket index.  `update_reach` skips combos whose bucket equals this
+/// sentinel (in addition to combos with reach == 0.0).
+pub const BLOCKED_BUCKET: u16 = u16::MAX;
+
 /// Precompute the bucket for each of 1326 combos given a board and street.
 ///
-/// Board-blocked combos get bucket 0 (irrelevant since their reach is 0).
+/// Board-blocked combos get `BLOCKED_BUCKET` (`u16::MAX`) so they can never
+/// alias a real bucket.
 pub fn compute_combo_buckets(
     buckets: &AllBuckets,
     street: Street,
     board: &[u8],
 ) -> [u16; 1326] {
-    let mut result = [0u16; 1326];
+    let mut result = [BLOCKED_BUCKET; 1326];
 
     // Build a set of board cards for fast blocking check
     let mut board_mask: u64 = 0;
@@ -91,7 +99,7 @@ pub fn compute_combo_buckets(
         // Check if either card is blocked by the board
         let hand_mask: u64 = (1u64 << c1) | (1u64 << c2);
         if hand_mask & board_mask != 0 {
-            *bucket_slot = 0;
+            // Already BLOCKED_BUCKET from initialisation; explicit for clarity.
             continue;
         }
 
@@ -235,6 +243,20 @@ fn traverse<R: Rng>(
             pbs.zero_blocked_combos();
 
             snapshots.push(pbs);
+
+            // Zero board-blocked combos in the live reach array so that
+            // subsequent Decision nodes on the new street never see non-zero
+            // reach for impossible combos.
+            for &board_card in next_board {
+                for other in 0..52u8 {
+                    if other == board_card {
+                        continue;
+                    }
+                    let idx = combo_index(board_card, other);
+                    reach[0][idx] = 0.0;
+                    reach[1][idx] = 0.0;
+                }
+            }
 
             // Continue traversal into the next street
             traverse(
@@ -700,18 +722,18 @@ mod tests {
         // but the blocking logic should still zero out combos with board cards.
         let combo_buckets = compute_combo_buckets(&buckets, Street::Preflop, &board);
 
-        // Combo (0, 1) contains card 0 (board card) -> bucket should be 0
+        // Combo (0, 1) contains card 0 (board card) -> bucket should be BLOCKED_BUCKET
         let blocked_idx = card_pair_to_index(0, 1);
         assert_eq!(
-            combo_buckets[blocked_idx], 0,
-            "Combo containing board card 0 should have bucket 0"
+            combo_buckets[blocked_idx], BLOCKED_BUCKET,
+            "Combo containing board card 0 should have BLOCKED_BUCKET"
         );
 
-        // Combo (5, 2) contains card 5 (board card) -> bucket should be 0
+        // Combo (5, 2) contains card 5 (board card) -> bucket should be BLOCKED_BUCKET
         let blocked_idx2 = card_pair_to_index(5, 2);
         assert_eq!(
-            combo_buckets[blocked_idx2], 0,
-            "Combo containing board card 5 should have bucket 0"
+            combo_buckets[blocked_idx2], BLOCKED_BUCKET,
+            "Combo containing board card 5 should have BLOCKED_BUCKET"
         );
 
         // Combo (1, 2) does NOT contain any board card -> should have valid bucket

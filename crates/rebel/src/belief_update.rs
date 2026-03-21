@@ -1,12 +1,13 @@
 // Belief updates — Bayesian reach probability updates
 
+use crate::blueprint_sampler::BLOCKED_BUCKET;
 use rand::Rng;
 
 /// Update reach probabilities after an action is taken.
 ///
 /// For each combo i: reach[i] *= action_probs_per_bucket[combo_buckets[i]][action_taken]
 ///
-/// Combos with reach == 0.0 are skipped (they're blocked).
+/// Combos with reach == 0.0 or bucket == `BLOCKED_BUCKET` are skipped.
 pub fn update_reach(
     reach: &mut [f32],
     combo_buckets: &[u16],
@@ -15,7 +16,7 @@ pub fn update_reach(
 ) {
     debug_assert_eq!(reach.len(), combo_buckets.len());
     for (r, &bucket) in reach.iter_mut().zip(combo_buckets.iter()) {
-        if *r == 0.0 {
+        if *r == 0.0 || bucket == BLOCKED_BUCKET {
             continue;
         }
         *r *= action_probs_per_bucket[bucket as usize][action_taken];
