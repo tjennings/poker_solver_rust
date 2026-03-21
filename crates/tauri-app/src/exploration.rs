@@ -16,8 +16,10 @@ use poker_solver_core::abstraction::isomorphism::{CanonicalBoard, SuitMapping};
 use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint_v2::bundle::{self as v2_bundle, BlueprintV2Strategy};
+use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
+use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode as V2GameNode, GameTree as V2GameTree, TreeAction};
 use poker_solver_core::hand_class::classify;
 use poker_solver_core::hands::CanonicalHand;
@@ -273,6 +275,10 @@ fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
 /// Expects:
 ///   `dir_path/config.yaml` — `BlueprintV2Config`
 ///   `dir_path/strategy.bin` or `dir_path/final/strategy.bin` — `BlueprintV2Strategy`
+///
+/// If `postflop_state` is provided and the bundle contains CBV tables and
+/// bucket files, automatically populates the CBV context for depth-limited
+/// solving.
 pub async fn load_blueprint_v2_core(
     state: &ExplorationState,
     dir_path: String,
@@ -378,12 +384,101 @@ pub async fn load_blueprint_v2_core(
 }
 
 /// Load a Blueprint V2 bundle (Tauri wrapper).
+///
+/// After loading the bundle, automatically populates the CBV context on
+/// the postflop solver state if the bundle contains CBV tables.
 #[tauri::command]
 pub async fn load_blueprint_v2(
     state: State<'_, ExplorationState>,
+    postflop_state: State<'_, Arc<crate::postflop::PostflopState>>,
     path: String,
 ) -> Result<BundleInfo, String> {
-    load_blueprint_v2_core(&state, path).await
+    let info = load_blueprint_v2_core(&state, path).await?;
+    populate_cbv_context(&state, &postflop_state);
+    Ok(info)
+}
+
+/// Populate the CBV context on `PostflopState` from the currently loaded
+/// blueprint bundle, if it contains CBV tables and bucket files.
+///
+/// This is called after `load_blueprint_v2_core()` completes. If the bundle
+/// has no CBV tables, the CBV context is cleared.
+fn populate_cbv_context(
+    exploration: &ExplorationState,
+    postflop: &crate::postflop::PostflopState,
+) {
+    let source_guard = exploration.source.read();
+    let Some(source) = source_guard.as_ref() else {
+        crate::postflop::set_cbv_context(postflop, None);
+        return;
+    };
+
+    let StrategySource::BlueprintV2 {
+        config,
+        tree,
+        cbv_tables: Some(cbv_tables),
+        ..
+    } = source
+    else {
+        crate::postflop::set_cbv_context(postflop, None);
+        return;
+    };
+
+    // Build AllBuckets from the config's cluster path.
+    let Some(ref cluster_path) = config.training.cluster_path else {
+        eprintln!("CBV tables found but no cluster_path in config; skipping CBV context");
+        crate::postflop::set_cbv_context(postflop, None);
+        return;
+    };
+
+    let cluster_dir = std::path::Path::new(cluster_path);
+    let bucket_counts = [
+        config.clustering.preflop.buckets,
+        config.clustering.flop.buckets,
+        config.clustering.turn.buckets,
+        config.clustering.river.buckets,
+    ];
+
+    let bucket_files: [Option<BucketFile>; 4] = {
+        const NAMES: [&str; 4] = [
+            "preflop.buckets",
+            "flop.buckets",
+            "turn.buckets",
+            "river.buckets",
+        ];
+        let mut files: [Option<BucketFile>; 4] = [None, None, None, None];
+        for (i, name) in NAMES.iter().enumerate() {
+            let path = cluster_dir.join(name);
+            if path.exists() {
+                match BucketFile::load(&path) {
+                    Ok(bf) => files[i] = Some(bf),
+                    Err(e) => eprintln!("Warning: failed to load {}: {e}", path.display()),
+                }
+            }
+        }
+        files
+    };
+
+    let all_buckets = AllBuckets::new(bucket_counts, bucket_files);
+
+    // Enable per-flop bucket files if present.
+    let all_buckets = {
+        let per_flop_marker = cluster_dir.join("flop_0000.buckets");
+        if per_flop_marker.exists() {
+            all_buckets.with_per_flop_dir(cluster_dir.to_path_buf())
+        } else {
+            all_buckets
+        }
+    };
+
+    let ctx = crate::postflop::CbvContext {
+        cbv_tables: cbv_tables.clone(),
+        abstract_tree: (**tree).clone(),
+        all_buckets,
+    };
+
+    eprintln!("CBV context populated for depth-limited solving");
+    crate::postflop::set_cbv_context(postflop, Some(ctx));
 }
 
 /// Scan a directory for blueprint bundles (subdirectories containing `config.yaml`).

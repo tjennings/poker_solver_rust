@@ -5,9 +5,12 @@ use poker_solver_core::blueprint_v2::solver_dispatch::{
 };
 use poker_solver_core::blueprint_v2::{
     SubgameCfrSolver, SubgameHands, SubgameStrategy,
-    compute_combo_equities,
+    compute_combo_equities, build_boundary_mapping,
 };
+use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
+use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
+use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 use poker_solver_core::blueprint_v2::Street as V2Street;
 use poker_solver_core::poker::{Card as RsPokerCard, Suit as RsPokerSuit, Value as RsPokerValue};
 use range_solver::action_tree::{Action, ActionTree, BoardState, TreeConfig};
@@ -318,6 +321,9 @@ fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
 ///
 /// Leaf values at `DepthBoundary` nodes use reach-weighted equity against
 /// the opponent range, converted to chip values by the solver.
+///
+/// When `cbv_context` is `Some`, uses blueprint CBV tables at depth
+/// boundaries instead of raw equity for strategically informed leaf values.
 #[allow(clippy::too_many_arguments)]
 pub fn build_subgame_solver(
     board_cards: &[RsPokerCard],
@@ -327,6 +333,7 @@ pub fn build_subgame_solver(
     oop_weights: &[f32],
     ip_weights: &[f32],
     player: usize,
+    cbv_context: Option<&CbvContext>,
 ) -> Result<(SubgameCfrSolver, SubgameHands, Vec<ActionInfo>, GameTree, f64, f64), String> {
     let street = match board_cards.len() {
         3 => V2Street::Flop,
@@ -363,22 +370,40 @@ pub fn build_subgame_solver(
         })
         .collect();
 
-    // Equity-based leaf values for DepthBoundary nodes (per-boundary).
-    let equities = compute_combo_equities(&hands, board_cards, &opponent_reach);
-    let boundary_count = tree
-        .nodes
-        .iter()
-        .filter(|n| {
-            matches!(
-                n,
-                GameNode::Terminal {
-                    kind: TerminalKind::DepthBoundary,
-                    ..
-                }
-            )
-        })
-        .count();
-    let leaf_values: Vec<Vec<f64>> = vec![equities; boundary_count];
+    // Compute leaf values for DepthBoundary nodes.
+    let leaf_values = if let Some(ctx) = cbv_context {
+        // CBV-based: use blueprint counterfactual boundary values.
+        let boundary_mapping = build_boundary_mapping(&tree, &ctx.abstract_tree);
+        let boundary_pots: Vec<f64> = tree.nodes.iter().filter_map(|n| match n {
+            GameNode::Terminal { kind: TerminalKind::DepthBoundary, pot, .. } => Some(*pot),
+            _ => None,
+        }).collect();
+
+        boundary_mapping
+            .iter()
+            .zip(boundary_pots.iter())
+            .map(|(&chance_ord, &bpot)| {
+                let half_pot = bpot / 2.0;
+                hands.combos.iter().map(|&hole| {
+                    let bucket = ctx.all_buckets.get_bucket(street, hole, board_cards) as usize;
+                    let cbv = f64::from(ctx.cbv_tables[0].lookup(chance_ord, bucket));
+                    // Normalize: equity = (cbv / half_pot + 1) / 2
+                    (cbv / half_pot + 1.0) / 2.0
+                }).collect()
+            })
+            .collect()
+    } else {
+        // Equity-based fallback: use raw showdown equity.
+        let equities = compute_combo_equities(&hands, board_cards, &opponent_reach);
+        let boundary_count = tree.nodes.iter().filter(|n| matches!(n,
+            GameNode::Terminal { kind: TerminalKind::DepthBoundary, .. }
+        )).count();
+        if boundary_count == 0 {
+            vec![]
+        } else {
+            vec![equities; boundary_count]
+        }
+    };
 
     // Extract action labels from tree root.
     let action_infos = match &tree.nodes[tree.root as usize] {
@@ -409,6 +434,30 @@ pub fn build_subgame_solver(
 // TODO: re-enable with a compact format when real-time solving is optimized.
 
 // ---------------------------------------------------------------------------
+// CbvContext
+// ---------------------------------------------------------------------------
+
+/// Blueprint data needed for CBV-based depth-limited solving.
+///
+/// When a blueprint bundle includes precomputed CBV tables, this context
+/// is constructed and stored in `PostflopState`. The subgame solver uses
+/// it to look up boundary values instead of raw equity.
+pub struct CbvContext {
+    pub cbv_tables: [CbvTable; 2],
+    pub abstract_tree: V2GameTree,
+    pub all_buckets: AllBuckets,
+}
+
+/// Set the CBV context on `PostflopState` for use by the depth-limited solver.
+///
+/// Call after loading a blueprint bundle that includes CBV tables and bucket
+/// files. If `context` is `None`, clears any existing CBV context (fallback
+/// to equity-based leaf values).
+pub fn set_cbv_context(state: &PostflopState, context: Option<CbvContext>) {
+    *state.cbv_context.write() = context.map(Arc::new);
+}
+
+// ---------------------------------------------------------------------------
 // PostflopState
 // ---------------------------------------------------------------------------
 
@@ -429,6 +478,10 @@ pub struct PostflopState {
     pub subgame_result: RwLock<Option<SubgameSolveResult>>,
     /// Current node index in the subgame tree during navigation.
     pub subgame_node: AtomicU32,
+    /// CBV tables + abstract tree for depth-limited solving.
+    /// Loaded from the blueprint bundle. If present, subgame solver
+    /// uses CBVs at depth boundaries instead of raw equity.
+    pub cbv_context: RwLock<Option<Arc<CbvContext>>>,
 }
 
 impl Default for PostflopState {
@@ -449,6 +502,7 @@ impl Default for PostflopState {
             solver_name: RwLock::new("range".to_string()),
             subgame_result: RwLock::new(None),
             subgame_node: AtomicU32::new(0),
+            cbv_context: RwLock::new(None),
         }
     }
 }
@@ -999,7 +1053,8 @@ fn postflop_solve_street_impl(
             solve_full_depth(state, &config, board, max_iterations, target_exp, &filtered_oop, &filtered_ip)
         }
         SolverChoice::DepthLimited => {
-            solve_depth_limited(state, &config, board, max_iterations, &solver_config, &filtered_oop, &filtered_ip)
+            let cbv_ctx = state.cbv_context.read().clone();
+            solve_depth_limited(state, &config, board, max_iterations, &solver_config, &filtered_oop, &filtered_ip, cbv_ctx)
         }
     }
 }
@@ -1104,6 +1159,7 @@ fn solve_depth_limited(
     solver_config: &SolverConfig,
     filtered_oop: &Option<Vec<f32>>,
     filtered_ip: &Option<Vec<f32>>,
+    cbv_context: Option<Arc<CbvContext>>,
 ) -> Result<(), String> {
     let max_iters = max_iterations.unwrap_or(solver_config.depth_limited_iterations);
     state.max_iterations.store(max_iters, Ordering::Relaxed);
@@ -1158,6 +1214,7 @@ fn solve_depth_limited(
             &oop_w,
             &ip_w,
             player,
+            cbv_context.as_deref(),
         ) {
             Ok((mut solver, hands, action_infos, tree, initial_pot, starting_stack)) => {
                 // Helper closure to build matrix from current strategy.
