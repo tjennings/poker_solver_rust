@@ -9,6 +9,8 @@
 //!    opponent range, producing per-combo CFVs.
 //! 3. Uses those CFVs during CFR traversal.
 
+use rayon::prelude::*;
+
 use crate::blueprint_v2::subgame_cfr::{
     cards_overlap, compute_combo_equities, compute_equity_matrix, precompute_opp_reach,
     SubgameCfrSolver, SubgameHands, SubgameStrategy,
@@ -501,28 +503,15 @@ impl CfvSubgameSolver {
                         }
                     }
                     TerminalKind::Showdown => {
-                        // Compute equity conditional on the opponent's reaching range,
-                        // not the static initial range. This prevents the solver from
-                        // overvaluing all-in (which would be evaluated against the full
-                        // range instead of just the calling range).
-                        for i in 0..n {
-                            let hero = self.hands.combos[i];
-                            let mut eq_sum = 0.0;
-                            let mut reach_sum = 0.0;
-                            for (j, &opp_r) in reach_opponent.iter().enumerate() {
-                                if opp_r <= 0.0 || cards_overlap(hero, self.hands.combos[j]) {
-                                    continue;
-                                }
-                                eq_sum += opp_r * self.equity_matrix[i][j];
-                                reach_sum += opp_r;
-                            }
-                            cfv_buf[out_start + i] = if reach_sum > 0.0 {
-                                let avg_eq = eq_sum / reach_sum;
-                                (2.0 * avg_eq - 1.0) * half_pot
-                            } else {
-                                0.0
-                            };
-                        }
+                        // Compute equity conditional on the opponent's reaching
+                        // range. Parallelized with rayon — each combo is independent.
+                        compute_conditional_showdowns(
+                            &self.hands.combos,
+                            &self.equity_matrix,
+                            reach_opponent,
+                            half_pot,
+                            &mut cfv_buf[out_start..out_start + n],
+                        );
                     }
                     TerminalKind::DepthBoundary => {
                         let ordinal = self.node_to_boundary[node_idx];
@@ -889,6 +878,42 @@ impl CfvSubgameSolver {
             num_combos,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel showdown computation
+// ---------------------------------------------------------------------------
+
+/// Compute conditional showdown equity for all combos in parallel.
+///
+/// For each hero combo `i`, computes the reach-weighted equity against
+/// `reach_opponent`, then converts to chip value via `(2*eq - 1) * half_pot`.
+/// Uses rayon to parallelize across combos (each is independent).
+fn compute_conditional_showdowns(
+    combos: &[[Card; 2]],
+    equity_matrix: &[Vec<f64>],
+    reach_opponent: &[f64],
+    half_pot: f64,
+    out: &mut [f64],
+) {
+    out.par_iter_mut().enumerate().for_each(|(i, val)| {
+        let hero = combos[i];
+        let mut eq_sum = 0.0;
+        let mut reach_sum = 0.0;
+        for (j, &opp_r) in reach_opponent.iter().enumerate() {
+            if opp_r <= 0.0 || cards_overlap(hero, combos[j]) {
+                continue;
+            }
+            eq_sum += opp_r * equity_matrix[i][j];
+            reach_sum += opp_r;
+        }
+        *val = if reach_sum > 0.0 {
+            let avg_eq = eq_sum / reach_sum;
+            (2.0 * avg_eq - 1.0) * half_pot
+        } else {
+            0.0
+        };
+    });
 }
 
 // ---------------------------------------------------------------------------
