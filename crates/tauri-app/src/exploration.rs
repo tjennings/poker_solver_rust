@@ -83,9 +83,9 @@ enum StrategySource {
         tree: Box<V2GameTree>,
         /// Arena-index to decision-node-index mapping.
         decision_map: Vec<u32>,
-        /// Precomputed CBV tables for depth-limited subgame solving.
+        /// Precomputed CBV table (player 0) for depth-limited subgame solving.
         /// `None` if the bundle doesn't include CBV files.
-        cbv_tables: Option<[CbvTable; 2]>,
+        cbv_table: Option<CbvTable>,
     },
 }
 
@@ -284,7 +284,7 @@ pub async fn load_blueprint_v2_core(
     dir_path: String,
 ) -> Result<BundleInfo, String> {
     let dir = PathBuf::from(&dir_path);
-    let (config, strategy, cbv_tables) = tokio::task::spawn_blocking(move || {
+    let (config, strategy, cbv_table) = tokio::task::spawn_blocking(move || {
         let cfg = v2_bundle::load_config(&dir)
             .map_err(|e| format!("Failed to load config.yaml: {e}"))?;
 
@@ -318,8 +318,8 @@ pub async fn load_blueprint_v2_core(
         let strat = BlueprintV2Strategy::load(&strat_path)
             .map_err(|e| format!("Failed to load strategy.bin: {e}"))?;
 
-        // Load CBV tables if present. Search the same directory as strategy.bin,
-        // then the bundle root, then the latest snapshot.
+        // Load CBV table (player 0) if present. Search the same directory as
+        // strategy.bin, then the bundle root, then the latest snapshot.
         let strat_dir = strat_path.parent().unwrap_or(&dir);
         let cbv_dir = if strat_dir.join("cbv_p0.bin").exists() {
             strat_dir.to_path_buf()
@@ -329,19 +329,15 @@ pub async fn load_blueprint_v2_core(
             dir.clone() // fallback; will check existence below
         };
 
-        let cbv_tables = if cbv_dir.join("cbv_p0.bin").exists()
-            && cbv_dir.join("cbv_p1.bin").exists()
-        {
+        let cbv_table = if cbv_dir.join("cbv_p0.bin").exists() {
             let p0 = CbvTable::load(&cbv_dir.join("cbv_p0.bin"))
                 .map_err(|e| format!("Failed to load cbv_p0.bin: {e}"))?;
-            let p1 = CbvTable::load(&cbv_dir.join("cbv_p1.bin"))
-                .map_err(|e| format!("Failed to load cbv_p1.bin: {e}"))?;
-            Some([p0, p1])
+            Some(p0)
         } else {
             None
         };
 
-        Ok::<_, String>((cfg, strat, cbv_tables))
+        Ok::<_, String>((cfg, strat, cbv_table))
     })
     .await
     .map_err(|e| format!("Load task panicked: {e}"))??;
@@ -375,7 +371,7 @@ pub async fn load_blueprint_v2_core(
         strategy: Box::new(strategy),
         tree: Box::new(tree),
         decision_map,
-        cbv_tables,
+        cbv_table,
     });
     state.bucket_cache.write().clear();
     *state.suit_mapping.write() = None;
@@ -403,7 +399,7 @@ pub async fn load_blueprint_v2(
 ///
 /// This is called after `load_blueprint_v2_core()` completes. If the bundle
 /// has no CBV tables, the CBV context is cleared.
-fn populate_cbv_context(
+pub fn populate_cbv_context(
     exploration: &ExplorationState,
     postflop: &crate::postflop::PostflopState,
 ) {
@@ -416,7 +412,7 @@ fn populate_cbv_context(
     let StrategySource::BlueprintV2 {
         config,
         tree,
-        cbv_tables: Some(cbv_tables),
+        cbv_table: Some(cbv_table),
         ..
     } = source
     else {
@@ -426,7 +422,7 @@ fn populate_cbv_context(
 
     // Build AllBuckets from the config's cluster path.
     let Some(ref cluster_path) = config.training.cluster_path else {
-        eprintln!("CBV tables found but no cluster_path in config; skipping CBV context");
+        eprintln!("CBV table found but no cluster_path in config; skipping CBV context");
         crate::postflop::set_cbv_context(postflop, None);
         return;
     };
@@ -472,7 +468,7 @@ fn populate_cbv_context(
     };
 
     let ctx = crate::postflop::CbvContext {
-        cbv_tables: cbv_tables.clone(),
+        cbv_table: cbv_table.clone(),
         abstract_tree: (**tree).clone(),
         all_buckets,
     };

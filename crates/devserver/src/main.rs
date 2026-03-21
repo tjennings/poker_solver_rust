@@ -142,18 +142,26 @@ fn result_to_response<T: serde::Serialize>(
 
 async fn handle_load_bundle(
     AxumState(state): AxumState<AppState>,
+    Extension(postflop): Extension<Arc<PostflopState>>,
     Json(params): Json<PathParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::load_bundle_core(&state, params.path).await)
+    let info = poker_solver_tauri::load_bundle_core(&state, params.path).await;
+    if info.is_ok() {
+        poker_solver_tauri::populate_cbv_context(&state, &postflop);
+    }
+    result_to_response(info)
 }
 
 async fn handle_load_blueprint_v2(
     AxumState(state): AxumState<AppState>,
+    Extension(postflop): Extension<Arc<PostflopState>>,
     Json(params): Json<PathParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(
-        poker_solver_tauri::load_blueprint_v2_core(&state, params.path).await,
-    )
+    let info = poker_solver_tauri::load_blueprint_v2_core(&state, params.path).await;
+    if info.is_ok() {
+        poker_solver_tauri::populate_cbv_context(&state, &postflop);
+    }
+    result_to_response(info)
 }
 
 // ---------------------------------------------------------------------------

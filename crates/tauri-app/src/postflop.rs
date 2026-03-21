@@ -9,7 +9,6 @@ use poker_solver_core::blueprint_v2::{
 };
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
-use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 use poker_solver_core::blueprint_v2::Street as V2Street;
 use poker_solver_core::poker::{Card as RsPokerCard, Suit as RsPokerSuit, Value as RsPokerValue};
@@ -386,7 +385,7 @@ pub fn build_subgame_solver(
                 let half_pot = bpot / 2.0;
                 hands.combos.iter().map(|&hole| {
                     let bucket = ctx.all_buckets.get_bucket(street, hole, board_cards) as usize;
-                    let cbv = f64::from(ctx.cbv_tables[0].lookup(chance_ord, bucket));
+                    let cbv = f64::from(ctx.cbv_table.lookup(chance_ord, bucket));
                     // Normalize: equity = (cbv / half_pot + 1) / 2
                     (cbv / half_pot + 1.0) / 2.0
                 }).collect()
@@ -443,8 +442,8 @@ pub fn build_subgame_solver(
 /// is constructed and stored in `PostflopState`. The subgame solver uses
 /// it to look up boundary values instead of raw equity.
 pub struct CbvContext {
-    pub cbv_tables: [CbvTable; 2],
-    pub abstract_tree: V2GameTree,
+    pub cbv_table: CbvTable,
+    pub abstract_tree: GameTree,
     pub all_buckets: AllBuckets,
 }
 
