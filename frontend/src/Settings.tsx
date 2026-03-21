@@ -226,6 +226,34 @@ export default function Settings() {
         </p>
       </div>
 
+      {/* Solve Iterations */}
+      <div style={{ marginBottom: '1.5rem' }}>
+        <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
+          Solve Iterations
+        </label>
+        <input
+          type="text"
+          value={config.solve_iterations ?? 200}
+          onChange={e => {
+            const v = parseInt(e.target.value);
+            if (!isNaN(v) && v > 0) setConfig({ solve_iterations: v });
+          }}
+          style={{
+            width: 80,
+            padding: '0.45rem 0.6rem',
+            background: 'rgba(255,255,255,0.06)',
+            border: '1px solid rgba(255,255,255,0.12)',
+            borderRadius: 6,
+            color: '#eee',
+            fontSize: '0.85rem',
+            fontFamily: 'inherit',
+          }}
+        />
+        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
+          Number of DCFR iterations for postflop solving. More iterations = better convergence but slower.
+        </p>
+      </div>
+
       {/* Stub Range Solver */}
       <div style={{ marginBottom: '1.5rem' }}>
         <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', color: '#eee', cursor: 'pointer' }}>

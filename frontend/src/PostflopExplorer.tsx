@@ -280,7 +280,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     initialExplRef.current = Infinity;
     const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
     const targetExpl = globalConfig.stub_range_solver ? 1e9 : (globalConfig.target_exploitability ?? 3.0);
-    invoke('postflop_solve_street', { board: cards, target_exploitability: targetExpl })
+    const maxIters = globalConfig.solve_iterations ?? 200;
+    invoke('postflop_solve_street', { board: cards, target_exploitability: targetExpl, max_iterations: maxIters })
       .then(() => startPolling())
       .catch((e) => { setError(String(e)); setSolving(false); });
   }, [solving, boardInput, startPolling]);
