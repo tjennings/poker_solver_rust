@@ -501,8 +501,27 @@ impl CfvSubgameSolver {
                         }
                     }
                     TerminalKind::Showdown => {
+                        // Compute equity conditional on the opponent's reaching range,
+                        // not the static initial range. This prevents the solver from
+                        // overvaluing all-in (which would be evaluated against the full
+                        // range instead of just the calling range).
                         for i in 0..n {
-                            cfv_buf[out_start + i] = self.showdown_equity[i] * half_pot;
+                            let hero = self.hands.combos[i];
+                            let mut eq_sum = 0.0;
+                            let mut reach_sum = 0.0;
+                            for (j, &opp_r) in reach_opponent.iter().enumerate() {
+                                if opp_r <= 0.0 || cards_overlap(hero, self.hands.combos[j]) {
+                                    continue;
+                                }
+                                eq_sum += opp_r * self.equity_matrix[i][j];
+                                reach_sum += opp_r;
+                            }
+                            cfv_buf[out_start + i] = if reach_sum > 0.0 {
+                                let avg_eq = eq_sum / reach_sum;
+                                (2.0 * avg_eq - 1.0) * half_pot
+                            } else {
+                                0.0
+                            };
                         }
                     }
                     TerminalKind::DepthBoundary => {

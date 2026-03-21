@@ -2,7 +2,7 @@
 game:
   name: "500bkt"
   players: 2
-  stack_depth: 100.0
+  stack_depth: 50
   small_blind: 0.5
   big_blind: 1.0
 
@@ -16,35 +16,35 @@ clustering:
     #sample_boards: 2000  # default
   turn:
     buckets: 500
-    sample_boards: 3000
+    sample_boards: 16432
   river:
     buckets: 500
     sample_boards: 500000  # default
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
+    - ["2bb"]
     - ["4bb", "6bb"]
     - ["18bb"]
   flop:
-    - [0.33, 0.67, 1.0]
+    - [0.1, 0.25, 0.33, 0.67, 1.0]
     - [0.33, 0.67, 2.0]
     - [2.0]
   turn:
-    - [0.33, 0.67, 1.0]
+    - [0.1, 0.25, 0.33, 0.67, 1.0]
     - [0.33, 0.67, 2.0]
     - [2.0]
   river:
-    - [0.33, 0.67, 1.0]
+    - [0.1, 0.25, 0.33, 0.67, 1.0]
     - [0.33, 0.67, 2.0]
     - [2.0]
 
 training:
-  cluster_path: "./local_data/clusters_500bkt_v3"
+  cluster_path: "./local_data/buckets/500bkt_15turn"
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 5000000
   prune_after_iterations: 5000000
-  prune_threshold: 0
+  prune_threshold: -500
   lcfr_discount_interval: 1000000
   batch_size: 2000
 
@@ -52,7 +52,7 @@ snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/500bkt_pot_aware/snap"
+  output_dir: "./local_data/blueprints/500bkt_50bb/snap"
 
 tui:
   enabled: true
