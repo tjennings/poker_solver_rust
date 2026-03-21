@@ -86,6 +86,8 @@ enum StrategySource {
         /// Precomputed CBV table (player 0) for depth-limited subgame solving.
         /// `None` if the bundle doesn't include CBV files.
         cbv_table: Option<CbvTable>,
+        /// Directory the bundle was loaded from (for resolving relative paths).
+        bundle_dir: PathBuf,
     },
 }
 
@@ -372,6 +374,7 @@ pub async fn load_blueprint_v2_core(
         tree: Box::new(tree),
         decision_map,
         cbv_table,
+        bundle_dir: PathBuf::from(&dir_path),
     });
     state.bucket_cache.write().clear();
     *state.suit_mapping.write() = None;
@@ -413,6 +416,7 @@ pub fn populate_cbv_context(
         config,
         tree,
         cbv_table: Some(cbv_table),
+        bundle_dir,
         ..
     } = source
     else {
@@ -427,7 +431,14 @@ pub fn populate_cbv_context(
         return;
     };
 
-    let cluster_dir = std::path::Path::new(cluster_path);
+    let cluster_dir_raw = std::path::Path::new(cluster_path);
+    // Resolve relative cluster_path against the bundle directory.
+    let cluster_dir = if cluster_dir_raw.is_relative() {
+        bundle_dir.join(cluster_dir_raw)
+    } else {
+        cluster_dir_raw.to_path_buf()
+    };
+    eprintln!("[cbv] cluster_path={} exists={}", cluster_dir.display(), cluster_dir.exists());
     let bucket_counts = [
         config.clustering.preflop.buckets,
         config.clustering.flop.buckets,
@@ -455,6 +466,8 @@ pub fn populate_cbv_context(
         files
     };
 
+    let loaded_count = bucket_files.iter().filter(|f| f.is_some()).count();
+    eprintln!("[cbv] loaded {loaded_count}/4 bucket files");
     let all_buckets = AllBuckets::new(bucket_counts, bucket_files);
 
     // Enable per-flop bucket files if present.
