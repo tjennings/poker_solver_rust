@@ -452,7 +452,7 @@ impl LeafEvaluator for BlueprintCbvEvaluator {
 #[allow(clippy::too_many_arguments)]
 pub fn build_subgame_solver(
     board_cards: &[RsPokerCard],
-    bet_sizes: &[f32],
+    bet_sizes_per_depth: &[Vec<f32>],
     pot: u32,
     stacks: [u32; 2],
     _oop_weights: &[f32],
@@ -470,14 +470,17 @@ pub fn build_subgame_solver(
     let pot_f = f64::from(pot);
     let inv = [pot_f / 2.0; 2];
     let starting_stack = f64::from(stacks[0]) + inv[0];
-    let bet_sizes_f64: Vec<f64> = bet_sizes.iter().map(|&s| f64::from(s)).collect();
+    let sizes_f64: Vec<Vec<f64>> = bet_sizes_per_depth
+        .iter()
+        .map(|depth| depth.iter().map(|&s| f64::from(s)).collect())
+        .collect();
 
     let tree = GameTree::build_subgame(
         street,
         pot_f,
         inv,
         starting_stack,
-        &[bet_sizes_f64],
+        &sizes_f64,
         Some(1),
     );
 
@@ -1263,20 +1266,27 @@ fn solve_depth_limited(
         .map(|s| parse_rs_poker_card(s))
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Extract bet sizes from config (parse comma-separated percentage strings).
-    let bet_sizes: Vec<f32> = config
-        .oop_bet_sizes
-        .split(',')
-        .filter_map(|s| {
-            let s = s.trim().trim_end_matches('%');
-            s.parse::<f32>().ok().map(|v| v / 100.0)
-        })
-        .collect();
-    let bet_sizes = if bet_sizes.is_empty() {
-        vec![1.0]
-    } else {
-        bet_sizes
+    // Extract bet/raise sizes from config (parse comma-separated percentage strings).
+    let parse_sizes = |s: &str| -> Vec<f32> {
+        s.split(',')
+            .filter_map(|s| {
+                let s = s.trim().trim_end_matches('%');
+                if s == "a" || s == "e" { return None; }
+                s.parse::<f32>().ok().map(|v| v / 100.0)
+            })
+            .collect()
     };
+    let bet_depth = parse_sizes(&config.oop_bet_sizes);
+    let raise_depth = parse_sizes(&config.oop_raise_sizes);
+    let mut bet_sizes_per_depth: Vec<Vec<f32>> = vec![];
+    if !bet_depth.is_empty() {
+        bet_sizes_per_depth.push(bet_depth);
+    } else {
+        bet_sizes_per_depth.push(vec![1.0]);
+    }
+    if !raise_depth.is_empty() {
+        bet_sizes_per_depth.push(raise_depth);
+    }
 
     let pot = config.pot;
     let eff_stack = config.effective_stack;
@@ -1297,7 +1307,7 @@ fn solve_depth_limited(
         let player = 0; // OOP acts first at root
         match build_subgame_solver(
             &board_cards,
-            &bet_sizes,
+            &bet_sizes_per_depth,
             pot as u32,
             [eff_stack as u32, eff_stack as u32],
             &oop_w,
@@ -2563,7 +2573,7 @@ mod tests {
             RsPokerCard::new(RsPokerValue::Seven, RsPokerSuit::Diamond),
             RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
         ];
-        let bet_sizes = vec![1.0f32];
+        let bet_sizes = vec![vec![1.0f32]];
         let oop_w = weights_from_range("AA,KK,QQ");
         let ip_w = weights_from_range("JJ,TT,99");
 
@@ -2618,7 +2628,7 @@ mod tests {
             RsPokerCard::new(RsPokerValue::Six, RsPokerSuit::Club),
             RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Spade),
         ];
-        let bet_sizes = vec![0.5f32];
+        let bet_sizes = vec![vec![0.5f32]];
         let oop_w = weights_from_range("AA,KK");
         let ip_w = weights_from_range("QQ,JJ");
 
