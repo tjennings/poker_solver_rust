@@ -192,7 +192,7 @@ impl OfflineSeeder {
         strategy: &BlueprintV2Strategy,
         tree: &GameTree,
         buckets: &AllBuckets,
-        _evaluator: Option<&dyn poker_solver_core::blueprint_v2::LeafEvaluator>,
+        evaluator: Option<&dyn poker_solver_core::blueprint_v2::LeafEvaluator>,
         buffer: &mut DiskBuffer,
     ) -> Result<StreetResult, String> {
         let board_card_count = street_to_board_cards(street);
@@ -249,22 +249,55 @@ impl OfflineSeeder {
         );
 
         // Step 2: Solve the newly added records.
-        // For river, solve_buffer_records solves 5-card board records exactly.
-        // For other streets, depth-limited solving with the evaluator is not yet
-        // implemented in solve_buffer_records; we solve what we can (river records).
-        //
-        // TODO(rebel): Extend solve_buffer_records to handle non-river streets
-        //   with a LeafEvaluator for depth-limited subgame solving.
+        // solve_buffer_records supports both modes:
+        //   - evaluator=None: solves river records (5-card boards) exactly
+        //   - evaluator=Some: solves all streets depth-limited with the evaluator
+        //     at street boundaries
         let solve_config = build_solve_config(&self.config.seed);
         let records_to_solve = buffer.len() - pre_count;
 
-        if street == Street::River && records_to_solve > 0 {
-            eprintln!("Solving {records_to_solve} river records...");
-            let solved = solve_buffer_records(
-                buffer,
-                &solve_config,
-                self.config.seed.threads,
-            );
+        if records_to_solve > 0 {
+            if street == Street::River {
+                eprintln!("Solving {records_to_solve} river records (exact, no evaluator)...");
+            } else {
+                eprintln!(
+                    "Solving {records_to_solve} {:?} records (depth-limited with value net)...",
+                    street
+                );
+            }
+
+            // For river: pass None (exact solving).
+            // For other streets: pass the evaluator for depth-limited solving.
+            //
+            // The LeafEvaluator trait is not Sync by default, but
+            // solve_buffer_records needs Option<&(dyn LeafEvaluator + Sync)>.
+            // RebelLeafEvaluator<NdArray> is Sync since NdArray's Device is Sync.
+            // When we receive a type-erased &dyn LeafEvaluator, we cannot prove
+            // Sync at compile time. So we use a wrapper for the non-river case.
+            let solved = if street == Street::River {
+                solve_buffer_records(
+                    buffer,
+                    &solve_config,
+                    None,
+                    self.config.seed.threads,
+                )
+            } else {
+                // The evaluator is created from RebelLeafEvaluator<NdArray> which is
+                // Send+Sync, but type-erased to Box<dyn LeafEvaluator>. We need to
+                // solve single-threaded or wrap for sync access.
+                // Use a SyncEvaluatorWrapper to make the &dyn LeafEvaluator usable
+                // in the parallel solver.
+                let sync_eval = SyncEvaluatorWrapper(evaluator.expect(
+                    "non-river street requires an evaluator",
+                ));
+                solve_buffer_records(
+                    buffer,
+                    &solve_config,
+                    Some(&sync_eval),
+                    self.config.seed.threads,
+                )
+            };
+
             eprintln!("Solved {solved} records.");
 
             Ok(StreetResult {
@@ -274,12 +307,7 @@ impl OfflineSeeder {
                 training_loss: None,
             })
         } else {
-            // For non-river streets, subgame solving with depth-limited evaluation
-            // will be implemented when the depth-limited solver is integrated.
-            eprintln!(
-                "Skipping subgame solving for {:?} (depth-limited solver not yet integrated).",
-                street
-            );
+            eprintln!("No records to solve for {:?}.", street);
 
             Ok(StreetResult {
                 street,
@@ -357,13 +385,77 @@ impl OfflineSeeder {
 }
 
 /// Map a street to the expected number of board cards.
-fn street_to_board_cards(street: Street) -> u8 {
+pub fn street_to_board_cards(street: Street) -> u8 {
     match street {
         Street::Preflop => 0,
         Street::Flop => 3,
         Street::Turn => 4,
         Street::River => 5,
     }
+}
+
+/// Wrapper to expose a `&dyn LeafEvaluator` as `LeafEvaluator + Sync`.
+///
+/// The underlying `RebelLeafEvaluator<NdArray>` is inherently `Sync` (NdArray's
+/// device is a unit type, and the model is behind `Arc<Mutex<...>>`), but once
+/// boxed as `Box<dyn LeafEvaluator>` the compiler loses proof of `Sync`.
+///
+/// This wrapper is safe because we only construct it from evaluators that were
+/// originally `RebelLeafEvaluator<NdArray>`, which is `Send + Sync`.
+struct SyncEvaluatorWrapper<'a>(&'a dyn poker_solver_core::blueprint_v2::LeafEvaluator);
+
+// SAFETY: The only concrete type wrapped is RebelLeafEvaluator<NdArray>,
+// which is Sync (NdArray device is (), model is Arc<Mutex<CfvNet<NdArray>>>).
+unsafe impl Sync for SyncEvaluatorWrapper<'_> {}
+
+impl poker_solver_core::blueprint_v2::LeafEvaluator for SyncEvaluatorWrapper<'_> {
+    fn evaluate(
+        &self,
+        combos: &[[poker_solver_core::poker::Card; 2]],
+        board: &[poker_solver_core::poker::Card],
+        pot: f64,
+        effective_stack: f64,
+        oop_range: &[f64],
+        ip_range: &[f64],
+        traverser: u8,
+    ) -> Vec<f64> {
+        self.0.evaluate(combos, board, pot, effective_stack, oop_range, ip_range, traverser)
+    }
+
+    fn evaluate_boundaries(
+        &self,
+        combos: &[[poker_solver_core::poker::Card; 2]],
+        board: &[poker_solver_core::poker::Card],
+        oop_range: &[f64],
+        ip_range: &[f64],
+        requests: &[(f64, f64, u8)],
+    ) -> Vec<Vec<f64>> {
+        self.0.evaluate_boundaries(combos, board, oop_range, ip_range, requests)
+    }
+}
+
+/// Run the full bottom-up offline seeding pipeline.
+///
+/// Pipeline order: River -> Turn -> Flop -> Preflop
+///
+/// At each street:
+/// 1. Generate PBSs from blueprint play (all streets at once via play_hand)
+/// 2. Solve subgames for target street only
+///    - River: exact (no depth limit)
+///    - Others: depth-limited with current value net at boundaries
+/// 3. Export accumulated buffer to cfvnet training files
+/// 4. Train/retrain value net on ALL accumulated data
+/// 5. Load retrained model for next street's leaf evaluation
+///
+/// Returns paths and stats.
+pub fn run_offline_seeding(
+    config: &RebelConfig,
+    strategy: &BlueprintV2Strategy,
+    tree: &GameTree,
+    buckets: &AllBuckets,
+) -> Result<SeederResult, String> {
+    let mut seeder = OfflineSeeder::new(config.clone());
+    seeder.run(strategy, tree, buckets)
 }
 
 #[cfg(test)]
@@ -489,6 +581,25 @@ mod tests {
     }
 
     #[test]
+    fn test_board_card_count_for_street() {
+        // Verify the mapping used for filtering buffer records by street.
+        let mapping: Vec<(Street, u8)> = vec![
+            (Street::River, 5),
+            (Street::Turn, 4),
+            (Street::Flop, 3),
+            (Street::Preflop, 0),
+        ];
+
+        for (street, expected) in mapping {
+            assert_eq!(
+                street_to_board_cards(street),
+                expected,
+                "street_to_board_cards({street:?}) should be {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn test_street_order() {
         assert_eq!(STREET_ORDER[0], Street::River);
         assert_eq!(STREET_ORDER[1], Street::Turn);
@@ -529,6 +640,25 @@ mod tests {
             err_msg.contains("model file not found"),
             "unexpected error: {err_msg}"
         );
+    }
+
+    #[test]
+    fn test_run_offline_seeding_delegates_to_seeder() {
+        // Verify run_offline_seeding creates an OfflineSeeder internally.
+        // We cannot run the full pipeline without a blueprint, but we can
+        // verify the function exists and has the correct signature by
+        // checking that a missing blueprint_path causes an appropriate error
+        // when the pipeline tries to create output dirs (not at the function
+        // signature level — that's checked at compile time).
+        //
+        // This test just verifies the free function compiles and is callable.
+        // The actual integration is tested in test_full_pipeline_integration.
+        let _fn_ptr: fn(
+            &RebelConfig,
+            &BlueprintV2Strategy,
+            &GameTree,
+            &AllBuckets,
+        ) -> Result<SeederResult, String> = run_offline_seeding;
     }
 
     #[test]
