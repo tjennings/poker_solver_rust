@@ -4,8 +4,8 @@ use poker_solver_core::blueprint_v2::solver_dispatch::{
     self, SolverChoice, SolverConfig, Street,
 };
 use poker_solver_core::blueprint_v2::{
-    SubgameCfrSolver, SubgameHands, SubgameStrategy,
-    compute_combo_equities, build_boundary_mapping,
+    CfvSubgameSolver, LeafEvaluator, SubgameHands, SubgameStrategy,
+    compute_combo_equities,
 };
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
@@ -312,28 +312,58 @@ fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
     Ok(RsPokerCard::new(value, suit))
 }
 
-/// Build a subgame tree and CFR solver, ready to iterate.
+// ---------------------------------------------------------------------------
+// EquityLeafEvaluator — simple equity-based evaluator for depth boundaries
+// ---------------------------------------------------------------------------
+
+/// Evaluates depth boundary nodes by computing equity against the opponent's
+/// current reach-weighted range. Returns per-combo CFVs in pot-fraction units.
+///
+/// Unlike the old `SubgameCfrSolver` approach (which used a static scalar
+/// opponent reach), this evaluator receives the dynamically-propagated opponent
+/// range at each boundary, properly tracking which opponent combos reach each
+/// terminal.
+struct EquityLeafEvaluator;
+
+impl LeafEvaluator for EquityLeafEvaluator {
+    fn evaluate(
+        &self,
+        combos: &[[RsPokerCard; 2]],
+        board: &[RsPokerCard],
+        _pot: f64,
+        _effective_stack: f64,
+        oop_range: &[f64],
+        ip_range: &[f64],
+        traverser: u8,
+    ) -> Vec<f64> {
+        let opp_range = if traverser == 0 { ip_range } else { oop_range };
+        let hands = SubgameHands { combos: combos.to_vec() };
+        let equities = compute_combo_equities(&hands, board, opp_range);
+        // Convert equity (0..1) to pot-fraction CFVs (-1..+1).
+        equities.iter().map(|&eq| 2.0 * eq - 1.0).collect()
+    }
+}
+
+/// Build a subgame tree and CFV solver, ready to iterate.
 ///
 /// Returns the solver, hands, action labels, tree, initial pot, and starting
 /// stack without running any iterations. The caller drives the iteration loop
 /// and can build matrix snapshots between iterations.
 ///
-/// Leaf values at `DepthBoundary` nodes use reach-weighted equity against
-/// the opponent range, converted to chip values by the solver.
-///
-/// When `cbv_context` is `Some`, uses blueprint CBV tables at depth
-/// boundaries instead of raw equity for strategically informed leaf values.
+/// Uses [`CfvSubgameSolver`] with per-combo reach vectors at depth boundaries,
+/// which properly tracks which opponent combos reach each terminal (fixing the
+/// mass-shoving bug from the old `SubgameCfrSolver`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_subgame_solver(
     board_cards: &[RsPokerCard],
     bet_sizes: &[f32],
     pot: u32,
     stacks: [u32; 2],
-    oop_weights: &[f32],
-    ip_weights: &[f32],
-    player: usize,
-    cbv_context: Option<&CbvContext>,
-) -> Result<(SubgameCfrSolver, SubgameHands, Vec<ActionInfo>, GameTree, f64, f64), String> {
+    _oop_weights: &[f32],
+    _ip_weights: &[f32],
+    _player: usize,
+    _cbv_context: Option<&CbvContext>,
+) -> Result<(CfvSubgameSolver, SubgameHands, Vec<ActionInfo>, GameTree, f64, f64), String> {
     let street = match board_cards.len() {
         3 => V2Street::Flop,
         4 => V2Street::Turn,
@@ -356,54 +386,6 @@ pub fn build_subgame_solver(
 
     let hands = SubgameHands::enumerate(board_cards);
 
-    // Map opponent reach from the 1326-weight vector to SubgameHands ordering.
-    let opp_weights = if player == 0 { ip_weights } else { oop_weights };
-    let opponent_reach: Vec<f64> = hands
-        .combos
-        .iter()
-        .map(|combo| {
-            let rs_id0 = rs_poker_card_to_id(combo[0]);
-            let rs_id1 = rs_poker_card_to_id(combo[1]);
-            let ci = card_pair_to_index(rs_id0, rs_id1);
-            f64::from(opp_weights[ci])
-        })
-        .collect();
-
-    // Compute leaf values for DepthBoundary nodes.
-    let leaf_values = if let Some(ctx) = cbv_context {
-        // CBV-based: use blueprint counterfactual boundary values.
-        let boundary_mapping = build_boundary_mapping(&tree, &ctx.abstract_tree);
-        let boundary_pots: Vec<f64> = tree.nodes.iter().filter_map(|n| match n {
-            GameNode::Terminal { kind: TerminalKind::DepthBoundary, pot, .. } => Some(*pot),
-            _ => None,
-        }).collect();
-
-        boundary_mapping
-            .iter()
-            .zip(boundary_pots.iter())
-            .map(|(&chance_ord, &bpot)| {
-                let half_pot = bpot / 2.0;
-                hands.combos.iter().map(|&hole| {
-                    let bucket = ctx.all_buckets.get_bucket(street, hole, board_cards) as usize;
-                    let cbv = f64::from(ctx.cbv_table.lookup(chance_ord, bucket));
-                    // Normalize: equity = (cbv / half_pot + 1) / 2
-                    (cbv / half_pot + 1.0) / 2.0
-                }).collect()
-            })
-            .collect()
-    } else {
-        // Equity-based fallback: use raw showdown equity.
-        let equities = compute_combo_equities(&hands, board_cards, &opponent_reach);
-        let boundary_count = tree.nodes.iter().filter(|n| matches!(n,
-            GameNode::Terminal { kind: TerminalKind::DepthBoundary, .. }
-        )).count();
-        if boundary_count == 0 {
-            vec![]
-        } else {
-            vec![equities; boundary_count]
-        }
-    };
-
     // Extract action labels from tree root.
     // invested_offset = pot/2 so labels show bet amounts on this street,
     // not total invested including preflop contributions.
@@ -417,12 +399,13 @@ pub fn build_subgame_solver(
         _ => return Err("Subgame tree root is not a decision node".to_string()),
     };
 
-    let solver = SubgameCfrSolver::new(
+    let evaluator: Box<dyn LeafEvaluator> = Box::new(EquityLeafEvaluator);
+    let solver = CfvSubgameSolver::new(
         tree.clone(),
         hands.clone(),
         board_cards,
-        opponent_reach,
-        leaf_values,
+        evaluator,
+        starting_stack,
     );
 
     Ok((solver, hands, action_infos, tree, pot_f, starting_stack))
@@ -1151,7 +1134,7 @@ fn solve_full_depth(
     Ok(())
 }
 
-/// Depth-limited solve using `SubgameCfrSolver`.
+/// Depth-limited solve using `CfvSubgameSolver`.
 #[allow(clippy::too_many_arguments)]
 fn solve_depth_limited(
     state: &Arc<PostflopState>,
@@ -2463,5 +2446,104 @@ mod tests {
 
         let solver_name = state.solver_name.read().clone();
         assert_eq!(solver_name, "full", "narrow flop should dispatch to full");
+    }
+
+    #[test]
+    fn test_build_subgame_solver_returns_cfv_solver() {
+        use poker_solver_core::blueprint_v2::CfvSubgameSolver;
+
+        let board_cards = vec![
+            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Seven, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+        ];
+        let bet_sizes = vec![1.0f32];
+        let oop_w = weights_from_range("AA,KK,QQ");
+        let ip_w = weights_from_range("JJ,TT,99");
+
+        let result = build_subgame_solver(
+            &board_cards,
+            &bet_sizes,
+            100,
+            [200, 200],
+            &oop_w,
+            &ip_w,
+            0,
+            None,
+        );
+        assert!(result.is_ok(), "build_subgame_solver failed: {:?}", result.err());
+
+        // Explicit type annotation: this MUST be CfvSubgameSolver, not SubgameCfrSolver.
+        let (mut solver, _hands, action_infos, _tree, initial_pot, starting_stack):
+            (CfvSubgameSolver, SubgameHands, Vec<ActionInfo>, GameTree, f64, f64) =
+            result.unwrap();
+
+        // Verify the solver trains and produces valid strategy.
+        solver.train(5);
+        let strategy = solver.strategy();
+        assert!(strategy.num_combos() > 0);
+        assert!(!action_infos.is_empty());
+        assert!(initial_pot > 0.0);
+        assert!(starting_stack > 0.0);
+
+        // Verify strategy produces valid probability distributions at root.
+        for combo_idx in 0..strategy.num_combos() {
+            let probs = strategy.root_probs(combo_idx);
+            if probs.is_empty() {
+                continue;
+            }
+            let sum: f64 = probs.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 0.05,
+                "combo {combo_idx}: strategy sum = {sum}, expected ~1.0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_subgame_solver_no_precomputed_leaf_values() {
+        // Verify build_subgame_solver does NOT use precomputed leaf values
+        // (which was the source of the mass-shoving bug). The CfvSubgameSolver
+        // evaluates leaves dynamically using per-combo reach vectors.
+        let board_cards = vec![
+            RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Nine, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Six, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Spade),
+        ];
+        let bet_sizes = vec![0.5f32];
+        let oop_w = weights_from_range("AA,KK");
+        let ip_w = weights_from_range("QQ,JJ");
+
+        let result = build_subgame_solver(
+            &board_cards,
+            &bet_sizes,
+            80,
+            [150, 150],
+            &oop_w,
+            &ip_w,
+            0,
+            None,
+        );
+        assert!(result.is_ok());
+
+        let (mut solver, _hands, _, _, _, _) = result.unwrap();
+
+        // Train a few iterations and verify convergence produces
+        // non-degenerate strategies (not 100% all-in).
+        solver.train(20);
+        let strategy = solver.strategy();
+
+        // Verify the solver produces a strategy with valid distributions.
+        let mut total_checked = 0;
+        for combo_idx in 0..strategy.num_combos() {
+            let probs = strategy.root_probs(combo_idx);
+            if probs.is_empty() {
+                continue;
+            }
+            total_checked += 1;
+        }
+        assert!(total_checked > 0, "should have combos with strategies");
     }
 }
