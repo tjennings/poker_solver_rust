@@ -374,7 +374,15 @@ pub async fn load_blueprint_v2_core(
         tree: Box::new(tree),
         decision_map,
         cbv_table,
-        bundle_dir: PathBuf::from(&dir_path),
+        bundle_dir: {
+            // The bundle root is where config.yaml lives. dir_path might
+            // point to a snapshot subdir, so walk up to find config.yaml.
+            let mut d = PathBuf::from(&dir_path);
+            while !d.join("config.yaml").exists() {
+                if !d.pop() { break; }
+            }
+            d
+        },
     });
     state.bucket_cache.write().clear();
     *state.suit_mapping.write() = None;
