@@ -432,18 +432,21 @@ pub fn populate_cbv_context(
         return;
     };
 
-    // Expect bucket files at <bundle_dir>/buckets/.
-    // For distribution, symlink or copy the cluster output into the bundle.
-    let cluster_dir = bundle_dir.join("buckets");
-    if !cluster_dir.exists() {
+    // Expect bucket files at <bundle_dir>/buckets/ or ../buckets/.
+    // For distribution, symlink or copy the cluster output into the bundle root.
+    let cluster_dir = if bundle_dir.join("buckets").exists() {
+        bundle_dir.join("buckets")
+    } else if bundle_dir.parent().is_some_and(|p| p.join("buckets").exists()) {
+        bundle_dir.parent().unwrap().join("buckets")
+    } else {
         eprintln!(
-            "CBV table found but no buckets/ directory in bundle (expected {}). \
+            "CBV table found but no buckets/ directory in bundle (checked {} and parent). \
              Symlink your cluster output there.",
-            cluster_dir.display()
+            bundle_dir.join("buckets").display()
         );
         crate::postflop::set_cbv_context(postflop, None);
         return;
-    }
+    };
     eprintln!("[cbv] buckets dir: {}", cluster_dir.display());
     let bucket_counts = [
         config.clustering.preflop.buckets,
