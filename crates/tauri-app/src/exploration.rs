@@ -807,15 +807,19 @@ fn v2_actions_at_node(tree: &V2GameTree, node_idx: u32) -> Vec<ActionInfo> {
         V2GameNode::Decision { actions, .. } => actions
             .iter()
             .enumerate()
-            .map(|(i, a)| v2_action_info(a, i))
+            .map(|(i, a)| v2_action_info(a, i, 1.0))
             .collect(),
         _ => vec![],
     }
 }
 
 /// Convert a V2 `TreeAction` to an `ActionInfo`.
+///
+/// `bb_scale` converts internal tree units to BB for display labels.
+/// Use `1.0` when the tree uses BB units (blueprint preflop tree).
+/// Use `0.5` when the tree uses chip units (subgame solver, 1BB = 2 chips).
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn v2_action_info(action: &TreeAction, idx: usize) -> ActionInfo {
+pub(crate) fn v2_action_info(action: &TreeAction, idx: usize, bb_scale: f64) -> ActionInfo {
     let id = idx.to_string();
     match action {
         TreeAction::Fold => ActionInfo {
@@ -838,13 +842,13 @@ pub(crate) fn v2_action_info(action: &TreeAction, idx: usize) -> ActionInfo {
         },
         TreeAction::Bet(amount) => ActionInfo {
             id,
-            label: format!("{:.1}bb", amount),
+            label: format!("{:.1}bb", amount * bb_scale),
             action_type: "bet".to_string(),
             size_key: Some(format!("{amount:.2}")),
         },
         TreeAction::Raise(amount) => ActionInfo {
             id,
-            label: format!("{:.1}bb", amount),
+            label: format!("{:.1}bb", amount * bb_scale),
             action_type: "raise".to_string(),
             size_key: Some(format!("{amount:.2}")),
         },

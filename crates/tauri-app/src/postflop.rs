@@ -409,7 +409,7 @@ pub fn build_subgame_solver(
         GameNode::Decision { actions, .. } => actions
             .iter()
             .enumerate()
-            .map(|(i, a)| v2_action_info(a, i))
+            .map(|(i, a)| v2_action_info(a, i, 0.5))
             .collect(),
         _ => return Err("Subgame tree root is not a decision node".to_string()),
     };
@@ -1462,7 +1462,7 @@ fn subgame_node_to_result(
             let action_infos: Vec<ActionInfo> = actions
                 .iter()
                 .enumerate()
-                .map(|(i, a)| v2_action_info(a, i))
+                .map(|(i, a)| v2_action_info(a, i, 0.5))
                 .collect();
 
             let (pot_i32, stacks_i32) = decision_display_info(
