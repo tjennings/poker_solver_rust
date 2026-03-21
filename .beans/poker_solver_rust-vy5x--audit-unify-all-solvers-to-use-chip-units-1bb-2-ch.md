@@ -24,7 +24,7 @@ The blueprint solver (MCCFR) uses BB units (big_blind=1.0), while the range-solv
 - [ ] mccfr.rs: terminal_value uses BB units
 - [ ] cbv_compute.rs: CBV backward induction produces BB values
 - [ ] trainer.rs: training loop in BB units
-- [ ] **Convert to chips at tree build time** (small_blind=1, big_blind=2, stack_depth*2)
+- [ ] **Convert to chips at tree build time** (small_blind=1, big_blind=2, stack_depth stays as-is — it already represents chips, e.g. 100 chips = 50BB)
 
 ### 2. Subgame Solver (CfvSubgameSolver) — crates/core/src/blueprint_v2/cfv_subgame_solver.rs
 - [ ] Currently receives chip-unit pot/stacks from PostflopConfig
@@ -51,7 +51,7 @@ The blueprint solver (MCCFR) uses BB units (big_blind=1.0), while the range-solv
 
 ## Recommendation
 
-Convert the blueprint tree builder to use chips (small_blind=1, big_blind=2, stack_depth*=2). This eliminates ALL conversion code at boundaries. Tree topology unchanged (uniform 2x scale). Requires retrain.
+Convert the blueprint tree builder to use chips (small_blind=1, big_blind=2). stack_depth in config already represents chips (e.g. 100 = 50BB). This eliminates ALL conversion code at boundaries. Tree topology unchanged (uniform 2x scale). Requires retrain.
 
 ## Acceptance Criteria
 - [ ] All three solvers use chip units
