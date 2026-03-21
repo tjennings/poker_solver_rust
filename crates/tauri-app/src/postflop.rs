@@ -498,7 +498,7 @@ impl Default for PostflopState {
             filtered_ip_weights: RwLock::new(None),
             cache_dir: RwLock::new(None),
             solve_start: RwLock::new(None),
-            solver_name: RwLock::new("range".to_string()),
+            solver_name: RwLock::new("full".to_string()),
             subgame_result: RwLock::new(None),
             subgame_node: AtomicU32::new(0),
             cbv_context: RwLock::new(None),
@@ -1073,7 +1073,7 @@ fn solve_full_depth(
     state
         .exploitability_bits
         .store(f32::MAX.to_bits(), Ordering::Relaxed);
-    *state.solver_name.write() = "range".to_string();
+    *state.solver_name.write() = "full".to_string();
     *state.subgame_result.write() = None;
     state.solving.store(true, Ordering::Release);
 
@@ -2416,7 +2416,7 @@ mod tests {
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
-        assert_eq!(solver_name, "range", "river should always dispatch to range");
+        assert_eq!(solver_name, "full", "river should always dispatch to full");
 
         // Wait for completion.
         for _ in 0..600 {
@@ -2458,6 +2458,6 @@ mod tests {
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
-        assert_eq!(solver_name, "range", "narrow flop should dispatch to range");
+        assert_eq!(solver_name, "full", "narrow flop should dispatch to full");
     }
 }

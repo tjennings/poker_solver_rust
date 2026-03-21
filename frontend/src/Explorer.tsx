@@ -244,7 +244,7 @@ export function ActionBlock({
         onClick={onHeaderClick}
       >
         <span className="position">{position}</span>
-        <span className="stack">{isNaN(stack) ? '--' : `${Math.round(stack / 2)}BB`} / {isNaN(pot) ? '--' : `${Math.round(pot / 2)}BB`}</span>
+        <span className="stack">{isNaN(stack) ? '--' : `${+(stack / 2).toFixed(1)}BB`} / {isNaN(pot) ? '--' : `${+(pot / 2).toFixed(1)}BB`}</span>
       </div>
       <div className="action-list">
         {displayOrderActions(actions).map((action) => {
@@ -733,8 +733,8 @@ export default function Explorer() {
               ip_range: FULL_RANGE,
               oop_weights: ranges.oop_weights,
               ip_weights: ranges.ip_weights,
-              pot: Math.round(ranges.pot),
-              effective_stack: Math.round(ranges.effective_stack),
+              pot: Math.round(ranges.pot * 2),
+              effective_stack: Math.round(ranges.effective_stack * 2),
               oop_bet_sizes: ranges.oop_bet_sizes,
               oop_raise_sizes: ranges.oop_raise_sizes,
               ip_bet_sizes: ranges.ip_bet_sizes,

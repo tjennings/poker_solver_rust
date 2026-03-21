@@ -432,7 +432,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         >
           <div className="postflop-config-label">{blueprintConfig ? 'Blueprint' : 'Config'}</div>
           <div className="postflop-config-summary">
-            {config.pot} pot / {config.effective_stack} eff
+            {+(config.pot / 2).toFixed(1)} pot / {+(config.effective_stack / 2).toFixed(1)} eff
             {config.rake_rate > 0 && ` / ${(config.rake_rate * 100).toFixed(1)}% rake`}
           </div>
           {configSummary && (
