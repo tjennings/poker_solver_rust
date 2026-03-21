@@ -1,0 +1,22 @@
+[package]
+name = "rebel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+poker-solver-core = { path = "../core" }
+range-solver = { path = "../range-solver" }
+
+serde.workspace = true
+serde_yaml.workspace = true
+rayon.workspace = true
+rs_poker.workspace = true
+
+rand = "0.9"
+rand_chacha = "0.9"
+memmap2 = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
