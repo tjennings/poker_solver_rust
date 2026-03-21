@@ -13,7 +13,7 @@ use crate::poker::{Card, Hand, Rank, Rankable};
 
 use super::SubgameConfig;
 use super::cbv::CbvTable;
-use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind};
+use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
 use crate::blueprint_v2::Street;
 
 // ---------------------------------------------------------------------------
@@ -802,6 +802,155 @@ pub fn solve_subgame(
 }
 
 // ---------------------------------------------------------------------------
+// build_boundary_mapping -- parallel tree walk
+// ---------------------------------------------------------------------------
+
+/// Map each `DepthBoundary` in `subgame_tree` to the corresponding `Chance`
+/// node ordinal in `abstract_tree` by walking both trees in lockstep.
+///
+/// Both trees must share the same action set at every decision node. Returns
+/// a `Vec<usize>` of length equal to the number of `DepthBoundary` nodes,
+/// where each value is the ordinal position of the matching `Chance` node
+/// among all `Chance` nodes in the abstract tree (matching [`CbvTable`]
+/// indexing).
+///
+/// # Panics
+///
+/// Panics if any subgame action has no match in the abstract tree, or if a
+/// `DepthBoundary` doesn't correspond to a `Chance` node.
+#[must_use]
+pub fn build_boundary_mapping(
+    subgame_tree: &GameTree,
+    abstract_tree: &GameTree,
+) -> Vec<usize> {
+    // Precompute chance node ordinals in the abstract tree.
+    let mut chance_ordinals = vec![usize::MAX; abstract_tree.nodes.len()];
+    let mut ord = 0;
+    for (idx, node) in abstract_tree.nodes.iter().enumerate() {
+        if matches!(node, GameNode::Chance { .. }) {
+            chance_ordinals[idx] = ord;
+            ord += 1;
+        }
+    }
+
+    let mut mapping = Vec::new();
+    walk_trees_lockstep(
+        subgame_tree,
+        abstract_tree,
+        &chance_ordinals,
+        subgame_tree.root as usize,
+        abstract_tree.root as usize,
+        &mut mapping,
+    );
+    mapping
+}
+
+fn walk_trees_lockstep(
+    sub: &GameTree,
+    abs: &GameTree,
+    chance_ordinals: &[usize],
+    sub_idx: usize,
+    abs_idx: usize,
+    mapping: &mut Vec<usize>,
+) {
+    match (&sub.nodes[sub_idx], &abs.nodes[abs_idx]) {
+        // Subgame hits DepthBoundary -> abstract should be at Chance.
+        (
+            GameNode::Terminal {
+                kind: TerminalKind::DepthBoundary,
+                ..
+            },
+            GameNode::Chance { .. },
+        ) => {
+            let ord = chance_ordinals[abs_idx];
+            assert_ne!(
+                ord,
+                usize::MAX,
+                "abstract Chance node {abs_idx} has no ordinal"
+            );
+            mapping.push(ord);
+        }
+
+        // Both are terminals (Fold or Showdown) -- nothing to map.
+        (GameNode::Terminal { .. }, GameNode::Terminal { .. }) => {}
+
+        // Both are Chance nodes -- recurse into children.
+        (
+            GameNode::Chance {
+                child: sub_child, ..
+            },
+            GameNode::Chance {
+                child: abs_child, ..
+            },
+        ) => {
+            walk_trees_lockstep(
+                sub,
+                abs,
+                chance_ordinals,
+                *sub_child as usize,
+                *abs_child as usize,
+                mapping,
+            );
+        }
+
+        // Both are Decision nodes -- match actions and recurse.
+        (
+            GameNode::Decision {
+                actions: sub_actions,
+                children: sub_children,
+                ..
+            },
+            GameNode::Decision {
+                actions: abs_actions,
+                children: abs_children,
+                ..
+            },
+        ) => {
+            for (sub_a_idx, sub_action) in sub_actions.iter().enumerate() {
+                let abs_a_idx = abs_actions
+                    .iter()
+                    .position(|a| actions_match(a, sub_action))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "no matching action for {sub_action:?} in abstract tree at node {abs_idx}"
+                        )
+                    });
+                walk_trees_lockstep(
+                    sub,
+                    abs,
+                    chance_ordinals,
+                    sub_children[sub_a_idx] as usize,
+                    abs_children[abs_a_idx] as usize,
+                    mapping,
+                );
+            }
+        }
+
+        (sub_node, abs_node) => {
+            panic!(
+                "tree structure mismatch at sub={sub_idx} abs={abs_idx}: \
+                 sub={sub_node:?}, abs={abs_node:?}"
+            );
+        }
+    }
+}
+
+/// Compare two `TreeAction`s for equivalence during lockstep tree walking.
+///
+/// Uses approximate comparison for `Bet`/`Raise` amounts (within `SIZE_EPSILON`).
+fn actions_match(a: &TreeAction, b: &TreeAction) -> bool {
+    match (a, b) {
+        (TreeAction::Fold, TreeAction::Fold)
+        | (TreeAction::Check, TreeAction::Check)
+        | (TreeAction::Call, TreeAction::Call)
+        | (TreeAction::AllIn, TreeAction::AllIn) => true,
+        (TreeAction::Bet(x), TreeAction::Bet(y))
+        | (TreeAction::Raise(x), TreeAction::Raise(y)) => (x - y).abs() < 0.01,
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1325,5 +1474,85 @@ mod tests {
         }
         // All slots should be used.
         assert!(used.iter().all(|&u| u), "some layout slots are unused");
+    }
+
+    #[timed_test]
+    fn build_boundary_mapping_matches_trees() {
+        // Build abstract full-depth flop tree.
+        let abstract_tree = GameTree::build_subgame(
+            Street::Flop,
+            100.0,
+            [50.0, 50.0],
+            250.0,
+            &[vec![1.0]],
+            None, // full depth
+        );
+
+        // Build subgame depth-limited flop tree with SAME bet sizes.
+        let subgame_tree = GameTree::build_subgame(
+            Street::Flop,
+            100.0,
+            [50.0, 50.0],
+            250.0,
+            &[vec![1.0]],
+            Some(1), // depth limit = 1 street
+        );
+
+        // Count expected boundaries.
+        let boundary_count = subgame_tree
+            .nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n,
+                    GameNode::Terminal {
+                        kind: TerminalKind::DepthBoundary,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(boundary_count > 0, "subgame should have boundaries");
+
+        // Count chance nodes in abstract tree.
+        let chance_count = abstract_tree
+            .nodes
+            .iter()
+            .filter(|n| matches!(n, GameNode::Chance { .. }))
+            .count();
+
+        let mapping = build_boundary_mapping(&subgame_tree, &abstract_tree);
+
+        assert_eq!(mapping.len(), boundary_count);
+        // Every mapped ordinal must be valid.
+        for &ord in &mapping {
+            assert!(
+                ord < chance_count,
+                "ordinal {ord} out of range (chance_count={chance_count})"
+            );
+        }
+    }
+
+    #[timed_test]
+    #[should_panic(expected = "no matching action")]
+    fn build_boundary_mapping_panics_on_mismatch() {
+        let tree_a = GameTree::build_subgame(
+            Street::Flop,
+            100.0,
+            [50.0, 50.0],
+            250.0,
+            &[vec![1.0]],
+            Some(1),
+        );
+        // Different bet sizes -> different actions -> panic.
+        let tree_b = GameTree::build_subgame(
+            Street::Flop,
+            100.0,
+            [50.0, 50.0],
+            250.0,
+            &[vec![0.5]],
+            None,
+        );
+        build_boundary_mapping(&tree_a, &tree_b);
     }
 }

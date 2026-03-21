@@ -22,7 +22,7 @@ pub mod cfv_subgame_solver;
 
 // Re-export subgame types at module level for convenience.
 pub use subgame::SubgameConfig;
-pub use subgame_cfr::{SubgameCfrSolver, SubgameHands, SubgameStrategy, compute_combo_equities};
+pub use subgame_cfr::{SubgameCfrSolver, SubgameHands, SubgameStrategy, compute_combo_equities, build_boundary_mapping};
 pub use cfv_subgame_solver::{CfvSubgameSolver, ExactRiverEvaluator, LeafEvaluator};
 
 use serde::{Deserialize, Serialize};
