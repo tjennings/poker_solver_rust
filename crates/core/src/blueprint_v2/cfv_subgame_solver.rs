@@ -592,14 +592,32 @@ impl CfvSubgameSolver {
 
                 // Update regrets and strategy sums at traverser's nodes.
                 if is_traverser {
+                    // Compute total non-blocked opponent reach per hero combo.
+                    // This is the correct CFR regret weight: how likely the
+                    // opponent is to be at this node given hero holds combo i.
+                    // Using reach_opponent[i] (one combo's reach) was wrong —
+                    // it needs to be the SUM of all non-blocked opponent combos.
+                    let combos = &self.hands.combos;
+                    let opp_reach_totals: Vec<f64> = (0..n)
+                        .into_par_iter()
+                        .map(|i| {
+                            let hero = combos[i];
+                            reach_opponent.iter().enumerate()
+                                .filter(|&(j, &r)| r > 0.0 && !cards_overlap(hero, combos[j]))
+                                .map(|(_, &r)| r)
+                                .sum()
+                        })
+                        .collect();
+
                     for i in 0..n {
                         let base = node_base + i * num_actions;
                         let node_val = cfv_buf[out_start + i];
+                        let opp_total = opp_reach_totals[i];
                         for a in 0..num_actions {
                             let child_idx = children_buf[a] as usize;
                             let child_val = cfv_buf[child_idx * n + i];
                             self.regret_sum[base + a] +=
-                                reach_opponent[i] * (child_val - node_val);
+                                opp_total * (child_val - node_val);
                             self.strategy_sum[base + a] +=
                                 reach_traverser[i] * snapshot[base + a];
                         }
