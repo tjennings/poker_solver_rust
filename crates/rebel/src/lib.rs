@@ -7,4 +7,6 @@ pub mod blueprint_sampler;
 pub mod data_buffer;
 pub mod generate;
 pub mod solver;
+pub mod self_play;
+pub mod subgame_solve;
 pub mod training;

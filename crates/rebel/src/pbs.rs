@@ -13,6 +13,7 @@ pub fn combo_index(c1: u8, c2: u8) -> usize {
 
 /// Public Belief State — the minimal game state visible to both players
 /// in a ReBeL subgame.
+#[derive(Clone)]
 ///
 /// Contains the public board cards, pot/stack geometry, and per-player
 /// reach probabilities over all 1326 hole-card combos.
