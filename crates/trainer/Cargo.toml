@@ -9,6 +9,7 @@ description = "CLI tool for training poker blueprint strategies"
 [dependencies]
 poker-solver-core = { path = "../core" }
 range-solver = { path = "../range-solver" }
+rebel = { path = "../rebel" }
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 ratatui = "0.29"

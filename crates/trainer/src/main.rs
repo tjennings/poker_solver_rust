@@ -155,6 +155,13 @@ enum Commands {
         #[arg(long)]
         verbose: bool,
     },
+    /// Generate PBS training data from blueprint play for ReBeL offline seeding
+    #[command(name = "rebel-seed")]
+    RebelSeed {
+        /// Path to ReBeL YAML configuration file
+        #[arg(short, long)]
+        config: PathBuf,
+    },
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -923,7 +930,124 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("no matching .buckets files found in both directories");
             }
         }
+        Commands::RebelSeed { config } => {
+            run_rebel_seed(&config)?;
+        }
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ReBeL seed data generation
+// ---------------------------------------------------------------------------
+
+fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
+    use poker_solver_core::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
+    use poker_solver_core::blueprint_v2::game_tree::GameTree;
+    use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
+
+    let yaml = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("Failed to read config: {e}"))?;
+    let rebel_config: rebel::config::RebelConfig = serde_yaml::from_str(&yaml)
+        .map_err(|e| format!("Failed to parse config: {e}"))?;
+
+    // Create output directory if needed
+    std::fs::create_dir_all(&rebel_config.output_dir)
+        .map_err(|e| format!("Failed to create output dir: {e}"))?;
+
+    // Load blueprint strategy
+    let strategy_path = std::path::Path::new(&rebel_config.blueprint_path).join("strategy.bin");
+    eprintln!("Loading blueprint from {}...", strategy_path.display());
+    let strategy = BlueprintV2Strategy::load(&strategy_path)
+        .map_err(|e| format!("Failed to load blueprint: {e}"))?;
+
+    // Load bucket files from cluster directory
+    eprintln!("Loading bucket files from {}...", rebel_config.cluster_dir);
+    let cluster_dir = std::path::Path::new(&rebel_config.cluster_dir);
+    let bucket_names = ["preflop.buckets", "flop.buckets", "turn.buckets", "river.buckets"];
+    let mut bucket_files: [Option<BucketFile>; 4] = [None, None, None, None];
+    for (i, name) in bucket_names.iter().enumerate() {
+        let path = cluster_dir.join(name);
+        if path.exists() {
+            match BucketFile::load(&path) {
+                Ok(bf) => {
+                    eprintln!(
+                        "  Loaded {}: {} boards, {} combos/board, {} buckets",
+                        name, bf.header.board_count, bf.header.combos_per_board, bf.header.bucket_count,
+                    );
+                    bucket_files[i] = Some(bf);
+                }
+                Err(e) => eprintln!("  Warning: failed to load {}: {e}", path.display()),
+            }
+        }
+    }
+
+    let bucket_counts = [
+        strategy.bucket_counts[0],
+        strategy.bucket_counts[1],
+        strategy.bucket_counts[2],
+        strategy.bucket_counts[3],
+    ];
+    let buckets = AllBuckets::new(bucket_counts, bucket_files);
+
+    // Auto-detect per-flop bucket files
+    let buckets = {
+        let per_flop_marker = cluster_dir.join("flop_0000.buckets");
+        if per_flop_marker.exists() {
+            eprintln!("  Detected per-flop bucket files in {}", cluster_dir.display());
+            buckets.with_per_flop_dir(cluster_dir.to_path_buf())
+        } else {
+            buckets
+        }
+    };
+
+    // Build game tree from blueprint config
+    let bp_config_path = std::path::Path::new(&rebel_config.blueprint_path).join("config.yaml");
+    eprintln!("Loading blueprint config from {}...", bp_config_path.display());
+    let bp_config = load_config(std::path::Path::new(&rebel_config.blueprint_path))
+        .map_err(|e| format!("Failed to load blueprint config: {e}"))?;
+    let tree = GameTree::build(
+        bp_config.game.stack_depth,
+        bp_config.game.small_blind,
+        bp_config.game.big_blind,
+        &bp_config.action_abstraction.preflop,
+        &bp_config.action_abstraction.flop,
+        &bp_config.action_abstraction.turn,
+        &bp_config.action_abstraction.river,
+    );
+
+    // Create buffer
+    let buffer_path = std::path::Path::new(&rebel_config.output_dir)
+        .join(&rebel_config.buffer.path);
+    eprintln!("Creating buffer at {}...", buffer_path.display());
+    let buffer = std::sync::Mutex::new(
+        rebel::data_buffer::DiskBuffer::create(&buffer_path, rebel_config.buffer.max_records)
+            .map_err(|e| format!("Failed to create buffer: {e}"))?
+    );
+
+    // Generate PBSs
+    eprintln!(
+        "Generating {} hands with {} threads...",
+        rebel_config.seed.num_hands, rebel_config.seed.threads
+    );
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(rebel_config.seed.threads)
+        .build()
+        .map_err(|e| format!("Failed to create thread pool: {e}"))?;
+
+    let pbs_count = pool.install(|| {
+        rebel::generate::generate_pbs(&strategy, &tree, &buckets, &rebel_config, &buffer)
+    });
+
+    let buf = buffer.lock().unwrap();
+    eprintln!(
+        "Done! Generated {} PBS snapshots, {} buffer records",
+        pbs_count,
+        buf.len()
+    );
 
     Ok(())
 }

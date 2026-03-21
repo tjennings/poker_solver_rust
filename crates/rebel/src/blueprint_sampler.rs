@@ -258,6 +258,7 @@ fn traverse<R: Rng>(
             street,
             actions,
             children,
+            ..
         } => {
             let player = *player;
             let street = *street;

@@ -1,0 +1,30 @@
+blueprint_path: "/path/to/trained/blueprint"
+cluster_dir: "/path/to/clusters"
+output_dir: "/tmp/rebel_output"
+
+game:
+  initial_stack: 400
+  small_blind: 1
+  big_blind: 2
+
+seed:
+  num_hands: 100000
+  seed: 42
+  threads: 16
+  solver_iterations: 1024
+  target_exploitability: 0.005
+  bet_sizes:
+    flop: [[0.33, 0.67, 1.0], [0.33, 0.67, 1.0]]
+    turn: [[0.5, 0.75, 1.0], [0.5, 0.75, 1.0]]
+    river: [[0.5, 0.75, 1.0], [0.5, 0.75, 1.0]]
+
+training:
+  hidden_layers: 7
+  hidden_size: 500
+  batch_size: 4096
+  epochs: 200
+  learning_rate: 0.0003
+
+buffer:
+  max_records: 12000000
+  path: "rebel_buffer.bin"
