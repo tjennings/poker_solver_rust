@@ -162,6 +162,40 @@ enum Commands {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Run ReBeL training: offline seeding then live self-play
+    #[command(name = "rebel-train")]
+    RebelTrain {
+        /// Path to ReBeL YAML configuration file
+        #[arg(short, long)]
+        config: PathBuf,
+
+        /// Skip offline seeding and start from an existing model
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Run offline seeding only (no self-play)
+        #[arg(long)]
+        offline_only: bool,
+    },
+    /// Evaluate a trained ReBeL model
+    #[command(name = "rebel-eval")]
+    RebelEval {
+        /// Path to ReBeL YAML configuration file
+        #[arg(short, long)]
+        config: PathBuf,
+
+        /// Path to trained model checkpoint
+        #[arg(long)]
+        model: String,
+
+        /// Evaluation mode: mse or h2h
+        #[arg(long, default_value = "mse")]
+        mode: String,
+
+        /// Number of hands for head-to-head evaluation
+        #[arg(long, default_value_t = 100000)]
+        num_hands: usize,
+    },
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -933,6 +967,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::RebelSeed { config } => {
             run_rebel_seed(&config)?;
         }
+        Commands::RebelTrain {
+            config,
+            model,
+            offline_only,
+        } => {
+            run_rebel_train(&config, model.as_deref(), offline_only)?;
+        }
+        Commands::RebelEval {
+            config,
+            model,
+            mode,
+            num_hands,
+        } => {
+            run_rebel_eval(&config, &model, &mode, num_hands)?;
+        }
     }
 
     Ok(())
@@ -1075,6 +1124,197 @@ fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
         exported,
         export_path.display()
     );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ReBeL training (offline seeding + optional self-play)
+// ---------------------------------------------------------------------------
+
+fn run_rebel_train(
+    config_path: &std::path::Path,
+    existing_model: Option<&str>,
+    offline_only: bool,
+) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
+    use poker_solver_core::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
+    use poker_solver_core::blueprint_v2::game_tree::GameTree;
+    use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
+
+    let yaml = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("Failed to read config: {e}"))?;
+    let rebel_config: rebel::config::RebelConfig = serde_yaml::from_str(&yaml)
+        .map_err(|e| format!("Failed to parse config: {e}"))?;
+
+    eprintln!("ReBeL Training Pipeline");
+    eprintln!("  Blueprint: {}", rebel_config.blueprint_path);
+    eprintln!("  Cluster dir: {}", rebel_config.cluster_dir);
+    eprintln!("  Output dir: {}", rebel_config.output_dir);
+    if let Some(model_path) = existing_model {
+        eprintln!("  Existing model: {model_path} (skipping offline seeding)");
+    }
+    if offline_only {
+        eprintln!("  Mode: offline seeding only (no self-play)");
+    }
+    eprintln!();
+
+    // Create output directory
+    std::fs::create_dir_all(&rebel_config.output_dir)
+        .map_err(|e| format!("Failed to create output dir: {e}"))?;
+
+    // Load blueprint strategy
+    let strategy_path = std::path::Path::new(&rebel_config.blueprint_path).join("strategy.bin");
+    eprintln!("Loading blueprint from {}...", strategy_path.display());
+    let strategy = BlueprintV2Strategy::load(&strategy_path)
+        .map_err(|e| format!("Failed to load blueprint: {e}"))?;
+
+    // Load bucket files
+    eprintln!("Loading bucket files from {}...", rebel_config.cluster_dir);
+    let cluster_dir = std::path::Path::new(&rebel_config.cluster_dir);
+    let bucket_names = ["preflop.buckets", "flop.buckets", "turn.buckets", "river.buckets"];
+    let mut bucket_files: [Option<BucketFile>; 4] = [None, None, None, None];
+    for (i, name) in bucket_names.iter().enumerate() {
+        let path = cluster_dir.join(name);
+        if path.exists() {
+            match BucketFile::load(&path) {
+                Ok(bf) => {
+                    eprintln!(
+                        "  Loaded {}: {} boards, {} combos/board, {} buckets",
+                        name, bf.header.board_count, bf.header.combos_per_board, bf.header.bucket_count,
+                    );
+                    bucket_files[i] = Some(bf);
+                }
+                Err(e) => eprintln!("  Warning: failed to load {}: {e}", path.display()),
+            }
+        }
+    }
+
+    let bucket_counts = [
+        strategy.bucket_counts[0],
+        strategy.bucket_counts[1],
+        strategy.bucket_counts[2],
+        strategy.bucket_counts[3],
+    ];
+    let buckets = AllBuckets::new(bucket_counts, bucket_files);
+
+    // Auto-detect per-flop bucket files
+    let buckets = {
+        let per_flop_marker = cluster_dir.join("flop_0000.buckets");
+        if per_flop_marker.exists() {
+            eprintln!("  Detected per-flop bucket files in {}", cluster_dir.display());
+            buckets.with_per_flop_dir(cluster_dir.to_path_buf())
+        } else {
+            buckets
+        }
+    };
+
+    // Build game tree from blueprint config
+    let bp_config_path = std::path::Path::new(&rebel_config.blueprint_path).join("config.yaml");
+    eprintln!("Loading blueprint config from {}...", bp_config_path.display());
+    let bp_config = load_config(std::path::Path::new(&rebel_config.blueprint_path))
+        .map_err(|e| format!("Failed to load blueprint config: {e}"))?;
+    let tree = GameTree::build(
+        bp_config.game.stack_depth,
+        bp_config.game.small_blind,
+        bp_config.game.big_blind,
+        &bp_config.action_abstraction.preflop,
+        &bp_config.action_abstraction.flop,
+        &bp_config.action_abstraction.turn,
+        &bp_config.action_abstraction.river,
+    );
+
+    // Step 1: Offline seeding (unless an existing model was provided)
+    let model_path = if let Some(model_path) = existing_model {
+        eprintln!("Skipping offline seeding — using existing model: {model_path}");
+        std::path::PathBuf::from(model_path)
+    } else {
+        eprintln!("\n--- Phase 1: Offline Seeding ---");
+        let result = rebel::orchestration::run_offline_seeding(
+            &rebel_config, &strategy, &tree, &buckets,
+        )?;
+        eprintln!(
+            "\nOffline seeding complete: {} total records, model at {}",
+            result.total_records,
+            result.model_path.display()
+        );
+        for sr in &result.per_street {
+            eprintln!(
+                "  {:?}: {} PBSs, {} solved, loss={:.6}",
+                sr.street,
+                sr.pbs_generated,
+                sr.records_solved,
+                sr.training_loss.unwrap_or(0.0)
+            );
+        }
+        result.model_path
+    };
+
+    // Step 2: Self-play (unless --offline-only)
+    if offline_only {
+        eprintln!("\nOffline-only mode — skipping self-play.");
+        eprintln!("Model saved at: {}", model_path.display());
+    } else {
+        eprintln!("\n--- Phase 2: Self-Play Training ---");
+        eprintln!("Self-play training loop not yet implemented.");
+        eprintln!("Model at: {}", model_path.display());
+        // TODO (Phase 5): Load model as LeafEvaluator, build SelfPlayConfig
+        // from rebel_config, create buffer, call self_play_training_loop(),
+        // then retrain model on accumulated data.
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ReBeL evaluation
+// ---------------------------------------------------------------------------
+
+fn run_rebel_eval(
+    config_path: &std::path::Path,
+    model_path: &str,
+    mode: &str,
+    num_hands: usize,
+) -> Result<(), Box<dyn Error>> {
+    let yaml = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("Failed to read config: {e}"))?;
+    let rebel_config: rebel::config::RebelConfig = serde_yaml::from_str(&yaml)
+        .map_err(|e| format!("Failed to parse config: {e}"))?;
+
+    eprintln!("ReBeL Evaluation");
+    eprintln!("  Config: {}", config_path.display());
+    eprintln!("  Model: {model_path}");
+    eprintln!("  Mode: {mode}");
+    if mode == "h2h" {
+        eprintln!("  Num hands: {num_hands}");
+    }
+    eprintln!();
+
+    // Verify model exists
+    let model_file = std::path::Path::new(model_path);
+    if !model_file.exists() {
+        return Err(format!("Model not found at: {model_path}").into());
+    }
+
+    match mode {
+        "mse" => {
+            eprintln!("MSE evaluation not yet implemented.");
+            eprintln!("This will compare value net predictions against exact subgame solutions.");
+            eprintln!(
+                "  Network: {} hidden layers x {} units",
+                rebel_config.training.hidden_layers, rebel_config.training.hidden_size
+            );
+        }
+        "h2h" => {
+            eprintln!("Head-to-head evaluation not yet implemented.");
+            eprintln!(
+                "This will play {num_hands} hands of ReBeL vs blueprint and report exploitability."
+            );
+        }
+        other => {
+            return Err(format!("Unknown evaluation mode: '{other}'. Use 'mse' or 'h2h'.").into());
+        }
+    }
 
     Ok(())
 }
