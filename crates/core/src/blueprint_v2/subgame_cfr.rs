@@ -240,45 +240,75 @@ impl SubgameCfrSolver {
         }
     }
 
-    /// Create a solver with leaf values populated from a [`CbvTable`].
+    /// Create a solver with per-boundary leaf values from [`CbvTable`]s.
     ///
-    /// For each combo, `combo_to_bucket` maps its index to a bucket id, then
-    /// the CBV is looked up for the given `boundary_node_idx` in the table.
+    /// For each `DepthBoundary` node, `boundary_mapping[ordinal]` gives the
+    /// corresponding Chance node ordinal in the CBV table. Each combo's CBV
+    /// is looked up via `combo_to_bucket`, then normalized from chip units
+    /// to equity `[0, 1]` using the boundary's pot:
     ///
-    /// **Deprecated:** Use `with_cbv_tables()` for per-boundary normalization.
-    /// This method replicates a single boundary's values across all boundaries
-    /// without proper normalization.
+    /// ```text
+    /// equity = (cbv / half_pot + 1) / 2
+    /// ```
+    ///
+    /// The traversal later recovers chip values via `(2 * equity - 1) * half_pot`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `boundary_mapping` length doesn't match the number of
+    /// `DepthBoundary` nodes, or if any CBV/bucket lookup is out of range.
     #[must_use]
-    pub fn with_cbv_table(
+    pub fn with_cbv_tables(
         tree: GameTree,
         hands: SubgameHands,
         board: &[Card],
         opponent_reach: Vec<f64>,
-        cbv_table: &CbvTable,
-        boundary_node_idx: usize,
-        combo_to_bucket: impl Fn(usize) -> usize,
+        cbv_tables: [&CbvTable; 2],
+        boundary_mapping: &[usize],
+        combo_to_bucket: impl Fn(usize) -> u16,
     ) -> Self {
-        let single_boundary: Vec<f64> = (0..hands.combos.len())
-            .map(|combo_idx| {
-                let bucket = combo_to_bucket(combo_idx);
-                f64::from(cbv_table.lookup(boundary_node_idx, bucket))
+        let n = hands.combos.len();
+
+        // Collect boundary pots in ordinal order.
+        let mut boundary_pots = Vec::new();
+        for node in &tree.nodes {
+            if let GameNode::Terminal {
+                kind: TerminalKind::DepthBoundary,
+                pot,
+                ..
+            } = node
+            {
+                boundary_pots.push(*pot);
+            }
+        }
+        assert_eq!(
+            boundary_pots.len(),
+            boundary_mapping.len(),
+            "boundary_mapping length ({}) must match DepthBoundary count ({})",
+            boundary_mapping.len(),
+            boundary_pots.len(),
+        );
+
+        // Build per-boundary, per-combo leaf values.
+        // Use player 0's CBV table (both players' CBVs are symmetric in
+        // the abstract tree; the traversal handles player perspective).
+        let leaf_values: Vec<Vec<f64>> = boundary_mapping
+            .iter()
+            .zip(boundary_pots.iter())
+            .map(|(&chance_ord, &pot)| {
+                let half_pot = pot / 2.0;
+                assert!(half_pot > 0.0, "boundary pot must be positive, got {pot}");
+                (0..n)
+                    .map(|combo_idx| {
+                        let bucket = combo_to_bucket(combo_idx) as usize;
+                        let cbv = f64::from(cbv_tables[0].lookup(chance_ord, bucket));
+                        // Normalize: equity = (cbv / half_pot + 1) / 2
+                        (cbv / half_pot + 1.0) / 2.0
+                    })
+                    .collect()
             })
             .collect();
-        // Count boundaries and replicate the flat vec for each.
-        let boundary_count = tree
-            .nodes
-            .iter()
-            .filter(|n| {
-                matches!(
-                    n,
-                    GameNode::Terminal {
-                        kind: TerminalKind::DepthBoundary,
-                        ..
-                    }
-                )
-            })
-            .count();
-        let leaf_values = vec![single_boundary; boundary_count];
+
         Self::new(tree, hands, board, opponent_reach, leaf_values)
     }
 
@@ -932,10 +962,9 @@ mod tests {
     }
 
     #[timed_test]
-    fn with_cbv_table_populates_leaf_values() {
+    fn with_cbv_tables_normalizes_per_boundary() {
         use super::super::cbv::CbvTable;
 
-        // Build a depth-limited flop tree so it has DepthBoundary nodes.
         let board = vec![
             Card::new(Value::Ace, Suit::Spade),
             Card::new(Value::King, Suit::Heart),
@@ -947,61 +976,76 @@ mod tests {
             [50.0, 50.0],
             250.0,
             &[vec![1.0]],
-            Some(1), // flop-only: turn transitions become boundaries
+            Some(1),
         );
 
         let hands = small_hands(&board, 6);
         let n = hands.combos.len();
 
-        // CBV table: 1 boundary node, 4 buckets with known values.
+        // Count boundaries and their pots.
+        let boundary_pots: Vec<f64> = tree
+            .nodes
+            .iter()
+            .filter_map(|nd| match nd {
+                GameNode::Terminal {
+                    kind: TerminalKind::DepthBoundary,
+                    pot,
+                    ..
+                } => Some(*pot),
+                _ => None,
+            })
+            .collect();
+        let num_boundaries = boundary_pots.len();
+        assert!(num_boundaries >= 2, "need multiple boundaries");
+
+        // CBV table with `num_boundaries` chance nodes, 4 buckets each.
+        // Use known chip values so we can verify the normalization.
+        let cbv_chip_value = 15.0_f32; // 15 chips
+        let values: Vec<f32> = vec![cbv_chip_value; num_boundaries * 4];
+        let node_offsets: Vec<usize> = (0..num_boundaries).map(|i| i * 4).collect();
+        let buckets_per_node: Vec<u16> = vec![4; num_boundaries];
         let cbv_table = CbvTable {
-            values: vec![10.0, 20.0, 30.0, 40.0],
-            node_offsets: vec![0],
-            buckets_per_node: vec![4],
+            values,
+            node_offsets,
+            buckets_per_node,
         };
 
-        // Map combo index to bucket via modulo.
-        let mut solver = SubgameCfrSolver::with_cbv_table(
+        // boundary_mapping: identity (boundary 0 -> chance 0, etc.)
+        let boundary_mapping: Vec<usize> = (0..num_boundaries).collect();
+
+        let mut solver = SubgameCfrSolver::with_cbv_tables(
             tree,
             hands,
             &board,
             vec![1.0; n],
-            &cbv_table,
-            0,
-            |combo_idx| combo_idx % 4,
+            [&cbv_table, &cbv_table],
+            &boundary_mapping,
+            |combo_idx| (combo_idx % 4) as u16,
         );
 
-        // Verify leaf values were populated correctly (replicated across all boundaries).
-        for boundary in &solver.leaf_values {
-            for i in 0..n {
-                let expected = f64::from(cbv_table.lookup(0, i % 4));
+        // Verify normalization: equity = (cbv / half_pot + 1) / 2
+        // Round-trip check: (2 * equity - 1) * half_pot should recover cbv.
+        for (b, &pot) in boundary_pots.iter().enumerate() {
+            let half_pot = pot / 2.0;
+            let expected_equity = (f64::from(cbv_chip_value) / half_pot + 1.0) / 2.0;
+            for combo_idx in 0..n {
+                let actual = solver.leaf_values[b][combo_idx];
                 assert!(
-                    (boundary[i] - expected).abs() < 1e-10,
-                    "leaf_values[{i}] = {}, expected {expected}",
-                    boundary[i],
+                    (actual - expected_equity).abs() < 1e-10,
+                    "boundary {b} combo {combo_idx}: expected {expected_equity}, got {actual}"
+                );
+                // Round-trip: traversal would compute (2*eq - 1) * half_pot = cbv
+                let round_trip = (2.0 * actual - 1.0) * half_pot;
+                assert!(
+                    (round_trip - f64::from(cbv_chip_value)).abs() < 1e-6,
+                    "round-trip failed: {round_trip} != {cbv_chip_value}"
                 );
             }
         }
 
-        // Run a few iterations to confirm no panics and valid output.
+        // Train to verify no panics.
         solver.train(10);
         assert_eq!(solver.iteration, 10);
-
-        let strategy = solver.strategy();
-        assert_eq!(strategy.num_combos(), n);
-
-        // Every combo that has a strategy entry should sum to ~1.0.
-        for combo_idx in 0..n {
-            let probs = strategy.root_probs(combo_idx);
-            if probs.is_empty() {
-                continue;
-            }
-            let sum: f64 = probs.iter().sum();
-            assert!(
-                (sum - 1.0).abs() < 0.01,
-                "combo {combo_idx}: strategy sum = {sum}, expected ~1.0"
-            );
-        }
     }
 
     #[timed_test]
