@@ -29,15 +29,15 @@ pub struct SolveConfig {
 
 /// Result of solving a single river PBS.
 pub struct SolveResult {
-    /// Counterfactual values for OOP, indexed by combo (0..1326).
+    /// Pot-relative counterfactual values for OOP, indexed by combo (0..1326).
     /// Board-blocked combos have CFV = 0.0.
     pub oop_cfvs: [f32; NUM_COMBOS],
-    /// Counterfactual values for IP, indexed by combo (0..1326).
+    /// Pot-relative counterfactual values for IP, indexed by combo (0..1326).
     /// Board-blocked combos have CFV = 0.0.
     pub ip_cfvs: [f32; NUM_COMBOS],
-    /// Weighted game value for OOP: sum(cfv[i] * reach[i]) / sum(reach[i]).
+    /// Weighted game value for OOP: sum(cfv[i] * reach[i]).
     pub oop_game_value: f32,
-    /// Weighted game value for IP: sum(cfv[i] * reach[i]) / sum(reach[i]).
+    /// Weighted game value for IP: sum(cfv[i] * reach[i]).
     pub ip_game_value: f32,
     /// Final exploitability returned by the solver.
     pub exploitability: f32,
@@ -52,6 +52,10 @@ pub struct SolveResult {
 /// Board-blocked combos get CFV = 0.0.
 /// If `effective_stack <= 0`, returns an error.
 pub fn solve_river_pbs(pbs: &Pbs, config: &SolveConfig) -> Result<SolveResult, String> {
+    if pbs.pot <= 0 {
+        return Err("pot must be positive for solver".into());
+    }
+
     if pbs.effective_stack <= 0 {
         return Err("effective_stack must be positive for solver".into());
     }
@@ -106,11 +110,13 @@ pub fn solve_river_pbs(pbs: &Pbs, config: &SolveConfig) -> Result<SolveResult, S
     let oop_hands = game.private_cards(0);
     let ip_hands = game.private_cards(1);
 
+    let pot = pbs.pot as f32;
+
     let mut oop_cfvs = [0.0f32; NUM_COMBOS];
     let mut ip_cfvs = [0.0f32; NUM_COMBOS];
 
-    map_evs_to_combos(&raw_oop, oop_hands, &mut oop_cfvs);
-    map_evs_to_combos(&raw_ip, ip_hands, &mut ip_cfvs);
+    map_evs_to_combos(&raw_oop, oop_hands, pot, &mut oop_cfvs);
+    map_evs_to_combos(&raw_ip, ip_hands, pot, &mut ip_cfvs);
 
     let oop_game_value = weighted_game_value(&oop_cfvs, &pbs.reach_probs[0]);
     let ip_game_value = weighted_game_value(&ip_cfvs, &pbs.reach_probs[1]);
@@ -124,29 +130,30 @@ pub fn solve_river_pbs(pbs: &Pbs, config: &SolveConfig) -> Result<SolveResult, S
     })
 }
 
-/// Map solver EVs (indexed by private_cards order) into the canonical 1326 layout.
-fn map_evs_to_combos(raw_evs: &[f32], hands: &[(Card, Card)], out: &mut [f32; NUM_COMBOS]) {
+/// Map solver EVs (indexed by private_cards order) into the canonical 1326 layout,
+/// dividing by pot to produce pot-relative values.
+fn map_evs_to_combos(
+    raw_evs: &[f32],
+    hands: &[(Card, Card)],
+    pot: f32,
+    out: &mut [f32; NUM_COMBOS],
+) {
     for (i, &(c1, c2)) in hands.iter().enumerate() {
         let idx = card_pair_to_index(c1, c2);
-        out[idx] = raw_evs[i];
+        out[idx] = raw_evs[i] / pot;
     }
 }
 
-/// Compute range-weighted game value: sum(cfv[i] * reach[i]) / sum(reach[i]).
+/// Compute range-weighted game value: sum(cfv[i] * reach[i]).
 ///
-/// Returns 0.0 if the total reach is zero (all combos blocked).
+/// This is a plain weighted sum with no normalization, matching the cfvnet
+/// training pipeline convention.
 pub fn weighted_game_value(cfvs: &[f32; NUM_COMBOS], reach: &[f32; NUM_COMBOS]) -> f32 {
     let mut weighted_sum = 0.0f64;
-    let mut total_reach = 0.0f64;
     for i in 0..NUM_COMBOS {
-        let r = reach[i] as f64;
-        weighted_sum += cfvs[i] as f64 * r;
-        total_reach += r;
+        weighted_sum += cfvs[i] as f64 * reach[i] as f64;
     }
-    if total_reach == 0.0 {
-        return 0.0;
-    }
-    (weighted_sum / total_reach) as f32
+    weighted_sum as f32
 }
 
 #[cfg(test)]
@@ -199,11 +206,11 @@ mod tests {
         cfvs[2] = 30.0;
         reach[2] = 2.0;
 
-        // Expected: (10*1 + 20*1 + 30*2) / (1 + 1 + 2) = 90/4 = 22.5
+        // Expected: 10*1 + 20*1 + 30*2 = 90.0 (plain weighted sum, no normalization)
         let gv = weighted_game_value(&cfvs, &reach);
         assert!(
-            (gv - 22.5).abs() < 1e-4,
-            "expected 22.5, got {}",
+            (gv - 90.0).abs() < 1e-4,
+            "expected 90.0, got {}",
             gv
         );
     }
@@ -323,6 +330,24 @@ mod tests {
         let config = test_solve_config();
         let result = solve_river_pbs(&pbs, &config);
         assert!(result.is_err(), "expected error for zero effective_stack");
+    }
+
+    #[test]
+    fn test_solve_river_pbs_zero_pot_error() {
+        let board = test_board();
+        let pbs = Pbs::new_uniform(board, 0, 100);
+        let config = test_solve_config();
+        let result = solve_river_pbs(&pbs, &config);
+        assert!(result.is_err(), "expected error for zero pot");
+    }
+
+    #[test]
+    fn test_solve_river_pbs_negative_pot_error() {
+        let board = test_board();
+        let pbs = Pbs::new_uniform(board, -50, 100);
+        let config = test_solve_config();
+        let result = solve_river_pbs(&pbs, &config);
+        assert!(result.is_err(), "expected error for negative pot");
     }
 
     #[test]
