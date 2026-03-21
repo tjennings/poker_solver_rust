@@ -1963,6 +1963,9 @@ pub struct PreflopRanges {
     pub ip_bet_sizes: String,
     /// IP raise sizes for flop in range-solver format.
     pub ip_raise_sizes: String,
+    /// Abstract tree node index at the postflop starting position.
+    /// Used by the CBV evaluator to navigate the abstract tree.
+    pub abstract_node_idx: u32,
     /// Rake rate (0.0–1.0 fraction of pot).
     pub rake_rate: f64,
     /// Rake cap in chips.
@@ -2228,6 +2231,7 @@ pub fn get_preflop_ranges_core(
         ip_raise_sizes,
         rake_rate: config.game.rake_rate,
         rake_cap: config.game.rake_cap,
+        abstract_node_idx: node_idx,
     })
 }
 

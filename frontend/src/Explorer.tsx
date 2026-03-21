@@ -742,6 +742,7 @@ export default function Explorer() {
               blueprint_dir: globalConfig.blueprint_dir || '',
               rake_rate: ranges.rake_rate,
               rake_cap: ranges.rake_cap,
+              abstract_node_idx: ranges.abstract_node_idx,
             };
             setBlueprintPostflopConfig(bpConfig);
             blueprintPostflopConfigRef.current = bpConfig;

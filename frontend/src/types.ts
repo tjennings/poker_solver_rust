@@ -156,6 +156,7 @@ export interface BlueprintConfig {
   board?: string[];
   rake_rate: number;
   rake_cap: number;
+  abstract_node_idx?: number;
 }
 
 // Postflop solver types
@@ -173,6 +174,7 @@ export interface PostflopConfig {
   rake_cap: number;
   flop_combo_threshold: number;
   turn_combo_threshold: number;
+  abstract_node_idx?: number;
 }
 
 export interface PostflopConfigSummary {
@@ -259,6 +261,7 @@ export interface PreflopRanges {
   ip_raise_sizes: string;
   rake_rate: number;
   rake_cap: number;
+  abstract_node_idx: number;
 }
 
 export interface CacheInfo {

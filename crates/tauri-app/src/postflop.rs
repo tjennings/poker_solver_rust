@@ -47,6 +47,9 @@ pub struct PostflopConfig {
     /// Max live combos on turn before switching to depth-limited solver.
     #[serde(default = "default_turn_combo_threshold")]
     pub turn_combo_threshold: usize,
+    /// Abstract tree node index at the postflop start (for CBV boundary mapping).
+    #[serde(default)]
+    pub abstract_node_idx: Option<u32>,
 }
 
 fn default_flop_combo_threshold() -> usize { 200 }
@@ -67,6 +70,7 @@ impl Default for PostflopConfig {
             rake_cap: 0.0,
             flop_combo_threshold: default_flop_combo_threshold(),
             turn_combo_threshold: default_turn_combo_threshold(),
+            abstract_node_idx: None,
         }
     }
 }
@@ -372,8 +376,17 @@ impl BlueprintCbvEvaluator {
         hands: &SubgameHands,
         board: &[RsPokerCard],
         street: V2Street,
+        abstract_start_node: u32,
     ) -> Self {
-        let boundary_mapping = build_boundary_mapping(subgame_tree, &ctx.abstract_tree);
+        // Build a "sub-view" of the abstract tree rooted at the postflop
+        // starting node. build_boundary_mapping walks from both roots,
+        // so we create a wrapper that starts at the correct position.
+        let abstract_subtree = GameTree {
+            nodes: ctx.abstract_tree.nodes.clone(),
+            root: abstract_start_node,
+            blinds: ctx.abstract_tree.blinds,
+        };
+        let boundary_mapping = build_boundary_mapping(subgame_tree, &abstract_subtree);
 
         // Collect boundary pots in ordinal order.
         let boundary_pots: Vec<f64> = subgame_tree.nodes.iter().filter_map(|n| match n {
@@ -446,6 +459,7 @@ pub fn build_subgame_solver(
     _ip_weights: &[f32],
     _player: usize,
     cbv_context: Option<&CbvContext>,
+    abstract_node_idx: Option<u32>,
 ) -> Result<(CfvSubgameSolver, SubgameHands, Vec<ActionInfo>, GameTree, f64, f64), String> {
     let street = match board_cards.len() {
         3 => V2Street::Flop,
@@ -482,9 +496,9 @@ pub fn build_subgame_solver(
         _ => return Err("Subgame tree root is not a decision node".to_string()),
     };
 
-    let evaluator: Box<dyn LeafEvaluator> = if let Some(ctx) = cbv_context {
-        eprintln!("[subgame] using BlueprintCbvEvaluator for depth boundaries");
-        Box::new(BlueprintCbvEvaluator::new(&tree, ctx, &hands, board_cards, street))
+    let evaluator: Box<dyn LeafEvaluator> = if let (Some(ctx), Some(abs_node)) = (cbv_context, abstract_node_idx) {
+        eprintln!("[subgame] using BlueprintCbvEvaluator (abstract_node={abs_node})");
+        Box::new(BlueprintCbvEvaluator::new(&tree, ctx, &hands, board_cards, street, abs_node))
     } else {
         eprintln!("[subgame] using EquityLeafEvaluator (no CBV context)");
         Box::new(EquityLeafEvaluator)
@@ -1266,6 +1280,7 @@ fn solve_depth_limited(
 
     let pot = config.pot;
     let eff_stack = config.effective_stack;
+    let abstract_node_idx = config.abstract_node_idx;
 
     let oop_w = filtered_oop.clone().unwrap_or_else(|| {
         let range: Range = config.oop_range.parse().unwrap_or_default();
@@ -1289,6 +1304,7 @@ fn solve_depth_limited(
             &ip_w,
             player,
             cbv_context.as_deref(),
+            abstract_node_idx,
         ) {
             Ok((mut solver, hands, action_infos, tree, initial_pot, starting_stack)) => {
                 // Helper closure to build matrix from current strategy.
@@ -2560,6 +2576,7 @@ mod tests {
             &ip_w,
             0,
             None,
+            None,
         );
         assert!(result.is_ok(), "build_subgame_solver failed: {:?}", result.err());
 
@@ -2613,6 +2630,7 @@ mod tests {
             &oop_w,
             &ip_w,
             0,
+            None,
             None,
         );
         assert!(result.is_ok());

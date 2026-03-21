@@ -59,6 +59,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         rake_cap: blueprintConfig.rake_cap,
         flop_combo_threshold: flopThreshold,
         turn_combo_threshold: turnThreshold,
+        abstract_node_idx: blueprintConfig.abstract_node_idx,
       };
     }
     return {
