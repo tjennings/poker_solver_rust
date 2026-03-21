@@ -16,6 +16,7 @@ use poker_solver_core::abstraction::isomorphism::{CanonicalBoard, SuitMapping};
 use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint_v2::bundle::{self as v2_bundle, BlueprintV2Strategy};
+use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode as V2GameNode, GameTree as V2GameTree, TreeAction};
 use poker_solver_core::hand_class::classify;
@@ -80,6 +81,9 @@ enum StrategySource {
         tree: Box<V2GameTree>,
         /// Arena-index to decision-node-index mapping.
         decision_map: Vec<u32>,
+        /// Precomputed CBV tables for depth-limited subgame solving.
+        /// `None` if the bundle doesn't include CBV files.
+        cbv_tables: Option<[CbvTable; 2]>,
     },
 }
 
@@ -274,7 +278,7 @@ pub async fn load_blueprint_v2_core(
     dir_path: String,
 ) -> Result<BundleInfo, String> {
     let dir = PathBuf::from(&dir_path);
-    let (config, strategy) = tokio::task::spawn_blocking(move || {
+    let (config, strategy, cbv_tables) = tokio::task::spawn_blocking(move || {
         let cfg = v2_bundle::load_config(&dir)
             .map_err(|e| format!("Failed to load config.yaml: {e}"))?;
 
@@ -308,7 +312,30 @@ pub async fn load_blueprint_v2_core(
         let strat = BlueprintV2Strategy::load(&strat_path)
             .map_err(|e| format!("Failed to load strategy.bin: {e}"))?;
 
-        Ok::<_, String>((cfg, strat))
+        // Load CBV tables if present. Search the same directory as strategy.bin,
+        // then the bundle root, then the latest snapshot.
+        let strat_dir = strat_path.parent().unwrap_or(&dir);
+        let cbv_dir = if strat_dir.join("cbv_p0.bin").exists() {
+            strat_dir.to_path_buf()
+        } else if dir.join("cbv_p0.bin").exists() {
+            dir.clone()
+        } else {
+            dir.clone() // fallback; will check existence below
+        };
+
+        let cbv_tables = if cbv_dir.join("cbv_p0.bin").exists()
+            && cbv_dir.join("cbv_p1.bin").exists()
+        {
+            let p0 = CbvTable::load(&cbv_dir.join("cbv_p0.bin"))
+                .map_err(|e| format!("Failed to load cbv_p0.bin: {e}"))?;
+            let p1 = CbvTable::load(&cbv_dir.join("cbv_p1.bin"))
+                .map_err(|e| format!("Failed to load cbv_p1.bin: {e}"))?;
+            Some([p0, p1])
+        } else {
+            None
+        };
+
+        Ok::<_, String>((cfg, strat, cbv_tables))
     })
     .await
     .map_err(|e| format!("Load task panicked: {e}"))??;
@@ -342,6 +369,7 @@ pub async fn load_blueprint_v2_core(
         strategy: Box::new(strategy),
         tree: Box::new(tree),
         decision_map,
+        cbv_tables,
     });
     state.bucket_cache.write().clear();
     *state.suit_mapping.write() = None;
@@ -491,6 +519,7 @@ pub fn get_strategy_matrix_core(
             strategy,
             tree,
             decision_map,
+            ..
         } => get_strategy_matrix_v2(config, strategy, tree, decision_map, &position),
     }
 }
@@ -1954,6 +1983,7 @@ pub fn get_preflop_ranges_core(
             strategy,
             tree,
             decision_map,
+            ..
         } => (config, strategy, tree, decision_map),
         _ => return Err("get_preflop_ranges requires a BlueprintV2 source".to_string()),
     };
