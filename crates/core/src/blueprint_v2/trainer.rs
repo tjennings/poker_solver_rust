@@ -146,6 +146,9 @@ pub struct BlueprintTrainer {
     pub shared_iterations: Arc<AtomicU64>,
     /// Skip the bucket-file validation check in `train()`. Only for tests.
     pub skip_bucket_validation: bool,
+    /// Per-street bucket visit counts. `bucket_visits[street][bucket]` = number
+    /// of deals that mapped to this bucket. Updated atomically during training.
+    pub bucket_visits: [Vec<AtomicU64>; 4],
     /// When `true`, the training loop sleeps until unpaused.
     pub paused: Arc<AtomicBool>,
     /// When `true`, the training loop exits at the next iteration boundary.
@@ -259,6 +262,12 @@ impl BlueprintTrainer {
             deck,
             scenario_ev_tracker: ScenarioEvTracker::new(vec![]),
             skip_bucket_validation: false,
+            bucket_visits: [
+                (0..bucket_counts[0]).map(|_| AtomicU64::new(0)).collect(),
+                (0..bucket_counts[1]).map(|_| AtomicU64::new(0)).collect(),
+                (0..bucket_counts[2]).map(|_| AtomicU64::new(0)).collect(),
+                (0..bucket_counts[3]).map(|_| AtomicU64::new(0)).collect(),
+            ],
             shared_iterations: Arc::new(AtomicU64::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
             quit_requested: Arc::new(AtomicBool::new(false)),
@@ -444,6 +453,7 @@ impl BlueprintTrainer {
             let storage = &self.storage;
             let buckets_ref = &self.buckets;
             let ev_tracker = &self.scenario_ev_tracker;
+            let visit_counters = &self.bucket_visits;
 
             let rake_rate = self.config.game.rake_rate;
             let rake_cap = self.config.game.rake_cap;
@@ -454,6 +464,17 @@ impl BlueprintTrainer {
                 let mut rng = SmallRng::seed_from_u64(seed);
                 let deal = sample_deal_with_rng(&mut rng);
                 let buckets = buckets_ref.precompute_buckets(&deal);
+
+                // Count bucket visits (both players, all streets).
+                for player_buckets in &buckets {
+                    for (street, &bucket) in player_buckets.iter().enumerate() {
+                        if (bucket as usize) < visit_counters[street].len() {
+                            visit_counters[street][bucket as usize]
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+
                 let deal = DealWithBuckets { deal, buckets };
                 let mut stats = PruneStats::default();
 
@@ -969,6 +990,31 @@ impl BlueprintTrainer {
             );
         p0_cbvs.save(&snapshot_dir.join("cbv_p0.bin"))?;
         p1_cbvs.save(&snapshot_dir.join("cbv_p1.bin"))?;
+
+        // Write bucket visit counts.
+        {
+            let street_names = ["preflop", "flop", "turn", "river"];
+            let mut visit_json = String::from("{\n");
+            for (s, name) in street_names.iter().enumerate() {
+                let counts: Vec<u64> = self.bucket_visits[s]
+                    .iter()
+                    .map(|a| a.load(Ordering::Relaxed))
+                    .collect();
+                let total: u64 = counts.iter().sum();
+                let nonzero = counts.iter().filter(|&&c| c > 0).count();
+                let max = counts.iter().max().copied().unwrap_or(0);
+                let min_nonzero = counts.iter().filter(|&&c| c > 0).min().copied().unwrap_or(0);
+                eprintln!(
+                    "[bucket visits] {name}: {nonzero}/{} buckets visited, total={total}, min={min_nonzero}, max={max}",
+                    counts.len()
+                );
+                let _ = write!(visit_json, "  \"{name}\": {:?}", counts);
+                if s < 3 { visit_json.push(','); }
+                visit_json.push('\n');
+            }
+            visit_json.push('}');
+            std::fs::write(snapshot_dir.join("bucket_visits.json"), visit_json)?;
+        }
 
         // Write per-hand chip EV averages with sample counts (averaged across both positions
         // for backward compatibility with existing JSON consumers).
