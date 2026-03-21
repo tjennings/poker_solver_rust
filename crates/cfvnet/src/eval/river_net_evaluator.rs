@@ -17,7 +17,7 @@ use crate::model::network::{CfvNet, DECK_SIZE, INPUT_SIZE, NUM_RANKS, OUTPUT_SIZ
 ///
 /// Range-solver encoding: `card = 4 * rank + suit`
 /// where rank Two=0..Ace=12, suit Club=0, Diamond=1, Heart=2, Spade=3.
-fn rs_card_to_u8(card: Card) -> u8 {
+pub fn rs_card_to_u8(card: Card) -> u8 {
     let rank = card.value as u8;
     let suit = match card.suit {
         Suit::Club => 0,

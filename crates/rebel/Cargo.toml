@@ -18,6 +18,7 @@ rs_poker.workspace = true
 rand = "0.9"
 rand_chacha = "0.9"
 memmap2 = "0.9"
+burn = { version = "0.16", features = ["ndarray"] }
 
 [dev-dependencies]
 tempfile = "3"
