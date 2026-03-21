@@ -874,6 +874,11 @@ fn walk_trees_lockstep(
         // Both are terminals (Fold or Showdown) -- nothing to map.
         (GameNode::Terminal { .. }, GameNode::Terminal { .. }) => {}
 
+        // Subgame terminal vs abstract Chance/Decision -- the subgame
+        // resolved this path (e.g. all-in showdown) while the abstract
+        // tree continues through more streets. No boundaries needed.
+        (GameNode::Terminal { .. }, GameNode::Chance { .. } | GameNode::Decision { .. }) => {}
+
         // Both are Chance nodes -- recurse into children.
         (
             GameNode::Chance {
@@ -914,8 +919,10 @@ fn walk_trees_lockstep(
                 let abs_a_idx = match sub_action {
                     TreeAction::Fold => abs_actions.iter().position(|a| matches!(a, TreeAction::Fold)),
                     TreeAction::Check => abs_actions.iter().position(|a| matches!(a, TreeAction::Check)),
-                    TreeAction::Call => abs_actions.iter().position(|a| matches!(a, TreeAction::Call)),
-                    TreeAction::AllIn => abs_actions.iter().position(|a| matches!(a, TreeAction::AllIn)),
+                    // Call and AllIn are interchangeable — calling can be all-in
+                    // in one tree but not the other due to different unit scaling.
+                    TreeAction::Call => abs_actions.iter().position(|a| matches!(a, TreeAction::Call | TreeAction::AllIn)),
+                    TreeAction::AllIn => abs_actions.iter().position(|a| matches!(a, TreeAction::AllIn | TreeAction::Call)),
                     TreeAction::Bet(_) | TreeAction::Raise(_) => {
                         let sub_sized_idx = sub_actions[..sub_a_idx]
                             .iter()
@@ -939,6 +946,32 @@ fn walk_trees_lockstep(
                     abs_children[abs_a_idx] as usize,
                     mapping,
                 );
+            }
+        }
+
+        // Subgame has an all-in response Decision [Fold, Call/AllIn] where
+        // the abstract tree has a Chance node (the call was already resolved
+        // in the full-depth tree). Walk the Call/AllIn child against the
+        // Chance node; the Fold child leads to a terminal (no boundaries).
+        (
+            GameNode::Decision { actions: sub_actions, children: sub_children, .. },
+            GameNode::Chance { .. },
+        ) => {
+            for (sub_a_idx, sub_action) in sub_actions.iter().enumerate() {
+                match sub_action {
+                    TreeAction::Call | TreeAction::AllIn => {
+                        walk_trees_lockstep(
+                            sub, abs, chance_ordinals,
+                            sub_children[sub_a_idx] as usize,
+                            abs_idx, // stay at same abstract Chance node
+                            mapping,
+                        );
+                    }
+                    TreeAction::Fold => {
+                        // Fold leads to a terminal — no boundaries to map.
+                    }
+                    _ => {}
+                }
             }
         }
 
