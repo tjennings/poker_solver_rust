@@ -413,10 +413,49 @@ impl BlueprintCbvEvaluator {
             .collect();
 
         eprintln!(
-            "[cbv evaluator] {} boundaries, {} combos, {} buckets checked",
+            "[cbv evaluator] {} boundaries, {} combos",
             boundary_cfvs.len(), hands.combos.len(),
-            if boundary_cfvs.is_empty() { 0 } else { hands.combos.len() * boundary_cfvs.len() },
         );
+
+        // Audit: dump CBV values for boundary 0 (check-check line)
+        if !boundary_cfvs.is_empty() {
+            let b0 = &boundary_cfvs[0];
+            let b0_pot = boundary_pots[0];
+            let mut samples: Vec<(String, usize, f64, f64)> = Vec::new();
+            for (i, &hole) in hands.combos.iter().enumerate() {
+                let bucket = ctx.all_buckets.get_bucket(street, hole, board) as usize;
+                let raw_cbv = f64::from(ctx.cbv_table.lookup(boundary_mapping[0], bucket));
+                samples.push((format!("{}{}", hole[0], hole[1]), bucket, raw_cbv, b0[i]));
+            }
+            // Sort by raw CBV descending, show top 20 and bottom 10
+            samples.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+            eprintln!("[cbv audit] boundary 0: pot={b0_pot} half_pot={}", b0_pot / 2.0);
+            eprintln!("[cbv audit] TOP 20 (highest CBV):");
+            for (name, bucket, raw, norm) in samples.iter().take(20) {
+                eprintln!("  {name:<12} bucket={bucket:>4}  cbv_bb={raw:>8.3}  pot_frac={norm:>8.4}");
+            }
+            eprintln!("[cbv audit] BOTTOM 10 (lowest CBV):");
+            for (name, bucket, raw, norm) in samples.iter().rev().take(10) {
+                eprintln!("  {name:<12} bucket={bucket:>4}  cbv_bb={raw:>8.3}  pot_frac={norm:>8.4}");
+            }
+            // Bucket collision summary: how many combos share each bucket
+            let mut bucket_counts: std::collections::HashMap<usize, Vec<String>> = std::collections::HashMap::new();
+            for (name, bucket, _, _) in &samples {
+                bucket_counts.entry(*bucket).or_default().push(name.clone());
+            }
+            let mut buckets_sorted: Vec<_> = bucket_counts.iter().collect();
+            buckets_sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+            eprintln!("[cbv audit] {} distinct buckets used out of {} combos",
+                bucket_counts.len(), samples.len());
+            eprintln!("[cbv audit] LARGEST BUCKETS (most collisions):");
+            for (bucket, combos) in buckets_sorted.iter().take(5) {
+                let raw_cbv = samples.iter().find(|(_, b, _, _)| b == *bucket).map(|(_, _, r, _)| *r).unwrap_or(0.0);
+                let preview: Vec<_> = combos.iter().take(8).cloned().collect();
+                let suffix = if combos.len() > 8 { format!(" +{} more", combos.len() - 8) } else { String::new() };
+                eprintln!("  bucket {bucket:>4}: {: >3} combos  cbv={raw_cbv:>7.3}  [{}{suffix}]",
+                    combos.len(), preview.join(", "));
+            }
+        }
 
         Self {
             boundary_cfvs,
@@ -457,8 +496,8 @@ pub fn build_subgame_solver(
     bet_sizes_per_depth: &[Vec<f32>],
     pot: u32,
     stacks: [u32; 2],
-    _oop_weights: &[f32],
-    _ip_weights: &[f32],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
     _player: usize,
     cbv_context: Option<&CbvContext>,
     abstract_node_idx: Option<u32>,
@@ -508,12 +547,30 @@ pub fn build_subgame_solver(
         eprintln!("[subgame] using EquityLeafEvaluator (no CBV context)");
         Box::new(EquityLeafEvaluator)
     };
+    // Map 1326-element weight vectors to SubgameHands ordering.
+    let map_weights = |weights: &[f32]| -> Vec<f64> {
+        hands.combos.iter().map(|combo| {
+            let id0 = rs_poker_card_to_id(combo[0]);
+            let id1 = rs_poker_card_to_id(combo[1]);
+            let ci = card_pair_to_index(id0, id1);
+            f64::from(weights[ci])
+        }).collect()
+    };
+    let oop_reach = map_weights(oop_weights);
+    let ip_reach = map_weights(ip_weights);
+
+    let nonzero_oop = oop_reach.iter().filter(|&&r| r > 0.0).count();
+    let nonzero_ip = ip_reach.iter().filter(|&&r| r > 0.0).count();
+    eprintln!("[subgame] initial reach: OOP={nonzero_oop} IP={nonzero_ip} combos with nonzero reach");
+
     let solver = CfvSubgameSolver::new(
         tree.clone(),
         hands.clone(),
         board_cards,
         evaluator,
         starting_stack,
+        oop_reach,
+        ip_reach,
     );
 
     Ok((solver, hands, action_infos, tree, pot_f, starting_stack))

@@ -167,9 +167,11 @@ pub struct CfvSubgameSolver {
     starting_stack: f64,
     /// Precomputed: for each combo, the total opponent reach of non-blocked combos.
     opp_reach_totals: Vec<f64>,
-    /// Precomputed showdown values per combo (normalized equity: -1 to +1).
-    /// Multiply by half_pot at showdown nodes. Fixed across iterations.
-    showdown_equity: Vec<f64>,
+    /// Initial reach probabilities for OOP (player 0).
+    /// From preflop range filtering — not all combos are equally likely.
+    oop_reach_init: Vec<f64>,
+    /// Initial reach probabilities for IP (player 1).
+    ip_reach_init: Vec<f64>,
 }
 
 impl CfvSubgameSolver {
@@ -182,6 +184,11 @@ impl CfvSubgameSolver {
     /// * `board` - the board cards (3-5 cards)
     /// * `evaluator` - leaf evaluator for depth boundaries
     /// * `starting_stack` - the starting stack for each player
+    /// Create a new CFV subgame solver with initial reach probabilities.
+    ///
+    /// `oop_reach` and `ip_reach` are per-combo reach probabilities from
+    /// preflop range filtering (0.0–1.0). These determine which combos
+    /// each player can have at the start of the subgame.
     #[must_use]
     pub fn new(
         tree: GameTree,
@@ -189,13 +196,13 @@ impl CfvSubgameSolver {
         board: &[Card],
         evaluator: Box<dyn LeafEvaluator>,
         starting_stack: f64,
+        oop_reach: Vec<f64>,
+        ip_reach: Vec<f64>,
     ) -> Self {
         let equity_matrix = compute_equity_matrix(&hands.combos, board);
         let n = hands.combos.len();
 
-        // Uniform initial reach for opp_reach_totals precomputation.
-        let uniform_reach = vec![1.0; n];
-        let opp_reach_totals = precompute_opp_reach(&hands.combos, &uniform_reach);
+        let opp_reach_totals = precompute_opp_reach(&hands.combos, &ip_reach);
 
         let layout = CfvLayout::build(&tree, n);
         let buf_size = layout.total_size;
@@ -219,25 +226,6 @@ impl CfvSubgameSolver {
         let num_boundaries = boundaries.len();
         let leaf_cfvs = vec![vec![0.0; n]; num_boundaries];
 
-        // Precompute showdown equity for all combos (O(n²) but done once).
-        let showdown_equity: Vec<f64> = (0..n)
-            .map(|i| {
-                let opp_total = opp_reach_totals[i];
-                if opp_total <= 0.0 {
-                    return 0.0;
-                }
-                let mut eq_sum = 0.0;
-                for (j, eq) in equity_matrix[i].iter().enumerate() {
-                    if cards_overlap(hands.combos[i], hands.combos[j]) {
-                        continue;
-                    }
-                    eq_sum += eq;
-                }
-                let avg_eq = eq_sum / opp_total;
-                2.0 * avg_eq - 1.0
-            })
-            .collect();
-
         Self {
             tree,
             hands,
@@ -254,7 +242,8 @@ impl CfvSubgameSolver {
             iteration: 0,
             starting_stack,
             opp_reach_totals,
-            showdown_equity,
+            oop_reach_init: oop_reach,
+            ip_reach_init: ip_reach,
         }
     }
 
@@ -296,7 +285,8 @@ impl CfvSubgameSolver {
     fn propagate_ranges(
         &self,
         snapshot: &[f64],
-        reach_init: &[f64],
+        oop_reach_init: &[f64],
+        ip_reach_init: &[f64],
         reach_pool: &mut [f64],
     ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
         let n = self.hands.combos.len();
@@ -308,8 +298,8 @@ impl CfvSubgameSolver {
         self.propagate_ranges_recursive(
             snapshot,
             self.tree.root as usize,
-            reach_init,
-            reach_init,
+            oop_reach_init,
+            ip_reach_init,
             &mut oop_ranges,
             &mut ip_ranges,
             reach_pool,
@@ -649,8 +639,9 @@ impl CfvSubgameSolver {
         let n = self.hands.combos.len();
         let num_nodes = self.tree.nodes.len();
 
-        // Pre-allocate all scratch buffers once, reused across all iterations.
-        let reach_init = vec![1.0; n];
+        // Clone preflop-filtered reach to avoid borrow conflicts with &mut self.
+        let oop_reach = self.oop_reach_init.clone();
+        let ip_reach = self.ip_reach_init.clone();
         let mut cfv_buf = vec![0.0; num_nodes * n];
         let max_depth: usize = 64;
         let mut reach_pool = vec![0.0; max_depth * n];
@@ -674,7 +665,7 @@ impl CfvSubgameSolver {
             let boundary_ranges =
                 if should_eval && !self.boundary_info.boundaries.is_empty() {
                     Some(self.propagate_ranges(
-                        &snapshot, &reach_init, &mut prop_reach_pool,
+                        &snapshot, &oop_reach, &ip_reach, &mut prop_reach_pool,
                     ))
                 } else {
                     None
@@ -700,11 +691,16 @@ impl CfvSubgameSolver {
                     }
                 }
 
+                let (reach_trav, reach_opp) = if traverser == 0 {
+                    (oop_reach.as_slice(), ip_reach.as_slice())
+                } else {
+                    (ip_reach.as_slice(), oop_reach.as_slice())
+                };
                 self.cfr_traverse_vectorized(
                     self.tree.root as usize,
                     traverser,
-                    &reach_init,
-                    &reach_init,
+                    reach_trav,
+                    reach_opp,
                     &snapshot,
                     &mut cfv_buf,
                     &mut reach_pool,
@@ -1178,7 +1174,7 @@ mod tests {
         let tree = river_tree(&[1.0]);
         let hands = small_hands(&board, 30);
         let evaluator = Box::new(ConstantEvaluator(0.5));
-        let solver = CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+        let solver = CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         assert_eq!(solver.iteration, 0);
         assert!(!solver.hands.combos.is_empty());
@@ -1193,7 +1189,7 @@ mod tests {
         let hands = small_hands(&board, 30);
         let n = hands.combos.len();
         let evaluator = Box::new(ConstantEvaluator(0.5));
-        let solver = CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+        let solver = CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         // With no training, strategy is uniform. Propagation should still
         // produce non-negative ranges that sum to at most 1.0 per combo.
@@ -1202,7 +1198,7 @@ mod tests {
         let max_depth: usize = 64;
         let mut prop_reach_pool = vec![0.0; max_depth * n];
         let (oop_ranges, ip_ranges) = solver.propagate_ranges(
-            &snapshot, &reach_init, &mut prop_reach_pool,
+            &snapshot, &reach_init, &reach_init, &mut prop_reach_pool,
         );
 
         assert!(
@@ -1241,7 +1237,7 @@ mod tests {
         let hands = small_hands(&board, 30);
         let evaluator = Box::new(ConstantEvaluator(0.5));
         let mut solver =
-            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         solver.train(100);
         assert_eq!(solver.iteration, 100);
@@ -1293,7 +1289,7 @@ mod tests {
 
         let evaluator = Box::new(ConstantEvaluator(0.5));
         let mut solver =
-            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         assert!(
             !solver.boundary_info.boundaries.is_empty(),
@@ -1350,7 +1346,7 @@ mod tests {
 
         let evaluator = Box::new(ConstantEvaluator(0.5));
         let mut solver =
-            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         assert!(
             solver.boundary_info.boundaries.is_empty(),
@@ -1448,7 +1444,7 @@ mod tests {
             iterations: 5,
         });
         let mut solver =
-            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         solver.train(10);
         assert_eq!(solver.iteration, 10);
@@ -1465,7 +1461,7 @@ mod tests {
         let n = hands.combos.len();
         let evaluator = Box::new(ConstantEvaluator(0.5));
         let mut solver =
-            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         solver.train(100);
 
@@ -1482,7 +1478,7 @@ mod tests {
         let hands = small_hands(&board, 30);
         let evaluator = Box::new(ConstantEvaluator(0.5));
         let mut solver =
-            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         solver.train(200);
 
@@ -1510,7 +1506,7 @@ mod tests {
         let n = hands.combos.len();
         let evaluator = Box::new(ConstantEvaluator(0.5));
         let mut solver =
-            CfvSubgameSolver::new(tree, hands, &board, evaluator, 250.0);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         solver.train(200);
 
