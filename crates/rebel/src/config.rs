@@ -33,6 +33,12 @@ pub struct SeedConfig {
     pub solver_iterations: u32,
     #[serde(default = "default_target_expl")]
     pub target_exploitability: f32,
+    /// Add all-in if max bet / pot <= this threshold (range-solver TreeConfig).
+    #[serde(default = "default_add_allin")]
+    pub add_allin_threshold: f64,
+    /// Force all-in if SPR after call <= this threshold (range-solver TreeConfig).
+    #[serde(default = "default_force_allin")]
+    pub force_allin_threshold: f64,
     pub bet_sizes: BetSizeConfig,
 }
 
@@ -86,6 +92,14 @@ fn default_threads() -> usize {
 
 fn default_solver_iters() -> u32 {
     1024
+}
+
+fn default_add_allin() -> f64 {
+    1.5
+}
+
+fn default_force_allin() -> f64 {
+    0.15
 }
 
 fn default_target_expl() -> f32 {

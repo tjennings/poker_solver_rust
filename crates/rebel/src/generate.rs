@@ -4,6 +4,7 @@
 // street boundaries, converts to BufferRecords, and appends to the
 // disk buffer for later CFV solving.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
@@ -18,6 +19,7 @@ use crate::blueprint_sampler::{deal_hand, play_hand};
 use crate::config::RebelConfig;
 use crate::data_buffer::{BufferRecord, DiskBuffer};
 use crate::pbs::{Pbs, NUM_COMBOS};
+use crate::solver::{solve_river_pbs, SolveConfig};
 
 /// Convert a PBS to a `BufferRecord` for one player's perspective.
 ///
@@ -121,6 +123,167 @@ pub fn generate_pbs(
         .sum();
 
     total_pbs
+}
+
+/// Reconstruct a `Pbs` from a `BufferRecord`.
+///
+/// Maps BufferRecord fields back to Pbs:
+/// - `board` is sliced to `board[..board_card_count]`
+/// - `pot` and `effective_stack` are cast from f32 to i32
+/// - `reach_probs` are taken from `oop_reach` / `ip_reach`
+pub fn buffer_record_to_pbs(rec: &BufferRecord) -> Pbs {
+    let board = rec.board[..rec.board_card_count as usize].to_vec();
+    let mut reach_probs = Box::new([[0.0f32; NUM_COMBOS]; 2]);
+    reach_probs[0] = rec.oop_reach;
+    reach_probs[1] = rec.ip_reach;
+    Pbs {
+        board,
+        pot: rec.pot as i32,
+        effective_stack: rec.effective_stack as i32,
+        reach_probs,
+    }
+}
+
+/// Solve all river PBS records in the buffer and fill in their CFVs.
+///
+/// For each record:
+/// 1. Read the `BufferRecord`
+/// 2. Convert to a `Pbs` via `buffer_record_to_pbs`
+/// 3. Solve using `solve_river_pbs()`
+/// 4. Write the solved CFVs and game_value back
+///
+/// Uses rayon for parallel solving across threads.
+/// Returns the number of successfully solved records.
+pub fn solve_buffer_records(
+    buffer: &mut DiskBuffer,
+    solve_config: &SolveConfig,
+    threads: usize,
+) -> usize {
+    let total = buffer.len();
+    if total == 0 {
+        return 0;
+    }
+
+    let chunk_size = 1000;
+    let solved_count = AtomicUsize::new(0);
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("failed to create rayon thread pool for solving");
+
+    // Process records in chunks for manageable memory usage
+    for chunk_start in (0..total).step_by(chunk_size) {
+        let chunk_end = (chunk_start + chunk_size).min(total);
+
+        // Read all records in this chunk
+        let records: Vec<(usize, BufferRecord)> = (chunk_start..chunk_end)
+            .map(|idx| {
+                let rec = buffer
+                    .read_record(idx)
+                    .unwrap_or_else(|e| panic!("failed to read record {idx}: {e}"));
+                (idx, rec)
+            })
+            .collect();
+
+        // Solve in parallel
+        let results: Vec<(usize, BufferRecord)> = pool.install(|| {
+            records
+                .into_par_iter()
+                .filter_map(|(idx, mut rec)| {
+                    let pbs = buffer_record_to_pbs(&rec);
+
+                    // Only solve river PBSs (5-card boards)
+                    if pbs.board.len() != 5 {
+                        eprintln!(
+                            "  Warning: skipping non-river record {} ({} board cards)",
+                            idx,
+                            pbs.board.len()
+                        );
+                        return None;
+                    }
+
+                    match solve_river_pbs(&pbs, solve_config) {
+                        Ok(result) => {
+                            // Fill CFVs based on player perspective
+                            if rec.player == 0 {
+                                rec.cfvs = result.oop_cfvs;
+                                rec.game_value = result.oop_game_value;
+                            } else {
+                                rec.cfvs = result.ip_cfvs;
+                                rec.game_value = result.ip_game_value;
+                            }
+                            solved_count.fetch_add(1, Ordering::Relaxed);
+                            Some((idx, rec))
+                        }
+                        Err(e) => {
+                            eprintln!("  Warning: failed to solve record {idx}: {e}");
+                            None
+                        }
+                    }
+                })
+                .collect()
+        });
+
+        // Write solved records back to buffer
+        for (idx, rec) in &results {
+            buffer
+                .write_record(*idx, rec)
+                .unwrap_or_else(|e| panic!("failed to write record {idx}: {e}"));
+        }
+
+        let done = (chunk_end).min(total);
+        let solved_so_far = solved_count.load(Ordering::Relaxed);
+        eprintln!(
+            "  Solving progress: {}/{} records processed, {} solved",
+            done, total, solved_so_far
+        );
+    }
+
+    solved_count.load(Ordering::Relaxed)
+}
+
+/// Build a `SolveConfig` from the rebel `SeedConfig`.
+///
+/// Converts river bet size fractions to `BetSizeOptions` with `PotRelative`
+/// entries, adding an all-in option.
+pub fn build_solve_config(seed: &crate::config::SeedConfig) -> SolveConfig {
+    use range_solver::bet_size::{BetSize, BetSizeOptions};
+
+    // Convert river bet size fractions to BetSize::PotRelative entries.
+    // river[0] = OOP bet sizes, river[1] = IP bet sizes.
+    // For BetSizeOptions: bet = first bets, raise = raises.
+    // We use river[0] for bets (OOP's first action) and river[1] for raises.
+    let mut bets: Vec<BetSize> = seed
+        .bet_sizes
+        .river[0]
+        .iter()
+        .map(|&f| BetSize::PotRelative(f))
+        .collect();
+    bets.push(BetSize::AllIn);
+    bets.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let mut raises: Vec<BetSize> = seed
+        .bet_sizes
+        .river[1]
+        .iter()
+        .map(|&f| BetSize::PotRelative(f))
+        .collect();
+    raises.push(BetSize::AllIn);
+    raises.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let bet_sizes = BetSizeOptions {
+        bet: bets,
+        raise: raises,
+    };
+
+    SolveConfig {
+        bet_sizes,
+        solver_iterations: seed.solver_iterations,
+        target_exploitability: seed.target_exploitability,
+        add_allin_threshold: seed.add_allin_threshold,
+        force_allin_threshold: seed.force_allin_threshold,
+    }
 }
 
 #[cfg(test)]
@@ -306,5 +469,141 @@ mod tests {
         //
         // To run: cargo test -p rebel generate::tests::test_generate_pbs_integration -- --ignored
         // Requires: trained blueprint model and cluster files
+    }
+
+    #[test]
+    fn test_buffer_record_to_pbs_roundtrip() {
+        // Create a PBS, convert to BufferRecord, convert back, verify fields match.
+        let board = vec![0, 4, 8, 12, 16]; // 2c, 3c, 4c, 5c, 6c (5-card river board)
+        let pbs = Pbs::new_uniform(board.clone(), 200, 350);
+
+        let rec = pbs_to_buffer_record(&pbs, 0);
+        let pbs2 = buffer_record_to_pbs(&rec);
+
+        // Board should match
+        assert_eq!(pbs2.board, board);
+
+        // Pot and effective stack should match (after f32 roundtrip)
+        assert_eq!(pbs2.pot, 200);
+        assert_eq!(pbs2.effective_stack, 350);
+
+        // Reach probs should match exactly (both go through [f32; 1326])
+        assert_eq!(pbs2.reach_probs[0], pbs.reach_probs[0]);
+        assert_eq!(pbs2.reach_probs[1], pbs.reach_probs[1]);
+
+        // Verify blocked combos are still zero
+        let blocked_idx = combo_index(0, 1); // card 0 is on board
+        assert_eq!(pbs2.reach_probs[0][blocked_idx], 0.0);
+        assert_eq!(pbs2.reach_probs[1][blocked_idx], 0.0);
+
+        // Verify non-blocked combos are still 1.0
+        let valid_idx = combo_index(1, 2); // cards 1,2 not on board
+        assert_eq!(pbs2.reach_probs[0][valid_idx], 1.0);
+        assert_eq!(pbs2.reach_probs[1][valid_idx], 1.0);
+    }
+
+    #[test]
+    fn test_buffer_record_to_pbs_short_board() {
+        // 3-card board — padded to 5 in record, should round-trip back to 3
+        let board = vec![10, 20, 30];
+        let pbs = Pbs::new_uniform(board.clone(), 50, 400);
+
+        let rec = pbs_to_buffer_record(&pbs, 1);
+        let pbs2 = buffer_record_to_pbs(&rec);
+
+        assert_eq!(pbs2.board, board);
+        assert_eq!(pbs2.pot, 50);
+        assert_eq!(pbs2.effective_stack, 400);
+    }
+
+    #[test]
+    fn test_build_solve_config() {
+        use crate::config::{BetSizeConfig, SeedConfig};
+        use range_solver::bet_size::BetSize;
+
+        let seed = SeedConfig {
+            num_hands: 1000,
+            seed: 42,
+            threads: 4,
+            solver_iterations: 512,
+            target_exploitability: 0.01,
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.15,
+            bet_sizes: BetSizeConfig {
+                flop: [vec![0.33, 0.67], vec![0.33, 0.67]],
+                turn: [vec![0.5, 0.75], vec![0.5, 0.75]],
+                river: [vec![0.5, 1.0], vec![0.75]],
+            },
+        };
+
+        let sc = build_solve_config(&seed);
+
+        assert_eq!(sc.solver_iterations, 512);
+        assert!((sc.target_exploitability - 0.01).abs() < 1e-6);
+        assert!((sc.add_allin_threshold - 1.5).abs() < 1e-9);
+        assert!((sc.force_allin_threshold - 0.15).abs() < 1e-9);
+
+        // Bets should contain PotRelative(0.5), PotRelative(1.0), AllIn — sorted
+        assert!(sc.bet_sizes.bet.contains(&BetSize::PotRelative(0.5)));
+        assert!(sc.bet_sizes.bet.contains(&BetSize::PotRelative(1.0)));
+        assert!(sc.bet_sizes.bet.contains(&BetSize::AllIn));
+
+        // Raises should contain PotRelative(0.75), AllIn — sorted
+        assert!(sc.bet_sizes.raise.contains(&BetSize::PotRelative(0.75)));
+        assert!(sc.bet_sizes.raise.contains(&BetSize::AllIn));
+    }
+
+    #[test]
+    #[ignore] // Requires solving (takes ~1s per PBS)
+    fn test_solve_buffer_records_integration() {
+        use crate::solver::SolveConfig;
+        use range_solver::bet_size::BetSizeOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let buffer_path = dir.path().join("test_solve.bin");
+
+        let mut buffer = DiskBuffer::create(&buffer_path, 100).unwrap();
+
+        // Create a few river PBSs with uniform reach and write to buffer
+        let boards = vec![
+            vec![0, 4, 8, 12, 16],  // 2c,3c,4c,5c,6c
+            vec![51, 46, 40, 25, 7], // As,Kh,Qd,8d,3s
+        ];
+
+        for board in &boards {
+            let pbs = Pbs::new_uniform(board.clone(), 100, 100);
+            let rec_oop = pbs_to_buffer_record(&pbs, 0);
+            let rec_ip = pbs_to_buffer_record(&pbs, 1);
+            buffer.append(&rec_oop).unwrap();
+            buffer.append(&rec_ip).unwrap();
+        }
+        assert_eq!(buffer.len(), 4);
+
+        let solve_config = SolveConfig {
+            bet_sizes: BetSizeOptions::try_from(("50%,a", "")).expect("valid bet sizes"),
+            solver_iterations: 100,
+            target_exploitability: 0.05,
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.15,
+        };
+
+        let solved = solve_buffer_records(&mut buffer, &solve_config, 2);
+        assert_eq!(solved, 4, "expected all 4 records to be solved");
+
+        // Verify CFVs are non-zero for at least some combos
+        for i in 0..4 {
+            let rec = buffer.read_record(i).unwrap();
+            let has_nonzero = rec.cfvs.iter().any(|&v| v != 0.0);
+            assert!(
+                has_nonzero,
+                "record {} should have at least some non-zero CFVs after solving",
+                i
+            );
+            assert!(
+                rec.game_value.is_finite(),
+                "record {} game_value should be finite, got {}",
+                i, rec.game_value
+            );
+        }
     }
 }

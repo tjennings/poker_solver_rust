@@ -5825,6 +5825,7 @@ dependencies = [
 name = "rebel"
 version = "0.1.0"
 dependencies = [
+ "cfvnet",
  "memmap2",
  "poker-solver-core",
  "rand 0.9.2",

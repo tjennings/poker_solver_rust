@@ -1042,11 +1042,37 @@ fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
         rebel::generate::generate_pbs(&strategy, &tree, &buckets, &rebel_config, &buffer)
     });
 
-    let buf = buffer.lock().unwrap();
+    let mut buf = buffer.into_inner().unwrap();
+    let record_count = buf.len();
     eprintln!(
-        "Done! Generated {} PBS snapshots, {} buffer records",
+        "Generated {} PBS snapshots, {} buffer records",
         pbs_count,
-        buf.len()
+        record_count
+    );
+
+    // --- Step 3: Solve PBSs in buffer → fill CFVs ---
+    eprintln!("Building solve config and solving {} records...", record_count);
+    let solve_config = rebel::generate::build_solve_config(&rebel_config.seed);
+    let solved = rebel::generate::solve_buffer_records(
+        &mut buf,
+        &solve_config,
+        rebel_config.seed.threads,
+    );
+    eprintln!(
+        "Solved {}/{} records successfully",
+        solved, record_count
+    );
+
+    // --- Step 4: Export buffer → cfvnet training files ---
+    let export_path = std::path::Path::new(&rebel_config.output_dir)
+        .join("training_data.bin");
+    eprintln!("Exporting training data to {}...", export_path.display());
+    let exported = rebel::training::export_training_data(&buf, &export_path)
+        .map_err(|e| format!("Failed to export training data: {e}"))?;
+    eprintln!(
+        "Done! Exported {} training records to {}",
+        exported,
+        export_path.display()
     );
 
     Ok(())
