@@ -5,7 +5,7 @@ use poker_solver_core::blueprint_v2::solver_dispatch::{
 };
 use poker_solver_core::blueprint_v2::{
     CfvSubgameSolver, LeafEvaluator, SubgameHands, SubgameStrategy,
-    compute_combo_equities,
+    compute_combo_equities, build_boundary_mapping,
 };
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
@@ -344,6 +344,89 @@ impl LeafEvaluator for EquityLeafEvaluator {
     }
 }
 
+/// Leaf evaluator that uses blueprint counterfactual boundary values (CBVs).
+///
+/// Pre-computes per-boundary, per-combo CFVs at construction. The `evaluate`
+/// calls return precomputed values — CBVs are properties of the fixed blueprint
+/// strategy and don't change with the subgame solver's evolving ranges.
+///
+/// CBVs encode strategic information (fold equity, future street potential,
+/// flush draw value, etc.) that raw showdown equity misses.
+struct BlueprintCbvEvaluator {
+    /// Pre-computed CBV values per boundary in pot-fraction units.
+    /// Indexed by boundary ordinal, each entry is a per-combo Vec.
+    boundary_cfvs: Vec<Vec<f64>>,
+    /// Tracks which boundary is being evaluated (wraps modulo boundary count).
+    call_index: std::cell::Cell<usize>,
+}
+
+impl BlueprintCbvEvaluator {
+    /// Build a CBV evaluator for the given subgame tree and blueprint data.
+    ///
+    /// Maps each subgame `DepthBoundary` to the corresponding abstract-tree
+    /// `Chance` node, looks up per-combo bucket assignments, and normalizes
+    /// CBV chip values to pot-fraction units.
+    fn new(
+        subgame_tree: &GameTree,
+        ctx: &CbvContext,
+        hands: &SubgameHands,
+        board: &[RsPokerCard],
+        street: V2Street,
+    ) -> Self {
+        let boundary_mapping = build_boundary_mapping(subgame_tree, &ctx.abstract_tree);
+
+        // Collect boundary pots in ordinal order.
+        let boundary_pots: Vec<f64> = subgame_tree.nodes.iter().filter_map(|n| match n {
+            GameNode::Terminal { kind: TerminalKind::DepthBoundary, pot, .. } => Some(*pot),
+            _ => None,
+        }).collect();
+
+        let boundary_cfvs: Vec<Vec<f64>> = boundary_mapping
+            .iter()
+            .zip(boundary_pots.iter())
+            .map(|(&chance_ord, &pot)| {
+                let half_pot = pot / 2.0;
+                assert!(half_pot > 0.0, "boundary pot must be positive, got {pot}");
+                hands.combos.iter().map(|&hole| {
+                    let bucket = ctx.all_buckets.get_bucket(street, hole, board) as usize;
+                    let cbv = f64::from(ctx.cbv_table.lookup(chance_ord, bucket));
+                    // Normalize chip value to pot-fraction: cbv / half_pot
+                    // The solver multiplies by half_pot at the boundary, recovering cbv.
+                    cbv / half_pot
+                }).collect()
+            })
+            .collect();
+
+        eprintln!(
+            "[cbv evaluator] {} boundaries, {} combos, {} buckets checked",
+            boundary_cfvs.len(), hands.combos.len(),
+            if boundary_cfvs.is_empty() { 0 } else { hands.combos.len() * boundary_cfvs.len() },
+        );
+
+        Self {
+            boundary_cfvs,
+            call_index: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl LeafEvaluator for BlueprintCbvEvaluator {
+    fn evaluate(
+        &self,
+        _combos: &[[RsPokerCard; 2]],
+        _board: &[RsPokerCard],
+        _pot: f64,
+        _effective_stack: f64,
+        _oop_range: &[f64],
+        _ip_range: &[f64],
+        _traverser: u8,
+    ) -> Vec<f64> {
+        let idx = self.call_index.get() % self.boundary_cfvs.len();
+        self.call_index.set(self.call_index.get() + 1);
+        self.boundary_cfvs[idx].clone()
+    }
+}
+
 /// Build a subgame tree and CFV solver, ready to iterate.
 ///
 /// Returns the solver, hands, action labels, tree, initial pot, and starting
@@ -362,7 +445,7 @@ pub fn build_subgame_solver(
     _oop_weights: &[f32],
     _ip_weights: &[f32],
     _player: usize,
-    _cbv_context: Option<&CbvContext>,
+    cbv_context: Option<&CbvContext>,
 ) -> Result<(CfvSubgameSolver, SubgameHands, Vec<ActionInfo>, GameTree, f64, f64), String> {
     let street = match board_cards.len() {
         3 => V2Street::Flop,
@@ -399,7 +482,13 @@ pub fn build_subgame_solver(
         _ => return Err("Subgame tree root is not a decision node".to_string()),
     };
 
-    let evaluator: Box<dyn LeafEvaluator> = Box::new(EquityLeafEvaluator);
+    let evaluator: Box<dyn LeafEvaluator> = if let Some(ctx) = cbv_context {
+        eprintln!("[subgame] using BlueprintCbvEvaluator for depth boundaries");
+        Box::new(BlueprintCbvEvaluator::new(&tree, ctx, &hands, board_cards, street))
+    } else {
+        eprintln!("[subgame] using EquityLeafEvaluator (no CBV context)");
+        Box::new(EquityLeafEvaluator)
+    };
     let solver = CfvSubgameSolver::new(
         tree.clone(),
         hands.clone(),
