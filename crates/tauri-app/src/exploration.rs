@@ -424,21 +424,19 @@ pub fn populate_cbv_context(
         return;
     };
 
-    // Build AllBuckets from the config's cluster path.
-    let Some(ref cluster_path) = config.training.cluster_path else {
-        eprintln!("CBV table found but no cluster_path in config; skipping CBV context");
+    // Expect bucket files at <bundle_dir>/buckets/.
+    // For distribution, symlink or copy the cluster output into the bundle.
+    let cluster_dir = bundle_dir.join("buckets");
+    if !cluster_dir.exists() {
+        eprintln!(
+            "CBV table found but no buckets/ directory in bundle (expected {}). \
+             Symlink your cluster output there.",
+            cluster_dir.display()
+        );
         crate::postflop::set_cbv_context(postflop, None);
         return;
-    };
-
-    let cluster_dir_raw = std::path::Path::new(cluster_path);
-    // Resolve relative cluster_path against the bundle directory.
-    let cluster_dir = if cluster_dir_raw.is_relative() {
-        bundle_dir.join(cluster_dir_raw)
-    } else {
-        cluster_dir_raw.to_path_buf()
-    };
-    eprintln!("[cbv] cluster_path={} exists={}", cluster_dir.display(), cluster_dir.exists());
+    }
+    eprintln!("[cbv] buckets dir: {}", cluster_dir.display());
     let bucket_counts = [
         config.clustering.preflop.buckets,
         config.clustering.flop.buckets,
