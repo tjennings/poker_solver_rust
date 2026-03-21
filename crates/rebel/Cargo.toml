@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 poker-solver-core = { path = "../core" }
 range-solver = { path = "../range-solver" }
+cfvnet = { path = "../cfvnet" }
 
 serde.workspace = true
 serde_yaml.workspace = true
