@@ -1,22 +1,33 @@
-// solver.rs — PBS → range-solver conversion and river subgame solving.
+// solver.rs — PBS → range-solver conversion and subgame solving.
 //
 // Converts a PBS (public belief state) into the data structures required by
-// range-solver, solves the resulting river subgame with DCFR, and extracts
+// range-solver, solves the resulting subgame with DCFR, and extracts
 // per-combo counterfactual values.
+//
+// Supports:
+// - River PBSs (5 cards): direct solving, no depth limit needed.
+// - Turn/Flop PBSs (4/3 cards): depth-limited solving with a LeafEvaluator
+//   providing CFVs at street boundaries.
 
 use crate::pbs::{Pbs, NUM_COMBOS};
+use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
+use poker_solver_core::poker::Card as RsPokerCard;
 use range_solver::{
     action_tree::{ActionTree, BoardState, TreeConfig},
     bet_size::BetSizeOptions,
-    card::{card_pair_to_index, Card},
+    card::{card_pair_to_index, Card, NOT_DEALT},
     range::Range,
     solve, CardConfig, PostFlopGame,
 };
 
 /// Configuration for the range-solver wrapper used in ReBeL subgame solving.
 pub struct SolveConfig {
-    /// Pre-parsed bet size options (avoids re-parsing per solve call).
+    /// River bet size options (also used as the sole bet sizes for river-only solves).
     pub bet_sizes: BetSizeOptions,
+    /// Turn bet size options (used when solving turn PBSs with depth_limit).
+    pub turn_bet_sizes: Option<[BetSizeOptions; 2]>,
+    /// Flop bet size options (used when solving flop PBSs with depth_limit).
+    pub flop_bet_sizes: Option<[BetSizeOptions; 2]>,
     /// Maximum number of solver iterations.
     pub solver_iterations: u32,
     /// Target exploitability (pot-relative); solver stops early if reached.
@@ -130,6 +141,254 @@ pub fn solve_river_pbs(pbs: &Pbs, config: &SolveConfig) -> Result<SolveResult, S
     })
 }
 
+/// Solve a PBS with depth-limited CFR using a LeafEvaluator at boundaries.
+///
+/// - For river PBSs (5 cards): delegates to `solve_river_pbs` (no boundaries needed).
+/// - For turn PBSs (4 cards): builds turn tree with `depth_limit=0`, evaluator at river boundary.
+/// - For flop PBSs (3 cards): builds flop tree with `depth_limit=0`, evaluator at turn boundary.
+///
+/// The evaluator provides CFVs at depth boundary nodes where the tree is truncated.
+/// Board-blocked combos get CFV = 0.0.
+pub fn solve_depth_limited_pbs(
+    pbs: &Pbs,
+    config: &SolveConfig,
+    evaluator: &dyn LeafEvaluator,
+) -> Result<SolveResult, String> {
+    if pbs.pot <= 0 {
+        return Err("pot must be positive for solver".into());
+    }
+    if pbs.effective_stack <= 0 {
+        return Err("effective_stack must be positive for solver".into());
+    }
+
+    match pbs.board.len() {
+        5 => solve_river_pbs(pbs, config),
+        4 => solve_turn_pbs(pbs, config, evaluator),
+        3 => solve_flop_pbs(pbs, config, evaluator),
+        n => Err(format!(
+            "depth-limited solving requires 3-5 board cards, got {n}"
+        )),
+    }
+}
+
+/// Solve a turn PBS (4 board cards) with depth_limit=0 and evaluator at river boundary.
+fn solve_turn_pbs(
+    pbs: &Pbs,
+    config: &SolveConfig,
+    evaluator: &dyn LeafEvaluator,
+) -> Result<SolveResult, String> {
+    let oop_range = Range::from_raw_data(&pbs.reach_probs[0])?;
+    let ip_range = Range::from_raw_data(&pbs.reach_probs[1])?;
+
+    let card_config = CardConfig {
+        range: [oop_range, ip_range],
+        flop: [pbs.board[0], pbs.board[1], pbs.board[2]],
+        turn: pbs.board[3],
+        river: NOT_DEALT,
+    };
+
+    // Use turn-specific bet sizes if available, otherwise fall back to river sizes.
+    let turn_sizes = config
+        .turn_bet_sizes
+        .clone()
+        .unwrap_or_else(|| [config.bet_sizes.clone(), config.bet_sizes.clone()]);
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Turn,
+        starting_pot: pbs.pot,
+        effective_stack: pbs.effective_stack,
+        turn_bet_sizes: turn_sizes,
+        depth_limit: Some(0),
+        add_allin_threshold: config.add_allin_threshold,
+        force_allin_threshold: config.force_allin_threshold,
+        ..Default::default()
+    };
+
+    solve_with_boundaries(pbs, config, evaluator, card_config, tree_config)
+}
+
+/// Solve a flop PBS (3 board cards) with depth_limit=0 and evaluator at turn boundary.
+fn solve_flop_pbs(
+    pbs: &Pbs,
+    config: &SolveConfig,
+    evaluator: &dyn LeafEvaluator,
+) -> Result<SolveResult, String> {
+    let oop_range = Range::from_raw_data(&pbs.reach_probs[0])?;
+    let ip_range = Range::from_raw_data(&pbs.reach_probs[1])?;
+
+    let card_config = CardConfig {
+        range: [oop_range, ip_range],
+        flop: [pbs.board[0], pbs.board[1], pbs.board[2]],
+        turn: NOT_DEALT,
+        river: NOT_DEALT,
+    };
+
+    // Use flop-specific bet sizes if available, otherwise fall back to river sizes.
+    let flop_sizes = config
+        .flop_bet_sizes
+        .clone()
+        .unwrap_or_else(|| [config.bet_sizes.clone(), config.bet_sizes.clone()]);
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Flop,
+        starting_pot: pbs.pot,
+        effective_stack: pbs.effective_stack,
+        flop_bet_sizes: flop_sizes,
+        depth_limit: Some(0),
+        add_allin_threshold: config.add_allin_threshold,
+        force_allin_threshold: config.force_allin_threshold,
+        ..Default::default()
+    };
+
+    solve_with_boundaries(pbs, config, evaluator, card_config, tree_config)
+}
+
+/// Common logic for depth-limited solving: build game, set boundary CFVs, solve, extract.
+fn solve_with_boundaries(
+    pbs: &Pbs,
+    config: &SolveConfig,
+    evaluator: &dyn LeafEvaluator,
+    card_config: CardConfig,
+    tree_config: TreeConfig,
+) -> Result<SolveResult, String> {
+    let action_tree = ActionTree::new(tree_config)?;
+    let mut game = PostFlopGame::with_config(card_config, action_tree)?;
+    game.allocate_memory(false);
+
+    let n_boundary = game.num_boundary_nodes();
+
+    if n_boundary > 0 {
+        // Convert PBS board to rs_poker Card format for the evaluator.
+        let board_cards: Vec<RsPokerCard> = pbs
+            .board
+            .iter()
+            .map(|&c| u8_to_rs_poker_card(c))
+            .collect();
+
+        let starting_pot = game.tree_config().starting_pot;
+        let eff_stack = game.tree_config().effective_stack;
+
+        // Evaluate boundary CFVs for each player separately, since each player
+        // has its own combo ordering in the solver.
+        for player in 0..2usize {
+            let hands = game.private_cards(player);
+
+            // Convert solver combos to rs_poker Card pairs.
+            let combos_rs: Vec<[RsPokerCard; 2]> = hands
+                .iter()
+                .map(|&(c1, c2)| [u8_to_rs_poker_card(c1), u8_to_rs_poker_card(c2)])
+                .collect();
+
+            // Build range arrays in f64 for the evaluator, in solver combo ordering.
+            let oop_range_f64: Vec<f64> = hands
+                .iter()
+                .map(|&(c1, c2)| pbs.reach_probs[0][card_pair_to_index(c1, c2)] as f64)
+                .collect();
+            let ip_range_f64: Vec<f64> = hands
+                .iter()
+                .map(|&(c1, c2)| pbs.reach_probs[1][card_pair_to_index(c1, c2)] as f64)
+                .collect();
+
+            // Build boundary requests: (pot, eff_stack, traverser).
+            let requests: Vec<(f64, f64, u8)> = (0..n_boundary)
+                .map(|ordinal| {
+                    let bpot = game.boundary_pot(ordinal);
+                    let amount = (bpot - starting_pot) / 2;
+                    let boundary_eff_stack = eff_stack - amount;
+                    (bpot as f64, boundary_eff_stack as f64, player as u8)
+                })
+                .collect();
+
+            let batch_cfvs = evaluator.evaluate_boundaries(
+                &combos_rs,
+                &board_cards,
+                &oop_range_f64,
+                &ip_range_f64,
+                &requests,
+            );
+
+            // Set boundary CFVs for this player.
+            for (ordinal, cfvs_f64) in batch_cfvs.into_iter().enumerate() {
+                let cfvs_f32: Vec<f32> = cfvs_f64.iter().map(|&v| v as f32).collect();
+                game.set_boundary_cfvs(ordinal, player, cfvs_f32);
+            }
+        }
+    }
+
+    // Solve with DCFR.
+    let exploitability = solve(
+        &mut game,
+        config.solver_iterations,
+        config.target_exploitability,
+        false,
+    );
+
+    // Extract CFVs back to canonical 1326 layout.
+    game.cache_normalized_weights();
+
+    let raw_oop = game.expected_values(0);
+    let raw_ip = game.expected_values(1);
+    let oop_hands = game.private_cards(0);
+    let ip_hands = game.private_cards(1);
+
+    let pot = pbs.pot as f32;
+
+    let mut oop_cfvs = [0.0f32; NUM_COMBOS];
+    let mut ip_cfvs = [0.0f32; NUM_COMBOS];
+
+    map_evs_to_combos(&raw_oop, oop_hands, pot, &mut oop_cfvs);
+    map_evs_to_combos(&raw_ip, ip_hands, pot, &mut ip_cfvs);
+
+    let oop_game_value = weighted_game_value(&oop_cfvs, &pbs.reach_probs[0]);
+    let ip_game_value = weighted_game_value(&ip_cfvs, &pbs.reach_probs[1]);
+
+    Ok(SolveResult {
+        oop_cfvs,
+        ip_cfvs,
+        oop_game_value,
+        ip_game_value,
+        exploitability,
+    })
+}
+
+/// Convert a range-solver card (u8: 4*rank + suit) to an rs_poker Card.
+///
+/// range-solver: rank 0=2..12=A, suit 0=club,1=diamond,2=heart,3=spade
+/// rs_poker: Value enum (Two..Ace), Suit enum (Club..Spade)
+fn u8_to_rs_poker_card(card: u8) -> RsPokerCard {
+    use poker_solver_core::poker::{Suit, Value};
+
+    let rank = card / 4;
+    let suit = card % 4;
+
+    let value = match rank {
+        0 => Value::Two,
+        1 => Value::Three,
+        2 => Value::Four,
+        3 => Value::Five,
+        4 => Value::Six,
+        5 => Value::Seven,
+        6 => Value::Eight,
+        7 => Value::Nine,
+        8 => Value::Ten,
+        9 => Value::Jack,
+        10 => Value::Queen,
+        11 => Value::King,
+        12 => Value::Ace,
+        _ => panic!("invalid card rank: {rank}"),
+    };
+
+    let suit = match suit {
+        0 => Suit::Club,
+        1 => Suit::Diamond,
+        2 => Suit::Heart,
+        3 => Suit::Spade,
+        _ => unreachable!(),
+    };
+
+    RsPokerCard::new(value, suit)
+}
+
 /// Map solver EVs (indexed by private_cards order) into the canonical 1326 layout,
 /// dividing by pot to produce pot-relative values.
 fn map_evs_to_combos(
@@ -161,16 +420,39 @@ mod tests {
     use super::*;
     use range_solver::card::index_to_card_pair;
 
+    use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
+    use poker_solver_core::poker::Card as RsPokerCard;
+
     /// Build a test solve config with reasonable defaults.
     fn test_solve_config() -> SolveConfig {
         let bet_sizes =
             BetSizeOptions::try_from(("50%,a", "")).expect("valid test bet sizes");
         SolveConfig {
             bet_sizes,
+            turn_bet_sizes: None,
+            flop_bet_sizes: None,
             solver_iterations: 200,
             target_exploitability: 0.01,
             add_allin_threshold: 1.5,
             force_allin_threshold: 0.15,
+        }
+    }
+
+    /// A trivial evaluator that returns zero CFVs at every boundary.
+    struct ZeroEvaluator;
+
+    impl LeafEvaluator for ZeroEvaluator {
+        fn evaluate(
+            &self,
+            combos: &[[RsPokerCard; 2]],
+            _board: &[RsPokerCard],
+            _pot: f64,
+            _effective_stack: f64,
+            _oop_range: &[f64],
+            _ip_range: &[f64],
+            _traverser: u8,
+        ) -> Vec<f64> {
+            vec![0.0; combos.len()]
         }
     }
 
@@ -358,5 +640,186 @@ mod tests {
         let config = test_solve_config();
         let result = solve_river_pbs(&pbs, &config);
         assert!(result.is_err(), "expected error for non-river board");
+    }
+
+    // -----------------------------------------------------------------------
+    // Depth-limited solving tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_solve_depth_limited_river_delegates() {
+        // A 5-card board should work the same as solve_river_pbs.
+        let board = test_board();
+        let pbs = Pbs::new_uniform(board.clone(), 100, 100);
+        let config = test_solve_config();
+        let evaluator = ZeroEvaluator;
+
+        let result = solve_depth_limited_pbs(&pbs, &config, &evaluator).unwrap();
+
+        // Should produce valid output (same as river solver)
+        assert_eq!(result.oop_cfvs.len(), NUM_COMBOS);
+        assert_eq!(result.ip_cfvs.len(), NUM_COMBOS);
+
+        // Board-blocked combos should be zero
+        for i in 0..NUM_COMBOS {
+            if is_blocked(i, &board) {
+                assert_eq!(result.oop_cfvs[i], 0.0);
+                assert_eq!(result.ip_cfvs[i], 0.0);
+            }
+        }
+
+        // Some non-blocked combos should be non-zero
+        let has_nonzero = result
+            .oop_cfvs
+            .iter()
+            .enumerate()
+            .any(|(i, &v)| !is_blocked(i, &board) && v != 0.0);
+        assert!(has_nonzero, "expected non-zero CFVs from river delegation");
+
+        assert!(result.exploitability.is_finite());
+        assert!(result.oop_game_value.is_finite());
+        assert!(result.ip_game_value.is_finite());
+    }
+
+    #[test]
+    fn test_solve_depth_limited_turn() {
+        // 4-card board: turn PBS
+        // Board: Qs Jh 2c 8d
+        let board = vec![
+            4 * 10 + 3, // Qs = 43
+            4 * 9 + 2,  // Jh = 38
+            4 * 0 + 0,  // 2c = 0
+            4 * 6 + 1,  // 8d = 25
+        ];
+        let pbs = Pbs::new_uniform(board.clone(), 100, 200);
+        let config = test_solve_config();
+        let evaluator = ZeroEvaluator;
+
+        let result = solve_depth_limited_pbs(&pbs, &config, &evaluator).unwrap();
+
+        // Should produce valid output
+        assert_eq!(result.oop_cfvs.len(), NUM_COMBOS);
+        assert_eq!(result.ip_cfvs.len(), NUM_COMBOS);
+
+        // Board-blocked combos should be zero
+        for i in 0..NUM_COMBOS {
+            if is_blocked(i, &board) {
+                assert_eq!(
+                    result.oop_cfvs[i], 0.0,
+                    "blocked combo {i} should have OOP CFV 0.0"
+                );
+                assert_eq!(
+                    result.ip_cfvs[i], 0.0,
+                    "blocked combo {i} should have IP CFV 0.0"
+                );
+            }
+        }
+
+        // Game values should be finite
+        assert!(
+            result.oop_game_value.is_finite(),
+            "OOP game value not finite: {}",
+            result.oop_game_value
+        );
+        assert!(
+            result.ip_game_value.is_finite(),
+            "IP game value not finite: {}",
+            result.ip_game_value
+        );
+        assert!(
+            result.exploitability.is_finite(),
+            "exploitability not finite: {}",
+            result.exploitability
+        );
+    }
+
+    #[test]
+    fn test_solve_depth_limited_flop() {
+        // 3-card board: flop PBS
+        // Board: Qs Jh 2c
+        let board = vec![
+            4 * 10 + 3, // Qs = 43
+            4 * 9 + 2,  // Jh = 38
+            4 * 0 + 0,  // 2c = 0
+        ];
+        let pbs = Pbs::new_uniform(board.clone(), 100, 200);
+        let config = test_solve_config();
+        let evaluator = ZeroEvaluator;
+
+        let result = solve_depth_limited_pbs(&pbs, &config, &evaluator).unwrap();
+
+        // Should produce valid output
+        assert_eq!(result.oop_cfvs.len(), NUM_COMBOS);
+        assert_eq!(result.ip_cfvs.len(), NUM_COMBOS);
+
+        // Board-blocked combos should be zero
+        for i in 0..NUM_COMBOS {
+            if is_blocked(i, &board) {
+                assert_eq!(result.oop_cfvs[i], 0.0);
+                assert_eq!(result.ip_cfvs[i], 0.0);
+            }
+        }
+
+        // Game values should be finite
+        assert!(result.oop_game_value.is_finite());
+        assert!(result.ip_game_value.is_finite());
+        assert!(result.exploitability.is_finite());
+    }
+
+    #[test]
+    fn test_solve_depth_limited_invalid_board_size() {
+        // 2 cards — not a valid street
+        let board = vec![43, 38];
+        let pbs = Pbs::new_uniform(board, 100, 100);
+        let config = test_solve_config();
+        let evaluator = ZeroEvaluator;
+        let result = solve_depth_limited_pbs(&pbs, &config, &evaluator);
+        assert!(result.is_err(), "expected error for 2-card board");
+    }
+
+    #[test]
+    fn test_solve_depth_limited_zero_pot_error() {
+        let board = vec![43, 38, 0, 25]; // turn board
+        let pbs = Pbs::new_uniform(board, 0, 100);
+        let config = test_solve_config();
+        let evaluator = ZeroEvaluator;
+        let result = solve_depth_limited_pbs(&pbs, &config, &evaluator);
+        assert!(result.is_err(), "expected error for zero pot");
+    }
+
+    #[test]
+    fn test_solve_depth_limited_zero_stack_error() {
+        let board = vec![43, 38, 0, 25]; // turn board
+        let pbs = Pbs::new_uniform(board, 100, 0);
+        let config = test_solve_config();
+        let evaluator = ZeroEvaluator;
+        let result = solve_depth_limited_pbs(&pbs, &config, &evaluator);
+        assert!(result.is_err(), "expected error for zero stack");
+    }
+
+    #[test]
+    fn test_u8_to_rs_poker_card_roundtrip() {
+        // Verify card conversion for a few known cards
+        use poker_solver_core::poker::{Suit, Value};
+
+        // 2c = 0
+        let card = u8_to_rs_poker_card(0);
+        assert_eq!(card.value, Value::Two);
+        assert_eq!(card.suit, Suit::Club);
+
+        // As = 51
+        let card = u8_to_rs_poker_card(51);
+        assert_eq!(card.value, Value::Ace);
+        assert_eq!(card.suit, Suit::Spade);
+
+        // Kh = 4*11 + 2 = 46
+        let card = u8_to_rs_poker_card(46);
+        assert_eq!(card.value, Value::King);
+        assert_eq!(card.suit, Suit::Heart);
+
+        // 8d = 4*6 + 1 = 25
+        let card = u8_to_rs_poker_card(25);
+        assert_eq!(card.value, Value::Eight);
+        assert_eq!(card.suit, Suit::Diamond);
     }
 }

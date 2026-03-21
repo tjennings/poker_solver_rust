@@ -19,7 +19,8 @@ use crate::blueprint_sampler::{deal_hand, play_hand};
 use crate::config::RebelConfig;
 use crate::data_buffer::{BufferRecord, DiskBuffer};
 use crate::pbs::{Pbs, NUM_COMBOS};
-use crate::solver::{solve_river_pbs, SolveConfig};
+use crate::solver::{solve_depth_limited_pbs, solve_river_pbs, SolveConfig};
+use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
 
 /// Convert a PBS to a `BufferRecord` for one player's perspective.
 ///
@@ -144,12 +145,14 @@ pub fn buffer_record_to_pbs(rec: &BufferRecord) -> Pbs {
     }
 }
 
-/// Solve all river PBS records in the buffer and fill in their CFVs.
+/// Solve PBS records in the buffer and fill in their CFVs.
 ///
 /// For each record:
 /// 1. Read the `BufferRecord`
 /// 2. Convert to a `Pbs` via `buffer_record_to_pbs`
-/// 3. Solve using `solve_river_pbs()`
+/// 3. Solve:
+///    - If `evaluator` is `Some`, uses `solve_depth_limited_pbs` (supports all streets).
+///    - If `evaluator` is `None`, uses `solve_river_pbs` (river PBSs only).
 /// 4. Write the solved CFVs and game_value back
 ///
 /// Uses rayon for parallel solving across threads.
@@ -157,6 +160,7 @@ pub fn buffer_record_to_pbs(rec: &BufferRecord) -> Pbs {
 pub fn solve_buffer_records(
     buffer: &mut DiskBuffer,
     solve_config: &SolveConfig,
+    evaluator: Option<&(dyn LeafEvaluator + Sync)>,
     threads: usize,
 ) -> usize {
     let total = buffer.len();
@@ -193,17 +197,23 @@ pub fn solve_buffer_records(
                 .filter_map(|(idx, mut rec)| {
                     let pbs = buffer_record_to_pbs(&rec);
 
-                    // Only solve river PBSs (5-card boards)
-                    if pbs.board.len() != 5 {
-                        eprintln!(
-                            "  Warning: skipping non-river record {} ({} board cards)",
-                            idx,
-                            pbs.board.len()
-                        );
-                        return None;
-                    }
+                    let solve_result = if let Some(eval) = evaluator {
+                        // Depth-limited solving: supports all streets (3-5 cards).
+                        solve_depth_limited_pbs(&pbs, solve_config, eval)
+                    } else {
+                        // River-only solving: requires exactly 5 board cards.
+                        if pbs.board.len() != 5 {
+                            eprintln!(
+                                "  Warning: skipping non-river record {} ({} board cards, no evaluator)",
+                                idx,
+                                pbs.board.len()
+                            );
+                            return None;
+                        }
+                        solve_river_pbs(&pbs, solve_config)
+                    };
 
-                    match solve_river_pbs(&pbs, solve_config) {
+                    match solve_result {
                         Ok(result) => {
                             // Fill CFVs based on player perspective
                             if rec.player == 0 {
@@ -243,42 +253,54 @@ pub fn solve_buffer_records(
     solved_count.load(Ordering::Relaxed)
 }
 
-/// Build a `SolveConfig` from the rebel `SeedConfig`.
-///
-/// Converts river bet size fractions to `BetSizeOptions` with `PotRelative`
-/// entries, adding an all-in option.
-pub fn build_solve_config(seed: &crate::config::SeedConfig) -> SolveConfig {
+/// Convert a pair of bet size fraction arrays `[bets, raises]` to per-player
+/// `BetSizeOptions` with `PotRelative` entries and an all-in option.
+fn fractions_to_bet_size_options(
+    fractions: &[Vec<f64>; 2],
+) -> [range_solver::bet_size::BetSizeOptions; 2] {
     use range_solver::bet_size::{BetSize, BetSizeOptions};
 
-    // Convert river bet size fractions to BetSize::PotRelative entries.
-    // river[0] = OOP bet sizes, river[1] = IP bet sizes.
-    // For BetSizeOptions: bet = first bets, raise = raises.
-    // We use river[0] for bets (OOP's first action) and river[1] for raises.
-    let mut bets: Vec<BetSize> = seed
-        .bet_sizes
-        .river[0]
-        .iter()
-        .map(|&f| BetSize::PotRelative(f))
-        .collect();
-    bets.push(BetSize::AllIn);
-    bets.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    // OOP: fractions[0] = bets, fractions[1] = raises
+    let build_one = |bet_fracs: &[f64], raise_fracs: &[f64]| {
+        let mut bets: Vec<BetSize> = bet_fracs
+            .iter()
+            .map(|&f| BetSize::PotRelative(f))
+            .collect();
+        bets.push(BetSize::AllIn);
+        bets.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
-    let mut raises: Vec<BetSize> = seed
-        .bet_sizes
-        .river[1]
-        .iter()
-        .map(|&f| BetSize::PotRelative(f))
-        .collect();
-    raises.push(BetSize::AllIn);
-    raises.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut raises: Vec<BetSize> = raise_fracs
+            .iter()
+            .map(|&f| BetSize::PotRelative(f))
+            .collect();
+        raises.push(BetSize::AllIn);
+        raises.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
-    let bet_sizes = BetSizeOptions {
-        bet: bets,
-        raise: raises,
+        BetSizeOptions {
+            bet: bets,
+            raise: raises,
+        }
     };
 
+    // Both players use the same bet/raise structure for simplicity.
+    // fractions[0] = bet sizes, fractions[1] = raise sizes.
+    let opts = build_one(&fractions[0], &fractions[1]);
+    [opts.clone(), opts]
+}
+
+/// Build a `SolveConfig` from the rebel `SeedConfig`.
+///
+/// Converts bet size fractions for each street to `BetSizeOptions` with
+/// `PotRelative` entries, adding an all-in option.
+pub fn build_solve_config(seed: &crate::config::SeedConfig) -> SolveConfig {
+    let river_sizes = fractions_to_bet_size_options(&seed.bet_sizes.river);
+    let turn_sizes = fractions_to_bet_size_options(&seed.bet_sizes.turn);
+    let flop_sizes = fractions_to_bet_size_options(&seed.bet_sizes.flop);
+
     SolveConfig {
-        bet_sizes,
+        bet_sizes: river_sizes[0].clone(),
+        turn_bet_sizes: Some(turn_sizes),
+        flop_bet_sizes: Some(flop_sizes),
         solver_iterations: seed.solver_iterations,
         target_exploitability: seed.target_exploitability,
         add_allin_threshold: seed.add_allin_threshold,
@@ -581,13 +603,15 @@ mod tests {
 
         let solve_config = SolveConfig {
             bet_sizes: BetSizeOptions::try_from(("50%,a", "")).expect("valid bet sizes"),
+            turn_bet_sizes: None,
+            flop_bet_sizes: None,
             solver_iterations: 100,
             target_exploitability: 0.05,
             add_allin_threshold: 1.5,
             force_allin_threshold: 0.15,
         };
 
-        let solved = solve_buffer_records(&mut buffer, &solve_config, 2);
+        let solved = solve_buffer_records(&mut buffer, &solve_config, None, 2);
         assert_eq!(solved, 4, "expected all 4 records to be solved");
 
         // Verify CFVs are non-zero for at least some combos

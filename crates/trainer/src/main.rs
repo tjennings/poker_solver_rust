@@ -1056,6 +1056,7 @@ fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
     let solved = rebel::generate::solve_buffer_records(
         &mut buf,
         &solve_config,
+        None,
         rebel_config.seed.threads,
     );
     eprintln!(
