@@ -549,6 +549,47 @@ impl LeafEvaluator for RolloutLeafEvaluator {
             self.bias, active, combos.len(), requests.len(), elapsed.as_secs_f64() * 1000.0
         );
 
+        // Diagnostic: dump rollout chip values for hands of interest.
+        // Only log for Unbiased on the first traverser to avoid spam.
+        if self.bias == BiasType::Unbiased && traverser == 0 {
+            let mut samples: Vec<(String, f64, f64)> = combos
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| hero_range[*i] > 0.0)
+                .map(|(i, combo)| {
+                    let name = format!("{}{}", combo[0], combo[1]);
+                    let chip_val = chip_values[i];
+                    let pot_frac = if requests.is_empty() { 0.0 } else { chip_val / (requests[0].0 / 2.0) };
+                    (name, chip_val, pot_frac)
+                })
+                .collect();
+            samples.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let n = samples.len();
+            eprintln!("[rollout audit] TOP 10 (highest chip value):");
+            for (name, chip, pf) in samples.iter().take(10) {
+                eprintln!("  {name:<8} chips={chip:>8.2}  pot_frac={pf:>+.4}");
+            }
+            eprintln!("[rollout audit] BOTTOM 10 (lowest chip value):");
+            for (name, chip, pf) in samples.iter().rev().take(10) {
+                eprintln!("  {name:<8} chips={chip:>8.2}  pot_frac={pf:>+.4}");
+            }
+            // Look for specific hands of interest
+            let targets = ["7s6s", "6s5s", "6s4s", "5s4s", "7h6h", "6h5h", "AsKs", "AhKh", "QdJd"];
+            let found: Vec<_> = samples.iter()
+                .filter(|(name, _, _)| targets.iter().any(|t| name.contains(t) || {
+                    // Also match reversed card order
+                    let rev: String = t.chars().collect::<Vec<_>>().chunks(2).rev().flatten().collect();
+                    name.contains(&rev)
+                }))
+                .collect();
+            if !found.is_empty() {
+                eprintln!("[rollout audit] HANDS OF INTEREST:");
+                for (name, chip, pf) in &found {
+                    eprintln!("  {name:<8} chips={chip:>8.2}  pot_frac={pf:>+.4}");
+                }
+            }
+        }
+
         // Normalize per-boundary by each boundary's half_pot.
         requests
             .iter()
