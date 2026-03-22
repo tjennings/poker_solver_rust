@@ -1198,51 +1198,6 @@ pub fn fast_kmeans_1d(
     (labels, centroid_vals)
 }
 
-/// Convenience wrapper for histogram clustering.
-///
-/// Converts `u8` histograms to `f32` feature vectors and runs fast_kmeans.
-/// Returns labels + centroids as `Vec<Vec<f32>>`.
-#[allow(clippy::cast_possible_truncation)]
-#[must_use]
-pub fn fast_kmeans_histogram(
-    histograms: &[Vec<u8>],
-    k: usize,
-    max_iters: u32,
-    seed: u64,
-) -> (Vec<u16>, Vec<Vec<f32>>) {
-    let features: Vec<Vec<f32>> = histograms
-        .iter()
-        .map(|h| h.iter().map(|&v| f32::from(v)).collect())
-        .collect();
-    fast_kmeans(&features, k, max_iters, seed)
-}
-
-/// Assign a single u8 histogram point to the nearest centroid by L2 distance.
-///
-/// Used in the exhaustive assignment phase after `fast_kmeans_histogram`
-/// finds centroids.
-#[allow(clippy::cast_possible_truncation)]
-#[must_use]
-pub fn nearest_centroid_l2(point: &[u8], centroids: &[Vec<f32>]) -> u16 {
-    let mut best_idx = 0_u16;
-    let mut best_dist = f32::MAX;
-    for (ci, centroid) in centroids.iter().enumerate() {
-        let d: f32 = point
-            .iter()
-            .zip(centroid.iter())
-            .map(|(&p, &c)| {
-                let diff = f32::from(p) - c;
-                diff * diff
-            })
-            .sum();
-        if d < best_dist {
-            best_dist = d;
-            best_idx = ci as u16;
-        }
-    }
-    best_idx
-}
-
 // ---------------------------------------------------------------------------
 // Centroid EV computation, sorting, and label remapping
 // ---------------------------------------------------------------------------
