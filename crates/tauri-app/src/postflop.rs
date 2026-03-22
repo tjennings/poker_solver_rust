@@ -363,6 +363,7 @@ impl LeafEvaluator for EquityLeafEvaluator {
 ///
 /// CBVs encode strategic information (fold equity, future street potential,
 /// flush draw value, etc.) that raw showdown equity misses.
+#[allow(dead_code)] // retained as fallback; rollout evaluators are now primary
 struct BlueprintCbvEvaluator {
     /// Pre-computed CBV values per boundary in pot-fraction units.
     /// Indexed by boundary ordinal, each entry is a per-combo Vec.
@@ -371,6 +372,7 @@ struct BlueprintCbvEvaluator {
     call_index: std::cell::Cell<usize>,
 }
 
+#[allow(dead_code)]
 impl BlueprintCbvEvaluator {
     /// Build a CBV evaluator for the given subgame tree and blueprint data.
     ///
@@ -499,14 +501,12 @@ impl LeafEvaluator for BlueprintCbvEvaluator {
 // ---------------------------------------------------------------------------
 
 /// Returns true if either card in `hand` appears on the `board`.
-#[allow(dead_code)] // used by RolloutLeafEvaluator; wired in Task 6
 fn hand_conflicts_board(hand: &[RsPokerCard; 2], board: &[RsPokerCard]) -> bool {
     board.iter().any(|b| hand[0] == *b || hand[1] == *b)
 }
 
 /// Sample `n` indices weighted by `weights`, returning indices into the weights
 /// array.  Returns empty if total weight is zero or `n` is zero.
-#[allow(dead_code)] // used by RolloutLeafEvaluator; wired in Task 6
 fn sample_weighted(rng: &mut impl Rng, weights: &[f64], n: u32) -> Vec<usize> {
     let total: f64 = weights.iter().sum();
     if total <= 0.0 {
@@ -536,7 +536,6 @@ fn sample_weighted(rng: &mut impl Rng, weights: &[f64], n: u32) -> Vec<usize> {
 /// For each hero combo, samples opponent hands weighted by reach probabilities,
 /// performs fixed-strategy rollouts from the boundary node, and averages the
 /// results.  Returns per-combo CFVs in pot-fraction units.
-#[allow(dead_code)] // wired into build_subgame_solver in Task 6
 struct RolloutLeafEvaluator {
     strategy: Arc<BlueprintV2Strategy>,
     abstract_tree: Arc<GameTree>,
@@ -549,7 +548,6 @@ struct RolloutLeafEvaluator {
     num_opponent_samples: u32,
 }
 
-#[allow(dead_code)] // wired into build_subgame_solver in Task 6
 impl RolloutLeafEvaluator {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -708,12 +706,33 @@ pub fn build_subgame_solver(
         _ => return Err("Subgame tree root is not a decision node".to_string()),
     };
 
-    let evaluator: Box<dyn LeafEvaluator> = if let (Some(ctx), Some(abs_node)) = (cbv_context, abstract_node_idx) {
-        eprintln!("[subgame] using BlueprintCbvEvaluator (abstract_node={abs_node})");
-        Box::new(BlueprintCbvEvaluator::new(&tree, ctx, &hands, board_cards, street, abs_node))
+    let evaluators: Vec<Box<dyn LeafEvaluator>> = if let (Some(ctx), Some(abs_node)) = (cbv_context, abstract_node_idx) {
+        eprintln!("[subgame] using RolloutLeafEvaluator x4 (abstract_node={abs_node})");
+        let strategy = Arc::clone(&ctx.strategy);
+        let abstract_tree = Arc::new(ctx.abstract_tree.clone());
+        let all_buckets = Arc::clone(&ctx.all_buckets);
+
+        vec![
+            Box::new(RolloutLeafEvaluator::new(
+                Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
+                abs_node, BiasType::Unbiased, 10.0, 3, 8,
+            )) as Box<dyn LeafEvaluator>,
+            Box::new(RolloutLeafEvaluator::new(
+                Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
+                abs_node, BiasType::Fold, 10.0, 3, 8,
+            )),
+            Box::new(RolloutLeafEvaluator::new(
+                Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
+                abs_node, BiasType::Call, 10.0, 3, 8,
+            )),
+            Box::new(RolloutLeafEvaluator::new(
+                Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
+                abs_node, BiasType::Raise, 10.0, 3, 8,
+            )),
+        ]
     } else {
         eprintln!("[subgame] using EquityLeafEvaluator (no CBV context)");
-        Box::new(EquityLeafEvaluator)
+        vec![Box::new(EquityLeafEvaluator)]
     };
     // Map 1326-element weight vectors to SubgameHands ordering.
     let map_weights = |weights: &[f32]| -> Vec<f64> {
@@ -735,7 +754,7 @@ pub fn build_subgame_solver(
         tree.clone(),
         hands.clone(),
         board_cards,
-        vec![evaluator],
+        evaluators,
         starting_stack,
         oop_reach,
         ip_reach,
@@ -763,7 +782,8 @@ pub fn build_subgame_solver(
 pub struct CbvContext {
     pub cbv_table: CbvTable,
     pub abstract_tree: GameTree,
-    pub all_buckets: AllBuckets,
+    pub all_buckets: Arc<AllBuckets>,
+    pub strategy: Arc<BlueprintV2Strategy>,
 }
 
 /// Set the CBV context on `PostflopState` for use by the depth-limited solver.
@@ -1619,6 +1639,14 @@ fn solve_depth_limited(
                         eprintln!("    str_sums: {}", ssum_str.join(" "));
                         shown += 1;
                     }
+                }
+
+                // Log final choice node mix if using multi-valued evaluation.
+                if solver.choice_regrets().len() > 1 {
+                    let choice_mix = solver.choice_strategy();
+                    let mix_str = CfvSubgameSolver::format_choice_mix(max_iters, &choice_mix);
+                    eprintln!("[choice audit] final mix: {mix_str}");
+                    eprintln!("[choice regrets] {:?}", solver.choice_regrets());
                 }
 
                 // Store subgame result for range propagation and navigation.
@@ -3052,5 +3080,63 @@ mod tests {
             total_checked += 1;
         }
         assert!(total_checked > 0, "should have combos with strategies");
+    }
+
+    #[test]
+    fn test_cbv_context_has_strategy_and_arc_all_buckets() {
+        // CbvContext must store Arc<BlueprintV2Strategy> and Arc<AllBuckets>
+        // so the RolloutLeafEvaluator can share them cheaply across 4 instances.
+        use poker_solver_core::blueprint_v2::cbv::CbvTable;
+
+        let strategy = Arc::new(BlueprintV2Strategy::empty());
+        let tree = GameTree::build_subgame(
+            V2Street::Turn, 100.0, [50.0; 2], 200.0, &[vec![1.0]], Some(1),
+        );
+        let all_buckets = Arc::new(AllBuckets::new([2, 2, 2, 2], [None, None, None, None]));
+        let cbv_table = CbvTable { values: vec![], node_offsets: vec![], buckets_per_node: vec![] };
+
+        let ctx = CbvContext {
+            cbv_table,
+            abstract_tree: tree,
+            all_buckets: Arc::clone(&all_buckets),
+            strategy: Arc::clone(&strategy),
+        };
+
+        // Verify the Arc fields are accessible and can be cloned cheaply
+        // (this is the interface needed by build_subgame_solver).
+        let _s: Arc<BlueprintV2Strategy> = Arc::clone(&ctx.strategy);
+        let _b: Arc<AllBuckets> = Arc::clone(&ctx.all_buckets);
+    }
+
+    #[test]
+    fn test_rollout_evaluator_constructible_from_cbv_context_arcs() {
+        // Verify RolloutLeafEvaluator can be constructed from Arc fields
+        // that CbvContext now provides, for all 4 bias types.
+        let strategy = Arc::new(BlueprintV2Strategy::empty());
+        let tree = Arc::new(GameTree::build_subgame(
+            V2Street::Turn, 100.0, [50.0; 2], 200.0, &[vec![1.0]], Some(1),
+        ));
+        let all_buckets = Arc::new(AllBuckets::new([2, 2, 2, 2], [None, None, None, None]));
+
+        let evaluators: Vec<Box<dyn LeafEvaluator>> = vec![
+            Box::new(RolloutLeafEvaluator::new(
+                Arc::clone(&strategy), Arc::clone(&tree), Arc::clone(&all_buckets),
+                0, BiasType::Unbiased, 10.0, 3, 8,
+            )),
+            Box::new(RolloutLeafEvaluator::new(
+                Arc::clone(&strategy), Arc::clone(&tree), Arc::clone(&all_buckets),
+                0, BiasType::Fold, 10.0, 3, 8,
+            )),
+            Box::new(RolloutLeafEvaluator::new(
+                Arc::clone(&strategy), Arc::clone(&tree), Arc::clone(&all_buckets),
+                0, BiasType::Call, 10.0, 3, 8,
+            )),
+            Box::new(RolloutLeafEvaluator::new(
+                Arc::clone(&strategy), Arc::clone(&tree), Arc::clone(&all_buckets),
+                0, BiasType::Raise, 10.0, 3, 8,
+            )),
+        ];
+
+        assert_eq!(evaluators.len(), 4, "should create exactly 4 rollout evaluators");
     }
 }

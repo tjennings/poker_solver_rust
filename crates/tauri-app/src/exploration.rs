@@ -422,6 +422,7 @@ pub fn populate_cbv_context(
 
     let StrategySource::BlueprintV2 {
         config,
+        strategy,
         tree,
         cbv_table: Some(cbv_table),
         bundle_dir,
@@ -492,7 +493,8 @@ pub fn populate_cbv_context(
     let ctx = crate::postflop::CbvContext {
         cbv_table: cbv_table.clone(),
         abstract_tree: (**tree).clone(),
-        all_buckets,
+        all_buckets: Arc::new(all_buckets),
+        strategy: Arc::new((**strategy).clone()),
     };
 
     eprintln!("CBV context populated for depth-limited solving");

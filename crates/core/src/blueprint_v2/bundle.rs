@@ -32,7 +32,7 @@ use super::storage::BlueprintStorage;
 /// Stores per-decision-node action probabilities as `f32` in the same
 /// flat layout used by [`BlueprintStorage`], but with concrete
 /// probabilities instead of raw regrets / strategy sums.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlueprintV2Strategy {
     /// Per-decision-node flat `f32` action probabilities.
     ///
