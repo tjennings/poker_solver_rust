@@ -1668,6 +1668,49 @@ fn solve_depth_limited(
                     eprintln!("[SC DEBUG] === End Suited Connector Dive ===\n");
                 }
 
+                // Diagnostic: dump IP's strategy at decision nodes facing OOP's all-in.
+                {
+                    use poker_solver_core::blueprint_v2::game_tree::{GameNode as GN, TreeAction as TA};
+                    let avg_strat = solver.strategy();
+                    let n = hands.combos.len();
+
+                    // Find the OOP root's all-in child, then look for IP decision node.
+                    if let GN::Decision { actions, children, .. } = &tree.nodes[tree.root as usize] {
+                        // Find the all-in action index
+                        if let Some(ai_idx) = actions.iter().position(|a| matches!(a, TA::AllIn)) {
+                            let ai_child = children[ai_idx] as usize;
+                            // ai_child should be IP's fold/call decision
+                            if let GN::Decision { player, actions: ip_actions, .. } = &tree.nodes[ai_child] {
+                                let ip_labels: Vec<String> = ip_actions.iter().map(|a| format!("{a:?}")).collect();
+                                eprintln!("\n[IP DEBUG] IP decision node {} facing all-in (player={player}): actions={ip_labels:?}", ai_child);
+
+                                // Show IP strategy for first 15 combos with IP reach
+                                let mut shown = 0;
+                                for combo_idx in 0..n {
+                                    if shown >= 15 { break; }
+                                    let c = hands.combos[combo_idx];
+                                    let reach_id0 = rs_poker_card_to_id(c[0]);
+                                    let reach_id1 = rs_poker_card_to_id(c[1]);
+                                    let ci = card_pair_to_index(reach_id0, reach_id1);
+                                    let ip_reach = ip_w[ci];
+                                    if ip_reach <= 0.0 { continue; }
+
+                                    let probs = avg_strat.get_probs(ai_child as u32, combo_idx);
+                                    let name = format!("{}{}", c[0], c[1]);
+                                    if !probs.is_empty() {
+                                        let probs_str: Vec<String> = probs.iter()
+                                            .zip(ip_labels.iter())
+                                            .map(|(p, l)| format!("{l}={:.1}%", p * 100.0))
+                                            .collect();
+                                        eprintln!("[IP DEBUG] {name} (reach={ip_reach:.3}): {}", probs_str.join("  "));
+                                    }
+                                    shown += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Log final choice node mix if using multi-valued evaluation.
                 if solver.choice_regrets().len() > 1 {
                     let choice_mix = solver.choice_strategy();
