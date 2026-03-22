@@ -17,6 +17,8 @@ lru = "0.12"
 poker-solver-core = { path = "../core" }
 range-solver = { path = "../range-solver" }
 rs_poker = { workspace = true }
+rand = "0.9.2"
+rayon = { workspace = true }
 
 [dev-dependencies]
 test-macros = { path = "../test-macros" }

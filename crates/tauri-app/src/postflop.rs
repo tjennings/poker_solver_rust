@@ -1,8 +1,11 @@
 use parking_lot::{Mutex, RwLock};
+use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
+use poker_solver_core::blueprint_v2::continuation::{BiasType, rollout_from_boundary};
 use poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id;
 use poker_solver_core::blueprint_v2::solver_dispatch::{
     self, SolverChoice, SolverConfig, Street,
 };
+use poker_solver_core::blueprint_v2::subgame_cfr::cards_overlap;
 use poker_solver_core::blueprint_v2::{
     CfvSubgameSolver, LeafEvaluator, SubgameHands, SubgameStrategy,
     compute_combo_equities, build_boundary_mapping,
@@ -12,6 +15,10 @@ use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKin
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 use poker_solver_core::blueprint_v2::Street as V2Street;
 use poker_solver_core::poker::{Card as RsPokerCard, Suit as RsPokerSuit, Value as RsPokerValue};
+use rand::Rng;
+use rand::SeedableRng;
+use rand::rngs::SmallRng;
+use rayon::prelude::*;
 use range_solver::action_tree::{Action, ActionTree, BoardState, TreeConfig};
 use range_solver::bet_size::BetSizeOptions;
 use range_solver::card::{card_from_str, card_pair_to_index, card_to_string, CardConfig, NOT_DEALT};
@@ -484,6 +491,161 @@ impl LeafEvaluator for BlueprintCbvEvaluator {
         let idx = self.call_index.get() % self.boundary_cfvs.len();
         self.call_index.set(self.call_index.get() + 1);
         self.boundary_cfvs[idx].clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RolloutLeafEvaluator helpers
+// ---------------------------------------------------------------------------
+
+/// Returns true if either card in `hand` appears on the `board`.
+#[allow(dead_code)] // used by RolloutLeafEvaluator; wired in Task 6
+fn hand_conflicts_board(hand: &[RsPokerCard; 2], board: &[RsPokerCard]) -> bool {
+    board.iter().any(|b| hand[0] == *b || hand[1] == *b)
+}
+
+/// Sample `n` indices weighted by `weights`, returning indices into the weights
+/// array.  Returns empty if total weight is zero or `n` is zero.
+#[allow(dead_code)] // used by RolloutLeafEvaluator; wired in Task 6
+fn sample_weighted(rng: &mut impl Rng, weights: &[f64], n: u32) -> Vec<usize> {
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 {
+        return vec![];
+    }
+    let mut samples = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let mut r = rng.random::<f64>() * total;
+        for (i, &w) in weights.iter().enumerate() {
+            r -= w;
+            if r <= 0.0 {
+                samples.push(i);
+                break;
+            }
+        }
+    }
+    samples
+}
+
+// ---------------------------------------------------------------------------
+// RolloutLeafEvaluator — Monte Carlo rollout-based evaluator
+// ---------------------------------------------------------------------------
+
+/// Evaluates depth boundary nodes by performing Monte Carlo rollouts through
+/// the blueprint strategy tree.
+///
+/// For each hero combo, samples opponent hands weighted by reach probabilities,
+/// performs fixed-strategy rollouts from the boundary node, and averages the
+/// results.  Returns per-combo CFVs in pot-fraction units.
+#[allow(dead_code)] // wired into build_subgame_solver in Task 6
+struct RolloutLeafEvaluator {
+    strategy: Arc<BlueprintV2Strategy>,
+    abstract_tree: Arc<GameTree>,
+    all_buckets: Arc<AllBuckets>,
+    decision_idx_map: Vec<u32>,
+    abstract_start_node: u32,
+    bias: BiasType,
+    bias_factor: f64,
+    num_rollouts: u32,
+    num_opponent_samples: u32,
+}
+
+#[allow(dead_code)] // wired into build_subgame_solver in Task 6
+impl RolloutLeafEvaluator {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        strategy: Arc<BlueprintV2Strategy>,
+        abstract_tree: Arc<GameTree>,
+        all_buckets: Arc<AllBuckets>,
+        abstract_start_node: u32,
+        bias: BiasType,
+        bias_factor: f64,
+        num_rollouts: u32,
+        num_opponent_samples: u32,
+    ) -> Self {
+        let decision_idx_map = abstract_tree.decision_index_map();
+        Self {
+            strategy,
+            abstract_tree,
+            all_buckets,
+            decision_idx_map,
+            abstract_start_node,
+            bias,
+            bias_factor,
+            num_rollouts,
+            num_opponent_samples,
+        }
+    }
+}
+
+impl LeafEvaluator for RolloutLeafEvaluator {
+    fn evaluate(
+        &self,
+        combos: &[[RsPokerCard; 2]],
+        board: &[RsPokerCard],
+        pot: f64,
+        _effective_stack: f64,
+        oop_range: &[f64],
+        ip_range: &[f64],
+        traverser: u8,
+    ) -> Vec<f64> {
+        let half_pot = pot / 2.0;
+        let opp_range = if traverser == 0 { ip_range } else { oop_range };
+
+        combos
+            .par_iter()
+            .enumerate()
+            .map(|(i, hero_hand)| {
+                // Build opponent sampling weights: zero out combos that
+                // conflict with hero hand or board.
+                let weights: Vec<f64> = combos
+                    .iter()
+                    .enumerate()
+                    .map(|(j, opp_hand)| {
+                        if opp_range[j] <= 0.0
+                            || cards_overlap(*hero_hand, *opp_hand)
+                            || hand_conflicts_board(opp_hand, board)
+                        {
+                            0.0
+                        } else {
+                            opp_range[j]
+                        }
+                    })
+                    .collect();
+
+                // Seed deterministically per-combo for reproducibility.
+                let mut rng = SmallRng::seed_from_u64(i as u64);
+                let sampled = sample_weighted(&mut rng, &weights, self.num_opponent_samples);
+                if sampled.is_empty() {
+                    return 0.0;
+                }
+
+                let total: f64 = sampled
+                    .iter()
+                    .map(|&j| {
+                        let opp_hand = combos[j];
+                        rollout_from_boundary(
+                            *hero_hand,
+                            opp_hand,
+                            board,
+                            &self.abstract_tree,
+                            self.abstract_start_node,
+                            &self.decision_idx_map,
+                            &self.strategy,
+                            &self.all_buckets,
+                            self.bias,
+                            self.bias_factor,
+                            traverser,
+                            self.num_rollouts,
+                            &mut rng,
+                        )
+                    })
+                    .sum();
+
+                let avg_chips = total / sampled.len() as f64;
+                // Convert from chip value to pot-fraction units.
+                avg_chips / half_pot
+            })
+            .collect()
     }
 }
 
@@ -2148,6 +2310,126 @@ pub fn postflop_load_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // RolloutLeafEvaluator helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hand_conflicts_board_no_overlap() {
+        let hand = [
+            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
+        ];
+        let board = [
+            RsPokerCard::new(RsPokerValue::Queen, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Jack, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Spade),
+        ];
+        assert!(!hand_conflicts_board(&hand, &board));
+    }
+
+    #[test]
+    fn test_hand_conflicts_board_first_card_overlaps() {
+        let hand = [
+            RsPokerCard::new(RsPokerValue::Queen, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
+        ];
+        let board = [
+            RsPokerCard::new(RsPokerValue::Queen, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Jack, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Spade),
+        ];
+        assert!(hand_conflicts_board(&hand, &board));
+    }
+
+    #[test]
+    fn test_hand_conflicts_board_second_card_overlaps() {
+        let hand = [
+            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Spade),
+        ];
+        let board = [
+            RsPokerCard::new(RsPokerValue::Queen, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Jack, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Spade),
+        ];
+        assert!(hand_conflicts_board(&hand, &board));
+    }
+
+    #[test]
+    fn test_hand_conflicts_board_empty_board() {
+        let hand = [
+            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
+        ];
+        assert!(!hand_conflicts_board(&hand, &[]));
+    }
+
+    #[test]
+    fn test_sample_weighted_basic() {
+        use rand::SeedableRng;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(42);
+        let weights = [0.0, 1.0, 0.0]; // only index 1 has weight
+        let samples = sample_weighted(&mut rng, &weights, 5);
+        assert_eq!(samples.len(), 5);
+        for &s in &samples {
+            assert_eq!(s, 1); // all samples must be index 1
+        }
+    }
+
+    #[test]
+    fn test_sample_weighted_empty_weights() {
+        use rand::SeedableRng;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(42);
+        let weights: [f64; 0] = [];
+        let samples = sample_weighted(&mut rng, &weights, 5);
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn test_sample_weighted_all_zero() {
+        use rand::SeedableRng;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(42);
+        let weights = [0.0, 0.0, 0.0];
+        let samples = sample_weighted(&mut rng, &weights, 5);
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn test_sample_weighted_respects_distribution() {
+        use rand::SeedableRng;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(123);
+        // 90% weight on index 0, 10% on index 1
+        let weights = [9.0, 1.0];
+        let samples = sample_weighted(&mut rng, &weights, 1000);
+        assert_eq!(samples.len(), 1000);
+        let count_0 = samples.iter().filter(|&&s| s == 0).count();
+        // With 90/10 split over 1000 samples, index 0 should get ~900
+        assert!(count_0 > 800, "expected ~900 samples at index 0, got {count_0}");
+        assert!(count_0 < 980, "expected ~900 samples at index 0, got {count_0}");
+    }
+
+    #[test]
+    fn test_sample_weighted_zero_samples_requested() {
+        use rand::SeedableRng;
+        use rand::rngs::SmallRng;
+        let mut rng = SmallRng::seed_from_u64(42);
+        let weights = [1.0, 2.0];
+        let samples = sample_weighted(&mut rng, &weights, 0);
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn test_rollout_leaf_evaluator_implements_leaf_evaluator() {
+        // Compile-time check: RolloutLeafEvaluator implements LeafEvaluator.
+        fn _assert_impl<T: LeafEvaluator>() {}
+        _assert_impl::<RolloutLeafEvaluator>();
+    }
 
     #[test]
     fn test_card_pair_to_matrix_pair() {
