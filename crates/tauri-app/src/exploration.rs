@@ -2971,6 +2971,7 @@ mod tests {
                 dcfr_alpha: 1.5,
                 dcfr_beta: 0.5,
                 dcfr_gamma: 2.0,
+                dcfr_epoch_cap: None,
                 target_strategy_delta: None,
                 purify_threshold: 0.0,
                 equity_cache_path: None,

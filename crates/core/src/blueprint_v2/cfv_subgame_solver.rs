@@ -832,7 +832,11 @@ impl CfvSubgameSolver {
                                 &requests,
                             );
                             for (b_idx, cfvs) in batch.into_iter().enumerate() {
-                                self.leaf_cfvs[b_idx] = cfvs;
+                                // Clamp: pot-fraction CFV can never be negative.
+                                // The player can always fold for 0 EV.
+                                self.leaf_cfvs[b_idx] = cfvs.into_iter()
+                                    .map(|v| v.max(0.0))
+                                    .collect();
                             }
 
                             // Scale opponent reach by choice probability for
@@ -928,7 +932,11 @@ impl CfvSubgameSolver {
                             &requests,
                         );
                         for (b_idx, cfvs) in batch.into_iter().enumerate() {
-                            self.leaf_cfvs[b_idx] = cfvs;
+                            // Clamp: pot-fraction CFV can never be negative.
+                            // The player can always fold for 0 EV.
+                            self.leaf_cfvs[b_idx] = cfvs.into_iter()
+                                .map(|v| v.max(0.0))
+                                .collect();
                         }
                         if traverser == 0
                             && (self.iteration == 1

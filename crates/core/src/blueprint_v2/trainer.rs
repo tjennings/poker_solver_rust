@@ -698,6 +698,7 @@ impl BlueprintTrainer {
     fn apply_lcfr_discount(&mut self) {
         let interval = self.config.training.lcfr_discount_interval.max(1);
         let t = self.iterations / interval;
+        let t = self.config.training.dcfr_epoch_cap.map_or(t, |cap| t.min(cap));
         let tf = t as f64;
 
         let alpha = self.config.training.dcfr_alpha;
@@ -1174,6 +1175,7 @@ mod tests {
                 dcfr_alpha: 1.0,
                 dcfr_beta: 1.0,
                 dcfr_gamma: 1.0,
+                dcfr_epoch_cap: None,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 9999,
@@ -1285,6 +1287,74 @@ mod tests {
         assert_eq!(
             trainer.storage.strategy_sums[0].load(Ordering::Relaxed),
             0
+        );
+    }
+
+    #[test]
+    fn dcfr_epoch_cap_limits_discount() {
+        let mut config = toy_config();
+        config.training.dcfr_alpha = 1.0;
+        config.training.dcfr_beta = 1.0;
+        config.training.dcfr_gamma = 1.0;
+        config.training.lcfr_discount_interval = 1;
+        config.training.dcfr_epoch_cap = Some(5);
+        let mut trainer = BlueprintTrainer::new(config);
+
+        // Seed a known regret and strategy sum value.
+        trainer.storage.regrets[0].store(1000, Ordering::Relaxed);
+        trainer.storage.strategy_sums[0].store(2000, Ordering::Relaxed);
+
+        // Set iterations to 10, which without the cap would give t=10.
+        // With cap=5, t should be clamped to 5.
+        trainer.iterations = 10;
+        trainer.apply_lcfr_discount();
+
+        // d_pos = 5^1 / (5^1 + 1) = 5/6 ≈ 0.8333
+        // regret: (1000 * 5/6) as i32 = 833
+        let expected_regret = (1000.0 * 5.0 / 6.0) as i32;
+        assert_eq!(
+            trainer.storage.regrets[0].load(Ordering::Relaxed),
+            expected_regret,
+        );
+
+        // d_strat = (5/6)^1 = 5/6 ≈ 0.8333
+        // strategy_sum: (2000 * 5/6) as i64 = 1666
+        let expected_strat = (2000.0 * 5.0 / 6.0) as i64;
+        assert_eq!(
+            trainer.storage.strategy_sums[0].load(Ordering::Relaxed),
+            expected_strat,
+        );
+    }
+
+    #[test]
+    fn dcfr_epoch_cap_none_preserves_behavior() {
+        let mut config = toy_config();
+        config.training.dcfr_alpha = 1.0;
+        config.training.dcfr_beta = 1.0;
+        config.training.dcfr_gamma = 1.0;
+        config.training.lcfr_discount_interval = 1;
+        config.training.dcfr_epoch_cap = None;
+        let mut trainer = BlueprintTrainer::new(config);
+
+        trainer.storage.regrets[0].store(1000, Ordering::Relaxed);
+        trainer.storage.strategy_sums[0].store(2000, Ordering::Relaxed);
+
+        // With no cap and iterations=10, t=10 is used directly.
+        trainer.iterations = 10;
+        trainer.apply_lcfr_discount();
+
+        // d_pos = 10^1 / (10^1 + 1) = 10/11 ≈ 0.9091
+        let expected_regret = (1000.0 * 10.0 / 11.0) as i32;
+        assert_eq!(
+            trainer.storage.regrets[0].load(Ordering::Relaxed),
+            expected_regret,
+        );
+
+        // d_strat = (10/11)^1 ≈ 0.9091
+        let expected_strat = (2000.0 * 10.0 / 11.0) as i64;
+        assert_eq!(
+            trainer.storage.strategy_sums[0].load(Ordering::Relaxed),
+            expected_strat,
         );
     }
 
