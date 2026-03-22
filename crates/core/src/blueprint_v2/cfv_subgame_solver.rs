@@ -248,7 +248,13 @@ impl CfvSubgameSolver {
             evaluators,
             choice_regret_sum: vec![0.0; k],
             choice_strategy_sum: vec![0.0; k],
-            dcfr: DcfrParams::default(),
+            dcfr: DcfrParams::from_config(
+                crate::cfr::dcfr::CfrVariant::Dcfr,
+                1.5,  // alpha: positive regret discount
+                0.0,  // beta: negative regret discount (0 = aggressive decay)
+                2.0,  // gamma: strategy sum discount
+                10,   // warmup: no discounting for first 10 iterations
+            ),
             iteration: 0,
             starting_stack,
             opp_reach_totals,
