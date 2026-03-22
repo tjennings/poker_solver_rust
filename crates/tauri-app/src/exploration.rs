@@ -1045,6 +1045,23 @@ fn get_strategy_matrix_v2(
         Street::River => "River",
     };
     let is_preflop = street_enum == Street::Preflop;
+
+    // Check that the board has enough cards for the tree node's street.
+    // walk_v2_tree auto-skips chance nodes, so the tree can advance to
+    // Turn while the board only has 3 cards. Return the street name so
+    // the frontend knows to prompt for the next card.
+    let required_cards = match street_enum {
+        Street::Preflop => 0,
+        Street::Flop => 3,
+        Street::Turn => 4,
+        Street::River => 5,
+    };
+    if position.board.len() < required_cards {
+        return Err(format!(
+            "street_transition:{street_name}:Board has {} cards but {street_name} requires {required_cards}",
+            position.board.len(),
+        ));
+    }
     let num_buckets = strategy.bucket_counts[
         strategy.node_street_indices[decision_idx as usize] as usize
     ] as usize;

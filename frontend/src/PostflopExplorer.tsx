@@ -467,12 +467,16 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       setMatrix(blueprintToPostflopMatrix(sm, boardCards, sm.to_act));
     } catch (e) {
       pendingNavRef.current = false;
-      if (String(e).includes('terminal')) {
+      const msg = String(e);
+      if (msg.includes('street_transition')) {
+        // Tree advanced past a chance node — need next card
+        setAwaitingCard(true);
+      } else if (msg.includes('terminal')) {
         setTerminal(true);
       } else {
         setBlueprintHistory(prev => prev.slice(0, -1));
         setActionHistory(prev => prev.slice(0, -1));
-        setError(String(e));
+        setError(msg);
       }
     }
   }, [blueprintHistory, boardCards, makeBlueprintPosition, pushActionCard]);
