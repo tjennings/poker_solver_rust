@@ -4,6 +4,7 @@
 //! flat arrays indexed by `(decision_node, combo, action)` instead of
 //! hash maps, with rayon parallelism over combos and DCFR discounting.
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::cfr::dcfr::DcfrParams;
@@ -657,7 +658,98 @@ pub fn precompute_opp_reach(combos: &[[Card; 2]], opponent_reach: &[f64]) -> Vec
 }
 
 /// Build an N x N equity matrix for all combo pairs on the given board.
+///
+/// For 5-card boards (river), compares hand ranks directly.
+/// For shorter boards (flop/turn), enumerates all possible runouts to
+/// compute all-in equity that accounts for future streets.
 pub fn compute_equity_matrix(combos: &[[Card; 2]], board: &[Card]) -> Vec<Vec<f64>> {
+    let n = combos.len();
+
+    if board.len() >= 5 {
+        // River: direct rank comparison (no runouts needed).
+        return compute_equity_matrix_direct(combos, board);
+    }
+
+    // Flop (3 cards) or Turn (4 cards): enumerate runouts.
+    let cards_needed = 5 - board.len();
+    let remaining = remaining_cards_for_runout(board);
+
+    // Build all possible runouts.
+    let runouts: Vec<Vec<Card>> = if cards_needed == 2 {
+        // Flop: enumerate all C(remaining, 2) pairs.
+        let mut runs = Vec::new();
+        for i in 0..remaining.len() {
+            for j in (i + 1)..remaining.len() {
+                runs.push(vec![remaining[i], remaining[j]]);
+            }
+        }
+        runs
+    } else {
+        // Turn: enumerate all remaining single cards.
+        remaining.iter().map(|&c| vec![c]).collect()
+    };
+
+    eprintln!(
+        "[equity matrix] {} combos, {} board cards, {} runouts — enumerating all-in equity",
+        n, board.len(), runouts.len()
+    );
+
+    // For each combo pair, average equity across all valid runouts.
+    // Parallelize across the first combo index.
+    let matrix: Vec<Vec<f64>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut row = vec![0.5; n];
+            for j in (i + 1)..n {
+                if cards_overlap(combos[i], combos[j]) {
+                    continue;
+                }
+                let mut wins = 0u32;
+                let mut losses = 0u32;
+                let mut ties = 0u32;
+                for runout in &runouts {
+                    // Skip runouts that conflict with either combo's cards.
+                    if runout.iter().any(|&c| {
+                        c == combos[i][0] || c == combos[i][1]
+                            || c == combos[j][0] || c == combos[j][1]
+                    }) {
+                        continue;
+                    }
+                    let mut full_board = board.to_vec();
+                    full_board.extend_from_slice(runout);
+                    let rank_i = rank_combo(combos[i], &full_board);
+                    let rank_j = rank_combo(combos[j], &full_board);
+                    match rank_i.cmp(&rank_j) {
+                        std::cmp::Ordering::Greater => wins += 1,
+                        std::cmp::Ordering::Less => losses += 1,
+                        std::cmp::Ordering::Equal => ties += 1,
+                    }
+                }
+                let total = wins + losses + ties;
+                if total > 0 {
+                    let eq = (f64::from(wins) + f64::from(ties) * 0.5) / f64::from(total);
+                    row[j] = eq;
+                }
+            }
+            row
+        })
+        .collect();
+
+    // Fill in the lower triangle (matrix[j][i] = 1 - matrix[i][j]).
+    let mut full_matrix = matrix;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if cards_overlap(combos[i], combos[j]) {
+                continue;
+            }
+            full_matrix[j][i] = 1.0 - full_matrix[i][j];
+        }
+    }
+    full_matrix
+}
+
+/// Direct rank comparison for 5-card boards (no runout enumeration needed).
+fn compute_equity_matrix_direct(combos: &[[Card; 2]], board: &[Card]) -> Vec<Vec<f64>> {
     let n = combos.len();
     let ranks: Vec<Rank> = combos.iter().map(|c| rank_combo(*c, board)).collect();
     let mut matrix = vec![vec![0.5; n]; n];
@@ -665,7 +757,7 @@ pub fn compute_equity_matrix(combos: &[[Card; 2]], board: &[Card]) -> Vec<Vec<f6
     for i in 0..n {
         for j in (i + 1)..n {
             if cards_overlap(combos[i], combos[j]) {
-                continue; // blocked, stays at 0.5 (irrelevant)
+                continue;
             }
             match ranks[i].cmp(&ranks[j]) {
                 std::cmp::Ordering::Greater => {
@@ -676,11 +768,19 @@ pub fn compute_equity_matrix(combos: &[[Card; 2]], board: &[Card]) -> Vec<Vec<f6
                     matrix[i][j] = 0.0;
                     matrix[j][i] = 1.0;
                 }
-                std::cmp::Ordering::Equal => {} // tie: 0.5 already set
+                std::cmp::Ordering::Equal => {}
             }
         }
     }
     matrix
+}
+
+/// Collect remaining deck cards excluding the board (for runout enumeration).
+fn remaining_cards_for_runout(board: &[Card]) -> Vec<Card> {
+    crate::poker::full_deck()
+        .into_iter()
+        .filter(|c| !board.contains(c))
+        .collect()
 }
 
 /// Rank a combo (2 hole cards) on a board using `rs_poker`.
