@@ -912,14 +912,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let bf_a = BucketFile::load(&path_a)?;
                 let bf_b = BucketFile::load(&path_b)?;
 
-                if bf_a.header.bucket_count != bf_b.header.bucket_count {
-                    eprintln!(
-                        "error: {street_name} bucket count mismatch: {} vs {}",
-                        bf_a.header.bucket_count, bf_b.header.bucket_count
-                    );
-                    continue;
-                }
-
                 eprintln!("diffing {street_name}...");
                 let report = diff_bucket_files(&bf_a, &bf_b, sample_boards, 42);
                 println!("{}", report.summary(verbose));
