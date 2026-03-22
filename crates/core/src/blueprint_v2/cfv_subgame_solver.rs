@@ -1052,13 +1052,18 @@ impl CfvSubgameSolver {
         }
     }
 
-    /// Showdown value for `root_cfvs` evaluation: equity vs uniform opponent.
-    fn showdown_value_avg(&self, hero_combo: usize, pot: f64, invested_traverser: f64, _traverser: u8) -> f64 {
+    /// Showdown value for `root_cfvs` evaluation: equity vs opponent's initial reach.
+    fn showdown_value_avg(&self, hero_combo: usize, pot: f64, invested_traverser: f64, traverser: u8) -> f64 {
+        let opp_reach = if traverser == 0 {
+            &self.ip_reach_init
+        } else {
+            &self.oop_reach_init
+        };
         showdown_value_single(
             hero_combo,
             &self.hands,
             &self.equity_matrix,
-            &self.opp_reach_totals,
+            opp_reach,
             pot,
             invested_traverser,
         )
@@ -1234,23 +1239,25 @@ fn showdown_value_single(
     hero_combo: usize,
     hands: &SubgameHands,
     equity_matrix: &[Vec<f64>],
-    opp_reach_totals: &[f64],
+    opp_reach: &[f64],
     pot: f64,
     invested_traverser: f64,
 ) -> f64 {
     let hero_cards = hands.combos[hero_combo];
-    let opp_reach_total = opp_reach_totals[hero_combo];
-    if opp_reach_total <= 0.0 {
-        return 0.0;
-    }
-    let mut equity_sum = 0.0;
-    for (j, eq_row) in equity_matrix[hero_combo].iter().enumerate() {
-        if cards_overlap(hero_cards, hands.combos[j]) {
+    let mut eq_sum = 0.0;
+    let mut reach_sum = 0.0;
+    for (j, &eq) in equity_matrix[hero_combo].iter().enumerate() {
+        let r = opp_reach[j];
+        if r <= 0.0 || cards_overlap(hero_cards, hands.combos[j]) {
             continue;
         }
-        equity_sum += eq_row;
+        eq_sum += r * eq;
+        reach_sum += r;
     }
-    let avg_equity = equity_sum / opp_reach_total;
+    if reach_sum <= 0.0 {
+        return 0.0;
+    }
+    let avg_equity = eq_sum / reach_sum;
     // EV = eq * (pot - invested) + (1-eq) * (-invested) = eq * pot - invested
     avg_equity * pot - invested_traverser
 }
