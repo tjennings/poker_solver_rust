@@ -735,7 +735,7 @@ pub fn build_subgame_solver(
         tree.clone(),
         hands.clone(),
         board_cards,
-        evaluator,
+        vec![evaluator],
         starting_stack,
         oop_reach,
         ip_reach,

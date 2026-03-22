@@ -100,7 +100,7 @@ fn solve_and_extract(
 
     let hands = SubgameHands::enumerate(&board_cards);
     let mut solver =
-        CfvSubgameSolver::new(tree, hands.clone(), &board_cards, evaluator, starting_stack, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
+        CfvSubgameSolver::new(tree, hands.clone(), &board_cards, vec![evaluator], starting_stack, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
     solver.train(solver_iterations);
 
     let cfvs_combo = solver.root_cfvs(traverser);

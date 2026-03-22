@@ -161,7 +161,11 @@ pub struct CfvSubgameSolver {
     boundary_info: BoundaryInfo,
     /// Maps tree node index to boundary ordinal (or `usize::MAX` if not a boundary).
     node_to_boundary: Vec<usize>,
-    evaluator: Box<dyn LeafEvaluator>,
+    evaluators: Vec<Box<dyn LeafEvaluator>>,
+    /// Regret sums for the virtual choice node (length K = evaluators.len()).
+    choice_regret_sum: Vec<f64>,
+    /// Strategy sums for the virtual choice node (length K).
+    choice_strategy_sum: Vec<f64>,
     dcfr: DcfrParams,
     pub iteration: u32,
     starting_stack: f64,
@@ -182,23 +186,27 @@ impl CfvSubgameSolver {
     /// * `tree` - the game tree (may contain `DepthBoundary` terminals)
     /// * `hands` - valid hole card combos for the board
     /// * `board` - the board cards (3-5 cards)
-    /// * `evaluator` - leaf evaluator for depth boundaries
+    /// * `evaluators` - leaf evaluators for depth boundaries (K strategies)
     /// * `starting_stack` - the starting stack for each player
     /// Create a new CFV subgame solver with initial reach probabilities.
     ///
     /// `oop_reach` and `ip_reach` are per-combo reach probabilities from
-    /// preflop range filtering (0.0–1.0). These determine which combos
+    /// preflop range filtering (0.0-1.0). These determine which combos
     /// each player can have at the start of the subgame.
+    ///
+    /// When `evaluators` has length > 1, a virtual opponent choice node
+    /// selects which continuation strategy is used at ALL depth boundaries.
     #[must_use]
     pub fn new(
         tree: GameTree,
         hands: SubgameHands,
         board: &[Card],
-        evaluator: Box<dyn LeafEvaluator>,
+        evaluators: Vec<Box<dyn LeafEvaluator>>,
         starting_stack: f64,
         oop_reach: Vec<f64>,
         ip_reach: Vec<f64>,
     ) -> Self {
+        let k = evaluators.len();
         let equity_matrix = compute_equity_matrix(&hands.combos, board);
         let n = hands.combos.len();
 
@@ -237,7 +245,9 @@ impl CfvSubgameSolver {
             leaf_cfvs,
             boundary_info: BoundaryInfo { boundaries },
             node_to_boundary,
-            evaluator,
+            evaluators,
+            choice_regret_sum: vec![0.0; k],
+            choice_strategy_sum: vec![0.0; k],
             dcfr: DcfrParams::default(),
             iteration: 0,
             starting_stack,
@@ -635,6 +645,7 @@ impl CfvSubgameSolver {
     /// re-evaluated:
     /// - `0` = every iteration (original behavior)
     /// - `N > 0` = evaluate at iteration 1, every N iterations, and the final iteration
+    #[allow(clippy::too_many_lines)]
     pub fn train_with_leaf_interval(&mut self, iterations: u32, leaf_eval_interval: u32) {
         let n = self.hands.combos.len();
         let num_nodes = self.tree.nodes.len();
@@ -672,39 +683,121 @@ impl CfvSubgameSolver {
                 };
 
             // Evaluate leaf CFVs and traverse for each traverser.
-            for traverser in 0..2u8 {
-                if let Some((ref oop_ranges, ref ip_ranges)) = boundary_ranges {
-                    for (b_idx, &(_, pot, invested)) in
-                        self.boundary_info.boundaries.iter().enumerate()
-                    {
-                        let eff_stack =
-                            self.starting_stack - invested[0].max(invested[1]);
-                        self.leaf_cfvs[b_idx] = self.evaluator.evaluate(
-                            &self.hands.combos,
-                            &self.board,
-                            pot,
-                            eff_stack,
-                            &oop_ranges[b_idx],
-                            &ip_ranges[b_idx],
-                            traverser,
-                        );
-                    }
-                }
+            let k = self.evaluators.len();
+            let root_idx = self.tree.root as usize;
 
+            for traverser in 0..2u8 {
                 let (reach_trav, reach_opp) = if traverser == 0 {
                     (oop_reach.as_slice(), ip_reach.as_slice())
                 } else {
                     (ip_reach.as_slice(), oop_reach.as_slice())
                 };
-                self.cfr_traverse_vectorized(
-                    self.tree.root as usize,
-                    traverser,
-                    reach_trav,
-                    reach_opp,
-                    &snapshot,
-                    &mut cfv_buf,
-                    &mut reach_pool,
-                );
+
+                if let Some((ref oop_ranges, ref ip_ranges)) = boundary_ranges {
+                    if k > 1 {
+                        // Multi-valued: choice node with K strategies.
+                        let choice_probs = regret_match(&self.choice_regret_sum);
+                        let mut root_cfvs_per_k: Vec<Vec<f64>> = Vec::with_capacity(k);
+
+                        for eval_k in 0..k {
+                            // Evaluate leaves with evaluator k.
+                            for (b_idx, &(_, pot, invested)) in
+                                self.boundary_info.boundaries.iter().enumerate()
+                            {
+                                let eff_stack =
+                                    self.starting_stack - invested[0].max(invested[1]);
+                                self.leaf_cfvs[b_idx] = self.evaluators[eval_k].evaluate(
+                                    &self.hands.combos,
+                                    &self.board,
+                                    pot,
+                                    eff_stack,
+                                    &oop_ranges[b_idx],
+                                    &ip_ranges[b_idx],
+                                    traverser,
+                                );
+                            }
+
+                            // Run CFR traversal.
+                            self.cfr_traverse_vectorized(
+                                root_idx,
+                                traverser,
+                                reach_trav,
+                                reach_opp,
+                                &snapshot,
+                                &mut cfv_buf,
+                                &mut reach_pool,
+                            );
+
+                            // Capture root CFVs for this k before next traversal overwrites.
+                            let root_start = root_idx * n;
+                            root_cfvs_per_k.push(cfv_buf[root_start..root_start + n].to_vec());
+                        }
+
+                        // Compute choice node regrets.
+                        let reach = if traverser == 0 { &oop_reach } else { &ip_reach };
+                        let total_reach: f64 = reach.iter().sum();
+                        if total_reach > 0.0 {
+                            let v_k: Vec<f64> = root_cfvs_per_k
+                                .iter()
+                                .map(|cfvs| {
+                                    cfvs.iter()
+                                        .zip(reach.iter())
+                                        .map(|(&cfv, &r)| cfv * r)
+                                        .sum::<f64>()
+                                        / total_reach
+                                })
+                                .collect();
+                            let v_weighted: f64 = choice_probs
+                                .iter()
+                                .zip(v_k.iter())
+                                .map(|(&p, &v)| p * v)
+                                .sum();
+                            for eval_k in 0..k {
+                                // Opponent prefers k that gives traverser LOWER value.
+                                self.choice_regret_sum[eval_k] += v_weighted - v_k[eval_k];
+                                self.choice_strategy_sum[eval_k] += choice_probs[eval_k];
+                            }
+                        }
+                    } else {
+                        // K=1: original behavior, no choice node.
+                        for (b_idx, &(_, pot, invested)) in
+                            self.boundary_info.boundaries.iter().enumerate()
+                        {
+                            let eff_stack =
+                                self.starting_stack - invested[0].max(invested[1]);
+                            self.leaf_cfvs[b_idx] = self.evaluators[0].evaluate(
+                                &self.hands.combos,
+                                &self.board,
+                                pot,
+                                eff_stack,
+                                &oop_ranges[b_idx],
+                                &ip_ranges[b_idx],
+                                traverser,
+                            );
+                        }
+
+                        self.cfr_traverse_vectorized(
+                            root_idx,
+                            traverser,
+                            reach_trav,
+                            reach_opp,
+                            &snapshot,
+                            &mut cfv_buf,
+                            &mut reach_pool,
+                        );
+                    }
+                } else {
+                    // No boundaries to evaluate -- just traverse.
+                    self.cfr_traverse_vectorized(
+                        root_idx,
+                        traverser,
+                        reach_trav,
+                        reach_opp,
+                        &snapshot,
+                        &mut cfv_buf,
+                        &mut reach_pool,
+                    );
+                }
             }
 
             let iter_u64 = u64::from(self.iteration);
@@ -916,6 +1009,25 @@ impl CfvSubgameSolver {
         };
         let (base, _) = self.layout.slot(root, combo_idx);
         self.strategy_sum[base..base + num_actions].to_vec()
+    }
+
+    /// Get the averaged choice node strategy (normalized strategy sums).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn choice_strategy(&self) -> Vec<f64> {
+        let total: f64 = self.choice_strategy_sum.iter().sum();
+        if total > 0.0 {
+            self.choice_strategy_sum.iter().map(|&s| s / total).collect()
+        } else {
+            let k = self.evaluators.len();
+            vec![1.0 / k as f64; k]
+        }
+    }
+
+    /// Get the raw choice node regret sums.
+    #[must_use]
+    pub fn choice_regrets(&self) -> &[f64] {
+        &self.choice_regret_sum
     }
 }
 
@@ -1199,7 +1311,7 @@ mod tests {
         let tree = river_tree(&[1.0]);
         let hands = small_hands(&board, 30);
         let evaluator = Box::new(ConstantEvaluator(0.5));
-        let solver = CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
+        let solver = CfvSubgameSolver::new(tree, hands.clone(), &board, vec![evaluator], 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         assert_eq!(solver.iteration, 0);
         assert!(!solver.hands.combos.is_empty());
@@ -1214,7 +1326,7 @@ mod tests {
         let hands = small_hands(&board, 30);
         let n = hands.combos.len();
         let evaluator = Box::new(ConstantEvaluator(0.5));
-        let solver = CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
+        let solver = CfvSubgameSolver::new(tree, hands.clone(), &board, vec![evaluator], 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         // With no training, strategy is uniform. Propagation should still
         // produce non-negative ranges that sum to at most 1.0 per combo.
@@ -1262,7 +1374,7 @@ mod tests {
         let hands = small_hands(&board, 30);
         let evaluator = Box::new(ConstantEvaluator(0.5));
         let mut solver =
-            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, vec![evaluator], 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         solver.train(100);
         assert_eq!(solver.iteration, 100);
@@ -1314,7 +1426,7 @@ mod tests {
 
         let evaluator = Box::new(ConstantEvaluator(0.5));
         let mut solver =
-            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, vec![evaluator], 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         assert!(
             !solver.boundary_info.boundaries.is_empty(),
@@ -1371,7 +1483,7 @@ mod tests {
 
         let evaluator = Box::new(ConstantEvaluator(0.5));
         let mut solver =
-            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, vec![evaluator], 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         assert!(
             solver.boundary_info.boundaries.is_empty(),
@@ -1469,7 +1581,7 @@ mod tests {
             iterations: 5,
         });
         let mut solver =
-            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, vec![evaluator], 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         solver.train(10);
         assert_eq!(solver.iteration, 10);
@@ -1486,7 +1598,7 @@ mod tests {
         let n = hands.combos.len();
         let evaluator = Box::new(ConstantEvaluator(0.5));
         let mut solver =
-            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, vec![evaluator], 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         solver.train(100);
 
@@ -1503,7 +1615,7 @@ mod tests {
         let hands = small_hands(&board, 30);
         let evaluator = Box::new(ConstantEvaluator(0.5));
         let mut solver =
-            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, vec![evaluator], 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         solver.train(200);
 
@@ -1531,7 +1643,7 @@ mod tests {
         let n = hands.combos.len();
         let evaluator = Box::new(ConstantEvaluator(0.5));
         let mut solver =
-            CfvSubgameSolver::new(tree, hands.clone(), &board, evaluator, 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
+            CfvSubgameSolver::new(tree, hands.clone(), &board, vec![evaluator], 250.0, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
 
         solver.train(200);
 
@@ -1544,5 +1656,163 @@ mod tests {
             assert!(oop.is_finite(), "OOP combo {i}: CFV not finite: {oop}");
             assert!(ip.is_finite(), "IP combo {i}: CFV not finite: {ip}");
         }
+    }
+
+    #[timed_test(30)]
+    fn choice_node_with_multiple_evaluators() {
+        let board = turn_board();
+        let tree = turn_tree_depth_limited(&[1.0], 1);
+        let hands = small_hands(&board, 30);
+        let n = hands.combos.len();
+
+        let evaluators: Vec<Box<dyn LeafEvaluator>> = vec![
+            Box::new(ConstantEvaluator(0.3)),
+            Box::new(ConstantEvaluator(0.7)),
+        ];
+
+        let mut solver = CfvSubgameSolver::new(
+            tree,
+            hands.clone(),
+            &board,
+            evaluators,
+            250.0,
+            vec![1.0; n],
+            vec![1.0; n],
+        );
+
+        solver.train(50);
+        assert_eq!(solver.iteration, 50);
+
+        // choice_strategy() should return valid probabilities
+        let choice_strat = solver.choice_strategy();
+        assert_eq!(choice_strat.len(), 2);
+        let sum: f64 = choice_strat.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-10,
+            "choice strategy should sum to 1.0, got {sum}"
+        );
+        for (k, &p) in choice_strat.iter().enumerate() {
+            assert!(p >= 0.0, "choice strategy k={k} is negative: {p}");
+        }
+
+        // choice_regrets() should return values of length 2
+        let regrets = solver.choice_regrets();
+        assert_eq!(regrets.len(), 2);
+        for (k, &r) in regrets.iter().enumerate() {
+            assert!(r.is_finite(), "choice regret k={k} is not finite: {r}");
+        }
+
+        // Existing strategy should still be valid
+        let strategy = solver.strategy();
+        assert!(strategy.num_combos() > 0);
+    }
+
+    #[timed_test(5)]
+    fn choice_strategy_k1_returns_singleton() {
+        // K=1: no choice node, but accessors should still work.
+        let board = turn_board();
+        let tree = turn_tree_depth_limited(&[1.0], 1);
+        let hands = small_hands(&board, 20);
+        let n = hands.combos.len();
+        let evaluator = Box::new(ConstantEvaluator(0.5));
+        let solver = CfvSubgameSolver::new(
+            tree, hands, &board, vec![evaluator], 250.0,
+            vec![1.0; n], vec![1.0; n],
+        );
+
+        // Before training, choice_strategy should return uniform [1.0] for K=1.
+        let strat = solver.choice_strategy();
+        assert_eq!(strat.len(), 1);
+        assert!((strat[0] - 1.0).abs() < 1e-10);
+
+        let regrets = solver.choice_regrets();
+        assert_eq!(regrets.len(), 1);
+        assert!((regrets[0] - 0.0).abs() < 1e-10);
+    }
+
+    #[timed_test(5)]
+    fn choice_strategy_untrained_returns_uniform() {
+        // K=3: before training, choice_strategy should return uniform.
+        let board = turn_board();
+        let tree = turn_tree_depth_limited(&[1.0], 1);
+        let hands = small_hands(&board, 20);
+        let n = hands.combos.len();
+        let evaluators: Vec<Box<dyn LeafEvaluator>> = vec![
+            Box::new(ConstantEvaluator(0.2)),
+            Box::new(ConstantEvaluator(0.5)),
+            Box::new(ConstantEvaluator(0.8)),
+        ];
+        let solver = CfvSubgameSolver::new(
+            tree, hands, &board, evaluators, 250.0,
+            vec![1.0; n], vec![1.0; n],
+        );
+
+        let strat = solver.choice_strategy();
+        assert_eq!(strat.len(), 3);
+        for &p in &strat {
+            assert!(
+                (p - 1.0 / 3.0).abs() < 1e-10,
+                "untrained choice strategy should be uniform, got {p}"
+            );
+        }
+    }
+
+    #[timed_test(30)]
+    fn choice_node_k1_matches_original_behavior() {
+        // K=1 with boundaries should behave identically to the original code.
+        let board = turn_board();
+        let tree = turn_tree_depth_limited(&[1.0], 1);
+        let hands = small_hands(&board, 30);
+        let n = hands.combos.len();
+        let evaluator = Box::new(ConstantEvaluator(0.5));
+        let mut solver = CfvSubgameSolver::new(
+            tree, hands, &board, vec![evaluator], 250.0,
+            vec![1.0; n], vec![1.0; n],
+        );
+
+        solver.train(100);
+
+        // With K=1, choice regrets should remain zero (no choice node logic runs).
+        let regrets = solver.choice_regrets();
+        assert_eq!(regrets.len(), 1);
+        assert!(
+            (regrets[0] - 0.0).abs() < 1e-10,
+            "K=1 choice regret should stay zero"
+        );
+
+        // Strategy should still be valid.
+        let strategy = solver.strategy();
+        for combo_idx in 0..strategy.num_combos() {
+            let probs = strategy.root_probs(combo_idx);
+            if probs.is_empty() { continue; }
+            let sum: f64 = probs.iter().sum();
+            assert!((sum - 1.0).abs() < 0.01, "combo {combo_idx}: sum={sum}");
+        }
+    }
+
+    #[timed_test(30)]
+    fn choice_node_no_boundaries_leaves_choice_unchanged() {
+        // River tree has no depth boundaries, so K>1 shouldn't crash
+        // and choice regrets should stay zero.
+        let board = river_board();
+        let tree = river_tree(&[1.0]);
+        let hands = small_hands(&board, 20);
+        let n = hands.combos.len();
+        let evaluators: Vec<Box<dyn LeafEvaluator>> = vec![
+            Box::new(ConstantEvaluator(0.3)),
+            Box::new(ConstantEvaluator(0.7)),
+        ];
+        let mut solver = CfvSubgameSolver::new(
+            tree, hands, &board, evaluators, 250.0,
+            vec![1.0; n], vec![1.0; n],
+        );
+
+        solver.train(50);
+
+        // No boundaries means choice node logic never runs.
+        let regrets = solver.choice_regrets();
+        assert_eq!(regrets.len(), 2);
+        assert!((regrets[0]).abs() < 1e-10, "no boundaries: regret[0] should be 0");
+        assert!((regrets[1]).abs() < 1e-10, "no boundaries: regret[1] should be 0");
     }
 }
