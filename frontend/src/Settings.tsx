@@ -254,6 +254,81 @@ export default function Settings() {
         </p>
       </div>
 
+      {/* Rollout Settings (depth-limited solver) */}
+      <div style={{ marginBottom: '1.5rem' }}>
+        <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
+          Rollout Settings (depth-limited solver)
+        </label>
+        <div style={{ display: 'flex', gap: '0.8rem', alignItems: 'center', flexWrap: 'wrap' }}>
+          <div>
+            <span style={{ fontSize: '0.7rem', color: '#666', marginRight: '0.3rem' }}>Bias Factor</span>
+            <input
+              type="text"
+              value={config.rollout_bias_factor ?? 10}
+              onChange={e => {
+                const v = parseFloat(e.target.value);
+                if (!isNaN(v) && v > 0) setConfig({ rollout_bias_factor: v });
+              }}
+              style={{
+                width: 55,
+                padding: '0.45rem 0.6rem',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 6,
+                color: '#eee',
+                fontSize: '0.85rem',
+                fontFamily: 'inherit',
+              }}
+            />
+          </div>
+          <div>
+            <span style={{ fontSize: '0.7rem', color: '#666', marginRight: '0.3rem' }}>Rollouts</span>
+            <input
+              type="text"
+              value={config.rollout_num_samples ?? 3}
+              onChange={e => {
+                const v = parseInt(e.target.value);
+                if (!isNaN(v) && v > 0) setConfig({ rollout_num_samples: v });
+              }}
+              style={{
+                width: 45,
+                padding: '0.45rem 0.6rem',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 6,
+                color: '#eee',
+                fontSize: '0.85rem',
+                fontFamily: 'inherit',
+              }}
+            />
+          </div>
+          <div>
+            <span style={{ fontSize: '0.7rem', color: '#666', marginRight: '0.3rem' }}>Opp. Samples</span>
+            <input
+              type="text"
+              value={config.rollout_opponent_samples ?? 8}
+              onChange={e => {
+                const v = parseInt(e.target.value);
+                if (!isNaN(v) && v > 0) setConfig({ rollout_opponent_samples: v });
+              }}
+              style={{
+                width: 45,
+                padding: '0.45rem 0.6rem',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 6,
+                color: '#eee',
+                fontSize: '0.85rem',
+                fontFamily: 'inherit',
+              }}
+            />
+          </div>
+        </div>
+        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
+          Bias factor multiplies fold/call/raise probabilities in continuation strategies. Rollouts = Monte Carlo samples per street transition. Opp. Samples = opponent hands sampled per combo at boundaries.
+        </p>
+      </div>
+
       {/* Stub Range Solver */}
       <div style={{ marginBottom: '1.5rem' }}>
         <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', color: '#eee', cursor: 'pointer' }}>

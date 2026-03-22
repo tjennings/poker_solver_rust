@@ -281,7 +281,17 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
     const targetExpl = globalConfig.stub_range_solver ? 1e9 : (globalConfig.target_exploitability ?? 3.0);
     const maxIters = globalConfig.solve_iterations ?? 200;
-    invoke('postflop_solve_street', { board: cards, target_exploitability: targetExpl, max_iterations: maxIters })
+    const biasFactor = globalConfig.rollout_bias_factor ?? 10.0;
+    const numRollouts = globalConfig.rollout_num_samples ?? 3;
+    const oppSamples = globalConfig.rollout_opponent_samples ?? 8;
+    invoke('postflop_solve_street', {
+      board: cards,
+      target_exploitability: targetExpl,
+      max_iterations: maxIters,
+      rollout_bias_factor: biasFactor,
+      rollout_num_samples: numRollouts,
+      rollout_opponent_samples: oppSamples,
+    })
       .then(() => startPolling())
       .catch((e) => { setError(String(e)); setSolving(false); });
   }, [solving, boardInput, startPolling]);

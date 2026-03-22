@@ -82,6 +82,9 @@ struct PostflopSolveParams {
     board: Vec<String>,
     max_iterations: Option<u32>,
     target_exploitability: Option<f32>,
+    rollout_bias_factor: Option<f64>,
+    rollout_num_samples: Option<u32>,
+    rollout_opponent_samples: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -422,6 +425,9 @@ async fn handle_postflop_solve_street(
         params.board,
         params.max_iterations,
         params.target_exploitability,
+        params.rollout_bias_factor,
+        params.rollout_num_samples,
+        params.rollout_opponent_samples,
     ))
 }
 

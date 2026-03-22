@@ -242,6 +242,9 @@ export interface GlobalConfig {
   turn_combo_threshold: number;
   solve_iterations: number;
   backend_url: string;
+  rollout_bias_factor: number;
+  rollout_num_samples: number;
+  rollout_opponent_samples: number;
 }
 
 export interface BlueprintListEntry {

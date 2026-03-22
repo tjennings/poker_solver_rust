@@ -525,6 +525,9 @@ pub fn build_subgame_solver(
     _player: usize,
     cbv_context: Option<&CbvContext>,
     abstract_node_idx: Option<u32>,
+    rollout_bias_factor: Option<f64>,
+    rollout_num_samples: Option<u32>,
+    rollout_opponent_samples: Option<u32>,
 ) -> Result<(CfvSubgameSolver, SubgameHands, Vec<ActionInfo>, GameTree, f64, f64), String> {
     let street = match board_cards.len() {
         3 => V2Street::Flop,
@@ -565,7 +568,10 @@ pub fn build_subgame_solver(
     };
 
     let evaluators: Vec<Box<dyn LeafEvaluator>> = if let (Some(ctx), Some(abs_node)) = (cbv_context, abstract_node_idx) {
-        eprintln!("[subgame] using RolloutLeafEvaluator x4 (abstract_node={abs_node})");
+        let bias_factor = rollout_bias_factor.unwrap_or(10.0);
+        let num_rollouts = rollout_num_samples.unwrap_or(3);
+        let opp_samples = rollout_opponent_samples.unwrap_or(8);
+        eprintln!("[subgame] using RolloutLeafEvaluator x4 (abstract_node={abs_node}, bias={bias_factor}, rollouts={num_rollouts}, opp_samples={opp_samples})");
         let strategy = Arc::clone(&ctx.strategy);
         let abstract_tree = Arc::new(ctx.abstract_tree.clone());
         let all_buckets = Arc::clone(&ctx.all_buckets);
@@ -573,19 +579,19 @@ pub fn build_subgame_solver(
         vec![
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Unbiased, 10.0, 3, 8,
+                abs_node, BiasType::Unbiased, bias_factor, num_rollouts, opp_samples,
             )) as Box<dyn LeafEvaluator>,
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Fold, 10.0, 3, 8,
+                abs_node, BiasType::Fold, bias_factor, num_rollouts, opp_samples,
             )),
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Call, 10.0, 3, 8,
+                abs_node, BiasType::Call, bias_factor, num_rollouts, opp_samples,
             )),
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Raise, 10.0, 3, 8,
+                abs_node, BiasType::Raise, bias_factor, num_rollouts, opp_samples,
             )),
         ]
     } else {
@@ -1188,16 +1194,24 @@ pub fn postflop_solve_street_core(
     board: Vec<String>,
     max_iterations: Option<u32>,
     target_exploitability: Option<f32>,
+    rollout_bias_factor: Option<f64>,
+    rollout_num_samples: Option<u32>,
+    rollout_opponent_samples: Option<u32>,
 ) -> Result<(), String> {
-    postflop_solve_street_impl(state, board, max_iterations, target_exploitability, vec![])
+    postflop_solve_street_impl(state, board, max_iterations, target_exploitability, vec![],
+        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn postflop_solve_street_impl(
     state: &Arc<PostflopState>,
     board: Vec<String>,
     max_iterations: Option<u32>,
     target_exploitability: Option<f32>,
     _prior_actions: Vec<Vec<usize>>,
+    rollout_bias_factor: Option<f64>,
+    rollout_num_samples: Option<u32>,
+    rollout_opponent_samples: Option<u32>,
 ) -> Result<(), String> {
     // Guard: reject if already solving.
     if state.solving.load(Ordering::Relaxed) {
@@ -1250,7 +1264,8 @@ fn postflop_solve_street_impl(
         }
         SolverChoice::DepthLimited => {
             let cbv_ctx = state.cbv_context.read().clone();
-            solve_depth_limited(state, &config, board, max_iterations, &solver_config, &filtered_oop, &filtered_ip, cbv_ctx)
+            solve_depth_limited(state, &config, board, max_iterations, &solver_config, &filtered_oop, &filtered_ip, cbv_ctx,
+                rollout_bias_factor, rollout_num_samples, rollout_opponent_samples)
         }
     }
 }
@@ -1356,6 +1371,9 @@ fn solve_depth_limited(
     filtered_oop: &Option<Vec<f32>>,
     filtered_ip: &Option<Vec<f32>>,
     cbv_context: Option<Arc<CbvContext>>,
+    rollout_bias_factor: Option<f64>,
+    rollout_num_samples: Option<u32>,
+    rollout_opponent_samples: Option<u32>,
 ) -> Result<(), String> {
     let max_iters = max_iterations.unwrap_or(solver_config.depth_limited_iterations);
     state.max_iterations.store(max_iters, Ordering::Relaxed);
@@ -1420,6 +1438,9 @@ fn solve_depth_limited(
             player,
             cbv_context.as_deref(),
             abstract_node_idx,
+            rollout_bias_factor,
+            rollout_num_samples,
+            rollout_opponent_samples,
         ) {
             Ok((mut solver, hands, action_infos, tree, initial_pot, starting_stack)) => {
                 // Helper closure to build matrix from current strategy.
@@ -1535,8 +1556,12 @@ pub async fn postflop_solve_street(
     board: Vec<String>,
     max_iterations: Option<u32>,
     target_exploitability: Option<f32>,
+    rollout_bias_factor: Option<f64>,
+    rollout_num_samples: Option<u32>,
+    rollout_opponent_samples: Option<u32>,
 ) -> Result<(), String> {
-    postflop_solve_street_core(&state, board, max_iterations, target_exploitability)
+    postflop_solve_street_core(&state, board, max_iterations, target_exploitability,
+        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples)
 }
 
 // ---------------------------------------------------------------------------
@@ -2488,7 +2513,7 @@ mod tests {
         // River board — single street, fast even in debug mode
         let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
         let result =
-            postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX));
+            postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX), None, None, None);
         assert!(result.is_ok(), "solve_street failed: {:?}", result.err());
 
         // Wait for the background thread to finish (generous timeout for debug builds).
@@ -2513,7 +2538,7 @@ mod tests {
 
         let board = vec!["Td".into(), "9d".into(), "6h".into()];
         let result =
-            postflop_solve_street_core(&state, board, None, None);
+            postflop_solve_street_core(&state, board, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2545,7 +2570,7 @@ mod tests {
         *state.config.write() = config;
 
         let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
-        postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX)).unwrap();
+        postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX), None, None, None).unwrap();
 
         // Wait for the background thread to finish.
         for _ in 0..600 {
@@ -2599,7 +2624,7 @@ mod tests {
         postflop_set_config_core(&state, config).unwrap();
 
         let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
-        postflop_solve_street_core(&state, board, Some(5), Some(f32::MAX)).unwrap();
+        postflop_solve_street_core(&state, board, Some(5), Some(f32::MAX), None, None, None).unwrap();
 
         // Wait for background solve to finish.
         for _ in 0..600 {
@@ -2683,7 +2708,7 @@ mod tests {
 
         // Solve flop — should dispatch to subgame due to wide ranges.
         let board = vec!["Ks".to_string(), "Qh".to_string(), "Jd".to_string()];
-        let result = postflop_solve_street_core(&state, board, Some(5), Some(1e9));
+        let result = postflop_solve_street_core(&state, board, Some(5), Some(1e9), None, None, None);
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
@@ -2739,7 +2764,7 @@ mod tests {
             "Tc".to_string(),
             "2d".to_string(),
         ];
-        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9));
+        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None);
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
@@ -2781,7 +2806,7 @@ mod tests {
         *state.filtered_ip_weights.write() = Some(narrow_ip);
 
         let board = vec!["Ks".to_string(), "Qh".to_string(), "Jd".to_string()];
-        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9));
+        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None);
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
@@ -2812,6 +2837,7 @@ mod tests {
             0,
             None,
             None,
+            None, None, None,
         );
         assert!(result.is_ok(), "build_subgame_solver failed: {:?}", result.err());
 
@@ -2867,6 +2893,7 @@ mod tests {
             0,
             None,
             None,
+            None, None, None,
         );
         assert!(result.is_ok());
 
@@ -2945,5 +2972,77 @@ mod tests {
         ];
 
         assert_eq!(evaluators.len(), 4, "should create exactly 4 rollout evaluators");
+    }
+
+    #[test]
+    fn test_build_subgame_solver_accepts_rollout_params() {
+        // Verify build_subgame_solver accepts optional rollout configuration
+        // parameters (bias_factor, num_samples, opponent_samples) and produces
+        // a valid solver when custom values are provided.
+        let board_cards = vec![
+            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Seven, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+        ];
+        let bet_sizes = vec![vec![1.0f32]];
+        let oop_w = weights_from_range("AA,KK,QQ");
+        let ip_w = weights_from_range("JJ,TT,99");
+
+        // Pass custom rollout params (these only matter when cbv_context is Some,
+        // but the function must accept them regardless).
+        let result = build_subgame_solver(
+            &board_cards,
+            &bet_sizes,
+            100,
+            [200, 200],
+            &oop_w,
+            &ip_w,
+            0,
+            None,
+            None,
+            Some(5.0),  // rollout_bias_factor
+            Some(5),     // rollout_num_samples
+            Some(12),    // rollout_opponent_samples
+        );
+        assert!(result.is_ok(), "build_subgame_solver with rollout params failed: {:?}", result.err());
+
+        let (mut solver, _hands, action_infos, _tree, initial_pot, starting_stack) = result.unwrap();
+        solver.train(5);
+        let strategy = solver.strategy();
+        assert!(strategy.num_combos() > 0);
+        assert!(!action_infos.is_empty());
+        assert!(initial_pot > 0.0);
+        assert!(starting_stack > 0.0);
+    }
+
+    #[test]
+    fn test_build_subgame_solver_defaults_rollout_params_to_none() {
+        // Verify that passing None for all rollout params works (backward compat).
+        let board_cards = vec![
+            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Seven, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+        ];
+        let bet_sizes = vec![vec![1.0f32]];
+        let oop_w = weights_from_range("AA,KK");
+        let ip_w = weights_from_range("QQ,JJ");
+
+        let result = build_subgame_solver(
+            &board_cards,
+            &bet_sizes,
+            100,
+            [200, 200],
+            &oop_w,
+            &ip_w,
+            0,
+            None,
+            None,
+            None, // rollout_bias_factor
+            None, // rollout_num_samples
+            None, // rollout_opponent_samples
+        );
+        assert!(result.is_ok(), "build_subgame_solver with None rollout params failed: {:?}", result.err());
     }
 }
