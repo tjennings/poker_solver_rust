@@ -976,10 +976,14 @@ fn get_strategy_matrix_v2(
                             // Postflop with bucket data: for each canonical hand,
                             // enumerate combos, look up each combo's bucket,
                             // get the action probability, and average.
+                            // Slice the board to the correct length for this
+                            // node's street (e.g. 3 cards for flop even if the
+                            // full board has 4+ cards at a later street).
+                            let board_slice = board_for_street_slice(board, *street);
                             for (hand_idx, r) in reach.iter_mut().enumerate() {
                                 if let Some(hand) = CanonicalHand::from_index(hand_idx) {
                                     let avg_p = avg_action_prob_for_hand(
-                                        &hand, board, *street,
+                                        &hand, board_slice, *street,
                                         &ctx.all_buckets, &ctx.strategy,
                                         dec_idx as usize, action_pos,
                                     );
@@ -1160,11 +1164,10 @@ fn postflop_cell_probs(
     let mut sum_probs = vec![0.0_f32; num_actions];
     let mut count = 0u32;
 
-    let board_set: std::collections::HashSet<Card> = board.iter().copied().collect();
-
     for (c1, c2) in &combos {
-        // Skip combos blocked by board cards.
-        if board_set.contains(c1) || board_set.contains(c2) {
+        // Skip combos blocked by board cards (linear scan over <=5 elements
+        // is faster than HashSet with hashing overhead).
+        if board.iter().any(|b| *b == *c1 || *b == *c2) {
             continue;
         }
 
@@ -1212,13 +1215,13 @@ fn avg_action_prob_for_hand(
     action_pos: usize,
 ) -> f32 {
     let combos = hand.combos();
-    let board_set: std::collections::HashSet<Card> = board.iter().copied().collect();
 
     let mut sum = 0.0_f32;
     let mut count = 0u32;
 
     for (c1, c2) in &combos {
-        if board_set.contains(c1) || board_set.contains(c2) {
+        // Linear scan over <=5 board elements is faster than HashSet.
+        if board.iter().any(|b| *b == *c1 || *b == *c2) {
             continue;
         }
 
@@ -1743,6 +1746,19 @@ fn street_from_board_len(len: usize) -> Result<Street, String> {
         5 => Ok(Street::River),
         n => Err(format!("Invalid board length: {n}")),
     }
+}
+
+/// Return the board slice visible at the given street, clamping to `board.len()`.
+///
+/// Mirrors [`AllBuckets::board_for_street`] but accepts a dynamically-sized slice.
+fn board_for_street_slice(board: &[Card], street: Street) -> &[Card] {
+    let n = match street {
+        Street::Preflop => 0,
+        Street::Flop => 3,
+        Street::Turn => 4,
+        Street::River => board.len(),
+    };
+    &board[..n.min(board.len())]
 }
 
 fn get_actions_for_position(
@@ -3011,6 +3027,104 @@ mod tests {
         );
 
         assert!(p.abs() < f32::EPSILON, "Expected 0.0 for fully blocked hand, got {p}");
+    }
+
+    #[timed_test]
+    fn board_for_street_slice_returns_correct_length() {
+        let board = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Diamond),
+            Card::new(Value::Jack, Suit::Club),
+            Card::new(Value::Ten, Suit::Spade),
+        ];
+
+        assert_eq!(board_for_street_slice(&board, Street::Preflop).len(), 0);
+        assert_eq!(board_for_street_slice(&board, Street::Flop).len(), 3);
+        assert_eq!(board_for_street_slice(&board, Street::Turn).len(), 4);
+        assert_eq!(board_for_street_slice(&board, Street::River).len(), 5);
+    }
+
+    #[timed_test]
+    fn board_for_street_slice_short_board_clamps() {
+        // A 3-card board (flop) should clamp for turn/river queries
+        let board = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Diamond),
+        ];
+
+        assert_eq!(board_for_street_slice(&board, Street::Flop).len(), 3);
+        assert_eq!(board_for_street_slice(&board, Street::Turn).len(), 3); // clamped
+        assert_eq!(board_for_street_slice(&board, Street::River).len(), 3); // clamped
+    }
+
+    #[timed_test]
+    fn board_for_street_slice_empty_board() {
+        let board: Vec<Card> = vec![];
+        assert_eq!(board_for_street_slice(&board, Street::Preflop).len(), 0);
+        assert_eq!(board_for_street_slice(&board, Street::Flop).len(), 0);
+    }
+
+    #[timed_test]
+    fn postflop_cell_probs_no_hashset_still_filters_blockers() {
+        // Verify that blocker filtering works correctly (same behavior
+        // after replacing HashSet with linear scan).
+        let (strategy, _) = build_minimal_postflop_strategy();
+        let all_buckets = AllBuckets::new([169, 10, 10, 10], [None, None, None, None]);
+        let actions = vec![
+            ActionInfo { id: "0".into(), label: "Check".into(), action_type: "check".into(), size_key: None },
+            ActionInfo { id: "1".into(), label: "Bet".into(), action_type: "bet".into(), size_key: None },
+        ];
+
+        // Board with 3 cards (flop) -- KsKhKd blocks all KK combos
+        let board = vec![
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::King, Suit::Diamond),
+        ];
+
+        let probs = postflop_cell_probs(
+            'K', 'K', false, &board, Street::Flop,
+            &all_buckets, &strategy, 1,
+            &actions,
+        );
+
+        // Only 1 KK combo remains (Kc isn't on the board) -- but KK needs 2 kings,
+        // and we only have 1 unblocked king. So all KK combos are blocked.
+        // Actually: KK combos are (Ks,Kh), (Ks,Kd), (Ks,Kc), (Kh,Kd), (Kh,Kc), (Kd,Kc)
+        // Board has Ks, Kh, Kd -- blocks any combo containing those. Only (Kc, X) where
+        // X is not on board... but all other Ks are on board. So only if both cards are Kc
+        // which is impossible. All 6 combos are blocked.
+        assert_eq!(probs.len(), 2);
+        assert!((probs[0].probability - 0.5).abs() < 0.01, "expected uniform for all-blocked KK");
+    }
+
+    #[timed_test]
+    fn avg_action_prob_no_hashset_still_filters_blockers() {
+        // Verify blocker filtering works after HashSet removal
+        let (strategy, _) = build_minimal_postflop_strategy();
+        let all_buckets = AllBuckets::new([169, 10, 10, 10], [None, None, None, None]);
+
+        // Board blocks all AA combos
+        let board = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::Ace, Suit::Diamond),
+        ];
+
+        let hand = CanonicalHand::new(Value::Ace, Value::Ace, false);
+        let p = avg_action_prob_for_hand(
+            &hand, &board, Street::Flop,
+            &all_buckets, &strategy, 1, 0,
+        );
+
+        // All AA combos blocked (3 aces on board block all 6 AA combos
+        // since each combo needs 2 aces from 4, but 3 are on board)
+        // Wait: (Ac, X) where X not on board -- only Ac is off board.
+        // So only combo not fully blocked would need 2 off-board aces.
+        // Only 1 ace (Ac) is off board. All combos blocked.
+        assert!(p.abs() < f32::EPSILON, "Expected 0.0 for blocked hand");
     }
 
     #[timed_test]
