@@ -69,7 +69,21 @@ Each iteration:
 
 The choice node has its own regret and strategy sums, separate from the real tree.
 
-### Rollout Implementation
+### Fixed-Strategy Rollout (No CFR Beyond the Boundary)
+
+The rollout does NOT run CFR on future streets. It mechanically follows the (biased) blueprint strategy — a pure expected-value calculation with no iteration or convergence. This is critical to understanding the approach:
+
+1. **Deal a next-street card** (or iterate exhaustively over all possible cards)
+2. **Look up each player's bucket** for the new board using `AllBuckets::get_bucket()`
+3. **Walk the abstract tree** from the boundary's corresponding node:
+   - At each decision node, read the blueprint action probabilities for the acting player's bucket
+   - Apply the bias (if any) to get the continuation strategy probabilities
+   - Compute the **expected value** by weighting each child's value by its probability — no sampling, no regret matching, just `EV = Σ p_action × child_value`
+4. **At terminals**: fold → zero-sum payoff, showdown → hand evaluation with concrete cards
+5. **At the next Chance node** (turn→river): repeat — deal all possible river cards, average
+6. **Return the weighted average** across all dealt cards
+
+This is a deterministic computation for a given (combo, board, continuation_k). No randomness, no iteration — just a tree walk multiplying probabilities. The result: one `f64` payoff per combo.
 
 ```rust
 fn rollout_from_boundary(
@@ -82,15 +96,28 @@ fn rollout_from_boundary(
     continuation_k: u8,       // which biased strategy to use
     bias_factor: f64,         // 10.0 default
     player: u8,               // which player's value to compute
-    num_rollout_cards: Option<usize>,  // None = exhaustive, Some(N) = sample N
 ) -> f64
 ```
 
-For **exhaustive** rollout (all possible next cards): iterate over all remaining deck cards, weight equally. This is exact but O(48) per boundary per combo for flop→turn, O(48×47) for flop→turn→river.
+For each rollout: deal a random turn card (and river card if needed), walk the abstract tree to a terminal, record the payoff. Average N rollouts per combo per boundary. N is configurable (default 3, matching Pluribus). More rollouts = less variance but slower.
 
-For **sampled** rollout: deal N random next cards, average. Faster but noisier.
+```rust
+fn rollout_from_boundary(
+    combo: [Card; 2],
+    board: &[Card],
+    abstract_tree: &GameTree,
+    abstract_node: u32,
+    strategy: &BlueprintV2Strategy,
+    buckets: &AllBuckets,
+    continuation_k: u8,
+    bias_factor: f64,
+    player: u8,
+    num_rollouts: u32,        // number of Monte Carlo samples (default 3)
+    rng: &mut impl Rng,
+) -> f64
+```
 
-Recommended: exhaustive for turn→river (47 cards), sampled for flop→turn→river (too many combinations). Configurable via `num_rollout_cards`.
+Each rollout is independent and cheap (~microseconds). The entire evaluation is embarrassingly parallel across combos.
 
 ### Biasing the Strategy
 
@@ -133,6 +160,20 @@ Diagnostics emitted during solving:
    [rollout] 1176 combos × 41 boundaries × 4 strategies: 2.3s (parallelized)
    ```
 
+4. **Choice node action frequencies** — logged periodically during solving and at completion. Shows how the opponent's continuation mix evolves as the solver converges:
+   ```
+   [choice node] iter=100:  unbiased=42.1% fold=8.3% call=31.2% raise=18.4%
+   [choice node] iter=500:  unbiased=35.7% fold=12.1% call=33.8% raise=18.4%
+   [choice node] iter=2000: unbiased=33.2% fold=15.0% call=30.5% raise=21.3%  (final)
+   ```
+
+   Also log per-action regret sums at the choice node:
+   ```
+   [choice regrets] unbiased=+1204.3 fold=-892.1 call=+3301.2 raise=-1891.0
+   ```
+
+   If one strategy dominates (>80%), it suggests the other strategies aren't providing useful signal. If the mix is roughly even, the multi-valued approach is working as intended.
+
 ### Performance
 
 Per leaf evaluation (called every `leaf_eval_interval` iterations):
@@ -151,7 +192,7 @@ Per CFR iteration (excluding leaf evaluation):
 subgame:
   continuation_strategies: 4          # K value (1 = single-valued, 4 = Pluribus)
   bias_factor: 10.0                   # how much to bias fold/call/raise
-  rollout_samples: null               # null = exhaustive, N = sample N cards
+  num_rollouts: 3                     # Monte Carlo rollouts per combo per boundary
   leaf_eval_interval: 10              # re-evaluate leaves every N iterations
 ```
 
