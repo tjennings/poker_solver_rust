@@ -182,6 +182,12 @@ pub struct TrainingConfig {
     /// Set to 1.0 for standard LCFR.
     #[serde(default = "default_dcfr_gamma")]
     pub dcfr_gamma: f64,
+    /// Cap on the DCFR epoch counter `t`. When set, `t = min(t, cap)` so
+    /// discount factors plateau instead of approaching 1.0 during
+    /// indefinite training. `None` = no cap (default, preserves original
+    /// DCFR behavior).
+    #[serde(default)]
+    pub dcfr_epoch_cap: Option<u64>,
     /// Stop when mean strategy delta falls below this threshold.
     /// Checked every `print_every_minutes`. `None` = never stop on delta.
     #[serde(default)]
@@ -422,6 +428,7 @@ snapshots:
                 dcfr_alpha: 1.5,
                 dcfr_beta: 0.0,
                 dcfr_gamma: 2.0,
+                dcfr_epoch_cap: None,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 120,

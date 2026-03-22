@@ -438,6 +438,7 @@ mod tests {
                 dcfr_alpha: 1.0,
                 dcfr_beta: 1.0,
                 dcfr_gamma: 1.0,
+                dcfr_epoch_cap: None,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 60,

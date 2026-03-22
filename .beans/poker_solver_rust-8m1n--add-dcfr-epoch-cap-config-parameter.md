@@ -1,10 +1,11 @@
 ---
 # poker_solver_rust-8m1n
 title: Add dcfr_epoch_cap config parameter
-status: in-progress
+status: completed
 type: feature
+priority: normal
 created_at: 2026-03-22T23:06:18Z
-updated_at: 2026-03-22T23:06:18Z
+updated_at: 2026-03-22T23:12:38Z
 ---
 
 Add dcfr_epoch_cap: Option<u64> to TrainingConfig to cap the DCFR epoch counter t, preventing discount factors from approaching 1.0 during indefinite training.
