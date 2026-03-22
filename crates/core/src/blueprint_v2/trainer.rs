@@ -243,6 +243,32 @@ impl BlueprintTrainer {
             buckets
         };
 
+        // Copy bucket files into the snapshot output directory so the bundle
+        // is self-contained and the explorer can find them.
+        if let Some(ref cluster_path) = config.training.cluster_path {
+            let dest = Path::new(&config.snapshots.output_dir).join("buckets");
+            if !dest.exists() {
+                std::fs::create_dir_all(&dest).expect("failed to create buckets/ in output dir");
+                let src = Path::new(cluster_path);
+                let mut copied = 0u32;
+                for entry in std::fs::read_dir(src).expect("failed to read cluster_path") {
+                    let entry = entry.expect("failed to read dir entry");
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.ends_with(".buckets") {
+                        let dest_file = dest.join(&name);
+                        std::fs::copy(entry.path(), &dest_file).unwrap_or_else(|e| {
+                            panic!("failed to copy {} to {}: {e}", entry.path().display(), dest_file.display())
+                        });
+                        copied += 1;
+                    }
+                }
+                eprintln!("  Copied {copied} bucket files from {cluster_path} to {}", dest.display());
+            } else {
+                eprintln!("  Bucket files already present at {}", dest.display());
+            }
+        }
+
         let rng = StdRng::seed_from_u64(config.clustering.seed);
 
         let deck = *CANONICAL_DECK;
