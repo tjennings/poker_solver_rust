@@ -1347,6 +1347,102 @@ pub fn sample_hands_for_bucket(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Adjusted Rand Index (sampling-based)
+// ---------------------------------------------------------------------------
+
+/// Compute the Adjusted Rand Index between two clusterings.
+///
+/// ARI measures agreement between two clusterings, adjusted for chance:
+/// - 1.0 = identical groupings (regardless of label permutation)
+/// - 0.0 = agreement expected by random chance
+/// - negative = less agreement than random
+///
+/// Uses sampling to avoid O(n^2) pairwise comparison: draws random pairs
+/// of indices, checks same-cluster agreement, builds a contingency table.
+///
+/// Returns `None` if degenerate (all items in one cluster in either input).
+#[must_use]
+pub fn adjusted_rand_index(a: &[u16], b: &[u16], seed: u64) -> Option<f64> {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    assert_eq!(a.len(), b.len(), "clusterings must have same length");
+    let n = a.len();
+    if n < 2 {
+        return None;
+    }
+
+    // Check for degenerate cases: all items in one cluster.
+    let a_unique: std::collections::HashSet<u16> = a.iter().copied().collect();
+    let b_unique: std::collections::HashSet<u16> = b.iter().copied().collect();
+    if a_unique.len() <= 1 || b_unique.len() <= 1 {
+        return None;
+    }
+
+    // Build contingency counts from pairs.
+    let mut tp = 0_u64; // same in A and same in B
+    let mut fp = 0_u64; // same in A, different in B
+    let mut fn_ = 0_u64; // different in A, same in B
+    let mut tn = 0_u64; // different in A, different in B
+
+    let total_pairs = n * (n - 1) / 2;
+    if total_pairs <= 100_000 {
+        // Exhaustive enumeration for small inputs.
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let same_a = a[i] == a[j];
+                let same_b = b[i] == b[j];
+                match (same_a, same_b) {
+                    (true, true) => tp += 1,
+                    (true, false) => fp += 1,
+                    (false, true) => fn_ += 1,
+                    (false, false) => tn += 1,
+                }
+            }
+        }
+    } else {
+        // Sample random pairs for large inputs.
+        let num_samples = 100_000;
+        let mut rng = StdRng::seed_from_u64(seed);
+        for _ in 0..num_samples {
+            let i = rng.random_range(0..n);
+            let mut j = rng.random_range(0..n - 1);
+            if j >= i {
+                j += 1;
+            }
+            let same_a = a[i] == a[j];
+            let same_b = b[i] == b[j];
+            match (same_a, same_b) {
+                (true, true) => tp += 1,
+                (true, false) => fp += 1,
+                (false, true) => fn_ += 1,
+                (false, false) => tn += 1,
+            }
+        }
+    }
+
+    if tp + fp + fn_ + tn == 0 {
+        return None;
+    }
+
+    // Hubert-Arabie ARI formula via contingency table:
+    // ARI = 2(tp*tn - fn*fp) / ((tp+fp)(fp+tn) + (tp+fn)(fn+tn))
+    let tp_f = tp as f64;
+    let fp_f = fp as f64;
+    let fn_f = fn_ as f64;
+    let tn_f = tn as f64;
+
+    let numerator = 2.0 * (tp_f * tn_f - fn_f * fp_f);
+    let denominator = (tp_f + fp_f) * (fp_f + tn_f) + (tp_f + fn_f) * (fn_f + tn_f);
+
+    if denominator.abs() < 1e-15 {
+        return None;
+    }
+
+    Some(numerator / denominator)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1806,5 +1902,49 @@ mod tests {
         let s = report.summary();
         assert!(!s.contains("Between-centroid"), "should not show between-centroid when None: {s}");
         assert!(!s.contains("Separation ratio"), "should not show separation ratio when None: {s}");
+    }
+
+    #[test]
+    fn ari_identical_clusterings() {
+        let a = vec![0u16, 0, 1, 1, 2, 2];
+        let b = vec![0u16, 0, 1, 1, 2, 2];
+        let ari = adjusted_rand_index(&a, &b, 42);
+        assert!(
+            (ari.unwrap() - 1.0).abs() < 0.05,
+            "identical clusterings should have ARI ~1.0, got {ari:?}"
+        );
+    }
+
+    #[test]
+    fn ari_permuted_ids_is_one() {
+        // Same grouping, different IDs: {0,0,1,1} vs {5,5,3,3}
+        let a = vec![0u16, 0, 1, 1];
+        let b = vec![5u16, 5, 3, 3];
+        let ari = adjusted_rand_index(&a, &b, 42);
+        assert!(
+            (ari.unwrap() - 1.0).abs() < 0.05,
+            "permuted IDs should have ARI ~1.0, got {ari:?}"
+        );
+    }
+
+    #[test]
+    fn ari_completely_different() {
+        // A groups by pairs, B groups odds/evens — maximally different for 4 items
+        let a = vec![0u16, 0, 1, 1];
+        let b = vec![0u16, 1, 0, 1];
+        let ari = adjusted_rand_index(&a, &b, 42);
+        // For 4 items with these groupings, ARI should be negative or near zero
+        assert!(
+            ari.unwrap() < 0.3,
+            "completely different clusterings should have low ARI, got {ari:?}"
+        );
+    }
+
+    #[test]
+    fn ari_degenerate_single_cluster() {
+        let a = vec![0u16, 0, 0, 0];
+        let b = vec![0u16, 1, 2, 3];
+        let ari = adjusted_rand_index(&a, &b, 42);
+        assert!(ari.is_none(), "degenerate clustering should return None");
     }
 }
