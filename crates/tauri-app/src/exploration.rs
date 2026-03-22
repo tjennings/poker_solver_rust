@@ -1154,6 +1154,175 @@ fn get_strategy_matrix_v2(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Blueprint range propagation
+// ---------------------------------------------------------------------------
+
+/// Propagate 1326-combo range weights through the blueprint's action history.
+///
+/// Walks the abstract game tree following `action_history`, and at each
+/// decision node, multiplies the acting player's combo weights by the
+/// blueprint strategy probability for each combo's bucket. This is the
+/// blueprint equivalent of `postflop_close_street_core` — it updates
+/// `PostflopState.filtered_{oop,ip}_weights` so the subgame solver can
+/// use blueprint ranges as its starting point.
+///
+/// Also sets `PostflopState.config.abstract_node_idx` to the tree node
+/// after walking the history, so the subgame solver starts from the
+/// correct position in the abstract tree.
+pub fn blueprint_propagate_ranges(
+    exploration: &ExplorationState,
+    postflop: &crate::postflop::PostflopState,
+    board: &[String],
+    action_history: &[String],
+) -> Result<(), String> {
+    use poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id;
+    use poker_solver_core::hands::all_hands;
+    use range_solver::card::card_pair_to_index;
+    use range_solver::range::Range;
+
+    let source_guard = exploration.source.read();
+    let source = source_guard
+        .as_ref()
+        .ok_or_else(|| "No bundle loaded".to_string())?;
+
+    let StrategySource::BlueprintV2 {
+        strategy, tree, decision_map, ..
+    } = source
+    else {
+        return Err("Blueprint range propagation requires a BlueprintV2 source".to_string());
+    };
+
+    let cbv_guard = postflop.cbv_context.read();
+    let ctx = cbv_guard
+        .as_ref()
+        .ok_or("CbvContext is required for blueprint range propagation")?;
+
+    let board_cards = parse_board(board)?;
+
+    // Start from current filtered weights (set by preflop explorer).
+    let config = postflop.config.read().clone();
+    let mut oop_weights: Vec<f32> = postflop
+        .filtered_oop_weights
+        .read()
+        .clone()
+        .unwrap_or_else(|| {
+            let range: Range = config.oop_range.parse().unwrap_or_default();
+            range.raw_data().to_vec()
+        });
+    let mut ip_weights: Vec<f32> = postflop
+        .filtered_ip_weights
+        .read()
+        .clone()
+        .unwrap_or_else(|| {
+            let range: Range = config.ip_range.parse().unwrap_or_default();
+            range.raw_data().to_vec()
+        });
+
+    // Walk the abstract tree through the action history.
+    let mut node_idx = tree.root;
+    for action_str in action_history {
+        // Skip chance nodes.
+        if let V2GameNode::Chance { child, .. } = &tree.nodes[node_idx as usize] {
+            node_idx = *child;
+        }
+
+        let (player, street, actions, children) = match &tree.nodes[node_idx as usize] {
+            V2GameNode::Decision { player, street, actions, children, .. } => {
+                (*player, *street, actions, children)
+            }
+            _ => break,
+        };
+
+        let dec_idx = decision_map
+            .get(node_idx as usize)
+            .copied()
+            .unwrap_or(u32::MAX);
+        if dec_idx == u32::MAX {
+            break;
+        }
+
+        let action_pos = find_v2_action_position(action_str, actions)
+            .ok_or_else(|| format!("Action '{action_str}' not found at node {node_idx}"))?;
+
+        // Slice board to the correct length for this node's street.
+        let board_slice = board_for_street_slice(&board_cards, street);
+
+        let weights = if player == 0 {
+            &mut oop_weights
+        } else {
+            &mut ip_weights
+        };
+
+        let lookup = BucketLookup {
+            all_buckets: &ctx.all_buckets,
+            strategy: &ctx.strategy,
+            decision_idx: dec_idx as usize,
+        };
+
+        // For each combo, look up its bucket and multiply by action probability.
+        for hand in all_hands() {
+            for (c0, c1) in hand.combos() {
+                if board_slice.iter().any(|b| *b == c0 || *b == c1) {
+                    continue; // blocked by board
+                }
+                let id0 = rs_poker_card_to_id(c0);
+                let id1 = rs_poker_card_to_id(c1);
+                let ci = card_pair_to_index(id0, id1);
+
+                if street == Street::Preflop {
+                    let bucket = if strategy.bucket_counts[0] == 169 {
+                        hand.index() as u16
+                    } else {
+                        (hand.index() % strategy.bucket_counts[0] as usize) as u16
+                    };
+                    let probs = strategy.get_action_probs(dec_idx as usize, bucket);
+                    let p = probs.get(action_pos).copied().unwrap_or(0.0);
+                    weights[ci] *= p;
+                } else {
+                    let bucket = ctx.all_buckets.get_bucket(street, [c0, c1], board_slice);
+                    let probs = ctx.strategy.get_action_probs(dec_idx as usize, bucket);
+                    let p = probs.get(action_pos).copied().unwrap_or(0.0);
+                    weights[ci] *= p;
+                }
+            }
+        }
+
+        node_idx = children[action_pos];
+
+        // Skip chance nodes after action.
+        if let V2GameNode::Chance { child, .. } = &tree.nodes[node_idx as usize] {
+            node_idx = *child;
+        }
+    }
+
+    // Store propagated weights and the abstract tree position.
+    *postflop.filtered_oop_weights.write() = Some(oop_weights);
+    *postflop.filtered_ip_weights.write() = Some(ip_weights);
+
+    // Update abstract_node_idx so the subgame solver starts from the right place.
+    postflop.config.write().abstract_node_idx = Some(node_idx);
+
+    eprintln!(
+        "[blueprint_propagate_ranges] propagated through {} actions, abstract_node_idx={}",
+        action_history.len(),
+        node_idx
+    );
+
+    Ok(())
+}
+
+/// Tauri command wrapper for blueprint range propagation.
+#[tauri::command(rename_all = "snake_case")]
+pub fn blueprint_propagate_ranges_cmd(
+    state: State<'_, ExplorationState>,
+    postflop_state: State<'_, Arc<crate::postflop::PostflopState>>,
+    board: Vec<String>,
+    action_history: Vec<String>,
+) -> Result<(), String> {
+    blueprint_propagate_ranges(&state, &postflop_state, &board, &action_history)
+}
+
 /// Get the canonical hand index (0..169) from rank characters.
 fn canonical_hand_index_from_ranks(rank1: char, rank2: char, suited: bool) -> usize {
     let v1 = char_to_value(rank1);

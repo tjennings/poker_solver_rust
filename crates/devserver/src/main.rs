@@ -187,6 +187,20 @@ async fn handle_get_strategy_matrix(
     ))
 }
 
+async fn handle_blueprint_propagate_ranges(
+    AxumState(state): AxumState<AppState>,
+    Extension(postflop): Extension<Arc<PostflopState>>,
+    Json(params): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let board: Vec<String> = serde_json::from_value(params["board"].clone())
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("Invalid board: {e}")))?;
+    let action_history: Vec<String> = serde_json::from_value(params["action_history"].clone())
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("Invalid action_history: {e}")))?;
+    result_to_response(
+        poker_solver_tauri::blueprint_propagate_ranges(&state, &postflop, &board, &action_history)
+    )
+}
+
 async fn handle_get_available_actions(
     AxumState(state): AxumState<AppState>,
     Json(params): Json<PositionParams>,
@@ -542,6 +556,7 @@ async fn main() {
         .route("/api/load_bundle", post(handle_load_bundle))
         .route("/api/load_blueprint_v2", post(handle_load_blueprint_v2))
         .route("/api/get_strategy_matrix", post(handle_get_strategy_matrix))
+        .route("/api/blueprint_propagate_ranges_cmd", post(handle_blueprint_propagate_ranges))
         .route(
             "/api/get_available_actions",
             post(handle_get_available_actions),

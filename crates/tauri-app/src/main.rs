@@ -42,6 +42,7 @@ fn main() {
             poker_solver_tauri::postflop_set_cache_dir,
             poker_solver_tauri::postflop_check_cache,
             poker_solver_tauri::postflop_load_cached,
+            poker_solver_tauri::blueprint_propagate_ranges_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

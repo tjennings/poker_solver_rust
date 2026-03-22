@@ -299,6 +299,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     setSolved(false);
     setNeedsSolve(false);
     setBlueprintMode(false); // Switch to solver mode
+    const savedBlueprintHistory = [...blueprintHistory];
     setActionHistory([]); // Reset action history for solver tree
     setBlueprintHistory([]);
     setMatrix(null);
@@ -312,19 +313,27 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     const oppSamples = globalConfig.rollout_opponent_samples ?? 8;
     const leafEvalInterval = globalConfig.leaf_eval_interval ?? 10;
     const rangeClamp = globalConfig.range_clamp_threshold ?? 0.05;
-    invoke('postflop_solve_street', {
-      board: cards,
-      target_exploitability: targetExpl,
-      max_iterations: maxIters,
-      rollout_bias_factor: biasFactor,
-      rollout_num_samples: numRollouts,
-      rollout_opponent_samples: oppSamples,
-      leaf_eval_interval: leafEvalInterval,
-      range_clamp_threshold: rangeClamp,
-    })
+
+    // Propagate blueprint ranges before solving if there's action history.
+    const fullHistory = [...preflopActionIds, ...savedBlueprintHistory];
+    const propagate = fullHistory.length > 0
+      ? invoke('blueprint_propagate_ranges_cmd', { board: cards, action_history: fullHistory })
+      : Promise.resolve();
+
+    propagate
+      .then(() => invoke('postflop_solve_street', {
+        board: cards,
+        target_exploitability: targetExpl,
+        max_iterations: maxIters,
+        rollout_bias_factor: biasFactor,
+        rollout_num_samples: numRollouts,
+        rollout_opponent_samples: oppSamples,
+        leaf_eval_interval: leafEvalInterval,
+        range_clamp_threshold: rangeClamp,
+      }))
       .then(() => startPolling())
       .catch((e) => { setError(String(e)); setSolving(false); });
-  }, [solving, boardInput, startPolling, fetchBlueprintMatrix]);
+  }, [solving, boardInput, startPolling, fetchBlueprintMatrix, blueprintHistory, preflopActionIds]);
 
   /** Optimistically push an action card onto the history. */
   const pushActionCard = useCallback((actionIndex: number, selectedId?: string) => {

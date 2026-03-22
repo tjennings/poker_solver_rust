@@ -4,11 +4,13 @@ mod simulation;
 
 pub use exploration::{
     // Tauri command wrappers
+    blueprint_propagate_ranges_cmd,
     canonicalize_board, get_available_actions, get_bundle_info, get_combo_classes,
     get_computation_status, get_hand_equity, get_preflop_ranges, get_strategy_matrix,
     is_board_cached, is_bundle_loaded, list_agents, list_blueprints, load_blueprint_v2, load_bundle,
     start_bucket_computation,
     // Core functions (no Tauri dependency, usable from Axum or other runtimes)
+    blueprint_propagate_ranges,
     canonicalize_board_core, get_available_actions_core, get_bundle_info_core,
     get_combo_classes_core, get_computation_status_core, get_hand_equity_core,
     get_preflop_ranges_core, get_strategy_matrix_core, is_board_cached_core,
