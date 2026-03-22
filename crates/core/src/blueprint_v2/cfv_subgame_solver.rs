@@ -698,6 +698,7 @@ impl CfvSubgameSolver {
                         // Multi-valued: choice node with K strategies.
                         let choice_probs = regret_match(&self.choice_regret_sum);
                         let mut root_cfvs_per_k: Vec<Vec<f64>> = Vec::with_capacity(k);
+                        let leaf_eval_start = std::time::Instant::now();
 
                         for eval_k in 0..k {
                             // Evaluate leaves with evaluator k.
@@ -742,6 +743,20 @@ impl CfvSubgameSolver {
                             root_cfvs_per_k.push(cfv_buf[root_start..root_start + n].to_vec());
                         }
 
+                        // Log leaf evaluation timing at intervals.
+                        if traverser == 0
+                            && (self.iteration == 1
+                                || self.iteration.is_multiple_of(100)
+                                || iter_idx == iterations - 1)
+                        {
+                            let elapsed = leaf_eval_start.elapsed();
+                            let num_boundaries = self.boundary_info.boundaries.len();
+                            eprintln!(
+                                "[leaf eval] iter={}: {} combos × {} boundaries × {} strategies in {:.2}s",
+                                self.iteration, n, num_boundaries, k, elapsed.as_secs_f64()
+                            );
+                        }
+
                         // Compute choice node regrets.
                         let reach = if traverser == 0 { &oop_reach } else { &ip_reach };
                         let total_reach: f64 = reach.iter().sum();
@@ -777,6 +792,7 @@ impl CfvSubgameSolver {
                         }
                     } else {
                         // K=1: original behavior, no choice node.
+                        let leaf_eval_start = std::time::Instant::now();
                         for (b_idx, &(_, pot, invested)) in
                             self.boundary_info.boundaries.iter().enumerate()
                         {
@@ -790,6 +806,18 @@ impl CfvSubgameSolver {
                                 &oop_ranges[b_idx],
                                 &ip_ranges[b_idx],
                                 traverser,
+                            );
+                        }
+                        if traverser == 0
+                            && (self.iteration == 1
+                                || self.iteration.is_multiple_of(100)
+                                || iter_idx == iterations - 1)
+                        {
+                            let elapsed = leaf_eval_start.elapsed();
+                            let num_boundaries = self.boundary_info.boundaries.len();
+                            eprintln!(
+                                "[leaf eval] iter={}: {} combos × {} boundaries in {:.2}s",
+                                self.iteration, n, num_boundaries, elapsed.as_secs_f64()
                             );
                         }
 

@@ -440,10 +440,11 @@ impl LeafEvaluator for RolloutLeafEvaluator {
         ip_range: &[f64],
         traverser: u8,
     ) -> Vec<f64> {
+        let eval_start = std::time::Instant::now();
         let half_pot = pot / 2.0;
         let opp_range = if traverser == 0 { ip_range } else { oop_range };
 
-        combos
+        let result: Vec<f64> = combos
             .par_iter()
             .enumerate()
             .map(|(i, hero_hand)| {
@@ -501,7 +502,15 @@ impl LeafEvaluator for RolloutLeafEvaluator {
                 // Convert from chip value to pot-fraction units.
                 avg_chips / half_pot
             })
-            .collect()
+            .collect();
+
+        let elapsed = eval_start.elapsed();
+        eprintln!(
+            "[rollout] {:?} bias: {} combos, {:.0}ms",
+            self.bias, combos.len(), elapsed.as_secs_f64() * 1000.0
+        );
+
+        result
     }
 }
 
