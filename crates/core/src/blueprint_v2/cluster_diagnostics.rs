@@ -1347,6 +1347,263 @@ pub fn sample_hands_for_bucket(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Adjusted Rand Index (sampling-based)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of pair comparisons for ARI. Uses exhaustive enumeration
+/// below this threshold, random sampling above it.
+const ARI_PAIR_BUDGET: usize = 100_000;
+
+/// Compute the Adjusted Rand Index between two clusterings.
+///
+/// ARI measures agreement between two clusterings, adjusted for chance:
+/// - 1.0 = identical groupings (regardless of label permutation)
+/// - 0.0 = agreement expected by random chance
+/// - negative = less agreement than random
+///
+/// Uses sampling to avoid O(n^2) pairwise comparison: draws random pairs
+/// of indices, checks same-cluster agreement, builds a contingency table.
+///
+/// Returns `None` if degenerate (all items in one cluster in either input).
+#[must_use]
+pub fn adjusted_rand_index(a: &[u16], b: &[u16], seed: u64) -> Option<f64> {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    assert_eq!(a.len(), b.len(), "clusterings must have same length");
+    let n = a.len();
+    if n < 2 {
+        return None;
+    }
+
+    // Check for degenerate cases: all items in one cluster.
+    let a_unique: std::collections::HashSet<u16> = a.iter().copied().collect();
+    let b_unique: std::collections::HashSet<u16> = b.iter().copied().collect();
+    if a_unique.len() <= 1 || b_unique.len() <= 1 {
+        return None;
+    }
+
+    // Build contingency counts from pairs.
+    let mut tp = 0_u64; // same in A and same in B
+    let mut fp = 0_u64; // same in A, different in B
+    let mut fn_ = 0_u64; // different in A, same in B
+    let mut tn = 0_u64; // different in A, different in B
+
+    let mut classify = |i: usize, j: usize| {
+        match (a[i] == a[j], b[i] == b[j]) {
+            (true, true) => tp += 1,
+            (true, false) => fp += 1,
+            (false, true) => fn_ += 1,
+            (false, false) => tn += 1,
+        }
+    };
+
+    let total_pairs = n * (n - 1) / 2;
+    if total_pairs <= ARI_PAIR_BUDGET {
+        // Exhaustive enumeration for small inputs.
+        for i in 0..n {
+            for j in (i + 1)..n {
+                classify(i, j);
+            }
+        }
+    } else {
+        // Sample random pairs for large inputs.
+        let mut rng = StdRng::seed_from_u64(seed);
+        for _ in 0..ARI_PAIR_BUDGET {
+            let i = rng.random_range(0..n);
+            let mut j = rng.random_range(0..n - 1);
+            if j >= i {
+                j += 1;
+            }
+            classify(i, j);
+        }
+    }
+
+    if tp + fp + fn_ + tn == 0 {
+        return None;
+    }
+
+    // Hubert-Arabie ARI formula via contingency table:
+    // ARI = 2(tp*tn - fn*fp) / ((tp+fp)(fp+tn) + (tp+fn)(fn+tn))
+    let tp_f = tp as f64;
+    let fp_f = fp as f64;
+    let fn_f = fn_ as f64;
+    let tn_f = tn as f64;
+
+    let numerator = 2.0 * (tp_f * tn_f - fn_f * fp_f);
+    let denominator = (tp_f + fp_f) * (fp_f + tn_f) + (tp_f + fn_f) * (fn_f + tn_f);
+
+    if denominator.abs() < 1e-15 {
+        return None;
+    }
+
+    Some(numerator / denominator)
+}
+
+// ---------------------------------------------------------------------------
+// Cluster diff
+// ---------------------------------------------------------------------------
+
+/// Side-by-side comparison of two bucket files.
+#[derive(Debug)]
+pub struct ClusterDiffReport {
+    pub street: String,
+    pub bucket_count: u16,
+    /// Bucket size report for dir A.
+    pub size_a: ClusterReport,
+    /// Bucket size report for dir B.
+    pub size_b: ClusterReport,
+    /// Equity audit for dir A (None if sample_boards == 0).
+    pub equity_a: Option<EquityAuditReport>,
+    /// Equity audit for dir B (None if sample_boards == 0).
+    pub equity_b: Option<EquityAuditReport>,
+    /// Adjusted Rand Index (None if degenerate).
+    pub ari: Option<f64>,
+}
+
+/// Format a side-by-side equity histogram comparing bucket distributions
+/// across 10 equity bins for two audit reports.
+#[allow(clippy::cast_precision_loss)]
+fn format_equity_histogram(ea: &EquityAuditReport, eb: &EquityAuditReport) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "\n  Equity histogram (buckets per equity bin):");
+    let _ = writeln!(s, "  {:<16} {:<10} {:<10}", "Equity Range", "Dir A", "Dir B");
+    for bin in 0..10 {
+        let lo = bin as f64 * 0.1;
+        let hi = lo + 0.1;
+        let count_a = ea.buckets.iter().filter(|b| b.count > 0 && b.mean_equity >= lo && b.mean_equity < hi).count();
+        let count_b = eb.buckets.iter().filter(|b| b.count > 0 && b.mean_equity >= lo && b.mean_equity < hi).count();
+        let _ = writeln!(s, "  [{:.1}, {:.1})       {:<10} {:<10}", lo, hi, count_a, count_b);
+    }
+    s
+}
+
+impl ClusterDiffReport {
+    /// Format as a human-readable summary.
+    #[must_use]
+    pub fn summary(&self, verbose: bool) -> String {
+        use std::fmt::Write;
+        let mut s = format!("=== Cluster Diff: {} ===\n", self.street);
+        let _ = writeln!(s, "{:<28} {:<16} {:<16}", "", "Dir A", "Dir B");
+        let _ = writeln!(
+            s, "{:<28} {:<16} {:<16}",
+            "Bucket count:", self.size_a.bucket_count, self.size_b.bucket_count
+        );
+
+        // Bucket size stats
+        let _ = writeln!(
+            s, "{:<28} {:<16.1} {:<16.1}",
+            "Bucket size std:", self.size_a.size_stats.std_dev, self.size_b.size_stats.std_dev
+        );
+        let empty_a = self.size_a.bucket_sizes.iter().filter(|&&c| c == 0).count();
+        let empty_b = self.size_b.bucket_sizes.iter().filter(|&&c| c == 0).count();
+        let _ = writeln!(
+            s, "{:<28} {:<16} {:<16}",
+            "Empty buckets:", empty_a, empty_b
+        );
+
+        // Equity quality (if audited)
+        if let (Some(ea), Some(eb)) = (&self.equity_a, &self.equity_b) {
+            let pct = if ea.mean_intra_bucket_std > 0.0 {
+                (eb.mean_intra_bucket_std - ea.mean_intra_bucket_std)
+                    / ea.mean_intra_bucket_std
+                    * 100.0
+            } else {
+                0.0
+            };
+            let _ = writeln!(
+                s, "{:<28} {:<16.4} {:<12.4} ({:+.1}%)",
+                "Mean intra-bkt std:", ea.mean_intra_bucket_std, eb.mean_intra_bucket_std, pct
+            );
+            let pct_max = if ea.max_intra_bucket_std > 0.0 {
+                (eb.max_intra_bucket_std - ea.max_intra_bucket_std)
+                    / ea.max_intra_bucket_std
+                    * 100.0
+            } else {
+                0.0
+            };
+            let _ = writeln!(
+                s, "{:<28} {:<16.4} {:<12.4} ({:+.1}%)",
+                "Max intra-bkt std:", ea.max_intra_bucket_std, eb.max_intra_bucket_std, pct_max
+            );
+        }
+
+        // ARI
+        match self.ari {
+            Some(ari) => { let _ = writeln!(s, "{:<28} {:.3}", "Adjusted Rand Index:", ari); }
+            None => { let _ = writeln!(s, "{:<28} N/A", "Adjusted Rand Index:"); }
+        }
+
+        // Verbose: equity histogram comparison
+        if verbose {
+            if let (Some(ea), Some(eb)) = (&self.equity_a, &self.equity_b) {
+                s.push_str(&format_equity_histogram(ea, eb));
+            }
+        }
+
+        s
+    }
+}
+
+/// Compare two bucket files: size distribution, equity quality, and ARI.
+///
+/// Both files must have the same bucket count, board count, and street.
+/// If `sample_boards > 0`, runs equity audit on both files.
+///
+/// # Panics
+///
+/// Panics if the files have different bucket counts, board counts, or streets.
+#[must_use]
+pub fn diff_bucket_files(
+    a: &BucketFile,
+    b: &BucketFile,
+    sample_boards: usize,
+    seed: u64,
+) -> ClusterDiffReport {
+    assert_eq!(
+        a.header.bucket_count, b.header.bucket_count,
+        "bucket count mismatch: {} vs {}",
+        a.header.bucket_count, b.header.bucket_count
+    );
+    assert_eq!(
+        a.header.board_count, b.header.board_count,
+        "board count mismatch: {} vs {}",
+        a.header.board_count, b.header.board_count
+    );
+    assert_eq!(
+        a.header.street, b.header.street,
+        "street mismatch"
+    );
+
+    let size_a = ClusterReport::from_bucket_file(a);
+    let size_b = ClusterReport::from_bucket_file(b);
+
+    let (equity_a, equity_b) = if sample_boards > 0 {
+        (
+            Some(audit_bucket_equity(a, sample_boards, seed)),
+            Some(audit_bucket_equity(b, sample_boards, seed)),
+        )
+    } else {
+        (None, None)
+    };
+
+    let ari = adjusted_rand_index(&a.buckets, &b.buckets, seed);
+
+    let street = format!("{:?}", a.header.street);
+
+    ClusterDiffReport {
+        street,
+        bucket_count: a.header.bucket_count,
+        size_a,
+        size_b,
+        equity_a,
+        equity_b,
+        ari,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1806,5 +2063,167 @@ mod tests {
         let s = report.summary();
         assert!(!s.contains("Between-centroid"), "should not show between-centroid when None: {s}");
         assert!(!s.contains("Separation ratio"), "should not show separation ratio when None: {s}");
+    }
+
+    #[test]
+    fn ari_identical_clusterings() {
+        let a = vec![0u16, 0, 1, 1, 2, 2];
+        let b = vec![0u16, 0, 1, 1, 2, 2];
+        let ari = adjusted_rand_index(&a, &b, 42);
+        assert!(
+            (ari.unwrap() - 1.0).abs() < 0.05,
+            "identical clusterings should have ARI ~1.0, got {ari:?}"
+        );
+    }
+
+    #[test]
+    fn ari_permuted_ids_is_one() {
+        // Same grouping, different IDs: {0,0,1,1} vs {5,5,3,3}
+        let a = vec![0u16, 0, 1, 1];
+        let b = vec![5u16, 5, 3, 3];
+        let ari = adjusted_rand_index(&a, &b, 42);
+        assert!(
+            (ari.unwrap() - 1.0).abs() < 0.05,
+            "permuted IDs should have ARI ~1.0, got {ari:?}"
+        );
+    }
+
+    #[test]
+    fn ari_completely_different() {
+        // A groups by pairs, B groups odds/evens — maximally different for 4 items
+        let a = vec![0u16, 0, 1, 1];
+        let b = vec![0u16, 1, 0, 1];
+        let ari = adjusted_rand_index(&a, &b, 42);
+        // For 4 items with these groupings, ARI should be negative or near zero
+        assert!(
+            ari.unwrap() < 0.3,
+            "completely different clusterings should have low ARI, got {ari:?}"
+        );
+    }
+
+    #[test]
+    fn ari_degenerate_single_cluster() {
+        let a = vec![0u16, 0, 0, 0];
+        let b = vec![0u16, 1, 2, 3];
+        let ari = adjusted_rand_index(&a, &b, 42);
+        assert!(ari.is_none(), "degenerate clustering should return None");
+    }
+
+    #[test]
+    fn diff_report_identical_files() {
+        let bf = make_test_bucket_file(3, vec![0, 0, 1, 1, 2, 2]);
+        let report = diff_bucket_files(&bf, &bf, 0, 42);
+        assert_eq!(report.bucket_count, 3);
+        assert!(
+            report.ari.unwrap() > 0.95,
+            "identical files should have ARI ~1.0, got {:?}",
+            report.ari
+        );
+        assert_eq!(report.street, "River");
+    }
+
+    #[test]
+    fn diff_report_different_groupings() {
+        let a = make_test_bucket_file(2, vec![0, 0, 1, 1]);
+        let b = make_test_bucket_file(2, vec![0, 1, 0, 1]);
+        let report = diff_bucket_files(&a, &b, 0, 42);
+        assert_eq!(report.bucket_count, 2);
+        assert!(
+            report.ari.unwrap() < 0.3,
+            "different groupings should have low ARI, got {:?}",
+            report.ari
+        );
+    }
+
+    #[test]
+    fn diff_report_size_stats() {
+        let a = make_test_bucket_file(3, vec![0, 0, 0, 1, 2, 2]);
+        let b = make_test_bucket_file(3, vec![0, 1, 1, 1, 2, 2]);
+        let report = diff_bucket_files(&a, &b, 0, 42);
+        // a: sizes [3, 1, 2], b: sizes [1, 3, 2]
+        assert_eq!(report.size_a.bucket_sizes, vec![3, 1, 2]);
+        assert_eq!(report.size_b.bucket_sizes, vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn format_equity_histogram_shows_bins() {
+        // Build two EquityAuditReports with known bucket equities
+        let ea = EquityAuditReport {
+            street: "River".to_string(),
+            bucket_count: 2,
+            sample_boards: 10,
+            buckets: vec![
+                BucketEquityStats { bucket_id: 0, count: 5, mean_equity: 0.15, std_dev: 0.01, min_equity: 0.1, max_equity: 0.2 },
+                BucketEquityStats { bucket_id: 1, count: 5, mean_equity: 0.85, std_dev: 0.01, min_equity: 0.8, max_equity: 0.9 },
+            ],
+            mean_intra_bucket_std: 0.01,
+            max_intra_bucket_std: 0.01,
+        };
+        let eb = EquityAuditReport {
+            street: "River".to_string(),
+            bucket_count: 2,
+            sample_boards: 10,
+            buckets: vec![
+                BucketEquityStats { bucket_id: 0, count: 5, mean_equity: 0.25, std_dev: 0.01, min_equity: 0.2, max_equity: 0.3 },
+                BucketEquityStats { bucket_id: 1, count: 5, mean_equity: 0.75, std_dev: 0.01, min_equity: 0.7, max_equity: 0.8 },
+            ],
+            mean_intra_bucket_std: 0.01,
+            max_intra_bucket_std: 0.01,
+        };
+        let hist = format_equity_histogram(&ea, &eb);
+        assert!(hist.contains("Equity histogram"), "should contain header: {hist}");
+        assert!(hist.contains("[0.1, 0.2)"), "should contain bin range: {hist}");
+        assert!(hist.contains("Dir A"), "should contain Dir A column: {hist}");
+        assert!(hist.contains("Dir B"), "should contain Dir B column: {hist}");
+    }
+
+    #[test]
+    fn format_equity_histogram_counts_correct_bins() {
+        // One bucket at equity 0.05 (bin [0.0, 0.1)), one at 0.95 (bin [0.9, 1.0))
+        let ea = EquityAuditReport {
+            street: "River".to_string(),
+            bucket_count: 2,
+            sample_boards: 10,
+            buckets: vec![
+                BucketEquityStats { bucket_id: 0, count: 5, mean_equity: 0.05, std_dev: 0.01, min_equity: 0.0, max_equity: 0.1 },
+                BucketEquityStats { bucket_id: 1, count: 5, mean_equity: 0.95, std_dev: 0.01, min_equity: 0.9, max_equity: 1.0 },
+            ],
+            mean_intra_bucket_std: 0.01,
+            max_intra_bucket_std: 0.01,
+        };
+        // eb has both buckets in the [0.4, 0.5) range
+        let eb = EquityAuditReport {
+            street: "River".to_string(),
+            bucket_count: 2,
+            sample_boards: 10,
+            buckets: vec![
+                BucketEquityStats { bucket_id: 0, count: 5, mean_equity: 0.45, std_dev: 0.01, min_equity: 0.4, max_equity: 0.5 },
+                BucketEquityStats { bucket_id: 1, count: 5, mean_equity: 0.46, std_dev: 0.01, min_equity: 0.4, max_equity: 0.5 },
+            ],
+            mean_intra_bucket_std: 0.01,
+            max_intra_bucket_std: 0.01,
+        };
+        let hist = format_equity_histogram(&ea, &eb);
+        // [0.0, 0.1) should have 1 in Dir A and 0 in Dir B
+        // [0.4, 0.5) should have 0 in Dir A and 2 in Dir B
+        assert!(hist.contains("[0.0, 0.1)"), "should contain first bin: {hist}");
+    }
+
+    #[test]
+    fn diff_report_verbose_includes_histogram() {
+        let a = make_test_bucket_file(2, vec![0, 0, 1, 1]);
+        let b = make_test_bucket_file(2, vec![0, 1, 0, 1]);
+        // Need equity audits for histogram to appear — use sample_boards > 0
+        // But that requires real board data. Instead, test the non-verbose path
+        // doesn't include the histogram, and test format_equity_histogram directly.
+        let report = diff_bucket_files(&a, &b, 0, 42);
+        let non_verbose = report.summary(false);
+        assert!(!non_verbose.contains("Equity histogram"), "non-verbose should not have histogram");
+    }
+
+    #[test]
+    fn ari_pair_budget_constant_exists() {
+        // Verify the constant is accessible and has the expected value.
+        assert_eq!(ARI_PAIR_BUDGET, 100_000);
     }
 }

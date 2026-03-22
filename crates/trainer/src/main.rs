@@ -140,6 +140,21 @@ enum Commands {
         #[arg(long)]
         cluster_dir: Option<PathBuf>,
     },
+    /// Compare two sets of cluster bucket files
+    DiffClusters {
+        /// Directory A containing .buckets files
+        #[arg(long)]
+        dir_a: PathBuf,
+        /// Directory B containing .buckets files
+        #[arg(long)]
+        dir_b: PathBuf,
+        /// Number of boards to sample for equity audit (0 = skip equity)
+        #[arg(long, default_value = "200")]
+        sample_boards: usize,
+        /// Show per-bucket equity histogram breakdown
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -864,6 +879,48 @@ fn main() -> Result<(), Box<dyn Error>> {
                         name, r.num_hands, r.num_actions, r.exploitability,
                     );
                 }
+            }
+        }
+        Commands::DiffClusters {
+            dir_a,
+            dir_b,
+            sample_boards,
+            verbose,
+        } => {
+            use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
+            use poker_solver_core::blueprint_v2::cluster_diagnostics::diff_bucket_files;
+
+            let streets = ["river", "turn", "flop", "preflop"];
+            let mut any_found = false;
+
+            for street_name in &streets {
+                let path_a = dir_a.join(format!("{street_name}.buckets"));
+                let path_b = dir_b.join(format!("{street_name}.buckets"));
+
+                if !path_a.exists() && !path_b.exists() {
+                    continue;
+                }
+                if !path_a.exists() {
+                    eprintln!("warning: {street_name}.buckets missing from dir-a, skipping");
+                    continue;
+                }
+                if !path_b.exists() {
+                    eprintln!("warning: {street_name}.buckets missing from dir-b, skipping");
+                    continue;
+                }
+
+                let bf_a = BucketFile::load(&path_a)?;
+                let bf_b = BucketFile::load(&path_b)?;
+
+                eprintln!("diffing {street_name}...");
+                let report = diff_bucket_files(&bf_a, &bf_b, sample_boards, 42);
+                println!("{}", report.summary(verbose));
+
+                any_found = true;
+            }
+
+            if !any_found {
+                eprintln!("no matching .buckets files found in both directories");
             }
         }
     }
