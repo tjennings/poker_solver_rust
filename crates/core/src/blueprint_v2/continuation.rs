@@ -108,6 +108,19 @@ fn remaining_deck(hero: [Card; 2], opponent: [Card; 2], board: &[Card]) -> Vec<C
     remaining
 }
 
+/// Context for rollout evaluation -- groups invariant parameters that don't
+/// change across recursive calls.
+pub struct RolloutContext<'a> {
+    pub abstract_tree: &'a GameTree,
+    pub decision_idx_map: &'a [u32],
+    pub strategy: &'a BlueprintV2Strategy,
+    pub buckets: &'a AllBuckets,
+    pub bias: BiasType,
+    pub bias_factor: f64,
+    pub player: u8,
+    pub num_rollouts: u32,
+}
+
 /// Walk the abstract game tree using a (biased) blueprint strategy with
 /// two concrete hands, computing the expected value for `player`.
 ///
@@ -121,30 +134,22 @@ fn remaining_deck(hero: [Card; 2], opponent: [Card; 2], board: &[Card]) -> Vec<C
 ///
 /// Panics if a `DepthBoundary` terminal is encountered (should not
 /// appear in rollout trees).
-#[allow(clippy::too_many_arguments)]
 pub fn rollout_from_boundary(
     hero_hand: [Card; 2],
     opponent_hand: [Card; 2],
     board: &[Card],
-    abstract_tree: &GameTree,
+    ctx: &RolloutContext<'_>,
     abstract_node: u32,
-    decision_idx_map: &[u32],
-    strategy: &BlueprintV2Strategy,
-    buckets: &AllBuckets,
-    bias: BiasType,
-    bias_factor: f64,
-    player: u8,
-    num_rollouts: u32,
     rng: &mut impl Rng,
 ) -> f64 {
-    match &abstract_tree.nodes[abstract_node as usize] {
+    match &ctx.abstract_tree.nodes[abstract_node as usize] {
         GameNode::Terminal { kind, pot, invested } => {
             match kind {
                 TerminalKind::Fold { winner } => {
-                    if player == *winner {
-                        pot - invested[player as usize]
+                    if ctx.player == *winner {
+                        pot - invested[ctx.player as usize]
                     } else {
-                        -invested[player as usize]
+                        -invested[ctx.player as usize]
                     }
                 }
                 TerminalKind::Showdown => {
@@ -152,9 +157,9 @@ pub fn rollout_from_boundary(
                     let player_rank = crate::showdown_equity::rank_hand(hero_hand, board);
                     let opponent_rank = crate::showdown_equity::rank_hand(opponent_hand, board);
                     match player_rank.cmp(&opponent_rank) {
-                        std::cmp::Ordering::Greater => pot - invested[player as usize],
-                        std::cmp::Ordering::Less => -invested[player as usize],
-                        std::cmp::Ordering::Equal => pot / 2.0 - invested[player as usize],
+                        std::cmp::Ordering::Greater => pot - invested[ctx.player as usize],
+                        std::cmp::Ordering::Less => -invested[ctx.player as usize],
+                        std::cmp::Ordering::Equal => pot / 2.0 - invested[ctx.player as usize],
                     }
                 }
                 TerminalKind::DepthBoundary => {
@@ -169,26 +174,24 @@ pub fn rollout_from_boundary(
             let children = children.clone();
 
             // Determine the acting player's hand
-            let acting_hand = if acting_player == player {
+            let acting_hand = if acting_player == ctx.player {
                 hero_hand
             } else {
                 opponent_hand
             };
 
-            let bucket = buckets.get_bucket(street, acting_hand, board);
-            let decision_idx = decision_idx_map[abstract_node as usize];
-            let probs = strategy.get_action_probs(decision_idx as usize, bucket);
+            let bucket = ctx.buckets.get_bucket(street, acting_hand, board);
+            let decision_idx = ctx.decision_idx_map[abstract_node as usize];
+            let probs = ctx.strategy.get_action_probs(decision_idx as usize, bucket);
 
             // Classify actions for biasing
             let action_classes: Vec<ActionClass> = actions.iter().map(classify_action).collect();
-            let biased = bias_strategy(probs, &action_classes, bias, bias_factor);
+            let biased = bias_strategy(probs, &action_classes, ctx.bias, ctx.bias_factor);
 
             let mut ev = 0.0;
             for (i, &child) in children.iter().enumerate() {
                 let child_ev = rollout_from_boundary(
-                    hero_hand, opponent_hand, board, abstract_tree, child,
-                    decision_idx_map, strategy, buckets, bias, bias_factor,
-                    player, num_rollouts, rng,
+                    hero_hand, opponent_hand, board, ctx, child, rng,
                 );
                 ev += f64::from(biased[i]) * child_ev;
             }
@@ -200,7 +203,7 @@ pub fn rollout_from_boundary(
             // Deck size is at most 48 (< u32::MAX), so truncation is safe.
             #[allow(clippy::cast_possible_truncation)]
             let deck_len = deck.len() as u32;
-            let n = num_rollouts.min(deck_len);
+            let n = ctx.num_rollouts.min(deck_len);
             if n == 0 {
                 return 0.0;
             }
@@ -212,9 +215,7 @@ pub fn rollout_from_boundary(
                 let mut new_board = board.to_vec();
                 new_board.push(card);
                 let child_ev = rollout_from_boundary(
-                    hero_hand, opponent_hand, &new_board, abstract_tree, child,
-                    decision_idx_map, strategy, buckets, bias, bias_factor,
-                    player, num_rollouts, rng,
+                    hero_hand, opponent_hand, &new_board, ctx, child, rng,
                 );
                 total += child_ev;
             }
@@ -352,6 +353,28 @@ mod tests {
         BlueprintV2Strategy::empty()
     }
 
+    fn make_ctx<'a>(
+        tree: &'a GameTree,
+        dim: &'a [u32],
+        strategy: &'a BlueprintV2Strategy,
+        buckets: &'a AllBuckets,
+        bias: BiasType,
+        bias_factor: f64,
+        player: u8,
+        num_rollouts: u32,
+    ) -> RolloutContext<'a> {
+        RolloutContext {
+            abstract_tree: tree,
+            decision_idx_map: dim,
+            strategy,
+            buckets,
+            bias,
+            bias_factor,
+            player,
+            num_rollouts,
+        }
+    }
+
     #[test]
     fn rollout_fold_terminal_winner_gets_pot_minus_invested() {
         let (tree, dim) = fold_terminal_tree();
@@ -361,10 +384,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         // player=1 (winner): payoff = pot - invested[1] = 10 - 5 = 5
-        let ev = rollout_from_boundary(
-            hero, opp, &[], &tree, 0, &dim, &strategy, &buckets,
-            BiasType::Unbiased, 1.0, 1, 1, &mut rng,
-        );
+        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 1, 1);
+        let ev = rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng);
         assert!((ev - 5.0).abs() < 1e-9, "Winner EV should be 5.0, got {ev}");
     }
 
@@ -377,10 +398,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         // player=0 (loser): payoff = -invested[0] = -3
-        let ev = rollout_from_boundary(
-            hero, opp, &[], &tree, 0, &dim, &strategy, &buckets,
-            BiasType::Unbiased, 1.0, 0, 1, &mut rng,
-        );
+        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ev = rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng);
         assert!((ev - (-3.0)).abs() < 1e-9, "Loser EV should be -3.0, got {ev}");
     }
 
@@ -418,10 +437,8 @@ mod tests {
         ];
 
         // hero (player=0) has trip aces with K kicker, opponent has nothing
-        let ev = rollout_from_boundary(
-            hero, opp, &board, &tree, 0, &dim, &strategy, &buckets,
-            BiasType::Unbiased, 1.0, 0, 1, &mut rng,
-        );
+        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
         // Hero wins: pot - invested[0] = 20 - 8 = 12
         assert!((ev - 12.0).abs() < 1e-9, "Hero should win 12.0, got {ev}");
     }
@@ -445,10 +462,8 @@ mod tests {
         ];
 
         // hero (player=0) loses
-        let ev = rollout_from_boundary(
-            hero, opp, &board, &tree, 0, &dim, &strategy, &buckets,
-            BiasType::Unbiased, 1.0, 0, 1, &mut rng,
-        );
+        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
         assert!((ev - (-8.0)).abs() < 1e-9, "Hero should lose 8.0, got {ev}");
     }
 
@@ -479,10 +494,8 @@ mod tests {
             Card::new(Value::Five, Suit::Diamond),
         ];
 
-        let ev = rollout_from_boundary(
-            hero, opp, &board, &tree, 0, &dim, &strategy, &buckets,
-            BiasType::Unbiased, 1.0, 0, 1, &mut rng,
-        );
+        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
         // Tie: pot/2 - invested[0] = 10 - 10 = 0
         assert!((ev).abs() < 1e-9, "Tie should give EV 0.0, got {ev}");
     }
@@ -560,10 +573,8 @@ mod tests {
         // Fold: -invested[0] = -3 (player 0 is loser)
         // Call (showdown): hero wins => pot - invested[0] = 14 - 7 = 7
         // EV = 0.6 * (-3) + 0.4 * 7 = -1.8 + 2.8 = 1.0
-        let ev = rollout_from_boundary(
-            hero, opp, &board, &tree, 0, &dim, &strategy, &buckets,
-            BiasType::Unbiased, 1.0, 0, 1, &mut rng,
-        );
+        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
         assert!((ev - 1.0).abs() < 0.01, "Expected EV ~1.0, got {ev}");
     }
 
@@ -584,17 +595,13 @@ mod tests {
         ];
 
         // Unbiased EV = 0.6 * (-3) + 0.4 * 7 = 1.0
-        let unbiased_ev = rollout_from_boundary(
-            hero, opp, &board, &tree, 0, &dim, &strategy, &buckets,
-            BiasType::Unbiased, 1.0, 0, 1, &mut rng,
-        );
+        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let unbiased_ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
 
         // Bias toward Call (factor 10): call gets more weight, fold less
         // So EV should increase (call=+7 is more favored than fold=-3)
-        let biased_ev = rollout_from_boundary(
-            hero, opp, &board, &tree, 0, &dim, &strategy, &buckets,
-            BiasType::Call, 10.0, 0, 1, &mut rng,
-        );
+        let ctx_biased = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Call, 10.0, 0, 1);
+        let biased_ev = rollout_from_boundary(hero, opp, &board, &ctx_biased, 0, &mut rng);
         assert!(biased_ev > unbiased_ev, "Call bias should increase EV when call is +7");
     }
 
@@ -629,10 +636,8 @@ mod tests {
         ];
 
         // With many rollouts, hero should have positive EV
-        let ev = rollout_from_boundary(
-            hero, opp, &board, &tree, 0, &dim, &strategy, &buckets,
-            BiasType::Unbiased, 1.0, 0, 100, &mut rng,
-        );
+        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 100);
+        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
         // AA vs 72o on K84: hero is ~90%+ equity
         // EV should be positive (win 5 most of the time)
         assert!(ev > 0.0, "AA vs 72o should have positive EV, got {ev}");
@@ -749,10 +754,8 @@ mod tests {
         // Fold by opp -> player 0 wins: pot - invested[0] = 10 - 3 = 7
         // Call -> showdown hero wins: pot - invested[0] = 14 - 7 = 7
         // EV = 0.5 * 7 + 0.5 * 7 = 7
-        let ev = rollout_from_boundary(
-            hero, opp, &board, &tree, 0, &dim, &strategy, &buckets,
-            BiasType::Unbiased, 1.0, 0, 1, &mut rng,
-        );
+        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
         assert!((ev - 7.0).abs() < 0.01, "EV should be 7.0, got {ev}");
     }
 
@@ -773,9 +776,7 @@ mod tests {
         let strategy = dummy_strategy();
         let mut rng = StdRng::seed_from_u64(42);
 
-        rollout_from_boundary(
-            hero, opp, &[], &tree, 0, &dim, &strategy, &buckets,
-            BiasType::Unbiased, 1.0, 0, 1, &mut rng,
-        );
+        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng);
     }
 }

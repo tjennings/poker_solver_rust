@@ -1,6 +1,6 @@
 use parking_lot::{Mutex, RwLock};
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
-use poker_solver_core::blueprint_v2::continuation::{BiasType, rollout_from_boundary};
+use poker_solver_core::blueprint_v2::continuation::{BiasType, RolloutContext, rollout_from_boundary};
 use poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id;
 use poker_solver_core::blueprint_v2::solver_dispatch::{
     self, SolverChoice, SolverConfig, Street,
@@ -8,7 +8,7 @@ use poker_solver_core::blueprint_v2::solver_dispatch::{
 use poker_solver_core::blueprint_v2::subgame_cfr::cards_overlap;
 use poker_solver_core::blueprint_v2::{
     CfvSubgameSolver, LeafEvaluator, SubgameHands, SubgameStrategy,
-    compute_combo_equities, build_boundary_mapping,
+    compute_combo_equities,
 };
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
@@ -355,155 +355,9 @@ impl LeafEvaluator for EquityLeafEvaluator {
     }
 }
 
-/// Leaf evaluator that uses blueprint counterfactual boundary values (CBVs).
-///
-/// Pre-computes per-boundary, per-combo CFVs at construction. The `evaluate`
-/// calls return precomputed values — CBVs are properties of the fixed blueprint
-/// strategy and don't change with the subgame solver's evolving ranges.
-///
-/// CBVs encode strategic information (fold equity, future street potential,
-/// flush draw value, etc.) that raw showdown equity misses.
-#[allow(dead_code)] // retained as fallback; rollout evaluators are now primary
-struct BlueprintCbvEvaluator {
-    /// Pre-computed CBV values per boundary in pot-fraction units.
-    /// Indexed by boundary ordinal, each entry is a per-combo Vec.
-    boundary_cfvs: Vec<Vec<f64>>,
-    /// Tracks which boundary is being evaluated (wraps modulo boundary count).
-    call_index: std::cell::Cell<usize>,
-}
-
-#[allow(dead_code)]
-impl BlueprintCbvEvaluator {
-    /// Build a CBV evaluator for the given subgame tree and blueprint data.
-    ///
-    /// Maps each subgame `DepthBoundary` to the corresponding abstract-tree
-    /// `Chance` node, looks up per-combo bucket assignments, and normalizes
-    /// CBV chip values to pot-fraction units.
-    fn new(
-        subgame_tree: &GameTree,
-        ctx: &CbvContext,
-        hands: &SubgameHands,
-        board: &[RsPokerCard],
-        street: V2Street,
-        abstract_start_node: u32,
-    ) -> Self {
-        // Build a "sub-view" of the abstract tree rooted at the postflop
-        // starting node. build_boundary_mapping walks from both roots,
-        // so we create a wrapper that starts at the correct position.
-        let abstract_subtree = GameTree {
-            nodes: ctx.abstract_tree.nodes.clone(),
-            root: abstract_start_node,
-            blinds: ctx.abstract_tree.blinds,
-        };
-        let boundary_mapping = build_boundary_mapping(subgame_tree, &abstract_subtree);
-
-        // Collect boundary pots in ordinal order.
-        let boundary_pots: Vec<f64> = subgame_tree.nodes.iter().filter_map(|n| match n {
-            GameNode::Terminal { kind: TerminalKind::DepthBoundary, pot, .. } => Some(*pot),
-            _ => None,
-        }).collect();
-
-        let boundary_cfvs: Vec<Vec<f64>> = boundary_mapping
-            .iter()
-            .zip(boundary_pots.iter())
-            .map(|(&chance_ord, &pot)| {
-                let half_pot = pot / 2.0;
-                assert!(half_pot > 0.0, "boundary pot must be positive, got {pot}");
-                hands.combos.iter().map(|&hole| {
-                    let bucket = ctx.all_buckets.get_bucket(street, hole, board) as usize;
-                    let cbv = f64::from(ctx.cbv_table.lookup(chance_ord, bucket));
-                    // CBV is in BB (abstract tree units). Subgame uses chips (1BB = 2 chips).
-                    // Convert to pot-fraction in chip units: (cbv * 2) / half_pot_chips.
-                    // The solver multiplies by half_pot_chips at the boundary, recovering
-                    // cbv in chips.
-                    (cbv * 2.0) / half_pot
-                }).collect()
-            })
-            .collect();
-
-        eprintln!(
-            "[cbv evaluator] {} boundaries, {} combos",
-            boundary_cfvs.len(), hands.combos.len(),
-        );
-
-        // Audit: dump CBV values for boundary 0 (check-check line)
-        if !boundary_cfvs.is_empty() {
-            let b0 = &boundary_cfvs[0];
-            let b0_pot = boundary_pots[0];
-            let mut samples: Vec<(String, usize, f64, f64)> = Vec::new();
-            for (i, &hole) in hands.combos.iter().enumerate() {
-                let bucket = ctx.all_buckets.get_bucket(street, hole, board) as usize;
-                let raw_cbv = f64::from(ctx.cbv_table.lookup(boundary_mapping[0], bucket));
-                samples.push((format!("{}{}", hole[0], hole[1]), bucket, raw_cbv, b0[i]));
-            }
-            // Sort by raw CBV descending, show top 20 and bottom 10
-            samples.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
-            eprintln!("[cbv audit] boundary 0: pot={b0_pot} half_pot={}", b0_pot / 2.0);
-            eprintln!("[cbv audit] TOP 20 (highest CBV):");
-            for (name, bucket, raw, norm) in samples.iter().take(20) {
-                eprintln!("  {name:<12} bucket={bucket:>4}  cbv_bb={raw:>8.3}  pot_frac={norm:>8.4}");
-            }
-            eprintln!("[cbv audit] BOTTOM 10 (lowest CBV):");
-            for (name, bucket, raw, norm) in samples.iter().rev().take(10) {
-                eprintln!("  {name:<12} bucket={bucket:>4}  cbv_bb={raw:>8.3}  pot_frac={norm:>8.4}");
-            }
-            // Bucket collision summary: how many combos share each bucket
-            let mut bucket_counts: std::collections::HashMap<usize, Vec<String>> = std::collections::HashMap::new();
-            for (name, bucket, _, _) in &samples {
-                bucket_counts.entry(*bucket).or_default().push(name.clone());
-            }
-            let mut buckets_sorted: Vec<_> = bucket_counts.iter().collect();
-            buckets_sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-            eprintln!("[cbv audit] {} distinct buckets used out of {} combos",
-                bucket_counts.len(), samples.len());
-            eprintln!("[cbv audit] LARGEST BUCKETS (most collisions):");
-            for (bucket, combos) in buckets_sorted.iter().take(5) {
-                let raw_cbv = samples.iter().find(|(_, b, _, _)| b == *bucket).map(|(_, _, r, _)| *r).unwrap_or(0.0);
-                let preview: Vec<_> = combos.iter().take(8).cloned().collect();
-                let suffix = if combos.len() > 8 { format!(" +{} more", combos.len() - 8) } else { String::new() };
-                eprintln!("  bucket {bucket:>4}: {: >3} combos  cbv={raw_cbv:>7.3}  [{}{suffix}]",
-                    combos.len(), preview.join(", "));
-            }
-
-            // Search for specific hands of interest
-            eprintln!("[cbv audit] ALL COMBOS (sorted by CBV desc):");
-            for (name, bucket, raw, norm) in &samples {
-                eprintln!("  {name:<12} bucket={bucket:>4}  cbv_bb={raw:>8.3}  pot_frac={norm:>8.4}");
-            }
-        }
-
-        Self {
-            boundary_cfvs,
-            call_index: std::cell::Cell::new(0),
-        }
-    }
-}
-
-impl LeafEvaluator for BlueprintCbvEvaluator {
-    fn evaluate(
-        &self,
-        _combos: &[[RsPokerCard; 2]],
-        _board: &[RsPokerCard],
-        _pot: f64,
-        _effective_stack: f64,
-        _oop_range: &[f64],
-        _ip_range: &[f64],
-        _traverser: u8,
-    ) -> Vec<f64> {
-        let idx = self.call_index.get() % self.boundary_cfvs.len();
-        self.call_index.set(self.call_index.get() + 1);
-        self.boundary_cfvs[idx].clone()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // RolloutLeafEvaluator helpers
 // ---------------------------------------------------------------------------
-
-/// Returns true if either card in `hand` appears on the `board`.
-fn hand_conflicts_board(hand: &[RsPokerCard; 2], board: &[RsPokerCard]) -> bool {
-    board.iter().any(|b| hand[0] == *b || hand[1] == *b)
-}
 
 /// Sample `n` indices weighted by `weights`, returning indices into the weights
 /// array.  Returns empty if total weight is zero or `n` is zero.
@@ -594,14 +448,14 @@ impl LeafEvaluator for RolloutLeafEvaluator {
             .enumerate()
             .map(|(i, hero_hand)| {
                 // Build opponent sampling weights: zero out combos that
-                // conflict with hero hand or board.
+                // conflict with hero hand. Board conflicts are already
+                // excluded by SubgameHands::enumerate(board).
                 let weights: Vec<f64> = combos
                     .iter()
                     .enumerate()
                     .map(|(j, opp_hand)| {
                         if opp_range[j] <= 0.0
                             || cards_overlap(*hero_hand, *opp_hand)
-                            || hand_conflicts_board(opp_hand, board)
                         {
                             0.0
                         } else {
@@ -617,6 +471,17 @@ impl LeafEvaluator for RolloutLeafEvaluator {
                     return 0.0;
                 }
 
+                let ctx = RolloutContext {
+                    abstract_tree: &self.abstract_tree,
+                    decision_idx_map: &self.decision_idx_map,
+                    strategy: &self.strategy,
+                    buckets: &self.all_buckets,
+                    bias: self.bias,
+                    bias_factor: self.bias_factor,
+                    player: traverser,
+                    num_rollouts: self.num_rollouts,
+                };
+
                 let total: f64 = sampled
                     .iter()
                     .map(|&j| {
@@ -625,15 +490,8 @@ impl LeafEvaluator for RolloutLeafEvaluator {
                             *hero_hand,
                             opp_hand,
                             board,
-                            &self.abstract_tree,
+                            &ctx,
                             self.abstract_start_node,
-                            &self.decision_idx_map,
-                            &self.strategy,
-                            &self.all_buckets,
-                            self.bias,
-                            self.bias_factor,
-                            traverser,
-                            self.num_rollouts,
                             &mut rng,
                         )
                     })
@@ -2342,57 +2200,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // RolloutLeafEvaluator helper tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_hand_conflicts_board_no_overlap() {
-        let hand = [
-            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
-            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
-        ];
-        let board = [
-            RsPokerCard::new(RsPokerValue::Queen, RsPokerSuit::Diamond),
-            RsPokerCard::new(RsPokerValue::Jack, RsPokerSuit::Club),
-            RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Spade),
-        ];
-        assert!(!hand_conflicts_board(&hand, &board));
-    }
-
-    #[test]
-    fn test_hand_conflicts_board_first_card_overlaps() {
-        let hand = [
-            RsPokerCard::new(RsPokerValue::Queen, RsPokerSuit::Diamond),
-            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
-        ];
-        let board = [
-            RsPokerCard::new(RsPokerValue::Queen, RsPokerSuit::Diamond),
-            RsPokerCard::new(RsPokerValue::Jack, RsPokerSuit::Club),
-            RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Spade),
-        ];
-        assert!(hand_conflicts_board(&hand, &board));
-    }
-
-    #[test]
-    fn test_hand_conflicts_board_second_card_overlaps() {
-        let hand = [
-            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
-            RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Spade),
-        ];
-        let board = [
-            RsPokerCard::new(RsPokerValue::Queen, RsPokerSuit::Diamond),
-            RsPokerCard::new(RsPokerValue::Jack, RsPokerSuit::Club),
-            RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Spade),
-        ];
-        assert!(hand_conflicts_board(&hand, &board));
-    }
-
-    #[test]
-    fn test_hand_conflicts_board_empty_board() {
-        let hand = [
-            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
-            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
-        ];
-        assert!(!hand_conflicts_board(&hand, &[]));
-    }
 
     #[test]
     fn test_sample_weighted_basic() {
