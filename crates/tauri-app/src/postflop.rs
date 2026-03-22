@@ -1514,18 +1514,22 @@ fn solve_depth_limited(
 
                 const SNAPSHOT_INTERVAL: u32 = 10;
 
-                for t in 0..max_iters {
+                // Train in batches of SNAPSHOT_INTERVAL iterations, taking
+                // strategy snapshots between batches for the UI.
+                // Leaf evaluation happens every SNAPSHOT_INTERVAL iterations
+                // within train_with_leaf_interval (matching the batch size).
+                let mut t = 0u32;
+                while t < max_iters {
                     if !shared.solving.load(Ordering::Relaxed) {
                         break;
                     }
-                    solver.train(1);
-                    shared.current_iteration.store(t + 1, Ordering::Relaxed);
+                    let batch = SNAPSHOT_INTERVAL.min(max_iters - t);
+                    solver.train_with_leaf_interval(batch, SNAPSHOT_INTERVAL);
+                    t += batch;
+                    shared.current_iteration.store(t, Ordering::Relaxed);
 
-                    let is_snapshot = (t + 1) % SNAPSHOT_INTERVAL == 0 || t + 1 == max_iters;
-                    if is_snapshot {
-                        let strategy = solver.strategy();
-                        *shared.matrix_snapshot.write() = Some(make_matrix(&strategy));
-                    }
+                    let strategy = solver.strategy();
+                    *shared.matrix_snapshot.write() = Some(make_matrix(&strategy));
                 }
 
                 // Final strategy snapshot.
