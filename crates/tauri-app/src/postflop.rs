@@ -1565,6 +1565,9 @@ fn solve_depth_limited(
             rollout_opponent_samples,
         ) {
             Ok((mut solver, hands, action_infos, tree, initial_pot, starting_stack)) => {
+                // Set DCFR warmup to 10% of total iterations.
+                solver.set_dcfr_warmup((max_iters / 10).max(1) as u64);
+
                 // Helper closure to build matrix from current strategy.
                 let make_matrix = |strat: &SubgameStrategy| {
                     let snap = snapshot_from_subgame(

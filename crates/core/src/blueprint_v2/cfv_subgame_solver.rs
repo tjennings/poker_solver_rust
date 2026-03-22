@@ -253,7 +253,7 @@ impl CfvSubgameSolver {
                 1.5,  // alpha: positive regret discount
                 0.0,  // beta: negative regret discount (0 = aggressive decay)
                 2.0,  // gamma: strategy sum discount
-                10,   // warmup: no discounting for first 10 iterations
+                0,    // warmup: set dynamically in train_with_leaf_interval
             ),
             iteration: 0,
             starting_stack,
@@ -668,6 +668,11 @@ impl CfvSubgameSolver {
                 }
             }
         }
+    }
+
+    /// Set the DCFR warmup period (iterations without discounting).
+    pub fn set_dcfr_warmup(&mut self, warmup: u64) {
+        self.dcfr.warmup = warmup;
     }
 
     /// Run parallel DCFR for the given number of iterations.
