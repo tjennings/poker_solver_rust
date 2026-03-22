@@ -689,63 +689,88 @@ pub fn compute_equity_matrix(combos: &[[Card; 2]], board: &[Card]) -> Vec<Vec<f6
         remaining.iter().map(|&c| vec![c]).collect()
     };
 
+    let start = std::time::Instant::now();
     eprintln!(
         "[equity matrix] {} combos, {} board cards, {} runouts — enumerating all-in equity",
         n, board.len(), runouts.len()
     );
 
-    // For each combo pair, average equity across all valid runouts.
-    // Parallelize across the first combo index.
-    let matrix: Vec<Vec<f64>> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let mut row = vec![0.5; n];
-            for j in (i + 1)..n {
-                if cards_overlap(combos[i], combos[j]) {
-                    continue;
-                }
-                let mut wins = 0u32;
-                let mut losses = 0u32;
-                let mut ties = 0u32;
-                for runout in &runouts {
-                    // Skip runouts that conflict with either combo's cards.
-                    if runout.iter().any(|&c| {
-                        c == combos[i][0] || c == combos[i][1]
-                            || c == combos[j][0] || c == combos[j][1]
-                    }) {
-                        continue;
-                    }
-                    let mut full_board = board.to_vec();
-                    full_board.extend_from_slice(runout);
-                    let rank_i = rank_combo(combos[i], &full_board);
-                    let rank_j = rank_combo(combos[j], &full_board);
-                    match rank_i.cmp(&rank_j) {
-                        std::cmp::Ordering::Greater => wins += 1,
-                        std::cmp::Ordering::Less => losses += 1,
-                        std::cmp::Ordering::Equal => ties += 1,
-                    }
-                }
-                let total = wins + losses + ties;
-                if total > 0 {
-                    let eq = (f64::from(wins) + f64::from(ties) * 0.5) / f64::from(total);
-                    row[j] = eq;
-                }
-            }
-            row
-        })
+    // Accumulate wins/losses/ties per combo pair across all runouts.
+    // Strategy: for each runout, rank ALL combos once (cheap), then do
+    // pairwise comparisons using pre-ranked values (integer compare).
+    // This avoids redundant hand ranking — O(runouts × n) rankings
+    // instead of O(runouts × n²).
+
+    // wins[i][j] and total[i][j] for i < j only (upper triangle).
+    let mut win_counts = vec![vec![0u32; n]; n];
+    let mut tie_counts = vec![vec![0u32; n]; n];
+    let mut total_counts = vec![vec![0u32; n]; n];
+
+    // Precompute which cards each combo uses (for conflict checking).
+    let combo_bits: Vec<u64> = combos
+        .iter()
+        .map(|c| (1u64 << card_bit_idx(c[0])) | (1u64 << card_bit_idx(c[1])))
         .collect();
 
-    // Fill in the lower triangle (matrix[j][i] = 1 - matrix[i][j]).
-    let mut full_matrix = matrix;
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if cards_overlap(combos[i], combos[j]) {
-                continue;
+    for runout in &runouts {
+        let mut runout_bits = 0u64;
+        for &c in runout.iter() {
+            runout_bits |= 1u64 << card_bit_idx(c);
+        }
+
+        // Build full board for this runout.
+        let mut full_board = board.to_vec();
+        full_board.extend_from_slice(runout);
+
+        // Rank all combos on this full board (skip conflicting ones).
+        let ranks: Vec<Option<Rank>> = combos
+            .iter()
+            .zip(combo_bits.iter())
+            .map(|(combo, &bits)| {
+                if bits & runout_bits != 0 {
+                    None // combo conflicts with runout cards
+                } else {
+                    Some(rank_combo(*combo, &full_board))
+                }
+            })
+            .collect();
+
+        // Pairwise comparisons using pre-ranked values.
+        for i in 0..n {
+            let Some(ref rank_i) = ranks[i] else { continue };
+            for j in (i + 1)..n {
+                if combo_bits[i] & combo_bits[j] != 0 {
+                    continue; // combos share cards
+                }
+                let Some(ref rank_j) = ranks[j] else { continue };
+                total_counts[i][j] += 1;
+                match rank_i.cmp(rank_j) {
+                    std::cmp::Ordering::Greater => win_counts[i][j] += 1,
+                    std::cmp::Ordering::Equal => tie_counts[i][j] += 1,
+                    std::cmp::Ordering::Less => {}
+                }
             }
-            full_matrix[j][i] = 1.0 - full_matrix[i][j];
         }
     }
-    full_matrix
+
+    // Convert counts to equity matrix.
+    let mut matrix = vec![vec![0.5; n]; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let total = total_counts[i][j];
+            if total > 0 {
+                let eq = (f64::from(win_counts[i][j]) + f64::from(tie_counts[i][j]) * 0.5)
+                    / f64::from(total);
+                matrix[i][j] = eq;
+                matrix[j][i] = 1.0 - eq;
+            }
+        }
+    }
+
+    let elapsed = start.elapsed();
+    eprintln!("[equity matrix] completed in {:.2}s", elapsed.as_secs_f64());
+
+    matrix
 }
 
 /// Direct rank comparison for 5-card boards (no runout enumeration needed).
@@ -773,6 +798,11 @@ fn compute_equity_matrix_direct(combos: &[[Card; 2]], board: &[Card]) -> Vec<Vec
         }
     }
     matrix
+}
+
+/// Map a card to a bit index (0..51) for 64-bit bitset conflict checking.
+fn card_bit_idx(card: Card) -> u32 {
+    card.value as u32 * 4 + card.suit as u32
 }
 
 /// Collect remaining deck cards excluding the board (for runout enumeration).
