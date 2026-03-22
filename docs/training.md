@@ -146,6 +146,30 @@ Options:
 - `--sample-bucket <STREET> <BUCKET_ID>` -- Show 10 sample hands from the given bucket
 - `--centroid-emd <STREET>` -- Placeholder; centroid EMD requires feature vectors not stored in bucket files
 
+### diff-clusters
+
+Compare two sets of bucket files to measure quality improvement and clustering similarity.
+
+```bash
+cargo run -p poker-solver-trainer --release -- diff-clusters \
+  --dir-a /path/to/old/clusters \
+  --dir-b /path/to/new/clusters \
+  --sample-boards 200
+
+# Verbose mode with equity histogram
+cargo run -p poker-solver-trainer --release -- diff-clusters \
+  --dir-a /path/to/old/clusters \
+  --dir-b /path/to/new/clusters \
+  --sample-boards 200 \
+  --verbose
+```
+
+- `--dir-a`, `--dir-b` -- directories containing `.buckets` files to compare
+- `--sample-boards` -- boards to sample for equity audit (default 200, 0 = skip)
+- `--verbose` -- show per-equity-bin bucket histogram
+
+Reports per-street: bucket size stats, intra-bucket equity std (lower = better), and Adjusted Rand Index (1.0 = identical groupings, 0.0 = random agreement).
+
 ---
 
 ## Training TUI Dashboard
