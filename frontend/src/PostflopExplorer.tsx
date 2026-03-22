@@ -125,6 +125,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
   const [blueprintMode, setBlueprintMode] = useState(false);
   const [blueprintHistory, setBlueprintHistory] = useState<string[]>([]);
   const [solved, setSolved] = useState(false);
+  const [blueprintFetchTrigger, setBlueprintFetchTrigger] = useState(0);
 
   /** Extract preflop action IDs from preflopHistory for ExplorationPosition. */
   const preflopActionIds = useMemo(() => {
@@ -198,15 +199,13 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
             history: fullHistory,
             pot: config.pot,
             stacks: [config.effective_stack, config.effective_stack],
-            stack_p1: config.effective_stack,
-            stack_p2: config.effective_stack,
             to_act: 0,
             num_players: 2,
             active_players: [true, true],
           },
         });
         if (cancelled) return;
-        setMatrix(blueprintToPostflopMatrix(sm, boardCards, 0));
+        setMatrix(blueprintToPostflopMatrix(sm, boardCards, sm.to_act));
         setBlueprintMode(true);
         setNeedsSolve(true);
       } catch (e) {
@@ -218,7 +217,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     };
     fetchBlueprint();
     return () => { cancelled = true; };
-  }, [boardCards.length, configSummary]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [boardCards.length, configSummary, blueprintFetchTrigger]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Cleanup polling on unmount
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
@@ -290,6 +289,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       setSolving(false);
       setNeedsSolve(true);
       setBlueprintMode(true); // Back to blueprint mode
+      setBlueprintFetchTrigger(prev => prev + 1); // Trigger re-fetch of blueprint matrix
       return;
     }
     const cards = boardInput.trim().split(/\s+/);
@@ -460,8 +460,6 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
           history: fullHistory,
           pot: config.pot,
           stacks: [config.effective_stack, config.effective_stack],
-          stack_p1: config.effective_stack,
-          stack_p2: config.effective_stack,
           to_act: 0,
           num_players: 2,
           active_players: [true, true],
@@ -476,7 +474,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         return;
       }
 
-      setMatrix(blueprintToPostflopMatrix(sm, boardCards, 0));
+      setMatrix(blueprintToPostflopMatrix(sm, boardCards, sm.to_act));
     } catch (e) {
       if (String(e).includes('terminal')) {
         setTerminal(true);
@@ -509,14 +507,12 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
           history: fullHistory,
           pot: config.pot,
           stacks: [config.effective_stack, config.effective_stack],
-          stack_p1: config.effective_stack,
-          stack_p2: config.effective_stack,
           to_act: 0,
           num_players: 2,
           active_players: [true, true],
         },
       });
-      setMatrix(blueprintToPostflopMatrix(sm, boardCards, 0));
+      setMatrix(blueprintToPostflopMatrix(sm, boardCards, sm.to_act));
     } catch (e) {
       setError(String(e));
     }

@@ -21,6 +21,7 @@ function makeStrategyMatrix(overrides?: Partial<StrategyMatrix>): StrategyMatrix
     pot: 30,
     stack: 170,
     to_call: 0,
+    to_act: 0,
     stack_p1: 170,
     stack_p2: 170,
     reaching_p1: [],
@@ -101,5 +102,19 @@ describe('blueprintToPostflopMatrix', () => {
     const result = blueprintToPostflopMatrix(sm, ['Ah', '7d', '2c'], 0);
 
     expect(result.actions).toBe(sm.actions);
+  });
+
+  it('uses to_act from StrategyMatrix to set player', () => {
+    const sm = makeStrategyMatrix({ to_act: 1 });
+    const result = blueprintToPostflopMatrix(sm, ['Ah', '7d', '2c'], sm.to_act);
+
+    expect(result.player).toBe(1);
+  });
+
+  it('defaults to_act of 0 for OOP player', () => {
+    const sm = makeStrategyMatrix({ to_act: 0 });
+    const result = blueprintToPostflopMatrix(sm, ['Ah', '7d', '2c'], sm.to_act);
+
+    expect(result.player).toBe(0);
   });
 });
