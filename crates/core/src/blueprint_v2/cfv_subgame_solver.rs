@@ -645,7 +645,7 @@ impl CfvSubgameSolver {
                                 .map(|&s| format!("{:.0}%", s * 100.0))
                                 .collect();
                             eprintln!(
-                                "[TRACE] iter={} t={traverser} node={node_idx} combo={i} strat=[{}] node_val={node_val:.2} child_vals={:?}",
+                                "[TRACE] iter={} t={traverser} node={node_idx} combo={i} strat=[{}] node_val={node_val:.2} opp_total={opp_total:.4} child_vals={:?}",
                                 self.iteration, strat_str.join(","), child_vals
                             );
                         }
