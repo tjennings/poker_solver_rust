@@ -2020,6 +2020,11 @@ pub fn postflop_play_action_core(
 ) -> Result<PostflopPlayResult, String> {
     let solver_name = state.solver_name.read().clone();
     if solver_name == "subgame" {
+        // During solving, subgame_result is not yet populated.
+        // Wait for solve to complete before allowing navigation.
+        if state.solving.load(Ordering::Relaxed) {
+            return Err("Solve in progress — wait for completion before navigating".to_string());
+        }
         return postflop_play_action_subgame(state, action);
     }
 
@@ -2117,6 +2122,9 @@ pub fn postflop_navigate_to_core(
 ) -> Result<PostflopPlayResult, String> {
     let solver_name = state.solver_name.read().clone();
     if solver_name == "subgame" {
+        if state.solving.load(Ordering::Relaxed) {
+            return Err("Solve in progress — wait for completion before navigating".to_string());
+        }
         return postflop_navigate_to_subgame(state, &history);
     }
 
