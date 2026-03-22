@@ -644,6 +644,173 @@ pub fn kmeans_emd_weighted(
 }
 
 // ---------------------------------------------------------------------------
+// Elkan-accelerated EMD k-means
+// ---------------------------------------------------------------------------
+
+/// Triangle-inequality accelerated k-means with EMD distance for u8 histograms.
+///
+/// Produces identical results to [`kmeans_emd_weighted_u8`] but skips ~80-95%
+/// of EMD computations via Elkan (2003) bound maintenance.
+///
+/// Ported from robopoker's `crates/clustering/src/elkan.rs`, adapted from
+/// const-generic `<K, N>` to runtime-sized `Vec`s.
+///
+/// # Panics
+/// Panics if `data` is empty, `k` is zero, or `data.len() != weights.len()`.
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+pub fn elkan_emd_weighted_u8(
+    data: &[Vec<u8>],
+    weights: &[f64],
+    k: usize,
+    max_iterations: u32,
+    seed: u64,
+    progress: impl Fn(u32, u32),
+) -> (Vec<u16>, Vec<Vec<f64>>) {
+    assert_eq!(data.len(), weights.len());
+    assert!(!data.is_empty(), "data must not be empty");
+    assert!(k > 0, "k must be positive");
+
+    let n = data.len();
+    if k >= n {
+        let assignments: Vec<u16> = (0..n).map(|i| i as u16).collect();
+        let centroids: Vec<Vec<f64>> = data.iter().map(|d| normalize_u8(d)).collect();
+        return (assignments, centroids);
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut centroids = kmeanspp_init_u8(data, k, &mut rng);
+
+    // Initialize bounds by computing all N x K distances.
+    let mut bounds: Vec<ElkanBounds> = data
+        .par_iter()
+        .map(|point| {
+            let mut b = ElkanBounds::new(k);
+            let mut best_j = 0;
+            let mut best_d = f32::MAX;
+            for (j, centroid) in centroids.iter().enumerate() {
+                let d = emd_u8_vs_f64(point, centroid) as f32;
+                b.lower[j] = d;
+                if d < best_d {
+                    best_d = d;
+                    best_j = j;
+                }
+            }
+            b.assign(best_d, best_j);
+            b
+        })
+        .collect();
+
+    for iter in 0..max_iterations {
+        progress(iter, max_iterations);
+
+        // Compute K x K pairwise centroid distances.
+        let pairwise: Vec<Vec<f32>> = (0..k)
+            .into_par_iter()
+            .map(|i| {
+                (0..k)
+                    .map(|j| {
+                        if i == j {
+                            0.0
+                        } else {
+                            emd(&centroids[i], &centroids[j]) as f32
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Compute midpoints: s(c) = min_{c' != c} d(c, c') / 2
+        let midpoints: Vec<f32> = (0..k)
+            .map(|i| {
+                pairwise[i]
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, &d)| d * 0.5)
+                    .fold(f32::MAX, f32::min)
+            })
+            .collect();
+
+        // Elkan assignment: only check points where upper > s(assigned).
+        bounds
+            .par_iter_mut()
+            .enumerate()
+            .filter(|(_, b)| b.upper() > midpoints[b.j()])
+            .for_each(|(i, b)| {
+                let point = &data[i];
+                // Refresh stale upper bound.
+                if b.stale() {
+                    let d = emd_u8_vs_f64(point, &centroids[b.j()]) as f32;
+                    b.refresh(d);
+                }
+                // Check all other centroids via triangle inequality.
+                for j in 0..k {
+                    if b.has_shifted(&pairwise, j) {
+                        let d = emd_u8_vs_f64(point, &centroids[j]) as f32;
+                        b.witness(d, j);
+                    }
+                }
+            });
+
+        // Weighted centroid update.
+        let mut new_centroids = vec![vec![0.0_f64; centroids[0].len()]; k];
+        let mut weight_sums = vec![0.0_f64; k];
+
+        for (i, point) in data.iter().enumerate() {
+            let ci = bounds[i].j();
+            let w = weights[i];
+            let total: f64 = point.iter().map(|&c| f64::from(c)).sum();
+            let inv = if total > 0.0 { 1.0 / total } else { 0.0 };
+            weight_sums[ci] += w;
+            for (j, &val) in point.iter().enumerate() {
+                new_centroids[ci][j] += f64::from(val) * inv * w;
+            }
+        }
+
+        // Average and handle empty clusters.
+        for ci in 0..k {
+            if weight_sums[ci] <= 0.0 {
+                // Re-seed: find point farthest from its assigned centroid.
+                let farthest = farthest_point_u8(
+                    data,
+                    &bounds.iter().map(|b| b.j() as u16).collect::<Vec<_>>(),
+                    &centroids,
+                );
+                new_centroids[ci] = normalize_u8(&data[farthest]);
+                bounds[farthest].assign(0.0, ci);
+            } else {
+                let inv = 1.0 / weight_sums[ci];
+                for v in &mut new_centroids[ci] {
+                    *v *= inv;
+                }
+            }
+        }
+
+        // Compute drift and update bounds.
+        let drifts: Vec<f32> = (0..k)
+            .map(|i| emd(&centroids[i], &new_centroids[i]) as f32)
+            .collect();
+
+        let max_drift: f32 = drifts.iter().copied().fold(0.0, f32::max);
+        centroids = new_centroids;
+
+        if max_drift < 1e-8 {
+            break; // Converged
+        }
+
+        bounds.par_iter_mut().for_each(|b| b.update(&drifts));
+    }
+
+    // Final assignment pass to ensure labels match centroids exactly.
+    let assignments: Vec<u16> = data
+        .par_iter()
+        .map(|point| nearest_centroid_u8(point, &centroids))
+        .collect();
+
+    (assignments, centroids)
+}
+
+// ---------------------------------------------------------------------------
 // Weighted EMD k-means for u8 count histograms
 // ---------------------------------------------------------------------------
 
@@ -1606,5 +1773,117 @@ mod tests {
         assert!(!b.has_shifted(&pairwise, 2));
         // Same centroid -> always skip
         assert!(!b.has_shifted(&pairwise, 0));
+    }
+
+    #[test]
+    fn elkan_emd_naive_equivalence() {
+        // Two well-separated clusters of u8 histograms
+        let mut data: Vec<Vec<u8>> = Vec::new();
+        let mut weights: Vec<f64> = Vec::new();
+        for _ in 0..50 {
+            data.push(vec![36, 4, 0, 0]);
+            weights.push(1.0);
+        }
+        for _ in 0..50 {
+            data.push(vec![0, 0, 4, 36]);
+            weights.push(1.0);
+        }
+
+        let seed = 42;
+        let max_iter = 50;
+
+        let (naive_labels, naive_centroids) =
+            kmeans_emd_weighted_u8(&data, &weights, 2, max_iter, seed, |_, _| {});
+        let (elkan_labels, elkan_centroids) =
+            elkan_emd_weighted_u8(&data, &weights, 2, max_iter, seed, |_, _| {});
+
+        // Same assignments
+        assert_eq!(naive_labels, elkan_labels, "labels differ");
+        // Same centroids (within float tolerance)
+        assert_eq!(naive_centroids.len(), elkan_centroids.len());
+        for (nc, ec) in naive_centroids.iter().zip(elkan_centroids.iter()) {
+            for (nv, ev) in nc.iter().zip(ec.iter()) {
+                assert!(
+                    (nv - ev).abs() < 1e-10,
+                    "centroid mismatch: naive={nv}, elkan={ev}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn elkan_emd_three_clusters() {
+        let mut data: Vec<Vec<u8>> = Vec::new();
+        let mut weights: Vec<f64> = Vec::new();
+        for _ in 0..30 {
+            data.push(vec![40, 0, 0, 0, 0]);
+            weights.push(1.0);
+        }
+        for _ in 0..30 {
+            data.push(vec![0, 0, 40, 0, 0]);
+            weights.push(1.0);
+        }
+        for _ in 0..30 {
+            data.push(vec![0, 0, 0, 0, 40]);
+            weights.push(1.0);
+        }
+
+        let (labels, centroids) =
+            elkan_emd_weighted_u8(&data, &weights, 3, 50, 42, |_, _| {});
+
+        assert_eq!(labels.len(), 90);
+        assert_eq!(centroids.len(), 3);
+        // Each cluster should be internally consistent
+        assert!(labels[0..30].iter().all(|&a| a == labels[0]));
+        assert!(labels[30..60].iter().all(|&a| a == labels[30]));
+        assert!(labels[60..90].iter().all(|&a| a == labels[60]));
+        // All three clusters should be different
+        let unique: std::collections::HashSet<u16> = labels.iter().copied().collect();
+        assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn elkan_emd_k_equals_n() {
+        let data = vec![vec![10, 0], vec![0, 10], vec![5, 5]];
+        let weights = vec![1.0, 1.0, 1.0];
+        let (labels, centroids) = elkan_emd_weighted_u8(&data, &weights, 3, 10, 42, |_, _| {});
+        assert_eq!(labels.len(), 3);
+        assert_eq!(centroids.len(), 3);
+        // Each point should be in its own cluster
+        let unique: std::collections::HashSet<u16> = labels.iter().copied().collect();
+        assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn elkan_emd_k_exceeds_n() {
+        let data = vec![vec![10, 0], vec![0, 10]];
+        let weights = vec![1.0, 1.0];
+        let (labels, centroids) = elkan_emd_weighted_u8(&data, &weights, 5, 10, 42, |_, _| {});
+        assert_eq!(labels.len(), 2);
+        assert_eq!(centroids.len(), 2);
+    }
+
+    #[test]
+    fn elkan_emd_weighted_nonuniform() {
+        // Heavy weight on first cluster should not change assignments
+        // for well-separated data, but centroids should reflect weights.
+        let mut data: Vec<Vec<u8>> = Vec::new();
+        let mut weights: Vec<f64> = Vec::new();
+        for _ in 0..50 {
+            data.push(vec![36, 4, 0, 0]);
+            weights.push(10.0); // heavy weight
+        }
+        for _ in 0..50 {
+            data.push(vec![0, 0, 4, 36]);
+            weights.push(1.0);
+        }
+
+        let seed = 42;
+        let (naive_labels, _) =
+            kmeans_emd_weighted_u8(&data, &weights, 2, 50, seed, |_, _| {});
+        let (elkan_labels, _) =
+            elkan_emd_weighted_u8(&data, &weights, 2, 50, seed, |_, _| {});
+
+        assert_eq!(naive_labels, elkan_labels, "weighted labels differ");
     }
 }
