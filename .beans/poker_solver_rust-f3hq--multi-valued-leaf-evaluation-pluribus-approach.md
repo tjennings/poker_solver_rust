@@ -1,10 +1,11 @@
 ---
 # poker_solver_rust-f3hq
 title: Multi-valued leaf evaluation (Pluribus approach)
-status: in-progress
+status: completed
 type: feature
+priority: normal
 created_at: 2026-03-22T01:50:14Z
-updated_at: 2026-03-22T01:50:14Z
+updated_at: 2026-03-22T02:07:34Z
 parent: poker_solver_rust-60h7
 ---
 
