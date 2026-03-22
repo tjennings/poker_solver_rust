@@ -717,12 +717,21 @@ impl CfvSubgameSolver {
                                 );
                             }
 
+                            // Scale opponent reach by choice probability for
+                            // this continuation strategy. The choice node is
+                            // the opponent's decision, so their reaching
+                            // probability includes the choice probability.
+                            let scaled_reach_opp: Vec<f64> = reach_opp
+                                .iter()
+                                .map(|&r| r * choice_probs[eval_k])
+                                .collect();
+
                             // Run CFR traversal.
                             self.cfr_traverse_vectorized(
                                 root_idx,
                                 traverser,
                                 reach_trav,
-                                reach_opp,
+                                &scaled_reach_opp,
                                 &snapshot,
                                 &mut cfv_buf,
                                 &mut reach_pool,
@@ -1978,6 +1987,59 @@ mod tests {
         assert!(
             (sum - 1.0).abs() < 1e-10,
             "choice strategy should sum to 1.0, got {sum}"
+        );
+    }
+
+    #[timed_test(30)]
+    fn choice_node_reach_scaling_affects_convergence() {
+        // With K=2 and very different evaluator values, the opponent (choice
+        // node) should strongly prefer the evaluator giving the traverser
+        // LOWER value. Without reach scaling, both evaluators get equal
+        // regret weight and convergence is distorted.
+        //
+        // Evaluator 0: value = -0.5 (bad for traverser => opponent likes it)
+        // Evaluator 1: value = +0.5 (good for traverser => opponent avoids it)
+        //
+        // After training, choice_strategy should put most weight on evaluator 0.
+        let board = turn_board();
+        let tree = turn_tree_depth_limited(&[1.0], 1);
+        let hands = small_hands(&board, 20);
+        let n = hands.combos.len();
+
+        let evaluators: Vec<Box<dyn LeafEvaluator>> = vec![
+            Box::new(ConstantEvaluator(-0.5)), // bad for traverser
+            Box::new(ConstantEvaluator(0.5)),   // good for traverser
+        ];
+
+        let mut solver = CfvSubgameSolver::new(
+            tree,
+            hands.clone(),
+            &board,
+            evaluators,
+            250.0,
+            vec![1.0; n],
+            vec![1.0; n],
+        );
+
+        solver.train(300);
+
+        let strat = solver.choice_strategy();
+        assert_eq!(strat.len(), 2);
+
+        // Opponent should prefer evaluator 0 (lower value for traverser).
+        // With correct reach scaling, convergence should be clear after 300 iters.
+        assert!(
+            strat[0] > strat[1],
+            "opponent should prefer lower-value evaluator: \
+             strat[0]={:.4} should be > strat[1]={:.4}",
+            strat[0], strat[1],
+        );
+
+        // Should converge strongly (>60% on preferred evaluator).
+        assert!(
+            strat[0] > 0.6,
+            "choice should strongly favor evaluator 0: strat[0]={:.4}",
+            strat[0],
         );
     }
 }
