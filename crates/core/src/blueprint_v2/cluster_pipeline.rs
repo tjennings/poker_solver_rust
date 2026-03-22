@@ -41,7 +41,7 @@ use crate::showdown_equity::rank_hand;
 use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard, VERSION};
 use super::centroid_file::CentroidFile;
 use super::clustering::{
-    compute_centroid_ev, compute_centroid_gaps, fast_kmeans_1d, fast_kmeans_histogram,
+    compute_centroid_ev, compute_centroid_gaps, elkan_emd_weighted_u8, fast_kmeans_1d,
     kmeans_1d, nearest_centroid_1d, nearest_centroid_u8, nearest_centroid_u8_weighted,
     sort_centroids_by_ev,
 };
@@ -169,13 +169,17 @@ pub fn cluster_turn_with_boards(
         }
     }
 
-    let (cluster_labels, _centroids) = fast_kmeans_histogram(
+    let (cluster_labels, _centroids) = elkan_emd_weighted_u8(
         &all_features,
+        &all_weights,
         bucket_count as usize,
         kmeans_iterations,
         seed,
+        |iter, total| {
+            #[allow(clippy::cast_precision_loss)]
+            progress("k-means", (iter + 1) as f64 / total as f64);
+        },
     );
-    progress("k-means", 1.0);
 
     let total = num_boards * TOTAL_COMBOS as usize;
     let mut buckets = vec![0_u16; total];
@@ -291,13 +295,17 @@ pub fn cluster_flop_with_boards(
         }
     }
 
-    let (cluster_labels, _centroids) = fast_kmeans_histogram(
+    let (cluster_labels, _centroids) = elkan_emd_weighted_u8(
         &all_features,
+        &all_weights,
         bucket_count as usize,
         kmeans_iterations,
         seed,
+        |iter, total| {
+            #[allow(clippy::cast_precision_loss)]
+            progress("k-means", (iter + 1) as f64 / total as f64);
+        },
     );
-    progress("k-means", 1.0);
 
     let total = num_boards * TOTAL_COMBOS as usize;
     let mut buckets = vec![0_u16; total];
@@ -437,7 +445,7 @@ pub fn cluster_river_exhaustive(
 /// then exhaustive nearest-centroid assignment for all canonical boards.
 ///
 /// Phase 1 samples canonical boards, builds bucket histograms over the
-/// prior street, and runs `kmeans_emd_weighted_u8` to find centroids.
+/// prior street, and runs `elkan_emd_weighted_u8` to find centroids.
 /// Phase 2 enumerates ALL canonical boards and assigns each combo to its
 /// nearest centroid via `nearest_centroid_u8`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -493,23 +501,17 @@ fn cluster_histogram_exhaustive<const N: usize>(
         }
     }
 
-    let (_labels, centroids) = fast_kmeans_histogram(
+    let (_labels, centroids_f64) = elkan_emd_weighted_u8(
         &all_features,
+        &all_weights,
         bucket_count as usize,
         kmeans_iterations,
         seed,
+        |iter, total| {
+            #[allow(clippy::cast_precision_loss)]
+            progress("k-means", (iter + 1) as f64 / total as f64);
+        },
     );
-    progress("k-means", 1.0);
-
-    // Convert f32 centroids to f64 normalized probability distributions.
-    let centroids_f64: Vec<Vec<f64>> = centroids
-        .iter()
-        .map(|c| {
-            let total: f64 = c.iter().map(|&v| f64::from(v)).sum();
-            let inv = if total > 0.0 { 1.0 / total } else { 0.0 };
-            c.iter().map(|&v| f64::from(v) * inv).collect()
-        })
-        .collect();
 
     // Sort centroids by expected equity so bucket IDs are ordered.
     let (sorted_centroids, _remap) = sort_centroids_by_ev(&centroids_f64, child_centroid_evs);
@@ -574,7 +576,7 @@ fn cluster_histogram_exhaustive<const N: usize>(
 
 /// Cluster turn situations using two-phase clustering:
 /// - Phase 1: Sample canonical turns, build histograms over `river_buckets`,
-///   run `kmeans_emd_weighted_u8` to find centroids.
+///   run `elkan_emd_weighted_u8` to find centroids.
 /// - Phase 2: Enumerate ALL canonical turns, build histograms, assign to
 ///   nearest centroid via weighted EMD (or unweighted if gaps are empty).
 #[allow(clippy::too_many_arguments)]
@@ -605,7 +607,7 @@ pub fn cluster_turn_exhaustive(
 
 /// Cluster flop situations using two-phase clustering:
 /// - Phase 1: Sample canonical flops, build histograms over `turn_buckets`,
-///   run `kmeans_emd_weighted_u8` to find centroids.
+///   run `elkan_emd_weighted_u8` to find centroids.
 /// - Phase 2: Enumerate ALL canonical flops, build histograms, assign to
 ///   nearest centroid via weighted EMD (or unweighted if gaps are empty).
 #[allow(clippy::too_many_arguments)]
@@ -1133,7 +1135,7 @@ pub fn cluster_single_flop(
     let (turn_labels, _) = if all_features.is_empty() {
         (vec![], vec![])
     } else {
-        fast_kmeans_histogram(&all_features, turn_k, kmeans_iterations, seed)
+        elkan_emd_weighted_u8(&all_features, &all_weights, turn_k, kmeans_iterations, seed, |_, _| {})
     };
     progress("turn-kmeans", 1, 1);
 
@@ -1290,13 +1292,13 @@ pub fn run_per_flop_pipeline(
         );
     }
 
-    // Run L2 k-means on flop histograms (BLAS-accelerated).
+    // Run EMD k-means on flop histograms (Elkan-accelerated).
     progress("flop-clustering", "k-means", 0.0);
     let flop_k = (config.flop_buckets as usize).min(all_features.len());
     let (flop_labels, _) = if all_features.is_empty() {
         (vec![], vec![])
     } else {
-        fast_kmeans_histogram(&all_features, flop_k, config.kmeans_iterations, config.seed)
+        elkan_emd_weighted_u8(&all_features, &all_weights, flop_k, config.kmeans_iterations, config.seed, |_, _| {})
     };
     progress("flop-clustering", "k-means", 1.0);
 
