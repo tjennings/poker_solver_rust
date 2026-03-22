@@ -245,6 +245,7 @@ export interface GlobalConfig {
   rollout_bias_factor: number;
   rollout_num_samples: number;
   rollout_opponent_samples: number;
+  leaf_eval_interval: number;
 }
 
 export interface BlueprintListEntry {

@@ -284,6 +284,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     const biasFactor = globalConfig.rollout_bias_factor ?? 10.0;
     const numRollouts = globalConfig.rollout_num_samples ?? 3;
     const oppSamples = globalConfig.rollout_opponent_samples ?? 8;
+    const leafEvalInterval = globalConfig.leaf_eval_interval ?? 10;
     invoke('postflop_solve_street', {
       board: cards,
       target_exploitability: targetExpl,
@@ -291,6 +292,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       rollout_bias_factor: biasFactor,
       rollout_num_samples: numRollouts,
       rollout_opponent_samples: oppSamples,
+      leaf_eval_interval: leafEvalInterval,
     })
       .then(() => startPolling())
       .catch((e) => { setError(String(e)); setSolving(false); });

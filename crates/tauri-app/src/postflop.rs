@@ -1252,9 +1252,10 @@ pub fn postflop_solve_street_core(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
+    leaf_eval_interval: Option<u32>,
 ) -> Result<(), String> {
     postflop_solve_street_impl(state, board, max_iterations, target_exploitability, vec![],
-        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples)
+        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1267,6 +1268,7 @@ fn postflop_solve_street_impl(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
+    leaf_eval_interval: Option<u32>,
 ) -> Result<(), String> {
     // Guard: reject if already solving.
     if state.solving.load(Ordering::Relaxed) {
@@ -1320,7 +1322,7 @@ fn postflop_solve_street_impl(
         SolverChoice::DepthLimited => {
             let cbv_ctx = state.cbv_context.read().clone();
             solve_depth_limited(state, &config, board, max_iterations, &solver_config, &filtered_oop, &filtered_ip, cbv_ctx,
-                rollout_bias_factor, rollout_num_samples, rollout_opponent_samples)
+                rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval)
         }
     }
 }
@@ -1429,6 +1431,7 @@ fn solve_depth_limited(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
+    leaf_eval_interval: Option<u32>,
 ) -> Result<(), String> {
     let max_iters = max_iterations.unwrap_or(solver_config.depth_limited_iterations);
     state.max_iterations.store(max_iters, Ordering::Relaxed);
@@ -1513,18 +1516,17 @@ fn solve_depth_limited(
                 *shared.matrix_snapshot.write() = Some(make_matrix(&initial_strategy));
 
                 const SNAPSHOT_INTERVAL: u32 = 10;
+                let leaf_interval = leaf_eval_interval.unwrap_or(SNAPSHOT_INTERVAL);
 
                 // Train in batches of SNAPSHOT_INTERVAL iterations, taking
                 // strategy snapshots between batches for the UI.
-                // Leaf evaluation happens every SNAPSHOT_INTERVAL iterations
-                // within train_with_leaf_interval (matching the batch size).
                 let mut t = 0u32;
                 while t < max_iters {
                     if !shared.solving.load(Ordering::Relaxed) {
                         break;
                     }
                     let batch = SNAPSHOT_INTERVAL.min(max_iters - t);
-                    solver.train_with_leaf_interval(batch, SNAPSHOT_INTERVAL);
+                    solver.train_with_leaf_interval(batch, leaf_interval);
                     t += batch;
                     shared.current_iteration.store(t, Ordering::Relaxed);
 
@@ -1618,9 +1620,10 @@ pub async fn postflop_solve_street(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
+    leaf_eval_interval: Option<u32>,
 ) -> Result<(), String> {
     postflop_solve_street_core(&state, board, max_iterations, target_exploitability,
-        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples)
+        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval)
 }
 
 // ---------------------------------------------------------------------------
@@ -2572,7 +2575,7 @@ mod tests {
         // River board — single street, fast even in debug mode
         let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
         let result =
-            postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX), None, None, None);
+            postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX), None, None, None, None);
         assert!(result.is_ok(), "solve_street failed: {:?}", result.err());
 
         // Wait for the background thread to finish (generous timeout for debug builds).
@@ -2597,7 +2600,7 @@ mod tests {
 
         let board = vec!["Td".into(), "9d".into(), "6h".into()];
         let result =
-            postflop_solve_street_core(&state, board, None, None, None, None, None);
+            postflop_solve_street_core(&state, board, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2629,7 +2632,7 @@ mod tests {
         *state.config.write() = config;
 
         let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
-        postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX), None, None, None).unwrap();
+        postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX), None, None, None, None).unwrap();
 
         // Wait for the background thread to finish.
         for _ in 0..600 {
@@ -2683,7 +2686,7 @@ mod tests {
         postflop_set_config_core(&state, config).unwrap();
 
         let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
-        postflop_solve_street_core(&state, board, Some(5), Some(f32::MAX), None, None, None).unwrap();
+        postflop_solve_street_core(&state, board, Some(5), Some(f32::MAX), None, None, None, None).unwrap();
 
         // Wait for background solve to finish.
         for _ in 0..600 {
@@ -2767,7 +2770,7 @@ mod tests {
 
         // Solve flop — should dispatch to subgame due to wide ranges.
         let board = vec!["Ks".to_string(), "Qh".to_string(), "Jd".to_string()];
-        let result = postflop_solve_street_core(&state, board, Some(5), Some(1e9), None, None, None);
+        let result = postflop_solve_street_core(&state, board, Some(5), Some(1e9), None, None, None, None);
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
@@ -2823,7 +2826,7 @@ mod tests {
             "Tc".to_string(),
             "2d".to_string(),
         ];
-        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None);
+        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None, None);
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
@@ -2865,7 +2868,7 @@ mod tests {
         *state.filtered_ip_weights.write() = Some(narrow_ip);
 
         let board = vec!["Ks".to_string(), "Qh".to_string(), "Jd".to_string()];
-        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None);
+        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None, None);
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
