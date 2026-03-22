@@ -285,6 +285,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     const numRollouts = globalConfig.rollout_num_samples ?? 3;
     const oppSamples = globalConfig.rollout_opponent_samples ?? 8;
     const leafEvalInterval = globalConfig.leaf_eval_interval ?? 10;
+    const rangeClamp = globalConfig.range_clamp_threshold ?? 0.05;
     invoke('postflop_solve_street', {
       board: cards,
       target_exploitability: targetExpl,
@@ -293,6 +294,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       rollout_num_samples: numRollouts,
       rollout_opponent_samples: oppSamples,
       leaf_eval_interval: leafEvalInterval,
+      range_clamp_threshold: rangeClamp,
     })
       .then(() => startPolling())
       .catch((e) => { setError(String(e)); setSolving(false); });

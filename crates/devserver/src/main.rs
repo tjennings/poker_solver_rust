@@ -86,6 +86,7 @@ struct PostflopSolveParams {
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
     leaf_eval_interval: Option<u32>,
+    range_clamp_threshold: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -430,6 +431,7 @@ async fn handle_postflop_solve_street(
         params.rollout_num_samples,
         params.rollout_opponent_samples,
         params.leaf_eval_interval,
+        params.range_clamp_threshold,
     ))
 }
 

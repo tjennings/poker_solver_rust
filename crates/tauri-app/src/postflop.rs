@@ -1294,9 +1294,11 @@ pub fn postflop_solve_street_core(
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
     leaf_eval_interval: Option<u32>,
+    range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
     postflop_solve_street_impl(state, board, max_iterations, target_exploitability, vec![],
-        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval)
+        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval,
+        range_clamp_threshold)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1310,6 +1312,7 @@ fn postflop_solve_street_impl(
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
     leaf_eval_interval: Option<u32>,
+    range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
     // Guard: reject if already solving.
     if state.solving.load(Ordering::Relaxed) {
@@ -1363,7 +1366,8 @@ fn postflop_solve_street_impl(
         SolverChoice::DepthLimited => {
             let cbv_ctx = state.cbv_context.read().clone();
             solve_depth_limited(state, &config, board, max_iterations, &solver_config, &filtered_oop, &filtered_ip, cbv_ctx,
-                rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval)
+                rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval,
+                range_clamp_threshold)
         }
     }
 }
@@ -1473,6 +1477,7 @@ fn solve_depth_limited(
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
     leaf_eval_interval: Option<u32>,
+    range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
     let max_iters = max_iterations.unwrap_or(solver_config.depth_limited_iterations);
     state.max_iterations.store(max_iters, Ordering::Relaxed);
@@ -1514,14 +1519,32 @@ fn solve_depth_limited(
     let eff_stack = config.effective_stack;
     let abstract_node_idx = config.abstract_node_idx;
 
-    let oop_w = filtered_oop.clone().unwrap_or_else(|| {
+    let mut oop_w = filtered_oop.clone().unwrap_or_else(|| {
         let range: Range = config.oop_range.parse().unwrap_or_default();
         range.raw_data().to_vec()
     });
-    let ip_w = filtered_ip.clone().unwrap_or_else(|| {
+    let mut ip_w = filtered_ip.clone().unwrap_or_else(|| {
         let range: Range = config.ip_range.parse().unwrap_or_default();
         range.raw_data().to_vec()
     });
+
+    // Clamp low-reach combos to zero to remove blueprint noise.
+    let clamp = range_clamp_threshold.unwrap_or(0.0) as f32;
+    if clamp > 0.0 {
+        let oop_before = oop_w.iter().filter(|&&w| w > 0.0).count();
+        let ip_before = ip_w.iter().filter(|&&w| w > 0.0).count();
+        for w in oop_w.iter_mut() {
+            if *w > 0.0 && *w < clamp { *w = 0.0; }
+        }
+        for w in ip_w.iter_mut() {
+            if *w > 0.0 && *w < clamp { *w = 0.0; }
+        }
+        let oop_after = oop_w.iter().filter(|&&w| w > 0.0).count();
+        let ip_after = ip_w.iter().filter(|&&w| w > 0.0).count();
+        eprintln!(
+            "[range clamp] threshold={clamp:.3}: OOP {oop_before}→{oop_after} combos, IP {ip_before}→{ip_after} combos"
+        );
+    }
 
     let shared = Arc::clone(state);
     let board_strings = board;
@@ -1751,9 +1774,11 @@ pub async fn postflop_solve_street(
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
     leaf_eval_interval: Option<u32>,
+    range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
     postflop_solve_street_core(&state, board, max_iterations, target_exploitability,
-        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval)
+        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval,
+        range_clamp_threshold)
 }
 
 // ---------------------------------------------------------------------------
@@ -2705,7 +2730,7 @@ mod tests {
         // River board — single street, fast even in debug mode
         let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
         let result =
-            postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX), None, None, None, None);
+            postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX), None, None, None, None, None);
         assert!(result.is_ok(), "solve_street failed: {:?}", result.err());
 
         // Wait for the background thread to finish (generous timeout for debug builds).
@@ -2730,7 +2755,7 @@ mod tests {
 
         let board = vec!["Td".into(), "9d".into(), "6h".into()];
         let result =
-            postflop_solve_street_core(&state, board, None, None, None, None, None, None);
+            postflop_solve_street_core(&state, board, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2816,7 +2841,7 @@ mod tests {
         postflop_set_config_core(&state, config).unwrap();
 
         let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
-        postflop_solve_street_core(&state, board, Some(5), Some(f32::MAX), None, None, None, None).unwrap();
+        postflop_solve_street_core(&state, board, Some(5), Some(f32::MAX), None, None, None, None, None).unwrap();
 
         // Wait for background solve to finish.
         for _ in 0..600 {
@@ -2900,7 +2925,7 @@ mod tests {
 
         // Solve flop — should dispatch to subgame due to wide ranges.
         let board = vec!["Ks".to_string(), "Qh".to_string(), "Jd".to_string()];
-        let result = postflop_solve_street_core(&state, board, Some(5), Some(1e9), None, None, None, None);
+        let result = postflop_solve_street_core(&state, board, Some(5), Some(1e9), None, None, None, None, None);
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
@@ -2956,7 +2981,7 @@ mod tests {
             "Tc".to_string(),
             "2d".to_string(),
         ];
-        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None, None);
+        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None, None, None);
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
@@ -2998,7 +3023,7 @@ mod tests {
         *state.filtered_ip_weights.write() = Some(narrow_ip);
 
         let board = vec!["Ks".to_string(), "Qh".to_string(), "Jd".to_string()];
-        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None, None);
+        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None, None, None);
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();

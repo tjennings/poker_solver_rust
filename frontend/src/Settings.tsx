@@ -350,6 +350,34 @@ export default function Settings() {
         </p>
       </div>
 
+      {/* Range Clamp Threshold */}
+      <div style={{ marginBottom: '1.5rem' }}>
+        <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
+          Range Clamp Threshold
+        </label>
+        <input
+          type="text"
+          value={config.range_clamp_threshold ?? 0.05}
+          onChange={e => {
+            const v = parseFloat(e.target.value);
+            if (!isNaN(v) && v >= 0 && v <= 1) setConfig({ range_clamp_threshold: v });
+          }}
+          style={{
+            width: 70,
+            padding: '0.45rem 0.6rem',
+            background: 'rgba(255,255,255,0.06)',
+            border: '1px solid rgba(255,255,255,0.12)',
+            borderRadius: 6,
+            color: '#eee',
+            fontSize: '0.85rem',
+            fontFamily: 'inherit',
+          }}
+        />
+        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
+          Zero out combos with reach below this threshold before solving. Removes blueprint noise (trash hands that shouldn't be in range). 0 = no clamping.
+        </p>
+      </div>
+
       {/* Stub Range Solver */}
       <div style={{ marginBottom: '1.5rem' }}>
         <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', color: '#eee', cursor: 'pointer' }}>
