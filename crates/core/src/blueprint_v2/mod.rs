@@ -1,4 +1,5 @@
 pub mod bucket_file;
+pub mod continuation;
 pub mod centroid_file;
 pub mod per_flop_bucket_file;
 pub mod bundle;
