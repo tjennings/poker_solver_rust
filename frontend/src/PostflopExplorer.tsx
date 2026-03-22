@@ -287,7 +287,10 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       invoke('postflop_cancel_solve').catch(() => {});
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
       setSolving(false);
+      setSolved(false);
       setNeedsSolve(true);
+      setActionHistory([]);
+      setBlueprintHistory([]);
       setBlueprintMode(true); // Back to blueprint mode
       setBlueprintFetchTrigger(prev => prev + 1); // Trigger re-fetch of blueprint matrix
       return;
@@ -296,6 +299,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     if (cards.length < 3) return;
     setError(null);
     setSolving(true);
+    setSolved(false);
     setNeedsSolve(false);
     setBlueprintMode(false); // Switch to solver mode
     setActionHistory([]); // Reset action history for solver tree
@@ -429,6 +433,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
 
   /** Navigate the blueprint tree by clicking an action button. */
   const handleBlueprintAction = useCallback(async (actionId: string) => {
+    if (pendingNavRef.current) return; // Guard against rapid clicks
+    pendingNavRef.current = true;
     setError(null);
     setSelectedCell(null);
 
@@ -466,6 +472,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         },
       });
 
+      pendingNavRef.current = false;
+
       // Detect street transition: tree advanced past a chance node
       const expectedStreet = boardCards.length === 3 ? 'Flop' : boardCards.length === 4 ? 'Turn' : 'River';
       if (sm.street !== expectedStreet) {
@@ -476,6 +484,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
 
       setMatrix(blueprintToPostflopMatrix(sm, boardCards, sm.to_act));
     } catch (e) {
+      pendingNavRef.current = false;
       if (String(e).includes('terminal')) {
         setTerminal(true);
       } else {
@@ -488,6 +497,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
 
   /** Navigate back in blueprint mode by clicking a history action card. */
   const handleBlueprintNavigateBack = useCallback(async (historyIndex: number) => {
+    if (pendingNavRef.current) return; // Guard against rapid clicks
+    pendingNavRef.current = true;
     setError(null);
     setSelectedCell(null);
     setTerminal(false);
@@ -512,8 +523,10 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
           active_players: [true, true],
         },
       });
+      pendingNavRef.current = false;
       setMatrix(blueprintToPostflopMatrix(sm, boardCards, sm.to_act));
     } catch (e) {
+      pendingNavRef.current = false;
       setError(String(e));
     }
   }, [blueprintHistory, boardCards, config, preflopActionIds]);
