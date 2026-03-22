@@ -630,6 +630,20 @@ impl CfvSubgameSolver {
                         let base = node_base + i * num_actions;
                         let node_val = cfv_buf[out_start + i];
                         let opp_total = opp_reach_totals[i];
+
+                        // One-time trace for debugging: log per-action values
+                        // at the root node for specific combos on first iteration.
+                        if self.iteration == 1 && node_idx == self.tree.root as usize
+                            && traverser == 0 && (i == 359 || i == 651)
+                        {
+                            let child_vals: Vec<f64> = (0..num_actions)
+                                .map(|a| cfv_buf[children_buf[a] as usize * n + i])
+                                .collect();
+                            eprintln!(
+                                "[TRACE] iter=1 combo={i} node_val={node_val:.2} opp_total={opp_total:.2} child_vals={child_vals:?}"
+                            );
+                        }
+
                         for a in 0..num_actions {
                             let child_idx = children_buf[a] as usize;
                             let child_val = cfv_buf[child_idx * n + i];
