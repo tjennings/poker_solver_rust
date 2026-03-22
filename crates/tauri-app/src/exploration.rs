@@ -734,7 +734,6 @@ struct V2WalkState {
     stacks: [f64; 2],
     #[allow(dead_code)]
     to_call: f64,
-    #[allow(dead_code)]
     to_act: u8,
 }
 
@@ -980,12 +979,16 @@ fn get_strategy_matrix_v2(
                             // node's street (e.g. 3 cards for flop even if the
                             // full board has 4+ cards at a later street).
                             let board_slice = board_for_street_slice(board, *street);
+                            let lookup = BucketLookup {
+                                all_buckets: &ctx.all_buckets,
+                                strategy: &ctx.strategy,
+                                decision_idx: dec_idx as usize,
+                            };
                             for (hand_idx, r) in reach.iter_mut().enumerate() {
                                 if let Some(hand) = CanonicalHand::from_index(hand_idx) {
                                     let avg_p = avg_action_prob_for_hand(
                                         &hand, board_slice, *street,
-                                        &ctx.all_buckets, &ctx.strategy,
-                                        dec_idx as usize, action_pos,
+                                        &lookup, action_pos,
                                     );
                                     *r *= avg_p;
                                 }
@@ -1025,28 +1028,24 @@ fn get_strategy_matrix_v2(
         ));
     }
 
-    // Determine the street from the node.
-    let street_name = match &tree.nodes[walk.node_idx as usize] {
-        V2GameNode::Decision { street, .. } => match street {
-            Street::Preflop => "Preflop",
-            Street::Flop => "Flop",
-            Street::Turn => "Turn",
-            Street::River => "River",
-        },
-        _ => "Unknown",
-    };
-
-    let is_preflop = street_name == "Preflop";
+    // Determine the street from the node (single match).
     let street_enum = match &tree.nodes[walk.node_idx as usize] {
         V2GameNode::Decision { street, .. } => *street,
         _ => Street::Preflop,
     };
+    let street_name = match street_enum {
+        Street::Preflop => "Preflop",
+        Street::Flop => "Flop",
+        Street::Turn => "Turn",
+        Street::River => "River",
+    };
+    let is_preflop = street_enum == Street::Preflop;
     let num_buckets = strategy.bucket_counts[
         strategy.node_street_indices[decision_idx as usize] as usize
     ] as usize;
 
-    // Parse board cards once for postflop bucket lookups.
-    let board = if !is_preflop { parse_board(&position.board).ok() } else { None };
+    // Reuse board_cards parsed above for postflop bucket lookups.
+    let board = if !is_preflop { board_cards.as_ref() } else { None };
 
     let ranks = RANKS;
     let mut cells = Vec::with_capacity(13);
@@ -1074,13 +1073,17 @@ fn get_strategy_matrix_v2(
                         probability: p,
                     })
                     .collect()
-            } else if let (Some(ctx), Some(board)) = (cbv_context, board.as_ref()) {
+            } else if let (Some(ctx), Some(board)) = (cbv_context, board) {
                 // Postflop with bucket data: enumerate combos, look up buckets,
                 // average strategy probabilities.
+                let lookup = BucketLookup {
+                    all_buckets: &ctx.all_buckets,
+                    strategy: &ctx.strategy,
+                    decision_idx: decision_idx as usize,
+                };
                 postflop_cell_probs(
                     rank1, rank2, suited, board, street_enum,
-                    &ctx.all_buckets, &ctx.strategy, decision_idx as usize,
-                    &actions,
+                    &lookup, &actions,
                 )
             } else {
                 // Postflop without bucket data: return uniform distribution.
@@ -1140,39 +1143,41 @@ fn canonical_hand_index_from_ranks(rank1: char, rank2: char, suited: bool) -> us
     canonical.index()
 }
 
-/// Compute postflop action probabilities for a single 13x13 cell by
-/// enumerating all specific Card combos, filtering board blockers,
-/// looking up each combo's bucket, querying the strategy, and averaging.
-#[allow(clippy::too_many_arguments)]
-fn postflop_cell_probs(
-    rank1: char,
-    rank2: char,
-    suited: bool,
+/// Groups the bucket-lookup parameters shared by postflop helpers.
+struct BucketLookup<'a> {
+    all_buckets: &'a AllBuckets,
+    strategy: &'a BlueprintV2Strategy,
+    decision_idx: usize,
+}
+
+/// Enumerate all combos for a canonical hand, filter board blockers, look up
+/// each combo's bucket, and accumulate action probabilities.
+///
+/// Returns `(sum_of_probs_per_action, combo_count)`.
+fn bucket_probs_for_hand(
+    hand: &CanonicalHand,
     board: &[Card],
     street: Street,
-    all_buckets: &AllBuckets,
-    strategy: &BlueprintV2Strategy,
-    decision_idx: usize,
-    actions: &[ActionInfo],
-) -> Vec<ActionProb> {
-    let v1 = char_to_value(rank1);
-    let v2 = char_to_value(rank2);
-    let canonical = CanonicalHand::new(v1, v2, suited);
-    let combos = canonical.combos();
-
-    let num_actions = actions.len();
+    lookup: &BucketLookup,
+) -> (Vec<f32>, u32) {
+    let combos = hand.combos();
+    let num_actions = lookup
+        .strategy
+        .get_action_probs(lookup.decision_idx, 0)
+        .len();
     let mut sum_probs = vec![0.0_f32; num_actions];
     let mut count = 0u32;
 
     for (c1, c2) in &combos {
-        // Skip combos blocked by board cards (linear scan over <=5 elements
-        // is faster than HashSet with hashing overhead).
+        // Linear scan over <=5 board elements is faster than HashSet.
         if board.iter().any(|b| *b == *c1 || *b == *c2) {
             continue;
         }
 
-        let bucket = all_buckets.get_bucket(street, [*c1, *c2], board);
-        let probs = strategy.get_action_probs(decision_idx, bucket);
+        let bucket = lookup.all_buckets.get_bucket(street, [*c1, *c2], board);
+        let probs = lookup
+            .strategy
+            .get_action_probs(lookup.decision_idx, bucket);
 
         for (i, &p) in probs.iter().enumerate().take(num_actions) {
             sum_probs[i] += p;
@@ -1180,8 +1185,30 @@ fn postflop_cell_probs(
         count += 1;
     }
 
+    (sum_probs, count)
+}
+
+/// Compute postflop action probabilities for a single 13x13 cell by
+/// enumerating all specific Card combos, filtering board blockers,
+/// looking up each combo's bucket, querying the strategy, and averaging.
+fn postflop_cell_probs(
+    rank1: char,
+    rank2: char,
+    suited: bool,
+    board: &[Card],
+    street: Street,
+    lookup: &BucketLookup,
+    actions: &[ActionInfo],
+) -> Vec<ActionProb> {
+    let v1 = char_to_value(rank1);
+    let v2 = char_to_value(rank2);
+    let canonical = CanonicalHand::new(v1, v2, suited);
+
+    let (sum_probs, count) = bucket_probs_for_hand(&canonical, board, street, lookup);
+
     if count == 0 {
         // All combos blocked — return uniform as fallback.
+        let num_actions = actions.len();
         let uniform = 1.0 / num_actions as f32;
         return actions
             .iter()
@@ -1197,47 +1224,29 @@ fn postflop_cell_probs(
         .enumerate()
         .map(|(i, a)| ActionProb {
             action: a.label.clone(),
-            probability: sum_probs[i] / count as f32,
+            probability: sum_probs.get(i).copied().unwrap_or(0.0) / count as f32,
         })
         .collect()
 }
 
 /// Compute the average probability of a specific action for a canonical hand
-/// at a postflop decision node. Enumerates all combos, filters board blockers,
-/// looks up each combo's bucket, and averages the action probability.
+/// at a postflop decision node. Uses `bucket_probs_for_hand` and indexes the
+/// result.
 fn avg_action_prob_for_hand(
     hand: &CanonicalHand,
     board: &[Card],
     street: Street,
-    all_buckets: &AllBuckets,
-    strategy: &BlueprintV2Strategy,
-    decision_idx: usize,
+    lookup: &BucketLookup,
     action_pos: usize,
 ) -> f32 {
-    let combos = hand.combos();
-
-    let mut sum = 0.0_f32;
-    let mut count = 0u32;
-
-    for (c1, c2) in &combos {
-        // Linear scan over <=5 board elements is faster than HashSet.
-        if board.iter().any(|b| *b == *c1 || *b == *c2) {
-            continue;
-        }
-
-        let bucket = all_buckets.get_bucket(street, [*c1, *c2], board);
-        let probs = strategy.get_action_probs(decision_idx, bucket);
-        let p = probs.get(action_pos).copied().unwrap_or(0.0);
-        sum += p;
-        count += 1;
-    }
+    let (sum_probs, count) = bucket_probs_for_hand(hand, board, street, lookup);
 
     if count == 0 {
         // All combos blocked — return 0 (won't contribute to reach).
         return 0.0;
     }
 
-    sum / count as f32
+    sum_probs.get(action_pos).copied().unwrap_or(0.0) / count as f32
 }
 
 /// Get available actions at the current position (core logic, no Tauri dependency).
@@ -2893,10 +2902,14 @@ mod tests {
             Card::new(Value::King, Suit::Spade),
         ];
 
+        let lookup = BucketLookup {
+            all_buckets: &all_buckets,
+            strategy: &strategy,
+            decision_idx: 1, // flop node
+        };
         let probs = postflop_cell_probs(
             'A', 'A', false, &board, Street::River,
-            &all_buckets, &strategy, 1, // decision_idx 1 = flop node
-            &actions,
+            &lookup, &actions,
         );
 
         // All AA combos blocked by board, should get uniform
@@ -3021,9 +3034,14 @@ mod tests {
         ];
 
         let hand = CanonicalHand::new(Value::Ace, Value::Ace, false);
+        let lookup = BucketLookup {
+            all_buckets: &all_buckets,
+            strategy: &strategy,
+            decision_idx: 1,
+        };
         let p = avg_action_prob_for_hand(
             &hand, &board, Street::River,
-            &all_buckets, &strategy, 1, 0,
+            &lookup, 0,
         );
 
         assert!(p.abs() < f32::EPSILON, "Expected 0.0 for fully blocked hand, got {p}");
@@ -3084,10 +3102,14 @@ mod tests {
             Card::new(Value::King, Suit::Diamond),
         ];
 
+        let lookup = BucketLookup {
+            all_buckets: &all_buckets,
+            strategy: &strategy,
+            decision_idx: 1,
+        };
         let probs = postflop_cell_probs(
             'K', 'K', false, &board, Street::Flop,
-            &all_buckets, &strategy, 1,
-            &actions,
+            &lookup, &actions,
         );
 
         // Only 1 KK combo remains (Kc isn't on the board) -- but KK needs 2 kings,
@@ -3114,9 +3136,14 @@ mod tests {
         ];
 
         let hand = CanonicalHand::new(Value::Ace, Value::Ace, false);
+        let lookup = BucketLookup {
+            all_buckets: &all_buckets,
+            strategy: &strategy,
+            decision_idx: 1,
+        };
         let p = avg_action_prob_for_hand(
             &hand, &board, Street::Flop,
-            &all_buckets, &strategy, 1, 0,
+            &lookup, 0,
         );
 
         // All AA combos blocked (3 aces on board block all 6 AA combos
@@ -3125,6 +3152,66 @@ mod tests {
         // So only combo not fully blocked would need 2 off-board aces.
         // Only 1 ace (Ac) is off board. All combos blocked.
         assert!(p.abs() < f32::EPSILON, "Expected 0.0 for blocked hand");
+    }
+
+    #[timed_test]
+    fn bucket_probs_for_hand_returns_sum_and_count() {
+        let (strategy, _) = build_minimal_postflop_strategy();
+        let all_buckets = AllBuckets::new([169, 10, 10, 10], [None, None, None, None]);
+
+        // Use preflop (no bucket files needed) with an unblocked hand.
+        let hand = CanonicalHand::new(Value::King, Value::Queen, true);
+        let board: Vec<Card> = vec![];
+
+        let lookup = BucketLookup {
+            all_buckets: &all_buckets,
+            strategy: &strategy,
+            decision_idx: 0, // preflop node
+        };
+
+        let (sum_probs, count) = bucket_probs_for_hand(
+            &hand, &board, Street::Preflop, &lookup,
+        );
+
+        // KQs has 4 combos, none blocked by empty board
+        assert_eq!(count, 4, "Expected 4 unblocked KQs combos");
+        // sum_probs should have entries for each action
+        assert_eq!(sum_probs.len(), 2, "Expected 2 actions in sum_probs");
+        // Average should equal sum / count and be in [0,1]
+        let avg = sum_probs[0] / count as f32;
+        assert!(avg >= 0.0 && avg <= 1.0, "Average prob should be in [0,1], got {avg}");
+    }
+
+    #[timed_test]
+    fn bucket_probs_for_hand_all_blocked_returns_zero_count() {
+        let (strategy, _) = build_minimal_postflop_strategy();
+        let all_buckets = AllBuckets::new([169, 10, 10, 10], [None, None, None, None]);
+
+        let hand = CanonicalHand::new(Value::Ace, Value::Ace, false);
+        // Board blocks all AA combos
+        let board = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::Ace, Suit::Diamond),
+            Card::new(Value::Ace, Suit::Club),
+            Card::new(Value::King, Suit::Spade),
+        ];
+
+        let lookup = BucketLookup {
+            all_buckets: &all_buckets,
+            strategy: &strategy,
+            decision_idx: 1,
+        };
+
+        let (sum_probs, count) = bucket_probs_for_hand(
+            &hand, &board, Street::River, &lookup,
+        );
+
+        assert_eq!(count, 0, "All combos should be blocked");
+        // sum_probs should be all zeros
+        for p in &sum_probs {
+            assert!(p.abs() < f32::EPSILON, "Expected 0.0 in sum_probs when all blocked");
+        }
     }
 
     #[timed_test]
