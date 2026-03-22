@@ -116,6 +116,98 @@ pub fn nearest_centroid_u8_weighted(point: &[u8], centroids: &[Vec<f64>], gaps: 
 }
 
 // ---------------------------------------------------------------------------
+// Elkan bounds for triangle-inequality accelerated k-means
+// ---------------------------------------------------------------------------
+
+/// Per-point distance bounds for Elkan's accelerated k-means.
+///
+/// Maintains upper/lower bounds on point-centroid distances to skip
+/// expensive EMD computations via the triangle inequality.
+/// Runtime-sized adaptation of robopoker's `Bounds<K>`.
+#[derive(Debug, Clone)]
+pub(crate) struct ElkanBounds {
+    /// Currently assigned centroid index.
+    j: usize,
+    /// Lower bounds on distance to each centroid.
+    lower: Vec<f32>,
+    /// Upper bound on distance to assigned centroid.
+    error: f32,
+    /// Whether the upper bound is potentially stale.
+    stale: bool,
+}
+
+impl ElkanBounds {
+    /// Create bounds for `k` centroids, initially unassigned.
+    fn new(k: usize) -> Self {
+        Self {
+            j: 0,
+            lower: vec![0.0; k],
+            error: f32::MAX,
+            stale: false,
+        }
+    }
+
+    /// Currently assigned centroid index.
+    fn j(&self) -> usize {
+        self.j
+    }
+
+    /// Upper bound on distance to assigned centroid.
+    fn upper(&self) -> f32 {
+        self.error
+    }
+
+    /// Whether the upper bound may be outdated.
+    fn stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Checks if centroid `j` could be closer than current assignment.
+    ///
+    /// Returns false (skip) if triangle inequality proves it can't be closer:
+    /// 1. j == assigned centroid -> skip
+    /// 2. upper <= lower\[j\] -> skip
+    /// 3. upper <= d(assigned, j) / 2 -> skip
+    fn has_shifted(&self, pairwise: &[Vec<f32>], j: usize) -> bool {
+        self.j != j
+            && self.error > self.lower[j]
+            && self.error > 0.5 * pairwise[self.j][j]
+    }
+
+    /// Direct assignment (for initialization).
+    fn assign(&mut self, distance: f32, j: usize) {
+        self.j = j;
+        self.error = distance;
+    }
+
+    /// Refreshes stale upper bound with actual distance.
+    fn refresh(&mut self, distance: f32) {
+        self.lower[self.j] = distance;
+        self.error = distance;
+        self.stale = false;
+    }
+
+    /// Records distance to centroid `j`, reassigning if closer.
+    fn witness(&mut self, distance: f32, j: usize) {
+        self.lower[j] = distance;
+        if distance < self.error {
+            self.j = j;
+            self.error = distance;
+        }
+    }
+
+    /// Updates bounds after centroids move.
+    /// Lower bounds decrease by drift; upper bound increases by assigned drift.
+    fn update(&mut self, drifts: &[f32]) {
+        for (lower, &drift) in self.lower.iter_mut().zip(drifts.iter()) {
+            *lower = (*lower - drift).max(0.0);
+        }
+        self.error += drifts[self.j];
+        self.stale = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // K-Means with EMD distance
 // ---------------------------------------------------------------------------
 
@@ -1451,5 +1543,68 @@ mod tests {
         let gaps = vec![1.0, 1.0, 1.0];
         let idx = nearest_centroid_u8_weighted(&point, &centroids, &gaps);
         assert_eq!(idx, 0, "should pick centroid 0 (closer)");
+    }
+
+    #[test]
+    fn elkan_bounds_witness_reassigns_when_closer() {
+        let mut b = ElkanBounds::new(3);
+        // Simulate initial assignment to centroid 0 with distance 1.0
+        b.assign(1.0, 0);
+        assert_eq!(b.j(), 0);
+        assert!((b.upper() - 1.0).abs() < 1e-6);
+
+        // Witness centroid 2 at distance 0.5 — should reassign
+        b.witness(0.5, 2);
+        assert_eq!(b.j(), 2);
+        assert!((b.upper() - 0.5).abs() < 1e-6);
+
+        // Witness centroid 1 at distance 0.8 — should NOT reassign
+        b.witness(0.8, 1);
+        assert_eq!(b.j(), 2);
+        assert!((b.upper() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn elkan_bounds_update_shifts_bounds() {
+        let k = 3;
+        let mut b = ElkanBounds::new(k);
+        b.assign(1.0, 1);
+        b.lower[0] = 2.0;
+        b.lower[1] = 1.0;
+        b.lower[2] = 3.0;
+
+        let drifts = vec![0.1, 0.2, 0.5];
+        b.update(&drifts);
+
+        // Lower bounds decrease by drift amounts (clamped to 0)
+        assert!((b.lower[0] - 1.9).abs() < 1e-6);
+        assert!((b.lower[1] - 0.8).abs() < 1e-6);
+        assert!((b.lower[2] - 2.5).abs() < 1e-6);
+        // Upper bound increases by assigned centroid's drift
+        assert!((b.upper() - 1.2).abs() < 1e-6);
+        assert!(b.stale());
+    }
+
+    #[test]
+    fn elkan_bounds_has_shifted_triangle_inequality() {
+        let k = 3;
+        let mut b = ElkanBounds::new(k);
+        b.assign(1.0, 0);
+        b.lower[1] = 0.5;
+        b.lower[2] = 1.5;
+
+        // Pairwise distances: centroid 0-1 = 3.0, centroid 0-2 = 0.5
+        let pairwise = vec![
+            vec![0.0, 3.0, 0.5],
+            vec![3.0, 0.0, 2.0],
+            vec![0.5, 2.0, 0.0],
+        ];
+
+        // Centroid 1: upper(1.0) > lower(0.5) but upper(1.0) <= d(0,1)/2 = 1.5 -> skip
+        assert!(!b.has_shifted(&pairwise, 1));
+        // Centroid 2: upper(1.0) > lower(1.5)? No -> skip
+        assert!(!b.has_shifted(&pairwise, 2));
+        // Same centroid -> always skip
+        assert!(!b.has_shifted(&pairwise, 0));
     }
 }
