@@ -73,9 +73,14 @@ impl BlueprintV2Strategy {
         tree: &GameTree,
         purify_threshold: f64,
     ) -> Self {
+        if purify_threshold > 0.0 {
+            eprintln!("[purify] exporting strategy with purify_threshold={purify_threshold}");
+        }
         let mut action_probs = Vec::new();
         let mut node_action_counts = Vec::new();
         let mut node_street_indices = Vec::new();
+        let mut purified_count = 0u64;
+        let mut total_count = 0u64;
 
         for (i, node) in tree.nodes.iter().enumerate() {
             if let GameNode::Decision {
@@ -91,7 +96,15 @@ impl BlueprintV2Strategy {
 
                 for bucket in 0..buckets {
                     let avg = if purify_threshold > 0.0 {
-                        storage.purified_average_strategy(i as u32, bucket, purify_threshold)
+                        let raw = storage.average_strategy(i as u32, bucket);
+                        let purified = storage.purified_average_strategy(i as u32, bucket, purify_threshold);
+                        for (r, p) in raw.iter().zip(purified.iter()) {
+                            total_count += 1;
+                            if *r > 0.0 && *p == 0.0 {
+                                purified_count += 1;
+                            }
+                        }
+                        purified
                     } else {
                         storage.average_strategy(i as u32, bucket)
                     };
@@ -100,6 +113,13 @@ impl BlueprintV2Strategy {
                     }
                 }
             }
+        }
+
+        if purify_threshold > 0.0 {
+            eprintln!(
+                "[purify] zeroed {purified_count}/{total_count} action entries ({:.2}%)",
+                purified_count as f64 / total_count.max(1) as f64 * 100.0
+            );
         }
 
         let node_offsets = compute_node_offsets(
