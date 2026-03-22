@@ -307,20 +307,33 @@ impl CfvSubgameSolver {
                         continue;
                     }
 
-                    // Build action mapping: subgame action index → abstract action index
-                    let action_map: Vec<Option<usize>> = sg_actions.iter().map(|sg_a| {
-                        abs_actions.iter().position(|abs_a| actions_match(sg_a, abs_a))
+                    // Build action mapping: blueprint action index → subgame action index.
+                    // Every blueprint action MUST have a match in the subgame (subgame
+                    // is a superset). Extra subgame-only actions are fine (no blueprint match).
+                    let abs_to_sg: Vec<usize> = abs_actions.iter().enumerate().map(|(ai, abs_a)| {
+                        sg_actions.iter().position(|sg_a| actions_match(sg_a, abs_a))
+                            .unwrap_or_else(|| panic!(
+                                "Blueprint action {abs_a:?} (index {ai}) has no match in subgame. \
+                                 Subgame actions: {sg_actions:?}, Abstract actions: {abs_actions:?}"
+                            ))
                     }).collect();
 
+                    if seeded_nodes == 0 {
+                        eprintln!("[warm-start] root subgame actions: {sg_actions:?}");
+                        eprintln!("[warm-start] root abstract actions: {abs_actions:?}");
+                        eprintln!("[warm-start] abs→sg mapping: {abs_to_sg:?}");
+                    }
+
                     // Seed strategy_sum for each combo
+                    let board_slice = match sg_street {
+                        Street::Flop => &self.board[..3.min(self.board.len())],
+                        Street::Turn => &self.board[..4.min(self.board.len())],
+                        Street::River => &self.board,
+                        Street::Preflop => &[],
+                    };
+
                     for combo_idx in 0..num_combos {
                         let combo = self.hands.combos[combo_idx];
-                        let board_slice = match sg_street {
-                            Street::Flop => &self.board[..3.min(self.board.len())],
-                            Street::Turn => &self.board[..4.min(self.board.len())],
-                            Street::River => &self.board,
-                            Street::Preflop => &[],
-                        };
 
                         // Skip blocked combos
                         if board_slice.iter().any(|b| *b == combo[0] || *b == combo[1]) {
@@ -331,28 +344,23 @@ impl CfvSubgameSolver {
                         let probs = strategy.get_action_probs(dec_idx as usize, bucket);
 
                         let (base, _na) = self.layout.slot(sg_idx, combo_idx);
-                        for (sg_action_idx, mapped) in action_map.iter().enumerate() {
-                            if let Some(abs_action_idx) = mapped {
-                                let p = probs.get(*abs_action_idx).copied().unwrap_or(0.0);
-                                self.strategy_sum[base + sg_action_idx] += p as f64 * warmup_weight;
-                            }
-                            // Unmatched actions stay at 0.0
+                        // Map each blueprint action prob to the corresponding subgame slot
+                        for (abs_action_idx, &sg_action_idx) in abs_to_sg.iter().enumerate() {
+                            let p = probs.get(abs_action_idx).copied().unwrap_or(0.0);
+                            self.strategy_sum[base + sg_action_idx] += p as f64 * warmup_weight;
                         }
                     }
 
                     seeded_nodes += 1;
 
-                    // Push children for matched actions (parallel walk)
-                    for (sg_action_idx, mapped) in action_map.iter().enumerate() {
-                        if let Some(abs_action_idx) = mapped {
-                            let sg_child = sg_children[sg_action_idx];
-                            let abs_child = abs_children[*abs_action_idx];
-                            // Skip chance nodes in both trees
-                            let sg_child = skip_chance(&self.tree, sg_child);
-                            let abs_child = skip_chance(abstract_tree, abs_child);
-                            stack.push((sg_child, abs_child));
-                        }
-                        // Subgame-only actions: no abstract counterpart to walk
+                    // Push children for matched blueprint actions (parallel walk)
+                    for (abs_action_idx, &sg_action_idx) in abs_to_sg.iter().enumerate() {
+                        let sg_child = sg_children[sg_action_idx];
+                        let abs_child = abs_children[abs_action_idx];
+                        // Skip chance nodes in both trees
+                        let sg_child = skip_chance(&self.tree, sg_child);
+                        let abs_child = skip_chance(abstract_tree, abs_child);
+                        stack.push((sg_child, abs_child));
                     }
                 }
 
