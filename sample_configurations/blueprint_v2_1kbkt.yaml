@@ -47,6 +47,7 @@ training:
   prune_threshold: -10
   lcfr_discount_interval: 1000000
   batch_size: 2000
+  purify_threshold: 0.03
 
 snapshots:
   resume: true
