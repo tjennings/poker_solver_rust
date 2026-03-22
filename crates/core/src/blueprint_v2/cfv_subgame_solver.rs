@@ -633,14 +633,22 @@ impl CfvSubgameSolver {
 
                         // One-time trace for debugging: log per-action values
                         // at the root node for specific combos on first iteration.
-                        if self.iteration == 1 && node_idx == self.tree.root as usize
+                        if self.iteration.is_multiple_of(10)
+                            && node_idx == self.tree.root as usize
                             && traverser == 0 && (i == 359 || i == 651)
                         {
                             let child_vals: Vec<f64> = (0..num_actions)
                                 .map(|a| cfv_buf[children_buf[a] as usize * n + i])
                                 .collect();
+                            let strat: Vec<f64> = (0..num_actions)
+                                .map(|a| snapshot[node_base + i * num_actions + a])
+                                .collect();
+                            let strat_str: Vec<String> = strat.iter()
+                                .map(|&s| format!("{:.0}%", s * 100.0))
+                                .collect();
                             eprintln!(
-                                "[TRACE] iter=1 combo={i} node_val={node_val:.2} opp_total={opp_total:.2} child_vals={child_vals:?}"
+                                "[TRACE] iter={} combo={i} strat=[{}] node_val={node_val:.2} child_vals={:?}",
+                                self.iteration, strat_str.join(","), child_vals
                             );
                         }
 
