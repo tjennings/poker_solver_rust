@@ -701,21 +701,31 @@ impl CfvSubgameSolver {
                         let leaf_eval_start = std::time::Instant::now();
 
                         for eval_k in 0..k {
-                            // Evaluate leaves with evaluator k.
-                            for (b_idx, &(_, pot, invested)) in
-                                self.boundary_info.boundaries.iter().enumerate()
-                            {
-                                let eff_stack =
-                                    self.starting_stack - invested[0].max(invested[1]);
-                                self.leaf_cfvs[b_idx] = self.evaluators[eval_k].evaluate(
-                                    &self.hands.combos,
-                                    &self.board,
-                                    pot,
-                                    eff_stack,
-                                    &oop_ranges[b_idx],
-                                    &ip_ranges[b_idx],
-                                    traverser,
-                                );
+                            // Evaluate all boundaries at once (evaluator may
+                            // share expensive computation across boundaries).
+                            let requests: Vec<(f64, f64, u8)> = self
+                                .boundary_info
+                                .boundaries
+                                .iter()
+                                .map(|&(_, pot, invested)| {
+                                    let eff_stack =
+                                        self.starting_stack - invested[0].max(invested[1]);
+                                    (pot, eff_stack, traverser)
+                                })
+                                .collect();
+                            // Use initial ranges (not per-boundary propagated ranges)
+                            // for rollout sampling. The rollout estimates blueprint
+                            // continuation value, which is a property of the hand
+                            // matchup, not the subgame's evolving strategy.
+                            let batch = self.evaluators[eval_k].evaluate_boundaries(
+                                &self.hands.combos,
+                                &self.board,
+                                &oop_reach,
+                                &ip_reach,
+                                &requests,
+                            );
+                            for (b_idx, cfvs) in batch.into_iter().enumerate() {
+                                self.leaf_cfvs[b_idx] = cfvs;
                             }
 
                             // Scale opponent reach by choice probability for
@@ -793,20 +803,25 @@ impl CfvSubgameSolver {
                     } else {
                         // K=1: original behavior, no choice node.
                         let leaf_eval_start = std::time::Instant::now();
-                        for (b_idx, &(_, pot, invested)) in
-                            self.boundary_info.boundaries.iter().enumerate()
-                        {
-                            let eff_stack =
-                                self.starting_stack - invested[0].max(invested[1]);
-                            self.leaf_cfvs[b_idx] = self.evaluators[0].evaluate(
-                                &self.hands.combos,
-                                &self.board,
-                                pot,
-                                eff_stack,
-                                &oop_ranges[b_idx],
-                                &ip_ranges[b_idx],
-                                traverser,
-                            );
+                        let requests: Vec<(f64, f64, u8)> = self
+                            .boundary_info
+                            .boundaries
+                            .iter()
+                            .map(|&(_, pot, invested)| {
+                                let eff_stack =
+                                    self.starting_stack - invested[0].max(invested[1]);
+                                (pot, eff_stack, traverser)
+                            })
+                            .collect();
+                        let batch = self.evaluators[0].evaluate_boundaries(
+                            &self.hands.combos,
+                            &self.board,
+                            &oop_reach,
+                            &ip_reach,
+                            &requests,
+                        );
+                        for (b_idx, cfvs) in batch.into_iter().enumerate() {
+                            self.leaf_cfvs[b_idx] = cfvs;
                         }
                         if traverser == 0
                             && (self.iteration == 1

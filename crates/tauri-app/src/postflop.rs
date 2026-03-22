@@ -429,28 +429,24 @@ impl RolloutLeafEvaluator {
     }
 }
 
-impl LeafEvaluator for RolloutLeafEvaluator {
-    fn evaluate(
+impl RolloutLeafEvaluator {
+    /// Compute raw rollout chip values per combo (before pot-fraction normalization).
+    /// This is the expensive part — shared across all boundaries since the rollout
+    /// walks the abstract tree whose terminal payoffs don't depend on the subgame pot.
+    fn rollout_chip_values(
         &self,
         combos: &[[RsPokerCard; 2]],
         board: &[RsPokerCard],
-        pot: f64,
-        _effective_stack: f64,
         oop_range: &[f64],
         ip_range: &[f64],
         traverser: u8,
     ) -> Vec<f64> {
-        let eval_start = std::time::Instant::now();
-        let half_pot = pot / 2.0;
         let opp_range = if traverser == 0 { ip_range } else { oop_range };
 
-        let result: Vec<f64> = combos
+        combos
             .par_iter()
             .enumerate()
             .map(|(i, hero_hand)| {
-                // Build opponent sampling weights: zero out combos that
-                // conflict with hero hand. Board conflicts are already
-                // excluded by SubgameHands::enumerate(board).
                 let weights: Vec<f64> = combos
                     .iter()
                     .enumerate()
@@ -465,7 +461,6 @@ impl LeafEvaluator for RolloutLeafEvaluator {
                     })
                     .collect();
 
-                // Seed deterministically per-combo for reproducibility.
                 let mut rng = SmallRng::seed_from_u64(i as u64);
                 let sampled = sample_weighted(&mut rng, &weights, self.num_opponent_samples);
                 if sampled.is_empty() {
@@ -498,19 +493,61 @@ impl LeafEvaluator for RolloutLeafEvaluator {
                     })
                     .sum();
 
-                let avg_chips = total / sampled.len() as f64;
-                // Convert from chip value to pot-fraction units.
-                avg_chips / half_pot
+                total / sampled.len() as f64
             })
-            .collect();
+            .collect()
+    }
+}
+
+impl LeafEvaluator for RolloutLeafEvaluator {
+    fn evaluate(
+        &self,
+        combos: &[[RsPokerCard; 2]],
+        board: &[RsPokerCard],
+        pot: f64,
+        _effective_stack: f64,
+        oop_range: &[f64],
+        ip_range: &[f64],
+        traverser: u8,
+    ) -> Vec<f64> {
+        let half_pot = pot / 2.0;
+        let chip_values = self.rollout_chip_values(combos, board, oop_range, ip_range, traverser);
+        chip_values.iter().map(|&v| v / half_pot).collect()
+    }
+
+    fn evaluate_boundaries(
+        &self,
+        combos: &[[RsPokerCard; 2]],
+        board: &[RsPokerCard],
+        oop_range: &[f64],
+        ip_range: &[f64],
+        requests: &[(f64, f64, u8)],
+    ) -> Vec<Vec<f64>> {
+        if requests.is_empty() {
+            return vec![];
+        }
+
+        // All requests share the same traverser — use the first one.
+        let traverser = requests[0].2;
+        let eval_start = std::time::Instant::now();
+
+        // Compute rollout chip values ONCE (the expensive part).
+        let chip_values = self.rollout_chip_values(combos, board, oop_range, ip_range, traverser);
 
         let elapsed = eval_start.elapsed();
         eprintln!(
-            "[rollout] {:?} bias: {} combos, {:.0}ms",
-            self.bias, combos.len(), elapsed.as_secs_f64() * 1000.0
+            "[rollout] {:?} bias: {} combos × {} boundaries, {:.0}ms",
+            self.bias, combos.len(), requests.len(), elapsed.as_secs_f64() * 1000.0
         );
 
-        result
+        // Normalize per-boundary by each boundary's half_pot.
+        requests
+            .iter()
+            .map(|&(pot, _, _)| {
+                let half_pot = pot / 2.0;
+                chip_values.iter().map(|&v| v / half_pot).collect()
+            })
+            .collect()
     }
 }
 
