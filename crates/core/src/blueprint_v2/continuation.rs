@@ -142,6 +142,23 @@ pub fn rollout_from_boundary(
     abstract_node: u32,
     rng: &mut impl Rng,
 ) -> f64 {
+    rollout_inner(hero_hand, opponent_hand, board, ctx, abstract_node, rng, None)
+}
+
+/// Inner recursive function with bucket caching.
+///
+/// `cached_buckets` holds `[hero_bucket, opponent_bucket]` for the current
+/// street. Computed on the first Decision node of each street, invalidated
+/// (set to `None`) at Chance nodes when the board changes.
+fn rollout_inner(
+    hero_hand: [Card; 2],
+    opponent_hand: [Card; 2],
+    board: &[Card],
+    ctx: &RolloutContext<'_>,
+    abstract_node: u32,
+    rng: &mut impl Rng,
+    cached_buckets: Option<[u16; 2]>,
+) -> f64 {
     match &ctx.abstract_tree.nodes[abstract_node as usize] {
         GameNode::Terminal { kind, pot, invested } => {
             match kind {
@@ -153,7 +170,6 @@ pub fn rollout_from_boundary(
                     }
                 }
                 TerminalKind::Showdown => {
-                    // hero_hand always belongs to `player`
                     let player_rank = crate::showdown_equity::rank_hand(hero_hand, board);
                     let opponent_rank = crate::showdown_equity::rank_hand(opponent_hand, board);
                     match player_rank.cmp(&opponent_rank) {
@@ -173,25 +189,30 @@ pub fn rollout_from_boundary(
             let actions = actions.clone();
             let children = children.clone();
 
-            // Determine the acting player's hand
-            let acting_hand = if acting_player == ctx.player {
-                hero_hand
+            // Compute buckets for both players once per street, reuse
+            // across all Decision nodes until a Chance node changes the board.
+            let buckets = cached_buckets.unwrap_or_else(|| [
+                ctx.buckets.get_bucket(street, hero_hand, board),
+                ctx.buckets.get_bucket(street, opponent_hand, board),
+            ]);
+
+            let acting_bucket = if acting_player == ctx.player {
+                buckets[0] // hero
             } else {
-                opponent_hand
+                buckets[1] // opponent
             };
 
-            let bucket = ctx.buckets.get_bucket(street, acting_hand, board);
             let decision_idx = ctx.decision_idx_map[abstract_node as usize];
-            let probs = ctx.strategy.get_action_probs(decision_idx as usize, bucket);
+            let probs = ctx.strategy.get_action_probs(decision_idx as usize, acting_bucket);
 
-            // Classify actions for biasing
             let action_classes: Vec<ActionClass> = actions.iter().map(classify_action).collect();
             let biased = bias_strategy(probs, &action_classes, ctx.bias, ctx.bias_factor);
 
             let mut ev = 0.0;
             for (i, &child) in children.iter().enumerate() {
-                let child_ev = rollout_from_boundary(
+                let child_ev = rollout_inner(
                     hero_hand, opponent_hand, board, ctx, child, rng,
+                    Some(buckets),
                 );
                 ev += f64::from(biased[i]) * child_ev;
             }
@@ -200,7 +221,6 @@ pub fn rollout_from_boundary(
         GameNode::Chance { next_street: _, child } => {
             let child = *child;
             let deck = remaining_deck(hero_hand, opponent_hand, board);
-            // Deck size is at most 48 (< u32::MAX), so truncation is safe.
             #[allow(clippy::cast_possible_truncation)]
             let deck_len = deck.len() as u32;
             let n = ctx.num_rollouts.min(deck_len);
@@ -214,8 +234,9 @@ pub fn rollout_from_boundary(
                 let card = deck[idx];
                 let mut new_board = board.to_vec();
                 new_board.push(card);
-                let child_ev = rollout_from_boundary(
+                let child_ev = rollout_inner(
                     hero_hand, opponent_hand, &new_board, ctx, child, rng,
+                    None, // invalidate cache — board changed
                 );
                 total += child_ev;
             }
