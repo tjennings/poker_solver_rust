@@ -18,7 +18,7 @@ export function blueprintToPostflopMatrix(
           combo_count: hasAction ? 1 : 0,
           ev: null,
           combos: [],
-          weight: hasAction ? 1.0 : 0.0,
+          weight: cell.weight,
         };
       }),
     ),

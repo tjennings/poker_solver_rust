@@ -12,6 +12,7 @@ function makeStrategyMatrix(overrides?: Partial<StrategyMatrix>): StrategyMatrix
         { action: 'Check', probability: 0.6 },
         { action: 'Bet 33%', probability: 0.4 },
       ],
+      weight: 0.7,
     }]],
     actions: [
       { id: 'c', label: 'Check', action_type: 'check' },
@@ -64,6 +65,7 @@ describe('blueprintToPostflopMatrix', () => {
           { action: 'Check', probability: 0 },
           { action: 'Bet 33%', probability: 0 },
         ],
+        weight: 0.0,
       }]],
     });
     const result = blueprintToPostflopMatrix(sm, ['Ah', '7d', '2c'], 0);

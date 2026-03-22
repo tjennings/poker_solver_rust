@@ -23,7 +23,7 @@ import {
 import { ActionBlock, HandCell, CellDetail, HistoryItem } from './Explorer';
 
 /** Convert postflop cell to shared MatrixCell format. */
-function toMatrixCell(cell: { hand: string; suited: boolean; pair: boolean; probabilities: number[] }, actions: ActionInfo[]): MatrixCell {
+function toMatrixCell(cell: { hand: string; suited: boolean; pair: boolean; probabilities: number[]; weight?: number }, actions: ActionInfo[]): MatrixCell {
   return {
     hand: cell.hand,
     suited: cell.suited,
@@ -32,6 +32,7 @@ function toMatrixCell(cell: { hand: string; suited: boolean; pair: boolean; prob
       action: actions[i]?.label ?? '',
       probability: p,
     })),
+    weight: cell.weight ?? 1.0,
   };
 }
 

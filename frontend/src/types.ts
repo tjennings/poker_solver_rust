@@ -30,6 +30,7 @@ export interface MatrixCell {
   suited: boolean;
   pair: boolean;
   probabilities: ActionProb[];
+  weight: number;
 }
 
 export interface ActionInfo {

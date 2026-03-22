@@ -138,6 +138,8 @@ pub struct MatrixCell {
     pub probabilities: Vec<ActionProb>,
     /// Whether this hand was filtered out by the range threshold.
     pub filtered: bool,
+    /// Reaching probability for the acting player (0.0–1.0).
+    pub weight: f32,
 }
 
 /// An action with its probability.
@@ -696,6 +698,7 @@ fn get_strategy_matrix_agent(
                 pair,
                 probabilities,
                 filtered: false,
+                weight: 1.0,
             });
         }
         cells.push(row_cells);
@@ -1117,12 +1120,21 @@ fn get_strategy_matrix_v2(
                 );
             };
 
+            // Compute reaching weight for the acting player.
+            let hand_idx = canonical_hand_index_from_ranks(rank1, rank2, suited);
+            let reach = if walk.to_act == 0 {
+                reaching_p1[hand_idx]
+            } else {
+                reaching_p2[hand_idx]
+            };
+
             row_cells.push(MatrixCell {
                 hand: hand_label,
                 suited,
                 pair,
                 probabilities,
                 filtered: false,
+                weight: reach,
             });
         }
         cells.push(row_cells);
