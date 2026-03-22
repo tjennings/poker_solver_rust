@@ -42,12 +42,17 @@ action_abstraction:
 training:
   cluster_path: "./local_data/buckets/1kbkt"
   time_limit_minutes: 7200
-  lcfr_warmup_iterations: 5000000
-  prune_after_iterations: 5000000
+  lcfr_warmup_iterations: 50000000
+  prune_after_iterations: 50000000
   prune_threshold: -10
-  lcfr_discount_interval: 1000000
+  lcfr_discount_interval: 10000000
   batch_size: 2000
   purify_threshold: 0.03
+  dcfr_epoch_cap: 40
+  dcfr_alpha: 0.80
+  dcfr_gamma: 2.0
+  dcfr_beta: 0
+
 
 snapshots:
   resume: true
