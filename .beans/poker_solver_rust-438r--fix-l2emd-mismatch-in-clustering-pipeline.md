@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-438r
 title: Fix L2/EMD mismatch in clustering pipeline
-status: todo
+status: in-progress
 type: bug
 priority: high
 created_at: 2026-03-22T13:51:11Z
-updated_at: 2026-03-22T13:51:11Z
+updated_at: 2026-03-22T13:56:05Z
 parent: poker_solver_rust-60h7
 ---
 
