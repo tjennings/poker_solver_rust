@@ -357,8 +357,8 @@ export default function Settings() {
         </label>
         <input
           type="text"
-          value={config.range_clamp_threshold ?? 0.05}
-          onChange={e => {
+          defaultValue={config.range_clamp_threshold ?? 0.05}
+          onBlur={e => {
             const v = parseFloat(e.target.value);
             if (!isNaN(v) && v >= 0 && v <= 1) setConfig({ range_clamp_threshold: v });
           }}
