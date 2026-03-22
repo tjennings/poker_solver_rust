@@ -504,13 +504,11 @@ impl CfvSubgameSolver {
                         } else {
                             -invested[traverser as usize]
                         };
-                        // One-time diagnostic: log fold payoffs on first iteration.
-                        if self.iteration <= 1 {
+                        // Diagnostic: log fold payoffs on first iteration.
+                        if self.iteration <= 1 && self.iteration > 0 {
                             eprintln!(
                                 "[fold payoff] node={node_idx} winner={winner} traverser={traverser} \
-                                 pot={pot:.1} invested={invested:?} payoff={payoff:.2} \
-                                 (old half_pot would be {:.2})",
-                                pot / 2.0
+                                 pot={pot:.1} invested={invested:?} payoff={payoff:.2}"
                             );
                         }
                         for i in 0..n {
@@ -631,11 +629,11 @@ impl CfvSubgameSolver {
                         let node_val = cfv_buf[out_start + i];
                         let opp_total = opp_reach_totals[i];
 
-                        // One-time trace for debugging: log per-action values
-                        // at the root node for specific combos on first iteration.
+                        // Trace: log per-action values at key nodes.
                         if self.iteration.is_multiple_of(10)
-                            && node_idx == self.tree.root as usize
-                            && traverser == 0 && (i == 359 || i == 651)
+                            && (i == 359 || i == 651)
+                            && (node_idx == self.tree.root as usize
+                                || (traverser == 1 && num_actions == 2))
                         {
                             let child_vals: Vec<f64> = (0..num_actions)
                                 .map(|a| cfv_buf[children_buf[a] as usize * n + i])
@@ -647,7 +645,7 @@ impl CfvSubgameSolver {
                                 .map(|&s| format!("{:.0}%", s * 100.0))
                                 .collect();
                             eprintln!(
-                                "[TRACE] iter={} combo={i} strat=[{}] node_val={node_val:.2} child_vals={:?}",
+                                "[TRACE] iter={} t={traverser} node={node_idx} combo={i} strat=[{}] node_val={node_val:.2} child_vals={:?}",
                                 self.iteration, strat_str.join(","), child_vals
                             );
                         }
