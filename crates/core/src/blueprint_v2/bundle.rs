@@ -203,6 +203,33 @@ impl BlueprintV2Strategy {
             node_offsets: Vec::new(),
         }
     }
+
+    /// Create a strategy with explicit action probabilities for testing.
+    ///
+    /// Computes the internal `node_offsets` table from the provided fields.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_parts(
+        action_probs: Vec<f32>,
+        node_action_counts: Vec<u16>,
+        node_street_indices: Vec<u8>,
+        bucket_counts: [u16; 4],
+    ) -> Self {
+        let node_offsets = compute_node_offsets(
+            &node_action_counts,
+            &node_street_indices,
+            bucket_counts,
+        );
+        Self {
+            action_probs,
+            node_action_counts,
+            node_street_indices,
+            bucket_counts,
+            iterations: 0,
+            elapsed_minutes: 0,
+            node_offsets,
+        }
+    }
 }
 
 /// Build a prefix-sum offset table so `get_action_probs` is O(1).
