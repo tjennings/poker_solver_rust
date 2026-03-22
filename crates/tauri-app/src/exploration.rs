@@ -616,11 +616,13 @@ pub fn blueprint_sizes_to_range_solver(depths: &[Vec<f64>]) -> (String, String) 
 /// `threshold` filters out hands whose prior action probabilities fell below
 /// this value (range narrowing).  `street_histories` supplies the action
 /// sequences of all completed streets so the filter can replay the game.
+/// `postflop_state` provides CbvContext for real postflop bucket lookups.
 pub fn get_strategy_matrix_core(
     state: &ExplorationState,
     position: ExplorationPosition,
     _threshold: Option<f32>,
     _street_histories: Option<Vec<Vec<String>>>,
+    postflop_state: Option<&crate::postflop::PostflopState>,
 ) -> Result<StrategyMatrix, String> {
     let source_guard = state.source.read();
     let source = source_guard
@@ -635,7 +637,13 @@ pub fn get_strategy_matrix_core(
             tree,
             decision_map,
             ..
-        } => get_strategy_matrix_v2(config, strategy, tree, decision_map, &position),
+        } => {
+            let cbv_guard = postflop_state.map(|ps| ps.cbv_context.read());
+            let cbv_ref = cbv_guard
+                .as_ref()
+                .and_then(|g| g.as_deref());
+            get_strategy_matrix_v2(config, strategy, tree, decision_map, &position, cbv_ref)
+        }
     }
 }
 
@@ -643,11 +651,12 @@ pub fn get_strategy_matrix_core(
 #[tauri::command(rename_all = "snake_case")]
 pub fn get_strategy_matrix(
     state: State<'_, ExplorationState>,
+    postflop_state: State<'_, Arc<crate::postflop::PostflopState>>,
     position: ExplorationPosition,
     threshold: Option<f32>,
     street_histories: Option<Vec<Vec<String>>>,
 ) -> Result<StrategyMatrix, String> {
-    get_strategy_matrix_core(&state, position, threshold, street_histories)
+    get_strategy_matrix_core(&state, position, threshold, street_histories, Some(&postflop_state))
 }
 
 fn get_strategy_matrix_agent(
@@ -910,11 +919,13 @@ fn get_strategy_matrix_v2(
     tree: &V2GameTree,
     decision_map: &[u32],
     position: &ExplorationPosition,
+    cbv_context: Option<&crate::postflop::CbvContext>,
 ) -> Result<StrategyMatrix, String> {
     // Compute reaching probabilities by replaying the history step-by-step.
     let mut reaching_p1 = vec![1.0_f32; 169];
     let mut reaching_p2 = vec![1.0_f32; 169];
     let num_buckets_preflop = strategy.bucket_counts[0] as usize;
+    let board_cards = parse_board(&position.board).ok();
 
     {
         let mut node_idx = tree.root;
@@ -925,7 +936,8 @@ fn get_strategy_matrix_v2(
             }
 
             if let V2GameNode::Decision {
-                player, actions, children, ..
+                player, actions, children, street,
+                ..
             } = &tree.nodes[node_idx as usize]
             {
                 let dec_idx = decision_map
@@ -942,17 +954,38 @@ fn get_strategy_matrix_v2(
                             &mut reaching_p2
                         };
 
-                        for (hand_idx, r) in reach.iter_mut().enumerate() {
-                            let bucket = if num_buckets_preflop == 169 {
-                                hand_idx as u16
-                            } else {
-                                (hand_idx % num_buckets_preflop) as u16
-                            };
-                            let probs =
-                                strategy.get_action_probs(dec_idx as usize, bucket);
-                            let p = probs.get(action_pos).copied().unwrap_or(0.0);
-                            *r *= p;
+                        let is_preflop_node = *street == Street::Preflop;
+
+                        if is_preflop_node {
+                            // Preflop: canonical hand index maps to bucket.
+                            for (hand_idx, r) in reach.iter_mut().enumerate() {
+                                let bucket = if num_buckets_preflop == 169 {
+                                    hand_idx as u16
+                                } else {
+                                    (hand_idx % num_buckets_preflop) as u16
+                                };
+                                let probs =
+                                    strategy.get_action_probs(dec_idx as usize, bucket);
+                                let p = probs.get(action_pos).copied().unwrap_or(0.0);
+                                *r *= p;
+                            }
+                        } else if let (Some(ctx), Some(board)) = (cbv_context, board_cards.as_ref()) {
+                            // Postflop with bucket data: for each canonical hand,
+                            // enumerate combos, look up each combo's bucket,
+                            // get the action probability, and average.
+                            for (hand_idx, r) in reach.iter_mut().enumerate() {
+                                if let Some(hand) = CanonicalHand::from_index(hand_idx) {
+                                    let avg_p = avg_action_prob_for_hand(
+                                        &hand, board, *street,
+                                        &ctx.all_buckets, &ctx.strategy,
+                                        dec_idx as usize, action_pos,
+                                    );
+                                    *r *= avg_p;
+                                }
+                            }
                         }
+                        // If postflop without CbvContext, leave reaching probs
+                        // unchanged (assume uniform reach).
 
                         node_idx = children[action_pos];
                     }
@@ -997,9 +1030,16 @@ fn get_strategy_matrix_v2(
     };
 
     let is_preflop = street_name == "Preflop";
+    let street_enum = match &tree.nodes[walk.node_idx as usize] {
+        V2GameNode::Decision { street, .. } => *street,
+        _ => Street::Preflop,
+    };
     let num_buckets = strategy.bucket_counts[
         strategy.node_street_indices[decision_idx as usize] as usize
     ] as usize;
+
+    // Parse board cards once for postflop bucket lookups.
+    let board = if !is_preflop { parse_board(&position.board).ok() } else { None };
 
     let ranks = RANKS;
     let mut cells = Vec::with_capacity(13);
@@ -1027,9 +1067,16 @@ fn get_strategy_matrix_v2(
                         probability: p,
                     })
                     .collect()
+            } else if let (Some(ctx), Some(board)) = (cbv_context, board.as_ref()) {
+                // Postflop with bucket data: enumerate combos, look up buckets,
+                // average strategy probabilities.
+                postflop_cell_probs(
+                    rank1, rank2, suited, board, street_enum,
+                    &ctx.all_buckets, &ctx.strategy, decision_idx as usize,
+                    &actions,
+                )
             } else {
-                // Postflop: bucket assignment requires cluster data which
-                // is not yet loaded. Return uniform distribution.
+                // Postflop without bucket data: return uniform distribution.
                 let n = actions.len();
                 let uniform = 1.0 / n as f32;
                 actions
@@ -1083,6 +1130,107 @@ fn canonical_hand_index_from_ranks(rank1: char, rank2: char, suited: bool) -> us
     let v2 = char_to_value(rank2);
     let canonical = CanonicalHand::new(v1, v2, suited);
     canonical.index()
+}
+
+/// Compute postflop action probabilities for a single 13x13 cell by
+/// enumerating all specific Card combos, filtering board blockers,
+/// looking up each combo's bucket, querying the strategy, and averaging.
+#[allow(clippy::too_many_arguments)]
+fn postflop_cell_probs(
+    rank1: char,
+    rank2: char,
+    suited: bool,
+    board: &[Card],
+    street: Street,
+    all_buckets: &AllBuckets,
+    strategy: &BlueprintV2Strategy,
+    decision_idx: usize,
+    actions: &[ActionInfo],
+) -> Vec<ActionProb> {
+    let v1 = char_to_value(rank1);
+    let v2 = char_to_value(rank2);
+    let canonical = CanonicalHand::new(v1, v2, suited);
+    let combos = canonical.combos();
+
+    let num_actions = actions.len();
+    let mut sum_probs = vec![0.0_f32; num_actions];
+    let mut count = 0u32;
+
+    let board_set: std::collections::HashSet<Card> = board.iter().copied().collect();
+
+    for (c1, c2) in &combos {
+        // Skip combos blocked by board cards.
+        if board_set.contains(c1) || board_set.contains(c2) {
+            continue;
+        }
+
+        let bucket = all_buckets.get_bucket(street, [*c1, *c2], board);
+        let probs = strategy.get_action_probs(decision_idx, bucket);
+
+        for (i, &p) in probs.iter().enumerate().take(num_actions) {
+            sum_probs[i] += p;
+        }
+        count += 1;
+    }
+
+    if count == 0 {
+        // All combos blocked — return uniform as fallback.
+        let uniform = 1.0 / num_actions as f32;
+        return actions
+            .iter()
+            .map(|a| ActionProb {
+                action: a.label.clone(),
+                probability: uniform,
+            })
+            .collect();
+    }
+
+    actions
+        .iter()
+        .enumerate()
+        .map(|(i, a)| ActionProb {
+            action: a.label.clone(),
+            probability: sum_probs[i] / count as f32,
+        })
+        .collect()
+}
+
+/// Compute the average probability of a specific action for a canonical hand
+/// at a postflop decision node. Enumerates all combos, filters board blockers,
+/// looks up each combo's bucket, and averages the action probability.
+fn avg_action_prob_for_hand(
+    hand: &CanonicalHand,
+    board: &[Card],
+    street: Street,
+    all_buckets: &AllBuckets,
+    strategy: &BlueprintV2Strategy,
+    decision_idx: usize,
+    action_pos: usize,
+) -> f32 {
+    let combos = hand.combos();
+    let board_set: std::collections::HashSet<Card> = board.iter().copied().collect();
+
+    let mut sum = 0.0_f32;
+    let mut count = 0u32;
+
+    for (c1, c2) in &combos {
+        if board_set.contains(c1) || board_set.contains(c2) {
+            continue;
+        }
+
+        let bucket = all_buckets.get_bucket(street, [*c1, *c2], board);
+        let probs = strategy.get_action_probs(decision_idx, bucket);
+        let p = probs.get(action_pos).copied().unwrap_or(0.0);
+        sum += p;
+        count += 1;
+    }
+
+    if count == 0 {
+        // All combos blocked — return 0 (won't contribute to reach).
+        return 0.0;
+    }
+
+    sum / count as f32
 }
 
 /// Get available actions at the current position (core logic, no Tauri dependency).
@@ -2448,5 +2596,460 @@ mod tests {
     fn format_bet_sizes_empty() {
         let result = format_bet_sizes(&[]);
         assert_eq!(result, "e");
+    }
+
+    // -------------------------------------------------------------------
+    // Postflop strategy matrix tests
+    // -------------------------------------------------------------------
+
+    /// Build a minimal V2 game tree with one preflop decision node (node 0)
+    /// and one flop decision node (node 2, after chance node 1).
+    /// The preflop node has 2 actions (fold, call) leading to terminal and chance.
+    /// The flop node has 2 actions (check, bet) leading to terminals.
+    fn build_minimal_postflop_tree() -> V2GameTree {
+        let nodes = vec![
+            // Node 0: preflop decision (player 0, SB)
+            V2GameNode::Decision {
+                player: 0,
+                street: Street::Preflop,
+                actions: vec![TreeAction::Fold, TreeAction::Call],
+                children: vec![3, 1], // fold -> terminal, call -> chance
+            },
+            // Node 1: chance node (flop deal)
+            V2GameNode::Chance {
+                next_street: Street::Flop,
+                child: 2,
+            },
+            // Node 2: flop decision (player 1, BB)
+            V2GameNode::Decision {
+                player: 1,
+                street: Street::Flop,
+                actions: vec![TreeAction::Check, TreeAction::Bet(2.0)],
+                children: vec![4, 5],
+            },
+            // Node 3: terminal (fold)
+            V2GameNode::Terminal {
+                kind: poker_solver_core::blueprint_v2::game_tree::TerminalKind::Fold { winner: 1 },
+                pot: 1.5,
+                invested: [0.5, 1.0],
+            },
+            // Node 4: terminal (check through)
+            V2GameNode::Terminal {
+                kind: poker_solver_core::blueprint_v2::game_tree::TerminalKind::Showdown,
+                pot: 2.0,
+                invested: [1.0, 1.0],
+            },
+            // Node 5: terminal (bet, then fold assumed)
+            V2GameNode::Terminal {
+                kind: poker_solver_core::blueprint_v2::game_tree::TerminalKind::Fold { winner: 1 },
+                pot: 4.0,
+                invested: [1.0, 1.0],
+            },
+        ];
+        V2GameTree {
+            nodes,
+            root: 0,
+            blinds: [0.5, 1.0],
+        }
+    }
+
+    /// Build a matching strategy for the minimal postflop tree.
+    /// 2 decision nodes: node 0 (preflop, 2 actions) and node 2 (flop, 2 actions).
+    /// decision_map: node 0 -> decision 0, node 2 -> decision 1.
+    fn build_minimal_postflop_strategy() -> (BlueprintV2Strategy, Vec<u32>) {
+        // bucket_counts: preflop=169, flop=10, turn=10, river=10
+        let bucket_counts: [u16; 4] = [169, 10, 10, 10];
+
+        // Decision 0: preflop, 2 actions, 169 buckets -> 169*2 = 338 probs
+        // Decision 1: flop, 2 actions, 10 buckets -> 10*2 = 20 probs
+        let mut action_probs = Vec::new();
+        // Preflop: fold=0.3, call=0.7 for all buckets
+        for _ in 0..169 {
+            action_probs.push(0.3);
+            action_probs.push(0.7);
+        }
+        // Flop: check=0.6, bet=0.4 for all buckets
+        for _ in 0..10 {
+            action_probs.push(0.6);
+            action_probs.push(0.4);
+        }
+
+        let node_action_counts = vec![2u16, 2u16];
+        let node_street_indices = vec![0u8, 1u8]; // preflop=0, flop=1
+
+        // Build via serde_json -> save -> load roundtrip to populate private node_offsets
+        let json = serde_json::json!({
+            "action_probs": action_probs,
+            "node_action_counts": node_action_counts,
+            "node_street_indices": node_street_indices,
+            "bucket_counts": bucket_counts,
+            "iterations": 100u64,
+            "elapsed_minutes": 1u64,
+        });
+        let strat_raw: BlueprintV2Strategy = serde_json::from_value(json).expect("from_value");
+        let tmp = std::env::temp_dir().join(format!(
+            "test_strategy_postflop_{:?}.bin",
+            std::thread::current().id()
+        ));
+        strat_raw.save(&tmp).expect("save");
+        let strat = BlueprintV2Strategy::load(&tmp).expect("load");
+        let _ = std::fs::remove_file(&tmp);
+
+        // decision_map: 6 nodes, node 0 -> decision 0, node 2 -> decision 1, rest -> MAX
+        let decision_map = vec![0, u32::MAX, 1, u32::MAX, u32::MAX, u32::MAX];
+
+        (strat, decision_map)
+    }
+
+    fn build_minimal_config() -> BlueprintV2Config {
+        use poker_solver_core::blueprint_v2::config::*;
+        BlueprintV2Config {
+            game: GameConfig {
+                name: "test".to_string(),
+                players: 2,
+                stack_depth: 100.0,
+                small_blind: 0.5,
+                big_blind: 1.0,
+                rake_rate: 0.0,
+                rake_cap: 0.0,
+            },
+            clustering: ClusteringConfig {
+                algorithm: ClusteringAlgorithm::default(),
+                preflop: StreetClusterConfig { buckets: 169, delta_bins: None, expected_delta: false, sample_boards: None },
+                flop: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
+                turn: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
+                river: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
+                seed: 42,
+                kmeans_iterations: 10,
+                cfvnet_river_data: None,
+                per_flop: None,
+            },
+            action_abstraction: ActionAbstractionConfig {
+                preflop: vec![vec!["2.5bb".to_string()]],
+                flop: vec![vec![0.5]],
+                turn: vec![vec![0.5]],
+                river: vec![vec![0.5]],
+            },
+            training: TrainingConfig {
+                cluster_path: None,
+                iterations: Some(100),
+                time_limit_minutes: None,
+                lcfr_warmup_iterations: 0,
+                lcfr_discount_interval: 1,
+                prune_after_iterations: 0,
+                prune_threshold: -250,
+                prune_explore_pct: 0.05,
+                print_every_minutes: 10,
+                batch_size: 200,
+                dcfr_alpha: 1.5,
+                dcfr_beta: 0.5,
+                dcfr_gamma: 2.0,
+                target_strategy_delta: None,
+                purify_threshold: 0.0,
+                equity_cache_path: None,
+            },
+            snapshots: SnapshotConfig {
+                warmup_minutes: 1,
+                snapshot_every_minutes: 10,
+                output_dir: "/tmp".to_string(),
+                resume: false,
+                max_snapshots: None,
+            },
+        }
+    }
+
+    /// Build a CbvContext with the same strategy and tree, and AllBuckets
+    /// using equity-based fallback (no bucket files).
+    fn build_test_cbv_context(
+        strategy: &BlueprintV2Strategy,
+        tree: &V2GameTree,
+    ) -> crate::postflop::CbvContext {
+        let bucket_counts = strategy.bucket_counts;
+        let all_buckets = AllBuckets::new(bucket_counts, [None, None, None, None]);
+
+        // Build via serde_json -> save -> load roundtrip
+        let json = serde_json::json!({
+            "action_probs": strategy.action_probs,
+            "node_action_counts": strategy.node_action_counts,
+            "node_street_indices": strategy.node_street_indices,
+            "bucket_counts": strategy.bucket_counts,
+            "iterations": strategy.iterations,
+            "elapsed_minutes": strategy.elapsed_minutes,
+        });
+        let strat_raw: BlueprintV2Strategy = serde_json::from_value(json).expect("from_value");
+        let tmp = std::env::temp_dir().join(format!(
+            "test_cbv_strategy_{:?}.bin",
+            std::thread::current().id()
+        ));
+        strat_raw.save(&tmp).expect("save");
+        let cbv_strategy = BlueprintV2Strategy::load(&tmp).expect("load");
+        let _ = std::fs::remove_file(&tmp);
+
+        crate::postflop::CbvContext {
+            cbv_table: CbvTable { values: vec![], node_offsets: vec![], buckets_per_node: vec![] },
+            abstract_tree: tree.clone(),
+            all_buckets: Arc::new(all_buckets),
+            strategy: Arc::new(cbv_strategy),
+        }
+    }
+
+    #[timed_test]
+    fn v2_postflop_with_none_cbv_context_returns_uniform() {
+        let tree = build_minimal_postflop_tree();
+        let (strategy, decision_map) = build_minimal_postflop_strategy();
+        let config = build_minimal_config();
+
+        // Position at the flop decision node: history = ["1"] (call = action index 1)
+        let position = ExplorationPosition {
+            board: vec!["As".into(), "Kh".into(), "7d".into()],
+            history: vec!["1".to_string()],
+            pot: 4,
+            stacks: vec![198, 198],
+            to_act: 1,
+            num_players: 2,
+            active_players: vec![true, true],
+        };
+
+        let result = get_strategy_matrix_v2(
+            &config,
+            &strategy,
+            &tree,
+            &decision_map,
+            &position,
+            None, // no cbv_context
+        );
+
+        let matrix = result.expect("should succeed");
+        assert_eq!(matrix.street, "Flop");
+
+        // With no CbvContext, postflop should return uniform (0.5, 0.5)
+        for row in &matrix.cells {
+            for cell in row {
+                assert_eq!(cell.probabilities.len(), 2);
+                for prob in &cell.probabilities {
+                    assert!(
+                        (prob.probability - 0.5).abs() < 0.01,
+                        "Expected uniform 0.5, got {} for hand {}",
+                        prob.probability,
+                        cell.hand
+                    );
+                }
+            }
+        }
+    }
+
+    #[timed_test]
+    fn get_strategy_matrix_core_accepts_postflop_state() {
+        let state = ExplorationState::default();
+        let postflop_state = crate::postflop::PostflopState::default();
+
+        let position = ExplorationPosition::default();
+        // No bundle loaded, should return an error
+        let result = get_strategy_matrix_core(
+            &state,
+            position,
+            None,
+            None,
+            Some(&postflop_state),
+        );
+        assert!(result.is_err(), "Should fail because no bundle is loaded");
+    }
+
+    #[timed_test]
+    fn postflop_cell_probs_all_blocked_returns_uniform() {
+        let (strategy, _) = build_minimal_postflop_strategy();
+        let all_buckets = AllBuckets::new([169, 10, 10, 10], [None, None, None, None]);
+        let actions = vec![
+            ActionInfo { id: "0".into(), label: "Check".into(), action_type: "check".into(), size_key: None },
+            ActionInfo { id: "1".into(), label: "Bet".into(), action_type: "bet".into(), size_key: None },
+        ];
+
+        // Board contains all 4 aces — any AA combo is fully blocked
+        let board = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::Ace, Suit::Diamond),
+            Card::new(Value::Ace, Suit::Club),
+            Card::new(Value::King, Suit::Spade),
+        ];
+
+        let probs = postflop_cell_probs(
+            'A', 'A', false, &board, Street::River,
+            &all_buckets, &strategy, 1, // decision_idx 1 = flop node
+            &actions,
+        );
+
+        // All AA combos blocked by board, should get uniform
+        assert_eq!(probs.len(), 2);
+        assert!((probs[0].probability - 0.5).abs() < 0.01, "expected uniform, got {}", probs[0].probability);
+        assert!((probs[1].probability - 0.5).abs() < 0.01, "expected uniform, got {}", probs[1].probability);
+    }
+
+    #[timed_test]
+    #[ignore] // Requires bucket files loaded; run with --ignored when real data available
+    fn v2_postflop_with_cbv_context_returns_strategy_probs() {
+        let tree = build_minimal_postflop_tree();
+        let (strategy, decision_map) = build_minimal_postflop_strategy();
+        let config = build_minimal_config();
+        let ctx = build_test_cbv_context(&strategy, &tree);
+
+        // Position at the flop decision node: history = ["1"] (call = action index 1)
+        let position = ExplorationPosition {
+            board: vec!["As".into(), "Kh".into(), "7d".into()],
+            history: vec!["1".to_string()],
+            pot: 4,
+            stacks: vec![198, 198],
+            to_act: 1,
+            num_players: 2,
+            active_players: vec![true, true],
+        };
+
+        let result = get_strategy_matrix_v2(
+            &config,
+            &strategy,
+            &tree,
+            &decision_map,
+            &position,
+            Some(&ctx),
+        );
+
+        let matrix = result.expect("should succeed");
+        assert_eq!(matrix.street, "Flop");
+
+        // With CbvContext, postflop should return strategy probs (0.6/0.4),
+        // not uniform (0.5/0.5). Since the strategy has check=0.6, bet=0.4
+        // for all buckets, every cell should show approximately those values.
+        let mut found_non_uniform = false;
+        for row in &matrix.cells {
+            for cell in row {
+                assert_eq!(cell.probabilities.len(), 2, "should have 2 actions");
+                // Check that at least some cells differ from 0.5
+                let p0 = cell.probabilities[0].probability;
+                if (p0 - 0.5).abs() > 0.01 {
+                    found_non_uniform = true;
+                }
+            }
+        }
+        assert!(
+            found_non_uniform,
+            "Expected at least some cells to have non-uniform probabilities \
+             when CbvContext is provided"
+        );
+    }
+
+    #[timed_test]
+    fn v2_preflop_still_works_with_new_signature() {
+        let tree = build_minimal_postflop_tree();
+        let (strategy, decision_map) = build_minimal_postflop_strategy();
+        let config = build_minimal_config();
+
+        // Position at preflop decision node: empty history
+        let position = ExplorationPosition {
+            board: vec![],
+            history: vec![],
+            pot: 3,
+            stacks: vec![199, 198],
+            to_act: 0,
+            num_players: 2,
+            active_players: vec![true, true],
+        };
+
+        let result = get_strategy_matrix_v2(
+            &config,
+            &strategy,
+            &tree,
+            &decision_map,
+            &position,
+            None,
+        );
+
+        let matrix = result.expect("should succeed");
+        assert_eq!(matrix.street, "Preflop");
+
+        // Preflop should return the strategy probs (0.3/0.7), not uniform
+        for row in &matrix.cells {
+            for cell in row {
+                assert_eq!(cell.probabilities.len(), 2);
+                let p0 = cell.probabilities[0].probability;
+                let p1 = cell.probabilities[1].probability;
+                assert!(
+                    (p0 - 0.3).abs() < 0.01,
+                    "Expected fold=0.3, got {} for hand {}",
+                    p0, cell.hand
+                );
+                assert!(
+                    (p1 - 0.7).abs() < 0.01,
+                    "Expected call=0.7, got {} for hand {}",
+                    p1, cell.hand
+                );
+            }
+        }
+    }
+
+    #[timed_test]
+    fn avg_action_prob_all_blocked_returns_zero() {
+        let (strategy, _) = build_minimal_postflop_strategy();
+        let all_buckets = AllBuckets::new([169, 10, 10, 10], [None, None, None, None]);
+
+        // Board contains all 4 aces — AA is fully blocked
+        let board = vec![
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::Ace, Suit::Diamond),
+            Card::new(Value::Ace, Suit::Club),
+            Card::new(Value::King, Suit::Spade),
+        ];
+
+        let hand = CanonicalHand::new(Value::Ace, Value::Ace, false);
+        let p = avg_action_prob_for_hand(
+            &hand, &board, Street::River,
+            &all_buckets, &strategy, 1, 0,
+        );
+
+        assert!(p.abs() < f32::EPSILON, "Expected 0.0 for fully blocked hand, got {p}");
+    }
+
+    #[timed_test]
+    fn v2_postflop_reaching_probs_preflop_only_still_computed() {
+        let tree = build_minimal_postflop_tree();
+        let (strategy, decision_map) = build_minimal_postflop_strategy();
+        let config = build_minimal_config();
+
+        // Navigate to flop (through preflop call). The preflop reaching
+        // probs should reflect the call action (0.7 for all hands).
+        let position = ExplorationPosition {
+            board: vec!["Ts".into(), "9h".into(), "2d".into()],
+            history: vec!["1".to_string()], // call
+            pot: 4,
+            stacks: vec![198, 198],
+            to_act: 1,
+            num_players: 2,
+            active_players: vec![true, true],
+        };
+
+        let result = get_strategy_matrix_v2(
+            &config,
+            &strategy,
+            &tree,
+            &decision_map,
+            &position,
+            None,
+        );
+
+        let matrix = result.expect("should succeed");
+        // Player 0 (SB) called preflop with prob 0.7 for all hands.
+        for &r in &matrix.reaching_p1 {
+            assert!(
+                (r - 0.7).abs() < 0.01,
+                "Expected reaching prob 0.7 after call, got {r}"
+            );
+        }
+        // Player 1 (BB) didn't act yet, reaching should be 1.0.
+        for &r in &matrix.reaching_p2 {
+            assert!(
+                (r - 1.0).abs() < 0.01,
+                "Expected reaching prob 1.0, got {r}"
+            );
+        }
     }
 }
