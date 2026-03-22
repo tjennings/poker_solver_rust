@@ -563,12 +563,12 @@ impl CfvSubgameSolver {
                 let half_pot = pot / 2.0;
                 match kind {
                     TerminalKind::Fold { winner } => {
-                        // Correct asymmetric payoff: winner gains pot minus
-                        // their own investment; loser loses their investment.
+                        // Fold EV is always 0 for the folder — sunk costs
+                        // are sunk. Winner gains pot minus own investment.
                         let payoff = if winner == traverser {
                             pot - invested[traverser as usize]
                         } else {
-                            -invested[traverser as usize]
+                            0.0
                         };
                         // Diagnostic: log fold payoffs on first iteration.
                         if self.iteration <= 1 && self.iteration > 0 {
@@ -832,11 +832,7 @@ impl CfvSubgameSolver {
                                 &requests,
                             );
                             for (b_idx, cfvs) in batch.into_iter().enumerate() {
-                                // Clamp: pot-fraction CFV can never be negative.
-                                // The player can always fold for 0 EV.
-                                self.leaf_cfvs[b_idx] = cfvs.into_iter()
-                                    .map(|v| v.max(0.0))
-                                    .collect();
+                                self.leaf_cfvs[b_idx] = cfvs;
                             }
 
                             // Scale opponent reach by choice probability for
@@ -932,11 +928,7 @@ impl CfvSubgameSolver {
                             &requests,
                         );
                         for (b_idx, cfvs) in batch.into_iter().enumerate() {
-                            // Clamp: pot-fraction CFV can never be negative.
-                            // The player can always fold for 0 EV.
-                            self.leaf_cfvs[b_idx] = cfvs.into_iter()
-                                .map(|v| v.max(0.0))
-                                .collect();
+                            self.leaf_cfvs[b_idx] = cfvs;
                         }
                         if traverser == 0
                             && (self.iteration == 1
