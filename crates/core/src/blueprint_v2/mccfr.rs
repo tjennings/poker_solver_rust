@@ -606,6 +606,17 @@ fn terminal_value(
     }
 }
 
+/// Assert that a CFV is within valid bounds for the game.
+/// The maximum a player can win is the opponent's starting stack
+/// (stack_depth in BB). The maximum they can lose is their own stack.
+#[inline]
+pub fn assert_cfv_bounds(cfv: f64, stack_depth: f64, context: &str) {
+    assert!(
+        cfv.abs() <= stack_depth * 1.01,
+        "CFV {cfv:.1} exceeds stack depth {stack_depth:.1} — {context}",
+    );
+}
+
 /// Traverser's decision node: explore all actions, update regrets and
 /// strategy sums.
 #[allow(clippy::too_many_arguments)]
