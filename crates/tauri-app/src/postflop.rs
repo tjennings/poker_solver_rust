@@ -1622,6 +1622,52 @@ fn solve_depth_limited(
                     }
                 }
 
+                // Targeted diagnostic for suited connector debugging.
+                {
+                    let target_names = ["7s6s", "6s7s", "6s5s", "5s6s", "5s4s", "4s5s",
+                                        "7h6h", "6h7h", "6h5h", "5h6h", "5h4h", "4h5h",
+                                        "7d6d", "6d7d", "7c6c", "6c7c"];
+                    let labels: Vec<&str> = action_infos.iter().map(|a| a.label.as_str()).collect();
+                    let cfvs_oop = solver.root_cfvs(0);
+
+                    eprintln!("\n[SC DEBUG] === Suited Connector Deep Dive ===");
+                    for combo_idx in 0..hands.combos.len() {
+                        let c = hands.combos[combo_idx];
+                        let name = format!("{}{}", c[0], c[1]);
+                        if !target_names.iter().any(|t| *t == name) { continue; }
+
+                        let reach_id0 = rs_poker_card_to_id(c[0]);
+                        let reach_id1 = rs_poker_card_to_id(c[1]);
+                        let ci = card_pair_to_index(reach_id0, reach_id1);
+                        let hero_reach = oop_w[ci];
+                        if hero_reach <= 0.0 { continue; }
+
+                        let probs = strategy.root_probs(combo_idx);
+                        let regrets = solver.root_regrets(combo_idx);
+                        let strat_sums = solver.root_strategy_sums(combo_idx);
+
+                        let probs_str: Vec<String> = probs.iter()
+                            .zip(labels.iter())
+                            .map(|(p, l)| format!("{l}={:.1}%", p * 100.0))
+                            .collect();
+                        let regret_str: Vec<String> = regrets.iter()
+                            .zip(labels.iter())
+                            .map(|(r, l)| format!("{l}={r:.1}"))
+                            .collect();
+                        let ssum_str: Vec<String> = strat_sums.iter()
+                            .zip(labels.iter())
+                            .map(|(s, l)| format!("{l}={s:.1}"))
+                            .collect();
+
+                        eprintln!("[SC DEBUG] {name} (combo {combo_idx}, reach={hero_reach:.3}):");
+                        eprintln!("  strategy:  {}", probs_str.join("  "));
+                        eprintln!("  regrets:   {}", regret_str.join("  "));
+                        eprintln!("  strt_sums: {}", ssum_str.join("  "));
+                        eprintln!("  root CFV:  {:.3}", cfvs_oop[combo_idx]);
+                    }
+                    eprintln!("[SC DEBUG] === End Suited Connector Dive ===\n");
+                }
+
                 // Log final choice node mix if using multi-valued evaluation.
                 if solver.choice_regrets().len() > 1 {
                     let choice_mix = solver.choice_strategy();
