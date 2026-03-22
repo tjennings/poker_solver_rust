@@ -669,7 +669,6 @@ impl CfvSubgameSolver {
             } else {
                 self.iteration == 1
                     || self.iteration % leaf_eval_interval == 0
-                    || iter_idx == iterations - 1
             };
 
             // Propagate ranges once (shared between both traversers).
