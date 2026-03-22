@@ -1864,6 +1864,33 @@ mod tests {
     }
 
     #[test]
+    fn elkan_emd_centroids_are_normalized_f64() {
+        // Verify centroids are normalized probability distributions (sum to 1.0)
+        // This is the contract needed by cluster_histogram_exhaustive which
+        // previously converted f32 centroids to f64 and manually normalized.
+        let data = vec![
+            vec![36u8, 4, 0, 0],
+            vec![30, 10, 0, 0],
+            vec![0, 0, 4, 36],
+            vec![0, 0, 10, 30],
+        ];
+        let weights = vec![1.0; 4];
+        let (_labels, centroids) =
+            elkan_emd_weighted_u8(&data, &weights, 2, 20, 42, |_, _| {});
+
+        assert_eq!(centroids.len(), 2);
+        for c in &centroids {
+            let sum: f64 = c.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-10,
+                "centroid not normalized: sum={sum}"
+            );
+            // All values should be non-negative
+            assert!(c.iter().all(|&v| v >= 0.0), "negative centroid value");
+        }
+    }
+
+    #[test]
     fn elkan_emd_weighted_nonuniform() {
         // Heavy weight on first cluster should not change assignments
         // for well-separated data, but centroids should reflect weights.
