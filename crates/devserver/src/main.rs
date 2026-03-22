@@ -175,6 +175,7 @@ async fn handle_load_blueprint_v2(
 
 async fn handle_get_strategy_matrix(
     AxumState(state): AxumState<AppState>,
+    Extension(postflop): Extension<Arc<PostflopState>>,
     Json(params): Json<StrategyMatrixParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     result_to_response(poker_solver_tauri::get_strategy_matrix_core(
@@ -182,6 +183,7 @@ async fn handle_get_strategy_matrix(
         params.position,
         params.threshold,
         params.street_histories,
+        Some(&postflop),
     ))
 }
 

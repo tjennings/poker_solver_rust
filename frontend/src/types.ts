@@ -46,6 +46,7 @@ export interface StrategyMatrix {
   pot: number;
   stack: number;
   to_call: number;
+  to_act: number;
   stack_p1: number;
   stack_p2: number;
   reaching_p1: number[];
@@ -57,8 +58,6 @@ export interface ExplorationPosition {
   history: string[];
   pot: number;
   stacks: number[];
-  stack_p1: number;
-  stack_p2: number;
   to_act: number;
   num_players: number;
   active_players: boolean[];

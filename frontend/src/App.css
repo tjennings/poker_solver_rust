@@ -609,6 +609,19 @@ button:disabled {
 .action-block.solve-block.solving .solve-label {
   color: #dc2626;
 }
+.action-block.solve-block.solved {
+  background: #16a34a;
+  color: white;
+  cursor: default;
+  border-color: #16a34a;
+}
+.action-block.solve-block.solved:hover {
+  background: #16a34a;
+  border-color: #16a34a;
+}
+.action-block.solve-block.solved .solve-label {
+  color: white;
+}
 
 .action-block-header {
   display: flex;

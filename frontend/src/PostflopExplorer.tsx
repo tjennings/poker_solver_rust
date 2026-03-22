@@ -3,7 +3,6 @@ import { invoke } from './invoke';
 import {
   ActionInfo,
   BlueprintConfig,
-  CacheInfo,
   MatrixCell,
   PostflopConfig,
   PostflopConfigSummary,
@@ -11,7 +10,9 @@ import {
   PostflopProgress,
   PostflopPlayResult,
   PostflopStreetResult,
+  StrategyMatrix,
 } from './types';
+import { blueprintToPostflopMatrix } from './blueprint-utils';
 import {
   SUIT_COLORS,
   SUIT_SYMBOLS,
@@ -113,17 +114,45 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
   const [needsSolve, setNeedsSolve] = useState(false);
   // Track actions per street for close_street call
   const [streetActions, setStreetActions] = useState<number[]>([]);
-  // Cache integration
-  const [cacheInfo, setCacheInfo] = useState<CacheInfo | null>(null);
-  const [loadingCache, setLoadingCache] = useState(false);
   const blockedAtChanceRef = useRef(false);
-  const [priorStreetActions, setPriorStreetActions] = useState<number[][]>([]);
+
+  // Blueprint navigation state
+  const [blueprintMode, setBlueprintMode] = useState(false);
+  const [blueprintHistory, setBlueprintHistory] = useState<string[]>([]);
+  const [solved, setSolved] = useState(false);
+
+  /** Extract preflop action IDs from preflopHistory for ExplorationPosition. */
+  const preflopActionIds = useMemo(() => {
+    if (!preflopHistory) return [];
+    return preflopHistory
+      .filter((item): item is Extract<HistoryItem, { type: 'action' }> => item.type === 'action')
+      .map(item => item.selected);
+  }, [preflopHistory]);
 
   const boardCards = useMemo(() => {
     const trimmed = boardInput.trim();
     if (!trimmed) return [];
     return trimmed.split(/\s+/);
   }, [boardInput]);
+
+  /** Build an ExplorationPosition for the blueprint tree. */
+  const makeBlueprintPosition = useCallback((history: string[]) => ({
+    board: boardCards,
+    history: [...preflopActionIds, ...history],
+    pot: config.pot,
+    stacks: [config.effective_stack, config.effective_stack],
+    to_act: 0,
+    num_players: 2,
+    active_players: [true, true],
+  }), [boardCards, preflopActionIds, config.pot, config.effective_stack]);
+
+  /** Fetch a blueprint strategy matrix and convert it to postflop format. */
+  const fetchBlueprintMatrix = useCallback(async (history: string[]) => {
+    const sm = await invoke<StrategyMatrix>('get_strategy_matrix', {
+      position: makeBlueprintPosition(history),
+    });
+    return blueprintToPostflopMatrix(sm, boardCards, sm.to_act);
+  }, [boardCards, makeBlueprintPosition]);
 
   useEffect(() => {
     // Guard against HMR re-mounts calling postflop_set_config again,
@@ -167,41 +196,28 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     }
   }, []);
 
-  // Check cache when board changes and config is set
+  // Fetch blueprint strategy when board changes and config is set.
+  // Only triggers on board length changes (new street) or initial config — NOT on blueprint navigation.
+  // Blueprint action navigation is handled by handleBlueprintAction/handleBlueprintNavigateBack.
   useEffect(() => {
-    if (!configSummary || boardCards.length < 3 || solving || matrix) return;
+    if (!configSummary || boardCards.length < 3 || solving || solved) return;
 
     let cancelled = false;
-    const checkCache = async () => {
-      setLoadingCache(true);
-      try {
-        const info = await invoke<CacheInfo | null>('postflop_check_cache', {
-          board: boardCards,
-          prior_actions: priorStreetActions,
-        });
+    fetchBlueprintMatrix(blueprintHistory)
+      .then(m => {
         if (cancelled) return;
-        setCacheInfo(info);
-        if (info) {
-          const cachedMatrix = await invoke<PostflopStrategyMatrix>('postflop_load_cached', {
-            board: boardCards,
-            prior_actions: priorStreetActions,
-          });
-          if (cancelled) return;
-          setMatrix(cachedMatrix);
-          setSolving(false);
-          setNeedsSolve(false);
-        } else {
+        setMatrix(m);
+        setBlueprintMode(true);
+        setNeedsSolve(true);
+      })
+      .catch(e => {
+        if (!cancelled) {
+          setError(String(e));
           setNeedsSolve(true);
         }
-      } catch {
-        if (!cancelled) setNeedsSolve(true);
-      } finally {
-        if (!cancelled) setLoadingCache(false);
-      }
-    };
-    checkCache();
+      });
     return () => { cancelled = true; };
-  }, [boardCards.length, configSummary, priorStreetActions]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [boardCards.length, configSummary]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Cleanup polling on unmount
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
@@ -227,6 +243,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         if (p.matrix && !pendingNavRef.current) setMatrix(p.matrix);
         if (p.is_complete) {
           setSolving(false);
+          setSolved(true);
           if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
         }
       } catch (e) {
@@ -255,9 +272,9 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     setProgress(null);
     setError(null);
     setSolving(false);
-    setCacheInfo(null);
-    setPriorStreetActions([]);
-    setLoadingCache(false);
+    setSolved(false);
+    setBlueprintMode(false);
+    setBlueprintHistory([]);
   }, []);
 
   /** Start or cancel solve for the current board. */
@@ -267,14 +284,23 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       invoke('postflop_cancel_solve').catch(() => {});
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
       setSolving(false);
+      setSolved(false);
       setNeedsSolve(true);
+      setActionHistory([]);
+      setBlueprintHistory([]);
+      setBlueprintMode(true); // Back to blueprint mode
+      fetchBlueprintMatrix([]).then(m => setMatrix(m)).catch(() => {});
       return;
     }
     const cards = boardInput.trim().split(/\s+/);
     if (cards.length < 3) return;
     setError(null);
     setSolving(true);
+    setSolved(false);
     setNeedsSolve(false);
+    setBlueprintMode(false); // Switch to solver mode
+    setActionHistory([]); // Reset action history for solver tree
+    setBlueprintHistory([]);
     setMatrix(null);
     setProgress(null);
     initialExplRef.current = Infinity;
@@ -298,7 +324,21 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     })
       .then(() => startPolling())
       .catch((e) => { setError(String(e)); setSolving(false); });
-  }, [solving, boardInput, startPolling]);
+  }, [solving, boardInput, startPolling, fetchBlueprintMatrix]);
+
+  /** Optimistically push an action card onto the history. */
+  const pushActionCard = useCallback((actionIndex: number, selectedId?: string) => {
+    if (!matrix) return;
+    setActionHistory(prev => [...prev, {
+      selectedId: selectedId ?? String(actionIndex),
+      actionIndex,
+      position: matrix.player === 0 ? 'SB' : 'BB',
+      stack: matrix.stacks[matrix.player],
+      pot: matrix.pot,
+      actions: matrix.actions,
+      streetIndex: currentStreetIndex,
+    }]);
+  }, [matrix, currentStreetIndex]);
 
   /** Navigate the tree by clicking an action button (works during solving). */
   const handleAction = useCallback(async (actionIndex: number) => {
@@ -306,17 +346,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     setSelectedCell(null);
 
     // Optimistically add the action card and clear the matrix immediately
-    if (matrix) {
-      setActionHistory(prev => [...prev, {
-        selectedId: String(actionIndex),
-        actionIndex,
-        position: matrix.player === 0 ? 'SB' : 'BB',
-        stack: matrix.stacks[matrix.player],
-        pot: matrix.pot,
-        actions: matrix.actions,
-        streetIndex: currentStreetIndex,
-      }]);
-    }
+    pushActionCard(actionIndex);
     setStreetActions(prev => [...prev, actionIndex]);
     setMatrix(null);
     pendingNavRef.current = true;
@@ -351,7 +381,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       setStreetActions(prev => prev.slice(0, -1));
       setError(String(e));
     }
-  }, [solving, matrix, currentStreetIndex]);
+  }, [solving, pushActionCard]);
 
   /** Navigate back to a previous point by clicking a history action card. */
   const handleNavigateBack = useCallback(async (historyIndex: number) => {
@@ -401,6 +431,76 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       setError(String(e));
     }
   }, [solving, actionHistory, currentStreetIndex]);
+
+  /** Navigate the blueprint tree by clicking an action button. */
+  const handleBlueprintAction = useCallback(async (actionId: string) => {
+    if (pendingNavRef.current) return; // Guard against rapid clicks
+    pendingNavRef.current = true;
+    setError(null);
+    setSelectedCell(null);
+
+    // Find the action index for the action card display
+    const actionIndex = matrix?.actions.findIndex(a => a.id === actionId) ?? 0;
+
+    // Optimistically add action card
+    pushActionCard(actionIndex, actionId);
+    setMatrix(null);
+
+    const newHistory = [...blueprintHistory, actionId];
+    setBlueprintHistory(newHistory);
+
+    try {
+      const sm = await invoke<StrategyMatrix>('get_strategy_matrix', {
+        position: makeBlueprintPosition(newHistory),
+      });
+
+      pendingNavRef.current = false;
+
+      // Detect street transition: tree advanced past a chance node
+      const expectedStreet = boardCards.length === 3 ? 'Flop' : boardCards.length === 4 ? 'Turn' : 'River';
+      if (sm.street !== expectedStreet) {
+        // Need next card before we can show the matrix
+        setAwaitingCard(true);
+        return;
+      }
+
+      setMatrix(blueprintToPostflopMatrix(sm, boardCards, sm.to_act));
+    } catch (e) {
+      pendingNavRef.current = false;
+      if (String(e).includes('terminal')) {
+        setTerminal(true);
+      } else {
+        setBlueprintHistory(prev => prev.slice(0, -1));
+        setActionHistory(prev => prev.slice(0, -1));
+        setError(String(e));
+      }
+    }
+  }, [blueprintHistory, boardCards, makeBlueprintPosition, pushActionCard]);
+
+  /** Navigate back in blueprint mode by clicking a history action card. */
+  const handleBlueprintNavigateBack = useCallback(async (historyIndex: number) => {
+    if (pendingNavRef.current) return; // Guard against rapid clicks
+    pendingNavRef.current = true;
+    setError(null);
+    setSelectedCell(null);
+    setTerminal(false);
+    setAwaitingCard(false);
+
+    // Truncate history
+    setActionHistory(prev => prev.slice(0, historyIndex));
+    const newHistory = blueprintHistory.slice(0, historyIndex);
+    setBlueprintHistory(newHistory);
+    setMatrix(null);
+
+    try {
+      const m = await fetchBlueprintMatrix(newHistory);
+      pendingNavRef.current = false;
+      setMatrix(m);
+    } catch (e) {
+      pendingNavRef.current = false;
+      setError(String(e));
+    }
+  }, [blueprintHistory, fetchBlueprintMatrix]);
 
   return (
     <div className="explorer-root">
@@ -507,6 +607,14 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
 
           const elems: React.ReactNode[] = [];
 
+          const navigateBack = (i: number) => {
+            if (blueprintMode) {
+              handleBlueprintNavigateBack(i);
+            } else {
+              handleNavigateBack(i);
+            }
+          };
+
           // Flop (street 0) actions
           actionHistory.forEach((item, i) => {
             if (item.streetIndex !== 0) return;
@@ -518,8 +626,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
                 pot={item.pot}
                 actions={item.actions}
                 selectedAction={item.selectedId}
-                onSelect={() => handleNavigateBack(i)}
-                onHeaderClick={() => handleNavigateBack(i)}
+                onSelect={() => navigateBack(i)}
+                onHeaderClick={() => navigateBack(i)}
                 isCurrent={false}
               />
             );
@@ -538,8 +646,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
                   pot={item.pot}
                   actions={item.actions}
                   selectedAction={item.selectedId}
-                  onSelect={() => handleNavigateBack(i)}
-                  onHeaderClick={() => handleNavigateBack(i)}
+                  onSelect={() => navigateBack(i)}
+                  onHeaderClick={() => navigateBack(i)}
                   isCurrent={false}
                 />
               );
@@ -559,8 +667,8 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
                   pot={item.pot}
                   actions={item.actions}
                   selectedAction={item.selectedId}
-                  onSelect={() => handleNavigateBack(i)}
-                  onHeaderClick={() => handleNavigateBack(i)}
+                  onSelect={() => navigateBack(i)}
+                  onHeaderClick={() => navigateBack(i)}
                   isCurrent={false}
                 />
               );
@@ -577,7 +685,13 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
             stack={matrix.stacks[matrix.player]}
             pot={matrix.pot}
             actions={matrix.actions}
-            onSelect={(actionId) => handleAction(Number(actionId))}
+            onSelect={(actionId) => {
+              if (blueprintMode) {
+                handleBlueprintAction(actionId);
+              } else {
+                handleAction(Number(actionId));
+              }
+            }}
             isCurrent={true}
           />
         )}
@@ -596,9 +710,14 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         )}
 
         {/* Solve button — always rightmost in strip */}
-        {(needsSolve || solving) && (
-          <div className={`action-block solve-block ${solving ? 'solving' : ''}`} onClick={handleSolve}>
-            <span className="solve-label">{solving ? 'CANCEL' : 'SOLVE'}</span>
+        {(needsSolve || solving || solved) && (
+          <div
+            className={`action-block solve-block ${solving ? 'solving' : ''} ${solved ? 'solved' : ''}`}
+            onClick={solved ? undefined : handleSolve}
+          >
+            <span className="solve-label">
+              {solved ? 'SOLVED' : solving ? 'CANCEL' : 'SOLVE'}
+            </span>
           </div>
         )}
       </div>
@@ -615,13 +734,14 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
                 setShowFlopPicker(false);
                 setActionHistory([]);
                 setStreetActions([]);
-                setPriorStreetActions([]);
                 setMatrix(null);
                 setProgress(null);
                 setTerminal(false);
                 setAwaitingCard(false);
-                setCacheInfo(null);
-                // needsSolve will be set by cache check effect
+                setSolved(false);
+                setBlueprintMode(false);
+                setBlueprintHistory([]);
+                // Blueprint fetch will be triggered by boardCards.length change
               }}
             />
           </div>
@@ -639,18 +759,31 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
               setShowNextCardPicker(false);
               setAwaitingCard(false);
               setError(null);
-              invoke<PostflopStreetResult>('postflop_close_street', { action_history: streetActions })
-                .then(() => {
-                  const newBoard = [...boardCards, card];
-                  setBoardInput(newBoard.join(' '));
-                  setPriorStreetActions(prev => [...prev, streetActions]);
-                  setStreetActions([]);
-                  setCurrentStreetIndex(prev => prev + 1);
-                  setMatrix(null);
-                  setProgress(null);
-                  setCacheInfo(null);
-                })
-                .catch((e) => { setError(String(e)); });
+
+              if (solved) {
+                // Solved mode: use existing close_street with solver ranges
+                invoke<PostflopStreetResult>('postflop_close_street', { action_history: streetActions })
+                  .then(() => {
+                    const newBoard = [...boardCards, card];
+                    setBoardInput(newBoard.join(' '));
+                    setStreetActions([]);
+                    setCurrentStreetIndex(prev => prev + 1);
+                    setMatrix(null);
+                    setProgress(null);
+                    setSolved(false); // New street, not yet solved
+                    setNeedsSolve(true);
+                    setBlueprintMode(true); // Back to blueprint for new street
+                  })
+                  .catch((e) => { setError(String(e)); });
+              } else {
+                // Blueprint mode: update board and re-fetch blueprint strategy
+                const newBoard = [...boardCards, card];
+                setBoardInput(newBoard.join(' '));
+                setCurrentStreetIndex(prev => prev + 1);
+                setMatrix(null);
+                // blueprintHistory continues — the tree already advanced past the chance node
+                // The useEffect for boardCards change will re-fetch with the new board
+              }
             }}
           />
           </div>
@@ -685,23 +818,6 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
       })()}
 
 
-
-      {/* Cache info */}
-      {cacheInfo && matrix && !solving && (
-        <div className="cache-info">
-          Cached ({cacheInfo.iterations} iterations, {cacheInfo.exploitability.toFixed(1)}% pot)
-          <button className="re-solve-btn" onClick={() => { setCacheInfo(null); setNeedsSolve(true); setMatrix(null); }}>
-            Re-solve
-          </button>
-        </div>
-      )}
-
-      {/* Loading cache indicator */}
-      {loadingCache && !matrix && !solving && (
-        <div style={{ padding: 8, textAlign: 'center', fontSize: '0.8em', color: '#94a3b8' }}>
-          Checking cache...
-        </div>
-      )}
 
       {/* Strategy matrix */}
       {matrix && (() => {
