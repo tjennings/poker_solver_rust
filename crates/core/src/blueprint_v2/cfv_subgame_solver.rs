@@ -758,6 +758,14 @@ impl CfvSubgameSolver {
                                 self.choice_strategy_sum[eval_k] += choice_probs[eval_k];
                             }
                         }
+
+                        // Log choice node mix at intervals (second traverser only).
+                        if traverser == 1
+                            && (self.iteration.is_multiple_of(100) || iter_idx == iterations - 1)
+                        {
+                            let mix = self.choice_strategy();
+                            eprintln!("{}", Self::format_choice_mix(self.iteration, &mix));
+                        }
                     } else {
                         // K=1: original behavior, no choice node.
                         for (b_idx, &(_, pot, invested)) in
@@ -1028,6 +1036,30 @@ impl CfvSubgameSolver {
     #[must_use]
     pub fn choice_regrets(&self) -> &[f64] {
         &self.choice_regret_sum
+    }
+
+    /// Format a choice node mix log message for diagnostics.
+    ///
+    /// For K=4 evaluators, uses named labels (unbiased/fold/call/raise).
+    /// For other K, uses a generic list format.
+    #[must_use]
+    pub fn format_choice_mix(iteration: u32, mix: &[f64]) -> String {
+        if mix.len() == 4 {
+            format!(
+                "[choice node] iter={}: unbiased={:.1}% fold={:.1}% call={:.1}% raise={:.1}%",
+                iteration,
+                mix[0] * 100.0,
+                mix[1] * 100.0,
+                mix[2] * 100.0,
+                mix[3] * 100.0
+            )
+        } else {
+            let parts: Vec<_> = mix.iter().map(|&v| format!("{:.1}%", v * 100.0)).collect();
+            format!(
+                "[choice node] iter={}: mix={:?}",
+                iteration, parts
+            )
+        }
     }
 }
 
@@ -1814,5 +1846,138 @@ mod tests {
         assert_eq!(regrets.len(), 2);
         assert!((regrets[0]).abs() < 1e-10, "no boundaries: regret[0] should be 0");
         assert!((regrets[1]).abs() < 1e-10, "no boundaries: regret[1] should be 0");
+    }
+
+    #[test]
+    fn format_choice_mix_four_evaluators() {
+        // K=4 should use the named format: "unbiased=... fold=... call=... raise=..."
+        let mix = vec![0.25, 0.25, 0.25, 0.25];
+        let msg = CfvSubgameSolver::format_choice_mix(42, &mix);
+        assert!(
+            msg.contains("iter=42"),
+            "should contain iteration number: {msg}"
+        );
+        assert!(
+            msg.contains("unbiased=25.0%"),
+            "should contain named unbiased pct: {msg}"
+        );
+        assert!(
+            msg.contains("fold=25.0%"),
+            "should contain named fold pct: {msg}"
+        );
+        assert!(
+            msg.contains("call=25.0%"),
+            "should contain named call pct: {msg}"
+        );
+        assert!(
+            msg.contains("raise=25.0%"),
+            "should contain named raise pct: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_choice_mix_three_evaluators() {
+        // K!=4 should use the generic format: "mix=[...]"
+        let mix = vec![0.5, 0.3, 0.2];
+        let msg = CfvSubgameSolver::format_choice_mix(10, &mix);
+        assert!(
+            msg.contains("iter=10"),
+            "should contain iteration number: {msg}"
+        );
+        assert!(
+            msg.contains("mix="),
+            "should contain generic mix label: {msg}"
+        );
+        assert!(
+            msg.contains("50.0%"),
+            "should contain 50.0%: {msg}"
+        );
+        assert!(
+            msg.contains("30.0%"),
+            "should contain 30.0%: {msg}"
+        );
+        assert!(
+            msg.contains("20.0%"),
+            "should contain 20.0%: {msg}"
+        );
+    }
+
+    #[timed_test(30)]
+    fn choice_node_logging_during_training_k4() {
+        // Run 200 iterations with K=4 to exercise the choice node logging
+        // code path: iteration 100 hits `% 100 == 0`, iteration 200 hits
+        // the final-iteration guard.
+        let board = turn_board();
+        let tree = turn_tree_depth_limited(&[1.0], 1);
+        let hands = small_hands(&board, 20);
+        let n = hands.combos.len();
+
+        let evaluators: Vec<Box<dyn LeafEvaluator>> = vec![
+            Box::new(ConstantEvaluator(0.2)),
+            Box::new(ConstantEvaluator(0.4)),
+            Box::new(ConstantEvaluator(0.6)),
+            Box::new(ConstantEvaluator(0.8)),
+        ];
+
+        let mut solver = CfvSubgameSolver::new(
+            tree,
+            hands.clone(),
+            &board,
+            evaluators,
+            250.0,
+            vec![1.0; n],
+            vec![1.0; n],
+        );
+
+        // Run 200 iterations to hit logging at iter 100 and iter 200 (final).
+        solver.train(200);
+
+        // Choice strategy should still be valid after logging.
+        let strat = solver.choice_strategy();
+        assert_eq!(strat.len(), 4);
+        let sum: f64 = strat.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-10,
+            "choice strategy should sum to 1.0, got {sum}"
+        );
+        for (k, &p) in strat.iter().enumerate() {
+            assert!(p >= 0.0, "choice strategy k={k} is negative: {p}");
+        }
+    }
+
+    #[timed_test(30)]
+    fn choice_node_logging_during_training_k3() {
+        // K=3 exercises the else branch of the logging format (not exactly 4).
+        let board = turn_board();
+        let tree = turn_tree_depth_limited(&[1.0], 1);
+        let hands = small_hands(&board, 20);
+        let n = hands.combos.len();
+
+        let evaluators: Vec<Box<dyn LeafEvaluator>> = vec![
+            Box::new(ConstantEvaluator(0.3)),
+            Box::new(ConstantEvaluator(0.5)),
+            Box::new(ConstantEvaluator(0.7)),
+        ];
+
+        let mut solver = CfvSubgameSolver::new(
+            tree,
+            hands.clone(),
+            &board,
+            evaluators,
+            250.0,
+            vec![1.0; n],
+            vec![1.0; n],
+        );
+
+        // Run 100 iterations to hit logging at iter 100 (final + %100).
+        solver.train(100);
+
+        let strat = solver.choice_strategy();
+        assert_eq!(strat.len(), 3);
+        let sum: f64 = strat.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-10,
+            "choice strategy should sum to 1.0, got {sum}"
+        );
     }
 }
