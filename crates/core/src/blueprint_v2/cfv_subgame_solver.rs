@@ -504,6 +504,15 @@ impl CfvSubgameSolver {
                         } else {
                             -invested[traverser as usize]
                         };
+                        // One-time diagnostic: log fold payoffs on first iteration.
+                        if self.iteration <= 1 {
+                            eprintln!(
+                                "[fold payoff] node={node_idx} winner={winner} traverser={traverser} \
+                                 pot={pot:.1} invested={invested:?} payoff={payoff:.2} \
+                                 (old half_pot would be {:.2})",
+                                pot / 2.0
+                            );
+                        }
                         for i in 0..n {
                             cfv_buf[out_start + i] = payoff;
                         }
