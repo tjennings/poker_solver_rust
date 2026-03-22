@@ -445,7 +445,7 @@ pub fn cluster_river_exhaustive(
 /// then exhaustive nearest-centroid assignment for all canonical boards.
 ///
 /// Phase 1 samples canonical boards, builds bucket histograms over the
-/// prior street, and runs `kmeans_emd_weighted_u8` to find centroids.
+/// prior street, and runs `elkan_emd_weighted_u8` to find centroids.
 /// Phase 2 enumerates ALL canonical boards and assigns each combo to its
 /// nearest centroid via `nearest_centroid_u8`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -576,7 +576,7 @@ fn cluster_histogram_exhaustive<const N: usize>(
 
 /// Cluster turn situations using two-phase clustering:
 /// - Phase 1: Sample canonical turns, build histograms over `river_buckets`,
-///   run `kmeans_emd_weighted_u8` to find centroids.
+///   run `elkan_emd_weighted_u8` to find centroids.
 /// - Phase 2: Enumerate ALL canonical turns, build histograms, assign to
 ///   nearest centroid via weighted EMD (or unweighted if gaps are empty).
 #[allow(clippy::too_many_arguments)]
@@ -607,7 +607,7 @@ pub fn cluster_turn_exhaustive(
 
 /// Cluster flop situations using two-phase clustering:
 /// - Phase 1: Sample canonical flops, build histograms over `turn_buckets`,
-///   run `kmeans_emd_weighted_u8` to find centroids.
+///   run `elkan_emd_weighted_u8` to find centroids.
 /// - Phase 2: Enumerate ALL canonical flops, build histograms, assign to
 ///   nearest centroid via weighted EMD (or unweighted if gaps are empty).
 #[allow(clippy::too_many_arguments)]
