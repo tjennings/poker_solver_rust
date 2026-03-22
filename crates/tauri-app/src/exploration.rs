@@ -172,6 +172,8 @@ pub struct StrategyMatrix {
     pub reaching_p1: Vec<f32>,
     /// Per-hand reaching probability for player 2 (169 canonical hands)
     pub reaching_p2: Vec<f32>,
+    /// Which player is currently acting (0 = P1/SB, 1 = P2/BB)
+    pub to_act: u8,
 }
 
 /// Information about an available action.
@@ -717,6 +719,7 @@ fn get_strategy_matrix_agent(
         stacks: vec![pos_state.stack_p1, pos_state.stack_p2],
         reaching_p1: vec![],
         reaching_p2: vec![],
+        to_act: position.to_act,
     })
 }
 
@@ -1121,6 +1124,7 @@ fn get_strategy_matrix_v2(
         stacks: position.stacks.clone(),
         reaching_p1,
         reaching_p2,
+        to_act: walk.to_act,
     })
 }
 
