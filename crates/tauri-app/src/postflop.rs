@@ -441,12 +441,19 @@ impl RolloutLeafEvaluator {
         ip_range: &[f64],
         traverser: u8,
     ) -> Vec<f64> {
+        let hero_range = if traverser == 0 { oop_range } else { ip_range };
         let opp_range = if traverser == 0 { ip_range } else { oop_range };
 
         combos
             .par_iter()
             .enumerate()
             .map(|(i, hero_hand)| {
+                // Skip combos with zero hero reach — no point rolling out
+                // hands the hero can't hold at this point.
+                if hero_range[i] <= 0.0 {
+                    return 0.0;
+                }
+
                 let weights: Vec<f64> = combos
                     .iter()
                     .enumerate()
@@ -535,9 +542,11 @@ impl LeafEvaluator for RolloutLeafEvaluator {
         let chip_values = self.rollout_chip_values(combos, board, oop_range, ip_range, traverser);
 
         let elapsed = eval_start.elapsed();
+        let hero_range = if traverser == 0 { oop_range } else { ip_range };
+        let active = hero_range.iter().filter(|&&r| r > 0.0).count();
         eprintln!(
-            "[rollout] {:?} bias: {} combos × {} boundaries, {:.0}ms",
-            self.bias, combos.len(), requests.len(), elapsed.as_secs_f64() * 1000.0
+            "[rollout] {:?} bias: {}/{} active combos × {} boundaries, {:.0}ms",
+            self.bias, active, combos.len(), requests.len(), elapsed.as_secs_f64() * 1000.0
         );
 
         // Normalize per-boundary by each boundary's half_pot.
