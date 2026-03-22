@@ -563,12 +563,13 @@ impl CfvSubgameSolver {
                 let half_pot = pot / 2.0;
                 match kind {
                     TerminalKind::Fold { winner } => {
-                        // Fold EV is always 0 for the folder — sunk costs
-                        // are sunk. Winner gains pot minus own investment.
+                        // Zero-sum over chips invested on this street.
+                        // Folder loses their investment; winner gains it.
+                        let opponent = (1 - traverser) as usize;
                         let payoff = if winner == traverser {
-                            pot - invested[traverser as usize]
+                            invested[opponent]
                         } else {
-                            0.0
+                            -invested[traverser as usize]
                         };
                         // Diagnostic: log fold payoffs on first iteration.
                         if self.iteration <= 1 && self.iteration > 0 {
