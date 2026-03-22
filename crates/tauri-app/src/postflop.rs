@@ -1568,6 +1568,19 @@ fn solve_depth_limited(
                 // Set DCFR warmup to 10% of total iterations.
                 solver.set_dcfr_warmup((max_iters / 10).max(1) as u64);
 
+                // Warm-start strategy from blueprint if available.
+                if let (Some(ctx), Some(abs_node)) = (&cbv_context, abstract_node_idx) {
+                    let decision_map = ctx.abstract_tree.decision_index_map();
+                    solver.warm_start_from_blueprint(
+                        &ctx.abstract_tree,
+                        abs_node,
+                        &ctx.all_buckets,
+                        &ctx.strategy,
+                        &decision_map,
+                        10.0, // warmup_weight: ~10 virtual iterations of blueprint strategy
+                    );
+                }
+
                 // Helper closure to build matrix from current strategy.
                 let make_matrix = |strat: &SubgameStrategy| {
                     let snap = snapshot_from_subgame(
