@@ -639,7 +639,7 @@ pub fn build_subgame_solver(
         .map(|depth| depth.iter().map(|&s| f64::from(s)).collect())
         .collect();
 
-    let tree = GameTree::build_subgame(
+    let mut tree = GameTree::build_subgame(
         street,
         pot_f,
         inv,
@@ -647,6 +647,12 @@ pub fn build_subgame_solver(
         &sizes_f64,
         Some(1),
     );
+
+    // Annotate subgame tree nodes with blueprint decision indices.
+    if let (Some(ctx), Some(abs_node)) = (cbv_context, abstract_node_idx) {
+        let decision_map = ctx.abstract_tree.decision_index_map();
+        tree.annotate_blueprint_indices(&ctx.abstract_tree, abs_node, &decision_map);
+    }
 
     let hands = SubgameHands::enumerate(board_cards);
 
@@ -1569,14 +1575,10 @@ fn solve_depth_limited(
                 solver.set_dcfr_warmup((max_iters / 10).max(1) as u64);
 
                 // Warm-start strategy from blueprint if available.
-                if let (Some(ctx), Some(abs_node)) = (&cbv_context, abstract_node_idx) {
-                    let decision_map = ctx.abstract_tree.decision_index_map();
+                if let Some(ctx) = &cbv_context {
                     solver.warm_start_from_blueprint(
-                        &ctx.abstract_tree,
-                        abs_node,
                         &ctx.all_buckets,
                         &ctx.strategy,
-                        &decision_map,
                         10.0, // warmup_weight: ~10 virtual iterations of blueprint strategy
                     );
                 }

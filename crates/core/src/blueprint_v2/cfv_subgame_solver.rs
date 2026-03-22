@@ -16,7 +16,7 @@ use crate::blueprint_v2::subgame_cfr::{
     SubgameCfrSolver, SubgameHands, SubgameStrategy,
 };
 use crate::blueprint_v2::bundle::BlueprintV2Strategy;
-use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
+use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind};
 use crate::blueprint_v2::mccfr::AllBuckets;
 use crate::blueprint_v2::Street;
 use crate::cfr::dcfr::DcfrParams;
@@ -267,110 +267,55 @@ impl CfvSubgameSolver {
 
     /// Warm-start `strategy_sum` from the blueprint's action probabilities.
     ///
-    /// Walks the subgame tree and abstract tree in parallel, mapping actions
-    /// by type and size. For each matched action at each decision node, seeds
-    /// `strategy_sum` with `blueprint_prob * warmup_weight` for every combo.
-    /// Extra subgame-only actions (raises not in the blueprint) get zero weight.
+    /// Requires that `tree.annotate_blueprint_indices()` was called first
+    /// to set `blueprint_decision_idx` on each decision node. For each
+    /// annotated node, looks up the blueprint strategy per combo's bucket
+    /// and seeds `strategy_sum` with `prob * warmup_weight`.
     ///
     /// `warmup_weight` controls how strongly the blueprint influences the
     /// initial average strategy — equivalent to N virtual iterations.
     pub fn warm_start_from_blueprint(
         &mut self,
-        abstract_tree: &GameTree,
-        abstract_start: u32,
         all_buckets: &AllBuckets,
         strategy: &BlueprintV2Strategy,
-        decision_idx_map: &[u32],
         warmup_weight: f64,
     ) {
         let num_combos = self.hands.combos.len();
         let mut seeded_nodes = 0u32;
 
-        // Parallel DFS: (subgame_node, abstract_node)
-        let mut stack: Vec<(u32, u32)> = vec![(self.tree.root, abstract_start)];
+        for (node_idx, node) in self.tree.nodes.iter().enumerate() {
+            let GameNode::Decision { street, blueprint_decision_idx: Some(dec_idx), .. } = node else {
+                continue;
+            };
 
-        while let Some((sg_node, abs_node)) = stack.pop() {
-            // Skip chance nodes in both trees.
-            let sg_idx = sg_node as usize;
-            let abs_idx = abs_node as usize;
+            let board_slice = match street {
+                Street::Flop => &self.board[..3.min(self.board.len())],
+                Street::Turn => &self.board[..4.min(self.board.len())],
+                Street::River => &self.board,
+                Street::Preflop => &[],
+            };
 
-            let sg_node_ref = &self.tree.nodes[sg_idx];
-            let abs_node_ref = &abstract_tree.nodes[abs_idx];
+            let num_blueprint_actions = strategy.node_action_counts[*dec_idx as usize] as usize;
 
-            match (sg_node_ref, abs_node_ref) {
-                (
-                    GameNode::Decision { actions: sg_actions, children: sg_children, street: sg_street, .. },
-                    GameNode::Decision { actions: abs_actions, children: abs_children, .. },
-                ) => {
-                    let dec_idx = decision_idx_map[abs_idx];
-                    if dec_idx == u32::MAX {
-                        continue;
-                    }
-
-                    // Build action mapping: blueprint action index → subgame action index.
-                    // Every blueprint action MUST have a match in the subgame (subgame
-                    // is a superset). Extra subgame-only actions are fine (no blueprint match).
-                    let abs_to_sg: Vec<usize> = abs_actions.iter().enumerate().map(|(ai, abs_a)| {
-                        sg_actions.iter().position(|sg_a| actions_match(sg_a, abs_a))
-                            .unwrap_or_else(|| panic!(
-                                "Blueprint action {abs_a:?} (index {ai}) has no match in subgame. \
-                                 Subgame actions: {sg_actions:?}, Abstract actions: {abs_actions:?}"
-                            ))
-                    }).collect();
-
-                    if seeded_nodes == 0 {
-                        eprintln!("[warm-start] root subgame actions: {sg_actions:?}");
-                        eprintln!("[warm-start] root abstract actions: {abs_actions:?}");
-                        eprintln!("[warm-start] abs→sg mapping: {abs_to_sg:?}");
-                    }
-
-                    // Seed strategy_sum for each combo
-                    let board_slice = match sg_street {
-                        Street::Flop => &self.board[..3.min(self.board.len())],
-                        Street::Turn => &self.board[..4.min(self.board.len())],
-                        Street::River => &self.board,
-                        Street::Preflop => &[],
-                    };
-
-                    for combo_idx in 0..num_combos {
-                        let combo = self.hands.combos[combo_idx];
-
-                        // Skip blocked combos
-                        if board_slice.iter().any(|b| *b == combo[0] || *b == combo[1]) {
-                            continue;
-                        }
-
-                        let bucket = all_buckets.get_bucket(*sg_street, combo, board_slice);
-                        let probs = strategy.get_action_probs(dec_idx as usize, bucket);
-
-                        let (base, _na) = self.layout.slot(sg_idx, combo_idx);
-                        // Map each blueprint action prob to the corresponding subgame slot
-                        for (abs_action_idx, &sg_action_idx) in abs_to_sg.iter().enumerate() {
-                            let p = probs.get(abs_action_idx).copied().unwrap_or(0.0);
-                            self.strategy_sum[base + sg_action_idx] += p as f64 * warmup_weight;
-                        }
-                    }
-
-                    seeded_nodes += 1;
-
-                    // Push children for matched blueprint actions (parallel walk)
-                    for (abs_action_idx, &sg_action_idx) in abs_to_sg.iter().enumerate() {
-                        let sg_child = sg_children[sg_action_idx];
-                        let abs_child = abs_children[abs_action_idx];
-                        // Skip chance nodes in both trees
-                        let sg_child = skip_chance(&self.tree, sg_child);
-                        let abs_child = skip_chance(abstract_tree, abs_child);
-                        stack.push((sg_child, abs_child));
-                    }
+            for combo_idx in 0..num_combos {
+                let combo = self.hands.combos[combo_idx];
+                if board_slice.iter().any(|b| *b == combo[0] || *b == combo[1]) {
+                    continue;
                 }
 
-                (GameNode::Chance { child: sg_child, .. }, GameNode::Chance { child: abs_child, .. }) => {
-                    stack.push((*sg_child, *abs_child));
-                }
+                let bucket = all_buckets.get_bucket(*street, combo, board_slice);
+                let probs = strategy.get_action_probs(*dec_idx as usize, bucket);
 
-                // Terminal or mismatched node types — stop walking this branch
-                _ => {}
+                let (base, _na) = self.layout.slot(node_idx, combo_idx);
+                // Blueprint actions map 1:1 to the first N subgame actions.
+                // Any extra subgame-only actions keep zero weight.
+                for a in 0..num_blueprint_actions {
+                    let p = probs.get(a).copied().unwrap_or(0.0);
+                    self.strategy_sum[base + a] += p as f64 * warmup_weight;
+                }
             }
+
+            seeded_nodes += 1;
         }
 
         eprintln!(
@@ -1377,30 +1322,6 @@ fn showdown_value_single(
     avg_equity * pot - invested_traverser
 }
 
-/// Check if two `TreeAction`s match for warm-start mapping.
-/// Fold, Check, Call, AllIn match exactly. Bet/Raise match by size (within 1% tolerance).
-fn actions_match(a: &TreeAction, b: &TreeAction) -> bool {
-    match (a, b) {
-        (TreeAction::Fold, TreeAction::Fold)
-        | (TreeAction::Check, TreeAction::Check)
-        | (TreeAction::Call, TreeAction::Call)
-        | (TreeAction::AllIn, TreeAction::AllIn) => true,
-        (TreeAction::Bet(x), TreeAction::Bet(y))
-        | (TreeAction::Raise(x), TreeAction::Raise(y)) => {
-            (x - y).abs() < 0.01 * x.abs().max(y.abs()).max(1.0)
-        }
-        _ => false,
-    }
-}
-
-/// Skip past a chance node if present, returning the child node index.
-fn skip_chance(tree: &GameTree, node: u32) -> u32 {
-    match &tree.nodes[node as usize] {
-        GameNode::Chance { child, .. } => *child,
-        _ => node,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // ExactRiverEvaluator
 // ---------------------------------------------------------------------------
@@ -2328,6 +2249,7 @@ mod tests {
                         crate::blueprint_v2::game_tree::TreeAction::Bet(pot_bet - pot),
                     ],
                     children: vec![1, 2],
+                    blueprint_decision_idx: None,
                 },
                 // 1: Showdown after check
                 GameNode::Terminal {

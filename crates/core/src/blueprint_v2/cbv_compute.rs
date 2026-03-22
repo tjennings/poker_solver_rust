@@ -600,6 +600,7 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Check, TreeAction::Bet(2.0)],
                 children: vec![1, 7],
+                blueprint_decision_idx: None,
             },
             // Node 1: Player 1 decision after check (Flop)
             GameNode::Decision {
@@ -607,6 +608,7 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Check, TreeAction::Bet(2.0)],
                 children: vec![2, 4],
+                blueprint_decision_idx: None,
             },
             // Node 2: Chance (check-check -> Turn)
             GameNode::Chance {
@@ -625,6 +627,7 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Fold, TreeAction::Call],
                 children: vec![5, 6],
+                blueprint_decision_idx: None,
             },
             // Node 5: Terminal fold (player 1 wins)
             GameNode::Terminal {
@@ -836,6 +839,7 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Check, TreeAction::Bet(2.0)],
                 children: vec![1, 8],
+                blueprint_decision_idx: None,
             },
             // 1: P1 Flop (Check only - keeps it simple)
             GameNode::Decision {
@@ -843,6 +847,7 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Check],
                 children: vec![2],
+            blueprint_decision_idx: None,
             },
             // 2: Chance (flop->turn)
             GameNode::Chance {
@@ -855,6 +860,7 @@ mod tests {
                 street: Street::Turn,
                 actions: vec![TreeAction::Check],
                 children: vec![4],
+            blueprint_decision_idx: None,
             },
             // 4: P1 Turn (Check only)
             GameNode::Decision {
@@ -862,6 +868,7 @@ mod tests {
                 street: Street::Turn,
                 actions: vec![TreeAction::Check],
                 children: vec![5],
+            blueprint_decision_idx: None,
             },
             // 5: Chance (turn->river)
             GameNode::Chance {
@@ -953,12 +960,14 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Check],
                 children: vec![1],
+            blueprint_decision_idx: None,
             },
             GameNode::Decision {
                 player: 1,
                 street: Street::Flop,
                 actions: vec![TreeAction::Check],
                 children: vec![2],
+            blueprint_decision_idx: None,
             },
             GameNode::Chance {
                 next_street: Street::Turn,
@@ -1231,6 +1240,7 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Check],
                 children: vec![1],
+            blueprint_decision_idx: None,
             },
             // 1: P1 Flop
             GameNode::Decision {
@@ -1238,6 +1248,7 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Check],
                 children: vec![2],
+            blueprint_decision_idx: None,
             },
             // 2: Chance (flop->turn)
             GameNode::Chance {

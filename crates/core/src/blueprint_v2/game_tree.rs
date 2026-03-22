@@ -22,6 +22,11 @@ pub enum GameNode {
         actions: Vec<TreeAction>,
         /// Arena indices, 1:1 with `actions`.
         children: Vec<u32>,
+        /// Blueprint decision node index for this node (set during subgame
+        /// construction when an abstract tree is provided). `None` for
+        /// blueprint-native trees or when no mapping is available.
+        #[allow(dead_code)]
+        blueprint_decision_idx: Option<u32>,
     },
     Chance {
         next_street: Street,
@@ -275,6 +280,7 @@ impl GameTree {
             street: state.street,
             actions,
             children,
+            blueprint_decision_idx: None,
         };
 
         node_idx
@@ -465,6 +471,7 @@ impl GameTree {
             street: state.street,
             actions: vec![TreeAction::Fold, call_action],
             children,
+            blueprint_decision_idx: None,
         };
 
         node_idx
@@ -790,6 +797,75 @@ impl GameTree {
         Self { nodes, root, blinds: [0.0, 0.0] }
     }
 
+    /// Annotate each decision node in this (subgame) tree with the
+    /// corresponding blueprint decision index from `abstract_tree`.
+    ///
+    /// Walks both trees in parallel from `abstract_start`. Since the
+    /// subgame is built from the same action config, the action order
+    /// matches 1:1 for shared actions (the subgame may have extra raises).
+    ///
+    /// After this call, `GameNode::Decision.blueprint_decision_idx` is
+    /// `Some(idx)` for every reachable decision node.
+    pub fn annotate_blueprint_indices(
+        &mut self,
+        abstract_tree: &GameTree,
+        abstract_start: u32,
+        decision_idx_map: &[u32],
+    ) {
+        let mut stack: Vec<(u32, u32)> = vec![(self.root, abstract_start)];
+
+        while let Some((sg_node, abs_node)) = stack.pop() {
+            let sg_idx = sg_node as usize;
+            let abs_idx = abs_node as usize;
+
+            match (&self.nodes[sg_idx], &abstract_tree.nodes[abs_idx]) {
+                (
+                    GameNode::Decision { actions: sg_actions, children: sg_children, .. },
+                    GameNode::Decision { actions: abs_actions, children: abs_children, .. },
+                ) => {
+                    let dec_idx = decision_idx_map[abs_idx];
+
+                    // Clone what we need before mutating
+                    let sg_children = sg_children.clone();
+                    let abs_children = abs_children.clone();
+                    let sg_actions = sg_actions.clone();
+                    let abs_actions = abs_actions.clone();
+
+                    // Set the blueprint index on this node
+                    if let GameNode::Decision { blueprint_decision_idx, .. } = &mut self.nodes[sg_idx] {
+                        *blueprint_decision_idx = if dec_idx != u32::MAX { Some(dec_idx) } else { None };
+                    }
+
+                    // Walk children: for each abstract action, find its match in the subgame
+                    for (abs_ai, abs_action) in abs_actions.iter().enumerate() {
+                        // Find matching subgame action by type+ordinal
+                        let abs_ordinal = abs_actions[..abs_ai].iter()
+                            .filter(|a| same_action_type(abs_action, a))
+                            .count();
+                        let mut count = 0usize;
+                        for (sg_ai, sg_action) in sg_actions.iter().enumerate() {
+                            if same_action_type(abs_action, sg_action) {
+                                if count == abs_ordinal {
+                                    let sg_child = skip_chance_node(self, sg_children[sg_ai]);
+                                    let abs_child = skip_chance_node_ref(abstract_tree, abs_children[abs_ai]);
+                                    stack.push((sg_child, abs_child));
+                                    break;
+                                }
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+
+                (GameNode::Chance { child: sg_child, .. }, GameNode::Chance { child: abs_child, .. }) => {
+                    stack.push((*sg_child, *abs_child));
+                }
+
+                _ => {}
+            }
+        }
+    }
+
     /// Count the number of nodes of each type in the tree.
     #[must_use]
     pub fn node_counts(&self) -> (usize, usize, usize) {
@@ -823,6 +899,32 @@ impl GameTree {
         }
         map
     }
+}
+
+/// Check if two actions are the same type (ignoring size values).
+fn same_action_type(a: &TreeAction, b: &TreeAction) -> bool {
+    matches!(
+        (a, b),
+        (TreeAction::Fold, TreeAction::Fold)
+            | (TreeAction::Check, TreeAction::Check)
+            | (TreeAction::Call, TreeAction::Call)
+            | (TreeAction::AllIn, TreeAction::AllIn)
+            | (TreeAction::Bet(_), TreeAction::Bet(_))
+            | (TreeAction::Raise(_), TreeAction::Raise(_))
+    )
+}
+
+/// Skip past a chance node, returning the child.
+fn skip_chance_node(tree: &GameTree, node: u32) -> u32 {
+    match &tree.nodes[node as usize] {
+        GameNode::Chance { child, .. } => *child,
+        _ => node,
+    }
+}
+
+/// Skip past a chance node in an immutable tree reference.
+fn skip_chance_node_ref(tree: &GameTree, node: u32) -> u32 {
+    skip_chance_node(tree, node)
 }
 
 #[cfg(test)]

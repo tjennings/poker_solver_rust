@@ -183,7 +183,7 @@ fn rollout_inner(
                 }
             }
         }
-        GameNode::Decision { player: acting_player, street, actions, children } => {
+        GameNode::Decision { player: acting_player, street, actions, children, .. } => {
             let acting_player = *acting_player;
             let street = *street;
             let actions = actions.clone();
@@ -535,6 +535,7 @@ mod tests {
                 street: Street::River,
                 actions: vec![TreeAction::Fold, TreeAction::Call],
                 children: vec![1, 2],
+                blueprint_decision_idx: None,
             },
             // Node 1: Fold terminal, winner=1
             GameNode::Terminal {
@@ -726,6 +727,7 @@ mod tests {
                 street: Street::River,
                 actions: vec![TreeAction::Fold, TreeAction::Call],
                 children: vec![1, 2],
+                blueprint_decision_idx: None,
             },
             // Fold -> player 0 wins
             GameNode::Terminal {
