@@ -88,6 +88,10 @@ enum StrategySource {
         cbv_table: Option<CbvTable>,
         /// Directory the bundle was loaded from (for resolving relative paths).
         bundle_dir: PathBuf,
+        /// Per-node, per-player, per-hand average EVs loaded from hand_ev.bin.
+        /// Indexed by `[decision_node_idx][player]` → `[f64; 169]`.
+        /// `None` if the bundle doesn't include hand_ev.bin.
+        hand_evs: Option<Vec<[[f64; 169]; 2]>>,
     },
 }
 
@@ -140,6 +144,9 @@ pub struct MatrixCell {
     pub filtered: bool,
     /// Reaching probability for the acting player (0.0–1.0).
     pub weight: f32,
+    /// Expected value for this hand at this decision point (in BB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ev: Option<f32>,
 }
 
 /// An action with its probability.
@@ -374,12 +381,58 @@ pub async fn load_blueprint_v2_core(
         rake_cap: config.game.rake_cap,
     };
 
+    // Load per-node hand EVs if available (from hand_ev.bin).
+    let hand_evs = {
+        // Search same directory as strategy.bin, then bundle root, then latest snapshot
+        let dir = PathBuf::from(&dir_path);
+        let candidates = [
+            dir.join("hand_ev.bin"),
+            dir.join("final/hand_ev.bin"),
+        ];
+        let mut found = None;
+        for candidate in &candidates {
+            if candidate.exists() {
+                found = Some(candidate.clone());
+                break;
+            }
+        }
+        // Also check latest snapshot
+        if found.is_none() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut snapshots: Vec<_> = entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("snapshot_")))
+                    .collect();
+                snapshots.sort_by_key(|e| e.file_name());
+                if let Some(last) = snapshots.last() {
+                    let path = last.path().join("hand_ev.bin");
+                    if path.exists() { found = Some(path); }
+                }
+            }
+        }
+        if let Some(path) = found {
+            match load_hand_ev_bin(&path, decision_nodes) {
+                Ok(evs) => {
+                    eprintln!("[explorer] loaded hand_ev.bin ({} decision nodes)", evs.len());
+                    Some(evs)
+                }
+                Err(e) => {
+                    eprintln!("[explorer] failed to load hand_ev.bin: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     *state.source.write() = Some(StrategySource::BlueprintV2 {
         config: Box::new(config),
         strategy: Box::new(strategy),
         tree: Box::new(tree),
         decision_map,
         cbv_table,
+        hand_evs,
         bundle_dir: {
             // The bundle root is where config.yaml lives. dir_path might
             // point to a snapshot subdir, so walk up to find config.yaml.
@@ -642,13 +695,14 @@ pub fn get_strategy_matrix_core(
             strategy,
             tree,
             decision_map,
+            hand_evs,
             ..
         } => {
             let cbv_guard = postflop_state.map(|ps| ps.cbv_context.read());
             let cbv_ref = cbv_guard
                 .as_ref()
                 .and_then(|g| g.as_deref());
-            get_strategy_matrix_v2(config, strategy, tree, decision_map, &position, cbv_ref)
+            get_strategy_matrix_v2(config, strategy, tree, decision_map, &position, cbv_ref, hand_evs.as_deref())
         }
     }
 }
@@ -701,6 +755,7 @@ fn get_strategy_matrix_agent(
                 probabilities,
                 filtered: false,
                 weight: 1.0,
+                ev: None,
             });
         }
         cells.push(row_cells);
@@ -928,6 +983,7 @@ fn get_strategy_matrix_v2(
     decision_map: &[u32],
     position: &ExplorationPosition,
     cbv_context: Option<&crate::postflop::CbvContext>,
+    hand_evs: Option<&[[[f64; 169]; 2]]>,
 ) -> Result<StrategyMatrix, String> {
     // Compute reaching probabilities by replaying the history step-by-step.
     let mut reaching_p1 = vec![1.0_f32; 169];
@@ -1131,6 +1187,11 @@ fn get_strategy_matrix_v2(
                 reaching_p2[hand_idx]
             };
 
+            // Look up EV for this hand if available.
+            let ev = hand_evs
+                .and_then(|evs| evs.get(decision_idx as usize))
+                .map(|node_evs| node_evs[walk.to_act as usize][hand_idx] as f32);
+
             row_cells.push(MatrixCell {
                 hand: hand_label,
                 suited,
@@ -1138,6 +1199,7 @@ fn get_strategy_matrix_v2(
                 probabilities,
                 filtered: false,
                 weight: reach,
+                ev,
             });
         }
         cells.push(row_cells);
@@ -1911,6 +1973,37 @@ fn value_to_char(v: Value) -> char {
 // ============================================================================
 // Helper functions
 // ============================================================================
+
+/// Load per-node hand EVs from hand_ev.bin (FullTreeEvTracker format).
+/// Returns `Vec<[[f64; 169]; 2]>` indexed by decision node index.
+fn load_hand_ev_bin(path: &Path, expected_nodes: usize) -> Result<Vec<[[f64; 169]; 2]>, String> {
+    use std::io::Read;
+    let mut f = std::io::BufReader::new(
+        std::fs::File::open(path).map_err(|e| format!("Cannot open: {e}"))?
+    );
+    let mut buf4 = [0u8; 4];
+    f.read_exact(&mut buf4).map_err(|e| format!("Read error: {e}"))?;
+    let num_nodes = u32::from_le_bytes(buf4) as usize;
+
+    let mut result = vec![[[0.0f64; 169]; 2]; num_nodes];
+    let mut buf8 = [0u8; 8];
+    for node_idx in 0..num_nodes {
+        for player in 0..2 {
+            for hand in 0..169 {
+                f.read_exact(&mut buf8).map_err(|e| format!("Read error: {e}"))?;
+                let sum = i64::from_le_bytes(buf8) as f64 / 1000.0;
+                f.read_exact(&mut buf8).map_err(|e| format!("Read error: {e}"))?;
+                let count = u64::from_le_bytes(buf8);
+                result[node_idx][player][hand] = if count > 0 {
+                    sum / count as f64
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+    Ok(result)
+}
 
 fn parse_board(board_strs: &[String]) -> Result<Vec<Card>, String> {
     board_strs.iter().map(|s| parse_card(s)).collect()
@@ -3052,6 +3145,7 @@ mod tests {
             &decision_map,
             &position,
             None,
+            None,
         );
     }
 
@@ -3132,6 +3226,7 @@ mod tests {
             &decision_map,
             &position,
             Some(&ctx),
+            None,
         );
 
         let matrix = result.expect("should succeed");
@@ -3181,6 +3276,7 @@ mod tests {
             &tree,
             &decision_map,
             &position,
+            None,
             None,
         );
 
@@ -3429,6 +3525,7 @@ mod tests {
             &decision_map,
             &position,
             Some(&ctx),
+            None,
         );
 
         let matrix = result.expect("should succeed");

@@ -31,6 +31,7 @@ export interface MatrixCell {
   pair: boolean;
   probabilities: ActionProb[];
   weight: number;
+  ev?: number | null;
 }
 
 export interface ActionInfo {

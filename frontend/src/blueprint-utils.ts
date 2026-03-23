@@ -16,7 +16,7 @@ export function blueprintToPostflopMatrix(
           pair: cell.pair,
           probabilities: cell.probabilities.map(ap => ap.probability),
           combo_count: hasAction ? 1 : 0,
-          ev: null,
+          ev: cell.ev ?? null,
           combos: [],
           weight: cell.weight,
         };
