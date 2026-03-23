@@ -1529,7 +1529,6 @@ mod tests {
     }
 
     #[timed_test(5)]
-    #[ignore] // TODO: test assumes player 0 acts first postflop; needs rework after position fix
     fn propagate_ranges_sums_correctly() {
         let board = turn_board();
         let tree = turn_tree_depth_limited(&[1.0], 1);

@@ -24,19 +24,19 @@ clustering:
 action_abstraction:
   preflop:
     - ["2bb"]
-    - ["4bb", "6bb"]
-    - ["18bb"]
+    - ["4bb", "7bb"]
+    - ["15bb"]
   flop:
-    - [0.1, 0.25, 0.33, 0.67, 1.0]
-    - [0.33, 0.67, 2.0]
+    - [0.25, 0.33, 0.75, 1.0]
+    - [0.33, 0.67, 1.0, 1.5]
     - [2.0]
   turn:
-    - [0.1, 0.25, 0.33, 0.67, 1.0]
-    - [0.33, 0.67, 2.0]
+    - [0.25, 0.33, 0.75, 1.0]
+    - [0.33, 0.75, 1.0, 1.5]
     - [2.0]
   river:
-    - [0.1, 0.25, 0.33, 0.67, 1.0]
-    - [0.33, 0.67, 2.0]
+    - [0.25, 0.33, 0.75, 1.0]
+    - [0.33, 0.75, 1.0, 1.5]
     - [2.0]
 
 training:
@@ -44,20 +44,20 @@ training:
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 50000000
   prune_after_iterations: 50000000
-  prune_threshold: 0
-  lcfr_discount_interval: 10000000
+  prune_threshold: -50
+  lcfr_discount_interval: 1000000
   batch_size: 2000
   purify_threshold: 0.03
-  dcfr_epoch_cap: 40
-  dcfr_alpha: 0.80
-  dcfr_gamma: 2.0
-  dcfr_beta: 0
+  dcfr_epoch_cap: 80
+  #dcfr_alpha: 0.80
+  #dcfr_gamma: 2.0
+  #dcfr_beta: 0
 
 snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/1k_50bb_v7/snap"
+  output_dir: "./local_data/blueprints/1k_50bb_v11/snap"
 
 tui:
   enabled: true
