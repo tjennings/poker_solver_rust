@@ -27,6 +27,7 @@ function makeStrategyMatrix(overrides?: Partial<StrategyMatrix>): StrategyMatrix
     stack_p2: 170,
     reaching_p1: [],
     reaching_p2: [],
+    dealer: 0,
     ...overrides,
   };
 }

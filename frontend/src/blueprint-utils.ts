@@ -27,5 +27,6 @@ export function blueprintToPostflopMatrix(
     pot: sm.pot,
     stacks: [sm.stack_p1, sm.stack_p2],
     board,
+    dealer: sm.dealer,
   };
 }

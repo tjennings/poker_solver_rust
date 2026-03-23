@@ -342,7 +342,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
     setActionHistory(prev => [...prev, {
       selectedId: selectedId ?? String(actionIndex),
       actionIndex,
-      position: matrix.player === 0 ? 'SB' : 'BB',
+      position: matrix.player === matrix.dealer ? 'SB' : 'BB',
       stack: matrix.stacks[matrix.player],
       pot: matrix.pot,
       actions: matrix.actions,
@@ -695,7 +695,7 @@ export default function PostflopExplorer({ onBack, blueprintConfig, preflopHisto
         {/* Available actions */}
         {matrix && !terminal && !awaitingCard && (
           <ActionBlock
-            position={matrix.player === 0 ? 'SB' : 'BB'}
+            position={matrix.player === matrix.dealer ? 'SB' : 'BB'}
             stack={matrix.stacks[matrix.player]}
             pot={matrix.pot}
             actions={matrix.actions}

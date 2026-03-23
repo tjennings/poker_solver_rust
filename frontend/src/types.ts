@@ -53,6 +53,8 @@ export interface StrategyMatrix {
   stack_p2: number;
   reaching_p1: number[];
   reaching_p2: number[];
+  /** Which seat is the dealer/button (SB in heads-up). */
+  dealer: number;
 }
 
 export interface ExplorationPosition {
@@ -207,6 +209,8 @@ export interface PostflopStrategyMatrix {
   pot: number;
   stacks: [number, number];
   board: string[];
+  /** Which seat is the dealer/button (SB in heads-up). */
+  dealer: number;
 }
 
 export interface PostflopProgress {
