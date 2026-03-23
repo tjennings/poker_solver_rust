@@ -912,18 +912,16 @@ impl BlueprintTrainer {
     /// Returns the dead-money fold payoff (e.g. -2.0 if the player has
     /// voluntarily invested 2.0). At the root preflop node this is 0.0.
     /// Returns 0.0 if the node has no Fold action.
-    fn fold_value_at_node(tree: &GameTree, node_idx: u32, _player: usize) -> f64 {
+    fn fold_value_at_node(tree: &GameTree, node_idx: u32, player: usize) -> f64 {
         use super::game_tree::{GameNode, TreeAction, TerminalKind};
         if let GameNode::Decision { actions, children, .. } = &tree.nodes[node_idx as usize] {
             for (a, &child_idx) in children.iter().enumerate() {
                 if actions[a] == TreeAction::Fold {
-                    if let GameNode::Terminal { kind: TerminalKind::Fold { winner }, .. } =
+                    if let GameNode::Terminal { kind: TerminalKind::Fold { .. }, stacks, .. } =
                         &tree.nodes[child_idx as usize]
                     {
-                        // Pot-only model: folder gets 0 (loses everything invested).
-                        // The folder is the non-winner.
-                        let _ = winner;
-                        return 0.0;
+                        // Fold payoff = stacks[folder] - starting_stack (negative, loses blind)
+                        return stacks[player] - tree.starting_stack;
                     }
                 }
             }
