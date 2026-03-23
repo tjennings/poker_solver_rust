@@ -900,9 +900,11 @@ impl BlueprintTrainer {
                     if let GameNode::Terminal { kind: TerminalKind::Fold { .. }, invested, .. } =
                         &tree.nodes[child_idx as usize]
                     {
-                        // invested is voluntary-only (blinds already excluded).
+                        // Fold value = -(blind + voluntary). Blinds are
+                        // dead money in the tree model but terminal_value
+                        // charges them to the folder.
                         let vol_self = invested[player];
-                        return -vol_self;
+                        return -(tree.blinds[player] + vol_self);
                     }
                 }
             }
