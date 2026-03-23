@@ -2841,6 +2841,7 @@ mod tests {
                 street: Street::Preflop,
                 actions: vec![TreeAction::Fold, TreeAction::Call],
                 children: vec![3, 1], // fold -> terminal, call -> chance
+                blueprint_decision_idx: None,
             },
             // Node 1: chance node (flop deal)
             V2GameNode::Chance {
@@ -2853,6 +2854,7 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Check, TreeAction::Bet(2.0)],
                 children: vec![4, 5],
+                blueprint_decision_idx: None,
             },
             // Node 3: terminal (fold)
             V2GameNode::Terminal {

@@ -119,6 +119,9 @@ pub struct RolloutContext<'a> {
     pub bias_factor: f64,
     pub player: u8,
     pub num_rollouts: u32,
+    /// Starting stack per player (in the same units as pot/invested).
+    /// Used for all-in calculations in the rollout.
+    pub starting_stack: f64,
 }
 
 /// Walk the abstract game tree using a (biased) blueprint strategy with
@@ -134,6 +137,9 @@ pub struct RolloutContext<'a> {
 ///
 /// Panics if a `DepthBoundary` terminal is encountered (should not
 /// appear in rollout trees).
+/// Rollout from a depth boundary using the subgame's actual pot and
+/// invested amounts. Terminal payoffs are computed from the carried
+/// state, not from the abstract tree's stored values.
 pub fn rollout_from_boundary(
     hero_hand: [Card; 2],
     opponent_hand: [Card; 2],
@@ -141,8 +147,10 @@ pub fn rollout_from_boundary(
     ctx: &RolloutContext<'_>,
     abstract_node: u32,
     rng: &mut impl Rng,
+    pot: f64,
+    invested: [f64; 2],
 ) -> f64 {
-    rollout_inner(hero_hand, opponent_hand, board, ctx, abstract_node, rng, None)
+    rollout_inner(hero_hand, opponent_hand, board, ctx, abstract_node, rng, None, pot, invested)
 }
 
 /// Inner recursive function with bucket caching.
@@ -150,6 +158,10 @@ pub fn rollout_from_boundary(
 /// `cached_buckets` holds `[hero_bucket, opponent_bucket]` for the current
 /// street. Computed on the first Decision node of each street, invalidated
 /// (set to `None`) at Chance nodes when the board changes.
+///
+/// `pot` and `invested` are carried from the subgame's boundary state and
+/// updated at each action so terminal payoffs reflect the actual chip amounts.
+#[allow(clippy::too_many_arguments)]
 fn rollout_inner(
     hero_hand: [Card; 2],
     opponent_hand: [Card; 2],
@@ -158,24 +170,30 @@ fn rollout_inner(
     abstract_node: u32,
     rng: &mut impl Rng,
     cached_buckets: Option<[u16; 2]>,
+    pot: f64,
+    invested: [f64; 2],
 ) -> f64 {
     match &ctx.abstract_tree.nodes[abstract_node as usize] {
-        GameNode::Terminal { kind, pot, invested } => {
+        GameNode::Terminal { kind, .. } => {
+            // Use carried pot/invested, NOT the abstract tree's stored values.
+            let p = ctx.player as usize;
             match kind {
                 TerminalKind::Fold { winner } => {
                     if ctx.player == *winner {
-                        pot - invested[ctx.player as usize]
+                        // Winner gains pot minus own investment
+                        pot - invested[p]
                     } else {
-                        -invested[ctx.player as usize]
+                        // Folder loses own investment
+                        -invested[p]
                     }
                 }
                 TerminalKind::Showdown => {
                     let player_rank = crate::showdown_equity::rank_hand(hero_hand, board);
                     let opponent_rank = crate::showdown_equity::rank_hand(opponent_hand, board);
                     match player_rank.cmp(&opponent_rank) {
-                        std::cmp::Ordering::Greater => pot - invested[ctx.player as usize],
-                        std::cmp::Ordering::Less => -invested[ctx.player as usize],
-                        std::cmp::Ordering::Equal => pot / 2.0 - invested[ctx.player as usize],
+                        std::cmp::Ordering::Greater => pot - invested[p],
+                        std::cmp::Ordering::Less => -invested[p],
+                        std::cmp::Ordering::Equal => pot / 2.0 - invested[p],
                     }
                 }
                 TerminalKind::DepthBoundary => {
@@ -185,6 +203,7 @@ fn rollout_inner(
         }
         GameNode::Decision { player: acting_player, street, actions, children, .. } => {
             let acting_player = *acting_player;
+            let actor = acting_player as usize;
             let street = *street;
             let actions = actions.clone();
             let children = children.clone();
@@ -210,9 +229,13 @@ fn rollout_inner(
 
             let mut ev = 0.0;
             for (i, &child) in children.iter().enumerate() {
+                // Compute new invested/pot for this action.
+                let (child_pot, child_invested) = apply_action(
+                    &actions[i], pot, invested, actor, ctx.starting_stack,
+                );
                 let child_ev = rollout_inner(
                     hero_hand, opponent_hand, board, ctx, child, rng,
-                    Some(buckets),
+                    Some(buckets), child_pot, child_invested,
                 );
                 ev += f64::from(biased[i]) * child_ev;
             }
@@ -237,10 +260,50 @@ fn rollout_inner(
                 let child_ev = rollout_inner(
                     hero_hand, opponent_hand, &new_board, ctx, child, rng,
                     None, // invalidate cache — board changed
+                    pot, invested, // pot/invested unchanged through chance
                 );
                 total += child_ev;
             }
             total / f64::from(n)
+        }
+    }
+}
+
+/// Compute new pot and invested amounts after an action.
+/// Mirrors the logic in `GameTree::build_child`.
+fn apply_action(
+    action: &TreeAction,
+    pot: f64,
+    invested: [f64; 2],
+    actor: usize,
+    starting_stack: f64,
+) -> (f64, [f64; 2]) {
+    let opponent = 1 - actor;
+    let mut new_invested = invested;
+
+    match action {
+        TreeAction::Fold | TreeAction::Check => {
+            // No chip movement
+            (pot, new_invested)
+        }
+        TreeAction::Call => {
+            // Match opponent's investment
+            new_invested[actor] = invested[opponent];
+            let new_pot = pot + (new_invested[actor] - invested[actor]);
+            (new_pot, new_invested)
+        }
+        TreeAction::Bet(amount) | TreeAction::Raise(amount) => {
+            // Bet/raise TO this amount (absolute, not increment)
+            let old = invested[actor];
+            new_invested[actor] = *amount;
+            let new_pot = pot + (new_invested[actor] - old);
+            (new_pot, new_invested)
+        }
+        TreeAction::AllIn => {
+            let old = invested[actor];
+            new_invested[actor] = starting_stack;
+            let new_pot = pot + (new_invested[actor] - old);
+            (new_pot, new_invested)
         }
     }
 }
@@ -393,6 +456,7 @@ mod tests {
             bias_factor,
             player,
             num_rollouts,
+            starting_stack: 100.0,
         }
     }
 
@@ -406,7 +470,7 @@ mod tests {
 
         // player=1 (winner): payoff = pot - invested[1] = 10 - 5 = 5
         let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 1, 1);
-        let ev = rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng);
+        let ev = rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng, 10.0, [3.0, 5.0]);
         assert!((ev - 5.0).abs() < 1e-9, "Winner EV should be 5.0, got {ev}");
     }
 
@@ -420,7 +484,7 @@ mod tests {
 
         // player=0 (loser): payoff = -invested[0] = -3
         let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
-        let ev = rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng);
+        let ev = rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng, 10.0, [3.0, 5.0]);
         assert!((ev - (-3.0)).abs() < 1e-9, "Loser EV should be -3.0, got {ev}");
     }
 
@@ -459,7 +523,7 @@ mod tests {
 
         // hero (player=0) has trip aces with K kicker, opponent has nothing
         let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
-        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
+        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 20.0, [8.0, 8.0]);
         // Hero wins: pot - invested[0] = 20 - 8 = 12
         assert!((ev - 12.0).abs() < 1e-9, "Hero should win 12.0, got {ev}");
     }
@@ -484,7 +548,7 @@ mod tests {
 
         // hero (player=0) loses
         let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
-        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
+        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 20.0, [8.0, 8.0]);
         assert!((ev - (-8.0)).abs() < 1e-9, "Hero should lose 8.0, got {ev}");
     }
 
@@ -516,7 +580,7 @@ mod tests {
         ];
 
         let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
-        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
+        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 20.0, [10.0, 10.0]);
         // Tie: pot/2 - invested[0] = 10 - 10 = 0
         assert!((ev).abs() < 1e-9, "Tie should give EV 0.0, got {ev}");
     }
@@ -595,8 +659,11 @@ mod tests {
         // Fold: -invested[0] = -3 (player 0 is loser)
         // Call (showdown): hero wins => pot - invested[0] = 14 - 7 = 7
         // EV = 0.6 * (-3) + 0.4 * 7 = -1.8 + 2.8 = 1.0
+        // Initial state: pot=10, invested=[3,7]. Player 0 facing a bet.
+        // Fold: pot=10, invested=[3,7] → loser payoff = -3
+        // Call: invested[0] matches invested[1]=7, pot=10+(7-3)=14, invested=[7,7] → winner payoff = 14-7=7
         let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
-        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
+        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 10.0, [3.0, 7.0]);
         assert!((ev - 1.0).abs() < 0.01, "Expected EV ~1.0, got {ev}");
     }
 
@@ -618,12 +685,12 @@ mod tests {
 
         // Unbiased EV = 0.6 * (-3) + 0.4 * 7 = 1.0
         let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
-        let unbiased_ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
+        let unbiased_ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 10.0, [3.0, 7.0]);
 
         // Bias toward Call (factor 10): call gets more weight, fold less
         // So EV should increase (call=+7 is more favored than fold=-3)
         let ctx_biased = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Call, 10.0, 0, 1);
-        let biased_ev = rollout_from_boundary(hero, opp, &board, &ctx_biased, 0, &mut rng);
+        let biased_ev = rollout_from_boundary(hero, opp, &board, &ctx_biased, 0, &mut rng, 10.0, [3.0, 7.0]);
         assert!(biased_ev > unbiased_ev, "Call bias should increase EV when call is +7");
     }
 
@@ -659,7 +726,7 @@ mod tests {
 
         // With many rollouts, hero should have positive EV
         let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 100);
-        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
+        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 10.0, [5.0, 5.0]);
         // AA vs 72o on K84: hero is ~90%+ equity
         // EV should be positive (win 5 most of the time)
         assert!(ev > 0.0, "AA vs 72o should have positive EV, got {ev}");
@@ -774,11 +841,12 @@ mod tests {
         ];
 
         // For player 0:
-        // Fold by opp -> player 0 wins: pot - invested[0] = 10 - 3 = 7
-        // Call -> showdown hero wins: pot - invested[0] = 14 - 7 = 7
+        // Initial: pot=10, invested=[3,3]. Player 1 deciding.
+        // Fold by opp: pot=10, invested=[3,3] → player 0 wins: 10 - 3 = 7
+        // Call by opp: invested[1]=invested[0]=3 (no change), pot=10 → showdown hero wins: 10 - 3 = 7
         // EV = 0.5 * 7 + 0.5 * 7 = 7
         let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
-        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng);
+        let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 10.0, [3.0, 3.0]);
         assert!((ev - 7.0).abs() < 0.01, "EV should be 7.0, got {ev}");
     }
 
@@ -800,6 +868,6 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
-        rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng);
+        rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng, 10.0, [5.0, 5.0]);
     }
 }

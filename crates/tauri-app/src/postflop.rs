@@ -400,6 +400,7 @@ struct RolloutLeafEvaluator {
     bias_factor: f64,
     num_rollouts: u32,
     num_opponent_samples: u32,
+    starting_stack: f64,
 }
 
 impl RolloutLeafEvaluator {
@@ -413,6 +414,7 @@ impl RolloutLeafEvaluator {
         bias_factor: f64,
         num_rollouts: u32,
         num_opponent_samples: u32,
+        starting_stack: f64,
     ) -> Self {
         let decision_idx_map = abstract_tree.decision_index_map();
         Self {
@@ -425,21 +427,25 @@ impl RolloutLeafEvaluator {
             bias_factor,
             num_rollouts,
             num_opponent_samples,
+            starting_stack,
         }
     }
 }
 
+
 impl RolloutLeafEvaluator {
-    /// Compute raw rollout chip values per combo (before pot-fraction normalization).
-    /// This is the expensive part — shared across all boundaries since the rollout
-    /// walks the abstract tree whose terminal payoffs don't depend on the subgame pot.
-    fn rollout_chip_values(
+    /// Compute rollout chip values per combo, passing the subgame's actual
+    /// pot and invested amounts through the abstract tree traversal.
+    #[allow(clippy::too_many_arguments)]
+    fn rollout_chip_values_with_state(
         &self,
         combos: &[[RsPokerCard; 2]],
         board: &[RsPokerCard],
         oop_range: &[f64],
         ip_range: &[f64],
         traverser: u8,
+        boundary_pot: f64,
+        boundary_invested: [f64; 2],
     ) -> Vec<f64> {
         let hero_range = if traverser == 0 { oop_range } else { ip_range };
         let opp_range = if traverser == 0 { ip_range } else { oop_range };
@@ -448,8 +454,6 @@ impl RolloutLeafEvaluator {
             .par_iter()
             .enumerate()
             .map(|(i, hero_hand)| {
-                // Skip combos with zero hero reach — no point rolling out
-                // hands the hero can't hold at this point.
                 if hero_range[i] <= 0.0 {
                     return 0.0;
                 }
@@ -458,9 +462,7 @@ impl RolloutLeafEvaluator {
                     .iter()
                     .enumerate()
                     .map(|(j, opp_hand)| {
-                        if opp_range[j] <= 0.0
-                            || cards_overlap(*hero_hand, *opp_hand)
-                        {
+                        if opp_range[j] <= 0.0 || cards_overlap(*hero_hand, *opp_hand) {
                             0.0
                         } else {
                             opp_range[j]
@@ -483,6 +485,7 @@ impl RolloutLeafEvaluator {
                     bias_factor: self.bias_factor,
                     player: traverser,
                     num_rollouts: self.num_rollouts,
+                    starting_stack: self.starting_stack,
                 };
 
                 let total: f64 = sampled
@@ -496,6 +499,8 @@ impl RolloutLeafEvaluator {
                             &ctx,
                             self.abstract_start_node,
                             &mut rng,
+                            boundary_pot,
+                            boundary_invested,
                         )
                     })
                     .sum();
@@ -518,7 +523,11 @@ impl LeafEvaluator for RolloutLeafEvaluator {
         traverser: u8,
     ) -> Vec<f64> {
         let half_pot = pot / 2.0;
-        let chip_values = self.rollout_chip_values(combos, board, oop_range, ip_range, traverser);
+        // Assume symmetric investment for the single-boundary evaluate path.
+        let invested = [pot / 2.0, pot / 2.0];
+        let chip_values = self.rollout_chip_values_with_state(
+            combos, board, oop_range, ip_range, traverser, pot, invested,
+        );
         chip_values.iter().map(|&v| v / half_pot).collect()
     }
 
@@ -528,43 +537,53 @@ impl LeafEvaluator for RolloutLeafEvaluator {
         board: &[RsPokerCard],
         oop_range: &[f64],
         ip_range: &[f64],
-        requests: &[(f64, f64, u8)],
+        requests: &[(f64, f64, u8, [f64; 2])],
     ) -> Vec<Vec<f64>> {
         if requests.is_empty() {
             return vec![];
         }
 
-        // All requests share the same traverser — use the first one.
         let traverser = requests[0].2;
+        let hero_range = if traverser == 0 { oop_range } else { ip_range };
+        let opp_range = if traverser == 0 { ip_range } else { oop_range };
         let eval_start = std::time::Instant::now();
 
-        // Compute rollout chip values ONCE (the expensive part).
-        let chip_values = self.rollout_chip_values(combos, board, oop_range, ip_range, traverser);
+        // Each boundary has its own pot/invested, so we compute rollout
+        // chip values per boundary. The rollout passes the subgame's actual
+        // pot/invested through the abstract tree so terminal payoffs reflect
+        // the real chip amounts.
+        let results: Vec<Vec<f64>> = requests
+            .iter()
+            .map(|&(pot, _eff_stack, trav, invested)| {
+                let chip_values = self.rollout_chip_values_with_state(
+                    combos, board, oop_range, ip_range, trav, pot, invested,
+                );
+                let half_pot = pot / 2.0;
+                chip_values.iter().map(|&v| v / half_pot).collect()
+            })
+            .collect();
 
         let elapsed = eval_start.elapsed();
-        let hero_range = if traverser == 0 { oop_range } else { ip_range };
         let active = hero_range.iter().filter(|&&r| r > 0.0).count();
         eprintln!(
             "[rollout] {:?} bias: {}/{} active combos × {} boundaries, {:.0}ms",
             self.bias, active, combos.len(), requests.len(), elapsed.as_secs_f64() * 1000.0
         );
 
-        // Diagnostic: dump rollout chip values for hands of interest.
-        // Only log for Unbiased on the first traverser to avoid spam.
-        if self.bias == BiasType::Unbiased && traverser == 0 {
+        // Diagnostic: dump rollout values for the first boundary.
+        if self.bias == BiasType::Unbiased && traverser == 0 && !results.is_empty() {
+            let half_pot = requests[0].0 / 2.0;
+            let chip_values: Vec<f64> = results[0].iter().map(|&pf| pf * half_pot).collect();
             let mut samples: Vec<(String, f64, f64)> = combos
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| hero_range[*i] > 0.0)
                 .map(|(i, combo)| {
                     let name = format!("{}{}", combo[0], combo[1]);
-                    let chip_val = chip_values[i];
-                    let pot_frac = if requests.is_empty() { 0.0 } else { chip_val / (requests[0].0 / 2.0) };
-                    (name, chip_val, pot_frac)
+                    (name, chip_values[i], results[0][i])
                 })
                 .collect();
             samples.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let n = samples.len();
             eprintln!("[rollout audit] TOP 10 (highest chip value):");
             for (name, chip, pf) in samples.iter().take(10) {
                 eprintln!("  {name:<8} chips={chip:>8.2}  pot_frac={pf:>+.4}");
@@ -573,11 +592,9 @@ impl LeafEvaluator for RolloutLeafEvaluator {
             for (name, chip, pf) in samples.iter().rev().take(10) {
                 eprintln!("  {name:<8} chips={chip:>8.2}  pot_frac={pf:>+.4}");
             }
-            // Look for specific hands of interest
             let targets = ["7s6s", "6s5s", "6s4s", "5s4s", "7h6h", "6h5h", "AsKs", "AhKh", "QdJd"];
             let found: Vec<_> = samples.iter()
                 .filter(|(name, _, _)| targets.iter().any(|t| name.contains(t) || {
-                    // Also match reversed card order
                     let rev: String = t.chars().collect::<Vec<_>>().chunks(2).rev().flatten().collect();
                     name.contains(&rev)
                 }))
@@ -590,14 +607,7 @@ impl LeafEvaluator for RolloutLeafEvaluator {
             }
         }
 
-        // Normalize per-boundary by each boundary's half_pot.
-        requests
-            .iter()
-            .map(|&(pot, _, _)| {
-                let half_pot = pot / 2.0;
-                chip_values.iter().map(|&v| v / half_pot).collect()
-            })
-            .collect()
+        results
     }
 }
 
@@ -681,19 +691,19 @@ pub fn build_subgame_solver(
         vec![
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Unbiased, bias_factor, num_rollouts, opp_samples,
+                abs_node, BiasType::Unbiased, bias_factor, num_rollouts, opp_samples, starting_stack,
             )) as Box<dyn LeafEvaluator>,
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Fold, bias_factor, num_rollouts, opp_samples,
+                abs_node, BiasType::Fold, bias_factor, num_rollouts, opp_samples, starting_stack,
             )),
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Call, bias_factor, num_rollouts, opp_samples,
+                abs_node, BiasType::Call, bias_factor, num_rollouts, opp_samples, starting_stack,
             )),
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Raise, bias_factor, num_rollouts, opp_samples,
+                abs_node, BiasType::Raise, bias_factor, num_rollouts, opp_samples, starting_stack,
             )),
         ]
     } else {
@@ -3199,19 +3209,19 @@ mod tests {
         let evaluators: Vec<Box<dyn LeafEvaluator>> = vec![
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&tree), Arc::clone(&all_buckets),
-                0, BiasType::Unbiased, 10.0, 3, 8,
+                0, BiasType::Unbiased, 10.0, 3, 8, 100.0,
             )),
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&tree), Arc::clone(&all_buckets),
-                0, BiasType::Fold, 10.0, 3, 8,
+                0, BiasType::Fold, 10.0, 3, 8, 100.0,
             )),
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&tree), Arc::clone(&all_buckets),
-                0, BiasType::Call, 10.0, 3, 8,
+                0, BiasType::Call, 10.0, 3, 8, 100.0,
             )),
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&tree), Arc::clone(&all_buckets),
-                0, BiasType::Raise, 10.0, 3, 8,
+                0, BiasType::Raise, 10.0, 3, 8, 100.0,
             )),
         ];
 

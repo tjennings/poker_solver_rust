@@ -59,9 +59,9 @@ pub trait LeafEvaluator {
 
     /// Batch-evaluate multiple boundary requests in one call.
     ///
-    /// Each request specifies `(pot, effective_stack, traverser)` for a
-    /// different boundary node. All requests share the same combos, board,
-    /// and ranges.
+    /// Each request specifies `(pot, effective_stack, traverser, invested)`
+    /// for a different boundary node. All requests share the same combos,
+    /// board, and ranges.
     ///
     /// Returns one `Vec<f64>` per request (same length as `combos`).
     ///
@@ -73,11 +73,11 @@ pub trait LeafEvaluator {
         board: &[Card],
         oop_range: &[f64],
         ip_range: &[f64],
-        requests: &[(f64, f64, u8)], // (pot, effective_stack, traverser)
+        requests: &[(f64, f64, u8, [f64; 2])], // (pot, effective_stack, traverser, invested)
     ) -> Vec<Vec<f64>> {
         requests
             .iter()
-            .map(|&(pot, eff_stack, traverser)| {
+            .map(|&(pot, eff_stack, traverser, _invested)| {
                 self.evaluate(combos, board, pot, eff_stack, oop_range, ip_range, traverser)
             })
             .collect()
@@ -814,14 +814,14 @@ impl CfvSubgameSolver {
                         for eval_k in 0..k {
                             // Evaluate all boundaries at once (evaluator may
                             // share expensive computation across boundaries).
-                            let requests: Vec<(f64, f64, u8)> = self
+                            let requests: Vec<(f64, f64, u8, [f64; 2])> = self
                                 .boundary_info
                                 .boundaries
                                 .iter()
                                 .map(|&(_, pot, invested)| {
                                     let eff_stack =
                                         self.starting_stack - invested[0].max(invested[1]);
-                                    (pot, eff_stack, traverser)
+                                    (pot, eff_stack, traverser, invested)
                                 })
                                 .collect();
                             // Use initial ranges (not per-boundary propagated ranges)
@@ -914,14 +914,14 @@ impl CfvSubgameSolver {
                     } else {
                         // K=1: original behavior, no choice node.
                         let leaf_eval_start = std::time::Instant::now();
-                        let requests: Vec<(f64, f64, u8)> = self
+                        let requests: Vec<(f64, f64, u8, [f64; 2])> = self
                             .boundary_info
                             .boundaries
                             .iter()
                             .map(|&(_, pot, invested)| {
                                 let eff_stack =
                                     self.starting_stack - invested[0].max(invested[1]);
-                                (pot, eff_stack, traverser)
+                                (pot, eff_stack, traverser, invested)
                             })
                             .collect();
                         let batch = self.evaluators[0].evaluate_boundaries(
