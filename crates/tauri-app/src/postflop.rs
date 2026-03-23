@@ -401,6 +401,9 @@ struct RolloutLeafEvaluator {
     num_rollouts: u32,
     num_opponent_samples: u32,
     starting_stack: f64,
+    /// Stack-to-pot ratio at the subgame root, used to scale the unit
+    /// game's starting stack so rollout dynamics match the real game.
+    root_spr: f64,
 }
 
 impl RolloutLeafEvaluator {
@@ -415,8 +418,10 @@ impl RolloutLeafEvaluator {
         num_rollouts: u32,
         num_opponent_samples: u32,
         starting_stack: f64,
+        root_pot: f64,
     ) -> Self {
         let decision_idx_map = abstract_tree.decision_index_map();
+        let root_spr = (starting_stack - root_pot / 2.0) / root_pot;
         Self {
             strategy,
             abstract_tree,
@@ -428,6 +433,7 @@ impl RolloutLeafEvaluator {
             num_rollouts,
             num_opponent_samples,
             starting_stack,
+            root_spr,
         }
     }
 }
@@ -476,6 +482,8 @@ impl RolloutLeafEvaluator {
                     return 0.0;
                 }
 
+                // Unit game stack: SPR * unit_pot + invested = SPR * 1 + 0.5
+                let unit_stack = self.root_spr + 0.5;
                 let ctx = RolloutContext {
                     abstract_tree: &self.abstract_tree,
                     decision_idx_map: &self.decision_idx_map,
@@ -485,7 +493,7 @@ impl RolloutLeafEvaluator {
                     bias_factor: self.bias_factor,
                     player: traverser,
                     num_rollouts: self.num_rollouts,
-                    starting_stack: self.starting_stack,
+                    starting_stack: unit_stack,
                 };
 
                 let total: f64 = sampled
@@ -547,28 +555,22 @@ impl LeafEvaluator for RolloutLeafEvaluator {
         let hero_range = if traverser == 0 { oop_range } else { ip_range };
         let eval_start = std::time::Instant::now();
 
-        // Compute rollout ONCE using the first boundary's pot/invested.
-        // The rollout walks the abstract tree with the subgame's actual
-        // pot/invested passed through, so terminal payoffs reflect real
-        // chip amounts. All boundaries share the same rollout since the
-        // abstract tree path is the same — only pot/invested differ, and
-        // terminal payoffs scale linearly with pot.
-        let ref_pot = requests[0].0;
-        let ref_invested = requests[0].3;
+        // Compute rollout ONCE using a unit game (pot=1) with the same
+        // SPR as the subgame root. Terminal payoffs scale linearly with
+        // pot, so we scale the unit-game chip values to each boundary's
+        // actual pot to get pot-fraction CFVs.
+        let unit_pot = 1.0;
+        let unit_invested = [0.5, 0.5]; // each player put in half the unit pot
         let chip_values = self.rollout_chip_values_with_state(
-            combos, board, oop_range, ip_range, traverser, ref_pot, ref_invested,
+            combos, board, oop_range, ip_range, traverser, unit_pot, unit_invested,
         );
 
-        // Convert to pot-fraction per boundary, scaling for different pots.
-        let ref_half_pot = ref_pot / 2.0;
+        // Unit-game chip values → pot-fraction: multiply by 2 (divide by half_pot=0.5).
+        // Then scale doesn't depend on boundary pot since payoffs are proportional.
         let results: Vec<Vec<f64>> = requests
             .iter()
-            .map(|&(pot, _, _, _)| {
-                let half_pot = pot / 2.0;
-                // Scale: chip_values are for ref_pot. For a different pot,
-                // payoffs scale proportionally: actual_chips = chip * (pot / ref_pot).
-                let scale = pot / ref_pot;
-                chip_values.iter().map(|&v| v * scale / half_pot).collect()
+            .map(|_| {
+                chip_values.iter().map(|&v| v / 0.5).collect()
             })
             .collect();
 
@@ -700,19 +702,19 @@ pub fn build_subgame_solver(
         vec![
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Unbiased, bias_factor, num_rollouts, opp_samples, starting_stack,
+                abs_node, BiasType::Unbiased, bias_factor, num_rollouts, opp_samples, starting_stack, pot_f,
             )) as Box<dyn LeafEvaluator>,
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Fold, bias_factor, num_rollouts, opp_samples, starting_stack,
+                abs_node, BiasType::Fold, bias_factor, num_rollouts, opp_samples, starting_stack, pot_f,
             )),
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Call, bias_factor, num_rollouts, opp_samples, starting_stack,
+                abs_node, BiasType::Call, bias_factor, num_rollouts, opp_samples, starting_stack, pot_f,
             )),
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Raise, bias_factor, num_rollouts, opp_samples, starting_stack,
+                abs_node, BiasType::Raise, bias_factor, num_rollouts, opp_samples, starting_stack, pot_f,
             )),
         ]
     } else {
@@ -3218,19 +3220,19 @@ mod tests {
         let evaluators: Vec<Box<dyn LeafEvaluator>> = vec![
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&tree), Arc::clone(&all_buckets),
-                0, BiasType::Unbiased, 10.0, 3, 8, 100.0,
+                0, BiasType::Unbiased, 10.0, 3, 8, 100.0, 10.0,
             )),
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&tree), Arc::clone(&all_buckets),
-                0, BiasType::Fold, 10.0, 3, 8, 100.0,
+                0, BiasType::Fold, 10.0, 3, 8, 100.0, 10.0,
             )),
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&tree), Arc::clone(&all_buckets),
-                0, BiasType::Call, 10.0, 3, 8, 100.0,
+                0, BiasType::Call, 10.0, 3, 8, 100.0, 10.0,
             )),
             Box::new(RolloutLeafEvaluator::new(
                 Arc::clone(&strategy), Arc::clone(&tree), Arc::clone(&all_buckets),
-                0, BiasType::Raise, 10.0, 3, 8, 100.0,
+                0, BiasType::Raise, 10.0, 3, 8, 100.0, 10.0,
             )),
         ];
 
