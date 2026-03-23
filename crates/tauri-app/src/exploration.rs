@@ -893,19 +893,19 @@ pub(crate) fn v2_action_info(
             size_key: None,
         },
         TreeAction::Bet(amount) => {
-            let display = (amount - invested_offset) * bb_scale;
+            let display = ((amount - invested_offset) * bb_scale).round();
             ActionInfo {
                 id,
-                label: format!("{display:.1}bb"),
+                label: format!("{display:.0}bb"),
                 action_type: "bet".to_string(),
                 size_key: Some(format!("{amount:.2}")),
             }
         }
         TreeAction::Raise(amount) => {
-            let display = (amount - invested_offset) * bb_scale;
+            let display = ((amount - invested_offset) * bb_scale).round();
             ActionInfo {
                 id,
-                label: format!("{display:.1}bb"),
+                label: format!("{display:.0}bb"),
                 action_type: "raise".to_string(),
                 size_key: Some(format!("{amount:.2}")),
             }

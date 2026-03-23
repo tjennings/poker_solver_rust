@@ -681,14 +681,13 @@ pub fn build_subgame_solver(
     let hands = SubgameHands::enumerate(board_cards);
 
     // Extract action labels from tree root.
-    // invested_offset = pot/2 so labels show bet amounts on this street,
-    // not total invested including preflop contributions.
-    let invested_offset = pot_f / 2.0;
+    // street_bets start at 0 postflop, so no offset needed.
+    // bb_scale = 0.5 converts chip units (1BB = 2 chips) to BB.
     let action_infos = match &tree.nodes[tree.root as usize] {
         GameNode::Decision { actions, .. } => actions
             .iter()
             .enumerate()
-            .map(|(i, a)| v2_action_info(a, i, 0.5, invested_offset))
+            .map(|(i, a)| v2_action_info(a, i, 0.5, 0.0))
             .collect(),
         _ => return Err("Subgame tree root is not a decision node".to_string()),
     };
@@ -2004,11 +2003,10 @@ fn subgame_node_to_result(
                 })
                 .collect();
 
-            let invested_offset = result.initial_pot / 2.0;
             let action_infos: Vec<ActionInfo> = actions
                 .iter()
                 .enumerate()
-                .map(|(i, a)| v2_action_info(a, i, 0.5, invested_offset))
+                .map(|(i, a)| v2_action_info(a, i, 0.5, 0.0))
                 .collect();
 
             let (pot_i32, stacks_i32) = decision_display_info(
