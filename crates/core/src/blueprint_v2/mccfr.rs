@@ -363,6 +363,162 @@ impl AllBuckets {
     }
 }
 
+/// Full-tree EV accumulator that tracks EVs at ALL decision nodes.
+///
+/// Maps every arena index to a dense decision-node index via `decision_map`.
+/// Each decision node gets a `[player][169]` pair of sum/count arrays.
+/// Persisted as `hand_ev.bin` in snapshots for resume support.
+pub struct FullTreeEvTracker {
+    num_nodes: usize,
+    /// `decision_map[arena_idx]` -> decision_node_idx (`u32::MAX` if not a decision).
+    decision_map: Vec<u32>,
+    /// `ev_sum[decision_idx][player][hand_index]` -- sum * 1000.
+    pub ev_sum: Vec<[[AtomicI64; 169]; 2]>,
+    /// `ev_count[decision_idx][player][hand_index]`.
+    pub ev_count: Vec<[[AtomicU64; 169]; 2]>,
+}
+
+impl FullTreeEvTracker {
+    /// Create a new tracker for all decision nodes in the tree.
+    #[must_use]
+    pub fn new(tree: &super::game_tree::GameTree) -> Self {
+        let decision_map = tree.decision_index_map();
+        let num_nodes = decision_map.iter().filter(|&&d| d != u32::MAX).count();
+        let ev_sum = (0..num_nodes)
+            .map(|_| {
+                [
+                    std::array::from_fn(|_| AtomicI64::new(0)),
+                    std::array::from_fn(|_| AtomicI64::new(0)),
+                ]
+            })
+            .collect();
+        let ev_count = (0..num_nodes)
+            .map(|_| {
+                [
+                    std::array::from_fn(|_| AtomicU64::new(0)),
+                    std::array::from_fn(|_| AtomicU64::new(0)),
+                ]
+            })
+            .collect();
+        Self {
+            num_nodes,
+            decision_map,
+            ev_sum,
+            ev_count,
+        }
+    }
+
+    /// Accumulate an EV sample at an arena node. No-op if the node is not a decision.
+    pub fn accumulate(&self, arena_idx: u32, player: usize, hand_index: usize, ev: f64) {
+        let dec_idx = self.decision_map[arena_idx as usize];
+        if dec_idx == u32::MAX {
+            return;
+        }
+        let idx = dec_idx as usize;
+        self.ev_sum[idx][player][hand_index]
+            .fetch_add((ev * 1000.0) as i64, AtomicOrdering::Relaxed);
+        self.ev_count[idx][player][hand_index]
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Compute average EV per hand for a decision node and player.
+    #[must_use]
+    pub fn hand_ev_array(&self, decision_idx: usize, player: usize) -> [f64; 169] {
+        std::array::from_fn(|i| {
+            let sum =
+                self.ev_sum[decision_idx][player][i].load(AtomicOrdering::Relaxed) as f64 / 1000.0;
+            let count =
+                self.ev_count[decision_idx][player][i].load(AtomicOrdering::Relaxed);
+            if count > 0 {
+                sum / count as f64
+            } else {
+                0.0
+            }
+        })
+    }
+
+    /// Number of decision nodes tracked.
+    #[must_use]
+    pub fn num_nodes(&self) -> usize {
+        self.num_nodes
+    }
+
+    /// Save to binary file: `[u32 num_nodes][per node: per player: per hand: i64 sum, u64 count]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be created or written.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        f.write_all(&(self.num_nodes as u32).to_le_bytes())?;
+        for node_idx in 0..self.num_nodes {
+            for player in 0..2 {
+                for hand in 0..169 {
+                    let sum =
+                        self.ev_sum[node_idx][player][hand].load(AtomicOrdering::Relaxed);
+                    let count =
+                        self.ev_count[node_idx][player][hand].load(AtomicOrdering::Relaxed);
+                    f.write_all(&sum.to_le_bytes())?;
+                    f.write_all(&count.to_le_bytes())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Load from binary file. Handles mismatched node counts gracefully:
+    /// loads min(saved, current) nodes, ignores extras.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened or read.
+    pub fn load(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Read;
+        let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
+        let mut buf4 = [0u8; 4];
+        f.read_exact(&mut buf4)?;
+        let saved_nodes = u32::from_le_bytes(buf4) as usize;
+        let nodes_to_load = saved_nodes.min(self.num_nodes);
+        let mut buf8 = [0u8; 8];
+        for node_idx in 0..saved_nodes {
+            for player in 0..2 {
+                for hand in 0..169 {
+                    f.read_exact(&mut buf8)?;
+                    let sum = i64::from_le_bytes(buf8);
+                    f.read_exact(&mut buf8)?;
+                    let count = u64::from_le_bytes(buf8);
+                    if node_idx < nodes_to_load {
+                        self.ev_sum[node_idx][player][hand]
+                            .store(sum, AtomicOrdering::Relaxed);
+                        self.ev_count[node_idx][player][hand]
+                            .store(count, AtomicOrdering::Relaxed);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reset all accumulators to zero.
+    pub fn reset(&self) {
+        for node in &self.ev_sum {
+            for player in node {
+                for val in player {
+                    val.store(0, AtomicOrdering::Relaxed);
+                }
+            }
+        }
+        for node in &self.ev_count {
+            for player in node {
+                for val in player {
+                    val.store(0, AtomicOrdering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
 /// Per-scenario-node EV accumulator for TUI display.
 ///
 /// Each scenario node gets a `[player][169]` pair of sum/count arrays.
@@ -464,6 +620,7 @@ impl ScenarioEvTracker {
 /// * `rake_rate` - Fraction of pot taken as rake (0.0 = no rake)
 /// * `rake_cap` - Maximum rake in chip units (0.0 = no cap)
 /// * `ev_tracker` - Optional per-scenario EV tracker for TUI display
+/// * `full_ev_tracker` - Optional full-tree EV tracker for all decision nodes
 #[allow(clippy::too_many_arguments)]
 pub fn traverse_external(
     tree: &GameTree,
@@ -477,6 +634,7 @@ pub fn traverse_external(
     rake_rate: f64,
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
+    full_ev_tracker: Option<&FullTreeEvTracker>,
 ) -> (f64, PruneStats) {
     match &tree.nodes[node_idx as usize] {
         GameNode::Terminal { kind, invested, .. } => {
@@ -487,7 +645,7 @@ pub fn traverse_external(
             // Board cards are pre-dealt in the Deal; just recurse.
             traverse_external(
                 tree, storage, deal, traverser, *child, prune, prune_threshold, rng,
-                rake_rate, rake_cap, ev_tracker,
+                rake_rate, rake_cap, ev_tracker, full_ev_tracker,
             )
         }
 
@@ -519,6 +677,7 @@ pub fn traverse_external(
                     rake_rate,
                     rake_cap,
                     ev_tracker,
+                    full_ev_tracker,
                 )
             } else {
                 traverse_opponent(
@@ -536,6 +695,7 @@ pub fn traverse_external(
                     rake_rate,
                     rake_cap,
                     ev_tracker,
+                    full_ev_tracker,
                 )
             }
         }
@@ -635,6 +795,7 @@ fn traverse_traverser(
     rake_rate: f64,
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
+    full_ev_tracker: Option<&FullTreeEvTracker>,
 ) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
@@ -660,7 +821,7 @@ fn traverse_traverser(
 
         let (child_ev, child_stats) = traverse_external(
             tree, storage, deal, traverser, child_idx, prune, prune_threshold, rng,
-            rake_rate, rake_cap, ev_tracker,
+            rake_rate, rake_cap, ev_tracker, full_ev_tracker,
         );
         action_values[a] = child_ev;
         node_value += strategy[a] * child_ev;
@@ -683,14 +844,20 @@ fn traverse_traverser(
     }
 
     // Accumulate EV at tracked scenario nodes.
+    let hand_index = crate::hands::CanonicalHand::from_cards(
+        deal.deal.hole_cards[traverser as usize][0],
+        deal.deal.hole_cards[traverser as usize][1],
+    )
+    .index();
+
     if let Some(tracker) = ev_tracker {
         if let Some(scenario_idx) = tracker.find_scenario(node_idx) {
-            let hand_index = crate::hands::CanonicalHand::from_cards(
-                deal.deal.hole_cards[traverser as usize][0],
-                deal.deal.hole_cards[traverser as usize][1],
-            ).index();
             tracker.accumulate(scenario_idx, traverser as usize, hand_index, node_value);
         }
+    }
+
+    if let Some(tracker) = full_ev_tracker {
+        tracker.accumulate(node_idx, traverser as usize, hand_index, node_value);
     }
 
     (node_value, stats)
@@ -714,6 +881,7 @@ fn traverse_opponent(
     rake_rate: f64,
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
+    full_ev_tracker: Option<&FullTreeEvTracker>,
 ) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
@@ -733,7 +901,7 @@ fn traverse_opponent(
 
     traverse_external(
         tree, storage, deal, traverser, children[chosen], prune, prune_threshold, rng,
-        rake_rate, rake_cap, ev_tracker,
+        rake_rate, rake_cap, ev_tracker, full_ev_tracker,
     )
 }
 
@@ -836,6 +1004,139 @@ mod tests {
         }
     }
 
+    // --- FullTreeEvTracker tests ---
+
+    #[test]
+    fn full_tree_ev_tracker_new_counts_decision_nodes() {
+        let tree = toy_tree();
+        let tracker = FullTreeEvTracker::new(&tree);
+        // The toy tree has decision nodes; num_nodes should match.
+        let (decision_count, _, _) = tree.node_counts();
+        assert_eq!(tracker.num_nodes(), decision_count);
+    }
+
+    #[test]
+    fn full_tree_ev_tracker_accumulates() {
+        let tree = toy_tree();
+        let tracker = FullTreeEvTracker::new(&tree);
+        tracker.accumulate(tree.root, 0, 42, 2.5);
+        tracker.accumulate(tree.root, 0, 42, 3.5);
+        let dec_idx = tree.decision_index_map()[tree.root as usize];
+        let evs = tracker.hand_ev_array(dec_idx as usize, 0);
+        assert!((evs[42] - 3.0).abs() < 0.01, "expected avg 3.0, got {}", evs[42]);
+    }
+
+    #[test]
+    fn full_tree_ev_tracker_accumulate_non_decision_is_noop() {
+        let tree = toy_tree();
+        let tracker = FullTreeEvTracker::new(&tree);
+        // Find a terminal node (non-decision).
+        let decision_map = tree.decision_index_map();
+        let terminal_idx = decision_map.iter().position(|&d| d == u32::MAX).unwrap();
+        // Accumulating at a non-decision node should not panic.
+        tracker.accumulate(terminal_idx as u32, 0, 0, 1.0);
+    }
+
+    #[test]
+    fn full_tree_ev_tracker_both_players() {
+        let tree = toy_tree();
+        let tracker = FullTreeEvTracker::new(&tree);
+        let dec_idx = tree.decision_index_map()[tree.root as usize];
+        tracker.accumulate(tree.root, 0, 10, 5.0);
+        tracker.accumulate(tree.root, 1, 10, -3.0);
+        let evs_p0 = tracker.hand_ev_array(dec_idx as usize, 0);
+        let evs_p1 = tracker.hand_ev_array(dec_idx as usize, 1);
+        assert!((evs_p0[10] - 5.0).abs() < 0.01);
+        assert!((evs_p1[10] - (-3.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn full_tree_ev_tracker_no_samples_returns_zero() {
+        let tree = toy_tree();
+        let tracker = FullTreeEvTracker::new(&tree);
+        let dec_idx = tree.decision_index_map()[tree.root as usize];
+        let evs = tracker.hand_ev_array(dec_idx as usize, 0);
+        for &v in &evs {
+            assert!((v - 0.0).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn full_tree_ev_tracker_reset_zeroes_all() {
+        let tree = toy_tree();
+        let tracker = FullTreeEvTracker::new(&tree);
+        tracker.accumulate(tree.root, 0, 42, 10.0);
+        tracker.reset();
+        let dec_idx = tree.decision_index_map()[tree.root as usize];
+        let evs = tracker.hand_ev_array(dec_idx as usize, 0);
+        assert!((evs[42] - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn full_tree_ev_tracker_save_load_roundtrip() {
+        let tree = toy_tree();
+        let tracker = FullTreeEvTracker::new(&tree);
+        tracker.accumulate(tree.root, 0, 10, 5.0);
+        tracker.accumulate(tree.root, 1, 100, -2.5);
+        let tmp = std::env::temp_dir().join("test_hand_ev_roundtrip.bin");
+        tracker.save(&tmp).unwrap();
+        let tracker2 = FullTreeEvTracker::new(&tree);
+        tracker2.load(&tmp).unwrap();
+        let dec_idx = tree.decision_index_map()[tree.root as usize];
+        let evs_p0 = tracker2.hand_ev_array(dec_idx as usize, 0);
+        let evs_p1 = tracker2.hand_ev_array(dec_idx as usize, 1);
+        assert!((evs_p0[10] - 5.0).abs() < 0.01, "p0 hand 10 should be 5.0, got {}", evs_p0[10]);
+        assert!((evs_p1[100] - (-2.5)).abs() < 0.01, "p1 hand 100 should be -2.5, got {}", evs_p1[100]);
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn full_tree_ev_tracker_load_smaller_file() {
+        // Build a small tree, save, then load into a bigger tracker.
+        let tree = toy_tree();
+        let tracker = FullTreeEvTracker::new(&tree);
+        tracker.accumulate(tree.root, 0, 5, 7.0);
+        let tmp = std::env::temp_dir().join("test_hand_ev_smaller.bin");
+        tracker.save(&tmp).unwrap();
+        // Load into the same tree — should work fine.
+        let tracker2 = FullTreeEvTracker::new(&tree);
+        tracker2.load(&tmp).unwrap();
+        let dec_idx = tree.decision_index_map()[tree.root as usize];
+        let evs = tracker2.hand_ev_array(dec_idx as usize, 0);
+        assert!((evs[5] - 7.0).abs() < 0.01);
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn traverse_with_full_tracker_accumulates_ev() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
+        let precomputed = make_precomputed(&buckets, make_deal());
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let tracker = FullTreeEvTracker::new(&tree);
+
+        for _ in 0..20 {
+            traverse_external(
+                &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
+                &mut rng, 0.0, 0.0, None, Some(&tracker),
+            );
+        }
+
+        // The root node is a decision node for player 0 (SB),
+        // so EVs for player 0 should have samples.
+        let hand_idx = crate::hands::CanonicalHand::from_cards(
+            precomputed.deal.hole_cards[0][0],
+            precomputed.deal.hole_cards[0][1],
+        ).index();
+        let dec_idx = tree.decision_index_map()[tree.root as usize];
+        let evs = tracker.hand_ev_array(dec_idx as usize, 0);
+        let count = tracker.ev_count[dec_idx as usize][0][hand_idx].load(Ordering::Relaxed);
+        assert!(count > 0, "should have accumulated samples for traverser hand");
+        assert!(evs[hand_idx].is_finite(), "EV should be finite");
+    }
+
     #[test]
     fn traverse_with_tracker_accumulates_ev() {
         let tree = toy_tree();
@@ -850,7 +1151,7 @@ mod tests {
         for _ in 0..20 {
             traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-                &mut rng, 0.0, 0.0, Some(&tracker),
+                &mut rng, 0.0, 0.0, Some(&tracker), None,
             );
         }
 
@@ -876,7 +1177,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-            &mut rng, 0.0, 0.0, None,
+            &mut rng, 0.0, 0.0, None, None,
         );
         assert!(ev.is_finite(), "EV should be finite without tracker");
     }
@@ -937,7 +1238,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None,
+            0.0, 0.0, None, None,
         );
         assert!(ev.is_finite(), "EV should be finite, got {ev}");
     }
@@ -955,11 +1256,11 @@ mod tests {
 
         let (ev0, _) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None,
+            0.0, 0.0, None, None,
         );
         let (ev1, _) = traverse_external(
             &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None,
+            0.0, 0.0, None, None,
         );
 
         assert!(ev0.is_finite());
@@ -981,7 +1282,7 @@ mod tests {
 
         let (_ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None,
+            0.0, 0.0, None, None,
         );
 
         assert!(
@@ -1003,7 +1304,7 @@ mod tests {
 
         let (_ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None,
+            0.0, 0.0, None, None,
         );
 
         assert!(
@@ -1027,11 +1328,11 @@ mod tests {
         for _ in 0..50 {
             let _ = traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-                0.0, 0.0, None,
+                0.0, 0.0, None, None,
             );
             let _ = traverse_external(
                 &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
-                0.0, 0.0, None,
+                0.0, 0.0, None, None,
             );
         }
 
@@ -1069,7 +1370,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, true, -310_000_000, &mut rng,
-            0.0, 0.0, None,
+            0.0, 0.0, None, None,
         );
         assert!(ev.is_finite());
     }

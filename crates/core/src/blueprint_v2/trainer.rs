@@ -26,7 +26,7 @@ use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
 use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
-use super::mccfr::{traverse_external, AllBuckets, Deal, DealWithBuckets, PruneStats, ScenarioEvTracker, PRUNE_HITS, PRUNE_TOTAL};
+use super::mccfr::{traverse_external, AllBuckets, Deal, DealWithBuckets, FullTreeEvTracker, PruneStats, ScenarioEvTracker, PRUNE_HITS, PRUNE_TOTAL};
 use super::storage::BlueprintStorage;
 use crate::hands::CanonicalHand;
 use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
@@ -140,6 +140,8 @@ pub struct BlueprintTrainer {
     // --- Per-scenario-node EV tracking ---
     /// Per-scenario-node EV accumulator for TUI display.
     pub scenario_ev_tracker: ScenarioEvTracker,
+    /// Full-tree EV tracker for all decision nodes (persisted in snapshots).
+    pub full_ev_tracker: FullTreeEvTracker,
 
     // --- TUI shared state ---
     /// Iteration counter visible to the TUI thread.
@@ -273,6 +275,8 @@ impl BlueprintTrainer {
 
         let deck = *CANONICAL_DECK;
 
+        let full_ev_tracker = FullTreeEvTracker::new(&tree);
+
         Self {
             tree,
             storage,
@@ -287,6 +291,7 @@ impl BlueprintTrainer {
             snapshot_count: 0,
             deck,
             scenario_ev_tracker: ScenarioEvTracker::new(vec![]),
+            full_ev_tracker,
             skip_bucket_validation: false,
             bucket_visits: [
                 (0..bucket_counts[0]).map(|_| AtomicU64::new(0)).collect(),
@@ -399,6 +404,12 @@ impl BlueprintTrainer {
 
         self.snapshot_count = snapshot_num + 1;
 
+        // Load full-tree EV tracker if available.
+        let hand_ev_path = snapshot_dir.join("hand_ev.bin");
+        if hand_ev_path.exists() {
+            self.full_ev_tracker.load(&hand_ev_path)?;
+        }
+
         // Seed the strategy-delta baseline so the first check after resume
         // compares against the loaded state instead of producing zero.
         self.prev_strategy_sums = Some(self.storage.snapshot_strategy_sums());
@@ -479,6 +490,7 @@ impl BlueprintTrainer {
             let storage = &self.storage;
             let buckets_ref = &self.buckets;
             let ev_tracker = &self.scenario_ev_tracker;
+            let full_ev_tracker = &self.full_ev_tracker;
             let visit_counters = &self.bucket_visits;
 
             let rake_rate = self.config.game.rake_rate;
@@ -506,12 +518,12 @@ impl BlueprintTrainer {
 
                 let (_, s0) = traverse_external(
                     tree, storage, &deal, 0, tree.root, prune, threshold, &mut rng,
-                    rake_rate, rake_cap, Some(ev_tracker),
+                    rake_rate, rake_cap, Some(ev_tracker), Some(full_ev_tracker),
                 );
                 stats.merge(s0);
                 let (_, s1) = traverse_external(
                     tree, storage, &deal, 1, tree.root, prune, threshold, &mut rng,
-                    rake_rate, rake_cap, Some(ev_tracker),
+                    rake_rate, rake_cap, Some(ev_tracker), Some(full_ev_tracker),
                 );
                 stats.merge(s1);
 
@@ -644,13 +656,20 @@ impl BlueprintTrainer {
 
         // Strategy refresh for TUI.
         if refresh_due {
+            let decision_map = self.tree.decision_index_map();
             if let Some(ref callback) = self.on_strategy_refresh {
                 for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
                     let player = match &self.tree.nodes[node_idx as usize] {
                         super::game_tree::GameNode::Decision { player, .. } => *player as usize,
                         _ => 0,
                     };
-                    let mut hand_evs = self.scenario_ev_tracker.hand_ev_array(i, player);
+                    // Read EVs from the full-tree tracker.
+                    let dec_idx = decision_map[node_idx as usize];
+                    let mut hand_evs = if dec_idx != u32::MAX {
+                        self.full_ev_tracker.hand_ev_array(dec_idx as usize, player)
+                    } else {
+                        [0.0; 169]
+                    };
                     // Normalize to decision-point frame: fold = 0.
                     // The traversal measures from hand start, so node_value
                     // includes the sunk cost of reaching this node. Subtract
@@ -667,6 +686,7 @@ impl BlueprintTrainer {
             // Reset EV accumulators after reading so displayed values
             // reflect only the most recent window, not cumulative history.
             self.scenario_ev_tracker.reset();
+            self.full_ev_tracker.reset();
             self.last_strategy_refresh_secs = elapsed_secs;
         }
 
@@ -1005,6 +1025,9 @@ impl BlueprintTrainer {
         );
 
         bundle::save_snapshot(&snapshot_dir, &strategy, &self.storage, &metadata)?;
+
+        // Save full-tree EV tracker.
+        self.full_ev_tracker.save(&snapshot_dir.join("hand_ev.bin"))?;
 
         // Compute and save counterfactual boundary values (CBVs) for
         // real-time subgame solving. One table per player, indexed by
@@ -1376,6 +1399,7 @@ mod tests {
         assert!(snapshot_dir.join("regrets.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
         assert!(snapshot_dir.join("hand_ev.json").exists());
+        assert!(snapshot_dir.join("hand_ev.bin").exists(), "full-tree EV tracker should be saved");
 
         // Verify hand_ev.json is valid JSON with 169 entries.
         let ev_json = std::fs::read_to_string(snapshot_dir.join("hand_ev.json"))
@@ -1525,6 +1549,9 @@ mod tests {
                 .any(|r| r.load(Ordering::Relaxed) != 0),
             "regrets should be loaded from snapshot"
         );
+
+        // Full EV tracker should have been loaded from hand_ev.bin.
+        assert!(snapshot_dir.join("hand_ev.bin").exists(), "hand_ev.bin should exist in snapshot");
 
         trainer2.train().expect("resumed training");
         assert_eq!(trainer2.iterations, 40, "should reach 40 total");
