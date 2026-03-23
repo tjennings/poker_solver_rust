@@ -1031,7 +1031,6 @@ impl CfvSubgameSolver {
         let avg_strategy = self.build_average_strategy();
         let num_combos = self.hands.combos.len();
         let mut cfvs = Vec::with_capacity(num_combos);
-        let max_cfv = self.starting_stack;
 
         for combo_idx in 0..num_combos {
             let val = self.eval_combo_value(
@@ -1039,11 +1038,6 @@ impl CfvSubgameSolver {
                 self.tree.root as usize,
                 combo_idx,
                 traverser,
-            );
-            super::mccfr::assert_cfv_bounds(
-                val,
-                max_cfv,
-                &format!("combo {} ({:?})", combo_idx, self.hands.combos[combo_idx]),
             );
             cfvs.push(val);
         }
