@@ -545,21 +545,30 @@ impl LeafEvaluator for RolloutLeafEvaluator {
 
         let traverser = requests[0].2;
         let hero_range = if traverser == 0 { oop_range } else { ip_range };
-        let opp_range = if traverser == 0 { ip_range } else { oop_range };
         let eval_start = std::time::Instant::now();
 
-        // Each boundary has its own pot/invested, so we compute rollout
-        // chip values per boundary. The rollout passes the subgame's actual
-        // pot/invested through the abstract tree so terminal payoffs reflect
-        // the real chip amounts.
+        // Compute rollout ONCE using the first boundary's pot/invested.
+        // The rollout walks the abstract tree with the subgame's actual
+        // pot/invested passed through, so terminal payoffs reflect real
+        // chip amounts. All boundaries share the same rollout since the
+        // abstract tree path is the same — only pot/invested differ, and
+        // terminal payoffs scale linearly with pot.
+        let ref_pot = requests[0].0;
+        let ref_invested = requests[0].3;
+        let chip_values = self.rollout_chip_values_with_state(
+            combos, board, oop_range, ip_range, traverser, ref_pot, ref_invested,
+        );
+
+        // Convert to pot-fraction per boundary, scaling for different pots.
+        let ref_half_pot = ref_pot / 2.0;
         let results: Vec<Vec<f64>> = requests
             .iter()
-            .map(|&(pot, _eff_stack, trav, invested)| {
-                let chip_values = self.rollout_chip_values_with_state(
-                    combos, board, oop_range, ip_range, trav, pot, invested,
-                );
+            .map(|&(pot, _, _, _)| {
                 let half_pot = pot / 2.0;
-                chip_values.iter().map(|&v| v / half_pot).collect()
+                // Scale: chip_values are for ref_pot. For a different pot,
+                // payoffs scale proportionally: actual_chips = chip * (pot / ref_pot).
+                let scale = pot / ref_pot;
+                chip_values.iter().map(|&v| v * scale / half_pot).collect()
             })
             .collect();
 
