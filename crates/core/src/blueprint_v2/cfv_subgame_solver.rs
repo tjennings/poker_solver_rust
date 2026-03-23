@@ -59,7 +59,7 @@ pub trait LeafEvaluator {
 
     /// Batch-evaluate multiple boundary requests in one call.
     ///
-    /// Each request specifies `(pot, effective_stack, traverser, invested)`
+    /// Each request specifies `(pot, effective_stack, traverser)`
     /// for a different boundary node. All requests share the same combos,
     /// board, and ranges.
     ///
@@ -73,11 +73,11 @@ pub trait LeafEvaluator {
         board: &[Card],
         oop_range: &[f64],
         ip_range: &[f64],
-        requests: &[(f64, f64, u8, [f64; 2])], // (pot, effective_stack, traverser, invested)
+        requests: &[(f64, f64, u8)], // (pot, effective_stack, traverser)
     ) -> Vec<Vec<f64>> {
         requests
             .iter()
-            .map(|&(pot, eff_stack, traverser, _invested)| {
+            .map(|&(pot, eff_stack, traverser)| {
                 self.evaluate(combos, board, pot, eff_stack, oop_range, ip_range, traverser)
             })
             .collect()
@@ -90,10 +90,10 @@ pub trait LeafEvaluator {
 
 /// Information about depth boundary nodes in the tree.
 ///
-/// Each entry records: `(node_index, pot, invested)`.
+/// Each entry records: `(node_index, pot)`.
 #[derive(Debug, Clone)]
 pub struct BoundaryInfo {
-    pub boundaries: Vec<(usize, f64, [f64; 2])>,
+    pub boundaries: Vec<(usize, f64)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,11 +173,13 @@ pub struct CfvSubgameSolver {
     starting_stack: f64,
     /// Precomputed: for each combo, the total opponent reach of non-blocked combos.
     opp_reach_totals: Vec<f64>,
-    /// Initial reach probabilities for OOP (player 0).
+    /// Initial reach probabilities for OOP.
     /// From preflop range filtering — not all combos are equally likely.
     oop_reach_init: Vec<f64>,
-    /// Initial reach probabilities for IP (player 1).
+    /// Initial reach probabilities for IP.
     ip_reach_init: Vec<f64>,
+    /// Seat index of the OOP player (`1 - dealer`).
+    oop_seat: u8,
 }
 
 impl CfvSubgameSolver {
@@ -224,17 +226,18 @@ impl CfvSubgameSolver {
             if let GameNode::Terminal {
                 kind: TerminalKind::DepthBoundary,
                 pot,
-                invested,
             } = node
             {
                 let ordinal = boundaries.len();
-                boundaries.push((idx, *pot, *invested));
+                boundaries.push((idx, *pot));
                 node_to_boundary[idx] = ordinal;
             }
         }
 
         let num_boundaries = boundaries.len();
         let leaf_cfvs = vec![vec![0.0; n]; num_boundaries];
+
+        let oop_seat = 1 - tree.dealer;
 
         Self {
             tree,
@@ -262,6 +265,7 @@ impl CfvSubgameSolver {
             opp_reach_totals,
             oop_reach_init: oop_reach,
             ip_reach_init: ip_reach,
+            oop_seat,
         }
     }
 
@@ -467,7 +471,7 @@ impl CfvSubgameSolver {
                     let child_idx = children_buf[a];
 
                     // Build child reach into this_level, reusing the buffer.
-                    if player == 0 {
+                    if player == self.oop_seat {
                         for combo_idx in 0..n {
                             let strat_prob =
                                 snapshot[node_base + combo_idx * num_actions + a];
@@ -537,13 +541,13 @@ impl CfvSubgameSolver {
 
         // Extract node info into small Copy types to free borrow on self.tree.
         enum NodeInfo {
-            Terminal { kind: TerminalKind, pot: f64, invested: [f64; 2] },
+            Terminal { kind: TerminalKind, pot: f64 },
             Chance { child: u32 },
             Decision { player: u8, num_actions: usize, children_buf: [u32; 16] },
         }
 
         let info = match &self.tree.nodes[node_idx] {
-            GameNode::Terminal { kind, pot, invested } => NodeInfo::Terminal { kind: *kind, pot: *pot, invested: *invested },
+            GameNode::Terminal { kind, pot } => NodeInfo::Terminal { kind: *kind, pot: *pot },
             GameNode::Chance { child, .. } => NodeInfo::Chance { child: *child },
             GameNode::Decision { player, children, actions, .. } => {
                 let num_actions = actions.len();
@@ -559,42 +563,27 @@ impl CfvSubgameSolver {
         };
 
         match info {
-            NodeInfo::Terminal { kind, pot, invested } => {
+            NodeInfo::Terminal { kind, pot } => {
                 let half_pot = pot / 2.0;
                 match kind {
                     TerminalKind::Fold { winner } => {
-                        // Folder gets 0 (sunk costs are sunk, walk away).
-                        // Winner gets the dead money pot + opponent's
-                        // street investment.
+                        // Pot-only: winner gets pot, folder gets 0.
                         let payoff = if winner == traverser {
-                            let opponent = (1 - traverser) as usize;
-                            // pot includes initial dead money + both investments.
-                            // Winner's gain = pot - own investment = dead_money + opp_investment.
-                            pot - invested[traverser as usize]
+                            pot
                         } else {
                             0.0
                         };
-                        // Diagnostic: log fold payoffs on first iteration.
-                        if self.iteration <= 1 && self.iteration > 0 {
-                            eprintln!(
-                                "[fold payoff] node={node_idx} winner={winner} traverser={traverser} \
-                                 pot={pot:.1} invested={invested:?} payoff={payoff:.2}"
-                            );
-                        }
                         for i in 0..n {
                             cfv_buf[out_start + i] = payoff;
                         }
                     }
                     TerminalKind::Showdown => {
-                        // Compute equity conditional on the opponent's reaching
-                        // range. Uses asymmetric payoffs: win = pot - invested,
-                        // lose = -invested.
+                        // Pot-only: EV = equity * pot.
                         compute_conditional_showdowns(
                             &self.hands.combos,
                             &self.equity_matrix,
                             reach_opponent,
                             pot,
-                            invested[traverser as usize],
                             &mut cfv_buf[out_start..out_start + n],
                         );
                     }
@@ -797,14 +786,15 @@ impl CfvSubgameSolver {
             let k = self.evaluators.len();
             let root_idx = self.tree.root as usize;
 
+            let oop_seat = self.oop_seat;
             for traverser in 0..2u8 {
-                let (reach_trav, reach_opp) = if traverser == 0 {
+                let (reach_trav, reach_opp) = if traverser == oop_seat {
                     (oop_reach.as_slice(), ip_reach.as_slice())
                 } else {
                     (ip_reach.as_slice(), oop_reach.as_slice())
                 };
 
-                if let Some((ref oop_ranges, ref ip_ranges)) = boundary_ranges {
+                if let Some((ref _oop_ranges, ref _ip_ranges)) = boundary_ranges {
                     if k > 1 {
                         // Multi-valued: choice node with K strategies.
                         let choice_probs = regret_match(&self.choice_regret_sum);
@@ -814,14 +804,17 @@ impl CfvSubgameSolver {
                         for eval_k in 0..k {
                             // Evaluate all boundaries at once (evaluator may
                             // share expensive computation across boundaries).
-                            let requests: Vec<(f64, f64, u8, [f64; 2])> = self
+                            // Map seat-based traverser to positional (0=OOP, 1=IP)
+                            // for the LeafEvaluator interface.
+                            let pos_trav = if traverser == oop_seat { 0u8 } else { 1u8 };
+                            let requests: Vec<(f64, f64, u8)> = self
                                 .boundary_info
                                 .boundaries
                                 .iter()
-                                .map(|&(_, pot, invested)| {
-                                    let eff_stack =
-                                        self.starting_stack - invested[0].max(invested[1]);
-                                    (pot, eff_stack, traverser, invested)
+                                .map(|&(_, pot)| {
+                                    // Effective stack: approximate from pot
+                                    let eff_stack = self.starting_stack - pot / 2.0;
+                                    (pot, eff_stack, pos_trav)
                                 })
                                 .collect();
                             // Use initial ranges (not per-boundary propagated ranges)
@@ -865,7 +858,7 @@ impl CfvSubgameSolver {
                         }
 
                         // Log leaf evaluation timing at intervals.
-                        if traverser == 0
+                        if traverser == oop_seat
                             && (self.iteration == 1
                                 || self.iteration.is_multiple_of(100)
                                 || iter_idx == iterations - 1)
@@ -879,7 +872,7 @@ impl CfvSubgameSolver {
                         }
 
                         // Compute choice node regrets.
-                        let reach = if traverser == 0 { &oop_reach } else { &ip_reach };
+                        let reach = if traverser == oop_seat { &oop_reach } else { &ip_reach };
                         let total_reach: f64 = reach.iter().sum();
                         if total_reach > 0.0 {
                             let v_k: Vec<f64> = root_cfvs_per_k
@@ -914,14 +907,14 @@ impl CfvSubgameSolver {
                     } else {
                         // K=1: original behavior, no choice node.
                         let leaf_eval_start = std::time::Instant::now();
-                        let requests: Vec<(f64, f64, u8, [f64; 2])> = self
+                        let pos_trav = if traverser == oop_seat { 0u8 } else { 1u8 };
+                        let requests: Vec<(f64, f64, u8)> = self
                             .boundary_info
                             .boundaries
                             .iter()
-                            .map(|&(_, pot, invested)| {
-                                let eff_stack =
-                                    self.starting_stack - invested[0].max(invested[1]);
-                                (pot, eff_stack, traverser, invested)
+                            .map(|&(_, pot)| {
+                                let eff_stack = self.starting_stack - pot / 2.0;
+                                (pot, eff_stack, pos_trav)
                             })
                             .collect();
                         let batch = self.evaluators[0].evaluate_boundaries(
@@ -934,7 +927,7 @@ impl CfvSubgameSolver {
                         for (b_idx, cfvs) in batch.into_iter().enumerate() {
                             self.leaf_cfvs[b_idx] = cfvs;
                         }
-                        if traverser == 0
+                        if traverser == oop_seat
                             && (self.iteration == 1
                                 || self.iteration.is_multiple_of(100)
                                 || iter_idx == iterations - 1)
@@ -1026,8 +1019,13 @@ impl CfvSubgameSolver {
     /// from the last training iteration, which is acceptable because the
     /// average strategy converges to Nash and the last boundary evaluations
     /// reflect the final range propagation.
+    /// Compute root counterfactual values for each combo.
+    ///
+    /// `traverser`: positional index (0 = OOP, 1 = IP).
     #[must_use]
     pub fn root_cfvs(&self, traverser: u8) -> Vec<f64> {
+        // Convert positional (0=OOP, 1=IP) to seat index.
+        let seat = if traverser == 0 { self.oop_seat } else { 1 - self.oop_seat };
         let avg_strategy = self.build_average_strategy();
         let num_combos = self.hands.combos.len();
         let mut cfvs = Vec::with_capacity(num_combos);
@@ -1037,7 +1035,7 @@ impl CfvSubgameSolver {
                 &avg_strategy,
                 self.tree.root as usize,
                 combo_idx,
-                traverser,
+                seat,
             );
             cfvs.push(val);
         }
@@ -1058,18 +1056,18 @@ impl CfvSubgameSolver {
         traverser: u8,
     ) -> f64 {
         match &self.tree.nodes[node_idx] {
-            GameNode::Terminal { kind, pot, invested } => {
+            GameNode::Terminal { kind, pot } => {
                 let half_pot = *pot / 2.0;
                 match kind {
                     TerminalKind::Fold { winner } => {
                         if *winner == traverser {
-                            pot - invested[traverser as usize]
+                            *pot
                         } else {
-                            -invested[traverser as usize]
+                            0.0
                         }
                     }
                     TerminalKind::Showdown => {
-                        self.showdown_value_avg(combo_idx, *pot, invested[traverser as usize], traverser)
+                        self.showdown_value_avg(combo_idx, *pot, traverser)
                     }
                     TerminalKind::DepthBoundary => {
                         let ordinal = self.node_to_boundary[node_idx];
@@ -1111,8 +1109,8 @@ impl CfvSubgameSolver {
     }
 
     /// Showdown value for `root_cfvs` evaluation: equity vs opponent's initial reach.
-    fn showdown_value_avg(&self, hero_combo: usize, pot: f64, invested_traverser: f64, traverser: u8) -> f64 {
-        let opp_reach = if traverser == 0 {
+    fn showdown_value_avg(&self, hero_combo: usize, pot: f64, traverser: u8) -> f64 {
+        let opp_reach = if traverser == self.oop_seat {
             &self.ip_reach_init
         } else {
             &self.oop_reach_init
@@ -1123,7 +1121,6 @@ impl CfvSubgameSolver {
             &self.equity_matrix,
             opp_reach,
             pot,
-            invested_traverser,
         )
     }
 
@@ -1247,7 +1244,6 @@ fn compute_conditional_showdowns(
     equity_matrix: &[Vec<f64>],
     reach_opponent: &[f64],
     pot: f64,
-    invested_traverser: f64,
     out: &mut [f64],
 ) {
     out.par_iter_mut().enumerate().for_each(|(i, val)| {
@@ -1263,9 +1259,8 @@ fn compute_conditional_showdowns(
         }
         *val = if reach_sum > 0.0 {
             let avg_eq = eq_sum / reach_sum;
-            // Win: pot - invested, Lose: -invested
-            // EV = eq * (pot - invested) + (1-eq) * (-invested) = eq * pot - invested
-            avg_eq * pot - invested_traverser
+            // Pot-only: EV = equity * pot
+            avg_eq * pot
         } else {
             0.0
         };
@@ -1299,7 +1294,6 @@ fn showdown_value_single(
     equity_matrix: &[Vec<f64>],
     opp_reach: &[f64],
     pot: f64,
-    invested_traverser: f64,
 ) -> f64 {
     let hero_cards = hands.combos[hero_combo];
     let mut eq_sum = 0.0;
@@ -1316,8 +1310,8 @@ fn showdown_value_single(
         return 0.0;
     }
     let avg_equity = eq_sum / reach_sum;
-    // EV = eq * (pot - invested) + (1-eq) * (-invested) = eq * pot - invested
-    avg_equity * pot - invested_traverser
+    // Pot-only: EV = equity * pot
+    avg_equity * pot
 }
 
 // ---------------------------------------------------------------------------
@@ -1400,6 +1394,7 @@ impl LeafEvaluator for ExactRiverEvaluator {
                 starting_stack,
                 &[self.bet_sizes.clone()],
                 None,
+                0,
             );
 
             // River tree has no DepthBoundary nodes, so leaf_values is empty.
@@ -1500,6 +1495,7 @@ mod tests {
             250.0,
             &[bet_sizes.to_vec()],
             None,
+            0,
         )
     }
 
@@ -1511,6 +1507,7 @@ mod tests {
             250.0,
             &[bet_sizes.to_vec()],
             Some(depth_limit),
+            0,
         )
     }
 
@@ -2215,16 +2212,15 @@ mod tests {
     // Asymmetric pot / terminal payoff tests
     // -----------------------------------------------------------------------
 
-    /// Build a minimal tree with a single fold terminal at given pot/invested.
-    fn fold_terminal_tree(pot: f64, invested: [f64; 2], winner: u8) -> GameTree {
+    /// Build a minimal tree with a single fold terminal at given pot.
+    fn fold_terminal_tree(pot: f64, winner: u8) -> GameTree {
         GameTree {
             nodes: vec![GameNode::Terminal {
                 kind: TerminalKind::Fold { winner },
                 pot,
-                invested,
             }],
             root: 0,
-            blinds: [0.0, 0.0],
+            dealer: 0,
         }
     }
 
@@ -2232,9 +2228,7 @@ mod tests {
     /// Used to test that the solver doesn't overvalue betting with bad hands.
     fn check_or_bet_tree(
         pot: f64,
-        inv_check: [f64; 2],
         pot_bet: f64,
-        inv_bet: [f64; 2],
     ) -> GameTree {
         GameTree {
             nodes: vec![
@@ -2253,214 +2247,137 @@ mod tests {
                 GameNode::Terminal {
                     kind: TerminalKind::Showdown,
                     pot,
-                    invested: inv_check,
                 },
                 // 2: Fold after bet (opponent folds, hero wins)
                 GameNode::Terminal {
                     kind: TerminalKind::Fold { winner: 0 },
                     pot: pot_bet,
-                    invested: inv_bet,
                 },
             ],
             root: 0,
-            blinds: [0.0, 0.0],
+            dealer: 0,
         }
     }
 
     #[timed_test(5)]
     fn fold_payoff_symmetric_pot() {
-        // Both invested equally: pot=100, each put in 50
-        let tree = fold_terminal_tree(100.0, [50.0, 50.0], 0);
+        // Pot-only: winner gets pot, loser gets 0.
+        // winner=1 (OOP seat with dealer=0), so root_cfvs(0) = OOP = winner.
+        let tree = fold_terminal_tree(100.0, 1);
         let board = river_board();
         let hands = small_hands(&board, 10);
         let n = hands.combos.len();
         let evaluator = vec![Box::new(ConstantEvaluator(0.0)) as Box<dyn LeafEvaluator>];
         let mut solver = CfvSubgameSolver::new(tree, hands, &board, evaluator, 200.0, vec![1.0; n], vec![1.0; n]);
         solver.train(1);
-        let cfvs = solver.root_cfvs(0);
-        // Winner gains pot - invested = 100 - 50 = 50
-        for &v in &cfvs { assert!((v - 50.0).abs() < 0.01, "expected 50, got {v}"); }
+        let cfvs = solver.root_cfvs(0); // OOP = seat 1 = winner
+        for &v in &cfvs { assert!((v - 100.0).abs() < 0.01, "expected 100, got {v}"); }
     }
 
     #[timed_test(5)]
-    fn fold_payoff_asymmetric_small_bet_into_big_pot() {
-        // Hero bet 10 into 100 pot, opp folds. pot=110, invested=[60,50]
-        let tree = fold_terminal_tree(110.0, [60.0, 50.0], 0);
+    fn fold_payoff_small_pot() {
+        // Pot-only: winner gets pot
+        let tree = fold_terminal_tree(12.0, 1);
         let board = river_board();
         let hands = small_hands(&board, 10);
         let n = hands.combos.len();
         let evaluator = vec![Box::new(ConstantEvaluator(0.0)) as Box<dyn LeafEvaluator>];
         let mut solver = CfvSubgameSolver::new(tree, hands, &board, evaluator, 200.0, vec![1.0; n], vec![1.0; n]);
         solver.train(1);
-        let cfvs = solver.root_cfvs(0);
-        // Winner gains pot - invested = 110 - 60 = 50
-        for &v in &cfvs { assert!((v - 50.0).abs() < 0.01, "expected 50, got {v}"); }
+        let cfvs = solver.root_cfvs(0); // OOP = seat 1 = winner
+        for &v in &cfvs { assert!((v - 12.0).abs() < 0.01, "expected 12, got {v}"); }
     }
 
     #[timed_test(5)]
-    fn fold_payoff_asymmetric_big_shove() {
-        // Hero shoves 200 into 20 pot, opp folds. pot=220, invested=[210,10]
-        let tree = fold_terminal_tree(220.0, [210.0, 10.0], 0);
+    fn fold_payoff_large_pot() {
+        // Pot-only: winner gets pot
+        let tree = fold_terminal_tree(220.0, 1);
         let board = river_board();
         let hands = small_hands(&board, 10);
         let n = hands.combos.len();
         let evaluator = vec![Box::new(ConstantEvaluator(0.0)) as Box<dyn LeafEvaluator>];
         let mut solver = CfvSubgameSolver::new(tree, hands, &board, evaluator, 400.0, vec![1.0; n], vec![1.0; n]);
         solver.train(1);
-        let cfvs = solver.root_cfvs(0);
-        // Winner gains pot - invested = 220 - 210 = 10 (NOT 110!)
-        for &v in &cfvs { assert!((v - 10.0).abs() < 0.01, "expected 10, got {v}"); }
+        let cfvs = solver.root_cfvs(0); // OOP = seat 1 = winner
+        for &v in &cfvs { assert!((v - 220.0).abs() < 0.01, "expected 220, got {v}"); }
     }
 
     #[timed_test(5)]
     fn fold_payoff_loser_perspective() {
-        // Hero shoves 200 into 20 pot, opp folds. From opp's perspective:
-        let tree = fold_terminal_tree(220.0, [210.0, 10.0], 0);
+        // Pot-only: loser gets 0
+        let tree = fold_terminal_tree(220.0, 1);
         let board = river_board();
         let hands = small_hands(&board, 10);
         let n = hands.combos.len();
         let evaluator = vec![Box::new(ConstantEvaluator(0.0)) as Box<dyn LeafEvaluator>];
         let mut solver = CfvSubgameSolver::new(tree, hands, &board, evaluator, 400.0, vec![1.0; n], vec![1.0; n]);
         solver.train(1);
-        let cfvs = solver.root_cfvs(1); // opponent's perspective
-        // Loser loses their investment = -10
-        for &v in &cfvs { assert!((v - (-10.0)).abs() < 0.01, "expected -10, got {v}"); }
-    }
-
-    #[timed_test(5)]
-    fn fold_payoff_3bet_pot_scenario() {
-        // 3bet pot: SB raise 2bb, BB raise 6bb, SB call. pot=12bb.
-        // Hero shoves ~44bb more. invested=[50,6], pot=56.
-        let tree = fold_terminal_tree(56.0, [50.0, 6.0], 0);
-        let board = river_board();
-        let hands = small_hands(&board, 10);
-        let n = hands.combos.len();
-        let evaluator = vec![Box::new(ConstantEvaluator(0.0)) as Box<dyn LeafEvaluator>];
-        let mut solver = CfvSubgameSolver::new(tree, hands, &board, evaluator, 100.0, vec![1.0; n], vec![1.0; n]);
-        solver.train(1);
-        let cfvs = solver.root_cfvs(0);
-        // Winner gains 56 - 50 = 6 (NOT 28!)
-        for &v in &cfvs { assert!((v - 6.0).abs() < 0.01, "expected 6, got {v}"); }
-    }
-
-    #[timed_test(5)]
-    fn fold_payoff_minraise_pot() {
-        // Small raise: pot=10, hero raised to 12, invested=[7,5], pot=12
-        let tree = fold_terminal_tree(12.0, [7.0, 5.0], 0);
-        let board = river_board();
-        let hands = small_hands(&board, 10);
-        let n = hands.combos.len();
-        let evaluator = vec![Box::new(ConstantEvaluator(0.0)) as Box<dyn LeafEvaluator>];
-        let mut solver = CfvSubgameSolver::new(tree, hands, &board, evaluator, 200.0, vec![1.0; n], vec![1.0; n]);
-        solver.train(1);
-        let cfvs = solver.root_cfvs(0);
-        // Winner gains 12 - 7 = 5
-        for &v in &cfvs { assert!((v - 5.0).abs() < 0.01, "expected 5, got {v}"); }
+        let cfvs = solver.root_cfvs(1); // IP = seat 0 = loser
+        for &v in &cfvs { assert!(v.abs() < 0.01, "expected 0, got {v}"); }
     }
 
     #[timed_test(5)]
     fn fold_payoff_equal_pot_contributions() {
-        // Limped pot: pot=2, each invested 1
-        let tree = fold_terminal_tree(2.0, [1.0, 1.0], 1);
+        // Limped pot: pot=2, seat 1 (OOP) wins
+        let tree = fold_terminal_tree(2.0, 1);
         let board = river_board();
         let hands = small_hands(&board, 10);
         let n = hands.combos.len();
         let evaluator = vec![Box::new(ConstantEvaluator(0.0)) as Box<dyn LeafEvaluator>];
         let mut solver = CfvSubgameSolver::new(tree, hands, &board, evaluator, 200.0, vec![1.0; n], vec![1.0; n]);
         solver.train(1);
-        // Player 1 wins: gains 2 - 1 = 1
-        let cfvs_p1 = solver.root_cfvs(1);
-        for &v in &cfvs_p1 { assert!((v - 1.0).abs() < 0.01, "expected 1, got {v}"); }
-        // Player 0 loses: -invested = -1
-        let cfvs_p0 = solver.root_cfvs(0);
-        for &v in &cfvs_p0 { assert!((v - (-1.0)).abs() < 0.01, "expected -1, got {v}"); }
-    }
-
-    #[timed_test(5)]
-    fn fold_payoff_overbet_shove() {
-        // Overbet: hero shoves 500 into 10 pot. pot=510, invested=[505,5]
-        let tree = fold_terminal_tree(510.0, [505.0, 5.0], 0);
-        let board = river_board();
-        let hands = small_hands(&board, 10);
-        let n = hands.combos.len();
-        let evaluator = vec![Box::new(ConstantEvaluator(0.0)) as Box<dyn LeafEvaluator>];
-        let mut solver = CfvSubgameSolver::new(tree, hands, &board, evaluator, 600.0, vec![1.0; n], vec![1.0; n]);
-        solver.train(1);
-        let cfvs = solver.root_cfvs(0);
-        // Winner gains 510 - 505 = 5 (NOT 255!)
-        for &v in &cfvs { assert!((v - 5.0).abs() < 0.01, "expected 5, got {v}"); }
+        // OOP (seat 1) wins: gets pot = 2
+        let cfvs_oop = solver.root_cfvs(0);
+        for &v in &cfvs_oop { assert!((v - 2.0).abs() < 0.01, "expected 2, got {v}"); }
+        // IP (seat 0) loses: gets 0
+        let cfvs_ip = solver.root_cfvs(1);
+        for &v in &cfvs_ip { assert!(v.abs() < 0.01, "expected 0, got {v}"); }
     }
 
     #[timed_test(5)]
     fn showdown_payoff_symmetric() {
-        // Symmetric showdown: pot=100, each invested 50
-        // With equity 0.5, EV = 0.5 * 100 - 50 = 0
+        // Symmetric showdown: pot=100.
+        // With equity 0.5, EV = 0.5 * 100 = 50
+        // Use 200+ combos so not all share the same card (first 46 share deck[0]).
         let tree = GameTree {
             nodes: vec![GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 100.0,
-                invested: [50.0, 50.0],
             }],
             root: 0,
-            blinds: [0.0, 0.0],
+            dealer: 0,
         };
         let board = river_board();
-        let hands = small_hands(&board, 30);
+        let hands = small_hands(&board, 200);
         let n = hands.combos.len();
         let evaluator = vec![Box::new(ConstantEvaluator(0.0)) as Box<dyn LeafEvaluator>];
         let mut solver = CfvSubgameSolver::new(tree, hands, &board, evaluator, 200.0, vec![1.0; n], vec![1.0; n]);
         solver.train(1);
         let cfvs = solver.root_cfvs(0);
-        // Average equity is ~0.5 against uniform range, so EV ≈ 0.5*100 - 50 = 0
+        // Average equity ~0.5 against uniform: EV ≈ 0.5*100 = 50
         let avg: f64 = cfvs.iter().sum::<f64>() / cfvs.len() as f64;
-        assert!(avg.abs() < 5.0, "average showdown EV should be near 0 for uniform range, got {avg}");
+        assert!((avg - 50.0).abs() < 5.0, "average showdown EV should be near 50 for uniform range, got {avg}");
     }
 
     #[timed_test(5)]
-    fn showdown_payoff_asymmetric_allin() {
-        // All-in showdown: hero shoved 200 into 20 pot, opp called.
-        // pot=220, invested=[110,110] (both all-in for equal stacks)
-        // This should be symmetric since both invested equally after call.
+    fn showdown_payoff_large_pot() {
+        // pot=220, EV ≈ 0.5*220 = 110 against uniform range
         let tree = GameTree {
             nodes: vec![GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 220.0,
-                invested: [110.0, 110.0],
             }],
             root: 0,
-            blinds: [0.0, 0.0],
+            dealer: 0,
         };
         let board = river_board();
-        let hands = small_hands(&board, 30);
+        let hands = small_hands(&board, 200);
         let n = hands.combos.len();
         let evaluator = vec![Box::new(ConstantEvaluator(0.0)) as Box<dyn LeafEvaluator>];
         let mut solver = CfvSubgameSolver::new(tree, hands, &board, evaluator, 200.0, vec![1.0; n], vec![1.0; n]);
         solver.train(1);
         let cfvs = solver.root_cfvs(0);
-        // Average equity ~0.5 against uniform: EV ≈ 0.5*220 - 110 = 0
         let avg: f64 = cfvs.iter().sum::<f64>() / cfvs.len() as f64;
-        assert!(avg.abs() < 5.0, "average showdown EV should be near 0, got {avg}");
-    }
-
-    #[timed_test(30)]
-    fn solver_doesnt_overvalue_shoving_with_bad_hands() {
-        // Verify zero-sum: winner gain + loser loss = 0 across scenarios.
-        let scenarios: Vec<(f64, [f64; 2])> = vec![
-            (100.0, [50.0, 50.0]),   // symmetric
-            (56.0, [50.0, 6.0]),     // 3bet pot shove
-            (220.0, [210.0, 10.0]),  // massive overbet
-            (12.0, [7.0, 5.0]),      // minraise
-            (510.0, [505.0, 5.0]),   // extreme overbet
-            (2.0, [1.0, 1.0]),       // limped pot
-        ];
-        for (pot, invested) in &scenarios {
-            let winner_payoff = pot - invested[0];
-            let loser_payoff = -invested[1];
-            assert!(
-                (winner_payoff + loser_payoff).abs() < 1e-10,
-                "not zero-sum for pot={pot} invested={invested:?}: sum={}",
-                winner_payoff + loser_payoff
-            );
-        }
+        assert!((avg - 110.0).abs() < 10.0, "average showdown EV should be near 110, got {avg}");
     }
 }

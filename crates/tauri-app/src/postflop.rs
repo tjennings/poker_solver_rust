@@ -545,7 +545,7 @@ impl LeafEvaluator for RolloutLeafEvaluator {
         board: &[RsPokerCard],
         oop_range: &[f64],
         ip_range: &[f64],
-        requests: &[(f64, f64, u8, [f64; 2])],
+        requests: &[(f64, f64, u8)],
     ) -> Vec<Vec<f64>> {
         if requests.is_empty() {
             return vec![];
@@ -667,6 +667,7 @@ pub fn build_subgame_solver(
         starting_stack,
         &sizes_f64,
         Some(1),
+        0,
     );
 
     // Annotate subgame tree nodes with blueprint decision indices.
@@ -1913,14 +1914,16 @@ fn decision_display_info(
     if let GameNode::Decision { actions, children, .. } = node {
         for (a, &child_idx) in actions.iter().zip(children.iter()) {
             if matches!(a, TreeAction::Fold) {
-                if let GameNode::Terminal { pot, invested, .. } =
+                if let GameNode::Terminal { pot, .. } =
                     &tree.nodes[child_idx as usize]
                 {
+                    // Approximate: each player invested half the pot.
+                    let each_inv = *pot / 2.0;
                     return (
                         *pot as i32,
                         [
-                            (starting_stack - invested[0]) as i32,
-                            (starting_stack - invested[1]) as i32,
+                            (starting_stack - each_inv) as i32,
+                            (starting_stack - each_inv) as i32,
                         ],
                     );
                 }
@@ -1948,11 +1951,12 @@ fn subgame_node_to_result(
 ) -> Result<PostflopPlayResult, String> {
     match &result.tree.nodes[node_idx as usize] {
         GameNode::Terminal {
-            kind, pot, invested,
+            kind, pot,
         } => {
+            let each_inv = *pot / 2.0;
             let remaining = [
-                (result.starting_stack - invested[0]) as i32,
-                (result.starting_stack - invested[1]) as i32,
+                (result.starting_stack - each_inv) as i32,
+                (result.starting_stack - each_inv) as i32,
             ];
             match kind {
                 TerminalKind::Fold { .. } | TerminalKind::Showdown => Ok(PostflopPlayResult {
@@ -2365,10 +2369,9 @@ fn postflop_close_street_subgame(
     // Get pot/effective_stack from the final node.
     #[allow(clippy::cast_possible_truncation)]
     let (pot, effective_stack) = match &result.tree.nodes[current_node as usize] {
-        GameNode::Terminal { pot, invested, .. } => {
-            let s0 = (result.starting_stack - invested[0]) as i32;
-            let s1 = (result.starting_stack - invested[1]) as i32;
-            (*pot as i32, s0.min(s1))
+        GameNode::Terminal { pot, .. } => {
+            let eff = (result.starting_stack - pot / 2.0) as i32;
+            (*pot as i32, eff)
         }
         GameNode::Decision { .. } => {
             let (pot_i32, stacks) = decision_display_info(
@@ -2382,10 +2385,9 @@ fn postflop_close_street_subgame(
         GameNode::Chance { child, .. } => {
             // Chance node: look through to child for pot info.
             match &result.tree.nodes[*child as usize] {
-                GameNode::Terminal { pot, invested, .. } => {
-                    let s0 = (result.starting_stack - invested[0]) as i32;
-                    let s1 = (result.starting_stack - invested[1]) as i32;
-                    (*pot as i32, s0.min(s1))
+                GameNode::Terminal { pot, .. } => {
+                    let eff = (result.starting_stack - pot / 2.0) as i32;
+                    (*pot as i32, eff)
                 }
                 _ => {
                     let inv = result.initial_pot / 2.0;
@@ -3189,7 +3191,7 @@ mod tests {
 
         let strategy = Arc::new(BlueprintV2Strategy::empty());
         let tree = GameTree::build_subgame(
-            V2Street::Turn, 100.0, [50.0; 2], 200.0, &[vec![1.0]], Some(1),
+            V2Street::Turn, 100.0, [50.0; 2], 200.0, &[vec![1.0]], Some(1), 0,
         );
         let all_buckets = Arc::new(AllBuckets::new([2, 2, 2, 2], [None, None, None, None]));
         let cbv_table = CbvTable { values: vec![], node_offsets: vec![], buckets_per_node: vec![] };
@@ -3213,7 +3215,7 @@ mod tests {
         // that CbvContext now provides, for all 4 bias types.
         let strategy = Arc::new(BlueprintV2Strategy::empty());
         let tree = Arc::new(GameTree::build_subgame(
-            V2Street::Turn, 100.0, [50.0; 2], 200.0, &[vec![1.0]], Some(1),
+            V2Street::Turn, 100.0, [50.0; 2], 200.0, &[vec![1.0]], Some(1), 0,
         ));
         let all_buckets = Arc::new(AllBuckets::new([2, 2, 2, 2], [None, None, None, None]));
 

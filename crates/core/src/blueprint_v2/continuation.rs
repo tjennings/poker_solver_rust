@@ -409,16 +409,15 @@ mod tests {
     use rand::rngs::StdRng;
 
     /// Build a minimal tree with a single fold terminal.
-    /// Player 0 folds, player 1 wins. Pot=10, invested=[3,5].
+    /// Player 0 folds, player 1 wins. Pot=10.
     fn fold_terminal_tree() -> (GameTree, Vec<u32>) {
         let nodes = vec![
             GameNode::Terminal {
                 kind: TerminalKind::Fold { winner: 1 },
                 pot: 10.0,
-                invested: [3.0, 5.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, blinds: [0.0, 0.0] };
+        let tree = GameTree { nodes, root: 0, dealer: 0 };
         let decision_idx_map = vec![u32::MAX]; // no decision nodes
         (tree, decision_idx_map)
     }
@@ -488,16 +487,15 @@ mod tests {
         assert!((ev - (-3.0)).abs() < 1e-9, "Loser EV should be -3.0, got {ev}");
     }
 
-    /// Build a showdown terminal with pot=20, invested=[8,8].
+    /// Build a showdown terminal with pot=20.
     fn showdown_terminal_tree() -> (GameTree, Vec<u32>) {
         let nodes = vec![
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 20.0,
-                invested: [8.0, 8.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, blinds: [0.0, 0.0] };
+        let tree = GameTree { nodes, root: 0, dealer: 0 };
         let decision_idx_map = vec![u32::MAX];
         (tree, decision_idx_map)
     }
@@ -559,10 +557,9 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 20.0,
-                invested: [10.0, 10.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, blinds: [0.0, 0.0] };
+        let tree = GameTree { nodes, root: 0, dealer: 0 };
         let dim = vec![u32::MAX];
         let buckets = dummy_buckets();
         let strategy = dummy_strategy();
@@ -605,16 +602,14 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Fold { winner: 1 },
                 pot: 10.0,
-                invested: [3.0, 5.0],
             },
             // Node 2: Showdown
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 14.0,
-                invested: [7.0, 7.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, blinds: [0.0, 0.0] };
+        let tree = GameTree { nodes, root: 0, dealer: 0 };
         let decision_idx_map = vec![0, u32::MAX, u32::MAX];
 
         // Build a strategy with 1 decision node, 2 actions, 10 river buckets.
@@ -701,14 +696,13 @@ mod tests {
         let nodes = vec![
             // Node 0: Chance node to turn
             GameNode::Chance { next_street: Street::Turn, child: 1 },
-            // Node 1: Showdown terminal (pot=10, invested=[5,5])
+            // Node 1: Showdown terminal (pot=10)
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 10.0,
-                invested: [5.0, 5.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, blinds: [0.0, 0.0] };
+        let tree = GameTree { nodes, root: 0, dealer: 0 };
         let dim = vec![u32::MAX, u32::MAX];
         let buckets = dummy_buckets();
         let strategy = dummy_strategy();
@@ -800,16 +794,14 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Fold { winner: 0 },
                 pot: 10.0,
-                invested: [3.0, 5.0],
             },
             // Call -> showdown
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 14.0,
-                invested: [7.0, 7.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, blinds: [0.0, 0.0] };
+        let tree = GameTree { nodes, root: 0, dealer: 0 };
         let dim = vec![0, u32::MAX, u32::MAX];
 
         // Strategy: all buckets play [0.5, 0.5]
@@ -857,10 +849,9 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::DepthBoundary,
                 pot: 10.0,
-                invested: [5.0, 5.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, blinds: [0.0, 0.0] };
+        let tree = GameTree { nodes, root: 0, dealer: 0 };
         let dim = vec![u32::MAX];
         let (hero, opp) = dummy_hands();
         let buckets = dummy_buckets();

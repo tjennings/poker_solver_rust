@@ -823,7 +823,7 @@ fn v2_node_state(tree: &V2GameTree, node_idx: u32) -> (u8, f64, [f64; 2], f64) {
             // This function returns defaults that get overridden.
             (*player, 0.0, [0.0; 2], 0.0)
         }
-        V2GameNode::Terminal { pot, invested, .. } => (0, *pot, *invested, 0.0),
+        V2GameNode::Terminal { pot, .. } => (0, *pot, [0.0; 2], 0.0),
         V2GameNode::Chance { child, .. } => v2_node_state(tree, *child),
     }
 }
@@ -1140,15 +1140,16 @@ fn get_strategy_matrix_v2(
         cells.push(row_cells);
     }
 
-    // Compute pot/stacks from the tree (invested amounts at current node).
-    // invested is voluntary-only; pot includes blinds as dead money.
-    let invested = invested_at_v2_node(tree, walk.node_idx);
+    // Compute pot/stacks from the tree.
+    let node_pot = pot_at_v2_node(tree, walk.node_idx);
     let stack_depth = _config.game.stack_depth;
-    let pot = ((tree.blinds[0] + tree.blinds[1] + invested[0] + invested[1]) * 2.0) as u32; // convert BB to half-BB units
-    let stack_p1 = ((stack_depth - tree.blinds[0] - invested[0]) * 2.0) as u32;
-    let stack_p2 = ((stack_depth - tree.blinds[1] - invested[1]) * 2.0) as u32;
-    // to_call: difference in invested amounts
-    let to_call = ((invested[0] - invested[1]).abs() * 2.0) as u32;
+    let pot = (node_pot * 2.0) as u32; // convert BB to half-BB units
+    // Approximate remaining stacks: each player started with stack_depth,
+    // and roughly half the pot has come from each player.
+    let each_invested = node_pot / 2.0;
+    let stack_p1 = ((stack_depth - each_invested) * 2.0) as u32;
+    let stack_p2 = ((stack_depth - each_invested) * 2.0) as u32;
+    let to_call = 0u32; // approximation; exact to_call requires action tracking
 
     Ok(StrategyMatrix {
         cells,
@@ -2447,32 +2448,30 @@ fn format_bet_sizes(fractions: &[f64]) -> String {
 /// whose `invested` field reflects the amounts put in by each player *before*
 /// that fold. For nodes without a fold (e.g. check-only), we look at the Call
 /// child's terminal instead and back out the opponent's investment.
-fn invested_at_v2_node(tree: &V2GameTree, node_idx: u32) -> [f64; 2] {
+/// Walk the V2 tree to find the pot at a given node.
+///
+/// For fold terminals, the pot is stored directly. For decision/chance nodes,
+/// we look at the fold terminal child's pot (which equals the current pot before
+/// any new action). Falls back to recursive search.
+fn pot_at_v2_node(tree: &V2GameTree, node_idx: u32) -> f64 {
     match &tree.nodes[node_idx as usize] {
-        V2GameNode::Terminal { invested, .. } => *invested,
-        V2GameNode::Chance { child, .. } => invested_at_v2_node(tree, *child),
+        V2GameNode::Terminal { pot, .. } => *pot,
+        V2GameNode::Chance { child, .. } => pot_at_v2_node(tree, *child),
         V2GameNode::Decision {
             actions, children, ..
         } => {
-            // Try the fold terminal first — its invested is exactly what we want.
+            // Fold terminal's pot reflects the pot before the fold action.
             if let Some(fold_pos) = actions.iter().position(|a| matches!(a, TreeAction::Fold)) {
                 let child_idx = children[fold_pos] as usize;
-                if let V2GameNode::Terminal { invested, .. } = &tree.nodes[child_idx] {
-                    return *invested;
+                if let V2GameNode::Terminal { pot, .. } = &tree.nodes[child_idx] {
+                    return *pot;
                 }
             }
-            // Fall back: use any terminal child we can find.
-            for &child in children {
-                if let V2GameNode::Terminal { invested, .. } = &tree.nodes[child as usize] {
-                    return *invested;
-                }
-            }
-            // No direct terminal children (e.g. first-to-act on a new street has no fold).
-            // Follow Check (same invested) or first child recursively.
+            // Check child preserves the pot.
             if let Some(check_pos) = actions.iter().position(|a| matches!(a, TreeAction::Check)) {
-                return invested_at_v2_node(tree, children[check_pos]);
+                return pot_at_v2_node(tree, children[check_pos]);
             }
-            invested_at_v2_node(tree, children[0])
+            pot_at_v2_node(tree, children[0])
         }
     }
 }
@@ -2588,13 +2587,13 @@ pub fn get_preflop_ranges_core(
     }
 
     // Compute pot and stacks at the current position.
-    // invested is voluntary-only; pot includes blinds as dead money.
-    let invested = invested_at_v2_node(tree.as_ref(), node_idx);
+    let pot = pot_at_v2_node(tree.as_ref(), node_idx);
     let stack_depth = config.game.stack_depth;
-    let pot = tree.blinds[0] + tree.blinds[1] + invested[0] + invested[1];
+    // Approximate remaining stacks from pot.
+    let each_invested = pot / 2.0;
     let remaining = [
-        stack_depth - tree.blinds[0] - invested[0],
-        stack_depth - tree.blinds[1] - invested[1],
+        stack_depth - each_invested,
+        stack_depth - each_invested,
     ];
     let effective_stack = remaining[0].min(remaining[1]);
 
@@ -2860,25 +2859,22 @@ mod tests {
             V2GameNode::Terminal {
                 kind: poker_solver_core::blueprint_v2::game_tree::TerminalKind::Fold { winner: 1 },
                 pot: 1.5,
-                invested: [0.5, 1.0],
             },
             // Node 4: terminal (check through)
             V2GameNode::Terminal {
                 kind: poker_solver_core::blueprint_v2::game_tree::TerminalKind::Showdown,
                 pot: 2.0,
-                invested: [1.0, 1.0],
             },
             // Node 5: terminal (bet, then fold assumed)
             V2GameNode::Terminal {
                 kind: poker_solver_core::blueprint_v2::game_tree::TerminalKind::Fold { winner: 1 },
                 pot: 4.0,
-                invested: [1.0, 1.0],
             },
         ];
         V2GameTree {
             nodes,
             root: 0,
-            blinds: [0.5, 1.0],
+            dealer: 0,
         }
     }
 
