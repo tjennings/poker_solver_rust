@@ -1736,9 +1736,11 @@ mod tests {
             nodes: vec![GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 100.0,
+                stacks: [200.0, 200.0],
             }],
             root: 0,
             dealer: 0,
+            starting_stack: 250.0,
         };
         let _ = build_boundary_mapping(&tree_a, &tree_b);
     }

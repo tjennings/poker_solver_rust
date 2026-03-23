@@ -35,6 +35,9 @@ pub enum GameNode {
     Terminal {
         kind: TerminalKind,
         pot: f64,
+        /// Each player's remaining stack at this terminal.
+        /// Payoff = final_stack - starting_stack (+ pot if winner).
+        stacks: [f64; 2],
     },
 }
 
@@ -65,15 +68,18 @@ pub struct GameTree {
     /// Preflop: `dealer` (SB) acts first.
     /// Postflop: `1 - dealer` (BB/OOP) acts first.
     pub dealer: u8,
+    /// Starting stack per player (same for both). Used for terminal payoff computation.
+    pub starting_stack: f64,
 }
 
 /// Internal state tracked during recursive tree construction.
 struct BuildState {
     /// Stacks at the start of the hand (same for both players).
     starting_stack: f64,
-    /// Per-player investment on the current action sequence (voluntary only).
-    /// Used for to-call computation. Starts at [0, 0].
-    invested: [f64; 2],
+    /// Each player's current stack (depletes as bets/calls are made).
+    stacks: [f64; 2],
+    /// Per-street bet amount per player (for to-call computation). Resets each street.
+    street_bets: [f64; 2],
     /// Which seat is the button/SB (0 or 1).
     dealer: u8,
     /// Small blind amount in BB.
@@ -91,7 +97,7 @@ struct BuildState {
     /// Whether the current action sequence on this street has seen a bet.
     /// Used to distinguish check vs call, bet vs raise.
     facing_bet: bool,
-    /// The size of the last bet/raise TO (total invested by the aggressor).
+    /// The size of the last bet/raise TO (total street bet by the aggressor).
     /// Used for preflop multiplier sizings.
     last_raise_to: f64,
 }
@@ -179,9 +185,21 @@ impl GameTree {
 
         let mut nodes = Vec::new();
 
+        let sb = 0usize; // dealer seat
+        let bb = 1usize;
+        let mut initial_stacks = [stack_depth; 2];
+        initial_stacks[sb] -= small_blind;
+        initial_stacks[bb] -= big_blind;
+
         let initial_state = BuildState {
             starting_stack: stack_depth,
-            invested: [0.0, 0.0],
+            stacks: initial_stacks,
+            street_bets: {
+                let mut sb_arr = [0.0; 2];
+                sb_arr[sb] = small_blind;
+                sb_arr[bb] = big_blind;
+                sb_arr
+            },
             dealer: 0, // seat 0 is SB/button
             small_blind,
             big_blind,
@@ -195,24 +213,12 @@ impl GameTree {
 
         let root = Self::build_node(&config, &initial_state, &mut nodes);
 
-        Self { nodes, root, dealer: 0 }
-    }
-
-    /// Blind amount posted by a given seat.
-    fn blind_for_seat(state: &BuildState, seat: usize) -> f64 {
-        if seat == state.dealer as usize {
-            state.small_blind
-        } else {
-            state.big_blind
-        }
+        Self { nodes, root, dealer: 0, starting_stack: stack_depth }
     }
 
     /// Recursively build a node and return its arena index.
     fn build_node(config: &TreeConfig, state: &BuildState, nodes: &mut Vec<GameNode>) -> u32 {
-        let remaining = [
-            state.starting_stack - Self::blind_for_seat(state, 0) - state.invested[0],
-            state.starting_stack - Self::blind_for_seat(state, 1) - state.invested[1],
-        ];
+        let remaining = state.stacks;
         let actor = state.to_act as usize;
 
         // If the actor has no chips left, treat as terminal or pass action.
@@ -236,7 +242,7 @@ impl GameTree {
                 // SB faces BB obligation: call = BB blind - SB blind
                 state.big_blind - state.small_blind
             } else {
-                state.invested[1 - actor] - state.invested[actor]
+                state.street_bets[1 - actor] - state.street_bets[actor]
             };
             if call_amount >= remaining[actor] - SIZE_EPSILON {
                 // Calling for all-in
@@ -260,7 +266,7 @@ impl GameTree {
         // All-in is always available when the actor has chips, regardless of raise cap.
         // This ensures players can shove even after all sized raise depths are exhausted.
         if remaining[actor] > SIZE_EPSILON {
-            let all_in_amount = state.invested[actor] + remaining[actor];
+            let all_in_amount = state.street_bets[actor] + remaining[actor];
             let has_all_in = actions.iter().any(|a| match a {
                 TreeAction::Bet(v) | TreeAction::Raise(v) => {
                     (*v - all_in_amount).abs() < SIZE_EPSILON
@@ -284,6 +290,7 @@ impl GameTree {
         nodes.push(GameNode::Terminal {
             kind: TerminalKind::Showdown,
             pot: 0.0,
+            stacks: [0.0; 2],
         });
 
         let mut children = Vec::with_capacity(actions.len());
@@ -312,23 +319,23 @@ impl GameTree {
     ) -> u32 {
         let actor = state.to_act as usize;
         let opponent = 1 - actor;
-        let actor_blind = Self::blind_for_seat(state, actor);
-        let remaining_actor = state.starting_stack - actor_blind - state.invested[actor];
+        let remaining_actor = state.stacks[actor];
 
         match action {
             TreeAction::Fold => {
-                // Fold: pot unchanged
+                // Fold: no stack/pot change
                 let idx = nodes.len() as u32;
                 nodes.push(GameNode::Terminal {
                     kind: TerminalKind::Fold {
                         winner: opponent as u8,
                     },
                     pot: state.pot,
+                    stacks: state.stacks,
                 });
                 idx
             }
             TreeAction::Check => {
-                // Check: pot unchanged
+                // Check: no stack/pot change
                 let both_checked = !state.facing_bet && Self::is_closing_action(state);
                 if both_checked {
                     Self::make_showdown_or_chance(config, state, nodes)
@@ -342,22 +349,19 @@ impl GameTree {
                 }
             }
             TreeAction::Call => {
-                let call_to = if state.street == Street::Preflop && state.num_raises == 0 {
-                    // SB limps: voluntary investment = big_blind - small_blind
-                    state.big_blind - state.small_blind
-                } else {
-                    state.invested[opponent]
-                };
-                let call_amount = call_to - state.invested[actor];
+                let call_amount = state.street_bets[opponent] - state.street_bets[actor];
+                let mut new_stacks = state.stacks;
+                new_stacks[actor] -= call_amount;
                 let new_pot = state.pot + call_amount;
-                let mut new_invested = state.invested;
-                new_invested[actor] = call_to;
+                let mut new_street_bets = state.street_bets;
+                new_street_bets[actor] = state.street_bets[opponent];
 
                 // Preflop limp: SB calls the BB blind. BB still gets to act
                 // (check or raise) because the blind is not a voluntary action.
                 if state.street == Street::Preflop && state.num_raises == 0 {
                     let new_state = BuildState {
-                        invested: new_invested,
+                        stacks: new_stacks,
+                        street_bets: new_street_bets,
                         pot: new_pot,
                         to_act: opponent as u8,
                         facing_bet: false,
@@ -369,23 +373,26 @@ impl GameTree {
 
                 // After a call, the betting round is over
                 let new_state = BuildState {
-                    invested: new_invested,
+                    stacks: new_stacks,
+                    street_bets: new_street_bets,
                     pot: new_pot,
                     ..*state
                 };
                 Self::make_showdown_or_chance(config, &new_state, nodes)
             }
             TreeAction::AllIn => {
-                let all_in_total = state.starting_stack - actor_blind;
-                let additional = all_in_total - state.invested[actor];
+                let additional = remaining_actor;
                 let new_pot = state.pot + additional;
-                let mut new_invested = state.invested;
-                new_invested[actor] = all_in_total;
+                let mut new_stacks = state.stacks;
+                new_stacks[actor] = 0.0;
+                let mut new_street_bets = state.street_bets;
+                new_street_bets[actor] += additional;
 
+                let all_in_street_bet = new_street_bets[actor];
                 let is_call_all_in = state.facing_bet
-                    && (state.invested[opponent] - all_in_total).abs() < SIZE_EPSILON;
+                    && (state.street_bets[opponent] - all_in_street_bet).abs() < SIZE_EPSILON;
                 let is_call_all_in = is_call_all_in
-                    || (state.facing_bet && all_in_total <= state.invested[opponent] + SIZE_EPSILON);
+                    || (state.facing_bet && all_in_street_bet <= state.street_bets[opponent] + SIZE_EPSILON);
 
                 if is_call_all_in || !state.facing_bet && remaining_actor < SIZE_EPSILON {
                     // All-in call or weird edge case => showdown
@@ -393,42 +400,49 @@ impl GameTree {
                     nodes.push(GameNode::Terminal {
                         kind: TerminalKind::Showdown,
                         pot: new_pot,
+                        stacks: new_stacks,
                     });
                     idx
                 } else if state.facing_bet {
                     // All-in raise => opponent can fold or call
                     let next_state = BuildState {
-                        invested: new_invested,
+                        stacks: new_stacks,
+                        street_bets: new_street_bets,
                         pot: new_pot,
                         to_act: opponent as u8,
                         num_raises: state.num_raises + 1,
                         facing_bet: true,
-                        last_raise_to: all_in_total,
+                        last_raise_to: all_in_street_bet,
                         ..*state
                     };
                     Self::build_allin_response(config, &next_state, nodes)
                 } else {
                     // All-in open bet => opponent responds
                     let next_state = BuildState {
-                        invested: new_invested,
+                        stacks: new_stacks,
+                        street_bets: new_street_bets,
                         pot: new_pot,
                         to_act: opponent as u8,
                         num_raises: state.num_raises + 1,
                         facing_bet: true,
-                        last_raise_to: all_in_total,
+                        last_raise_to: all_in_street_bet,
                         ..*state
                     };
                     Self::build_allin_response(config, &next_state, nodes)
                 }
             }
             TreeAction::Bet(amount) | TreeAction::Raise(amount) => {
-                let additional = amount - state.invested[actor];
+                // amount is raise-TO (total street bet)
+                let additional = amount - state.street_bets[actor];
                 let new_pot = state.pot + additional;
-                let mut new_invested = state.invested;
-                new_invested[actor] = amount;
+                let mut new_stacks = state.stacks;
+                new_stacks[actor] -= additional;
+                let mut new_street_bets = state.street_bets;
+                new_street_bets[actor] = amount;
 
                 let next_state = BuildState {
-                    invested: new_invested,
+                    stacks: new_stacks,
+                    street_bets: new_street_bets,
                     pot: new_pot,
                     to_act: opponent as u8,
                     num_raises: state.num_raises + 1,
@@ -450,41 +464,43 @@ impl GameTree {
     ) -> u32 {
         let actor = state.to_act as usize;
         let opponent = 1 - actor;
-        let actor_blind = Self::blind_for_seat(state, actor);
-        let remaining = state.starting_stack - actor_blind - state.invested[actor];
+        let remaining = state.stacks[actor];
 
         let node_idx = nodes.len() as u32;
         nodes.push(GameNode::Terminal {
             kind: TerminalKind::Showdown,
             pot: 0.0,
+            stacks: [0.0; 2],
         });
 
         let mut children = Vec::with_capacity(2);
 
-        // Fold: pot unchanged
+        // Fold: pot unchanged, stacks unchanged
         let fold_idx = nodes.len() as u32;
         nodes.push(GameNode::Terminal {
             kind: TerminalKind::Fold {
                 winner: opponent as u8,
             },
             pot: state.pot,
+            stacks: state.stacks,
         });
         children.push(fold_idx);
 
         // Call (match the all-in or go all-in yourself)
-        let actor_all_in = state.starting_stack - actor_blind;
-        let call_to = state.invested[opponent].min(actor_all_in);
-        let call_amount = call_to - state.invested[actor];
+        let call_amount = (state.street_bets[opponent] - state.street_bets[actor]).min(remaining);
         let call_pot = state.pot + call_amount;
+        let mut call_stacks = state.stacks;
+        call_stacks[actor] -= call_amount;
         let call_idx = nodes.len() as u32;
         nodes.push(GameNode::Terminal {
             kind: TerminalKind::Showdown,
             pot: call_pot,
+            stacks: call_stacks,
         });
         children.push(call_idx);
 
         // Check if actor also can't cover — use AllIn action label
-        let call_action = if remaining <= state.invested[opponent] - state.invested[actor] + SIZE_EPSILON {
+        let call_action = if remaining <= state.street_bets[opponent] - state.street_bets[actor] + SIZE_EPSILON {
             TreeAction::AllIn
         } else {
             TreeAction::Call
@@ -520,8 +536,8 @@ impl GameTree {
         state: &BuildState,
         nodes: &mut Vec<GameNode>,
     ) -> u32 {
-        let both_all_in = (state.starting_stack - Self::blind_for_seat(state, 0) - state.invested[0]).abs() < SIZE_EPSILON
-            && (state.starting_stack - Self::blind_for_seat(state, 1) - state.invested[1]).abs() < SIZE_EPSILON;
+        let both_all_in = state.stacks[0].abs() < SIZE_EPSILON
+            && state.stacks[1].abs() < SIZE_EPSILON;
 
         match state.street.next() {
             Some(next_street) if !both_all_in => {
@@ -533,6 +549,7 @@ impl GameTree {
                         nodes.push(GameNode::Terminal {
                             kind: TerminalKind::DepthBoundary,
                             pot: state.pot,
+                            stacks: state.stacks,
                         });
                         return idx;
                     }
@@ -544,17 +561,20 @@ impl GameTree {
                 nodes.push(GameNode::Terminal {
                     kind: TerminalKind::Showdown,
                     pot: 0.0,
+                    stacks: [0.0; 2],
                 });
 
                 // Postflop: OOP (1 - dealer) acts first.
                 let postflop_to_act = 1 - state.dealer;
 
+                // Street bets reset at street transitions
                 let next_state = BuildState {
                     street: next_street,
                     num_raises: 0,
                     to_act: postflop_to_act,
                     facing_bet: false,
                     last_raise_to: 0.0,
+                    street_bets: [0.0; 2],
                     ..*state
                 };
 
@@ -573,6 +593,7 @@ impl GameTree {
                 nodes.push(GameNode::Terminal {
                     kind: TerminalKind::Showdown,
                     pot: state.pot,
+                    stacks: state.stacks,
                 });
                 idx
             }
@@ -641,7 +662,7 @@ impl GameTree {
                 .map_or(&[] as &[PreflopSize], Vec::as_slice)
         };
 
-        let all_in_total = state.starting_stack - Self::blind_for_seat(state, actor);
+        let all_in_street_bet = state.street_bets[actor] + remaining;
         let mut actions = Vec::new();
 
         for &size in sizes {
@@ -655,13 +676,13 @@ impl GameTree {
             let raise_to = raise_to.max(min_raise_to);
 
             // Can't raise more than all-in
-            if raise_to >= all_in_total - SIZE_EPSILON {
+            if raise_to >= all_in_street_bet - SIZE_EPSILON {
                 // This would be all-in; skip (all-in added separately)
                 continue;
             }
 
             // Must be able to afford it
-            let additional = raise_to - state.invested[actor];
+            let additional = raise_to - state.street_bets[actor];
             if additional > remaining + SIZE_EPSILON {
                 continue;
             }
@@ -700,30 +721,30 @@ impl GameTree {
                 .map_or(&[] as &[f64], Vec::as_slice)
         };
 
-        let all_in_total = state.starting_stack - Self::blind_for_seat(state, actor);
+        let all_in_street_bet = state.street_bets[actor] + remaining;
         let mut actions = Vec::new();
 
         for &frac in fractions {
             let bet_amount = if state.facing_bet {
                 // Raise: call first, then add fraction of new pot
-                let call_amount = state.invested[opponent] - state.invested[actor];
+                let call_amount = state.street_bets[opponent] - state.street_bets[actor];
                 let pot_after_call = pot + call_amount;
                 let raise_amount = call_amount + pot_after_call * frac;
-                state.invested[actor] + raise_amount
+                state.street_bets[actor] + raise_amount
             } else {
                 // Open bet: fraction of pot
                 let bet = pot * frac;
-                state.invested[actor] + bet
+                state.street_bets[actor] + bet
             };
 
             let min_raise = Self::min_raise_to(state);
             let bet_amount = bet_amount.max(min_raise);
 
-            if bet_amount >= all_in_total - SIZE_EPSILON {
+            if bet_amount >= all_in_street_bet - SIZE_EPSILON {
                 continue;
             }
 
-            let additional = bet_amount - state.invested[actor];
+            let additional = bet_amount - state.street_bets[actor];
             if additional > remaining + SIZE_EPSILON {
                 continue;
             }
@@ -746,7 +767,7 @@ impl GameTree {
         actions
     }
 
-    /// Minimum legal raise-to amount.
+    /// Minimum legal raise-to amount (as a street bet total).
     fn min_raise_to(state: &BuildState) -> f64 {
         let actor = state.to_act as usize;
         let opponent = 1 - actor;
@@ -757,14 +778,14 @@ impl GameTree {
             call + state.big_blind
         } else if state.facing_bet {
             // Must raise by at least the size of the last raise
-            let last_raise_size = state.last_raise_to - state.invested[actor];
+            let last_raise_size = state.last_raise_to - state.street_bets[actor];
             // The gap between what opponent has in and what we have in
-            let call_amount = state.invested[opponent] - state.invested[actor];
+            let call_amount = state.street_bets[opponent] - state.street_bets[actor];
             // Min raise = call + at least the same increment
-            state.invested[actor] + call_amount + call_amount.max(last_raise_size)
+            state.street_bets[actor] + call_amount + call_amount.max(last_raise_size)
         } else {
             // Min bet is 1 BB
-            state.invested[actor] + 1.0
+            state.street_bets[actor] + 1.0
         }
     }
 
@@ -787,6 +808,8 @@ impl GameTree {
     /// Unlike [`build`], this starts mid-game with a known pot and stack
     /// state, and optionally stops after `depth_limit` street transitions.
     ///
+    /// `invested` is per-player total investment so far (used to compute
+    /// remaining stacks as `starting_stack - invested[p]`).
     /// `dealer` indicates which seat is the button/SB. OOP = `1 - dealer`.
     #[must_use]
     pub fn build_subgame(
@@ -810,9 +833,16 @@ impl GameTree {
         // OOP acts first postflop = 1 - dealer
         let to_act = 1 - dealer;
 
+        // Convert invested to stacks: stack = starting_stack - invested
+        let stacks = [
+            starting_stack - invested[0],
+            starting_stack - invested[1],
+        ];
+
         let initial_state = BuildState {
             starting_stack,
-            invested,
+            stacks,
+            street_bets: [0.0; 2], // street bets start at 0 for a new street
             dealer,
             small_blind: 0.0, // no blind dead money in postflop subgames
             big_blind: 0.0,
@@ -826,7 +856,7 @@ impl GameTree {
 
         let mut nodes = Vec::new();
         let root = Self::build_node(&config, &initial_state, &mut nodes);
-        Self { nodes, root, dealer }
+        Self { nodes, root, dealer, starting_stack }
     }
 
     /// Annotate each decision node in this (subgame) tree with the
@@ -1510,8 +1540,9 @@ mod tests {
     #[test]
     fn test_raise_fold_pot_trace() {
         // Use "2.5bb" sizing, stack=50
-        // SB raises to 2.5 voluntary, BB folds.
-        // Pot = SB blind (0.5) + BB blind (1.0) + SB vol (2.5) = 4.0
+        // SB raises to 2.5 (total street bet). Additional = 2.5 - 0.5 = 2.0.
+        // BB folds.
+        // Pot = SB blind (0.5) + BB blind (1.0) + SB additional (2.0) = 3.5
         let tree = GameTree::build(
             50.0,
             0.5,
@@ -1532,10 +1563,10 @@ mod tests {
                 let fold_idx = bb_a.iter().position(|a| matches!(a, TreeAction::Fold))
                     .expect("BB should have Fold");
                 if let GameNode::Terminal { pot, .. } = &tree.nodes[bb_c[fold_idx] as usize] {
-                    // Pot = blinds(1.5) + SB voluntary(2.5) = 4.0
+                    // Pot = blinds(1.5) + SB additional(2.0) = 3.5
                     assert!(
-                        (*pot - 4.0).abs() < SIZE_EPSILON,
-                        "Pot should be 4.0 (blinds 1.5 + SB vol 2.5), got {pot}"
+                        (*pot - 3.5).abs() < SIZE_EPSILON,
+                        "Pot should be 3.5 (blinds 1.5 + SB additional 2.0), got {pot}"
                     );
                 } else { panic!("Expected Terminal after fold"); }
             } else { panic!("Expected Decision for BB"); }
@@ -1727,6 +1758,106 @@ mod tests {
             }
         }
         panic!("Should find a Chance node to Flop");
+    }
+
+    #[test]
+    fn terminal_payoffs_zero_sum() {
+        // SB raises to 2.5bb, BB calls. pot=6.0, stacks=[47.0, 47.0] (from 50.0)
+        // Starting stack=50, SB blind=0.5, BB blind=1.0
+        // SB raises to 2.5bb: street_bets[SB]=2.5, stacks[SB]=50-0.5-2.5=47.0
+        // BB calls: street_bets[BB]=2.5, stacks[BB]=50-1.0-2.5=46.5
+        // Wait, let me trace precisely:
+        // Initial: stacks=[49.5, 49.0], pot=1.5, street_bets=[0.5, 1.0]
+        // SB Raise(2.5): additional=2.5-0.5=2.0, stacks=[47.5, 49.0], pot=3.5, street_bets=[2.5, 1.0]
+        // BB Call: call_amount=2.5-1.0=1.5, stacks=[47.5, 47.5], pot=5.0, street_bets=[2.5, 2.5]
+        // Then showdown terminal: stacks=[47.5, 47.5], pot=5.0
+        //
+        // Winner: (47.5 + 5.0) - 50 = +2.5
+        // Loser: 47.5 - 50 = -2.5
+        // Sum = 0 ✓
+        //
+        // Tie: (47.5 + 5.0/2) - 50 = 0
+        // Both sum to 0 ✓
+        let tree = GameTree::build(
+            50.0, 0.5, 1.0,
+            &[vec!["2.5bb".into()]],
+            &[vec![0.5]],
+            &[vec![0.5]],
+            &[vec![0.5]],
+        );
+        let starting_stack = tree.starting_stack;
+
+        for node in &tree.nodes {
+            if let GameNode::Terminal { kind, pot, stacks } = node {
+                match kind {
+                    TerminalKind::Fold { winner } => {
+                        let w = *winner as usize;
+                        let l = 1 - w;
+                        let winner_ev = (stacks[w] + pot) - starting_stack;
+                        let loser_ev = stacks[l] - starting_stack;
+                        let sum = winner_ev + loser_ev;
+                        assert!(
+                            sum.abs() < 0.01,
+                            "Fold not zero-sum: winner_ev={winner_ev:.2}, loser_ev={loser_ev:.2}, sum={sum:.2}, \
+                             pot={pot:.2}, stacks={stacks:?}"
+                        );
+                        // Winner should gain, loser should lose
+                        assert!(winner_ev >= -0.01, "Winner EV should be non-negative: {winner_ev:.2}");
+                        assert!(loser_ev <= 0.01, "Loser EV should be non-positive: {loser_ev:.2}");
+                    }
+                    TerminalKind::Showdown => {
+                        // For showdown, winner gets pot, loser gets nothing
+                        // Check both perspectives sum to zero
+                        let p0_winner_ev = (stacks[0] + pot) - starting_stack;
+                        let p1_loser_ev = stacks[1] - starting_stack;
+                        let sum = p0_winner_ev + p1_loser_ev;
+                        assert!(
+                            sum.abs() < 0.01,
+                            "Showdown not zero-sum (p0 wins): sum={sum:.2}, pot={pot:.2}, stacks={stacks:?}"
+                        );
+
+                        // Tie check
+                        let p0_tie = (stacks[0] + pot / 2.0) - starting_stack;
+                        let p1_tie = (stacks[1] + pot / 2.0) - starting_stack;
+                        let tie_sum = p0_tie + p1_tie;
+                        assert!(
+                            tie_sum.abs() < 0.01,
+                            "Showdown tie not zero-sum: sum={tie_sum:.2}, pot={pot:.2}, stacks={stacks:?}"
+                        );
+                    }
+                    TerminalKind::DepthBoundary => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_stacks_pot_conservation() {
+        // For every terminal: stacks[0] + stacks[1] + pot == 2 * starting_stack
+        // (total chips in the system are conserved)
+        let tree = GameTree::build(
+            50.0, 0.5, 1.0,
+            &[vec!["2.5bb".into()], vec!["3.0x".into()]],
+            &[vec![0.5, 1.0]],
+            &[vec![0.5, 1.0]],
+            &[vec![0.5, 1.0]],
+        );
+        let starting_stack = tree.starting_stack;
+
+        for (i, node) in tree.nodes.iter().enumerate() {
+            if let GameNode::Terminal { pot, stacks, kind } = node {
+                if matches!(kind, TerminalKind::DepthBoundary) {
+                    continue;
+                }
+                let total = stacks[0] + stacks[1] + pot;
+                let expected = 2.0 * starting_stack;
+                assert!(
+                    (total - expected).abs() < 0.01,
+                    "Node {i}: chip conservation violated: stacks={stacks:?}, pot={pot:.2}, \
+                     total={total:.2}, expected={expected:.2}, kind={kind:?}"
+                );
+            }
+        }
     }
 
     #[test]

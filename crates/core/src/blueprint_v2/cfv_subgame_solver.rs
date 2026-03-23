@@ -226,6 +226,7 @@ impl CfvSubgameSolver {
             if let GameNode::Terminal {
                 kind: TerminalKind::DepthBoundary,
                 pot,
+                ..
             } = node
             {
                 let ordinal = boundaries.len();
@@ -547,7 +548,7 @@ impl CfvSubgameSolver {
         }
 
         let info = match &self.tree.nodes[node_idx] {
-            GameNode::Terminal { kind, pot } => NodeInfo::Terminal { kind: *kind, pot: *pot },
+            GameNode::Terminal { kind, pot, .. } => NodeInfo::Terminal { kind: *kind, pot: *pot },
             GameNode::Chance { child, .. } => NodeInfo::Chance { child: *child },
             GameNode::Decision { player, children, actions, .. } => {
                 let num_actions = actions.len();
@@ -1056,7 +1057,7 @@ impl CfvSubgameSolver {
         traverser: u8,
     ) -> f64 {
         match &self.tree.nodes[node_idx] {
-            GameNode::Terminal { kind, pot } => {
+            GameNode::Terminal { kind, pot, .. } => {
                 let half_pot = *pot / 2.0;
                 match kind {
                     TerminalKind::Fold { winner } => {
@@ -2218,9 +2219,11 @@ mod tests {
             nodes: vec![GameNode::Terminal {
                 kind: TerminalKind::Fold { winner },
                 pot,
+                stacks: [0.0; 2],
             }],
             root: 0,
             dealer: 0,
+            starting_stack: 0.0,
         }
     }
 
@@ -2247,15 +2250,18 @@ mod tests {
                 GameNode::Terminal {
                     kind: TerminalKind::Showdown,
                     pot,
+                    stacks: [0.0; 2],
                 },
                 // 2: Fold after bet (opponent folds, hero wins)
                 GameNode::Terminal {
                     kind: TerminalKind::Fold { winner: 0 },
                     pot: pot_bet,
+                    stacks: [0.0; 2],
                 },
             ],
             root: 0,
             dealer: 0,
+            starting_stack: 0.0,
         }
     }
 
@@ -2343,9 +2349,11 @@ mod tests {
             nodes: vec![GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 100.0,
+                stacks: [0.0; 2],
             }],
             root: 0,
             dealer: 0,
+            starting_stack: 0.0,
         };
         let board = river_board();
         let hands = small_hands(&board, 200);
@@ -2366,9 +2374,11 @@ mod tests {
             nodes: vec![GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 220.0,
+                stacks: [0.0; 2],
             }],
             root: 0,
             dealer: 0,
+            starting_stack: 0.0,
         };
         let board = river_board();
         let hands = small_hands(&board, 200);

@@ -1951,7 +1951,7 @@ fn subgame_node_to_result(
 ) -> Result<PostflopPlayResult, String> {
     match &result.tree.nodes[node_idx as usize] {
         GameNode::Terminal {
-            kind, pot,
+            kind, pot, ..
         } => {
             let each_inv = *pot / 2.0;
             let remaining = [

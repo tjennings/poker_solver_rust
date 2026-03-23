@@ -2859,22 +2859,26 @@ mod tests {
             V2GameNode::Terminal {
                 kind: poker_solver_core::blueprint_v2::game_tree::TerminalKind::Fold { winner: 1 },
                 pot: 1.5,
+                stacks: [49.5, 49.0],
             },
             // Node 4: terminal (check through)
             V2GameNode::Terminal {
                 kind: poker_solver_core::blueprint_v2::game_tree::TerminalKind::Showdown,
                 pot: 2.0,
+                stacks: [49.0, 49.0],
             },
             // Node 5: terminal (bet, then fold assumed)
             V2GameNode::Terminal {
                 kind: poker_solver_core::blueprint_v2::game_tree::TerminalKind::Fold { winner: 1 },
                 pot: 4.0,
+                stacks: [49.0, 47.0],
             },
         ];
         V2GameTree {
             nodes,
             root: 0,
             dealer: 0,
+            starting_stack: 50.0,
         }
     }
 

@@ -607,6 +607,7 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 2.0,
+                stacks: [49.0, 49.0],
             },
             // Node 4: Player 0 facing bet (Flop, Fold/Call)
             GameNode::Decision {
@@ -620,6 +621,7 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Fold { winner: 1 },
                 pot: 2.0,
+                stacks: [49.0, 49.0],
             },
             // Node 6: Chance (bet-call -> Turn)
             GameNode::Chance {
@@ -630,15 +632,17 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Fold { winner: 0 },
                 pot: 2.0,
+                stacks: [49.0, 49.0],
             },
             // Node 8: Terminal showdown (pot=4)
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 4.0,
+                stacks: [48.0, 48.0],
             },
         ];
 
-        GameTree { nodes, root: 0, dealer: 0 }
+        GameTree { nodes, root: 0, dealer: 0, starting_stack: 50.0 }
     }
 
     /// With uniform strategy (fresh storage), verify that the CBV
@@ -857,20 +861,23 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 2.0,
+                stacks: [49.0, 49.0],
             },
             // 7: (unused slot for alignment)
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 2.0,
+                stacks: [49.0, 49.0],
             },
             // 8: Fold terminal (P0 wins)
             GameNode::Terminal {
                 kind: TerminalKind::Fold { winner: 0 },
                 pot: 2.0,
+                stacks: [49.0, 49.0],
             },
         ];
 
-        GameTree { nodes, root: 0, dealer: 0 }
+        GameTree { nodes, root: 0, dealer: 0, starting_stack: 50.0 }
     }
 
     /// Identity transition (each bucket maps 100% to same bucket on
@@ -951,9 +958,10 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 2.0,
+                stacks: [49.0, 49.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, dealer: 0 };
+        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 50.0 };
         let bucket_counts: [u16; 4] = [2, 2, 2, 2];
         let storage = BlueprintStorage::new(&tree, bucket_counts);
         let strategy = BlueprintV2Strategy::from_storage(&storage, &tree);
@@ -1230,9 +1238,10 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 2.0,
+                stacks: [49.0, 49.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, dealer: 0 };
+        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 50.0 };
         // 3 flop buckets, 2 turn buckets
         let bucket_counts: [u16; 4] = [3, 3, 2, 2];
         let storage = BlueprintStorage::new(&tree, bucket_counts);
