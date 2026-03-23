@@ -523,7 +523,7 @@ impl GameTree {
                 let next_state = BuildState {
                     street: next_street,
                     num_raises: 0,
-                    to_act: 0, // OOP acts first on postflop streets
+                    to_act: 1, // BB (player 1) is OOP postflop in heads-up, acts first
                     facing_bet: false,
                     last_raise_to: 0.0,
                     ..*state
@@ -786,7 +786,7 @@ impl GameTree {
             blinds: [0.0, 0.0], // no blind dead money in postflop subgames
             street,
             num_raises: 0,
-            to_act: 0,       // OOP acts first postflop
+            to_act: 1,       // BB (player 1) is OOP postflop, acts first
             facing_bet: false,
             last_raise_to: 0.0,
         };
@@ -1171,9 +1171,10 @@ mod tests {
     }
 
     #[test]
-    fn test_postflop_player0_acts_first() {
+    fn test_postflop_bb_acts_first() {
         let tree = simple_tree();
-        // Find a Chance node transitioning to Flop and verify its child
+        // In heads-up, BB (player 1) is OOP postflop and acts first.
+        // SB (player 0) is the button/IP and acts second.
         for node in &tree.nodes {
             if let GameNode::Chance {
                 next_street: Street::Flop,
@@ -1181,7 +1182,7 @@ mod tests {
             } = node
             {
                 if let GameNode::Decision { player, street, .. } = &tree.nodes[*child as usize] {
-                    assert_eq!(*player, 0, "Player 0 (OOP) should act first on flop");
+                    assert_eq!(*player, 1, "BB (player 1, OOP) should act first on flop");
                     assert_eq!(*street, Street::Flop);
                 }
                 return;
@@ -1420,7 +1421,8 @@ mod tests {
             Street::Flop, 10.0, [5.0, 5.0], 50.0,
             &[vec![0.5, 1.0]], None,
         );
-        assert!(matches!(tree.nodes[tree.root as usize], GameNode::Decision { player: 0, .. }));
+        assert!(matches!(tree.nodes[tree.root as usize], GameNode::Decision { player: 1, .. }),
+            "BB (player 1) should act first in postflop subgame");
         let has_chance = tree.nodes.iter().any(|n| matches!(n, GameNode::Chance { .. }));
         assert!(has_chance, "Full-depth subgame should have Chance nodes");
     }
@@ -1545,27 +1547,28 @@ mod tests {
                 // Should transition to flop
                 match after_check {
                     GameNode::Chance { child, .. } => {
-                        // Flop root: P0 (OOP) acts first, has Check/Bet/AllIn (no Fold since not facing bet)
-                        // Follow Bet path to get P1's response, which will have Fold
-                        if let GameNode::Decision { actions: flop_a, children: flop_c, .. } = &tree.nodes[*child as usize] {
+                        // Flop root: BB (player 1, OOP) acts first, has Check/Bet/AllIn
+                        // Follow Bet path to get SB's (player 0) response, which will have Fold
+                        if let GameNode::Decision { player, actions: flop_a, children: flop_c, .. } = &tree.nodes[*child as usize] {
+                            assert_eq!(*player, 1, "BB should act first on flop");
                             let bet_idx = flop_a.iter().position(|a| matches!(a, TreeAction::Bet(_)))
-                                .expect("OOP should have a Bet action on flop");
-                            // P1 faces the bet and can fold
-                            if let GameNode::Decision { actions: p1_a, children: p1_c, .. } = &tree.nodes[flop_c[bet_idx] as usize] {
-                                let fold_idx = p1_a.iter().position(|a| matches!(a, TreeAction::Fold))
-                                    .expect("P1 should have Fold facing a bet");
-                                if let GameNode::Terminal { pot, invested, .. } = &tree.nodes[p1_c[fold_idx] as usize] {
+                                .expect("BB (OOP) should have a Bet action on flop");
+                            // SB (player 0) faces the bet and can fold
+                            if let GameNode::Decision { player: p0, actions: p0_a, children: p0_c, .. } = &tree.nodes[flop_c[bet_idx] as usize] {
+                                assert_eq!(*p0, 0, "SB should respond to BB's bet");
+                                let fold_idx = p0_a.iter().position(|a| matches!(a, TreeAction::Fold))
+                                    .expect("SB should have Fold facing a bet");
+                                if let GameNode::Terminal { pot, invested, .. } = &tree.nodes[p0_c[fold_idx] as usize] {
                                     // At the flop entry: blinds are dead money (1.5),
-                                    // SB voluntary = 0.5, BB voluntary = 0.0.
-                                    // P0 bet adds more voluntary.
-                                    // The pot should be blinds(1.5) + vol_SB(0.5) + vol_BB(0.0) + P0_bet
-                                    // P1 folds without adding. invested[1] should still be 0.0 (BB's voluntary).
+                                    // SB voluntary = 0.5 (preflop limp), BB voluntary = 0.0.
+                                    // BB bet adds voluntary. SB folds without adding.
+                                    // invested[0] should still be 0.5 (SB's preflop limp).
                                     assert!(
-                                        invested[1].abs() < SIZE_EPSILON,
-                                        "BB voluntary after limp+fold should be 0.0, got {}",
-                                        invested[1]
+                                        (invested[0] - 0.5).abs() < SIZE_EPSILON,
+                                        "SB voluntary after limp+fold should be 0.5, got {}",
+                                        invested[0]
                                     );
-                                    // pot = blinds + all voluntary including P0's bet
+                                    // pot = blinds + all voluntary including BB's bet
                                     assert!(
                                         *pot > 2.0 - SIZE_EPSILON,
                                         "Pot should be at least 2.0 (before bet), got {pot}"
@@ -1574,7 +1577,7 @@ mod tests {
                                     panic!("Fold child should be Terminal");
                                 }
                             } else {
-                                panic!("P1 response should be Decision");
+                                panic!("SB response should be Decision");
                             }
                         }
                     }
