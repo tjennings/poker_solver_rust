@@ -176,6 +176,8 @@ pub struct StrategyMatrix {
     pub reaching_p2: Vec<f32>,
     /// Which player is currently acting (0 = P1/SB, 1 = P2/BB)
     pub to_act: u8,
+    /// Which seat is the dealer/button (SB in heads-up).
+    pub dealer: u8,
 }
 
 /// Information about an available action.
@@ -723,6 +725,7 @@ fn get_strategy_matrix_agent(
         reaching_p1: vec![],
         reaching_p2: vec![],
         to_act: position.to_act,
+        dealer: 0, // agent source doesn't have dealer info
     })
 }
 
@@ -1164,6 +1167,7 @@ fn get_strategy_matrix_v2(
         reaching_p1,
         reaching_p2,
         to_act: walk.to_act,
+        dealer: tree.dealer,
     })
 }
 

@@ -118,6 +118,8 @@ pub struct PostflopStrategyMatrix {
     pub pot: i32,
     pub stacks: [i32; 2],
     pub board: Vec<String>,
+    /// Which seat is the dealer/button (SB in heads-up).
+    pub dealer: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -988,6 +990,7 @@ fn build_matrix_from_snapshot(snap: MatrixSnapshot) -> PostflopStrategyMatrix {
         pot: snap.pot,
         stacks: snap.stacks,
         board: snap.board,
+        dealer: 1, // In the range-solver, player 0 = OOP = BB, player 1 = IP = SB = dealer
     }
 }
 

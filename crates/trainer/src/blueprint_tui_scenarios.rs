@@ -164,7 +164,7 @@ pub fn decision_nodes_at_street(tree: &GameTree, street: Street) -> Vec<u32> {
 pub fn random_scenario_name(tree: &GameTree, node_idx: u32, board_display: &str) -> String {
     let player_name = match &tree.nodes[node_idx as usize] {
         GameNode::Decision { player, .. } => {
-            if *player == 0 { "SB" } else { "BB" }
+            tree.position_label(*player)
         }
         _ => return "Random".to_string(),
     };
