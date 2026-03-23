@@ -108,8 +108,8 @@ fn compute_node_value(
     table: &mut CbvTable,
 ) -> f32 {
     match &ctx.tree.nodes[node_idx as usize] {
-        GameNode::Terminal { kind, invested, .. } => {
-            terminal_bucket_value(*kind, invested, &ctx.tree.blinds, ctx.player, bucket, ctx.bucket_counts)
+        GameNode::Terminal { kind, pot, .. } => {
+            terminal_bucket_value(*kind, *pot, ctx.player, bucket, ctx.bucket_counts)
         }
 
         GameNode::Chance { next_street, child } => {
@@ -170,32 +170,22 @@ fn compute_node_value(
 
 /// Approximate terminal value for an abstract bucket.
 ///
-/// For fold terminals the payoff is deterministic. For showdown
-/// terminals we approximate equity from the river bucket index:
+/// Pot-only payoff model: fold winner = pot, loser = 0, showdown uses
+/// equity approximated from river bucket index:
 /// `equity ~ (bucket + 0.5) / river_bucket_count`.
 fn terminal_bucket_value(
     kind: TerminalKind,
-    invested: &[f64; 2],
-    blinds: &[f64; 2],
+    pot: f64,
     player: u8,
     bucket: u16,
     bucket_counts: [u16; 4],
 ) -> f32 {
-    let p = player as usize;
-    let o = 1 - p;
-    let initial_pot = blinds[0] + blinds[1];
-    // invested is voluntary-only (blinds already excluded).
-    let vol_p = invested[p];
-    let vol_o = invested[o];
-
     match kind {
         TerminalKind::Fold { winner } => {
-            // Zero-sum: winner gains opponent's total (blind + voluntary),
-            // loser loses own total (blind + voluntary).
             if winner == player {
-                (blinds[o] + vol_o) as f32
+                pot as f32
             } else {
-                -((blinds[p] + vol_p) as f32)
+                0.0
             }
         }
         TerminalKind::Showdown => {
@@ -203,10 +193,8 @@ fn terminal_bucket_value(
             let clamped_bucket = bucket.min(river_buckets - 1);
             let equity = (f64::from(clamped_bucket) + 0.5) / f64::from(river_buckets);
 
-            // Zero-sum: payoff = equity * total_pot - own_contribution
-            let total_pot = initial_pot + vol_p + vol_o;
-            let own_contribution = blinds[p] + vol_p;
-            let ev = equity * total_pot - own_contribution;
+            // Pot-only: payoff = equity * pot
+            let ev = equity * pot;
             ev as f32
         }
         TerminalKind::DepthBoundary => {
@@ -481,8 +469,8 @@ fn compute_street_values(
     chance_continuation: &HashMap<u32, Vec<f32>>,
 ) -> f32 {
     match &ctx.tree.nodes[node_idx as usize] {
-        GameNode::Terminal { kind, invested, .. } => {
-            terminal_bucket_value(*kind, invested, &ctx.tree.blinds, ctx.player, bucket, ctx.bucket_counts)
+        GameNode::Terminal { kind, pot, .. } => {
+            terminal_bucket_value(*kind, *pot, ctx.player, bucket, ctx.bucket_counts)
         }
 
         GameNode::Chance { .. } => {
@@ -581,12 +569,12 @@ mod tests {
     ///   Root: Decision(player=0, street=Flop, [Check, Bet])
     ///     Check -> Decision(player=1, street=Flop, [Check, Bet])
     ///       Check -> Chance(next=Turn, child=...)
-    ///         -> Terminal(Showdown, pot=2.0, invested=[1.0, 1.0])
+    ///         -> Terminal(Showdown, pot=2.0)
     ///       Bet -> Decision(player=0, street=Flop, [Fold, Call])
-    ///         Fold -> Terminal(Fold{winner=1}, pot=2.0, invested=[1.0, 1.0])
+    ///         Fold -> Terminal(Fold{winner=1}, pot=2.0)
     ///         Call -> Chance(next=Turn, child=...)
-    ///           -> Terminal(Showdown, pot=4.0, invested=[2.0, 2.0])
-    ///     Bet -> Terminal(Fold{winner=0}, pot=2.0, invested=[1.0, 1.0])
+    ///           -> Terminal(Showdown, pot=4.0)
+    ///     Bet -> Terminal(Fold{winner=0}, pot=2.0)
     /// ```
     ///
     /// This gives us 2 Chance nodes to compute CBVs for.
@@ -615,11 +603,10 @@ mod tests {
                 next_street: Street::Turn,
                 child: 3,
             },
-            // Node 3: Terminal showdown (pot=2, each invested 1)
+            // Node 3: Terminal showdown (pot=2)
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 2.0,
-                invested: [1.0, 1.0],
             },
             // Node 4: Player 0 facing bet (Flop, Fold/Call)
             GameNode::Decision {
@@ -633,7 +620,6 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Fold { winner: 1 },
                 pot: 2.0,
-                invested: [1.0, 1.0],
             },
             // Node 6: Chance (bet-call -> Turn)
             GameNode::Chance {
@@ -644,17 +630,15 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Fold { winner: 0 },
                 pot: 2.0,
-                invested: [1.0, 1.0],
             },
-            // Node 8: Terminal showdown (pot=4, each invested 2)
+            // Node 8: Terminal showdown (pot=4)
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 4.0,
-                invested: [2.0, 2.0],
             },
         ];
 
-        GameTree { nodes, root: 0, blinds: [0.0, 0.0] }
+        GameTree { nodes, root: 0, dealer: 0 }
     }
 
     /// With uniform strategy (fresh storage), verify that the CBV
@@ -702,13 +686,12 @@ mod tests {
         //
         // Bucket 0: equity = 0.25, Bucket 1: equity = 0.75
         //
-        // Node 3 (showdown, invested=[1,1]):
-        //   p0 EV = eq*1 - (1-eq)*1 = 2*eq - 1
-        //   bucket 0: -0.5, bucket 1: 0.5
+        // Pot-only model:
+        // Node 3 (showdown, pot=2.0): EV = equity * 2.0
+        //   bucket 0: 0.5, bucket 1: 1.5
         //
-        // Node 8 (showdown, invested=[2,2]):
-        //   p0 EV = eq*2 - (1-eq)*2 = 4*eq - 2
-        //   bucket 0: -1.0, bucket 1: 1.0
+        // Node 8 (showdown, pot=4.0): EV = equity * 4.0
+        //   bucket 0: 1.0, bucket 1: 3.0
         //
         // Chance node 2 (check-check -> node 3):
         //   CBV = showdown value at node 3
@@ -719,24 +702,24 @@ mod tests {
         let eps = 1e-4;
 
         assert!(
-            (p0_cbvs.lookup(0, 0) - (-0.5)).abs() < eps,
-            "chance0 bucket0: expected -0.5, got {}",
+            (p0_cbvs.lookup(0, 0) - 0.5).abs() < eps,
+            "chance0 bucket0: expected 0.5, got {}",
             p0_cbvs.lookup(0, 0)
         );
         assert!(
-            (p0_cbvs.lookup(0, 1) - 0.5).abs() < eps,
-            "chance0 bucket1: expected 0.5, got {}",
+            (p0_cbvs.lookup(0, 1) - 1.5).abs() < eps,
+            "chance0 bucket1: expected 1.5, got {}",
             p0_cbvs.lookup(0, 1)
         );
 
         assert!(
-            (p0_cbvs.lookup(1, 0) - (-1.0)).abs() < eps,
-            "chance1 bucket0: expected -1.0, got {}",
+            (p0_cbvs.lookup(1, 0) - 1.0).abs() < eps,
+            "chance1 bucket0: expected 1.0, got {}",
             p0_cbvs.lookup(1, 0)
         );
         assert!(
-            (p0_cbvs.lookup(1, 1) - 1.0).abs() < eps,
-            "chance1 bucket1: expected 1.0, got {}",
+            (p0_cbvs.lookup(1, 1) - 3.0).abs() < eps,
+            "chance1 bucket1: expected 3.0, got {}",
             p0_cbvs.lookup(1, 1)
         );
     }
@@ -747,56 +730,52 @@ mod tests {
     fn fold_terminal_value_independent_of_bucket() {
         let bucket_counts: [u16; 4] = [4, 4, 4, 4];
 
-        // Player 0 wins fold: gains opponent's investment.
+        // Player 0 wins fold: pot-only model gives pot.
         let v = terminal_bucket_value(
             TerminalKind::Fold { winner: 0 },
-            &[1.0, 1.0],
-            &[0.0, 0.0],
+            2.0,
             0,
             0,
             bucket_counts,
         );
-        assert!((v - 1.0).abs() < 1e-6);
+        assert!((v - 2.0).abs() < 1e-6);
 
         // Same value regardless of bucket.
         let v2 = terminal_bucket_value(
             TerminalKind::Fold { winner: 0 },
-            &[1.0, 1.0],
-            &[0.0, 0.0],
+            2.0,
             0,
             3,
             bucket_counts,
         );
         assert!((v - v2).abs() < 1e-6);
 
-        // Player 0 loses fold: loses own investment.
+        // Player 0 loses fold: pot-only model gives 0.
         let v3 = terminal_bucket_value(
             TerminalKind::Fold { winner: 1 },
-            &[1.0, 1.0],
-            &[0.0, 0.0],
+            2.0,
             0,
             2,
             bucket_counts,
         );
-        assert!((v3 - (-1.0)).abs() < 1e-6);
+        assert!(v3.abs() < 1e-6);
     }
 
     /// Verify bucket-equity mapping at showdown terminals.
     #[test]
     fn showdown_equity_midpoint() {
         // With 4 buckets: equities = 0.125, 0.375, 0.625, 0.875
-        // EV = 2*equity - 1 when both invested 1.0.
+        // Pot-only: EV = equity * pot. With pot=2.0:
         let bucket_counts: [u16; 4] = [4, 4, 4, 4];
 
         let v0 = terminal_bucket_value(
             TerminalKind::Showdown,
-            &[1.0, 1.0],
-            &[0.0, 0.0],
+            2.0,
             0,
             0,
             bucket_counts,
         );
-        let expected_0 = (2.0 * 0.125 - 1.0) as f32;
+        let expected_0 = (0.125 * 2.0) as f32;
         assert!(
             (v0 - expected_0).abs() < 1e-5,
             "bucket 0: expected {expected_0}, got {v0}"
@@ -804,13 +783,12 @@ mod tests {
 
         let v3 = terminal_bucket_value(
             TerminalKind::Showdown,
-            &[1.0, 1.0],
-            &[0.0, 0.0],
+            2.0,
             0,
             3,
             bucket_counts,
         );
-        let expected_3 = (2.0 * 0.875 - 1.0) as f32;
+        let expected_3 = (0.875 * 2.0) as f32;
         assert!(
             (v3 - expected_3).abs() < 1e-5,
             "bucket 3: expected {expected_3}, got {v3}"
@@ -826,8 +804,8 @@ mod tests {
     ///       Check -> Chance(next=Turn, child=...)
     ///         -> Decision(player=0, street=Turn, [Check])
     ///           Check -> Decision(player=1, street=Turn, [Check])
-    ///             Check -> Terminal(Showdown, invested=[1,1])
-    ///     Bet -> Terminal(Fold{winner=0}, invested=[1,1])
+    ///             Check -> Terminal(Showdown, pot=2.0)
+    ///     Bet -> Terminal(Fold{winner=0}, pot=2.0)
     /// ```
     fn build_two_street_tree() -> GameTree {
         use crate::blueprint_v2::Street;
@@ -879,23 +857,20 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 2.0,
-                invested: [1.0, 1.0],
             },
             // 7: (unused slot for alignment)
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 2.0,
-                invested: [1.0, 1.0],
             },
             // 8: Fold terminal (P0 wins)
             GameNode::Terminal {
                 kind: TerminalKind::Fold { winner: 0 },
                 pot: 2.0,
-                invested: [1.0, 1.0],
             },
         ];
 
-        GameTree { nodes, root: 0, blinds: [0.0, 0.0] }
+        GameTree { nodes, root: 0, dealer: 0 }
     }
 
     /// Identity transition (each bucket maps 100% to same bucket on
@@ -953,7 +928,7 @@ mod tests {
         //   0: Decision(P0, Flop, [Check])
         //     1: Decision(P1, Flop, [Check])
         //       2: Chance(next=Turn)
-        //         3: Terminal(Showdown, invested=[1,1])
+        //         3: Terminal(Showdown, pot=2.0)
         let nodes = vec![
             GameNode::Decision {
                 player: 0,
@@ -976,10 +951,9 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 2.0,
-                invested: [1.0, 1.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, blinds: [0.0, 0.0] };
+        let tree = GameTree { nodes, root: 0, dealer: 0 };
         let bucket_counts: [u16; 4] = [2, 2, 2, 2];
         let storage = BlueprintStorage::new(&tree, bucket_counts);
         let strategy = BlueprintV2Strategy::from_storage(&storage, &tree);
@@ -992,9 +966,10 @@ mod tests {
         //   flop bucket 0 -> [0.8 turn_0, 0.2 turn_1]
         //   flop bucket 1 -> [0.3 turn_0, 0.7 turn_1]
         //
+        // Pot-only: turn bucket 0: eq=0.25, EV=0.5; bucket 1: eq=0.75, EV=1.5
         // Expected CBV at chance node 2:
-        //   flop bucket 0: 0.8 * (-0.5) + 0.2 * 0.5 = -0.4 + 0.1 = -0.3
-        //   flop bucket 1: 0.3 * (-0.5) + 0.7 * 0.5 = -0.15 + 0.35 = 0.2
+        //   flop bucket 0: 0.8 * 0.5 + 0.2 * 1.5 = 0.4 + 0.3 = 0.7
+        //   flop bucket 1: 0.3 * 0.5 + 0.7 * 1.5 = 0.15 + 1.05 = 1.2
         let transition = BucketTransition {
             matrix: vec![vec![0.8, 0.2], vec![0.3, 0.7]],
         };
@@ -1009,13 +984,13 @@ mod tests {
 
         let eps = 1e-4;
         assert!(
-            (p0_cbvs.lookup(0, 0) - (-0.3)).abs() < eps,
-            "flop bucket 0: expected -0.3, got {}",
+            (p0_cbvs.lookup(0, 0) - 0.7).abs() < eps,
+            "flop bucket 0: expected 0.7, got {}",
             p0_cbvs.lookup(0, 0)
         );
         assert!(
-            (p0_cbvs.lookup(0, 1) - 0.2).abs() < eps,
-            "flop bucket 1: expected 0.2, got {}",
+            (p0_cbvs.lookup(0, 1) - 1.2).abs() < eps,
+            "flop bucket 1: expected 1.2, got {}",
             p0_cbvs.lookup(0, 1)
         );
     }
@@ -1029,25 +1004,25 @@ mod tests {
         let storage = BlueprintStorage::new(&tree, bucket_counts);
         let strategy = BlueprintV2Strategy::from_storage(&storage, &tree);
 
-        // River has 2 buckets: equity = (b+0.5)/2
-        //   bucket 0: eq=0.25, EV = -0.5
-        //   bucket 1: eq=0.75, EV =  0.5
+        // Pot-only: River has 2 buckets: equity = (b+0.5)/2
+        //   bucket 0: eq=0.25, EV = 0.5
+        //   bucket 1: eq=0.75, EV = 1.5
         //
         // Turn->river transition:
         //   turn bucket 0 -> [0.9 river_0, 0.1 river_1]
         //   turn bucket 1 -> [0.2 river_0, 0.8 river_1]
         //
         // After turn->river transition, continuation values at turn:
-        //   turn bucket 0: 0.9*(-0.5) + 0.1*(0.5) = -0.45 + 0.05 = -0.4
-        //   turn bucket 1: 0.2*(-0.5) + 0.8*(0.5) = -0.1 + 0.4 = 0.3
+        //   turn bucket 0: 0.9*0.5 + 0.1*1.5 = 0.45 + 0.15 = 0.6
+        //   turn bucket 1: 0.2*0.5 + 0.8*1.5 = 0.1 + 1.2 = 1.3
         //
         // Flop->turn transition:
         //   flop bucket 0 -> [0.7 turn_0, 0.3 turn_1]
         //   flop bucket 1 -> [0.1 turn_0, 0.9 turn_1]
         //
         // After flop->turn transition, CBV at flop->turn chance node:
-        //   flop bucket 0: 0.7*(-0.4) + 0.3*(0.3) = -0.28 + 0.09 = -0.19
-        //   flop bucket 1: 0.1*(-0.4) + 0.9*(0.3) = -0.04 + 0.27 = 0.23
+        //   flop bucket 0: 0.7*0.6 + 0.3*1.3 = 0.42 + 0.39 = 0.81
+        //   flop bucket 1: 0.1*0.6 + 0.9*1.3 = 0.06 + 1.17 = 1.23
 
         let turn_river = BucketTransition {
             matrix: vec![vec![0.9, 0.1], vec![0.2, 0.8]],
@@ -1072,26 +1047,26 @@ mod tests {
         // Chance node for flop->turn (node 2, position 0 in table):
         // CBV indexed by flop buckets
         assert!(
-            (p0_cbvs.lookup(0, 0) - (-0.19)).abs() < eps,
-            "flop->turn, flop bucket 0: expected -0.19, got {}",
+            (p0_cbvs.lookup(0, 0) - 0.81).abs() < eps,
+            "flop->turn, flop bucket 0: expected 0.81, got {}",
             p0_cbvs.lookup(0, 0)
         );
         assert!(
-            (p0_cbvs.lookup(0, 1) - 0.23).abs() < eps,
-            "flop->turn, flop bucket 1: expected 0.23, got {}",
+            (p0_cbvs.lookup(0, 1) - 1.23).abs() < eps,
+            "flop->turn, flop bucket 1: expected 1.23, got {}",
             p0_cbvs.lookup(0, 1)
         );
 
         // Chance node for turn->river (node 5, position 1 in table):
         // CBV indexed by turn buckets
         assert!(
-            (p0_cbvs.lookup(1, 0) - (-0.4)).abs() < eps,
-            "turn->river, turn bucket 0: expected -0.4, got {}",
+            (p0_cbvs.lookup(1, 0) - 0.6).abs() < eps,
+            "turn->river, turn bucket 0: expected 0.6, got {}",
             p0_cbvs.lookup(1, 0)
         );
         assert!(
-            (p0_cbvs.lookup(1, 1) - 0.3).abs() < eps,
-            "turn->river, turn bucket 1: expected 0.3, got {}",
+            (p0_cbvs.lookup(1, 1) - 1.3).abs() < eps,
+            "turn->river, turn bucket 1: expected 1.3, got {}",
             p0_cbvs.lookup(1, 1)
         );
     }
@@ -1118,18 +1093,14 @@ mod tests {
         let [p0_cbvs, _] =
             compute_cbvs_with_transitions(&strategy, &tree, bucket_counts, &transitions);
 
-        // For both chance nodes, bucket 0 (weak) should be negative,
-        // bucket 1 (strong) should be positive.
+        // For both chance nodes, bucket 1 (strong) should exceed
+        // bucket 0 (weak). With pot-only model both are positive.
         for node in 0..p0_cbvs.num_boundary_nodes() {
             let v0 = p0_cbvs.lookup(node, 0);
             let v1 = p0_cbvs.lookup(node, 1);
             assert!(
-                v0 < 0.0,
-                "node {node} bucket 0 (weak) should be negative, got {v0}"
-            );
-            assert!(
-                v1 > 0.0,
-                "node {node} bucket 1 (strong) should be positive, got {v1}"
+                v0 > 0.0,
+                "node {node} bucket 0 (weak) should be positive with pot-only, got {v0}"
             );
             assert!(
                 v1 > v0,
@@ -1259,23 +1230,22 @@ mod tests {
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 2.0,
-                invested: [1.0, 1.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, blinds: [0.0, 0.0] };
+        let tree = GameTree { nodes, root: 0, dealer: 0 };
         // 3 flop buckets, 2 turn buckets
         let bucket_counts: [u16; 4] = [3, 3, 2, 2];
         let storage = BlueprintStorage::new(&tree, bucket_counts);
         let strategy = BlueprintV2Strategy::from_storage(&storage, &tree);
 
-        // Turn 2 buckets: equity = (b+0.5)/2
-        //   bucket 0: eq=0.25, EV = -0.5
-        //   bucket 1: eq=0.75, EV =  0.5
+        // Pot-only: Turn 2 buckets: equity = (b+0.5)/2
+        //   bucket 0: eq=0.25, EV = 0.5
+        //   bucket 1: eq=0.75, EV = 1.5
         //
         // 3x2 transition (flop 3 buckets -> turn 2 buckets):
-        //   flop 0 -> [0.9, 0.1]  => 0.9*(-0.5) + 0.1*0.5 = -0.4
-        //   flop 1 -> [0.5, 0.5]  => 0.5*(-0.5) + 0.5*0.5 =  0.0
-        //   flop 2 -> [0.1, 0.9]  => 0.1*(-0.5) + 0.9*0.5 =  0.4
+        //   flop 0 -> [0.9, 0.1]  => 0.9*0.5 + 0.1*1.5 = 0.6
+        //   flop 1 -> [0.5, 0.5]  => 0.5*0.5 + 0.5*1.5 = 1.0
+        //   flop 2 -> [0.1, 0.9]  => 0.1*0.5 + 0.9*1.5 = 1.4
         let transition = BucketTransition {
             matrix: vec![
                 vec![0.9, 0.1],
@@ -1298,18 +1268,18 @@ mod tests {
 
         let eps = 1e-4;
         assert!(
-            (p0_cbvs.lookup(0, 0) - (-0.4)).abs() < eps,
-            "flop bucket 0: expected -0.4, got {}",
+            (p0_cbvs.lookup(0, 0) - 0.6).abs() < eps,
+            "flop bucket 0: expected 0.6, got {}",
             p0_cbvs.lookup(0, 0)
         );
         assert!(
-            (p0_cbvs.lookup(0, 1) - 0.0).abs() < eps,
-            "flop bucket 1: expected 0.0, got {}",
+            (p0_cbvs.lookup(0, 1) - 1.0).abs() < eps,
+            "flop bucket 1: expected 1.0, got {}",
             p0_cbvs.lookup(0, 1)
         );
         assert!(
-            (p0_cbvs.lookup(0, 2) - 0.4).abs() < eps,
-            "flop bucket 2: expected 0.4, got {}",
+            (p0_cbvs.lookup(0, 2) - 1.4).abs() < eps,
+            "flop bucket 2: expected 1.4, got {}",
             p0_cbvs.lookup(0, 2)
         );
     }

@@ -904,6 +904,7 @@ pub fn solve_subgame(
         } else {
             None
         },
+        0,
     );
     let hands = SubgameHands::enumerate(board);
     // Count boundaries and replicate flat leaf values for each.
@@ -1192,6 +1193,7 @@ mod tests {
             250.0,
             &[bet_sizes.to_vec()],
             None,
+            0,
         )
     }
 
@@ -1305,6 +1307,7 @@ mod tests {
             250.0,
             &[vec![1.0]],
             Some(1),
+            0,
         );
 
         let hands = small_hands(&board, 6);
@@ -1536,6 +1539,7 @@ mod tests {
             250.0,
             &[vec![0.5, 1.0]],
             None,
+            0,
         );
         let hands = small_hands(&board, 20);
         let n = hands.combos.len();
@@ -1570,6 +1574,7 @@ mod tests {
             250.0,
             &[vec![1.0]], // pot-size bet
             Some(1),
+            0,
         );
 
         // Count DepthBoundary nodes -- should be > 1 (check-check and bet-call paths).
@@ -1665,6 +1670,7 @@ mod tests {
             250.0,
             &[vec![1.0]],
             None, // full depth
+            0,
         );
 
         // Build subgame depth-limited flop tree with SAME bet sizes.
@@ -1675,6 +1681,7 @@ mod tests {
             250.0,
             &[vec![1.0]],
             Some(1), // depth limit = 1 street
+            0,
         );
 
         // Count expected boundaries.
@@ -1722,16 +1729,16 @@ mod tests {
             250.0,
             &[vec![1.0]],
             Some(1),
+            0,
         );
         // Abstract tree is a bare terminal — structural mismatch.
         let tree_b = GameTree {
             nodes: vec![GameNode::Terminal {
                 kind: TerminalKind::Showdown,
                 pot: 100.0,
-                invested: [50.0, 50.0],
             }],
             root: 0,
-            blinds: [0.0, 0.0],
+            dealer: 0,
         };
         let _ = build_boundary_mapping(&tree_a, &tree_b);
     }

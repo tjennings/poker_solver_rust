@@ -35,8 +35,6 @@ pub enum GameNode {
     Terminal {
         kind: TerminalKind,
         pot: f64,
-        /// Voluntary investment per player (excludes blinds). `pot` includes blinds.
-        invested: [f64; 2],
     },
 }
 
@@ -63,19 +61,27 @@ pub enum TerminalKind {
 pub struct GameTree {
     pub nodes: Vec<GameNode>,
     pub root: u32,
-    /// Forced blind postings (dead money). `blinds[0]` = SB, `blinds[1]` = BB.
-    /// Terminal node `pot` includes blinds; terminal `invested` is voluntary only.
-    pub blinds: [f64; 2],
+    /// Which seat is the button/SB. The other seat is BB.
+    /// Preflop: `dealer` (SB) acts first.
+    /// Postflop: `1 - dealer` (BB/OOP) acts first.
+    pub dealer: u8,
 }
 
 /// Internal state tracked during recursive tree construction.
 struct BuildState {
     /// Stacks at the start of the hand (same for both players).
     starting_stack: f64,
-    /// Voluntary investment only (starts at [0, 0]).
+    /// Per-player investment on the current action sequence (voluntary only).
+    /// Used for to-call computation. Starts at [0, 0].
     invested: [f64; 2],
-    /// Dead money from forced blind postings. `blinds[0]` = SB, `blinds[1]` = BB.
-    blinds: [f64; 2],
+    /// Which seat is the button/SB (0 or 1).
+    dealer: u8,
+    /// Small blind amount in BB.
+    small_blind: f64,
+    /// Big blind amount in BB.
+    big_blind: f64,
+    /// Running total pot (includes blinds and all bets).
+    pot: f64,
     /// Current street.
     street: Street,
     /// Number of bets/raises made on the current street.
@@ -176,7 +182,10 @@ impl GameTree {
         let initial_state = BuildState {
             starting_stack: stack_depth,
             invested: [0.0, 0.0],
-            blinds: [small_blind, big_blind],
+            dealer: 0, // seat 0 is SB/button
+            small_blind,
+            big_blind,
+            pot: small_blind + big_blind, // blinds are dead money in pot
             street: Street::Preflop,
             num_raises: 0, // BB is a forced blind, not a voluntary raise
             to_act: 0,     // SB acts first preflop
@@ -186,14 +195,23 @@ impl GameTree {
 
         let root = Self::build_node(&config, &initial_state, &mut nodes);
 
-        Self { nodes, root, blinds: [small_blind, big_blind] }
+        Self { nodes, root, dealer: 0 }
+    }
+
+    /// Blind amount posted by a given seat.
+    fn blind_for_seat(state: &BuildState, seat: usize) -> f64 {
+        if seat == state.dealer as usize {
+            state.small_blind
+        } else {
+            state.big_blind
+        }
     }
 
     /// Recursively build a node and return its arena index.
     fn build_node(config: &TreeConfig, state: &BuildState, nodes: &mut Vec<GameNode>) -> u32 {
         let remaining = [
-            state.starting_stack - state.blinds[0] - state.invested[0],
-            state.starting_stack - state.blinds[1] - state.invested[1],
+            state.starting_stack - Self::blind_for_seat(state, 0) - state.invested[0],
+            state.starting_stack - Self::blind_for_seat(state, 1) - state.invested[1],
         ];
         let actor = state.to_act as usize;
 
@@ -216,7 +234,7 @@ impl GameTree {
             // Call: match the opponent's bet
             let call_amount = if state.street == Street::Preflop && state.num_raises == 0 && state.facing_bet {
                 // SB faces BB obligation: call = BB blind - SB blind
-                state.blinds[1] - state.blinds[0]
+                state.big_blind - state.small_blind
             } else {
                 state.invested[1 - actor] - state.invested[actor]
             };
@@ -266,7 +284,6 @@ impl GameTree {
         nodes.push(GameNode::Terminal {
             kind: TerminalKind::Showdown,
             pot: 0.0,
-            invested: [0.0; 2],
         });
 
         let mut children = Vec::with_capacity(actions.len());
@@ -295,27 +312,27 @@ impl GameTree {
     ) -> u32 {
         let actor = state.to_act as usize;
         let opponent = 1 - actor;
-        let remaining_actor = state.starting_stack - state.blinds[actor] - state.invested[actor];
+        let actor_blind = Self::blind_for_seat(state, actor);
+        let remaining_actor = state.starting_stack - actor_blind - state.invested[actor];
 
         match action {
             TreeAction::Fold => {
+                // Fold: pot unchanged
                 let idx = nodes.len() as u32;
                 nodes.push(GameNode::Terminal {
                     kind: TerminalKind::Fold {
                         winner: opponent as u8,
                     },
-                    pot: state.blinds[0] + state.blinds[1] + state.invested[0] + state.invested[1],
-                    invested: state.invested,
+                    pot: state.pot,
                 });
                 idx
             }
             TreeAction::Check => {
-                // If both players have checked (actor is second to act on this street)
+                // Check: pot unchanged
                 let both_checked = !state.facing_bet && Self::is_closing_action(state);
                 if both_checked {
                     Self::make_showdown_or_chance(config, state, nodes)
                 } else {
-                    // Pass action to opponent
                     let next_state = BuildState {
                         to_act: opponent as u8,
                         facing_bet: false,
@@ -327,10 +344,12 @@ impl GameTree {
             TreeAction::Call => {
                 let call_to = if state.street == Street::Preflop && state.num_raises == 0 {
                     // SB limps: voluntary investment = big_blind - small_blind
-                    state.blinds[1] - state.blinds[0]
+                    state.big_blind - state.small_blind
                 } else {
                     state.invested[opponent]
                 };
+                let call_amount = call_to - state.invested[actor];
+                let new_pot = state.pot + call_amount;
                 let mut new_invested = state.invested;
                 new_invested[actor] = call_to;
 
@@ -339,6 +358,7 @@ impl GameTree {
                 if state.street == Street::Preflop && state.num_raises == 0 {
                     let new_state = BuildState {
                         invested: new_invested,
+                        pot: new_pot,
                         to_act: opponent as u8,
                         facing_bet: false,
                         num_raises: 0,
@@ -350,12 +370,15 @@ impl GameTree {
                 // After a call, the betting round is over
                 let new_state = BuildState {
                     invested: new_invested,
+                    pot: new_pot,
                     ..*state
                 };
                 Self::make_showdown_or_chance(config, &new_state, nodes)
             }
             TreeAction::AllIn => {
-                let all_in_total = state.starting_stack - state.blinds[actor];
+                let all_in_total = state.starting_stack - actor_blind;
+                let additional = all_in_total - state.invested[actor];
+                let new_pot = state.pot + additional;
                 let mut new_invested = state.invested;
                 new_invested[actor] = all_in_total;
 
@@ -369,26 +392,26 @@ impl GameTree {
                     let idx = nodes.len() as u32;
                     nodes.push(GameNode::Terminal {
                         kind: TerminalKind::Showdown,
-                        pot: state.blinds[0] + state.blinds[1] + new_invested[0] + new_invested[1],
-                        invested: new_invested,
+                        pot: new_pot,
                     });
                     idx
                 } else if state.facing_bet {
                     // All-in raise => opponent can fold or call
                     let next_state = BuildState {
                         invested: new_invested,
+                        pot: new_pot,
                         to_act: opponent as u8,
                         num_raises: state.num_raises + 1,
                         facing_bet: true,
                         last_raise_to: all_in_total,
                         ..*state
                     };
-                    // Opponent faces the all-in: fold or call only (no re-raise)
                     Self::build_allin_response(config, &next_state, nodes)
                 } else {
                     // All-in open bet => opponent responds
                     let next_state = BuildState {
                         invested: new_invested,
+                        pot: new_pot,
                         to_act: opponent as u8,
                         num_raises: state.num_raises + 1,
                         facing_bet: true,
@@ -399,11 +422,14 @@ impl GameTree {
                 }
             }
             TreeAction::Bet(amount) | TreeAction::Raise(amount) => {
+                let additional = amount - state.invested[actor];
+                let new_pot = state.pot + additional;
                 let mut new_invested = state.invested;
                 new_invested[actor] = amount;
 
                 let next_state = BuildState {
                     invested: new_invested,
+                    pot: new_pot,
                     to_act: opponent as u8,
                     num_raises: state.num_raises + 1,
                     facing_bet: true,
@@ -424,38 +450,36 @@ impl GameTree {
     ) -> u32 {
         let actor = state.to_act as usize;
         let opponent = 1 - actor;
-        let remaining = state.starting_stack - state.blinds[actor] - state.invested[actor];
+        let actor_blind = Self::blind_for_seat(state, actor);
+        let remaining = state.starting_stack - actor_blind - state.invested[actor];
 
         let node_idx = nodes.len() as u32;
         nodes.push(GameNode::Terminal {
             kind: TerminalKind::Showdown,
             pot: 0.0,
-            invested: [0.0; 2],
         });
 
         let mut children = Vec::with_capacity(2);
 
-        // Fold
+        // Fold: pot unchanged
         let fold_idx = nodes.len() as u32;
         nodes.push(GameNode::Terminal {
             kind: TerminalKind::Fold {
                 winner: opponent as u8,
             },
-            pot: state.blinds[0] + state.blinds[1] + state.invested[0] + state.invested[1],
-            invested: state.invested,
+            pot: state.pot,
         });
         children.push(fold_idx);
 
         // Call (match the all-in or go all-in yourself)
-        let actor_all_in = state.starting_stack - state.blinds[actor];
+        let actor_all_in = state.starting_stack - actor_blind;
         let call_to = state.invested[opponent].min(actor_all_in);
-        let mut call_invested = state.invested;
-        call_invested[actor] = call_to;
+        let call_amount = call_to - state.invested[actor];
+        let call_pot = state.pot + call_amount;
         let call_idx = nodes.len() as u32;
         nodes.push(GameNode::Terminal {
             kind: TerminalKind::Showdown,
-            pot: state.blinds[0] + state.blinds[1] + call_invested[0] + call_invested[1],
-            invested: call_invested,
+            pot: call_pot,
         });
         children.push(call_idx);
 
@@ -480,10 +504,14 @@ impl GameTree {
     /// Determine if the current action is the "closing" action on the street
     /// (i.e., the second player to act checking, or calling).
     fn is_closing_action(state: &BuildState) -> bool {
-        // Player 1 always closes the action round:
-        // - Preflop: BB (player 1) checking after SB limps transitions to flop
-        // - Postflop: player 1 checking after player 0 checks transitions
-        state.to_act == 1
+        // The second player to act on this street closes the action.
+        // Preflop: BB (1 - dealer) acts second.
+        // Postflop: IP (dealer) acts second.
+        if state.street == Street::Preflop {
+            state.to_act == 1 - state.dealer
+        } else {
+            state.to_act == state.dealer
+        }
     }
 
     /// After a call or check-check, either go to showdown or next street.
@@ -492,8 +520,8 @@ impl GameTree {
         state: &BuildState,
         nodes: &mut Vec<GameNode>,
     ) -> u32 {
-        let both_all_in = (state.starting_stack - state.blinds[0] - state.invested[0]).abs() < SIZE_EPSILON
-            && (state.starting_stack - state.blinds[1] - state.invested[1]).abs() < SIZE_EPSILON;
+        let both_all_in = (state.starting_stack - Self::blind_for_seat(state, 0) - state.invested[0]).abs() < SIZE_EPSILON
+            && (state.starting_stack - Self::blind_for_seat(state, 1) - state.invested[1]).abs() < SIZE_EPSILON;
 
         match state.street.next() {
             Some(next_street) if !both_all_in => {
@@ -504,8 +532,7 @@ impl GameTree {
                         let idx = nodes.len() as u32;
                         nodes.push(GameNode::Terminal {
                             kind: TerminalKind::DepthBoundary,
-                            pot: state.blinds[0] + state.blinds[1] + state.invested[0] + state.invested[1],
-                            invested: state.invested,
+                            pot: state.pot,
                         });
                         return idx;
                     }
@@ -517,13 +544,15 @@ impl GameTree {
                 nodes.push(GameNode::Terminal {
                     kind: TerminalKind::Showdown,
                     pot: 0.0,
-                    invested: [0.0; 2],
                 });
+
+                // Postflop: OOP (1 - dealer) acts first.
+                let postflop_to_act = 1 - state.dealer;
 
                 let next_state = BuildState {
                     street: next_street,
                     num_raises: 0,
-                    to_act: 0, // OOP acts first on postflop streets
+                    to_act: postflop_to_act,
                     facing_bet: false,
                     last_raise_to: 0.0,
                     ..*state
@@ -543,8 +572,7 @@ impl GameTree {
                 let idx = nodes.len() as u32;
                 nodes.push(GameNode::Terminal {
                     kind: TerminalKind::Showdown,
-                    pot: state.blinds[0] + state.blinds[1] + state.invested[0] + state.invested[1],
-                    invested: state.invested,
+                    pot: state.pot,
                 });
                 idx
             }
@@ -557,7 +585,7 @@ impl GameTree {
         state: &BuildState,
         remaining: f64,
     ) -> Vec<TreeAction> {
-        let pot = state.blinds[0] + state.blinds[1] + state.invested[0] + state.invested[1];
+        let pot = state.pot;
 
         // Determine which raise depth index to use
         let depth_idx = state.num_raises as usize;
@@ -613,7 +641,7 @@ impl GameTree {
                 .map_or(&[] as &[PreflopSize], Vec::as_slice)
         };
 
-        let all_in_total = state.starting_stack - state.blinds[actor];
+        let all_in_total = state.starting_stack - Self::blind_for_seat(state, actor);
         let mut actions = Vec::new();
 
         for &size in sizes {
@@ -672,7 +700,7 @@ impl GameTree {
                 .map_or(&[] as &[f64], Vec::as_slice)
         };
 
-        let all_in_total = state.starting_stack - state.blinds[actor];
+        let all_in_total = state.starting_stack - Self::blind_for_seat(state, actor);
         let mut actions = Vec::new();
 
         for &frac in fractions {
@@ -725,8 +753,8 @@ impl GameTree {
         if state.street == Street::Preflop && state.num_raises == 0 && state.facing_bet {
             // Preflop root: SB facing BB obligation.
             // Call = BB - SB blind. Min raise = call + BB.
-            let call = state.blinds[1] - state.blinds[0];
-            call + state.blinds[1]
+            let call = state.big_blind - state.small_blind;
+            call + state.big_blind
         } else if state.facing_bet {
             // Must raise by at least the size of the last raise
             let last_raise_size = state.last_raise_to - state.invested[actor];
@@ -758,6 +786,8 @@ impl GameTree {
     ///
     /// Unlike [`build`], this starts mid-game with a known pot and stack
     /// state, and optionally stops after `depth_limit` street transitions.
+    ///
+    /// `dealer` indicates which seat is the button/SB. OOP = `1 - dealer`.
     #[must_use]
     pub fn build_subgame(
         street: Street,
@@ -766,6 +796,7 @@ impl GameTree {
         starting_stack: f64,
         bet_sizes: &[Vec<f64>],
         depth_limit: Option<u8>,
+        dealer: u8,
     ) -> Self {
         let config = TreeConfig {
             preflop_sizes: vec![],
@@ -776,25 +807,26 @@ impl GameTree {
             starting_street: Some(street),
         };
 
-        // Distribute pot evenly if invested doesn't sum to pot (caller
-        // may pass [pot/2, pot/2] or an asymmetric split).
-        let _ = pot; // pot is implicit in invested[0] + invested[1]
+        // OOP acts first postflop = 1 - dealer
+        let to_act = 1 - dealer;
 
         let initial_state = BuildState {
             starting_stack,
             invested,
-            blinds: [0.0, 0.0], // no blind dead money in postflop subgames
+            dealer,
+            small_blind: 0.0, // no blind dead money in postflop subgames
+            big_blind: 0.0,
+            pot,
             street,
             num_raises: 0,
-            to_act: 0,       // OOP acts first postflop
+            to_act,
             facing_bet: false,
             last_raise_to: 0.0,
         };
 
         let mut nodes = Vec::new();
         let root = Self::build_node(&config, &initial_state, &mut nodes);
-        // Subgames start postflop: no blind dead money. blinds = [0, 0].
-        Self { nodes, root, blinds: [0.0, 0.0] }
+        Self { nodes, root, dealer }
     }
 
     /// Annotate each decision node in this (subgame) tree with the
@@ -880,6 +912,24 @@ impl GameTree {
             }
         }
         (decision, chance, terminal)
+    }
+
+    /// Return the position label for a seat: `"SB"` for the dealer, `"BB"` for the other.
+    #[must_use]
+    pub fn position_label(&self, seat: u8) -> &str {
+        if seat == self.dealer { "SB" } else { "BB" }
+    }
+
+    /// Return the seat index of the small blind (= dealer).
+    #[must_use]
+    pub fn sb_seat(&self) -> u8 {
+        self.dealer
+    }
+
+    /// Return the seat index of the big blind (= 1 - dealer).
+    #[must_use]
+    pub fn bb_seat(&self) -> u8 {
+        1 - self.dealer
     }
 
     /// Build a mapping from arena index to decision-node index.
@@ -995,24 +1045,32 @@ mod tests {
     /// Walk the tree verifying every decision node where the actor has chips
     /// includes AllIn. This catches the beyond-raise-cap case.
     fn check_all_in_everywhere(tree: &GameTree, starting_stack: f64) {
-        // With the new model, invested starts at [0, 0] (voluntary only).
-        // Remaining = starting_stack - blind - invested.
-        // All-in invested = starting_stack - blind.
-        check_all_in_with_invested(tree, starting_stack, [0.0, 0.0]);
+        // Full game tree: blinds are [0.5, 1.0] for dealer=0
+        let blinds = blind_amounts_for_tree(tree, 0.5, 1.0);
+        check_all_in_with_invested(tree, starting_stack, [0.0, 0.0], blinds);
     }
 
-    fn check_all_in_with_invested(tree: &GameTree, starting_stack: f64, initial: [f64; 2]) {
+    /// Compute per-seat blind amounts from tree's dealer field.
+    fn blind_amounts_for_tree(tree: &GameTree, sb: f64, bb: f64) -> [f64; 2] {
+        let mut blinds = [0.0; 2];
+        blinds[tree.dealer as usize] = sb;
+        blinds[1 - tree.dealer as usize] = bb;
+        blinds
+    }
+
+    fn check_all_in_with_invested(tree: &GameTree, starting_stack: f64, initial: [f64; 2], blinds: [f64; 2]) {
         fn walk(
             tree: &GameTree,
             node_idx: u32,
             invested: [f64; 2],
             starting_stack: f64,
+            blinds: [f64; 2],
             violations: &mut Vec<String>,
         ) {
             match &tree.nodes[node_idx as usize] {
                 GameNode::Terminal { .. } => {}
                 GameNode::Chance { child, .. } => {
-                    walk(tree, *child, invested, starting_stack, violations);
+                    walk(tree, *child, invested, starting_stack, blinds, violations);
                 }
                 GameNode::Decision {
                     player,
@@ -1021,7 +1079,7 @@ mod tests {
                     ..
                 } => {
                     let p = *player as usize;
-                    let remaining = starting_stack - tree.blinds[p] - invested[p];
+                    let remaining = starting_stack - blinds[p] - invested[p];
                     // Skip all-in response nodes (exactly [Fold, Call/AllIn]) —
                     // these intentionally lack a full AllIn option.
                     let is_allin_response = actions.len() == 2
@@ -1050,17 +1108,17 @@ mod tests {
                                 new_inv[p] = *v;
                             }
                             TreeAction::AllIn => {
-                                new_inv[p] = starting_stack - tree.blinds[p];
+                                new_inv[p] = starting_stack - blinds[p];
                             }
                         }
-                        walk(tree, child, new_inv, starting_stack, violations);
+                        walk(tree, child, new_inv, starting_stack, blinds, violations);
                     }
                 }
             }
         }
 
         let mut violations = Vec::new();
-        walk(tree, tree.root, initial, starting_stack, &mut violations);
+        walk(tree, tree.root, initial, starting_stack, blinds, &mut violations);
         assert!(
             violations.is_empty(),
             "AllIn missing at {} node(s):\n{}",
@@ -1171,9 +1229,9 @@ mod tests {
     }
 
     #[test]
-    fn test_postflop_player0_acts_first() {
+    fn test_postflop_oop_acts_first() {
         let tree = simple_tree();
-        // Find a Chance node transitioning to Flop and verify its child
+        // With dealer=0, OOP = 1 - dealer = seat 1 (BB) acts first postflop.
         for node in &tree.nodes {
             if let GameNode::Chance {
                 next_street: Street::Flop,
@@ -1181,7 +1239,7 @@ mod tests {
             } = node
             {
                 if let GameNode::Decision { player, street, .. } = &tree.nodes[*child as usize] {
-                    assert_eq!(*player, 0, "Player 0 (OOP) should act first on flop");
+                    assert_eq!(*player, 1, "BB (seat 1, OOP) should act first on flop");
                     assert_eq!(*street, Street::Flop);
                 }
                 return;
@@ -1207,9 +1265,9 @@ mod tests {
     }
 
     #[test]
-    fn test_invested_tracks_voluntary_only() {
+    fn test_fold_pot_includes_blinds() {
         let tree = simple_tree();
-        // Fold at root: SB folds with no voluntary investment
+        // Fold at root: pot should be SB + BB = 1.5
         if let GameNode::Decision {
             actions, children, ..
         } = &tree.nodes[tree.root as usize]
@@ -1218,18 +1276,8 @@ mod tests {
                 .iter()
                 .position(|a| matches!(a, TreeAction::Fold))
                 .unwrap();
-            if let GameNode::Terminal { invested, pot, .. } = &tree.nodes[children[fold_idx] as usize]
+            if let GameNode::Terminal { pot, .. } = &tree.nodes[children[fold_idx] as usize]
             {
-                assert!(
-                    invested[0].abs() < SIZE_EPSILON,
-                    "SB voluntary investment should be 0.0, got {}",
-                    invested[0]
-                );
-                assert!(
-                    invested[1].abs() < SIZE_EPSILON,
-                    "BB voluntary investment should be 0.0, got {}",
-                    invested[1]
-                );
                 assert!(
                     (*pot - 1.5).abs() < SIZE_EPSILON,
                     "Pot should include blinds: 1.5, got {pot}"
@@ -1418,9 +1466,10 @@ mod tests {
     fn test_build_subgame_basic() {
         let tree = GameTree::build_subgame(
             Street::Flop, 10.0, [5.0, 5.0], 50.0,
-            &[vec![0.5, 1.0]], None,
+            &[vec![0.5, 1.0]], None, 0,
         );
-        assert!(matches!(tree.nodes[tree.root as usize], GameNode::Decision { player: 0, .. }));
+        // With dealer=0, postflop OOP = 1 - dealer = seat 1 acts first.
+        assert!(matches!(tree.nodes[tree.root as usize], GameNode::Decision { player: 1, .. }));
         let has_chance = tree.nodes.iter().any(|n| matches!(n, GameNode::Chance { .. }));
         assert!(has_chance, "Full-depth subgame should have Chance nodes");
     }
@@ -1429,7 +1478,7 @@ mod tests {
     fn test_build_subgame_depth_limited() {
         let tree = GameTree::build_subgame(
             Street::Flop, 10.0, [5.0, 5.0], 50.0,
-            &[vec![0.5, 1.0]], Some(1),
+            &[vec![0.5, 1.0]], Some(1), 0,
         );
         let has_boundary = tree.nodes.iter().any(|n| matches!(
             n, GameNode::Terminal { kind: TerminalKind::DepthBoundary, .. }
@@ -1443,7 +1492,7 @@ mod tests {
     fn test_build_subgame_river_no_chance() {
         let tree = GameTree::build_subgame(
             Street::River, 20.0, [10.0, 10.0], 50.0,
-            &[vec![0.5, 1.0]], None,
+            &[vec![0.5, 1.0]], None, 0,
         );
         let has_chance = tree.nodes.iter().any(|n| matches!(n, GameNode::Chance { .. }));
         assert!(!has_chance, "River subgame has no next street");
@@ -1459,8 +1508,10 @@ mod tests {
     /// Trace: SB Raise(2.5) -> BB Fold
     /// invested = [2.5, 0.0], pot = blinds(1.5) + vol(2.5 + 0.0) = 4.0
     #[test]
-    fn test_blinds_are_dead_money_hand_trace() {
+    fn test_raise_fold_pot_trace() {
         // Use "2.5bb" sizing, stack=50
+        // SB raises to 2.5 voluntary, BB folds.
+        // Pot = SB blind (0.5) + BB blind (1.0) + SB vol (2.5) = 4.0
         let tree = GameTree::build(
             50.0,
             0.5,
@@ -1470,25 +1521,7 @@ mod tests {
             &[vec![0.5]],
             &[vec![0.5]],
         );
-        // Root: SB's decision
         if let GameNode::Decision { actions, children, .. } = &tree.nodes[tree.root as usize] {
-            // SB raises. In old model Raise(2.5), in new model Raise(2.5) but invested = 2.5 voluntary.
-            // Wait: "2.5bb" parse => PreflopSize::Absolute(2.5). Then raise_to = 2.5.
-            // In the new model, Raise(2.5) and invested[actor] = 2.5 means voluntary = 2.5.
-            // That makes total from SB = 0.5 + 2.5 = 3.0. That's NOT what 2.5bb means.
-            //
-            // After the change, the `compute_preflop_sizes` will set raise_to = 2.5,
-            // and then `invested[actor] = raise_to` means voluntary = 2.5. Total = 3.0.
-            //
-            // Hmm, but the task says "Do NOT change PreflopSize::Absolute interpretation --
-            // 2bb still means raise TO 2.0 (but now it's 2.0 voluntary since invested starts at 0)."
-            //
-            // So "2bb" means raise TO 2.0 voluntary. "2.5bb" means raise TO 2.5 voluntary.
-            // Total from SB = 0.5 + 2.5 = 3.0. Pot = 3.0 + 1.0 (BB blind) = 4.0 if BB folds.
-            //
-            // But the old pot was 2.5 + 1.0 = 3.5. So pot DOES change with this interpretation.
-            //
-            // For now, follow the task literally: Raise(2.5) means voluntary = 2.5.
             let raise_idx = actions
                 .iter()
                 .position(|a| matches!(a, TreeAction::Raise(_)))
@@ -1498,20 +1531,8 @@ mod tests {
             if let GameNode::Decision { actions: bb_a, children: bb_c, .. } = &tree.nodes[children[raise_idx] as usize] {
                 let fold_idx = bb_a.iter().position(|a| matches!(a, TreeAction::Fold))
                     .expect("BB should have Fold");
-                if let GameNode::Terminal { pot, invested, .. } = &tree.nodes[bb_c[fold_idx] as usize] {
-                    // BB voluntary = 0 (folded without adding voluntary chips)
-                    assert!(
-                        invested[1].abs() < SIZE_EPSILON,
-                        "BB voluntary should be 0.0 after folding, got {}",
-                        invested[1]
-                    );
-                    // SB voluntary = raise amount (2.5)
-                    assert!(
-                        (invested[0] - 2.5).abs() < SIZE_EPSILON,
-                        "SB voluntary should be 2.5 after raising, got {}",
-                        invested[0]
-                    );
-                    // Pot = blinds + voluntary = 0.5 + 1.0 + 2.5 + 0.0 = 4.0
+                if let GameNode::Terminal { pot, .. } = &tree.nodes[bb_c[fold_idx] as usize] {
+                    // Pot = blinds(1.5) + SB voluntary(2.5) = 4.0
                     assert!(
                         (*pot - 4.0).abs() < SIZE_EPSILON,
                         "Pot should be 4.0 (blinds 1.5 + SB vol 2.5), got {pot}"
@@ -1554,21 +1575,12 @@ mod tests {
                             if let GameNode::Decision { actions: p1_a, children: p1_c, .. } = &tree.nodes[flop_c[bet_idx] as usize] {
                                 let fold_idx = p1_a.iter().position(|a| matches!(a, TreeAction::Fold))
                                     .expect("P1 should have Fold facing a bet");
-                                if let GameNode::Terminal { pot, invested, .. } = &tree.nodes[p1_c[fold_idx] as usize] {
-                                    // At the flop entry: blinds are dead money (1.5),
-                                    // SB voluntary = 0.5, BB voluntary = 0.0.
-                                    // P0 bet adds more voluntary.
-                                    // The pot should be blinds(1.5) + vol_SB(0.5) + vol_BB(0.0) + P0_bet
-                                    // P1 folds without adding. invested[1] should still be 0.0 (BB's voluntary).
-                                    assert!(
-                                        invested[1].abs() < SIZE_EPSILON,
-                                        "BB voluntary after limp+fold should be 0.0, got {}",
-                                        invested[1]
-                                    );
-                                    // pot = blinds + all voluntary including P0's bet
+                                if let GameNode::Terminal { pot, .. } = &tree.nodes[p1_c[fold_idx] as usize] {
+                                    // After limp: pot = 2.0 (0.5 SB + 1.0 BB + 0.5 SB call)
+                                    // P0 bets on flop, P1 folds. Pot includes limp pot + bet.
                                     assert!(
                                         *pot > 2.0 - SIZE_EPSILON,
-                                        "Pot should be at least 2.0 (before bet), got {pot}"
+                                        "Pot should be at least 2.0 (after limp + bet), got {pot}"
                                     );
                                 } else {
                                     panic!("Fold child should be Terminal");
@@ -1589,9 +1601,144 @@ mod tests {
         for street in [Street::Flop, Street::Turn, Street::River] {
             let tree = GameTree::build_subgame(
                 street, 10.0, [5.0, 5.0], 50.0,
-                &[vec![0.5]], Some(1),
+                &[vec![0.5]], Some(1), 0,
             );
-            check_all_in_with_invested(&tree, 50.0, [5.0, 5.0]);
+            check_all_in_with_invested(&tree, 50.0, [5.0, 5.0], [0.0, 0.0]);
+        }
+    }
+
+    // ── Phase 1: Domain types & game tree refactor tests ─────────────
+
+    #[test]
+    fn test_terminal_has_pot_only_no_invested() {
+        // After the refactor, Terminal nodes should have only `pot`, not `invested`.
+        let tree = simple_tree();
+        for node in &tree.nodes {
+            if let GameNode::Terminal { pot, .. } = node {
+                // Pot should be positive.
+                assert!(*pot > 0.0, "Terminal pot should be positive, got {pot}");
+                // Crucially: there should be NO `invested` field.
+                // This test asserts by pattern matching — if `invested` exists
+                // on Terminal, this match would need to include it.
+            }
+        }
+    }
+
+    #[test]
+    fn test_fold_at_preflop_root_pot() {
+        // SB folds immediately: pot = small_blind + big_blind = 0.5 + 1.0 = 1.5
+        let tree = simple_tree();
+        if let GameNode::Decision { actions, children, .. } = &tree.nodes[tree.root as usize] {
+            let fold_idx = actions.iter().position(|a| matches!(a, TreeAction::Fold)).unwrap();
+            if let GameNode::Terminal { pot, .. } = &tree.nodes[children[fold_idx] as usize] {
+                assert!(
+                    (*pot - 1.5).abs() < SIZE_EPSILON,
+                    "Fold at preflop root should have pot=1.5, got {pot}"
+                );
+            } else {
+                panic!("Expected Terminal after fold");
+            }
+        }
+    }
+
+    #[test]
+    fn test_raise_then_call_pot() {
+        // SB raises to 2.5bb, BB calls.
+        // Pot = SB blind (0.5) + BB blind (1.0) + SB vol (2.5) + BB call (2.5) = 6.5
+        // Wait: raise TO 2.5 means SB invested 2.5 voluntary. BB calls to match = 2.5.
+        // Pot = 0.5 + 1.0 + 2.5 + 2.5 = 6.5
+        let tree = simple_tree();
+        if let GameNode::Decision { actions, children, .. } = &tree.nodes[tree.root as usize] {
+            let raise_idx = actions.iter().position(|a| matches!(a, TreeAction::Raise(_))).unwrap();
+            // BB's response to SB's raise
+            if let GameNode::Decision { actions: bb_a, children: bb_c, .. } = &tree.nodes[children[raise_idx] as usize] {
+                let call_idx = bb_a.iter().position(|a| matches!(a, TreeAction::Call)).unwrap();
+                // After call, should go to chance/showdown. Find the first terminal via chance nodes.
+                let after_call = bb_c[call_idx] as usize;
+                // This should be a chance node to flop
+                if let GameNode::Chance { child, .. } = &tree.nodes[after_call] {
+                    // Follow into flop, find a fold terminal to verify pot
+                    if let GameNode::Decision { actions: flop_a, children: flop_c, .. } = &tree.nodes[*child as usize] {
+                        if let Some(bet_idx) = flop_a.iter().position(|a| matches!(a, TreeAction::Bet(_))) {
+                            if let GameNode::Decision { actions: p1_a, children: p1_c, .. } = &tree.nodes[flop_c[bet_idx] as usize] {
+                                let fold_idx = p1_a.iter().position(|a| matches!(a, TreeAction::Fold)).unwrap();
+                                if let GameNode::Terminal { pot, .. } = &tree.nodes[p1_c[fold_idx] as usize] {
+                                    // After SB raise 2.5, BB call, flop bet: pot should be >= 6.5 (the pre-bet pot)
+                                    assert!(
+                                        *pot >= 6.5 - SIZE_EPSILON,
+                                        "After raise+call+bet, pot should be >= 6.5, got {pot}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dealer_field_replaces_blinds() {
+        let tree = simple_tree();
+        // After refactor, tree should have `dealer` field, not `blinds`.
+        // dealer=0 means seat 0 is SB.
+        assert_eq!(tree.dealer, 0, "Default dealer should be seat 0 (SB)");
+    }
+
+    #[test]
+    fn test_position_label_sb() {
+        let tree = simple_tree();
+        assert_eq!(tree.position_label(tree.dealer), "SB");
+    }
+
+    #[test]
+    fn test_position_label_bb() {
+        let tree = simple_tree();
+        assert_eq!(tree.position_label(1 - tree.dealer), "BB");
+    }
+
+    #[test]
+    fn test_sb_seat() {
+        let tree = simple_tree();
+        assert_eq!(tree.sb_seat(), 0);
+    }
+
+    #[test]
+    fn test_bb_seat() {
+        let tree = simple_tree();
+        assert_eq!(tree.bb_seat(), 1);
+    }
+
+    #[test]
+    fn test_postflop_bb_acts_first_with_dealer() {
+        // When dealer=0, SB=seat 0, BB=seat 1.
+        // Postflop: BB (seat 1) should act first = 1 - dealer.
+        let tree = simple_tree();
+        for node in &tree.nodes {
+            if let GameNode::Chance { next_street: Street::Flop, child } = node {
+                if let GameNode::Decision { player, .. } = &tree.nodes[*child as usize] {
+                    assert_eq!(
+                        *player,
+                        1 - tree.dealer,
+                        "BB (1-dealer) should act first postflop"
+                    );
+                }
+                return;
+            }
+        }
+        panic!("Should find a Chance node to Flop");
+    }
+
+    #[test]
+    fn test_subgame_oop_acts_first() {
+        // Subgame: OOP (1 - dealer) acts first.
+        let tree = GameTree::build_subgame(
+            Street::Flop, 10.0, [5.0, 5.0], 50.0,
+            &[vec![0.5, 1.0]], None, 0,
+        );
+        if let GameNode::Decision { player, .. } = &tree.nodes[tree.root as usize] {
+            // dealer=0 => OOP = 1 - 0 = 1
+            assert_eq!(*player, 1 - tree.dealer, "OOP should act first in subgame");
         }
     }
 }

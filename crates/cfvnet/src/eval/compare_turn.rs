@@ -96,6 +96,7 @@ fn solve_and_extract(
         starting_stack,
         bet_sizes,
         Some(1),
+        0,
     );
 
     let hands = SubgameHands::enumerate(&board_cards);

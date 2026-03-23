@@ -479,8 +479,8 @@ pub fn traverse_external(
     ev_tracker: Option<&ScenarioEvTracker>,
 ) -> (f64, PruneStats) {
     match &tree.nodes[node_idx as usize] {
-        GameNode::Terminal { kind, invested, .. } => {
-            (terminal_value(*kind, invested, &tree.blinds, traverser, &deal.deal, rake_rate, rake_cap), PruneStats::default())
+        GameNode::Terminal { kind, pot, .. } => {
+            (terminal_value(*kind, *pot, traverser, &deal.deal, rake_rate, rake_cap), PruneStats::default())
         }
 
         GameNode::Chance { child, .. } => {
@@ -552,24 +552,16 @@ pub fn traverse_external(
 ///
 /// Blinds (and future antes/straddles) are treated as dead money in the pot —
 /// neither player "owns" them. Voluntary investment = invested - blinds.
-/// Fold = 0 for the folder (sunk cost), winner collects dead money + opponent's
-/// voluntary investment.
+/// Pot-only payoff model: fold winner = pot, loser = 0, showdown winner = pot,
+/// loser = 0, tie = pot/2.  Rake is applied to the winner's payoff.
 fn terminal_value(
     kind: TerminalKind,
-    invested: &[f64; 2],
-    blinds: &[f64; 2],
+    pot: f64,
     traverser: u8,
     deal: &Deal,
     rake_rate: f64,
     rake_cap: f64,
 ) -> f64 {
-    let t = traverser as usize;
-    let o = 1 - t;
-    let initial_pot = blinds[0] + blinds[1];
-    // invested is now voluntary-only (blinds already excluded).
-    let vol_t = invested[t];
-    let vol_o = invested[o];
-    let pot = initial_pot + vol_t + vol_o;
     let rake = if rake_rate > 0.0 {
         let uncapped = pot * rake_rate;
         if rake_cap > 0.0 {
@@ -582,22 +574,21 @@ fn terminal_value(
     };
     match kind {
         TerminalKind::Fold { winner } => {
-            // Zero-sum: winner gains opponent's total (blind + voluntary),
-            // loser loses own total (blind + voluntary).
             if winner == traverser {
-                blinds[o] + vol_o - rake
+                pot - rake
             } else {
-                -(blinds[t] + vol_t)
+                0.0
             }
         }
         TerminalKind::Showdown => {
+            let t = traverser as usize;
+            let o = 1 - t;
             let rank_t = rank_hand(deal.hole_cards[t], &deal.board);
             let rank_o = rank_hand(deal.hole_cards[o], &deal.board);
-            let own_contribution = blinds[t] + vol_t;
             match rank_t.cmp(&rank_o) {
-                Ordering::Greater => pot - own_contribution - rake,
-                Ordering::Less => -own_contribution,
-                Ordering::Equal => pot / 2.0 - own_contribution - rake / 2.0,
+                Ordering::Greater => pot - rake,
+                Ordering::Less => 0.0,
+                Ordering::Equal => pot / 2.0 - rake / 2.0,
             }
         }
         TerminalKind::DepthBoundary => {
@@ -1076,30 +1067,28 @@ mod tests {
 
     #[test]
     fn terminal_fold_payoff() {
-        let invested = [0.5, 1.0]; // SB folded
         let deal = make_deal();
 
-        // Winner is player 1 (BB), traverser is player 0 (SB).
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, &[0.0, 0.0], 0, &deal, 0.0, 0.0);
-        assert!((v - (-0.5)).abs() < 1e-10, "SB loses 0.5 on fold, got {v}");
+        // Pot-only: winner gets pot, loser gets 0.
+        // pot = 1.5 (example).
+        let v = terminal_value(TerminalKind::Fold { winner: 1 }, 1.5, 0, &deal, 0.0, 0.0);
+        assert!(v.abs() < 1e-10, "Loser gets 0 on fold, got {v}");
 
-        // Winner is player 1, traverser is player 1.
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, &[0.0, 0.0], 1, &deal, 0.0, 0.0);
-        assert!((v - 0.5).abs() < 1e-10, "BB wins 0.5 on SB fold, got {v}");
+        let v = terminal_value(TerminalKind::Fold { winner: 1 }, 1.5, 1, &deal, 0.0, 0.0);
+        assert!((v - 1.5).abs() < 1e-10, "Winner gets pot=1.5 on fold, got {v}");
     }
 
     #[test]
     fn terminal_showdown_payoff() {
-        let invested = [2.0, 2.0];
         let deal = make_deal();
 
         // Both have a straight on 2-3-4-5-6; AKs (6-high straight) vs
         // QJh (6-high straight). Both make the same board straight, so
-        // this should be a tie (chop).
-        let v = terminal_value(TerminalKind::Showdown, &invested, &[0.0, 0.0], 0, &deal, 0.0, 0.0);
+        // this should be a tie (chop). Pot-only: tie = pot/2.
+        let v = terminal_value(TerminalKind::Showdown, 4.0, 0, &deal, 0.0, 0.0);
         assert!(
-            v.abs() < 1e-10,
-            "Equal hands should chop (EV=0), got {v}"
+            (v - 2.0).abs() < 1e-10,
+            "Equal hands should chop (EV=pot/2=2.0), got {v}"
         );
     }
 
@@ -1130,92 +1119,85 @@ mod tests {
 
     #[test]
     fn terminal_fold_with_rake() {
-        let invested = [5.0, 5.0]; // pot = 10
         let deal = make_deal();
-        // 5% rake, cap 1.0 -> rake = min(10*0.05, 1.0) = 0.5
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, &[0.0, 0.0], 1, &deal, 0.05, 1.0);
-        assert!((v - 4.5).abs() < 1e-10, "Winner gets 5 - 0.5 rake = 4.5, got {v}");
+        // pot=10, 5% rake, cap 1.0 -> rake = min(10*0.05, 1.0) = 0.5
+        // Pot-only: winner = pot - rake = 10 - 0.5 = 9.5
+        let v = terminal_value(TerminalKind::Fold { winner: 1 }, 10.0, 1, &deal, 0.05, 1.0);
+        assert!((v - 9.5).abs() < 1e-10, "Winner gets pot - rake = 9.5, got {v}");
 
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, &[0.0, 0.0], 0, &deal, 0.05, 1.0);
-        assert!((v - (-5.0)).abs() < 1e-10, "Loser loses 5.0, got {v}");
+        // Loser gets 0
+        let v = terminal_value(TerminalKind::Fold { winner: 1 }, 10.0, 0, &deal, 0.05, 1.0);
+        assert!(v.abs() < 1e-10, "Loser gets 0, got {v}");
     }
 
     #[test]
     fn terminal_showdown_with_rake_winner() {
-        let invested = [5.0, 5.0]; // pot = 10
         let deal = make_deal_p0_wins();
-        // 5% rake, no cap -> rake = 0.5
-        // Player 0 wins: gets opponent's 5.0 minus 0.5 rake = 4.5
-        let v = terminal_value(TerminalKind::Showdown, &invested, &[0.0, 0.0], 0, &deal, 0.05, 0.0);
-        assert!((v - 4.5).abs() < 1e-10, "Winner gets 5 - 0.5 rake = 4.5, got {v}");
+        // pot=10, 5% rake, no cap -> rake = 0.5
+        // Pot-only: winner = pot - rake = 10 - 0.5 = 9.5
+        let v = terminal_value(TerminalKind::Showdown, 10.0, 0, &deal, 0.05, 0.0);
+        assert!((v - 9.5).abs() < 1e-10, "Winner gets pot - rake = 9.5, got {v}");
 
-        // Player 1 loses: loses full 5.0
-        let v = terminal_value(TerminalKind::Showdown, &invested, &[0.0, 0.0], 1, &deal, 0.05, 0.0);
-        assert!((v - (-5.0)).abs() < 1e-10, "Loser loses 5.0, got {v}");
+        // Loser gets 0
+        let v = terminal_value(TerminalKind::Showdown, 10.0, 1, &deal, 0.05, 0.0);
+        assert!(v.abs() < 1e-10, "Loser gets 0, got {v}");
     }
 
     #[test]
     fn terminal_tie_with_rake() {
-        let invested = [5.0, 5.0]; // pot = 10
         let deal = make_deal(); // equal hands (tie via board straight)
-        // 5% rake, no cap -> rake = 0.5
-        let v = terminal_value(TerminalKind::Showdown, &invested, &[0.0, 0.0], 0, &deal, 0.05, 0.0);
-        assert!((v - (-0.25)).abs() < 1e-10, "Tie splits 0.5 rake: -0.25 each, got {v}");
+        // pot=10, 5% rake, no cap -> rake = 0.5
+        // Pot-only tie: pot/2 - rake/2 = 5 - 0.25 = 4.75
+        let v = terminal_value(TerminalKind::Showdown, 10.0, 0, &deal, 0.05, 0.0);
+        assert!((v - 4.75).abs() < 1e-10, "Tie: pot/2 - rake/2 = 4.75, got {v}");
     }
 
     #[test]
     fn terminal_rake_cap_applied() {
-        let invested = [50.0, 50.0]; // pot = 100
         let deal = make_deal(); // tie
-        // 5% rake, cap 3.0 -> rake = min(5.0, 3.0) = 3.0 (capped)
-        let v = terminal_value(TerminalKind::Showdown, &invested, &[0.0, 0.0], 0, &deal, 0.05, 3.0);
-        assert!((v - (-1.5)).abs() < 1e-10, "Capped rake 3.0 split = -1.5 each, got {v}");
+        // pot=100, 5% rake, cap 3.0 -> rake = min(5.0, 3.0) = 3.0 (capped)
+        // Pot-only tie: pot/2 - rake/2 = 50 - 1.5 = 48.5
+        let v = terminal_value(TerminalKind::Showdown, 100.0, 0, &deal, 0.05, 3.0);
+        assert!((v - 48.5).abs() < 1e-10, "Capped rake tie = 48.5, got {v}");
     }
 
     #[test]
     fn terminal_rake_zero_rate_is_noop() {
-        let invested = [5.0, 5.0];
         let deal = make_deal_p0_wins();
-        // rate=0 should produce identical results to no-rake
-        let v = terminal_value(TerminalKind::Showdown, &invested, &[0.0, 0.0], 0, &deal, 0.0, 3.0);
-        assert!((v - 5.0).abs() < 1e-10, "Zero rate means no rake, got {v}");
+        // pot=10, rate=0 -> no rake. Winner gets pot = 10.
+        let v = terminal_value(TerminalKind::Showdown, 10.0, 0, &deal, 0.0, 3.0);
+        assert!((v - 10.0).abs() < 1e-10, "Zero rate means no rake, got {v}");
     }
 
     #[test]
     fn terminal_rake_uncapped() {
-        let invested = [50.0, 50.0]; // pot = 100
         let deal = make_deal_p0_wins();
-        // 10% rake, no cap -> rake = 10.0
-        let v = terminal_value(TerminalKind::Showdown, &invested, &[0.0, 0.0], 0, &deal, 0.10, 0.0);
-        assert!((v - 40.0).abs() < 1e-10, "Winner gets 50 - 10 rake = 40, got {v}");
+        // pot=100, 10% rake, no cap -> rake = 10.0
+        // Pot-only: winner = pot - rake = 100 - 10 = 90
+        let v = terminal_value(TerminalKind::Showdown, 100.0, 0, &deal, 0.10, 0.0);
+        assert!((v - 90.0).abs() < 1e-10, "Winner gets pot - rake = 90, got {v}");
     }
 
     #[test]
-    fn terminal_dead_money_model() {
+    fn terminal_pot_only_model() {
         let deal = make_deal();
-        let blinds = [0.5, 1.0]; // SB=0.5, BB=1.0
-        // invested is now voluntary-only: SB fold with no voluntary action
-        let invested = [0.0, 0.0];
 
-        // SB folds (traverser=0): loses own blind = -0.5
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, &blinds, 0, &deal, 0.0, 0.0);
-        assert!((v - (-0.5)).abs() < 1e-10, "SB fold should lose blind (-0.5), got {v}");
+        // Pot-only: SB fold at root, pot=1.5. Loser=0, winner=1.5.
+        let v = terminal_value(TerminalKind::Fold { winner: 1 }, 1.5, 0, &deal, 0.0, 0.0);
+        assert!(v.abs() < 1e-10, "Loser gets 0 on fold, got {v}");
 
-        // BB wins SB fold (traverser=1): gains opponent's blind = 0.5
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, &invested, &blinds, 1, &deal, 0.0, 0.0);
-        assert!((v - 0.5).abs() < 1e-10, "BB wins opponent blind (0.5), got {v}");
+        let v = terminal_value(TerminalKind::Fold { winner: 1 }, 1.5, 1, &deal, 0.0, 0.0);
+        assert!((v - 1.5).abs() < 1e-10, "Winner gets pot=1.5, got {v}");
 
-        // After raise: voluntary invested=[2.5, 2.0], blinds=[0.5, 1.0]
-        // pot = 1.5 + 2.5 + 2.0 = 6.0
-        let invested2 = [2.5, 2.0];
+        // After raise: pot=6.0
         let deal_p0_wins = make_deal_p0_wins();
-        // Player 0 wins showdown: pot - own_contribution = 6.0 - (0.5 + 2.5) = 3.0
-        let v = terminal_value(TerminalKind::Showdown, &invested2, &blinds, 0, &deal_p0_wins, 0.0, 0.0);
-        assert!((v - 3.0).abs() < 1e-10, "Winner net = pot - own_total = 3.0, got {v}");
+        // Player 0 wins showdown: pot = 6.0
+        let v = terminal_value(TerminalKind::Showdown, 6.0, 0, &deal_p0_wins, 0.0, 0.0);
+        assert!((v - 6.0).abs() < 1e-10, "Winner gets pot = 6.0, got {v}");
 
-        // Player 1 loses: -(blind + vol) = -(1.0 + 2.0) = -3.0
-        let v = terminal_value(TerminalKind::Showdown, &invested2, &blinds, 1, &deal_p0_wins, 0.0, 0.0);
-        assert!((v - (-3.0)).abs() < 1e-10, "Loser loses own_total = -3.0, got {v}");
+        // Player 1 loses: 0
+        let v = terminal_value(TerminalKind::Showdown, 6.0, 1, &deal_p0_wins, 0.0, 0.0);
+        assert!(v.abs() < 1e-10, "Loser gets 0, got {v}");
     }
 
     /// Helper: shorthand card constructor.
