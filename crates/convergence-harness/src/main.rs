@@ -1,5 +1,9 @@
 mod baseline;
+mod comparison;
+mod evaluator;
 mod game;
+mod harness;
+mod reporter;
 mod solver_trait;
 mod solvers;
 
