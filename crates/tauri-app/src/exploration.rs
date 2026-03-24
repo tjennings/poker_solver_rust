@@ -52,6 +52,8 @@ pub struct BlueprintListEntry {
     pub path: String,
     pub stack_depth: f64,
     pub has_strategy: bool,
+    /// Name of the latest snapshot directory (e.g. "snapshot_1234"), if any.
+    pub latest_snapshot: Option<String>,
 }
 
 /// State for the exploration view.
@@ -673,11 +675,27 @@ fn try_make_blueprint_entry(dir: &Path) -> Option<BlueprintListEntry> {
             })
             .unwrap_or(false);
 
+    // Find the latest snapshot directory name.
+    let latest_snapshot = std::fs::read_dir(dir)
+        .ok()
+        .and_then(|rd| {
+            let mut snaps: Vec<String> = rd
+                .filter_map(Result::ok)
+                .filter_map(|e| {
+                    let n = e.file_name().to_str()?.to_string();
+                    if n.starts_with("snapshot_") { Some(n) } else { None }
+                })
+                .collect();
+            snaps.sort();
+            snaps.pop()
+        });
+
     Some(BlueprintListEntry {
         name,
         path: dir.to_string_lossy().to_string(),
         stack_depth,
         has_strategy,
+        latest_snapshot,
     })
 }
 

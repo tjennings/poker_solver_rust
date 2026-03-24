@@ -211,7 +211,7 @@ export default function GameExplorer() {
     col: number;
   } | null>(null);
 
-  const [blueprints, setBlueprints] = useState<{ name: string; path: string; stack_depth: number }[]>([]);
+  const [blueprints, setBlueprints] = useState<{ name: string; path: string; stack_depth: number; latest_snapshot: string | null }[]>([]);
   const [bundleName, setBundleName] = useState<string | null>(null);
 
   // ── List available blueprints on mount ──────────────────────────
@@ -224,7 +224,7 @@ export default function GameExplorer() {
           setError('Set Blueprint Directory in Settings first');
           return;
         }
-        const list = await invoke<{ name: string; path: string; stack_depth: number; has_strategy: boolean }[]>(
+        const list = await invoke<{ name: string; path: string; stack_depth: number; has_strategy: boolean; latest_snapshot: string | null }[]>(
           'list_blueprints', { dir: globalConfig.blueprint_dir }
         );
         setBlueprints(list.filter(b => b.has_strategy));
@@ -427,7 +427,7 @@ export default function GameExplorer() {
                 >
                   <div style={{ fontWeight: 600 }}>{bp.name}</div>
                   <div style={{ fontSize: '0.7rem', color: '#94a3b8', marginTop: '2px' }}>
-                    {bp.stack_depth > 0 ? `${bp.stack_depth}bb` : ''} — {bp.path.split('/').pop()}
+                    {bp.stack_depth > 0 ? `${bp.stack_depth}bb` : ''}{bp.latest_snapshot ? ` — ${bp.latest_snapshot}` : ''}
                   </div>
                 </button>
               ))}
