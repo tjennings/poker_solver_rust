@@ -13,8 +13,8 @@ use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 
 use poker_solver_tauri::{
-    ExplorationState, PostflopState, SimEventSink, SimProgressEvent, SimResultResponse,
-    SimulationState,
+    ExplorationState, GameSessionState, PostflopState, SimEventSink, SimProgressEvent,
+    SimResultResponse, SimulationState,
 };
 
 type AppState = Arc<ExplorationState>;
@@ -121,6 +121,16 @@ struct PostflopCacheParams {
     prior_actions: Vec<Vec<usize>>,
 }
 
+
+#[derive(Deserialize)]
+struct GamePlayActionParams {
+    action_id: String,
+}
+
+#[derive(Deserialize)]
+struct GameDealCardParams {
+    card: String,
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -536,6 +546,56 @@ async fn handle_postflop_load_cached(
 }
 
 // ---------------------------------------------------------------------------
+// Handlers — game session
+// ---------------------------------------------------------------------------
+
+async fn handle_game_new(
+    AxumState(state): AxumState<AppState>,
+    Extension(postflop): Extension<Arc<PostflopState>>,
+    Extension(session_state): Extension<Arc<GameSessionState>>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::game_new_core(&state, &postflop, &session_state))
+}
+
+async fn handle_game_get_state(
+    Extension(session_state): Extension<Arc<GameSessionState>>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::game_get_state_core(&session_state))
+}
+
+async fn handle_game_play_action(
+    Extension(session_state): Extension<Arc<GameSessionState>>,
+    Json(params): Json<GamePlayActionParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::game_play_action_core(
+        &session_state,
+        &params.action_id,
+    ))
+}
+
+async fn handle_game_deal_card(
+    Extension(session_state): Extension<Arc<GameSessionState>>,
+    Json(params): Json<GameDealCardParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::game_deal_card_core(
+        &session_state,
+        &params.card,
+    ))
+}
+
+async fn handle_game_back(
+    Extension(session_state): Extension<Arc<GameSessionState>>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::game_back_core(&session_state))
+}
+
+async fn handle_game_solve(
+    Extension(session_state): Extension<Arc<GameSessionState>>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::game_solve_core(&session_state))
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -544,6 +604,7 @@ async fn main() {
     let state: AppState = Arc::new(ExplorationState::default());
     let postflop_state: Arc<PostflopState> = Arc::new(PostflopState::default());
     let simulation_state: Arc<SimulationState> = Arc::new(SimulationState::default());
+    let game_session_state: Arc<GameSessionState> = Arc::new(GameSessionState::default());
     let (ws_tx, _) = broadcast::channel::<WsEvent>(64);
 
     let cors = CorsLayer::new()
@@ -638,8 +699,16 @@ async fn main() {
             "/api/postflop_load_cached",
             post(handle_postflop_load_cached),
         )
+        // Game session endpoints
+        .route("/api/game_new", post(handle_game_new))
+        .route("/api/game_get_state", post(handle_game_get_state))
+        .route("/api/game_play_action", post(handle_game_play_action))
+        .route("/api/game_deal_card", post(handle_game_deal_card))
+        .route("/api/game_back", post(handle_game_back))
+        .route("/api/game_solve", post(handle_game_solve))
         .layer(Extension(ws_tx))
         .layer(Extension(simulation_state))
+        .layer(Extension(game_session_state))
         .layer(Extension(postflop_state))
         .layer(cors)
         .with_state(state);

@@ -8,6 +8,7 @@ fn main() {
         .manage(poker_solver_tauri::ExplorationState::default())
         .manage(poker_solver_tauri::SimulationState::default())
         .manage(Arc::new(poker_solver_tauri::PostflopState::default()))
+        .manage(poker_solver_tauri::GameSessionState::default())
         .invoke_handler(tauri::generate_handler![
             // Exploration commands
             poker_solver_tauri::load_bundle,
@@ -43,6 +44,13 @@ fn main() {
             poker_solver_tauri::postflop_check_cache,
             poker_solver_tauri::postflop_load_cached,
             poker_solver_tauri::blueprint_propagate_ranges_cmd,
+            // Game session commands
+            poker_solver_tauri::game_new,
+            poker_solver_tauri::game_get_state,
+            poker_solver_tauri::game_play_action,
+            poker_solver_tauri::game_deal_card,
+            poker_solver_tauri::game_back,
+            poker_solver_tauri::game_solve,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
