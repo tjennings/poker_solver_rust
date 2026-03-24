@@ -1377,6 +1377,12 @@ pub fn blueprint_propagate_ranges(
     }
 
     // Store propagated weights and the abstract tree position.
+    let oop_nz = oop_weights.iter().filter(|&&w| w > 0.0).count();
+    let ip_nz = ip_weights.iter().filter(|&&w| w > 0.0).count();
+    eprintln!(
+        "[blueprint_propagate_ranges] dealer={}, OOP(BB) nonzero={}/1326, IP(SB) nonzero={}/1326",
+        tree.dealer, oop_nz, ip_nz,
+    );
     *postflop.filtered_oop_weights.write() = Some(oop_weights);
     *postflop.filtered_ip_weights.write() = Some(ip_weights);
 
@@ -2716,6 +2722,13 @@ pub fn get_preflop_ranges_core(
     // Expand 169 → 1326.
     let oop_1326 = expand_169_to_1326(&oop_weights);
     let ip_1326 = expand_169_to_1326(&ip_weights);
+
+    let oop_nonzero = oop_weights.iter().filter(|&&w| w > 0.0).count();
+    let ip_nonzero = ip_weights.iter().filter(|&&w| w > 0.0).count();
+    eprintln!(
+        "[get_preflop_ranges] dealer={}, OOP(BB) nonzero={}/169, IP(SB) nonzero={}/169",
+        tree.dealer, oop_nonzero, ip_nonzero,
+    );
 
     Ok(PreflopRanges {
         oop_weights: oop_1326,
