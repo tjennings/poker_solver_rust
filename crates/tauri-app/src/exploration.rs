@@ -109,6 +109,43 @@ impl Default for ExplorationState {
     }
 }
 
+/// Data extracted from a loaded BlueprintV2 source for use by GameSession.
+pub(crate) struct BlueprintV2Data {
+    pub(crate) config: Box<BlueprintV2Config>,
+    pub(crate) strategy: Box<BlueprintV2Strategy>,
+    pub(crate) tree: Box<V2GameTree>,
+    pub(crate) decision_map: Vec<u32>,
+    pub(crate) hand_evs: Option<Vec<[[f64; 169]; 2]>>,
+}
+
+impl ExplorationState {
+    /// Extract BlueprintV2 data for use by GameSession.
+    ///
+    /// Clones the inner data so the session can own it independently
+    /// of the ExplorationState lock.
+    pub(crate) fn extract_blueprint_v2_data(&self) -> Result<BlueprintV2Data, String> {
+        let source_guard = self.source.read();
+        let source = source_guard.as_ref().ok_or("No bundle loaded")?;
+        match source {
+            StrategySource::BlueprintV2 {
+                config,
+                strategy,
+                tree,
+                decision_map,
+                hand_evs,
+                ..
+            } => Ok(BlueprintV2Data {
+                config: config.clone(),
+                strategy: strategy.clone(),
+                tree: tree.clone(),
+                decision_map: decision_map.clone(),
+                hand_evs: hand_evs.clone(),
+            }),
+            _ => Err("game_new requires a BlueprintV2 source".to_string()),
+        }
+    }
+}
+
 /// Information about a loaded bundle or agent.
 #[derive(Debug, Clone, Serialize)]
 pub struct BundleInfo {
@@ -1410,7 +1447,7 @@ pub fn blueprint_propagate_ranges_cmd(
 }
 
 /// Get the canonical hand index (0..169) from rank characters.
-fn canonical_hand_index_from_ranks(rank1: char, rank2: char, suited: bool) -> usize {
+pub(crate) fn canonical_hand_index_from_ranks(rank1: char, rank2: char, suited: bool) -> usize {
     let v1 = char_to_value(rank1);
     let v2 = char_to_value(rank2);
     let canonical = CanonicalHand::new(v1, v2, suited);
@@ -1418,17 +1455,17 @@ fn canonical_hand_index_from_ranks(rank1: char, rank2: char, suited: bool) -> us
 }
 
 /// Groups the bucket-lookup parameters shared by postflop helpers.
-struct BucketLookup<'a> {
-    all_buckets: &'a AllBuckets,
-    strategy: &'a BlueprintV2Strategy,
-    decision_idx: usize,
+pub(crate) struct BucketLookup<'a> {
+    pub(crate) all_buckets: &'a AllBuckets,
+    pub(crate) strategy: &'a BlueprintV2Strategy,
+    pub(crate) decision_idx: usize,
 }
 
 /// Enumerate all combos for a canonical hand, filter board blockers, look up
 /// each combo's bucket, and accumulate action probabilities.
 ///
 /// Returns `(sum_of_probs_per_action, combo_count)`.
-fn bucket_probs_for_hand(
+pub(crate) fn bucket_probs_for_hand(
     hand: &CanonicalHand,
     board: &[Card],
     street: Street,
@@ -1465,7 +1502,7 @@ fn bucket_probs_for_hand(
 /// Compute postflop action probabilities for a single 13x13 cell by
 /// enumerating all specific Card combos, filtering board blockers,
 /// looking up each combo's bucket, querying the strategy, and averaging.
-fn postflop_cell_probs(
+pub(crate) fn postflop_cell_probs(
     rank1: char,
     rank2: char,
     suited: bool,
@@ -1504,7 +1541,7 @@ fn postflop_cell_probs(
 /// Compute the average probability of a specific action for a canonical hand
 /// at a postflop decision node. Uses `bucket_probs_for_hand` and indexes the
 /// result.
-fn avg_action_prob_for_hand(
+pub(crate) fn avg_action_prob_for_hand(
     hand: &CanonicalHand,
     board: &[Card],
     street: Street,
@@ -2012,11 +2049,11 @@ fn load_hand_ev_bin(path: &Path, expected_nodes: usize) -> Result<Vec<[[f64; 169
     Ok(result)
 }
 
-fn parse_board(board_strs: &[String]) -> Result<Vec<Card>, String> {
+pub(crate) fn parse_board(board_strs: &[String]) -> Result<Vec<Card>, String> {
     board_strs.iter().map(|s| parse_card(s)).collect()
 }
 
-fn parse_card(s: &str) -> Result<Card, String> {
+pub(crate) fn parse_card(s: &str) -> Result<Card, String> {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() != 2 {
         return Err(format!("Invalid card: {s}"));
@@ -2063,7 +2100,7 @@ fn street_from_board_len(len: usize) -> Result<Street, String> {
 /// Return the board slice visible at the given street, clamping to `board.len()`.
 ///
 /// Mirrors [`AllBuckets::board_for_street`] but accepts a dynamically-sized slice.
-fn board_for_street_slice(board: &[Card], street: Street) -> &[Card] {
+pub(crate) fn board_for_street_slice(board: &[Card], street: Street) -> &[Card] {
     let n = match street {
         Street::Preflop => 0,
         Street::Flop => 3,
@@ -2233,11 +2270,11 @@ fn resolve_bet_index(idx_str: &str, bet_sizes: &[f32], pot: u32, effective_stack
     idx_str.parse::<u32>().unwrap_or(0)
 }
 
-const RANKS: [char; 13] = [
+pub(crate) const RANKS: [char; 13] = [
     'A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2',
 ];
 
-fn hand_label_from_matrix(
+pub(crate) fn hand_label_from_matrix(
     row: usize,
     col: usize,
     rank1: char,
@@ -2425,7 +2462,7 @@ fn make_representative_hand(
     (Card::new(v1, suit1), Card::new(v2, suit2))
 }
 
-fn char_to_value(c: char) -> Value {
+pub(crate) fn char_to_value(c: char) -> Value {
     match c {
         'A' => Value::Ace,
         'K' => Value::King,
@@ -2483,7 +2520,7 @@ pub struct PreflopRanges {
 ///
 /// `rs_poker` encoding: `Value::Two = 0 .. Ace = 12`,
 /// `Suit::Spade = 0, Club = 1, Heart = 2, Diamond = 3`.
-fn rs_card_to_range_solver(card: Card) -> u8 {
+pub(crate) fn rs_card_to_range_solver(card: Card) -> u8 {
     let rank = card.value as u8; // Two=0 .. Ace=12, matches range-solver
     let suit = match card.suit {
         Suit::Club => 0,
@@ -2496,7 +2533,7 @@ fn rs_card_to_range_solver(card: Card) -> u8 {
 
 /// Build a lookup table mapping each canonical hand index (0..169) to its
 /// combo indices (0..1326) in range-solver encoding.
-fn build_canonical_to_combo_map() -> Vec<Vec<usize>> {
+pub(crate) fn build_canonical_to_combo_map() -> Vec<Vec<usize>> {
     let mut map = Vec::with_capacity(169);
     for i in 0..169 {
         // INVARIANT: index is always 0..169, so `from_index` always returns Some
@@ -2518,7 +2555,7 @@ fn build_canonical_to_combo_map() -> Vec<Vec<usize>> {
 /// Expand 169 canonical hand weights to 1326 combo weights.
 ///
 /// Each combo inherits the weight of its canonical hand.
-fn expand_169_to_1326(weights_169: &[f32; 169]) -> Vec<f32> {
+pub(crate) fn expand_169_to_1326(weights_169: &[f32; 169]) -> Vec<f32> {
     let combo_map = build_canonical_to_combo_map();
     let mut weights_1326 = vec![0.0f32; 1326];
     for (hand_idx, combo_indices) in combo_map.iter().enumerate() {
@@ -2557,7 +2594,7 @@ fn format_bet_sizes(fractions: &[f64]) -> String {
 /// For fold terminals, the pot is stored directly. For decision/chance nodes,
 /// we look at the fold terminal child's pot (which equals the current pot before
 /// any new action). Falls back to recursive search.
-fn pot_at_v2_node(tree: &V2GameTree, node_idx: u32) -> f64 {
+pub(crate) fn pot_at_v2_node(tree: &V2GameTree, node_idx: u32) -> f64 {
     match &tree.nodes[node_idx as usize] {
         V2GameNode::Terminal { pot, .. } => *pot,
         V2GameNode::Chance { child, .. } => pot_at_v2_node(tree, *child),
