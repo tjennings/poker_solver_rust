@@ -49,11 +49,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Commands::GenerateBaseline {
-            output_dir: _,
-            iterations: _,
-            target_exploitability: _,
+            output_dir,
+            iterations,
+            target_exploitability,
         } => {
-            println!("generate-baseline: not yet implemented");
+            let baseline = harness::generate_baseline(iterations, target_exploitability)?;
+
+            let dir = std::path::Path::new(&output_dir);
+            baseline.save(dir)?;
+
+            println!("\n=== Baseline Summary ===");
+            println!("Solver: {}", baseline.summary.solver_name);
+            println!("Iterations: {}", baseline.summary.total_iterations);
+            println!(
+                "Final exploitability: {:.4e}",
+                baseline.summary.final_exploitability
+            );
+            println!(
+                "Time: {:.1}s",
+                baseline.summary.total_time_ms as f64 / 1000.0
+            );
+            println!("Info sets captured: {}", baseline.summary.num_info_sets);
+            println!(
+                "Combos per player: {}",
+                baseline.summary.num_combos_per_player
+            );
+            println!("Saved to: {}", output_dir);
+
             Ok(())
         }
         Commands::Compare {
