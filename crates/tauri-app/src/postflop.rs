@@ -1,10 +1,8 @@
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::continuation::{BiasType, RolloutContext, rollout_from_boundary};
 use poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id;
-use poker_solver_core::blueprint_v2::solver_dispatch::{
-    self, SolverChoice, SolverConfig, Street,
-};
+use poker_solver_core::blueprint_v2::solver_dispatch::SolverConfig;
 use poker_solver_core::blueprint_v2::subgame_cfr::cards_overlap;
 use poker_solver_core::blueprint_v2::{
     CfvSubgameSolver, LeafEvaluator, SubgameHands, SubgameStrategy,
@@ -19,12 +17,9 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
-use range_solver::action_tree::{Action, ActionTree, BoardState, TreeConfig};
 use range_solver::bet_size::BetSizeOptions;
-use range_solver::card::{card_from_str, card_pair_to_index, card_to_string, CardConfig, NOT_DEALT};
-use range_solver::interface::Game;
+use range_solver::card::{card_pair_to_index, card_to_string};
 use range_solver::range::Range;
-use range_solver::{compute_exploitability, finalize, solve_step, PostFlopGame};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -213,63 +208,6 @@ fn matrix_cell_label(row: usize, col: usize) -> (String, bool, bool) {
     }
 }
 
-/// Format a chip amount as a pot-percentage string (e.g. "33%" or "120%").
-fn format_pot_pct(amt: i32, pot: i32) -> String {
-    if pot > 0 {
-        let pct = (amt as f64 / pot as f64 * 100.0).round() as i32;
-        format!("{pct}%")
-    } else {
-        format!("{amt}")
-    }
-}
-
-/// Converts a range-solver `Action` to a serializable `ActionInfo`.
-fn action_to_info(action: &Action, index: usize, pot: i32) -> ActionInfo {
-    match action {
-        Action::Fold => ActionInfo {
-            id: index.to_string(),
-            label: "Fold".to_string(),
-            action_type: "fold".to_string(),
-            size_key: None,
-        },
-        Action::Check => ActionInfo {
-            id: index.to_string(),
-            label: "Check".to_string(),
-            action_type: "check".to_string(),
-            size_key: None,
-        },
-        Action::Call => ActionInfo {
-            id: index.to_string(),
-            label: "Call".to_string(),
-            action_type: "call".to_string(),
-            size_key: None,
-        },
-        Action::Bet(amt) => ActionInfo {
-            id: index.to_string(),
-            label: format!("Bet {}", format_pot_pct(*amt, pot)),
-            action_type: "bet".to_string(),
-            size_key: Some(amt.to_string()),
-        },
-        Action::Raise(amt) => ActionInfo {
-            id: index.to_string(),
-            label: format!("Raise {}", format_pot_pct(*amt, pot)),
-            action_type: "raise".to_string(),
-            size_key: Some(amt.to_string()),
-        },
-        Action::AllIn(amt) => ActionInfo {
-            id: index.to_string(),
-            label: format!("All-in {amt}"),
-            action_type: "allin".to_string(),
-            size_key: Some(amt.to_string()),
-        },
-        _ => ActionInfo {
-            id: index.to_string(),
-            label: format!("{action}"),
-            action_type: "other".to_string(),
-            size_key: None,
-        },
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Subgame solve result (stored for range propagation and navigation)
@@ -790,7 +728,6 @@ pub fn set_cbv_context(state: &PostflopState, context: Option<CbvContext>) {
 
 pub struct PostflopState {
     pub config: RwLock<PostflopConfig>,
-    pub game: Mutex<Option<PostFlopGame>>,
     pub current_iteration: AtomicU32,
     pub max_iterations: AtomicU32,
     pub exploitability_bits: AtomicU32,
@@ -815,7 +752,6 @@ impl Default for PostflopState {
     fn default() -> Self {
         Self {
             config: RwLock::new(PostflopConfig::default()),
-            game: Mutex::new(None),
             current_iteration: AtomicU32::new(0),
             max_iterations: AtomicU32::new(0),
             exploitability_bits: AtomicU32::new(0),
@@ -851,65 +787,6 @@ struct MatrixSnapshot {
     hand_evs: Option<Vec<f32>>,
     board: Vec<String>,
     dealer: u8,
-}
-
-/// Capture all data needed for matrix construction from the game.
-/// This borrows the game briefly; the expensive matrix build runs on owned data.
-fn capture_matrix_snapshot(game: &mut PostFlopGame) -> MatrixSnapshot {
-    let player = game.current_player();
-    let raw_actions = game.available_actions();
-    let strategy = game.strategy();
-    let private_cards = game.private_cards(player).to_vec();
-    let initial_weights = game.initial_weights(player).to_vec();
-    let num_hands = game.num_private_hands(player);
-
-    let (pot, stacks) = {
-        let tc = game.tree_config();
-        let ba = game.total_bet_amount();
-        let pot = tc.starting_pot + ba[0] + ba[1];
-        let stacks = [tc.effective_stack - ba[0], tc.effective_stack - ba[1]];
-        (pot, stacks)
-    };
-
-    let hand_evs: Option<Vec<f32>> = if game.is_solved() {
-        game.cache_normalized_weights();
-        Some(game.expected_values(player))
-    } else {
-        None
-    };
-
-    let cc = game.card_config();
-    let mut board_cards: Vec<u8> = cc.flop.to_vec();
-    if cc.turn != NOT_DEALT {
-        board_cards.push(cc.turn);
-    }
-    if cc.river != NOT_DEALT {
-        board_cards.push(cc.river);
-    }
-    let board: Vec<String> = board_cards
-        .iter()
-        .filter_map(|&c| card_to_string(c).ok())
-        .collect();
-
-    let actions: Vec<ActionInfo> = raw_actions
-        .iter()
-        .enumerate()
-        .map(|(i, a)| action_to_info(a, i, pot))
-        .collect();
-
-    MatrixSnapshot {
-        player,
-        strategy,
-        private_cards,
-        initial_weights,
-        num_hands,
-        actions,
-        pot,
-        stacks,
-        hand_evs,
-        board,
-        dealer: 1, // range-solver: player 1 = IP = SB = dealer
-    }
 }
 
 /// Build the matrix from a snapshot (no game borrow needed).
@@ -993,14 +870,6 @@ fn build_matrix_from_snapshot(snap: MatrixSnapshot) -> PostflopStrategyMatrix {
         board: snap.board,
         dealer: snap.dealer,
     }
-}
-
-/// Builds a 13x13 strategy matrix from the current game state.
-///
-/// The game must be at a non-terminal, non-chance node with memory allocated.
-pub fn build_strategy_matrix(game: &mut PostFlopGame) -> PostflopStrategyMatrix {
-    let snap = capture_matrix_snapshot(game);
-    build_matrix_from_snapshot(snap)
 }
 
 /// Convert subgame solver output into a [`MatrixSnapshot`] so it can be rendered
@@ -1121,7 +990,6 @@ pub fn postflop_set_config_core(
 
     // Store config and clear stale state.
     *state.config.write() = config.clone();
-    *state.game.lock() = None;
     *state.matrix_snapshot.write() = None;
     *state.filtered_oop_weights.write() = None;
     *state.filtered_ip_weights.write() = None;
@@ -1197,129 +1065,6 @@ pub fn postflop_set_filtered_weights(
 // postflop_solve_street
 // ---------------------------------------------------------------------------
 
-/// Determines the `BoardState` and parses board cards from a list of card strings.
-///
-/// Returns `(flop, turn, river, initial_state)`.
-fn parse_board(board: &[String]) -> Result<([u8; 3], u8, u8, BoardState), String> {
-    match board.len() {
-        3 => {
-            let flop_str = format!("{}{}{}", board[0], board[1], board[2]);
-            let flop = range_solver::card::flop_from_str(&flop_str)
-                .map_err(|e| format!("Invalid flop: {e}"))?;
-            Ok((flop, NOT_DEALT, NOT_DEALT, BoardState::Flop))
-        }
-        4 => {
-            let flop_str = format!("{}{}{}", board[0], board[1], board[2]);
-            let flop = range_solver::card::flop_from_str(&flop_str)
-                .map_err(|e| format!("Invalid flop: {e}"))?;
-            let turn =
-                card_from_str(&board[3]).map_err(|e| format!("Invalid turn card: {e}"))?;
-            Ok((flop, turn, NOT_DEALT, BoardState::Turn))
-        }
-        5 => {
-            let flop_str = format!("{}{}{}", board[0], board[1], board[2]);
-            let flop = range_solver::card::flop_from_str(&flop_str)
-                .map_err(|e| format!("Invalid flop: {e}"))?;
-            let turn =
-                card_from_str(&board[3]).map_err(|e| format!("Invalid turn card: {e}"))?;
-            let river =
-                card_from_str(&board[4]).map_err(|e| format!("Invalid river card: {e}"))?;
-            Ok((flop, turn, river, BoardState::River))
-        }
-        n => Err(format!("Board must have 3-5 cards, got {n}")),
-    }
-}
-
-/// Builds the range-solver `PostFlopGame` from the current config, board, and
-/// optional filtered weights.
-fn build_game(
-    config: &PostflopConfig,
-    board: &[String],
-    filtered_oop: &Option<Vec<f32>>,
-    filtered_ip: &Option<Vec<f32>>,
-) -> Result<PostFlopGame, String> {
-    let (flop, turn, river, initial_state) = parse_board(board)?;
-
-    // Parse ranges (or use filtered weights if available from multi-street).
-    let oop_range = match filtered_oop {
-        Some(weights) => {
-            let nonzero = weights.iter().filter(|&&w| w > 0.0).count();
-            let sum: f32 = weights.iter().sum();
-            eprintln!("[build_game] OOP filtered weights: {nonzero}/1326 nonzero, sum={sum:.1}");
-            Range::from_raw_data(weights).map_err(|e| format!("Bad OOP weights: {e}"))?
-        }
-        None => config
-            .oop_range
-            .parse()
-            .map_err(|e: String| format!("Invalid OOP range: {e}"))?,
-    };
-    let ip_range = match filtered_ip {
-        Some(weights) => {
-            let nonzero = weights.iter().filter(|&&w| w > 0.0).count();
-            let sum: f32 = weights.iter().sum();
-            eprintln!("[build_game] IP filtered weights: {nonzero}/1326 nonzero, sum={sum:.1}");
-            Range::from_raw_data(weights).map_err(|e| format!("Bad IP weights: {e}"))?
-        }
-        None => config
-            .ip_range
-            .parse()
-            .map_err(|e: String| format!("Invalid IP range: {e}"))?,
-    };
-
-    // Parse bet sizes.
-    let oop_sizes = BetSizeOptions::try_from((
-        config.oop_bet_sizes.as_str(),
-        config.oop_raise_sizes.as_str(),
-    ))
-    .map_err(|e| format!("Invalid OOP bet sizes: {e}"))?;
-    let ip_sizes = BetSizeOptions::try_from((
-        config.ip_bet_sizes.as_str(),
-        config.ip_raise_sizes.as_str(),
-    ))
-    .map_err(|e| format!("Invalid IP bet sizes: {e}"))?;
-
-    let card_config = CardConfig {
-        range: [oop_range, ip_range],
-        flop,
-        turn,
-        river,
-    };
-
-    let tree_config = TreeConfig {
-        initial_state,
-        starting_pot: config.pot,
-        effective_stack: config.effective_stack,
-        rake_rate: config.rake_rate,
-        rake_cap: config.rake_cap,
-        flop_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
-        turn_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
-        river_bet_sizes: [oop_sizes, ip_sizes],
-        turn_donk_sizes: None,
-        river_donk_sizes: None,
-        add_allin_threshold: 1.5,
-        force_allin_threshold: 0.15,
-        merging_threshold: 0.1,
-        depth_limit: None,
-    };
-
-    let action_tree =
-        ActionTree::new(tree_config).map_err(|e| format!("Failed to build tree: {e}"))?;
-    let mut game = PostFlopGame::with_config(card_config, action_tree)
-        .map_err(|e| format!("Failed to build game: {e}"))?;
-
-    // Reject trees that would exceed the memory budget to prevent OOM.
-    const MEM_LIMIT: u64 = 2 * 1_024 * 1_024 * 1_024; // 2 GB
-    let (mem_estimate, _) = game.memory_usage();
-    if mem_estimate > MEM_LIMIT {
-        return Err(format!(
-            "Tree too large ({:.0} MB). Reduce bet sizes or solve from a later street.",
-            mem_estimate as f64 / 1_048_576.0
-        ));
-    }
-    game.allocate_memory(false);
-    Ok(game)
-}
-
 pub fn postflop_solve_street_core(
     state: &Arc<PostflopState>,
     board: Vec<String>,
@@ -1341,7 +1086,7 @@ fn postflop_solve_street_impl(
     state: &Arc<PostflopState>,
     board: Vec<String>,
     max_iterations: Option<u32>,
-    target_exploitability: Option<f32>,
+    _target_exploitability: Option<f32>,
     _prior_actions: Vec<Vec<usize>>,
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
@@ -1356,37 +1101,14 @@ fn postflop_solve_street_impl(
 
     // Snapshot config and filtered weights under their locks.
     let config = state.config.read().clone();
-    let target_exp = target_exploitability.unwrap_or(3.0);
     let filtered_oop = state.filtered_oop_weights.read().clone();
     let filtered_ip = state.filtered_ip_weights.read().clone();
-
-    // Determine street from board length.
-    let street = match board.len() {
-        3 => Street::Flop,
-        4 => Street::Turn,
-        5 => Street::River,
-        n => return Err(format!("Invalid board length: {n}")),
-    };
-
-    // Count live combos for dispatch decision.
-    let live_combos = {
-        let oop_count = filtered_oop
-            .as_ref()
-            .map(|w| w.iter().filter(|&&v| v > 0.0).count())
-            .unwrap_or(0);
-        let ip_count = filtered_ip
-            .as_ref()
-            .map(|w| w.iter().filter(|&&v| v > 0.0).count())
-            .unwrap_or(0);
-        oop_count.max(ip_count)
-    };
 
     let solver_config = SolverConfig {
         flop_combo_threshold: config.flop_combo_threshold,
         turn_combo_threshold: config.turn_combo_threshold,
         ..SolverConfig::default()
     };
-    let choice = solver_dispatch::dispatch_decision(&solver_config, street, live_combos);
 
     // Reset progress atomics.
     state.current_iteration.store(0, Ordering::Relaxed);
@@ -1395,107 +1117,11 @@ fn postflop_solve_street_impl(
     *state.solve_start.write() = Some(std::time::Instant::now());
     *state.matrix_snapshot.write() = None;
 
-    match choice {
-        SolverChoice::FullDepth => {
-            solve_full_depth(state, &config, board, max_iterations, target_exp, &filtered_oop, &filtered_ip)
-        }
-        SolverChoice::DepthLimited => {
-            let cbv_ctx = state.cbv_context.read().clone();
-            solve_depth_limited(state, &config, board, max_iterations, &solver_config, &filtered_oop, &filtered_ip, cbv_ctx,
-                rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval,
-                range_clamp_threshold)
-        }
-    }
-}
-
-/// Full-depth solve using the range-solver (existing path).
-fn solve_full_depth(
-    state: &Arc<PostflopState>,
-    config: &PostflopConfig,
-    board: Vec<String>,
-    max_iterations: Option<u32>,
-    target_exp: f32,
-    filtered_oop: &Option<Vec<f32>>,
-    filtered_ip: &Option<Vec<f32>>,
-) -> Result<(), String> {
-    let max_iters = max_iterations.unwrap_or(200);
-    state.max_iterations.store(max_iters, Ordering::Relaxed);
-    state
-        .exploitability_bits
-        .store(f32::MAX.to_bits(), Ordering::Relaxed);
-    *state.solver_name.write() = "full".to_string();
-    *state.subgame_result.write() = None;
-    state.solving.store(true, Ordering::Release);
-
-    // Build game (expensive but runs on the calling thread before spawn).
-    let mut game = build_game(config, &board, filtered_oop, filtered_ip)?;
-
-    // Take initial matrix snapshot and store game in shared state so
-    // navigation commands can access it during solving.
-    {
-        let matrix = build_strategy_matrix(&mut game);
-        *state.matrix_snapshot.write() = Some(matrix);
-    }
-    *state.game.lock() = Some(game);
-
-    let shared = Arc::clone(state);
-    std::thread::spawn(move || {
-        #[allow(unused_assignments)]
-        let mut last_exp = f32::MAX;
-
-        for t in 0..max_iters {
-            if !shared.solving.load(Ordering::Relaxed) {
-                break;
-            }
-
-            // Lock game for solve_step + exploitability. solve_step traverses
-            // from root regardless of the game's current query position, so
-            // user navigation between iterations doesn't interfere.
-            {
-                let game_guard = shared.game.lock();
-                let game = game_guard.as_ref().unwrap();
-                solve_step(game, t);
-                last_exp = compute_exploitability(game);
-            }
-            // Lock released — navigation commands can run here.
-
-            shared.current_iteration.store(t + 1, Ordering::Relaxed);
-            shared
-                .exploitability_bits
-                .store(last_exp.to_bits(), Ordering::Relaxed);
-
-            // Capture snapshot at the game's current position (which the user
-            // may have changed via navigation). Build matrix on another thread.
-            {
-                let mut game_guard = shared.game.lock();
-                let game = game_guard.as_mut().unwrap();
-                let snap = capture_matrix_snapshot(game);
-                let shared2 = Arc::clone(&shared);
-                std::thread::spawn(move || {
-                    let matrix = build_matrix_from_snapshot(snap);
-                    *shared2.matrix_snapshot.write() = Some(matrix);
-                });
-            }
-
-            if last_exp <= target_exp {
-                break;
-            }
-        }
-
-        // Finalize: compute EV / normalize strategy.
-        {
-            let mut game_guard = shared.game.lock();
-            let game = game_guard.as_mut().unwrap();
-            finalize(game);
-            let matrix = build_strategy_matrix(game);
-            *shared.matrix_snapshot.write() = Some(matrix);
-        }
-
-        shared.solve_complete.store(true, Ordering::Relaxed);
-        shared.solving.store(false, Ordering::Release);
-    });
-
-    Ok(())
+    // Always use depth-limited solver (full-depth range-solver path removed).
+    let cbv_ctx = state.cbv_context.read().clone();
+    solve_depth_limited(state, &config, board, max_iterations, &solver_config, &filtered_oop, &filtered_ip, cbv_ctx,
+        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval,
+        range_clamp_threshold)
 }
 
 /// Depth-limited solve using `CfvSubgameSolver`.
@@ -2072,60 +1698,12 @@ pub fn postflop_play_action_core(
     state: &PostflopState,
     action: usize,
 ) -> Result<PostflopPlayResult, String> {
-    let solver_name = state.solver_name.read().clone();
-    if solver_name == "subgame" {
-        // During solving, subgame_result is not yet populated.
-        // Wait for solve to complete before allowing navigation.
-        if state.solving.load(Ordering::Relaxed) {
-            return Err("Solve in progress — wait for completion before navigating".to_string());
-        }
-        return postflop_play_action_subgame(state, action);
+    // During solving, subgame_result is not yet populated.
+    // Wait for solve to complete before allowing navigation.
+    if state.solving.load(Ordering::Relaxed) {
+        return Err("Solve in progress — wait for completion before navigating".to_string());
     }
-
-    let mut game_guard = state.game.lock();
-    let game = game_guard.as_mut().ok_or("No game loaded")?;
-
-    game.play(action);
-
-    let bet_amounts = game.total_bet_amount();
-    let tree_config = game.tree_config();
-    let pot = tree_config.starting_pot + bet_amounts[0] + bet_amounts[1];
-    let stacks = [
-        tree_config.effective_stack - bet_amounts[0],
-        tree_config.effective_stack - bet_amounts[1],
-    ];
-
-    if game.is_terminal_node() {
-        return Ok(PostflopPlayResult {
-            matrix: None,
-            is_terminal: true,
-            is_chance: false,
-            current_player: None,
-            pot,
-            stacks,
-        });
-    }
-
-    if game.is_chance_node() {
-        return Ok(PostflopPlayResult {
-            matrix: None,
-            is_terminal: false,
-            is_chance: true,
-            current_player: None,
-            pot,
-            stacks,
-        });
-    }
-
-    let matrix = build_strategy_matrix(game);
-    Ok(PostflopPlayResult {
-        matrix: Some(matrix),
-        is_terminal: false,
-        is_chance: false,
-        current_player: Some(game.current_player()),
-        pot,
-        stacks,
-    })
+    postflop_play_action_subgame(state, action)
 }
 
 #[tauri::command]
@@ -2174,58 +1752,10 @@ pub fn postflop_navigate_to_core(
     state: &PostflopState,
     history: Vec<usize>,
 ) -> Result<PostflopPlayResult, String> {
-    let solver_name = state.solver_name.read().clone();
-    if solver_name == "subgame" {
-        if state.solving.load(Ordering::Relaxed) {
-            return Err("Solve in progress — wait for completion before navigating".to_string());
-        }
-        return postflop_navigate_to_subgame(state, &history);
+    if state.solving.load(Ordering::Relaxed) {
+        return Err("Solve in progress — wait for completion before navigating".to_string());
     }
-
-    let mut game_guard = state.game.lock();
-    let game = game_guard.as_mut().ok_or("No game loaded")?;
-
-    game.apply_history(&history);
-
-    let bet_amounts = game.total_bet_amount();
-    let tree_config = game.tree_config();
-    let pot = tree_config.starting_pot + bet_amounts[0] + bet_amounts[1];
-    let stacks = [
-        tree_config.effective_stack - bet_amounts[0],
-        tree_config.effective_stack - bet_amounts[1],
-    ];
-
-    if game.is_terminal_node() {
-        return Ok(PostflopPlayResult {
-            matrix: None,
-            is_terminal: true,
-            is_chance: false,
-            current_player: None,
-            pot,
-            stacks,
-        });
-    }
-
-    if game.is_chance_node() {
-        return Ok(PostflopPlayResult {
-            matrix: None,
-            is_terminal: false,
-            is_chance: true,
-            current_player: None,
-            pot,
-            stacks,
-        });
-    }
-
-    let matrix = build_strategy_matrix(game);
-    Ok(PostflopPlayResult {
-        matrix: Some(matrix),
-        is_terminal: false,
-        is_chance: false,
-        current_player: Some(game.current_player()),
-        pot,
-        stacks,
-    })
+    postflop_navigate_to_subgame(state, &history)
 }
 
 #[tauri::command]
@@ -2250,79 +1780,7 @@ pub fn postflop_close_street_core(
     state: &PostflopState,
     action_history: Vec<usize>,
 ) -> Result<PostflopStreetResult, String> {
-    let solver_name = state.solver_name.read().clone();
-    if solver_name == "subgame" {
-        return postflop_close_street_subgame(state, action_history);
-    }
-
-    let mut game_guard = state.game.lock();
-    let game = game_guard.as_mut().ok_or("No game loaded")?;
-
-    game.back_to_root();
-
-    // Start from current filtered weights, or fall back to the config ranges.
-    let config = state.config.read().clone();
-    let oop_range: Range = config
-        .oop_range
-        .parse()
-        .map_err(|e: String| format!("Invalid OOP range: {e}"))?;
-    let ip_range: Range = config
-        .ip_range
-        .parse()
-        .map_err(|e: String| format!("Invalid IP range: {e}"))?;
-
-    let mut oop_weights: Vec<f32> = state
-        .filtered_oop_weights
-        .read()
-        .clone()
-        .unwrap_or_else(|| oop_range.raw_data().to_vec());
-    let mut ip_weights: Vec<f32> = state
-        .filtered_ip_weights
-        .read()
-        .clone()
-        .unwrap_or_else(|| ip_range.raw_data().to_vec());
-
-    // Walk each action, filtering the acting player's range at each step.
-    for &action_idx in &action_history {
-        if game.is_terminal_node() || game.is_chance_node() {
-            break;
-        }
-
-        let player = game.current_player();
-        let num_hands = game.num_private_hands(player);
-        let strategy = game.strategy();
-        let private_cards = game.private_cards(player);
-
-        let weights = if player == 0 {
-            &mut oop_weights
-        } else {
-            &mut ip_weights
-        };
-        for (hand_idx, &(c1, c2)) in private_cards.iter().enumerate().take(num_hands) {
-            let ci = card_pair_to_index(c1, c2);
-            let action_prob = strategy[action_idx * num_hands + hand_idx];
-            weights[ci] *= action_prob;
-        }
-
-        game.play(action_idx);
-    }
-
-    // Compute pot/stacks at the final node.
-    let bet_amounts = game.total_bet_amount();
-    let tc = game.tree_config();
-    let pot = tc.starting_pot + bet_amounts[0] + bet_amounts[1];
-    let effective_stack = tc.effective_stack - bet_amounts[0].max(bet_amounts[1]);
-
-    // Store filtered weights for the next street.
-    *state.filtered_oop_weights.write() = Some(oop_weights.clone());
-    *state.filtered_ip_weights.write() = Some(ip_weights.clone());
-
-    Ok(PostflopStreetResult {
-        filtered_oop_range: oop_weights,
-        filtered_ip_range: ip_weights,
-        pot,
-        effective_stack,
-    })
+    postflop_close_street_subgame(state, action_history)
 }
 
 /// Range propagation through a subgame tree for `postflop_close_street_core`.
@@ -2646,21 +2104,6 @@ mod tests {
     }
 
     #[test]
-    fn test_action_to_info() {
-        let info = action_to_info(&Action::Fold, 0, 100);
-        assert_eq!(info.label, "Fold");
-        assert_eq!(info.action_type, "fold");
-
-        let info = action_to_info(&Action::Bet(50), 1, 100);
-        assert_eq!(info.label, "Bet 50%");
-        assert_eq!(info.action_type, "bet");
-
-        let info = action_to_info(&Action::AllIn(200), 2, 100);
-        assert_eq!(info.label, "All-in 200");
-        assert_eq!(info.action_type, "allin");
-    }
-
-    #[test]
     fn test_set_config_valid() {
         let state = PostflopState::default();
         let config = PostflopConfig::default();
@@ -2713,7 +2156,6 @@ mod tests {
 
         assert!(!state.solving.load(Ordering::Relaxed));
         assert_eq!(state.current_iteration.load(Ordering::Relaxed), 0);
-        assert!(state.game.lock().is_none());
     }
 
     #[test]
@@ -2737,54 +2179,6 @@ mod tests {
         let (r1, c1, s1) = card_pair_to_matrix(51, 47);
         let (r2, c2, s2) = card_pair_to_matrix(47, 51);
         assert_eq!((r1, c1, s1), (r2, c2, s2));
-    }
-
-    #[test]
-    fn test_parse_board_flop() {
-        let (flop, turn, river, state) =
-            parse_board(&["Ah".into(), "Kd".into(), "7c".into()]).unwrap();
-        assert_eq!(state, BoardState::Flop);
-        assert_eq!(turn, NOT_DEALT);
-        assert_eq!(river, NOT_DEALT);
-        // flop_from_str sorts, so just check all three are valid cards.
-        assert!(flop.iter().all(|&c| c < 52));
-    }
-
-    #[test]
-    fn test_parse_board_turn() {
-        let (_, turn, river, state) =
-            parse_board(&["Ah".into(), "Kd".into(), "7c".into(), "2s".into()]).unwrap();
-        assert_eq!(state, BoardState::Turn);
-        assert!(turn < 52);
-        assert_eq!(river, NOT_DEALT);
-    }
-
-    #[test]
-    fn test_parse_board_river() {
-        let (_, turn, river, state) = parse_board(&[
-            "Ah".into(),
-            "Kd".into(),
-            "7c".into(),
-            "2s".into(),
-            "Ts".into(),
-        ])
-        .unwrap();
-        assert_eq!(state, BoardState::River);
-        assert!(turn < 52);
-        assert!(river < 52);
-    }
-
-    #[test]
-    fn test_parse_board_invalid_count() {
-        assert!(parse_board(&["Ah".into(), "Kd".into()]).is_err());
-    }
-
-    #[test]
-    fn test_build_game_flop() {
-        let config = PostflopConfig::default();
-        let board = vec!["Td".into(), "9d".into(), "6h".into()];
-        let game = build_game(&config, &board, &None, &None);
-        assert!(game.is_ok(), "build_game failed: {:?}", game.err());
     }
 
     #[test]
@@ -2822,7 +2216,6 @@ mod tests {
         assert!(state.solve_complete.load(Ordering::Relaxed));
         assert!(!state.solving.load(Ordering::Relaxed));
         assert!(state.current_iteration.load(Ordering::Relaxed) > 0);
-        assert!(state.game.lock().is_some());
         assert!(state.matrix_snapshot.read().is_some());
     }
 
@@ -2839,11 +2232,11 @@ mod tests {
     }
 
     #[test]
-    fn test_play_action_no_game() {
+    fn test_play_action_no_subgame() {
         let state = PostflopState::default();
         let result = postflop_play_action_core(&state, 0);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No game loaded"));
+        assert!(result.unwrap_err().contains("No subgame result stored"));
     }
 
     #[test]
@@ -2893,11 +2286,11 @@ mod tests {
     }
 
     #[test]
-    fn test_close_street_no_game() {
+    fn test_close_street_no_subgame() {
         let state = PostflopState::default();
         let result = postflop_close_street_core(&state, vec![0]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No game loaded"));
+        assert!(result.unwrap_err().contains("No subgame result stored"));
     }
 
     #[test]
@@ -3052,7 +2445,7 @@ mod tests {
         let narrow_ip = weights_from_range("KK");
         *state.filtered_ip_weights.write() = Some(narrow_ip);
 
-        // River — always dispatches to range solver regardless of combo count.
+        // River — always dispatches to subgame solver.
         let board = vec![
             "Ks".to_string(),
             "Qh".to_string(),
@@ -3064,7 +2457,7 @@ mod tests {
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
-        assert_eq!(solver_name, "full", "river should always dispatch to full");
+        assert_eq!(solver_name, "subgame", "river should dispatch to subgame");
 
         // Wait for completion.
         for _ in 0..600 {
@@ -3106,7 +2499,7 @@ mod tests {
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
-        assert_eq!(solver_name, "full", "narrow flop should dispatch to full");
+        assert_eq!(solver_name, "subgame", "narrow flop should dispatch to subgame");
     }
 
     #[test]
