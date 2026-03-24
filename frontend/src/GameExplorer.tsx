@@ -211,12 +211,33 @@ export default function GameExplorer() {
     col: number;
   } | null>(null);
 
-  // ── Initialize session on mount ──────────────────────────────────
+  // ── Load bundle and initialize session on mount ─────────────────
 
   useEffect(() => {
     const init = async () => {
       try {
         setLoading(true);
+        setError(null);
+
+        // Load blueprint bundle from settings
+        const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
+        if (!globalConfig.blueprint_dir) {
+          setError('Set Blueprint Directory in Settings first');
+          return;
+        }
+
+        const list = await invoke<{ name: string; path: string; has_strategy: boolean }[]>(
+          'list_blueprints', { dir: globalConfig.blueprint_dir }
+        );
+        const available = list.filter(b => b.has_strategy);
+        if (available.length === 0) {
+          setError('No blueprints with strategy found in ' + globalConfig.blueprint_dir);
+          return;
+        }
+
+        // Auto-load the first blueprint
+        await invoke('load_blueprint_v2', { path: available[0].path });
+        // Initialize game session
         await invoke('game_new', {});
         const s = await invoke<GameState>('game_get_state', {});
         setState(s);
