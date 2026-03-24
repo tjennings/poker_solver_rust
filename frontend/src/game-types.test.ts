@@ -23,7 +23,7 @@ describe('GameState types', () => {
       probabilities: [0.3, 0.7],
       combo_count: 4,
       weight: 0.85,
-      ev: 1.5,
+      ev: 1.5, combos: [],
     };
 
     const matrix: GameMatrix = {
@@ -141,7 +141,7 @@ describe('GameState types', () => {
       probabilities: [0.0, 0.5, 0.5],
       combo_count: 6,
       weight: 1.0,
-      ev: null,
+      ev: null, combos: [],
     };
 
     expect(cell.ev).toBeNull();
@@ -157,7 +157,7 @@ describe('GameState types', () => {
       probabilities: [1.0],
       combo_count: 1,
       weight: 1.0,
-      ev: null,
+      ev: null, combos: [],
     });
 
     const cells: GameMatrixCell[][] = Array.from({ length: 13 }, (_, r) =>

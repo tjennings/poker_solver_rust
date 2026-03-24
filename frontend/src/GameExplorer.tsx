@@ -546,10 +546,49 @@ export default function GameExplorer() {
             {/* Detail panel */}
             <div className="detail-column">
               {selectedCellData && (
-                <CellDetail
-                  cell={toMatrixCell(selectedCellData, matrixActions)}
-                  actions={matrixActions}
-                />
+                <>
+                  <CellDetail
+                    cell={toMatrixCell(selectedCellData, matrixActions)}
+                    actions={matrixActions}
+                  />
+                  {/* Per-combo breakdown */}
+                  {selectedCellData.combos.length > 0 && selectedCellData.combos[0].probabilities.length > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.5rem' }}>
+                      {selectedCellData.combos.map((combo) => (
+                        <div
+                          key={combo.cards}
+                          className="cell-detail"
+                          style={{ minWidth: '120px', flex: '0 0 auto', padding: '0.4rem' }}
+                        >
+                          <div className="cell-detail-header">
+                            <span style={{ fontWeight: 700 }}>
+                              {combo.cards.slice(0, 2)}
+                              <span style={{ color: SUIT_COLORS[combo.cards[1]?.toLowerCase()] || '#fff' }}>
+                                {SUIT_SYMBOLS[combo.cards[1]?.toLowerCase()] || ''}
+                              </span>
+                              {combo.cards.slice(2, 4)}
+                              <span style={{ color: SUIT_COLORS[combo.cards[3]?.toLowerCase()] || '#fff' }}>
+                                {SUIT_SYMBOLS[combo.cards[3]?.toLowerCase()] || ''}
+                              </span>
+                            </span>
+                          </div>
+                          <div className="cell-detail-actions">
+                            {matrixActions.map((action, i) => {
+                              const pct = (combo.probabilities[i] || 0) * 100;
+                              if (pct < 0.1) return null;
+                              return (
+                                <div key={action.id} className="cell-detail-row" style={{ fontSize: '0.65rem' }}>
+                                  <span className="cell-detail-label">{action.label}</span>
+                                  <span className="cell-detail-pct">{pct.toFixed(0)}%</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </div>

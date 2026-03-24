@@ -11,7 +11,7 @@ describe('toMatrixCell', () => {
       probabilities: [0.3, 0.7],
       combo_count: 4,
       weight: 0.85,
-      ev: 1.5,
+      ev: 1.5, combos: [],
     };
     const actions: GameAction[] = [
       { id: '0', label: 'Fold', action_type: 'fold' },
@@ -39,6 +39,7 @@ describe('toMatrixCell', () => {
       combo_count: 6,
       weight: 1.0,
       ev: 2.5,
+      combos: [],
     };
     const actions: GameAction[] = [
       { id: '0', label: 'Check', action_type: 'check' },
@@ -57,7 +58,7 @@ describe('toMatrixCell', () => {
       probabilities: [],
       combo_count: 0,
       weight: 0.0,
-      ev: null,
+      ev: null, combos: [],
     };
 
     const result = toMatrixCell(cell, []);
@@ -75,7 +76,7 @@ describe('toMatrixCell', () => {
       probabilities: [0.5, 0.5],
       combo_count: 6,
       weight: 1.0,
-      ev: null,
+      ev: null, combos: [],
     };
     const actions: GameAction[] = [
       { id: '0', label: 'Check', action_type: 'check' },

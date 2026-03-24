@@ -2561,6 +2561,36 @@ pub(crate) fn rs_card_to_range_solver(card: Card) -> u8 {
     4 * rank + suit
 }
 
+/// Convert a range-solver card ID (0..51) to an rs_poker Card.
+pub(crate) fn range_solver_to_rs_card(id: u8) -> Card {
+    let rank = id / 4;
+    let suit = id % 4;
+    let value = match rank {
+        0 => Value::Two,
+        1 => Value::Three,
+        2 => Value::Four,
+        3 => Value::Five,
+        4 => Value::Six,
+        5 => Value::Seven,
+        6 => Value::Eight,
+        7 => Value::Nine,
+        8 => Value::Ten,
+        9 => Value::Jack,
+        10 => Value::Queen,
+        11 => Value::King,
+        12 => Value::Ace,
+        _ => Value::Two,
+    };
+    let suit = match suit {
+        0 => Suit::Club,
+        1 => Suit::Diamond,
+        2 => Suit::Heart,
+        3 => Suit::Spade,
+        _ => Suit::Club,
+    };
+    Card::new(value, suit)
+}
+
 /// Build a lookup table mapping each canonical hand index (0..169) to its
 /// combo indices (0..1326) in range-solver encoding.
 pub(crate) fn build_canonical_to_combo_map() -> Vec<Vec<usize>> {

@@ -23,6 +23,12 @@ export interface GameAction {
   action_type: string;  // "fold", "check", "call", "bet", "raise", "allin"
 }
 
+export interface ComboDetail {
+  cards: string;
+  probabilities: number[];
+  weight: number;
+}
+
 export interface GameMatrixCell {
   hand: string;
   suited: boolean;
@@ -31,6 +37,7 @@ export interface GameMatrixCell {
   combo_count: number;
   weight: number;
   ev: number | null;
+  combos: ComboDetail[];
 }
 
 export interface GameMatrix {

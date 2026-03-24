@@ -58,16 +58,25 @@ pub struct GameAction {
     pub action_type: String,
 }
 
+/// Per-combo strategy detail (e.g., "AhKh" with its own action probabilities).
+#[derive(Debug, Clone, Serialize)]
+pub struct ComboDetail {
+    pub cards: String,           // e.g. "AhKh"
+    pub probabilities: Vec<f32>, // one per action
+    pub weight: f32,             // reaching probability for this combo
+}
+
 /// A single cell in the 13x13 strategy matrix.
 #[derive(Debug, Clone, Serialize)]
 pub struct GameMatrixCell {
     pub hand: String,
     pub suited: bool,
     pub pair: bool,
-    pub probabilities: Vec<f32>, // one per action
+    pub probabilities: Vec<f32>, // one per action (averaged across combos)
     pub combo_count: usize,
     pub weight: f32, // reaching probability
     pub ev: Option<f32>,
+    pub combos: Vec<ComboDetail>,
 }
 
 /// The 13x13 strategy matrix with action labels.
@@ -375,6 +384,12 @@ impl GameSession {
                     .and_then(|evs| evs.get(decision_idx))
                     .map(|node_evs| node_evs[player as usize][hand_idx] as f32);
 
+                // Build per-combo details.
+                let combos = self.build_combo_details(
+                    combo_indices, weight_idx, decision_idx, street, actions.len(),
+                    &board_cards,
+                );
+
                 row_cells.push(GameMatrixCell {
                     hand: label,
                     suited,
@@ -383,11 +398,73 @@ impl GameSession {
                     combo_count,
                     weight,
                     ev,
+                    combos,
                 });
             }
             cells.push(row_cells);
         }
         cells
+    }
+
+    /// Build per-combo strategy details for a canonical hand's combos.
+    fn build_combo_details(
+        &self,
+        combo_indices: &[usize],
+        weight_idx: usize,
+        decision_idx: usize,
+        street: Street,
+        num_actions: usize,
+        board_cards: &Option<Vec<rs_poker::core::Card>>,
+    ) -> Vec<ComboDetail> {
+        use range_solver::card::{card_to_string, index_to_card_pair};
+
+        combo_indices
+            .iter()
+            .filter_map(|&ci| {
+                let w = self.weights[weight_idx][ci];
+                if w <= 0.0 {
+                    return None;
+                }
+
+                let (c1, c2) = index_to_card_pair(ci);
+                let s1 = card_to_string(c1).unwrap_or_default();
+                let s2 = card_to_string(c2).unwrap_or_default();
+
+                // Check board blockers for postflop.
+                if let Some(board) = board_cards {
+                    // Convert range-solver card IDs to rs_poker for comparison.
+                    let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
+                    let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
+                    if board.iter().any(|b| *b == rs_c1 || *b == rs_c2) {
+                        return None;
+                    }
+                }
+
+                let probs = if street == Street::Preflop {
+                    // Preflop: all combos of a canonical hand share the same strategy.
+                    // Return empty — the cell's aggregated probs are sufficient.
+                    vec![]
+                } else if let (Some(ctx), Some(board)) = (&self.cbv_context, board_cards) {
+                    // Postflop: per-combo bucket lookup.
+                    let board_slice = board_for_street_slice(board, street);
+                    let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
+                    let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
+                    let bucket = ctx.all_buckets.get_bucket(street, [rs_c1, rs_c2], board_slice);
+                    let strategy_probs = ctx.strategy.get_action_probs(decision_idx, bucket);
+                    (0..num_actions)
+                        .map(|i| strategy_probs.get(i).copied().unwrap_or(0.0))
+                        .collect()
+                } else {
+                    vec![0.0; num_actions]
+                };
+
+                Some(ComboDetail {
+                    cards: format!("{s1}{s2}"),
+                    probabilities: probs,
+                    weight: w,
+                })
+            })
+            .collect()
     }
 
     /// Navigate to the child node for the given action.
@@ -1040,6 +1117,11 @@ mod tests {
             combo_count: 4,
             weight: 0.85,
             ev: Some(1.5),
+            combos: vec![ComboDetail {
+                cards: "AhKh".to_string(),
+                probabilities: vec![0.5, 0.3, 0.2],
+                weight: 1.0,
+            }],
         };
         let json = serde_json::to_string(&cell).unwrap();
         assert!(json.contains("AKs"));
