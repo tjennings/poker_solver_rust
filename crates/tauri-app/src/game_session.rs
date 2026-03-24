@@ -449,15 +449,15 @@ impl GameSession {
     pub fn deal_card(&mut self, card: &str) -> Result<(), String> {
         match &self.tree.nodes[self.node_idx as usize] {
             V2GameNode::Chance { .. } => {
-                self.board.push(card.to_string());
-
-                // Determine how many cards the next street needs.
+                // Determine target card count BEFORE pushing (based on current board).
                 let cards_needed = match self.board.len() {
-                    0..=2 => 3,  // flop needs 3
+                    0..=2 => 3,  // flop needs 3 total
                     3 => 4,      // turn needs 4 total
                     4 => 5,      // river needs 5 total
-                    _ => self.board.len(),
+                    _ => self.board.len() + 1,
                 };
+
+                self.board.push(card.to_string());
 
                 // Only advance past chance node(s) when we have enough cards.
                 if self.board.len() >= cards_needed {
