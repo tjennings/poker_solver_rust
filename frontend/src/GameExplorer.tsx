@@ -1,0 +1,516 @@
+import { useState, useCallback, useMemo, useEffect } from 'react';
+import { invoke } from './invoke';
+import type {
+  GameState,
+  ActionRecord,
+} from './game-types';
+import { HandCell, CellDetail, ActionBlock } from './Explorer';
+import { toMatrixCell } from './game-explorer-utils';
+import {
+  SUIT_COLORS,
+  SUIT_SYMBOLS,
+  formatEV,
+} from './matrix-utils';
+
+// ── Card picker (local, since Explorer.tsx does not export it) ──────────
+
+const PICKER_RANKS = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+const PICKER_SUITS = ['s', 'h', 'd', 'c'];
+const PICKER_COLORS: Record<string, string> = {
+  s: '#fff',
+  h: '#dc2626',
+  d: '#2563eb',
+  c: '#16a34a',
+};
+
+function CardPicker({
+  expectedCards,
+  deadCards,
+  onConfirm,
+}: {
+  expectedCards: number;
+  deadCards: string[];
+  onConfirm: (cards: string[]) => void;
+}) {
+  const [selected, setSelected] = useState<string[]>([]);
+
+  const deadSet = useMemo(
+    () => new Set(deadCards.map((c) => c.toLowerCase())),
+    [deadCards],
+  );
+
+  const handleCardClick = (card: string) => {
+    if (deadSet.has(card.toLowerCase())) return;
+
+    setSelected((prev) => {
+      if (prev.includes(card)) {
+        return prev.filter((c) => c !== card);
+      }
+      if (prev.length >= expectedCards) return prev;
+      const next = [...prev, card];
+      if (expectedCards === 1 && next.length === 1) {
+        setTimeout(() => onConfirm(next), 0);
+      }
+      return next;
+    });
+  };
+
+  return (
+    <div className="card-picker">
+      {PICKER_SUITS.map((suit) => (
+        <div key={suit} className="card-picker-row">
+          {PICKER_RANKS.map((rank) => {
+            const card = `${rank}${suit}`;
+            const isDead = deadSet.has(card.toLowerCase());
+            const isSel = selected.includes(card);
+            return (
+              <button
+                key={card}
+                className={`card-picker-card ${isDead ? 'dead' : ''} ${isSel ? 'selected' : ''}`}
+                style={{
+                  color: PICKER_COLORS[suit] || '#eee',
+                  borderColor: isSel ? '#00d9ff' : 'transparent',
+                }}
+                disabled={isDead}
+                onClick={() => handleCardClick(card)}
+              >
+                <span className="picker-rank">{rank}</span>
+                <span className="picker-suit">{SUIT_SYMBOLS[suit]}</span>
+              </button>
+            );
+          })}
+        </div>
+      ))}
+      {expectedCards > 1 && (
+        <button
+          className="card-picker-confirm"
+          disabled={selected.length !== expectedCards}
+          onClick={() => onConfirm(selected)}
+        >
+          Deal {selected.length}/{expectedCards}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ── Board display ───────────────────────────────────────────────────────
+
+function BoardCards({ cards }: { cards: string[] }) {
+  if (cards.length === 0) return null;
+  return (
+    <div className="street-cards" style={{ justifyContent: 'flex-start' }}>
+      {cards.map((card, i) => {
+        const rank = card[0]?.toUpperCase();
+        const suit = card[1]?.toLowerCase();
+        const bgColor = SUIT_COLORS[suit] || '#333';
+        return (
+          <div
+            key={i}
+            className="street-card"
+            style={{ backgroundColor: bgColor }}
+          >
+            <span className="card-rank">{rank}</span>
+            <span className="card-suit">{SUIT_SYMBOLS[suit] || '?'}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Action history breadcrumbs ──────────────────────────────────────────
+
+function HistoryBreadcrumbs({
+  history,
+  onRewind,
+}: {
+  history: ActionRecord[];
+  onRewind: (index: number) => void;
+}) {
+  if (history.length === 0) return null;
+
+  // Group actions by street
+  let currentStreet = '';
+  const groups: { street: string; actions: (ActionRecord & { idx: number })[] }[] = [];
+
+  history.forEach((rec, idx) => {
+    if (rec.street !== currentStreet) {
+      currentStreet = rec.street;
+      groups.push({ street: currentStreet, actions: [] });
+    }
+    groups[groups.length - 1].actions.push({ ...rec, idx });
+  });
+
+  return (
+    <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap', alignItems: 'center' }}>
+      {groups.map((group, gi) => (
+        <div key={gi} style={{ display: 'flex', gap: '0.25rem', alignItems: 'center' }}>
+          <span style={{ fontSize: '0.6rem', color: '#f59e0b', fontWeight: 600 }}>
+            {group.street}
+          </span>
+          {group.actions.map((rec) => (
+            <button
+              key={rec.idx}
+              className="action-button"
+              style={{
+                padding: '2px 6px',
+                fontSize: '0.6rem',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid #333',
+                borderRadius: '3px',
+                color: '#ccc',
+                cursor: 'pointer',
+              }}
+              onClick={() => onRewind(rec.idx)}
+              title={`${rec.position}: ${rec.label}`}
+            >
+              <span style={{ color: '#00d9ff', marginRight: '3px' }}>{rec.position}</span>
+              {rec.label}
+            </button>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Solve progress bar ──────────────────────────────────────────────────
+
+function SolveProgress({ state }: { state: GameState }) {
+  const solve = state.solve;
+  if (!solve) return null;
+
+  const pct = solve.max_iterations > 0
+    ? Math.min((solve.iteration / solve.max_iterations) * 100, 100)
+    : 0;
+
+  return (
+    <div className="progress-bar-container">
+      <div className="progress-bar-track">
+        <div className="progress-bar-fill" style={{ width: `${pct}%` }} />
+        <div className="progress-text">
+          {solve.solver_name} - {solve.iteration}/{solve.max_iterations} iters
+          {' '} | expl: {solve.exploitability.toFixed(3)}
+          {' '} | {solve.elapsed_secs.toFixed(1)}s
+          {solve.is_complete ? ' (done)' : ''}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main component ──────────────────────────────────────────────────────
+
+export default function GameExplorer() {
+  const [state, setState] = useState<GameState | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [selectedCell, setSelectedCell] = useState<{
+    row: number;
+    col: number;
+  } | null>(null);
+
+  // ── Initialize session on mount ──────────────────────────────────
+
+  useEffect(() => {
+    const init = async () => {
+      try {
+        setLoading(true);
+        await invoke('game_new', {});
+        const s = await invoke<GameState>('game_get_state', {});
+        setState(s);
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setLoading(false);
+      }
+    };
+    init();
+  }, []);
+
+  // ── Action handler ───────────────────────────────────────────────
+
+  const playAction = useCallback(async (actionId: string) => {
+    try {
+      setLoading(true);
+      const s = await invoke<GameState>('game_play_action', {
+        action_id: actionId,
+      });
+      setState(s);
+      setSelectedCell(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // ── Deal card handler ────────────────────────────────────────────
+
+  const dealCard = useCallback(async (card: string) => {
+    try {
+      setLoading(true);
+      const s = await invoke<GameState>('game_deal_card', { card });
+      setState(s);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const dealCards = useCallback(
+    async (cards: string[]) => {
+      try {
+        setLoading(true);
+        let s: GameState | null = null;
+        for (const card of cards) {
+          s = await invoke<GameState>('game_deal_card', { card });
+        }
+        if (s) setState(s);
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
+
+  // ── Back handler ─────────────────────────────────────────────────
+
+  const goBack = useCallback(async () => {
+    try {
+      setLoading(true);
+      const s = await invoke<GameState>('game_back', {});
+      setState(s);
+      setSelectedCell(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // ── New hand ─────────────────────────────────────────────────────
+
+  const newHand = useCallback(async () => {
+    try {
+      setLoading(true);
+      await invoke('game_new', {});
+      const s = await invoke<GameState>('game_get_state', {});
+      setState(s);
+      setSelectedCell(null);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // ── Rewind to a specific history point ───────────────────────────
+
+  const rewindTo = useCallback(
+    async (index: number) => {
+      if (!state) return;
+      const stepsBack = state.action_history.length - index;
+      if (stepsBack <= 0) return;
+      try {
+        setLoading(true);
+        // Call game_back once for each step to undo.
+        // The backend replays from root each time, so this is correct
+        // even across street boundaries.
+        let s: GameState | null = null;
+        for (let i = 0; i < stepsBack; i++) {
+          s = await invoke<GameState>('game_back', {});
+        }
+        if (s) setState(s);
+        setSelectedCell(null);
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [state],
+  );
+
+  // ── Derived state ────────────────────────────────────────────────
+
+  const matrixActions = state?.matrix?.actions ?? state?.actions ?? [];
+  const selectedCellData =
+    selectedCell && state?.matrix
+      ? state.matrix.cells[selectedCell.row]?.[selectedCell.col]
+      : null;
+
+  // Determine how many cards the next street needs
+  const expectedCards = useMemo(() => {
+    if (!state?.is_chance) return 0;
+    const boardLen = state.board.length;
+    if (boardLen === 0) return 3; // flop
+    if (boardLen === 3) return 1; // turn
+    if (boardLen === 4) return 1; // river
+    return 0;
+  }, [state]);
+
+  const nextStreetLabel = useMemo(() => {
+    if (!state?.is_chance) return '';
+    const boardLen = state.board.length;
+    if (boardLen === 0) return 'FLOP';
+    if (boardLen === 3) return 'TURN';
+    if (boardLen === 4) return 'RIVER';
+    return '';
+  }, [state]);
+
+  // ── Render ───────────────────────────────────────────────────────
+
+  if (!state && !error && loading) {
+    return <div className="explorer"><div className="loading">Initializing...</div></div>;
+  }
+
+  return (
+    <div className="explorer">
+      {error && (
+        <div className="error" onClick={() => setError(null)} style={{ cursor: 'pointer' }}>
+          {error}
+        </div>
+      )}
+
+      {/* Action strip: history breadcrumbs + current actions */}
+      {state && (
+        <div className="action-strip">
+          {/* Back / New Hand buttons */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', flexShrink: 0 }}>
+            <button
+              style={{
+                padding: '4px 8px',
+                fontSize: '0.65rem',
+                background: '#1e293b',
+                border: '1px solid #444',
+                borderRadius: '4px',
+                color: '#ccc',
+              }}
+              disabled={state.action_history.length === 0}
+              onClick={goBack}
+            >
+              Back
+            </button>
+            <button
+              style={{
+                padding: '4px 8px',
+                fontSize: '0.65rem',
+                background: '#1e293b',
+                border: '1px solid #444',
+                borderRadius: '4px',
+                color: '#ccc',
+              }}
+              onClick={newHand}
+            >
+              New
+            </button>
+          </div>
+
+          {/* Board cards */}
+          {state.board.length > 0 && <BoardCards cards={state.board} />}
+
+          {/* History breadcrumbs */}
+          <HistoryBreadcrumbs
+            history={state.action_history}
+            onRewind={rewindTo}
+          />
+
+          {/* Current action block (non-terminal, non-chance) */}
+          {!state.is_terminal && !state.is_chance && matrixActions.length > 0 && (
+            <ActionBlock
+              position={state.position}
+              stack={state.stacks[state.position === 'SB' ? 1 : 0]}
+              pot={state.pot}
+              actions={matrixActions}
+              onSelect={playAction}
+              isCurrent={true}
+            />
+          )}
+        </div>
+      )}
+
+      {/* Strategy matrix */}
+      {state?.matrix && (
+        <div className="matrix-container">
+          <div className="matrix-with-detail">
+            <div className="hand-matrix">
+              {state.matrix.cells.map((row, rowIdx) => (
+                <div key={rowIdx} className="matrix-row">
+                  {row.map((cell, colIdx) => {
+                    const matCell = toMatrixCell(cell, matrixActions);
+                    return (
+                      <HandCell
+                        key={colIdx}
+                        cell={matCell}
+                        actions={matrixActions}
+                        reachWeight={cell.weight}
+                        isSelected={
+                          selectedCell?.row === rowIdx &&
+                          selectedCell?.col === colIdx
+                        }
+                        onClick={() =>
+                          setSelectedCell({ row: rowIdx, col: colIdx })
+                        }
+                        overlayText={
+                          cell.ev != null ? formatEV(cell.ev) : undefined
+                        }
+                      />
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+
+            {/* Detail panel */}
+            <div className="detail-column">
+              {selectedCellData && (
+                <CellDetail
+                  cell={toMatrixCell(selectedCellData, matrixActions)}
+                  actions={matrixActions}
+                />
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Card picker for chance nodes */}
+      {state?.is_chance && expectedCards > 0 && (
+        <div className="card-picker-container">
+          <p className="card-picker-prompt">
+            Select {nextStreetLabel.toLowerCase()} card
+            {expectedCards > 1 ? 's' : ''}
+          </p>
+          <CardPicker
+            expectedCards={expectedCards}
+            deadCards={state.board}
+            onConfirm={expectedCards === 1 ? (cards) => dealCard(cards[0]) : dealCards}
+          />
+        </div>
+      )}
+
+      {/* Terminal state */}
+      {state?.is_terminal && (
+        <div className="hand-complete">
+          <p className="hand-complete-result">
+            Hand complete — Pot: {state.pot}
+          </p>
+          <button className="new-hand-btn" onClick={newHand}>
+            New Hand
+          </button>
+        </div>
+      )}
+
+      {/* Solve progress */}
+      {state && <SolveProgress state={state} />}
+
+      {loading && <div className="loading">Loading...</div>}
+    </div>
+  );
+}
