@@ -8,7 +8,6 @@ import { toMatrixCell } from './game-explorer-utils';
 import {
   SUIT_COLORS,
   SUIT_SYMBOLS,
-  formatEV,
 } from './matrix-utils';
 
 // ── Card picker (local, since Explorer.tsx does not export it) ──────────
@@ -534,7 +533,9 @@ export default function GameExplorer() {
                           setSelectedCell({ row: rowIdx, col: colIdx })
                         }
                         overlayText={
-                          cell.ev != null ? formatEV(cell.ev) : undefined
+                          cell.ev != null
+                            ? `${cell.ev >= 0 ? '+' : ''}${(cell.ev / 2).toFixed(1)}`
+                            : undefined
                         }
                       />
                     );
