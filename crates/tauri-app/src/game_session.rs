@@ -7,22 +7,18 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::game_tree::{
     GameNode as V2GameNode, GameTree as V2GameTree, TreeAction,
 };
-use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 use poker_solver_core::blueprint_v2::Street;
-use poker_solver_core::hands::CanonicalHand;
-use poker_solver_core::poker::Card;
 
 use crate::exploration::{
-    avg_action_prob_for_hand, board_for_street_slice, build_canonical_to_combo_map,
-    canonical_hand_index_from_ranks, hand_label_from_matrix, parse_board, pot_at_v2_node,
-    v2_action_info, ActionInfo, BucketLookup, RANKS,
+    board_for_street_slice, build_canonical_to_combo_map, canonical_hand_index_from_ranks,
+    hand_label_from_matrix, parse_board, pot_at_v2_node, ActionInfo, BucketLookup, RANKS,
 };
 use crate::postflop::CbvContext;
 
