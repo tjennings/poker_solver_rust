@@ -157,6 +157,7 @@ pub struct BundleInfo {
     pub preflop_only: bool,
     pub rake_rate: f64,
     pub rake_cap: f64,
+    pub snapshot_name: Option<String>,
 }
 
 /// Information about an available agent config.
@@ -317,6 +318,7 @@ fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
         preflop_only: false,
         rake_rate: 0.0,
         rake_cap: 0.0,
+        snapshot_name: None,
     };
 
     Ok((info, StrategySource::Agent(agent)))
@@ -336,7 +338,7 @@ pub async fn load_blueprint_v2_core(
     dir_path: String,
 ) -> Result<BundleInfo, String> {
     let dir = PathBuf::from(&dir_path);
-    let (config, strategy, cbv_table) = tokio::task::spawn_blocking(move || {
+    let (config, strategy, cbv_table, snapshot_name) = tokio::task::spawn_blocking(move || {
         let cfg = v2_bundle::load_config(&dir)
             .map_err(|e| format!("Failed to load config.yaml: {e}"))?;
 
@@ -389,7 +391,14 @@ pub async fn load_blueprint_v2_core(
             None
         };
 
-        Ok::<_, String>((cfg, strat, cbv_table))
+        // Extract snapshot name from strategy path (e.g. "snapshot_1234")
+        let snapshot_name = strat_path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .filter(|n| n.starts_with("snapshot_"))
+            .map(String::from);
+
+        Ok::<_, String>((cfg, strat, cbv_table, snapshot_name))
     })
     .await
     .map_err(|e| format!("Load task panicked: {e}"))??;
@@ -416,6 +425,7 @@ pub async fn load_blueprint_v2_core(
         preflop_only: true,
         rake_rate: config.game.rake_rate,
         rake_cap: config.game.rake_cap,
+        snapshot_name,
     };
 
     // Load per-node hand EVs if available (from hand_ev.bin).
@@ -1616,6 +1626,7 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
             preflop_only: false,
             rake_rate: 0.0,
             rake_cap: 0.0,
+            snapshot_name: None,
         },
         StrategySource::BlueprintV2 {
             config,
@@ -1633,6 +1644,7 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
                 preflop_only: false,
                 rake_rate: config.game.rake_rate,
                 rake_cap: config.game.rake_cap,
+                snapshot_name: None, // not available from this code path
             }
         }
     })

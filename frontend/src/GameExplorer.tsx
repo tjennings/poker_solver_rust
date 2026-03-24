@@ -242,11 +242,11 @@ export default function GameExplorer() {
       setLoading(true);
       setError(null);
       setState(null);
-      await invoke('load_blueprint_v2', { path });
+      const info = await invoke<{ snapshot_name: string | null }>('load_blueprint_v2', { path });
       await invoke('game_new', {});
       const s = await invoke<GameState>('game_get_state', {});
       setState(s);
-      setBundleName(name);
+      setBundleName(info.snapshot_name ? `${name} (${info.snapshot_name})` : name);
     } catch (e) {
       setError(String(e));
     } finally {

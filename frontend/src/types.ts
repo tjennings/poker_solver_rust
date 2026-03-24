@@ -7,6 +7,7 @@ export interface BundleInfo {
   preflop_only: boolean;
   rake_rate: number;
   rake_cap: number;
+  snapshot_name: string | null;
 }
 
 export interface AgentInfo {
