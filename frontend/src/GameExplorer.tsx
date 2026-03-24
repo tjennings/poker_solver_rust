@@ -211,43 +211,47 @@ export default function GameExplorer() {
     col: number;
   } | null>(null);
 
-  // ── Load bundle and initialize session on mount ─────────────────
+  const [blueprints, setBlueprints] = useState<{ name: string; path: string; stack_depth: number }[]>([]);
+  const [bundleName, setBundleName] = useState<string | null>(null);
+
+  // ── List available blueprints on mount ──────────────────────────
 
   useEffect(() => {
     const init = async () => {
       try {
-        setLoading(true);
-        setError(null);
-
-        // Load blueprint bundle from settings
         const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
         if (!globalConfig.blueprint_dir) {
           setError('Set Blueprint Directory in Settings first');
           return;
         }
-
-        const list = await invoke<{ name: string; path: string; has_strategy: boolean }[]>(
+        const list = await invoke<{ name: string; path: string; stack_depth: number; has_strategy: boolean }[]>(
           'list_blueprints', { dir: globalConfig.blueprint_dir }
         );
-        const available = list.filter(b => b.has_strategy);
-        if (available.length === 0) {
-          setError('No blueprints with strategy found in ' + globalConfig.blueprint_dir);
-          return;
-        }
-
-        // Auto-load the first blueprint
-        await invoke('load_blueprint_v2', { path: available[0].path });
-        // Initialize game session
-        await invoke('game_new', {});
-        const s = await invoke<GameState>('game_get_state', {});
-        setState(s);
+        setBlueprints(list.filter(b => b.has_strategy));
       } catch (e) {
         setError(String(e));
-      } finally {
-        setLoading(false);
       }
     };
     init();
+  }, []);
+
+  // ── Load a specific blueprint and start game session ────────────
+
+  const loadBlueprint = useCallback(async (path: string, name: string) => {
+    try {
+      setLoading(true);
+      setError(null);
+      setState(null);
+      await invoke('load_blueprint_v2', { path });
+      await invoke('game_new', {});
+      const s = await invoke<GameState>('game_get_state', {});
+      setState(s);
+      setBundleName(name);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
   // ── Action handler ───────────────────────────────────────────────
@@ -387,8 +391,51 @@ export default function GameExplorer() {
 
   // ── Render ───────────────────────────────────────────────────────
 
-  if (!state && !error && loading) {
-    return <div className="explorer"><div className="loading">Initializing...</div></div>;
+  if (loading) {
+    return <div className="explorer"><div className="loading">Loading...</div></div>;
+  }
+
+  // Blueprint picker — shown when no game session is active
+  if (!state) {
+    return (
+      <div className="explorer">
+        {error && (
+          <div className="error" onClick={() => setError(null)} style={{ cursor: 'pointer' }}>
+            {error}
+          </div>
+        )}
+        <div style={{ padding: '2rem', maxWidth: '500px', margin: '0 auto' }}>
+          <h2 style={{ color: '#e2e8f0', marginBottom: '1rem', fontSize: '1.1rem' }}>Select Blueprint</h2>
+          {blueprints.length === 0 ? (
+            <p style={{ color: '#94a3b8' }}>No blueprints found. Set Blueprint Directory in Settings.</p>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              {blueprints.map((bp) => (
+                <button
+                  key={bp.path}
+                  onClick={() => loadBlueprint(bp.path, bp.name)}
+                  style={{
+                    padding: '0.75rem 1rem',
+                    background: '#1e293b',
+                    border: '1px solid #334155',
+                    borderRadius: '6px',
+                    color: '#e2e8f0',
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                    fontSize: '0.85rem',
+                  }}
+                >
+                  <div style={{ fontWeight: 600 }}>{bp.name}</div>
+                  <div style={{ fontSize: '0.7rem', color: '#94a3b8', marginTop: '2px' }}>
+                    {bp.stack_depth > 0 ? `${bp.stack_depth}bb` : ''} — {bp.path.split('/').pop()}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -402,8 +449,25 @@ export default function GameExplorer() {
       {/* Action strip: history breadcrumbs + current actions */}
       {state && (
         <div className="action-strip">
-          {/* Back / New Hand buttons */}
+          {/* Back / New Hand / Blueprint buttons */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', flexShrink: 0 }}>
+            {bundleName && (
+              <button
+                style={{
+                  padding: '2px 6px',
+                  fontSize: '0.55rem',
+                  background: 'transparent',
+                  border: '1px solid #334155',
+                  borderRadius: '4px',
+                  color: '#94a3b8',
+                  cursor: 'pointer',
+                }}
+                onClick={() => { setState(null); setBundleName(null); }}
+                title="Change blueprint"
+              >
+                {bundleName}
+              </button>
+            )}
             <button
               style={{
                 padding: '4px 8px',
