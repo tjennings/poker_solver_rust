@@ -1,3 +1,8 @@
+mod baseline;
+mod game;
+mod solver_trait;
+mod solvers;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
