@@ -441,18 +441,39 @@ impl GameSession {
         Ok(())
     }
 
-    /// Deal a board card at a chance node and advance past it.
+    /// Deal board card(s) at a chance node.
+    ///
+    /// For flop transitions, the V2 tree has a single chance node but 3 cards
+    /// must be dealt. Cards are buffered in `self.board`; the chance node is
+    /// only advanced once enough cards are present for the next street.
     pub fn deal_card(&mut self, card: &str) -> Result<(), String> {
         match &self.tree.nodes[self.node_idx as usize] {
-            V2GameNode::Chance { child, .. } => {
+            V2GameNode::Chance { .. } => {
                 self.board.push(card.to_string());
-                self.node_idx = *child;
-                // Skip additional chance nodes (flop deals 3 cards at once in V2).
-                while let V2GameNode::Chance { child, .. } =
-                    &self.tree.nodes[self.node_idx as usize]
-                {
-                    self.node_idx = *child;
+
+                // Determine how many cards the next street needs.
+                let cards_needed = match self.board.len() {
+                    0..=2 => 3,  // flop needs 3
+                    3 => 4,      // turn needs 4 total
+                    4 => 5,      // river needs 5 total
+                    _ => self.board.len(),
+                };
+
+                // Only advance past chance node(s) when we have enough cards.
+                if self.board.len() >= cards_needed {
+                    if let V2GameNode::Chance { child, .. } =
+                        &self.tree.nodes[self.node_idx as usize]
+                    {
+                        self.node_idx = *child;
+                    }
+                    // Skip additional chance nodes.
+                    while let V2GameNode::Chance { child, .. } =
+                        &self.tree.nodes[self.node_idx as usize]
+                    {
+                        self.node_idx = *child;
+                    }
                 }
+
                 Ok(())
             }
             _ => Err("Not at a chance node -- cannot deal card".to_string()),
