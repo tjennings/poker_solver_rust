@@ -1,10 +1,11 @@
 import { useState } from 'react';
 import Explorer from './Explorer';
+import GameExplorer from './GameExplorer';
 import Simulator from './Simulator';
 import Train from './Train';
 import Settings from './Settings';
 
-type View = 'explore' | 'train' | 'arena' | 'settings';
+type View = 'explore' | 'game' | 'train' | 'arena' | 'settings';
 
 const VIEWS: { id: View; label: string; icon: JSX.Element; bottom?: boolean }[] = [
   {
@@ -14,6 +15,18 @@ const VIEWS: { id: View; label: string; icon: JSX.Element; bottom?: boolean }[] 
       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <circle cx="12" cy="12" r="10" />
         <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76" />
+      </svg>
+    ),
+  },
+  {
+    id: 'game',
+    label: 'Game',
+    icon: (
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="3" y="3" width="7" height="7" rx="1" />
+        <rect x="14" y="3" width="7" height="7" rx="1" />
+        <rect x="3" y="14" width="7" height="7" rx="1" />
+        <rect x="14" y="14" width="7" height="7" rx="1" />
       </svg>
     ),
   },
@@ -82,6 +95,7 @@ function App() {
       </nav>
       <main className="main-pane">
         <div className="view-pane" style={{ display: view === 'explore' ? undefined : 'none' }}><Explorer /></div>
+        <div className="view-pane" style={{ display: view === 'game' ? undefined : 'none' }}><GameExplorer /></div>
         <div className="view-pane" style={{ display: view === 'train' ? undefined : 'none' }}><Train /></div>
         <div className="view-pane" style={{ display: view === 'arena' ? undefined : 'none' }}><Simulator /></div>
         <div className="view-pane" style={{ display: view === 'settings' ? undefined : 'none' }}><Settings /></div>
