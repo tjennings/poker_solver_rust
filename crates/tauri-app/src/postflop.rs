@@ -850,6 +850,7 @@ struct MatrixSnapshot {
     stacks: [i32; 2],
     hand_evs: Option<Vec<f32>>,
     board: Vec<String>,
+    dealer: u8,
 }
 
 /// Capture all data needed for matrix construction from the game.
@@ -907,6 +908,7 @@ fn capture_matrix_snapshot(game: &mut PostFlopGame) -> MatrixSnapshot {
         stacks,
         hand_evs,
         board,
+        dealer: 1, // range-solver: player 1 = IP = SB = dealer
     }
 }
 
@@ -989,7 +991,7 @@ fn build_matrix_from_snapshot(snap: MatrixSnapshot) -> PostflopStrategyMatrix {
         pot: snap.pot,
         stacks: snap.stacks,
         board: snap.board,
-        dealer: 1, // In the range-solver, player 0 = OOP = BB, player 1 = IP = SB = dealer
+        dealer: snap.dealer,
     }
 }
 
@@ -1014,6 +1016,8 @@ fn snapshot_from_subgame(
     stacks: [i32; 2],
     player: usize,
     node_idx: u32,
+    dealer: u8,
+    hand_evs: Option<Vec<f32>>,
 ) -> MatrixSnapshot {
     let num_actions = action_infos.len();
 
@@ -1057,8 +1061,9 @@ fn snapshot_from_subgame(
         actions: action_infos,
         pot,
         stacks,
-        hand_evs: None,
+        hand_evs,
         board: board_strings.to_vec(),
+        dealer,
     }
 }
 
@@ -1388,6 +1393,7 @@ fn postflop_solve_street_impl(
     state.solve_complete.store(false, Ordering::Relaxed);
     state.subgame_node.store(0, Ordering::Relaxed);
     *state.solve_start.write() = Some(std::time::Instant::now());
+    *state.matrix_snapshot.write() = None;
 
     match choice {
         SolverChoice::FullDepth => {
@@ -1579,7 +1585,6 @@ fn solve_depth_limited(
     let shared = Arc::clone(state);
     let board_strings = board;
     std::thread::spawn(move || {
-        let player = 0; // OOP acts first at root
         match build_subgame_solver(
             &board_cards,
             &bet_sizes_per_depth,
@@ -1587,7 +1592,7 @@ fn solve_depth_limited(
             [eff_stack as u32, eff_stack as u32],
             &oop_w,
             &ip_w,
-            player,
+            0, // _player param (unused)
             cbv_context.as_deref(),
             abstract_node_idx,
             rollout_bias_factor,
@@ -1595,6 +1600,13 @@ fn solve_depth_limited(
             rollout_opponent_samples,
         ) {
             Ok((mut solver, hands, action_infos, tree, initial_pot, starting_stack)) => {
+                // Get root player and dealer from V2 tree convention.
+                let root_player = match &tree.nodes[tree.root as usize] {
+                    GameNode::Decision { player, .. } => *player as usize,
+                    _ => 0, // shouldn't happen — root is always a decision node
+                };
+                let tree_dealer = tree.dealer;
+
                 // Set DCFR warmup to 10% of total iterations.
                 solver.set_dcfr_warmup((max_iters / 10).max(1) as u64);
 
@@ -1608,18 +1620,18 @@ fn solve_depth_limited(
                 }
 
                 // Helper closure to build matrix from current strategy.
-                let make_matrix = |strat: &SubgameStrategy| {
+                let make_matrix = |strat: &SubgameStrategy, evs: Option<Vec<f32>>| {
                     let snap = snapshot_from_subgame(
                         &hands, strat, action_infos.clone(),
                         &oop_w, &board_strings, pot,
-                        [eff_stack, eff_stack], player, 0,
+                        [eff_stack, eff_stack], root_player, 0, tree_dealer, evs,
                     );
                     build_matrix_from_snapshot(snap)
                 };
 
                 // Initial matrix: uniform strategy with range weights, shown before any iterations.
                 let initial_strategy = solver.strategy();
-                *shared.matrix_snapshot.write() = Some(make_matrix(&initial_strategy));
+                *shared.matrix_snapshot.write() = Some(make_matrix(&initial_strategy, None));
 
                 const SNAPSHOT_INTERVAL: u32 = 10;
                 let leaf_interval = leaf_eval_interval.unwrap_or(SNAPSHOT_INTERVAL);
@@ -1637,12 +1649,26 @@ fn solve_depth_limited(
                     shared.current_iteration.store(t, Ordering::Relaxed);
 
                     let strategy = solver.strategy();
-                    *shared.matrix_snapshot.write() = Some(make_matrix(&strategy));
+                    *shared.matrix_snapshot.write() = Some(make_matrix(&strategy, None));
                 }
 
-                // Final strategy snapshot.
+                // Final strategy snapshot with EVs.
                 let strategy = solver.strategy();
-                *shared.matrix_snapshot.write() = Some(make_matrix(&strategy));
+                let cfvs = solver.root_cfvs(0); // 0 = OOP (positional convention)
+                // Filter to match snapshot_from_subgame's combo filtering (skip zero-weight).
+                let hand_evs: Vec<f32> = hands.combos.iter().enumerate()
+                    .filter_map(|(combo_idx, combo)| {
+                        let id0 = rs_poker_card_to_id(combo[0]);
+                        let id1 = rs_poker_card_to_id(combo[1]);
+                        let ci = card_pair_to_index(id0, id1);
+                        if oop_w[ci] > 0.0 {
+                            Some(cfvs[combo_idx] as f32)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                *shared.matrix_snapshot.write() = Some(make_matrix(&strategy, Some(hand_evs)));
 
                 // Post-training diagnostic: dump regrets and strategy for
                 // a few sample combos at the root node.
@@ -1659,7 +1685,7 @@ fn solve_depth_limited(
                         if shown >= 10 { break; }
                         let probs = strategy.root_probs(combo_idx);
                         if probs.is_empty() { continue; }
-                        let reach = if player == 0 { &oop_w } else { &ip_w };
+                        let reach = if root_player == 0 { &oop_w } else { &ip_w };
                         let card_id0 = rs_poker_card_to_id(hands.combos[combo_idx][0]);
                         let card_id1 = rs_poker_card_to_id(hands.combos[combo_idx][1]);
                         let ci = card_pair_to_index(card_id0, card_id1);
@@ -2026,6 +2052,8 @@ fn subgame_node_to_result(
                 stacks_i32,
                 player_usize,
                 node_idx,
+                result.tree.dealer,
+                None, // EVs not available during navigation
             );
             let matrix = build_matrix_from_snapshot(snap);
             Ok(PostflopPlayResult {
@@ -3312,5 +3340,43 @@ mod tests {
             None, // rollout_opponent_samples
         );
         assert!(result.is_ok(), "build_subgame_solver with None rollout params failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_matrix_snapshot_dealer_passthrough() {
+        // Minimal snapshot with no combos — verify dealer is passed through.
+        let snap = MatrixSnapshot {
+            player: 0,
+            strategy: vec![],
+            private_cards: vec![],
+            initial_weights: vec![],
+            num_hands: 0,
+            actions: vec![],
+            pot: 100,
+            stacks: [900, 900],
+            hand_evs: None,
+            board: vec!["Td".into(), "9d".into(), "6h".into()],
+            dealer: 0,
+        };
+        let matrix = build_matrix_from_snapshot(snap);
+        assert_eq!(matrix.dealer, 0, "dealer should pass through from snapshot");
+        assert_eq!(matrix.player, 0);
+
+        // Range-solver convention: dealer = 1
+        let snap2 = MatrixSnapshot {
+            player: 0,
+            strategy: vec![],
+            private_cards: vec![],
+            initial_weights: vec![],
+            num_hands: 0,
+            actions: vec![],
+            pot: 100,
+            stacks: [900, 900],
+            hand_evs: None,
+            board: vec!["Td".into(), "9d".into(), "6h".into()],
+            dealer: 1,
+        };
+        let matrix2 = build_matrix_from_snapshot(snap2);
+        assert_eq!(matrix2.dealer, 1, "range-solver dealer convention");
     }
 }
