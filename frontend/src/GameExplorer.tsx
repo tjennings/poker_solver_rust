@@ -315,42 +315,18 @@ export default function GameExplorer() {
   const rewindTo = useCallback(
     async (index: number) => {
       if (!state) return;
+      const stepsBack = state.action_history.length - index;
+      if (stepsBack <= 0) return;
       try {
         setLoading(true);
-        // Go back to root, then replay up to index
-        // The simplest approach: call game_back enough times
-        // But game_back replays from root anyway -- so we can reset and replay
-        await invoke('game_new', {});
-
-        // Replay actions from history up to (but not including) the action at index
-        const replay = state.action_history.slice(0, index);
+        // Call game_back once for each step to undo.
+        // The backend replays from root each time, so this is correct
+        // even across street boundaries.
         let s: GameState | null = null;
-        for (const rec of replay) {
-          // If at a chance node, we need to deal cards.
-          // The current state after each action tells us.
-          s = await invoke<GameState>('game_play_action', {
-            action_id: rec.action_id,
-          });
-          // If the result is a chance node, deal the board cards
-          if (s.is_chance && state.board.length > 0) {
-            const cardsDealt = s.board.length;
-            const cardsNeeded = state.board.slice(cardsDealt);
-            // Deal one card at a time until we're past the chance node
-            for (const card of cardsNeeded) {
-              const next = await invoke<GameState>('game_deal_card', { card });
-              s = next;
-              if (!s.is_chance) break;
-            }
-          }
+        for (let i = 0; i < stepsBack; i++) {
+          s = await invoke<GameState>('game_back', {});
         }
-
-        if (s) {
-          setState(s);
-        } else {
-          // No replay needed -- just get fresh state
-          s = await invoke<GameState>('game_get_state', {});
-          setState(s);
-        }
+        if (s) setState(s);
         setSelectedCell(null);
       } catch (e) {
         setError(String(e));
