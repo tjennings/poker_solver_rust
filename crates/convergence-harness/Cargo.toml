@@ -1,0 +1,18 @@
+[package]
+name = "convergence-harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+range-solver = { path = "../range-solver" }
+poker-solver-core = { path = "../core" }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = "1"
+serde_yaml = { workspace = true }
+bincode = "1"
+csv = "1"
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
