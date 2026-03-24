@@ -260,7 +260,7 @@ export default function GameExplorer() {
     try {
       setLoading(true);
       const s = await invoke<GameState>('game_play_action', {
-        action_id: actionId,
+        actionId,
       });
       setState(s);
       setSelectedCell(null);
