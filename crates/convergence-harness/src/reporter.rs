@@ -114,7 +114,7 @@ impl ComparisonResult {
                     (last.iteration as f64 / first.iteration.max(1) as f64).ln();
                 if iter_ratio > 0.0 {
                     let rate = log_ratio / iter_ratio;
-                    s.push_str(&format!("\n--- Convergence Rate ---\n"));
+                    s.push_str("\n--- Convergence Rate ---\n");
                     s.push_str(&format!("Approximate rate: O(1/T^{:.2})\n", rate));
                     s.push_str("(DCFR typically converges at ~O(1/T^0.5))\n");
                 }

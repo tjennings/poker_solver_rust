@@ -12,9 +12,9 @@ fn should_sample(iteration: u64) -> bool {
     if iteration < 100 {
         true
     } else if iteration < 1000 {
-        iteration % 10 == 0
+        iteration.is_multiple_of(10)
     } else {
-        iteration % 100 == 0
+        iteration.is_multiple_of(100)
     }
 }
 
