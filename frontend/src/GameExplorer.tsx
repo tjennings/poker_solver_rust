@@ -93,32 +93,7 @@ function CardPicker({
   );
 }
 
-// ── Board display ───────────────────────────────────────────────────────
-
-function BoardCards({ cards }: { cards: string[] }) {
-  if (cards.length === 0) return null;
-  return (
-    <div className="street-cards" style={{ justifyContent: 'flex-start' }}>
-      {cards.map((card, i) => {
-        const rank = card[0]?.toUpperCase();
-        const suit = card[1]?.toLowerCase();
-        const bgColor = SUIT_COLORS[suit] || '#333';
-        return (
-          <div
-            key={i}
-            className="street-card"
-            style={{ backgroundColor: bgColor }}
-          >
-            <span className="card-rank">{rank}</span>
-            <span className="card-suit">{SUIT_SYMBOLS[suit] || '?'}</span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-// (HistoryBreadcrumbs removed — action history now rendered inline as ActionBlocks)
+// (BoardCards and HistoryBreadcrumbs removed — rendered inline in action strip)
 
 // ── Solve progress bar ──────────────────────────────────────────────────
 
@@ -442,67 +417,85 @@ export default function GameExplorer() {
             </button>
           </div>
 
-          {/* Action history as full ActionBlocks with board cards between streets */}
+          {/* Action history as full ActionBlocks with street cards */}
           {(() => {
             const elems: JSX.Element[] = [];
             let prevStreet = '';
             const board = state.board;
 
+            const streetBlock = (streetName: string, cards: string[]) => (
+              <div key={`street-${streetName}`} className="street-block">
+                <div className="street-block-header">
+                  <span className="street-name">{streetName}</span>
+                </div>
+                <div className="street-cards">
+                  {cards.map((card, i) => {
+                    const rank = card[0]?.toUpperCase();
+                    const suit = card[1]?.toLowerCase();
+                    const bgColor = SUIT_COLORS[suit] || '#333';
+                    return (
+                      <div key={i} className="street-card" style={{ backgroundColor: bgColor }}>
+                        <span className="card-rank">{rank}</span>
+                        <span className="card-suit">{SUIT_SYMBOLS[suit] || '?'}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+
             state.action_history.forEach((rec, idx) => {
-              // Insert board cards at street transitions
+              // Insert street block at transitions
               if (rec.street !== prevStreet && prevStreet !== '') {
-                const boardCards = prevStreet === 'Preflop' ? board.slice(0, 3)
+                const cards = prevStreet === 'Preflop' ? board.slice(0, 3)
                   : prevStreet === 'Flop' ? board.slice(3, 4)
                   : prevStreet === 'Turn' ? board.slice(4, 5)
                   : [];
-                if (boardCards.length > 0) {
-                  elems.push(
-                    <div key={`board-${prevStreet}`} style={{ display: 'flex', alignItems: 'center' }}>
-                      <BoardCards cards={boardCards} />
-                    </div>
-                  );
+                if (cards.length > 0) {
+                  const nextStreet = rec.street;
+                  elems.push(streetBlock(nextStreet, cards));
                 }
               }
               prevStreet = rec.street;
 
-              // Render as a compact history action block
+              // Full ActionBlock with all available actions, selected highlighted
               elems.push(
-                <div
+                <ActionBlock
                   key={`action-${idx}`}
-                  className="action-block"
-                  style={{ cursor: 'pointer', opacity: 0.8 }}
-                  onClick={() => rewindTo(idx)}
-                  title="Click to rewind here"
-                >
-                  <div className="action-block-header">
-                    <span className="position">{rec.position}</span>
-                  </div>
-                  <div className="action-list">
-                    <button className="action-button selected" style={{ borderLeft: '3px solid #666' }}>
-                      {rec.label}
-                    </button>
-                  </div>
-                </div>
+                  position={rec.position}
+                  stack={rec.stack}
+                  pot={rec.pot}
+                  actions={rec.actions.length > 0 ? rec.actions : [{ id: rec.action_id, label: rec.label, action_type: 'bet' }]}
+                  selectedAction={rec.action_id}
+                  onSelect={() => rewindTo(idx)}
+                  onHeaderClick={() => rewindTo(idx)}
+                  isCurrent={false}
+                />
               );
             });
 
-            // Board cards after last street transition (if at chance/decision on new street)
-            if (prevStreet && prevStreet !== state.street) {
-              const boardCards = prevStreet === 'Preflop' ? board.slice(0, 3)
+            // Street block after last action if we transitioned to a new street
+            if (prevStreet && prevStreet !== state.street && !state.is_chance) {
+              const cards = prevStreet === 'Preflop' ? board.slice(0, 3)
                 : prevStreet === 'Flop' ? board.slice(3, 4)
                 : prevStreet === 'Turn' ? board.slice(4, 5)
                 : [];
-              if (boardCards.length > 0) {
-                elems.push(
-                  <div key={`board-${prevStreet}-end`} style={{ display: 'flex', alignItems: 'center' }}>
-                    <BoardCards cards={boardCards} />
-                  </div>
-                );
+              if (cards.length > 0) {
+                elems.push(streetBlock(state.street, cards));
               }
             }
 
             return elems;
           })()}
+
+          {/* Card picker shown as street block when at chance node */}
+          {state.is_chance && (
+            <div className="street-block pending">
+              <div className="street-block-header">
+                <span className="street-name">{nextStreetLabel}</span>
+              </div>
+            </div>
+          )}
 
           {/* Current action block (non-terminal, non-chance) */}
           {!state.is_terminal && !state.is_chance && matrixActions.length > 0 && (

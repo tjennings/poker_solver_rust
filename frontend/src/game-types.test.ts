@@ -38,6 +38,7 @@ describe('GameState types', () => {
       street: 'Preflop',
       pot: 3,
       stack: 199,
+      actions: [action],
     };
 
     const state: GameState = {

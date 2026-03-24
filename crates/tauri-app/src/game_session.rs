@@ -35,6 +35,8 @@ pub struct ActionRecord {
     pub street: String,
     pub pot: i32,
     pub stack: i32,
+    /// All actions that were available at this decision point.
+    pub actions: Vec<GameAction>,
 }
 
 /// Solve progress info (when a subgame solve is running).
@@ -412,16 +414,20 @@ impl GameSession {
             ));
         }
 
-        // Record breadcrumb.
+        // Record breadcrumb with all available actions.
         let position = self.position_label(player).to_string();
         let pot = self.compute_pot();
+        let all_actions = build_game_actions(&actions);
+        let wi = self.weight_index(player);
+        let stack = self.compute_stacks()[wi];
         self.action_history.push(ActionRecord {
             action_id: action_id.to_string(),
             label: format_tree_action(&actions[action_idx]),
             position,
             street: street_to_string(street),
             pot,
-            stack: 0,
+            stack,
+            actions: all_actions,
         });
 
         // Update acting player's range weights.
@@ -1049,6 +1055,7 @@ mod tests {
             street: "Preflop".to_string(),
             pot: 3,
             stack: 100,
+            actions: vec![],
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("Fold"));

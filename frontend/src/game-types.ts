@@ -5,6 +5,7 @@ export interface ActionRecord {
   street: string;
   pot: number;
   stack: number;
+  actions: GameAction[];  // all available actions at this decision point
 }
 
 export interface SolveStatus {
