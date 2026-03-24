@@ -1327,10 +1327,11 @@ pub fn blueprint_propagate_ranges(
         // Slice board to the correct length for this node's street.
         let board_slice = board_for_street_slice(&board_cards, street);
 
-        let weights = if player == 0 {
-            &mut oop_weights
-        } else {
+        // V2 convention: player 0 = SB (IP), player 1 = BB (OOP).
+        let weights = if player == tree.dealer {
             &mut ip_weights
+        } else {
+            &mut oop_weights
         };
 
         let lookup = BucketLookup {
