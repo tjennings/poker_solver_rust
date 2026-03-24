@@ -2,7 +2,6 @@ import { useState, useCallback, useMemo, useEffect } from 'react';
 import { invoke } from './invoke';
 import type {
   GameState,
-  ActionRecord,
 } from './game-types';
 import { HandCell, CellDetail, ActionBlock } from './Explorer';
 import { toMatrixCell } from './game-explorer-utils';
@@ -119,61 +118,7 @@ function BoardCards({ cards }: { cards: string[] }) {
   );
 }
 
-// ── Action history breadcrumbs ──────────────────────────────────────────
-
-function HistoryBreadcrumbs({
-  history,
-  onRewind,
-}: {
-  history: ActionRecord[];
-  onRewind: (index: number) => void;
-}) {
-  if (history.length === 0) return null;
-
-  // Group actions by street
-  let currentStreet = '';
-  const groups: { street: string; actions: (ActionRecord & { idx: number })[] }[] = [];
-
-  history.forEach((rec, idx) => {
-    if (rec.street !== currentStreet) {
-      currentStreet = rec.street;
-      groups.push({ street: currentStreet, actions: [] });
-    }
-    groups[groups.length - 1].actions.push({ ...rec, idx });
-  });
-
-  return (
-    <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap', alignItems: 'center' }}>
-      {groups.map((group, gi) => (
-        <div key={gi} style={{ display: 'flex', gap: '0.25rem', alignItems: 'center' }}>
-          <span style={{ fontSize: '0.6rem', color: '#f59e0b', fontWeight: 600 }}>
-            {group.street}
-          </span>
-          {group.actions.map((rec) => (
-            <button
-              key={rec.idx}
-              className="action-button"
-              style={{
-                padding: '2px 6px',
-                fontSize: '0.6rem',
-                background: 'rgba(255,255,255,0.06)',
-                border: '1px solid #333',
-                borderRadius: '3px',
-                color: '#ccc',
-                cursor: 'pointer',
-              }}
-              onClick={() => onRewind(rec.idx)}
-              title={`${rec.position}: ${rec.label}`}
-            >
-              <span style={{ color: '#00d9ff', marginRight: '3px' }}>{rec.position}</span>
-              {rec.label}
-            </button>
-          ))}
-        </div>
-      ))}
-    </div>
-  );
-}
+// (HistoryBreadcrumbs removed — action history now rendered inline as ActionBlocks)
 
 // ── Solve progress bar ──────────────────────────────────────────────────
 
@@ -497,14 +442,67 @@ export default function GameExplorer() {
             </button>
           </div>
 
-          {/* Board cards */}
-          {state.board.length > 0 && <BoardCards cards={state.board} />}
+          {/* Action history as full ActionBlocks with board cards between streets */}
+          {(() => {
+            const elems: JSX.Element[] = [];
+            let prevStreet = '';
+            const board = state.board;
 
-          {/* History breadcrumbs */}
-          <HistoryBreadcrumbs
-            history={state.action_history}
-            onRewind={rewindTo}
-          />
+            state.action_history.forEach((rec, idx) => {
+              // Insert board cards at street transitions
+              if (rec.street !== prevStreet && prevStreet !== '') {
+                const boardCards = prevStreet === 'Preflop' ? board.slice(0, 3)
+                  : prevStreet === 'Flop' ? board.slice(3, 4)
+                  : prevStreet === 'Turn' ? board.slice(4, 5)
+                  : [];
+                if (boardCards.length > 0) {
+                  elems.push(
+                    <div key={`board-${prevStreet}`} style={{ display: 'flex', alignItems: 'center' }}>
+                      <BoardCards cards={boardCards} />
+                    </div>
+                  );
+                }
+              }
+              prevStreet = rec.street;
+
+              // Render as a compact history action block
+              elems.push(
+                <div
+                  key={`action-${idx}`}
+                  className="action-block"
+                  style={{ cursor: 'pointer', opacity: 0.8 }}
+                  onClick={() => rewindTo(idx)}
+                  title="Click to rewind here"
+                >
+                  <div className="action-block-header">
+                    <span className="position">{rec.position}</span>
+                  </div>
+                  <div className="action-list">
+                    <button className="action-button selected" style={{ borderLeft: '3px solid #666' }}>
+                      {rec.label}
+                    </button>
+                  </div>
+                </div>
+              );
+            });
+
+            // Board cards after last street transition (if at chance/decision on new street)
+            if (prevStreet && prevStreet !== state.street) {
+              const boardCards = prevStreet === 'Preflop' ? board.slice(0, 3)
+                : prevStreet === 'Flop' ? board.slice(3, 4)
+                : prevStreet === 'Turn' ? board.slice(4, 5)
+                : [];
+              if (boardCards.length > 0) {
+                elems.push(
+                  <div key={`board-${prevStreet}-end`} style={{ display: 'flex', alignItems: 'center' }}>
+                    <BoardCards cards={boardCards} />
+                  </div>
+                );
+              }
+            }
+
+            return elems;
+          })()}
 
           {/* Current action block (non-terminal, non-chance) */}
           {!state.is_terminal && !state.is_chance && matrixActions.length > 0 && (
