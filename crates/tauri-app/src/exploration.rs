@@ -2656,10 +2656,11 @@ pub fn get_preflop_ranges_core(
                 as usize;
 
             // Select which player's weights to update.
-            let weights = if player == 0 {
-                &mut oop_weights
-            } else {
+            // V2 convention: player 0 = SB (IP), player 1 = BB (OOP).
+            let weights = if player == tree.dealer {
                 &mut ip_weights
+            } else {
+                &mut oop_weights
             };
 
             for (hand_idx, w) in weights.iter_mut().enumerate() {
