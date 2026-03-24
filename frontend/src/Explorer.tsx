@@ -1,8 +1,6 @@
-import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import { useState, useCallback, useMemo, useEffect } from 'react';
 import { invoke } from './invoke';
-import PostflopExplorer from './PostflopExplorer';
 import {
-  BlueprintConfig,
   BundleInfo,
   CanonicalizeResult,
   HandEquity,
@@ -590,11 +588,8 @@ export default function Explorer() {
       .catch(() => setHandEquity(null));
   }, [matrix, selectedCell, bundleInfo, villainHand]);
 
-  const [showPostflop, setShowPostflop] = useState(false);
   const [showBlueprintPicker, setShowBlueprintPicker] = useState(false);
   const [blueprints, setBlueprints] = useState<BlueprintListEntry[]>([]);
-  const [blueprintPostflopConfig, setBlueprintPostflopConfig] = useState<BlueprintConfig | null>(null);
-  const blueprintPostflopConfigRef = useRef<BlueprintConfig | null>(null);
 
   const handleLoadStrategy = async () => {
     const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
@@ -724,26 +719,6 @@ export default function Explorer() {
               return;
             }
 
-            const FULL_RANGE = 'AA,KK,QQ,JJ,TT,99,88,77,66,55,44,33,22,AKs,AQs,AJs,ATs,A9s,A8s,A7s,A6s,A5s,A4s,A3s,A2s,KQs,KJs,KTs,K9s,K8s,K7s,K6s,K5s,K4s,K3s,K2s,QJs,QTs,Q9s,Q8s,Q7s,Q6s,Q5s,Q4s,Q3s,Q2s,JTs,J9s,J8s,J7s,J6s,J5s,J4s,J3s,J2s,T9s,T8s,T7s,T6s,T5s,T4s,T3s,T2s,98s,97s,96s,95s,94s,93s,92s,87s,86s,85s,84s,83s,82s,76s,75s,74s,73s,72s,65s,64s,63s,62s,54s,53s,52s,43s,42s,32s,AKo,AQo,AJo,ATo,A9o,A8o,A7o,A6o,A5o,A4o,A3o,A2o,KQo,KJo,KTo,K9o,K8o,K7o,K6o,K5o,K4o,K3o,K2o,QJo,QTo,Q9o,Q8o,Q7o,Q6o,Q5o,Q4o,Q3o,Q2o,JTo,J9o,J8o,J7o,J6o,J5o,J4o,J3o,J2o,T9o,T8o,T7o,T6o,T5o,T4o,T3o,T2o,98o,97o,96o,95o,94o,93o,92o,87o,86o,85o,84o,83o,82o,76o,75o,74o,73o,72o,65o,64o,63o,62o,54o,53o,52o,43o,42o,32o';
-            const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
-            const bpConfig: BlueprintConfig = {
-              oop_range: FULL_RANGE,
-              ip_range: FULL_RANGE,
-              oop_weights: ranges.oop_weights,
-              ip_weights: ranges.ip_weights,
-              pot: Math.round(ranges.pot * 2),
-              effective_stack: Math.round(ranges.effective_stack * 2),
-              oop_bet_sizes: ranges.oop_bet_sizes,
-              oop_raise_sizes: ranges.oop_raise_sizes,
-              ip_bet_sizes: ranges.ip_bet_sizes,
-              ip_raise_sizes: ranges.ip_raise_sizes,
-              blueprint_dir: globalConfig.blueprint_dir || '',
-              rake_rate: ranges.rake_rate,
-              rake_cap: ranges.rake_cap,
-              abstract_node_idx: ranges.abstract_node_idx,
-            };
-            setBlueprintPostflopConfig(bpConfig);
-            blueprintPostflopConfigRef.current = bpConfig;
           } catch (e) {
             setError(String(e));
             return;
@@ -816,16 +791,6 @@ export default function Explorer() {
         // Canonicalize the board cards via backend
         const result = await invoke<CanonicalizeResult>('canonicalize_board', { cards });
         const canonicalCards = result.canonical_cards;
-
-        // Blueprint preflop → postflop: transition to PostflopExplorer with board pre-filled
-        if (blueprintPostflopConfigRef.current) {
-          const withBoard = { ...blueprintPostflopConfigRef.current, board: canonicalCards };
-          setBlueprintPostflopConfig(withBoard);
-          blueprintPostflopConfigRef.current = withBoard;
-          setPendingStreet(null);
-          setShowPostflop(true);
-          return;
-        }
 
         // Track remap info for the indicator.
         setRemapInfo((prev) => {
@@ -1033,7 +998,6 @@ export default function Explorer() {
     <div className="explorer">
       {error && <div className="error">{error}</div>}
 
-      {!showPostflop && (
       <div className="action-strip">
         <div className="dataset-switcher-split">
           <div className="dataset-switcher-half" onClick={handleLoadStrategy} title="Load Strategy">
@@ -1041,12 +1005,6 @@ export default function Explorer() {
               <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
               <line x1="12" y1="11" x2="12" y2="17" />
               <line x1="9" y1="14" x2="15" y2="14" />
-            </svg>
-          </div>
-          <div className="dataset-switcher-half" onClick={() => setShowPostflop(true)} title="Range Solve">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="2" y="2" width="20" height="20" rx="2" />
-              <path d="M7 12h10M12 7v10" />
             </svg>
           </div>
         </div>
@@ -1110,9 +1068,8 @@ export default function Explorer() {
         </>
       )}
       </div>
-      )}
 
-      {!showPostflop && bundleInfo && matrix && (
+      {bundleInfo && matrix && (
             <div className="range-toolbar">
               <button
                 className={`range-edit-btn ${editingPlayer === 0 ? 'active' : ''}`}
@@ -1141,7 +1098,7 @@ export default function Explorer() {
             </div>
           )}
 
-      {!showPostflop && bundleInfo && matrix && (
+      {bundleInfo && matrix && (
             <div className="matrix-container">
               <div className="matrix-with-detail">
                 <div className="hand-matrix">
@@ -1250,7 +1207,7 @@ export default function Explorer() {
             </div>
           )}
 
-      {!showPostflop && bundleInfo && !matrix && pendingStreet && (
+      {bundleInfo && !matrix && pendingStreet && (
         <div className="card-picker-container">
           <p className="card-picker-prompt">
             Select {pendingStreet.street.toLowerCase()} card{pendingStreet.expectedCards > 1 ? 's' : ''}
@@ -1263,7 +1220,7 @@ export default function Explorer() {
         </div>
       )}
 
-      {!showPostflop && bundleInfo && handResult && (
+      {bundleInfo && handResult && (
         <div className="hand-complete">
           <p className="hand-complete-result">
             {handResult.type === 'fold' ? 'Player folded' : 'Showdown'} — Pot: {handResult.pot}
@@ -1332,20 +1289,6 @@ export default function Explorer() {
           )}
         </div>
         </div>
-      )}
-
-      {showPostflop && (
-        <PostflopExplorer
-          onBack={(preflopIdx?: number) => {
-            setShowPostflop(false);
-            setBlueprintPostflopConfig(null);
-            if (preflopIdx !== undefined) {
-              handleHistoryRewind(preflopIdx);
-            }
-          }}
-          blueprintConfig={blueprintPostflopConfig ?? undefined}
-          preflopHistory={historyItems}
-        />
       )}
 
       {loading && <div className="loading">Loading...</div>}
