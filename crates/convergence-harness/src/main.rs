@@ -1,13 +1,5 @@
-mod baseline;
-mod comparison;
-mod evaluator;
-mod game;
-mod harness;
-mod reporter;
-mod solver_trait;
-mod solvers;
-
 use clap::{Parser, Subcommand};
+use convergence_harness::{baseline, comparison, harness, reporter};
 
 #[derive(Parser)]
 #[command(name = "convergence-harness")]
