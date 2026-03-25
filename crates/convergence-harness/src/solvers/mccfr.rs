@@ -24,6 +24,7 @@ use poker_solver_core::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
+use crate::baseline::Baseline;
 use crate::game::FlopPokerConfig;
 use crate::solver_trait::{ComboEvMap, ConvergenceSolver, SolverMetrics, StrategyMap};
 
@@ -460,6 +461,245 @@ pub fn lock_strategy_recursive(
         history.push(action_idx);
         game.play(action_idx);
         lock_strategy_recursive(game, tree, storage, bp_child_idx, history);
+        history.pop();
+        crate::evaluator::navigate_back(game, history);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Head-to-head EV computation
+// ---------------------------------------------------------------------------
+
+/// Compute head-to-head EV: exact baseline vs MCCFR strategy.
+///
+/// Builds two range-solver games. In each, one player uses the exact baseline
+/// strategy and the other uses the MCCFR (lifted bucket) strategy. The EV
+/// difference from the Nash value measures how much the MCCFR strategy loses.
+///
+/// Returns `(oop_loss, ip_loss, average)` in mbb/hand where each loss is
+/// how much the MCCFR player loses when playing that position against the
+/// exact strategy.
+pub fn compute_head_to_head_ev(
+    solver: &MccfrSolver,
+    baseline: &Baseline,
+    config: &FlopPokerConfig,
+) -> Result<(f64, f64, f64), String> {
+    let rs_config = FlopPokerConfig {
+        add_allin_threshold: 100.0,
+        force_allin_threshold: 0.0,
+        ..config.clone()
+    };
+
+    // Compute Nash EV: both players use baseline strategy
+    let nash_ev = {
+        let mut game = crate::game::build_flop_poker_game_with_config(&rs_config)?;
+        game.allocate_memory(false);
+        lock_baseline_strategy(&mut game, &baseline.strategy);
+        range_solver::compute_current_ev(&game)
+    };
+
+    let bp_flop_root = find_flop_root(solver.tree());
+
+    // MCCFR as OOP (player 0), baseline as IP (player 1)
+    let ev_mccfr_oop = {
+        let mut game = crate::game::build_flop_poker_game_with_config(&rs_config)?;
+        game.allocate_memory(false);
+        let mut history = Vec::new();
+        lock_head_to_head_recursive(
+            &mut game,
+            solver.tree(),
+            solver.storage(),
+            &baseline.strategy,
+            bp_flop_root,
+            &mut history,
+            0, // mccfr plays OOP
+        );
+        range_solver::compute_current_ev(&game)
+    };
+
+    // MCCFR as IP (player 1), baseline as OOP (player 0)
+    let ev_mccfr_ip = {
+        let mut game = crate::game::build_flop_poker_game_with_config(&rs_config)?;
+        game.allocate_memory(false);
+        let mut history = Vec::new();
+        lock_head_to_head_recursive(
+            &mut game,
+            solver.tree(),
+            solver.storage(),
+            &baseline.strategy,
+            bp_flop_root,
+            &mut history,
+            1, // mccfr plays IP
+        );
+        range_solver::compute_current_ev(&game)
+    };
+
+    // OOP loss: how much MCCFR loses as OOP compared to Nash
+    // Nash EV for OOP is nash_ev[0]. Head-to-head EV for MCCFR-OOP is ev_mccfr_oop[0].
+    // Loss = nash_ev[0] - ev_mccfr_oop[0] (positive means MCCFR is worse)
+    let oop_loss_raw = (nash_ev[0] - ev_mccfr_oop[0]) as f64;
+    let ip_loss_raw = (nash_ev[1] - ev_mccfr_ip[1]) as f64;
+
+    // Convert to mbb/hand: multiply by 1000 (milli big blinds)
+    let oop_loss_mbb = oop_loss_raw * 1000.0;
+    let ip_loss_mbb = ip_loss_raw * 1000.0;
+    let avg_mbb = (oop_loss_mbb + ip_loss_mbb) / 2.0;
+
+    Ok((oop_loss_mbb, ip_loss_mbb, avg_mbb))
+}
+
+/// Lock the baseline (exact) strategy at every decision node in the
+/// range-solver game tree.
+fn lock_baseline_strategy(
+    game: &mut range_solver::PostFlopGame,
+    baseline_strategy: &std::collections::BTreeMap<u64, Vec<f32>>,
+) {
+    let mut history = Vec::new();
+    lock_baseline_recursive(game, baseline_strategy, &mut history);
+    game.back_to_root();
+}
+
+/// Recursively walk the range-solver tree, locking the baseline strategy
+/// at every decision node.
+fn lock_baseline_recursive(
+    game: &mut range_solver::PostFlopGame,
+    baseline_strategy: &std::collections::BTreeMap<u64, Vec<f32>>,
+    history: &mut Vec<usize>,
+) {
+    if game.is_terminal_node() {
+        return;
+    }
+
+    if game.is_chance_node() {
+        let num_chance_actions = game.available_actions().len();
+        for i in 0..num_chance_actions {
+            let actions = game.available_actions();
+            if let range_solver::action_tree::Action::Chance(card) = actions[i] {
+                history.push(card as usize);
+                game.play(card as usize);
+                lock_baseline_recursive(game, baseline_strategy, history);
+                history.pop();
+                crate::evaluator::navigate_back(game, history);
+            }
+        }
+        return;
+    }
+
+    // Decision node: lock the baseline strategy
+    let nid = crate::evaluator::node_id(history);
+    if let Some(strat) = baseline_strategy.get(&nid) {
+        game.lock_current_strategy(strat);
+    }
+
+    let num_actions = game.available_actions().len();
+    for action_idx in 0..num_actions {
+        history.push(action_idx);
+        game.play(action_idx);
+        lock_baseline_recursive(game, baseline_strategy, history);
+        history.pop();
+        crate::evaluator::navigate_back(game, history);
+    }
+}
+
+/// Recursively walk both trees, locking MCCFR strategy for `mccfr_player`
+/// and baseline strategy for the other player at each decision node.
+fn lock_head_to_head_recursive(
+    game: &mut range_solver::PostFlopGame,
+    tree: &GameTree,
+    storage: &BlueprintStorage,
+    baseline_strategy: &std::collections::BTreeMap<u64, Vec<f32>>,
+    bp_node_idx: u32,
+    history: &mut Vec<usize>,
+    mccfr_player: usize,
+) {
+    if game.is_terminal_node() {
+        return;
+    }
+
+    if game.is_chance_node() {
+        let bp_child = match &tree.nodes[bp_node_idx as usize] {
+            GameNode::Chance { child, .. } => *child,
+            other => panic!(
+                "Expected blueprint Chance node at idx {}, got {:?}",
+                bp_node_idx,
+                std::mem::discriminant(other)
+            ),
+        };
+
+        let num_chance_actions = game.available_actions().len();
+        for i in 0..num_chance_actions {
+            let actions = game.available_actions();
+            if let range_solver::action_tree::Action::Chance(card) = actions[i] {
+                history.push(card as usize);
+                game.play(card as usize);
+                lock_head_to_head_recursive(
+                    game,
+                    tree,
+                    storage,
+                    baseline_strategy,
+                    bp_child,
+                    history,
+                    mccfr_player,
+                );
+                history.pop();
+                crate::evaluator::navigate_back(game, history);
+            }
+        }
+        return;
+    }
+
+    // Decision node
+    let bp_node = &tree.nodes[bp_node_idx as usize];
+    let (bp_actions, bp_children) = match bp_node {
+        GameNode::Decision {
+            actions, children, ..
+        } => (actions, children),
+        other => panic!(
+            "Expected blueprint Decision node at idx {}, got {:?}",
+            bp_node_idx,
+            std::mem::discriminant(other)
+        ),
+    };
+
+    let rs_actions = game.available_actions();
+    let num_actions = rs_actions.len();
+    assert_eq!(
+        num_actions,
+        bp_actions.len(),
+        "Action count mismatch at history {:?}: range-solver has {}, blueprint has {}",
+        history,
+        num_actions,
+        bp_actions.len()
+    );
+
+    let player = game.current_player();
+    if player == mccfr_player {
+        // Lock MCCFR lifted strategy
+        let combos = game.private_cards(player);
+        let strategy =
+            lift_bucket_strategy_for_node(storage, bp_node_idx, num_actions, combos);
+        game.lock_current_strategy(&strategy);
+    } else {
+        // Lock baseline strategy
+        let nid = crate::evaluator::node_id(history);
+        if let Some(strat) = baseline_strategy.get(&nid) {
+            game.lock_current_strategy(strat);
+        }
+    }
+
+    // Recurse into children
+    for (action_idx, &bp_child_idx) in bp_children.iter().enumerate() {
+        history.push(action_idx);
+        game.play(action_idx);
+        lock_head_to_head_recursive(
+            game,
+            tree,
+            storage,
+            baseline_strategy,
+            bp_child_idx,
+            history,
+            mccfr_player,
+        );
         history.pop();
         crate::evaluator::navigate_back(game, history);
     }

@@ -116,7 +116,7 @@ fn test_mccfr_pipeline_end_to_end() {
 #[test]
 fn test_run_mccfr_solver_produces_baseline() {
     let checkpoints = vec![1000, 3000, 5000];
-    let result = convergence_harness::harness::run_mccfr_solver(5000, &checkpoints).unwrap();
+    let result = convergence_harness::harness::run_mccfr_solver(5000, &checkpoints, None).unwrap();
 
     // Should have convergence samples at each checkpoint
     assert!(

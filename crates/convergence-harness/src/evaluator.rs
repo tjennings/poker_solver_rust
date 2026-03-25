@@ -4,7 +4,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 /// Compute a stable node ID from an action history.
-fn node_id(history: &[usize]) -> u64 {
+pub(crate) fn node_id(history: &[usize]) -> u64 {
     let mut hasher = DefaultHasher::new();
     history.hash(&mut hasher);
     hasher.finish()

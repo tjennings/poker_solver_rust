@@ -5,7 +5,7 @@ use crate::evaluator;
 use crate::game::{build_flop_poker_game_with_config, FlopPokerConfig};
 use crate::solver_trait::ConvergenceSolver;
 use crate::solvers::exhaustive::ExhaustiveSolver;
-use crate::solvers::mccfr::{compute_mccfr_exploitability, MccfrSolver};
+use crate::solvers::mccfr::{compute_head_to_head_ev, compute_mccfr_exploitability, MccfrSolver};
 use crate::strategy_matrix;
 
 /// Determines how often to sample exploitability.
@@ -161,6 +161,23 @@ pub fn generate_mccfr_matching_baseline(
     generate_baseline_with_config_and_checkpoints(&config, 1000, 0.001, Some(checkpoints))
 }
 
+/// Compute head-to-head EV loss of the MCCFR strategy against the exact
+/// baseline strategy, returned as a single average mbb/hand value.
+///
+/// Plays the MCCFR strategy against the exact (baseline) strategy in both
+/// positions and averages the loss. A return value of 0.0 means the MCCFR
+/// strategy is Nash-optimal; positive values indicate how many milli-big-blinds
+/// per hand the MCCFR strategy loses on average.
+pub fn compute_head_to_head_mbb(
+    solver: &MccfrSolver,
+    baseline: &Baseline,
+    config: &FlopPokerConfig,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    let (_oop_loss, _ip_loss, avg) =
+        compute_head_to_head_ev(solver, baseline, config).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    Ok(avg)
+}
+
 /// Run the MCCFR solver and produce a Baseline with convergence data.
 ///
 /// Uses an all-in-only `FlopPokerConfig` because the MCCFR exploitability
@@ -170,9 +187,12 @@ pub fn generate_mccfr_matching_baseline(
 /// `max_iterations` is the total number of MCCFR iterations to run.
 /// `checkpoints` is a sorted list of iteration counts at which to compute
 /// exploitability and record convergence samples.
+/// `baseline` is an optional exact baseline; when provided, head-to-head
+/// mbb/hand loss is computed and printed at each checkpoint.
 pub fn run_mccfr_solver(
     max_iterations: u64,
     checkpoints: &[u64],
+    baseline: Option<&Baseline>,
 ) -> Result<Baseline, Box<dyn std::error::Error>> {
     // All-in-only config: required for tree correspondence in exploitability
     let config = FlopPokerConfig {
@@ -217,12 +237,39 @@ pub fn run_mccfr_solver(
                 elapsed_ms: elapsed,
             });
 
-            eprintln!(
-                "checkpoint: {} iterations, exploitability = {:.4e}, elapsed = {:.1}s",
-                current_iter,
-                expl,
-                elapsed as f64 / 1000.0
-            );
+            if let Some(bl) = baseline {
+                match compute_head_to_head_ev(&solver, bl, &config) {
+                    Ok((oop_loss, ip_loss, avg)) => {
+                        eprintln!(
+                            "checkpoint: {} iterations, exploitability = {:.4e}, \
+                             h2h mbb/hand = {:.2} (OOP {:.2}, IP {:.2}), elapsed = {:.1}s",
+                            current_iter,
+                            expl,
+                            avg,
+                            oop_loss,
+                            ip_loss,
+                            elapsed as f64 / 1000.0
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "checkpoint: {} iterations, exploitability = {:.4e}, \
+                             h2h error: {}, elapsed = {:.1}s",
+                            current_iter,
+                            expl,
+                            e,
+                            elapsed as f64 / 1000.0
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "checkpoint: {} iterations, exploitability = {:.4e}, elapsed = {:.1}s",
+                    current_iter,
+                    expl,
+                    elapsed as f64 / 1000.0
+                );
+            }
 
             checkpoint_idx += 1;
         }

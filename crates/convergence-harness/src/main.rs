@@ -193,7 +193,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Baseline saved to: {}\n", baseline_dir);
             }
 
-            let result = harness::run_mccfr_solver(iterations, &checkpoint_iters)?;
+            // Load baseline for head-to-head EV computation during run
+            let loaded_baseline = baseline::Baseline::load(baseline_path).ok();
+            let result = harness::run_mccfr_solver(
+                iterations,
+                &checkpoint_iters,
+                loaded_baseline.as_ref(),
+            )?;
 
             println!("\n=== MCCFR Run Summary ===");
             println!("Solver: {}", result.summary.solver_name);

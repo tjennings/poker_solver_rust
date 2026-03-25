@@ -16,6 +16,6 @@ pub(crate) mod hand;
 
 // Convenience re-exports
 pub use game::PostFlopGame;
-pub use solver::{solve, solve_step, compute_exploitability, compute_average, finalize};
+pub use solver::{solve, solve_step, compute_exploitability, compute_average, compute_current_ev, finalize};
 pub use card::CardConfig;
 pub use action_tree::{Action, ActionTree, TreeConfig, BoardState, PLAYER_DEPTH_BOUNDARY_FLAG};
