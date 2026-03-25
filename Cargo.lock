@@ -1251,6 +1251,7 @@ dependencies = [
  "clap",
  "csv",
  "poker-solver-core",
+ "rand 0.9.2",
  "range-solver",
  "serde",
  "serde_json",
