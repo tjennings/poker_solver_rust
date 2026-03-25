@@ -157,8 +157,8 @@ pub fn generate_mccfr_matching_baseline(
         raise_sizes: "a".into(),
         ..Default::default()
     };
-    let max_iter = checkpoints.last().copied().unwrap_or(1000) as u32;
-    generate_baseline_with_config_and_checkpoints(&config, max_iter, 0.001, Some(checkpoints))
+    // Exact DCFR converges fast — 1000 iterations is plenty. Stop early at target.
+    generate_baseline_with_config_and_checkpoints(&config, 1000, 0.001, Some(checkpoints))
 }
 
 /// Run the MCCFR solver and produce a Baseline with convergence data.
