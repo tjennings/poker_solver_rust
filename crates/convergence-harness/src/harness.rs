@@ -5,6 +5,7 @@ use crate::evaluator;
 use crate::game::{build_flop_poker_game_with_config, FlopPokerConfig};
 use crate::solver_trait::ConvergenceSolver;
 use crate::solvers::exhaustive::ExhaustiveSolver;
+use crate::strategy_matrix;
 
 /// Determines how often to sample exploitability.
 /// Dense early, sparse later.
@@ -87,8 +88,11 @@ pub fn generate_baseline_with_config(
     println!("\nFinalizing solver (computing EVs and normalizing strategy)...");
     solver.finalize();
 
-    println!("Extracting strategy and combo EVs...");
     let mut game = solver.into_game();
+    game.back_to_root();
+    strategy_matrix::print_strategy_matrix(&game, 0);
+
+    println!("Extracting strategy and combo EVs...");
     let strategy = evaluator::extract_strategy(&mut game);
     let combo_evs = evaluator::extract_combo_evs(&mut game);
 

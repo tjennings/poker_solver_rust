@@ -6,3 +6,4 @@ pub mod harness;
 pub mod reporter;
 pub mod solver_trait;
 pub mod solvers;
+pub mod strategy_matrix;
