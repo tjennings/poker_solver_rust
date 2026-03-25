@@ -217,6 +217,10 @@ fn build_mccfr_config(
             target_strategy_delta: None,
             purify_threshold: 0.0,
             equity_cache_path: None,
+            use_baselines: false,
+            baseline_alpha: 0.01,
+            optimizer: "dcfr".to_string(),
+            sapcfr_eta: 0.5,
         },
         snapshots: SnapshotConfig {
             warmup_minutes: 9999,
@@ -999,6 +1003,7 @@ impl ConvergenceSolver for MccfrSolver {
                 0.0,
                 None,
                 None,
+                0.0,
             );
             traverse_external(
                 &self.tree,
@@ -1013,6 +1018,7 @@ impl ConvergenceSolver for MccfrSolver {
                 0.0,
                 None,
                 None,
+                0.0,
             );
         }
         self.iteration += BATCH_SIZE;

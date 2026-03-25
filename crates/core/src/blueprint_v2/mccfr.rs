@@ -621,6 +621,7 @@ impl ScenarioEvTracker {
 /// * `rake_cap` - Maximum rake in chip units (0.0 = no cap)
 /// * `ev_tracker` - Optional per-scenario EV tracker for TUI display
 /// * `full_ev_tracker` - Optional full-tree EV tracker for all decision nodes
+/// * `baseline_alpha` - EMA learning rate for VR-MCCFR baselines (0.0 = disabled)
 #[allow(clippy::too_many_arguments)]
 pub fn traverse_external(
     tree: &GameTree,
@@ -635,6 +636,7 @@ pub fn traverse_external(
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
     full_ev_tracker: Option<&FullTreeEvTracker>,
+    baseline_alpha: f64,
 ) -> (f64, PruneStats) {
     match &tree.nodes[node_idx as usize] {
         GameNode::Terminal { kind, pot, stacks } => {
@@ -645,7 +647,7 @@ pub fn traverse_external(
             // Board cards are pre-dealt in the Deal; just recurse.
             traverse_external(
                 tree, storage, deal, traverser, *child, prune, prune_threshold, rng,
-                rake_rate, rake_cap, ev_tracker, full_ev_tracker,
+                rake_rate, rake_cap, ev_tracker, full_ev_tracker, baseline_alpha,
             )
         }
 
@@ -678,6 +680,7 @@ pub fn traverse_external(
                     rake_cap,
                     ev_tracker,
                     full_ev_tracker,
+                    baseline_alpha,
                 )
             } else {
                 traverse_opponent(
@@ -696,6 +699,7 @@ pub fn traverse_external(
                     rake_cap,
                     ev_tracker,
                     full_ev_tracker,
+                    baseline_alpha,
                 )
             }
         }
@@ -788,6 +792,7 @@ fn traverse_traverser(
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
     full_ev_tracker: Option<&FullTreeEvTracker>,
+    baseline_alpha: f64,
 ) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
@@ -813,7 +818,7 @@ fn traverse_traverser(
 
         let (child_ev, child_stats) = traverse_external(
             tree, storage, deal, traverser, child_idx, prune, prune_threshold, rng,
-            rake_rate, rake_cap, ev_tracker, full_ev_tracker,
+            rake_rate, rake_cap, ev_tracker, full_ev_tracker, baseline_alpha,
         );
         action_values[a] = child_ev;
         node_value += strategy[a] * child_ev;
@@ -822,12 +827,15 @@ fn traverse_traverser(
 
     // Update regrets: delta = action_value - node_value, scaled to
     // integer by ×1000 for precision. Skip pruned actions.
+    // Also store as prediction for SAPCFR+ (no-op when predictions disabled).
     for (a, &av) in action_values.iter().enumerate().take(num_actions) {
         if pruned[a] {
             continue;
         }
         let delta = av - node_value;
-        storage.add_regret(node_idx, bucket, a, (delta * 1000.0) as i32);
+        let delta_i32 = (delta * 1000.0) as i32;
+        storage.add_regret(node_idx, bucket, a, delta_i32);
+        storage.set_prediction(node_idx, bucket, a, delta_i32);
     }
 
     // Accumulate strategy sums (for computing the average strategy).
@@ -855,8 +863,32 @@ fn traverse_traverser(
     (node_value, stats)
 }
 
+/// Compute baseline-corrected value for VR-MCCFR (Schmid et al., AAAI 2019).
+///
+/// Formula: `v = sum(strategy[a] * baseline[a]) + (v_sampled - baseline[a_sampled])`
+///
+/// When baselines are all zero, this degenerates to `v_sampled` (standard sampling).
+/// When baselines are accurate, the correction term is small, reducing variance.
+#[inline]
+fn baseline_corrected_value(
+    strategy: &[f64],
+    baselines: &[f64],
+    a_sampled: usize,
+    v_sampled: f64,
+) -> f64 {
+    let mut v = 0.0;
+    for (&s, &b) in strategy.iter().zip(baselines.iter()) {
+        v += s * b;
+    }
+    v += v_sampled - baselines[a_sampled];
+    v
+}
+
 /// Opponent's decision node: sample one action according to the
 /// current strategy and recurse.
+///
+/// When `baseline_alpha > 0.0` and baselines are enabled in storage, uses
+/// the VR-MCCFR corrected value formula to reduce sampling variance.
 #[allow(clippy::too_many_arguments)]
 fn traverse_opponent(
     tree: &GameTree,
@@ -874,6 +906,7 @@ fn traverse_opponent(
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
     full_ev_tracker: Option<&FullTreeEvTracker>,
+    baseline_alpha: f64,
 ) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
@@ -891,10 +924,28 @@ fn traverse_opponent(
         }
     }
 
-    traverse_external(
+    let (v_sampled, stats) = traverse_external(
         tree, storage, deal, traverser, children[chosen], prune, prune_threshold, rng,
-        rake_rate, rake_cap, ev_tracker, full_ev_tracker,
-    )
+        rake_rate, rake_cap, ev_tracker, full_ev_tracker, baseline_alpha,
+    );
+
+    // Baseline-corrected value (VR-MCCFR).
+    // Read baselines BEFORE updating so the correction uses the old estimate.
+    let mut baseline_buf = [0.0f64; MAX_ACTIONS];
+    for (a, slot) in baseline_buf[..num_actions].iter_mut().enumerate() {
+        *slot = storage.get_baseline(node_idx, bucket, a);
+    }
+    let v = baseline_corrected_value(
+        strategy,
+        &baseline_buf[..num_actions],
+        chosen,
+        v_sampled,
+    );
+
+    // Update baseline for the sampled action with the observed value.
+    storage.update_baseline(node_idx, bucket, chosen, v_sampled, baseline_alpha);
+
+    (v, stats)
 }
 
 /// Rank a hand (hole + board) using `rs_poker`.
@@ -1112,7 +1163,7 @@ mod tests {
         for _ in 0..20 {
             traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-                &mut rng, 0.0, 0.0, None, Some(&tracker),
+                &mut rng, 0.0, 0.0, None, Some(&tracker), 0.0,
             );
         }
 
@@ -1143,7 +1194,7 @@ mod tests {
         for _ in 0..20 {
             traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-                &mut rng, 0.0, 0.0, Some(&tracker), None,
+                &mut rng, 0.0, 0.0, Some(&tracker), None, 0.0,
             );
         }
 
@@ -1169,7 +1220,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-            &mut rng, 0.0, 0.0, None, None,
+            &mut rng, 0.0, 0.0, None, None, 0.0,
         );
         assert!(ev.is_finite(), "EV should be finite without tracker");
     }
@@ -1230,7 +1281,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None,
+            0.0, 0.0, None, None, 0.0,
         );
         assert!(ev.is_finite(), "EV should be finite, got {ev}");
     }
@@ -1248,11 +1299,11 @@ mod tests {
 
         let (ev0, _) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None,
+            0.0, 0.0, None, None, 0.0,
         );
         let (ev1, _) = traverse_external(
             &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None,
+            0.0, 0.0, None, None, 0.0,
         );
 
         assert!(ev0.is_finite());
@@ -1274,7 +1325,7 @@ mod tests {
 
         let (_ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None,
+            0.0, 0.0, None, None, 0.0,
         );
 
         assert!(
@@ -1296,7 +1347,7 @@ mod tests {
 
         let (_ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None,
+            0.0, 0.0, None, None, 0.0,
         );
 
         assert!(
@@ -1320,11 +1371,11 @@ mod tests {
         for _ in 0..50 {
             let _ = traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-                0.0, 0.0, None, None,
+                0.0, 0.0, None, None, 0.0,
             );
             let _ = traverse_external(
                 &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
-                0.0, 0.0, None, None,
+                0.0, 0.0, None, None, 0.0,
             );
         }
 
@@ -1362,7 +1413,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, true, -310_000_000, &mut rng,
-            0.0, 0.0, None, None,
+            0.0, 0.0, None, None, 0.0,
         );
         assert!(ev.is_finite());
     }
@@ -2224,5 +2275,71 @@ mod tests {
         // Should fall back to equity-based bucketing (returns valid bucket in [0,10))
         let bucket = all.get_bucket(Street::Turn, hole, &turn_board);
         assert!(bucket < 10, "should fall back to equity bucketing, got {bucket}");
+    }
+
+    // --- Baseline-corrected value tests ---
+
+    #[test]
+    fn baseline_corrected_zero_baselines_equals_standard() {
+        // When all baselines are 0, the corrected formula should return
+        // exactly v_sampled (standard external-sampling behavior).
+        let strategy = &[0.4, 0.3, 0.3];
+        let baselines = &[0.0, 0.0, 0.0];
+        let a_sampled = 1;
+        let v_sampled = 5.0;
+        let v = baseline_corrected_value(strategy, baselines, a_sampled, v_sampled);
+        assert!(
+            (v - v_sampled).abs() < 1e-10,
+            "zero baselines should yield v_sampled={v_sampled}, got {v}"
+        );
+    }
+
+    #[test]
+    fn baseline_corrected_perfect_baselines_returns_expected() {
+        // When baseline[a] == Q(a) exactly, the correction term
+        // (v_sampled - baseline[a_sampled]) = 0, so:
+        //   v = sum(strategy[a] * Q(a)) + 0 = EV
+        // This is the ideal case with zero variance.
+        let strategy = &[0.5, 0.3, 0.2];
+        let q_values = &[3.0, 5.0, -1.0]; // "true" action values
+        let a_sampled = 1;
+        let v_sampled = q_values[a_sampled]; // perfect sample
+        let v = baseline_corrected_value(strategy, q_values, a_sampled, v_sampled);
+        let ev = 0.5 * 3.0 + 0.3 * 5.0 + 0.2 * (-1.0); // = 2.8
+        assert!(
+            (v - ev).abs() < 1e-10,
+            "perfect baselines should yield EV={ev}, got {v}"
+        );
+    }
+
+    #[test]
+    fn baseline_corrected_formula_is_correct() {
+        // v = sum(strategy[a] * baseline[a]) + (v_sampled - baseline[a_sampled])
+        let strategy = &[0.6, 0.4];
+        let baselines = &[2.0, 8.0];
+        let a_sampled = 0;
+        let v_sampled = 3.5;
+        let v = baseline_corrected_value(strategy, baselines, a_sampled, v_sampled);
+        // sum = 0.6*2.0 + 0.4*8.0 = 1.2 + 3.2 = 4.4
+        // correction = 3.5 - 2.0 = 1.5
+        // total = 4.4 + 1.5 = 5.9
+        assert!(
+            (v - 5.9).abs() < 1e-10,
+            "expected 5.9, got {v}"
+        );
+    }
+
+    #[test]
+    fn baseline_corrected_single_action() {
+        // With one action, strategy = [1.0], correction cancels out:
+        // v = 1.0*b + (v_sampled - b) = v_sampled
+        let strategy = &[1.0];
+        let baselines = &[99.0]; // arbitrary baseline
+        let v_sampled = 7.0;
+        let v = baseline_corrected_value(strategy, baselines, 0, v_sampled);
+        assert!(
+            (v - 7.0).abs() < 1e-10,
+            "single action should always return v_sampled, got {v}"
+        );
     }
 }

@@ -28,6 +28,7 @@ use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
 use super::mccfr::{traverse_external, AllBuckets, Deal, DealWithBuckets, FullTreeEvTracker, PruneStats, ScenarioEvTracker, PRUNE_HITS, PRUNE_TOTAL};
 use super::storage::BlueprintStorage;
+use crate::cfr::optimizer::{CfrOptimizer, DcfrOptimizer, SapcfrPlusOptimizer};
 use crate::hands::CanonicalHand;
 use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
 
@@ -225,7 +226,31 @@ impl BlueprintTrainer {
             config.clustering.river.buckets,
         ];
 
-        let storage = BlueprintStorage::new(&tree, bucket_counts);
+        let mut storage = BlueprintStorage::new_with_baselines(
+            &tree,
+            bucket_counts,
+            config.training.use_baselines,
+        );
+
+        // Create the pluggable optimizer based on config.
+        let optimizer: Arc<dyn CfrOptimizer> = if config.training.optimizer == "sapcfr+" {
+            Arc::new(SapcfrPlusOptimizer {
+                alpha: config.training.dcfr_alpha,
+                gamma: config.training.dcfr_gamma,
+                eta: config.training.sapcfr_eta,
+            })
+        } else {
+            Arc::new(DcfrOptimizer {
+                alpha: config.training.dcfr_alpha,
+                beta: config.training.dcfr_beta,
+                gamma: config.training.dcfr_gamma,
+            })
+        };
+        if optimizer.needs_predictions() {
+            storage.enable_predictions();
+        }
+        storage.set_optimizer(optimizer);
+
         let bucket_files = match &config.training.cluster_path {
             Some(path) => load_bucket_files(Path::new(path)),
             None => [None, None, None, None],
@@ -495,6 +520,11 @@ impl BlueprintTrainer {
 
             let rake_rate = self.config.game.rake_rate;
             let rake_cap = self.config.game.rake_cap;
+            let baseline_alpha = if self.storage.baselines.is_some() {
+                self.config.training.baseline_alpha
+            } else {
+                0.0
+            };
 
             // Fully parallel: each thread samples its own deal, precomputes
             // buckets, and traverses — no sequential deal generation.
@@ -519,11 +549,13 @@ impl BlueprintTrainer {
                 let (_, s0) = traverse_external(
                     tree, storage, &deal, 0, tree.root, prune, threshold, &mut rng,
                     rake_rate, rake_cap, Some(ev_tracker), Some(full_ev_tracker),
+                    baseline_alpha,
                 );
                 stats.merge(s0);
                 let (_, s1) = traverse_external(
                     tree, storage, &deal, 1, tree.root, prune, threshold, &mut rng,
                     rake_rate, rake_cap, Some(ev_tracker), Some(full_ev_tracker),
+                    baseline_alpha,
                 );
                 stats.merge(s1);
 
@@ -719,27 +751,37 @@ impl BlueprintTrainer {
         let interval = self.config.training.lcfr_discount_interval.max(1);
         let t = self.iterations / interval;
         let t = self.config.training.dcfr_epoch_cap.map_or(t, |cap| t.min(cap));
-        let tf = t as f64;
 
-        let alpha = self.config.training.dcfr_alpha;
-        let beta = self.config.training.dcfr_beta;
-        let gamma = self.config.training.dcfr_gamma;
+        if let Some(ref opt) = self.storage.optimizer {
+            opt.apply_discount(
+                &self.storage.regrets,
+                &self.storage.strategy_sums,
+                self.storage.predictions.as_deref(),
+                t,
+            );
+        } else {
+            // Fallback: inline DCFR (should not happen when optimizer is wired).
+            let tf = t as f64;
+            let alpha = self.config.training.dcfr_alpha;
+            let beta = self.config.training.dcfr_beta;
+            let gamma = self.config.training.dcfr_gamma;
 
-        let t_alpha = tf.powf(alpha);
-        let t_beta = tf.powf(beta);
-        let d_pos = t_alpha / (t_alpha + 1.0);
-        let d_neg = t_beta / (t_beta + 1.0);
-        let d_strat = (tf / (tf + 1.0)).powf(gamma);
+            let t_alpha = tf.powf(alpha);
+            let t_beta = tf.powf(beta);
+            let d_pos = t_alpha / (t_alpha + 1.0);
+            let d_neg = t_beta / (t_beta + 1.0);
+            let d_strat = (tf / (tf + 1.0)).powf(gamma);
 
-        self.storage.regrets.par_iter().for_each(|atom| {
-            let v = atom.load(Ordering::Relaxed);
-            let d = if v >= 0 { d_pos } else { d_neg };
-            atom.store((f64::from(v) * d) as i32, Ordering::Relaxed);
-        });
-        self.storage.strategy_sums.par_iter().for_each(|atom| {
-            let v = atom.load(Ordering::Relaxed);
-            atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
-        });
+            self.storage.regrets.par_iter().for_each(|atom| {
+                let v = atom.load(Ordering::Relaxed);
+                let d = if v >= 0 { d_pos } else { d_neg };
+                atom.store((f64::from(v) * d) as i32, Ordering::Relaxed);
+            });
+            self.storage.strategy_sums.par_iter().for_each(|atom| {
+                let v = atom.load(Ordering::Relaxed);
+                atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
+            });
+        }
 
         self.last_discount_time = self.iterations;
     }
@@ -1198,6 +1240,10 @@ mod tests {
                 dcfr_beta: 1.0,
                 dcfr_gamma: 1.0,
                 dcfr_epoch_cap: None,
+                use_baselines: false,
+                baseline_alpha: 0.01,
+                optimizer: "dcfr".to_string(),
+                sapcfr_eta: 0.5,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 9999,
@@ -1701,5 +1747,86 @@ mod tests {
 
         let trainer = toy_trainer(config);
         assert!(!trainer.buckets.has_per_flop_dir(), "trainer should not enable per-flop without marker file");
+    }
+
+    #[test]
+    fn train_with_baselines_runs_iterations() {
+        let mut config = toy_config();
+        config.training.iterations = Some(50);
+        config.training.use_baselines = true;
+        config.training.baseline_alpha = 0.05;
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("training with baselines should complete");
+        assert_eq!(trainer.iterations, 50);
+    }
+
+    #[test]
+    fn train_with_baselines_updates_storage() {
+        let mut config = toy_config();
+        config.training.iterations = Some(20);
+        config.training.use_baselines = true;
+        config.training.baseline_alpha = 0.1;
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("training should complete");
+
+        // Verify that some regrets have been updated (training happened).
+        let any_nonzero = trainer
+            .storage
+            .regrets
+            .iter()
+            .any(|r| r.load(std::sync::atomic::Ordering::Relaxed) != 0);
+        assert!(any_nonzero, "training with baselines should update regrets");
+    }
+
+    #[test]
+    fn trainer_creates_dcfr_optimizer_by_default() {
+        let config = toy_config();
+        let trainer = BlueprintTrainer::new(config);
+        let opt = trainer.storage.optimizer.as_ref().expect("optimizer should be set");
+        assert_eq!(opt.name(), "dcfr");
+        assert!(!opt.needs_predictions());
+        assert!(trainer.storage.predictions.is_none());
+    }
+
+    #[test]
+    fn trainer_creates_sapcfr_optimizer() {
+        let mut config = toy_config();
+        config.training.optimizer = "sapcfr+".to_string();
+        config.training.sapcfr_eta = 0.75;
+        let trainer = BlueprintTrainer::new(config);
+        let opt = trainer.storage.optimizer.as_ref().expect("optimizer should be set");
+        assert_eq!(opt.name(), "sapcfr+");
+        assert!(opt.needs_predictions());
+        assert!(trainer.storage.predictions.is_some());
+    }
+
+    #[test]
+    fn train_with_sapcfr_optimizer() {
+        let mut config = toy_config();
+        config.training.optimizer = "sapcfr+".to_string();
+        config.training.sapcfr_eta = 0.5;
+        config.training.iterations = Some(50);
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("training with sapcfr+ should complete");
+        assert_eq!(trainer.iterations, 50);
+        assert!(
+            trainer.storage.regrets.iter().any(|r| r.load(Ordering::Relaxed) != 0),
+            "regrets should be updated after sapcfr+ training"
+        );
+    }
+
+    #[test]
+    fn sapcfr_training_populates_predictions() {
+        let mut config = toy_config();
+        config.training.optimizer = "sapcfr+".to_string();
+        config.training.sapcfr_eta = 0.5;
+        config.training.iterations = Some(50);
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("training should complete");
+        let preds = trainer.storage.predictions.as_ref().expect("predictions should be Some");
+        assert!(
+            preds.iter().any(|p| p.load(Ordering::Relaxed) != 0),
+            "predictions should be populated after training"
+        );
     }
 }
