@@ -60,6 +60,14 @@ enum Commands {
         /// Output directory for results
         #[arg(long, default_value = "results/mccfr_run")]
         output_dir: String,
+
+        /// Turn buckets for clustering
+        #[arg(long, default_value_t = 200)]
+        turn_buckets: u16,
+
+        /// River buckets for clustering
+        #[arg(long, default_value_t = 200)]
+        river_buckets: u16,
     },
 }
 
@@ -172,6 +180,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             checkpoints,
             baseline_dir,
             output_dir,
+            turn_buckets,
+            river_buckets,
         } => {
             if solver != "mccfr" {
                 return Err(format!("Unknown solver '{}'. Available: mccfr", solver).into());
@@ -199,6 +209,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 iterations,
                 &checkpoint_iters,
                 loaded_baseline.as_ref(),
+                turn_buckets,
+                river_buckets,
             )?;
 
             println!("\n=== MCCFR Run Summary ===");
@@ -481,12 +493,16 @@ mod tests {
                 checkpoints,
                 baseline_dir,
                 output_dir,
+                turn_buckets,
+                river_buckets,
             } => {
                 assert_eq!(solver, "mccfr");
                 assert_eq!(iterations, 1_000_000);
                 assert_eq!(checkpoints, "1000,10000,100000,500000,1000000");
                 assert_eq!(baseline_dir, "baselines/flop_poker_allin");
                 assert_eq!(output_dir, "results/mccfr_run");
+                assert_eq!(turn_buckets, 200);
+                assert_eq!(river_buckets, 200);
             }
             _ => panic!("expected RunSolver"),
         }
@@ -507,6 +523,10 @@ mod tests {
             "/tmp/baseline",
             "--output-dir",
             "/tmp/output",
+            "--turn-buckets",
+            "100",
+            "--river-buckets",
+            "50",
         ]);
         match cli.command {
             Commands::RunSolver {
@@ -515,12 +535,16 @@ mod tests {
                 checkpoints,
                 baseline_dir,
                 output_dir,
+                turn_buckets,
+                river_buckets,
             } => {
                 assert_eq!(solver, "mccfr");
                 assert_eq!(iterations, 50_000);
                 assert_eq!(checkpoints, "5000,25000,50000");
                 assert_eq!(baseline_dir, "/tmp/baseline");
                 assert_eq!(output_dir, "/tmp/output");
+                assert_eq!(turn_buckets, 100);
+                assert_eq!(river_buckets, 50);
             }
             _ => panic!("expected RunSolver"),
         }

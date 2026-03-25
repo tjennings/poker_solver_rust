@@ -95,8 +95,8 @@ fn test_mccfr_pipeline_end_to_end() {
     let baseline = harness::generate_baseline_with_config(&config, 20, 10.0).unwrap();
     assert!(!baseline.strategy.is_empty());
 
-    // 2. Run MCCFR
-    let mut solver = MccfrSolver::new(config.clone());
+    // 2. Run MCCFR with real clustering (small bucket counts for speed)
+    let mut solver = MccfrSolver::new(config.clone(), 10, 10);
     for _ in 0..5 {
         solver.solve_step();
     }
@@ -116,7 +116,7 @@ fn test_mccfr_pipeline_end_to_end() {
 #[test]
 fn test_run_mccfr_solver_produces_baseline() {
     let checkpoints = vec![1000, 3000, 5000];
-    let result = convergence_harness::harness::run_mccfr_solver(5000, &checkpoints, None).unwrap();
+    let result = convergence_harness::harness::run_mccfr_solver(5000, &checkpoints, None, 10, 10).unwrap();
 
     // Should have convergence samples at each checkpoint
     assert!(
@@ -124,20 +124,21 @@ fn test_run_mccfr_solver_produces_baseline() {
         "Convergence curve should not be empty"
     );
 
-    // Final exploitability should be positive and finite
-    assert!(
-        result.summary.final_exploitability > 0.0,
-        "Final exploitability should be positive"
-    );
+    // Final exploitability is 0.0 when no baseline is provided (no h2h computation)
     assert!(
         result.summary.final_exploitability.is_finite(),
         "Final exploitability should be finite"
     );
 
-    // Solver name should identify MCCFR
+    // Solver name should identify MCCFR with bucket counts
     assert!(
         result.summary.solver_name.contains("MCCFR"),
         "Solver name should contain MCCFR, got: {}",
+        result.summary.solver_name
+    );
+    assert!(
+        result.summary.solver_name.contains("10t/10r"),
+        "Solver name should contain bucket counts, got: {}",
         result.summary.solver_name
     );
 

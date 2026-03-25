@@ -193,6 +193,8 @@ pub fn run_mccfr_solver(
     max_iterations: u64,
     checkpoints: &[u64],
     baseline: Option<&Baseline>,
+    turn_buckets: u16,
+    river_buckets: u16,
 ) -> Result<Baseline, Box<dyn std::error::Error>> {
     // All-in-only config: required for tree correspondence in exploitability
     let config = FlopPokerConfig {
@@ -202,7 +204,7 @@ pub fn run_mccfr_solver(
         ..Default::default()
     };
 
-    let mut solver = MccfrSolver::new(config.clone());
+    let mut solver = MccfrSolver::new(config.clone(), turn_buckets, river_buckets);
     let mut convergence_curve = Vec::new();
     let start = Instant::now();
 

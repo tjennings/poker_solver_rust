@@ -1,8 +1,9 @@
 //! MCCFR solver adapter for the convergence harness.
 //!
 //! Wraps `BlueprintTrainer` from poker-solver-core, implementing the
-//! `ConvergenceSolver` trait with fixed-flop deals and canonical preflop
-//! hand bucketing.
+//! `ConvergenceSolver` trait with fixed-flop deals. Uses canonical preflop
+//! hand bucketing (169 buckets) for preflop/flop streets and real
+//! potential-aware clustering via `cluster_single_flop()` for turn/river.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -10,12 +11,14 @@
     clippy::cast_sign_loss
 )]
 
+use poker_solver_core::blueprint_v2::cluster_pipeline::{cluster_single_flop, combo_index};
 use poker_solver_core::blueprint_v2::config::{
     ActionAbstractionConfig, BlueprintV2Config, ClusteringAlgorithm, ClusteringConfig, GameConfig,
     SnapshotConfig, StreetClusterConfig, TrainingConfig,
 };
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree};
 use poker_solver_core::blueprint_v2::mccfr::{Deal, DealWithBuckets, traverse_external};
+use poker_solver_core::blueprint_v2::per_flop_bucket_file::PerFlopBucketFile;
 use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
 use poker_solver_core::blueprint_v2::trainer::BlueprintTrainer;
 use poker_solver_core::blueprint_v2::Street;
@@ -23,6 +26,7 @@ use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use std::time::Instant;
 
 use crate::baseline::Baseline;
 use crate::game::FlopPokerConfig;
@@ -108,6 +112,8 @@ fn sample_fixed_flop_deal(rng: &mut impl Rng) -> Deal {
 
 /// Assign canonical preflop hand index as bucket for ALL streets.
 /// This ignores board interaction -- pipeline validation only.
+/// Retained for tests; production code uses `MccfrSolver::clustered_buckets`.
+#[cfg(test)]
 fn canonical_buckets(deal: &Deal) -> [[u16; 4]; 2] {
     let mut result = [[0u16; 4]; 2];
     for (player, row) in result.iter_mut().enumerate() {
@@ -152,7 +158,11 @@ fn parse_bet_sizes(s: &str) -> Vec<Vec<f64>> {
 }
 
 /// Build a `BlueprintV2Config` from a `FlopPokerConfig`.
-fn build_mccfr_config(config: &FlopPokerConfig) -> BlueprintV2Config {
+fn build_mccfr_config(
+    config: &FlopPokerConfig,
+    turn_buckets: u16,
+    river_buckets: u16,
+) -> BlueprintV2Config {
     let street_cluster = |buckets| StreetClusterConfig {
         buckets,
         delta_bins: None,
@@ -176,8 +186,8 @@ fn build_mccfr_config(config: &FlopPokerConfig) -> BlueprintV2Config {
             algorithm: ClusteringAlgorithm::PotentialAwareEmd,
             preflop: street_cluster(NUM_BUCKETS),
             flop: street_cluster(NUM_BUCKETS),
-            turn: street_cluster(NUM_BUCKETS),
-            river: street_cluster(NUM_BUCKETS),
+            turn: street_cluster(turn_buckets),
+            river: street_cluster(river_buckets),
             seed: 42,
             kmeans_iterations: 0,
             cfvnet_river_data: None,
@@ -707,25 +717,67 @@ fn lock_head_to_head_recursive(
 // MccfrSolver
 // ---------------------------------------------------------------------------
 
-/// MCCFR solver adapter: runs blueprint MCCFR with canonical preflop bucketing.
+/// MCCFR solver adapter: runs blueprint MCCFR with potential-aware clustering.
 pub struct MccfrSolver {
     tree: GameTree,
     storage: BlueprintStorage,
     /// Combo list from range-solver (card pairs using range-solver u8 encoding).
     combos: Vec<(u8, u8)>,
+    /// Clustered turn/river bucket assignments for this flop.
+    per_flop_buckets: PerFlopBucketFile,
+    /// Pre-computed solver name string.
+    name_str: String,
     iteration: u64,
     rng: SmallRng,
 }
 
 impl MccfrSolver {
     /// Create a new MCCFR solver from a `FlopPokerConfig`.
-    pub fn new(config: FlopPokerConfig) -> Self {
+    ///
+    /// `turn_buckets` and `river_buckets` control the granularity of the
+    /// potential-aware clustering used for turn and river streets.
+    pub fn new(config: FlopPokerConfig, turn_buckets: u16, river_buckets: u16) -> Self {
         // Build a range-solver game to get the combo list.
         let rs_game = crate::game::build_flop_poker_game_with_config(&config)
             .expect("Failed to build range-solver game for combo list");
         let combos: Vec<(u8, u8)> = rs_game.private_cards(0).to_vec();
 
-        let mccfr_config = build_mccfr_config(&config);
+        // Cluster the fixed flop into turn/river buckets.
+        let flop = flop_cards();
+        eprintln!(
+            "Clustering flop {:?} with {} turn / {} river buckets...",
+            flop, turn_buckets, river_buckets
+        );
+        let cluster_start = Instant::now();
+        let per_flop_buckets = cluster_single_flop(
+            flop,
+            turn_buckets,
+            river_buckets,
+            50,
+            42,
+            |phase, done, total| {
+                if done == total {
+                    eprintln!("  clustering phase {}: done", phase);
+                }
+            },
+        );
+        eprintln!(
+            "Clustering complete in {:.1}s ({} turns, {} rivers/turn avg)",
+            cluster_start.elapsed().as_secs_f64(),
+            per_flop_buckets.turn_cards.len(),
+            if per_flop_buckets.turn_cards.is_empty() {
+                0
+            } else {
+                per_flop_buckets
+                    .river_cards_per_turn
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>()
+                    / per_flop_buckets.turn_cards.len()
+            },
+        );
+
+        let mccfr_config = build_mccfr_config(&config, turn_buckets, river_buckets);
         let mut trainer = BlueprintTrainer::new(mccfr_config);
         trainer.skip_bucket_validation = true;
 
@@ -753,10 +805,14 @@ impl MccfrSolver {
             ),
         );
 
+        let name_str = format!("MCCFR ({}t/{}r buckets)", turn_buckets, river_buckets);
+
         Self {
             tree,
             storage,
             combos,
+            per_flop_buckets,
+            name_str,
             iteration: 0,
             rng: SmallRng::seed_from_u64(42),
         }
@@ -771,11 +827,64 @@ impl MccfrSolver {
     pub fn storage(&self) -> &BlueprintStorage {
         &self.storage
     }
+
+    /// Find the index of a turn card in the per-flop bucket file.
+    fn find_turn_index(&self, turn_card: Card) -> usize {
+        self.per_flop_buckets
+            .turn_cards
+            .iter()
+            .position(|&c| c == turn_card)
+            .unwrap_or_else(|| panic!("Turn card {:?} not found in per-flop bucket file", turn_card))
+    }
+
+    /// Find the index of a river card for a given turn in the per-flop bucket file.
+    fn find_river_index(&self, turn_idx: usize, river_card: Card) -> usize {
+        self.per_flop_buckets.river_cards_per_turn[turn_idx]
+            .iter()
+            .position(|&c| c == river_card)
+            .unwrap_or_else(|| {
+                panic!(
+                    "River card {:?} not found for turn_idx {} in per-flop bucket file",
+                    river_card, turn_idx
+                )
+            })
+    }
+
+    /// Assign buckets using real potential-aware clustering.
+    ///
+    /// Preflop and flop use canonical hand index (169 buckets).
+    /// Turn and river use the per-flop clustered bucket assignments.
+    fn clustered_buckets(&self, deal: &Deal) -> [[u16; 4]; 2] {
+        let mut result = [[0u16; 4]; 2];
+        let turn_card = deal.board[3];
+        let river_card = deal.board[4];
+        let turn_idx = self.find_turn_index(turn_card);
+        let river_idx = self.find_river_index(turn_idx, river_card);
+
+        for (player, row) in result.iter_mut().enumerate() {
+            let hole = deal.hole_cards[player];
+
+            // Preflop: canonical hand index (169)
+            let hand = CanonicalHand::from_cards(hole[0], hole[1]);
+            row[0] = hand.index() as u16;
+
+            // Flop: same as preflop (single flop, no real flop clustering)
+            row[1] = row[0];
+
+            // Turn: look up in per-flop file
+            let ci = combo_index(hole[0], hole[1]) as usize;
+            row[2] = self.per_flop_buckets.get_turn_bucket(turn_idx, ci);
+
+            // River: look up in per-flop file
+            row[3] = self.per_flop_buckets.get_river_bucket(turn_idx, river_idx, ci);
+        }
+        result
+    }
 }
 
 impl ConvergenceSolver for MccfrSolver {
     fn name(&self) -> &str {
-        "MCCFR (169 canonical buckets)"
+        &self.name_str
     }
 
     fn solve_step(&mut self) {
@@ -783,7 +892,7 @@ impl ConvergenceSolver for MccfrSolver {
             let seed: u64 = self.rng.random();
             let mut deal_rng = SmallRng::seed_from_u64(seed);
             let deal = sample_fixed_flop_deal(&mut deal_rng);
-            let buckets = canonical_buckets(&deal);
+            let buckets = self.clustered_buckets(&deal);
             let dwb = DealWithBuckets { deal, buckets };
 
             // Traverse for both players (external sampling MCCFR)
