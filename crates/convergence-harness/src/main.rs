@@ -24,6 +24,10 @@ enum Commands {
         /// Target exploitability (fraction of pot)
         #[arg(long, default_value_t = 0.001)]
         target_exploitability: f32,
+
+        /// Exploitability checkpoint iterations (comma-separated). If omitted, uses dense-early schedule.
+        #[arg(long)]
+        checkpoints: Option<String>,
     },
     /// Compare a saved solver result against the baseline
     Compare {
@@ -109,8 +113,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_dir,
             iterations,
             target_exploitability,
+            checkpoints,
         } => {
-            let baseline = harness::generate_baseline(iterations, target_exploitability)?;
+            let cps = checkpoints.as_deref().map(parse_checkpoint_string);
+            let baseline = harness::generate_baseline_with_config_and_checkpoints(
+                &convergence_harness::game::FlopPokerConfig::default(),
+                iterations,
+                target_exploitability,
+                cps.as_deref(),
+            )?;
 
             let dir = std::path::Path::new(&output_dir);
             baseline.save(dir)?;
@@ -241,10 +252,12 @@ mod tests {
                 output_dir,
                 iterations,
                 target_exploitability,
+                checkpoints,
             } => {
                 assert_eq!(output_dir, "baselines/flop_poker_v1");
                 assert_eq!(iterations, 1000);
                 assert!((target_exploitability - 0.001).abs() < 1e-6);
+                assert!(checkpoints.is_none());
             }
             _ => panic!("expected GenerateBaseline"),
         }
@@ -267,10 +280,12 @@ mod tests {
                 output_dir,
                 iterations,
                 target_exploitability,
+                checkpoints,
             } => {
                 assert_eq!(output_dir, "/tmp/my_baseline");
                 assert_eq!(iterations, 5000);
                 assert!((target_exploitability - 0.01).abs() < 1e-6);
+                assert!(checkpoints.is_none());
             }
             _ => panic!("expected GenerateBaseline"),
         }
