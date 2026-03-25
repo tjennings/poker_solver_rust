@@ -1,10 +1,11 @@
 ---
 # poker_solver_rust-ly7w
 title: 'Phase 2: Blueprint MCCFR comparison'
-status: todo
+status: in-progress
 type: feature
+priority: normal
 created_at: 2026-03-24T22:12:40Z
-updated_at: 2026-03-24T22:12:40Z
+updated_at: 2026-03-25T03:04:12Z
 parent: poker_solver_rust-elst
 ---
 
