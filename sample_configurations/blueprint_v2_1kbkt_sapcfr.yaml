@@ -40,9 +40,9 @@ action_abstraction:
 training:
   cluster_path: "./local_data/buckets/1k_v3"
   time_limit_minutes: 7200
-  lcfr_warmup_iterations: 50000000
-  prune_after_iterations: 50000000
-  prune_threshold: 0
+  lcfr_warmup_iterations: 1000000
+  prune_after_iterations: 1000000
+  prune_threshold: -5
   lcfr_discount_interval: 1000000
   batch_size: 2000
   purify_threshold: 0.03
