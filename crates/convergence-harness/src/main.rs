@@ -217,12 +217,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Solver: {}", result.summary.solver_name);
             println!("Iterations: {}", result.summary.total_iterations);
             println!(
-                "Final exploitability: {:.4e}",
-                result.summary.final_exploitability
-            );
-            println!(
                 "Time: {:.1}s",
                 result.summary.total_time_ms as f64 / 1000.0
+            );
+            println!(
+                "h2h mbb/hand: {:.2}",
+                result.summary.final_exploitability
             );
             println!("Info sets captured: {}", result.summary.num_info_sets);
 
