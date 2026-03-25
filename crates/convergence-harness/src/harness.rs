@@ -5,7 +5,7 @@ use crate::evaluator;
 use crate::game::{build_flop_poker_game_with_config, FlopPokerConfig};
 use crate::solver_trait::ConvergenceSolver;
 use crate::solvers::exhaustive::ExhaustiveSolver;
-use crate::solvers::mccfr::{compute_head_to_head_ev, compute_mccfr_exploitability, MccfrSolver};
+use crate::solvers::mccfr::{compute_head_to_head_ev, MccfrSolver};
 use crate::strategy_matrix;
 
 /// Determines how often to sample exploitability.
@@ -202,11 +202,6 @@ pub fn run_mccfr_solver(
         ..Default::default()
     };
 
-    eprintln!(
-        "NOTE: MCCFR exploitability currently only works with all-in-only configs \
-         due to tree correspondence requirements."
-    );
-
     let mut solver = MccfrSolver::new(config.clone());
     let mut convergence_curve = Vec::new();
     let start = Instant::now();
@@ -229,45 +224,42 @@ pub fn run_mccfr_solver(
             && current_iter >= active_checkpoints[checkpoint_idx]
         {
             let elapsed = start.elapsed().as_millis() as u64;
-            let expl = compute_mccfr_exploitability(&solver, &config)?;
-
-            convergence_curve.push(ConvergenceSample {
-                iteration: current_iter,
-                exploitability: expl,
-                elapsed_ms: elapsed,
-            });
 
             if let Some(bl) = baseline {
                 match compute_head_to_head_ev(&solver, bl, &config) {
-                    Ok((oop_loss, ip_loss, avg)) => {
+                    Ok((oop, ip, avg)) => {
+                        convergence_curve.push(ConvergenceSample {
+                            iteration: current_iter,
+                            exploitability: avg, // h2h mbb/hand as primary metric
+                            elapsed_ms: elapsed,
+                        });
                         eprintln!(
-                            "checkpoint: {} iterations, exploitability = {:.4e}, \
-                             h2h mbb/hand = {:.2} (OOP {:.2}, IP {:.2}), elapsed = {:.1}s",
-                            current_iter,
-                            expl,
-                            avg,
-                            oop_loss,
-                            ip_loss,
+                            "checkpoint: {} iterations, h2h mbb/hand = {:.2} (OOP {:.2}, IP {:.2}), elapsed = {:.1}s",
+                            current_iter, avg, oop, ip,
                             elapsed as f64 / 1000.0
                         );
                     }
                     Err(e) => {
+                        convergence_curve.push(ConvergenceSample {
+                            iteration: current_iter,
+                            exploitability: 0.0,
+                            elapsed_ms: elapsed,
+                        });
                         eprintln!(
-                            "checkpoint: {} iterations, exploitability = {:.4e}, \
-                             h2h error: {}, elapsed = {:.1}s",
-                            current_iter,
-                            expl,
-                            e,
-                            elapsed as f64 / 1000.0
+                            "checkpoint: {} iterations, h2h error: {}, elapsed = {:.1}s",
+                            current_iter, e, elapsed as f64 / 1000.0
                         );
                     }
                 }
             } else {
+                convergence_curve.push(ConvergenceSample {
+                    iteration: current_iter,
+                    exploitability: 0.0,
+                    elapsed_ms: elapsed,
+                });
                 eprintln!(
-                    "checkpoint: {} iterations, exploitability = {:.4e}, elapsed = {:.1}s",
-                    current_iter,
-                    expl,
-                    elapsed as f64 / 1000.0
+                    "checkpoint: {} iterations, elapsed = {:.1}s",
+                    current_iter, elapsed as f64 / 1000.0
                 );
             }
 
@@ -276,7 +268,7 @@ pub fn run_mccfr_solver(
     }
 
     let total_time = start.elapsed().as_millis() as u64;
-    let final_expl = convergence_curve
+    let final_h2h = convergence_curve
         .last()
         .map_or(0.0, |s| s.exploitability);
 
@@ -311,7 +303,7 @@ pub fn run_mccfr_solver(
     let summary = BaselineSummary {
         solver_name: solver.name().into(),
         total_iterations: solver.iterations(),
-        final_exploitability: final_expl,
+        final_exploitability: final_h2h,
         total_time_ms: total_time,
         num_info_sets: strategy.len(),
         num_combos_per_player: num_combos,
