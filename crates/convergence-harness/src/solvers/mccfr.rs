@@ -476,9 +476,8 @@ pub fn lock_strategy_recursive(
 /// strategy and the other uses the MCCFR (lifted bucket) strategy. The EV
 /// difference from the Nash value measures how much the MCCFR strategy loses.
 ///
-/// Returns `(oop_loss, ip_loss, average)` in mbb/hand where each loss is
-/// how much the MCCFR player loses when playing that position against the
-/// exact strategy.
+/// Returns `(oop_delta, ip_delta, average)` in mbb/hand from MCCFR's
+/// perspective. Negative means MCCFR loses to the baseline strategy.
 pub fn compute_head_to_head_ev(
     solver: &MccfrSolver,
     baseline: &Baseline,
@@ -534,18 +533,17 @@ pub fn compute_head_to_head_ev(
         range_solver::compute_current_ev(&game)
     };
 
-    // OOP loss: how much MCCFR loses as OOP compared to Nash
-    // Nash EV for OOP is nash_ev[0]. Head-to-head EV for MCCFR-OOP is ev_mccfr_oop[0].
-    // Loss = nash_ev[0] - ev_mccfr_oop[0] (positive means MCCFR is worse)
-    let oop_loss_raw = (nash_ev[0] - ev_mccfr_oop[0]) as f64;
-    let ip_loss_raw = (nash_ev[1] - ev_mccfr_ip[1]) as f64;
+    // EV delta from MCCFR's perspective: negative means MCCFR loses vs baseline.
+    // mccfr_ev - nash_ev: negative when MCCFR is worse (losing to the exact strategy).
+    let oop_delta_raw = (ev_mccfr_oop[0] - nash_ev[0]) as f64;
+    let ip_delta_raw = (ev_mccfr_ip[1] - nash_ev[1]) as f64;
 
     // Convert to mbb/hand: multiply by 1000 (milli big blinds)
-    let oop_loss_mbb = oop_loss_raw * 1000.0;
-    let ip_loss_mbb = ip_loss_raw * 1000.0;
-    let avg_mbb = (oop_loss_mbb + ip_loss_mbb) / 2.0;
+    let oop_mbb = oop_delta_raw * 1000.0;
+    let ip_mbb = ip_delta_raw * 1000.0;
+    let avg_mbb = (oop_mbb + ip_mbb) / 2.0;
 
-    Ok((oop_loss_mbb, ip_loss_mbb, avg_mbb))
+    Ok((oop_mbb, ip_mbb, avg_mbb))
 }
 
 /// Lock the baseline (exact) strategy at every decision node in the
