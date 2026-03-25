@@ -439,6 +439,10 @@ mod tests {
                 dcfr_beta: 1.0,
                 dcfr_gamma: 1.0,
                 dcfr_epoch_cap: None,
+                optimizer: "dcfr".to_string(),
+                sapcfr_eta: 0.5,
+                use_baselines: false,
+                baseline_alpha: 0.01,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 60,

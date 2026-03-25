@@ -34,6 +34,10 @@ pub struct BlueprintStorage {
     pub regrets: Vec<AtomicI32>,
     /// Strategy sums: one `AtomicI64` per (decision node, bucket, action).
     pub strategy_sums: Vec<AtomicI64>,
+    /// Optional baseline buffer for VR-MCCFR variance reduction.
+    /// Same layout as regrets. Stores running-average counterfactual
+    /// values scaled by x1000.
+    pub(crate) baselines: Option<Vec<AtomicI32>>,
     /// Number of buckets per street `[preflop, flop, turn, river]`.
     pub bucket_counts: [u16; 4],
     /// Per-node layout metadata. Non-decision nodes use the `Default`
@@ -91,8 +95,67 @@ impl BlueprintStorage {
         Self {
             regrets: (0..total).map(|_| AtomicI32::new(0)).collect(),
             strategy_sums: (0..total).map(|_| AtomicI64::new(0)).collect(),
+            baselines: None,
             bucket_counts,
             layout,
+        }
+    }
+
+    /// Build storage with optional baseline buffer for VR-MCCFR.
+    ///
+    /// When `use_baselines` is `true`, allocates a zeroed baseline buffer
+    /// with the same layout as regrets.
+    #[must_use]
+    pub fn new_with_baselines(tree: &GameTree, bucket_counts: [u16; 4], use_baselines: bool) -> Self {
+        let mut storage = Self::new(tree, bucket_counts);
+        if use_baselines {
+            let total = storage.regrets.len();
+            storage.baselines = Some((0..total).map(|_| AtomicI32::new(0)).collect());
+        }
+        storage
+    }
+
+    /// Flat-buffer index for a given (node, bucket, action) triple.
+    #[inline]
+    fn slot_index(&self, node_idx: u32, bucket: u16, action: usize) -> usize {
+        let nl = &self.layout[node_idx as usize];
+        Self::slot_offset(nl, bucket) + action
+    }
+
+    /// Read the baseline value for a (node, bucket, action) slot.
+    ///
+    /// Returns `0.0` when baselines are disabled (`None`), which causes
+    /// the VR-MCCFR corrected formula to degenerate to standard sampling.
+    #[inline]
+    #[must_use]
+    pub fn get_baseline(&self, node_idx: u32, bucket: u16, action: usize) -> f64 {
+        match self.baselines.as_ref() {
+            Some(b) => {
+                f64::from(b[self.slot_index(node_idx, bucket, action)].load(Ordering::Relaxed))
+                    / 1000.0
+            }
+            None => 0.0,
+        }
+    }
+
+    /// Update the baseline with an exponential moving average.
+    ///
+    /// `alpha` controls the learning rate: `new = (1 - alpha) * old + alpha * value`.
+    /// No-op when baselines are disabled (`None`).
+    #[inline]
+    pub fn update_baseline(
+        &self,
+        node_idx: u32,
+        bucket: u16,
+        action: usize,
+        value: f64,
+        alpha: f64,
+    ) {
+        if let Some(ref b) = self.baselines {
+            let idx = self.slot_index(node_idx, bucket, action);
+            let old = f64::from(b[idx].load(Ordering::Relaxed)) / 1000.0;
+            let new_val = old * (1.0 - alpha) + value * alpha;
+            b[idx].store((new_val * 1000.0) as i32, Ordering::Relaxed);
         }
     }
 
@@ -630,5 +693,149 @@ mod tests {
 
         let (delta, _pct) = storage.strategy_delta(&snap);
         assert!(delta > 0.0, "changed strategy should have delta > 0, got {delta}");
+    }
+
+    // --- Baseline buffer tests ---
+
+    #[test]
+    fn baseline_returns_zero_when_disabled() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        assert!((storage.get_baseline(node_idx, 0, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn baseline_update_is_noop_when_disabled() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        storage.update_baseline(node_idx, 0, 0, 5.0, 0.1);
+        assert!((storage.get_baseline(node_idx, 0, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn baseline_enabled_initial_zero() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new_with_baselines(&tree, [50, 50, 50, 50], true);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        assert!((storage.get_baseline(node_idx, 0, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn baseline_ema_single_update() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new_with_baselines(&tree, [50, 50, 50, 50], true);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        // EMA: new = (1 - alpha) * old + alpha * value
+        // old = 0.0, alpha = 0.5, value = 10.0 => new = 5.0
+        storage.update_baseline(node_idx, 0, 0, 10.0, 0.5);
+        let b = storage.get_baseline(node_idx, 0, 0);
+        assert!((b - 5.0).abs() < 0.01, "expected ~5.0 after EMA update, got {b}");
+    }
+
+    #[test]
+    fn baseline_ema_multiple_updates() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new_with_baselines(&tree, [50, 50, 50, 50], true);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        let alpha = 0.1;
+        // Update 1: new = 0.0 * 0.9 + 10.0 * 0.1 = 1.0
+        storage.update_baseline(node_idx, 0, 0, 10.0, alpha);
+        // Update 2: new = 1.0 * 0.9 + 10.0 * 0.1 = 1.9
+        storage.update_baseline(node_idx, 0, 0, 10.0, alpha);
+        // Update 3: new = 1.9 * 0.9 + 10.0 * 0.1 = 2.71
+        storage.update_baseline(node_idx, 0, 0, 10.0, alpha);
+        let b = storage.get_baseline(node_idx, 0, 0);
+        assert!((b - 2.71).abs() < 0.05, "expected ~2.71 after 3 EMA updates, got {b}");
+    }
+
+    #[test]
+    fn baseline_different_actions_independent() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new_with_baselines(&tree, [50, 50, 50, 50], true);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        let num_actions = storage.num_actions(node_idx) as usize;
+        if num_actions >= 2 {
+            storage.update_baseline(node_idx, 0, 0, 10.0, 1.0);
+            storage.update_baseline(node_idx, 0, 1, 20.0, 1.0);
+            let b0 = storage.get_baseline(node_idx, 0, 0);
+            let b1 = storage.get_baseline(node_idx, 0, 1);
+            assert!((b0 - 10.0).abs() < 0.01, "action 0 baseline: expected ~10.0, got {b0}");
+            assert!((b1 - 20.0).abs() < 0.01, "action 1 baseline: expected ~20.0, got {b1}");
+        }
+    }
+
+    #[test]
+    fn baseline_different_buckets_independent() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new_with_baselines(&tree, [50, 50, 50, 50], true);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        storage.update_baseline(node_idx, 0, 0, 10.0, 1.0);
+        storage.update_baseline(node_idx, 1, 0, 30.0, 1.0);
+        let b0 = storage.get_baseline(node_idx, 0, 0);
+        let b1 = storage.get_baseline(node_idx, 1, 0);
+        assert!((b0 - 10.0).abs() < 0.01, "bucket 0: expected ~10.0, got {b0}");
+        assert!((b1 - 30.0).abs() < 0.01, "bucket 1: expected ~30.0, got {b1}");
+    }
+
+    #[test]
+    fn baseline_alpha_one_replaces_completely() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new_with_baselines(&tree, [50, 50, 50, 50], true);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        storage.update_baseline(node_idx, 0, 0, 7.5, 1.0);
+        let b = storage.get_baseline(node_idx, 0, 0);
+        assert!((b - 7.5).abs() < 0.01, "alpha=1 should fully replace: expected 7.5, got {b}");
+        storage.update_baseline(node_idx, 0, 0, -3.0, 1.0);
+        let b = storage.get_baseline(node_idx, 0, 0);
+        assert!((b - (-3.0)).abs() < 0.01, "alpha=1 second update: expected -3.0, got {b}");
+    }
+
+    #[test]
+    fn baseline_alpha_zero_keeps_old_value() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new_with_baselines(&tree, [50, 50, 50, 50], true);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        storage.update_baseline(node_idx, 0, 0, 5.0, 1.0);
+        storage.update_baseline(node_idx, 0, 0, 99.0, 0.0);
+        let b = storage.get_baseline(node_idx, 0, 0);
+        assert!((b - 5.0).abs() < 0.01, "alpha=0 should keep old: expected 5.0, got {b}");
     }
 }

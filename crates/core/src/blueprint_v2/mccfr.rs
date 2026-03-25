@@ -635,6 +635,7 @@ pub fn traverse_external(
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
     full_ev_tracker: Option<&FullTreeEvTracker>,
+    baseline_alpha: f64,
 ) -> (f64, PruneStats) {
     match &tree.nodes[node_idx as usize] {
         GameNode::Terminal { kind, pot, stacks } => {
@@ -645,7 +646,7 @@ pub fn traverse_external(
             // Board cards are pre-dealt in the Deal; just recurse.
             traverse_external(
                 tree, storage, deal, traverser, *child, prune, prune_threshold, rng,
-                rake_rate, rake_cap, ev_tracker, full_ev_tracker,
+                rake_rate, rake_cap, ev_tracker, full_ev_tracker, baseline_alpha,
             )
         }
 
@@ -678,6 +679,7 @@ pub fn traverse_external(
                     rake_cap,
                     ev_tracker,
                     full_ev_tracker,
+                    baseline_alpha,
                 )
             } else {
                 traverse_opponent(
@@ -696,6 +698,7 @@ pub fn traverse_external(
                     rake_cap,
                     ev_tracker,
                     full_ev_tracker,
+                    baseline_alpha,
                 )
             }
         }
@@ -788,6 +791,7 @@ fn traverse_traverser(
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
     full_ev_tracker: Option<&FullTreeEvTracker>,
+    baseline_alpha: f64,
 ) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
@@ -813,7 +817,7 @@ fn traverse_traverser(
 
         let (child_ev, child_stats) = traverse_external(
             tree, storage, deal, traverser, child_idx, prune, prune_threshold, rng,
-            rake_rate, rake_cap, ev_tracker, full_ev_tracker,
+            rake_rate, rake_cap, ev_tracker, full_ev_tracker, baseline_alpha,
         );
         action_values[a] = child_ev;
         node_value += strategy[a] * child_ev;
@@ -822,12 +826,15 @@ fn traverse_traverser(
 
     // Update regrets: delta = action_value - node_value, scaled to
     // integer by ×1000 for precision. Skip pruned actions.
+    // Also store the instantaneous regret as the SAPCFR+ prediction
+    // for the next iteration (no-op when predictions are disabled).
     for (a, &av) in action_values.iter().enumerate().take(num_actions) {
         if pruned[a] {
             continue;
         }
         let delta = av - node_value;
-        storage.add_regret(node_idx, bucket, a, (delta * 1000.0) as i32);
+        let delta_i32 = (delta * 1000.0) as i32;
+        storage.add_regret(node_idx, bucket, a, delta_i32);
     }
 
     // Accumulate strategy sums (for computing the average strategy).
@@ -874,6 +881,7 @@ fn traverse_opponent(
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
     full_ev_tracker: Option<&FullTreeEvTracker>,
+    baseline_alpha: f64,
 ) -> (f64, PruneStats) {
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy_buf = [0.0f64; MAX_ACTIONS];
@@ -891,10 +899,40 @@ fn traverse_opponent(
         }
     }
 
-    traverse_external(
+    let (v_sampled, child_stats) = traverse_external(
         tree, storage, deal, traverser, children[chosen], prune, prune_threshold, rng,
-        rake_rate, rake_cap, ev_tracker, full_ev_tracker,
-    )
+        rake_rate, rake_cap, ev_tracker, full_ev_tracker, baseline_alpha,
+    );
+
+    // Read baselines BEFORE updating (use old values for correction).
+    let mut baseline_buf = [0.0f64; MAX_ACTIONS];
+    for (a, slot) in baseline_buf[..num_actions].iter_mut().enumerate() {
+        *slot = storage.get_baseline(node_idx, bucket, a);
+    }
+
+    // Baseline-corrected value: v = sum(s[a]*b[a]) + (v_sampled - b[chosen])
+    // When baselines are disabled, get_baseline returns 0.0 and this
+    // degenerates to the standard external-sampling value (v_sampled).
+    let v = baseline_corrected_value(strategy, &baseline_buf[..num_actions], chosen, v_sampled);
+
+    // Update the baseline for the sampled action with the new observation.
+    storage.update_baseline(node_idx, bucket, chosen, v_sampled, baseline_alpha);
+
+    (v, child_stats)
+}
+
+/// Compute the baseline-corrected value for VR-MCCFR (Schmid et al., AAAI 2019).
+///
+/// Formula: `v = sum(strategy[a] * baseline[a]) + (v_sampled - baseline[a_sampled])`
+///
+/// When baselines are all zero (disabled), this reduces to `v_sampled`.
+fn baseline_corrected_value(strategy: &[f64], baselines: &[f64], a_sampled: usize, v_sampled: f64) -> f64 {
+    let mut v = 0.0;
+    for (&s, &b) in strategy.iter().zip(baselines.iter()) {
+        v += s * b;
+    }
+    v += v_sampled - baselines[a_sampled];
+    v
 }
 
 /// Rank a hand (hole + board) using `rs_poker`.
@@ -1112,7 +1150,7 @@ mod tests {
         for _ in 0..20 {
             traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-                &mut rng, 0.0, 0.0, None, Some(&tracker),
+                &mut rng, 0.0, 0.0, None, Some(&tracker), 0.0,
             );
         }
 
@@ -1143,7 +1181,7 @@ mod tests {
         for _ in 0..20 {
             traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-                &mut rng, 0.0, 0.0, Some(&tracker), None,
+                &mut rng, 0.0, 0.0, Some(&tracker), None, 0.0,
             );
         }
 
@@ -1169,7 +1207,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-            &mut rng, 0.0, 0.0, None, None,
+            &mut rng, 0.0, 0.0, None, None, 0.0,
         );
         assert!(ev.is_finite(), "EV should be finite without tracker");
     }
@@ -1230,7 +1268,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None,
+            0.0, 0.0, None, None, 0.0,
         );
         assert!(ev.is_finite(), "EV should be finite, got {ev}");
     }
@@ -1248,11 +1286,11 @@ mod tests {
 
         let (ev0, _) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None,
+            0.0, 0.0, None, None, 0.0,
         );
         let (ev1, _) = traverse_external(
             &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None,
+            0.0, 0.0, None, None, 0.0,
         );
 
         assert!(ev0.is_finite());
@@ -1274,7 +1312,7 @@ mod tests {
 
         let (_ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None,
+            0.0, 0.0, None, None, 0.0,
         );
 
         assert!(
@@ -1296,7 +1334,7 @@ mod tests {
 
         let (_ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None,
+            0.0, 0.0, None, None, 0.0,
         );
 
         assert!(
@@ -1320,11 +1358,11 @@ mod tests {
         for _ in 0..50 {
             let _ = traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-                0.0, 0.0, None, None,
+                0.0, 0.0, None, None, 0.0,
             );
             let _ = traverse_external(
                 &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
-                0.0, 0.0, None, None,
+                0.0, 0.0, None, None, 0.0,
             );
         }
 
@@ -1362,7 +1400,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, true, -310_000_000, &mut rng,
-            0.0, 0.0, None, None,
+            0.0, 0.0, None, None, 0.0,
         );
         assert!(ev.is_finite());
     }
@@ -2224,5 +2262,45 @@ mod tests {
         // Should fall back to equity-based bucketing (returns valid bucket in [0,10))
         let bucket = all.get_bucket(Street::Turn, hole, &turn_board);
         assert!(bucket < 10, "should fall back to equity bucketing, got {bucket}");
+    }
+
+    // ── baseline_corrected_value unit tests ──────────────────────────────
+
+    #[test]
+    fn baseline_corrected_value_zero_baselines_returns_sampled() {
+        // With zero baselines, formula degenerates to v_sampled.
+        let strategy = &[0.5, 0.3, 0.2];
+        let baselines = &[0.0, 0.0, 0.0];
+        let v = baseline_corrected_value(strategy, baselines, 1, 5.0);
+        assert!((v - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn baseline_corrected_value_perfect_baselines() {
+        // When baselines exactly equal the sampled value, v = sum(s*b).
+        let strategy = &[0.6, 0.4];
+        let baselines = &[3.0, 3.0];
+        let v = baseline_corrected_value(strategy, baselines, 0, 3.0);
+        // sum(s*b) = 0.6*3 + 0.4*3 = 3.0; + (3.0 - 3.0) = 3.0
+        assert!((v - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn baseline_corrected_value_nonzero_correction() {
+        let strategy = &[0.5, 0.5];
+        let baselines = &[2.0, 4.0];
+        let v = baseline_corrected_value(strategy, baselines, 1, 6.0);
+        // sum(s*b) = 0.5*2 + 0.5*4 = 3.0; + (6.0 - 4.0) = 5.0
+        assert!((v - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn baseline_corrected_value_single_action() {
+        // With one action, strategy = [1.0], always sampled.
+        let strategy = &[1.0];
+        let baselines = &[10.0];
+        let v = baseline_corrected_value(strategy, baselines, 0, 7.0);
+        // sum(s*b) = 10.0; + (7.0 - 10.0) = 7.0
+        assert!((v - 7.0).abs() < 1e-10);
     }
 }

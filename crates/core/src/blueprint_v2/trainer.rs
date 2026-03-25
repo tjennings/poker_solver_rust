@@ -225,7 +225,11 @@ impl BlueprintTrainer {
             config.clustering.river.buckets,
         ];
 
-        let storage = BlueprintStorage::new(&tree, bucket_counts);
+        let storage = BlueprintStorage::new_with_baselines(
+            &tree,
+            bucket_counts,
+            config.training.use_baselines,
+        );
         let bucket_files = match &config.training.cluster_path {
             Some(path) => load_bucket_files(Path::new(path)),
             None => [None, None, None, None],
@@ -495,6 +499,11 @@ impl BlueprintTrainer {
 
             let rake_rate = self.config.game.rake_rate;
             let rake_cap = self.config.game.rake_cap;
+            let baseline_alpha = if self.storage.baselines.is_some() {
+                self.config.training.baseline_alpha
+            } else {
+                0.0
+            };
 
             // Fully parallel: each thread samples its own deal, precomputes
             // buckets, and traverses — no sequential deal generation.
@@ -519,11 +528,13 @@ impl BlueprintTrainer {
                 let (_, s0) = traverse_external(
                     tree, storage, &deal, 0, tree.root, prune, threshold, &mut rng,
                     rake_rate, rake_cap, Some(ev_tracker), Some(full_ev_tracker),
+                    baseline_alpha,
                 );
                 stats.merge(s0);
                 let (_, s1) = traverse_external(
                     tree, storage, &deal, 1, tree.root, prune, threshold, &mut rng,
                     rake_rate, rake_cap, Some(ev_tracker), Some(full_ev_tracker),
+                    baseline_alpha,
                 );
                 stats.merge(s1);
 
@@ -1198,6 +1209,10 @@ mod tests {
                 dcfr_beta: 1.0,
                 dcfr_gamma: 1.0,
                 dcfr_epoch_cap: None,
+                optimizer: "dcfr".to_string(),
+                sapcfr_eta: 0.5,
+                use_baselines: false,
+                baseline_alpha: 0.01,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 9999,
@@ -1701,5 +1716,34 @@ mod tests {
 
         let trainer = toy_trainer(config);
         assert!(!trainer.buckets.has_per_flop_dir(), "trainer should not enable per-flop without marker file");
+    }
+
+    #[test]
+    fn train_with_baselines_runs_iterations() {
+        let mut config = toy_config();
+        config.training.iterations = Some(50);
+        config.training.use_baselines = true;
+        config.training.baseline_alpha = 0.05;
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("training with baselines should complete");
+        assert_eq!(trainer.iterations, 50);
+    }
+
+    #[test]
+    fn train_with_baselines_updates_storage() {
+        let mut config = toy_config();
+        config.training.iterations = Some(20);
+        config.training.use_baselines = true;
+        config.training.baseline_alpha = 0.1;
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("training should complete");
+
+        // Verify that some regrets have been updated (training happened).
+        let any_nonzero = trainer
+            .storage
+            .regrets
+            .iter()
+            .any(|r| r.load(std::sync::atomic::Ordering::Relaxed) != 0);
+        assert!(any_nonzero, "training with baselines should update regrets");
     }
 }
