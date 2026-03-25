@@ -287,12 +287,15 @@ pub fn run_mccfr_solver(
     let bp_flop_root =
         crate::solvers::mccfr::find_flop_root(solver.tree());
     let mut history: Vec<usize> = Vec::new();
+    let mut board_cards = (None, None);
     crate::solvers::mccfr::lock_strategy_recursive(
         &mut game,
         solver.tree(),
         solver.storage(),
+        Some(solver.per_flop_buckets()),
         bp_flop_root,
         &mut history,
+        &mut board_cards,
     );
 
     game.back_to_root();
