@@ -118,6 +118,18 @@ pub fn generate_baseline_with_config(
     })
 }
 
+/// Generate an exact DCFR baseline using the same all-in-only config that
+/// `run_mccfr_solver` uses, so the comparison is apples-to-apples.
+pub fn generate_mccfr_matching_baseline() -> Result<Baseline, Box<dyn std::error::Error>> {
+    let config = FlopPokerConfig {
+        effective_stack: 10,
+        bet_sizes: "a".into(),
+        raise_sizes: "a".into(),
+        ..Default::default()
+    };
+    generate_baseline_with_config(&config, 1000, 0.001)
+}
+
 /// Run the MCCFR solver and produce a Baseline with convergence data.
 ///
 /// Uses an all-in-only `FlopPokerConfig` because the MCCFR exploitability

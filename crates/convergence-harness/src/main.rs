@@ -172,6 +172,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Max iterations: {}", iterations);
             println!("Checkpoints: {:?}", checkpoint_iters);
 
+            // Ensure a baseline exists with the SAME config (all-in-only)
+            // so the comparison is fair.
+            let baseline_path = std::path::Path::new(&baseline_dir);
+            if !baseline_path.join("summary.json").exists() {
+                println!("\nNo baseline at {}. Generating matching baseline (all-in-only config)...", baseline_dir);
+                let matching_baseline = harness::generate_mccfr_matching_baseline()?;
+                matching_baseline.save(baseline_path)?;
+                println!("Baseline saved to: {}\n", baseline_dir);
+            }
+
             let result = harness::run_mccfr_solver(iterations, &checkpoint_iters)?;
 
             println!("\n=== MCCFR Run Summary ===");
@@ -192,9 +202,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             result.save(result_dir)?;
             println!("Results saved to: {}", output_dir);
 
-            // Auto-compare if baseline exists
-            let baseline_path = std::path::Path::new(&baseline_dir);
-            if baseline_path.join("summary.json").exists() {
+            // Compare against baseline (guaranteed to exist and use matching config)
+            {
                 println!("\nComparing against baseline at: {}", baseline_dir);
                 match run_compare(baseline_path, result_dir) {
                     Ok(comparison) => {
@@ -210,11 +219,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("Warning: comparison failed: {}", e);
                     }
                 }
-            } else {
-                println!(
-                    "\nNo baseline found at '{}'. Run generate-baseline first to enable comparison.",
-                    baseline_dir
-                );
             }
 
             Ok(())
