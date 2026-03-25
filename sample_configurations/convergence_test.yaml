@@ -1,0 +1,31 @@
+# Convergence test game configuration
+# Used by both the exact baseline solver and MCCFR comparison
+
+game:
+  # Flop boards to include in the game (solver sees all, picks randomly per deal)
+  flops:
+    - "QhJdTh"   # draw-heavy, connected
+    - "Ks7d2c"   # dry, rainbow
+    - "8c8d3h"   # paired
+
+  starting_pot: 2
+  effective_stack: 20
+
+  # Bet sizes (pot-relative). Applied symmetrically to both players, all streets.
+  bet_sizes: "50%,100%,a"
+  raise_sizes: "50%,100%,a"
+
+# Baseline solver settings
+baseline:
+  max_iterations: 1000
+  target_exploitability: 0.001
+
+# MCCFR solver settings
+mccfr:
+  iterations: 1000000
+  buckets:
+    preflop: 169
+    flop: 169
+    turn: 200
+    river: 200
+  checkpoints: [1000, 10000, 100000, 500000, 1000000]
