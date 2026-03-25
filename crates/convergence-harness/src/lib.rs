@@ -3,6 +3,7 @@ pub mod comparison;
 pub mod evaluator;
 pub mod game;
 pub mod harness;
+pub mod metrics;
 pub mod reporter;
 pub mod solver_trait;
 pub mod solvers;
