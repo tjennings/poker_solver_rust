@@ -159,18 +159,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             solver,
             iterations,
             checkpoints,
-            baseline_dir: _,
-            output_dir: _,
+            baseline_dir,
+            output_dir,
         } => {
+            if solver != "mccfr" {
+                return Err(format!("Unknown solver '{}'. Available: mccfr", solver).into());
+            }
+
             let checkpoint_iters = parse_checkpoint_string(&checkpoints);
 
             println!("Starting solver: {}", solver);
             println!("Max iterations: {}", iterations);
             println!("Checkpoints: {:?}", checkpoint_iters);
 
+            let result = harness::run_mccfr_solver(iterations, &checkpoint_iters)?;
+
+            println!("\n=== MCCFR Run Summary ===");
+            println!("Solver: {}", result.summary.solver_name);
+            println!("Iterations: {}", result.summary.total_iterations);
             println!(
-                "run-solver: MCCFR adapter not yet integrated (see solvers/mccfr.rs)"
+                "Final exploitability: {:.4e}",
+                result.summary.final_exploitability
             );
+            println!(
+                "Time: {:.1}s",
+                result.summary.total_time_ms as f64 / 1000.0
+            );
+            println!("Info sets captured: {}", result.summary.num_info_sets);
+
+            // Save results
+            let result_dir = std::path::Path::new(&output_dir);
+            result.save(result_dir)?;
+            println!("Results saved to: {}", output_dir);
+
+            // Auto-compare if baseline exists
+            let baseline_path = std::path::Path::new(&baseline_dir);
+            if baseline_path.join("summary.json").exists() {
+                println!("\nComparing against baseline at: {}", baseline_dir);
+                match run_compare(baseline_path, result_dir) {
+                    Ok(comparison) => {
+                        println!("{}", comparison.human_summary());
+                        let comparison_dir = result_dir.join("comparison");
+                        comparison.save(&comparison_dir)?;
+                        println!(
+                            "Comparison artifacts saved to: {}",
+                            comparison_dir.display()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: comparison failed: {}", e);
+                    }
+                }
+            } else {
+                println!(
+                    "\nNo baseline found at '{}'. Run generate-baseline first to enable comparison.",
+                    baseline_dir
+                );
+            }
 
             Ok(())
         }
@@ -296,7 +341,7 @@ mod tests {
                 },
                 ConvergenceSample {
                     iteration: 100,
-                    exploitability: exploitability,
+                    exploitability,
                     elapsed_ms: 5000,
                 },
             ],

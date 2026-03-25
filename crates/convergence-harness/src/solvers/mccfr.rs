@@ -286,7 +286,7 @@ fn extract_lifted_strategies(
 /// The blueprint tree starts with preflop decisions and chance nodes. This
 /// walks from the root, following through preflop decisions and the
 /// preflop-to-flop chance node, until it reaches the first Flop Decision.
-fn find_flop_root(tree: &GameTree) -> u32 {
+pub fn find_flop_root(tree: &GameTree) -> u32 {
     let mut idx = tree.root;
     loop {
         match &tree.nodes[idx as usize] {
@@ -384,7 +384,7 @@ pub fn compute_mccfr_exploitability(
 
 /// Recursively walk the range-solver game tree and blueprint tree in parallel,
 /// locking the MCCFR lifted strategy at every decision node.
-fn lock_strategy_recursive(
+pub fn lock_strategy_recursive(
     game: &mut range_solver::PostFlopGame,
     tree: &GameTree,
     storage: &BlueprintStorage,
@@ -638,12 +638,12 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
         let deal = sample_fixed_flop_deal(&mut rng);
         let buckets = canonical_buckets(&deal);
-        for player in 0..2 {
-            assert_eq!(buckets[player][0], buckets[player][1]);
-            assert_eq!(buckets[player][1], buckets[player][2]);
-            assert_eq!(buckets[player][2], buckets[player][3]);
+        for player_buckets in &buckets {
+            assert_eq!(player_buckets[0], player_buckets[1]);
+            assert_eq!(player_buckets[1], player_buckets[2]);
+            assert_eq!(player_buckets[2], player_buckets[3]);
             assert!(
-                buckets[player][0] < 169,
+                player_buckets[0] < 169,
                 "Bucket must be valid canonical index"
             );
         }
@@ -736,7 +736,7 @@ mod tests {
             solver.solve_step();
         }
         let strategy = solver.average_strategy();
-        for (_nid, strat) in &strategy {
+        for strat in strategy.values() {
             assert!(!strat.is_empty(), "Strategy vector should not be empty");
             for &val in strat.iter() {
                 assert!(

@@ -5,6 +5,7 @@ use crate::evaluator;
 use crate::game::{build_flop_poker_game_with_config, FlopPokerConfig};
 use crate::solver_trait::ConvergenceSolver;
 use crate::solvers::exhaustive::ExhaustiveSolver;
+use crate::solvers::mccfr::{compute_mccfr_exploitability, MccfrSolver};
 use crate::strategy_matrix;
 
 /// Determines how often to sample exploitability.
@@ -114,6 +115,127 @@ pub fn generate_baseline_with_config(
         convergence_curve,
         strategy,
         combo_evs,
+    })
+}
+
+/// Run the MCCFR solver and produce a Baseline with convergence data.
+///
+/// Uses an all-in-only `FlopPokerConfig` because the MCCFR exploitability
+/// computation requires tree correspondence between the blueprint and
+/// range-solver trees, which currently only holds for all-in-only configs.
+///
+/// `max_iterations` is the total number of MCCFR iterations to run.
+/// `checkpoints` is a sorted list of iteration counts at which to compute
+/// exploitability and record convergence samples.
+pub fn run_mccfr_solver(
+    max_iterations: u64,
+    checkpoints: &[u64],
+) -> Result<Baseline, Box<dyn std::error::Error>> {
+    // All-in-only config: required for tree correspondence in exploitability
+    let config = FlopPokerConfig {
+        effective_stack: 10,
+        bet_sizes: "a".into(),
+        raise_sizes: "a".into(),
+        ..Default::default()
+    };
+
+    eprintln!(
+        "NOTE: MCCFR exploitability currently only works with all-in-only configs \
+         due to tree correspondence requirements."
+    );
+
+    let mut solver = MccfrSolver::new(config.clone());
+    let mut convergence_curve = Vec::new();
+    let start = Instant::now();
+
+    // Determine which checkpoints are within our iteration budget
+    let active_checkpoints: Vec<u64> = checkpoints
+        .iter()
+        .copied()
+        .filter(|&cp| cp <= max_iterations)
+        .collect();
+
+    let mut checkpoint_idx = 0;
+
+    while solver.iterations() < max_iterations {
+        solver.solve_step();
+        let current_iter = solver.iterations();
+
+        // Check if we've reached or passed the next checkpoint
+        while checkpoint_idx < active_checkpoints.len()
+            && current_iter >= active_checkpoints[checkpoint_idx]
+        {
+            let elapsed = start.elapsed().as_millis() as u64;
+            let expl = compute_mccfr_exploitability(&solver, &config)?;
+
+            convergence_curve.push(ConvergenceSample {
+                iteration: current_iter,
+                exploitability: expl,
+                elapsed_ms: elapsed,
+            });
+
+            eprintln!(
+                "checkpoint: {} iterations, exploitability = {:.4e}, elapsed = {:.1}s",
+                current_iter,
+                expl,
+                elapsed as f64 / 1000.0
+            );
+
+            checkpoint_idx += 1;
+        }
+    }
+
+    let total_time = start.elapsed().as_millis() as u64;
+    let final_expl = convergence_curve
+        .last()
+        .map_or(0.0, |s| s.exploitability);
+
+    // Print strategy matrix
+    let rs_config = FlopPokerConfig {
+        add_allin_threshold: 100.0,
+        force_allin_threshold: 0.0,
+        ..config.clone()
+    };
+    let mut game = build_flop_poker_game_with_config(&rs_config)?;
+    game.allocate_memory(false);
+
+    // Lock the MCCFR strategy into the range-solver game for visualization
+    let bp_flop_root =
+        crate::solvers::mccfr::find_flop_root(solver.tree());
+    let mut history: Vec<usize> = Vec::new();
+    crate::solvers::mccfr::lock_strategy_recursive(
+        &mut game,
+        solver.tree(),
+        solver.storage(),
+        bp_flop_root,
+        &mut history,
+    );
+
+    game.back_to_root();
+    strategy_matrix::print_strategy_matrix(&game, 0);
+
+    // Extract strategy from MCCFR solver
+    let strategy = solver.average_strategy();
+    let num_combos = game.private_cards(0).len();
+
+    let summary = BaselineSummary {
+        solver_name: solver.name().into(),
+        total_iterations: solver.iterations(),
+        final_exploitability: final_expl,
+        total_time_ms: total_time,
+        num_info_sets: strategy.len(),
+        num_combos_per_player: num_combos,
+        game_description: format!(
+            "Flop Poker: {}, {}bb effective, {}bb pot (all-in only)",
+            config.flop, config.effective_stack, config.starting_pot
+        ),
+    };
+
+    Ok(Baseline {
+        summary,
+        convergence_curve,
+        strategy,
+        combo_evs: std::collections::BTreeMap::new(), // MCCFR doesn't produce combo EVs
     })
 }
 
