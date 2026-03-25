@@ -35,6 +35,38 @@ enum Commands {
         #[arg(long)]
         result_dir: String,
     },
+    /// Run a solver against the Flop Poker game and compare to baseline
+    RunSolver {
+        /// Solver to run ("mccfr")
+        #[arg(long)]
+        solver: String,
+
+        /// Maximum iterations
+        #[arg(long, default_value_t = 1_000_000)]
+        iterations: u64,
+
+        /// Exploitability checkpoint iterations (comma-separated)
+        #[arg(long, default_value = "1000,10000,100000,500000,1000000")]
+        checkpoints: String,
+
+        /// Path to baseline directory
+        #[arg(long, default_value = "baselines/flop_poker_v1")]
+        baseline_dir: String,
+
+        /// Output directory for results
+        #[arg(long, default_value = "results/mccfr_run")]
+        output_dir: String,
+    },
+}
+
+/// Parse a comma-separated string of checkpoint iterations into a sorted Vec<u64>.
+fn parse_checkpoint_string(s: &str) -> Vec<u64> {
+    let mut checkpoints: Vec<u64> = s
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect();
+    checkpoints.sort_unstable();
+    checkpoints
 }
 
 /// Load a baseline and a solver result, compute comparison metrics.
@@ -120,6 +152,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let output_dir = result_path.join("comparison");
             comparison.save(&output_dir)?;
             println!("Comparison artifacts saved to: {}", output_dir.display());
+
+            Ok(())
+        }
+        Commands::RunSolver {
+            solver,
+            iterations,
+            checkpoints,
+            baseline_dir: _,
+            output_dir: _,
+        } => {
+            let checkpoint_iters = parse_checkpoint_string(&checkpoints);
+
+            println!("Starting solver: {}", solver);
+            println!("Max iterations: {}", iterations);
+            println!("Checkpoints: {:?}", checkpoint_iters);
+
+            println!(
+                "run-solver: MCCFR adapter not yet integrated (see solvers/mccfr.rs)"
+            );
 
             Ok(())
         }
@@ -343,5 +394,90 @@ mod tests {
             &dir.path().join("also_nonexistent"),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_run_solver_defaults() {
+        let cli = Cli::parse_from([
+            "convergence-harness",
+            "run-solver",
+            "--solver",
+            "mccfr",
+        ]);
+        match cli.command {
+            Commands::RunSolver {
+                solver,
+                iterations,
+                checkpoints,
+                baseline_dir,
+                output_dir,
+            } => {
+                assert_eq!(solver, "mccfr");
+                assert_eq!(iterations, 1_000_000);
+                assert_eq!(checkpoints, "1000,10000,100000,500000,1000000");
+                assert_eq!(baseline_dir, "baselines/flop_poker_v1");
+                assert_eq!(output_dir, "results/mccfr_run");
+            }
+            _ => panic!("expected RunSolver"),
+        }
+    }
+
+    #[test]
+    fn parse_run_solver_custom() {
+        let cli = Cli::parse_from([
+            "convergence-harness",
+            "run-solver",
+            "--solver",
+            "mccfr",
+            "--iterations",
+            "50000",
+            "--checkpoints",
+            "5000,25000,50000",
+            "--baseline-dir",
+            "/tmp/baseline",
+            "--output-dir",
+            "/tmp/output",
+        ]);
+        match cli.command {
+            Commands::RunSolver {
+                solver,
+                iterations,
+                checkpoints,
+                baseline_dir,
+                output_dir,
+            } => {
+                assert_eq!(solver, "mccfr");
+                assert_eq!(iterations, 50_000);
+                assert_eq!(checkpoints, "5000,25000,50000");
+                assert_eq!(baseline_dir, "/tmp/baseline");
+                assert_eq!(output_dir, "/tmp/output");
+            }
+            _ => panic!("expected RunSolver"),
+        }
+    }
+
+    #[test]
+    fn parse_checkpoints() {
+        let input = "1000,10000,100000,500000,1000000";
+        let parsed = parse_checkpoint_string(input);
+        assert_eq!(parsed, vec![1000, 10000, 100000, 500000, 1000000]);
+    }
+
+    #[test]
+    fn parse_checkpoints_single_value() {
+        let parsed = parse_checkpoint_string("5000");
+        assert_eq!(parsed, vec![5000]);
+    }
+
+    #[test]
+    fn parse_checkpoints_with_spaces() {
+        let parsed = parse_checkpoint_string("1000, 2000, 3000");
+        assert_eq!(parsed, vec![1000, 2000, 3000]);
+    }
+
+    #[test]
+    fn run_solver_requires_solver_arg() {
+        let result = Cli::try_parse_from(["convergence-harness", "run-solver"]);
+        assert!(result.is_err(), "run-solver should require --solver");
     }
 }
