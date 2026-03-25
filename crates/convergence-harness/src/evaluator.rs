@@ -12,7 +12,7 @@ fn node_id(history: &[usize]) -> u64 {
 
 /// Navigate back to parent position after visiting a child.
 /// Uses back_to_root + apply_history since PostFlopGame has no pop/undo.
-fn navigate_back(game: &mut PostFlopGame, history: &[usize]) {
+pub(crate) fn navigate_back(game: &mut PostFlopGame, history: &[usize]) {
     game.back_to_root();
     if !history.is_empty() {
         game.apply_history(history);
