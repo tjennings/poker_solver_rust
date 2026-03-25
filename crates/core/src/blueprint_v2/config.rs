@@ -203,23 +203,22 @@ pub struct TrainingConfig {
     /// When omitted, expected delta is computed on-the-fly (slower).
     #[serde(default)]
     pub equity_cache_path: Option<String>,
-    /// Enable variance-reducing baselines for MCCFR opponent traversal
-    /// (Schmid et al., AAAI 2019). When enabled, the opponent sampling
-    /// formula uses a running-average baseline to reduce variance.
-    #[serde(default)]
-    pub use_baselines: bool,
-    /// Baseline EMA learning rate. Controls how fast the baseline tracks
-    /// observed values: `b = (1 - alpha) * b + alpha * v_observed`.
-    #[serde(default = "default_baseline_alpha")]
-    pub baseline_alpha: f64,
-    /// Optimizer variant: `"dcfr"` (default) or `"sapcfr+"`.
+    /// Optimizer variant: "dcfr" (default), "sapcfr+", "lcfr", "cfr+".
     #[serde(default = "default_optimizer")]
     pub optimizer: String,
-    /// SAPCFR+ prediction step size (eta). Controls how much the
-    /// prediction buffer influences the current strategy. 0 = no
-    /// prediction, 1 = full PCFR+. Only used when optimizer = "sapcfr+".
+    /// SAPCFR+ prediction step size (0 = no prediction, 1 = full PCFR+).
     #[serde(default = "default_sapcfr_eta")]
     pub sapcfr_eta: f64,
+    /// Enable variance-reducing baselines for opponent external sampling.
+    /// When true, uses VR-MCCFR (Schmid et al., AAAI 2019) to reduce
+    /// sampling variance while remaining unbiased.
+    #[serde(default)]
+    pub use_baselines: bool,
+    /// EMA step size for baseline updates: `b = (1 - alpha) * b_old + alpha * v`.
+    /// Smaller values give smoother baselines but slower adaptation.
+    /// Only used when `use_baselines` is true.
+    #[serde(default = "default_baseline_alpha")]
+    pub baseline_alpha: f64,
 }
 
 /// Snapshot (checkpoint) output settings.
@@ -458,10 +457,10 @@ snapshots:
                 dcfr_beta: 0.0,
                 dcfr_gamma: 2.0,
                 dcfr_epoch_cap: None,
-                use_baselines: false,
-                baseline_alpha: 0.01,
                 optimizer: "dcfr".to_string(),
                 sapcfr_eta: 0.5,
+                use_baselines: false,
+                baseline_alpha: 0.01,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 120,
@@ -693,7 +692,100 @@ snapshots:
     }
 
     #[test]
+    fn test_optimizer_defaults_to_dcfr() {
+        let yaml = r#"
+game:
+  name: "Optimizer Default"
+  players: 2
+  stack_depth: 100.0
+  small_blind: 0.5
+  big_blind: 1.0
+
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+
+action_abstraction:
+  preflop:
+    - ["2.5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+
+training:
+  iterations: 100
+
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse config");
+        assert_eq!(cfg.training.optimizer, "dcfr");
+        assert!((cfg.training.sapcfr_eta - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_optimizer_sapcfr_plus_config() {
+        let yaml = r#"
+game:
+  name: "SAPCFR+ Test"
+  players: 2
+  stack_depth: 100.0
+  small_blind: 0.5
+  big_blind: 1.0
+
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+
+action_abstraction:
+  preflop:
+    - ["2.5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+
+training:
+  iterations: 100
+  optimizer: "sapcfr+"
+  sapcfr_eta: 0.75
+
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse sapcfr+ config");
+        assert_eq!(cfg.training.optimizer, "sapcfr+");
+        assert!((cfg.training.sapcfr_eta - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn test_baseline_config_defaults() {
+        // When baseline fields are omitted from YAML, defaults apply.
         let yaml = r#"
 game:
   name: "Baseline Defaults"
@@ -777,6 +869,7 @@ snapshots:
   snapshot_every_minutes: 30
   output_dir: "/tmp/snapshots"
 "#;
+
         let cfg: BlueprintV2Config =
             serde_yaml::from_str(yaml).expect("failed to parse config");
         assert!(cfg.training.use_baselines);
@@ -832,93 +925,4 @@ snapshots:
         assert!((restored.training.baseline_alpha - 0.02).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn test_optimizer_defaults_to_dcfr() {
-        let yaml = r#"
-game:
-  name: "Optimizer Default"
-  players: 2
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
-
-clustering:
-  preflop:
-    buckets: 169
-  flop:
-    buckets: 200
-  turn:
-    buckets: 200
-  river:
-    buckets: 200
-
-action_abstraction:
-  preflop:
-    - ["2.5bb"]
-  flop:
-    - [1.0]
-  turn:
-    - [1.0]
-  river:
-    - [1.0]
-
-training:
-  iterations: 100
-
-snapshots:
-  warmup_minutes: 60
-  snapshot_every_minutes: 30
-  output_dir: "/tmp/snapshots"
-"#;
-        let cfg: BlueprintV2Config =
-            serde_yaml::from_str(yaml).expect("failed to parse config");
-        assert_eq!(cfg.training.optimizer, "dcfr");
-        assert!((cfg.training.sapcfr_eta - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_optimizer_sapcfr_plus_config() {
-        let yaml = r#"
-game:
-  name: "SAPCFR+ Config"
-  players: 2
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
-
-clustering:
-  preflop:
-    buckets: 169
-  flop:
-    buckets: 200
-  turn:
-    buckets: 200
-  river:
-    buckets: 200
-
-action_abstraction:
-  preflop:
-    - ["2.5bb"]
-  flop:
-    - [1.0]
-  turn:
-    - [1.0]
-  river:
-    - [1.0]
-
-training:
-  iterations: 100
-  optimizer: "sapcfr+"
-  sapcfr_eta: 0.75
-
-snapshots:
-  warmup_minutes: 60
-  snapshot_every_minutes: 30
-  output_dir: "/tmp/snapshots"
-"#;
-        let cfg: BlueprintV2Config =
-            serde_yaml::from_str(yaml).expect("failed to parse config");
-        assert_eq!(cfg.training.optimizer, "sapcfr+");
-        assert!((cfg.training.sapcfr_eta - 0.75).abs() < f64::EPSILON);
-    }
 }

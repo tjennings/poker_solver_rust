@@ -217,10 +217,10 @@ fn build_mccfr_config(
             target_strategy_delta: None,
             purify_threshold: 0.0,
             equity_cache_path: None,
-            use_baselines: false,
-            baseline_alpha: 0.01,
             optimizer: "dcfr".to_string(),
             sapcfr_eta: 0.5,
+            use_baselines: false,
+            baseline_alpha: 0.01,
         },
         snapshots: SnapshotConfig {
             warmup_minutes: 9999,
