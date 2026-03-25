@@ -20,8 +20,6 @@ fn end_to_end_baseline_pipeline() {
         effective_stack: 10,
         bet_sizes: "a".into(),
         raise_sizes: "a".into(),
-        add_allin_threshold: 0.0,
-        force_allin_threshold: 0.0,
         ..Default::default()
     };
 
@@ -101,8 +99,8 @@ fn test_mccfr_pipeline_end_to_end() {
         solver.solve_step();
     }
 
-    // 3. Compute exploitability
-    let expl = compute_mccfr_exploitability(&solver, &config).unwrap();
+    // 3. Compute exploitability (flop_idx=0 for single-flop solver)
+    let expl = compute_mccfr_exploitability(&solver, &config, 0).unwrap();
     assert!(expl > 0.0, "Exploitability should be positive, got {}", expl);
     assert!(expl.is_finite(), "Exploitability should be finite, got {}", expl);
 
@@ -134,11 +132,6 @@ fn test_run_mccfr_solver_produces_baseline() {
     assert!(
         result.summary.solver_name.contains("MCCFR"),
         "Solver name should contain MCCFR, got: {}",
-        result.summary.solver_name
-    );
-    assert!(
-        result.summary.solver_name.contains("10t/10r"),
-        "Solver name should contain bucket counts, got: {}",
         result.summary.solver_name
     );
 

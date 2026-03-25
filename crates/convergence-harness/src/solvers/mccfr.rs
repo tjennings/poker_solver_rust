@@ -26,6 +26,7 @@ use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use range_solver::card::flop_from_str;
 use std::time::Instant;
 
 use crate::baseline::Baseline;
@@ -88,14 +89,20 @@ fn build_deck() -> [Card; 52] {
 
 /// Sample a deal with a fixed flop (QhJdTh).
 /// Hole cards, turn, and river are random from the remaining 49 cards.
+#[cfg(test)]
 fn sample_fixed_flop_deal(rng: &mut impl Rng) -> Deal {
-    let blocked = flop_cards();
+    sample_deal_for_flop(rng, &flop_cards())
+}
+
+/// Sample a deal for a specific flop.
+/// Hole cards, turn, and river are random from the remaining 49 cards.
+fn sample_deal_for_flop(rng: &mut impl Rng, flop: &[Card; 3]) -> Deal {
     let full_deck = build_deck();
 
     let mut deck: Vec<Card> = full_deck
         .iter()
         .copied()
-        .filter(|c| !blocked.contains(c))
+        .filter(|c| !flop.contains(c))
         .collect();
 
     // Partial Fisher-Yates: shuffle first 6 positions (2+2 hole + turn + river)
@@ -106,8 +113,22 @@ fn sample_fixed_flop_deal(rng: &mut impl Rng) -> Deal {
 
     Deal {
         hole_cards: [[deck[0], deck[1]], [deck[2], deck[3]]],
-        board: [blocked[0], blocked[1], blocked[2], deck[4], deck[5]],
+        board: [flop[0], flop[1], flop[2], deck[4], deck[5]],
     }
+}
+
+/// Convert a flop string (e.g. "QhJdTh") to core `Card` types.
+///
+/// Uses the range-solver's `flop_from_str` for parsing, then converts
+/// each range-solver card ID to a core `Card`.
+pub fn flop_str_to_core_cards(flop_str: &str) -> [Card; 3] {
+    let rs_cards = flop_from_str(flop_str)
+        .unwrap_or_else(|e| panic!("Invalid flop string '{}': {}", flop_str, e));
+    [
+        rs_card_to_core_card(rs_cards[0]),
+        rs_card_to_core_card(rs_cards[1]),
+        rs_card_to_core_card(rs_cards[2]),
+    ]
 }
 
 /// Assign canonical preflop hand index as bucket for ALL streets.
@@ -417,22 +438,15 @@ fn find_flop_root_dfs(tree: &GameTree, idx: u32) -> Option<u32> {
 /// parallel with the blueprint tree, locks the lifted MCCFR strategy at
 /// every decision node, and then runs best-response exploitability.
 ///
-/// The config's `add_allin_threshold` is overridden to a large value so the
-/// range-solver always adds all-in, matching the blueprint tree which always
-/// includes all-in at every decision node.
+/// `flop_idx` selects which flop's per-flop bucket file to use for
+/// turn/river bucket lookups.
 pub fn compute_mccfr_exploitability(
     solver: &MccfrSolver,
     config: &FlopPokerConfig,
+    flop_idx: usize,
 ) -> Result<f64, String> {
     // 1. Build range-solver game with matching tree structure.
-    //    The blueprint tree always adds all-in at every node, so we must
-    //    ensure the range-solver does the same by using a high threshold.
-    let rs_config = FlopPokerConfig {
-        add_allin_threshold: 100.0,
-        force_allin_threshold: 0.0,
-        ..config.clone()
-    };
-    let mut game = crate::game::build_flop_poker_game_with_config(&rs_config)?;
+    let mut game = crate::game::build_flop_poker_game_with_config(config)?;
     game.allocate_memory(false);
 
     // 2. Find the flop root in the blueprint tree
@@ -445,7 +459,7 @@ pub fn compute_mccfr_exploitability(
         &mut game,
         solver.tree(),
         solver.storage(),
-        Some(solver.per_flop_buckets()),
+        Some(solver.per_flop_buckets_for(flop_idx)),
         bp_flop_root,
         &mut history,
         &mut board_cards,
@@ -560,11 +574,13 @@ pub fn lock_strategy_recursive(
 // Head-to-head EV computation
 // ---------------------------------------------------------------------------
 
-/// Compute head-to-head EV: exact baseline vs MCCFR strategy.
+/// Compute head-to-head EV: exact baseline vs MCCFR strategy for a single flop.
 ///
 /// Builds two range-solver games. In each, one player uses the exact baseline
 /// strategy and the other uses the MCCFR (lifted bucket) strategy. The EV
 /// difference from the Nash value measures how much the MCCFR strategy loses.
+///
+/// `flop_idx` selects which flop's per-flop bucket file to use.
 ///
 /// Returns `(oop_delta, ip_delta, average)` in mbb/hand from MCCFR's
 /// perspective. Negative means MCCFR loses to the baseline strategy.
@@ -572,26 +588,22 @@ pub fn compute_head_to_head_ev(
     solver: &MccfrSolver,
     baseline: &Baseline,
     config: &FlopPokerConfig,
+    flop_idx: usize,
 ) -> Result<(f64, f64, f64), String> {
-    let rs_config = FlopPokerConfig {
-        add_allin_threshold: 100.0,
-        force_allin_threshold: 0.0,
-        ..config.clone()
-    };
-
     // Compute Nash EV: both players use baseline strategy
     let nash_ev = {
-        let mut game = crate::game::build_flop_poker_game_with_config(&rs_config)?;
+        let mut game = crate::game::build_flop_poker_game_with_config(config)?;
         game.allocate_memory(false);
         lock_baseline_strategy(&mut game, &baseline.strategy);
         range_solver::compute_current_ev(&game)
     };
 
     let bp_flop_root = find_flop_root(solver.tree());
+    let pf_buckets = solver.per_flop_buckets_for(flop_idx);
 
     // MCCFR as OOP (player 0), baseline as IP (player 1)
     let ev_mccfr_oop = {
-        let mut game = crate::game::build_flop_poker_game_with_config(&rs_config)?;
+        let mut game = crate::game::build_flop_poker_game_with_config(config)?;
         game.allocate_memory(false);
         let mut history = Vec::new();
         let mut board_cards = (None, None);
@@ -599,7 +611,7 @@ pub fn compute_head_to_head_ev(
             &mut game,
             solver.tree(),
             solver.storage(),
-            Some(solver.per_flop_buckets()),
+            Some(pf_buckets),
             &baseline.strategy,
             bp_flop_root,
             &mut history,
@@ -611,7 +623,7 @@ pub fn compute_head_to_head_ev(
 
     // MCCFR as IP (player 1), baseline as OOP (player 0)
     let ev_mccfr_ip = {
-        let mut game = crate::game::build_flop_poker_game_with_config(&rs_config)?;
+        let mut game = crate::game::build_flop_poker_game_with_config(config)?;
         game.allocate_memory(false);
         let mut history = Vec::new();
         let mut board_cards = (None, None);
@@ -619,7 +631,7 @@ pub fn compute_head_to_head_ev(
             &mut game,
             solver.tree(),
             solver.storage(),
-            Some(solver.per_flop_buckets()),
+            Some(pf_buckets),
             &baseline.strategy,
             bp_flop_root,
             &mut history,
@@ -812,8 +824,10 @@ pub struct MccfrSolver {
     storage: BlueprintStorage,
     /// Combo list from range-solver (card pairs using range-solver u8 encoding).
     combos: Vec<(u8, u8)>,
-    /// Clustered turn/river bucket assignments for this flop.
-    per_flop_buckets: PerFlopBucketFile,
+    /// Flop boards (core Card types).
+    flops: Vec<[Card; 3]>,
+    /// Clustered turn/river bucket assignments, one per flop.
+    all_per_flop_buckets: Vec<PerFlopBucketFile>,
     /// Pre-computed solver name string.
     name_str: String,
     iteration: u64,
@@ -826,45 +840,69 @@ impl MccfrSolver {
     /// `turn_buckets` and `river_buckets` control the granularity of the
     /// potential-aware clustering used for turn and river streets.
     pub fn new(config: FlopPokerConfig, turn_buckets: u16, river_buckets: u16) -> Self {
-        // Build a range-solver game to get the combo list.
+        Self::new_multi_flop(
+            config,
+            &[flop_cards()],
+            turn_buckets,
+            river_buckets,
+        )
+    }
+
+    /// Create a new MCCFR solver with multiple flops.
+    ///
+    /// All flops share the same game tree structure and storage (since bet
+    /// sizes are identical). Each flop gets its own per-flop bucket file
+    /// for turn/river clustering.
+    pub fn new_multi_flop(
+        config: FlopPokerConfig,
+        flops: &[[Card; 3]],
+        turn_buckets: u16,
+        river_buckets: u16,
+    ) -> Self {
+        assert!(!flops.is_empty(), "Must provide at least one flop");
+
+        // Build a range-solver game to get the combo list (using the first flop).
         let rs_game = crate::game::build_flop_poker_game_with_config(&config)
             .expect("Failed to build range-solver game for combo list");
         let combos: Vec<(u8, u8)> = rs_game.private_cards(0).to_vec();
 
-        // Cluster the fixed flop into turn/river buckets.
-        let flop = flop_cards();
-        eprintln!(
-            "Clustering flop {:?} with {} turn / {} river buckets...",
-            flop, turn_buckets, river_buckets
-        );
-        let cluster_start = Instant::now();
-        let per_flop_buckets = cluster_single_flop(
-            flop,
-            turn_buckets,
-            river_buckets,
-            50,
-            42,
-            |phase, done, total| {
-                if done == total {
-                    eprintln!("  clustering phase {}: done", phase);
-                }
-            },
-        );
-        eprintln!(
-            "Clustering complete in {:.1}s ({} turns, {} rivers/turn avg)",
-            cluster_start.elapsed().as_secs_f64(),
-            per_flop_buckets.turn_cards.len(),
-            if per_flop_buckets.turn_cards.is_empty() {
-                0
-            } else {
-                per_flop_buckets
-                    .river_cards_per_turn
-                    .iter()
-                    .map(Vec::len)
-                    .sum::<usize>()
-                    / per_flop_buckets.turn_cards.len()
-            },
-        );
+        // Cluster each flop independently.
+        let mut all_per_flop_buckets = Vec::with_capacity(flops.len());
+        for flop in flops {
+            eprintln!(
+                "Clustering flop {:?} with {} turn / {} river buckets...",
+                flop, turn_buckets, river_buckets
+            );
+            let cluster_start = Instant::now();
+            let per_flop = cluster_single_flop(
+                *flop,
+                turn_buckets,
+                river_buckets,
+                50,
+                42,
+                |phase, done, total| {
+                    if done == total {
+                        eprintln!("  clustering phase {}: done", phase);
+                    }
+                },
+            );
+            eprintln!(
+                "Clustering complete in {:.1}s ({} turns, {} rivers/turn avg)",
+                cluster_start.elapsed().as_secs_f64(),
+                per_flop.turn_cards.len(),
+                if per_flop.turn_cards.is_empty() {
+                    0
+                } else {
+                    per_flop
+                        .river_cards_per_turn
+                        .iter()
+                        .map(Vec::len)
+                        .sum::<usize>()
+                        / per_flop.turn_cards.len()
+                },
+            );
+            all_per_flop_buckets.push(per_flop);
+        }
 
         let mccfr_config = build_mccfr_config(&config, turn_buckets, river_buckets);
         let mut trainer = BlueprintTrainer::new(mccfr_config);
@@ -894,13 +932,19 @@ impl MccfrSolver {
             ),
         );
 
-        let name_str = format!("MCCFR ({}t/{}r buckets)", turn_buckets, river_buckets);
+        let name_str = format!(
+            "MCCFR ({}t/{}r buckets, {} flops)",
+            turn_buckets,
+            river_buckets,
+            flops.len()
+        );
 
         Self {
             tree,
             storage,
             combos,
-            per_flop_buckets,
+            flops: flops.to_vec(),
+            all_per_flop_buckets,
             name_str,
             iteration: 0,
             rng: SmallRng::seed_from_u64(42),
@@ -917,23 +961,36 @@ impl MccfrSolver {
         &self.storage
     }
 
-    /// Access the per-flop bucket file.
-    pub fn per_flop_buckets(&self) -> &PerFlopBucketFile {
-        &self.per_flop_buckets
+    /// Access the per-flop bucket file for a specific flop index.
+    pub fn per_flop_buckets_for(&self, flop_idx: usize) -> &PerFlopBucketFile {
+        &self.all_per_flop_buckets[flop_idx]
     }
 
-    /// Find the index of a turn card in the per-flop bucket file.
-    fn find_turn_index(&self, turn_card: Card) -> usize {
-        self.per_flop_buckets
+    /// Access all per-flop bucket files.
+    pub fn all_per_flop_buckets(&self) -> &[PerFlopBucketFile] {
+        &self.all_per_flop_buckets
+    }
+
+    /// Access the flop boards.
+    pub fn flops(&self) -> &[[Card; 3]] {
+        &self.flops
+    }
+
+    /// Assign buckets using real potential-aware clustering for a specific flop.
+    ///
+    /// Preflop and flop use canonical hand index (169 buckets).
+    /// Turn and river use the per-flop clustered bucket assignments.
+    fn clustered_buckets(&self, deal: &Deal, flop_idx: usize) -> [[u16; 4]; 2] {
+        let pf = &self.all_per_flop_buckets[flop_idx];
+        let mut result = [[0u16; 4]; 2];
+        let turn_card = deal.board[3];
+        let river_card = deal.board[4];
+        let turn_idx = pf
             .turn_cards
             .iter()
             .position(|&c| c == turn_card)
-            .unwrap_or_else(|| panic!("Turn card {:?} not found in per-flop bucket file", turn_card))
-    }
-
-    /// Find the index of a river card for a given turn in the per-flop bucket file.
-    fn find_river_index(&self, turn_idx: usize, river_card: Card) -> usize {
-        self.per_flop_buckets.river_cards_per_turn[turn_idx]
+            .unwrap_or_else(|| panic!("Turn card {:?} not found in per-flop bucket file", turn_card));
+        let river_idx = pf.river_cards_per_turn[turn_idx]
             .iter()
             .position(|&c| c == river_card)
             .unwrap_or_else(|| {
@@ -941,19 +998,7 @@ impl MccfrSolver {
                     "River card {:?} not found for turn_idx {} in per-flop bucket file",
                     river_card, turn_idx
                 )
-            })
-    }
-
-    /// Assign buckets using real potential-aware clustering.
-    ///
-    /// Preflop and flop use canonical hand index (169 buckets).
-    /// Turn and river use the per-flop clustered bucket assignments.
-    fn clustered_buckets(&self, deal: &Deal) -> [[u16; 4]; 2] {
-        let mut result = [[0u16; 4]; 2];
-        let turn_card = deal.board[3];
-        let river_card = deal.board[4];
-        let turn_idx = self.find_turn_index(turn_card);
-        let river_idx = self.find_river_index(turn_idx, river_card);
+            });
 
         for (player, row) in result.iter_mut().enumerate() {
             let hole = deal.hole_cards[player];
@@ -962,15 +1007,15 @@ impl MccfrSolver {
             let hand = CanonicalHand::from_cards(hole[0], hole[1]);
             row[0] = hand.index() as u16;
 
-            // Flop: same as preflop (single flop, no real flop clustering)
+            // Flop: same as preflop (no real flop clustering)
             row[1] = row[0];
 
             // Turn: look up in per-flop file
             let ci = combo_index(hole[0], hole[1]) as usize;
-            row[2] = self.per_flop_buckets.get_turn_bucket(turn_idx, ci);
+            row[2] = pf.get_turn_bucket(turn_idx, ci);
 
             // River: look up in per-flop file
-            row[3] = self.per_flop_buckets.get_river_bucket(turn_idx, river_idx, ci);
+            row[3] = pf.get_river_bucket(turn_idx, river_idx, ci);
         }
         result
     }
@@ -982,11 +1027,18 @@ impl ConvergenceSolver for MccfrSolver {
     }
 
     fn solve_step(&mut self) {
+        let num_flops = self.flops.len();
         for _ in 0..BATCH_SIZE {
             let seed: u64 = self.rng.random();
             let mut deal_rng = SmallRng::seed_from_u64(seed);
-            let deal = sample_fixed_flop_deal(&mut deal_rng);
-            let buckets = self.clustered_buckets(&deal);
+            // Pick a random flop (skip RNG for single-flop case)
+            let flop_idx = if num_flops == 1 {
+                0
+            } else {
+                deal_rng.random_range(0..num_flops)
+            };
+            let deal = sample_deal_for_flop(&mut deal_rng, &self.flops[flop_idx]);
+            let buckets = self.clustered_buckets(&deal, flop_idx);
             let dwb = DealWithBuckets { deal, buckets };
 
             // Traverse for both players (external sampling MCCFR)
@@ -1029,7 +1081,16 @@ impl ConvergenceSolver for MccfrSolver {
     }
 
     fn average_strategy(&self) -> StrategyMap {
-        extract_lifted_strategies(&self.tree, &self.storage, &self.combos, Some(&self.per_flop_buckets))
+        // Use the first flop's bucket file for bulk extraction. Turn/river
+        // nodes won't have board context anyway (None turn/river cards in
+        // extract_lifted_strategies), so the specific bucket file used
+        // doesn't affect preflop/flop extraction.
+        extract_lifted_strategies(
+            &self.tree,
+            &self.storage,
+            &self.combos,
+            self.all_per_flop_buckets.first(),
+        )
     }
 
     fn combo_evs(&self) -> ComboEvMap {
@@ -1163,5 +1224,72 @@ mod tests {
     fn test_parse_bet_sizes_fallback_to_default() {
         // Non-numeric, non-"a" input falls back to 67%
         assert_eq!(parse_bet_sizes("invalid"), vec![vec![0.67]]);
+    }
+
+    #[test]
+    fn test_sample_deal_for_flop_uses_given_flop() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let flop = [
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::Seven, Suit::Diamond),
+            Card::new(Value::Two, Suit::Club),
+        ];
+        let deal = sample_deal_for_flop(&mut rng, &flop);
+        assert_eq!(deal.board[0], flop[0]);
+        assert_eq!(deal.board[1], flop[1]);
+        assert_eq!(deal.board[2], flop[2]);
+    }
+
+    #[test]
+    fn test_sample_deal_for_flop_no_duplicates() {
+        let mut rng = SmallRng::seed_from_u64(7);
+        let flop = [
+            Card::new(Value::Eight, Suit::Club),
+            Card::new(Value::Eight, Suit::Diamond),
+            Card::new(Value::Three, Suit::Heart),
+        ];
+        let deal = sample_deal_for_flop(&mut rng, &flop);
+        let mut all_cards: Vec<Card> = vec![
+            deal.hole_cards[0][0],
+            deal.hole_cards[0][1],
+            deal.hole_cards[1][0],
+            deal.hole_cards[1][1],
+            deal.board[0],
+            deal.board[1],
+            deal.board[2],
+            deal.board[3],
+            deal.board[4],
+        ];
+        all_cards.sort();
+        all_cards.dedup();
+        assert_eq!(all_cards.len(), 9, "All 9 dealt cards must be unique");
+    }
+
+    #[test]
+    fn test_flop_from_str_helper_parses_valid_flop() {
+        let cards = flop_str_to_core_cards("QhJdTh");
+        let mut sorted = cards;
+        sorted.sort();
+        let mut expected = [
+            Card::new(Value::Queen, Suit::Heart),
+            Card::new(Value::Jack, Suit::Diamond),
+            Card::new(Value::Ten, Suit::Heart),
+        ];
+        expected.sort();
+        assert_eq!(sorted, expected);
+    }
+
+    #[test]
+    fn test_flop_from_str_helper_different_flop() {
+        let cards = flop_str_to_core_cards("Ks7d2c");
+        let mut sorted = cards;
+        sorted.sort();
+        let mut expected = [
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::Seven, Suit::Diamond),
+            Card::new(Value::Two, Suit::Club),
+        ];
+        expected.sort();
+        assert_eq!(sorted, expected);
     }
 }

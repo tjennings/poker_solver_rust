@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use convergence_harness::{baseline, comparison, harness, reporter};
+use convergence_harness::{baseline, comparison, config::ConvergenceConfig, harness, reporter};
 
 #[derive(Parser)]
 #[command(name = "convergence-harness")]
@@ -13,21 +13,13 @@ struct Cli {
 enum Commands {
     /// Solve Flop Poker exactly and persist the golden baseline
     GenerateBaseline {
-        /// Output directory for baseline artifacts
-        #[arg(long, default_value = "baselines/flop_poker_v1")]
-        output_dir: String,
-
-        /// Maximum iterations for the solver
-        #[arg(long, default_value_t = 1000)]
-        iterations: u32,
-
-        /// Target exploitability (fraction of pot)
-        #[arg(long, default_value_t = 0.001)]
-        target_exploitability: f32,
-
-        /// Exploitability checkpoint iterations (comma-separated). If omitted, uses dense-early schedule.
+        /// Path to YAML config file
         #[arg(long)]
-        checkpoints: Option<String>,
+        config: String,
+
+        /// Output directory for baseline artifacts
+        #[arg(long, default_value = "baselines/convergence")]
+        output_dir: String,
     },
     /// Compare a saved solver result against the baseline
     Compare {
@@ -41,44 +33,18 @@ enum Commands {
     },
     /// Run a solver against the Flop Poker game and compare to baseline
     RunSolver {
-        /// Solver to run ("mccfr")
+        /// Path to YAML config file
         #[arg(long)]
-        solver: String,
+        config: String,
 
-        /// Maximum iterations
-        #[arg(long, default_value_t = 1_000_000)]
-        iterations: u64,
-
-        /// Exploitability checkpoint iterations (comma-separated)
-        #[arg(long, default_value = "1000,10000,100000,500000,1000000")]
-        checkpoints: String,
-
-        /// Path to baseline directory (auto-generated with matching config if missing)
-        #[arg(long, default_value = "baselines/flop_poker_allin")]
+        /// Path to baseline directory (auto-generated if missing)
+        #[arg(long, default_value = "baselines/convergence")]
         baseline_dir: String,
 
         /// Output directory for results
         #[arg(long, default_value = "results/mccfr_run")]
         output_dir: String,
-
-        /// Turn buckets for clustering
-        #[arg(long, default_value_t = 200)]
-        turn_buckets: u16,
-
-        /// River buckets for clustering
-        #[arg(long, default_value_t = 200)]
-        river_buckets: u16,
     },
-}
-
-/// Parse a comma-separated string of checkpoint iterations into a sorted Vec<u64>.
-fn parse_checkpoint_string(s: &str) -> Vec<u64> {
-    let mut checkpoints: Vec<u64> = s
-        .split(',')
-        .filter_map(|part| part.trim().parse().ok())
-        .collect();
-    checkpoints.sort_unstable();
-    checkpoints
 }
 
 /// Load a baseline and a solver result, compute comparison metrics.
@@ -117,19 +83,15 @@ fn run_compare(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::GenerateBaseline {
-            output_dir,
-            iterations,
-            target_exploitability,
-            checkpoints,
-        } => {
-            let cps = checkpoints.as_deref().map(parse_checkpoint_string);
-            let baseline = harness::generate_baseline_with_config_and_checkpoints(
-                &convergence_harness::game::FlopPokerConfig::default(),
-                iterations,
-                target_exploitability,
-                cps.as_deref(),
-            )?;
+        Commands::GenerateBaseline { config, output_dir } => {
+            let cfg = ConvergenceConfig::load(std::path::Path::new(&config))?;
+
+            println!("Generating baseline for {} flop(s):", cfg.game.flops.len());
+            for flop in &cfg.game.flops {
+                println!("  - {}", flop);
+            }
+
+            let baseline = harness::generate_baseline_from_config(&cfg)?;
 
             let dir = std::path::Path::new(&output_dir);
             baseline.save(dir)?;
@@ -175,53 +137,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Commands::RunSolver {
-            solver,
-            iterations,
-            checkpoints,
+            config,
             baseline_dir,
             output_dir,
-            turn_buckets,
-            river_buckets,
         } => {
-            if solver != "mccfr" {
-                return Err(format!("Unknown solver '{}'. Available: mccfr", solver).into());
-            }
+            let cfg = ConvergenceConfig::load(std::path::Path::new(&config))?;
 
-            let checkpoint_iters = parse_checkpoint_string(&checkpoints);
+            println!("Starting MCCFR solver");
+            println!("Flops: {:?}", cfg.game.flops);
+            println!("Max iterations: {}", cfg.mccfr.iterations);
+            println!("Checkpoints: {:?}", cfg.mccfr.checkpoints);
 
-            println!("Starting solver: {}", solver);
-            println!("Max iterations: {}", iterations);
-            println!("Checkpoints: {:?}", checkpoint_iters);
-
-            // Ensure a baseline exists with the SAME config (all-in-only)
-            // so the comparison is fair.
+            // Ensure a baseline exists so h2h comparison is fair
             let baseline_path = std::path::Path::new(&baseline_dir);
             if !baseline_path.join("summary.json").exists() {
-                println!("\nNo baseline at {}. Generating matching baseline (all-in-only config)...", baseline_dir);
-                let matching_baseline = harness::generate_mccfr_matching_baseline(&checkpoint_iters)?;
+                println!(
+                    "\nNo baseline at {}. Generating matching baseline...",
+                    baseline_dir
+                );
+                let matching_baseline = harness::generate_baseline_from_config(&cfg)?;
                 matching_baseline.save(baseline_path)?;
                 println!("Baseline saved to: {}\n", baseline_dir);
             }
 
             // Load baseline for head-to-head EV computation during run
             let loaded_baseline = baseline::Baseline::load(baseline_path).ok();
-            let result = harness::run_mccfr_solver(
-                iterations,
-                &checkpoint_iters,
-                loaded_baseline.as_ref(),
-                turn_buckets,
-                river_buckets,
-            )?;
+            let result =
+                harness::run_mccfr_solver_from_config(&cfg, loaded_baseline.as_ref())?;
 
             // Save results
             let result_dir = std::path::Path::new(&output_dir);
             result.save(result_dir)?;
 
-            // Clean summary block — easy to parse in a loop
+            // Clean summary block
             println!("\n=== Result ===");
             println!("solver:     {}", result.summary.solver_name);
             println!("iterations: {}", result.summary.total_iterations);
-            println!("time:       {:.1}s", result.summary.total_time_ms as f64 / 1000.0);
+            println!(
+                "time:       {:.1}s",
+                result.summary.total_time_ms as f64 / 1000.0
+            );
             println!("mbb/hand:   {:.2}", result.summary.final_exploitability);
             println!("output:     {}", output_dir);
 
@@ -238,47 +193,45 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn parse_generate_baseline_defaults() {
-        let cli = Cli::parse_from(["convergence-harness", "generate-baseline"]);
+    fn parse_generate_baseline_requires_config() {
+        let result = Cli::try_parse_from(["convergence-harness", "generate-baseline"]);
+        assert!(
+            result.is_err(),
+            "generate-baseline should require --config"
+        );
+    }
+
+    #[test]
+    fn parse_generate_baseline_with_config() {
+        let cli = Cli::parse_from([
+            "convergence-harness",
+            "generate-baseline",
+            "--config",
+            "my_config.yaml",
+        ]);
         match cli.command {
-            Commands::GenerateBaseline {
-                output_dir,
-                iterations,
-                target_exploitability,
-                checkpoints,
-            } => {
-                assert_eq!(output_dir, "baselines/flop_poker_v1");
-                assert_eq!(iterations, 1000);
-                assert!((target_exploitability - 0.001).abs() < 1e-6);
-                assert!(checkpoints.is_none());
+            Commands::GenerateBaseline { config, output_dir } => {
+                assert_eq!(config, "my_config.yaml");
+                assert_eq!(output_dir, "baselines/convergence");
             }
             _ => panic!("expected GenerateBaseline"),
         }
     }
 
     #[test]
-    fn parse_generate_baseline_custom_args() {
+    fn parse_generate_baseline_custom_output() {
         let cli = Cli::parse_from([
             "convergence-harness",
             "generate-baseline",
+            "--config",
+            "my_config.yaml",
             "--output-dir",
             "/tmp/my_baseline",
-            "--iterations",
-            "5000",
-            "--target-exploitability",
-            "0.01",
         ]);
         match cli.command {
-            Commands::GenerateBaseline {
-                output_dir,
-                iterations,
-                target_exploitability,
-                checkpoints,
-            } => {
+            Commands::GenerateBaseline { config, output_dir } => {
+                assert_eq!(config, "my_config.yaml");
                 assert_eq!(output_dir, "/tmp/my_baseline");
-                assert_eq!(iterations, 5000);
-                assert!((target_exploitability - 0.01).abs() < 1e-6);
-                assert!(checkpoints.is_none());
             }
             _ => panic!("expected GenerateBaseline"),
         }
@@ -328,7 +281,6 @@ mod tests {
 
     #[test]
     fn compare_requires_result_dir() {
-        // --result-dir has no default, so omitting it should fail parsing
         let result = Cli::try_parse_from(["convergence-harness", "compare"]);
         assert!(result.is_err(), "compare should require --result-dir");
     }
@@ -394,8 +346,14 @@ mod tests {
         assert_eq!(comparison.solver_name, "Test Solver");
         assert!((comparison.baseline_exploitability - 0.001).abs() < 1e-9);
         assert!((comparison.final_exploitability - 0.01).abs() < 1e-9);
-        assert!(comparison.overall_l1_distance > 0.0, "L1 distance should be positive");
-        assert!(comparison.overall_max_ev_diff > 0.0, "EV diff should be positive");
+        assert!(
+            comparison.overall_l1_distance > 0.0,
+            "L1 distance should be positive"
+        );
+        assert!(
+            comparison.overall_max_ev_diff > 0.0,
+            "EV diff should be positive"
+        );
     }
 
     #[test]
@@ -454,30 +412,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_run_solver_requires_config() {
+        let result = Cli::try_parse_from(["convergence-harness", "run-solver"]);
+        assert!(result.is_err(), "run-solver should require --config");
+    }
+
+    #[test]
     fn parse_run_solver_defaults() {
         let cli = Cli::parse_from([
             "convergence-harness",
             "run-solver",
-            "--solver",
-            "mccfr",
+            "--config",
+            "test.yaml",
         ]);
         match cli.command {
             Commands::RunSolver {
-                solver,
-                iterations,
-                checkpoints,
+                config,
                 baseline_dir,
                 output_dir,
-                turn_buckets,
-                river_buckets,
             } => {
-                assert_eq!(solver, "mccfr");
-                assert_eq!(iterations, 1_000_000);
-                assert_eq!(checkpoints, "1000,10000,100000,500000,1000000");
-                assert_eq!(baseline_dir, "baselines/flop_poker_allin");
+                assert_eq!(config, "test.yaml");
+                assert_eq!(baseline_dir, "baselines/convergence");
                 assert_eq!(output_dir, "results/mccfr_run");
-                assert_eq!(turn_buckets, 200);
-                assert_eq!(river_buckets, 200);
             }
             _ => panic!("expected RunSolver"),
         }
@@ -488,65 +444,24 @@ mod tests {
         let cli = Cli::parse_from([
             "convergence-harness",
             "run-solver",
-            "--solver",
-            "mccfr",
-            "--iterations",
-            "50000",
-            "--checkpoints",
-            "5000,25000,50000",
+            "--config",
+            "custom.yaml",
             "--baseline-dir",
             "/tmp/baseline",
             "--output-dir",
             "/tmp/output",
-            "--turn-buckets",
-            "100",
-            "--river-buckets",
-            "50",
         ]);
         match cli.command {
             Commands::RunSolver {
-                solver,
-                iterations,
-                checkpoints,
+                config,
                 baseline_dir,
                 output_dir,
-                turn_buckets,
-                river_buckets,
             } => {
-                assert_eq!(solver, "mccfr");
-                assert_eq!(iterations, 50_000);
-                assert_eq!(checkpoints, "5000,25000,50000");
+                assert_eq!(config, "custom.yaml");
                 assert_eq!(baseline_dir, "/tmp/baseline");
                 assert_eq!(output_dir, "/tmp/output");
-                assert_eq!(turn_buckets, 100);
-                assert_eq!(river_buckets, 50);
             }
             _ => panic!("expected RunSolver"),
         }
-    }
-
-    #[test]
-    fn parse_checkpoints() {
-        let input = "1000,10000,100000,500000,1000000";
-        let parsed = parse_checkpoint_string(input);
-        assert_eq!(parsed, vec![1000, 10000, 100000, 500000, 1000000]);
-    }
-
-    #[test]
-    fn parse_checkpoints_single_value() {
-        let parsed = parse_checkpoint_string("5000");
-        assert_eq!(parsed, vec![5000]);
-    }
-
-    #[test]
-    fn parse_checkpoints_with_spaces() {
-        let parsed = parse_checkpoint_string("1000, 2000, 3000");
-        assert_eq!(parsed, vec![1000, 2000, 3000]);
-    }
-
-    #[test]
-    fn run_solver_requires_solver_arg() {
-        let result = Cli::try_parse_from(["convergence-harness", "run-solver"]);
-        assert!(result.is_err(), "run-solver should require --solver");
     }
 }

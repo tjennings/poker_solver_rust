@@ -1,3 +1,4 @@
+use crate::config::GameDef;
 use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
 use range_solver::bet_size::BetSizeOptions;
 use range_solver::card::{flop_from_str, NOT_DEALT};
@@ -17,10 +18,19 @@ pub struct FlopPokerConfig {
     pub bet_sizes: String,
     /// Raise size string (pot-relative), e.g. "67%"
     pub raise_sizes: String,
-    /// Threshold for adding all-in as a bet option (0.0 = never auto-add)
-    pub add_allin_threshold: f64,
-    /// Force all-in when SPR after call is below this (0.0 = disable)
-    pub force_allin_threshold: f64,
+}
+
+impl FlopPokerConfig {
+    /// Build a `FlopPokerConfig` from a `GameDef` for a specific flop.
+    pub fn from_game_def(game: &GameDef, flop: &str) -> Self {
+        Self {
+            flop: flop.into(),
+            starting_pot: game.starting_pot,
+            effective_stack: game.effective_stack,
+            bet_sizes: game.bet_sizes.clone(),
+            raise_sizes: game.raise_sizes.clone(),
+        }
+    }
 }
 
 impl Default for FlopPokerConfig {
@@ -31,15 +41,8 @@ impl Default for FlopPokerConfig {
             effective_stack: 20,
             bet_sizes: "67%".into(),
             raise_sizes: "67%".into(),
-            add_allin_threshold: 1.5,
-            force_allin_threshold: 0.6,
         }
     }
-}
-
-/// Builds the Flop Poker game with default configuration.
-pub fn build_flop_poker_game() -> Result<PostFlopGame, String> {
-    build_flop_poker_game_with_config(&FlopPokerConfig::default())
 }
 
 /// Builds the Flop Poker game with the given configuration.
@@ -70,8 +73,8 @@ pub fn build_flop_poker_game_with_config(config: &FlopPokerConfig) -> Result<Pos
         river_bet_sizes: [bet_sizes.clone(), bet_sizes.clone()],
         turn_donk_sizes: None,
         river_donk_sizes: None,
-        add_allin_threshold: config.add_allin_threshold,
-        force_allin_threshold: config.force_allin_threshold,
+        add_allin_threshold: 0.0,
+        force_allin_threshold: 0.0,
         merging_threshold: 0.0,
         depth_limit: None,
     };
@@ -83,6 +86,7 @@ pub fn build_flop_poker_game_with_config(config: &FlopPokerConfig) -> Result<Pos
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GameDef;
 
     #[test]
     fn test_invalid_flop_returns_error() {
@@ -91,5 +95,49 @@ mod tests {
             ..Default::default()
         };
         assert!(build_flop_poker_game_with_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_from_game_def_sets_all_fields() {
+        let game_def = GameDef {
+            flops: vec!["QhJdTh".into(), "Ks7d2c".into()],
+            starting_pot: 4,
+            effective_stack: 15,
+            bet_sizes: "50%,100%,a".into(),
+            raise_sizes: "50%,100%,a".into(),
+        };
+        let config = FlopPokerConfig::from_game_def(&game_def, "QhJdTh");
+        assert_eq!(config.flop, "QhJdTh");
+        assert_eq!(config.starting_pot, 4);
+        assert_eq!(config.effective_stack, 15);
+        assert_eq!(config.bet_sizes, "50%,100%,a");
+        assert_eq!(config.raise_sizes, "50%,100%,a");
+    }
+
+    #[test]
+    fn test_from_game_def_uses_specified_flop() {
+        let game_def = GameDef {
+            flops: vec!["QhJdTh".into(), "Ks7d2c".into()],
+            starting_pot: 2,
+            effective_stack: 20,
+            bet_sizes: "67%".into(),
+            raise_sizes: "67%".into(),
+        };
+        let config = FlopPokerConfig::from_game_def(&game_def, "Ks7d2c");
+        assert_eq!(config.flop, "Ks7d2c");
+    }
+
+    #[test]
+    fn test_from_game_def_builds_valid_game() {
+        let game_def = GameDef {
+            flops: vec!["QhJdTh".into()],
+            starting_pot: 2,
+            effective_stack: 10,
+            bet_sizes: "a".into(),
+            raise_sizes: "a".into(),
+        };
+        let config = FlopPokerConfig::from_game_def(&game_def, "QhJdTh");
+        let result = build_flop_poker_game_with_config(&config);
+        assert!(result.is_ok(), "Should build valid game from GameDef");
     }
 }

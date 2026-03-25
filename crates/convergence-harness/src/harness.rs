@@ -1,11 +1,14 @@
 use std::time::Instant;
 
 use crate::baseline::{Baseline, BaselineSummary, ConvergenceSample};
+use crate::config::ConvergenceConfig;
 use crate::evaluator;
 use crate::game::{build_flop_poker_game_with_config, FlopPokerConfig};
 use crate::solver_trait::ConvergenceSolver;
 use crate::solvers::exhaustive::ExhaustiveSolver;
-use crate::solvers::mccfr::{compute_head_to_head_ev, MccfrSolver};
+use crate::solvers::mccfr::{
+    compute_head_to_head_ev, flop_str_to_core_cards, MccfrSolver,
+};
 use crate::strategy_matrix;
 
 /// Determines how often to sample exploitability.
@@ -18,18 +21,6 @@ fn should_sample(iteration: u64) -> bool {
     } else {
         iteration.is_multiple_of(100)
     }
-}
-
-/// Run the exhaustive solver with default config and produce a baseline.
-pub fn generate_baseline(
-    max_iterations: u32,
-    target_exploitability: f32,
-) -> Result<Baseline, Box<dyn std::error::Error>> {
-    generate_baseline_with_config(
-        &FlopPokerConfig::default(),
-        max_iterations,
-        target_exploitability,
-    )
 }
 
 /// Run the exhaustive solver with a custom config and produce a baseline.
@@ -145,37 +136,100 @@ pub fn generate_baseline_with_config_and_checkpoints(
     })
 }
 
-/// Generate an exact DCFR baseline using the same all-in-only config that
-/// `run_mccfr_solver` uses, so the comparison is apples-to-apples.
-/// Uses the same checkpoint schedule for convergence sampling.
-pub fn generate_mccfr_matching_baseline(
-    checkpoints: &[u64],
+/// Generate an exact baseline from a `ConvergenceConfig`, solving each flop
+/// independently and combining the results into a single `Baseline`.
+///
+/// Each flop is solved with the exhaustive DCFR solver using the baseline
+/// settings from the config. Node IDs are prefixed with the flop index
+/// to ensure uniqueness across flops.
+pub fn generate_baseline_from_config(
+    cfg: &ConvergenceConfig,
 ) -> Result<Baseline, Box<dyn std::error::Error>> {
-    let config = FlopPokerConfig {
-        effective_stack: 10,
-        bet_sizes: "a".into(),
-        raise_sizes: "a".into(),
-        ..Default::default()
+    let start = Instant::now();
+    let mut combined_strategy = crate::solver_trait::StrategyMap::new();
+    let mut combined_combo_evs = crate::solver_trait::ComboEvMap::new();
+    let mut total_info_sets = 0;
+    let mut total_num_combos = 0;
+    let mut worst_exploitability = 0.0_f64;
+    let mut combined_convergence = Vec::new();
+    let checkpoints: Vec<u64> = cfg.mccfr.checkpoints.clone();
+
+    for (flop_idx, flop_str) in cfg.game.flops.iter().enumerate() {
+        println!("\n--- Solving flop {}/{}: {} ---", flop_idx + 1, cfg.game.flops.len(), flop_str);
+        let flop_config = FlopPokerConfig::from_game_def(&cfg.game, flop_str);
+
+        let baseline = generate_baseline_with_config_and_checkpoints(
+            &flop_config,
+            cfg.baseline.max_iterations,
+            cfg.baseline.target_exploitability,
+            Some(&checkpoints),
+        )?;
+
+        // Merge strategies with flop-prefixed node IDs
+        let offset = (flop_idx as u64) << 48;
+        for (nid, strat) in &baseline.strategy {
+            combined_strategy.insert(offset | nid, strat.clone());
+        }
+        for (nid, evs) in &baseline.combo_evs {
+            combined_combo_evs.insert(offset | nid, evs.clone());
+        }
+
+        total_info_sets += baseline.summary.num_info_sets;
+        total_num_combos = baseline.summary.num_combos_per_player; // same across flops
+        worst_exploitability = worst_exploitability.max(baseline.summary.final_exploitability);
+
+        // Use convergence from the first flop as representative
+        if flop_idx == 0 {
+            combined_convergence = baseline.convergence_curve;
+        }
+    }
+
+    let total_time = start.elapsed().as_millis() as u64;
+    let flop_list: String = cfg.game.flops.join(", ");
+
+    let summary = BaselineSummary {
+        solver_name: "Exhaustive DCFR (multi-flop)".into(),
+        total_iterations: combined_convergence.last().map_or(0, |s| s.iteration),
+        final_exploitability: worst_exploitability,
+        total_time_ms: total_time,
+        num_info_sets: total_info_sets,
+        num_combos_per_player: total_num_combos,
+        game_description: format!(
+            "Flop Poker: [{}], {}bb effective, {}bb pot",
+            flop_list, cfg.game.effective_stack, cfg.game.starting_pot
+        ),
     };
-    // Exact DCFR converges fast — 1000 iterations is plenty. Stop early at target.
-    generate_baseline_with_config_and_checkpoints(&config, 1000, 0.001, Some(checkpoints))
+
+    Ok(Baseline {
+        summary,
+        convergence_curve: combined_convergence,
+        strategy: combined_strategy,
+        combo_evs: combined_combo_evs,
+    })
 }
 
-/// Compute head-to-head EV loss of the MCCFR strategy against the exact
-/// baseline strategy, returned as a single average mbb/hand value.
+/// Compute multi-flop head-to-head EV loss: average mbb/hand across all flops.
 ///
-/// Plays the MCCFR strategy against the exact (baseline) strategy in both
-/// positions and averages the loss. A return value of 0.0 means the MCCFR
-/// strategy is Nash-optimal; positive values indicate how many milli-big-blinds
-/// per hand the MCCFR strategy loses on average.
-pub fn compute_head_to_head_mbb(
+/// For each flop, builds a per-flop baseline, computes h2h EV, and averages.
+fn compute_multi_flop_h2h(
     solver: &MccfrSolver,
-    baseline: &Baseline,
-    config: &FlopPokerConfig,
-) -> Result<f64, Box<dyn std::error::Error>> {
-    let (_oop_loss, _ip_loss, avg) =
-        compute_head_to_head_ev(solver, baseline, config).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    Ok(avg)
+    per_flop_baselines: &[Baseline],
+    configs: &[FlopPokerConfig],
+) -> Result<(f64, f64, f64), String> {
+    let mut total_oop = 0.0;
+    let mut total_ip = 0.0;
+    let n = configs.len();
+
+    for (flop_idx, (config, baseline)) in configs.iter().zip(per_flop_baselines.iter()).enumerate() {
+        let (oop, ip, _avg) = compute_head_to_head_ev(solver, baseline, config, flop_idx)?;
+        total_oop += oop;
+        total_ip += ip;
+    }
+
+    let avg_oop = total_oop / n as f64;
+    let avg_ip = total_ip / n as f64;
+    let avg = (avg_oop + avg_ip) / 2.0;
+    Ok((avg_oop, avg_ip, avg))
 }
 
 /// Run the MCCFR solver and produce a Baseline with convergence data.
@@ -228,7 +282,7 @@ pub fn run_mccfr_solver(
             let elapsed = start.elapsed().as_millis() as u64;
 
             if let Some(bl) = baseline {
-                match compute_head_to_head_ev(&solver, bl, &config) {
+                match compute_head_to_head_ev(&solver, bl, &config, 0) {
                     Ok((oop, ip, avg)) => {
                         convergence_curve.push(ConvergenceSample {
                             iteration: current_iter,
@@ -275,12 +329,7 @@ pub fn run_mccfr_solver(
         .map_or(0.0, |s| s.exploitability);
 
     // Print strategy matrix
-    let rs_config = FlopPokerConfig {
-        add_allin_threshold: 100.0,
-        force_allin_threshold: 0.0,
-        ..config.clone()
-    };
-    let mut game = build_flop_poker_game_with_config(&rs_config)?;
+    let mut game = build_flop_poker_game_with_config(&config)?;
     game.allocate_memory(false);
 
     // Lock the MCCFR strategy into the range-solver game for visualization
@@ -292,7 +341,7 @@ pub fn run_mccfr_solver(
         &mut game,
         solver.tree(),
         solver.storage(),
-        Some(solver.per_flop_buckets()),
+        Some(solver.per_flop_buckets_for(0)),
         bp_flop_root,
         &mut history,
         &mut board_cards,
@@ -323,6 +372,156 @@ pub fn run_mccfr_solver(
         convergence_curve,
         strategy,
         combo_evs: std::collections::BTreeMap::new(), // MCCFR doesn't produce combo EVs
+    })
+}
+
+/// Run the MCCFR solver from a `ConvergenceConfig` with multi-flop support.
+///
+/// Clusters each flop, trains a single blueprint across all flops, and
+/// computes head-to-head mbb/hand loss against per-flop baselines at
+/// each checkpoint.
+pub fn run_mccfr_solver_from_config(
+    cfg: &ConvergenceConfig,
+    baseline: Option<&Baseline>,
+) -> Result<Baseline, Box<dyn std::error::Error>> {
+    let flops: Vec<[poker_solver_core::poker::Card; 3]> = cfg
+        .game
+        .flops
+        .iter()
+        .map(|s| flop_str_to_core_cards(s))
+        .collect();
+
+    let configs: Vec<FlopPokerConfig> = cfg
+        .game
+        .flops
+        .iter()
+        .map(|s| FlopPokerConfig::from_game_def(&cfg.game, s))
+        .collect();
+
+    // Use the first flop's config to build the MCCFR solver (tree structure
+    // is identical for all flops since bet sizes are the same).
+    let mut solver = MccfrSolver::new_multi_flop(
+        configs[0].clone(),
+        &flops,
+        cfg.mccfr.buckets.turn,
+        cfg.mccfr.buckets.river,
+    );
+
+    let max_iterations = cfg.mccfr.iterations;
+    let checkpoints = &cfg.mccfr.checkpoints;
+
+    // Build per-flop baselines for h2h computation (if a combined baseline was provided).
+    // We solve each flop independently to get per-flop baselines.
+    let per_flop_baselines: Option<Vec<Baseline>> = if baseline.is_some() {
+        let mut baselines = Vec::new();
+        for (flop_idx, flop_config) in configs.iter().enumerate() {
+            eprintln!("Building per-flop baseline for flop {} ({})...", flop_idx, cfg.game.flops[flop_idx]);
+            let bl = generate_baseline_with_config_and_checkpoints(
+                flop_config,
+                cfg.baseline.max_iterations,
+                cfg.baseline.target_exploitability,
+                Some(checkpoints),
+            )?;
+            baselines.push(bl);
+        }
+        Some(baselines)
+    } else {
+        None
+    };
+
+    let mut convergence_curve = Vec::new();
+    let start = Instant::now();
+
+    let active_checkpoints: Vec<u64> = checkpoints
+        .iter()
+        .copied()
+        .filter(|&cp| cp <= max_iterations)
+        .collect();
+
+    let mut checkpoint_idx = 0;
+
+    while solver.iterations() < max_iterations {
+        solver.solve_step();
+        let current_iter = solver.iterations();
+
+        while checkpoint_idx < active_checkpoints.len()
+            && current_iter >= active_checkpoints[checkpoint_idx]
+        {
+            let elapsed = start.elapsed().as_millis() as u64;
+
+            if let Some(ref baselines) = per_flop_baselines {
+                match compute_multi_flop_h2h(&solver, baselines, &configs) {
+                    Ok((oop, ip, avg)) => {
+                        convergence_curve.push(ConvergenceSample {
+                            iteration: current_iter,
+                            exploitability: avg,
+                            elapsed_ms: elapsed,
+                        });
+                        eprintln!(
+                            "checkpoint: {} iterations, h2h mbb/hand = {:.2} (OOP {:.2}, IP {:.2}), elapsed = {:.1}s",
+                            current_iter, avg, oop, ip,
+                            elapsed as f64 / 1000.0
+                        );
+                    }
+                    Err(e) => {
+                        convergence_curve.push(ConvergenceSample {
+                            iteration: current_iter,
+                            exploitability: 0.0,
+                            elapsed_ms: elapsed,
+                        });
+                        eprintln!(
+                            "checkpoint: {} iterations, h2h error: {}, elapsed = {:.1}s",
+                            current_iter, e, elapsed as f64 / 1000.0
+                        );
+                    }
+                }
+            } else {
+                convergence_curve.push(ConvergenceSample {
+                    iteration: current_iter,
+                    exploitability: 0.0,
+                    elapsed_ms: elapsed,
+                });
+                eprintln!(
+                    "checkpoint: {} iterations, elapsed = {:.1}s",
+                    current_iter, elapsed as f64 / 1000.0
+                );
+            }
+
+            checkpoint_idx += 1;
+        }
+    }
+
+    let total_time = start.elapsed().as_millis() as u64;
+    let final_h2h = convergence_curve
+        .last()
+        .map_or(0.0, |s| s.exploitability);
+
+    // Extract strategy
+    let strategy = solver.average_strategy();
+
+    // Use the first flop to get num_combos (same for all flops with identical stack/pot)
+    let rs_game = build_flop_poker_game_with_config(&configs[0])?;
+    let num_combos = rs_game.private_cards(0).len();
+
+    let flop_list: String = cfg.game.flops.join(", ");
+    let summary = BaselineSummary {
+        solver_name: solver.name().into(),
+        total_iterations: solver.iterations(),
+        final_exploitability: final_h2h,
+        total_time_ms: total_time,
+        num_info_sets: strategy.len(),
+        num_combos_per_player: num_combos,
+        game_description: format!(
+            "Flop Poker: [{}], {}bb effective, {}bb pot",
+            flop_list, cfg.game.effective_stack, cfg.game.starting_pot
+        ),
+    };
+
+    Ok(Baseline {
+        summary,
+        convergence_curve,
+        strategy,
+        combo_evs: std::collections::BTreeMap::new(),
     })
 }
 

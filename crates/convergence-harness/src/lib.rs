@@ -1,5 +1,6 @@
 pub mod baseline;
 pub mod comparison;
+pub mod config;
 pub mod evaluator;
 pub mod game;
 pub mod harness;
