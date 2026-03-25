@@ -213,42 +213,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 river_buckets,
             )?;
 
-            println!("\n=== MCCFR Run Summary ===");
-            println!("Solver: {}", result.summary.solver_name);
-            println!("Iterations: {}", result.summary.total_iterations);
-            println!(
-                "Time: {:.1}s",
-                result.summary.total_time_ms as f64 / 1000.0
-            );
-            println!(
-                "h2h mbb/hand: {:.2}",
-                result.summary.final_exploitability
-            );
-            println!("Info sets captured: {}", result.summary.num_info_sets);
-
             // Save results
             let result_dir = std::path::Path::new(&output_dir);
             result.save(result_dir)?;
-            println!("Results saved to: {}", output_dir);
 
-            // Compare against baseline (guaranteed to exist and use matching config)
-            {
-                println!("\nComparing against baseline at: {}", baseline_dir);
-                match run_compare(baseline_path, result_dir) {
-                    Ok(comparison) => {
-                        println!("{}", comparison.human_summary());
-                        let comparison_dir = result_dir.join("comparison");
-                        comparison.save(&comparison_dir)?;
-                        println!(
-                            "Comparison artifacts saved to: {}",
-                            comparison_dir.display()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: comparison failed: {}", e);
-                    }
-                }
-            }
+            // Clean summary block — easy to parse in a loop
+            println!("\n=== Result ===");
+            println!("solver:     {}", result.summary.solver_name);
+            println!("iterations: {}", result.summary.total_iterations);
+            println!("time:       {:.1}s", result.summary.total_time_ms as f64 / 1000.0);
+            println!("mbb/hand:   {:.2}", result.summary.final_exploitability);
+            println!("output:     {}", output_dir);
 
             Ok(())
         }
