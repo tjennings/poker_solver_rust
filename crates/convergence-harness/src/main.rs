@@ -53,8 +53,8 @@ enum Commands {
         #[arg(long, default_value = "1000,10000,100000,500000,1000000")]
         checkpoints: String,
 
-        /// Path to baseline directory
-        #[arg(long, default_value = "baselines/flop_poker_v1")]
+        /// Path to baseline directory (auto-generated with matching config if missing)
+        #[arg(long, default_value = "baselines/flop_poker_allin")]
         baseline_dir: String,
 
         /// Output directory for results
@@ -479,7 +479,7 @@ mod tests {
                 assert_eq!(solver, "mccfr");
                 assert_eq!(iterations, 1_000_000);
                 assert_eq!(checkpoints, "1000,10000,100000,500000,1000000");
-                assert_eq!(baseline_dir, "baselines/flop_poker_v1");
+                assert_eq!(baseline_dir, "baselines/flop_poker_allin");
                 assert_eq!(output_dir, "results/mccfr_run");
             }
             _ => panic!("expected RunSolver"),
