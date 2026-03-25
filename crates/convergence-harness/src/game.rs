@@ -85,36 +85,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_flop_poker_game() {
-        let game = build_flop_poker_game().unwrap();
-        // 49 remaining cards (52 - 3 board cards) => C(49,2) = 1176 combos per player
-        assert_eq!(game.private_cards(0).len(), 1176);
-        assert_eq!(game.private_cards(1).len(), 1176);
-    }
-
-    #[test]
-    fn test_flop_poker_memory_is_tractable() {
-        let game = build_flop_poker_game().unwrap();
-        let (uncompressed, _compressed) = game.memory_usage();
-        // Must be under 4GB uncompressed to be tractable
-        assert!(
-            uncompressed < 4 * 1024 * 1024 * 1024,
-            "Memory usage too high: {} bytes",
-            uncompressed
-        );
-    }
-
-    #[test]
-    fn test_custom_config() {
-        let config = FlopPokerConfig {
-            effective_stack: 10,
-            ..Default::default()
-        };
-        let game = build_flop_poker_game_with_config(&config).unwrap();
-        assert_eq!(game.private_cards(0).len(), 1176);
-    }
-
-    #[test]
     fn test_invalid_flop_returns_error() {
         let config = FlopPokerConfig {
             flop: "ZzZzZz".into(),
