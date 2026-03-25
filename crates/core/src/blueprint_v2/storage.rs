@@ -178,11 +178,21 @@ impl BlueprintStorage {
     }
 
     /// Add a delta to a single regret value atomically.
+    /// Panics if the result would overflow i32 — this indicates the discount
+    /// interval is too large and regrets are accumulating without being scaled.
     #[inline]
     pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
-        self.regrets[idx].fetch_add(delta, Ordering::Relaxed);
+        let old = self.regrets[idx].fetch_add(delta, Ordering::Relaxed);
+        // Check for overflow: if signs match and result flipped, we overflowed.
+        if delta > 0 && old > 0 && old.checked_add(delta).is_none() {
+            panic!(
+                "Regret overflow at node={node_idx} bucket={bucket} action={action}: \
+                 old={old} + delta={delta} exceeds i32::MAX. \
+                 Reduce lcfr_discount_interval to apply discounting more frequently."
+            );
+        }
     }
 
     /// Read a single strategy sum value atomically.
