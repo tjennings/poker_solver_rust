@@ -33,10 +33,23 @@ pub fn generate_baseline(
 }
 
 /// Run the exhaustive solver with a custom config and produce a baseline.
+///
+/// If `checkpoints` is `Some`, exploitability is sampled at those iterations only.
+/// If `None`, uses the default dense-early/sparse-later schedule.
 pub fn generate_baseline_with_config(
     config: &FlopPokerConfig,
     max_iterations: u32,
     target_exploitability: f32,
+) -> Result<Baseline, Box<dyn std::error::Error>> {
+    generate_baseline_with_config_and_checkpoints(config, max_iterations, target_exploitability, None)
+}
+
+/// Run the exhaustive solver with explicit checkpoint iterations.
+pub fn generate_baseline_with_config_and_checkpoints(
+    config: &FlopPokerConfig,
+    max_iterations: u32,
+    target_exploitability: f32,
+    checkpoints: Option<&[u64]>,
 ) -> Result<Baseline, Box<dyn std::error::Error>> {
     let game = build_flop_poker_game_with_config(config)?;
     let num_combos = game.private_cards(0).len();
@@ -54,11 +67,25 @@ pub fn generate_baseline_with_config(
     });
     println!("iteration: 0 (exploitability = {:.4e})", initial_expl);
 
+    let mut checkpoint_idx = 0;
+
     for _t in 0..max_iterations {
         solver.solve_step();
         let iter = solver.iterations();
 
-        if should_sample(iter) || iter == max_iterations as u64 {
+        let should_record = match checkpoints {
+            Some(cps) => {
+                let mut hit = false;
+                while checkpoint_idx < cps.len() && iter >= cps[checkpoint_idx] {
+                    hit = true;
+                    checkpoint_idx += 1;
+                }
+                hit
+            }
+            None => should_sample(iter) || iter == max_iterations as u64,
+        };
+
+        if should_record {
             let expl = solver.exploitability();
             let elapsed = start.elapsed().as_millis() as u64;
 
@@ -120,14 +147,18 @@ pub fn generate_baseline_with_config(
 
 /// Generate an exact DCFR baseline using the same all-in-only config that
 /// `run_mccfr_solver` uses, so the comparison is apples-to-apples.
-pub fn generate_mccfr_matching_baseline() -> Result<Baseline, Box<dyn std::error::Error>> {
+/// Uses the same checkpoint schedule for convergence sampling.
+pub fn generate_mccfr_matching_baseline(
+    checkpoints: &[u64],
+) -> Result<Baseline, Box<dyn std::error::Error>> {
     let config = FlopPokerConfig {
         effective_stack: 10,
         bet_sizes: "a".into(),
         raise_sizes: "a".into(),
         ..Default::default()
     };
-    generate_baseline_with_config(&config, 1000, 0.001)
+    let max_iter = checkpoints.last().copied().unwrap_or(1000) as u32;
+    generate_baseline_with_config_and_checkpoints(&config, max_iter, 0.001, Some(checkpoints))
 }
 
 /// Run the MCCFR solver and produce a Baseline with convergence data.

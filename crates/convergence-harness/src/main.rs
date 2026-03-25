@@ -177,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let baseline_path = std::path::Path::new(&baseline_dir);
             if !baseline_path.join("summary.json").exists() {
                 println!("\nNo baseline at {}. Generating matching baseline (all-in-only config)...", baseline_dir);
-                let matching_baseline = harness::generate_mccfr_matching_baseline()?;
+                let matching_baseline = harness::generate_mccfr_matching_baseline(&checkpoint_iters)?;
                 matching_baseline.save(baseline_path)?;
                 println!("Baseline saved to: {}\n", baseline_dir);
             }
