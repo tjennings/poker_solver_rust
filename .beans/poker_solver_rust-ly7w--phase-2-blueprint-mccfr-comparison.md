@@ -1,28 +1,25 @@
 ---
 # poker_solver_rust-ly7w
 title: 'Phase 2: Blueprint MCCFR comparison'
-status: in-progress
+status: completed
 type: feature
 priority: normal
 created_at: 2026-03-24T22:12:40Z
-updated_at: 2026-03-25T03:04:12Z
+updated_at: 2026-03-25T04:05:15Z
 parent: poker_solver_rust-elst
 ---
 
-Run blueprint MCCFR solver on the Flop Poker game and compare against the exact baseline.
+## Summary of Changes
 
-## Key Work
-- [ ] Run clustering pipeline on Flop Poker to produce buckets (or use 169 canonical hands as simple first pass)
-- [ ] MCCFR solver adapter implementing ConvergenceSolver trait
-- [ ] Bucket-to-combo strategy lifting (map bucket-level strategy back to individual combos)
-- [ ] Compute exploitability of MCCFR strategy in the full (unabstracted) game
-- [ ] run-solver --solver mccfr CLI subcommand
-- [ ] Compare report: exploitability gap, L1 distance, combo EV diff vs baseline
+Added MCCFR solver adapter to the convergence harness (Phase 2):
 
-## Open Questions
-- Can we bypass full clustering and use 169 canonical preflop hand indices as buckets for a simple first pass?
-- How to build the blueprint game tree for postflop-only (no preflop)?
-- What bucket counts to test? (100, 200, 500, 1000?)
+- **MccfrSolver**: wraps BlueprintTrainer, custom training loop calling traverse_external() directly
+- **Fixed-flop deals**: always QhJdTh, random hole cards/turn/river
+- **169 canonical buckets**: preflop hand index for all streets (pipeline validation)
+- **Strategy lifting**: bucket→combo mapping via CanonicalHand
+- **Exploitability computation**: inject MCCFR strategy into range-solver via lock_current_strategy, compute best-response Nash gap
+- **run-solver CLI**: \`--solver mccfr --iterations N --checkpoints 1K,10K,...\`
+- **Metrics**: strategy delta, avg positive regret
+- **Limitation**: tree correspondence currently works with all-in-only configs; pot-relative bet sizes need matching work
 
-## Blocked By
-Phase 1 (complete)
+144 tests, clippy clean.
