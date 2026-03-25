@@ -208,7 +208,7 @@ mod tests {
         let num_hands_ip = game.private_cards(1).len();
         let strategy = extract_strategy(&mut game);
 
-        for (_nid, strat) in &strategy {
+        for strat in strategy.values() {
             assert!(!strat.is_empty(), "Strategy vector should not be empty");
             // All values should be non-negative (probabilities)
             for &val in strat.iter() {
