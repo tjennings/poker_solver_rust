@@ -1714,15 +1714,13 @@ pub fn game_solve_core(
         let final_matrix = build_solve_matrix(&mut game, Some(&evs));
         *ss_clone.matrix_snapshot.write() = Some(final_matrix);
 
-        // Compute final exploitability (only valid for full-depth solves).
-        // For depth-limited solves, boundary CFV cache is strategy-dependent
-        // and gives incorrect values for the best-response traversal.
-        if n_boundaries == 0 {
-            let final_exp = compute_exploitability(&game);
-            ss_clone
-                .exploitability_bits
-                .store(final_exp.to_bits(), Ordering::Relaxed);
-        }
+        // Flush boundary caches so exploitability computation repopulates
+        // them with best-response reach (different from the solve's reach).
+        game.flush_boundary_caches();
+        let final_exp = compute_exploitability(&game);
+        ss_clone
+            .exploitability_bits
+            .store(final_exp.to_bits(), Ordering::Relaxed);
 
         ss_clone.solving.store(false, Ordering::Release);
         let reported_exp = f32::from_bits(ss_clone.exploitability_bits.load(Ordering::Relaxed));
