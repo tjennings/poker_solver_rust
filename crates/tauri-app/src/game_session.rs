@@ -1068,13 +1068,122 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
     }
 }
 
-/// Evaluate boundary CFVs using a `RolloutLeafEvaluator` and inject them
-/// into the `PostFlopGame`.
-///
-/// After at least one solve_step, `game.boundary_reach(ordinal, player)`
-/// contains the opponent's reach probabilities at each boundary — filtered
-/// through the current strategy. We use these for rollout opponent sampling
-/// instead of the initial (unfiltered) ranges.
+/// Adapter implementing `BoundaryEvaluator` for the range-solver.
+/// SPR=0 boundaries use exact matchup equity; SPR>0 uses RolloutLeafEvaluator.
+struct SolveBoundaryEvaluator {
+    /// Private cards per player, in range-solver ordering (card ID pairs).
+    private_cards: [Vec<(u8, u8)>; 2],
+    /// Board cards as rs_poker Cards (for equity computation).
+    board_cards: Vec<rs_poker::core::Card>,
+    /// Effective stack at game start.
+    eff_stack: f64,
+    /// Rollout evaluator for SPR>0 boundaries (None if CbvContext unavailable).
+    rollout: Option<RolloutLeafEvaluator>,
+    /// Combos in rollout ordering + card mappings per player.
+    combos: Vec<[rs_poker::core::Card; 2]>,
+    /// Maps game private_cards index → combo index, per player.
+    game_to_combo: [Vec<usize>; 2],
+}
+
+impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
+    fn compute_cfvs(
+        &self,
+        player: usize,
+        pot: i32,
+        remaining_stack: f64,
+        opponent_reach: &[f32],
+        num_hands: usize,
+    ) -> Vec<f32> {
+        let opp = player ^ 1;
+
+        if remaining_stack <= 0.0 {
+            // SPR=0: exact equity against opponent's filtered range.
+            use rayon::prelude::*;
+            let hero_cards = &self.private_cards[player];
+            let opp_cards = &self.private_cards[opp];
+
+            hero_cards
+                .par_iter()
+                .enumerate()
+                .map(|(i, &(h1, h2))| {
+                    let rs_h1 = crate::exploration::range_solver_to_rs_card(h1);
+                    let rs_h2 = crate::exploration::range_solver_to_rs_card(h2);
+                    let mut ev_sum = 0.0f64;
+                    let mut weight_sum = 0.0f64;
+                    for (j, &(o1, o2)) in opp_cards.iter().enumerate() {
+                        let w = if j < opponent_reach.len() { opponent_reach[j] as f64 } else { 0.0 };
+                        if w <= 0.0 { continue; }
+                        let rs_o1 = crate::exploration::range_solver_to_rs_card(o1);
+                        let rs_o2 = crate::exploration::range_solver_to_rs_card(o2);
+                        // Skip card overlaps
+                        if rs_h1 == rs_o1 || rs_h1 == rs_o2 || rs_h2 == rs_o1 || rs_h2 == rs_o2 {
+                            continue;
+                        }
+                        if self.board_cards.iter().any(|b| *b == rs_o1 || *b == rs_o2) {
+                            continue;
+                        }
+                        let eq = poker_solver_core::showdown_equity::compute_matchup_equity(
+                            [rs_h1, rs_h2], [rs_o1, rs_o2], &self.board_cards,
+                        );
+                        ev_sum += eq * w;
+                        weight_sum += w;
+                    }
+                    if weight_sum > 0.0 {
+                        ((ev_sum / weight_sum) - 0.5) as f32 * 2.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        } else if let Some(ref rollout) = self.rollout {
+            // SPR > 0: rollout with boundary stack/pot.
+            // Convert opponent_reach from game ordering to combo ordering.
+            let opp_map = &self.game_to_combo[opp];
+            let mut opp_combo_reach = vec![0.0f64; self.combos.len()];
+            for (game_idx, &combo_idx) in opp_map.iter().enumerate() {
+                if combo_idx < opp_combo_reach.len() && game_idx < opponent_reach.len() {
+                    opp_combo_reach[combo_idx] = opponent_reach[game_idx] as f64;
+                }
+            }
+            // Hero reach: use 1.0 for all (the solver weights externally).
+            let hero_combo_reach = vec![1.0f64; self.combos.len()];
+
+            let boundary_starting_stack = remaining_stack + pot as f64 / 2.0;
+            let eval = RolloutLeafEvaluator::new(
+                rollout.strategy.clone(),
+                rollout.abstract_tree.clone(),
+                rollout.all_buckets.clone(),
+                rollout.abstract_start_node,
+                rollout.bias,
+                rollout.bias_factor,
+                rollout.num_rollouts,
+                rollout.num_opponent_samples,
+                boundary_starting_stack,
+                pot as f64,
+            );
+            let requests = vec![(pot as f64, 0.0, player as u8)];
+            let results = eval.evaluate_boundaries(
+                &self.combos, &self.board_cards, &hero_combo_reach, &opp_combo_reach, &requests,
+            );
+            let combo_cfvs = results.into_iter().next().unwrap_or_default();
+
+            // Map combo ordering → game ordering
+            let hero_map = &self.game_to_combo[player];
+            let mut cfvs = vec![0.0f32; num_hands];
+            for (game_idx, &combo_idx) in hero_map.iter().enumerate() {
+                if combo_idx < combo_cfvs.len() && game_idx < cfvs.len() {
+                    cfvs[game_idx] = combo_cfvs[combo_idx] as f32;
+                }
+            }
+            cfvs
+        } else {
+            // No rollout available, return zero
+            vec![0.0; num_hands]
+        }
+    }
+}
+
+/// Old evaluate_and_inject_boundaries — kept for reference but no longer called.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_and_inject_boundaries(
     game: &mut PostFlopGame,
@@ -1494,40 +1603,44 @@ pub fn game_solve_core(
             *ss_clone.solve_actions.write() = actions;
         }
 
-        // Build RolloutLeafEvaluator if CbvContext available and boundaries exist
-        let evaluator_data = if game.num_boundary_nodes() > 0 {
-            if let Some(ctx) = &cbv_ctx {
-                // Parse board for rs_poker cards
-                let board_cards: Vec<rs_poker::core::Card> = board_clone
-                    .iter()
-                    .filter_map(|s| parse_rs_poker_card(s).ok())
-                    .collect();
+        // Set up lazy boundary evaluator if boundaries exist
+        let n_boundaries = game.num_boundary_nodes();
+        if n_boundaries > 0 {
+            let board_cards: Vec<rs_poker::core::Card> = board_clone
+                .iter()
+                .filter_map(|s| parse_rs_poker_card(s).ok())
+                .collect();
 
-                // Enumerate combos (all non-blocked 2-card combos)
-                let mut combos: Vec<[rs_poker::core::Card; 2]> = Vec::new();
-                let mut oop_reach_f64 = Vec::new();
-                let mut ip_reach_f64 = Vec::new();
-                use poker_solver_core::hands::all_hands;
-                for hand in all_hands() {
-                    for (c0, c1) in hand.combos() {
-                        if board_cards.iter().any(|b| *b == c0 || *b == c1) {
-                            continue;
-                        }
-                        let id0 = rs_poker_card_to_id(c0);
-                        let id1 = rs_poker_card_to_id(c1);
-                        let ci = card_pair_to_index(id0, id1);
-                        combos.push([c0, c1]);
-                        oop_reach_f64.push(f64::from(oop_w[ci]));
-                        ip_reach_f64.push(f64::from(ip_w[ci]));
+            // Enumerate combos + build game→combo mappings
+            let mut combos: Vec<[rs_poker::core::Card; 2]> = Vec::new();
+            use poker_solver_core::hands::all_hands;
+            for hand in all_hands() {
+                for (c0, c1) in hand.combos() {
+                    if board_cards.iter().any(|b| *b == c0 || *b == c1) {
+                        continue;
                     }
+                    combos.push([c0, c1]);
                 }
+            }
 
+            let build_map = |player: usize, combos: &[[rs_poker::core::Card; 2]]| -> Vec<usize> {
+                game.private_cards(player).iter().map(|&(c1, c2)| {
+                    let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
+                    let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
+                    combos.iter().position(|c|
+                        (c[0] == rs_c1 && c[1] == rs_c2) || (c[0] == rs_c2 && c[1] == rs_c1)
+                    ).unwrap_or(usize::MAX)
+                }).collect()
+            };
+            let map0 = build_map(0, &combos);
+            let map1 = build_map(1, &combos);
+
+            let rollout = cbv_ctx.as_ref().map(|ctx| {
                 let bias_factor = rollout_bias_factor.unwrap_or(10.0);
                 let num_rollouts = rollout_num_samples.unwrap_or(3);
                 let opp_samples = rollout_opponent_samples.unwrap_or(8);
                 let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
-
-                let evaluator = RolloutLeafEvaluator::new(
+                RolloutLeafEvaluator::new(
                     Arc::clone(&ctx.strategy),
                     Arc::new(ctx.abstract_tree.clone()),
                     Arc::clone(&ctx.all_buckets),
@@ -1538,26 +1651,28 @@ pub fn game_solve_core(
                     opp_samples,
                     starting_stack,
                     f64::from(pot),
-                );
+                )
+            });
 
-                Some((evaluator, board_cards, combos, oop_reach_f64, ip_reach_f64))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+            game.boundary_evaluator = Some(Arc::new(SolveBoundaryEvaluator {
+                private_cards: [
+                    game.private_cards(0).to_vec(),
+                    game.private_cards(1).to_vec(),
+                ],
+                board_cards,
+                eff_stack: f64::from(eff_stack),
+                rollout,
+                combos,
+                game_to_combo: [map0, map1],
+            }));
+        }
 
-        let n_boundaries = game.num_boundary_nodes();
         let (mem_est, _) = game.memory_usage();
-        eprintln!("[solve] boundary nodes: {n_boundaries}, evaluator: {}", evaluator_data.is_some());
+        eprintln!("[solve] boundary nodes: {n_boundaries}, evaluator: {}", game.boundary_evaluator.is_some());
         eprintln!("[solve] abstract_node_idx: {:?}", abstract_node_idx);
         eprintln!("[solve] pot={pot}, eff_stack={eff_stack}, board={board:?}");
         eprintln!("[solve] OOP hands: {}, IP hands: {}", game.private_cards(0).len(), game.private_cards(1).len());
         eprintln!("[solve] memory: {:.1} MB", mem_est as f64 / 1_048_576.0);
-
-        // Boundary CFVs are computed lazily during solve_step (via BoundaryEvaluator).
-        // No explicit pre-population needed.
 
         // Initial matrix snapshot
         let matrix = build_solve_matrix(&mut game, None);
