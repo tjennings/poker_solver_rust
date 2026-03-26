@@ -1494,12 +1494,19 @@ pub fn game_solve_core(
 
         // Check if boundary CFVs are being read by the solver
         if n_boundaries > 0 {
-            // Run one solve step, then check exploitability change
             if let Some((ref evaluator, ref board_cards, ref combos, ref oop_reach, ref ip_reach)) = evaluator_data {
                 evaluate_and_inject_boundaries(
                     &mut game, evaluator, board_cards, oop_reach, ip_reach, combos,
                 );
             }
+            // Count how many boundary slots have CFVs set (2 per boundary: OOP + IP)
+            let total_slots = n_boundaries * 2;
+            let set_slots = (0..n_boundaries).map(|o| {
+                let oop_set = !game.boundary_cfvs_empty(o, 0);
+                let ip_set = !game.boundary_cfvs_empty(o, 1);
+                (if oop_set { 1 } else { 0 }) + (if ip_set { 1 } else { 0 })
+            }).sum::<usize>();
+            eprintln!("[solve] boundary CFVs set: {set_slots}/{total_slots}");
             let exp_before = compute_exploitability(&game);
             solve_step(&game, 0);
             let exp_after = compute_exploitability(&game);

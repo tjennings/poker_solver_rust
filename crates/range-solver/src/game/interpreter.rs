@@ -353,6 +353,12 @@ impl PostFlopGame {
         let node = self.node_arena[indices[ordinal]].lock();
         self.tree_config.starting_pot + 2 * node.amount
     }
+
+    /// Returns true if boundary CFVs for the given ordinal and player are empty.
+    pub fn boundary_cfvs_empty(&self, ordinal: usize, player: usize) -> bool {
+        let idx = ordinal * 2 + player;
+        idx >= self.boundary_cfvs.len() || self.boundary_cfvs[idx].is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
