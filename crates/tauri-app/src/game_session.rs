@@ -922,10 +922,12 @@ fn build_solve_game(
         river_bet_sizes: [oop_sizes, ip_sizes],
         turn_donk_sizes: None,
         river_donk_sizes: None,
-        add_allin_threshold: 1.5,
-        force_allin_threshold: 0.15,
-        merging_threshold: 0.1,
-        depth_limit: Some(1),
+        add_allin_threshold: 0.0,
+        force_allin_threshold: 0.0,
+        merging_threshold: 0.0,
+        // River: solve to showdown (no boundaries).
+        // Flop/Turn: solve current street only, boundaries at next street.
+        depth_limit: if initial_state == range_solver::BoardState::River { None } else { Some(0) },
     };
 
     let action_tree =
@@ -2222,7 +2224,7 @@ mod tests {
             add_allin_threshold: 1.5,
             force_allin_threshold: 0.15,
             merging_threshold: 0.1,
-            depth_limit: Some(1),
+            depth_limit: Some(0),
         };
         let action_tree = ActionTree::new(tree_config).unwrap();
         let card_config = CardConfig {
