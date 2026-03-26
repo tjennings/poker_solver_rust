@@ -38,6 +38,79 @@ pub fn compute_equity(hole: [Card; 2], board: &[Card]) -> f64 {
     (f64::from(wins) + f64::from(ties) * 0.5) / f64::from(total)
 }
 
+/// Compute showdown equity of `hero` vs a specific `opponent` on `board`.
+///
+/// For a 5-card board, directly compares hand ranks.
+/// For a 4-card board (turn), enumerates all ~44 river cards.
+/// For a 3-card board (flop), enumerates all ~990 turn+river combos.
+/// Returns a value in [0.0, 1.0].
+#[must_use]
+pub fn compute_matchup_equity(hero: [Card; 2], opponent: [Card; 2], board: &[Card]) -> f64 {
+    let dead: arrayvec::ArrayVec<Card, 9> = board.iter()
+        .chain(hero.iter())
+        .chain(opponent.iter())
+        .copied()
+        .collect();
+
+    if board.len() >= 5 {
+        // Direct comparison on complete board
+        let hr = rank_hand(hero, board);
+        let or = rank_hand(opponent, board);
+        return match hr.cmp(&or) {
+            Ordering::Greater => 1.0,
+            Ordering::Equal => 0.5,
+            Ordering::Less => 0.0,
+        };
+    }
+
+    // Enumerate remaining cards to complete the board
+    let remaining: Vec<Card> = (0u8..52)
+        .map(Card::from)
+        .filter(|c| !dead.contains(c))
+        .collect();
+
+    let cards_needed = 5 - board.len();
+
+    if cards_needed == 1 {
+        // Turn → river: enumerate 1 card
+        let (mut wins, mut ties, mut total) = (0u32, 0u32, 0u32);
+        for &c in &remaining {
+            let mut full = board.to_vec();
+            full.push(c);
+            let hr = rank_hand(hero, &full);
+            let or = rank_hand(opponent, &full);
+            match hr.cmp(&or) {
+                Ordering::Greater => wins += 1,
+                Ordering::Equal => ties += 1,
+                Ordering::Less => {}
+            }
+            total += 1;
+        }
+        if total == 0 { return 0.5; }
+        (f64::from(wins) + f64::from(ties) * 0.5) / f64::from(total)
+    } else {
+        // Flop → turn+river: enumerate 2 cards
+        let (mut wins, mut ties, mut total) = (0u32, 0u32, 0u32);
+        for (i, &c1) in remaining.iter().enumerate() {
+            for &c2 in &remaining[i + 1..] {
+                let mut full = board.to_vec();
+                full.push(c1);
+                full.push(c2);
+                let hr = rank_hand(hero, &full);
+                let or = rank_hand(opponent, &full);
+                match hr.cmp(&or) {
+                    Ordering::Greater => wins += 1,
+                    Ordering::Equal => ties += 1,
+                    Ordering::Less => {}
+                }
+                total += 1;
+            }
+        }
+        if total == 0 { return 0.5; }
+        (f64::from(wins) + f64::from(ties) * 0.5) / f64::from(total)
+    }
+}
+
 /// Map an equity value in \[0.0, 1.0\] to a bin index in \[0, `num_bins`\).
 ///
 /// Linearly maps equity to bin, clamping at `num_bins - 1`.

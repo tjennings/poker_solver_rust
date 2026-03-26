@@ -1112,26 +1112,85 @@ fn evaluate_and_inject_boundaries(
         let mut pot_cache: std::collections::HashMap<i64, Vec<f64>> = std::collections::HashMap::new();
 
         for &bp in &unique_pots {
-            // At the boundary, each player has invested bp/2 chips.
-            // remaining=0 means all-in: SPR=0, rollout just deals cards + showdown.
             let remaining = (eff_stack - bp / 2.0).max(0.0);
-            let boundary_starting_stack = remaining + bp / 2.0;
-            let boundary_spr_pot = bp;
-            let eval = RolloutLeafEvaluator::new(
-                evaluator.strategy.clone(),
-                evaluator.abstract_tree.clone(),
-                evaluator.all_buckets.clone(),
-                evaluator.abstract_start_node,
-                evaluator.bias,
-                evaluator.bias_factor,
-                evaluator.num_rollouts,
-                evaluator.num_opponent_samples,
-                boundary_starting_stack,
-                boundary_spr_pot,
-            );
-            let requests = vec![(bp, 0.0, traverser)];
-            let results = eval.evaluate_boundaries(combos, board_cards, oop_weights, ip_weights, &requests);
-            pot_cache.insert(bp as i64, results.into_iter().next().unwrap_or_default());
+
+            if remaining <= 0.0 {
+                // SPR=0: all-in, no betting. Compute exact showdown equity
+                // per hero hand against the opponent's range-weighted hands,
+                // enumerating all remaining board cards.
+                use rayon::prelude::*;
+                let hero_range = if traverser == 0 { oop_weights } else { ip_weights };
+                let opp_range = if traverser == 0 { ip_weights } else { oop_weights };
+
+                let cfvs: Vec<f64> = combos
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, hero_hand)| {
+                        if hero_range[i] <= 0.0 {
+                            return 0.0;
+                        }
+                        // Per-matchup showdown equity weighted by opponent reach.
+                        let mut ev_sum = 0.0;
+                        let mut weight_sum = 0.0;
+                        for (j, opp_hand) in combos.iter().enumerate() {
+                            if opp_range[j] <= 0.0 {
+                                continue;
+                            }
+                            // Skip card overlaps
+                            if hero_hand[0] == opp_hand[0] || hero_hand[0] == opp_hand[1]
+                                || hero_hand[1] == opp_hand[0] || hero_hand[1] == opp_hand[1]
+                            {
+                                continue;
+                            }
+                            // Also skip if opponent cards overlap with board
+                            if board_cards.iter().any(|b| *b == opp_hand[0] || *b == opp_hand[1]) {
+                                continue;
+                            }
+
+                            // Compute matchup equity vs this specific opponent.
+                            // compute_equity handles both 5-card and incomplete boards
+                            // (enumerates remaining cards internally).
+                            let eq = poker_solver_core::showdown_equity::compute_matchup_equity(
+                                *hero_hand, *opp_hand, board_cards,
+                            );
+
+                            ev_sum += eq * opp_range[j];
+                            weight_sum += opp_range[j];
+                        }
+                        if weight_sum > 0.0 {
+                            let eq = ev_sum / weight_sum;
+                            (eq - 0.5) * 2.0 // pot-fraction: +1 = win pot, -1 = lose pot
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+
+                eprintln!(
+                    "[boundary eval] pot={bp:.0} SPR=0: exact equity for {} combos (traverser={traverser})",
+                    combos.len()
+                );
+                pot_cache.insert(bp as i64, cfvs);
+            } else {
+                // SPR > 0: use rollout with correct boundary stack/pot.
+                let boundary_starting_stack = remaining + bp / 2.0;
+                let boundary_spr_pot = bp;
+                let eval = RolloutLeafEvaluator::new(
+                    evaluator.strategy.clone(),
+                    evaluator.abstract_tree.clone(),
+                    evaluator.all_buckets.clone(),
+                    evaluator.abstract_start_node,
+                    evaluator.bias,
+                    evaluator.bias_factor,
+                    evaluator.num_rollouts,
+                    evaluator.num_opponent_samples,
+                    boundary_starting_stack,
+                    boundary_spr_pot,
+                );
+                let requests = vec![(bp, 0.0, traverser)];
+                let results = eval.evaluate_boundaries(combos, board_cards, oop_weights, ip_weights, &requests);
+                pot_cache.insert(bp as i64, results.into_iter().next().unwrap_or_default());
+            }
         }
 
         for ordinal in 0..n_boundaries {
