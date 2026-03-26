@@ -925,9 +925,10 @@ fn build_solve_game(
         add_allin_threshold: 0.0,
         force_allin_threshold: 0.0,
         merging_threshold: 0.0,
-        // River: solve to showdown (no boundaries).
-        // Flop/Turn: solve current street only, boundaries at next street.
-        depth_limit: if initial_state == range_solver::BoardState::River { None } else { Some(0) },
+        // Solve to showdown — no depth limit, no boundaries.
+        // Boundary evaluation is not yet correctly calibrated, so full-depth
+        // solving is more reliable. This is slower but produces correct strategies.
+        depth_limit: None,
     };
 
     let action_tree =
