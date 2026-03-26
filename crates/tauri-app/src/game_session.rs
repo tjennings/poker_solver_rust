@@ -1131,7 +1131,7 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
                     if weight_sum > 0.0 {
                         ((ev_sum / weight_sum) - 0.5) as f32 * 2.0
                     } else {
-                        0.0
+                        1.0 // No opponent reach — hero wins pot uncontested
                     }
                 })
                 .collect()
@@ -1145,6 +1145,12 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
                     opp_combo_reach[combo_idx] = opponent_reach[game_idx] as f64;
                 }
             }
+            // If no opponent combos have reach, hero wins pot uncontested.
+            let opp_total: f64 = opp_combo_reach.iter().sum();
+            if opp_total <= 0.0 {
+                return vec![1.0f32; num_hands];
+            }
+
             // Hero reach: use 1.0 for all (the solver weights externally).
             let hero_combo_reach = vec![1.0f64; self.combos.len()];
 
