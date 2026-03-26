@@ -925,10 +925,9 @@ fn build_solve_game(
         add_allin_threshold: 0.0,
         force_allin_threshold: 0.0,
         merging_threshold: 0.0,
-        // Solve to showdown — no depth limit, no boundaries.
-        // Boundary evaluation is not yet correctly calibrated, so full-depth
-        // solving is more reliable. This is slower but produces correct strategies.
-        depth_limit: None,
+        // Solve current street only. Boundaries at next street transition.
+        // River: no boundaries needed (solve to showdown).
+        depth_limit: if initial_state == range_solver::BoardState::River { None } else { Some(0) },
     };
 
     let action_tree =
@@ -1085,39 +1084,64 @@ fn evaluate_and_inject_boundaries(
         return;
     }
 
-    // The rollout produces pot-fraction CFVs from a unit-game rollout.
-    // All boundaries get the same base values (the rollout doesn't know about
-    // the range-solver's internal tree). We run the rollout ONCE per traverser,
-    // then the range-solver scales internally by each boundary's half_pot.
+    // Each boundary has a different pot (and thus different SPR for the
+    // continuation game). We group boundaries by pot, create one evaluator
+    // per unique pot (with that pot's SPR), and run one rollout per group.
     //
-    // The rollout pot fractions already account for the full continuation
-    // (turn + river play from the abstract tree position). The range-solver
-    // expects boundary CFVs where bcfv * half_pot = expected chip payoff.
-    // Since rollout pot_frac = chip_value / (root_half_pot), and we want
-    // bcfv = chip_value / boundary_half_pot, we scale:
-    //   bcfv = pot_frac * root_half_pot / boundary_half_pot
-    //        = pot_frac * root_pot / boundary_pot
-    let root_pot = game.tree_config().starting_pot as f64;
+    // The range-solver expects boundary CFVs in pot-normalised units where
+    // bcfv=1.0 means winning one half-pot (see set_boundary_cfvs docs).
+    let eff_stack = game.tree_config().effective_stack as f64;
+
+    // Collect boundary pots
+    let boundary_pots: Vec<f64> = (0..n_boundaries)
+        .map(|o| game.boundary_pot(o) as f64)
+        .collect();
+
+    // Find unique pots
+    let mut unique_pots: Vec<f64> = boundary_pots.clone();
+    unique_pots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    unique_pots.dedup();
+
+    eprintln!(
+        "[boundary eval] {n_boundaries} boundaries, {} unique pots: {:?}",
+        unique_pots.len(), unique_pots
+    );
 
     for traverser in 0..2u8 {
-        // Single rollout for this traverser — returns pot-fraction CFVs.
-        let requests = vec![(root_pot, 0.0, traverser)];
-        let cfv_results = evaluator.evaluate_boundaries(
-            combos,
-            board_cards,
-            oop_weights,
-            ip_weights,
-            &requests,
-        );
-        let base_cfvs = &cfv_results[0]; // one result (same for all boundaries)
+        // Cache: pot → rollout results for this traverser
+        let mut pot_cache: std::collections::HashMap<i64, Vec<f64>> = std::collections::HashMap::new();
 
-        // Inject per-boundary, scaling by pot ratio.
+        for &bp in &unique_pots {
+            // Create evaluator with this boundary's SPR
+            let boundary_starting_stack = eff_stack;  // stacks at game start
+            let boundary_spr_pot = bp;  // pot at the boundary
+            let eval = RolloutLeafEvaluator::new(
+                evaluator.strategy.clone(),
+                evaluator.abstract_tree.clone(),
+                evaluator.all_buckets.clone(),
+                evaluator.abstract_start_node,
+                evaluator.bias,
+                evaluator.bias_factor,
+                evaluator.num_rollouts,
+                evaluator.num_opponent_samples,
+                boundary_starting_stack,
+                boundary_spr_pot,
+            );
+            let requests = vec![(bp, 0.0, traverser)];
+            let results = eval.evaluate_boundaries(combos, board_cards, oop_weights, ip_weights, &requests);
+            pot_cache.insert(bp as i64, results.into_iter().next().unwrap_or_default());
+        }
+
         for ordinal in 0..n_boundaries {
-            let boundary_pot = game.boundary_pot(ordinal) as f64;
-            let scale = if boundary_pot > 0.0 { root_pot / boundary_pot } else { 1.0 };
-            // Convert from SubgameHands combo ordering to PostFlopGame private_cards ordering
+            let bp = boundary_pots[ordinal];
+            let cfvs = pot_cache.get(&(bp as i64)).unwrap();
+
             let private_cards = game.private_cards(traverser as usize);
             let mut mapped_cfvs = vec![0.0f32; private_cards.len()];
+
+            // Max bcfv: can't win more than remaining stack
+            let boundary_half_pot = bp / 2.0;
+            let max_bcfv = if boundary_half_pot > 0.0 { eff_stack / boundary_half_pot } else { 100.0 };
 
             for (hand_idx, &(c1, c2)) in private_cards.iter().enumerate() {
                 let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
@@ -1126,7 +1150,8 @@ fn evaluate_and_inject_boundaries(
                     if (combo[0] == rs_c1 && combo[1] == rs_c2)
                         || (combo[0] == rs_c2 && combo[1] == rs_c1)
                     {
-                        mapped_cfvs[hand_idx] = (base_cfvs[ci] * scale) as f32;
+                        let v = cfvs[ci];
+                        mapped_cfvs[hand_idx] = v.clamp(-max_bcfv, max_bcfv) as f32;
                         break;
                     }
                 }
@@ -1138,8 +1163,8 @@ fn evaluate_and_inject_boundaries(
                 let max = mapped_cfvs.iter().cloned().fold(f32::MIN, f32::max);
                 let nonzero_count = mapped_cfvs.iter().filter(|v| v.abs() > 0.001).count();
                 eprintln!(
-                    "[boundary inject] ordinal={ordinal} traverser={traverser} pot={boundary_pot:.0} \
-                     scale={scale:.3} nonzero={nonzero_count}/{} min={min:.3} max={max:.3}",
+                    "[boundary inject] ordinal={ordinal} traverser={traverser} pot={bp:.0} \
+                     max_bcfv={max_bcfv:.1} nonzero={nonzero_count}/{} min={min:.3} max={max:.3}",
                     mapped_cfvs.len()
                 );
             }

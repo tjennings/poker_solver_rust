@@ -331,16 +331,16 @@ fn sample_weighted(rng: &mut impl Rng, weights: &[f64], n: u32) -> Vec<usize> {
 /// performs fixed-strategy rollouts from the boundary node, and averages the
 /// results.  Returns per-combo CFVs in pot-fraction units.
 pub(crate) struct RolloutLeafEvaluator {
-    strategy: Arc<BlueprintV2Strategy>,
-    abstract_tree: Arc<GameTree>,
-    all_buckets: Arc<AllBuckets>,
-    decision_idx_map: Vec<u32>,
-    abstract_start_node: u32,
-    bias: BiasType,
-    bias_factor: f64,
-    num_rollouts: u32,
-    num_opponent_samples: u32,
-    starting_stack: f64,
+    pub(crate) strategy: Arc<BlueprintV2Strategy>,
+    pub(crate) abstract_tree: Arc<GameTree>,
+    pub(crate) all_buckets: Arc<AllBuckets>,
+    pub(crate) decision_idx_map: Vec<u32>,
+    pub(crate) abstract_start_node: u32,
+    pub(crate) bias: BiasType,
+    pub(crate) bias_factor: f64,
+    pub(crate) num_rollouts: u32,
+    pub(crate) num_opponent_samples: u32,
+    pub(crate) starting_stack: f64,
     /// Stack-to-pot ratio at the subgame root, used to scale the unit
     /// game's starting stack so rollout dynamics match the real game.
     root_spr: f64,
