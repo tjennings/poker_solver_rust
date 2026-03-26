@@ -443,6 +443,38 @@ export default function GameExplorer() {
               </div>
             );
 
+            const solveBtn = (key: string) => (
+              <button
+                key={key}
+                className="solve-btn"
+                onClick={async () => {
+                  try {
+                    setLoading(true);
+                    const s = await invoke<GameState>('game_solve', {});
+                    setState(s);
+                  } catch (e) {
+                    setError(String(e));
+                  } finally {
+                    setLoading(false);
+                  }
+                }}
+                style={{
+                  padding: '0.4rem 0.8rem',
+                  background: '#00d9ff22',
+                  border: '1px solid #00d9ff',
+                  borderRadius: '4px',
+                  color: '#00d9ff',
+                  cursor: 'pointer',
+                  fontSize: '0.7rem',
+                  fontWeight: 600,
+                  alignSelf: 'center',
+                  flexShrink: 0,
+                }}
+              >
+                SOLVE
+              </button>
+            );
+
             state.action_history.forEach((rec, idx) => {
               // Insert street block at transitions
               if (rec.street !== prevStreet && prevStreet !== '') {
@@ -453,6 +485,8 @@ export default function GameExplorer() {
                 if (cards.length > 0) {
                   const nextStreet = rec.street;
                   elems.push(streetBlock(nextStreet, cards));
+                  // Solve button after each street transition
+                  elems.push(solveBtn(`solve-${prevStreet}`));
                 }
               }
               prevStreet = rec.street;
@@ -481,6 +515,7 @@ export default function GameExplorer() {
                 : [];
               if (cards.length > 0) {
                 elems.push(streetBlock(state.street, cards));
+                elems.push(solveBtn(`solve-${prevStreet}-end`));
               }
             }
 
@@ -626,38 +661,6 @@ export default function GameExplorer() {
           </p>
           <button className="new-hand-btn" onClick={newHand}>
             New Hand
-          </button>
-        </div>
-      )}
-
-      {/* Solve button — available on postflop streets when not at chance/terminal */}
-      {state && !state.is_terminal && !state.is_chance && state.board.length >= 3 && (
-        <div style={{ padding: '0 1rem 0.5rem' }}>
-          <button
-            className="solve-btn"
-            onClick={async () => {
-              try {
-                setLoading(true);
-                const s = await invoke<GameState>('game_solve', {});
-                setState(s);
-              } catch (e) {
-                setError(String(e));
-              } finally {
-                setLoading(false);
-              }
-            }}
-            style={{
-              padding: '0.5rem 1.5rem',
-              background: '#00d9ff22',
-              border: '1px solid #00d9ff',
-              borderRadius: '4px',
-              color: '#00d9ff',
-              cursor: 'pointer',
-              fontSize: '0.8rem',
-              fontWeight: 600,
-            }}
-          >
-            Solve
           </button>
         </div>
       )}
