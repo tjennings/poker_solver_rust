@@ -8,6 +8,7 @@ import { toMatrixCell } from './game-explorer-utils';
 import {
   SUIT_COLORS,
   SUIT_SYMBOLS,
+  getActionColor,
 } from './matrix-utils';
 
 // ── Card picker (local, since Explorer.tsx does not export it) ──────────
@@ -624,12 +625,22 @@ export default function GameExplorer() {
                             className="cell-detail"
                             style={{ width: 'auto', flex: '0 0 auto', minWidth: '80px', maxWidth: '130px', padding: '0.3rem 0.4rem' }}
                           >
-                            <div style={{ fontWeight: 700, fontSize: '0.8rem', marginBottom: '0.2rem' }}>
+                            <div style={{ fontWeight: 700, fontSize: '0.8rem', marginBottom: '0.15rem' }}>
                               <span>{r1}</span>
                               <span style={{ color: PICKER_COLORS[s1] || '#fff' }}>{SUIT_SYMBOLS[s1] || ''}</span>
                               {' '}
                               <span>{r2}</span>
                               <span style={{ color: PICKER_COLORS[s2] || '#fff' }}>{SUIT_SYMBOLS[s2] || ''}</span>
+                            </div>
+                            {/* Color bar */}
+                            <div style={{ display: 'flex', height: '6px', borderRadius: '3px', overflow: 'hidden', background: '#222', marginBottom: '0.25rem' }}>
+                              {matrixActions.map((action, i) => {
+                                const pct = (combo.probabilities[i] || 0) * 100;
+                                if (pct < 0.1) return null;
+                                return (
+                                  <div key={action.id} style={{ width: `${pct}%`, background: getActionColor(action, matrixActions), height: '100%' }} />
+                                );
+                              })}
                             </div>
                             {matrixActions.map((action, i) => {
                               const pct = (combo.probabilities[i] || 0) * 100;

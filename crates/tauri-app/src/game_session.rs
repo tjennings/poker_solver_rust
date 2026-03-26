@@ -426,7 +426,9 @@ impl GameSession {
                     return None;
                 }
 
-                let (c1, c2) = index_to_card_pair(ci);
+                let (c1_raw, c2_raw) = index_to_card_pair(ci);
+                // Show high card first: rank = id / 4, higher rank = higher id.
+                let (c1, c2) = if c1_raw / 4 >= c2_raw / 4 { (c1_raw, c2_raw) } else { (c2_raw, c1_raw) };
                 let s1 = card_to_string(c1).unwrap_or_default();
                 let s2 = card_to_string(c2).unwrap_or_default();
 
