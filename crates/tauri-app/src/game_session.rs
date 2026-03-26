@@ -1714,10 +1714,12 @@ pub fn game_solve_core(
         let final_matrix = build_solve_matrix(&mut game, Some(&evs));
         *ss_clone.matrix_snapshot.write() = Some(final_matrix);
 
-        // Flush boundary caches so exploitability computation repopulates
-        // them with best-response reach (different from the solve's reach).
-        game.flush_boundary_caches();
+        // Compute exploitability using the solver's boundary CFVs (not recomputed).
+        // Disable the lazy evaluator temporarily so compute_exploitability uses
+        // the cached CFVs from the solve rather than recomputing with best-response reach.
+        let saved_evaluator = game.boundary_evaluator.take();
         let final_exp = compute_exploitability(&game);
+        game.boundary_evaluator = saved_evaluator;
         ss_clone
             .exploitability_bits
             .store(final_exp.to_bits(), Ordering::Relaxed);
