@@ -1084,16 +1084,23 @@ fn evaluate_and_inject_boundaries(
         return;
     }
 
-    // Build requests: (pot, effective_stack, traverser) per boundary.
-    // We need both players, so we evaluate twice (once per traverser).
-    for traverser in 0..2u8 {
-        let requests: Vec<(f64, f64, u8)> = (0..n_boundaries)
-            .map(|ordinal| {
-                let pot = game.boundary_pot(ordinal) as f64;
-                (pot, 0.0, traverser)
-            })
-            .collect();
+    // The rollout produces pot-fraction CFVs from a unit-game rollout.
+    // All boundaries get the same base values (the rollout doesn't know about
+    // the range-solver's internal tree). We run the rollout ONCE per traverser,
+    // then the range-solver scales internally by each boundary's half_pot.
+    //
+    // The rollout pot fractions already account for the full continuation
+    // (turn + river play from the abstract tree position). The range-solver
+    // expects boundary CFVs where bcfv * half_pot = expected chip payoff.
+    // Since rollout pot_frac = chip_value / (root_half_pot), and we want
+    // bcfv = chip_value / boundary_half_pot, we scale:
+    //   bcfv = pot_frac * root_half_pot / boundary_half_pot
+    //        = pot_frac * root_pot / boundary_pot
+    let root_pot = game.tree_config().starting_pot as f64;
 
+    for traverser in 0..2u8 {
+        // Single rollout for this traverser — returns pot-fraction CFVs.
+        let requests = vec![(root_pot, 0.0, traverser)];
         let cfv_results = evaluator.evaluate_boundaries(
             combos,
             board_cards,
@@ -1101,42 +1108,37 @@ fn evaluate_and_inject_boundaries(
             ip_weights,
             &requests,
         );
+        let base_cfvs = &cfv_results[0]; // one result (same for all boundaries)
 
-        // Inject CFVs for each boundary
-        for (ordinal, cfvs_f64) in cfv_results.into_iter().enumerate() {
+        // Inject per-boundary, scaling by pot ratio.
+        for ordinal in 0..n_boundaries {
+            let boundary_pot = game.boundary_pot(ordinal) as f64;
+            let scale = if boundary_pot > 0.0 { root_pot / boundary_pot } else { 1.0 };
             // Convert from SubgameHands combo ordering to PostFlopGame private_cards ordering
             let private_cards = game.private_cards(traverser as usize);
             let mut mapped_cfvs = vec![0.0f32; private_cards.len()];
 
-            // Build lookup: (rs_poker card pair) -> combo_idx in evaluator combos
             for (hand_idx, &(c1, c2)) in private_cards.iter().enumerate() {
-                // Find matching combo in evaluator combos
                 let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
                 let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
                 for (ci, combo) in combos.iter().enumerate() {
                     if (combo[0] == rs_c1 && combo[1] == rs_c2)
                         || (combo[0] == rs_c2 && combo[1] == rs_c1)
                     {
-                        mapped_cfvs[hand_idx] = cfvs_f64[ci] as f32;
+                        mapped_cfvs[hand_idx] = (base_cfvs[ci] * scale) as f32;
                         break;
                     }
                 }
             }
 
-            // Diagnostic: dump boundary CFVs for first eval
+            // Diagnostic: dump boundary CFVs for first 3
             if traverser == 0 && ordinal < 3 {
-                let pot = game.boundary_pot(ordinal);
-                let nonzero: Vec<(usize, f32)> = mapped_cfvs.iter().enumerate()
-                    .filter(|(_, &v)| v.abs() > 0.001)
-                    .take(5)
-                    .map(|(i, &v)| (i, v))
-                    .collect();
                 let min = mapped_cfvs.iter().cloned().fold(f32::MAX, f32::min);
                 let max = mapped_cfvs.iter().cloned().fold(f32::MIN, f32::max);
                 let nonzero_count = mapped_cfvs.iter().filter(|v| v.abs() > 0.001).count();
                 eprintln!(
-                    "[boundary inject] ordinal={ordinal} traverser={traverser} pot={pot} \
-                     nonzero={nonzero_count}/{} min={min:.2} max={max:.2} samples={nonzero:?}",
+                    "[boundary inject] ordinal={ordinal} traverser={traverser} pot={boundary_pot:.0} \
+                     scale={scale:.3} nonzero={nonzero_count}/{} min={min:.3} max={max:.3}",
                     mapped_cfvs.len()
                 );
             }
