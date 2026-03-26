@@ -287,15 +287,17 @@ fn apply_action(
             (pot, new_invested)
         }
         TreeAction::Call => {
-            // Match opponent's investment
-            new_invested[actor] = invested[opponent];
+            // Match opponent's investment, capped to stack.
+            new_invested[actor] = invested[opponent].min(starting_stack);
             let new_pot = pot + (new_invested[actor] - invested[actor]);
             (new_pot, new_invested)
         }
         TreeAction::Bet(amount) | TreeAction::Raise(amount) => {
-            // Bet/raise TO this amount (absolute, not increment)
+            // Bet/raise TO this amount (absolute, not increment).
+            // Cap to starting_stack — the abstract tree's amounts may exceed
+            // the unit game's stack when SPR is small.
             let old = invested[actor];
-            new_invested[actor] = *amount;
+            new_invested[actor] = (*amount).min(starting_stack);
             let new_pot = pot + (new_invested[actor] - old);
             (new_pot, new_invested)
         }
