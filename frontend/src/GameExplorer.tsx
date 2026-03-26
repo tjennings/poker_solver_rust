@@ -602,8 +602,8 @@ export default function GameExplorer() {
               ))}
             </div>
 
-            {/* Detail panel */}
-            <div className="detail-column">
+            {/* Detail panel — right rail */}
+            <div className="detail-column" style={{ width: selectedCellData ? '220px' : '0', transition: 'width 0.15s' }}>
               {selectedCellData && (
                 <>
                   <CellDetail
@@ -612,7 +612,7 @@ export default function GameExplorer() {
                   />
                   {/* Per-combo breakdown */}
                   {selectedCellData.combos.length > 0 && selectedCellData.combos[0].probabilities.length > 0 && (
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.5rem' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '0.5rem' }}>
                       {selectedCellData.combos.map((combo) => (
                         <div
                           key={combo.cards}
