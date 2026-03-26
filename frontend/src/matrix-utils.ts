@@ -72,10 +72,10 @@ export function getActionColor(action: ActionInfo, actions: ActionInfo[]): strin
       const count = ordered.length;
       // Lightest (t=0) → darkest (t=1), all-in always darkest
       const t = count > 1 ? idx / (count - 1) : 1;
-      // Interpolate from salmon (210, 100, 100) to deep red (180, 40, 40)
-      const r = Math.round(210 - t * (210 - 180));
-      const g = Math.round(100 - t * (100 - 40));
-      const b = Math.round(100 - t * (100 - 40));
+      // Interpolate from light coral (220, 120, 110) to deep crimson (160, 30, 30)
+      const r = Math.round(220 - t * (220 - 160));
+      const g = Math.round(120 - t * (120 - 30));
+      const b = Math.round(110 - t * (110 - 30));
       return `rgba(${r}, ${g}, ${b}, 0.7)`;
     }
     default:
