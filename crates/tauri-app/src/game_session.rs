@@ -1123,6 +1123,24 @@ fn evaluate_and_inject_boundaries(
                 }
             }
 
+            // Diagnostic: dump boundary CFVs for first eval
+            if traverser == 0 && ordinal < 3 {
+                let pot = game.boundary_pot(ordinal);
+                let nonzero: Vec<(usize, f32)> = mapped_cfvs.iter().enumerate()
+                    .filter(|(_, &v)| v.abs() > 0.001)
+                    .take(5)
+                    .map(|(i, &v)| (i, v))
+                    .collect();
+                let min = mapped_cfvs.iter().cloned().fold(f32::MAX, f32::min);
+                let max = mapped_cfvs.iter().cloned().fold(f32::MIN, f32::max);
+                let nonzero_count = mapped_cfvs.iter().filter(|v| v.abs() > 0.001).count();
+                eprintln!(
+                    "[boundary inject] ordinal={ordinal} traverser={traverser} pot={pot} \
+                     nonzero={nonzero_count}/{} min={min:.2} max={max:.2} samples={nonzero:?}",
+                    mapped_cfvs.len()
+                );
+            }
+
             game.set_boundary_cfvs(ordinal, traverser as usize, mapped_cfvs);
         }
     }
