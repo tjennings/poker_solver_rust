@@ -463,8 +463,30 @@ export default function GameExplorer() {
                     // Start solve
                     try {
                       setSolving(true);
-                      const s = await invoke<GameState>('game_solve', {});
-                      setState(s);
+                      const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
+                      await invoke('game_solve', {
+                        maxIterations: globalConfig.solve_iterations ?? 200,
+                        targetExploitability: globalConfig.target_exploitability ?? 3.0,
+                        leafEvalInterval: globalConfig.leaf_eval_interval ?? 10,
+                        rolloutBiasFactor: globalConfig.rollout_bias_factor ?? 10.0,
+                        rolloutNumSamples: globalConfig.rollout_num_samples ?? 3,
+                        rolloutOpponentSamples: globalConfig.rollout_opponent_samples ?? 8,
+                        rangeClampThreshold: globalConfig.range_clamp_threshold ?? 0.05,
+                      });
+                      // Poll for progress
+                      const pollId = setInterval(async () => {
+                        try {
+                          const s = await invoke<GameState>('game_get_state', {});
+                          setState(s);
+                          if (s.solve?.is_complete) {
+                            clearInterval(pollId);
+                            setSolving(false);
+                          }
+                        } catch {
+                          clearInterval(pollId);
+                          setSolving(false);
+                        }
+                      }, 500);
                     } catch (e) {
                       setError(String(e));
                       setSolving(false);
