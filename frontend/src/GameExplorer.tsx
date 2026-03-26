@@ -132,6 +132,7 @@ export default function GameExplorer() {
 
   const [blueprints, setBlueprints] = useState<{ name: string; path: string; stack_depth: number; latest_snapshot: string | null }[]>([]);
   const [bundleName, setBundleName] = useState<string | null>(null);
+  const [solving, setSolving] = useState(false);
 
   // ── List available blueprints on mount ──────────────────────────
 
@@ -446,32 +447,47 @@ export default function GameExplorer() {
             const solveBtn = (key: string) => (
               <button
                 key={key}
-                className="solve-btn"
                 onClick={async () => {
-                  try {
-                    setLoading(true);
-                    const s = await invoke<GameState>('game_solve', {});
-                    setState(s);
-                  } catch (e) {
-                    setError(String(e));
-                  } finally {
-                    setLoading(false);
+                  if (solving) {
+                    // Cancel
+                    try {
+                      setSolving(false);
+                      await invoke('game_cancel_solve', {});
+                      const s = await invoke<GameState>('game_get_state', {});
+                      setState(s);
+                    } catch (e) {
+                      setError(String(e));
+                    }
+                  } else {
+                    // Start solve
+                    try {
+                      setSolving(true);
+                      const s = await invoke<GameState>('game_solve', {});
+                      setState(s);
+                    } catch (e) {
+                      setError(String(e));
+                      setSolving(false);
+                    }
                   }
                 }}
                 style={{
-                  padding: '0.4rem 0.8rem',
-                  background: '#00d9ff22',
-                  border: '1px solid #00d9ff',
+                  padding: '0.3rem 0.4rem',
+                  background: solving ? '#dc262622' : '#00d9ff22',
+                  border: `2px solid ${solving ? '#dc2626' : '#00d9ff'}`,
                   borderRadius: '4px',
-                  color: '#00d9ff',
+                  color: solving ? '#dc2626' : '#00d9ff',
                   cursor: 'pointer',
                   fontSize: '0.7rem',
-                  fontWeight: 600,
-                  alignSelf: 'center',
+                  fontWeight: 700,
+                  writingMode: 'vertical-rl',
+                  textOrientation: 'mixed',
+                  letterSpacing: '0.15em',
+                  alignSelf: 'stretch',
                   flexShrink: 0,
+                  minHeight: '60px',
                 }}
               >
-                SOLVE
+                {solving ? 'CANCEL' : 'SOLVE'}
               </button>
             );
 
