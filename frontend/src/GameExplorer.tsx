@@ -494,7 +494,7 @@ export default function GameExplorer() {
                 <span className="street-name">{nextStreetLabel}</span>
               </div>
               <div className="street-cards">
-                {Array.from({ length: cardsNeeded }).map((_, i) => (
+                {Array.from({ length: expectedCards }).map((_, i) => (
                   <div key={i} className="street-card empty">
                     <span className="card-rank">?</span>
                   </div>
