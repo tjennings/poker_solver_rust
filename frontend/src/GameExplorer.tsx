@@ -621,21 +621,15 @@ export default function GameExplorer() {
                         return (
                           <div
                             key={combo.cards}
-                            style={{
-                              flex: '0 0 auto',
-                              minWidth: '80px',
-                              padding: '0.3rem 0.4rem',
-                              background: 'rgba(255,255,255,0.03)',
-                              border: '1px solid #334155',
-                              borderRadius: '4px',
-                            }}
+                            className="cell-detail"
+                            style={{ flex: '0 0 auto', minWidth: '80px', padding: '0.3rem 0.4rem' }}
                           >
                             <div style={{ fontWeight: 700, fontSize: '0.8rem', marginBottom: '0.2rem' }}>
                               <span>{r1}</span>
-                              <span style={{ color: SUIT_COLORS[s1] || '#fff' }}>{SUIT_SYMBOLS[s1] || ''}</span>
+                              <span style={{ color: PICKER_COLORS[s1] || '#fff' }}>{SUIT_SYMBOLS[s1] || ''}</span>
                               {' '}
                               <span>{r2}</span>
-                              <span style={{ color: SUIT_COLORS[s2] || '#fff' }}>{SUIT_SYMBOLS[s2] || ''}</span>
+                              <span style={{ color: PICKER_COLORS[s2] || '#fff' }}>{SUIT_SYMBOLS[s2] || ''}</span>
                             </div>
                             {matrixActions.map((action, i) => {
                               const pct = (combo.probabilities[i] || 0) * 100;
