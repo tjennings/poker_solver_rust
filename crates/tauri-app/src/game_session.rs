@@ -1695,19 +1695,13 @@ pub fn game_solve_core(
             t += 1;
             ss_clone.iteration.store(t, Ordering::Relaxed);
 
-            // Compute exploitability and snapshot matrix periodically
+            // Snapshot matrix periodically.
+            // Note: exploitability can't be computed during depth-limited solves
+            // because the boundary CFV cache is strategy-dependent and would give
+            // incorrect values for the best-response traversal.
             if t.is_multiple_of(eval_interval) {
-                let exp = compute_exploitability(&game);
-                ss_clone
-                    .exploitability_bits
-                    .store(exp.to_bits(), Ordering::Relaxed);
-
                 let matrix = build_solve_matrix(&mut game, None);
                 *ss_clone.matrix_snapshot.write() = Some(matrix);
-
-                if exp <= target_exp {
-                    break;
-                }
             }
         }
 
@@ -1720,16 +1714,21 @@ pub fn game_solve_core(
         let final_matrix = build_solve_matrix(&mut game, Some(&evs));
         *ss_clone.matrix_snapshot.write() = Some(final_matrix);
 
-        // Compute final exploitability
-        let final_exp = compute_exploitability(&game);
-        ss_clone
-            .exploitability_bits
-            .store(final_exp.to_bits(), Ordering::Relaxed);
+        // Compute final exploitability (only valid for full-depth solves).
+        // For depth-limited solves, boundary CFV cache is strategy-dependent
+        // and gives incorrect values for the best-response traversal.
+        if n_boundaries == 0 {
+            let final_exp = compute_exploitability(&game);
+            ss_clone
+                .exploitability_bits
+                .store(final_exp.to_bits(), Ordering::Relaxed);
+        }
 
         ss_clone.solving.store(false, Ordering::Release);
+        let reported_exp = f32::from_bits(ss_clone.exploitability_bits.load(Ordering::Relaxed));
         eprintln!(
             "[solve] complete: {} iterations, exploitability={:.4}",
-            t, final_exp
+            t, reported_exp
         );
     });
 
