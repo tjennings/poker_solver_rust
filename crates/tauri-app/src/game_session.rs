@@ -1347,8 +1347,8 @@ pub fn game_solve_core(
             let mut found_next_street = false;
             for _ in 0..100 { // safety limit
                 match &session.tree.nodes[idx as usize] {
-                    V2GameNode::Chance { child, .. } => {
-                        idx = *child;
+                    V2GameNode::Chance { .. } => {
+                        // Stop AT the chance node — the rollout handles dealing cards.
                         found_next_street = true;
                         break;
                     }
