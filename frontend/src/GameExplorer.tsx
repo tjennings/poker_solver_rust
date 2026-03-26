@@ -603,48 +603,53 @@ export default function GameExplorer() {
             </div>
 
             {/* Detail panel — right rail */}
-            <div className="detail-column" style={{ width: selectedCellData ? '220px' : '0', transition: 'width 0.15s' }}>
+            <div className="detail-column" style={{ width: selectedCellData ? '300px' : '0', transition: 'width 0.15s' }}>
               {selectedCellData && (
                 <>
                   <CellDetail
                     cell={toMatrixCell(selectedCellData, matrixActions)}
                     actions={matrixActions}
                   />
-                  {/* Per-combo breakdown */}
+                  {/* Per-combo breakdown grid */}
                   {selectedCellData.combos.length > 0 && selectedCellData.combos[0].probabilities.length > 0 && (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '0.5rem' }}>
-                      {selectedCellData.combos.map((combo) => (
-                        <div
-                          key={combo.cards}
-                          className="cell-detail"
-                          style={{ minWidth: '120px', flex: '0 0 auto', padding: '0.4rem' }}
-                        >
-                          <div className="cell-detail-header">
-                            <span style={{ fontWeight: 700 }}>
-                              {combo.cards.slice(0, 2)}
-                              <span style={{ color: SUIT_COLORS[combo.cards[1]?.toLowerCase()] || '#fff' }}>
-                                {SUIT_SYMBOLS[combo.cards[1]?.toLowerCase()] || ''}
-                              </span>
-                              {combo.cards.slice(2, 4)}
-                              <span style={{ color: SUIT_COLORS[combo.cards[3]?.toLowerCase()] || '#fff' }}>
-                                {SUIT_SYMBOLS[combo.cards[3]?.toLowerCase()] || ''}
-                              </span>
-                            </span>
-                          </div>
-                          <div className="cell-detail-actions">
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem', marginTop: '0.5rem' }}>
+                      {selectedCellData.combos.map((combo) => {
+                        const r1 = combo.cards[0]?.toUpperCase();
+                        const s1 = combo.cards[1]?.toLowerCase();
+                        const r2 = combo.cards[2]?.toUpperCase();
+                        const s2 = combo.cards[3]?.toLowerCase();
+                        return (
+                          <div
+                            key={combo.cards}
+                            style={{
+                              flex: '0 0 auto',
+                              minWidth: '80px',
+                              padding: '0.3rem 0.4rem',
+                              background: 'rgba(255,255,255,0.03)',
+                              border: '1px solid #334155',
+                              borderRadius: '4px',
+                            }}
+                          >
+                            <div style={{ fontWeight: 700, fontSize: '0.8rem', marginBottom: '0.2rem' }}>
+                              <span>{r1}</span>
+                              <span style={{ color: SUIT_COLORS[s1] || '#fff' }}>{SUIT_SYMBOLS[s1] || ''}</span>
+                              {' '}
+                              <span>{r2}</span>
+                              <span style={{ color: SUIT_COLORS[s2] || '#fff' }}>{SUIT_SYMBOLS[s2] || ''}</span>
+                            </div>
                             {matrixActions.map((action, i) => {
                               const pct = (combo.probabilities[i] || 0) * 100;
-                              if (pct < 0.1) return null;
+                              if (pct < 0.5) return null;
                               return (
-                                <div key={action.id} className="cell-detail-row" style={{ fontSize: '0.65rem' }}>
-                                  <span className="cell-detail-label">{action.label}</span>
-                                  <span className="cell-detail-pct">{pct.toFixed(0)}%</span>
+                                <div key={action.id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.6rem', color: '#94a3b8' }}>
+                                  <span>{action.label}</span>
+                                  <span>{pct.toFixed(0)}%</span>
                                 </div>
                               );
                             })}
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                 </>
