@@ -1404,6 +1404,10 @@ pub fn game_solve_core(
             None
         };
 
+        let n_boundaries = game.num_boundary_nodes();
+        eprintln!("[solve] boundary nodes: {n_boundaries}, evaluator: {}", evaluator_data.is_some());
+        eprintln!("[solve] abstract_node_idx: {:?}", abstract_node_idx);
+
         // Initial matrix snapshot
         let matrix = build_solve_matrix(&mut game, None);
         *ss_clone.matrix_snapshot.write() = Some(matrix);
