@@ -358,6 +358,107 @@ See `sample_configurations/river_cfvnet.yaml` for all options. Key parameters:
 
 ---
 
+## Convergence Testing
+
+Test CFR algorithm convergence against an exact baseline using the `convergence-harness` crate. Defines a small tractable game ("Flop Poker") via YAML config, solves it exactly with range-solver DCFR, then compares MCCFR with bucketing against that baseline.
+
+### Game Config
+
+Define the game in a YAML file (see `sample_configurations/convergence_test.yaml`):
+
+```yaml
+game:
+  flops:
+    - "QhJdTh"   # draw-heavy, connected
+    - "Ks7d2c"   # dry, rainbow
+    - "8c8d3h"   # paired
+  starting_pot: 2
+  effective_stack: 20
+  bet_sizes: "50%,100%,a"
+  raise_sizes: "50%,100%,a"
+
+baseline:
+  max_iterations: 1000
+  target_exploitability: 0.001
+
+mccfr:
+  iterations: 1000000
+  buckets:
+    preflop: 169
+    flop: 169
+    turn: 200
+    river: 200
+  checkpoints: [1000, 10000, 100000, 500000, 1000000]
+```
+
+### Generate Exact Baseline
+
+Solves each flop exactly with range-solver DCFR (no abstraction). One-time cost — may take minutes to hours depending on game size.
+
+```bash
+cargo run -p convergence-harness --release -- generate-baseline \
+  --config sample_configurations/convergence_test.yaml \
+  --output-dir baselines/convergence
+```
+
+Produces: `summary.json`, `convergence.csv`, `strategy.bin`, `combo_ev.bin` in the output directory. Also prints a colored 13x13 SB strategy matrix on exit.
+
+### Run MCCFR Comparison
+
+Runs MCCFR with potential-aware bucketing on the same game, clusters each flop at startup (~2-10s per flop), then compares against the baseline via head-to-head EV (mbb/hand).
+
+```bash
+cargo run -p convergence-harness --release -- run-solver \
+  --config sample_configurations/convergence_test.yaml \
+  --baseline-dir baselines/convergence \
+  --output-dir results/mccfr_run
+```
+
+At each checkpoint, prints: `h2h mbb/hand = -X.XX (OOP -X.XX, IP -X.XX)`. Negative = MCCFR loses to the exact solution. Final summary:
+
+```
+=== Result ===
+solver:     MCCFR (200t/200r buckets)
+iterations: 1000000
+time:       4.4s
+mbb/hand:   -230.90
+output:     results/mccfr_run
+```
+
+### Compare Saved Results
+
+Re-compare any two saved solver results without re-solving:
+
+```bash
+cargo run -p convergence-harness --release -- compare \
+  --baseline-dir baselines/convergence \
+  --result-dir results/mccfr_run
+```
+
+### Key Metrics
+
+| Metric | Meaning |
+|-|-|
+| **mbb/hand** | Milli-big-blinds per hand lost vs exact strategy (negative = losing). 1000 mbb = 1 bb. |
+| **L1 distance** | Average total variation distance between strategies per info set. < 0.05 = excellent. |
+| **Combo EV diff** | Per-hand EV difference at each decision node. |
+
+### Bucket Sweep
+
+Test different bucket counts to find the optimal abstraction granularity:
+
+```bash
+for bkt in 10 50 100 200 500; do
+  cargo run -p convergence-harness --release -- run-solver \
+    --config sample_configurations/convergence_test.yaml \
+    --baseline-dir baselines/convergence \
+    --output-dir /tmp/sweep_${bkt} \
+    2>&1 | grep "mbb/hand"
+done
+```
+
+---
+
 ## Cloud Training (AWS)
 
 See [`docs/cloud.md`](cloud.md) for running training jobs on AWS EC2 instances via the `solver-cloud` CLI.
