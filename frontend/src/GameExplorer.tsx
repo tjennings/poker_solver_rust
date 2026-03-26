@@ -472,10 +472,10 @@ export default function GameExplorer() {
                 }}
                 style={{
                   padding: '0.3rem 0.4rem',
-                  background: solving ? '#dc262622' : '#00d9ff22',
-                  border: `2px solid ${solving ? '#dc2626' : '#00d9ff'}`,
+                  background: solving ? '#dc262622' : '#f59e0b22',
+                  border: `2px solid ${solving ? '#dc2626' : '#f59e0b'}`,
                   borderRadius: '4px',
-                  color: solving ? '#dc2626' : '#00d9ff',
+                  color: solving ? '#dc2626' : '#f59e0b',
                   cursor: 'pointer',
                   fontSize: '0.7rem',
                   fontWeight: 700,
