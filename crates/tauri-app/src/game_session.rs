@@ -1156,12 +1156,12 @@ fn evaluate_and_inject_boundaries(
 
             // Diagnostic: dump boundary CFVs for first 3
             if traverser == 0 && ordinal < 3 {
-                let remaining = eff_stack - bp / 2.0;
+                let stack_behind = (eff_stack - bp / 2.0).max(0.0);
                 let min = mapped_cfvs.iter().cloned().fold(f32::MAX, f32::min);
                 let max = mapped_cfvs.iter().cloned().fold(f32::MIN, f32::max);
                 let nonzero_count = mapped_cfvs.iter().filter(|v| v.abs() > 0.001).count();
                 eprintln!(
-                    "[boundary inject] ordinal={ordinal} pot={bp:.0} stack_behind={remaining:.0} \
+                    "[boundary inject] ordinal={ordinal} pot={bp:.0} stack_behind={stack_behind:.0} \
                      nonzero={nonzero_count}/{} min={min:.3} max={max:.3}",
                     mapped_cfvs.len()
                 );
