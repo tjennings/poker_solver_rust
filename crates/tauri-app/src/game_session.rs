@@ -1070,6 +1070,11 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
 
 /// Evaluate boundary CFVs using a `RolloutLeafEvaluator` and inject them
 /// into the `PostFlopGame`.
+///
+/// After at least one solve_step, `game.boundary_reach(ordinal, player)`
+/// contains the opponent's reach probabilities at each boundary — filtered
+/// through the current strategy. We use these for rollout opponent sampling
+/// instead of the initial (unfiltered) ranges.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_and_inject_boundaries(
     game: &mut PostFlopGame,
@@ -1092,6 +1097,21 @@ fn evaluate_and_inject_boundaries(
     // bcfv=1.0 means winning one half-pot (see set_boundary_cfvs docs).
     let eff_stack = game.tree_config().effective_stack as f64;
 
+    // Build mapping: PostFlopGame private_cards index → combo index.
+    // Used to convert boundary_reach (game ordering) to combo ordering (rollout).
+    let build_game_to_combo_map = |player: usize| -> Vec<usize> {
+        let pc = game.private_cards(player);
+        pc.iter().map(|&(c1, c2)| {
+            let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
+            let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
+            combos.iter().position(|c|
+                (c[0] == rs_c1 && c[1] == rs_c2) || (c[0] == rs_c2 && c[1] == rs_c1)
+            ).unwrap_or(usize::MAX)
+        }).collect()
+    };
+    let oop_map = build_game_to_combo_map(0);
+    let ip_map = build_game_to_combo_map(1);
+
     // Collect boundary pots
     let boundary_pots: Vec<f64> = (0..n_boundaries)
         .map(|o| game.boundary_pot(o) as f64)
@@ -1108,73 +1128,65 @@ fn evaluate_and_inject_boundaries(
     );
 
     for traverser in 0..2u8 {
-        // Cache: pot → rollout results for this traverser
-        let mut pot_cache: std::collections::HashMap<i64, Vec<f64>> = std::collections::HashMap::new();
+        let opp = (traverser ^ 1) as usize;
 
-        for &bp in &unique_pots {
+        for ordinal in 0..n_boundaries {
+            let bp = boundary_pots[ordinal];
             let remaining = (eff_stack - bp / 2.0).max(0.0);
 
-            if remaining <= 0.0 {
-                // SPR=0: all-in, no betting. Compute exact showdown equity
-                // per hero hand against the opponent's range-weighted hands,
-                // enumerating all remaining board cards.
-                use rayon::prelude::*;
-                let hero_range = if traverser == 0 { oop_weights } else { ip_weights };
-                let opp_range = if traverser == 0 { ip_weights } else { oop_weights };
+            // Get filtered opponent range at this boundary from the solver.
+            // Falls back to initial range if boundary_reach not yet computed.
+            let game_reach = game.boundary_reach(ordinal, opp);
+            let opp_map = if opp == 0 { &oop_map } else { &ip_map };
+            let hero_range = if traverser == 0 { oop_weights } else { ip_weights };
 
-                let cfvs: Vec<f64> = combos
+            // Convert boundary reach (game ordering) to combo ordering
+            let opp_range_filtered: Vec<f64> = if !game_reach.is_empty() {
+                let mut r = vec![0.0f64; combos.len()];
+                for (game_idx, &combo_idx) in opp_map.iter().enumerate() {
+                    if combo_idx < r.len() && game_idx < game_reach.len() {
+                        r[combo_idx] = game_reach[game_idx] as f64;
+                    }
+                }
+                r
+            } else {
+                // Fallback: use initial range
+                (if opp == 0 { oop_weights } else { ip_weights }).to_vec()
+            };
+            let use_filtered = !game_reach.is_empty();
+
+            // Compute boundary CFVs
+            let cfvs: Vec<f64> = if remaining <= 0.0 {
+                // SPR=0: exact equity against (filtered) opponent range
+                use rayon::prelude::*;
+                combos
                     .par_iter()
                     .enumerate()
                     .map(|(i, hero_hand)| {
-                        if hero_range[i] <= 0.0 {
-                            return 0.0;
-                        }
-                        // Per-matchup showdown equity weighted by opponent reach.
+                        if hero_range[i] <= 0.0 { return 0.0; }
                         let mut ev_sum = 0.0;
                         let mut weight_sum = 0.0;
                         for (j, opp_hand) in combos.iter().enumerate() {
-                            if opp_range[j] <= 0.0 {
-                                continue;
-                            }
-                            // Skip card overlaps
+                            if opp_range_filtered[j] <= 0.0 { continue; }
                             if hero_hand[0] == opp_hand[0] || hero_hand[0] == opp_hand[1]
                                 || hero_hand[1] == opp_hand[0] || hero_hand[1] == opp_hand[1]
-                            {
-                                continue;
-                            }
-                            // Also skip if opponent cards overlap with board
-                            if board_cards.iter().any(|b| *b == opp_hand[0] || *b == opp_hand[1]) {
-                                continue;
-                            }
-
-                            // Compute matchup equity vs this specific opponent.
-                            // compute_equity handles both 5-card and incomplete boards
-                            // (enumerates remaining cards internally).
+                            { continue; }
+                            if board_cards.iter().any(|b| *b == opp_hand[0] || *b == opp_hand[1])
+                            { continue; }
                             let eq = poker_solver_core::showdown_equity::compute_matchup_equity(
                                 *hero_hand, *opp_hand, board_cards,
                             );
-
-                            ev_sum += eq * opp_range[j];
-                            weight_sum += opp_range[j];
+                            ev_sum += eq * opp_range_filtered[j];
+                            weight_sum += opp_range_filtered[j];
                         }
                         if weight_sum > 0.0 {
-                            let eq = ev_sum / weight_sum;
-                            (eq - 0.5) * 2.0 // pot-fraction: +1 = win pot, -1 = lose pot
-                        } else {
-                            0.0
-                        }
+                            ((ev_sum / weight_sum) - 0.5) * 2.0
+                        } else { 0.0 }
                     })
-                    .collect();
-
-                eprintln!(
-                    "[boundary eval] pot={bp:.0} SPR=0: exact equity for {} combos (traverser={traverser})",
-                    combos.len()
-                );
-                pot_cache.insert(bp as i64, cfvs);
+                    .collect()
             } else {
-                // SPR > 0: use rollout with correct boundary stack/pot.
+                // SPR > 0: rollout with boundary's stack/pot and filtered opponent range
                 let boundary_starting_stack = remaining + bp / 2.0;
-                let boundary_spr_pot = bp;
                 let eval = RolloutLeafEvaluator::new(
                     evaluator.strategy.clone(),
                     evaluator.abstract_tree.clone(),
@@ -1185,21 +1197,18 @@ fn evaluate_and_inject_boundaries(
                     evaluator.num_rollouts,
                     evaluator.num_opponent_samples,
                     boundary_starting_stack,
-                    boundary_spr_pot,
+                    bp,
                 );
                 let requests = vec![(bp, 0.0, traverser)];
-                let results = eval.evaluate_boundaries(combos, board_cards, oop_weights, ip_weights, &requests);
-                pot_cache.insert(bp as i64, results.into_iter().next().unwrap_or_default());
-            }
-        }
+                let results = eval.evaluate_boundaries(
+                    combos, board_cards, hero_range, &opp_range_filtered, &requests,
+                );
+                results.into_iter().next().unwrap_or_default()
+            };
 
-        for ordinal in 0..n_boundaries {
-            let bp = boundary_pots[ordinal];
-            let cfvs = pot_cache.get(&(bp as i64)).unwrap();
-
+            // Map combo ordering → game ordering and inject
             let private_cards = game.private_cards(traverser as usize);
             let mut mapped_cfvs = vec![0.0f32; private_cards.len()];
-
             for (hand_idx, &(c1, c2)) in private_cards.iter().enumerate() {
                 let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
                 let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
@@ -1213,16 +1222,12 @@ fn evaluate_and_inject_boundaries(
                 }
             }
 
-            // Diagnostic: dump boundary CFVs for first 3
             if traverser == 0 && ordinal < 3 {
-                let stack_behind = (eff_stack - bp / 2.0).max(0.0);
                 let min = mapped_cfvs.iter().cloned().fold(f32::MAX, f32::min);
                 let max = mapped_cfvs.iter().cloned().fold(f32::MIN, f32::max);
-                let nonzero_count = mapped_cfvs.iter().filter(|v| v.abs() > 0.001).count();
                 eprintln!(
-                    "[boundary inject] ordinal={ordinal} pot={bp:.0} stack_behind={stack_behind:.0} \
-                     nonzero={nonzero_count}/{} min={min:.3} max={max:.3}",
-                    mapped_cfvs.len()
+                    "[boundary] ord={ordinal} pot={bp:.0} stack={remaining:.0} filtered={use_filtered} \
+                     min={min:.3} max={max:.3}",
                 );
             }
 

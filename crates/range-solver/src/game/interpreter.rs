@@ -359,6 +359,17 @@ impl PostFlopGame {
         let idx = ordinal * 2 + player;
         idx >= self.boundary_cfvs.len() || self.boundary_cfvs[idx].is_empty()
     }
+
+    /// Returns the opponent reach probabilities at a boundary node for a given player.
+    /// Captured during the most recent `solve_step`. Returns empty vec if not yet computed.
+    pub fn boundary_reach(&self, ordinal: usize, player: usize) -> Vec<f32> {
+        let idx = ordinal * 2 + player;
+        if idx < self.boundary_reach.len() {
+            self.boundary_reach[idx].lock().unwrap().clone()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +636,9 @@ impl PostFlopGame {
         }
         // 2 slots per boundary node: one for each player.
         self.boundary_cfvs = vec![Vec::new(); boundary_count as usize * 2];
+        self.boundary_reach = (0..boundary_count as usize * 2)
+            .map(|_| std::sync::Mutex::new(Vec::new()))
+            .collect();
 
         self.misc_memory_usage = self.memory_usage_internal();
 

@@ -64,6 +64,14 @@ impl PostFlopGame {
             let bcfv_index = ordinal * 2 + player;
             let bcfvs = &self.boundary_cfvs[bcfv_index];
 
+            // Capture opponent reach at this boundary for rollout range filtering.
+            // cfreach is the opponent's (player^1) reach probabilities.
+            let opp = player ^ 1;
+            let reach_index = ordinal * 2 + opp;
+            if reach_index < self.boundary_reach.len() {
+                *self.boundary_reach[reach_index].lock().unwrap() = cfreach.to_vec();
+            }
+
             if bcfvs.is_empty() {
                 // No boundary CFVs set — treat as zero.
                 return;

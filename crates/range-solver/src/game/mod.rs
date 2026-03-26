@@ -160,6 +160,11 @@ pub struct PostFlopGame {
     /// Maps node arena index to boundary ordinal. `u32::MAX` means not a
     /// boundary. Built during tree construction.
     pub(crate) node_to_boundary: Vec<u32>,
+    /// Per-boundary opponent reach probabilities, captured during solve_step.
+    /// Layout: `boundary_reach[ordinal * 2 + player]` → `Vec<f32>` with one
+    /// entry per private hand of that player. Updated each solve iteration.
+    /// Uses `Mutex` for interior mutability (written during `evaluate` which takes `&self`).
+    pub boundary_reach: Vec<std::sync::Mutex<Vec<f32>>>,
 
     // -- result interpreter state --
     pub(crate) action_history: Vec<usize>,
