@@ -163,7 +163,7 @@ const RANK_NAMES: [char; 13] = [
 /// - Pairs sit on the diagonal (row == col).
 /// - Suited hands go above the diagonal (smaller row first).
 /// - Offsuit hands go below the diagonal (larger row first).
-fn card_pair_to_matrix(c1: u8, c2: u8) -> (usize, usize, bool) {
+pub(crate) fn card_pair_to_matrix(c1: u8, c2: u8) -> (usize, usize, bool) {
     let rank1 = c1 >> 2; // 0=deuce..12=ace
     let suit1 = c1 & 3;
     let rank2 = c2 >> 2;
@@ -194,7 +194,7 @@ fn card_pair_to_matrix(c1: u8, c2: u8) -> (usize, usize, bool) {
 }
 
 /// Returns (label, is_suited, is_pair) for a given matrix cell.
-fn matrix_cell_label(row: usize, col: usize) -> (String, bool, bool) {
+pub(crate) fn matrix_cell_label(row: usize, col: usize) -> (String, bool, bool) {
     let r1 = RANK_NAMES[row];
     let r2 = RANK_NAMES[col];
     if row == col {
@@ -229,7 +229,7 @@ pub struct SubgameSolveResult {
 // ---------------------------------------------------------------------------
 
 /// Parse a 2-char card string (e.g. "Ks") into an `rs_poker` Card.
-fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
+pub(crate) fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
     if s.len() != 2 {
         return Err(format!("Invalid card string: {s}"));
     }
@@ -330,7 +330,7 @@ fn sample_weighted(rng: &mut impl Rng, weights: &[f64], n: u32) -> Vec<usize> {
 /// For each hero combo, samples opponent hands weighted by reach probabilities,
 /// performs fixed-strategy rollouts from the boundary node, and averages the
 /// results.  Returns per-combo CFVs in pot-fraction units.
-struct RolloutLeafEvaluator {
+pub(crate) struct RolloutLeafEvaluator {
     strategy: Arc<BlueprintV2Strategy>,
     abstract_tree: Arc<GameTree>,
     all_buckets: Arc<AllBuckets>,

@@ -4,23 +4,31 @@
 //! Six Tauri commands expose it: `game_new`, `game_get_state`, `game_play_action`,
 //! `game_deal_card`, `game_back`, `game_solve`.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use serde::Serialize;
 
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
+use poker_solver_core::blueprint_v2::continuation::BiasType;
 use poker_solver_core::blueprint_v2::game_tree::{
     GameNode as V2GameNode, GameTree as V2GameTree, TreeAction,
 };
+use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::blueprint_v2::Street;
 
+use range_solver::card::{card_to_string, NOT_DEALT};
+use range_solver::{PostFlopGame, solve_step, finalize, compute_exploitability};
+
 use crate::exploration::{
-    board_for_street_slice, build_canonical_to_combo_map, canonical_hand_index_from_ranks,
-    hand_label_from_matrix, parse_board, pot_at_v2_node, ActionInfo, BucketLookup, RANKS,
+    board_for_street_slice, blueprint_sizes_to_range_solver, build_canonical_to_combo_map,
+    canonical_hand_index_from_ranks, hand_label_from_matrix, parse_board, pot_at_v2_node,
+    ActionInfo, BucketLookup, RANKS,
 };
-use crate::postflop::CbvContext;
+use crate::postflop::{CbvContext, RolloutLeafEvaluator, parse_rs_poker_card};
 
 // ---------------------------------------------------------------------------
 // Types returned to the frontend
@@ -103,18 +111,76 @@ pub struct GameState {
 }
 
 // ---------------------------------------------------------------------------
+// Shared solve state (background thread <-> UI queries)
+// ---------------------------------------------------------------------------
+
+/// Shared state between the background solve thread and UI queries.
+///
+/// Lives in `GameSessionState` (not `GameSession`) because it must be
+/// `Arc`-shared with the background thread while the session is behind
+/// a `RwLock`.
+pub struct SolveState {
+    pub solving: AtomicBool,
+    pub cancel: AtomicBool,
+    pub iteration: AtomicU32,
+    pub max_iterations: AtomicU32,
+    /// Exploitability stored as f32 bits (use `f32::to_bits` / `f32::from_bits`).
+    pub exploitability_bits: AtomicU32,
+    pub solve_start: RwLock<Option<Instant>>,
+    /// Matrix snapshot updated during solve.
+    pub matrix_snapshot: RwLock<Option<GameMatrix>>,
+    /// Actions at the solve game's root node.
+    pub solve_actions: RwLock<Vec<GameAction>>,
+    /// Position label at the solve root.
+    pub solve_position: RwLock<String>,
+}
+
+impl Default for SolveState {
+    fn default() -> Self {
+        Self {
+            solving: AtomicBool::new(false),
+            cancel: AtomicBool::new(false),
+            iteration: AtomicU32::new(0),
+            max_iterations: AtomicU32::new(0),
+            exploitability_bits: AtomicU32::new(0),
+            solve_start: RwLock::new(None),
+            matrix_snapshot: RwLock::new(None),
+            solve_actions: RwLock::new(vec![]),
+            solve_position: RwLock::new(String::new()),
+        }
+    }
+}
+
+impl SolveState {
+    /// Reset all fields to defaults. Called when starting a new hand or going back.
+    pub fn reset(&self) {
+        self.solving.store(false, Ordering::Relaxed);
+        self.cancel.store(false, Ordering::Relaxed);
+        self.iteration.store(0, Ordering::Relaxed);
+        self.max_iterations.store(0, Ordering::Relaxed);
+        self.exploitability_bits.store(0, Ordering::Relaxed);
+        *self.solve_start.write() = None;
+        *self.matrix_snapshot.write() = None;
+        *self.solve_actions.write() = vec![];
+        *self.solve_position.write() = String::new();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared state for Tauri commands
 // ---------------------------------------------------------------------------
 
 /// Shared session state, accessible by Tauri commands.
 pub struct GameSessionState {
     pub session: RwLock<Option<GameSession>>,
+    pub solve_state: Arc<SolveState>,
 }
 
 impl Default for GameSessionState {
     fn default() -> Self {
         Self {
             session: RwLock::new(None),
+            solve_state: Arc::new(SolveState::default()),
         }
     }
 }
@@ -621,11 +687,6 @@ impl GameSession {
         Ok(())
     }
 
-    /// Stub: subgame solver integration (not yet implemented).
-    pub fn solve(&self) -> Result<(), String> {
-        Err("Solve not yet implemented".to_string())
-    }
-
     /// Multiply the acting player's weights by action probability at each hand.
     #[allow(clippy::cast_possible_truncation)]
     fn propagate_weights(
@@ -776,6 +837,290 @@ fn street_to_string(street: Street) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Range-solver helpers for subgame solving
+// ---------------------------------------------------------------------------
+
+/// Parse board card strings into range-solver card IDs.
+fn parse_solve_board(
+    board: &[String],
+) -> Result<([u8; 3], u8, u8, range_solver::BoardState), String> {
+    use range_solver::card::{card_from_str, flop_from_str};
+
+    match board.len() {
+        3 => {
+            let flop_str = format!("{}{}{}", board[0], board[1], board[2]);
+            let flop = flop_from_str(&flop_str).map_err(|e| format!("Bad flop: {e}"))?;
+            Ok((flop, NOT_DEALT, NOT_DEALT, range_solver::BoardState::Flop))
+        }
+        4 => {
+            let flop_str = format!("{}{}{}", board[0], board[1], board[2]);
+            let flop = flop_from_str(&flop_str).map_err(|e| format!("Bad flop: {e}"))?;
+            let turn = card_from_str(&board[3]).map_err(|e| format!("Bad turn: {e}"))?;
+            Ok((flop, turn, NOT_DEALT, range_solver::BoardState::Turn))
+        }
+        5 => {
+            let flop_str = format!("{}{}{}", board[0], board[1], board[2]);
+            let flop = flop_from_str(&flop_str).map_err(|e| format!("Bad flop: {e}"))?;
+            let turn = card_from_str(&board[3]).map_err(|e| format!("Bad turn: {e}"))?;
+            let river = card_from_str(&board[4]).map_err(|e| format!("Bad river: {e}"))?;
+            Ok((flop, turn, river, range_solver::BoardState::River))
+        }
+        n => Err(format!("Board must have 3-5 cards, got {n}")),
+    }
+}
+
+/// Convert blueprint bet sizes (`Vec<Vec<f64>>` pot fractions per raise depth)
+/// into range-solver format strings: `(bet_str, raise_str)`.
+///
+/// Reuses `blueprint_sizes_to_range_solver` from exploration.rs.
+fn format_bet_sizes_for_solve(sizes: &[Vec<f64>]) -> (String, String) {
+    blueprint_sizes_to_range_solver(sizes)
+}
+
+/// Build a `PostFlopGame` from session state, ready for solving.
+#[allow(clippy::too_many_arguments)]
+fn build_solve_game(
+    board: &[String],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    pot: i32,
+    effective_stack: i32,
+    bet_sizes: &[Vec<f64>],
+) -> Result<PostFlopGame, String> {
+    use range_solver::bet_size::BetSizeOptions;
+    use range_solver::card::CardConfig;
+    use range_solver::range::Range;
+    use range_solver::{ActionTree, TreeConfig};
+
+    let (flop, turn, river, initial_state) = parse_solve_board(board)?;
+
+    let oop_range =
+        Range::from_raw_data(oop_weights).map_err(|e| format!("Bad OOP weights: {e}"))?;
+    let ip_range =
+        Range::from_raw_data(ip_weights).map_err(|e| format!("Bad IP weights: {e}"))?;
+
+    let (bet_str, raise_str) = format_bet_sizes_for_solve(bet_sizes);
+    let oop_sizes = BetSizeOptions::try_from((bet_str.as_str(), raise_str.as_str()))
+        .map_err(|e| format!("Bad bet sizes: {e}"))?;
+    let ip_sizes = oop_sizes.clone();
+
+    let card_config = CardConfig {
+        range: [oop_range, ip_range],
+        flop,
+        turn,
+        river,
+    };
+
+    let tree_config = TreeConfig {
+        initial_state,
+        starting_pot: pot,
+        effective_stack,
+        rake_rate: 0.0,
+        rake_cap: 0.0,
+        flop_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
+        turn_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
+        river_bet_sizes: [oop_sizes, ip_sizes],
+        turn_donk_sizes: None,
+        river_donk_sizes: None,
+        add_allin_threshold: 1.5,
+        force_allin_threshold: 0.15,
+        merging_threshold: 0.1,
+        depth_limit: Some(1),
+    };
+
+    let action_tree =
+        ActionTree::new(tree_config).map_err(|e| format!("Failed to build tree: {e}"))?;
+    let mut game = PostFlopGame::with_config(card_config, action_tree)
+        .map_err(|e| format!("Failed to build game: {e}"))?;
+    game.allocate_memory(false);
+    Ok(game)
+}
+
+/// Convert a range-solver `Action` to a `GameAction`.
+fn range_solver_action_to_game_action(
+    action: &range_solver::Action,
+    idx: usize,
+) -> GameAction {
+    let (label, action_type) = match action {
+        range_solver::Action::Fold => ("Fold".to_string(), "fold"),
+        range_solver::Action::Check => ("Check".to_string(), "check"),
+        range_solver::Action::Call => ("Call".to_string(), "call"),
+        range_solver::Action::Bet(amt) => (format!("{amt}"), "bet"),
+        range_solver::Action::Raise(amt) => (format!("{amt}"), "raise"),
+        range_solver::Action::AllIn(amt) => (format!("All-in {amt}"), "allin"),
+        _ => ("?".to_string(), "unknown"),
+    };
+    GameAction {
+        id: idx.to_string(),
+        label,
+        action_type: action_type.to_string(),
+    }
+}
+
+/// Build a `GameMatrix` from the current `PostFlopGame` state at the root node.
+///
+/// Reuses the `card_pair_to_matrix` and `matrix_cell_label` helpers from postflop.rs.
+#[allow(clippy::cast_possible_truncation)]
+fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> GameMatrix {
+    use crate::postflop::{card_pair_to_matrix, matrix_cell_label};
+    use range_solver::interface::Game;
+
+    game.back_to_root();
+    let player = game.current_player();
+    let strategy = game.strategy();
+    let private_cards = game.private_cards(player);
+    let num_hands = game.num_private_hands(player);
+    let initial_weights = game.initial_weights(player);
+    let available_actions = game.available_actions();
+
+    let game_actions: Vec<GameAction> = available_actions
+        .iter()
+        .enumerate()
+        .map(|(i, a)| range_solver_action_to_game_action(a, i))
+        .collect();
+    let num_actions = game_actions.len();
+
+    // Accumulators for 13x13 grid
+    let mut prob_sums = vec![vec![vec![0.0f64; num_actions]; 13]; 13];
+    let mut combo_counts = vec![vec![0usize; 13]; 13];
+    let mut weight_sums = vec![vec![0.0f64; 13]; 13];
+    let mut ev_sums = vec![vec![0.0f64; 13]; 13];
+    let mut combo_details: Vec<Vec<Vec<ComboDetail>>> = vec![vec![Vec::new(); 13]; 13];
+
+    for (hand_idx, &(c1, c2)) in private_cards.iter().enumerate() {
+        let (row, col, _) = card_pair_to_matrix(c1, c2);
+        combo_counts[row][col] += 1;
+        weight_sums[row][col] += initial_weights[hand_idx] as f64;
+        if let Some(evs) = hand_evs {
+            if hand_idx < evs.len() {
+                ev_sums[row][col] += evs[hand_idx] as f64;
+            }
+        }
+
+        let mut probs = Vec::with_capacity(num_actions);
+        for (action_idx, prob_sum) in prob_sums[row][col].iter_mut().enumerate() {
+            let prob = strategy[action_idx * num_hands + hand_idx];
+            *prob_sum += prob as f64;
+            probs.push(prob);
+        }
+
+        let s1 = card_to_string(c1).unwrap_or_default();
+        let s2 = card_to_string(c2).unwrap_or_default();
+        combo_details[row][col].push(ComboDetail {
+            cards: format!("{s1}{s2}"),
+            probabilities: probs,
+            weight: initial_weights[hand_idx],
+        });
+    }
+
+    let cells: Vec<Vec<GameMatrixCell>> = (0..13)
+        .map(|row| {
+            (0..13)
+                .map(|col| {
+                    let (label, suited, pair) = matrix_cell_label(row, col);
+                    let count = combo_counts[row][col];
+                    let probabilities = if count > 0 {
+                        prob_sums[row][col]
+                            .iter()
+                            .map(|&s| (s / count as f64) as f32)
+                            .collect()
+                    } else {
+                        vec![0.0; num_actions]
+                    };
+                    let ev = if count > 0 && hand_evs.is_some() {
+                        Some((ev_sums[row][col] / count as f64) as f32)
+                    } else {
+                        None
+                    };
+                    let combos = std::mem::take(&mut combo_details[row][col]);
+                    let weight = if count > 0 {
+                        (weight_sums[row][col] / count as f64) as f32
+                    } else {
+                        0.0
+                    };
+                    let combo_count = combos.iter().filter(|c| c.weight > 0.0).count();
+                    GameMatrixCell {
+                        hand: label,
+                        suited,
+                        pair,
+                        probabilities,
+                        combo_count,
+                        weight,
+                        ev,
+                        combos,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    GameMatrix {
+        cells,
+        actions: game_actions,
+    }
+}
+
+/// Evaluate boundary CFVs using a `RolloutLeafEvaluator` and inject them
+/// into the `PostFlopGame`.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_and_inject_boundaries(
+    game: &mut PostFlopGame,
+    evaluator: &RolloutLeafEvaluator,
+    board_cards: &[rs_poker::core::Card],
+    oop_weights: &[f64],
+    ip_weights: &[f64],
+    combos: &[[rs_poker::core::Card; 2]],
+) {
+    let n_boundaries = game.num_boundary_nodes();
+    if n_boundaries == 0 {
+        return;
+    }
+
+    // Build requests: (pot, effective_stack, traverser) per boundary.
+    // We need both players, so we evaluate twice (once per traverser).
+    for traverser in 0..2u8 {
+        let requests: Vec<(f64, f64, u8)> = (0..n_boundaries)
+            .map(|ordinal| {
+                let pot = game.boundary_pot(ordinal) as f64;
+                (pot, 0.0, traverser)
+            })
+            .collect();
+
+        let cfv_results = evaluator.evaluate_boundaries(
+            combos,
+            board_cards,
+            oop_weights,
+            ip_weights,
+            &requests,
+        );
+
+        // Inject CFVs for each boundary
+        for (ordinal, cfvs_f64) in cfv_results.into_iter().enumerate() {
+            // Convert from SubgameHands combo ordering to PostFlopGame private_cards ordering
+            let private_cards = game.private_cards(traverser as usize);
+            let mut mapped_cfvs = vec![0.0f32; private_cards.len()];
+
+            // Build lookup: (rs_poker card pair) -> combo_idx in evaluator combos
+            for (hand_idx, &(c1, c2)) in private_cards.iter().enumerate() {
+                // Find matching combo in evaluator combos
+                let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
+                let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
+                for (ci, combo) in combos.iter().enumerate() {
+                    if (combo[0] == rs_c1 && combo[1] == rs_c2)
+                        || (combo[0] == rs_c2 && combo[1] == rs_c1)
+                    {
+                        mapped_cfvs[hand_idx] = cfvs_f64[ci] as f32;
+                        break;
+                    }
+                }
+            }
+
+            game.set_boundary_cfvs(ordinal, traverser as usize, mapped_cfvs);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core functions (no Tauri dependency, usable from Axum devserver)
 // ---------------------------------------------------------------------------
 
@@ -788,14 +1133,54 @@ pub fn game_new_core(
     let cbv_ctx = postflop.cbv_context.read().clone();
     let session = GameSession::from_exploration_state(exploration, cbv_ctx)?;
     *session_state.session.write() = Some(session);
+    session_state.solve_state.reset();
     Ok(())
 }
 
-/// Get the current game state.
+/// Get the current game state, including solve progress if active.
 pub fn game_get_state_core(session_state: &GameSessionState) -> Result<GameState, String> {
     let guard = session_state.session.read();
     let session = guard.as_ref().ok_or("No game session active")?;
-    Ok(session.get_state())
+    let mut state = session.get_state();
+
+    // Override with solve state if active or just completed
+    let ss = &session_state.solve_state;
+    let is_solving = ss.solving.load(Ordering::Relaxed);
+    let iteration = ss.iteration.load(Ordering::Relaxed);
+
+    if is_solving || iteration > 0 {
+        let exp = f32::from_bits(ss.exploitability_bits.load(Ordering::Relaxed));
+        let max_iters = ss.max_iterations.load(Ordering::Relaxed);
+        let elapsed = ss
+            .solve_start
+            .read()
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+
+        state.solve = Some(SolveStatus {
+            iteration,
+            max_iterations: max_iters,
+            exploitability: exp,
+            elapsed_secs: elapsed,
+            solver_name: "range".to_string(),
+            is_complete: !is_solving && iteration > 0,
+        });
+
+        // Use solve matrix if available
+        if let Some(matrix) = ss.matrix_snapshot.read().clone() {
+            state.matrix = Some(matrix);
+        }
+        let actions = ss.solve_actions.read();
+        if !actions.is_empty() {
+            state.actions = actions.clone();
+        }
+        let position = ss.solve_position.read();
+        if !position.is_empty() {
+            state.position = position.clone();
+        }
+    }
+
+    Ok(state)
 }
 
 /// Play an action and return the new game state.
@@ -806,7 +1191,11 @@ pub fn game_play_action_core(
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
     session.play_action(action_id)?;
-    Ok(session.get_state())
+    let state = session.get_state();
+    drop(guard);
+    // Reset solve state so stale data doesn't leak into the next position.
+    session_state.solve_state.reset();
+    Ok(state)
 }
 
 /// Deal a board card and return the new game state.
@@ -825,14 +1214,254 @@ pub fn game_back_core(session_state: &GameSessionState) -> Result<GameState, Str
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
     session.back()?;
+    // Reset solve state so stale data doesn't leak.
+    drop(guard);
+    session_state.solve_state.reset();
+    let guard = session_state.session.read();
+    let session = guard.as_ref().ok_or("No game session active")?;
     Ok(session.get_state())
 }
 
-/// Start a subgame solve (stub).
-pub fn game_solve_core(session_state: &GameSessionState) -> Result<(), String> {
-    let guard = session_state.session.read();
-    let session = guard.as_ref().ok_or("No game session active")?;
-    session.solve()
+/// Start a subgame solve using range-solver `PostFlopGame` with depth limit.
+///
+/// Spawns a background thread that builds a `PostFlopGame`, runs an iterative
+/// solve loop with optional `RolloutLeafEvaluator` boundary re-evaluation,
+/// and stores matrix snapshots in `SolveState` for the UI to read.
+#[allow(clippy::too_many_arguments)]
+pub fn game_solve_core(
+    session_state: &GameSessionState,
+    max_iterations: Option<u32>,
+    target_exploitability: Option<f32>,
+    leaf_eval_interval: Option<u32>,
+    rollout_bias_factor: Option<f64>,
+    rollout_num_samples: Option<u32>,
+    rollout_opponent_samples: Option<u32>,
+    range_clamp_threshold: Option<f64>,
+) -> Result<(), String> {
+    use poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id;
+    use range_solver::card::card_pair_to_index;
+
+    // Guard: reject if already solving
+    if session_state.solve_state.solving.load(Ordering::Relaxed) {
+        return Err("A solve is already in progress".to_string());
+    }
+
+    // Read session state under lock, clone what the thread needs
+    let (board, oop_w, ip_w, pot, eff_stack, bet_sizes, cbv_ctx, abstract_node_idx, position_label) = {
+        let guard = session_state.session.read();
+        let session = guard.as_ref().ok_or("No game session active")?;
+
+        // Must be at a postflop decision node
+        if session.board.len() < 3 {
+            return Err("Solve requires a postflop position (deal board cards first)".to_string());
+        }
+        let node = &session.tree.nodes[session.node_idx as usize];
+        let player = match node {
+            V2GameNode::Decision { player, .. } => *player,
+            _ => return Err("Not at a decision node".to_string()),
+        };
+
+        let board = session.board.clone();
+        let oop_w = session.weights[0].clone();
+        let ip_w = session.weights[1].clone();
+        let pot = session.compute_pot();
+        let stacks = session.compute_stacks();
+        let eff_stack = stacks[0].min(stacks[1]);
+
+        // Bet sizes from blueprint config for the current street
+        let street = session.current_street();
+        let sizes = match street {
+            Street::Flop => &session.config.action_abstraction.flop,
+            Street::Turn => &session.config.action_abstraction.turn,
+            Street::River => &session.config.action_abstraction.river,
+            Street::Preflop => return Err("Cannot solve preflop".to_string()),
+        };
+
+        let cbv_ctx = session.cbv_context.clone();
+        // abstract_node_idx: not yet wired from config (deferred).
+        let abs_node_idx: Option<u32> = None;
+
+        let position = session.position_label(player).to_string();
+
+        (board, oop_w, ip_w, pot, eff_stack, sizes.clone(), cbv_ctx, abs_node_idx, position)
+    };
+
+    // Apply range clamping
+    let clamp = range_clamp_threshold.unwrap_or(0.0) as f32;
+    let mut oop_w = oop_w;
+    let mut ip_w = ip_w;
+    if clamp > 0.0 {
+        for w in oop_w.iter_mut() {
+            if *w > 0.0 && *w < clamp {
+                *w = 0.0;
+            }
+        }
+        for w in ip_w.iter_mut() {
+            if *w > 0.0 && *w < clamp {
+                *w = 0.0;
+            }
+        }
+    }
+
+    let max_iters = max_iterations.unwrap_or(200);
+    let eval_interval = leaf_eval_interval.unwrap_or(10);
+    let target_exp = target_exploitability.unwrap_or(3.0);
+
+    // Reset solve state atomics
+    let ss = &session_state.solve_state;
+    ss.iteration.store(0, Ordering::Relaxed);
+    ss.max_iterations.store(max_iters, Ordering::Relaxed);
+    ss.exploitability_bits
+        .store(f32::MAX.to_bits(), Ordering::Relaxed);
+    ss.cancel.store(false, Ordering::Relaxed);
+    ss.solving.store(true, Ordering::Release);
+    *ss.solve_start.write() = Some(Instant::now());
+    *ss.matrix_snapshot.write() = None;
+    *ss.solve_position.write() = position_label;
+
+    // Spawn background thread
+    let ss_clone = Arc::clone(&session_state.solve_state);
+    let board_clone = board.clone();
+    std::thread::spawn(move || {
+        // Build game
+        let mut game = match build_solve_game(&board_clone, &oop_w, &ip_w, pot, eff_stack, &bet_sizes) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[solve] failed to build game: {e}");
+                ss_clone.solving.store(false, Ordering::Release);
+                return;
+            }
+        };
+
+        // Store available actions at root
+        {
+            game.back_to_root();
+            let actions: Vec<GameAction> = game
+                .available_actions()
+                .iter()
+                .enumerate()
+                .map(|(i, a)| range_solver_action_to_game_action(a, i))
+                .collect();
+            *ss_clone.solve_actions.write() = actions;
+        }
+
+        // Build RolloutLeafEvaluator if CbvContext available and boundaries exist
+        let evaluator_data = if game.num_boundary_nodes() > 0 {
+            if let Some(ctx) = &cbv_ctx {
+                // Parse board for rs_poker cards
+                let board_cards: Vec<rs_poker::core::Card> = board_clone
+                    .iter()
+                    .filter_map(|s| parse_rs_poker_card(s).ok())
+                    .collect();
+
+                // Enumerate combos (all non-blocked 2-card combos)
+                let mut combos: Vec<[rs_poker::core::Card; 2]> = Vec::new();
+                let mut oop_reach_f64 = Vec::new();
+                let mut ip_reach_f64 = Vec::new();
+                use poker_solver_core::hands::all_hands;
+                for hand in all_hands() {
+                    for (c0, c1) in hand.combos() {
+                        if board_cards.iter().any(|b| *b == c0 || *b == c1) {
+                            continue;
+                        }
+                        let id0 = rs_poker_card_to_id(c0);
+                        let id1 = rs_poker_card_to_id(c1);
+                        let ci = card_pair_to_index(id0, id1);
+                        combos.push([c0, c1]);
+                        oop_reach_f64.push(f64::from(oop_w[ci]));
+                        ip_reach_f64.push(f64::from(ip_w[ci]));
+                    }
+                }
+
+                let bias_factor = rollout_bias_factor.unwrap_or(10.0);
+                let num_rollouts = rollout_num_samples.unwrap_or(3);
+                let opp_samples = rollout_opponent_samples.unwrap_or(8);
+                let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
+
+                let evaluator = RolloutLeafEvaluator::new(
+                    Arc::clone(&ctx.strategy),
+                    Arc::new(ctx.abstract_tree.clone()),
+                    Arc::clone(&ctx.all_buckets),
+                    abstract_node_idx.unwrap_or(0),
+                    BiasType::Unbiased,
+                    bias_factor,
+                    num_rollouts,
+                    opp_samples,
+                    starting_stack,
+                    f64::from(pot),
+                );
+
+                Some((evaluator, board_cards, combos, oop_reach_f64, ip_reach_f64))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Initial matrix snapshot
+        let matrix = build_solve_matrix(&mut game, None);
+        *ss_clone.matrix_snapshot.write() = Some(matrix);
+
+        // Solve loop
+        let mut t = 0u32;
+        while t < max_iters {
+            if ss_clone.cancel.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Re-evaluate boundary CFVs every eval_interval
+            if t.is_multiple_of(eval_interval) {
+                if let Some((ref evaluator, ref board_cards, ref combos, ref oop_reach, ref ip_reach)) = evaluator_data {
+                    evaluate_and_inject_boundaries(
+                        &mut game, evaluator, board_cards, oop_reach, ip_reach, combos,
+                    );
+                }
+            }
+
+            solve_step(&game, t);
+            t += 1;
+            ss_clone.iteration.store(t, Ordering::Relaxed);
+
+            // Compute exploitability and snapshot matrix periodically
+            if t.is_multiple_of(eval_interval) {
+                let exp = compute_exploitability(&game);
+                ss_clone
+                    .exploitability_bits
+                    .store(exp.to_bits(), Ordering::Relaxed);
+
+                let matrix = build_solve_matrix(&mut game, None);
+                *ss_clone.matrix_snapshot.write() = Some(matrix);
+
+                if exp <= target_exp {
+                    break;
+                }
+            }
+        }
+
+        // Finalize: normalize strategy, compute EVs
+        finalize(&mut game);
+        game.back_to_root();
+        game.cache_normalized_weights();
+        let player = game.current_player();
+        let evs = game.expected_values(player);
+        let final_matrix = build_solve_matrix(&mut game, Some(&evs));
+        *ss_clone.matrix_snapshot.write() = Some(final_matrix);
+
+        // Compute final exploitability
+        let final_exp = compute_exploitability(&game);
+        ss_clone
+            .exploitability_bits
+            .store(final_exp.to_bits(), Ordering::Relaxed);
+
+        ss_clone.solving.store(false, Ordering::Release);
+        eprintln!(
+            "[solve] complete: {} iterations, exploitability={:.4}",
+            t, final_exp
+        );
+    });
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -848,6 +1477,7 @@ pub fn game_new(
     let cbv_ctx = postflop_state.cbv_context.read().clone();
     let session = GameSession::from_exploration_state(&exploration, cbv_ctx)?;
     *session_state.session.write() = Some(session);
+    session_state.solve_state.reset();
     Ok(())
 }
 
@@ -855,9 +1485,7 @@ pub fn game_new(
 pub fn game_get_state(
     session_state: tauri::State<'_, GameSessionState>,
 ) -> Result<GameState, String> {
-    let guard = session_state.session.read();
-    let session = guard.as_ref().ok_or("No game session active")?;
-    Ok(session.get_state())
+    game_get_state_core(&session_state)
 }
 
 #[tauri::command]
@@ -865,10 +1493,7 @@ pub fn game_play_action(
     session_state: tauri::State<'_, GameSessionState>,
     action_id: String,
 ) -> Result<GameState, String> {
-    let mut guard = session_state.session.write();
-    let session = guard.as_mut().ok_or("No game session active")?;
-    session.play_action(&action_id)?;
-    Ok(session.get_state())
+    game_play_action_core(&session_state, &action_id)
 }
 
 #[tauri::command]
@@ -886,25 +1511,38 @@ pub fn game_deal_card(
 pub fn game_back(
     session_state: tauri::State<'_, GameSessionState>,
 ) -> Result<GameState, String> {
-    let mut guard = session_state.session.write();
-    let session = guard.as_mut().ok_or("No game session active")?;
-    session.back()?;
-    Ok(session.get_state())
+    game_back_core(&session_state)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn game_solve(
     session_state: tauri::State<'_, GameSessionState>,
+    max_iterations: Option<u32>,
+    target_exploitability: Option<f32>,
+    leaf_eval_interval: Option<u32>,
+    rollout_bias_factor: Option<f64>,
+    rollout_num_samples: Option<u32>,
+    rollout_opponent_samples: Option<u32>,
+    range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
-    let guard = session_state.session.read();
-    let session = guard.as_ref().ok_or("No game session active")?;
-    session.solve()
+    game_solve_core(
+        &session_state,
+        max_iterations,
+        target_exploitability,
+        leaf_eval_interval,
+        rollout_bias_factor,
+        rollout_num_samples,
+        rollout_opponent_samples,
+        range_clamp_threshold,
+    )
 }
 
 pub fn game_cancel_solve_core(session_state: &GameSessionState) -> Result<(), String> {
-    let guard = session_state.session.read();
-    let _session = guard.as_ref().ok_or("No game session active")?;
-    // TODO: once solve runs in a background thread, set a cancellation flag here
+    session_state
+        .solve_state
+        .cancel
+        .store(true, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1299,15 +1937,300 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // game_solve stub test
+    // SolveState tests
     // -------------------------------------------------------------------
 
     #[test]
-    fn solve_returns_not_implemented() {
+    fn solve_state_defaults_to_not_solving() {
+        let ss = SolveState::default();
+        assert!(!ss.solving.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!ss.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(ss.iteration.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(ss.max_iterations.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(ss.matrix_snapshot.read().is_none());
+        assert!(ss.solve_actions.read().is_empty());
+        assert!(ss.solve_position.read().is_empty());
+    }
+
+    #[test]
+    fn game_session_state_has_solve_state() {
+        let gss = GameSessionState::default();
+        // solve_state should be an Arc<SolveState>
+        assert!(!gss.solve_state.solving.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // -------------------------------------------------------------------
+    // get_state reads solve progress
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn get_state_core_returns_solve_status_when_solving() {
+        let gss = GameSessionState::default();
+        // Set up a session
         let session = make_decision_session();
-        let result = session.solve();
+        *gss.session.write() = Some(session);
+
+        // Simulate active solve
+        gss.solve_state.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.solve_state.iteration.store(50, std::sync::atomic::Ordering::Relaxed);
+        gss.solve_state.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.solve_state.exploitability_bits.store(5.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        *gss.solve_state.solve_start.write() = Some(std::time::Instant::now());
+
+        let state = game_get_state_core(&gss).unwrap();
+        let solve = state.solve.expect("solve should be Some");
+        assert_eq!(solve.iteration, 50);
+        assert_eq!(solve.max_iterations, 200);
+        assert!((solve.exploitability - 5.0).abs() < 0.01);
+        assert!(!solve.is_complete);
+        assert_eq!(solve.solver_name, "range");
+    }
+
+    #[test]
+    fn get_state_core_returns_complete_after_solve() {
+        let gss = GameSessionState::default();
+        let session = make_decision_session();
+        *gss.session.write() = Some(session);
+
+        // Simulate completed solve
+        gss.solve_state.solving.store(false, std::sync::atomic::Ordering::Relaxed);
+        gss.solve_state.iteration.store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.solve_state.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.solve_state.exploitability_bits.store(1.5f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        *gss.solve_state.solve_start.write() = Some(std::time::Instant::now());
+
+        let state = game_get_state_core(&gss).unwrap();
+        let solve = state.solve.expect("solve should be Some after completion");
+        assert!(solve.is_complete);
+        assert_eq!(solve.iteration, 200);
+    }
+
+    #[test]
+    fn get_state_core_overrides_matrix_with_solve_snapshot() {
+        let gss = GameSessionState::default();
+        let session = make_decision_session();
+        *gss.session.write() = Some(session);
+
+        // Simulate solve with matrix snapshot
+        gss.solve_state.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.solve_state.iteration.store(10, std::sync::atomic::Ordering::Relaxed);
+        gss.solve_state.max_iterations.store(100, std::sync::atomic::Ordering::Relaxed);
+        *gss.solve_state.solve_start.write() = Some(std::time::Instant::now());
+
+        // Create a dummy matrix snapshot
+        let dummy_matrix = GameMatrix {
+            cells: vec![vec![GameMatrixCell {
+                hand: "TEST".to_string(),
+                suited: false,
+                pair: false,
+                probabilities: vec![1.0],
+                combo_count: 1,
+                weight: 1.0,
+                ev: None,
+                combos: vec![],
+            }]],
+            actions: vec![GameAction { id: "0".to_string(), label: "Check".to_string(), action_type: "check".to_string() }],
+        };
+        *gss.solve_state.matrix_snapshot.write() = Some(dummy_matrix);
+
+        let state = game_get_state_core(&gss).unwrap();
+        let matrix = state.matrix.expect("matrix should be overridden by solve snapshot");
+        assert_eq!(matrix.cells[0][0].hand, "TEST");
+    }
+
+    #[test]
+    fn get_state_core_no_solve_data_returns_none() {
+        let gss = GameSessionState::default();
+        let session = make_decision_session();
+        *gss.session.write() = Some(session);
+
+        // No solve has been run - iteration is 0, not solving
+        let state = game_get_state_core(&gss).unwrap();
+        assert!(state.solve.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // game_solve_core tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn game_solve_core_rejects_no_session() {
+        let gss = GameSessionState::default();
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not yet implemented"));
+        assert!(result.unwrap_err().contains("No game session"));
+    }
+
+    #[test]
+    fn game_solve_core_rejects_double_solve() {
+        let gss = GameSessionState::default();
+        let session = make_decision_session();
+        *gss.session.write() = Some(session);
+        gss.solve_state.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already in progress"));
+    }
+
+    // -------------------------------------------------------------------
+    // game_cancel_solve tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn cancel_solve_sets_cancel_flag() {
+        let gss = GameSessionState::default();
+        assert!(!gss.solve_state.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        game_cancel_solve_core(&gss).unwrap();
+        assert!(gss.solve_state.cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // -------------------------------------------------------------------
+    // parse_solve_board tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_solve_board_flop() {
+        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
+        let (flop, turn, river, state) = parse_solve_board(&board).unwrap();
+        assert_eq!(state, range_solver::BoardState::Flop);
+        assert_eq!(turn, range_solver::card::NOT_DEALT);
+        assert_eq!(river, range_solver::card::NOT_DEALT);
+        // Flop should be 3 valid card IDs
+        assert!(flop.iter().all(|&c| c < 52));
+    }
+
+    #[test]
+    fn parse_solve_board_turn() {
+        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string(), "Js".to_string()];
+        let (_flop, turn, river, state) = parse_solve_board(&board).unwrap();
+        assert_eq!(state, range_solver::BoardState::Turn);
+        assert!(turn < 52);
+        assert_eq!(river, range_solver::card::NOT_DEALT);
+    }
+
+    #[test]
+    fn parse_solve_board_river() {
+        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string(), "Js".to_string(), "Ts".to_string()];
+        let (_flop, _turn, river, state) = parse_solve_board(&board).unwrap();
+        assert_eq!(state, range_solver::BoardState::River);
+        assert!(river < 52);
+    }
+
+    #[test]
+    fn parse_solve_board_invalid_length() {
+        let board = vec!["Ah".to_string(), "Kd".to_string()];
+        let result = parse_solve_board(&board);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("3-5 cards"));
+    }
+
+    // -------------------------------------------------------------------
+    // bet size formatting tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn format_bet_sizes_single_depth() {
+        let sizes = vec![vec![0.33, 0.67, 1.0]];
+        let (bet_str, raise_str) = format_bet_sizes_for_solve(&sizes);
+        assert!(bet_str.contains("33%"));
+        assert!(bet_str.contains("67%"));
+        assert!(bet_str.contains("100%"));
+        // Should include allin
+        assert!(bet_str.contains('a'));
+        // raise_str defaults to bet_str when only one depth
+        assert!(raise_str.contains('a'));
+    }
+
+    #[test]
+    fn format_bet_sizes_two_depths() {
+        let sizes = vec![vec![0.33, 1.0], vec![2.5, 3.0]];
+        let (bet_str, raise_str) = format_bet_sizes_for_solve(&sizes);
+        assert!(bet_str.contains("33%"));
+        assert!(bet_str.contains("100%"));
+        assert!(raise_str.contains("250%"));
+        assert!(raise_str.contains("300%"));
+    }
+
+    #[test]
+    fn format_bet_sizes_empty() {
+        let sizes: Vec<Vec<f64>> = vec![];
+        let (bet_str, raise_str) = format_bet_sizes_for_solve(&sizes);
+        // Should have allin at minimum
+        assert!(bet_str.contains('a'));
+        assert!(raise_str.contains('a'));
+    }
+
+    // -------------------------------------------------------------------
+    // solve state reset on game_new tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn game_new_resets_solve_state() {
+        let gss = GameSessionState::default();
+        // Simulate prior solve
+        gss.solve_state.iteration.store(100, std::sync::atomic::Ordering::Relaxed);
+        gss.solve_state.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.solve_state.solving.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // game_new_core needs ExplorationState and PostflopState, but
+        // we can test the reset by calling reset_solve_state directly
+        gss.solve_state.reset();
+
+        assert_eq!(gss.solve_state.iteration.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(gss.solve_state.max_iterations.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(gss.solve_state.matrix_snapshot.read().is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // build_solve_matrix tests (basic structure)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn build_solve_matrix_from_postflop_game() {
+        // Build a tiny PostFlopGame and verify matrix extraction
+        use range_solver::{PostFlopGame, ActionTree, CardConfig, TreeConfig, BoardState};
+        use range_solver::card::{flop_from_str, NOT_DEALT};
+        use range_solver::range::Range;
+        use range_solver::bet_size::BetSizeOptions;
+
+        let oop_range: Range = "AA".parse().unwrap();
+        let ip_range: Range = "KK".parse().unwrap();
+        let flop = flop_from_str("AhKdQc").unwrap();
+
+        let sizes = BetSizeOptions::try_from(("50%,a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Flop,
+            starting_pot: 20,
+            effective_stack: 90,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+            flop_bet_sizes: [sizes.clone(), sizes.clone()],
+            turn_bet_sizes: [sizes.clone(), sizes.clone()],
+            river_bet_sizes: [sizes.clone(), sizes.clone()],
+            turn_donk_sizes: None,
+            river_donk_sizes: None,
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.15,
+            merging_threshold: 0.1,
+            depth_limit: Some(1),
+        };
+        let action_tree = ActionTree::new(tree_config).unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop,
+            turn: NOT_DEALT,
+            river: NOT_DEALT,
+        };
+        let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+        game.allocate_memory(false);
+
+        let matrix = build_solve_matrix(&mut game, None);
+        // Should be a 13x13 grid
+        assert_eq!(matrix.cells.len(), 13);
+        assert_eq!(matrix.cells[0].len(), 13);
+        // Should have actions
+        assert!(!matrix.actions.is_empty());
     }
 
     // -------------------------------------------------------------------

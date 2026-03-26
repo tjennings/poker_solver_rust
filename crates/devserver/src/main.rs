@@ -133,6 +133,18 @@ struct GameDealCardParams {
     card: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GameSolveParams {
+    max_iterations: Option<u32>,
+    target_exploitability: Option<f32>,
+    leaf_eval_interval: Option<u32>,
+    rollout_bias_factor: Option<f64>,
+    rollout_num_samples: Option<u32>,
+    rollout_opponent_samples: Option<u32>,
+    range_clamp_threshold: Option<f64>,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -592,8 +604,18 @@ async fn handle_game_back(
 
 async fn handle_game_solve(
     Extension(session_state): Extension<Arc<GameSessionState>>,
+    Json(params): Json<GameSolveParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::game_solve_core(&session_state))
+    result_to_response(poker_solver_tauri::game_solve_core(
+        &session_state,
+        params.max_iterations,
+        params.target_exploitability,
+        params.leaf_eval_interval,
+        params.rollout_bias_factor,
+        params.rollout_num_samples,
+        params.rollout_opponent_samples,
+        params.range_clamp_threshold,
+    ))
 }
 
 async fn handle_game_cancel_solve(
