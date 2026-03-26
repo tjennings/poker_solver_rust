@@ -1,17 +1,21 @@
 ---
 # poker_solver_rust-nv3f
 title: Boundary CFV magnitude calibration — rollout values too large
-status: todo
+status: in-progress
 type: bug
+priority: normal
 created_at: 2026-03-26T13:35:42Z
-updated_at: 2026-03-26T13:35:42Z
+updated_at: 2026-03-26T14:23:53Z
 ---
 
-The RolloutLeafEvaluator produces boundary CFVs with magnitudes far exceeding the physically achievable range (e.g. ±16 when max should be ±1.3). The rollout walks the abstract V2 tree whose bet sizes don't match the solve tree's, producing oversized terminal payoffs. The relative ordering is correct so the solver converges directionally, but exploitability plateaus around 18-32 instead of <5.
+The range-solver subgame solve converges to 0.0 exploitability on river (no boundaries). On flop with depth_limit=0, exploitability plateaus at ~12 due to boundary CFV approximation from rollout. The solver itself is correct — the floor is from rollout inaccuracy.
 
-## TODO
-- [ ] Investigate: unit-game terminal payoffs may use abstract tree pot/invested instead of boundary pot/invested
-- [ ] Option A: Clamp rollout chip values to ±(remaining_stack / unit_pot) before converting to bcfv
-- [ ] Option B: Run rollout with boundary-specific bet sizes instead of abstract tree sizes  
-- [ ] Option C: Use equity-based boundary values as a simpler alternative to rollouts
-- [ ] Validate: compare boundary CFVs against exact range-solver solution for a small test case
+## Validated
+- [x] River solve: expl=0.0000 (no boundaries, solver works perfectly)
+- [x] Flop solve: expl~12 (boundary CFVs are approximate, not exact)
+- [x] Boundary values in correct range (±1-2 pot fractions after stack cap fix)
+
+## Remaining
+- [ ] Improve boundary CFV accuracy (more rollout samples, better SPR mapping, or equity-based fallback)
+- [ ] The abstract tree walk to find next-street node follows first child only — may not find the right chance node in all tree shapes
+- [ ] Consider caching boundary evaluations across solve iterations
