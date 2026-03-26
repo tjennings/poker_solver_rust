@@ -113,7 +113,11 @@ function SolveProgress({ state }: { state: GameState }) {
           {solve.solver_name} - {solve.iteration}/{solve.max_iterations} iters
           {' '} | expl: {solve.exploitability.toFixed(3)}
           {' '} | {solve.elapsed_secs.toFixed(1)}s
-          {solve.is_complete ? ' (done)' : ''}
+          {solve.is_complete
+            ? solve.iteration < solve.max_iterations
+              ? ' — target exploitability reached'
+              : ' — done'
+            : ''}
         </div>
       </div>
     </div>
