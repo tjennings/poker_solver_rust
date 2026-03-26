@@ -200,6 +200,76 @@ Use `--no-tui` to disable the dashboard and use text output instead.
 
 See `sample_configurations/blueprint_v2_with_tui.yaml` for a complete example.
 
+## Blueprint Training Configuration
+
+The `training:` section of the blueprint YAML config controls the MCCFR training loop. Key parameters:
+
+### Optimizer
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `optimizer` | `"dcfr"` | CFR variant: `"dcfr"`, `"sapcfr+"`, `"lcfr"`, `"cfr+"` |
+| `dcfr_alpha` | `1.5` | Positive regret discount exponent. Higher = retain positive regrets longer |
+| `dcfr_beta` | `0.0` | Negative regret discount exponent. Used by DCFR only (SAPCFR+ floors to 0) |
+| `dcfr_gamma` | `2.0` | Strategy sum discount exponent. Higher = weight recent strategies more |
+| `dcfr_epoch_cap` | `null` | Optional cap on discount epoch counter. Prevents discount from converging to 1.0 |
+| `sapcfr_eta` | `0.5` | SAPCFR+ prediction step size. 0 = no prediction (DCFR+RM+), 1 = full PCFR+, 0.5 = dampened |
+
+**DCFR** (default): Discounted CFR with polynomial decay. Positive regrets multiplied by `t^α/(t^α+1)`, negative by `t^β/(t^β+1)`, strategy sums by `(t/(t+1))^γ`. Standard choice from Brown & Sandholm 2019.
+
+**SAPCFR+**: Simplified Asymmetric Predictive CFR+. Combines DCFR discount with RM+ (negative regret flooring) and predictive strategy computation. Stores previous iteration's instantaneous regret as a prediction, then computes strategy from `R + eta * prediction` instead of raw cumulative regrets. Based on Xu et al. 2025. Requires extra ~1.1 GB for prediction buffer. Since negative regrets are floored to 0, `dcfr_beta` is ignored and `prune_threshold` should be 0 or negative.
+
+**LCFR**: Linear CFR (α=β=γ=1). Used by Pluribus. Simplest discounting scheme.
+
+**CFR+**: Regret matching+ with negative regret flooring. No discounting.
+
+### Variance Reduction
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `use_baselines` | `false` | Enable VR-MCCFR variance-reducing baselines (Schmid et al. 2019) |
+| `baseline_alpha` | `0.01` | Baseline EMA learning rate. Lower = smoother estimates, slower adaptation |
+
+When enabled, the opponent traversal uses learned baselines to reduce sampling variance by up to 1000×. Each (node, bucket, action) gets an exponential moving average of observed counterfactual values. The baseline-corrected formula is unbiased and degenerates to standard sampling when baselines are zero. Requires extra ~1.1 GB for the baseline buffer (same size as regret buffer).
+
+### Schedule & Pruning
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `lcfr_warmup_iterations` | `0` | Iterations before discounting starts |
+| `lcfr_discount_interval` | `1` | Iterations between discount applications |
+| `prune_after_iterations` | `0` | Iterations before action pruning starts |
+| `prune_threshold` | `-300` | Cumulative regret threshold for pruning. Actions below this are skipped |
+| `batch_size` | `200` | Deals per parallel batch |
+| `time_limit_minutes` | `0` | Stop after this many minutes (0 = unlimited) |
+| `purify_threshold` | `0.0` | Purify strategies with probability below this threshold (0 = disabled) |
+
+**Important for SAPCFR+**: Since RM+ floors negative regrets to 0, they can't accumulate below the prune threshold. Set `prune_threshold: 0` to effectively disable pruning, or use a small negative value as a safety margin.
+
+**Regret overflow**: Regrets are stored as `i32` (×1000 scaling, max ~2.1M). If `lcfr_discount_interval` is too large, regrets overflow and the trainer panics with a clear message. For SAPCFR+ (which only accumulates positive regrets), keep the discount interval reasonable (e.g., 1M-10M).
+
+### Example: SAPCFR+ with Baselines
+
+```yaml
+training:
+  cluster_path: "./local_data/buckets/1k_v3"
+  time_limit_minutes: 7200
+  optimizer: "sapcfr+"
+  sapcfr_eta: 0.5
+  dcfr_alpha: 1.5
+  dcfr_gamma: 2.0
+  dcfr_epoch_cap: 80
+  lcfr_warmup_iterations: 10000000
+  lcfr_discount_interval: 10000000
+  prune_after_iterations: 10000000
+  prune_threshold: 0
+  batch_size: 2000
+  use_baselines: true
+  baseline_alpha: 0.01
+```
+
+See `sample_configurations/blueprint_v2_1kbkt_sapcfr.yaml` for the full config.
+
 ---
 
 ## CFVnet Training Pipeline
