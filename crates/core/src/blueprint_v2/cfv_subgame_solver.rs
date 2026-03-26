@@ -150,6 +150,17 @@ impl CfvLayout {
 /// At each iteration, propagates ranges to depth boundaries, calls the
 /// [`LeafEvaluator`] to compute per-combo CFVs, then runs CFR traversal
 /// using those values at boundary nodes.
+///
+/// # Deprecated
+///
+/// **Do not use for new code.** This solver uses bucket abstraction which
+/// limits hand resolution. Use the range-solver `PostFlopGame` with
+/// `depth_limit` instead — it solves with exact 1326-combo granularity
+/// and supports boundary CFVs from the blueprint (Libratus/Pluribus approach).
+///
+/// See bean `poker_solver_rust-lcyi` for migration tracking.
+#[deprecated(note = "Use range-solver PostFlopGame with depth_limit instead of CfvSubgameSolver. \
+    CfvSubgameSolver uses bucket abstraction; PostFlopGame solves at full 1326-combo resolution.")]
 pub struct CfvSubgameSolver {
     tree: GameTree,
     hands: SubgameHands,
