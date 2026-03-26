@@ -1336,7 +1336,41 @@ pub fn game_solve_core(
         };
 
         let cbv_ctx = session.cbv_context.clone();
-        let abs_node_idx = Some(session.node_idx);
+        // For boundary evaluation, the rollout should start at the NEXT street
+        // (turn for a flop solve, river for a turn solve). Walk the abstract
+        // tree from the current node to find the first Chance node's child,
+        // which is the next street's decision root.
+        let abs_node_idx = {
+            let mut idx = session.node_idx;
+            // Walk past decision nodes to the first Chance node.
+            // Use a simple BFS: find any child that's a Chance node.
+            let mut found_next_street = false;
+            for _ in 0..100 { // safety limit
+                match &session.tree.nodes[idx as usize] {
+                    V2GameNode::Chance { child, .. } => {
+                        idx = *child;
+                        found_next_street = true;
+                        break;
+                    }
+                    V2GameNode::Decision { children, .. } => {
+                        // Follow the first child to find the chance node faster.
+                        if let Some(&first_child) = children.first() {
+                            idx = first_child;
+                        } else {
+                            break;
+                        }
+                    }
+                    V2GameNode::Terminal { .. } => break,
+                }
+            }
+            if found_next_street {
+                eprintln!("[solve] boundary rollout starts at abstract node {idx} (next street)");
+                Some(idx)
+            } else {
+                eprintln!("[solve] could not find next-street node, using current: {}", session.node_idx);
+                Some(session.node_idx)
+            }
+        };
 
         let position = session.position_label(player).to_string();
 
