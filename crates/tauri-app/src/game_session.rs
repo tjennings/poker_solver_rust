@@ -1112,9 +1112,11 @@ fn evaluate_and_inject_boundaries(
         let mut pot_cache: std::collections::HashMap<i64, Vec<f64>> = std::collections::HashMap::new();
 
         for &bp in &unique_pots {
-            // Create evaluator with this boundary's SPR
-            let boundary_starting_stack = eff_stack;  // stacks at game start
-            let boundary_spr_pot = bp;  // pot at the boundary
+            // Create evaluator with this boundary's actual pot and remaining stack.
+            // At the boundary, each player has invested bp/2 chips.
+            let boundary_remaining_stack = eff_stack - bp / 2.0;
+            let boundary_starting_stack = boundary_remaining_stack + bp / 2.0; // stack behind + own investment
+            let boundary_spr_pot = bp;
             let eval = RolloutLeafEvaluator::new(
                 evaluator.strategy.clone(),
                 evaluator.abstract_tree.clone(),
@@ -1139,10 +1141,6 @@ fn evaluate_and_inject_boundaries(
             let private_cards = game.private_cards(traverser as usize);
             let mut mapped_cfvs = vec![0.0f32; private_cards.len()];
 
-            // Max bcfv: can't win more than remaining stack
-            let boundary_half_pot = bp / 2.0;
-            let max_bcfv = if boundary_half_pot > 0.0 { eff_stack / boundary_half_pot } else { 100.0 };
-
             for (hand_idx, &(c1, c2)) in private_cards.iter().enumerate() {
                 let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
                 let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
@@ -1150,8 +1148,7 @@ fn evaluate_and_inject_boundaries(
                     if (combo[0] == rs_c1 && combo[1] == rs_c2)
                         || (combo[0] == rs_c2 && combo[1] == rs_c1)
                     {
-                        let v = cfvs[ci];
-                        mapped_cfvs[hand_idx] = v.clamp(-max_bcfv, max_bcfv) as f32;
+                        mapped_cfvs[hand_idx] = cfvs[ci] as f32;
                         break;
                     }
                 }
@@ -1159,12 +1156,13 @@ fn evaluate_and_inject_boundaries(
 
             // Diagnostic: dump boundary CFVs for first 3
             if traverser == 0 && ordinal < 3 {
+                let remaining = eff_stack - bp / 2.0;
                 let min = mapped_cfvs.iter().cloned().fold(f32::MAX, f32::min);
                 let max = mapped_cfvs.iter().cloned().fold(f32::MIN, f32::max);
                 let nonzero_count = mapped_cfvs.iter().filter(|v| v.abs() > 0.001).count();
                 eprintln!(
-                    "[boundary inject] ordinal={ordinal} traverser={traverser} pot={bp:.0} \
-                     max_bcfv={max_bcfv:.1} nonzero={nonzero_count}/{} min={min:.3} max={max:.3}",
+                    "[boundary inject] ordinal={ordinal} pot={bp:.0} stack_behind={remaining:.0} \
+                     nonzero={nonzero_count}/{} min={min:.3} max={max:.3}",
                     mapped_cfvs.len()
                 );
             }
