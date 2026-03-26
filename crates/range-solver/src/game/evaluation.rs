@@ -64,12 +64,16 @@ impl PostFlopGame {
             let bcfv_index = ordinal * 2 + player;
             let bcfvs = &self.boundary_cfvs[bcfv_index];
 
-            // Capture opponent reach at this boundary for rollout range filtering.
-            // cfreach is the opponent's (player^1) reach probabilities.
+            // Lazily cache opponent reach at this boundary for rollout range filtering.
+            // Only write on cache miss (empty). Flushed externally at each eval interval.
             let opp = player ^ 1;
             let reach_index = ordinal * 2 + opp;
             if reach_index < self.boundary_reach.len() {
-                *self.boundary_reach[reach_index].lock().unwrap() = cfreach.to_vec();
+                let guard = self.boundary_reach[reach_index].lock().unwrap();
+                if guard.is_empty() {
+                    drop(guard);
+                    *self.boundary_reach[reach_index].lock().unwrap() = cfreach.to_vec();
+                }
             }
 
             if bcfvs.is_empty() {

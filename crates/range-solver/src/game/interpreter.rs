@@ -360,8 +360,16 @@ impl PostFlopGame {
         idx >= self.boundary_cfvs.len() || self.boundary_cfvs[idx].is_empty()
     }
 
+    /// Flush the boundary reach cache. Call at each eval interval so the next
+    /// solve iteration repopulates with updated reach values.
+    pub fn flush_boundary_reach(&self) {
+        for m in &self.boundary_reach {
+            m.lock().unwrap().clear();
+        }
+    }
+
     /// Returns the opponent reach probabilities at a boundary node for a given player.
-    /// Captured during the most recent `solve_step`. Returns empty vec if not yet computed.
+    /// Lazily cached during solve_step. Returns empty vec if not yet visited.
     pub fn boundary_reach(&self, ordinal: usize, player: usize) -> Vec<f32> {
         let idx = ordinal * 2 + player;
         if idx < self.boundary_reach.len() {

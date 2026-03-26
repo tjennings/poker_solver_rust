@@ -1588,8 +1588,11 @@ pub fn game_solve_core(
                 break;
             }
 
-            // Re-evaluate boundary CFVs every eval_interval
+            // Re-evaluate boundary CFVs every eval_interval.
+            // Flush the reach cache first so the solver repopulates it
+            // with current strategy-filtered ranges during the next iterations.
             if t.is_multiple_of(eval_interval) {
+                game.flush_boundary_reach();
                 if let Some((ref evaluator, ref board_cards, ref combos, ref oop_reach, ref ip_reach)) = evaluator_data {
                     evaluate_and_inject_boundaries(
                         &mut game, evaluator, board_cards, oop_reach, ip_reach, combos,
