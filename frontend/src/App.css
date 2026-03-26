@@ -790,8 +790,9 @@ button:disabled {
 
 /* Cell detail panel */
 .cell-detail {
-  width: 320px;
-  flex-shrink: 0;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
   background: linear-gradient(135deg, #12122a 0%, #1a1a32 100%);
   border: 1px solid rgba(255, 255, 255, 0.06);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
