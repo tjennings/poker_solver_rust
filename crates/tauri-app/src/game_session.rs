@@ -1113,14 +1113,8 @@ fn evaluate_and_inject_boundaries(
 
         for &bp in &unique_pots {
             // At the boundary, each player has invested bp/2 chips.
+            // remaining=0 means all-in: SPR=0, rollout just deals cards + showdown.
             let remaining = (eff_stack - bp / 2.0).max(0.0);
-            if remaining <= 0.0 {
-                // All-in — no continuation play, zero boundary CFVs.
-                eprintln!("[boundary eval] pot={bp:.0} is all-in (remaining=0), skipping");
-                pot_cache.insert(bp as i64, vec![0.0; combos.len()]);
-                continue;
-            }
-            // Evaluator SPR = (starting_stack - pot/2) / pot = remaining / pot.
             let boundary_starting_stack = remaining + bp / 2.0;
             let boundary_spr_pot = bp;
             let eval = RolloutLeafEvaluator::new(
