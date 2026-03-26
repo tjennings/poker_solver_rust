@@ -945,9 +945,15 @@ fn range_solver_action_to_game_action(
         range_solver::Action::Fold => ("Fold".to_string(), "fold"),
         range_solver::Action::Check => ("Check".to_string(), "check"),
         range_solver::Action::Call => ("Call".to_string(), "call"),
-        range_solver::Action::Bet(amt) => (format!("{amt}"), "bet"),
-        range_solver::Action::Raise(amt) => (format!("{amt}"), "raise"),
-        range_solver::Action::AllIn(amt) => (format!("All-in {amt}"), "allin"),
+        range_solver::Action::Bet(amt) => {
+            let bb = *amt as f64 / 2.0;
+            (format!("{bb:.0}bb"), "bet")
+        }
+        range_solver::Action::Raise(amt) => {
+            let bb = *amt as f64 / 2.0;
+            (format!("{bb:.0}bb"), "raise")
+        }
+        range_solver::Action::AllIn(_) => ("All-in".to_string(), "allin"),
         _ => ("?".to_string(), "unknown"),
     };
     GameAction {
@@ -1278,8 +1284,7 @@ pub fn game_solve_core(
         };
 
         let cbv_ctx = session.cbv_context.clone();
-        // abstract_node_idx: not yet wired from config (deferred).
-        let abs_node_idx: Option<u32> = None;
+        let abs_node_idx = Some(session.node_idx);
 
         let position = session.position_label(player).to_string();
 
