@@ -622,7 +622,7 @@ export default function GameExplorer() {
                           <div
                             key={combo.cards}
                             className="cell-detail"
-                            style={{ flex: '0 0 auto', minWidth: '80px', padding: '0.3rem 0.4rem' }}
+                            style={{ width: 'auto', flex: '0 0 auto', minWidth: '80px', maxWidth: '130px', padding: '0.3rem 0.4rem' }}
                           >
                             <div style={{ fontWeight: 700, fontSize: '0.8rem', marginBottom: '0.2rem' }}>
                               <span>{r1}</span>
