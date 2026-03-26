@@ -596,6 +596,12 @@ async fn handle_game_solve(
     result_to_response(poker_solver_tauri::game_solve_core(&session_state))
 }
 
+async fn handle_game_cancel_solve(
+    Extension(session_state): Extension<Arc<GameSessionState>>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::game_cancel_solve_core(&session_state))
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -707,6 +713,7 @@ async fn main() {
         .route("/api/game_deal_card", post(handle_game_deal_card))
         .route("/api/game_back", post(handle_game_back))
         .route("/api/game_solve", post(handle_game_solve))
+        .route("/api/game_cancel_solve", post(handle_game_cancel_solve))
         .layer(Extension(ws_tx))
         .layer(Extension(simulation_state))
         .layer(Extension(game_session_state))

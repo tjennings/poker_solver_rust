@@ -899,6 +899,20 @@ pub fn game_solve(
     session.solve()
 }
 
+pub fn game_cancel_solve_core(session_state: &GameSessionState) -> Result<(), String> {
+    let guard = session_state.session.read();
+    let _session = guard.as_ref().ok_or("No game session active")?;
+    // TODO: once solve runs in a background thread, set a cancellation flag here
+    Ok(())
+}
+
+#[tauri::command]
+pub fn game_cancel_solve(
+    session_state: tauri::State<'_, GameSessionState>,
+) -> Result<(), String> {
+    game_cancel_solve_core(&session_state)
+}
+
 #[cfg(test)]
 fn make_test_config() -> BlueprintV2Config {
     use poker_solver_core::blueprint_v2::config::*;

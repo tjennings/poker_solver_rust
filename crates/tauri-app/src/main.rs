@@ -51,6 +51,7 @@ fn main() {
             poker_solver_tauri::game_deal_card,
             poker_solver_tauri::game_back,
             poker_solver_tauri::game_solve,
+            poker_solver_tauri::game_cancel_solve,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
