@@ -1425,8 +1425,26 @@ pub fn game_solve_core(
         };
 
         let n_boundaries = game.num_boundary_nodes();
+        let (mem_est, _) = game.memory_usage();
         eprintln!("[solve] boundary nodes: {n_boundaries}, evaluator: {}", evaluator_data.is_some());
         eprintln!("[solve] abstract_node_idx: {:?}", abstract_node_idx);
+        eprintln!("[solve] pot={pot}, eff_stack={eff_stack}, board={board:?}");
+        eprintln!("[solve] OOP hands: {}, IP hands: {}", game.private_cards(0).len(), game.private_cards(1).len());
+        eprintln!("[solve] memory: {:.1} MB", mem_est as f64 / 1_048_576.0);
+
+        // Check if boundary CFVs are being read by the solver
+        if n_boundaries > 0 {
+            // Run one solve step, then check exploitability change
+            if let Some((ref evaluator, ref board_cards, ref combos, ref oop_reach, ref ip_reach)) = evaluator_data {
+                evaluate_and_inject_boundaries(
+                    &mut game, evaluator, board_cards, oop_reach, ip_reach, combos,
+                );
+            }
+            let exp_before = compute_exploitability(&game);
+            solve_step(&game, 0);
+            let exp_after = compute_exploitability(&game);
+            eprintln!("[solve] after 1 step: expl {exp_before:.3} → {exp_after:.3}");
+        }
 
         // Initial matrix snapshot
         let matrix = build_solve_matrix(&mut game, None);
