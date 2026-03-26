@@ -123,6 +123,7 @@ struct PostflopCacheParams {
 
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GamePlayActionParams {
     action_id: String,
 }

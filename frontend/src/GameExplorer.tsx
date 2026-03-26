@@ -493,6 +493,13 @@ export default function GameExplorer() {
               <div className="street-block-header">
                 <span className="street-name">{nextStreetLabel}</span>
               </div>
+              <div className="street-cards">
+                {Array.from({ length: cardsNeeded }).map((_, i) => (
+                  <div key={i} className="street-card empty">
+                    <span className="card-rank">?</span>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
 
@@ -619,6 +626,38 @@ export default function GameExplorer() {
           </p>
           <button className="new-hand-btn" onClick={newHand}>
             New Hand
+          </button>
+        </div>
+      )}
+
+      {/* Solve button — available on postflop streets when not at chance/terminal */}
+      {state && !state.is_terminal && !state.is_chance && state.board.length >= 3 && (
+        <div style={{ padding: '0 1rem 0.5rem' }}>
+          <button
+            className="solve-btn"
+            onClick={async () => {
+              try {
+                setLoading(true);
+                const s = await invoke<GameState>('game_solve', {});
+                setState(s);
+              } catch (e) {
+                setError(String(e));
+              } finally {
+                setLoading(false);
+              }
+            }}
+            style={{
+              padding: '0.5rem 1.5rem',
+              background: '#00d9ff22',
+              border: '1px solid #00d9ff',
+              borderRadius: '4px',
+              color: '#00d9ff',
+              cursor: 'pointer',
+              fontSize: '0.8rem',
+              fontWeight: 600,
+            }}
+          >
+            Solve
           </button>
         </div>
       )}
