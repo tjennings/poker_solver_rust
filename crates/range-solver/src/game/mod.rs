@@ -7,6 +7,34 @@ use crate::action_tree::*;
 use crate::card::*;
 use crate::mutex_like::*;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// Callback for computing boundary CFVs on demand during solving.
+///
+/// When the solver reaches a depth boundary with no cached CFVs, it calls
+/// `compute_cfvs` to get per-hand values. The implementation (e.g. rollout
+/// evaluator) receives the boundary's pot, remaining stack, the opponent's
+/// reach at the boundary, and the player being evaluated.
+pub trait BoundaryEvaluator: Send + Sync {
+    /// Compute per-hand CFVs at a depth boundary.
+    ///
+    /// - `player`: the traverser (0=OOP, 1=IP)
+    /// - `pot`: pot size at the boundary (in half-BB chips)
+    /// - `remaining_stack`: chips behind at the boundary
+    /// - `opponent_reach`: opponent's reach probabilities (per private hand, game ordering)
+    /// - `num_hands`: number of private hands for `player`
+    ///
+    /// Returns `Vec<f32>` with one CFV per private hand, in pot-normalised units
+    /// (1.0 = win one half-pot).
+    fn compute_cfvs(
+        &self,
+        player: usize,
+        pot: i32,
+        remaining_stack: f64,
+        opponent_reach: &[f32],
+        num_hands: usize,
+    ) -> Vec<f32>;
+}
 
 // ---------------------------------------------------------------------------
 // StrengthItem
@@ -156,7 +184,7 @@ pub struct PostFlopGame {
     /// Per-boundary leaf CFVs, indexed by boundary ordinal.
     /// Each inner `Vec<f32>` has one f32 per private hand for the evaluation
     /// player. Set externally before solving via [`set_boundary_cfvs`].
-    pub(crate) boundary_cfvs: Vec<Vec<f32>>,
+    pub(crate) boundary_cfvs: Vec<std::sync::Mutex<Vec<f32>>>,
     /// Maps node arena index to boundary ordinal. `u32::MAX` means not a
     /// boundary. Built during tree construction.
     pub(crate) node_to_boundary: Vec<u32>,
@@ -165,6 +193,9 @@ pub struct PostFlopGame {
     /// entry per private hand of that player. Updated each solve iteration.
     /// Uses `Mutex` for interior mutability (written during `evaluate` which takes `&self`).
     pub boundary_reach: Vec<std::sync::Mutex<Vec<f32>>>,
+    /// Optional callback for lazy boundary CFV computation.
+    /// When set, boundaries with empty CFVs call this instead of returning zero.
+    pub boundary_evaluator: Option<Arc<dyn BoundaryEvaluator>>,
 
     // -- result interpreter state --
     pub(crate) action_history: Vec<usize>,

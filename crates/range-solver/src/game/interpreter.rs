@@ -336,12 +336,11 @@ impl PostFlopGame {
     ///
     /// CFVs should be in pot-normalised units: a value of 1.0 means the
     /// player wins 1× the half-pot from that point forward.
-    pub fn set_boundary_cfvs(&mut self, ordinal: usize, player: usize, cfvs: Vec<f32>) {
+    pub fn set_boundary_cfvs(&self, ordinal: usize, player: usize, cfvs: Vec<f32>) {
         let idx = ordinal * 2 + player;
-        if idx >= self.boundary_cfvs.len() {
-            self.boundary_cfvs.resize(idx + 1, Vec::new());
+        if idx < self.boundary_cfvs.len() {
+            *self.boundary_cfvs[idx].lock().unwrap() = cfvs;
         }
-        self.boundary_cfvs[idx] = cfvs;
     }
 
     /// Returns the pot size at a given depth boundary node.
@@ -357,13 +356,16 @@ impl PostFlopGame {
     /// Returns true if boundary CFVs for the given ordinal and player are empty.
     pub fn boundary_cfvs_empty(&self, ordinal: usize, player: usize) -> bool {
         let idx = ordinal * 2 + player;
-        idx >= self.boundary_cfvs.len() || self.boundary_cfvs[idx].is_empty()
+        idx >= self.boundary_cfvs.len() || self.boundary_cfvs[idx].lock().unwrap().is_empty()
     }
 
-    /// Flush the boundary reach cache. Call at each eval interval so the next
-    /// solve iteration repopulates with updated reach values.
-    pub fn flush_boundary_reach(&self) {
+    /// Flush all boundary caches (reach + CFVs). Call at each eval interval
+    /// so the next solve iterations lazily recompute both with updated strategy.
+    pub fn flush_boundary_caches(&self) {
         for m in &self.boundary_reach {
+            m.lock().unwrap().clear();
+        }
+        for m in &self.boundary_cfvs {
             m.lock().unwrap().clear();
         }
     }
@@ -643,7 +645,9 @@ impl PostFlopGame {
             }
         }
         // 2 slots per boundary node: one for each player.
-        self.boundary_cfvs = vec![Vec::new(); boundary_count as usize * 2];
+        self.boundary_cfvs = (0..boundary_count as usize * 2)
+            .map(|_| std::sync::Mutex::new(Vec::new()))
+            .collect();
         self.boundary_reach = (0..boundary_count as usize * 2)
             .map(|_| std::sync::Mutex::new(Vec::new()))
             .collect();

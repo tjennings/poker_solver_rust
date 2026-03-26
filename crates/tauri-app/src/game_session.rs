@@ -1556,26 +1556,8 @@ pub fn game_solve_core(
         eprintln!("[solve] OOP hands: {}, IP hands: {}", game.private_cards(0).len(), game.private_cards(1).len());
         eprintln!("[solve] memory: {:.1} MB", mem_est as f64 / 1_048_576.0);
 
-        // Check if boundary CFVs are being read by the solver
-        if n_boundaries > 0 {
-            if let Some((ref evaluator, ref board_cards, ref combos, ref oop_reach, ref ip_reach)) = evaluator_data {
-                evaluate_and_inject_boundaries(
-                    &mut game, evaluator, board_cards, oop_reach, ip_reach, combos,
-                );
-            }
-            // Count how many boundary slots have CFVs set (2 per boundary: OOP + IP)
-            let total_slots = n_boundaries * 2;
-            let set_slots = (0..n_boundaries).map(|o| {
-                let oop_set = !game.boundary_cfvs_empty(o, 0);
-                let ip_set = !game.boundary_cfvs_empty(o, 1);
-                (if oop_set { 1 } else { 0 }) + (if ip_set { 1 } else { 0 })
-            }).sum::<usize>();
-            eprintln!("[solve] boundary CFVs set: {set_slots}/{total_slots}");
-            let exp_before = compute_exploitability(&game);
-            solve_step(&game, 0);
-            let exp_after = compute_exploitability(&game);
-            eprintln!("[solve] after 1 step: expl {exp_before:.3} → {exp_after:.3}");
-        }
+        // Boundary CFVs are computed lazily during solve_step (via BoundaryEvaluator).
+        // No explicit pre-population needed.
 
         // Initial matrix snapshot
         let matrix = build_solve_matrix(&mut game, None);
@@ -1588,16 +1570,10 @@ pub fn game_solve_core(
                 break;
             }
 
-            // Re-evaluate boundary CFVs every eval_interval.
-            // Read cached reach (filtered by current strategy), recompute CFVs,
-            // then flush the cache so next cycle gets fresh values.
-            if t.is_multiple_of(eval_interval) {
-                if let Some((ref evaluator, ref board_cards, ref combos, ref oop_reach, ref ip_reach)) = evaluator_data {
-                    evaluate_and_inject_boundaries(
-                        &mut game, evaluator, board_cards, oop_reach, ip_reach, combos,
-                    );
-                }
-                game.flush_boundary_reach();
+            // Flush boundary caches every eval_interval so the solver
+            // lazily recomputes reach + CFVs with updated strategy.
+            if t > 0 && t.is_multiple_of(eval_interval) {
+                game.flush_boundary_caches();
             }
 
             solve_step(&game, t);

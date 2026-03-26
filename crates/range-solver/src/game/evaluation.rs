@@ -62,10 +62,8 @@ impl PostFlopGame {
             let node_index = self.node_index(node);
             let ordinal = self.node_to_boundary[node_index] as usize;
             let bcfv_index = ordinal * 2 + player;
-            let bcfvs = &self.boundary_cfvs[bcfv_index];
 
-            // Lazily cache opponent reach at this boundary for rollout range filtering.
-            // Only write on cache miss (empty). Flushed externally at each eval interval.
+            // Lazily cache opponent reach at this boundary.
             let opp = player ^ 1;
             let reach_index = ordinal * 2 + opp;
             if reach_index < self.boundary_reach.len() {
@@ -76,10 +74,30 @@ impl PostFlopGame {
                 }
             }
 
-            if bcfvs.is_empty() {
-                // No boundary CFVs set — treat as zero.
-                return;
+            // Lazily compute and cache boundary CFVs on first visit.
+            {
+                let guard = self.boundary_cfvs[bcfv_index].lock().unwrap();
+                if guard.is_empty() {
+                    drop(guard);
+                    if let Some(ref evaluator) = self.boundary_evaluator {
+                        let pot = self.tree_config.starting_pot + 2 * node.amount;
+                        let remaining = (self.tree_config.effective_stack as f64 - pot as f64 / 2.0).max(0.0);
+                        let opp_reach = self.boundary_reach[reach_index].lock().unwrap().clone();
+                        let opp_reach_ref = if opp_reach.is_empty() {
+                            self.initial_weights[opp].to_vec()
+                        } else {
+                            opp_reach
+                        };
+                        let num_hands = self.private_cards[player].len();
+                        let cfvs = evaluator.compute_cfvs(player, pot, remaining, &opp_reach_ref, num_hands);
+                        *self.boundary_cfvs[bcfv_index].lock().unwrap() = cfvs;
+                    } else {
+                        return; // No evaluator — treat as zero.
+                    }
+                }
             }
+
+            let bcfvs = self.boundary_cfvs[bcfv_index].lock().unwrap();
 
             let payoff_scale = half_pot / self.num_combinations;
 
