@@ -2,9 +2,9 @@
 game:
   name: "1k_sapcfr"
   players: 2
-  stack_depth: 50
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 100
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   algorithm: potential_aware_emd
@@ -21,9 +21,9 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2bb"]
-    - ["4bb", "7bb"]
-    - ["15bb"]
+    - ["4bb"]
+    - ["8bb", "14bb"]
+    - ["30bb"]
   flop:
     - [0.25, 0.33, 0.75, 1.0]
     - [0.33, 0.67, 1.0, 1.5]

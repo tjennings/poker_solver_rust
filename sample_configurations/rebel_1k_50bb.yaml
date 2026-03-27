@@ -3,8 +3,8 @@ cluster_dir: "./local_data/blueprints/1k_50bb_sapcfr/snap/buckets"
 output_dir: "./local_data/rebel/1k_50bb"
 
 game:
-  initial_stack: 50   # 50bb × 1 chip per bb
-  small_blind: 1      # SB=0.5bb but we use integer chips, so 1:2 ratio
+  initial_stack: 100   # 50bb × 2 chips per bb
+  small_blind: 1
   big_blind: 2
 
 seed:
