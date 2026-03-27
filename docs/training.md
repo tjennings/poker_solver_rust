@@ -202,6 +202,8 @@ See `sample_configurations/blueprint_v2_with_tui.yaml` for a complete example.
 
 ## Blueprint Training Configuration
 
+All `game:` section values are in **chips** (1 BB = 2 chips). Example: `stack_depth: 200` = 100 BB, `small_blind: 1`, `big_blind: 2`. Preflop action sizes use chip amounts with a `bb` suffix: `"5bb"` = raise to 5 chips (2.5 BB). Display converts to BB at the UI/CLI boundary only (dividing by 2). See `docs/architecture.md` for full unit convention.
+
 The `training:` section of the blueprint YAML config controls the MCCFR training loop. Key parameters:
 
 ### Optimizer

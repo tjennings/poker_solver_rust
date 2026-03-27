@@ -2,9 +2,9 @@
 game:
   name: "500bkt"
   players: 2
-  stack_depth: 50
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 100
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   algorithm: potential_aware_emd
@@ -23,9 +23,9 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2bb"]
-    - ["4bb", "6bb"]
-    - ["18bb"]
+    - ["4bb"]
+    - ["8bb", "12bb"]
+    - ["36bb"]
   flop:
     - [0.1, 0.25, 0.33, 0.67, 1.0]
     - [0.33, 0.67, 2.0]

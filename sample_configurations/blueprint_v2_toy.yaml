@@ -2,9 +2,9 @@
 game:
   name: "HU 10BB Toy"
   players: 2
-  stack_depth: 10.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 20
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   algorithm: potential_aware_emd
@@ -21,7 +21,7 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
+    - ["5bb"]
     - ["3.0x"]
   flop:
     - [0.5, 1.0]

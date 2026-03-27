@@ -5,7 +5,7 @@
 //! ```text
 //! Bits 63-36: hand/bucket   (28 bits)
 //! Bits 35-34: street         (2 bits)
-//! Bits 33-29: spr_bucket     (5 bits) — min(eff_stack*2/pot, 31), half-SPR units
+//! Bits 33-29: spr_bucket     (5 bits) — min(eff_stack/pot, 31)
 //! Bits 28-24: (reserved)     (5 bits)
 //! Bits 23-0:  action slots  (24 bits) — up to 6 actions × 4 bits
 //! ```
@@ -37,16 +37,16 @@ const HAND_SHIFT: u32 = 36;
 const STREET_SHIFT: u32 = 34;
 const SPR_SHIFT: u32 = 29;
 
-/// Compute SPR bucket: `min(eff_stack * 2 / pot, 31)`.
+/// Compute SPR bucket: `min(eff_stack / pot, 31)`.
 ///
-/// Half-SPR units give fine resolution at low SPR where decisions matter most.
+/// Both `eff_stack` and `pot` are in chips.
 /// Returns 31 when pot is zero (infinite SPR).
 #[must_use]
 pub fn spr_bucket(pot: u32, eff_stack: u32) -> u32 {
     if pot == 0 {
         return 31;
     }
-    (eff_stack * 2 / pot).min(31)
+    (eff_stack / pot).min(31)
 }
 
 /// A packed u64 information set key.
@@ -62,7 +62,7 @@ impl InfoKey {
     /// # Arguments
     /// * `hand_or_bucket` - Canonical hand index (0-168) or classification bits (up to 28 bits)
     /// * `street` - 0=Preflop, 1=Flop, 2=Turn, 3=River
-    /// * `spr_bucket` - `min(eff_stack * 2 / pot, 31)` (5 bits, max 31)
+    /// * `spr_bucket` - `min(eff_stack / pot, 31)` (5 bits, max 31)
     /// * `actions` - Slice of encoded action codes (from `encode_action`)
     #[must_use]
     pub fn new(hand_or_bucket: u32, street: u8, spr_bucket: u32, actions: &[u8]) -> Self {
@@ -908,17 +908,17 @@ mod tests {
     #[timed_test]
     fn spr_bucket_edge_cases() {
         // Zero pot → infinite SPR → capped at 31
-        assert_eq!(spr_bucket(0, 100), 31);
+        assert_eq!(spr_bucket(0, 200), 31);
         // Small pot, large stack → high SPR capped at 31
         assert_eq!(spr_bucket(1, 200), 31);
-        // Equal pot and stack → SPR = 2 (half-SPR units)
-        assert_eq!(spr_bucket(10, 10), 2);
+        // Equal pot and stack → SPR = 1
+        assert_eq!(spr_bucket(10, 10), 1);
         // Pot larger than stack → low SPR
         assert_eq!(spr_bucket(20, 5), 0);
-        // Typical flop after limp: pot=4, eff_stack=18 → 36/4 = 9
-        assert_eq!(spr_bucket(4, 18), 9);
-        // Typical raised pot: pot=12, eff_stack=14 → 28/12 = 2
-        assert_eq!(spr_bucket(12, 14), 2);
+        // Typical flop after limp: pot=8 chips, eff_stack=36 chips → 36/8 = 4
+        assert_eq!(spr_bucket(8, 36), 4);
+        // Typical raised pot: pot=24 chips, eff_stack=28 chips → 28/24 = 1
+        assert_eq!(spr_bucket(24, 28), 1);
     }
 
     #[timed_test]

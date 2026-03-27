@@ -2,9 +2,9 @@
 game:
   name: "HU 100BB Realistic"
   players: 2
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 200
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   algorithm: potential_aware_emd
@@ -21,7 +21,7 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
+    - ["5bb"]
     - ["3.0x"]
     - ["3.0x"]
   flop:

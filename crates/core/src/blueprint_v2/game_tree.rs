@@ -154,10 +154,10 @@ impl GameTree {
     ///
     /// # Arguments
     /// * `stack_depth` - Starting stacks in BB (both players)
-    /// * `small_blind` - Small blind in BB (typically 0.5)
-    /// * `big_blind` - Big blind in BB (typically 1.0)
+    /// * `small_blind` - Small blind in chips (typically 1)
+    /// * `big_blind` - Big blind in chips (typically 2)
     /// * `preflop_sizes` - Per raise depth, list of size strings
-    ///   (`"2.5bb"` = absolute, `"3.0x"` = multiplier of last raise)
+    ///   (`"5bb"` = absolute in chips, `"3.0x"` = multiplier of last raise)
     /// * `flop_sizes`, `turn_sizes`, `river_sizes` - Per raise depth,
     ///   list of pot fractions. The number of entries determines the
     ///   maximum raises allowed on that street.
@@ -1013,10 +1013,10 @@ mod tests {
 
     fn simple_tree() -> GameTree {
         GameTree::build(
-            10.0,
-            0.5,
+            20.0,
             1.0,
-            &[vec!["2.5bb".into()]],
+            2.0,
+            &[vec!["5bb".into()]],
             &[vec![1.0]],
             &[vec![1.0]],
             &[vec![1.0]],
@@ -1058,12 +1058,12 @@ mod tests {
     fn test_all_in_always_available() {
         // Test with deep stacks and multiple raise depths to ensure AllIn is present
         // even AFTER all raise depths are exhausted.
-        for stack in [10.0, 50.0, 100.0] {
+        for stack in [20.0, 100.0, 200.0] {
             let tree = GameTree::build(
                 stack,
-                0.5,
                 1.0,
-                &[vec!["2.5bb".into()], vec!["3bb".into()]],
+                2.0,
+                &[vec!["5bb".into()], vec!["6bb".into()]],
                 &[vec![0.5]],
                 &[vec![0.5]],
                 &[vec![0.5]],
@@ -1075,8 +1075,8 @@ mod tests {
     /// Walk the tree verifying every decision node where the actor has chips
     /// includes AllIn. This catches the beyond-raise-cap case.
     fn check_all_in_everywhere(tree: &GameTree, starting_stack: f64) {
-        // Full game tree: blinds are [0.5, 1.0] for dealer=0
-        let blinds = blind_amounts_for_tree(tree, 0.5, 1.0);
+        // Full game tree: blinds are [1.0, 2.0] for dealer=0
+        let blinds = blind_amounts_for_tree(tree, 1.0, 2.0);
         check_all_in_with_invested(tree, starting_stack, [0.0, 0.0], blinds);
     }
 
@@ -1223,10 +1223,10 @@ mod tests {
     fn test_raise_depths_enforced() {
         // 2 preflop depths, 2 flop depths, 1 turn, 1 river
         let tree = GameTree::build(
-            100.0,
-            0.5,
+            200.0,
             1.0,
-            &[vec!["2.5bb".into()], vec!["3.0x".into()]],
+            2.0,
+            &[vec!["5bb".into()], vec!["3.0x".into()]],
             &[vec![1.0], vec![1.0]],
             &[vec![1.0]],
             &[vec![1.0]],
@@ -1238,7 +1238,7 @@ mod tests {
     fn test_preflop_sb_actions() {
         let tree = simple_tree();
         if let GameNode::Decision { actions, .. } = &tree.nodes[tree.root as usize] {
-            // SB facing BB should have: Fold, Call, Raise(2.5), AllIn
+            // SB facing BB should have: Fold, Call, Raise(5), AllIn
             assert!(
                 actions.iter().any(|a| matches!(a, TreeAction::Fold)),
                 "SB should be able to fold"
@@ -1297,7 +1297,7 @@ mod tests {
     #[test]
     fn test_fold_pot_includes_blinds() {
         let tree = simple_tree();
-        // Fold at root: pot should be SB + BB = 1.5
+        // Fold at root: pot should be SB + BB = 1 + 2 = 3 chips
         if let GameNode::Decision {
             actions, children, ..
         } = &tree.nodes[tree.root as usize]
@@ -1309,8 +1309,8 @@ mod tests {
             if let GameNode::Terminal { pot, .. } = &tree.nodes[children[fold_idx] as usize]
             {
                 assert!(
-                    (*pot - 1.5).abs() < SIZE_EPSILON,
-                    "Pot should include blinds: 1.5, got {pot}"
+                    (*pot - 3.0).abs() < SIZE_EPSILON,
+                    "Pot should include blinds: 3.0 chips, got {pot}"
                 );
             }
         }
@@ -1321,10 +1321,10 @@ mod tests {
         // With 1 preflop depth, SB can open-raise (raise #1), but BB
         // cannot re-raise (would exceed declared depths).
         let tree = GameTree::build(
-            10.0,
-            0.5,
+            20.0,
             1.0,
-            &[vec!["2.5bb".into()]],
+            2.0,
+            &[vec!["5bb".into()]],
             &[vec![1.0]],
             &[vec![1.0]],
             &[vec![1.0]],
@@ -1356,15 +1356,15 @@ mod tests {
     #[test]
     fn test_multiplier_sizing() {
         let tree = GameTree::build(
-            100.0,
-            0.5,
+            200.0,
             1.0,
-            &[vec!["2.5bb".into()], vec!["3.0x".into()], vec!["3.0x".into()]],
+            2.0,
+            &[vec!["5bb".into()], vec!["3.0x".into()], vec!["3.0x".into()]],
             &[vec![1.0]],
             &[vec![1.0]],
             &[vec![1.0]],
         );
-        // SB raises to 2.5bb. BB can re-raise to 3.0x * 2.5 = 7.5bb
+        // SB raises to 5 chips. BB can re-raise to 3.0x * 5 = 15 chips
         // Find BB's response to SB's raise
         if let GameNode::Decision {
             actions, children, ..
@@ -1379,8 +1379,8 @@ mod tests {
                 let raise_action = actions.iter().find(|a| matches!(a, TreeAction::Raise(_)));
                 if let Some(TreeAction::Raise(to)) = raise_action {
                     assert!(
-                        (*to - 7.5).abs() < SIZE_EPSILON,
-                        "BB should raise to 7.5bb (3.0x * 2.5), got {to}"
+                        (*to - 15.0).abs() < SIZE_EPSILON,
+                        "BB should raise to 15 chips (3.0x * 5), got {to}"
                     );
                 }
             }
@@ -1390,10 +1390,10 @@ mod tests {
     #[test]
     fn test_deep_stack_tree_size() {
         let tree = GameTree::build(
-            100.0,
-            0.5,
+            200.0,
             1.0,
-            &[vec!["2.5bb".into()], vec!["3.0x".into()], vec!["3.0x".into()]],
+            2.0,
+            &[vec!["5bb".into()], vec!["3.0x".into()], vec!["3.0x".into()]],
             &[vec![0.5, 1.0], vec![0.5, 1.0]],
             &[vec![0.5, 1.0], vec![0.5, 1.0]],
             &[vec![0.5, 1.0], vec![0.5, 1.0]],
@@ -1457,12 +1457,12 @@ mod tests {
 
     #[test]
     fn test_pot_fraction_sizing() {
-        // With pot = 2bb (SB calls, both invested 1bb each), a 0.5 pot bet = 1bb
+        // With pot = 4 chips (SB calls, both invested 2 chips each), a 0.5 pot bet = 2 chips
         let tree = GameTree::build(
-            20.0,
-            0.5,
+            40.0,
             1.0,
-            &[vec!["2.0bb".into()]],
+            2.0,
+            &[vec!["4bb".into()]],
             &[vec![0.5], vec![0.5]],
             &[vec![0.5], vec![0.5]],
             &[vec![0.5], vec![0.5]],
@@ -1534,20 +1534,20 @@ mod tests {
 
     /// Hand trace: verify invested tracks voluntary chips only.
     ///
-    /// Config: stack=50, sb=0.5, bb=1.0, preflop=["2.5bb"]
-    /// Trace: SB Raise(2.5) -> BB Fold
-    /// invested = [2.5, 0.0], pot = blinds(1.5) + vol(2.5 + 0.0) = 4.0
+    /// Config: stack=100, sb=1, bb=2, preflop=["5bb"]
+    /// Trace: SB Raise(5) -> BB Fold
+    /// invested = [5, 0], pot = blinds(3) + vol(5-1 + 0) = 7
     #[test]
     fn test_raise_fold_pot_trace() {
-        // Use "2.5bb" sizing, stack=50
-        // SB raises to 2.5 (total street bet). Additional = 2.5 - 0.5 = 2.0.
+        // Use "5bb" sizing (5 chips = 2.5 BB), stack=100 chips
+        // SB raises to 5 (total street bet). Additional = 5 - 1 = 4.
         // BB folds.
-        // Pot = SB blind (0.5) + BB blind (1.0) + SB additional (2.0) = 3.5
+        // Pot = SB blind (1) + BB blind (2) + SB additional (4) = 7
         let tree = GameTree::build(
-            50.0,
-            0.5,
+            100.0,
             1.0,
-            &[vec!["2.5bb".into()]],
+            2.0,
+            &[vec!["5bb".into()]],
             &[vec![0.5]],
             &[vec![0.5]],
             &[vec![0.5]],
@@ -1563,18 +1563,18 @@ mod tests {
                 let fold_idx = bb_a.iter().position(|a| matches!(a, TreeAction::Fold))
                     .expect("BB should have Fold");
                 if let GameNode::Terminal { pot, .. } = &tree.nodes[bb_c[fold_idx] as usize] {
-                    // Pot = blinds(1.5) + SB additional(2.0) = 3.5
+                    // Pot = blinds(3) + SB additional(4) = 7.0 chips
                     assert!(
-                        (*pot - 3.5).abs() < SIZE_EPSILON,
-                        "Pot should be 3.5 (blinds 1.5 + SB additional 2.0), got {pot}"
+                        (*pot - 7.0).abs() < SIZE_EPSILON,
+                        "Pot should be 7.0 chips (blinds 3 + SB additional 4), got {pot}"
                     );
                 } else { panic!("Expected Terminal after fold"); }
             } else { panic!("Expected Decision for BB"); }
         } else { panic!("Expected Decision at root"); }
     }
 
-    /// Preflop limp: SB calls (voluntary = BB - SB blind = 0.5),
-    /// BB checks, pot at flop = 0.5 + 1.0 + 0.5 + 0.0 = 2.0
+    /// Preflop limp: SB calls (voluntary = BB - SB blind = 1 chip),
+    /// BB checks, pot at flop = 1 + 2 + 1 + 0 = 4 chips
     ///
     /// Trace: SB call -> BB check -> Chance -> Flop P0 bets -> P1 folds.
     /// The fold terminal's pot includes blinds + both voluntary amounts.
@@ -1607,11 +1607,11 @@ mod tests {
                                 let fold_idx = p1_a.iter().position(|a| matches!(a, TreeAction::Fold))
                                     .expect("P1 should have Fold facing a bet");
                                 if let GameNode::Terminal { pot, .. } = &tree.nodes[p1_c[fold_idx] as usize] {
-                                    // After limp: pot = 2.0 (0.5 SB + 1.0 BB + 0.5 SB call)
+                                    // After limp: pot = 4.0 chips (1 SB + 2 BB + 1 SB call)
                                     // P0 bets on flop, P1 folds. Pot includes limp pot + bet.
                                     assert!(
-                                        *pot > 2.0 - SIZE_EPSILON,
-                                        "Pot should be at least 2.0 (after limp + bet), got {pot}"
+                                        *pot > 4.0 - SIZE_EPSILON,
+                                        "Pot should be at least 4.0 chips (after limp + bet), got {pot}"
                                     );
                                 } else {
                                     panic!("Fold child should be Terminal");
@@ -1657,14 +1657,14 @@ mod tests {
 
     #[test]
     fn test_fold_at_preflop_root_pot() {
-        // SB folds immediately: pot = small_blind + big_blind = 0.5 + 1.0 = 1.5
+        // SB folds immediately: pot = small_blind + big_blind = 1 + 2 = 3 chips
         let tree = simple_tree();
         if let GameNode::Decision { actions, children, .. } = &tree.nodes[tree.root as usize] {
             let fold_idx = actions.iter().position(|a| matches!(a, TreeAction::Fold)).unwrap();
             if let GameNode::Terminal { pot, .. } = &tree.nodes[children[fold_idx] as usize] {
                 assert!(
-                    (*pot - 1.5).abs() < SIZE_EPSILON,
-                    "Fold at preflop root should have pot=1.5, got {pot}"
+                    (*pot - 3.0).abs() < SIZE_EPSILON,
+                    "Fold at preflop root should have pot=3.0 chips, got {pot}"
                 );
             } else {
                 panic!("Expected Terminal after fold");
@@ -1674,10 +1674,11 @@ mod tests {
 
     #[test]
     fn test_raise_then_call_pot() {
-        // SB raises to 2.5bb, BB calls.
-        // Pot = SB blind (0.5) + BB blind (1.0) + SB vol (2.5) + BB call (2.5) = 6.5
-        // Wait: raise TO 2.5 means SB invested 2.5 voluntary. BB calls to match = 2.5.
-        // Pot = 0.5 + 1.0 + 2.5 + 2.5 = 6.5
+        // SB raises to 5 chips, BB calls.
+        // Pot = SB blind (1) + BB blind (2) + SB raise-to (5) + BB call (5) = 13 chips
+        // Wait: raise TO 5 means SB invested 5 voluntary. BB calls to match = 5.
+        // Pot = 1 + 2 + (5-1) + (5-2) = 10. Actually: stacks are debited for both.
+        // Actually: pot = 5 + 5 = 10 chips (both invested 5 total each).
         let tree = simple_tree();
         if let GameNode::Decision { actions, children, .. } = &tree.nodes[tree.root as usize] {
             let raise_idx = actions.iter().position(|a| matches!(a, TreeAction::Raise(_))).unwrap();
@@ -1694,10 +1695,10 @@ mod tests {
                             if let GameNode::Decision { actions: p1_a, children: p1_c, .. } = &tree.nodes[flop_c[bet_idx] as usize] {
                                 let fold_idx = p1_a.iter().position(|a| matches!(a, TreeAction::Fold)).unwrap();
                                 if let GameNode::Terminal { pot, .. } = &tree.nodes[p1_c[fold_idx] as usize] {
-                                    // After SB raise 2.5, BB call, flop bet: pot should be >= 6.5 (the pre-bet pot)
+                                    // After SB raise 5, BB call, flop bet: pot should be >= 10.0 chips (the pre-bet pot)
                                     assert!(
-                                        *pot >= 6.5 - SIZE_EPSILON,
-                                        "After raise+call+bet, pot should be >= 6.5, got {pot}"
+                                        *pot >= 10.0 - SIZE_EPSILON,
+                                        "After raise+call+bet, pot should be >= 10.0, got {pot}"
                                     );
                                 }
                             }
@@ -1762,25 +1763,21 @@ mod tests {
 
     #[test]
     fn terminal_payoffs_zero_sum() {
-        // SB raises to 2.5bb, BB calls. pot=6.0, stacks=[47.0, 47.0] (from 50.0)
-        // Starting stack=50, SB blind=0.5, BB blind=1.0
-        // SB raises to 2.5bb: street_bets[SB]=2.5, stacks[SB]=50-0.5-2.5=47.0
-        // BB calls: street_bets[BB]=2.5, stacks[BB]=50-1.0-2.5=46.5
-        // Wait, let me trace precisely:
-        // Initial: stacks=[49.5, 49.0], pot=1.5, street_bets=[0.5, 1.0]
-        // SB Raise(2.5): additional=2.5-0.5=2.0, stacks=[47.5, 49.0], pot=3.5, street_bets=[2.5, 1.0]
-        // BB Call: call_amount=2.5-1.0=1.5, stacks=[47.5, 47.5], pot=5.0, street_bets=[2.5, 2.5]
-        // Then showdown terminal: stacks=[47.5, 47.5], pot=5.0
+        // SB raises to 5 chips, BB calls. pot=10, stacks=[95, 95] (from 100)
+        // Starting stack=100 chips, SB blind=1, BB blind=2
+        // SB Raise(5): additional=5-1=4, stacks=[95, 98], pot=7, street_bets=[5, 2]
+        // BB Call: call_amount=5-2=3, stacks=[95, 95], pot=10, street_bets=[5, 5]
+        // Then showdown terminal: stacks=[95, 95], pot=10
         //
-        // Winner: (47.5 + 5.0) - 50 = +2.5
-        // Loser: 47.5 - 50 = -2.5
-        // Sum = 0 ✓
+        // Winner: (95 + 10) - 100 = +5
+        // Loser: 95 - 100 = -5
+        // Sum = 0
         //
-        // Tie: (47.5 + 5.0/2) - 50 = 0
-        // Both sum to 0 ✓
+        // Tie: (95 + 10/2) - 100 = 0
+        // Both sum to 0
         let tree = GameTree::build(
-            50.0, 0.5, 1.0,
-            &[vec!["2.5bb".into()]],
+            100.0, 1.0, 2.0,
+            &[vec!["5bb".into()]],
             &[vec![0.5]],
             &[vec![0.5]],
             &[vec![0.5]],
@@ -1836,8 +1833,8 @@ mod tests {
         // For every terminal: stacks[0] + stacks[1] + pot == 2 * starting_stack
         // (total chips in the system are conserved)
         let tree = GameTree::build(
-            50.0, 0.5, 1.0,
-            &[vec!["2.5bb".into()], vec!["3.0x".into()]],
+            100.0, 1.0, 2.0,
+            &[vec!["5bb".into()], vec!["3.0x".into()]],
             &[vec![0.5, 1.0]],
             &[vec![0.5, 1.0]],
             &[vec![0.5, 1.0]],

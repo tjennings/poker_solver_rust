@@ -187,9 +187,11 @@ impl Widget for &HandGridWidget<'_> {
                         CanonicalHand::from_matrix_position(r as usize, c as usize)
                             .map_or_else(|| "   ".to_string(), |h| format!("{h}"));
                     let hand_label = if let Some(ev) = cell.ev {
-                        let ev = if ev.abs() < 0.005 { 0.0_f32 } else { ev };
-                        let sign = if ev > 0.0 { "+" } else { "" };
-                        format!("{hand_name} {sign}{ev:.2}")
+                        // Convert chips to BB for display
+                        let ev_bb = ev / 2.0;
+                        let ev_bb = if ev_bb.abs() < 0.005 { 0.0_f32 } else { ev_bb };
+                        let sign = if ev_bb > 0.0 { "+" } else { "" };
+                        format!("{hand_name} {sign}{ev_bb:.2}")
                     } else {
                         hand_name
                     };

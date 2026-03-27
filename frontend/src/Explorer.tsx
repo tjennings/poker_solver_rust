@@ -864,8 +864,8 @@ export default function Explorer() {
       let streetActionCount = 0;
       // Start with preflop initial values
       let pot = 3;
-      let sp1 = bundleInfo ? bundleInfo.stack_depth * 2 - 1 : 199;
-      let sp2 = bundleInfo ? bundleInfo.stack_depth * 2 - 2 : 198;
+      let sp1 = bundleInfo ? bundleInfo.stack_depth - 1 : 199;
+      let sp2 = bundleInfo ? bundleInfo.stack_depth - 2 : 198;
 
       for (const item of items) {
         if (item.type === 'action') {
@@ -960,8 +960,8 @@ export default function Explorer() {
     if (!bundleInfo) return;
     try {
       setLoading(true);
-      const sp1 = bundleInfo.stack_depth * 2 - 1;
-      const sp2 = bundleInfo.stack_depth * 2 - 2;
+      const sp1 = bundleInfo.stack_depth - 1;
+      const sp2 = bundleInfo.stack_depth - 2;
       const initialPosition: ExplorationPosition = {
         board: [],
         history: [],
@@ -1253,8 +1253,8 @@ export default function Explorer() {
                     try {
                       const info = await invoke<BundleInfo>('load_blueprint_v2', { path: bp.path });
                       setBundleInfo(info);
-                      const sp1 = info.stack_depth * 2 - 1;
-                      const sp2 = info.stack_depth * 2 - 2;
+                      const sp1 = info.stack_depth - 1;
+                      const sp2 = info.stack_depth - 2;
                       const initialPosition: ExplorationPosition = {
                         board: [],
                         history: [],

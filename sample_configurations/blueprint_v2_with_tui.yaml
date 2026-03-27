@@ -2,9 +2,9 @@
 game:
   name: "HU 100BB TUI"
   players: 2
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 200
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   algorithm: potential_aware_emd
@@ -19,8 +19,8 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
-    - ["4bb", "2x"]
+    - ["5bb"]
+    - ["8bb", "2x"]
     - ["2x", "3x"]
     - ["2x"]
   flop:

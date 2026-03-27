@@ -299,10 +299,10 @@ impl GameSession {
                     street: street_to_string(self.current_street()),
                     position: String::new(),
                     board: self.board.clone(),
-                    pot: (*pot * 2.0) as i32,
+                    pot: *pot as i32,
                     stacks: [
-                        (stacks[bb_idx] * 2.0) as i32,
-                        (stacks[sb_idx] * 2.0) as i32,
+                        stacks[bb_idx] as i32,
+                        stacks[sb_idx] as i32,
                     ],
                     matrix: None,
                     actions: vec![],
@@ -773,19 +773,19 @@ impl GameSession {
         // If no CbvContext for postflop, weights are unchanged (blueprint-only mode).
     }
 
-    /// Compute pot at the current node (in half-BB units for display).
+    /// Compute pot at the current node (in chips).
     #[allow(clippy::cast_possible_truncation)]
     fn compute_pot(&self) -> i32 {
-        (pot_at_v2_node(&self.tree, self.node_idx) * 2.0) as i32
+        pot_at_v2_node(&self.tree, self.node_idx) as i32
     }
 
-    /// Compute remaining stacks [BB, SB] (in half-BB units for display).
+    /// Compute remaining stacks [BB, SB] (in chips).
     #[allow(clippy::cast_possible_truncation)]
     fn compute_stacks(&self) -> [i32; 2] {
         let pot = pot_at_v2_node(&self.tree, self.node_idx);
         let stack_depth = self.config.game.stack_depth;
         let each_invested = pot / 2.0;
-        let remaining = ((stack_depth - each_invested) * 2.0) as i32;
+        let remaining = (stack_depth - each_invested) as i32;
         [remaining, remaining]
     }
 
@@ -971,13 +971,21 @@ fn build_game_actions(tree_actions: &[TreeAction]) -> Vec<GameAction> {
 }
 
 /// Format a tree action as a human-readable label.
+///
+/// Amounts are in chips; display converts to BB (chips / 2).
 fn format_tree_action(action: &TreeAction) -> String {
     match action {
         TreeAction::Fold => "Fold".to_string(),
         TreeAction::Check => "Check".to_string(),
         TreeAction::Call => "Call".to_string(),
-        TreeAction::Bet(amount) => format!("{amount:.0}bb"),
-        TreeAction::Raise(amount) => format!("{amount:.0}bb"),
+        TreeAction::Bet(amount) => {
+            let bb = (amount / 2.0).round();
+            format!("{bb:.0}bb")
+        }
+        TreeAction::Raise(amount) => {
+            let bb = (amount / 2.0).round();
+            format!("{bb:.0}bb")
+        }
         TreeAction::AllIn => "All-in".to_string(),
     }
 }
@@ -2038,9 +2046,9 @@ fn make_test_config() -> BlueprintV2Config {
         game: GameConfig {
             name: "test".to_string(),
             players: 2,
-            stack_depth: 100.0,
-            small_blind: 0.5,
-            big_blind: 1.0,
+            stack_depth: 200.0,
+            small_blind: 1.0,
+            big_blind: 2.0,
             rake_rate: 0.0,
             rake_cap: 0.0,
         },
@@ -2727,12 +2735,12 @@ mod tests {
         let mut tree = V2GameTree {
             nodes: vec![V2GameNode::Terminal {
                 kind: TerminalKind::Showdown,
-                pot: 10.0,
-                stacks: [95.0, 95.0],
+                pot: 20.0,
+                stacks: [190.0, 190.0],
             }],
             root: 0,
             dealer: 0,
-            starting_stack: 100.0,
+            starting_stack: 200.0,
         };
         GameSession::new_for_test(tree)
     }
@@ -2754,18 +2762,18 @@ mod tests {
                 },
                 V2GameNode::Terminal {
                     kind: TerminalKind::Showdown,
-                    pot: 10.0,
-                    stacks: [95.0, 95.0],
+                    pot: 20.0,
+                    stacks: [190.0, 190.0],
                 },
                 V2GameNode::Terminal {
                     kind: TerminalKind::Fold { winner: 0 },
-                    pot: 10.0,
-                    stacks: [95.0, 95.0],
+                    pot: 20.0,
+                    stacks: [190.0, 190.0],
                 },
             ],
             root: 0,
             dealer: 0,
-            starting_stack: 100.0,
+            starting_stack: 200.0,
         };
         GameSession::new_for_test(tree)
     }
@@ -2791,8 +2799,8 @@ mod tests {
                 // 1: fold terminal
                 V2GameNode::Terminal {
                     kind: TerminalKind::Fold { winner: 1 },
-                    pot: 3.0,
-                    stacks: [99.5, 100.5],
+                    pot: 6.0,
+                    stacks: [199.0, 201.0],
                 },
                 // 2: child decision (player 1)
                 V2GameNode::Decision {
@@ -2805,19 +2813,19 @@ mod tests {
                 // 3: showdown
                 V2GameNode::Terminal {
                     kind: TerminalKind::Showdown,
-                    pot: 4.0,
-                    stacks: [98.0, 98.0],
+                    pot: 8.0,
+                    stacks: [196.0, 196.0],
                 },
                 // 4: fold terminal
                 V2GameNode::Terminal {
                     kind: TerminalKind::Fold { winner: 0 },
-                    pot: 4.0,
-                    stacks: [98.0, 98.0],
+                    pot: 8.0,
+                    stacks: [196.0, 196.0],
                 },
             ],
             root: 0,
             dealer: 0,
-            starting_stack: 100.0,
+            starting_stack: 200.0,
         };
         GameSession::new_for_test(tree)
     }
@@ -2837,30 +2845,31 @@ mod tests {
                 // 1: fold terminal
                 V2GameNode::Terminal {
                     kind: TerminalKind::Fold { winner: 1 },
-                    pot: 3.0,
-                    stacks: [99.5, 100.5],
+                    pot: 6.0,
+                    stacks: [199.0, 201.0],
                 },
                 // 2: call terminal (showdown)
                 V2GameNode::Terminal {
                     kind: TerminalKind::Showdown,
-                    pot: 4.0,
-                    stacks: [98.0, 98.0],
+                    pot: 8.0,
+                    stacks: [196.0, 196.0],
                 },
                 // 3: all-in terminal
                 V2GameNode::Terminal {
                     kind: TerminalKind::Showdown,
-                    pot: 200.0,
+                    pot: 400.0,
                     stacks: [0.0, 0.0],
                 },
             ],
             root: 0,
             dealer,
-            starting_stack: 100.0,
+            starting_stack: 200.0,
         }
     }
 
     /// A multi-street tree: preflop SB raise/fold -> BB call/fold -> Chance -> Flop decisions.
     /// Dealer = 0 (SB = player 0, BB = player 1).
+    /// All values in chips (1 BB = 2 chips).
     ///
     /// Nodes:
     /// 0: SB decision (Preflop) [Fold(->1), Bet 2bb(->2)]
@@ -2886,15 +2895,15 @@ mod tests {
                 V2GameNode::Decision {
                     player: 0,
                     street: Street::Preflop,
-                    actions: vec![TreeAction::Fold, TreeAction::Bet(2.0)],
+                    actions: vec![TreeAction::Fold, TreeAction::Bet(4.0)],
                     children: vec![1, 2],
                     blueprint_decision_idx: None,
                 },
                 // 1: Terminal (SB fold)
                 V2GameNode::Terminal {
                     kind: TerminalKind::Fold { winner: 1 },
-                    pot: 1.5,
-                    stacks: [99.5, 100.5],
+                    pot: 3.0,
+                    stacks: [199.0, 201.0],
                 },
                 // 2: BB decision (Preflop)
                 V2GameNode::Decision {
@@ -2907,8 +2916,8 @@ mod tests {
                 // 3: Terminal (BB fold)
                 V2GameNode::Terminal {
                     kind: TerminalKind::Fold { winner: 0 },
-                    pot: 2.5,
-                    stacks: [100.5, 99.5],
+                    pot: 5.0,
+                    stacks: [201.0, 199.0],
                 },
                 // 4: Chance (Flop)
                 V2GameNode::Chance {
@@ -2919,7 +2928,7 @@ mod tests {
                 V2GameNode::Decision {
                     player: 1,
                     street: Street::Flop,
-                    actions: vec![TreeAction::Check, TreeAction::Bet(4.0)],
+                    actions: vec![TreeAction::Check, TreeAction::Bet(8.0)],
                     children: vec![6, 7],
                     blueprint_decision_idx: None,
                 },
@@ -2927,7 +2936,7 @@ mod tests {
                 V2GameNode::Decision {
                     player: 0,
                     street: Street::Flop,
-                    actions: vec![TreeAction::Check, TreeAction::Bet(4.0)],
+                    actions: vec![TreeAction::Check, TreeAction::Bet(8.0)],
                     children: vec![8, 9],
                     blueprint_decision_idx: None,
                 },
@@ -2942,20 +2951,20 @@ mod tests {
                 // 8: Terminal (check-check showdown)
                 V2GameNode::Terminal {
                     kind: TerminalKind::Showdown,
-                    pot: 4.0,
-                    stacks: [98.0, 98.0],
+                    pot: 8.0,
+                    stacks: [196.0, 196.0],
                 },
                 // 9: Terminal (check-bet showdown)
                 V2GameNode::Terminal {
                     kind: TerminalKind::Showdown,
-                    pot: 8.0,
-                    stacks: [96.0, 96.0],
+                    pot: 16.0,
+                    stacks: [192.0, 192.0],
                 },
                 // 10: Terminal (SB fold to BB bet)
                 V2GameNode::Terminal {
                     kind: TerminalKind::Fold { winner: 1 },
-                    pot: 8.0,
-                    stacks: [96.0, 96.0],
+                    pot: 16.0,
+                    stacks: [192.0, 192.0],
                 },
                 // 11: Chance (Turn)
                 V2GameNode::Chance {
@@ -2966,26 +2975,26 @@ mod tests {
                 V2GameNode::Decision {
                     player: 1,
                     street: Street::Turn,
-                    actions: vec![TreeAction::Check, TreeAction::Bet(10.0)],
+                    actions: vec![TreeAction::Check, TreeAction::Bet(20.0)],
                     children: vec![13, 14],
                     blueprint_decision_idx: None,
                 },
                 // 13: Terminal (showdown)
                 V2GameNode::Terminal {
                     kind: TerminalKind::Showdown,
-                    pot: 12.0,
-                    stacks: [94.0, 94.0],
+                    pot: 24.0,
+                    stacks: [188.0, 188.0],
                 },
                 // 14: Terminal (showdown)
                 V2GameNode::Terminal {
                     kind: TerminalKind::Showdown,
-                    pot: 32.0,
-                    stacks: [84.0, 84.0],
+                    pot: 64.0,
+                    stacks: [168.0, 168.0],
                 },
             ],
             root: 0,
             dealer: 0,
-            starting_stack: 100.0,
+            starting_stack: 200.0,
         }
     }
 

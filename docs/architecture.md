@@ -67,6 +67,17 @@ poker_solver_rust/
 
 **`agents/`** -- TOML files defining agent play styles (tight-aggressive, loose-aggressive, etc.) that map hand classes to action frequency distributions for simulation.
 
+## Unit Convention
+
+All internal values (pot, stacks, bet sizes, EVs) are in **chips**.
+
+- 1 BB = 2 chips
+- Config files use chips: `small_blind: 1`, `big_blind: 2`, `stack_depth: 200` (for 100 BB)
+- Preflop action sizes use chip amounts with a `bb` suffix: `"5bb"` means raise to 5 chips (2.5 BB)
+- Pot-fraction sizes (e.g. `0.67`) and multiplier sizes (e.g. `"3.0x"`) are unitless and unchanged
+- Display to users converts chips to BB by dividing by 2, at the UI/CLI boundary only
+- The range-solver (`TreeConfig`) also uses chips for `starting_pot` and `effective_stack`
+
 ## Blueprint V2 MCCFR Solver
 
 **Algorithm:** External-sampling MCCFR with DCFR discounting. Samples random deals (hole cards + full board), traverses preflop through river, accumulates regrets at each information set. DCFR logic (iteration weighting, regret discounting, strategy discounting) is delegated to the shared `DcfrParams` module in `cfr/dcfr.rs`.
