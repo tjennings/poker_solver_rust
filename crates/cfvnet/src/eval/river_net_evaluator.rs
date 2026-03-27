@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
-use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
+use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::poker::{Card, Suit};
 use range_solver::card::card_pair_to_index;
 

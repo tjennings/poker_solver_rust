@@ -12,7 +12,7 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use cfvnet::eval::river_net_evaluator::{build_input, rs_card_to_u8};
 use cfvnet::model::network::{CfvNet, INPUT_SIZE, OUTPUT_SIZE};
-use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
+use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::poker::Card;
 use range_solver::card::card_pair_to_index;
 

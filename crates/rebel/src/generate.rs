@@ -20,7 +20,7 @@ use crate::config::RebelConfig;
 use crate::data_buffer::{BufferRecord, DiskBuffer};
 use crate::pbs::{Pbs, NUM_COMBOS};
 use crate::solver::{solve_depth_limited_pbs, solve_river_pbs, SolveConfig};
-use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
+use poker_solver_core::blueprint_v2::LeafEvaluator;
 
 /// Convert a PBS to a `BufferRecord` for one player's perspective.
 ///

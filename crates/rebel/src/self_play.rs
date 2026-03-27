@@ -21,7 +21,7 @@ use crate::generate::pbs_to_buffer_record;
 use crate::pbs::{combo_index, Pbs, NUM_COMBOS};
 use crate::solver::{solve_depth_limited_pbs, SolveConfig, SolveResult};
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
-use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
+use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::blueprint_v2::game_tree::GameTree;
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 

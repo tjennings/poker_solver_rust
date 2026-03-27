@@ -10,7 +10,7 @@
 //   providing CFVs at street boundaries.
 
 use crate::pbs::{Pbs, NUM_COMBOS};
-use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
+use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::poker::Card as RsPokerCard;
 use range_solver::{
     action_tree::{ActionTree, BoardState, TreeConfig},
@@ -420,7 +420,7 @@ mod tests {
     use super::*;
     use range_solver::card::index_to_card_pair;
 
-    use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
+    use poker_solver_core::blueprint_v2::LeafEvaluator;
     use poker_solver_core::poker::Card as RsPokerCard;
 
     /// Build a test solve config with reasonable defaults.

@@ -15,16 +15,15 @@ pub mod game_tree;
 pub mod mccfr;
 pub mod solver_dispatch;
 pub mod storage;
+pub mod leaf_evaluator;
 pub mod subgame;
 pub mod subgame_cfr;
 pub mod trainer;
 
-pub mod cfv_subgame_solver;
-
 // Re-export subgame types at module level for convenience.
+pub use leaf_evaluator::LeafEvaluator;
 pub use subgame::SubgameConfig;
-pub use subgame_cfr::{SubgameCfrSolver, SubgameHands, SubgameStrategy, compute_combo_equities, build_boundary_mapping};
-pub use cfv_subgame_solver::{CfvSubgameSolver, ExactRiverEvaluator, LeafEvaluator};
+pub use subgame_cfr::{SubgameHands, SubgameStrategy, compute_combo_equities, build_boundary_mapping};
 
 use serde::{Deserialize, Serialize};
 

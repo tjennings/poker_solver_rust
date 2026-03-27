@@ -10,7 +10,7 @@
 
 use crate::pbs::{Pbs, NUM_COMBOS};
 use crate::solver::SolveConfig;
-use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
+use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::poker::Card as RsPokerCard;
 use range_solver::{
     action_tree::{ActionTree, BoardState, TreeConfig},
@@ -377,7 +377,7 @@ fn u8_to_rs_poker_card(card: u8) -> RsPokerCard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
+    use poker_solver_core::blueprint_v2::LeafEvaluator;
     use poker_solver_core::poker::Card as RsPokerCard;
     use range_solver::bet_size::BetSizeOptions;
     use range_solver::card::index_to_card_pair;

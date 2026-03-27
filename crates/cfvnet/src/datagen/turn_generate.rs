@@ -1,7 +1,7 @@
 //! Turn training data generation pipeline.
 //!
-//! Samples random turn situations, solves them using [`CfvSubgameSolver`] with
-//! a [`RiverNetEvaluator`] as the leaf evaluator, extracts root CFVs, and
+//! Samples random turn situations, solves them using `PostFlopGame` with
+//! a `RiverNetEvaluator` as the leaf evaluator, extracts root CFVs, and
 //! writes [`TrainingRecord`]s with 4-card boards.
 
 use std::io::BufWriter;
@@ -11,7 +11,7 @@ use burn::backend::NdArray;
 use burn::module::Module;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 use indicatif::{ProgressBar, ProgressStyle};
-use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
+use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::poker::{Card, Suit, Value};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -696,7 +696,7 @@ fn generate_turn_training_data_cuda(
 }
 
 /// Generate turn training data by sampling situations, solving with
-/// `CfvSubgameSolver` + `RiverNetEvaluator`, and writing paired records.
+/// `PostFlopGame` + `RiverNetEvaluator`, and writing paired records.
 ///
 /// The river model is loaded once and cloned for each situation's evaluator.
 ///
