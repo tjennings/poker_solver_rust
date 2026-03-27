@@ -1,13 +1,5 @@
 use serde::Deserialize;
 
-/// Which player seat a scenario monitors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum PlayerLabel {
-    Sb,
-    Bb,
-}
-
 /// Which street a scenario or random-pool entry refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -22,14 +14,8 @@ pub enum StreetLabel {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScenarioConfig {
     pub name: String,
-    #[allow(dead_code)]
-    pub player: PlayerLabel,
     #[serde(default)]
-    pub actions: Vec<String>,
-    #[serde(default)]
-    pub board: Option<Vec<String>>,
-    #[serde(default)]
-    pub street: Option<StreetLabel>,
+    pub spot: String,
 }
 
 /// Controls how often telemetry signals are sampled.
@@ -150,13 +136,9 @@ tui:
     sparkline_window: 120
   scenarios:
     - name: "SB open"
-      player: SB
-      actions: ["raise"]
-      street: preflop
-    - name: "BB defend"
-      player: BB
-      board: ["As", "Kh", "7d"]
-      street: flop
+      spot: ""
+    - name: "BB vs raise"
+      spot: "sb:5bb"
   random_scenario:
     enabled: true
     hold_minutes: 5
@@ -171,15 +153,11 @@ tui:
 
         let s0 = &cfg.scenarios[0];
         assert_eq!(s0.name, "SB open");
-        assert_eq!(s0.player, PlayerLabel::Sb);
-        assert_eq!(s0.actions, vec!["raise"]);
-        assert_eq!(s0.street, Some(StreetLabel::Preflop));
+        assert_eq!(s0.spot, "");
 
         let s1 = &cfg.scenarios[1];
-        assert_eq!(s1.name, "BB defend");
-        assert_eq!(s1.player, PlayerLabel::Bb);
-        assert_eq!(s1.board, Some(vec!["As".to_string(), "Kh".to_string(), "7d".to_string()]));
-        assert_eq!(s1.street, Some(StreetLabel::Flop));
+        assert_eq!(s1.name, "BB vs raise");
+        assert_eq!(s1.spot, "sb:5bb");
 
         assert!(cfg.random_scenario.enabled);
         assert_eq!(cfg.random_scenario.hold_minutes, 5);
@@ -219,14 +197,14 @@ tui:
   refresh_rate_ms: 500
   scenarios:
     - name: "Check spot"
-      player: BB
+      spot: ""
 "#;
         let cfg = parse_tui_config(yaml);
         assert!(cfg.enabled);
         assert_eq!(cfg.refresh_rate_ms, 500);
         assert_eq!(cfg.scenarios.len(), 1);
         assert_eq!(cfg.scenarios[0].name, "Check spot");
-        // Telemetry and random_scenario should be defaults.
+        assert_eq!(cfg.scenarios[0].spot, "");
         assert_eq!(cfg.telemetry.sparkline_window, 60);
         assert!(!cfg.random_scenario.enabled);
     }
