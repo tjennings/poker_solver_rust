@@ -10,37 +10,6 @@ use poker_solver_core::poker::{self, Card, full_deck};
 
 use crate::blueprint_tui_widgets::CellStrategy;
 
-/// Walk `tree` following `actions` from the root. Returns the arena
-/// index of the target node, or `None` if any action string is invalid
-/// or the path runs into a terminal.
-///
-/// Chance nodes are skipped automatically — the walk passes through
-/// them to reach the next decision node.
-pub fn resolve_action_path(tree: &GameTree, actions: &[String]) -> Option<u32> {
-    let mut node_idx = tree.root;
-
-    for action_str in actions {
-        // Skip through chance nodes transparently.
-        node_idx = skip_chance(tree, node_idx);
-
-        let GameNode::Decision {
-            actions: ref node_actions,
-            ref children,
-            ..
-        } = tree.nodes[node_idx as usize]
-        else {
-            return None;
-        };
-
-        let matched = match_action(action_str, node_actions)?;
-        node_idx = children[matched];
-    }
-
-    // Skip trailing chance node so caller always lands on a decision or terminal.
-    node_idx = skip_chance(tree, node_idx);
-    Some(node_idx)
-}
-
 /// Format a `TreeAction` for display.
 pub fn format_tree_action(action: &TreeAction) -> String {
     match action {
@@ -345,55 +314,6 @@ fn skip_chance(tree: &GameTree, mut idx: u32) -> u32 {
     idx
 }
 
-/// Find the index of the action in `node_actions` that matches
-/// `action_str`. Returns `None` if no match.
-fn match_action(action_str: &str, node_actions: &[TreeAction]) -> Option<usize> {
-    let lower = action_str.to_ascii_lowercase();
-
-    if lower == "fold" {
-        return node_actions
-            .iter()
-            .position(|a| matches!(a, TreeAction::Fold));
-    }
-    if lower == "check" {
-        return node_actions
-            .iter()
-            .position(|a| matches!(a, TreeAction::Check));
-    }
-    if lower == "call" {
-        return node_actions
-            .iter()
-            .position(|a| matches!(a, TreeAction::Call));
-    }
-    if lower == "allin" || lower == "all-in" {
-        return node_actions
-            .iter()
-            .position(|a| matches!(a, TreeAction::AllIn));
-    }
-
-    // "bet-N" or "raise-N": the N-th occurrence of Bet/Raise in this node.
-    if let Some(n_str) = lower.strip_prefix("bet-") {
-        let n: usize = n_str.parse().ok()?;
-        return node_actions
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| matches!(a, TreeAction::Bet(_)))
-            .nth(n)
-            .map(|(i, _)| i);
-    }
-    if let Some(n_str) = lower.strip_prefix("raise-") {
-        let n: usize = n_str.parse().ok()?;
-        return node_actions
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| matches!(a, TreeAction::Raise(_)))
-            .nth(n)
-            .map(|(i, _)| i);
-    }
-
-    None
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -411,29 +331,6 @@ mod tests {
             &[vec![1.0]],
             &[vec![1.0]],
         )
-    }
-
-    #[timed_test(10)]
-    fn resolve_root_node() {
-        let tree = toy_tree();
-        let result = resolve_action_path(&tree, &[]);
-        assert_eq!(result, Some(tree.root));
-    }
-
-    #[timed_test(10)]
-    fn resolve_raise_call() {
-        let tree = toy_tree();
-        let path: Vec<String> = vec!["raise-0".into(), "call".into()];
-        let result = resolve_action_path(&tree, &path);
-        assert!(result.is_some(), "raise-0 then call should resolve");
-    }
-
-    #[timed_test(10)]
-    fn resolve_invalid_returns_none() {
-        let tree = toy_tree();
-        let path: Vec<String> = vec!["invalid".into()];
-        let result = resolve_action_path(&tree, &path);
-        assert_eq!(result, None);
     }
 
     #[timed_test(10)]
