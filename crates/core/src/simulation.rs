@@ -198,9 +198,8 @@ fn setup_competition(
     stack_depth: u32,
     bet_sizes: &[f32],
 ) -> HoldemCompetition<StandardSimulationIterator<RotatingDealerGenerator>> {
-    // stack_depth is in BB. Internal units: 1 BB = 2 units, so
-    // arena stacks = stack_depth * 2 (with big_blind=2.0, small_blind=1.0).
-    let stacks = vec![(stack_depth * 2) as f32; 2];
+    // stack_depth is in chips (1 BB = 2 chips).
+    let stacks = vec![stack_depth as f32; 2];
     let game_state = GameState::new_starting(stacks, 2.0, 1.0, 0.0, 0);
 
     let p1_wrapped: Box<dyn AgentGenerator> = Box::new(LoggingAgentGeneratorWrapper {
@@ -534,7 +533,7 @@ raise = 0.33
         let p2_gen: Box<dyn AgentGenerator> = Box::new(FoldingAgentGenerator);
 
         let stop = AtomicBool::new(false);
-        let result = run_simulation(p1_gen, p2_gen, 2000, 100, &stop, &[0.5, 1.0], |_| {}).unwrap();
+        let result = run_simulation(p1_gen, p2_gen, 2000, 200, &stop, &[0.5, 1.0], |_| {}).unwrap();
 
         assert_eq!(result.hands_played, 2000);
         // With dealer rotation:
@@ -580,7 +579,7 @@ raise = 0.1
             Box::new(RuleBasedAgentGenerator::new(passive_config));
 
         let stop = AtomicBool::new(false);
-        let result = run_simulation(p1_gen, p2_gen, 200, 100, &stop, &[0.5, 1.0], |_| {}).unwrap();
+        let result = run_simulation(p1_gen, p2_gen, 200, 200, &stop, &[0.5, 1.0], |_| {}).unwrap();
 
         assert_eq!(result.hands_played, 200);
         // Simulation completed successfully with two different agents
@@ -607,7 +606,7 @@ raise = 0.33
 
         let stop = AtomicBool::new(true); // Start already stopped
         let result =
-            run_simulation(p1_gen, p2_gen, 10000, 100, &stop, &[0.5, 1.0], |_| {}).unwrap();
+            run_simulation(p1_gen, p2_gen, 10000, 200, &stop, &[0.5, 1.0], |_| {}).unwrap();
 
         assert_eq!(result.hands_played, 0, "Should stop immediately");
     }
@@ -632,7 +631,7 @@ raise = 0.4
 
         let stop = AtomicBool::new(false);
         let mut progress_count = 0u32;
-        let result = run_simulation(p1_gen, p2_gen, 200, 100, &stop, &[0.5, 1.0], |_| {
+        let result = run_simulation(p1_gen, p2_gen, 200, 200, &stop, &[0.5, 1.0], |_| {
             progress_count += 1;
         })
         .unwrap();
