@@ -299,10 +299,10 @@ impl GameSession {
                     street: street_to_string(self.current_street()),
                     position: String::new(),
                     board: self.board.clone(),
-                    pot: (*pot * 2.0) as i32,
+                    pot: *pot as i32,
                     stacks: [
-                        (stacks[bb_idx] * 2.0) as i32,
-                        (stacks[sb_idx] * 2.0) as i32,
+                        stacks[bb_idx] as i32,
+                        stacks[sb_idx] as i32,
                     ],
                     matrix: None,
                     actions: vec![],
@@ -773,19 +773,19 @@ impl GameSession {
         // If no CbvContext for postflop, weights are unchanged (blueprint-only mode).
     }
 
-    /// Compute pot at the current node (in half-BB units for display).
+    /// Compute pot at the current node (in chips).
     #[allow(clippy::cast_possible_truncation)]
     fn compute_pot(&self) -> i32 {
-        (pot_at_v2_node(&self.tree, self.node_idx) * 2.0) as i32
+        pot_at_v2_node(&self.tree, self.node_idx) as i32
     }
 
-    /// Compute remaining stacks [BB, SB] (in half-BB units for display).
+    /// Compute remaining stacks [BB, SB] (in chips).
     #[allow(clippy::cast_possible_truncation)]
     fn compute_stacks(&self) -> [i32; 2] {
         let pot = pot_at_v2_node(&self.tree, self.node_idx);
         let stack_depth = self.config.game.stack_depth;
         let each_invested = pot / 2.0;
-        let remaining = ((stack_depth - each_invested) * 2.0) as i32;
+        let remaining = (stack_depth - each_invested) as i32;
         [remaining, remaining]
     }
 
@@ -971,13 +971,21 @@ fn build_game_actions(tree_actions: &[TreeAction]) -> Vec<GameAction> {
 }
 
 /// Format a tree action as a human-readable label.
+///
+/// Amounts are in chips; display converts to BB (chips / 2).
 fn format_tree_action(action: &TreeAction) -> String {
     match action {
         TreeAction::Fold => "Fold".to_string(),
         TreeAction::Check => "Check".to_string(),
         TreeAction::Call => "Call".to_string(),
-        TreeAction::Bet(amount) => format!("{amount:.0}bb"),
-        TreeAction::Raise(amount) => format!("{amount:.0}bb"),
+        TreeAction::Bet(amount) => {
+            let bb = (amount / 2.0).round();
+            format!("{bb:.0}bb")
+        }
+        TreeAction::Raise(amount) => {
+            let bb = (amount / 2.0).round();
+            format!("{bb:.0}bb")
+        }
         TreeAction::AllIn => "All-in".to_string(),
     }
 }

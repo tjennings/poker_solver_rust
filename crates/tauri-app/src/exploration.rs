@@ -968,7 +968,7 @@ fn v2_actions_at_node(tree: &V2GameTree, node_idx: u32) -> Vec<ActionInfo> {
         V2GameNode::Decision { actions, .. } => actions
             .iter()
             .enumerate()
-            .map(|(i, a)| v2_action_info(a, i, 1.0, 0.0))
+            .map(|(i, a)| v2_action_info(a, i, 0.0))
             .collect(),
         _ => vec![],
     }
@@ -976,9 +976,7 @@ fn v2_actions_at_node(tree: &V2GameTree, node_idx: u32) -> Vec<ActionInfo> {
 
 /// Convert a V2 `TreeAction` to an `ActionInfo`.
 ///
-/// `bb_scale` converts internal tree units to BB for display labels.
-/// Use `1.0` when the tree uses BB units (blueprint preflop tree).
-/// Use `0.5` when the tree uses chip units (subgame solver, 1BB = 2 chips).
+/// All amounts are in chips; display labels convert to BB (chips / 2).
 ///
 /// `invested_offset` is subtracted from Bet/Raise amounts before display.
 /// For postflop subgame trees this is the per-player investment entering
@@ -989,7 +987,6 @@ fn v2_actions_at_node(tree: &V2GameTree, node_idx: u32) -> Vec<ActionInfo> {
 pub(crate) fn v2_action_info(
     action: &TreeAction,
     idx: usize,
-    bb_scale: f64,
     invested_offset: f64,
 ) -> ActionInfo {
     let id = idx.to_string();
@@ -1013,7 +1010,7 @@ pub(crate) fn v2_action_info(
             size_key: None,
         },
         TreeAction::Bet(amount) => {
-            let display = ((amount - invested_offset) * bb_scale).round();
+            let display = ((amount - invested_offset) / 2.0).round();
             ActionInfo {
                 id,
                 label: format!("{display:.0}bb"),
@@ -1022,7 +1019,7 @@ pub(crate) fn v2_action_info(
             }
         }
         TreeAction::Raise(amount) => {
-            let display = ((amount - invested_offset) * bb_scale).round();
+            let display = ((amount - invested_offset) / 2.0).round();
             ActionInfo {
                 id,
                 label: format!("{display:.0}bb"),
@@ -1273,12 +1270,12 @@ fn get_strategy_matrix_v2(
     // Compute pot/stacks from the tree.
     let node_pot = pot_at_v2_node(tree, walk.node_idx);
     let stack_depth = _config.game.stack_depth;
-    let pot = (node_pot * 2.0) as u32; // convert BB to half-BB units
+    let pot = node_pot as u32;
     // Approximate remaining stacks: each player started with stack_depth,
     // and roughly half the pot has come from each player.
     let each_invested = node_pot / 2.0;
-    let stack_p1 = ((stack_depth - each_invested) * 2.0) as u32;
-    let stack_p2 = ((stack_depth - each_invested) * 2.0) as u32;
+    let stack_p1 = (stack_depth - each_invested) as u32;
+    let stack_p2 = (stack_depth - each_invested) as u32;
     let to_call = 0u32; // approximation; exact to_call requires action tracking
 
     Ok(StrategyMatrix {
