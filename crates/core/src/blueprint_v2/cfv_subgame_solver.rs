@@ -183,6 +183,7 @@ pub struct CfvSubgameSolver {
     pub iteration: u32,
     starting_stack: f64,
     /// Precomputed: for each combo, the total opponent reach of non-blocked combos.
+    #[allow(dead_code)]
     opp_reach_totals: Vec<f64>,
     /// Initial reach probabilities for OOP.
     /// From preflop range filtering — not all combos are equally likely.

@@ -4,7 +4,9 @@ mod blueprint_tui_metrics;
 mod blueprint_tui_scenarios;
 mod blueprint_tui_widgets;
 mod inspect_spot;
+#[allow(dead_code)]
 mod log_file;
+#[allow(dead_code)]
 mod validate_blueprint;
 mod validation_spots;
 

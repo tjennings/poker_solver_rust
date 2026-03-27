@@ -60,6 +60,7 @@ pub struct SelfPlayConfig {
 /// enum, to keep the self-play logic self-contained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Street {
+    #[allow(dead_code)]
     Preflop,
     Flop,
     Turn,

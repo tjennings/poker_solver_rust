@@ -1252,6 +1252,7 @@ struct SolveBoundaryEvaluator {
     /// Board cards as rs_poker Cards (for equity computation).
     board_cards: Vec<rs_poker::core::Card>,
     /// Effective stack at game start.
+    #[allow(dead_code)]
     eff_stack: f64,
     /// Rollout evaluator for SPR>0 boundaries (None if CbvContext unavailable).
     rollout: Option<RolloutLeafEvaluator>,
@@ -1281,7 +1282,7 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
             hero_cards
                 .par_iter()
                 .enumerate()
-                .map(|(i, &(h1, h2))| {
+                .map(|(_i, &(h1, h2))| {
                     let rs_h1 = crate::exploration::range_solver_to_rs_card(h1);
                     let rs_h2 = crate::exploration::range_solver_to_rs_card(h2);
                     let mut ev_sum = 0.0f64;
@@ -1366,7 +1367,7 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
 }
 
 /// Old evaluate_and_inject_boundaries — kept for reference but no longer called.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 fn evaluate_and_inject_boundaries(
     game: &mut PostFlopGame,
     evaluator: &RolloutLeafEvaluator,
@@ -1645,9 +1646,6 @@ pub fn game_solve_core(
     rollout_opponent_samples: Option<u32>,
     range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
-    use poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id;
-    use range_solver::card::card_pair_to_index;
-
     // Guard: reject if already solving
     if session_state.solve_state.solving.load(Ordering::Relaxed) {
         return Err("A solve is already in progress".to_string());
@@ -1745,7 +1743,7 @@ pub fn game_solve_core(
 
     let max_iters = max_iterations.unwrap_or(200);
     let eval_interval = leaf_eval_interval.unwrap_or(10);
-    let target_exp = target_exploitability.unwrap_or(3.0);
+    let _target_exp = target_exploitability.unwrap_or(3.0);
 
     // Reset solve state atomics
     let ss = &session_state.solve_state;

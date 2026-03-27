@@ -4,7 +4,6 @@
 //! flat arrays indexed by `(decision_node, combo, action)` instead of
 //! hash maps, with rayon parallelism over combos and DCFR discounting.
 
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::cfr::dcfr::DcfrParams;
@@ -1115,20 +1114,6 @@ fn walk_trees_lockstep(
     }
 }
 
-/// Compare two `TreeAction`s for equivalence during lockstep tree walking.
-///
-/// Uses approximate comparison for `Bet`/`Raise` amounts (within `SIZE_EPSILON`).
-fn actions_match(a: &TreeAction, b: &TreeAction) -> bool {
-    match (a, b) {
-        (TreeAction::Fold, TreeAction::Fold)
-        | (TreeAction::Check, TreeAction::Check)
-        | (TreeAction::Call, TreeAction::Call)
-        | (TreeAction::AllIn, TreeAction::AllIn) => true,
-        (TreeAction::Bet(x), TreeAction::Bet(y))
-        | (TreeAction::Raise(x), TreeAction::Raise(y)) => (x - y).abs() < 0.01,
-        _ => false,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests

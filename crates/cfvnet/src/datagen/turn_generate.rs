@@ -269,6 +269,7 @@ fn weighted_sum(range: &[f32; NUM_COMBOS], cfvs: &[f32; NUM_COMBOS]) -> f32 {
 /// Build a depth-limited turn game tree for a situation.
 ///
 /// Returns `None` for degenerate situations (effective_stack <= 0).
+#[allow(dead_code)]
 fn build_turn_game(
     board_u8: &[u8],
     pot: f64,
@@ -315,7 +316,7 @@ fn build_turn_game(
 }
 
 /// Solve a game with boundaries already set. Returns 1326-indexed CFVs.
-#[allow(clippy::type_complexity)]
+#[allow(dead_code, clippy::type_complexity)]
 fn solve_and_extract(
     game: &mut PostFlopGame,
     pot: f64,

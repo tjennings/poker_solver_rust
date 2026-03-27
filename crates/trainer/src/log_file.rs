@@ -4,7 +4,6 @@
 //! solver diagnostic messages would be lost. This module captures all solver
 //! output to a timestamped log file under `./logs/`, and conditionally mirrors
 //! to stdout/stderr when the TUI is not running.
-
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -340,6 +340,7 @@ pub(crate) struct RolloutLeafEvaluator {
     pub(crate) bias_factor: f64,
     pub(crate) num_rollouts: u32,
     pub(crate) num_opponent_samples: u32,
+    #[allow(dead_code)]
     pub(crate) starting_stack: f64,
     /// Stack-to-pot ratio at the subgame root, used to scale the unit
     /// game's starting stack so rollout dynamics match the real game.

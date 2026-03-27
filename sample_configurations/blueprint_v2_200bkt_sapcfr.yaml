@@ -40,27 +40,27 @@ action_abstraction:
 training:
   cluster_path: "./local_data/buckets/200_v1"
   time_limit_minutes: 7200
-  lcfr_warmup_iterations: 10000000
+  #lcfr_warmup_iterations: 10000000
   prune_after_iterations: 10000000
-  prune_threshold: -5
+  prune_threshold: -2
   lcfr_discount_interval: 1000000
   batch_size: 2000
   purify_threshold: 0.03
   #dcfr_epoch_cap: 80
   # SAPCFR+ optimizer with prediction-based strategy
   optimizer: "sapcfr+"
-  sapcfr_eta: 0.5
+  sapcfr_eta: 0.33
   dcfr_alpha: 1.5
   dcfr_gamma: 2.0
   # Variance-reducing baselines
   use_baselines: true
-  baseline_alpha: 0.01
+  baseline_alpha: 0.10
 
 snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/200_100bb_sapcfr/snap"
+  output_dir: "./local_data/blueprints/200_100bb_sapcfr_v2/snap"
 
 tui:
   enabled: true

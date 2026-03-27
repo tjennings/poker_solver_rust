@@ -1396,12 +1396,6 @@ pub fn blueprint_propagate_ranges(
             &mut oop_weights
         };
 
-        let lookup = BucketLookup {
-            all_buckets: &ctx.all_buckets,
-            strategy: &ctx.strategy,
-            decision_idx: dec_idx as usize,
-        };
-
         // For each combo, look up its bucket and multiply by action probability.
         for hand in all_hands() {
             for (c0, c1) in hand.combos() {
@@ -2047,7 +2041,7 @@ fn value_to_char(v: Value) -> char {
 
 /// Load per-node hand EVs from hand_ev.bin (FullTreeEvTracker format).
 /// Returns `Vec<[[f64; 169]; 2]>` indexed by decision node index.
-pub fn load_hand_ev_bin(path: &Path, expected_nodes: usize) -> Result<Vec<[[f64; 169]; 2]>, String> {
+pub fn load_hand_ev_bin(path: &Path, _expected_nodes: usize) -> Result<Vec<[[f64; 169]; 2]>, String> {
     use std::io::Read;
     let mut f = std::io::BufReader::new(
         std::fs::File::open(path).map_err(|e| format!("Cannot open: {e}"))?

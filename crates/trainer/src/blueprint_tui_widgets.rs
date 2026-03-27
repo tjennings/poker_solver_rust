@@ -426,6 +426,7 @@ fn render_color_bar_offset(
 }
 
 /// Get the color for the dominant action, respecting bet/raise rank gradient.
+#[allow(dead_code)]
 fn dominant_action_color(dom_name: &str, actions: &[(String, f32)]) -> Color {
     if is_bet_or_raise(dom_name) {
         let mut sorted_names: Vec<_> = actions

@@ -69,12 +69,14 @@ pub struct GameTree {
     /// Postflop: `1 - dealer` (BB/OOP) acts first.
     pub dealer: u8,
     /// Starting stack per player (same for both). Used for terminal payoff computation.
+    #[allow(dead_code)]
     pub starting_stack: f64,
 }
 
 /// Internal state tracked during recursive tree construction.
 struct BuildState {
     /// Stacks at the start of the hand (same for both players).
+    #[allow(dead_code)]
     starting_stack: f64,
     /// Each player's current stack (depletes as bets/calls are made).
     stacks: [f64; 2],
