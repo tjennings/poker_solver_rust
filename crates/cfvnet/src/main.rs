@@ -76,7 +76,7 @@ enum Commands {
         #[arg(long)]
         threads: Option<usize>,
     },
-    /// Compare turn model against CfvSubgameSolver + RiverNetEvaluator
+    /// Compare turn model against PostFlopGame + RiverNetEvaluator
     CompareNet {
         /// Path to turn model directory
         #[arg(short, long)]
@@ -88,7 +88,7 @@ enum Commands {
         #[arg(long, default_value = "100")]
         num_spots: usize,
     },
-    /// Compare turn model against CfvSubgameSolver + ExactRiverEvaluator
+    /// Compare turn model against PostFlopGame + exact river evaluation
     CompareExact {
         /// Path to turn model directory
         #[arg(short, long)]
@@ -591,7 +591,7 @@ fn cmd_compare_net(
     let model_path = resolve_model_path(&model_dir);
     let river_path = resolve_model_path(&river_model_dir);
 
-    println!("Comparing {num_spots} turn spots against CfvSubgameSolver + RiverNetEvaluator...");
+    println!("Comparing {num_spots} turn spots against PostFlopGame + RiverNetEvaluator...");
 
     let summary = run_turn_comparison_net(&cfg, &model_path, &river_path, num_spots, cfvnet::config::resolve_seed(cfg.datagen.seed))
         .unwrap_or_else(|e| {
@@ -608,7 +608,7 @@ fn cmd_compare_exact(model_dir: PathBuf, num_spots: usize) {
     let cfg = load_model_config(&model_dir);
     let model_path = resolve_model_path(&model_dir);
 
-    println!("Comparing {num_spots} turn spots against CfvSubgameSolver + ExactRiverEvaluator...");
+    println!("Comparing {num_spots} turn spots against PostFlopGame + exact river evaluation...");
 
     let summary = run_turn_comparison_exact(&cfg, &model_path, num_spots, cfvnet::config::resolve_seed(cfg.datagen.seed)).unwrap_or_else(|e| {
         eprintln!("comparison failed: {e}");

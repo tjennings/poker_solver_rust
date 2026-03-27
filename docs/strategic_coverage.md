@@ -123,7 +123,7 @@
 | Element | Status | Notes |
 |-|-|-|
 | Blueprint strategy lookup | Covered | `BlueprintStrategy` hash map |
-| **Real-time subgame solving** | **Gap** | `SubgameCfrSolver` and `SubgameTree` exist and are tested but not wired into the play loop. Falls back to blueprint |
+| **Real-time subgame solving** | **Partial** | `PostFlopGame` with `depth_limit` provides exact subgame solving; wired into the explorer but not the play loop |
 | **Depth-limited search** | **Gap** | `SubgameConfig.depth_limit` exists but not enforced |
 | **Opponent range construction at subgame root** | **Gap** | Missing piece for subgame solving — need to derive opponent's range from blueprint reach probabilities |
 | **Safe subgame resolution** | **Gap** | No maxmargin or gift-giving at subgame boundaries (Libratus/Pluribus approach) |
@@ -159,7 +159,7 @@ The info key discards all prior-street actions. This prevents the solver from le
 **2. Real-time subgame solving**
 Without this, the solver plays a static blueprint everywhere. Pluribus demonstrated that real-time search is what makes the difference between a good solver and a superhuman one. The infrastructure exists but needs wiring.
 
-*Suggestion:* Wire `SubgameCfrSolver` into `SubgameSolver.solve()`. The missing integration pieces are: (a) construct opponent range at subgame root from blueprint reach, (b) provide continuation values at depth boundaries from blueprint, (c) enforce time budget.
+*Suggestion:* Wire `PostFlopGame` into the play loop. The missing integration pieces are: (a) construct opponent range at subgame root from blueprint reach, (b) provide continuation values at depth boundaries from blueprint, (c) enforce time budget.
 
 ### Tier 2 — Significant
 

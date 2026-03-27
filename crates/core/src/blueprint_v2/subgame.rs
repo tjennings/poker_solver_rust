@@ -1,7 +1,6 @@
 //! Subgame solver configuration.
 //!
-//! Provides the `SubgameConfig` used by the `SubgameCfrSolver` and other
-//! subgame-related components.
+//! Provides the `SubgameConfig` used by subgame solvers.
 
 /// Configuration for subgame solving
 #[derive(Debug, Clone)]

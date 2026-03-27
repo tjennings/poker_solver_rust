@@ -373,7 +373,7 @@ cargo run -p cfvnet --release -- train \
 
 #### Compare Turn Model Against River Net Evaluator
 
-Validates the turn model by comparing its predictions against fresh CfvSubgameSolver solves using the river network as leaf evaluator:
+Validates the turn model by comparing its predictions against fresh PostFlopGame solves using the river network as leaf evaluator:
 
 ```bash
 cargo run -p cfvnet --release -- compare-net \
@@ -384,7 +384,7 @@ cargo run -p cfvnet --release -- compare-net \
 
 #### Compare Turn Model Against Exact River Solves
 
-Validates the turn model against CfvSubgameSolver with exact river evaluation (solves all 46 runouts). Slow but provides ground-truth comparison:
+Validates the turn model against PostFlopGame with exact river evaluation (solves all 46 runouts). Slow but provides ground-truth comparison:
 
 ```bash
 cargo run -p cfvnet --release -- compare-exact \

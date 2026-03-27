@@ -295,10 +295,8 @@ pub(crate) fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
 /// Evaluates depth boundary nodes by computing equity against the opponent's
 /// current reach-weighted range. Returns per-combo CFVs in pot-fraction units.
 ///
-/// Unlike the old `SubgameCfrSolver` approach (which used a static scalar
-/// opponent reach), this evaluator receives the dynamically-propagated opponent
-/// range at each boundary, properly tracking which opponent combos reach each
-/// terminal.
+/// This evaluator receives the dynamically-propagated opponent range at each
+/// boundary, properly tracking which opponent combos reach each terminal.
 #[allow(dead_code)]
 struct EquityLeafEvaluator;
 
