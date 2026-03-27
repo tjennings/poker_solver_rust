@@ -1,6 +1,5 @@
 import { useState, useCallback, useMemo, useEffect } from 'react';
 import { invoke } from './invoke';
-import { useGlobalConfig } from './useGlobalConfig';
 import type {
   GameState,
 } from './game-types';
@@ -128,7 +127,6 @@ function SolveProgress({ state }: { state: GameState }) {
 // ── Main component ──────────────────────────────────────────────────────
 
 export default function GameExplorer() {
-  const { config } = useGlobalConfig();
   const [state, setState] = useState<GameState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -139,7 +137,6 @@ export default function GameExplorer() {
 
   const [blueprints, setBlueprints] = useState<{ name: string; path: string; stack_depth: number; latest_snapshot: string | null }[]>([]);
   const [bundleName, setBundleName] = useState<string | null>(null);
-  const [snapshotName, setSnapshotName] = useState<string | null>(null);
   const [solving, setSolving] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showLoadModal, setShowLoadModal] = useState(false);
@@ -151,13 +148,13 @@ export default function GameExplorer() {
   useEffect(() => {
     const init = async () => {
       try {
-        if (!config.blueprint_dir) {
+        const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
+        if (!globalConfig.blueprint_dir) {
           setError('Set Blueprint Directory in Settings first');
           return;
         }
-        setError(null);
         const list = await invoke<{ name: string; path: string; stack_depth: number; has_strategy: boolean; latest_snapshot: string | null }[]>(
-          'list_blueprints', { dir: config.blueprint_dir }
+          'list_blueprints', { dir: globalConfig.blueprint_dir }
         );
         setBlueprints(list.filter(b => b.has_strategy));
       } catch (e) {
@@ -165,7 +162,7 @@ export default function GameExplorer() {
       }
     };
     init();
-  }, [config.blueprint_dir]);
+  }, []);
 
   // ── Load a specific blueprint and start game session ────────────
 
@@ -178,8 +175,7 @@ export default function GameExplorer() {
       await invoke('game_new', {});
       const s = await invoke<GameState>('game_get_state', {});
       setState(s);
-      setBundleName(name);
-      setSnapshotName(info.snapshot_name ?? null);
+      setBundleName(info.snapshot_name ? `${name} (${info.snapshot_name})` : name);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -485,7 +481,7 @@ export default function GameExplorer() {
             <div style={{
               display: 'flex',
               flexDirection: 'column',
-              justifyContent: 'flex-start',
+              justifyContent: 'center',
               padding: '4px 8px',
               background: '#1a1a2e',
               border: '1px solid #334155',
@@ -496,11 +492,6 @@ export default function GameExplorer() {
               <div style={{ fontSize: '0.6rem', color: '#e2e8f0', fontWeight: 600, whiteSpace: 'nowrap' }}>
                 {bundleName}
               </div>
-              {snapshotName && (
-                <div style={{ fontSize: '0.5rem', color: '#94a3b8', whiteSpace: 'nowrap' }}>
-                  {snapshotName}
-                </div>
-              )}
               <button
                 style={{
                   fontSize: '0.5rem',
@@ -715,7 +706,7 @@ export default function GameExplorer() {
                         }
                         overlayText={
                           cell.ev != null
-                            ? `${cell.ev >= 0 ? '+' : ''}${cell.ev.toFixed(1)}`
+                            ? `${cell.ev >= 0 ? '+' : ''}${(cell.ev / 2).toFixed(1)}`
                             : undefined
                         }
                       />
