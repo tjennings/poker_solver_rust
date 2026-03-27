@@ -296,7 +296,19 @@ export default function GameExplorer() {
   const copySpot = useCallback(async () => {
     try {
       const spot = await invoke<string>('game_encode_spot', {});
-      await navigator.clipboard.writeText(spot);
+      // Fallback clipboard copy (works in Tauri webview where navigator.clipboard may be blocked)
+      try {
+        await navigator.clipboard.writeText(spot);
+      } catch {
+        const ta = document.createElement('textarea');
+        ta.value = spot;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch (e) {
