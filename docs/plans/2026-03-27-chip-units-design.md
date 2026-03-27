@@ -112,6 +112,19 @@ The ONLY place BB appears:
 ### CLI
 - `crates/trainer/src/inspect_spot.rs` — update display formatting
 
+## EV Convention (Confirmed Correct)
+
+Terminal payoffs use `stacks[t]` (player's remaining stack at terminal):
+- **Fold/Lose**: `EV = stacks[t] - starting_stack = -invested`
+- **Win**: `EV = (stacks[t] + pot) - starting_stack = pot - invested`
+- **Tie**: `EV = (stacks[t] + pot/2) - starting_stack = pot/2 - invested`
+
+Where `invested = starting_stack - stacks[t]` (total chips put in, including blinds).
+
+This is the standard convention. Blinds are an investment cost. BB folding preflop = -2 chips = -1BB. No changes needed to the payoff formulas — they work in any unit system.
+
+The per-node EV shown in the explorer is the strategy-weighted average across all continuations from that decision point, which is correct.
+
 ## Migration
 
 - Update all YAML configs: multiply stack_depth by 2, small_blind from 0.5→1, big_blind from 1.0→2
