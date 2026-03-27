@@ -1,11 +1,16 @@
 //! `inspect-spot` subcommand: load a blueprint and dump strategy/EV data for a spot.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
+use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
+use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 use poker_solver_tauri::{GameMatrixCell, GameSession, GameState};
+use poker_solver_tauri::postflop::CbvContext;
 #[cfg(test)]
 use poker_solver_tauri::GameAction;
 
@@ -15,7 +20,7 @@ use poker_solver_tauri::GameAction;
 /// Tauri async or State wrappers.
 fn load_blueprint(
     config_path: &Path,
-) -> Result<(BlueprintV2Config, BlueprintV2Strategy, V2GameTree, Vec<u32>), String> {
+) -> Result<(BlueprintV2Config, BlueprintV2Strategy, V2GameTree, Vec<u32>, Option<Arc<CbvContext>>), String> {
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| format!("Failed to read config: {e}"))?;
     let config: BlueprintV2Config =
@@ -68,7 +73,87 @@ fn load_blueprint(
     );
     let decision_map = tree.decision_index_map();
 
-    Ok((config, strategy, tree, decision_map))
+    // Load CbvContext (bucket files) for postflop strategy lookups.
+    let strat_dir = strat_path.parent().unwrap_or(Path::new("."));
+    let bundle_dir = &output_dir;
+
+    // Find bucket directory
+    let cluster_dir = if bundle_dir.join("buckets").exists() {
+        Some(bundle_dir.join("buckets"))
+    } else if strat_dir.join("buckets").exists() {
+        Some(strat_dir.join("buckets"))
+    } else {
+        // Try cluster_path from config
+        config.training.cluster_path.as_ref().and_then(|p| {
+            let cp = PathBuf::from(p);
+            if cp.exists() { Some(cp) } else { None }
+        })
+    };
+
+    let cbv_ctx = if let Some(cluster_dir) = cluster_dir {
+        eprintln!("[cbv] buckets dir: {}", cluster_dir.display());
+        let bucket_counts = [
+            config.clustering.preflop.buckets,
+            config.clustering.flop.buckets,
+            config.clustering.turn.buckets,
+            config.clustering.river.buckets,
+        ];
+        let mut bucket_files: [Option<BucketFile>; 4] = [None, None, None, None];
+        for (i, name) in ["preflop.buckets", "flop.buckets", "turn.buckets", "river.buckets"].iter().enumerate() {
+            let path = cluster_dir.join(name);
+            if path.exists() {
+                match BucketFile::load(&path) {
+                    Ok(bf) => bucket_files[i] = Some(bf),
+                    Err(e) => eprintln!("Warning: failed to load {}: {e}", path.display()),
+                }
+            }
+        }
+        let loaded = bucket_files.iter().filter(|f| f.is_some()).count();
+        eprintln!("[cbv] loaded {loaded}/4 bucket files");
+        let all_buckets = AllBuckets::new(bucket_counts, bucket_files);
+        let all_buckets = {
+            let per_flop = cluster_dir.join("flop_0000.buckets");
+            if per_flop.exists() {
+                all_buckets.with_per_flop_dir(cluster_dir.clone())
+            } else {
+                all_buckets
+            }
+        };
+
+        // Load CBV table if present
+        let cbv_path = strat_dir.join("cbv_p0.bin");
+        let cbv_table = if cbv_path.exists() {
+            CbvTable::load(&cbv_path).ok()
+        } else {
+            // Try bundle root
+            let alt = bundle_dir.join("cbv_p0.bin");
+            if alt.exists() { CbvTable::load(&alt).ok() } else { None }
+        };
+
+        if let Some(cbv_table) = cbv_table {
+            Some(Arc::new(CbvContext {
+                cbv_table,
+                abstract_tree: tree.clone(),
+                all_buckets: Arc::new(all_buckets),
+                strategy: Arc::new(strategy.clone()),
+            }))
+        } else {
+            // No CBV table, but still build CbvContext with a dummy for strategy lookups
+            // The CbvContext is needed for postflop matrix building even without CBV boundaries
+            let dummy_cbv = CbvTable { values: vec![], node_offsets: vec![], buckets_per_node: vec![] };
+            Some(Arc::new(CbvContext {
+                cbv_table: dummy_cbv,
+                abstract_tree: tree.clone(),
+                all_buckets: Arc::new(all_buckets),
+                strategy: Arc::new(strategy.clone()),
+            }))
+        }
+    } else {
+        eprintln!("Warning: no bucket directory found — postflop strategy will be empty");
+        None
+    };
+
+    Ok((config, strategy, tree, decision_map, cbv_ctx))
 }
 
 /// Format a strategy report from a `GameState` and print it to stdout.
@@ -174,7 +259,7 @@ fn format_report(spot: &str, state: &GameState) -> String {
 
 /// Run the inspect-spot command.
 pub fn run(config_path: &Path, spot: &str) -> Result<(), String> {
-    let (config, strategy, tree, decision_map) = load_blueprint(config_path)?;
+    let (config, strategy, tree, decision_map, cbv_ctx) = load_blueprint(config_path)?;
 
     eprintln!(
         "Blueprint: {} ({}BB stacks)",
@@ -182,6 +267,9 @@ pub fn run(config_path: &Path, spot: &str) -> Result<(), String> {
     );
 
     let mut session = GameSession::new(config, strategy, tree, decision_map, None);
+    if let Some(ctx) = cbv_ctx {
+        session.set_cbv_context(ctx);
+    }
 
     session.load_spot(spot)?;
     let state = session.get_state();

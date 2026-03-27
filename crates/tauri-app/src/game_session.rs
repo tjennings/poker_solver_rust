@@ -236,6 +236,11 @@ impl GameSession {
         }
     }
 
+    /// Set the CbvContext for postflop bucket lookups.
+    pub fn set_cbv_context(&mut self, ctx: Arc<CbvContext>) {
+        self.cbv_context = Some(ctx);
+    }
+
     /// Create a session from already-loaded exploration state.
     pub fn from_exploration_state(
         exploration: &crate::exploration::ExplorationState,
