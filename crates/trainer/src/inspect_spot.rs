@@ -268,7 +268,7 @@ fn format_report(spot: &str, state: &GameState) -> String {
                 out.push_str(&format!("{:>7.1}%", prob * 100.0));
             }
             match cell.ev {
-                Some(ev) => out.push_str(&format!("{:>+8.1}\n", ev)),
+                Some(ev) => out.push_str(&format!("{:>+8.1}\n", ev / 2.0)),
                 None => out.push_str(&format!("{:>8}\n", "-")),
             }
         }
