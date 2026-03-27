@@ -1246,20 +1246,20 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
 
 /// Adapter implementing `BoundaryEvaluator` for the range-solver.
 /// SPR=0 boundaries use exact matchup equity; SPR>0 uses RolloutLeafEvaluator.
-struct SolveBoundaryEvaluator {
+pub(crate) struct SolveBoundaryEvaluator {
     /// Private cards per player, in range-solver ordering (card ID pairs).
-    private_cards: [Vec<(u8, u8)>; 2],
+    pub(crate) private_cards: [Vec<(u8, u8)>; 2],
     /// Board cards as rs_poker Cards (for equity computation).
-    board_cards: Vec<rs_poker::core::Card>,
+    pub(crate) board_cards: Vec<rs_poker::core::Card>,
     /// Effective stack at game start.
     #[allow(dead_code)]
-    eff_stack: f64,
+    pub(crate) eff_stack: f64,
     /// Rollout evaluator for SPR>0 boundaries (None if CbvContext unavailable).
-    rollout: Option<RolloutLeafEvaluator>,
+    pub(crate) rollout: Option<RolloutLeafEvaluator>,
     /// Combos in rollout ordering + card mappings per player.
-    combos: Vec<[rs_poker::core::Card; 2]>,
+    pub(crate) combos: Vec<[rs_poker::core::Card; 2]>,
     /// Maps game private_cards index → combo index, per player.
-    game_to_combo: [Vec<usize>; 2],
+    pub(crate) game_to_combo: [Vec<usize>; 2],
 }
 
 impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {

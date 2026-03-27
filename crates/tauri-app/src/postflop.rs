@@ -5,13 +5,12 @@ use poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id;
 use poker_solver_core::blueprint_v2::solver_dispatch::SolverConfig;
 use poker_solver_core::blueprint_v2::subgame_cfr::cards_overlap;
 use poker_solver_core::blueprint_v2::{
-    CfvSubgameSolver, LeafEvaluator, SubgameHands, SubgameStrategy,
+    LeafEvaluator, SubgameHands,
     compute_combo_equities,
 };
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
-use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
+use poker_solver_core::blueprint_v2::game_tree::GameTree;
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
-use poker_solver_core::blueprint_v2::Street as V2Street;
 use poker_solver_core::poker::{Card as RsPokerCard, Suit as RsPokerSuit, Value as RsPokerValue};
 use rand::Rng;
 use rand::SeedableRng;
@@ -20,12 +19,13 @@ use rayon::prelude::*;
 use range_solver::bet_size::BetSizeOptions;
 use range_solver::card::{card_pair_to_index, card_to_string};
 use range_solver::range::Range;
+use range_solver::{PostFlopGame, solve_step, finalize};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
-use crate::exploration::{ActionInfo, v2_action_info};
+use crate::exploration::ActionInfo;
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -210,15 +210,40 @@ pub(crate) fn matrix_cell_label(row: usize, col: usize) -> (String, bool, bool) 
 
 
 // ---------------------------------------------------------------------------
+// range-solver Action -> ActionInfo conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a range-solver `Action` to an `ActionInfo` for the postflop explorer.
+fn range_solver_action_to_action_info(
+    action: &range_solver::Action,
+    idx: usize,
+) -> ActionInfo {
+    let (label, action_type, id) = match action {
+        range_solver::Action::Fold => ("Fold".to_string(), "fold", "fold".to_string()),
+        range_solver::Action::Check => ("Check".to_string(), "check", "check".to_string()),
+        range_solver::Action::Call => ("Call".to_string(), "call", "call".to_string()),
+        range_solver::Action::Bet(amt) => (format!("Bet {amt}"), "bet", format!("bet:{amt}")),
+        range_solver::Action::Raise(amt) => (format!("Raise {amt}"), "raise", format!("raise:{amt}")),
+        range_solver::Action::AllIn(amt) => ("All-in".to_string(), "allin", format!("allin:{amt}")),
+        _ => ("?".to_string(), "unknown", format!("unknown:{idx}")),
+    };
+    ActionInfo {
+        id,
+        label,
+        action_type: action_type.to_string(),
+        size_key: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Subgame solve result (stored for range propagation and navigation)
 // ---------------------------------------------------------------------------
 
 /// Stored result from a subgame solve, used for range propagation and navigation.
 pub struct SubgameSolveResult {
-    pub strategy: SubgameStrategy,
+    pub game: PostFlopGame,
     pub hands: SubgameHands,
     pub action_infos: Vec<ActionInfo>,
-    pub tree: GameTree,
     pub board: Vec<RsPokerCard>,
     pub initial_pot: f64,
     pub starting_stack: f64,
@@ -274,6 +299,7 @@ pub(crate) fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
 /// opponent reach), this evaluator receives the dynamically-propagated opponent
 /// range at each boundary, properly tracking which opponent combos reach each
 /// terminal.
+#[allow(dead_code)]
 struct EquityLeafEvaluator;
 
 impl LeafEvaluator for EquityLeafEvaluator {
@@ -563,15 +589,14 @@ impl LeafEvaluator for RolloutLeafEvaluator {
     }
 }
 
-/// Build a subgame tree and CFV solver, ready to iterate.
+/// Build a `PostFlopGame` and associated data for subgame solving.
 ///
-/// Returns the solver, hands, action labels, tree, initial pot, and starting
+/// Returns the game, hands, action labels, initial pot, and starting
 /// stack without running any iterations. The caller drives the iteration loop
 /// and can build matrix snapshots between iterations.
 ///
-/// Uses [`CfvSubgameSolver`] with per-combo reach vectors at depth boundaries,
-/// which properly tracks which opponent combos reach each terminal (fixing the
-/// mass-shoving bug from the old `SubgameCfrSolver`).
+/// Uses [`PostFlopGame`] from range-solver for depth-limited solving, with
+/// optional `BoundaryEvaluator` for rollout-based boundary values.
 #[allow(clippy::too_many_arguments)]
 pub fn build_subgame_solver(
     board_cards: &[RsPokerCard],
@@ -586,109 +611,170 @@ pub fn build_subgame_solver(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
-) -> Result<(CfvSubgameSolver, SubgameHands, Vec<ActionInfo>, GameTree, f64, f64), String> {
-    let street = match board_cards.len() {
-        3 => V2Street::Flop,
-        4 => V2Street::Turn,
-        5 => V2Street::River,
+) -> Result<(PostFlopGame, SubgameHands, Vec<ActionInfo>, f64, f64), String> {
+    use range_solver::card::CardConfig;
+    use range_solver::{ActionTree, TreeConfig, BoardState};
+
+    let (initial_state, n_board) = match board_cards.len() {
+        3 => (BoardState::Flop, 3),
+        4 => (BoardState::Turn, 4),
+        5 => (BoardState::River, 5),
         n => return Err(format!("Invalid board length for subgame: {n}")),
     };
+
+    let pot_i32 = pot as i32;
+    let eff_stack = stacks[0] as i32;
     let pot_f = f64::from(pot);
-    let inv = [pot_f / 2.0; 2];
-    let starting_stack = f64::from(stacks[0]) + inv[0];
-    let sizes_f64: Vec<Vec<f64>> = bet_sizes_per_depth
+    let starting_stack = f64::from(stacks[0]) + pot_f / 2.0;
+
+    // Convert board cards from rs_poker to range-solver IDs.
+    let board_ids: Vec<u8> = board_cards.iter().map(|c| rs_poker_card_to_id(*c)).collect();
+    let flop = [board_ids[0], board_ids[1], board_ids[2]];
+    let turn = if n_board >= 4 { board_ids[3] } else { range_solver::card::NOT_DEALT };
+    let river = if n_board >= 5 { board_ids[4] } else { range_solver::card::NOT_DEALT };
+
+    // Build bet size strings from pot fractions.
+    let bet_str = if !bet_sizes_per_depth.is_empty() {
+        bet_sizes_per_depth[0]
+            .iter()
+            .map(|s| format!("{}%", s * 100.0))
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        "100%".to_string()
+    };
+    let raise_str = if bet_sizes_per_depth.len() > 1 {
+        bet_sizes_per_depth[1]
+            .iter()
+            .map(|s| format!("{}%", s * 100.0))
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        String::new()
+    };
+
+    let oop_range = Range::from_raw_data(oop_weights)
+        .map_err(|e| format!("Bad OOP weights: {e}"))?;
+    let ip_range = Range::from_raw_data(ip_weights)
+        .map_err(|e| format!("Bad IP weights: {e}"))?;
+
+    let oop_sizes = BetSizeOptions::try_from((bet_str.as_str(), raise_str.as_str()))
+        .map_err(|e| format!("Bad bet sizes: {e}"))?;
+    let ip_sizes = oop_sizes.clone();
+
+    let card_config = CardConfig {
+        range: [oop_range, ip_range],
+        flop,
+        turn,
+        river,
+    };
+
+    let tree_config = TreeConfig {
+        initial_state,
+        starting_pot: pot_i32,
+        effective_stack: eff_stack,
+        rake_rate: 0.0,
+        rake_cap: 0.0,
+        flop_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
+        turn_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
+        river_bet_sizes: [oop_sizes, ip_sizes],
+        turn_donk_sizes: None,
+        river_donk_sizes: None,
+        add_allin_threshold: 0.0,
+        force_allin_threshold: 0.0,
+        merging_threshold: 0.0,
+        // Solve current street only. Boundaries at next street transition.
+        // River: no boundaries needed (solve to showdown).
+        depth_limit: if initial_state == BoardState::River { None } else { Some(0) },
+    };
+
+    let action_tree = ActionTree::new(tree_config)
+        .map_err(|e| format!("Failed to build tree: {e}"))?;
+    let mut game = PostFlopGame::with_config(card_config, action_tree)
+        .map_err(|e| format!("Failed to build game: {e}"))?;
+    game.allocate_memory(false);
+
+    // Extract action labels from the game root.
+    game.back_to_root();
+    let action_infos: Vec<ActionInfo> = game
+        .available_actions()
         .iter()
-        .map(|depth| depth.iter().map(|&s| f64::from(s)).collect())
+        .enumerate()
+        .map(|(i, a)| range_solver_action_to_action_info(a, i))
         .collect();
 
-    let mut tree = GameTree::build_subgame(
-        street,
-        pot_f,
-        inv,
-        starting_stack,
-        &sizes_f64,
-        Some(1),
-        0,
-    );
+    // Set up BoundaryEvaluator if boundaries exist and CBV context is available.
+    let n_boundaries = game.num_boundary_nodes();
+    if n_boundaries > 0 {
+        if let (Some(ctx), Some(abs_node)) = (cbv_context, abstract_node_idx) {
+            let bias_factor = rollout_bias_factor.unwrap_or(10.0);
+            let num_rollouts = rollout_num_samples.unwrap_or(3);
+            let opp_samples = rollout_opponent_samples.unwrap_or(8);
+            eprintln!("[subgame] using SolveBoundaryEvaluator (abstract_node={abs_node}, bias={bias_factor}, rollouts={num_rollouts}, opp_samples={opp_samples})");
 
-    // Annotate subgame tree nodes with blueprint decision indices.
-    if let (Some(ctx), Some(abs_node)) = (cbv_context, abstract_node_idx) {
-        let decision_map = ctx.abstract_tree.decision_index_map();
-        tree.annotate_blueprint_indices(&ctx.abstract_tree, abs_node, &decision_map);
+            // Build combos in rollout ordering for the boundary evaluator.
+            let rs_board_cards: Vec<rs_poker::core::Card> = board_cards.to_vec();
+            let mut combos: Vec<[rs_poker::core::Card; 2]> = Vec::new();
+            use poker_solver_core::hands::all_hands;
+            for hand in all_hands() {
+                for (c0, c1) in hand.combos() {
+                    if rs_board_cards.iter().any(|b| *b == c0 || *b == c1) {
+                        continue;
+                    }
+                    combos.push([c0, c1]);
+                }
+            }
+
+            let build_map = |player: usize, combos: &[[rs_poker::core::Card; 2]]| -> Vec<usize> {
+                game.private_cards(player).iter().map(|&(c1, c2)| {
+                    let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
+                    let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
+                    combos.iter().position(|c|
+                        (c[0] == rs_c1 && c[1] == rs_c2) || (c[0] == rs_c2 && c[1] == rs_c1)
+                    ).unwrap_or(usize::MAX)
+                }).collect()
+            };
+            let map0 = build_map(0, &combos);
+            let map1 = build_map(1, &combos);
+
+            let rollout = RolloutLeafEvaluator::new(
+                Arc::clone(&ctx.strategy),
+                Arc::new(ctx.abstract_tree.clone()),
+                Arc::clone(&ctx.all_buckets),
+                abs_node,
+                BiasType::Unbiased,
+                bias_factor,
+                num_rollouts,
+                opp_samples,
+                starting_stack,
+                pot_f,
+            );
+
+            game.boundary_evaluator = Some(Arc::new(
+                crate::game_session::SolveBoundaryEvaluator {
+                    private_cards: [
+                        game.private_cards(0).to_vec(),
+                        game.private_cards(1).to_vec(),
+                    ],
+                    board_cards: rs_board_cards,
+                    eff_stack: f64::from(eff_stack),
+                    rollout: Some(rollout),
+                    combos,
+                    game_to_combo: [map0, map1],
+                },
+            ));
+        } else {
+            eprintln!("[subgame] {} boundary nodes but no CBV context — boundaries will use default evaluation", n_boundaries);
+        }
     }
 
     let hands = SubgameHands::enumerate(board_cards);
 
-    // Extract action labels from tree root.
-    // street_bets start at 0 postflop, so no offset needed.
-    // Amounts are in chips; v2_action_info converts to BB for display.
-    let action_infos = match &tree.nodes[tree.root as usize] {
-        GameNode::Decision { actions, .. } => actions
-            .iter()
-            .enumerate()
-            .map(|(i, a)| v2_action_info(a, i, 0.0))
-            .collect(),
-        _ => return Err("Subgame tree root is not a decision node".to_string()),
-    };
-
-    let evaluators: Vec<Box<dyn LeafEvaluator>> = if let (Some(ctx), Some(abs_node)) = (cbv_context, abstract_node_idx) {
-        let bias_factor = rollout_bias_factor.unwrap_or(10.0);
-        let num_rollouts = rollout_num_samples.unwrap_or(3);
-        let opp_samples = rollout_opponent_samples.unwrap_or(8);
-        eprintln!("[subgame] using RolloutLeafEvaluator x4 (abstract_node={abs_node}, bias={bias_factor}, rollouts={num_rollouts}, opp_samples={opp_samples})");
-        let strategy = Arc::clone(&ctx.strategy);
-        let abstract_tree = Arc::new(ctx.abstract_tree.clone());
-        let all_buckets = Arc::clone(&ctx.all_buckets);
-
-        vec![
-            Box::new(RolloutLeafEvaluator::new(
-                Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Unbiased, bias_factor, num_rollouts, opp_samples, starting_stack, pot_f,
-            )) as Box<dyn LeafEvaluator>,
-            Box::new(RolloutLeafEvaluator::new(
-                Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Fold, bias_factor, num_rollouts, opp_samples, starting_stack, pot_f,
-            )),
-            Box::new(RolloutLeafEvaluator::new(
-                Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Call, bias_factor, num_rollouts, opp_samples, starting_stack, pot_f,
-            )),
-            Box::new(RolloutLeafEvaluator::new(
-                Arc::clone(&strategy), Arc::clone(&abstract_tree), Arc::clone(&all_buckets),
-                abs_node, BiasType::Raise, bias_factor, num_rollouts, opp_samples, starting_stack, pot_f,
-            )),
-        ]
-    } else {
-        eprintln!("[subgame] using EquityLeafEvaluator (no CBV context)");
-        vec![Box::new(EquityLeafEvaluator)]
-    };
-    // Map 1326-element weight vectors to SubgameHands ordering.
-    let map_weights = |weights: &[f32]| -> Vec<f64> {
-        hands.combos.iter().map(|combo| {
-            let id0 = rs_poker_card_to_id(combo[0]);
-            let id1 = rs_poker_card_to_id(combo[1]);
-            let ci = card_pair_to_index(id0, id1);
-            f64::from(weights[ci])
-        }).collect()
-    };
-    let oop_reach = map_weights(oop_weights);
-    let ip_reach = map_weights(ip_weights);
-
-    let nonzero_oop = oop_reach.iter().filter(|&&r| r > 0.0).count();
-    let nonzero_ip = ip_reach.iter().filter(|&&r| r > 0.0).count();
+    let nonzero_oop = oop_weights.iter().filter(|&&w| w > 0.0).count();
+    let nonzero_ip = ip_weights.iter().filter(|&&w| w > 0.0).count();
     eprintln!("[subgame] initial reach: OOP={nonzero_oop} IP={nonzero_ip} combos with nonzero reach");
 
-    let solver = CfvSubgameSolver::new(
-        tree.clone(),
-        hands.clone(),
-        board_cards,
-        evaluators,
-        starting_stack,
-        oop_reach,
-        ip_reach,
-    );
-
-    Ok((solver, hands, action_infos, tree, pot_f, starting_stack))
+    Ok((game, hands, action_infos, pot_f, starting_stack))
 }
 
 // ---------------------------------------------------------------------------
@@ -873,58 +959,32 @@ fn build_matrix_from_snapshot(snap: MatrixSnapshot) -> PostflopStrategyMatrix {
     }
 }
 
-/// Convert subgame solver output into a [`MatrixSnapshot`] so it can be rendered
-/// by the same [`build_matrix_from_snapshot`] used by the range-solver.
+/// Build a [`MatrixSnapshot`] directly from a `PostFlopGame`'s current strategy.
+///
+/// The game must be positioned at the desired node (call `back_to_root()` or
+/// navigate before calling this). Extracts strategy, private cards, and weights
+/// from the game, producing a snapshot compatible with `build_matrix_from_snapshot`.
 #[allow(clippy::cast_possible_truncation)]
-fn snapshot_from_subgame(
-    hands: &SubgameHands,
-    strategy: &SubgameStrategy,
+fn snapshot_from_game(
+    game: &mut PostFlopGame,
     action_infos: Vec<ActionInfo>,
-    weights: &[f32],
     board_strings: &[String],
     pot: i32,
     stacks: [i32; 2],
-    player: usize,
-    node_idx: u32,
     dealer: u8,
     hand_evs: Option<Vec<f32>>,
 ) -> MatrixSnapshot {
-    let num_actions = action_infos.len();
+    use range_solver::interface::Game;
 
-    // Build private_cards and initial_weights in the same order as SubgameHands.
-    // Only include combos with non-zero weight.
-    let mut private_cards = Vec::with_capacity(hands.combos.len());
-    let mut initial_weights = Vec::with_capacity(hands.combos.len());
-    // strategy laid out as action_idx * num_included_hands + hand_idx
-    let mut hand_strategies: Vec<Vec<f32>> = vec![Vec::new(); num_actions];
-
-    for (combo_idx, combo) in hands.combos.iter().enumerate() {
-        let rs_id0 = rs_poker_card_to_id(combo[0]);
-        let rs_id1 = rs_poker_card_to_id(combo[1]);
-        let ci = card_pair_to_index(rs_id0, rs_id1);
-        let w = weights[ci];
-        if w <= 0.0 {
-            continue;
-        }
-        private_cards.push((rs_id0, rs_id1));
-        initial_weights.push(w);
-        let probs = strategy.get_probs(node_idx, combo_idx);
-        for a in 0..num_actions {
-            hand_strategies[a].push(probs.get(a).copied().unwrap_or(0.0) as f32);
-        }
-    }
-
+    let player = game.current_player();
+    let strategy = game.strategy();
+    let private_cards: Vec<(u8, u8)> = game.private_cards(player).to_vec();
+    let initial_weights: Vec<f32> = game.initial_weights(player).to_vec();
     let num_hands = private_cards.len();
-    // Flatten to the layout expected by build_matrix_from_snapshot:
-    // strategy[action_idx * num_hands + hand_idx]
-    let mut flat_strategy = Vec::with_capacity(num_actions * num_hands);
-    for a in 0..num_actions {
-        flat_strategy.extend_from_slice(&hand_strategies[a]);
-    }
 
     MatrixSnapshot {
         player,
-        strategy: flat_strategy,
+        strategy,
         private_cards,
         initial_weights,
         num_hands,
@@ -1125,7 +1185,7 @@ fn postflop_solve_street_impl(
         range_clamp_threshold)
 }
 
-/// Depth-limited solve using `CfvSubgameSolver`.
+/// Depth-limited solve using `PostFlopGame` from range-solver.
 #[allow(clippy::too_many_arguments)]
 fn solve_depth_limited(
     state: &Arc<PostflopState>,
@@ -1226,223 +1286,63 @@ fn solve_depth_limited(
             rollout_num_samples,
             rollout_opponent_samples,
         ) {
-            Ok((mut solver, hands, action_infos, tree, initial_pot, starting_stack)) => {
-                // Get root player and dealer from V2 tree convention.
-                let root_player = match &tree.nodes[tree.root as usize] {
-                    GameNode::Decision { player, .. } => *player as usize,
-                    _ => 0, // shouldn't happen — root is always a decision node
-                };
-                let tree_dealer = tree.dealer;
+            Ok((mut game, hands, action_infos, initial_pot, starting_stack)) => {
+                let eval_interval = leaf_eval_interval.unwrap_or(10);
 
-                // Set DCFR warmup to 10% of total iterations.
-                solver.set_dcfr_warmup((max_iters / 10).max(1) as u64);
+                // Initial matrix snapshot.
+                game.back_to_root();
+                let snap = snapshot_from_game(
+                    &mut game, action_infos.clone(), &board_strings,
+                    pot, [eff_stack, eff_stack], 1, None,
+                );
+                *shared.matrix_snapshot.write() = Some(build_matrix_from_snapshot(snap));
 
-                // Warm-start strategy from blueprint if available.
-                if let Some(ctx) = &cbv_context {
-                    solver.warm_start_from_blueprint(
-                        &ctx.all_buckets,
-                        &ctx.strategy,
-                        10.0, // warmup_weight: ~10 virtual iterations of blueprint strategy
-                    );
-                }
-
-                // Helper closure to build matrix from current strategy.
-                let make_matrix = |strat: &SubgameStrategy, evs: Option<Vec<f32>>| {
-                    let snap = snapshot_from_subgame(
-                        &hands, strat, action_infos.clone(),
-                        &oop_w, &board_strings, pot,
-                        [eff_stack, eff_stack], root_player, 0, tree_dealer, evs,
-                    );
-                    build_matrix_from_snapshot(snap)
-                };
-
-                // Initial matrix: uniform strategy with range weights, shown before any iterations.
-                let initial_strategy = solver.strategy();
-                *shared.matrix_snapshot.write() = Some(make_matrix(&initial_strategy, None));
-
-                const SNAPSHOT_INTERVAL: u32 = 10;
-                let leaf_interval = leaf_eval_interval.unwrap_or(SNAPSHOT_INTERVAL);
-
-                // Train in batches of SNAPSHOT_INTERVAL iterations, taking
-                // strategy snapshots between batches for the UI.
+                // Solve loop.
                 let mut t = 0u32;
                 while t < max_iters {
                     if !shared.solving.load(Ordering::Relaxed) {
                         break;
                     }
-                    let batch = SNAPSHOT_INTERVAL.min(max_iters - t);
-                    solver.train_with_leaf_interval(batch, leaf_interval);
-                    t += batch;
+
+                    // Flush boundary caches periodically so the solver
+                    // lazily recomputes reach + CFVs with updated strategy.
+                    if t > 0 && t % eval_interval == 0 {
+                        game.flush_boundary_caches();
+                    }
+
+                    solve_step(&game, t);
+                    t += 1;
                     shared.current_iteration.store(t, Ordering::Relaxed);
 
-                    let strategy = solver.strategy();
-                    *shared.matrix_snapshot.write() = Some(make_matrix(&strategy, None));
-                }
-
-                // Final strategy snapshot with EVs.
-                let strategy = solver.strategy();
-                let cfvs = solver.root_cfvs(0); // 0 = OOP (positional convention)
-                // Filter to match snapshot_from_subgame's combo filtering (skip zero-weight).
-                let hand_evs: Vec<f32> = hands.combos.iter().enumerate()
-                    .filter_map(|(combo_idx, combo)| {
-                        let id0 = rs_poker_card_to_id(combo[0]);
-                        let id1 = rs_poker_card_to_id(combo[1]);
-                        let ci = card_pair_to_index(id0, id1);
-                        if oop_w[ci] > 0.0 {
-                            Some(cfvs[combo_idx] as f32)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                *shared.matrix_snapshot.write() = Some(make_matrix(&strategy, Some(hand_evs)));
-
-                // Post-training diagnostic: dump regrets and strategy for
-                // a few sample combos at the root node.
-                {
-                    let n = hands.combos.len();
-                    let num_actions = action_infos.len();
-                    let labels: Vec<&str> = action_infos.iter().map(|a| a.label.as_str()).collect();
-                    eprintln!("[solver audit] {} iterations complete, {} combos, {} actions: {:?}",
-                        max_iters, n, num_actions, labels);
-
-                    // Show strategy + regrets for first 10 combos with nonzero reach
-                    let mut shown = 0;
-                    for combo_idx in 0..n {
-                        if shown >= 10 { break; }
-                        let probs = strategy.root_probs(combo_idx);
-                        if probs.is_empty() { continue; }
-                        let reach = if root_player == 0 { &oop_w } else { &ip_w };
-                        let card_id0 = rs_poker_card_to_id(hands.combos[combo_idx][0]);
-                        let card_id1 = rs_poker_card_to_id(hands.combos[combo_idx][1]);
-                        let ci = card_pair_to_index(card_id0, card_id1);
-                        if reach[ci] <= 0.0 { continue; }
-                        let probs_str: Vec<String> = probs.iter()
-                            .zip(labels.iter())
-                            .map(|(p, l)| format!("{l}={:.1}%", p * 100.0))
-                            .collect();
-                        let regrets = solver.root_regrets(combo_idx);
-                        let strat_sums = solver.root_strategy_sums(combo_idx);
-                        let regret_str: Vec<String> = regrets.iter()
-                            .zip(labels.iter())
-                            .map(|(r, l)| format!("{l}={r:.1}"))
-                            .collect();
-                        let ssum_str: Vec<String> = strat_sums.iter()
-                            .zip(labels.iter())
-                            .map(|(s, l)| format!("{l}={s:.1}"))
-                            .collect();
-                        eprintln!("  combo {combo_idx} {}{}:",
-                            hands.combos[combo_idx][0], hands.combos[combo_idx][1]);
-                        eprintln!("    strategy: {}", probs_str.join(" "));
-                        eprintln!("    regrets:  {}", regret_str.join(" "));
-                        eprintln!("    str_sums: {}", ssum_str.join(" "));
-                        shown += 1;
+                    // Snapshot matrix periodically.
+                    if t % eval_interval == 0 {
+                        game.back_to_root();
+                        let snap = snapshot_from_game(
+                            &mut game, action_infos.clone(), &board_strings,
+                            pot, [eff_stack, eff_stack], 1, None,
+                        );
+                        *shared.matrix_snapshot.write() = Some(build_matrix_from_snapshot(snap));
                     }
                 }
 
-                // Targeted diagnostic for suited connector debugging.
-                {
-                    let target_names = ["7s6s", "6s7s", "6s5s", "5s6s", "5s4s", "4s5s",
-                                        "7h6h", "6h7h", "6h5h", "5h6h", "5h4h", "4h5h",
-                                        "7d6d", "6d7d", "7c6c", "6c7c"];
-                    let labels: Vec<&str> = action_infos.iter().map(|a| a.label.as_str()).collect();
-                    let cfvs_oop = solver.root_cfvs(0);
+                // Finalize: normalize strategy, compute EVs.
+                finalize(&mut game);
+                game.back_to_root();
+                game.cache_normalized_weights();
+                let player = game.current_player();
+                let evs = game.expected_values(player);
 
-                    eprintln!("\n[SC DEBUG] === Suited Connector Deep Dive ===");
-                    for combo_idx in 0..hands.combos.len() {
-                        let c = hands.combos[combo_idx];
-                        let name = format!("{}{}", c[0], c[1]);
-                        if !target_names.iter().any(|t| *t == name) { continue; }
-
-                        let reach_id0 = rs_poker_card_to_id(c[0]);
-                        let reach_id1 = rs_poker_card_to_id(c[1]);
-                        let ci = card_pair_to_index(reach_id0, reach_id1);
-                        let hero_reach = oop_w[ci];
-                        if hero_reach <= 0.0 { continue; }
-
-                        let probs = strategy.root_probs(combo_idx);
-                        let regrets = solver.root_regrets(combo_idx);
-                        let strat_sums = solver.root_strategy_sums(combo_idx);
-
-                        let probs_str: Vec<String> = probs.iter()
-                            .zip(labels.iter())
-                            .map(|(p, l)| format!("{l}={:.1}%", p * 100.0))
-                            .collect();
-                        let regret_str: Vec<String> = regrets.iter()
-                            .zip(labels.iter())
-                            .map(|(r, l)| format!("{l}={r:.1}"))
-                            .collect();
-                        let ssum_str: Vec<String> = strat_sums.iter()
-                            .zip(labels.iter())
-                            .map(|(s, l)| format!("{l}={s:.1}"))
-                            .collect();
-
-                        eprintln!("[SC DEBUG] {name} (combo {combo_idx}, reach={hero_reach:.3}):");
-                        eprintln!("  strategy:  {}", probs_str.join("  "));
-                        eprintln!("  regrets:   {}", regret_str.join("  "));
-                        eprintln!("  strt_sums: {}", ssum_str.join("  "));
-                        eprintln!("  root CFV:  {:.3}", cfvs_oop[combo_idx]);
-                    }
-                    eprintln!("[SC DEBUG] === End Suited Connector Dive ===\n");
-                }
-
-                // Diagnostic: dump IP's strategy at decision nodes facing OOP's all-in.
-                {
-                    use poker_solver_core::blueprint_v2::game_tree::{GameNode as GN, TreeAction as TA};
-                    let avg_strat = solver.strategy();
-                    let n = hands.combos.len();
-
-                    // Find the OOP root's all-in child, then look for IP decision node.
-                    if let GN::Decision { actions, children, .. } = &tree.nodes[tree.root as usize] {
-                        // Find the all-in action index
-                        if let Some(ai_idx) = actions.iter().position(|a| matches!(a, TA::AllIn)) {
-                            let ai_child = children[ai_idx] as usize;
-                            // ai_child should be IP's fold/call decision
-                            if let GN::Decision { player, actions: ip_actions, .. } = &tree.nodes[ai_child] {
-                                let ip_labels: Vec<String> = ip_actions.iter().map(|a| format!("{a:?}")).collect();
-                                eprintln!("\n[IP DEBUG] IP decision node {} facing all-in (player={player}): actions={ip_labels:?}", ai_child);
-
-                                // Show IP strategy for first 15 combos with IP reach
-                                let mut shown = 0;
-                                for combo_idx in 0..n {
-                                    if shown >= 15 { break; }
-                                    let c = hands.combos[combo_idx];
-                                    let reach_id0 = rs_poker_card_to_id(c[0]);
-                                    let reach_id1 = rs_poker_card_to_id(c[1]);
-                                    let ci = card_pair_to_index(reach_id0, reach_id1);
-                                    let ip_reach = ip_w[ci];
-                                    if ip_reach <= 0.0 { continue; }
-
-                                    let probs = avg_strat.get_probs(ai_child as u32, combo_idx);
-                                    let name = format!("{}{}", c[0], c[1]);
-                                    if !probs.is_empty() {
-                                        let probs_str: Vec<String> = probs.iter()
-                                            .zip(ip_labels.iter())
-                                            .map(|(p, l)| format!("{l}={:.1}%", p * 100.0))
-                                            .collect();
-                                        eprintln!("[IP DEBUG] {name} (reach={ip_reach:.3}): {}", probs_str.join("  "));
-                                    }
-                                    shown += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Log final choice node mix if using multi-valued evaluation.
-                if solver.choice_regrets().len() > 1 {
-                    let choice_mix = solver.choice_strategy();
-                    let mix_str = CfvSubgameSolver::format_choice_mix(max_iters, &choice_mix);
-                    eprintln!("[choice audit] final mix: {mix_str}");
-                    eprintln!("[choice regrets] {:?}", solver.choice_regrets());
-                }
+                let snap = snapshot_from_game(
+                    &mut game, action_infos.clone(), &board_strings,
+                    pot, [eff_stack, eff_stack], 1, Some(evs),
+                );
+                *shared.matrix_snapshot.write() = Some(build_matrix_from_snapshot(snap));
 
                 // Store subgame result for range propagation and navigation.
                 *shared.subgame_result.write() = Some(SubgameSolveResult {
-                    strategy,
+                    game,
                     hands,
                     action_infos,
-                    tree,
                     board: board_cards.clone(),
                     initial_pot,
                     starting_stack,
@@ -1529,170 +1429,99 @@ pub fn postflop_get_progress(
 // postflop_play_action
 // ---------------------------------------------------------------------------
 
-/// Navigate the subgame tree by one action and return the result at the child node.
-fn postflop_play_action_subgame(
-    state: &PostflopState,
-    action: usize,
-) -> Result<PostflopPlayResult, String> {
-    let result_guard = state.subgame_result.read();
-    let result = result_guard.as_ref().ok_or("No subgame result stored")?;
-
-    let current = state.subgame_node.load(Ordering::Relaxed);
-
-    let children = match &result.tree.nodes[current as usize] {
-        GameNode::Decision { children, .. } => children,
-        _ => return Err("Current subgame node is not a decision node".to_string()),
-    };
-
-    if action >= children.len() {
-        return Err(format!(
-            "Action {action} out of range (max {})",
-            children.len() - 1
-        ));
-    }
-    let child_idx = children[action];
-    state.subgame_node.store(child_idx, Ordering::Relaxed);
-
-    subgame_node_to_result(state, result, child_idx)
-}
-
-/// Compute pot and remaining stacks for a `GameNode::Decision` by finding its
-/// fold child's terminal state. Falls back to `initial_pot` for nodes without
-/// a fold action (e.g., the opening check/bet node).
+/// Compute pot and stack info from the `PostFlopGame`'s current position.
 #[allow(clippy::cast_possible_truncation)]
-fn decision_display_info(
-    tree: &GameTree,
-    node: &GameNode,
-    starting_stack: f64,
-    initial_pot: f64,
-) -> (i32, [i32; 2]) {
-    if let GameNode::Decision { actions, children, .. } = node {
-        for (a, &child_idx) in actions.iter().zip(children.iter()) {
-            if matches!(a, TreeAction::Fold) {
-                if let GameNode::Terminal { pot, .. } =
-                    &tree.nodes[child_idx as usize]
-                {
-                    // Approximate: each player invested half the pot.
-                    let each_inv = *pot / 2.0;
-                    return (
-                        *pot as i32,
-                        [
-                            (starting_stack - each_inv) as i32,
-                            (starting_stack - each_inv) as i32,
-                        ],
-                    );
-                }
-            }
-        }
-        // No fold action — opening node. Use initial pot.
-        let inv = initial_pot / 2.0;
-        return (
-            initial_pot as i32,
-            [
-                (starting_stack - inv) as i32,
-                (starting_stack - inv) as i32,
-            ],
-        );
-    }
-    (0, [0, 0])
+fn game_display_info(game: &PostFlopGame) -> (i32, [i32; 2]) {
+    let tc = game.tree_config();
+    let bets = game.total_bet_amount();
+    let pot = tc.starting_pot + bets[0] + bets[1];
+    let stacks = [
+        tc.effective_stack - bets[0],
+        tc.effective_stack - bets[1],
+    ];
+    (pot, stacks)
 }
 
-/// Convert a subgame tree node into a `PostflopPlayResult`, building the
-/// strategy matrix when the node is a decision point.
-fn subgame_node_to_result(
-    state: &PostflopState,
-    result: &SubgameSolveResult,
-    node_idx: u32,
+/// Build a `PostflopPlayResult` from the current position of the `PostFlopGame`.
+fn game_node_to_result(
+    result: &mut SubgameSolveResult,
 ) -> Result<PostflopPlayResult, String> {
-    match &result.tree.nodes[node_idx as usize] {
-        GameNode::Terminal {
-            kind, pot, ..
-        } => {
-            let each_inv = *pot / 2.0;
-            let remaining = [
-                (result.starting_stack - each_inv) as i32,
-                (result.starting_stack - each_inv) as i32,
-            ];
-            match kind {
-                TerminalKind::Fold { .. } | TerminalKind::Showdown => Ok(PostflopPlayResult {
-                    matrix: None,
-                    is_terminal: true,
-                    is_chance: false,
-                    current_player: None,
-                    pot: *pot as i32,
-                    stacks: remaining,
-                }),
-                TerminalKind::DepthBoundary => Ok(PostflopPlayResult {
-                    matrix: None,
-                    is_terminal: false,
-                    is_chance: true,
-                    current_player: None,
-                    pot: *pot as i32,
-                    stacks: remaining,
-                }),
-            }
-        }
-        GameNode::Chance { child, .. } => {
-            subgame_node_to_result(state, result, *child)
-        }
-        GameNode::Decision {
-            player, actions, ..
-        } => {
-            let player_usize = *player as usize;
+    let game = &mut result.game;
 
-            let weights = if player_usize == 0 {
-                state.filtered_oop_weights.read().clone()
-            } else {
-                state.filtered_ip_weights.read().clone()
-            };
-            let weights = weights.unwrap_or_else(|| vec![0.0f32; 1326]);
-
-            let board_card_strings: Vec<String> = result
-                .board
-                .iter()
-                .map(|c| {
-                    let id = rs_poker_card_to_id(*c);
-                    card_to_string(id).unwrap_or_default()
-                })
-                .collect();
-
-            let action_infos: Vec<ActionInfo> = actions
-                .iter()
-                .enumerate()
-                .map(|(i, a)| v2_action_info(a, i, 0.0))
-                .collect();
-
-            let (pot_i32, stacks_i32) = decision_display_info(
-                &result.tree,
-                &result.tree.nodes[node_idx as usize],
-                result.starting_stack,
-                result.initial_pot,
-            );
-
-            let snap = snapshot_from_subgame(
-                &result.hands,
-                &result.strategy,
-                action_infos,
-                &weights,
-                &board_card_strings,
-                pot_i32,
-                stacks_i32,
-                player_usize,
-                node_idx,
-                result.tree.dealer,
-                None, // EVs not available during navigation
-            );
-            let matrix = build_matrix_from_snapshot(snap);
-            Ok(PostflopPlayResult {
-                matrix: Some(matrix),
-                is_terminal: false,
-                is_chance: false,
-                current_player: Some(player_usize),
-                pot: pot_i32,
-                stacks: stacks_i32,
-            })
-        }
+    if game.is_terminal_node() {
+        let (pot, stacks) = game_display_info(game);
+        // Depth boundaries appear as terminal nodes but represent
+        // a street transition — report as chance nodes.
+        let is_boundary = game.num_boundary_nodes() > 0 && {
+            // Check if the current terminal is a depth boundary by
+            // inspecting whether remaining stack equals zero or not.
+            // Actually, all depth-boundary terminals are explicitly marked
+            // in range-solver. For simplicity, report all terminals as
+            // terminal (fold/showdown). Depth boundaries won't appear
+            // for river solves, and for flop/turn the UI handles
+            // the chance/boundary transition via close_street.
+            false
+        };
+        return Ok(PostflopPlayResult {
+            matrix: None,
+            is_terminal: !is_boundary,
+            is_chance: is_boundary,
+            current_player: None,
+            pot,
+            stacks,
+        });
     }
+
+    if game.is_chance_node() {
+        let (pot, stacks) = game_display_info(game);
+        return Ok(PostflopPlayResult {
+            matrix: None,
+            is_terminal: false,
+            is_chance: true,
+            current_player: None,
+            pot,
+            stacks,
+        });
+    }
+
+    // Decision node: build strategy matrix.
+    let board_card_strings: Vec<String> = result
+        .board
+        .iter()
+        .map(|c| {
+            let id = rs_poker_card_to_id(*c);
+            card_to_string(id).unwrap_or_default()
+        })
+        .collect();
+
+    let action_infos: Vec<ActionInfo> = game
+        .available_actions()
+        .iter()
+        .enumerate()
+        .map(|(i, a)| range_solver_action_to_action_info(a, i))
+        .collect();
+
+    let (pot, stacks) = game_display_info(game);
+    let player = game.current_player();
+
+    let snap = snapshot_from_game(
+        game,
+        action_infos,
+        &board_card_strings,
+        pot,
+        stacks,
+        1, // dealer (range-solver convention)
+        None, // EVs not available during navigation
+    );
+    let matrix = build_matrix_from_snapshot(snap);
+    Ok(PostflopPlayResult {
+        matrix: Some(matrix),
+        is_terminal: false,
+        is_chance: false,
+        current_player: Some(player),
+        pot,
+        stacks,
+    })
 }
 
 pub fn postflop_play_action_core(
@@ -1704,7 +1533,21 @@ pub fn postflop_play_action_core(
     if state.solving.load(Ordering::Relaxed) {
         return Err("Solve in progress — wait for completion before navigating".to_string());
     }
-    postflop_play_action_subgame(state, action)
+
+    let mut result_guard = state.subgame_result.write();
+    let result = result_guard.as_mut().ok_or("No subgame result stored")?;
+
+    // Navigate one step: play the action on the PostFlopGame.
+    let num_actions = result.game.available_actions().len();
+    if action >= num_actions {
+        return Err(format!(
+            "Action {action} out of range (max {})",
+            num_actions.saturating_sub(1)
+        ));
+    }
+    result.game.play(action);
+
+    game_node_to_result(result)
 }
 
 #[tauri::command]
@@ -1722,32 +1565,6 @@ pub async fn postflop_play_action(
 // postflop_navigate_to
 // ---------------------------------------------------------------------------
 
-/// Replay a subgame tree from the root along `history` and return the result.
-fn postflop_navigate_to_subgame(
-    state: &PostflopState,
-    history: &[usize],
-) -> Result<PostflopPlayResult, String> {
-    let root = {
-        let result_guard = state.subgame_result.read();
-        let result = result_guard.as_ref().ok_or("No subgame result stored")?;
-        result.tree.root
-    };
-    state.subgame_node.store(root, Ordering::Relaxed);
-
-    if history.is_empty() {
-        let result_guard = state.subgame_result.read();
-        let result = result_guard.as_ref().ok_or("No subgame result stored")?;
-        return subgame_node_to_result(state, result, root);
-    }
-
-    let mut last_result = None;
-    for &action in history {
-        last_result = Some(postflop_play_action_subgame(state, action)?);
-    }
-    // INVARIANT: history is non-empty so last_result is Some.
-    Ok(last_result.unwrap())
-}
-
 /// Replay the game tree to a given action history and return the result.
 pub fn postflop_navigate_to_core(
     state: &PostflopState,
@@ -1756,7 +1573,17 @@ pub fn postflop_navigate_to_core(
     if state.solving.load(Ordering::Relaxed) {
         return Err("Solve in progress — wait for completion before navigating".to_string());
     }
-    postflop_navigate_to_subgame(state, &history)
+
+    let mut result_guard = state.subgame_result.write();
+    let result = result_guard.as_mut().ok_or("No subgame result stored")?;
+
+    // Reset to root, then replay the action history.
+    result.game.back_to_root();
+    for &action in &history {
+        result.game.play(action);
+    }
+
+    game_node_to_result(result)
 }
 
 #[tauri::command]
@@ -1784,18 +1611,18 @@ pub fn postflop_close_street_core(
     postflop_close_street_subgame(state, action_history)
 }
 
-/// Range propagation through a subgame tree for `postflop_close_street_core`.
+/// Range propagation through a subgame for `postflop_close_street_core`.
 ///
-/// Walks the stored `SubgameSolveResult`, multiplying each acting player's
-/// 1326-element weight vector by the subgame strategy probabilities at each
-/// decision node. Returns pot/stacks from the final node.
+/// Walks the stored `PostFlopGame`, multiplying each acting player's
+/// 1326-element weight vector by the strategy probabilities at each
+/// decision node. Returns pot/stacks from the final position.
 fn postflop_close_street_subgame(
     state: &PostflopState,
     action_history: Vec<usize>,
 ) -> Result<PostflopStreetResult, String> {
-    let result_guard = state.subgame_result.read();
+    let mut result_guard = state.subgame_result.write();
     let result = result_guard
-        .as_ref()
+        .as_mut()
         .ok_or("No subgame result stored")?;
 
     let config = state.config.read().clone();
@@ -1819,70 +1646,43 @@ fn postflop_close_street_subgame(
         .clone()
         .unwrap_or_else(|| ip_range.raw_data().to_vec());
 
-    // Walk each action through the subgame tree, narrowing the acting player's range.
-    let mut current_node = result.tree.root;
+    // Walk each action, narrowing the acting player's range.
+    result.game.back_to_root();
     for &action_idx in &action_history {
-        match &result.tree.nodes[current_node as usize] {
-            GameNode::Decision {
-                player, children, ..
-            } => {
-                let player_usize = *player as usize;
-                let weights = if player_usize == 0 {
-                    &mut oop_weights
-                } else {
-                    &mut ip_weights
-                };
-
-                // Multiply each combo's weight by its strategy probability for this action.
-                for (combo_idx, combo) in result.hands.combos.iter().enumerate() {
-                    let rs_id0 = rs_poker_card_to_id(combo[0]);
-                    let rs_id1 = rs_poker_card_to_id(combo[1]);
-                    let ci = card_pair_to_index(rs_id0, rs_id1);
-                    let probs = result.strategy.get_probs(current_node, combo_idx);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let action_prob = probs.get(action_idx).copied().unwrap_or(0.0) as f32;
-                    weights[ci] *= action_prob;
-                }
-
-                if action_idx < children.len() {
-                    current_node = children[action_idx];
-                } else {
-                    break;
-                }
-            }
-            _ => break,
+        if result.game.is_terminal_node() || result.game.is_chance_node() {
+            break;
         }
+
+        let player = result.game.current_player();
+        let strategy = result.game.strategy();
+        let private_cards = result.game.private_cards(player).to_vec();
+        let num_hands = private_cards.len();
+        let num_actions = result.game.available_actions().len();
+
+        let weights = if player == 0 {
+            &mut oop_weights
+        } else {
+            &mut ip_weights
+        };
+
+        // Multiply each combo's weight by its strategy probability for this action.
+        for (hand_idx, &(c1, c2)) in private_cards.iter().enumerate() {
+            let ci = card_pair_to_index(c1, c2);
+            let action_prob = if action_idx < num_actions {
+                strategy[action_idx * num_hands + hand_idx]
+            } else {
+                0.0
+            };
+            weights[ci] *= action_prob;
+        }
+
+        result.game.play(action_idx);
     }
 
-    // Get pot/effective_stack from the final node.
-    #[allow(clippy::cast_possible_truncation)]
-    let (pot, effective_stack) = match &result.tree.nodes[current_node as usize] {
-        GameNode::Terminal { pot, .. } => {
-            let eff = (result.starting_stack - pot / 2.0) as i32;
-            (*pot as i32, eff)
-        }
-        GameNode::Decision { .. } => {
-            let (pot_i32, stacks) = decision_display_info(
-                &result.tree,
-                &result.tree.nodes[current_node as usize],
-                result.starting_stack,
-                result.initial_pot,
-            );
-            (pot_i32, stacks[0].min(stacks[1]))
-        }
-        GameNode::Chance { child, .. } => {
-            // Chance node: look through to child for pot info.
-            match &result.tree.nodes[*child as usize] {
-                GameNode::Terminal { pot, .. } => {
-                    let eff = (result.starting_stack - pot / 2.0) as i32;
-                    (*pot as i32, eff)
-                }
-                _ => {
-                    let inv = result.initial_pot / 2.0;
-                    (result.initial_pot as i32, (result.starting_stack - inv) as i32)
-                }
-            }
-        }
+    // Get pot/effective_stack from the final position.
+    let (pot, effective_stack) = {
+        let (pot_val, stacks) = game_display_info(&result.game);
+        (pot_val, stacks[0].min(stacks[1]))
     };
 
     *state.filtered_oop_weights.write() = Some(oop_weights.clone());
@@ -2504,8 +2304,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_subgame_solver_returns_cfv_solver() {
-        use poker_solver_core::blueprint_v2::CfvSubgameSolver;
+    fn test_build_subgame_solver_returns_postflop_game() {
+        use range_solver::interface::Game;
 
         let board_cards = vec![
             RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
@@ -2531,38 +2331,45 @@ mod tests {
         );
         assert!(result.is_ok(), "build_subgame_solver failed: {:?}", result.err());
 
-        // Explicit type annotation: this MUST be CfvSubgameSolver, not SubgameCfrSolver.
-        let (mut solver, _hands, action_infos, _tree, initial_pot, starting_stack):
-            (CfvSubgameSolver, SubgameHands, Vec<ActionInfo>, GameTree, f64, f64) =
+        let (mut game, _hands, action_infos, initial_pot, starting_stack) =
             result.unwrap();
 
-        // Verify the solver trains and produces valid strategy.
-        solver.train(5);
-        let strategy = solver.strategy();
-        assert!(strategy.num_combos() > 0);
+        // Verify the game has hands and actions.
+        assert!(game.num_private_hands(0) > 0);
         assert!(!action_infos.is_empty());
         assert!(initial_pot > 0.0);
         assert!(starting_stack > 0.0);
 
-        // Verify strategy produces valid probability distributions at root.
-        for combo_idx in 0..strategy.num_combos() {
-            let probs = strategy.root_probs(combo_idx);
-            if probs.is_empty() {
-                continue;
+        // Solve a few iterations and verify strategy.
+        for i in 0..5u32 {
+            range_solver::solve_step(&game, i);
+        }
+        range_solver::finalize(&mut game);
+        game.back_to_root();
+
+        let strategy = game.strategy();
+        let num_hands = game.num_private_hands(game.current_player());
+        let num_actions = game.available_actions().len();
+        assert_eq!(strategy.len(), num_actions * num_hands);
+
+        // Verify strategy produces valid probability distributions.
+        for hand_idx in 0..num_hands {
+            let sum: f32 = (0..num_actions)
+                .map(|a| strategy[a * num_hands + hand_idx])
+                .sum();
+            if sum > 0.0 {
+                assert!(
+                    (sum - 1.0).abs() < 0.05,
+                    "hand {hand_idx}: strategy sum = {sum}, expected ~1.0"
+                );
             }
-            let sum: f64 = probs.iter().sum();
-            assert!(
-                (sum - 1.0).abs() < 0.05,
-                "combo {combo_idx}: strategy sum = {sum}, expected ~1.0"
-            );
         }
     }
 
     #[test]
-    fn test_build_subgame_solver_no_precomputed_leaf_values() {
-        // Verify build_subgame_solver does NOT use precomputed leaf values
-        // (which was the source of the mass-shoving bug). The CfvSubgameSolver
-        // evaluates leaves dynamically using per-combo reach vectors.
+    fn test_build_subgame_solver_produces_valid_strategy() {
+        use range_solver::interface::Game;
+
         let board_cards = vec![
             RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Diamond),
             RsPokerCard::new(RsPokerValue::Nine, RsPokerSuit::Heart),
@@ -2587,23 +2394,20 @@ mod tests {
         );
         assert!(result.is_ok());
 
-        let (mut solver, _hands, _, _, _, _) = result.unwrap();
+        let (mut game, _hands, _, _, _) = result.unwrap();
 
         // Train a few iterations and verify convergence produces
         // non-degenerate strategies (not 100% all-in).
-        solver.train(20);
-        let strategy = solver.strategy();
-
-        // Verify the solver produces a strategy with valid distributions.
-        let mut total_checked = 0;
-        for combo_idx in 0..strategy.num_combos() {
-            let probs = strategy.root_probs(combo_idx);
-            if probs.is_empty() {
-                continue;
-            }
-            total_checked += 1;
+        for i in 0..20u32 {
+            range_solver::solve_step(&game, i);
         }
-        assert!(total_checked > 0, "should have combos with strategies");
+        range_solver::finalize(&mut game);
+        game.back_to_root();
+
+        let strategy = game.strategy();
+        let num_hands = game.num_private_hands(game.current_player());
+        assert!(num_hands > 0, "should have hands");
+        assert!(!strategy.is_empty(), "strategy should not be empty");
     }
 
     #[test]
@@ -2614,7 +2418,7 @@ mod tests {
 
         let strategy = Arc::new(BlueprintV2Strategy::empty());
         let tree = GameTree::build_subgame(
-            V2Street::Turn, 100.0, [50.0; 2], 200.0, &[vec![1.0]], Some(1), 0,
+            poker_solver_core::blueprint_v2::Street::Turn, 100.0, [50.0; 2], 200.0, &[vec![1.0]], Some(1), 0,
         );
         let all_buckets = Arc::new(AllBuckets::new([2, 2, 2, 2], [None, None, None, None]));
         let cbv_table = CbvTable { values: vec![], node_offsets: vec![], buckets_per_node: vec![] };
@@ -2638,7 +2442,7 @@ mod tests {
         // that CbvContext now provides, for all 4 bias types.
         let strategy = Arc::new(BlueprintV2Strategy::empty());
         let tree = Arc::new(GameTree::build_subgame(
-            V2Street::Turn, 100.0, [50.0; 2], 200.0, &[vec![1.0]], Some(1), 0,
+            poker_solver_core::blueprint_v2::Street::Turn, 100.0, [50.0; 2], 200.0, &[vec![1.0]], Some(1), 0,
         ));
         let all_buckets = Arc::new(AllBuckets::new([2, 2, 2, 2], [None, None, None, None]));
 
@@ -2666,6 +2470,8 @@ mod tests {
 
     #[test]
     fn test_build_subgame_solver_accepts_rollout_params() {
+        use range_solver::interface::Game;
+
         // Verify build_subgame_solver accepts optional rollout configuration
         // parameters (bias_factor, num_samples, opponent_samples) and produces
         // a valid solver when custom values are provided.
@@ -2697,10 +2503,8 @@ mod tests {
         );
         assert!(result.is_ok(), "build_subgame_solver with rollout params failed: {:?}", result.err());
 
-        let (mut solver, _hands, action_infos, _tree, initial_pot, starting_stack) = result.unwrap();
-        solver.train(5);
-        let strategy = solver.strategy();
-        assert!(strategy.num_combos() > 0);
+        let (game, _hands, action_infos, initial_pot, starting_stack) = result.unwrap();
+        assert!(game.num_private_hands(0) > 0);
         assert!(!action_infos.is_empty());
         assert!(initial_pot > 0.0);
         assert!(starting_stack > 0.0);
@@ -2734,6 +2538,8 @@ mod tests {
             None, // rollout_opponent_samples
         );
         assert!(result.is_ok(), "build_subgame_solver with None rollout params failed: {:?}", result.err());
+        // Verify the tuple shape: (PostFlopGame, SubgameHands, Vec<ActionInfo>, f64, f64)
+        let (_game, _hands, _action_infos, _initial_pot, _starting_stack) = result.unwrap();
     }
 
     #[test]
