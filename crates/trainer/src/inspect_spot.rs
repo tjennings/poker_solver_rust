@@ -1,6 +1,6 @@
 //! `inspect-spot` subcommand: load a blueprint and dump strategy/EV data for a spot.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
@@ -22,10 +22,7 @@ fn load_blueprint(
         serde_yaml::from_str(&yaml).map_err(|e| format!("Failed to parse config: {e}"))?;
 
     // Determine strategy path: look relative to the config file's directory
-    let config_dir = config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let output_dir = config_dir.join(&config.snapshots.output_dir);
+    let output_dir = PathBuf::from(&config.snapshots.output_dir);
 
     // Search for strategy.bin in standard locations
     let strat_path = if output_dir.join("final/strategy.bin").exists() {
