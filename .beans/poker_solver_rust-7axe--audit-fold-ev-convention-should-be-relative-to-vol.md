@@ -3,17 +3,20 @@
 title: Audit fold EV convention — should be relative to voluntary investment
 status: todo
 type: task
+priority: normal
 created_at: 2026-03-27T15:49:59Z
-updated_at: 2026-03-27T15:49:59Z
+updated_at: 2026-03-27T15:52:21Z
 ---
 
-Current EV tracking reports fold EVs relative to starting stack (including blinds). BB folding preflop shows -1BB instead of 0. Need to verify the convention matches commercial solvers (PioSOLVER, GTO Wizard) and fix if needed.
+Terminal payoff formulas are already correct:
+- Fold/Lose: EV = -invested (stacks[t] - starting_stack)
+- Win: EV = pot - invested
+- Tie: EV = pot/2 - invested
 
-## TODO
-- [ ] Check how PioSOLVER/GTO Wizard report fold EVs
-- [ ] Check if this affects CFR regret computation (not just display)
-- [ ] If regrets use the same convention, verify it doesn't distort strategy
-- [ ] Decide: relative to starting stack vs relative to voluntary investment
-- [ ] Fix EV tracker accumulation or display conversion accordingly
+This matches standard convention. Blinds are an investment cost.
+BB folding preflop = -2 chips (-1BB) which is correct.
 
-Note: fix chip unit unification first (docs/plans/2026-03-27-chip-units-impl.md), then address this.
+Still need to verify:
+- [ ] Per-node EV display: should show EV at that decision point (strategy-weighted across all continuations), not just fold EV
+- [ ] Check if CFR regrets use the same payoff convention (they should)
+- [ ] Confirm display matches PioSOLVER/GTO Wizard
