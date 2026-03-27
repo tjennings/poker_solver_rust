@@ -508,7 +508,7 @@ impl BlueprintTrainer {
                 .collect();
 
             let prune = self.should_prune();
-            // Config is in BB units; stored regrets are ×1000.
+            // Config prune_threshold is in chip units; stored regrets are ×1000.
             let threshold = self.config.training.prune_threshold.saturating_mul(1000);
 
             let tree = &self.tree;
