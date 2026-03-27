@@ -15,12 +15,15 @@
 use rand::Rng;
 use rand::SeedableRng;
 
-use crate::blueprint_sampler::deal_hand;
+use crate::blueprint_sampler::{deal_hand, play_preflop_under_blueprint};
 use crate::data_buffer::DiskBuffer;
 use crate::generate::pbs_to_buffer_record;
 use crate::pbs::{combo_index, Pbs, NUM_COMBOS};
 use crate::solver::{solve_depth_limited_pbs, SolveConfig, SolveResult};
+use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::cfv_subgame_solver::LeafEvaluator;
+use poker_solver_core::blueprint_v2::game_tree::GameTree;
+use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 
 /// A training example from self-play: a PBS and its computed CFVs.
 pub struct TrainingExample {
@@ -73,9 +76,8 @@ fn board_card_count(street: Street) -> usize {
     }
 }
 
-/// The sequence of streets in a hand.
-const STREET_ORDER: [Street; 4] = [
-    Street::Preflop,
+/// The sequence of postflop streets (preflop is handled by blueprint).
+const STREET_ORDER: [Street; 3] = [
     Street::Flop,
     Street::Turn,
     Street::River,
@@ -102,27 +104,28 @@ pub fn play_self_play_hand<R: Rng>(
     evaluator: &dyn LeafEvaluator,
     solve_config: &SolveConfig,
     sp_config: &SelfPlayConfig,
+    strategy: &BlueprintV2Strategy,
+    tree: &GameTree,
+    buckets: &AllBuckets,
     rng: &mut R,
 ) -> Vec<TrainingExample> {
     let mut examples = Vec::new();
     let deal = deal_hand(rng);
 
-    // Initial pot = small blind + big blind
-    let initial_pot = sp_config.small_blind + sp_config.big_blind;
+    // --- Play preflop under blueprint policy ---
+    let preflop_result = match play_preflop_under_blueprint(
+        strategy, tree, buckets, &deal,
+        sp_config.initial_stack, sp_config.small_blind, sp_config.big_blind,
+        rng,
+    ) {
+        Some(r) => r,
+        None => return examples, // hand ended preflop (fold)
+    };
 
-    // Effective stack = starting stack minus the larger blind
-    let initial_eff_stack =
-        sp_config.initial_stack - sp_config.small_blind.max(sp_config.big_blind);
-
-    // Pot and effective stack for the simplified version.
-    // In a full implementation these would be updated by betting actions;
-    // here they remain at their initial values since we only solve at
-    // street boundaries and don't model intra-street bet sizing.
-    let pot = initial_pot;
-    let effective_stack = initial_eff_stack;
-
-    // Initialize reach probabilities: uniform for both players.
-    let mut reach_probs = Box::new([[1.0f32; NUM_COMBOS]; 2]);
+    // Use preflop-updated state for postflop solving
+    let pot = preflop_result.pot;
+    let effective_stack = preflop_result.effective_stack;
+    let mut reach_probs = preflop_result.reach_probs;
 
     // Decide exploration for this hand.
     let exploring = rng.random::<f32>() < sp_config.exploration_epsilon;
@@ -209,10 +212,10 @@ pub fn play_self_play_hand<R: Rng>(
 /// Returns the index of a street in `STREET_ORDER`.
 fn street_index(street: Street) -> usize {
     match street {
-        Street::Preflop => 0,
-        Street::Flop => 1,
-        Street::Turn => 2,
-        Street::River => 3,
+        Street::Preflop => panic!("preflop not in STREET_ORDER"),
+        Street::Flop => 0,
+        Street::Turn => 1,
+        Street::River => 2,
     }
 }
 
@@ -287,13 +290,20 @@ pub fn self_play_training_loop(
     evaluator: &dyn LeafEvaluator,
     solve_config: &SolveConfig,
     sp_config: &SelfPlayConfig,
+    strategy: &BlueprintV2Strategy,
+    tree: &GameTree,
+    buckets: &AllBuckets,
     buffer: &mut DiskBuffer,
 ) -> usize {
     let mut total_examples = 0usize;
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(sp_config.seed);
 
     for hand_idx in 0..sp_config.num_hands {
-        let examples = play_self_play_hand(evaluator, solve_config, sp_config, &mut rng);
+        let examples = play_self_play_hand(
+            evaluator, solve_config, sp_config,
+            strategy, tree, buckets,
+            &mut rng,
+        );
 
         // Convert each training example to buffer records (one per player).
         for example in &examples {
@@ -383,12 +393,11 @@ mod tests {
     }
 
     #[test]
-    fn test_street_order() {
-        assert_eq!(STREET_ORDER.len(), 4);
-        assert_eq!(STREET_ORDER[0], Street::Preflop);
-        assert_eq!(STREET_ORDER[1], Street::Flop);
-        assert_eq!(STREET_ORDER[2], Street::Turn);
-        assert_eq!(STREET_ORDER[3], Street::River);
+    fn test_street_order_starts_at_flop() {
+        assert_eq!(STREET_ORDER.len(), 3);
+        assert_eq!(STREET_ORDER[0], Street::Flop);
+        assert_eq!(STREET_ORDER[1], Street::Turn);
+        assert_eq!(STREET_ORDER[2], Street::River);
     }
 
     #[test]
@@ -401,10 +410,15 @@ mod tests {
 
     #[test]
     fn test_street_index() {
-        assert_eq!(street_index(Street::Preflop), 0);
-        assert_eq!(street_index(Street::Flop), 1);
-        assert_eq!(street_index(Street::Turn), 2);
-        assert_eq!(street_index(Street::River), 3);
+        assert_eq!(street_index(Street::Flop), 0);
+        assert_eq!(street_index(Street::Turn), 1);
+        assert_eq!(street_index(Street::River), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "preflop not in STREET_ORDER")]
+    fn test_street_index_preflop_panics() {
+        street_index(Street::Preflop);
     }
 
     #[test]
