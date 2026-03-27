@@ -18,7 +18,7 @@ pub use exploration::{
     is_bundle_loaded_core, list_blueprints_core, load_blueprint_v2_core, load_bundle_core,
     start_bucket_computation_core,
     // Helpers
-    blueprint_sizes_to_range_solver, populate_cbv_context,
+    blueprint_sizes_to_range_solver, load_hand_ev_bin, populate_cbv_context,
     // Types
     BlueprintListEntry, ExplorationState, SubgameProgressEvent,
     // Additional types needed by consumers of core functions

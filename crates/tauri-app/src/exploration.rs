@@ -2050,7 +2050,7 @@ fn value_to_char(v: Value) -> char {
 
 /// Load per-node hand EVs from hand_ev.bin (FullTreeEvTracker format).
 /// Returns `Vec<[[f64; 169]; 2]>` indexed by decision node index.
-fn load_hand_ev_bin(path: &Path, expected_nodes: usize) -> Result<Vec<[[f64; 169]; 2]>, String> {
+pub fn load_hand_ev_bin(path: &Path, expected_nodes: usize) -> Result<Vec<[[f64; 169]; 2]>, String> {
     use std::io::Read;
     let mut f = std::io::BufReader::new(
         std::fs::File::open(path).map_err(|e| format!("Cannot open: {e}"))?

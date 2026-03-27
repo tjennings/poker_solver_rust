@@ -20,7 +20,7 @@ use poker_solver_tauri::GameAction;
 /// Tauri async or State wrappers.
 fn load_blueprint(
     config_path: &Path,
-) -> Result<(BlueprintV2Config, BlueprintV2Strategy, V2GameTree, Vec<u32>, Option<Arc<CbvContext>>), String> {
+) -> Result<(BlueprintV2Config, BlueprintV2Strategy, V2GameTree, Vec<u32>, Option<Arc<CbvContext>>, Option<Vec<[[f64; 169]; 2]>>), String> {
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| format!("Failed to read config: {e}"))?;
     let config: BlueprintV2Config =
@@ -72,6 +72,48 @@ fn load_blueprint(
         &aa.river,
     );
     let decision_map = tree.decision_index_map();
+    let (decision_nodes, _, _) = tree.node_counts();
+
+    // Load hand_ev.bin if available.
+    let hand_evs = {
+        let candidates = [
+            strat_path.parent().unwrap_or(Path::new(".")).join("hand_ev.bin"),
+            output_dir.join("hand_ev.bin"),
+            output_dir.join("final/hand_ev.bin"),
+        ];
+        let mut found = None;
+        for c in &candidates {
+            if c.exists() { found = Some(c.clone()); break; }
+        }
+        // Check latest snapshot
+        if found.is_none() {
+            if let Ok(entries) = std::fs::read_dir(&output_dir) {
+                let mut snaps: Vec<_> = entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("snapshot_")))
+                    .collect();
+                snaps.sort_by_key(|e| e.file_name());
+                if let Some(last) = snaps.last() {
+                    let p = last.path().join("hand_ev.bin");
+                    if p.exists() { found = Some(p); }
+                }
+            }
+        }
+        if let Some(path) = found {
+            match poker_solver_tauri::load_hand_ev_bin(&path, decision_nodes) {
+                Ok(evs) => {
+                    eprintln!("[inspect] loaded hand_ev.bin ({} decision nodes)", evs.len());
+                    Some(evs)
+                }
+                Err(e) => {
+                    eprintln!("[inspect] failed to load hand_ev.bin: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
 
     // Load CbvContext (bucket files) for postflop strategy lookups.
     let strat_dir = strat_path.parent().unwrap_or(Path::new("."));
@@ -153,7 +195,7 @@ fn load_blueprint(
         None
     };
 
-    Ok((config, strategy, tree, decision_map, cbv_ctx))
+    Ok((config, strategy, tree, decision_map, cbv_ctx, hand_evs))
 }
 
 /// Format a strategy report from a `GameState` and print it to stdout.
@@ -259,14 +301,14 @@ fn format_report(spot: &str, state: &GameState) -> String {
 
 /// Run the inspect-spot command.
 pub fn run(config_path: &Path, spot: &str) -> Result<(), String> {
-    let (config, strategy, tree, decision_map, cbv_ctx) = load_blueprint(config_path)?;
+    let (config, strategy, tree, decision_map, cbv_ctx, hand_evs) = load_blueprint(config_path)?;
 
     eprintln!(
         "Blueprint: {} ({}BB stacks)",
         config.game.name, config.game.stack_depth
     );
 
-    let mut session = GameSession::new(config, strategy, tree, decision_map, None);
+    let mut session = GameSession::new(config, strategy, tree, decision_map, hand_evs);
     if let Some(ctx) = cbv_ctx {
         session.set_cbv_context(ctx);
     }
