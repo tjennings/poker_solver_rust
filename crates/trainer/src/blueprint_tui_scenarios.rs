@@ -6,7 +6,7 @@ use rand::seq::SliceRandom;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
 use poker_solver_core::blueprint_v2::Street;
-use poker_solver_core::poker::{Card, full_deck};
+use poker_solver_core::poker::{self, Card, full_deck};
 
 use crate::blueprint_tui_widgets::CellStrategy;
 
@@ -51,6 +51,85 @@ pub fn format_tree_action(action: &TreeAction) -> String {
         TreeAction::Bet(v) => format!("bet {v:.1}"),
         TreeAction::Raise(v) => format!("raise {v:.1}"),
     }
+}
+
+/// Format a `TreeAction` as a BB-based label matching Tauri's spot notation.
+///
+/// Chip amounts are converted to BB by dividing by 2 and rounding.
+/// E.g. `Raise(10.0)` → `"5bb"`, `Fold` → `"fold"`.
+pub fn format_tree_action_bb(action: &TreeAction) -> String {
+    match action {
+        TreeAction::Fold => "fold".to_string(),
+        TreeAction::Check => "check".to_string(),
+        TreeAction::Call => "call".to_string(),
+        TreeAction::AllIn => "all-in".to_string(),
+        TreeAction::Bet(chips) | TreeAction::Raise(chips) => {
+            format!("{}bb", (chips / 2.0).round() as u32)
+        }
+    }
+}
+
+/// Find the position of an action in a slice by case-insensitive BB label match.
+fn match_action_by_label(label: &str, actions: &[TreeAction]) -> Option<usize> {
+    let lower = label.to_ascii_lowercase();
+    actions
+        .iter()
+        .position(|a| format_tree_action_bb(a) == lower)
+}
+
+/// Parse a spot notation string and walk the game tree to find the target node.
+///
+/// Format: segments separated by `|`.
+/// - Action segments contain comma-separated `position:label` pairs (e.g. `"sb:5bb,bb:call"`)
+/// - Board segments contain pairs of rank+suit characters (e.g. `"Kh7s2d"`)
+///
+/// Returns the node index and board cards, or `None` if any label fails to match.
+pub fn resolve_spot(tree: &GameTree, spot: &str) -> Option<(u32, Vec<Card>)> {
+    if spot.is_empty() {
+        return Some((tree.root, vec![]));
+    }
+
+    let mut node_idx = tree.root;
+    let mut board = Vec::new();
+
+    for segment in spot.split('|') {
+        if segment.contains(':') {
+            // Action segment: comma-separated "position:label" pairs
+            for pair in segment.split(',') {
+                let label = pair.split(':').nth(1)?;
+
+                // Skip chance nodes before each action
+                node_idx = skip_chance(tree, node_idx);
+
+                let GameNode::Decision {
+                    actions: ref node_actions,
+                    ref children,
+                    ..
+                } = tree.nodes[node_idx as usize]
+                else {
+                    return None;
+                };
+
+                let matched = match_action_by_label(label, node_actions)?;
+                node_idx = children[matched];
+            }
+        } else {
+            // Board segment: pairs of rank+suit chars
+            let chars: Vec<char> = segment.chars().collect();
+            for pair in chars.chunks(2) {
+                if pair.len() == 2 {
+                    let card_str: String = pair.iter().collect();
+                    let card = poker::parse_card(&card_str)?;
+                    board.push(card);
+                }
+            }
+        }
+    }
+
+    // Skip trailing chance node so caller lands on a decision or terminal
+    node_idx = skip_chance(tree, node_idx);
+
+    Some((node_idx, board))
 }
 
 /// Build the 13x13 strategy grid for the decision node at `node_idx`.
@@ -370,5 +449,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[timed_test(10)]
+    fn format_tree_action_bb_labels() {
+        assert_eq!(format_tree_action_bb(&TreeAction::Fold), "fold");
+        assert_eq!(format_tree_action_bb(&TreeAction::Check), "check");
+        assert_eq!(format_tree_action_bb(&TreeAction::Call), "call");
+        assert_eq!(format_tree_action_bb(&TreeAction::AllIn), "all-in");
+        assert_eq!(format_tree_action_bb(&TreeAction::Bet(10.0)), "5bb");
+        assert_eq!(format_tree_action_bb(&TreeAction::Raise(10.0)), "5bb");
+        assert_eq!(format_tree_action_bb(&TreeAction::Raise(5.0)), "3bb");
+    }
+
+    #[timed_test(10)]
+    fn match_action_by_label_finds_actions() {
+        let actions = vec![
+            TreeAction::Fold,
+            TreeAction::Call,
+            TreeAction::Raise(10.0),
+        ];
+        assert_eq!(match_action_by_label("fold", &actions), Some(0));
+        assert_eq!(match_action_by_label("call", &actions), Some(1));
+        assert_eq!(match_action_by_label("5bb", &actions), Some(2));
+        assert_eq!(match_action_by_label("Call", &actions), Some(1));
+        assert_eq!(match_action_by_label("999bb", &actions), None);
+    }
+
+    #[timed_test(10)]
+    fn resolve_spot_empty_string() {
+        let tree = toy_tree();
+        let (node_idx, board) = resolve_spot(&tree, "").unwrap();
+        assert_eq!(node_idx, tree.root);
+        assert!(board.is_empty());
+    }
+
+    #[timed_test(10)]
+    fn resolve_spot_single_action() {
+        // toy_tree root: SB has [Fold, Call, Raise(5.0), AllIn]
+        // Raise(5.0) → 5/2=2.5 → round=3 → "3bb"
+        let tree = toy_tree();
+        let (node_idx, board) = resolve_spot(&tree, "sb:3bb").unwrap();
+        assert_ne!(node_idx, tree.root);
+        assert!(board.is_empty());
+    }
+
+    #[timed_test(10)]
+    fn resolve_spot_two_actions() {
+        let tree = toy_tree();
+        let result = resolve_spot(&tree, "sb:3bb,bb:call");
+        assert!(result.is_some(), "sb:3bb,bb:call should resolve");
+        let (_, board) = result.unwrap();
+        assert!(board.is_empty());
+    }
+
+    #[timed_test(10)]
+    fn resolve_spot_with_board() {
+        let tree = toy_tree();
+        let result = resolve_spot(&tree, "sb:3bb,bb:call|Kh7s2d");
+        assert!(result.is_some());
+        let (_, board) = result.unwrap();
+        assert_eq!(board.len(), 3);
+    }
+
+    #[timed_test(10)]
+    fn resolve_spot_invalid_label() {
+        let tree = toy_tree();
+        let result = resolve_spot(&tree, "sb:999bb");
+        assert!(result.is_none());
     }
 }
