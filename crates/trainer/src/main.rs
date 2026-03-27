@@ -274,64 +274,53 @@ fn main() -> Result<(), Box<dyn Error>> {
                 trainer.shared_iterations = Arc::clone(&metrics.iterations);
                 trainer.snapshot_trigger = Arc::clone(&metrics.snapshot_trigger);
 
-                // Pre-compute board cards for each scenario.
-                let scenario_boards: Vec<Vec<poker_solver_core::poker::Card>> = tui_config
+                // Resolve scenarios using spot notation.
+                let (scenarios, boards_for_refresh): (Vec<blueprint_tui::ResolvedScenario>, Vec<Vec<poker_solver_core::poker::Card>>) = tui_config
                     .scenarios
                     .iter()
                     .map(|sc| {
-                        sc.board
-                            .as_ref()
-                            .map(|strings| {
-                                strings
-                                    .iter()
-                                    .filter_map(|s| {
-                                        poker_solver_core::poker::parse_card(s)
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect();
-
-                // Resolve scenarios to game-tree nodes.
-                let scenarios: Vec<blueprint_tui::ResolvedScenario> = tui_config
-                    .scenarios
-                    .iter()
-                    .enumerate()
-                    .map(|(i, sc)| {
-                        let node_idx = blueprint_tui_scenarios::resolve_action_path(
+                        let (node_idx, board) = blueprint_tui_scenarios::resolve_spot(
                             &trainer.tree,
-                            &sc.actions,
+                            &sc.spot,
                         )
-                        .unwrap_or(trainer.tree.root);
+                        .unwrap_or_else(|| {
+                            eprintln!("WARNING: scenario '{}' spot '{}' failed to resolve, using root", sc.name, sc.spot);
+                            (trainer.tree.root, vec![])
+                        });
                         let grid = blueprint_tui_scenarios::extract_strategy_grid(
                             &trainer.tree,
                             &trainer.storage,
                             node_idx,
-                            &scenario_boards[i],
+                            &board,
                             None,
                         );
-                        blueprint_tui::ResolvedScenario {
+                        let street_label = match &trainer.tree.nodes[node_idx as usize] {
+                            poker_solver_core::blueprint_v2::game_tree::GameNode::Decision { street, .. } => {
+                                format!("{street:?}")
+                            }
+                            _ => "Preflop".to_string(),
+                        };
+                        let scenario = blueprint_tui::ResolvedScenario {
                             name: sc.name.clone(),
                             node_idx,
                             grid: blueprint_tui_widgets::HandGridState {
                                 cells: grid,
                                 prev_cells: None,
                                 scenario_name: sc.name.clone(),
-                                action_path: sc.actions.clone(),
-                                board_display: sc
-                                    .board
-                                    .as_ref()
-                                    .map(|b| b.join(" ")),
+                                action_path: vec![sc.spot.clone()],
+                                board_display: if board.is_empty() {
+                                    None
+                                } else {
+                                    Some(board.iter().map(|c| format!("{c}")).collect::<Vec<_>>().join(" "))
+                                },
                                 cluster_id: None,
-                                street_label: sc
-                                    .street
-                                    .map_or("Preflop".into(), |s| format!("{s:?}")),
+                                street_label,
                                 iteration_at_snapshot: 0,
                             },
-                        }
+                        };
+                        (scenario, board)
                     })
-                    .collect();
+                    .unzip();
 
                 // Wire strategy refresh callback from trainer to TUI metrics.
                 let scenarios_node_indices: Vec<u32> =
@@ -342,7 +331,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                     tui_config.telemetry.strategy_delta_interval_seconds;
 
                 let metrics_for_refresh = Arc::clone(&metrics);
-                let boards_for_refresh = scenario_boards;
                 trainer.on_strategy_refresh =
                     Some(Box::new(move |scenario_idx, node_idx, storage, tree, hand_evs| {
                         let board = &boards_for_refresh[scenario_idx];
