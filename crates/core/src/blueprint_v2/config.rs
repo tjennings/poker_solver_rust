@@ -303,7 +303,7 @@ fn default_optimizer() -> String {
 }
 
 fn default_sapcfr_eta() -> f64 {
-    0.5
+    0.33
 }
 
 #[cfg(test)]
@@ -733,7 +733,7 @@ snapshots:
         let cfg: BlueprintV2Config =
             serde_yaml::from_str(yaml).expect("failed to parse config");
         assert_eq!(cfg.training.optimizer, "dcfr");
-        assert!((cfg.training.sapcfr_eta - 0.5).abs() < f64::EPSILON);
+        assert!((cfg.training.sapcfr_eta - 0.33).abs() < f64::EPSILON);
     }
 
     #[test]
