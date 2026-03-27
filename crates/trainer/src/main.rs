@@ -275,7 +275,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 trainer.snapshot_trigger = Arc::clone(&metrics.snapshot_trigger);
 
                 // Resolve scenarios using spot notation.
-                let scenarios: Vec<blueprint_tui::ResolvedScenario> = tui_config
+                let (scenarios, boards_for_refresh): (Vec<blueprint_tui::ResolvedScenario>, Vec<Vec<poker_solver_core::poker::Card>>) = tui_config
                     .scenarios
                     .iter()
                     .map(|sc| {
@@ -300,7 +300,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }
                             _ => "Preflop".to_string(),
                         };
-                        blueprint_tui::ResolvedScenario {
+                        let scenario = blueprint_tui::ResolvedScenario {
                             name: sc.name.clone(),
                             node_idx,
                             grid: blueprint_tui_widgets::HandGridState {
@@ -317,9 +317,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 street_label,
                                 iteration_at_snapshot: 0,
                             },
-                        }
+                        };
+                        (scenario, board)
                     })
-                    .collect();
+                    .unzip();
 
                 // Wire strategy refresh callback from trainer to TUI metrics.
                 let scenarios_node_indices: Vec<u32> =
@@ -330,15 +331,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                     tui_config.telemetry.strategy_delta_interval_seconds;
 
                 let metrics_for_refresh = Arc::clone(&metrics);
-                let boards_for_refresh: Vec<Vec<poker_solver_core::poker::Card>> = tui_config
-                    .scenarios
-                    .iter()
-                    .map(|sc| {
-                        blueprint_tui_scenarios::resolve_spot(&trainer.tree, &sc.spot)
-                            .map(|(_, b)| b)
-                            .unwrap_or_default()
-                    })
-                    .collect();
                 trainer.on_strategy_refresh =
                     Some(Box::new(move |scenario_idx, node_idx, storage, tree, hand_evs| {
                         let board = &boards_for_refresh[scenario_idx];

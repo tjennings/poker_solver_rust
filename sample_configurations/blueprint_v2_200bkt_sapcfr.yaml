@@ -72,11 +72,11 @@ tui:
     - name: "SB Open"
       spot: ""
     - name: "BB vs 2x"
-      spot: "sb:4bb"
+      spot: "sb:2bb"
     - name: "SB vs 3-bet"
-      spot: "sb:4bb,bb:14bb"
+      spot: "sb:2bb,bb:7bb"
     - name: "SB Cbet K72"
-      spot: "sb:4bb,bb:call|Kh7s2d"
+      spot: "sb:2bb,bb:call|Kh7s2d"
   random_scenario:
     enabled: true
     hold_minutes: 3

@@ -54,6 +54,7 @@ fn match_action_by_label(label: &str, actions: &[TreeAction]) -> Option<usize> {
 ///
 /// Returns the node index and board cards, or `None` if any label fails to match.
 pub fn resolve_spot(tree: &GameTree, spot: &str) -> Option<(u32, Vec<Card>)> {
+    let spot = spot.trim();
     if spot.is_empty() {
         return Some((tree.root, vec![]));
     }
@@ -62,10 +63,15 @@ pub fn resolve_spot(tree: &GameTree, spot: &str) -> Option<(u32, Vec<Card>)> {
     let mut board = Vec::new();
 
     for segment in spot.split('|') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
         if segment.contains(':') {
             // Action segment: comma-separated "position:label" pairs
             for pair in segment.split(',') {
-                let label = pair.split(':').nth(1)?;
+                let pair = pair.trim();
+                let label = pair.split_once(':').map(|(_, l)| l).unwrap_or(pair);
 
                 // Skip chance nodes before each action
                 node_idx = skip_chance(tree, node_idx);
