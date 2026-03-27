@@ -1,62 +1,34 @@
-//! Turn model comparison against CfvSubgameSolver ground truth.
+//! Turn model comparison against range-solver ground truth.
 //!
 //! Two modes:
-//! - **compare-net**: solver uses `RiverNetEvaluator` at leaves (fast, approximate)
-//! - **compare-exact**: solver uses `ExactRiverEvaluator` at leaves (slow, exact)
+//! - **compare-net**: solver uses `NetBoundaryEvaluator` (river net) at depth boundaries
+//! - **compare-exact**: solver uses `PostFlopGame` with `depth_limit: None` (full solve through river)
+
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use burn::backend::NdArray;
 use burn::module::Module;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 use burn::tensor::{Tensor, TensorData};
-use poker_solver_core::blueprint_v2::cfv_subgame_solver::{
-    CfvSubgameSolver, ExactRiverEvaluator, LeafEvaluator,
-};
-use poker_solver_core::blueprint_v2::game_tree::GameTree;
-use poker_solver_core::blueprint_v2::subgame_cfr::SubgameHands;
-use poker_solver_core::blueprint_v2::Street;
-use poker_solver_core::poker::{Card, Suit, Value};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use range_solver::card::card_pair_to_index;
+use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
+use range_solver::bet_size::{BetSize, BetSizeOptions};
+use range_solver::card::{card_pair_to_index, CardConfig, NOT_DEALT};
+use range_solver::game::{BoundaryEvaluator, PostFlopGame};
+use range_solver::range::Range as RsRange;
+use range_solver::solve;
 
 use crate::config::CfvnetConfig;
 use crate::datagen::range_gen::NUM_COMBOS;
 use crate::datagen::sampler::{sample_situation, Situation};
 use crate::eval::compare::{ComparisonSummary, SpotResult};
 use crate::eval::metrics::compute_prediction_metrics;
-use crate::eval::river_net_evaluator::RiverNetEvaluator;
-use crate::model::network::{CfvNet, DECK_SIZE, INPUT_SIZE, NUM_RANKS};
-
-use std::path::Path;
+use crate::eval::river_net_evaluator::build_input;
+use crate::model::network::{CfvNet, DECK_SIZE, INPUT_SIZE, NUM_RANKS, OUTPUT_SIZE};
 
 type B = NdArray;
-
-/// Convert a range-solver `u8` card to an `rs_poker::core::Card`.
-fn u8_to_rs_card(id: u8) -> Card {
-    let rank = id / 4;
-    let suit_id = id % 4;
-    let value = Value::from(rank);
-    let suit = match suit_id {
-        0 => Suit::Club,
-        1 => Suit::Diamond,
-        2 => Suit::Heart,
-        3 => Suit::Spade,
-        _ => unreachable!(),
-    };
-    Card::new(value, suit)
-}
-
-/// Convert an `rs_poker::core::Card` to a range-solver `u8` card.
-fn rs_card_to_u8(card: Card) -> u8 {
-    let rank = card.value as u8;
-    let suit = match card.suit {
-        Suit::Club => 0,
-        Suit::Diamond => 1,
-        Suit::Heart => 2,
-        Suit::Spade => 3,
-    };
-    4 * rank + suit
-}
 
 /// Parse config bet size strings into pot fractions, skipping "a" (all-in).
 fn parse_bet_sizes(sizes: &[String]) -> Vec<f64> {
@@ -73,53 +45,302 @@ fn parse_bet_sizes(sizes: &[String]) -> Vec<f64> {
         .collect()
 }
 
-/// Solve a turn situation with the given evaluator and return 1326-indexed CFVs.
+/// Build a `PostFlopGame` for a turn situation.
 ///
-/// Returns `(cfvs_1326, valid_mask)` for the given traverser.
-fn solve_and_extract(
-    sit: &Situation,
+/// - `depth_limit: Some(0)` stops at the river boundary (for net evaluation)
+/// - `depth_limit: None` solves through river to showdown (for exact evaluation)
+fn build_turn_postflop_game(
+    board_u8: &[u8],
+    pot: f64,
+    effective_stack: f64,
+    ranges: &[[f32; NUM_COMBOS]; 2],
     bet_sizes: &[Vec<f64>],
-    solver_iterations: u32,
-    evaluator: Box<dyn LeafEvaluator>,
+    depth_limit: Option<u8>,
+) -> Option<PostFlopGame> {
+    if effective_stack <= 0.0 {
+        return None;
+    }
+
+    let oop_range = RsRange::from_raw_data(&ranges[0]).expect("valid OOP range");
+    let ip_range = RsRange::from_raw_data(&ranges[1]).expect("valid IP range");
+
+    let sizes: Vec<BetSize> = bet_sizes
+        .iter()
+        .flat_map(|v| v.iter().map(|&f| BetSize::PotRelative(f)))
+        .collect();
+    let bet_size_opts = BetSizeOptions {
+        bet: sizes.clone(),
+        raise: Vec::new(),
+    };
+
+    let card_config = CardConfig {
+        range: [oop_range, ip_range],
+        flop: [board_u8[0], board_u8[1], board_u8[2]],
+        turn: board_u8[3],
+        river: NOT_DEALT,
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Turn,
+        starting_pot: pot as i32,
+        effective_stack: effective_stack as i32,
+        turn_bet_sizes: [bet_size_opts.clone(), bet_size_opts],
+        river_bet_sizes: [BetSizeOptions::default(), BetSizeOptions::default()],
+        depth_limit,
+        add_allin_threshold: 1.5,
+        force_allin_threshold: 0.15,
+        merging_threshold: 0.1,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).expect("valid action tree");
+    let mut game = PostFlopGame::with_config(card_config, action_tree).expect("valid game");
+    game.allocate_memory(false);
+    Some(game)
+}
+
+/// Boundary evaluator wrapping a river neural network for turn depth boundaries.
+///
+/// When the solver reaches a turn-river boundary, this evaluator averages
+/// the river CFV network predictions over all possible river cards.
+///
+/// The model is held behind a `Mutex` because `CfvNet<NdArray>` is not `Sync`
+/// (burn's `Param` contains `OnceCell`). The mutex is uncontended in practice
+/// since boundary evaluation is single-threaded.
+struct NetBoundaryEvaluator {
+    model: Mutex<CfvNet<B>>,
+    device: <B as burn::tensor::backend::Backend>::Device,
+    board_u8: [u8; 4],
+    /// Private cards per player, in game ordering.
+    private_cards: [Vec<(u8, u8)>; 2],
+}
+
+impl NetBoundaryEvaluator {
+    fn new(
+        model: CfvNet<B>,
+        device: <B as burn::tensor::backend::Backend>::Device,
+        board_u8: [u8; 4],
+        private_cards: [Vec<(u8, u8)>; 2],
+    ) -> Self {
+        Self {
+            model: Mutex::new(model),
+            device,
+            board_u8,
+            private_cards,
+        }
+    }
+}
+
+impl BoundaryEvaluator for NetBoundaryEvaluator {
+    fn compute_cfvs(
+        &self,
+        player: usize,
+        pot: i32,
+        remaining_stack: f64,
+        opponent_reach: &[f32],
+        num_hands: usize,
+    ) -> Vec<f32> {
+        let opp = player ^ 1;
+        let hero_cards = &self.private_cards[player];
+        let opp_cards = &self.private_cards[opp];
+
+        // Map opponent reach from game ordering to 1326-indexed.
+        let mut opp_1326 = [0.0_f32; OUTPUT_SIZE];
+        for (i, &(c0, c1)) in opp_cards.iter().enumerate() {
+            if i < opponent_reach.len() {
+                let idx = card_pair_to_index(c0, c1);
+                opp_1326[idx] = opponent_reach[i];
+            }
+        }
+
+        // For the hero side, use uniform reach (solver handles weighting externally).
+        let mut hero_1326 = [0.0_f32; OUTPUT_SIZE];
+        for &(c0, c1) in hero_cards.iter() {
+            let idx = card_pair_to_index(c0, c1);
+            hero_1326[idx] = 1.0;
+        }
+
+        // Map to (oop, ip) ordering for the network input.
+        let (oop_1326, ip_1326) = if player == 0 {
+            (&hero_1326, &opp_1326)
+        } else {
+            (&opp_1326, &hero_1326)
+        };
+
+        let effective_stack = remaining_stack;
+        let pot_f64 = f64::from(pot);
+        let board_u8 = &self.board_u8;
+
+        // Accumulate CFVs per hero hand, averaged over river cards.
+        let mut cfv_sum = vec![0.0_f64; num_hands];
+        let mut cfv_count = vec![0_u32; num_hands];
+
+        // Pre-compute hero card 1326 indices.
+        let hero_indices: Vec<usize> = hero_cards
+            .iter()
+            .map(|&(c0, c1)| card_pair_to_index(c0, c1))
+            .collect();
+
+        for river_u8 in 0u8..52 {
+            if board_u8.contains(&river_u8) {
+                continue;
+            }
+
+            let river_board: [u8; 5] = [
+                board_u8[0], board_u8[1], board_u8[2], board_u8[3], river_u8,
+            ];
+
+            // Filter out combos that conflict with the river card.
+            let mut oop_filtered = *oop_1326;
+            let mut ip_filtered = *ip_1326;
+            // Zero out all combos containing the river card.
+            for other in 0u8..52 {
+                if other == river_u8 {
+                    continue;
+                }
+                let (lo, hi) = if river_u8 < other {
+                    (river_u8, other)
+                } else {
+                    (other, river_u8)
+                };
+                let idx = card_pair_to_index(lo, hi);
+                oop_filtered[idx] = 0.0;
+                ip_filtered[idx] = 0.0;
+            }
+
+            let input_vec = build_input(
+                &oop_filtered,
+                &ip_filtered,
+                &river_board,
+                pot_f64,
+                effective_stack,
+                player as u8,
+            );
+
+            let data = TensorData::new(input_vec, [1, INPUT_SIZE]);
+            let input_tensor = Tensor::<B, 2>::from_data(data, &self.device);
+            let model = self.model.lock().unwrap();
+            let output = model.forward(input_tensor);
+            drop(model);
+            let out_vec: Vec<f32> = output
+                .into_data()
+                .to_vec()
+                .expect("output tensor conversion");
+
+            // Map 1326-indexed output back to hero's game ordering.
+            for (i, &idx) in hero_indices.iter().enumerate() {
+                let (c0, c1) = hero_cards[i];
+                if c0 != river_u8 && c1 != river_u8 {
+                    cfv_sum[i] += f64::from(out_vec[idx]);
+                    cfv_count[i] += 1;
+                }
+            }
+        }
+
+        // Average over river cards.
+        cfv_sum
+            .iter()
+            .zip(cfv_count.iter())
+            .map(|(&sum, &count)| {
+                if count > 0 {
+                    (sum / f64::from(count)) as f32
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+}
+
+/// Extract 1326-indexed CFVs from a solved `PostFlopGame`.
+fn extract_cfvs(
+    game: &mut PostFlopGame,
+    pot: f64,
     traverser: u8,
 ) -> ([f32; NUM_COMBOS], [bool; NUM_COMBOS]) {
-    let board_cards: Vec<Card> = sit.board_cards().iter().map(|&c| u8_to_rs_card(c)).collect();
-    let pot = f64::from(sit.pot);
-    let effective_stack = f64::from(sit.effective_stack);
-    let invested = [pot / 2.0; 2];
-    let starting_stack = effective_stack + pot / 2.0;
+    game.back_to_root();
+    game.cache_normalized_weights();
+    let raw_evs = game.expected_values(traverser as usize);
+    let hands = game.private_cards(traverser as usize);
 
-    let tree = GameTree::build_subgame(
-        Street::Turn,
-        pot,
-        invested,
-        starting_stack,
-        bet_sizes,
-        Some(1),
-        0,
-    );
-
-    let hands = SubgameHands::enumerate(&board_cards);
-    let mut solver =
-        CfvSubgameSolver::new(tree, hands.clone(), &board_cards, vec![evaluator], starting_stack, vec![1.0; hands.combos.len()], vec![1.0; hands.combos.len()]);
-    solver.train(solver_iterations);
-
-    let cfvs_combo = solver.root_cfvs(traverser);
-
-    let mut cfvs_1326 = [0.0_f32; NUM_COMBOS];
-    let mut valid_mask = [false; NUM_COMBOS];
     let half_pot = pot / 2.0;
     let norm = if half_pot > 0.0 { half_pot } else { 1.0 };
 
-    for (combo_idx, combo) in hands.combos.iter().enumerate() {
-        let c0 = rs_card_to_u8(combo[0]);
-        let c1 = rs_card_to_u8(combo[1]);
+    let mut cfvs_1326 = [0.0_f32; NUM_COMBOS];
+    let mut valid_mask = [false; NUM_COMBOS];
+
+    for (i, &(c0, c1)) in hands.iter().enumerate() {
         let idx = card_pair_to_index(c0, c1);
-        cfvs_1326[idx] = (cfvs_combo[combo_idx] / norm) as f32;
+        cfvs_1326[idx] = ((f64::from(raw_evs[i]) - half_pot) / norm) as f32;
         valid_mask[idx] = true;
     }
 
     (cfvs_1326, valid_mask)
+}
+
+/// Solve a turn situation with a river net boundary evaluator and return 1326-indexed CFVs.
+fn solve_and_extract_net(
+    sit: &Situation,
+    bet_sizes: &[Vec<f64>],
+    solver_iterations: u32,
+    river_model: CfvNet<B>,
+    device: <B as burn::tensor::backend::Backend>::Device,
+    traverser: u8,
+) -> ([f32; NUM_COMBOS], [bool; NUM_COMBOS]) {
+    let pot = f64::from(sit.pot);
+    let effective_stack = f64::from(sit.effective_stack);
+    let board_u8 = sit.board_cards();
+
+    let mut game = build_turn_postflop_game(
+        board_u8,
+        pot,
+        effective_stack,
+        &sit.ranges,
+        bet_sizes,
+        Some(0), // depth-limited: stop at river boundary
+    )
+    .expect("game should build for non-degenerate situation");
+
+    // Build boundary evaluator with the game's private cards.
+    let private_cards = [
+        game.private_cards(0).to_vec(),
+        game.private_cards(1).to_vec(),
+    ];
+    let board_arr: [u8; 4] = [board_u8[0], board_u8[1], board_u8[2], board_u8[3]];
+    let evaluator = NetBoundaryEvaluator::new(river_model, device, board_arr, private_cards);
+    game.boundary_evaluator = Some(Arc::new(evaluator));
+
+    let abs_target = 0.0; // no early stop
+    solve(&mut game, solver_iterations, abs_target, false);
+
+    extract_cfvs(&mut game, pot, traverser)
+}
+
+/// Solve a turn situation exactly (through river to showdown) and return 1326-indexed CFVs.
+fn solve_and_extract_exact(
+    sit: &Situation,
+    bet_sizes: &[Vec<f64>],
+    solver_iterations: u32,
+    traverser: u8,
+) -> ([f32; NUM_COMBOS], [bool; NUM_COMBOS]) {
+    let pot = f64::from(sit.pot);
+    let effective_stack = f64::from(sit.effective_stack);
+    let board_u8 = sit.board_cards();
+
+    let mut game = build_turn_postflop_game(
+        board_u8,
+        pot,
+        effective_stack,
+        &sit.ranges,
+        bet_sizes,
+        None, // no depth limit: solve through river to showdown
+    )
+    .expect("game should build for non-degenerate situation");
+
+    let abs_target = 0.0;
+    solve(&mut game, solver_iterations, abs_target, false);
+
+    extract_cfvs(&mut game, pot, traverser)
 }
 
 /// Run the turn model forward pass and return 1326-indexed predicted CFVs.
@@ -152,31 +373,69 @@ fn predict_with_model(
     let data = TensorData::new(input, [1, INPUT_SIZE]);
     let input_tensor = Tensor::<B, 2>::from_data(data, device);
     let output = model.forward(input_tensor);
-    output.into_data().to_vec::<f32>().expect("output tensor conversion")
+    output
+        .into_data()
+        .to_vec::<f32>()
+        .expect("output tensor conversion")
 }
 
-/// Compare a single spot: model prediction vs ground truth.
-fn compare_single(
+/// Compare a single spot (net mode): model prediction vs ground truth.
+fn compare_single_net(
     model: &CfvNet<B>,
     device: &<B as burn::tensor::backend::Backend>::Device,
     sit: &Situation,
     bet_sizes: &[Vec<f64>],
     solver_iterations: u32,
-    evaluator: Box<dyn LeafEvaluator>,
+    river_model: CfvNet<B>,
+    river_device: <B as burn::tensor::backend::Backend>::Device,
 ) -> (f64, f64, f64, SpotResult) {
-    let (actual, valid_mask) = solve_and_extract(sit, bet_sizes, solver_iterations, evaluator, 0);
+    let (actual, valid_mask) =
+        solve_and_extract_net(sit, bet_sizes, solver_iterations, river_model, river_device, 0);
     let predicted = predict_with_model(model, device, sit, 0);
 
     let mask_bool: Vec<bool> = valid_mask.to_vec();
     let metrics = compute_prediction_metrics(&predicted, &actual, &mask_bool, sit.pot as f32);
-    (metrics.mae, metrics.max_error, metrics.mbb_error, SpotResult {
-        board: sit.board,
-        board_size: sit.board_size,
-        pot: sit.pot,
-        effective_stack: sit.effective_stack,
-        mae: metrics.mae,
-        mbb: metrics.mbb_error,
-    })
+    (
+        metrics.mae,
+        metrics.max_error,
+        metrics.mbb_error,
+        SpotResult {
+            board: sit.board,
+            board_size: sit.board_size,
+            pot: sit.pot,
+            effective_stack: sit.effective_stack,
+            mae: metrics.mae,
+            mbb: metrics.mbb_error,
+        },
+    )
+}
+
+/// Compare a single spot (exact mode): model prediction vs ground truth.
+fn compare_single_exact(
+    model: &CfvNet<B>,
+    device: &<B as burn::tensor::backend::Backend>::Device,
+    sit: &Situation,
+    bet_sizes: &[Vec<f64>],
+    solver_iterations: u32,
+) -> (f64, f64, f64, SpotResult) {
+    let (actual, valid_mask) = solve_and_extract_exact(sit, bet_sizes, solver_iterations, 0);
+    let predicted = predict_with_model(model, device, sit, 0);
+
+    let mask_bool: Vec<bool> = valid_mask.to_vec();
+    let metrics = compute_prediction_metrics(&predicted, &actual, &mask_bool, sit.pot as f32);
+    (
+        metrics.mae,
+        metrics.max_error,
+        metrics.mbb_error,
+        SpotResult {
+            board: sit.board,
+            board_size: sit.board_size,
+            pot: sit.pot,
+            effective_stack: sit.effective_stack,
+            mae: metrics.mae,
+            mbb: metrics.mbb_error,
+        },
+    )
 }
 
 /// Aggregate per-spot metrics into a `ComparisonSummary`.
@@ -209,11 +468,11 @@ fn aggregate(results: Vec<(f64, f64, f64, SpotResult)>) -> ComparisonSummary {
     }
 }
 
-/// Compare a turn model against `CfvSubgameSolver` + `RiverNetEvaluator`.
+/// Compare a turn model against `PostFlopGame` + `NetBoundaryEvaluator` (river net).
 ///
 /// Loads the turn model from `turn_model_path` and the river model from
 /// `river_model_path`. For each random turn spot, solves it with the
-/// river net as the leaf evaluator, then compares solver CFVs against
+/// river net at depth boundaries, then compares solver CFVs against
 /// the turn model's predictions.
 ///
 /// # Errors
@@ -263,19 +522,21 @@ pub fn run_turn_comparison_net(
             continue;
         }
 
-        let eval_model = river_model.clone();
-        let evaluator: Box<dyn LeafEvaluator> =
-            Box::new(RiverNetEvaluator::new(eval_model, device));
-
-        let result = compare_single(
+        let result = compare_single_net(
             &turn_model,
             &device,
             &sit,
             &bet_sizes_vec,
             solver_iterations,
-            evaluator,
+            river_model.clone(),
+            device,
         );
-        eprintln!("  spot {}/{num_spots}: MAE={:.6}, mBB={:.2}", i + 1, result.0, result.2);
+        eprintln!(
+            "  spot {}/{num_spots}: MAE={:.6}, mBB={:.2}",
+            i + 1,
+            result.0,
+            result.2
+        );
         results.push(result);
     }
 
@@ -286,11 +547,11 @@ pub fn run_turn_comparison_net(
     Ok(aggregate(results))
 }
 
-/// Compare a turn model against `CfvSubgameSolver` + `ExactRiverEvaluator`.
+/// Compare a turn model against `PostFlopGame` with exact river solving.
 ///
 /// Loads the turn model from `turn_model_path`. For each random turn spot,
-/// solves it exactly by enumerating all river runouts at depth boundaries,
-/// then compares solver CFVs against the turn model's predictions.
+/// solves it exactly through the river to showdown, then compares solver
+/// CFVs against the turn model's predictions.
 ///
 /// This is much slower than `run_turn_comparison_net` but produces exact
 /// ground truth without relying on a river model.
@@ -332,20 +593,19 @@ pub fn run_turn_comparison_exact(
             continue;
         }
 
-        let evaluator: Box<dyn LeafEvaluator> = Box::new(ExactRiverEvaluator {
-            bet_sizes: vec![1.0],
-            iterations: 50,
-        });
-
-        let result = compare_single(
+        let result = compare_single_exact(
             &turn_model,
             &device,
             &sit,
             &bet_sizes_vec,
             solver_iterations,
-            evaluator,
         );
-        eprintln!("  spot {}/{num_spots}: MAE={:.6}, mBB={:.2}", i + 1, result.0, result.2);
+        eprintln!(
+            "  spot {}/{num_spots}: MAE={:.6}, mBB={:.2}",
+            i + 1,
+            result.0,
+            result.2
+        );
         results.push(result);
     }
 
@@ -383,17 +643,14 @@ pub fn run_turn_comparison_net_with_models(
             continue;
         }
 
-        let eval_model = river_model.clone();
-        let evaluator: Box<dyn LeafEvaluator> =
-            Box::new(RiverNetEvaluator::new(eval_model, device));
-
-        let result = compare_single(
+        let result = compare_single_net(
             turn_model,
             &device,
             &sit,
             &bet_sizes_vec,
             solver_iterations,
-            evaluator,
+            river_model.clone(),
+            device,
         );
         results.push(result);
     }
@@ -407,15 +664,15 @@ pub fn run_turn_comparison_net_with_models(
 
 /// Run exact comparison using a pre-loaded turn model (for testing).
 ///
-/// `exact_iterations` controls how many CFR iterations the
-/// `ExactRiverEvaluator` runs per river runout. Use a small value
-/// (e.g. 2) in tests for speed.
+/// Unlike the old implementation, `exact_iterations` is no longer needed
+/// since `PostFlopGame` with `depth_limit: None` solves through river
+/// to showdown natively. The parameter is kept for API compatibility.
 pub fn run_turn_comparison_exact_with_model(
     config: &CfvnetConfig,
     turn_model: &CfvNet<B>,
     num_spots: usize,
     seed: u64,
-    exact_iterations: u32,
+    _exact_iterations: u32,
 ) -> Result<ComparisonSummary, String> {
     let device = <B as burn::tensor::backend::Backend>::Device::default();
     let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
@@ -434,18 +691,12 @@ pub fn run_turn_comparison_exact_with_model(
             continue;
         }
 
-        let evaluator: Box<dyn LeafEvaluator> = Box::new(ExactRiverEvaluator {
-            bet_sizes: vec![1.0],
-            iterations: exact_iterations,
-        });
-
-        let result = compare_single(
+        let result = compare_single_exact(
             turn_model,
             &device,
             &sit,
             &bet_sizes_vec,
             solver_iterations,
-            evaluator,
         );
         results.push(result);
     }
@@ -510,9 +761,8 @@ mod tests {
         assert!(summary.worst_mbb.is_finite(), "worst_mbb not finite");
     }
 
-    /// Smoke test for the exact comparison pipeline. Ignored by default
-    /// because `ExactRiverEvaluator` solves ~48 river subgames per boundary
-    /// and is too slow in debug mode. Run with `cargo test --release -- --ignored`.
+    /// Smoke test for the exact comparison pipeline.
+    /// Uses `PostFlopGame` with `depth_limit: None` (solve through river).
     #[test]
     #[ignore]
     fn compare_exact_pipeline_runs() {
@@ -563,8 +813,8 @@ mod tests {
         assert!(summary.mean_mae.is_finite());
     }
 
-    /// File-based model loading + exact comparison. Ignored for the same
-    /// reason as `compare_exact_pipeline_runs`.
+    /// File-based model loading + exact comparison. Ignored because
+    /// full turn+river solving is slow in debug mode.
     #[test]
     #[ignore]
     fn compare_exact_with_saved_model_loads_from_disk() {
@@ -597,5 +847,92 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!((parsed[0] - 0.5).abs() < 1e-10);
         assert!((parsed[1] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn net_boundary_evaluator_returns_values_per_hand() {
+        use range_solver::game::BoundaryEvaluator;
+
+        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let river_model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+        // Board: As Kh 7d 4c (turn)
+        let board_u8: [u8; 4] = [
+            4 * 12 + 3, // As
+            4 * 11 + 2, // Kh
+            4 * 5 + 1,  // 7d
+            4 * 2 + 0,  // 4c
+        ];
+        // Build a PostFlopGame to get realistic private cards
+        let bet_sizes_f64 = parse_bet_sizes(&vec!["50%".into()]);
+        let game = build_turn_postflop_game(
+            &board_u8,
+            100.0,
+            200.0,
+            &[[1.0; NUM_COMBOS]; 2],
+            &[bet_sizes_f64],
+            Some(0),
+        )
+        .expect("game should build");
+        let private_cards = [
+            game.private_cards(0).to_vec(),
+            game.private_cards(1).to_vec(),
+        ];
+        let evaluator = NetBoundaryEvaluator::new(river_model, device, board_u8, private_cards);
+
+        let num_hands = game.private_cards(0).len();
+        let opponent_reach = vec![1.0_f32; game.private_cards(1).len()];
+        let result = evaluator.compute_cfvs(0, 100, 200.0, &opponent_reach, num_hands);
+        assert_eq!(result.len(), num_hands, "should return one CFV per hand");
+        for (i, &v) in result.iter().enumerate() {
+            assert!(v.is_finite(), "hand {i} has non-finite CFV: {v}");
+        }
+    }
+
+    #[test]
+    fn solve_and_extract_net_returns_valid_cfvs() {
+        let config = test_config();
+        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let river_model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let sit = sample_situation(&config.datagen, config.game.initial_stack, 4, &mut rng);
+
+        let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
+        let bet_sizes_vec = vec![bet_sizes_f64];
+
+        let (cfvs, valid) =
+            solve_and_extract_net(&sit, &bet_sizes_vec, 10, river_model, device, 0);
+
+        // At least some combos should be valid
+        let valid_count = valid.iter().filter(|&&v| v).count();
+        assert!(valid_count > 0, "should have valid combos");
+
+        // All valid CFVs should be finite
+        for (i, (&c, &v)) in cfvs.iter().zip(valid.iter()).enumerate() {
+            if v {
+                assert!(c.is_finite(), "combo {i} has non-finite CFV: {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn solve_and_extract_exact_returns_valid_cfvs() {
+        let config = test_config();
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let sit = sample_situation(&config.datagen, config.game.initial_stack, 4, &mut rng);
+
+        let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
+        let bet_sizes_vec = vec![bet_sizes_f64];
+
+        let (cfvs, valid) = solve_and_extract_exact(&sit, &bet_sizes_vec, 5, 0);
+
+        let valid_count = valid.iter().filter(|&&v| v).count();
+        assert!(valid_count > 0, "should have valid combos");
+
+        for (i, (&c, &v)) in cfvs.iter().zip(valid.iter()).enumerate() {
+            if v {
+                assert!(c.is_finite(), "combo {i} has non-finite CFV: {c}");
+            }
+        }
     }
 }
