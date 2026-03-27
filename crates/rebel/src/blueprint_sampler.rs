@@ -151,6 +151,169 @@ fn board_for_street(board: &[u8; 5], street: Street) -> &[u8] {
     }
 }
 
+/// Result of playing preflop under blueprint policy.
+///
+/// Contains the reach probabilities, pot, and effective stack
+/// at the flop entry point (after all preflop betting).
+pub struct PreFlopResult {
+    /// Reach probabilities for both players after preflop actions.
+    pub reach_probs: Box<[[f32; NUM_COMBOS]; 2]>,
+    /// Pot size entering the flop (sum of all preflop investments).
+    pub pot: i32,
+    /// Effective stack remaining after preflop betting.
+    pub effective_stack: i32,
+}
+
+/// Play preflop under blueprint policy, stopping at the flop boundary.
+///
+/// Traverses the blueprint game tree from root through all preflop
+/// Decision nodes, sampling actions and updating reach probabilities
+/// for all 1326 combos. Stops at the first Chance node (preflop→flop).
+///
+/// Returns updated reach, pot, and effective stack entering the flop.
+/// If the hand terminates during preflop (e.g., fold), returns `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn play_preflop_under_blueprint<R: Rng>(
+    strategy: &BlueprintV2Strategy,
+    tree: &GameTree,
+    buckets: &AllBuckets,
+    deal: &Deal,
+    initial_stack: i32,
+    small_blind: i32,
+    big_blind: i32,
+    rng: &mut R,
+) -> Option<PreFlopResult> {
+    let starting_stack = f64::from(initial_stack);
+    let decision_idx_map = tree.decision_index_map();
+    let mut reach = [[1.0f32; NUM_COMBOS]; 2];
+    let invested = [f64::from(small_blind), f64::from(big_blind)];
+
+    traverse_preflop(
+        strategy,
+        tree,
+        buckets,
+        deal,
+        &decision_idx_map,
+        &mut reach,
+        tree.root,
+        invested,
+        starting_stack,
+        initial_stack,
+        rng,
+    )
+}
+
+/// Recursive preflop traversal under blueprint policy.
+///
+/// Like `traverse`, but stops at the first Chance node (flop boundary)
+/// instead of recursing into postflop streets. Does not push PBS snapshots.
+#[allow(clippy::too_many_arguments)]
+fn traverse_preflop<R: Rng>(
+    strategy: &BlueprintV2Strategy,
+    tree: &GameTree,
+    buckets: &AllBuckets,
+    deal: &Deal,
+    decision_idx_map: &[u32],
+    reach: &mut [[f32; NUM_COMBOS]; 2],
+    node_idx: u32,
+    invested: [f64; 2],
+    starting_stack: f64,
+    initial_stack: i32,
+    rng: &mut R,
+) -> Option<PreFlopResult> {
+    match &tree.nodes[node_idx as usize] {
+        GameNode::Terminal { .. } => {
+            // Hand ended during preflop (fold)
+            None
+        }
+
+        GameNode::Chance { .. } => {
+            // Reached flop boundary — return result
+            let pot = (invested[0] + invested[1]).round() as i32;
+            let max_invested = invested[0].max(invested[1]);
+            let effective_stack = initial_stack - max_invested.round() as i32;
+
+            Some(PreFlopResult {
+                reach_probs: Box::new(*reach),
+                pot,
+                effective_stack,
+            })
+        }
+
+        GameNode::Decision {
+            player,
+            street,
+            actions,
+            children,
+            ..
+        } => {
+            // Same action sampling + reach update logic as traverse()
+            let player = *player;
+            let street = *street;
+            let decision_idx = decision_idx_map[node_idx as usize];
+
+            let hole = deal.hole_cards[player as usize];
+            let board_slice = board_for_street(&deal.board, street);
+            let rs_hole = [rs_id_to_card(hole[0]), rs_id_to_card(hole[1])];
+            let rs_board: Vec<Card> = board_slice.iter().map(|&c| rs_id_to_card(c)).collect();
+            let actual_bucket = buckets.get_bucket(street, rs_hole, &rs_board);
+
+            let action_probs = strategy.get_action_probs(decision_idx as usize, actual_bucket);
+            if action_probs.is_empty() || actions.is_empty() {
+                return None;
+            }
+
+            let chosen_action_idx = sample_action(action_probs, rng);
+
+            // Update reach for acting player
+            let combo_buckets = compute_combo_buckets(buckets, street, board_slice);
+            let num_buckets = buckets.bucket_counts[street as usize] as usize;
+            let num_actions = actions.len();
+
+            let mut action_probs_per_bucket: Vec<Vec<f32>> = Vec::with_capacity(num_buckets);
+            for b in 0..num_buckets {
+                let probs = strategy.get_action_probs(decision_idx as usize, b as u16);
+                if probs.len() == num_actions {
+                    action_probs_per_bucket.push(probs.to_vec());
+                } else {
+                    let uniform = 1.0 / num_actions as f32;
+                    action_probs_per_bucket.push(vec![uniform; num_actions]);
+                }
+            }
+
+            update_reach(
+                &mut reach[player as usize],
+                &combo_buckets,
+                &action_probs_per_bucket,
+                chosen_action_idx,
+            );
+
+            // Update invested based on action
+            let new_invested = apply_action(
+                &actions[chosen_action_idx],
+                invested,
+                player as usize,
+                starting_stack,
+            );
+
+            // Recurse into chosen child
+            traverse_preflop(
+                strategy,
+                tree,
+                buckets,
+                deal,
+                decision_idx_map,
+                reach,
+                children[chosen_action_idx],
+                new_invested,
+                starting_stack,
+                initial_stack,
+                rng,
+            )
+        }
+    }
+}
+
 /// Play one hand under blueprint policy, returning PBS snapshots at street boundaries.
 ///
 /// For each decision node:
@@ -743,6 +906,19 @@ mod tests {
             "Unblocked combo should have valid bucket, got {}",
             combo_buckets[unblocked_idx]
         );
+    }
+
+    #[test]
+    fn test_play_preflop_result_has_updated_reach() {
+        // PreFlopResult should exist and have the right fields
+        let result = PreFlopResult {
+            reach_probs: Box::new([[1.0f32; 1326]; 2]),
+            pot: 3,
+            effective_stack: 47,
+        };
+        assert_eq!(result.pot, 3);
+        assert_eq!(result.effective_stack, 47);
+        assert_eq!(result.reach_probs[0].len(), 1326);
     }
 
     #[test]
