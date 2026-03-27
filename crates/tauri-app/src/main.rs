@@ -2,6 +2,47 @@
 
 use std::sync::Arc;
 
+#[tauri::command]
+fn copy_to_clipboard(text: String) -> Result<(), String> {
+    use std::process::Command;
+    // Use pbcopy on macOS, xclip on Linux, clip on Windows
+    #[cfg(target_os = "macos")]
+    {
+        let mut child = Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn pbcopy: {e}"))?;
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(text.as_bytes())
+            .map_err(|e| format!("Failed to write to pbcopy: {e}"))?;
+        child.wait().map_err(|e| format!("pbcopy failed: {e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut child = Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn xclip: {e}"))?;
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(text.as_bytes())
+            .map_err(|e| format!("Failed to write to xclip: {e}"))?;
+        child.wait().map_err(|e| format!("xclip failed: {e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut child = Command::new("clip")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn clip: {e}"))?;
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(text.as_bytes())
+            .map_err(|e| format!("Failed to write to clip: {e}"))?;
+        child.wait().map_err(|e| format!("clip failed: {e}"))?;
+    }
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -54,6 +95,7 @@ fn main() {
             poker_solver_tauri::game_cancel_solve,
             poker_solver_tauri::game_encode_spot,
             poker_solver_tauri::game_load_spot,
+            copy_to_clipboard,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
