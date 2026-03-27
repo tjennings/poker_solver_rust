@@ -3,6 +3,7 @@ mod blueprint_tui_config;
 mod blueprint_tui_metrics;
 mod blueprint_tui_scenarios;
 mod blueprint_tui_widgets;
+mod inspect_spot;
 mod log_file;
 mod validate_blueprint;
 mod validation_spots;
@@ -195,6 +196,16 @@ enum Commands {
         /// Number of hands for head-to-head evaluation
         #[arg(long, default_value_t = 100000)]
         num_hands: usize,
+    },
+    /// Inspect a blueprint strategy at a specific spot encoding
+    InspectSpot {
+        /// Path to blueprint config YAML
+        #[arg(short, long)]
+        config: PathBuf,
+
+        /// Spot encoding string (e.g. "sb:2bb,bb:call|Td9d6h|bb:check,sb:4bb")
+        #[arg(long)]
+        spot: String,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -978,6 +989,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             if !any_found {
                 eprintln!("no matching .buckets files found in both directories");
             }
+        }
+        Commands::InspectSpot { config, spot } => {
+            inspect_spot::run(&config, &spot)
+                .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
         Commands::RebelSeed { config } => {
             run_rebel_seed(&config)?;
