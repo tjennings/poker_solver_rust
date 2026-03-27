@@ -126,10 +126,12 @@ impl Widget for &HandGridWidget<'_> {
         }
 
         // ── Title row ────────────────────────────────────────────────
-        let title = format!(
-            " {} | {} ",
-            self.state.scenario_name, self.state.street_label,
-        );
+        let spot = self.state.action_path.first().map(String::as_str).unwrap_or("");
+        let title = if spot.is_empty() {
+            format!(" {} | {} ", self.state.scenario_name, self.state.street_label)
+        } else {
+            format!(" {}({}) | {} ", self.state.scenario_name, spot, self.state.street_label)
+        };
         buf.set_string(area.x, area.y, &title, Style::default().bold());
 
         // ── Grid rows ───────────────────────────────────────────────
