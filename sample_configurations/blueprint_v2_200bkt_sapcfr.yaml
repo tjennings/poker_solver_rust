@@ -1,0 +1,89 @@
+# Blueprint V2 Config — 100BB HU, 200 buckets, SAPCFR+ optimizer + VR-MCCFR baselines
+game:
+  name: "200_sapcfr"
+  players: 2
+  stack_depth: 200
+  small_blind: 1
+  big_blind: 2
+
+clustering:
+  algorithm: potential_aware_emd
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+    sample_boards: 16432
+  river:
+    buckets: 200
+    sample_boards: 500000
+
+action_abstraction:
+  preflop:
+    - ["4bb"]
+    - ["8bb", "14bb"]
+    - ["30bb"]
+  flop:
+    - [0.25, 0.33, 0.75, 1.0]
+    - [0.33, 0.67, 1.0, 1.5]
+    - [2.0]
+  turn:
+    - [0.25, 0.33, 0.75, 1.0]
+    - [0.33, 0.75, 1.0, 1.5]
+    - [2.0]
+  river:
+    - [0.25, 0.33, 0.75, 1.0]
+    - [0.33, 0.75, 1.0, 1.5]
+    - [2.0]
+
+training:
+  cluster_path: "./local_data/buckets/200_v1"
+  time_limit_minutes: 7200
+  lcfr_warmup_iterations: 10000000
+  prune_after_iterations: 10000000
+  prune_threshold: -5
+  lcfr_discount_interval: 1000000
+  batch_size: 2000
+  purify_threshold: 0.03
+  #dcfr_epoch_cap: 80
+  # SAPCFR+ optimizer with prediction-based strategy
+  optimizer: "sapcfr+"
+  sapcfr_eta: 0.5
+  dcfr_alpha: 1.5
+  dcfr_gamma: 2.0
+  # Variance-reducing baselines
+  use_baselines: true
+  baseline_alpha: 0.01
+
+snapshots:
+  resume: true
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "./local_data/blueprints/200_100bb_sapcfr/snap"
+
+tui:
+  enabled: true
+  refresh_rate_ms: 2000
+  telemetry:
+    strategy_delta_interval_seconds: 120
+    sparkline_window: 60
+  scenarios:
+    - name: "SB Open"
+      player: SB
+      actions: []
+    - name: "BB vs 2.5x"
+      player: BB
+      actions: ["raise-0"]
+    - name: "SB vs 3-bet"
+      player: BB
+      actions: ["raise-0", "raise-1"]
+    - name: "SB Cbet K72"
+      player: SB
+      actions: ["raise-0", "call"]
+      board: ["Kh", "7s", "2d"]
+      street: flop
+  random_scenario:
+    enabled: true
+    hold_minutes: 3
+    pool: ["preflop", "flop", "turn", "river"]
