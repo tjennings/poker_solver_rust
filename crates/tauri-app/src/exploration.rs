@@ -3057,34 +3057,34 @@ mod tests {
             V2GameNode::Decision {
                 player: 1,
                 street: Street::Flop,
-                actions: vec![TreeAction::Check, TreeAction::Bet(2.0)],
+                actions: vec![TreeAction::Check, TreeAction::Bet(4.0)],
                 children: vec![4, 5],
                 blueprint_decision_idx: None,
             },
             // Node 3: terminal (fold)
             V2GameNode::Terminal {
                 kind: poker_solver_core::blueprint_v2::game_tree::TerminalKind::Fold { winner: 1 },
-                pot: 1.5,
-                stacks: [49.5, 49.0],
+                pot: 3.0,
+                stacks: [99.0, 98.0],
             },
             // Node 4: terminal (check through)
             V2GameNode::Terminal {
                 kind: poker_solver_core::blueprint_v2::game_tree::TerminalKind::Showdown,
-                pot: 2.0,
-                stacks: [49.0, 49.0],
+                pot: 4.0,
+                stacks: [98.0, 98.0],
             },
             // Node 5: terminal (bet, then fold assumed)
             V2GameNode::Terminal {
                 kind: poker_solver_core::blueprint_v2::game_tree::TerminalKind::Fold { winner: 1 },
-                pot: 4.0,
-                stacks: [49.0, 47.0],
+                pot: 8.0,
+                stacks: [98.0, 94.0],
             },
         ];
         V2GameTree {
             nodes,
             root: 0,
             dealer: 0,
-            starting_stack: 50.0,
+            starting_stack: 100.0,
         }
     }
 
@@ -3142,9 +3142,9 @@ mod tests {
             game: GameConfig {
                 name: "test".to_string(),
                 players: 2,
-                stack_depth: 100.0,
-                small_blind: 0.5,
-                big_blind: 1.0,
+                stack_depth: 200.0,
+                small_blind: 1.0,
+                big_blind: 2.0,
                 rake_rate: 0.0,
                 rake_cap: 0.0,
             },
@@ -3160,7 +3160,7 @@ mod tests {
                 per_flop: None,
             },
             action_abstraction: ActionAbstractionConfig {
-                preflop: vec![vec!["2.5bb".to_string()]],
+                preflop: vec![vec!["5bb".to_string()]],
                 flop: vec![vec![0.5]],
                 turn: vec![vec![0.5]],
                 river: vec![vec![0.5]],

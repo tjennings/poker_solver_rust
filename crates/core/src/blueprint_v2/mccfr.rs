@@ -1253,10 +1253,10 @@ mod tests {
 
     fn toy_tree() -> GameTree {
         GameTree::build(
-            10.0,
-            0.5,
+            20.0,
             1.0,
-            &[vec!["2.5bb".into()]],
+            2.0,
+            &[vec!["5bb".into()]],
             &[vec![1.0]],
             &[vec![1.0]],
             &[vec![1.0]],

@@ -1151,10 +1151,10 @@ mod tests {
     #[test]
     fn cbv_real_tree_with_transitions_finite() {
         let tree = GameTree::build(
-            10.0,
-            0.5,
+            20.0,
             1.0,
-            &[vec!["2.5bb".into()]],
+            2.0,
+            &[vec!["5bb".into()]],
             &[vec![1.0]],
             &[vec![1.0]],
             &[vec![1.0]],
@@ -1298,10 +1298,10 @@ mod tests {
     #[test]
     fn cbv_on_real_tree() {
         let tree = GameTree::build(
-            10.0,
-            0.5,
+            20.0,
             1.0,
-            &[vec!["2.5bb".into()]],
+            2.0,
+            &[vec!["5bb".into()]],
             &[vec![1.0]],
             &[vec![1.0]],
             &[vec![1.0]],

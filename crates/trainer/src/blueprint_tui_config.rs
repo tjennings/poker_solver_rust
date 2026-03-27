@@ -209,9 +209,9 @@ tui:
         let yaml = r#"
 game:
   players: 2
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
 training:
   cluster_path: "/tmp/clusters"
 tui:

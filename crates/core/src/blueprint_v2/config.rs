@@ -121,7 +121,7 @@ pub struct StreetClusterConfig {
 /// Action abstraction: allowed bet sizes per street and raise cap.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionAbstractionConfig {
-    /// Preflop sizes as string labels (e.g. `"2.5bb"`, `"3.0x"`).
+    /// Preflop sizes as string labels (e.g. `"5bb"`, `"3.0x"`).
     /// Outer vec is per raise depth, inner vec is the set of sizes at that depth.
     pub preflop: Vec<Vec<String>>,
     /// Flop bet sizes as pot fractions, indexed by raise depth.
@@ -333,7 +333,7 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
+    - ["5bb"]
     - ["3.0x"]
   flop:
     - [0.33, 0.67, 1.0]
@@ -384,7 +384,7 @@ snapshots:
 
         // Action abstraction
         assert_eq!(cfg.action_abstraction.preflop.len(), 2);
-        assert_eq!(cfg.action_abstraction.preflop[0], vec!["2.5bb"]);
+        assert_eq!(cfg.action_abstraction.preflop[0], vec!["5bb"]);
         assert_eq!(cfg.action_abstraction.flop[0], vec![0.33, 0.67, 1.0]);
 
         // Training
@@ -434,7 +434,7 @@ snapshots:
                 per_flop: None,
             },
             action_abstraction: ActionAbstractionConfig {
-                preflop: vec![vec!["2.5bb".to_owned()], vec!["3.0x".to_owned()]],
+                preflop: vec![vec!["5bb".to_owned()], vec!["3.0x".to_owned()]],
                 flop: vec![vec![0.5, 1.0]],
                 turn: vec![vec![0.5, 1.0]],
                 river: vec![vec![1.0]],
@@ -531,7 +531,7 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
+    - ["5bb"]
   flop:
     - [1.0]
   turn:
@@ -612,7 +612,7 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
+    - ["5bb"]
   flop:
     - [1.0]
   turn:
@@ -665,7 +665,7 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
+    - ["5bb"]
   flop:
     - [1.0]
   turn:
@@ -713,7 +713,7 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
+    - ["5bb"]
   flop:
     - [1.0]
   turn:
@@ -758,7 +758,7 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
+    - ["5bb"]
   flop:
     - [1.0]
   turn:
@@ -806,7 +806,7 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
+    - ["5bb"]
   flop:
     - [1.0]
   turn:
@@ -851,7 +851,7 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
+    - ["5bb"]
   flop:
     - [1.0]
   turn:
@@ -898,7 +898,7 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["2.5bb"]
+    - ["5bb"]
   flop:
     - [1.0]
   turn:
