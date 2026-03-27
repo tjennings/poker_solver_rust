@@ -145,6 +145,11 @@ struct GameSolveParams {
     range_clamp_threshold: Option<f64>,
 }
 
+#[derive(Deserialize)]
+struct GameLoadSpotParams {
+    spot: String,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -624,6 +629,22 @@ async fn handle_game_cancel_solve(
     result_to_response(poker_solver_tauri::game_cancel_solve_core(&session_state))
 }
 
+async fn handle_game_encode_spot(
+    Extension(session_state): Extension<Arc<GameSessionState>>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::game_encode_spot_core(&session_state))
+}
+
+async fn handle_game_load_spot(
+    Extension(session_state): Extension<Arc<GameSessionState>>,
+    Json(params): Json<GameLoadSpotParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::game_load_spot_core(
+        &session_state,
+        &params.spot,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -736,6 +757,8 @@ async fn main() {
         .route("/api/game_back", post(handle_game_back))
         .route("/api/game_solve", post(handle_game_solve))
         .route("/api/game_cancel_solve", post(handle_game_cancel_solve))
+        .route("/api/game_encode_spot", post(handle_game_encode_spot))
+        .route("/api/game_load_spot", post(handle_game_load_spot))
         .layer(Extension(ws_tx))
         .layer(Extension(simulation_state))
         .layer(Extension(game_session_state))

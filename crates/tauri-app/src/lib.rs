@@ -51,10 +51,12 @@ pub use simulation::{
 
 pub use game_session::{
     // Tauri command wrappers
-    game_new, game_get_state, game_play_action, game_deal_card, game_back, game_solve, game_cancel_solve,
+    game_new, game_get_state, game_play_action, game_deal_card, game_back, game_solve,
+    game_cancel_solve, game_encode_spot, game_load_spot,
     // Core functions (no Tauri dependency, usable from Axum or other runtimes)
     game_new_core, game_get_state_core, game_play_action_core, game_deal_card_core,
     game_back_core, game_solve_core, game_cancel_solve_core,
+    game_encode_spot_core, game_load_spot_core,
     // Types
     GameSessionState,
 };

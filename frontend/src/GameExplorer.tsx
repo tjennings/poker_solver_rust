@@ -138,6 +138,10 @@ export default function GameExplorer() {
   const [blueprints, setBlueprints] = useState<{ name: string; path: string; stack_depth: number; latest_snapshot: string | null }[]>([]);
   const [bundleName, setBundleName] = useState<string | null>(null);
   const [solving, setSolving] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [showLoadModal, setShowLoadModal] = useState(false);
+  const [loadSpotInput, setLoadSpotInput] = useState('');
+  const [loadSpotError, setLoadSpotError] = useState<string | null>(null);
 
   // ── List available blueprints on mount ──────────────────────────
 
@@ -287,6 +291,34 @@ export default function GameExplorer() {
     [state],
   );
 
+  // ── Copy spot handler ──────────────────────────────────────────────
+
+  const copySpot = useCallback(async () => {
+    try {
+      const spot = await invoke<string>('game_encode_spot', {});
+      await navigator.clipboard.writeText(spot);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  // ── Load spot handler ─────────────────────────────────────────────
+
+  const loadSpot = useCallback(async () => {
+    try {
+      setLoadSpotError(null);
+      const s = await invoke<GameState>('game_load_spot', { spot: loadSpotInput });
+      setState(s);
+      setShowLoadModal(false);
+      setLoadSpotInput('');
+      setSelectedCell(null);
+    } catch (e) {
+      setLoadSpotError(String(e));
+    }
+  }, [loadSpotInput]);
+
   // ── Derived state ────────────────────────────────────────────────
 
   const matrixActions = state?.matrix?.actions ?? state?.actions ?? [];
@@ -374,53 +406,107 @@ export default function GameExplorer() {
       {/* Action strip: history breadcrumbs + current actions */}
       {state && (
         <div className="action-strip">
-          {/* Back / New Hand / Blueprint buttons */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', flexShrink: 0 }}>
-            {bundleName && (
-              <button
-                style={{
-                  padding: '2px 6px',
-                  fontSize: '0.55rem',
-                  background: 'transparent',
-                  border: '1px solid #334155',
-                  borderRadius: '4px',
-                  color: '#94a3b8',
-                  cursor: 'pointer',
-                }}
-                onClick={() => { setState(null); setBundleName(null); }}
-                title="Change blueprint"
-              >
-                {bundleName}
-              </button>
-            )}
+          {/* Vertical toolbar */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', flexShrink: 0 }}>
             <button
               style={{
-                padding: '4px 8px',
+                padding: '4px 6px',
                 fontSize: '0.65rem',
                 background: '#1e293b',
                 border: '1px solid #444',
                 borderRadius: '4px',
                 color: '#ccc',
+                cursor: 'pointer',
               }}
               disabled={state.action_history.length === 0}
               onClick={goBack}
+              title="Undo last action"
             >
-              Back
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6" /></svg>
             </button>
             <button
               style={{
-                padding: '4px 8px',
+                padding: '4px 6px',
                 fontSize: '0.65rem',
                 background: '#1e293b',
                 border: '1px solid #444',
                 borderRadius: '4px',
                 color: '#ccc',
+                cursor: 'pointer',
               }}
               onClick={newHand}
+              title="New hand"
             >
-              New
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" /></svg>
+            </button>
+            <button
+              style={{
+                padding: '4px 6px',
+                fontSize: '0.65rem',
+                background: copied ? '#16a34a22' : '#1e293b',
+                border: `1px solid ${copied ? '#16a34a' : '#444'}`,
+                borderRadius: '4px',
+                color: copied ? '#16a34a' : '#ccc',
+                cursor: 'pointer',
+              }}
+              onClick={copySpot}
+              title={copied ? 'Copied!' : 'Copy spot encoding'}
+            >
+              {copied ? (
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+              ) : (
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+              )}
+            </button>
+            <button
+              style={{
+                padding: '4px 6px',
+                fontSize: '0.65rem',
+                background: '#1e293b',
+                border: '1px solid #444',
+                borderRadius: '4px',
+                color: '#ccc',
+                cursor: 'pointer',
+              }}
+              onClick={() => { setShowLoadModal(true); setLoadSpotError(null); }}
+              title="Load spot encoding"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></svg>
             </button>
           </div>
+
+          {/* Blueprint summary card */}
+          {bundleName && (
+            <div style={{
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'center',
+              padding: '4px 8px',
+              background: '#1a1a2e',
+              border: '1px solid #334155',
+              borderRadius: '4px',
+              flexShrink: 0,
+              gap: '2px',
+            }}>
+              <div style={{ fontSize: '0.6rem', color: '#e2e8f0', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                {bundleName}
+              </div>
+              <button
+                style={{
+                  fontSize: '0.5rem',
+                  color: '#00d9ff',
+                  background: 'transparent',
+                  border: 'none',
+                  cursor: 'pointer',
+                  padding: 0,
+                  textAlign: 'left',
+                }}
+                onClick={() => { setState(null); setBundleName(null); }}
+              >
+                Change
+              </button>
+            </div>
+          )}
 
           {/* Action history as full ActionBlocks with street cards */}
           {(() => {
@@ -721,6 +807,101 @@ export default function GameExplorer() {
       {state && <SolveProgress state={state} />}
 
       {loading && <div className="loading">Loading...</div>}
+
+      {/* Load spot modal */}
+      {showLoadModal && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: 'rgba(0,0,0,0.6)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onClick={() => setShowLoadModal(false)}
+        >
+          <div
+            style={{
+              background: '#1a1a2e',
+              border: '1px solid #334155',
+              borderRadius: '8px',
+              padding: '1.5rem',
+              width: '500px',
+              maxWidth: '90vw',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ color: '#e2e8f0', marginTop: 0, marginBottom: '1rem', fontSize: '0.95rem' }}>
+              Load Spot
+            </h3>
+            <input
+              type="text"
+              value={loadSpotInput}
+              onChange={(e) => { setLoadSpotInput(e.target.value); setLoadSpotError(null); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') loadSpot(); }}
+              placeholder="sb:2bb,bb:call|Td9d6h|bb:check,sb:4bb"
+              style={{
+                width: '100%',
+                padding: '0.5rem',
+                fontFamily: 'monospace',
+                fontSize: '0.85rem',
+                background: '#0f0f1e',
+                border: '1px solid #334155',
+                borderRadius: '4px',
+                color: '#e2e8f0',
+                boxSizing: 'border-box',
+              }}
+              autoFocus
+            />
+            {loadSpotError && (
+              <div style={{
+                color: '#ef4444',
+                fontSize: '0.75rem',
+                marginTop: '0.5rem',
+                whiteSpace: 'pre-wrap',
+              }}>
+                {loadSpotError}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem', justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => { setShowLoadModal(false); setLoadSpotInput(''); setLoadSpotError(null); }}
+                style={{
+                  padding: '0.4rem 1rem',
+                  background: 'transparent',
+                  border: '1px solid #334155',
+                  borderRadius: '4px',
+                  color: '#94a3b8',
+                  cursor: 'pointer',
+                  fontSize: '0.8rem',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={loadSpot}
+                style={{
+                  padding: '0.4rem 1rem',
+                  background: '#00d9ff22',
+                  border: '1px solid #00d9ff',
+                  borderRadius: '4px',
+                  color: '#00d9ff',
+                  cursor: 'pointer',
+                  fontSize: '0.8rem',
+                  fontWeight: 600,
+                }}
+              >
+                Load
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -763,6 +763,148 @@ impl GameSession {
         [remaining, remaining]
     }
 
+    /// Encode the current game state as a human-readable spot string.
+    ///
+    /// Format: `sb:2bb,bb:call|AhKdQc|bb:check,sb:4bb`
+    /// - Actions are `position:label` (lowercased), comma-separated
+    /// - `|` separates street transitions (board card deals)
+    /// - Board segments are card strings concatenated (e.g. "AhKdQc")
+    pub fn encode_spot(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut current_actions: Vec<String> = Vec::new();
+        let mut prev_street = String::new();
+        let mut board_idx = 0;
+
+        for rec in &self.action_history {
+            if rec.street != prev_street && !prev_street.is_empty() {
+                // Flush current actions
+                if !current_actions.is_empty() {
+                    parts.push(current_actions.join(","));
+                    current_actions.clear();
+                }
+                // Emit board cards for the street transition
+                let new_cards = match prev_street.as_str() {
+                    "Preflop" => 3,
+                    _ => 1,
+                };
+                let end = (board_idx + new_cards).min(self.board.len());
+                let board_str: String = self.board[board_idx..end].join("");
+                board_idx = end;
+                parts.push(board_str);
+            }
+            prev_street = rec.street.clone();
+            current_actions.push(format!(
+                "{}:{}",
+                rec.position.to_lowercase(),
+                rec.label.to_lowercase()
+            ));
+        }
+
+        // Flush remaining actions
+        if !current_actions.is_empty() {
+            parts.push(current_actions.join(","));
+        }
+
+        // Emit any remaining board cards (e.g. board dealt but no actions on new street)
+        if board_idx < self.board.len() {
+            let remaining: String = self.board[board_idx..].join("");
+            parts.push(remaining);
+        }
+
+        parts.join("|")
+    }
+
+    /// Parse a spot encoding and replay to that state.
+    ///
+    /// Resets to preflop root (including weights, board, action history),
+    /// then replays each action and board card deal from the encoding.
+    pub fn load_spot(&mut self, spot: &str) -> Result<(), String> {
+        let spot = spot.trim();
+        if spot.is_empty() {
+            return Ok(());
+        }
+
+        // Reset to root
+        self.node_idx = self.tree.root;
+        self.board.clear();
+        self.action_history.clear();
+        self.weights = [vec![1.0f32; 1326], vec![1.0f32; 1326]];
+
+        let segments: Vec<&str> = spot.split('|').collect();
+
+        for segment in segments {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+
+            if segment.contains(':') {
+                // Action segment: "sb:2bb,bb:call"
+                let actions: Vec<&str> = segment.split(',').collect();
+                for action_str in actions {
+                    let action_str = action_str.trim();
+                    let (pos, label) = action_str.split_once(':').ok_or_else(|| {
+                        format!(
+                            "Invalid action format: '{action_str}'. Expected 'position:label'"
+                        )
+                    })?;
+
+                    // Get current state to find matching action
+                    let state = self.get_state();
+                    let position = state.position.to_lowercase();
+                    if pos.to_lowercase() != position {
+                        return Err(format!(
+                            "Position mismatch: '{pos}' but current position is '{}'",
+                            state.position
+                        ));
+                    }
+
+                    // Find matching action by label (case-insensitive)
+                    let matched = state
+                        .actions
+                        .iter()
+                        .find(|a| a.label.to_lowercase() == label.to_lowercase());
+
+                    match matched {
+                        Some(action) => {
+                            let id = action.id.clone();
+                            self.play_action(&id)?;
+                        }
+                        None => {
+                            let available: Vec<String> = state
+                                .actions
+                                .iter()
+                                .map(|a| {
+                                    format!("{}:{}", position, a.label.to_lowercase())
+                                })
+                                .collect();
+                            return Err(format!(
+                                "Action '{}:{}' not found. Available: {}",
+                                pos,
+                                label,
+                                available.join(", ")
+                            ));
+                        }
+                    }
+                }
+            } else {
+                // Board segment: "AhKdQc" or "7s" or "2d"
+                let chars: Vec<char> = segment.chars().collect();
+                if chars.len() % 2 != 0 {
+                    return Err(format!(
+                        "Invalid board segment: '{segment}'. Must be pairs of rank+suit."
+                    ));
+                }
+                for chunk in chars.chunks(2) {
+                    let card: String = chunk.iter().collect();
+                    self.deal_card(&card)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// For testing: create a session with a tree but no real strategy.
     #[cfg(test)]
     fn new_for_test(tree: V2GameTree) -> Self {
@@ -1830,6 +1972,39 @@ pub fn game_cancel_solve(
     game_cancel_solve_core(&session_state)
 }
 
+/// Encode the current game state as a human-readable spot string.
+pub fn game_encode_spot_core(session_state: &GameSessionState) -> Result<String, String> {
+    let guard = session_state.session.read();
+    let session = guard.as_ref().ok_or("No game session active")?;
+    Ok(session.encode_spot())
+}
+
+/// Parse a spot encoding and replay to that state, returning the new game state.
+pub fn game_load_spot_core(
+    session_state: &GameSessionState,
+    spot: &str,
+) -> Result<GameState, String> {
+    let mut guard = session_state.session.write();
+    let session = guard.as_mut().ok_or("No game session active")?;
+    session.load_spot(spot)?;
+    Ok(session.get_state())
+}
+
+#[tauri::command]
+pub fn game_encode_spot(
+    session_state: tauri::State<'_, GameSessionState>,
+) -> Result<String, String> {
+    game_encode_spot_core(&session_state)
+}
+
+#[tauri::command]
+pub fn game_load_spot(
+    session_state: tauri::State<'_, GameSessionState>,
+    spot: String,
+) -> Result<GameState, String> {
+    game_load_spot_core(&session_state, &spot)
+}
+
 #[cfg(test)]
 fn make_test_config() -> BlueprintV2Config {
     use poker_solver_core::blueprint_v2::config::*;
@@ -2656,5 +2831,454 @@ mod tests {
             dealer,
             starting_stack: 100.0,
         }
+    }
+
+    /// A multi-street tree: preflop SB raise/fold -> BB call/fold -> Chance -> Flop decisions.
+    /// Dealer = 0 (SB = player 0, BB = player 1).
+    ///
+    /// Nodes:
+    /// 0: SB decision (Preflop) [Fold(->1), Bet 2bb(->2)]
+    /// 1: Terminal (fold)
+    /// 2: BB decision (Preflop) [Fold(->3), Call(->4)]
+    /// 3: Terminal (fold)
+    /// 4: Chance (Flop) -> 5
+    /// 5: BB decision (Flop) [Check(->6), Bet 4bb(->7)]
+    /// 6: SB decision (Flop) [Check(->8), Bet 4bb(->9)]
+    /// 7: SB decision (Flop) [Fold(->10), Call(->11)]
+    /// 8: Terminal (showdown)
+    /// 9: Terminal (showdown)
+    /// 10: Terminal (fold)
+    /// 11: Chance (Turn) -> 12
+    /// 12: BB decision (Turn) [Check(->13), Bet 10bb(->14)]
+    /// 13: Terminal (showdown)
+    /// 14: Terminal (showdown)
+    fn make_multi_street_tree() -> V2GameTree {
+        use poker_solver_core::blueprint_v2::game_tree::TerminalKind;
+        V2GameTree {
+            nodes: vec![
+                // 0: SB decision (Preflop)
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Preflop,
+                    actions: vec![TreeAction::Fold, TreeAction::Bet(2.0)],
+                    children: vec![1, 2],
+                    blueprint_decision_idx: None,
+                },
+                // 1: Terminal (SB fold)
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Fold { winner: 1 },
+                    pot: 1.5,
+                    stacks: [99.5, 100.5],
+                },
+                // 2: BB decision (Preflop)
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Preflop,
+                    actions: vec![TreeAction::Fold, TreeAction::Call],
+                    children: vec![3, 4],
+                    blueprint_decision_idx: None,
+                },
+                // 3: Terminal (BB fold)
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Fold { winner: 0 },
+                    pot: 2.5,
+                    stacks: [100.5, 99.5],
+                },
+                // 4: Chance (Flop)
+                V2GameNode::Chance {
+                    next_street: Street::Flop,
+                    child: 5,
+                },
+                // 5: BB decision (Flop)
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Flop,
+                    actions: vec![TreeAction::Check, TreeAction::Bet(4.0)],
+                    children: vec![6, 7],
+                    blueprint_decision_idx: None,
+                },
+                // 6: SB decision (Flop) after BB check
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Flop,
+                    actions: vec![TreeAction::Check, TreeAction::Bet(4.0)],
+                    children: vec![8, 9],
+                    blueprint_decision_idx: None,
+                },
+                // 7: SB decision (Flop) after BB bet
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Flop,
+                    actions: vec![TreeAction::Fold, TreeAction::Call],
+                    children: vec![10, 11],
+                    blueprint_decision_idx: None,
+                },
+                // 8: Terminal (check-check showdown)
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Showdown,
+                    pot: 4.0,
+                    stacks: [98.0, 98.0],
+                },
+                // 9: Terminal (check-bet showdown)
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Showdown,
+                    pot: 8.0,
+                    stacks: [96.0, 96.0],
+                },
+                // 10: Terminal (SB fold to BB bet)
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Fold { winner: 1 },
+                    pot: 8.0,
+                    stacks: [96.0, 96.0],
+                },
+                // 11: Chance (Turn)
+                V2GameNode::Chance {
+                    next_street: Street::Turn,
+                    child: 12,
+                },
+                // 12: BB decision (Turn)
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::Check, TreeAction::Bet(10.0)],
+                    children: vec![13, 14],
+                    blueprint_decision_idx: None,
+                },
+                // 13: Terminal (showdown)
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Showdown,
+                    pot: 12.0,
+                    stacks: [94.0, 94.0],
+                },
+                // 14: Terminal (showdown)
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Showdown,
+                    pot: 32.0,
+                    stacks: [84.0, 84.0],
+                },
+            ],
+            root: 0,
+            dealer: 0,
+            starting_stack: 100.0,
+        }
+    }
+
+    fn make_multi_street_session() -> GameSession {
+        let tree = make_multi_street_tree();
+        GameSession::new_for_test(tree)
+    }
+
+    // -------------------------------------------------------------------
+    // core function tests (encode_spot_core, load_spot_core)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn encode_spot_core_no_session_errors() {
+        let gss = GameSessionState::default();
+        let result = game_encode_spot_core(&gss);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No game session"));
+    }
+
+    #[test]
+    fn encode_spot_core_returns_encoding() {
+        let gss = GameSessionState::default();
+        let mut session = make_multi_street_session();
+        session.play_action("0").unwrap(); // SB fold
+        *gss.session.write() = Some(session);
+        let result = game_encode_spot_core(&gss).unwrap();
+        assert_eq!(result, "sb:fold");
+    }
+
+    #[test]
+    fn load_spot_core_no_session_errors() {
+        let gss = GameSessionState::default();
+        let result = game_load_spot_core(&gss, "sb:fold");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No game session"));
+    }
+
+    #[test]
+    fn load_spot_core_returns_game_state() {
+        let gss = GameSessionState::default();
+        let session = make_multi_street_session();
+        *gss.session.write() = Some(session);
+        let state = game_load_spot_core(&gss, "sb:2bb,bb:fold").unwrap();
+        assert_eq!(state.action_history.len(), 2);
+        assert!(state.is_terminal);
+    }
+
+    // -------------------------------------------------------------------
+    // load_spot tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn load_spot_empty_string_is_noop() {
+        let mut session = make_multi_street_session();
+        let root = session.node_idx;
+        session.load_spot("").unwrap();
+        assert_eq!(session.node_idx, root);
+        assert!(session.action_history.is_empty());
+        assert!(session.board.is_empty());
+    }
+
+    #[test]
+    fn load_spot_whitespace_only_is_noop() {
+        let mut session = make_multi_street_session();
+        session.load_spot("  \n  ").unwrap();
+        assert!(session.action_history.is_empty());
+    }
+
+    #[test]
+    fn load_spot_preflop_fold() {
+        let mut session = make_multi_street_session();
+        session.load_spot("sb:fold").unwrap();
+        assert_eq!(session.action_history.len(), 1);
+        assert_eq!(session.action_history[0].label, "Fold");
+        assert_eq!(session.action_history[0].position, "SB");
+    }
+
+    #[test]
+    fn load_spot_preflop_two_actions() {
+        let mut session = make_multi_street_session();
+        session.load_spot("sb:2bb,bb:fold").unwrap();
+        assert_eq!(session.action_history.len(), 2);
+        assert_eq!(session.action_history[0].label, "2bb");
+        assert_eq!(session.action_history[1].label, "Fold");
+    }
+
+    #[test]
+    fn load_spot_case_insensitive_labels() {
+        let mut session = make_multi_street_session();
+        session.load_spot("SB:FOLD").unwrap();
+        assert_eq!(session.action_history.len(), 1);
+        assert_eq!(session.action_history[0].label, "Fold");
+    }
+
+    #[test]
+    fn load_spot_board_segment_parsed() {
+        let mut session = make_multi_street_session();
+        session.load_spot("sb:2bb,bb:call|Td9d6h").unwrap();
+        assert_eq!(session.board, vec!["Td", "9d", "6h"]);
+        assert_eq!(session.action_history.len(), 2);
+    }
+
+    #[test]
+    fn load_spot_flop_actions_after_board() {
+        let mut session = make_multi_street_session();
+        session.load_spot("sb:2bb,bb:call|Td9d6h|bb:check,sb:4bb").unwrap();
+        assert_eq!(session.action_history.len(), 4);
+        assert_eq!(session.board.len(), 3);
+        assert_eq!(session.action_history[2].label, "Check");
+        assert_eq!(session.action_history[2].street, "Flop");
+        assert_eq!(session.action_history[3].label, "4bb");
+    }
+
+    #[test]
+    fn load_spot_turn_deal() {
+        let mut session = make_multi_street_session();
+        session
+            .load_spot("sb:2bb,bb:call|Td9d6h|bb:4bb,sb:call|Kh")
+            .unwrap();
+        assert_eq!(session.board.len(), 4);
+        assert_eq!(session.board[3], "Kh");
+    }
+
+    #[test]
+    fn load_spot_invalid_action_errors() {
+        let mut session = make_multi_street_session();
+        let result = session.load_spot("sb:invalid");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("not found"), "Error was: {err}");
+        assert!(err.contains("Available"), "Error was: {err}");
+    }
+
+    #[test]
+    fn load_spot_position_mismatch_errors() {
+        let mut session = make_multi_street_session();
+        // First action should be SB, not BB
+        let result = session.load_spot("bb:fold");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Position mismatch"), "Error was: {err}");
+    }
+
+    #[test]
+    fn load_spot_invalid_format_errors() {
+        let mut session = make_multi_street_session();
+        let result = session.load_spot("nocolon");
+        // "nocolon" has no colon, so it's treated as a board segment
+        // With odd length it should error
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_spot_resets_prior_state() {
+        let mut session = make_multi_street_session();
+        // Play some actions first
+        session.play_action("0").unwrap(); // SB fold
+        assert_eq!(session.action_history.len(), 1);
+
+        // load_spot should reset and replay from scratch
+        session.load_spot("sb:2bb,bb:call|Td9d6h").unwrap();
+        assert_eq!(session.action_history.len(), 2);
+        assert_eq!(session.board.len(), 3);
+    }
+
+    // -------------------------------------------------------------------
+    // encode/load round-trip tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn round_trip_preflop_fold() {
+        let mut session1 = make_multi_street_session();
+        session1.play_action("0").unwrap(); // SB fold
+        let encoded = session1.encode_spot();
+
+        let mut session2 = make_multi_street_session();
+        session2.load_spot(&encoded).unwrap();
+        assert_eq!(session2.encode_spot(), encoded);
+        assert_eq!(session2.action_history.len(), session1.action_history.len());
+    }
+
+    #[test]
+    fn round_trip_preflop_to_flop() {
+        let mut session1 = make_multi_street_session();
+        session1.play_action("1").unwrap(); // SB 2bb
+        session1.play_action("1").unwrap(); // BB call
+        session1.deal_card("Ah").unwrap();
+        session1.deal_card("Kd").unwrap();
+        session1.deal_card("Qc").unwrap();
+        let encoded = session1.encode_spot();
+
+        let mut session2 = make_multi_street_session();
+        session2.load_spot(&encoded).unwrap();
+        assert_eq!(session2.encode_spot(), encoded);
+        assert_eq!(session2.board, session1.board);
+    }
+
+    #[test]
+    fn round_trip_flop_actions() {
+        let mut session1 = make_multi_street_session();
+        session1.play_action("1").unwrap(); // SB 2bb
+        session1.play_action("1").unwrap(); // BB call
+        session1.deal_card("Td").unwrap();
+        session1.deal_card("9d").unwrap();
+        session1.deal_card("6h").unwrap();
+        session1.play_action("0").unwrap(); // BB check
+        session1.play_action("1").unwrap(); // SB 4bb
+        let encoded = session1.encode_spot();
+
+        let mut session2 = make_multi_street_session();
+        session2.load_spot(&encoded).unwrap();
+        assert_eq!(session2.encode_spot(), encoded);
+        assert_eq!(session2.action_history.len(), 4);
+    }
+
+    #[test]
+    fn round_trip_turn_deal() {
+        let mut session1 = make_multi_street_session();
+        session1.play_action("1").unwrap(); // SB 2bb
+        session1.play_action("1").unwrap(); // BB call
+        session1.deal_card("Td").unwrap();
+        session1.deal_card("9d").unwrap();
+        session1.deal_card("6h").unwrap();
+        session1.play_action("1").unwrap(); // BB 4bb
+        session1.play_action("1").unwrap(); // SB call
+        session1.deal_card("Kh").unwrap();
+        let encoded = session1.encode_spot();
+
+        let mut session2 = make_multi_street_session();
+        session2.load_spot(&encoded).unwrap();
+        assert_eq!(session2.encode_spot(), encoded);
+        assert_eq!(session2.board, vec!["Td", "9d", "6h", "Kh"]);
+    }
+
+    // -------------------------------------------------------------------
+    // encode_spot tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn encode_spot_empty_history() {
+        let session = make_multi_street_session();
+        assert_eq!(session.encode_spot(), "");
+    }
+
+    #[test]
+    fn encode_spot_preflop_fold() {
+        let mut session = make_multi_street_session();
+        session.play_action("0").unwrap(); // SB fold
+        assert_eq!(session.encode_spot(), "sb:fold");
+    }
+
+    #[test]
+    fn encode_spot_preflop_two_actions() {
+        let mut session = make_multi_street_session();
+        session.play_action("1").unwrap(); // SB 2bb
+        session.play_action("0").unwrap(); // BB fold
+        assert_eq!(session.encode_spot(), "sb:2bb,bb:fold");
+    }
+
+    #[test]
+    fn encode_spot_preflop_to_flop_deal() {
+        let mut session = make_multi_street_session();
+        session.play_action("1").unwrap(); // SB 2bb
+        session.play_action("1").unwrap(); // BB call -> Chance node
+        session.deal_card("Td").unwrap();
+        session.deal_card("9d").unwrap();
+        session.deal_card("6h").unwrap();
+        assert_eq!(session.encode_spot(), "sb:2bb,bb:call|Td9d6h");
+    }
+
+    #[test]
+    fn encode_spot_flop_action_after_board() {
+        let mut session = make_multi_street_session();
+        session.play_action("1").unwrap(); // SB 2bb
+        session.play_action("1").unwrap(); // BB call
+        session.deal_card("Td").unwrap();
+        session.deal_card("9d").unwrap();
+        session.deal_card("6h").unwrap();
+        session.play_action("0").unwrap(); // BB check
+        session.play_action("1").unwrap(); // SB 4bb
+        assert_eq!(
+            session.encode_spot(),
+            "sb:2bb,bb:call|Td9d6h|bb:check,sb:4bb"
+        );
+    }
+
+    #[test]
+    fn encode_spot_flop_to_turn_deal() {
+        let mut session = make_multi_street_session();
+        session.play_action("1").unwrap(); // SB 2bb
+        session.play_action("1").unwrap(); // BB call
+        session.deal_card("Td").unwrap();
+        session.deal_card("9d").unwrap();
+        session.deal_card("6h").unwrap();
+        session.play_action("1").unwrap(); // BB 4bb
+        session.play_action("1").unwrap(); // SB call -> Chance (Turn)
+        session.deal_card("Kh").unwrap();
+        assert_eq!(
+            session.encode_spot(),
+            "sb:2bb,bb:call|Td9d6h|bb:4bb,sb:call|Kh"
+        );
+    }
+
+    #[test]
+    fn encode_spot_turn_action() {
+        let mut session = make_multi_street_session();
+        session.play_action("1").unwrap(); // SB 2bb
+        session.play_action("1").unwrap(); // BB call
+        session.deal_card("Td").unwrap();
+        session.deal_card("9d").unwrap();
+        session.deal_card("6h").unwrap();
+        session.play_action("1").unwrap(); // BB 4bb
+        session.play_action("1").unwrap(); // SB call -> Turn
+        session.deal_card("Kh").unwrap();
+        session.play_action("1").unwrap(); // BB 10bb
+        assert_eq!(
+            session.encode_spot(),
+            "sb:2bb,bb:call|Td9d6h|bb:4bb,sb:call|Kh|bb:10bb"
+        );
     }
 }
