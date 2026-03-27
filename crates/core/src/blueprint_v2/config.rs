@@ -21,11 +21,11 @@ pub struct GameConfig {
     /// Human-readable name for this blueprint (shown in UI).
     pub name: String,
     pub players: u8,
-    /// Stack depth in big blinds.
+    /// Stack depth in chips (1 BB = 2 chips).
     pub stack_depth: f64,
-    /// Small blind size in big blinds (typically 0.5).
+    /// Small blind size in chips (typically 1).
     pub small_blind: f64,
-    /// Big blind size in big blinds (typically 1.0).
+    /// Big blind size in chips (typically 2).
     pub big_blind: f64,
     /// Rake as a fraction of the pot (0.0 = no rake, 0.05 = 5%).
     #[serde(default)]
@@ -316,9 +316,9 @@ mod tests {
 game:
   name: "Test Config"
   players: 6
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   algorithm: potential_aware_emd
@@ -362,9 +362,9 @@ snapshots:
         // Game
         assert_eq!(cfg.game.name, "Test Config");
         assert_eq!(cfg.game.players, 6);
-        assert!((cfg.game.stack_depth - 100.0).abs() < f64::EPSILON);
-        assert!((cfg.game.small_blind - 0.5).abs() < f64::EPSILON);
-        assert!((cfg.game.big_blind - 1.0).abs() < f64::EPSILON);
+        assert!((cfg.game.stack_depth - 200.0).abs() < f64::EPSILON);
+        assert!((cfg.game.small_blind - 1.0).abs() < f64::EPSILON);
+        assert!((cfg.game.big_blind - 2.0).abs() < f64::EPSILON);
         // rake defaults to 0.0 when omitted
         assert!((cfg.game.rake_rate).abs() < f64::EPSILON);
         assert!((cfg.game.rake_cap).abs() < f64::EPSILON);
@@ -416,9 +416,9 @@ snapshots:
             game: GameConfig {
                 name: "Round Trip Test".to_string(),
                 players: 2,
-                stack_depth: 50.0,
-                small_blind: 0.5,
-                big_blind: 1.0,
+                stack_depth: 100.0,
+                small_blind: 1.0,
+                big_blind: 2.0,
                 rake_rate: 0.045,
                 rake_cap: 3.0,
             },
@@ -512,9 +512,9 @@ snapshots:
 game:
   name: "Per-Flop Test"
   players: 2
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   flop:
@@ -595,9 +595,9 @@ turn_buckets: 150
 game:
   name: "Legacy Config"
   players: 6
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   algorithm: potential_aware_emd
@@ -646,9 +646,9 @@ snapshots:
 game:
   name: "Raked Game"
   players: 2
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
   rake_rate: 0.05
   rake_cap: 3.0
 
@@ -697,9 +697,9 @@ snapshots:
 game:
   name: "Optimizer Default"
   players: 2
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   preflop:
@@ -742,9 +742,9 @@ snapshots:
 game:
   name: "SAPCFR+ Test"
   players: 2
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   preflop:
@@ -790,9 +790,9 @@ snapshots:
 game:
   name: "Baseline Defaults"
   players: 2
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   preflop:
@@ -835,9 +835,9 @@ snapshots:
 game:
   name: "Baseline Explicit"
   players: 2
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   preflop:
@@ -882,9 +882,9 @@ snapshots:
 game:
   name: "Round Trip"
   players: 2
-  stack_depth: 100.0
-  small_blind: 0.5
-  big_blind: 1.0
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
 
 clustering:
   preflop:

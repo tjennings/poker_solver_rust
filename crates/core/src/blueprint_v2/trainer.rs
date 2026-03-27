@@ -1199,9 +1199,9 @@ mod tests {
             game: GameConfig {
                 name: "Test".to_string(),
                 players: 2,
-                stack_depth: 10.0,
-                small_blind: 0.5,
-                big_blind: 1.0,
+                stack_depth: 20.0,
+                small_blind: 1.0,
+                big_blind: 2.0,
                 rake_rate: 0.0,
                 rake_cap: 0.0,
             },
@@ -1217,7 +1217,7 @@ mod tests {
                 per_flop: None,
             },
             action_abstraction: ActionAbstractionConfig {
-                preflop: vec![vec!["2.5bb".into()]],
+                preflop: vec![vec!["5bb".into()]],
                 flop: vec![vec![1.0]],
                 turn: vec![vec![1.0]],
                 river: vec![vec![1.0]],
