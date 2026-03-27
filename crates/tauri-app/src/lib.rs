@@ -58,5 +58,5 @@ pub use game_session::{
     game_back_core, game_solve_core, game_cancel_solve_core,
     game_encode_spot_core, game_load_spot_core,
     // Types
-    GameSessionState,
+    GameSession, GameSessionState, GameState, GameMatrix, GameMatrixCell, GameAction,
 };

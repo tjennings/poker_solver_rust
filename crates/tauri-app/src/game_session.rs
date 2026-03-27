@@ -210,26 +210,47 @@ pub struct GameSession {
 }
 
 impl GameSession {
+    /// Create a session from raw blueprint components.
+    ///
+    /// This constructor is used by the CLI (`inspect-spot`) and any other
+    /// context that loads blueprint data independently of the Tauri explorer.
+    pub fn new(
+        config: BlueprintV2Config,
+        strategy: BlueprintV2Strategy,
+        tree: V2GameTree,
+        decision_map: Vec<u32>,
+        hand_evs: Option<Vec<[[f64; 169]; 2]>>,
+    ) -> Self {
+        let root = tree.root;
+        GameSession {
+            tree: Box::new(tree),
+            strategy: Box::new(strategy),
+            decision_map,
+            config: Box::new(config),
+            cbv_context: None,
+            hand_evs,
+            node_idx: root,
+            board: vec![],
+            action_history: vec![],
+            weights: [vec![1.0f32; 1326], vec![1.0f32; 1326]],
+        }
+    }
+
     /// Create a session from already-loaded exploration state.
     pub fn from_exploration_state(
         exploration: &crate::exploration::ExplorationState,
         cbv_context: Option<Arc<CbvContext>>,
     ) -> Result<Self, String> {
         let data = exploration.extract_blueprint_v2_data()?;
-        let root = data.tree.root;
-
-        Ok(GameSession {
-            tree: data.tree,
-            strategy: data.strategy,
-            decision_map: data.decision_map,
-            config: data.config,
-            cbv_context,
-            hand_evs: data.hand_evs,
-            node_idx: root,
-            board: vec![],
-            action_history: vec![],
-            weights: [vec![1.0f32; 1326], vec![1.0f32; 1326]],
-        })
+        let mut session = Self::new(
+            *data.config,
+            *data.strategy,
+            *data.tree,
+            data.decision_map,
+            data.hand_evs,
+        );
+        session.cbv_context = cbv_context;
+        Ok(session)
     }
 
     /// The ONE canonical mapping from V2 tree player index to position label.
@@ -3280,5 +3301,58 @@ mod tests {
             session.encode_spot(),
             "sb:2bb,bb:call|Td9d6h|bb:4bb,sb:call|Kh|bb:10bb"
         );
+    }
+
+    #[test]
+    fn round_trip_turn_action_verifies_all_fields() {
+        let mut session1 = make_multi_street_session();
+        session1.play_action("1").unwrap(); // SB 2bb
+        session1.play_action("1").unwrap(); // BB call
+        session1.deal_card("Td").unwrap();
+        session1.deal_card("9d").unwrap();
+        session1.deal_card("6h").unwrap();
+        session1.play_action("1").unwrap(); // BB 4bb
+        session1.play_action("1").unwrap(); // SB call -> Turn
+        session1.deal_card("Kh").unwrap();
+        session1.play_action("1").unwrap(); // BB 10bb (terminal)
+
+        let encoded = session1.encode_spot();
+        let state1 = session1.get_state();
+
+        let mut session2 = make_multi_street_session();
+        session2.load_spot(&encoded).unwrap();
+        let state2 = session2.get_state();
+
+        // Verify round-trip fidelity
+        assert_eq!(session2.encode_spot(), encoded);
+        assert_eq!(state2.action_history.len(), state1.action_history.len());
+        assert_eq!(state2.board, state1.board);
+        assert_eq!(state2.position, state1.position);
+        assert_eq!(state2.street, state1.street);
+        assert_eq!(state2.is_terminal, state1.is_terminal);
+    }
+
+    #[test]
+    fn round_trip_flop_deal_only_verifies_position() {
+        // Encode a spot at a chance node (board dealt, waiting for action)
+        let mut session1 = make_multi_street_session();
+        session1.play_action("1").unwrap(); // SB 2bb
+        session1.play_action("1").unwrap(); // BB call
+        session1.deal_card("Ah").unwrap();
+        session1.deal_card("Kd").unwrap();
+        session1.deal_card("Qc").unwrap();
+
+        let encoded = session1.encode_spot();
+        let state1 = session1.get_state();
+
+        let mut session2 = make_multi_street_session();
+        session2.load_spot(&encoded).unwrap();
+        let state2 = session2.get_state();
+
+        assert_eq!(session2.encode_spot(), encoded);
+        assert_eq!(state2.board, state1.board);
+        assert_eq!(state2.position, state1.position);
+        assert_eq!(state2.street, state1.street);
+        assert_eq!(state2.action_history.len(), state1.action_history.len());
     }
 }
