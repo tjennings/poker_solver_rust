@@ -85,9 +85,16 @@ pub fn generate_pbs(
     let small_blind = config.game.small_blind;
     let big_blind = config.game.big_blind;
 
-    // Parallel iteration: each hand gets a deterministic RNG seeded
-    // from (base_seed + hand_idx).  We collect per-hand PBS counts
-    // and sum them for the return value.
+    let pb = indicatif::ProgressBar::new(num_hands as u64);
+    pb.set_style(
+        indicatif::ProgressStyle::with_template(
+            "{msg} [{bar:40}] {pos}/{len} ({per_sec}, eta {eta})"
+        )
+        .unwrap()
+        .progress_chars("=> "),
+    );
+    pb.set_message("Generating PBSs");
+
     let total_pbs: usize = (0..num_hands)
         .into_par_iter()
         .map(|hand_idx| {
@@ -119,10 +126,12 @@ pub fn generate_pbs(
                 }
             }
 
+            pb.inc(1);
             pbs_count
         })
         .sum();
 
+    pb.finish_with_message("PBS generation complete");
     total_pbs
 }
 
@@ -171,12 +180,21 @@ pub fn solve_buffer_records(
     let chunk_size = 1000;
     let solved_count = AtomicUsize::new(0);
 
+    let pb = indicatif::ProgressBar::new(total as u64);
+    pb.set_style(
+        indicatif::ProgressStyle::with_template(
+            "{msg} [{bar:40}] {pos}/{len} ({per_sec}, eta {eta})"
+        )
+        .unwrap()
+        .progress_chars("=> "),
+    );
+    pb.set_message("Solving PBSs");
+
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .expect("failed to create rayon thread pool for solving");
 
-    // Process records in chunks for manageable memory usage
     for chunk_start in (0..total).step_by(chunk_size) {
         let chunk_end = (chunk_start + chunk_size).min(total);
 
@@ -242,15 +260,12 @@ pub fn solve_buffer_records(
                 .unwrap_or_else(|e| panic!("failed to write record {idx}: {e}"));
         }
 
-        let done = (chunk_end).min(total);
-        let solved_so_far = solved_count.load(Ordering::Relaxed);
-        eprintln!(
-            "  Solving progress: {}/{} records processed, {} solved",
-            done, total, solved_so_far
-        );
+        pb.inc((chunk_end - chunk_start) as u64);
     }
 
-    solved_count.load(Ordering::Relaxed)
+    let solved = solved_count.load(Ordering::Relaxed);
+    pb.finish_with_message(format!("Solved {solved}/{total} records"));
+    solved
 }
 
 /// Convert a pair of bet size fraction arrays `[bets, raises]` to per-player
