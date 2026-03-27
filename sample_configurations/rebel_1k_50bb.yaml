@@ -1,0 +1,37 @@
+blueprint_path: "./local_data/blueprints/1k_50bb_sapcfr/snap"
+cluster_dir: "./local_data/blueprints/1k_50bb_sapcfr/snap/buckets"
+output_dir: "./local_data/rebel/1k_50bb"
+
+game:
+  initial_stack: 50   # 50bb × 1 chip per bb
+  small_blind: 1      # SB=0.5bb but we use integer chips, so 1:2 ratio
+  big_blind: 2
+
+seed:
+  num_hands: 500000
+  seed: 42
+  threads: 16
+  solver_iterations: 1024
+  target_exploitability: 0.005
+  bet_sizes:
+    # Match the blueprint's postflop bet sizes (pot fractions)
+    flop:
+      - [0.25, 0.33, 0.75, 1.0]   # OOP
+      - [0.33, 0.67, 1.0, 1.5]    # IP
+    turn:
+      - [0.25, 0.33, 0.75, 1.0]
+      - [0.33, 0.75, 1.0, 1.5]
+    river:
+      - [0.25, 0.33, 0.75, 1.0]
+      - [0.33, 0.75, 1.0, 1.5]
+
+training:
+  hidden_layers: 7
+  hidden_size: 500
+  batch_size: 4096
+  epochs: 200
+  learning_rate: 0.0003
+
+buffer:
+  max_records: 12000000
+  path: "rebel_buffer.bin"
