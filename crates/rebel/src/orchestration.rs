@@ -1,6 +1,9 @@
 // Multi-street offline seeding orchestration.
 //
-// Runs the bottom-up training pipeline: river -> turn -> flop -> preflop.
+// Runs the bottom-up training pipeline: river -> turn -> flop.
+// Preflop is handled by the blueprint strategy (see `play_preflop_under_blueprint`
+// in `blueprint_sampler.rs`), so orchestration only seeds postflop streets.
+//
 // At each street layer:
 //   1. Generate PBSs from blueprint play for that street
 //   2. Solve subgames (exact for river, depth-limited for others using value net)
@@ -49,7 +52,7 @@ pub struct SeederResult {
     pub data_path: PathBuf,
     /// Total number of solved records across all streets.
     pub total_records: usize,
-    /// Per-street results in execution order (river, turn, flop, preflop).
+    /// Per-street results in execution order (river, turn, flop).
     pub per_street: Vec<StreetResult>,
 }
 
@@ -59,7 +62,9 @@ pub struct SeederResult {
 /// 1. River: generate PBSs, solve exactly (no depth limit), train value net
 /// 2. Turn: generate PBSs, solve depth-limited (value net at river boundary), retrain
 /// 3. Flop: generate PBSs, solve depth-limited (value net at turn boundary), retrain
-/// 4. Preflop: generate PBSs, solve depth-limited (value net at flop boundary), retrain
+///
+/// Preflop is excluded — it is handled by the blueprint strategy via
+/// `play_preflop_under_blueprint` in the self-play loop.
 pub struct OfflineSeeder {
     config: RebelConfig,
     /// Track which streets have been seeded.
@@ -67,7 +72,11 @@ pub struct OfflineSeeder {
 }
 
 /// The bottom-up street ordering for offline seeding.
-const STREET_ORDER: [Street; 4] = [Street::River, Street::Turn, Street::Flop, Street::Preflop];
+///
+/// Preflop is excluded: it is handled by the blueprint strategy
+/// (see `play_preflop_under_blueprint` in `blueprint_sampler.rs`).
+/// We only need value-net training data for postflop streets.
+const STREET_ORDER: [Street; 3] = [Street::River, Street::Turn, Street::Flop];
 
 /// Backend type for CPU training via NdArray.
 type TrainBackend = Autodiff<NdArray>;
@@ -436,7 +445,8 @@ impl poker_solver_core::blueprint_v2::LeafEvaluator for SyncEvaluatorWrapper<'_>
 
 /// Run the full bottom-up offline seeding pipeline.
 ///
-/// Pipeline order: River -> Turn -> Flop -> Preflop
+/// Pipeline order: River -> Turn -> Flop
+/// (Preflop is handled by the blueprint strategy, not solved here.)
 ///
 /// At each street:
 /// 1. Generate PBSs from blueprint play (all streets at once via play_hand)
@@ -604,7 +614,15 @@ mod tests {
         assert_eq!(STREET_ORDER[0], Street::River);
         assert_eq!(STREET_ORDER[1], Street::Turn);
         assert_eq!(STREET_ORDER[2], Street::Flop);
-        assert_eq!(STREET_ORDER[3], Street::Preflop);
+    }
+
+    #[test]
+    fn test_street_order_no_preflop() {
+        // Preflop is handled by the blueprint strategy, not orchestration.
+        assert_eq!(STREET_ORDER.len(), 3);
+        assert_eq!(STREET_ORDER[0], Street::River);
+        assert_eq!(STREET_ORDER[1], Street::Turn);
+        assert_eq!(STREET_ORDER[2], Street::Flop);
     }
 
     #[test]
