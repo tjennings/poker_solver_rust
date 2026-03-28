@@ -74,6 +74,11 @@ struct ListBlueprintsParams {
 }
 
 #[derive(Deserialize)]
+struct ListSnapshotsParams {
+    path: String,
+}
+
+#[derive(Deserialize)]
 struct PreflopRangesParams {
     history: Vec<String>,
 }
@@ -337,6 +342,12 @@ async fn handle_list_blueprints(
     Json(params): Json<ListBlueprintsParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     result_to_response(poker_solver_tauri::list_blueprints_core(params.dir))
+}
+
+async fn handle_list_snapshots(
+    Json(params): Json<ListSnapshotsParams>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    result_to_response(poker_solver_tauri::list_snapshots_core(params.path))
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +703,7 @@ async fn main() {
         .route("/api/is_board_cached", post(handle_is_board_cached))
         .route("/api/list_agents", post(handle_list_agents))
         .route("/api/list_blueprints", post(handle_list_blueprints))
+        .route("/api/list_snapshots", post(handle_list_snapshots))
         .route("/api/get_combo_classes", post(handle_get_combo_classes))
         .route("/api/get_hand_equity", post(handle_get_hand_equity))
         .route(
