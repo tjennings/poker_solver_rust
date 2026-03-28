@@ -19,6 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Sparkline, Tabs};
 
+use crate::blueprint_tui_audit_widget::{AuditPanelState, AuditPanelWidget};
 use crate::blueprint_tui_config::TelemetryConfig;
 use crate::blueprint_tui_metrics::BlueprintTuiMetrics;
 use crate::blueprint_tui_widgets::{HandGridState, HandGridWidget};
@@ -58,6 +59,8 @@ pub struct BlueprintTuiApp {
     prune_history: Vec<u64>,
     // Random scenario carousel tracking
     has_random_tab: bool,
+    // Optional regret audit panel state
+    pub audit_panel: Option<AuditPanelState>,
 }
 
 impl BlueprintTuiApp {
@@ -82,7 +85,14 @@ impl BlueprintTuiApp {
             avg_pos_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
             prune_history: Vec::with_capacity(SPARKLINE_HISTORY),
             has_random_tab: false,
+            audit_panel: None,
         }
+    }
+
+    /// Install an audit panel to be rendered beside the sparklines.
+    #[allow(dead_code)]
+    pub fn set_audit_panel(&mut self, panel: AuditPanelState) {
+        self.audit_panel = Some(panel);
     }
 
     /// Sample iteration counter, compute delta, update sparkline histories.
@@ -269,6 +279,14 @@ impl BlueprintTuiApp {
                 }
             }
         }
+
+        // Audit panel refresh
+        if let Some(ref mut panel) = self.audit_panel {
+            if let Some(snapshots) = self.metrics.take_regret_audits() {
+                panel.snapshots = snapshots;
+            }
+            panel.iteration = self.metrics.iterations.load(Ordering::Relaxed);
+        }
     }
 
     pub fn next_tab(&mut self) {
@@ -286,40 +304,74 @@ impl BlueprintTuiApp {
     /// Render the full dashboard — metrics on top, strategy grids below.
     pub fn render(&self, frame: &mut Frame) {
         let area = frame.area();
+        let has_audits = self
+            .audit_panel
+            .as_ref()
+            .is_some_and(|p| !p.metas.is_empty());
 
-        // Vertical split: metrics top, strategy grids bottom, hotkeys footer.
-        let chunks = Layout::default()
+        // Three-part vertical: metrics area, grids, hotkeys.
+        let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),  // Iterations counter
-                Constraint::Length(1),  // Progress gauge
-                Constraint::Length(1),  // Runtime + ETA
-                Constraint::Length(2),  // Throughput sparkline
-                Constraint::Length(2),  // Strategy delta sparkline
-                Constraint::Length(2),  // Leaf movement sparkline
-                Constraint::Length(2),  // Max positive regret sparkline
-                Constraint::Length(2),  // Max negative regret sparkline
-                Constraint::Length(2),  // Avg positive regret sparkline
-                Constraint::Length(2),  // Traversals pruned sparkline
-                Constraint::Length(1),  // Spacer
+                Constraint::Length(18), // Metrics area (3 header + 7 sparklines x 2 + 1 spacer)
                 Constraint::Min(0),    // Strategy grids
-                Constraint::Length(1),  // Hotkeys footer
+                Constraint::Length(1), // Hotkeys
             ])
             .split(area);
 
-        self.render_iterations(frame, chunks[0]);
-        self.render_progress_gauge(frame, chunks[1]);
-        self.render_runtime(frame, chunks[2]);
-        self.render_sparkline(frame, chunks[3]);
-        self.render_strategy_delta(frame, chunks[4]);
-        self.render_leaf_movement(frame, chunks[5]);
-        self.render_max_regret(frame, chunks[6]);
-        self.render_min_regret(frame, chunks[7]);
-        self.render_avg_pos_regret(frame, chunks[8]);
-        self.render_prune_sparkline(frame, chunks[9]);
-        // chunks[10] is an empty spacer
-        self.render_right_panel(frame, chunks[11]);
-        self.render_hotkeys(frame, chunks[12]);
+        // Split metrics area horizontally if audits configured.
+        let (metrics_area, audit_area) = if has_audits {
+            let hsplit = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .split(main_chunks[0]);
+            (hsplit[0], Some(hsplit[1]))
+        } else {
+            (main_chunks[0], None)
+        };
+
+        // Render sparklines within metrics_area.
+        let sparkline_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // Iterations counter
+                Constraint::Length(1), // Progress gauge
+                Constraint::Length(1), // Runtime + ETA
+                Constraint::Length(2), // Throughput sparkline
+                Constraint::Length(2), // Strategy delta sparkline
+                Constraint::Length(2), // Leaf movement sparkline
+                Constraint::Length(2), // Max positive regret sparkline
+                Constraint::Length(2), // Max negative regret sparkline
+                Constraint::Length(2), // Avg positive regret sparkline
+                Constraint::Length(2), // Traversals pruned sparkline
+                Constraint::Min(0),   // Spacer
+            ])
+            .split(metrics_area);
+
+        self.render_iterations(frame, sparkline_chunks[0]);
+        self.render_progress_gauge(frame, sparkline_chunks[1]);
+        self.render_runtime(frame, sparkline_chunks[2]);
+        self.render_sparkline(frame, sparkline_chunks[3]);
+        self.render_strategy_delta(frame, sparkline_chunks[4]);
+        self.render_leaf_movement(frame, sparkline_chunks[5]);
+        self.render_max_regret(frame, sparkline_chunks[6]);
+        self.render_min_regret(frame, sparkline_chunks[7]);
+        self.render_avg_pos_regret(frame, sparkline_chunks[8]);
+        self.render_prune_sparkline(frame, sparkline_chunks[9]);
+
+        // Render audit panel if configured.
+        if let Some(audit_rect) = audit_area
+            && let Some(ref panel) = self.audit_panel
+        {
+            let widget = AuditPanelWidget { state: panel };
+            frame.render_widget(&widget, audit_rect);
+        }
+
+        // Hand grids
+        self.render_right_panel(frame, main_chunks[1]);
+
+        // Hotkeys
+        self.render_hotkeys(frame, main_chunks[2]);
     }
 
     fn render_iterations(&self, frame: &mut Frame, area: Rect) {
@@ -488,7 +540,15 @@ impl BlueprintTuiApp {
     }
 
     fn render_hotkeys(&self, frame: &mut Frame, area: Rect) {
-        let text = "[p]ause [s]napshot [←/→]tab [q]uit";
+        let text = if self
+            .audit_panel
+            .as_ref()
+            .is_some_and(|p| !p.metas.is_empty())
+        {
+            "[p]ause [s]napshot [\u{2190}/\u{2192}]scenario [\u{2191}/\u{2193}]audit [q]uit"
+        } else {
+            "[p]ause [s]napshot [\u{2190}/\u{2192}]tab [q]uit"
+        };
         frame.render_widget(
             Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
             area,
@@ -578,6 +638,16 @@ fn run_tui_inner(
                 }
                 KeyCode::Right | KeyCode::Tab => app.next_tab(),
                 KeyCode::Left | KeyCode::BackTab => app.prev_tab(),
+                KeyCode::Up => {
+                    if let Some(ref mut panel) = app.audit_panel {
+                        panel.prev_tab();
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(ref mut panel) = app.audit_panel {
+                        panel.next_tab();
+                    }
+                }
                 KeyCode::Char('p') => metrics.toggle_pause(),
                 KeyCode::Char('s') => metrics.request_snapshot(),
                 _ => {}
@@ -707,6 +777,137 @@ mod tests {
         assert_eq!(app.active_tab, 0); // wraps
         app.prev_tab();
         assert_eq!(app.active_tab, 1); // wraps backward
+    }
+
+    #[timed_test(10)]
+    fn app_renders_with_audit_panel() {
+        let metrics = make_metrics();
+        let mut app = BlueprintTuiApp::new(
+            metrics,
+            vec![],
+            TelemetryConfig::default(),
+        );
+        app.set_audit_panel(crate::blueprint_tui_audit_widget::AuditPanelState {
+            metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
+                name: "AKo test".to_string(),
+                hand: "AKo".to_string(),
+                player: crate::blueprint_tui_config::PlayerLabel::Sb,
+                bucket_trail: vec![(poker_solver_core::blueprint_v2::Street::Preflop, 3)],
+                action_labels: vec!["fold".into(), "call".into(), "raise".into()],
+                error: None,
+            }],
+            snapshots: vec![crate::blueprint_tui_audit::AuditSnapshot {
+                regrets: vec![-1.0, 0.5, 0.5],
+                deltas: vec![0.0, 0.1, -0.1],
+                trends: vec![
+                    crate::blueprint_tui_audit::Trend::Down,
+                    crate::blueprint_tui_audit::Trend::Up,
+                    crate::blueprint_tui_audit::Trend::Flat,
+                ],
+                strategy: vec![0.0, 0.5, 0.5],
+            }],
+            active_tab: 0,
+            iteration: 0,
+        });
+        let backend = ratatui::backend::TestBackend::new(160, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+    }
+
+    #[timed_test(10)]
+    fn app_renders_without_audit_panel_unchanged() {
+        // Verify that when audit_panel is None, the layout remains the same
+        // (no horizontal split in the metrics area).
+        let metrics = make_metrics();
+        let app = BlueprintTuiApp::new(
+            metrics,
+            vec![make_scenario("Test")],
+            TelemetryConfig::default(),
+        );
+        assert!(app.audit_panel.is_none());
+        let backend = ratatui::backend::TestBackend::new(160, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+    }
+
+    #[timed_test(10)]
+    fn audit_panel_tick_updates_snapshots() {
+        let metrics = make_metrics();
+        let mut app = BlueprintTuiApp::new(
+            Arc::clone(&metrics),
+            vec![],
+            TelemetryConfig::default(),
+        );
+        app.set_audit_panel(crate::blueprint_tui_audit_widget::AuditPanelState {
+            metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
+                name: "test".to_string(),
+                hand: "AKo".to_string(),
+                player: crate::blueprint_tui_config::PlayerLabel::Sb,
+                bucket_trail: vec![],
+                action_labels: vec!["fold".into(), "call".into()],
+                error: None,
+            }],
+            snapshots: vec![crate::blueprint_tui_audit::AuditSnapshot {
+                regrets: vec![0.0, 0.0],
+                deltas: vec![0.0, 0.0],
+                trends: vec![
+                    crate::blueprint_tui_audit::Trend::Flat,
+                    crate::blueprint_tui_audit::Trend::Flat,
+                ],
+                strategy: vec![0.5, 0.5],
+            }],
+            active_tab: 0,
+            iteration: 0,
+        });
+        // Push new audit snapshots via metrics
+        metrics.update_regret_audits(vec![crate::blueprint_tui_audit::AuditSnapshot {
+            regrets: vec![10.0, -5.0],
+            deltas: vec![1.0, -0.5],
+            trends: vec![
+                crate::blueprint_tui_audit::Trend::Up,
+                crate::blueprint_tui_audit::Trend::Down,
+            ],
+            strategy: vec![1.0, 0.0],
+        }]);
+        metrics.iterations.store(500, Ordering::Relaxed);
+        app.tick();
+        let panel = app.audit_panel.as_ref().unwrap();
+        assert_eq!(panel.snapshots[0].regrets, vec![10.0, -5.0]);
+        assert_eq!(panel.iteration, 500);
+    }
+
+    #[timed_test(10)]
+    fn hotkey_text_includes_audit_when_panel_set() {
+        let metrics = make_metrics();
+        let mut app = BlueprintTuiApp::new(
+            metrics,
+            vec![],
+            TelemetryConfig::default(),
+        );
+        // Without audit panel, render the hotkeys area and check for "tab"
+        let backend = ratatui::backend::TestBackend::new(80, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        // After setting audit panel, hotkeys should change
+        app.set_audit_panel(crate::blueprint_tui_audit_widget::AuditPanelState {
+            metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
+                name: "test".to_string(),
+                hand: "AKo".to_string(),
+                player: crate::blueprint_tui_config::PlayerLabel::Sb,
+                bucket_trail: vec![],
+                action_labels: vec!["fold".into()],
+                error: None,
+            }],
+            snapshots: vec![crate::blueprint_tui_audit::AuditSnapshot {
+                regrets: vec![0.0],
+                deltas: vec![0.0],
+                trends: vec![crate::blueprint_tui_audit::Trend::Flat],
+                strategy: vec![1.0],
+            }],
+            active_tab: 0,
+            iteration: 0,
+        });
+        terminal.draw(|frame| app.render(frame)).unwrap();
     }
 
     #[timed_test(10)]
