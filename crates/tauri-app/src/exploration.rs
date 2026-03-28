@@ -56,6 +56,19 @@ pub struct BlueprintListEntry {
     pub latest_snapshot: Option<String>,
 }
 
+/// A single snapshot within a blueprint directory.
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotEntry {
+    /// Directory name, e.g. "snapshot_0005".
+    pub name: String,
+    /// Iteration count from metadata.json, if available.
+    pub iterations: Option<u64>,
+    /// Elapsed training minutes from metadata.json, if available.
+    pub elapsed_minutes: Option<u64>,
+    /// Whether this snapshot contains a strategy.bin file.
+    pub has_strategy: bool,
+}
+
 /// State for the exploration view.
 pub struct ExplorationState {
     /// Currently loaded strategy source (bundle or agent)
@@ -703,6 +716,56 @@ fn try_make_blueprint_entry(dir: &Path) -> Option<BlueprintListEntry> {
 #[tauri::command]
 pub async fn list_blueprints(dir: String) -> Result<Vec<BlueprintListEntry>, String> {
     list_blueprints_core(dir)
+}
+
+/// List all snapshots in a blueprint directory, sorted newest-first.
+pub fn list_snapshots_core(blueprint_path: String) -> Result<Vec<SnapshotEntry>, String> {
+    let dir = PathBuf::from(&blueprint_path);
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| format!("Failed to read directory {blueprint_path}: {e}"))?;
+
+    let mut snapshots: Vec<SnapshotEntry> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            if !name.starts_with("snapshot_") {
+                return None;
+            }
+            let snap_dir = e.path();
+            let has_strategy = snap_dir.join("strategy.bin").exists();
+
+            // Try to read metadata.json for iteration count and elapsed time.
+            let (iterations, elapsed_minutes) = snap_dir
+                .join("metadata.json")
+                .exists()
+                .then(|| {
+                    let data = std::fs::read_to_string(snap_dir.join("metadata.json")).ok()?;
+                    let json: serde_json::Value = serde_json::from_str(&data).ok()?;
+                    let iters = json.get("iteration").and_then(|v| v.as_u64());
+                    let mins = json.get("elapsed_minutes").and_then(|v| v.as_u64());
+                    Some((iters, mins))
+                })
+                .flatten()
+                .unwrap_or((None, None));
+
+            Some(SnapshotEntry {
+                name,
+                iterations,
+                elapsed_minutes,
+                has_strategy,
+            })
+        })
+        .collect();
+
+    // Sort newest-first (highest snapshot number first).
+    snapshots.sort_by(|a, b| b.name.cmp(&a.name));
+    Ok(snapshots)
+}
+
+/// List snapshots in a blueprint directory (Tauri wrapper).
+#[tauri::command]
+pub async fn list_snapshots(path: String) -> Result<Vec<SnapshotEntry>, String> {
+    list_snapshots_core(path)
 }
 
 /// Convert blueprint action abstraction sizes to range-solver format strings.
@@ -3650,5 +3713,137 @@ mod tests {
                 "Expected reaching prob 1.0, got {r}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // list_snapshots_core tests
+    // -------------------------------------------------------------------
+
+    #[timed_test]
+    fn list_snapshots_core_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = list_snapshots_core(tmp.path().to_string_lossy().to_string());
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[timed_test]
+    fn list_snapshots_core_nonexistent_dir() {
+        let result = list_snapshots_core("/nonexistent/path/to/dir".to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to read directory"));
+    }
+
+    #[timed_test]
+    fn list_snapshots_core_ignores_non_snapshot_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("final")).unwrap();
+        std::fs::create_dir(tmp.path().join("data")).unwrap();
+        std::fs::write(tmp.path().join("config.yaml"), "").unwrap();
+        let result = list_snapshots_core(tmp.path().to_string_lossy().to_string()).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[timed_test]
+    fn list_snapshots_core_finds_snapshot_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create two snapshot dirs with strategy.bin
+        let snap1 = tmp.path().join("snapshot_0001");
+        let snap2 = tmp.path().join("snapshot_0005");
+        std::fs::create_dir(&snap1).unwrap();
+        std::fs::create_dir(&snap2).unwrap();
+        std::fs::write(snap1.join("strategy.bin"), b"fake").unwrap();
+        std::fs::write(snap2.join("strategy.bin"), b"fake").unwrap();
+
+        let result = list_snapshots_core(tmp.path().to_string_lossy().to_string()).unwrap();
+        assert_eq!(result.len(), 2);
+        // Newest first (sorted descending by name)
+        assert_eq!(result[0].name, "snapshot_0005");
+        assert_eq!(result[1].name, "snapshot_0001");
+        assert!(result[0].has_strategy);
+        assert!(result[1].has_strategy);
+    }
+
+    #[timed_test]
+    fn list_snapshots_core_detects_missing_strategy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = tmp.path().join("snapshot_0010");
+        std::fs::create_dir(&snap).unwrap();
+        // No strategy.bin in this snapshot
+
+        let result = list_snapshots_core(tmp.path().to_string_lossy().to_string()).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "snapshot_0010");
+        assert!(!result[0].has_strategy);
+        assert!(result[0].iterations.is_none());
+        assert!(result[0].elapsed_minutes.is_none());
+    }
+
+    #[timed_test]
+    fn list_snapshots_core_reads_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = tmp.path().join("snapshot_0003");
+        std::fs::create_dir(&snap).unwrap();
+        std::fs::write(snap.join("strategy.bin"), b"fake").unwrap();
+        std::fs::write(
+            snap.join("metadata.json"),
+            r#"{"iteration": 5000000, "elapsed_minutes": 120}"#,
+        )
+        .unwrap();
+
+        let result = list_snapshots_core(tmp.path().to_string_lossy().to_string()).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].iterations, Some(5_000_000));
+        assert_eq!(result[0].elapsed_minutes, Some(120));
+    }
+
+    #[timed_test]
+    fn list_snapshots_core_handles_partial_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = tmp.path().join("snapshot_0002");
+        std::fs::create_dir(&snap).unwrap();
+        std::fs::write(snap.join("strategy.bin"), b"fake").unwrap();
+        // metadata.json with only iteration, no elapsed_minutes
+        std::fs::write(
+            snap.join("metadata.json"),
+            r#"{"iteration": 1000}"#,
+        )
+        .unwrap();
+
+        let result = list_snapshots_core(tmp.path().to_string_lossy().to_string()).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].iterations, Some(1000));
+        assert_eq!(result[0].elapsed_minutes, None);
+    }
+
+    #[timed_test]
+    fn list_snapshots_core_handles_corrupt_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = tmp.path().join("snapshot_0007");
+        std::fs::create_dir(&snap).unwrap();
+        std::fs::write(snap.join("strategy.bin"), b"fake").unwrap();
+        std::fs::write(snap.join("metadata.json"), "not json").unwrap();
+
+        let result = list_snapshots_core(tmp.path().to_string_lossy().to_string()).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "snapshot_0007");
+        assert!(result[0].has_strategy);
+        // Corrupt metadata should result in None values, not an error
+        assert!(result[0].iterations.is_none());
+        assert!(result[0].elapsed_minutes.is_none());
+    }
+
+    #[timed_test]
+    fn snapshot_entry_serializes() {
+        let entry = SnapshotEntry {
+            name: "snapshot_0001".to_string(),
+            iterations: Some(1000),
+            elapsed_minutes: Some(5),
+            has_strategy: true,
+        };
+        let json = serde_json::to_string(&entry).expect("should serialize");
+        assert!(json.contains("\"name\":\"snapshot_0001\""));
+        assert!(json.contains("\"iterations\":1000"));
+        assert!(json.contains("\"has_strategy\":true"));
     }
 }
