@@ -344,6 +344,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         );
                         let meta = blueprint_tui_audit_widget::AuditMeta {
                             name: ac.name.clone(),
+                            spot: ac.spot.clone(),
                             hand: ac.hand.clone(),
                             player: ac.player,
                             bucket_trail: audit.bucket_trail.clone(),

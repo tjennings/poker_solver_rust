@@ -795,6 +795,7 @@ mod tests {
         app.set_audit_panel(crate::blueprint_tui_audit_widget::AuditPanelState {
             metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
                 name: "AKo test".to_string(),
+                spot: String::new(),
                 hand: "AKo".to_string(),
                 player: crate::blueprint_tui_config::PlayerLabel::Sb,
                 bucket_trail: vec![(poker_solver_core::blueprint_v2::Street::Preflop, 3)],
@@ -847,6 +848,7 @@ mod tests {
         app.set_audit_panel(crate::blueprint_tui_audit_widget::AuditPanelState {
             metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
                 name: "test".to_string(),
+                spot: String::new(),
                 hand: "AKo".to_string(),
                 player: crate::blueprint_tui_config::PlayerLabel::Sb,
                 bucket_trail: vec![],
@@ -900,6 +902,7 @@ mod tests {
         app.set_audit_panel(crate::blueprint_tui_audit_widget::AuditPanelState {
             metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
                 name: "test".to_string(),
+                spot: String::new(),
                 hand: "AKo".to_string(),
                 player: crate::blueprint_tui_config::PlayerLabel::Sb,
                 bucket_trail: vec![],

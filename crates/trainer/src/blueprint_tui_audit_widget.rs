@@ -10,6 +10,7 @@ use poker_solver_core::blueprint_v2::Street;
 #[derive(Debug, Clone)]
 pub struct AuditMeta {
     pub name: String,
+    pub spot: String,
     pub hand: String,
     pub player: PlayerLabel,
     pub bucket_trail: Vec<(Street, u16)>,
@@ -78,11 +79,18 @@ impl Widget for &AuditPanelWidget<'_> {
 
         // 1. Title — current audit name with index
         let total = self.state.metas.len();
+        let meta_ref = &self.state.metas[self.state.active_tab];
+        let spot_suffix = if meta_ref.spot.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", meta_ref.spot)
+        };
         let title = format!(
-            "Regret Audit [{}/{}] {}",
+            "[{}/{}] {}{}",
             self.state.active_tab + 1,
             total,
-            self.state.metas[self.state.active_tab].name,
+            meta_ref.name,
+            spot_suffix,
         );
         buf.set_string(x, y, &title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
         y += 1;
@@ -243,6 +251,7 @@ mod tests {
         AuditPanelState {
             metas: vec![AuditMeta {
                 name: "AKo SB open".to_string(),
+                spot: String::new(),
                 hand: "AKo".to_string(),
                 player: PlayerLabel::Sb,
                 bucket_trail: vec![(Street::Preflop, 3)],
@@ -279,6 +288,7 @@ mod tests {
         let mut state = mock_panel_state();
         state.metas.push(AuditMeta {
             name: "TT 3bet".into(),
+            spot: "sb:2bb".into(),
             hand: "TT".into(),
             player: PlayerLabel::Sb,
             bucket_trail: vec![(Street::Preflop, 5)],
@@ -306,6 +316,7 @@ mod tests {
         let state = AuditPanelState {
             metas: vec![AuditMeta {
                 name: "bad".into(),
+                spot: "sb:999bb".into(),
                 hand: "AKo".into(),
                 player: PlayerLabel::Sb,
                 bucket_trail: vec![],
