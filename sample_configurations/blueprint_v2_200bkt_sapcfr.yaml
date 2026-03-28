@@ -106,6 +106,14 @@ tui:
       spot: "sb:2bb,bb:call|AsTd9d"
       hand: "7h2h"
       player: BB
+    - name: "AhKc river top pair"
+      spot: "sb:2bb,bb:call|AsTd9d,sb:check,bb:check|3c,sb:check,bb:check|2h"
+      hand: "AhKc"
+      player: SB
+    - name: "Kd7d river missed FD"
+      spot: "sb:2bb,bb:call|AsTd9d,sb:check,bb:check|3c,sb:check,bb:check|2h"
+      hand: "Kd7d"
+      player: SB
   random_scenario:
     enabled: true
     hold_minutes: 3
