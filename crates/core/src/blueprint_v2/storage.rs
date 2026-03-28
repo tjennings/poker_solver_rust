@@ -12,16 +12,19 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use super::game_tree::{GameNode, GameTree};
 use crate::cfr::optimizer::CfrOptimizer;
 
-/// Pluribus-style regret floor: minimum clamped value for regret accumulators.
-pub const REGRET_FLOOR: i32 = -310_000_000;
-/// Pluribus-style regret cap: maximum clamped value for regret accumulators.
-pub const REGRET_CAP: i32 = 310_000_000;
+/// Fixed-point scaling factor for regret, prediction, and baseline buffers.
+///
+/// All three buffers store values as `(chip_value * REGRET_SCALE) as i64`.
+/// Reads divide by `REGRET_SCALE` to recover the original floating-point value.
+/// This preserves sub-chip precision (e.g. 0.003 chips = 300 in storage)
+/// while using fast integer atomics.
+pub const REGRET_SCALE: f64 = 100_000.0;
 
 fn humanize_bytes(bytes: usize) -> String {
     if bytes >= 1_073_741_824 {
@@ -37,17 +40,19 @@ fn humanize_bytes(bytes: usize) -> String {
 
 /// Flat-buffer storage for regrets and strategy sums.
 pub struct BlueprintStorage {
-    /// Cumulative regrets: one `AtomicI32` per (decision node, bucket, action).
-    pub regrets: Vec<AtomicI32>,
+    /// Cumulative regrets: one `AtomicI64` per (decision node, bucket, action).
+    /// Stored as fixed-point: `(chip_value * REGRET_SCALE) as i64`.
+    pub regrets: Vec<AtomicI64>,
     /// Strategy sums: one `AtomicI64` per (decision node, bucket, action).
     pub strategy_sums: Vec<AtomicI64>,
     /// Optional baseline buffer for VR-MCCFR variance reduction.
-    /// Same layout as regrets. Stores running-average counterfactual
-    /// values as raw integer chip units.
-    pub(crate) baselines: Option<Vec<AtomicI32>>,
+    /// Same layout as regrets. Stored as fixed-point `i64` values
+    /// scaled by `REGRET_SCALE`.
+    pub(crate) baselines: Option<Vec<AtomicI64>>,
     /// Optional prediction buffer for SAPCFR+. Same layout as regrets.
-    /// Stores instantaneous regrets from the previous iteration.
-    pub(crate) predictions: Option<Vec<AtomicI32>>,
+    /// Stores instantaneous regrets from the previous iteration,
+    /// scaled by `REGRET_SCALE`.
+    pub(crate) predictions: Option<Vec<AtomicI64>>,
     /// Optional pluggable optimizer (DCFR, SAPCFR+, etc.).
     pub(crate) optimizer: Option<Arc<dyn CfrOptimizer>>,
     /// Number of buckets per street `[preflop, flop, turn, river]`.
@@ -94,7 +99,7 @@ impl BlueprintStorage {
             }
         }
 
-        let regret_bytes = total * 4;
+        let regret_bytes = total * 8;
         let strategy_bytes = total * 8;
         eprintln!(
             "  Storage: {} slots ({} regret + {} strategy = {} total)",
@@ -105,7 +110,7 @@ impl BlueprintStorage {
         );
 
         Self {
-            regrets: (0..total).map(|_| AtomicI32::new(0)).collect(),
+            regrets: (0..total).map(|_| AtomicI64::new(0)).collect(),
             strategy_sums: (0..total).map(|_| AtomicI64::new(0)).collect(),
             baselines: None,
             predictions: None,
@@ -124,7 +129,7 @@ impl BlueprintStorage {
         let mut storage = Self::new(tree, bucket_counts);
         if use_baselines {
             let total = storage.regrets.len();
-            storage.baselines = Some((0..total).map(|_| AtomicI32::new(0)).collect());
+            storage.baselines = Some((0..total).map(|_| AtomicI64::new(0)).collect());
         }
         storage
     }
@@ -140,13 +145,16 @@ impl BlueprintStorage {
     ///
     /// Returns `0.0` when baselines are disabled (`None`), which causes
     /// the VR-MCCFR corrected formula to degenerate to standard sampling.
+    /// The stored fixed-point value is divided by `REGRET_SCALE` to recover
+    /// the original floating-point chip value.
     #[inline]
     #[must_use]
     pub fn get_baseline(&self, node_idx: u32, bucket: u16, action: usize) -> f64 {
         self.baselines
             .as_ref()
             .map(|b| {
-                f64::from(b[self.slot_index(node_idx, bucket, action)].load(Ordering::Relaxed))
+                b[self.slot_index(node_idx, bucket, action)].load(Ordering::Relaxed) as f64
+                    / REGRET_SCALE
             })
             .unwrap_or(0.0)
     }
@@ -155,6 +163,7 @@ impl BlueprintStorage {
     ///
     /// `alpha` controls the learning rate: `new = (1 - alpha) * old + alpha * value`.
     /// No-op when baselines are disabled (`None`).
+    /// Values are stored as fixed-point `i64` scaled by `REGRET_SCALE`.
     #[inline]
     pub fn update_baseline(
         &self,
@@ -166,16 +175,16 @@ impl BlueprintStorage {
     ) {
         if let Some(ref b) = self.baselines {
             let idx = self.slot_index(node_idx, bucket, action);
-            let old = f64::from(b[idx].load(Ordering::Relaxed));
+            let old = b[idx].load(Ordering::Relaxed) as f64 / REGRET_SCALE;
             let new_val = old * (1.0 - alpha) + value * alpha;
-            b[idx].store(new_val as i32, Ordering::Relaxed);
+            b[idx].store((new_val * REGRET_SCALE) as i64, Ordering::Relaxed);
         }
     }
 
-    /// Read a single regret value atomically.
+    /// Read a single regret value atomically (raw scaled i64).
     #[inline]
     #[must_use]
-    pub fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
+    pub fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i64 {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
         self.regrets[idx].load(Ordering::Relaxed)
@@ -183,21 +192,13 @@ impl BlueprintStorage {
 
     /// Add a delta to a single regret value atomically.
     ///
-    /// Clamps the result to `[REGRET_FLOOR, REGRET_CAP]` (Pluribus-style
-    /// regret bounding) to prevent overflow without requiring frequent
-    /// discounting.
+    /// Simple `fetch_add` with no clamping. The i64 range is large enough
+    /// that overflow is not a practical concern with REGRET_SCALE = 100,000.
     #[inline]
-    pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
+    pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
-        let old = self.regrets[idx].fetch_add(delta, Ordering::Relaxed);
-        let new = old.wrapping_add(delta);
-        // Clamp on overflow or exceeding bounds (Pluribus-style regret floor/cap).
-        if new > REGRET_CAP || (delta > 0 && new < old) {
-            self.regrets[idx].store(REGRET_CAP, Ordering::Relaxed);
-        } else if new < REGRET_FLOOR || (delta < 0 && new > old) {
-            self.regrets[idx].store(REGRET_FLOOR, Ordering::Relaxed);
-        }
+        self.regrets[idx].fetch_add(delta, Ordering::Relaxed);
     }
 
     /// Read a single strategy sum value atomically.
@@ -225,14 +226,14 @@ impl BlueprintStorage {
     /// Allocate the prediction buffer (same size as regrets, zeroed).
     pub fn enable_predictions(&mut self) {
         let total = self.regrets.len();
-        self.predictions = Some((0..total).map(|_| AtomicI32::new(0)).collect());
+        self.predictions = Some((0..total).map(|_| AtomicI64::new(0)).collect());
     }
 
     /// Read a prediction value for a (node, bucket, action) slot.
     /// Returns 0 when predictions are disabled.
     #[inline]
     #[must_use]
-    pub fn get_prediction(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
+    pub fn get_prediction(&self, node_idx: u32, bucket: u16, action: usize) -> i64 {
         self.predictions
             .as_ref()
             .map_or(0, |p| p[self.slot_index(node_idx, bucket, action)].load(Ordering::Relaxed))
@@ -241,7 +242,7 @@ impl BlueprintStorage {
     /// Write a prediction value for a (node, bucket, action) slot.
     /// No-op when predictions are disabled.
     #[inline]
-    pub fn set_prediction(&self, node_idx: u32, bucket: u16, action: usize, value: i32) {
+    pub fn set_prediction(&self, node_idx: u32, bucket: u16, action: usize, value: i64) {
         if let Some(ref p) = self.predictions {
             p[self.slot_index(node_idx, bucket, action)].store(value, Ordering::Relaxed);
         }
@@ -270,7 +271,7 @@ impl BlueprintStorage {
         let mut positive_sum = 0.0_f64;
         let mut positives = Vec::with_capacity(num_actions);
         for i in 0..num_actions {
-            let r = f64::from(self.regrets[start + i].load(Ordering::Relaxed).max(0));
+            let r = self.regrets[start + i].load(Ordering::Relaxed).max(0) as f64;
             positives.push(r);
             positive_sum += r;
         }
@@ -318,8 +319,8 @@ impl BlueprintStorage {
 
         let mut positive_sum = 0.0_f64;
         for (i, slot) in out.iter_mut().enumerate() {
-            let r = self.regrets[start + i].load(Ordering::Relaxed).max(0);
-            *slot = f64::from(r);
+            let r = self.regrets[start + i].load(Ordering::Relaxed).max(0) as f64;
+            *slot = r;
             positive_sum += *slot;
         }
         if positive_sum > 0.0 {
@@ -479,9 +480,9 @@ impl BlueprintStorage {
 
     /// Serialize regrets and strategy sums to a binary file.
     ///
-    /// Regrets are stored as raw chip-unit i32 values (no scaling factor).
-    /// Files saved before the scaling removal (pre-2026-03-27) have regrets
-    /// x1000 larger and are NOT compatible — discard old checkpoints.
+    /// Regrets are stored as scaled i64 values (`chip_value * REGRET_SCALE`).
+    /// Files saved with the old i32 format are NOT compatible — discard
+    /// old checkpoints.
     ///
     /// # Errors
     ///
@@ -490,7 +491,7 @@ impl BlueprintStorage {
         let file = std::fs::File::create(path)?;
         let mut writer = std::io::BufWriter::new(file);
 
-        let regrets_plain: Vec<i32> = self
+        let regrets_plain: Vec<i64> = self
             .regrets
             .iter()
             .map(|a| a.load(Ordering::Relaxed))
@@ -522,7 +523,7 @@ impl BlueprintStorage {
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
 
-        let (stored_counts, regrets_plain, sums_plain): ([u16; 4], Vec<i32>, Vec<i64>) =
+        let (stored_counts, regrets_plain, sums_plain): ([u16; 4], Vec<i64>, Vec<i64>) =
             bincode::deserialize_from(reader)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -999,82 +1000,6 @@ mod tests {
         assert_eq!(base, idx, "slot_offset_for + 0 should equal slot_index");
     }
 
-    // --- Regret clamping tests ---
-
-    #[test]
-    fn add_regret_clamps_at_positive_limit() {
-        let tree = toy_tree();
-        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
-        let node_idx = tree
-            .nodes
-            .iter()
-            .position(|n| matches!(n, GameNode::Decision { .. }))
-            .expect("need a decision node") as u32;
-        storage.regrets[storage.slot_index(node_idx, 0, 0)].store(300_000_000, Ordering::Relaxed);
-        storage.add_regret(node_idx, 0, 0, 100_000_000);
-        let val = storage.get_regret(node_idx, 0, 0);
-        assert!(
-            val <= REGRET_CAP,
-            "should clamp to REGRET_CAP ({REGRET_CAP}), got {val}"
-        );
-    }
-
-    #[test]
-    fn add_regret_clamps_at_negative_limit() {
-        let tree = toy_tree();
-        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
-        let node_idx = tree
-            .nodes
-            .iter()
-            .position(|n| matches!(n, GameNode::Decision { .. }))
-            .expect("need a decision node") as u32;
-        storage.regrets[storage.slot_index(node_idx, 0, 0)].store(-300_000_000, Ordering::Relaxed);
-        storage.add_regret(node_idx, 0, 0, -100_000_000);
-        let val = storage.get_regret(node_idx, 0, 0);
-        assert!(
-            val >= REGRET_FLOOR,
-            "should clamp to REGRET_FLOOR ({REGRET_FLOOR}), got {val}"
-        );
-    }
-
-    #[test]
-    fn add_regret_clamps_on_i32_overflow() {
-        let tree = toy_tree();
-        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
-        let node_idx = tree
-            .nodes
-            .iter()
-            .position(|n| matches!(n, GameNode::Decision { .. }))
-            .expect("need a decision node") as u32;
-        storage.regrets[storage.slot_index(node_idx, 0, 0)]
-            .store(i32::MAX - 10, Ordering::Relaxed);
-        storage.add_regret(node_idx, 0, 0, 100);
-        let val = storage.get_regret(node_idx, 0, 0);
-        assert!(
-            val <= REGRET_CAP,
-            "should clamp on overflow, got {val}"
-        );
-    }
-
-    #[test]
-    fn add_regret_clamps_on_i32_underflow() {
-        let tree = toy_tree();
-        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
-        let node_idx = tree
-            .nodes
-            .iter()
-            .position(|n| matches!(n, GameNode::Decision { .. }))
-            .expect("need a decision node") as u32;
-        storage.regrets[storage.slot_index(node_idx, 0, 0)]
-            .store(i32::MIN + 10, Ordering::Relaxed);
-        storage.add_regret(node_idx, 0, 0, -100);
-        let val = storage.get_regret(node_idx, 0, 0);
-        assert!(
-            val >= REGRET_FLOOR,
-            "should clamp on underflow, got {val}"
-        );
-    }
-
     #[test]
     fn add_regret_normal_values_not_clamped() {
         let tree = toy_tree();
@@ -1088,5 +1013,111 @@ mod tests {
         assert_eq!(storage.get_regret(node_idx, 0, 0), 500);
         storage.add_regret(node_idx, 0, 0, -200);
         assert_eq!(storage.get_regret(node_idx, 0, 0), 300);
+    }
+
+    // --- REGRET_SCALE and i64 regret tests ---
+
+    #[test]
+    fn regret_scale_constant_is_100_000() {
+        assert!((super::REGRET_SCALE - 100_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn regret_buffer_is_i64() {
+        // Verify regrets are AtomicI64 by storing a value > i32::MAX
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        let large_val: i64 = 5_000_000_000; // exceeds i32::MAX
+        storage.add_regret(node_idx, 0, 0, large_val);
+        assert_eq!(storage.get_regret(node_idx, 0, 0), large_val);
+    }
+
+    #[test]
+    fn prediction_buffer_is_i64() {
+        let tree = toy_tree();
+        let mut storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        storage.enable_predictions();
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        let large_val: i64 = 5_000_000_000;
+        storage.set_prediction(node_idx, 0, 0, large_val);
+        assert_eq!(storage.get_prediction(node_idx, 0, 0), large_val);
+    }
+
+    #[test]
+    fn baseline_buffer_is_i64() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new_with_baselines(&tree, [50, 50, 50, 50], true);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        // Store a large value via alpha=1.0 (full replace)
+        let large_val = 5_000_000_000.0;
+        storage.update_baseline(node_idx, 0, 0, large_val, 1.0);
+        let b = storage.get_baseline(node_idx, 0, 0);
+        assert!((b - large_val).abs() < 1.0, "expected ~{large_val}, got {b}");
+    }
+
+    #[test]
+    fn add_regret_is_simple_fetch_add_no_clamping() {
+        // With i64, no clamping needed: just a simple fetch_add
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        // Large positive delta: should not be clamped
+        let large_delta: i64 = 1_000_000_000_000;
+        storage.add_regret(node_idx, 0, 0, large_delta);
+        assert_eq!(storage.get_regret(node_idx, 0, 0), large_delta);
+        // Large negative delta: should also work without clamping
+        storage.add_regret(node_idx, 0, 0, -2 * large_delta);
+        assert_eq!(storage.get_regret(node_idx, 0, 0), -large_delta);
+    }
+
+    #[test]
+    fn save_load_round_trip_i64_regrets() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        // Store a value exceeding i32 range
+        let large_val: i64 = 10_000_000_000;
+        storage.add_regret(node_idx, 5, 0, large_val);
+        storage.add_strategy_sum(node_idx, 5, 0, 999);
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("storage.bin");
+        storage.save_regrets(&path).expect("save");
+
+        let loaded =
+            BlueprintStorage::load_regrets(&path, &tree, [50, 50, 50, 50]).expect("load");
+
+        assert_eq!(loaded.get_regret(node_idx, 5, 0), large_val);
+        assert_eq!(loaded.get_strategy_sum(node_idx, 5, 0), 999);
+    }
+
+    #[test]
+    fn storage_memory_reports_i64_regret_size() {
+        // Each regret slot should be 8 bytes (i64), not 4 bytes (i32)
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let regret_bytes = storage.regrets.len() * std::mem::size_of::<AtomicI64>();
+        assert_eq!(regret_bytes, storage.regrets.len() * 8);
     }
 }

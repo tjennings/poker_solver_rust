@@ -630,7 +630,7 @@ pub fn traverse_external(
     traverser: u8,
     node_idx: u32,
     prune: bool,
-    prune_threshold: i32,
+    prune_threshold: i64,
     rng: &mut impl Rng,
     rake_rate: f64,
     rake_cap: f64,
@@ -786,7 +786,7 @@ fn traverse_traverser(
     children: &[u32],
     num_actions: usize,
     prune: bool,
-    prune_threshold: i32,
+    prune_threshold: i64,
     rng: &mut impl Rng,
     rake_rate: f64,
     rake_cap: f64,
@@ -825,16 +825,16 @@ fn traverse_traverser(
         stats.merge(child_stats);
     }
 
-    // Update regrets: delta = action_value - node_value (integer chip units).
+    // Update regrets: delta = (action_value - node_value) * REGRET_SCALE.
     // Skip pruned actions. Also store as prediction for SAPCFR+.
     for (a, &av) in action_values.iter().enumerate().take(num_actions) {
         if pruned[a] {
             continue;
         }
         let delta = av - node_value;
-        let delta_i32 = delta as i32;
-        storage.add_regret(node_idx, bucket, a, delta_i32);
-        storage.set_prediction(node_idx, bucket, a, delta_i32);
+        let delta_scaled = (delta * super::storage::REGRET_SCALE) as i64;
+        storage.add_regret(node_idx, bucket, a, delta_scaled);
+        storage.set_prediction(node_idx, bucket, a, delta_scaled);
     }
 
     // Accumulate strategy sums (for computing the average strategy).
@@ -899,7 +899,7 @@ fn traverse_opponent(
     children: &[u32],
     num_actions: usize,
     prune: bool,
-    prune_threshold: i32,
+    prune_threshold: i64,
     rng: &mut impl Rng,
     rake_rate: f64,
     rake_cap: f64,
