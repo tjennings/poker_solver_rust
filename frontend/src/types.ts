@@ -166,6 +166,13 @@ export interface BlueprintListEntry {
   has_strategy: boolean;
 }
 
+export interface SnapshotEntry {
+  name: string;
+  iterations: number | null;
+  elapsed_minutes: number | null;
+  has_strategy: boolean;
+}
+
 export interface PreflopRanges {
   oop_weights: number[];
   ip_weights: number[];
