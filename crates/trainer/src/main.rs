@@ -1,7 +1,5 @@
 mod blueprint_tui;
-#[allow(dead_code)]
 mod blueprint_tui_audit;
-#[allow(dead_code)]
 mod blueprint_tui_audit_widget;
 mod blueprint_tui_config;
 mod blueprint_tui_metrics;
@@ -330,6 +328,45 @@ fn main() -> Result<(), Box<dyn Error>> {
                     })
                     .unzip();
 
+                // Resolve regret audits.
+                let (audit_metas, mut resolved_audits): (Vec<_>, Vec<_>) = tui_config
+                    .regret_audits
+                    .iter()
+                    .map(|ac| {
+                        let audit = blueprint_tui_audit::resolve_regret_audit(
+                            &trainer.tree,
+                            &trainer.storage,
+                            &ac.name,
+                            &ac.spot,
+                            &ac.hand,
+                            ac.player,
+                            tui_config.telemetry.sparkline_window,
+                        );
+                        let meta = blueprint_tui_audit_widget::AuditMeta {
+                            name: ac.name.clone(),
+                            hand: ac.hand.clone(),
+                            player: ac.player,
+                            bucket_trail: audit.bucket_trail.clone(),
+                            action_labels: audit.action_labels.clone(),
+                            error: audit.error.clone(),
+                        };
+                        (meta, audit)
+                    })
+                    .unzip();
+
+                let audit_panel = if !audit_metas.is_empty() {
+                    let initial_snapshots: Vec<_> =
+                        resolved_audits.iter().map(|a| a.snapshot()).collect();
+                    Some(blueprint_tui_audit_widget::AuditPanelState {
+                        metas: audit_metas,
+                        snapshots: initial_snapshots,
+                        active_tab: 0,
+                        iteration: 0,
+                    })
+                } else {
+                    None
+                };
+
                 // Wire strategy refresh callback from trainer to TUI metrics.
                 let scenarios_node_indices: Vec<u32> =
                     scenarios.iter().map(|s| s.node_idx).collect();
@@ -377,6 +414,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 trainer.on_prune_fraction = Some(Box::new(move |frac| {
                     metrics_for_prune.push_prune_fraction(frac);
                 }));
+
+                // Wire audit refresh callback.
+                if !resolved_audits.is_empty() {
+                    let metrics_for_audit = Arc::clone(&metrics);
+                    trainer.on_audit_refresh = Some(Box::new(move |storage| {
+                        for audit in &mut resolved_audits {
+                            audit.tick(storage);
+                        }
+                        let snapshots: Vec<_> =
+                            resolved_audits.iter().map(|a| a.snapshot()).collect();
+                        metrics_for_audit.update_regret_audits(snapshots);
+                    }));
+                }
 
                 // Random scenario carousel.
                 if tui_config.random_scenario.enabled {
@@ -457,6 +507,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     scenarios,
                     tui_config.telemetry.clone(),
                     refresh,
+                    audit_panel,
                 );
 
                 trainer.train()?;
@@ -1672,5 +1723,28 @@ mod tests {
             cfg.clustering.per_flop.is_none(),
             "standard config should not have per_flop"
         );
+    }
+
+    /// The sample TUI config with regret_audits must parse and contain two audit entries.
+    #[test]
+    fn tui_sample_yaml_parses_regret_audits() {
+        let yaml = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../sample_configurations/blueprint_v2_with_tui.yaml"),
+        )
+        .expect("blueprint_v2_with_tui.yaml must exist");
+        let tui_cfg = crate::blueprint_tui_config::parse_tui_config(&yaml);
+        assert_eq!(
+            tui_cfg.regret_audits.len(),
+            2,
+            "expected 2 regret_audits entries in sample config"
+        );
+        assert_eq!(tui_cfg.regret_audits[0].name, "AKo SB open");
+        assert_eq!(tui_cfg.regret_audits[0].hand, "AKo");
+        assert_eq!(
+            tui_cfg.regret_audits[0].player,
+            crate::blueprint_tui_config::PlayerLabel::Sb,
+        );
+        assert_eq!(tui_cfg.regret_audits[1].name, "72o SB open");
+        assert_eq!(tui_cfg.regret_audits[1].hand, "72o");
     }
 }

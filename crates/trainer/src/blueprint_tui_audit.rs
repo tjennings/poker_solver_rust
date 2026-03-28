@@ -32,8 +32,10 @@ pub struct AuditSnapshot {
 
 /// Resolved regret audit state for a single hand+spot.
 pub struct ResolvedRegretAudit {
+    #[allow(dead_code)]
     pub name: String,
     pub node_idx: u32,
+    #[allow(dead_code)]
     pub player: u8,
     pub bucket: u16,
     pub bucket_trail: Vec<(Street, u16)>,

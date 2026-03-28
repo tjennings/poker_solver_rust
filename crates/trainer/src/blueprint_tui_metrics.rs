@@ -154,14 +154,12 @@ impl BlueprintTuiMetrics {
     }
 
     /// Store updated audit snapshots for the TUI to pick up.
-    #[allow(dead_code)]
     pub fn update_regret_audits(&self, snapshots: Vec<AuditSnapshot>) {
         let mut data = self.regret_audit_snapshots.lock().unwrap_or_else(|e| e.into_inner());
         *data = Some(snapshots);
     }
 
     /// Take the latest audit snapshots (returns None if none pending).
-    #[allow(dead_code)]
     pub fn take_regret_audits(&self) -> Option<Vec<AuditSnapshot>> {
         let mut data = self.regret_audit_snapshots.lock().unwrap_or_else(|e| e.into_inner());
         data.take()

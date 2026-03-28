@@ -90,7 +90,6 @@ impl BlueprintTuiApp {
     }
 
     /// Install an audit panel to be rendered beside the sparklines.
-    #[allow(dead_code)]
     pub fn set_audit_panel(&mut self, panel: AuditPanelState) {
         self.audit_panel = Some(panel);
     }
@@ -593,6 +592,7 @@ pub fn run_blueprint_tui(
     scenarios: Vec<ResolvedScenario>,
     telemetry_config: TelemetryConfig,
     refresh_interval: Duration,
+    audit_panel: Option<AuditPanelState>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         if let Err(e) = run_tui_inner(
@@ -600,6 +600,7 @@ pub fn run_blueprint_tui(
             scenarios,
             telemetry_config,
             refresh_interval,
+            audit_panel,
         ) {
             eprintln!("Blueprint TUI error: {e}");
         }
@@ -611,6 +612,7 @@ fn run_tui_inner(
     scenarios: Vec<ResolvedScenario>,
     telemetry_config: TelemetryConfig,
     refresh_interval: Duration,
+    audit_panel: Option<AuditPanelState>,
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stderr = io::stderr();
@@ -623,6 +625,9 @@ fn run_tui_inner(
         scenarios,
         telemetry_config,
     );
+    if let Some(panel) = audit_panel {
+        app.set_audit_panel(panel);
+    }
 
     loop {
         app.tick();
