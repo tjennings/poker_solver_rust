@@ -342,6 +342,7 @@ mod tests {
                     crate::blueprint_tui_audit::Trend::Flat,
                 ],
                 strategy: vec![0.0, 0.25, 0.75],
+                avg_strategy: vec![0.0, 0.20, 0.80],
             },
         ];
         m.update_regret_audits(snapshot.clone());

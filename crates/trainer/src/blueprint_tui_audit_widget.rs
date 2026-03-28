@@ -203,19 +203,37 @@ impl Widget for &AuditPanelWidget<'_> {
         // Blank line
         y += 1;
 
-        // 7. Strategy line
+        // 7. Strategy lines (current from regret matching + average from strategy sums)
         if y < area.y + area.height {
-            let parts: Vec<String> = meta
-                .action_labels
-                .iter()
-                .zip(snap.strategy.iter())
-                .map(|(label, &prob)| {
-                    let abbrev = label.chars().next().unwrap_or('?');
-                    format!("{}:{}%", abbrev, (prob * 100.0).round() as u64)
-                })
-                .collect();
-            let strategy_text = format!("Strategy: {}", parts.join(" "));
-            buf.set_string(x, y, &strategy_text, Style::default().fg(Color::Cyan));
+            let fmt_strategy = |probs: &[f64]| -> String {
+                meta.action_labels
+                    .iter()
+                    .zip(probs.iter())
+                    .map(|(label, &prob)| {
+                        let abbrev = label.chars().next().unwrap_or('?');
+                        format!("{}:{}%", abbrev, (prob * 100.0).round() as u64)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let curr_text = format!("Current:  {}", fmt_strategy(&snap.strategy));
+            buf.set_string(x, y, &curr_text, Style::default().fg(Color::DarkGray));
+            y += 1;
+        }
+        if y < area.y + area.height {
+            let fmt_strategy = |probs: &[f64]| -> String {
+                meta.action_labels
+                    .iter()
+                    .zip(probs.iter())
+                    .map(|(label, &prob)| {
+                        let abbrev = label.chars().next().unwrap_or('?');
+                        format!("{}:{}%", abbrev, (prob * 100.0).round() as u64)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let avg_text = format!("Average:  {}", fmt_strategy(&snap.avg_strategy));
+            buf.set_string(x, y, &avg_text, Style::default().fg(Color::Cyan));
         }
     }
 }
@@ -241,6 +259,7 @@ mod tests {
                 deltas: vec![-0.03, 0.02, 0.01],
                 trends: vec![Trend::Down, Trend::Up, Trend::Up],
                 strategy: vec![0.0, 0.25, 0.75],
+                avg_strategy: vec![0.0, 0.20, 0.80],
             }],
             active_tab: 0,
             iteration: 1_200_000,
@@ -276,6 +295,7 @@ mod tests {
             deltas: vec![0.0, 0.0],
             trends: vec![Trend::Flat, Trend::Flat],
             strategy: vec![0.5, 0.5],
+            avg_strategy: vec![0.5, 0.5],
         });
         assert_eq!(state.active_tab, 0);
         state.next_tab();
@@ -302,6 +322,7 @@ mod tests {
                 deltas: vec![],
                 trends: vec![],
                 strategy: vec![],
+                avg_strategy: vec![],
             }],
             active_tab: 0,
             iteration: 0,

@@ -810,6 +810,7 @@ mod tests {
                     crate::blueprint_tui_audit::Trend::Flat,
                 ],
                 strategy: vec![0.0, 0.5, 0.5],
+                avg_strategy: vec![0.0, 0.5, 0.5],
             }],
             active_tab: 0,
             iteration: 0,
@@ -860,6 +861,7 @@ mod tests {
                     crate::blueprint_tui_audit::Trend::Flat,
                 ],
                 strategy: vec![0.5, 0.5],
+                avg_strategy: vec![0.5, 0.5],
             }],
             active_tab: 0,
             iteration: 0,
@@ -873,6 +875,7 @@ mod tests {
                 crate::blueprint_tui_audit::Trend::Down,
             ],
             strategy: vec![1.0, 0.0],
+            avg_strategy: vec![0.8, 0.2],
         }]);
         metrics.iterations.store(500, Ordering::Relaxed);
         app.tick();
@@ -908,6 +911,7 @@ mod tests {
                 deltas: vec![0.0],
                 trends: vec![crate::blueprint_tui_audit::Trend::Flat],
                 strategy: vec![1.0],
+                avg_strategy: vec![1.0],
             }],
             active_tab: 0,
             iteration: 0,

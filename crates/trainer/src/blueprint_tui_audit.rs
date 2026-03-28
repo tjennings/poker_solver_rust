@@ -27,7 +27,10 @@ pub struct AuditSnapshot {
     pub regrets: Vec<f64>,
     pub deltas: Vec<f64>,
     pub trends: Vec<Trend>,
+    /// Current strategy from regret matching (instantaneous).
     pub strategy: Vec<f64>,
+    /// Average strategy from strategy sums (converged output, matches matrix).
+    pub avg_strategy: Vec<f64>,
 }
 
 /// Resolved regret audit state for a single hand+spot.
@@ -43,6 +46,7 @@ pub struct ResolvedRegretAudit {
     pub num_actions: usize,
     pub regrets: Vec<f64>,
     pub prev_regrets: Vec<f64>,
+    pub avg_strategy: Vec<f64>,
     pub trend_buffers: Vec<VecDeque<f64>>,
     pub error: Option<String>,
     trend_window: usize,
@@ -60,6 +64,7 @@ fn error_audit(name: &str, msg: String, trend_window: usize) -> ResolvedRegretAu
         num_actions: 0,
         regrets: Vec::new(),
         prev_regrets: Vec::new(),
+        avg_strategy: Vec::new(),
         trend_buffers: Vec::new(),
         error: Some(msg),
         trend_window,
@@ -244,6 +249,7 @@ pub fn resolve_regret_audit(
     let regrets: Vec<f64> = (0..num_actions)
         .map(|a| storage.get_regret(node_idx, bucket, a) as f64 / poker_solver_core::blueprint_v2::storage::REGRET_SCALE)
         .collect();
+    let avg_strategy = storage.average_strategy(node_idx, bucket);
 
     ResolvedRegretAudit {
         name: name.to_string(),
@@ -255,6 +261,7 @@ pub fn resolve_regret_audit(
         num_actions,
         prev_regrets: regrets.clone(),
         regrets,
+        avg_strategy,
         trend_buffers: vec![VecDeque::with_capacity(trend_window); num_actions],
         error: None,
         trend_window,
@@ -269,6 +276,7 @@ impl ResolvedRegretAudit {
             let raw = storage.get_regret(self.node_idx, self.bucket, a);
             self.regrets[a] = raw as f64 / poker_solver_core::blueprint_v2::storage::REGRET_SCALE;
         }
+        self.avg_strategy = storage.average_strategy(self.node_idx, self.bucket);
         // Push deltas into trend ring buffers
         for a in 0..self.num_actions {
             let d = self.regrets[a] - self.prev_regrets[a];
@@ -325,6 +333,7 @@ impl ResolvedRegretAudit {
             deltas: (0..self.num_actions).map(|a| self.delta(a)).collect(),
             trends: (0..self.num_actions).map(|a| self.trend(a)).collect(),
             strategy: self.strategy(),
+            avg_strategy: self.avg_strategy.clone(),
         }
     }
 }
