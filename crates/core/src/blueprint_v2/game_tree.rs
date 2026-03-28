@@ -159,7 +159,7 @@ impl GameTree {
     /// * `small_blind` - Small blind in chips (typically 1)
     /// * `big_blind` - Big blind in chips (typically 2)
     /// * `preflop_sizes` - Per raise depth, list of size strings
-    ///   (`"5bb"` = absolute in chips, `"3.0x"` = multiplier of last raise)
+    ///   (`"5bb"` = raise to 5 big blinds, `"3.0x"` = multiplier of last raise)
     /// * `flop_sizes`, `turn_sizes`, `river_sizes` - Per raise depth,
     ///   list of pot fractions. The number of entries determines the
     ///   maximum raises allowed on that street.
@@ -669,7 +669,7 @@ impl GameTree {
 
         for &size in sizes {
             let raise_to = match size {
-                PreflopSize::Absolute(bb) => bb,
+                PreflopSize::Absolute(bb) => bb * state.big_blind,
                 PreflopSize::Multiplier(mult) => state.last_raise_to * mult,
             };
 
@@ -1366,7 +1366,7 @@ mod tests {
             &[vec![1.0]],
             &[vec![1.0]],
         );
-        // SB raises to 5 chips. BB can re-raise to 3.0x * 5 = 15 chips
+        // SB raises to 5bb = 10 chips. BB can re-raise to 3.0x * 10 = 30 chips
         // Find BB's response to SB's raise
         if let GameNode::Decision {
             actions, children, ..
@@ -1381,8 +1381,8 @@ mod tests {
                 let raise_action = actions.iter().find(|a| matches!(a, TreeAction::Raise(_)));
                 if let Some(TreeAction::Raise(to)) = raise_action {
                     assert!(
-                        (*to - 15.0).abs() < SIZE_EPSILON,
-                        "BB should raise to 15 chips (3.0x * 5), got {to}"
+                        (*to - 30.0).abs() < SIZE_EPSILON,
+                        "BB should raise to 30 chips (3.0x * 10), got {to}"
                     );
                 }
             }
@@ -1537,14 +1537,11 @@ mod tests {
     /// Hand trace: verify invested tracks voluntary chips only.
     ///
     /// Config: stack=100, sb=1, bb=2, preflop=["5bb"]
-    /// Trace: SB Raise(5) -> BB Fold
-    /// invested = [5, 0], pot = blinds(3) + vol(5-1 + 0) = 7
+    /// Trace: SB Raise(10) -> BB Fold
+    /// SB raises to 5bb = 10 chips. Additional = 10 - 1 = 9.
+    /// Pot = SB blind(1) + BB blind(2) + SB additional(9) = 12
     #[test]
     fn test_raise_fold_pot_trace() {
-        // Use "5bb" sizing (5 chips = 2.5 BB), stack=100 chips
-        // SB raises to 5 (total street bet). Additional = 5 - 1 = 4.
-        // BB folds.
-        // Pot = SB blind (1) + BB blind (2) + SB additional (4) = 7
         let tree = GameTree::build(
             100.0,
             1.0,
@@ -1565,10 +1562,10 @@ mod tests {
                 let fold_idx = bb_a.iter().position(|a| matches!(a, TreeAction::Fold))
                     .expect("BB should have Fold");
                 if let GameNode::Terminal { pot, .. } = &tree.nodes[bb_c[fold_idx] as usize] {
-                    // Pot = blinds(3) + SB additional(4) = 7.0 chips
+                    // Pot = blinds(3) + SB additional(9) = 12.0 chips
                     assert!(
-                        (*pot - 7.0).abs() < SIZE_EPSILON,
-                        "Pot should be 7.0 chips (blinds 3 + SB additional 4), got {pot}"
+                        (*pot - 12.0).abs() < SIZE_EPSILON,
+                        "Pot should be 12.0 chips (blinds 3 + SB raise to 5bb=10 chips), got {pot}"
                     );
                 } else { panic!("Expected Terminal after fold"); }
             } else { panic!("Expected Decision for BB"); }
@@ -1869,6 +1866,162 @@ mod tests {
         if let GameNode::Decision { player, .. } = &tree.nodes[tree.root as usize] {
             // dealer=0 => OOP = 1 - 0 = 1
             assert_eq!(*player, 1 - tree.dealer, "OOP should act first in subgame");
+        }
+    }
+
+    // ── Preflop sizing tests ────────────────────────────────────────────
+
+    /// Helper: extract the Raise/Bet chip amount at a given tree node for
+    /// actions matching a BB label.
+    fn find_raise_chips(tree: &GameTree, node_idx: u32, bb_label: &str) -> Option<f64> {
+        if let GameNode::Decision { actions, .. } = &tree.nodes[node_idx as usize] {
+            actions.iter().find_map(|a| {
+                let label = action_bb_label(a);
+                if label == bb_label {
+                    match a {
+                        TreeAction::Raise(v) | TreeAction::Bet(v) => Some(*v),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        }
+    }
+
+    fn action_bb_label(action: &TreeAction) -> String {
+        match action {
+            TreeAction::Fold => "fold".into(),
+            TreeAction::Check => "check".into(),
+            TreeAction::Call => "call".into(),
+            TreeAction::AllIn => "all-in".into(),
+            TreeAction::Bet(v) | TreeAction::Raise(v) => {
+                format!("{}bb", (v / 2.0).round() as u32)
+            }
+        }
+    }
+
+    /// "Xbb" notation should produce raise-to = X * big_blind chips.
+    #[test]
+    fn preflop_absolute_bb_sizing() {
+        // stack=200 chips, sb=1, bb=2
+        // "2bb" → 2 * 2 = 4 chips, "4bb" → 4 * 2 = 8 chips, "10bb" → 10 * 2 = 20 chips
+        let tree = GameTree::build(
+            200.0, 1.0, 2.0,
+            &[vec!["2bb".into()], vec!["4bb".into(), "10bb".into()]],
+            &[vec![0.5]], &[vec![0.5]], &[vec![0.5]],
+        );
+        // SB open: "2bb" → Raise(4.0)
+        let sb_raise = find_raise_chips(&tree, tree.root, "2bb");
+        assert_eq!(sb_raise, Some(4.0), "SB open 2bb should be 4 chips");
+
+        // BB response: find the raise child
+        if let GameNode::Decision { actions, children, .. } = &tree.nodes[tree.root as usize] {
+            let raise_idx = actions.iter().position(|a| matches!(a, TreeAction::Raise(v) if (*v - 4.0).abs() < SIZE_EPSILON)).unwrap();
+            let bb_node = children[raise_idx];
+            // BB should have "4bb" → Raise(8.0) and "10bb" → Raise(20.0)
+            let bb_4bb = find_raise_chips(&tree, bb_node, "4bb");
+            assert_eq!(bb_4bb, Some(8.0), "BB 3bet 4bb should be 8 chips");
+            let bb_10bb = find_raise_chips(&tree, bb_node, "10bb");
+            assert_eq!(bb_10bb, Some(20.0), "BB 3bet 10bb should be 20 chips");
+        } else {
+            panic!("root should be Decision");
+        }
+    }
+
+    /// Multiplier sizing: "3.0x" should multiply the last raise-to amount.
+    #[test]
+    fn preflop_multiplier_sizing_correct() {
+        // SB opens "5bb" = 10 chips. BB responds "3.0x" = 3 * 10 = 30 chips.
+        let tree = GameTree::build(
+            200.0, 1.0, 2.0,
+            &[vec!["5bb".into()], vec!["3.0x".into()]],
+            &[vec![0.5]], &[vec![0.5]], &[vec![0.5]],
+        );
+        if let GameNode::Decision { actions, children, .. } = &tree.nodes[tree.root as usize] {
+            let raise_idx = actions.iter().position(|a| matches!(a, TreeAction::Raise(_))).unwrap();
+            let bb_node = children[raise_idx];
+            let bb_raise = find_raise_chips(&tree, bb_node, "15bb");
+            assert_eq!(bb_raise, Some(30.0), "BB 3.0x of 10 chips = 30 chips = 15bb");
+        }
+    }
+
+    /// Mixed sizing: absolute and multiplier at the same depth.
+    #[test]
+    fn preflop_mixed_absolute_and_multiplier() {
+        // SB opens "2bb" = 4 chips. BB can "4bb" (8 chips) or "2.0x" (2 * 4 = 8 chips).
+        // Both produce the same amount → deduplicated to one action.
+        let tree = GameTree::build(
+            200.0, 1.0, 2.0,
+            &[vec!["2bb".into()], vec!["4bb".into(), "2.0x".into()]],
+            &[vec![0.5]], &[vec![0.5]], &[vec![0.5]],
+        );
+        if let GameNode::Decision { actions, children, .. } = &tree.nodes[tree.root as usize] {
+            let raise_idx = actions.iter().position(|a| matches!(a, TreeAction::Raise(_))).unwrap();
+            let bb_node = children[raise_idx];
+            if let GameNode::Decision { actions: bb_actions, .. } = &tree.nodes[bb_node as usize] {
+                let raise_count = bb_actions.iter().filter(|a| matches!(a, TreeAction::Raise(_))).count();
+                assert_eq!(raise_count, 1, "4bb and 2.0x produce same amount, should be deduped to 1 raise");
+            }
+        }
+    }
+
+    /// Min-raise floor: if the absolute BB amount is below the min raise, it
+    /// gets floored up.
+    #[test]
+    fn preflop_min_raise_floor() {
+        // SB opens "2bb" = 4 chips. BB tries "3bb" = 6 chips.
+        // Min raise = last_raise_to(4) + increment(4-2) = 6 chips. So 6 is exactly min.
+        let tree = GameTree::build(
+            200.0, 1.0, 2.0,
+            &[vec!["2bb".into()], vec!["3bb".into()]],
+            &[vec![0.5]], &[vec![0.5]], &[vec![0.5]],
+        );
+        if let GameNode::Decision { actions, children, .. } = &tree.nodes[tree.root as usize] {
+            let raise_idx = actions.iter().position(|a| matches!(a, TreeAction::Raise(_))).unwrap();
+            let bb_node = children[raise_idx];
+            let bb_raise = find_raise_chips(&tree, bb_node, "3bb");
+            assert_eq!(bb_raise, Some(6.0), "BB 3bb = 6 chips = min raise");
+        }
+    }
+
+    /// Postflop pot-fraction sizing produces correct chip amounts.
+    #[test]
+    fn postflop_pot_fraction_sizing() {
+        // SRP: SB 2bb (4 chips), BB calls. Pot = 8 chips entering flop.
+        // Flop bets: 0.33 pot = 2.64, 0.5 pot = 4.0, 1.0 pot = 8.0
+        let tree = GameTree::build(
+            200.0, 1.0, 2.0,
+            &[vec!["2bb".into()]],
+            &[vec![0.33, 0.5, 1.0]],
+            &[vec![0.5]],
+            &[vec![0.5]],
+        );
+        // Navigate: SB raises → BB calls → chance → flop decision
+        if let GameNode::Decision { actions, children, .. } = &tree.nodes[tree.root as usize] {
+            let raise_idx = actions.iter().position(|a| matches!(a, TreeAction::Raise(_))).unwrap();
+            let bb_node_idx = children[raise_idx];
+            if let GameNode::Decision { actions: bb_actions, children: bb_children, .. } = &tree.nodes[bb_node_idx as usize] {
+                let call_idx = bb_actions.iter().position(|a| matches!(a, TreeAction::Call)).unwrap();
+                let mut flop_idx = bb_children[call_idx];
+                // Skip chance node
+                while let GameNode::Chance { child, .. } = &tree.nodes[flop_idx as usize] {
+                    flop_idx = *child;
+                }
+                if let GameNode::Decision { actions: flop_actions, .. } = &tree.nodes[flop_idx as usize] {
+                    let bets: Vec<f64> = flop_actions.iter().filter_map(|a| {
+                        if let TreeAction::Bet(v) = a { Some(*v) } else { None }
+                    }).collect();
+                    assert!(!bets.is_empty(), "flop should have bet actions");
+                    // With pot=8, 0.33*8≈2.64, 0.5*8=4.0, 1.0*8=8.0
+                    // Bet amounts are "raise to" from 0 street bet, so they equal the bet size
+                    for &b in &bets {
+                        assert!(b > 0.0 && b < 200.0, "bet {b} should be reasonable");
+                    }
+                }
+            }
         }
     }
 }

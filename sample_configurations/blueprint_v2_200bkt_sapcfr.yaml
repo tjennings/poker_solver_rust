@@ -47,14 +47,18 @@ training:
   batch_size: 4000
   #purify_threshold: 0.03
   dcfr_epoch_cap: 40
-  # SAPCFR+ optimizer with prediction-based strategy
-  optimizer: "sapcfr+"
-  sapcfr_eta: 0.33
+  optimizer: "dcfr+"
   dcfr_alpha: 1.5
   dcfr_gamma: 2.0
-  # Variance-reducing baselines
-  use_baselines: true
-  baseline_alpha: 0.05
+ 
+  # SAPCFR+ optimizer with prediction-based strategy
+  # optimizer: "sapcfr+"
+  # sapcfr_eta: 0.6
+  # dcfr_alpha: 1.5
+  # dcfr_gamma: 2.0
+  # # Variance-reducing baselines
+  # use_baselines: true
+  # baseline_alpha: 0.5
 
 snapshots:
   resume: true
@@ -86,6 +90,14 @@ tui:
       spot: ""
       hand: "AA"
       player: SB
+    - name: "62o SB open"
+      spot: ""
+      hand: "62o"
+      player: SB
+    - name: "52o SB open"
+      spot: ""
+      hand: "52o"
+      player: SB
     - name: "AKo SB open"
       spot: ""
       hand: "AKo"
@@ -94,6 +106,14 @@ tui:
       spot: ""
       hand: "72o"
       player: SB
+    - name: "75s SB open"
+      spot: ""
+      hand: "75s"
+      player: SB
+    - name: "77 BB vs SB open"
+      spot: "sb:2bb"
+      hand: "77"
+      player: SB  
     - name: "QQ BB vs SB open"
       spot: "sb:2bb"
       hand: "QQ"

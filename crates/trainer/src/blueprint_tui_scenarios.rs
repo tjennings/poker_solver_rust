@@ -389,10 +389,10 @@ mod tests {
 
     #[timed_test(10)]
     fn resolve_spot_single_action() {
-        // toy_tree root: SB has [Fold, Call, Raise(5.0), AllIn]
-        // Raise(5.0) → 5/2=2.5 → round=3 → "3bb"
+        // toy_tree root: SB has [Fold, Call, Raise(10.0), AllIn]
+        // "5bb" → 5 * big_blind(2) = 10 chips → Raise(10.0) → 10/2=5 → "5bb"
         let tree = toy_tree();
-        let (node_idx, board) = resolve_spot(&tree, "sb:3bb").unwrap();
+        let (node_idx, board) = resolve_spot(&tree, "sb:5bb").unwrap();
         assert_ne!(node_idx, tree.root);
         assert!(board.is_empty());
     }
@@ -400,8 +400,8 @@ mod tests {
     #[timed_test(10)]
     fn resolve_spot_two_actions() {
         let tree = toy_tree();
-        let result = resolve_spot(&tree, "sb:3bb,bb:call");
-        assert!(result.is_some(), "sb:3bb,bb:call should resolve");
+        let result = resolve_spot(&tree, "sb:5bb,bb:call");
+        assert!(result.is_some(), "sb:5bb,bb:call should resolve");
         let (_, board) = result.unwrap();
         assert!(board.is_empty());
     }
@@ -409,7 +409,7 @@ mod tests {
     #[timed_test(10)]
     fn resolve_spot_with_board() {
         let tree = toy_tree();
-        let result = resolve_spot(&tree, "sb:3bb,bb:call|Kh7s2d");
+        let result = resolve_spot(&tree, "sb:5bb,bb:call|Kh7s2d");
         assert!(result.is_some());
         let (_, board) = result.unwrap();
         assert_eq!(board.len(), 3);

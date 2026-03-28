@@ -215,7 +215,7 @@ fn build_mccfr_config(
             per_flop: None,
         },
         action_abstraction: ActionAbstractionConfig {
-            preflop: vec![vec!["4bb".into()]],
+            preflop: vec![vec!["2bb".into()]],
             flop: postflop_sizes.clone(),
             turn: postflop_sizes.clone(),
             river: postflop_sizes,
