@@ -82,6 +82,10 @@ tui:
     - name: "BB call rainbow broadway"
       spot: "sb:2bb,bb:call|AsKhQd"
   regret_audits:
+    - name: "AA SB open"
+      spot: ""
+      hand: "AA"
+      player: SB
     - name: "AKo SB open"
       spot: ""
       hand: "AKo"
