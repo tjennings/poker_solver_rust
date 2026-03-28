@@ -1098,40 +1098,48 @@ fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
         &bp_config.action_abstraction.river,
     );
 
-    // Create buffer
+    // Open or create buffer
     let buffer_path = std::path::Path::new(&rebel_config.output_dir)
         .join(&rebel_config.buffer.path);
-    eprintln!("Creating buffer at {}...", buffer_path.display());
-    let buffer = std::sync::Mutex::new(
-        rebel::data_buffer::DiskBuffer::create(&buffer_path, rebel_config.buffer.max_records)
-            .map_err(|e| format!("Failed to create buffer: {e}"))?
-    );
+    let buffer = if buffer_path.exists() {
+        let buf = rebel::data_buffer::DiskBuffer::open(&buffer_path, rebel_config.buffer.max_records)
+            .map_err(|e| format!("Failed to open buffer: {e}"))?;
+        eprintln!("Resuming from existing buffer: {} records at {}", buf.len(), buffer_path.display());
+        std::sync::Mutex::new(buf)
+    } else {
+        eprintln!("Creating buffer at {}...", buffer_path.display());
+        std::sync::Mutex::new(
+            rebel::data_buffer::DiskBuffer::create(&buffer_path, rebel_config.buffer.max_records)
+                .map_err(|e| format!("Failed to create buffer: {e}"))?
+        )
+    };
 
-    // Generate PBSs
-    eprintln!(
-        "Generating {} hands with {} threads...",
-        rebel_config.seed.num_hands, rebel_config.seed.threads
-    );
+    // Skip PBS generation if buffer already has records
+    let existing_count = buffer.lock().unwrap().len();
+    if existing_count > 0 {
+        eprintln!("Buffer has {} existing records, skipping PBS generation", existing_count);
+    } else {
+        eprintln!(
+            "Generating {} hands with {} threads...",
+            rebel_config.seed.num_hands, rebel_config.seed.threads
+        );
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(rebel_config.seed.threads)
-        .build()
-        .map_err(|e| format!("Failed to create thread pool: {e}"))?;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(rebel_config.seed.threads)
+            .build()
+            .map_err(|e| format!("Failed to create thread pool: {e}"))?;
 
-    let pbs_count = pool.install(|| {
-        rebel::generate::generate_pbs(&strategy, &tree, &buckets, &rebel_config, &buffer)
-    });
+        let pbs_count = pool.install(|| {
+            rebel::generate::generate_pbs(&strategy, &tree, &buckets, &rebel_config, &buffer)
+        });
+        eprintln!("Generated {} PBS snapshots", pbs_count);
+    }
 
     let mut buf = buffer.into_inner().unwrap();
     let record_count = buf.len();
-    eprintln!(
-        "Generated {} PBS snapshots, {} buffer records",
-        pbs_count,
-        record_count
-    );
 
     // --- Step 3: Solve PBSs in buffer → fill CFVs ---
-    eprintln!("Building solve config and solving {} records...", record_count);
+    eprintln!("Solving {} records...", record_count);
     let solve_config = rebel::generate::build_solve_config(&rebel_config.seed);
     let solved = rebel::generate::solve_buffer_records(
         &mut buf,

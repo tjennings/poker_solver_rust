@@ -213,6 +213,12 @@ pub fn solve_buffer_records(
             records
                 .into_par_iter()
                 .filter_map(|(idx, mut rec)| {
+                    // Skip already-solved records (non-zero game_value)
+                    if rec.game_value != 0.0 {
+                        pb.inc(1);
+                        return None;
+                    }
+
                     let pbs = buffer_record_to_pbs(&rec);
 
                     let solve_result = if let Some(eval) = evaluator {
@@ -221,11 +227,7 @@ pub fn solve_buffer_records(
                     } else {
                         // River-only solving: requires exactly 5 board cards.
                         if pbs.board.len() != 5 {
-                            eprintln!(
-                                "  Warning: skipping non-river record {} ({} board cards, no evaluator)",
-                                idx,
-                                pbs.board.len()
-                            );
+                            pb.inc(1);
                             return None;
                         }
                         solve_river_pbs(&pbs, solve_config)
@@ -246,6 +248,7 @@ pub fn solve_buffer_records(
                         }
                         Err(e) => {
                             eprintln!("  Warning: failed to solve record {idx}: {e}");
+                            pb.inc(1);
                             None
                         }
                     }
@@ -258,9 +261,8 @@ pub fn solve_buffer_records(
             buffer
                 .write_record(*idx, rec)
                 .unwrap_or_else(|e| panic!("failed to write record {idx}: {e}"));
+            pb.inc(1);
         }
-
-        pb.inc((chunk_end - chunk_start) as u64);
     }
 
     let solved = solved_count.load(Ordering::Relaxed);
