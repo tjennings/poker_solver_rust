@@ -277,14 +277,15 @@ impl ResolvedRegretAudit {
             self.regrets[a] = raw as f64 / poker_solver_core::blueprint_v2::storage::REGRET_SCALE;
         }
         self.avg_strategy = storage.average_strategy(self.node_idx, self.bucket);
-        // Push deltas into trend ring buffers
+        // Push magnitude deltas into trend ring buffers.
+        // Positive = moving away from zero (strengthening), negative = decaying toward zero.
         for a in 0..self.num_actions {
-            let d = self.regrets[a] - self.prev_regrets[a];
+            let mag_delta = self.regrets[a].abs() - self.prev_regrets[a].abs();
             let buf = &mut self.trend_buffers[a];
             if buf.len() == self.trend_window {
                 buf.pop_front();
             }
-            buf.push_back(d);
+            buf.push_back(mag_delta);
         }
     }
 
