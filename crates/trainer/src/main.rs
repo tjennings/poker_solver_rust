@@ -1,4 +1,6 @@
 mod blueprint_tui;
+#[allow(dead_code)]
+mod blueprint_tui_audit;
 mod blueprint_tui_config;
 mod blueprint_tui_metrics;
 mod blueprint_tui_scenarios;
