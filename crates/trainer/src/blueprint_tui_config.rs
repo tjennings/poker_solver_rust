@@ -10,6 +10,24 @@ pub enum StreetLabel {
     River,
 }
 
+/// Which player position a regret-audit entry refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum PlayerLabel {
+    Sb,
+    Bb,
+}
+
+/// A hand whose regret accumulation is tracked live in the TUI.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegretAuditConfig {
+    pub name: String,
+    #[serde(default)]
+    pub spot: String,
+    pub hand: String,
+    pub player: PlayerLabel,
+}
+
 /// A single scenario to display live strategy evolution in the TUI.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScenarioConfig {
@@ -70,6 +88,8 @@ pub struct BlueprintTuiConfig {
     pub scenarios: Vec<ScenarioConfig>,
     #[serde(default)]
     pub random_scenario: RandomScenarioConfig,
+    #[serde(default)]
+    pub regret_audits: Vec<RegretAuditConfig>,
 }
 
 impl Default for BlueprintTuiConfig {
@@ -80,6 +100,7 @@ impl Default for BlueprintTuiConfig {
             telemetry: TelemetryConfig::default(),
             scenarios: Vec::new(),
             random_scenario: RandomScenarioConfig::default(),
+            regret_audits: Vec::new(),
         }
     }
 }
@@ -180,6 +201,36 @@ tui:
             StreetLabel::Flop,
             StreetLabel::Turn,
         ]);
+    }
+
+    #[timed_test(10)]
+    fn parse_regret_audits() {
+        let yaml = r#"
+tui:
+  enabled: true
+  regret_audits:
+    - name: "AKo SB open"
+      spot: ""
+      hand: "AKo"
+      player: SB
+    - name: "T9s flop cbet"
+      spot: "sb:2bb,bb:call|AsTd9d"
+      hand: "Ts9s"
+      player: SB
+"#;
+        let cfg = parse_tui_config(yaml);
+        assert_eq!(cfg.regret_audits.len(), 2);
+        assert_eq!(cfg.regret_audits[0].name, "AKo SB open");
+        assert_eq!(cfg.regret_audits[0].hand, "AKo");
+        assert_eq!(cfg.regret_audits[0].player, PlayerLabel::Sb);
+        assert_eq!(cfg.regret_audits[1].spot, "sb:2bb,bb:call|AsTd9d");
+        assert_eq!(cfg.regret_audits[1].hand, "Ts9s");
+    }
+
+    #[timed_test(10)]
+    fn regret_audits_default_empty() {
+        let cfg = parse_tui_config("");
+        assert!(cfg.regret_audits.is_empty());
     }
 
     #[timed_test(10)]
