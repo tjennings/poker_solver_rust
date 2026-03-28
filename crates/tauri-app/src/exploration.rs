@@ -744,17 +744,13 @@ pub fn list_snapshots_core(blueprint_path: String) -> Result<Vec<SnapshotEntry>,
             let has_strategy = snap_dir.join("strategy.bin").exists();
 
             // Try to read metadata.json for iteration count and elapsed time.
-            let (iterations, elapsed_minutes) = snap_dir
-                .join("metadata.json")
-                .exists()
-                .then(|| {
-                    let data = std::fs::read_to_string(snap_dir.join("metadata.json")).ok()?;
-                    let json: serde_json::Value = serde_json::from_str(&data).ok()?;
-                    let iters = json.get("iteration").and_then(|v| v.as_u64());
-                    let mins = json.get("elapsed_minutes").and_then(|v| v.as_u64());
-                    Some((iters, mins))
-                })
-                .flatten()
+            let (iterations, elapsed_minutes) = std::fs::read_to_string(snap_dir.join("metadata.json"))
+                .ok()
+                .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+                .map(|json| (
+                    json.get("iteration").and_then(|v| v.as_u64()),
+                    json.get("elapsed_minutes").and_then(|v| v.as_u64()),
+                ))
                 .unwrap_or((None, None));
 
             Some(SnapshotEntry {
