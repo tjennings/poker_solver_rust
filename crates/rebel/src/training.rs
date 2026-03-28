@@ -17,17 +17,45 @@ use crate::data_buffer::{BufferRecord, DiskBuffer};
 /// - `cfvs`, `pot`, `effective_stack`, `player`, `game_value`, `valid_mask` copy directly
 pub fn to_training_record(rec: &BufferRecord) -> TrainingRecord {
     let board_len = rec.board_card_count as usize;
+
+    // Normalize reach probabilities to sum to 1.0.
+    // cfvnet expects probability distributions, not raw reach probs.
+    let oop_range = normalize_range(&rec.oop_reach);
+    let ip_range = normalize_range(&rec.ip_reach);
+
+    // Recompute game_value with normalized ranges.
+    let acting_range = if rec.player == 0 { &oop_range } else { &ip_range };
+    let game_value: f32 = acting_range
+        .iter()
+        .zip(rec.cfvs.iter())
+        .map(|(&r, &c)| r * c)
+        .sum();
+
     TrainingRecord {
         board: rec.board[..board_len].to_vec(),
         pot: rec.pot,
         effective_stack: rec.effective_stack,
         player: rec.player,
-        game_value: rec.game_value,
-        oop_range: rec.oop_reach,
-        ip_range: rec.ip_reach,
+        game_value,
+        oop_range,
+        ip_range,
         cfvs: rec.cfvs,
         valid_mask: rec.valid_mask,
     }
+}
+
+/// Normalize a reach probability vector to sum to 1.0.
+fn normalize_range(reach: &[f32; 1326]) -> [f32; 1326] {
+    let sum: f32 = reach.iter().sum();
+    if sum <= 0.0 {
+        return *reach;
+    }
+    let mut out = *reach;
+    let inv = 1.0 / sum;
+    for v in &mut out {
+        *v *= inv;
+    }
+    out
 }
 
 /// Export buffer records to cfvnet `TrainingRecord` binary files.
@@ -125,9 +153,16 @@ mod tests {
         assert_eq!(train_rec.pot, 150.0);
         assert_eq!(train_rec.effective_stack, 200.0);
         assert_eq!(train_rec.player, 1);
-        assert!((train_rec.game_value - 0.42).abs() < 1e-6);
 
-        // CFVs match
+        // game_value is recomputed with normalized IP range (player=1)
+        // ip_reach = [0.6, 0, ..., 0.9 @50, ...], sum = 1.5
+        // normalized: ip_range[0] = 0.4, ip_range[50] = 0.6
+        // cfvs[0] = 1.5, cfvs[50] = 0.0
+        // game_value = 0.4 * 1.5 + 0.6 * 0.0 = 0.6
+        assert!((train_rec.game_value - 0.6).abs() < 1e-5,
+            "game_value should be ~0.6 after normalization, got {}", train_rec.game_value);
+
+        // CFVs match (unchanged by normalization)
         assert_eq!(train_rec.cfvs[0], 1.5);
         assert_eq!(train_rec.cfvs[1], -2.3);
 
@@ -137,14 +172,17 @@ mod tests {
         assert_eq!(train_rec.valid_mask[100], 1);
         assert_eq!(train_rec.valid_mask[2], 0);
 
-        // oop_range == oop_reach
-        assert_eq!(train_rec.oop_range[0], 0.8);
-        assert_eq!(train_rec.oop_range[100], 0.3);
+        // Ranges are normalized (sum to 1.0)
+        let oop_sum: f32 = train_rec.oop_range.iter().sum();
+        assert!((oop_sum - 1.0).abs() < 1e-5, "oop_range should sum to 1.0, got {oop_sum}");
+        let ip_sum: f32 = train_rec.ip_range.iter().sum();
+        assert!((ip_sum - 1.0).abs() < 1e-5, "ip_range should sum to 1.0, got {ip_sum}");
+        // Normalized values preserve relative proportions
+        // oop: [0.8, 0, ..., 0.3 @100, ...] sum=1.1 → [0.727, 0, ..., 0.273, ...]
+        assert!(train_rec.oop_range[0] > train_rec.oop_range[100]);
         assert_eq!(train_rec.oop_range[1], 0.0);
-
-        // ip_range == ip_reach
-        assert_eq!(train_rec.ip_range[0], 0.6);
-        assert_eq!(train_rec.ip_range[50], 0.9);
+        // ip: [0.6, ..., 0.9 @50, ...] sum=1.5 → [0.4, ..., 0.6, ...]
+        assert!(train_rec.ip_range[50] > train_rec.ip_range[0]);
         assert_eq!(train_rec.ip_range[1], 0.0);
     }
 
@@ -189,11 +227,14 @@ mod tests {
         assert_eq!(loaded1.pot, 100.0);
         assert_eq!(loaded1.effective_stack, 200.0);
         assert_eq!(loaded1.player, 1);
-        assert!((loaded1.game_value - 0.42).abs() < 1e-6);
-        assert_eq!(loaded1.oop_range[0], 0.8);
-        assert_eq!(loaded1.oop_range[100], 0.3);
-        assert_eq!(loaded1.ip_range[0], 0.6);
-        assert_eq!(loaded1.ip_range[50], 0.9);
+        // game_value recomputed with normalized ranges
+        assert!((loaded1.game_value - 0.6).abs() < 1e-5,
+            "game_value should be ~0.6, got {}", loaded1.game_value);
+        // Ranges are normalized
+        let oop_sum: f32 = loaded1.oop_range.iter().sum();
+        assert!((oop_sum - 1.0).abs() < 1e-5);
+        let ip_sum: f32 = loaded1.ip_range.iter().sum();
+        assert!((ip_sum - 1.0).abs() < 1e-5);
         assert_eq!(loaded1.cfvs[0], 1.5);
         assert_eq!(loaded1.cfvs[1], -2.3);
         assert_eq!(loaded1.valid_mask[0], 1);
