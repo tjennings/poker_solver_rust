@@ -66,6 +66,15 @@ tui:
       actions: ["raise-0", "call"]
       board: ["Kh", "7s", "2d"]
       street: flop
+  regret_audits:
+    - name: "AKo SB open"
+      spot: ""
+      hand: "AKo"
+      player: SB
+    - name: "72o SB open"
+      spot: ""
+      hand: "72o"
+      player: SB
   random_scenario:
     enabled: true
     hold_minutes: 3
