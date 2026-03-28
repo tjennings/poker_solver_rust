@@ -825,15 +825,14 @@ fn traverse_traverser(
         stats.merge(child_stats);
     }
 
-    // Update regrets: delta = action_value - node_value, scaled to
-    // integer by ×1000 for precision. Skip pruned actions.
-    // Also store as prediction for SAPCFR+ (no-op when predictions disabled).
+    // Update regrets: delta = action_value - node_value (integer chip units).
+    // Skip pruned actions. Also store as prediction for SAPCFR+.
     for (a, &av) in action_values.iter().enumerate().take(num_actions) {
         if pruned[a] {
             continue;
         }
         let delta = av - node_value;
-        let delta_i32 = (delta * 1000.0) as i32;
+        let delta_i32 = delta as i32;
         storage.add_regret(node_idx, bucket, a, delta_i32);
         storage.set_prediction(node_idx, bucket, a, delta_i32);
     }

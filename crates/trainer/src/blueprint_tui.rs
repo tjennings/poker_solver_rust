@@ -48,11 +48,11 @@ pub struct BlueprintTuiApp {
     delta_history: Vec<u64>,
     // Leaf movement sparkline data
     leaf_movement_history: Vec<u64>,
-    // Max positive regret sparkline data (stored as value × 1000 for sparkline)
+    // Max positive regret sparkline data
     max_regret_history: Vec<u64>,
-    // Max negative regret sparkline data (stored as abs value × 1000 for sparkline)
+    // Max negative regret sparkline data
     min_regret_history: Vec<u64>,
-    // Avg positive regret sparkline data (stored as value × 1000 for sparkline)
+    // Avg positive regret sparkline data
     avg_pos_regret_history: Vec<u64>,
     // Prune fraction sparkline data (stored as value × 1000 for sparkline)
     prune_history: Vec<u64>,

@@ -508,8 +508,8 @@ impl BlueprintTrainer {
                 .collect();
 
             let prune = self.should_prune();
-            // Config prune_threshold is in chip units; stored regrets are ×1000.
-            let threshold = self.config.training.prune_threshold.saturating_mul(1000);
+            // Config prune_threshold is in chip units, matching stored regrets directly.
+            let threshold = self.config.training.prune_threshold;
 
             let tree = &self.tree;
             let storage = &self.storage;
@@ -840,8 +840,8 @@ impl BlueprintTrainer {
         );
     }
 
-    /// The most-negative regret value across all info-set entries,
-    /// divided by the ×1000 scaling factor used in storage.
+    /// The most-negative regret value across all info-set entries
+    /// (raw integer chip units).
     #[must_use]
     pub fn min_regret(&self) -> f64 {
         let min_raw = self
@@ -851,11 +851,11 @@ impl BlueprintTrainer {
             .map(|atom| atom.load(Ordering::Relaxed))
             .min()
             .unwrap_or(0);
-        f64::from(min_raw) / 1000.0
+        f64::from(min_raw)
     }
 
-    /// The most-positive regret value across all info-set entries,
-    /// divided by the ×1000 scaling factor used in storage.
+    /// The most-positive regret value across all info-set entries
+    /// (raw integer chip units).
     #[must_use]
     pub fn max_regret(&self) -> f64 {
         let max_raw = self
@@ -865,7 +865,7 @@ impl BlueprintTrainer {
             .map(|atom| atom.load(Ordering::Relaxed))
             .max()
             .unwrap_or(0);
-        f64::from(max_raw) / 1000.0
+        f64::from(max_raw)
     }
 
     /// Average positive regret per iteration: mean of positive regret
@@ -889,7 +889,7 @@ impl BlueprintTrainer {
                 }
             });
         if count > 0 {
-            sum / count as f64 / 1000.0 / self.iterations as f64
+            sum / count as f64 / self.iterations as f64
         } else {
             0.0
         }
@@ -898,8 +898,8 @@ impl BlueprintTrainer {
     /// Fraction of regret entries below the prune threshold (0.0–1.0).
     #[must_use]
     pub fn prune_fraction(&self) -> f64 {
-        // Config is in BB units; stored regrets are ×1000.
-        let threshold = self.config.training.prune_threshold.saturating_mul(1000);
+        // Config prune_threshold is in chip units, matching stored regrets directly.
+        let threshold = self.config.training.prune_threshold;
         let total = self.storage.regrets.len() as f64;
         if total == 0.0 {
             return 0.0;
