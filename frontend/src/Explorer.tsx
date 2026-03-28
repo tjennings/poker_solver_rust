@@ -13,6 +13,7 @@ import {
   PlayerRange,
   RangeSnapshot,
   BlueprintListEntry,
+  SnapshotEntry,
 } from './types';
 import {
   SUIT_COLORS,
@@ -590,6 +591,47 @@ export default function Explorer() {
 
   const [showBlueprintPicker, setShowBlueprintPicker] = useState(false);
   const [blueprints, setBlueprints] = useState<BlueprintListEntry[]>([]);
+  const [selectedBlueprint, setSelectedBlueprint] = useState<BlueprintListEntry | null>(null);
+  const [snapshots, setSnapshots] = useState<SnapshotEntry[]>([]);
+  const [selectedSnapshot, setSelectedSnapshot] = useState<string | null>(null);
+  const [showSnapshotPicker, setShowSnapshotPicker] = useState(false);
+
+  // Load a blueprint (with optional snapshot) and apply initial state.
+  const loadAndApplyBlueprint = async (path: string, snapshot: string | null) => {
+    setShowBlueprintPicker(false);
+    setShowSnapshotPicker(false);
+    setLoading(true);
+    setError(null);
+    try {
+      const info = await invoke<BundleInfo>('load_blueprint_v2', { path, snapshot });
+      setBundleInfo(info);
+      const sp1 = info.stack_depth - 1;
+      const sp2 = info.stack_depth - 2;
+      const initialPosition: ExplorationPosition = {
+        board: [],
+        history: [],
+        pot: 3,
+        stacks: [sp1, sp2],
+        to_act: 0,
+        num_players: 2,
+        active_players: [true, true],
+      };
+      setPosition(initialPosition);
+      setHistoryItems([]);
+      setPendingStreet(null);
+      setHandResult(null);
+      setSelectedCell(null);
+      const initialMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
+        position: initialPosition,
+      });
+      setMatrix(initialMatrix);
+      updateRangesFromMatrix(initialMatrix);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleLoadStrategy = async () => {
     const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
@@ -1247,37 +1289,24 @@ export default function Explorer() {
                   key={bp.path}
                   className="dataset-picker-item"
                   onClick={async () => {
-                    setShowBlueprintPicker(false);
-                    setLoading(true);
-                    setError(null);
                     try {
-                      const info = await invoke<BundleInfo>('load_blueprint_v2', { path: bp.path });
-                      setBundleInfo(info);
-                      const sp1 = info.stack_depth - 1;
-                      const sp2 = info.stack_depth - 2;
-                      const initialPosition: ExplorationPosition = {
-                        board: [],
-                        history: [],
-                        pot: 3,
-                        stacks: [sp1, sp2],
-                        to_act: 0,
-                        num_players: 2,
-                        active_players: [true, true],
-                      };
-                      setPosition(initialPosition);
-                      setHistoryItems([]);
-                      setPendingStreet(null);
-                      setHandResult(null);
-                      setSelectedCell(null);
-                      const initialMatrix = await invoke<StrategyMatrix>('get_strategy_matrix', {
-                        position: initialPosition,
-                      });
-                      setMatrix(initialMatrix);
-                      updateRangesFromMatrix(initialMatrix);
+                      const snaps = await invoke<SnapshotEntry[]>('list_snapshots', { path: bp.path });
+                      const strategySnaps = snaps.filter(s => s.has_strategy);
+                      if (strategySnaps.length <= 1) {
+                        // 0 or 1 snapshot -- load directly (no picker needed)
+                        await loadAndApplyBlueprint(
+                          bp.path,
+                          strategySnaps.length === 1 ? strategySnaps[0].name : null,
+                        );
+                      } else {
+                        // Multiple snapshots -- show snapshot picker
+                        setSelectedBlueprint(bp);
+                        setSnapshots(strategySnaps);
+                        setSelectedSnapshot(strategySnaps[0].name);
+                        setShowSnapshotPicker(true);
+                      }
                     } catch (e) {
                       setError(String(e));
-                    } finally {
-                      setLoading(false);
                     }
                   }}
                 >
@@ -1288,6 +1317,57 @@ export default function Explorer() {
             </div>
           )}
         </div>
+        </div>
+      )}
+
+      {showSnapshotPicker && selectedBlueprint && (
+        <div className="dataset-picker-overlay" onClick={() => setShowSnapshotPicker(false)}>
+          <div className="dataset-picker" onClick={e => e.stopPropagation()}>
+            <div className="dataset-picker-header">
+              <h3>{selectedBlueprint.name} -- Select Snapshot</h3>
+              <button className="dataset-picker-close" onClick={() => setShowSnapshotPicker(false)}>x</button>
+            </div>
+            <div className="dataset-picker-list">
+              {snapshots.map((snap) => (
+                <div
+                  key={snap.name}
+                  className={`dataset-picker-item ${selectedSnapshot === snap.name ? 'selected' : ''}`}
+                  onClick={() => setSelectedSnapshot(snap.name)}
+                  onDoubleClick={() => loadAndApplyBlueprint(selectedBlueprint.path, snap.name)}
+                >
+                  <span className="dataset-kind-badge preflop">
+                    {snap.name.replace('snapshot_', '#')}
+                  </span>
+                  <span className="dataset-name">
+                    {snap.iterations != null
+                      ? `${(snap.iterations / 1_000_000).toFixed(1)}M iterations`
+                      : 'unknown iterations'}
+                    {snap.elapsed_minutes != null
+                      ? ` \u00b7 ${Math.round(snap.elapsed_minutes)}min`
+                      : ''}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div style={{ padding: '8px 12px', display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+              <button
+                className="action-button"
+                onClick={() => setShowSnapshotPicker(false)}
+              >
+                Cancel
+              </button>
+              <button
+                className="action-button"
+                onClick={() => {
+                  if (selectedSnapshot) {
+                    loadAndApplyBlueprint(selectedBlueprint.path, selectedSnapshot);
+                  }
+                }}
+              >
+                Load
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
