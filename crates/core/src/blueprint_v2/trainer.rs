@@ -202,6 +202,10 @@ pub struct BlueprintTrainer {
     pub random_scenario_hold_minutes: u64,
     /// Last time (in minutes) a random scenario was pushed.
     last_random_scenario_min: u64,
+
+    // --- Regret audit ---
+    /// Called at strategy-refresh interval to update regret audit state.
+    pub on_audit_refresh: Option<Box<dyn FnMut(&BlueprintStorage) + Send>>,
 }
 
 impl BlueprintTrainer {
@@ -345,6 +349,7 @@ impl BlueprintTrainer {
             on_random_scenario: None,
             random_scenario_hold_minutes: 3,
             last_random_scenario_min: 0,
+            on_audit_refresh: None,
         }
     }
 
@@ -714,6 +719,9 @@ impl BlueprintTrainer {
                     }
                     callback(i, node_idx, &self.storage, &self.tree, &hand_evs);
                 }
+            }
+            if let Some(ref mut cb) = self.on_audit_refresh {
+                cb(&self.storage);
             }
             // Reset EV accumulators after reading so displayed values
             // reflect only the most recent window, not cumulative history.
