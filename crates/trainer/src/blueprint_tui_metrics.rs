@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::blueprint_tui_audit::AuditSnapshot;
 use crate::blueprint_tui_widgets::CellStrategy;
 
 /// Maximum number of monitored scenarios.
@@ -45,6 +46,9 @@ pub struct BlueprintTuiMetrics {
     // --- strategy grids for TUI scenario refresh ---
     pub strategy_grids: Mutex<Vec<Option<[[CellStrategy; 13]; 13]>>>,
 
+    /// Latest regret audit snapshots, ready for the TUI to consume.
+    pub regret_audit_snapshots: Mutex<Option<Vec<AuditSnapshot>>>,
+
     // --- sparkline history ---
     pub strategy_delta_history: Mutex<Vec<f64>>,
     pub leaf_movement_history: Mutex<Vec<f64>>,
@@ -83,6 +87,7 @@ impl BlueprintTuiMetrics {
             random_scenario: Mutex::new(None),
 
             strategy_grids: Mutex::new(grids),
+            regret_audit_snapshots: Mutex::new(None),
             strategy_delta_history: Mutex::new(Vec::new()),
             leaf_movement_history: Mutex::new(Vec::new()),
             min_regret_history: Mutex::new(Vec::new()),
@@ -146,6 +151,20 @@ impl BlueprintTuiMetrics {
         if idx < grids.len() {
             grids[idx] = Some(grid);
         }
+    }
+
+    /// Store updated audit snapshots for the TUI to pick up.
+    #[allow(dead_code)]
+    pub fn update_regret_audits(&self, snapshots: Vec<AuditSnapshot>) {
+        let mut data = self.regret_audit_snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        *data = Some(snapshots);
+    }
+
+    /// Take the latest audit snapshots (returns None if none pending).
+    #[allow(dead_code)]
+    pub fn take_regret_audits(&self) -> Option<Vec<AuditSnapshot>> {
+        let mut data = self.regret_audit_snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        data.take()
     }
 
     /// Push a strategy delta sample into the sparkline history.
@@ -310,5 +329,30 @@ mod tests {
         m.update_scenario_grid(0, grid);
         let grids = m.strategy_grids.lock().unwrap();
         assert!(grids[0].is_some());
+    }
+
+    #[timed_test(10)]
+    fn regret_audit_snapshot_exchange() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        let snapshot = vec![
+            crate::blueprint_tui_audit::AuditSnapshot {
+                regrets: vec![1.0, -2.0, 3.0],
+                deltas: vec![0.5, -0.1, 0.2],
+                trends: vec![
+                    crate::blueprint_tui_audit::Trend::Up,
+                    crate::blueprint_tui_audit::Trend::Down,
+                    crate::blueprint_tui_audit::Trend::Flat,
+                ],
+                strategy: vec![0.0, 0.25, 0.75],
+            },
+        ];
+        m.update_regret_audits(snapshot.clone());
+        let taken = m.take_regret_audits();
+        assert!(taken.is_some());
+        let taken = taken.unwrap();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].regrets, vec![1.0, -2.0, 3.0]);
+        // Second take should return None.
+        assert!(m.take_regret_audits().is_none());
     }
 }
