@@ -62,6 +62,8 @@ pub struct HandGridState {
     pub cluster_id: Option<u32>,
     pub street_label: String,
     pub iteration_at_snapshot: u64,
+    /// When set, the grid renders this error message instead of the hand matrix.
+    pub error_message: Option<String>,
 }
 
 // ─── Color helpers ───────────────────────────────────────────────────────────
@@ -122,6 +124,19 @@ impl Widget for &HandGridWidget<'_> {
         // 3-row cells: row 0-1 = stacked color bar, row 2 = hand label.
         let cell_h: u16 = 3;
         if area.height < 4 || area.width < 13 {
+            return;
+        }
+
+        // ── Error overlay ──────────────────────────────────────────
+        if let Some(ref msg) = self.state.error_message {
+            let style = Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD);
+            let title = format!(" {} ", self.state.scenario_name);
+            buf.set_string(area.x, area.y, &title, Style::default().bold());
+            let msg_y = area.y + area.height / 3;
+            let msg_x = area.x + area.width.saturating_sub(msg.len() as u16) / 2;
+            buf.set_string(msg_x, msg_y, msg, style);
             return;
         }
 
@@ -475,6 +490,7 @@ mod tests {
             cluster_id: Some(42),
             street_label: "Flop".to_string(),
             iteration_at_snapshot: 5000,
+            error_message: None,
         };
 
         // AA is row=0, col=0 (pair on diagonal)
@@ -599,5 +615,27 @@ mod tests {
             })
             .unwrap();
         // No panic = success
+    }
+
+    #[timed_test(10)]
+    fn error_message_renders_instead_of_grid() {
+        let mut state = mock_grid_state();
+        state.error_message = Some("Spot failed to resolve: sb:2bb,bb:7bb".to_string());
+
+        let widget = HandGridWidget { state: &state };
+        let area = Rect::new(0, 0, 80, 42);
+        let mut buf = Buffer::empty(area);
+        (&widget).render(area, &mut buf);
+
+        let mut content = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                content.push(buf.cell((x, y)).unwrap().symbol().chars().next().unwrap_or(' '));
+            }
+        }
+        assert!(
+            content.contains("Spot failed to resolve"),
+            "expected error text in buffer, got: {content}"
+        );
     }
 }

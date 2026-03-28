@@ -250,6 +250,7 @@ impl BlueprintTuiApp {
                     cluster_id: None,
                     street_label: state.street_label,
                     iteration_at_snapshot: self.metrics.iterations.load(Ordering::Relaxed),
+                    error_message: None,
                 };
 
                 let scenario = ResolvedScenario {
@@ -671,6 +672,7 @@ mod tests {
                 cluster_id: None,
                 street_label: "Preflop".to_string(),
                 iteration_at_snapshot: 0,
+                error_message: None,
             },
         }
     }

@@ -279,14 +279,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .scenarios
                     .iter()
                     .map(|sc| {
-                        let (node_idx, board) = blueprint_tui_scenarios::resolve_spot(
+                        let (node_idx, board, error_message) = match blueprint_tui_scenarios::resolve_spot(
                             &trainer.tree,
                             &sc.spot,
-                        )
-                        .unwrap_or_else(|| {
-                            eprintln!("WARNING: scenario '{}' spot '{}' failed to resolve, using root", sc.name, sc.spot);
-                            (trainer.tree.root, vec![])
-                        });
+                        ) {
+                            Some((idx, board)) => (idx, board, None),
+                            None => {
+                                let msg = format!("Spot failed to resolve: {}", sc.spot);
+                                eprintln!("WARNING: scenario '{}': {msg}", sc.name);
+                                (trainer.tree.root, vec![], Some(msg))
+                            }
+                        };
                         let grid = blueprint_tui_scenarios::extract_strategy_grid(
                             &trainer.tree,
                             &trainer.storage,
@@ -316,6 +319,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 cluster_id: None,
                                 street_label,
                                 iteration_at_snapshot: 0,
+                                error_message,
                             },
                         };
                         (scenario, board)
