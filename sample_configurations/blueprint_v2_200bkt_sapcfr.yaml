@@ -1,6 +1,6 @@
 # Blueprint V2 Config — 100BB HU, 200 buckets, SAPCFR+ optimizer + VR-MCCFR baselines
 game:
-  name: "200_sapcfr"
+  name: "200_v4_sapcfr"
   players: 2
   stack_depth: 200
   small_blind: 1
@@ -21,32 +21,32 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["4bb"]
-    - ["8bb", "14bb"]
-    - ["30bb"]
+    - ["2bb"]
+    - ["4bb", "10bb"]
+    - ["22bb"]
   flop:
     - [0.25, 0.33, 0.75, 1.0]
     - [0.33, 0.67, 1.0, 1.5]
-    - [2.0]
+    - [0.67, 2.0]
   turn:
     - [0.25, 0.33, 0.75, 1.0]
     - [0.33, 0.75, 1.0, 1.5]
-    - [2.0]
+    - [0.67, 2.0]
   river:
     - [0.25, 0.33, 0.75, 1.0]
     - [0.33, 0.75, 1.0, 1.5]
-    - [2.0]
+    - [0.33, 0.67, 1.0, 2.0]
 
 training:
   cluster_path: "./local_data/buckets/200_v1"
   time_limit_minutes: 7200
-  #lcfr_warmup_iterations: 10000000
-  prune_after_iterations: 10000000
+  lcfr_warmup_iterations: 300000000
+  prune_after_iterations: 100000000
   prune_threshold: -2
-  lcfr_discount_interval: 1000000
-  batch_size: 2000
+  lcfr_discount_interval: 300000000
+  batch_size: 4000
   purify_threshold: 0.03
-  #dcfr_epoch_cap: 80
+  dcfr_epoch_cap: 40
   # SAPCFR+ optimizer with prediction-based strategy
   optimizer: "sapcfr+"
   sapcfr_eta: 0.33
@@ -54,13 +54,13 @@ training:
   dcfr_gamma: 2.0
   # Variance-reducing baselines
   use_baselines: true
-  baseline_alpha: 0.10
+  baseline_alpha: 0.05
 
 snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/200_100bb_sapcfr_v2/snap"
+  output_dir: "./local_data/blueprints/200_v3_100bb_sapcfr_v1"
 
 tui:
   enabled: true
@@ -71,12 +71,16 @@ tui:
   scenarios:
     - name: "SB Open"
       spot: ""
-    - name: "BB vs 2x"
+    - name: "BB vs SB open"
       spot: "sb:2bb"
     - name: "SB vs 3-bet"
-      spot: "sb:2bb,bb:7bb"
-    - name: "SB Cbet K72"
-      spot: "sb:2bb,bb:call|Kh7s2d"
+      spot: "sb:2bb,bb:4bb"
+    - name: "Flop SRP"
+      spot: "sb:2bb,bb:call|AsTd9d"
+    - name: "Flop 3bet pot"
+      spot: "sb:2bb,bb:4bb,sb:call|AsTd9d"
+    - name: "BB call rainbow broadway"
+      spot: "sb:2bb,bb:call|AsKhQd"
   random_scenario:
     enabled: true
     hold_minutes: 3
