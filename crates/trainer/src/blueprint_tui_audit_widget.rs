@@ -1,7 +1,6 @@
 //! Ratatui widget for the regret audit panel.
 
 use ratatui::prelude::*;
-use ratatui::widgets::Tabs;
 
 use crate::blueprint_tui_audit::{AuditSnapshot, Trend};
 use crate::blueprint_tui_config::PlayerLabel;
@@ -77,19 +76,15 @@ impl Widget for &AuditPanelWidget<'_> {
         let x = area.x;
         let w = area.width;
 
-        // 1. Tab bar
-        let titles: Vec<Line<'_>> = self
-            .state
-            .metas
-            .iter()
-            .map(|m| Line::from(m.name.as_str()))
-            .collect();
-        let tabs = Tabs::new(titles)
-            .select(self.state.active_tab)
-            .highlight_style(Style::default().fg(Color::Cyan).bold())
-            .divider("|");
-        let tab_area = Rect::new(x, y, w, 1);
-        tabs.render(tab_area, buf);
+        // 1. Title — current audit name with index
+        let total = self.state.metas.len();
+        let title = format!(
+            "Regret Audit [{}/{}] {}",
+            self.state.active_tab + 1,
+            total,
+            self.state.metas[self.state.active_tab].name,
+        );
+        buf.set_string(x, y, &title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
         y += 1;
 
         let idx = self.state.active_tab;
