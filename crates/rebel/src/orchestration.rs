@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use burn::backend::{Autodiff, NdArray};
+use burn::backend::{wgpu::Wgpu, Autodiff, NdArray};
 use burn::module::Module;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 
@@ -78,10 +78,10 @@ pub struct OfflineSeeder {
 /// We only need value-net training data for postflop streets.
 const STREET_ORDER: [Street; 3] = [Street::River, Street::Turn, Street::Flop];
 
-/// Backend type for CPU training via NdArray.
-type TrainBackend = Autodiff<NdArray>;
-/// Inference backend for leaf evaluation.
-type InferBackend = NdArray;
+/// Backend type for GPU training via Wgpu.
+type TrainBackend = Autodiff<Wgpu>;
+/// Inference backend for leaf evaluation (GPU).
+type InferBackend = Wgpu;
 
 impl OfflineSeeder {
     /// Create a new offline seeder with the given configuration.
