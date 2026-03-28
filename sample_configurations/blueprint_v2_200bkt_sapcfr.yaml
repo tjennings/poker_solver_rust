@@ -81,6 +81,27 @@ tui:
       spot: "sb:2bb,bb:4bb,sb:call|AsTd9d"
     - name: "BB call rainbow broadway"
       spot: "sb:2bb,bb:call|AsKhQd"
+  regret_audits:
+    - name: "AKo SB open"
+      spot: ""
+      hand: "AKo"
+      player: SB
+    - name: "72o SB open"
+      spot: ""
+      hand: "72o"
+      player: SB
+    - name: "QQ BB vs 3bet"
+      spot: "sb:2bb,bb:4bb"
+      hand: "QQ"
+      player: SB
+    - name: "AsKs flop SRP"
+      spot: "sb:2bb,bb:call|AsTd9d"
+      hand: "AsKs"
+      player: SB
+    - name: "7h2h flop SRP"
+      spot: "sb:2bb,bb:call|AsTd9d"
+      hand: "7h2h"
+      player: BB
   random_scenario:
     enabled: true
     hold_minutes: 3
