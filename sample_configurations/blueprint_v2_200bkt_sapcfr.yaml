@@ -94,10 +94,10 @@ tui:
       spot: ""
       hand: "72o"
       player: SB
-    - name: "QQ BB vs 3bet"
-      spot: "sb:2bb,bb:4bb"
+    - name: "QQ BB vs SB open"
+      spot: "sb:2bb"
       hand: "QQ"
-      player: SB
+      player: BB
     - name: "AhKc flop SRP"
       spot: "sb:2bb,bb:call|AsTd9d"
       hand: "AhKc"
