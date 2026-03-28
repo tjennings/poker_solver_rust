@@ -63,6 +63,12 @@ struct HandEquityParams {
 }
 
 #[derive(Deserialize)]
+struct LoadBlueprintParams {
+    path: String,
+    snapshot: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ListBlueprintsParams {
     dir: String,
 }
@@ -188,9 +194,9 @@ async fn handle_load_bundle(
 async fn handle_load_blueprint_v2(
     AxumState(state): AxumState<AppState>,
     Extension(postflop): Extension<Arc<PostflopState>>,
-    Json(params): Json<PathParams>,
+    Json(params): Json<LoadBlueprintParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    let info = poker_solver_tauri::load_blueprint_v2_core(&state, params.path).await;
+    let info = poker_solver_tauri::load_blueprint_v2_core(&state, params.path, params.snapshot).await;
     if info.is_ok() {
         poker_solver_tauri::populate_cbv_context(&state, &postflop);
     }

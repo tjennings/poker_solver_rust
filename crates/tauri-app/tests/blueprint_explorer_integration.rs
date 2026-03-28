@@ -56,7 +56,7 @@ async fn test_load_strategy_and_get_preflop_ranges() {
     // --- Step 1: Load the blueprint ---
     let state = ExplorationState::default();
 
-    let bundle_info = poker_solver_tauri::load_blueprint_v2_core(&state, blueprint_path.clone())
+    let bundle_info = poker_solver_tauri::load_blueprint_v2_core(&state, blueprint_path.clone(), None)
         .await
         .unwrap_or_else(|e| panic!("load_blueprint_v2_core failed for {blueprint_path}: {e}"));
 

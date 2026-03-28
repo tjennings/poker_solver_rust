@@ -306,7 +306,7 @@ pub async fn load_bundle_core(
     }
     if bundle_path.join("config.yaml").exists() {
         // Blueprint V2 bundle — delegate to the dedicated loader.
-        return load_blueprint_v2_core(state, path).await;
+        return load_blueprint_v2_core(state, path, None).await;
     }
 
     Err("Directory does not contain config.yaml (BlueprintV2 bundle) or .toml (agent)".to_string())
@@ -351,19 +351,27 @@ fn load_agent(path: &Path) -> Result<(BundleInfo, StrategySource), String> {
 pub async fn load_blueprint_v2_core(
     state: &ExplorationState,
     dir_path: String,
+    snapshot: Option<String>,
 ) -> Result<BundleInfo, String> {
     let dir = PathBuf::from(&dir_path);
     let (config, strategy, cbv_table, snapshot_name) = tokio::task::spawn_blocking(move || {
         let cfg = v2_bundle::load_config(&dir)
             .map_err(|e| format!("Failed to load config.yaml: {e}"))?;
 
-        // Try final/strategy.bin first, then strategy.bin at root.
-        let strat_path = if dir.join("final/strategy.bin").exists() {
+        // Determine strategy path. If a specific snapshot is requested, use it.
+        // Otherwise: final/ -> root -> latest snapshot.
+        let strat_path = if let Some(ref snap_name) = snapshot {
+            let snap_dir = dir.join(snap_name);
+            if !snap_dir.join("strategy.bin").exists() {
+                return Err(format!("No strategy.bin in {snap_name}"));
+            }
+            snap_dir.join("strategy.bin")
+        } else if dir.join("final/strategy.bin").exists() {
             dir.join("final/strategy.bin")
         } else if dir.join("strategy.bin").exists() {
             dir.join("strategy.bin")
         } else {
-            // Look for the latest snapshot_NNNN directory.
+            // Auto-detect latest snapshot.
             let mut snapshots: Vec<_> = std::fs::read_dir(&dir)
                 .map_err(|e| format!("Cannot read directory: {e}"))?
                 .filter_map(Result::ok)
@@ -520,8 +528,9 @@ pub async fn load_blueprint_v2(
     state: State<'_, ExplorationState>,
     postflop_state: State<'_, Arc<crate::postflop::PostflopState>>,
     path: String,
+    snapshot: Option<String>,
 ) -> Result<BundleInfo, String> {
-    let info = load_blueprint_v2_core(&state, path).await?;
+    let info = load_blueprint_v2_core(&state, path, snapshot).await?;
     populate_cbv_context(&state, &postflop_state);
     Ok(info)
 }

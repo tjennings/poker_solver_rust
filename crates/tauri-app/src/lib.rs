@@ -8,19 +8,21 @@ pub use exploration::{
     blueprint_propagate_ranges_cmd,
     canonicalize_board, get_available_actions, get_bundle_info, get_combo_classes,
     get_computation_status, get_hand_equity, get_preflop_ranges, get_strategy_matrix,
-    is_board_cached, is_bundle_loaded, list_agents, list_blueprints, load_blueprint_v2, load_bundle,
+    is_board_cached, is_bundle_loaded, list_agents, list_blueprints, list_snapshots,
+    load_blueprint_v2, load_bundle,
     start_bucket_computation,
     // Core functions (no Tauri dependency, usable from Axum or other runtimes)
     blueprint_propagate_ranges,
     canonicalize_board_core, get_available_actions_core, get_bundle_info_core,
     get_combo_classes_core, get_computation_status_core, get_hand_equity_core,
     get_preflop_ranges_core, get_strategy_matrix_core, is_board_cached_core,
-    is_bundle_loaded_core, list_blueprints_core, load_blueprint_v2_core, load_bundle_core,
+    is_bundle_loaded_core, list_blueprints_core, list_snapshots_core,
+    load_blueprint_v2_core, load_bundle_core,
     start_bucket_computation_core,
     // Helpers
     blueprint_sizes_to_range_solver, load_hand_ev_bin, populate_cbv_context,
     // Types
-    BlueprintListEntry, ExplorationState, SubgameProgressEvent,
+    BlueprintListEntry, ExplorationState, SnapshotEntry, SubgameProgressEvent,
     // Additional types needed by consumers of core functions
     ActionInfo, ActionProb, BucketProgressEvent, BundleInfo, CanonicalizeResult,
     ComboGroup, ComboGroupInfo, ComputationStatus, ExplorationPosition, HandEquity,
