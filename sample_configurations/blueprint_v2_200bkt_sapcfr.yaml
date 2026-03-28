@@ -45,7 +45,7 @@ training:
   prune_threshold: -2
   lcfr_discount_interval: 300000000
   batch_size: 4000
-  purify_threshold: 0.03
+  #purify_threshold: 0.03
   dcfr_epoch_cap: 40
   # SAPCFR+ optimizer with prediction-based strategy
   optimizer: "sapcfr+"
@@ -98,9 +98,9 @@ tui:
       spot: "sb:2bb,bb:4bb"
       hand: "QQ"
       player: SB
-    - name: "AsKs flop SRP"
+    - name: "AhKc flop SRP"
       spot: "sb:2bb,bb:call|AsTd9d"
-      hand: "AsKs"
+      hand: "AhKc"
       player: SB
     - name: "7h2h flop SRP"
       spot: "sb:2bb,bb:call|AsTd9d"
