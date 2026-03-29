@@ -1078,19 +1078,27 @@ pub(crate) fn v2_action_info(
             size_key: None,
         },
         TreeAction::Bet(amount) => {
-            let display = ((amount - invested_offset) / 2.0).round();
+            let display = (amount - invested_offset) / 2.0;
             ActionInfo {
                 id,
-                label: format!("{display:.0}bb"),
+                label: if (display - display.round()).abs() < 0.05 {
+                    format!("{:.0}bb", display.round())
+                } else {
+                    format!("{display:.1}bb")
+                },
                 action_type: "bet".to_string(),
                 size_key: Some(format!("{amount:.2}")),
             }
         }
         TreeAction::Raise(amount) => {
-            let display = ((amount - invested_offset) / 2.0).round();
+            let display = (amount - invested_offset) / 2.0;
             ActionInfo {
                 id,
-                label: format!("{display:.0}bb"),
+                label: if (display - display.round()).abs() < 0.05 {
+                    format!("{:.0}bb", display.round())
+                } else {
+                    format!("{display:.1}bb")
+                },
                 action_type: "raise".to_string(),
                 size_key: Some(format!("{amount:.2}")),
             }
@@ -3850,5 +3858,66 @@ mod tests {
         assert!(json.contains("\"name\":\"snapshot_0001\""));
         assert!(json.contains("\"iterations\":1000"));
         assert!(json.contains("\"has_strategy\":true"));
+    }
+
+    #[timed_test]
+    fn v2_action_info_bet_whole_number_label() {
+        // 2.0 chips with invested_offset=0.0 => (2.0 - 0.0) / 2.0 = 1.0 => "1bb"
+        let info = v2_action_info(&TreeAction::Bet(2.0), 0, 0.0);
+        assert_eq!(info.label, "1bb");
+        assert_eq!(info.action_type, "bet");
+    }
+
+    #[timed_test]
+    fn v2_action_info_bet_fractional_label() {
+        // 2.64 chips with invested_offset=0.0 => (2.64 - 0.0) / 2.0 = 1.32 => "1.3bb"
+        let info = v2_action_info(&TreeAction::Bet(2.64), 0, 0.0);
+        assert_eq!(info.label, "1.3bb");
+        assert_eq!(info.action_type, "bet");
+    }
+
+    #[timed_test]
+    fn v2_action_info_bet_distinct_labels_for_close_amounts() {
+        // Two bets that previously both rounded to "1bb" must produce distinct labels.
+        let info_a = v2_action_info(&TreeAction::Bet(2.0), 0, 0.0);
+        let info_b = v2_action_info(&TreeAction::Bet(2.64), 1, 0.0);
+        assert_ne!(info_a.label, info_b.label, "distinct bet amounts must have distinct labels");
+    }
+
+    #[timed_test]
+    fn v2_action_info_raise_whole_number_label() {
+        // 6.0 chips with invested_offset=0.0 => (6.0 - 0.0) / 2.0 = 3.0 => "3bb"
+        let info = v2_action_info(&TreeAction::Raise(6.0), 0, 0.0);
+        assert_eq!(info.label, "3bb");
+        assert_eq!(info.action_type, "raise");
+    }
+
+    #[timed_test]
+    fn v2_action_info_raise_fractional_label() {
+        // 5.28 chips with invested_offset=0.0 => (5.28 - 0.0) / 2.0 = 2.64 => "2.6bb"
+        let info = v2_action_info(&TreeAction::Raise(5.28), 0, 0.0);
+        assert_eq!(info.label, "2.6bb");
+        assert_eq!(info.action_type, "raise");
+    }
+
+    #[timed_test]
+    fn v2_action_info_bet_near_whole_rounds_up() {
+        // 1.92 chips => (1.92 - 0.0) / 2.0 = 0.96, diff from 1.0 = 0.04 < 0.05 => "1bb"
+        let info = v2_action_info(&TreeAction::Bet(1.92), 0, 0.0);
+        assert_eq!(info.label, "1bb");
+    }
+
+    #[timed_test]
+    fn v2_action_info_bet_with_invested_offset() {
+        // 6.0 chips with invested_offset=2.0 => (6.0 - 2.0) / 2.0 = 2.0 => "2bb"
+        let info = v2_action_info(&TreeAction::Bet(6.0), 0, 2.0);
+        assert_eq!(info.label, "2bb");
+    }
+
+    #[timed_test]
+    fn v2_action_info_size_key_unchanged() {
+        // size_key should still use the raw amount with 2 decimals
+        let info = v2_action_info(&TreeAction::Bet(2.64), 0, 0.0);
+        assert_eq!(info.size_key, Some("2.64".to_string()));
     }
 }
