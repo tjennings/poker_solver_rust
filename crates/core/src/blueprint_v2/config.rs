@@ -219,6 +219,34 @@ pub struct TrainingConfig {
     /// Only used when `use_baselines` is true.
     #[serde(default = "default_baseline_alpha")]
     pub baseline_alpha: f64,
+    /// Streets on which regret-based pruning is active.
+    /// When omitted, all streets are pruned (backwards compatible).
+    /// Example: `[flop, turn, river]` disables pruning on preflop.
+    #[serde(default)]
+    pub prune_streets: Option<Vec<String>>,
+}
+
+impl TrainingConfig {
+    /// Convert the `prune_streets` config into a `[bool; 4]` mask indexed by
+    /// `Street as usize`. When `prune_streets` is `None`, all streets enabled.
+    pub fn prune_street_mask(&self) -> [bool; 4] {
+        match &self.prune_streets {
+            None => [true; 4],
+            Some(streets) => {
+                let mut mask = [false; 4];
+                for s in streets {
+                    match s.to_lowercase().as_str() {
+                        "preflop" => mask[0] = true,
+                        "flop" => mask[1] = true,
+                        "turn" => mask[2] = true,
+                        "river" => mask[3] = true,
+                        other => panic!("unknown street in prune_streets: {other:?}"),
+                    }
+                }
+                mask
+            }
+        }
+    }
 }
 
 /// Snapshot (checkpoint) output settings.
@@ -461,6 +489,7 @@ snapshots:
                 sapcfr_eta: 0.5,
                 use_baselines: false,
                 baseline_alpha: 0.01,
+                prune_streets: None,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 120,
@@ -874,6 +903,126 @@ snapshots:
             serde_yaml::from_str(yaml).expect("failed to parse config");
         assert!(cfg.training.use_baselines);
         assert!((cfg.training.baseline_alpha - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_prune_streets_default() {
+        let yaml = r#"
+game:
+  name: "Prune Default"
+  players: 2
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+action_abstraction:
+  preflop:
+    - ["5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+training:
+  iterations: 100
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse config");
+        assert_eq!(cfg.training.prune_street_mask(), [true; 4]);
+    }
+
+    #[test]
+    fn test_prune_streets_subset() {
+        let yaml = r#"
+game:
+  name: "Prune Subset"
+  players: 2
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+action_abstraction:
+  preflop:
+    - ["5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+training:
+  iterations: 100
+  prune_streets: [flop, turn, river]
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse config");
+        let mask = cfg.training.prune_street_mask();
+        assert_eq!(mask, [false, true, true, true]);
+    }
+
+    #[test]
+    fn test_prune_streets_empty() {
+        let yaml = r#"
+game:
+  name: "Prune Empty"
+  players: 2
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+action_abstraction:
+  preflop:
+    - ["5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+training:
+  iterations: 100
+  prune_streets: []
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse config");
+        assert_eq!(cfg.training.prune_street_mask(), [false; 4]);
     }
 
     #[test]
