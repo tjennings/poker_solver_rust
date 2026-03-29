@@ -3260,6 +3260,7 @@ mod tests {
                 sapcfr_eta: 0.5,
                 use_baselines: false,
                 baseline_alpha: 0.01,
+                prune_streets: None,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 1,
