@@ -702,22 +702,14 @@ impl BlueprintTrainer {
                         _ => 0,
                     };
                     // Read EVs from the full-tree tracker.
+                    // EVs are raw counterfactual values measured from hand start.
+                    // Blinds are included: fold at root = -0.5 BB for SB.
                     let dec_idx = decision_map[node_idx as usize];
-                    let mut hand_evs = if dec_idx != u32::MAX {
+                    let hand_evs = if dec_idx != u32::MAX {
                         self.full_ev_tracker.hand_ev_array(dec_idx as usize, player)
                     } else {
                         [0.0; 169]
                     };
-                    // Normalize to decision-point frame: fold = 0.
-                    // The traversal measures from hand start, so node_value
-                    // includes the sunk cost of reaching this node. Subtract
-                    // the fold terminal value (= -vol_self) so fold shows 0.
-                    let fold_offset = Self::fold_value_at_node(&self.tree, node_idx, player);
-                    for ev in &mut hand_evs {
-                        if *ev != 0.0 {
-                            *ev -= fold_offset;
-                        }
-                    }
                     callback(i, node_idx, &self.storage, &self.tree, &hand_evs);
                 }
             }
@@ -964,6 +956,7 @@ impl BlueprintTrainer {
     /// Returns the dead-money fold payoff (e.g. -2.0 if the player has
     /// voluntarily invested 2.0). At the root preflop node this is 0.0.
     /// Returns 0.0 if the node has no Fold action.
+    #[allow(dead_code)]
     fn fold_value_at_node(tree: &GameTree, node_idx: u32, player: usize) -> f64 {
         use super::game_tree::{GameNode, TreeAction, TerminalKind};
         if let GameNode::Decision { actions, children, .. } = &tree.nodes[node_idx as usize] {
