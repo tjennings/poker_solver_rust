@@ -716,10 +716,10 @@ impl BlueprintTrainer {
             if let Some(ref mut cb) = self.on_audit_refresh {
                 cb(&self.storage);
             }
-            // Reset EV accumulators after reading so displayed values
-            // reflect only the most recent window, not cumulative history.
+            // Reset the scenario (windowed) EV tracker so TUI displays
+            // only the most recent window. The full_ev_tracker is cumulative
+            // and must NOT be reset — it persists to hand_ev.bin at snapshot time.
             self.scenario_ev_tracker.reset();
-            self.full_ev_tracker.reset();
             self.last_strategy_refresh_secs = elapsed_secs;
         }
 
@@ -1871,6 +1871,50 @@ mod tests {
         assert!(
             (fraction - expected).abs() < 1e-10,
             "expected prune fraction {expected}, got {fraction}"
+        );
+    }
+
+    #[test]
+    fn full_ev_tracker_not_reset_on_strategy_refresh() {
+        let config = toy_config();
+        let mut trainer = toy_trainer(config);
+
+        // Accumulate EV data into the full_ev_tracker at root.
+        let root = trainer.tree.root;
+        trainer.full_ev_tracker.accumulate(root, 0, 42, 10.0);
+
+        // Verify it was recorded.
+        let dec_map = trainer.tree.decision_index_map();
+        let dec_idx = dec_map[root as usize] as usize;
+        let evs_before = trainer.full_ev_tracker.hand_ev_array(dec_idx, 0);
+        assert!((evs_before[42] - 10.0).abs() < 0.01, "precondition: full_ev_tracker should have data");
+
+        // Also accumulate into the scenario_ev_tracker.
+        trainer.scenario_ev_tracker.set_nodes(vec![root]);
+        trainer.scenario_ev_tracker.accumulate(0, 0, 42, 5.0);
+
+        // Force strategy refresh: set interval to 0 so refresh fires immediately.
+        trainer.strategy_refresh_interval_secs = 0;
+        trainer.last_strategy_refresh_secs = 0;
+        trainer.iterations = 1; // need at least 1 iteration to pass
+
+        // Trigger check_timed_actions which includes strategy refresh.
+        trainer.check_timed_actions().expect("check_timed_actions should not fail");
+
+        // scenario_ev_tracker SHOULD be reset (windowed for TUI display).
+        let scenario_evs = trainer.scenario_ev_tracker.hand_ev_array(0, 0);
+        assert!(
+            (scenario_evs[42] - 0.0).abs() < 1e-10,
+            "scenario_ev_tracker should be reset, got {}",
+            scenario_evs[42],
+        );
+
+        // full_ev_tracker should NOT be reset (cumulative for hand_ev.bin persistence).
+        let evs_after = trainer.full_ev_tracker.hand_ev_array(dec_idx, 0);
+        assert!(
+            (evs_after[42] - 10.0).abs() < 0.01,
+            "full_ev_tracker should NOT be reset after strategy refresh, got {}",
+            evs_after[42],
         );
     }
 }

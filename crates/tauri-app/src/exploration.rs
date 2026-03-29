@@ -354,7 +354,7 @@ pub async fn load_blueprint_v2_core(
     snapshot: Option<String>,
 ) -> Result<BundleInfo, String> {
     let dir = PathBuf::from(&dir_path);
-    let (config, strategy, cbv_table, snapshot_name) = tokio::task::spawn_blocking(move || {
+    let (config, strategy, cbv_table, snapshot_name, strat_dir) = tokio::task::spawn_blocking(move || {
         let cfg = v2_bundle::load_config(&dir)
             .map_err(|e| format!("Failed to load config.yaml: {e}"))?;
 
@@ -421,7 +421,8 @@ pub async fn load_blueprint_v2_core(
             .filter(|n| n.starts_with("snapshot_"))
             .map(String::from);
 
-        Ok::<_, String>((cfg, strat, cbv_table, snapshot_name))
+        let strat_dir_owned = strat_dir.to_path_buf();
+        Ok::<_, String>((cfg, strat, cbv_table, snapshot_name, strat_dir_owned))
     })
     .await
     .map_err(|e| format!("Load task panicked: {e}"))??;
@@ -453,9 +454,11 @@ pub async fn load_blueprint_v2_core(
 
     // Load per-node hand EVs if available (from hand_ev.bin).
     let hand_evs = {
-        // Search same directory as strategy.bin, then bundle root, then latest snapshot
+        // Search strategy dir first (matches the loaded snapshot), then bundle root,
+        // then final/, then latest snapshot.
         let dir = PathBuf::from(&dir_path);
         let candidates = [
+            strat_dir.join("hand_ev.bin"),
             dir.join("hand_ev.bin"),
             dir.join("final/hand_ev.bin"),
         ];
@@ -3919,5 +3922,80 @@ mod tests {
         // size_key should still use the raw amount with 2 decimals
         let info = v2_action_info(&TreeAction::Bet(2.64), 0, 0.0);
         assert_eq!(info.size_key, Some("2.64".to_string()));
+    }
+
+    /// Write a minimal hand_ev.bin file with `num_nodes` decision nodes.
+    /// Sets hand index 0, player 0 to `ev_value` (sum=ev*1000, count=1).
+    /// All other entries are zero.
+    fn write_hand_ev_bin(path: &std::path::Path, num_nodes: usize, ev_value: f64) {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        f.write_all(&(num_nodes as u32).to_le_bytes()).unwrap();
+        for node_idx in 0..num_nodes {
+            for player in 0..2usize {
+                for hand in 0..169usize {
+                    if node_idx == 0 && player == 0 && hand == 0 {
+                        let sum = (ev_value * 1000.0) as i64;
+                        let count = 1u64;
+                        f.write_all(&sum.to_le_bytes()).unwrap();
+                        f.write_all(&count.to_le_bytes()).unwrap();
+                    } else {
+                        f.write_all(&0i64.to_le_bytes()).unwrap();
+                        f.write_all(&0u64.to_le_bytes()).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn load_blueprint_v2_hand_ev_from_snapshot_dir() {
+        use poker_solver_core::blueprint_v2::bundle;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle_root = tmp.path();
+
+        // Create config.yaml
+        let config = build_minimal_config();
+        bundle::save_config(bundle_root, &config).unwrap();
+
+        // Build a matching strategy
+        let (strat, _decision_map) = build_minimal_postflop_strategy();
+        let num_decision_nodes = strat.node_action_counts.len();
+
+        // Create snapshot_0001/ with strategy.bin and hand_ev.bin (EV = 5.0)
+        let snap_dir = bundle_root.join("snapshot_0001");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        strat.save(&snap_dir.join("strategy.bin")).unwrap();
+        write_hand_ev_bin(&snap_dir.join("hand_ev.bin"), num_decision_nodes, 5.0);
+
+        // Create hand_ev.bin at bundle root with DIFFERENT EV (99.0)
+        write_hand_ev_bin(&bundle_root.join("hand_ev.bin"), num_decision_nodes, 99.0);
+
+        // Load with snapshot="snapshot_0001" — should use snapshot's hand_ev.bin
+        let state = ExplorationState::default();
+        let info = load_blueprint_v2_core(
+            &state,
+            bundle_root.to_string_lossy().to_string(),
+            Some("snapshot_0001".to_string()),
+        )
+        .await
+        .expect("load should succeed");
+
+        assert!(info.info_sets > 0);
+
+        // Inspect the loaded hand_evs — should have EV=5.0 from snapshot, not 99.0 from root
+        let source = state.source.read();
+        let hand_evs = match source.as_ref().unwrap() {
+            StrategySource::BlueprintV2 { hand_evs, .. } => hand_evs.clone(),
+            _ => panic!("expected BlueprintV2 source"),
+        };
+        let evs = hand_evs.expect("hand_evs should be loaded");
+        let loaded_ev = evs[0][0][0]; // node 0, player 0, hand 0
+        assert!(
+            (loaded_ev - 5.0).abs() < 0.01,
+            "should load hand_ev.bin from snapshot dir (5.0), but got {} (root has 99.0)",
+            loaded_ev,
+        );
     }
 }
