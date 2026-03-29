@@ -35,6 +35,8 @@ Open the hamburger menu to choose a strategy source:
 ### Blueprint V2 Bundle
 Select a blueprint_v2 strategy bundle directory (output from `train-blueprint` command). Displays metadata: stack depth, bet sizes, info set count, training iterations.
 
+**Snapshot selection**: If a blueprint has multiple training snapshots (`snapshot_0000/`, `snapshot_0001/`, etc.), a second picker appears showing each snapshot with its iteration count and training time. The latest snapshot is pre-selected. Blueprints with only one snapshot load directly without the extra step.
+
 ### Rule-Based Agents
 Agent TOML configs from `agents/*.toml` are listed automatically. Each agent maps `HandClass` variants to action frequencies. Select one to explore its strategy.
 
@@ -115,7 +117,8 @@ The explorer uses these backend commands (available as Tauri commands or HTTP `P
 | Command | Description |
 |-|-|
 | `load_bundle` | Load a trained strategy bundle (auto-detects blueprint_v2 format) |
-| `load_blueprint_v2` | Load a blueprint_v2 strategy bundle directly |
+| `load_blueprint_v2` | Load a blueprint_v2 strategy bundle (optional `snapshot` param to pick a specific snapshot) |
+| `list_snapshots` | List available snapshots in a blueprint directory (returns name, iterations, elapsed time) |
 | `get_strategy_matrix` | Get strategy for a position (returns 13x13 matrix) |
 | `get_available_actions` | Get actions at current position |
 | `get_bundle_info` | Get loaded bundle metadata |
