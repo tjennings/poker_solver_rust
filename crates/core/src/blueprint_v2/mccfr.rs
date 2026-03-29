@@ -631,6 +631,7 @@ pub fn traverse_external(
     node_idx: u32,
     prune: bool,
     prune_threshold: i64,
+    prune_streets: [bool; 4],
     rng: &mut impl Rng,
     rake_rate: f64,
     rake_cap: f64,
@@ -646,8 +647,9 @@ pub fn traverse_external(
         GameNode::Chance { child, .. } => {
             // Board cards are pre-dealt in the Deal; just recurse.
             traverse_external(
-                tree, storage, deal, traverser, *child, prune, prune_threshold, rng,
-                rake_rate, rake_cap, ev_tracker, full_ev_tracker, baseline_alpha,
+                tree, storage, deal, traverser, *child, prune, prune_threshold,
+                prune_streets, rng, rake_rate, rake_cap, ev_tracker,
+                full_ev_tracker, baseline_alpha,
             )
         }
 
@@ -675,6 +677,8 @@ pub fn traverse_external(
                     num_actions,
                     prune,
                     prune_threshold,
+                    street,
+                    prune_streets,
                     rng,
                     rake_rate,
                     rake_cap,
@@ -694,6 +698,7 @@ pub fn traverse_external(
                     num_actions,
                     prune,
                     prune_threshold,
+                    prune_streets,
                     rng,
                     rake_rate,
                     rake_cap,
@@ -787,6 +792,8 @@ fn traverse_traverser(
     num_actions: usize,
     prune: bool,
     prune_threshold: i64,
+    street: Street,
+    prune_streets: [bool; 4],
     rng: &mut impl Rng,
     rake_rate: f64,
     rake_cap: f64,
@@ -807,7 +814,7 @@ fn traverse_traverser(
     let mut stats = PruneStats::default();
 
     for (a, &child_idx) in children.iter().enumerate() {
-        if prune {
+        if prune && prune_streets[street as usize] {
             stats.total += 1;
             if storage.get_regret(node_idx, bucket, a) < prune_threshold {
                 stats.hits += 1;
@@ -817,8 +824,9 @@ fn traverse_traverser(
         }
 
         let (child_ev, child_stats) = traverse_external(
-            tree, storage, deal, traverser, child_idx, prune, prune_threshold, rng,
-            rake_rate, rake_cap, ev_tracker, full_ev_tracker, baseline_alpha,
+            tree, storage, deal, traverser, child_idx, prune, prune_threshold,
+            prune_streets, rng, rake_rate, rake_cap, ev_tracker,
+            full_ev_tracker, baseline_alpha,
         );
         action_values[a] = child_ev;
         node_value += strategy[a] * child_ev;
@@ -900,6 +908,7 @@ fn traverse_opponent(
     num_actions: usize,
     prune: bool,
     prune_threshold: i64,
+    prune_streets: [bool; 4],
     rng: &mut impl Rng,
     rake_rate: f64,
     rake_cap: f64,
@@ -924,8 +933,9 @@ fn traverse_opponent(
     }
 
     let (v_sampled, stats) = traverse_external(
-        tree, storage, deal, traverser, children[chosen], prune, prune_threshold, rng,
-        rake_rate, rake_cap, ev_tracker, full_ev_tracker, baseline_alpha,
+        tree, storage, deal, traverser, children[chosen], prune, prune_threshold,
+        prune_streets, rng, rake_rate, rake_cap, ev_tracker,
+        full_ev_tracker, baseline_alpha,
     );
 
     // Baseline-corrected value (VR-MCCFR).
@@ -1162,7 +1172,7 @@ mod tests {
         for _ in 0..20 {
             traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-                &mut rng, 0.0, 0.0, None, Some(&tracker), 0.0,
+                [true; 4], &mut rng, 0.0, 0.0, None, Some(&tracker), 0.0,
             );
         }
 
@@ -1193,7 +1203,7 @@ mod tests {
         for _ in 0..20 {
             traverse_external(
                 &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-                &mut rng, 0.0, 0.0, Some(&tracker), None, 0.0,
+                [true; 4], &mut rng, 0.0, 0.0, Some(&tracker), None, 0.0,
             );
         }
 
@@ -1219,7 +1229,7 @@ mod tests {
 
         let (ev, _stats) = traverse_external(
             &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-            &mut rng, 0.0, 0.0, None, None, 0.0,
+            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
         );
         assert!(ev.is_finite(), "EV should be finite without tracker");
     }
@@ -1279,8 +1289,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         let (ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None, 0.0,
+            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
+            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
         );
         assert!(ev.is_finite(), "EV should be finite, got {ev}");
     }
@@ -1297,12 +1307,12 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         let (ev0, _) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None, 0.0,
+            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
+            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
         );
         let (ev1, _) = traverse_external(
-            &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None, 0.0,
+            &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000,
+            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
         );
 
         assert!(ev0.is_finite());
@@ -1323,8 +1333,8 @@ mod tests {
         assert!(storage.regrets.iter().all(|r| r.load(Ordering::Relaxed) == 0));
 
         let (_ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None, 0.0,
+            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
+            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
         );
 
         assert!(
@@ -1345,8 +1355,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         let (_ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-            0.0, 0.0, None, None, 0.0,
+            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
+            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
         );
 
         assert!(
@@ -1369,12 +1379,12 @@ mod tests {
 
         for _ in 0..50 {
             let _ = traverse_external(
-                &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000, &mut rng,
-                0.0, 0.0, None, None, 0.0,
+                &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
+                [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
             );
             let _ = traverse_external(
-                &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000, &mut rng,
-                0.0, 0.0, None, None, 0.0,
+                &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000,
+                [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
             );
         }
 
@@ -1411,8 +1421,8 @@ mod tests {
         }
 
         let (ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, true, -310_000_000, &mut rng,
-            0.0, 0.0, None, None, 0.0,
+            &tree, &storage, &precomputed, 0, tree.root, true, -310_000_000,
+            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
         );
         assert!(ev.is_finite());
     }
@@ -2339,6 +2349,103 @@ mod tests {
         assert!(
             (v - 7.0).abs() < 1e-10,
             "single action should always return v_sampled, got {v}"
+        );
+    }
+
+    #[test]
+    fn traverse_prune_streets_all_enabled() {
+        // When prune_streets = [true; 4], pruning should behave identically
+        // to the previous all-streets-pruning mode.
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let precomputed = make_precomputed(
+            &AllBuckets::new([10, 10, 10, 10], [None, None, None, None]),
+            make_deal(),
+        );
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Force some very negative regrets so pruning can trigger.
+        for r in storage.regrets.iter().step_by(3) {
+            r.store(-400_000_000, Ordering::Relaxed);
+        }
+
+        let (ev, stats) = traverse_external(
+            &tree, &storage, &precomputed, 0, tree.root,
+            true, -310_000_000, [true; 4],
+            &mut rng, 0.0, 0.0, None, None, 0.0,
+        );
+        assert!(ev.is_finite());
+        // With all streets enabled and negative regrets, should see prune hits.
+        assert!(stats.total > 0, "should have prune candidates when all streets enabled");
+        assert!(stats.hits > 0, "should have prune hits when all streets enabled");
+    }
+
+    #[test]
+    fn traverse_prune_streets_all_disabled() {
+        // When prune_streets = [false; 4], pruning should never trigger
+        // even when prune=true and regrets are very negative.
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let precomputed = make_precomputed(
+            &AllBuckets::new([10, 10, 10, 10], [None, None, None, None]),
+            make_deal(),
+        );
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Force very negative regrets — but pruning is disabled on all streets.
+        for r in storage.regrets.iter().step_by(3) {
+            r.store(-400_000_000, Ordering::Relaxed);
+        }
+
+        let (_ev, stats) = traverse_external(
+            &tree, &storage, &precomputed, 0, tree.root,
+            true, -310_000_000, [false; 4],
+            &mut rng, 0.0, 0.0, None, None, 0.0,
+        );
+        assert_eq!(stats.hits, 0, "no prune hits when all streets disabled");
+        assert_eq!(stats.total, 0, "no prune candidates when all streets disabled");
+    }
+
+    #[test]
+    fn traverse_prune_streets_partial_mask() {
+        // Only enable pruning on flop/turn/river (not preflop).
+        // The toy tree has preflop decision nodes, so with preflop disabled,
+        // pruning should not trigger there.
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let precomputed = make_precomputed(
+            &AllBuckets::new([10, 10, 10, 10], [None, None, None, None]),
+            make_deal(),
+        );
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Force very negative regrets.
+        for r in storage.regrets.iter().step_by(3) {
+            r.store(-400_000_000, Ordering::Relaxed);
+        }
+
+        // Disable preflop pruning only.
+        let mask = [false, true, true, true];
+        let (_ev, stats_no_preflop) = traverse_external(
+            &tree, &storage, &precomputed, 0, tree.root,
+            true, -310_000_000, mask,
+            &mut rng, 0.0, 0.0, None, None, 0.0,
+        );
+
+        // Now enable all streets.
+        let mut rng2 = StdRng::seed_from_u64(42);
+        let (_, stats_all) = traverse_external(
+            &tree, &storage, &precomputed, 0, tree.root,
+            true, -310_000_000, [true; 4],
+            &mut rng2, 0.0, 0.0, None, None, 0.0,
+        );
+
+        // With preflop disabled, there should be fewer prune candidates
+        // (or equal if no preflop nodes appear in traversal).
+        assert!(
+            stats_no_preflop.total <= stats_all.total,
+            "partial mask should have <= prune candidates vs all-enabled: {} vs {}",
+            stats_no_preflop.total, stats_all.total,
         );
     }
 }

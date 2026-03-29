@@ -516,6 +516,7 @@ impl BlueprintTrainer {
             // Config prune_threshold is in chip units; scale to match stored regrets.
             let threshold = i64::from(self.config.training.prune_threshold)
                 * super::storage::REGRET_SCALE as i64;
+            let prune_streets = self.config.training.prune_street_mask();
 
             let tree = &self.tree;
             let storage = &self.storage;
@@ -553,15 +554,15 @@ impl BlueprintTrainer {
                 let mut stats = PruneStats::default();
 
                 let (_, s0) = traverse_external(
-                    tree, storage, &deal, 0, tree.root, prune, threshold, &mut rng,
-                    rake_rate, rake_cap, Some(ev_tracker), Some(full_ev_tracker),
-                    baseline_alpha,
+                    tree, storage, &deal, 0, tree.root, prune, threshold,
+                    prune_streets, &mut rng, rake_rate, rake_cap,
+                    Some(ev_tracker), Some(full_ev_tracker), baseline_alpha,
                 );
                 stats.merge(s0);
                 let (_, s1) = traverse_external(
-                    tree, storage, &deal, 1, tree.root, prune, threshold, &mut rng,
-                    rake_rate, rake_cap, Some(ev_tracker), Some(full_ev_tracker),
-                    baseline_alpha,
+                    tree, storage, &deal, 1, tree.root, prune, threshold,
+                    prune_streets, &mut rng, rake_rate, rake_cap,
+                    Some(ev_tracker), Some(full_ev_tracker), baseline_alpha,
                 );
                 stats.merge(s1);
 
