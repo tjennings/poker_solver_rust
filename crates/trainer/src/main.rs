@@ -371,6 +371,48 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }));
                 }
 
+                // Wire config reload callback.
+                {
+                    let config_path_for_reload = config.clone();
+                    let shared_boards_for_reload = Arc::clone(&shared_boards);
+                    let shared_audits_for_reload = Arc::clone(&shared_audits);
+                    let metrics_for_reload = Arc::clone(&metrics);
+                    let reloaded_indices = Arc::clone(&trainer.reloaded_node_indices);
+                    let sparkline_window = tui_config.telemetry.sparkline_window;
+                    trainer.on_config_reload = Some(Box::new(move |tree, storage| {
+                        let Ok(yaml) = std::fs::read_to_string(&config_path_for_reload) else {
+                            return;
+                        };
+                        let new_tui_config = blueprint_tui_config::parse_tui_config(&yaml);
+
+                        // Re-resolve scenarios.
+                        let resolved = blueprint_tui_resolve::resolve_scenarios(
+                            tree, storage, &new_tui_config.scenarios,
+                        );
+
+                        // Re-resolve audits.
+                        let audits = blueprint_tui_resolve::resolve_audits(
+                            tree, storage, &new_tui_config.regret_audits, sparkline_window,
+                        );
+
+                        // Swap shared data for callbacks.
+                        *shared_boards_for_reload.write().unwrap() = resolved.boards;
+                        *shared_audits_for_reload.write().unwrap() = audits.audits;
+
+                        // Provide new node indices so the trainer updates tracking.
+                        let new_indices: Vec<u32> =
+                            resolved.scenarios.iter().map(|s| s.node_idx).collect();
+                        *reloaded_indices.lock().unwrap() = Some(new_indices);
+
+                        // Push new UI state to TUI.
+                        let state = blueprint_tui_metrics::ReloadedTuiState {
+                            scenarios: resolved.scenarios,
+                            audit_panel: audits.panel,
+                        };
+                        *metrics_for_reload.reloaded_tui_state.lock().unwrap() = Some(state);
+                    }));
+                }
+
                 // Random scenario carousel.
                 if tui_config.random_scenario.enabled {
                     trainer.random_scenario_hold_minutes =
