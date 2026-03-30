@@ -70,6 +70,11 @@ pub struct BlueprintTuiMetrics {
     pub avg_pos_regret_history: Mutex<Vec<f64>>,
     pub prune_history: Mutex<Vec<f64>>,
     pub exploitability_history: Mutex<Vec<f64>>,
+
+    // --- exploitability pass progress ---
+    pub exploitability_progress: Arc<AtomicU64>,
+    pub exploitability_total: Arc<AtomicU64>,
+    pub exploitability_start_time: Mutex<Option<Instant>>,
 }
 
 impl BlueprintTuiMetrics {
@@ -112,6 +117,10 @@ impl BlueprintTuiMetrics {
             avg_pos_regret_history: Mutex::new(Vec::new()),
             prune_history: Mutex::new(Vec::new()),
             exploitability_history: Mutex::new(Vec::new()),
+
+            exploitability_progress: Arc::new(AtomicU64::new(0)),
+            exploitability_total: Arc::new(AtomicU64::new(0)),
+            exploitability_start_time: Mutex::new(None),
         }
     }
 
@@ -258,6 +267,27 @@ impl BlueprintTuiMetrics {
     /// Seconds elapsed since this metrics instance was created.
     pub fn elapsed_secs(&self) -> f64 {
         self.start_time.elapsed().as_secs_f64()
+    }
+
+    /// Signal the start of an exploitability/BR pass with the given total sample count.
+    pub fn start_exploitability_pass(&self, total: u64) {
+        self.exploitability_progress.store(0, Ordering::Relaxed);
+        self.exploitability_total.store(total, Ordering::Relaxed);
+        let mut start = self.exploitability_start_time.lock().unwrap_or_else(|e| e.into_inner());
+        *start = Some(Instant::now());
+    }
+
+    /// Increment the exploitability progress counter by one deal.
+    pub fn tick_exploitability_progress(&self) {
+        self.exploitability_progress.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Signal the end of an exploitability/BR pass, resetting progress state.
+    pub fn finish_exploitability_pass(&self) {
+        self.exploitability_total.store(0, Ordering::Relaxed);
+        self.exploitability_progress.store(0, Ordering::Relaxed);
+        let mut start = self.exploitability_start_time.lock().unwrap_or_else(|e| e.into_inner());
+        *start = None;
     }
 }
 
@@ -435,5 +465,75 @@ mod tests {
         assert_eq!(hist.len(), 2);
         assert!((hist[0] - 42.5).abs() < 1e-9);
         assert!((hist[1] - 38.0).abs() < 1e-9);
+    }
+
+    #[timed_test(10)]
+    fn exploitability_progress_initial_state() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        assert_eq!(m.exploitability_progress.load(Ordering::Relaxed), 0);
+        assert_eq!(m.exploitability_total.load(Ordering::Relaxed), 0);
+        let start = m.exploitability_start_time.lock().unwrap();
+        assert!(start.is_none());
+    }
+
+    #[timed_test(10)]
+    fn start_exploitability_pass_sets_total_and_resets_progress() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        // Pre-set progress to simulate leftover from previous run.
+        m.exploitability_progress.store(50, Ordering::Relaxed);
+
+        m.start_exploitability_pass(1000);
+
+        assert_eq!(m.exploitability_total.load(Ordering::Relaxed), 1000);
+        assert_eq!(m.exploitability_progress.load(Ordering::Relaxed), 0);
+        let start = m.exploitability_start_time.lock().unwrap();
+        assert!(start.is_some());
+    }
+
+    #[timed_test(10)]
+    fn tick_exploitability_progress_increments() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        m.start_exploitability_pass(100);
+
+        m.tick_exploitability_progress();
+        assert_eq!(m.exploitability_progress.load(Ordering::Relaxed), 1);
+
+        m.tick_exploitability_progress();
+        m.tick_exploitability_progress();
+        assert_eq!(m.exploitability_progress.load(Ordering::Relaxed), 3);
+    }
+
+    #[timed_test(10)]
+    fn finish_exploitability_pass_resets_state() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        m.start_exploitability_pass(100);
+        m.tick_exploitability_progress();
+
+        m.finish_exploitability_pass();
+
+        assert_eq!(m.exploitability_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.exploitability_progress.load(Ordering::Relaxed), 0);
+        let start = m.exploitability_start_time.lock().unwrap();
+        assert!(start.is_none());
+    }
+
+    #[timed_test(10)]
+    fn exploitability_progress_full_lifecycle() {
+        let m = BlueprintTuiMetrics::new(None, None);
+
+        // Start a pass.
+        m.start_exploitability_pass(50);
+        assert_eq!(m.exploitability_total.load(Ordering::Relaxed), 50);
+
+        // Tick halfway.
+        for _ in 0..25 {
+            m.tick_exploitability_progress();
+        }
+        assert_eq!(m.exploitability_progress.load(Ordering::Relaxed), 25);
+
+        // Finish.
+        m.finish_exploitability_pass();
+        assert_eq!(m.exploitability_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.exploitability_progress.load(Ordering::Relaxed), 0);
     }
 }

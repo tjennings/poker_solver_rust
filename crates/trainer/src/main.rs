@@ -359,6 +359,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                     metrics_for_exploit.push_exploitability(val);
                 }));
 
+                let metrics_for_exploit_start = Arc::clone(&metrics);
+                trainer.on_exploitability_start = Some(Box::new(move |total| {
+                    metrics_for_exploit_start.start_exploitability_pass(total);
+                }));
+
+                let metrics_for_exploit_tick = Arc::clone(&metrics);
+                trainer.on_exploitability_tick = Some(Arc::new(move || {
+                    metrics_for_exploit_tick.tick_exploitability_progress();
+                }));
+
+                let metrics_for_exploit_finish = Arc::clone(&metrics);
+                trainer.on_exploitability_finish = Some(Box::new(move || {
+                    metrics_for_exploit_finish.finish_exploitability_pass();
+                }));
+
                 // Wire audit refresh callback.
                 {
                     let audits_for_refresh = Arc::clone(&shared_audits);

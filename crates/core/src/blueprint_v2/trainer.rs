@@ -214,6 +214,13 @@ pub struct BlueprintTrainer {
     // --- Exploitability measurement ---
     /// Callback to push exploitability values to TUI metrics.
     pub on_exploitability: Option<Box<dyn Fn(f64) + Send>>,
+    /// Called at the start of an exploitability/BR pass with the total sample count.
+    pub on_exploitability_start: Option<Box<dyn Fn(u64) + Send>>,
+    /// Called once per completed deal during an exploitability/BR pass.
+    /// Must be `Arc` (not `Box`) because it is shared across rayon threads.
+    pub on_exploitability_tick: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called when an exploitability/BR pass finishes.
+    pub on_exploitability_finish: Option<Box<dyn Fn() + Send>>,
     /// Last time (in minutes) an exploitability measurement was performed.
     last_exploitability_time: u64,
 
@@ -383,6 +390,9 @@ impl BlueprintTrainer {
             last_random_scenario_min: 0,
             on_audit_refresh: None,
             on_exploitability: None,
+            on_exploitability_start: None,
+            on_exploitability_tick: None,
+            on_exploitability_finish: None,
             last_exploitability_time: 0,
             config_reload_trigger: Arc::new(AtomicBool::new(false)),
             on_config_reload: None,
@@ -711,6 +721,11 @@ impl BlueprintTrainer {
         let rake_cap = self.config.game.rake_cap;
         let big_blind = self.config.game.big_blind;
 
+        if let Some(ref cb) = self.on_exploitability_start {
+            cb(n);
+        }
+        let tick = self.on_exploitability_tick.clone();
+
         let (sum_p0, sum_p1): (f64, f64) = (0..n)
             .into_par_iter()
             .map(|i| {
@@ -725,9 +740,16 @@ impl BlueprintTrainer {
                 let br1 = traverse_best_response(
                     tree, storage, &deal, 1, tree.root, rake_rate, rake_cap, None, None,
                 );
+                if let Some(ref cb) = tick {
+                    cb();
+                }
                 (br0, br1)
             })
             .reduce(|| (0.0, 0.0), |(a0, a1), (b0, b1)| (a0 + b0, a1 + b1));
+
+        if let Some(ref cb) = self.on_exploitability_finish {
+            cb();
+        }
 
         let n_f = n as f64;
         // Exploitability in mbb/hand: avg BR value in chips, convert to mBB.
@@ -742,6 +764,11 @@ impl BlueprintTrainer {
         let rake_rate = self.config.game.rake_rate;
         let rake_cap = self.config.game.rake_cap;
         let big_blind = self.config.game.big_blind;
+
+        if let Some(ref cb) = self.on_exploitability_start {
+            cb(n);
+        }
+        let tick = self.on_exploitability_tick.clone();
 
         // Unlock and zero predictions for fresh accumulation.
         self.storage.unlock_predictions();
@@ -768,9 +795,16 @@ impl BlueprintTrainer {
                     tree, storage, &deal, 1, tree.root, rake_rate, rake_cap,
                     Some(storage), Some(vc_ref),
                 );
+                if let Some(ref cb) = tick {
+                    cb();
+                }
                 (br0, br1)
             })
             .reduce(|| (0.0, 0.0), |(a0, a1), (b0, b1)| (a0 + b0, a1 + b1));
+
+        if let Some(ref cb) = self.on_exploitability_finish {
+            cb();
+        }
 
         // Normalize predictions by visit count.
         if let Some(ref preds) = self.storage.predictions {

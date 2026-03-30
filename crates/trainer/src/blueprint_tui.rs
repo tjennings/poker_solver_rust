@@ -487,7 +487,37 @@ impl BlueprintTuiApp {
             .last()
             .map(|&v| v as f64 / 100.0)
             .unwrap_or(0.0);
-        let title = format!("Exploitability: {latest:.1} mbb/hand");
+
+        let total = self.metrics.exploitability_total.load(Ordering::Relaxed);
+        let progress = self.metrics.exploitability_progress.load(Ordering::Relaxed);
+
+        let title = if total > 0 && progress < total {
+            let pct = (progress as f64 / total as f64 * 100.0) as u32;
+            let elapsed = self
+                .metrics
+                .exploitability_start_time
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
+            let eta = if progress > 0 {
+                let remaining =
+                    (total - progress) as f64 / (progress as f64 / elapsed);
+                format!("ETA {remaining:.0}s")
+            } else {
+                "ETA ...".to_string()
+            };
+            let filled = (pct as usize * 10 / 100).min(10);
+            let bar = format!(
+                "{}{}",
+                "\u{2588}".repeat(filled),
+                "\u{2591}".repeat(10 - filled)
+            );
+            format!("Exploitability: {latest:.1} mbb/hand  [{bar}] {pct}% {eta}")
+        } else {
+            format!("Exploitability: {latest:.1} mbb/hand")
+        };
+
         let sparkline = Sparkline::default()
             .block(Block::default().title(title).borders(Borders::NONE))
             .data(&self.exploitability_history)
@@ -1080,6 +1110,83 @@ mod tests {
         }
         assert!(hotkey_line.contains("[c]onfig"), "hotkey bar missing [c]onfig: {hotkey_line}");
         assert!(hotkey_line.contains("[r]efresh"), "hotkey bar missing [r]efresh: {hotkey_line}");
+    }
+
+    #[timed_test(10)]
+    fn exploitability_shows_progress_bar_during_pass() {
+        let metrics = make_metrics();
+        // Simulate an in-progress exploitability pass: 42% done.
+        metrics.start_exploitability_pass(100);
+        for _ in 0..42 {
+            metrics.tick_exploitability_progress();
+        }
+        // Push a prior exploitability value so the sparkline has data.
+        metrics.push_exploitability(500.0);
+
+        let mut app = BlueprintTuiApp::new(
+            Arc::clone(&metrics),
+            vec![],
+            TelemetryConfig::default(),
+        );
+        app.tick();
+
+        let backend = ratatui::backend::TestBackend::new(120, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        // Extract the exploitability sparkline title row.
+        // Layout: row 0=iterations, 1=gauge, 2=runtime, 3-4=throughput, 5-6=exploitability.
+        let buf = terminal.backend().buffer().clone();
+        let mut exploit_line = String::new();
+        for x in 0..buf.area().width {
+            exploit_line.push(buf[(x, 5)].symbol().chars().next().unwrap_or(' '));
+        }
+
+        // Should contain progress indicators.
+        assert!(
+            exploit_line.contains("42%"),
+            "exploitability line should show 42% progress: {exploit_line}"
+        );
+        assert!(
+            exploit_line.contains("ETA"),
+            "exploitability line should show ETA: {exploit_line}"
+        );
+    }
+
+    #[timed_test(10)]
+    fn exploitability_hides_progress_bar_when_idle() {
+        let metrics = make_metrics();
+        // No active pass -- total is 0.
+        metrics.push_exploitability(500.0);
+
+        let mut app = BlueprintTuiApp::new(
+            Arc::clone(&metrics),
+            vec![],
+            TelemetryConfig::default(),
+        );
+        app.tick();
+
+        let backend = ratatui::backend::TestBackend::new(120, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        // Layout: row 0=iterations, 1=gauge, 2=runtime, 3-4=throughput, 5-6=exploitability.
+        let buf = terminal.backend().buffer().clone();
+        let mut exploit_line = String::new();
+        for x in 0..buf.area().width {
+            exploit_line.push(buf[(x, 5)].symbol().chars().next().unwrap_or(' '));
+        }
+
+        // Should NOT contain progress bar elements.
+        assert!(
+            !exploit_line.contains("ETA"),
+            "exploitability line should not show ETA when idle: {exploit_line}"
+        );
+        // Should show the normal label.
+        assert!(
+            exploit_line.contains("Exploitability:"),
+            "exploitability line should show label: {exploit_line}"
+        );
     }
 
     #[timed_test(10)]
