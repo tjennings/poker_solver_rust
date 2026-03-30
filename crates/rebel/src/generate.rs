@@ -19,7 +19,10 @@ use crate::blueprint_sampler::{deal_hand, play_hand};
 use crate::config::RebelConfig;
 use crate::data_buffer::{BufferRecord, DiskBuffer};
 use crate::pbs::{Pbs, NUM_COMBOS};
-use crate::solver::{solve_depth_limited_pbs, solve_river_pbs, SolveConfig};
+use crate::solver::{
+    boundary_requests, prepare_game, set_boundaries, solve_depth_limited_pbs, solve_prepared,
+    solve_river_pbs, SolveConfig,
+};
 use poker_solver_core::blueprint_v2::LeafEvaluator;
 
 /// Convert a PBS to a `BufferRecord` for one player's perspective.
@@ -198,70 +201,134 @@ pub fn solve_buffer_records(
     for chunk_start in (0..total).step_by(chunk_size) {
         let chunk_end = (chunk_start + chunk_size).min(total);
 
-        // Read all records in this chunk
-        let records: Vec<(usize, BufferRecord)> = (chunk_start..chunk_end)
-            .map(|idx| {
-                let rec = buffer
-                    .read_record(idx)
-                    .unwrap_or_else(|e| panic!("failed to read record {idx}: {e}"));
-                (idx, rec)
-            })
-            .collect();
+        // Read unsolved records in this chunk
+        let mut records: Vec<(usize, BufferRecord)> = Vec::new();
+        for idx in chunk_start..chunk_end {
+            let rec = buffer
+                .read_record(idx)
+                .unwrap_or_else(|e| panic!("failed to read record {idx}: {e}"));
+            if rec.game_value != 0.0 {
+                pb.inc(1); // already solved
+                continue;
+            }
+            records.push((idx, rec));
+        }
 
-        // Solve in parallel
-        let results: Vec<(usize, BufferRecord)> = pool.install(|| {
-            records
-                .into_par_iter()
-                .filter_map(|(idx, mut rec)| {
-                    // Skip already-solved records (non-zero game_value)
-                    if rec.game_value != 0.0 {
-                        pb.inc(1);
-                        return None;
+        if records.is_empty() {
+            continue;
+        }
+
+        if evaluator.is_some() {
+            // --- Batched path: prepare games, batch GPU eval, then solve on CPU ---
+
+            // Phase 1: Prepare all games (CPU, parallel)
+            let mut prepared: Vec<Option<(usize, BufferRecord, crate::solver::PreparedGame)>> =
+                pool.install(|| {
+                    records
+                        .into_par_iter()
+                        .map(|(idx, rec)| {
+                            let pbs = buffer_record_to_pbs(&rec);
+                            match prepare_game(&pbs, solve_config) {
+                                Ok(pg) => Some((idx, rec, pg)),
+                                Err(e) => {
+                                    eprintln!("  Warning: failed to prepare record {idx}: {e}");
+                                    pb.inc(1);
+                                    None
+                                }
+                            }
+                        })
+                        .collect()
+                });
+
+            let eval = evaluator.unwrap();
+
+            // Phase 2: Batch boundary evaluations (single-threaded GPU)
+            for entry in &mut prepared {
+                if let Some((_idx, _rec, pg)) = entry {
+                    let reqs = boundary_requests(pg);
+                    if reqs.is_empty() {
+                        continue;
                     }
+                    let mut cfvs_per_player: [Vec<Vec<f64>>; 2] = [Vec::new(), Vec::new()];
+                    for req in &reqs {
+                        let batch = eval.evaluate_boundaries(
+                            &req.combos,
+                            &req.board_cards,
+                            &req.oop_range,
+                            &req.ip_range,
+                            &req.requests,
+                        );
+                        cfvs_per_player[req.player] = batch;
+                    }
+                    set_boundaries(pg, &cfvs_per_player);
+                }
+            }
 
-                    let pbs = buffer_record_to_pbs(&rec);
+            // Phase 3: Solve all games (CPU, parallel — no GPU calls)
+            let results: Vec<(usize, BufferRecord)> = pool.install(|| {
+                prepared
+                    .into_par_iter()
+                    .filter_map(|entry| {
+                        let (idx, mut rec, mut pg) = entry?;
+                        let result = solve_prepared(&mut pg);
+                        if rec.player == 0 {
+                            rec.cfvs = result.oop_cfvs;
+                            rec.game_value = result.oop_game_value;
+                        } else {
+                            rec.cfvs = result.ip_cfvs;
+                            rec.game_value = result.ip_game_value;
+                        }
+                        solved_count.fetch_add(1, Ordering::Relaxed);
+                        Some((idx, rec))
+                    })
+                    .collect()
+            });
 
-                    let solve_result = if let Some(eval) = evaluator {
-                        // Depth-limited solving: supports all streets (3-5 cards).
-                        solve_depth_limited_pbs(&pbs, solve_config, eval)
-                    } else {
-                        // River-only solving: requires exactly 5 board cards.
+            for (idx, rec) in &results {
+                buffer
+                    .write_record(*idx, rec)
+                    .unwrap_or_else(|e| panic!("failed to write record {idx}: {e}"));
+                pb.inc(1);
+            }
+        } else {
+            // --- Non-batched path: river solving (no GPU needed) ---
+            let results: Vec<(usize, BufferRecord)> = pool.install(|| {
+                records
+                    .into_par_iter()
+                    .filter_map(|(idx, mut rec)| {
+                        let pbs = buffer_record_to_pbs(&rec);
                         if pbs.board.len() != 5 {
                             pb.inc(1);
                             return None;
                         }
-                        solve_river_pbs(&pbs, solve_config)
-                    };
-
-                    match solve_result {
-                        Ok(result) => {
-                            // Fill CFVs based on player perspective
-                            if rec.player == 0 {
-                                rec.cfvs = result.oop_cfvs;
-                                rec.game_value = result.oop_game_value;
-                            } else {
-                                rec.cfvs = result.ip_cfvs;
-                                rec.game_value = result.ip_game_value;
+                        match solve_river_pbs(&pbs, solve_config) {
+                            Ok(result) => {
+                                if rec.player == 0 {
+                                    rec.cfvs = result.oop_cfvs;
+                                    rec.game_value = result.oop_game_value;
+                                } else {
+                                    rec.cfvs = result.ip_cfvs;
+                                    rec.game_value = result.ip_game_value;
+                                }
+                                solved_count.fetch_add(1, Ordering::Relaxed);
+                                Some((idx, rec))
                             }
-                            solved_count.fetch_add(1, Ordering::Relaxed);
-                            Some((idx, rec))
+                            Err(e) => {
+                                eprintln!("  Warning: failed to solve record {idx}: {e}");
+                                pb.inc(1);
+                                None
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("  Warning: failed to solve record {idx}: {e}");
-                            pb.inc(1);
-                            None
-                        }
-                    }
-                })
-                .collect()
-        });
+                    })
+                    .collect()
+            });
 
-        // Write solved records back to buffer
-        for (idx, rec) in &results {
-            buffer
-                .write_record(*idx, rec)
-                .unwrap_or_else(|e| panic!("failed to write record {idx}: {e}"));
-            pb.inc(1);
+            for (idx, rec) in &results {
+                buffer
+                    .write_record(*idx, rec)
+                    .unwrap_or_else(|e| panic!("failed to write record {idx}: {e}"));
+                pb.inc(1);
+            }
         }
     }
 

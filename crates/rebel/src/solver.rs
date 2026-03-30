@@ -21,6 +21,7 @@ use range_solver::{
 };
 
 /// Configuration for the range-solver wrapper used in ReBeL subgame solving.
+#[derive(Clone)]
 pub struct SolveConfig {
     /// River bet size options (also used as the sole bet sizes for river-only solves).
     pub bet_sizes: BetSizeOptions,
@@ -241,6 +242,221 @@ fn solve_flop_pbs(
     };
 
     solve_with_boundaries(pbs, config, evaluator, card_config, tree_config)
+}
+
+/// A prepared game ready for boundary evaluation and solving.
+/// Separates game construction from GPU evaluation to enable batching.
+pub struct PreparedGame {
+    pub game: PostFlopGame,
+    pub pbs: Pbs,
+    pub config: SolveConfig,
+}
+
+/// Prepare a depth-limited game for solving (build tree, allocate memory).
+/// Does NOT evaluate boundaries — call `set_boundaries` or batch-evaluate separately.
+pub fn prepare_game(
+    pbs: &Pbs,
+    config: &SolveConfig,
+) -> Result<PreparedGame, String> {
+    if pbs.pot <= 0 {
+        return Err("pot must be positive for solver".into());
+    }
+    if pbs.effective_stack <= 0 {
+        return Err("effective_stack must be positive for solver".into());
+    }
+
+    let oop_range = Range::from_raw_data(&pbs.reach_probs[0])?;
+    let ip_range = Range::from_raw_data(&pbs.reach_probs[1])?;
+
+    let (card_config, tree_config) = match pbs.board.len() {
+        5 => {
+            let cc = CardConfig {
+                range: [oop_range, ip_range],
+                flop: [pbs.board[0], pbs.board[1], pbs.board[2]],
+                turn: pbs.board[3],
+                river: pbs.board[4],
+            };
+            let tc = TreeConfig {
+                initial_state: BoardState::River,
+                starting_pot: pbs.pot,
+                effective_stack: pbs.effective_stack,
+                river_bet_sizes: [config.bet_sizes.clone(), config.bet_sizes.clone()],
+                add_allin_threshold: config.add_allin_threshold,
+                force_allin_threshold: config.force_allin_threshold,
+                ..Default::default()
+            };
+            (cc, tc)
+        }
+        4 => {
+            let cc = CardConfig {
+                range: [oop_range, ip_range],
+                flop: [pbs.board[0], pbs.board[1], pbs.board[2]],
+                turn: pbs.board[3],
+                river: NOT_DEALT,
+            };
+            let turn_sizes = config
+                .turn_bet_sizes
+                .clone()
+                .unwrap_or_else(|| [config.bet_sizes.clone(), config.bet_sizes.clone()]);
+            let tc = TreeConfig {
+                initial_state: BoardState::Turn,
+                starting_pot: pbs.pot,
+                effective_stack: pbs.effective_stack,
+                turn_bet_sizes: turn_sizes,
+                depth_limit: Some(0),
+                add_allin_threshold: config.add_allin_threshold,
+                force_allin_threshold: config.force_allin_threshold,
+                ..Default::default()
+            };
+            (cc, tc)
+        }
+        3 => {
+            let cc = CardConfig {
+                range: [oop_range, ip_range],
+                flop: [pbs.board[0], pbs.board[1], pbs.board[2]],
+                turn: NOT_DEALT,
+                river: NOT_DEALT,
+            };
+            let flop_sizes = config
+                .flop_bet_sizes
+                .clone()
+                .unwrap_or_else(|| [config.bet_sizes.clone(), config.bet_sizes.clone()]);
+            let tc = TreeConfig {
+                initial_state: BoardState::Flop,
+                starting_pot: pbs.pot,
+                effective_stack: pbs.effective_stack,
+                flop_bet_sizes: flop_sizes,
+                depth_limit: Some(0),
+                add_allin_threshold: config.add_allin_threshold,
+                force_allin_threshold: config.force_allin_threshold,
+                ..Default::default()
+            };
+            (cc, tc)
+        }
+        n => return Err(format!("requires 3-5 board cards, got {n}")),
+    };
+
+    let action_tree = ActionTree::new(tree_config)?;
+    let mut game = PostFlopGame::with_config(card_config, action_tree)?;
+    game.allocate_memory(false);
+
+    Ok(PreparedGame {
+        game,
+        pbs: pbs.clone(),
+        config: config.clone(),
+    })
+}
+
+/// Collect boundary evaluation requests from a prepared game.
+/// Returns (board_cards_rs, combos_rs, oop_range, ip_range, requests) per player.
+/// Empty if the game has no boundary nodes (e.g., river).
+pub fn boundary_requests(
+    prepared: &PreparedGame,
+) -> Vec<BoundaryRequest> {
+    let game = &prepared.game;
+    let pbs = &prepared.pbs;
+    let n_boundary = game.num_boundary_nodes();
+    if n_boundary == 0 {
+        return Vec::new();
+    }
+
+    let board_cards: Vec<RsPokerCard> = pbs.board.iter().map(|&c| u8_to_rs_poker_card(c)).collect();
+    let starting_pot = game.tree_config().starting_pot;
+    let eff_stack = game.tree_config().effective_stack;
+
+    let mut out = Vec::new();
+    for player in 0..2usize {
+        let hands = game.private_cards(player);
+        let combos_rs: Vec<[RsPokerCard; 2]> = hands
+            .iter()
+            .map(|&(c1, c2)| [u8_to_rs_poker_card(c1), u8_to_rs_poker_card(c2)])
+            .collect();
+        let oop_range: Vec<f64> = hands
+            .iter()
+            .map(|&(c1, c2)| pbs.reach_probs[0][card_pair_to_index(c1, c2)] as f64)
+            .collect();
+        let ip_range: Vec<f64> = hands
+            .iter()
+            .map(|&(c1, c2)| pbs.reach_probs[1][card_pair_to_index(c1, c2)] as f64)
+            .collect();
+        let requests: Vec<(f64, f64, u8)> = (0..n_boundary)
+            .map(|ordinal| {
+                let bpot = game.boundary_pot(ordinal);
+                let amount = (bpot - starting_pot) / 2;
+                let boundary_eff_stack = eff_stack - amount;
+                (bpot as f64, boundary_eff_stack as f64, player as u8)
+            })
+            .collect();
+
+        out.push(BoundaryRequest {
+            board_cards: board_cards.clone(),
+            combos: combos_rs,
+            oop_range,
+            ip_range,
+            requests,
+            player,
+        });
+    }
+    out
+}
+
+/// A batch of boundary evaluation requests for one player of one game.
+pub struct BoundaryRequest {
+    pub board_cards: Vec<RsPokerCard>,
+    pub combos: Vec<[RsPokerCard; 2]>,
+    pub oop_range: Vec<f64>,
+    pub ip_range: Vec<f64>,
+    pub requests: Vec<(f64, f64, u8)>,
+    pub player: usize,
+}
+
+/// Set boundary CFVs on a prepared game from pre-computed evaluations.
+/// `cfvs_per_player` should have one entry per player (0=OOP, 1=IP),
+/// each containing one Vec<f64> per boundary node.
+pub fn set_boundaries(
+    prepared: &mut PreparedGame,
+    cfvs_per_player: &[Vec<Vec<f64>>; 2],
+) {
+    for player in 0..2 {
+        for (ordinal, cfvs) in cfvs_per_player[player].iter().enumerate() {
+            let cfvs_f32: Vec<f32> = cfvs.iter().map(|&v| v as f32).collect();
+            prepared.game.set_boundary_cfvs(ordinal, player, cfvs_f32);
+        }
+    }
+}
+
+/// Solve a prepared game (boundaries must already be set) and extract results.
+pub fn solve_prepared(prepared: &mut PreparedGame) -> SolveResult {
+    let exploitability = solve(
+        &mut prepared.game,
+        prepared.config.solver_iterations,
+        prepared.config.target_exploitability,
+        false,
+    );
+
+    prepared.game.cache_normalized_weights();
+
+    let raw_oop = prepared.game.expected_values(0);
+    let raw_ip = prepared.game.expected_values(1);
+    let oop_hands = prepared.game.private_cards(0);
+    let ip_hands = prepared.game.private_cards(1);
+    let pot = prepared.pbs.pot as f32;
+
+    let mut oop_cfvs = [0.0f32; NUM_COMBOS];
+    let mut ip_cfvs = [0.0f32; NUM_COMBOS];
+    map_evs_to_combos(&raw_oop, oop_hands, pot, &mut oop_cfvs);
+    map_evs_to_combos(&raw_ip, ip_hands, pot, &mut ip_cfvs);
+
+    let oop_game_value = weighted_game_value(&oop_cfvs, &prepared.pbs.reach_probs[0]);
+    let ip_game_value = weighted_game_value(&ip_cfvs, &prepared.pbs.reach_probs[1]);
+
+    SolveResult {
+        oop_cfvs,
+        ip_cfvs,
+        oop_game_value,
+        ip_game_value,
+        exploitability,
+    }
 }
 
 /// Common logic for depth-limited solving: build game, set boundary CFVs, solve, extract.
