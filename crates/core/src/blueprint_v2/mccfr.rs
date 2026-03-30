@@ -815,11 +815,20 @@ fn traverse_traverser(
 
     for (a, &child_idx) in children.iter().enumerate() {
         if prune && prune_streets[street as usize] {
-            stats.total += 1;
-            if storage.get_regret(node_idx, bucket, a) < prune_threshold {
-                stats.hits += 1;
-                pruned[a] = true;
-                continue;
+            // Never prune actions that lead directly to a terminal node
+            // (folds, all-ins) — these are high-leverage and must always
+            // be explored (matches Pluribus pruning exceptions).
+            let child_is_terminal = matches!(
+                tree.nodes[child_idx as usize],
+                GameNode::Terminal { .. }
+            );
+            if !child_is_terminal {
+                stats.total += 1;
+                if storage.get_regret(node_idx, bucket, a) < prune_threshold {
+                    stats.hits += 1;
+                    pruned[a] = true;
+                    continue;
+                }
             }
         }
 
