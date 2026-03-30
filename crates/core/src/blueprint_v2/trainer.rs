@@ -26,7 +26,7 @@ use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
 use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
-use super::mccfr::{traverse_external, AllBuckets, Deal, DealWithBuckets, FullTreeEvTracker, PruneStats, ScenarioEvTracker, PRUNE_HITS, PRUNE_TOTAL};
+use super::mccfr::{traverse_best_response, traverse_external, AllBuckets, Deal, DealWithBuckets, FullTreeEvTracker, PruneStats, ScenarioEvTracker, PRUNE_HITS, PRUNE_TOTAL};
 use super::storage::BlueprintStorage;
 use crate::cfr::optimizer::{CfrOptimizer, DcfrOptimizer, SapcfrPlusOptimizer};
 use crate::hands::CanonicalHand;
@@ -209,6 +209,12 @@ pub struct BlueprintTrainer {
     /// Called at strategy-refresh interval to update regret audit state.
     pub on_audit_refresh: Option<Box<dyn FnMut(&BlueprintStorage) + Send>>,
 
+    // --- Exploitability measurement ---
+    /// Callback to push exploitability values to TUI metrics.
+    pub on_exploitability: Option<Box<dyn Fn(f64) + Send>>,
+    /// Last time (in minutes) an exploitability measurement was performed.
+    last_exploitability_time: u64,
+
     // --- Config reload ---
     /// One-shot trigger: the TUI sets this to request a config reload.
     pub config_reload_trigger: Arc<AtomicBool>,
@@ -367,6 +373,8 @@ impl BlueprintTrainer {
             random_scenario_hold_minutes: 3,
             last_random_scenario_min: 0,
             on_audit_refresh: None,
+            on_exploitability: None,
+            last_exploitability_time: 0,
             config_reload_trigger: Arc::new(AtomicBool::new(false)),
             on_config_reload: None,
             reloaded_node_indices: Arc::new(std::sync::Mutex::new(None)),
@@ -675,6 +683,42 @@ impl BlueprintTrainer {
         }
     }
 
+    /// Compute sample-based best-response exploitability in mbb/hand.
+    ///
+    /// Samples N random deals, computes BR value for each player,
+    /// and returns the average exploitability.
+    pub fn compute_exploitability(&self) -> f64 {
+        let n = self.config.training.exploitability_samples.max(1);
+        let tree = &self.tree;
+        let storage = &self.storage;
+        let buckets_ref = &self.buckets;
+        let rake_rate = self.config.game.rake_rate;
+        let rake_cap = self.config.game.rake_cap;
+        let big_blind = self.config.game.big_blind;
+
+        let (sum_p0, sum_p1): (f64, f64) = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut rng = SmallRng::seed_from_u64(i.wrapping_mul(0x9E3779B97F4A7C15));
+                let deal = sample_deal_with_rng(&mut rng);
+                let buckets = buckets_ref.precompute_buckets(&deal);
+                let deal = DealWithBuckets { deal, buckets };
+
+                let br0 = traverse_best_response(
+                    tree, storage, &deal, 0, tree.root, rake_rate, rake_cap,
+                );
+                let br1 = traverse_best_response(
+                    tree, storage, &deal, 1, tree.root, rake_rate, rake_cap,
+                );
+                (br0, br1)
+            })
+            .reduce(|| (0.0, 0.0), |(a0, a1), (b0, b1)| (a0 + b0, a1 + b1));
+
+        let n_f = n as f64;
+        // Exploitability in mbb/hand: avg BR value in chips, convert to mBB.
+        (sum_p0 / n_f + sum_p1 / n_f) / 2.0 / big_blind * 1000.0
+    }
+
     /// True when either the iteration limit or time limit has been reached.
     fn should_stop(&self) -> bool {
         if self.quit_requested.load(Ordering::Relaxed) {
@@ -799,6 +843,21 @@ impl BlueprintTrainer {
             // and must NOT be reset — it persists to hand_ev.bin at snapshot time.
             self.scenario_ev_tracker.reset();
             self.last_strategy_refresh_secs = elapsed_secs;
+        }
+
+        // Exploitability measurement.
+        if self.config.training.exploitability_interval_minutes > 0 {
+            let interval = self.config.training.exploitability_interval_minutes;
+            if elapsed_min >= self.last_exploitability_time + interval {
+                let exploit = self.compute_exploitability();
+                if !self.tui_active {
+                    eprintln!("  Exploitability: {exploit:.2} mbb/hand");
+                }
+                if let Some(ref cb) = self.on_exploitability {
+                    cb(exploit);
+                }
+                self.last_exploitability_time = elapsed_min;
+            }
         }
 
         // Random scenario carousel rotation.
@@ -2043,6 +2102,34 @@ mod tests {
             (evs_after[42] - 10.0).abs() < 0.01,
             "full_ev_tracker should NOT be reset after strategy refresh, got {}",
             evs_after[42],
+        );
+    }
+
+    #[test]
+    fn compute_exploitability_returns_nonneg() {
+        let mut config = toy_config();
+        config.training.exploitability_samples = 100;
+        let trainer = toy_trainer(config);
+        let exploit = trainer.compute_exploitability();
+        assert!(
+            exploit >= -0.01,
+            "Exploitability should be non-negative, got {exploit}",
+        );
+        assert!(exploit.is_finite(), "Exploitability should be finite");
+    }
+
+    #[test]
+    fn compute_exploitability_units_are_mbb() {
+        let mut config = toy_config();
+        config.training.exploitability_samples = 100;
+        let trainer = toy_trainer(config);
+        let exploit = trainer.compute_exploitability();
+        // With a uniform (untrained) strategy, exploitability should be
+        // reasonably bounded. Stack depth is 20 chips = 10 BB = 10,000 mbb.
+        // Exploitability must be within [0, 10,000] mbb/hand.
+        assert!(
+            exploit <= 10_000.0,
+            "Exploitability should be <= stack depth in mbb, got {exploit}",
         );
     }
 }
