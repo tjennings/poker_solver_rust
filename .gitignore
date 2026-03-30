@@ -41,3 +41,4 @@ cloud/config.local.sh
 # External solver symlinks (for comparison tests)
 external/
 baselines/
+.reviews-done

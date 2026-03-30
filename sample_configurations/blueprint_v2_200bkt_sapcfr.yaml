@@ -49,10 +49,13 @@ training:
   batch_size: 4000
   #purify_threshold: 0.03
   dcfr_epoch_cap: 40
-  optimizer: "dcfr+"
-  dcfr_alpha: 1.5
-  dcfr_gamma: 2.0
-  exploitability_interval_minutes: 30
+
+
+
+  # optimizer: "dcfr+"
+  # dcfr_alpha: 1.5
+  # dcfr_gamma: 2.0
+  # exploitability_interval_minutes: 30
   exploitability_samples: 100000
 
   # SAPCFR+ optimizer with prediction-based strategy
@@ -65,12 +68,13 @@ training:
   # baseline_alpha: 0.5
 
   # BRCFR+ optimizer with periodic best-response prediction
-  # optimizer: "brcfr+"
-  # brcfr_eta: 0.6
-  # brcfr_warmup_iterations: 300000000
-  # brcfr_interval: 100000000
-  # dcfr_alpha: 1.5
-  # dcfr_gamma: 2.0
+  optimizer: "brcfr+"
+  brcfr_eta: 0.6
+  brcfr_warmup_iterations: 300000000
+  brcfr_interval: 100000000
+  dcfr_alpha: 1.5
+  dcfr_gamma: 2.0
+  exploitability_samples: 25000
 
 snapshots:
   resume: true
