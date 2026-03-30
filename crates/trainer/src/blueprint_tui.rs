@@ -640,17 +640,17 @@ impl BlueprintTuiApp {
         } else {
             for (i, spot) in spots.iter().take(10).enumerate() {
                 let player = if spot.player == 0 { "SB" } else { "BB" };
-                let street = match spot.street {
-                    poker_solver_core::blueprint_v2::Street::Preflop => "pre",
-                    poker_solver_core::blueprint_v2::Street::Flop => "flp",
-                    poker_solver_core::blueprint_v2::Street::Turn => "trn",
-                    poker_solver_core::blueprint_v2::Street::River => "rvr",
+                // Truncate spot path to fit display width.
+                let path = if spot.spot.len() > 40 {
+                    format!("…{}", &spot.spot[spot.spot.len() - 39..])
+                } else {
+                    spot.spot.clone()
                 };
                 lines.push(Line::from(format!(
-                    " {}. [{}] {} b{} -> {} ({:.0})",
+                    " {}. {} {} b{} → {} ({:.0})",
                     i + 1,
-                    street,
                     player,
+                    path,
                     spot.bucket,
                     spot.br_action,
                     spot.magnitude,
