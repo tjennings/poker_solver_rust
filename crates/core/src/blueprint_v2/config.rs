@@ -33,6 +33,14 @@ pub struct GameConfig {
     /// Maximum rake in chips (min bet units). 0.0 = no cap.
     #[serde(default)]
     pub rake_cap: f64,
+    /// Allow SB to open-limp (call the BB blind) preflop. Default true.
+    /// Set to false to force SB into raise-or-fold only.
+    #[serde(default = "default_true")]
+    pub allow_preflop_limp: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Per-flop clustering configuration.
@@ -487,6 +495,7 @@ snapshots:
                 big_blind: 2.0,
                 rake_rate: 0.045,
                 rake_cap: 3.0,
+                allow_preflop_limp: true,
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,

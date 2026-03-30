@@ -11,12 +11,12 @@ clustering:
   preflop:
     buckets: 169
   flop:
-    buckets: 200
+    buckets: 1000
   turn:
-    buckets: 200
+    buckets: 1000
     sample_boards: 16432
   river:
-    buckets: 200
+    buckets: 1000
     sample_boards: 500000
 
 action_abstraction:
@@ -35,7 +35,7 @@ action_abstraction:
     - [2.0]
 
 training:
-  cluster_path: "./local_data/buckets/200_v1"
+  cluster_path: "./local_data/buckets/1k_v3"
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 300000000
   prune_after_iterations: 100000000
@@ -65,24 +65,24 @@ training:
 
   # BRCFR+ optimizer with periodic best-response prediction
   optimizer: "brcfr+"
-  brcfr_eta: 0.6
-  brcfr_warmup_iterations: 600000000
-  brcfr_interval: 300000000
+  brcfr_eta: 0.9
+  brcfr_warmup_iterations: 300000000
+  brcfr_interval: 100000000
   dcfr_alpha: 1.5
   dcfr_gamma: 2.0
-  exploitability_samples: 25000
+  exploitability_samples: 300000
 
 snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/200_100bb_brdcfr_test"
+  output_dir: "./local_data/blueprints/1k_100bb_brdcfr_test"
 
 tui:
   enabled: true
   refresh_rate_ms: 2000
   telemetry:
-    strategy_delta_interval_seconds: 120
+    strategy_delta_interval_seconds: 20
     sparkline_window: 60
   scenarios:
     - name: "SB Open"

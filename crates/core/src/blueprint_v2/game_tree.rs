@@ -115,6 +115,8 @@ struct TreeConfig {
     depth_limit: Option<u8>,
     /// Street the subgame starts on (for depth counting).
     starting_street: Option<Street>,
+    /// When false, SB cannot open-limp (call the BB blind). Default true.
+    allow_preflop_limp: bool,
 }
 
 impl TreeConfig {
@@ -173,6 +175,21 @@ impl GameTree {
         turn_sizes: &[Vec<f64>],
         river_sizes: &[Vec<f64>],
     ) -> Self {
+        Self::build_with_options(stack_depth, small_blind, big_blind, preflop_sizes, flop_sizes, turn_sizes, river_sizes, true)
+    }
+
+    /// Build a game tree with additional options.
+    #[must_use]
+    pub fn build_with_options(
+        stack_depth: f64,
+        small_blind: f64,
+        big_blind: f64,
+        preflop_sizes: &[Vec<String>],
+        flop_sizes: &[Vec<f64>],
+        turn_sizes: &[Vec<f64>],
+        river_sizes: &[Vec<f64>],
+        allow_preflop_limp: bool,
+    ) -> Self {
         let config = TreeConfig {
             preflop_sizes: preflop_sizes
                 .iter()
@@ -183,6 +200,7 @@ impl GameTree {
             river_sizes: river_sizes.to_vec(),
             depth_limit: None,
             starting_street: None,
+            allow_preflop_limp,
         };
 
         let mut nodes = Vec::new();
@@ -246,7 +264,11 @@ impl GameTree {
             } else {
                 state.street_bets[1 - actor] - state.street_bets[actor]
             };
-            if call_amount >= remaining[actor] - SIZE_EPSILON {
+            // Skip SB open-limp when disallowed.
+            let is_preflop_limp = state.street == Street::Preflop && state.num_raises == 0;
+            if is_preflop_limp && !config.allow_preflop_limp {
+                // No limp option — SB must raise or fold.
+            } else if call_amount >= remaining[actor] - SIZE_EPSILON {
                 // Calling for all-in
                 actions.push(TreeAction::AllIn);
             } else {
@@ -830,6 +852,7 @@ impl GameTree {
             river_sizes: bet_sizes.to_vec(),
             depth_limit,
             starting_street: Some(street),
+            allow_preflop_limp: true,
         };
 
         // OOP acts first postflop = 1 - dealer

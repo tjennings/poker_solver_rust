@@ -241,7 +241,7 @@ impl BlueprintTrainer {
     /// storage, and initialises timing state.
     #[must_use]
     pub fn new(config: BlueprintV2Config) -> Self {
-        let tree = GameTree::build(
+        let tree = GameTree::build_with_options(
             config.game.stack_depth,
             config.game.small_blind,
             config.game.big_blind,
@@ -249,6 +249,7 @@ impl BlueprintTrainer {
             &config.action_abstraction.flop,
             &config.action_abstraction.turn,
             &config.action_abstraction.river,
+            config.game.allow_preflop_limp,
         );
 
         let bucket_counts = [
@@ -1509,6 +1510,7 @@ mod tests {
                 big_blind: 2.0,
                 rake_rate: 0.0,
                 rake_cap: 0.0,
+                allow_preflop_limp: true,
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
