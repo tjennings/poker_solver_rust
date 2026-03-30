@@ -36,6 +36,7 @@ pub struct BlueprintTuiMetrics {
     pub paused: Arc<AtomicBool>,
     pub quit_requested: Arc<AtomicBool>,
     pub snapshot_trigger: Arc<AtomicBool>,
+    pub strategy_refresh_trigger: Arc<AtomicBool>,
 
     // --- infrequent bulk data (behind Mutex) ---
     pub strategy_snapshots: Mutex<Vec<Vec<f64>>>,
@@ -80,6 +81,7 @@ impl BlueprintTuiMetrics {
             paused: Arc::new(AtomicBool::new(false)),
             quit_requested: Arc::new(AtomicBool::new(false)),
             snapshot_trigger: Arc::new(AtomicBool::new(false)),
+            strategy_refresh_trigger: Arc::new(AtomicBool::new(false)),
 
             strategy_snapshots: Mutex::new(snapshots),
             prev_strategy_snapshots: Mutex::new(prev_snapshots),
@@ -107,6 +109,10 @@ impl BlueprintTuiMetrics {
 
     pub fn request_snapshot(&self) {
         self.snapshot_trigger.store(true, Ordering::Relaxed);
+    }
+
+    pub fn request_strategy_refresh(&self) {
+        self.strategy_refresh_trigger.store(true, Ordering::Relaxed);
     }
 
     /// Consume the snapshot trigger, returning `true` if it was set.

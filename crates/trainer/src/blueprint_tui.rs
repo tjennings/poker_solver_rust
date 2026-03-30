@@ -654,6 +654,7 @@ fn run_tui_inner(
                     }
                 }
                 KeyCode::Char('p') => metrics.toggle_pause(),
+                KeyCode::Char('r') => metrics.request_strategy_refresh(),
                 KeyCode::Char('s') => metrics.request_snapshot(),
                 _ => {}
             }

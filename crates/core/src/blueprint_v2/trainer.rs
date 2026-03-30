@@ -158,6 +158,8 @@ pub struct BlueprintTrainer {
     pub quit_requested: Arc<AtomicBool>,
     /// One-shot trigger: the TUI sets this to request an immediate snapshot.
     pub snapshot_trigger: Arc<AtomicBool>,
+    /// One-shot trigger: the TUI sets this to request an immediate strategy refresh.
+    pub strategy_refresh_trigger: Arc<AtomicBool>,
 
     // --- TUI integration ---
     /// When `true`, suppress `eprintln!()` output that would corrupt the TUI.
@@ -337,6 +339,7 @@ impl BlueprintTrainer {
             paused: Arc::new(AtomicBool::new(false)),
             quit_requested: Arc::new(AtomicBool::new(false)),
             snapshot_trigger: Arc::new(AtomicBool::new(false)),
+            strategy_refresh_trigger: Arc::new(AtomicBool::new(false)),
             tui_active: false,
             strategy_refresh_interval_secs: 30,
             scenario_node_indices: Vec::new(),
@@ -677,8 +680,9 @@ impl BlueprintTrainer {
         let elapsed_secs = self.start_time.elapsed().as_secs();
         let print_due =
             elapsed_min >= self.last_print_time + self.config.training.print_every_minutes;
-        let refresh_due =
-            elapsed_secs >= self.last_strategy_refresh_secs + self.strategy_refresh_interval_secs;
+        let tui_refresh_triggered = self.strategy_refresh_trigger.swap(false, Ordering::Relaxed);
+        let refresh_due = tui_refresh_triggered
+            || elapsed_secs >= self.last_strategy_refresh_secs + self.strategy_refresh_interval_secs;
 
         if print_due || refresh_due {
             self.update_strategy_delta();

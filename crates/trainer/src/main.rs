@@ -275,6 +275,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 trainer.quit_requested = Arc::clone(&metrics.quit_requested);
                 trainer.shared_iterations = Arc::clone(&metrics.iterations);
                 trainer.snapshot_trigger = Arc::clone(&metrics.snapshot_trigger);
+                trainer.strategy_refresh_trigger = Arc::clone(&metrics.strategy_refresh_trigger);
 
                 // Resolve scenarios using spot notation.
                 let (scenarios, boards_for_refresh): (Vec<blueprint_tui::ResolvedScenario>, Vec<Vec<poker_solver_core::poker::Card>>) = tui_config
