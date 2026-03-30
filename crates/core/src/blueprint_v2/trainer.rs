@@ -1376,10 +1376,12 @@ impl BlueprintTrainer {
                 let nonzero = counts.iter().filter(|&&c| c > 0).count();
                 let max = counts.iter().max().copied().unwrap_or(0);
                 let min_nonzero = counts.iter().filter(|&&c| c > 0).min().copied().unwrap_or(0);
-                eprintln!(
-                    "[bucket visits] {name}: {nonzero}/{} buckets visited, total={total}, min={min_nonzero}, max={max}",
-                    counts.len()
-                );
+                if !self.tui_active {
+                    eprintln!(
+                        "[bucket visits] {name}: {nonzero}/{} buckets visited, total={total}, min={min_nonzero}, max={max}",
+                        counts.len()
+                    );
+                }
                 let _ = write!(visit_json, "  \"{name}\": {:?}", counts);
                 if s < 3 { visit_json.push(','); }
                 visit_json.push('\n');

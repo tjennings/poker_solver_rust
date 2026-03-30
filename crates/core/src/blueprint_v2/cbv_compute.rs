@@ -268,10 +268,7 @@ pub fn build_transitions_from_buckets(
     let pairs = [(0, 1, 0), (1, 2, 1), (2, 3, 2)];
     for (from_idx, to_idx, slot) in pairs {
         if let (Some(from_bf), Some(to_bf)) = (&bucket_files[from_idx], &bucket_files[to_idx]) {
-            eprintln!(
-                "  CBV: computing bucket transition {:?} -> {:?} ...",
-                from_bf.header.street, to_bf.header.street,
-            );
+            // Log removed — disrupts TUI when active.
             result[slot] = Some(build_transition_from_pair(from_bf, to_bf));
         }
     }
