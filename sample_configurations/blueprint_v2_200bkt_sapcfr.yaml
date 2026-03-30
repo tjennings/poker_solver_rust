@@ -44,7 +44,7 @@ training:
   prune_after_iterations: 100000000
   prune_threshold: -3000
   prune_streets: [flop, turn]
-  regret_floor: -3100
+  regret_floor: -310000
   lcfr_discount_interval: 300000000
   batch_size: 4000
   #purify_threshold: 0.03
