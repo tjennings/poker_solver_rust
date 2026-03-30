@@ -96,6 +96,13 @@ impl BlueprintTuiApp {
 
     /// Sample iteration counter, compute delta, update sparkline histories.
     pub fn tick(&mut self) {
+        // Check for config reload state from the trainer.
+        if let Some(state) = self.metrics.reloaded_tui_state.lock().unwrap().take() {
+            self.scenarios = state.scenarios;
+            self.audit_panel = state.audit_panel;
+            self.active_tab = 0;
+        }
+
         let sparkline_max = self.telemetry_config.sparkline_window.min(SPARKLINE_HISTORY);
 
         // Throughput
@@ -544,9 +551,9 @@ impl BlueprintTuiApp {
             .as_ref()
             .is_some_and(|p| !p.metas.is_empty())
         {
-            "[p]ause [s]napshot [\u{2190}/\u{2192}]scenario [\u{2191}/\u{2193}]audit [q]uit"
+            "[p]ause [r]efresh [s]napshot [c]onfig \u{2190}/\u{2192} scenario \u{2191}/\u{2193} audit [q]uit"
         } else {
-            "[p]ause [s]napshot [\u{2190}/\u{2192}]tab [q]uit"
+            "[p]ause [r]efresh [s]napshot [c]onfig \u{2190}/\u{2192} tab [q]uit"
         };
         frame.render_widget(
             Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -921,6 +928,121 @@ mod tests {
             iteration: 0,
         });
         terminal.draw(|frame| app.render(frame)).unwrap();
+    }
+
+    #[timed_test(10)]
+    fn tick_consumes_reloaded_tui_state() {
+        let metrics = make_metrics();
+        let scenarios = vec![make_scenario("Old")];
+        let mut app = BlueprintTuiApp::new(
+            Arc::clone(&metrics),
+            scenarios,
+            TelemetryConfig::default(),
+        );
+        assert_eq!(app.scenarios.len(), 1);
+        assert_eq!(app.scenarios[0].name, "Old");
+
+        // Push reloaded state via metrics.
+        let new_scenarios = vec![make_scenario("New1"), make_scenario("New2")];
+        let state = crate::blueprint_tui_metrics::ReloadedTuiState {
+            scenarios: new_scenarios,
+            audit_panel: None,
+        };
+        *metrics.reloaded_tui_state.lock().unwrap() = Some(state);
+
+        app.tick();
+
+        assert_eq!(app.scenarios.len(), 2);
+        assert_eq!(app.scenarios[0].name, "New1");
+        assert_eq!(app.scenarios[1].name, "New2");
+        assert_eq!(app.active_tab, 0);
+    }
+
+    #[timed_test(10)]
+    fn tick_reloaded_state_resets_active_tab() {
+        let metrics = make_metrics();
+        let scenarios = vec![make_scenario("A"), make_scenario("B")];
+        let mut app = BlueprintTuiApp::new(
+            Arc::clone(&metrics),
+            scenarios,
+            TelemetryConfig::default(),
+        );
+        app.active_tab = 1;
+
+        let state = crate::blueprint_tui_metrics::ReloadedTuiState {
+            scenarios: vec![make_scenario("X")],
+            audit_panel: None,
+        };
+        *metrics.reloaded_tui_state.lock().unwrap() = Some(state);
+
+        app.tick();
+
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.scenarios.len(), 1);
+    }
+
+    #[timed_test(10)]
+    fn tick_reloaded_state_swaps_audit_panel() {
+        let metrics = make_metrics();
+        let mut app = BlueprintTuiApp::new(
+            Arc::clone(&metrics),
+            vec![],
+            TelemetryConfig::default(),
+        );
+        assert!(app.audit_panel.is_none());
+
+        let state = crate::blueprint_tui_metrics::ReloadedTuiState {
+            scenarios: vec![],
+            audit_panel: Some(crate::blueprint_tui_audit_widget::AuditPanelState {
+                metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
+                    name: "reloaded".to_string(),
+                    spot: String::new(),
+                    hand: "AKo".to_string(),
+                    player: crate::blueprint_tui_config::PlayerLabel::Sb,
+                    bucket_trail: vec![],
+                    action_labels: vec!["fold".into()],
+                    error: None,
+                }],
+                snapshots: vec![crate::blueprint_tui_audit::AuditSnapshot {
+                    regrets: vec![0.0],
+                    deltas: vec![0.0],
+                    trends: vec![crate::blueprint_tui_audit::Trend::Flat],
+                    strategy: vec![1.0],
+                    avg_strategy: vec![1.0],
+                }],
+                active_tab: 0,
+                iteration: 0,
+            }),
+        };
+        *metrics.reloaded_tui_state.lock().unwrap() = Some(state);
+
+        app.tick();
+
+        assert!(app.audit_panel.is_some());
+        assert_eq!(app.audit_panel.as_ref().unwrap().metas[0].name, "reloaded");
+    }
+
+    #[timed_test(10)]
+    fn hotkey_text_includes_config_and_refresh() {
+        let metrics = make_metrics();
+        let app = BlueprintTuiApp::new(
+            metrics,
+            vec![],
+            TelemetryConfig::default(),
+        );
+        // Render and check the hotkey bar contains [c]onfig and [r]efresh
+        let backend = ratatui::backend::TestBackend::new(100, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        // Extract the last line (hotkeys bar)
+        let buf = terminal.backend().buffer().clone();
+        let last_row = buf.area().height - 1;
+        let mut hotkey_line = String::new();
+        for x in 0..buf.area().width {
+            hotkey_line.push(buf[(x, last_row)].symbol().chars().next().unwrap_or(' '));
+        }
+        assert!(hotkey_line.contains("[c]onfig"), "hotkey bar missing [c]onfig: {hotkey_line}");
+        assert!(hotkey_line.contains("[r]efresh"), "hotkey bar missing [r]efresh: {hotkey_line}");
     }
 
     #[timed_test(10)]
