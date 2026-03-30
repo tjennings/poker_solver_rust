@@ -14,7 +14,7 @@
 
 use std::error::Error;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -433,6 +433,32 @@ impl BlueprintTrainer {
             self.config.clustering.river.buckets,
         ];
         self.storage = BlueprintStorage::load_regrets(&regrets_path, &self.tree, bucket_counts)?;
+
+        // Re-apply settings lost by load_regrets (which creates fresh storage).
+        if let Some(floor) = self.config.training.regret_floor {
+            self.storage.regret_floor = floor * super::storage::REGRET_SCALE as i64;
+        }
+        let optimizer: Arc<dyn CfrOptimizer> = if self.config.training.optimizer == "sapcfr+" {
+            Arc::new(SapcfrPlusOptimizer {
+                alpha: self.config.training.dcfr_alpha,
+                gamma: self.config.training.dcfr_gamma,
+                eta: self.config.training.sapcfr_eta,
+            })
+        } else {
+            Arc::new(DcfrOptimizer {
+                alpha: self.config.training.dcfr_alpha,
+                beta: self.config.training.dcfr_beta,
+                gamma: self.config.training.dcfr_gamma,
+            })
+        };
+        if optimizer.needs_predictions() {
+            self.storage.enable_predictions();
+        }
+        self.storage.set_optimizer(optimizer);
+        if self.config.training.use_baselines {
+            let total = self.storage.regrets.len();
+            self.storage.baselines = Some((0..total).map(|_| AtomicI64::new(0)).collect());
+        }
 
         // Load metadata for iteration count and elapsed time.
         let meta_path = snapshot_dir.join("metadata.json");
