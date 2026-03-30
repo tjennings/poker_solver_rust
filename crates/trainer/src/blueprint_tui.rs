@@ -655,6 +655,7 @@ fn run_tui_inner(
                 }
                 KeyCode::Char('p') => metrics.toggle_pause(),
                 KeyCode::Char('s') => metrics.request_snapshot(),
+                KeyCode::Char('c') => metrics.request_config_reload(),
                 _ => {}
             }
         }

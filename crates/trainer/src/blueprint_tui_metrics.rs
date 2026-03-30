@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::blueprint_tui::ResolvedScenario;
 use crate::blueprint_tui_audit::AuditSnapshot;
+use crate::blueprint_tui_audit_widget::AuditPanelState;
 use crate::blueprint_tui_widgets::CellStrategy;
 
 /// Maximum number of monitored scenarios.
@@ -17,6 +19,12 @@ pub struct RandomScenarioState {
     pub grid: [[CellStrategy; 13]; 13],
     pub board_display: String,
     pub street_label: String,
+}
+
+/// State pushed from the trainer to the TUI after a config reload.
+pub struct ReloadedTuiState {
+    pub scenarios: Vec<ResolvedScenario>,
+    pub audit_panel: Option<AuditPanelState>,
 }
 
 /// Shared state bridging the Blueprint V2 training thread and the TUI render
@@ -36,6 +44,10 @@ pub struct BlueprintTuiMetrics {
     pub paused: Arc<AtomicBool>,
     pub quit_requested: Arc<AtomicBool>,
     pub snapshot_trigger: Arc<AtomicBool>,
+    pub config_reload_trigger: Arc<AtomicBool>,
+
+    /// Reloaded TUI state pushed by the trainer after a config reload.
+    pub reloaded_tui_state: Mutex<Option<ReloadedTuiState>>,
 
     // --- infrequent bulk data (behind Mutex) ---
     pub strategy_snapshots: Mutex<Vec<Vec<f64>>>,
@@ -80,6 +92,8 @@ impl BlueprintTuiMetrics {
             paused: Arc::new(AtomicBool::new(false)),
             quit_requested: Arc::new(AtomicBool::new(false)),
             snapshot_trigger: Arc::new(AtomicBool::new(false)),
+            config_reload_trigger: Arc::new(AtomicBool::new(false)),
+            reloaded_tui_state: Mutex::new(None),
 
             strategy_snapshots: Mutex::new(snapshots),
             prev_strategy_snapshots: Mutex::new(prev_snapshots),
@@ -107,6 +121,10 @@ impl BlueprintTuiMetrics {
 
     pub fn request_snapshot(&self) {
         self.snapshot_trigger.store(true, Ordering::Relaxed);
+    }
+
+    pub fn request_config_reload(&self) {
+        self.config_reload_trigger.store(true, Ordering::Relaxed);
     }
 
     /// Consume the snapshot trigger, returning `true` if it was set.
@@ -327,6 +345,45 @@ mod tests {
         m.update_scenario_grid(0, grid);
         let grids = m.strategy_grids.lock().unwrap();
         assert!(grids[0].is_some());
+    }
+
+    #[timed_test(10)]
+    fn config_reload_trigger_initial_state() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        // Not set initially.
+        assert!(!m.config_reload_trigger.load(Ordering::Relaxed));
+    }
+
+    #[timed_test(10)]
+    fn config_reload_request_and_consume() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        m.request_config_reload();
+        assert!(m.config_reload_trigger.load(Ordering::Relaxed));
+        // Consuming via swap.
+        assert!(m.config_reload_trigger.swap(false, Ordering::Relaxed));
+        // Second read is false.
+        assert!(!m.config_reload_trigger.load(Ordering::Relaxed));
+    }
+
+    #[timed_test(10)]
+    fn reloaded_tui_state_initially_none() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        let state = m.reloaded_tui_state.lock().unwrap();
+        assert!(state.is_none());
+    }
+
+    #[timed_test(10)]
+    fn reloaded_tui_state_push_and_take() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        let state = ReloadedTuiState {
+            scenarios: vec![],
+            audit_panel: None,
+        };
+        *m.reloaded_tui_state.lock().unwrap() = Some(state);
+        let taken = m.reloaded_tui_state.lock().unwrap().take();
+        assert!(taken.is_some());
+        // Second take is None.
+        assert!(m.reloaded_tui_state.lock().unwrap().is_none());
     }
 
     #[timed_test(10)]
