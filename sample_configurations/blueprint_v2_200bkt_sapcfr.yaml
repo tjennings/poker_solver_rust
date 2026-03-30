@@ -1,6 +1,6 @@
 # Blueprint V2 Config — 100BB HU, 200 buckets, SAPCFR+ optimizer + VR-MCCFR baselines
 game:
-  name: "1000_dcfr_v1"
+  name: "100bb 200bkt skip preflop prune"
   players: 2
   stack_depth: 200
   small_blind: 1
@@ -11,12 +11,12 @@ clustering:
   preflop:
     buckets: 169
   flop:
-    buckets: 1000
+    buckets: 200
   turn:
-    buckets: 1000
+    buckets: 200
     sample_boards: 16432
   river:
-    buckets: 1000
+    buckets: 200
     sample_boards: 500000
 
 action_abstraction:
@@ -38,12 +38,13 @@ action_abstraction:
     - [0.33, 0.67, 1.0, 2.0]
 
 training:
-  cluster_path: "./local_data/buckets/1k_v3"
+  cluster_path: "./local_data/buckets/200_v1"
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 300000000
   prune_after_iterations: 100000000
-  prune_threshold: -200
-  prune_streets: [flop, turn, river]
+  prune_threshold: -3000
+  prune_streets: [flop, turn]
+  regret_floor: -3100
   lcfr_discount_interval: 300000000
   batch_size: 4000
   #purify_threshold: 0.03
@@ -65,7 +66,7 @@ snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/1000_100bb_dcfr_v1"
+  output_dir: "./local_data/blueprints/200_100bb_no_prune_preflop_v1"
 
 tui:
   enabled: true
@@ -138,4 +139,4 @@ tui:
   random_scenario:
     enabled: true
     hold_minutes: 3
-    pool: ["preflop", "flop", "turn", "river"]
+    pool: ["turn", "river"]

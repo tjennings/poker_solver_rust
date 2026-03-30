@@ -208,6 +208,15 @@ pub struct BlueprintTrainer {
     // --- Regret audit ---
     /// Called at strategy-refresh interval to update regret audit state.
     pub on_audit_refresh: Option<Box<dyn FnMut(&BlueprintStorage) + Send>>,
+
+    // --- Config reload ---
+    /// One-shot trigger: the TUI sets this to request a config reload.
+    pub config_reload_trigger: Arc<AtomicBool>,
+    /// Callback invoked when config reload is triggered.
+    pub on_config_reload: Option<Box<dyn FnMut(&GameTree, &BlueprintStorage) + Send>>,
+    /// After a config reload, the callback stores new node indices here
+    /// so the trainer can update `scenario_node_indices` and `scenario_ev_tracker`.
+    pub reloaded_node_indices: Arc<std::sync::Mutex<Option<Vec<u32>>>>,
 }
 
 impl BlueprintTrainer {
@@ -358,6 +367,9 @@ impl BlueprintTrainer {
             random_scenario_hold_minutes: 3,
             last_random_scenario_min: 0,
             on_audit_refresh: None,
+            config_reload_trigger: Arc::new(AtomicBool::new(false)),
+            on_config_reload: None,
+            reloaded_node_indices: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -690,6 +702,18 @@ impl BlueprintTrainer {
 
         if print_due {
             self.print_metrics();
+        }
+
+        // Config reload: TUI-triggered.
+        if self.config_reload_trigger.swap(false, Ordering::Relaxed) {
+            if let Some(ref mut reload_fn) = self.on_config_reload {
+                reload_fn(&self.tree, &self.storage);
+            }
+            // Update scenario tracking if the callback provided new indices.
+            if let Some(new_indices) = self.reloaded_node_indices.lock().unwrap().take() {
+                self.scenario_node_indices = new_indices.clone();
+                self.scenario_ev_tracker.set_nodes(new_indices);
+            }
         }
 
         // Snapshot: either timed or TUI-triggered.
@@ -1284,6 +1308,52 @@ mod tests {
         let trainer = BlueprintTrainer::new(config);
         assert_eq!(trainer.iterations, 0);
         assert!(!trainer.storage.regrets.is_empty());
+    }
+
+    #[test]
+    fn config_reload_trigger_default_false() {
+        let config = toy_config();
+        let trainer = BlueprintTrainer::new(config);
+        assert!(!trainer.config_reload_trigger.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn on_config_reload_default_none() {
+        let config = toy_config();
+        let trainer = BlueprintTrainer::new(config);
+        assert!(trainer.on_config_reload.is_none());
+    }
+
+    #[test]
+    fn config_reload_trigger_fires_callback() {
+        use std::sync::atomic::AtomicBool;
+        let config = toy_config();
+        let mut trainer = toy_trainer(config);
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = Arc::clone(&called);
+        trainer.on_config_reload = Some(Box::new(move |_tree, _storage| {
+            called_clone.store(true, Ordering::Relaxed);
+        }));
+        // Set trigger
+        trainer.config_reload_trigger.store(true, Ordering::Relaxed);
+        // check_timed_actions should fire the callback and clear the trigger
+        let _ = trainer.check_timed_actions();
+        assert!(called.load(Ordering::Relaxed));
+        assert!(!trainer.config_reload_trigger.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn config_reload_updates_scenario_node_indices() {
+        let config = toy_config();
+        let mut trainer = toy_trainer(config);
+        let new_indices = vec![42u32, 7u32];
+        let shared = Arc::clone(&trainer.reloaded_node_indices);
+        trainer.on_config_reload = Some(Box::new(move |_tree, _storage| {
+            *shared.lock().unwrap() = Some(vec![42, 7]);
+        }));
+        trainer.config_reload_trigger.store(true, Ordering::Relaxed);
+        let _ = trainer.check_timed_actions();
+        assert_eq!(trainer.scenario_node_indices, new_indices);
     }
 
     #[test]

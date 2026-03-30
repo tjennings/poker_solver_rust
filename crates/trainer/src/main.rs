@@ -3,6 +3,7 @@ mod blueprint_tui_audit;
 mod blueprint_tui_audit_widget;
 mod blueprint_tui_config;
 mod blueprint_tui_metrics;
+mod blueprint_tui_resolve;
 mod blueprint_tui_scenarios;
 mod blueprint_tui_widgets;
 mod inspect_spot;
@@ -14,7 +15,7 @@ mod validation_spots;
 
 use std::error::Error;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -278,96 +279,29 @@ fn main() -> Result<(), Box<dyn Error>> {
                 trainer.strategy_refresh_trigger = Arc::clone(&metrics.strategy_refresh_trigger);
 
                 // Resolve scenarios using spot notation.
-                let (scenarios, boards_for_refresh): (Vec<blueprint_tui::ResolvedScenario>, Vec<Vec<poker_solver_core::poker::Card>>) = tui_config
-                    .scenarios
-                    .iter()
-                    .map(|sc| {
-                        let (node_idx, board, error_message) = match blueprint_tui_scenarios::resolve_spot(
-                            &trainer.tree,
-                            &sc.spot,
-                        ) {
-                            Some((idx, board)) => (idx, board, None),
-                            None => {
-                                let msg = format!("Spot failed to resolve: {}", sc.spot);
-                                eprintln!("WARNING: scenario '{}': {msg}", sc.name);
-                                (trainer.tree.root, vec![], Some(msg))
-                            }
-                        };
-                        let grid = blueprint_tui_scenarios::extract_strategy_grid(
-                            &trainer.tree,
-                            &trainer.storage,
-                            node_idx,
-                            &board,
-                            None,
-                        );
-                        let street_label = match &trainer.tree.nodes[node_idx as usize] {
-                            poker_solver_core::blueprint_v2::game_tree::GameNode::Decision { street, .. } => {
-                                format!("{street:?}")
-                            }
-                            _ => "Preflop".to_string(),
-                        };
-                        let scenario = blueprint_tui::ResolvedScenario {
-                            name: sc.name.clone(),
-                            node_idx,
-                            grid: blueprint_tui_widgets::HandGridState {
-                                cells: grid,
-                                prev_cells: None,
-                                scenario_name: sc.name.clone(),
-                                action_path: vec![sc.spot.clone()],
-                                board_display: if board.is_empty() {
-                                    None
-                                } else {
-                                    Some(board.iter().map(|c| format!("{c}")).collect::<Vec<_>>().join(" "))
-                                },
-                                cluster_id: None,
-                                street_label,
-                                iteration_at_snapshot: 0,
-                                error_message,
-                            },
-                        };
-                        (scenario, board)
-                    })
-                    .unzip();
+                let resolved = blueprint_tui_resolve::resolve_scenarios(
+                    &trainer.tree,
+                    &trainer.storage,
+                    &tui_config.scenarios,
+                );
+                let scenarios = resolved.scenarios;
+                let shared_boards: Arc<RwLock<Vec<Vec<poker_solver_core::poker::Card>>>> =
+                    Arc::new(RwLock::new(resolved.boards));
 
                 // Resolve regret audits.
-                let (audit_metas, mut resolved_audits): (Vec<_>, Vec<_>) = tui_config
-                    .regret_audits
-                    .iter()
-                    .map(|ac| {
-                        let audit = blueprint_tui_audit::resolve_regret_audit(
-                            &trainer.tree,
-                            &trainer.storage,
-                            &ac.name,
-                            &ac.spot,
-                            &ac.hand,
-                            ac.player,
-                            tui_config.telemetry.sparkline_window,
-                        );
-                        let meta = blueprint_tui_audit_widget::AuditMeta {
-                            name: ac.name.clone(),
-                            spot: ac.spot.clone(),
-                            hand: ac.hand.clone(),
-                            player: ac.player,
-                            bucket_trail: audit.bucket_trail.clone(),
-                            action_labels: audit.action_labels.clone(),
-                            error: audit.error.clone(),
-                        };
-                        (meta, audit)
-                    })
-                    .unzip();
+                let resolved_audit = blueprint_tui_resolve::resolve_audits(
+                    &trainer.tree,
+                    &trainer.storage,
+                    &tui_config.regret_audits,
+                    tui_config.telemetry.sparkline_window,
+                );
+                let shared_audits: Arc<RwLock<Vec<blueprint_tui_audit::ResolvedRegretAudit>>> =
+                    Arc::new(RwLock::new(resolved_audit.audits));
+                let audit_panel = resolved_audit.panel;
 
-                let audit_panel = if !audit_metas.is_empty() {
-                    let initial_snapshots: Vec<_> =
-                        resolved_audits.iter().map(|a| a.snapshot()).collect();
-                    Some(blueprint_tui_audit_widget::AuditPanelState {
-                        metas: audit_metas,
-                        snapshots: initial_snapshots,
-                        active_tab: 0,
-                        iteration: 0,
-                    })
-                } else {
-                    None
-                };
+                // Wire config reload trigger.
+                trainer.config_reload_trigger =
+                    Arc::clone(&metrics.config_reload_trigger);
 
                 // Wire strategy refresh callback from trainer to TUI metrics.
                 let scenarios_node_indices: Vec<u32> =
@@ -377,14 +311,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 trainer.strategy_refresh_interval_secs =
                     tui_config.telemetry.strategy_delta_interval_seconds;
 
+                let boards_for_refresh = Arc::clone(&shared_boards);
                 let metrics_for_refresh = Arc::clone(&metrics);
                 trainer.on_strategy_refresh =
                     Some(Box::new(move |scenario_idx, node_idx, storage, tree, hand_evs| {
-                        let board = &boards_for_refresh[scenario_idx];
-                        let grid = blueprint_tui_scenarios::extract_strategy_grid(
-                            tree, storage, node_idx, board, Some(hand_evs),
-                        );
-                        metrics_for_refresh.update_scenario_grid(scenario_idx, grid);
+                        let boards = boards_for_refresh.read().unwrap();
+                        if scenario_idx < boards.len() {
+                            let grid = blueprint_tui_scenarios::extract_strategy_grid(
+                                tree, storage, node_idx, &boards[scenario_idx], Some(hand_evs),
+                            );
+                            metrics_for_refresh.update_scenario_grid(scenario_idx, grid);
+                        }
                     }));
 
                 let metrics_for_delta = Arc::clone(&metrics);
@@ -418,15 +355,62 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }));
 
                 // Wire audit refresh callback.
-                if !resolved_audits.is_empty() {
+                {
+                    let audits_for_refresh = Arc::clone(&shared_audits);
                     let metrics_for_audit = Arc::clone(&metrics);
                     trainer.on_audit_refresh = Some(Box::new(move |storage| {
-                        for audit in &mut resolved_audits {
+                        let mut audits = audits_for_refresh.write().unwrap();
+                        if audits.is_empty() {
+                            return;
+                        }
+                        for audit in audits.iter_mut() {
                             audit.tick(storage);
                         }
                         let snapshots: Vec<_> =
-                            resolved_audits.iter().map(|a| a.snapshot()).collect();
+                            audits.iter().map(|a| a.snapshot()).collect();
                         metrics_for_audit.update_regret_audits(snapshots);
+                    }));
+                }
+
+                // Wire config reload callback.
+                {
+                    let config_path_for_reload = config.clone();
+                    let shared_boards_for_reload = Arc::clone(&shared_boards);
+                    let shared_audits_for_reload = Arc::clone(&shared_audits);
+                    let metrics_for_reload = Arc::clone(&metrics);
+                    let reloaded_indices = Arc::clone(&trainer.reloaded_node_indices);
+                    let sparkline_window = tui_config.telemetry.sparkline_window;
+                    trainer.on_config_reload = Some(Box::new(move |tree, storage| {
+                        let Ok(yaml) = std::fs::read_to_string(&config_path_for_reload) else {
+                            return;
+                        };
+                        let new_tui_config = blueprint_tui_config::parse_tui_config(&yaml);
+
+                        // Re-resolve scenarios.
+                        let resolved = blueprint_tui_resolve::resolve_scenarios(
+                            tree, storage, &new_tui_config.scenarios,
+                        );
+
+                        // Re-resolve audits.
+                        let audits = blueprint_tui_resolve::resolve_audits(
+                            tree, storage, &new_tui_config.regret_audits, sparkline_window,
+                        );
+
+                        // Swap shared data for callbacks.
+                        *shared_boards_for_reload.write().unwrap() = resolved.boards;
+                        *shared_audits_for_reload.write().unwrap() = audits.audits;
+
+                        // Provide new node indices so the trainer updates tracking.
+                        let new_indices: Vec<u32> =
+                            resolved.scenarios.iter().map(|s| s.node_idx).collect();
+                        *reloaded_indices.lock().unwrap() = Some(new_indices);
+
+                        // Push new UI state to TUI.
+                        let state = blueprint_tui_metrics::ReloadedTuiState {
+                            scenarios: resolved.scenarios,
+                            audit_panel: audits.panel,
+                        };
+                        *metrics_for_reload.reloaded_tui_state.lock().unwrap() = Some(state);
                     }));
                 }
 
