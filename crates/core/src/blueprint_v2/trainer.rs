@@ -493,6 +493,11 @@ impl BlueprintTrainer {
 
         self.snapshot_count = snapshot_num + 1;
 
+        // Prevent spurious immediate discount: align last_discount_time
+        // with the restored iteration count so the next discount waits
+        // a full interval.
+        self.last_discount_time = self.iterations;
+
         // Load full-tree EV tracker if available.
         let hand_ev_path = snapshot_dir.join("hand_ev.bin");
         if hand_ev_path.exists() {
