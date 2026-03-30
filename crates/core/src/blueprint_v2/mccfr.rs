@@ -845,10 +845,18 @@ pub fn traverse_best_response(
                         best = v;
                     }
                 }
-                // Accumulate BR-derived regrets into prediction buffer.
+                // Accumulate BR-derived predictions into prediction buffer.
+                // Use strategy-weighted node value as baseline so predictions
+                // are centered around zero: positive for actions BR prefers
+                // over the current strategy, negative for actions it avoids.
                 if let Some(ps) = predict_storage {
+                    let strategy = storage.average_strategy(node_idx, bucket);
+                    let mut node_value = 0.0f64;
                     for (a, _) in children.iter().enumerate() {
-                        let delta = action_values[a] - best;
+                        node_value += strategy[a] * action_values[a];
+                    }
+                    for (a, _) in children.iter().enumerate() {
+                        let delta = action_values[a] - node_value;
                         let delta_scaled = (delta * super::storage::REGRET_SCALE) as i32;
                         ps.add_prediction(node_idx, bucket, a, delta_scaled);
                     }
@@ -2673,6 +2681,23 @@ mod tests {
             .iter()
             .any(|a| a.load(std::sync::atomic::Ordering::Relaxed) != 0);
         assert!(any_nonzero, "predictions should be populated by BR traversal");
+
+        // With strategy-weighted baseline, predictions should have both
+        // positive (BR-preferred actions) and negative (BR-avoided actions).
+        let has_positive = preds
+            .iter()
+            .any(|a| a.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        let has_negative = preds
+            .iter()
+            .any(|a| a.load(std::sync::atomic::Ordering::Relaxed) < 0);
+        assert!(
+            has_positive,
+            "predictions should have positive values (BR-preferred actions)"
+        );
+        assert!(
+            has_negative,
+            "predictions should have negative values (BR-avoided actions)"
+        );
     }
 
     #[test]
