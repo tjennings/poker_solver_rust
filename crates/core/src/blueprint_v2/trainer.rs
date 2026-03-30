@@ -206,6 +206,15 @@ pub struct BlueprintTrainer {
     // --- Regret audit ---
     /// Called at strategy-refresh interval to update regret audit state.
     pub on_audit_refresh: Option<Box<dyn FnMut(&BlueprintStorage) + Send>>,
+
+    // --- Config reload ---
+    /// One-shot trigger: the TUI sets this to request a config reload.
+    pub config_reload_trigger: Arc<AtomicBool>,
+    /// Callback invoked when config reload is triggered.
+    pub on_config_reload: Option<Box<dyn FnMut(&GameTree, &BlueprintStorage) + Send>>,
+    /// After a config reload, the callback stores new node indices here
+    /// so the trainer can update `scenario_node_indices` and `scenario_ev_tracker`.
+    pub reloaded_node_indices: Arc<std::sync::Mutex<Option<Vec<u32>>>>,
 }
 
 impl BlueprintTrainer {
@@ -350,6 +359,9 @@ impl BlueprintTrainer {
             random_scenario_hold_minutes: 3,
             last_random_scenario_min: 0,
             on_audit_refresh: None,
+            config_reload_trigger: Arc::new(AtomicBool::new(false)),
+            on_config_reload: None,
+            reloaded_node_indices: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1279,6 +1291,20 @@ mod tests {
         let trainer = BlueprintTrainer::new(config);
         assert_eq!(trainer.iterations, 0);
         assert!(!trainer.storage.regrets.is_empty());
+    }
+
+    #[test]
+    fn config_reload_trigger_default_false() {
+        let config = toy_config();
+        let trainer = BlueprintTrainer::new(config);
+        assert!(!trainer.config_reload_trigger.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn on_config_reload_default_none() {
+        let config = toy_config();
+        let trainer = BlueprintTrainer::new(config);
+        assert!(trainer.on_config_reload.is_none());
     }
 
     #[test]

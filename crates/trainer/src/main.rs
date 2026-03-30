@@ -15,7 +15,7 @@ mod validation_spots;
 
 use std::error::Error;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -284,7 +284,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     &tui_config.scenarios,
                 );
                 let scenarios = resolved.scenarios;
-                let boards_for_refresh = resolved.boards;
+                let shared_boards: Arc<RwLock<Vec<Vec<poker_solver_core::poker::Card>>>> =
+                    Arc::new(RwLock::new(resolved.boards));
 
                 // Resolve regret audits.
                 let resolved_audit = blueprint_tui_resolve::resolve_audits(
@@ -293,8 +294,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     &tui_config.regret_audits,
                     tui_config.telemetry.sparkline_window,
                 );
-                let mut resolved_audits = resolved_audit.audits;
+                let shared_audits: Arc<RwLock<Vec<blueprint_tui_audit::ResolvedRegretAudit>>> =
+                    Arc::new(RwLock::new(resolved_audit.audits));
                 let audit_panel = resolved_audit.panel;
+
+                // Wire config reload trigger.
+                trainer.config_reload_trigger =
+                    Arc::clone(&metrics.config_reload_trigger);
 
                 // Wire strategy refresh callback from trainer to TUI metrics.
                 let scenarios_node_indices: Vec<u32> =
@@ -304,14 +310,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 trainer.strategy_refresh_interval_secs =
                     tui_config.telemetry.strategy_delta_interval_seconds;
 
+                let boards_for_refresh = Arc::clone(&shared_boards);
                 let metrics_for_refresh = Arc::clone(&metrics);
                 trainer.on_strategy_refresh =
                     Some(Box::new(move |scenario_idx, node_idx, storage, tree, hand_evs| {
-                        let board = &boards_for_refresh[scenario_idx];
-                        let grid = blueprint_tui_scenarios::extract_strategy_grid(
-                            tree, storage, node_idx, board, Some(hand_evs),
-                        );
-                        metrics_for_refresh.update_scenario_grid(scenario_idx, grid);
+                        let boards = boards_for_refresh.read().unwrap();
+                        if scenario_idx < boards.len() {
+                            let grid = blueprint_tui_scenarios::extract_strategy_grid(
+                                tree, storage, node_idx, &boards[scenario_idx], Some(hand_evs),
+                            );
+                            metrics_for_refresh.update_scenario_grid(scenario_idx, grid);
+                        }
                     }));
 
                 let metrics_for_delta = Arc::clone(&metrics);
@@ -345,14 +354,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }));
 
                 // Wire audit refresh callback.
-                if !resolved_audits.is_empty() {
+                {
+                    let audits_for_refresh = Arc::clone(&shared_audits);
                     let metrics_for_audit = Arc::clone(&metrics);
                     trainer.on_audit_refresh = Some(Box::new(move |storage| {
-                        for audit in &mut resolved_audits {
+                        let mut audits = audits_for_refresh.write().unwrap();
+                        if audits.is_empty() {
+                            return;
+                        }
+                        for audit in audits.iter_mut() {
                             audit.tick(storage);
                         }
                         let snapshots: Vec<_> =
-                            resolved_audits.iter().map(|a| a.snapshot()).collect();
+                            audits.iter().map(|a| a.snapshot()).collect();
                         metrics_for_audit.update_regret_audits(snapshots);
                     }));
                 }
