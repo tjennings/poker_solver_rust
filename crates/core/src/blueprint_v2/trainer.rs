@@ -436,7 +436,20 @@ impl BlueprintTrainer {
 
         // Re-apply settings lost by load_regrets (which creates fresh storage).
         if let Some(floor) = self.config.training.regret_floor {
-            self.storage.regret_floor = floor * super::storage::REGRET_SCALE as i64;
+            let scaled_floor = floor * super::storage::REGRET_SCALE as i64;
+            self.storage.regret_floor = scaled_floor;
+            // Retroactively clamp loaded regrets that exceed the floor.
+            let mut clamped = 0u64;
+            for atom in &self.storage.regrets {
+                let v = atom.load(Ordering::Relaxed);
+                if v < scaled_floor {
+                    atom.store(scaled_floor, Ordering::Relaxed);
+                    clamped += 1;
+                }
+            }
+            if clamped > 0 {
+                eprintln!("  Clamped {clamped} regret values to floor ({floor} chips)");
+            }
         }
         let optimizer: Arc<dyn CfrOptimizer> = if self.config.training.optimizer == "sapcfr+" {
             Arc::new(SapcfrPlusOptimizer {
