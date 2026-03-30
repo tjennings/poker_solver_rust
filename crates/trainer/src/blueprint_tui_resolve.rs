@@ -22,6 +22,7 @@ pub struct ResolvedScenarios {
 
 /// Result of resolving audit configs against a game tree.
 pub struct ResolvedAudits {
+    #[allow(dead_code)]
     pub metas: Vec<blueprint_tui_audit_widget::AuditMeta>,
     pub audits: Vec<blueprint_tui_audit::ResolvedRegretAudit>,
     pub panel: Option<blueprint_tui_audit_widget::AuditPanelState>,
