@@ -69,6 +69,7 @@ pub struct BlueprintTuiMetrics {
     pub max_regret_history: Mutex<Vec<f64>>,
     pub avg_pos_regret_history: Mutex<Vec<f64>>,
     pub prune_history: Mutex<Vec<f64>>,
+    pub exploitability_history: Mutex<Vec<f64>>,
 }
 
 impl BlueprintTuiMetrics {
@@ -110,6 +111,7 @@ impl BlueprintTuiMetrics {
             max_regret_history: Mutex::new(Vec::new()),
             avg_pos_regret_history: Mutex::new(Vec::new()),
             prune_history: Mutex::new(Vec::new()),
+            exploitability_history: Mutex::new(Vec::new()),
         }
     }
 
@@ -223,6 +225,12 @@ impl BlueprintTuiMetrics {
     pub fn push_leaf_movement(&self, pct: f64) {
         let mut hist = self.leaf_movement_history.lock().unwrap_or_else(|e| e.into_inner());
         hist.push(pct);
+    }
+
+    /// Push an exploitability sample into the sparkline history.
+    pub fn push_exploitability(&self, val: f64) {
+        let mut hist = self.exploitability_history.lock().unwrap_or_else(|e| e.into_inner());
+        hist.push(val);
     }
 
     /// Push a new random scenario to be picked up by the TUI on its next tick.
@@ -416,5 +424,16 @@ mod tests {
         assert_eq!(taken[0].regrets, vec![1.0, -2.0, 3.0]);
         // Second take should return None.
         assert!(m.take_regret_audits().is_none());
+    }
+
+    #[timed_test(10)]
+    fn push_exploitability_stores_values() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        m.push_exploitability(42.5);
+        m.push_exploitability(38.0);
+        let hist = m.exploitability_history.lock().unwrap();
+        assert_eq!(hist.len(), 2);
+        assert!((hist[0] - 42.5).abs() < 1e-9);
+        assert!((hist[1] - 38.0).abs() < 1e-9);
     }
 }

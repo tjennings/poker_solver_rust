@@ -354,6 +354,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     metrics_for_prune.push_prune_fraction(frac);
                 }));
 
+                let metrics_for_exploit = Arc::clone(&metrics);
+                trainer.on_exploitability = Some(Box::new(move |val| {
+                    metrics_for_exploit.push_exploitability(val);
+                }));
+
                 // Wire audit refresh callback.
                 {
                     let audits_for_refresh = Arc::clone(&shared_audits);

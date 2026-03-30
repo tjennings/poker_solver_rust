@@ -57,6 +57,8 @@ pub struct BlueprintTuiApp {
     avg_pos_regret_history: Vec<u64>,
     // Prune fraction sparkline data (stored as value × 1000 for sparkline)
     prune_history: Vec<u64>,
+    // Exploitability sparkline data (stored as value × 100 for sparkline, in mbb/hand)
+    exploitability_history: Vec<u64>,
     // Random scenario carousel tracking
     has_random_tab: bool,
     // Optional regret audit panel state
@@ -84,6 +86,7 @@ impl BlueprintTuiApp {
             min_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
             avg_pos_regret_history: Vec::with_capacity(SPARKLINE_HISTORY),
             prune_history: Vec::with_capacity(SPARKLINE_HISTORY),
+            exploitability_history: Vec::with_capacity(SPARKLINE_HISTORY),
             has_random_tab: false,
             audit_panel: None,
         }
@@ -225,6 +228,23 @@ impl BlueprintTuiApp {
             hist.clear();
         }
 
+        // Exploitability sparkline: read all new values
+        {
+            let mut hist = self
+                .metrics
+                .exploitability_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for &v in hist.iter() {
+                push_bounded(
+                    &mut self.exploitability_history,
+                    (v * 100.0) as u64,
+                    sparkline_max,
+                );
+            }
+            hist.clear();
+        }
+
         // Strategy grid refresh from trainer
         {
             let mut grids = self
@@ -319,7 +339,7 @@ impl BlueprintTuiApp {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(18), // Metrics area (3 header + 7 sparklines x 2 + 1 spacer)
+                Constraint::Length(20), // Metrics area (3 header + 8 sparklines x 2 + 1 spacer)
                 Constraint::Min(0),    // Strategy grids
                 Constraint::Length(1), // Hotkeys
             ])
@@ -344,6 +364,7 @@ impl BlueprintTuiApp {
                 Constraint::Length(1), // Progress gauge
                 Constraint::Length(1), // Runtime + ETA
                 Constraint::Length(2), // Throughput sparkline
+                Constraint::Length(2), // Exploitability sparkline
                 Constraint::Length(2), // Strategy delta sparkline
                 Constraint::Length(2), // Leaf movement sparkline
                 Constraint::Length(2), // Max positive regret sparkline
@@ -358,12 +379,13 @@ impl BlueprintTuiApp {
         self.render_progress_gauge(frame, sparkline_chunks[1]);
         self.render_runtime(frame, sparkline_chunks[2]);
         self.render_sparkline(frame, sparkline_chunks[3]);
-        self.render_strategy_delta(frame, sparkline_chunks[4]);
-        self.render_leaf_movement(frame, sparkline_chunks[5]);
-        self.render_max_regret(frame, sparkline_chunks[6]);
-        self.render_min_regret(frame, sparkline_chunks[7]);
-        self.render_avg_pos_regret(frame, sparkline_chunks[8]);
-        self.render_prune_sparkline(frame, sparkline_chunks[9]);
+        self.render_exploitability(frame, sparkline_chunks[4]);
+        self.render_strategy_delta(frame, sparkline_chunks[5]);
+        self.render_leaf_movement(frame, sparkline_chunks[6]);
+        self.render_max_regret(frame, sparkline_chunks[7]);
+        self.render_min_regret(frame, sparkline_chunks[8]);
+        self.render_avg_pos_regret(frame, sparkline_chunks[9]);
+        self.render_prune_sparkline(frame, sparkline_chunks[10]);
 
         // Render audit panel if configured.
         if let Some(audit_rect) = audit_area
@@ -456,6 +478,20 @@ impl BlueprintTuiApp {
             .block(Block::default().title(title).borders(Borders::NONE))
             .data(&self.iter_per_sec_history)
             .style(Style::default().fg(Color::Cyan));
+        frame.render_widget(sparkline, area);
+    }
+
+    fn render_exploitability(&self, frame: &mut Frame, area: Rect) {
+        let latest = self
+            .exploitability_history
+            .last()
+            .map(|&v| v as f64 / 100.0)
+            .unwrap_or(0.0);
+        let title = format!("Exploitability: {latest:.1} mbb/hand");
+        let sparkline = Sparkline::default()
+            .block(Block::default().title(title).borders(Borders::NONE))
+            .data(&self.exploitability_history)
+            .style(Style::default().fg(Color::Magenta));
         frame.render_widget(sparkline, area);
     }
 
