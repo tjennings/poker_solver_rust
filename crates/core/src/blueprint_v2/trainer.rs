@@ -14,7 +14,7 @@
 
 use std::error::Error;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -192,7 +192,7 @@ pub struct BlueprintTrainer {
 
     // --- Strategy delta stopping ---
     /// Previous strategy-sum snapshot for delta computation.
-    prev_strategy_sums: Option<Vec<i64>>,
+    prev_strategy_sums: Option<Vec<i32>>,
     /// Most recent strategy delta value.
     pub last_strategy_delta: f64,
     /// Most recent fraction of info sets with max action delta > 0.20.
@@ -257,7 +257,7 @@ impl BlueprintTrainer {
 
         // Apply regret floor if configured (value is in chip units, scale to match stored regrets).
         if let Some(floor) = config.training.regret_floor {
-            storage.regret_floor = floor * super::storage::REGRET_SCALE as i64;
+            storage.regret_floor = (floor as f64 * super::storage::REGRET_SCALE) as i32;
         }
 
         // Create the pluggable optimizer based on config.
@@ -453,7 +453,7 @@ impl BlueprintTrainer {
 
         // Re-apply settings lost by load_regrets (which creates fresh storage).
         if let Some(floor) = self.config.training.regret_floor {
-            let scaled_floor = floor * super::storage::REGRET_SCALE as i64;
+            let scaled_floor = (floor as f64 * super::storage::REGRET_SCALE) as i32;
             self.storage.regret_floor = scaled_floor;
             // Retroactively clamp loaded regrets that exceed the floor.
             let mut clamped = 0u64;
@@ -493,7 +493,7 @@ impl BlueprintTrainer {
         self.storage.set_optimizer(optimizer);
         if self.config.training.use_baselines {
             let total = self.storage.regrets.len();
-            self.storage.baselines = Some((0..total).map(|_| AtomicI64::new(0)).collect());
+            self.storage.baselines = Some((0..total).map(|_| std::sync::atomic::AtomicI32::new(0)).collect());
         }
 
         // Load metadata for iteration count and elapsed time.
@@ -601,8 +601,8 @@ impl BlueprintTrainer {
 
             let prune = self.should_prune();
             // Config prune_threshold is in chip units; scale to match stored regrets.
-            let threshold = i64::from(self.config.training.prune_threshold)
-                * super::storage::REGRET_SCALE as i64;
+            let threshold = (f64::from(self.config.training.prune_threshold)
+                * super::storage::REGRET_SCALE) as i32;
             let prune_streets = self.config.training.prune_street_mask();
 
             let tree = &self.tree;
@@ -1003,11 +1003,11 @@ impl BlueprintTrainer {
             self.storage.regrets.par_iter().for_each(|atom| {
                 let v = atom.load(Ordering::Relaxed);
                 let d = if v >= 0 { d_pos } else { d_neg };
-                atom.store((v as f64 * d) as i64, Ordering::Relaxed);
+                atom.store((v as f64 * d) as i32, Ordering::Relaxed);
             });
             self.storage.strategy_sums.par_iter().for_each(|atom| {
                 let v = atom.load(Ordering::Relaxed);
-                atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
+                atom.store((v as f64 * d_strat) as i32, Ordering::Relaxed);
             });
         }
 
@@ -1127,8 +1127,8 @@ impl BlueprintTrainer {
     #[must_use]
     pub fn prune_fraction(&self) -> f64 {
         // Config prune_threshold is in chip units; scale to match stored regrets.
-        let threshold = i64::from(self.config.training.prune_threshold)
-            * super::storage::REGRET_SCALE as i64;
+        let threshold = (f64::from(self.config.training.prune_threshold)
+            * super::storage::REGRET_SCALE) as i32;
         let total = self.storage.regrets.len() as f64;
         if total == 0.0 {
             return 0.0;
@@ -1663,16 +1663,16 @@ mod tests {
         trainer.apply_lcfr_discount();
 
         // d_pos = 5^1 / (5^1 + 1) = 5/6 ≈ 0.8333
-        // regret: (1000 * 5/6) as i64 = 833
-        let expected_regret = (1000.0 * 5.0 / 6.0) as i64;
+        // regret: (1000 * 5/6) as i32 = 833
+        let expected_regret = (1000.0 * 5.0 / 6.0) as i32;
         assert_eq!(
             trainer.storage.regrets[0].load(Ordering::Relaxed),
             expected_regret,
         );
 
         // d_strat = (5/6)^1 = 5/6 ≈ 0.8333
-        // strategy_sum: (2000 * 5/6) as i64 = 1666
-        let expected_strat = (2000.0 * 5.0 / 6.0) as i64;
+        // strategy_sum: (2000 * 5/6) as i32 = 1666
+        let expected_strat = (2000.0 * 5.0 / 6.0) as i32;
         assert_eq!(
             trainer.storage.strategy_sums[0].load(Ordering::Relaxed),
             expected_strat,
@@ -1697,14 +1697,14 @@ mod tests {
         trainer.apply_lcfr_discount();
 
         // d_pos = 10^1 / (10^1 + 1) = 10/11 ≈ 0.9091
-        let expected_regret = (1000.0 * 10.0 / 11.0) as i64;
+        let expected_regret = (1000.0 * 10.0 / 11.0) as i32;
         assert_eq!(
             trainer.storage.regrets[0].load(Ordering::Relaxed),
             expected_regret,
         );
 
         // d_strat = (10/11)^1 ≈ 0.9091
-        let expected_strat = (2000.0 * 10.0 / 11.0) as i64;
+        let expected_strat = (2000.0 * 10.0 / 11.0) as i32;
         assert_eq!(
             trainer.storage.strategy_sums[0].load(Ordering::Relaxed),
             expected_strat,
@@ -2118,31 +2118,31 @@ mod tests {
     #[timed_test]
     fn prune_threshold_scaling() {
         // prune_threshold is in chip units; prune_fraction() should scale it
-        // by REGRET_SCALE (100,000) before comparing against stored regrets.
+        // by REGRET_SCALE (1,000) before comparing against stored regrets.
         let mut config = toy_config();
         config.training.prune_threshold = -5; // -5 chips
         let trainer = toy_trainer(config);
 
-        let scale = crate::blueprint_v2::storage::REGRET_SCALE as i64; // 100_000
+        let scale = crate::blueprint_v2::storage::REGRET_SCALE as i32; // 1_000
         let n = trainer.storage.regrets.len();
         assert!(n >= 6, "need at least 6 regret slots for this test");
 
-        // Scaled threshold = -5 * 100_000 = -500_000.
-        // Values *below* -500_000 are pruned; values >= -500_000 are not.
+        // Scaled threshold = -5 * 1_000 = -5_000.
+        // Values *below* -5_000 are pruned; values >= -5_000 are not.
         //
         // Set 6 regrets at known scaled values:
-        //   [0] = -600_000  (below threshold, pruned)
-        //   [1] = -500_001  (below threshold, pruned)
-        //   [2] = -500_000  (at threshold, NOT pruned — filter uses strict <)
-        //   [3] = -499_999  (above threshold, NOT pruned)
-        //   [4] =  0        (above threshold, NOT pruned)
-        //   [5] =  300_000  (above threshold, NOT pruned)
-        trainer.storage.regrets[0].store(-600_000, Ordering::Relaxed);
-        trainer.storage.regrets[1].store(-500_001, Ordering::Relaxed);
-        trainer.storage.regrets[2].store(-500_000, Ordering::Relaxed);
-        trainer.storage.regrets[3].store(-499_999, Ordering::Relaxed);
+        //   [0] = -6_000  (below threshold, pruned)
+        //   [1] = -5_001  (below threshold, pruned)
+        //   [2] = -5_000  (at threshold, NOT pruned -- filter uses strict <)
+        //   [3] = -4_999  (above threshold, NOT pruned)
+        //   [4] =  0      (above threshold, NOT pruned)
+        //   [5] =  300 * scale = 300_000  (above threshold, NOT pruned)
+        trainer.storage.regrets[0].store(-6_000, Ordering::Relaxed);
+        trainer.storage.regrets[1].store(-5_001, Ordering::Relaxed);
+        trainer.storage.regrets[2].store(-5_000, Ordering::Relaxed);
+        trainer.storage.regrets[3].store(-4_999, Ordering::Relaxed);
         trainer.storage.regrets[4].store(0, Ordering::Relaxed);
-        trainer.storage.regrets[5].store(300_000 * scale, Ordering::Relaxed);
+        trainer.storage.regrets[5].store(300 * scale, Ordering::Relaxed);
 
         // Remaining regret slots are 0 (default), which is above threshold.
         // Total slots = n, below count = 2 (indices 0 and 1).

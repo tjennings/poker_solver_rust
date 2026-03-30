@@ -648,7 +648,7 @@ pub fn traverse_external(
     traverser: u8,
     node_idx: u32,
     prune: bool,
-    prune_threshold: i64,
+    prune_threshold: i32,
     prune_streets: [bool; 4],
     rng: &mut impl Rng,
     rake_rate: f64,
@@ -848,7 +848,7 @@ pub fn traverse_best_response(
                 if let Some(ps) = predict_storage {
                     for (a, _) in children.iter().enumerate() {
                         let delta = action_values[a] - best;
-                        let delta_scaled = (delta * super::storage::REGRET_SCALE) as i64;
+                        let delta_scaled = (delta * super::storage::REGRET_SCALE) as i32;
                         ps.set_prediction(node_idx, bucket, a, delta_scaled);
                     }
                 }
@@ -885,7 +885,7 @@ fn traverse_traverser(
     children: &[u32],
     num_actions: usize,
     prune: bool,
-    prune_threshold: i64,
+    prune_threshold: i32,
     street: Street,
     prune_streets: [bool; 4],
     rng: &mut impl Rng,
@@ -943,14 +943,14 @@ fn traverse_traverser(
             continue;
         }
         let delta = av - node_value;
-        let delta_scaled = (delta * super::storage::REGRET_SCALE) as i64;
+        let delta_scaled = (delta * super::storage::REGRET_SCALE) as i32;
         storage.add_regret(node_idx, bucket, a, delta_scaled);
         storage.set_prediction(node_idx, bucket, a, delta_scaled);
     }
 
     // Accumulate strategy sums (for computing the average strategy).
     for (a, &s) in strategy.iter().enumerate().take(num_actions) {
-        storage.add_strategy_sum(node_idx, bucket, a, (s * 1000.0) as i64);
+        storage.add_strategy_sum(node_idx, bucket, a, (s * 1000.0) as i32);
     }
 
     // Accumulate EV at tracked scenario nodes.
@@ -1010,7 +1010,7 @@ fn traverse_opponent(
     children: &[u32],
     num_actions: usize,
     prune: bool,
-    prune_threshold: i64,
+    prune_threshold: i32,
     prune_streets: [bool; 4],
     rng: &mut impl Rng,
     rake_rate: f64,

@@ -406,7 +406,7 @@ mod tests {
             assert_eq!(r, 0.0);
         }
         // Simulate regret accumulation (values in scaled units: chip_value * REGRET_SCALE)
-        let scale = poker_solver_core::blueprint_v2::storage::REGRET_SCALE as i64;
+        let scale = poker_solver_core::blueprint_v2::storage::REGRET_SCALE as i32;
         storage.add_regret(audit.node_idx, audit.bucket, 0, 500 * scale);
         storage.add_regret(audit.node_idx, audit.bucket, 1, -300 * scale);
         audit.tick(&storage);
@@ -423,7 +423,7 @@ mod tests {
             &tree, &storage, "AKo", "", "AKo", PlayerLabel::Sb, 10,
         );
         assert!(audit.error.is_none());
-        let scale = poker_solver_core::blueprint_v2::storage::REGRET_SCALE as i64;
+        let scale = poker_solver_core::blueprint_v2::storage::REGRET_SCALE as i32;
         storage.add_regret(audit.node_idx, audit.bucket, 0, 0);
         storage.add_regret(audit.node_idx, audit.bucket, 1, 100 * scale);
         storage.add_regret(audit.node_idx, audit.bucket, 2, 300 * scale);
@@ -442,7 +442,7 @@ mod tests {
             &tree, &storage, "AKo", "", "AKo", PlayerLabel::Sb, 3,
         );
         assert!(audit.error.is_none());
-        let scale = poker_solver_core::blueprint_v2::storage::REGRET_SCALE as i64;
+        let scale = poker_solver_core::blueprint_v2::storage::REGRET_SCALE as i32;
         for _ in 0..3 {
             storage.add_regret(audit.node_idx, audit.bucket, 0, 100 * scale);
             audit.tick(&storage);
@@ -458,7 +458,7 @@ mod tests {
         let mut audit = resolve_regret_audit(
             &tree, &storage, "AKo", "", "AKo", PlayerLabel::Sb, 10,
         );
-        let scale = poker_solver_core::blueprint_v2::storage::REGRET_SCALE as i64;
+        let scale = poker_solver_core::blueprint_v2::storage::REGRET_SCALE as i32;
         storage.add_regret(audit.node_idx, audit.bucket, 0, 100 * scale);
         audit.tick(&storage);
         let snap = audit.snapshot();

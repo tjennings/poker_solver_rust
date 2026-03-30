@@ -5,10 +5,10 @@
 //! to be selected via config.
 
 // Precision loss on cast to f64 is acceptable for action counts and
-// regret values. Truncation from f64 back to i64 is intentional.
+// regret values. Truncation from f64 back to i32 is intentional.
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use rayon::prelude::*;
 
@@ -25,9 +25,9 @@ pub trait CfrOptimizer: Send + Sync {
     /// DCFR ignores it.
     fn apply_discount(
         &self,
-        regrets: &[AtomicI64],
-        strategy_sums: &[AtomicI64],
-        predictions: Option<&[AtomicI64]>,
+        regrets: &[AtomicI32],
+        strategy_sums: &[AtomicI32],
+        predictions: Option<&[AtomicI32]>,
         iteration: u64,
     );
 
@@ -39,8 +39,8 @@ pub trait CfrOptimizer: Send + Sync {
     /// `predictions` is the optional prediction buffer.
     fn current_strategy(
         &self,
-        regrets: &[AtomicI64],
-        predictions: Option<&[AtomicI64]>,
+        regrets: &[AtomicI32],
+        predictions: Option<&[AtomicI32]>,
         offset: usize,
         num_actions: usize,
         out: &mut [f64],
@@ -74,9 +74,9 @@ pub struct DcfrOptimizer {
 impl CfrOptimizer for DcfrOptimizer {
     fn apply_discount(
         &self,
-        regrets: &[AtomicI64],
-        strategy_sums: &[AtomicI64],
-        _predictions: Option<&[AtomicI64]>,
+        regrets: &[AtomicI32],
+        strategy_sums: &[AtomicI32],
+        _predictions: Option<&[AtomicI32]>,
         iteration: u64,
     ) {
         let tf = iteration as f64;
@@ -89,19 +89,19 @@ impl CfrOptimizer for DcfrOptimizer {
         regrets.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
             let d = if v >= 0 { d_pos } else { d_neg };
-            atom.store((v as f64 * d) as i64, Ordering::Relaxed);
+            atom.store((v as f64 * d) as i32, Ordering::Relaxed);
         });
 
         strategy_sums.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
-            atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
+            atom.store((v as f64 * d_strat) as i32, Ordering::Relaxed);
         });
     }
 
     fn current_strategy(
         &self,
-        regrets: &[AtomicI64],
-        _predictions: Option<&[AtomicI64]>,
+        regrets: &[AtomicI32],
+        _predictions: Option<&[AtomicI32]>,
         offset: usize,
         num_actions: usize,
         out: &mut [f64],
@@ -153,9 +153,9 @@ pub struct SapcfrPlusOptimizer {
 impl CfrOptimizer for SapcfrPlusOptimizer {
     fn apply_discount(
         &self,
-        regrets: &[AtomicI64],
-        strategy_sums: &[AtomicI64],
-        _predictions: Option<&[AtomicI64]>,
+        regrets: &[AtomicI32],
+        strategy_sums: &[AtomicI32],
+        _predictions: Option<&[AtomicI32]>,
         iteration: u64,
     ) {
         let tf = iteration as f64;
@@ -166,21 +166,21 @@ impl CfrOptimizer for SapcfrPlusOptimizer {
         // Discount regrets: floor negative to 0 (RM+ style).
         regrets.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
-            let discounted = (v as f64 * d_pos) as i64;
+            let discounted = (v as f64 * d_pos) as i32;
             atom.store(discounted.max(0), Ordering::Relaxed);
         });
 
         // Discount strategy sums.
         strategy_sums.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
-            atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
+            atom.store((v as f64 * d_strat) as i32, Ordering::Relaxed);
         });
     }
 
     fn current_strategy(
         &self,
-        regrets: &[AtomicI64],
-        predictions: Option<&[AtomicI64]>,
+        regrets: &[AtomicI32],
+        predictions: Option<&[AtomicI32]>,
         offset: usize,
         num_actions: usize,
         out: &mut [f64],
@@ -257,9 +257,9 @@ impl BrcfrPlusOptimizer {
 impl CfrOptimizer for BrcfrPlusOptimizer {
     fn apply_discount(
         &self,
-        regrets: &[AtomicI64],
-        strategy_sums: &[AtomicI64],
-        _predictions: Option<&[AtomicI64]>,
+        regrets: &[AtomicI32],
+        strategy_sums: &[AtomicI32],
+        _predictions: Option<&[AtomicI32]>,
         iteration: u64,
     ) {
         let tf = iteration as f64;
@@ -270,21 +270,21 @@ impl CfrOptimizer for BrcfrPlusOptimizer {
         // Discount regrets: floor negative to 0 (RM+ style).
         regrets.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
-            let discounted = (v as f64 * d_pos) as i64;
+            let discounted = (v as f64 * d_pos) as i32;
             atom.store(discounted.max(0), Ordering::Relaxed);
         });
 
         // Discount strategy sums.
         strategy_sums.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
-            atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
+            atom.store((v as f64 * d_strat) as i32, Ordering::Relaxed);
         });
     }
 
     fn current_strategy(
         &self,
-        regrets: &[AtomicI64],
-        predictions: Option<&[AtomicI64]>,
+        regrets: &[AtomicI32],
+        predictions: Option<&[AtomicI32]>,
         offset: usize,
         num_actions: usize,
         out: &mut [f64],
@@ -336,8 +336,8 @@ mod tests {
             beta: 0.0,
             gamma: 2.0,
         };
-        let regrets = vec![AtomicI64::new(1000), AtomicI64::new(-500)];
-        let strats = vec![AtomicI64::new(2000)];
+        let regrets = vec![AtomicI32::new(1000), AtomicI32::new(-500)];
+        let strats = vec![AtomicI32::new(2000)];
         opt.apply_discount(&regrets, &strats, None, 10);
 
         // d_pos = 10^1.5 / (10^1.5 + 1) ~= 31.623 / 32.623 ~= 0.9693
@@ -360,13 +360,13 @@ mod tests {
             beta: 0.0,
             gamma: 2.0,
         };
-        let regrets: Vec<AtomicI64> = vec![];
-        let strats = vec![AtomicI64::new(2000)];
+        let regrets: Vec<AtomicI32> = vec![];
+        let strats = vec![AtomicI32::new(2000)];
         opt.apply_discount(&regrets, &strats, None, 10);
 
         // d_strat = (10/11)^2.0 ~= 0.8264
         let s0 = strats[0].load(Ordering::Relaxed);
-        let expected = (2000.0 * (10.0_f64 / 11.0).powf(2.0)) as i64;
+        let expected = (2000.0 * (10.0_f64 / 11.0).powf(2.0)) as i32;
         assert_eq!(s0, expected, "strategy sum discounted");
     }
 
@@ -378,9 +378,9 @@ mod tests {
             beta: 0.0,
             gamma: 2.0,
         };
-        let regrets = vec![AtomicI64::new(1000)];
-        let strats = vec![AtomicI64::new(2000)];
-        let preds = vec![AtomicI64::new(999)];
+        let regrets = vec![AtomicI32::new(1000)];
+        let strats = vec![AtomicI32::new(2000)];
+        let preds = vec![AtomicI32::new(999)];
         // Passing predictions should not change behavior for DCFR
         opt.apply_discount(&regrets, &strats, Some(&preds), 10);
         let r0 = regrets[0].load(Ordering::Relaxed);
@@ -396,9 +396,9 @@ mod tests {
             gamma: 2.0,
         };
         let regrets = vec![
-            AtomicI64::new(300),  // action 0
-            AtomicI64::new(100),  // action 1
-            AtomicI64::new(-50),  // action 2 (negative, excluded)
+            AtomicI32::new(300),  // action 0
+            AtomicI32::new(100),  // action 1
+            AtomicI32::new(-50),  // action 2 (negative, excluded)
         ];
         let mut out = [0.0; 3];
         opt.current_strategy(&regrets, None, 0, 3, &mut out);
@@ -417,8 +417,8 @@ mod tests {
             gamma: 2.0,
         };
         let regrets = vec![
-            AtomicI64::new(-100),
-            AtomicI64::new(-200),
+            AtomicI32::new(-100),
+            AtomicI32::new(-200),
         ];
         let mut out = [0.0; 2];
         opt.current_strategy(&regrets, None, 0, 2, &mut out);
@@ -436,10 +436,10 @@ mod tests {
         };
         // Simulate a buffer with multiple nodes. Node at offset 2 has 2 actions.
         let regrets = vec![
-            AtomicI64::new(0),    // slot 0 (different node)
-            AtomicI64::new(0),    // slot 1 (different node)
-            AtomicI64::new(600),  // slot 2 = our node, action 0
-            AtomicI64::new(200),  // slot 3 = our node, action 1
+            AtomicI32::new(0),    // slot 0 (different node)
+            AtomicI32::new(0),    // slot 1 (different node)
+            AtomicI32::new(600),  // slot 2 = our node, action 0
+            AtomicI32::new(200),  // slot 3 = our node, action 1
         ];
         let mut out = [0.0; 2];
         opt.current_strategy(&regrets, None, 2, 2, &mut out);
@@ -480,8 +480,8 @@ mod tests {
             gamma: 2.0,
             eta: 0.5,
         };
-        let regrets = vec![AtomicI64::new(200), AtomicI64::new(100), AtomicI64::new(0)];
-        let preds = vec![AtomicI64::new(100), AtomicI64::new(-50), AtomicI64::new(50)];
+        let regrets = vec![AtomicI32::new(200), AtomicI32::new(100), AtomicI32::new(0)];
+        let preds = vec![AtomicI32::new(100), AtomicI32::new(-50), AtomicI32::new(50)];
         let mut out = [0.0; 3];
         opt.current_strategy(&regrets, Some(&preds), 0, 3, &mut out);
         // R_tilde[0] = max(0, 200 + 0.5*100) = 250
@@ -517,7 +517,7 @@ mod tests {
             eta: 0.5,
         };
         // Without predictions, eta * 0 = 0 => standard regret matching
-        let regrets = vec![AtomicI64::new(300), AtomicI64::new(100)];
+        let regrets = vec![AtomicI32::new(300), AtomicI32::new(100)];
         let mut out = [0.0; 2];
         opt.current_strategy(&regrets, None, 0, 2, &mut out);
         assert!((out[0] - 0.75).abs() < 0.01);
@@ -533,8 +533,8 @@ mod tests {
             eta: 0.5,
         };
         // Even with predictions, if all predicted regrets are negative => uniform
-        let regrets = vec![AtomicI64::new(-100), AtomicI64::new(-200)];
-        let preds = vec![AtomicI64::new(-100), AtomicI64::new(-100)];
+        let regrets = vec![AtomicI32::new(-100), AtomicI32::new(-200)];
+        let preds = vec![AtomicI32::new(-100), AtomicI32::new(-100)];
         let mut out = [0.0; 2];
         opt.current_strategy(&regrets, Some(&preds), 0, 2, &mut out);
         assert!((out[0] - 0.5).abs() < 0.01);
@@ -549,8 +549,8 @@ mod tests {
             gamma: 2.0,
             eta: 0.5,
         };
-        let regrets = vec![AtomicI64::new(1000), AtomicI64::new(-500)];
-        let strats = vec![AtomicI64::new(2000)];
+        let regrets = vec![AtomicI32::new(1000), AtomicI32::new(-500)];
+        let strats = vec![AtomicI32::new(2000)];
         opt.apply_discount(&regrets, &strats, None, 10);
         // Negative regrets are floored to 0 (RM+ style).
         let r1 = regrets[1].load(Ordering::Relaxed);
@@ -568,11 +568,11 @@ mod tests {
             gamma: 2.0,
             eta: 0.5,
         };
-        let regrets: Vec<AtomicI64> = vec![];
-        let strats = vec![AtomicI64::new(2000)];
+        let regrets: Vec<AtomicI32> = vec![];
+        let strats = vec![AtomicI32::new(2000)];
         opt.apply_discount(&regrets, &strats, None, 10);
         let s0 = strats[0].load(Ordering::Relaxed);
-        let expected = (2000.0 * (10.0_f64 / 11.0).powf(2.0)) as i64;
+        let expected = (2000.0 * (10.0_f64 / 11.0).powf(2.0)) as i32;
         assert_eq!(s0, expected, "strategy sum discounted like DCFR");
     }
 
@@ -608,16 +608,16 @@ mod tests {
         };
         // 4-slot buffer, our node starts at offset 2 with 2 actions
         let regrets = vec![
-            AtomicI64::new(0),
-            AtomicI64::new(0),
-            AtomicI64::new(100), // our action 0
-            AtomicI64::new(100), // our action 1
+            AtomicI32::new(0),
+            AtomicI32::new(0),
+            AtomicI32::new(100), // our action 0
+            AtomicI32::new(100), // our action 1
         ];
         let preds = vec![
-            AtomicI64::new(0),
-            AtomicI64::new(0),
-            AtomicI64::new(200), // prediction for action 0
-            AtomicI64::new(-200), // prediction for action 1 (negative)
+            AtomicI32::new(0),
+            AtomicI32::new(0),
+            AtomicI32::new(200), // prediction for action 0
+            AtomicI32::new(-200), // prediction for action 1 (negative)
         ];
         let mut out = [0.0; 2];
         opt.current_strategy(&regrets, Some(&preds), 2, 2, &mut out);
@@ -635,8 +635,8 @@ mod tests {
         use super::*;
         let opt = BrcfrPlusOptimizer::new(1.5, 2.0, 0.6);
         opt.set_decay(0.5);
-        let regrets = vec![AtomicI64::new(200), AtomicI64::new(100), AtomicI64::new(0)];
-        let preds = vec![AtomicI64::new(100), AtomicI64::new(-300), AtomicI64::new(50)];
+        let regrets = vec![AtomicI32::new(200), AtomicI32::new(100), AtomicI32::new(0)];
+        let preds = vec![AtomicI32::new(100), AtomicI32::new(-300), AtomicI32::new(50)];
         let mut out = [0.0; 3];
         opt.current_strategy(&regrets, Some(&preds), 0, 3, &mut out);
         // R_tilde[0] = max(0, 200 + 0.6 * 0.5 * 100) = max(0, 230) = 230
@@ -653,8 +653,8 @@ mod tests {
         use super::*;
         let brcfr = BrcfrPlusOptimizer::new(1.5, 2.0, 0.6);
         brcfr.set_decay(0.0);
-        let regrets = vec![AtomicI64::new(300), AtomicI64::new(100), AtomicI64::new(-50)];
-        let preds = vec![AtomicI64::new(999), AtomicI64::new(-999), AtomicI64::new(999)];
+        let regrets = vec![AtomicI32::new(300), AtomicI32::new(100), AtomicI32::new(-50)];
+        let preds = vec![AtomicI32::new(999), AtomicI32::new(-999), AtomicI32::new(999)];
         let mut out_brcfr = [0.0; 3];
         brcfr.current_strategy(&regrets, Some(&preds), 0, 3, &mut out_brcfr);
         // With decay=0, predictions are ignored => standard RM+: 300/400, 100/400, 0
@@ -668,8 +668,8 @@ mod tests {
         use super::*;
         let opt = BrcfrPlusOptimizer::new(1.5, 2.0, 0.6);
         opt.set_decay(1.0);
-        let regrets = vec![AtomicI64::new(1000), AtomicI64::new(-500)];
-        let strats = vec![AtomicI64::new(2000)];
+        let regrets = vec![AtomicI32::new(1000), AtomicI32::new(-500)];
+        let strats = vec![AtomicI32::new(2000)];
         opt.apply_discount(&regrets, &strats, None, 10);
         // Negative regrets are floored to 0 (RM+ style).
         let r1 = regrets[1].load(Ordering::Relaxed);
