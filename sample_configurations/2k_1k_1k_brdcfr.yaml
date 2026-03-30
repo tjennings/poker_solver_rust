@@ -1,0 +1,152 @@
+# Blueprint V2 Config — 100BB HU, 200 buckets, SAPCFR+ optimizer + VR-MCCFR baselines
+game:
+  name: "100bb 200bkt skip preflop prune"
+  players: 2
+  stack_depth: 200
+  small_blind: 1
+  big_blind: 2
+
+clustering:
+  algorithm: potential_aware_emd
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 2000
+  turn:
+    buckets: 1000
+    sample_boards: 20000
+  river:
+    buckets: 1000
+    sample_boards: 250000
+
+action_abstraction:
+  preflop:
+    - ["2bb"]
+    - ["4bb", "10bb"]
+    - ["22bb"]
+  flop:
+    - [0.33, 0.75, 1.0]
+    - [2.0]
+  turn:
+    - [0.33, 0.75, 1.0]
+    - [2.0]
+  river:
+    - [0.33, 0.75, 1.0]
+    - [2.0]
+
+training:
+  cluster_path: "./local_data/buckets/200_v1"
+  time_limit_minutes: 7200
+  lcfr_warmup_iterations: 300000000
+  prune_after_iterations: 100000000
+  prune_threshold: -250000
+  prune_streets: [flop, turn]
+  regret_floor: -310000
+  lcfr_discount_interval: 300000000
+  batch_size: 4000
+  #purify_threshold: 0.03
+  dcfr_epoch_cap: 40
+
+
+
+  # optimizer: "dcfr+"
+  # dcfr_alpha: 1.5
+  # dcfr_gamma: 2.0
+  # exploitability_interval_minutes: 30
+
+  # SAPCFR+ optimizer with prediction-based strategy
+  # optimizer: "sapcfr+"
+  # sapcfr_eta: 0.6
+  # dcfr_alpha: 1.5
+  # dcfr_gamma: 2.0
+  # # Variance-reducing baselines
+  # use_baselines: true
+  # baseline_alpha: 0.5
+
+  # BRCFR+ optimizer with periodic best-response prediction
+  optimizer: "brcfr+"
+  brcfr_eta: 0.6
+  brcfr_warmup_iterations: 600000000
+  brcfr_interval: 300000000
+  dcfr_alpha: 1.5
+  dcfr_gamma: 2.0
+  exploitability_samples: 25000
+
+snapshots:
+  resume: true
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "./local_data/blueprints/200_100bb_brdcfr_test"
+
+tui:
+  enabled: true
+  refresh_rate_ms: 2000
+  telemetry:
+    strategy_delta_interval_seconds: 120
+    sparkline_window: 60
+  scenarios:
+    - name: "SB Open"
+      spot: ""
+    - name: "BB vs SB open"
+      spot: "sb:2bb"
+    - name: "SB vs 3-bet"
+      spot: "sb:2bb,bb:4bb"
+    - name: "Flop SRP"
+      spot: "sb:2bb,bb:call|AsTd9d"
+    - name: "Flop 3bet pot"
+      spot: "sb:2bb,bb:4bb,sb:call|AsTd9d"
+    - name: "BB call rainbow broadway"
+      spot: "sb:2bb,bb:call|AsKhQd"
+  regret_audits:
+    - name: "AA SB open"
+      spot: ""
+      hand: "AA"
+      player: SB
+    - name: "62o SB open"
+      spot: ""
+      hand: "62o"
+      player: SB
+    - name: "52o SB open"
+      spot: ""
+      hand: "52o"
+      player: SB
+    - name: "AKo SB open"
+      spot: ""
+      hand: "AKo"
+      player: SB
+    - name: "72o SB open"
+      spot: ""
+      hand: "72o"
+      player: SB
+    - name: "75s SB open"
+      spot: ""
+      hand: "75s"
+      player: SB
+    - name: "77 BB vs SB open"
+      spot: "sb:2bb"
+      hand: "77"
+      player: SB  
+    - name: "QQ BB vs SB open"
+      spot: "sb:2bb"
+      hand: "QQ"
+      player: BB
+    - name: "AhKc flop SRP"
+      spot: "sb:2bb,bb:call|AsTd9d"
+      hand: "AhKc"
+      player: SB
+    - name: "7h2h flop SRP"
+      spot: "sb:2bb,bb:call|AsTd9d"
+      hand: "7h2h"
+      player: BB
+    - name: "AhKc river top pair"
+      spot: "sb:2bb,bb:call|AsTd9d|sb:check,bb:check|3c|sb:check,bb:check|2h"
+      hand: "AhKc"
+      player: SB
+    - name: "Kd7d river missed FD"
+      spot: "sb:2bb,bb:call|AsTd9d|sb:check,bb:check|3c|sb:check,bb:check|2h"
+      hand: "Kd7d"
+      player: SB
+  random_scenario:
+    enabled: true
+    hold_minutes: 3
+    pool: ["turn", "river"]
