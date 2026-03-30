@@ -387,12 +387,21 @@ impl BlueprintTuiApp {
         self.render_avg_pos_regret(frame, sparkline_chunks[9]);
         self.render_prune_sparkline(frame, sparkline_chunks[10]);
 
-        // Render audit panel if configured.
-        if let Some(audit_rect) = audit_area
-            && let Some(ref panel) = self.audit_panel
-        {
-            let widget = AuditPanelWidget { state: panel };
-            frame.render_widget(&widget, audit_rect);
+        // Render audit panel and exploitable spots in the right side area.
+        if let Some(audit_rect) = audit_area {
+            let audit_split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(audit_rect);
+
+            // Regret audit in top half.
+            if let Some(ref panel) = self.audit_panel {
+                let widget = AuditPanelWidget { state: panel };
+                frame.render_widget(&widget, audit_split[0]);
+            }
+
+            // Exploitable spots in bottom half.
+            self.render_exploitable_spots(frame, audit_split[1]);
         }
 
         // Hand grids
@@ -609,6 +618,49 @@ impl BlueprintTuiApp {
             .data(&self.prune_history)
             .style(Style::default().fg(Color::Magenta));
         frame.render_widget(sparkline, area);
+    }
+
+    fn render_exploitable_spots(&self, frame: &mut Frame, area: Rect) {
+        let spots = self
+            .metrics
+            .exploitable_spots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut lines = vec![Line::from(Span::styled(
+            "Top Exploitable Spots",
+            Style::default().fg(Color::Red).bold(),
+        ))];
+
+        if spots.is_empty() {
+            lines.push(Line::from(Span::styled(
+                " (waiting for BR pass)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for (i, spot) in spots.iter().take(10).enumerate() {
+                let player = if spot.player == 0 { "SB" } else { "BB" };
+                let street = match spot.street {
+                    poker_solver_core::blueprint_v2::Street::Preflop => "pre",
+                    poker_solver_core::blueprint_v2::Street::Flop => "flp",
+                    poker_solver_core::blueprint_v2::Street::Turn => "trn",
+                    poker_solver_core::blueprint_v2::Street::River => "rvr",
+                };
+                lines.push(Line::from(format!(
+                    " {}. [{}] {} b{} -> {} ({:.0})",
+                    i + 1,
+                    street,
+                    player,
+                    spot.bucket,
+                    spot.br_action,
+                    spot.magnitude,
+                )));
+            }
+        }
+
+        let paragraph = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::TOP));
+        frame.render_widget(paragraph, area);
     }
 
     fn render_hotkeys(&self, frame: &mut Frame, area: Rect) {
@@ -1206,5 +1258,128 @@ mod tests {
         assert_eq!(format_eta(1000, 1000, 60.0), "done");
         // 500/1000 = 50%, elapsed=60s, total_est=120s, remaining=60s
         assert_eq!(format_eta(500, 1000, 60.0), "1m 00s");
+    }
+
+    #[timed_test(10)]
+    fn app_renders_with_exploitable_spots_no_panic() {
+        use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
+        use poker_solver_core::blueprint_v2::Street;
+
+        let metrics = make_metrics();
+        metrics.set_exploitable_spots(vec![
+            ExploitableSpot {
+                spot: "sb:5bb,bb:call".to_string(),
+                street: Street::Preflop,
+                player: 0,
+                bucket: 3,
+                br_action: "fold".to_string(),
+                magnitude: 42.5,
+            },
+            ExploitableSpot {
+                spot: "sb:5bb,bb:call|flop|bb:check,sb:2bb".to_string(),
+                street: Street::Flop,
+                player: 1,
+                bucket: 7,
+                br_action: "5bb".to_string(),
+                magnitude: 10.0,
+            },
+        ]);
+        let mut app = BlueprintTuiApp::new(
+            Arc::clone(&metrics),
+            vec![],
+            TelemetryConfig::default(),
+        );
+        // Set up audit panel so the horizontal split fires
+        app.set_audit_panel(crate::blueprint_tui_audit_widget::AuditPanelState {
+            metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
+                name: "test".to_string(),
+                spot: String::new(),
+                hand: "AKo".to_string(),
+                player: crate::blueprint_tui_config::PlayerLabel::Sb,
+                bucket_trail: vec![(Street::Preflop, 3)],
+                action_labels: vec!["fold".into(), "call".into()],
+                error: None,
+            }],
+            snapshots: vec![crate::blueprint_tui_audit::AuditSnapshot {
+                regrets: vec![0.0, 0.0],
+                deltas: vec![0.0, 0.0],
+                trends: vec![
+                    crate::blueprint_tui_audit::Trend::Flat,
+                    crate::blueprint_tui_audit::Trend::Flat,
+                ],
+                strategy: vec![0.5, 0.5],
+                avg_strategy: vec![0.5, 0.5],
+            }],
+            active_tab: 0,
+            iteration: 0,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(160, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        // Verify the exploitable spots panel rendered by scanning the buffer
+        // for characteristic text
+        let buf = terminal.backend().buffer().clone();
+        let mut all_text = String::new();
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                all_text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+        }
+        assert!(
+            all_text.contains("Exploitable Spots"),
+            "should contain 'Exploitable Spots' panel title: buffer did not contain it",
+        );
+    }
+
+    #[timed_test(10)]
+    fn app_renders_exploitable_spots_waiting_message_when_empty() {
+        use poker_solver_core::blueprint_v2::Street;
+
+        let metrics = make_metrics();
+        // Don't set any exploitable spots
+        let mut app = BlueprintTuiApp::new(
+            Arc::clone(&metrics),
+            vec![],
+            TelemetryConfig::default(),
+        );
+        // Set up audit panel so the split fires
+        app.set_audit_panel(crate::blueprint_tui_audit_widget::AuditPanelState {
+            metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
+                name: "test".to_string(),
+                spot: String::new(),
+                hand: "AKo".to_string(),
+                player: crate::blueprint_tui_config::PlayerLabel::Sb,
+                bucket_trail: vec![(Street::Preflop, 3)],
+                action_labels: vec!["fold".into()],
+                error: None,
+            }],
+            snapshots: vec![crate::blueprint_tui_audit::AuditSnapshot {
+                regrets: vec![0.0],
+                deltas: vec![0.0],
+                trends: vec![crate::blueprint_tui_audit::Trend::Flat],
+                strategy: vec![1.0],
+                avg_strategy: vec![1.0],
+            }],
+            active_tab: 0,
+            iteration: 0,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(160, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let mut all_text = String::new();
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                all_text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+        }
+        assert!(
+            all_text.contains("waiting for BR pass"),
+            "should show waiting message when no spots available",
+        );
     }
 }

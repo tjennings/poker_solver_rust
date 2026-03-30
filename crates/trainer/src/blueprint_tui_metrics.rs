@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
+
 use crate::blueprint_tui::ResolvedScenario;
 use crate::blueprint_tui_audit::AuditSnapshot;
 use crate::blueprint_tui_audit_widget::AuditPanelState;
@@ -75,6 +77,9 @@ pub struct BlueprintTuiMetrics {
     pub exploitability_progress: Arc<AtomicU64>,
     pub exploitability_total: Arc<AtomicU64>,
     pub exploitability_start_time: Mutex<Option<Instant>>,
+
+    // --- top exploitable spots from BR pass ---
+    pub exploitable_spots: Mutex<Vec<ExploitableSpot>>,
 }
 
 impl BlueprintTuiMetrics {
@@ -121,6 +126,8 @@ impl BlueprintTuiMetrics {
             exploitability_progress: Arc::new(AtomicU64::new(0)),
             exploitability_total: Arc::new(AtomicU64::new(0)),
             exploitability_start_time: Mutex::new(None),
+
+            exploitable_spots: Mutex::new(Vec::new()),
         }
     }
 
@@ -267,6 +274,11 @@ impl BlueprintTuiMetrics {
     /// Seconds elapsed since this metrics instance was created.
     pub fn elapsed_secs(&self) -> f64 {
         self.start_time.elapsed().as_secs_f64()
+    }
+
+    /// Replace the stored exploitable spots with a new set from the latest BR pass.
+    pub fn set_exploitable_spots(&self, spots: Vec<ExploitableSpot>) {
+        *self.exploitable_spots.lock().unwrap_or_else(|e| e.into_inner()) = spots;
     }
 
     /// Signal the start of an exploitability/BR pass with the given total sample count.
@@ -535,5 +547,85 @@ mod tests {
         m.finish_exploitability_pass();
         assert_eq!(m.exploitability_total.load(Ordering::Relaxed), 0);
         assert_eq!(m.exploitability_progress.load(Ordering::Relaxed), 0);
+    }
+
+    #[timed_test(10)]
+    fn exploitable_spots_initially_empty() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        let spots = m.exploitable_spots.lock().unwrap();
+        assert!(spots.is_empty());
+    }
+
+    #[timed_test(10)]
+    fn set_exploitable_spots_stores_spots() {
+        use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
+        use poker_solver_core::blueprint_v2::Street;
+
+        let m = BlueprintTuiMetrics::new(None, None);
+        let spots = vec![
+            ExploitableSpot {
+                spot: "sb:5bb".to_string(),
+                street: Street::Preflop,
+                player: 0,
+                bucket: 3,
+                br_action: "fold".to_string(),
+                magnitude: 42.5,
+            },
+            ExploitableSpot {
+                spot: "sb:5bb,bb:call".to_string(),
+                street: Street::Preflop,
+                player: 1,
+                bucket: 7,
+                br_action: "5bb".to_string(),
+                magnitude: 10.0,
+            },
+        ];
+        m.set_exploitable_spots(spots);
+        let stored = m.exploitable_spots.lock().unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].spot, "sb:5bb");
+        assert!((stored[0].magnitude - 42.5).abs() < f64::EPSILON);
+    }
+
+    #[timed_test(10)]
+    fn set_exploitable_spots_replaces_previous() {
+        use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
+        use poker_solver_core::blueprint_v2::Street;
+
+        let m = BlueprintTuiMetrics::new(None, None);
+        let spots1 = vec![ExploitableSpot {
+            spot: "first".to_string(),
+            street: Street::Preflop,
+            player: 0,
+            bucket: 0,
+            br_action: "fold".to_string(),
+            magnitude: 1.0,
+        }];
+        m.set_exploitable_spots(spots1);
+        assert_eq!(m.exploitable_spots.lock().unwrap().len(), 1);
+
+        let spots2 = vec![
+            ExploitableSpot {
+                spot: "second".to_string(),
+                street: Street::Flop,
+                player: 1,
+                bucket: 5,
+                br_action: "check".to_string(),
+                magnitude: 2.0,
+            },
+            ExploitableSpot {
+                spot: "third".to_string(),
+                street: Street::River,
+                player: 0,
+                bucket: 8,
+                br_action: "all-in".to_string(),
+                magnitude: 3.0,
+            },
+        ];
+        m.set_exploitable_spots(spots2);
+        let stored = m.exploitable_spots.lock().unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].spot, "second");
+        assert_eq!(stored[1].spot, "third");
     }
 }

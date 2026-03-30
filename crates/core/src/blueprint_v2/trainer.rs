@@ -212,6 +212,8 @@ pub struct BlueprintTrainer {
     pub on_audit_refresh: Option<Box<dyn FnMut(&BlueprintStorage) + Send>>,
 
     // --- Exploitability measurement ---
+    /// Callback to push top exploitable spots to TUI after a BR pass.
+    pub on_exploitable_spots: Option<Box<dyn Fn(Vec<super::exploitable_spots::ExploitableSpot>) + Send>>,
     /// Callback to push exploitability values to TUI metrics.
     pub on_exploitability: Option<Box<dyn Fn(f64) + Send>>,
     /// Called at the start of an exploitability/BR pass with the total sample count.
@@ -393,6 +395,7 @@ impl BlueprintTrainer {
             random_scenario_hold_minutes: 3,
             last_random_scenario_min: 0,
             on_audit_refresh: None,
+            on_exploitable_spots: None,
             on_exploitability: None,
             on_exploitability_start: None,
             on_exploitability_tick: None,
@@ -827,6 +830,16 @@ impl BlueprintTrainer {
         // Lock predictions to prevent MCCFR from overwriting.
         self.storage.lock_predictions();
         self.last_br_iteration = self.iterations;
+
+        // Find and push top exploitable spots to TUI.
+        if let Some(ref cb) = self.on_exploitable_spots {
+            let spots = super::exploitable_spots::find_top_exploitable_spots(
+                &self.tree,
+                &self.storage,
+                10,
+            );
+            cb(spots);
+        }
 
         let n_f = n as f64;
         (sum_p0 / n_f + sum_p1 / n_f) / 2.0 / big_blind * 1000.0
@@ -2325,5 +2338,46 @@ mod tests {
             trainer.storage.predictions_locked.load(Ordering::Relaxed),
             "predictions should be locked after BR pass",
         );
+    }
+
+    #[test]
+    fn on_exploitable_spots_callback_fires_after_br_pass() {
+        use std::sync::Mutex;
+        let mut config = toy_config();
+        config.training.optimizer = "brcfr+".to_string();
+        config.training.brcfr_eta = 0.6;
+        config.training.brcfr_warmup_iterations = 200;
+        config.training.brcfr_interval = 200;
+        config.training.iterations = Some(400);
+        config.training.exploitability_samples = 100;
+        let mut trainer = toy_trainer(config);
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
+        trainer.on_exploitable_spots = Some(Box::new(move |spots| {
+            received_clone.lock().unwrap().push(spots);
+        }));
+
+        trainer.train().expect("training should complete");
+
+        let calls = received.lock().unwrap();
+        assert!(
+            !calls.is_empty(),
+            "on_exploitable_spots should have been called at least once",
+        );
+        // Each call should have received a non-empty vec (there are predictions)
+        for (i, spots) in calls.iter().enumerate() {
+            assert!(
+                !spots.is_empty(),
+                "call {i} should have non-empty spots",
+            );
+        }
+    }
+
+    #[test]
+    fn on_exploitable_spots_default_is_none() {
+        let config = toy_config();
+        let trainer = BlueprintTrainer::new(config);
+        assert!(trainer.on_exploitable_spots.is_none());
     }
 }

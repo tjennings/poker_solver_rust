@@ -10,6 +10,7 @@ pub mod cluster_pipeline;
 pub mod clustering;
 pub mod config;
 pub mod equity_cache;
+pub mod exploitable_spots;
 pub mod full_depth_solver;
 pub mod game_tree;
 pub mod mccfr;
