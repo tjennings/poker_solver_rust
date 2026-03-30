@@ -806,18 +806,13 @@ impl BlueprintTrainer {
             cb();
         }
 
-        // Scale predictions to match cumulative regret magnitude.
-        // Raw predictions are summed across `exploitability_samples` deals.
-        // Multiply by (interval / samples) to project what they'd accumulate
-        // to over one full BR interval if BR regrets arrived every iteration.
-        let interval = self.config.training.brcfr_interval.max(1) as f64;
-        let samples = n as f64;
-        let scale = interval / samples;
+        // Normalize predictions by visit count.
         if let Some(ref preds) = self.storage.predictions {
-            for pred in preds.iter() {
-                let val = pred.load(Ordering::Relaxed);
-                if val != 0 {
-                    pred.store((val as f64 * scale) as i32, Ordering::Relaxed);
+            for (i, pred) in preds.iter().enumerate() {
+                let count = visit_counts[i].load(Ordering::Relaxed);
+                if count > 0 {
+                    let val = pred.load(Ordering::Relaxed);
+                    pred.store(val / count as i32, Ordering::Relaxed);
                 }
             }
         }
