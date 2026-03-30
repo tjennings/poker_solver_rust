@@ -16,7 +16,7 @@
 
 use std::cmp::Ordering;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 
 use rand::Rng;
@@ -810,6 +810,7 @@ pub fn traverse_best_response(
     rake_rate: f64,
     rake_cap: f64,
     predict_storage: Option<&BlueprintStorage>,
+    visit_counts: Option<&[AtomicU32]>,
 ) -> f64 {
     match &tree.nodes[node_idx as usize] {
         GameNode::Terminal { kind, pot, stacks } => {
@@ -817,7 +818,7 @@ pub fn traverse_best_response(
         }
 
         GameNode::Chance { child, .. } => {
-            traverse_best_response(tree, storage, deal, traverser, *child, rake_rate, rake_cap, predict_storage)
+            traverse_best_response(tree, storage, deal, traverser, *child, rake_rate, rake_cap, predict_storage, visit_counts)
         }
 
         GameNode::Decision {
@@ -837,19 +838,25 @@ pub fn traverse_best_response(
                 for (a, &child_idx) in children.iter().enumerate() {
                     let v = traverse_best_response(
                         tree, storage, deal, traverser, child_idx, rake_rate, rake_cap,
-                        predict_storage,
+                        predict_storage, visit_counts,
                     );
                     action_values[a] = v;
                     if v > best {
                         best = v;
                     }
                 }
-                // Write BR-derived regrets to prediction buffer.
+                // Accumulate BR-derived regrets into prediction buffer.
                 if let Some(ps) = predict_storage {
                     for (a, _) in children.iter().enumerate() {
                         let delta = action_values[a] - best;
                         let delta_scaled = (delta * super::storage::REGRET_SCALE) as i32;
-                        ps.set_prediction(node_idx, bucket, a, delta_scaled);
+                        ps.add_prediction(node_idx, bucket, a, delta_scaled);
+                    }
+                    if let Some(vc) = visit_counts {
+                        for (a, _) in children.iter().enumerate() {
+                            let idx = ps.slot_offset_for(node_idx, bucket) + a;
+                            vc[idx].fetch_add(1, AtomicOrdering::Relaxed);
+                        }
                     }
                 }
                 best
@@ -861,7 +868,7 @@ pub fn traverse_best_response(
                     if strategy[a] > 0.0 {
                         let v = traverse_best_response(
                             tree, storage, deal, traverser, child_idx, rake_rate, rake_cap,
-                            predict_storage,
+                            predict_storage, visit_counts,
                         );
                         value += strategy[a] * v;
                     }
@@ -2561,8 +2568,8 @@ mod tests {
         let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
 
-        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None);
-        let br1 = traverse_best_response(&tree, &storage, &precomputed, 1, tree.root, 0.0, 0.0, None);
+        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None, None);
+        let br1 = traverse_best_response(&tree, &storage, &precomputed, 1, tree.root, 0.0, 0.0, None, None);
         assert!(br0.is_finite(), "BR value for p0 should be finite, got {br0}");
         assert!(br1.is_finite(), "BR value for p1 should be finite, got {br1}");
     }
@@ -2585,7 +2592,7 @@ mod tests {
         );
 
         // BR value: the best response can only do at least as well.
-        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None);
+        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None, None);
         assert!(
             br0 >= ev0 - 0.01,
             "BR value ({br0}) should be >= external sampling value ({ev0})",
@@ -2599,8 +2606,8 @@ mod tests {
         let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
 
-        let br_no_rake = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None);
-        let br_with_rake = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.05, 3.0, None);
+        let br_no_rake = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None, None);
+        let br_with_rake = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.05, 3.0, None, None);
         // Rake should reduce the BR value (or keep equal if terminal is fold).
         assert!(
             br_with_rake <= br_no_rake + 0.01,
@@ -2618,8 +2625,8 @@ mod tests {
         let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
 
-        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None);
-        let br1 = traverse_best_response(&tree, &storage, &precomputed, 1, tree.root, 0.0, 0.0, None);
+        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None, None);
+        let br1 = traverse_best_response(&tree, &storage, &precomputed, 1, tree.root, 0.0, 0.0, None, None);
         // Exploitability = (br0 + br1) / 2 should be non-negative.
         let exploit = (br0 + br1) / 2.0;
         assert!(
@@ -2647,11 +2654,11 @@ mod tests {
         }
 
         let br0 = traverse_best_response(
-            &tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, Some(&predict_store),
+            &tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, Some(&predict_store), None,
         );
         // BR value should be the same as without predictions.
         let br0_plain = traverse_best_response(
-            &tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None,
+            &tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None, None,
         );
         assert!(
             (br0 - br0_plain).abs() < 1e-10,
@@ -2666,5 +2673,68 @@ mod tests {
             .iter()
             .any(|a| a.load(std::sync::atomic::Ordering::Relaxed) != 0);
         assert!(any_nonzero, "predictions should be populated by BR traversal");
+    }
+
+    #[test]
+    fn best_response_accumulates_predictions_across_calls() {
+        use std::sync::atomic::AtomicU32;
+
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
+        let precomputed = make_precomputed(&buckets, make_deal());
+
+        let mut predict_store = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        predict_store.enable_predictions();
+        for i in 0..storage.strategy_sums.len() {
+            predict_store.strategy_sums[i].store(
+                storage.strategy_sums[i].load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        let pred_len = predict_store.predictions.as_ref().unwrap().len();
+        let visit_counts: Vec<AtomicU32> = (0..pred_len).map(|_| AtomicU32::new(0)).collect();
+
+        // Call once to get a baseline.
+        traverse_best_response(
+            &tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0,
+            Some(&predict_store), Some(&visit_counts),
+        );
+
+        // Snapshot predictions after first call.
+        let preds = predict_store.predictions.as_ref().unwrap();
+        let first_pass: Vec<i32> = preds
+            .iter()
+            .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+
+        // Call again with the same deal -- predictions should accumulate.
+        traverse_best_response(
+            &tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0,
+            Some(&predict_store), Some(&visit_counts),
+        );
+
+        let second_pass: Vec<i32> = preds
+            .iter()
+            .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+
+        // Each non-zero prediction should be exactly 2x the first-pass value
+        // (same deal, same traverser, deterministic).
+        for (i, (&f, &s)) in first_pass.iter().zip(second_pass.iter()).enumerate() {
+            if f != 0 {
+                assert_eq!(
+                    s, 2 * f,
+                    "prediction[{i}] should be 2*{f} after two identical calls, got {s}"
+                );
+            }
+        }
+
+        // Visit counts should be 2 for visited slots, 0 for unvisited.
+        let any_visited = visit_counts
+            .iter()
+            .any(|a| a.load(std::sync::atomic::Ordering::Relaxed) == 2);
+        assert!(any_visited, "visit counts should show 2 visits for traversed slots");
     }
 }

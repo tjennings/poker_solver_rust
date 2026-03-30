@@ -285,6 +285,25 @@ impl BlueprintStorage {
         }
     }
 
+    /// Atomically add to a prediction value for a (node, bucket, action) slot.
+    /// No-op when predictions are disabled or locked.
+    #[inline]
+    pub fn add_prediction(&self, node_idx: u32, bucket: u16, action: usize, value: i32) {
+        if self.predictions_locked.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(ref p) = self.predictions {
+            p[self.slot_index(node_idx, bucket, action)].fetch_add(value, Ordering::Relaxed);
+        }
+    }
+
+    /// Reset all predictions to zero.
+    pub fn zero_predictions(&self) {
+        if let Some(ref p) = self.predictions {
+            p.iter().for_each(|a| a.store(0, Ordering::Relaxed));
+        }
+    }
+
     /// Flat-buffer offset for a given (node, bucket) pair.
     ///
     /// Exposed for the optimizer trait to use when computing strategies.
@@ -1226,5 +1245,82 @@ mod tests {
         let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
         let regret_bytes = storage.regrets.len() * std::mem::size_of::<AtomicI32>();
         assert_eq!(regret_bytes, storage.regrets.len() * 4);
+    }
+
+    // --- add_prediction tests ---
+
+    #[test]
+    fn add_prediction_accumulates() {
+        let tree = toy_tree();
+        let mut storage = BlueprintStorage::new(&tree, [2, 2, 2, 2]);
+        storage.enable_predictions();
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        storage.add_prediction(node_idx, 0, 0, 100);
+        storage.add_prediction(node_idx, 0, 0, 50);
+        assert_eq!(storage.get_prediction(node_idx, 0, 0), 150);
+    }
+
+    #[test]
+    fn add_prediction_noop_when_disabled() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [2, 2, 2, 2]);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        // Should not panic when predictions are None.
+        storage.add_prediction(node_idx, 0, 0, 100);
+        assert_eq!(storage.get_prediction(node_idx, 0, 0), 0);
+    }
+
+    #[test]
+    fn add_prediction_noop_when_locked() {
+        let tree = toy_tree();
+        let mut storage = BlueprintStorage::new(&tree, [2, 2, 2, 2]);
+        storage.enable_predictions();
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        storage.add_prediction(node_idx, 0, 0, 100);
+        storage.lock_predictions();
+        storage.add_prediction(node_idx, 0, 0, 50);
+        assert_eq!(
+            storage.get_prediction(node_idx, 0, 0),
+            100,
+            "locked buffer should not change"
+        );
+    }
+
+    // --- zero_predictions tests ---
+
+    #[test]
+    fn zero_predictions_clears_buffer() {
+        let tree = toy_tree();
+        let mut storage = BlueprintStorage::new(&tree, [2, 2, 2, 2]);
+        storage.enable_predictions();
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        storage.set_prediction(node_idx, 0, 0, 42);
+        assert_eq!(storage.get_prediction(node_idx, 0, 0), 42);
+        storage.zero_predictions();
+        assert_eq!(storage.get_prediction(node_idx, 0, 0), 0);
+    }
+
+    #[test]
+    fn zero_predictions_noop_when_disabled() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [2, 2, 2, 2]);
+        // Should not panic when predictions are None.
+        storage.zero_predictions();
     }
 }

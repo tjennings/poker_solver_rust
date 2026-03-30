@@ -14,7 +14,7 @@
 
 use std::error::Error;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -720,10 +720,10 @@ impl BlueprintTrainer {
                 let deal = DealWithBuckets { deal, buckets };
 
                 let br0 = traverse_best_response(
-                    tree, storage, &deal, 0, tree.root, rake_rate, rake_cap, None,
+                    tree, storage, &deal, 0, tree.root, rake_rate, rake_cap, None, None,
                 );
                 let br1 = traverse_best_response(
-                    tree, storage, &deal, 1, tree.root, rake_rate, rake_cap, None,
+                    tree, storage, &deal, 1, tree.root, rake_rate, rake_cap, None, None,
                 );
                 (br0, br1)
             })
@@ -743,8 +743,14 @@ impl BlueprintTrainer {
         let rake_cap = self.config.game.rake_cap;
         let big_blind = self.config.game.big_blind;
 
-        // Unlock predictions so BR traversal can write.
+        // Unlock and zero predictions for fresh accumulation.
         self.storage.unlock_predictions();
+        self.storage.zero_predictions();
+
+        // Allocate temporary visit counts (same layout as predictions).
+        let pred_len = self.storage.predictions.as_ref().map_or(0, |p| p.len());
+        let visit_counts: Vec<AtomicU32> = (0..pred_len).map(|_| AtomicU32::new(0)).collect();
+        let vc_ref = &visit_counts;
 
         let (sum_p0, sum_p1): (f64, f64) = (0..n)
             .into_par_iter()
@@ -756,15 +762,26 @@ impl BlueprintTrainer {
 
                 let br0 = traverse_best_response(
                     tree, storage, &deal, 0, tree.root, rake_rate, rake_cap,
-                    Some(storage),
+                    Some(storage), Some(vc_ref),
                 );
                 let br1 = traverse_best_response(
                     tree, storage, &deal, 1, tree.root, rake_rate, rake_cap,
-                    Some(storage),
+                    Some(storage), Some(vc_ref),
                 );
                 (br0, br1)
             })
             .reduce(|| (0.0, 0.0), |(a0, a1), (b0, b1)| (a0 + b0, a1 + b1));
+
+        // Normalize predictions by visit count.
+        if let Some(ref preds) = self.storage.predictions {
+            for (i, pred) in preds.iter().enumerate() {
+                let count = visit_counts[i].load(Ordering::Relaxed);
+                if count > 0 {
+                    let val = pred.load(Ordering::Relaxed);
+                    pred.store(val / count as i32, Ordering::Relaxed);
+                }
+            }
+        }
 
         // Lock predictions to prevent MCCFR from overwriting.
         self.storage.lock_predictions();
