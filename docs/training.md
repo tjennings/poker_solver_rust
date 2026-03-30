@@ -210,12 +210,15 @@ The `training:` section of the blueprint YAML config controls the MCCFR training
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `optimizer` | `"dcfr"` | CFR variant: `"dcfr"`, `"sapcfr+"`, `"lcfr"`, `"cfr+"` |
+| `optimizer` | `"dcfr"` | CFR variant: `"dcfr"`, `"sapcfr+"`, `"brcfr+"`, `"lcfr"`, `"cfr+"` |
 | `dcfr_alpha` | `1.5` | Positive regret discount exponent. Higher = retain positive regrets longer |
 | `dcfr_beta` | `0.0` | Negative regret discount exponent. Used by DCFR only (SAPCFR+ floors to 0) |
 | `dcfr_gamma` | `2.0` | Strategy sum discount exponent. Higher = weight recent strategies more |
 | `dcfr_epoch_cap` | `null` | Optional cap on discount epoch counter. Prevents discount from converging to 1.0 |
 | `sapcfr_eta` | `0.5` | SAPCFR+ prediction step size. 0 = no prediction (DCFR+RM+), 1 = full PCFR+, 0.5 = dampened |
+| `brcfr_eta` | `0.6` | BRCFR+ BR prediction weight. Scales the best-response signal in strategy computation |
+| `brcfr_warmup_iterations` | `0` | Iterations of pure DCFR+ before the first BR prediction pass |
+| `brcfr_interval` | `100000000` | Iterations between BR prediction passes (after warmup) |
 
 **DCFR** (default): Discounted CFR with polynomial decay. Positive regrets multiplied by `t^α/(t^α+1)`, negative by `t^β/(t^β+1)`, strategy sums by `(t/(t+1))^γ`. Standard choice from Brown & Sandholm 2019.
 
@@ -224,6 +227,24 @@ The `training:` section of the blueprint YAML config controls the MCCFR training
 **LCFR**: Linear CFR (α=β=γ=1). Used by Pluribus. Simplest discounting scheme.
 
 **CFR+**: Regret matching+ with negative regret flooring. No discounting.
+
+**BRCFR+**: Best-Response augmented DCFR+. Layers periodic best-response prediction passes on top of the standard DCFR+ optimizer. During the warmup phase (`brcfr_warmup_iterations`), behaves identically to DCFR+. After warmup, a full BR traversal runs every `brcfr_interval` iterations for both players. The BR-derived per-infoset regrets are stored in the prediction buffer and used in strategy computation as `R_tilde = max(0, R + eta * decay * v_br)`. The decay factor starts at 1.0 after each BR pass and decreases linearly to 0.0 over the refresh interval, so stale predictions fade naturally. When decay reaches 0, behavior is pure DCFR+. Exploitability is measured for free during each BR pass (no separate exploitability calculation needed). Requires the same prediction buffer as SAPCFR+ (~1.1 GB extra). Based on ideas from CFR-BR (Johanson 2012) with decay scheduling.
+
+### Example: BRCFR+ Configuration
+
+```yaml
+training:
+  cluster_path: "./local_data/buckets/200_v1"
+  time_limit_minutes: 7200
+  optimizer: "brcfr+"
+  brcfr_eta: 0.6
+  brcfr_warmup_iterations: 300000000
+  brcfr_interval: 100000000
+  dcfr_alpha: 1.5
+  dcfr_gamma: 2.0
+  dcfr_epoch_cap: 40
+  batch_size: 4000
+```
 
 ### Variance Reduction
 

@@ -95,6 +95,10 @@ pub struct AllBuckets {
     /// When set, turn/river lookups use per-flop files instead of global
     /// bucket files.
     per_flop_dir: Option<PathBuf>,
+    /// When true, fall back to equity-based bucketing for missing boards
+    /// instead of panicking. Enabled automatically in `#[cfg(test)]` unit
+    /// tests; can also be set explicitly for integration tests.
+    pub equity_fallback: bool,
     /// Cache of loaded per-flop bucket files, keyed by canonical flop
     /// `PackedBoard`.
     per_flop_cache: RwLock<FxHashMap<PackedBoard, Arc<PerFlopBucketFile>>>,
@@ -125,6 +129,7 @@ impl AllBuckets {
             per_flop_dir: None,
             per_flop_cache: RwLock::new(FxHashMap::default()),
             flop_index_map: None,
+            equity_fallback: false,
         }
     }
 
@@ -194,15 +199,29 @@ impl AllBuckets {
     ///
     /// For turn (`street_idx`=2) and river (`street_idx`=3), when `per_flop_dir`
     /// is set, uses per-flop bucket files instead of global bucket files.
+    /// Equity-based bucket fallback: quantize showdown equity into `k` buckets.
+    fn equity_bucket(&self, street_idx: usize, hole: [Card; 2], board: &[Card]) -> u16 {
+        let equity = crate::showdown_equity::compute_equity(hole, board);
+        let k = self.bucket_counts[street_idx];
+        let bucket = (equity * f64::from(k)) as u16;
+        bucket.min(k - 1)
+    }
+
     fn lookup_bucket(&self, street_idx: usize, hole: [Card; 2], board: &[Card]) -> u16 {
         // Per-flop lookup for turn and river when available
         if (street_idx == 2 || street_idx == 3) && self.per_flop_dir.is_some() {
             if let Some(bucket) = self.lookup_per_flop(street_idx, hole, board) {
                 return bucket;
             }
-            // In tests, fall back to equity-based bucketing
-            #[cfg(not(test))]
+            // In tests or when equity_fallback is enabled, fall back to equity-based bucketing.
+            #[cfg(test)]
             {
+                return self.equity_bucket(street_idx, hole, board);
+            }
+            #[cfg(not(test))]
+            if self.equity_fallback {
+                return self.equity_bucket(street_idx, hole, board);
+            } else {
                 let street_name = if street_idx == 2 { "turn" } else { "river" };
                 panic!(
                     "No per-flop bucket file found for {street_name} board {board:?} \
@@ -223,17 +242,16 @@ impl AllBuckets {
             }
         }
 
-        // In tests, fall back to equity-based bucketing.
-        // In production, missing bucket files are a fatal configuration error.
+        // In tests or when equity_fallback is enabled, fall back to equity-based bucketing.
+        // In production without equity_fallback, missing bucket files are a fatal error.
         #[cfg(test)]
         {
-            let equity = crate::showdown_equity::compute_equity(hole, board);
-            let k = self.bucket_counts[street_idx];
-            let bucket = (equity * f64::from(k)) as u16;
-            return bucket.min(k - 1);
+            return self.equity_bucket(street_idx, hole, board);
         }
         #[cfg(not(test))]
-        {
+        if self.equity_fallback {
+            self.equity_bucket(street_idx, hole, board)
+        } else {
             let street_name = match street_idx {
                 1 => "flop",
                 2 => "turn",
@@ -791,6 +809,7 @@ pub fn traverse_best_response(
     node_idx: u32,
     rake_rate: f64,
     rake_cap: f64,
+    predict_storage: Option<&BlueprintStorage>,
 ) -> f64 {
     match &tree.nodes[node_idx as usize] {
         GameNode::Terminal { kind, pot, stacks } => {
@@ -798,7 +817,7 @@ pub fn traverse_best_response(
         }
 
         GameNode::Chance { child, .. } => {
-            traverse_best_response(tree, storage, deal, traverser, *child, rake_rate, rake_cap)
+            traverse_best_response(tree, storage, deal, traverser, *child, rake_rate, rake_cap, predict_storage)
         }
 
         GameNode::Decision {
@@ -814,12 +833,23 @@ pub fn traverse_best_response(
             if player == traverser {
                 // BR player: take max over all actions.
                 let mut best = f64::NEG_INFINITY;
-                for &child_idx in children.iter() {
+                let mut action_values = [0.0f64; 16];
+                for (a, &child_idx) in children.iter().enumerate() {
                     let v = traverse_best_response(
                         tree, storage, deal, traverser, child_idx, rake_rate, rake_cap,
+                        predict_storage,
                     );
+                    action_values[a] = v;
                     if v > best {
                         best = v;
+                    }
+                }
+                // Write BR-derived regrets to prediction buffer.
+                if let Some(ps) = predict_storage {
+                    for (a, _) in children.iter().enumerate() {
+                        let delta = action_values[a] - best;
+                        let delta_scaled = (delta * super::storage::REGRET_SCALE) as i64;
+                        ps.set_prediction(node_idx, bucket, a, delta_scaled);
                     }
                 }
                 best
@@ -831,6 +861,7 @@ pub fn traverse_best_response(
                     if strategy[a] > 0.0 {
                         let v = traverse_best_response(
                             tree, storage, deal, traverser, child_idx, rake_rate, rake_cap,
+                            predict_storage,
                         );
                         value += strategy[a] * v;
                     }
@@ -2530,8 +2561,8 @@ mod tests {
         let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
 
-        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0);
-        let br1 = traverse_best_response(&tree, &storage, &precomputed, 1, tree.root, 0.0, 0.0);
+        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None);
+        let br1 = traverse_best_response(&tree, &storage, &precomputed, 1, tree.root, 0.0, 0.0, None);
         assert!(br0.is_finite(), "BR value for p0 should be finite, got {br0}");
         assert!(br1.is_finite(), "BR value for p1 should be finite, got {br1}");
     }
@@ -2554,7 +2585,7 @@ mod tests {
         );
 
         // BR value: the best response can only do at least as well.
-        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0);
+        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None);
         assert!(
             br0 >= ev0 - 0.01,
             "BR value ({br0}) should be >= external sampling value ({ev0})",
@@ -2568,8 +2599,8 @@ mod tests {
         let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
 
-        let br_no_rake = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0);
-        let br_with_rake = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.05, 3.0);
+        let br_no_rake = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None);
+        let br_with_rake = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.05, 3.0, None);
         // Rake should reduce the BR value (or keep equal if terminal is fold).
         assert!(
             br_with_rake <= br_no_rake + 0.01,
@@ -2587,13 +2618,53 @@ mod tests {
         let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
 
-        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0);
-        let br1 = traverse_best_response(&tree, &storage, &precomputed, 1, tree.root, 0.0, 0.0);
+        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None);
+        let br1 = traverse_best_response(&tree, &storage, &precomputed, 1, tree.root, 0.0, 0.0, None);
         // Exploitability = (br0 + br1) / 2 should be non-negative.
         let exploit = (br0 + br1) / 2.0;
         assert!(
             exploit >= -0.01,
             "Exploitability should be non-negative, got {exploit} (br0={br0}, br1={br1})",
         );
+    }
+
+    #[test]
+    fn best_response_writes_predictions_when_storage_provided() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
+        let precomputed = make_precomputed(&buckets, make_deal());
+
+        // Create a separate storage for predictions with the same layout.
+        let mut predict_store = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        predict_store.enable_predictions();
+        // Copy strategy sums from the main storage so average_strategy works.
+        for i in 0..storage.strategy_sums.len() {
+            predict_store.strategy_sums[i].store(
+                storage.strategy_sums[i].load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        let br0 = traverse_best_response(
+            &tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, Some(&predict_store),
+        );
+        // BR value should be the same as without predictions.
+        let br0_plain = traverse_best_response(
+            &tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None,
+        );
+        assert!(
+            (br0 - br0_plain).abs() < 1e-10,
+            "BR value should match: {} vs {}",
+            br0,
+            br0_plain,
+        );
+
+        // Predictions should have been written (at least some non-zero).
+        let preds = predict_store.predictions.as_ref().expect("predictions enabled");
+        let any_nonzero = preds
+            .iter()
+            .any(|a| a.load(std::sync::atomic::Ordering::Relaxed) != 0);
+        assert!(any_nonzero, "predictions should be populated by BR traversal");
     }
 }

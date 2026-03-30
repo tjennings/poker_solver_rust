@@ -209,6 +209,16 @@ pub struct TrainingConfig {
     /// SAPCFR+ prediction step size (0 = no prediction, 1 = full PCFR+).
     #[serde(default = "default_sapcfr_eta")]
     pub sapcfr_eta: f64,
+    /// BRCFR+ prediction weight (0 = no prediction, 1 = full weight).
+    #[serde(default = "default_brcfr_eta")]
+    pub brcfr_eta: f64,
+    /// Number of pure DCFR+ warmup iterations before BRCFR+ best-response
+    /// passes begin. Default 0 (no warmup).
+    #[serde(default)]
+    pub brcfr_warmup_iterations: u64,
+    /// Iterations between best-response passes in BRCFR+.
+    #[serde(default = "default_brcfr_interval")]
+    pub brcfr_interval: u64,
     /// Enable variance-reducing baselines for opponent external sampling.
     /// When true, uses VR-MCCFR (Schmid et al., AAAI 2019) to reduce
     /// sampling variance while remaining unbiased.
@@ -344,6 +354,14 @@ fn default_optimizer() -> String {
 
 fn default_sapcfr_eta() -> f64 {
     0.33
+}
+
+fn default_brcfr_eta() -> f64 {
+    0.6
+}
+
+const fn default_brcfr_interval() -> u64 {
+    100_000_000
 }
 
 const fn default_exploitability_samples() -> u64 {
@@ -507,6 +525,9 @@ snapshots:
                 dcfr_epoch_cap: None,
                 optimizer: "dcfr".to_string(),
                 sapcfr_eta: 0.5,
+                brcfr_eta: 0.6,
+                brcfr_warmup_iterations: 0,
+                brcfr_interval: 100_000_000,
                 use_baselines: false,
                 baseline_alpha: 0.01,
                 prune_streets: None,
@@ -1046,6 +1067,53 @@ snapshots:
         let cfg: BlueprintV2Config =
             serde_yaml::from_str(yaml).expect("failed to parse config");
         assert_eq!(cfg.training.prune_street_mask(), [false; 4]);
+    }
+
+    #[test]
+    fn test_optimizer_brcfr_plus_config() {
+        let yaml = r#"
+game:
+  name: test
+  players: 2
+  stack_depth: 200
+  small_blind: 1
+  big_blind: 2
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+action_abstraction:
+  preflop:
+    - ["5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+training:
+  optimizer: "brcfr+"
+  brcfr_eta: 0.7
+  brcfr_warmup_iterations: 300000000
+  brcfr_interval: 100000000
+  dcfr_alpha: 1.5
+  dcfr_gamma: 2.0
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse brcfr+ config");
+        assert_eq!(cfg.training.optimizer, "brcfr+");
+        assert!((cfg.training.brcfr_eta - 0.7).abs() < f64::EPSILON);
+        assert_eq!(cfg.training.brcfr_warmup_iterations, 300_000_000);
+        assert_eq!(cfg.training.brcfr_interval, 100_000_000);
     }
 
     #[test]

@@ -61,6 +61,9 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
             dcfr_epoch_cap: None,
             optimizer: "dcfr".to_string(),
             sapcfr_eta: 0.5,
+            brcfr_eta: 0.6,
+            brcfr_warmup_iterations: 0,
+            brcfr_interval: 100_000_000,
             use_baselines: false,
             baseline_alpha: 0.01,
             prune_streets: None,
@@ -264,5 +267,102 @@ fn blueprint_v2_e2e_pipeline() {
         loaded_config.clustering.river.buckets,
         config.clustering.river.buckets,
         "config round-trip: river buckets mismatch"
+    );
+}
+
+/// BRCFR+ convergence: train on a small game and verify exploitability drops.
+#[test]
+fn brcfr_plus_converges_small_game() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let run_dir = dir.path().join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+
+    let config = BlueprintV2Config {
+        game: GameConfig {
+            name: "BRCFR+ Test".to_string(),
+            players: 2,
+            stack_depth: 10.0,
+            small_blind: 1.0,
+            big_blind: 2.0,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        },
+        clustering: ClusteringConfig {
+            algorithm: ClusteringAlgorithm::PotentialAwareEmd,
+            preflop: StreetClusterConfig { buckets: 5, delta_bins: None, expected_delta: false, sample_boards: None },
+            flop: StreetClusterConfig { buckets: 5, delta_bins: None, expected_delta: false, sample_boards: None },
+            turn: StreetClusterConfig { buckets: 5, delta_bins: None, expected_delta: false, sample_boards: None },
+            river: StreetClusterConfig { buckets: 5, delta_bins: None, expected_delta: false, sample_boards: None },
+            seed: 42,
+            kmeans_iterations: 10,
+            cfvnet_river_data: None,
+            per_flop: None,
+        },
+        action_abstraction: ActionAbstractionConfig {
+            preflop: vec![vec!["5bb".into()]],
+            flop: vec![vec![1.0]],
+            turn: vec![vec![1.0]],
+            river: vec![vec![1.0]],
+        },
+        training: TrainingConfig {
+            cluster_path: None,
+            iterations: Some(2000),
+            time_limit_minutes: None,
+            lcfr_warmup_iterations: 0,
+            lcfr_discount_interval: 1,
+            prune_after_iterations: 9999,
+            prune_threshold: -310_000_000,
+            prune_explore_pct: 0.05,
+            print_every_minutes: 9999,
+            batch_size: 1,
+            target_strategy_delta: None,
+            purify_threshold: 0.0,
+            equity_cache_path: None,
+            dcfr_alpha: 1.0,
+            dcfr_beta: 1.0,
+            dcfr_gamma: 1.0,
+            dcfr_epoch_cap: None,
+            optimizer: "brcfr+".to_string(),
+            sapcfr_eta: 0.5,
+            brcfr_eta: 0.6,
+            brcfr_warmup_iterations: 500,
+            brcfr_interval: 200,
+            use_baselines: false,
+            baseline_alpha: 0.01,
+            prune_streets: None,
+            regret_floor: None,
+            exploitability_interval_minutes: 0,
+            exploitability_samples: 50,
+        },
+        snapshots: SnapshotConfig {
+            warmup_minutes: 9999,
+            snapshot_every_minutes: 9999,
+            output_dir: run_dir.to_string_lossy().into_owned(),
+            resume: false,
+            max_snapshots: None,
+        },
+    };
+
+    let mut trainer = BlueprintTrainer::new(config);
+    trainer.skip_bucket_validation = true;
+    trainer.buckets.equity_fallback = true;
+    trainer.train().expect("brcfr+ training should complete");
+
+    let exploit = trainer.compute_exploitability();
+    assert!(
+        exploit < 2500.0,
+        "exploitability should be reasonable: got {exploit}"
+    );
+
+    let preds = trainer
+        .storage
+        .predictions()
+        .expect("predictions enabled");
+    let any_nonzero = preds
+        .iter()
+        .any(|a| a.load(std::sync::atomic::Ordering::Relaxed) != 0);
+    assert!(
+        any_nonzero,
+        "predictions should be populated after BR passes"
     );
 }

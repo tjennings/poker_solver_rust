@@ -28,7 +28,7 @@ use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
 use super::mccfr::{traverse_best_response, traverse_external, AllBuckets, Deal, DealWithBuckets, FullTreeEvTracker, PruneStats, ScenarioEvTracker, PRUNE_HITS, PRUNE_TOTAL};
 use super::storage::BlueprintStorage;
-use crate::cfr::optimizer::{CfrOptimizer, DcfrOptimizer, SapcfrPlusOptimizer};
+use crate::cfr::optimizer::{BrcfrPlusOptimizer, CfrOptimizer, DcfrOptimizer, SapcfrPlusOptimizer};
 use crate::hands::CanonicalHand;
 use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
 
@@ -132,6 +132,8 @@ pub struct BlueprintTrainer {
     pub iterations: u64,
     last_discount_time: u64,
     last_print_time: u64,
+    /// Iteration of the most recent BR prediction pass (BRCFR+).
+    pub last_br_iteration: u64,
     last_snapshot_time: u64,
     snapshot_count: u32,
     /// Pre-allocated deck for [`sample_deal`](Self::sample_deal), avoiding
@@ -259,7 +261,13 @@ impl BlueprintTrainer {
         }
 
         // Create the pluggable optimizer based on config.
-        let optimizer: Arc<dyn CfrOptimizer> = if config.training.optimizer == "sapcfr+" {
+        let optimizer: Arc<dyn CfrOptimizer> = if config.training.optimizer == "brcfr+" {
+            Arc::new(BrcfrPlusOptimizer::new(
+                config.training.dcfr_alpha,
+                config.training.dcfr_gamma,
+                config.training.brcfr_eta,
+            ))
+        } else if config.training.optimizer == "sapcfr+" {
             Arc::new(SapcfrPlusOptimizer {
                 alpha: config.training.dcfr_alpha,
                 gamma: config.training.dcfr_gamma,
@@ -338,6 +346,7 @@ impl BlueprintTrainer {
             iterations: 0,
             last_discount_time: 0,
             last_print_time: 0,
+            last_br_iteration: 0,
             last_snapshot_time: 0,
             snapshot_count: 0,
             deck,
@@ -459,7 +468,13 @@ impl BlueprintTrainer {
                 eprintln!("  Clamped {clamped} regret values to floor ({floor} chips)");
             }
         }
-        let optimizer: Arc<dyn CfrOptimizer> = if self.config.training.optimizer == "sapcfr+" {
+        let optimizer: Arc<dyn CfrOptimizer> = if self.config.training.optimizer == "brcfr+" {
+            Arc::new(BrcfrPlusOptimizer::new(
+                self.config.training.dcfr_alpha,
+                self.config.training.dcfr_gamma,
+                self.config.training.brcfr_eta,
+            ))
+        } else if self.config.training.optimizer == "sapcfr+" {
             Arc::new(SapcfrPlusOptimizer {
                 alpha: self.config.training.dcfr_alpha,
                 gamma: self.config.training.dcfr_gamma,
@@ -705,10 +720,10 @@ impl BlueprintTrainer {
                 let deal = DealWithBuckets { deal, buckets };
 
                 let br0 = traverse_best_response(
-                    tree, storage, &deal, 0, tree.root, rake_rate, rake_cap,
+                    tree, storage, &deal, 0, tree.root, rake_rate, rake_cap, None,
                 );
                 let br1 = traverse_best_response(
-                    tree, storage, &deal, 1, tree.root, rake_rate, rake_cap,
+                    tree, storage, &deal, 1, tree.root, rake_rate, rake_cap, None,
                 );
                 (br0, br1)
             })
@@ -716,6 +731,46 @@ impl BlueprintTrainer {
 
         let n_f = n as f64;
         // Exploitability in mbb/hand: avg BR value in chips, convert to mBB.
+        (sum_p0 / n_f + sum_p1 / n_f) / 2.0 / big_blind * 1000.0
+    }
+
+    fn run_br_prediction_pass(&mut self) -> f64 {
+        let n = self.config.training.exploitability_samples.max(1);
+        let tree = &self.tree;
+        let storage = &self.storage;
+        let buckets_ref = &self.buckets;
+        let rake_rate = self.config.game.rake_rate;
+        let rake_cap = self.config.game.rake_cap;
+        let big_blind = self.config.game.big_blind;
+
+        // Unlock predictions so BR traversal can write.
+        self.storage.unlock_predictions();
+
+        let (sum_p0, sum_p1): (f64, f64) = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut rng = SmallRng::seed_from_u64(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let deal = sample_deal_with_rng(&mut rng);
+                let buckets = buckets_ref.precompute_buckets(&deal);
+                let deal = DealWithBuckets { deal, buckets };
+
+                let br0 = traverse_best_response(
+                    tree, storage, &deal, 0, tree.root, rake_rate, rake_cap,
+                    Some(storage),
+                );
+                let br1 = traverse_best_response(
+                    tree, storage, &deal, 1, tree.root, rake_rate, rake_cap,
+                    Some(storage),
+                );
+                (br0, br1)
+            })
+            .reduce(|| (0.0, 0.0), |(a0, a1), (b0, b1)| (a0 + b0, a1 + b1));
+
+        // Lock predictions to prevent MCCFR from overwriting.
+        self.storage.lock_predictions();
+        self.last_br_iteration = self.iterations;
+
+        let n_f = n as f64;
         (sum_p0 / n_f + sum_p1 / n_f) / 2.0 / big_blind * 1000.0
     }
 
@@ -872,6 +927,41 @@ impl BlueprintTrainer {
             };
             callback(&self.storage, &self.tree, &hand_evs);
             self.last_random_scenario_min = elapsed_min;
+        }
+
+        // BRCFR+ BR prediction pass (iteration-based).
+        if self.config.training.optimizer == "brcfr+" {
+            let warmup = self.config.training.brcfr_warmup_iterations;
+            let interval = self.config.training.brcfr_interval.max(1);
+
+            if self.iterations >= warmup {
+                let should_br = if self.last_br_iteration < warmup {
+                    true // First pass right at warmup boundary
+                } else {
+                    self.iterations >= self.last_br_iteration + interval
+                };
+
+                if should_br {
+                    let exploit = self.run_br_prediction_pass();
+                    if !self.tui_active {
+                        eprintln!("  BRCFR+ BR pass: exploitability = {exploit:.2} mbb/hand");
+                    }
+                    if let Some(ref cb) = self.on_exploitability {
+                        cb(exploit);
+                    }
+                }
+            }
+
+            // Update decay on the optimizer.
+            let decay = if self.iterations < warmup || self.last_br_iteration == 0 {
+                0.0
+            } else {
+                let elapsed_iters = self.iterations.saturating_sub(self.last_br_iteration) as f64;
+                (1.0 - elapsed_iters / interval as f64).max(0.0)
+            };
+            if let Some(ref opt) = self.storage.optimizer {
+                opt.set_decay(decay);
+            }
         }
 
         Ok(())
@@ -1384,6 +1474,9 @@ mod tests {
                 dcfr_epoch_cap: None,
                 optimizer: "dcfr".to_string(),
                 sapcfr_eta: 0.5,
+                brcfr_eta: 0.6,
+                brcfr_warmup_iterations: 0,
+                brcfr_interval: 100_000_000,
                 use_baselines: false,
                 baseline_alpha: 0.01,
                 prune_streets: None,
@@ -2130,6 +2223,47 @@ mod tests {
         assert!(
             exploit <= 10_000.0,
             "Exploitability should be <= stack depth in mbb, got {exploit}",
+        );
+    }
+
+    #[test]
+    fn trainer_creates_brcfr_optimizer() {
+        let mut config = toy_config();
+        config.training.optimizer = "brcfr+".to_string();
+        config.training.brcfr_eta = 0.7;
+        let trainer = BlueprintTrainer::new(config);
+        let opt = trainer.storage.optimizer.as_ref().expect("optimizer should be set");
+        assert_eq!(opt.name(), "brcfr+");
+        assert!(trainer.storage.predictions.is_some(), "predictions should be enabled");
+    }
+
+    #[test]
+    fn brcfr_runs_br_pass_after_warmup() {
+        let mut config = toy_config();
+        config.training.optimizer = "brcfr+".to_string();
+        config.training.brcfr_eta = 0.6;
+        config.training.brcfr_warmup_iterations = 200;
+        config.training.brcfr_interval = 200;
+        config.training.iterations = Some(400);
+        config.training.exploitability_samples = 100;
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("training should complete");
+        // After training 400 iters with warmup=200, interval=200, we should have
+        // had at least 1 BR pass (at iter 200).
+        // Predictions should be populated.
+        let preds = trainer.storage.predictions.as_ref().expect("predictions enabled");
+        let any_nonzero = preds.iter().any(|a| a.load(Ordering::Relaxed) != 0);
+        assert!(any_nonzero, "predictions should be populated after BR pass");
+        // last_br_iteration should have been advanced past 0.
+        assert!(
+            trainer.last_br_iteration > 0,
+            "last_br_iteration should be > 0 after BR pass, got {}",
+            trainer.last_br_iteration,
+        );
+        // predictions should be locked after the BR pass
+        assert!(
+            trainer.storage.predictions_locked.load(Ordering::Relaxed),
+            "predictions should be locked after BR pass",
         );
     }
 }

@@ -12,7 +12,7 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use super::game_tree::{GameNode, GameTree};
@@ -53,6 +53,9 @@ pub struct BlueprintStorage {
     /// Stores instantaneous regrets from the previous iteration,
     /// scaled by `REGRET_SCALE`.
     pub(crate) predictions: Option<Vec<AtomicI64>>,
+    /// When true, `set_prediction` becomes a no-op. Used by BRCFR+ to
+    /// protect BR-derived predictions from being overwritten by MCCFR.
+    pub predictions_locked: AtomicBool,
     /// Optional pluggable optimizer (DCFR, SAPCFR+, etc.).
     pub(crate) optimizer: Option<Arc<dyn CfrOptimizer>>,
     /// Number of buckets per street `[preflop, flop, turn, river]`.
@@ -118,6 +121,7 @@ impl BlueprintStorage {
             strategy_sums: (0..total).map(|_| AtomicI64::new(0)).collect(),
             baselines: None,
             predictions: None,
+            predictions_locked: AtomicBool::new(false),
             optimizer: None,
             bucket_counts,
             layout,
@@ -240,6 +244,22 @@ impl BlueprintStorage {
         self.predictions = Some((0..total).map(|_| AtomicI64::new(0)).collect());
     }
 
+    /// Lock the prediction buffer so `set_prediction` becomes a no-op.
+    pub fn lock_predictions(&self) {
+        self.predictions_locked.store(true, Ordering::Relaxed);
+    }
+
+    /// Unlock the prediction buffer so `set_prediction` writes again.
+    pub fn unlock_predictions(&self) {
+        self.predictions_locked.store(false, Ordering::Relaxed);
+    }
+
+    /// Return a reference to the predictions buffer, if enabled.
+    #[must_use]
+    pub fn predictions(&self) -> Option<&[AtomicI64]> {
+        self.predictions.as_deref()
+    }
+
     /// Read a prediction value for a (node, bucket, action) slot.
     /// Returns 0 when predictions are disabled.
     #[inline]
@@ -251,9 +271,12 @@ impl BlueprintStorage {
     }
 
     /// Write a prediction value for a (node, bucket, action) slot.
-    /// No-op when predictions are disabled.
+    /// No-op when predictions are disabled or locked.
     #[inline]
     pub fn set_prediction(&self, node_idx: u32, bucket: u16, action: usize, value: i64) {
+        if self.predictions_locked.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(ref p) = self.predictions {
             p[self.slot_index(node_idx, bucket, action)].store(value, Ordering::Relaxed);
         }
@@ -1121,6 +1144,38 @@ mod tests {
 
         assert_eq!(loaded.get_regret(node_idx, 5, 0), large_val);
         assert_eq!(loaded.get_strategy_sum(node_idx, 5, 0), 999);
+    }
+
+    #[test]
+    fn predictions_locked_prevents_writes() {
+        let tree = toy_tree();
+        let mut storage = BlueprintStorage::new(&tree, [2, 2, 2, 2]);
+        storage.enable_predictions();
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        // Write a prediction value.
+        storage.set_prediction(node_idx, 0, 0, 42);
+        assert_eq!(storage.get_prediction(node_idx, 0, 0), 42);
+        // Lock predictions.
+        storage.lock_predictions();
+        // Write should be silently ignored.
+        storage.set_prediction(node_idx, 0, 0, 999);
+        assert_eq!(storage.get_prediction(node_idx, 0, 0), 42, "locked buffer should not change");
+        // Unlock.
+        storage.unlock_predictions();
+        storage.set_prediction(node_idx, 0, 0, 999);
+        assert_eq!(storage.get_prediction(node_idx, 0, 0), 999, "unlocked buffer should update");
+    }
+
+    #[test]
+    fn predictions_locked_default_is_false() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [2, 2, 2, 2]);
+        // Default: predictions are not locked (writes should work if enabled).
+        assert!(!storage.predictions_locked.load(Ordering::Relaxed));
     }
 
     #[test]
