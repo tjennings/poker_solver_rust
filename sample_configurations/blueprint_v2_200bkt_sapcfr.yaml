@@ -52,7 +52,9 @@ training:
   optimizer: "dcfr+"
   dcfr_alpha: 1.5
   dcfr_gamma: 2.0
- 
+  exploitability_interval_minutes: 30
+  exploitability_samples: 100000
+
   # SAPCFR+ optimizer with prediction-based strategy
   # optimizer: "sapcfr+"
   # sapcfr_eta: 0.6
