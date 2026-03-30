@@ -230,6 +230,12 @@ pub struct TrainingConfig {
     /// raw (with i32 storage). Default: None (no floor).
     #[serde(default)]
     pub regret_floor: Option<i64>,
+    /// Minutes between exploitability measurements. 0 = disabled.
+    #[serde(default)]
+    pub exploitability_interval_minutes: u64,
+    /// Number of deals to sample per exploitability measurement.
+    #[serde(default = "default_exploitability_samples")]
+    pub exploitability_samples: u64,
 }
 
 impl TrainingConfig {
@@ -340,6 +346,10 @@ fn default_sapcfr_eta() -> f64 {
     0.33
 }
 
+const fn default_exploitability_samples() -> u64 {
+    100_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +452,10 @@ snapshots:
         assert_eq!(cfg.snapshots.warmup_minutes, 60);
         assert_eq!(cfg.snapshots.snapshot_every_minutes, 30);
         assert_eq!(cfg.snapshots.output_dir, "/tmp/snapshots");
+
+        // Exploitability defaults (omitted from YAML → should get defaults)
+        assert_eq!(cfg.training.exploitability_interval_minutes, 0);
+        assert_eq!(cfg.training.exploitability_samples, 100_000);
     }
 
     #[test]
@@ -497,6 +511,8 @@ snapshots:
                 baseline_alpha: 0.01,
                 prune_streets: None,
                 regret_floor: None,
+                exploitability_interval_minutes: 0,
+                exploitability_samples: 100_000,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 120,
