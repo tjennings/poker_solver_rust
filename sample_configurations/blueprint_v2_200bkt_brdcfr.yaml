@@ -25,24 +25,21 @@ action_abstraction:
     - ["4bb", "10bb"]
     - ["22bb"]
   flop:
-    - [0.25, 0.33, 0.75, 1.0]
-    - [0.33, 0.67, 1.0, 1.5]
-    - [0.67, 2.0]
+    - [0.33, 0.75, 1.0]
+    - [2.0]
   turn:
-    - [0.25, 0.33, 0.75, 1.0]
-    - [0.33, 0.75, 1.0, 1.5]
-    - [0.67, 2.0]
+    - [0.33, 0.75, 1.0]
+    - [2.0]
   river:
-    - [0.25, 0.33, 0.75, 1.0]
-    - [0.33, 0.75, 1.0, 1.5]
-    - [0.33, 0.67, 1.0, 2.0]
+    - [0.33, 0.75, 1.0]
+    - [2.0]
 
 training:
   cluster_path: "./local_data/buckets/200_v1"
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 300000000
   prune_after_iterations: 100000000
-  prune_threshold: -300000
+  prune_threshold: -250000
   prune_streets: [flop, turn]
   regret_floor: -310000
   lcfr_discount_interval: 300000000
@@ -69,8 +66,8 @@ training:
   # BRCFR+ optimizer with periodic best-response prediction
   optimizer: "brcfr+"
   brcfr_eta: 0.6
-  brcfr_warmup_iterations: 300000000
-  brcfr_interval: 100000000
+  brcfr_warmup_iterations: 600000000
+  brcfr_interval: 300000000
   dcfr_alpha: 1.5
   dcfr_gamma: 2.0
   exploitability_samples: 25000
@@ -79,7 +76,7 @@ snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/200_100bb_no_prune_preflop_v1"
+  output_dir: "./local_data/blueprints/200_100bb_brdcfr_test"
 
 tui:
   enabled: true
