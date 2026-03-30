@@ -965,7 +965,7 @@ fn traverse_traverser(
 
     // Accumulate strategy sums (for computing the average strategy).
     for (a, &s) in strategy.iter().enumerate().take(num_actions) {
-        storage.add_strategy_sum(node_idx, bucket, a, (s * 1000.0) as i32);
+        storage.add_strategy_sum(node_idx, bucket, a, (s * 1000.0) as i64);
     }
 
     // Accumulate EV at tracked scenario nodes.

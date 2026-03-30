@@ -8,7 +8,7 @@
 // regret values. Truncation from f64 back to i32 is intentional.
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
 
 use rayon::prelude::*;
 
@@ -26,7 +26,7 @@ pub trait CfrOptimizer: Send + Sync {
     fn apply_discount(
         &self,
         regrets: &[AtomicI32],
-        strategy_sums: &[AtomicI32],
+        strategy_sums: &[AtomicI64],
         predictions: Option<&[AtomicI32]>,
         iteration: u64,
     );
@@ -75,7 +75,7 @@ impl CfrOptimizer for DcfrOptimizer {
     fn apply_discount(
         &self,
         regrets: &[AtomicI32],
-        strategy_sums: &[AtomicI32],
+        strategy_sums: &[AtomicI64],
         _predictions: Option<&[AtomicI32]>,
         iteration: u64,
     ) {
@@ -94,7 +94,7 @@ impl CfrOptimizer for DcfrOptimizer {
 
         strategy_sums.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
-            atom.store((v as f64 * d_strat) as i32, Ordering::Relaxed);
+            atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
         });
     }
 
@@ -154,7 +154,7 @@ impl CfrOptimizer for SapcfrPlusOptimizer {
     fn apply_discount(
         &self,
         regrets: &[AtomicI32],
-        strategy_sums: &[AtomicI32],
+        strategy_sums: &[AtomicI64],
         _predictions: Option<&[AtomicI32]>,
         iteration: u64,
     ) {
@@ -173,7 +173,7 @@ impl CfrOptimizer for SapcfrPlusOptimizer {
         // Discount strategy sums.
         strategy_sums.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
-            atom.store((v as f64 * d_strat) as i32, Ordering::Relaxed);
+            atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
         });
     }
 
@@ -258,7 +258,7 @@ impl CfrOptimizer for BrcfrPlusOptimizer {
     fn apply_discount(
         &self,
         regrets: &[AtomicI32],
-        strategy_sums: &[AtomicI32],
+        strategy_sums: &[AtomicI64],
         _predictions: Option<&[AtomicI32]>,
         iteration: u64,
     ) {
@@ -277,7 +277,7 @@ impl CfrOptimizer for BrcfrPlusOptimizer {
         // Discount strategy sums.
         strategy_sums.par_iter().for_each(|atom| {
             let v = atom.load(Ordering::Relaxed);
-            atom.store((v as f64 * d_strat) as i32, Ordering::Relaxed);
+            atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
         });
     }
 
@@ -337,7 +337,7 @@ mod tests {
             gamma: 2.0,
         };
         let regrets = vec![AtomicI32::new(1000), AtomicI32::new(-500)];
-        let strats = vec![AtomicI32::new(2000)];
+        let strats = vec![AtomicI64::new(2000)];
         opt.apply_discount(&regrets, &strats, None, 10);
 
         // d_pos = 10^1.5 / (10^1.5 + 1) ~= 31.623 / 32.623 ~= 0.9693
@@ -361,12 +361,12 @@ mod tests {
             gamma: 2.0,
         };
         let regrets: Vec<AtomicI32> = vec![];
-        let strats = vec![AtomicI32::new(2000)];
+        let strats = vec![AtomicI64::new(2000)];
         opt.apply_discount(&regrets, &strats, None, 10);
 
         // d_strat = (10/11)^2.0 ~= 0.8264
         let s0 = strats[0].load(Ordering::Relaxed);
-        let expected = (2000.0 * (10.0_f64 / 11.0).powf(2.0)) as i32;
+        let expected = (2000.0 * (10.0_f64 / 11.0).powf(2.0)) as i64;
         assert_eq!(s0, expected, "strategy sum discounted");
     }
 
@@ -379,7 +379,7 @@ mod tests {
             gamma: 2.0,
         };
         let regrets = vec![AtomicI32::new(1000)];
-        let strats = vec![AtomicI32::new(2000)];
+        let strats = vec![AtomicI64::new(2000)];
         let preds = vec![AtomicI32::new(999)];
         // Passing predictions should not change behavior for DCFR
         opt.apply_discount(&regrets, &strats, Some(&preds), 10);
@@ -550,7 +550,7 @@ mod tests {
             eta: 0.5,
         };
         let regrets = vec![AtomicI32::new(1000), AtomicI32::new(-500)];
-        let strats = vec![AtomicI32::new(2000)];
+        let strats = vec![AtomicI64::new(2000)];
         opt.apply_discount(&regrets, &strats, None, 10);
         // Negative regrets are floored to 0 (RM+ style).
         let r1 = regrets[1].load(Ordering::Relaxed);
@@ -569,10 +569,10 @@ mod tests {
             eta: 0.5,
         };
         let regrets: Vec<AtomicI32> = vec![];
-        let strats = vec![AtomicI32::new(2000)];
+        let strats = vec![AtomicI64::new(2000)];
         opt.apply_discount(&regrets, &strats, None, 10);
         let s0 = strats[0].load(Ordering::Relaxed);
-        let expected = (2000.0 * (10.0_f64 / 11.0).powf(2.0)) as i32;
+        let expected = (2000.0 * (10.0_f64 / 11.0).powf(2.0)) as i64;
         assert_eq!(s0, expected, "strategy sum discounted like DCFR");
     }
 
@@ -669,7 +669,7 @@ mod tests {
         let opt = BrcfrPlusOptimizer::new(1.5, 2.0, 0.6);
         opt.set_decay(1.0);
         let regrets = vec![AtomicI32::new(1000), AtomicI32::new(-500)];
-        let strats = vec![AtomicI32::new(2000)];
+        let strats = vec![AtomicI64::new(2000)];
         opt.apply_discount(&regrets, &strats, None, 10);
         // Negative regrets are floored to 0 (RM+ style).
         let r1 = regrets[1].load(Ordering::Relaxed);
@@ -713,5 +713,55 @@ mod tests {
         trait_ref.set_decay(0.5);
         // Verify the decay updated
         assert!((opt.decay() - 0.5).abs() < f64::EPSILON, "trait set_decay should update value");
+    }
+
+    // --- Strategy sums i64 tests ---
+
+    #[test]
+    fn dcfr_discount_strategy_sums_i64() {
+        use super::*;
+        use std::sync::atomic::AtomicI64;
+        let opt = DcfrOptimizer {
+            alpha: 1.5,
+            beta: 0.0,
+            gamma: 2.0,
+        };
+        let regrets: Vec<AtomicI32> = vec![];
+        let strats = vec![AtomicI64::new(5_000_000_000_i64)];
+        opt.apply_discount(&regrets, &strats, None, 10);
+        // d_strat = (10/11)^2.0 ~= 0.8264
+        let s0 = strats[0].load(Ordering::Relaxed);
+        let expected = (5_000_000_000.0 * (10.0_f64 / 11.0).powf(2.0)) as i64;
+        assert_eq!(s0, expected, "i64 strategy sum discounted correctly");
+    }
+
+    #[test]
+    fn sapcfr_discount_strategy_sums_i64() {
+        use super::*;
+        use std::sync::atomic::AtomicI64;
+        let opt = SapcfrPlusOptimizer {
+            alpha: 1.5,
+            gamma: 2.0,
+            eta: 0.5,
+        };
+        let regrets: Vec<AtomicI32> = vec![];
+        let strats = vec![AtomicI64::new(5_000_000_000_i64)];
+        opt.apply_discount(&regrets, &strats, None, 10);
+        let s0 = strats[0].load(Ordering::Relaxed);
+        let expected = (5_000_000_000.0 * (10.0_f64 / 11.0).powf(2.0)) as i64;
+        assert_eq!(s0, expected, "i64 strategy sum discounted correctly");
+    }
+
+    #[test]
+    fn brcfr_discount_strategy_sums_i64() {
+        use super::*;
+        use std::sync::atomic::AtomicI64;
+        let opt = BrcfrPlusOptimizer::new(1.5, 2.0, 0.6);
+        let regrets: Vec<AtomicI32> = vec![];
+        let strats = vec![AtomicI64::new(5_000_000_000_i64)];
+        opt.apply_discount(&regrets, &strats, None, 10);
+        let s0 = strats[0].load(Ordering::Relaxed);
+        let expected = (5_000_000_000.0 * (10.0_f64 / 11.0).powf(2.0)) as i64;
+        assert_eq!(s0, expected, "i64 strategy sum discounted correctly");
     }
 }

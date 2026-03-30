@@ -192,7 +192,7 @@ pub struct BlueprintTrainer {
 
     // --- Strategy delta stopping ---
     /// Previous strategy-sum snapshot for delta computation.
-    prev_strategy_sums: Option<Vec<i32>>,
+    prev_strategy_sums: Option<Vec<i64>>,
     /// Most recent strategy delta value.
     pub last_strategy_delta: f64,
     /// Most recent fraction of info sets with max action delta > 0.20.
@@ -1058,7 +1058,7 @@ impl BlueprintTrainer {
             });
             self.storage.strategy_sums.par_iter().for_each(|atom| {
                 let v = atom.load(Ordering::Relaxed);
-                atom.store((v as f64 * d_strat) as i32, Ordering::Relaxed);
+                atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
             });
         }
 
@@ -1724,8 +1724,8 @@ mod tests {
         );
 
         // d_strat = (5/6)^1 = 5/6 ≈ 0.8333
-        // strategy_sum: (2000 * 5/6) as i32 = 1666
-        let expected_strat = (2000.0 * 5.0 / 6.0) as i32;
+        // strategy_sum: (2000 * 5/6) as i64 = 1666
+        let expected_strat = (2000.0 * 5.0 / 6.0) as i64;
         assert_eq!(
             trainer.storage.strategy_sums[0].load(Ordering::Relaxed),
             expected_strat,
@@ -1757,7 +1757,7 @@ mod tests {
         );
 
         // d_strat = (10/11)^1 ≈ 0.9091
-        let expected_strat = (2000.0 * 10.0 / 11.0) as i32;
+        let expected_strat = (2000.0 * 10.0 / 11.0) as i64;
         assert_eq!(
             trainer.storage.strategy_sums[0].load(Ordering::Relaxed),
             expected_strat,

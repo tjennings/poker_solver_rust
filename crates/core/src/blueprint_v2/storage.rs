@@ -12,7 +12,7 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use super::game_tree::{GameNode, GameTree};
@@ -43,8 +43,10 @@ pub struct BlueprintStorage {
     /// Cumulative regrets: one `AtomicI32` per (decision node, bucket, action).
     /// Stored as fixed-point: `(chip_value * REGRET_SCALE) as i32`.
     pub regrets: Vec<AtomicI32>,
-    /// Strategy sums: one `AtomicI32` per (decision node, bucket, action).
-    pub strategy_sums: Vec<AtomicI32>,
+    /// Strategy sums: one `AtomicI64` per (decision node, bucket, action).
+    /// Uses i64 to prevent overflow during long training runs where sums
+    /// accumulate monotonically after LCFR warmup.
+    pub strategy_sums: Vec<AtomicI64>,
     /// Optional baseline buffer for VR-MCCFR variance reduction.
     /// Same layout as regrets. Stored as fixed-point `i32` values
     /// scaled by `REGRET_SCALE`.
@@ -106,8 +108,8 @@ impl BlueprintStorage {
             }
         }
 
-        let regret_bytes = total * 4;
-        let strategy_bytes = total * 4;
+        let regret_bytes = total * std::mem::size_of::<AtomicI32>();
+        let strategy_bytes = total * std::mem::size_of::<AtomicI64>();
         eprintln!(
             "  Storage: {} slots ({} regret + {} strategy = {} total)",
             total,
@@ -118,7 +120,7 @@ impl BlueprintStorage {
 
         Self {
             regrets: (0..total).map(|_| AtomicI32::new(0)).collect(),
-            strategy_sums: (0..total).map(|_| AtomicI32::new(0)).collect(),
+            strategy_sums: (0..total).map(|_| AtomicI64::new(0)).collect(),
             baselines: None,
             predictions: None,
             predictions_locked: AtomicBool::new(false),
@@ -222,7 +224,7 @@ impl BlueprintStorage {
     /// Read a single strategy sum value atomically.
     #[inline]
     #[must_use]
-    pub fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
+    pub fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64 {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
         self.strategy_sums[idx].load(Ordering::Relaxed)
@@ -230,7 +232,7 @@ impl BlueprintStorage {
 
     /// Add a delta to a single strategy sum value atomically.
     #[inline]
-    pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
+    pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
         self.strategy_sums[idx].fetch_add(delta, Ordering::Relaxed);
@@ -471,7 +473,7 @@ impl BlueprintStorage {
     /// # Panics
     /// Panics if `prev_sums.len()` differs from `self.strategy_sums.len()`.
     #[must_use]
-    pub fn strategy_delta(&self, prev_sums: &[i32]) -> (f64, f64) {
+    pub fn strategy_delta(&self, prev_sums: &[i64]) -> (f64, f64) {
         assert_eq!(prev_sums.len(), self.strategy_sums.len());
         let mut total_delta = 0.0_f64;
         let mut num_groups = 0_u64;
@@ -525,9 +527,9 @@ impl BlueprintStorage {
         }
     }
 
-    /// Snapshot the current strategy sums as plain `i32` values.
+    /// Snapshot the current strategy sums as plain `i64` values.
     #[must_use]
-    pub fn snapshot_strategy_sums(&self) -> Vec<i32> {
+    pub fn snapshot_strategy_sums(&self) -> Vec<i64> {
         self.strategy_sums
             .iter()
             .map(|a| a.load(Ordering::Relaxed))
@@ -550,7 +552,7 @@ impl BlueprintStorage {
             .iter()
             .map(|a| a.load(Ordering::Relaxed))
             .collect();
-        let sums_plain: Vec<i32> = self
+        let sums_plain: Vec<i64> = self
             .strategy_sums
             .iter()
             .map(|a| a.load(Ordering::Relaxed))
@@ -565,9 +567,10 @@ impl BlueprintStorage {
 
     /// Deserialize regrets and strategy sums, rebuilding layout from the tree.
     ///
-    /// Attempts to load as i32 format first. If that fails (e.g. legacy i64
-    /// checkpoint), falls back to loading as i64 and converting: values are
-    /// divided by 100 (old REGRET_SCALE was 100x larger) and cast to i32.
+    /// Attempts formats in order:
+    /// 1. Current format: `(bucket_counts, Vec<i32> regrets, Vec<i64> sums)`
+    /// 2. Legacy i32/i32: `(bucket_counts, Vec<i32> regrets, Vec<i32> sums)` — sums widened to i64
+    /// 3. Legacy i64/i64: `(bucket_counts, Vec<i64>, Vec<i64>)` — regrets divided by 100
     ///
     /// # Errors
     ///
@@ -580,9 +583,9 @@ impl BlueprintStorage {
     ) -> std::io::Result<Self> {
         let data = std::fs::read(path)?;
 
-        // Try i32 format first.
+        // Try current format: i32 regrets + i64 strategy sums.
         if let Ok((stored_counts, regrets_plain, sums_plain)) =
-            bincode::deserialize::<([u16; 4], Vec<i32>, Vec<i32>)>(&data)
+            bincode::deserialize::<([u16; 4], Vec<i32>, Vec<i64>)>(&data)
         {
             if stored_counts == bucket_counts {
                 let storage = Self::new(tree, bucket_counts);
@@ -600,7 +603,27 @@ impl BlueprintStorage {
             }
         }
 
-        // Legacy i64 fallback: divide by 100 (old scale was 100_000, new is 1_000).
+        // Legacy i32/i32 format: widen strategy sums from i32 to i64.
+        if let Ok((stored_counts, regrets_plain, sums_i32)) =
+            bincode::deserialize::<([u16; 4], Vec<i32>, Vec<i32>)>(&data)
+        {
+            if stored_counts == bucket_counts {
+                let storage = Self::new(tree, bucket_counts);
+                if regrets_plain.len() == storage.regrets.len()
+                    && sums_i32.len() == storage.strategy_sums.len()
+                {
+                    for (atom, &val) in storage.regrets.iter().zip(regrets_plain.iter()) {
+                        atom.store(val, Ordering::Relaxed);
+                    }
+                    for (atom, &val) in storage.strategy_sums.iter().zip(sums_i32.iter()) {
+                        atom.store(i64::from(val), Ordering::Relaxed);
+                    }
+                    return Ok(storage);
+                }
+            }
+        }
+
+        // Legacy i64/i64 fallback: divide regrets by 100 (old scale was 100_000, new is 1_000).
         let (stored_counts, regrets_i64, sums_i64): ([u16; 4], Vec<i64>, Vec<i64>) =
             bincode::deserialize(&data)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -646,7 +669,7 @@ impl BlueprintStorage {
             atom.store((val / 100) as i32, Ordering::Relaxed);
         }
         for (atom, &val) in storage.strategy_sums.iter().zip(sums_i64.iter()) {
-            atom.store((val / 100) as i32, Ordering::Relaxed);
+            atom.store(val / 100, Ordering::Relaxed);
         }
 
         Ok(storage)
@@ -1322,5 +1345,115 @@ mod tests {
         let storage = BlueprintStorage::new(&tree, [2, 2, 2, 2]);
         // Should not panic when predictions are None.
         storage.zero_predictions();
+    }
+
+    // --- Strategy sums i64 overflow prevention tests ---
+
+    #[test]
+    fn strategy_sum_holds_values_beyond_i32_max() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        // Store a value that exceeds i32::MAX (2_147_483_647).
+        let large_val: i64 = 3_000_000_000;
+        storage.add_strategy_sum(node_idx, 0, 0, large_val);
+        assert_eq!(storage.get_strategy_sum(node_idx, 0, 0), large_val);
+    }
+
+    #[test]
+    fn strategy_sum_accumulates_beyond_i32_range() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        // Accumulate many values that sum past i32::MAX.
+        let per_add: i64 = 1_000_000_000;
+        storage.add_strategy_sum(node_idx, 0, 0, per_add);
+        storage.add_strategy_sum(node_idx, 0, 0, per_add);
+        storage.add_strategy_sum(node_idx, 0, 0, per_add);
+        // Total = 3 billion, which overflows i32.
+        assert_eq!(storage.get_strategy_sum(node_idx, 0, 0), 3_000_000_000_i64);
+    }
+
+    #[test]
+    fn snapshot_strategy_sums_returns_i64() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        let large_val: i64 = 5_000_000_000;
+        storage.add_strategy_sum(node_idx, 0, 0, large_val);
+        let snap = storage.snapshot_strategy_sums();
+        let idx = storage.slot_index(node_idx, 0, 0);
+        assert_eq!(snap[idx], large_val);
+    }
+
+    #[test]
+    fn average_strategy_correct_with_large_i64_sums() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        let num_actions = storage.num_actions(node_idx) as usize;
+        if num_actions >= 2 {
+            // Use values beyond i32::MAX to verify f64 conversion works.
+            storage.add_strategy_sum(node_idx, 0, 0, 3_000_000_000_i64);
+            storage.add_strategy_sum(node_idx, 0, 1, 7_000_000_000_i64);
+        }
+        let avg = storage.average_strategy(node_idx, 0);
+        assert!((avg[0] - 0.3).abs() < 1e-6, "got {}", avg[0]);
+        assert!((avg[1] - 0.7).abs() < 1e-6, "got {}", avg[1]);
+    }
+
+    #[test]
+    fn strategy_delta_works_with_i64_sums() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        storage.add_strategy_sum(node_idx, 0, 0, 3_000_000_000_i64);
+        let snap = storage.snapshot_strategy_sums();
+        // Add more to change the distribution.
+        storage.add_strategy_sum(node_idx, 0, 0, 1_000_000_000_i64);
+        let (delta, _pct) = storage.strategy_delta(&snap);
+        // The delta should be computable (no overflow).
+        assert!(delta >= 0.0, "delta should be non-negative: {delta}");
+    }
+
+    #[test]
+    fn save_load_round_trip_i64_strategy_sums() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
+        let node_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, GameNode::Decision { .. }))
+            .expect("need a decision node") as u32;
+        let large_val: i64 = 5_000_000_000;
+        storage.add_strategy_sum(node_idx, 5, 0, large_val);
+        storage.add_regret(node_idx, 5, 0, 42);
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("storage.bin");
+        storage.save_regrets(&path).expect("save");
+        let loaded =
+            BlueprintStorage::load_regrets(&path, &tree, [50, 50, 50, 50]).expect("load");
+        assert_eq!(loaded.get_strategy_sum(node_idx, 5, 0), large_val);
+        assert_eq!(loaded.get_regret(node_idx, 5, 0), 42);
     }
 }
