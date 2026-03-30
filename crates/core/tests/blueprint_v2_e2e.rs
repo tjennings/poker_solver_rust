@@ -64,6 +64,7 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
             use_baselines: false,
             baseline_alpha: 0.01,
             prune_streets: None,
+            regret_floor: None,
         },
         snapshots: SnapshotConfig {
             warmup_minutes: 9999,

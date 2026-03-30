@@ -1948,6 +1948,7 @@ fn make_test_config() -> BlueprintV2Config {
             use_baselines: false,
             baseline_alpha: 0.01,
             prune_streets: None,
+            regret_floor: None,
         },
         snapshots: SnapshotConfig {
             warmup_minutes: 0,

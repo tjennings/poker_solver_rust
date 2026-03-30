@@ -60,6 +60,10 @@ pub struct BlueprintStorage {
     /// Per-node layout metadata. Non-decision nodes use the `Default`
     /// sentinel (`offset=0`, `num_actions=0`) and must never be queried.
     layout: Vec<NodeLayout>,
+    /// Floor for cumulative regret (scaled by REGRET_SCALE). When set,
+    /// regrets are clamped to this minimum after each update.
+    /// `i64::MIN` = no floor (default).
+    pub regret_floor: i64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -117,6 +121,7 @@ impl BlueprintStorage {
             optimizer: None,
             bucket_counts,
             layout,
+            regret_floor: i64::MIN,
         }
     }
 
@@ -190,15 +195,21 @@ impl BlueprintStorage {
         self.regrets[idx].load(Ordering::Relaxed)
     }
 
-    /// Add a delta to a single regret value atomically.
-    ///
-    /// Simple `fetch_add` with no clamping. The i64 range is large enough
-    /// that overflow is not a practical concern with REGRET_SCALE = 100,000.
+    /// Add a delta to a single regret value atomically, clamping to the
+    /// regret floor if one is configured.
     #[inline]
     pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
-        self.regrets[idx].fetch_add(delta, Ordering::Relaxed);
+        let atom = &self.regrets[idx];
+        if self.regret_floor == i64::MIN {
+            // Fast path: no floor configured.
+            atom.fetch_add(delta, Ordering::Relaxed);
+        } else {
+            atom.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(old.saturating_add(delta).max(self.regret_floor))
+            }).ok();
+        }
     }
 
     /// Read a single strategy sum value atomically.

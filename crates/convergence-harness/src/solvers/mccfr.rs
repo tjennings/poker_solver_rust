@@ -243,6 +243,7 @@ fn build_mccfr_config(
             use_baselines: false,
             baseline_alpha: 0.01,
             prune_streets: None,
+            regret_floor: None,
         },
         snapshots: SnapshotConfig {
             warmup_minutes: 9999,

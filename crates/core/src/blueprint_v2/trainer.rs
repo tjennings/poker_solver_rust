@@ -236,6 +236,11 @@ impl BlueprintTrainer {
             config.training.use_baselines,
         );
 
+        // Apply regret floor if configured (value is in chip units, scale to match stored regrets).
+        if let Some(floor) = config.training.regret_floor {
+            storage.regret_floor = floor * super::storage::REGRET_SCALE as i64;
+        }
+
         // Create the pluggable optimizer based on config.
         let optimizer: Arc<dyn CfrOptimizer> = if config.training.optimizer == "sapcfr+" {
             Arc::new(SapcfrPlusOptimizer {
@@ -1251,6 +1256,7 @@ mod tests {
                 use_baselines: false,
                 baseline_alpha: 0.01,
                 prune_streets: None,
+                regret_floor: None,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 9999,

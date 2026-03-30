@@ -224,6 +224,12 @@ pub struct TrainingConfig {
     /// Example: `[flop, turn, river]` disables pruning on preflop.
     #[serde(default)]
     pub prune_streets: Option<Vec<String>>,
+    /// Floor for cumulative regret values (in chip units, scaled by
+    /// REGRET_SCALE internally). Prevents regrets from going so negative
+    /// that discounting can't recover them. Pluribus used -310,000,000
+    /// raw (with i32 storage). Default: None (no floor).
+    #[serde(default)]
+    pub regret_floor: Option<i64>,
 }
 
 impl TrainingConfig {
@@ -490,6 +496,7 @@ snapshots:
                 use_baselines: false,
                 baseline_alpha: 0.01,
                 prune_streets: None,
+                regret_floor: None,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 120,
