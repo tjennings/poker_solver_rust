@@ -778,6 +778,69 @@ pub fn assert_cfv_bounds(cfv: f64, stack_depth: f64, context: &str) {
     );
 }
 
+/// Compute the best-response value for `traverser` on a single deal.
+///
+/// The BR player takes the max over actions at their nodes.
+/// The opponent plays their average strategy (from strategy sums).
+/// No regret or strategy updates are performed.
+pub fn traverse_best_response(
+    tree: &GameTree,
+    storage: &BlueprintStorage,
+    deal: &DealWithBuckets,
+    traverser: u8,
+    node_idx: u32,
+    rake_rate: f64,
+    rake_cap: f64,
+) -> f64 {
+    match &tree.nodes[node_idx as usize] {
+        GameNode::Terminal { kind, pot, stacks } => {
+            terminal_value(*kind, *pot, stacks, tree.starting_stack, traverser, &deal.deal, rake_rate, rake_cap)
+        }
+
+        GameNode::Chance { child, .. } => {
+            traverse_best_response(tree, storage, deal, traverser, *child, rake_rate, rake_cap)
+        }
+
+        GameNode::Decision {
+            player,
+            street,
+            children,
+            ..
+        } => {
+            let player = *player;
+            let street = *street;
+            let bucket = deal.buckets[player as usize][street as usize];
+
+            if player == traverser {
+                // BR player: take max over all actions.
+                let mut best = f64::NEG_INFINITY;
+                for &child_idx in children.iter() {
+                    let v = traverse_best_response(
+                        tree, storage, deal, traverser, child_idx, rake_rate, rake_cap,
+                    );
+                    if v > best {
+                        best = v;
+                    }
+                }
+                best
+            } else {
+                // Opponent: play average strategy.
+                let strategy = storage.average_strategy(node_idx, bucket);
+                let mut value = 0.0f64;
+                for (a, &child_idx) in children.iter().enumerate() {
+                    if strategy[a] > 0.0 {
+                        let v = traverse_best_response(
+                            tree, storage, deal, traverser, child_idx, rake_rate, rake_cap,
+                        );
+                        value += strategy[a] * v;
+                    }
+                }
+                value
+            }
+        }
+    }
+}
+
 /// Traverser's decision node: explore all actions, update regrets and
 /// strategy sums.
 #[allow(clippy::too_many_arguments)]
@@ -2455,6 +2518,82 @@ mod tests {
             stats_no_preflop.total <= stats_all.total,
             "partial mask should have <= prune candidates vs all-enabled: {} vs {}",
             stats_no_preflop.total, stats_all.total,
+        );
+    }
+
+    // --- traverse_best_response tests ---
+
+    #[test]
+    fn best_response_returns_finite() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
+        let precomputed = make_precomputed(&buckets, make_deal());
+
+        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0);
+        let br1 = traverse_best_response(&tree, &storage, &precomputed, 1, tree.root, 0.0, 0.0);
+        assert!(br0.is_finite(), "BR value for p0 should be finite, got {br0}");
+        assert!(br1.is_finite(), "BR value for p1 should be finite, got {br1}");
+    }
+
+    #[test]
+    fn best_response_br_value_geq_external_sampling() {
+        // The best-response value for a player should be >= the value they get
+        // under external sampling (where they play current strategy, not best response).
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
+        let deal = make_deal();
+        let precomputed = make_precomputed(&buckets, deal);
+
+        // Run external sampling to get the current strategy value.
+        let mut rng = StdRng::seed_from_u64(42);
+        let (ev0, _) = traverse_external(
+            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
+            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
+        );
+
+        // BR value: the best response can only do at least as well.
+        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0);
+        assert!(
+            br0 >= ev0 - 0.01,
+            "BR value ({br0}) should be >= external sampling value ({ev0})",
+        );
+    }
+
+    #[test]
+    fn best_response_with_rake() {
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
+        let precomputed = make_precomputed(&buckets, make_deal());
+
+        let br_no_rake = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0);
+        let br_with_rake = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.05, 3.0);
+        // Rake should reduce the BR value (or keep equal if terminal is fold).
+        assert!(
+            br_with_rake <= br_no_rake + 0.01,
+            "BR with rake ({br_with_rake}) should be <= BR without rake ({br_no_rake})",
+        );
+    }
+
+    #[test]
+    fn best_response_sum_nonpositive_at_equilibrium() {
+        // At a Nash equilibrium, the sum of BR values for both players
+        // should be >= 0 (exploitability >= 0). For a uniform strategy
+        // (which is generally NOT Nash), exploitability is typically positive.
+        let tree = toy_tree();
+        let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
+        let precomputed = make_precomputed(&buckets, make_deal());
+
+        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0);
+        let br1 = traverse_best_response(&tree, &storage, &precomputed, 1, tree.root, 0.0, 0.0);
+        // Exploitability = (br0 + br1) / 2 should be non-negative.
+        let exploit = (br0 + br1) / 2.0;
+        assert!(
+            exploit >= -0.01,
+            "Exploitability should be non-negative, got {exploit} (br0={br0}, br1={br1})",
         );
     }
 }
