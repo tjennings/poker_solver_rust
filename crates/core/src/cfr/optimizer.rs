@@ -57,6 +57,10 @@ pub trait CfrOptimizer: Send + Sync {
     /// Set the decay factor for prediction-based optimizers.
     /// Default: no-op (only `BrcfrPlusOptimizer` overrides this).
     fn set_decay(&self, _decay: f64) {}
+
+    /// Set the BR scale factor (interval / samples) for BRCFR+.
+    /// Default: no-op.
+    fn set_br_scale(&self, _scale: f64) {}
 }
 
 /// DCFR optimizer: discounted counterfactual regret minimization.
@@ -220,10 +224,11 @@ impl CfrOptimizer for SapcfrPlusOptimizer {
 ///
 /// Discounting is identical to SAPCFR+ (RM+ style: floor negatives to 0).
 /// Strategy computation uses BR-derived predictions with configurable decay:
-///   `R_tilde = max(0, R + eta * decay * v_br)`
+///   `R_tilde = max(0, R + eta * decay * br_scale * v_br)`
 ///
-/// The `decay` field is set by the trainer based on how many iterations
-/// have elapsed since the last BR pass. At `decay = 0`, this is pure DCFR+.
+/// `br_scale` = `brcfr_interval / exploitability_samples`, projecting
+/// per-visit BR predictions to cumulative regret magnitude.
+/// At `decay = 0`, this is pure DCFR+.
 pub struct BrcfrPlusOptimizer {
     /// Positive regret discount exponent.
     pub alpha: f64,
@@ -234,6 +239,9 @@ pub struct BrcfrPlusOptimizer {
     /// Current decay factor (0.0 to 1.0), stored as `AtomicU64` bit pattern
     /// for interior mutability through `&self`.
     decay_bits: AtomicU64,
+    /// Scaling factor (interval / samples) to project per-visit BR predictions
+    /// to cumulative regret scale. Stored as `AtomicU64` bit pattern.
+    br_scale_bits: AtomicU64,
 }
 
 impl BrcfrPlusOptimizer {
@@ -245,12 +253,23 @@ impl BrcfrPlusOptimizer {
             gamma,
             eta,
             decay_bits: AtomicU64::new(0.0_f64.to_bits()),
+            br_scale_bits: AtomicU64::new(1.0_f64.to_bits()),
         }
     }
 
     /// Read the current decay factor.
     pub fn decay(&self) -> f64 {
         f64::from_bits(self.decay_bits.load(Ordering::Relaxed))
+    }
+
+    /// Read the current BR scale factor.
+    pub fn br_scale(&self) -> f64 {
+        f64::from_bits(self.br_scale_bits.load(Ordering::Relaxed))
+    }
+
+    /// Set the BR scale factor (interval / samples).
+    pub fn set_br_scale(&self, scale: f64) {
+        self.br_scale_bits.store(scale.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -289,12 +308,12 @@ impl CfrOptimizer for BrcfrPlusOptimizer {
         num_actions: usize,
         out: &mut [f64],
     ) {
-        let eta_decay = self.eta * self.decay();
+        let scale = self.eta * self.decay() * self.br_scale();
         let mut sum = 0.0_f64;
         for a in 0..num_actions {
             let r = regrets[offset + a].load(Ordering::Relaxed);
             let v = predictions.map_or(0, |p| p[offset + a].load(Ordering::Relaxed));
-            let predicted = r as f64 + eta_decay * v as f64;
+            let predicted = r as f64 + scale * v as f64;
             let clamped = predicted.max(0.0);
             out[a] = clamped;
             sum += clamped;
@@ -321,6 +340,10 @@ impl CfrOptimizer for BrcfrPlusOptimizer {
 
     fn set_decay(&self, decay: f64) {
         self.decay_bits.store(decay.to_bits(), Ordering::Relaxed);
+    }
+
+    fn set_br_scale(&self, scale: f64) {
+        self.br_scale_bits.store(scale.to_bits(), Ordering::Relaxed);
     }
 }
 

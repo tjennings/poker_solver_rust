@@ -290,6 +290,10 @@ impl BlueprintTrainer {
         if optimizer.needs_predictions() {
             storage.enable_predictions();
         }
+        // Set BR scale factor: interval / samples.
+        let samples = config.training.exploitability_samples.max(1) as f64;
+        let br_interval = config.training.brcfr_interval.max(1) as f64;
+        optimizer.set_br_scale(br_interval / samples);
         storage.set_optimizer(optimizer);
 
         let bucket_files = match &config.training.cluster_path {
@@ -500,6 +504,9 @@ impl BlueprintTrainer {
         if optimizer.needs_predictions() {
             self.storage.enable_predictions();
         }
+        let samples = self.config.training.exploitability_samples.max(1) as f64;
+        let br_interval = self.config.training.brcfr_interval.max(1) as f64;
+        optimizer.set_br_scale(br_interval / samples);
         self.storage.set_optimizer(optimizer);
         if self.config.training.use_baselines {
             let total = self.storage.regrets.len();
