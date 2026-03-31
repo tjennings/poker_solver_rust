@@ -572,6 +572,7 @@ export default function GameExplorer() {
                         rolloutNumSamples: globalConfig.rollout_num_samples ?? 3,
                         rolloutOpponentSamples: globalConfig.rollout_opponent_samples ?? 8,
                         rangeClampThreshold: globalConfig.range_clamp_threshold ?? 0.05,
+                        boundaryMode: globalConfig.boundary_mode ?? 'cbv',
                       });
                       // Poll for progress
                       const pollId = setInterval(async () => {

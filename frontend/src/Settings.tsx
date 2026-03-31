@@ -254,6 +254,32 @@ export default function Settings() {
         </p>
       </div>
 
+      {/* Boundary Evaluator Mode */}
+      <div style={{ marginBottom: '1.5rem' }}>
+        <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
+          Boundary Evaluator
+        </label>
+        <select
+          value={config.boundary_mode ?? 'cbv'}
+          onChange={e => setConfig({ boundary_mode: e.target.value })}
+          style={{
+            padding: '0.45rem 0.6rem',
+            background: 'rgba(255,255,255,0.06)',
+            border: '1px solid rgba(255,255,255,0.12)',
+            borderRadius: 6,
+            color: '#eee',
+            fontSize: '0.85rem',
+            fontFamily: 'inherit',
+          }}
+        >
+          <option value="cbv">CBV Table Lookup (fast)</option>
+          <option value="rollout">Monte Carlo Rollout (slow, accurate)</option>
+        </select>
+        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
+          CBV uses pre-computed blueprint continuation values. Rollout runs Monte Carlo through the blueprint at street boundaries.
+        </p>
+      </div>
+
       {/* Rollout Settings (depth-limited solver) */}
       <div style={{ marginBottom: '1.5rem' }}>
         <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
