@@ -1,8 +1,14 @@
-//! GPU inference server with async batching.
+//! GPU inference server with async batching and interleaved training.
 //!
-//! A dedicated thread owns the [`CfvNet`] model, receives leaf-evaluation
-//! requests from CPU solver workers via channels, batches them, runs forward
-//! passes, and periodically triggers training steps.
+//! A dedicated thread owns the [`CfvNet`] model (with autograd support),
+//! receives leaf-evaluation requests from CPU solver workers via channels,
+//! batches them, runs forward passes, and periodically runs training steps
+//! on samples from the replay buffer.
+//!
+//! For inference, the server uses [`model.valid()`](burn::module::AutodiffModule::valid)
+//! to strip the autograd wrapper, avoiding unnecessary gradient tracking.
+//! For training, the full autograd model is used to compute MSE loss,
+//! backpropagate gradients, and update weights via Adam.
 //!
 //! Workers call [`InferenceHandle::evaluate`] which blocks until the GPU batch
 //! containing their request completes. [`InferenceHandle::notify_solve_complete`]
@@ -12,7 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use burn::tensor::backend::Backend;
+use burn::module::AutodiffModule;
+use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{Tensor, TensorData};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
@@ -39,6 +47,8 @@ pub struct InferenceServerConfig {
     pub train_every_n_solves: usize,
     /// Batch size for training steps.
     pub train_batch_size: usize,
+    /// Learning rate for Adam optimizer during online training.
+    pub learning_rate: f64,
 }
 
 /// Handle for workers to submit inference requests.
@@ -66,6 +76,15 @@ impl InferenceHandle {
         resp_rx.recv().expect("inference server dropped response")
     }
 
+    /// Create a handle for testing (no server needed for error-path tests).
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        request_tx: Sender<InferenceRequest>,
+        solve_counter: Arc<AtomicUsize>,
+    ) -> Self {
+        Self { request_tx, solve_counter }
+    }
+
     /// Notify the server that one subgame solve completed.
     ///
     /// Call this after extracting root CFVs and pushing to the replay buffer.
@@ -87,7 +106,10 @@ impl InferenceHandle {
 ///
 /// The server runs until `shutdown` is set to `true` and all pending
 /// requests have been drained, or until the request channel disconnects.
-pub fn spawn_inference_server<B: Backend + 'static>(
+///
+/// The model must be on an [`AutodiffBackend`] so the server can run
+/// training steps. For inference, `model.valid()` is used to strip autograd.
+pub fn spawn_inference_server<B: AutodiffBackend + 'static>(
     model: CfvNet<B>,
     device: B::Device,
     config: InferenceServerConfig,
@@ -96,6 +118,7 @@ pub fn spawn_inference_server<B: Backend + 'static>(
 ) -> (InferenceHandle, std::thread::JoinHandle<()>)
 where
     B::Device: Send,
+    B::InnerBackend: burn::tensor::backend::Backend<Device = B::Device>,
     CfvNet<B>: Send,
 {
     let (request_tx, request_rx) = crossbeam_channel::unbounded();
@@ -122,18 +145,25 @@ where
 
 /// Main server loop: collect requests -> batch forward pass -> send responses.
 ///
+/// The model is an `AutodiffBackend` model. For inference, we use `model.valid()`
+/// to get a non-autograd copy for efficient forward passes. For training, the
+/// full model with autograd is used to compute gradients and update weights.
+///
 /// Periodically checks whether a training step is due.
-fn run_server_loop<B: Backend>(
-    model: CfvNet<B>,
+fn run_server_loop<B: AutodiffBackend>(
+    mut model: CfvNet<B>,
     device: B::Device,
     config: InferenceServerConfig,
     request_rx: Receiver<InferenceRequest>,
     solve_counter: Arc<AtomicUsize>,
     replay_buffer: Arc<ReplayBuffer>,
     shutdown: Arc<AtomicBool>,
-) {
+) where
+    B::InnerBackend: burn::tensor::backend::Backend<Device = B::Device>,
+{
     let timeout = Duration::from_micros(config.batch_timeout_us);
     let mut last_train_at = 0usize;
+    let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
 
     while !shutdown.load(Ordering::Relaxed) {
         // Collect a batch of requests.
@@ -145,6 +175,9 @@ fn run_server_loop<B: Backend>(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // No requests — check if training is due.
                 maybe_train(
+                    &mut model,
+                    &mut optim,
+                    &device,
                     &config,
                     &replay_buffer,
                     &solve_counter,
@@ -172,19 +205,21 @@ fn run_server_loop<B: Backend>(
             continue;
         }
 
-        // Run batched forward pass.
+        // Run batched forward pass using the non-autograd model for efficiency.
         let batch_len = batch.len();
         let mut flat_input: Vec<f32> = Vec::with_capacity(batch_len * INPUT_SIZE);
         for req in &batch {
             flat_input.extend_from_slice(&req.input);
         }
 
-        let input_tensor = Tensor::<B, 2>::from_data(
+        // Use model.valid() to avoid tracking gradients during inference.
+        let inference_model = model.valid();
+        let input_tensor = Tensor::<B::InnerBackend, 2>::from_data(
             TensorData::new(flat_input, [batch_len, INPUT_SIZE]),
             &device,
         );
 
-        let output_tensor = model.forward(input_tensor);
+        let output_tensor = inference_model.forward(input_tensor);
         let output_data: Vec<f32> = output_tensor
             .into_data()
             .to_vec::<f32>()
@@ -199,6 +234,9 @@ fn run_server_loop<B: Backend>(
 
         // Check if training is due.
         maybe_train(
+            &mut model,
+            &mut optim,
+            &device,
             &config,
             &replay_buffer,
             &solve_counter,
@@ -209,33 +247,71 @@ fn run_server_loop<B: Backend>(
 
 /// Run one training step if enough solves have completed since the last one.
 ///
-/// TODO (Task 5): Replace this stub with actual training logic that requires
-/// an `AutodiffBackend`, optimizer state, and loss function. For now, this
-/// just logs that training would happen and updates the counter.
-fn maybe_train(
+/// Samples a batch from the replay buffer, builds input/target tensors,
+/// runs a forward pass through the autograd model, computes MSE loss,
+/// backpropagates, and updates the model weights via Adam.
+fn maybe_train<B: AutodiffBackend>(
+    model: &mut CfvNet<B>,
+    optim: &mut impl Optimizer<CfvNet<B>, B>,
+    device: &B::Device,
     config: &InferenceServerConfig,
     replay_buffer: &ReplayBuffer,
     solve_counter: &AtomicUsize,
     last_train_at: &mut usize,
 ) {
     let current = solve_counter.load(Ordering::Relaxed);
-    if current.wrapping_sub(*last_train_at) >= config.train_every_n_solves
-        && replay_buffer.len() >= config.train_batch_size
-    {
-        // Sample batch from replay buffer.
-        let samples = replay_buffer.sample(config.train_batch_size);
-
-        // TODO (Task 5): Build input/target tensors and run one training step.
-        // This requires an AutodiffBackend, optimizer state, and loss function.
-        // Full training integration is Task 5.
-        eprintln!(
-            "  [InferenceServer] Training step stub: {} samples, solves={}",
-            samples.len(),
-            current
-        );
-
-        *last_train_at = current;
+    if current.wrapping_sub(*last_train_at) < config.train_every_n_solves {
+        return;
     }
+    if replay_buffer.len() < config.train_batch_size {
+        return;
+    }
+
+    // Sample batch from replay buffer.
+    let samples = replay_buffer.sample(config.train_batch_size);
+    let n = samples.len();
+
+    // Build contiguous input/target arrays.
+    let mut flat_input = Vec::with_capacity(n * INPUT_SIZE);
+    let mut flat_target = Vec::with_capacity(n * OUTPUT_SIZE);
+    for s in &samples {
+        flat_input.extend_from_slice(&s.input);
+        flat_target.extend_from_slice(&s.target);
+    }
+
+    // Create tensors on the inner (non-autodiff) backend, then lift to autodiff.
+    let input_inner = Tensor::<B::InnerBackend, 2>::from_data(
+        TensorData::new(flat_input, [n, INPUT_SIZE]),
+        device,
+    );
+    let target_inner = Tensor::<B::InnerBackend, 2>::from_data(
+        TensorData::new(flat_target, [n, OUTPUT_SIZE]),
+        device,
+    );
+    let input = Tensor::<B, 2>::from_inner(input_inner);
+    let target = Tensor::<B, 2>::from_inner(target_inner);
+
+    // Forward pass through autograd model.
+    let predicted = model.forward(input);
+
+    // MSE loss: mean((predicted - target)^2)
+    let diff = predicted - target;
+    let loss = diff.powf_scalar(2.0).mean();
+
+    // Read loss value for logging.
+    let loss_val: f32 = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
+
+    // Backward pass and optimizer step.
+    let grads = loss.backward();
+    let grads_params = GradientsParams::from_grads(grads, model);
+    *model = optim.step(config.learning_rate, model.clone(), grads_params);
+
+    eprintln!(
+        "  [train] loss={loss_val:.6} buffer={} solves={current}",
+        replay_buffer.len()
+    );
+
+    *last_train_at = current;
 }
 
 #[cfg(test)]
@@ -263,17 +339,19 @@ mod tests {
             batch_timeout_us: 100,
             train_every_n_solves: 50,
             train_batch_size: 512,
+            learning_rate: 1e-3,
         };
         assert_eq!(config.batch_size, 256);
         assert_eq!(config.batch_timeout_us, 100);
         assert_eq!(config.train_every_n_solves, 50);
         assert_eq!(config.train_batch_size, 512);
+        assert!((config.learning_rate - 1e-3).abs() < 1e-10);
     }
 
     #[test]
     fn test_inference_handle_evaluate_end_to_end() {
-        use burn::backend::NdArray;
-        type TestBackend = NdArray;
+        use burn::backend::{Autodiff, NdArray};
+        type TestBackend = Autodiff<NdArray>;
 
         let device = Default::default();
         // Use a small model for fast tests.
@@ -289,6 +367,7 @@ mod tests {
                 batch_timeout_us: 1000,
                 train_every_n_solves: 100,
                 train_batch_size: 32,
+                learning_rate: 1e-3,
             },
             replay_buffer,
             Arc::clone(&shutdown),
@@ -311,8 +390,8 @@ mod tests {
 
     #[test]
     fn test_inference_handle_concurrent_workers() {
-        use burn::backend::NdArray;
-        type TestBackend = NdArray;
+        use burn::backend::{Autodiff, NdArray};
+        type TestBackend = Autodiff<NdArray>;
 
         let device = Default::default();
         let model = CfvNet::<TestBackend>::new(&device, 1, 8, INPUT_SIZE);
@@ -327,6 +406,7 @@ mod tests {
                 batch_timeout_us: 5000,
                 train_every_n_solves: 100,
                 train_batch_size: 32,
+                learning_rate: 1e-3,
             },
             replay_buffer,
             Arc::clone(&shutdown),
@@ -376,11 +456,19 @@ mod tests {
 
     #[test]
     fn test_maybe_train_fires_when_threshold_met() {
+        use burn::backend::{Autodiff, NdArray};
+        type B = Autodiff<NdArray>;
+
+        let device = Default::default();
+        let mut model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+        let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
+
         let config = InferenceServerConfig {
             batch_size: 256,
             batch_timeout_us: 100,
             train_every_n_solves: 2,
             train_batch_size: 4,
+            learning_rate: 1e-3,
         };
         let replay_buffer = ReplayBuffer::new(100);
         // Fill replay buffer with enough entries.
@@ -395,17 +483,33 @@ mod tests {
         let mut last_train_at = 0;
 
         // Should trigger training (5 - 0 = 5 >= 2, and buffer has 10 >= 4).
-        maybe_train(&config, &replay_buffer, &solve_counter, &mut last_train_at);
+        maybe_train(
+            &mut model,
+            &mut optim,
+            &device,
+            &config,
+            &replay_buffer,
+            &solve_counter,
+            &mut last_train_at,
+        );
         assert_eq!(last_train_at, 5, "last_train_at should update to current solve count");
     }
 
     #[test]
     fn test_maybe_train_skips_when_below_threshold() {
+        use burn::backend::{Autodiff, NdArray};
+        type B = Autodiff<NdArray>;
+
+        let device = Default::default();
+        let mut model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+        let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
+
         let config = InferenceServerConfig {
             batch_size: 256,
             batch_timeout_us: 100,
             train_every_n_solves: 10,
             train_batch_size: 4,
+            learning_rate: 1e-3,
         };
         let replay_buffer = ReplayBuffer::new(100);
         for i in 0..10 {
@@ -419,17 +523,33 @@ mod tests {
         let mut last_train_at = 0;
 
         // Should NOT trigger (3 - 0 = 3 < 10).
-        maybe_train(&config, &replay_buffer, &solve_counter, &mut last_train_at);
+        maybe_train(
+            &mut model,
+            &mut optim,
+            &device,
+            &config,
+            &replay_buffer,
+            &solve_counter,
+            &mut last_train_at,
+        );
         assert_eq!(last_train_at, 0, "last_train_at should not change");
     }
 
     #[test]
     fn test_maybe_train_skips_when_buffer_too_small() {
+        use burn::backend::{Autodiff, NdArray};
+        type B = Autodiff<NdArray>;
+
+        let device = Default::default();
+        let mut model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+        let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
+
         let config = InferenceServerConfig {
             batch_size: 256,
             batch_timeout_us: 100,
             train_every_n_solves: 1,
             train_batch_size: 100,
+            learning_rate: 1e-3,
         };
         let replay_buffer = ReplayBuffer::new(1000);
         // Only 5 entries, but train_batch_size requires 100.
@@ -443,14 +563,22 @@ mod tests {
         let solve_counter = AtomicUsize::new(10);
         let mut last_train_at = 0;
 
-        maybe_train(&config, &replay_buffer, &solve_counter, &mut last_train_at);
+        maybe_train(
+            &mut model,
+            &mut optim,
+            &device,
+            &config,
+            &replay_buffer,
+            &solve_counter,
+            &mut last_train_at,
+        );
         assert_eq!(last_train_at, 0, "should not train with insufficient buffer");
     }
 
     #[test]
     fn test_server_shutdown_clean() {
-        use burn::backend::NdArray;
-        type TestBackend = NdArray;
+        use burn::backend::{Autodiff, NdArray};
+        type TestBackend = Autodiff<NdArray>;
 
         let device = Default::default();
         let model = CfvNet::<TestBackend>::new(&device, 1, 8, INPUT_SIZE);
@@ -465,6 +593,7 @@ mod tests {
                 batch_timeout_us: 100,
                 train_every_n_solves: 100,
                 train_batch_size: 32,
+                learning_rate: 1e-3,
             },
             replay_buffer,
             Arc::clone(&shutdown),
@@ -477,8 +606,8 @@ mod tests {
 
     #[test]
     fn test_server_handles_different_inputs() {
-        use burn::backend::NdArray;
-        type TestBackend = NdArray;
+        use burn::backend::{Autodiff, NdArray};
+        type TestBackend = Autodiff<NdArray>;
 
         let device = Default::default();
         let model = CfvNet::<TestBackend>::new(&device, 1, 8, INPUT_SIZE);
@@ -493,6 +622,7 @@ mod tests {
                 batch_timeout_us: 5000,
                 train_every_n_solves: 100,
                 train_batch_size: 32,
+                learning_rate: 1e-3,
             },
             replay_buffer,
             Arc::clone(&shutdown),
@@ -510,6 +640,76 @@ mod tests {
         assert!(
             diff > 1e-6,
             "different inputs should produce different outputs, diff={diff}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        server_thread.join().expect("server thread should not panic");
+    }
+
+    #[test]
+    fn test_training_reduces_loss() {
+        use burn::backend::{Autodiff, NdArray};
+        type B = Autodiff<NdArray>;
+
+        let device = Default::default();
+        let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+        let replay_buffer = Arc::new(ReplayBuffer::new(1000));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Fill replay buffer with training data: inputs are small random-ish
+        // values, targets are zero. After training, the model should predict
+        // values closer to zero.
+        for i in 0..100 {
+            let mut input = vec![0.0f32; INPUT_SIZE];
+            // Set a few input features to small values.
+            for j in 0..10 {
+                input[j] = (i as f32 + j as f32) * 0.01;
+            }
+            replay_buffer.push(crate::replay_buffer::ReplayEntry {
+                input,
+                target: vec![0.0; OUTPUT_SIZE],
+            });
+        }
+
+        let (handle, server_thread) = spawn_inference_server(
+            model,
+            device,
+            InferenceServerConfig {
+                batch_size: 4,
+                batch_timeout_us: 1000,
+                train_every_n_solves: 1,
+                train_batch_size: 32,
+                learning_rate: 1e-3,
+            },
+            Arc::clone(&replay_buffer),
+            Arc::clone(&shutdown),
+        );
+
+        // Get initial prediction before any training.
+        let input = vec![0.05_f32; INPUT_SIZE];
+        let result_before = handle.evaluate(input.clone());
+        let mse_before: f32 = result_before.iter().map(|v| v * v).sum::<f32>()
+            / result_before.len() as f32;
+
+        // Trigger several training steps by notifying solve completions.
+        for _ in 0..20 {
+            handle.notify_solve_complete();
+            // Small sleep to let server process training.
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Give the server time to process training steps.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Get prediction after training.
+        let result_after = handle.evaluate(input);
+        let mse_after: f32 = result_after.iter().map(|v| v * v).sum::<f32>()
+            / result_after.len() as f32;
+
+        // Training towards zero targets should reduce the MSE.
+        assert!(
+            mse_after < mse_before,
+            "training should reduce MSE: before={mse_before:.6}, after={mse_after:.6}"
         );
 
         shutdown.store(true, Ordering::Relaxed);

@@ -12,18 +12,22 @@
 // than at every intra-street decision node. A full implementation would
 // traverse the betting tree within each street.
 
+use std::sync::Arc;
+
 use rand::Rng;
 use rand::SeedableRng;
 
 use crate::blueprint_sampler::{deal_hand, play_preflop_under_blueprint};
-use crate::data_buffer::DiskBuffer;
-use crate::generate::pbs_to_buffer_record;
+use crate::inference_server::InferenceHandle;
 use crate::pbs::{combo_index, Pbs, NUM_COMBOS};
+use crate::replay_buffer::{ReplayBuffer, ReplayEntry};
 use crate::solver::{solve_depth_limited_pbs, SolveConfig, SolveResult};
+use cfvnet::model::network::INPUT_SIZE;
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
-use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::blueprint_v2::game_tree::GameTree;
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
+use poker_solver_core::blueprint_v2::LeafEvaluator;
+use poker_solver_core::poker::Card as RsPokerCard;
 
 /// A training example from self-play: a PBS and its computed CFVs.
 pub struct TrainingExample {
@@ -52,6 +56,193 @@ pub struct SelfPlayConfig {
     pub hands_per_training_batch: usize,
     /// RNG seed for reproducibility.
     pub seed: u64,
+}
+
+// ---------------------------------------------------------------------------
+// InferenceHandle → LeafEvaluator adapter
+// ---------------------------------------------------------------------------
+
+/// Adapter that wraps an [`InferenceHandle`] to implement the
+/// [`LeafEvaluator`] trait. This bridges the self-play loop to the
+/// inference server for boundary evaluation during subgame solving.
+///
+/// When Task 3 (`solve_subgame_iterative`) is complete, this adapter will
+/// be replaced by a direct call to that function. For now it allows the
+/// self-play loop to use InferenceHandle with the existing solver API.
+struct InferenceLeafEvaluator<'a> {
+    handle: &'a InferenceHandle,
+}
+
+impl LeafEvaluator for InferenceLeafEvaluator<'_> {
+    fn evaluate(
+        &self,
+        combos: &[[RsPokerCard; 2]],
+        board: &[RsPokerCard],
+        pot: f64,
+        effective_stack: f64,
+        oop_range: &[f64],
+        ip_range: &[f64],
+        traverser: u8,
+    ) -> Vec<f64> {
+        // Build 2720-element input vector for the inference server.
+        let mut input = vec![0.0f32; INPUT_SIZE];
+
+        // Convert solver-ordered ranges back to canonical 1326 ordering.
+        // oop_range and ip_range are in solver combo ordering (same length as combos).
+        // We need canonical 1326 ordering for the net.
+        let mut canonical_oop = [0.0f32; NUM_COMBOS];
+        let mut canonical_ip = [0.0f32; NUM_COMBOS];
+        for (i, combo) in combos.iter().enumerate() {
+            let idx = rs_poker_pair_to_canonical(combo);
+            canonical_oop[idx] = oop_range[i] as f32;
+            canonical_ip[idx] = ip_range[i] as f32;
+        }
+
+        // Normalize ranges to sum to 1.0.
+        let oop_sum: f32 = canonical_oop.iter().sum();
+        let ip_sum: f32 = canonical_ip.iter().sum();
+        if oop_sum > 0.0 {
+            let inv = 1.0 / oop_sum;
+            for v in &mut canonical_oop {
+                *v *= inv;
+            }
+        }
+        if ip_sum > 0.0 {
+            let inv = 1.0 / ip_sum;
+            for v in &mut canonical_ip {
+                *v *= inv;
+            }
+        }
+
+        // Fill input: OOP range (0..1326), IP range (1326..2652).
+        input[..NUM_COMBOS].copy_from_slice(&canonical_oop);
+        input[NUM_COMBOS..2 * NUM_COMBOS].copy_from_slice(&canonical_ip);
+
+        // Board one-hot (2652..2704).
+        for card in board {
+            let idx = rs_poker_card_to_u8(card) as usize;
+            input[2 * NUM_COMBOS + idx] = 1.0;
+        }
+
+        // Rank presence (2704..2717).
+        for card in board {
+            let rank = rs_poker_card_to_u8(card) / 4;
+            input[2 * NUM_COMBOS + 52 + rank as usize] = 1.0;
+        }
+
+        // Pot / 400.0 (position 2717).
+        input[2 * NUM_COMBOS + 52 + 13] = pot as f32 / 400.0;
+        // Effective stack / 400.0 (position 2718).
+        input[2 * NUM_COMBOS + 52 + 13 + 1] = effective_stack as f32 / 400.0;
+        // Player indicator (position 2719).
+        input[2 * NUM_COMBOS + 52 + 13 + 2] = traverser as f32;
+
+        // Submit to inference server and get 1326 canonical CFVs.
+        let cfvs_canonical = self.handle.evaluate(input);
+
+        // Map canonical 1326 CFVs back to solver combo ordering.
+        combos
+            .iter()
+            .map(|combo| {
+                let idx = rs_poker_pair_to_canonical(combo);
+                cfvs_canonical[idx] as f64
+            })
+            .collect()
+    }
+}
+
+/// Convert an rs_poker Card pair to canonical combo index (0..1325).
+fn rs_poker_pair_to_canonical(pair: &[RsPokerCard; 2]) -> usize {
+    let c1 = rs_poker_card_to_u8(&pair[0]);
+    let c2 = rs_poker_card_to_u8(&pair[1]);
+    combo_index(c1, c2)
+}
+
+/// Convert an rs_poker Card to the u8 encoding (4*rank + suit).
+fn rs_poker_card_to_u8(card: &RsPokerCard) -> u8 {
+    use poker_solver_core::poker::{Suit, Value};
+
+    let rank = match card.value {
+        Value::Two => 0u8,
+        Value::Three => 1,
+        Value::Four => 2,
+        Value::Five => 3,
+        Value::Six => 4,
+        Value::Seven => 5,
+        Value::Eight => 6,
+        Value::Nine => 7,
+        Value::Ten => 8,
+        Value::Jack => 9,
+        Value::Queen => 10,
+        Value::King => 11,
+        Value::Ace => 12,
+    };
+    let suit = match card.suit {
+        Suit::Club => 0u8,
+        Suit::Diamond => 1,
+        Suit::Heart => 2,
+        Suit::Spade => 3,
+    };
+    4 * rank + suit
+}
+
+// ---------------------------------------------------------------------------
+// build_training_input — encode PBS → 2720-float net input
+// ---------------------------------------------------------------------------
+
+/// Encode a PBS and player indicator into a 2720-element input vector
+/// suitable for the CfvNet inference server.
+///
+/// Layout (matches cfvnet):
+/// - `[0..1326]`: OOP reach probabilities (normalized to sum to 1.0)
+/// - `[1326..2652]`: IP reach probabilities (normalized)
+/// - `[2652..2704]`: board card one-hot (52 positions)
+/// - `[2704..2717]`: rank presence (13 positions)
+/// - `[2717]`: pot / 400.0
+/// - `[2718]`: effective_stack / 400.0
+/// - `[2719]`: player indicator (0.0 or 1.0)
+pub fn build_training_input(pbs: &Pbs, player: u8) -> Vec<f32> {
+    let mut input = vec![0.0f32; INPUT_SIZE];
+
+    // OOP range: normalize to sum to 1.0.
+    let oop_sum: f32 = pbs.reach_probs[0].iter().sum();
+    if oop_sum > 0.0 {
+        let inv = 1.0 / oop_sum;
+        for i in 0..NUM_COMBOS {
+            input[i] = pbs.reach_probs[0][i] * inv;
+        }
+    }
+
+    // IP range: normalize to sum to 1.0.
+    let ip_sum: f32 = pbs.reach_probs[1].iter().sum();
+    if ip_sum > 0.0 {
+        let inv = 1.0 / ip_sum;
+        for i in 0..NUM_COMBOS {
+            input[NUM_COMBOS + i] = pbs.reach_probs[1][i] * inv;
+        }
+    }
+
+    // Board one-hot: positions 2652..2704.
+    for &card in &pbs.board {
+        input[2 * NUM_COMBOS + card as usize] = 1.0;
+    }
+
+    // Rank presence: positions 2704..2717.
+    for &card in &pbs.board {
+        let rank = card / 4;
+        input[2 * NUM_COMBOS + 52 + rank as usize] = 1.0;
+    }
+
+    // Pot: position 2717.
+    input[2 * NUM_COMBOS + 52 + 13] = pbs.pot as f32 / 400.0;
+
+    // Effective stack: position 2718.
+    input[2 * NUM_COMBOS + 52 + 13 + 1] = pbs.effective_stack as f32 / 400.0;
+
+    // Player indicator: position 2719.
+    input[2 * NUM_COMBOS + 52 + 13 + 2] = player as f32;
+
+    input
 }
 
 /// Street identifiers for the self-play state machine.
@@ -102,7 +293,7 @@ const STREET_ORDER: [Street; 3] = [
 ///
 /// Returns collected training examples for this hand.
 pub fn play_self_play_hand<R: Rng>(
-    evaluator: &dyn LeafEvaluator,
+    handle: &InferenceHandle,
     solve_config: &SolveConfig,
     sp_config: &SelfPlayConfig,
     strategy: &BlueprintV2Strategy,
@@ -149,8 +340,9 @@ pub fn play_self_play_hand<R: Rng>(
         };
         pbs.zero_blocked_combos();
 
-        // Solve the subgame at this PBS.
-        let solve_result = match solve_depth_limited_pbs(&pbs, solve_config, evaluator) {
+        // Solve the subgame at this PBS via the inference server.
+        let evaluator = InferenceLeafEvaluator { handle };
+        let solve_result = match solve_depth_limited_pbs(&pbs, solve_config, &evaluator) {
             Ok(r) => r,
             Err(_) => {
                 // Solving failed (e.g., pot or stack constraints).
@@ -283,47 +475,39 @@ fn update_beliefs_simplified<R: Rng>(
 /// Run the self-play training loop.
 ///
 /// Plays `sp_config.num_hands` hands via self-play, collecting training
-/// examples at each street boundary. All examples are converted to
-/// `BufferRecord`s and appended to the disk buffer.
+/// examples at each street boundary. Training examples are pushed to the
+/// replay buffer as `ReplayEntry` records (one per player per PBS).
 ///
 /// Returns the total number of training examples generated.
 pub fn self_play_training_loop(
-    evaluator: &dyn LeafEvaluator,
+    handle: &InferenceHandle,
     solve_config: &SolveConfig,
     sp_config: &SelfPlayConfig,
     strategy: &BlueprintV2Strategy,
     tree: &GameTree,
     buckets: &AllBuckets,
-    buffer: &mut DiskBuffer,
+    replay_buffer: &Arc<ReplayBuffer>,
 ) -> usize {
     let mut total_examples = 0usize;
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(sp_config.seed);
 
     for hand_idx in 0..sp_config.num_hands {
         let examples = play_self_play_hand(
-            evaluator, solve_config, sp_config,
+            handle, solve_config, sp_config,
             strategy, tree, buckets,
             &mut rng,
         );
 
-        // Convert each training example to buffer records (one per player).
+        // Push each training example to the replay buffer (one entry per player).
         for example in &examples {
             for player in 0..2u8 {
-                let mut rec = pbs_to_buffer_record(&example.pbs, player);
-                // Fill in the CFVs and game value from the solve result.
-                rec.cfvs = example.cfvs[player as usize];
-                rec.game_value = crate::solver::weighted_game_value(
-                    &example.cfvs[player as usize],
-                    &example.pbs.reach_probs[player as usize],
-                );
-                if let Err(e) = buffer.append(&rec) {
-                    eprintln!(
-                        "Warning: failed to append record for hand {hand_idx}, player {player}: {e}"
-                    );
-                }
+                let input = build_training_input(&example.pbs, player);
+                let target = example.cfvs[player as usize].to_vec();
+                replay_buffer.push(ReplayEntry { input, target });
             }
-            total_examples += 1;
         }
+        handle.notify_solve_complete();
+        total_examples += examples.len();
 
         // Progress logging every 100 hands.
         if (hand_idx + 1) % 100 == 0 {
@@ -525,62 +709,174 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // build_training_input tests
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_training_example_to_buffer_record() {
-        // Verify that training examples can be converted to buffer records.
-        let board = vec![0, 4, 8, 12, 16];
-        let pbs = Pbs::new_uniform(board.clone(), 100, 200);
-
-        let mut cfvs = Box::new([[0.0f32; NUM_COMBOS]; 2]);
-        cfvs[0][0] = 0.5;
-        cfvs[1][0] = -0.5;
-
-        let example = TrainingExample {
-            pbs: pbs.clone(),
-            cfvs,
-        };
-
-        // Convert to buffer record for OOP.
-        let mut rec = pbs_to_buffer_record(&example.pbs, 0);
-        rec.cfvs = example.cfvs[0];
-        rec.game_value = crate::solver::weighted_game_value(
-            &example.cfvs[0],
-            &example.pbs.reach_probs[0],
-        );
-
-        assert_eq!(rec.player, 0);
-        assert_eq!(rec.cfvs[0], 0.5);
-        assert_eq!(rec.board_card_count, 5);
-        assert_eq!(rec.pot, 100.0);
-        assert!(rec.game_value.is_finite());
+    fn test_build_training_input_length() {
+        let board = vec![0, 4, 8, 12, 16]; // 2c, 3c, 4c, 5c, 6c
+        let pbs = Pbs::new_uniform(board, 100, 200);
+        let input = build_training_input(&pbs, 0);
+        assert_eq!(input.len(), INPUT_SIZE, "input should be {INPUT_SIZE} floats");
     }
 
     #[test]
-    #[ignore] // Requires a LeafEvaluator (e.g., trained CfvNet)
+    fn test_build_training_input_ranges_normalized() {
+        let board = vec![0, 4, 8, 12, 16];
+        let pbs = Pbs::new_uniform(board, 200, 400);
+
+        let input = build_training_input(&pbs, 0);
+
+        // OOP range (0..1326) should sum to ~1.0.
+        let oop_sum: f32 = input[..NUM_COMBOS].iter().sum();
+        assert!(
+            (oop_sum - 1.0).abs() < 1e-4,
+            "OOP range should sum to ~1.0, got {oop_sum}"
+        );
+
+        // IP range (1326..2652) should sum to ~1.0.
+        let ip_sum: f32 = input[NUM_COMBOS..2 * NUM_COMBOS].iter().sum();
+        assert!(
+            (ip_sum - 1.0).abs() < 1e-4,
+            "IP range should sum to ~1.0, got {ip_sum}"
+        );
+    }
+
+    #[test]
+    fn test_build_training_input_board_one_hot() {
+        let board = vec![0, 4, 8]; // 2c, 3c, 4c (flop)
+        let pbs = Pbs::new_uniform(board.clone(), 100, 200);
+        let input = build_training_input(&pbs, 0);
+
+        // Board one-hot region: 2652..2704.
+        let board_start = 2 * NUM_COMBOS; // 2652
+        for card in 0..52usize {
+            let expected = if board.contains(&(card as u8)) {
+                1.0
+            } else {
+                0.0
+            };
+            assert_eq!(
+                input[board_start + card], expected,
+                "board one-hot mismatch at card {card}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_training_input_rank_presence() {
+        let board = vec![0, 4, 8]; // 2c(rank 0), 3c(rank 1), 4c(rank 2)
+        let pbs = Pbs::new_uniform(board, 100, 200);
+        let input = build_training_input(&pbs, 0);
+
+        // Rank presence region: 2704..2717.
+        let rank_start = 2 * NUM_COMBOS + 52; // 2704
+        for rank in 0..13usize {
+            let expected = if rank <= 2 { 1.0 } else { 0.0 };
+            assert_eq!(
+                input[rank_start + rank], expected,
+                "rank presence mismatch at rank {rank}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_training_input_pot_stack_player() {
+        let board = vec![0, 4, 8, 12, 16];
+        let pbs = Pbs::new_uniform(board, 200, 400);
+
+        let input_oop = build_training_input(&pbs, 0);
+        let input_ip = build_training_input(&pbs, 1);
+
+        // Pot: position 2717 = pot / 400.0 = 200 / 400 = 0.5.
+        assert!(
+            (input_oop[2717] - 0.5).abs() < 1e-6,
+            "pot should be 0.5, got {}",
+            input_oop[2717]
+        );
+
+        // Stack: position 2718 = stack / 400.0 = 400 / 400 = 1.0.
+        assert!(
+            (input_oop[2718] - 1.0).abs() < 1e-6,
+            "stack should be 1.0, got {}",
+            input_oop[2718]
+        );
+
+        // Player indicator: position 2719.
+        assert_eq!(input_oop[2719], 0.0, "OOP player indicator should be 0.0");
+        assert_eq!(input_ip[2719], 1.0, "IP player indicator should be 1.0");
+    }
+
+    #[test]
+    fn test_build_training_input_blocked_combos_zero() {
+        let board = vec![0, 4, 8, 12, 16]; // 2c, 3c, 4c, 5c, 6c
+        let pbs = Pbs::new_uniform(board, 100, 200);
+        let input = build_training_input(&pbs, 0);
+
+        // Combo containing card 0 (2c, which is on the board) should be 0.
+        let blocked_idx = combo_index(0, 1);
+        assert_eq!(
+            input[blocked_idx], 0.0,
+            "blocked combo should have 0 reach"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // rs_poker_card_to_u8 test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rs_poker_card_to_u8_roundtrip() {
+        use poker_solver_core::poker::{Suit, Value};
+
+        // 2c = 0
+        let card = RsPokerCard::new(Value::Two, Suit::Club);
+        assert_eq!(rs_poker_card_to_u8(&card), 0);
+
+        // As = 51
+        let card = RsPokerCard::new(Value::Ace, Suit::Spade);
+        assert_eq!(rs_poker_card_to_u8(&card), 51);
+
+        // Kh = 4*11 + 2 = 46
+        let card = RsPokerCard::new(Value::King, Suit::Heart);
+        assert_eq!(rs_poker_card_to_u8(&card), 46);
+
+        // 8d = 4*6 + 1 = 25
+        let card = RsPokerCard::new(Value::Eight, Suit::Diamond);
+        assert_eq!(rs_poker_card_to_u8(&card), 25);
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests (require running inference server)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore] // Requires a running InferenceHandle (e.g., GPU inference server)
     fn test_play_self_play_hand_integration() {
         // This test would:
-        // 1. Create or load a LeafEvaluator
+        // 1. Create an InferenceHandle connected to an inference server
         // 2. Configure SolveConfig and SelfPlayConfig
         // 3. Call play_self_play_hand
         // 4. Verify that training examples are produced
         // 5. Verify that CFVs are non-zero for non-blocked combos
         //
         // To run: cargo test -p rebel self_play::tests::test_play_self_play_hand_integration -- --ignored
-        // Requires: a trained value network model
+        // Requires: a running inference server with a trained value network
     }
 
     #[test]
-    #[ignore] // Requires a LeafEvaluator (e.g., trained CfvNet)
+    #[ignore] // Requires a running InferenceHandle (e.g., GPU inference server)
     fn test_self_play_training_loop_integration() {
         // This test would:
-        // 1. Create or load a LeafEvaluator
+        // 1. Create an InferenceHandle connected to an inference server
         // 2. Configure SolveConfig and SelfPlayConfig
-        // 3. Create a DiskBuffer
+        // 3. Create a ReplayBuffer
         // 4. Call self_play_training_loop with a small num_hands
-        // 5. Verify records were appended to the buffer
-        // 6. Verify buffer records have non-zero CFVs
+        // 5. Verify entries were pushed to the replay buffer
+        // 6. Verify replay entries have correct input/target dimensions
         //
         // To run: cargo test -p rebel self_play::tests::test_self_play_training_loop_integration -- --ignored
-        // Requires: a trained value network model
+        // Requires: a running inference server with a trained value network
     }
 }
