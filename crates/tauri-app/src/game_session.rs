@@ -4,6 +4,7 @@
 //! Six Tauri commands expose it: `game_new`, `game_get_state`, `game_play_action`,
 //! `game_deal_card`, `game_back`, `game_solve`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -73,6 +74,8 @@ pub struct ComboDetail {
     pub cards: String,           // e.g. "AhKh"
     pub probabilities: Vec<f32>, // one per action
     pub weight: f32,             // reaching probability for this combo
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<u16>,     // strategy bucket ID (postflop only)
 }
 
 /// A single cell in the 13x13 strategy matrix.
@@ -93,6 +96,14 @@ pub struct GameMatrixCell {
 pub struct GameMatrix {
     pub cells: Vec<Vec<GameMatrixCell>>,
     pub actions: Vec<GameAction>,
+}
+
+/// Cached strategy data for a single node in a solved subgame tree.
+#[derive(Debug, Clone)]
+pub struct CachedSolveNode {
+    pub matrix: GameMatrix,
+    pub actions: Vec<GameAction>,
+    pub position: String,
 }
 
 /// Complete game state returned to the frontend.
@@ -134,6 +145,11 @@ pub struct SolveState {
     pub solve_actions: RwLock<Vec<GameAction>>,
     /// Position label at the solve root.
     pub solve_position: RwLock<String>,
+    /// Cached matrices for every node in the solved subgame tree.
+    /// Key: action path from solve root (e.g., `[0, 1]` = first action then second).
+    pub solve_cache: RwLock<HashMap<Vec<usize>, CachedSolveNode>>,
+    /// Current position within the solved tree (action path from solve root).
+    pub solve_path: RwLock<Vec<usize>>,
 }
 
 impl Default for SolveState {
@@ -148,6 +164,8 @@ impl Default for SolveState {
             matrix_snapshot: RwLock::new(None),
             solve_actions: RwLock::new(vec![]),
             solve_position: RwLock::new(String::new()),
+            solve_cache: RwLock::new(HashMap::new()),
+            solve_path: RwLock::new(vec![]),
         }
     }
 }
@@ -164,6 +182,8 @@ impl SolveState {
         *self.matrix_snapshot.write() = None;
         *self.solve_actions.write() = vec![];
         *self.solve_position.write() = String::new();
+        *self.solve_cache.write() = HashMap::new();
+        *self.solve_path.write() = vec![];
     }
 }
 
@@ -393,6 +413,8 @@ impl GameSession {
 
         let weight_idx = self.weight_index(player);
         let board_cards = parse_board(&self.board).ok();
+        eprintln!("[matrix] street={street:?}, board_len={}, cbv_context={}, board_cards={}",
+            self.board.len(), self.cbv_context.is_some(), board_cards.as_ref().map_or(0, |b| b.len()));
 
         // Build the canonical-to-combo map for weight averaging.
         let combo_map = build_canonical_to_combo_map();
@@ -535,10 +557,10 @@ impl GameSession {
                     }
                 }
 
-                let probs = if street == Street::Preflop {
+                let (probs, bucket_id) = if street == Street::Preflop {
                     // Preflop: all combos of a canonical hand share the same strategy.
                     // Return empty — the cell's aggregated probs are sufficient.
-                    vec![]
+                    (vec![], None)
                 } else if let (Some(ctx), Some(board)) = (&self.cbv_context, board_cards) {
                     // Postflop: per-combo bucket lookup.
                     let board_slice = board_for_street_slice(board, street);
@@ -546,17 +568,19 @@ impl GameSession {
                     let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
                     let bucket = ctx.all_buckets.get_bucket(street, [rs_c1, rs_c2], board_slice);
                     let strategy_probs = ctx.strategy.get_action_probs(decision_idx, bucket);
-                    (0..num_actions)
+                    let probs = (0..num_actions)
                         .map(|i| strategy_probs.get(i).copied().unwrap_or(0.0))
-                        .collect()
+                        .collect();
+                    (probs, Some(bucket))
                 } else {
-                    vec![0.0; num_actions]
+                    (vec![0.0; num_actions], None)
                 };
 
                 Some(ComboDetail {
                     cards: format!("{s1}{s2}"),
                     probabilities: probs,
                     weight: w,
+                    bucket: bucket_id,
                 })
             })
             .collect()
@@ -1144,13 +1168,19 @@ fn range_solver_action_to_game_action(
 
 /// Build a `GameMatrix` from the current `PostFlopGame` state at the root node.
 ///
-/// Reuses the `card_pair_to_matrix` and `matrix_cell_label` helpers from postflop.rs.
-#[allow(clippy::cast_possible_truncation)]
+/// Navigates to root first, then delegates to `build_solve_matrix_at_current`.
 fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> GameMatrix {
-    use crate::postflop::{card_pair_to_matrix, matrix_cell_label};
-    use range_solver::interface::Game;
-
     game.back_to_root();
+    build_solve_matrix_at_current(game, hand_evs)
+}
+
+/// Build a `GameMatrix` from the current `PostFlopGame` position (without navigating to root).
+///
+/// Same logic as `build_solve_matrix` but does NOT call `game.back_to_root()`.
+#[allow(clippy::cast_possible_truncation)]
+fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> GameMatrix {
+    use crate::postflop::{card_pair_to_matrix, matrix_cell_label};
+
     let player = game.current_player();
     let strategy = game.strategy();
     let private_cards = game.private_cards(player);
@@ -1165,7 +1195,6 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
         .collect();
     let num_actions = game_actions.len();
 
-    // Accumulators for 13x13 grid
     let mut prob_sums = vec![vec![vec![0.0f64; num_actions]; 13]; 13];
     let mut combo_counts = vec![vec![0usize; 13]; 13];
     let mut weight_sums = vec![vec![0.0f64; 13]; 13];
@@ -1189,7 +1218,6 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
             probs.push(prob);
         }
 
-        // High card first: rank = id / 4.
         let (c1, c2) = if c1_raw / 4 >= c2_raw / 4 { (c1_raw, c2_raw) } else { (c2_raw, c1_raw) };
         let s1 = card_to_string(c1).unwrap_or_default();
         let s2 = card_to_string(c2).unwrap_or_default();
@@ -1197,6 +1225,7 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
             cards: format!("{s1}{s2}"),
             probabilities: probs,
             weight: initial_weights[hand_idx],
+            bucket: None,
         });
     }
 
@@ -1244,6 +1273,54 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
     GameMatrix {
         cells,
         actions: game_actions,
+    }
+}
+
+/// Walk the solved game tree and cache a `CachedSolveNode` at every decision node.
+///
+/// Returns a map from action path (e.g., `[0, 1]`) to cached node data.
+fn build_solve_cache(game: &mut PostFlopGame) -> HashMap<Vec<usize>, CachedSolveNode> {
+    let mut cache = HashMap::new();
+    build_solve_cache_recursive(game, &mut vec![], &mut cache);
+    cache
+}
+
+fn build_solve_cache_recursive(
+    game: &mut PostFlopGame,
+    path: &mut Vec<usize>,
+    cache: &mut HashMap<Vec<usize>, CachedSolveNode>,
+) {
+    if game.is_terminal_node() || game.is_chance_node() {
+        return;
+    }
+
+    let matrix = build_solve_matrix_at_current(game, None);
+    let actions: Vec<GameAction> = game
+        .available_actions()
+        .iter()
+        .enumerate()
+        .map(|(i, a)| range_solver_action_to_game_action(a, i))
+        .collect();
+    let player = game.current_player();
+    let position = if player == 0 { "OOP" } else { "IP" };
+
+    let num_actions = actions.len();
+    cache.insert(
+        path.clone(),
+        CachedSolveNode {
+            matrix,
+            actions,
+            position: position.to_string(),
+        },
+    );
+
+    for i in 0..num_actions {
+        game.play(i);
+        path.push(i);
+        build_solve_cache_recursive(game, path, cache);
+        path.pop();
+        // Navigate back: PostFlopGame has no undo, so replay from root
+        game.apply_history(path);
     }
 }
 
@@ -1418,17 +1495,26 @@ pub fn game_get_state_core(session_state: &GameSessionState) -> Result<GameState
             is_complete: !is_solving && iteration > 0,
         });
 
-        // Use solve matrix if available
-        if let Some(matrix) = ss.matrix_snapshot.read().clone() {
-            state.matrix = Some(matrix);
-        }
-        let actions = ss.solve_actions.read();
-        if !actions.is_empty() {
-            state.actions = actions.clone();
-        }
-        let position = ss.solve_position.read();
-        if !position.is_empty() {
-            state.position = position.clone();
+        // Prefer solve cache (navigated position) over root snapshot
+        let cache = ss.solve_cache.read();
+        let path = ss.solve_path.read();
+        if let Some(node) = cache.get(&*path) {
+            state.matrix = Some(node.matrix.clone());
+            state.actions = node.actions.clone();
+            state.position = node.position.clone();
+        } else {
+            // Fall back to root snapshot (during solve or before cache is built)
+            if let Some(matrix) = ss.matrix_snapshot.read().clone() {
+                state.matrix = Some(matrix);
+            }
+            let actions = ss.solve_actions.read();
+            if !actions.is_empty() {
+                state.actions = actions.clone();
+            }
+            let position = ss.solve_position.read();
+            if !position.is_empty() {
+                state.position = position.clone();
+            }
         }
     }
 
@@ -1436,16 +1522,55 @@ pub fn game_get_state_core(session_state: &GameSessionState) -> Result<GameState
 }
 
 /// Play an action and return the new game state.
+///
+/// If navigating within a solved subgame tree, serves the cached matrix
+/// instead of resetting the solve state.
 pub fn game_play_action_core(
     session_state: &GameSessionState,
     action_id: &str,
 ) -> Result<GameState, String> {
+    let ss = &session_state.solve_state;
+    let cache = ss.solve_cache.read();
+
+    if !cache.is_empty() {
+        let current_path = ss.solve_path.read().clone();
+        if let Some(current_node) = cache.get(&current_path) {
+            if let Some(action_idx) = current_node.actions.iter().position(|a| a.id == action_id) {
+                let mut new_path = current_path.clone();
+                new_path.push(action_idx);
+
+                if let Some(child_node) = cache.get(&new_path) {
+                    let child_matrix = child_node.matrix.clone();
+                    let child_actions = child_node.actions.clone();
+                    let child_position = child_node.position.clone();
+                    drop(cache);
+
+                    // Play the action on the session for board/range tracking
+                    let mut guard = session_state.session.write();
+                    let session = guard.as_mut().ok_or("No game session active")?;
+                    session.play_action(action_id)?;
+                    let mut state = session.get_state();
+                    drop(guard);
+
+                    // Override with cached data
+                    state.matrix = Some(child_matrix);
+                    state.actions = child_actions;
+                    state.position = child_position;
+                    *ss.solve_path.write() = new_path;
+
+                    return Ok(state);
+                }
+            }
+        }
+    }
+    drop(cache);
+
+    // Not in solved tree -- normal navigation, reset solve state
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
     session.play_action(action_id)?;
     let state = session.get_state();
     drop(guard);
-    // Reset solve state so stale data doesn't leak into the next position.
     session_state.solve_state.reset();
     Ok(state)
 }
@@ -1462,16 +1587,39 @@ pub fn game_deal_card_core(
 }
 
 /// Undo the last action and return the new game state.
+///
+/// If within a solved subgame tree, pops the last action from the solve path
+/// and serves the parent's cached matrix. If at the solve root, resets the
+/// solve state entirely.
 pub fn game_back_core(session_state: &GameSessionState) -> Result<GameState, String> {
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
     session.back()?;
-    // Reset solve state so stale data doesn't leak.
+    let mut state = session.get_state();
     drop(guard);
-    session_state.solve_state.reset();
-    let guard = session_state.session.read();
-    let session = guard.as_ref().ok_or("No game session active")?;
-    Ok(session.get_state())
+
+    let ss = &session_state.solve_state;
+    let cache = ss.solve_cache.read();
+
+    if !cache.is_empty() {
+        let mut path = ss.solve_path.write();
+        if !path.is_empty() {
+            // Pop last action to get parent path
+            path.pop();
+            if let Some(node) = cache.get(&*path) {
+                state.matrix = Some(node.matrix.clone());
+                state.actions = node.actions.clone();
+                state.position = node.position.clone();
+            }
+            return Ok(state);
+        }
+        // At solve root and going back -- navigating before solve root, reset
+        drop(path);
+        drop(cache);
+        session_state.solve_state.reset();
+    }
+
+    Ok(state)
 }
 
 /// Start a subgame solve using range-solver `PostFlopGame` with depth limit.
@@ -1860,6 +2008,12 @@ pub fn game_solve_core(
             .exploitability_bits
             .store(final_exp.to_bits(), Ordering::Relaxed);
 
+        // Build solve cache for all decision nodes in the solved tree.
+        let solve_cache = build_solve_cache(&mut game);
+        eprintln!("[solve] cached {} decision nodes for subgame navigation", solve_cache.len());
+        *ss_clone.solve_cache.write() = solve_cache;
+        *ss_clone.solve_path.write() = vec![];
+
         ss_clone.solving.store(false, Ordering::Release);
         let reported_exp = f32::from_bits(ss_clone.exploitability_bits.load(Ordering::Relaxed));
         eprintln!(
@@ -2227,6 +2381,7 @@ mod tests {
                 cards: "AhKh".to_string(),
                 probabilities: vec![0.5, 0.3, 0.2],
                 weight: 1.0,
+                bucket: None,
             }],
         };
         let json = serde_json::to_string(&cell).unwrap();
@@ -3330,5 +3485,289 @@ mod tests {
         assert_eq!(state2.position, state1.position);
         assert_eq!(state2.street, state1.street);
         assert_eq!(state2.action_history.len(), state1.action_history.len());
+    }
+
+    // -------------------------------------------------------------------
+    // Solve cache tests
+    // -------------------------------------------------------------------
+
+    /// Helper to create a dummy CachedSolveNode with a recognizable hand label.
+    fn make_cached_node(hand_label: &str, action_labels: &[&str], position: &str) -> CachedSolveNode {
+        let actions: Vec<GameAction> = action_labels
+            .iter()
+            .enumerate()
+            .map(|(i, &lbl)| GameAction {
+                id: i.to_string(),
+                label: lbl.to_string(),
+                action_type: "check".to_string(),
+            })
+            .collect();
+        let matrix = GameMatrix {
+            cells: vec![vec![GameMatrixCell {
+                hand: hand_label.to_string(),
+                suited: false,
+                pair: false,
+                probabilities: vec![1.0; action_labels.len()],
+                combo_count: 1,
+                weight: 1.0,
+                ev: None,
+                combos: vec![],
+            }]],
+            actions: actions.clone(),
+        };
+        CachedSolveNode {
+            matrix,
+            actions,
+            position: position.to_string(),
+        }
+    }
+
+    #[test]
+    fn solve_state_default_has_empty_cache_and_path() {
+        let ss = SolveState::default();
+        assert!(ss.solve_cache.read().is_empty());
+        assert!(ss.solve_path.read().is_empty());
+    }
+
+    #[test]
+    fn solve_state_reset_clears_cache_and_path() {
+        let ss = SolveState::default();
+        // Populate cache and path
+        ss.solve_cache.write().insert(vec![], make_cached_node("ROOT", &["Check", "Bet"], "OOP"));
+        ss.solve_cache.write().insert(vec![0], make_cached_node("CHILD0", &["Fold", "Call"], "IP"));
+        ss.solve_path.write().push(0);
+
+        assert!(!ss.solve_cache.read().is_empty());
+        assert!(!ss.solve_path.read().is_empty());
+
+        ss.reset();
+
+        assert!(ss.solve_cache.read().is_empty());
+        assert!(ss.solve_path.read().is_empty());
+    }
+
+    #[test]
+    fn play_action_serves_cached_matrix_within_solved_tree() {
+        let gss = GameSessionState::default();
+        let session = make_two_level_session();
+        *gss.session.write() = Some(session);
+
+        // Populate solve cache: root and one child
+        let root_node = make_cached_node("ROOT", &["Fold", "Call"], "BB");
+        let child_node = make_cached_node("CHILD", &["Check", "Fold"], "SB");
+        gss.solve_state.solve_cache.write().insert(vec![], root_node);
+        gss.solve_state.solve_cache.write().insert(vec![1], child_node);
+        // Mark solve as completed so iteration > 0
+        gss.solve_state.iteration.store(100, Ordering::Relaxed);
+
+        // Play action "1" (Call) which maps to cache path [1]
+        let state = game_play_action_core(&gss, "1").unwrap();
+        let matrix = state.matrix.expect("should have cached matrix");
+        assert_eq!(matrix.cells[0][0].hand, "CHILD");
+        assert_eq!(state.position, "SB");
+        // Path should now be [1]
+        assert_eq!(*gss.solve_state.solve_path.read(), vec![1]);
+    }
+
+    #[test]
+    fn play_action_resets_when_navigating_outside_solved_tree() {
+        let gss = GameSessionState::default();
+        let session = make_two_level_session();
+        *gss.session.write() = Some(session);
+
+        // Populate solve cache with only root (no children cached)
+        let root_node = make_cached_node("ROOT", &["Fold", "Call"], "BB");
+        gss.solve_state.solve_cache.write().insert(vec![], root_node);
+        gss.solve_state.iteration.store(100, Ordering::Relaxed);
+
+        // Play action "1" (Call) -- path [1] not in cache, should reset
+        let _state = game_play_action_core(&gss, "1").unwrap();
+        // Cache should be cleared
+        assert!(gss.solve_state.solve_cache.read().is_empty());
+        assert!(gss.solve_state.solve_path.read().is_empty());
+    }
+
+    #[test]
+    fn back_serves_parent_cached_matrix() {
+        let gss = GameSessionState::default();
+        let session = make_two_level_session();
+        *gss.session.write() = Some(session);
+
+        // Navigate to child first (without cache, so it resets -- we need to
+        // set cache AFTER navigating to simulate post-solve navigation)
+        // Instead, pre-populate cache and navigate within it:
+        let root_node = make_cached_node("ROOT", &["Fold", "Call"], "BB");
+        let child_node = make_cached_node("CHILD", &["Check", "Fold"], "SB");
+        gss.solve_state.solve_cache.write().insert(vec![], root_node);
+        gss.solve_state.solve_cache.write().insert(vec![1], child_node);
+        gss.solve_state.iteration.store(100, Ordering::Relaxed);
+
+        // Play action to get to child (within solved tree)
+        let _ = game_play_action_core(&gss, "1").unwrap();
+        assert_eq!(*gss.solve_state.solve_path.read(), vec![1]);
+
+        // Now go back -- should serve root cached matrix
+        let state = game_back_core(&gss).unwrap();
+        let matrix = state.matrix.expect("should have root cached matrix");
+        assert_eq!(matrix.cells[0][0].hand, "ROOT");
+        assert_eq!(*gss.solve_state.solve_path.read(), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn back_at_solve_root_shows_root_matrix() {
+        let gss = GameSessionState::default();
+        let session = make_two_level_session();
+        *gss.session.write() = Some(session);
+
+        // Play one action outside solve cache first, then set up cache at the child
+        // Actually, test the case where we're at solve root (path is empty) and go back
+        // We need to first navigate to a position, THEN set up solve cache
+
+        // Navigate to child node first
+        {
+            let mut guard = gss.session.write();
+            let s = guard.as_mut().unwrap();
+            s.play_action("1").unwrap(); // now at node 2
+        }
+
+        // Set up solve cache at this position (the solve root is the current node)
+        let root_node = make_cached_node("SOLVE_ROOT", &["Check", "Fold"], "SB");
+        gss.solve_state.solve_cache.write().insert(vec![], root_node);
+        gss.solve_state.iteration.store(100, Ordering::Relaxed);
+        // Path is empty (at solve root)
+
+        // Go back -- should clear cache (navigating before solve root)
+        let _state = game_back_core(&gss).unwrap();
+        // Cache should be cleared since we went before the solve root
+        assert!(gss.solve_state.solve_cache.read().is_empty());
+    }
+
+    #[test]
+    fn get_state_core_serves_cached_matrix_at_solve_path() {
+        let gss = GameSessionState::default();
+        let session = make_two_level_session();
+        *gss.session.write() = Some(session);
+
+        // Set up completed solve with cache
+        gss.solve_state.solving.store(false, Ordering::Relaxed);
+        gss.solve_state.iteration.store(100, Ordering::Relaxed);
+        gss.solve_state.max_iterations.store(100, Ordering::Relaxed);
+        *gss.solve_state.solve_start.write() = Some(std::time::Instant::now());
+
+        let root_node = make_cached_node("CACHE_ROOT", &["Fold", "Call"], "BB");
+        let child_node = make_cached_node("CACHE_CHILD", &["Check", "Fold"], "SB");
+        gss.solve_state.solve_cache.write().insert(vec![], root_node);
+        gss.solve_state.solve_cache.write().insert(vec![1], child_node);
+
+        // At solve root (empty path), should serve root cache
+        let state = game_get_state_core(&gss).unwrap();
+        let matrix = state.matrix.expect("should have cached matrix");
+        assert_eq!(matrix.cells[0][0].hand, "CACHE_ROOT");
+
+        // Navigate to child path
+        *gss.solve_state.solve_path.write() = vec![1];
+        let state = game_get_state_core(&gss).unwrap();
+        let matrix = state.matrix.expect("should have child cached matrix");
+        assert_eq!(matrix.cells[0][0].hand, "CACHE_CHILD");
+    }
+
+    #[test]
+    fn build_solve_cache_contains_root_and_children() {
+        use range_solver::{PostFlopGame, ActionTree, CardConfig, TreeConfig, BoardState};
+        use range_solver::card::{flop_from_str, NOT_DEALT};
+        use range_solver::range::Range;
+        use range_solver::bet_size::BetSizeOptions;
+
+        let oop_range: Range = "AA".parse().unwrap();
+        let ip_range: Range = "KK".parse().unwrap();
+        let flop = flop_from_str("AhKdQc").unwrap();
+
+        let sizes = BetSizeOptions::try_from(("50%,a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Flop,
+            starting_pot: 20,
+            effective_stack: 90,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+            flop_bet_sizes: [sizes.clone(), sizes.clone()],
+            turn_bet_sizes: [sizes.clone(), sizes.clone()],
+            river_bet_sizes: [sizes.clone(), sizes.clone()],
+            turn_donk_sizes: None,
+            river_donk_sizes: None,
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.15,
+            merging_threshold: 0.1,
+            depth_limit: Some(0),
+        };
+        let action_tree = ActionTree::new(tree_config).unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop,
+            turn: NOT_DEALT,
+            river: NOT_DEALT,
+        };
+        let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+        game.allocate_memory(false);
+
+        let cache = build_solve_cache(&mut game);
+        // Root should be present
+        assert!(cache.contains_key(&vec![]), "cache should contain root entry");
+        // Root should have actions
+        assert!(!cache[&vec![]].actions.is_empty());
+        // Root should have a 13x13 matrix
+        assert_eq!(cache[&vec![]].matrix.cells.len(), 13);
+        // Should have more than just root (children for each action at root)
+        assert!(cache.len() > 1, "cache should contain child entries too, got {}", cache.len());
+    }
+
+    #[test]
+    fn build_solve_matrix_at_current_works_without_back_to_root() {
+        use range_solver::{PostFlopGame, ActionTree, CardConfig, TreeConfig, BoardState};
+        use range_solver::card::{flop_from_str, NOT_DEALT};
+        use range_solver::range::Range;
+        use range_solver::bet_size::BetSizeOptions;
+
+        let oop_range: Range = "AA".parse().unwrap();
+        let ip_range: Range = "KK".parse().unwrap();
+        let flop = flop_from_str("AhKdQc").unwrap();
+
+        let sizes = BetSizeOptions::try_from(("50%,a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Flop,
+            starting_pot: 20,
+            effective_stack: 90,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+            flop_bet_sizes: [sizes.clone(), sizes.clone()],
+            turn_bet_sizes: [sizes.clone(), sizes.clone()],
+            river_bet_sizes: [sizes.clone(), sizes.clone()],
+            turn_donk_sizes: None,
+            river_donk_sizes: None,
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.15,
+            merging_threshold: 0.1,
+            depth_limit: Some(0),
+        };
+        let action_tree = ActionTree::new(tree_config).unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop,
+            turn: NOT_DEALT,
+            river: NOT_DEALT,
+        };
+        let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+        game.allocate_memory(false);
+
+        // Navigate to a child node first
+        let num_actions = game.available_actions().len();
+        assert!(num_actions > 0);
+        game.play(0); // play first action
+
+        // If we're NOT at a terminal/chance node, build matrix at current position
+        if !game.is_terminal_node() && !game.is_chance_node() {
+            let matrix = build_solve_matrix_at_current(&mut game, None);
+            assert_eq!(matrix.cells.len(), 13);
+            assert!(!matrix.actions.is_empty());
+        }
     }
 }

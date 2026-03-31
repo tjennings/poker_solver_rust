@@ -35,3 +35,11 @@ training:
 buffer:
   max_records: 12000000
   path: "rebel_buffer.bin"
+
+inference:
+  batch_size: 256
+  batch_timeout_us: 100
+  train_every_n_solves: 50
+  train_batch_size: 512
+  replay_capacity: 200000
+  learning_rate: 0.0003

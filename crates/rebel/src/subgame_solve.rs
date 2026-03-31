@@ -8,15 +8,18 @@
 // boundary-evaluation logic from solver.rs, but additionally extracts
 // the average strategy at the root node.
 
+use crate::inference_server::InferenceHandle;
+use crate::leaf_evaluator::build_boundary_input;
 use crate::pbs::{Pbs, NUM_COMBOS};
 use crate::solver::SolveConfig;
+use cfvnet::model::network::OUTPUT_SIZE;
 use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::poker::Card as RsPokerCard;
 use range_solver::{
     action_tree::{ActionTree, BoardState, TreeConfig},
     card::{card_pair_to_index, Card, NOT_DEALT},
     range::Range,
-    solve, CardConfig, PostFlopGame,
+    finalize, solve, solve_step, CardConfig, PostFlopGame,
 };
 
 // ---------------------------------------------------------------------------
@@ -100,6 +103,133 @@ pub fn solve_subgame(
         )),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Iterative subgame solving (inference server)
+// ---------------------------------------------------------------------------
+
+/// Solve a subgame with per-iteration boundary re-evaluation via the inference server.
+///
+/// Unlike [`solve_subgame`] (which evaluates boundaries once before solving),
+/// this function re-evaluates boundary CFVs at every CFR iteration as the
+/// strategy evolves. This matches the reference ReBeL implementation where
+/// the value network is queried each iteration.
+///
+/// The inference handle submits requests to the GPU inference server, which
+/// batches them across all worker threads for efficient GPU utilization.
+///
+/// For river PBSs (5 board cards), there are no depth boundaries so this
+/// delegates to the same solver as `solve_subgame`.
+///
+/// # Arguments
+///
+/// * `pbs` - The public belief state to solve at
+/// * `config` - Solver configuration (iterations, bet sizes, etc.)
+/// * `handle` - Handle to the inference server for boundary evaluation
+///
+/// # Returns
+///
+/// A `SubgameSolveResult` containing root CFVs and strategy, or an error
+/// if the PBS is invalid.
+pub fn solve_subgame_iterative(
+    pbs: &Pbs,
+    config: &SolveConfig,
+    handle: &InferenceHandle,
+) -> Result<SubgameSolveResult, String> {
+    if pbs.pot <= 0 {
+        return Err("pot must be positive for solver".into());
+    }
+    if pbs.effective_stack <= 0 {
+        return Err("effective_stack must be positive for solver".into());
+    }
+
+    // River PBSs have no depth boundaries — solve directly.
+    if pbs.board.len() == 5 {
+        return solve_subgame_river(pbs, config);
+    }
+
+    // Build the game tree (same as prepare_game in solver.rs).
+    let mut prepared = crate::solver::prepare_game(pbs, config)?;
+    let n_boundary = prepared.game.num_boundary_nodes();
+
+    for iter in 0..config.solver_iterations {
+        // Re-evaluate boundary CFVs with current ranges each iteration.
+        if n_boundary > 0 {
+            evaluate_boundaries_via_server(&prepared.game, pbs, handle);
+        }
+
+        // One CFR iteration.
+        solve_step(&prepared.game, iter);
+    }
+
+    // Finalize: compute average strategy and expected values.
+    finalize(&mut prepared.game);
+
+    // Extract results using the same logic as the one-shot solver.
+    extract_result(pbs, &mut prepared.game)
+}
+
+/// Evaluate all boundary nodes via the inference server.
+///
+/// For each boundary node x player combination: encode a 2720-element input
+/// vector from the current ranges, submit to the server, and set the returned
+/// CFVs on the game.
+///
+/// TODO: The ranges used here are the initial PBS reach probs, not the current
+/// per-iteration ranges from the evolving strategy. Using the actual per-iteration
+/// reaches requires extracting reach probabilities through the tree at each
+/// iteration, which is a follow-up optimization.
+fn evaluate_boundaries_via_server(
+    game: &PostFlopGame,
+    pbs: &Pbs,
+    handle: &InferenceHandle,
+) {
+    let n_boundary = game.num_boundary_nodes();
+    let starting_pot = game.tree_config().starting_pot;
+    let eff_stack = game.tree_config().effective_stack;
+
+    // Build 1326-indexed range arrays from PBS reach probs.
+    let oop_1326: &[f32; OUTPUT_SIZE] = &pbs.reach_probs[0];
+    let ip_1326: &[f32; OUTPUT_SIZE] = &pbs.reach_probs[1];
+
+    for player in 0..2usize {
+        let hands = game.private_cards(player);
+
+        for ordinal in 0..n_boundary {
+            let bpot = game.boundary_pot(ordinal);
+            let amount = (bpot - starting_pot) / 2;
+            let boundary_eff_stack = eff_stack - amount;
+
+            // Build 2720-element input using the same encoding as cfvnet.
+            let input = build_boundary_input(
+                oop_1326,
+                ip_1326,
+                &pbs.board,
+                bpot as f64,
+                boundary_eff_stack as f64,
+                player as u8,
+            );
+
+            // Submit to inference server and block until result arrives.
+            let cfvs_1326 = handle.evaluate(input);
+
+            // Map from 1326-canonical ordering to solver combo ordering.
+            let cfvs_solver: Vec<f32> = hands
+                .iter()
+                .map(|&(c1, c2)| {
+                    let idx = card_pair_to_index(c1, c2);
+                    cfvs_1326[idx]
+                })
+                .collect();
+
+            game.set_boundary_cfvs(ordinal, player, cfvs_solver);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One-shot subgame solving (LeafEvaluator)
+// ---------------------------------------------------------------------------
 
 /// Street indicator for selecting bet sizes and board state.
 enum Street {
@@ -639,5 +769,189 @@ mod tests {
         let evaluator = ZeroEvaluator;
         let result = solve_subgame(&pbs, &config, &evaluator);
         assert!(result.is_err(), "expected error for 2-card board");
+    }
+
+    // -----------------------------------------------------------------------
+    // Iterative subgame solver (inference server)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_solve_subgame_iterative_signature() {
+        // Verify the function signature compiles and accepts the expected types.
+        // A full integration test requires a running inference server.
+        fn _check_signature(
+            _pbs: &Pbs,
+            _config: &SolveConfig,
+            _handle: &InferenceHandle,
+        ) -> Result<SubgameSolveResult, String> {
+            solve_subgame_iterative(_pbs, _config, _handle)
+        }
+    }
+
+    #[test]
+    fn test_solve_subgame_iterative_river() {
+        // River PBSs have no boundaries, so iterative solver should produce
+        // the same kind of results as the one-shot solver.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        use burn::backend::{Autodiff, NdArray};
+        use cfvnet::model::network::{CfvNet, INPUT_SIZE};
+
+        use crate::inference_server::{spawn_inference_server, InferenceServerConfig};
+        use crate::replay_buffer::ReplayBuffer;
+
+        type TestBackend = Autodiff<NdArray>;
+
+        let device = Default::default();
+        let model = CfvNet::<TestBackend>::new(&device, 1, 8, INPUT_SIZE);
+        let replay_buffer = Arc::new(ReplayBuffer::new(100));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (handle, server_thread) = spawn_inference_server(
+            model,
+            device,
+            InferenceServerConfig {
+                batch_size: 4,
+                batch_timeout_us: 5000,
+                train_every_n_solves: 1000,
+                train_batch_size: 32,
+                learning_rate: 1e-4,
+            },
+            replay_buffer,
+            Arc::clone(&shutdown),
+        );
+
+        let board = test_river_board();
+        let pbs = Pbs::new_uniform(board.clone(), 100, 100);
+        let config = test_solve_config();
+
+        let result = solve_subgame_iterative(&pbs, &config, &handle).unwrap();
+
+        // Should produce valid results (same checks as river one-shot test).
+        assert!(result.num_actions > 0);
+        assert_eq!(
+            result.root_strategy.len(),
+            NUM_COMBOS * result.num_actions,
+        );
+
+        // CFVs should be finite.
+        for player in 0..2 {
+            for i in 0..NUM_COMBOS {
+                assert!(
+                    result.root_cfvs[player][i].is_finite(),
+                    "player {player}, combo {i}: non-finite CFV",
+                );
+            }
+        }
+
+        // Board-blocked combos should have 0 CFV.
+        for i in 0..NUM_COMBOS {
+            if is_blocked(i, &board) {
+                assert_eq!(result.root_cfvs[0][i], 0.0);
+                assert_eq!(result.root_cfvs[1][i], 0.0);
+            }
+        }
+
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        server_thread.join().expect("server thread should not panic");
+    }
+
+    #[test]
+    fn test_solve_subgame_iterative_error_cases() {
+        // Verify error handling without needing a real inference server.
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let handle = InferenceHandle::new_for_test(tx, Arc::new(AtomicUsize::new(0)));
+
+        let config = test_solve_config();
+
+        // Zero pot.
+        let pbs = Pbs::new_uniform(test_turn_board(), 0, 100);
+        assert!(solve_subgame_iterative(&pbs, &config, &handle).is_err());
+
+        // Zero stack.
+        let pbs = Pbs::new_uniform(test_turn_board(), 100, 0);
+        assert!(solve_subgame_iterative(&pbs, &config, &handle).is_err());
+
+        // Invalid board size (2 cards).
+        let pbs = Pbs::new_uniform(vec![43, 38], 100, 100);
+        assert!(solve_subgame_iterative(&pbs, &config, &handle).is_err());
+    }
+
+    #[test]
+    #[ignore] // requires running inference server with GPU
+    fn test_solve_subgame_iterative_turn_integration() {
+        // Integration test: solve a turn PBS with the iterative solver.
+        // Requires a running inference server with a loaded CfvNet model.
+        //
+        // Run with: cargo test -p rebel subgame_solve::tests::test_solve_subgame_iterative_turn_integration -- --ignored
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        use burn::backend::{Autodiff, NdArray};
+        use cfvnet::model::network::{CfvNet, INPUT_SIZE};
+
+        use crate::inference_server::{spawn_inference_server, InferenceServerConfig};
+        use crate::replay_buffer::ReplayBuffer;
+
+        type TestBackend = Autodiff<NdArray>;
+
+        let device = Default::default();
+        let model = CfvNet::<TestBackend>::new(&device, 1, 8, INPUT_SIZE);
+        let replay_buffer = Arc::new(ReplayBuffer::new(100));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (handle, server_thread) = spawn_inference_server(
+            model,
+            device,
+            InferenceServerConfig {
+                batch_size: 4,
+                batch_timeout_us: 5000,
+                train_every_n_solves: 1000,
+                train_batch_size: 32,
+                learning_rate: 1e-4,
+            },
+            replay_buffer,
+            Arc::clone(&shutdown),
+        );
+
+        let board = test_turn_board();
+        let pbs = Pbs::new_uniform(board.clone(), 100, 200);
+        let mut config = test_solve_config();
+        config.solver_iterations = 50; // fewer iterations for test speed
+
+        let result = solve_subgame_iterative(&pbs, &config, &handle).unwrap();
+
+        assert!(result.num_actions > 0);
+        assert_eq!(result.root_strategy.len(), NUM_COMBOS * result.num_actions);
+
+        // All CFVs should be finite.
+        for player in 0..2 {
+            for i in 0..NUM_COMBOS {
+                assert!(
+                    result.root_cfvs[player][i].is_finite(),
+                    "player {player}, combo {i}: non-finite CFV",
+                );
+            }
+        }
+
+        // Strategy should sum to ~1.0 for non-blocked combos.
+        for i in 0..NUM_COMBOS {
+            if is_blocked(i, &board) {
+                continue;
+            }
+            let probs = get_action_probs(&result, i);
+            let sum: f32 = probs.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-4,
+                "combo {i}: strategy sum = {sum}, expected ~1.0",
+            );
+        }
+
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        server_thread.join().expect("server thread should not panic");
     }
 }

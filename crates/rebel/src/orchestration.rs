@@ -511,6 +511,7 @@ mod tests {
                 max_records: 10_000,
                 path: "test_buffer.bin".to_string(),
             },
+            inference: InferenceConfig::default(),
         }
     }
 

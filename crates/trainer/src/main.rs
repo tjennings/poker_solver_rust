@@ -1360,12 +1360,85 @@ fn run_rebel_train(
         eprintln!("\nOffline-only mode — skipping self-play.");
         eprintln!("Model saved at: {}", model_path.display());
     } else {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use burn::backend::{Autodiff, wgpu::Wgpu};
+        use cfvnet::model::network::CfvNet;
+        use rebel::inference_server::{spawn_inference_server, InferenceServerConfig};
+        use rebel::replay_buffer::ReplayBuffer;
+        use rebel::self_play::{self_play_training_loop, SelfPlayConfig};
+
+        type TrainBackend = Autodiff<Wgpu>;
+
         eprintln!("\n--- Phase 2: Self-Play Training ---");
-        eprintln!("Self-play training loop not yet implemented.");
         eprintln!("Model at: {}", model_path.display());
-        // TODO (Phase 5): Load model as LeafEvaluator, build SelfPlayConfig
-        // from rebel_config, create buffer, call self_play_training_loop(),
-        // then retrain model on accumulated data.
+
+        // Create a fresh (random) CfvNet model.
+        // TODO: Load weights from model_path checkpoint once model serialization is wired.
+        let device = burn::backend::wgpu::WgpuDevice::default();
+        let model = CfvNet::<TrainBackend>::new(
+            &device,
+            rebel_config.training.hidden_layers,
+            rebel_config.training.hidden_size,
+            cfvnet::model::network::INPUT_SIZE,
+        );
+        eprintln!(
+            "  Created CfvNet: {} layers x {} hidden (random init, checkpoint loading is a follow-up)",
+            rebel_config.training.hidden_layers, rebel_config.training.hidden_size,
+        );
+
+        // Create replay buffer.
+        let replay_buffer = Arc::new(ReplayBuffer::new(
+            rebel_config.inference.replay_capacity,
+        ));
+
+        // Spawn inference server.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let inf_config = InferenceServerConfig {
+            batch_size: rebel_config.inference.batch_size,
+            batch_timeout_us: rebel_config.inference.batch_timeout_us,
+            train_every_n_solves: rebel_config.inference.train_every_n_solves,
+            train_batch_size: rebel_config.inference.train_batch_size,
+            learning_rate: rebel_config.inference.learning_rate,
+        };
+        let (handle, server_thread) = spawn_inference_server(
+            model,
+            device,
+            inf_config,
+            Arc::clone(&replay_buffer),
+            Arc::clone(&shutdown),
+        );
+        eprintln!("  Inference server spawned (batch_size={}, timeout={}us)",
+            rebel_config.inference.batch_size, rebel_config.inference.batch_timeout_us);
+
+        // Build SolveConfig and SelfPlayConfig.
+        let solve_config = rebel::generate::build_solve_config(&rebel_config.seed);
+        let sp_config = SelfPlayConfig {
+            num_hands: rebel_config.seed.num_hands,
+            cfr_iterations: rebel_config.seed.solver_iterations,
+            exploration_epsilon: 0.25,
+            initial_stack: rebel_config.game.initial_stack,
+            small_blind: rebel_config.game.small_blind,
+            big_blind: rebel_config.game.big_blind,
+            hands_per_training_batch: 100,
+            seed: rebel_config.seed.seed,
+        };
+
+        // Run self-play training loop.
+        let total = self_play_training_loop(
+            &handle,
+            &solve_config,
+            &sp_config,
+            &strategy,
+            &tree,
+            &buckets,
+            &replay_buffer,
+        );
+
+        // Shutdown inference server.
+        shutdown.store(true, Ordering::Relaxed);
+        server_thread.join().expect("inference server thread panicked");
+        eprintln!("Self-play complete: {total} examples generated");
     }
 
     Ok(())

@@ -5240,6 +5240,8 @@ dependencies = [
 name = "poker-solver-trainer"
 version = "0.1.0"
 dependencies = [
+ "burn",
+ "cfvnet",
  "clap",
  "crossterm",
  "indicatif",
@@ -5828,6 +5830,7 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "cfvnet",
+ "crossbeam-channel",
  "indicatif",
  "memmap2",
  "poker-solver-core",
