@@ -89,7 +89,7 @@ impl PostFlopGame {
                             opp_reach
                         };
                         let num_hands = self.private_cards[player].len();
-                        let cfvs = evaluator.compute_cfvs(player, pot, remaining, &opp_reach_ref, num_hands);
+                        let cfvs = evaluator.compute_cfvs(player, pot, remaining, &opp_reach_ref, num_hands, ordinal);
                         *self.boundary_cfvs[bcfv_index].lock().unwrap() = cfvs;
                     } else {
                         return; // No evaluator — treat as zero.

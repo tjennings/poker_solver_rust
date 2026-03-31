@@ -911,4 +911,81 @@ mod tests {
             "Exploitability should decrease below 10.0 after 100 iters: {expl}"
         );
     }
+
+    #[test]
+    fn boundary_evaluator_receives_boundary_index() {
+        use crate::action_tree::*;
+        use crate::bet_size::*;
+        use crate::card::*;
+        use crate::game::BoundaryEvaluator;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Test evaluator that records which boundary indices it was called with.
+        struct RecordingEvaluator {
+            max_index_seen: AtomicUsize,
+            call_count: AtomicUsize,
+        }
+        impl BoundaryEvaluator for RecordingEvaluator {
+            fn compute_cfvs(
+                &self,
+                _player: usize,
+                _pot: i32,
+                _remaining_stack: f64,
+                _opponent_reach: &[f32],
+                num_hands: usize,
+                boundary_index: usize,
+            ) -> Vec<f32> {
+                self.call_count.fetch_add(1, Ordering::Relaxed);
+                let prev = self.max_index_seen.load(Ordering::Relaxed);
+                if boundary_index > prev {
+                    self.max_index_seen.store(boundary_index, Ordering::Relaxed);
+                }
+                vec![0.0; num_hands]
+            }
+        }
+
+        let oop_range: crate::range::Range = "AA,KK,QQ,AKs".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ-JJ,AQs,AJs".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: NOT_DEALT,
+        };
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 100,
+            turn_bet_sizes: [sizes.clone(), sizes],
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
+        game.allocate_memory(false);
+
+        let n_boundary = game.num_boundary_nodes();
+        assert!(n_boundary > 0, "Should have at least one boundary node");
+
+        let evaluator = Arc::new(RecordingEvaluator {
+            max_index_seen: AtomicUsize::new(0),
+            call_count: AtomicUsize::new(0),
+        });
+        game.boundary_evaluator = Some(evaluator.clone());
+
+        // Run one solve step to trigger boundary evaluation
+        solve_step(&game, 0);
+
+        let calls = evaluator.call_count.load(Ordering::Relaxed);
+        assert!(calls > 0, "Evaluator should have been called at least once");
+
+        // The max boundary index seen should be less than n_boundary
+        let max_idx = evaluator.max_index_seen.load(Ordering::Relaxed);
+        assert!(
+            max_idx < n_boundary,
+            "Max boundary index {max_idx} should be < num_boundary_nodes {n_boundary}"
+        );
+    }
 }
