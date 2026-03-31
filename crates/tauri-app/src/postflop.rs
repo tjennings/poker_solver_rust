@@ -721,9 +721,6 @@ pub fn build_subgame_solver(
                     rollout: Some(rollout),
                     combos,
                     game_to_combo: [map0, map1],
-                    boundary_mode: crate::game_session::BoundaryMode::Rollout,
-                    cbv_table: None,
-                    all_buckets: None,
                 },
             ));
         } else {

@@ -139,7 +139,6 @@ impl BoundaryEvaluator for NetBoundaryEvaluator {
         remaining_stack: f64,
         opponent_reach: &[f32],
         num_hands: usize,
-        _boundary_index: usize,
     ) -> Vec<f32> {
         let opp = player ^ 1;
         let hero_cards = &self.private_cards[player];

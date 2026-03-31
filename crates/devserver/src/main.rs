@@ -154,7 +154,6 @@ struct GameSolveParams {
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
     range_clamp_threshold: Option<f64>,
-    boundary_mode: Option<poker_solver_tauri::game_session::BoundaryMode>,
 }
 
 #[derive(Deserialize)]
@@ -638,7 +637,6 @@ async fn handle_game_solve(
         params.rollout_num_samples,
         params.rollout_opponent_samples,
         params.range_clamp_threshold,
-        params.boundary_mode,
     ))
 }
 

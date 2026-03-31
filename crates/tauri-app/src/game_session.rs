@@ -1246,24 +1246,8 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
     }
 }
 
-/// Configures which evaluator is used for depth-limited boundary nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BoundaryMode {
-    /// Monte Carlo rollouts through the blueprint strategy (~40s per boundary).
-    Rollout,
-    /// Pre-computed CBV table lookups (microseconds per boundary).
-    Cbv,
-}
-
-impl Default for BoundaryMode {
-    fn default() -> Self {
-        Self::Cbv
-    }
-}
-
 /// Adapter implementing `BoundaryEvaluator` for the range-solver.
-/// SPR=0 boundaries use exact matchup equity; SPR>0 uses rollout or CBV lookup.
+/// SPR=0 boundaries use exact matchup equity; SPR>0 uses RolloutLeafEvaluator.
 pub(crate) struct SolveBoundaryEvaluator {
     /// Private cards per player, in range-solver ordering (card ID pairs).
     pub(crate) private_cards: [Vec<(u8, u8)>; 2],
@@ -1278,12 +1262,6 @@ pub(crate) struct SolveBoundaryEvaluator {
     pub(crate) combos: Vec<[rs_poker::core::Card; 2]>,
     /// Maps game private_cards index → combo index, per player.
     pub(crate) game_to_combo: [Vec<usize>; 2],
-    /// Which boundary evaluation mode to use for SPR>0 nodes.
-    pub(crate) boundary_mode: BoundaryMode,
-    /// Pre-computed CBV table for fast boundary value lookup.
-    pub(crate) cbv_table: Option<poker_solver_core::blueprint_v2::cbv::CbvTable>,
-    /// Bucket lookup for mapping combos to abstract buckets on the next street.
-    pub(crate) all_buckets: Option<Arc<poker_solver_core::blueprint_v2::mccfr::AllBuckets>>,
 }
 
 impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
@@ -1294,7 +1272,6 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
         remaining_stack: f64,
         opponent_reach: &[f32],
         num_hands: usize,
-        boundary_index: usize,
     ) -> Vec<f32> {
         let opp = player ^ 1;
 
@@ -1337,161 +1314,57 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
                     }
                 })
                 .collect()
-        } else if self.boundary_mode == BoundaryMode::Cbv {
-            // CBV-based boundary evaluation: look up pre-computed values.
-            self.compute_cfvs_cbv(player, opp, opponent_reach, num_hands, boundary_index)
         } else if let Some(ref rollout) = self.rollout {
             // SPR > 0: rollout with boundary stack/pot.
-            self.compute_cfvs_rollout(player, opp, pot, remaining_stack, opponent_reach, num_hands, rollout)
+            // Convert opponent_reach from game ordering to combo ordering.
+            let opp_map = &self.game_to_combo[opp];
+            let mut opp_combo_reach = vec![0.0f64; self.combos.len()];
+            for (game_idx, &combo_idx) in opp_map.iter().enumerate() {
+                if combo_idx < opp_combo_reach.len() && game_idx < opponent_reach.len() {
+                    opp_combo_reach[combo_idx] = opponent_reach[game_idx] as f64;
+                }
+            }
+            // If no opponent combos have reach, boundary is unreachable — value irrelevant.
+            let opp_total: f64 = opp_combo_reach.iter().sum();
+            if opp_total <= 0.0 {
+                return vec![0.0f32; num_hands];
+            }
+
+            // Hero reach: use 1.0 for all (the solver weights externally).
+            let hero_combo_reach = vec![1.0f64; self.combos.len()];
+
+            let boundary_starting_stack = remaining_stack + pot as f64 / 2.0;
+            let eval = RolloutLeafEvaluator::new(
+                rollout.strategy.clone(),
+                rollout.abstract_tree.clone(),
+                rollout.all_buckets.clone(),
+                rollout.abstract_start_node,
+                rollout.bias,
+                rollout.bias_factor,
+                rollout.num_rollouts,
+                rollout.num_opponent_samples,
+                boundary_starting_stack,
+                pot as f64,
+            );
+            let requests = vec![(pot as f64, 0.0, player as u8)];
+            let results = eval.evaluate_boundaries(
+                &self.combos, &self.board_cards, &hero_combo_reach, &opp_combo_reach, &requests,
+            );
+            let combo_cfvs = results.into_iter().next().unwrap_or_default();
+
+            // Map combo ordering → game ordering
+            let hero_map = &self.game_to_combo[player];
+            let mut cfvs = vec![0.0f32; num_hands];
+            for (game_idx, &combo_idx) in hero_map.iter().enumerate() {
+                if combo_idx < combo_cfvs.len() && game_idx < cfvs.len() {
+                    cfvs[game_idx] = combo_cfvs[combo_idx] as f32;
+                }
+            }
+            cfvs
         } else {
             // No rollout available, return zero
             vec![0.0; num_hands]
         }
-    }
-}
-
-impl SolveBoundaryEvaluator {
-    /// Compute boundary CFVs using pre-computed CBV table lookups.
-    ///
-    /// For each hero combo, enumerates all possible next-street cards,
-    /// looks up the bucket on the extended board, reads the CBV value,
-    /// and averages across all valid next cards.
-    fn compute_cfvs_cbv(
-        &self,
-        player: usize,
-        opp: usize,
-        opponent_reach: &[f32],
-        num_hands: usize,
-        boundary_index: usize,
-    ) -> Vec<f32> {
-        let (cbv_table, all_buckets) = match (&self.cbv_table, &self.all_buckets) {
-            (Some(t), Some(b)) => (t, b),
-            _ => return vec![0.0; num_hands],
-        };
-
-        // Boundary index must be valid for the CBV table
-        if boundary_index >= cbv_table.num_boundary_nodes() {
-            return vec![0.0; num_hands];
-        }
-
-        use rayon::prelude::*;
-        let hero_cards = &self.private_cards[player];
-        let opp_cards = &self.private_cards[opp];
-
-        let next_street = match self.board_cards.len() {
-            3 => Street::Turn,
-            4 => Street::River,
-            _ => return vec![0.0; num_hands],
-        };
-
-        hero_cards
-            .par_iter()
-            .enumerate()
-            .map(|(_i, &(h1, h2))| {
-                let rs_h1 = crate::exploration::range_solver_to_rs_card(h1);
-                let rs_h2 = crate::exploration::range_solver_to_rs_card(h2);
-
-                // Check if any opponent has reach (skip if boundary is unreachable)
-                let mut opp_weight = 0.0f64;
-                for (j, &(o1, o2)) in opp_cards.iter().enumerate() {
-                    let w = opponent_reach.get(j).copied().unwrap_or(0.0) as f64;
-                    if w <= 0.0 { continue; }
-                    let rs_o1 = crate::exploration::range_solver_to_rs_card(o1);
-                    let rs_o2 = crate::exploration::range_solver_to_rs_card(o2);
-                    if rs_h1 == rs_o1 || rs_h1 == rs_o2 || rs_h2 == rs_o1 || rs_h2 == rs_o2 {
-                        continue;
-                    }
-                    opp_weight += w;
-                }
-                if opp_weight <= 0.0 {
-                    return 0.0f32;
-                }
-
-                // Enumerate all possible next-street cards
-                let mut cbv_sum = 0.0f64;
-                let mut card_count = 0u32;
-                for card_id in 0..52u8 {
-                    let next_card = crate::exploration::range_solver_to_rs_card(card_id);
-                    // Skip if card is on board or in hero's hand
-                    if self.board_cards.contains(&next_card)
-                        || next_card == rs_h1
-                        || next_card == rs_h2
-                    {
-                        continue;
-                    }
-
-                    let mut extended_board = self.board_cards.clone();
-                    extended_board.push(next_card);
-
-                    let bucket =
-                        all_buckets.get_bucket(next_street, [rs_h1, rs_h2], &extended_board);
-                    let cbv = cbv_table.lookup(boundary_index, bucket as usize);
-                    cbv_sum += cbv as f64;
-                    card_count += 1;
-                }
-
-                if card_count > 0 {
-                    (cbv_sum / card_count as f64) as f32
-                } else {
-                    0.0
-                }
-            })
-            .collect()
-    }
-
-    /// Compute boundary CFVs using Monte Carlo rollouts through the blueprint.
-    fn compute_cfvs_rollout(
-        &self,
-        player: usize,
-        opp: usize,
-        pot: i32,
-        remaining_stack: f64,
-        opponent_reach: &[f32],
-        num_hands: usize,
-        rollout: &RolloutLeafEvaluator,
-    ) -> Vec<f32> {
-        let opp_map = &self.game_to_combo[opp];
-        let mut opp_combo_reach = vec![0.0f64; self.combos.len()];
-        for (game_idx, &combo_idx) in opp_map.iter().enumerate() {
-            if combo_idx < opp_combo_reach.len() && game_idx < opponent_reach.len() {
-                opp_combo_reach[combo_idx] = opponent_reach[game_idx] as f64;
-            }
-        }
-        let opp_total: f64 = opp_combo_reach.iter().sum();
-        if opp_total <= 0.0 {
-            return vec![0.0f32; num_hands];
-        }
-
-        let hero_combo_reach = vec![1.0f64; self.combos.len()];
-
-        let boundary_starting_stack = remaining_stack + pot as f64 / 2.0;
-        let eval = RolloutLeafEvaluator::new(
-            rollout.strategy.clone(),
-            rollout.abstract_tree.clone(),
-            rollout.all_buckets.clone(),
-            rollout.abstract_start_node,
-            rollout.bias,
-            rollout.bias_factor,
-            rollout.num_rollouts,
-            rollout.num_opponent_samples,
-            boundary_starting_stack,
-            pot as f64,
-        );
-        let requests = vec![(pot as f64, 0.0, player as u8)];
-        let results = eval.evaluate_boundaries(
-            &self.combos, &self.board_cards, &hero_combo_reach, &opp_combo_reach, &requests,
-        );
-        let combo_cfvs = results.into_iter().next().unwrap_or_default();
-
-        // Map combo ordering -> game ordering
-        let hero_map = &self.game_to_combo[player];
-        let mut cfvs = vec![0.0f32; num_hands];
-        for (game_idx, &combo_idx) in hero_map.iter().enumerate() {
-            if combo_idx < combo_cfvs.len() && game_idx < cfvs.len() {
-                cfvs[game_idx] = combo_cfvs[combo_idx] as f32;
-            }
-        }
-        cfvs
     }
 }
 
@@ -1612,7 +1485,6 @@ pub fn game_solve_core(
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
     range_clamp_threshold: Option<f64>,
-    boundary_mode: Option<BoundaryMode>,
 ) -> Result<(), String> {
     // Guard: reject if already solving
     if session_state.solve_state.solving.load(Ordering::Relaxed) {
@@ -1713,7 +1585,6 @@ pub fn game_solve_core(
     let max_iters = max_iterations.unwrap_or(200);
     let eval_interval = leaf_eval_interval.unwrap_or(10);
     let _target_exp = target_exploitability.unwrap_or(3.0);
-    let boundary_mode = boundary_mode.unwrap_or_default();
 
     // Reset solve state atomics
     let ss = &session_state.solve_state;
@@ -1804,9 +1675,6 @@ pub fn game_solve_core(
                 )
             });
 
-            let cbv_table_for_eval = cbv_ctx.as_ref().map(|ctx| ctx.cbv_table.clone());
-            let all_buckets_for_eval = cbv_ctx.as_ref().map(|ctx| Arc::clone(&ctx.all_buckets));
-
             game.boundary_evaluator = Some(Arc::new(SolveBoundaryEvaluator {
                 private_cards: [
                     game.private_cards(0).to_vec(),
@@ -1817,14 +1685,11 @@ pub fn game_solve_core(
                 rollout,
                 combos,
                 game_to_combo: [map0, map1],
-                boundary_mode,
-                cbv_table: cbv_table_for_eval,
-                all_buckets: all_buckets_for_eval,
             }));
         }
 
         let (mem_est, _) = game.memory_usage();
-        eprintln!("[solve] boundary nodes: {n_boundaries}, evaluator: {}, mode: {:?}", game.boundary_evaluator.is_some(), boundary_mode);
+        eprintln!("[solve] boundary nodes: {n_boundaries}, evaluator: {}", game.boundary_evaluator.is_some());
         eprintln!("[solve] abstract_node_idx: {:?}", abstract_node_idx);
         eprintln!("[solve] pot={pot}, eff_stack={eff_stack}, board={board:?}");
         eprintln!("[solve] OOP hands: {}, IP hands: {}", game.private_cards(0).len(), game.private_cards(1).len());
@@ -1976,7 +1841,6 @@ pub fn game_solve(
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
     range_clamp_threshold: Option<f64>,
-    boundary_mode: Option<BoundaryMode>,
 ) -> Result<(), String> {
     game_solve_core(
         &session_state,
@@ -1987,7 +1851,6 @@ pub fn game_solve(
         rollout_num_samples,
         rollout_opponent_samples,
         range_clamp_threshold,
-        boundary_mode,
     )
 }
 
@@ -2550,7 +2413,7 @@ mod tests {
     #[test]
     fn game_solve_core_rejects_no_session() {
         let gss = GameSessionState::default();
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No game session"));
     }
@@ -2562,7 +2425,7 @@ mod tests {
         *gss.session.write() = Some(session);
         gss.solve_state.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -3376,162 +3239,5 @@ mod tests {
         assert_eq!(state2.position, state1.position);
         assert_eq!(state2.street, state1.street);
         assert_eq!(state2.action_history.len(), state1.action_history.len());
-    }
-
-    // -------------------------------------------------------------------
-    // BoundaryMode tests
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn boundary_mode_default_is_cbv() {
-        let mode = BoundaryMode::default();
-        assert_eq!(mode, BoundaryMode::Cbv);
-    }
-
-    #[test]
-    fn boundary_mode_serde_roundtrip() {
-        let cbv = BoundaryMode::Cbv;
-        let json = serde_json::to_string(&cbv).unwrap();
-        assert_eq!(json, "\"cbv\"");
-        let rollout = BoundaryMode::Rollout;
-        let json2 = serde_json::to_string(&rollout).unwrap();
-        assert_eq!(json2, "\"rollout\"");
-
-        let deser: BoundaryMode = serde_json::from_str("\"cbv\"").unwrap();
-        assert_eq!(deser, BoundaryMode::Cbv);
-        let deser2: BoundaryMode = serde_json::from_str("\"rollout\"").unwrap();
-        assert_eq!(deser2, BoundaryMode::Rollout);
-    }
-
-    // -------------------------------------------------------------------
-    // CBV boundary evaluator tests
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn cbv_boundary_evaluator_spr_zero_uses_equity() {
-        // When remaining_stack=0, the CBV evaluator should fall through
-        // to the equity path regardless of boundary_mode.
-        use crate::exploration::range_solver_to_rs_card;
-        use range_solver::game::BoundaryEvaluator;
-
-        // Build minimal private cards: just 2 combos per player
-        let c0 = (48, 44); // As, Ah
-        let c1 = (49, 45); // Ac?, ...
-        let private_cards = [vec![c0], vec![c1]];
-        let board_cards = vec![
-            range_solver_to_rs_card(0),  // 2c
-            range_solver_to_rs_card(4),  // 3c
-            range_solver_to_rs_card(8),  // 4c
-        ];
-
-        let eval = SolveBoundaryEvaluator {
-            private_cards,
-            board_cards,
-            eff_stack: 0.0,
-            rollout: None,
-            combos: vec![],
-            game_to_combo: [vec![0], vec![0]],
-            boundary_mode: BoundaryMode::Cbv,
-            cbv_table: None,
-            all_buckets: None,
-        };
-
-        // SPR=0: should use equity path (remaining_stack=0)
-        let cfvs = eval.compute_cfvs(0, 100, 0.0, &[1.0], 1, 0);
-        assert_eq!(cfvs.len(), 1);
-        // The value should be finite (equity-based)
-        assert!(cfvs[0].is_finite());
-    }
-
-    #[test]
-    fn cbv_boundary_evaluator_cbv_mode_returns_table_values() {
-        // When boundary_mode=Cbv and SPR>0 and cbv data is available,
-        // should return CBV-table-derived values.
-        use crate::exploration::range_solver_to_rs_card;
-        use poker_solver_core::blueprint_v2::cbv::CbvTable;
-        use range_solver::game::BoundaryEvaluator;
-
-        // Create a CBV table with 1 boundary node and 200 buckets
-        // (matching typical bucket count).
-        let num_buckets = 200;
-        let values: Vec<f32> = (0..num_buckets).map(|i| i as f32 * 0.01).collect();
-        let cbv_table = CbvTable {
-            values,
-            node_offsets: vec![0],
-            buckets_per_node: vec![num_buckets as u16],
-        };
-
-        // Build minimal private cards for 1 combo
-        let c0 = (48, 44); // As, Ah
-        let c1 = (0, 4);   // 2c, 3c -- distinct from hero
-        let private_cards = [vec![c0], vec![c1]];
-        let board_cards = vec![
-            range_solver_to_rs_card(8),   // 4c
-            range_solver_to_rs_card(12),  // 5c
-            range_solver_to_rs_card(16),  // 6c
-        ];
-
-        let eval = SolveBoundaryEvaluator {
-            private_cards,
-            board_cards,
-            eff_stack: 100.0,
-            rollout: None,
-            combos: vec![],
-            game_to_combo: [vec![0], vec![0]],
-            boundary_mode: BoundaryMode::Cbv,
-            cbv_table: Some(cbv_table),
-            all_buckets: None, // will cause fallback to zero since we can't look up buckets
-        };
-
-        // SPR>0, CBV mode, but no all_buckets => should return zeros gracefully
-        let cfvs = eval.compute_cfvs(0, 100, 50.0, &[1.0], 1, 0);
-        assert_eq!(cfvs.len(), 1);
-        assert!(cfvs[0].is_finite());
-    }
-
-    #[test]
-    fn cbv_boundary_evaluator_rollout_mode_without_rollout_returns_zero() {
-        // When boundary_mode=Rollout but no rollout evaluator is available,
-        // should return zeros.
-        use crate::exploration::range_solver_to_rs_card;
-        use range_solver::game::BoundaryEvaluator;
-
-        let c0 = (48, 44);
-        let c1 = (0, 4);
-        let private_cards = [vec![c0], vec![c1]];
-        let board_cards = vec![
-            range_solver_to_rs_card(8),
-            range_solver_to_rs_card(12),
-            range_solver_to_rs_card(16),
-        ];
-
-        let eval = SolveBoundaryEvaluator {
-            private_cards,
-            board_cards,
-            eff_stack: 100.0,
-            rollout: None,
-            combos: vec![],
-            game_to_combo: [vec![0], vec![0]],
-            boundary_mode: BoundaryMode::Rollout,
-            cbv_table: None,
-            all_buckets: None,
-        };
-
-        let cfvs = eval.compute_cfvs(0, 100, 50.0, &[1.0], 1, 0);
-        assert_eq!(cfvs.len(), 1);
-        assert_eq!(cfvs[0], 0.0);
-    }
-
-    #[test]
-    fn game_solve_core_accepts_boundary_mode_param() {
-        // Verify that game_solve_core accepts the boundary_mode parameter.
-        // Just test the error path (no session) to verify it compiles.
-        let gss = GameSessionState::default();
-        let result = game_solve_core(
-            &gss, None, None, None, None, None, None, None,
-            Some(BoundaryMode::Cbv),
-        );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No game session"));
     }
 }

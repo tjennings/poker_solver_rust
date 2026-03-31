@@ -23,7 +23,6 @@ pub trait BoundaryEvaluator: Send + Sync {
     /// - `remaining_stack`: chips behind at the boundary
     /// - `opponent_reach`: opponent's reach probabilities (per private hand, game ordering)
     /// - `num_hands`: number of private hands for `player`
-    /// - `boundary_index`: ordinal index of the boundary node (0-based)
     ///
     /// Returns `Vec<f32>` with one CFV per private hand, in pot-normalised units
     /// (1.0 = win one half-pot).
@@ -34,7 +33,6 @@ pub trait BoundaryEvaluator: Send + Sync {
         remaining_stack: f64,
         opponent_reach: &[f32],
         num_hands: usize,
-        boundary_index: usize,
     ) -> Vec<f32>;
 }
 
