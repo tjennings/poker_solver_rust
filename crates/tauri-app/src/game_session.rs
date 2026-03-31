@@ -1371,12 +1371,8 @@ impl SolveBoundaryEvaluator {
 
         // Boundary index must be valid for the CBV table
         if boundary_index >= cbv_table.num_boundary_nodes() {
-            eprintln!("[cbv] boundary_index {} >= table size {}, returning zeros",
-                boundary_index, cbv_table.num_boundary_nodes());
             return vec![0.0; num_hands];
         }
-        eprintln!("[cbv] evaluating boundary {} of {} for player {}, {} hands, board len {}",
-            boundary_index, cbv_table.num_boundary_nodes(), player, num_hands, self.board_cards.len());
 
         use rayon::prelude::*;
         let hero_cards = &self.private_cards[player];
@@ -1388,7 +1384,7 @@ impl SolveBoundaryEvaluator {
             _ => return vec![0.0; num_hands],
         };
 
-        let cfvs: Vec<f32> = hero_cards
+        hero_cards
             .par_iter()
             .enumerate()
             .map(|(_i, &(h1, h2))| {
@@ -1440,14 +1436,7 @@ impl SolveBoundaryEvaluator {
                     0.0
                 }
             })
-            .collect();
-
-        let result: &Vec<f32> = &cfvs;
-        let sample: Vec<f32> = result.iter().take(5).copied().collect();
-        let distinct = result.iter().map(|v| v.to_bits()).collect::<std::collections::HashSet<_>>().len();
-        eprintln!("[cbv] result: {} hands, {} distinct values, sample: {:?}", result.len(), distinct, sample);
-
-        cfvs
+            .collect()
     }
 
     /// Compute boundary CFVs using Monte Carlo rollouts through the blueprint.
