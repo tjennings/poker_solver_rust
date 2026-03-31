@@ -11,6 +11,8 @@ poker-solver-core = { path = "../core" }
 poker-solver-tauri = { path = "../tauri-app" }
 range-solver = { path = "../range-solver" }
 rebel = { path = "../rebel" }
+cfvnet = { path = "../cfvnet" }
+burn = { version = "0.16", features = ["wgpu"] }
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 ratatui = "0.29"

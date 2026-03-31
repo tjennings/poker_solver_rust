@@ -11,6 +11,8 @@ pub struct RebelConfig {
     pub seed: SeedConfig,
     pub training: TrainingConfig,
     pub buffer: BufferConfig,
+    #[serde(default)]
+    pub inference: InferenceConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -134,6 +136,59 @@ fn default_max_records() -> usize {
     12_000_000
 }
 
+fn default_inf_batch() -> usize {
+    256
+}
+
+fn default_inf_timeout() -> u64 {
+    100
+}
+
+fn default_train_every() -> usize {
+    50
+}
+
+fn default_train_batch() -> usize {
+    512
+}
+
+fn default_replay_cap() -> usize {
+    200_000
+}
+
+fn default_inf_lr() -> f64 {
+    3e-4
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InferenceConfig {
+    #[serde(default = "default_inf_batch")]
+    pub batch_size: usize,
+    #[serde(default = "default_inf_timeout")]
+    pub batch_timeout_us: u64,
+    #[serde(default = "default_train_every")]
+    pub train_every_n_solves: usize,
+    #[serde(default = "default_train_batch")]
+    pub train_batch_size: usize,
+    #[serde(default = "default_replay_cap")]
+    pub replay_capacity: usize,
+    #[serde(default = "default_inf_lr")]
+    pub learning_rate: f64,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: default_inf_batch(),
+            batch_timeout_us: default_inf_timeout(),
+            train_every_n_solves: default_train_every(),
+            train_batch_size: default_train_batch(),
+            replay_capacity: default_replay_cap(),
+            learning_rate: default_inf_lr(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +255,14 @@ buffer:
 
         assert_eq!(config.buffer.max_records, 12_000_000);
         assert_eq!(config.buffer.path, "rebel_buffer.bin");
+
+        // Inference defaults (not specified in YAML)
+        assert_eq!(config.inference.batch_size, 256);
+        assert_eq!(config.inference.batch_timeout_us, 100);
+        assert_eq!(config.inference.train_every_n_solves, 50);
+        assert_eq!(config.inference.train_batch_size, 512);
+        assert_eq!(config.inference.replay_capacity, 200_000);
+        assert!((config.inference.learning_rate - 3e-4).abs() < 1e-9);
     }
 
     #[test]
@@ -243,6 +306,49 @@ buffer:
 
         // Buffer defaults
         assert_eq!(config.buffer.max_records, 12_000_000);
+
+        // Inference defaults
+        assert_eq!(config.inference.batch_size, 256);
+        assert_eq!(config.inference.batch_timeout_us, 100);
+        assert_eq!(config.inference.train_every_n_solves, 50);
+        assert_eq!(config.inference.train_batch_size, 512);
+        assert_eq!(config.inference.replay_capacity, 200_000);
+        assert!((config.inference.learning_rate - 3e-4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_explicit_inference_config() {
+        let yaml = r#"
+blueprint_path: "/data/blueprint"
+cluster_dir: "/data/clusters"
+output_dir: "/data/rebel"
+game:
+  initial_stack: 400
+seed:
+  num_hands: 500000
+  bet_sizes:
+    flop: [[0.5, 1.0], [0.5, 1.0]]
+    turn: [[0.75], [0.75]]
+    river: [[1.0], [1.0]]
+training: {}
+buffer:
+  path: "buf.bin"
+inference:
+  batch_size: 128
+  batch_timeout_us: 200
+  train_every_n_solves: 100
+  train_batch_size: 1024
+  replay_capacity: 500000
+  learning_rate: 0.001
+"#;
+        let config: RebelConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.inference.batch_size, 128);
+        assert_eq!(config.inference.batch_timeout_us, 200);
+        assert_eq!(config.inference.train_every_n_solves, 100);
+        assert_eq!(config.inference.train_batch_size, 1024);
+        assert_eq!(config.inference.replay_capacity, 500_000);
+        assert!((config.inference.learning_rate - 0.001).abs() < 1e-9);
     }
 
     #[test]
@@ -274,5 +380,11 @@ buffer:
         assert!((config.training.huber_delta - roundtripped.training.huber_delta).abs() < 1e-9);
         assert_eq!(config.buffer.max_records, roundtripped.buffer.max_records);
         assert_eq!(config.buffer.path, roundtripped.buffer.path);
+        assert_eq!(config.inference.batch_size, roundtripped.inference.batch_size);
+        assert_eq!(config.inference.batch_timeout_us, roundtripped.inference.batch_timeout_us);
+        assert_eq!(config.inference.train_every_n_solves, roundtripped.inference.train_every_n_solves);
+        assert_eq!(config.inference.train_batch_size, roundtripped.inference.train_batch_size);
+        assert_eq!(config.inference.replay_capacity, roundtripped.inference.replay_capacity);
+        assert!((config.inference.learning_rate - roundtripped.inference.learning_rate).abs() < 1e-9);
     }
 }
