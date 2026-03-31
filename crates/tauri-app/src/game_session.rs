@@ -22,6 +22,7 @@ use poker_solver_core::blueprint_v2::Street;
 
 use range_solver::card::{card_to_string, NOT_DEALT};
 use range_solver::{PostFlopGame, solve_step, finalize, compute_exploitability};
+use range_solver::interface::Game;
 
 use crate::exploration::{
     board_for_street_slice, blueprint_sizes_to_range_solver, build_canonical_to_combo_map,
@@ -1678,6 +1679,11 @@ pub fn game_solve_core(
                 )
             });
 
+            // Clone for multi-continuation precomputation (before move into evaluator).
+            let combos_for_precomp = combos.clone();
+            let board_cards_for_precomp = board_cards.clone();
+            let game_to_combo_for_precomp = [map0.clone(), map1.clone()];
+
             game.boundary_evaluator = Some(Arc::new(SolveBoundaryEvaluator {
                 private_cards: [
                     game.private_cards(0).to_vec(),
@@ -1689,6 +1695,67 @@ pub fn game_solve_core(
                 combos,
                 game_to_combo: [map0, map1],
             }));
+
+            // Precompute multi-valued boundary CFVs (K=4 continuations).
+            // Run 4 rollouts per boundary: unbiased, fold-biased, call-biased, raise-biased.
+            // All values are fixed before CFR begins.
+            let k = game.boundary_evaluator.as_ref().map_or(1, |e| e.num_continuations());
+            if k > 1 && cbv_ctx.is_some() {
+                game.init_multi_continuation(k);
+                let ctx = cbv_ctx.as_ref().unwrap();
+                let bias_factor = rollout_bias_factor.unwrap_or(10.0);
+                let biases = [BiasType::Unbiased, BiasType::Fold, BiasType::Call, BiasType::Raise];
+                let start = std::time::Instant::now();
+
+                for ordinal in 0..n_boundaries {
+                    let pot_at_boundary = game.boundary_pot(ordinal);
+
+                    for player in 0..2 {
+                        let num_hands = game.num_private_hands(player);
+
+                        for (ki, &bias) in biases.iter().enumerate().take(k) {
+                            let num_rollouts = rollout_num_samples.unwrap_or(3);
+                            let opp_samples = rollout_opponent_samples.unwrap_or(8);
+                            let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
+                            let eval = RolloutLeafEvaluator::new(
+                                Arc::clone(&ctx.strategy),
+                                Arc::new(ctx.abstract_tree.clone()),
+                                Arc::clone(&ctx.all_buckets),
+                                abstract_node_idx.unwrap_or(0),
+                                bias,
+                                bias_factor,
+                                num_rollouts,
+                                opp_samples,
+                                starting_stack,
+                                f64::from(pot),
+                            );
+                            let opp_combo_reach = vec![1.0f64; combos_for_precomp.len()];
+                            let hero_combo_reach = vec![1.0f64; combos_for_precomp.len()];
+                            let requests = vec![(pot_at_boundary as f64, 0.0, player as u8)];
+                            let results = eval.evaluate_boundaries(
+                                &combos_for_precomp, &board_cards_for_precomp,
+                                &hero_combo_reach, &opp_combo_reach, &requests,
+                            );
+                            let combo_cfvs = results.into_iter().next().unwrap_or_default();
+                            // Map combo ordering → game ordering
+                            let hero_map = &game_to_combo_for_precomp[player];
+                            let mut cfvs = vec![0.0f32; num_hands];
+                            for (game_idx, &combo_idx) in hero_map.iter().enumerate() {
+                                if combo_idx < combo_cfvs.len() && game_idx < cfvs.len() {
+                                    cfvs[game_idx] = combo_cfvs[combo_idx] as f32;
+                                }
+                            }
+                            game.set_boundary_cfvs_multi(ordinal, player, ki, cfvs);
+                        }
+                    }
+                }
+
+                let elapsed = start.elapsed();
+                eprintln!(
+                    "[solve] precomputed {} boundaries × {} continuations × 2 players in {:.1}s",
+                    n_boundaries, k, elapsed.as_secs_f64()
+                );
+            }
         }
 
         let (mem_est, _) = game.memory_usage();

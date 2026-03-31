@@ -5,6 +5,7 @@ game:
   stack_depth: 200
   small_blind: 1
   big_blind: 2
+  allow_preflop_limp: false
 
 clustering:
   algorithm: potential_aware_emd
@@ -22,7 +23,7 @@ clustering:
 action_abstraction:
   preflop:
     - ["2bb"]
-    - ["4bb", "10bb"]
+    - ["10bb"]
     - ["22bb"]
   flop:
     - [0.33, 0.75, 1.0]
@@ -50,9 +51,10 @@ training:
 
 
   # optimizer: "dcfr+"
-  # dcfr_alpha: 1.5
-  # dcfr_gamma: 2.0
-  # exploitability_interval_minutes: 30
+  dcfr_alpha: 1.5
+  dcfr_gamma: 2.0
+  exploitability_interval_minutes: 10
+  exploitability_samples: 25000
 
   # SAPCFR+ optimizer with prediction-based strategy
   # optimizer: "sapcfr+"
@@ -64,19 +66,19 @@ training:
   # baseline_alpha: 0.5
 
   # BRCFR+ optimizer with periodic best-response prediction
-  optimizer: "brcfr+"
-  brcfr_eta: 0.9
-  brcfr_warmup_iterations: 300000000
-  brcfr_interval: 100000000
-  dcfr_alpha: 1.5
-  dcfr_gamma: 2.0
-  exploitability_samples: 300000
+  # optimizer: "brcfr+"
+  # brcfr_eta: 0
+  # brcfr_warmup_iterations: 300000000
+  # brcfr_interval: 100000000
+  # dcfr_alpha: 1.5
+  # dcfr_gamma: 2.0
+  # exploitability_samples: 300000
 
 snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/1k_100bb_brdcfr_test"
+  output_dir: "./local_data/blueprints/1k_100bb_brdcfr_v2"
 
 tui:
   enabled: true

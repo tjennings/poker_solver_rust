@@ -1,10 +1,11 @@
 # Blueprint V2 Config — 50BB HU, 1000 buckets, SAPCFR+ optimizer + VR-MCCFR baselines
 game:
-  name: "1k_sapcfr"
+  name: "1k_sapcfr_nolimp"
   players: 2
   stack_depth: 100
   small_blind: 1
   big_blind: 2
+  allow_preflop_limp: false
 
 clustering:
   algorithm: potential_aware_emd
@@ -21,20 +22,17 @@ clustering:
 
 action_abstraction:
   preflop:
-    - ["4bb"]
-    - ["8bb", "14bb"]
-    - ["30bb"]
+    - ["2bb"]
+    - ["10bb"]
+    - ["22bb"]
   flop:
-    - [0.25, 0.33, 0.75, 1.0]
-    - [0.33, 0.67, 1.0, 1.5]
+    - [0.33, 0.75, 1.0]
     - [2.0]
   turn:
-    - [0.25, 0.33, 0.75, 1.0]
-    - [0.33, 0.75, 1.0, 1.5]
+    - [0.33, 0.75, 1.0]
     - [2.0]
   river:
-    - [0.25, 0.33, 0.75, 1.0]
-    - [0.33, 0.75, 1.0, 1.5]
+    - [0.33, 0.75, 1.0]
     - [2.0]
 
 training:
