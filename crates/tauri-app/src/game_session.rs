@@ -1280,6 +1280,8 @@ pub(crate) struct SolveBoundaryEvaluator {
     pub(crate) game_to_combo: [Vec<usize>; 2],
     /// Which boundary evaluation mode to use for SPR>0 nodes.
     pub(crate) boundary_mode: BoundaryMode,
+    /// Pot size at the boundary (for normalizing CBV chip values to pot fractions).
+    pub(crate) boundary_pot: f64,
     /// Pre-computed CBV table for fast boundary value lookup.
     pub(crate) cbv_table: Option<poker_solver_core::blueprint_v2::cbv::CbvTable>,
     /// Bucket lookup for mapping combos to abstract buckets on the next street.
@@ -1429,8 +1431,11 @@ impl SolveBoundaryEvaluator {
 
                     let bucket =
                         all_buckets.get_bucket(next_street, [rs_h1, rs_h2], &extended_board);
-                    let cbv = cbv_table.lookup(boundary_index, bucket as usize);
-                    cbv_sum += cbv as f64;
+                    let cbv_chips = cbv_table.lookup(boundary_index, bucket as usize) as f64;
+                    // Convert from chip payoff to pot fraction: 0 = lost all, pot = won all.
+                    // Range solver expects centered pot fractions in [-1, 1].
+                    let pot_frac = (cbv_chips / self.boundary_pot as f64) * 2.0 - 1.0;
+                    cbv_sum += pot_frac;
                     card_count += 1;
                 }
 
@@ -1829,6 +1834,7 @@ pub fn game_solve_core(
                 combos,
                 game_to_combo: [map0, map1],
                 boundary_mode,
+                boundary_pot: pot as f64,
                 cbv_table: cbv_table_for_eval,
                 all_buckets: all_buckets_for_eval,
             }));
@@ -3443,6 +3449,7 @@ mod tests {
             combos: vec![],
             game_to_combo: [vec![0], vec![0]],
             boundary_mode: BoundaryMode::Cbv,
+            boundary_pot: 100.0,
             cbv_table: None,
             all_buckets: None,
         };
