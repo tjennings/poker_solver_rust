@@ -413,6 +413,8 @@ impl GameSession {
 
         let weight_idx = self.weight_index(player);
         let board_cards = parse_board(&self.board).ok();
+        eprintln!("[matrix] street={street:?}, board_len={}, cbv_context={}, board_cards={}",
+            self.board.len(), self.cbv_context.is_some(), board_cards.as_ref().map_or(0, |b| b.len()));
 
         // Build the canonical-to-combo map for weight averaging.
         let combo_map = build_canonical_to_combo_map();
