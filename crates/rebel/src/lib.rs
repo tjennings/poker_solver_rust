@@ -1,4 +1,5 @@
 pub mod config;
+pub mod inference_server;
 pub mod leaf_evaluator;
 pub mod orchestration;
 pub mod pbs;
