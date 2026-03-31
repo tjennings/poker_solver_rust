@@ -200,11 +200,11 @@ pub(crate) fn matrix_cell_label(row: usize, col: usize) -> (String, bool, bool) 
     if row == col {
         (format!("{r1}{r2}"), false, true)
     } else if row < col {
-        // Above diagonal = suited.
+        // Above diagonal = suited. row has higher rank (lower index).
         (format!("{r1}{r2}s"), true, false)
     } else {
-        // Below diagonal = offsuit.
-        (format!("{r1}{r2}o"), false, false)
+        // Below diagonal = offsuit. col has higher rank (lower index).
+        (format!("{r2}{r1}o"), false, false)
     }
 }
 
@@ -955,8 +955,8 @@ fn build_matrix_from_snapshot(snap: MatrixSnapshot) -> PostflopStrategyMatrix {
     let mut combo_details: Vec<Vec<Vec<PostflopComboDetail>>> =
         vec![vec![Vec::new(); 13]; 13];
 
-    for (hand_idx, &(c1, c2)) in snap.private_cards.iter().enumerate() {
-        let (row, col, _) = card_pair_to_matrix(c1, c2);
+    for (hand_idx, &(c1_raw, c2_raw)) in snap.private_cards.iter().enumerate() {
+        let (row, col, _) = card_pair_to_matrix(c1_raw, c2_raw);
         combo_counts[row][col] += 1;
         weight_sums[row][col] += snap.initial_weights[hand_idx] as f64;
         if let Some(ref evs) = snap.hand_evs {
@@ -968,6 +968,8 @@ fn build_matrix_from_snapshot(snap: MatrixSnapshot) -> PostflopStrategyMatrix {
             *prob_sum += prob as f64;
             probs.push(prob);
         }
+        // High card first: rank = id / 4.
+        let (c1, c2) = if c1_raw / 4 >= c2_raw / 4 { (c1_raw, c2_raw) } else { (c2_raw, c1_raw) };
         let s1 = card_to_string(c1).unwrap_or_default();
         let s2 = card_to_string(c2).unwrap_or_default();
         combo_details[row][col].push(PostflopComboDetail {

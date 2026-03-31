@@ -1171,8 +1171,8 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
     let mut ev_sums = vec![vec![0.0f64; 13]; 13];
     let mut combo_details: Vec<Vec<Vec<ComboDetail>>> = vec![vec![Vec::new(); 13]; 13];
 
-    for (hand_idx, &(c1, c2)) in private_cards.iter().enumerate() {
-        let (row, col, _) = card_pair_to_matrix(c1, c2);
+    for (hand_idx, &(c1_raw, c2_raw)) in private_cards.iter().enumerate() {
+        let (row, col, _) = card_pair_to_matrix(c1_raw, c2_raw);
         combo_counts[row][col] += 1;
         weight_sums[row][col] += initial_weights[hand_idx] as f64;
         if let Some(evs) = hand_evs {
@@ -1188,6 +1188,8 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
             probs.push(prob);
         }
 
+        // High card first: rank = id / 4.
+        let (c1, c2) = if c1_raw / 4 >= c2_raw / 4 { (c1_raw, c2_raw) } else { (c2_raw, c1_raw) };
         let s1 = card_to_string(c1).unwrap_or_default();
         let s2 = card_to_string(c2).unwrap_or_default();
         combo_details[row][col].push(ComboDetail {
