@@ -1730,11 +1730,8 @@ pub fn game_solve_core(
                 break;
             }
 
-            // Flush boundary caches every eval_interval so the solver
-            // lazily recomputes reach + CFVs with updated strategy.
-            if t > 0 && t.is_multiple_of(eval_interval) {
-                game.flush_boundary_caches();
-            }
+            // Boundary values are fixed at construction (multi-valued states).
+            // No mid-solve refresh — prevents destabilizing feedback loop.
 
             solve_step(&game, t);
             t += 1;
