@@ -723,7 +723,6 @@ pub fn build_subgame_solver(
                     game_to_combo: [map0, map1],
                     boundary_mode: crate::game_session::BoundaryMode::Rollout,
                     boundary_pot: pot_f,
-                    cbv_cache: [vec![], vec![]],
                     cbv_table: None,
                     all_buckets: None,
                 },
