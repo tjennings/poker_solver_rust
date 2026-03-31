@@ -428,7 +428,7 @@ pub async fn load_blueprint_v2_core(
     .map_err(|e| format!("Load task panicked: {e}"))??;
 
     let aa = &config.action_abstraction;
-    let tree = V2GameTree::build(
+    let tree = V2GameTree::build_with_options(
         config.game.stack_depth,
         config.game.small_blind,
         config.game.big_blind,
@@ -436,6 +436,7 @@ pub async fn load_blueprint_v2_core(
         &aa.flop,
         &aa.turn,
         &aa.river,
+        config.game.allow_preflop_limp,
     );
     let decision_map = tree.decision_index_map();
 
