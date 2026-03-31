@@ -753,6 +753,9 @@ export default function GameExplorer() {
                               {' '}
                               <span>{r2}</span>
                               <span style={{ color: PICKER_COLORS[s2] || '#fff' }}>{SUIT_SYMBOLS[s2] || ''}</span>
+                              {combo.bucket != null && (
+                                <span style={{ fontSize: '0.55rem', color: '#666', marginLeft: '0.3rem' }}>b{combo.bucket}</span>
+                              )}
                             </div>
                             {/* Color bar */}
                             <div style={{ display: 'flex', height: '6px', borderRadius: '3px', overflow: 'hidden', background: '#222', marginBottom: '0.25rem' }}>

@@ -73,6 +73,8 @@ pub struct ComboDetail {
     pub cards: String,           // e.g. "AhKh"
     pub probabilities: Vec<f32>, // one per action
     pub weight: f32,             // reaching probability for this combo
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<u16>,     // strategy bucket ID (postflop only)
 }
 
 /// A single cell in the 13x13 strategy matrix.
@@ -535,10 +537,10 @@ impl GameSession {
                     }
                 }
 
-                let probs = if street == Street::Preflop {
+                let (probs, bucket_id) = if street == Street::Preflop {
                     // Preflop: all combos of a canonical hand share the same strategy.
                     // Return empty — the cell's aggregated probs are sufficient.
-                    vec![]
+                    (vec![], None)
                 } else if let (Some(ctx), Some(board)) = (&self.cbv_context, board_cards) {
                     // Postflop: per-combo bucket lookup.
                     let board_slice = board_for_street_slice(board, street);
@@ -546,17 +548,19 @@ impl GameSession {
                     let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
                     let bucket = ctx.all_buckets.get_bucket(street, [rs_c1, rs_c2], board_slice);
                     let strategy_probs = ctx.strategy.get_action_probs(decision_idx, bucket);
-                    (0..num_actions)
+                    let probs = (0..num_actions)
                         .map(|i| strategy_probs.get(i).copied().unwrap_or(0.0))
-                        .collect()
+                        .collect();
+                    (probs, Some(bucket))
                 } else {
-                    vec![0.0; num_actions]
+                    (vec![0.0; num_actions], None)
                 };
 
                 Some(ComboDetail {
                     cards: format!("{s1}{s2}"),
                     probabilities: probs,
                     weight: w,
+                    bucket: bucket_id,
                 })
             })
             .collect()
@@ -1197,6 +1201,7 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
             cards: format!("{s1}{s2}"),
             probabilities: probs,
             weight: initial_weights[hand_idx],
+            bucket: None, // solve matrix — no blueprint bucket
         });
     }
 
@@ -2227,6 +2232,7 @@ mod tests {
                 cards: "AhKh".to_string(),
                 probabilities: vec![0.5, 0.3, 0.2],
                 weight: 1.0,
+                bucket: None,
             }],
         };
         let json = serde_json::to_string(&cell).unwrap();
