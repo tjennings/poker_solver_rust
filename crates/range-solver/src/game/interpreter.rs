@@ -434,6 +434,15 @@ impl PostFlopGame {
             *self.boundary_cfvs[idx].lock().unwrap() = cfvs;
         }
     }
+
+    /// Update DCFR discount parameters for boundary continuation regrets/strategy.
+    /// Call once per solve_step iteration with the same DiscountParams the solver uses.
+    pub fn set_boundary_discount(&self, alpha_t: f32, beta_t: f32, gamma_t: f32) {
+        use std::sync::atomic::Ordering;
+        self.boundary_discount_alpha.store(alpha_t.to_bits(), Ordering::Relaxed);
+        self.boundary_discount_beta.store(beta_t.to_bits(), Ordering::Relaxed);
+        self.boundary_discount_gamma.store(gamma_t.to_bits(), Ordering::Relaxed);
+    }
 }
 
 // ---------------------------------------------------------------------------

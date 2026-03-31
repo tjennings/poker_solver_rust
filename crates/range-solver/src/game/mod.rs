@@ -212,6 +212,11 @@ pub struct PostFlopGame {
     /// Per-boundary continuation cumulative strategy sums for averaging.
     /// One `Mutex<Vec<f32>>` of length K per boundary ordinal.
     pub(crate) boundary_cont_strategy: Vec<std::sync::Mutex<Vec<f32>>>,
+    /// DCFR discount parameters for boundary continuation regrets/strategy.
+    /// Stored as f32 bit patterns in AtomicU32 for interior mutability.
+    pub(crate) boundary_discount_alpha: std::sync::atomic::AtomicU32,
+    pub(crate) boundary_discount_beta: std::sync::atomic::AtomicU32,
+    pub(crate) boundary_discount_gamma: std::sync::atomic::AtomicU32,
 
     // -- result interpreter state --
     pub(crate) action_history: Vec<usize>,

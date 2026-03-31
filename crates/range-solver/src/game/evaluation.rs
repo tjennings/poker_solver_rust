@@ -213,19 +213,27 @@ impl PostFlopGame {
                 .map(|(&av, &s)| av * s as f64)
                 .sum();
 
-            // Update continuation regrets: regret[k] += action_value[k] - combined_value
+            // Update continuation regrets with DCFR discounting.
+            // Apply the same alpha/beta weights used by the main solver so
+            // early noisy iterations don't contaminate the continuation choice.
             {
                 let mut regrets = self.boundary_cont_regrets[ordinal].lock().unwrap();
+                let alpha = self.boundary_discount_alpha.load(std::sync::atomic::Ordering::Relaxed);
+                let beta = self.boundary_discount_beta.load(std::sync::atomic::Ordering::Relaxed);
                 for cont_k in 0..k {
-                    regrets[cont_k] += (action_values[cont_k] - combined_value) as f32;
+                    // Discount existing regret (alpha for positive, beta for negative)
+                    let r = regrets[cont_k];
+                    let d = if r >= 0.0 { f32::from_bits(alpha) } else { f32::from_bits(beta) };
+                    regrets[cont_k] = r * d + (action_values[cont_k] - combined_value) as f32;
                 }
             }
 
-            // Update continuation cumulative strategy
+            // Update continuation cumulative strategy with gamma discounting.
             {
                 let mut strat = self.boundary_cont_strategy[ordinal].lock().unwrap();
+                let gamma = f32::from_bits(self.boundary_discount_gamma.load(std::sync::atomic::Ordering::Relaxed));
                 for cont_k in 0..k {
-                    strat[cont_k] += strategy[cont_k];
+                    strat[cont_k] = strat[cont_k] * gamma + strategy[cont_k];
                 }
             }
 

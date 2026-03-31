@@ -1729,8 +1729,22 @@ pub fn game_solve_core(
                                 starting_stack,
                                 f64::from(pot),
                             );
-                            let opp_combo_reach = vec![1.0f64; combos_for_precomp.len()];
-                            let hero_combo_reach = vec![1.0f64; combos_for_precomp.len()];
+                            // Map game-ordering initial weights to combo-ordering reach.
+                            let opp = player ^ 1;
+                            let mut opp_combo_reach = vec![0.0f64; combos_for_precomp.len()];
+                            let opp_weights = game.initial_weights(opp);
+                            for (gi, &ci) in game_to_combo_for_precomp[opp].iter().enumerate() {
+                                if ci < opp_combo_reach.len() && gi < opp_weights.len() {
+                                    opp_combo_reach[ci] = opp_weights[gi] as f64;
+                                }
+                            }
+                            let mut hero_combo_reach = vec![0.0f64; combos_for_precomp.len()];
+                            let hero_weights = game.initial_weights(player);
+                            for (gi, &ci) in game_to_combo_for_precomp[player].iter().enumerate() {
+                                if ci < hero_combo_reach.len() && gi < hero_weights.len() {
+                                    hero_combo_reach[ci] = hero_weights[gi] as f64;
+                                }
+                            }
                             let requests = vec![(pot_at_boundary as f64, 0.0, player as u8)];
                             let results = eval.evaluate_boundaries(
                                 &combos_for_precomp, &board_cards_for_precomp,
@@ -1800,8 +1814,18 @@ pub fn game_solve_core(
                 break;
             }
 
-            // Boundary values are fixed at construction (multi-valued states).
-            // No mid-solve refresh — prevents destabilizing feedback loop.
+            // Update DCFR discount params for boundary continuation regrets.
+            // Replicates the DiscountParams formula from range-solver/src/solver.rs.
+            {
+                let nearest_pow4 = if t == 0 { 0 } else { 1u32 << ((t.leading_zeros() ^ 31) & !1) };
+                let t_alpha = (t as i32 - 1).max(0) as f64;
+                let t_gamma = (t - nearest_pow4) as f64;
+                let pow_alpha = t_alpha * t_alpha.sqrt();
+                let alpha = (pow_alpha / (pow_alpha + 1.0)) as f32;
+                let beta = 0.5f32;
+                let gamma = (t_gamma / (t_gamma + 1.0)).powi(3) as f32;
+                game.set_boundary_discount(alpha, beta, gamma);
+            }
 
             solve_step(&game, t);
             t += 1;
