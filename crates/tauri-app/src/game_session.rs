@@ -1692,6 +1692,28 @@ pub fn game_solve_core(
         eprintln!("[solve] OOP hands: {}, IP hands: {}", game.private_cards(0).len(), game.private_cards(1).len());
         eprintln!("[solve] memory: {:.1} MB", mem_est as f64 / 1_048_576.0);
 
+        // Seed solver with blueprint strategy if available.
+        if let (Some(ref ctx), Some(abs_node)) = (&cbv_ctx, abstract_node_idx) {
+            let board_cards: Vec<rs_poker::core::Card> = board_clone
+                .iter()
+                .filter_map(|s| parse_rs_poker_card(s).ok())
+                .collect();
+            let seed_street = match board_cards.len() {
+                3 => Street::Flop,
+                4 => Street::Turn,
+                _ => Street::River,
+            };
+            crate::postflop::seed_solver_with_blueprint(
+                &game,
+                &ctx.strategy,
+                &ctx.all_buckets,
+                &ctx.abstract_tree,
+                &board_cards,
+                seed_street,
+                abs_node,
+            );
+        }
+
         // Initial matrix snapshot
         let matrix = build_solve_matrix(&mut game, None);
         *ss_clone.matrix_snapshot.write() = Some(matrix);
