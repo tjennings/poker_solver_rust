@@ -540,48 +540,10 @@ impl LeafEvaluator for RolloutLeafEvaluator {
             .collect();
 
         let elapsed = eval_start.elapsed();
-        let active = hero_range.iter().filter(|&&r| r > 0.0).count();
         eprintln!(
-            "[rollout] {:?} bias: {}/{} active combos × {} boundaries, {:.0}ms",
-            self.bias, active, combos.len(), requests.len(), elapsed.as_secs_f64() * 1000.0
+            "[rollout] {:?} {} boundaries, {:.1}s",
+            self.bias, requests.len(), elapsed.as_secs_f64()
         );
-
-        // Diagnostic: dump rollout values for the first boundary.
-        if self.bias == BiasType::Unbiased && traverser == 0 && !results.is_empty() {
-            let half_pot = requests[0].0 / 2.0;
-            let chip_values: Vec<f64> = results[0].iter().map(|&pf| pf * half_pot).collect();
-            let mut samples: Vec<(String, f64, f64)> = combos
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| hero_range[*i] > 0.0)
-                .map(|(i, combo)| {
-                    let name = format!("{}{}", combo[0], combo[1]);
-                    (name, chip_values[i], results[0][i])
-                })
-                .collect();
-            samples.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            eprintln!("[rollout audit] TOP 10 (highest chip value):");
-            for (name, chip, pf) in samples.iter().take(10) {
-                eprintln!("  {name:<8} chips={chip:>8.2}  pot_frac={pf:>+.4}");
-            }
-            eprintln!("[rollout audit] BOTTOM 10 (lowest chip value):");
-            for (name, chip, pf) in samples.iter().rev().take(10) {
-                eprintln!("  {name:<8} chips={chip:>8.2}  pot_frac={pf:>+.4}");
-            }
-            let targets = ["7s6s", "6s5s", "6s4s", "5s4s", "7h6h", "6h5h", "AsKs", "AhKh", "QdJd"];
-            let found: Vec<_> = samples.iter()
-                .filter(|(name, _, _)| targets.iter().any(|t| name.contains(t) || {
-                    let rev: String = t.chars().collect::<Vec<_>>().chunks(2).rev().flatten().collect();
-                    name.contains(&rev)
-                }))
-                .collect();
-            if !found.is_empty() {
-                eprintln!("[rollout audit] HANDS OF INTEREST:");
-                for (name, chip, pf) in &found {
-                    eprintln!("  {name:<8} chips={chip:>8.2}  pot_frac={pf:>+.4}");
-                }
-            }
-        }
 
         results
     }
@@ -1394,6 +1356,7 @@ fn solve_depth_limited(
         ) {
             Ok((mut game, hands, action_infos, initial_pot, starting_stack)) => {
                 // Seed solver with blueprint strategy if available.
+                eprintln!("[seed] cbv_context={}, abstract_node_idx={:?}", cbv_context.is_some(), abstract_node_idx);
                 if let (Some(ctx), Some(abs_node)) = (&cbv_context, abstract_node_idx) {
                     let seed_street = match board_cards.len() {
                         3 => Street::Flop,
