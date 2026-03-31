@@ -16,13 +16,18 @@ use std::sync::Arc;
 /// evaluator) receives the boundary's pot, remaining stack, the opponent's
 /// reach at the boundary, and the player being evaluated.
 pub trait BoundaryEvaluator: Send + Sync {
-    /// Compute per-hand CFVs at a depth boundary.
+    /// Number of continuation strategies at each boundary. Default: 1 (legacy).
+    fn num_continuations(&self) -> usize { 1 }
+
+    /// Compute per-hand CFVs at a depth boundary for a specific continuation.
     ///
     /// - `player`: the traverser (0=OOP, 1=IP)
     /// - `pot`: pot size at the boundary (in half-BB chips)
     /// - `remaining_stack`: chips behind at the boundary
     /// - `opponent_reach`: opponent's reach probabilities (per private hand, game ordering)
     /// - `num_hands`: number of private hands for `player`
+    /// - `continuation_index`: which of the K continuation strategies to evaluate
+    ///   (0 = unbiased/blueprint, 1..K-1 = biased variants)
     ///
     /// Returns `Vec<f32>` with one CFV per private hand, in pot-normalised units
     /// (1.0 = win one half-pot).
@@ -33,6 +38,7 @@ pub trait BoundaryEvaluator: Send + Sync {
         remaining_stack: f64,
         opponent_reach: &[f32],
         num_hands: usize,
+        continuation_index: usize,
     ) -> Vec<f32>;
 }
 
@@ -196,6 +202,16 @@ pub struct PostFlopGame {
     /// Optional callback for lazy boundary CFV computation.
     /// When set, boundaries with empty CFVs call this instead of returning zero.
     pub boundary_evaluator: Option<Arc<dyn BoundaryEvaluator>>,
+
+    // -- multi-continuation boundary data --
+    /// Number of continuation strategies per boundary. 1 = legacy, 4 = multi-valued.
+    pub(crate) num_continuations: usize,
+    /// Per-boundary continuation regrets for opponent's choice among K continuations.
+    /// One `Mutex<Vec<f32>>` of length K per boundary ordinal.
+    pub(crate) boundary_cont_regrets: Vec<std::sync::Mutex<Vec<f32>>>,
+    /// Per-boundary continuation cumulative strategy sums for averaging.
+    /// One `Mutex<Vec<f32>>` of length K per boundary ordinal.
+    pub(crate) boundary_cont_strategy: Vec<std::sync::Mutex<Vec<f32>>>,
 
     // -- result interpreter state --
     pub(crate) action_history: Vec<usize>,

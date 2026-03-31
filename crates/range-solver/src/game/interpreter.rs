@@ -311,8 +311,8 @@ impl PostFlopGame {
     /// before solving.
     #[inline]
     pub fn num_boundary_nodes(&self) -> usize {
-        // boundary_cfvs has 2 entries per boundary node (one per player)
-        self.boundary_cfvs.len() / 2
+        let k = self.num_continuations.max(1);
+        self.boundary_cfvs.len() / (2 * k)
     }
 
     /// Returns the node arena indices of all depth boundary terminals,
@@ -328,14 +328,18 @@ impl PostFlopGame {
         result
     }
 
-    /// Sets the counterfactual values for a depth boundary terminal.
+    /// Sets the counterfactual values for a depth boundary terminal
+    /// (legacy single-continuation mode, K=1).
     ///
     /// `ordinal` identifies the boundary node (0-based, in tree traversal
     /// order). `player` is the player whose CFVs are being set (0 = OOP,
     /// 1 = IP). `cfvs` must have one entry per private hand for `player`.
     ///
     /// CFVs should be in pot-normalised units: a value of 1.0 means the
-    /// player wins 1× the half-pot from that point forward.
+    /// player wins 1x the half-pot from that point forward.
+    ///
+    /// For multi-continuation mode (K > 1), use [`set_boundary_cfvs_multi`]
+    /// instead.
     pub fn set_boundary_cfvs(&self, ordinal: usize, player: usize, cfvs: Vec<f32>) {
         let idx = ordinal * 2 + player;
         if idx < self.boundary_cfvs.len() {
@@ -378,6 +382,56 @@ impl PostFlopGame {
             self.boundary_reach[idx].lock().unwrap().clone()
         } else {
             Vec::new()
+        }
+    }
+
+    /// Initialise multi-continuation boundary storage with K continuation
+    /// strategies per boundary node.
+    ///
+    /// Reallocates `boundary_cfvs` to hold `boundary_count * 2 * K` slots
+    /// (indexed as `ordinal * 2 * K + player * K + continuation`).
+    /// Also allocates per-boundary regret and strategy accumulators for the
+    /// opponent's virtual choice among K continuations.
+    ///
+    /// Must be called after tree construction and before solving. K=1 is a
+    /// no-op (legacy single-continuation mode).
+    pub fn init_multi_continuation(&mut self, k: usize) {
+        if k <= 1 {
+            return;
+        }
+        let boundary_count = self.num_boundary_nodes();
+
+        self.num_continuations = k;
+
+        // Reallocate boundary_cfvs: boundary_count * 2 * K slots
+        self.boundary_cfvs = (0..boundary_count * 2 * k)
+            .map(|_| std::sync::Mutex::new(Vec::new()))
+            .collect();
+
+        // Allocate per-boundary continuation regrets and strategy sums
+        self.boundary_cont_regrets = (0..boundary_count)
+            .map(|_| std::sync::Mutex::new(vec![0.0f32; k]))
+            .collect();
+        self.boundary_cont_strategy = (0..boundary_count)
+            .map(|_| std::sync::Mutex::new(vec![0.0f32; k]))
+            .collect();
+    }
+
+    /// Sets CFVs for a specific continuation strategy at a boundary.
+    ///
+    /// With multi-continuation mode (`num_continuations > 1`), the index is
+    /// `ordinal * 2 * K + player * K + continuation`.
+    pub fn set_boundary_cfvs_multi(
+        &self,
+        ordinal: usize,
+        player: usize,
+        continuation: usize,
+        cfvs: Vec<f32>,
+    ) {
+        let k = self.num_continuations.max(1);
+        let idx = ordinal * 2 * k + player * k + continuation;
+        if idx < self.boundary_cfvs.len() {
+            *self.boundary_cfvs[idx].lock().unwrap() = cfvs;
         }
     }
 }

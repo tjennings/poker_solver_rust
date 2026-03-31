@@ -911,4 +911,102 @@ mod tests {
             "Exploitability should decrease below 10.0 after 100 iters: {expl}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // BoundaryEvaluator trait extension tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn multi_continuation_solve_step_no_panic() {
+        use crate::action_tree::*;
+        use crate::bet_size::*;
+        use crate::card::*;
+
+        let oop_range: crate::range::Range = "AA,KK,QQ,AKs".parse().unwrap();
+        let ip_range: crate::range::Range =
+            "QQ-JJ,AQs,AJs".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: NOT_DEALT,
+        };
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 100,
+            turn_bet_sizes: [sizes.clone(), sizes],
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let mut game =
+            PostFlopGame::with_config(card_config, tree).unwrap();
+        game.allocate_memory(false);
+
+        let k = 4;
+        let n_boundary = game.num_boundary_nodes();
+        game.init_multi_continuation(k);
+
+        // Set distinct CFVs per continuation
+        for ordinal in 0..n_boundary {
+            for cont in 0..k {
+                let val = (cont as f32 + 1.0) * 0.1;
+                game.set_boundary_cfvs_multi(ordinal, 0, cont, vec![val; game.num_private_hands(0)]);
+                game.set_boundary_cfvs_multi(ordinal, 1, cont, vec![val; game.num_private_hands(1)]);
+            }
+        }
+
+        // Run 10 solve steps — should not panic
+        for i in 0..10 {
+            solve_step(&game, i);
+        }
+
+        let expl = compute_exploitability(&game);
+        assert!(expl.is_finite(), "exploitability should be finite after multi-continuation solve");
+    }
+
+    #[test]
+    fn boundary_evaluator_default_num_continuations_is_one() {
+        use crate::game::BoundaryEvaluator;
+
+        struct SingleCont;
+        impl BoundaryEvaluator for SingleCont {
+            fn compute_cfvs(
+                &self, _player: usize, _pot: i32, _remaining: f64,
+                _opp_reach: &[f32], _num_hands: usize,
+                _continuation_index: usize,
+            ) -> Vec<f32> {
+                vec![0.0]
+            }
+        }
+
+        let eval = SingleCont;
+        assert_eq!(eval.num_continuations(), 1);
+    }
+
+    #[test]
+    fn boundary_evaluator_supports_continuation_index() {
+        use crate::game::BoundaryEvaluator;
+
+        struct MultiBoundary;
+        impl BoundaryEvaluator for MultiBoundary {
+            fn num_continuations(&self) -> usize { 4 }
+            fn compute_cfvs(
+                &self, player: usize, _pot: i32, _remaining: f64,
+                _opp_reach: &[f32], _num_hands: usize,
+                continuation_index: usize,
+            ) -> Vec<f32> {
+                // Return different values for each continuation
+                vec![(continuation_index as f32 + 1.0) * (player as f32 + 1.0)]
+            }
+        }
+
+        let eval = MultiBoundary;
+        assert_eq!(eval.num_continuations(), 4);
+        let v0 = eval.compute_cfvs(0, 100, 50.0, &[1.0], 1, 0);
+        let v1 = eval.compute_cfvs(0, 100, 50.0, &[1.0], 1, 1);
+        assert_ne!(v0[0], v1[0]); // different continuations give different values
+    }
 }

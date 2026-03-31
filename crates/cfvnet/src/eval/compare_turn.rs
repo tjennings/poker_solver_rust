@@ -139,6 +139,7 @@ impl BoundaryEvaluator for NetBoundaryEvaluator {
         remaining_stack: f64,
         opponent_reach: &[f32],
         num_hands: usize,
+        _continuation_index: usize,
     ) -> Vec<f32> {
         let opp = player ^ 1;
         let hero_cards = &self.private_cards[player];
@@ -881,7 +882,7 @@ mod tests {
 
         let num_hands = game.private_cards(0).len();
         let opponent_reach = vec![1.0_f32; game.private_cards(1).len()];
-        let result = evaluator.compute_cfvs(0, 100, 200.0, &opponent_reach, num_hands);
+        let result = evaluator.compute_cfvs(0, 100, 200.0, &opponent_reach, num_hands, 0);
         assert_eq!(result.len(), num_hands, "should return one CFV per hand");
         for (i, &v) in result.iter().enumerate() {
             assert!(v.is_finite(), "hand {i} has non-finite CFV: {v}");

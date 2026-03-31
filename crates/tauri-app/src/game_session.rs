@@ -1265,6 +1265,8 @@ pub(crate) struct SolveBoundaryEvaluator {
 }
 
 impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
+    fn num_continuations(&self) -> usize { 4 }
+
     fn compute_cfvs(
         &self,
         player: usize,
@@ -1272,6 +1274,7 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
         remaining_stack: f64,
         opponent_reach: &[f32],
         num_hands: usize,
+        _continuation_index: usize,
     ) -> Vec<f32> {
         let opp = player ^ 1;
 
