@@ -1490,7 +1490,7 @@ pub fn game_solve_core(
     }
 
     // Read session state under lock, clone what the thread needs
-    let (board, oop_w, ip_w, pot, eff_stack, bet_sizes, cbv_ctx, abstract_node_idx, position_label) = {
+    let (board, oop_w, ip_w, pot, eff_stack, bet_sizes, cbv_ctx, abstract_node_idx, current_node_idx, position_label) = {
         let guard = session_state.session.read();
         let session = guard.as_ref().ok_or("No game session active")?;
 
@@ -1558,8 +1558,9 @@ pub fn game_solve_core(
         };
 
         let position = session.position_label(player).to_string();
+        let current_node = session.node_idx;
 
-        (board, oop_w, ip_w, pot, eff_stack, sizes.clone(), cbv_ctx, abs_node_idx, position)
+        (board, oop_w, ip_w, pot, eff_stack, sizes.clone(), cbv_ctx, abs_node_idx, current_node, position)
     };
 
     // Apply range clamping
@@ -1693,7 +1694,9 @@ pub fn game_solve_core(
         eprintln!("[solve] memory: {:.1} MB", mem_est as f64 / 1_048_576.0);
 
         // Seed solver with blueprint strategy if available.
-        if let (Some(ref ctx), Some(abs_node)) = (&cbv_ctx, abstract_node_idx) {
+        // Use current_node_idx (the decision node we're solving from),
+        // not abstract_node_idx (which points to the next-street boundary).
+        if let Some(ref ctx) = cbv_ctx {
             let board_cards: Vec<rs_poker::core::Card> = board_clone
                 .iter()
                 .filter_map(|s| parse_rs_poker_card(s).ok())
@@ -1710,7 +1713,7 @@ pub fn game_solve_core(
                 &ctx.abstract_tree,
                 &board_cards,
                 seed_street,
-                abs_node,
+                current_node_idx,
             );
         }
 
