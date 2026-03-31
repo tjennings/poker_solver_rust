@@ -5,11 +5,11 @@ use poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id;
 use poker_solver_core::blueprint_v2::solver_dispatch::SolverConfig;
 use poker_solver_core::blueprint_v2::subgame_cfr::cards_overlap;
 use poker_solver_core::blueprint_v2::{
-    LeafEvaluator, SubgameHands,
+    LeafEvaluator, Street, SubgameHands,
     compute_combo_equities,
 };
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
-use poker_solver_core::blueprint_v2::game_tree::GameTree;
+use poker_solver_core::blueprint_v2::game_tree::{GameNode as BlueprintGameNode, GameTree};
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 use poker_solver_core::poker::{Card as RsPokerCard, Suit as RsPokerSuit, Value as RsPokerValue};
 use rand::Rng;
@@ -776,6 +776,114 @@ pub fn build_subgame_solver(
 }
 
 // ---------------------------------------------------------------------------
+// Blueprint strategy seeding
+// ---------------------------------------------------------------------------
+
+/// Seed the range solver's cumulative strategy sums with blueprint action
+/// frequencies. This initializes the solver at the blueprint's strategy
+/// rather than uniform, giving it a warm start.
+///
+/// Walks the range-solver tree and blueprint tree in parallel via DFS.
+/// At each decision node, looks up each hand's bucket in the blueprint
+/// and writes `blueprint_prob * SCALE` into the strategy sums.
+pub fn seed_solver_with_blueprint(
+    game: &PostFlopGame,
+    strategy: &BlueprintV2Strategy,
+    all_buckets: &AllBuckets,
+    tree: &GameTree,
+    board: &[RsPokerCard],
+    street: Street,
+    blueprint_root: u32,
+) {
+    /// Scale factor for blueprint probabilities written into cumulative
+    /// strategy sums. Gives the initial blueprint sufficient weight so
+    /// early solver iterations don't immediately wash it out.
+    const SEED_SCALE: f32 = 1000.0;
+
+    // Build a map: range_solver_arena_index -> blueprint_decision_index.
+    let decision_map = tree.decision_index_map();
+    let mut arena_to_decision: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+
+    // DFS stack: (range_solver_arena_index, blueprint_tree_arena_index).
+    let mut dfs_stack: Vec<(usize, u32)> = vec![(0, blueprint_root)];
+
+    while let Some((rs_idx, bp_idx)) = dfs_stack.pop() {
+        let bp_node = &tree.nodes[bp_idx as usize];
+
+        match bp_node {
+            BlueprintGameNode::Decision { children, .. } => {
+                let dec_idx = decision_map[bp_idx as usize];
+                if dec_idx != u32::MAX {
+                    arena_to_decision.insert(rs_idx, dec_idx as usize);
+                }
+
+                // Push children in reverse order (to process in forward order).
+                let rs_children = game.child_indices(rs_idx);
+                let n = rs_children.len().min(children.len());
+                for i in (0..n).rev() {
+                    dfs_stack.push((rs_children[i], children[i]));
+                }
+            }
+            BlueprintGameNode::Chance { child, .. } => {
+                // Skip chance nodes: the range solver may also have a chance
+                // node here, or the subtree may be flattened. Try to descend
+                // through both.
+                let rs_children = game.child_indices(rs_idx);
+                if rs_children.len() == 1 {
+                    // Single child (chance passthrough) -- continue.
+                    dfs_stack.push((rs_children[0], *child));
+                }
+                // If the range solver has multiple chance children (deal
+                // cards), we can't match them 1:1 with the blueprint's single
+                // child. For single-street solves this shouldn't happen.
+            }
+            BlueprintGameNode::Terminal { .. } => {
+                // Leaf -- nothing to do.
+            }
+        }
+    }
+
+    if arena_to_decision.is_empty() {
+        eprintln!("[seed] no blueprint decision nodes mapped -- skipping seeding");
+        return;
+    }
+
+    let board_rs: Vec<RsPokerCard> = board.to_vec();
+    let num_seeded = std::sync::atomic::AtomicU32::new(0);
+
+    game.seed_strategy(|node_idx, player, num_actions, num_hands| {
+        let &dec_idx = arena_to_decision.get(&node_idx)?;
+
+        let bp_probs = strategy.get_action_probs(dec_idx, 0);
+        if bp_probs.is_empty() || bp_probs.len() != num_actions {
+            return None;
+        }
+
+        let private_cards = game.private_cards(player);
+        let mut strat = vec![0.0f32; num_actions * num_hands];
+
+        for (h, &(c1, c2)) in private_cards.iter().enumerate() {
+            let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
+            let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
+
+            let bucket = all_buckets.get_bucket(street, [rs_c1, rs_c2], &board_rs);
+            let probs = strategy.get_action_probs(dec_idx, bucket);
+
+            let n = probs.len().min(num_actions);
+            for a in 0..n {
+                strat[a * num_hands + h] = probs[a] * SEED_SCALE;
+            }
+        }
+
+        num_seeded.fetch_add(1, Ordering::Relaxed);
+        Some(strat)
+    });
+
+    let count = num_seeded.load(Ordering::Relaxed);
+    eprintln!("[seed] seeded {count} decision nodes with blueprint strategy");
+}
+
+// ---------------------------------------------------------------------------
 // Solve cache
 // ---------------------------------------------------------------------------
 
@@ -1285,6 +1393,24 @@ fn solve_depth_limited(
             rollout_opponent_samples,
         ) {
             Ok((mut game, hands, action_infos, initial_pot, starting_stack)) => {
+                // Seed solver with blueprint strategy if available.
+                if let (Some(ctx), Some(abs_node)) = (&cbv_context, abstract_node_idx) {
+                    let seed_street = match board_cards.len() {
+                        3 => Street::Flop,
+                        4 => Street::Turn,
+                        _ => Street::River,
+                    };
+                    seed_solver_with_blueprint(
+                        &game,
+                        &ctx.strategy,
+                        &ctx.all_buckets,
+                        &ctx.abstract_tree,
+                        &board_cards,
+                        seed_street,
+                        abs_node,
+                    );
+                }
+
                 let eval_interval = leaf_eval_interval.unwrap_or(10);
 
                 // Initial matrix snapshot.
@@ -2576,5 +2702,161 @@ mod tests {
         };
         let matrix2 = build_matrix_from_snapshot(snap2);
         assert_eq!(matrix2.dealer, 1, "range-solver dealer convention");
+    }
+
+    #[test]
+    fn test_seed_solver_with_blueprint_changes_strategy() {
+        use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
+        use poker_solver_core::blueprint_v2::Street;
+        use range_solver::interface::Game;
+
+        // 1. Build a range-solver game for a river board.
+        let board_cards = vec![
+            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Seven, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Club),
+        ];
+        let bet_sizes = vec![vec![1.0f32]]; // 100% pot bet
+        let oop_w = weights_from_range("AA,KK,QQ");
+        let ip_w = weights_from_range("JJ,TT,99");
+
+        let (mut game, _hands, _actions, _pot, _stack) = build_subgame_solver(
+            &board_cards, &bet_sizes, 100, [200, 200],
+            &oop_w, &ip_w, 0, None, None, None, None, None,
+        ).unwrap();
+
+        // 2. Capture the initial (uniform) strategy at root.
+        game.back_to_root();
+        let strategy_before = game.strategy();
+        let player = game.current_player();
+        let num_hands = game.num_private_hands(player);
+        let num_actions = game.available_actions().len();
+        assert!(num_actions >= 2, "need at least 2 actions");
+
+        // Verify initial strategy is uniform.
+        for h in 0..num_hands {
+            let p0 = strategy_before[h]; // action 0, hand h
+            let expected = 1.0 / num_actions as f32;
+            assert!(
+                (p0 - expected).abs() < 0.1,
+                "before seeding, strategy should be ~uniform, got {p0} vs {expected}"
+            );
+        }
+
+        // 3. Build a matching blueprint tree and strategy.
+        let blueprint_tree = V2GameTree::build_subgame(
+            Street::River,
+            100.0,        // pot
+            [100.0; 2],   // invested (stack 200 - invested 100 = eff 100)
+            200.0,        // starting_stack
+            &[vec![1.0]], // same 100% pot bet
+            None,         // no depth limit (river)
+            0,            // dealer = seat 0
+        );
+        // Create a strategy where every decision node has 1 bucket
+        // and action 0 gets 90% probability.
+        let bucket_counts: [u16; 4] = [169, 1, 1, 1]; // 1 bucket for river
+        let mut action_probs = Vec::new();
+        let mut node_action_counts = Vec::new();
+        let mut node_street_indices = Vec::new();
+
+        for node in &blueprint_tree.nodes {
+            if let poker_solver_core::blueprint_v2::game_tree::GameNode::Decision { actions, street, .. } = node {
+                let n_actions = actions.len() as u16;
+                node_action_counts.push(n_actions);
+                node_street_indices.push(*street as u8);
+                // For the single bucket: put 90% on action 0, spread rest.
+                let mut probs = vec![0.1 / (n_actions as f32 - 1.0); n_actions as usize];
+                probs[0] = 0.9;
+                action_probs.extend_from_slice(&probs);
+            }
+        }
+
+        let mut strategy = BlueprintV2Strategy {
+            action_probs,
+            node_action_counts,
+            node_street_indices,
+            bucket_counts,
+            iterations: 100,
+            elapsed_minutes: 1,
+            node_offsets: Vec::new(),
+        };
+        strategy.post_deserialize();
+
+        // Verify strategy works.
+        let probs = strategy.get_action_probs(0, 0);
+        assert!(!probs.is_empty(), "strategy should have action probs");
+        assert!(
+            (probs[0] - 0.9).abs() < 0.01,
+            "first action should be ~0.9, got {}",
+            probs[0]
+        );
+
+        // 4. Build AllBuckets that maps all hands to bucket 0.
+        // Enable equity_fallback so lookups don't panic without bucket files.
+        let mut all_buckets = AllBuckets::new(bucket_counts, [None, None, None, None]);
+        all_buckets.equity_fallback = true;
+
+        // 5. Seed the solver.
+        seed_solver_with_blueprint(
+            &game,
+            &strategy,
+            &all_buckets,
+            &blueprint_tree,
+            &board_cards,
+            Street::River,
+            blueprint_tree.root,
+        );
+
+        // 6. Verify strategy changed: action 0 should dominate.
+        game.back_to_root();
+        let strategy_after = game.strategy();
+        for h in 0..num_hands {
+            let p0 = strategy_after[h]; // action 0, hand h
+            assert!(
+                p0 > 0.7,
+                "after seeding, action 0 should dominate for hand {h}, got {p0}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_seed_solver_with_blueprint_no_cbv_context_is_noop() {
+        // When called with a tree that has no matching nodes, it should not panic.
+        use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
+        use poker_solver_core::blueprint_v2::Street;
+
+        let board_cards = vec![
+            RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Nine, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Six, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::Three, RsPokerSuit::Spade),
+        ];
+        let bet_sizes = vec![vec![0.5f32]];
+        let oop_w = weights_from_range("AA,KK");
+        let ip_w = weights_from_range("QQ,JJ");
+
+        let (game, _, _, _, _) = build_subgame_solver(
+            &board_cards, &bet_sizes, 80, [150, 150],
+            &oop_w, &ip_w, 0, None, None, None, None, None,
+        ).unwrap();
+
+        // Build a trivial empty tree with just a terminal.
+        let empty_tree = V2GameTree::build_subgame(
+            Street::River, 80.0, [75.0; 2], 150.0,
+            &[vec![0.5]], None, 0,
+        );
+        let strategy = BlueprintV2Strategy::empty();
+        let all_buckets = AllBuckets::new([169, 1, 1, 1], [None, None, None, None]);
+
+        // Should not panic even though the tree structure may differ.
+        seed_solver_with_blueprint(
+            &game, &strategy, &all_buckets,
+            &empty_tree, &board_cards,
+            Street::River, empty_tree.root,
+        );
     }
 }

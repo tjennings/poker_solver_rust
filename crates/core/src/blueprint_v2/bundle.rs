@@ -50,8 +50,9 @@ pub struct BlueprintV2Strategy {
     /// Wall-clock minutes elapsed when this snapshot was taken.
     pub elapsed_minutes: u64,
     /// Pre-computed flat offset for each decision node (not serialized).
+    /// Call [`post_deserialize`] after manual construction to populate.
     #[serde(skip)]
-    node_offsets: Vec<usize>,
+    pub node_offsets: Vec<usize>,
 }
 
 impl BlueprintV2Strategy {
@@ -140,8 +141,9 @@ impl BlueprintV2Strategy {
     }
 
     /// Rebuild transient fields that are not serialized (e.g.
-    /// `node_offsets`).  Must be called after deserialization.
-    fn post_deserialize(&mut self) {
+    /// `node_offsets`).  Must be called after deserialization or
+    /// manual construction.
+    pub fn post_deserialize(&mut self) {
         self.node_offsets = compute_node_offsets(
             &self.node_action_counts,
             &self.node_street_indices,

@@ -1887,6 +1887,7 @@ fn make_test_config() -> BlueprintV2Config {
             big_blind: 2.0,
             rake_rate: 0.0,
             rake_cap: 0.0,
+            allow_preflop_limp: true,
         },
         clustering: ClusteringConfig {
             algorithm: ClusteringAlgorithm::PotentialAwareEmd,

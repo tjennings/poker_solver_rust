@@ -391,6 +391,78 @@ impl PostFlopGame {
 }
 
 // ---------------------------------------------------------------------------
+// Strategy seeding
+// ---------------------------------------------------------------------------
+
+impl PostFlopGame {
+    /// Seed strategy sums at every decision node in the game tree.
+    ///
+    /// Walks the entire node arena and calls `visitor` for each decision
+    /// (non-terminal, non-chance) node. The visitor receives:
+    ///
+    /// - `node_index`: the arena index of the node
+    /// - `player`: which player acts (0 = OOP, 1 = IP)
+    /// - `num_actions`: number of available actions
+    /// - `num_hands`: number of private hands for the acting player
+    ///
+    /// If the visitor returns `Some(values)`, the values are written
+    /// directly into the node's cumulative strategy storage. The slice
+    /// must have length `num_actions * num_hands` in action-major,
+    /// hand-minor layout: `values[action * num_hands + hand]`.
+    ///
+    /// If the visitor returns `None`, the node's strategy is left unchanged.
+    pub fn seed_strategy<F>(&self, mut visitor: F)
+    where
+        F: FnMut(usize, usize, usize, usize) -> Option<Vec<f32>>,
+    {
+        if self.state < State::MemoryAllocated {
+            panic!("Memory is not allocated");
+        }
+
+        for (idx, node_mutex) in self.node_arena.iter().enumerate() {
+            let mut node = node_mutex.lock();
+            if node.is_terminal() || node.is_chance() {
+                continue;
+            }
+            let player = node.player();
+            let num_actions = node.num_actions();
+            let num_hands = self.num_private_hands(player);
+
+            if let Some(values) = visitor(idx, player, num_actions, num_hands) {
+                assert_eq!(
+                    values.len(),
+                    num_actions * num_hands,
+                    "seed_strategy: expected {} values ({}*{}), got {}",
+                    num_actions * num_hands,
+                    num_actions,
+                    num_hands,
+                    values.len(),
+                );
+                let strategy = node.strategy_mut();
+                strategy.copy_from_slice(&values);
+            }
+        }
+    }
+
+    /// Returns the child arena indices for the node at `node_index`.
+    ///
+    /// For decision and chance nodes, returns one index per child action.
+    /// For terminal nodes, returns an empty vec.
+    pub fn child_indices(&self, node_index: usize) -> Vec<usize> {
+        if self.state < State::MemoryAllocated {
+            panic!("Memory is not allocated");
+        }
+        let node = self.node_arena[node_index].lock();
+        if node.is_terminal() {
+            return Vec::new();
+        }
+        let offset = node.children_offset as usize;
+        let count = node.num_children as usize;
+        (0..count).map(|i| node_index + offset + i).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Weight caching and value queries
 // ---------------------------------------------------------------------------
 
@@ -1154,6 +1226,157 @@ mod tests {
                 let possible = game.possible_cards();
                 assert!(possible != 0, "should have possible cards at chance node");
             }
+        }
+    }
+
+    #[test]
+    fn test_seed_strategy_writes_to_root() {
+        let mut game = build_river_game();
+        game.allocate_memory(false);
+
+        let player = game.current_player();
+        let num_hands = game.num_private_hands(player);
+        let num_actions = game.available_actions().len();
+        assert!(num_actions >= 2, "need at least 2 actions for this test");
+
+        // Before seeding, strategy storage is all zeros (uniform).
+        let strategy_before = game.strategy();
+        // Uniform: each action gets 1/num_actions.
+        for h in 0..num_hands {
+            let sum: f32 = (0..num_actions)
+                .map(|a| strategy_before[a * num_hands + h])
+                .sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-4,
+                "before seeding, strategy should be uniform (sum={sum})"
+            );
+        }
+
+        // Seed: put all weight on action 0 for every hand.
+        let scale = 1000.0;
+        game.seed_strategy(|_node_idx, _player, n_actions, n_hands| {
+            let mut strat = vec![0.0f32; n_actions * n_hands];
+            for h in 0..n_hands {
+                strat[h] = scale; // action 0 gets all weight
+            }
+            Some(strat)
+        });
+
+        // After seeding, strategy at root should be ~100% action 0.
+        let strategy_after = game.strategy();
+        for h in 0..num_hands {
+            let p0 = strategy_after[h]; // action 0, hand h
+            assert!(
+                p0 > 0.95,
+                "hand {h}: action 0 should have ~100% after seeding, got {p0}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_seed_strategy_affects_child_nodes() {
+        let mut game = build_river_game();
+        game.allocate_memory(false);
+
+        let scale = 1000.0;
+        let mut nodes_visited = 0usize;
+        game.seed_strategy(|_node_idx, _player, n_actions, n_hands| {
+            nodes_visited += 1;
+            // Put all weight on the last action for every hand.
+            let mut strat = vec![0.0f32; n_actions * n_hands];
+            let last = n_actions - 1;
+            for h in 0..n_hands {
+                strat[last * n_hands + h] = scale;
+            }
+            Some(strat)
+        });
+
+        // Should have visited at least the root.
+        assert!(nodes_visited >= 1, "should visit at least the root decision node");
+
+        // Navigate to a child (play action 0 = fold/check) and check IP's strategy.
+        game.play(0);
+        if !game.is_terminal_node() && !game.is_chance_node() {
+            let ip_strategy = game.strategy();
+            let player = game.current_player();
+            let num_hands = game.num_private_hands(player);
+            let num_actions = game.available_actions().len();
+            // Last action should dominate.
+            for h in 0..num_hands {
+                let p_last = ip_strategy[(num_actions - 1) * num_hands + h];
+                assert!(
+                    p_last > 0.95,
+                    "child node: hand {h}: last action should dominate after seeding, got {p_last}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_seed_strategy_skip_nodes() {
+        let mut game = build_river_game();
+        game.allocate_memory(false);
+
+        let scale = 1000.0;
+        let mut call_count = 0usize;
+        // Return None for some nodes to skip seeding them.
+        game.seed_strategy(|_node_idx, _player, n_actions, n_hands| {
+            call_count += 1;
+            if call_count == 1 {
+                // Seed root only.
+                let mut strat = vec![0.0f32; n_actions * n_hands];
+                for h in 0..n_hands {
+                    strat[h] = scale;
+                }
+                Some(strat)
+            } else {
+                None // Skip other nodes.
+            }
+        });
+        assert!(call_count >= 1);
+        // Root should be seeded.
+        let strategy = game.strategy();
+        let player = game.current_player();
+        let num_hands = game.num_private_hands(player);
+        let p0 = strategy[0]; // action 0, hand 0
+        assert!(p0 > 0.95, "root should be seeded, action 0 hand 0 = {p0}");
+    }
+
+    #[test]
+    fn test_child_indices_root() {
+        let mut game = build_river_game();
+        game.allocate_memory(false);
+
+        let children = game.child_indices(0);
+        let num_actions = game.available_actions().len();
+        assert_eq!(
+            children.len(),
+            num_actions,
+            "root should have one child per action"
+        );
+        // All child indices should be unique and > 0.
+        for &idx in &children {
+            assert!(idx > 0, "child index should be > 0");
+        }
+    }
+
+    #[test]
+    fn test_child_indices_terminal() {
+        let mut game = build_river_game();
+        game.allocate_memory(false);
+        solve(&mut game, 10, 0.0, false);
+
+        // Navigate to a fold (terminal) node.
+        let actions = game.available_actions();
+        let fold_idx = actions.iter().position(|a| *a == Action::Fold);
+        if let Some(idx) = fold_idx {
+            let children = game.child_indices(0);
+            let fold_child = children[idx];
+            let terminal_children = game.child_indices(fold_child);
+            assert!(
+                terminal_children.is_empty(),
+                "terminal node should have no children"
+            );
         }
     }
 }
