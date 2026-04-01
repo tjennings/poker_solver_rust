@@ -11,6 +11,7 @@
 //! Stage 2 loads a single river model and evaluates depth-boundary CFVs.
 //! Stage 3 solves the games with DCFR in parallel and writes [`TrainingRecord`]s.
 
+use crate::config::BetSizeConfig;
 use std::io::BufWriter;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,11 +77,11 @@ fn rs_card_to_u8(card: Card) -> u8 {
     4 * rank + suit
 }
 
-/// Parse config bet size strings (e.g. `["50%", "100%", "a"]`) into pot fractions.
+/// Parse a single depth's bet size strings (e.g. `["50%", "100%", "a"]`) into pot fractions.
 ///
 /// Entries like "a" (all-in) are skipped — the game tree builder adds all-in
 /// automatically.
-fn parse_bet_sizes(sizes: &[String]) -> Vec<f64> {
+fn parse_bet_sizes_depth(sizes: &[String]) -> Vec<f64> {
     sizes
         .iter()
         .filter_map(|s| {
@@ -92,6 +93,11 @@ fn parse_bet_sizes(sizes: &[String]) -> Vec<f64> {
             num_str.parse::<f64>().ok().map(|v| v / 100.0)
         })
         .collect()
+}
+
+/// Parse all depths from a BetSizeConfig into `Vec<Vec<f64>>`.
+fn parse_bet_sizes_all(config: &crate::config::BetSizeConfig) -> Vec<Vec<f64>> {
+    config.depths().iter().map(|d| parse_bet_sizes_depth(d)).collect()
 }
 
 /// Solve a single turn situation and return per-player root CFVs mapped to 1326 indices.
@@ -210,14 +216,18 @@ fn build_turn_game(
     let oop_range = RsRange::from_raw_data(&ranges[0]).expect("valid OOP range");
     let ip_range = RsRange::from_raw_data(&ranges[1]).expect("valid IP range");
 
-    let sizes: Vec<BetSize> = bet_sizes
-        .iter()
-        .flat_map(|v| v.iter().map(|&f| BetSize::PotRelative(f)))
-        .collect();
-    let bet_size_opts = BetSizeOptions {
-        bet: sizes.clone(),
-        raise: sizes,
+    // bet_sizes[0] = first bet sizes, bet_sizes[1+] = raise sizes.
+    let bet = bet_sizes.first()
+        .map(|v| v.iter().map(|&f| BetSize::PotRelative(f)).collect())
+        .unwrap_or_default();
+    let raise = if bet_sizes.len() > 1 {
+        bet_sizes[1..].iter()
+            .flat_map(|v| v.iter().map(|&f| BetSize::PotRelative(f)))
+            .collect()
+    } else {
+        Vec::new()
     };
+    let bet_size_opts = BetSizeOptions { bet, raise };
 
     let card_config = CardConfig {
         range: [oop_range, ip_range],
@@ -317,11 +327,11 @@ fn generate_turn_training_data_cuda(
     let threads = config.datagen.threads;
     let solver_iterations = config.datagen.solver_iterations;
     let target_exploitability = config.datagen.target_exploitability as f32;
-    let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
+    let bet_sizes_f64 = parse_bet_sizes_all(&config.game.bet_sizes);
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
     }
-    let bet_sizes_vec = vec![bet_sizes_f64];
+    let bet_sizes_vec = bet_sizes_f64;
 
     // Load river model on CUDA.
     let device = CudaDevice::default();
@@ -660,11 +670,11 @@ pub fn generate_turn_training_data(
     let threads = config.datagen.threads;
     let solver_iterations = config.datagen.solver_iterations;
     let target_exploitability = config.datagen.target_exploitability as f32;
-    let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
+    let bet_sizes_f64 = parse_bet_sizes_all(&config.game.bet_sizes);
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
     }
-    let bet_sizes_vec = vec![bet_sizes_f64];
+    let bet_sizes_vec = bet_sizes_f64;
 
     // Load river model's config to get its architecture (may differ from turn config).
     let river_model_dir = std::path::Path::new(river_model_path)
@@ -984,7 +994,7 @@ mod tests {
         CfvnetConfig {
             game: GameConfig {
                 initial_stack: 200,
-                bet_sizes: vec!["50%".into(), "a".into()],
+                bet_sizes: BetSizeConfig(vec![vec!["50%".into(), "a".into()]]),
                 board_size: 4,
                 river_model_path: None, // tests don't load a real model
                 ..Default::default()
@@ -1010,7 +1020,7 @@ mod tests {
     #[test]
     fn parse_bet_sizes_basic() {
         let sizes = vec!["50%".into(), "100%".into(), "a".into()];
-        let parsed = parse_bet_sizes(&sizes);
+        let parsed = parse_bet_sizes_depth(&sizes);
         assert_eq!(parsed.len(), 2);
         assert!((parsed[0] - 0.5).abs() < 1e-10);
         assert!((parsed[1] - 1.0).abs() < 1e-10);
@@ -1019,7 +1029,7 @@ mod tests {
     #[test]
     fn parse_bet_sizes_only_allin() {
         let sizes = vec!["a".into()];
-        let parsed = parse_bet_sizes(&sizes);
+        let parsed = parse_bet_sizes_depth(&sizes);
         assert!(parsed.is_empty());
     }
 
@@ -1056,7 +1066,7 @@ mod tests {
             return; // Skip degenerate situation.
         }
 
-        let bet_sizes_f64 = parse_bet_sizes(&["50%".into(), "a".into()]);
+        let bet_sizes_f64 = parse_bet_sizes_depth(&["50%".into(), "a".into()]);
         let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv) = solve_turn_situation(
             sit.board_cards(),
             f64::from(sit.pot),
@@ -1111,7 +1121,7 @@ mod tests {
             return;
         }
 
-        let bet_sizes_f64 = parse_bet_sizes(&["50%".into(), "a".into()]);
+        let bet_sizes_f64 = parse_bet_sizes_depth(&["50%".into(), "a".into()]);
         let mut game = build_turn_game(
             sit.board_cards(),
             f64::from(sit.pot),
@@ -1177,7 +1187,7 @@ mod tests {
             return;
         }
 
-        let bet_sizes_f64 = parse_bet_sizes(&["50%".into(), "a".into()]);
+        let bet_sizes_f64 = parse_bet_sizes_depth(&["50%".into(), "a".into()]);
         let pot = f64::from(sit.pot);
         let eff = f64::from(sit.effective_stack);
 
@@ -1280,7 +1290,7 @@ mod tests {
             return;
         }
 
-        let bet_sizes_f64 = parse_bet_sizes(&["50%".into()]);
+        let bet_sizes_f64 = parse_bet_sizes_depth(&["50%".into()]);
         let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv) = solve_turn_situation(
             sit.board_cards(),
             f64::from(sit.pot),

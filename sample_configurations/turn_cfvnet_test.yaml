@@ -23,13 +23,14 @@ game:
 
 datagen:
   street: "turn"
-  num_samples: 10000
+  num_samples: 100000
+  per_file: 5000
   pot_intervals: [[4, 50], [50, 150], [150, 400]]
   spr_intervals: [[0.0, 1.0], [1.0, 4.0], [4.0, 50.0]]
-  solver_iterations: 200
+  solver_iterations: 2000
   target_exploitability: 0.1
   leaf_eval_interval: 50
-  threads: 8
+  threads: 18
 
 training:
   hidden_layers: 7

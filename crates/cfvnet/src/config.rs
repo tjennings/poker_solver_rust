@@ -1,5 +1,61 @@
 use serde::{Deserialize, Serialize};
 
+/// Bet size configuration supporting both flat and per-depth formats.
+///
+/// Flat: `["50%", "100%", "a"]` — one raise depth with these sizes.
+/// Nested: `[["33%", "75%"], ["100%"], ["a"]]` — one entry per raise depth.
+#[derive(Debug, Clone, Serialize)]
+pub struct BetSizeConfig(pub Vec<Vec<String>>);
+
+impl<'de> Deserialize<'de> for BetSizeConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Nested(Vec<Vec<String>>),
+            Flat(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Nested(v) => Ok(BetSizeConfig(v)),
+            Raw::Flat(v) => Ok(BetSizeConfig(vec![v])),
+        }
+    }
+}
+
+impl Default for BetSizeConfig {
+    fn default() -> Self {
+        BetSizeConfig(vec![vec!["25%".into(), "50%".into(), "100%".into(), "a".into()]])
+    }
+}
+
+impl BetSizeConfig {
+    /// Number of raise depths.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty() || self.0.iter().all(|d| d.is_empty())
+    }
+
+    pub fn depths(&self) -> &[Vec<String>] {
+        &self.0
+    }
+
+    /// Flatten all depths into a single list (for river datagen which doesn't use per-depth).
+    pub fn flat(&self) -> Vec<String> {
+        self.0.iter().flat_map(|d| d.iter().cloned()).collect()
+    }
+
+    /// Join all sizes into a comma-separated string (for range-solver BetSizeOptions parsing).
+    pub fn join_flat(&self, sep: &str) -> String {
+        self.flat().join(sep)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CfvnetConfig {
     pub game: GameConfig,
@@ -14,7 +70,11 @@ pub struct CfvnetConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameConfig {
     pub initial_stack: i32,
-    pub bet_sizes: Vec<String>,
+    /// Bet sizes per raise depth. Can be:
+    /// - Flat: `["50%", "100%", "a"]` — same sizes for all depths, one depth only
+    /// - Nested: `[["33%", "75%"], ["100%", "200%"], ["a"]]` — per-depth sizes
+    /// Number of entries in nested form = max raises per round.
+    pub bet_sizes: BetSizeConfig,
     #[serde(default = "default_board_size")]
     pub board_size: usize,
     #[serde(default = "default_allin_threshold")]
@@ -30,7 +90,7 @@ impl Default for GameConfig {
     fn default() -> Self {
         Self {
             initial_stack: 200,
-            bet_sizes: vec!["25%".into(), "50%".into(), "100%".into(), "a".into()],
+            bet_sizes: BetSizeConfig::default(),
             board_size: 5,
             add_allin_threshold: 1.5,
             force_allin_threshold: 0.15,
@@ -46,6 +106,9 @@ impl GameConfig {
         }
         if self.bet_sizes.is_empty() {
             return Err("bet_sizes must not be empty".into());
+        }
+        if self.bet_sizes.depths().is_empty() {
+            return Err("bet_sizes must have at least one depth".into());
         }
         if self.board_size != 4 && self.board_size != 5 {
             return Err(format!("board_size must be 4 or 5, got {}", self.board_size));
@@ -254,7 +317,9 @@ datagen:
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.game.initial_stack, 200);
-        assert_eq!(config.game.bet_sizes.len(), 4);
+        // Flat config wraps as 1 depth with 4 sizes.
+        assert_eq!(config.game.bet_sizes.len(), 1);
+        assert_eq!(config.game.bet_sizes.depths()[0].len(), 4);
         assert_eq!(config.datagen.num_samples, 1000);
         // Check defaults filled in
         assert_eq!(config.datagen.seed, None);
@@ -299,7 +364,7 @@ training:
     fn validate_rejects_empty_bet_sizes() {
         let config = GameConfig {
             initial_stack: 200,
-            bet_sizes: vec![],
+            bet_sizes: BetSizeConfig(vec![]),
             ..Default::default()
         };
         assert!(config.validate().is_err());
@@ -309,7 +374,7 @@ training:
     fn validate_rejects_zero_stack() {
         let config = GameConfig {
             initial_stack: 0,
-            bet_sizes: vec!["50%".into()],
+            bet_sizes: BetSizeConfig(vec![vec!["50%".into()]]),
             ..Default::default()
         };
         assert!(config.validate().is_err());

@@ -390,7 +390,7 @@ fn cmd_bench_solve(config_path: PathBuf, num_samples: u64, threads: usize) {
         std::process::exit(1);
     }
 
-    let bet_str = cfg.game.bet_sizes.join(",");
+    let bet_str = cfg.game.bet_sizes.join_flat(",");
     let bet_sizes = range_solver::bet_size::BetSizeOptions::try_from((bet_str.as_str(), ""))
         .unwrap_or_else(|e| {
             eprintln!("invalid bet sizes: {e}");

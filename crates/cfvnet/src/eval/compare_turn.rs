@@ -4,6 +4,7 @@
 //! - **compare-net**: solver uses `NetBoundaryEvaluator` (river net) at depth boundaries
 //! - **compare-exact**: solver uses `PostFlopGame` with `depth_limit: None` (full solve through river)
 
+use crate::config::BetSizeConfig;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -507,7 +508,7 @@ pub fn run_turn_comparison_net(
     .load_file(river_model_path, &recorder, &device)
     .map_err(|e| format!("failed to load river model: {e}"))?;
 
-    let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
+    let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes.flat());
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
     }
@@ -578,7 +579,7 @@ pub fn run_turn_comparison_exact(
     .load_file(turn_model_path, &recorder, &device)
     .map_err(|e| format!("failed to load turn model: {e}"))?;
 
-    let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
+    let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes.flat());
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
     }
@@ -628,7 +629,7 @@ pub fn run_turn_comparison_net_with_models(
     seed: u64,
 ) -> Result<ComparisonSummary, String> {
     let device = <B as burn::tensor::backend::Backend>::Device::default();
-    let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
+    let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes.flat());
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
     }
@@ -676,7 +677,7 @@ pub fn run_turn_comparison_exact_with_model(
     _exact_iterations: u32,
 ) -> Result<ComparisonSummary, String> {
     let device = <B as burn::tensor::backend::Backend>::Device::default();
-    let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
+    let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes.flat());
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
     }
@@ -718,7 +719,7 @@ mod tests {
         CfvnetConfig {
             game: GameConfig {
                 initial_stack: 200,
-                bet_sizes: vec!["50%".into(), "a".into()],
+                bet_sizes: BetSizeConfig(vec![vec!["50%".into(), "a".into()]]),
                 board_size: 4,
                 river_model_path: None,
                 ..Default::default()
@@ -898,7 +899,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let sit = sample_situation(&config.datagen, config.game.initial_stack, 4, &mut rng);
 
-        let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
+        let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes.flat());
         let bet_sizes_vec = vec![bet_sizes_f64];
 
         let (cfvs, valid) =
@@ -922,7 +923,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let sit = sample_situation(&config.datagen, config.game.initial_stack, 4, &mut rng);
 
-        let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes);
+        let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes.flat());
         let bet_sizes_vec = vec![bet_sizes_f64];
 
         let (cfvs, valid) = solve_and_extract_exact(&sit, &bet_sizes_vec, 5, 0);

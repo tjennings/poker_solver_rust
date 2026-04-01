@@ -33,7 +33,7 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
     let seed = crate::config::resolve_seed(config.datagen.seed);
     let threads = config.datagen.threads;
 
-    let bet_str = config.game.bet_sizes.join(",");
+    let bet_str = config.game.bet_sizes.join_flat(",");
     let bet_sizes = BetSizeOptions::try_from((bet_str.as_str(), ""))
         .map_err(|e| format!("invalid bet sizes: {e}"))?;
     let solve_config = SolveConfig {
@@ -185,7 +185,7 @@ fn bool_mask_to_u8(mask: &[bool; NUM_COMBOS]) -> [u8; NUM_COMBOS] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CfvnetConfig, DatagenConfig, EvaluationConfig, GameConfig, TrainingConfig};
+    use crate::config::{BetSizeConfig, CfvnetConfig, DatagenConfig, EvaluationConfig, GameConfig, TrainingConfig};
     use crate::datagen::storage;
     use tempfile::NamedTempFile;
 
@@ -193,7 +193,7 @@ mod tests {
         CfvnetConfig {
             game: GameConfig {
                 initial_stack: 200,
-                bet_sizes: vec!["50%".into(), "a".into()],
+                bet_sizes: BetSizeConfig(vec![vec!["50%".into(), "a".into()]]),
                 ..Default::default()
             },
             datagen: DatagenConfig {

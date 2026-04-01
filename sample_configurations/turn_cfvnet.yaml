@@ -18,7 +18,7 @@ game:
   board_size: 4
   add_allin_threshold: 1.5
   force_allin_threshold: 0.15
-  river_model_path: "local_data/models/river_v7/checkpoint_epoch340"
+  river_model_path: "./local_data/models/river_v6/checkpoint_epoch30.mpk.gz"
 
 datagen:
   street: "turn"

@@ -16,7 +16,7 @@ pub fn generate_comparison_spot(seed: u64, initial_stack: i32, datagen: &Datagen
 
 /// Default solve config for comparison spots.
 pub fn default_solve_config(game: &GameConfig, datagen: &DatagenConfig) -> Result<SolveConfig, String> {
-    let bet_str = game.bet_sizes.join(",");
+    let bet_str = game.bet_sizes.join_flat(",");
     let bet_sizes = BetSizeOptions::try_from((bet_str.as_str(), ""))
         .map_err(|e| format!("invalid bet sizes: {e}"))?;
     Ok(SolveConfig {
@@ -114,13 +114,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GameConfig;
+    use crate::config::{BetSizeConfig, GameConfig};
 
     #[test]
     fn comparison_with_perfect_oracle_shows_zero_error() {
         let game = GameConfig {
             initial_stack: 200,
-            bet_sizes: vec!["50%".into(), "a".into()],
+            bet_sizes: BetSizeConfig(vec![vec!["50%".into(), "a".into()]]),
             ..Default::default()
         };
         let datagen = DatagenConfig::default();
@@ -146,7 +146,7 @@ mod tests {
     fn summary_contains_per_spot_results() {
         let game = GameConfig {
             initial_stack: 200,
-            bet_sizes: vec!["50%".into(), "a".into()],
+            bet_sizes: BetSizeConfig(vec![vec!["50%".into(), "a".into()]]),
             ..Default::default()
         };
         let datagen = DatagenConfig::default();
