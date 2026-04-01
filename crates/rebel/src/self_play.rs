@@ -331,6 +331,14 @@ pub fn play_self_play_hand<R: Rng>(
     for &street in &STREET_ORDER {
         let n_board = board_card_count(street);
 
+        // Only solve streets where we have exact solving or a trained model.
+        // River: solve exactly (no depth limit, no leaf evaluator needed).
+        // Flop/Turn: skip for now — requires a value net trained on those streets
+        // (via bottom-up offline seeding). Self-play currently only refines river.
+        if street != Street::River {
+            continue;
+        }
+
         // Build the PBS for this street.
         let board = deal.board[..n_board].to_vec();
         let mut pbs = Pbs {
@@ -341,13 +349,10 @@ pub fn play_self_play_hand<R: Rng>(
         };
         pbs.zero_blocked_combos();
 
-        // Solve the subgame at this PBS via the inference server.
-        let evaluator = InferenceLeafEvaluator { handle };
-        let solve_result = match solve_depth_limited_pbs(&pbs, solve_config, &evaluator) {
+        // Solve the river subgame exactly (no boundaries needed).
+        let solve_result = match crate::solver::solve_river_pbs(&pbs, solve_config) {
             Ok(r) => r,
             Err(_) => {
-                // Solving failed (e.g., pot or stack constraints).
-                // End the hand here — no more examples.
                 break;
             }
         };
