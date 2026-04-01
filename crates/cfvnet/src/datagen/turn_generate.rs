@@ -34,7 +34,7 @@ type B = NdArray;
 
 /// Number of situations to generate, solve, and write per chunk.
 /// Keeps peak memory bounded regardless of total `num_samples`.
-const CHUNK_SIZE: u64 = 10_000;
+const CHUNK_SIZE: u64 = 128;
 
 /// Thin wrapper that marks `CfvNet<NdArray>` as `Sync` so it can be shared
 /// across rayon threads for cloning.
