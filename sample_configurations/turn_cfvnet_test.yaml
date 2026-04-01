@@ -1,0 +1,46 @@
+# Turn CFVnet — small test config for end-to-end pipeline verification
+#
+# Datagen:
+#   cargo run -p cfvnet --release -- generate \
+#     -c sample_configurations/turn_cfvnet_test.yaml \
+#     -o local_data/cfvnet/turn_test.bin \
+#     --num-samples 10000
+#
+# Training (Mac/wgpu):
+#   cargo run -p cfvnet --release -- train \
+#     -c sample_configurations/turn_cfvnet_test.yaml \
+#     -d local_data/cfvnet/turn_test.bin \
+#     -o local_data/models/turn_test \
+#     --backend wgpu
+
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "100%", "a"]
+  board_size: 4
+  add_allin_threshold: 1.5
+  force_allin_threshold: 0.15
+  river_model_path: "local_data/models/river_v6/model"
+
+datagen:
+  street: "turn"
+  num_samples: 10000
+  pot_intervals: [[4, 50], [50, 150], [150, 400]]
+  spr_intervals: [[0.0, 1.0], [1.0, 4.0], [4.0, 50.0]]
+  solver_iterations: 200
+  target_exploitability: 0.1
+  leaf_eval_interval: 50
+  threads: 8
+
+training:
+  hidden_layers: 7
+  hidden_size: 768
+  batch_size: 2048
+  epochs: 20
+  learning_rate: 0.002
+  lr_min: 0.0001
+  huber_delta: 1.0
+  aux_loss_weight: 1.0
+  validation_split: 0.1
+  checkpoint_every_n_epochs: 5
+  shuffle_buffer_size: 8192
+  prefetch_depth: 2
