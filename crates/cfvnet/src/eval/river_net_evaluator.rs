@@ -174,24 +174,19 @@ where
         // Convert board to u8.
         let board_u8: Vec<u8> = board.iter().map(|c| rs_card_to_u8(*c)).collect();
 
-        // Accumulate CFVs and counts per combo.
-        let mut cfv_sum = vec![0.0_f64; num_combos];
-        let mut cfv_count = vec![0_u32; num_combos];
+        // Build all river card inputs CPU-side, then run one batched forward pass.
+        let mut inputs: Vec<f32> = Vec::new();
+        let mut valid_combo_masks: Vec<Vec<bool>> = Vec::new();
 
-        // Iterate over all 52 possible river cards.
         for river_u8 in 0u8..52 {
-            // Skip cards already on the board.
             if board_u8.contains(&river_u8) {
                 continue;
             }
 
-            // Build the 5-card river board.
             let river_board_u8: [u8; 5] = [
                 board_u8[0], board_u8[1], board_u8[2], board_u8[3], river_u8,
             ];
 
-            // Map solver ranges to 1326-indexed arrays.
-            // Only include combos that don't conflict with the river card.
             let mut oop_1326 = [0.0_f32; OUTPUT_SIZE];
             let mut ip_1326 = [0.0_f32; OUTPUT_SIZE];
             let mut valid_combo_mask = vec![false; num_combos];
@@ -205,7 +200,6 @@ where
                 ip_1326[idx] = ip_range[i] as f32;
             }
 
-            // Build input and run forward pass.
             let input_vec = build_input(
                 &oop_1326,
                 &ip_1326,
@@ -214,25 +208,34 @@ where
                 effective_stack,
                 traverser,
             );
+            inputs.extend_from_slice(&input_vec);
+            valid_combo_masks.push(valid_combo_mask);
+        }
 
-            let data = TensorData::new(input_vec, [1, INPUT_SIZE]);
-            let input_tensor = Tensor::<B, 2>::from_data(data, &self.device);
-            let output = self.model.forward(input_tensor);
+        let batch_size = valid_combo_masks.len();
 
-            // Extract output values.
-            let out_data = output.into_data();
-            let out_vec: Vec<f32> = out_data.to_vec().expect("output tensor conversion");
+        // Single batched forward pass: [batch_size, INPUT_SIZE] -> [batch_size, OUTPUT_SIZE]
+        let data = TensorData::new(inputs, [batch_size, INPUT_SIZE]);
+        let input_tensor = Tensor::<B, 2>::from_data(data, &self.device);
+        let output = self.model.forward(input_tensor);
 
-            // Map 1326-indexed outputs back to solver combo order.
+        let out_data = output.into_data();
+        let out_vec: Vec<f32> = out_data.to_vec().expect("output tensor conversion");
+
+        // Post-process: average over river cards per combo.
+        let mut cfv_sum = vec![0.0_f64; num_combos];
+        let mut cfv_count = vec![0_u32; num_combos];
+
+        for (river_idx, mask) in valid_combo_masks.iter().enumerate() {
+            let row_start = river_idx * OUTPUT_SIZE;
             for (i, &idx) in combo_indices.iter().enumerate() {
-                if valid_combo_mask[i] {
-                    cfv_sum[i] += f64::from(out_vec[idx]);
+                if mask[i] {
+                    cfv_sum[i] += f64::from(out_vec[row_start + idx]);
                     cfv_count[i] += 1;
                 }
             }
         }
 
-        // Average over river cards.
         cfv_sum
             .iter()
             .zip(cfv_count.iter())
