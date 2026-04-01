@@ -45,7 +45,7 @@ use crate::model::network::{CfvNet, INPUT_SIZE};
 type B = Wgpu;
 
 /// Bounded channel capacity for the pipeline stages (tunable).
-const PIPELINE_CHANNEL_CAPACITY: usize = 5000;
+const PIPELINE_CHANNEL_CAPACITY: usize = 64;
 
 /// Batch size for Stage 3 rayon solve dispatch.
 const SOLVE_BATCH_SIZE: usize = 128;
