@@ -704,17 +704,39 @@ pub fn generate_turn_training_data(
             .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
             .expect("valid progress bar template"),
     );
-    pb.enable_steady_tick(std::time::Duration::from_secs(1));
+
+    // Show pipeline buffer depths in the progress bar message.
+    let stage1_count_for_pb = Arc::new(AtomicU64::new(0));
+    let stage2_count_for_pb = Arc::new(AtomicU64::new(0));
+    let stage3_count_for_pb = Arc::new(AtomicU64::new(0));
+    let s1_pb = Arc::clone(&stage1_count_for_pb);
+    let s2_pb = Arc::clone(&stage2_count_for_pb);
+    let s3_pb = Arc::clone(&stage3_count_for_pb);
+    let pb_ticker = Arc::clone(&pb);
+    let ticker = std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let s1 = s1_pb.load(Ordering::Relaxed);
+            let s2 = s2_pb.load(Ordering::Relaxed);
+            let s3 = s3_pb.load(Ordering::Relaxed);
+            let buf1 = s1.saturating_sub(s2);
+            let buf2 = s2.saturating_sub(s3);
+            pb_ticker.set_message(format!("deal→[{buf1}]→gpu→[{buf2}]→solve"));
+            if pb_ticker.is_finished() {
+                break;
+            }
+        }
+    });
 
     // Open output file with mutex for thread-safe writing from Stage 3.
     let file =
         std::fs::File::create(output_path).map_err(|e| format!("create output: {e}"))?;
     let writer = Arc::new(Mutex::new(BufWriter::new(file)));
 
-    // Per-stage throughput counters.
-    let stage1_count = Arc::new(AtomicU64::new(0));
-    let stage2_count = Arc::new(AtomicU64::new(0));
-    let stage3_count = Arc::new(AtomicU64::new(0));
+    // Per-stage throughput counters (shared with progress bar ticker).
+    let stage1_count = Arc::clone(&stage1_count_for_pb);
+    let stage2_count = Arc::clone(&stage2_count_for_pb);
+    let stage3_count = Arc::clone(&stage3_count_for_pb);
 
     let wall_start = std::time::Instant::now();
 
@@ -886,6 +908,7 @@ pub fn generate_turn_training_data(
     stage3.join().map_err(|e| format!("stage 3 panicked: {e:?}"))??;
 
     pb.finish_with_message("done");
+    let _ = ticker.join();
 
     // Report per-stage throughput.
     let wall_secs = wall_start.elapsed().as_secs_f64();
