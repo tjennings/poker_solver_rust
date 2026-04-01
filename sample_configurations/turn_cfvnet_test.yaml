@@ -15,7 +15,10 @@
 
 game:
   initial_stack: 200
-  bet_sizes: ["50%", "100%", "a"]
+  bet_sizes:
+    - ["33%", "75%", "100%"]    # first bet
+    - ["100%", "200%"]   
+    - ["a"]        # raises
   board_size: 4
   add_allin_threshold: 1.5
   force_allin_threshold: 0.15

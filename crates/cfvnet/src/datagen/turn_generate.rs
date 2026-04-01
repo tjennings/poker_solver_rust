@@ -124,6 +124,7 @@ fn solve_turn_situation(
     [u8; NUM_COMBOS],
     f32,
     f32,
+    f32,
 ) {
     let mut game = build_turn_game(board_u8, pot, effective_stack, ranges, bet_sizes)
         .expect("valid game");
@@ -255,7 +256,7 @@ fn build_turn_game(
     Some(game)
 }
 
-/// Solve a game with boundaries already set. Returns 1326-indexed CFVs.
+/// Solve a game with boundaries already set. Returns 1326-indexed CFVs + exploitability.
 #[allow(clippy::type_complexity)]
 fn solve_and_extract(
     game: &mut PostFlopGame,
@@ -263,13 +264,17 @@ fn solve_and_extract(
     ranges: &[[f32; NUM_COMBOS]; 2],
     solver_iterations: u32,
     target_exploitability: f32,
-) -> ([f32; NUM_COMBOS], [f32; NUM_COMBOS], [u8; NUM_COMBOS], f32, f32) {
+) -> ([f32; NUM_COMBOS], [f32; NUM_COMBOS], [u8; NUM_COMBOS], f32, f32, f32) {
     // Use solve_step directly to skip exploitability computation every 10 iterations.
     // For datagen, we run to a fixed iteration count — no early exit needed.
     let _ = target_exploitability;
     for t in 0..solver_iterations {
         solve_step(game, t);
     }
+
+    // Finalize before computing exploitability (marks game as solved).
+    range_solver::finalize(game);
+    let exploit = range_solver::compute_exploitability(game);
 
     game.back_to_root();
     game.cache_normalized_weights();
@@ -300,7 +305,7 @@ fn solve_and_extract(
     let oop_gv = weighted_sum(&ranges[0], &oop_cfvs);
     let ip_gv = weighted_sum(&ranges[1], &ip_cfvs);
 
-    (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)
+    (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, exploit)
 }
 
 /// GPU-accelerated turn datagen with pipelined GPU/CPU phases.
@@ -513,7 +518,7 @@ fn generate_turn_training_data_cuda(
         pb: &ProgressBar,
     ) -> Result<(), String> {
         for (sit, result) in situations.iter().zip(results) {
-            if let Some((oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)) = result {
+            if let Some((oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _exploit)) = result {
                 let board_vec = sit.board_cards().to_vec();
                 let oop_rec = TrainingRecord {
                     board: board_vec.clone(), pot: sit.pot as f32,
@@ -726,6 +731,10 @@ pub fn generate_turn_training_data(
     let s1_pb = Arc::clone(&stage1_count_for_pb);
     let s2_pb = Arc::clone(&stage2_count_for_pb);
     let s3_pb = Arc::clone(&stage3_count_for_pb);
+    let exploit_sum_pb = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let exploit_count_pb = Arc::new(AtomicU64::new(0));
+    let es_pb = Arc::clone(&exploit_sum_pb);
+    let ec_pb = Arc::clone(&exploit_count_pb);
     let pb_ticker = Arc::clone(&pb);
     let ticker = std::thread::spawn(move || {
         loop {
@@ -735,7 +744,13 @@ pub fn generate_turn_training_data(
             let s3 = s3_pb.load(Ordering::Relaxed);
             let buf1 = s1.saturating_sub(s2);
             let buf2 = s2.saturating_sub(s3);
-            pb_ticker.set_message(format!("deal→[{buf1}]→gpu→[{buf2}]→solve"));
+            let ec = ec_pb.load(Ordering::Relaxed);
+            let avg_exploit = if ec > 0 {
+                (es_pb.load(Ordering::Relaxed) as f64 / 10000.0) / ec as f64
+            } else {
+                0.0
+            };
+            pb_ticker.set_message(format!("deal→[{buf1}]→gpu→[{buf2}]→solve  expl:{avg_exploit:.4}"));
             if pb_ticker.is_finished() {
                 break;
             }
@@ -890,6 +905,8 @@ pub fn generate_turn_training_data(
     let pb_ref = Arc::clone(&pb);
     let writer_ref = Arc::clone(&writer);
     let stage3_count_ref = Arc::clone(&stage3_count);
+    let exploit_sum_ref = Arc::clone(&exploit_sum_pb);
+    let exploit_count_ref = Arc::clone(&exploit_count_pb);
     let stage3 = std::thread::spawn(move || -> Result<(), String> {
         let mut batch: Vec<(Situation, PostFlopGame)> = Vec::with_capacity(SOLVE_BATCH_SIZE);
 
@@ -919,6 +936,10 @@ pub fn generate_turn_training_data(
                             solver_iterations,
                             target_exploitability,
                         );
+                        let (_, _, _, _, _, exploit) = &result;
+                        // Store exploit * 10000 as integer for atomic accumulation.
+                        exploit_sum_ref.fetch_add((*exploit * 10000.0) as u64, Ordering::Relaxed);
+                        exploit_count_ref.fetch_add(1, Ordering::Relaxed);
                         pb_ref.inc(1);
                         stage3_count_ref.fetch_add(1, Ordering::Relaxed);
                         (sit, result)
@@ -928,7 +949,7 @@ pub fn generate_turn_training_data(
 
             // Write results sequentially under lock.
             let mut w = writer_ref.lock().expect("writer lock");
-            for (sit, (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)) in results {
+            for (sit, (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _exploit)) in results {
                 let board_vec = sit.board_cards().to_vec();
 
                 let oop_rec = TrainingRecord {
@@ -1071,7 +1092,7 @@ mod tests {
         }
 
         let bet_sizes_f64 = parse_bet_sizes_depth(&["50%".into(), "a".into()]);
-        let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv) = solve_turn_situation(
+        let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _exploit) = solve_turn_situation(
             sit.board_cards(),
             f64::from(sit.pot),
             f64::from(sit.effective_stack),
@@ -1150,7 +1171,7 @@ mod tests {
 
         // After evaluation, the game should be solvable. We verify by solving
         // and checking that results are finite.
-        let (oop_cfvs, ip_cfvs, _valid, oop_gv, ip_gv) = solve_and_extract(
+        let (oop_cfvs, ip_cfvs, _valid, oop_gv, ip_gv, _exploit) = solve_and_extract(
             &mut game,
             f64::from(sit.pot),
             &sit.ranges,
@@ -1196,7 +1217,7 @@ mod tests {
         let eff = f64::from(sit.effective_stack);
 
         // Monolithic path.
-        let (mono_oop, mono_ip, mono_mask, mono_oop_gv, mono_ip_gv) = solve_turn_situation(
+        let (mono_oop, mono_ip, mono_mask, mono_oop_gv, mono_ip_gv, _exploit) = solve_turn_situation(
             sit.board_cards(),
             pot,
             eff,
@@ -1226,7 +1247,7 @@ mod tests {
             &evaluator,
         );
 
-        let (pipe_oop, pipe_ip, pipe_mask, pipe_oop_gv, pipe_ip_gv) = solve_and_extract(
+        let (pipe_oop, pipe_ip, pipe_mask, pipe_oop_gv, pipe_ip_gv, _exploit) = solve_and_extract(
             &mut game,
             pot,
             &sit.ranges,
@@ -1295,7 +1316,7 @@ mod tests {
         }
 
         let bet_sizes_f64 = parse_bet_sizes_depth(&["50%".into()]);
-        let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv) = solve_turn_situation(
+        let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _exploit) = solve_turn_situation(
             sit.board_cards(),
             f64::from(sit.pot),
             f64::from(sit.effective_stack),
