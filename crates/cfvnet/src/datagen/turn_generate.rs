@@ -243,9 +243,9 @@ fn build_turn_game(
         turn_bet_sizes: [bet_size_opts.clone(), bet_size_opts],
         river_bet_sizes: [BetSizeOptions::default(), BetSizeOptions::default()],
         depth_limit: Some(0),
-        add_allin_threshold: 1.5,
-        force_allin_threshold: 0.15,
-        merging_threshold: 0.1,
+        add_allin_threshold: 0.0,
+        force_allin_threshold: 0.0,
+        merging_threshold: 0.0,
         ..Default::default()
     };
 
