@@ -118,6 +118,25 @@ enum Commands {
         #[arg(long, default_value = "1")]
         threads: usize,
     },
+    /// Precompute average turn entry ranges from a blueprint strategy, bucketed by SPR.
+    #[command(name = "precompute-ranges")]
+    PrecomputeRanges {
+        /// Path to blueprint bundle directory
+        #[arg(short, long)]
+        blueprint: PathBuf,
+        /// Output file for cached ranges
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Number of deals to sample per SPR bucket (default 10000)
+        #[arg(long, default_value = "10000")]
+        samples_per_bucket: usize,
+        /// SPR bucket boundaries (comma-separated, e.g. "0,1,3,8,50")
+        #[arg(long, default_value = "0,0.5,1.5,4,8,50")]
+        spr_boundaries: String,
+        /// Initial stack size in chips (default 200)
+        #[arg(long, default_value = "200")]
+        initial_stack: i32,
+    },
 }
 
 fn append_random_suffix(path: &std::path::Path) -> PathBuf {
@@ -207,6 +226,16 @@ fn main() {
         Commands::DatagenEval { data } => cmd_datagen_eval(data),
         Commands::BenchSolve { config, num_samples, threads } => {
             cmd_bench_solve(config, num_samples, threads);
+        }
+        Commands::PrecomputeRanges {
+            blueprint,
+            output,
+            samples_per_bucket,
+            spr_boundaries,
+            initial_stack,
+        } => {
+            ensure_parent_dir(&output);
+            cmd_precompute_ranges(blueprint, output, samples_per_bucket, &spr_boundaries, initial_stack);
         }
     }
 }
@@ -463,6 +492,51 @@ fn cmd_bench_solve(config_path: PathBuf, num_samples: u64, threads: usize) {
         "Solved {} situations in {:.2?} ({:.1} solves/sec, {:.2?}/solve)",
         num_samples, elapsed, solves_per_sec, per_solve,
     );
+}
+
+fn cmd_precompute_ranges(
+    blueprint: PathBuf,
+    output: PathBuf,
+    samples_per_bucket: usize,
+    spr_boundaries_str: &str,
+    initial_stack: i32,
+) {
+    use cfvnet::datagen::blueprint_ranges::BlueprintRangeGenerator;
+    use cfvnet::datagen::precompute_ranges::{parse_spr_boundaries, precompute_turn_ranges};
+
+    let generator = BlueprintRangeGenerator::load(&blueprint).unwrap_or_else(|e| {
+        eprintln!("Failed to load blueprint: {e}");
+        std::process::exit(1);
+    });
+
+    let boundaries = parse_spr_boundaries(spr_boundaries_str);
+    if boundaries.len() < 2 {
+        eprintln!("Need at least 2 SPR boundaries to define a bucket, got {}", boundaries.len());
+        std::process::exit(1);
+    }
+
+    println!(
+        "Precomputing turn ranges: {} SPR buckets, {} samples/bucket, initial_stack={}",
+        boundaries.len() - 1,
+        samples_per_bucket,
+        initial_stack,
+    );
+
+    let ranges = precompute_turn_ranges(&generator, &boundaries, samples_per_bucket, initial_stack);
+    ranges.save(&output).unwrap_or_else(|e| {
+        eprintln!("Failed to save: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Saved precomputed ranges to {}", output.display());
+    for bucket in &ranges.buckets {
+        let oop_nz = bucket.oop_range.iter().filter(|&&w| w > 0.01).count();
+        let ip_nz = bucket.ip_range.iter().filter(|&&w| w > 0.01).count();
+        println!(
+            "  SPR [{:.1}, {:.1}): {} samples, OOP ~{} combos, IP ~{} combos",
+            bucket.spr_low, bucket.spr_high, bucket.sample_count, oop_nz, ip_nz
+        );
+    }
 }
 
 fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
