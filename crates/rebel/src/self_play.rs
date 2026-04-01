@@ -490,6 +490,10 @@ pub fn self_play_training_loop(
 ) -> usize {
     let mut total_examples = 0usize;
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(sp_config.seed);
+    let start = std::time::Instant::now();
+
+    eprintln!("Starting self-play: {} hands, {} CFR iters/solve",
+        sp_config.num_hands, sp_config.cfr_iterations);
 
     for hand_idx in 0..sp_config.num_hands {
         let examples = play_self_play_hand(
@@ -509,13 +513,19 @@ pub fn self_play_training_loop(
         handle.notify_solve_complete();
         total_examples += examples.len();
 
-        // Progress logging every 100 hands.
-        if (hand_idx + 1) % 100 == 0 {
+        // Progress logging every 10 hands.
+        if (hand_idx + 1) % 10 == 0 {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = (hand_idx + 1) as f64 / elapsed;
+            let remaining = (sp_config.num_hands - hand_idx - 1) as f64 / rate;
             eprintln!(
-                "Self-play progress: {}/{} hands, {} examples so far",
+                "Self-play: {}/{} hands, {} examples, {:.1} hands/s, buffer={}, eta {:.0}s",
                 hand_idx + 1,
                 sp_config.num_hands,
-                total_examples
+                total_examples,
+                rate,
+                replay_buffer.len(),
+                remaining,
             );
         }
     }

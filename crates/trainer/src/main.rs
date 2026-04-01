@@ -1363,6 +1363,8 @@ fn run_rebel_train(
         use std::sync::atomic::{AtomicBool, Ordering};
 
         use burn::backend::{Autodiff, wgpu::Wgpu};
+        use burn::module::Module;
+        use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
         use cfvnet::model::network::CfvNet;
         use rebel::inference_server::{spawn_inference_server, InferenceServerConfig};
         use rebel::replay_buffer::ReplayBuffer;
@@ -1373,17 +1375,34 @@ fn run_rebel_train(
         eprintln!("\n--- Phase 2: Self-Play Training ---");
         eprintln!("Model at: {}", model_path.display());
 
-        // Create a fresh (random) CfvNet model.
-        // TODO: Load weights from model_path checkpoint once model serialization is wired.
         let device = burn::backend::wgpu::WgpuDevice::default();
-        let model = CfvNet::<TrainBackend>::new(
+        let mut model = CfvNet::<TrainBackend>::new(
             &device,
             rebel_config.training.hidden_layers,
             rebel_config.training.hidden_size,
             cfvnet::model::network::INPUT_SIZE,
         );
+
+        // Load weights from checkpoint if available
+        let recorder = burn::record::NamedMpkGzFileRecorder::<
+            burn::record::FullPrecisionSettings,
+        >::new();
+        let model_file = model_path.join("model");
+        if model_file.with_extension("mpk.gz").exists() {
+            match model.clone().load_file(&model_file, &recorder, &device) {
+                Ok(loaded) => {
+                    model = loaded;
+                    eprintln!("  Loaded model from {}", model_file.display());
+                }
+                Err(e) => {
+                    eprintln!("  Warning: failed to load model, using random init: {e}");
+                }
+            }
+        } else {
+            eprintln!("  No checkpoint found at {}, using random init", model_file.display());
+        }
         eprintln!(
-            "  Created CfvNet: {} layers x {} hidden (random init, checkpoint loading is a follow-up)",
+            "  CfvNet: {} layers x {} hidden",
             rebel_config.training.hidden_layers, rebel_config.training.hidden_size,
         );
 
