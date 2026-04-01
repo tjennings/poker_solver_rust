@@ -266,7 +266,7 @@ fn build_turn_game_inner(
 
     let action_tree = ActionTree::new(tree_config).expect("valid action tree");
     let mut game = PostFlopGame::with_config(card_config, action_tree).expect("valid game");
-    game.allocate_memory(false);
+    game.allocate_memory(true); // compressed (16-bit) storage to reduce memory ~4x
     use std::sync::atomic::{AtomicBool, Ordering as AO};
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if !LOGGED.swap(true, AO::Relaxed) {
