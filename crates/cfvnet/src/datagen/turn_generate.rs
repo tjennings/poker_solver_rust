@@ -31,6 +31,7 @@ use range_solver::bet_size::{BetSize, BetSizeOptions};
 use range_solver::card::{card_pair_to_index, CardConfig, NOT_DEALT};
 use range_solver::game::PostFlopGame;
 use range_solver::range::Range as RsRange;
+use range_solver::solve;
 use range_solver::solve_step;
 use rayon::prelude::*;
 
@@ -316,15 +317,10 @@ fn solve_and_extract(
     solver_iterations: u32,
     target_exploitability: f32,
 ) -> ([f32; NUM_COMBOS], [f32; NUM_COMBOS], [u8; NUM_COMBOS], f32, f32, f32) {
-    // Use solve_step directly to skip exploitability computation every 10 iterations.
-    // For datagen, we run to a fixed iteration count — no early exit needed.
-    let _ = target_exploitability;
-    for t in 0..solver_iterations {
-        solve_step(game, t);
-    }
-
-    range_solver::finalize(game);
-    let exploit = 0.0f32; // Caller computes exploitability selectively.
+    // Use solve() with early exit at target exploitability.
+    // This checks exploitability every 10 iterations and exits early when converged.
+    let abs_target = target_exploitability * pot as f32;
+    let exploit = solve(game, solver_iterations, abs_target, false);
 
     game.back_to_root();
     game.cache_normalized_weights();
