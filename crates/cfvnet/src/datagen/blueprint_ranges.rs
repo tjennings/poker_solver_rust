@@ -145,6 +145,10 @@ impl BlueprintRangeGenerator {
         })
     }
 
+    pub fn strategy(&self) -> &BlueprintV2Strategy { &self.strategy }
+    pub fn tree(&self) -> &GameTree { &self.tree }
+    pub fn decision_map(&self) -> &[u32] { &self.decision_map }
+
     /// Sample turn entry ranges by walking ONE random action path through
     /// preflop and flop, weighted by the blueprint's average strategy.
     ///
@@ -306,6 +310,16 @@ impl BlueprintRangeGenerator {
                             );
                             weights_mut[ci] *= p;
                         }
+                    }
+
+                    // Log the first few propagation steps.
+                    use std::sync::atomic::{AtomicU32, Ordering as AO};
+                    static LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+                    let lc = LOG_COUNT.fetch_add(1, AO::Relaxed);
+                    if lc < 20 {
+                        let oop_nz = oop_weights.iter().filter(|&&w| w > 0.01).count();
+                        let ip_nz = ip_weights.iter().filter(|&&w| w > 0.01).count();
+                        eprintln!("[propagate] street={street:?} player={player} action={chosen}/{num_actions} oop_nz={oop_nz} ip_nz={ip_nz}");
                     }
 
                     node_idx = children[chosen];

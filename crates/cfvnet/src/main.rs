@@ -497,44 +497,36 @@ fn cmd_bench_solve(config_path: PathBuf, num_samples: u64, threads: usize) {
 fn cmd_precompute_ranges(
     blueprint: PathBuf,
     output: PathBuf,
-    samples_per_bucket: usize,
-    spr_boundaries_str: &str,
-    initial_stack: i32,
+    _samples_per_bucket: usize,
+    _spr_boundaries_str: &str,
+    _initial_stack: i32,
 ) {
     use cfvnet::datagen::blueprint_ranges::BlueprintRangeGenerator;
-    use cfvnet::datagen::precompute_ranges::{parse_spr_boundaries, precompute_turn_ranges};
+    use cfvnet::datagen::precompute_ranges::compute_preflop_paths;
 
     let generator = BlueprintRangeGenerator::load(&blueprint).unwrap_or_else(|e| {
         eprintln!("Failed to load blueprint: {e}");
         std::process::exit(1);
     });
 
-    let boundaries = parse_spr_boundaries(spr_boundaries_str);
-    if boundaries.len() < 2 {
-        eprintln!("Need at least 2 SPR boundaries to define a bucket, got {}", boundaries.len());
-        std::process::exit(1);
-    }
+    println!("Computing preflop paths to flop...");
 
-    println!(
-        "Precomputing turn ranges: {} SPR buckets, {} samples/bucket, initial_stack={}",
-        boundaries.len() - 1,
-        samples_per_bucket,
-        initial_stack,
+    let ranges = compute_preflop_paths(
+        generator.strategy(),
+        generator.tree(),
+        generator.decision_map(),
     );
 
-    let ranges = precompute_turn_ranges(&generator, &boundaries, samples_per_bucket, initial_stack);
     ranges.save(&output).unwrap_or_else(|e| {
         eprintln!("Failed to save: {e}");
         std::process::exit(1);
     });
 
-    println!("Saved precomputed ranges to {}", output.display());
-    for bucket in &ranges.buckets {
-        let oop_nz = bucket.oop_range.iter().filter(|&&w| w > 0.01).count();
-        let ip_nz = bucket.ip_range.iter().filter(|&&w| w > 0.01).count();
+    println!("Saved {} preflop paths to {}", ranges.paths.len(), output.display());
+    for path in &ranges.paths {
         println!(
-            "  SPR [{:.1}, {:.1}): {} samples, OOP ~{} combos, IP ~{} combos",
-            bucket.spr_low, bucket.spr_high, bucket.sample_count, oop_nz, ip_nz
+            "  {:<40} freq={:.4}  OOP ~{} combos, IP ~{} combos",
+            path.label, path.frequency, path.oop_nonzero, path.ip_nonzero
         );
     }
 }
