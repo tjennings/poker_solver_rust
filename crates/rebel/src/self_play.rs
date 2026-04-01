@@ -521,8 +521,8 @@ pub fn self_play_training_loop(
         total_examples.fetch_add(examples.len(), std::sync::atomic::Ordering::Relaxed);
         let done = hands_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
-        // Progress logging every 100 hands.
-        if done % 100 == 0 {
+        // Progress logging every hand (self-play hands are slow).
+        if done % 1 == 0 {
             let elapsed = start.elapsed().as_secs_f64();
             let rate = done as f64 / elapsed;
             let remaining = (sp_config.num_hands - done) as f64 / rate;

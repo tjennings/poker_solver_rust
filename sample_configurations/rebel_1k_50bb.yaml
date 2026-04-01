@@ -11,8 +11,8 @@ seed:
   num_hands: 500000
   seed: 42
   threads: 16
-  solver_iterations: 1024
-  target_exploitability: 0.005
+  solver_iterations: 512
+  target_exploitability: 0.01
   bet_sizes:
     # Match the blueprint's postflop bet sizes (pot fractions)
     flop:
@@ -37,9 +37,9 @@ buffer:
   path: "rebel_buffer.bin"
 
 inference:
-  batch_size: 256
-  batch_timeout_us: 100
-  train_every_n_solves: 50
-  train_batch_size: 512
+  batch_size: 512
+  batch_timeout_us: 50
+  train_every_n_solves: 10
+  train_batch_size: 4096
   replay_capacity: 200000
   learning_rate: 0.0003
