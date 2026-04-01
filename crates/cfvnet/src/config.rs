@@ -145,6 +145,9 @@ pub struct DatagenConfig {
     /// Which street to generate data for: "river" (default), "turn", or "flop".
     #[serde(default = "default_street")]
     pub street: String,
+    /// Datagen mode: "model" uses river neural net at boundaries, "exact" solves to showdown.
+    #[serde(default = "default_datagen_mode")]
+    pub mode: String,
     #[serde(default = "default_pot_intervals")]
     pub pot_intervals: Vec<[i32; 2]>,
     #[serde(default)]
@@ -161,6 +164,10 @@ pub struct DatagenConfig {
     /// E.g. 1000 means evaluate at iteration 1, 1000, 2000, ... and the final iteration.
     #[serde(default)]
     pub leaf_eval_interval: u32,
+    /// Per-deal bet size perturbation. Each bet size is multiplied by
+    /// `1.0 + uniform(-fuzz, +fuzz)`. Default 0.0 (no fuzzing).
+    #[serde(default)]
+    pub bet_size_fuzz: f64,
 }
 
 impl Default for DatagenConfig {
@@ -168,6 +175,7 @@ impl Default for DatagenConfig {
         Self {
             num_samples: 1000,
             street: default_street(),
+            mode: default_datagen_mode(),
             pot_intervals: default_pot_intervals(),
             spr_intervals: None,
             solver_iterations: 1000,
@@ -175,8 +183,13 @@ impl Default for DatagenConfig {
             threads: 8,
             seed: Some(42),
             leaf_eval_interval: 0,
+            bet_size_fuzz: 0.0,
         }
     }
+}
+
+fn default_datagen_mode() -> String {
+    "model".into()
 }
 
 fn default_street() -> String {
@@ -486,5 +499,58 @@ datagen:
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.training.shuffle_buffer_size, 262_144);
         assert_eq!(config.training.prefetch_depth, 4);
+    }
+
+    #[test]
+    fn datagen_mode_defaults_to_model() {
+        let config = DatagenConfig::default();
+        assert_eq!(config.mode, "model");
+    }
+
+    #[test]
+    fn datagen_bet_size_fuzz_defaults_to_zero() {
+        let config = DatagenConfig::default();
+        assert!((config.bet_size_fuzz - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn parse_config_with_exact_mode() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  mode: "exact"
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.datagen.mode, "exact");
+    }
+
+    #[test]
+    fn parse_config_with_bet_size_fuzz() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  bet_size_fuzz: 0.10
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!((config.datagen.bet_size_fuzz - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_config_without_mode_defaults_to_model() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.datagen.mode, "model");
     }
 }

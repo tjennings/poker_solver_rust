@@ -23,6 +23,7 @@ use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 use indicatif::{ProgressBar, ProgressStyle};
 use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::poker::{Card, Suit, Value};
+use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
@@ -204,15 +205,21 @@ fn evaluate_game_boundaries(
     }
 }
 
-/// Build a depth-limited turn game tree for a situation.
+/// Build a turn game tree for a situation.
+///
+/// When `exact` is false (model mode): uses `depth_limit: Some(0)` to create boundary
+/// nodes at the river transition, with empty river bet sizes.
+/// When `exact` is true: uses `depth_limit: None` so the tree extends through the
+/// river to showdown, with river bet sizes matching turn sizes.
 ///
 /// Returns `None` for degenerate situations (effective_stack <= 0, or game construction fails).
-fn build_turn_game(
+fn build_turn_game_inner(
     board_u8: &[u8],
     pot: f64,
     effective_stack: f64,
     ranges: &[[f32; NUM_COMBOS]; 2],
     bet_sizes: &[Vec<f64>],
+    exact: bool,
 ) -> Option<PostFlopGame> {
     let oop_range = RsRange::from_raw_data(&ranges[0]).expect("valid OOP range");
     let ip_range = RsRange::from_raw_data(&ranges[1]).expect("valid IP range");
@@ -237,13 +244,19 @@ fn build_turn_game(
         river: NOT_DEALT,
     };
 
+    let (river_bet_sizes, depth_limit) = if exact {
+        ([bet_size_opts.clone(), bet_size_opts.clone()], None)
+    } else {
+        ([BetSizeOptions::default(), BetSizeOptions::default()], Some(0))
+    };
+
     let tree_config = TreeConfig {
         initial_state: BoardState::Turn,
         starting_pot: pot as i32,
         effective_stack: effective_stack as i32,
         turn_bet_sizes: [bet_size_opts.clone(), bet_size_opts],
-        river_bet_sizes: [BetSizeOptions::default(), BetSizeOptions::default()],
-        depth_limit: Some(0),
+        river_bet_sizes,
+        depth_limit,
         add_allin_threshold: 0.0,
         force_allin_threshold: 0.0,
         merging_threshold: 0.0,
@@ -254,6 +267,44 @@ fn build_turn_game(
     let mut game = PostFlopGame::with_config(card_config, action_tree).expect("valid game");
     game.allocate_memory(false);
     Some(game)
+}
+
+/// Build a depth-limited turn game tree (model mode, with boundary nodes at river).
+fn build_turn_game(
+    board_u8: &[u8],
+    pot: f64,
+    effective_stack: f64,
+    ranges: &[[f32; NUM_COMBOS]; 2],
+    bet_sizes: &[Vec<f64>],
+) -> Option<PostFlopGame> {
+    build_turn_game_inner(board_u8, pot, effective_stack, ranges, bet_sizes, false)
+}
+
+/// Build a full turn+river game tree (exact mode, no boundaries).
+fn build_turn_game_exact(
+    board_u8: &[u8],
+    pot: f64,
+    effective_stack: f64,
+    ranges: &[[f32; NUM_COMBOS]; 2],
+    bet_sizes: &[Vec<f64>],
+) -> Option<PostFlopGame> {
+    build_turn_game_inner(board_u8, pot, effective_stack, ranges, bet_sizes, true)
+}
+
+/// Perturb bet sizes by multiplying each by `1.0 + uniform(-fuzz, +fuzz)`.
+///
+/// Returns the original sizes unchanged if `fuzz <= 0.0`.
+/// Each fuzzed value is clamped to a minimum of 0.01 to avoid non-positive sizes.
+fn fuzz_bet_sizes(bet_sizes: &[Vec<f64>], fuzz: f64, rng: &mut impl Rng) -> Vec<Vec<f64>> {
+    if fuzz <= 0.0 {
+        return bet_sizes.to_vec();
+    }
+    bet_sizes.iter().map(|depth| {
+        depth.iter().map(|&size| {
+            let perturbation = 1.0 + rng.gen_range(-fuzz..fuzz);
+            (size * perturbation).max(0.01)
+        }).collect()
+    }).collect()
 }
 
 /// Solve a game with boundaries already set. Returns 1326-indexed CFVs + exploitability.
@@ -643,6 +694,212 @@ fn generate_turn_training_data_cuda(
     Ok(())
 }
 
+/// Generate turn training data in exact mode (no neural net).
+///
+/// Uses a 2-stage pipeline: Stage 1 builds full turn+river trees (depth_limit: None),
+/// and Stage 3 solves them to showdown. No GPU inference stage is needed.
+fn generate_turn_training_data_exact(
+    config: &CfvnetConfig,
+    output_path: &Path,
+) -> Result<(), String> {
+    let num_samples = config.datagen.num_samples;
+    let seed = crate::config::resolve_seed(config.datagen.seed);
+    let threads = config.datagen.threads;
+    let solver_iterations = config.datagen.solver_iterations;
+    let target_exploitability = config.datagen.target_exploitability as f32;
+    let bet_sizes_f64 = parse_bet_sizes_all(&config.game.bet_sizes);
+    if bet_sizes_f64.is_empty() {
+        return Err("no valid percentage bet sizes found in config".into());
+    }
+    let bet_sizes_vec = bet_sizes_f64;
+    let initial_stack = config.game.initial_stack;
+    let bet_size_fuzz = config.datagen.bet_size_fuzz;
+
+    eprintln!("[turn datagen] exact mode: solving turn+river to showdown (no neural net)");
+
+    let pb = Arc::new(ProgressBar::new(num_samples));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
+            .expect("valid progress bar template"),
+    );
+
+    let stage1_count_for_pb = Arc::new(AtomicU64::new(0));
+    let stage3_count_for_pb = Arc::new(AtomicU64::new(0));
+    let s1_pb = Arc::clone(&stage1_count_for_pb);
+    let s3_pb = Arc::clone(&stage3_count_for_pb);
+    let exploit_sum_pb = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let exploit_count_pb = Arc::new(AtomicU64::new(0));
+    let es_pb = Arc::clone(&exploit_sum_pb);
+    let ec_pb = Arc::clone(&exploit_count_pb);
+    let pb_ticker = Arc::clone(&pb);
+    let ticker = std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let s1 = s1_pb.load(Ordering::Relaxed);
+            let s3 = s3_pb.load(Ordering::Relaxed);
+            let buf = s1.saturating_sub(s3);
+            let ec = ec_pb.load(Ordering::Relaxed);
+            let avg_exploit = if ec > 0 {
+                (es_pb.load(Ordering::Relaxed) as f64 / 100.0) / ec as f64
+            } else {
+                0.0
+            };
+            pb_ticker.set_message(format!("deal→[{buf}]→solve  expl:{avg_exploit:.1} mbb/h"));
+            if pb_ticker.is_finished() {
+                break;
+            }
+        }
+    });
+
+    let file =
+        std::fs::File::create(output_path).map_err(|e| format!("create output: {e}"))?;
+    let writer = Arc::new(Mutex::new(BufWriter::new(file)));
+
+    let stage1_count = Arc::clone(&stage1_count_for_pb);
+    let stage3_count = Arc::clone(&stage3_count_for_pb);
+
+    let wall_start = std::time::Instant::now();
+
+    // Single channel: Stage 1 -> Stage 3 (no GPU stage).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Situation, PostFlopGame)>(
+        PIPELINE_CHANNEL_CAPACITY,
+    );
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max(1))
+        .build()
+        .map_err(|e| format!("thread pool: {e}"))?;
+
+    // --- Stage 1: Deal Generator (exact mode) ---
+    let datagen_config = config.datagen.clone();
+    let bet_sizes_for_stage1 = bet_sizes_vec;
+    let stage1_count_ref = Arc::clone(&stage1_count);
+    let stage1 = std::thread::spawn(move || {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        for _ in 0..num_samples {
+            let sit = sample_situation(&datagen_config, initial_stack, 4, &mut rng);
+            if sit.effective_stack <= 0 {
+                stage1_count_ref.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let sizes = fuzz_bet_sizes(&bet_sizes_for_stage1, bet_size_fuzz, &mut rng);
+            let game = build_turn_game_exact(
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &sizes,
+            );
+            if let Some(game) = game {
+                stage1_count_ref.fetch_add(1, Ordering::Relaxed);
+                if tx.send((sit, game)).is_err() {
+                    break;
+                }
+            } else {
+                stage1_count_ref.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+
+    // --- Stage 3: DCFR Solvers (no Stage 2 in exact mode) ---
+    let pb_ref = Arc::clone(&pb);
+    let writer_ref = Arc::clone(&writer);
+    let stage3_count_ref = Arc::clone(&stage3_count);
+    let exploit_sum_ref = Arc::clone(&exploit_sum_pb);
+    let exploit_count_ref = Arc::clone(&exploit_count_pb);
+    let stage3 = std::thread::spawn(move || -> Result<(), String> {
+        let mut batch: Vec<(Situation, PostFlopGame)> = Vec::with_capacity(SOLVE_BATCH_SIZE);
+
+        loop {
+            match rx.recv() {
+                Ok(item) => batch.push(item),
+                Err(_) => break,
+            }
+            while batch.len() < SOLVE_BATCH_SIZE {
+                match rx.try_recv() {
+                    Ok(item) => batch.push(item),
+                    Err(_) => break,
+                }
+            }
+
+            let results: Vec<_> = pool.install(|| {
+                batch
+                    .par_drain(..)
+                    .map(|(sit, mut game)| {
+                        let pot = f64::from(sit.pot);
+                        let result = solve_and_extract(
+                            &mut game,
+                            pot,
+                            &sit.ranges,
+                            solver_iterations,
+                            target_exploitability,
+                        );
+                        let count = stage3_count_ref.fetch_add(1, Ordering::Relaxed);
+                        if count % 100 == 0 {
+                            let exploit = range_solver::compute_exploitability(&game);
+                            let bb = initial_stack as f32 / 100.0;
+                            let exploit_mbb = if bb > 0.0 { exploit / bb * 1000.0 } else { 0.0 };
+                            exploit_sum_ref.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
+                            exploit_count_ref.fetch_add(1, Ordering::Relaxed);
+                        }
+                        pb_ref.inc(1);
+                        (sit, result)
+                    })
+                    .collect()
+            });
+
+            let mut w = writer_ref.lock().expect("writer lock");
+            for (sit, (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _exploit)) in results {
+                let board_vec = sit.board_cards().to_vec();
+
+                let oop_rec = TrainingRecord {
+                    board: board_vec.clone(),
+                    pot: sit.pot as f32,
+                    effective_stack: sit.effective_stack as f32,
+                    player: 0,
+                    game_value: oop_gv,
+                    oop_range: sit.ranges[0],
+                    ip_range: sit.ranges[1],
+                    cfvs: oop_cfvs,
+                    valid_mask,
+                };
+                write_record(&mut *w, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
+
+                let ip_rec = TrainingRecord {
+                    board: board_vec,
+                    pot: sit.pot as f32,
+                    effective_stack: sit.effective_stack as f32,
+                    player: 1,
+                    game_value: ip_gv,
+                    oop_range: sit.ranges[0],
+                    ip_range: sit.ranges[1],
+                    cfvs: ip_cfvs,
+                    valid_mask,
+                };
+                write_record(&mut *w, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
+            }
+        }
+
+        Ok(())
+    });
+
+    stage1.join().map_err(|e| format!("stage 1 panicked: {e:?}"))?;
+    stage3.join().map_err(|e| format!("stage 3 panicked: {e:?}"))??;
+
+    pb.finish_with_message("done");
+    let _ = ticker.join();
+
+    let wall_secs = wall_start.elapsed().as_secs_f64();
+    let s1 = stage1_count.load(Ordering::Relaxed);
+    let s3 = stage3_count.load(Ordering::Relaxed);
+    eprintln!("Stage 1 (deal gen):   {s1} items in {wall_secs:.1}s ({:.1}/s)", s1 as f64 / wall_secs);
+    eprintln!("Stage 3 (DCFR solve): {s3} items in {wall_secs:.1}s ({:.1}/s)", s3 as f64 / wall_secs);
+    eprintln!("Total wall time: {wall_secs:.1}s ({:.1} samples/sec)", num_samples as f64 / wall_secs);
+
+    Ok(())
+}
+
 /// Generate turn training data using a 3-stage producer-consumer pipeline.
 ///
 /// Stage 1 (deal generator): samples situations and builds game trees.
@@ -660,6 +917,12 @@ pub fn generate_turn_training_data(
     output_path: &Path,
     backend: &str,
 ) -> Result<(), String> {
+    let exact_mode = config.datagen.mode == "exact";
+
+    if exact_mode {
+        return generate_turn_training_data_exact(config, output_path);
+    }
+
     match backend {
         #[cfg(feature = "cuda")]
         "cuda" => return generate_turn_training_data_cuda(config, output_path),
@@ -791,6 +1054,7 @@ pub fn generate_turn_training_data(
     let datagen_config = config.datagen.clone();
     let initial_stack = config.game.initial_stack;
     let bet_sizes_for_stage1 = bet_sizes_vec.clone();
+    let bet_size_fuzz = config.datagen.bet_size_fuzz;
     let stage1_count_ref = Arc::clone(&stage1_count);
     let stage1 = std::thread::spawn(move || {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -800,12 +1064,13 @@ pub fn generate_turn_training_data(
                 stage1_count_ref.fetch_add(1, Ordering::Relaxed);
                 continue; // Skip degenerate situations.
             }
+            let sizes = fuzz_bet_sizes(&bet_sizes_for_stage1, bet_size_fuzz, &mut rng);
             let game = build_turn_game(
                 sit.board_cards(),
                 f64::from(sit.pot),
                 f64::from(sit.effective_stack),
                 &sit.ranges,
-                &bet_sizes_for_stage1,
+                &sizes,
             );
             if let Some(game) = game {
                 stage1_count_ref.fetch_add(1, Ordering::Relaxed);
@@ -1377,5 +1642,154 @@ mod tests {
         assert_eq!(rec1.player, 1);
         assert!(rec0.pot > 0.0);
         assert!(rec0.effective_stack > 0.0);
+    }
+
+    #[test]
+    fn fuzz_bet_sizes_zero_fuzz_returns_identical() {
+        let sizes = vec![vec![0.5, 1.0], vec![0.75]];
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let result = fuzz_bet_sizes(&sizes, 0.0, &mut rng);
+        assert_eq!(result, sizes);
+    }
+
+    #[test]
+    fn fuzz_bet_sizes_negative_fuzz_returns_identical() {
+        let sizes = vec![vec![0.5, 1.0]];
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let result = fuzz_bet_sizes(&sizes, -0.1, &mut rng);
+        assert_eq!(result, sizes);
+    }
+
+    #[test]
+    fn fuzz_bet_sizes_produces_different_values() {
+        let sizes = vec![vec![0.5, 1.0]];
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let result1 = fuzz_bet_sizes(&sizes, 0.1, &mut rng);
+        let result2 = fuzz_bet_sizes(&sizes, 0.1, &mut rng);
+        // With different rng state, results should differ.
+        assert_ne!(result1, result2, "two fuzz calls should produce different sizes");
+    }
+
+    #[test]
+    fn fuzz_bet_sizes_values_within_expected_range() {
+        let sizes = vec![vec![0.5, 1.0]];
+        let fuzz = 0.1;
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        for _ in 0..100 {
+            let result = fuzz_bet_sizes(&sizes, fuzz, &mut rng);
+            for (depth_idx, depth) in result.iter().enumerate() {
+                for (size_idx, &val) in depth.iter().enumerate() {
+                    let original = sizes[depth_idx][size_idx];
+                    // Value should be within [original * 0.9, original * 1.1]
+                    assert!(val >= original * (1.0 - fuzz) - 1e-9,
+                        "fuzzed {val} below min for original {original}");
+                    assert!(val <= original * (1.0 + fuzz) + 1e-9,
+                        "fuzzed {val} above max for original {original}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_bet_sizes_clamps_to_minimum() {
+        // Very small bet size with large fuzz should not go below 0.01.
+        let sizes = vec![vec![0.01]];
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        for _ in 0..100 {
+            let result = fuzz_bet_sizes(&sizes, 0.99, &mut rng);
+            assert!(result[0][0] >= 0.01,
+                "fuzzed size {} below 0.01 minimum", result[0][0]);
+        }
+    }
+
+    #[test]
+    fn fuzz_bet_sizes_preserves_structure() {
+        let sizes = vec![vec![0.25, 0.5, 1.0], vec![0.75, 1.5]];
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let result = fuzz_bet_sizes(&sizes, 0.1, &mut rng);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].len(), 3);
+        assert_eq!(result[1].len(), 2);
+    }
+
+    #[test]
+    fn build_turn_game_exact_has_no_boundaries() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            ..Default::default()
+        };
+        let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+        if sit.effective_stack <= 0 {
+            return;
+        }
+        let bet_sizes_f64 = parse_bet_sizes_depth(&["50%".into(), "a".into()]);
+        let game = build_turn_game_exact(
+            sit.board_cards(),
+            f64::from(sit.pot),
+            f64::from(sit.effective_stack),
+            &sit.ranges,
+            &[bet_sizes_f64],
+        )
+        .expect("game should be built");
+        assert_eq!(game.num_boundary_nodes(), 0,
+            "exact mode game should have no boundary nodes");
+    }
+
+    #[test]
+    fn exact_mode_solve_produces_finite_cfvs() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            ..Default::default()
+        };
+        let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+        if sit.effective_stack <= 0 {
+            return;
+        }
+        let bet_sizes_f64 = parse_bet_sizes_depth(&["50%".into(), "a".into()]);
+        let mut game = build_turn_game_exact(
+            sit.board_cards(),
+            f64::from(sit.pot),
+            f64::from(sit.effective_stack),
+            &sit.ranges,
+            &[bet_sizes_f64],
+        )
+        .expect("game should be built");
+
+        // No boundary evaluation needed — solve directly.
+        let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _exploit) = solve_and_extract(
+            &mut game,
+            f64::from(sit.pot),
+            &sit.ranges,
+            50,
+            0.0,
+        );
+
+        let num_valid: usize = valid_mask.iter().map(|&v| v as usize).sum();
+        assert!(num_valid > 0, "expected some valid combos in exact mode");
+
+        for (i, &cfv) in oop_cfvs.iter().enumerate() {
+            assert!(cfv.is_finite(), "exact OOP combo {i}: non-finite CFV {cfv}");
+        }
+        for (i, &cfv) in ip_cfvs.iter().enumerate() {
+            assert!(cfv.is_finite(), "exact IP combo {i}: non-finite CFV {cfv}");
+        }
+        assert!(oop_gv.is_finite(), "exact OOP game value not finite");
+        assert!(ip_gv.is_finite(), "exact IP game value not finite");
+    }
+
+    #[test]
+    fn generate_turn_exact_mode_skips_river_model() {
+        // In exact mode, river_model_path is not needed.
+        let mut config = turn_test_config(1);
+        config.datagen.mode = "exact".into();
+        config.game.river_model_path = None;
+        let output = NamedTempFile::new().unwrap();
+        let result = generate_turn_training_data(&config, output.path(), "ndarray");
+        // Should NOT error about river_model_path.
+        assert!(result.is_ok(), "exact mode should not require river_model_path: {:?}", result.err());
     }
 }

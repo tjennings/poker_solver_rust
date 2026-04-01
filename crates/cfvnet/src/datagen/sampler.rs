@@ -169,6 +169,7 @@ mod tests {
         DatagenConfig {
             num_samples: 100,
             street: "river".into(),
+            mode: "model".into(),
             pot_intervals: vec![[4, 20], [20, 80], [80, 200], [200, 400]],
             spr_intervals: None,
             solver_iterations: 100,
@@ -176,6 +177,7 @@ mod tests {
             threads: 1,
             seed: Some(42),
             leaf_eval_interval: 0,
+            bet_size_fuzz: 0.0,
         }
     }
 
