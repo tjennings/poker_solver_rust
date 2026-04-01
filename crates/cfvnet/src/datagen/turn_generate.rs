@@ -921,7 +921,37 @@ fn generate_turn_training_data_exact(
     let per_file = config.datagen.per_file.unwrap_or(u64::MAX);
     let extract_river = river_output_path.is_some();
 
+    // Load precomputed blueprint ranges if configured.
+    let precomputed_ranges = if let Some(ref bp) = config.datagen.blueprint_path {
+        let bp_path = Path::new(bp);
+        // Check if it's a .bin file (precomputed) or a bundle dir (compute on the fly)
+        if bp_path.extension().map_or(false, |e| e == "bin") {
+            let ranges = super::precompute_ranges::PrecomputedRanges::load(bp_path)
+                .map_err(|e| format!("load precomputed ranges: {e}"))?;
+            eprintln!("[turn datagen] loaded {} precomputed range paths from {}", ranges.paths.len(), bp);
+            Some(ranges)
+        } else {
+            // It's a blueprint bundle dir — compute paths on the fly
+            let bp_gen = super::blueprint_ranges::BlueprintRangeGenerator::load(bp_path)
+                .map_err(|e| format!("load blueprint: {e}"))?;
+            let ranges = super::precompute_ranges::compute_preflop_paths(
+                bp_gen.strategy(), bp_gen.tree(), bp_gen.decision_map(),
+            );
+            eprintln!("[turn datagen] computed {} preflop paths from blueprint", ranges.paths.len());
+            for path in &ranges.paths {
+                eprintln!("  {:<40} freq={:.4}  OOP ~{} combos, IP ~{} combos",
+                    path.label, path.frequency, path.oop_nonzero, path.ip_nonzero);
+            }
+            Some(ranges)
+        }
+    } else {
+        None
+    };
+
     eprintln!("[turn datagen] exact mode: solving turn+river to showdown (no neural net)");
+    if precomputed_ranges.is_some() {
+        eprintln!("[turn datagen] using blueprint ranges instead of RSP");
+    }
     if let Some(rp) = river_output_path {
         eprintln!("[turn datagen] river records will be extracted to: {}", rp.display());
     }
@@ -996,7 +1026,13 @@ fn generate_turn_training_data_exact(
     let stage1 = std::thread::spawn(move || {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         for _ in 0..num_samples {
-            let sit = sample_situation(&datagen_config, initial_stack, 4, &mut rng);
+            let sit = if let Some(ref precomp) = precomputed_ranges {
+                super::sampler::sample_situation_with_blueprint(
+                    &datagen_config, initial_stack, 4, precomp, &mut rng,
+                )
+            } else {
+                sample_situation(&datagen_config, initial_stack, 4, &mut rng)
+            };
             if sit.effective_stack <= 0 {
                 stage1_count_ref.fetch_add(1, Ordering::Relaxed);
                 continue;

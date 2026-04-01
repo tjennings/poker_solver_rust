@@ -1,6 +1,7 @@
 use rand::Rng;
 
 use crate::config::DatagenConfig;
+use super::precompute_ranges::PrecomputedRanges;
 use super::range_gen::{compute_hand_strengths, generate_rsp_range_with_strengths, NUM_COMBOS};
 
 /// A single training situation before solving.
@@ -48,6 +49,51 @@ pub fn sample_situation<R: Rng>(
     let strengths = compute_hand_strengths(&board[..board_size]);
     let oop_range = generate_rsp_range_with_strengths(&strengths, rng);
     let ip_range = generate_rsp_range_with_strengths(&strengths, rng);
+    Situation {
+        board,
+        board_size,
+        pot,
+        effective_stack,
+        ranges: [oop_range, ip_range],
+    }
+}
+
+/// Sample a situation using precomputed blueprint ranges.
+///
+/// Picks a random preflop path weighted by frequency, uses those ranges
+/// instead of random RSP. Board and pot/stack are still randomly sampled.
+pub fn sample_situation_with_blueprint<R: Rng>(
+    config: &DatagenConfig,
+    initial_stack: i32,
+    board_size: usize,
+    precomputed: &PrecomputedRanges,
+    rng: &mut R,
+) -> Situation {
+    let board = sample_board(board_size, rng);
+    let (pot, effective_stack) = if let Some(ref spr_intervals) = config.spr_intervals {
+        sample_pot_stack_by_spr(&config.pot_intervals, spr_intervals, initial_stack, rng)
+    } else {
+        let pot = sample_pot(&config.pot_intervals, rng);
+        let max_stack = initial_stack - pot / 2;
+        let effective_stack = if max_stack < 5 { 5 } else { rng.gen_range(5..=max_stack) };
+        (pot, effective_stack)
+    };
+
+    let (oop_range, ip_range) = if let Some(path) = precomputed.sample(rng) {
+        let mut oop = [0.0f32; NUM_COMBOS];
+        let mut ip = [0.0f32; NUM_COMBOS];
+        let n = path.oop_range.len().min(NUM_COMBOS);
+        oop[..n].copy_from_slice(&path.oop_range[..n]);
+        ip[..n].copy_from_slice(&path.ip_range[..n]);
+        (oop, ip)
+    } else {
+        // Fallback to RSP if no precomputed paths available.
+        let strengths = compute_hand_strengths(&board[..board_size]);
+        let oop = generate_rsp_range_with_strengths(&strengths, rng);
+        let ip = generate_rsp_range_with_strengths(&strengths, rng);
+        (oop, ip)
+    };
+
     Situation {
         board,
         board_size,
