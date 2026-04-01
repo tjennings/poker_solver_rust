@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use rand::Rng;
 use rand::SeedableRng;
+use rayon::prelude::*;
 
 use crate::blueprint_sampler::{deal_hand, play_preflop_under_blueprint};
 use crate::inference_server::InferenceHandle;
@@ -488,14 +489,20 @@ pub fn self_play_training_loop(
     buckets: &AllBuckets,
     replay_buffer: &Arc<ReplayBuffer>,
 ) -> usize {
-    let mut total_examples = 0usize;
-    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(sp_config.seed);
+    let total_examples = std::sync::atomic::AtomicUsize::new(0);
+    let hands_done = std::sync::atomic::AtomicUsize::new(0);
     let start = std::time::Instant::now();
 
-    eprintln!("Starting self-play: {} hands, {} CFR iters/solve",
+    eprintln!("Starting self-play: {} hands, {} CFR iters/solve, parallel workers",
         sp_config.num_hands, sp_config.cfr_iterations);
 
-    for hand_idx in 0..sp_config.num_hands {
+    // Parallel self-play: each thread gets its own RNG seeded deterministically.
+    // All threads share the inference handle (which batches GPU calls).
+    (0..sp_config.num_hands).into_par_iter().for_each(|hand_idx| {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
+            sp_config.seed.wrapping_add(hand_idx as u64),
+        );
+
         let examples = play_self_play_hand(
             handle, solve_config, sp_config,
             strategy, tree, buckets,
@@ -511,26 +518,28 @@ pub fn self_play_training_loop(
             }
         }
         handle.notify_solve_complete();
-        total_examples += examples.len();
+        total_examples.fetch_add(examples.len(), std::sync::atomic::Ordering::Relaxed);
+        let done = hands_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
-        // Progress logging every 10 hands.
-        if (hand_idx + 1) % 10 == 0 {
+        // Progress logging every 100 hands.
+        if done % 100 == 0 {
             let elapsed = start.elapsed().as_secs_f64();
-            let rate = (hand_idx + 1) as f64 / elapsed;
-            let remaining = (sp_config.num_hands - hand_idx - 1) as f64 / rate;
+            let rate = done as f64 / elapsed;
+            let remaining = (sp_config.num_hands - done) as f64 / rate;
+            let examples_so_far = total_examples.load(std::sync::atomic::Ordering::Relaxed);
             eprintln!(
                 "Self-play: {}/{} hands, {} examples, {:.1} hands/s, buffer={}, eta {:.0}s",
-                hand_idx + 1,
+                done,
                 sp_config.num_hands,
-                total_examples,
+                examples_so_far,
                 rate,
                 replay_buffer.len(),
                 remaining,
             );
         }
-    }
+    });
 
-    total_examples
+    total_examples.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
