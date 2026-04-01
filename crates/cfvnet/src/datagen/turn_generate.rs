@@ -713,19 +713,36 @@ pub fn generate_turn_training_data(
     }
     let bet_sizes_vec = vec![bet_sizes_f64];
 
-    // Load river model.
+    // Load river model's config to get its architecture (may differ from turn config).
+    let river_model_dir = std::path::Path::new(river_model_path)
+        .parent()
+        .ok_or("river_model_path has no parent directory")?;
+    let river_config_path = river_model_dir.join("config.yaml");
+    let (river_hidden_layers, river_hidden_size) = if river_config_path.exists() {
+        let river_yaml = std::fs::read_to_string(&river_config_path)
+            .map_err(|e| format!("read river config: {e}"))?;
+        let river_cfg: CfvnetConfig = serde_yaml::from_str(&river_yaml)
+            .map_err(|e| format!("parse river config: {e}"))?;
+        eprintln!("[turn datagen] river model architecture: {}×{} (from {})",
+            river_cfg.training.hidden_layers, river_cfg.training.hidden_size,
+            river_config_path.display());
+        (river_cfg.training.hidden_layers, river_cfg.training.hidden_size)
+    } else {
+        eprintln!("[turn datagen] warning: no river config.yaml found, using turn config architecture");
+        (config.training.hidden_layers, config.training.hidden_size)
+    };
+
+    // Verify initial load works (fail fast before spawning threads).
     let device = <B as burn::tensor::backend::Backend>::Device::default();
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model = CfvNet::<B>::new(
         &device,
-        config.training.hidden_layers,
-        config.training.hidden_size,
+        river_hidden_layers,
+        river_hidden_size,
         INPUT_SIZE,
     )
     .load_file(river_model_path, &recorder, &device)
     .map_err(|e| format!("failed to load river model: {e}"))?;
-
-    // Drop the initial model — each rayon thread will load its own via map_init.
     drop(model);
 
     let pb = ProgressBar::new(num_samples);
@@ -768,8 +785,8 @@ pub fn generate_turn_training_data(
         // Solve chunk in parallel. Each rayon thread loads its own model
         // on first use via map_init — no cloning, no sharing.
         let river_model_path = river_model_path.to_string();
-        let hidden_layers = config.training.hidden_layers;
-        let hidden_size = config.training.hidden_size;
+        let hidden_layers = river_hidden_layers;
+        let hidden_size = river_hidden_size;
 
         let results: Vec<_> = match &pool {
             Some(pool) => pool.install(|| {
