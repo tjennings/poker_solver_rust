@@ -817,6 +817,7 @@ mod tests {
                 train_every_n_solves: 1000,
                 train_batch_size: 32,
                 learning_rate: 1e-4,
+                ..Default::default()
             },
             replay_buffer,
             Arc::clone(&shutdown),
@@ -913,6 +914,7 @@ mod tests {
                 train_every_n_solves: 1000,
                 train_batch_size: 32,
                 learning_rate: 1e-4,
+                ..Default::default()
             },
             replay_buffer,
             Arc::clone(&shutdown),

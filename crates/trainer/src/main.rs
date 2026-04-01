@@ -1419,6 +1419,8 @@ fn run_rebel_train(
             train_every_n_solves: rebel_config.inference.train_every_n_solves,
             train_batch_size: rebel_config.inference.train_batch_size,
             learning_rate: rebel_config.inference.learning_rate,
+            checkpoint_dir: Some(model_path.clone()),
+            checkpoint_every_n_steps: 100,
         };
         let (handle, server_thread) = spawn_inference_server(
             model,

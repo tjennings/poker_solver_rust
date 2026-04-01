@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use burn::module::AutodiffModule;
+use burn::module::{AutodiffModule, Module};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{Tensor, TensorData};
@@ -49,6 +49,24 @@ pub struct InferenceServerConfig {
     pub train_batch_size: usize,
     /// Learning rate for Adam optimizer during online training.
     pub learning_rate: f64,
+    /// Directory to save model checkpoints. None = no checkpointing.
+    pub checkpoint_dir: Option<std::path::PathBuf>,
+    /// Save a checkpoint every N training steps.
+    pub checkpoint_every_n_steps: usize,
+}
+
+impl Default for InferenceServerConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 256,
+            batch_timeout_us: 100,
+            train_every_n_solves: 10,
+            train_batch_size: 512,
+            learning_rate: 3e-5,
+            checkpoint_dir: None,
+            checkpoint_every_n_steps: 100,
+        }
+    }
 }
 
 /// Handle for workers to submit inference requests.
@@ -163,6 +181,7 @@ fn run_server_loop<B: AutodiffBackend>(
 {
     let timeout = Duration::from_micros(config.batch_timeout_us);
     let mut last_train_at = 0usize;
+    let mut train_step_count = 0usize;
     let mut optim = AdamConfig::new()
         .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(5.0)))
         .init::<B, CfvNet<B>>();
@@ -184,6 +203,7 @@ fn run_server_loop<B: AutodiffBackend>(
                     &replay_buffer,
                     &solve_counter,
                     &mut last_train_at,
+                    &mut train_step_count,
                 );
                 continue;
             }
@@ -243,6 +263,7 @@ fn run_server_loop<B: AutodiffBackend>(
             &replay_buffer,
             &solve_counter,
             &mut last_train_at,
+            &mut train_step_count,
         );
     }
 }
@@ -260,6 +281,7 @@ fn maybe_train<B: AutodiffBackend>(
     replay_buffer: &ReplayBuffer,
     solve_counter: &AtomicUsize,
     last_train_at: &mut usize,
+    train_step_count: &mut usize,
 ) {
     let current = solve_counter.load(Ordering::Relaxed);
     if current.wrapping_sub(*last_train_at) < config.train_every_n_solves {
@@ -332,10 +354,32 @@ fn maybe_train<B: AutodiffBackend>(
     let grads_params = GradientsParams::from_grads(grads, model);
     *model = optim.step(config.learning_rate, model.clone(), grads_params);
 
+    *train_step_count += 1;
     eprintln!(
-        "  [train] loss={loss_val:.6} buffer={} solves={current}",
+        "  [train] step={} loss={loss_val:.6} buffer={} solves={current}",
+        train_step_count,
         replay_buffer.len()
     );
+
+    // Checkpoint model periodically.
+    if let Some(ref dir) = config.checkpoint_dir {
+        if *train_step_count % config.checkpoint_every_n_steps == 0 {
+            let recorder = burn::record::NamedMpkGzFileRecorder::<
+                burn::record::FullPrecisionSettings,
+            >::new();
+            let path = dir.join(format!("checkpoint_step{}", train_step_count));
+            if let Err(e) = model.clone().save_file(&path, &recorder) {
+                eprintln!("  Warning: failed to save checkpoint: {e}");
+            } else {
+                eprintln!("  [checkpoint] saved step {} to {}", train_step_count, path.display());
+            }
+            // Also save as "model" (latest)
+            let latest = dir.join("model");
+            if let Err(e) = model.clone().save_file(&latest, &recorder) {
+                eprintln!("  Warning: failed to save latest model: {e}");
+            }
+        }
+    }
 
     *last_train_at = current;
 }
@@ -366,6 +410,7 @@ mod tests {
             train_every_n_solves: 50,
             train_batch_size: 512,
             learning_rate: 1e-3,
+                ..Default::default()
         };
         assert_eq!(config.batch_size, 256);
         assert_eq!(config.batch_timeout_us, 100);
@@ -394,6 +439,7 @@ mod tests {
                 train_every_n_solves: 100,
                 train_batch_size: 32,
                 learning_rate: 1e-3,
+                ..Default::default()
             },
             replay_buffer,
             Arc::clone(&shutdown),
@@ -433,6 +479,7 @@ mod tests {
                 train_every_n_solves: 100,
                 train_batch_size: 32,
                 learning_rate: 1e-3,
+                ..Default::default()
             },
             replay_buffer,
             Arc::clone(&shutdown),
@@ -495,6 +542,7 @@ mod tests {
             train_every_n_solves: 2,
             train_batch_size: 4,
             learning_rate: 1e-3,
+                ..Default::default()
         };
         let replay_buffer = ReplayBuffer::new(100);
         // Fill replay buffer with enough entries.
@@ -507,6 +555,7 @@ mod tests {
 
         let solve_counter = AtomicUsize::new(5);
         let mut last_train_at = 0;
+        let mut train_step_count = 0usize;
 
         // Should trigger training (5 - 0 = 5 >= 2, and buffer has 10 >= 4).
         maybe_train(
@@ -517,6 +566,7 @@ mod tests {
             &replay_buffer,
             &solve_counter,
             &mut last_train_at,
+            &mut train_step_count,
         );
         assert_eq!(last_train_at, 5, "last_train_at should update to current solve count");
     }
@@ -536,6 +586,7 @@ mod tests {
             train_every_n_solves: 10,
             train_batch_size: 4,
             learning_rate: 1e-3,
+                ..Default::default()
         };
         let replay_buffer = ReplayBuffer::new(100);
         for i in 0..10 {
@@ -547,6 +598,7 @@ mod tests {
 
         let solve_counter = AtomicUsize::new(3);
         let mut last_train_at = 0;
+        let mut train_step_count = 0usize;
 
         // Should NOT trigger (3 - 0 = 3 < 10).
         maybe_train(
@@ -557,6 +609,7 @@ mod tests {
             &replay_buffer,
             &solve_counter,
             &mut last_train_at,
+            &mut train_step_count,
         );
         assert_eq!(last_train_at, 0, "last_train_at should not change");
     }
@@ -576,6 +629,7 @@ mod tests {
             train_every_n_solves: 1,
             train_batch_size: 100,
             learning_rate: 1e-3,
+                ..Default::default()
         };
         let replay_buffer = ReplayBuffer::new(1000);
         // Only 5 entries, but train_batch_size requires 100.
@@ -588,6 +642,7 @@ mod tests {
 
         let solve_counter = AtomicUsize::new(10);
         let mut last_train_at = 0;
+        let mut train_step_count = 0usize;
 
         maybe_train(
             &mut model,
@@ -597,6 +652,7 @@ mod tests {
             &replay_buffer,
             &solve_counter,
             &mut last_train_at,
+            &mut train_step_count,
         );
         assert_eq!(last_train_at, 0, "should not train with insufficient buffer");
     }
@@ -620,6 +676,7 @@ mod tests {
                 train_every_n_solves: 100,
                 train_batch_size: 32,
                 learning_rate: 1e-3,
+                ..Default::default()
             },
             replay_buffer,
             Arc::clone(&shutdown),
@@ -649,6 +706,7 @@ mod tests {
                 train_every_n_solves: 100,
                 train_batch_size: 32,
                 learning_rate: 1e-3,
+                ..Default::default()
             },
             replay_buffer,
             Arc::clone(&shutdown),
@@ -706,6 +764,7 @@ mod tests {
                 train_every_n_solves: 1,
                 train_batch_size: 32,
                 learning_rate: 1e-3,
+                ..Default::default()
             },
             Arc::clone(&replay_buffer),
             Arc::clone(&shutdown),
