@@ -98,26 +98,24 @@ impl BlueprintRangeGenerator {
         );
         let decision_map = tree.decision_index_map();
 
-        // Load bucket files
-        let buckets_dir = if let Some(ref cp) = config.training.cluster_path {
-            // cluster_path might be relative to bundle_dir or absolute
-            let p = Path::new(cp);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                bundle_dir.join(cp)
-            }
-        } else {
-            bundle_dir.join("buckets")
-        };
-
-        // Try the snap/buckets directory first (copied during training), then cluster_path
-        let snap_buckets = snap_dir.join("buckets");
-        let actual_buckets_dir = if snap_buckets.exists() {
-            snap_buckets
-        } else {
-            buckets_dir
-        };
+        // Load bucket files — try multiple locations in priority order.
+        let candidates = [
+            snap_dir.join("buckets"),                    // snapshot/buckets (copied during training)
+            bundle_dir.join("buckets"),                  // bundle/buckets
+            config.training.cluster_path.as_ref()        // cluster_path from config (relative to CWD)
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            config.training.cluster_path.as_ref()        // cluster_path relative to bundle_dir
+                .map(|cp| bundle_dir.join(cp))
+                .unwrap_or_default(),
+        ];
+        let actual_buckets_dir = candidates.iter()
+            .find(|p| p.join("flop.buckets").exists())
+            .cloned()
+            .unwrap_or_else(|| {
+                eprintln!("[blueprint ranges] warning: no bucket files found in any candidate directory");
+                bundle_dir.join("buckets")
+            });
 
         let bucket_files =
             poker_solver_core::blueprint_v2::trainer::load_bucket_files(&actual_buckets_dir);
