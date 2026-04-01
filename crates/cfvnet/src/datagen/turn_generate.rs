@@ -745,11 +745,11 @@ pub fn generate_turn_training_data(
             let buf2 = s2.saturating_sub(s3);
             let ec = ec_pb.load(Ordering::Relaxed);
             let avg_exploit = if ec > 0 {
-                (es_pb.load(Ordering::Relaxed) as f64 / 10000.0) / ec as f64
+                (es_pb.load(Ordering::Relaxed) as f64 / 100.0) / ec as f64
             } else {
                 0.0
             };
-            pb_ticker.set_message(format!("deal→[{buf1}]→gpu→[{buf2}]→solve  expl:{avg_exploit:.4}"));
+            pb_ticker.set_message(format!("deal→[{buf1}]→gpu→[{buf2}]→solve  expl:{avg_exploit:.1} mbb/h"));
             if pb_ticker.is_finished() {
                 break;
             }
@@ -938,7 +938,11 @@ pub fn generate_turn_training_data(
                         let count = stage3_count_ref.fetch_add(1, Ordering::Relaxed);
                         if count % 100 == 0 {
                             let exploit = range_solver::compute_exploitability(&game);
-                            exploit_sum_ref.fetch_add((exploit * 10000.0) as u64, Ordering::Relaxed);
+                            // Convert to mbb/hand: exploit_chips / big_blind * 1000.
+                            // BB = initial_stack / 100 (e.g. 200 chips = 100bb, so BB = 2 chips).
+                            let bb = initial_stack as f32 / 100.0;
+                            let exploit_mbb = if bb > 0.0 { exploit / bb * 1000.0 } else { 0.0 };
+                            exploit_sum_ref.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
                             exploit_count_ref.fetch_add(1, Ordering::Relaxed);
                         }
                         pb_ref.inc(1);
