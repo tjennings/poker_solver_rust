@@ -38,6 +38,9 @@ enum Commands {
         /// Backend for inference: ndarray (CPU, default) or cuda (GPU, requires --features cuda).
         #[arg(long, default_value = "ndarray")]
         backend: String,
+        /// Output path for river training data (exact mode only)
+        #[arg(long)]
+        river_output: Option<PathBuf>,
     },
     /// Train the CFVnet model
     Train {
@@ -172,9 +175,10 @@ fn main() {
             threads,
             per_file,
             backend,
+            river_output,
         } => {
             ensure_parent_dir(&output);
-            cmd_generate(config, output, num_samples, threads, per_file, &backend);
+            cmd_generate(config, output, num_samples, threads, per_file, &backend, river_output);
         }
         Commands::Train {
             config,
@@ -298,6 +302,7 @@ fn cmd_generate(
     threads: Option<usize>,
     per_file: Option<u64>,
     backend: &str,
+    river_output: Option<PathBuf>,
 ) {
     let yaml = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
         eprintln!("failed to read config {}: {e}", config_path.display());
@@ -319,6 +324,9 @@ fn cmd_generate(
     }
     if let Some(t) = threads {
         cfg.datagen.threads = t;
+    }
+    if let Some(rp) = river_output {
+        cfg.datagen.river_output = Some(rp.to_string_lossy().into_owned());
     }
 
     let total = cfg.datagen.num_samples;

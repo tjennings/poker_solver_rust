@@ -358,6 +358,164 @@ fn solve_and_extract(
     (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, exploit)
 }
 
+/// Extract river-level training records from a solved turn+river game.
+///
+/// After an exact-mode solve (turn + river to showdown), this walks the game
+/// tree to find each river chance outcome and extracts per-player CFVs at the
+/// first river decision node. Each river card produces two records (OOP + IP).
+///
+/// The game must already be finalized (`range_solver::finalize` called).
+fn extract_river_records(
+    game: &mut PostFlopGame,
+    sit: &Situation,
+    starting_pot: i32,
+) -> Vec<TrainingRecord> {
+    let mut records = Vec::new();
+    let mut path: Vec<usize> = Vec::new();
+
+    game.back_to_root();
+    collect_river_nodes(game, &mut path, sit, starting_pot, &mut records);
+    game.back_to_root();
+
+    records
+}
+
+/// Recursively walk the game tree to find river chance outcomes.
+///
+/// At each chance node (river deal), iterates over possible river cards,
+/// navigates to the resulting decision node, and extracts CFVs for both players.
+/// Uses `apply_history` for backtracking since `PostFlopGame` has no `undo()`.
+fn collect_river_nodes(
+    game: &mut PostFlopGame,
+    path: &mut Vec<usize>,
+    sit: &Situation,
+    starting_pot: i32,
+    records: &mut Vec<TrainingRecord>,
+) {
+    if game.is_terminal_node() {
+        return;
+    }
+
+    if game.is_chance_node() {
+        // This is the river chance node. Iterate over possible river cards.
+        let possible = game.possible_cards();
+        for card in 0u8..52 {
+            if possible & (1u64 << card) == 0 {
+                continue;
+            }
+            // Deal this river card.
+            path.push(card as usize);
+            game.apply_history(path);
+
+            // Now we're at the first river decision node (or possibly terminal
+            // if both players went all-in on the turn).
+            if !game.is_terminal_node() {
+                extract_river_data_at_node(game, sit, starting_pot, records);
+            }
+
+            path.pop();
+            game.apply_history(path);
+        }
+        return;
+    }
+
+    // Decision node on the turn. Recurse into each action.
+    let num_actions = game.available_actions().len();
+    for action_idx in 0..num_actions {
+        path.push(action_idx);
+        game.apply_history(path);
+
+        collect_river_nodes(game, path, sit, starting_pot, records);
+
+        path.pop();
+        game.apply_history(path);
+    }
+}
+
+/// Extract training records for both players at the current river decision node.
+///
+/// The game must be navigated to a river decision node (5-card board).
+/// Produces two `TrainingRecord`s (one per player) with pot-normalized CFVs.
+fn extract_river_data_at_node(
+    game: &mut PostFlopGame,
+    sit: &Situation,
+    starting_pot: i32,
+    records: &mut Vec<TrainingRecord>,
+) {
+    let board = game.current_board();
+    if board.len() != 5 {
+        return; // Not a river node.
+    }
+
+    // Compute pot at this node from the total bet amounts.
+    let bet_amounts = game.total_bet_amount();
+    let node_pot = starting_pot + bet_amounts[0] + bet_amounts[1];
+    let pot_f64 = f64::from(node_pot);
+    let half_pot = pot_f64 / 2.0;
+    let norm = if half_pot > 0.0 { half_pot } else { 1.0 };
+
+    game.cache_normalized_weights();
+
+    // Build reach-weighted ranges once for both players.
+    let mut oop_range = [0.0_f32; NUM_COMBOS];
+    let mut ip_range = [0.0_f32; NUM_COMBOS];
+
+    for player_idx in 0..2usize {
+        let hands = game.private_cards(player_idx);
+        let weights = game.weights(player_idx);
+        let range = if player_idx == 0 { &mut oop_range } else { &mut ip_range };
+
+        let weight_sum: f64 = hands.iter().zip(weights.iter())
+            .filter(|&(&(c0, c1), _)| !board.contains(&c0) && !board.contains(&c1))
+            .map(|(_, &w)| f64::from(w))
+            .sum();
+
+        for (i, &(c0, c1)) in hands.iter().enumerate() {
+            if !board.contains(&c0) && !board.contains(&c1) {
+                let idx = card_pair_to_index(c0, c1);
+                range[idx] = if weight_sum > 0.0 {
+                    (f64::from(weights[i]) / weight_sum) as f32
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+
+    let effective_stack = (sit.effective_stack - (node_pot - starting_pot) / 2) as f32;
+
+    for player in 0..2usize {
+        let raw_evs = game.expected_values(player);
+        let hands = game.private_cards(player);
+
+        let mut cfvs = [0.0_f32; NUM_COMBOS];
+        let mut valid_mask = [0_u8; NUM_COMBOS];
+
+        for (i, &(c0, c1)) in hands.iter().enumerate() {
+            let idx = card_pair_to_index(c0, c1);
+            cfvs[idx] = ((f64::from(raw_evs[i]) - half_pot) / norm) as f32;
+            valid_mask[idx] = 1;
+        }
+
+        let game_value = weighted_sum(
+            if player == 0 { &oop_range } else { &ip_range },
+            &cfvs,
+        );
+
+        records.push(TrainingRecord {
+            board: board.clone(),
+            pot: node_pot as f32,
+            effective_stack,
+            player: player as u8,
+            game_value,
+            oop_range,
+            ip_range,
+            cfvs,
+            valid_mask,
+        });
+    }
+}
+
 /// GPU-accelerated turn datagen with pipelined GPU/CPU phases.
 ///
 /// Phase 1 (CPU parallel): Build game trees for each situation.
@@ -714,8 +872,13 @@ fn generate_turn_training_data_exact(
     let bet_sizes_vec = bet_sizes_f64;
     let initial_stack = config.game.initial_stack;
     let bet_size_fuzz = config.datagen.bet_size_fuzz;
+    let river_output_path = config.datagen.river_output.as_ref().map(Path::new);
 
     eprintln!("[turn datagen] exact mode: solving turn+river to showdown (no neural net)");
+    if river_output_path.is_some() {
+        eprintln!("[turn datagen] river records will be extracted to: {}",
+            river_output_path.unwrap().display());
+    }
 
     let pb = Arc::new(ProgressBar::new(num_samples));
     pb.set_style(
@@ -755,6 +918,15 @@ fn generate_turn_training_data_exact(
     let file =
         std::fs::File::create(output_path).map_err(|e| format!("create output: {e}"))?;
     let writer = Arc::new(Mutex::new(BufWriter::new(file)));
+
+    let river_writer: Option<Arc<Mutex<BufWriter<std::fs::File>>>> =
+        if let Some(rp) = river_output_path {
+            let rf = std::fs::File::create(rp)
+                .map_err(|e| format!("create river output: {e}"))?;
+            Some(Arc::new(Mutex::new(BufWriter::new(rf))))
+        } else {
+            None
+        };
 
     let stage1_count = Arc::clone(&stage1_count_for_pb);
     let stage3_count = Arc::clone(&stage3_count_for_pb);
@@ -805,6 +977,8 @@ fn generate_turn_training_data_exact(
     // --- Stage 3: DCFR Solvers (no Stage 2 in exact mode) ---
     let pb_ref = Arc::clone(&pb);
     let writer_ref = Arc::clone(&writer);
+    let river_writer_ref = river_writer.clone();
+    let extract_river = river_writer.is_some();
     let stage3_count_ref = Arc::clone(&stage3_count);
     let exploit_sum_ref = Arc::clone(&exploit_sum_pb);
     let exploit_count_ref = Arc::clone(&exploit_count_pb);
@@ -823,7 +997,8 @@ fn generate_turn_training_data_exact(
                 }
             }
 
-            let results: Vec<_> = pool.install(|| {
+            type TurnResult = ([f32; NUM_COMBOS], [f32; NUM_COMBOS], [u8; NUM_COMBOS], f32, f32, f32);
+            let results: Vec<(Situation, TurnResult, Vec<TrainingRecord>)> = pool.install(|| {
                 batch
                     .par_drain(..)
                     .map(|(sit, mut game)| {
@@ -843,14 +1018,21 @@ fn generate_turn_training_data_exact(
                             exploit_sum_ref.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
                             exploit_count_ref.fetch_add(1, Ordering::Relaxed);
                         }
+                        // Extract river records if configured (game is already finalized).
+                        let river_recs = if extract_river {
+                            extract_river_records(&mut game, &sit, sit.pot)
+                        } else {
+                            Vec::new()
+                        };
                         pb_ref.inc(1);
-                        (sit, result)
+                        (sit, result, river_recs)
                     })
                     .collect()
             });
 
             let mut w = writer_ref.lock().expect("writer lock");
-            for (sit, (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _exploit)) in results {
+            let mut rw_guard = river_writer_ref.as_ref().map(|rw| rw.lock().expect("river writer lock"));
+            for (sit, (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _exploit), river_recs) in results {
                 let board_vec = sit.board_cards().to_vec();
 
                 let oop_rec = TrainingRecord {
@@ -878,6 +1060,14 @@ fn generate_turn_training_data_exact(
                     valid_mask,
                 };
                 write_record(&mut *w, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
+
+                // Write river records if configured.
+                if let Some(ref mut rw) = rw_guard {
+                    for river_rec in &river_recs {
+                        write_record(&mut **rw, river_rec)
+                            .map_err(|e| format!("write river: {e}"))?;
+                    }
+                }
             }
         }
 
@@ -1791,5 +1981,161 @@ mod tests {
         let result = generate_turn_training_data(&config, output.path(), "ndarray");
         // Should NOT error about river_model_path.
         assert!(result.is_ok(), "exact mode should not require river_model_path: {:?}", result.err());
+    }
+
+    #[test]
+    fn extract_river_records_produces_5_card_boards() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            ..Default::default()
+        };
+        let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+        if sit.effective_stack <= 0 {
+            return;
+        }
+        let bet_sizes_f64 = parse_bet_sizes_depth(&["50%".into(), "a".into()]);
+        let mut game = build_turn_game_exact(
+            sit.board_cards(),
+            f64::from(sit.pot),
+            f64::from(sit.effective_stack),
+            &sit.ranges,
+            &[bet_sizes_f64],
+        )
+        .expect("game should be built");
+
+        // Solve the game fully.
+        for t in 0..50 {
+            solve_step(&mut game, t);
+        }
+        range_solver::finalize(&mut game);
+
+        let records = extract_river_records(&mut game, &sit, sit.pot);
+        assert!(!records.is_empty(), "should produce river records from exact solve");
+
+        for (i, rec) in records.iter().enumerate() {
+            assert_eq!(rec.board.len(), 5, "river record {i} should have 5-card board");
+            // Board should start with the original 4 turn cards.
+            assert_eq!(&rec.board[..4], sit.board_cards(), "river record {i} board prefix mismatch");
+            // River card should be valid (0..52) and not duplicate any turn card.
+            let river_card = rec.board[4];
+            assert!(river_card < 52, "river record {i} river card out of range");
+            assert!(!sit.board_cards().contains(&river_card),
+                "river record {i} river card {river_card} conflicts with turn board");
+        }
+    }
+
+    #[test]
+    fn extract_river_records_have_finite_cfvs() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            ..Default::default()
+        };
+        let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+        if sit.effective_stack <= 0 {
+            return;
+        }
+        let bet_sizes_f64 = parse_bet_sizes_depth(&["50%".into(), "a".into()]);
+        let mut game = build_turn_game_exact(
+            sit.board_cards(),
+            f64::from(sit.pot),
+            f64::from(sit.effective_stack),
+            &sit.ranges,
+            &[bet_sizes_f64],
+        )
+        .expect("game should be built");
+
+        for t in 0..50 {
+            solve_step(&mut game, t);
+        }
+        range_solver::finalize(&mut game);
+
+        let records = extract_river_records(&mut game, &sit, sit.pot);
+        assert!(!records.is_empty(), "should produce river records");
+
+        for (i, rec) in records.iter().enumerate() {
+            assert!(rec.pot > 0.0, "river record {i} pot should be positive");
+            assert!(rec.effective_stack >= 0.0, "river record {i} stack should be non-negative");
+            assert!(rec.player <= 1, "river record {i} player should be 0 or 1");
+
+            let num_valid: usize = rec.valid_mask.iter().map(|&v| v as usize).sum();
+            assert!(num_valid > 0, "river record {i} should have valid combos");
+
+            for (j, &cfv) in rec.cfvs.iter().enumerate() {
+                assert!(cfv.is_finite(), "river record {i} combo {j}: non-finite CFV {cfv}");
+            }
+            assert!(rec.game_value.is_finite(), "river record {i} game value not finite");
+        }
+    }
+
+    #[test]
+    fn extract_river_records_have_both_players() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            ..Default::default()
+        };
+        let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+        if sit.effective_stack <= 0 {
+            return;
+        }
+        let bet_sizes_f64 = parse_bet_sizes_depth(&["50%".into(), "a".into()]);
+        let mut game = build_turn_game_exact(
+            sit.board_cards(),
+            f64::from(sit.pot),
+            f64::from(sit.effective_stack),
+            &sit.ranges,
+            &[bet_sizes_f64],
+        )
+        .expect("game should be built");
+
+        for t in 0..50 {
+            solve_step(&mut game, t);
+        }
+        range_solver::finalize(&mut game);
+
+        let records = extract_river_records(&mut game, &sit, sit.pot);
+        // Records come in pairs (OOP, IP) for each river card.
+        assert!(records.len() % 2 == 0, "river records should come in pairs");
+
+        let has_oop = records.iter().any(|r| r.player == 0);
+        let has_ip = records.iter().any(|r| r.player == 1);
+        assert!(has_oop, "should have OOP records");
+        assert!(has_ip, "should have IP records");
+    }
+
+    #[test]
+    fn exact_mode_pipeline_writes_river_records_when_configured() {
+        use tempfile::TempDir;
+
+        let mut config = turn_test_config(2);
+        config.datagen.mode = "exact".into();
+        config.game.river_model_path = None;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let turn_output = tmp_dir.path().join("turn_data.bin");
+        let river_output = tmp_dir.path().join("river_data.bin");
+        config.datagen.river_output = Some(river_output.to_string_lossy().into_owned());
+
+        let result = generate_turn_training_data(&config, &turn_output, "ndarray");
+        assert!(result.is_ok(), "pipeline failed: {:?}", result.err());
+
+        // Turn records should exist (4-card boards).
+        let turn_meta = std::fs::metadata(&turn_output).unwrap();
+        assert!(turn_meta.len() > 0, "turn output should be non-empty");
+
+        // River records should exist (5-card boards).
+        assert!(river_output.exists(), "river output file should exist");
+        let river_meta = std::fs::metadata(&river_output).unwrap();
+        assert!(river_meta.len() > 0, "river output should be non-empty");
+
+        // Read and verify river records.
+        let mut river_file = std::fs::File::open(&river_output).unwrap();
+        let rec = storage::read_record(&mut river_file).unwrap();
+        assert_eq!(rec.board.len(), 5, "river record should have 5-card board");
     }
 }

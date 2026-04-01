@@ -168,6 +168,10 @@ pub struct DatagenConfig {
     /// `1.0 + uniform(-fuzz, +fuzz)`. Default 0.0 (no fuzzing).
     #[serde(default)]
     pub bet_size_fuzz: f64,
+    /// Output path for river training data (extracted from exact turn+river solves).
+    /// When set in exact mode, river records are written alongside turn records.
+    #[serde(default)]
+    pub river_output: Option<String>,
 }
 
 impl Default for DatagenConfig {
@@ -184,6 +188,7 @@ impl Default for DatagenConfig {
             seed: Some(42),
             leaf_eval_interval: 0,
             bet_size_fuzz: 0.0,
+            river_output: None,
         }
     }
 }
@@ -552,5 +557,40 @@ datagen:
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.datagen.mode, "model");
+    }
+
+    #[test]
+    fn river_output_defaults_to_none() {
+        let config = DatagenConfig::default();
+        assert!(config.river_output.is_none());
+    }
+
+    #[test]
+    fn parse_config_with_river_output() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  mode: "exact"
+  river_output: "/tmp/river_data.bin"
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.datagen.river_output.as_deref(), Some("/tmp/river_data.bin"));
+    }
+
+    #[test]
+    fn parse_config_without_river_output_is_none() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  mode: "exact"
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.datagen.river_output.is_none());
     }
 }
