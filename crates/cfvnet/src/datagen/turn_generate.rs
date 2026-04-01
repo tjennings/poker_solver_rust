@@ -791,41 +791,68 @@ pub fn generate_turn_training_data(
         // tx1 drops here, closing the channel.
     });
 
-    // --- Stage 2: GPU Inference (1 thread) ---
-    // Loads ONE model, batches boundary evaluations across multiple samples
-    // for larger GPU forward passes.
+    // --- Stage 2: GPU Inference (N_GPU_THREADS threads) ---
+    // Each thread loads its own model, pulls from shared rx1, sends to tx2.
+    const N_GPU_THREADS: usize = 2;
     const GPU_BATCH_SIZE: usize = 32;
-    let river_model_path_owned = river_model_path.to_string();
-    let stage2_count_ref = Arc::clone(&stage2_count);
-    let stage2 = std::thread::spawn(move || {
-        let device = <B as burn::tensor::backend::Backend>::Device::default();
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
-        let model = CfvNet::<B>::new(
-            &device,
-            river_hidden_layers,
-            river_hidden_size,
-            INPUT_SIZE,
-        )
-        .load_file(&river_model_path_owned, &recorder, &device)
-        .expect("load river model on Stage 2 thread");
-        let evaluator = RiverNetEvaluator::new(model, device);
+    let rx1 = Arc::new(Mutex::new(rx1));
+    let mut stage2_handles = Vec::with_capacity(N_GPU_THREADS);
+    for gpu_id in 0..N_GPU_THREADS {
+        let rx1_ref = Arc::clone(&rx1);
+        let tx2_ref = tx2.clone();
+        let stage2_count_ref = Arc::clone(&stage2_count);
+        let river_model_path_owned = river_model_path.to_string();
+        stage2_handles.push(std::thread::spawn(move || {
+            let device = <B as burn::tensor::backend::Backend>::Device::default();
+            let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+            let model = CfvNet::<B>::new(
+                &device,
+                river_hidden_layers,
+                river_hidden_size,
+                INPUT_SIZE,
+            )
+            .load_file(&river_model_path_owned, &recorder, &device)
+            .unwrap_or_else(|e| panic!("GPU thread {gpu_id}: load river model: {e}"));
+            let evaluator = RiverNetEvaluator::new(model, device);
 
-        let mut batch: Vec<(Situation, PostFlopGame)> = Vec::with_capacity(GPU_BATCH_SIZE);
+            let mut batch: Vec<(Situation, PostFlopGame)> = Vec::with_capacity(GPU_BATCH_SIZE);
 
-        loop {
-            // Block on first receive, then drain non-blocking up to batch size.
-            match rx1.recv() {
-                Ok(item) => batch.push(item),
-                Err(_) => break, // Channel closed.
-            }
-            while batch.len() < GPU_BATCH_SIZE {
-                match rx1.try_recv() {
-                    Ok(item) => batch.push(item),
-                    Err(_) => break,
+            loop {
+                // Lock rx1, block on first recv, drain non-blocking up to batch size.
+                {
+                    let rx = rx1_ref.lock().expect("rx1 lock");
+                    match rx.recv() {
+                        Ok(item) => batch.push(item),
+                        Err(_) => break,
+                    }
+                    while batch.len() < GPU_BATCH_SIZE {
+                        match rx.try_recv() {
+                            Ok(item) => batch.push(item),
+                            Err(_) => break,
+                        }
+                    }
+                } // Drop lock before GPU work.
+
+                for (sit, game) in batch.iter_mut() {
+                    evaluate_game_boundaries(
+                        game,
+                        sit.board_cards(),
+                        f64::from(sit.pot),
+                        f64::from(sit.effective_stack),
+                        &sit.ranges,
+                        &evaluator,
+                    );
+                    stage2_count_ref.fetch_add(1, Ordering::Relaxed);
+                }
+
+                for item in batch.drain(..) {
+                    if tx2_ref.send(item).is_err() {
+                        return;
+                    }
                 }
             }
 
-            // Evaluate boundaries for entire batch.
+            // Process remaining.
             for (sit, game) in batch.iter_mut() {
                 evaluate_game_boundaries(
                     game,
@@ -837,32 +864,12 @@ pub fn generate_turn_training_data(
                 );
                 stage2_count_ref.fetch_add(1, Ordering::Relaxed);
             }
-
-            // Send all to Stage 3.
             for item in batch.drain(..) {
-                if tx2.send(item).is_err() {
-                    return;
-                }
+                let _ = tx2_ref.send(item);
             }
-        }
-
-        // Process remaining items.
-        for (sit, game) in batch.iter_mut() {
-            evaluate_game_boundaries(
-                game,
-                sit.board_cards(),
-                f64::from(sit.pot),
-                f64::from(sit.effective_stack),
-                &sit.ranges,
-                &evaluator,
-            );
-            stage2_count_ref.fetch_add(1, Ordering::Relaxed);
-        }
-        for item in batch.drain(..) {
-            let _ = tx2.send(item);
-        }
-        // tx2 drops here, closing the channel.
-    });
+        }));
+    }
+    drop(tx2); // Drop the original tx2 so channel closes when all GPU threads finish.
 
     // --- Stage 3: DCFR Solvers (rayon thread pool, N threads) ---
     // Receives games with boundaries set, solves in parallel batches, writes output.
@@ -943,7 +950,9 @@ pub fn generate_turn_training_data(
 
     // Wait for all stages to complete.
     stage1.join().map_err(|e| format!("stage 1 panicked: {e:?}"))?;
-    stage2.join().map_err(|e| format!("stage 2 panicked: {e:?}"))?;
+    for (i, handle) in stage2_handles.into_iter().enumerate() {
+        handle.join().map_err(|e| format!("stage 2 thread {i} panicked: {e:?}"))?;
+    }
     stage3.join().map_err(|e| format!("stage 3 panicked: {e:?}"))??;
 
     pb.finish_with_message("done");
