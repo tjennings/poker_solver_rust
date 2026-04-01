@@ -216,7 +216,7 @@ fn build_turn_game(
         .collect();
     let bet_size_opts = BetSizeOptions {
         bet: sizes.clone(),
-        raise: Vec::new(),
+        raise: sizes,
     };
 
     let card_config = CardConfig {
